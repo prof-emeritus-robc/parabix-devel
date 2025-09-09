@@ -66,6 +66,7 @@ public:
                   {Binding{"wordBoundaries", WordBoundaryMask}}) {}
 
     // the algorithm
+    
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -83,19 +84,24 @@ protected:
         //word → non-word, mark an end boundary
         //non-word → word, mark a start boundary.
         // 1) End of word: previous was word, current is not
+        
         PabloAST * wordToNonWord = pb.createAnd(prevWordChars, pb.createNot(wordChars));
 
 
         // 2) Start of word: previous was not word, current is
         //PabloAST * nonWordToWord = pb.createAnd(pb.createNot(prevWordChars), wordChars);
 
+        //PabloAST * allBoundaries = nonWordToWord;
         PabloAST * allBoundaries = wordToNonWord;
+        
+
 
         writeOutputStreamSet("wordBoundaries", std::vector<PabloAST*>{ allBoundaries });
 
     }
 };
 
+ 
 /** Unicode line separator insertion kernel: writes LF (0x0A) at mask positions */
 class AddUnicodeLineSeparators : public PabloKernel {
 public:

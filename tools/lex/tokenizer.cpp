@@ -87,9 +87,9 @@ protected:
 
 
         // 2) Start of word: previous was not word, current is
-        PabloAST * nonWordToWord = pb.createAnd(pb.createNot(prevWordChars), wordChars);
+        //PabloAST * nonWordToWord = pb.createAnd(pb.createNot(prevWordChars), wordChars);
 
-        PabloAST * allBoundaries = pb.createOr(wordToNonWord, nonWordToWord);
+        PabloAST * allBoundaries = wordToNonWord;
 
         writeOutputStreamSet("wordBoundaries", std::vector<PabloAST*>{ allBoundaries });
 

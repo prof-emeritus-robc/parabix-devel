@@ -60,10 +60,11 @@ public:
     // constructor argument: LLVMTypeSystemInterface --> to handle types for LLVM IR generation
     UnicodeWordBoundaryDetector(LLVMTypeSystemInterface & ts,
                                 StreamSet * WordStream,
-                                StreamSet * WordBoundaryMask)
+                                StreamSet * SpaceStream,
+                                StreamSet * TokenBoundaries)
     : PabloKernel(ts, "unicodeWordBoundaryDetector",
-                  {Binding{"WordStream", WordStream}},
-                  {Binding{"wordBoundaries", WordBoundaryMask}}) {}
+                  {Binding{"WordStream", WordStream}, Binding{"SpaceStream", SpaceStream}}, // Both as inputs
+                  {Binding{"tokenBoundaries", TokenBoundaries}}) {}
 
     // the algorithm
     
@@ -72,32 +73,42 @@ protected:
         PabloBuilder pb(getEntryScope());
 
         RE_Compiler re_compiler(getEntryScope(), nullptr);
-
+        
+//Gets bit streams representing word characters and space characters.
         PabloAST * wordChars = getInputStreamSet("WordStream")[0];
+        PabloAST * spaceChars = getInputStreamSet("SpaceStream")[0];
 
 
         // "Previous" bit relative to current position:
         // advance(s, 1) shifts forward so the previous char aligns with current bit.
         PabloAST * prevWordChars = pb.createAdvance(wordChars, 1);
+        PabloAST * prevSpaceChars = pb.createAdvance(spaceChars, 1);
 
 
         //word → non-word, mark an end boundary
         //non-word → word, mark a start boundary.
         // 1) End of word: previous was word, current is not
+       
         
-        PabloAST * wordToNonWord = pb.createAnd(prevWordChars, pb.createNot(wordChars));
-
-
-        // 2) Start of word: previous was not word, current is
-        //PabloAST * nonWordToWord = pb.createAnd(pb.createNot(prevWordChars), wordChars);
-
-        //PabloAST * allBoundaries = nonWordToWord;
-        PabloAST * allBoundaries = wordToNonWord;
+        // Non-word characters (everything that's not a word character)
+        //Creates inverse bit streams for non-word characters.
+        PabloAST * nonWordChars = pb.createNot(wordChars);
+        PabloAST * prevNonWordChars = pb.createNot(prevWordChars);
         
 
+        // This marks word endings that transition to punctuation (not spaces)( previous=word AND current=non-word AND current≠space) so it is a boundary before a punctuation
+        PabloAST * wordToNonSpace = pb.createAnd(prevWordChars,pb.createAnd(nonWordChars, pb.createNot(spaceChars)));
+        
+        //This marks word beginnings after punctuation(previous=non-word AND previous≠space AND current=word) - beggining
 
-        writeOutputStreamSet("wordBoundaries", std::vector<PabloAST*>{ allBoundaries });
-
+        PabloAST * nonSpaceToWord = pb.createAnd(pb.createAnd(prevNonWordChars, pb.createNot(prevSpaceChars)),wordChars);
+        
+        //the very first word character
+        PabloAST * streamStart = pb.createAnd(wordChars, pb.createNot(prevWordChars));
+        
+        PabloAST * tokenBoundaries = pb.createOr(pb.createOr(wordToNonSpace, nonSpaceToWord), streamStart);
+        
+        writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ tokenBoundaries });
     }
 };
 
@@ -170,7 +181,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
 
     // === Word boundary detection ===
-    StreamSet * wordBoundaryMask = P.CreateStreamSet(1, 1);
+    StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
 
     re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
     wordProp = UCD::linkAndResolve(wordProp);
@@ -179,19 +190,38 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * WordStream = P.CreateStreamSet(1);
     P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, BasisBits, WordStream);
     SHOW_STREAM(WordStream);
+        
+    
+    re::RE * spaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
+    spaceProp = UCD::linkAndResolve(spaceProp);
+    re::Name * space = re::makeName("space");
+    space->setDefinition(spaceProp);
+    StreamSet * SpaceStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(space, BasisBits, SpaceStream);
+    SHOW_STREAM(SpaceStream);
+        
 
     StreamSet * WordSpans = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<U8Spans>(WordStream, u8index, WordSpans);
     SHOW_STREAM(WordSpans);
+        
+        
+    StreamSet * SpaceSpans = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<U8Spans>(SpaceStream, u8index, SpaceSpans);
+    SHOW_STREAM(SpaceSpans);
+        
+//  Enhanced word boundary detection ===
+    P.CreateKernelCall<UnicodeWordBoundaryDetector>(WordSpans, SpaceSpans, TokenBoundaries);
+    SHOW_STREAM(TokenBoundaries);
 
 
     // P.CreateKernelCall<BoundaryKernel>(WordStream, U8index, wordBoundary_stream);
-    P.CreateKernelCall<UnicodeWordBoundaryDetector>(WordSpans, wordBoundaryMask);
-    SHOW_STREAM(wordBoundaryMask);
+    //P.CreateKernelCall<UnicodeWordBoundaryDetector>(WordSpans, TokenBoundaries);
+    //SHOW_STREAM(TokenBoundaries);
 
     // === Insertion & spreading ===
     // Insert BEFORE boundaries (line break in front of word starts/ends)
-    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, wordBoundaryMask, kernel::InsertPosition::Before);
+    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TokenBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
 
     StreamSet * spreadBasis = P.CreateStreamSet(8);

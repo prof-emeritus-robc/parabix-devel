@@ -88,6 +88,7 @@ protected:
         //word → non-word, mark an end boundary
         //non-word → word, mark a start boundary.
         // 1) End of word: previous was word, current is not
+<<<<<<< Updated upstream
        
         
         // Non-word characters (everything that's not a word character)
@@ -95,12 +96,17 @@ protected:
         PabloAST * nonWordChars = pb.createNot(wordChars);
         PabloAST * prevNonWordChars = pb.createNot(prevWordChars);
         
+=======
+        
+        PabloAST * wordToNonWord = pb.createAnd(prevWordChars, pb.createNot(wordChars));
+>>>>>>> Stashed changes
 
         // This marks word endings that transition to punctuation (not spaces)( previous=word AND current=non-word AND current≠space) so it is a boundary before a punctuation
         PabloAST * wordToNonSpace = pb.createAnd(prevWordChars,pb.createAnd(nonWordChars, pb.createNot(spaceChars)));
         
         //This marks word beginnings after punctuation(previous=non-word AND previous≠space AND current=word) - beggining
 
+<<<<<<< Updated upstream
         PabloAST * nonSpaceToWord = pb.createAnd(pb.createAnd(prevNonWordChars, pb.createNot(prevSpaceChars)),wordChars);
         
         //the very first word character
@@ -109,6 +115,17 @@ protected:
         PabloAST * tokenBoundaries = pb.createOr(pb.createOr(wordToNonSpace, nonSpaceToWord), streamStart);
         
         writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ tokenBoundaries });
+=======
+        // 2) Start of word: previous was not word, current is
+        //PabloAST * nonWordToWord = pb.createAnd(pb.createNot(prevWordChars), wordChars);
+
+        //PabloAST * allBoundaries = nonWordToWord;
+        PabloAST * allBoundaries = wordToNonWord;
+        
+
+        writeOutputStreamSet("wordBoundaries", std::vector<PabloAST*>{ allBoundaries });
+
+>>>>>>> Stashed changes
     }
 };
 

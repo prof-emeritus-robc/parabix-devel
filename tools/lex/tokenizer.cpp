@@ -57,14 +57,15 @@ static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), 
 // Spaces attach to following tokens, creating clean word boundaries
 class UnicodeWordBoundaryDetector : public PabloKernel {
 public:
-    // Fixed constructor: inputs first, outputs last
+    // Fixed constructor: Both inputs need LookAhead(1) for the lookahead operations
     UnicodeWordBoundaryDetector(LLVMTypeSystemInterface & ts,
                                 StreamSet * WordStream,
                                 StreamSet * SpaceStream,
                                 StreamSet * TokenBoundaries)
     : PabloKernel(ts, "tiktokenStyleTokenizer",
-                  {Binding{"WordStream", WordStream, FixedRate(), LookAhead(1)}, Binding{"SpaceStream", SpaceStream}}, // Inputs
-                  {Binding{"tokenBoundaries", TokenBoundaries}})                            // Output
+                  {Binding{"WordStream", WordStream, FixedRate(), LookAhead(1)},
+                   Binding{"SpaceStream", SpaceStream, FixedRate(), LookAhead(1)}}, // Added LookAhead(1)
+                  {Binding{"tokenBoundaries", TokenBoundaries}})
     {}
 
 protected:
@@ -74,49 +75,55 @@ protected:
         // Get input streams
         PabloAST * wordChars = getInputStreamSet("WordStream")[0];
         PabloAST * spaceChars = getInputStreamSet("SpaceStream")[0];
-        //PabloAST * markChars = getInputStreamSet("MarkStream")[0];
         
         // Previous character positions (shift forward by 1)
-        // This allows us to compare current position with previous position
         PabloAST * prevWordChars = pb.createAdvance(wordChars, 1);
         PabloAST * prevSpaceChars = pb.createAdvance(spaceChars, 1);
         
-        // not a word
-        PabloAST * Other = pb.createNot(pb.createOr(wordChars, spaceChars));
-        PabloAST * PrevOther = pb.createAdvance(Other, 1);
+        // Next character positions (lookahead by 1)
+        PabloAST * nextWordChars = pb.createLookahead(wordChars, 1);
         
-        // tokenization logic
+        // Non-word, non-space characters
+        PabloAST * otherChars = pb.createNot(pb.createOr(wordChars, spaceChars));
+        PabloAST * prevOtherChars = pb.createAdvance(otherChars, 1);
         
-        // Standard word boundaries: transitions between word and non-word
+        // Basic transitions
         PabloAST * wordToNonWord = pb.createAnd(prevWordChars, pb.createNot(wordChars));
-        PabloAST * nonWordToWord = pb.createAnd(PrevOther, wordChars);
-        //PabloAST * wordBoundaries = pb.createOr(wordToNonWord);
+        PabloAST * nonWordToWord = pb.createAnd(prevOtherChars, wordChars);
         
+        // Space sequence handling
         
-        // lookahead
-        PabloAST * SpaceBeforeWord = pb.createAnd(spaceChars, pb.createLookahead(wordChars, 1));
+        // Start of space sequence: non-space to space
+        PabloAST * startOfSpaceSequence = pb.createAnd(pb.createNot(prevSpaceChars), spaceChars);
         
-        //PabloAST * spaceFollowedBySpace = pb.createOr(spaceChars, pb.createLookahead(SpaceBeforeWord, 1));
+        // Last space before word: current=space AND next=word
+        PabloAST * lastSpaceBeforeWord = pb.createAnd(spaceChars, nextWordChars);
         
-        PabloAST * TokenStart = pb.createOr(SpaceBeforeWord, nonWordToWord);
+        PabloAST * boundaryBeforeLastSpace = pb.createAnd(
+                    prevSpaceChars,     // previous was space
+                    lastSpaceBeforeWord // current is last space before word
+                );
         
-        // Space handling: spaces attach to FOLLOWING tokens
-        // Create boundary before space sequences start (non-space -> space)
-        PabloAST * nonSpaceToSpace = pb.createAnd(pb.createNot(prevSpaceChars), spaceChars);
+        // Word boundaries
+        PabloAST * wordBoundaries = pb.createOr(wordToNonWord, nonWordToWord);
         
-        // Prevent boundaries within consecutive spaces
-        // We want space sequences to stay together with the following word
-        //PabloAST * spaceToSpace = pb.createAnd(prevSpaceChars, spaceChars);
+        // Space boundaries
+        PabloAST * spaceBoundaries = pb.createOr(startOfSpaceSequence, boundaryBeforeLastSpace);
         
-        // Combine all boundary conditions
-        PabloAST * allBoundaries = pb.createOr3(TokenStart, nonSpaceToSpace, wordToNonWord);
-               
+        // Other character boundaries
+        PabloAST * otherCharBoundaries = pb.createOr(otherChars, prevOtherChars);
+            
+                
         
-        // Remove boundaries within space sequences (keep spaces together)
-        //allBoundaries = pb.createAnd(allBoundaries, pb.createNot(spaceToSpace));
+        // Token boundaries occur at
+        PabloAST * tokenBoundaries = pb.createOr3(
+            wordBoundaries,
+            spaceBoundaries,
+            otherCharBoundaries
+        );
         
-        // Output the final token boundaries
-        writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ allBoundaries });
+        // Use the refined boundaries approach
+        writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ tokenBoundaries });
     }
 };
 

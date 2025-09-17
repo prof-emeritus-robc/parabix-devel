@@ -53,84 +53,74 @@ using namespace re;
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(wordBreakerFlags));
 
-
-// word boundary detection kernel using Unicode word characters
+// word boundary detection kernel
+// Spaces attach to following tokens, creating clean word boundaries
 class UnicodeWordBoundaryDetector : public PabloKernel {
 public:
-    // constructor argument: LLVMTypeSystemInterface --> to handle types for LLVM IR generation
+    // Fixed constructor: inputs first, outputs last
     UnicodeWordBoundaryDetector(LLVMTypeSystemInterface & ts,
                                 StreamSet * WordStream,
                                 StreamSet * SpaceStream,
                                 StreamSet * TokenBoundaries)
-    : PabloKernel(ts, "unicodeWordBoundaryDetector",
-                  {Binding{"WordStream", WordStream}, Binding{"SpaceStream", SpaceStream}}, // Both as inputs
-                  {Binding{"tokenBoundaries", TokenBoundaries}}) {}
+    : PabloKernel(ts, "tiktokenStyleTokenizer",
+                  {Binding{"WordStream", WordStream, FixedRate(), LookAhead(1)}, Binding{"SpaceStream", SpaceStream}}, // Inputs
+                  {Binding{"tokenBoundaries", TokenBoundaries}})                            // Output
+    {}
 
-    // the algorithm
-    
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
 
-        RE_Compiler re_compiler(getEntryScope(), nullptr);
-        
-//Gets bit streams representing word characters and space characters.
+        // Get input streams
         PabloAST * wordChars = getInputStreamSet("WordStream")[0];
         PabloAST * spaceChars = getInputStreamSet("SpaceStream")[0];
-
-
-        // "Previous" bit relative to current position:
-        // advance(s, 1) shifts forward so the previous char aligns with current bit.
+        //PabloAST * markChars = getInputStreamSet("MarkStream")[0];
+        
+        // Previous character positions (shift forward by 1)
+        // This allows us to compare current position with previous position
         PabloAST * prevWordChars = pb.createAdvance(wordChars, 1);
         PabloAST * prevSpaceChars = pb.createAdvance(spaceChars, 1);
-
-
-        //word → non-word, mark an end boundary
-        //non-word → word, mark a start boundary.
-        // 1) End of word: previous was word, current is not
-<<<<<<< Updated upstream
-       
         
-        // Non-word characters (everything that's not a word character)
-        //Creates inverse bit streams for non-word characters.
-        PabloAST * nonWordChars = pb.createNot(wordChars);
-        PabloAST * prevNonWordChars = pb.createNot(prevWordChars);
+        // not a word
+        PabloAST * Other = pb.createNot(pb.createOr(wordChars, spaceChars));
+        PabloAST * PrevOther = pb.createAdvance(Other, 1);
         
-=======
+        // tokenization logic
         
+        // Standard word boundaries: transitions between word and non-word
         PabloAST * wordToNonWord = pb.createAnd(prevWordChars, pb.createNot(wordChars));
->>>>>>> Stashed changes
-
-        // This marks word endings that transition to punctuation (not spaces)( previous=word AND current=non-word AND current≠space) so it is a boundary before a punctuation
-        PabloAST * wordToNonSpace = pb.createAnd(prevWordChars,pb.createAnd(nonWordChars, pb.createNot(spaceChars)));
+        PabloAST * nonWordToWord = pb.createAnd(PrevOther, wordChars);
+        //PabloAST * wordBoundaries = pb.createOr(wordToNonWord);
         
-        //This marks word beginnings after punctuation(previous=non-word AND previous≠space AND current=word) - beggining
-
-<<<<<<< Updated upstream
-        PabloAST * nonSpaceToWord = pb.createAnd(pb.createAnd(prevNonWordChars, pb.createNot(prevSpaceChars)),wordChars);
         
-        //the very first word character
-        PabloAST * streamStart = pb.createAnd(wordChars, pb.createNot(prevWordChars));
+        // lookahead
+        PabloAST * SpaceBeforeWord = pb.createAnd(spaceChars, pb.createLookahead(wordChars, 1));
         
-        PabloAST * tokenBoundaries = pb.createOr(pb.createOr(wordToNonSpace, nonSpaceToWord), streamStart);
+        //PabloAST * spaceFollowedBySpace = pb.createOr(spaceChars, pb.createLookahead(SpaceBeforeWord, 1));
         
-        writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ tokenBoundaries });
-=======
-        // 2) Start of word: previous was not word, current is
-        //PabloAST * nonWordToWord = pb.createAnd(pb.createNot(prevWordChars), wordChars);
-
-        //PabloAST * allBoundaries = nonWordToWord;
-        PabloAST * allBoundaries = wordToNonWord;
+        PabloAST * TokenStart = pb.createOr(SpaceBeforeWord, nonWordToWord);
         
-
-        writeOutputStreamSet("wordBoundaries", std::vector<PabloAST*>{ allBoundaries });
-
->>>>>>> Stashed changes
+        // Space handling: spaces attach to FOLLOWING tokens
+        // Create boundary before space sequences start (non-space -> space)
+        PabloAST * nonSpaceToSpace = pb.createAnd(pb.createNot(prevSpaceChars), spaceChars);
+        
+        // Prevent boundaries within consecutive spaces
+        // We want space sequences to stay together with the following word
+        //PabloAST * spaceToSpace = pb.createAnd(prevSpaceChars, spaceChars);
+        
+        // Combine all boundary conditions
+        PabloAST * allBoundaries = pb.createOr3(TokenStart, nonSpaceToSpace, wordToNonWord);
+               
+        
+        // Remove boundaries within space sequences (keep spaces together)
+        //allBoundaries = pb.createAnd(allBoundaries, pb.createNot(spaceToSpace));
+        
+        // Output the final token boundaries
+        writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ allBoundaries });
     }
 };
 
- 
-/** Unicode line separator insertion kernel: writes LF (0x0A) at mask positions */
+// Unicode line separator insertion kernel: writes LF (0x0A) at token boundaries
 class AddUnicodeLineSeparators : public PabloKernel {
 public:
     AddUnicodeLineSeparators(LLVMTypeSystemInterface & ts,
@@ -141,39 +131,35 @@ public:
                   {Binding{"insertMask", insertMask}, Binding{"spreadBasis", spreadBasis}},
                   {Binding{"finalBasis", finalBasis}}) {}
 
-
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        // The insertMask has 0 bits at inserted positions, 1s everywhere else.
+        
+        // insertMask has 0 bits where we want to insert LF, 1s elsewhere
         PabloAST * insert = getInputStreamSet("insertMask")[0];
         std::vector<PabloAST *> basis = getInputStreamSet("spreadBasis");
 
-        // Starting with the spread basis bits
+        // Copy the spread basis bits
         std::vector<PabloAST *> out(basis.size());
-        for (unsigned i = 0; i < basis.size(); ++i) out[i] = basis[i];
+        for (unsigned i = 0; i < basis.size(); ++i) {
+            out[i] = basis[i];
+        }
 
-        // This bit clearing clears the bits at all positions, not just
-        // at the places to insert LFs.   But the spreadBasis will have
-        // all bits cleared at the insert positions,
-        // Clearing all bits where we'll insert LF: AND with NOT(insert)
-        //PabloAST * keep = pb.createNot(insert);
-        //for (unsigned i = 0; i < out.size(); ++i) {
-        //    out[i] = pb.createAnd(out[i], keep);
-        //}
-
-        // We need to 1 bits at the positions for insertion of LFs.
+        // Create insertion mark (1s where we want to insert LF)
         PabloAST * insertMark = pb.createNot(insert);
-        // LF = 0x0A = b00001010 -> set bit1 and bit3 where insertMark=1
+        
+        // Insert LF character (0x0A = 00001010) at marked positions
+        // LF has bit 1 and bit 3 set
         if (out.size() >= 4) {
-            out[1] = pb.createOr(out[1], insertMark);
-            out[3] = pb.createOr(out[3], insertMark);
+            out[1] = pb.createOr(out[1], insertMark); // Set bit 1
+            out[3] = pb.createOr(out[3], insertMark); // Set bit 3
         }
 
         writeOutputStreamSet("finalBasis", out);
     }
 };
 
+// Debug macros for visualization
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name)  if (codegen::EnableIllustrator) P.captureByteData(#name, name)
@@ -181,25 +167,27 @@ protected:
 using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
-
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
-
+    
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
-
-    // Byte stream and 8 basis bit streams
+    
+    // Input Processing
+    // Read file into byte stream
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
-
+    
+    // Convert serial bytes to 8 parallel bit streams
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
     SHOW_BIXNUM(BasisBits);
-
+    
+    // Create UTF-8 character boundary index
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-
-    // === Word boundary detection ===
-    StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
-
+    
+    // Unicode Property Detection
+    
+    // Detect Unicode word characters (letters, digits, etc.)
     re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
     wordProp = UCD::linkAndResolve(wordProp);
     re::Name * word = re::makeName("word");
@@ -207,8 +195,8 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * WordStream = P.CreateStreamSet(1);
     P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, BasisBits, WordStream);
     SHOW_STREAM(WordStream);
-        
     
+    // Detect Unicode space characters
     re::RE * spaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
     spaceProp = UCD::linkAndResolve(spaceProp);
     re::Name * space = re::makeName("space");
@@ -216,47 +204,63 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * SpaceStream = P.CreateStreamSet(1);
     P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(space, BasisBits, SpaceStream);
     SHOW_STREAM(SpaceStream);
-        
+    
+    // Detect Unicode marks
+    /***
+    re::RE * markProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "mark");
+    markProp = UCD::linkAndResolve(markProp);
+    re::Name * mark = re::makeName("mark");
+    mark->setDefinition(markProp);
+    StreamSet * MarkStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(mark, BasisBits, MarkStream);
+    SHOW_STREAM(MarkStream);
+     ***/
+    
+    // Convert mark properties to UTF-8 byte spans
+    //StreamSet * MarkSpans = P.CreateStreamSet(1, 1);
+    //P.CreateKernelCall<U8Spans>(MarkStream, u8index, MarkSpans);
+    //SHOW_STREAM(MarkSpans);
 
+
+    // Convert character-level properties to UTF-8 byte spans
     StreamSet * WordSpans = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<U8Spans>(WordStream, u8index, WordSpans);
     SHOW_STREAM(WordSpans);
-        
-        
+    
     StreamSet * SpaceSpans = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<U8Spans>(SpaceStream, u8index, SpaceSpans);
     SHOW_STREAM(SpaceSpans);
-        
-//  Enhanced word boundary detection ===
+    
+   
+    StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
+    
+    // Fixed parameter order: WordSpans, SpaceSpans, TokenBoundaries (inputs first, output last)
     P.CreateKernelCall<UnicodeWordBoundaryDetector>(WordSpans, SpaceSpans, TokenBoundaries);
     SHOW_STREAM(TokenBoundaries);
-
-
-    // P.CreateKernelCall<BoundaryKernel>(WordStream, U8index, wordBoundary_stream);
-    //P.CreateKernelCall<UnicodeWordBoundaryDetector>(WordSpans, TokenBoundaries);
-    //SHOW_STREAM(TokenBoundaries);
-
-    // === Insertion & spreading ===
-    // Insert BEFORE boundaries (line break in front of word starts/ends)
+    
+   
+    // Create insertion mask and spread original data
     StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TokenBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
-
+    
     StreamSet * spreadBasis = P.CreateStreamSet(8);
     SpreadByMask(P, lineInsertMask, BasisBits, spreadBasis);
     SHOW_BIXNUM(spreadBasis);
-
-    // === Insert LF at boundary positions ===
+    
+    // Insert Token Separators
     StreamSet * tokenBasis = P.CreateStreamSet(8);
     P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     SHOW_BIXNUM(tokenBasis);
-
-    // Back to bytes and out
-    StreamSet * tokenizedWords = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<P2SKernel>(tokenBasis, tokenizedWords);
-    SHOW_BYTES(tokenizedWords);
-
-    P.CreateKernelCall<StdOutKernel>(tokenizedWords);
-
+    
+    // Output Processing
+    // Convert parallel bit streams back to serial bytes
+    StreamSet * tokenizedOutput = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<P2SKernel>(tokenBasis, tokenizedOutput);
+    SHOW_BYTES(tokenizedOutput);
+    
+    // Write to standard output
+    P.CreateKernelCall<StdOutKernel>(tokenizedOutput);
+    
     return reinterpret_cast<WordBreakerFunctionType>(P.compile());
 }
 
@@ -273,6 +277,6 @@ int main(int argc, char *argv[]) {
     } else {
         wordBreakerFn(fd);
         close(fd);
-    }
-    return 0;
+    
+    }    return 0;
 }

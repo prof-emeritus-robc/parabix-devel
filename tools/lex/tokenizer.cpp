@@ -59,12 +59,20 @@ class UnicodeWordBoundaryDetector : public PabloKernel {
 public:
     // Fixed constructor: Both inputs need LookAhead(1) for the lookahead operations
     UnicodeWordBoundaryDetector(LLVMTypeSystemInterface & ts,
-                                StreamSet * WordStream,
-                                StreamSet * SpaceStream,
+                                StreamSet * u8index,
+                                StreamSet * WordSpans,
+                                StreamSet * SpaceSpans,
+                                StreamSet * SymbolSpans,
+                                StreamSet * LTRSpans,
+                                StreamSet * RTLSpans,
                                 StreamSet * TokenBoundaries)
     : PabloKernel(ts, "tiktokenStyleTokenizer",
-                  {Binding{"WordStream", WordStream, FixedRate(), LookAhead(1)},
-                   Binding{"SpaceStream", SpaceStream, FixedRate(), LookAhead(1)}}, // Added LookAhead(1)
+                  {Binding{"u8index", u8index, FixedRate(), LookAhead(1)},
+                   Binding{"WordSpans", WordSpans, FixedRate(), LookAhead(1)},
+                   Binding{"SpaceSpans", SpaceSpans, FixedRate(), LookAhead(1)},
+                   Binding{"LTRSpans", LTRSpans, FixedRate(), LookAhead(1)},
+                   Binding{"RTLSpans", RTLSpans, FixedRate(), LookAhead(1)},
+                   Binding{"SymbolStream", SymbolSpans, FixedRate(), LookAhead(1)}},
                   {Binding{"tokenBoundaries", TokenBoundaries}})
     {}
 
@@ -73,35 +81,60 @@ protected:
         PabloBuilder pb(getEntryScope());
 
         // Get input streams
-        PabloAST * wordChars = getInputStreamSet("WordStream")[0];
-        PabloAST * spaceChars = getInputStreamSet("SpaceStream")[0];
+        PabloAST * u8index = getInputStreamSet("u8index")[0];
+        PabloAST * wordSpans = getInputStreamSet("WordSpans")[0];
+        PabloAST * spaceSpans = getInputStreamSet("SpaceSpans")[0];
+        PabloAST * symbolSpans = getInputStreamSet("SymbolStream")[0];
+        PabloAST * ltrSpans = getInputStreamSet("LTRSpans")[0];
+        PabloAST * rtlSpans = getInputStreamSet("RTLSpans")[0];
+        
         
         // Previous character positions (shift forward by 1)
-        PabloAST * prevWordChars = pb.createAdvance(wordChars, 1);
-        PabloAST * prevSpaceChars = pb.createAdvance(spaceChars, 1);
+        PabloAST * prevWordSpans = pb.createAdvance(wordSpans, 1);
+        PabloAST * prevSpaceSpans = pb.createAdvance(spaceSpans, 1);
+        PabloAST * prevSymbolSpans = pb.createAdvance(symbolSpans, 1);
+        PabloAST * prevLtrSpans = pb.createAdvance(ltrSpans, 1);
+        PabloAST * prevRtlSpans = pb.createAdvance(rtlSpans, 1);
+        PabloAST * u8First = pb.createAdvance(u8index, 1);
+        
+        
+        
         
         // Next character positions (lookahead by 1)
-        PabloAST * nextWordChars = pb.createLookahead(wordChars, 1);
+        PabloAST * nextWordSpans = pb.createLookahead(wordSpans, 1);
+        PabloAST * nextsymbolSpans = pb.createLookahead(symbolSpans, 1);
         
-        // Non-word, non-space characters
-        PabloAST * otherChars = pb.createNot(pb.createOr(wordChars, spaceChars));
-        PabloAST * prevOtherChars = pb.createAdvance(otherChars, 1);
+        // Non-word, non-space characters, puntuations
+        PabloAST * otherSpans = pb.createNot(pb.createOr3(wordSpans, spaceSpans, symbolSpans));
+        PabloAST * prevOtherSpans = pb.createAdvance(otherSpans, 1);
         
         // Basic transitions
-        PabloAST * wordToNonWord = pb.createAnd(prevWordChars, pb.createNot(wordChars));
-        PabloAST * nonWordToWord = pb.createAnd(prevOtherChars, wordChars);
+        PabloAST * wordToNonWord = pb.createAnd(prevWordSpans, pb.createNot(wordSpans));
+        PabloAST * nonWordToWord = pb.createAnd(prevOtherSpans, wordSpans);  //??
+        
+        // Symbol transitions - each symbol should be a token
+        PabloAST * symbolToAny = pb.createAnd(prevSymbolSpans, u8First);
+        PabloAST * anyToSymbol = pb.createAnd(u8First, symbolSpans);
+        
+        // create boundary when direction changes
+        PabloAST * ltrToRTL = pb.createAnd(prevLtrSpans, rtlSpans);
+        
+        
+        // create boundary when direction changes
+        PabloAST * rtlToLTR = pb.createAnd(prevRtlSpans, ltrSpans);
         
         // Space sequence handling
         
         // Start of space sequence: non-space to space
-        PabloAST * startOfSpaceSequence = pb.createAnd(pb.createNot(prevSpaceChars), spaceChars);
+        PabloAST * startOfSpaceSequence = pb.createAnd(pb.createNot(prevSpaceSpans), spaceSpans);
         
         // Last space before word: current=space AND next=word
-        PabloAST * lastSpaceBeforeWord = pb.createAnd(spaceChars, nextWordChars);
+        PabloAST * nextTokenSpans = pb.createOr(nextWordSpans, nextsymbolSpans);
+        PabloAST * lastSpaceBeforeToken = pb.createAnd(spaceSpans, nextTokenSpans);
         
         PabloAST * boundaryBeforeLastSpace = pb.createAnd(
-                    prevSpaceChars,     // previous was space
-                    lastSpaceBeforeWord // current is last space before word
+                    prevSpaceSpans,     // previous was space
+                    lastSpaceBeforeToken // current is last space before word
                 );
         
         // Word boundaries
@@ -111,16 +144,22 @@ protected:
         PabloAST * spaceBoundaries = pb.createOr(startOfSpaceSequence, boundaryBeforeLastSpace);
         
         // Other character boundaries
-        PabloAST * otherCharBoundaries = pb.createOr(otherChars, prevOtherChars);
-            
-                
+        PabloAST * otherCharBoundaries = pb.createOr(otherSpans, prevOtherSpans);
+        
+        // Symbiol character
+        PabloAST * symbolBoundaries = pb.createOr(symbolToAny, anyToSymbol);
+        
+        // directional Boundries
+        PabloAST * directionalBBoundries = pb.createOr(ltrToRTL, rtlToLTR);
+        
         
         // Token boundaries occur at
         PabloAST * tokenBoundaries = pb.createOr3(
             wordBoundaries,
             spaceBoundaries,
-            otherCharBoundaries
+            pb.createOr3(symbolBoundaries, otherCharBoundaries, directionalBBoundries)
         );
+        tokenBoundaries = pb.createAnd(tokenBoundaries, u8First); //boundary shouldn't be at anywhere except at the frst char
         
         // Use the refined boundaries approach
         writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ tokenBoundaries });
@@ -212,21 +251,33 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(space, BasisBits, SpaceStream);
     SHOW_STREAM(SpaceStream);
     
-    // Detect Unicode marks
-    /***
-    re::RE * markProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "mark");
-    markProp = UCD::linkAndResolve(markProp);
-    re::Name * mark = re::makeName("mark");
-    mark->setDefinition(markProp);
-    StreamSet * MarkStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(mark, BasisBits, MarkStream);
-    SHOW_STREAM(MarkStream);
-     ***/
+    // Detect symbol boundries
+    re::RE * symbolProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "symbol");
+    symbolProp = UCD::linkAndResolve(symbolProp);
+    re::Name * symbol = re::makeName("symbol");
+    symbol->setDefinition(symbolProp);
+    StreamSet * SymbolStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(symbol, BasisBits, SymbolStream);
+    SHOW_STREAM(SymbolStream);
     
-    // Convert mark properties to UTF-8 byte spans
-    //StreamSet * MarkSpans = P.CreateStreamSet(1, 1);
-    //P.CreateKernelCall<U8Spans>(MarkStream, u8index, MarkSpans);
-    //SHOW_STREAM(MarkSpans);
+    
+    // Detect Left-to-Right characters
+    re::RE * ltrProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Bidi_Class=L");
+    ltrProp = UCD::linkAndResolve(ltrProp);
+    re::Name * ltr = re::makeName("ltr");
+    ltr->setDefinition(ltrProp);
+    StreamSet * LTRStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(ltr, BasisBits, LTRStream);
+    SHOW_STREAM(LTRStream);
+        
+    // Detecting Right-to-Left characters
+    re::RE * rtlProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Bidi_Class=R");
+    rtlProp = UCD::linkAndResolve(rtlProp);
+    re::Name * rtl = re::makeName("rtl");
+    rtl->setDefinition(rtlProp);
+    StreamSet * RTLStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(rtl, BasisBits, RTLStream);
+    SHOW_STREAM(RTLStream);
 
 
     // Convert character-level properties to UTF-8 byte spans
@@ -238,11 +289,25 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<U8Spans>(SpaceStream, u8index, SpaceSpans);
     SHOW_STREAM(SpaceSpans);
     
+    // Convert symbol properties to UTF-8 byte spans
+    StreamSet * SymbolSpans = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<U8Spans>(SymbolStream, u8index, SymbolSpans);
+    SHOW_STREAM(SymbolSpans);
+    
+    
+    StreamSet * LTRSpans = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<U8Spans>(LTRStream, u8index, LTRSpans);
+    SHOW_STREAM(LTRSpans);
+    
+    StreamSet * RTLSpans = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<U8Spans>(RTLStream, u8index, RTLSpans);
+    SHOW_STREAM(RTLSpans);
+    
    
     StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
     
     // Fixed parameter order: WordSpans, SpaceSpans, TokenBoundaries (inputs first, output last)
-    P.CreateKernelCall<UnicodeWordBoundaryDetector>(WordSpans, SpaceSpans, TokenBoundaries);
+    P.CreateKernelCall<UnicodeWordBoundaryDetector>(u8index, WordSpans, SpaceSpans,SymbolSpans,LTRSpans, RTLSpans, TokenBoundaries);
     SHOW_STREAM(TokenBoundaries);
     
    

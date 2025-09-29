@@ -255,6 +255,53 @@ RE * generateGraphemeClusterBoundaryRule(bool extendedGraphemeClusters) {
 
     return gcb;
 }
+// Unicode word boundary rules
+RE * generateWordBoundaryRule() {
+    // Unicode Word Boundary Rules (UAX #29) - Basic Implementation
+    // let's start with the three fundamental rules: WB1, WB2, WB3
+    
+    // WB1: Break at the start of text, sot ÷ Any
+    RE * WB_1 = makeSOT();
+    
+    // WB2: Break at the end of text, Any ÷ eot
+    RE * WB_2 = makeEOT();
+
+    // WB3: Do not break within CRLF.
+    // CR × LF
+    RE * WB_CR = makePropertyExpression("wb", "cr");
+    RE * WB_LF = makePropertyExpression("wb", "lf");
+    RE * WB_Newline = makePropertyExpression("wb", "newline");
+    
+    // Combine CR, LF, and Newline for breaking rules
+    RE * WB_CRLFNewlinw = makeAlt({WB_CR, WB_LF, WB_Newline});
+    
+    // Do not break between a CR and LF.
+    RE * WB_3 = makeSeq({Behind(WB_CR), Ahead(WB_LF)});
+    
+    // break
+    // WB3a: Break before Newlines (including CR and LF)
+    RE * WB_3a = Behind(WB_CRLFNewlinw);
+    
+    // WB3b: Break after Newlines (including CR and LF)
+    RE * WB_3b = Ahead(WB_CRLFNewlinw);
+    
+    // Combine breaking rules (except WB_3 which prevents CR×LF break)
+    RE * WB_1_3 = makeAlt({WB_1, WB_2, makeDiff(makeAlt({WB_3a, WB_3b}), WB_3)});
+    
+    // Combine the "do not break" rules (just WB_3 for now)
+    RE * WBX = WB_3;
+    
+    // WB999: Break everywhere else.
+    RE * WB_999 = makeSeq({Behind(makeAny()), Ahead(makeAny())});
+    
+    // Final word boundary rule: break at start/end of text, or break everywhere except where WBX rules apply
+    RE * wb = makeAlt({WB_1_3, makeDiff(WB_999, WBX)});
+    
+    wb = UCD::linkAndResolve(wb);
+    
+    return wb;
+}
+
 
 RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj) {
     unsigned enum_count = enumObj->GetEnumCount();
@@ -288,8 +335,7 @@ public:
         }
         if (propExpr->getPropertyIdentifier() == "w") {
             Name * wb_name = makeZeroWidth("\\b{w}");
-            wb_name->setDefinition(nullptr);
-            re::UnsupportedRE("\\b{w} not yet supported.");
+            wb_name->setDefinition(generateWordBoundaryRule());
             return wb_name;
         }
         if (prop_code >= 0) {

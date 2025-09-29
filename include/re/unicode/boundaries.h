@@ -19,6 +19,9 @@ RE * resolveGraphemeMode(RE * re, bool inGraphemeMode);
 
 RE * generateGraphemeClusterBoundaryRule(bool extendedGraphemeClusters = true);
 
+// Word Boundary Rules         
+RE * generateWordBoundaryRule();
+
 RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj);
 
 RE * resolveBoundaryProperties(RE * r);

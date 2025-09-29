@@ -72,8 +72,13 @@ RE * PropertyResolver::resolveBoundary (std::string val, bool is_negated) {
         if (is_negated) {
             resolved = makeDiff(makeAny(), resolved);
         }
-    } else if (mPropCode == UCD::w) { // Unicode word boundary
-        UnicodePropertyExpressionError("\\b{w} not yet supported.");
+        
+        //changes
+    } else if (mPropCode == UCD::w) { // edited Unicode word boundary here
+        resolved = generateWordBoundaryRule();
+        if (is_negated) {
+            resolved = makeDiff(makeAny(), resolved);
+        }
     } else if (isa<EnumeratedPropertyObject>(mPropObj) && (val == "")) {
         // Boundary between codepoints with any two different values for an
         // enumerated property.

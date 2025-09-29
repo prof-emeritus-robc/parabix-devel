@@ -41,6 +41,11 @@
 #include <grep/regex_passes.h>
 #include <re/compile/re_compiler.h>
 #include <kernel/unicode/UCD_property_kernel.h>
+#include <re/unicode/boundaries.h>
+#include <re/analysis/collect_ccs.h>
+#include <re/transforms/re_transformer.h>
+#include <re/transforms/re_multiplex.h>
+#include <kernel/unicode/charclasses.h>
 
 namespace fs = boost::filesystem;
 
@@ -53,101 +58,8 @@ using namespace re;
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(wordBreakerFlags));
 
-// word boundary detection kernel
-// Spaces attach to following tokens, creating clean word boundaries
-class UnicodeWordBoundaryDetector : public PabloKernel {
-public:
-    // Fixed constructor: Both inputs need LookAhead(1) for the lookahead operations
-    UnicodeWordBoundaryDetector(LLVMTypeSystemInterface & ts,
-                                StreamSet * u8index,
-                                StreamSet * WordSpans,
-                                StreamSet * SpaceSpans,
-                                StreamSet * SymbolSpans,
-                                StreamSet * TokenBoundaries)
-    : PabloKernel(ts, "tiktokenStyleTokenizer",
-                  {Binding{"u8index", u8index, FixedRate(), LookAhead(1)},
-                   Binding{"WordSpans", WordSpans, FixedRate(), LookAhead(1)},
-                   Binding{"SpaceSpans", SpaceSpans, FixedRate(), LookAhead(1)},
-                   Binding{"SymbolStream", SymbolSpans, FixedRate(), LookAhead(1)}}, // Added LookAhead(1)
-                  {Binding{"tokenBoundaries", TokenBoundaries}})
-    {}
-
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-
-        // Get input streams
-        PabloAST * u8index = getInputStreamSet("u8index")[0];
-        PabloAST * wordSpans = getInputStreamSet("WordSpans")[0];
-        PabloAST * spaceSpans = getInputStreamSet("SpaceSpans")[0];
-        PabloAST * symbolSpans = getInputStreamSet("SymbolStream")[0];
-        
-        
-        // Previous character positions (shift forward by 1)
-        PabloAST * prevWordSpans = pb.createAdvance(wordSpans, 1);
-        PabloAST * prevSpaceSpans = pb.createAdvance(spaceSpans, 1);
-        PabloAST * prevsymbolSpans = pb.createAdvance(symbolSpans, 1);
-        PabloAST * u8First = pb.createAdvance(u8index, 1);
-        
-        
-        
-        
-        // Next character positions (lookahead by 1)
-        PabloAST * nextWordSpans = pb.createLookahead(wordSpans, 1);
-        PabloAST * nextsymbolSpans = pb.createLookahead(symbolSpans, 1);
-        
-        // Non-word, non-space characters, puntuations
-        PabloAST * otherSpans = pb.createNot(pb.createOr3(wordSpans, spaceSpans, symbolSpans));
-        PabloAST * prevOtherSpans = pb.createAdvance(otherSpans, 1);
-        
-        // Basic transitions
-        PabloAST * wordToNonWord = pb.createAnd(prevWordSpans, pb.createNot(wordSpans));
-        PabloAST * nonWordToWord = pb.createAnd(prevOtherSpans, wordSpans);  //??
-        
-        // Symbol transitions - each symbol should be a token
-        PabloAST * symbolToAny = pb.createAnd(prevsymbolSpans, u8First);
-        PabloAST * anyToSymbol = pb.createAnd(u8First, symbolSpans);
-        
-        
-        
-        // Space sequence handling
-        
-        // Start of space sequence: non-space to space
-        PabloAST * startOfSpaceSequence = pb.createAnd(pb.createNot(prevSpaceSpans), spaceSpans);
-        
-        // Last space before word: current=space AND next=word
-        PabloAST * nextTokenSpans = pb.createOr(nextWordSpans, nextsymbolSpans);
-        PabloAST * lastSpaceBeforeToken = pb.createAnd(spaceSpans, nextTokenSpans);
-        
-        PabloAST * boundaryBeforeLastSpace = pb.createAnd(
-                    prevSpaceSpans,     // previous was space
-                    lastSpaceBeforeToken // current is last space before word
-                );
-        
-        // Word boundaries
-        PabloAST * wordBoundaries = pb.createOr(wordToNonWord, nonWordToWord);
-        
-        // Space boundaries
-        PabloAST * spaceBoundaries = pb.createOr(startOfSpaceSequence, boundaryBeforeLastSpace);
-        
-        // Other character boundaries
-        PabloAST * otherCharBoundaries = pb.createOr(otherSpans, prevOtherSpans);
-        
-        // Symbiol character
-        PabloAST * symbolBoundaries = pb.createOr(symbolToAny, anyToSymbol);
-        
-        // Token boundaries occur at
-        PabloAST * tokenBoundaries = pb.createOr3(
-            wordBoundaries,
-            spaceBoundaries,
-            pb.createOr(symbolBoundaries, otherCharBoundaries)
-        );
-        tokenBoundaries = pb.createAnd(tokenBoundaries, u8First); //boundary shouldn't be at anywhere except at the frst char
-        
-        // Use the refined boundaries approach
-        writeOutputStreamSet("tokenBoundaries", std::vector<PabloAST*>{ tokenBoundaries });
-    }
-};
+// proper Unicode word boundary rules (WB1, WB2, WB3) implemented in 
+// generateWordBoundaryRule() function.
 
 // Unicode line separator insertion kernel: writes LF (0x0A) at token boundaries
 class AddUnicodeLineSeparators : public PabloKernel {
@@ -214,56 +126,26 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
     
-    // Unicode Property Detection
+    // Unicode Word Boundary Rules
+    StreamSet * WordBoundaries = P.CreateStreamSet(1, 1);
+    re::RE * wordBoundaryRule = re::generateWordBoundaryRule();
+    const auto WB_Sets = re::collectCCs(wordBoundaryRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+    auto WB_mpx = cc::makeMultiplexedAlphabet("WB_mpx", WB_Sets);
+    wordBoundaryRule = transformCCs(WB_mpx, wordBoundaryRule, re::NameTransformationMode::TransformDefinition);
+    auto WB_basis = WB_mpx->getMultiplexedCCs();
+    StreamSet * const WB_Classes = P.CreateStreamSet(WB_basis.size());
+    P.CreateKernelFamilyCall<CharClassesKernel>(WB_basis, BasisBits, WB_Classes);
+    auto options = std::make_unique<GrepKernelOptions>();
+    options->setIndexing(u8index);
+    options->setRE(wordBoundaryRule);
+    options->addAlphabet(WB_mpx, WB_Classes);
+    options->setResults(WordBoundaries);
+    options->addExternal("UTF8_index", u8index);
+    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+    SHOW_STREAM(WordBoundaries);
     
-    // Detect Unicode word characters (letters, digits, etc.)
-    re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
-    wordProp = UCD::linkAndResolve(wordProp);
-    re::Name * word = re::makeName("word");
-    word->setDefinition(wordProp);
-    StreamSet * WordStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, BasisBits, WordStream);
-    SHOW_STREAM(WordStream);
-    
-    // Detect Unicode space characters
-    re::RE * spaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
-    spaceProp = UCD::linkAndResolve(spaceProp);
-    re::Name * space = re::makeName("space");
-    space->setDefinition(spaceProp);
-    StreamSet * SpaceStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(space, BasisBits, SpaceStream);
-    SHOW_STREAM(SpaceStream);
-    
-    // Detect symbol boundries
-    re::RE * symbolProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "symbol");
-    symbolProp = UCD::linkAndResolve(symbolProp);
-    re::Name * symbol = re::makeName("symbol");
-    symbol->setDefinition(symbolProp);
-    StreamSet * SymbolStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(symbol, BasisBits, SymbolStream);
-    SHOW_STREAM(SymbolStream);
-
-
-    // Convert character-level properties to UTF-8 byte spans
-    StreamSet * WordSpans = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<U8Spans>(WordStream, u8index, WordSpans);
-    SHOW_STREAM(WordSpans);
-    
-    StreamSet * SpaceSpans = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<U8Spans>(SpaceStream, u8index, SpaceSpans);
-    SHOW_STREAM(SpaceSpans);
-    
-    // NEW: Convert symbol properties to UTF-8 byte spans
-    StreamSet * SymbolSpans = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<U8Spans>(SymbolStream, u8index, SymbolSpans);
-    SHOW_STREAM(SymbolSpans);
-    
-   
-    StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
-    
-    // Fixed parameter order: WordSpans, SpaceSpans, TokenBoundaries (inputs first, output last)
-    P.CreateKernelCall<UnicodeWordBoundaryDetector>(u8index, WordSpans, SpaceSpans,SymbolSpans, TokenBoundaries);
-    SHOW_STREAM(TokenBoundaries);
+    // Use WordBoundaries as TokenBoundaries
+    StreamSet * TokenBoundaries = WordBoundaries;
     
    
     // Create insertion mask and spread original data

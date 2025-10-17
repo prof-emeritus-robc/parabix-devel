@@ -298,37 +298,44 @@ RE * generateWordBoundaryRule() {
     // WB4: Ignore Format and Extend characters
     RE * WB_Extend = makePropertyExpression("wb", "extend");
     RE * WB_Format = makePropertyExpression("wb", "format");
+    
     RE * WB_4 = makeAlt({Behind(WB_Extend), Ahead(WB_Format)});
     
     // WB5: Do not break between most letters
     // AHLetter × AHLetter
     RE * WB_ALetter = makePropertyExpression("wb", "aletter");
-    RE * WBX_5 = makeSeq({Behind(WB_ALetter), Ahead(WB_ALetter)});
+    RE * WB_HebrewLetter = makePropertyExpression("wb", "hebrew_letter");
+
+    // Underscore as part of AHLetter
+    // RE * WB_Underscore = makeByte('_');
+
+    RE * WB_AHLetter = makeAlt({WB_ALetter, WB_HebrewLetter});
+    RE * WBX_5 = makeSeq({Behind(WB_AHLetter), Ahead(WB_AHLetter)});
     
     // WB6: Do not break letters across certain punctuation
     // AHLetter × (MidLetter | MidNumLetQ) × AHLetter
     //  punctuation inside words
     RE * WB_MidLetter = makePropertyExpression("wb", "midletter");
     RE * WB_MidNumLet = makePropertyExpression("wb", "midnumlet");
-    RE * WB_MidNumLetterQ = makeAlt({WB_MidLetter, WB_MidNumLet});
-    RE * WBX_6 = makeSeq({WB_MidNumLetterQ, makeRep(WB_4, 0, Rep::UNBOUNDED_REP), WB_ALetter});
+    RE * WB_SingleQuote = makePropertyExpression("wb", "single_quote");
+    RE * WB_MidNumLetQ = makeAlt({WB_MidNumLet, WB_SingleQuote});
+    RE * MidLetter_MidNumLetQ = makeAlt({WB_MidLetter, WB_MidNumLetQ});
+    RE * WBX_6 = makeSeq({Behind(WB_AHLetter), Ahead(makeSeq({MidLetter_MidNumLetQ, WB_AHLetter}))});
     
     // WB7: AHLetter (MidLetter | MidNumLetQ) × AHLetter
     RE * WBX_7 = makeSeq({
-           Behind(makeSeq({WB_ALetter, makeRep(WB_4, 0, Rep::UNBOUNDED_REP), WB_MidNumLetterQ})),
-           Ahead(WB_ALetter)
+        Behind(makeSeq({WB_AHLetter, MidLetter_MidNumLetQ})),
+           Ahead(WB_AHLetter)
        });
     // WB7a: Hebrew_Letter    ×    Single_Quote
-    RE * WB_HebrewLetter = makePropertyExpression("wb", "hebrew_letter");
-    RE * WB_SingleQuote = makePropertyExpression("wb", "single_quote");
-    RE * WB_7a = makeSeq({Behind(WB_SingleQuote), Ahead(WB_HebrewLetter    )});
+    RE * WB_7a = makeSeq({Behind(WB_HebrewLetter), Ahead(WB_SingleQuote)});
     
     // WB7b: Hebrew_Letter    ×    Double_Quote Hebrew_Letter
     RE * WB_DoubleQuote = makePropertyExpression("wb", "double_quote");
-    RE * WB_7b = makeSeq({Behind(WB_DoubleQuote), Ahead(WB_HebrewLetter)});
+    RE * WB_7b = makeSeq({Behind(WB_HebrewLetter), Ahead(makeSeq({WB_DoubleQuote, WB_HebrewLetter}))});
     
     // WB7c: Hebrew_Letter Double_Quote    ×    Hebrew_Letter
-    RE * WB_7c = makeSeq({Behind(WB_HebrewLetter), Ahead(WB_DoubleQuote)});
+    RE * WB_7c = makeSeq({Behind(makeSeq({WB_HebrewLetter, WB_DoubleQuote})), Ahead(WB_HebrewLetter)});
 
     
     // WB8: Do not break within sequences of digits, or digits adjacent to letters
@@ -337,15 +344,20 @@ RE * generateWordBoundaryRule() {
     RE * WBX_8 = makeSeq({Behind(WB_Numeric), Ahead(WB_Numeric)});
     
     // WB9: AHLetter × Numeric
-    RE * WBX_9 = makeSeq({Behind(WB_ALetter), Ahead(WB_Numeric)});
+    RE * WBX_9 = makeSeq({Behind(WB_AHLetter), Ahead(WB_Numeric)});
     
     // WB10: Numeric × AHLetter
-    RE * WBX_10 = makeSeq({Behind(WB_Numeric), Ahead(WB_Numeric)});
+    RE * WBX_10 = makeSeq({Behind(WB_Numeric), Ahead(WB_AHLetter)});
     
+    // am not using WB_midNumLetQ ?
     // WB11: Do not break within NUMERIC sequences
-    RE * WB_midNum = makePropertyExpression("wb", "midnum");
-    RE * WB_midNumQ = makeAlt({WB_midNum, WB_MidNumLet});
-    RE * WBX_11 = makeSeq({Behind(WB_midNumQ), Ahead(WB_Numeric)});
+    // Numeric (MidNum | MidNumLetQ)    ×    Numeric
+    RE * WB_MidNum = makePropertyExpression("wb", "midnum");
+    RE * MidNum_MidNumLetQ = makeAlt({WB_MidNum, WB_MidNumLetQ});
+    RE * WBX_11 = makeSeq({Behind(makeSeq({WB_Numeric, MidNum_MidNumLetQ})), Ahead(WB_Numeric)});
+    
+    // WB12: Numeric    ×    (MidNum | MidNumLetQ) Numeric --?
+    RE * WBX_12 = makeSeq({Behind(WB_Numeric), Ahead(makeSeq({MidNum_MidNumLetQ, WB_Numeric}))});
 
     // WB13:Do not break between Katakana
     RE * WB_Katakana = makePropertyExpression("wb", "katakana");
@@ -353,11 +365,11 @@ RE * generateWordBoundaryRule() {
     
     // WB13a: (AHLetter | Numeric | Katakana | ExtendNumLet) × ExtendNumLet , Do not break from extenders.
     RE * WB_ExtendNumLet = makePropertyExpression("wb", "extendnumlet");
-    RE * WB_ALetNumKat = makeAlt({WB_ALetter, WB_Numeric, WB_Katakana, WB_ExtendNumLet});
+    RE * WB_ALetNumKat = makeAlt({WB_AHLetter, WB_Numeric, WB_Katakana, WB_ExtendNumLet});
     RE * WBX_13a = makeSeq({Behind(WB_ALetNumKat), Ahead(WB_ExtendNumLet)});
     
     // WB13b:Do not break from extenders.
-    RE * WB_ALetNumKat_1 = makeAlt({WB_ALetter, WB_Numeric, WB_Katakana});
+    RE * WB_ALetNumKat_1 = makeAlt({WB_AHLetter, WB_Numeric, WB_Katakana});
     RE * WBX_13b = makeSeq({Behind(WB_ExtendNumLet), Ahead(WB_ALetNumKat_1)});
     
     // WB15/16: Do not break within emoji flag sequences, do not break between regional indicator (RI)
@@ -371,7 +383,7 @@ RE * generateWordBoundaryRule() {
     RE * WB_all = makeAlt({WB_1, WB_2, WBX_3, WB_3a, WB_3b, WB_4});
     
     // Combine the "do not break" rules (just WB_3 for now)
-    RE * WBX_all = makeAlt({WBX_3, WBX_3c, WBX_3d, WBX_5,WBX_6,WBX_7, WB_7a, WB_7b, WB_7c, WBX_8, WBX_9, WBX_10, WBX_11, WBX_13, WBX_13a, WBX_13b, WBX_15_16});
+    RE * WBX_all = makeAlt({WBX_3, WBX_3c, WBX_3d, WBX_5,/*WBX_6,*/WBX_7, WB_7a, /*WB_7b,*/ WB_7c, WBX_8, WBX_9, WBX_10, WBX_11, /*WBX_12,*/ WBX_13, WBX_13a, WBX_13b, WBX_15_16});
     
     // WB999: Break everywhere else.
     RE * WB_999 = makeSeq({Behind(makeAny()), Ahead(makeAny())});

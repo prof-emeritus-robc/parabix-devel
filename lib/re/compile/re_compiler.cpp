@@ -320,6 +320,7 @@ Marker RE_Block_Compiler::compileAssertion(Assertion * const a, Marker marker) {
         }
         return Marker(mPB.createAnd(marker.stream(), la, "lookahead"), marker.offset());
     }
+    // offset = 0 (match is last char), offset = 1 (right after the match)
     Marker lookahead = compile(asserted);
     if (LLVM_LIKELY((lengths.second == 1) && (lookahead.offset() == 0))) {
         Marker lookahead = compile(asserted);

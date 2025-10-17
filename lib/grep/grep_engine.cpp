@@ -152,6 +152,7 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mGrepDriver(driver),
     mMainMethod(nullptr),
     mBatchSize(FileBatchSegments * codegen::SegmentSize),
+    //mBatchSize(10 * 1024 * 1024),
     mBatchMethod(nullptr),
     mNextFileToGrep(0),
     mNextFileToPrint(0),
@@ -290,7 +291,7 @@ void GrepEngine::initRE(re::RE * re) {
 
     mRefInfo = re::buildReferenceInfo(mRE);
     if (!mRefInfo.twixtREs.empty()) {
-        UnicodeIndexing = true;
+        UnicodeIndexing = true;  // when regular expression is complevated like for grapheme cluster like capture
         auto indexCode = mExternalTable.getStreamIndex(cc::Unicode.getCode());
         setComponent(mExternalComponents, Component::S2P);
         re::FixedReferenceTransformer FRT(mRefInfo);
@@ -354,7 +355,7 @@ void GrepEngine::initRE(re::RE * re) {
         if (!mExternalTable.isDeclared(Unicode, "basis")) {
             const auto UnicodeSets = re::collectCCs(mRE, *mIndexAlphabet);
             if (!UnicodeSets.empty()) {
-                auto mpx = makeMultiplexedAlphabet("mpx", UnicodeSets);
+                auto mpx = makeMultiplexedAlphabet("mpx", UnicodeSets);   
                 mRE = transformCCs(mpx, mRE, re::NameTransformationMode::None);
                 mExternalTable.declareExternal(Unicode, mpx->getName() + "_basis", new MultiplexedExternal(mpx));
             }

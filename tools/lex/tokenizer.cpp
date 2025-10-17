@@ -39,7 +39,8 @@
 #include <vector>
 #include <map>
 #include <grep/regex_passes.h>
-#include <re/compile/re_compiler.h>
+
+
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <re/unicode/boundaries.h>
 #include <re/analysis/collect_ccs.h>
@@ -79,6 +80,9 @@ protected:
         // insertMask has 0 bits where we want to insert LF, 1s elsewhere
         PabloAST * insert = getInputStreamSet("insertMask")[0];
         std::vector<PabloAST *> basis = getInputStreamSet("spreadBasis");
+        
+        // UTF-8 boundary
+        //PabloAST * u8First = pb.createAdvance(u8index, 1);
 
         // Copy the spread basis bits
         std::vector<PabloAST *> out(basis.size());
@@ -99,6 +103,31 @@ protected:
         writeOutputStreamSet("finalBasis", out);
     }
 };
+
+
+// AND kernel to ensure boundaries only occur at UTF-8 character starts
+class AndKernel : public PabloKernel {
+public:
+    AndKernel(LLVMTypeSystemInterface & ts,
+              StreamSet * input1,  // WordBoundaries
+              StreamSet * input2, // u8index
+              StreamSet * output)
+    : PabloKernel(ts, "andKernel",
+                  {Binding{"input1", input1}, Binding{"input2", input2}},
+                  {Binding{"output", output}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * stream1 = getInputStreamSet("input1")[0];
+        PabloAST * u8index = getInputStreamSet("input2")[0];
+        PabloAST * u8First = pb.createNot(pb.createAdvance(pb.createNot(u8index), 1));
+        PabloAST * result = pb.createAnd(stream1, u8First);
+        writeOutputStreamSet("output", std::vector<PabloAST*>{result});
+    }
+};
+
+
 
 // Debug macros for visualization
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
@@ -144,10 +173,14 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
     SHOW_STREAM(WordBoundaries);
     
-    // Use WordBoundaries as TokenBoundaries
-    StreamSet * TokenBoundaries = WordBoundaries;
+    // Using WordBoundaries as TokenBoundaries
+    //StreamSet * TokenBoundaries = WordBoundaries;
     
-   
+    // UTF-8
+    StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<AndKernel>(WordBoundaries, u8index, TokenBoundaries);
+    SHOW_STREAM(TokenBoundaries);
+    
     // Create insertion mask and spread original data
     StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TokenBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);

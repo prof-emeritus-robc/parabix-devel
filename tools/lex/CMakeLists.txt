@@ -2,12 +2,19 @@
 #  SPDX-License-Identifier: OSL-3.0
 
 # module: lex
+# Find ICU components for locale-aware word boundaries
+# tells CMake to locate ICU on your system
+# COMPONENTS uc i18n - specifies we need:
+# uc = Unicode common library (basic Unicode functions)
+# i18n = Internationalization library (includes BreakIterator)
+find_package(ICU REQUIRED COMPONENTS uc i18n)
 
 parabix_add_executable(
 NAME
     tokenizer
 SRC
     tokenizer.cpp
+    ICU_Boundaries.cpp
 DEPS
     pablo
     kernel.basis
@@ -21,3 +28,8 @@ DEPS
     re.cc
     re.parse
 )
+
+# Link ICU libraries to tokenizer
+# Link the required ICU components to the tokenizer executable
+target_link_libraries(tokenizer PRIVATE ICU::uc ICU::i18n)
+target_include_directories(tokenizer PRIVATE ${ICU_INCLUDE_DIRS})

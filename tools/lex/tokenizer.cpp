@@ -48,6 +48,9 @@
 #include <re/transforms/re_multiplex.h>
 #include <kernel/unicode/charclasses.h>
 
+// ICU boundary provider
+#include "ICU_Boundaries.h"
+
 namespace fs = boost::filesystem;
 
 using namespace llvm;
@@ -58,6 +61,12 @@ using namespace re;
 
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(wordBreakerFlags));
+
+// ICU locale for word boundaries
+static cl::opt<std::string> Locale("locale",
+    cl::desc("ICU locale for word boundaries (e.g., en_US, fr_FR, ja_JP). Empty = default UAX#29"),
+    cl::init(""),
+    cl::cat(wordBreakerFlags));
 
 // proper Unicode word boundary rules (WB1, WB2, WB3) implemented in 
 // generateWordBoundaryRule() function.
@@ -156,21 +165,29 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
     
     // Unicode Word Boundary Rules
-    StreamSet * WordBoundaries = P.CreateStreamSet(1, 1);
-    re::RE * wordBoundaryRule = re::generateWordBoundaryRule();
-    const auto WB_Sets = re::collectCCs(wordBoundaryRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-    auto WB_mpx = cc::makeMultiplexedAlphabet("WB_mpx", WB_Sets);
-    wordBoundaryRule = transformCCs(WB_mpx, wordBoundaryRule, re::NameTransformationMode::TransformDefinition);
-    auto WB_basis = WB_mpx->getMultiplexedCCs();
-    StreamSet * const WB_Classes = P.CreateStreamSet(WB_basis.size());
-    P.CreateKernelFamilyCall<CharClassesKernel>(WB_basis, BasisBits, WB_Classes);
-    auto options = std::make_unique<GrepKernelOptions>();
-    options->setIndexing(u8index);
-    options->setRE(wordBoundaryRule);
-    options->addAlphabet(WB_mpx, WB_Classes);
-    options->setResults(WordBoundaries);
-    options->addExternal("UTF8_index", u8index);
-    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+    StreamSet * WordBoundaries = nullptr;
+    
+    if (!Locale.empty()) {
+        // Use ICU locale-aware word boundaries
+        WordBoundaries = buildWordBoundaryMaskFromICU(P, BasisBits, u8index, Locale);
+    } else {
+        // Use default UAX#29 word boundaries
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        re::RE * wordBoundaryRule = re::generateWordBoundaryRule();
+        const auto WB_Sets = re::collectCCs(wordBoundaryRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+        auto WB_mpx = cc::makeMultiplexedAlphabet("WB_mpx", WB_Sets);
+        wordBoundaryRule = transformCCs(WB_mpx, wordBoundaryRule, re::NameTransformationMode::TransformDefinition);
+        auto WB_basis = WB_mpx->getMultiplexedCCs();
+        StreamSet * const WB_Classes = P.CreateStreamSet(WB_basis.size());
+        P.CreateKernelFamilyCall<CharClassesKernel>(WB_basis, BasisBits, WB_Classes);
+        auto options = std::make_unique<GrepKernelOptions>();
+        options->setIndexing(u8index);
+        options->setRE(wordBoundaryRule);
+        options->addAlphabet(WB_mpx, WB_Classes);
+        options->setResults(WordBoundaries);
+        options->addExternal("UTF8_index", u8index);
+        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+    }
     SHOW_STREAM(WordBoundaries);
     
     // Using WordBoundaries as TokenBoundaries

@@ -63,6 +63,8 @@ static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breake
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(wordBreakerFlags));
 
 // ICU locale for word boundaries
+// the tokenizer will use this locale to build word boundaries, tokenizer callls buildWordBoundaryMaskFromICU 
+// when we selecet a locale other than the default
 static cl::opt<std::string> Locale("locale",
     cl::desc("ICU locale for word boundaries (e.g., en_US, fr_FR, ja_JP). Empty = default UAX#29"),
     cl::init(""),

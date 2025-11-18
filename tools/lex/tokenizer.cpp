@@ -138,8 +138,6 @@ protected:
     }
 };
 
-
-
 // Debug macros for visualization
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)

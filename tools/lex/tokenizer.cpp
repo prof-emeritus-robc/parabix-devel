@@ -70,6 +70,13 @@ static cl::opt<std::string> Locale("locale",
     cl::init(""),
     cl::cat(wordBreakerFlags));
 
+// Pre-tokenizer selection: uax29 (default Unicode word boundaries), icu (ICU BreakIterator),
+// whitespace (split on whitespace), bytelevel, punctuation, metaspace, etc.
+static cl::opt<std::string> PreTokenizer("pretokenizer",
+    cl::desc("Pre-tokenizer to use: uax29|icu|whitespace|bytelevel|punctuation|metaspace"),
+    cl::init("uax29"),
+    cl::cat(wordBreakerFlags));
+
 // proper Unicode word boundary rules (WB1, WB2, WB3) implemented in 
 // generateWordBoundaryRule() function.
 
@@ -167,7 +174,10 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Unicode Word Boundary Rules
     StreamSet * WordBoundaries = nullptr;
     
-    if (!Locale.empty()) {
+    (void)PreTokenizer; // PreTokenizer variable used later; silence unused-warning if any
+    (void)Locale;
+
+    if (PreTokenizer == "icu" || !Locale.empty()) {
         // Use ICU locale-aware word boundaries
         WordBoundaries = buildWordBoundaryMaskFromICU(P, BasisBits, u8index, Locale);
     } else {

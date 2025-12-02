@@ -2,6 +2,7 @@
 
 #include <re/adt/adt.h>
 #include <re/adt/re_name.h>
+    #include <re/parse/parser.h>
 #include <re/printer/re_printer.h>
 #include <re/analysis/validation.h>
 #include <re/transforms/re_transformer.h>
@@ -459,4 +460,30 @@ RE * resolveBoundaryProperties(RE * r) {
     return UCD::linkProperties(BoundaryPropertyResolver().transformRE(r));
 }
 
+// GPT-2 r50k pretokenizer pattern (fast equivalent of the original):
+// r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s"""
+RE * generateGPT2R50KRule() {
+    static const std::string pat = R"GPT('(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s)GPT";
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse GPT-2 r50k pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    
+    return r;
 }
+// Whitespace boundary rule for pretokenizer
+RE * generateWhitespaceBoundaryRule() {
+    static const std::string pat = R"(\w+|[^\w\s]+)";
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse Whitespace pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;
+}
+}
+
+

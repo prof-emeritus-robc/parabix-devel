@@ -557,6 +557,9 @@ void GraphemeClusterLogic(PipelineBuilder & P,
 void WordBoundaryLogic(PipelineBuilder & P,
                           StreamSet * Source, StreamSet * U8index, StreamSet * wordBoundary_stream);
 
+void WhitespaceBoundaryLogic(PipelineBuilder & P,
+                              StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_stream);
+
 //  The LongestMatchMarks kernel computes longest-match spans in start-end space.
 //  Logically, the input is a set of 2 streams marking, respectively, matches
 //  of a necessary prefix of the RE, and matches to the full RE.   However,

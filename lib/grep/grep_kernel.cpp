@@ -320,7 +320,7 @@ void MultiplexedExternal::resolveStreamSet(PipelineBuilder & b, std::vector<Stre
 const std::vector<std::string> GraphemeClusterBreak::getParameters() {
     return std::vector<std::string>{"UCD:" + getPropertyFullName(UCD::GCB) + "_basis", "Extended_Pictographic"};
 }
-
+// expernalize properties for gpt2?
 void GraphemeClusterBreak::resolveStreamSet(PipelineBuilder & b, std::vector<StreamSet *> inputs) {
     StreamSet * GCBstream = b.CreateStreamSet(1);
     re::RE * GCB_RE = re::generateGraphemeClusterBoundaryRule();
@@ -961,7 +961,7 @@ void kernel::GraphemeClusterLogic(PipelineBuilder & P, StreamSet * Source, Strea
     options->addExternal("UTF8_index", U8index);
     P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
 }
-
+// do this for the gpt2 ?
 void kernel::WordBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * wordBoundary_stream) {
     re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
     wordProp = UCD::linkAndResolve(wordProp);
@@ -970,6 +970,17 @@ void kernel::WordBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSe
     StreamSet * WordStream = P.CreateStreamSet(1);
     P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, Source, WordStream);
     P.CreateKernelCall<BoundaryKernel>(WordStream, U8index, wordBoundary_stream);
+}
+// whitespace boundary logic(pretokenizer)
+
+void kernel::WhitespaceBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_stream) {
+    re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
+    whitespaceProp = UCD::linkAndResolve(whitespaceProp);
+    re::Name * whitespace = re::makeName("whitespace");
+    whitespace->setDefinition(whitespaceProp);
+    StreamSet * WhitespaceStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(whitespace, Source, WhitespaceStream);
+    P.CreateKernelCall<BoundaryKernel>(WhitespaceStream, U8index, whitespace_stream);
 }
 
 LongestMatchMarks::LongestMatchMarks(LLVMTypeSystemInterface & ts, StreamSet * start_ends, StreamSet * marks)
@@ -1095,3 +1106,5 @@ void MaskSelfTransitions::generatePabloMethod() {
     }
     pb.createAssign(pb.createExtract(getOutputStreamVar("mask"), pb.getInteger(0)), mask);
 }
+
+

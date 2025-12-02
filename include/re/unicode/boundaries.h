@@ -22,6 +22,13 @@ RE * generateGraphemeClusterBoundaryRule(bool extendedGraphemeClusters = true);
 // Word Boundary Rules         
 RE * generateWordBoundaryRule();
 
+// GPT-2 r50k pretokenizer regex (PCRE). Returns a parsed RE representing
+// the GPT-2 pretokenizer pattern used by Hugging Face's tokenizer.
+RE * generateGPT2R50KRule();
+
+// Whitespace Pre-Tokenizer Rule
+RE * generateWhitespaceBoundaryRule();
+
 RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj);
 
 RE * resolveBoundaryProperties(RE * r);

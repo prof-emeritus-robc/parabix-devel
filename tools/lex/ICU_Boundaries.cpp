@@ -31,7 +31,7 @@
 
 // C linkage for the runtime function. Expose this definition with C linkage
 // so generated LLVM IR can call it by name without C++ name mangling.
-extern "C" int32_t find_icu_word_boundaries(const uint8_t* utf8Text, int32_t utf8Length, const char* localeName, uint8_t* boundaryBits) {
+extern "C" size_t find_icu_word_boundaries(const uint8_t* utf8Text, int32_t utf8Length, const char* localeName, uint8_t* boundaryBits) {
     if (!utf8Text || utf8Length <= 0 || !boundaryBits) return 0;
     
     // return on invalid inputs
@@ -70,7 +70,7 @@ extern "C" int32_t find_icu_word_boundaries(const uint8_t* utf8Text, int32_t utf
 
     // Iterate boundaries. When operating on a UText backed by UTF-8,
     // the break positions are byte offsets into the UTF-8 buffer.
-        int32_t pos = ubrk_first(bi);
+        int32_t pos = ubrk_first(bi);  // pos is a byte offset (index) reported by ICU for a word boundary.
         while (pos != UBRK_DONE) { // iterate through all boundaries, there are no more boundaries
         int32_t rule = ubrk_getRuleStatus(bi); // get the rule status for this boundary(whether the break is a word boundary and its kind)
 
@@ -84,22 +84,20 @@ extern "C" int32_t find_icu_word_boundaries(const uint8_t* utf8Text, int32_t utf
               UBRK_WORD_KANA — boundary around Japanese kana sequences (hiragana/katakana)
               UBRK_WORD_IDEO — boundary involving ideographic characters (CJK Han)
             */
-
-            
     
         // Advance iterator exactly once per loop and save the next position.
-        int32_t next = ubrk_next(bi);
+        int32_t next = ubrk_next(bi);  
 
         // Mark the byte offset reported by ICU as a word boundary.
-        boundaryBits[pos] = 1;
+        boundaryBits[pos] = 1;   // Mark the byte offset as a boundary
         ++totalCount;
         pos = next;
     }
 
     // Cleanup
-#if defined(ICU_DEBUG)
+
     std::cerr << "ICU: total boundaries set in this call: " << totalCount << "\n";
-#endif
+
     ubrk_close(bi);
     utext_close(ut);
 

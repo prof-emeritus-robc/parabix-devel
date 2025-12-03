@@ -73,7 +73,7 @@ static cl::opt<std::string> Locale("locale",
 // Pre-tokenizer selection: uax29 (default Unicode word boundaries), icu (ICU BreakIterator),
 // whitespace (split on whitespace), bytelevel, punctuation, metaspace, etc.
 static cl::opt<std::string> PreTokenizer("pretokenizer",
-    cl::desc("Pre-tokenizer to use: icu|gpt2|whitespace|bytelevel|punctuation|metaspace"),
+    cl::desc("Pre-tokenizer to use: icu|gpt2|whitespace|whitespacesplit|digits|punctuation"),
     cl::init(""),
     cl::cat(wordBreakerFlags));
 
@@ -221,7 +221,64 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-    }/*else if(PreTokenizer == "byte-level"){
+    }
+    else if(PreTokenizer == "whitespacesplit"){
+        // Use WhitespaceSplit pre-tokenizer
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        re::RE * wssRule = re::generateWhitespaceSplitBoundaryRule();
+        const auto WSS_Sets = re::collectCCs(wssRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+        auto WSS_mpx = cc::makeMultiplexedAlphabet("WSS_mpx", WSS_Sets);
+        wssRule = transformCCs(WSS_mpx, wssRule, re::NameTransformationMode::TransformDefinition);
+        auto WSS_basis = WSS_mpx->getMultiplexedCCs();
+        StreamSet * const WSS_Classes = P.CreateStreamSet(WSS_basis.size());
+        P.CreateKernelFamilyCall<CharClassesKernel>(WSS_basis, BasisBits, WSS_Classes);
+        auto options = std::make_unique<GrepKernelOptions>();
+        options->setIndexing(u8index);
+        options->setRE(wssRule);
+        options->addAlphabet(WSS_mpx, WSS_Classes);
+        options->setResults(WordBoundaries);
+        options->addExternal("UTF8_index", u8index);
+        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+    }
+    else if (PreTokenizer == "punctuation"){
+    // Use punctuation pre-tokenizer
+    WordBoundaries = P.CreateStreamSet(1, 1);
+    re::RE * punctRule = re::generatePunctuationBoundaryRule();
+    const auto PC_Sets = re::collectCCs(punctRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+    auto PC_mpx = cc::makeMultiplexedAlphabet("PC_mpx", PC_Sets);
+    punctRule = transformCCs(PC_mpx, punctRule, re::NameTransformationMode::TransformDefinition);
+    auto PC_basis = PC_mpx->getMultiplexedCCs();
+    StreamSet * const PC_Classes = P.CreateStreamSet(PC_basis.size());
+    P.CreateKernelFamilyCall<CharClassesKernel>(PC_basis, BasisBits, PC_Classes);
+    auto options = std::make_unique<GrepKernelOptions>();
+    options->setIndexing(u8index);
+    options->setRE(punctRule);
+    options->addAlphabet(PC_mpx, PC_Classes);
+    options->setResults(WordBoundaries);
+    options->addExternal("UTF8_index", u8index);
+    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+
+   }
+   else if (PreTokenizer == "digits"){
+    // Use digits pre-tokenizer
+    WordBoundaries = P.CreateStreamSet(1, 1);
+    re::RE * digitsRule = re::generateDigitBoundaryRule();
+    const auto DG_Sets = re::collectCCs(digitsRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+    auto DG_mpx = cc::makeMultiplexedAlphabet("DG_mpx", DG_Sets);
+    digitsRule = transformCCs(DG_mpx, digitsRule, re::NameTransformationMode::TransformDefinition);
+    auto DG_basis = DG_mpx->getMultiplexedCCs();
+    StreamSet * const DG_Classes = P.CreateStreamSet(DG_basis.size());
+    P.CreateKernelFamilyCall<CharClassesKernel>(DG_basis, BasisBits, DG_Classes);
+    auto options = std::make_unique<GrepKernelOptions>();
+    options->setIndexing(u8index);
+    options->setRE(digitsRule);
+    options->addAlphabet(DG_mpx, DG_Classes);
+    options->setResults(WordBoundaries);
+    options->addExternal("UTF8_index", u8index);
+    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+    }
+    
+    /*else if(PreTokenizer == "byte-level"){
         // Use byte-level pre-tokenizer
         WordBoundaries = P.CreateStreamSet(1, 1);
         re::RE * byteRule = re::generateByteLevelRule();

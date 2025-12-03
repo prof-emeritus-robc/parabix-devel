@@ -556,11 +556,22 @@ void GraphemeClusterLogic(PipelineBuilder & P,
 
 void WordBoundaryLogic(PipelineBuilder & P,
                           StreamSet * Source, StreamSet * U8index, StreamSet * wordBoundary_stream);
-
+// white space boundary rule, pretokenizer implementation
 void WhitespaceBoundaryLogic(PipelineBuilder & P,
                               StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_stream);
-
-//  The LongestMatchMarks kernel computes longest-match spans in start-end space.
+// whitespacesplit logic, pretokenizer implementation
+void WhitespaceSplitLogic(PipelineBuilder & P,
+                              StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_split_stream);
+// punctuation boundary rule, pretokenizer implementation
+void PunctuationBoundaryLogic(PipelineBuilder & P,
+                              StreamSet * Source, StreamSet * U8index, StreamSet * punctuation_stream);
+// digits boundary rule, pretokenizer implementation
+void DigitBoundaryLogic(PipelineBuilder & P,
+                              StreamSet * Source, StreamSet * U8index, StreamSet * digit_stream);
+//DigitSplit logic, pretokenizer implementation
+void DigitSplitLogic(PipelineBuilder & P,
+                              StreamSet * Source, StreamSet * U8index, StreamSet * digit_split_stream);
+                              //  The LongestMatchMarks kernel computes longest-match spans in start-end space.
 //  Logically, the input is a set of 2 streams marking, respectively, matches
 //  of a necessary prefix of the RE, and matches to the full RE.   However,
 //  a single combined stream may be provided as the start-end stream when these

@@ -19,6 +19,10 @@ RE * resolveGraphemeMode(RE * re, bool inGraphemeMode);
 
 RE * generateGraphemeClusterBoundaryRule(bool extendedGraphemeClusters = true);
 
+RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj);
+
+RE * resolveBoundaryProperties(RE * r);
+
 // Word Boundary Rules         
 RE * generateWordBoundaryRule();
 
@@ -29,8 +33,13 @@ RE * generateGPT2R50KRule();
 // Whitespace Pre-Tokenizer Rule
 RE * generateWhitespaceBoundaryRule();
 
-RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj);
+// WhitespaceSplit Pre-Tokenizer Rule
+RE * generateWhitespaceSplitBoundaryRule();
 
-RE * resolveBoundaryProperties(RE * r);
+// Punctuation Pre-Tokenizer Rule
+RE * generatePunctuationBoundaryRule();
+
+// Digit Pre-Tokenizer Rule
+RE * generateDigitBoundaryRule();
 }
 

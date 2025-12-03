@@ -972,6 +972,7 @@ void kernel::WordBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSe
     P.CreateKernelCall<BoundaryKernel>(WordStream, U8index, wordBoundary_stream);
 }
 // whitespace boundary logic(pretokenizer)
+// do i have to use rthe boundary kernel here for all?
 
 void kernel::WhitespaceBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_stream) {
     re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
@@ -981,6 +982,36 @@ void kernel::WhitespaceBoundaryLogic(PipelineBuilder & P, StreamSet * Source, St
     StreamSet * WhitespaceStream = P.CreateStreamSet(1);
     P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(whitespace, Source, WhitespaceStream);
     P.CreateKernelCall<BoundaryKernel>(WhitespaceStream, U8index, whitespace_stream);
+}
+// whitespacesplit logic (pretokenizer)
+void kernel::WhitespaceSplitLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_split_stream) {
+    re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
+    whitespaceProp = UCD::linkAndResolve(whitespaceProp);
+    re::Name * whitespace = re::makeName("whitespace");
+    whitespace->setDefinition(whitespaceProp);
+    StreamSet * WhitespaceStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(whitespace, Source, WhitespaceStream);
+    P.CreateKernelCall<BoundaryKernel>(WhitespaceStream, U8index, whitespace_split_stream);
+}
+// punctuation boundary logic (pretokenizer)
+void kernel::PunctuationBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * punctuation_stream) {
+    re::RE * punctProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "punctuation");
+    punctProp = UCD::linkAndResolve(punctProp);
+    re::Name * punctuation = re::makeName("punctuation");
+    punctuation->setDefinition(punctProp);
+    StreamSet * PunctuationStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(punctuation, Source, PunctuationStream);
+    P.CreateKernelCall<BoundaryKernel>(PunctuationStream, U8index, punctuation_stream);
+}
+// digit boundary logic (pretokenizer)
+void kernel::DigitBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * digit_stream) {
+    re::RE * digitProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "digit");
+    digitProp = UCD::linkAndResolve(digitProp);
+    re::Name * digit = re::makeName("digit");
+    digit->setDefinition(digitProp);
+    StreamSet * DigitStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(digit, Source, DigitStream);
+    P.CreateKernelCall<BoundaryKernel>(DigitStream, U8index, digit_stream);
 }
 
 LongestMatchMarks::LongestMatchMarks(LLVMTypeSystemInterface & ts, StreamSet * start_ends, StreamSet * marks)

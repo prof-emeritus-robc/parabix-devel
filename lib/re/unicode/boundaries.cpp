@@ -473,9 +473,10 @@ RE * generateGPT2R50KRule() {
     
     return r;
 }
-// Whitespace boundary rule for pretokenizer
+// Whitespace pretokenizer boundary rule
 RE * generateWhitespaceBoundaryRule() {
     static const std::string pat = R"(\w+|[^\w\s]+)";
+    //static const std::string pat = R"(\S+)";   // \S+ = "one or more non-whitespace characters"
     RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
     if (!r) {
         llvm::errs() << "Error: failed to parse Whitespace pattern.\n";
@@ -484,6 +485,42 @@ RE * generateWhitespaceBoundaryRule() {
     r = UCD::linkAndResolve(r);
     return r;
 }
+
+// WhitespaceSplit pretokenizer boundary rule
+RE * generateWhitespaceSplitBoundaryRule() {
+    static const std::string pat = R"(\S+|\s+)";
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse WhitespaceSplit pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;
 }
 
-
+// punctuation pretokenizer boundary rule
+RE * generatePunctuationBoundaryRule() {
+    // Match: one or more punctuation characters
+    // Splits before and after punctuation
+    static const std::string pat = R"([[:punct:]]+)";
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse Punctuation pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;
+}
+// Digit pretokenizer boundary rule
+RE * generateDigitBoundaryRule() {
+    // Match: one or more digit characters
+    static const std::string pat = R"(\d+)";
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse Digit pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;           
+}
+}

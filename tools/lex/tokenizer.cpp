@@ -77,6 +77,12 @@ static cl::opt<std::string> PreTokenizer("pretokenizer",
     cl::init(""),
     cl::cat(wordBreakerFlags));
 
+// Split delimiter behavior: removed, isolated, mergedwithprevious, mergedwithnext, contiguous
+static cl::opt<std::string> SplitBehavior("behavior",
+    cl::desc("Split delimiter behavior: removed|isolated|mergedwithprevious|mergedwithnext|contiguous"),
+    cl::init("isolated"),
+    cl::cat(wordBreakerFlags));
+
 // proper Unicode word boundary rules (WB1, WB2, WB3) implemented in 
 // generateWordBoundaryRule() function.
 
@@ -145,6 +151,56 @@ protected:
     }
 };
 
+// add a class to implement SplitDelimiterBehavior in pretokenizers
+class BehaviorMaskTransformer : public PabloKernel {
+public:
+    enum Behavior { Removed, Isolated, MergedWithPrevious, MergedWithNext, Contiguous };
+    
+    BehaviorMaskTransformer(LLVMTypeSystemInterface & ts,
+                           StreamSet * boundaryMask,
+                           StreamSet * outputMask,
+                           Behavior behavior)
+    : PabloKernel(ts, "behaviorMaskTransformer",
+                  {Binding{"boundaryMask", boundaryMask}},
+                  {Binding{"outputMask", outputMask}}), 
+      mBehavior(behavior) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * boundaries = getInputStreamSet("boundaryMask")[0];
+        
+        PabloAST * result;
+        switch(mBehavior) {
+            case Removed:
+                // Mark boundaries for removal
+                result = boundaries;
+                break;
+            case Isolated:
+                // Keep boundaries as-is (separate tokens)
+                result = boundaries;
+                break;
+            case MergedWithPrevious:
+                // Shift boundaries one position forward
+                result = pb.createAdvance(boundaries, 1);
+                break;
+            case MergedWithNext:
+                // Shift boundaries one position backward
+                result = pb.createAdvance(boundaries, -1);
+                break;
+            case Contiguous:
+                // Group consecutive boundaries
+                result = boundaries;
+                break;
+        }
+        
+        writeOutputStreamSet("outputMask", std::vector<PabloAST*>{result});
+    }
+
+private:
+    Behavior mBehavior;
+};
+
 // Debug macros for visualization
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -181,6 +237,8 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         // Use ICU locale-aware word boundaries
         WordBoundaries = buildWordBoundaryMaskFromICU(P, BasisBits, u8index, Locale);
 
+        SHOW_STREAM(WordBoundaries);
+
     }else if (PreTokenizer == "gpt2") {
         // Use GPT-2 r50k regex pretokenizer (centralized in boundaries.cpp)
         WordBoundaries = P.CreateStreamSet(1, 1);
@@ -203,7 +261,10 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
 
+        SHOW_STREAM(WordBoundaries);
     }
+    //Input: "Hello there!"
+    //Output: "Hello", "there", "!"   
     else if (PreTokenizer == "whitespace"){
         // Use whitespace pre-tokenizer
         WordBoundaries = P.CreateStreamSet(1, 1);
@@ -221,7 +282,11 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+
+        SHOW_STREAM(WordBoundaries);
     }
+    //Input: "Hello there!"
+    //Output: "Hello", "there!"
     else if(PreTokenizer == "whitespacesplit"){
         // Use WhitespaceSplit pre-tokenizer
         WordBoundaries = P.CreateStreamSet(1, 1);
@@ -239,6 +304,8 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+
+        SHOW_STREAM(WordBoundaries);
     }
     else if (PreTokenizer == "punctuation"){
     // Use punctuation pre-tokenizer
@@ -258,6 +325,8 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     options->addExternal("UTF8_index", u8index);
     P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
 
+    SHOW_STREAM(WordBoundaries);
+
    }
    else if (PreTokenizer == "digits"){
     // Use digits pre-tokenizer
@@ -276,6 +345,9 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     options->setResults(WordBoundaries);
     options->addExternal("UTF8_index", u8index);
     P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+
+    SHOW_STREAM(WordBoundaries);
+
     }
     
     /*else if(PreTokenizer == "byte-level"){
@@ -352,8 +424,9 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+
+        SHOW_STREAM(WordBoundaries);
     }
-    SHOW_STREAM(WordBoundaries);
     
     // Using WordBoundaries as TokenBoundaries
     //StreamSet * TokenBoundaries = WordBoundaries;
@@ -389,7 +462,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&wordBreakerFlags, pablo::pablo_toolchain_flags(), codegen::codegen_flags()});
+    codegen::ParseCommandLineOptions(argc, argv, {&wordBreakerFlags, pablo::pablo_toolchain_flags(), codegen::codegen_flags()});  //command line options 
     CPUDriver driver("unicode_word_tokenizer");
 
     WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);

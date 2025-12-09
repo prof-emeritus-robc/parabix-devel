@@ -475,7 +475,7 @@ RE * generateGPT2R50KRule() {
 }
 // Whitespace pretokenizer boundary rule
 RE * generateWhitespaceBoundaryRule() {
-    static const std::string pat = R"(\w+|[^\w\s]+)";
+    static const std::string pat = R"(\w++|[^\w\s]++)";  //\w+|[^\w\s]+
     //static const std::string pat = R"(\S+)";   // \S+ = "one or more non-whitespace characters"
     RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
     if (!r) {
@@ -488,7 +488,12 @@ RE * generateWhitespaceBoundaryRule() {
 
 // WhitespaceSplit pretokenizer boundary rule
 RE * generateWhitespaceSplitBoundaryRule() {
-    static const std::string pat = R"(\S+|\s+)";
+    //static const std::string pat = R"\w+[^\s]*(?!\S)|\s+(?!\s)";
+    //static const std::string pat = R"(\S+|\s+)";
+    static const std::string pat = R"(\s++)";
+    //static const std::string pat = R"(\S+(?!\S)|\s+(?!\s))";
+    
+
     RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
     if (!r) {
         llvm::errs() << "Error: failed to parse WhitespaceSplit pattern.\n";
@@ -502,7 +507,11 @@ RE * generateWhitespaceSplitBoundaryRule() {
 RE * generatePunctuationBoundaryRule() {
     // Match: one or more punctuation characters
     // Splits before and after punctuation
-    static const std::string pat = R"([[:punct:]]+)";
+    //static const std::string pat = R"([[:punct:]]+)";
+    static const std::string pat = R"([[:punct:]]|[^[:punct:]]++)";
+    //static const std::string pat = R"([[:punct:]]+(?![[:punct:]])|[^[:punct:]\s]+|\s+(?!\s))";
+    //static const std::string pat = R"([[:punct:]]+(?![[:punct:]]))";
+    
     RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
     if (!r) {
         llvm::errs() << "Error: failed to parse Punctuation pattern.\n";
@@ -514,7 +523,11 @@ RE * generatePunctuationBoundaryRule() {
 // Digit pretokenizer boundary rule
 RE * generateDigitBoundaryRule() {
     // Match: one or more digit characters
-    static const std::string pat = R"(\d+)";
+    //static const std::string pat = R"(\d+(?!\d)|[^\d\s]+)";
+    //static const std::string pat = R"((?<!\d)\d+(?!\d))"; 
+    //static const std::string pat = R"(\d+(?!\d)|[^\d\s]+|\s+(?!\s))";
+    static const std::string pat = R"(\d++|[^\d\s]++|\s++)";
+
     RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
     if (!r) {
         llvm::errs() << "Error: failed to parse Digit pattern.\n";

@@ -108,7 +108,7 @@ extern "C" size_t find_icu_word_boundaries(const uint8_t* utf8Text, int32_t utf8
 
 #ifndef ICU_BOUNDARIES_TEST_MAIN
 #include <kernel/core/kernel_builder.h>
-#include <kernel/basis/p2s_kernel.h>
+#include <kernel/basis/p2s_kernel.h> 
 #include <kernel/pipeline/program_builder.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/IR/Module.h>

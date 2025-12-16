@@ -80,7 +80,7 @@ static cl::opt<std::string> PreTokenizer("pretokenizer",
 // Split delimiter behavior: removed, isolated, mergedwithprevious, mergedwithnext, contiguous
 static cl::opt<std::string> SplitBehavior("behavior",
     cl::desc("Split delimiter behavior: removed|isolated|mergedwithprevious|mergedwithnext|contiguous"),
-    cl::init("isolated"),
+    cl::init(""),
     cl::cat(wordBreakerFlags));
 
 // proper Unicode word boundary rules (WB1, WB2, WB3) implemented in 
@@ -105,9 +105,6 @@ protected:
         PabloAST * insert = getInputStreamSet("insertMask")[0];
         std::vector<PabloAST *> basis = getInputStreamSet("spreadBasis");
         
-        // UTF-8 boundary
-        //PabloAST * u8First = pb.createAdvance(u8index, 1);
-
         // Copy the spread basis bits
         std::vector<PabloAST *> out(basis.size());
         for (unsigned i = 0; i < basis.size(); ++i) {
@@ -150,55 +147,197 @@ protected:
         writeOutputStreamSet("output", std::vector<PabloAST*>{result});
     }
 };
-
-// add a class to implement SplitDelimiterBehavior in pretokenizers
-class BehaviorMaskTransformer : public PabloKernel {
+// Alphanueric detector: marks positions of ASCII alphanumeric characters
+class AlphanumericDetector : public PabloKernel {
 public:
-    enum Behavior { Removed, Isolated, MergedWithPrevious, MergedWithNext, Contiguous };
-    
-    BehaviorMaskTransformer(LLVMTypeSystemInterface & ts,
-                           StreamSet * boundaryMask,
-                           StreamSet * outputMask,
-                           Behavior behavior)
-    : PabloKernel(ts, "behaviorMaskTransformer",
-                  {Binding{"boundaryMask", boundaryMask}},
-                  {Binding{"outputMask", outputMask}}), 
-      mBehavior(behavior) {}
+    AlphanumericDetector(LLVMTypeSystemInterface & ts,
+                       StreamSet * BasisBits,
+                       StreamSet * AlphanumericMask)
+    : PabloKernel(ts, "alphanumericDetector",
+                  {Binding{"BasisBits", BasisBits}},
+                  {Binding{"AlphanumericMask", AlphanumericMask}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("BasisBits"); 
+
+        // Letters A-Z and a-z have bit 6 set (bit[6]=1) and bit 7 clear (bit[7]=0)
+        // (01xxxxxx range: 0x40-0x7F, but we want 0x41-0x5A and 0x61-0x7A)
+        PabloAST * isLetter = pb.createAnd(basis[6], pb.createNot(basis[7]));
+        
+        // Digits 0-9 are 0x30-0x39 (00111xxx)
+        // Bit 7,6 must be clear (00xxxxxx), bits 5,4 must be set (xx11xxxx)
+        PabloAST * isDigit = pb.createAnd(
+            pb.createNot(basis[7]),
+            pb.createAnd(pb.createNot(basis[6]), 
+                        pb.createAnd(basis[5], basis[4]))
+        );
+        
+        // Result: letters OR digits
+        PabloAST * result = pb.createOr(isLetter, isDigit);
+        
+        writeOutputStreamSet("AlphanumericMask", std::vector<PabloAST*>{result});
+    }
+};
+
+// Detect whitespace/delimiter positions (ASCII space 0x20 = 00100000)
+class WhitespaceDetector : public PabloKernel {
+public:
+    WhitespaceDetector(LLVMTypeSystemInterface & ts,
+                       StreamSet * BasisBits,
+                       StreamSet * WhitespaceMask)
+    : PabloKernel(ts, "whitespaceDetector",
+                  {Binding{"BasisBits", BasisBits}},
+                  {Binding{"WhitespaceMask", WhitespaceMask}}) {}
 
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        PabloAST * boundaries = getInputStreamSet("boundaryMask")[0];
+        std::vector<PabloAST *> basis = getInputStreamSet("BasisBits");
         
-        PabloAST * result;
-        switch(mBehavior) {
-            case Removed:
-                // Mark boundaries for removal
-                result = boundaries;
-                break;
-            case Isolated:
-                // Keep boundaries as-is (separate tokens)
-                result = boundaries;
-                break;
-            case MergedWithPrevious:
-                // Shift boundaries one position forward
-                result = pb.createAdvance(boundaries, 1);
-                break;
-            case MergedWithNext:
-                // Shift boundaries one position backward
-                result = pb.createAdvance(boundaries, -1);
-                break;
-            case Contiguous:
-                // Group consecutive boundaries
-                result = boundaries;
-                break;
+        // ASCII space is 0x20 = 00100000 (bit 5 set, all others clear) ? unicdoe space?
+        PabloAST * isSpace = basis[5];
+        for (unsigned i = 0; i < basis.size(); ++i) {
+            if (i == 5) continue;
+            isSpace = pb.createAnd(isSpace, pb.createNot(basis[i]));
         }
-        
-        writeOutputStreamSet("outputMask", std::vector<PabloAST*>{result});
+        // WhitespaceMask is a binary stream that marks every position in the input 
+        //where an ASCII space character (0x20) occurs.
+        writeOutputStreamSet("WhitespaceMask", std::vector<PabloAST*>{isSpace});
     }
+};
 
-private:
-    Behavior mBehavior;
+// Behavior mode 1: Removed - only keep word/punctuation boundaries, exclude whitespace
+class RemovedBehavior : public PabloKernel {
+public:
+    RemovedBehavior(LLVMTypeSystemInterface & ts,
+                    StreamSet * TokenBoundaries,
+                    StreamSet * WhitespaceMask,
+                    StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "removedBehavior",
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"WhitespaceMask", WhitespaceMask}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
+        PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
+        
+        // For removed: keep boundaries at non-whitespace positions only
+        // This explicitly filters out any space positions
+        PabloAST * notSpace = pb.createNot(whitespace);
+        PabloAST * result = pb.createAnd(boundaries, notSpace);
+        
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
+    }
+};
+
+// Behavior mode 2: Isolated - keep token boundaries AND add space boundaries
+class IsolatedBehavior : public PabloKernel {
+public:
+    IsolatedBehavior(LLVMTypeSystemInterface & ts,
+                     StreamSet * TokenBoundaries,
+                     StreamSet * WhitespaceMask,
+                     StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "isolatedBehavior",
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"WhitespaceMask", WhitespaceMask}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
+        PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
+        
+        // Find start of whitespace runs (first space in consecutive spaces)
+        PabloAST * spaceStart = pb.createAnd(whitespace, pb.createNot(pb.createAdvance(whitespace, 1)));
+        
+        // Result = token boundaries OR space starts(space boundries, word/punctuation positions kept, spaces isolated)
+        PabloAST * result = pb.createOr(boundaries, spaceStart);
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
+    }
+};
+
+// Behavior mode 3: MergedWithPrevious - attach whitespace to previous word
+class MergedWithPreviousBehavior : public PabloKernel {
+public:
+    MergedWithPreviousBehavior(LLVMTypeSystemInterface & ts,
+                               StreamSet * TokenBoundaries,
+                               StreamSet * whitespaceMask,
+                               StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "mergedWithPreviousBehavior",
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"whitespaceMask", whitespaceMask}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
+        PabloAST * whitespace = getInputStreamSet("whitespaceMask")[0];
+        // Shift right by 1: moves boundaries to merge whitespace with previous token
+        //PabloAST * result = pb.createLookahead(boundaries, 1);
+        PabloAST * result = pb.createAnd(boundaries, pb.createNot(whitespace));
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
+    }
+};
+
+// Behavior mode 4: MergedWithNext - attach whitespace to next word
+class MergedWithNextBehavior : public PabloKernel {
+public:
+    MergedWithNextBehavior(LLVMTypeSystemInterface & ts,
+                           StreamSet * TokenBoundaries,
+                           StreamSet * whitespaceMask,
+                           StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "mergedWithNextBehavior",
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"whitespaceMask", whitespaceMask}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
+        PabloAST * whitespace = getInputStreamSet("whitespaceMask")[0];
+        
+        // Shift left by 1: moves boundaries to merge whitespace with next token
+        PabloAST * result = pb.createAnd(boundaries, pb.createNot(pb.createAdvance(whitespace, 1)));
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
+    }
+};
+
+// Behavior mode 5: Contiguous - keep punctuation with words, separate spaces
+class ContiguousBehavior : public PabloKernel {
+public:
+    ContiguousBehavior(LLVMTypeSystemInterface & ts,
+                       StreamSet * TokenBoundaries,
+                       StreamSet * WhitespaceMask,
+                       StreamSet * AlphanumericMask,
+                       StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "contiguousBehavior",
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"WhitespaceMask", WhitespaceMask, FixedRate(), LookAhead(1)}, Binding{"AlphanumericMask", AlphanumericMask, FixedRate(), LookAhead(1)}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
+        PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
+        PabloAST * alphanumeric = getInputStreamSet("AlphanumericMask")[0];
+        
+        // Detect punctuation: non-alphanumeric AND non-whitespace
+        PabloAST * notAlphanumeric = pb.createNot(pb.createLookahead(alphanumeric, 1));
+
+        PabloAST * notWhitespace = pb.createNot(pb.createLookahead(whitespace, 1));
+        PabloAST * isPunctuation = pb.createAnd(notAlphanumeric, notWhitespace);
+
+        // Detect punctuation that follows alphanumeric - these boundaries should be removed
+        PabloAST * punctAfterAlpha = pb.createAnd(isPunctuation, alphanumeric);
+        
+        // Filter out boundaries at punctuation positions following alphanumeric
+        PabloAST * filteredBoundaries = pb.createAnd(boundaries, pb.createNot(punctAfterAlpha));
+       
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{filteredBoundaries});
+    }
 };
 
 // Debug macros for visualization
@@ -349,64 +488,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     SHOW_STREAM(WordBoundaries);
 
     }
-    
-    /*else if(PreTokenizer == "byte-level"){
-        // Use byte-level pre-tokenizer
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * byteRule = re::generateByteLevelRule();
-        const auto BL_Sets = re::collectCCs(byteRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition
-    }else if (PreTokenizer == "punctuation"){
-        // Use punctuation pre-tokenizer
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * puncRule = re::generatePunctuationRule();
-        const auto PC_Sets = re::collectCCs(puncRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto PC_mpx = cc::makeMultiplexedAlphabet("PC_mpx", PC_Sets);
-        puncRule = transformCCs(PC_mpx, puncRule, re::NameTransformationMode::TransformDefinition);
-        auto PC_basis = PC_mpx->getMultiplexedCCs();
-        StreamSet * const PC_Classes = P.CreateStreamSet(PC_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(PC_basis, BasisBits, PC_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(puncRule);
-        options->addAlphabet(PC_mpx, PC_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-    }else if (PreTokenizer == "metaspace"){
-        // Use metaspace pre-tokenizer
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * msRule = re::generateMetaspaceRule();
-        const auto MS_Sets = re::collectCCs(msRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto MS_mpx = cc::makeMultiplexedAlphabet("MS_mpx", MS_Sets);
-        msRule = transformCCs(MS_mpx, msRule, re::NameTransformationMode::TransformDefinition);
-        auto MS_basis = MS_mpx->getMultiplexedCCs();
-        StreamSet * const MS_Classes = P.CreateStreamSet(MS_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(MS_basis, BasisBits, MS_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(msRule);
-        options->addAlphabet(MS_mpx, MS_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-    }else if (PreTokenizer == "punctuation"){
-        // use punctuation pre-tokenizer
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * puncRule = re::generatePunctuationRule();
-        const auto PC_Sets = re::collectCCs(puncRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto PC_mpx = cc::makeMultiplexedAlphabet("PC_mpx", PC_Sets);
-        puncRule = transformCCs(PC_mpx, puncRule, re::NameTransformationMode::TransformDefinition);
-        auto PC_basis = PC_mpx->getMultiplexedCCs();
-        StreamSet * const PC_Classes = P.CreateStreamSet(PC_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(PC_basis, BasisBits, PC_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(puncRule);
-        options->addAlphabet(PC_mpx, PC_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));  
-    }*/
     else {
         // Use default UAX#29 word boundaries
         WordBoundaries = P.CreateStreamSet(1, 1);
@@ -428,16 +509,43 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         SHOW_STREAM(WordBoundaries);
     }
     
-    // Using WordBoundaries as TokenBoundaries
-    //StreamSet * TokenBoundaries = WordBoundaries;
-    
-    // UTF-8
+    // UTF-8 - ensure boundaries only at UTF-8 character starts
     StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<AndKernel>(WordBoundaries, u8index, TokenBoundaries);
     SHOW_STREAM(TokenBoundaries);
+
+    // Detect whitespace/delimiter positions
+    StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<WhitespaceDetector>(BasisBits, WhitespaceMask);
+    SHOW_STREAM(WhitespaceMask);
+
+    // Detect alphanumeric positions (for contiguous behavior to keep punctuation with words)
+    StreamSet * AlphanumericMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<AlphanumericDetector>(BasisBits, AlphanumericMask);
+    SHOW_STREAM(AlphanumericMask);
+
+    // Apply behavior transformation using appropriate kernel
+    StreamSet * TransformedBoundaries = P.CreateStreamSet(1, 1);
     
+    if (SplitBehavior == "removed") {
+        P.CreateKernelCall<RemovedBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    } else if (SplitBehavior == "isolated") {
+        P.CreateKernelCall<IsolatedBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    } else if (SplitBehavior == "mergedwithprevious") {
+        P.CreateKernelCall<MergedWithPreviousBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    } else if (SplitBehavior == "mergedwithnext") {
+        P.CreateKernelCall<MergedWithNextBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    } else if (SplitBehavior == "contiguous") {
+        P.CreateKernelCall<ContiguousBehavior>(TokenBoundaries, WhitespaceMask, AlphanumericMask, TransformedBoundaries);
+    } else {
+        // Default to isolated if behavior not specified
+        P.CreateKernelCall<IsolatedBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    }
+    
+    SHOW_STREAM(TransformedBoundaries);
+
     // Create insertion mask and spread original data
-    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TokenBoundaries, kernel::InsertPosition::Before);
+    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TransformedBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
     
     StreamSet * spreadBasis = P.CreateStreamSet(8);

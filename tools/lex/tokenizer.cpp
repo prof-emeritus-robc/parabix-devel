@@ -39,14 +39,15 @@
 #include <vector>
 #include <map>
 #include <grep/regex_passes.h>
-
-
+#include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <re/unicode/boundaries.h>
 #include <re/analysis/collect_ccs.h>
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/re_multiplex.h>
 #include <kernel/unicode/charclasses.h>
+#include <kernel/streamutils/deletion.h>
+#include <kernel/unicode/utf8gen.h>
 
 // ICU boundary provider
 #include "ICU_Boundaries.h"
@@ -142,41 +143,48 @@ protected:
         PabloBuilder pb(getEntryScope());
         PabloAST * stream1 = getInputStreamSet("input1")[0];
         PabloAST * u8index = getInputStreamSet("input2")[0];
-        PabloAST * u8First = pb.createNot(pb.createAdvance(pb.createNot(u8index), 1));
-        PabloAST * result = pb.createAnd(stream1, u8First);
+        //PabloAST * u8First = pb.createNot(pb.createAdvance(pb.createNot(u8index), 1));
+        //PabloAST * notFirst = pb.createAdvance(pb.createOnes(), 1);
+        //PabloAST * notFirst = pb.createLookahead(pb.createOnes(), 1);
+        //u8index = pb.createAnd(u8index, notFirst);
+
+        PabloAST * result = pb.createAnd(stream1, u8index);
         writeOutputStreamSet("output", std::vector<PabloAST*>{result});
     }
 };
-// Alphanueric detector: marks positions of ASCII alphanumeric characters
-class AlphanumericDetector : public PabloKernel {
+// Unicode Alphanumeric Detection kernel using Unicode properties
+// Combinesf(L*), Mark (M*), and Number (N*) Unicode categories
+// to detect alphanumeric characters properly according to Unicode standard
+class UnicodeAlphanumericDetector : public PabloKernel {
 public:
-    AlphanumericDetector(LLVMTypeSystemInterface & ts,
-                       StreamSet * BasisBits,
-                       StreamSet * AlphanumericMask)
-    : PabloKernel(ts, "alphanumericDetector",
-                  {Binding{"BasisBits", BasisBits}},
+    UnicodeAlphanumericDetector(LLVMTypeSystemInterface & ts,
+                                StreamSet * BasisBits,
+                                StreamSet * AlphanumericMask,
+                                StreamSet * LetterStream,
+                                //StreamSet * MarkStream,
+                                StreamSet * NumberStream)
+    : PabloKernel(ts, "unicodeAlphanumericDetector",
+                  {Binding{"LetterStream", LetterStream}, 
+                   //Binding{"MarkStream", MarkStream}, 
+                   Binding{"NumberStream", NumberStream}},
                   {Binding{"AlphanumericMask", AlphanumericMask}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        std::vector<PabloAST *> basis = getInputStreamSet("BasisBits"); 
-
-        // Letters A-Z and a-z have bit 6 set (bit[6]=1) and bit 7 clear (bit[7]=0)
-        // (01xxxxxx range: 0x40-0x7F, but we want 0x41-0x5A and 0x61-0x7A)
-        PabloAST * isLetter = pb.createAnd(basis[6], pb.createNot(basis[7]));
         
-        // Digits 0-9 are 0x30-0x39 (00111xxx)
-        // Bit 7,6 must be clear (00xxxxxx), bits 5,4 must be set (xx11xxxx)
-        PabloAST * isDigit = pb.createAnd(
-            pb.createNot(basis[7]),
-            pb.createAnd(pb.createNot(basis[6]), 
-                        pb.createAnd(basis[5], basis[4]))
-        );
+        // Get the Unicode property streams for letters, marks, and numbers
+        PabloAST * letter = getInputStreamSet("LetterStream")[0];
+        //PabloAST * mark = getInputStreamSet("MarkStream")[0];
+        PabloAST * number = getInputStreamSet("NumberStream")[0];
         
-        // Result: letters OR digits
-        PabloAST * result = pb.createOr(isLetter, isDigit);
+        // Alphanumeric = Letter OR Number (excluding marks)
+        // L* categories include: Lu (Uppercase), Ll (Lowercase), Lt (Titlecase), 
+        //                        Lm (Modifier), Lo (Other Letter)
+        // N* categories include: Nd (Decimal Digit), Nl (Letter Number), No (Other Number)
+        //PabloAST * alphanumeric = pb.createOr(letter, pb.createOr(mark, number));
+        PabloAST * alphanumeric = pb.createOr(letter, number);
         
-        writeOutputStreamSet("AlphanumericMask", std::vector<PabloAST*>{result});
+        writeOutputStreamSet("AlphanumericMask", std::vector<PabloAST*>{alphanumeric});
     }
 };
 
@@ -186,7 +194,7 @@ public:
     WhitespaceDetector(LLVMTypeSystemInterface & ts,
                        StreamSet * BasisBits,
                        StreamSet * WhitespaceMask)
-    : PabloKernel(ts, "whitespaceDetector",
+    : PabloKernel(ts, "whitespaceDetector" + BasisBits -> shapeString(),
                   {Binding{"BasisBits", BasisBits}},
                   {Binding{"WhitespaceMask", WhitespaceMask}}) {}
 
@@ -206,6 +214,7 @@ protected:
         writeOutputStreamSet("WhitespaceMask", std::vector<PabloAST*>{isSpace});
     }
 };
+
 
 // Behavior mode 1: Removed - only keep word/punctuation boundaries, exclude whitespace
 class RemovedBehavior : public PabloKernel {
@@ -305,16 +314,21 @@ protected:
     }
 };
 
+
 // Behavior mode 5: Contiguous - keep punctuation with words, separate spaces
 class ContiguousBehavior : public PabloKernel {
 public:
     ContiguousBehavior(LLVMTypeSystemInterface & ts,
                        StreamSet * TokenBoundaries,
                        StreamSet * WhitespaceMask,
-                       StreamSet * AlphanumericMask,
+                       StreamSet * AlphanumericMask, // use a unicode property? or of letter and numeric ?
+                       StreamSet * PunctuationStream,
                        StreamSet * ResultBoundaries)
     : PabloKernel(ts, "contiguousBehavior",
-                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"WhitespaceMask", WhitespaceMask, FixedRate(), LookAhead(1)}, Binding{"AlphanumericMask", AlphanumericMask, FixedRate(), LookAhead(1)}},
+                  {Binding{"TokenBoundaries", TokenBoundaries}, 
+                   Binding{"WhitespaceMask", WhitespaceMask}, 
+                   Binding{"AlphanumericMask", AlphanumericMask, FixedRate(), LookAhead(1)},
+                   Binding{"PunctuationStream", PunctuationStream}},
                   {Binding{"ResultBoundaries", ResultBoundaries}}) {}
 
 protected:
@@ -323,20 +337,32 @@ protected:
         PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
         PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
         PabloAST * alphanumeric = getInputStreamSet("AlphanumericMask")[0];
+        PabloAST * punctuation = getInputStreamSet("PunctuationStream")[0];
+
+        // Punctuation immediately follows alphanumeric should not have boundaries
+        PabloAST * currentIsPunctuation = punctuation;
+        PabloAST * previousIsAlpha = pb.createAdvance(alphanumeric, 1); // looks BEHIND by 1 character position
+        PabloAST * punctAfterAlpha = pb.createAnd(currentIsPunctuation, previousIsAlpha);
+        
         
         // Detect punctuation: non-alphanumeric AND non-whitespace
-        PabloAST * notAlphanumeric = pb.createNot(pb.createLookahead(alphanumeric, 1));
+        //PabloAST * notAlphanumeric = pb.createNot(pb.createLookahead(alphanumeric, 1)); // only one position lookahed , punctuation of more than one byte ?
 
-        PabloAST * notWhitespace = pb.createNot(pb.createLookahead(whitespace, 1));
-        PabloAST * isPunctuation = pb.createAnd(notAlphanumeric, notWhitespace);
+        //PabloAST * notWhitespace = pb.createNot(pb.createLookahead(whitespace, 1));
+        //PabloAST * isPunctuation = pb.createAnd(notAlphanumeric, notWhitespace);
 
         // Detect punctuation that follows alphanumeric - these boundaries should be removed
-        PabloAST * punctAfterAlpha = pb.createAnd(isPunctuation, alphanumeric);
+        //PabloAST * punctAfterAlpha = pb.createAnd(isPunctuation, alphanumeric);
+
+        // transform from UTF-8 to unicode index data ?
         
         // Filter out boundaries at punctuation positions following alphanumeric
-        PabloAST * filteredBoundaries = pb.createAnd(boundaries, pb.createNot(punctAfterAlpha));
+        //PabloAST * filteredBoundaries = pb.createAnd(boundaries, pb.createNot(punctAfterAlpha));
+
+        // Filter out boundaries at punctuation following alphanumeric
+        PabloAST * result = pb.createAnd(boundaries, pb.createNot(punctAfterAlpha));
        
-        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{filteredBoundaries});
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
     }
 };
 
@@ -362,10 +388,10 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
     SHOW_BIXNUM(BasisBits);
     
-    // Create UTF-8 character boundary index
+    // Create UTF-8 character boundary index (UTF-8 Index Creation)
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-    
+    SHOW_STREAM(u8index);
     // Unicode Word Boundary Rules
     StreamSet * WordBoundaries = nullptr;
     
@@ -508,38 +534,123 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 
         SHOW_STREAM(WordBoundaries);
     }
+
     
     // UTF-8 - ensure boundaries only at UTF-8 character starts
     StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<AndKernel>(WordBoundaries, u8index, TokenBoundaries);
     SHOW_STREAM(TokenBoundaries);
+   
+    // UTF-8 to U21 Conversion Pipeline
+   // Creating U21 codepoint stream from UTF-8 basis bits (U21 Codepoint Generation)
+    StreamSet * U21_u8indexed = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21_u8indexed);
+    // filter by mask with UTF-8 index stream ?
+    SHOW_BIXNUM(U21_u8indexed);
 
+    StreamSet * U21codepoints = P.CreateStreamSet(21, 1);
+    FilterByMask(P, u8index, U21_u8indexed, U21codepoints);
+    SHOW_BIXNUM(U21codepoints); 
+
+    StreamSet * U21_tokenBoundaries = P.CreateStreamSet(1);
+    FilterByMask(P, u8index, TokenBoundaries, U21_tokenBoundaries);
+    SHOW_STREAM(U21_tokenBoundaries);
+
+    
+    // Detect alphanumeric positions using Unicode properties (Letter, Mark, Number)
+    // L* categories: Letter (uppercase, lowercase, titlecase, modifier, other)
+    // M* categories: Mark (nonspacing, spacing, enclosing)
+    // N* categories: Number (decimal, letter number, other)
+    
+    // Unicode Properties Created from U21 codepoint stream
+    // Create Letter property stream using Unicode general category 'Letter' 
+    // Detects all Unicode letter characters (Lu, Ll, Lt, Lm, Lo)
+    re::RE * letterProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Letter");
+    letterProp = UCD::linkAndResolve(letterProp);
+    re::Name * letterName = re::makeName("Letter");
+    letterName->setDefinition(letterProp);
+    StreamSet * LetterStream = P.CreateStreamSet(1);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterName, U21codepoints, LetterStream);
+    SHOW_STREAM(LetterStream);
+
+    // CreateKernelFamilyCall: Kernels that need runtime parameters, that are generic
+    
+    /*
+   // Create Mark property stream using Unicode general category 'Mark'
+    // Detects all Unicode mark characters (Mn, Mc, Me)
+    // Mn: Nonspacing marks , Mc: Spacing marks , Me: Enclosing marks
+    re::RE * markProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Mark");
+    markProp = UCD::linkAndResolve(markProp);
+    re::Name * markName = re::makeName("Mark");
+    markName->setDefinition(markProp);
+    StreamSet * MarkStream = P.CreateStreamSet(1);
+    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(markName, U21codepoints, MarkStream);
+    SHOW_STREAM(MarkStream);
+    */
+
+    // Create Number property stream using Unicode general category 'Number'
+    // Detects all Unicode number characters (Nd, Nl, No)
+    // Nd: Decimal digit numbers, Nl: Letter numbers, No: Other numbers
+    re::RE * numberProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Number");
+    numberProp = UCD::linkAndResolve(numberProp);
+    re::Name * numberName = re::makeName("Number");
+    numberName->setDefinition(numberProp);
+    StreamSet * NumberStream = P.CreateStreamSet(1);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberName, U21codepoints, NumberStream);
+    SHOW_STREAM(NumberStream);
+
+    // Create Punctuation property stream using Unicode general category 'Punctuation'
+    // Detects all Unicode punctuation characters (Pc, Pd, Ps, Pe, Pi, Pf, Po)
+    // Pc: Connector punctuation (_, ‿), Pd: Dash punctuation (-, –, —)
+    // Ps: Open punctuation ( (, {, [ ), Pe: Close punctuation ( ), }, ] )
+    // Pi: Initial quote punctuation (‘, “), Pf: Final quote punctuation (’, ”)
+    // Po: Other punctuation (!, ?, ., , , ;, :, etc.)
+    re::RE * punctuationProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Punctuation");
+    punctuationProp = UCD::linkAndResolve(punctuationProp);
+    re::Name * punctuationName = re::makeName("Punctuation");
+    punctuationName->setDefinition(punctuationProp);
+    StreamSet * PunctuationStream = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(punctuationName, U21codepoints, PunctuationStream);
+    SHOW_STREAM(PunctuationStream);
+
+    // Whitespace property stream using Unicode property 'space'
+    // Detects all Unicode whitespace characters (space, tab, newline, etc.)
+    // Includes: SPACE, TAB, LF, VT, FF, CR, NO-BREAK SPACE, etc.
+
+    re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
+    whitespaceProp = UCD::linkAndResolve(whitespaceProp);
+    re::Name * whitespaceName = re::makeName("Whitespace");
+    whitespaceName->setDefinition(whitespaceProp);
+    //StreamSet * WhitespaceStream = P.CreateStreamSet(1);
+    //P.CreateKernelCall<UnicodePropertyKernelBuilder>(whitespaceName, U21codepoints, WhitespaceMask);
+    //SHOW_STREAM(WhitespaceMask);
     // Detect whitespace/delimiter positions
     StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<WhitespaceDetector>(BasisBits, WhitespaceMask);
+    P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
     SHOW_STREAM(WhitespaceMask);
+    
 
-    // Detect alphanumeric positions (for contiguous behavior to keep punctuation with words)
+    // Combine Letter and Number properties to detect alphanumeric characters
     StreamSet * AlphanumericMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<AlphanumericDetector>(BasisBits, AlphanumericMask);
+    P.CreateKernelCall<UnicodeAlphanumericDetector>(U21codepoints, AlphanumericMask, LetterStream, NumberStream);
     SHOW_STREAM(AlphanumericMask);
 
     // Apply behavior transformation using appropriate kernel
     StreamSet * TransformedBoundaries = P.CreateStreamSet(1, 1);
     
     if (SplitBehavior == "removed") {
-        P.CreateKernelCall<RemovedBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<RemovedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
     } else if (SplitBehavior == "isolated") {
-        P.CreateKernelCall<IsolatedBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
     } else if (SplitBehavior == "mergedwithprevious") {
-        P.CreateKernelCall<MergedWithPreviousBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
     } else if (SplitBehavior == "mergedwithnext") {
-        P.CreateKernelCall<MergedWithNextBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
     } else if (SplitBehavior == "contiguous") {
-        P.CreateKernelCall<ContiguousBehavior>(TokenBoundaries, WhitespaceMask, AlphanumericMask, TransformedBoundaries);
+        P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
     } else {
         // Default to isolated if behavior not specified
-        P.CreateKernelCall<IsolatedBehavior>(TokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
     }
     
     SHOW_STREAM(TransformedBoundaries);
@@ -548,21 +659,27 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TransformedBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
     
-    StreamSet * spreadBasis = P.CreateStreamSet(8);
-    SpreadByMask(P, lineInsertMask, BasisBits, spreadBasis);
+    StreamSet * spreadBasis = P.CreateStreamSet(21);
+    SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);
     SHOW_BIXNUM(spreadBasis);
-    
+
+    // ??
     // Insert Token Separators
-    StreamSet * tokenBasis = P.CreateStreamSet(8);
+    StreamSet * tokenBasis = P.CreateStreamSet(21);
     P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     SHOW_BIXNUM(tokenBasis);
-    
+
+    // Convert U21 codepoints back to UTF-8 basis bits
+    StreamSet * output_basis = P.CreateStreamSet(8);
+    U21_to_UTF8(P, tokenBasis, output_basis);
+    SHOW_BIXNUM(output_basis);
+
     // Output Processing
     // Convert parallel bit streams back to serial bytes
     StreamSet * tokenizedOutput = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<P2SKernel>(tokenBasis, tokenizedOutput);
+    P.CreateKernelCall<P2SKernel>(output_basis, tokenizedOutput);
     SHOW_BYTES(tokenizedOutput);
-    
+
     // Write to standard output
     P.CreateKernelCall<StdOutKernel>(tokenizedOutput);
     

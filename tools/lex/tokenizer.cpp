@@ -27,6 +27,7 @@
 #include <pablo/pablo_kernel.h>
 #include <pablo/builder.hpp>
 #include <pablo/pe_zeroes.h>
+#include <pablo/pe_ones.h>
 #include <pablo/pablo_toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <grep/grep_kernel.h>
@@ -48,6 +49,7 @@
 #include <kernel/unicode/charclasses.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/unicode/utf8gen.h>
+#include <kernel/unicode/boundary_kernels.h>
 
 // ICU boundary provider
 #include "ICU_Boundaries.h"
@@ -86,6 +88,34 @@ static cl::opt<std::string> SplitBehavior("behavior",
 
 // proper Unicode word boundary rules (WB1, WB2, WB3) implemented in 
 // generateWordBoundaryRule() function.
+
+
+// Remove first position mark from insertion mask
+class RemoveFirstMarkKernel : public PabloKernel {
+public:
+    RemoveFirstMarkKernel(LLVMTypeSystemInterface & ts,
+                          StreamSet * inputMask,
+                          StreamSet * outputMask)
+    : PabloKernel(ts, "removeFirstMarkKernel",
+                  {Binding{"inputMask", inputMask}},
+                  {Binding{"outputMask", outputMask}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * mask = getInputStreamSet("inputMask")[0];
+        
+        // Create a stream that is 0 at position 0 and 1 everywhere else
+        //PabloAST * notAtFirst = pb.createAdvance(pb.createZeroes(), 1);
+        PabloAST * notAtFirst = pb.createAdvance(pb.createOnes(), 1);
+        // PabloAST * notAtFirst = pb.createLookahead(pb.createOnes(), 1);
+
+        
+        // AND the mask with notAtFirst to exclude position 0
+        PabloAST * result = pb.createAnd(mask, notAtFirst);
+        writeOutputStreamSet("outputMask", std::vector<PabloAST*>{result});
+    }
+};
 
 // Unicode line separator insertion kernel: writes LF (0x0A) at token boundaries
 class AddUnicodeLineSeparators : public PabloKernel {
@@ -514,6 +544,22 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     SHOW_STREAM(WordBoundaries);
 
     }
+    // simple word boundries 
+    else if(PreTokenizer == "simpleWordBoundaries"){
+        // Use simple word boundaries based on Unicode "word" property
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
+        wordProp = UCD::linkAndResolve(wordProp);
+        re::Name * word = re::makeName("word");
+        word->setDefinition(wordProp);
+        StreamSet * WordStream = P.CreateStreamSet(1);
+        llvm::errs() << "before unicode property kernel for word\n";
+        P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, BasisBits, WordStream);
+        llvm::errs() << "after unicode property kernel for word\n";
+        P.CreateKernelCall<BoundaryKernel>(WordStream, u8index, WordBoundaries);
+        llvm::errs() << "after boundary kernel for word.\n";
+
+    }
     else {
         // Use default UAX#29 word boundaries
         WordBoundaries = P.CreateStreamSet(1, 1);
@@ -653,20 +699,26 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
     }
     
+    StreamSet * TransformedBoundaries1 = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<RemoveFirstMarkKernel>(TransformedBoundaries, TransformedBoundaries1);
+    SHOW_STREAM(TransformedBoundaries1);
+    
     SHOW_STREAM(TransformedBoundaries);
 
     // Create insertion mask and spread original data
-    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TransformedBoundaries, kernel::InsertPosition::Before);
+    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TransformedBoundaries1, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
-    
+   
     StreamSet * spreadBasis = P.CreateStreamSet(21);
     SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);
+    //SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);
     SHOW_BIXNUM(spreadBasis);
 
     // ??
     // Insert Token Separators
     StreamSet * tokenBasis = P.CreateStreamSet(21);
     P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
+    //P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     SHOW_BIXNUM(tokenBasis);
 
     // Convert U21 codepoints back to UTF-8 basis bits

@@ -431,7 +431,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     if (PreTokenizer == "icu" || !Locale.empty()) {
         // Use ICU locale-aware word boundaries
         WordBoundaries = buildWordBoundaryMaskFromICU(P, BasisBits, u8index, Locale);
-
         SHOW_STREAM(WordBoundaries);
 
     }else if (PreTokenizer == "gpt2") {
@@ -455,7 +454,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-
         SHOW_STREAM(WordBoundaries);
     }
     //Input: "Hello there!"
@@ -477,7 +475,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-
         SHOW_STREAM(WordBoundaries);
     }
     //Input: "Hello there!"
@@ -499,7 +496,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-
         SHOW_STREAM(WordBoundaries);
     }
     else if (PreTokenizer == "punctuation"){
@@ -519,7 +515,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     options->setResults(WordBoundaries);
     options->addExternal("UTF8_index", u8index);
     P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-
     SHOW_STREAM(WordBoundaries);
 
    }
@@ -540,7 +535,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     options->setResults(WordBoundaries);
     options->addExternal("UTF8_index", u8index);
     P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-
     SHOW_STREAM(WordBoundaries);
 
     }
@@ -553,12 +547,9 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         re::Name * word = re::makeName("word");
         word->setDefinition(wordProp);
         StreamSet * WordStream = P.CreateStreamSet(1);
-        llvm::errs() << "before unicode property kernel for word\n";
         P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, BasisBits, WordStream);
-        llvm::errs() << "after unicode property kernel for word\n";
         P.CreateKernelCall<BoundaryKernel>(WordStream, u8index, WordBoundaries);
-        llvm::errs() << "after boundary kernel for word.\n";
-
+        
     }
     else {
         // Use default UAX#29 word boundaries
@@ -577,7 +568,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         options->setResults(WordBoundaries);
         options->addExternal("UTF8_index", u8index);
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-
         SHOW_STREAM(WordBoundaries);
     }
 

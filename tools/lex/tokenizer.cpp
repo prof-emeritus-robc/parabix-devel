@@ -65,24 +65,63 @@ using namespace re;
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(wordBreakerFlags));
 
-// ICU locale for word boundaries, make this the only option
-// the tokenizer will use this locale to build word boundaries, tokenizer callls buildWordBoundaryMaskFromICU 
-// when we selecet a locale other than the default
+
+// using Enum for command line options
+
+// Enum for pre-tokenizer selection
+enum PreTokenizerMode {
+  uax29,
+  icu,
+  gpt2,
+  whitespace,
+  whitespacesplit,
+  digits,
+  punctuation,
+  simpleWordBoundaries
+};
+
+// Enum for split behavior
+enum SplitBehaviorMode {
+  removed,
+  isolated,
+  mergedwithprevious,
+  mergedwithnext,
+  contiguous
+};
+
+// pretokenizer selection as named alternative 
+static cl::opt<PreTokenizerMode> PreTokenizer(
+    "pretokenizer",
+    cl::desc("Pre-tokenizer mode:"),
+    cl::init(uax29),
+    cl::values(
+        clEnumValN(uax29, "uax29", "Unicode UAX#29 word boundaries (default)"),
+        clEnumValN(icu, "icu", "ICU BreakIterator word boundaries"),
+        clEnumValN(gpt2, "gpt2", "GPT-2 style tokenization"),
+        clEnumValN(whitespace, "whitespace", "Split on whitespace characters"),
+        clEnumValN(whitespacesplit, "whitespacesplit", "Split on whitespace and output delimiters as separate tokens"),
+        clEnumValN(digits, "digits", "Split on digit sequences"),
+        clEnumValN(punctuation, "punctuation", "Split on punctuation characters"),
+        clEnumValN(simpleWordBoundaries, "simplewordboundaries", "Simple word boundaries based on alphanumeric characters")
+    ),
+    cl::cat(wordBreakerFlags)
+);
+
+// Split behavior as named alternative
+static cl::opt<SplitBehaviorMode> SplitBehavior("behavior",
+    cl::desc("Split delimiter behavior:"),
+    cl::init(isolated),
+    cl::values(
+        clEnumValN(removed, "removed", "only keep word/punctuation boundaries, exclude whitespace"),
+        clEnumValN(isolated, "isolated", "keep token boundaries AND add space boundaries"),
+        clEnumValN(mergedwithprevious, "mergedwithprevious", "attach whitespace to previous word"),
+        clEnumValN(mergedwithnext, "mergedwithnext", "attach whitespace to next word"),
+        clEnumValN(contiguous, "contiguous", "keep punctuation with words, separate spaces")),
+    cl::cat(wordBreakerFlags));
+
+// ICU locale remains as string (accepts arbitrary locale values)
 static cl::opt<std::string> Locale("locale",
     cl::desc("ICU locale for word boundaries (e.g., en_US, fr_FR, ja_JP). Empty = default UAX#29"),
-    cl::init(""),
-    cl::cat(wordBreakerFlags));
-
-// Pre-tokenizer selection: uax29 (default Unicode word boundaries), icu (ICU BreakIterator),
-// whitespace (split on whitespace), bytelevel, punctuation, metaspace, etc.
-static cl::opt<std::string> PreTokenizer("pretokenizer",
-    cl::desc("Pre-tokenizer to use: icu|gpt2|whitespace|whitespacesplit|digits|punctuation"),
-    cl::init(""),
-    cl::cat(wordBreakerFlags));
-
-// Split delimiter behavior: removed, isolated, mergedwithprevious, mergedwithnext, contiguous
-static cl::opt<std::string> SplitBehavior("behavior",
-    cl::desc("Split delimiter behavior: removed|isolated|mergedwithprevious|mergedwithnext|contiguous"),
     cl::init(""),
     cl::cat(wordBreakerFlags));
 
@@ -183,7 +222,7 @@ protected:
     }
 };
 // Unicode Alphanumeric Detection kernel using Unicode properties
-// Combinesf(L*), Mark (M*), and Number (N*) Unicode categories
+// Combines (L*), Mark (M*), and Number (N*) Unicode categories
 // to detect alphanumeric characters properly according to Unicode standard
 class UnicodeAlphanumericDetector : public PabloKernel {
 public:
@@ -303,17 +342,17 @@ class MergedWithPreviousBehavior : public PabloKernel {
 public:
     MergedWithPreviousBehavior(LLVMTypeSystemInterface & ts,
                                StreamSet * TokenBoundaries,
-                               StreamSet * whitespaceMask,
+                               StreamSet * WhitespaceMask,
                                StreamSet * ResultBoundaries)
     : PabloKernel(ts, "mergedWithPreviousBehavior",
-                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"whitespaceMask", whitespaceMask}},
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"WhitespaceMask", WhitespaceMask}},
                   {Binding{"ResultBoundaries", ResultBoundaries}}) {}
 
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
-        PabloAST * whitespace = getInputStreamSet("whitespaceMask")[0];
+        PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
         // Shift right by 1: moves boundaries to merge whitespace with previous token
         //PabloAST * result = pb.createLookahead(boundaries, 1);
         PabloAST * result = pb.createAnd(boundaries, pb.createNot(whitespace));
@@ -326,17 +365,17 @@ class MergedWithNextBehavior : public PabloKernel {
 public:
     MergedWithNextBehavior(LLVMTypeSystemInterface & ts,
                            StreamSet * TokenBoundaries,
-                           StreamSet * whitespaceMask,
+                           StreamSet * WhitespaceMask,
                            StreamSet * ResultBoundaries)
     : PabloKernel(ts, "mergedWithNextBehavior",
-                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"whitespaceMask", whitespaceMask}},
+                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"WhitespaceMask", WhitespaceMask}},
                   {Binding{"ResultBoundaries", ResultBoundaries}}) {}
 
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
-        PabloAST * whitespace = getInputStreamSet("whitespaceMask")[0];
+        PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
         
         // Shift left by 1: moves boundaries to merge whitespace with next token
         PabloAST * result = pb.createAnd(boundaries, pb.createNot(pb.createAdvance(whitespace, 1)));
@@ -365,7 +404,6 @@ protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
-        PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
         PabloAST * alphanumeric = getInputStreamSet("AlphanumericMask")[0];
         PabloAST * punctuation = getInputStreamSet("PunctuationStream")[0];
 
@@ -428,12 +466,12 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     (void)PreTokenizer; // PreTokenizer variable used later; silence unused-warning if any
     (void)Locale;
 
-    if (PreTokenizer == "icu" || !Locale.empty()) {
+    if (PreTokenizer == icu || !Locale.empty()) {
         // Use ICU locale-aware word boundaries
         WordBoundaries = buildWordBoundaryMaskFromICU(P, BasisBits, u8index, Locale);
         SHOW_STREAM(WordBoundaries);
 
-    }else if (PreTokenizer == "gpt2") {
+    }else if (PreTokenizer == gpt2) {
         // Use GPT-2 r50k regex pretokenizer (centralized in boundaries.cpp)
         WordBoundaries = P.CreateStreamSet(1, 1);
         re::RE * parsedRE = re::generateGPT2R50KRule();
@@ -458,7 +496,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     }
     //Input: "Hello there!"
     //Output: "Hello", "there", "!"   
-    else if (PreTokenizer == "whitespace"){
+    else if (PreTokenizer == whitespace){
         // Use whitespace pre-tokenizer
         WordBoundaries = P.CreateStreamSet(1, 1);
         re::RE * wsRule = re::generateWhitespaceBoundaryRule();
@@ -479,7 +517,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     }
     //Input: "Hello there!"
     //Output: "Hello", "there!"
-    else if(PreTokenizer == "whitespacesplit"){
+    else if(PreTokenizer == whitespacesplit){
         // Use WhitespaceSplit pre-tokenizer
         WordBoundaries = P.CreateStreamSet(1, 1);
         re::RE * wssRule = re::generateWhitespaceSplitBoundaryRule();
@@ -498,7 +536,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
         SHOW_STREAM(WordBoundaries);
     }
-    else if (PreTokenizer == "punctuation"){
+    else if (PreTokenizer == punctuation){
     // Use punctuation pre-tokenizer
     WordBoundaries = P.CreateStreamSet(1, 1);
     re::RE * punctRule = re::generatePunctuationBoundaryRule();
@@ -518,7 +556,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     SHOW_STREAM(WordBoundaries);
 
    }
-   else if (PreTokenizer == "digits"){
+   else if (PreTokenizer == digits){
     // Use digits pre-tokenizer
     WordBoundaries = P.CreateStreamSet(1, 1);
     re::RE * digitsRule = re::generateDigitBoundaryRule();
@@ -539,7 +577,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 
     }
     // simple word boundries 
-    else if(PreTokenizer == "simpleWordBoundaries"){
+    else if(PreTokenizer == simpleWordBoundaries){
         // Use simple word boundaries based on Unicode "word" property
         WordBoundaries = P.CreateStreamSet(1, 1);
         re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
@@ -674,15 +712,15 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Apply behavior transformation using appropriate kernel
     StreamSet * TransformedBoundaries = P.CreateStreamSet(1, 1);
     
-    if (SplitBehavior == "removed") {
+    if (SplitBehavior == removed) {
         P.CreateKernelCall<RemovedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (SplitBehavior == "isolated") {
+    } else if (SplitBehavior == isolated) {
         P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (SplitBehavior == "mergedwithprevious") {
+    } else if (SplitBehavior == mergedwithprevious) {
         P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (SplitBehavior == "mergedwithnext") {
+    } else if (SplitBehavior == mergedwithnext) {
         P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (SplitBehavior == "contiguous") {
+    } else if (SplitBehavior == contiguous) {
         P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
     } else {
         // Default to isolated if behavior not specified

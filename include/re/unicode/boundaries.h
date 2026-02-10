@@ -41,5 +41,13 @@ RE * generatePunctuationBoundaryRule();
 
 // Digit Pre-Tokenizer Rule
 RE * generateDigitBoundaryRule();
-}
 
+// ByteLevel Pre-Tokenizer Rule
+RE * generateByteLevelBoundaryRule();
+
+// BERT Pre-Tokenizer Rule
+RE * generateBertPreTokenizerRule();
+
+// Sequence Pre-Tokenizer: Whitespace then Punctuation
+RE * generateSequenceWhitespacePunctuationRule();
+}

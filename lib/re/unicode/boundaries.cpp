@@ -536,4 +536,61 @@ RE * generateDigitBoundaryRule() {
     r = UCD::linkAndResolve(r);
     return r;           
 }
+// ByteLevel Pre-Tokenizer Rule
+// Splits on whitespace characters while remapping bytes to visible characters
+RE * generateByteLevelBoundaryRule() {
+    // Pattern: Split whitespace and non-whitespace
+    // Matches one or more whitespace OR one or more non-whitespace
+    static const std::string pat = R"(\s++|\S++)";
+    
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse ByteLevel pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;
+}
+// BertPreTokenizer boundary rule: Whitespace + Punctuation separation
+// Splits on word characters, non-word characters, and punctuation separately
+RE * generateBertPreTokenizerRule() {
+    // Pattern: Match punctuation OR word sequences OR other non-whitespace
+    // This is like combining Whitespace + Punctuation patterns:
+    // [[:punct:]] = individual punctuation characters
+    // \w++ = one or more word characters (letters, digits, underscore)
+    // [^\w\s[:punct:]]++ = non-word, non-whitespace, non-punctuation chars
+    
+    // static const std::string pat = R"([[:punct:]]|\w++|[^\w\s[:punct:]]++)";
+    // static const std::string pat = R"([[:punct:]]|\w++)";
+    static const std::string pat = R"(\w++|[^\w\s]++)";  //\w+|[^\w\s]+
+    
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse BERT pre-tokenizer pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;
+}
+// Sequence Pre-Tokenizer: Whitespace then Punctuation
+// This applies whitespace splitting first, then punctuation splitting within each chunk
+// Result: separates punctuation and words, with whitespace as implicit delimiter
+RE * generateSequenceWhitespacePunctuationRule() {
+    // Pattern: Match punctuation OR word sequences OR special chars (not whitespace)
+    // [[:punct:]] = individual punctuation characters
+    // \w++ = one or more word characters (letters, digits, underscore)
+    // [^\w\s[:punct:]]++ = other special chars (not word, not space, not punct)
+    static const std::string pat = R"(\s++|[[:punct:]]|[^[:punct:]\s]++)";
+    //R"(\w++|[^\w\s]++)" - white space split
+    //R"([[:punct:]]|[^[:punct:]]++)"  - punctuation 
+   
+    
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse Sequence[Whitespace,Punctuation] pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;
+}
 }

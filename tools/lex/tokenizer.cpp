@@ -548,6 +548,27 @@ void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u
         SHOW_STREAM(results);
 };
 
+struct RemovedWhitespaceFilterResult {
+    StreamSet * filteredCodepoints;
+    StreamSet * filteredTokenBoundaries;
+};
+
+RemovedWhitespaceFilterResult applyRemovedWhitespaceFilter(PipelineBuilder & P,
+                                                          StreamSet * WhitespaceMask,
+                                                          StreamSet * U21codepoints,
+                                                          StreamSet * U21_tokenBoundaries) {
+    StreamSet * keepMask = P.CreateStreamSet(1);
+    P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
+
+    StreamSet * finalU21codepoints = P.CreateStreamSet(21);
+    FilterByMask(P, keepMask, U21codepoints, finalU21codepoints);
+
+    StreamSet * finalU21_tokenBoundaries = P.CreateStreamSet(1);
+    FilterByMask(P, keepMask, U21_tokenBoundaries, finalU21_tokenBoundaries);
+
+    return {finalU21codepoints, finalU21_tokenBoundaries};
+}
+
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
@@ -700,9 +721,13 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         
     }
     else if (PreTokenizer == bytelevel) {
-    // Use ByteLevel pre-tokenizer
+    // Use ByteLevel pre-tokenizer (GPT-2 regex splitting)
     WordBoundaries = P.CreateStreamSet(1, 1);
-    re::RE * byteLevelRule = re::generateByteLevelBoundaryRule();
+    re::RE * byteLevelRule = re::generateGPT2R50KRule();
+    if (!byteLevelRule) {
+        llvm::errs() << "Warning: failed to obtain GPT-2 ByteLevel regex. Falling back to whitespace split.\n";
+        byteLevelRule = re::generateByteLevelBoundaryRule();
+    }
     const auto BL_Sets = re::collectCCs(byteLevelRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
     auto BL_mpx = cc::makeMultiplexedAlphabet("BL_mpx", BL_Sets);
     byteLevelRule = transformCCs(BL_mpx, byteLevelRule, re::NameTransformationMode::TransformDefinition);
@@ -915,43 +940,48 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 
      // For BERT and Sequence pre-tokenizers, always use 'removed' behavior to skip whitespace
     SplitBehaviorMode effectiveBehavior = SplitBehavior;
-    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation) {
+    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit) {
         effectiveBehavior = removed;
     }
     
-    if (SplitBehavior == removed) {
+    if (effectiveBehavior == removed) {
 
-        // FILTERBYMASK for Whitespace Removal
-        // Remove whitespace characters from output
+        // // FILTERBYMASK for Whitespace Removal
+        // // Remove whitespace characters from output
     
-        // Create keep mask (inverse of whitespace)
-        // WhitespaceMask: 1=space, 0=non-space
-        // keepMask:       1=keep(non-space), 0=remove(space)
-        StreamSet * keepMask = P.CreateStreamSet(1);
-        P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
-        SHOW_STREAM(keepMask);
+        // // Create keep mask (inverse of whitespace)
+        // // WhitespaceMask: 1=space, 0=non-space
+        // // keepMask:       1=keep(non-space), 0=remove(space)
+        // StreamSet * keepMask = P.CreateStreamSet(1);
+        // P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
+        // SHOW_STREAM(keepMask);
 
-        // Filter U21 codepoints (remove whitespace characters)
-        StreamSet * finalU21codepoints = P.CreateStreamSet(21);
-        FilterByMask(P, keepMask, U21codepoints, finalU21codepoints);
-        SHOW_BIXNUM(finalU21codepoints);
+        // // Filter U21 codepoints (remove whitespace characters)
+        // StreamSet * finalU21codepoints = P.CreateStreamSet(21);
+        // FilterByMask(P, keepMask, U21codepoints, finalU21codepoints);
+        // SHOW_BIXNUM(finalU21codepoints);
         
-        // Filter boundaries to stay aligned with compressed codepoints
-        StreamSet * finalU21_tokenBoundaries = P.CreateStreamSet(1);
-        FilterByMask(P, keepMask, U21_tokenBoundaries, finalU21_tokenBoundaries);
-        SHOW_STREAM(finalU21_tokenBoundaries);
+        // // Filter boundaries to stay aligned with compressed codepoints
+        // StreamSet * finalU21_tokenBoundaries = P.CreateStreamSet(1);
+        // FilterByMask(P, keepMask, U21_tokenBoundaries, finalU21_tokenBoundaries);
+        // SHOW_STREAM(finalU21_tokenBoundaries);
 
-        // P.CreateKernelCall<RemovedBehavior>(finalU21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-        TransformedBoundaries = finalU21_tokenBoundaries;
-        U21codepoints = finalU21codepoints;
+        // // P.CreateKernelCall<RemovedBehavior>(finalU21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        // TransformedBoundaries = finalU21_tokenBoundaries;
+        // U21codepoints = finalU21codepoints;
 
-    } else if (SplitBehavior == isolated) {
+        // calling the helper function to remove whitespace
+        auto removed = applyRemovedWhitespaceFilter(P, WhitespaceMask, U21codepoints, U21_tokenBoundaries);
+        TransformedBoundaries = removed.filteredTokenBoundaries;
+        U21codepoints = removed.filteredCodepoints;
+
+    } else if (effectiveBehavior == isolated) {
         P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (SplitBehavior == mergedwithprevious) {
+    } else if (effectiveBehavior == mergedwithprevious) {
         P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (SplitBehavior == mergedwithnext) {
+    } else if (effectiveBehavior == mergedwithnext) {
         P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (SplitBehavior == contiguous) {
+    } else if (effectiveBehavior == contiguous) {
         P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
     } else {
         llvm::errs() << "Error: Unknown SplitBehavior mode.\n";

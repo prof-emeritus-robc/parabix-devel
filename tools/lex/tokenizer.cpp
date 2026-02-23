@@ -117,7 +117,7 @@ static cl::opt<PreTokenizerMode> PreTokenizer(
 // Split behavior as named alternative
 static cl::opt<SplitBehaviorMode> SplitBehavior("behavior",
     cl::desc("Split delimiter behavior:"),
-    cl::init(isolated),
+    cl::init(isolated),  // DEFAULT VALUE
     cl::values(
         clEnumValN(removed, "removed", "only keep word/punctuation boundaries, exclude whitespace"),
         clEnumValN(isolated, "isolated", "keep token boundaries AND add space boundaries"),
@@ -799,13 +799,11 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * U21_tokenBoundaries = P.CreateStreamSet(1);
     FilterByMask(P, u8index, TokenBoundaries, U21_tokenBoundaries);
     SHOW_STREAM(U21_tokenBoundaries);
-
     
     // Detect alphanumeric positions using Unicode properties (Letter, Mark, Number)
     // L* categories: Letter (uppercase, lowercase, titlecase, modifier, other)
     // M* categories: Mark (nonspacing, spacing, enclosing)
     // N* categories: Number (decimal, letter number, other)
-    
     // Unicode Properties Created from U21 codepoint stream
     // Create Letter property stream using Unicode general category 'Letter' 
     // Detects all Unicode letter characters (Lu, Ll, Lt, Lm, Lo)
@@ -879,46 +877,34 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     //P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     SHOW_BIXNUM(tokenBasis);
+
+    // spreading to match the streams
+    // Spread boundaries to match tokenBasis length (L+I)
+    StreamSet * spreadTokenBoundaries = P.CreateStreamSet(1);
+    SpreadByMask(P, lineInsertMask, U21_tokenBoundaries, spreadTokenBoundaries);
+
+    // Spread whitespace mask to match tokenBasis length
+    StreamSet * spreadWhitespaceMask = P.CreateStreamSet(1);
+    SpreadByMask(P, lineInsertMask, WhitespaceMask, spreadWhitespaceMask);
+    
+    // Spread alphanumeric mask to match tokenBasis length (needed for contiguous behavior)
+    StreamSet * spreadAlphanumericMask = P.CreateStreamSet(1);
+    SpreadByMask(P, lineInsertMask, AlphanumericMask, spreadAlphanumericMask);
+    
+    // Spread punctuation stream to match tokenBasis length (needed for contiguous behavior)
+    StreamSet * spreadPunctuationStream = P.CreateStreamSet(1);
+    SpreadByMask(P, lineInsertMask, PunctuationStream, spreadPunctuationStream);
     
     // After spreading and inserting, we have new codepoints at the inserted positions.
-    StreamSet * finalU21codepoints = U21codepoints;
-    applySplitBehaviorTransformation(P, PreTokenizer, SplitBehavior, U21codepoints, WhitespaceMask, 
-                                  U21_tokenBoundaries, tokenBasis, AlphanumericMask, PunctuationStream,
+    StreamSet * finalU21codepoints = tokenBasis;
+    applySplitBehaviorTransformation(P, PreTokenizer, SplitBehavior, tokenBasis, spreadWhitespaceMask, 
+                                  spreadTokenBoundaries, tokenBasis, spreadAlphanumericMask, spreadPunctuationStream,
                                   finalU21codepoints, TransformedBoundaries);
     SHOW_STREAM(TransformedBoundaries);
-
-     // For BERT and Sequence pre-tokenizers, always use 'removed' behavior to skip whitespace
-    // SplitBehaviorMode effectiveBehavior = SplitBehavior;
-    // if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
-    //     effectiveBehavior = removed;
-    // }
-    // StreamSet * finalU21codepoints = U21codepoints; // default to original codepoints if no filtering applied
-    
-    // if (effectiveBehavior == removed) {
-    //     finalU21codepoints = P.CreateStreamSet(21);
-
-    //     // calling the helper function to remove whitespace
-    //     // removed = applyRemovedWhitespaceFilter(P, WhitespaceMask, tokenBasis, U21_tokenBoundaries);
-    //     applyRemovedWhitespaceFilter(P, WhitespaceMask, tokenBasis, U21_tokenBoundaries, finalU21codepoints, TransformedBoundaries);
-
-    // } else if (effectiveBehavior == isolated) {
-    //     P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    // } else if (effectiveBehavior == mergedwithprevious) {
-    //     P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    // } else if (effectiveBehavior == mergedwithnext) {
-    //     P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    // } else if (effectiveBehavior == contiguous) {
-    //     P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
-    // } else {
-    //     llvm::errs() << "Error: Unknown SplitBehavior mode.\n";
-    //     TransformedBoundaries = U21_tokenBoundaries; // default to no transformation
-    // }
-    // SHOW_STREAM(TransformedBoundaries);
     
     StreamSet * TransformedBoundaries1 = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<RemoveFirstMarkKernel>(TransformedBoundaries, TransformedBoundaries1);
     SHOW_STREAM(TransformedBoundaries1);
-
 
     // Convert U21 codepoints back to UTF-8 basis bits
     StreamSet * output_basis = P.CreateStreamSet(8);

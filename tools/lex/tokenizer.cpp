@@ -65,9 +65,6 @@ using namespace re;
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(wordBreakerFlags));
 
-
-// using Enum for command line options
-
 // Enum for pre-tokenizer selection
 enum PreTokenizerMode {
   uax29,
@@ -86,6 +83,7 @@ enum PreTokenizerMode {
 
 // Enum for split behavior
 enum SplitBehaviorMode {
+  nosplitbehavior,
   removed,
   isolated,
   mergedwithprevious,
@@ -133,10 +131,6 @@ static cl::opt<std::string> Locale("locale",
     cl::desc("ICU locale for word boundaries (e.g., en_US, fr_FR, ja_JP). Empty = default UAX#29"),
     cl::init(""),
     cl::cat(wordBreakerFlags));
-
-// proper Unicode word boundary rules (WB1, WB2, WB3) implemented in 
-// generateWordBoundaryRule() function.
-
 
 // Remove first position mark from insertion mask
 class RemoveFirstMarkKernel : public PabloKernel {
@@ -221,11 +215,6 @@ protected:
         PabloBuilder pb(getEntryScope());
         PabloAST * stream1 = getInputStreamSet("input1")[0];
         PabloAST * u8index = getInputStreamSet("input2")[0];
-        //PabloAST * u8First = pb.createNot(pb.createAdvance(pb.createNot(u8index), 1));
-        //PabloAST * notFirst = pb.createAdvance(pb.createOnes(), 1);
-        //PabloAST * notFirst = pb.createLookahead(pb.createOnes(), 1);
-        //u8index = pb.createAnd(u8index, notFirst);
-
         PabloAST * result = pb.createAnd(stream1, u8index);
         writeOutputStreamSet("output", std::vector<PabloAST*>{result});
     }
@@ -305,7 +294,6 @@ public:
                                 StreamSet * NumberStream)
     : PabloKernel(ts, "unicodeAlphanumericDetector",
                   {Binding{"LetterStream", LetterStream}, 
-                   //Binding{"MarkStream", MarkStream}, 
                    Binding{"NumberStream", NumberStream}},
                   {Binding{"AlphanumericMask", AlphanumericMask}}) {}
 protected:
@@ -314,14 +302,12 @@ protected:
         
         // Get the Unicode property streams for letters, marks, and numbers
         PabloAST * letter = getInputStreamSet("LetterStream")[0];
-        //PabloAST * mark = getInputStreamSet("MarkStream")[0];
         PabloAST * number = getInputStreamSet("NumberStream")[0];
         
         // Alphanumeric = Letter OR Number (excluding marks)
         // L* categories include: Lu (Uppercase), Ll (Lowercase), Lt (Titlecase), 
         //                        Lm (Modifier), Lo (Other Letter)
         // N* categories include: Nd (Decimal Digit), Nl (Letter Number), No (Other Number)
-        //PabloAST * alphanumeric = pb.createOr(letter, pb.createOr(mark, number));
         PabloAST * alphanumeric = pb.createOr(letter, number);
         
         writeOutputStreamSet("AlphanumericMask", std::vector<PabloAST*>{alphanumeric});
@@ -355,7 +341,6 @@ protected:
     }
 };
 
-
 // Behavior mode 1: Removed - only keep word/punctuation boundaries, exclude whitespace
 class RemovedBehavior : public PabloKernel {
 public:
@@ -376,7 +361,8 @@ protected:
         // For removed: keep boundaries at non-whitespace positions only
         // This explicitly filters out any space positions
         PabloAST * notSpace = pb.createNot(whitespace);
-        PabloAST * result = pb.createAnd(boundaries, notSpace);
+        PabloAST * firstSpace = pb.createAnd(whitespace, pb.createNot(pb.createAdvance(whitespace, 1)));
+        PabloAST * result = pb.createAnd(boundaries, pb.createOr(notSpace, firstSpace));
         
         writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
     }
@@ -425,7 +411,6 @@ protected:
         PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
         PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
         // Shift right by 1: moves boundaries to merge whitespace with previous token
-        //PabloAST * result = pb.createLookahead(boundaries, 1);
         PabloAST * result = pb.createAnd(boundaries, pb.createNot(whitespace));
         writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
     }
@@ -447,13 +432,11 @@ protected:
         PabloBuilder pb(getEntryScope());
         PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
         PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
-        
         // Shift left by 1: moves boundaries to merge whitespace with next token
         PabloAST * result = pb.createAnd(boundaries, pb.createNot(pb.createAdvance(whitespace, 1)));
         writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
     }
 };
-
 
 // Behavior mode 5: Contiguous - keep punctuation with words, separate spaces
 class ContiguousBehavior : public PabloKernel {
@@ -482,23 +465,6 @@ protected:
         PabloAST * currentIsPunctuation = punctuation;
         PabloAST * previousIsAlpha = pb.createAdvance(alphanumeric, 1); // looks BEHIND by 1 character position
         PabloAST * punctAfterAlpha = pb.createAnd(currentIsPunctuation, previousIsAlpha);
-        
-        
-        // Detect punctuation: non-alphanumeric AND non-whitespace
-        //PabloAST * notAlphanumeric = pb.createNot(pb.createLookahead(alphanumeric, 1)); // only one position lookahed , punctuation of more than one byte ?
-
-        //PabloAST * notWhitespace = pb.createNot(pb.createLookahead(whitespace, 1));
-        //PabloAST * isPunctuation = pb.createAnd(notAlphanumeric, notWhitespace);
-
-        // Detect punctuation that follows alphanumeric - these boundaries should be removed
-        //PabloAST * punctAfterAlpha = pb.createAnd(isPunctuation, alphanumeric);
-
-        // transform from UTF-8 to unicode index data ?
-        
-        // Filter out boundaries at punctuation positions following alphanumeric
-        //PabloAST * filteredBoundaries = pb.createAnd(boundaries, pb.createNot(punctAfterAlpha));
-
-        // Filter out boundaries at punctuation following alphanumeric
         PabloAST * result = pb.createAnd(boundaries, pb.createNot(punctAfterAlpha));
        
         writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
@@ -515,21 +481,6 @@ using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 // make a new function here 
 void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u8index, StreamSet * results) {
-
-        // re::RE * wsRule = re::generateWhitespaceBoundaryRule();
-        // const auto WS_Sets = re::collectCCs(wsRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        // auto WS_mpx = cc::makeMultiplexedAlphabet("WS_mpx", WS_Sets);
-        // wsRule = transformCCs(WS_mpx, wsRule, re::NameTransformationMode::TransformDefinition);
-        // auto WS_basis = WS_mpx->getMultiplexedCCs();
-        // StreamSet * const WS_Classes = P.CreateStreamSet(WS_basis.size());
-        // P.CreateKernelFamilyCall<CharClassesKernel>(WS_basis, BasisBits, WS_Classes);
-        // auto options = std::make_unique<GrepKernelOptions>();
-        // options->setIndexing(u8index);
-        // options->setRE(wsRule);
-        // options->addAlphabet(WS_mpx, WS_Classes);
-        // options->setResults(WordBoundaries);
-        // options->addExternal("UTF8_index", u8index);
-        // P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
         
         re::RE * rule1 = re::generateWhitespaceBoundaryRule();
         const auto WS_Sets = re::collectCCs(rule1, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
@@ -547,28 +498,62 @@ void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(ws_options));
         SHOW_STREAM(results);
 };
-
-struct RemovedWhitespaceFilterResult {
-    StreamSet * filteredCodepoints;
-    StreamSet * filteredTokenBoundaries;
-};
-
-RemovedWhitespaceFilterResult applyRemovedWhitespaceFilter(PipelineBuilder & P,
+ 
+void applyRemovedWhitespaceFilter(PipelineBuilder & P,
                                                           StreamSet * WhitespaceMask,
                                                           StreamSet * U21codepoints,
-                                                          StreamSet * U21_tokenBoundaries) {
+                                                          StreamSet * U21_tokenBoundaries,
+                                                          StreamSet * finalU21codepoints,
+                                                          StreamSet * finalU21_tokenBoundaries) {
     StreamSet * keepMask = P.CreateStreamSet(1);
     P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
 
-    StreamSet * finalU21codepoints = P.CreateStreamSet(21);
-    FilterByMask(P, keepMask, U21codepoints, finalU21codepoints);
+     StreamSet * keepMask2 = P.CreateStreamSet(1);
+    P.CreateKernelCall<OrKernel>(keepMask,U21_tokenBoundaries, keepMask2);
 
-    StreamSet * finalU21_tokenBoundaries = P.CreateStreamSet(1);
-    FilterByMask(P, keepMask, U21_tokenBoundaries, finalU21_tokenBoundaries);
+    FilterByMask(P, keepMask2, U21codepoints, finalU21codepoints);
 
-    return {finalU21codepoints, finalU21_tokenBoundaries};
+    FilterByMask(P, keepMask2, U21_tokenBoundaries, finalU21_tokenBoundaries);
 }
-
+// Function to apply split behavior transformation based on pre-tokenizer selection and split behavior mode
+void applySplitBehaviorTransformation(
+    PipelineBuilder & P,
+    PreTokenizerMode PreTokenizer,
+    SplitBehaviorMode SplitBehavior,
+    StreamSet * U21codepoints,
+    StreamSet * WhitespaceMask,
+    StreamSet * U21_tokenBoundaries,
+    StreamSet * tokenBasis,
+    StreamSet * AlphanumericMask,
+    StreamSet * PunctuationStream,
+    StreamSet *& finalU21codepoints,
+    StreamSet *& TransformedBoundaries)
+{
+    // For some pre-tokenizers, use 'removed' behavior to skip whitespace
+    SplitBehaviorMode effectiveBehavior = SplitBehavior;
+    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
+        effectiveBehavior = removed;
+    }
+    finalU21codepoints = U21codepoints; // default to original codepoints if no filtering applied
+    
+    if (effectiveBehavior == removed) {
+        finalU21codepoints = P.CreateStreamSet(21);
+        // changed tokenBasis to U21codepoints
+        applyRemovedWhitespaceFilter(P, WhitespaceMask, U21codepoints, U21_tokenBoundaries, finalU21codepoints, TransformedBoundaries);
+    } else if (effectiveBehavior == isolated) {
+        P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    } else if (effectiveBehavior == mergedwithprevious) {
+        P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    } else if (effectiveBehavior == mergedwithnext) {
+        P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    } else if (effectiveBehavior == contiguous) {
+        P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
+    } else {
+        llvm::errs() << "Error: Unknown SplitBehavior mode.\n";
+        TransformedBoundaries = U21_tokenBoundaries; // default to no transformation
+    }
+    SHOW_STREAM(TransformedBoundaries);
+}
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
@@ -627,22 +612,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     //Output: "Hello", "there", "!"   
     else if (PreTokenizer == whitespace){
         // seperate function for white space that we call here 
-        // Use whitespace pre-tokenizer
         WordBoundaries = P.CreateStreamSet(1, 1);
-        // re::RE * wsRule = re::generateWhitespaceBoundaryRule();
-        // const auto WS_Sets = re::collectCCs(wsRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        // auto WS_mpx = cc::makeMultiplexedAlphabet("WS_mpx", WS_Sets);
-        // wsRule = transformCCs(WS_mpx, wsRule, re::NameTransformationMode::TransformDefinition);
-        // auto WS_basis = WS_mpx->getMultiplexedCCs();
-        // StreamSet * const WS_Classes = P.CreateStreamSet(WS_basis.size());
-        // P.CreateKernelFamilyCall<CharClassesKernel>(WS_basis, BasisBits, WS_Classes);
-        // auto options = std::make_unique<GrepKernelOptions>();
-        // options->setIndexing(u8index);
-        // options->setRE(wsRule);
-        // options->addAlphabet(WS_mpx, WS_Classes);
-        // options->setResults(WordBoundaries);
-        // options->addExternal("UTF8_index", u8index);
-        // P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
         SHOW_STREAM(WordBoundaries);
         whiteSpaceLogic(P, BasisBits, u8index, WordBoundaries);
     }
@@ -668,43 +638,43 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         SHOW_STREAM(WordBoundaries);
     }
     else if (PreTokenizer == punctuation){
-    // Use punctuation pre-tokenizer
-    WordBoundaries = P.CreateStreamSet(1, 1);
-    re::RE * punctRule = re::generatePunctuationBoundaryRule();
-    const auto PC_Sets = re::collectCCs(punctRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-    auto PC_mpx = cc::makeMultiplexedAlphabet("PC_mpx", PC_Sets);
-    punctRule = transformCCs(PC_mpx, punctRule, re::NameTransformationMode::TransformDefinition);
-    auto PC_basis = PC_mpx->getMultiplexedCCs();
-    StreamSet * const PC_Classes = P.CreateStreamSet(PC_basis.size());
-    P.CreateKernelFamilyCall<CharClassesKernel>(PC_basis, BasisBits, PC_Classes);
-    auto options = std::make_unique<GrepKernelOptions>();
-    options->setIndexing(u8index);
-    options->setRE(punctRule);
-    options->addAlphabet(PC_mpx, PC_Classes);
-    options->setResults(WordBoundaries);
-    options->addExternal("UTF8_index", u8index);
-    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-    SHOW_STREAM(WordBoundaries);
+        // Use punctuation pre-tokenizer
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        re::RE * punctRule = re::generatePunctuationBoundaryRule();
+        const auto PC_Sets = re::collectCCs(punctRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+        auto PC_mpx = cc::makeMultiplexedAlphabet("PC_mpx", PC_Sets);
+        punctRule = transformCCs(PC_mpx, punctRule, re::NameTransformationMode::TransformDefinition);
+        auto PC_basis = PC_mpx->getMultiplexedCCs();
+        StreamSet * const PC_Classes = P.CreateStreamSet(PC_basis.size());
+        P.CreateKernelFamilyCall<CharClassesKernel>(PC_basis, BasisBits, PC_Classes);
+        auto options = std::make_unique<GrepKernelOptions>();
+        options->setIndexing(u8index);
+        options->setRE(punctRule);
+        options->addAlphabet(PC_mpx, PC_Classes);
+        options->setResults(WordBoundaries);
+        options->addExternal("UTF8_index", u8index);
+        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+        SHOW_STREAM(WordBoundaries);
 
    }
    else if (PreTokenizer == digits){
-    // Use digits pre-tokenizer
-    WordBoundaries = P.CreateStreamSet(1, 1);
-    re::RE * digitsRule = re::generateDigitBoundaryRule();
-    const auto DG_Sets = re::collectCCs(digitsRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-    auto DG_mpx = cc::makeMultiplexedAlphabet("DG_mpx", DG_Sets);
-    digitsRule = transformCCs(DG_mpx, digitsRule, re::NameTransformationMode::TransformDefinition);
-    auto DG_basis = DG_mpx->getMultiplexedCCs();
-    StreamSet * const DG_Classes = P.CreateStreamSet(DG_basis.size());
-    P.CreateKernelFamilyCall<CharClassesKernel>(DG_basis, BasisBits, DG_Classes);
-    auto options = std::make_unique<GrepKernelOptions>();
-    options->setIndexing(u8index);
-    options->setRE(digitsRule);
-    options->addAlphabet(DG_mpx, DG_Classes);
-    options->setResults(WordBoundaries);
-    options->addExternal("UTF8_index", u8index);
-    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-    SHOW_STREAM(WordBoundaries);
+        // Use digits pre-tokenizer
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        re::RE * digitsRule = re::generateDigitBoundaryRule();
+        const auto DG_Sets = re::collectCCs(digitsRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+        auto DG_mpx = cc::makeMultiplexedAlphabet("DG_mpx", DG_Sets);
+        digitsRule = transformCCs(DG_mpx, digitsRule, re::NameTransformationMode::TransformDefinition);
+        auto DG_basis = DG_mpx->getMultiplexedCCs();
+        StreamSet * const DG_Classes = P.CreateStreamSet(DG_basis.size());
+        P.CreateKernelFamilyCall<CharClassesKernel>(DG_basis, BasisBits, DG_Classes);
+        auto options = std::make_unique<GrepKernelOptions>();
+        options->setIndexing(u8index);
+        options->setRE(digitsRule);
+        options->addAlphabet(DG_mpx, DG_Classes);
+        options->setResults(WordBoundaries);
+        options->addExternal("UTF8_index", u8index);
+        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+        SHOW_STREAM(WordBoundaries);
 
     }
     // simple word boundries 
@@ -721,27 +691,23 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         
     }
     else if (PreTokenizer == bytelevel) {
-    // Use ByteLevel pre-tokenizer (GPT-2 regex splitting)
-    WordBoundaries = P.CreateStreamSet(1, 1);
-    re::RE * byteLevelRule = re::generateGPT2R50KRule();
-    if (!byteLevelRule) {
-        llvm::errs() << "Warning: failed to obtain GPT-2 ByteLevel regex. Falling back to whitespace split.\n";
-        byteLevelRule = re::generateByteLevelBoundaryRule();
-    }
-    const auto BL_Sets = re::collectCCs(byteLevelRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-    auto BL_mpx = cc::makeMultiplexedAlphabet("BL_mpx", BL_Sets);
-    byteLevelRule = transformCCs(BL_mpx, byteLevelRule, re::NameTransformationMode::TransformDefinition);
-    auto BL_basis = BL_mpx->getMultiplexedCCs();
-    StreamSet * const BL_Classes = P.CreateStreamSet(BL_basis.size());
-    P.CreateKernelFamilyCall<CharClassesKernel>(BL_basis, BasisBits, BL_Classes);
-    auto options = std::make_unique<GrepKernelOptions>();
-    options->setIndexing(u8index);
-    options->setRE(byteLevelRule);
-    options->addAlphabet(BL_mpx, BL_Classes);
-    options->setResults(WordBoundaries);
-    options->addExternal("UTF8_index", u8index);
-    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-    SHOW_STREAM(WordBoundaries);
+        // Use ByteLevel pre-tokenizer
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        re::RE * byteLevelRule = re::generateByteLevelBoundaryRule();
+        const auto BL_Sets = re::collectCCs(byteLevelRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+        auto BL_mpx = cc::makeMultiplexedAlphabet("BL_mpx", BL_Sets);
+        byteLevelRule = transformCCs(BL_mpx, byteLevelRule, re::NameTransformationMode::TransformDefinition);
+        auto BL_basis = BL_mpx->getMultiplexedCCs();
+        StreamSet * const BL_Classes = P.CreateStreamSet(BL_basis.size());
+        P.CreateKernelFamilyCall<CharClassesKernel>(BL_basis, BasisBits, BL_Classes);
+        auto options = std::make_unique<GrepKernelOptions>();
+        options->setIndexing(u8index);
+        options->setRE(byteLevelRule);
+        options->addAlphabet(BL_mpx, BL_Classes);
+        options->setResults(WordBoundaries);
+        options->addExternal("UTF8_index", u8index);
+        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+        SHOW_STREAM(WordBoundaries);
    }
     else if (PreTokenizer == bert) {
         // Use BERT pre-tokenizer (Whitespace + Punctuation)
@@ -763,31 +729,10 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         SHOW_STREAM(WordBoundaries);
     }
     else if (PreTokenizer == sequence_whitespace_punctuation) {
-
-        // Generate First Pre-tokenizer Boundaries (Whitespace)
-        // finalU21TokenBoundaries 
-
         StreamSet * preTokenStrm1 = P.CreateStreamSet(1, 1);
-        // re::RE * rule1 = re::generateWhitespaceBoundaryRule();
-        // const auto WS_Sets = re::collectCCs(rule1, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        // auto WS_mpx = cc::makeMultiplexedAlphabet("WS_mpx", WS_Sets);
-        // rule1 = transformCCs(WS_mpx, rule1, re::NameTransformationMode::TransformDefinition);
-        // auto WS_basis = WS_mpx->getMultiplexedCCs();
-        // StreamSet * const WS_Classes = P.CreateStreamSet(WS_basis.size());
-        // P.CreateKernelFamilyCall<CharClassesKernel>(WS_basis, BasisBits, WS_Classes);
-        // auto ws_options = std::make_unique<GrepKernelOptions>();
-        // ws_options->setIndexing(u8index);
-        // ws_options->setRE(rule1);
-        // ws_options->addAlphabet(WS_mpx, WS_Classes);
-        // ws_options->setResults(preTokenStrm1);
-        // ws_options->addExternal("UTF8_index", u8index);
-        // P.CreateKernelFamilyCall<ICGrepKernel>(std::move(ws_options));
-        // SHOW_STREAM(preTokenStrm1);
-        
         whiteSpaceLogic(P, BasisBits, u8index, preTokenStrm1);
        
         // Generate Second Pre-tokenizer Boundaries (Punctuation)
-      
         StreamSet * preTokenStrm2 = P.CreateStreamSet(1, 1);
         re::RE * rule2 = re::generatePunctuationBoundaryRule();
         const auto PC_Sets = re::collectCCs(rule2, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
@@ -805,9 +750,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(pc_options));
         SHOW_STREAM(preTokenStrm2);
 
-      
         // Combine Boundaries (OR operation)
-
         StreamSet * combinedBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<OrKernel>(preTokenStrm1, preTokenStrm2, combinedBoundaries);
         SHOW_STREAM(combinedBoundaries);
@@ -874,21 +817,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterName, U21codepoints, LetterStream);
     SHOW_STREAM(LetterStream);
 
-    // CreateKernelFamilyCall: Kernels that need runtime parameters, that are generic
-    
-    /*
-   // Create Mark property stream using Unicode general category 'Mark'
-    // Detects all Unicode mark characters (Mn, Mc, Me)
-    // Mn: Nonspacing marks , Mc: Spacing marks , Me: Enclosing marks
-    re::RE * markProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Mark");
-    markProp = UCD::linkAndResolve(markProp);
-    re::Name * markName = re::makeName("Mark");
-    markName->setDefinition(markProp);
-    StreamSet * MarkStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(markName, U21codepoints, MarkStream);
-    SHOW_STREAM(MarkStream);
-    */
-
     // Create Number property stream using Unicode general category 'Number'
     // Detects all Unicode number characters (Nd, Nl, No)
     // Nd: Decimal digit numbers, Nl: Letter numbers, No: Other numbers
@@ -917,104 +845,86 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Whitespace property stream using Unicode property 'space'
     // Detects all Unicode whitespace characters (space, tab, newline, etc.)
     // Includes: SPACE, TAB, LF, VT, FF, CR, NO-BREAK SPACE, etc.
-
     re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
     whitespaceProp = UCD::linkAndResolve(whitespaceProp);
     re::Name * whitespaceName = re::makeName("Whitespace");
     whitespaceName->setDefinition(whitespaceProp);
-    //StreamSet * WhitespaceStream = P.CreateStreamSet(1);
-    //P.CreateKernelCall<UnicodePropertyKernelBuilder>(whitespaceName, U21codepoints, WhitespaceMask);
-    //SHOW_STREAM(WhitespaceMask);
-    // Detect whitespace/delimiter positions
-    StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
-    SHOW_STREAM(WhitespaceMask);
 
     // Combine Letter and Number properties to detect alphanumeric characters
     StreamSet * AlphanumericMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UnicodeAlphanumericDetector>(U21codepoints, AlphanumericMask, LetterStream, NumberStream);
     SHOW_STREAM(AlphanumericMask);
 
+    // Detect whitespace/delimiter positions BEFORE spreading/inserting
+    // This ensures alignment with U21_tokenBoundaries
+    StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
+    SHOW_STREAM(WhitespaceMask);
+
     // Apply behavior transformation using appropriate kernel
     StreamSet * TransformedBoundaries = P.CreateStreamSet(1, 1);
 
-     // For BERT and Sequence pre-tokenizers, always use 'removed' behavior to skip whitespace
-    SplitBehaviorMode effectiveBehavior = SplitBehavior;
-    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit) {
-        effectiveBehavior = removed;
-    }
-    
-    if (effectiveBehavior == removed) {
-
-        // // FILTERBYMASK for Whitespace Removal
-        // // Remove whitespace characters from output
-    
-        // // Create keep mask (inverse of whitespace)
-        // // WhitespaceMask: 1=space, 0=non-space
-        // // keepMask:       1=keep(non-space), 0=remove(space)
-        // StreamSet * keepMask = P.CreateStreamSet(1);
-        // P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
-        // SHOW_STREAM(keepMask);
-
-        // // Filter U21 codepoints (remove whitespace characters)
-        // StreamSet * finalU21codepoints = P.CreateStreamSet(21);
-        // FilterByMask(P, keepMask, U21codepoints, finalU21codepoints);
-        // SHOW_BIXNUM(finalU21codepoints);
-        
-        // // Filter boundaries to stay aligned with compressed codepoints
-        // StreamSet * finalU21_tokenBoundaries = P.CreateStreamSet(1);
-        // FilterByMask(P, keepMask, U21_tokenBoundaries, finalU21_tokenBoundaries);
-        // SHOW_STREAM(finalU21_tokenBoundaries);
-
-        // // P.CreateKernelCall<RemovedBehavior>(finalU21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-        // TransformedBoundaries = finalU21_tokenBoundaries;
-        // U21codepoints = finalU21codepoints;
-
-        // calling the helper function to remove whitespace
-        auto removed = applyRemovedWhitespaceFilter(P, WhitespaceMask, U21codepoints, U21_tokenBoundaries);
-        TransformedBoundaries = removed.filteredTokenBoundaries;
-        U21codepoints = removed.filteredCodepoints;
-
-    } else if (effectiveBehavior == isolated) {
-        P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (effectiveBehavior == mergedwithprevious) {
-        P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (effectiveBehavior == mergedwithnext) {
-        P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
-    } else if (effectiveBehavior == contiguous) {
-        P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
-    } else {
-        llvm::errs() << "Error: Unknown SplitBehavior mode.\n";
-        exit(1);
-    }
-    SHOW_STREAM(TransformedBoundaries);
-    
-    StreamSet * TransformedBoundaries1 = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<RemoveFirstMarkKernel>(TransformedBoundaries, TransformedBoundaries1);
-    SHOW_STREAM(TransformedBoundaries1);
-
-    // Create insertion mask and spread original data
-    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, TransformedBoundaries1, kernel::InsertPosition::Before);
+    // Create insertion mask and spread original data 
+    // This is the first place the length of the stream changes.
+    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, U21_tokenBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
    
     StreamSet * spreadBasis = P.CreateStreamSet(21);
-    SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);
+    SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);  //? same U21_tokenBoundaries used for spreading and later filtering to stay aligned with codepoints
     //SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);
     SHOW_BIXNUM(spreadBasis);
 
-    // ??
     // Insert Token Separators
     StreamSet * tokenBasis = P.CreateStreamSet(21);
     P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     //P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     SHOW_BIXNUM(tokenBasis);
+    
+    // After spreading and inserting, we have new codepoints at the inserted positions.
+    StreamSet * finalU21codepoints = U21codepoints;
+    applySplitBehaviorTransformation(P, PreTokenizer, SplitBehavior, U21codepoints, WhitespaceMask, 
+                                  U21_tokenBoundaries, tokenBasis, AlphanumericMask, PunctuationStream,
+                                  finalU21codepoints, TransformedBoundaries);
+    SHOW_STREAM(TransformedBoundaries);
+
+     // For BERT and Sequence pre-tokenizers, always use 'removed' behavior to skip whitespace
+    // SplitBehaviorMode effectiveBehavior = SplitBehavior;
+    // if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
+    //     effectiveBehavior = removed;
+    // }
+    // StreamSet * finalU21codepoints = U21codepoints; // default to original codepoints if no filtering applied
+    
+    // if (effectiveBehavior == removed) {
+    //     finalU21codepoints = P.CreateStreamSet(21);
+
+    //     // calling the helper function to remove whitespace
+    //     // removed = applyRemovedWhitespaceFilter(P, WhitespaceMask, tokenBasis, U21_tokenBoundaries);
+    //     applyRemovedWhitespaceFilter(P, WhitespaceMask, tokenBasis, U21_tokenBoundaries, finalU21codepoints, TransformedBoundaries);
+
+    // } else if (effectiveBehavior == isolated) {
+    //     P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    // } else if (effectiveBehavior == mergedwithprevious) {
+    //     P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    // } else if (effectiveBehavior == mergedwithnext) {
+    //     P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+    // } else if (effectiveBehavior == contiguous) {
+    //     P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
+    // } else {
+    //     llvm::errs() << "Error: Unknown SplitBehavior mode.\n";
+    //     TransformedBoundaries = U21_tokenBoundaries; // default to no transformation
+    // }
+    // SHOW_STREAM(TransformedBoundaries);
+    
+    StreamSet * TransformedBoundaries1 = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<RemoveFirstMarkKernel>(TransformedBoundaries, TransformedBoundaries1);
+    SHOW_STREAM(TransformedBoundaries1);
+
 
     // Convert U21 codepoints back to UTF-8 basis bits
     StreamSet * output_basis = P.CreateStreamSet(8);
-    U21_to_UTF8(P, tokenBasis, output_basis);
+    U21_to_UTF8(P, finalU21codepoints, output_basis);
     SHOW_BIXNUM(output_basis);
 
-    // Output Processing
     // Convert parallel bit streams back to serial bytes
     StreamSet * tokenizedOutput = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(output_basis, tokenizedOutput);

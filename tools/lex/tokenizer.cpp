@@ -508,49 +508,41 @@ void applyRemovedWhitespaceFilter(PipelineBuilder & P,
     StreamSet * keepMask = P.CreateStreamSet(1);
     P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
 
-     StreamSet * keepMask2 = P.CreateStreamSet(1);
+    StreamSet * keepMask2 = P.CreateStreamSet(1);
     P.CreateKernelCall<OrKernel>(keepMask,U21_tokenBoundaries, keepMask2);
 
     FilterByMask(P, keepMask2, U21codepoints, finalU21codepoints);
 
     FilterByMask(P, keepMask2, U21_tokenBoundaries, finalU21_tokenBoundaries);
 }
-// Function to apply split behavior transformation based on pre-tokenizer selection and split behavior mode
+// Function to apply split behavior transformation based on split behavior mode
 void applySplitBehaviorTransformation(
     PipelineBuilder & P,
-    PreTokenizerMode PreTokenizer,
-    SplitBehaviorMode SplitBehavior,
-    StreamSet * U21codepoints,
-    StreamSet * WhitespaceMask,
-    StreamSet * U21_tokenBoundaries,
-    StreamSet * tokenBasis,
-    StreamSet * AlphanumericMask,
-    StreamSet * PunctuationStream,
+    SplitBehaviorMode effectiveBehavior,
+    StreamSet * spreadBasis,
+    StreamSet * spreadWhitespaceMask,
+    StreamSet * spreadTokenBoundaries,
+    StreamSet * spreadAlphanumericMask,
+    StreamSet * spreadPunctuationStream,
     StreamSet *& finalU21codepoints,
     StreamSet *& TransformedBoundaries)
 {
-    // For some pre-tokenizers, use 'removed' behavior to skip whitespace
-    SplitBehaviorMode effectiveBehavior = SplitBehavior;
-    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
-        effectiveBehavior = removed;
-    }
-    finalU21codepoints = U21codepoints; // default to original codepoints if no filtering applied
+    finalU21codepoints = spreadBasis; // default to original codepoints if no filtering applied
     
     if (effectiveBehavior == removed) {
         finalU21codepoints = P.CreateStreamSet(21);
-        // changed tokenBasis to U21codepoints
-        applyRemovedWhitespaceFilter(P, WhitespaceMask, U21codepoints, U21_tokenBoundaries, finalU21codepoints, TransformedBoundaries);
+        applyRemovedWhitespaceFilter(P, spreadWhitespaceMask, spreadBasis, spreadTokenBoundaries, finalU21codepoints, TransformedBoundaries);
     } else if (effectiveBehavior == isolated) {
-        P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<IsolatedBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, TransformedBoundaries);
     } else if (effectiveBehavior == mergedwithprevious) {
-        P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<MergedWithPreviousBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, TransformedBoundaries);
     } else if (effectiveBehavior == mergedwithnext) {
-        P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, TransformedBoundaries);
+        P.CreateKernelCall<MergedWithNextBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, TransformedBoundaries);
     } else if (effectiveBehavior == contiguous) {
-        P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, TransformedBoundaries);
+        P.CreateKernelCall<ContiguousBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, spreadAlphanumericMask, spreadPunctuationStream, TransformedBoundaries);
     } else {
         llvm::errs() << "Error: Unknown SplitBehavior mode.\n";
-        TransformedBoundaries = U21_tokenBoundaries; // default to no transformation
+        TransformedBoundaries = spreadTokenBoundaries; // default to no transformation
     }
     SHOW_STREAM(TransformedBoundaries);
 }
@@ -577,8 +569,8 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Unicode Word Boundary Rules
     StreamSet * WordBoundaries = nullptr;
     
-    (void)PreTokenizer; // PreTokenizer variable used later; silence unused-warning if any
-    (void)Locale;
+    // (void)PreTokenizer; // PreTokenizer variable used later; silence unused-warning if any
+    // (void)Locale;
 
     if (PreTokenizer == icu || !Locale.empty()) {
         // Use ICU locale-aware word boundaries
@@ -895,10 +887,16 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * spreadPunctuationStream = P.CreateStreamSet(1);
     SpreadByMask(P, lineInsertMask, PunctuationStream, spreadPunctuationStream);
     
+    // Compute effective behavior mode based on PreTokenizer choice
+    SplitBehaviorMode effectiveBehavior = SplitBehavior;
+    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
+        effectiveBehavior = removed;
+    }
+    
     // After spreading and inserting, we have new codepoints at the inserted positions.
     StreamSet * finalU21codepoints = tokenBasis;
-    applySplitBehaviorTransformation(P, PreTokenizer, SplitBehavior, tokenBasis, spreadWhitespaceMask, 
-                                  spreadTokenBoundaries, tokenBasis, spreadAlphanumericMask, spreadPunctuationStream,
+    applySplitBehaviorTransformation(P, effectiveBehavior, tokenBasis, spreadWhitespaceMask, 
+                                  spreadTokenBoundaries, spreadAlphanumericMask, spreadPunctuationStream,
                                   finalU21codepoints, TransformedBoundaries);
     SHOW_STREAM(TransformedBoundaries);
     

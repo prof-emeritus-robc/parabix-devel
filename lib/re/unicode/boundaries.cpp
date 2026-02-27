@@ -574,7 +574,7 @@ RE * generateBertPreTokenizerRule() {
 }
 // Sequence Pre-Tokenizer: Whitespace then Punctuation
 // This applies whitespace splitting first, then punctuation splitting within each chunk
-// Result: separates punctuation and words, with whitespace as implicit delimiter
+// Result: separates punctuation and words, with whites implicit delimiter
 RE * generateSequenceWhitespacePunctuationRule() {
     // Pattern: Match punctuation OR word sequences OR special chars (not whitespace)
     // [[:punct:]] = individual punctuation characters

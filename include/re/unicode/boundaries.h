@@ -50,4 +50,11 @@ RE * generateBertPreTokenizerRule();
 
 // Sequence Pre-Tokenizer: Whitespace then Punctuation
 RE * generateSequenceWhitespacePunctuationRule();
+
+enum RE_TokenizerKind {
+    GPT2R50K, WhitespaceBoundary, WhitespaceSplitBoundary, PunctuationBoundary, DigitBoundary, 
+    ByteLevelBoundary, BertPreTokenizer, SequenceWhitespacePunctuation, KindCount
+};
+
+RE * generateRE_TokenizerRule(RE_TokenizerKind k);
 }

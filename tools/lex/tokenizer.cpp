@@ -91,6 +91,15 @@ enum SplitBehaviorMode {
   contiguous
 };
 
+std::string SplitCode(SplitBehaviorMode s) {
+    if (s == isolated) return "i";
+    if (s == contiguous) return "c";
+    if (s == mergedwithprevious) return "p";
+    if (s == mergedwithnext) return "n";
+    if (s == removed) return "r";
+    return "d";
+}
+
 // pretokenizer selection as named alternative 
 static cl::opt<PreTokenizerMode> PreTokenizer(
     "pretokenizer",
@@ -340,6 +349,48 @@ protected:
         writeOutputStreamSet("WhitespaceMask", std::vector<PabloAST*>{isSpace});
     }
 };
+
+
+// 
+//  Given SplitMarks marking characters that are "split" characters,
+//  produce output token marks according to a given split behaviour
+//  mode.   The result is a correct token mark stream, but an additional
+//  step is required when the behaviour is "removed" in which case all
+//  the split characters must be deleted.
+//
+class SplitMarksToTokens : public PabloKernel {
+public:
+    SplitMarksToTokens(LLVMTypeSystemInterface & ts,
+                  SplitBehaviorMode b, StreamSet * SplitMarks, StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "SplitMarksToTokens:" + SplitCode(b) ,
+                  {Binding{"SplitMarks", SplitMarks}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}), mBehavior(b) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * SplitMarks = getInputStreamSet("SplitMarks")[0];
+        //
+        PabloAST * SplitRun1 = pb.createAnd(pb.createAdvance(pb.createNot(SplitMarks), 1), SplitMarks);
+        PabloAST * SplitRunFollow = pb.createAnd(pb.createAdvance(SplitMarks, 1), pb.createNot(SplitMarks));
+        PabloAST * result = nullptr;
+        if (mBehavior == contiguous) {
+            result = pb.createOr(SplitRun1, SplitRunFollow);
+        } else if (mBehavior == mergedwithprevious) {
+            result = SplitRunFollow;
+        } else if (mBehavior == removed) {
+            result = SplitRunFollow;
+        } else if (mBehavior == mergedwithnext) {
+            result = SplitRun1;
+        } else { // isolated
+            result = pb.createOr(SplitMarks, SplitRunFollow);
+        }
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
+    }
+private:
+    SplitBehaviorMode mBehavior;
+};
+
 
 // Behavior mode 1: Removed - only keep word/punctuation boundaries, exclude whitespace
 class RemovedBehavior : public PabloKernel {

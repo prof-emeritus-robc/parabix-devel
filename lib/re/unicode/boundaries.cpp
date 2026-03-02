@@ -593,4 +593,29 @@ RE * generateSequenceWhitespacePunctuationRule() {
     r = UCD::linkAndResolve(r);
     return r;
 }
+
+const static std::map<RE_TokenizerKind, std::string> PreTokenizerPatterns =
+
+    {{GPT2R50K, R"GPT('(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s)GPT"},
+        {WhitespaceBoundary, R"(\w++|[^\w\s]++)"},
+        {WhitespaceSplitBoundary, R"(\S+(?!\S)|\s+(?!\s))"},
+        {PunctuationBoundary, R"([[:punct:]]|[^[:punct:]]++)"},
+        {DigitBoundary, R"(\d++|[^\d\s]++|\s++)"},
+        {ByteLevelBoundary, R"(\s++|\S++)"},
+        {BertPreTokenizer, R"(\w++|[^\w\s]++)"},
+        {SequenceWhitespacePunctuation, R"(\w++|[^\w\s]++)"}};
+
+
+RE * generateRE_TokenizerRule(RE_TokenizerKind k) {
+    auto f = PreTokenizerPatterns.find(k);
+    auto & pat = f->second;
+    RE * r = re::RE_Parser::parse(pat, re::DEFAULT_MODE, re::RE_Syntax::PCRE, false);
+    if (!r) {
+        llvm::errs() << "Error: failed to parse Sequence[Whitespace,Punctuation] pattern.\n";
+        return nullptr;
+    }
+    r = UCD::linkAndResolve(r);
+    return r;
+}
+
 }

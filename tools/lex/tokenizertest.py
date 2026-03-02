@@ -13,7 +13,32 @@
 import sys
 import subprocess
 import os
+import shlex
 import xml.etree.ElementTree as ET  # For XML parsing
+
+VALID_PRETOKENIZERS = {
+    "uax29",
+    "whitespace",
+    "whitespacesplit",
+    "digits",
+    "punctuation",
+    "simplewordboundaries",
+    "bytelevel",
+    "chardelimiter",
+    "bert",
+    "sequence_whitespace_punctuation",
+}
+
+VALID_BEHAVIORS = {
+    "removed",
+    "isolated",
+    "mergedwithprevious",
+    "mergedwithnext",
+    "contiguous",
+}
+
+def normalize_pretokenizer(name):
+    return (name or "").strip()
 
 def read_all_tests_from_xml(xml_file):
     """Read all test cases from XML file"""
@@ -32,9 +57,21 @@ def read_all_tests_from_xml(xml_file):
     for testcase in root.findall('tokenizercase'):
         inputdata_id = testcase.get('inputdata')
         input_text = inputdata_map.get(inputdata_id, "")
-        pretokenizer = testcase.get('pretokenizer', "whitespace")
-        behavior = testcase.get('behavior', "")  # Optional behavior attribute
+        pretokenizer = normalize_pretokenizer(testcase.get('pretokenizer', ""))
+        behavior = (testcase.get('behavior', "") or "").strip()  # Optional behavior attribute
         expectedcount = testcase.get('expectedcount', "2")
+
+        if pretokenizer and pretokenizer not in VALID_PRETOKENIZERS:
+            raise ValueError(
+                f"Invalid pretokenizer '{pretokenizer}' in testcase '{inputdata_id}'. "
+                f"Valid values: {sorted(VALID_PRETOKENIZERS)}"
+            )
+
+        if behavior and behavior not in VALID_BEHAVIORS:
+            raise ValueError(
+                f"Invalid behavior '{behavior}' in testcase '{inputdata_id}'. "
+                f"Valid values: {sorted(VALID_BEHAVIORS)}"
+            )
         
         tests.append({
             'input': input_text,
@@ -59,13 +96,15 @@ def main():
         print(f"Error: Tokenizer not found: {tokenizer_path}")
         sys.exit(1)
     
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+
     # Create test directory
-    testdir = "testfiles"
+    testdir = os.path.join(script_dir, "testfiles")
     if not os.path.exists(testdir):
         os.makedirs(testdir)
     
     # Read all tests from XML
-    xml_file = "tokenizertest.xml"
+    xml_file = os.path.join(script_dir, "tokenizertest.xml")
     if not os.path.isfile(xml_file):
         print(f"Error: Test file not found: {xml_file}")
         return 1
@@ -109,21 +148,21 @@ def main():
         print()
         
         # Run tokenizer - build command with optional flags
-        cmd = f"{tokenizer_path} {input_file}"
+        cmd = [tokenizer_path, input_file]
         
         # Only add --pretokenizer flag if it has a non-empty value
         if pretokenizer:
-            cmd += f" --pretokenizer {pretokenizer}"
+            cmd += ["--pretokenizer", pretokenizer]
         
         # Only add --behavior flag if it has a non-empty value
         if behavior:
-            cmd += f" --behavior {behavior}"
+            cmd += ["--behavior", behavior]
         
-        print(f"Command: {cmd}")
+        print(f"Command: {' '.join(shlex.quote(part) for part in cmd)}")
         print()
         
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
             output = result.stdout
             
             # Count tokens (each token is on its own line)

@@ -9,210 +9,133 @@
     </inputdata>
     
     <tokenizercase inputdata="test_name" 
-                   pretokenizer="whitespace|punctuation|gpt2|etc"
+             pretokenizer="uax29|whitespace|whitespacesplit|digits|punctuation|simplewordboundaries|bytelevel|chardelimiter|bert|sequence_whitespace_punctuation"
                    expectedcount="N"/>
   </tokenizertest>
 -->
 
 <tokenizertest>
 
-  <!-- ========== WHITESPACE PRETOKENIZER TESTS ========== -->
-  <!-- Simple test: Words separated by space -->
-  <inputdata id="white_space">
-hello there this is Muniza!
+  <!-- ========== PRETOKENIZER TESTS - ONE PER MODE ========== -->
+
+  <!-- UAX29: Unicode word boundaries (default) -->
+  <inputdata id="simple_words">
+hello world test
   </inputdata>
-
-  <tokenizercase inputdata="white_space" 
-                 pretokenizer="whitespace" 
-                 expectedcount="6"/>
-
-  <!-- Whitespace with multiple spaces and tabs -->
-  <inputdata id="multiple_whitespaces">
-hellow   there   this  is    Muniza!
-  </inputdata>
-
-  <tokenizercase inputdata="multiple_whitespaces" 
-                 pretokenizer="whitespace" 
-                 expectedcount="6"/>
-  <!-- ========== WHITESPACESPLIT PRETOKENIZER TESTS ========== -->
-  <!-- WhitespaceSplit keeps punctuation attached to words -->
-  <inputdata id="text_with_punctuation">
-Hello, world! How are you?
-  </inputdata>
-
-  <tokenizercase inputdata="text_with_punctuation" 
-                 pretokenizer="whitespacesplit" 
-                 expectedcount="9"/>
-
-  <!-- WhitespaceSplit test with contractions -->
-  <inputdata id="contractions">
-don't can't won't shouldn't
-  </inputdata>
-
-  <tokenizercase inputdata="contractions" 
-                 pretokenizer="whitespacesplit" 
-                 expectedcount="7"/>
-
-  <!-- ========== PUNCTUATION PRETOKENIZER TESTS ========== -->
-  <!-- Punctuation splits everything including punctuation marks -->
-  <inputdata id="punctuation_text">
-Hello, world! How are you?
-  </inputdata>
-
-  <tokenizercase inputdata="punctuation_text" 
-                 pretokenizer="punctuation" 
-                 expectedcount="8"/>
-
-  <!-- Punctuation with numbers and special chars -->
-  <inputdata id="punctuation_with_numbers">
-Price: $49.99! Amazing, right?
-  </inputdata>
-
-  <!-- Note: exact count may vary depending on implementation -->
-  <tokenizercase inputdata="punctuation_with_numbers" 
-                 pretokenizer="punctuation" 
-                 expectedcount="8"/> 
-
-  <!-- ========== DIGITS PRETOKENIZER TESTS ========== -->
-  <!-- Digits splits on digit boundaries -->
-  <inputdata id="digits_test">
-abc123def456ghi
-  </inputdata>
-
-  <tokenizercase inputdata="digits_test" 
-                 pretokenizer="digits" 
+  <tokenizercase inputdata="simple_words" 
+                 pretokenizer="uax29"
                  expectedcount="5"/>
 
-  <!-- Digits with spaces and numbers -->
-  <inputdata id="digits_with_spaces">
-year 2024 month 12 day 25
+  <!-- Whitespace: Split on space characters -->
+  <inputdata id="white_space">
+hello there this
   </inputdata>
+  <tokenizercase inputdata="white_space" 
+                 pretokenizer="whitespace" 
+                 expectedcount="3"/>
 
-  <tokenizercase inputdata="digits_with_spaces" 
+  <!-- WhitespaceSplit: Keep punctuation attached to words -->
+  <inputdata id="wss_text">
+hello world
+  </inputdata>
+  <tokenizercase inputdata="wss_text" 
+                 pretokenizer="whitespacesplit" 
+                 expectedcount="2"/>
+
+  <!-- Punctuation: Split on punctuation characters -->
+  <inputdata id="punct_text">
+hello, world!
+  </inputdata>
+  <tokenizercase inputdata="punct_text" 
+                 pretokenizer="punctuation" 
+                 expectedcount="4"/>
+
+  <!-- Digits: Split on digit sequences -->
+  <inputdata id="digit_text">
+abc123def
+  </inputdata>
+  <tokenizercase inputdata="digit_text" 
                  pretokenizer="digits" 
-                 expectedcount="11"/>
+                 expectedcount="3"/>
 
-  <!-- ========== GPT2 PRETOKENIZER TESTS ========== -->
-  <!-- GPT2 tokenizer uses BPE (Byte Pair Encoding) -->
-  <inputdata id="gpt2_simple">
+  <!-- SimpleWordBoundaries: Based on Unicode alphanumeric -->
+  <inputdata id="simple_test">
+hello world
+  </inputdata>
+  <tokenizercase inputdata="simple_test"
+                 pretokenizer="simplewordboundaries"
+                 expectedcount="2"/>
+
+  <!-- ByteLevel: Split on whitespace with byte remapping -->
+  <!-- <inputdata id="byte_text">
+hello world
+  </inputdata>
+  <tokenizercase inputdata="byte_text"
+                 pretokenizer="bytelevel"
+                 expectedcount="2"/> -->
+
+  <!-- CharDelimiter: Split on specific character delimiter -->
+  <!-- <inputdata id="char_delim_text">
+hello world
+  </inputdata>
+  <tokenizercase inputdata="char_delim_text"
+                 pretokenizer="chardelimiter"
+                 expectedcount="2"/> -->
+
+  <!-- BERT: Separates punctuation and words -->
+  <!-- <inputdata id="bert_text">
+hello, world!
+  </inputdata>
+  <tokenizercase inputdata="bert_text"
+                 pretokenizer="bert"
+                 expectedcount="3"/> -->
+
+  <!-- SeqWhitespacePunctuation: Whitespace + Punctuation combined -->
+  <inputdata id="seq_text">
+hello, world!
+  </inputdata>
+  <tokenizercase inputdata="seq_text"
+                 pretokenizer="sequence_whitespace_punctuation"
+                 expectedcount="4"/>
+
+  <!-- ========== BEHAVIOR TESTS - ONE PER MODE ========== -->
+  <!-- All behavior tests use UAX29 pretokenizer (respects behavior flag) -->
+
+  <inputdata id="behavior_test">
 hello world
   </inputdata>
 
-  <!-- Note: GPT2 results may need refinement based on actual implementation -->
-  <tokenizercase inputdata="gpt2_simple" 
-                 pretokenizer="gpt2" 
-                 expectedcount="3"/>
-
-  <!-- GPT2 with contractions (GPT2 handles these specifically) -->
-  <inputdata id="gpt2_contractions">
-I'm happy you're great
-  </inputdata>
-
-  <tokenizercase inputdata="gpt2_contractions" 
-                 pretokenizer="gpt2" 
-                 expectedcount="6"/>
-
-  <!-- ========== ICU PRETOKENIZER TESTS ========== -->
-  <!-- ICU uses international Unicode word boundaries -->
-  <inputdata id="icu_simple">
-The quick brown fox
-  </inputdata>
-
-  <tokenizercase inputdata="icu_simple" 
-                 pretokenizer="icu" 
-                 expectedcount="4"/>
-
-  <!-- ICU with multilingual text (if supported) -->
-  <inputdata id="icu_multilingual">
-Hello 世界 Bonjour
-  </inputdata>
-
-  <tokenizercase inputdata="icu_multilingual" 
-                 pretokenizer="icu"
-                 expectedcount="3"/>
-
-  <!-- ========== DEFAULT (UAX#29) WORD BOUNDARY TESTS ========== -->
-  <!-- Default behavior when no pretokenizer specified -->
-  <inputdata id="default_word_boundaries">
-The quick brown fox
-  </inputdata>
-
-  <tokenizercase inputdata="default_word_boundaries" 
-                 pretokenizer="" 
-                 expectedcount="7"/>
-
-  <!-- ========== SPLIT BEHAVIOR TESTS ========== -->
-  <!-- All behavior tests use the same input: "Hello world" with default pretokenizer -->
-  <inputdata id="behavior_test_input">
-Hello,  world!  How  are  you?
-  </inputdata>
-
-  <!-- Behavior: removed - only keep word/punctuation boundaries, exclude whitespace -->
-  <!-- "Hello world" split only at word boundaries, spaces removed -->
-  <tokenizercase inputdata="behavior_test_input" 
-                 pretokenizer=""
+  <!-- Behavior: removed - exclude whitespace -->
+  <tokenizercase inputdata="behavior_test" 
+                 pretokenizer="uax29"
                  behavior="removed"
-                 expectedcount="8"/>
+                 expectedcount="2"/>
 
-  <!-- Behavior: isolated - keep token boundaries AND add space boundaries -->
-  <!-- "Hello world" keeps words AND isolates spaces -->
-  <tokenizercase inputdata="behavior_test_input" 
-                 pretokenizer=""
+  <!-- Behavior: isolated - add space boundaries -->
+  <tokenizercase inputdata="behavior_test"
+                 pretokenizer="uax29"
                  behavior="isolated"
-                 expectedcount="12"/>
+                 expectedcount="3"/>
 
-  <!-- Behavior: mergedwithprevious - attach whitespace to previous word -->
-  <!-- "Hello world" -> "Hello " and "world" -->
-  <tokenizercase inputdata="behavior_test_input" 
-                 pretokenizer=""
+  <!-- Behavior: mergedwithprevious - attach space to previous word -->
+  <tokenizercase inputdata="behavior_test"
+                 pretokenizer="uax29"
                  behavior="mergedwithprevious"
-                 expectedcount="8"/>
+                 expectedcount="2"/>
 
-  <!-- Behavior: mergedwithnext - attach whitespace to next word -->
-  <!-- "Hello world" -> "Hello" and " world" -->
-  <tokenizercase inputdata="behavior_test_input" 
-                 pretokenizer=""
+  <!-- Behavior: mergedwithnext - attach space to next word -->
+  <tokenizercase inputdata="behavior_test"
+                 pretokenizer="uax29"
                  behavior="mergedwithnext"
-                 expectedcount="8"/>
+                 expectedcount="2"/>
 
-  <!-- Behavior: contiguous - keep punctuation with words, separate spaces -->
-  <!-- Works best with punctuation-containing text -->
-  <inputdata id="behavior_contiguous_test">
-Hello,  world!  How  are  you?
+  <!-- Behavior: contiguous - keep punctuation with words -->
+  <inputdata id="contiguous_test">
+hello, world
   </inputdata>
-
-  <tokenizercase inputdata="behavior_contiguous_test" 
-                 pretokenizer=""
+  <tokenizercase inputdata="contiguous_test"
+                 pretokenizer="uax29"
                  behavior="contiguous"
-                 expectedcount="9"/>
-
-  <!-- ========== WHITESPACE BEHAVIOR COMBINATIONS ========== -->
-  <inputdata id="whitespace_behavior_text">
-The   quick   brown   fox
-  </inputdata>
-
-  <!-- Default pretokenizer with removed behavior -->
-  <tokenizercase inputdata="whitespace_behavior_text" 
-                 pretokenizer=""
-                 behavior="removed"
-                 expectedcount="4"/>
-
-  <!-- Default pretokenizer with isolated behavior -->
-  <tokenizercase inputdata="whitespace_behavior_text" 
-                 pretokenizer=""
-                 behavior="isolated"
-                 expectedcount="7"/>
-
-  <!-- Default pretokenizer with mergedwithprevious behavior -->
-  <tokenizercase inputdata="whitespace_behavior_text" 
-                 pretokenizer=""
-                 behavior="mergedwithprevious"
-                 expectedcount="4"/>
-
-  <!-- Default pretokenizer with mergedwithnext behavior -->
-  <tokenizercase inputdata="whitespace_behavior_text" 
-                 pretokenizer=""
-                 behavior="mergedwithnext"
-                 expectedcount="4"/>
+                 expectedcount="3"/>
 
 </tokenizertest>

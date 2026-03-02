@@ -529,7 +529,7 @@ StreamSet* buildREBasedTokenizer(
 
 // Struct to hold tokenizer configuration
 struct TokenizerConfig {
-    re::RE_TokenizerKind kind;
+    re::RE_TokenizerKind kind;   // Enum value from boundaries.h
     std::string prefix;  // Prefix for multiplexed alphabet (e.g., "PC", "WS")
 };
 
@@ -604,7 +604,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         
         if (it != TokenizerConfigs.end()) {
             // Found in map: call the generator function and build pipeline
-            re::RE* rule = generateRE_TokenizerRule(it->second.kind);  // Call function pointer
+            re::RE* rule = generateRE_TokenizerRule(it->second.kind);  // Call enum depatcher to get the appropriate RE rule
             WordBoundaries = buildREBasedTokenizer(P, it->second.prefix, 
                                                    rule, BasisBits, u8index);
         } else {

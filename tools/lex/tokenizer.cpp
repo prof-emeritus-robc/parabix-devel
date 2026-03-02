@@ -51,9 +51,6 @@
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/boundary_kernels.h>
 
-// ICU boundary provider
-#include "ICU_Boundaries.h"
-
 namespace fs = boost::filesystem;
 
 using namespace llvm;
@@ -68,8 +65,6 @@ static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), 
 // Enum for pre-tokenizer selection
 enum PreTokenizerMode {
   uax29,
-  icu,
-  gpt2,
   whitespace,
   whitespacesplit,
   digits,
@@ -107,8 +102,6 @@ static cl::opt<PreTokenizerMode> PreTokenizer(
     cl::init(uax29),      // DEFAULT VALUE
     cl::values(
         clEnumValN(uax29, "uax29", "Unicode UAX#29 word boundaries (default)"),
-        clEnumValN(icu, "icu", "ICU BreakIterator word boundaries"),
-        clEnumValN(gpt2, "gpt2", "GPT-2 style tokenization"),
         clEnumValN(whitespace, "whitespace", "Split on whitespace characters"),
         clEnumValN(whitespacesplit, "whitespacesplit", "Split on whitespace and output delimiters as separate tokens"),
         clEnumValN(digits, "digits", "Split on digit sequences"),
@@ -133,12 +126,6 @@ static cl::opt<SplitBehaviorMode> SplitBehavior("behavior",
         clEnumValN(mergedwithprevious, "mergedwithprevious", "attach whitespace to previous word"),
         clEnumValN(mergedwithnext, "mergedwithnext", "attach whitespace to next word"),
         clEnumValN(contiguous, "contiguous", "keep punctuation with words, separate spaces")),
-    cl::cat(wordBreakerFlags));
-
-// ICU locale remains as string (accepts arbitrary locale values)
-static cl::opt<std::string> Locale("locale",
-    cl::desc("ICU locale for word boundaries (e.g., en_US, fr_FR, ja_JP). Empty = default UAX#29"),
-    cl::init(""),
     cl::cat(wordBreakerFlags));
 
 // Remove first position mark from insertion mask
@@ -206,7 +193,6 @@ protected:
         writeOutputStreamSet("finalBasis", out);
     }
 };
-
 
 // AND kernel to ensure boundaries only occur at UTF-8 character starts
 class AndKernel : public PabloKernel {
@@ -597,6 +583,61 @@ void applySplitBehaviorTransformation(
     }
     SHOW_STREAM(TransformedBoundaries);
 }
+// Function Declaration
+// Helper function to build RE-based tokenizer boundaries
+// Centralizes the common pattern: generate RE → collect CCs → multiplex → create kernels
+StreamSet* buildREBasedTokenizer(
+    PipelineBuilder& P,
+    const std::string& prefixName,  // unique identifier for this tokenizer e.g., "PC", "WS"
+    re::RE* rule,                  // the regex pattern to use
+    StreamSet* BasisBits,          // the basis bits representing the input characters
+    StreamSet* u8index             // UTF-8 character boundary index for correct token boundary alignment
+) {
+    if (!rule) {
+        llvm::errs() << "Error: null RE rule for " << prefixName << "\n";
+        return nullptr;
+    }
+    // empty stream to hold the boundary results
+    StreamSet* WordBoundaries = P.CreateStreamSet(1, 1);
+    
+    const auto Sets = re::collectCCs(rule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
+    auto mpx = cc::makeMultiplexedAlphabet(prefixName + "_mpx", Sets);
+    rule = transformCCs(mpx, rule, re::NameTransformationMode::TransformDefinition);
+    auto basis = mpx->getMultiplexedCCs();
+    
+    StreamSet* const Classes = P.CreateStreamSet(basis.size());
+    P.CreateKernelFamilyCall<CharClassesKernel>(basis, BasisBits, Classes);
+    
+    auto options = std::make_unique<GrepKernelOptions>();
+    options->setIndexing(u8index);
+    options->setRE(rule);
+    options->addAlphabet(mpx, Classes);
+    options->setResults(WordBoundaries);
+    options->addExternal("UTF8_index", u8index);
+    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+    
+    SHOW_STREAM(WordBoundaries);
+    return WordBoundaries;
+}
+
+// Function pointer type for RE generator functions
+using REGeneratorFunc = re::RE* (*)();
+
+// Struct to hold tokenizer configuration
+struct TokenizerConfig {
+    REGeneratorFunc generator;  // Function to generate the regex rule
+    std::string prefix;         // Prefix for multiplexed alphabet (e.g., "PC", "WS")
+};
+
+// Single map combining both pieces of information
+const static std::map<PreTokenizerMode, TokenizerConfig> TokenizerConfigs = {
+    {whitespace, {re::generateWhitespaceBoundaryRule, "WS"}},
+    {whitespacesplit, {re::generateWhitespaceSplitBoundaryRule, "WSS"}},
+    {punctuation, {re::generatePunctuationBoundaryRule, "PC"}},
+    {digits, {re::generateDigitBoundaryRule, "DG"}},
+    {bytelevel, {re::generateByteLevelBoundaryRule, "BL"}},
+    {bert, {re::generateBertPreTokenizerRule, "BERT"}}
+};
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
@@ -617,111 +658,12 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
     SHOW_STREAM(u8index);
+    
     // Unicode Word Boundary Rules
     StreamSet * WordBoundaries = nullptr;
-    
-    // (void)PreTokenizer; // PreTokenizer variable used later; silence unused-warning if any
-    // (void)Locale;
 
-    if (PreTokenizer == icu || !Locale.empty()) {
-        // Use ICU locale-aware word boundaries
-        WordBoundaries = buildWordBoundaryMaskFromICU(P, BasisBits, u8index, Locale);
-        SHOW_STREAM(WordBoundaries);
-
-    }else if (PreTokenizer == gpt2) {
-        // Use GPT-2 r50k regex pretokenizer (centralized in boundaries.cpp)
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * parsedRE = re::generateGPT2R50KRule();
-        if (!parsedRE) {
-            llvm::errs() << "Warning: failed to obtain GPT-2 pretokenizer regex. Falling back to UAX#29.\n";
-            parsedRE = re::generateWordBoundaryRule();
-        }
-        const auto Sets = re::collectCCs(parsedRE, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto mpx = cc::makeMultiplexedAlphabet("GPT2_mpx", Sets);
-        parsedRE = transformCCs(mpx, parsedRE, re::NameTransformationMode::TransformDefinition);
-        auto basis = mpx->getMultiplexedCCs();
-        StreamSet * const Classes = P.CreateStreamSet(basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(basis, BasisBits, Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(parsedRE);
-        options->addAlphabet(mpx, Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-        SHOW_STREAM(WordBoundaries);
-    }
-    //Input: "Hello there!"
-    //Output: "Hello", "there", "!"   
-    else if (PreTokenizer == whitespace){
-        // seperate function for white space that we call here 
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        SHOW_STREAM(WordBoundaries);
-        whiteSpaceLogic(P, BasisBits, u8index, WordBoundaries);
-    }
-    //Input: "Hello there!"
-    //Output: "Hello", "there!"
-    else if(PreTokenizer == whitespacesplit){
-        // Use WhitespaceSplit pre-tokenizer
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * wssRule = re::generateWhitespaceSplitBoundaryRule();
-        const auto WSS_Sets = re::collectCCs(wssRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto WSS_mpx = cc::makeMultiplexedAlphabet("WSS_mpx", WSS_Sets);
-        wssRule = transformCCs(WSS_mpx, wssRule, re::NameTransformationMode::TransformDefinition);
-        auto WSS_basis = WSS_mpx->getMultiplexedCCs();
-        StreamSet * const WSS_Classes = P.CreateStreamSet(WSS_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(WSS_basis, BasisBits, WSS_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(wssRule);
-        options->addAlphabet(WSS_mpx, WSS_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-        SHOW_STREAM(WordBoundaries);
-    }
-    else if (PreTokenizer == punctuation){
-        // Use punctuation pre-tokenizer
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * punctRule = re::generatePunctuationBoundaryRule();
-        const auto PC_Sets = re::collectCCs(punctRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto PC_mpx = cc::makeMultiplexedAlphabet("PC_mpx", PC_Sets);
-        punctRule = transformCCs(PC_mpx, punctRule, re::NameTransformationMode::TransformDefinition);
-        auto PC_basis = PC_mpx->getMultiplexedCCs();
-        StreamSet * const PC_Classes = P.CreateStreamSet(PC_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(PC_basis, BasisBits, PC_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(punctRule);
-        options->addAlphabet(PC_mpx, PC_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-        SHOW_STREAM(WordBoundaries);
-
-   }
-   else if (PreTokenizer == digits){
-        // Use digits pre-tokenizer
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * digitsRule = re::generateDigitBoundaryRule();
-        const auto DG_Sets = re::collectCCs(digitsRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto DG_mpx = cc::makeMultiplexedAlphabet("DG_mpx", DG_Sets);
-        digitsRule = transformCCs(DG_mpx, digitsRule, re::NameTransformationMode::TransformDefinition);
-        auto DG_basis = DG_mpx->getMultiplexedCCs();
-        StreamSet * const DG_Classes = P.CreateStreamSet(DG_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(DG_basis, BasisBits, DG_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(digitsRule);
-        options->addAlphabet(DG_mpx, DG_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-        SHOW_STREAM(WordBoundaries);
-
-    }
-    // simple word boundries 
-    else if(PreTokenizer == simpleWordBoundaries){
+    // Special case: simpleWordBoundaries uses different kernel pipeline
+    if(PreTokenizer == simpleWordBoundaries){
         // Use simple word boundaries based on Unicode "word" property
         WordBoundaries = P.CreateStreamSet(1, 1);
         re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
@@ -731,97 +673,42 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         StreamSet * WordStream = P.CreateStreamSet(1);
         P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, BasisBits, WordStream);
         P.CreateKernelCall<BoundaryKernel>(WordStream, u8index, WordBoundaries);
-        
     }
-    else if (PreTokenizer == bytelevel) {
-        // Use ByteLevel pre-tokenizer
+    // whitespace uses separate whiteSpaceLogic function
+    else if (PreTokenizer == whitespace){
         WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * byteLevelRule = re::generateByteLevelBoundaryRule();
-        const auto BL_Sets = re::collectCCs(byteLevelRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto BL_mpx = cc::makeMultiplexedAlphabet("BL_mpx", BL_Sets);
-        byteLevelRule = transformCCs(BL_mpx, byteLevelRule, re::NameTransformationMode::TransformDefinition);
-        auto BL_basis = BL_mpx->getMultiplexedCCs();
-        StreamSet * const BL_Classes = P.CreateStreamSet(BL_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(BL_basis, BasisBits, BL_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(byteLevelRule);
-        options->addAlphabet(BL_mpx, BL_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
-        SHOW_STREAM(WordBoundaries);
-   }
-    else if (PreTokenizer == bert) {
-        // Use BERT pre-tokenizer (Whitespace + Punctuation)
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * bertRule = re::generateBertPreTokenizerRule();
-        const auto BERT_Sets = re::collectCCs(bertRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto BERT_mpx = cc::makeMultiplexedAlphabet("BERT_mpx", BERT_Sets);
-        bertRule = transformCCs(BERT_mpx, bertRule, re::NameTransformationMode::TransformDefinition);
-        auto BERT_basis = BERT_mpx->getMultiplexedCCs();
-        StreamSet * const BERT_Classes = P.CreateStreamSet(BERT_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(BERT_basis, BasisBits, BERT_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(bertRule);
-        options->addAlphabet(BERT_mpx, BERT_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+        whiteSpaceLogic(P, BasisBits, u8index, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
+    // composite tokenizer (OR of two RE rules)
     else if (PreTokenizer == sequence_whitespace_punctuation) {
+        // Composite tokenizer: whitespace + punctuation combined with OR
         StreamSet * preTokenStrm1 = P.CreateStreamSet(1, 1);
         whiteSpaceLogic(P, BasisBits, u8index, preTokenStrm1);
        
-        // Generate Second Pre-tokenizer Boundaries (Punctuation)
-        StreamSet * preTokenStrm2 = P.CreateStreamSet(1, 1);
-        re::RE * rule2 = re::generatePunctuationBoundaryRule();
-        const auto PC_Sets = re::collectCCs(rule2, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto PC_mpx = cc::makeMultiplexedAlphabet("PC_mpx", PC_Sets);
-        rule2 = transformCCs(PC_mpx, rule2, re::NameTransformationMode::TransformDefinition);
-        auto PC_basis = PC_mpx->getMultiplexedCCs();
-        StreamSet * const PC_Classes = P.CreateStreamSet(PC_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(PC_basis, BasisBits, PC_Classes);
-        auto pc_options = std::make_unique<GrepKernelOptions>();
-        pc_options->setIndexing(u8index);
-        pc_options->setRE(rule2);
-        pc_options->addAlphabet(PC_mpx, PC_Classes);
-        pc_options->setResults(preTokenStrm2);
-        pc_options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(pc_options));
-        SHOW_STREAM(preTokenStrm2);
+        StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "PC", 
+            re::generatePunctuationBoundaryRule(), BasisBits, u8index);
 
-        // Combine Boundaries (OR operation)
-        StreamSet * combinedBoundaries = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<OrKernel>(preTokenStrm1, preTokenStrm2, combinedBoundaries);
-        SHOW_STREAM(combinedBoundaries);
-        
-        // Use combined boundaries as WordBoundaries
-        WordBoundaries = combinedBoundaries;
-    }
-
-    else {
-        // Use default UAX#29 word boundaries
+        // Combine boundaries (OR operation)
         WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * wordBoundaryRule = re::generateWordBoundaryRule();
-        const auto WB_Sets = re::collectCCs(wordBoundaryRule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto WB_mpx = cc::makeMultiplexedAlphabet("WB_mpx", WB_Sets);
-        wordBoundaryRule = transformCCs(WB_mpx, wordBoundaryRule, re::NameTransformationMode::TransformDefinition);
-        auto WB_basis = WB_mpx->getMultiplexedCCs();
-        StreamSet * const WB_Classes = P.CreateStreamSet(WB_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(WB_basis, BasisBits, WB_Classes);
-        auto options = std::make_unique<GrepKernelOptions>();
-        options->setIndexing(u8index);
-        options->setRE(wordBoundaryRule);
-        options->addAlphabet(WB_mpx, WB_Classes);
-        options->setResults(WordBoundaries);
-        options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+        P.CreateKernelCall<OrKernel>(preTokenStrm1, preTokenStrm2, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
-
+    else {
+        // Standard RE-based tokenizers - use lookup table
+        auto it = TokenizerConfigs.find(PreTokenizer);
+        
+        if (it != TokenizerConfigs.end()) {
+            // Found in map: call the generator function and build pipeline
+            re::RE* rule = it->second.generator();  // Call function pointer
+            WordBoundaries = buildREBasedTokenizer(P, it->second.prefix, 
+                                                   rule, BasisBits, u8index);
+        } else {
+            // Default fallback: UAX#29 word boundaries
+            re::RE* rule = re::generateWordBoundaryRule();
+            WordBoundaries = buildREBasedTokenizer(P, "WB", rule, BasisBits, u8index);
+        }
+    }
     
     // UTF-8 - ensure boundaries only at UTF-8 character starts
     StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
@@ -882,14 +769,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * PunctuationStream = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UnicodePropertyKernelBuilder>(punctuationName, U21codepoints, PunctuationStream);
     SHOW_STREAM(PunctuationStream);
-
-    // Whitespace property stream using Unicode property 'space'
-    // Detects all Unicode whitespace characters (space, tab, newline, etc.)
-    // Includes: SPACE, TAB, LF, VT, FF, CR, NO-BREAK SPACE, etc.
-    re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
-    whitespaceProp = UCD::linkAndResolve(whitespaceProp);
-    re::Name * whitespaceName = re::makeName("Whitespace");
-    whitespaceName->setDefinition(whitespaceProp);
 
     // Combine Letter and Number properties to detect alphanumeric characters
     StreamSet * AlphanumericMask = P.CreateStreamSet(1, 1);

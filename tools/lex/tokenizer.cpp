@@ -144,11 +144,8 @@ protected:
         PabloAST * mask = getInputStreamSet("inputMask")[0];
         
         // Create a stream that is 0 at position 0 and 1 everywhere else
-        //PabloAST * notAtFirst = pb.createAdvance(pb.createZeroes(), 1);
         PabloAST * notAtFirst = pb.createAdvance(pb.createOnes(), 1);
-        // PabloAST * notAtFirst = pb.createLookahead(pb.createOnes(), 1);
 
-        
         // AND the mask with notAtFirst to exclude position 0
         PabloAST * result = pb.createAnd(mask, notAtFirst);
         writeOutputStreamSet("outputMask", std::vector<PabloAST*>{result});
@@ -255,27 +252,6 @@ protected:
     }
 };
 
-// AND kernel for combining streams (intersection)
-class CombineAndKernel : public PabloKernel {
-public:
-    CombineAndKernel(LLVMTypeSystemInterface & ts,
-                     StreamSet * input1,
-                     StreamSet * input2,
-                     StreamSet * output)
-    : PabloKernel(ts, "combineAndKernel",
-                  {Binding{"input1", input1}, Binding{"input2", input2}},
-                  {Binding{"output", output}}) {}
-
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * stream1 = getInputStreamSet("input1")[0];
-        PabloAST * stream2 = getInputStreamSet("input2")[0];
-        PabloAST * result = pb.createAnd(stream1, stream2);
-        writeOutputStreamSet("output", std::vector<PabloAST*>{result});
-    }
-};
-
 // Unicode Alphanumeric Detection kernel using Unicode properties
 // Combines (L*), Mark (M*), and Number (N*) Unicode categories
 // to detect alphanumeric characters properly according to Unicode standard
@@ -336,76 +312,7 @@ protected:
     }
 };
 
-
-// 
-//  Given SplitMarks marking characters that are "split" characters,
-//  produce output token marks according to a given split behaviour
-//  mode.   The result is a correct token mark stream, but an additional
-//  step is required when the behaviour is "removed" in which case all
-//  the split characters must be deleted.
-//
-class SplitMarksToTokens : public PabloKernel {
-public:
-    SplitMarksToTokens(LLVMTypeSystemInterface & ts,
-                  SplitBehaviorMode b, StreamSet * SplitMarks, StreamSet * ResultBoundaries)
-    : PabloKernel(ts, "SplitMarksToTokens:" + SplitCode(b) ,
-                  {Binding{"SplitMarks", SplitMarks}},
-                  {Binding{"ResultBoundaries", ResultBoundaries}}), mBehavior(b) {}
-
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * SplitMarks = getInputStreamSet("SplitMarks")[0];
-        //
-        PabloAST * SplitRun1 = pb.createAnd(pb.createAdvance(pb.createNot(SplitMarks), 1), SplitMarks);
-        PabloAST * SplitRunFollow = pb.createAnd(pb.createAdvance(SplitMarks, 1), pb.createNot(SplitMarks));
-        PabloAST * result = nullptr;
-        if (mBehavior == contiguous) {
-            result = pb.createOr(SplitRun1, SplitRunFollow);
-        } else if (mBehavior == mergedwithprevious) {
-            result = SplitRunFollow;
-        } else if (mBehavior == removed) {
-            result = SplitRunFollow;
-        } else if (mBehavior == mergedwithnext) {
-            result = SplitRun1;
-        } else { // isolated
-            result = pb.createOr(SplitMarks, SplitRunFollow);
-        }
-        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
-    }
-private:
-    SplitBehaviorMode mBehavior;
-};
-
-
-// Behavior mode 1: Removed - only keep word/punctuation boundaries, exclude whitespace
-class RemovedBehavior : public PabloKernel {
-public:
-    RemovedBehavior(LLVMTypeSystemInterface & ts,
-                    StreamSet * TokenBoundaries,
-                    StreamSet * WhitespaceMask,
-                    StreamSet * ResultBoundaries)
-    : PabloKernel(ts, "removedBehavior",
-                  {Binding{"TokenBoundaries", TokenBoundaries}, Binding{"WhitespaceMask", WhitespaceMask}},
-                  {Binding{"ResultBoundaries", ResultBoundaries}}) {}
-
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * boundaries = getInputStreamSet("TokenBoundaries")[0];
-        PabloAST * whitespace = getInputStreamSet("WhitespaceMask")[0];
-        
-        // For removed: keep boundaries at non-whitespace positions only
-        // This explicitly filters out any space positions
-        PabloAST * notSpace = pb.createNot(whitespace);
-        PabloAST * firstSpace = pb.createAnd(whitespace, pb.createNot(pb.createAdvance(whitespace, 1)));
-        PabloAST * result = pb.createAnd(boundaries, pb.createOr(notSpace, firstSpace));
-        
-        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
-    }
-};
-
-// Behavior mode 2: Isolated - keep token boundaries AND add space boundaries
+// Behavior mode 1: Isolated - keep token boundaries AND add space boundaries
 class IsolatedBehavior : public PabloKernel {
 public:
     IsolatedBehavior(LLVMTypeSystemInterface & ts,
@@ -519,7 +426,7 @@ using WordBreakerFunctionType = void (*)(uint32_t fd);
 // make a new function here 
 void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u8index, StreamSet * results) {
         
-        re::RE * rule1 = re::generateWhitespaceBoundaryRule();
+    re::RE * rule1 = re::generateRE_TokenizerRule(re::WhitespaceBoundary);
         const auto WS_Sets = re::collectCCs(rule1, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
         auto WS_mpx = cc::makeMultiplexedAlphabet("WS_mpx", WS_Sets);
         rule1 = transformCCs(WS_mpx, rule1, re::NameTransformationMode::TransformDefinition);
@@ -620,23 +527,20 @@ StreamSet* buildREBasedTokenizer(
     return WordBoundaries;
 }
 
-// Function pointer type for RE generator functions
-using REGeneratorFunc = re::RE* (*)();
-
 // Struct to hold tokenizer configuration
 struct TokenizerConfig {
-    REGeneratorFunc generator;  // Function to generate the regex rule
-    std::string prefix;         // Prefix for multiplexed alphabet (e.g., "PC", "WS")
+    re::RE_TokenizerKind kind;
+    std::string prefix;  // Prefix for multiplexed alphabet (e.g., "PC", "WS")
 };
 
 // Single map combining both pieces of information
 const static std::map<PreTokenizerMode, TokenizerConfig> TokenizerConfigs = {
-    {whitespace, {re::generateWhitespaceBoundaryRule, "WS"}},
-    {whitespacesplit, {re::generateWhitespaceSplitBoundaryRule, "WSS"}},
-    {punctuation, {re::generatePunctuationBoundaryRule, "PC"}},
-    {digits, {re::generateDigitBoundaryRule, "DG"}},
-    {bytelevel, {re::generateByteLevelBoundaryRule, "BL"}},
-    {bert, {re::generateBertPreTokenizerRule, "BERT"}}
+    {whitespace, {re::WhitespaceBoundary, "WS"}},
+    {whitespacesplit, {re::WhitespaceSplitBoundary, "WSS"}},
+    {punctuation, {re::PunctuationBoundary, "PC"}},
+    {digits, {re::DigitBoundary, "DG"}},
+    {bytelevel, {re::ByteLevelBoundary, "BL"}},
+    {bert, {re::BertPreTokenizer, "BERT"}}
 };
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
@@ -687,7 +591,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         whiteSpaceLogic(P, BasisBits, u8index, preTokenStrm1);
        
         StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "PC", 
-            re::generatePunctuationBoundaryRule(), BasisBits, u8index);
+            re::generateRE_TokenizerRule(re::PunctuationBoundary), BasisBits, u8index);
 
         // Combine boundaries (OR operation)
         WordBoundaries = P.CreateStreamSet(1, 1);
@@ -700,7 +604,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         
         if (it != TokenizerConfigs.end()) {
             // Found in map: call the generator function and build pipeline
-            re::RE* rule = it->second.generator();  // Call function pointer
+            re::RE* rule = generateRE_TokenizerRule(it->second.kind);  // Call function pointer
             WordBoundaries = buildREBasedTokenizer(P, it->second.prefix, 
                                                    rule, BasisBits, u8index);
         } else {
@@ -709,7 +613,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
             WordBoundaries = buildREBasedTokenizer(P, "WB", rule, BasisBits, u8index);
         }
     }
-    
     // UTF-8 - ensure boundaries only at UTF-8 character starts
     StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<AndKernel>(WordBoundaries, u8index, TokenBoundaries);
@@ -790,14 +693,12 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     SHOW_STREAM(lineInsertMask);
    
     StreamSet * spreadBasis = P.CreateStreamSet(21);
-    SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);  //? same U21_tokenBoundaries used for spreading and later filtering to stay aligned with codepoints
-    //SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);
+    SpreadByMask(P, lineInsertMask, U21codepoints, spreadBasis);
     SHOW_BIXNUM(spreadBasis);
 
     // Insert Token Separators
     StreamSet * tokenBasis = P.CreateStreamSet(21);
     P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
-    //P.CreateKernelCall<AddUnicodeLineSeparators>(lineInsertMask, spreadBasis, tokenBasis);
     SHOW_BIXNUM(tokenBasis);
 
     // spreading to match the streams

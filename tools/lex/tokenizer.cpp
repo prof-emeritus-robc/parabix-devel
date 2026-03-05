@@ -312,6 +312,47 @@ protected:
     }
 };
 
+
+// 
+//  Given SplitMarks marking characters that are "split" characters,
+//  produce output token marks according to a given split behaviour
+//  mode.   The result is a correct token mark stream, but an additional
+//  step is required when the behaviour is "removed" in which case all
+//  the split characters must be deleted.
+//
+class SplitMarksToTokens : public PabloKernel {
+public:
+    SplitMarksToTokens(LLVMTypeSystemInterface & ts,
+                  SplitBehaviorMode b, StreamSet * SplitMarks, StreamSet * ResultBoundaries)
+    : PabloKernel(ts, "SplitMarksToTokens:" + SplitCode(b) ,
+                  {Binding{"SplitMarks", SplitMarks}},
+                  {Binding{"ResultBoundaries", ResultBoundaries}}), mBehavior(b) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * SplitMarks = getInputStreamSet("SplitMarks")[0];
+        //
+        PabloAST * SplitRun1 = pb.createAnd(pb.createAdvance(pb.createNot(SplitMarks), 1), SplitMarks);
+        PabloAST * SplitRunFollow = pb.createAnd(pb.createAdvance(SplitMarks, 1), pb.createNot(SplitMarks));
+        PabloAST * result = nullptr;
+        if (mBehavior == contiguous) {
+            result = pb.createOr(SplitRun1, SplitRunFollow);
+        } else if (mBehavior == mergedwithprevious) {
+            result = SplitRunFollow;
+        } else if (mBehavior == removed) {
+            result = SplitRunFollow;
+        } else if (mBehavior == mergedwithnext) {
+            result = SplitRun1;
+        } else { // isolated
+            result = pb.createOr(SplitMarks, SplitRunFollow);
+        }
+        writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
+    }
+private:
+    SplitBehaviorMode mBehavior;
+};
+
 // Behavior mode 1: Isolated - keep token boundaries AND add space boundaries
 class IsolatedBehavior : public PabloKernel {
 public:
@@ -471,23 +512,10 @@ void applySplitBehaviorTransformation(
     StreamSet *& finalU21codepoints,
     StreamSet *& TransformedBoundaries)
 {
-    finalU21codepoints = spreadBasis; // default to original codepoints if no filtering applied
-    
-    if (effectiveBehavior == removed) {
-        finalU21codepoints = P.CreateStreamSet(21);
-        applyRemovedWhitespaceFilter(P, spreadWhitespaceMask, spreadBasis, spreadTokenBoundaries, finalU21codepoints, TransformedBoundaries);
-    } else if (effectiveBehavior == isolated) {
-        P.CreateKernelCall<IsolatedBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, TransformedBoundaries);
-    } else if (effectiveBehavior == mergedwithprevious) {
-        P.CreateKernelCall<MergedWithPreviousBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, TransformedBoundaries);
-    } else if (effectiveBehavior == mergedwithnext) {
-        P.CreateKernelCall<MergedWithNextBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, TransformedBoundaries);
-    } else if (effectiveBehavior == contiguous) {
-        P.CreateKernelCall<ContiguousBehavior>(spreadTokenBoundaries, spreadWhitespaceMask, spreadAlphanumericMask, spreadPunctuationStream, TransformedBoundaries);
-    } else {
-        llvm::errs() << "Error: Unknown SplitBehavior mode.\n";
-        TransformedBoundaries = spreadTokenBoundaries; // default to no transformation
-    }
+    // All behavior transformations are applied at the U21 level (before LF insertion)
+    // via the insertionBoundaries block in wordBreakerPipeline. This is a pass-through.
+    finalU21codepoints = spreadBasis;
+    TransformedBoundaries = spreadTokenBoundaries;
     SHOW_STREAM(TransformedBoundaries);
 }
 // Function Declaration
@@ -687,9 +715,45 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Apply behavior transformation using appropriate kernel
     StreamSet * TransformedBoundaries = P.CreateStreamSet(1, 1);
 
-    // Create insertion mask and spread original data 
+    // moved here: needs to know effectiveBehavior BEFORE computing lineInsertMask
+    // Compute effective behavior mode based on PreTokenizer choice
+    SplitBehaviorMode effectiveBehavior = SplitBehavior;
+    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
+        effectiveBehavior = removed;
+    }
+
+    // For removed behavior: U21_tokenBoundaries has boundaries on BOTH sides of whitespace
+    // (UAX29 places a boundary before AND after each whitespace run). Inserting LF before
+    // the whitespace-position boundary + removing whitespace = two consecutive LFs = blank line.
+    // so to Fix it: we remove boundaries that fall ON whitespace positions before computing lineInsertMask.
+    // Compute corrected LF-insertion boundaries at U21 level (BEFORE spreading/insertion).
+    // Each behavior kernel removes or adds boundaries here so only the RIGHT LFs get inserted.
+
+    StreamSet * insertionBoundaries = U21_tokenBoundaries;
+    if (effectiveBehavior == removed) {
+        // Remove boundaries ON whitespace positions so no LF is inserted before a space.
+        // FilterByMask later deletes the space characters themselves.
+        StreamSet * notWhitespaceMask = P.CreateStreamSet(1);
+        P.CreateKernelCall<NotKernel>(WhitespaceMask, notWhitespaceMask);
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWhitespaceMask, insertionBoundaries);
+    } else if (effectiveBehavior == isolated) {
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
+    } else if (effectiveBehavior == mergedwithprevious) {
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
+    } else if (effectiveBehavior == mergedwithnext) {
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<MergedWithNextBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
+    } else if (effectiveBehavior == contiguous) {
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, insertionBoundaries);
+    }
+
+    // Create insertion mask and spread original data
     // This is the first place the length of the stream changes.
-    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, U21_tokenBoundaries, kernel::InsertPosition::Before);
+    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, insertionBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
    
     StreamSet * spreadBasis = P.CreateStreamSet(21);
@@ -718,10 +782,16 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * spreadPunctuationStream = P.CreateStreamSet(1);
     SpreadByMask(P, lineInsertMask, PunctuationStream, spreadPunctuationStream);
     
-    // Compute effective behavior mode based on PreTokenizer choice
-    SplitBehaviorMode effectiveBehavior = SplitBehavior;
-    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
-        effectiveBehavior = removed;
+    StreamSet * tokenMask = P.CreateStreamSet(1);
+    P.CreateKernelCall<NotKernel>(spreadWhitespaceMask, tokenMask);
+
+    if (effectiveBehavior == removed) {
+        StreamSet * newBasis = P.CreateStreamSet(21);
+        FilterByMask(P, tokenMask, tokenBasis, newBasis);
+        tokenBasis = newBasis;
+        StreamSet * newBoundaries = P.CreateStreamSet(1);
+        FilterByMask(P, tokenMask, spreadTokenBoundaries, newBoundaries);
+        spreadTokenBoundaries = newBoundaries;
     }
     
     // After spreading and inserting, we have new codepoints at the inserted positions.

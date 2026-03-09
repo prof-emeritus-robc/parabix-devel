@@ -78,7 +78,7 @@ enum PreTokenizerMode {
 
 // Enum for split behavior
 enum SplitBehaviorMode {
-  nosplitbehavior,
+  // nosplitbehavior,
   removed,
   isolated,
   mergedwithprevious,
@@ -484,22 +484,24 @@ void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u
         SHOW_STREAM(results);
 };
  
-void applyRemovedWhitespaceFilter(PipelineBuilder & P,
-                                                          StreamSet * WhitespaceMask,
-                                                          StreamSet * U21codepoints,
-                                                          StreamSet * U21_tokenBoundaries,
-                                                          StreamSet * finalU21codepoints,
-                                                          StreamSet * finalU21_tokenBoundaries) {
-    StreamSet * keepMask = P.CreateStreamSet(1);
-    P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
+// void applyRemovedWhitespaceFilter(PipelineBuilder & P,
+//                                                           StreamSet * WhitespaceMask,
+//                                                           StreamSet * U21codepoints,
+//                                                           StreamSet * U21_tokenBoundaries,
+//                                                           StreamSet * finalU21codepoints,
+//                                                           StreamSet * finalU21_tokenBoundaries) {
+//     StreamSet * keepMask = P.CreateStreamSet(1);
+//     P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
 
-    StreamSet * keepMask2 = P.CreateStreamSet(1);
-    P.CreateKernelCall<OrKernel>(keepMask,U21_tokenBoundaries, keepMask2);
+//     StreamSet * keepMask2 = P.CreateStreamSet(1);
+//     P.CreateKernelCall<OrKernel>(keepMask,U21_tokenBoundaries, keepMask2);
 
-    FilterByMask(P, keepMask2, U21codepoints, finalU21codepoints);
+//     FilterByMask(P, keepMask2, U21codepoints, finalU21codepoints);
 
-    FilterByMask(P, keepMask2, U21_tokenBoundaries, finalU21_tokenBoundaries);
-}
+//     FilterByMask(P, keepMask2, U21_tokenBoundaries, finalU21_tokenBoundaries);
+// }
+
+
 // Function to apply split behavior transformation based on split behavior mode
 void applySplitBehaviorTransformation(
     PipelineBuilder & P,
@@ -728,7 +730,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // so to Fix it: we remove boundaries that fall ON whitespace positions before computing lineInsertMask.
     // Compute corrected LF-insertion boundaries at U21 level (BEFORE spreading/insertion).
     // Each behavior kernel removes or adds boundaries here so only the RIGHT LFs get inserted.
-
+    // use RemoveFirstMarkKernel to remove the first boundary mark at whitespace positions for "removed" behavior, ensuring no LF is inserted before spaces. For other behaviors, compute insertion boundaries according to the specified rules??
     StreamSet * insertionBoundaries = U21_tokenBoundaries;
     if (effectiveBehavior == removed) {
         // Remove boundaries ON whitespace positions so no LF is inserted before a space.
@@ -751,8 +753,11 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         P.CreateKernelCall<ContiguousBehavior>(U21_tokenBoundaries, WhitespaceMask, AlphanumericMask, PunctuationStream, insertionBoundaries);
     }
 
-    // Create insertion mask and spread original data
-    // This is the first place the length of the stream changes.
+   // same convention as insertionBoundaries (1 = mark, 0 = nothing)
+    StreamSet * insertionBoundariesClean = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<RemoveFirstMarkKernel>(insertionBoundaries, insertionBoundariesClean);
+    insertionBoundaries = insertionBoundariesClean;
+
     StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, insertionBoundaries, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
    
@@ -800,10 +805,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
                                   spreadTokenBoundaries, spreadAlphanumericMask, spreadPunctuationStream,
                                   finalU21codepoints, TransformedBoundaries);
     SHOW_STREAM(TransformedBoundaries);
-    
-    StreamSet * TransformedBoundaries1 = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<RemoveFirstMarkKernel>(TransformedBoundaries, TransformedBoundaries1);
-    SHOW_STREAM(TransformedBoundaries1);
 
     // Convert U21 codepoints back to UTF-8 basis bits
     StreamSet * output_basis = P.CreateStreamSet(8);

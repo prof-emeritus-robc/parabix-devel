@@ -78,7 +78,6 @@ enum PreTokenizerMode {
 
 // Enum for split behavior
 enum SplitBehaviorMode {
-  // nosplitbehavior,
   removed,
   isolated,
   mergedwithprevious,
@@ -429,7 +428,7 @@ public:
     ContiguousBehavior(LLVMTypeSystemInterface & ts,
                        StreamSet * TokenBoundaries,
                        StreamSet * WhitespaceMask,
-                       StreamSet * AlphanumericMask, // use a unicode property? or of letter and numeric ?
+                       StreamSet * AlphanumericMask, 
                        StreamSet * PunctuationStream,
                        StreamSet * ResultBoundaries)
     : PabloKernel(ts, "contiguousBehavior",
@@ -483,24 +482,6 @@ void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u
         P.CreateKernelFamilyCall<ICGrepKernel>(std::move(ws_options));
         SHOW_STREAM(results);
 };
- 
-// void applyRemovedWhitespaceFilter(PipelineBuilder & P,
-//                                                           StreamSet * WhitespaceMask,
-//                                                           StreamSet * U21codepoints,
-//                                                           StreamSet * U21_tokenBoundaries,
-//                                                           StreamSet * finalU21codepoints,
-//                                                           StreamSet * finalU21_tokenBoundaries) {
-//     StreamSet * keepMask = P.CreateStreamSet(1);
-//     P.CreateKernelCall<NotKernel>(WhitespaceMask, keepMask);
-
-//     StreamSet * keepMask2 = P.CreateStreamSet(1);
-//     P.CreateKernelCall<OrKernel>(keepMask,U21_tokenBoundaries, keepMask2);
-
-//     FilterByMask(P, keepMask2, U21codepoints, finalU21codepoints);
-
-//     FilterByMask(P, keepMask2, U21_tokenBoundaries, finalU21_tokenBoundaries);
-// }
-
 
 // Function to apply split behavior transformation based on split behavior mode
 void applySplitBehaviorTransformation(
@@ -652,6 +633,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
    // Creating U21 codepoint stream from UTF-8 basis bits (U21 Codepoint Generation)
     StreamSet * U21_u8indexed = P.CreateStreamSet(21, 1);
     P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21_u8indexed);
+
     // filter by mask with UTF-8 index stream ?
     SHOW_BIXNUM(U21_u8indexed);
 

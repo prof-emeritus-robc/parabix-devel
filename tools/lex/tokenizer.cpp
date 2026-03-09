@@ -127,6 +127,12 @@ static cl::opt<SplitBehaviorMode> SplitBehavior("behavior",
         clEnumValN(contiguous, "contiguous", "keep punctuation with words, separate spaces")),
     cl::cat(wordBreakerFlags));
 
+// Delimiter character for chardelimiter pretokenizer
+static cl::opt<std::string> DelimiterString("delimiter",
+    cl::desc("Delimiter character for --pretokenizer chardelimiter (default: ',')"),
+    cl::init(","),
+    cl::cat(wordBreakerFlags));
+
 // Remove first position mark from insertion mask
 class RemoveFirstMarkKernel : public PabloKernel {
 public:
@@ -455,6 +461,40 @@ protected:
     }
 };
 
+// Detects positions where the input codepoint equals delimCodepoint.
+// Works on any parallel bit-stream set (BasisBits width=8 or U21codepoints width=21).
+// Each stream b[i] represents bit i of the character value at each position.
+class CharDelimiterKernel : public PabloKernel {
+public:
+    CharDelimiterKernel(LLVMTypeSystemInterface & ts,
+                        StreamSet * InputStreams,
+                        StreamSet * DelimMask,
+                        uint32_t delimCodepoint)
+    : PabloKernel(ts, "charDelimiter_" + std::to_string(delimCodepoint)
+                       + "_w" + std::to_string(InputStreams->getNumElements()),
+                  {Binding{"InputStreams", InputStreams}},
+                  {Binding{"DelimMask", DelimMask}}),
+      mDelimCodepoint(delimCodepoint) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> b = getInputStreamSet("InputStreams");
+
+        // Build AND of: b[i] for every bit that is SET in delimCodepoint,
+        //               NOT(b[i]) for every bit that is CLEAR.
+        PabloAST * result = pb.createOnes();
+        for (unsigned i = 0; i < b.size(); i++) {
+            bool bit_set = (mDelimCodepoint >> i) & 1;
+            PabloAST * cond = bit_set ? b[i] : pb.createNot(b[i]);
+            result = pb.createAnd(result, cond);
+        }
+        writeOutputStreamSet("DelimMask", std::vector<PabloAST*>{result});
+    }
+private:
+    uint32_t mDelimCodepoint;
+};
+
 // Debug macros for visualization
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -609,6 +649,16 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         P.CreateKernelCall<OrKernel>(preTokenStrm1, preTokenStrm2, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
+    else if (PreTokenizer == chardelimiter) {
+        // Detect positions of the delimiter character in raw bytes (BasisBits space)
+        uint32_t delimCP = DelimiterString.empty() ? (uint32_t)',' : (uint32_t)(unsigned char)DelimiterString[0];
+        StreamSet * CharDelimStream = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharDelimiterKernel>(BasisBits, CharDelimStream, delimCP);
+        // BoundaryKernel fires at transitions: non-delim→delim and delim→non-delim
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<BoundaryKernel>(CharDelimStream, u8index, WordBoundaries);
+        SHOW_STREAM(WordBoundaries);
+    }
     else {
         // Standard RE-based tokenizers - use lookup table
         auto it = TokenizerConfigs.find(PreTokenizer);
@@ -696,13 +746,23 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
     SHOW_STREAM(WhitespaceMask);
 
+    // For chardelimiter: treat the delimiter character as the "split char" everywhere
+    // WhitespaceMask is used in removed behavior to remove split chars from output.
+    if (PreTokenizer == chardelimiter) {
+        uint32_t delimCP = DelimiterString.empty() ? (uint32_t)',' : (uint32_t)(unsigned char)DelimiterString[0];
+        StreamSet * DelimMask = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharDelimiterKernel>(U21codepoints, DelimMask, delimCP);
+        WhitespaceMask = DelimMask;
+        SHOW_STREAM(WhitespaceMask);
+    }
+
     // Apply behavior transformation using appropriate kernel
     StreamSet * TransformedBoundaries = P.CreateStreamSet(1, 1);
 
     // moved here: needs to know effectiveBehavior BEFORE computing lineInsertMask
     // Compute effective behavior mode based on PreTokenizer choice
     SplitBehaviorMode effectiveBehavior = SplitBehavior;
-    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace) {
+    if (PreTokenizer == bert || PreTokenizer == sequence_whitespace_punctuation || PreTokenizer == whitespacesplit || PreTokenizer == whitespace || PreTokenizer == chardelimiter) {
         effectiveBehavior = removed;
     }
 

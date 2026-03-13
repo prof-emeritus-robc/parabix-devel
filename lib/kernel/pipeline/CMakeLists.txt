@@ -55,11 +55,13 @@ SRC
     compiler/codegen/streamdata_illustrator_logic.cpp
     compiler/codegen/synchronization_logic.cpp
     compiler/codegen/termination_logic.cpp
+    compiler/codegen/thread_local_management_logic.cpp
     compiler/internal/popcount_kernel.cpp
     compiler/internal/regionselectionkernel.cpp
     compiler/statistics/cycle_counter_logic.cpp
     compiler/statistics/histogram_generation_logic.cpp
     compiler/statistics/multithreading_report_logic.cpp
+    compiler/statistics/buffer_expansion_instrumentation_logic.cpp
     ${PAPI_CPP}
     optimizationbranch/optimizationbranch.cpp
     pipeline_builder.cpp

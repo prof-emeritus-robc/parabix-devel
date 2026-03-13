@@ -51,9 +51,9 @@ bool hasGraphemeClusterBoundary(const RE * re) {
 }
 
     
-struct WordBoundaryAbsentValidator final : public RE_Validator {
+struct SimpleWordBoundaryAbsentValidator final : public RE_Validator {
     
-    WordBoundaryAbsentValidator()
+    SimpleWordBoundaryAbsentValidator()
     : RE_Validator() {}
     
     bool validateName(const Name * n) override {
@@ -61,8 +61,23 @@ struct WordBoundaryAbsentValidator final : public RE_Validator {
     }
 };
 
-bool hasWordBoundary(const RE * re) {
-    WordBoundaryAbsentValidator v;
+bool hasSimpleWordBoundary(const RE * re) {
+    SimpleWordBoundaryAbsentValidator v;
+    return !(v.validateRE(re));
+}
+
+struct Level2WordBoundaryAbsentValidator final : public RE_Validator {
+    
+    Level2WordBoundaryAbsentValidator()
+    : RE_Validator() {}
+    
+    bool validateName(const Name * n) override {
+        return n->getName() != "\\b{w}";
+    }
+};
+
+bool hasLevel2WordBoundary(const RE * re) {
+    Level2WordBoundaryAbsentValidator v;
     return !(v.validateRE(re));
 }
 
@@ -384,7 +399,7 @@ RE * generateWordBoundaryRule() {
     RE * WB_all = makeAlt({WB_1, WB_2, WBX_3, WB_3a, WB_3b, WB_4});
     
     // Combine the "do not break" rules (just WB_3 for now)
-    RE * WBX_all = makeAlt({WBX_3, WBX_3c, WBX_3d, WBX_5,/*WBX_6,*/WBX_7, WB_7a, /*WB_7b,*/ WB_7c, WBX_8, WBX_9, WBX_10, WBX_11, /*WBX_12,*/ WBX_13, WBX_13a, WBX_13b, WBX_15_16});
+    RE * WBX_all = makeAlt({WBX_3, WBX_3c, WBX_3d, WBX_5, WBX_6, WBX_7, WB_7a, WB_7b, WB_7c, WBX_8, WBX_9, WBX_10, WBX_11, WBX_12, WBX_13, WBX_13a, WBX_13b, WBX_15_16});
     
     // WB999: Break everywhere else.
     RE * WB_999 = makeSeq({Behind(makeAny()), Ahead(makeAny())});
@@ -414,51 +429,6 @@ RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj) {
     return makeAlt(alts.begin(), alts.end());
 }
 
-class BoundaryPropertyResolver : public RE_Transformer {
-public:
-    BoundaryPropertyResolver() : RE_Transformer("ResolveBoundaryProperties") {}
-    
-    RE * transformPropertyExpression(PropertyExpression * propExpr) {
-        if (propExpr->getKind() == PropertyExpression::Kind::Codepoint) {
-            return propExpr;
-        }
-        int prop_code = propExpr->getPropertyCode();
-        if (propExpr->getPropertyIdentifier() == "g") {
-            Name * gcb_name = makeZeroWidth("\\b{g}");
-            gcb_name->setDefinition(generateGraphemeClusterBoundaryRule());
-            return gcb_name;
-        }
-        if (propExpr->getPropertyIdentifier() == "w") {
-            Name * wb_name = makeZeroWidth("\\b{w}");
-            wb_name->setDefinition(generateWordBoundaryRule());
-            return wb_name;
-        }
-        if (prop_code >= 0) {
-            auto obj = UCD::getPropertyObject(static_cast<UCD::property_t>(prop_code));
-            if ((propExpr->getValueString() == "") && isa<UCD::EnumeratedPropertyObject>(obj)) {
-                return EnumeratedPropertyBoundary(cast<UCD::EnumeratedPropertyObject>(obj));
-            }
-            auto pe = makePropertyExpression(propExpr->getPropertyIdentifier(), propExpr->getValueString());
-            RE * a = makeLookAheadAssertion(pe);
-            RE * na = makeNegativeLookAheadAssertion(pe);
-            RE * b = makeLookBehindAssertion(pe);
-            RE * nb = makeNegativeLookBehindAssertion(pe);
-            RE * resolved = nullptr;
-            if (propExpr->getOperator() == PropertyExpression::Operator::NEq) {
-                resolved = makeAlt({makeSeq({b, a}), makeSeq({nb, na})});
-            } else {
-                resolved = makeAlt({makeSeq({b, na}), makeSeq({nb, a})});
-            }
-            return resolved;
-        }
-        re::UnsupportedRE(Printer_RE::PrintRE(propExpr));
-    }
-
-};
-
-RE * resolveBoundaryProperties(RE * r) {
-    return UCD::linkProperties(BoundaryPropertyResolver().transformRE(r));
-}
 
 const static std::map<RE_TokenizerKind, std::string> PreTokenizerPatterns =
 

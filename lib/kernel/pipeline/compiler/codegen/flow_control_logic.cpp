@@ -17,22 +17,58 @@ namespace kernel {
 void PipelineCompiler::addSegmentLengthSlidingWindowKernelProperties(KernelBuilder & b, const size_t kernelId, const size_t groupId) {
     assert (FirstKernel <= kernelId && kernelId <= LastKernel);
     assert ("not root?" && (FirstKernelInPartition[KernelPartitionId[kernelId]] == kernelId));
-    if (MinimumNumOfStrides[kernelId] != MaximumNumOfStrides[kernelId] || mIsNestedPipeline) {
+    if (mBufferGraph[kernelId].controlsSlidingWindow()) {
         assert (FirstComputePartitionId <= KernelPartitionId[kernelId] && KernelPartitionId[kernelId] <= LastComputePartitionId);
         mTarget->addInternalScalar(b.getSizeTy(), SCALED_SLIDING_WINDOW_SIZE_PREFIX + std::to_string(kernelId), groupId);
     }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief calculateBufferScalingFactor
+ ** ------------------------------------------------------------------------------------------------------------- */
+Rational PipelineCompiler::calculateBufferScalingFactor(const unsigned kernelId) const {
+    assert (kernelId == FirstKernelInPartition[KernelPartitionId[kernelId]]);
+    Rational scale{0};
+    if (in_degree(kernelId, mBufferGraph) == 0) {
+        assert (out_degree(kernelId, mBufferGraph) > 0);
+        for (auto input : make_iterator_range(out_edges(kernelId, mBufferGraph))) {
+            const auto streamSet = target(input, mBufferGraph);
+            assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
+            const auto & bn = mBufferGraph[streamSet];
+            scale = std::max(scale, bn.RelativeIORate);
+        }
+        scale *= Rational{mTarget->getStride(), getKernel(kernelId)->getStride()};
+        assert (scale.numerator() > 0);
+    } else {
+        assert (in_degree(kernelId, mBufferGraph) > 0);
+        for (auto input : make_iterator_range(in_edges(kernelId, mBufferGraph))) {
+            const auto streamSet = source(input, mBufferGraph);
+            assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
+            const auto & bn = mBufferGraph[streamSet];
+            scale = std::max(scale, bn.RelativeIORate);
+        }
+        assert (scale.numerator() > 0);
+    }
+
+    return scale;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief initializeInitialSlidingWindowSegmentLengths
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::initializeInitialSlidingWindowSegmentLengths(KernelBuilder & b, Value * const segmentLengthScalingFactor) {
+    if (LLVM_UNLIKELY(CheckAssertions())) {
+        b.CreateAssert(segmentLengthScalingFactor, "segmentLengthScalingFactor cannot be zero %s", mCurrentKernelName);
+    }
     for (unsigned i = FirstComputePartitionId; i <= LastComputePartitionId; ++i) {
         const auto f = FirstKernelInPartition[i];
-      //  assert (FirstKernel <= f && f <= LastKernel);
-        if (MinimumNumOfStrides[f] != MaximumNumOfStrides[f] || mIsNestedPipeline) {
-            Value * const init = b.CreateMul(segmentLengthScalingFactor, b.getSize(MaximumNumOfStrides[f]));
+        if (mBufferGraph[f].controlsSlidingWindow()) {
+            const auto factor = calculateBufferScalingFactor(f);
+            Value * init = b.CreateMulRational(segmentLengthScalingFactor, factor);
+            init = b.CreateRoundUpRational(init, StrideStepLength[f]);
             b.setScalarField(SCALED_SLIDING_WINDOW_SIZE_PREFIX + std::to_string(f), init);
+        } else {
+            assert (!b.hasScalarField(SCALED_SLIDING_WINDOW_SIZE_PREFIX + std::to_string(f)));
         }
     }
 }
@@ -41,7 +77,7 @@ void PipelineCompiler::initializeInitialSlidingWindowSegmentLengths(KernelBuilde
  * @brief initializeFlowControl
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::initializeFlowControl(KernelBuilder & b) {
-    if (RequiredThreadLocalStreamSetMemory > 0 && !mIsIOProcessThread) {
+    if (num_edges(ThreadLocalPlacement) > 0 && !mIsIOProcessThread) {
         mThreadLocalMemorySizePtr = b.getScalarFieldPtr(BASE_THREAD_LOCAL_STREAMSET_MEMORY_BYTES).first;
     } else {
         mThreadLocalMemorySizePtr = nullptr;
@@ -62,96 +98,30 @@ void PipelineCompiler::detemineMaximumNumberOfStrides(KernelBuilder & b) {
     // the same partition refer to the mNumOfPartitionStrides to determine how their segment length.
 
     if (mIsPartitionRoot) {
-
-
         assert (mCurrentPartitionId == KernelPartitionId[mKernelId]);
-        assert (mKernelId == FirstKernelInPartition[KernelPartitionId[mKernelId]]);
-        const auto firstKernelOfNextPartition = FirstKernelInPartition[mCurrentPartitionId + 1];
-        size_t maxMemory = 0;
-
-        for (auto kernel = mKernelId; kernel < firstKernelOfNextPartition; ++kernel) {
-            for (const auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
-                const auto streamSet = target(output, mBufferGraph);
-                const BufferNode & bn = mBufferGraph[streamSet];
-                if (bn.isThreadLocal()) {
-                    assert (bn.BufferEnd > 0);
-                    assert ((bn.BufferStart % b.getPageSize()) == 0);
-                    assert ((bn.BufferEnd % b.getPageSize()) == 0);
-                    maxMemory = std::max<size_t>(maxMemory, bn.BufferEnd);
-                    assert (RequiredThreadLocalStreamSetMemory >= maxMemory);
-                }
-            }
-        }
-
-        assert (!mIsIOProcessThread || maxMemory == 0);
-
-        Value * threadLocalPtr = nullptr;
-        Type * threadLocalTy = nullptr;
-        if (maxMemory) {
-            std::tie(threadLocalPtr, threadLocalTy) = b.getScalarFieldPtr(BASE_THREAD_LOCAL_STREAMSET_MEMORY);
-        }
+        assert (mKernelId == FirstKernelInPartition[mCurrentPartitionId]);
 
         // If the min and max num of strides is equal, we almost certainly have strictly fixed
         // rate input into this partition. However if this a nested pipeline, we cannot assume
         // that the outer pipeline will feed data to this at a fixed rate.
-        if (mBufferGraph[mKernelId].permitSlidingWindow()) {
+
+        const auto & bn = mBufferGraph[mKernelId];
+        if (bn.controlsSlidingWindow()) {
             assert (!mIsIOProcessThread);
-
             mMaximumNumOfStrides = b.getScalarField(SCALED_SLIDING_WINDOW_SIZE_PREFIX + std::to_string(mKernelId));
-
-            #ifdef PRINT_DEBUG_MESSAGES
-            debugPrint(b, "%s.maxNumOfStrides=%" PRIu64, mCurrentKernelName, mMaximumNumOfStrides);
-            #endif
-
-            // calculate how much memory is required by this partition relative to max num of strides
-            // and determine if the current thread local buffer can fit it.
-
-            if (maxMemory > 0) {
-
-                mThreadLocalScalingFactor =
-                    b.CreateCeilUDivRational(mMaximumNumOfStrides, MaximumNumOfStrides[mKernelId]);
-
-                Value * const memoryForSegment = b.CreateMul(mThreadLocalScalingFactor, b.getSize(maxMemory));
-                BasicBlock * const expandThreadLocalMemory = b.CreateBasicBlock();
-                BasicBlock * const afterExpansion = b.CreateBasicBlock();
-                Value * const currentMem = b.CreateAlignedLoad(b.getSizeTy(), mThreadLocalMemorySizePtr, SizeTyABIAlignment);
-                Value * const needsExpansion = b.CreateICmpUGT(memoryForSegment, currentMem);
-                b.CreateCondBr(needsExpansion, expandThreadLocalMemory, afterExpansion);
-
-                b.SetInsertPoint(expandThreadLocalMemory);
-
-                b.CreateFree(b.CreateAlignedLoad(threadLocalTy, threadLocalPtr, PtrTyABIAlignment));
-                // At minimum, we want to double the required space to minimize future reallocs
-                Value * expanded = b.CreateRoundUp(memoryForSegment, currentMem);
-                b.CreateAlignedStore(expanded, mThreadLocalMemorySizePtr, SizeTyABIAlignment);
-                #ifdef THREADLOCAL_BUFFER_CAPACITY_MULTIPLIER
-                expanded = b.CreateMul(expanded, b.getSize(THREADLOCAL_BUFFER_CAPACITY_MULTIPLIER));
-                #endif
-                Value * const base = b.CreatePageAlignedMalloc(expanded);
-                b.CreateAlignedStore(base, threadLocalPtr, PtrTyABIAlignment);
-                b.CreateBr(afterExpansion);
-
-                b.SetInsertPoint(afterExpansion);
-            } else {
-                mThreadLocalScalingFactor = nullptr;
-            }
-
+        } else if (bn.permitSlidingWindow()) {
+            mMaximumNumOfStrides = nullptr;
         } else {
-            const auto numOfStrides = MaximumNumOfStrides[mCurrentPartitionRoot];
-            mMaximumNumOfStrides = b.CreateMul(mExpectedNumOfStridesMultiplier, b.getSize(numOfStrides));
-            mThreadLocalScalingFactor = mExpectedNumOfStridesMultiplier;
+            const auto factor = calculateBufferScalingFactor(mKernelId);
+            mMaximumNumOfStrides = b.CreateCeilUMulRational(mExpectedNumOfStridesMultiplier, factor);
+            mMaximumNumOfStrides = b.CreateRoundUpRational(mMaximumNumOfStrides, StrideStepLength[mKernelId]);
         }
-        if (maxMemory > 0) {
-            mThreadLocalStreamSetBaseAddress = b.CreateAlignedLoad(threadLocalTy, threadLocalPtr, PtrTyABIAlignment);
-        } else {
-            mThreadLocalStreamSetBaseAddress = nullptr;
-            mThreadLocalScalingFactor = nullptr;
-        }
-
+        allocateThreadLocalMemoryForMaximumNumOfStrides(b);
     } else {
         assert (!mIsIOProcessThread);
-        const auto ratio = Rational{StrideStepLength[mKernelId], StrideStepLength[mCurrentPartitionRoot]};
+        const Rational ratio{StrideStepLength[mKernelId], StrideStepLength[mCurrentPartitionRoot]};
         const auto factor = ratio / mPartitionStrideRateScalingFactor;
+        assert (factor.numerator() > 0);
         mMaximumNumOfStrides = b.CreateMulRational(mNumOfPartitionStrides, factor);
     }
 }
@@ -160,17 +130,19 @@ void PipelineCompiler::detemineMaximumNumberOfStrides(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief updateNextSlidingWindowSize
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::updateNextSlidingWindowSize(KernelBuilder & b, Value * const maxNumOfStrides, Value * const actualNumOfStrides) {
+void PipelineCompiler::updateNextSlidingWindowSize(KernelBuilder & b, Value * const maxNumOfStrides, Value * const potentialNumOfStrides) {
     assert (!mIsIOProcessThread);
-    if (MinimumNumOfStrides[mKernelId] != MaximumNumOfStrides[mKernelId] || mIsNestedPipeline) {
+    assert (mIsPartitionRoot);
+    const auto & bn = mBufferGraph[mKernelId];
+    if (bn.controlsSlidingWindow()) {
         ConstantInt * const TWO = b.getSize(2);
         Value * const A = b.CreateMul(maxNumOfStrides, TWO);
-        Value * const B = b.CreateAdd(maxNumOfStrides, actualNumOfStrides);
+        Value * const B = b.CreateAdd(maxNumOfStrides, potentialNumOfStrides);
         assert (StrideStepLength[mKernelId] > 0);
         ConstantInt * const stepLength = b.getSize(StrideStepLength[mKernelId] * 2U);
         Value * const C = b.CreateRoundUp(B, stepLength);
         Value * const D = b.CreateUDiv(C, TWO);
-        Value * const higher = b.CreateICmpUGT(actualNumOfStrides, maxNumOfStrides);
+        Value * const higher = b.CreateICmpUGT(potentialNumOfStrides, maxNumOfStrides);
         Value * const nextMaxNumOfStrides = b.CreateSelect(higher, A, D);
         b.setScalarField(SCALED_SLIDING_WINDOW_SIZE_PREFIX + std::to_string(mKernelId), nextMaxNumOfStrides);
     }

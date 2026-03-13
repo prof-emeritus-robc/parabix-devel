@@ -291,7 +291,6 @@ SCResults SelfComposableLogic(PabloBuilder & pb, std::vector<PabloAST *> Basis,
     PabloAST * A2 = pb.createXor(A, A1, "selfc.A2");  //  2nd, 4th, 6th, ... of the As
     PabloAST * A1_start = pb.createAnd(A_run_start, A1, "selfc.A1_start");
     PabloAST * A2_start = pb.createAnd(A_run_start, A2, "selfc.A2_start");
-    PabloAST * A_continue = A;
     PabloAST * run_continue = pb.createOr3(suffix, A, AA, "selfc.run_continue");
     PabloAST * A1_runs = pb.createMatchStar(A1_start, run_continue, "selfc.A1_runs");
     PabloAST * A2_runs = pb.createMatchStar(A2_start, run_continue, "selfc.A2_runs");
@@ -388,7 +387,8 @@ void ComputeWorkPlacement(PipelineBuilder & P,
     P.CreateKernelCall<CreateU8_FilterMask>(U8_Deletion_BixNum, U8_FilterMask);
     SHOW_STREAM(U8_FilterMask);
 
-    StreamSet * const U8_SpreadMask = InsertionSpreadMask(P, U8_Insertion_BixNum, kernel::InsertPosition::After);
+    StreamSet * const U8_SpreadMask =  P.CreateStreamSet(1, 1);
+    InsertionSpreadMask(P, U8_Insertion_BixNum, U8_SpreadMask, kernel::InsertPosition::After);
     SHOW_STREAM(U8_SpreadMask);
 
     StreamSet * const U8_PostSpreadFilterMask = P.CreateStreamSet(1, 1);

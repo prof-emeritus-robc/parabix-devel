@@ -122,7 +122,6 @@ void addKernelProperties(const Kernels & kernels, Kernel * const output) {
                 default: continue;
             }
         }
-        assert (kernel->getStride());
     }
 
     if (fatalTermination) {
@@ -136,6 +135,39 @@ void addKernelProperties(const Kernels & kernels, Kernel * const output) {
     if (sideEffecting) {
         output->addAttribute(SideEffecting());
     }
+
+    auto & inputs = output->getInputStreamSetBindings();
+    const auto n = inputs.size();
+    if (LLVM_UNLIKELY(n > 0)) {
+        SmallVector<size_t, 4> LA(n, 0);
+        for (const auto & K : kernels) {
+            Kernel * kernel = K.Object;
+            const auto & I = kernel->getInputStreamSetBindings();
+            const auto m = I.size();
+            for (size_t j = 0; j < m; ++j) {
+                const Relationship * const r = I[j].getRelationship(); assert (r);
+                for (size_t k = 0; k < n; ++k) {
+                    const auto & in = inputs[k];
+                    assert (in.getRelationship());
+                    if (LLVM_UNLIKELY(in.getRelationship() == r)) {
+                        for (const Attribute & attr : I[j].getAttributes()) {
+                            if (LLVM_UNLIKELY(attr.getKind() == AttrId::LookAhead)) {
+                                LA[k] = std::max<size_t>(LA[k], attr.amount());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (size_t i = 0; i < n; ++i) {
+            if (LLVM_UNLIKELY(LA[i] > 0)) {
+                inputs[i].findOrAddAttribute(AttrId::LookAhead, LA[i]);
+            }
+        }
+
+    }
+
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -175,6 +207,8 @@ Kernel * PipelineBuilder::makeKernel() {
     #endif
 
     auto requiresIllustratorObj = !mTarget->mIllustratorBindings.empty();
+
+    addKernelProperties(kernels, mTarget);
 
     if (LLVM_LIKELY(signature.empty())) {
 
@@ -487,19 +521,18 @@ Kernel * PipelineBuilder::makeKernel() {
 
     mTarget->mNumOfKernelFamilyCalls = numOfNestedKernelFamilyCalls;
 
-    addKernelProperties(kernels, mTarget);
-
     if (LLVM_UNLIKELY(requiresIllustratorObj)) {
-        mTarget->mFlags = Kernel::KernelFlags::RequiresIllustratorObject;
+        mTarget->mFlags |= Kernel::KernelFlags::RequiresIllustratorObject;
     }
 
     signature = PipelineKernel::annotateSignatureWithPipelineFlags(std::move(signature));
 
     mTarget->mKernelName =
-        Kernel::annotateKernelNameWithDebugFlags(Kernel::TypeId::Pipeline, mTarget->mFlags,
-            PipelineKernel::makePipelineHashName(signature));
+        Kernel::annotateKernelNameWithDebugFlags(Kernel::TypeId::Pipeline, mTarget->mFlags, PipelineKernel::makePipelineHashName(signature));
 
     mTarget->setCompilationStatus(Kernel::CompilationStatus::FullyInitialized);
+
+
 
     return mTarget;
 }
@@ -659,7 +692,7 @@ PipelineBuilder::PipelineBuilder(BaseDriver & driver, PipelineKernel * const ker
 Bindings replaceManagedWithSharedManagedBuffers(const Bindings & bindings) {
     Bindings replaced;
     replaced.reserve(bindings.size());
-    for (const Binding & binding : bindings) {        
+    for (const Binding & binding : bindings) {
         Binding newBinding(binding.getName(), binding.getRelationship(), binding.getRate());
         for (const Attribute & attr : binding.getAttributes()) {
             if (attr.getKind() == Attribute::KindId::ManagedBuffer) {

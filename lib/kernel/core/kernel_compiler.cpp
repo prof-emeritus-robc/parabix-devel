@@ -131,8 +131,6 @@ constexpr static auto TERMINATION_SIGNAL = "__termination_signal";
 // TODO: this check is a bit too strict in general; if the pipeline could request data/
 // EOF padding from the MemorySource kernel, it would be possible to re-enable.
 
-// #define CHECK_IO_ADDRESS_RANGE
-
 // TODO: split the init/final into two methods each, one to do allocation/init, and the
 // other final/deallocate? Would potentially allow us to reuse the kernel/stream set
 // memory in the nested engine if each init method memzero'ed them. Would need to change
@@ -420,13 +418,8 @@ void KernelCompiler::constructStreamSetBuffers(KernelBuilder & b) {
 
         StreamSetBuffer * buffer = nullptr;
         if (LLVM_UNLIKELY(Kernel::isManagedBuffer(output))) {
-            Rational R{mTarget->getStride(), b.getBitBlockWidth()};
-            const auto & ub = output.getRate().getUpperBound();
-            if (ub.numerator() > 0) {
-                R *= ub;
-            }
-            assert (R.numerator() > 0);
-            buffer = new ManagedDynamicBuffer(i + numOfInputStreams, b, output.getType(), R.numerator(), 0);
+            const auto isReturnedBuffer = output.hasAttribute(AttrId::ReturnedBuffer);
+            buffer = new ManagedDynamicBuffer(i + numOfInputStreams, b, output.getType(), isReturnedBuffer, 0);
         } else {
             buffer = new ExternalBuffer(i + numOfInputStreams, b, output.getType(), 0);
         }
@@ -495,9 +488,68 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
         return v;
     };
     assert (getHandle() == nullptr);
+
+    const auto ea = codegen::DebugOptionIsSet(codegen::EnableAsserts);
+
+    if (LLVM_UNLIKELY(ea)) {
+
+        Value * const providedSharedStateTySize = nextArg();
+
+        Constant * sharedStateTySize = nullptr;
+        if (LLVM_LIKELY(mTarget->isStateful())) {
+            sharedStateTySize = b.getTypeSize(mTarget->getSharedStateType());
+        } else {
+            sharedStateTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
+        }
+        Value * const correctSharedTySize = b.CreateICmpUGE(providedSharedStateTySize, sharedStateTySize);
+
+        b.CreateAssert(correctSharedTySize,
+                       "%s expected state type object of size %" PRIu64 " but received one of size %" PRIu64,
+                       b.GetString(getName()), sharedStateTySize, providedSharedStateTySize);
+
+        Value * const providedThreadLocalTySize = nextArg();
+
+        Constant * threadLocalTySize = nullptr;
+        if (mTarget->hasThreadLocal()) {
+            threadLocalTySize = b.getTypeSize(mTarget->getThreadLocalStateType());
+        } else {
+            threadLocalTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
+        }
+
+        Value * const correctThreadLocalTySize = b.CreateICmpUGE(providedThreadLocalTySize, threadLocalTySize);
+
+        b.CreateAssert(correctThreadLocalTySize,
+                       "%s expected state type object of size %" PRIu64 " but received one of size %" PRIu64,
+                       b.GetString(getName()), threadLocalTySize, providedThreadLocalTySize);
+
+
+
+    }
+
+
+
     if (LLVM_LIKELY(mTarget->isStateful())) {
         setHandle(nextArg());
+
+
+        if (LLVM_UNLIKELY(ea)) {
+            auto & dl = b.getModule()->getDataLayout();
+            const auto align = CBuilder::getAlignOf(dl, mTarget->getSharedStateType());
+            if (LLVM_LIKELY(align > 1U)) {
+            Value * handleInt = b.CreatePtrToInt(getHandle(), b.getSizeTy());
+            b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
+                               "%s shared handle addresss (x%" PRIx64 ") is misaligned for shared state type (%" PRIu64 ")",
+                               b.GetString("InitializeShared"), handleInt, b.getSize(align));
+            }
+        }
+
+
+
+
+
     }
+
+
     initializeScalarMap(b, InitializeOptions::DoNotIncludeThreadLocalScalars);
     for (const auto & binding : mInputScalars) {
         b.setScalarField(binding.getName(), nextArg());
@@ -598,6 +650,19 @@ inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilde
         PHINode * const threadLocal = b.CreatePHI(providedState->getType(), 2);
         threadLocal->addIncoming(providedState, mEntryPoint);
         threadLocal->addIncoming(allocedState, allocThreadLocal);
+
+        const auto ea = codegen::DebugOptionIsSet(codegen::EnableAsserts);
+        if (LLVM_UNLIKELY(ea)) {
+            auto & dl = b.getModule()->getDataLayout();
+            const auto align = CBuilder::getAlignOf(dl, threadLocalTy);
+            if (LLVM_LIKELY(align > 1U)) {
+            Value * handleInt = b.CreatePtrToInt(threadLocal, b.getSizeTy());
+            b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
+                               "%s thread local handle addresss (x%" PRIx64 ") is misaligned for state type (%" PRIu64 ")",
+                               b.GetString("InitializeThreadLocal"), handleInt, b.getSize(align));
+            }
+        }
+
         mThreadLocalHandle = threadLocal;
         initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
         mTarget->generateInitializeThreadLocalMethod(b);
@@ -627,6 +692,11 @@ inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelB
             setHandle(nextArg());
         }
         Value * const expectedNumOfStrides = nextArg();
+        const auto imss = (mTarget->getKernelFlags() & Kernel::KernelFlags::HasInternallyManagedStreamSet);
+        if (LLVM_UNLIKELY(imss && codegen::DebugOptionIsSet(codegen::TraceDynamicBuffers))) {
+            mReportExpansionCallback = nextArg();
+            mPipelineHandle = nextArg();
+        }
         initializeScalarMap(b, InitializeOptions::DoNotIncludeThreadLocalScalars);
         initializeOwnedBufferHandles(b, InitializeOptions::DoNotIncludeThreadLocalScalars, expectedNumOfStrides);
         mTarget->generateAllocateSharedInternalStreamSetsMethod(b, expectedNumOfStrides);
@@ -710,13 +780,33 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
         if (LLVM_UNLIKELY(enableAsserts)) {
             b.CreateAssert(getHandle(), "%s: shared handle cannot be null", b.GetString(getName()));
         }
+        if (LLVM_UNLIKELY(enableAsserts)) {
+            auto & dl = b.getModule()->getDataLayout();
+            const auto align = CBuilder::getAlignOf(dl, mTarget->getSharedStateType());
+            if (LLVM_LIKELY(align > 1U)) {
+            Value * handleInt = b.CreatePtrToInt(getHandle(), b.getSizeTy());
+            b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
+                               "%s shared handle addresss (x%" PRIx64 ") is misaligned for shared state type (%" PRIu64 ")",
+                               b.GetString("DoSegment"), handleInt, b.getSize(align));
+            }
+        }
     }
     if (LLVM_UNLIKELY(mTarget->hasThreadLocal())) {
         setThreadLocalHandle(nextArg());
         if (LLVM_UNLIKELY(enableAsserts)) {
             b.CreateAssert(getThreadLocalHandle(), "%s: thread local handle cannot be null", b.GetString(getName()));
         }
-    }    
+        if (LLVM_UNLIKELY(enableAsserts)) {
+            auto & dl = b.getModule()->getDataLayout();
+            const auto align = CBuilder::getAlignOf(dl, mTarget->getThreadLocalStateType());
+            if (LLVM_LIKELY(align > 1U)) {
+            Value * handleInt = b.CreatePtrToInt(getThreadLocalHandle(), b.getSizeTy());
+            b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
+                               "%s thread local handle addresss (x%" PRIx64 ") is misaligned for state type (%" PRIu64 ")",
+                               b.GetString("DoSegment"), handleInt, b.getSize(align));
+            }
+        }
+    }
     const auto internallySynchronized = mTarget->hasAttribute(AttrId::InternallySynchronized);
     // TODO: the simplest way of ensuring we can allow external I/O to be passed though the main pipeline
     // even if there are multiple consumers of the input with differing processing rates is to special
@@ -730,15 +820,15 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
     Rational fixedRateLCM{0};
     mFixedRateFactor = nullptr;
 
+    if (LLVM_UNLIKELY(internallySynchronized)) {
+        mExternalSegNo = nextArg();
+    }
+    mRawNumOfStrides = nextArg();
+
     if (LLVM_UNLIKELY(isMainPipeline)) {
         mIsFinal = b.getTrue();
-        mRawNumOfStrides = nullptr;
-        mNumOfStrides = nullptr;
+        mNumOfStrides = mRawNumOfStrides;
     } else {
-        if (LLVM_UNLIKELY(internallySynchronized)) {
-            mExternalSegNo = nextArg();
-        }
-        mRawNumOfStrides = nextArg();
         if (LLVM_UNLIKELY(mTarget->hasAttribute(AttrId::MustExplicitlyTerminate))) {
             mIsFinal = nullptr;
             mNumOfStrides = mRawNumOfStrides;
@@ -763,42 +853,9 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
     // to access a stream set from a LLVM function call. We could create a stream-set aware function creation
     // and call system here but that is not an ideal way of handling this.
 
-    #ifdef CHECK_IO_ADDRESS_RANGE
-    auto checkStreamRange = [&](const StreamSetBuffer * const buffer, const Binding & binding, Value * const startItemCount) {
-
-        SmallVector<char, 256> tmp;
-        raw_svector_ostream out(tmp);
-        out << "StreamSet " << getName() << ":" << binding.getName();
-
-        DataLayout DL(b.getModule());
-        Type * const intPtrTy = DL.getIntPtrType(b.getInt8PtrTy());
-
-        ConstantInt * const ZERO = b.getSize(0);
-        ConstantInt * const BLOCK_WIDTH = b.getSize(b.getBitBlockWidth());
-
-        Value * const fromIndex = b.CreateUDiv(startItemCount, BLOCK_WIDTH);
-        Value * const baseAddress = buffer->getBaseAddress(b);
-        Value * const startPtr = buffer->getStreamBlockPtr(b, baseAddress, ZERO, fromIndex);
-        Value * const start = b.CreatePtrToInt(startPtr, intPtrTy);
-
-        Value * const endPos = b.CreateAdd(startItemCount, buffer->getCapacity(b));
-        Value * const toIndex = b.CreateCeilUDiv(endPos, BLOCK_WIDTH);
-        Value * const endPtr = buffer->getStreamBlockPtr(b, baseAddress, ZERO, toIndex);
-        Value * const end = b.CreatePtrToInt(endPtr, intPtrTy);
-
-        Value * const length = b.CreateSub(end, start);
-
-        b.CreateAssert(b.CreateICmpULE(start, end),
-                        "%s: illegal kernel I/O address range [0x%" PRIx64 ", 0x%" PRIx64 ")",
-                        b.GetString(out.str()), start, end);
-
-        b.CheckAddress(startPtr, length, out.str());
-
-
-    };
-    #endif
-
     const auto numOfInputs = getNumOfStreamInputs();
+
+    const auto checkStreamSet = codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnableStreamSetAsserts);
 
     IntegerType * const sizeTy = b.getSizeTy();
     for (unsigned i = 0; i < numOfInputs; i++) {
@@ -815,8 +872,8 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
         buffer->setBaseAddress(b, virtualBaseAddress);
 
         if (LLVM_UNLIKELY(internallySynchronized)) {
-            mInputIsClosed[i] = nextArg();
-            assert (mInputIsClosed[i]->getType() == b.getInt1Ty());
+            Value * const closed = nextArg();
+            mInputIsClosed[i] = b.CreateIsNotNull(closed);
         } else {
             mInputIsClosed[i] = mIsFinal;
         }
@@ -859,18 +916,18 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
         assert (accessible);
         assert (accessible->getType() == sizeTy);
         mAccessibleInputItems[i] = accessible;
-
         Value * avail = b.CreateAdd(processed, accessible);
         mAvailableInputItems[i] = avail;
         if (input.hasLookahead()) {
             avail = b.CreateAdd(avail, b.getSize(input.getLookahead()));
         }
         buffer->setCapacity(b, avail);
-        #ifdef CHECK_IO_ADDRESS_RANGE
-        if (LLVM_UNLIKELY(enableAsserts)) {
-            checkStreamRange(buffer, input, processed);
+        /// ----------------------------------------------------
+        /// capacity
+        /// ----------------------------------------------------
+        if (LLVM_UNLIKELY(checkStreamSet)) {
+            mInputItemCapacity[i] = nextArg();
         }
-        #endif
     }
 
     // set all of the output buffers
@@ -889,7 +946,7 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
         const auto isLocal =  Kernel::isLocalBuffer(output);
         if (LLVM_UNLIKELY(isLocal.isShared())) {
             Value * const handle = nextArg();
-            assert (isa<DynamicBuffer>(buffer));
+            assert (isa<ManagedDynamicBuffer>(buffer));
             buffer->setHandle(b.CreatePointerCast(handle, buffer->getHandlePointerType(b)));
         } else if (LLVM_UNLIKELY(isMainPipeline || isLocal.any())) {
             // If an output is a managed buffer, the address is stored within the state instead
@@ -905,6 +962,7 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
             buffer->setHandle(localHandle);
             buffer->setBaseAddress(b, virtualBaseAddress);
         }
+
 
         /// ----------------------------------------------------
         /// produced item count
@@ -939,11 +997,12 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
         /// writable / consumed item count
         /// ----------------------------------------------------
         Value * writable = nullptr;
-        assert (isa<ManagedDynamicBuffer>(buffer) == isLocal.isManaged());
+        assert (isa<ManagedDynamicBuffer>(buffer) || !isLocal.isManaged());
         if (isLocal.any()) {
             Value * const consumed = nextArg();
             assert (consumed->getType() == sizeTy);
             mConsumedOutputItems[i] = consumed;
+            buffer->freePendingDeletions(b, consumed);
             writable = buffer->getLinearlyWritableItems(b, produced, consumed);
             assert (writable && writable->getType() == sizeTy);
         } else {
@@ -958,17 +1017,25 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
             if (writable) {
                 capacity = b.CreateAdd(produced, writable);
                 buffer->setCapacity(b, capacity);
-                #ifdef CHECK_IO_ADDRESS_RANGE
-                if (LLVM_UNLIKELY(enableAsserts)) {
-                    checkStreamRange(buffer, output, produced);
-                }
-                #endif
             } else {
                 capacity = ConstantExpr::getNeg(b.getSize(1));
                 buffer->setCapacity(b, capacity);
             }
+            /// ----------------------------------------------------
+            /// capacity
+            /// ----------------------------------------------------
+            if (LLVM_UNLIKELY(checkStreamSet)) {
+                mOutputItemCapacity[i] = nextArg();
+            }
         }
         mWritableOutputItems[i] = writable;
+    }
+
+    const auto hasManagedOutput = (mTarget->getKernelFlags() & Kernel::KernelFlags::HasInternallyManagedStreamSet);
+
+    if (LLVM_UNLIKELY(hasManagedOutput && codegen::DebugOptionIsSet(codegen::TraceDynamicBuffers))) {
+        mReportExpansionCallback = nextArg();
+        mPipelineHandle = nextArg();
     }
     assert (arg == args.end());
 
@@ -996,6 +1063,7 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
     // setDoSegmentProperties, and PipelineCompiler::writeKernelCall
 
     std::vector<Value *> props;
+    props.reserve(mTarget->getDoSegmentFunction(b)->getNumOperands());
     if (LLVM_LIKELY(mTarget->isStateful())) {
         props.push_back(mSharedHandle); assert (mSharedHandle);
     }
@@ -1010,8 +1078,9 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
         props.push_back(mExternalSegNo);
     }
 
+    props.push_back(mNumOfStrides); assert (mNumOfStrides);
+
     if (LLVM_LIKELY(!isMainPipeline)) {
-        props.push_back(mNumOfStrides); assert (mNumOfStrides);
         if (LLVM_LIKELY(mTarget->hasFixedRateIO())) {
             props.push_back(mFixedRateFactor);
         }
@@ -1021,6 +1090,8 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
         }
         #endif
     }
+
+    const auto checkStreamSet = codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnableStreamSetAsserts);
 
     PointerType * const voidPtrTy = b.getVoidPtrTy();
     IntegerType * const sizeTy = b.getSizeTy();
@@ -1051,6 +1122,12 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
         /// ----------------------------------------------------
         if (isMainPipeline || requiresItemCount(input)) {
             props.push_back(mAccessibleInputItems[i]);
+        }
+        /// ----------------------------------------------------
+        /// capacity
+        /// ----------------------------------------------------
+        if (LLVM_UNLIKELY(checkStreamSet)) {
+            props.push_back(mInputItemCapacity[i]);
         }
     }
 
@@ -1092,9 +1169,23 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
         /// ----------------------------------------------------
         if (LLVM_UNLIKELY(isLocal.any())) {
             props.push_back(mConsumedOutputItems[i]);
-        } else if (isMainPipeline || requiresItemCount(output)) {
-            props.push_back(mWritableOutputItems[i]);
+        } else {
+            if (isMainPipeline || requiresItemCount(output)) {
+                props.push_back(mWritableOutputItems[i]);
+            }
+            /// ----------------------------------------------------
+            /// capacity
+            /// ----------------------------------------------------
+            if (LLVM_UNLIKELY(checkStreamSet)) {
+                props.push_back(mOutputItemCapacity[i]);
+            }
         }
+    }
+    if (LLVM_UNLIKELY(mReportExpansionCallback != nullptr)) {
+        assert (codegen::DebugOptionIsSet(codegen::TraceDynamicBuffers));
+        props.push_back(mReportExpansionCallback);
+        assert (mPipelineHandle);
+        props.push_back(mPipelineHandle);
     }
     return props;
 }
@@ -1147,16 +1238,7 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
                                     "computed from a null base address.";
                 b.CreateAssert(baseAddress, out.str(), b.GetString(output.getName()));
             }
-            Value * produced = mInitiallyProducedOutputItems[i];
-            assert (isFromCurrentFunction(b, produced, false));
-            // TODO: will LLVM optimizations replace the following with the already loaded value?
-            // If not, re-loading it here may reduce register pressure / compilation time.
-            if (mProducedOutputItemPtr[i]) {
-                assert (isFromCurrentFunction(b, mProducedOutputItemPtr[i], false));
-                produced = b.CreateAlignedLoad(sizeTy, mProducedOutputItemPtr[i], sizeof(size_t));
-            }
-            assert (isFromCurrentFunction(b, produced, true));
-            Value * vba = buffer->getVirtualBasePtr(b, baseAddress, produced);
+            Value * vba = buffer->getVirtualBasePtr(b, baseAddress, mConsumedOutputItems[i]);
             vba = b.CreatePointerCast(vba, b.getVoidPtrTy());
 
             assert (isFromCurrentFunction(b, mUpdatableOutputBaseVirtualAddressPtr[i], true));
@@ -1198,27 +1280,6 @@ inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder 
         mThreadLocalHandle = nextArg();
         initializeScalarMap(b, InitializeOptions::IncludeAndAutomaticallyAccumulateThreadLocalScalars);
         mTarget->generateFinalizeThreadLocalMethod(b);
-
-
-        size_t numOfManagedBuffers = 0;
-        BEGIN_SCOPED_REGION
-        const auto n = mOutputStreamSets.size();
-        for (size_t i = 0; i < n; ++i) {
-            const auto & buffer = mStreamSetOutputBuffers[i];
-            assert (isa<ManagedDynamicBuffer>(buffer) == Kernel::isManagedBuffer(mOutputStreamSets[i]));
-            if (LLVM_UNLIKELY(isa<ManagedDynamicBuffer>(buffer))) {
-                StructType * const threadLocalTy = mTarget->getThreadLocalStateType();
-                assert (threadLocalTy->getStructElementType(0)->getStructElementType(numOfManagedBuffers) == 
-                        ManagedDynamicBuffer::getInternalThreadLocalHandleType(b));
-                FixedArray<Value *, 3> indices;
-                indices[0] = b.getInt32(0);
-                indices[1] = b.getInt32(0);
-                indices[2] = b.getInt32(numOfManagedBuffers++);
-                Value * const threadLocalStreamSetPtr = b.CreateGEP(threadLocalTy, mThreadLocalHandle, indices);
-                cast<ManagedDynamicBuffer>(buffer.get())->freePendingDeletion(b, threadLocalStreamSetPtr);
-            }
-        }
-        END_SCOPED_REGION
 
         b.CreateRetVoid();
         clearInternalStateAfterCodeGen();
@@ -1291,7 +1352,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
 
     StructType * const threadLocalTy = mTarget->getThreadLocalStateType();
 
-    DataLayout DL(b.getModule());
+    auto & DL = b.getModule()->getDataLayout();
 
     #ifndef NDEBUG
     auto verifyStateType = [](Value * const handle, StructType * const stateType) {
@@ -1307,7 +1368,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         assert (!stateType->isOpaque());
         assert (stateType->isSized());
         const auto n = stateType->getStructNumElements();
-        for (unsigned i = 0; i < n; ++i) {
+        for (unsigned i = 0; i < n; i += 2) {
             assert (isa<StructType>(stateType->getStructElementType(i)));
         }
         return true;
@@ -1318,7 +1379,11 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
     }
     #endif
 
+    assert (isFromCurrentFunction(b, mSharedHandle, true));
+    assert (isFromCurrentFunction(b, mThreadLocalHandle, true));
+
     mScalarFieldMap.clear();
+    mScalarAliasMap.clear();
 
     auto addToScalarFieldMap = [&](StringRef bindingName, Value * const scalar, Type * const expectedType, Type * const actualType) {
         const auto i = mScalarFieldMap.insert(std::make_pair(bindingName, std::make_pair(scalar, expectedType)));
@@ -1344,30 +1409,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
 
     bool hasThreadLocalAccum = false;
 
-    size_t threadLocalGroup0StartIndex = 0;
-
-    if (options != InitializeOptions::DoNotIncludeThreadLocalScalars) {
-        const auto n = mOutputStreamSets.size();
-        for (size_t i = 0; i < n; ++i) {
-            const auto & buffer = mStreamSetOutputBuffers[i];
-            assert (isa<ManagedDynamicBuffer>(buffer) == Kernel::isManagedBuffer(mOutputStreamSets[i]));
-            if (LLVM_UNLIKELY(isa<ManagedDynamicBuffer>(buffer))) {
-                assert (mThreadLocalHandle);
-                assert (threadLocalGroup0StartIndex < mTarget->getThreadLocalStateType()->getStructNumElements());
-                assert (mTarget->getThreadLocalStateType()->getStructElementType(0)->getStructElementType(threadLocalGroup0StartIndex) == ManagedDynamicBuffer::getInternalThreadLocalHandleType(b));
-                assert (mTarget->getThreadLocalStateType()->getStructElementType(0)->getStructElementType(threadLocalGroup0StartIndex + 1)->isEmptyTy());
-                FixedArray<Value *, 3> indices;
-                indices[0] = b.getInt32(0);
-                indices[1] = b.getInt32(0);
-                indices[2] = b.getInt32(threadLocalGroup0StartIndex);
-                Value * const tlh = b.CreateGEP(mTarget->getThreadLocalStateType(), mThreadLocalHandle, indices);
-                cast<ManagedDynamicBuffer>(buffer.get())->setThreadLocalHandle(tlh);
-                threadLocalGroup0StartIndex += 2;
-                threadLocalGroups.insert(0);
-            }
-        }
-    }
-
     for (const auto & scalar : mInternalScalars) {
         assert (scalar.getValueType());
         switch (scalar.getScalarType()) {
@@ -1390,14 +1431,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
     std::vector<unsigned> sharedIndex(sharedGroups.size() + 2, 0);
     std::vector<unsigned> threadLocalIndex(threadLocalGroups.size(), 0);
 
-    // Kernel managed buffers require both the struct for the buffer itself and a thread local pointer
-    // for the last "deallocated" memory chunk. A thread can only be confident that there are no other
-    // users of a buffer until after it fully executes the pipeline and reacquires the kernel sync lock.
-    // Thus each managed buffer has an implicit thread local state that is passed in.
-    if (LLVM_UNLIKELY(threadLocalGroup0StartIndex)) {
-        threadLocalIndex[0] = threadLocalGroup0StartIndex;
-    }
-
     BasicBlock * combineToMainThreadLocal = nullptr;
 
     if (LLVM_UNLIKELY(hasThreadLocalAccum)) {
@@ -1405,17 +1438,18 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
     }
 
     auto enumerate = [&](const Bindings & bindings, const unsigned groupId) {
-        indices[1] = b.getInt32(groupId);
+        indices[1] = b.getInt32(groupId * 2);
         auto & k = sharedIndex[groupId];
         for (const auto & binding : bindings) {
             assert (sharedTy);
-            assert ((groupId) < sharedTy->getStructNumElements());
-            assert (k < sharedTy->getStructElementType(groupId)->getStructNumElements());
-            assert (sharedTy->getStructElementType(groupId)->getStructElementType(k) == binding.getType());
-            Type * actualType = sharedTy->getStructElementType(groupId)->getStructElementType(k);
-            indices[2] = b.getInt32(k); k += 2;
+            assert ((groupId * 2) < sharedTy->getStructNumElements());
+            assert (k < sharedTy->getStructElementType(groupId * 2)->getStructNumElements());
+            assert (sharedTy->getStructElementType(groupId * 2)->getStructElementType(k) == binding.getType());
+            Type * actualType = sharedTy->getStructElementType(groupId * 2)->getStructElementType(k);
+            indices[2] = b.getInt32(k++);
             Value * const scalar = b.CreateGEP(sharedTy, mSharedHandle, indices);
             addToScalarFieldMap(binding.getName(), scalar, binding.getType(), actualType);
+
         }
     };
 
@@ -1427,10 +1461,10 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         Value * scalar = nullptr;
         Type * scalarType = nullptr;
 
-        auto getGroupIndex = [&](const flat_set<unsigned> & groups) {
+        auto getGroupIndex = [&](const flat_set<unsigned> & groups) -> unsigned {
             const auto f = groups.find(binding.getGroup());
             assert (f != groups.end());
-            return std::distance(groups.begin(), f);
+            return (unsigned)std::distance(groups.begin(), f);
         };
 
 
@@ -1439,13 +1473,13 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 assert (mSharedHandle);
                 BEGIN_SCOPED_REGION
                 const auto j = getGroupIndex(sharedGroups) + 1;
-                indices[1] = b.getInt32(j);
+                indices[1] = b.getInt32(j * 2);
                 auto & k = sharedIndex[j];
-                assert ((j) < sharedTy->getStructNumElements());
-                assert (k < sharedTy->getStructElementType(j)->getStructNumElements());
-                scalarType = sharedTy->getStructElementType(j)->getStructElementType(k);
+                assert ((j * 2) < sharedTy->getStructNumElements());
+                assert (k < sharedTy->getStructElementType(j * 2)->getStructNumElements());
+                scalarType = sharedTy->getStructElementType(j * 2)->getStructElementType(k);
                 assert (scalarType == binding.getValueType());
-                indices[2] = b.getInt32(k); k += 2;
+                indices[2] = b.getInt32(k++);
                 scalar = b.CreateGEP(sharedTy, mSharedHandle, indices);
                 END_SCOPED_REGION
                 break;
@@ -1454,13 +1488,13 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 assert (mThreadLocalHandle);
                 BEGIN_SCOPED_REGION
                 const auto j = getGroupIndex(threadLocalGroups);
-                indices[1] = b.getInt32(j);
+                indices[1] = b.getInt32(j * 2);
                 auto & k = threadLocalIndex[j];
-                assert ((j) < threadLocalTy->getStructNumElements());
-                assert (k < threadLocalTy->getStructElementType(j)->getStructNumElements());
-                scalarType = threadLocalTy->getStructElementType(j)->getStructElementType(k);
+                assert ((j * 2) < threadLocalTy->getStructNumElements());
+                assert (k < threadLocalTy->getStructElementType(j * 2)->getStructNumElements());
+                scalarType = threadLocalTy->getStructElementType(j * 2)->getStructElementType(k);
                 assert (scalarType == binding.getValueType());
-                indices[2] = b.getInt32(k); k += 2;
+                indices[2] = b.getInt32(k++);
                 scalar = b.CreateGEP(threadLocalTy, mThreadLocalHandle, indices);
 
                 if (LLVM_UNLIKELY(options == InitializeOptions::IncludeAndAutomaticallyAccumulateThreadLocalScalars)) {
@@ -1506,7 +1540,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
 
                                 if (idx == size) {
                                     Value * const scalarPtr = b.CreateGEP(scalarType, scalar, indices);
-                                    const auto align = b.getTypeSize(DL, elemTy);
+                                    const auto align = CBuilder::getAlignOf(DL, elemTy);
                                     Value * const scalarVal = b.CreateAlignedLoad(elemTy, scalarPtr, align);
                                     assert (scalarVal->getType()->isIntOrIntVectorTy());
                                     Value * const mainScalarPtr = b.CreateGEP(scalarType, mainScalar, indices);
@@ -1571,9 +1605,15 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 END_SCOPED_REGION
                 break;
             case ScalarType::NonPersistent:
-                scalarType = binding.getValueType(); assert (scalarType);
-                scalar = b.CreateAllocaAtEntryPoint(scalarType);
-                b.CreateStore(Constant::getNullValue(scalarType), scalar);
+                BEGIN_SCOPED_REGION
+                scalarType = binding.getValueType();
+                assert (scalarType);
+                assert (&scalarType->getContext() == &b.getContext());
+                scalar = b.CreateAlloca(scalarType);
+                const auto align = DL.getABITypeAlign(scalarType);
+                cast<AllocaInst>(scalar)->setAlignment(align);
+                b.CreateAlignedStore(Constant::getNullValue(scalarType), cast<AllocaInst>(scalar), align.value());
+                END_SCOPED_REGION
                 break;
             default: llvm_unreachable("I/O scalars cannot be internal");
         }
@@ -1581,7 +1621,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         addToScalarFieldMap(binding.getName(), scalar, binding.getValueType(), scalarType);
     }
 
-    enumerate(mOutputScalars, sharedGroups.size() + 1);
+    enumerate(mOutputScalars, sharedGroups.size() + 1U);
 
     // finally add any aliases
     for (const auto & alias : mScalarAliasMap) {
@@ -1641,15 +1681,16 @@ void KernelCompiler::initializeOwnedBufferHandles(KernelBuilder & b, const Initi
             const auto & buffer = mStreamSetOutputBuffers[i]; assert (buffer.get());
             buffer->setHandle(handle.first);
             assert (isLocal.isManaged() == Kernel::isManagedBuffer(output));
-            assert (isa<ManagedDynamicBuffer>(buffer) == Kernel::isManagedBuffer(output));
-            if (LLVM_UNLIKELY(isa<ManagedDynamicBuffer>(buffer) && expectedNumOfStrides)) {
+            assert (isa<ManagedDynamicBuffer>(buffer) || !isLocal.isManaged());
+            if (LLVM_UNLIKELY(isLocal.isManaged() && expectedNumOfStrides)) {
+                assert (isa<ManagedDynamicBuffer>(buffer));
                 Rational R{mTarget->getStride(), b.getBitBlockWidth()};
                 const auto & ub = output.getRate().getUpperBound();
                 if (ub.numerator() > 0) {
                     R *= ub;
                 }
                 Value * const bufferScale = b.CreateCeilUMulRational(expectedNumOfStrides, R);
-                buffer->allocateBuffer(b, bufferScale);
+                buffer->allocateBuffer(b, bufferScale, mReportExpansionCallback, mPipelineHandle, b.getSize(i));
             }
         }
     }
@@ -1829,19 +1870,18 @@ KernelCompiler::ScalarRef KernelCompiler::getThreadLocalScalarFieldPtr(KernelBui
     StructType * const threadLocalTy = mTarget->getThreadLocalStateType(); assert (threadLocalTy);
 
     const auto f = threadLocalGroups.find(groupIndex);
-    const auto groupPos = std::distance(threadLocalGroups.begin(), f);
+    const auto groupPos = std::distance(threadLocalGroups.begin(), f) * 2U;
 
     assert (groupPos < threadLocalTy->getStructNumElements());
-    assert ((scalarIndex * 2) < threadLocalTy->getStructElementType(groupPos)->getStructNumElements());
-
+    assert (scalarIndex < threadLocalTy->getStructElementType(groupPos)->getStructNumElements());
 
     FixedArray<Value *, 3> indices;
     indices[0] = b.getInt32(0);
     indices[1] = b.getInt32(groupPos);
-    indices[2] = b.getInt32(scalarIndex * 2);
+    indices[2] = b.getInt32(scalarIndex);
 
     Value * ptr = b.CreateGEP(threadLocalTy, handle, indices); assert (ptr);
-    Type * ty = threadLocalTy->getStructElementType(groupPos)->getStructElementType(scalarIndex * 2);
+    Type * ty = threadLocalTy->getStructElementType(groupPos)->getStructElementType(scalarIndex);
     return ScalarRef{ptr, ty};
 
 }
@@ -1912,11 +1952,13 @@ void KernelCompiler::clearInternalStateAfterCodeGen() {
     reset(mProcessedInputItemPtr, numOfInputs);
     reset(mAccessibleInputItems, numOfInputs);
     reset(mAvailableInputItems, numOfInputs);
+    reset(mInputItemCapacity, numOfInputs);
     const auto numOfOutputs = getNumOfStreamOutputs();
     reset(mProducedOutputItemPtr, numOfOutputs);
     reset(mInitiallyProducedOutputItems, numOfOutputs);
     reset(mWritableOutputItems, numOfOutputs);
     reset(mConsumedOutputItems, numOfOutputs);
+    reset(mOutputItemCapacity, numOfOutputs);
     reset(mUpdatableOutputBaseVirtualAddressPtr, numOfOutputs);
     for (const auto & buffer : mStreamSetInputBuffers) {
         buffer->setHandle(nullptr);
@@ -2241,6 +2283,5 @@ PreservedAnalyses TracePass::run(Function &F, FunctionAnalysisManager & AM) {
     return PreservedAnalyses::all();
 
 }
-
 
 }

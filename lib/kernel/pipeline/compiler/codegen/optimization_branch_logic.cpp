@@ -67,7 +67,7 @@ Value * PipelineCompiler::checkOptimizationBranchSpanLength(KernelBuilder & b, V
     const auto streamSetIdx = getInputBufferVertex(condInput);
 
     const BufferNode & bn = mBufferGraph[streamSetIdx];
-    StreamSetBuffer * const buffer = bn.Buffer;
+    StreamSetBuffer * const buffer = bn.OutputBuffer;
 
     if (LLVM_UNLIKELY(!isConstantOne(buffer->getStreamSetCount(b)))) {
         report_fatal_error("Optimization branch condition must be a fixed-rate single-stream StreamSet");
@@ -193,7 +193,7 @@ Value * PipelineCompiler::checkOptimizationBranchSpanLength(KernelBuilder & b, V
     Value * const isFinal = b.CreateICmpEQ(numOfLinearStrides, sz_ZERO);
     Value * const selectedNumOfStrides = b.CreateSelect(isFinal, sz_ZERO, finalNumOfStrides);
 
-    if (LLVM_UNLIKELY(CheckAssertions)) {
+    if (LLVM_UNLIKELY(CheckAssertions())) {
         Value * const valid = b.CreateICmpULE(selectedNumOfStrides, numOfLinearStrides);
         b.CreateAssert(valid, "%s: optimization branch span length (%" PRIu64 ") "
                                "exceeds maximum num of strides (%" PRIu64 ")",

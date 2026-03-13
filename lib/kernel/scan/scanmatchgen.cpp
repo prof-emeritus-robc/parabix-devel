@@ -191,6 +191,7 @@ void ScanMatchKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const n
     Value * matchWordPos = b.CreateAdd(stridePos, b.CreateMul(matchWordIdx, sw.WIDTH));
     Value * matchEndPosInWord = b.CreateCountForwardZeroes(theMatchWord);
     Value * matchEndPos = b.CreateAdd(matchWordPos, matchEndPosInWord, "matchEndPos");
+
     // Find the prior line break.  There are three possibilities.
     // (a) a prior break in the break word corresponding to the current match word.
     // (b) the last break in a prior word within the current stride.

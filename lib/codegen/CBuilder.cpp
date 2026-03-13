@@ -35,6 +35,13 @@ using boost::intrusive::detail::floor_log2;
 #endif
 #include <unistd.h>
 
+#include <boost/icl/interval_set.hpp>
+using IntervalSet = boost::icl::interval_set<uintptr_t>;
+
+using Interval = IntervalSet::interval_type;
+
+using IntervalItr = IntervalSet::const_iterator;
+
 static constexpr unsigned NON_HUGE_PAGE_SIZE = 4096;
 
 static constexpr auto ALIGNED_ALLOC_NAME = "std_aligned_alloc";
@@ -82,6 +89,8 @@ static constexpr auto ALIGNED_ALLOC_NAME = "std_aligned_alloc";
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
+
+#define PRINT_DEBUG_MESSAGES_INCLUDE_THREAD_NUM
 
 using namespace llvm;
 
@@ -397,11 +406,26 @@ CallInst * CBuilder::CallPrintInt(StringRef name, Value * const value, const STD
         name->setName("name");
         Value * value = &*arg;
         value->setName("value");
-        std::vector<Value *> args(4);
-        args[0] = fdInt;
-        args[1] = GetString("%-40s = %" PRIx64 "\n");
-        args[2] = name;
-        args[3] = value;
+        std::vector<Value *> args;
+        args.push_back(fdInt);
+        std::string tmp;
+        raw_string_ostream out(tmp);
+        #ifdef PRINT_DEBUG_MESSAGES_INCLUDE_THREAD_NUM
+        out << "%016" PRIx64 "  ";
+        #endif
+        out << "%-40s = %" PRIx64 "\n";
+        args.push_back(GetString(out.str()));
+        #ifdef PRINT_DEBUG_MESSAGES_INCLUDE_THREAD_NUM
+        Function * pthreadSelfFn = m->getFunction("pthread_self");
+        if (pthreadSelfFn == nullptr) {
+            IntegerType * const pThreadTy = IntegerType::getIntNTy(getContext(), sizeof(pthread_t) * CHAR_BIT);
+            FunctionType * funTy = FunctionType::get(pThreadTy, false);
+            pthreadSelfFn = LinkFunction("pthread_self", funTy, (void*)&pthread_self);
+        }
+        args.push_back(CreateCall(pthreadSelfFn));
+        #endif
+        args.push_back(name);
+        args.push_back(value);
         Function * DprintFn = GetDprintf();
         CreateCall(DprintFn->getFunctionType(), DprintFn, args);
         CreateFSync(fdInt);
@@ -1674,14 +1698,15 @@ CallInst * CBuilder::CreateMemCmp(Value * Ptr1, Value * Ptr2, Value * Num) {
 }
 
 AllocaInst * CBuilder::CreateAllocaAtEntryPoint(Type * Ty, Value * ArraySize, const Twine Name) {
-
-    auto BB = GetInsertBlock();
-    auto F = BB->getParent();
+    assert (Ty && "no type given to allocate?");
+    auto BB = GetInsertBlock(); assert (BB);
+    auto F = BB->getParent(); assert (F);
     auto entryBlock = F->begin();
     if (LLVM_UNLIKELY(entryBlock == F->end())) {
         report_fatal_error("CreateAllocaAtEntryPoint cannot create a value in an empty function");
     }
-    const auto & DL = F->getParent()->getDataLayout();
+    auto m = F->getParent(); assert (m);
+    const auto & DL = m->getDataLayout();
     const auto addrSize = DL.getAllocaAddrSpace();
     auto const first = entryBlock->getFirstNonPHIOrDbgOrLifetime();
     AllocaInst * alloca = nullptr;
@@ -1716,7 +1741,8 @@ AllocaInst * CBuilder::CreateAlignedAllocaAtEntryPoint(llvm::Type * const Ty, co
     } else {
         alloca = new AllocaInst(Ty, addrSize, ArraySize, "", first);
     }
-    alloca->setAlignment(AlignType{alignment});
+    AlignType align{alignment};
+    alloca->setAlignment(align);
     return alloca;
 }
 
@@ -2336,6 +2362,25 @@ uintptr_t LLVM_READNONE CBuilder::getTypeSize(const llvm::DataLayout & DL, llvm:
         #endif
     }
     return size;
+}
+
+uintptr_t LLVM_READNONE CBuilder::getAlignOf(const llvm::DataLayout & DL, llvm::Type * type) {
+    assert (type);
+//    if (isa<StructType>(type)) {
+//        const auto l = cast<StructType>(type)->getStructNumElements();
+//        auto align = DL.getABITypeAlign(type).value();
+//        for (unsigned j = 0; j != l; ++j) {
+//            align = boost::lcm(align, getAlignOf(DL, type->getStructElementType(j)));
+//        }
+//        assert (align > 0);
+//        return align;
+//    } else if (isa<ArrayType>(type)) {
+//        return getAlignOf(DL, type->getArrayElementType());
+//    } else {
+        const auto align = DL.getABITypeAlign(type).value();
+        assert (align > 0);
+        return align;
+//    }
 }
 
 void CBuilder::linkAllNecessaryExternalFunctions() const {

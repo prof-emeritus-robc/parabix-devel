@@ -80,12 +80,6 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
         b.SetInsertPoint(resumeKernelExecution);
     }
 
-    #ifdef PRINT_DEBUG_MESSAGES
-    const auto prefix = makeKernelName(mKernelId);
-    debugPrint(b, "* " + prefix + "_isFinal = %" PRIu64, mIsFinalInvocation);
-    debugPrint(b, "* " + prefix + "_executing = %" PRIu64, mNumOfLinearStrides);
-    #endif
-
     BasicBlock * individualStrideLoop = nullptr;
     PHINode * currentIndividualStrideIndexPhi = nullptr;
     PHINode * nextIndividualStrideIndexPhi = nullptr;
@@ -232,6 +226,12 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
 
     buildKernelCallArgumentList(b, args);
 
+    #ifdef PRINT_DEBUG_MESSAGES
+    const auto prefix = makeKernelName(mKernelId);
+    debugPrint(b, "* " + prefix + "_isFinal = %" PRIu64, mIsFinalInvocation);
+    debugPrint(b, "* " + prefix + "_executing = %" PRIu64, mNumOfLinearStrides);
+    #endif
+
     #ifdef ENABLE_PAPI
     if (NumOfPAPIEvents) {
         startPAPIMeasurement(b, PAPIKernelCounter::PAPI_KERNEL_EXECUTION);
@@ -253,6 +253,7 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
     } else {
         doSegmentRetVal = b.CreateCall(doSegFuncType, doSegment, args);
     }
+
     if (LLVM_UNLIKELY(EnableCycleCounter)) {
         updateCycleCounter(b, mKernelId, CycleCounter::KERNEL_EXECUTION);
     }
@@ -261,13 +262,16 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
         accumPAPIMeasurementWithoutReset(b, mKernelId, PAPIKernelCounter::PAPI_KERNEL_EXECUTION);
     }
     #endif
+
+    #ifdef PRINT_DEBUG_MESSAGES
+    debugPrint(b, "* " + prefix + "_executed = %" PRIu64, mNumOfLinearStrides);
+    #endif
     if (mKernelCanTerminateEarly) {
         mTerminatedExplicitly = doSegmentRetVal;
         assert (doSegmentRetVal->getType()->isIntegerTy());
     } else {
         mTerminatedExplicitly = nullptr;
     }
-
     if (LLVM_LIKELY(!mCurrentKernelIsStateFree)) {
         updateProcessedAndProducedItemCounts(b);
         readReturnedOutputVirtualBaseAddresses(b);
@@ -421,7 +425,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
     };
 
 
-    args.reserve(4 + (numOfInputs + numOfOutputs) * 4);
+  //  args.reserve(mKernelDoSegmentFunctionType->getNumParams());
     if (LLVM_LIKELY(mKernelSharedHandle)) {
         addNextArg(mKernelSharedHandle);
     }
@@ -451,7 +455,10 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
     }
     #endif
 
+    const auto checkStreamSet = codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnableStreamSetAsserts);
+
     PointerType * const voidPtrTy = b.getVoidPtrTy();
+    IntegerType * const sizeTy = b.getSizeTy();
 
     for (unsigned i = 0; i < numOfInputs; ++i) {
         const StreamSetPort inputPort{PortType::Input, i};
@@ -472,7 +479,15 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
             Value * const addr = mInputVirtualBaseAddressPhi[inputPort]; assert (addr);
             #ifdef PRINT_DEBUG_MESSAGES
             debugPrint(b, makeBufferName(mKernelId, inputPort) + "_processed = %" PRIu64, processed);
+            #ifndef PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY
             debugPrint(b, makeBufferName(mKernelId, inputPort) + "_addr = %" PRIx64, addr);
+            StreamSetBuffer * bf = mBufferGraph[source(port, mBufferGraph)].OutputBuffer;
+            if (isa<ManagedDynamicBuffer>(bf)) {
+            Value * start = b.CreatePointerCast(bf->getMallocAddress(b), b.getInt8PtrTy());
+            Value * end = b.CreateGEP(b.getInt8Ty(), start, bf->getInternalCapacity(b));
+            debugPrint(b, "< " + makeBufferName(mKernelId, inputPort) + "_memoryRange = [%" PRIx64 ",%" PRIx64 ")", start, end);
+            }
+            #endif
             #endif
             addNextArg(b.CreatePointerCast(addr, voidPtrTy));
             if (LLVM_UNLIKELY(mKernelIsInternallySynchronized)) {
@@ -482,6 +497,10 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
                 } else {
                     isExhausted = mExhaustedInputPort[inputPort]; assert (isExhausted);
                 }
+                isExhausted = b.CreateZExt(isExhausted, sizeTy);
+                #ifdef PRINT_DEBUG_MESSAGES
+                debugPrint(b, makeBufferName(mKernelId, inputPort) + "_isExhausted = %" PRIu64, isExhausted);
+                #endif
                 addNextArg(isExhausted);
             }
 
@@ -492,15 +511,53 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
                 Value * inputItems = mLinearInputItemsPhi[inputPort]; assert (inputItems);
                 if (rt.isDeferred()) {
                     const auto prefix = makeBufferName(mKernelId, inputPort);
-                    Value * diff = b.CreateSub(mCurrentProcessedItemCountPhi[inputPort], mCurrentProcessedDeferredItemCountPhi[rt.Port], prefix + "_deferredItems");
+                    Value * diff = b.CreateSub(mCurrentProcessedItemCountPhi[inputPort], mCurrentProcessedDeferredItemCountPhi[inputPort], prefix + "_deferredItems");
                     inputItems = b.CreateAdd(inputItems, diff);
                 }
                 addNextArg(inputItems);
             }
+
+            if (LLVM_UNLIKELY(CheckAssertions() && !(mIsPartitionRoot || rt.canModifySegmentLength()))) {
+                const Binding & input = rt.Binding;
+                const auto streamSet = source(port, mBufferGraph);
+                Value * required = b.CreateAdd(mCurrentProcessedItemCountPhi[inputPort], mLinearInputItemsPhi[inputPort]);
+                Value * avail = mLocallyAvailableItems[streamSet];
+                Value * const isValid = b.CreateICmpUGE(avail, required);
+                b.CreateAssert(isValid,
+                                "%s.%s: requires more input (%" PRIu64 ") "
+                                "than available (%" PRIu64 ")",
+                                mCurrentKernelName,
+                                b.GetString(input.getName()),
+                                required, avail);
+            }
+
+            if (LLVM_UNLIKELY(checkStreamSet)) {
+                const auto streamSet = source(port, mBufferGraph);
+                const BufferNode & bn = mBufferGraph[streamSet];
+                Value * max = nullptr;
+                if (bn.isConstant()) {
+                    max = getGuaranteedRepeatingStreamSetLength(b, streamSet);
+//                } else if (bn.isThreadLocal()) {
+//                    max = b.CreateAdd(processed, bn.OutputBuffer->getCapacity(b));
+                } else if (rt.inputMayBeTruncated()) {
+                    max = mLinearInputItemCapacityPhi[inputPort]; assert (max);
+                } else {
+                    max = mLocallyAvailableItems[streamSet]; assert (max);
+                }
+                max = b.CreateRoundUpRational(max, rt.Maximum);
+                if (rt.LookAhead) {
+                    const auto la = round_up_to(rt.LookAhead, b.getBitBlockWidth());
+                    max = b.CreateAdd(max, b.getSize(la));
+                }
+                addNextArg(max);
+            }
+
         }
     }
 
     PointerType * const voidPtrPtrTy = voidPtrTy->getPointerTo();
+
+    bool hasManagedOutput = false;
 
     for (unsigned i = 0; i < numOfOutputs; ++i) {
         const auto port = getOutput(mKernelId, StreamSetPort(PortType::Output, i));
@@ -511,7 +568,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
 
         const auto streamSet = target(port, mBufferGraph);
         const BufferNode & bn = mBufferGraph[streamSet];
-        const StreamSetBuffer * const buffer = bn.Buffer;
+        const StreamSetBuffer * const buffer = bn.OutputBuffer;
 
         Value * produced = nullptr;
         if (rt.isDeferred()) {
@@ -521,6 +578,8 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
         }
         assert (produced);
 
+        Value * vba = nullptr;
+
         if (LLVM_UNLIKELY(rt.isShared())) {
             addNextArg(b.CreatePointerCast(buffer->getHandle(), voidPtrTy));
         } else if (LLVM_UNLIKELY(rt.isManaged())) {
@@ -529,33 +588,81 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
                 mVirtualBaseAddressPtr.push_back(vba);
             }
             Value * ptr = mVirtualBaseAddressPtr[numOfVirtualBaseAddresses++];
-            ptr = b.CreatePointerCast(ptr, buffer->getPointerType()->getPointerTo());
-            b.CreateAlignedStore(buffer->getBaseAddress(b), ptr, PtrTyABIAlignment);
             #ifdef PRINT_DEBUG_MESSAGES
             debugPrint(b, makeBufferName(mKernelId, rt.Port) + "_produced = %" PRIu64, produced);
-            debugPrint(b, makeBufferName(mKernelId, rt.Port) + "_ba = %" PRIx64, buffer->getBaseAddress(b));
             #endif
             addNextArg(b.CreatePointerCast(ptr, voidPtrPtrTy));
             mReturnedOutputVirtualBaseAddressPtr[rt.Port] = ptr;
+            hasManagedOutput = true;
         } else {
-
-            Value * const vba = getVirtualBaseAddress(b, rt, bn, produced, bn.isNonThreadLocal(), true);
+            vba = getVirtualBaseAddress(b, rt, bn, produced, bn.isNonThreadLocal(), true);
             #ifdef PRINT_DEBUG_MESSAGES
             debugPrint(b, makeBufferName(mKernelId, rt.Port) + "_produced = %" PRIu64, produced);
+            #ifndef PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY
             debugPrint(b, makeBufferName(mKernelId, rt.Port) + "_vba = %" PRIx64, vba);
+            #endif
             #endif
             addNextArg(b.CreatePointerCast(vba, voidPtrTy));
         }
+
+        #ifdef PRINT_DEBUG_MESSAGES
+        #ifndef PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY
+        StreamSetBuffer * bf = mBufferGraph[target(port, mBufferGraph)].OutputBuffer;
+        if (isa<ManagedDynamicBuffer>(bf)) {
+        Value * start = b.CreatePointerCast(bf->getMallocAddress(b), b.getInt8PtrTy());
+        Value * end = b.CreateGEP(b.getInt8Ty(), start, bf->getInternalCapacity(b));
+        debugPrint(b, "> " + makeBufferName(mKernelId,  rt.Port) + "_memoryRange = [%" PRIx64 ",%" PRIx64 ")", start, end);
+        }
+        #endif
+        #endif
 
         mReturnedProducedItemCountPtr[rt.Port] = addItemCountArg(rt, rt.isDeferred() || mKernelCanTerminateEarly, produced);
 
         if (LLVM_UNLIKELY(rt.isShared() || rt.isManaged())) {
             addNextArg(readConsumedItemCount(b, streamSet));
-        } else if (requiresItemCount(rt.Binding)) {
-            addNextArg(mLinearOutputItemsPhi[rt.Port]);
+        } else {
+            if (requiresItemCount(rt.Binding)) {
+                addNextArg(mLinearOutputItemsPhi[rt.Port]);
+            }
+            Value * max = nullptr;
+            if (LLVM_UNLIKELY(CheckAssertions() || checkStreamSet)) {
+                if (bn.isThreadLocal()) {
+                    max = b.CreateAdd(produced, mLinearOutputItemsPhi[rt.Port]);
+                } else if (bn.isConstant()) {
+                    max = ConstantInt::getAllOnesValue(b.getSizeTy());
+                } else {
+                    Value * base = readConsumedItemCount(b, streamSet); assert (base);
+                    max = b.CreateAdd(base, buffer->getInternalCapacity(b));
+                }
+                if (rt.Add) {
+                    assert (!bn.isConstant());
+                    max = b.CreateAdd(max, b.getSize(rt.Add));
+                }
+                if (LLVM_UNLIKELY(bn.isThreadLocal())) {
+                    ExternalBuffer tmp(0, b, buffer->getBaseType(), 0);
+                    Value * h = b.CreateAllocaAtEntryPoint(tmp.getHandleType(b));
+                    tmp.setHandle(h);
+                    tmp.setBaseAddress(b, vba);
+                    Value * end = tmp.getRawItemPointer(b, b.getSize(0), max);
+                    Value * endInt = b.CreatePtrToInt(end, b.getSizeTy());
+                    Value * lim = b.CreateGEP(b.getInt8Ty(), mThreadLocalStreamSetBaseAddress, mThreadLocalEndOffset[streamSet]);
+                    Value * limInt = b.CreatePtrToInt(lim, b.getSizeTy());
+                    b.CreateAssert(b.CreateICmpULE(endInt, limInt),
+                                   "Kernel execution will exceed thread-local buffer %s.%s space limit",
+                                   mCurrentKernelName, b.GetString(rt.Binding.get().getName()));
+                }
+            }
+            if (LLVM_UNLIKELY(checkStreamSet)) {
+                addNextArg(max);
+            }
         }
-
     }
+
+    if (LLVM_UNLIKELY(mTraceDynamicBuffers && hasManagedOutput)) {
+        addNextArg(mBufferExpansionFunction);
+        addNextArg(b.CreatePointerCast(getHandle(), voidPtrTy));
+    }
+
     assert (args.size() == mKernelDoSegmentFunctionType->getNumParams());
 }
 
@@ -627,7 +734,7 @@ void PipelineCompiler::updateProcessedAndProducedItemCounts(KernelBuilder & b) {
                 const auto prefix = makeBufferName(mKernelId, inputPort);
                 debugPrint(b, prefix + "_processed_deferred' = %" PRIu64, mProcessedDeferredItemCount[inputPort]);
                 #endif
-                if (LLVM_UNLIKELY(CheckAssertions)) {
+                if (LLVM_UNLIKELY(CheckAssertions())) {
                     Value * const deferred = mProcessedDeferredItemCount[inputPort];
                     Value * const isDeferred = b.CreateICmpULE(deferred, processed);
                     Value * const isFinal = mIsFinalInvocationPhi;
@@ -676,9 +783,9 @@ void PipelineCompiler::updateProcessedAndProducedItemCounts(KernelBuilder & b) {
                 mProducedDeferredItemCount[outputPort] = b.CreateAlignedLoad(b.getSizeTy(), mReturnedProducedItemCountPtr[outputPort], SizeTyABIAlignment);
                 #ifdef PRINT_DEBUG_MESSAGES
                 const auto prefix = makeBufferName(mKernelId, outputPort);
-                debugPrint(b, prefix + "_produced_deferred' = %" PRIu64, mProcessedDeferredItemCount[outputPort]);
+                debugPrint(b, prefix + "_produced_deferred' = %" PRIu64, mProducedDeferredItemCount[outputPort]);
                 #endif
-                if (LLVM_UNLIKELY(CheckAssertions)) {
+                if (LLVM_UNLIKELY(CheckAssertions())) {
                     Value * const deferred = mProducedDeferredItemCount[outputPort];
                     Value * const isDeferred = b.CreateICmpULE(deferred, produced);
                     Value * const isFinal = mIsFinalInvocationPhi;
@@ -731,7 +838,7 @@ void PipelineCompiler::updateProcessedAndProducedItemCounts(KernelBuilder & b) {
         debugPrint(b, prefix + "_produced' = %" PRIu64, produced);
         #endif
 
-        if (LLVM_UNLIKELY(CheckAssertions)) {
+        if (LLVM_UNLIKELY(CheckAssertions())) {
             if (mReturnedProducedItemCountPtr[outputPort]) {
                 const auto port = getOutput(mKernelId, outputPort);
                 const auto streamSet = target(port, mBufferGraph);

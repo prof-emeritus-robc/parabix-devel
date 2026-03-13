@@ -62,10 +62,10 @@ void PipelineCompiler::computeFullyProcessedItemCounts(KernelBuilder & b, Value 
         Value * const fullyProcessed = b.CreateSelect(terminated, avail, processed);
 
         mFullyProcessedItemCount[port] = fullyProcessed;
-        if (LLVM_UNLIKELY(CheckAssertions)) {
+        if (LLVM_UNLIKELY(CheckAssertions())) {
             const auto streamSet = source(e, mBufferGraph);
             const BufferNode & bn = mBufferGraph[streamSet];
-            if (bn.Locality == BufferLocality::ThreadLocal) {
+            if (bn.isThreadLocal()) {
                 Value * const produced = mLocallyAvailableItems[streamSet]; assert (produced);
                 Value * const fullyConsumed = b.CreateICmpEQ(produced, processed);
                 Constant * const fatal = getTerminationSignal(b, TerminationSignal::Fatal);
@@ -159,7 +159,7 @@ Value * PipelineCompiler::getThreadLocalHandlePtr(KernelBuilder & b, const unsig
     }
     if (LLVM_UNLIKELY(isKernelFamilyCall(kernelIndex))) {
         StructType * const localStateTy = kernel->getThreadLocalStateType();
-        if (LLVM_UNLIKELY(CheckAssertions)) {
+        if (LLVM_UNLIKELY(CheckAssertions())) {
             b.CreateAssert(handle, "null handle load");
         }
         handle = b.CreateAlignedLoad(localStateTy->getPointerTo(), handle, PtrTyABIAlignment);
@@ -323,7 +323,6 @@ void PipelineCompiler::clearInternalStateForCurrentKernel() {
     mStrideStepSize = nullptr;
     mAnyClosed = nullptr;
 
-    mPrincipalFixedRateFactor = nullptr;
     mHasExhaustedClosedInput = nullptr;
     mStrideStepSizeAtLoopEntryPhi = nullptr;
     mKernelInsufficientInput = nullptr;

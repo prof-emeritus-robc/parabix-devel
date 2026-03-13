@@ -106,13 +106,15 @@ void PipelineCompiler::bindRepeatingStreamSetInitializationArguments(KernelBuild
                 Value * const handle = b.getScalarFieldPtr(handleName).first;
                 const BufferNode & bn = mBufferGraph[streamSet];
                 #ifndef NDEBUG
+                assert (bn.isConstant());
+                assert (!bn.isTruncated());
                 const RelationshipNode & rn = mStreamGraph[streamSet];
                 assert (rn.Type == RelationshipNode::IsStreamSet);
                 assert (isa<RepeatingStreamSet>(rn.Relationship));
                 assert (cast<RepeatingStreamSet>(rn.Relationship)->isDynamic());
                 #endif
                 // external buffers already have a buffer handle
-                RepeatingBuffer * const buffer = cast<RepeatingBuffer>(bn.Buffer);
+                RepeatingBuffer * const buffer = cast<RepeatingBuffer>(bn.OutputBuffer);
                 buffer->setHandle(handle);
                 Value * const ba = b.CreatePointerCast(addr, buffer->getPointerType());
                 buffer->setBaseAddress(b, ba);
@@ -155,9 +157,9 @@ void PipelineCompiler::addRepeatingStreamSetInitializationArguments(const unsign
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateGlobalDataForRepeatingStreamSet
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::generateGlobalDataForRepeatingStreamSet(KernelBuilder & b, const unsigned streamSet, Value * const expectedNumOfStrides) {
+void PipelineCompiler::generateGlobalDataForRepeatingStreamSet(KernelBuilder & b, const unsigned streamSet) {
     const BufferNode & bn = mBufferGraph[streamSet];
-    RepeatingBuffer * const buffer = cast<RepeatingBuffer>(bn.Buffer);
+    RepeatingBuffer * const buffer = cast<RepeatingBuffer>(bn.OutputBuffer);
 
     const auto handleName = REPEATING_STREAMSET_HANDLE_PREFIX + std::to_string(streamSet);
     Value * const handle = b.getScalarFieldPtr(handleName).first;
@@ -221,12 +223,12 @@ void PipelineCompiler::generateGlobalDataForRepeatingStreamSet(KernelBuilder & b
 void PipelineCompiler::addRepeatingStreamSetBufferProperties(KernelBuilder & b) {
     for (auto streamSet = FirstStreamSet; streamSet <= LastStreamSet; ++streamSet) {
         const BufferNode & bn = mBufferGraph[streamSet];
-        if (LLVM_UNLIKELY(bn.isConstant())) {
+        if (LLVM_UNLIKELY(bn.isConstant() && !bn.isTruncated())) {
             auto & S = mStreamGraph[streamSet];
             assert (S.Type == RelationshipNode::IsStreamSet);
             assert (isa<RepeatingStreamSet>(S.Relationship));
 
-            Type * const handleTy = bn.Buffer->getHandleType(b);
+            Type * const handleTy = bn.OutputBuffer->getHandleType(b);
             mTarget->addInternalScalar(handleTy,
                 REPEATING_STREAMSET_HANDLE_PREFIX + std::to_string(streamSet),
                                        getCacheLineGroupId(PipelineOutput));
@@ -235,9 +237,6 @@ void PipelineCompiler::addRepeatingStreamSetBufferProperties(KernelBuilder & b) 
                     REPEATING_STREAMSET_LENGTH_PREFIX + std::to_string(streamSet),
                                            getCacheLineGroupId(PipelineOutput));
             }
-//            mTarget->addInternalScalar(b.getVoidPtrTy(),
-//                REPEATING_STREAMSET_MALLOCED_DATA_PREFIX + std::to_string(streamSet),
-//                                       getCacheLineGroupId(PipelineOutput));
         }
     }
 }

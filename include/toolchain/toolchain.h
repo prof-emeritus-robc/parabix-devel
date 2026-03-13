@@ -43,6 +43,7 @@ enum DebugFlags {
     GenerateTransferredItemCountHistogram,
     GenerateDeferredItemCountHistogram,
     EnableAsserts,
+    EnableStreamSetAsserts,
     EnablePipelineAsserts,
     EnableMProtect,
     EnableCycleCounter,
@@ -70,6 +71,8 @@ extern bool SplitTransposition;
 
 bool LLVM_READONLY DebugOptionIsSet(const DebugFlags flag);
 
+bool LLVM_READONLY DebugOptionIsSet(const DebugFlags flag1, const DebugFlags flag2);
+
 bool LLVM_READONLY AnyDebugOptionIsSet();
 
 bool LLVM_READONLY AnyAssertionOptionIsSet();
@@ -81,6 +84,8 @@ extern std::string ShowIROption;
 extern std::string ShowIRFilter;
 extern std::string TraceOption;
 extern std::string CCCOption;
+extern std::string ThreadLocalPermittedOptions;
+extern std::string PreserveAllStreamSetDataOptions;
 extern PipelineCompilationModeOptions PipelineCompilationMode;
 #ifdef ENABLE_PAPI
 extern std::string PapiCounterOptions;

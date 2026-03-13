@@ -14,6 +14,9 @@ void PipelineCompiler::executeKernel(KernelBuilder & b) {
     #ifndef NDEBUG
     Value * const initialSegNum = mSegNo;
     #endif
+    if (LLVM_UNLIKELY(mTraceDynamicBuffers)) {
+        mBufferExpansionFunction = generateBufferExpansionFunctionForCurrentKernel(b, mKernelId);
+    }
     assert (FirstKernel <= mKernelId && mKernelId <= LastKernel);
     clearInternalStateForCurrentKernel();
     checkForPartitionEntry(b);
@@ -47,29 +50,11 @@ void PipelineCompiler::executeKernel(KernelBuilder & b) {
         mHasPrincipalInput |= port.isPrincipal();
     }
 
-    bool checkOutputChannels = false;
-    size_t numOfManagedBuffers = 0;
-    for (const auto output : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
-        const BufferPort & port = mBufferGraph[output];
-        if (LLVM_UNLIKELY(port.canModifySegmentLength())) {
-            checkOutputChannels = true;
-        }
-        if (LLVM_UNLIKELY(port.isManaged())) {
-            assert (!mAllowDataParallelExecution);
-            assert (mKernelThreadLocalHandle);
-            StructType * const threadLocalTy = mKernel->getThreadLocalStateType();
-            assert (threadLocalTy->getStructElementType(0)->getStructElementType(numOfManagedBuffers) ==
-                    ManagedDynamicBuffer::getInternalThreadLocalHandleType(b));
-            FixedArray<Value *, 4> indices;
-            indices[0] = b.getInt32(0);
-            indices[1] = b.getInt32(0);
-            indices[2] = b.getInt32(numOfManagedBuffers++);
-            indices[3] = b.getInt32(ManagedDynamicBuffer::NewAddress);
-            Value * const newAddrPtr = b.CreateGEP(threadLocalTy, mKernelThreadLocalHandle, indices);
-            // TODO: voidptralign from DL
-            b.CreateAlignedStore(ConstantPointerNull::get(b.getVoidPtrTy()), newAddrPtr, sizeof(void *));
-        }
-    }
+    // We could immediately free the old buffer if one is stored in thread local data, it relies on the idea
+    // that if we have N threads, we will invoke this kernel every N segments. This isn't true if we allow
+    // threads to immediately restart upon reaching a jump that branches to the end of the pipeline.
+
+    const auto checkOutputChannels = initializeOutputStreamSetBuffersBeforeSegmentInvocation(b);
 
     mMayHaveInsufficientIO = checkInputChannels || checkOutputChannels;
 
@@ -171,7 +156,6 @@ void PipelineCompiler::executeKernel(KernelBuilder & b) {
     checkPropagatedTerminationSignals(b);
     determineNumOfLinearStrides(b);
     mIsFinalInvocation = mIsFinalInvocationPhi;
-
     // When tracing blocking I/O, test all I/O streams but do not execute the
     // kernel if any stream is insufficient.
     if (LLVM_UNLIKELY(TraceIO && mMayHaveInsufficientIO)) {
@@ -329,20 +313,9 @@ void PipelineCompiler::executeKernel(KernelBuilder & b) {
         mNumOfPartitionStrides = mTotalNumOfStridesAtExitPhi;
         assert (isFromCurrentFunction(b, mFinalPartitionSegmentAtExitPhi, false));
         mFinalPartitionSegment = mFinalPartitionSegmentAtExitPhi;
-        if (LLVM_UNLIKELY(mIsIOProcessThread)) {
-            mThreadLocalScalingFactor = nullptr;
-        } else {
-            // NOTE: we use the partition root's max num of strides as a common scaling factor for
-            // thread local buffer memory placement. Since we won't actually know how many strides
-            // have been executed until after the root kernel has finished processing, we assume the
-            // maximum was used.
-            mThreadLocalScalingFactor =
-                b.CreateCeilUDivRational(mMaximumNumOfStridesAtExitPhi, MaximumNumOfStrides[mKernelId]);
-        }
-
     }
 
-    if (LLVM_UNLIKELY(CheckAssertions)) {
+    if (LLVM_UNLIKELY(CheckAssertions())) {
         verifyPostInvocationTerminationSignal(b);
     }
     assert ("segment number should not have been modified prior to kernel exit" && initialSegNum == mSegNo);
@@ -556,10 +529,17 @@ void PipelineCompiler::initializeKernelCheckOutputSpacePhis(KernelBuilder & b) {
     const auto makeExhaustedInputPhi =
         mKernelIsInternallySynchronized && StrideStepLength[mKernelId] > 1 && mIsPartitionRoot;
     for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
-        const auto inputPort = mBufferGraph[e].Port;
+        const auto & bp = mBufferGraph[e];
+        const auto inputPort = bp.Port;
         const auto prefix = makeBufferName(mKernelId, inputPort);
-        PHINode * const phi = b.CreatePHI(sizeTy, 2, prefix + "_linearlyAccessible");
+        PHINode * const phi = b.CreatePHI(sizeTy, 2, prefix + "_linearlyAccessiblePhi");
         mLinearInputItemsPhi[inputPort] = phi;
+        if (bp.inputMayBeTruncated()) {
+            PHINode * const capacityPhi = b.CreatePHI(sizeTy, 2, prefix + "_inputCapacityPhi");
+            mLinearInputItemCapacityPhi[inputPort] = capacityPhi;
+        } else {
+            mLinearInputItemCapacityPhi[inputPort] = nullptr;
+        }
         mCurrentLinearInputItems[inputPort] = phi;
         Type * const bufferTy = getInputBuffer(inputPort)->getPointerType();
         mInputVirtualBaseAddressPhi[inputPort] = b.CreatePHI(bufferTy, 2, prefix + "_baseAddress");
@@ -691,7 +671,7 @@ void PipelineCompiler::writeInsufficientIOExit(KernelBuilder & b) {
 
     b.SetInsertPoint(mKernelInsufficientInput);
 
-    if (LLVM_UNLIKELY(CheckAssertions && mAllowDataParallelExecution)) {
+    if (LLVM_UNLIKELY(CheckAssertions() && mAllowDataParallelExecution)) {
         b.CreateAssert(b.CreateNot(mExecutedAtLeastOnceAtLoopEntryPhi),
                         "%s: is a data-parallel kernel with an invalid loop again check",
                         mCurrentKernelName);

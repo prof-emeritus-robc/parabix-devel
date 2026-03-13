@@ -78,6 +78,8 @@ public:
 
     enum KernelFlags {
         RequiresIllustratorObject = 1
+        , HasInternallyManagedStreamSet = 2
+        , HasInOutStreamSet = 4
     };
 
     using InitArgs = llvm::SmallVector<llvm::Value *, 32>;
@@ -577,10 +579,11 @@ protected:
 
     void finalizeThreadLocalInstance(KernelBuilder & b, llvm::ArrayRef<llvm::Value *> args) const;
 
-protected:
+public:
 
     static std::string getStringHash(const llvm::StringRef str);
 
+protected:
     LLVM_READNONE bool hasFixedRateIO() const;
 
     virtual void addInternalProperties(KernelBuilder &) { }

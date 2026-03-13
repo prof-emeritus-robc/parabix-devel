@@ -132,7 +132,7 @@ enum class ReasonType : unsigned {
     // -----------------------------
     , Explicit
     // -----------------------------
-    , ImplicitRegionSelector
+    , ImplicitRepeatingStreamSet
     , ImplicitPopCount
     , ImplicitTruncatedSource
     // -----------------------------
@@ -274,10 +274,12 @@ enum BufferType : unsigned {
     , CrossThreaded = 32
     , InOutRedirect = 64
     , ManagedOutput = 128
+    , PreserveEntireStreamSet = 256
     // ------------------
     , HasIllustratedStreamset = 512
     , StartsNestedSynchronizationRegion = 1024
-    , RequiresEmptyWriteOverflow = 2048
+    , RequiresEmptyOverflow = 2048
+    , HasNonFixedRateConsumer = 4096
 };
 
 ENABLE_ENUM_FLAGS(BufferType)
@@ -292,10 +294,13 @@ enum BufferLocality {
 
 enum KernelFlags {
     PermitSegmentSizeSlidingWindowing = 1
+    , ControlsSegmentSizeSlidingWindowing = 2
 };
 
 struct BufferNode {
-    StreamSetBuffer * Buffer = nullptr;
+
+    StreamSetBuffer * OutputBuffer = nullptr;
+
     unsigned Type = 0;
     bool IsLinear = false;
 
@@ -304,20 +309,24 @@ struct BufferNode {
     unsigned LookBehind = 0;
     unsigned MaxAdd = 0;
 
-    unsigned BufferStart = 0;
-    unsigned BufferEnd = 0;
+    unsigned NumOfOverflowStrides = 0;
 
     bool RequiresUnderflow = false;
 
-    unsigned RequiredCapacity = 0;
     unsigned PartialSumSpanLength = 0;
 
     unsigned OutputItemCountId = 0;
     unsigned LockId = 0;
+    unsigned ManagedStructId = 0;
 
+    Rational RelativeIORate{0};
 
     bool permitSlidingWindow() const {
         return (Type & KernelFlags::PermitSegmentSizeSlidingWindowing) != 0;
+    }
+
+    bool controlsSlidingWindow() const {
+        return (Type & KernelFlags::ControlsSegmentSizeSlidingWindowing) != 0;
     }
 
     bool isOwned() const {
@@ -344,6 +353,10 @@ struct BufferNode {
         return (Type & BufferType::Returned) != 0;
     }
 
+    bool preserveEntireStreamSet() const {
+        return (Type & BufferType::PreserveEntireStreamSet) != 0;
+    }
+
     bool isTruncated() const {
         return (Type & BufferType::Truncated) != 0;
     }
@@ -364,8 +377,12 @@ struct BufferNode {
         return (Type & BufferType::StartsNestedSynchronizationRegion) != 0;
     }
 
-    bool requiresEmptyWriteOverflow() const {
-        return (Type & BufferType::RequiresEmptyWriteOverflow) != 0;
+    bool requiresEmptyOverflow() const {
+        return (Type & BufferType::RequiresEmptyOverflow) != 0;
+    }
+
+    bool hasNonFixedRateConsumer() const {
+        return (Type & BufferType::HasNonFixedRateConsumer) != 0;
     }
 
     bool isThreadLocal() const {
@@ -399,7 +416,8 @@ enum BufferPortType : unsigned {
     IsManaged = 64,
     CanModifySegmentLength = 128,
     IsCrossThreaded = 256,
-    Illustrated = 512
+    Illustrated = 512,
+    InputMayBeTruncated = 1024
 };
 
 struct BufferPort {
@@ -419,6 +437,7 @@ struct BufferPort {
     unsigned Delay = 0;
     unsigned LookAhead = 0;
     unsigned LookBehind = 0;
+    unsigned EmptyOverflow = 0;
 
     //bool mCanModifySegmentLength = false;
 
@@ -464,6 +483,10 @@ struct BufferPort {
         return (Flags & BufferPortType::Illustrated) != 0;
     }
 
+    bool inputMayBeTruncated() const {
+        return (Flags & BufferPortType::InputMayBeTruncated) != 0;
+    }
+
     bool operator < (const BufferPort & rn) const {
         if (LLVM_LIKELY(Port.Type == rn.Port.Type)) {
             return Port.Number < rn.Port.Number;
@@ -492,11 +515,6 @@ struct BufferPort {
 
 using BufferGraph = adjacency_list<vecS, vecS, bidirectionalS, BufferNode, BufferPort>;
 
-struct ConsumerNode {
-//    mutable Value * Consumed = nullptr;
-//    mutable PHINode * PhiNode = nullptr;
-};
-
 struct ConsumerEdge {
 
     enum ConsumerTypeFlags : unsigned {
@@ -516,7 +534,7 @@ struct ConsumerEdge {
     : Port(port.Number), Index(index), Flags(flags) { }
 };
 
-using ConsumerGraph = adjacency_list<vecS, vecS, bidirectionalS, ConsumerNode, ConsumerEdge>;
+using ConsumerGraph = adjacency_list<vecS, vecS, bidirectionalS, size_t, ConsumerEdge>;
 
 using PartialSumStepFactorGraph = adjacency_list<vecS, vecS, bidirectionalS, no_property, unsigned>;
 
@@ -553,10 +571,16 @@ using KernelIdVector = std::vector<unsigned>;
 
 using OrderingDAWG = adjacency_list<vecS, vecS, bidirectionalS, no_property, unsigned>;
 
+struct ComponentLinkage {
+    size_t KernelA;
+    size_t KernelB;
+    Rational Rate;
+};
+
 struct PartitionData {
 
     KernelIdVector          Kernels;
-    std::vector<Rational>   Repetitions;
+    std::vector<unsigned>   Repetitions;
     OrderingDAWG            Orderings;
     Rational                ExpectedStridesPerSegment{1};
     Rational                StridesPerSegmentCoV{0};
@@ -564,7 +588,14 @@ struct PartitionData {
 
 };
 
-using PartitionGraph = adjacency_list<vecS, vecS, bidirectionalS, PartitionData, StreamSetId>;
+struct PartitionStreamSet {
+    StreamSetId Id = 0;
+    unsigned Type = 0;
+    PartitionStreamSet() = default;
+    PartitionStreamSet(unsigned id, unsigned type) : Id(id), Type(type) {}
+};
+
+using PartitionGraph = adjacency_list<vecS, vecS, bidirectionalS, PartitionData, PartitionStreamSet>;
 
 using PartitionDependencyGraph = adjacency_list<vecS, vecS, bidirectionalS, no_property, no_property>;
 
@@ -665,6 +696,10 @@ using FamilyScalarGraph = adjacency_list<vecS, vecS, bidirectionalS, no_property
 using ZeroInputGraph = adjacency_list<vecS, vecS, directedS, no_property, unsigned>;
 
 using InOutGraph = adjacency_list<vecS, vecS, bidirectionalS, no_property, no_property>;
+
+using ThreadLocalPlacementGraph = adjacency_list<vecS, vecS, bidirectionalS, bool, Rational>;
+
+using ThreadLocalConflictGraphType = adjacency_list<vecS, vecS, undirectedS>;
 
 }
 

@@ -162,7 +162,7 @@ void PipelineKernel::generateAllocateThreadLocalInternalStreamSetsMethod(KernelB
  * @brief linkExternalMethods
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::linkExternalMethods(KernelBuilder & b) {
-    PipelineCompiler::linkPThreadLibrary(b);
+    PipelineCompiler::linkPipelineExternalMethods(b);
     StreamSetBuffer::linkFunctions(b);
     for (const auto & k : mKernels) {
         k.Object->linkExternalMethods(b);
@@ -513,7 +513,7 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(const Relation
  ** ------------------------------------------------------------------------------------------------------------- */
 Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const MainMethodGenerationType method) const {
 
-    unsigned suppliedArgs = 0;
+    unsigned suppliedArgs = 1; // segment size
     if (LLVM_LIKELY(isStateful())) {
         suppliedArgs += 1;
     }
@@ -538,6 +538,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     PointerType * streamSetPtrTy = nullptr;
     PointerType * voidPtrTy = b.getVoidPtrTy();
     IntegerType * int64Ty = b.getInt64Ty();
+    IntegerType * sizeTy = b.getSizeTy();
     if (numOfStreamSets) {
         // must match streamsetptr.h
         FixedArray<Type *, 2> fields;
@@ -585,7 +586,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
     SmallVector<char, 256> tmp;
     raw_svector_ostream funcNameGen(tmp);
-    funcNameGen << getName() << '@' << codegen::SegmentSize << "_main";
+    funcNameGen << getName() << "_main";
     const auto funcName = funcNameGen.str();
 
     Function * main = m->getFunction(funcName);
@@ -624,6 +625,8 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         FixedArray<Value *, 2> fields;
         fields[0] = i32_ZERO;
 
+        const auto checkStreamSet = codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnableStreamSetAsserts);
+
         for (auto i = mInputStreamSets.size(); i--; ) {
             Value * const streamSetArg = nextArg();
             assert (streamSetArg->getType() == streamSetPtrTy);
@@ -637,7 +640,11 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
             b.CreateStore(sz_ZERO, processedPtr);
             segmentArgs[segmentArgCount++] = processedPtr; // updatable
             // accessible input items
-            segmentArgs[segmentArgCount++] = b.CreateLoad(int64Ty, b.CreateGEP(streamSetTy, streamSetArg, fields));
+            Value * accessible = b.CreateLoad(int64Ty, b.CreateGEP(streamSetTy, streamSetArg, fields));
+            segmentArgs[segmentArgCount++] = accessible;
+            if (LLVM_UNLIKELY(checkStreamSet)) {
+                segmentArgs[segmentArgCount++] = accessible;
+            }
         }
 
         for (auto i = mOutputStreamSets.size(); i--; ) {
@@ -652,7 +659,11 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
             fields[1] = i32_ONE;
             Value * const itemPtr = b.CreateGEP(streamSetTy, streamSetArg, fields);
             segmentArgs[segmentArgCount++] = itemPtr;
-            segmentArgs[segmentArgCount++] = b.CreateLoad(int64Ty, itemPtr);
+            Value * produced = b.CreateLoad(int64Ty, itemPtr);
+            segmentArgs[segmentArgCount++] = produced;
+            if (LLVM_UNLIKELY(checkStreamSet)) {
+                segmentArgs[segmentArgCount++] = ConstantInt::getAllOnesValue(sizeTy);
+            }
         }
     }
     assert (segmentArgCount == doSegment->arg_size());
@@ -700,7 +711,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
                     value = b.getSize(codegen::DynamicMultithreadingPeriod);
                     break;
                 case C::BufferSegmentLength:
-                    value = b.getSize(codegen::BufferSegments);
+                    value = b.getSize(codegen::BufferSegments); assert (false);
                     break;
                 case C::DynamicMultithreadingAddSynchronizationThreshold:
                     value = ConstantFP::get(b.getFloatTy(), codegen::DynamicMultithreadingAddThreshold); // %
@@ -748,6 +759,12 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         toFree.push_back(threadLocalHandle);
     }
 
+#warning this is being compiled into the kernel, not passed in
+
+    const auto segLength = (codegen::SegmentSize + getStride()  - 1U) / getStride();
+
+    segmentArgs[argCount++] = b.getSize(segLength);
+
     assert (argCount == suppliedArgs);
 
     if (LLVM_UNLIKELY(hasAttribute(AttrId::InternallySynchronized))) {
@@ -756,14 +773,21 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
     // allocate any internal stream sets
     if (LLVM_LIKELY(allocatesInternalStreamSets())) {
-        Constant * const sz_ONE = b.getSize(1);
+
+        ConstantInt * const sz_BufferSize = b.getSize(segLength * codegen::BufferSegments);
+
         Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b);
-        SmallVector<Value *, 2> allocArgs;
+        SmallVector<Value *, 4> allocArgs;
         if (LLVM_LIKELY(isStateful())) {
             allocArgs.push_back(sharedHandle);
         }
         // pass in the desired number of segments
-        allocArgs.push_back(sz_ONE);
+        allocArgs.push_back(sz_BufferSize);
+        if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::TraceDynamicBuffers))) {
+            Constant * nil = ConstantPointerNull::get(b.getVoidPtrTy());
+            allocArgs.push_back(nil);
+            allocArgs.push_back(nil);
+        }
         b.CreateCall(allocShared->getFunctionType(), allocShared, allocArgs);
         if (LLVM_LIKELY(hasThreadLocal())) {
             Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b);
@@ -772,7 +796,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
                 allocArgs.push_back(sharedHandle);
             }
             allocArgs.push_back(threadLocalHandle);
-            allocArgs.push_back(sz_ONE);
+            allocArgs.push_back(sz_BufferSize);
             b.CreateCall(allocThreadLocal->getFunctionType(), allocThreadLocal, allocArgs);
         }
     }
@@ -869,8 +893,14 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     if (codegen::UseProcessThreadForIO) {
         out << "+IOT";
     }
+    if (!codegen::PreserveAllStreamSetDataOptions.empty()) {
+        out << "+TLP:" << codegen::ThreadLocalPermittedOptions;
+    }
+    if (!codegen::PreserveAllStreamSetDataOptions.empty()) {
+        out << "+PAS:" << codegen::PreserveAllStreamSetDataOptions;
+    }
     if (LLVM_UNLIKELY(codegen::AnyDebugOptionIsSet())) {
-        if (DebugOptionIsSet(codegen::EnableCycleCounter)) {
+        if (LLVM_UNLIKELY(DebugOptionIsSet(codegen::EnableCycleCounter))) {
             out << "+CYC";
         }
         if (LLVM_UNLIKELY(DebugOptionIsSet(codegen::EnableBlockingIOCounter))) {
@@ -993,7 +1023,7 @@ PipelineKernel::PipelineKernel(LLVMTypeSystemInterface & ts,
          std::move(stream_inputs), std::move(stream_outputs),
          std::move(scalar_inputs), std::move(scalar_outputs))
 , mSignature(std::move(signature)) {
-
+    setStride(ts.getBitBlockWidth());
 }
 
 PipelineKernel::~PipelineKernel() {

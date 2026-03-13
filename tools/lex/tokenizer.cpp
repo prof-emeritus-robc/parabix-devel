@@ -30,7 +30,7 @@
 #include <pablo/pe_ones.h>
 #include <pablo/pablo_toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
-#include <grep/grep_kernel.h>
+#include <kernel/re/regexp_kernel.h>
 #include <toolchain/toolchain.h>
 #include <fcntl.h>
 #include <iomanip>
@@ -39,7 +39,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include <map>
-#include <grep/regex_passes.h>
+#include <re/unicode/regex_passes.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <re/unicode/boundaries.h>
@@ -507,20 +507,13 @@ using WordBreakerFunctionType = void (*)(uint32_t fd);
 void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u8index, StreamSet * results) {
         
     re::RE * rule1 = re::generateRE_TokenizerRule(re::WhitespaceBoundary);
-        const auto WS_Sets = re::collectCCs(rule1, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-        auto WS_mpx = cc::makeMultiplexedAlphabet("WS_mpx", WS_Sets);
-        rule1 = transformCCs(WS_mpx, rule1, re::NameTransformationMode::TransformDefinition);
-        auto WS_basis = WS_mpx->getMultiplexedCCs();
-        StreamSet * const WS_Classes = P.CreateStreamSet(WS_basis.size());
-        P.CreateKernelFamilyCall<CharClassesKernel>(WS_basis, BasisBits, WS_Classes);
-        auto ws_options = std::make_unique<GrepKernelOptions>();
-        ws_options->setIndexing(u8index);
-        ws_options->setRE(rule1);
-        ws_options->addAlphabet(WS_mpx, WS_Classes);
-        ws_options->setResults(results);
-        ws_options->addExternal("UTF8_index", u8index);
-        P.CreateKernelFamilyCall<ICGrepKernel>(std::move(ws_options));
-        SHOW_STREAM(results);
+    RE_CompilerContext ctxt;
+    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
+    ctxt.setIndexingContext(&cc::Unicode, u8index);
+    RE_PipelineBuilder RE_PB(P, ctxt);
+    RE_PB.matchSearchPipeline(rule1, results);
+
+    SHOW_STREAM(results);
 };
 
 // Function to apply split behavior transformation based on split behavior mode
@@ -558,21 +551,11 @@ StreamSet* buildREBasedTokenizer(
     // empty stream to hold the boundary results
     StreamSet* WordBoundaries = P.CreateStreamSet(1, 1);
     
-    const auto Sets = re::collectCCs(rule, cc::Unicode, re::NameProcessingMode::ProcessDefinition);
-    auto mpx = cc::makeMultiplexedAlphabet(prefixName + "_mpx", Sets);
-    rule = transformCCs(mpx, rule, re::NameTransformationMode::TransformDefinition);
-    auto basis = mpx->getMultiplexedCCs();
-    
-    StreamSet* const Classes = P.CreateStreamSet(basis.size());
-    P.CreateKernelFamilyCall<CharClassesKernel>(basis, BasisBits, Classes);
-    
-    auto options = std::make_unique<GrepKernelOptions>();
-    options->setIndexing(u8index);
-    options->setRE(rule);
-    options->addAlphabet(mpx, Classes);
-    options->setResults(WordBoundaries);
-    options->addExternal("UTF8_index", u8index);
-    P.CreateKernelFamilyCall<ICGrepKernel>(std::move(options));
+    RE_CompilerContext ctxt;
+    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
+    ctxt.setIndexingContext(&cc::Unicode, u8index);
+    RE_PipelineBuilder RE_PB(P, ctxt);
+    RE_PB.matchSearchPipeline(rule, WordBoundaries);
     
     SHOW_STREAM(WordBoundaries);
     return WordBoundaries;
@@ -643,7 +626,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
        
         StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "PC", 
             re::generateRE_TokenizerRule(re::PunctuationBoundary), BasisBits, u8index);
-
         // Combine boundaries (OR operation)
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<OrKernel>(preTokenStrm1, preTokenStrm2, WordBoundaries);
@@ -800,7 +782,8 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<RemoveFirstMarkKernel>(insertionBoundaries, insertionBoundariesClean);
     insertionBoundaries = insertionBoundariesClean;
 
-    StreamSet * lineInsertMask = UnitInsertionSpreadMask(P, insertionBoundaries, kernel::InsertPosition::Before);
+    StreamSet * lineInsertMask = P.CreateStreamSet(1);
+    UnitInsertionSpreadMask(P, insertionBoundaries, lineInsertMask, kernel::InsertPosition::Before);
     SHOW_STREAM(lineInsertMask);
    
     StreamSet * spreadBasis = P.CreateStreamSet(21);

@@ -54,6 +54,9 @@ DebugOptions(cl::desc("Debugging Options"), cl::values(clEnumVal(VerifyIR, "Run 
                                                                       "the difference between the deferred and total item count "
                                                                       "per executed stride."),
                         clEnumVal(EnableAsserts, "Enable built-in Parabix framework asserts in all generated IR."),
+
+                        clEnumVal(EnableStreamSetAsserts, "Enable built-in Parabix framework asserts for streamset I/O IR."),
+
                         clEnumVal(EnablePipelineAsserts, "Enable built-in Parabix framework asserts in generated pipeline IR."),
                         clEnumVal(EnableMProtect, "Use mprotect to cause a write fault when erroneously "
                                                   "overwriting kernel state / stream space."),
@@ -88,7 +91,16 @@ static cl::opt<std::string, true> UnoptimizedIROutputOption("ShowUnoptimizedIR",
 
 std::string ShowIRFilter = "";
 static cl::opt<std::string, true> ToShowIRFilerOption("ToShow", cl::location(ShowIRFilter), cl::ValueOptional,
-                                                            cl::desc("Regex filter to choose which kernels to display when showing LLVM IR "), cl::value_desc("regex"), cl::cat(CodeGenOptions));
+                                                            cl::desc("Regex filter to choose which kernels to display when showing LLVM IR"), cl::value_desc("regex"), cl::cat(CodeGenOptions));
+
+
+std::string ThreadLocalPermittedOptions = "";
+static cl::opt<std::string, true> optThreadLocalPermittedOption("permitted-thread-local-streamsets", cl::location(ThreadLocalPermittedOptions), cl::ValueOptional,
+                                                            cl::desc("Comma delimited list of which streamsets to permit to be thread local (default=all)"), cl::value_desc("regex"), cl::cat(CodeGenOptions));
+
+std::string PreserveAllStreamSetDataOptions = "";
+static cl::opt<std::string, true> optPreserveAllStreamSetDataOption("preserve-all-streamset-data", cl::location(PreserveAllStreamSetDataOptions), cl::ValueOptional,
+                                                            cl::desc("Comma delimited list of which streamsets to permit to be thread local (default=all)"), cl::value_desc("regex"), cl::cat(CodeGenOptions));
 
 
 #ifdef ENABLE_PAPI
@@ -276,6 +288,16 @@ bool LLVM_READONLY DebugOptionIsSet(const DebugFlags flag) {
     return DebugOptions.isSet(flag);
 }
 
+bool LLVM_READONLY DebugOptionIsSet(const DebugFlags flag1, const DebugFlags flag2) {
+    #ifdef FORCE_ASSERTIONS
+    if (flag1 == DebugFlags::EnableAsserts) return true;
+    if (flag2 == DebugFlags::EnableAsserts) return true;
+    #endif
+    return DebugOptions.isSet(flag1) || DebugOptions.isSet(flag2);
+}
+
+
+
 bool LLVM_READONLY AnyDebugOptionIsSet() {
     #ifdef FORCE_ASSERTIONS
     return true;
@@ -287,7 +309,7 @@ bool LLVM_READONLY AnyAssertionOptionIsSet() {
     #ifdef FORCE_ASSERTIONS
     return true;
     #endif
-    return DebugOptions.isSet(DebugFlags::EnableAsserts) || DebugOptions.isSet(DebugFlags::EnablePipelineAsserts);
+    return DebugOptions.isSet(DebugFlags::EnableAsserts) || DebugOptions.isSet(DebugFlags::EnableStreamSetAsserts) || DebugOptions.isSet(DebugFlags::EnablePipelineAsserts);
 }
 
 const char * ProgramName;

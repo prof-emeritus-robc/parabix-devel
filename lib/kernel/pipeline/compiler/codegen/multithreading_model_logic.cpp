@@ -61,7 +61,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
 
     FunctionType * const threadFuncType = FunctionType::get(voidPtrTy, {voidPtrTy}, false);
     Function * const threadFunc = Function::Create(threadFuncType, Function::InternalLinkage, threadName, m);
-    if (LLVM_UNLIKELY(CheckAssertions)) {
+    if (LLVM_UNLIKELY(CheckAssertions())) {
         #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
         threadFunc->setHasUWTable();
         #else
@@ -71,6 +71,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
     Value * const initialSharedState = getHandle();
     Value * const initialThreadLocal = getThreadLocalHandle();
     Value * const initialTerminationSignalPtr = getTerminationSignalPtr();
+
 
     // -------------------------------------------------------------------------------------------------------------------------
     // MAKE PIPELINE DRIVER
@@ -131,8 +132,6 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         b.CreateCondBr(moreThanOneThread, constructThread, constructedThreads);
     }
 
-
-
     b.SetInsertPoint(constructThread);
     PHINode * const threadIndex = b.CreatePHI(sizeTy, 2);
     threadIndex->addIncoming(sz_ONE, constructThreadEntry);
@@ -156,7 +155,8 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
                 allocArgs.push_back(initialSharedState);
             }
             allocArgs.push_back(cThreadLocal);
-            allocArgs.push_back(sz_ONE);
+#warning this needs to be scaled by buffer-segments
+            allocArgs.push_back(getNumOfStrides());
             b.CreateCall(allocInternal->getFunctionType(), allocInternal, allocArgs);
         }
     }
@@ -212,6 +212,11 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
     fieldIndex[1] = b.getInt32(CURRENT_THREAD_ID);
     b.CreateAlignedStore(ConstantInt::getNullValue(pThreadTy), b.CreateInBoundsGEP(threadStructTy, threadStateArray, fieldIndex), pThreadAlign);
     // store where we'll resume compiling the DoSegment method
+
+    ScalarValueMap originalScalarFieldMap(mScalarFieldMap);
+    ScalarAliasMap originalScalarFieldMapScalarAliasMap(mScalarAliasMap);
+    BindingMap originalBindingMap(mBindingMap);
+
     const auto resumePoint = b.saveIP();
 
     const auto anyDebugOptionIsSet = codegen::AnyDebugOptionIsSet();
@@ -220,7 +225,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
 
     SmallVector<Type *, 2> csRetValFields;
     csRetValFields.push_back(hasTermSignal ? sizeTy : boolTy);
-    if (CheckAssertions) {
+    if (CheckAssertions()) {
         csRetValFields.push_back(boolTy);
     }
 
@@ -251,7 +256,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
 
         csFunc->setCallingConv(CallingConv::C);
 
-        if (LLVM_UNLIKELY(CheckAssertions)) {
+        if (LLVM_UNLIKELY(CheckAssertions())) {
             #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
             csFunc->setHasUWTable();
             #else
@@ -265,9 +270,6 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         assert (threadStruct->getType() == threadStructPtrTy);
         readThreadStructObject(b, threadStructTy, threadStruct);
         assert (isFromCurrentFunction(b, getHandle(), !mTarget->isStateful()));
-
-//        Value * baseFunctionPtrInt = b.CreatePtrToInt(csFunc, intPtrTy);
-//        b.CallPrintInt(csFunc->getName().str() + "." + b.GetInsertBlock()->getName().str(), baseFunctionPtrInt);
 
         readDoSegmentState(b, threadStructTy, threadStruct);
         initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
@@ -291,7 +293,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         }
         // generate the pipeline logic for this thread
         start(b);
-
+        assignLocalDynamicBufferStructs(b);
         branchToInitialPartition(b);
         const auto firstComputeKernel = FirstKernelInPartition[FirstComputePartitionId];
         assert (AllowIOProcessThread || firstComputeKernel == FirstKernel);
@@ -360,10 +362,10 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         } else {
             retVal.push_back(b.CreateIsNotNull(terminated));
         }
-        if (LLVM_UNLIKELY(CheckAssertions)) {
+        if (LLVM_UNLIKELY(CheckAssertions())) {
             retVal.push_back(mPipelineProgress);
         }
-
+        resetLocalDynamicBufferStructs(b);
 //        Constant * ba = BlockAddress::get(csFunc, b.GetInsertBlock());
 //        Value * ptr = b.CreateAdd(baseFunctionPtrInt, ConstantExpr::getPtrToInt(ba, intPtrTy));
 //        b.CallPrintInt(csFunc->getName().str() + "." + b.GetInsertBlock()->getName().str(), ptr);
@@ -384,7 +386,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         assert (!mIsNestedPipeline);
         const auto outerFuncName = concat(mTarget->getName(), "_ProcessThread", tmp);
         doSegmentProcessThreadFunc = Function::Create(csDoSegmentProcessFuncType, Function::InternalLinkage, outerFuncName, m);
-        makeDoSegmentLogicFunction(doSegmentProcessThreadFunc, true); 
+        makeDoSegmentLogicFunction(doSegmentProcessThreadFunc, true);
         doSegmentProcessThreadFunc->addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
         doSegmentComputeThreadFunc->addFnAttr(llvm::Attribute::AttrKind::AlwaysInline);
     } else {
@@ -452,6 +454,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         }
         #endif
 
+
         // generate the pipeline logic for this thread
         BasicBlock * const mPipelineLoop = b.CreateBasicBlock("PipelineLoop");
         BasicBlock * const mPipelineEnd = b.CreateBasicBlock("PipelineEnd");
@@ -460,7 +463,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         b.CreateBr(mPipelineLoop);
 
         b.SetInsertPoint(mPipelineLoop);
-        if (LLVM_UNLIKELY(CheckAssertions)) {
+        if (LLVM_UNLIKELY(CheckAssertions())) {
             mMadeProgressInLastSegment = b.CreatePHI(b.getInt1Ty(), 2, "madeProgressInLastSegment");
             mMadeProgressInLastSegment->addIncoming(b.getTrue(), entryBlock);
         }
@@ -486,7 +489,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         Function * const doSegFunc = generateProcessThread ? doSegmentProcessThreadFunc : doSegmentComputeThreadFunc;
 
         Value * csRetVal = nullptr;
-        if (CheckAssertions) {
+        if (CheckAssertions()) {
             BasicBlock * rethrowException = b.WriteDefaultRethrowBlock();
             const auto prefix = makeKernelName(mKernelId);
             BasicBlock * const invokeOk = b.CreateBasicBlock(prefix + "_invokeOk");
@@ -506,7 +509,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         Value * done = b.CreateIsNotNull(terminated);
         Value * madeProgress = nullptr;
 
-        if (LLVM_UNLIKELY(CheckAssertions)) {
+        if (LLVM_UNLIKELY(CheckAssertions())) {
             madeProgress = b.CreateExtractValue(csRetVal, {1});
 //            if (LLVM_LIKELY(hasTermSignal)) {
                 madeProgress = b.CreateOr(madeProgress, done);
@@ -701,7 +704,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         if (mIsNestedPipeline) {
             b.CreateBr(mPipelineEnd);
         } else {
-            if (LLVM_UNLIKELY(CheckAssertions)) {
+            if (LLVM_UNLIKELY(CheckAssertions())) {
                 mMadeProgressInLastSegment->addIncoming(madeProgress, exitBlock);
             }
             if (mUseDynamicMultithreading && generateProcessThread) {
@@ -822,7 +825,12 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
 
     setHandle(initialSharedState);
     setThreadLocalHandle(initialThreadLocal);
-    initializeScalarMap(b, InitializeOptions::DoNotIncludeThreadLocalScalars);
+
+    mScalarFieldMap = originalScalarFieldMap;
+    mScalarAliasMap = originalScalarFieldMapScalarAliasMap;
+    mBindingMap = originalBindingMap;
+
+    // initializeScalarMap(b, InitializeOptions::DoNotIncludeThreadLocalScalars);
 
     Value * firstTerminationSignal = nullptr;
     if (LLVM_LIKELY(PipelineHasTerminationSignal)) {
@@ -970,11 +978,15 @@ void PipelineCompiler::start(KernelBuilder & b) {
 
     makePartitionEntryPoints(b);
 
-    if (LLVM_UNLIKELY(CheckAssertions)) {
+    if (LLVM_UNLIKELY(CheckAssertions())) {
         mRethrowException = b.WriteDefaultRethrowBlock();
     }
 
-    mExpectedNumOfStridesMultiplier = b.getScalarField(EXPECTED_NUM_OF_STRIDES_MULTIPLIER);
+    assert (mExpectedNumOfStridesMultiplier == nullptr);
+    Value * const ns = b.CreateUMax(getNumOfStrides(), b.getSize(1));
+
+    mExpectedNumOfStridesMultiplier = ns; // b.CreateCeilUMulRational(ns, mTarget->getStride());
+
     initializeFlowControl(b);
     readExternalConsumerItemCounts(b);
     loadInternalStreamSetHandles(b, true);
@@ -986,8 +998,6 @@ void PipelineCompiler::start(KernelBuilder & b) {
     mAddressableItemCountPtr.clear();
     mVirtualBaseAddressPtr.clear();
     mPipelineProgress = b.getFalse();
-
-
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -1029,7 +1039,7 @@ StructType * PipelineCompiler::getThreadStuctType(KernelBuilder & b, const std::
     for (unsigned i = 0; i < n; ++i) {
         Type * const ty = props[i]->getType();
         const auto align = dl.getABITypeAlign(ty).value();
-        const auto padding = align - (currentOffset % align);
+        const auto padding = (align > 1U) ? (align - (currentOffset % align)) : 0U;
         paramType[i * 2] = ArrayType::get(int8Ty, padding);
         currentOffset += padding;
         paramType[i * 2 + 1] = ty;
@@ -1198,14 +1208,13 @@ Value * PipelineCompiler::isProcessThread(KernelBuilder & b, StructType * const 
     auto & DL = b.getModule()->getDataLayout();
     const auto pThreadAlign = DL.getABITypeAlign(pThreadTy).value();
     Value * const threadId = b.CreateAlignedLoad(pThreadTy, ptr, pThreadAlign);
-//    b.CallPrintInt("exiting thread", threadId);
     return b.CreateIsNull(threadId);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief linkPThreadLibrary
+ * @brief linkPipelineExternalMethods
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::linkPThreadLibrary(KernelBuilder & b) {
+void PipelineCompiler::linkPipelineExternalMethods(KernelBuilder & b) {
 
     Type * const voidPtrTy = b.getVoidPtrTy();
     IntegerType * const intTy = IntegerType::getIntNTy(b.getContext(), sizeof(int) * CHAR_BIT);
@@ -1285,13 +1294,12 @@ void PipelineCompiler::generateSingleThreadKernelMethod(KernelBuilder & b) {
     mMadeProgressInLastSegment = b.CreatePHI(b.getInt1Ty(), 2, "madeProgressInLastSegment");
     mMadeProgressInLastSegment->addIncoming(b.getTrue(), entryBlock);
     obtainCurrentSegmentNumber(b, entryBlock);
-
+    assignLocalDynamicBufferStructs(b);
     branchToInitialPartition(b);
     for (auto i = FirstKernel; i <= LastKernel; ++i) {
         setActiveKernel(b, i, true);
         executeKernel(b);
     }
-
     Value * terminated = nullptr;
     if (mIsNestedPipeline || mUseDynamicMultithreading) {
         if (PipelineHasTerminationSignal) {
@@ -1301,7 +1309,7 @@ void PipelineCompiler::generateSingleThreadKernelMethod(KernelBuilder & b) {
     } else {
         terminated = hasPipelineTerminated(b);
         Value * const done = b.CreateIsNotNull(terminated);
-        if (LLVM_UNLIKELY(CheckAssertions && !AllowIOProcessThread)) {
+        if (LLVM_UNLIKELY(CheckAssertions() && !AllowIOProcessThread)) {
             Value * const progressedOrFinished = b.CreateOr(mPipelineProgress, done);
             Value * const live = b.CreateOr(mMadeProgressInLastSegment, progressedOrFinished);
             b.CreateAssert(live, "Dead lock detected: pipeline could not progress after two iterations");
@@ -1333,6 +1341,7 @@ void PipelineCompiler::generateSingleThreadKernelMethod(KernelBuilder & b) {
 
     updateExternalConsumedItemCounts(b);
     updateExternalProducedItemCounts(b);
+    resetLocalDynamicBufferStructs(b);
 
     if (LLVM_UNLIKELY(codegen::AnyDebugOptionIsSet())) {
         // TODO: this isn't fully correct when this is a nested pipeline
@@ -1395,7 +1404,7 @@ std::vector<Value *> PipelineCompiler::storeDoSegmentState() const {
     };
 
     append(mIsFinal);
-    append(mNumOfStrides);
+    append(mNumOfStrides); assert (mNumOfStrides);
     append(mFixedRateFactor);
     append(mExternalSegNo);
 
@@ -1461,7 +1470,7 @@ void PipelineCompiler::readDoSegmentState(KernelBuilder & b, StructType * const 
     };
 
     revertOne(mIsFinal, mIsFinal != nullptr);
-    revertOne(mNumOfStrides, mNumOfStrides != nullptr);
+    revertOne(mNumOfStrides, true);
     revertOne(mFixedRateFactor, mFixedRateFactor != nullptr);
     revertOne(mExternalSegNo, mExternalSegNo != nullptr);
 
@@ -1515,7 +1524,7 @@ void PipelineCompiler::restoreDoSegmentState(const std::vector<Value *> & S) {
     };
 
     revertOne(mIsFinal, mIsFinal != nullptr);
-    revertOne(mNumOfStrides, mNumOfStrides != nullptr);
+    revertOne(mNumOfStrides, true);
     revertOne(mFixedRateFactor, mFixedRateFactor != nullptr);
     revertOne(mExternalSegNo, mExternalSegNo != nullptr);
 

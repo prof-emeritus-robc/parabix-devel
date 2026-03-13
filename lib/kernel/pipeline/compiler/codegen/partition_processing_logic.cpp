@@ -395,6 +395,7 @@ void PipelineCompiler::phiOutPartitionItemCounts(KernelBuilder & b, const unsign
                         produced = mAlreadyProducedPhi[br.Port];
                     }
                 }
+                mLocallyAvailableItems[streamSet] = produced;
             } else { // if (kernel > mKernelId) {
                 StreamSetPort port;
                 if (br.isRelative()) {
@@ -403,16 +404,19 @@ void PipelineCompiler::phiOutPartitionItemCounts(KernelBuilder & b, const unsign
                     port = br.Port;
                 }
                 const auto prefix = makeBufferName(kernel, port);
+                Type * ty = nullptr;
                 Value * ptr = nullptr;
                 if (LLVM_UNLIKELY(br.isDeferred() && !fromKernelEntryBlock)) {
-                    ptr = b.getScalarFieldPtr(prefix + DEFERRED_ITEM_COUNT_SUFFIX).first;
+                    std::tie(ptr, ty) = b.getScalarFieldPtr(prefix + DEFERRED_ITEM_COUNT_SUFFIX);
                 } else {
-                    ptr = b.getScalarFieldPtr(prefix + ITEM_COUNT_SUFFIX).first;
+                    std::tie(ptr, ty) = b.getScalarFieldPtr(prefix + ITEM_COUNT_SUFFIX);
                 }
-                produced = b.CreateAlignedLoad(b.getSizeTy(), ptr, SizeTyABIAlignment);
+                assert (ty == b.getSizeTy());
+                produced = b.CreateAlignedLoad(b.getSizeTy(), ptr, SizeTyABIAlignment, true);
                 if (br.isRelative()) {
                     produced = b.CreateMulRational(produced, br.getRate().getRate());
                 }
+                mLocallyAvailableItems[streamSet] = produced;
             }
 
             assert (isFromCurrentFunction(b, produced, false));
@@ -680,6 +684,7 @@ void PipelineCompiler::writeInitiallyTerminatedPartitionExit(KernelBuilder & b) 
 
         acquirePartitionSynchronizationLock(b, targetKernelId, nextSegNo);
         phiOutPartitionStateAndReleaseSynchronizationLocks(b, targetKernelId, nextPartitionId, true);
+        updateLocalDynamicBufferStructsUntil(b, targetKernelId);
         zeroAnySkippedTransitoryConsumedItemCountsUntil(b, targetKernelId);
 
         mKernelInitiallyTerminatedExit = b.GetInsertBlock();
@@ -718,7 +723,6 @@ void PipelineCompiler::writeInitiallyTerminatedPartitionExit(KernelBuilder & b) 
         #ifdef PRINT_DEBUG_MESSAGES
         debugPrint(b, "** " + makeKernelName(mKernelId) + ".initiallyTerminated (exitdirect) = %" PRIu64, mSegNo);
         #endif
-
         if (LLVM_UNLIKELY(mAllowDataParallelExecution)) {
             assert (!mIsIOProcessThread);
             releaseSynchronizationLock(b, mKernelId, SYNC_LOCK_PRE_INVOCATION, mSegNo);
@@ -758,8 +762,10 @@ void PipelineCompiler::writeJumpToNextPartition(KernelBuilder & b) {
     if (!mUsesNestedSynchronizationVariable || targetKernelId != PipelineOutput) {
         acquirePartitionSynchronizationLock(b, targetKernelId, mSegNo);
         phiOutPartitionStateAndReleaseSynchronizationLocks(b, targetKernelId, jumpPartitionId, false);
+        updateLocalDynamicBufferStructsUntil(b, targetKernelId);
         zeroAnySkippedTransitoryConsumedItemCountsUntil(b, targetKernelId);
     } else {
+        updateLocalDynamicBufferStructsUntil(b, targetKernelId);
         if (LLVM_UNLIKELY(isDataParallel(mKernelId))) {
             releaseSynchronizationLock(b, mKernelId, SYNC_LOCK_PRE_INVOCATION, mSegNo);
             acquireSynchronizationLockWithTimingInstrumentation(b, mKernelId, SYNC_LOCK_POST_INVOCATION, mSegNo);
@@ -795,6 +801,8 @@ void PipelineCompiler::checkForPartitionExit(KernelBuilder & b) {
     // and combine them at the end?
 
     auto nextKernel = mKernelId + 1;
+
+    updateLocalDynamicBufferStructsUntil(b, nextKernel);
 
     if (mIsIOProcessThread) {
         assert (!mUsesNestedSynchronizationVariable);

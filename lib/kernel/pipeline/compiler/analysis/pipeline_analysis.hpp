@@ -34,36 +34,20 @@ public:
 
         // Initially, we gather information about our partition to determine what kernels
         // are within each partition in a topological order
-        auto initialGraph = P.initialPartitioningPass();
+        auto initialGraph = P.generatePartitionGraph();
 
         P.computeIntraPartitionRepetitionVectors(initialGraph);
 
-        switch (codegen::PipelineCompilationMode) {
-            case codegen::PipelineCompilationModeOptions::DefaultFast:
-                P.simpleEstimateInterPartitionDataflow(initialGraph, rng);
-                break;
-            case codegen::PipelineCompilationModeOptions::Expensive:
-                P.estimateInterPartitionDataflow(initialGraph, rng);
-                break;
-        }
-
-        auto partitionGraph = P.postDataflowAnalysisPartitioningPass(initialGraph);
-
-        switch (codegen::PipelineCompilationMode) {
-            case codegen::PipelineCompilationModeOptions::DefaultFast:
-                P.simpleSchedulePartitionedProgram(partitionGraph, rng);
-                break;
-            case codegen::PipelineCompilationModeOptions::Expensive:
-                P.schedulePartitionedProgram(partitionGraph, rng);
-                break;
-        }
+        P.simpleSchedulePartitionedProgram(initialGraph, rng);
 
         // Construct the Stream and Scalar graphs
-        P.transcribeRelationshipGraph(initialGraph, partitionGraph);
+        P.transcribeRelationshipGraph(initialGraph, initialGraph);
 
-        P.generateInitialBufferGraph();
+        P.generateInitialBufferGraph(b);
 
         P.updateInterPartitionThreadLocalBuffers();
+
+        P.calculateRelativeToInputDataTransferIORates();
 
         P.identifyOutputNodeIds();
 
@@ -90,7 +74,8 @@ public:
             P.identifyIllustratedStreamSets();
         }
         P.calculatePartialSumStepFactors(b);
-        P.determineBufferSize(b);
+
+        P.estimateInitialBufferSizes(b);
 
         P.makeConsumerGraph();
 
@@ -104,13 +89,15 @@ public:
 
         // Finish the buffer graph
 
-        P.determineInitialThreadLocalBufferLayout(b, rng);
-
         P.addStreamSetsToBufferGraph(b);
+
+        P.determineInitialThreadLocalBufferLayout(b, rng);
 
         P.scanFamilyKernelBindings();
 
         P.setStreamSetLockIds();
+
+        P.identifyManagedBufferStructIds(rng);
 
         P.gatherInfo();
 
@@ -133,7 +120,8 @@ private:
     , mTraceProcessedProducedItemCounts(codegen::DebugOptionIsSet(codegen::TraceCounts))
     , mTraceDynamicBuffers(codegen::DebugOptionIsSet(codegen::TraceDynamicBuffers))
     , mTraceIndividualConsumedItemCounts(mTraceProcessedProducedItemCounts || mTraceDynamicBuffers)
-    , IsNestedPipeline(pipelineKernel->hasAttribute(AttrId::InternallySynchronized)) {
+    , IsNestedPipeline(pipelineKernel->hasAttribute(AttrId::InternallySynchronized))
+    , PreserveAllStreamSetData(parseCommaDelimitedList(codegen::PreserveAllStreamSetDataOptions)) {
 
     }
 
@@ -159,8 +147,7 @@ private:
 
 
     // partitioning analysis
-    PartitionGraph initialPartitioningPass();
-    PartitionGraph postDataflowAnalysisPartitioningPass(PartitionGraph & initial);
+    PartitionGraph generatePartitionGraph();
 
     PartitionGraph identifyKernelPartitions();
 
@@ -193,9 +180,10 @@ private:
     // buffer management analysis functions
 
     void addStreamSetsToBufferGraph(KernelBuilder & b);
-    void generateInitialBufferGraph();
 
-    void determineBufferSize(KernelBuilder & b);
+    void generateInitialBufferGraph(KernelBuilder & b);
+
+    void estimateInitialBufferSizes(KernelBuilder & b);
 
     void identifyOwnedBuffers();
 
@@ -212,6 +200,8 @@ private:
     void addFlowControlAnnotations();
 
     void setStreamSetLockIds();
+
+    void identifyManagedBufferStructIds(pipeline_random_engine & rng);
 
     // thread local analysis
 
@@ -232,6 +222,8 @@ private:
     void identifyInterPartitionSymbolicRates();
 
     void calculatePartialSumStepFactors(KernelBuilder & b);
+
+    void calculateRelativeToInputDataTransferIORates();
 
     void simpleEstimateInterPartitionDataflow(PartitionGraph & P, pipeline_random_engine & rng);
 
@@ -302,12 +294,11 @@ public:
     unsigned                        PartitionCount = 0;
     unsigned                        FirstComputePartitionId = 0;
     unsigned                        LastComputePartitionId = 0;
+    unsigned                        ManagedBufferStructCount = 0;
     bool                            AllowIOProcessThread = false;
 
     bool                            HasZeroExtendedStream = false;
     bool                            RequiresIllustratorObject = false;
-
-    size_t                          RequiredThreadLocalStreamSetMemory = 0;
 
     unsigned                        MaxNumOfInputPorts = 0;
     unsigned                        MaxNumOfOutputPorts = 0;
@@ -321,8 +312,12 @@ public:
     std::vector<unsigned>           MaximumNumOfStrides;
     std::vector<unsigned>           StrideRepetitionVector;
 
+
     BufferGraph                     mBufferGraph;
     InOutGraph                      InOutStreamSetReplacement;
+    ThreadLocalPlacementGraph       ThreadLocalPlacement;
+
+    ThreadLocalConflictGraphType    ThreadLocalConflictGraph;
 
     std::vector<unsigned>           PartitionJumpTargetId;
     RedundantStreamSetMap           RedundantStreamSets;
@@ -342,6 +337,8 @@ public:
 
     FamilyScalarGraph               mFamilyScalarGraph;
     ZeroInputGraph                  mZeroInputGraph;
+
+    IntervalSet                     PreserveAllStreamSetData;
 
     IllustratedStreamSetMap         mIllustratedStreamSetBindings;
 

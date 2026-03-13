@@ -78,12 +78,13 @@ class RE_Compiler {
 
     class Marker {
     public:
-        Marker(pablo::PabloAST * strm, unsigned offset = 0) : mOffset(offset), mStream(strm) {}
+        enum class Position : unsigned {AtEnd, AtNextCodeUnit, AtNextChar};
+        Marker(pablo::PabloAST * strm, Position p = Position::AtEnd) : mPosition(p), mStream(strm) {}
         Marker & operator =(const Marker &) = default;
-        unsigned offset() {return mOffset;}
+        Position position() {return mPosition;}
         pablo::PabloAST * stream() {return mStream;}
     private:
-        unsigned mOffset;
+        Position mPosition;
         pablo::PabloAST * mStream;
     };
 
@@ -98,19 +99,26 @@ class RE_Compiler {
     // normally zero, indicating that the marker is placed on the last
     // matched character of the named object.   An offset of 1 is used
     // when the length is zero or potentially zero (e.g., zero-width assertions).
+    // When the from_first parameter is true, offsets are counted from
+    // the first matched character; these are intended for externals
+    // used for lookahead assertions.
     //
     class ExternalStream {
     public:
-        ExternalStream(Marker m, std::pair<int, int> lgthRange) :
-            mMarker(m), mLengthRange(lgthRange) {}
+        ExternalStream(pablo::PabloAST * s, unsigned offset, std::pair<int, int> lgthRange, bool from_first = false) :
+            mStream(s), mOffset(offset), mLengthRange(lgthRange), mFromFirst(from_first) {}
         ExternalStream & operator = (const ExternalStream &) = default;
+        pablo::PabloAST * stream() {return mStream;}
+        unsigned offset() {return mOffset;}
         std::pair<int, int> lengthRange() {return mLengthRange;}
         unsigned minLength() {return mLengthRange.first;}
         unsigned maxLength() {return mLengthRange.second;}
-        Marker & marker() {return mMarker;}
+        bool fromFirst() {return mFromFirst;}
     private:
-        Marker mMarker;
+        pablo::PabloAST * mStream;
+        unsigned mOffset;
         std::pair<int, int> mLengthRange;
+        bool mFromFirst;
     };
 
     void addPrecompiled(std::string externalName, ExternalStream s);

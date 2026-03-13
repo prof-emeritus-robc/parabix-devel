@@ -44,14 +44,12 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
 
     IntegerType * const sizeTy = b.getSizeTy();
 
-    mTarget->addInternalScalar(sizeTy, EXPECTED_NUM_OF_STRIDES_MULTIPLIER, 0);
-
     #ifdef ENABLE_PAPI
     if (LLVM_LIKELY(NumOfPAPIEvents > 0)) {
         mTarget->addThreadLocalScalar(b.getInt32Ty(), STATISTICS_PAPI_EVENT_SET, 0);
     }
     #endif
-    if (LLVM_LIKELY(RequiredThreadLocalStreamSetMemory > 0)) {
+    if (LLVM_LIKELY(num_edges(ThreadLocalPlacement) > 0)) {
         PointerType * const int8PtrTy = b.getInt8PtrTy();
         mTarget->addThreadLocalScalar(int8PtrTy, BASE_THREAD_LOCAL_STREAMSET_MEMORY, 0);
         mTarget->addThreadLocalScalar(sizeTy, BASE_THREAD_LOCAL_STREAMSET_MEMORY_BYTES, 0);
@@ -77,9 +75,8 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
     for (auto i = FirstKernel; i <= LastKernel; ++i) {
         const auto partitionId = KernelPartitionId[i];
         const bool isRoot = (partitionId != currentPartitionId);
-        currentPartitionId = partitionId;        
+        currentPartitionId = partitionId;
         addInternalKernelProperties(b, i, isRoot);
-        addCycleCounterProperties(b, i, isRoot);
         #ifdef ENABLE_PAPI
         addPAPIEventCounterKernelProperties(b, i, isRoot);
         #endif
@@ -93,11 +90,21 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
                 NEXT_LOGICAL_SEGMENT_NUMBER + std::to_string(i), getCacheLineGroupId(i));
         }
     }
+
     if (LLVM_UNLIKELY(EnableCycleCounter)) {
+        auto currentPartitionId = -1U;
+        constexpr auto L = 0U;
+        for (auto i = FirstKernel; i <= LastKernel; ++i) {
+            const auto partitionId = KernelPartitionId[i];
+            const bool isRoot = (partitionId != currentPartitionId);
+            currentPartitionId = partitionId;
+            addCycleCounterProperties(b, i, isRoot, L + i);
+        }
+        addCycleCounterProperties(b, PipelineOutput, true, L + PipelineOutput);
         mTarget->addThreadLocalScalar(b.getInt64Ty(), STATISTICS_CYCLE_COUNT_TOTAL,
                                       getCacheLineGroupId(PipelineOutput), ThreadLocalScalarAccumulationRule::Sum);
     }
-    addCycleCounterProperties(b, PipelineOutput, true);
+
     addRepeatingStreamSetBufferProperties(b);
     generateMetaDataForRepeatingStreamSets(b);
     #ifdef ENABLE_PAPI
@@ -107,6 +114,7 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
         addDynamicThreadingReportProperties(b, getCacheLineGroupId(PipelineOutput + 1));
     }
     addZeroInputStructProperties(b);
+    addLocalDynamicBufferStructs(b);
 
     const auto first = FirstKernelInPartition[FirstComputePartitionId];
     const auto last = FirstKernelInPartition[LastComputePartitionId + 1];
@@ -140,6 +148,7 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     const auto firstComputeKernelId = FirstKernelInPartition[FirstComputePartitionId];
     const auto onAfterLastComputeKernelId = FirstKernelInPartition[LastComputePartitionId + 1];
 
+    #ifndef DISABLE_ALL_DATA_PARALLEL_SYNCHRONIZATION
     if (LLVM_UNLIKELY(isKernelStateFree(kernelId))) {
         if (LLVM_LIKELY(firstComputeKernelId <= kernelId && kernelId < onAfterLastComputeKernelId)) {
             if (LLVM_LIKELY((mKernel->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject) == 0)) {
@@ -148,15 +157,14 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
             }
         }
     }
+    #endif
 
     const auto isInternallySynchronized = mKernel->hasAttribute(AttrId::InternallySynchronized);
     if (LLVM_UNLIKELY(isInternallySynchronized)) {
         mIsInternallySynchronized.set(kernelId);
     }
 
-    #if defined(DISABLE_ALL_DATA_PARALLEL_SYNCHRONIZATION)
-    const auto allowDataParallelExecution = false;
-    #elif defined(ALLOW_INTERNALLY_SYNCHRONIZED_KERNELS_TO_BE_DATA_PARALLEL)
+    #if defined(ALLOW_INTERNALLY_SYNCHRONIZED_KERNELS_TO_BE_DATA_PARALLEL)
     const auto allowDataParallelExecution = isStateless || isInternallySynchronized;
     #else
     const auto allowDataParallelExecution = isStateless;
@@ -253,21 +261,21 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     }
 
     if (LLVM_UNLIKELY(mTraceDynamicBuffers)) {
-        for (const auto e : make_iterator_range(out_edges(kernelId, mBufferGraph))) {
-            const auto bufferVertex = target(e, mBufferGraph);
-            const BufferNode & bn = mBufferGraph[bufferVertex];
-            if (bn.Buffer->isDynamic()) {
-                const BufferPort & rd = mBufferGraph[e];
+        for (const auto output : make_iterator_range(out_edges(kernelId, mBufferGraph))) {
+            const BufferPort & bp = mBufferGraph[output];
+            const auto streamSet = target(output, mBufferGraph);
+            const BufferNode & bn = mBufferGraph[streamSet];
+            if (bp.isManaged() || isa<ManagedDynamicBuffer>(bn.OutputBuffer)) {
+                const BufferPort & rd = mBufferGraph[output];
                 const auto prefix = makeBufferName(kernelId, rd.Port);
                 LLVMContext & C = b.getContext();
-                const auto numOfConsumers = std::max(out_degree(bufferVertex, mConsumerGraph), 1UL);
+                const auto numOfConsumers = std::max(out_degree(streamSet, mConsumerGraph), 1UL);
 
                 // segment num  0
                 // new capacity 1
                 // produced item count 2
                 // consumer processed item count [3,n)
                 Type * const traceStructTy = ArrayType::get(sizeTy, numOfConsumers + 3);
-
                 FixedArray<Type *, 2> traceStruct;
                 traceStruct[0] = traceStructTy->getPointerTo(); // pointer to trace log
                 traceStruct[1] = sizeTy; // length of trace log
@@ -337,6 +345,25 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 
         if (LLVM_LIKELY(!isKernelFamilyCall(i))) {
             ArgVec args;
+
+            if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
+
+                Constant * sharedStateTySize = nullptr;
+                if (mKernel->isStateful()) {
+                    sharedStateTySize = b.getTypeSize(mKernel->getSharedStateType());
+                } else {
+                    sharedStateTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
+                }
+                args.push_back(sharedStateTySize);
+
+                Constant * threadLocalTySize = nullptr;
+                if (mKernel->hasThreadLocal()) {
+                    threadLocalTySize = b.getTypeSize(mKernel->getThreadLocalStateType());
+                } else {
+                    threadLocalTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
+                }
+                args.push_back(threadLocalTySize);
+            }
             if (LLVM_LIKELY(mKernel->isStateful())) {
                 args.push_back(mKernelSharedHandle);
             }
@@ -395,15 +422,14 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateAllocateInternalStreamSetsMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, Value * const expectedNumOfStrides) {
+void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, Value * const segmentSize) {
     if (LLVM_UNLIKELY(FirstKernel == PipelineInput)) {
         assert (FirstKernel == LastKernel);
+        assert (LastStreamSet <= FirstStreamSet);
         return;
     }
 
     getABIAlignments(b);
-
-    b.setScalarField(EXPECTED_NUM_OF_STRIDES_MULTIPLIER, expectedNumOfStrides);
 
     if (LLVM_UNLIKELY(FirstKernel == PipelineInput)) {
         assert (LastKernel == PipelineInput);
@@ -416,15 +442,7 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
         return;
     }
 
-    initializeInitialSlidingWindowSegmentLengths(b, expectedNumOfStrides);
-
-    Value * allocScale = expectedNumOfStrides;
-    if (LLVM_LIKELY(!mIsNestedPipeline)) {
-        Value * bsl = b.getScalarField(BUFFER_SEGMENT_LENGTH);
-        allocScale = b.CreateMul(allocScale, bsl);
-        Value * const threadCount = b.getScalarField(MAXIMUM_NUM_OF_THREADS);
-        allocScale = b.CreateMul(allocScale, threadCount);
-    }
+    initializeInitialSlidingWindowSegmentLengths(b, segmentSize);
 
     bool hasAnyReturnedBuffer = false;
     for (const auto output : make_iterator_range(in_edges(PipelineOutput, mBufferGraph))) {
@@ -438,7 +456,7 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
         }
     }
 
-    Value * expectedSourceOutputSize = expectedNumOfStrides;
+    Value * expectedSourceOutputSize = nullptr;
     if (LLVM_UNLIKELY(hasAnyReturnedBuffer)) {
         Value * bufferScaling = nullptr;
         for (auto kernel = FirstKernel; kernel <= LastKernel; ++kernel) {
@@ -452,14 +470,16 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
             }
         }
         if (bufferScaling) {
-            bufferScaling = b.CreateMul(bufferScaling, expectedNumOfStrides);
-            expectedSourceOutputSize = b.CreateCeilUDiv(bufferScaling, b.getSize(b.getBitBlockWidth()));
+            expectedSourceOutputSize = b.CreateCeilUDivRational(bufferScaling, b.getBitBlockWidth());
         }
     }
 
-    assert (expectedSourceOutputSize);
+    const Rational T{mTarget->getStride(), b.getBitBlockWidth()};
+    Value * allocScale = b.CreateCeilUMulRational(segmentSize, T);
+    if (LLVM_LIKELY(!mIsNestedPipeline)) {
+        allocScale = b.CreateMul(allocScale, b.getScalarField(MAXIMUM_NUM_OF_THREADS));
+    }
     allocateOwnedBuffers(b, allocScale, expectedSourceOutputSize, true);
-    initializeBufferExpansionHistory(b);
     resetInternalBufferHandles();
 }
 
@@ -486,31 +506,17 @@ void PipelineCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateAllocateThreadLocalInternalStreamSetsMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder & b, Value * const expectedNumOfStrides) {
+void PipelineCompiler::generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder & b, Value * const segmentSize) {
     if (LLVM_UNLIKELY(FirstKernel == PipelineInput)) {
         assert (FirstKernel == LastKernel);
         return;
     }
     getABIAlignments(b);
-    assert (mTarget->hasThreadLocal());
-    Value * allocScale = expectedNumOfStrides;
-    if (LLVM_LIKELY(!mIsNestedPipeline)) {
-        Value * bsl = b.getScalarField(BUFFER_SEGMENT_LENGTH);
-        allocScale = b.CreateMul(allocScale, bsl);
-    }
-    if (LLVM_LIKELY(RequiredThreadLocalStreamSetMemory > 0)) {
-        auto size = RequiredThreadLocalStreamSetMemory;
-        #ifdef THREADLOCAL_BUFFER_CAPACITY_MULTIPLIER
-        size *= THREADLOCAL_BUFFER_CAPACITY_MULTIPLIER;
-        #endif
-        ConstantInt * const reqMemory = b.getSize(size);
-        Value * const memorySize = b.CreateMul(reqMemory, allocScale);
-        Value * const base = b.CreatePageAlignedMalloc(memorySize);
-        PointerType * const int8PtrTy = b.getInt8PtrTy();
-        b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY, b.CreatePointerCast(base, int8PtrTy));
-        b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY_BYTES, memorySize);
-    }
-    allocateOwnedBuffers(b, expectedNumOfStrides, nullptr, false);
+    assert (LastStreamSet >= FirstStreamSet);
+    assert (PartitionCount > 0);
+    initializeThreadLocalMemory(b, segmentSize);
+    const Rational T{mTarget->getStride(), b.getBitBlockWidth()};
+    allocateOwnedBuffers(b, b.CreateCeilUMulRational(segmentSize, T), nullptr, false);
     resetInternalBufferHandles();
 }
 
@@ -624,13 +630,14 @@ void PipelineCompiler::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
     // Since all of the nested kernels thread local state is contained within
     // this pipeline thread's thread local state, freeing the pipeline's will
     // also free the inner kernels.
-    if (LLVM_LIKELY(RequiredThreadLocalStreamSetMemory > 0)) {
-        b.CreateFree(b.getScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY));
+    if (LLVM_LIKELY(num_edges(ThreadLocalPlacement) > 0)) {
+        Value * tlptr = b.getScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY);
+        b.CreateFree(tlptr);
     }
     if (LLVM_UNLIKELY(HasZeroExtendedStream)) {
         b.CreateFree(b.getScalarField(ZERO_EXTENDED_BUFFER));
     }
-    freePendingFreeableDynamicBuffers(b);
+//    freePendingFreeableDynamicBuffers(b);
     freeZeroedInputBuffers(b);
 }
 

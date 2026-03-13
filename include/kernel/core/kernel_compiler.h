@@ -334,6 +334,16 @@ public:
 
 protected:
 
+    LLVM_READNONE llvm::Value * getStreamSetAssertionInputItemCapacity(const unsigned index) const {
+        return mInputItemCapacity[index];
+    }
+
+    LLVM_READNONE llvm::Value * getStreamSetAssertionOutputItemCapacity(const unsigned index) const {
+        return mOutputItemCapacity[index];
+    }
+
+protected:
+
     virtual void constructStreamSetBuffers(KernelBuilder & b);
 
     virtual void addBaseInternalProperties(KernelBuilder & b);
@@ -386,7 +396,15 @@ protected:
 
     void captureStreamData(KernelBuilder & b, llvm::Constant * kernelName, llvm::Constant * streamName, llvm::Value * handle, llvm::Value * strideNum, llvm::Type * type, const MemoryOrdering ordering, llvm::Value * streamData, llvm::Value * from, llvm::Value * to) const;
 
+protected:
 
+    llvm::Value * getReportExpansionCallback() const {
+        return mReportExpansionCallback;
+    }
+
+    llvm::Value * getPipelineHandle() const {
+        return mPipelineHandle;
+    }
 
 protected:
 
@@ -430,18 +448,23 @@ protected:
     llvm::Value *                   mPAPIEventSetId = nullptr;
     #endif
 
+    llvm::Value *                   mReportExpansionCallback = nullptr;
+    llvm::Value *                   mPipelineHandle = nullptr;
+
     Vec<llvm::Value *>              mInputIsClosed;
 
     Vec<llvm::Value *>              mProcessedInputItemPtr;
 
     Vec<llvm::Value *>              mAccessibleInputItems;
     Vec<llvm::Value *>              mAvailableInputItems;
+    Vec<llvm::Value *>              mInputItemCapacity;
     Vec<llvm::Value *>              mProducedOutputItemPtr;
     Vec<llvm::Value *>              mUpdatableOutputBaseVirtualAddressPtr;
     Vec<llvm::Value *>              mInitiallyProducedOutputItems;
 
     Vec<llvm::Value *>              mWritableOutputItems;
     Vec<llvm::Value *>              mConsumedOutputItems;
+    Vec<llvm::Value *>              mOutputItemCapacity;
 
     ScalarValueMap                  mScalarFieldMap;
     ScalarAliasMap                  mScalarAliasMap;

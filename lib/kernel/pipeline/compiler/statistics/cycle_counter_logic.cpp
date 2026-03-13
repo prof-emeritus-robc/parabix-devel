@@ -9,31 +9,40 @@ namespace kernel {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInternalKernelCycleCountProperties
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::addCycleCounterProperties(KernelBuilder & b, const unsigned kernelId, const bool isRoot) {
-
-    const auto groupId = getCacheLineGroupId(kernelId);
+void PipelineCompiler::addCycleCounterProperties(KernelBuilder & b, const unsigned kernelId, const bool isRoot, const unsigned groupId) {
 
     if (LLVM_UNLIKELY(EnableCycleCounter)) {
         // TODO: make these thread local to prevent false sharing and enable
         // analysis of thread distributions?
+
+        auto & C = b.getContext();
+
         Type * const int64Ty = b.getInt64Ty();
-        Type * const emptyTy = StructType::get(b.getContext());
+        Type * const emptyTy = StructType::get(C);
         Type * const jumpPropertyIntTy = isRoot ? int64Ty : emptyTy;
         Type * const otherPropertyTy = (kernelId == PipelineOutput) ? emptyTy : int64Ty;
         Type * const numInvokePropertyTy = isRoot ? otherPropertyTy : emptyTy;
-
+        Type * copyPropertyTy = emptyTy;
+        for (const auto e : make_iterator_range(out_edges(kernelId, mBufferGraph))) {
+            const auto streamSet = target(e, mBufferGraph);
+            const auto & bn = mBufferGraph[streamSet];
+            if (bn.OutputBuffer->isLinear()) {
+                copyPropertyTy = otherPropertyTy;
+                break;
+            }
+        }
 
         FixedArray<Type *, NUM_OF_KERNEL_CYCLE_COUNTERS> fields;
         fields[KERNEL_SYNCHRONIZATION] = otherPropertyTy;
         fields[PARTITION_JUMP_SYNCHRONIZATION] = jumpPropertyIntTy;
         fields[BUFFER_EXPANSION] = otherPropertyTy;
-        fields[BUFFER_COPY] = otherPropertyTy;
+        fields[BUFFER_COPY] = copyPropertyTy;
         fields[KERNEL_EXECUTION] = otherPropertyTy;
         fields[TOTAL_TIME] = otherPropertyTy;
         fields[SQ_SUM_TOTAL_TIME] = otherPropertyTy;
         fields[NUM_OF_INVOCATIONS] = numInvokePropertyTy;
 
-        StructType * const cycleCounterTy = StructType::get(b.getContext(), fields);
+        StructType * const cycleCounterTy = StructType::get(C, fields);
         const auto name = makeKernelName(kernelId) + STATISTICS_CYCLE_COUNT_SUFFIX;
         mTarget->addInternalScalar(cycleCounterTy, name, groupId);
     }
@@ -46,12 +55,12 @@ void PipelineCompiler::addCycleCounterProperties(KernelBuilder & b, const unsign
         // # of blocked I/O channel attempts in which no strides
         // were possible (i.e., blocked on first iteration)
 
-        for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
+        for (const auto e : make_iterator_range(in_edges(kernelId, mBufferGraph))) {
             const auto port = mBufferGraph[e].Port;
             const auto prefix = makeBufferName(kernelId, port);
             mTarget->addInternalScalar(int64Ty, prefix + STATISTICS_BLOCKING_IO_SUFFIX, groupId);
         }
-        for (const auto e : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
+        for (const auto e : make_iterator_range(out_edges(kernelId, mBufferGraph))) {
             // TODO: ignore dynamic buffers
             const auto port = mBufferGraph[e].Port;
             const auto prefix = makeBufferName(kernelId, port);
@@ -70,14 +79,14 @@ void PipelineCompiler::addCycleCounterProperties(KernelBuilder & b, const unsign
 
         // # of blocked I/O channel attempts in which no strides
         // were possible (i.e., blocked on first iteration)
-        for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
+        for (const auto e : make_iterator_range(in_edges(kernelId, mBufferGraph))) {
             const auto & bp = mBufferGraph[e];
             if (bp.canModifySegmentLength()) {
                 const auto prefix = makeBufferName(kernelId, bp.Port);
                 mTarget->addInternalScalar(historyTy, prefix + STATISTICS_BLOCKING_IO_HISTORY_SUFFIX, groupId);
             }
         }
-        for (const auto e : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
+        for (const auto e : make_iterator_range(out_edges(kernelId, mBufferGraph))) {
             const auto & bp = mBufferGraph[e];
             if (bp.canModifySegmentLength()) {
                 const auto prefix = makeBufferName(kernelId, bp.Port);
@@ -85,6 +94,7 @@ void PipelineCompiler::addCycleCounterProperties(KernelBuilder & b, const unsign
             }
         }
     }
+
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -98,21 +108,32 @@ inline bool isSynchronizationCounter(const CycleCounter type) {
  * @brief startCycleCounter
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::startCycleCounter(KernelBuilder & b, const CycleCounter type) {
+#if 1
     assert (EnableCycleCounter || isSynchronizationCounter(type));
     Value * const counter = b.CreateReadCycleCounter();
     mCycleCounters[(unsigned)type] = counter;
+#else
+    mCycleCounters[(unsigned)type] = b.getSize(0);
+#endif
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief startCycleCounter
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::startCycleCounter(KernelBuilder & b, const std::initializer_list<CycleCounter> types) {
+#if 1
     Value * counter = b.CreateReadCycleCounter();
     assert (types.size() > 0);
     for (auto type : types) {
         assert (EnableCycleCounter || isSynchronizationCounter(type));
         mCycleCounters[(unsigned)type] = counter;
     }
+#else
+    for (auto type : types) {
+        assert (EnableCycleCounter || isSynchronizationCounter(type));
+        mCycleCounters[(unsigned)type] = b.getSize(0);
+    }
+#endif
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -121,12 +142,12 @@ void PipelineCompiler::startCycleCounter(KernelBuilder & b, const std::initializ
 void PipelineCompiler::updateCycleCounter(KernelBuilder & b, const unsigned kernelId, const CycleCounter type) {
     assert (FirstKernel <= kernelId && kernelId <= PipelineOutput);
     assert (EnableCycleCounter || isSynchronizationCounter(type));
-
+#if 1
     Value * const end = b.CreateReadCycleCounter();
     Value * const start = mCycleCounters[(unsigned)type]; assert (start);
     Value * const duration = b.CreateSub(end, start);
 
-    IntegerType * sizeTy = b.getSizeTy();
+    IntegerType * sizeTy = b.getInt64Ty();
     if (mUseDynamicMultithreading && isSynchronizationCounter(type)) {
         Value * const cur = b.CreateAlignedLoad(sizeTy, mAccumulatedSynchronizationTimePtr, SizeTyABIAlignment);
         Value * const accum = b.CreateAdd(cur, duration);
@@ -139,6 +160,7 @@ void PipelineCompiler::updateCycleCounter(KernelBuilder & b, const unsigned kern
         std::tie(ptr, ty) = b.getScalarFieldPtr(prefix  + STATISTICS_CYCLE_COUNT_SUFFIX);
         FixedArray<Value *, 2> index;
         index[0] = b.getInt32(0);
+        assert (ty->getStructElementType(type)->isIntegerTy());
         index[1] = b.getInt32(type);
         Value * const sumCounterPtr = b.CreateGEP(ty, ptr, index);
         Value * const sumRunningCount = b.CreateAlignedLoad(sizeTy, sumCounterPtr, SizeTyABIAlignment);
@@ -147,6 +169,7 @@ void PipelineCompiler::updateCycleCounter(KernelBuilder & b, const unsigned kern
 
         if (type == CycleCounter::TOTAL_TIME) {
             index[1] = b.getInt32(SQ_SUM_TOTAL_TIME);
+            assert (ty->getStructElementType(SQ_SUM_TOTAL_TIME)->isIntegerTy());
             Value * const sqSumCounterPtr = b.CreateGEP(ty, ptr, index);
             Value * const sqSumRunningCount = b.CreateAlignedLoad(sizeTy, sqSumCounterPtr, SizeTyABIAlignment);
             Value * sqDuration = b.CreateZExt(duration, sqSumRunningCount->getType());
@@ -155,6 +178,7 @@ void PipelineCompiler::updateCycleCounter(KernelBuilder & b, const unsigned kern
             b.CreateAlignedStore(sqSumUpdatedCount, sqSumCounterPtr, SizeTyABIAlignment);
             if (mIsPartitionRoot) {
                 index[1] = b.getInt32(NUM_OF_INVOCATIONS);
+                assert (ty->getStructElementType(NUM_OF_INVOCATIONS)->isIntegerTy());
                 Value * const invokePtr = b.CreateGEP(ty, ptr, index);
                 Value * const invoked = b.CreateAlignedLoad(sizeTy, invokePtr, SizeTyABIAlignment);
                 Value * const invoked2 = b.CreateAdd(invoked, b.getSize(1));
@@ -162,13 +186,14 @@ void PipelineCompiler::updateCycleCounter(KernelBuilder & b, const unsigned kern
             }
         }
     }
+#endif
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief updateOptionalCycleCounter
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::updateCycleCounter(KernelBuilder & b, const unsigned kernelId, Value * const cond, const CycleCounter ifTrue, const CycleCounter ifFalse) {
-
+#if 1
     assert (EnableCycleCounter || mUseDynamicMultithreading);
     Value * const end = b.CreateReadCycleCounter();
     Value * const start = mCycleCounters[(unsigned)ifTrue];
@@ -189,12 +214,14 @@ void PipelineCompiler::updateCycleCounter(KernelBuilder & b, const unsigned kern
     Value * const sumRunningCount = b.CreateAlignedLoad(b.getSizeTy(), sumCounterPtr, SizeTyABIAlignment);
     Value * const sumUpdatedCount = b.CreateAdd(sumRunningCount, duration);
     b.CreateAlignedStore(sumUpdatedCount, sumCounterPtr, SizeTyABIAlignment);
+#endif
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief updateOptionalCycleCounter
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::updateTotalCycleCounterTime(KernelBuilder & b) const {
+#if 1
     assert (EnableCycleCounter);
     Value * const end = b.CreateReadCycleCounter();
     Value * const start = mCycleCounters[(unsigned)FULL_PIPELINE_TIME];
@@ -204,6 +231,7 @@ void PipelineCompiler::updateTotalCycleCounterTime(KernelBuilder & b) const {
     Value * const ptr = getScalarFieldPtr(b, STATISTICS_CYCLE_COUNT_TOTAL).first;
     Value * const updated = b.CreateAdd(b.CreateAlignedLoad(b.getSizeTy(), ptr, SizeTyABIAlignment), duration);
     b.CreateAlignedStore(updated, ptr, SizeTyABIAlignment);
+#endif
 }
 
 
@@ -439,8 +467,8 @@ void __print_pipeline_cycle_counter_report(const uint64_t numOfKernels,
  * @brief printOptionalCycleCounter
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::printOptionalCycleCounter(KernelBuilder & b) {
+#if 1
     if (LLVM_UNLIKELY(EnableCycleCounter)) {
-
         ConstantInt * const ZERO = b.getInt32(0);
 
         auto toGlobal = [&](ArrayRef<Constant *> array, Type * const type, size_t size) {
@@ -519,14 +547,13 @@ void PipelineCompiler::printOptionalCycleCounter(KernelBuilder & b) {
 
             std::tie(cycleCountPtr, cycleCountTy) = b.getScalarFieldPtr(prefix + STATISTICS_CYCLE_COUNT_SUFFIX);
 
+            assert (cycleCountTy->getStructNumElements() == NUM_OF_KERNEL_CYCLE_COUNTERS);
+
             for (unsigned j = 0; j < NUM_OF_INVOCATIONS; ++j) {
                 Value * sumCycles = INT64_ZERO;
-                if (isRoot || j != PARTITION_JUMP_SYNCHRONIZATION) {
-                    assert (cycleCountTy->getStructElementType(j)->isIntegerTy());
+                if (cycleCountTy->getStructElementType(j)->isIntegerTy()) {
                     index[1] = b.getInt32(j);
                     sumCycles = b.CreateAlignedLoad(int64Ty, b.CreateGEP(cycleCountTy, cycleCountPtr, index), Int64TyABIAlignment);
-                } else {
-                    assert (cycleCountTy->getStructElementType(j)->isEmptyTy());
                 }
                 assert (k < REQ_INTEGERS);
                 b.CreateAlignedStore(sumCycles, b.CreateGEP(int64Ty, values, b.getInt32(k++)), Int64TyABIAlignment);
@@ -589,6 +616,7 @@ void PipelineCompiler::printOptionalCycleCounter(KernelBuilder & b) {
 
         b.CreateFree(values);
     }
+#endif
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -1108,379 +1136,6 @@ has_ports:
             b.CreateFree(traceLogArray[i]);
         }
     }
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief initializeBufferExpansionHistory
- ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::initializeBufferExpansionHistory(KernelBuilder & b) const {
-
-    if (LLVM_UNLIKELY(mTraceDynamicBuffers)) {
-
-        const auto firstBuffer = PipelineOutput + 1;
-        const auto lastBuffer = num_vertices(mBufferGraph);
-
-        Constant * const ZERO = b.getInt32(0);
-        Constant * const ONE = b.getInt32(1);
-        Constant * const TWO = b.getInt32(2);
-        Constant * const SZ_ZERO = b.getSize(0);
-        Constant * const SZ_ONE = b.getSize(1);
-
-
-
-        for (unsigned i = firstBuffer; i < lastBuffer; ++i) {
-            const BufferNode & bn = mBufferGraph[i];
-
-            const StreamSetBuffer * const buffer = bn.Buffer; assert (buffer);
-
-            if (buffer->isDynamic()) {
-                const auto pe = in_edge(i, mBufferGraph);
-                const auto p = source(pe, mBufferGraph);
-                const BufferPort & rd = mBufferGraph[pe];
-                const auto prefix = makeBufferName(p, rd.Port);
-
-                Value * traceData; Type * traceTy;
-                std::tie(traceData, traceTy) = b.getScalarFieldPtr(prefix + STATISTICS_BUFFER_EXPANSION_SUFFIX);
-
-                const auto numOfConsumers = std::max(out_degree(i, mConsumerGraph), 1UL);
-                const auto n = numOfConsumers + 3;
-                Type * const entryTy = ArrayType::get(b.getSizeTy(), n);
-
-                Value * const entryData = b.CreatePageAlignedMalloc(entryTy, SZ_ONE);
-                // fill in the struct
-                b.CreateAlignedStore(entryData, b.CreateGEP(traceTy, traceData, {ZERO, ZERO}), PtrTyABIAlignment);
-                b.CreateAlignedStore(SZ_ONE, b.CreateGEP(traceTy, traceData, {ZERO, ONE}), SizeTyABIAlignment);
-                // then the initial record
-                b.CreateAlignedStore(SZ_ZERO, b.CreateGEP(entryTy, entryData, {ZERO, ZERO}), SizeTyABIAlignment);
-                b.CreateAlignedStore(buffer->getInternalCapacity(b), b.CreateGEP(entryTy, entryData, {ZERO, ONE}), SizeTyABIAlignment);
-
-                unsigned sizeTyWidth = b.getSizeTy()->getIntegerBitWidth() / 8;
-                Constant * const length = b.getSize(sizeTyWidth * (n - 2));
-                b.CreateMemZero(b.CreateGEP(entryTy, entryData, {ZERO, TWO}), length, sizeTyWidth);
-
-            }
-        }
-
-    }
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief recordBufferExpansionHistory
- ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::recordBufferExpansionHistory(KernelBuilder & b,
-                                                    const unsigned streamSet,
-                                                    const BufferNode & bn,
-                                                    const BufferPort & port,
-                                                    const StreamSetBuffer * const buffer) const {
-
-    assert (mTraceDynamicBuffers && buffer->isDynamic());
-    const StreamSetPort outputPort = port.Port;
-    const auto prefix = makeBufferName(mKernelId, outputPort);
-
-    Value * traceData; Type * traceDataTy;
-    std::tie(traceData, traceDataTy) = b.getScalarFieldPtr(prefix + STATISTICS_BUFFER_EXPANSION_SUFFIX);
-
-
-    Constant * const ZERO = b.getInt32(0);
-    Constant * const ONE = b.getInt32(1);
-    Constant * const TWO = b.getInt32(2);
-    Constant * const THREE = b.getInt32(3);
-
-    IntegerType * const sizeTy = b.getSizeTy();
-    const auto numOfConsumers = std::max(out_degree(streamSet, mConsumerGraph), 1UL);
-    const auto n = numOfConsumers + 3;
-    Type * const entryTy = ArrayType::get(sizeTy, numOfConsumers + 3);
-
-    Value * const traceLogArrayField = b.CreateGEP(traceDataTy, traceData, {ZERO, ZERO});
-    Value * entryArray = b.CreateAlignedLoad(entryTy->getPointerTo(), traceLogArrayField, PtrTyABIAlignment);
-
-    Value * const traceLogCountField = b.CreateGEP(traceDataTy, traceData, {ZERO, ONE});
-    Value * const traceIndex = b.CreateAlignedLoad(sizeTy, traceLogCountField, SizeTyABIAlignment);
-    Value * const traceCount = b.CreateAdd(traceIndex, b.getSize(1));
-
-    entryArray = b.CreateRealloc(entryTy, entryArray, traceCount);
-    b.CreateAlignedStore(entryArray, traceLogArrayField, PtrTyABIAlignment);
-    b.CreateAlignedStore(traceCount, traceLogCountField, SizeTyABIAlignment);
-
-    FixedArray<Value *, 2> indices;
-    indices[0] = traceIndex;
-
-    // segment num  0
-    indices[1] = ZERO;
-    b.CreateAlignedStore(mSegNo, b.CreateGEP(entryTy, entryArray, indices), SizeTyABIAlignment);
-    // new capacity 1
-    indices[1] = ONE;
-    b.CreateAlignedStore(buffer->getInternalCapacity(b), b.CreateGEP(entryTy, entryArray, indices), SizeTyABIAlignment);
-    // produced item count 2
-    indices[1] = TWO;
-    Value * const produced = mCurrentProducedItemCountPhi[outputPort];
-    b.CreateAlignedStore(produced, b.CreateGEP(entryTy, entryArray, indices), SizeTyABIAlignment);
-
-    // consumer processed item count [3,n)
-    if (LLVM_LIKELY(!bn.isReturned())) {
-        const auto id = getTruncatedStreamSetSourceId(streamSet);
-        assert (out_degree(id, mConsumerGraph) > 0);
-        Value * consumerDataPtr; Type * consumerTy;
-        std::tie(consumerDataPtr, consumerTy) = b.getScalarFieldPtr(CONSUMED_ITEM_COUNT_PREFIX + std::to_string(id));
-        Value * const processedPtr = b.CreateGEP(consumerTy, consumerDataPtr, { ZERO, ONE });
-        Value * const logPtr = b.CreateGEP(entryTy, entryArray, {traceIndex, THREE});
-        unsigned sizeTyWidth = b.getSizeTy()->getIntegerBitWidth() / 8;
-        Constant * const length = b.getSize(sizeTyWidth * (n - 3));
-        b.CreateMemCpy(logPtr, processedPtr, length, sizeTyWidth);
-    }
-
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief printOptionalBufferExpansionHistory
- ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::printOptionalBufferExpansionHistory(KernelBuilder & b) {
-
-    if (LLVM_UNLIKELY(mTraceDynamicBuffers)) {
-
-        // Print the title line
-        Function * Dprintf = b.GetDprintf();
-        FunctionType * fTy = Dprintf->getFunctionType();
-
-        size_t maxKernelLength = 0;
-        size_t maxBindingLength = 0;        
-        for (auto i = FirstKernel; i <= LastKernel; ++i) {
-            const Kernel * const kernel = getKernel(i);
-            maxKernelLength = std::max(maxKernelLength, kernel->getName().size());
-            for (const auto e : make_iterator_range(in_edges(i, mBufferGraph))) {
-                const BufferPort & binding = mBufferGraph[e];
-                const Binding & ref = binding.Binding;
-                maxBindingLength = std::max(maxBindingLength, ref.getName().length());
-            }
-            for (const auto e : make_iterator_range(out_edges(i, mBufferGraph))) {
-                const BufferPort & binding = mBufferGraph[e];
-                const Binding & ref = binding.Binding;
-                maxBindingLength = std::max(maxBindingLength, ref.getName().length());
-            }
-        }
-        if (LLVM_UNLIKELY(in_degree(PipelineOutput, mConsumerGraph) > 0)) {
-            maxKernelLength = std::max(maxKernelLength, mTarget->getName().size());
-        }
-
-        maxKernelLength += 4;
-        maxBindingLength += 4;
-
-        SmallVector<char, 160> buffer;
-        raw_svector_ostream format(buffer);
-
-        // TODO: if expanding buffers are supported again, we need another field here for streamset size
-
-        format << "BUFFER EXPANSION HISTORY:\n\n"
-                  "  # "  // kernel ID #  (only shown for first)
-                  "KERNEL"; // kernel Name (only shown for first)
-        format.indent(maxKernelLength - 6);
-        format << "PORT";
-        format.indent(5 + maxBindingLength - 4); // I/O Type (e.g., input port 3 = I3), Port Name
-        format << " BUFFER " // buffer ID #
-                  "        SEG # "
-                  "     ITEM CAPACITY\n";
-
-        Constant * const STDERR = b.getInt32(STDERR_FILENO);
-        FixedArray<Value *, 2> constantArgs;
-        constantArgs[0] = STDERR;
-        constantArgs[1] = b.GetString(format.str());
-        b.CreateCall(fTy, Dprintf, constantArgs);
-
-        const auto totalLength = 4 + maxKernelLength + 4 + maxBindingLength + 7 + 15 + 18 + 2;
-
-        // generate a single-line (-) bar
-        buffer.clear();
-        for (unsigned i = 0; i < totalLength; ++i) {
-            format.write('-');
-        }
-        format.write('\n');
-        Constant * const singleBar = b.GetString(format.str());
-        constantArgs[1] = singleBar;
-        b.CreateCall(fTy, Dprintf, constantArgs);
-
-
-        // generate the produced/processed title line
-        buffer.clear();
-        format.indent(totalLength - 19);
-        format << "PRODUCED/PROCESSED\n";
-        constantArgs[1] = b.GetString(format.str());
-        b.CreateCall(fTy, Dprintf, constantArgs);
-
-        // generate a double-line (=) bar
-        buffer.clear();
-        for (unsigned i = 0; i < totalLength; ++i) {
-            format.write('=');
-        }
-        format.write('\n');
-        Constant * const doubleBar = b.GetString(format.str());
-        constantArgs[1] = doubleBar;
-        b.CreateCall(fTy, Dprintf, constantArgs);
-
-        // Generate expansion line format string
-        buffer.clear();
-        format << "%3" PRIu32 " " // kernel #
-                  "%-" << maxKernelLength << "s" // kernel name
-                  "O%-3" PRIu32 " " // I/O type
-                  "%-" << maxBindingLength << "s" // port name
-                  "%7" PRIu32 // buffer ID #
-                  "%14" PRIu64 " " // segment #
-                  "%18" PRIu64 "\n"; // item capacity
-        Constant * const expansionFormat = b.GetString(format.str());
-
-        // Generate the item count history format string
-        buffer.clear();
-        format << "%3" PRIu32 " " // kernel #
-                  "%-" << maxKernelLength << "s" // kernel name
-                  "%c%-3" PRIu32 " " // I/O type
-                  "%-" << maxBindingLength << "s" // port name
-                  "%40" PRIu64 "\n"; // produced/processed item count
-        Constant * const itemCountFormat = b.GetString(format.str());
-
-        // Print each kernel line
-        FixedArray<Value *, 9> expansionArgs;
-        expansionArgs[0] = STDERR;
-        expansionArgs[1] = expansionFormat;
-
-        FixedArray<Value *, 8> itemCountArgs;
-        itemCountArgs[0] = STDERR;
-        itemCountArgs[1] = itemCountFormat;
-
-        Constant * const ZERO = b.getInt32(0);
-        Constant * const ONE = b.getInt32(1);
-        Constant * const TWO = b.getInt32(2);
-
-        Constant * const SZ_ZERO = b.getSize(0);
-        Constant * const SZ_ONE = b.getSize(1);
-
-        IntegerType * sizeTy = b.getSizeTy();
-
-        for (auto i = FirstKernel; i <= LastKernel; ++i) {
-
-            for (const auto output : make_iterator_range(out_edges(i, mBufferGraph))) {
-                const BufferPort & br = mBufferGraph[output];
-                const auto buffer = target(output, mBufferGraph);
-                const BufferNode & bn = mBufferGraph[buffer];
-                if (bn.Buffer->isDynamic()) {
-
-                    //  # KERNEL                      PORT                      BUFFER         SEG #      ITEM CAPACITY
-
-                    expansionArgs[2] = b.getInt32(i);
-                    expansionArgs[3] = b.GetString(getKernel(i)->getName());
-                    const auto outputPort = br.Port.Number;
-                    expansionArgs[4] = b.getInt32(outputPort);
-                    const Binding & binding = br.Binding;
-                    expansionArgs[5] = b.GetString(binding.getName());
-                    expansionArgs[6] = b.getInt32(buffer);
-
-                    const auto prefix = makeBufferName(i, br.Port);
-
-                    Value * traceData; Type * traceTy;
-                    std::tie(traceData, traceTy) = b.getScalarFieldPtr(prefix + STATISTICS_BUFFER_EXPANSION_SUFFIX);
-
-                    Value * const traceArrayField = b.CreateGEP(traceTy, traceData, {ZERO, ZERO});
-                    const auto numOfConsumers = std::max(out_degree(buffer, mConsumerGraph), 1UL);
-
-                    Type * const arrayTy = ArrayType::get(sizeTy, numOfConsumers + 3);
-                    Value * const entryArray = b.CreateAlignedLoad(arrayTy->getPointerTo(), traceArrayField, PtrTyABIAlignment);
-
-                    Value * const traceCountField = b.CreateGEP(traceTy, traceData, {ZERO, ONE});
-                    Value * const traceCount = b.CreateAlignedLoad(sizeTy, traceCountField, SizeTyABIAlignment);
-
-                    BasicBlock * const outputEntry = b.GetInsertBlock();
-                    BasicBlock * const outputLoop = b.CreateBasicBlock(prefix + "_bufferExpansionReportLoop");
-                    BasicBlock * const writeItemCount = b.CreateBasicBlock(prefix + "_bufferWriteItemCountLoop");
-
-                    BasicBlock * const nextEntry = b.CreateBasicBlock(prefix + "_bufferWriteItemCountLoop");
-
-                    BasicBlock * const outputExit = b.CreateBasicBlock(prefix + "_bufferExpansionReportExit");
-
-                    b.CreateBr(outputLoop);
-
-                    b.SetInsertPoint(outputLoop);
-                    PHINode * const index = b.CreatePHI(b.getSizeTy(), 2);
-                    index->addIncoming(SZ_ZERO, outputEntry);
-
-                    Value * const isFirst = b.CreateICmpEQ(index, SZ_ZERO);
-                    Value * const nextIndex = b.CreateAdd(index, SZ_ONE);
-                    Value * const isLast = b.CreateICmpEQ(nextIndex, traceCount);
-                    Value * const onlyEntry = b.CreateICmpEQ(traceCount, SZ_ONE);
-
-                    Value * const openingBar = b.CreateSelect(onlyEntry, doubleBar, singleBar);
-
-                    Value * const segmentNumField = b.CreateGEP(arrayTy, entryArray, {index, ZERO});
-                    Value * const segmentNum = b.CreateAlignedLoad(sizeTy, segmentNumField, SizeTyABIAlignment);
-                    expansionArgs[7] = segmentNum;
-
-                    Value * const newBufferSizeField = b.CreateGEP(arrayTy, entryArray, {index, ONE});
-                    Value * const newBufferSize = b.CreateAlignedLoad(sizeTy, newBufferSizeField, SizeTyABIAlignment);
-                    expansionArgs[8] = newBufferSize;
-
-                    b.CreateCall(fTy, Dprintf, expansionArgs);
-
-                    constantArgs[1] = openingBar;
-
-                    b.CreateCall(fTy, Dprintf, constantArgs);
-
-                    b.CreateCondBr(isFirst, nextEntry, writeItemCount);
-
-                    // Do not write processed/produced item counts for the first entry as they
-                    // are guaranteed to be 0 and only add noise to the log output.
-                    b.SetInsertPoint(writeItemCount);
-
-                    // --------------------------------------------------------------------------------------------------
-
-                    //  # KERNEL                      PORT                                           PRODUCED/PROCESSED
-
-                    itemCountArgs[2] = expansionArgs[2];
-                    itemCountArgs[3] = expansionArgs[3];
-                    itemCountArgs[4] = b.getInt8('O');
-                    itemCountArgs[5] = expansionArgs[4];
-                    itemCountArgs[6] = expansionArgs[5];
-                    Value * const producedField = b.CreateGEP(arrayTy, entryArray, {index, TWO});
-                    itemCountArgs[7] = b.CreateAlignedLoad(sizeTy, producedField, SizeTyABIAlignment);
-
-                    b.CreateCall(fTy, Dprintf, itemCountArgs);
-                    itemCountArgs[4] = b.getInt8('I');
-                    for (const auto e : make_iterator_range(out_edges(buffer, mConsumerGraph))) {
-                        const ConsumerEdge & c = mConsumerGraph[e];
-                        const auto consumer = target(e, mConsumerGraph);
-                        if (LLVM_UNLIKELY(consumer == PipelineOutput)) {
-                            itemCountArgs[2] = b.getInt32(PipelineInput);
-                            itemCountArgs[3] = b.GetString(mTarget->getName());
-                            itemCountArgs[5] = b.getInt32(0);
-                            itemCountArgs[6] = b.GetString("");
-                        } else {
-                            itemCountArgs[2] = b.getInt32(consumer);
-                            itemCountArgs[3] = b.GetString(getKernel(consumer)->getName());
-                            itemCountArgs[5] = b.getInt32(c.Port);
-                            const Binding & binding = getBinding(consumer, StreamSetPort{PortType::Input, c.Port});
-                            itemCountArgs[6] = b.GetString(binding.getName());
-                        }
-                        Value * const processedField = b.CreateGEP(arrayTy, entryArray, {index, b.getInt32(c.Index + 2)});
-                        itemCountArgs[7] = b.CreateAlignedLoad(sizeTy, processedField, SizeTyABIAlignment);
-                        b.CreateCall(fTy, Dprintf, itemCountArgs);
-                    }
-
-                    Value * const closingBar = b.CreateSelect(isLast, doubleBar, singleBar);
-                    constantArgs[1] = closingBar;
-                    b.CreateCall(fTy, Dprintf, constantArgs);
-
-                    b.CreateBr(nextEntry);
-
-                    b.SetInsertPoint(nextEntry);
-                    index->addIncoming(nextIndex, nextEntry);
-                    b.CreateCondBr(isLast, outputExit, outputLoop);
-
-                    b.SetInsertPoint(outputExit);
-                    b.CreateFree(entryArray);
-                }
-            }
-        }
-        // print final new line
-        constantArgs[1] = doubleBar;
-        b.CreateCall(fTy, Dprintf, constantArgs);
-    }
-
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

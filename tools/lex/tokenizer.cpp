@@ -504,12 +504,11 @@ using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 
 // make a new function here 
-void whiteSpaceLogic (PipelineBuilder & P, StreamSet * BasisBits , StreamSet * u8index, StreamSet * results) {
+void whiteSpaceLogic (PipelineBuilder & P, StreamSet * U21Basis, StreamSet * results) {
         
     re::RE * rule1 = re::generateRE_TokenizerRule(re::WhitespaceBoundary);
     RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
-    ctxt.setIndexingContext(&cc::Unicode, u8index);
+    ctxt.setCodeUnitContext(&cc::Unicode, U21Basis);
     RE_PipelineBuilder RE_PB(P, ctxt);
     RE_PB.matchSearchPipeline(rule1, results);
 
@@ -541,8 +540,7 @@ StreamSet* buildREBasedTokenizer(
     PipelineBuilder& P,
     const std::string& prefixName,  // unique identifier for this tokenizer e.g., "PC", "WS"
     re::RE* rule,                  // the regex pattern to use
-    StreamSet* BasisBits,          // the basis bits representing the input characters
-    StreamSet* u8index             // UTF-8 character boundary index for correct token boundary alignment
+    StreamSet* U21Basis          // the basis bits representing the input characters
 ) {
     if (!rule) {
         llvm::errs() << "Error: null RE rule for " << prefixName << "\n";
@@ -552,8 +550,7 @@ StreamSet* buildREBasedTokenizer(
     StreamSet* WordBoundaries = P.CreateStreamSet(1, 1);
     
     RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
-    ctxt.setIndexingContext(&cc::Unicode, u8index);
+    ctxt.setCodeUnitContext(&cc::Unicode, U21Basis);
     RE_PipelineBuilder RE_PB(P, ctxt);
     RE_PB.matchSearchPipeline(rule, WordBoundaries);
     
@@ -564,7 +561,7 @@ StreamSet* buildREBasedTokenizer(
 // Struct to hold tokenizer configuration
 struct TokenizerConfig {
     re::RE_TokenizerKind kind;   // Enum value from boundaries.h
-    std::string prefix;  // Prefix for multiplexed alphabet (e.g., "PC", "WS")
+    std::string prefix;  // Prefix for multiplexed alphabet (e.g., "PC", "WS")git cd
 };
 
 // Single map combining both pieces of information
@@ -596,42 +593,50 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
     SHOW_STREAM(u8index);
-    
+
+    // UTF-8 to U21 Conversion Pipeline
+    // Creating U21 codepoint stream from UTF-8 basis bits (U21 Codepoint Generation)
+    StreamSet * U21_u8indexed = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21_u8indexed);
+
+    // filter by mask with UTF-8 index stream ?
+    SHOW_BIXNUM(U21_u8indexed);
+
+    StreamSet * U21codepoints = P.CreateStreamSet(21, 1);
+    FilterByMask(P, u8index, U21_u8indexed, U21codepoints);
+    SHOW_BIXNUM(U21codepoints); 
+
     // Unicode Word Boundary Rules
     StreamSet * WordBoundaries = nullptr;
 
     // Special case: simpleWordBoundaries uses different kernel pipeline
     if(PreTokenizer == simpleWordBoundaries){
         // Use simple word boundaries based on Unicode "word" property
+        auto wb = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "word");
         WordBoundaries = P.CreateStreamSet(1, 1);
-        re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
-        wordProp = UCD::linkAndResolve(wordProp);
-        re::Name * word = re::makeName("word");
-        word->setDefinition(wordProp);
-        StreamSet * WordStream = P.CreateStreamSet(1);
-        P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, BasisBits, WordStream);
-        P.CreateKernelCall<BoundaryKernel>(WordStream, u8index, WordBoundaries);
+        UnicodePropertyLogic(P, wb, U21codepoints, nullptr, WordBoundaries);
     }
     // whitespace uses separate whiteSpaceLogic function
     else if (PreTokenizer == whitespace){
         WordBoundaries = P.CreateStreamSet(1, 1);
-        whiteSpaceLogic(P, BasisBits, u8index, WordBoundaries);
+        whiteSpaceLogic(P, U21codepoints, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
     // composite tokenizer (OR of two RE rules)
     else if (PreTokenizer == sequence_whitespace_punctuation) {
         // Composite tokenizer: whitespace + punctuation combined with OR
         StreamSet * preTokenStrm1 = P.CreateStreamSet(1, 1);
-        whiteSpaceLogic(P, BasisBits, u8index, preTokenStrm1);
+        whiteSpaceLogic(P, U21codepoints, WordBoundaries);
        
         StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "PC", 
-            re::generateRE_TokenizerRule(re::PunctuationBoundary), BasisBits, u8index);
+            re::generateRE_TokenizerRule(re::PunctuationBoundary), U21codepoints);
         // Combine boundaries (OR operation)
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<OrKernel>(preTokenStrm1, preTokenStrm2, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
     else if (PreTokenizer == chardelimiter) {
+        //TODO: Fix this to work with 21 basis bits of Unicode.
         // Detect positions of the delimiter character in raw bytes (BasisBits space)
         uint32_t delimCP = DelimiterString.empty() ? (uint32_t)',' : (uint32_t)(unsigned char)DelimiterString[0];
         StreamSet * CharDelimStream = P.CreateStreamSet(1, 1);
@@ -649,33 +654,17 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
             // Found in map: call the generator function and build pipeline
             re::RE* rule = generateRE_TokenizerRule(it->second.kind);  // Call enum depatcher to get the appropriate RE rule
             WordBoundaries = buildREBasedTokenizer(P, it->second.prefix, 
-                                                   rule, BasisBits, u8index);
+                                                   rule, U21codepoints);
         } else {
             // Default fallback: UAX#29 word boundaries
-            re::RE* rule = re::generateWordBoundaryRule();
-            WordBoundaries = buildREBasedTokenizer(P, "WB", rule, BasisBits, u8index);
+            WordBoundaries = P.CreateStreamSet(1);
+            auto wbProp = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "w");
+            wbProp = cast<re::PropertyExpression>(UCD::linkAndResolve(wbProp));     
+            UnicodePropertyLogic(P, wbProp, U21codepoints, nullptr, WordBoundaries);
         }
     }
-    // UTF-8 - ensure boundaries only at UTF-8 character starts
-    StreamSet * TokenBoundaries = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<AndKernel>(WordBoundaries, u8index, TokenBoundaries);
-    SHOW_STREAM(TokenBoundaries);
    
-    // UTF-8 to U21 Conversion Pipeline
-   // Creating U21 codepoint stream from UTF-8 basis bits (U21 Codepoint Generation)
-    StreamSet * U21_u8indexed = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21_u8indexed);
-
-    // filter by mask with UTF-8 index stream ?
-    SHOW_BIXNUM(U21_u8indexed);
-
-    StreamSet * U21codepoints = P.CreateStreamSet(21, 1);
-    FilterByMask(P, u8index, U21_u8indexed, U21codepoints);
-    SHOW_BIXNUM(U21codepoints); 
-
-    StreamSet * U21_tokenBoundaries = P.CreateStreamSet(1);
-    FilterByMask(P, u8index, TokenBoundaries, U21_tokenBoundaries);
-    SHOW_STREAM(U21_tokenBoundaries);
+    StreamSet * U21_tokenBoundaries = WordBoundaries;
     
     // Detect alphanumeric positions using Unicode properties (Letter, Mark, Number)
     // L* categories: Letter (uppercase, lowercase, titlecase, modifier, other)
@@ -684,23 +673,19 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Unicode Properties Created from U21 codepoint stream
     // Create Letter property stream using Unicode general category 'Letter' 
     // Detects all Unicode letter characters (Lu, Ll, Lt, Lm, Lo)
-    re::RE * letterProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Letter");
-    letterProp = UCD::linkAndResolve(letterProp);
-    re::Name * letterName = re::makeName("Letter");
-    letterName->setDefinition(letterProp);
+    auto letterProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Letter");
+    letterProp = cast<re::PropertyExpression>(UCD::linkAndResolve(letterProp));
     StreamSet * LetterStream = P.CreateStreamSet(1);
-    P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterName, U21codepoints, LetterStream);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterProp, U21codepoints, LetterStream);
     SHOW_STREAM(LetterStream);
 
     // Create Number property stream using Unicode general category 'Number'
     // Detects all Unicode number characters (Nd, Nl, No)
     // Nd: Decimal digit numbers, Nl: Letter numbers, No: Other numbers
-    re::RE * numberProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Number");
-    numberProp = UCD::linkAndResolve(numberProp);
-    re::Name * numberName = re::makeName("Number");
-    numberName->setDefinition(numberProp);
+    auto numberProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Number");
+    numberProp = cast<re::PropertyExpression>(UCD::linkAndResolve(numberProp));
     StreamSet * NumberStream = P.CreateStreamSet(1);
-    P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberName, U21codepoints, NumberStream);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberProp, U21codepoints, NumberStream);
     SHOW_STREAM(NumberStream);
 
     // Create Punctuation property stream using Unicode general category 'Punctuation'
@@ -709,12 +694,10 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Ps: Open punctuation ( (, {, [ ), Pe: Close punctuation ( ), }, ] )
     // Pi: Initial quote punctuation (‘, “), Pf: Final quote punctuation (’, ”)
     // Po: Other punctuation (!, ?, ., , , ;, :, etc.)
-    re::RE * punctuationProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Punctuation");
-    punctuationProp = UCD::linkAndResolve(punctuationProp);
-    re::Name * punctuationName = re::makeName("Punctuation");
-    punctuationName->setDefinition(punctuationProp);
+    auto punctuationProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Punctuation");
+    punctuationProp = cast<re::PropertyExpression>(UCD::linkAndResolve(punctuationProp));
     StreamSet * PunctuationStream = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UnicodePropertyKernelBuilder>(punctuationName, U21codepoints, PunctuationStream);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(punctuationProp, U21codepoints, PunctuationStream);
     SHOW_STREAM(PunctuationStream);
 
     // Combine Letter and Number properties to detect alphanumeric characters

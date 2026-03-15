@@ -614,7 +614,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         // Use simple word boundaries based on Unicode "word" property
         auto wb = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "word");
         WordBoundaries = P.CreateStreamSet(1, 1);
-        UnicodePropertyLogic(P, wb, U21codepoints, nullptr, WordBoundaries);
+        UnicodePropertyLogic(P, wb, U21codepoints, WordBoundaries);
     }
     // whitespace uses separate whiteSpaceLogic function
     else if (PreTokenizer == whitespace){
@@ -660,7 +660,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
             WordBoundaries = P.CreateStreamSet(1);
             auto wbProp = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "w");
             wbProp = cast<re::PropertyExpression>(UCD::linkAndResolve(wbProp));     
-            UnicodePropertyLogic(P, wbProp, U21codepoints, nullptr, WordBoundaries);
+            UnicodePropertyLogic(P, wbProp, U21codepoints, WordBoundaries);
         }
     }
    

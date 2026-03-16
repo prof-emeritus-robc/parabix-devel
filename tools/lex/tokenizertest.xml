@@ -1,141 +1,129 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   tokenizertest.xml - Simple test for tokenizer pretokenizer functionality
-  
+
   Test format:
   <tokenizertest>
     <inputdata id="test_name">
       raw text input to tokenize
     </inputdata>
-    
-    <tokenizercase inputdata="test_name" 
+
+    <tokenizercase inputdata="test_name"
              pretokenizer="uax29|whitespace|whitespacesplit|digits|punctuation|simplewordboundaries|bytelevel|chardelimiter|bert|sequence_whitespace_punctuation"
                    expectedcount="N"/>
   </tokenizertest>
+
+  Single shared input: "Hello, world! abc123def, test-case 42."
+    - Multiple words with spaces                  (whitespace / uax29 tests)
+    - Comma and exclamation punctuation           (punctuation / chardelimiter / bert)
+    - Digits mixed with letters: abc123def        (digits test)
+    - Hyphen within word: test-case               (word-boundary edge case)
+    - Two commas as delimiters                    (chardelimiter gives 3 segments)
 -->
 
 <tokenizertest>
 
-  <!-- ========== PRETOKENIZER TESTS - ONE PER MODE ========== -->
-
-  <!-- UAX29: Unicode word boundaries (default) -->
-  <inputdata id="simple_words">
-hello world test
+  <!-- Shared input for all tests -->
+  <inputdata id="test_input">
+Hello, world! abc123def, test-case 42.
   </inputdata>
-  <tokenizercase inputdata="simple_words" 
+
+  <!-- ========== PRETOKENIZER TESTS ========== -->
+
+  <!-- UAX29: Unicode word boundaries, isolated behavior (default)
+       Hello | , | [sp] | world | ! | [sp] | abc123def | , | [sp] | test | - | case | [sp] | 42 | . -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="uax29"
+                 expectedcount="15"/>
+
+  <!-- Whitespace: \w++ | [^\w\s]++ pattern, forced removed behavior
+       Hello | , | world | ! | abc123def | , | test | - | case | 42 | . -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="whitespace"
+                 expectedcount="11"/>
+
+  <!-- WhitespaceSplit: non-space runs, forced removed behavior
+       Hello, | world! | abc123def, | test-case | 42. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="whitespacesplit"
                  expectedcount="5"/>
 
-  <!-- Whitespace: Split on space characters -->
-  <inputdata id="white_space">
-hello there this
-  </inputdata>
-  <tokenizercase inputdata="white_space" 
-                 pretokenizer="whitespace" 
-                 expectedcount="3"/>
+  <!-- Punctuation: each punct char or non-punct run, isolated behavior
+       Hello | , | [sp]world | ! | [sp]abc123def | , | [sp]test | - | case | [sp]42 | . -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="punctuation"
+                 expectedcount="11"/>
 
-  <!-- WhitespaceSplit: Keep punctuation attached to words -->
-  <inputdata id="wss_text">
-hello world
-  </inputdata>
-  <tokenizercase inputdata="wss_text" 
-                 pretokenizer="whitespacesplit" 
-                 expectedcount="2"/>
+  <!-- Digits: digit run | non-digit-non-space run | space run, isolated behavior
+       Hello, | [sp] | world! | [sp] | abc | 123 | def, | [sp] | test-case | [sp] | 42 | . -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="digits"
+                 expectedcount="12"/>
 
-  <!-- Punctuation: Split on punctuation characters -->
-  <inputdata id="punct_text">
-hello, world!
-  </inputdata>
-  <tokenizercase inputdata="punct_text" 
-                 pretokenizer="punctuation" 
-                 expectedcount="4"/>
-
-  <!-- Digits: Split on digit sequences -->
-  <inputdata id="digit_text">
-abc123def
-  </inputdata>
-  <tokenizercase inputdata="digit_text" 
-                 pretokenizer="digits" 
-                 expectedcount="3"/>
-
-  <!-- SimpleWordBoundaries: Based on Unicode alphanumeric -->
-  <inputdata id="simple_test">
-hello world
-  </inputdata>
-  <tokenizercase inputdata="simple_test"
+  <!-- SimpleWordBoundaries: Unicode word property boundary, isolated behavior -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="simplewordboundaries"
-                 expectedcount="2"/>
+                 expectedcount="15"/>
 
-  <!-- ByteLevel: Split on whitespace with byte remapping -->
-  <!-- <inputdata id="byte_text">
-hello world
-  </inputdata>
-  <tokenizercase inputdata="byte_text"
+  <!-- ByteLevel: space/non-space runs, forced removed behavior
+       Hello, | world! | abc123def, | test-case | 42. -->
+  <!-- <tokenizercase inputdata="test_input"
                  pretokenizer="bytelevel"
-                 expectedcount="2"/> -->
+                 expectedcount="5"/> -->
 
-  <!-- CharDelimiter: Split on specific character delimiter -->
-  <!-- <inputdata id="char_delim_text">
-hello world
-  </inputdata>
-  <tokenizercase inputdata="char_delim_text"
+  <!-- CharDelimiter: split on ',' (default), forced removed behavior
+       Two commas produce 3 segments: Hello | [sp]world! abc123def | [sp]test-case 42. -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="chardelimiter"
-                 expectedcount="2"/> -->
+                 expectedcount="3"/>
 
-  <!-- BERT: Separates punctuation and words -->
-  <!-- <inputdata id="bert_text">
-hello, world!
-  </inputdata>
-  <tokenizercase inputdata="bert_text"
+  <!-- BERT: \w++ | [^\w\s]++ pattern, forced removed behavior
+       Hello | , | world | ! | abc123def | , | test | - | case | 42 | . -->
+  <!-- <tokenizercase inputdata="test_input"
                  pretokenizer="bert"
-                 expectedcount="3"/> -->
+                 expectedcount="11"/> -->
 
-  <!-- SeqWhitespacePunctuation: Whitespace + Punctuation combined -->
-  <inputdata id="seq_text">
-hello, world!
-  </inputdata>
-  <tokenizercase inputdata="seq_text"
+  <!-- SeqWhitespacePunctuation: \w++ | [^\w\s]++ pattern, forced removed behavior
+       Hello | , | world | ! | abc123def | , | test | - | case | 42 | . -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="sequence_whitespace_punctuation"
-                 expectedcount="4"/>
+                 expectedcount="11"/>
 
-  <!-- ========== BEHAVIOR TESTS - ONE PER MODE ========== -->
-  <!-- All behavior tests use UAX29 pretokenizer (respects behavior flag) -->
+  <!-- ========== BEHAVIOR TESTS (all use uax29 pretokenizer) ========== -->
 
-  <inputdata id="behavior_test">
-hello world
-  </inputdata>
-
-  <!-- Behavior: removed - exclude whitespace -->
-  <tokenizercase inputdata="behavior_test" 
+  <!-- Behavior: removed - delete whitespace, exclude space boundaries
+       Hello | , | world | ! | abc123def | , | test | - | case | 42 | . -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="uax29"
                  behavior="removed"
-                 expectedcount="2"/>
+                 expectedcount="11"/>
 
-  <!-- Behavior: isolated - add space boundaries -->
-  <tokenizercase inputdata="behavior_test"
+  <!-- Behavior: isolated - spaces appear as their own tokens (same as uax29 default)
+       Hello | , | [sp] | world | ! | [sp] | abc123def | , | [sp] | test | - | case | [sp] | 42 | . -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="uax29"
                  behavior="isolated"
-                 expectedcount="3"/>
+                 expectedcount="15"/>
 
-  <!-- Behavior: mergedwithprevious - attach space to previous word -->
-  <tokenizercase inputdata="behavior_test"
+  <!-- Behavior: mergedwithprevious - trailing space merged into preceding token
+       Hello | , [sp] | world | ! [sp] | abc123def | , [sp] | test | - | case [sp] | 42 | . -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="uax29"
                  behavior="mergedwithprevious"
-                 expectedcount="2"/>
+                 expectedcount="11"/>
 
-  <!-- Behavior: mergedwithnext - attach space to next word -->
-  <tokenizercase inputdata="behavior_test"
+  <!-- Behavior: mergedwithnext - leading space merged into following token
+       Hello | , | [sp]world | ! | [sp]abc123def | , | [sp]test | - | case | [sp]42 | . -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="uax29"
                  behavior="mergedwithnext"
-                 expectedcount="2"/>
+                 expectedcount="11"/>
 
-  <!-- Behavior: contiguous - keep punctuation with words -->
-  <inputdata id="contiguous_test">
-hello, world
-  </inputdata>
-  <tokenizercase inputdata="contiguous_test"
+  <!-- Behavior: contiguous - punct attached to adjacent alphanumeric, spaces isolated
+       Hello, | [sp] | world! | [sp] | abc123def, | [sp] | test- | case | [sp] | 42. -->
+  <tokenizercase inputdata="test_input"
                  pretokenizer="uax29"
                  behavior="contiguous"
-                 expectedcount="3"/>
+                 expectedcount="10"/>
 
 </tokenizertest>

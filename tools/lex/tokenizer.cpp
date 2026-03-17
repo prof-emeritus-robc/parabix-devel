@@ -612,6 +612,15 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     // Unicode Word Boundary Rules
     StreamSet * WordBoundaries = nullptr;
 
+    // Create Number property stream using Unicode general category 'Number'
+    // Detects all Unicode number characters (Nd, Nl, No)
+    // Nd: Decimal digit numbers, Nl: Letter numbers, No: Other numbers
+    auto numberProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Number");
+    numberProp = cast<re::PropertyExpression>(UCD::linkAndResolve(numberProp));
+    StreamSet * NumberStream = P.CreateStreamSet(1);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberProp, U21codepoints, NumberStream);
+    SHOW_STREAM(NumberStream);
+
     // Special case: simpleWordBoundaries uses different kernel pipeline
     if(PreTokenizer == simpleWordBoundaries){
         // Use simple word boundaries based on Unicode "word" property
@@ -654,6 +663,11 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<BoundaryKernel>(CharDelimStream, u8index, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
+        
+    }
+    else if (PreTokenizer == digits) {
+        WordBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<SplitMarksToTokens>(isolated, NumberStream, WordBoundaries);
     }
     else {
         // Standard RE-based tokenizers - use lookup table
@@ -688,15 +702,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterProp, U21codepoints, LetterStream);
     SHOW_STREAM(LetterStream);
 
-    // Create Number property stream using Unicode general category 'Number'
-    // Detects all Unicode number characters (Nd, Nl, No)
-    // Nd: Decimal digit numbers, Nl: Letter numbers, No: Other numbers
-    auto numberProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Number");
-    numberProp = cast<re::PropertyExpression>(UCD::linkAndResolve(numberProp));
-    StreamSet * NumberStream = P.CreateStreamSet(1);
-    P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberProp, U21codepoints, NumberStream);
-    SHOW_STREAM(NumberStream);
-
     // Create Punctuation property stream using Unicode general category 'Punctuation'
     // Detects all Unicode punctuation characters (Pc, Pd, Ps, Pe, Pi, Pf, Po)
     // Pc: Connector punctuation (_, ‿), Pd: Dash punctuation (-, –, —)
@@ -716,13 +721,13 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 
     // For chardelimiter: treat the delimiter character as the "split char" everywhere
     // WhitespaceMask is used in removed behavior to remove split chars from output.
-    if (PreTokenizer == chardelimiter) {
-        uint32_t delimCP = DelimiterString.empty() ? (uint32_t)',' : (uint32_t)(unsigned char)DelimiterString[0];
-        StreamSet * DelimMask = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<CharDelimiterKernel>(U21codepoints, DelimMask, delimCP);
-        WhitespaceMask = DelimMask;
-        SHOW_STREAM(WhitespaceMask);
-    }
+    // if (PreTokenizer == chardelimiter) {
+    //     uint32_t delimCP = DelimiterString.empty() ? (uint32_t)',' : (uint32_t)(unsigned char)DelimiterString[0];
+    //     StreamSet * DelimMask = P.CreateStreamSet(1, 1);
+    //     P.CreateKernelCall<CharDelimiterKernel>(U21codepoints, DelimMask, delimCP);
+    //     WhitespaceMask = DelimMask;
+    //     SHOW_STREAM(WhitespaceMask);
+    // }
 
     // Apply behavior transformation using appropriate kernel
     StreamSet * TransformedBoundaries = P.CreateStreamSet(1, 1);
@@ -749,7 +754,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         P.CreateKernelCall<NotKernel>(WhitespaceMask, notWhitespaceMask);
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWhitespaceMask, insertionBoundaries);
-    } else if (effectiveBehavior == isolated) {
+    } else if (effectiveBehavior == isolated && PreTokenizer != digits) {
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
     } else if (effectiveBehavior == mergedwithprevious) {

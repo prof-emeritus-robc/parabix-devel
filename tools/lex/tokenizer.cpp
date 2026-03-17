@@ -504,14 +504,17 @@ using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 
 // make a new function here 
-void whiteSpaceLogic (PipelineBuilder & P, StreamSet * U21Basis, StreamSet * results) {
+void whiteSpaceLogic (PipelineBuilder & P, StreamSet * U21Basis, StreamSet * WSmask, StreamSet * results) {
         
     re::RE * rule1 = re::generateRE_TokenizerRule(re::WhitespaceBoundary);
     RE_CompilerContext ctxt;
     ctxt.setCodeUnitContext(&cc::Unicode, U21Basis);
     RE_PipelineBuilder RE_PB(P, ctxt);
-    RE_PB.matchSearchPipeline(rule1, results);
-
+    StreamSet * wsb = P.CreateStreamSet(1);
+    RE_PB.matchSearchPipeline(rule1, wsb);
+    StreamSet * wsFollows = P.CreateStreamSet(1);
+    P.CreateKernelCall<SplitMarksToTokens>(removed, WSmask, wsFollows);
+    P.CreateKernelCall<OrKernel>(wsFollows, wsb, results);
     SHOW_STREAM(results);
 };
 
@@ -616,17 +619,23 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         WordBoundaries = P.CreateStreamSet(1, 1);
         UnicodePropertyLogic(P, wb, U21codepoints, WordBoundaries);
     }
+    // Detect whitespace/delimiter positions BEFORE spreading/inserting
+    // This ensures alignment with U21_tokenBoundaries
+    StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
+    SHOW_STREAM(WhitespaceMask);
+
     // whitespace uses separate whiteSpaceLogic function
     else if (PreTokenizer == whitespace){
         WordBoundaries = P.CreateStreamSet(1, 1);
-        whiteSpaceLogic(P, U21codepoints, WordBoundaries);
+        whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
     // composite tokenizer (OR of two RE rules)
     else if (PreTokenizer == sequence_whitespace_punctuation) {
         // Composite tokenizer: whitespace + punctuation combined with OR
         StreamSet * preTokenStrm1 = P.CreateStreamSet(1, 1);
-        whiteSpaceLogic(P, U21codepoints, WordBoundaries);
+        whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
        
         StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "PC", 
             re::generateRE_TokenizerRule(re::PunctuationBoundary), U21codepoints);
@@ -704,12 +713,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * AlphanumericMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UnicodeAlphanumericDetector>(U21codepoints, AlphanumericMask, LetterStream, NumberStream);
     SHOW_STREAM(AlphanumericMask);
-
-    // Detect whitespace/delimiter positions BEFORE spreading/inserting
-    // This ensures alignment with U21_tokenBoundaries
-    StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
-    SHOW_STREAM(WhitespaceMask);
 
     // For chardelimiter: treat the delimiter character as the "split char" everywhere
     // WhitespaceMask is used in removed behavior to remove split chars from output.

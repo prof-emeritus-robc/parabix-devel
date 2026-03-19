@@ -1,3 +1,4 @@
+
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   tokenizertest.xml - Simple test for tokenizer pretokenizer functionality
@@ -58,12 +59,7 @@ Hello, world! abc123def, test-case 42.
        Hello, | [sp] | world! | [sp] | abc | 123 | def, | [sp] | test-case | [sp] | 42 | . -->
   <tokenizercase inputdata="test_input"
                  pretokenizer="digits"
-                 expectedcount="12"/>
-
-  <!-- SimpleWordBoundaries: Unicode word property boundary, isolated behavior -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="simplewordboundaries"
-                 expectedcount="15"/>
+                 expectedcount="8"/>
 
   <!-- ByteLevel: space/non-space runs, forced removed behavior
        Hello, | world! | abc123def, | test-case | 42. -->

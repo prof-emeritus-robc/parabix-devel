@@ -429,7 +429,6 @@ RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj) {
     return makeAlt(alts.begin(), alts.end());
 }
 
-
 const static std::map<RE_TokenizerKind, std::string> PreTokenizerPatterns =
 
     {{GPT2R50K, R"GPT('(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s++$|\s+(?!\S)|\s)GPT"},
@@ -440,7 +439,6 @@ const static std::map<RE_TokenizerKind, std::string> PreTokenizerPatterns =
         {ByteLevelBoundary, R"(\s++|\S++)"},
         {BertPreTokenizer, R"(\w++|[^\w\s]++)"},
         {SequenceWhitespacePunctuation, R"(\w++|[^\w\s]++)"}};
-
 
 RE * generateRE_TokenizerRule(RE_TokenizerKind k) {
     auto f = PreTokenizerPatterns.find(k);

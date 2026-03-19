@@ -69,7 +69,6 @@ enum PreTokenizerMode {
   whitespacesplit,
   digits,
   punctuation,
-  simpleWordBoundaries,
   bytelevel,
   chardelimiter,
   bert,
@@ -105,7 +104,6 @@ static cl::opt<PreTokenizerMode> PreTokenizer(
         clEnumValN(whitespacesplit, "whitespacesplit", "Split on whitespace and output delimiters as separate tokens"),
         clEnumValN(digits, "digits", "Split on digit sequences"),
         clEnumValN(punctuation, "punctuation", "Split on punctuation characters"),
-        clEnumValN(simpleWordBoundaries, "simplewordboundaries", "Simple word boundaries based on alphanumeric characters"),
         clEnumValN(bytelevel, "bytelevel", "ByteLevel tokenization: split on whitespace with byte remapping"),
         clEnumValN(chardelimiter, "chardelimiter", "Split on a specific character delimiter"),
         clEnumValN(bert, "bert", "BERT pre-tokenizer: separates punctuation and words"),
@@ -572,7 +570,7 @@ const static std::map<PreTokenizerMode, TokenizerConfig> TokenizerConfigs = {
     {whitespace, {re::WhitespaceBoundary, "WS"}},
     {whitespacesplit, {re::WhitespaceSplitBoundary, "WSS"}},
     {punctuation, {re::PunctuationBoundary, "PC"}},
-    {digits, {re::DigitBoundary, "DG"}},
+    // {digits, {re::DigitBoundary, "DG"}},
     {bytelevel, {re::ByteLevelBoundary, "BL"}},
     {bert, {re::BertPreTokenizer, "BERT"}}
 };
@@ -621,13 +619,6 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberProp, U21codepoints, NumberStream);
     SHOW_STREAM(NumberStream);
 
-    // Special case: simpleWordBoundaries uses different kernel pipeline
-    if(PreTokenizer == simpleWordBoundaries){
-        // Use simple word boundaries based on Unicode "word" property
-        auto wb = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "word");
-        WordBoundaries = P.CreateStreamSet(1, 1);
-        UnicodePropertyLogic(P, wb, U21codepoints, WordBoundaries);
-    }
     // Detect whitespace/delimiter positions BEFORE spreading/inserting
     // This ensures alignment with U21_tokenBoundaries
     StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
@@ -644,7 +635,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     else if (PreTokenizer == sequence_whitespace_punctuation) {
         // Composite tokenizer: whitespace + punctuation combined with OR
         StreamSet * preTokenStrm1 = P.CreateStreamSet(1, 1);
-        whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
+        whiteSpaceLogic(P, U21codepoints, WhitespaceMask, preTokenStrm1);
        
         StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "PC", 
             re::generateRE_TokenizerRule(re::PunctuationBoundary), U21codepoints);

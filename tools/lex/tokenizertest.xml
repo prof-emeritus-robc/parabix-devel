@@ -28,13 +28,23 @@
 Hello, world! abc123def, test-case 42.
   </inputdata>
 
+  <inputdata id="test_input2">
+Hello, world! abc123def, shouldn't test-case 42.
+  </inputdata>
+
   <!-- ========== PRETOKENIZER TESTS ========== -->
 
   <!-- UAX29: Unicode word boundaries, isolated behavior (default)
-       Hello | , | [sp] | world | ! | [sp] | abc123def | , | [sp] | test | - | case | [sp] | 42 | . -->
-  <tokenizercase inputdata="test_input"
+       Hello | , | [sp] | world | ! | [sp] | abc123def | , | [sp] | shouldn't | [sp] | test | - | case | [sp] | 42 | . -->
+  <tokenizercase inputdata="test_input2"
                  pretokenizer="uax29"
-                 expectedcount="15"/>
+                 expectedcount="17"/>
+
+  <!-- simple word boundaries, isolated behavior (default)
+       Hello | , | [sp] | world | ! | [sp] | abc123def | , | [sp] | shouldn | ' | t | [sp] | test | - | case | [sp] | 42 | . -->
+  <tokenizercase inputdata="test_input2"
+                 pretokenizer="simplewordboundaries"
+                 expectedcount="19"/>
 
   <!-- Whitespace: \w++ | [^\w\s]++ pattern, forced removed behavior
        Hello | , | world | ! | abc123def | , | test | - | case | 42 | . -->

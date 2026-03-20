@@ -69,6 +69,7 @@ enum PreTokenizerMode {
   whitespacesplit,
   digits,
   punctuation,
+  simpleWordBoundaries,
   bytelevel,
   chardelimiter,
   bert,
@@ -104,6 +105,7 @@ static cl::opt<PreTokenizerMode> PreTokenizer(
         clEnumValN(whitespacesplit, "whitespacesplit", "Split on whitespace and output delimiters as separate tokens"),
         clEnumValN(digits, "digits", "Split on digit sequences"),
         clEnumValN(punctuation, "punctuation", "Split on punctuation characters"),
+        clEnumValN(simpleWordBoundaries, "simplewordboundaries", "boundaries between word (\\w) and non-word (\\W) characters"),
         clEnumValN(bytelevel, "bytelevel", "ByteLevel tokenization: split on whitespace with byte remapping"),
         clEnumValN(chardelimiter, "chardelimiter", "Split on a specific character delimiter"),
         clEnumValN(bert, "bert", "BERT pre-tokenizer: separates punctuation and words"),
@@ -625,8 +627,16 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
     SHOW_STREAM(WhitespaceMask);
 
+    // Special case: simpleWordBoundaries uses different kernel pipeline
+    if(PreTokenizer == simpleWordBoundaries){
+        // Use simple word boundaries based on Unicode "word" property
+        auto wb = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "word");
+        wb = cast<re::PropertyExpression>(UCD::linkAndResolve(wb));
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        UnicodePropertyLogic(P, wb, U21codepoints, WordBoundaries);
+    }
     // whitespace uses separate whiteSpaceLogic function
-    if (PreTokenizer == whitespace){
+    else if (PreTokenizer == whitespace){
         WordBoundaries = P.CreateStreamSet(1, 1);
         whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
         SHOW_STREAM(WordBoundaries);

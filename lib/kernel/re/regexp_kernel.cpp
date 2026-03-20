@@ -392,6 +392,12 @@ LongestSpan::LongestSpan (LLVMTypeSystemInterface & ts, unsigned pfxOffset, unsi
 
 
 void RE_PipelineBuilder::addExternal(std::string extName, ExternalStream s) {
+    //llvm::errs() << "addExternal(" << extName << ", ";
+    //if (s.kind == ExternalStreamKind::StartIndexed) llvm::errs() << "StartIndexed";
+    //if (s.kind == ExternalStreamKind::ZeroWidth) llvm::errs() << "ZeroWidth";
+    //if (s.kind == ExternalStreamKind::FixedLength) llvm::errs() << "FixedLength";
+    //if (s.kind == ExternalStreamKind::EndIndexed) llvm::errs() << "EndIndexed";
+    //llvm::errs() << ", (" << s.lgthRange.first << ", " << s.lgthRange.second << "), " << s.offset << ")\n";
     mCtxt.mExternals.emplace(extName, s);
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         mPB.captureBitstream(extName, s.extStream);
@@ -588,6 +594,9 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
         }
     }
 
+    re::LookAheadNamer LA;
+    xfrmedRE = LA.transformRE(xfrmedRE);
+
     re::VariableLengthCCNamer CCnamer;
     xfrmedRE = CCnamer.transformRE(xfrmedRE);
     for (auto m : CCnamer.mNameMap) {
@@ -717,8 +726,7 @@ void UnicodePropertyLogic(PipelineBuilder & P, re::PropertyExpression * pe,
             std::vector<re::CC *> ccs = {makeCC(obj->GetCodepointSet("Y"), &cc::Unicode)};
             StreamSet * pStrm = P.CreateStreamSet(1);
             P.CreateKernelFamilyCall<CharClassesKernel>(ccs, BasisBits, pStrm);
-            StreamSet * bStrm  = P.CreateStreamSet(1);
-            P.CreateKernelCall<BoundaryKernel>(pStrm, IndexStream, bStrm);
+            P.CreateKernelCall<BoundaryKernel>(pStrm, IndexStream, PropertyStream);
         } else {
             llvm::report_fatal_error("Unsupported property for boundary expression");
         }

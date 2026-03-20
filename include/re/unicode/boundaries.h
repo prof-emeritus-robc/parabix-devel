@@ -25,7 +25,6 @@ RE * generateWordBoundaryRule();
 
 RE * EnumeratedPropertyBoundary(UCD::EnumeratedPropertyObject * enumObj);
 
-
 // Word Boundary Rules         
 RE * generateWordBoundaryRule();
 

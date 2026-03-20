@@ -1088,9 +1088,9 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
 
     re::CC * breakCC = nullptr;
     if (mGrepRecordBreak == GrepRecordBreakKind::Null) {
-        breakCC = re::makeCC(0x0, &cc::Unicode);
+        breakCC = re::makeCC(0x0, &cc::UTF8);
     } else {// if (mGrepRecordBreak == GrepRecordBreakKind::LF)
-        breakCC = re::makeCC(0x0A, &cc::Unicode);
+        breakCC = re::makeCC(0x0A, &cc::UTF8);
     }
 
     matchingRE = re::exclude_CC(matchingRE, breakCC);
@@ -1166,9 +1166,9 @@ void InternalMultiSearchEngine::grepCodeGen(const re::PatternVector & patterns) 
 
     re::CC * breakCC = nullptr;
     if (mGrepRecordBreak == GrepRecordBreakKind::Null) {
-        breakCC = re::makeByte(0x0);
+        breakCC = re::makeCC(0x0, &cc::UTF8);
     } else {// if (mGrepRecordBreak == GrepRecordBreakKind::LF)
-        breakCC = re::makeByte(0x0A);
+        breakCC = re::makeCC(0x0A, &cc::UTF8);
     }
 
     auto E = CreatePipeline(mGrepDriver,

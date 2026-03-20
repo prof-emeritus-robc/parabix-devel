@@ -83,9 +83,6 @@ private:
     const unsigned          mAfterContext;
 };
 
-void SimpleWordBoundaryLogic(PipelineBuilder & P,
-                          StreamSet * Source, StreamSet * U8index, StreamSet * wordBoundary_stream);
-
 // white space boundary rule, pretokenizer implementation
 void WhitespaceBoundaryLogic(PipelineBuilder & P,
                               StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_stream);
@@ -102,6 +99,12 @@ void DigitBoundaryLogic(PipelineBuilder & P,
 void DigitSplitLogic(PipelineBuilder & P,
                               StreamSet * Source, StreamSet * U8index, StreamSet * digit_split_stream);
                               //  The LongestMatchMarks kernel computes longest-match spans in start-end space.
+
+void GraphemeClusterLogic(PipelineBuilder & P,
+                          StreamSet * Source, StreamSet * U8index, StreamSet * GCBstream);
+
+void SimpleWordBoundaryLogic(PipelineBuilder & P,
+                          StreamSet * Source, StreamSet * U8index, StreamSet * wordBoundary_stream);
 
 void Level2WordBoundaryLogic(PipelineBuilder & P,
                           StreamSet * Source, StreamSet * wordBoundary_stream);

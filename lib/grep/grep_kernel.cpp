@@ -67,12 +67,10 @@ using namespace pablo;
 using namespace re;
 using namespace llvm;
 
-
 unsigned round_up_to_blocksize(int lgth) {
     unsigned lookahead_blocks = (codegen::BlockSize - 1 + lgth)/codegen::BlockSize;
     return lookahead_blocks * codegen::BlockSize;
 }
-
 
 void MatchedLinesKernel::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());

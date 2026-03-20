@@ -626,7 +626,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     SHOW_STREAM(WhitespaceMask);
 
     // whitespace uses separate whiteSpaceLogic function
-    else if (PreTokenizer == whitespace){
+    if (PreTokenizer == whitespace){
         WordBoundaries = P.CreateStreamSet(1, 1);
         whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
         SHOW_STREAM(WordBoundaries);

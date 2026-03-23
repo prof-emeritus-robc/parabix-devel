@@ -659,7 +659,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         // Detect positions of the delimiter character in raw bytes (BasisBits space)
         uint32_t delimCP = DelimiterString.empty() ? (uint32_t)',' : (uint32_t)(unsigned char)DelimiterString[0];
         StreamSet * CharDelimStream = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<CharDelimiterKernel>(BasisBits, CharDelimStream, delimCP);
+        P.CreateKernelCall<CharDelimiterKernel>(U21codepoints, CharDelimStream, delimCP);
         // BoundaryKernel fires at transitions: non-delim→delim and delim→non-delim
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<BoundaryKernel>(CharDelimStream, u8index, WordBoundaries);
@@ -755,7 +755,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         P.CreateKernelCall<NotKernel>(WhitespaceMask, notWhitespaceMask);
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWhitespaceMask, insertionBoundaries);
-    } else if (effectiveBehavior == isolated && PreTokenizer != digits) {
+    } else if (effectiveBehavior == isolated && PreTokenizer != digits && PreTokenizer != punctuation) {
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
     } else if (effectiveBehavior == mergedwithprevious) {

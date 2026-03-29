@@ -73,9 +73,9 @@ Hello, world! abc123def, shouldn't test-case 42.
 
   <!-- ByteLevel: space/non-space runs, forced removed behavior
        Hello, | world! | abc123def, | test-case | 42. -->
-  <!-- <tokenizercase inputdata="test_input"
+  <tokenizercase inputdata="test_input"
                  pretokenizer="bytelevel"
-                 expectedcount="5"/> -->
+                 expectedcount="14"/>
 
   <!-- CharDelimiter: split on ',' (default), forced removed behavior
        Two commas produce 3 segments: Hello | [sp]world! abc123def | [sp]test-case 42. -->

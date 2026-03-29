@@ -290,6 +290,37 @@ protected:
     }
 };
 
+// ByteLevel transform: for codepoints in [0x00, 0x20], OR bit 8 (adds 0x100).
+// Matches HuggingFace GPT-2 byte-level mapping for this range:
+//   Space 0x20 → Ġ (U+0120), Newline 0x0A → Ċ (U+010A), Tab 0x09 → ĉ (U+0109), etc.
+class ByteLevelTransformKernel : public PabloKernel {
+public:
+    ByteLevelTransformKernel(LLVMTypeSystemInterface & ts,
+                              StreamSet * U21codepoints,
+                              StreamSet * InvisibleMask,
+                              StreamSet * U21transformed)
+    : PabloKernel(ts, "byteLevelTransform",
+                  {Binding{"codepoints", U21codepoints}, Binding{"invisible", InvisibleMask}},
+                  {Binding{"transformed", U21transformed}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> u21 = getInputStreamSet("codepoints");
+        PabloAST * invisible = getInputStreamSet("invisible")[0];
+
+        std::vector<PabloAST *> out(21);
+        for (unsigned i = 0; i < 21; i++) {
+            if (i == 8) {
+                out[i] = pb.createOr(u21[i], invisible);  // bit 8 gets OR'd with the invisible mask
+            } else {
+                out[i] = u21[i];  // all other bits pass through unchanged
+            }
+        }
+        writeOutputStreamSet("transformed", out);
+    }
+};
+
 // Detect whitespace/delimiter positions (ASCII space 0x20 = 00100000)
 class WhitespaceDetector : public PabloKernel {
 public:
@@ -466,6 +497,7 @@ protected:
 // Each stream b[i] represents bit i of the character value at each position.
 class CharDelimiterKernel : public PabloKernel {
 public:
+// character class kernel ? 
     CharDelimiterKernel(LLVMTypeSystemInterface & ts,
                         StreamSet * InputStreams,
                         StreamSet * DelimMask,
@@ -584,10 +616,11 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     
     // Input Processing
     // Read file into byte stream
+    // 1 stream, each element is 8 bits wide
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
     
-    // Convert serial bytes to 8 parallel bit streams
+    // Convert serial bytes to 8 parallel bit streams(8 streams of 1-bit values)
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
     SHOW_BIXNUM(BasisBits);
@@ -607,7 +640,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 
     StreamSet * U21codepoints = P.CreateStreamSet(21, 1);
     FilterByMask(P, u8index, U21_u8indexed, U21codepoints);
-    SHOW_BIXNUM(U21codepoints); 
+    SHOW_BIXNUM(U21codepoints);
 
     // Unicode Word Boundary Rules
     StreamSet * WordBoundaries = nullptr;
@@ -641,6 +674,28 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
+    // ByteLevel transform: remap [0x00, 0x20] → [0x100, 0x120] by setting bit 8.
+    // Must happen before any downstream kernel reads U21codepoints.
+    else if(PreTokenizer == bytelevel) {
+        // Creat a character class for the byte-level range [0x00, 0x20] to identify which codepoints to transform
+        // 0x00–0x08: NUL, SOH, STX, ... (C0 controls)
+        // 0x09: Tab
+        // 0x0A: Newline (LF)
+        // 0x0D: Carriage Return
+        // 0x0E–0x1F: more C0 controls
+        // 0x20: Space
+        re::CC * invisibleCC = re::makeCC(0x00, 0x20);
+        StreamSet * InvisibleMask = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(
+            std::vector<re::CC *>{invisibleCC}, U21codepoints, InvisibleMask);
+        StreamSet * U21transformed = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<ByteLevelTransformKernel>(U21codepoints, InvisibleMask, U21transformed);
+        SHOW_BIXNUM(U21transformed);
+        U21codepoints = U21transformed;
+        WordBoundaries = buildREBasedTokenizer(P, "BL",
+            re::generateRE_TokenizerRule(re::ByteLevelBoundary), U21codepoints);
+        SHOW_STREAM(WordBoundaries);
+    }
     // composite tokenizer (OR of two RE rules)
     else if (PreTokenizer == sequence_whitespace_punctuation) {
         // Composite tokenizer: whitespace + punctuation combined with OR
@@ -655,14 +710,24 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         SHOW_STREAM(WordBoundaries);
     }
     else if (PreTokenizer == chardelimiter) {
-        //TODO: Fix this to work with 21 basis bits of Unicode.
         // Detect positions of the delimiter character in raw bytes (BasisBits space)
-        uint32_t delimCP = DelimiterString.empty() ? (uint32_t)',' : (uint32_t)(unsigned char)DelimiterString[0];
+       // replace with:
+        uint32_t delimCP;
+        if (DelimiterString.empty()) {
+            delimCP = (uint32_t)',';
+        } else {
+            unsigned char c0 = (unsigned char)DelimiterString[0];
+            if      (c0 < 0x80) delimCP = c0; // starts with 0 → 1 byte
+            else if (c0 < 0xE0) delimCP = ((c0 & 0x1F) << 6)  | ((unsigned char)DelimiterString[1] & 0x3F);  // starts with 110 → 2 bytes
+            else if (c0 < 0xF0) delimCP = ((c0 & 0x0F) << 12) | (((unsigned char)DelimiterString[1] & 0x3F) << 6)  | ((unsigned char)DelimiterString[2] & 0x3F);    // starts with 1110 → 3 bytes
+            else                delimCP = ((c0 & 0x07) << 18) | (((unsigned char)DelimiterString[1] & 0x3F) << 12) | (((unsigned char)DelimiterString[2] & 0x3F) << 6) | ((unsigned char)DelimiterString[3] & 0x3F);   // starts with 11110 → 4 bytes (emoji etc.)
+        } 
         StreamSet * CharDelimStream = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<CharDelimiterKernel>(U21codepoints, CharDelimStream, delimCP);
+        re::CC * delimCC = re::makeCC(delimCP);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{delimCC}, U21codepoints, CharDelimStream);
         // BoundaryKernel fires at transitions: non-delim→delim and delim→non-delim
         WordBoundaries = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<BoundaryKernel>(CharDelimStream, u8index, WordBoundaries);
+        P.CreateKernelCall<BoundaryKernel>(CharDelimStream, nullptr, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
         
     }

@@ -44,15 +44,15 @@ DASH = "-" * 65
 # ---------------------------------------------------------------------------
 
 MODES = {
-    "whitespace":                WhitespaceSplit(),
-    "whitespacesplit":           Whitespace(),
+    "whitespacesplit":           WhitespaceSplit(),
+    "whitespace":                Whitespace(),
     "bytelevel":                 ByteLevel(add_prefix_space=False),
-    "bert":                      BertPreTokenizer(),
+    # "bert":                      BertPreTokenizer(),
     "punctuation":               Punctuation(),
     "digits":                    Digits(individual_digits=True),
     "chardelimiter":             CharDelimiterSplit(","),
     "sequence_whitespace_punct": Sequence([WhitespaceSplit(), Punctuation()]),
-    "simplewordboundaries":      Split(pattern=Regex(r"\w+"), behavior="isolated"),
+    # "simplewordboundaries":      Split(pattern=Regex(r"\w+"), behavior="isolated"),
     # uax29: no HF equivalent — appears in parabix-only / behavior tests only
 }
 

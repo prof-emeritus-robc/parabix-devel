@@ -38,16 +38,20 @@ OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "hf_pretokenizers_output.t
 
 def run(out):
     out.write(f"Input: {repr(TEXT)}\n\n")
-    for name, pt in PRETOKENIZERS.items():
-        out.write(f"[{name}]\n")
+    for num, (name, pt) in enumerate(PRETOKENIZERS.items(), 1):
+        out.write("=" * 60 + "\n")
+        out.write(f"Test {num}: {name.capitalize()} Pre-tokenizer (HuggingFace)\n")
+        out.write("=" * 60 + "\n\n")
+        out.write(f"Input text:    {repr(TEXT)}\n")
+        out.write(f"Pretokenizer:  {name}\n\n")
         if pt is None:
             out.write("  No HuggingFace equivalent for uax29 (needs ICU/PyICU)\n\n")
             continue
         result = pt.pre_tokenize_str(TEXT)
         tokens = [tok for tok, _ in result]
-        out.write(f"  Total tokens: {len(tokens)}\n")
-        for i, tok in enumerate(tokens):
-            out.write(f"  {i+1:3}. {repr(tok)}\n")
+        out.write(f"Output tokens ({len(tokens)}):\n")
+        for i, tok in enumerate(tokens, 1):
+            out.write(f"  {i:3}. {repr(tok)}\n")
         out.write("\n")
 
 run(sys.stdout)

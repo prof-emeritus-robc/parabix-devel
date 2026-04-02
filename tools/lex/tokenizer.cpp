@@ -891,6 +891,14 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
                                   finalU21codepoints, TransformedBoundaries);
     SHOW_STREAM(TransformedBoundaries);
 
+    // Remove null codepoints (U+0000) from zero-padded stream end
+    re::CC * nonNullCC = re::makeCC(0x01, 0x10FFFF);
+    StreamSet * nonNullMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{nonNullCC}, finalU21codepoints, nonNullMask);
+    StreamSet * filteredU21 = P.CreateStreamSet(21);
+    FilterByMask(P, nonNullMask, finalU21codepoints, filteredU21);
+    finalU21codepoints = filteredU21;
+
     // Convert U21 codepoints back to UTF-8 basis bits
     StreamSet * output_basis = P.CreateStreamSet(8);
     U21_to_UTF8(P, finalU21codepoints, output_basis);

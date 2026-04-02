@@ -712,6 +712,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     else if (PreTokenizer == chardelimiter) {
         // Detect positions of the delimiter character in raw bytes (BasisBits space)
        // replace with:
+       // uint32_t — 32 bits, comfortably holds any Unicode code point 
         uint32_t delimCP;
         if (DelimiterString.empty()) {
             delimCP = (uint32_t)',';
@@ -723,11 +724,13 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
             else                delimCP = ((c0 & 0x07) << 18) | (((unsigned char)DelimiterString[1] & 0x3F) << 12) | (((unsigned char)DelimiterString[2] & 0x3F) << 6) | ((unsigned char)DelimiterString[3] & 0x3F);   // starts with 11110 → 4 bytes (emoji etc.)
         } 
         StreamSet * CharDelimStream = P.CreateStreamSet(1, 1);
+        // {delimCC} — the character class to match the delimiter code point
         re::CC * delimCC = re::makeCC(delimCP);
         P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{delimCC}, U21codepoints, CharDelimStream);
         // BoundaryKernel fires at transitions: non-delim→delim and delim→non-delim
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<BoundaryKernel>(CharDelimStream, nullptr, WordBoundaries);
+        WhitespaceMask = CharDelimStream;
         SHOW_STREAM(WordBoundaries);
         
     }

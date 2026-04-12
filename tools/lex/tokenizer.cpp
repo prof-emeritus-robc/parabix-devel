@@ -321,6 +321,145 @@ protected:
     }
 };
 
+// ByteLevel GPT-2 byte encoding kernel.
+// Input:  BasisBits       — 8 parallel streams, one position per UTF-8 byte (byte domain)
+// Output: GPT2Codepoints  — 21 streams, bytes_char() codepoints (byte domain)
+//         FirstByteMask   —  1 stream,  1 at the first byte of each UTF-8 sequence
+//
+// bytes_char() mapping (identical to HuggingFace / GPT-2):
+//   Bytes 33-126, 161-172, 174-255  →  same value        (passthrough, bit 8 = 0)
+//   Bytes   0-32                    →  byte + 256         (set bit 8, bits 0-7 unchanged)
+//   Byte  127                       →  289  (0x121)
+//   Bytes 128-160                   →  byte + 162
+//   Byte  173                       →  323  (0x143)
+class ByteLevelGPT2Kernel : public PabloKernel {
+public:
+    ByteLevelGPT2Kernel(LLVMTypeSystemInterface & ts,
+                        StreamSet * BasisBits,
+                        StreamSet * GPT2Codepoints,
+                        StreamSet * FirstByteMask)
+    : PabloKernel(ts, "byteLevelGPT2",
+                  {Binding{"basis", BasisBits}},
+                  {Binding{"codepoints", GPT2Codepoints},
+                   Binding{"firstbyte",  FirstByteMask}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> b = getInputStreamSet("basis");
+        // b[0]=LSB (bit 0), b[7]=MSB (bit 7)
+
+        // ── Zone detection ────────────────────────────────────────────────────
+         
+        // Bytes 0–31 are control characters (null, tab, newline, bell, escape, etc.)
+        // Byte 32 is ASCII space  
+        // Zone 1: bytes 0-32  →  byte + 256  (passthrough bits 0-7, set bit 8)
+        //   bytes 0-31: b[7]=0, b[6]=0, b[5]=0
+        //   byte 32:    b[7]=0, b[6]=0, b[5]=1, b[4-0]=00000
+        PabloAST * notHi   = pb.createAnd(pb.createNot(b[7]), pb.createNot(b[6]));   // bytes 0–63
+        PabloAST * isLow   = pb.createAnd(notHi, pb.createNot(b[5]));                // bytes 0–31
+        // isLow catches 0–31, is32 catches exactly 32. Together they cover 0–32 with no overlap.
+        // match for byte 32 = 0b00100000
+        PabloAST * is32    = pb.createAnd(notHi,
+                             pb.createAnd(b[5],
+                             pb.createAnd(pb.createNot(b[4]),
+                             pb.createAnd(pb.createNot(b[3]),
+                             pb.createAnd(pb.createNot(b[2]),
+                             pb.createAnd(pb.createNot(b[1]),
+                                          pb.createNot(b[0])))))));                  // bytes 32
+        PabloAST * isZone1 = pb.createOr(isLow, is32);  // bytes 0–32
+
+        // Byte 127 is the DEL (delete) control character
+        // Zone 2: byte 127 (0b01111111)  →  289  (bits 0-7 = 33 = 0b00100001)
+        PabloAST * isZone2 = pb.createAnd(pb.createNot(b[7]),
+                             pb.createAnd(b[6],
+                             pb.createAnd(b[5],
+                             pb.createAnd(b[4],
+                             pb.createAnd(b[3],
+                             pb.createAnd(b[2],
+                             pb.createAnd(b[1], b[0])))))));
+
+        // bytes 128–159 are control characters, and byte 160 is the non-breaking space
+        // Zone 3: bytes 128-160  →  byte + 162
+        //   bytes 128-159: b[7]=1, b[6]=0, b[5]=0
+        //   byte 160:      b[7]=1, b[6]=0, b[5]=1, b[4-0]=00000
+        PabloAST * hi1lo0  = pb.createAnd(b[7], pb.createNot(b[6]));    // bytes 128–191
+        PabloAST * isLow3  = pb.createAnd(hi1lo0, pb.createNot(b[5]));  // bytes 128–159
+        PabloAST * is160   = pb.createAnd(hi1lo0,
+                             pb.createAnd(b[5],
+                             pb.createAnd(pb.createNot(b[4]),
+                             pb.createAnd(pb.createNot(b[3]),
+                             pb.createAnd(pb.createNot(b[2]),
+                             pb.createAnd(pb.createNot(b[1]),
+                                          pb.createNot(b[0])))))));    // Only byte 160 
+        PabloAST * isZone3 = pb.createOr(isLow3, is160);   // bytes 128-160
+        
+        // Byte 173 is the soft hyphen - 10101101
+        // Zone 4: byte 173 (0b10101101)  →  323  (bits 0-7 = 67 = 0b01000011)
+        PabloAST * isZone4 = pb.createAnd(b[7],
+                             pb.createAnd(pb.createNot(b[6]),
+                             pb.createAnd(b[5],
+                             pb.createAnd(pb.createNot(b[4]),
+                             pb.createAnd(b[3],
+                             pb.createAnd(b[2],
+                             pb.createAnd(pb.createNot(b[1]), b[0])))))));
+
+        // Passthrough: all bytes NOT in zones 2/3/4. zone 1 and passthrough keep bits 0–7 the same
+        // Zone 1 also uses passthrough bits 0-7 (its identity carries through automatically).
+        PabloAST * notPass = pb.createOr(isZone2, pb.createOr(isZone3, isZone4));  // every position where bits 0–7 need to change
+        PabloAST * isPass  = pb.createNot(notPass); // every position where bits 0–7 stay the same, passthrough and zone 1
+
+        //  Zone 3 carry chain: byte + 162  (162 = 0b10100010) 
+        // bytes 128-160 - adding all zone 3 bytes simultaneously
+        // In zone 3: b[7]=1 always, and bit 7 of 162=1, so they cancel → sum[7]=0,
+        // carry propagates into bit 8 (always 1).  b[6]=0 in zone 3.
+        PabloAST * c2 = pb.createAnd(b[2], b[1]);
+        PabloAST * c3 = pb.createAnd(b[3], c2);
+        PabloAST * c4 = pb.createAnd(b[4], c3);
+        PabloAST * z3[8];
+        z3[0] = b[0];
+        z3[1] = pb.createNot(b[1]);
+        z3[2] = pb.createXor(b[2], b[1]);
+        z3[3] = pb.createXor(b[3], c2);
+        z3[4] = pb.createXor(b[4], c3);
+        z3[5] = pb.createXor(pb.createNot(b[5]), c4);
+        z3[6] = pb.createOr(b[5], c4);   // b[6]=0 in zone3 → result = carry5
+        z3[7] = pb.createZeroes();        // 1 XOR 1 = 0; carry always enters bit 8
+
+        //  Output bit 8: set for all remapped zones 
+        std::vector<PabloAST *> out(21);
+        // Output bits 8 - 1
+        // sets bit 8 of the output to 1 at every position where any remapping happened.
+        out[8] = pb.createOr(isZone1, pb.createOr(isZone2, pb.createOr(isZone3, isZone4)));
+        // highest output is 323 which only needs 9 bits (bits 0–8), bits 9 through 20 are always zero
+        // sets 9 through 20  to zero so the output streams are clean.
+        for (unsigned i = 9; i < 21; i++) out[i] = pb.createZeroes();
+
+        //  Output bits 0-7
+        //  combine correct output bits for each zone, into one single output stream
+        constexpr uint32_t zone2_low = 33;  // bits 0-7 of 289 (= 256+33) - zone 2 constant - 127
+        constexpr uint32_t zone4_low = 67;  // bits 0-7 of 323 (= 256+67) - zone 4 constant - 173
+        for (unsigned i = 0; i < 8; i++) {
+            PabloAST * pass = pb.createAnd(isPass, b[i]);
+            PabloAST * z3c  = pb.createAnd(isZone3, z3[i]);
+            PabloAST * z2c  = ((zone2_low >> i) & 1)
+                              ? static_cast<PabloAST *>(isZone2)
+                              : static_cast<PabloAST *>(pb.createZeroes());
+            PabloAST * z4c  = ((zone4_low >> i) & 1)
+                              ? static_cast<PabloAST *>(isZone4)
+                              : static_cast<PabloAST *>(pb.createZeroes());
+            out[i] = pb.createOr(pass, pb.createOr(z3c, pb.createOr(z2c, z4c)));
+        }
+        writeOutputStreamSet("codepoints", out);
+
+        //  First-byte mask 
+        // UTF-8 continuation bytes have pattern 10xxxxxx (b[7]=1, b[6]=0).
+        // First byte of any UTF-8 sequence is NOT a continuation byte.
+        PabloAST * isCont     = pb.createAnd(b[7], pb.createNot(b[6]));
+        PabloAST * isFirstByte = pb.createNot(isCont);
+        writeOutputStreamSet("firstbyte", std::vector<PabloAST *>{isFirstByte});
+    }
+};
+
 // Detect whitespace/delimiter positions (ASCII space 0x20 = 00100000)
 class WhitespaceDetector : public PabloKernel {
 public:
@@ -347,7 +486,6 @@ protected:
         writeOutputStreamSet("WhitespaceMask", std::vector<PabloAST*>{isSpace});
     }
 };
-
 
 // 
 //  Given SplitMarks marking characters that are "split" characters,
@@ -674,27 +812,61 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
         whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
-    // ByteLevel transform: remap [0x00, 0x20] → [0x100, 0x120] by setting bit 8.
-    // Must happen before any downstream kernel reads U21codepoints.
+    // ByteLevel pre-tokenizer (GPT-2 style):
+    //
+    // Step 1 — find token boundaries on the ORIGINAL Unicode codepoints.
+    //   The GPT-2 regex uses ' ?' (literal ASCII space) as an optional prefix:
+    //     | ?\p{L}++   matches " world" as one token
+    //     | ?[^\s\p{L}\p{N}]++  matches " ." as one token
+    //   The regex must see space as 0x20 (whitespace) for these ` ?` patterns to work.
+    //   We also removed the |\s fallback alternatives from ByteLevelBoundary in boundaries.cpp
+    //   because Parabix evaluates all alternatives in parallel — |\s would fire for every
+    //   space independently, creating spurious extra boundaries even when the space was
+    //   already consumed as a ` ?` prefix by a longer match.
+    //
+    // Step 2 — remap [0x00, 0x20] → [0x100, 0x120] for OUTPUT display only.
+    //   space 0x20 → Ġ (U+0120), newline 0x0A → Ċ, tab 0x09 → ĉ, etc.
+    //   This encoding only affects the token text shown in output, not the boundaries.
     else if(PreTokenizer == bytelevel) {
-        // Creat a character class for the byte-level range [0x00, 0x20] to identify which codepoints to transform
-        // 0x00–0x08: NUL, SOH, STX, ... (C0 controls)
-        // 0x09: Tab
-        // 0x0A: Newline (LF)
-        // 0x0D: Carriage Return
-        // 0x0E–0x1F: more C0 controls
-        // 0x20: Space
-        re::CC * invisibleCC = re::makeCC(0x00, 0x20);
-        StreamSet * InvisibleMask = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<CharClassesKernel>(
-            std::vector<re::CC *>{invisibleCC}, U21codepoints, InvisibleMask);
-        StreamSet * U21transformed = P.CreateStreamSet(21, 1);
-        P.CreateKernelCall<ByteLevelTransformKernel>(U21codepoints, InvisibleMask, U21transformed);
-        SHOW_BIXNUM(U21transformed);
-        U21codepoints = U21transformed;
+        // find token boundaries on the ORIGINAL Unicode codepoints.
+        // The GPT-2 regex uses ' ?' (literal space) as an optional prefix, so space must
+        // still be 0x20 (whitespace) here. Boundaries are in char domain (one per codepoint).
         WordBoundaries = buildREBasedTokenizer(P, "BL",
             re::generateRE_TokenizerRule(re::ByteLevelBoundary), U21codepoints);
         SHOW_STREAM(WordBoundaries);
+
+        // GPT-2 byte encoding + first-byte mask, both derived from BasisBits.
+        // ByteLevelGPT2Kernel maps every raw UTF-8 byte through bytes_char() — the full
+        // HuggingFace mapping — and simultaneously marks first bytes of each UTF-8 sequence.
+        StreamSet * GPT2Codepoints = P.CreateStreamSet(21, 1);
+        StreamSet * FirstByteMask  = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<ByteLevelGPT2Kernel>(BasisBits, GPT2Codepoints, FirstByteMask);
+        SHOW_BIXNUM(GPT2Codepoints);
+
+        // Spread char-domain boundaries → byte domain using FirstByteMask.
+        // u8index marks LAST bytes of UTF-8 sequences (used by FilterByMask for decoding),
+        // so we MUST use FirstByteMask here to land each boundary at the correct first byte.
+        StreamSet * ByteWordBoundaries = P.CreateStreamSet(1, 1);
+        SpreadByMask(P, FirstByteMask, WordBoundaries, ByteWordBoundaries);
+
+        // Switch the pipeline to byte domain.
+        U21codepoints  = GPT2Codepoints;
+        WordBoundaries = ByteWordBoundaries;
+
+        // re-compute NumberStream in byte domain.
+        // GPT-2 maps ASCII digits 48-57 to themselves, so decimal-digit property still works.
+        NumberStream = P.CreateStreamSet(1);
+        P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberProp, GPT2Codepoints, NumberStream);
+
+        // zero WhitespaceMask in byte domain.
+        // Space 0x20 → Ġ (0x120) in GPT-2 — no longer whitespace — so IsolatedBehavior
+        // must not add extra boundaries.  Codepoint 0x00 never appears in GPT-2 output
+        // (minimum mapped value is 33), so this mask is always zero.
+        re::CC * neverCC = re::makeCC((codepoint_t)0x00);
+        StreamSet * BL_WhitespaceMask = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(
+            std::vector<re::CC *>{neverCC}, GPT2Codepoints, BL_WhitespaceMask);
+        WhitespaceMask = BL_WhitespaceMask;
     }
     // composite tokenizer (OR of two RE rules)
     else if (PreTokenizer == sequence_whitespace_punctuation) {

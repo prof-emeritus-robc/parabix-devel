@@ -65,7 +65,7 @@ Hello, world! abc123def, test-case . مرحبا بالعالم، یہ ایک ٹ�
   <!-- ByteLevel: GPT-2 byte-level pattern; space before word encoded as Ġ prefix. -->
   <tokenizercase inputdata="test_input"
                  pretokenizer="bytelevel"
-                 expectedcount="31"/>
+                 expectedcount="30"/>
 
   <!-- CharDelimiter: split on ',' (ASCII comma only), forced removed behavior. -->
   <tokenizercase inputdata="test_input"

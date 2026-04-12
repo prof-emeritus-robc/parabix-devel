@@ -350,58 +350,15 @@ protected:
 
         // ── Zone detection ────────────────────────────────────────────────────
          
-        // Bytes 0–31 are control characters (null, tab, newline, bell, escape, etc.)
-        // Byte 32 is ASCII space  
         // Zone 1: bytes 0-32  →  byte + 256  (passthrough bits 0-7, set bit 8)
-        //   bytes 0-31: b[7]=0, b[6]=0, b[5]=0
-        //   byte 32:    b[7]=0, b[6]=0, b[5]=1, b[4-0]=00000
-        PabloAST * notHi   = pb.createAnd(pb.createNot(b[7]), pb.createNot(b[6]));   // bytes 0–63
-        PabloAST * isLow   = pb.createAnd(notHi, pb.createNot(b[5]));                // bytes 0–31
-        // isLow catches 0–31, is32 catches exactly 32. Together they cover 0–32 with no overlap.
-        // match for byte 32 = 0b00100000
-        PabloAST * is32    = pb.createAnd(notHi,
-                             pb.createAnd(b[5],
-                             pb.createAnd(pb.createNot(b[4]),
-                             pb.createAnd(pb.createNot(b[3]),
-                             pb.createAnd(pb.createNot(b[2]),
-                             pb.createAnd(pb.createNot(b[1]),
-                                          pb.createNot(b[0])))))));                  // bytes 32
-        PabloAST * isZone1 = pb.createOr(isLow, is32);  // bytes 0–32
-
-        // Byte 127 is the DEL (delete) control character
-        // Zone 2: byte 127 (0b01111111)  →  289  (bits 0-7 = 33 = 0b00100001)
-        PabloAST * isZone2 = pb.createAnd(pb.createNot(b[7]),
-                             pb.createAnd(b[6],
-                             pb.createAnd(b[5],
-                             pb.createAnd(b[4],
-                             pb.createAnd(b[3],
-                             pb.createAnd(b[2],
-                             pb.createAnd(b[1], b[0])))))));
-
-        // bytes 128–159 are control characters, and byte 160 is the non-breaking space
+        // Zone 2: byte 127  →  289
         // Zone 3: bytes 128-160  →  byte + 162
-        //   bytes 128-159: b[7]=1, b[6]=0, b[5]=0
-        //   byte 160:      b[7]=1, b[6]=0, b[5]=1, b[4-0]=00000
-        PabloAST * hi1lo0  = pb.createAnd(b[7], pb.createNot(b[6]));    // bytes 128–191
-        PabloAST * isLow3  = pb.createAnd(hi1lo0, pb.createNot(b[5]));  // bytes 128–159
-        PabloAST * is160   = pb.createAnd(hi1lo0,
-                             pb.createAnd(b[5],
-                             pb.createAnd(pb.createNot(b[4]),
-                             pb.createAnd(pb.createNot(b[3]),
-                             pb.createAnd(pb.createNot(b[2]),
-                             pb.createAnd(pb.createNot(b[1]),
-                                          pb.createNot(b[0])))))));    // Only byte 160 
-        PabloAST * isZone3 = pb.createOr(isLow3, is160);   // bytes 128-160
-        
-        // Byte 173 is the soft hyphen - 10101101
-        // Zone 4: byte 173 (0b10101101)  →  323  (bits 0-7 = 67 = 0b01000011)
-        PabloAST * isZone4 = pb.createAnd(b[7],
-                             pb.createAnd(pb.createNot(b[6]),
-                             pb.createAnd(b[5],
-                             pb.createAnd(pb.createNot(b[4]),
-                             pb.createAnd(b[3],
-                             pb.createAnd(b[2],
-                             pb.createAnd(pb.createNot(b[1]), b[0])))))));
+        // Zone 4: byte 173  →  323
+        cc::Parabix_CC_Compiler_Builder ccc(b);
+        PabloAST * isZone1 = ccc.compileCC(makeByte(0x00, 0x20), pb);  // bytes 0–32
+        PabloAST * isZone2 = ccc.compileCC(makeByte(0x7F),        pb);  // byte 127
+        PabloAST * isZone3 = ccc.compileCC(makeByte(0x80, 0xA0),  pb);  // bytes 128–160
+        PabloAST * isZone4 = ccc.compileCC(makeByte(0xAD),        pb);  // byte 173
 
         // Passthrough: all bytes NOT in zones 2/3/4. zone 1 and passthrough keep bits 0–7 the same
         // Zone 1 also uses passthrough bits 0-7 (its identity carries through automatically).

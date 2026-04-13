@@ -494,7 +494,8 @@ Marker RE_Block_Compiler::compileRep(int lb, int ub, RE * repeated, Marker marke
             if (lb > 0) {
                 PabloAST * cc_lb = consecutive_matches(cc, 1, rpt, lengths.first, nullptr);
                 auto lb_lgth = lengths.first * rpt;
-                if (marker.position() == Position::AtNextChar) {
+                if (marker.position() != Position::AtEnd) {
+                    marker = Marker(NextCharacter(marker, mPB));
                     lb_lgth--;
                 }
                 PabloAST * marker_fwd = mPB.createAdvance(marker.stream(), lb_lgth, "marker_fwd");
@@ -519,7 +520,7 @@ Marker RE_Block_Compiler::compileRep(int lb, int ub, RE * repeated, Marker marke
                 PabloAST * cc = compile(repeated).stream();
                 PabloAST * cursor = marker.stream();
                 if (marker.position() != Position::AtEnd) {
-                    cursor = mPB.createAnd(cc, mPB.createScanTo(marker.stream(), mMain.mIndexStream));
+                    cursor = mPB.createAnd(cc, NextCharacter(marker, mPB));
                     rpt -= 1;
                 }
                 PabloAST * cc_lb = consecutive_matches(cc, 1, rpt, 1, mMain.mIndexStream);
@@ -741,16 +742,19 @@ Marker RE_Block_Compiler::processUnboundedRep(RE * const repeated, Marker marker
 }
 
 inline Marker RE_Block_Compiler::compileStart(Marker marker) {
-    PabloAST * SOT = mPB.createNot(mPB.createAdvance(mPB.createNot(mMain.mBarrier), 1), "SOT");
+    PabloAST * notBarrier = mPB.createNot(mMain.mBarrier);
+    PabloAST * barrierFollow = mPB.createNot(mPB.createAdvance(notBarrier, 1));
+    PabloAST * SOT = mPB.createAnd(barrierFollow, notBarrier, "SOT");
     return Marker(SOT, Position::AtNextCodeUnit);
 }
 
 inline Marker RE_Block_Compiler::compileEnd(Marker marker) {
-    PabloAST * nextPos = marker.stream();
     if (marker.position() == Position::AtEnd) {
-        nextPos = mPB.createIndexedAdvance(nextPos, mMain.mIndexStream, 1);
+        PabloAST * barrierAhead = mPB.createLookahead(mMain.mBarrier, 1);
+        return Marker(mPB.createAnd(marker.stream(), barrierAhead, "EOT_match"));
     }
-    PabloAST * const EOT_match = mPB.createAnd(mMain.mBarrier, nextPos, "EOT_match");
+    PabloAST * nextPos = NextCharacter(marker, mPB);
+    PabloAST * const EOT_match = mPB.createAnd(mMain.mBarrier, nextPos, "EOT_follow");
     return Marker(EOT_match, Position::AtNextChar);
 }
 

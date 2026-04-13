@@ -21,6 +21,7 @@
 #include <re/unicode/regex_passes.h>
 #include <kernel/basis/s2p_kernel.h>
 #include <kernel/basis/p2s_kernel.h>
+#include <kernel/bitwise/bixlogic.h>
 #include <kernel/core/idisa_target.h>
 #include <kernel/core/streamset.h>
 #include <kernel/core/kernel_builder.h>
@@ -90,7 +91,7 @@ using UntilNMode = UntilNkernel::Mode;
 
 static cl::opt<UntilNMode>
 MaxLimitTerminationMode("maxlimit-termination-mode",
-                  cl::init(UntilNMode::TerminateAtN),
+                  cl::init(UntilNMode::ZeroAfterN),
                   cl::desc("method of pipeline termination when -m=maxlimit is reached."),
                   cl::values(clEnumValN(UntilNMode::ReportAcceptedLengthAtAndBeforeN, "report", "halt pipeline after maxlimit using truncated streamset"),
                              clEnumValN(UntilNMode::TerminateAtN, "terminate", "halt pipeline after maxlimit using streamset copy"),
@@ -162,6 +163,9 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mIndexAlphabet(&cc::UTF8),
     mLineBreakStream(nullptr),
     mU8index(nullptr),
+    mEmptyMatches(nullptr),
+    mU21(nullptr),
+    mU21_LB(nullptr),
     mEngineThread(pthread_self()) {
 
     }
@@ -258,7 +262,7 @@ bool GrepEngine::matchesToEOLrequired () {
     // may be on the CR of a CRLF.
     if (mGrepRecordBreak == GrepRecordBreakKind::Unicode) return true;
     // If all REs are anchored to EOL already, then we can avoid moving them.
-    if (hasEndAnchor(mRE)) return false;
+    if (hasEndAnchor(mRE) && (grepOffset(mRE) > 0)) return false;
     //
     // Not all REs are anchored.   We can avoid moving matches, if we are
     // in MatchOnly mode (or CountOnly with MaxCount = 1) and no invert match inversion.
@@ -379,17 +383,30 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
         } else {
             StreamSet * u21_u8indexed = P.CreateStreamSet(21);
             P.CreateKernelCall<UTF8_Decoder>(Source, u21_u8indexed);
-            StreamSet * u21 = P.CreateStreamSet(21);
-            FilterByMask(P, mU8index, u21_u8indexed, u21);
-            mCtxt.setCodeUnitContext(mIndexAlphabet, u21);
+            StreamSet * mU21 = P.CreateStreamSet(21);
+            FilterByMask(P, mU8index, u21_u8indexed, mU21);
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                P.captureBixNum("u21basis", mU21);
+            }
+            mCtxt.setCodeUnitContext(mIndexAlphabet, mU21);
         }
-
-        StreamSet * U21_LB = P.CreateStreamSet(1);
-        FilterByMask(P, mU8index, mLineBreakStream, U21_LB);
+        mU21_LB = P.CreateStreamSet(1);
+        FilterByMask(P, mU8index, mLineBreakStream, mU21_LB);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBitstream("U21_LB", U21_LB);
+            P.captureBitstream("mU21_LB", mU21_LB);
         }
-        mCtxt.setBarrier(U21_LB);
+        mCtxt.setBarrier(mU21_LB);
+    }
+    if (re::matchesEmptyString(mRE)) {
+        mEmptyMatches = P.CreateStreamSet(1);
+        if (mIndexAlphabet == &cc::UTF8) {
+            P.CreateKernelCall<FindEmptyBreaks>(mLineBreakStream, mEmptyMatches, mU8index);
+        } else {
+            P.CreateKernelCall<FindEmptyBreaks>(mU21_LB, mEmptyMatches);
+        }
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBitstream("mEmptyMatches", mEmptyMatches);
+        }
     }
 }
 
@@ -397,17 +414,22 @@ StreamSet * GrepEngine::initialMatches(RE_PipelineBuilder & RE_PB, StreamSet * I
     kernel::PipelineBuilder & P = RE_PB.getPipelineBuilder();
     StreamSet * Matches = P.CreateStreamSet();
     RE_PB.matchSearchPipeline(mRE, Matches);
+    if (mEmptyMatches) {
+        StreamSet * combined = P.CreateStreamSet();
+        OrCombine(P, Matches, mEmptyMatches, combined);
+        Matches = combined;
+    }
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         P.captureBitstream("initial matches", Matches);
     }
     return Matches;
 }
 
-StreamSet * GrepEngine::matchedLines(kernel::PipelineBuilder & P, StreamSet * initialMatches) {
+StreamSet * GrepEngine::matchedLines(kernel::PipelineBuilder & P, StreamSet * initialMatches, StreamSet * lineBreaks) {
     StreamSet * MatchedLineEnds = nullptr;
     if (matchesToEOLrequired() || mColoring) {
         StreamSet * const MovedMatches = P.CreateStreamSet();
-        P.CreateKernelCall<MatchedLinesKernel>(initialMatches, mLineBreakStream, MovedMatches);
+        P.CreateKernelCall<MatchedLinesKernel>(initialMatches, lineBreaks, MovedMatches);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             P.captureBitstream("MovedMatches", MovedMatches);
         }
@@ -417,31 +439,11 @@ StreamSet * GrepEngine::matchedLines(kernel::PipelineBuilder & P, StreamSet * in
     }
     if (mInvertMatches) {
         StreamSet * const InvertedMatches = P.CreateStreamSet();
-        P.CreateKernelCall<InvertMatchesKernel>(MatchedLineEnds, mLineBreakStream, InvertedMatches);
+        P.CreateKernelCall<InvertMatchesKernel>(MatchedLineEnds, lineBreaks, InvertedMatches);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             P.captureBitstream("InvertedMatches", InvertedMatches);
         }
         MatchedLineEnds = InvertedMatches;
-    }
-    if (mMaxCount > 0) {
-        StreamSet * MaxCountLines = nullptr;
-        Scalar * const maxCount = P.getInputScalar("maxCount");
-        const UntilNMode m = MaxLimitTerminationMode;
-        if (m == UntilNMode::ReportAcceptedLengthAtAndBeforeN) {
-            MaxCountLines = P.CreateTruncatedStreamSet(MatchedLineEnds);
-        } else {
-            MaxCountLines = P.CreateStreamSet();
-        }
-        P.CreateKernelCall<UntilNkernel>(maxCount, MatchedLineEnds, MaxCountLines, m);
-        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBitstream("MaxCountLines", MaxCountLines);
-        }
-        MatchedLineEnds = MaxCountLines;
-        StreamSet * TruncatedLines = streamutils::Merge(P, {{MaxCountLines, {0}}, {mLineBreakStream, {0}}});
-        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBitstream("TruncatedLines", TruncatedLines);
-        }
-        mLineBreakStream = TruncatedLines;
     }
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         P.captureBitstream("MatchedLineEnds", MatchedLineEnds);
@@ -449,23 +451,40 @@ StreamSet * GrepEngine::matchedLines(kernel::PipelineBuilder & P, StreamSet * in
     return MatchedLineEnds;
 }
 
-StreamSet * GrepEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * InputStream) {
-    grepPrologue(P, InputStream);
-    RE_PipelineBuilder RE_PB(P, mCtxt);
-    StreamSet * Matches = initialMatches(RE_PB, InputStream);
-    if (mIndexAlphabet == &cc::Unicode) {
-        StreamSet * u8index1 = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<AddSentinel>(mU8index, u8index1);
-        StreamSet * Results = P.CreateStreamSet(1, 1);
-        SpreadByMask(P, u8index1, Matches, Results);
-        Matches = Results;
+StreamSet * GrepEngine::applyMatchLimit(kernel::PipelineBuilder & P, StreamSet * MatchedLineEnds) {
+    if (mMaxCount > 0) {
+        StreamSet * MaxCountLines = nullptr;
+        Scalar * const maxCount = P.getInputScalar("maxCount");
+        if (MaxLimitTerminationMode == UntilNMode::ReportAcceptedLengthAtAndBeforeN) {
+            MaxCountLines = P.CreateTruncatedStreamSet(MatchedLineEnds);
+        } else {
+            MaxCountLines = P.CreateStreamSet();
+        }
+        P.CreateKernelCall<UntilNkernel>(maxCount, MatchedLineEnds, MaxCountLines, MaxLimitTerminationMode);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBitstream("u8 matches", Matches);
+            P.captureBitstream("MaxCountLines", MaxCountLines);
+        }
+        MatchedLineEnds = MaxCountLines;
+        if (MaxLimitTerminationMode != UntilNMode::ZeroAfterN) {
+            StreamSet * TruncatedLines = streamutils::Merge(P, {{MaxCountLines, {0}}, {mLineBreakStream, {0}}});
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                P.captureBitstream("TruncatedLines", TruncatedLines);
+            }
+            mLineBreakStream = TruncatedLines;
         }
     }
-    return matchedLines(P, Matches);
+    return MatchedLineEnds;
+
 }
 
+StreamSet * GrepEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * InputStream) {
+    grepPrologue(P, InputStream);
+    StreamSet * lbs = (mIndexAlphabet == &cc::Unicode) ? mU21_LB : mLineBreakStream;
+    RE_PipelineBuilder RE_PB(P, mCtxt);
+    StreamSet * Matches = initialMatches(RE_PB, InputStream);
+    StreamSet * matches = matchedLines(P, Matches, lbs);
+    return applyMatchLimit(P, matches);
+}
 
 
 // The QuietMode, MatchOnly and CountOnly engines share a common code generation main function,
@@ -641,7 +660,6 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
         Kernel * const matchK = E.CreateKernelCall<ColorizedReporter>(ColorizedBytes, SourceCoords, ColorizedCoords, callbackObject);
         matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
         matchK->link("finalize_match_wrapper", finalize_match_wrapper);
-        return E.makeKernel();
     };
 
 
@@ -657,7 +675,9 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
                                 SideEffecting()
                                 );
 
-        P.AddKernelCall(makeNestedColourizationPipeline(E));
+        makeNestedColourizationPipeline(E);
+
+        P.AddKernelCall(E.makeKernel());
 
     } else {
 
@@ -686,43 +706,58 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
             P.captureBitstream("Matches", Matches);
         }
     }
-
-    if (mIndexAlphabet == &cc::Unicode) {
-        StreamSet * u8index1 = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<AddSentinel>(mU8index, u8index1);
-        StreamSet * Results = P.CreateStreamSet(1, 1);
-        SpreadByMask(P, u8index1, Matches, Results);
-        Matches = Results;
-        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBitstream("u8 matches", Matches);
-        }
-        if (mColoring) {
-            StreamSet * spreadSpans = P.CreateStreamSet(1, 1);
-            SpreadByMask(P, mU8index, MatchSpans, spreadSpans);
-            StreamSet * ResultSpans = P.CreateStreamSet(1, 1);
-            P.CreateKernelCall<U8Spans>(spreadSpans, mU8index, ResultSpans);
-            MatchSpans = ResultSpans;
-        }
+    if (mEmptyMatches) {
+        StreamSet * combined = P.CreateStreamSet();
+        OrCombine(P, Matches, mEmptyMatches, combined);
+        Matches = combined;
     }
 
-    StreamSet * MatchedLineEnds = matchedLines(P, Matches);
+    StreamSet * lbs = (mIndexAlphabet == &cc::Unicode) ? mU21_LB : mLineBreakStream;
+    StreamSet * MatchedLineEnds = matchedLines(P, Matches, lbs);
 
     bool hasContext = (mAfterContext != 0) || (mBeforeContext != 0);
     StreamSet * MatchesByLine = nullptr;
     if (mColoring | hasContext) {
         MatchesByLine = P.CreateStreamSet(1, 1);
-        FilterByMask(P, mLineBreakStream, MatchedLineEnds, MatchesByLine);
+        FilterByMask(P, lbs, MatchedLineEnds, MatchesByLine);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             P.captureBitstream("MatchesByLine", MatchesByLine);
         }
     }
+
     if (hasContext) {
         StreamSet * ContextByLine = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<ContextSpan>(MatchesByLine, ContextByLine, mBeforeContext, mAfterContext);
         StreamSet * SelectedLines = P.CreateStreamSet(1, 1);
+        // Note that the following spread will produce SelectedLines in u8 space.
         SpreadByMask(P, mLineBreakStream, ContextByLine, SelectedLines);
         MatchedLineEnds = SelectedLines;
         MatchesByLine = ContextByLine;
+    } else if (mIndexAlphabet == &cc::Unicode) {
+        StreamSet * u8index1 = mU8index;
+        if (grepOffset(mRE) > 0) {
+            u8index1 = P.CreateStreamSet(1, 1);
+            P.CreateKernelCall<AddSentinel>(mU8index, u8index1);
+        }
+        StreamSet * Results = P.CreateStreamSet(1, 1);
+        SpreadByMask(P, u8index1, MatchedLineEnds, Results);
+        MatchedLineEnds = Results;
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBitstream("u8 matches", MatchedLineEnds);
+        }
+    }
+
+    MatchedLineEnds = applyMatchLimit(P, MatchedLineEnds);
+
+    if (mColoring && (mIndexAlphabet == &cc::Unicode)) {
+        StreamSet * spreadSpans = P.CreateStreamSet(1, 1);
+        SpreadByMask(P, mU8index, MatchSpans, spreadSpans);
+        StreamSet * ResultSpans = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<U8Spans>(spreadSpans, mU8index, ResultSpans);
+        MatchSpans = ResultSpans;
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBitstream("u8 spreadSpans", ResultSpans);
+        }
     }
 
     if (mColoring) {
@@ -742,6 +777,9 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
         }
         StreamSet * MatchedLineSpans = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<LineSpansKernel>(MatchedLineStarts, MatchedLineEnds, MatchedLineSpans);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBitstream("MatchedLineSpans", MatchedLineSpans);
+        }
 
         StreamSet * Filtered = P.CreateStreamSet(1, 8);
         if (UseByteFilterByMask) {
@@ -752,7 +790,6 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             P.captureByteData("Filtered", Filtered);
         }
-        //StreamSet * MatchSpans = Matches;
 
         StreamSet * FilteredMatchSpans = P.CreateStreamSet(1, 1);
         FilterByMask(P, MatchedLineSpans, MatchSpans, FilteredMatchSpans);
@@ -764,6 +801,9 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
             Staged_S2P(P, Filtered, FilteredBasis);
         } else {
             P.CreateKernelCall<S2PKernel>(Filtered, FilteredBasis);
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                P.captureBixNum("FilteredBasis", FilteredBasis);
+            }
         }
 
         applyColorization(P, SourceCoords, FilteredMatchSpans, FilteredBasis);

@@ -91,8 +91,14 @@ std::string RE_Kernel::makeSignature(RE_CompilerContext & ctxt, RE * re) {
     llvm::raw_string_ostream sigstrm(signature);
     sigstrm << AnnotateWithREflags("RE");
     if (ctxt.mBarrierStream) {
+        // A barrier stream is normally expected.
+        if (anyEndAnchor(re)) {
+            // For end anchors, a lookahead attribute is added.
+            sigstrm << "+B";
+        }
+    } else {
         sigstrm << "-B";
-    }    
+    }
     if (ctxt.mIndexStream) {
         sigstrm << "+X";
     }
@@ -151,7 +157,11 @@ Bindings RE_Kernel::makeInputBindings(RE_CompilerContext & ctxt, RE * re) {
     gatherExternals(re, localExternals, localAlphabets);
     Bindings externalBindings;
     if (ctxt.mBarrierStream) {
-        externalBindings.emplace_back("mBarrier", ctxt.mBarrierStream);
+        if (anyEndAnchor(re)) {
+            externalBindings.emplace_back("mBarrier", ctxt.mBarrierStream, FixedRate(), LookAhead(1));
+        } else {
+            externalBindings.emplace_back("mBarrier", ctxt.mBarrierStream);
+        }
     }
     if (ctxt.mIndexStream) {
         externalBindings.emplace_back("mIndexing", ctxt.mIndexStream);
@@ -376,10 +386,12 @@ void LongestSpan::generatePabloMethod() {
     PabloAST * matchEnd = getInputStreamSet("matchEnd")[0];
     PabloAST * pfxStart = pb.createAnd(pb.createLookahead(pfxStrm, mPfxOffset), pb.createLookahead(endBack, mPfxOffset));
     PabloAST * longestEnd = pb.createAnd(matchEnd, pb.createNot(endBack));
-    if (mEndOffset != 0) {
-        longestEnd = pb.createAdvance(longestEnd, 1);
+    PabloAST * spans = nullptr;
+    if (mEndOffset > 0) {
+        spans = pb.createIntrinsicCall(pablo::Intrinsic::SpanUpTo, {pfxStart, longestEnd});
+    } else {
+        spans = pb.createIntrinsicCall(pablo::Intrinsic::InclusiveSpan, {pfxStart, longestEnd});
     }
-    PabloAST * spans = pb.createIntrinsicCall(pablo::Intrinsic::SpanUpTo, {pfxStart, longestEnd});
     writeOutputStreamSet("spans", std::vector<PabloAST*>{spans});
 }
 
@@ -544,6 +556,7 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
         auto matchEnd = f->second.extStream;
         auto minlgth = f->second.lgthRange.first;
         auto endOffset = f->second.offset;
+        //llvm::errs() << "endOffset: " << endOffset << "\n";
         auto f2 = mUPnamer.mNameMap.find(name);
         if (f2 != mUPnamer.mNameMap.end()) {
             auto namedRE = f2->second;
@@ -558,6 +571,10 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
             OrCombine(mPB, pfxStrm, matchEnd, maskStrm);
             StreamSet * endBack = mPB.CreateStreamSet(1);
             mPB.CreateKernelCall<IndexedShiftBack>(maskStrm, matchEnd, endBack);
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                mPB.captureBitstream("pfxStrm", pfxStrm);
+                mPB.captureBitstream("endBack", endBack);
+            }
             mPB.CreateKernelCall<LongestSpan>(pfxLgth + pfxOffset - 1, endOffset, pfxStrm, endBack, matchEnd, spans);
         } else {
             mPB.CreateKernelFamilyCall<FixedMatchSpansKernel>(minlgth, endOffset, matchEnd, spans);
@@ -583,6 +600,7 @@ RE * RE_PipelineBuilder::spanFactoring(RE * re) {
     re::FixedSpanNamer FLnamer(mCtxt.mCodeUnitAlphabet);
     RE * xfrmedRE = FLnamer.transformRE(re);
     xfrmedRE = mUPnamer.transformRE(xfrmedRE);
+    xfrmedRE = zeroBoundElimination(xfrmedRE);
     //re::Repeated_CC_Seq_Namer RCCSnamer;
     //xfrmedRE = mRCCSnamer.transformRE(xfrmedRE);
     return xfrmedRE;

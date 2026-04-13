@@ -14,6 +14,8 @@ NAME
     tokenizer
 SRC
     tokenizer.cpp
+    normalize.cpp
+    pretokenizer.cpp
     ICU_Boundaries.cpp
 DEPS
     pablo
@@ -22,6 +24,7 @@ DEPS
     kernel.unicode
     kernel.pipeline
     kernel.streamutils
+    kernel.bitwise
     kernel.util
     toolchain
     grep

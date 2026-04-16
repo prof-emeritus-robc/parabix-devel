@@ -11,9 +11,15 @@
 using StreamSet = kernel::StreamSet;
 using PipelineBuilder = kernel::PipelineBuilder;
 
-enum NormalizationMode { NormNone, NormNFC, NormNFD };
+enum NormalizationMode {
+    NormNone,
+    NormNFC,
+    NormNFD,
+    NormStripAccents   // Remove all Mn (Mark, Nonspacing) codepoints.
+                       // Should be preceded by NFD so accents are isolated.
+};
 
-// Dispatches to the appropriate library normalization function based on mode.
+// Dispatches to the appropriate normalization step based on mode.
 // Returns BasisBits unchanged if mode is NormNone.
 StreamSet * applyNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,

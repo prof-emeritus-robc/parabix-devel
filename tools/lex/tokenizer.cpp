@@ -135,7 +135,8 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&tokFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, 
+        {&wordBreakerFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     CPUDriver driver("unicode_word_tokenizer");
     WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);

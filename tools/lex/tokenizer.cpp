@@ -18,7 +18,9 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/pablo_toolchain.h>
+#include <pablo/pablo_kernel.h>
+#include <pablo/builder.hpp>
+#include <pablo/pe_zeroes.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
 #include <kernel/unicode/utf8_decoder.h>
@@ -133,8 +135,7 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv,
-        {&wordBreakerFlags, pablo::pablo_toolchain_flags(), codegen::codegen_flags()});
+    codegen::ParseCommandLineOptions(argc, argv, {&tokFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     CPUDriver driver("unicode_word_tokenizer");
     WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);

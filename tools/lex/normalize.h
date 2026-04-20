@@ -15,8 +15,11 @@ enum NormalizationMode {
     NormNone,
     NormNFC,
     NormNFD,
-    NormStripAccents   // Remove all Mn (Mark, Nonspacing) codepoints.
+    NormStripAccents,  // Remove all Mn (Mark, Nonspacing) codepoints.
                        // Should be preceded by NFD so accents are isolated.
+    NormStripLeft,     // Remove leading Unicode White_Space characters.
+    NormStripRight,    // Remove trailing Unicode White_Space characters.
+    NormStrip          // Remove both leading and trailing whitespace.
 };
 
 // Dispatches to the appropriate normalization step based on mode.

@@ -4,7 +4,9 @@
  */
 
 #include "normalize.h"
+#include "pretokenizer.h"
 
+#include <kernel/unicode/utf8gen.h>
 #include <re/adt/adt.h>
 #include <re/parse/parser.h>
 #include <re/transforms/re_simplifier.h>
@@ -249,6 +251,20 @@ static StreamSet * applyStrip(PipelineBuilder & P, StreamSet * BasisBits,
     return FilteredBasis;
 }
 
+// applyByteLevel — GPT-2 byte alphabet normalization.
+//
+// Maps every input byte to a unique printable Unicode codepoint using the GPT-2
+// byte alphabet (same mapping as the bytelevel pre-tokenizer), then re-encodes
+// the result as UTF-8.  The output byte stream is a valid UTF-8 string where
+// every original byte is represented by exactly one printable character.
+
+static StreamSet * applyByteLevel(PipelineBuilder & P, StreamSet * BasisBits) {
+    StreamSet * codepoints = applyByteLevelEncoding(P, BasisBits);
+    StreamSet * OutputBasis = P.CreateStreamSet(8, 1);
+    U21_to_UTF8(P, codepoints, OutputBasis);
+    return OutputBasis;
+}
+
 // applyNFD — convert UTF-8 input to NFD form.
 
 static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * BasisBits) {
@@ -263,6 +279,7 @@ StreamSet * applyNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
                                NormalizationMode mode) {
 
+    if (mode == NormByteLevel)    return applyByteLevel(P, BasisBits);
     if (mode == NormStripAccents) return applyStripAccents(P, applyNFD(P, BasisBits));
     if (mode == NormStripLeft)    return applyStrip(P, BasisBits, true,  false);
     if (mode == NormStripRight)   return applyStrip(P, BasisBits, false, true);

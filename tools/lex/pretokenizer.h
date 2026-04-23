@@ -66,3 +66,8 @@ PreTokenizerResult buildPreTokenizerBoundaries(
 StreamSet * applyTokenSeparatorInsertion(
     PipelineBuilder & P,
     const PreTokenizerResult & result);
+
+// ByteLevel encoding: maps every input byte to a unique printable Unicode codepoint
+// using the GPT-2 byte alphabet. Returns a 21-bit U21 stream with one codepoint
+// per input byte position (suitable for U21_to_UTF8).
+StreamSet * applyByteLevelEncoding(PipelineBuilder & P, StreamSet * BasisBits);

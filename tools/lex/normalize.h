@@ -15,6 +15,7 @@ enum NormalizationMode {
     NormNone,
     NormNFC,
     NormNFD,
+    NormByteLevel,     // GPT-2 byte alphabet: map every byte to a unique printable Unicode char.
     NormStripAccents,  // Remove all Mn (Mark, Nonspacing) codepoints.
                        // Should be preceded by NFD so accents are isolated.
     NormStripLeft,     // Remove leading Unicode White_Space characters.

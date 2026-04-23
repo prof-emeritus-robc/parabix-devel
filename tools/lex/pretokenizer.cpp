@@ -751,3 +751,10 @@ StreamSet * applyTokenSeparatorInsertion(
 
     return filteredU21;
 }
+
+StreamSet * applyByteLevelEncoding(PipelineBuilder & P, StreamSet * BasisBits) {
+    StreamSet * GPT2Codepoints = P.CreateStreamSet(21, 1);
+    StreamSet * FirstByteMask  = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<ByteLevelGPT2Kernel>(BasisBits, GPT2Codepoints, FirstByteMask);
+    return GPT2Codepoints;
+}

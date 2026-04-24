@@ -33,7 +33,7 @@ from tokenizers import Regex
 
 DEFAULT_INPUT     = "/Users/munizahashim/parabix-devel/build19/test.txt"
 DEFAULT_TOKENIZER = "/Users/munizahashim/parabix-devel/build19/bin/tokenizer"
-OUTPUT_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare_parabix_hf_output.txt")
+OUTPUT_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare_pretokenizers_output.txt")
 BEHAVIOR_XML      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizertest.xml")
 
 SEP  = "=" * 65

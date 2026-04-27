@@ -20,7 +20,8 @@ enum NormalizationMode {
                        // Should be preceded by NFD so accents are isolated.
     NormStripLeft,     // Remove leading Unicode White_Space characters.
     NormStripRight,    // Remove trailing Unicode White_Space characters.
-    NormStrip          // Remove both leading and trailing whitespace.
+    NormStrip,         // Remove both leading and trailing whitespace.
+    NormLowercase      // Map all uppercase codepoints to lowercase (SLC).
 };
 
 // Dispatches to the appropriate normalization step based on mode.

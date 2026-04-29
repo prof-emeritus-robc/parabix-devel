@@ -1,19 +1,26 @@
 # Tokenizer Test Suite
 
 This directory contains Python scripts that compare the Parabix tokenizer output
-against the equivalent HuggingFace tokenizers library output.
+against the equivalent HuggingFace `tokenizers` library output. Each script runs
+both sides on the same input and reports MATCH, MISMATCH, or CRASH for each mode.
 
----
+## Requirements
 
-## Prerequisites
-### 1. Install the HuggingFace tokenizers library
+- Python 3.10 or later.
+- The HuggingFace `tokenizers` package (PyPI — no account or API token required).
+- A built Parabix tokenizer binary. See the [main README](../README.md) for build
+  instructions.
+
+## Setup
+
+Create a Python virtual environment and install the HuggingFace library:
 
 ```bash
+cd ~/parabix-devel
+python3 -m venv .venv
+source .venv/bin/activate
 pip install tokenizers
 ```
-
-This installs the `tokenizers` package from HuggingFace. No HuggingFace account
-or API token is required — it is a plain PyPI package.
 
 Verify the install:
 
@@ -21,90 +28,67 @@ Verify the install:
 python -c "import tokenizers; print(tokenizers.__version__)"
 ```
 
----
-
-## Test scripts
-
-### `compare_normalizers.py` — Normalizer tests
-
-Compares Parabix `--normalize=X` against the equivalent HuggingFace normalizer.
-No pre-tokenizer is used — normalization is a pure string transformation.
-
-**Supported modes:**
-
-| Mode flag | What it does |
-|---|---|
-| `nfd` | Unicode NFD decomposition |
-| `stripaccents` | NFD then remove combining accent marks |
-| `stripleft` | Remove leading whitespace |
-| `stripright` | Remove trailing whitespace |
-| `strip` | Remove both leading and trailing whitespace |
-| `bytelevel` | GPT-2 byte alphabet remapping |
-| `lowercase` | Map all uppercase to lowercase (SLC) |
-
-**Run all modes (compare Parabix vs HuggingFace):**
-
-```bash
-python compare_normalizers.py
-```
-
-**Run specific modes only:**
-
-```bash
-python compare_normalizers.py lowercase nfd strip
-```
-
-**Run HuggingFace only (no Parabix):**
-
-```bash
-python compare_normalizers.py --hf-only
-```
-
-**Run Parabix only:**
-
-```bash
-python compare_normalizers.py --parabix-only
-```
-
-**Use a custom input file:**
-
-```bash
-python compare_normalizers.py --input /path/to/your/file.txt
-```
-
-Output is written to `compare_normalizers_output.txt` in this directory and
-also printed to the terminal.
-
----
-
-### `compare_pretokenizers.py` — Pre-tokenizer tests
-
-Compares Parabix `--pretokenizer=X` against HuggingFace pre-tokenizers.
-Also runs behavior tests defined in `tokenizertest.xml`.
-
-**Run all modes:**
-
-```bash
-python compare_pretokenizers.py
-```
-
-**Run specific modes:**
-
-```bash
-python compare_pretokenizers.py whitespace bert
-```
-
-Output is written to `compare_pretokenizers_output.txt`.
-
----
-
-## Updating the tokenizer binary path
+## Updating the binary path
 
 Each script hardcodes the path to the Parabix tokenizer binary and the default
-input file. If your build directory is different from `build19`, edit these two
-lines near the top of each script:
+input file. If your build directory differs from `build19`, update these two lines
+near the top of each script:
 
 ```python
 DEFAULT_INPUT     = "/path/to/your/parabix-devel/build/test.txt"
 DEFAULT_TOKENIZER = "/path/to/your/parabix-devel/build/bin/tokenizer"
 ```
+
+## compare_normalizers.py
+
+Compares Parabix `--normalize=X` against the equivalent HuggingFace normalizer.
+No pre-tokenizer is used — normalization is a pure string transformation.
+
+Supported modes: `nfd`, `stripaccents`, `stripleft`, `stripright`, `strip`,
+`bytelevel`, `lowercase`.
+
+```bash
+python compare_normalizers.py                        # run all modes
+python compare_normalizers.py lowercase nfd strip    # specific modes only
+python compare_normalizers.py --hf-only              # HuggingFace output only
+python compare_normalizers.py --parabix-only         # Parabix output only
+python compare_normalizers.py --input file.txt       # custom input file
+```
+
+Output is written to `compare_normalizers_output.txt` and also printed to the
+terminal.
+
+## compare_pretokenizers.py
+
+Compares Parabix `--pretokenizer=X` against HuggingFace pre-tokenizers. Also
+runs behavior tests defined in `tokenizertest.xml`.
+
+```bash
+python compare_pretokenizers.py                      # run all modes
+python compare_pretokenizers.py whitespace bert      # specific modes only
+python compare_pretokenizers.py --hf-only            # HuggingFace output only
+python compare_pretokenizers.py --parabix-only       # Parabix output only
+```
+
+Output is written to `compare_pretokenizers_output.txt`.
+
+## Reading the output
+
+Each test prints a block like the following:
+
+```
+=================================================================
+Test 1: lowercase  →  MATCH
+=================================================================
+  Input:   'ПРИВЕТ Hello WORLD'
+  Parabix: 'привет hello world'
+  HF:      'привет hello world'
+  Match:   YES
+```
+
+The summary at the end shows PASS, FAIL, or CRASH for each mode tested.
+
+## License
+
+Parabix is governed by the Open Software License 3.0. See `OSL3.0.txt` in the
+repository root.

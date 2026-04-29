@@ -17,6 +17,7 @@ SRC
     normalize.cpp
     pretokenizer.cpp
     ICU_Boundaries.cpp
+    bpe.cpp
 DEPS
     pablo
     kernel.basis
@@ -35,4 +36,4 @@ DEPS
 # Link ICU libraries to tokenizer
 # Link the required ICU components to the tokenizer executable
 target_link_libraries(tokenizer PRIVATE ICU::uc ICU::i18n)
-target_include_directories(tokenizer PRIVATE ${ICU_INCLUDE_DIRS})
+target_include_directories(tokenizer PRIVATE ${ICU_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/third_party)

@@ -4,7 +4,6 @@
  */
 
 #include <kernel/core/idisa_target.h>
-#include <boost/filesystem.hpp>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/basis/s2p_kernel.h>
@@ -27,15 +26,14 @@
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/streamutils/deletion.h>
 #include <fcntl.h>
+#include <unistd.h>
 #include <fstream>
 #include <iostream>
 #include <string>
 #include <sys/stat.h>
 #include "normalize.h"
 #include "pretokenizer.h"
-// #include "bpe.h"
-
-namespace fs = boost::filesystem;
+#include "bpe.h"
 
 using namespace llvm;
 using namespace codegen;
@@ -53,10 +51,12 @@ static cl::opt<NormalizationMode> Normalization(
         clEnumValN(NormNone,         "none",         "No normalization (default)"),
         clEnumValN(NormNFC,          "nfc",          "NFC normalization"),
         clEnumValN(NormNFD,          "nfd",          "NFD normalization"),
+        clEnumValN(NormByteLevel,    "bytelevel",    "GPT-2 byte alphabet: map every byte to a unique printable Unicode char"),
         clEnumValN(NormStripAccents, "stripaccents", "Remove Mn (Mark, Nonspacing) codepoints — apply after NFD"),
         clEnumValN(NormStripLeft,    "stripleft",    "Remove leading Unicode whitespace (\\p{White_Space})"),
         clEnumValN(NormStripRight,   "stripright",   "Remove trailing Unicode whitespace (\\p{White_Space})"),
-        clEnumValN(NormStrip,        "strip",        "Remove both leading and trailing Unicode whitespace")),
+        clEnumValN(NormStrip,        "strip",        "Remove both leading and trailing Unicode whitespace"),
+        clEnumValN(NormLowercase,    "lowercase",    "Map all uppercase codepoints to lowercase (SLC)")),
     cl::cat(wordBreakerFlags));
 
 static cl::opt<PreTokenizerMode> PreTokenizer(
@@ -95,28 +95,27 @@ static cl::opt<std::string> DelimiterString(
     cl::init(","),
     cl::cat(wordBreakerFlags));
 
-// // ── BPE options ──────────────────────────────────────────────────────────────
-// // When both --vocab and --merges are provided, the tokenizer switches into BPE
-// // mode: pre-tokenization + byte-level BPE + vocab lookup → token IDs on stdout.
-// // The Parabix pipeline is bypassed entirely in this mode.
+//  BPE options. 
+// When both --vocab and --merges are provided, the tokenizer switches into BPE mode.
+// merge loop and vocab lookup to emit token IDs.
 
-// static cl::opt<std::string> VocabFile(
-//     "vocab",
-//     cl::desc("Path to HuggingFace vocab.json  (enables BPE mode)"),
-//     cl::init(""),
-//     cl::cat(wordBreakerFlags));
+static cl::opt<std::string> VocabFile(
+    "vocab",
+    cl::desc("Path to HuggingFace vocab.json  (enables BPE mode)"),
+    cl::init(""),
+    cl::cat(wordBreakerFlags));
 
-// static cl::opt<std::string> MergesFile(
-//     "merges",
-//     cl::desc("Path to HuggingFace merges.txt  (enables BPE mode)"),
-//     cl::init(""),
-//     cl::cat(wordBreakerFlags));
+static cl::opt<std::string> MergesFile(
+    "merges",
+    cl::desc("Path to HuggingFace merges.txt  (enables BPE mode)"),
+    cl::init(""),
+    cl::cat(wordBreakerFlags));
 
-// static cl::opt<bool> OutputStrings(
-//     "strings",
-//     cl::desc("BPE mode: print token strings instead of integer IDs"),
-//     cl::init(false),
-//     cl::cat(wordBreakerFlags));
+static cl::opt<bool> OutputStrings(
+    "strings",
+    cl::desc("BPE mode: print token strings instead of integer IDs"),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
 
 using WordBreakerFunctionType = void (*)(uint32_t fd);
 
@@ -132,10 +131,19 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
-    //  Stage 1: Normalization 
+    //  Stage 1: Normalization
     BasisBits = applyNormalization(P, BasisBits, Normalization);
 
-    //  Stage 2: Decode UTF-8 → U21 codepoints 
+    // If normalization is active but no --pretokenizer was explicitly given,
+    // output the raw normalized text and stop — normalization is not tokenization.
+    if (Normalization != NormNone && PreTokenizer.getNumOccurrences() == 0) {
+        StreamSet * normalizedOutput = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<P2SKernel>(BasisBits, normalizedOutput);
+        P.CreateKernelCall<StdOutKernel>(normalizedOutput);
+        return reinterpret_cast<WordBreakerFunctionType>(P.compile());
+    }
+
+    //  Stage 2: Decode UTF-8 → U21 codepoints
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
 
@@ -167,44 +175,36 @@ int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, 
         {&wordBreakerFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
-    // // ── BPE mode ─────────────────────────────────────────────────────────────
-    // // When the user supplies both --vocab and --merges, run BPE tokenization
-    // // instead of the Parabix pre-tokenizer pipeline.
-    // if (!VocabFile.empty() && !MergesFile.empty()) {
-    //     BPETokenizer bpe;
-    //     if (!bpe.loadVocab(VocabFile) || !bpe.loadMerges(MergesFile)) {
-    //         return 1;
-    //     }
+    //  two-step BPE mode 
+    // Input file is already pre-tokenized
+    // tokenizer --pretokenizer bytelevel input.txt > pretokens.txt
+    // tokenizer --vocab vocab.json --merges merges.txt pretokens.txt
+    if (!VocabFile.empty() && !MergesFile.empty()) {
+        BPETokenizer bpe;
+        if (!bpe.loadVocab(VocabFile) || !bpe.loadMerges(MergesFile))
+            return 1;
 
-    //     // Read the pre-tokenized input file: each line is one pre-token,
-    //     // exactly as produced by pretokenizer.cpp (newline-separated output).
-    //     std::ifstream inFile(inputFile.c_str());
-    //     if (!inFile.is_open()) {
-    //         llvm::errs() << "Error: cannot open " << inputFile << "\n";
-    //         return 1;
-    //     }
-    //     std::vector<std::string> preTokens;
-    //     std::string line;
-    //     while (std::getline(inFile, line)) {
-    //         if (!line.empty())
-    //             preTokens.push_back(line);
-    //     }
+        std::ifstream inFile(inputFile.c_str());
+        if (!inFile.is_open()) {
+            llvm::errs() << "Error: cannot open " << inputFile << "\n";
+            return 1;
+        }
+        std::vector<std::string> preTokens;
+        std::string line;
+        while (std::getline(inFile, line))
+            if (!line.empty()) preTokens.push_back(line);
 
-    //     // BPE encode each pre-token → flat list of token IDs.
-    //     std::vector<int> ids = bpe.encodePreTokens(preTokens);
+        std::vector<int> ids = bpe.encodePreTokens(preTokens);
+        for (int id : ids) {
+            if (OutputStrings)
+                llvm::outs() << bpe.decodeToken(id) << "\n";
+            else
+                llvm::outs() << id << "\n";
+        }
+        return 0;
+    }
 
-    //     // Output: one entry per line.
-    //     for (int id : ids) {
-    //         if (OutputStrings) {
-    //             std::cout << bpe.decodeToken(id) << "\n";
-    //         } else {
-    //             std::cout << id << "\n";
-    //         }
-    //     }
-    //     return 0;
-    // }
-
-    // ── Pre-tokenizer pipeline mode (existing behaviour) ─────────────────────
+    // Pre-tokenizer pipeline mode (existing behaviour) 
     CPUDriver driver("unicode_word_tokenizer");
     WordBreakerFunctionType wordBreakerFn = wordBreakerPipeline(driver);
 

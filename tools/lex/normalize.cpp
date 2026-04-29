@@ -321,7 +321,7 @@ protected:
         for (unsigned i = 0; i < basis.size(); i++) { 
             PabloAST * out = (i < LC1.size())
                 ? pb.createXor(basis[i], LC1_Vars[i])
-                : basis[i];  .// pass-through
+                : basis[i];  // pass-through
             pb.createAssign(pb.createExtract(outputVar, pb.getInteger(i)), out);
         }
     }

@@ -25,7 +25,7 @@ import tempfile
 import os
 import argparse
 
-from tokenizers.normalizers import NFD, StripAccents, Strip, Sequence, ByteLevel, Lowercase
+from tokenizers.normalizers import NFD, StripAccents, Strip, Sequence, ByteLevel, Lowercase, Nmt
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -50,8 +50,7 @@ MODES = {
     "strip":        Strip(left=True,  right=True),
     "bytelevel":    ByteLevel(),
     "lowercase":    Lowercase(),
-
-    # sequence tests 
+    "nmt":          Nmt(),
     "bytelevel,lowercase":              Sequence([ByteLevel(), Lowercase()]),
     "lowercase,strip":                  Sequence([Lowercase(), Strip()]),
     "bytelevel,strip":                  Sequence([ByteLevel(), Strip()]),

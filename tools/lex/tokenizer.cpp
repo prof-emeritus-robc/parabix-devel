@@ -58,7 +58,8 @@ static cl::list<NormalizationMode> Normalization(
         clEnumValN(NormStripLeft,    "stripleft",    "Remove leading Unicode whitespace (\\p{White_Space})"),
         clEnumValN(NormStripRight,   "stripright",   "Remove trailing Unicode whitespace (\\p{White_Space})"),
         clEnumValN(NormStrip,        "strip",        "Remove both leading and trailing Unicode whitespace"),
-        clEnumValN(NormLowercase,    "lowercase",    "Map all uppercase codepoints to lowercase (SLC)")),
+        clEnumValN(NormLowercase,    "lowercase",    "Map all uppercase codepoints to lowercase (SLC)"),
+        clEnumValN(NormNmt,          "nmt",          "Google NMT preprocessing (control char cleanup, whitespace → space)")),
     cl::cat(wordBreakerFlags));
 
 static cl::opt<PreTokenizerMode> PreTokenizer(

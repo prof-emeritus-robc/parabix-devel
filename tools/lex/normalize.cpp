@@ -5,7 +5,6 @@
 
 #include "normalize.h"
 #include "pretokenizer.h"
-
 #include <kernel/unicode/utf8gen.h>
 #include <re/adt/adt.h>
 #include <re/parse/parser.h>
@@ -25,7 +24,7 @@
 #include <unicode/utf/utf_compiler.h>
 #include <unicode/data/PropertyObjects.h>
 #include <unicode/data/PropertyObjectTable.h>
-
+#include <kernel/unicode/charclasses.h>
 
 using namespace kernel;
 using namespace pablo;
@@ -130,6 +129,38 @@ protected:
         writeOutputStreamSet("output", std::vector<PabloAST*>{pb.createOr(a, b)});
     }
 };
+
+// NmtReplaceKernel21 — at ReplaceMask positions, force the 21-bit codepoint to 0x20 (space).
+// 0x20 in binary: only bit 5 is set, all other bits are 0.
+//   - At replace positions: bit 5 = 1, others = 0   (= the codepoint 0x20)
+//   - At non-replace positions: each bit = original  (codepoint unchanged)
+class NmtReplaceKernel21 : public PabloKernel {
+public:
+    NmtReplaceKernel21(LLVMTypeSystemInterface & ts,
+                       StreamSet * U21Basis,
+                       StreamSet * ReplaceMask,
+                       StreamSet * Output)
+    : PabloKernel(ts, "NmtReplace21",
+                  {Binding{"basis",   U21Basis},
+                   Binding{"replace", ReplaceMask}},
+                  {Binding{"output",  Output}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> basis = getInputStreamSet("basis");
+        PabloAST * replace = getInputStreamSet("replace")[0];
+        Var * out = getOutputStreamVar("output");
+
+        for (unsigned i = 0; i < 21; i++) {
+            PabloAST * v = (i == 5)
+                ? pb.createOr(basis[i], replace)              // bit 5: replace=1 → 1, else original
+                : pb.createAnd(basis[i], pb.createNot(replace)); // others: replace=1 → 0, else original
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)), v);
+        }
+    }
+};
+
 
 // applyStripAccents
 //
@@ -358,6 +389,64 @@ static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * BasisBits) {
     return TransformedBasis;
 }
 
+// applyNmt — Google NMT preprocessing.
+// Deletes a fixed set of control characters and replaces a fixed set of
+// whitespace/special characters with U+0020 (space).
+// Operates at codepoint level so multi-byte chars (e.g. U+1680) are handled uniformly.
+static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
+    // Decode bytes → U21 codepoints (with multi-byte padding).
+    StreamSet * U21 = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
+
+    // u8index = 1 at the LAST byte of each UTF-8 char, used to filter U21 down to one position per char.
+    StreamSet * u8index = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+
+    // U21_focus: one position per codepoint (no multi-byte padding).
+    StreamSet * U21_focus = P.CreateStreamSet(21, 1);
+    FilterByMask(P, u8index, U21, U21_focus);
+
+    // Build the DELETE character class:
+    //   U+0001-U+0008, U+000B, U+000E-U+001F, U+007F
+    re::CC * delCC = re::makeCC(0x01, 0x08);
+    delCC = re::makeCC(delCC, re::makeCC(0x0B));
+    delCC = re::makeCC(delCC, re::makeCC(0x0E, 0x1F));
+    delCC = re::makeCC(delCC, re::makeCC(0x7F));
+    StreamSet * DelMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<CharClassesKernel>(
+        std::vector<re::CC*>{delCC}, U21_focus, DelMask);
+
+    // Build the REPLACE character class:
+    //   tab, LF, FF, CR  +  Unicode whitespace/special chars
+    re::CC * repCC = re::makeCC(0x09, 0x0A);
+    repCC = re::makeCC(repCC, re::makeCC(0x0C, 0x0D));
+    repCC = re::makeCC(repCC, re::makeCC(0x1680));
+    repCC = re::makeCC(repCC, re::makeCC(0x200B, 0x200F));
+    repCC = re::makeCC(repCC, re::makeCC(0x2028, 0x2029));
+    repCC = re::makeCC(repCC, re::makeCC(0x2581));
+    repCC = re::makeCC(repCC, re::makeCC(0xFEFF));
+    repCC = re::makeCC(repCC, re::makeCC(0xFFFD));
+    StreamSet * RepMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<CharClassesKernel>(
+        std::vector<re::CC*>{repCC}, U21_focus, RepMask);
+
+    // At RepMask positions, force codepoint to 0x20 (space).
+    StreamSet * ReplacedU21 = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<NmtReplaceKernel21>(U21_focus, RepMask, ReplacedU21);
+
+    // Filter out delete positions: KeepMask = NOT DelMask
+    StreamSet * KeepMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<InvertMaskKernel>(DelMask, KeepMask);
+
+    StreamSet * FilteredU21 = P.CreateStreamSet(21, 1);
+    FilterByMask(P, KeepMask, ReplacedU21, FilteredU21);
+
+    // Re-encode codepoints → UTF-8 bytes.
+    StreamSet * Output = P.CreateStreamSet(8, 1);
+    U21_to_UTF8(P, FilteredU21, Output);
+    return Output;
+}
+
 // applyOneNormalization — dispatch a single mode to the right kernel.
 StreamSet * applyOneNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
@@ -368,10 +457,10 @@ StreamSet * applyOneNormalization(PipelineBuilder & P,
     if (mode == NormStripLeft)    return applyStrip(P, BasisBits, true,  false);
     if (mode == NormStripRight)   return applyStrip(P, BasisBits, false, true);
     if (mode == NormStrip)        return applyStrip(P, BasisBits, true,  true);
-
     if (mode == NormNFD) return applyNFD(P, BasisBits);
     if (mode == NormLowercase) return applyLowercase(P, BasisBits);
     //if (mode == NormNFC) return applyNFC(P, BasisBits);
+     if (mode == NormNmt) return applyNmt(P, BasisBits); 
 
     return BasisBits;  // NormNone — pass-through
 }
@@ -385,5 +474,4 @@ StreamSet * applyNormalization(PipelineBuilder & P,
         BasisBits = applyOneNormalization(P, BasisBits, m);
     }
     return BasisBits;
-}
-
+} 

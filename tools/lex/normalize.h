@@ -7,6 +7,7 @@
 
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/unicode/normalization.h>
+#include <vector>
 
 using StreamSet = kernel::StreamSet;
 using PipelineBuilder = kernel::PipelineBuilder;
@@ -24,8 +25,9 @@ enum NormalizationMode {
     NormLowercase      // Map all uppercase codepoints to lowercase (SLC).
 };
 
-// Dispatches to the appropriate normalization step based on mode.
-// Returns BasisBits unchanged if mode is NormNone.
+// Apply a sequence of normalizations in order. Each step's output feeds into
+// the next. An empty list (or a list containing only NormNone) is a no-op.
+// Equivalent to HuggingFace's normalizers.Sequence([...]).
 StreamSet * applyNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
-                               NormalizationMode mode);
+                               const std::vector<NormalizationMode> & modes);

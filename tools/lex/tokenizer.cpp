@@ -43,10 +43,12 @@ static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breake
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required,
                                       cl::cat(wordBreakerFlags));
 
-static cl::opt<NormalizationMode> Normalization(
+static cl::list<NormalizationMode> Normalization(
     "normalize",
-    cl::desc("Unicode normalization to apply before tokenizing:"),
-    cl::init(NormNone),
+    cl::desc("Unicode normalization(s) to apply before tokenizing. "
+             "Comma-separate multiple modes to chain (Sequence), "
+             "e.g. --normalize=nfd,lowercase :"),
+    cl::CommaSeparated,
     cl::values(
         clEnumValN(NormNone,         "none",         "No normalization (default)"),
         clEnumValN(NormNFC,          "nfc",          "NFC normalization"),
@@ -132,11 +134,15 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
     //  Stage 1: Normalization
-    BasisBits = applyNormalization(P, BasisBits, Normalization);
+    // cl::list<NormalizationMode> implicitly converts to a range usable as vector<NormalizationMode>
+    std::vector<NormalizationMode> normModes(Normalization.begin(), Normalization.end());
+    BasisBits = applyNormalization(P, BasisBits, normModes);
 
-    // If normalization is active but no --pretokenizer was explicitly given,
+    // If any active normalization was requested but no --pretokenizer was given,
     // output the raw normalized text and stop — normalization is not tokenization.
-    if (Normalization != NormNone && PreTokenizer.getNumOccurrences() == 0) {
+    bool hasActiveNorm = false;
+    for (auto m : normModes) if (m != NormNone) { hasActiveNorm = true; break; }
+    if (hasActiveNorm && PreTokenizer.getNumOccurrences() == 0) {
         StreamSet * normalizedOutput = P.CreateStreamSet(1, 8);
         P.CreateKernelCall<P2SKernel>(BasisBits, normalizedOutput);
         P.CreateKernelCall<StdOutKernel>(normalizedOutput);

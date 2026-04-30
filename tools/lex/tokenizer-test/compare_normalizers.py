@@ -50,6 +50,12 @@ MODES = {
     "strip":        Strip(left=True,  right=True),
     "bytelevel":    ByteLevel(),
     "lowercase":    Lowercase(),
+
+    # sequence tests 
+    "bytelevel,lowercase":              Sequence([ByteLevel(), Lowercase()]),
+    "lowercase,strip":                  Sequence([Lowercase(), Strip()]),
+    "bytelevel,strip":                  Sequence([ByteLevel(), Strip()]),
+    "bytelevel,strip,lowercase":        Sequence([ByteLevel(), Strip(), Lowercase()]),
 }
 
 # ---------------------------------------------------------------------------

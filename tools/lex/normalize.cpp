@@ -358,8 +358,8 @@ static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * BasisBits) {
     return TransformedBasis;
 }
 
-// applyNormalization — public dispatch function
-StreamSet * applyNormalization(PipelineBuilder & P,
+// applyOneNormalization — dispatch a single mode to the right kernel.
+StreamSet * applyOneNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
                                NormalizationMode mode) {
 
@@ -375,3 +375,15 @@ StreamSet * applyNormalization(PipelineBuilder & P,
 
     return BasisBits;  // NormNone — pass-through
 }
+
+// applyNormalization — apply a sequence of normalizations in order.
+// normalizers.Sequence([N1, N2, ...]).
+StreamSet * applyNormalization(PipelineBuilder & P,
+                               StreamSet * BasisBits,
+                               const std::vector<NormalizationMode> & modes) {
+    for (NormalizationMode m : modes) {
+        BasisBits = applyOneNormalization(P, BasisBits, m);
+    }
+    return BasisBits;
+}
+

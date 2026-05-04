@@ -23,7 +23,8 @@ enum NormalizationMode {
     NormStripRight,    // Remove trailing Unicode White_Space characters.
     NormStrip,         // Remove both leading and trailing whitespace.
     NormLowercase,      // Map all uppercase codepoints to lowercase (SLC
-    NormNmt            // Google NMT preprocessing: control char cleanup + whitespace → space.
+    NormNmt,           // Google NMT preprocessing: control char cleanup + whitespace → space.
+    NormBertCleanText  // BERT _clean_text: drop \p{C}-{\t\n\r} + U+FFFD; \p{Zs}+\t\n\r → space.
 };
 
 // Apply a sequence of normalizations in order. Each step's output feeds into

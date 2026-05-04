@@ -98,7 +98,8 @@ def run_parabix_bpe(text: str) -> tuple[list[int], list[str]]:
         )
     finally:
         os.unlink(pretokens_path)
-
+        
+   # lists of typed values to be compared 
     ids     = [int(x) for x in r_ids.stdout.split() if x.lstrip("-").isdigit()]
     strings = [s for s in r_strs.stdout.split("\n") if s]
     return ids, strings

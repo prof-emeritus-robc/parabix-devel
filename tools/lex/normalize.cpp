@@ -303,8 +303,8 @@ static StreamSet * applyByteLevel(PipelineBuilder & P, StreamSet * BasisBits) {
     return OutputBasis;
 }
 
-// applyLowercase — map all uppercase codepoints to
-lowercase using SLC (1-to-1).
+// applyLowercase — map all uppercase codepoints to lowercase
+// using full Unicode Lower_Case (UCD::lc) via U21_StringOverridePipeline.
 static StreamSet * applyLowercase(PipelineBuilder & P, StreamSet * BasisBits) {
     // decode the raw UTF-8 bytes into 21-bit Unicode codepoint values
     StreamSet * U21 = P.CreateStreamSet(21, 1);
@@ -333,16 +333,19 @@ static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * BasisBits) {
     return TransformedBasis;
 }
 
-// applyNmt — Google NMT preprocessing.
-// Deletes a fixed set of control characters and replaces a fixed set of
-// whitespace/special characters with U+0020 (space).
-// Operates at codepoint level so multi-byte chars (e.g. U+1680) are handled uniformly.
-static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
+// applyDeleteAndSpaceReplace — generic per-codepoint cleanup pipeline.
+// Deletes codepoints matching delCC, replaces codepoints matching repCC with
+// U+0020 (space), keeps everything else unchanged.  Reused by applyNmt and
+// applyBertCleanText since both have this exact shape, just with different CCs.
+static StreamSet * applyDeleteAndSpaceReplace(PipelineBuilder & P,
+                                              StreamSet * BasisBits,
+                                              re::CC * delCC,
+                                              re::CC * repCC) {
     // Decode bytes → U21 codepoints (with multi-byte padding).
     StreamSet * U21 = P.CreateStreamSet(21, 1);
     P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
 
-    // u8index = 1 at the LAST byte of each UTF-8 char, used to filter U21 down to one position per char.
+    // u8index = 1 at the LAST byte of each UTF-8 char.
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
 
@@ -350,26 +353,10 @@ static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
     StreamSet * U21_focus = P.CreateStreamSet(21, 1);
     FilterByMask(P, u8index, U21, U21_focus);
 
-    // Build the DELETE character class:
-    //   U+0001-U+0008, U+000B, U+000E-U+001F, U+007F
-    re::CC * delCC = re::makeCC(0x01, 0x08);
-    delCC = re::makeCC(delCC, re::makeCC(0x0B));
-    delCC = re::makeCC(delCC, re::makeCC(0x0E, 0x1F));
-    delCC = re::makeCC(delCC, re::makeCC(0x7F));
     StreamSet * DelMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<CharClassesKernel>(
         std::vector<re::CC*>{delCC}, U21_focus, DelMask);
 
-    // Build the REPLACE character class:
-    //   tab, LF, FF, CR  +  Unicode whitespace/special chars
-    re::CC * repCC = re::makeCC(0x09, 0x0A);
-    repCC = re::makeCC(repCC, re::makeCC(0x0C, 0x0D));
-    repCC = re::makeCC(repCC, re::makeCC(0x1680));
-    repCC = re::makeCC(repCC, re::makeCC(0x200B, 0x200F));
-    repCC = re::makeCC(repCC, re::makeCC(0x2028, 0x2029));
-    repCC = re::makeCC(repCC, re::makeCC(0x2581));
-    repCC = re::makeCC(repCC, re::makeCC(0xFEFF));
-    repCC = re::makeCC(repCC, re::makeCC(0xFFFD));
     StreamSet * RepMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<CharClassesKernel>(
         std::vector<re::CC*>{repCC}, U21_focus, RepMask);
@@ -391,6 +378,61 @@ static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
     return Output;
 }
 
+// applyNmt — Google NMT preprocessing.
+// Deletes a fixed set of control characters and replaces a fixed set of
+// whitespace/special characters with U+0020 (space).
+static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
+    // DELETE: U+0001-U+0008, U+000B, U+000E-U+001F, U+007F
+    re::CC * delCC = re::makeCC(0x01, 0x08);
+    delCC = re::makeCC(delCC, re::makeCC(0x0B));
+    delCC = re::makeCC(delCC, re::makeCC(0x0E, 0x1F));
+    delCC = re::makeCC(delCC, re::makeCC(0x7F));
+
+    // REPLACE: tab, LF, FF, CR + Unicode whitespace/special chars
+    re::CC * repCC = re::makeCC(0x09, 0x0A);
+    repCC = re::makeCC(repCC, re::makeCC(0x0C, 0x0D));
+    repCC = re::makeCC(repCC, re::makeCC(0x1680));
+    repCC = re::makeCC(repCC, re::makeCC(0x200B, 0x200F));
+    repCC = re::makeCC(repCC, re::makeCC(0x2028, 0x2029));
+    repCC = re::makeCC(repCC, re::makeCC(0x2581));
+    repCC = re::makeCC(repCC, re::makeCC(0xFEFF));
+    repCC = re::makeCC(repCC, re::makeCC(0xFFFD));
+
+    return applyDeleteAndSpaceReplace(P, BasisBits, delCC, repCC);
+}
+
+// applyBertCleanText — BERT BasicTokenizer's _clean_text.
+// Deletes \p{C} codepoints (control/format/surrogate/private/unassigned) plus
+// U+FFFD, EXCEPT \t \n \r which are kept-but-replaced.  Replaces \p{Zs} (space
+// separator) plus \t \n \r with U+0020.  Note: does NOT collapse runs.
+static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * BasisBits) {
+    auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
+        UCD::getPropertyObject(UCD::gc));
+
+    // Delete = \p{C} - {\t, \n, \r} + {U+FFFD}.
+    // Build \p{C} as the union of its five subcategories (Cc, Cf, Cs, Co, Cn).
+    UCD::UnicodeSet delSet;
+    delSet.insert(gcObj->GetCodepointSet("Cc"));
+    delSet.insert(gcObj->GetCodepointSet("Cf"));
+    delSet.insert(gcObj->GetCodepointSet("Cs"));
+    delSet.insert(gcObj->GetCodepointSet("Co"));
+    delSet.insert(gcObj->GetCodepointSet("Cn"));
+    delSet = delSet - UCD::UnicodeSet(0x09)   // \t
+                    - UCD::UnicodeSet(0x0A)   // \n
+                    - UCD::UnicodeSet(0x0D);  // \r
+    delSet.insert(0xFFFD);
+    re::CC * delCC = re::makeCC(delSet, &cc::Unicode);
+
+    // Replace = \p{Zs} + {\t, \n, \r} - with space.
+    UCD::UnicodeSet repSet = gcObj->GetCodepointSet("Zs");
+    repSet.insert(0x09);
+    repSet.insert(0x0A);
+    repSet.insert(0x0D);
+    re::CC * repCC = re::makeCC(repSet, &cc::Unicode);
+
+    return applyDeleteAndSpaceReplace(P, BasisBits, delCC, repCC);
+}
+
 // applyOneNormalization — dispatch a single mode to the right kernel.
 StreamSet * applyOneNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
@@ -404,7 +446,8 @@ StreamSet * applyOneNormalization(PipelineBuilder & P,
     if (mode == NormNFD) return applyNFD(P, BasisBits);
     if (mode == NormLowercase) return applyLowercase(P, BasisBits);
     //if (mode == NormNFC) return applyNFC(P, BasisBits);
-     if (mode == NormNmt) return applyNmt(P, BasisBits); 
+     if (mode == NormNmt) return applyNmt(P, BasisBits);
+    if (mode == NormBertCleanText) return applyBertCleanText(P, BasisBits);
 
     return BasisBits;  // NormNone — pass-through
 }

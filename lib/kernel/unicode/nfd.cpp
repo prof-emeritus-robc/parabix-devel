@@ -31,6 +31,7 @@
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/normalization.h>
+#include <kernel/unicode/char_replacement.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
@@ -44,14 +45,14 @@
 #include <toolchain/toolchain.h>
 #include <pablo/pablo_toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
-#include <unicode/algo/normalization.h>
-#include <unicode/core/unicode_set.h>
-#include <unicode/data/PropertyAliases.h>
-#include <unicode/data/PropertyObjects.h>
-#include <unicode/data/PropertyObjectTable.h>
-#include <unicode/utf/utf_compiler.h>
-#include <unicode/utf/utf_encoder.h>
-#include <unicode/utf/transchar.h>
+#include <ucd/algo/normalization.h>
+#include <ucd/core/unicode_set.h>
+#include <ucd/data/PropertyAliases.h>
+#include <ucd/data/PropertyObjects.h>
+#include <ucd/data/PropertyObjectTable.h>
+#include <ucd/utf/utf_compiler.h>
+#include <ucd/utf/utf_encoder.h>
+#include <ucd/utf/transchar.h>
 #include <re/toolchain/toolchain.h>
 
 using namespace kernel;
@@ -534,19 +535,12 @@ StreamSet * NFD_PipelineBuilder::NFD_U21_Pipeline(StreamSet * U21_Basis) {
 
     // Now we have a Unicode-indexed representation of all significant
     // sequences for NFD processing.
+    UCD::NFD_Engine NFD_engine(UCD::DecompositionOptions::NFD);
     // Expand to make room for decompositions.
-    auto insert_ccs = NFD_Data.NFD_Insertion_BixNumCCs();
-    StreamSet * const U21_Insertion_BixNum = mPB.CreateStreamSet(insert_ccs.size());
-    mPB.CreateKernelCall<CharClassesKernel>(insert_ccs, U21_Basis, U21_Insertion_BixNum);
-    SHOW_BIXNUM(U21_Insertion_BixNum);
+    auto insert_ccs = NFD_engine.UnicodeInsertLengthBixNumSets();
+    auto bit_translate_ccs = NFD_engine.UnicodeBitTransformSets();
 
-    StreamSet * const U21_SpreadMask = mPB.CreateStreamSet(1, 1);
-    InsertionSpreadMask(mPB, U21_Insertion_BixNum, U21_SpreadMask, kernel::InsertPosition::After);
-    SHOW_STREAM(U21_SpreadMask);
-
-    StreamSet * const U21_ExpandedBasis = mPB.CreateStreamSet(21, 1);
-    SpreadByMask(mPB, U21_SpreadMask, U21_Basis, U21_ExpandedBasis);
-    SHOW_BIXNUM(U21_ExpandedBasis);
+    StreamSet * NFD_Basis = U21_CharToShortStringPipeline(mPB, insert_ccs, bit_translate_ccs, U21_Basis);
 
     //  The Hangul decomposition algorithm calculates replacements for LV and
     //  LVT characters using calculations based on three 5-bit indexes for
@@ -554,7 +548,7 @@ StreamSet * NFD_PipelineBuilder::NFD_U21_Pipeline(StreamSet * U21_Basis) {
     StreamSet * const LIndexBixNum = mPB.CreateStreamSet(L_Index_bits);
     StreamSet * const VIndexBixNum = mPB.CreateStreamSet(V_Index_bits);
     StreamSet * const TIndexBixNum = mPB.CreateStreamSet(T_Index_bits);
-    mPB.CreateKernelCall<LVT_Indexes>(U21_ExpandedBasis, LIndexBixNum, VIndexBixNum, TIndexBixNum);
+    mPB.CreateKernelCall<LVT_Indexes>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum);
     SHOW_BIXNUM(LIndexBixNum);
     SHOW_BIXNUM(VIndexBixNum);
     SHOW_BIXNUM(TIndexBixNum);
@@ -563,12 +557,59 @@ StreamSet * NFD_PipelineBuilder::NFD_U21_Pipeline(StreamSet * U21_Basis) {
     // can be calculated to determine the correct 21-bit representations at
     // <L, V> and <L, V, T> positions.
     StreamSet * const Hangul_NFD_Basis = mPB.CreateStreamSet(21, 1);
-    mPB.CreateKernelCall<LVT2NFD>(U21_ExpandedBasis, LIndexBixNum, VIndexBixNum, TIndexBixNum, Hangul_NFD_Basis);
+    mPB.CreateKernelCall<LVT2NFD>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum, Hangul_NFD_Basis);
     SHOW_BIXNUM(Hangul_NFD_Basis);
 
-    StreamSet * const NFD_Basis = mPB.CreateStreamSet(21, 1);
-    mPB.CreateKernelCall<NFD_Translation>(NFD_Data, Hangul_NFD_Basis, NFD_Basis);
-    SHOW_BIXNUM(NFD_Basis);
+    NFD_Basis = Hangul_NFD_Basis;
+
+    UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(getPropertyObject(UCD::ccc));
+    StreamSet * const CCC_Basis = mPB.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
+    mPB.CreateKernelCall<UnicodePropertyBasis>(enumObj, NFD_Basis, CCC_Basis);
+    SHOW_BIXNUM(CCC_Basis);
+
+    StreamSet * const CCC_NonZero = mPB.CreateStreamSet(1, 1);
+    mPB.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
+    SHOW_STREAM(CCC_NonZero);
+
+    StreamSets ToSort = {CCC_Basis, NFD_Basis};
+
+    StreamSets SortResults = BitonicSortRuns(mPB, 8, CCC_NonZero, ToSort);
+    SHOW_BIXNUM(SortResults[0]);
+    SHOW_BIXNUM(SortResults[1]);
+
+    return SortResults[1];
+}
+
+StreamSet * NFD_PipelineBuilder::NFKD_U21_Pipeline(StreamSet * U21_Basis) {
+
+    // Now we have a Unicode-indexed representation of all significant
+    // sequences for NFD processing.
+    UCD::NFD_Engine NFD_engine(UCD::DecompositionOptions::NFKD);
+    // Expand to make room for decompositions.
+    auto insert_ccs = NFD_engine.UnicodeInsertLengthBixNumSets();
+    auto bit_translate_ccs = NFD_engine.UnicodeBitTransformSets();
+
+    StreamSet * NFD_Basis = U21_CharToShortStringPipeline(mPB, insert_ccs, bit_translate_ccs, U21_Basis);
+
+    //  The Hangul decomposition algorithm calculates replacements for LV and
+    //  LVT characters using calculations based on three 5-bit indexes for
+    //  the L, V and T characters.
+    StreamSet * const LIndexBixNum = mPB.CreateStreamSet(L_Index_bits);
+    StreamSet * const VIndexBixNum = mPB.CreateStreamSet(V_Index_bits);
+    StreamSet * const TIndexBixNum = mPB.CreateStreamSet(T_Index_bits);
+    mPB.CreateKernelCall<LVT_Indexes>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum);
+    SHOW_BIXNUM(LIndexBixNum);
+    SHOW_BIXNUM(VIndexBixNum);
+    SHOW_BIXNUM(TIndexBixNum);
+
+    // Given the L, V and T indexes, the replacements for LV and LVT characters
+    // can be calculated to determine the correct 21-bit representations at
+    // <L, V> and <L, V, T> positions.
+    StreamSet * const Hangul_NFD_Basis = mPB.CreateStreamSet(21, 1);
+    mPB.CreateKernelCall<LVT2NFD>(NFD_Basis, LIndexBixNum, VIndexBixNum, TIndexBixNum, Hangul_NFD_Basis);
+    SHOW_BIXNUM(Hangul_NFD_Basis);
+
+    NFD_Basis = Hangul_NFD_Basis;
 
     UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(getPropertyObject(UCD::ccc));
     StreamSet * const CCC_Basis = mPB.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
@@ -639,6 +680,26 @@ void NFD_PipelineBuilder::NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * 
     SHOW_BIXNUM(U21_focus);
 
     StreamSet * NFD_U21_Results = NFD_U21_Pipeline(U21_focus);
+
+    U21_to_UTF8(mPB, NFD_U21_Results, TransformedBasis);
+    SHOW_BIXNUM(TransformedBasis);
+}
+
+void NFD_PipelineBuilder::NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis) {
+
+    StreamSet * const U21_u8indexed = mPB.CreateStreamSet(21, 1);
+    mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed);
+    SHOW_BIXNUM(U21_u8indexed);
+
+    StreamSet * const WorkingU8index = mPB.CreateStreamSet(1, 1);
+    mPB.CreateKernelCall<UTF8_index>(WorkingBasis, WorkingU8index);
+    SHOW_STREAM(WorkingU8index);
+
+    StreamSet * const U21_focus = mPB.CreateStreamSet(21, 1);
+    FilterByMask(mPB, WorkingU8index, U21_u8indexed, U21_focus);
+    SHOW_BIXNUM(U21_focus);
+
+    StreamSet * NFD_U21_Results = NFKD_U21_Pipeline(U21_focus);
 
     U21_to_UTF8(mPB, NFD_U21_Results, TransformedBasis);
     SHOW_BIXNUM(TransformedBasis);

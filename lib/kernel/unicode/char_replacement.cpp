@@ -11,8 +11,8 @@
 #include <kernel/streamutils/stream_shift.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/bitwise/bixlogic.h>
-#include <unicode/data/PropertyObjects.h>
-#include <unicode/data/PropertyObjectTable.h>
+#include <ucd/data/PropertyObjects.h>
+#include <ucd/data/PropertyObjectTable.h>
 #include <re/adt/re_cc.h>
 
 using namespace kernel;
@@ -38,6 +38,45 @@ StreamSet * U21_StringOverridePipeline(PipelineBuilder & P,
         insertion_bixnum = p->GetUnicodeInsertLengthBixNumSets();
     } else {
         llvm::report_fatal_error("Specified property is neither codepoint nor string override property.");
+    }
+    return U21_CharToShortStringPipeline(P, insertion_bixnum, xfrms, U21_basis);
+}
+
+StreamSet * U21_CharMapPipeline(PipelineBuilder & P,
+    std::map<UCD::codepoint_t, std::u32string> replacementMap,
+    StreamSet * U21_basis) {
+    unicode::BitTranslationSets insertion_bixnum;
+    unsigned maxLgth = 0;
+    for (auto & mapping : replacementMap) {
+        UCD::codepoint_t cp = mapping.first;
+        if (mapping.second.size() > maxLgth) {
+            maxLgth = mapping.second.size();
+        }
+        unsigned diff = mapping.second.size() - 1;
+        unsigned bit = 0;
+        while (diff > 0) {
+            if ((diff & 1UL) == 1UL) {
+                while (insertion_bixnum.size() <= bit) {
+                    insertion_bixnum.push_back(UCD::UnicodeSet());
+                }
+                insertion_bixnum[bit].insert(cp);
+            }
+            diff >>= 1;
+            bit++;
+        }
+    }
+    std::vector<unicode::TranslationMap> xmaps(maxLgth);
+    for (auto & mapping : replacementMap) {
+        UCD::codepoint_t cp = mapping.first;
+        std::u32string s = mapping.second;
+        for (unsigned j = 0; j < s.size(); j++) {
+            xmaps[j].emplace(cp, static_cast<UCD::codepoint_t>(s[j]));
+        };
+    }
+    std::vector<unicode::BitTranslationSets> xfrms(maxLgth);
+    xfrms[0] = unicode::ComputeBitTranslationSets(xmaps[0], unicode::XlateMode::XorBit);
+    for (unsigned j = 1; j < maxLgth; j++) {
+        xfrms[j] = unicode::ComputeBitTranslationSets(xmaps[j], unicode::XlateMode::LiteralBit);
     }
     return U21_CharToShortStringPipeline(P, insertion_bixnum, xfrms, U21_basis);
 }

@@ -7,8 +7,8 @@
 #include <pablo/pablo_kernel.h>  // for PabloKernel
 #include <pablo/pablo_toolchain.h>
 #include <kernel/pipeline/pipeline_builder.h>
-#include <unicode/utf/utf_encoder.h>
-#include <unicode/utf/transchar.h>
+#include <ucd/utf/utf_encoder.h>
+#include <ucd/utf/transchar.h>
 
 using StreamSet = kernel::StreamSet;
 using PipelineBuilder = kernel::PipelineBuilder;
@@ -276,11 +276,15 @@ public:
 
     StreamSet * NFD_U21_Pipeline(StreamSet * U21_Basis);
 
+    StreamSet * NFKD_U21_Pipeline(StreamSet * U21_Basis);
+
     void DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * workItems);
 
     void NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask, StreamSet * WorkingBasis);
 
     void NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
+
+    void NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
 
 private:
     PipelineBuilder & mPB;

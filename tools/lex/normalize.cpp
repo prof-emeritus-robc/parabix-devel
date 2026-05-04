@@ -25,6 +25,7 @@
 #include <unicode/data/PropertyObjects.h>
 #include <unicode/data/PropertyObjectTable.h>
 #include <kernel/unicode/charclasses.h>
+#include <kernel/unicode/char_replacement.h>
 
 using namespace kernel;
 using namespace pablo;
@@ -302,63 +303,8 @@ static StreamSet * applyByteLevel(PipelineBuilder & P, StreamSet * BasisBits) {
     return OutputBasis;
 }
 
-// applyLowercase — map all uppercase codepoints to lowercase using SLC (1-to-1).
-//
-// Pipeline:
-//   BasisBits
-//     → UTF8_Decoder   → U21          (21-bit Unicode basis, u8final-indexed)
-//     → UTF8_index     → u8index      (1 at the last byte of each UTF-8 sequence)
-//     → FilterByMask   → U21_focus    (character-indexed: one position per codepoint)
-//     → LC_Translation → LC_U21       (XOR masks applied to flip uppercase bits)
-//     → U21_to_UTF8    → Output       (re-encoded UTF-8)
-
-struct Lowercase_BixData {
-    Lowercase_BixData() {
-        auto * slc_obj = llvm::cast<UCD::CodePointPropertyObject>(getPropertyObject(UCD::slc));
-        mLC1_Sets = slc_obj->GetBitTransformSets();
-    }
-    unicode::BitTranslationSets LC_1st_BitXorCCs() {
-        return mLC1_Sets;
-    }
-    unicode::BitTranslationSets mLC1_Sets;
-};
-
-class LC_Translation : public PabloKernel {
-public:
-    LC_Translation(LLVMTypeSystemInterface & ts, Lowercase_BixData data,
-                   StreamSet * Basis, StreamSet * Output)
-    : PabloKernel(ts, "LC_Translation" + std::to_string(Basis->getNumElements()) + "x1",
-                  {Binding{"basis", Basis}},
-                  {Binding{"Output", Output}}), mData(std::move(data)) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        UTF::UTF_Compiler unicodeCompiler(getInput(0), pb);
-        unicode::BitTranslationSets LC1 = mData.LC_1st_BitXorCCs();   // UnicodeSet
-        std::vector<Var *> LC1_Vars(LC1.size());    //  mask bitstream
-        std::vector<Var *> all_targets(LC1.size()); 
-        std::vector<UCD::UnicodeSet> all_CCs(LC1.size());
-        for (unsigned i = 0; i < LC1.size(); i++) {  
-            Var * v = pb.createVar("LC1_bit" + std::to_string(i), pb.createZeroes());
-            LC1_Vars[i] = v;
-            all_targets[i] = v;  
-            all_CCs[i] = LC1[i];   // UnicodeSet - which characters need bit i flipped?
-        }
-        unicodeCompiler.compile(all_targets, all_CCs);
-        std::vector<PabloAST *> basis = getInputStreamSet("basis");
-        Var * outputVar = getOutputStreamVar("Output");
-
-        // loop over all 21 bit positions and decides what to write to the output:
-        for (unsigned i = 0; i < basis.size(); i++) { 
-            PabloAST * out = (i < LC1.size())
-                ? pb.createXor(basis[i], LC1_Vars[i])
-                : basis[i];  // pass-through
-            pb.createAssign(pb.createExtract(outputVar, pb.getInteger(i)), out);
-        }
-    }
-    Lowercase_BixData mData;
-};
-
+// applyLowercase — map all uppercase codepoints to
+lowercase using SLC (1-to-1).
 static StreamSet * applyLowercase(PipelineBuilder & P, StreamSet * BasisBits) {
     // decode the raw UTF-8 bytes into 21-bit Unicode codepoint values
     StreamSet * U21 = P.CreateStreamSet(21, 1);
@@ -371,15 +317,13 @@ static StreamSet * applyLowercase(PipelineBuilder & P, StreamSet * BasisBits) {
     StreamSet * U21_focus = P.CreateStreamSet(21, 1);
     FilterByMask(P, u8index, U21, U21_focus);
 
-    Lowercase_BixData lc_data; //  loads the XOR masks
-    StreamSet * LC_U21 = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<LC_Translation>(lc_data, U21_focus, LC_U21);
+    // Full Unicode Lower_Case — handles 1→N expansions like İ → i\u0307.
+    StreamSet * LC_U21 = U21_StringOverridePipeline(P, UCD::lc, U21_focus);
 
     StreamSet * Output = P.CreateStreamSet(8, 1);
     U21_to_UTF8(P, LC_U21, Output);
     return Output;
 }
-
 // applyNFD — convert UTF-8 input to NFD form.
 
 static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * BasisBits) {

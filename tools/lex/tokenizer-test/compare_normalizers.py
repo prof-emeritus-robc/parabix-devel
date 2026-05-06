@@ -15,7 +15,7 @@ Usage:
     python compare_normalizers.py                           # compare all modes
     python compare_normalizers.py --hf-only                 # HF reference only
     python compare_normalizers.py --parabix-only            # Parabix only
-    python compare_normalizers.py nfd strip                 # specific modes
+    python compare_normalizers.py nfd nfkd bertchinesechars   # specific modes
     python compare_normalizers.py --input /path/to/file.txt # custom input file
 """
 
@@ -25,7 +25,7 @@ import tempfile
 import os
 import argparse
 
-from tokenizers.normalizers import NFD, StripAccents, Strip, Sequence, ByteLevel, Lowercase, Nmt
+from tokenizers.normalizers import NFD, NFKD, StripAccents, Strip, Sequence, ByteLevel, Lowercase, Nmt, BertNormalizer
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -44,6 +44,7 @@ SEP = "=" * 65
 
 MODES = {
     "nfd":          NFD(),
+    "nfkd":         NFKD(),
     "stripaccents": Sequence([NFD(), StripAccents()]),
     "stripleft":    Strip(left=True,  right=False),
     "stripright":   Strip(left=False, right=True),
@@ -51,6 +52,20 @@ MODES = {
     "bytelevel":    ByteLevel(),
     "lowercase":    Lowercase(),
     "nmt":          Nmt(),
+    "bertchinesechars":  BertNormalizer(clean_text=False,
+                                        handle_chinese_chars=True,
+                                        strip_accents=False,
+                                        lowercase=False),
+    "bertcleantext,stripaccents,lowercase":
+        BertNormalizer(clean_text=True,
+                       handle_chinese_chars=False,
+                       strip_accents=True,
+                       lowercase=True),
+    "bertcleantext,bertchinesechars,stripaccents,lowercase":
+        BertNormalizer(clean_text=True,
+                       handle_chinese_chars=True,
+                       strip_accents=True,
+                       lowercase=True),
     "bytelevel,lowercase":              Sequence([ByteLevel(), Lowercase()]),
     "lowercase,strip":                  Sequence([Lowercase(), Strip()]),
     "bytelevel,strip":                  Sequence([ByteLevel(), Strip()]),

@@ -16,6 +16,7 @@ enum NormalizationMode {
     NormNone,
     NormNFC,
     NormNFD,
+    NormNFKD,          // Unicode NFKD: compatibility decomposition.
     NormByteLevel,     // GPT-2 byte alphabet: map every byte to a unique printable Unicode char.
     NormStripAccents,  // Remove all Mn (Mark, Nonspacing) codepoints.
                        // Should be preceded by NFD so accents are isolated.
@@ -23,8 +24,9 @@ enum NormalizationMode {
     NormStripRight,    // Remove trailing Unicode White_Space characters.
     NormStrip,         // Remove both leading and trailing whitespace.
     NormLowercase,      // Map all uppercase codepoints to lowercase (SLC
-    NormNmt,           // Google NMT preprocessing: control char cleanup + whitespace → space.
-    NormBertCleanText  // BERT _clean_text: drop \p{C}-{\t\n\r} + U+FFFD; \p{Zs}+\t\n\r → space.
+    NormNmt,              // Google NMT preprocessing: control char cleanup + whitespace → space.
+    NormBertCleanText,    // BERT _clean_text: drop \p{C}-{\t\n\r} + U+FFFD; \p{Zs}+\t\n\r → space.
+    NormBertChineseChars  // BERT handle_chinese_chars: surround each CJK char with spaces.
 };
 
 // Apply a sequence of normalizations in order. Each step's output feeds into

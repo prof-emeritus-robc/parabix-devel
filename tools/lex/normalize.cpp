@@ -20,12 +20,13 @@
 #include <pablo/pe_zeroes.h>
 #include <llvm/Support/Casting.h>
 #include <kernel/unicode/utf8_decoder.h>
-#include <unicode/utf/transchar.h>
-#include <unicode/utf/utf_compiler.h>
-#include <unicode/data/PropertyObjects.h>
-#include <unicode/data/PropertyObjectTable.h>
+#include <ucd/utf/transchar.h>
+#include <ucd/utf/utf_compiler.h>
+#include <ucd/data/PropertyObjects.h>
+#include <ucd/data/PropertyObjectTable.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/char_replacement.h>
+#include <kernel/streamutils/pdep_kernel.h>
 
 using namespace kernel;
 using namespace pablo;
@@ -288,7 +289,6 @@ static StreamSet * applyStrip(PipelineBuilder & P, StreamSet * BasisBits,
 
     return FilteredBasis;
 }
-
 // applyByteLevel — GPT-2 byte alphabet normalization.
 //
 // Maps every input byte to a unique printable Unicode codepoint using the GPT-2
@@ -302,7 +302,6 @@ static StreamSet * applyByteLevel(PipelineBuilder & P, StreamSet * BasisBits) {
     U21_to_UTF8(P, codepoints, OutputBasis);
     return OutputBasis;
 }
-
 // applyLowercase — map all uppercase codepoints to lowercase
 // using full Unicode Lower_Case (UCD::lc) via U21_StringOverridePipeline.
 static StreamSet * applyLowercase(PipelineBuilder & P, StreamSet * BasisBits) {
@@ -325,18 +324,21 @@ static StreamSet * applyLowercase(PipelineBuilder & P, StreamSet * BasisBits) {
     return Output;
 }
 // applyNFD — convert UTF-8 input to NFD form.
-
 static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * BasisBits) {
     NFD_PipelineBuilder nfd(P);
     StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
     nfd.NFD_U8_Pipeline(BasisBits, TransformedBasis);
     return TransformedBasis;
 }
-
+// applyNFKD — convert UTF-8 input to NFKD form (compatibility decomposition).
+static StreamSet * applyNFKD(PipelineBuilder & P, StreamSet * BasisBits) {
+    NFD_PipelineBuilder nfd(P);
+    StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
+    nfd.NFKD_U8_Pipeline(BasisBits, TransformedBasis);
+    return TransformedBasis;
+}
 // applyDeleteAndSpaceReplace — generic per-codepoint cleanup pipeline.
 // Deletes codepoints matching delCC, replaces codepoints matching repCC with
-// U+0020 (space), keeps everything else unchanged.  Reused by applyNmt and
-// applyBertCleanText since both have this exact shape, just with different CCs.
 static StreamSet * applyDeleteAndSpaceReplace(PipelineBuilder & P,
                                               StreamSet * BasisBits,
                                               re::CC * delCC,
@@ -378,7 +380,7 @@ static StreamSet * applyDeleteAndSpaceReplace(PipelineBuilder & P,
     return Output;
 }
 
-// applyNmt — Google NMT preprocessing.
+// applyNmt
 // Deletes a fixed set of control characters and replaces a fixed set of
 // whitespace/special characters with U+0020 (space).
 static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
@@ -404,7 +406,7 @@ static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
 // applyBertCleanText — BERT BasicTokenizer's _clean_text.
 // Deletes \p{C} codepoints (control/format/surrogate/private/unassigned) plus
 // U+FFFD, EXCEPT \t \n \r which are kept-but-replaced.  Replaces \p{Zs} (space
-// separator) plus \t \n \r with U+0020.  Note: does NOT collapse runs.
+// separator) plus \t \n \r with U+0020. 
 static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * BasisBits) {
     auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
         UCD::getPropertyObject(UCD::gc));
@@ -433,6 +435,78 @@ static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * BasisBits
     return applyDeleteAndSpaceReplace(P, BasisBits, delCC, repCC);
 }
 
+// applyBertChineseChars — BERT handle_chinese_chars=True.
+// Surrounds every CJK codepoint C with spaces: C → " C ".
+// Two passes are required so that consecutive CJK chars each get their own
+// surrounding spaces (e.g. 中文 → " 中  文 ", not " 中 文 ").
+//
+// Pass 1 — insert one space BEFORE each CJK:
+//   U21_focus  →  UnitInsertionSpreadMask(CJK, Before)  →  preMask
+//              →  SpreadByMask                          →  preSpread (0 at inserted slots)
+//              →  NmtReplaceKernel21(NOT preMask)       →  preResult (space at inserted slots)
+//
+// Pass 2 — insert one space AFTER each CJK (tracking CJK through Pass 1 via spread):
+//   CJK_in_pre →  UnitInsertionSpreadMask(CJK_in_pre, After)  →  postMask
+//   preResult  →  SpreadByMask                                →  postSpread
+//              →  NmtReplaceKernel21(NOT postMask)            →  postResult
+//
+//   postResult  →  U21_to_UTF8  →  Output
+static StreamSet * applyBertChineseChars(PipelineBuilder & P, StreamSet * BasisBits) {
+    // Decode UTF-8 → one U21 codepoint per position
+    StreamSet * U21 = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
+    StreamSet * u8index = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+    StreamSet * U21_focus = P.CreateStreamSet(21, 1);
+    FilterByMask(P, u8index, U21, U21_focus);
+
+    // CJK ranges — identical to HuggingFace BertTokenizer._is_chinese_char
+    re::CC * cjkCC = re::makeCC(0x3400,  0x4DBF);   // Extension A
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0x4E00,  0x9FFF));   // Unified Ideographs
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0xF900,  0xFAFF));   // Compatibility Ideographs
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0x20000, 0x2A6DF));  // Extension B
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0x2A700, 0x2B73F));  // Extension C
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0x2B740, 0x2B81F));  // Extension D
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0x2B820, 0x2CEAF));  // Extension E
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0x2F800, 0x2FA1F));  // Compatibility Supplement
+
+    StreamSet * CJK_Mask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC*>{cjkCC}, U21_focus, CJK_Mask);
+
+    // Pass 1: insert a space BEFORE each CJK character
+    StreamSet * preMask = P.CreateStreamSet(1, 1);
+    UnitInsertionSpreadMask(P, CJK_Mask, preMask, InsertPosition::Before);
+
+    StreamSet * preSpread = P.CreateStreamSet(21, 1);
+    SpreadByMask(P, preMask, U21_focus, preSpread);
+
+    // Spread CJK_Mask into the expanded stream so Pass 2 knows where CJK chars landed
+    StreamSet * CJK_in_pre = P.CreateStreamSet(1, 1);
+    SpreadByMask(P, preMask, CJK_Mask, CJK_in_pre);
+
+    // Inserted slots have 0 in preSpread; OR bit 5 at those positions → U+0020
+    StreamSet * insertMark1 = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<InvertMaskKernel>(preMask, insertMark1);
+    StreamSet * preResult = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<NmtReplaceKernel21>(preSpread, insertMark1, preResult);
+
+    // Pass 2: insert a space AFTER each CJK character
+    StreamSet * postMask = P.CreateStreamSet(1, 1);
+    UnitInsertionSpreadMask(P, CJK_in_pre, postMask, InsertPosition::After);
+
+    StreamSet * postSpread = P.CreateStreamSet(21, 1);
+    SpreadByMask(P, postMask, preResult, postSpread);
+
+    StreamSet * insertMark2 = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<InvertMaskKernel>(postMask, insertMark2);
+    StreamSet * postResult = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<NmtReplaceKernel21>(postSpread, insertMark2, postResult);
+
+    StreamSet * Output = P.CreateStreamSet(8, 1);
+    U21_to_UTF8(P, postResult, Output);
+    return Output;
+}
+
 // applyOneNormalization — dispatch a single mode to the right kernel.
 StreamSet * applyOneNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
@@ -443,11 +517,13 @@ StreamSet * applyOneNormalization(PipelineBuilder & P,
     if (mode == NormStripLeft)    return applyStrip(P, BasisBits, true,  false);
     if (mode == NormStripRight)   return applyStrip(P, BasisBits, false, true);
     if (mode == NormStrip)        return applyStrip(P, BasisBits, true,  true);
-    if (mode == NormNFD) return applyNFD(P, BasisBits);
-    if (mode == NormLowercase) return applyLowercase(P, BasisBits);
-    //if (mode == NormNFC) return applyNFC(P, BasisBits);
-     if (mode == NormNmt) return applyNmt(P, BasisBits);
-    if (mode == NormBertCleanText) return applyBertCleanText(P, BasisBits);
+    if (mode == NormNFD)          return applyNFD(P, BasisBits);
+    if (mode == NormNFKD)         return applyNFKD(P, BasisBits);
+    //if (mode == NormNFC)        return applyNFC(P, BasisBits);
+    if (mode == NormLowercase)    return applyLowercase(P, BasisBits);
+    if (mode == NormNmt)              return applyNmt(P, BasisBits);
+    if (mode == NormBertCleanText)    return applyBertCleanText(P, BasisBits);
+    if (mode == NormBertChineseChars) return applyBertChineseChars(P, BasisBits);
 
     return BasisBits;  // NormNone — pass-through
 }

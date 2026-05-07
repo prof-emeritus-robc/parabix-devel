@@ -51,9 +51,10 @@ static cl::list<NormalizationMode> Normalization(
     cl::CommaSeparated,
     cl::values(
         clEnumValN(NormNone,         "none",         "No normalization (default)"),
-        clEnumValN(NormNFC,          "nfc",          "NFC normalization"),
-        clEnumValN(NormNFD,          "nfd",          "NFD normalization"),
-        clEnumValN(NormNFKD,         "nfkd",         "NFKD normalization (compatibility decomposition)"),
+        clEnumValN(NormNFC,          "nfc",          "NFC: canonical decomposition + canonical composition"),
+        clEnumValN(NormNFD,          "nfd",          "NFD: canonical decomposition"),
+        clEnumValN(NormNFKC,         "nfkc",         "NFKC: compatibility decomposition + canonical composition"),
+        clEnumValN(NormNFKD,         "nfkd",         "NFKD: compatibility decomposition"),
         clEnumValN(NormByteLevel,    "bytelevel",    "GPT-2 byte alphabet: map every byte to a unique printable Unicode char"),
         clEnumValN(NormStripAccents, "stripaccents", "Remove Mn (Mark, Nonspacing) codepoints — apply after NFD"),
         clEnumValN(NormStripLeft,    "stripleft",    "Remove leading Unicode whitespace (\\p{White_Space})"),

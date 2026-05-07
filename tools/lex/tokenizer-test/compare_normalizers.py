@@ -15,7 +15,7 @@ Usage:
     python compare_normalizers.py                           # compare all modes
     python compare_normalizers.py --hf-only                 # HF reference only
     python compare_normalizers.py --parabix-only            # Parabix only
-    python compare_normalizers.py nfd nfkd bertchinesechars   # specific modes
+    python compare_normalizers.py nfd nfc nfkd nfkc            # specific modes
     python compare_normalizers.py --input /path/to/file.txt # custom input file
 """
 
@@ -25,7 +25,7 @@ import tempfile
 import os
 import argparse
 
-from tokenizers.normalizers import NFD, NFKD, StripAccents, Strip, Sequence, ByteLevel, Lowercase, Nmt, BertNormalizer
+from tokenizers.normalizers import NFD, NFC, NFKD, NFKC, StripAccents, Strip, Sequence, ByteLevel, Lowercase, Nmt, BertNormalizer
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -44,7 +44,9 @@ SEP = "=" * 65
 
 MODES = {
     "nfd":          NFD(),
+    "nfc":          NFC(),
     "nfkd":         NFKD(),
+    "nfkc":         NFKC(),
     "stripaccents": Sequence([NFD(), StripAccents()]),
     "stripleft":    Strip(left=True,  right=False),
     "stripright":   Strip(left=False, right=True),

@@ -14,8 +14,9 @@ using PipelineBuilder = kernel::PipelineBuilder;
 
 enum NormalizationMode {
     NormNone,
-    NormNFC,
-    NormNFD,
+    NormNFC,           // Unicode NFC:  canonical decomposition + canonical composition.
+    NormNFD,           // Unicode NFD:  canonical decomposition.
+    NormNFKC,          // Unicode NFKC: compatibility decomposition + canonical composition.
     NormNFKD,          // Unicode NFKD: compatibility decomposition.
     NormByteLevel,     // GPT-2 byte alphabet: map every byte to a unique printable Unicode char.
     NormStripAccents,  // Remove all Mn (Mark, Nonspacing) codepoints.

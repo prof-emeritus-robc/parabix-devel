@@ -14,6 +14,7 @@ bool BPETokenizer::isLoaded() const {
 }
 
 // Reads vocab.json from disk and populates two tables:
+// loadVocab - parses the file 
 bool BPETokenizer::loadVocab(const std::string & path) {
     std::ifstream file(path);
     if (!file.is_open()) {
@@ -78,7 +79,7 @@ std::vector<std::string> BPETokenizer::splitByCodepoint(const std::string & s) {
     std::vector<std::string> symbols;
     symbols.reserve(s.size());
     size_t i = 0;
-    while (i < s.size()) {
+    while (i < s.size()) {   // parallelize
         // Determine how many bytes this UTF-8 codepoint occupies.
         unsigned char c = (unsigned char)s[i];
         size_t len = (c < 0x80) ? 1 :   // 0xxxxxxx  — 1-byte codepoint
@@ -94,12 +95,11 @@ std::vector<std::string> BPETokenizer::splitByCodepoint(const std::string & s) {
 std::vector<std::pair<std::string,std::string>> BPETokenizer::getPairs(
         const std::vector<std::string> & symbols) {
     std::vector<std::pair<std::string,std::string>> pairs;
-    pairs.reserve(symbols.size());
+    pairs.reserve(symbols.size());   
     for (size_t i = 0; i + 1 < symbols.size(); i++)
         pairs.push_back({symbols[i], symbols[i+1]});
     return pairs;
 }
-
 // Core BPE merge loop. Takes a symbol sequence and iteratively merges
 std::vector<std::string> BPETokenizer::applyBPE(
         const std::vector<std::string> & input) const {
@@ -120,7 +120,7 @@ std::vector<std::string> BPETokenizer::applyBPE(
 
         // Scan all pairs to find the one with the lowest rank in merges_.
         // Lower rank = earlier in merges.txt = higher priority = applied first.
-        int bestRank = std::numeric_limits<int>::max(); // start with worst possible rank
+        int bestRank = std::numeric_limits<int>::max(); // start with worst possible rank // parallelize
         std::pair<std::string,std::string> bestPair;
         bool found = false;
         for (const auto & p : pairs) {
@@ -157,10 +157,11 @@ std::vector<std::string> BPETokenizer::applyBPE(
 }
 
 // encoding function: takes a list of already-byte-encoded pre-tokens and returns a flat list of integer token IDs.
+// encodePreTokens - the lookup-and-write
 std::vector<int> BPETokenizer::encodePreTokens(
         const std::vector<std::string> & preTokens) const {
     std::vector<int> ids;
-    for (const auto & token : preTokens) {
+    for (const auto & token : preTokens) {  
         // split by Unicode codepoint — each codepoint is one BPE symbol.
         auto symbols = splitByCodepoint(token);
 
@@ -168,7 +169,7 @@ std::vector<int> BPETokenizer::encodePreTokens(
         auto merged  = applyBPE(symbols);
 
         // look up each merged symbol in the vocab and emit its ID.
-        for (const auto & sym : merged) {
+        for (const auto & sym : merged) { // parallelize 
             auto vit = vocab_.find(sym);
             ids.push_back(vit != vocab_.end() ? vit->second : -1);
         }

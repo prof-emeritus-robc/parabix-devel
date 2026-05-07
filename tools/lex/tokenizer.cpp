@@ -53,13 +53,16 @@ static cl::list<NormalizationMode> Normalization(
         clEnumValN(NormNone,         "none",         "No normalization (default)"),
         clEnumValN(NormNFC,          "nfc",          "NFC normalization"),
         clEnumValN(NormNFD,          "nfd",          "NFD normalization"),
+        clEnumValN(NormNFKD,         "nfkd",         "NFKD normalization (compatibility decomposition)"),
         clEnumValN(NormByteLevel,    "bytelevel",    "GPT-2 byte alphabet: map every byte to a unique printable Unicode char"),
         clEnumValN(NormStripAccents, "stripaccents", "Remove Mn (Mark, Nonspacing) codepoints — apply after NFD"),
         clEnumValN(NormStripLeft,    "stripleft",    "Remove leading Unicode whitespace (\\p{White_Space})"),
         clEnumValN(NormStripRight,   "stripright",   "Remove trailing Unicode whitespace (\\p{White_Space})"),
         clEnumValN(NormStrip,        "strip",        "Remove both leading and trailing Unicode whitespace"),
         clEnumValN(NormLowercase,    "lowercase",    "Map all uppercase codepoints to lowercase (SLC)"),
-        clEnumValN(NormNmt,          "nmt",          "Google NMT preprocessing (control char cleanup, whitespace → space)")),
+        clEnumValN(NormNmt,          "nmt",          "Google NMT preprocessing (control char cleanup, whitespace → space)"),
+        clEnumValN(NormBertCleanText,   "bertcleantext",    "BERT clean_text: drop \\p{C} (except \\t\\n\\r) + U+FFFD; \\p{Zs}+\\t\\n\\r → U+0020"),
+        clEnumValN(NormBertChineseChars,"bertchinesechars",  "BERT handle_chinese_chars: surround each CJK character with spaces")),
     cl::cat(wordBreakerFlags));
 
 static cl::opt<PreTokenizerMode> PreTokenizer(

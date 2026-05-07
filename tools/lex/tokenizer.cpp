@@ -125,6 +125,15 @@ static cl::opt<bool> OutputStrings(
 
 using WordBreakerFunctionType = void (*)(uint32_t fd);
 
+// writeToStdout — convert 8x1 parallel basis bits to serial bytes and write
+// to stdout.  Extracted to avoid repeating the P2SKernel + StdOutKernel pair
+// in the two output paths (normalization-only and tokenization).
+static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
+    StreamSet * output = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<P2SKernel>(basis, output);
+    P.CreateKernelCall<StdOutKernel>(output);
+}
+
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
 
@@ -137,46 +146,36 @@ WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
-    //  Stage 1: Normalization
-    // cl::list<NormalizationMode> implicitly converts to a range usable as vector<NormalizationMode>
+    // Normalization
+    // Using applyNormalizationU21 to get U21 codepoints directly
     std::vector<NormalizationMode> normModes(Normalization.begin(), Normalization.end());
-    BasisBits = applyNormalization(P, BasisBits, normModes);
+    StreamSet * U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
+
+    // Re-encode to BasisBits once — needed by the pretokenizer's bytelevel mode
+    // and by the normalization-only output path below.
+    StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
+    U21_to_UTF8(P, U21codepoints, normalizedBasis);
 
     // If any active normalization was requested but no --pretokenizer was given,
-    // output the raw normalized text and stop — normalization is not tokenization.
+    // output the raw normalized text and stop
     bool hasActiveNorm = false;
     for (auto m : normModes) if (m != NormNone) { hasActiveNorm = true; break; }
     if (hasActiveNorm && PreTokenizer.getNumOccurrences() == 0) {
-        StreamSet * normalizedOutput = P.CreateStreamSet(1, 8);
-        P.CreateKernelCall<P2SKernel>(BasisBits, normalizedOutput);
-        P.CreateKernelCall<StdOutKernel>(normalizedOutput);
+        writeToStdout(P, normalizedBasis);
         return reinterpret_cast<WordBreakerFunctionType>(P.compile());
     }
 
-    //  Stage 2: Decode UTF-8 → U21 codepoints
-    StreamSet * u8index = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-
-    StreamSet * U21_u8indexed = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21_u8indexed);
-
-    StreamSet * U21codepoints = P.CreateStreamSet(21, 1);
-    FilterByMask(P, u8index, U21_u8indexed, U21codepoints);
-
-    //  Stage 2: Pre-tokenization 
+    //Pre-tokenization
+    // U21codepoints is already decoded above — no re-decode needed here.
     PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
-        P, BasisBits, U21codepoints, PreTokenizer, SplitBehavior, DelimiterString);
+        P, normalizedBasis, U21codepoints, PreTokenizer, SplitBehavior, DelimiterString);
 
     StreamSet * finalU21 = applyTokenSeparatorInsertion(P, ptResult);
 
-    //  Stage 3: Output — U21 → UTF-8 → serial bytes → stdout 
+    // Output — U21 → UTF-8 → serial bytes → stdout
     StreamSet * output_basis = P.CreateStreamSet(8);
     U21_to_UTF8(P, finalU21, output_basis);
-
-    StreamSet * tokenizedOutput = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<P2SKernel>(output_basis, tokenizedOutput);
-
-    P.CreateKernelCall<StdOutKernel>(tokenizedOutput);
+    writeToStdout(P, output_basis);
 
     return reinterpret_cast<WordBreakerFunctionType>(P.compile());
 }

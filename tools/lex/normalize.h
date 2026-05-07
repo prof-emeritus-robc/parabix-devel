@@ -29,9 +29,12 @@ enum NormalizationMode {
     NormBertChineseChars  // BERT handle_chinese_chars: surround each CJK char with spaces.
 };
 
-// Apply a sequence of normalizations in order. Each step's output feeds into
-// the next. An empty list (or a list containing only NormNone) is a no-op.
-// Equivalent to HuggingFace's normalizers.Sequence([...]).
+// Apply a sequence of normalizations and return the result as UTF-8 BasisBits.
 StreamSet * applyNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
                                const std::vector<NormalizationMode> & modes);
+
+// Same as applyNormalization but returns U21_focus (one codepoint per slot)
+StreamSet * applyNormalizationU21(PipelineBuilder & P,
+                                   StreamSet * BasisBits,
+                                   const std::vector<NormalizationMode> & modes);

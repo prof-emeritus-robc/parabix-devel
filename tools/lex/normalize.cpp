@@ -164,113 +164,166 @@ protected:
 };
 
 
-// applyStripAccents
-//
-// Removes all Unicode Mn (Mark, Nonspacing) characters from the byte stream.
-// Should be called after NFD normalization so that combining accents are
-// isolated codepoints.
-//
-// Pipeline:
-//   BasisBits
-//     → UTF8_index          → u8index   (last byte of each UTF-8 char)
-//     → UnicodePropertyKernelBuilder(\p{Mn})
-//                           → MnMask    (last byte of each Mn char)
-//     → U8Spans             → MnSpans   (all bytes of each Mn char)
-//     → InvertMaskKernel    → KeepMask  (1 = non-Mn byte, keep)
-//     → FilterByMask        → filtered BasisBits (Mn chars removed)
+// ---------------------------------------------------------------------------
+// Shared helpers — decode once at the top, encode once at the bottom.
+// ---------------------------------------------------------------------------
 
-static StreamSet * applyStripAccents(PipelineBuilder & P, StreamSet * BasisBits) {
-
+// decodeToU21: UTF-8 bytes → one U21 codepoint per stream position.
+static StreamSet * decodeToU21(PipelineBuilder & P, StreamSet * BasisBits) {
+    StreamSet * U21 = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-
-    re::RE * mnRE = re::simplifyRE(re::RE_Parser::parse("\\p{Mn}"));
-    mnRE = UCD::linkAndResolve(mnRE);
-    mnRE = UCD::externalizeProperties(mnRE);
-    re::Name * mnName = llvm::cast<re::Name>(mnRE);
-
-    StreamSet * MnMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(mnName, BasisBits, MnMask);
-
-    StreamSet * MnSpans = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<U8Spans>(MnMask, u8index, MnSpans);
-
-    StreamSet * KeepMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<InvertMaskKernel>(MnSpans, KeepMask);
-
-    StreamSet * FilteredBasis = P.CreateStreamSet(8, 1);
-    FilterByMask(P, KeepMask, BasisBits, FilteredBasis);
-
-    return FilteredBasis;
+    StreamSet * U21_focus = P.CreateStreamSet(21, 1);
+    FilterByMask(P, u8index, U21, U21_focus);
+    return U21_focus;
 }
 
-// applyStrip
+// encodeFromU21: U21 codepoints → UTF-8 bytes.
+static StreamSet * encodeFromU21(PipelineBuilder & P, StreamSet * U21_focus) {
+    StreamSet * Output = P.CreateStreamSet(8, 1);
+    U21_to_UTF8(P, U21_focus, Output);
+    return Output;
+}
+
+// applyStripAccents — remove all accent/combining marks (Unicode category Mn).
 //
-// Removes Unicode White_Space characters from the left edge, right edge, or both.
+// Now works entirely in U21 space (one slot = one codepoint), so we never
+// need to think about how many bytes a character takes.
 //
 // Pipeline:
-//   BasisBits
-//     → UTF8_index                               → u8index
-//     → UnicodePropertyKernelBuilder(\p{White_Space})
-//                                                → WS_Mask  (last byte of each ws char)
-//     → U8Spans                                  → WS_Spans (all bytes of each ws char)
-//     → InvertMaskKernel                         → nonWS
+//   U21_focus
+//     → NFD_U21_Pipeline   → NFD_U21   decompose é → e + ◌́  so each accent
+//                                       is now isolated in its own slot
+//     → CharClassesKernel  → MnMask    1 at every slot that holds an Mn
+//                                       (Mark, Nonspacing) codepoint
+//     → InvertMaskKernel   → KeepMask  flip: 1 = "keep this slot"
+//     → FilterByMask       → result    squeeze out the Mn slots; only the
+//                                       base characters remain
+static StreamSet * applyStripAccents(PipelineBuilder & P, StreamSet * U21_focus) {
+
+    // Step 1 — Canonical decomposition (NFD) in U21 space.
+    // NFD_U21_Pipeline expands precomposed characters so every combining mark
+    // gets its own slot.  e.g. U+00E9 (é) → U+0065 (e) + U+0301 (combining acute).
+    NFD_PipelineBuilder nfd(P);
+    StreamSet * NFD_U21 = nfd.NFD_U21_Pipeline(U21_focus);
+
+    // Step 2 — Build the Mn character class from the Unicode General Category table.
+    // We look up the "Mn" (Mark, Nonspacing) set — all combining diacritics, accents,
+    // dots, etc. — directly from the UCD property object so the list is always correct
+    // for the Unicode version Parabix was built with.
+    auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
+        UCD::getPropertyObject(UCD::gc));
+    re::CC * mnCC = re::makeCC(gcObj->GetCodepointSet("Mn"), &cc::Unicode);
+
+    // Step 3 — Mark every slot that holds an Mn codepoint.
+    // CharClassesKernel takes our NFD stream (one codepoint per slot) and outputs
+    // a 1-bit stream: 1 where the codepoint is in mnCC, 0 everywhere else.
+    StreamSet * MnMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC*>{mnCC}, NFD_U21, MnMask);
+
+    // Step 4 — Invert: we want to KEEP non-Mn slots, not delete them.
+    // InvertMaskKernel flips every bit: the 0s (non-Mn) become 1s (keep).
+    StreamSet * KeepMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<InvertMaskKernel>(MnMask, KeepMask);
+
+    // Step 5 — Filter: remove all slots where KeepMask = 0 (the accent slots).
+    // FilterByMask compresses the stream, leaving only the kept codepoints.
+    StreamSet * result = P.CreateStreamSet(21, 1);
+    FilterByMask(P, KeepMask, NFD_U21, result);
+    return result;
+}
+
+// applyStrip — remove Unicode White_Space from the left, right, or both edges.
+//
+// In U21 space every slot is one codepoint, so we just ask "is this slot
+// a whitespace character?" with CharClassesKernel — no UTF8_index or U8Spans
+// needed.  The leading/trailing logic (MatchStar, IndexedShiftBack) is
+// unchanged — it only cares about a 1-bit yes/no stream, not about bytes.
+//
+// Pipeline:
+//   U21_focus
+//     → CharClassesKernel(wsCC)  → WS_Mask   1 at every whitespace codepoint
+//     → InvertMaskKernel         → nonWS     1 at every non-whitespace codepoint
 //
 //   Leading path (stripLeading):
-//     → StripLeadingMaskKernel                   → leadDelete
+//     nonWS → StripLeadingMaskKernel          → leadDelete
 //
 //   Trailing path (stripTrailing):
-//     nonWS → AddSentinel                        → nonWS_s  (N+1, sentinel at N)
-//     nonWS → EOFbit                             → eofMark  (N+1, 1 only at N)
-//     nonWS_s + eofMark → IndexedShiftBack       → lastNWS  (1 at last nonWS pos K)
-//     lastNWS + WS_Spans → StripTrailingMaskKernel → trailDelete
+//     nonWS → AddSentinel                     → nonWS_s
+//     nonWS → EOFbit                          → eofMark
+//     nonWS_s + eofMark → IndexedShiftBack    → lastNWS  (1 at the last non-ws slot)
+//     lastNWS + WS_Mask → StripTrailingMask   → trailDelete
 //
-//   Combine → InvertMaskKernel → KeepMask → FilterByMask → filtered BasisBits
-
-static StreamSet * applyStrip(PipelineBuilder & P, StreamSet * BasisBits,
+//   Combine → InvertMaskKernel → KeepMask → FilterByMask → result (U21)
+static StreamSet * applyStrip(PipelineBuilder & P, StreamSet * U21_focus,
                                bool stripLeading, bool stripTrailing) {
 
-    StreamSet * u8index = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+    // Step 1 — Build the Unicode White_Space character class.
+    // These are the exact codepoints in the Unicode White_Space property
+    // (stable since Unicode 6.3).  We hardcode them here because
+    // CharClassesKernel works on U21 codepoints and needs a re::CC, not
+    // a property name string.
+    re::CC * wsCC = re::makeCC(0x09, 0x0D);              // HT LF VT FF CR
+    wsCC = re::makeCC(wsCC, re::makeCC(0x20));            // SPACE
+    wsCC = re::makeCC(wsCC, re::makeCC(0x85));            // NEL
+    wsCC = re::makeCC(wsCC, re::makeCC(0xA0));            // NBSP
+    wsCC = re::makeCC(wsCC, re::makeCC(0x1680));          // OGHAM SPACE MARK
+    wsCC = re::makeCC(wsCC, re::makeCC(0x2000, 0x200A));  // EN QUAD … HAIR SPACE
+    wsCC = re::makeCC(wsCC, re::makeCC(0x2028, 0x2029));  // LINE SEP / PARA SEP
+    wsCC = re::makeCC(wsCC, re::makeCC(0x202F));          // NARROW NO-BREAK SPACE
+    wsCC = re::makeCC(wsCC, re::makeCC(0x205F));          // MEDIUM MATH SPACE
+    wsCC = re::makeCC(wsCC, re::makeCC(0x3000));          // IDEOGRAPHIC SPACE
 
-    re::RE * wsRE = re::simplifyRE(re::RE_Parser::parse("\\p{White_Space}"));
-    wsRE = UCD::linkAndResolve(wsRE);
-    wsRE = UCD::externalizeProperties(wsRE);
-    re::Name * wsName = llvm::cast<re::Name>(wsRE);
-
+    // Step 2 — Mark which slots are whitespace.
+    // CharClassesKernel outputs a 1-bit stream: 1 = whitespace, 0 = not.
+    // Because we're in U21 space, each slot is already one codepoint —
+    // no byte-span extension needed.
     StreamSet * WS_Mask = P.CreateStreamSet(1, 1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(wsName, BasisBits, WS_Mask);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC*>{wsCC}, U21_focus, WS_Mask);
 
-    StreamSet * WS_Spans = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<U8Spans>(WS_Mask, u8index, WS_Spans);
-
+    // Step 3 — Flip the mask to get non-whitespace positions.
+    // The leading/trailing kernels below need to know WHERE the non-ws chars are.
     StreamSet * nonWS = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<InvertMaskKernel>(WS_Spans, nonWS);
+    P.CreateKernelCall<InvertMaskKernel>(WS_Mask, nonWS);
 
     StreamSet * deleteMask = nullptr;
 
+    // Step 4a — Leading strip.
+    // StripLeadingMaskKernel uses MatchStar to mark every slot before the
+    // first non-whitespace slot as "delete".
     if (stripLeading) {
         StreamSet * leadDelete = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<StripLeadingMaskKernel>(nonWS, leadDelete);
         deleteMask = leadDelete;
     }
 
+    // Step 4b — Trailing strip.
+    // We find the LAST non-whitespace slot using a sentinel + IndexedShiftBack,
+    // then mark everything after it that is whitespace as "delete".
     if (stripTrailing) {
-        // Sentinel approach: shift the EOF marker back through the nonWS index
-        // to land at the last nonWS position K.
+        // AddSentinel appends a sentinel bit so IndexedShiftBack has a
+        // guaranteed stopping point at the end of the stream.
         StreamSet * nonWS_s = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<AddSentinel>(nonWS, nonWS_s);
 
+        // EOFbit produces a single 1 at the very last position of the stream.
         StreamSet * eofMark = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<EOFbit>(nonWS, eofMark);
 
+        // IndexedShiftBack slides the EOF marker backwards through nonWS_s
+        // until it lands on the last non-whitespace position K.
         StreamSet * lastNWS = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<IndexedShiftBack>(nonWS_s, eofMark, lastNWS);
 
+        // StripTrailingMaskKernel marks every slot after K that is whitespace.
+        // Note: we pass WS_Mask directly — in U21 space it already has
+        // exactly one 1 per whitespace codepoint, no U8Spans needed.
         StreamSet * trailDelete = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<StripTrailingMaskKernel>(lastNWS, WS_Spans, trailDelete);
+        P.CreateKernelCall<StripTrailingMaskKernel>(lastNWS, WS_Mask, trailDelete);
 
         if (deleteMask != nullptr) {
+            // Both leading and trailing: OR the two delete masks together.
             StreamSet * combined = P.CreateStreamSet(1, 1);
             P.CreateKernelCall<OrMaskKernel>(deleteMask, trailDelete, combined);
             deleteMask = combined;
@@ -279,111 +332,115 @@ static StreamSet * applyStrip(PipelineBuilder & P, StreamSet * BasisBits,
         }
     }
 
-    if (deleteMask == nullptr) return BasisBits;
+    // If neither flag was set, nothing to do — return the input unchanged.
+    if (deleteMask == nullptr) return U21_focus;
 
+    // Step 5 — Keep everything that is NOT marked for deletion.
     StreamSet * KeepMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<InvertMaskKernel>(deleteMask, KeepMask);
 
-    StreamSet * FilteredBasis = P.CreateStreamSet(8, 1);
-    FilterByMask(P, KeepMask, BasisBits, FilteredBasis);
-
-    return FilteredBasis;
+    // Step 6 — Compress: remove the deleted slots from the U21 stream.
+    StreamSet * result = P.CreateStreamSet(21, 1);
+    FilterByMask(P, KeepMask, U21_focus, result);
+    return result;
 }
 // applyByteLevel — GPT-2 byte alphabet normalization.
 //
-// Maps every input byte to a unique printable Unicode codepoint using the GPT-2
-// byte alphabet (same mapping as the bytelevel pre-tokenizer), then re-encodes
-// the result as UTF-8.  The output byte stream is a valid UTF-8 string where
-// every original byte is represented by exactly one printable character.
+// This is the ONE exception in our U21 pipeline: it must work on raw bytes
+// because it maps each individual byte (0x00-0xFF) to a unique printable
+// Unicode codepoint.  If we stayed in U21, a character like 中 (one codepoint)
+// would lose its three individual bytes — so we must go back to bytes first.
+//
+// Key insight: applyByteLevelEncoding already RETURNS U21 (one output codepoint
+// per input byte), so we stay in U21 after it — no second encode needed.
+// The old version wrongly called U21_to_UTF8 after it, which applyNormalization
+// would then immediately decode back to U21 — a wasted round-trip.
+static StreamSet * applyByteLevel(PipelineBuilder & P, StreamSet * U21_focus) {
+    // Step 1 — Encode our current U21 stream back to UTF-8 bytes.
+    // We need raw bytes because the mapping is per-byte, not per-codepoint.
+    StreamSet * bytes = encodeFromU21(P, U21_focus);
 
-static StreamSet * applyByteLevel(PipelineBuilder & P, StreamSet * BasisBits) {
-    StreamSet * codepoints = applyByteLevelEncoding(P, BasisBits);
-    StreamSet * OutputBasis = P.CreateStreamSet(8, 1);
-    U21_to_UTF8(P, codepoints, OutputBasis);
-    return OutputBasis;
+    // Step 2 — Apply the GPT-2 byte alphabet mapping.
+    // Each byte becomes one printable Unicode codepoint.
+    // applyByteLevelEncoding returns a U21 stream directly — we're back in
+    // U21 space and can continue chaining other normalizers.
+    return applyByteLevelEncoding(P, bytes);
 }
 // applyLowercase — map all uppercase codepoints to lowercase
 // using full Unicode Lower_Case (UCD::lc) via U21_StringOverridePipeline.
-static StreamSet * applyLowercase(PipelineBuilder & P, StreamSet * BasisBits) {
-    // decode the raw UTF-8 bytes into 21-bit Unicode codepoint values
-    StreamSet * U21 = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
-
-    StreamSet * u8index = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-
-    // Remove the multi-byte padding, there's exactly one position per codepoint.
-    StreamSet * U21_focus = P.CreateStreamSet(21, 1);
-    FilterByMask(P, u8index, U21, U21_focus);
+// Takes U21_focus directly — the old 6-line decode/encode wrapper is gone.
+// U21_StringOverridePipeline handles 1-to-N expansions (some characters
+// lowercase into two codepoints in certain languages).
+static StreamSet * applyLowercase(PipelineBuilder & P, StreamSet * U21_focus) {
 
     // Full Unicode Lower_Case — handles 1→N expansions like İ → i\u0307.
-    StreamSet * LC_U21 = U21_StringOverridePipeline(P, UCD::lc, U21_focus);
-
-    StreamSet * Output = P.CreateStreamSet(8, 1);
-    U21_to_UTF8(P, LC_U21, Output);
-    return Output;
+    return U21_StringOverridePipeline(P, UCD::lc, U21_focus);
 }
-// applyNFD — convert UTF-8 input to NFD form.
-static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * BasisBits) {
+// applyNFD — canonical decomposition in U21 space.
+// NFD_U21_Pipeline already exists in NFD_PipelineBuilder and returns U21
+// directly, so we no longer need an intermediate byte streamset.
+// e.g. U+00E9 (e-acute, one slot) becomes U+0065 + U+0301 (two slots).
+static StreamSet * applyNFD(PipelineBuilder & P, StreamSet * U21_focus) {
     NFD_PipelineBuilder nfd(P);
-    StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
-    nfd.NFD_U8_Pipeline(BasisBits, TransformedBasis);
-    return TransformedBasis;
+    // Takes U21_focus (one codepoint per slot), returns the decomposed U21.
+    return nfd.NFD_U21_Pipeline(U21_focus);
 }
-// applyNFKD — convert UTF-8 input to NFKD form (compatibility decomposition).
-static StreamSet * applyNFKD(PipelineBuilder & P, StreamSet * BasisBits) {
+// applyNFKD — compatibility decomposition in U21 space.
+// Same pattern as applyNFD but uses NFKD_U21_Pipeline, which applies the
+// more aggressive compatibility decomposition on top of canonical decomposition.
+// e.g. U+FB01 (fi ligature, one slot) becomes U+0066 + U+0069 (two slots).
+static StreamSet * applyNFKD(PipelineBuilder & P, StreamSet * U21_focus) {
     NFD_PipelineBuilder nfd(P);
-    StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
-    nfd.NFKD_U8_Pipeline(BasisBits, TransformedBasis);
-    return TransformedBasis;
+    // Takes U21_focus (one codepoint per slot), returns the decomposed U21.
+    return nfd.NFKD_U21_Pipeline(U21_focus);
 }
-// applyDeleteAndSpaceReplace — generic per-codepoint cleanup pipeline.
-// Deletes codepoints matching delCC, replaces codepoints matching repCC with
+// applyDeleteAndSpaceReplace — shared engine for applyNmt and applyBertCleanText.
+// Deletes every codepoint in delCC, replaces every codepoint in repCC with
+// U+0020 (space), and passes everything else through unchanged.
+//
+// Now takes U21_focus directly — the old 7-line decode block at the top
+// and 2-line encode at the bottom are gone.  The actual logic is unchanged.
 static StreamSet * applyDeleteAndSpaceReplace(PipelineBuilder & P,
-                                              StreamSet * BasisBits,
+                                              StreamSet * U21_focus,
                                               re::CC * delCC,
                                               re::CC * repCC) {
-    // Decode bytes → U21 codepoints (with multi-byte padding).
-    StreamSet * U21 = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
-
-    // u8index = 1 at the LAST byte of each UTF-8 char.
-    StreamSet * u8index = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-
-    // U21_focus: one position per codepoint (no multi-byte padding).
-    StreamSet * U21_focus = P.CreateStreamSet(21, 1);
-    FilterByMask(P, u8index, U21, U21_focus);
-
+    // Step 1 — Mark which codepoints to DELETE.
+    // CharClassesKernel scans every slot in U21_focus and outputs 1 wherever
+    // the codepoint falls inside delCC.
     StreamSet * DelMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<CharClassesKernel>(
         std::vector<re::CC*>{delCC}, U21_focus, DelMask);
 
+    // Step 2 — Mark which codepoints to REPLACE with space.
     StreamSet * RepMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<CharClassesKernel>(
         std::vector<re::CC*>{repCC}, U21_focus, RepMask);
 
-    // At RepMask positions, force codepoint to 0x20 (space).
+    // Step 3 — Write U+0020 at every RepMask position.
+    // NmtReplaceKernel21 forces bit 5 = 1 and all other bits = 0 (= 0x20)
+    // at those positions, leaving all other slots untouched.
     StreamSet * ReplacedU21 = P.CreateStreamSet(21, 1);
     P.CreateKernelCall<NmtReplaceKernel21>(U21_focus, RepMask, ReplacedU21);
 
-    // Filter out delete positions: KeepMask = NOT DelMask
+    // Step 4 — Build a keep-mask: 1 = keep this slot, 0 = delete it.
+    // We invert DelMask so that non-deleted slots are marked 1.
     StreamSet * KeepMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<InvertMaskKernel>(DelMask, KeepMask);
 
+    // Step 5 — Compress: squeeze out the deleted slots.
+    // FilterByMask removes every slot where KeepMask = 0.
     StreamSet * FilteredU21 = P.CreateStreamSet(21, 1);
     FilterByMask(P, KeepMask, ReplacedU21, FilteredU21);
-
-    // Re-encode codepoints → UTF-8 bytes.
-    StreamSet * Output = P.CreateStreamSet(8, 1);
-    U21_to_UTF8(P, FilteredU21, Output);
-    return Output;
+    return FilteredU21;
 }
 
 // applyNmt
 // Deletes a fixed set of control characters and replaces a fixed set of
 // whitespace/special characters with U+0020 (space).
-static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
+// applyNmt — Google NMT preprocessing.
+// Just builds the delete/replace character sets and hands them to the engine.
+// Only change from before: parameter is now U21_focus instead of BasisBits.
+static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * U21_focus) {
     // DELETE: U+0001-U+0008, U+000B, U+000E-U+001F, U+007F
     re::CC * delCC = re::makeCC(0x01, 0x08);
     delCC = re::makeCC(delCC, re::makeCC(0x0B));
@@ -400,39 +457,42 @@ static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * BasisBits) {
     repCC = re::makeCC(repCC, re::makeCC(0xFEFF));
     repCC = re::makeCC(repCC, re::makeCC(0xFFFD));
 
-    return applyDeleteAndSpaceReplace(P, BasisBits, delCC, repCC);
+    return applyDeleteAndSpaceReplace(P, U21_focus, delCC, repCC);
 }
 
 // applyBertCleanText — BERT BasicTokenizer's _clean_text.
 // Deletes \p{C} codepoints (control/format/surrogate/private/unassigned) plus
 // U+FFFD, EXCEPT \t \n \r which are kept-but-replaced.  Replaces \p{Zs} (space
 // separator) plus \t \n \r with U+0020. 
-static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * BasisBits) {
+// applyBertCleanText — BERT BasicTokenizer's _clean_text.
+// Just builds the delete/replace character sets and hands them to the engine.
+// Only change from before: parameter is now U21_focus instead of BasisBits.
+static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * U21_focus) {
     auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
         UCD::getPropertyObject(UCD::gc));
 
-    // Delete = \p{C} - {\t, \n, \r} + {U+FFFD}.
-    // Build \p{C} as the union of its five subcategories (Cc, Cf, Cs, Co, Cn).
+    // DELETE: all of \p{C} (five subcategories) minus \t \n \r, plus U+FFFD.
+    // \p{C} = control/format/surrogate/private-use/unassigned codepoints.
     UCD::UnicodeSet delSet;
     delSet.insert(gcObj->GetCodepointSet("Cc"));
     delSet.insert(gcObj->GetCodepointSet("Cf"));
     delSet.insert(gcObj->GetCodepointSet("Cs"));
     delSet.insert(gcObj->GetCodepointSet("Co"));
     delSet.insert(gcObj->GetCodepointSet("Cn"));
-    delSet = delSet - UCD::UnicodeSet(0x09)   // \t
-                    - UCD::UnicodeSet(0x0A)   // \n
-                    - UCD::UnicodeSet(0x0D);  // \r
+    delSet = delSet - UCD::UnicodeSet(0x09)   // \t — kept but replaced
+                    - UCD::UnicodeSet(0x0A)   // \n — kept but replaced
+                    - UCD::UnicodeSet(0x0D);  // \r — kept but replaced
     delSet.insert(0xFFFD);
     re::CC * delCC = re::makeCC(delSet, &cc::Unicode);
 
-    // Replace = \p{Zs} + {\t, \n, \r} - with space.
+    // REPLACE with space: \p{Zs} (space separators) plus \t \n \r.
     UCD::UnicodeSet repSet = gcObj->GetCodepointSet("Zs");
     repSet.insert(0x09);
     repSet.insert(0x0A);
     repSet.insert(0x0D);
     re::CC * repCC = re::makeCC(repSet, &cc::Unicode);
 
-    return applyDeleteAndSpaceReplace(P, BasisBits, delCC, repCC);
+    return applyDeleteAndSpaceReplace(P, U21_focus, delCC, repCC);
 }
 
 // applyBertChineseChars — BERT handle_chinese_chars=True.
@@ -450,16 +510,10 @@ static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * BasisBits
 //   preResult  →  SpreadByMask                                →  postSpread
 //              →  NmtReplaceKernel21(NOT postMask)            →  postResult
 //
-//   postResult  →  U21_to_UTF8  →  Output
-static StreamSet * applyBertChineseChars(PipelineBuilder & P, StreamSet * BasisBits) {
-    // Decode UTF-8 → one U21 codepoint per position
-    StreamSet * U21 = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
-    StreamSet * u8index = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-    StreamSet * U21_focus = P.CreateStreamSet(21, 1);
-    FilterByMask(P, u8index, U21, U21_focus);
-
+//   postResult  →  returned as U21 (applyNormalization encodes at the end)
+// Takes U21_focus directly — the 5-line decode at the top and the 2-line
+// encode at the bottom are gone. Every step inside was already U21.
+static StreamSet * applyBertChineseChars(PipelineBuilder & P, StreamSet * U21_focus) {
     // CJK ranges — identical to HuggingFace BertTokenizer._is_chinese_char
     re::CC * cjkCC = re::makeCC(0x3400,  0x4DBF);   // Extension A
     cjkCC = re::makeCC(cjkCC, re::makeCC(0x4E00,  0x9FFF));   // Unified Ideographs
@@ -502,39 +556,55 @@ static StreamSet * applyBertChineseChars(PipelineBuilder & P, StreamSet * BasisB
     StreamSet * postResult = P.CreateStreamSet(21, 1);
     P.CreateKernelCall<NmtReplaceKernel21>(postSpread, insertMark2, postResult);
 
-    StreamSet * Output = P.CreateStreamSet(8, 1);
-    U21_to_UTF8(P, postResult, Output);
-    return Output;
+    // Return U21 directly — no encode needed, applyNormalization handles that.
+    return postResult;
 }
 
-// applyOneNormalization — dispatch a single mode to the right kernel.
-StreamSet * applyOneNormalization(PipelineBuilder & P,
-                               StreamSet * BasisBits,
-                               NormalizationMode mode) {
+// applyOneNormalization — dispatch a single mode in U21 space.
+// Takes U21_focus (one codepoint per slot) and returns a transformed U21 stream.
+// Every normalizer above now speaks U21, so this is a pure U21-to-U21 dispatch.
+static StreamSet * applyOneNormalization(PipelineBuilder & P,
+                                         StreamSet * U21_focus,
+                                         NormalizationMode mode) {
+    // NormStripAccents: NFD decompose first so accents are isolated, then delete Mn.
+    // Both applyNFD and applyStripAccents now work in U21, so we chain them directly.
+    if (mode == NormStripAccents)     return applyStripAccents(P, applyNFD(P, U21_focus));
 
-    if (mode == NormByteLevel)    return applyByteLevel(P, BasisBits);
-    if (mode == NormStripAccents) return applyStripAccents(P, applyNFD(P, BasisBits));
-    if (mode == NormStripLeft)    return applyStrip(P, BasisBits, true,  false);
-    if (mode == NormStripRight)   return applyStrip(P, BasisBits, false, true);
-    if (mode == NormStrip)        return applyStrip(P, BasisBits, true,  true);
-    if (mode == NormNFD)          return applyNFD(P, BasisBits);
-    if (mode == NormNFKD)         return applyNFKD(P, BasisBits);
-    //if (mode == NormNFC)        return applyNFC(P, BasisBits);
-    if (mode == NormLowercase)    return applyLowercase(P, BasisBits);
-    if (mode == NormNmt)              return applyNmt(P, BasisBits);
-    if (mode == NormBertCleanText)    return applyBertCleanText(P, BasisBits);
-    if (mode == NormBertChineseChars) return applyBertChineseChars(P, BasisBits);
+    if (mode == NormByteLevel)        return applyByteLevel(P, U21_focus);
+    if (mode == NormStripLeft)        return applyStrip(P, U21_focus, true,  false);
+    if (mode == NormStripRight)       return applyStrip(P, U21_focus, false, true);
+    if (mode == NormStrip)            return applyStrip(P, U21_focus, true,  true);
+    if (mode == NormNFD)              return applyNFD(P, U21_focus);
+    if (mode == NormNFKD)             return applyNFKD(P, U21_focus);
+    //if (mode == NormNFC)            return applyNFC(P, U21_focus);
+    if (mode == NormLowercase)        return applyLowercase(P, U21_focus);
+    if (mode == NormNmt)              return applyNmt(P, U21_focus);
+    if (mode == NormBertCleanText)    return applyBertCleanText(P, U21_focus);
+    if (mode == NormBertChineseChars) return applyBertChineseChars(P, U21_focus);
 
-    return BasisBits;  // NormNone — pass-through
+    return U21_focus;  // NormNone — pass-through
 }
 
-// applyNormalization — apply a sequence of normalizations in order.
-// normalizers.Sequence([N1, N2, ...]).
+// applyNormalization — THE PAYOFF.
+// Decode UTF-8 → U21 exactly once at the start, run every normalization step
+// in U21 space (one codepoint per slot, no byte gymnastics), then encode back
+// to UTF-8 exactly once at the end.
+//
+// Before this refactor, a 3-step chain like bertcleantext,bertchinesechars,lowercase
+// decoded and re-encoded 3 times (6 round-trips total).  Now it's 1 decode + 1 encode
+// no matter how many steps are in the chain.
 StreamSet * applyNormalization(PipelineBuilder & P,
                                StreamSet * BasisBits,
                                const std::vector<NormalizationMode> & modes) {
+    // Step 1 — Decode UTF-8 bytes to U21 codepoints, one per stream slot.
+    StreamSet * U21_focus = decodeToU21(P, BasisBits);
+
+    // Step 2 — Apply each normalizer in order, fully in U21 space.
+    // Each step receives the output of the previous one as its input.
     for (NormalizationMode m : modes) {
-        BasisBits = applyOneNormalization(P, BasisBits, m);
+        U21_focus = applyOneNormalization(P, U21_focus, m);
     }
-    return BasisBits;
-} 
+
+    // Step 3 — Encode the final U21 stream back to UTF-8 bytes.
+    return encodeFromU21(P, U21_focus);
+}

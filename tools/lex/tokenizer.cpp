@@ -25,6 +25,9 @@
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/stream_select.h>
+#include <kernel/scan/index_generator.h>
+#include <kernel/scan/reader.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <fstream>
@@ -38,6 +41,47 @@
 using namespace llvm;
 using namespace codegen;
 using namespace kernel;
+using namespace pablo;
+
+// Global BPE state accessed by the scan callback.
+// Both are set in main() before invoking the compiled BPE pipeline function.
+static const BPETokenizer * gBPE           = nullptr;
+static bool                  gOutputStrings = false;
+
+// bpe_emit_token
+// Called once per surviving BPE token by the scan::Reader stage.
+// lo_ptr points into the lo-byte stream at the token's compressed position;
+// hi is the matching high byte of the 16-bit vocab ID.
+// Reconstructs the full token ID and writes it (or its string) to stdout.
+extern "C" void bpe_emit_token(const uint8_t * lo_ptr, uint8_t hi) {
+    uint16_t id = static_cast<uint16_t>(*lo_ptr)
+                | (static_cast<uint16_t>(hi) << 8);
+    if (gOutputStrings && gBPE)
+        llvm::outs() << gBPE->decodeToken(static_cast<int>(id)) << "\n";
+    else
+        llvm::outs() << id << "\n";
+}
+
+// AllTokenMarkKernel 
+// Marks every in-file position with a 1.  In the compressed BPE output stream
+// every surviving position is one complete token, so this gives one scan event
+// per token to the downstream ScanIndexGenerator.
+class AllTokenMarkKernel : public PabloKernel {
+public:
+    AllTokenMarkKernel(LLVMTypeSystemInterface & ts,
+                       StreamSet * input,
+                       StreamSet * marks)
+    : PabloKernel(ts, "BPE_AllTokenMark",
+                  {Binding{"input", input}},
+                  {Binding{"marks", marks}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * allMarks = pb.createInFile(pb.createNot(pb.createZeroes()));
+        Var * out = getOutputStreamVar("marks");
+        pb.createAssign(pb.createExtract(out, pb.getInteger(0)), allMarks);
+    }
+};
 
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required,
@@ -135,6 +179,101 @@ static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
     P.CreateKernelCall<StdOutKernel>(output);
 }
 
+//  bpePipeline 
+//
+// Full parallel BPE pipeline.  Takes a file descriptor, runs normalization +
+// pre-tokenization + depth-stratified BPE merge passes entirely in SIMD
+// stream kernels, and writes raw 16-bit token IDs (little-endian) to stdout.
+//
+// Building the pipeline:
+//   Stage 0  I/O + S2P
+//   Stage 1  Normalization    → U21codepoints  (one slot per input character)
+//   Stage 2  Pre-tokenization → ptResult       (including U21tokenBoundaries)
+//   Stage 3  buildInitialSymID                 → initialSymID (16×1 BixNum)
+//   Stage 4  runBPEPipeline                    → finalSymID   (compressed)
+//
+// The bpe object must have both vocab and merges loaded before this is called.
+// mergesByDepth is filled by BPETokenizer::loadMergesWithDepth.
+// 
+using BPEPipelineFunctionType = void (*)(uint32_t fd);
+
+static BPEPipelineFunctionType buildBPEPipeline(
+        CPUDriver & driver,
+        const BPETokenizer & bpe,
+        const std::vector<std::vector<MergeRule>> & mergesByDepth) {
+
+    auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
+    Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
+
+    // Stage 0: I/O
+    StreamSet * ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    StreamSet * BasisBits = P.CreateStreamSet(8, 1);
+    P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
+
+    // Stage 1: normalization → U21
+    std::vector<NormalizationMode> normModes(Normalization.begin(), Normalization.end());
+    StreamSet * U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
+    StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
+    U21_to_UTF8(P, U21codepoints, normalizedBasis);
+
+    // Stage 2: pre-tokenization — gives us the pre-token boundary marks.
+    // U21tokenBoundaries[p] = 1 at the start of each new pre-token, so a
+    // BPE merge at position p is blocked when U21tokenBoundaries[p+1] = 1.
+    PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
+        P, normalizedBasis, U21codepoints,
+        PreTokenizer, SplitBehavior, DelimiterString);
+    StreamSet * ptBound = ptResult.U21tokenBoundaries;
+
+    // Stage 3: map each U21 codepoint to its initial BPE vocab ID.
+    // buildInitialSymID wraps InitialSymIDKernel which uses the (codepoint →
+    // vocab_ID) table built by BPETokenizer::buildInitialVocabMap().
+    StreamSet * initialSymID = buildInitialSymID(P, ptResult.U21codepoints, bpe);
+
+    // Stage 4: D depth-level merge passes.
+    // Each pass runs BPEMergePassKernel over the full document in SIMD,
+    // then FilterByMask compresses out consumed right-side positions.
+    // After all passes, finalSymID holds one slot per output token.
+    StreamSet * finalSymID = runBPEPipeline(P, initialSymID, ptBound, mergesByDepth);
+
+    // Stage 5: emit token IDs.
+    //
+    // finalSymID is a 16×1 BixNum (16 parallel 1-bit streams encoding a
+    // 16-bit integer per position).  We need one scan callback per surviving
+    // token.  The scan::Reader pattern requires:
+    //   (a) a byte-width source stream (field width != 1)
+    //   (b) a 64-bit index stream (from ScanIndexGenerator)
+    //   (c) optional per-token data streams
+    //
+    // Strategy:
+    //   1. Split the BixNum into bits 0-7 (lo) and bits 8-15 (hi).
+    //   2. Pack each half to a byte stream via P2SKernel.
+    //   3. Mark every compressed position as a token (AllTokenMarkKernel).
+    //   4. ScanIndexGenerator → one index per token.
+    //   5. scan::Reader calls bpe_emit_token(lo_ptr, hi_byte) per token.
+    namespace su = kernel::streamutils;
+    StreamSet * lo8basis = su::Select(P, finalSymID,
+                               std::vector<uint32_t>{0,1,2,3,4,5,6,7});
+    StreamSet * hi8basis = su::Select(P, finalSymID,
+                               std::vector<uint32_t>{8,9,10,11,12,13,14,15});
+
+    StreamSet * loBytes = P.CreateStreamSet(1, 8);
+    StreamSet * hiBytes = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<P2SKernel>(lo8basis, loBytes);
+    P.CreateKernelCall<P2SKernel>(hi8basis, hiBytes);
+
+    StreamSet * tokenMarks = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<AllTokenMarkKernel>(loBytes, tokenMarks);
+
+    StreamSet * scanIndices = P.CreateStreamSet(1, 64);
+    P.CreateKernelCall<ScanIndexGenerator>(tokenMarks, scanIndices);
+
+    scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),
+                 loBytes, scanIndices, {hiBytes});
+
+    return reinterpret_cast<BPEPipelineFunctionType>(P.compile());
+}
+
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
 
@@ -185,32 +324,32 @@ int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, 
         {&wordBreakerFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
-    //  two-step BPE mode 
-    // Input file is already pre-tokenized
-    // tokenizer --pretokenizer bytelevel input.txt > pretokens.txt
-    // tokenizer --vocab vocab.json --merges merges.txt pretokens.txt
+    // BPE pipeline mode — enabled when both --vocab and --merges are supplied.
+    // Runs the full integrated pipeline: I/O → normalize → pre-tokenize →
+    // initial symbol assignment → depth-stratified BPE merges → emit IDs.
     if (!VocabFile.empty() && !MergesFile.empty()) {
         BPETokenizer bpe;
-        if (!bpe.loadVocab(VocabFile) || !bpe.loadMerges(MergesFile))
+        if (!bpe.loadVocab(VocabFile))
             return 1;
 
-        std::ifstream inFile(inputFile.c_str());
-        if (!inFile.is_open()) {
-            llvm::errs() << "Error: cannot open " << inputFile << "\n";
+        std::vector<std::vector<MergeRule>> mergesByDepth;
+        if (!bpe.loadMergesWithDepth(MergesFile, mergesByDepth))
+            return 1;
+
+        // Wire globals used by bpe_emit_token.
+        gBPE           = &bpe;
+        gOutputStrings = OutputStrings;
+
+        CPUDriver driver("bpe_tokenizer");
+        BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe, mergesByDepth);
+
+        const int fd = open(inputFile.c_str(), O_RDONLY);
+        if (LLVM_UNLIKELY(fd == -1)) {
+            llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
             return 1;
         }
-        std::vector<std::string> preTokens;
-        std::string line;
-        while (std::getline(inFile, line))
-            if (!line.empty()) preTokens.push_back(line);
-
-        std::vector<int> ids = bpe.encodePreTokens(preTokens);
-        for (int id : ids) {
-            if (OutputStrings)
-                llvm::outs() << bpe.decodeToken(id) << "\n";
-            else
-                llvm::outs() << id << "\n";
-        }
+        bpeFn(fd);
+        close(fd);
         return 0;
     }
 

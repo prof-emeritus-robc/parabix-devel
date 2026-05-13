@@ -25,6 +25,7 @@ DEPS
     kernel.unicode
     kernel.pipeline
     kernel.streamutils
+    kernel.scan
     kernel.bitwise
     kernel.util
     toolchain

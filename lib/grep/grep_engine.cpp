@@ -581,6 +581,10 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
                                    StreamSet * MatchSpans,
                                    StreamSet * Basis) {
 
+    if (UsePhaseForColourization) {
+        P.InsertPhaseBoundary();
+    }
+
     Scalar * const callbackObject = P.getInputScalar("callbackObject");
 
     auto makeNestedColourizationPipeline = [&](PipelineBuilder & E) {

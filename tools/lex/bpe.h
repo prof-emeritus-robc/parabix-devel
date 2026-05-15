@@ -65,7 +65,10 @@ kernel::StreamSet * buildInitialSymID(
     const BPETokenizer       & bpe);
 
 // runBPEPipeline
-//   Wires D BPEMergePassKernel passes into the enclosing pipeline.
+//   Wires D depth passes into the enclosing pipeline.  Each depth pass uses
+//   the two-kernel Detect+Resolve split for HuggingFace-equivalent
+//   rank-priority conflict resolution (lowest-rank rule wins across
+//   adjacent overlapping merges).
 //   symID         16×1 BixNum — initial symbol IDs from buildInitialSymID.
 //   ptBound       1×1 — 1 at every pre-token boundary.
 //   mergesByDepth from BPETokenizer::loadMergesWithDepth.
@@ -75,3 +78,24 @@ kernel::StreamSet * runBPEPipeline(
     kernel::StreamSet                             * symID,
     kernel::StreamSet                             * ptBound,
     const std::vector<std::vector<MergeRule>>     & mergesByDepth);
+
+// ── Line-delimited pretokenizer (inline; for compare_bpe.py step 2) ─────────
+//
+// When `tokenizer --vocab=... --merges=... pretokens.txt` is invoked without
+// a `--pretokenizer` flag, the input is one-pretoken-per-line bytelevel text.
+// This helper builds the BPE-mode inputs directly from the U21 stream:
+//   - Detects '\n' (U+000A) codepoints as pretoken separators.
+//   - Marks ptBound at each position immediately after a newline.
+//   - Filters newline positions out of both u21 and ptBound so the
+//     downstream BPE kernels never see them.
+//
+// Returns: compressed u21 (newlines removed) and the corresponding ptBound
+// (1 at every first-position of a pretoken, in the compressed domain).
+struct LinePretokensResult {
+    kernel::StreamSet * u21Compressed;
+    kernel::StreamSet * ptBoundCompressed;
+};
+
+LinePretokensResult buildLinePretokens(
+    kernel::PipelineBuilder & P,
+    kernel::StreamSet       * u21);

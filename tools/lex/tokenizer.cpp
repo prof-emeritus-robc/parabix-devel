@@ -217,23 +217,41 @@ static BPEPipelineFunctionType buildBPEPipeline(
     StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
     U21_to_UTF8(P, U21codepoints, normalizedBasis);
 
-    // Stage 2: pre-tokenization — gives us the pre-token boundary marks.
-    // U21tokenBoundaries[p] = 1 at the start of each new pre-token, so a
-    // BPE merge at position p is blocked when U21tokenBoundaries[p+1] = 1.
-    PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
-        P, normalizedBasis, U21codepoints,
-        PreTokenizer, SplitBehavior, DelimiterString);
-    StreamSet * ptBound = ptResult.U21tokenBoundaries;
+    // Stage 2: pre-tokenization — produces ptBound + the codepoint stream
+    // that feeds BPE.  Two paths:
+    //   (a) --pretokenizer flag was given  → buildPreTokenizerBoundaries
+    //       (full HF-equivalent pretokenizer pipeline from pretokenizer.cpp).
+    //   (b) no --pretokenizer flag in BPE mode → inline newline mode
+    //       (input is one-pretoken-per-line bytelevel text from
+    //        compare_bpe.py step 1; '\n' marks separators).
+    StreamSet * ptBound;
+    StreamSet * bpeU21;
+    if (PreTokenizer.getNumOccurrences() == 0) {
+        // Path (b): inline newline-based pretokenizer.
+        LinePretokensResult lr = buildLinePretokens(P, U21codepoints);
+        bpeU21  = lr.u21Compressed;
+        ptBound = lr.ptBoundCompressed;
+    } else {
+        // Path (a): existing pretokenizer pipeline.
+        // U21tokenBoundaries[p] = 1 at the start of each new pre-token, so a
+        // BPE merge at position p is blocked when U21tokenBoundaries[p+1] = 1.
+        PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
+            P, normalizedBasis, U21codepoints,
+            PreTokenizer, SplitBehavior, DelimiterString);
+        ptBound = ptResult.U21tokenBoundaries;
+        bpeU21  = ptResult.U21codepoints;
+    }
 
     // Stage 3: map each U21 codepoint to its initial BPE vocab ID.
     // buildInitialSymID wraps InitialSymIDKernel which uses the (codepoint →
     // vocab_ID) table built by BPETokenizer::buildInitialVocabMap().
-    StreamSet * initialSymID = buildInitialSymID(P, ptResult.U21codepoints, bpe);
+    StreamSet * initialSymID = buildInitialSymID(P, bpeU21, bpe);
 
-    // Stage 4: D depth-level merge passes.
-    // Each pass runs BPEMergePassKernel over the full document in SIMD,
-    // then FilterByMask compresses out consumed right-side positions.
-    // After all passes, finalSymID holds one slot per output token.
+    // Stage 4: D depth-level merge passes (Detect+Resolve per depth).
+    // Each pass detects the lowest-rank firing rule per position, resolves
+    // adjacent-merge conflicts by rank, then FilterByMask compresses out
+    // consumed right-side positions.  After all passes, finalSymID holds
+    // one slot per output token.
     StreamSet * finalSymID = runBPEPipeline(P, initialSymID, ptBound, mergesByDepth);
 
     // Stage 5: emit token IDs.

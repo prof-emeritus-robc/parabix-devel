@@ -62,27 +62,6 @@ extern "C" void bpe_emit_token(const uint8_t * lo_ptr, uint8_t hi) {
         llvm::outs() << id << "\n";
 }
 
-// AllTokenMarkKernel 
-// Marks every in-file position with a 1.  In the compressed BPE output stream
-// every surviving position is one complete token, so this gives one scan event
-// per token to the downstream ScanIndexGenerator.
-class AllTokenMarkKernel : public PabloKernel {
-public:
-    AllTokenMarkKernel(LLVMTypeSystemInterface & ts,
-                       StreamSet * input,
-                       StreamSet * marks)
-    : PabloKernel(ts, "BPE_AllTokenMark",
-                  {Binding{"input", input}},
-                  {Binding{"marks", marks}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * allMarks = pb.createInFile(pb.createNot(pb.createZeroes()));
-        Var * out = getOutputStreamVar("marks");
-        pb.createAssign(pb.createExtract(out, pb.getInteger(0)), allMarks);
-    }
-};
-
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required,
                                       cl::cat(wordBreakerFlags));
@@ -179,28 +158,28 @@ static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
     P.CreateKernelCall<StdOutKernel>(output);
 }
 
-//  bpePipeline 
+//  bpePipeline
 //
-// Full parallel BPE pipeline.  Takes a file descriptor, runs normalization +
-// pre-tokenization + depth-stratified BPE merge passes entirely in SIMD
-// stream kernels, and writes raw 16-bit token IDs (little-endian) to stdout.
+// Full parallel BPE pipeline. Takes a file descriptor, runs normalization +
+// pre-tokenization + a vocab-trie longest-match scan entirely in SIMD stream
+// kernels, and writes raw 16-bit token IDs (little-endian) to stdout.
 //
-// Building the pipeline:
+// Stages:
 //   Stage 0  I/O + S2P
-//   Stage 1  Normalization    → U21codepoints  (one slot per input character)
-//   Stage 2  Pre-tokenization → ptResult       (including U21tokenBoundaries)
-//   Stage 3  buildInitialSymID                 → initialSymID (16×1 BixNum)
-//   Stage 4  runBPEPipeline                    → finalSymID   (compressed)
+//   Stage 1  Normalization     → U21codepoints
+//   Stage 2  Pre-tokenization  → codepoint stream feeding BPE
+//   Stage 3  runBPETrie        → (matchEnd, trieVocabID)  per-bucket OR-merged
+//   Stage 4  Emit token IDs at every matchEnd position
 //
-// The bpe object must have both vocab and merges loaded before this is called.
-// mergesByDepth is filled by BPETokenizer::loadMergesWithDepth.
-// 
+// Phase-1: only trie matches (length >= 2) are emitted. Positions where no
+// vocab word ended are silently skipped; single-codepoint fallback will be
+// added in a later phase.
+//
 using BPEPipelineFunctionType = void (*)(uint32_t fd);
 
 static BPEPipelineFunctionType buildBPEPipeline(
         CPUDriver & driver,
-        const BPETokenizer & bpe,
-        const std::vector<std::vector<MergeRule>> & mergesByDepth) {
+        const BPETokenizer & bpe) {
 
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
@@ -217,62 +196,43 @@ static BPEPipelineFunctionType buildBPEPipeline(
     StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
     U21_to_UTF8(P, U21codepoints, normalizedBasis);
 
-    // Stage 2: pre-tokenization — produces ptBound + the codepoint stream
-    // that feeds BPE.  Two paths:
+    // Stage 2: pre-tokenization — produces the codepoint stream that feeds
+    // BPE. Two paths:
     //   (a) --pretokenizer flag was given  → buildPreTokenizerBoundaries
     //       (full HF-equivalent pretokenizer pipeline from pretokenizer.cpp).
     //   (b) no --pretokenizer flag in BPE mode → inline newline mode
     //       (input is one-pretoken-per-line bytelevel text from
     //        compare_bpe.py step 1; '\n' marks separators).
-    StreamSet * ptBound;
     StreamSet * bpeU21;
     if (PreTokenizer.getNumOccurrences() == 0) {
-        // Path (b): inline newline-based pretokenizer.
-        LinePretokensResult lr = buildLinePretokens(P, U21codepoints);
-        bpeU21  = lr.u21Compressed;
-        ptBound = lr.ptBoundCompressed;
+        bpeU21 = buildLinePretokens(P, U21codepoints);
     } else {
-        // Path (a): existing pretokenizer pipeline.
-        // U21tokenBoundaries[p] = 1 at the start of each new pre-token, so a
-        // BPE merge at position p is blocked when U21tokenBoundaries[p+1] = 1.
         PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
             P, normalizedBasis, U21codepoints,
             PreTokenizer, SplitBehavior, DelimiterString);
-        ptBound = ptResult.U21tokenBoundaries;
-        bpeU21  = ptResult.U21codepoints;
+        bpeU21 = ptResult.U21codepoints;
     }
 
-    // Stage 3: map each U21 codepoint to its initial BPE vocab ID.
-    // buildInitialSymID wraps InitialSymIDKernel which uses the (codepoint →
-    // vocab_ID) table built by BPETokenizer::buildInitialVocabMap().
-    StreamSet * initialSymID = buildInitialSymID(P, bpeU21, bpe);
+    // Stage 3: vocab-trie longest-match scan across all (cp0,cp1) buckets.
+    BPETrieResult tr = runBPETrie(P, bpeU21, bpe);
+    StreamSet * matchEnd = tr.matchEnd;
+    StreamSet * vocabID  = tr.vocabID;
 
-    // Stage 4: D depth-level merge passes (Detect+Resolve per depth).
-    // Each pass detects the lowest-rank firing rule per position, resolves
-    // adjacent-merge conflicts by rank, then FilterByMask compresses out
-    // consumed right-side positions.  After all passes, finalSymID holds
-    // one slot per output token.
-    StreamSet * finalSymID = runBPEPipeline(P, initialSymID, ptBound, mergesByDepth);
-
-    // Stage 5: emit token IDs.
+    // Stage 4: emit a token ID at every matchEnd position.
     //
-    // finalSymID is a 16×1 BixNum (16 parallel 1-bit streams encoding a
-    // 16-bit integer per position).  We need one scan callback per surviving
-    // token.  The scan::Reader pattern requires:
-    //   (a) a byte-width source stream (field width != 1)
-    //   (b) a 64-bit index stream (from ScanIndexGenerator)
-    //   (c) optional per-token data streams
+    // vocabID is a 16×1 BixNum (16 parallel 1-bit streams). The scan::Reader
+    // pattern requires a byte-width source stream and a 64-bit index stream.
     //
-    // Strategy:
-    //   1. Split the BixNum into bits 0-7 (lo) and bits 8-15 (hi).
+    //   1. Split vocabID into bits 0-7 (lo) and bits 8-15 (hi).
     //   2. Pack each half to a byte stream via P2SKernel.
-    //   3. Mark every compressed position as a token (AllTokenMarkKernel).
-    //   4. ScanIndexGenerator → one index per token.
-    //   5. scan::Reader calls bpe_emit_token(lo_ptr, hi_byte) per token.
+    //   3. matchEnd marks the right-most codepoint of every matched vocab
+    //      word — use it directly as the per-token scan mark.
+    //   4. ScanIndexGenerator → one index per match.
+    //   5. scan::Reader calls bpe_emit_token(lo_ptr, hi_byte) per match.
     namespace su = kernel::streamutils;
-    StreamSet * lo8basis = su::Select(P, finalSymID,
+    StreamSet * lo8basis = su::Select(P, vocabID,
                                std::vector<uint32_t>{0,1,2,3,4,5,6,7});
-    StreamSet * hi8basis = su::Select(P, finalSymID,
+    StreamSet * hi8basis = su::Select(P, vocabID,
                                std::vector<uint32_t>{8,9,10,11,12,13,14,15});
 
     StreamSet * loBytes = P.CreateStreamSet(1, 8);
@@ -280,11 +240,8 @@ static BPEPipelineFunctionType buildBPEPipeline(
     P.CreateKernelCall<P2SKernel>(lo8basis, loBytes);
     P.CreateKernelCall<P2SKernel>(hi8basis, hiBytes);
 
-    StreamSet * tokenMarks = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<AllTokenMarkKernel>(loBytes, tokenMarks);
-
     StreamSet * scanIndices = P.CreateStreamSet(1, 64);
-    P.CreateKernelCall<ScanIndexGenerator>(tokenMarks, scanIndices);
+    P.CreateKernelCall<ScanIndexGenerator>(matchEnd, scanIndices);
 
     scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),
                  loBytes, scanIndices, {hiBytes});
@@ -342,24 +299,22 @@ int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, 
         {&wordBreakerFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
-    // BPE pipeline mode — enabled when both --vocab and --merges are supplied.
-    // Runs the full integrated pipeline: I/O → normalize → pre-tokenize →
-    // initial symbol assignment → depth-stratified BPE merges → emit IDs.
-    if (!VocabFile.empty() && !MergesFile.empty()) {
+    // BPE pipeline mode — enabled when --vocab is supplied. --merges is
+    // accepted for CLI compatibility but ignored in the trie pipeline.
+    if (!VocabFile.empty()) {
         BPETokenizer bpe;
         if (!bpe.loadVocab(VocabFile))
             return 1;
 
-        std::vector<std::vector<MergeRule>> mergesByDepth;
-        if (!bpe.loadMergesWithDepth(MergesFile, mergesByDepth))
-            return 1;
+        if (!MergesFile.empty()) {
+            std::cerr << "BPE: --merges is ignored in trie pipeline\n";
+        }
 
-        // Wire globals used by bpe_emit_token.
         gBPE           = &bpe;
         gOutputStrings = OutputStrings;
 
         CPUDriver driver("bpe_tokenizer");
-        BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe, mergesByDepth);
+        BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe);
 
         const int fd = open(inputFile.c_str(), O_RDONLY);
         if (LLVM_UNLIKELY(fd == -1)) {

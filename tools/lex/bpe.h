@@ -5,97 +5,78 @@
 
 #pragma once
 
+#include <cstdint>
+#include <map>
 #include <string>
-#include <vector>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
-// Forward declarations — callers using pipeline functions must include the
-// full pipeline headers themselves.  bpe.h stays lightweight.
 namespace kernel {
     class PipelineBuilder;
     class StreamSet;
 }
 
-// One BPE merge rule: (left, right) → merged.
-struct MergeRule {
-    unsigned leftID;    // vocab ID of left symbol
-    unsigned rightID;   // vocab ID of right symbol
-    unsigned mergedID;  // vocab ID of merged output
-    int      rank;      // line number in merges.txt (tiebreaking)
+// Vocabulary trie node — one entry per codepoint along a vocab word's spelling.
+// vocabID >= 0 marks a complete vocab word ending at this trie depth.
+struct TrieNode {
+    std::map<uint32_t, TrieNode> children;
+    int vocabID = -1;
 };
 
-// ── BPETokenizer ─────────────────────────────────────────────────────────────
+// One bucket per distinct (cp0, cp1) two-codepoint prefix found in vocab.
+// prefixVocabID holds the vocab ID when (cp0, cp1) IS itself a two-codepoint
+// vocab word; root.children carry suffixes for vocab words of length >= 3.
+struct VocabBucket {
+    uint32_t cp0 = 0;
+    uint32_t cp1 = 0;
+    int prefixVocabID = -1;
+    TrieNode root;
+};
 
 class BPETokenizer {
 public:
-    // Load token→ID mapping from HuggingFace vocab.json.
     bool loadVocab(const std::string & path);
-
-    // Load merge rules and stratify by depth for parallel execution.
-    // mergesByDepth[d] holds all rules at tree depth d.  Rules at the same
-    // depth are mutually independent — one BPEMergePassKernel pass handles all.
-    bool loadMergesWithDepth(const std::string & path,
-                             std::vector<std::vector<MergeRule>> & mergesByDepth);
 
     bool   isLoaded()  const { return !vocab_.empty(); }
     size_t vocabSize() const { return vocab_.size(); }
 
-    // Map a single token ID back to its string representation.
     std::string decodeToken(int id) const;
 
-    // Returns (codepoint_value, vocab_ID) for every single-character token.
-    // Used by buildInitialSymID to construct the InitialSymIDKernel lookup table.
-    std::vector<std::pair<unsigned,unsigned>> buildInitialVocabMap() const;
+    // Bucketed trie covering vocab words of length >= 2. One bucket per
+    // distinct (cp0, cp1) prefix; each bucket carries a suffix trie for words
+    // of length >= 3.
+    std::vector<VocabBucket> buildVocabBuckets() const;
 
 private:
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string>             idToToken_;
 };
 
-// ── Parabix pipeline integration ─────────────────────────────────────────────
-
-// buildInitialSymID
-//   Maps each U21 codepoint slot to its BPE vocab ID (16×1 BixNum output).
-//   u21 must be the U21 codepoint stream (one slot per input character).
-//   bpe must have vocab loaded before calling.
-kernel::StreamSet * buildInitialSymID(
-    kernel::PipelineBuilder  & P,
-    kernel::StreamSet        * u21,
-    const BPETokenizer       & bpe);
-
-// runBPEPipeline
-//   Wires D depth passes into the enclosing pipeline.  Each depth pass uses
-//   the two-kernel Detect+Resolve split for HuggingFace-equivalent
-//   rank-priority conflict resolution (lowest-rank rule wins across
-//   adjacent overlapping merges).
-//   symID         16×1 BixNum — initial symbol IDs from buildInitialSymID.
-//   ptBound       1×1 — 1 at every pre-token boundary.
-//   mergesByDepth from BPETokenizer::loadMergesWithDepth.
-//   Returns final compressed 16×1 BixNum of output token IDs.
-kernel::StreamSet * runBPEPipeline(
-    kernel::PipelineBuilder                       & P,
-    kernel::StreamSet                             * symID,
-    kernel::StreamSet                             * ptBound,
-    const std::vector<std::vector<MergeRule>>     & mergesByDepth);
-
-// ── Line-delimited pretokenizer (inline; for compare_bpe.py step 2) ─────────
+// runBPETrie
+//   Builds one BPETrieKernel per (cp0, cp1) prefix bucket. Each kernel emits
+//   a per-position matchEnd bit (1 at the last codepoint of any vocab word
+//   that ended there) and a 16-bit vocabID BixNum (the matched token's ID
+//   at matchEnd positions; 0 elsewhere). Within a single bucket, longer
+//   matches override shorter ones at their own end position via nested
+//   Pablo scopes. Across buckets, outputs are bitwise OR-merged pairwise.
 //
-// When `tokenizer --vocab=... --merges=... pretokens.txt` is invoked without
-// a `--pretokenizer` flag, the input is one-pretoken-per-line bytelevel text.
-// This helper builds the BPE-mode inputs directly from the U21 stream:
-//   - Detects '\n' (U+000A) codepoints as pretoken separators.
-//   - Marks ptBound at each position immediately after a newline.
-//   - Filters newline positions out of both u21 and ptBound so the
-//     downstream BPE kernels never see them.
-//
-// Returns: compressed u21 (newlines removed) and the corresponding ptBound
-// (1 at every first-position of a pretoken, in the compressed domain).
-struct LinePretokensResult {
-    kernel::StreamSet * u21Compressed;
-    kernel::StreamSet * ptBoundCompressed;
+//   Phase-1 limitation: cross-bucket conflicts at the same end position are
+//   resolved by simple OR, NOT by longest-match. A separate resolution layer
+//   will handle that.
+struct BPETrieResult {
+    kernel::StreamSet * matchEnd;   //  1×1
+    kernel::StreamSet * vocabID;    // 16×1 BixNum
 };
 
-LinePretokensResult buildLinePretokens(
+BPETrieResult runBPETrie(
+    kernel::PipelineBuilder & P,
+    kernel::StreamSet       * u21,
+    const BPETokenizer      & bpe);
+
+// Line-delimited pretokenizer used when --vocab is given without
+// --pretokenizer (compare_bpe.py step-2 input format).
+// Returns the u21 stream with '\n' codepoints removed via FilterByMask.
+kernel::StreamSet * buildLinePretokens(
     kernel::PipelineBuilder & P,
     kernel::StreamSet       * u21);

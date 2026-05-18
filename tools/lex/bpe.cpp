@@ -2,63 +2,39 @@
  *  Part of the Parabix Project, under the Open Software License 3.0.
  *  SPDX-License-Identifier: OSL-3.0
  *
- *  BPE tokenizer — depth-stratified parallel encoding with
- *  rank-priority conflict resolution (HuggingFace-equivalent semantics).
+ *  BPE tokenizer — vocabulary-trie longest-match scan.
  *
- *  Parallelism key insight
- *  ───────────────────────
- *  BPE merge rules form a DAG.  The merged token AB can only exist AFTER
- *  both A and B exist, so depth(AB) = 1 + max(depth(A), depth(B)).  Rules
- *  at the same depth are mutually independent and can be applied in a
- *  single SIMD pass — BUT when two adjacent merges compete for the same
- *  position, the lower-rank rule wins (HuggingFace BPE semantics).
+ *  Algorithm
+ *  ─────────
+ *  Vocab words of length >= 2 are bucketed by their first two codepoints
+ *  (cp0, cp1). One PabloKernel is emitted per (cp0, cp1) bucket. Inside the
+ *  kernel a nested-scope trie walks the bucket's suffix codepoints
+ *  (codepoint index 2 onward). Each trie level uses
  *
- *  Pipeline structure per depth level d
- *  ─────────────────────────────────────
- *    BPEDetectFiresKernel(symID_d, ptBound_d)  →  ruleRank_d, desiredID_d, fireFlag_d
- *    BPEResolveFiresKernel(symID_d, ruleRank_d, fireFlag_d, desiredID_d)
- *                                              →  newSymID_d + deleteMask_d
- *    InvertStreamKernel(deleteMask_d)          →  keepMask_d
- *    FilterByMask(keepMask_d, newSymID_d)      →  symID_{d+1}     (compressed)
- *    FilterByMask(keepMask_d, ptBound_d)       →  ptBound_{d+1}   (aligned)
+ *      childMark = Advance(parentMark, 1) & EQ(symBN, child_cp)
  *
- *  Why two kernels?
- *  ────────────────
- *  Rank-priority resolution at position p needs to compare the rank of the
- *  merge firing at p against the ranks at p-1 (left neighbor) and p+1
- *  (right neighbor).  Pablo `LookAhead` operations require the source to be
- *  a kernel input binding with `LookAhead(N)` declared — internal Vars
- *  cannot be looked ahead on.  Therefore the rank must cross a kernel
- *  boundary as an output→input stream so the resolution kernel can do
- *  `createLookahead(rank_bit, 1)`.
+ *  to extend the match one codepoint to the right. Pablo `createIf` on the
+ *  child marker runtime-skips dead subtries.
  *
- *  Correctness invariants
- *  ──────────────────────
- *  I1. ptBound compressed alongside symID at every depth — positions stay
- *      aligned.  (Omitting this causes wrong boundary data from depth 1 on.)
- *  I2. Within a depth, rules iterate in rank order so the "beats current
- *      best" update is monotonically decreasing in rank.
- *  I3. Rank-priority survival: a fire at position p survives iff
- *          (rank[p] < rank[p-1] or no fire at p-1)  AND
- *          (rank[p] < rank[p+1] or no fire at p+1)
- *      This matches HuggingFace's "argmin rank over all adjacent pairs"
- *      sequential behavior at the local conflict level.
- *  I4. Detect kernel name encodes depth — different rule sets per depth
- *      must not share a compiled-kernel cache entry.  Resolve kernel is
- *      rule-set-independent but still depth-tagged for cache keying.
+ *  Per-kernel longest match wins: deeper trie nodes overwrite the per-Var
+ *  vocab-ID slots via createSel(parentMark, …, prevVal). Because each match
+ *  fires at the right-most codepoint of its word, distinct word lengths land
+ *  at distinct end positions — overwrite competition is only between vocab
+ *  words ending at the same position via this bucket's trie.
  *
- *  if/scope tree (lib/kernel/util/linebreak_kernel.cpp pattern)
- *  ─────────────────────────────────────────────────────────────
- *  Outer guard if(canMerge) skips all rule work where merging is impossible
- *  (next position is a pre-token boundary).
- *  Per-rule inner guard if(leftMatch) skips right-match + rank-update when
- *  the left symbol doesn't match.  Mirrors UnicodeLinesKernelBuilder
- *  "if(u8pfx,it)" / "if(u8pfx2,it2)".
+ *  Phase-1 limitations
+ *  ───────────────────
+ *   - Single-codepoint vocab tokens are not in the trie; a fallback layer
+ *     covering positions where no >=2-codepoint match fires is not wired.
+ *   - Cross-bucket conflicts at the same end position are OR-merged. A
+ *     subsequent resolution kernel (longest-across-buckets) is not yet
+ *     wired here.
  */
 
 #include "bpe.h"
 #include <fstream>
 #include <iostream>
+#include <cstdint>
 #include <nlohmann/json.hpp>
 #include <pablo/pablo_kernel.h>
 #include <pablo/builder.hpp>
@@ -70,271 +46,249 @@
 using namespace pablo;
 using namespace kernel;
 
+namespace {
 
-//  BPEDetectFiresKernel
-//
-//  Stage A of the rank-priority depth pass.  Tests every rule at this
-//  depth and records, per position p, the LOWEST-rank rule that fires
-//  (i.e. whose left symbol matches symID[p] and whose right symbol matches
-//  symID[p+1], with p+1 not a pretoken start).
-//
-//  Inputs
-//  symID      16×1 BixNum — current symbol IDs.
-//  ptBound    1×1 — 1 at every pre-token boundary.  LookAhead(1) so we can
-//             read ptBound[p+1] from position p.
-//
-//  Outputs
-//  ruleRank   RANK_BITS×1 BixNum — rank of the lowest-rank firing rule
-//             at each position; ∞ (= all-ones) if no rule fires.
-//  desiredID  16×1 BixNum — the mergedID of that lowest-rank rule.
-//  fireFlag   1×1 — 1 iff some rule fires at this position (= ruleRank ≠ ∞).
-//
-//  if/scope tree (linebreak pattern)
-//  ──────────────────────────────────
-//  Outer scope  if(canMerge)  — skip all work where merging is impossible.
-//  Inner scope  if(leftMatch) — skip right-match + rank-update when left misses.
-
-// decides which mergr should fire at each position, if any.  
-// Ranks are stored as a BixNum across multiple Vars so we can do bitwise comparisons and updates.
-    // 1. Should a merge happen here?
-    // 2. Which rule won here?
-    // 3. What should the merged token become?
-class BPEDetectFiresKernel : public PabloKernel {
-public:
-    static constexpr unsigned RANK_BITS = 16;   // ceil(log2(GPT-2 merges)) ≤ 16
-
-    BPEDetectFiresKernel(LLVMTypeSystemInterface & ts,
-                         StreamSet * symID,
-                         StreamSet * ptBound,
-                         StreamSet * ruleRank,
-                         StreamSet * desiredID,
-                         StreamSet * fireFlag,
-                         const std::vector<MergeRule> & rules,
-                         unsigned depth)
-    : PabloKernel(ts,
-                  "BPEDetectFires_D" + std::to_string(depth),
-                  {Binding{"symID",   symID,   FixedRate(), LookAhead(1)},
-                   Binding{"ptBound", ptBound, FixedRate(), LookAhead(1)}},
-                  {Binding{"ruleRank",  ruleRank},
-                   Binding{"desiredID", desiredID},
-                   Binding{"fireFlag",  fireFlag}}),
-      mRules(rules) {}
-
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-
-        // Input streams.
-        std::vector<PabloAST*> symBits = getInputStreamSet("symID");
-        PabloAST * const ptBoundIn   = getInputStreamSet("ptBound")[0];
-
-        // Right symbol bits: rightBits[i] = symID[i+1] = LookAhead(symID[i], 1).
-        std::vector<PabloAST*> rightBits;
-        rightBits.reserve(symBits.size());
-        for (auto * bit : symBits)
-            rightBits.push_back(pb.createLookahead(bit, 1));
-
-        // Can merge if right symbol matches and next position not a pretoken start.
-        PabloAST * canMerge = pb.createNot(pb.createLookahead(ptBoundIn, 1));
-        PabloAST * const ones   = pb.createNot(pb.createZeroes());
-        PabloAST * const zeroes = pb.createZeroes();
-
-        // ruleRank Vars — init to ∞ (all ones).
-        // Rank is stored as a BixNum across RANK_BITS Vars, so we can do bitwise
-        std::vector<Var*> rankBits;
-        rankBits.reserve(RANK_BITS);
-        for (unsigned i = 0; i < RANK_BITS; i++)
-            rankBits.push_back(pb.createVar(
-                "rank_" + std::to_string(i), ones));
-
-        // desiredID Vars (merges)— init to 0 (will mux later: survive ? desired : sym).
-        // Same bitwise storage as rank for easy per-bit updates.
-        std::vector<Var*> desiredBits;
-        desiredBits.reserve(symBits.size());
-        for (size_t i = 0; i < symBits.size(); i++)
-            desiredBits.push_back(pb.createVar(
-                "des_" + std::to_string(i), zeroes));
-
-        // Fire-any flag: set to 1 when any rule fires at this position, else 0.
-        // Did ANY rule match here
-        Var * fireAny = pb.createVar("fireAny", zeroes);
-
-        // Outer guard: if(canMerge) — skip everything where merge impossible.
-        auto mergeScope = pb.createScope();
-        pb.createIf(canMerge, mergeScope);
-        BixNumCompiler bncOuter(mergeScope);
-
-        // Construct BixNums for left and right symbols so we can test rules.
-        BixNum symBN(symBits.begin(), symBits.end());
-        BixNum rightBN(rightBits.begin(), rightBits.end());
-
-        // Iterate over rules in rank order (mRules is pre-sorted by rank) and update
-        for (const auto & rule : mRules) {
-
-            // Left match: left symbol matches rule's leftID.
-            PabloAST * leftMatch = bncOuter.EQ(symBN, rule.leftID);
-
-            // Inner guard: if(leftMatch) — skip right-match + rank-update when left misses.
-            auto ruleScope = mergeScope.createScope();
-            // Only do merge checking where merging is allowed
-            // Only continue where left side matched.
-            mergeScope.createIf(leftMatch, ruleScope);
-            BixNumCompiler bncR(ruleScope);
-
-            // Right match: right symbol matches rule's rightID.
-            PabloAST * rightMatch = bncR.EQ(rightBN, rule.rightID);
-
-            // Construct current rank BixNum from Vars (Var* → PabloAST*).
-            // reconstructs the currently winning rank 
-            BixNum curRank;
-            curRank.reserve(RANK_BITS);
-            for (auto * v : rankBits) curRank.push_back(v);
-
-            // "Beats current best": rule.rank < curRank, equivalent to
-            // curRank > rule.rank.  rule.rank is a constant unsigned.
-            PabloAST * lower = bncR.UGT(curRank,
-                static_cast<unsigned>(rule.rank));
-
-            // Beats current best and matches: rightMatch AND lower.
-            PabloAST * beats = ruleScope.createAnd(rightMatch, lower);
-
-            // Update rankBits where beats: rankBits[i] ← rule.rank bit i.
-            for (unsigned i = 0; i < RANK_BITS; i++) {
-                unsigned bit = (static_cast<unsigned>(rule.rank) >> i) & 1u;
-                PabloAST * newVal = ruleScope.createSel(beats,
-                    bit ? ones : zeroes, rankBits[i]);
-                ruleScope.createAssign(rankBits[i], newVal);
-            }
-            // Update desiredBits where beats: desiredBits[i] ← rule.mergedID bit i.
-            for (size_t i = 0; i < symBits.size(); i++) {
-                unsigned bit = (rule.mergedID >> i) & 1u;
-                PabloAST * newVal = ruleScope.createSel(beats,
-                    bit ? ones : zeroes, desiredBits[i]);
-                ruleScope.createAssign(desiredBits[i], newVal);
-            }
-            // Update fireAny: fireAny ← fireAny OR beats/ A merge should happen here.
-            ruleScope.createAssign(fireAny,
-                ruleScope.createOr(fireAny, beats));
+// UTF-8 decode for vocab strings. Returns a flat vector of Unicode codepoints.
+std::vector<uint32_t> decodeUTF8(const std::string & s) {
+    std::vector<uint32_t> cps;
+    cps.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char lead = static_cast<unsigned char>(s[i]);
+        size_t len = (lead < 0x80) ? 1u
+                   : (lead < 0xE0) ? 2u
+                   : (lead < 0xF0) ? 3u : 4u;
+        if (i + len > s.size()) break;
+        uint32_t cp = 0;
+        if (len == 1) {
+            cp = lead;
+        } else if (len == 2) {
+            cp = ((lead & 0x1Fu) << 6)
+               | (static_cast<unsigned char>(s[i+1]) & 0x3Fu);
+        } else if (len == 3) {
+            cp = ((lead & 0x0Fu) << 12)
+               | ((static_cast<unsigned char>(s[i+1]) & 0x3Fu) << 6)
+               | (static_cast<unsigned char>(s[i+2]) & 0x3Fu);
+        } else {
+            cp = ((lead & 0x07u) << 18)
+               | ((static_cast<unsigned char>(s[i+1]) & 0x3Fu) << 12)
+               | ((static_cast<unsigned char>(s[i+2]) & 0x3Fu) << 6)
+               | (static_cast<unsigned char>(s[i+3]) & 0x3Fu);
         }
-
-        // Write outputs: rankBits, desiredBits, fireAny.
-        Var * rankOut = getOutputStreamVar("ruleRank");
-        for (unsigned i = 0; i < RANK_BITS; i++)
-            pb.createAssign(
-                pb.createExtract(rankOut, pb.getInteger(i)), rankBits[i]);
-
-        // desiredID output is muxed at the end of the resolve kernel for better reuse of this detect kernel across different rule sets.  
-        // But we still need to write the desiredID here so the resolve kernel can read it as an input.
-        Var * desOut = getOutputStreamVar("desiredID");
-        for (size_t i = 0; i < symBits.size(); i++)
-            pb.createAssign(
-                pb.createExtract(desOut, pb.getInteger(i)), desiredBits[i]);
-
-        // fireFlag output: 1 if any rule fires at this position, else 0.
-        Var * flagOut = getOutputStreamVar("fireFlag");
-        pb.createAssign(
-            pb.createExtract(flagOut, pb.getInteger(0)), fireAny);
+        cps.push_back(cp);
+        i += len;
     }
+    return cps;
+}
+//
+// This function creates a unique fingerprint for a trie node by mixing its vocabID, 
+// rotating bits, and recursively mixing in all its children's codepoints and structures, 
+// so that two different tries never get the same fingerprint.
+//
+// Rolling hash of a trie node — used to disambiguate JIT cache entries when
+// two buckets share (cp0, cp1) across different vocab files.
+uint64_t hashTrieNode(const TrieNode & n, uint64_t seed = 0) {
+    seed ^= 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(n.vocabID + 1);
+    seed = (seed << 13) | (seed >> 51);
+    for (const auto & kv : n.children) {
+        seed ^= static_cast<uint64_t>(kv.first) + 0x9E3779B97F4A7C15ull;
+        seed = hashTrieNode(kv.second, seed);
+    }
+    return seed;
+}
 
-private:
-    std::vector<MergeRule> mRules;
-};
+} // anonymous namespace
 
 
-//  BPEResolveFiresKernel
+// ─── BPETrieKernel ──────────────────────────────────────────────────────────
 //
-//  Stage B of the rank-priority depth pass.  Reads per-position rule rank
-//  and applies HuggingFace-equivalent conflict resolution:
-//      A fire at p survives iff
-//          ( no fire at p-1  OR  rank[p] < rank[p-1] )  AND
-//          ( no fire at p+1  OR  rank[p] < rank[p+1] )
+//BPETrieKernel is a worker that takes text and a trie of words,
+// walks through the trie recursively to find longest matches,
+// and outputs a stream marking WHERE matches ended and WHICH word IDs matched
 //
-//  This requires LookAhead(1) on ruleRank and fireFlag inputs — hence the
-//  kernel boundary between detect and resolve.
-//
-//  Inputs
-//  symID      16×1 — original symbol IDs (unchanged at suppressed positions).
-//  ruleRank   16×1 BixNum, LookAhead(1).
-//  fireFlag   1×1, LookAhead(1).
-//  desiredID  16×1 — merged ID emitted at surviving fire positions.
-//
-//  Outputs
-//  newSymID   16×1 — survive ? desiredID : symID.
-//  deleteMask 1×1 — Advance(survive, 1): right-side consumed positions.
-class BPEResolveFiresKernel : public PabloKernel {
+// One PabloKernel per (cp0, cp1) bucket. Inputs: u21 codepoints. Outputs:
+// matchEnd (1×1, marks the right-most codepoint of every vocab word in this
+// bucket that ended there) and vocabID (16×1 BixNum, the matched word's ID at
+// matchEnd positions; 0 elsewhere within this bucket's output).
+class BPETrieKernel : public PabloKernel {
 public:
-    static constexpr unsigned RANK_BITS = BPEDetectFiresKernel::RANK_BITS;
-
-    BPEResolveFiresKernel(LLVMTypeSystemInterface & ts,
-                          StreamSet * symID,
-                          StreamSet * ruleRank,
-                          StreamSet * fireFlag,
-                          StreamSet * desiredID,
-                          StreamSet * newSymID,
-                          StreamSet * deleteMask,
-                          unsigned depth)
+    BPETrieKernel(LLVMTypeSystemInterface & ts,
+                  StreamSet * u21,
+                  StreamSet * matchEnd,
+                  StreamSet * vocabID,
+                  VocabBucket bucket,
+                  unsigned tag,
+                  uint64_t shapeHash)
     : PabloKernel(ts,
-                  "BPEResolveFires_D" + std::to_string(depth),
-                  {Binding{"symID",     symID},
-                   Binding{"ruleRank",  ruleRank,  FixedRate(), LookAhead(1)},
-                   Binding{"fireFlag",  fireFlag,  FixedRate(), LookAhead(1)},
-                   Binding{"desiredID", desiredID}},
-                  {Binding{"newSymID",   newSymID},
-                   Binding{"deleteMask", deleteMask}}) {}
+                  "BPETrie_t" + std::to_string(tag)
+                       + "_p" + std::to_string(bucket.cp0)
+                       + "_" + std::to_string(bucket.cp1)
+                       + "_h" + std::to_string(shapeHash),
+                  {Binding{"u21", u21}},
+                  {Binding{"matchEnd", matchEnd},
+                   Binding{"vocabID",  vocabID}}),
+      mBucket(std::move(bucket)) {}
 
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
 
-        std::vector<PabloAST*> symBits  = getInputStreamSet("symID");
-        std::vector<PabloAST*> rankBits = getInputStreamSet("ruleRank");
-        std::vector<PabloAST*> desBits  = getInputStreamSet("desiredID");
-        PabloAST * flag = getInputStreamSet("fireFlag")[0];
+        // symBN is the BixNum of the input u21 codepoint stream; 
+        // used for matching against cp0 and cp1 in the trie walk
+        std::vector<PabloAST*> u21bits = getInputStreamSet("u21");
+        BixNum symBN(u21bits.begin(), u21bits.end());
 
-        BixNum rank(rankBits.begin(), rankBits.end());
-
-        // Left neighbor's rank (Advance by 1) and fire flag.
-        BixNum rankL;
-        rankL.reserve(rankBits.size());
-        for (auto * b : rankBits) rankL.push_back(pb.createAdvance(b, 1));
-        PabloAST * flagL = pb.createAdvance(flag, 1);
-
-        // Right neighbor's rank (LookAhead by 1) and fire flag.
-        BixNum rankR;
-        rankR.reserve(rankBits.size());
-        for (auto * b : rankBits) rankR.push_back(pb.createLookahead(b, 1));
-        PabloAST * flagR = pb.createLookahead(flag, 1);
-
-        // "I beat left" = left has no fire OR my rank < left's rank.
-        PabloAST * leftLoses  = pb.createOr(
-            pb.createNot(flagL), bnc.ULT(rank, rankL));
-        PabloAST * rightLoses = pb.createOr(
-            pb.createNot(flagR), bnc.ULT(rank, rankR));
-        PabloAST * survive = pb.createAnd(flag,
-            pb.createAnd(leftLoses, rightLoses));
-        PabloAST * notSurvive = pb.createNot(survive);
-
-        Var * symOut = getOutputStreamVar("newSymID");
-        for (size_t i = 0; i < symBits.size(); i++) {
-            pb.createAssign(
-                pb.createExtract(symOut, pb.getInteger(i)),
-                pb.createOr(pb.createAnd(desBits[i], survive),
-                            pb.createAnd(symBits[i], notSurvive)));
+        // Prepare output variables and constants.
+        PabloAST * zeroes = pb.createZeroes();
+        PabloAST * ones   = pb.createNot(zeroes);
+        
+        // matchEndV is the per-position marker variable we write to whenever we hit a trie node with a vocabID; 
+        // idBits are the per-bit variables we write the vocabID to in the same cases. 
+        // After the trie walk, we assign these to the output streams.
+        // accumulates match bits
+        Var * matchEndV = pb.createVar("matchEnd", zeroes);
+        std::vector<Var*> idBits;
+        // We have 16 bits to represent the vocabID, so we need 16 per-position variables to accumulate them bitwise via createSel on each match.
+        // idBits[i] accumulates the i-th bit of the vocabID across all matches at this position; 
+        // after the trie walk, we assign each idBits[i] to the i-th bit of the output vocabID BixNum stream.
+        idBits.reserve(16);
+        // Accumulates the 16th bit of vocabID across all matches 
+        for (unsigned i = 0; i < 16; i++) {
+            idBits.push_back(pb.createVar(
+                "id_" + std::to_string(i), zeroes));
         }
 
-        Var * delOut = getOutputStreamVar("deleteMask");
-        pb.createAssign(pb.createExtract(delOut, pb.getInteger(0)),
-                        pb.createAdvance(survive, 1));
+        // First match stage: check the bucket's (cp0, cp1) against the symBN codepoint stream. 
+        // Only positions where both match can possibly match any token in this bucket, 
+        // so this is a quick filter before we enter the more expensive trie walk.
+        PabloAST * c0 = bnc.EQ(symBN, mBucket.cp0);
+        PabloAST * c1 = bnc.EQ(symBN, mBucket.cp1);
+        //  pairMark[p] = 1  iff  symBN[p-1]==cp0 AND symBN[p]==cp1
+        //  → marks the cp1 (right-hand) position of every (cp0,cp1) pair.
+        PabloAST * pairMark = pb.createAnd(
+            pb.createAdvance(c0, 1), c1);
+
+        // look at positions where I found an HE pair, skip everywhere else
+        auto pairScope = pb.createScope();
+        pb.createIf(pairMark, pairScope);
+
+        // Handle the special case of a vocab word of length 2 that ends at the same position as the bucket's (cp0, cp1) pair match:
+        // If my bucket has a 2-letter word, record it at this position!"
+        if (mBucket.prefixVocabID >= 0) {
+            recordMatch(pairScope, pairMark, mBucket.prefixVocabID,
+                        matchEndV, idBits, ones, zeroes);
+        }
+        // Then emit the trie walk for longer vocab words:
+        emitTrie(pairScope, pairMark, mBucket.root, u21bits,
+                 matchEndV, idBits, ones, zeroes);
+
+        // Finally, assign the per-position matchEndV and idBits to the output streams.
+        pb.createAssign(
+            pb.createExtract(getOutputStreamVar("matchEnd"),
+                             pb.getInteger(0)),
+            matchEndV);
+        // idOut is a 16-bit BixNum stream; assign each bit from the idBits vector to its corresponding position in the output BixNum.
+        Var * idOut = getOutputStreamVar("vocabID");
+        for (unsigned i = 0; i < 16; i++) {
+            pb.createAssign(
+                pb.createExtract(idOut, pb.getInteger(i)),
+                idBits[i]);
+        }
+    }
+
+private:
+    VocabBucket mBucket;
+
+    static void recordMatch(PabloBuilder & pb, PabloAST * mark, int vocabID,
+                            Var * matchEndV, std::vector<Var*> & idBits,
+                            PabloAST * ones, PabloAST * zeroes) {
+        pb.createAssign(matchEndV, pb.createOr(matchEndV, mark));
+        for (unsigned i = 0; i < 16; i++) {
+            unsigned bit = (static_cast<unsigned>(vocabID) >> i) & 1u;
+            pb.createAssign(
+                idBits[i],
+                pb.createSel(mark, bit ? ones : zeroes, idBits[i]));
+        }
+    }
+    
+    // Recursive trie emitter. Emits a scope for each trie node, 
+    // with an If on the childMark that extends the parentMark by one codepoint and EQ-matches it against the node's cp.
+    // Whenever we hit a node with a vocabID, call recordMatch to write to matchEndV and idBits.
+    static void emitTrie(PabloBuilder & pb, PabloAST * parentMark,
+                         const TrieNode & node,
+                         const std::vector<PabloAST*> & u21bits,
+                         Var * matchEndV, std::vector<Var*> & idBits,
+                         PabloAST * ones, PabloAST * zeroes) {
+        
+        // Base case: if this node has no children, we're done. 
+        // The recursive calls below only happen if there is at least one child, so we don't need to emit an empty scope for a leaf node.
+        if (node.children.empty()) return;
+        BixNumCompiler bnc(pb);
+        BixNum symBN(u21bits.begin(), u21bits.end());
+        for (const auto & kv : node.children) {
+            uint32_t cp = kv.first;
+            const TrieNode & child = kv.second;
+            PabloAST * cpMark = bnc.EQ(symBN, cp);
+            PabloAST * childMark = pb.createAnd(
+                pb.createAdvance(parentMark, 1), cpMark);
+            auto childScope = pb.createScope();
+            pb.createIf(childMark, childScope);
+            // If this child node has a vocabID, record the match at this position. 
+            // Then recurse to emit the child's children.
+            if (child.vocabID >= 0) {
+                recordMatch(childScope, childMark, child.vocabID,
+                            matchEndV, idBits, ones, zeroes);
+            }
+            // Recurse to emit the child's children:
+            emitTrie(childScope, childMark, child, u21bits,
+                     matchEndV, idBits, ones, zeroes);
+        }
     }
 };
 
+
+// ─── BPETriePairMergeKernel ─────────────────────────────────────────────────
 //
-//  InvertStreamKernel
+// Bitwise-OR merges two (matchEnd, vocabID) streams. Used to fold per-bucket
+// outputs into one combined stream. Cache-keyed by name alone — semantics
+// are bucket-independent.
+class BPETriePairMergeKernel : public PabloKernel {
+public:
+    BPETriePairMergeKernel(LLVMTypeSystemInterface & ts,
+                           StreamSet * me1, StreamSet * id1,
+                           StreamSet * me2, StreamSet * id2,
+                           StreamSet * meOut, StreamSet * idOut)
+    : PabloKernel(ts, "BPETriePairMerge",
+                  {Binding{"me1", me1}, Binding{"id1", id1},
+                   Binding{"me2", me2}, Binding{"id2", id2}},
+                  {Binding{"meOut", meOut}, Binding{"idOut", idOut}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * me1 = getInputStreamSet("me1")[0];
+        PabloAST * me2 = getInputStreamSet("me2")[0];
+        std::vector<PabloAST*> id1 = getInputStreamSet("id1");
+        std::vector<PabloAST*> id2 = getInputStreamSet("id2");
+        pb.createAssign(
+            pb.createExtract(getOutputStreamVar("meOut"),
+                             pb.getInteger(0)),
+            pb.createOr(me1, me2));
+        Var * idOut = getOutputStreamVar("idOut");
+        for (unsigned i = 0; i < 16; i++) {
+            pb.createAssign(
+                pb.createExtract(idOut, pb.getInteger(i)),
+                pb.createOr(id1[i], id2[i]));
+        }
+    }
+};
+
+
+// ─── InvertStreamKernel ─────────────────────────────────────────────────────
 //
-//  Flips every bit in a 1-bit stream.
-//  Converts deleteMask (1=remove) → keepMask (1=keep) for FilterByMask.
-//
+// Flips every bit of a 1×1 stream. Used by buildLinePretokens to convert a
+// newline mask into a keep mask for FilterByMask.
 class InvertStreamKernel : public PabloKernel {
 public:
     InvertStreamKernel(LLVMTypeSystemInterface & ts,
@@ -347,37 +301,24 @@ protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * in = getInputStreamSet("input")[0];
-        writeOutputStreamSet("output", std::vector<PabloAST*>{pb.createNot(in)});
+        writeOutputStreamSet("output",
+                             std::vector<PabloAST*>{pb.createNot(in)});
     }
 };
 
 
+// ─── LinePtBoundKernel ──────────────────────────────────────────────────────
 //
-//  LinePtBoundKernel
-//
-//  Inline pretokenizer for compare_bpe.py step 2.  Input is U21 codepoint
-//  stream where '\n' (U+000A) marks pretoken separators.
-//
-//  Outputs:
-//    newlineMask   1×1 — 1 at every '\n' codepoint position.
-//    ptBoundPre    1×1 — Advance(newlineMask, 1): 1 at first position of
-//                  every pretoken (= immediately after a '\n').
-//
-//  Downstream: FilterByMask(NOT newlineMask) compresses both u21 and
-//  ptBoundPre to remove newline positions.  After compression, ptBound[p]=1
-//  at position p marks "p is start of a new pretoken in the compressed
-//  stream", which is exactly what BPEDetectFiresKernel needs.
-//
+// Inline pretokenizer for compare_bpe.py step 2. Marks each newline codepoint
+// so callers can FilterByMask it out of the downstream stream.
 class LinePtBoundKernel : public PabloKernel {
 public:
     LinePtBoundKernel(LLVMTypeSystemInterface & ts,
                       StreamSet * u21,
-                      StreamSet * newlineMask,  // Marks positions containing newline.
-                      StreamSet * ptBoundPre)   // Marks positions AFTER newline.
+                      StreamSet * newlineMask)
     : PabloKernel(ts, "BPE_LinePtBound",
                   {Binding{"u21", u21}},
-                  {Binding{"newlineMask", newlineMask},
-                   Binding{"ptBoundPre",  ptBoundPre}}) {}  
+                  {Binding{"newlineMask", newlineMask}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -385,200 +326,104 @@ protected:
         std::vector<PabloAST*> bits = getInputStreamSet("u21");
         BixNum bn(bits.begin(), bits.end());
         PabloAST * isNL = bnc.EQ(bn, 0x0A);
-        PabloAST * ptB  = pb.createAdvance(isNL, 1);
         pb.createAssign(
-            // newlineMask: 1 at every '\n' codepoint position.
-            pb.createExtract(getOutputStreamVar("newlineMask"), 0), isNL);
-        pb.createAssign(
-            // ptBoundPre: 1 at first position of every pretoken (= immediately after a '\n').
-            pb.createExtract(getOutputStreamVar("ptBoundPre"), 0), ptB);
+            pb.createExtract(getOutputStreamVar("newlineMask"),
+                             pb.getInteger(0)),
+            isNL);
     }
 };
 
-// 
-//  InitialSymIDKernel
+
+// ─── Pipeline glue ─────────────────────────────────────────────────────────
 //
-//  Maps each U21 codepoint slot to its BPE vocab ID (16-bit BixNum output).
-//  Uses BixNumCompiler.EQ + createSel per single-character vocab entry.
-//  Since codepoints are unique per slot, conditions are mutually exclusive.
-//  Pattern from ztf-logic.cpp.
-// 
-class InitialSymIDKernel : public PabloKernel {
-public:
-    InitialSymIDKernel(LLVMTypeSystemInterface & ts,
-                       StreamSet * u21,
-                       StreamSet * symID,
-                       // cpToVocab is a vector of (codepoint, vocabID) pairs for all single-character vocab entries.
-                       // This is pre-computed by buildInitialVocabMap() from the BPE merges
-                       // is basically a lookup table.
-                       std::vector<std::pair<unsigned,unsigned>> cpToVocab)
-    : PabloKernel(ts, "InitialSymID",
-                  {Binding{"u21",   u21}},
-                  {Binding{"symID", symID}}),
-      mCpToVocab(std::move(cpToVocab)) {}
-
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        BixNumCompiler bnc(pb);
-
-        // Construct BixNum for input codepoint.
-        std::vector<PabloAST*> u21bits = getInputStreamSet("u21");
-        // bit streams like integers.
-        BixNum codepoint(u21bits.begin(), u21bits.end());
-
-        // Constants for EQ + Sel: 1 and 0 as PabloAST*.
-        PabloAST * ones   = pb.createNot(pb.createZeroes());
-        PabloAST * zeroes = pb.createZeroes();
-
-        // vocabID starts as all zeroes; each codepoint match sets it to that codepoint's vocab ID.
-        BixNum vocabID(16, zeroes); // GPT-2 vocab IDs fit in 16 bits.
-        // For each single-character vocab entry, if codepoint matches, set vocabID to that entry's vocab ID.
-        // Loop Through Lookup Table
-        for (const auto & [cp, vid] : mCpToVocab) {
-            PabloAST * match = bnc.EQ(codepoint, cp);
-            for (unsigned i = 0; i < 16; i++) {
-                unsigned bit = (vid >> i) & 1u;
-                vocabID[i] = pb.createSel(match, bit ? ones : zeroes, vocabID[i]);
-            }
-        }
-
-        // Write vocabID to output symID stream.
-        Var * outVar = getOutputStreamVar("symID");
-        for (unsigned i = 0; i < 16; i++)
-            pb.createAssign(pb.createExtract(outVar, pb.getInteger(i)), vocabID[i]);
-    }
-
-private:
-    std::vector<std::pair<unsigned,unsigned>> mCpToVocab;
-};
-
-// 
-//  buildInitialSymID
-//  Wraps InitialSymIDKernel; returns 16×1 BixNum of initial vocab IDs.
-// 
-kernel::StreamSet * buildInitialSymID(
+// This function takes all vocabulary words, groups them by their first two letters, 
+// creates a worker for each group to find matches in the text, 
+// and combines all the results together.
+//
+// Builds the BPE trie longest-match pipeline. 
+//Returns the (matchEnd, vocabID) stream pair from the final merge stage.
+BPETrieResult runBPETrie(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * u21,
         const BPETokenizer & bpe) {
-    // Build lookup table for InitialSymIDKernel from single-character vocab entries in the BPE merges.
-    auto cpToVocab = bpe.buildInitialVocabMap();
-    // Create output stream for InitialSymIDKernel.
-    StreamSet * symID = P.CreateStreamSet(16, 1);
-    // Create InitialSymIDKernel to map each U21 codepoint to its BPE vocab ID.
-    P.CreateKernelCall<InitialSymIDKernel>(u21, symID, std::move(cpToVocab));
-    return symID;
-}
-
-//
-//  runBPEPipeline
-//
-//  Wires D depth passes into the enclosing pipeline.  Each depth pass is a
-//  Detect+Resolve kernel pair (see BPEDetectFiresKernel/BPEResolveFiresKernel
-//  for rationale) plus a FilterByMask compression of both symID and ptBound
-//  to remove consumed right-side positions (I1).
-//
-//  Returns final compressed 16×1 BixNum — one slot per output token.
-// main BPE engine loop
-// 
-kernel::StreamSet * runBPEPipeline(
-        kernel::PipelineBuilder & P,
-        kernel::StreamSet * symID,
-        kernel::StreamSet * ptBound,
-        const std::vector<std::vector<MergeRule>> & mergesByDepth) {
-
-    // how many bits needed to store merge ranks, 16
-    constexpr unsigned RANK_BITS = BPEDetectFiresKernel::RANK_BITS;
-
-    // For each depth, create Detect+Resolve kernel pair and FilterByMask compression.
-    // Run one BPE pass per depth, with symID and ptBound compressed at each step to keep them aligned and minimize work for subsequent passes.
-    unsigned depth = 0;
-    for (const auto & rulesAtDepth : mergesByDepth) {
-        if (rulesAtDepth.empty()) { depth++; continue; }  // skip empty depths, but still increment depth counter for correct kernel naming and cache keying 
-
-        // Stage A: detect best-rank firing rule per position.
-        // ruleRank: which rule won
-        // desiredID: what merged token should become
-        // fireFlag: whether merge should happen
-        StreamSet * ruleRank  = P.CreateStreamSet(RANK_BITS, 1);
-        StreamSet * desiredID = P.CreateStreamSet(16, 1);
-        StreamSet * fireFlag  = P.CreateStreamSet(1,  1);
-        // Create detect kernel for this depth, passing in the rules for this depth.
-        P.CreateKernelCall<BPEDetectFiresKernel>(
-            symID, ptBound, ruleRank, desiredID, fireFlag,
-            rulesAtDepth, depth);
-
-        // Stage B: rank-priority survival + emit newSymID + deleteMask.
-        // newSymID: Updated token stream after merges.
-        // deleteMask: Marks tokens to REMOVE
-        StreamSet * newSymID   = P.CreateStreamSet(16, 1);
-        StreamSet * deleteMask = P.CreateStreamSet(1,  1);
-        P.CreateKernelCall<BPEResolveFiresKernel>(
-            symID, ruleRank, fireFlag, desiredID,
-            newSymID, deleteMask, depth);
-
-        // Compress both symID and ptBound with the same keepMask (I1).
-        // Invert Delete Mask
-        StreamSet * keepMask = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<InvertStreamKernel>(deleteMask, keepMask);
-
-        // Compress symID and ptBound with the same keepMask to keep them aligned (I1).
-        // after deletion remove deleted position / compress them 
-        StreamSet * compressedSym   = P.CreateStreamSet(16, 1);
-        StreamSet * compressedBound = P.CreateStreamSet(1,  1);
-        FilterByMask(P, keepMask, newSymID,  compressedSym);
-        FilterByMask(P, keepMask, ptBound,   compressedBound);
-
-        //  Next iteration's input is this iteration's compressed output.
-        symID   = compressedSym;
-        ptBound = compressedBound;
-        depth++;
+    // Build the per-(cp0, cp1) buckets from the vocab - groups by the first two letters
+    // Each bucket has its own trie kernel. 
+    // Then merge the outputs with BPETriePairMergeKernel.
+    auto buckets = bpe.buildVocabBuckets();
+    // If there are no tokens of length >= 2, we won't emit any trie kernels;
+    //return empty streams to avoid special-casing the caller.
+    if (buckets.empty()) {
+        std::cerr << "BPE: vocabulary has no length>=2 tokens; "
+                     "trie pipeline has nothing to do\n";
+        StreamSet * me = P.CreateStreamSet(1, 1);  // matchEnd
+        StreamSet * id = P.CreateStreamSet(16, 1);  // vocabID
+        return {me, id};
     }
 
-    return symID;
+    // storage for the current merged output of the trie pipeline as we build it up;
+
+    StreamSet * curMe = nullptr;  // current matchEnd stream
+    StreamSet * curId = nullptr; // current vocabID stream
+    unsigned tag = 0;  // for debug naming of the kernels; not semantically significant
+    for (auto & bucket : buckets) {
+        // a unique ID for this bucket's structure.
+        uint64_t shape = hashTrieNode(bucket.root,
+            (static_cast<uint64_t>(bucket.cp0) << 32) ^ bucket.cp1
+                ^ static_cast<uint64_t>(bucket.prefixVocabID + 1));
+        
+        // Emit the kernel for this bucket. It takes the u21 codepoint stream as input, and produces a (matchEnd, vocabID) stream pair as output.
+        StreamSet * me = P.CreateStreamSet(1, 1);
+        StreamSet * id = P.CreateStreamSet(16, 1);
+        P.CreateKernelCall<BPETrieKernel>(
+            u21,  // input codapoint stream
+            me,   // output matchEnd stream
+            id,   // output vocabID stream
+            std::move(bucket),  // bucket structure (trie and prefixVocabID)
+            tag,   // tag for debug naming
+            shape);  // shape hash for JIT cache disambiguation
+        tag++;
+        // Merge this bucket's output with the current merged output using BPETriePairMergeKernel.
+        if (curMe == nullptr) {
+            curMe = me;
+            curId = id;
+            continue;
+        }
+        // Merge curMe/curId with me/id into new streams outMe/outId, 
+        // then update curMe/curId to point to the merged result for the next iteration.
+        StreamSet * outMe = P.CreateStreamSet(1, 1);
+        StreamSet * outId = P.CreateStreamSet(16, 1);
+        P.CreateKernelCall<BPETriePairMergeKernel>(
+            curMe, curId, me, id, outMe, outId);
+        curMe = outMe;
+        curId = outId;
+    }
+    std::cerr << "BPE: trie pipeline built with " << tag
+              << " (cp0,cp1) buckets\n";
+    // After the loop, curMe and curId are the merged output of all the buckets' trie kernels. 
+    // Return them as the final result of this function.
+    return {curMe, curId};
 }
 
-
-//
-//  buildLinePretokens
-//
-//  Inline pretokenizer for BPE-mode invocations without --pretokenizer.
-//  Builds ptBound + compressed u21 directly from newline positions.
-// this is basically the pretokenizer for the BPE pipeline, which is just splitting on newlines and figuring out where the pretoken boundaries are.
-LinePretokensResult buildLinePretokens(
+kernel::StreamSet * buildLinePretokens(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * u21) {
 
     const unsigned u21Bits = u21->getNumElements();
 
-    StreamSet * newlineMask = P.CreateStreamSet(1, 1);  // where newline characters are
-    StreamSet * ptBoundPre  = P.CreateStreamSet(1, 1);  // where next pretoken begins
-    P.CreateKernelCall<LinePtBoundKernel>(u21, newlineMask, ptBoundPre);
+    StreamSet * newlineMask = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<LinePtBoundKernel>(u21, newlineMask);
 
-    // keep everything EXCEPT newline
     StreamSet * keepMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<InvertStreamKernel>(newlineMask, keepMask);
 
-    // Unicode stream WITHOUT newlines
-    StreamSet * compressedU21    = P.CreateStreamSet(u21Bits, 1);
-    // compressed boundaries.
-    StreamSet * compressedPtBound = P.CreateStreamSet(1, 1);
-    // removes newline characters, ? 
-    FilterByMask(P, keepMask, u21,        compressedU21);
-    // compresses boundary stream
-    FilterByMask(P, keepMask, ptBoundPre, compressedPtBound);
+    StreamSet * compressedU21 = P.CreateStreamSet(u21Bits, 1);
+    FilterByMask(P, keepMask, u21, compressedU21);
 
-    return {compressedU21, compressedPtBound};
+    return compressedU21;
 }
 
-// 
-//  BPETokenizer — file I/O 
-// Pure C++ functions to load BPE vocab and merges from disk, 
-// build the initial codepoint→vocabID mapping, 
-// and organize merges by depth for the pipeline.  
-// These are called from the main() function in bpe.cpp 
-// to set up the pipeline before running it.
-// 
+
+// ─── BPETokenizer — file I/O ────────────────────────────────────────────────
 
 bool BPETokenizer::loadVocab(const std::string & path) {
     std::ifstream file(path);
@@ -593,17 +438,12 @@ bool BPETokenizer::loadVocab(const std::string & path) {
         std::cerr << "BPE: failed to parse vocab file: " << e.what() << "\n";
         return false;
     }
-    // vocab_: token string -> token ID
-    // idToToken_: token ID -> token string
     for (auto & [key, val] : j.items()) {
         int id = val.get<int>();
-        // Insert into vocab_ mapping token string to token ID.
         vocab_[key] = id;
-        // Ensure idToToken_ is large enough and insert reverse mapping from token ID to token string.
         if (id >= 0) {
             if (static_cast<size_t>(id) >= idToToken_.size())
                 idToToken_.resize(static_cast<size_t>(id) + 1);
-                // idToToken_[id] = key;  // Insert token string at index of token ID. reverse lookup
             idToToken_[static_cast<size_t>(id)] = key;
         }
     }
@@ -611,154 +451,53 @@ bool BPETokenizer::loadVocab(const std::string & path) {
     return !vocab_.empty();
 }
 
-// 
-//  loadMergesWithDepth — single-pass depth assignment
-// Loads all BPE merge rules AND organizes them into dependency depths.
-
-// four tasks 
-// 1.  Read merge rules from file
-// 2	Assign rank to each rule
-// 3	Compute dependency depth
-// 4	Convert strings into token IDs
-//  BPE training guarantees rank ordering: when merged token AB appears as a
-//  component of another merge at rank R, the merge that created AB has rank
-//  < R.  Processing rules in rank order (= file order) allows depth[AB] to
-//  be computed in a single O(N) pass without fixed-point iteration.
-//
-//    depth[merged] = 1 + max(depth[left], depth[right])
-//    Components absent from symbolDepth are base-vocab tokens at depth 0.
-// 
-bool BPETokenizer::loadMergesWithDepth(
-        const std::string & path,
-        std::vector<std::vector<MergeRule>> & mergesByDepth) {
-
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        std::cerr << "BPE: cannot open merges file: " << path << "\n";
-        return false;
-    }
-
-    // 1. Read merge rules from file and assign rank.
-    struct ParsedRule { std::string left, right, merged; int rank; };
-    std::vector<ParsedRule> parsed;
-
-    std::string line;
-    int rank = 0;
-    // Each non-empty, non-comment line should contain "left right".  Merged token is concatenation of left+right.
-    // We assign rank in file order, starting from 0.  HuggingFace's BPE implementation guarantees that merges are listed in rank order in the merges.txt file, so this matches the intended ranks.
-    while (std::getline(file, line)) {
-        if (line.empty() || line[0] == '#') continue; // skip empty lines and comments
-        size_t sp = line.find(' ');  
-        if (sp == std::string::npos) continue; // skip malformed lines
-        std::string left  = line.substr(0, sp); // left token
-        std::string right = line.substr(sp + 1); // right token
-        if (!right.empty() && right.back() == '\r') right.pop_back(); // handle Windows line endings
-        parsed.push_back({left, right, left + right, rank++}); // stores merged token is concatenation of left and right
-    }
-
-    if (parsed.empty()) {
-        std::cerr << "BPE: no merge rules found in " << path << "\n";
-        return false;
-    }
-
-    // 2. Compute dependency depth with single pass in rank order.
-    std::unordered_map<std::string, int> symbolDepth;  // depth of each symbol (base vocab tokens start at depth 0)
-    int maxDepth = 0;
-    // For each rule in rank order, compute depth of merged token as 1 + max(depth of left, depth of right).
-    for (const auto & r : parsed) {
-        // Get depth of left and right components; default to 0 if not found (base vocab).
-        int dLeft  = symbolDepth.count(r.left)  ? symbolDepth.at(r.left)  : 0;
-        // Get depth of right component; default to 0 if not found (base vocab).
-        int dRight = symbolDepth.count(r.right) ? symbolDepth.at(r.right) : 0;
-        // Depth of merged token is 1 + max(depth of left, depth of right).
-        int d = 1 + std::max(dLeft, dRight);
-        // Store depth of merged token and track max depth.
-        symbolDepth[r.merged] = d;
-        // Track maximum depth across all merges for sizing mergesByDepth.
-        maxDepth = std::max(maxDepth, d);
-    }
-
-    // Bucket rules by depth.
-    mergesByDepth.clear();
-    // Resize mergesByDepth to have enough buckets for all depths up to maxDepth.
-    mergesByDepth.resize(static_cast<size_t>(maxDepth) + 1);
-
-    // 3. Convert strings in rules to token IDs and store in mergesByDepth.
-    for (const auto & r : parsed) {
-        auto leftIt   = vocab_.find(r.left);
-        auto rightIt  = vocab_.find(r.right);
-        auto mergedIt = vocab_.find(r.merged);
-        if (leftIt   == vocab_.end() ||
-            rightIt  == vocab_.end() ||
-            mergedIt == vocab_.end())
-            continue;   // skip symbols absent from vocabulary
-
-        // Create MergeRule with token IDs and rank, and add to appropriate depth bucket.
-        int d = symbolDepth.at(r.merged);
-        MergeRule rule;
-        // Convert token IDs to unsigned for storage in MergeRule.
-        rule.leftID   = static_cast<unsigned>(leftIt->second);
-        rule.rightID  = static_cast<unsigned>(rightIt->second);
-        rule.mergedID = static_cast<unsigned>(mergedIt->second);
-        rule.rank     = r.rank;
-        // Store rule in mergesByDepth at index corresponding to its depth.
-        mergesByDepth[static_cast<size_t>(d)].push_back(rule);
-    }
-
-    // Log summary of loaded rules and depth distribution.
-    std::cerr << "BPE: loaded " << parsed.size() << " merge rules in "
-              << mergesByDepth.size() << " depth levels\n";
-    return true;
-}
-
-// decodeToken
 std::string BPETokenizer::decodeToken(int id) const {
     if (id < 0 || static_cast<size_t>(id) >= idToToken_.size()) return "";
     return idToToken_[static_cast<size_t>(id)];
 }
 
-// Returns (codepoint_value, vocab_ID) for every single-character token.
-// Used by InitialSymIDKernel to map U21 codepoints to initial vocab IDs.
-std::vector<std::pair<unsigned,unsigned>>
-BPETokenizer::buildInitialVocabMap() const {
-    std::vector<std::pair<unsigned,unsigned>> result;
-    result.reserve(512);   // GPT-2 has 256 initial byte-level symbols
-
-    // For each vocab entry, if it's a single-character token, decode its codepoint and add (codepoint, vocabID) to the result.
+//
+// sorting vocabulary words into groups
+// This function creates organized "buckets" - group of words
+//
+// This function takes all vocabulary words, groups them by their first two letters,
+// stores 2-letter words in a special slot, and stores longer words in a tree structure under each bucket,
+// then returns the organized buckets as a list.
+//
+std::vector<VocabBucket> BPETokenizer::buildVocabBuckets() const {
+    std::map<std::pair<uint32_t,uint32_t>, VocabBucket> byPrefix;
+    // the same (cp0, cp1) prefix can appear in multiple vocab files with different vocabIDs;
+    // the hashTrieNode seed incorporates the prefix and vocabID to disambiguate them in the JIT cache key
     for (const auto & [token, id] : vocab_) {
-        if (token.empty()) continue;
-        // Decode the single-character token to get its Unicode codepoint value.
-        unsigned char lead = static_cast<unsigned char>(token[0]);
-        // Determine expected UTF-8 length based on lead byte.
-        size_t cpLen = (lead < 0x80) ? 1u : (lead < 0xE0) ? 2u : (lead < 0xF0) ? 3u : 4u;
-        // Skip tokens that aren't exactly one Unicode codepoint (i.e. not single-character tokens).
-        if (token.size() != cpLen) continue;
+        auto cps = decodeUTF8(token); // convert all the vocab to codepoints
+        if (cps.size() < 2) continue;  // single-codepoint tokens skipped (not in trie)
 
-        // Decode UTF-8 codepoint from token string.
-        const auto & s = token; 
-        unsigned cp = 0;
-        // Decode UTF-8 codepoint based on expected length.
-        if (lead < 0x80) {
-            cp = lead;
-        // For multi-byte UTF-8, decode according to UTF-8 rules.
-        } else if (lead < 0xE0) {
-            cp = ((lead & 0x1F) << 6)
-               | (static_cast<unsigned char>(s[1]) & 0x3F);
-        // For 3-byte UTF-8, decode using 3 bytes.
-        } else if (lead < 0xF0) {
-            cp = ((lead & 0x0F) << 12)
-               | ((static_cast<unsigned char>(s[1]) & 0x3F) << 6)
-               | (static_cast<unsigned char>(s[2]) & 0x3F);
-        // For 4-byte UTF-8, decode using 4 bytes.
-        } else {
-            cp = ((lead & 0x07) << 18)
-               | ((static_cast<unsigned char>(s[1]) & 0x3F) << 12)
-               | ((static_cast<unsigned char>(s[2]) & 0x3F) << 6)
-               | (static_cast<unsigned char>(s[3]) & 0x3F);
+        // take the first two letters of the word and use them as the bucket label.
+        auto key = std::make_pair(cps[0], cps[1]);  // bucket by (cp0, cp1) prefix
+        // insert token into the trie of the appropriate bucket
+        auto & b = byPrefix[key]; // Find the box labeled key - create if it doesn't exist
+        // If this is the first time we've seen this bucket, set its cp0 and cp1 from the key.
+        b.cp0 = cps[0];
+        b.cp1 = cps[1];
+        // tokens of length 2 land in the bucket's prefixVocabID slot; longer tokens go in the trie
+        if (cps.size() == 2) {
+            b.prefixVocabID = id;
+        } 
+        // For tokens of length > 2, we need to insert them into the trie structure of the bucket.
+        else {
+            // insert into trie: walk/create nodes for cps[2..end-1], then set vocabID at the leaf
+            TrieNode * cur = &b.root;
+            for (size_t i = 2; i < cps.size(); i++) {
+                cur = &cur->children[cps[i]];
+            }
+            // if the same token appears multiple times with different vocabIDs, the last one wins; 
+            // this is not a well-defined scenario but we should at least be deterministic about it
+            cur->vocabID = id;
         }
-        // Add (codepoint, vocabID) pair to result for this single-character token.
-        result.push_back({cp, static_cast<unsigned>(id)});
     }
+    // convert from map to vector; the order doesn't matter but we want it to be deterministic
+    std::vector<VocabBucket> result;
+    result.reserve(byPrefix.size());
+    for (auto & kv : byPrefix) result.push_back(std::move(kv.second));
     return result;
 }
-

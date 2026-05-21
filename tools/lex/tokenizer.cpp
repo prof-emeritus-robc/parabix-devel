@@ -168,7 +168,7 @@ static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
 //   Stage 0  I/O + S2P
 //   Stage 1  Normalization     → U21codepoints
 //   Stage 2  Pre-tokenization  → codepoint stream feeding BPE
-//   Stage 3  runBPETrie        → (matchEnd, trieVocabID)  per-bucket OR-merged
+//   Stage 3  runBPETrie        → (matchEnd, vocabID)  bucket fold of single-byte + 2+byte tries
 //   Stage 4  Emit token IDs at every matchEnd position
 //
 // Phase-1: only trie matches (length >= 2) are emitted. Positions where no
@@ -196,39 +196,36 @@ static BPEPipelineFunctionType buildBPEPipeline(
     StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
     U21_to_UTF8(P, U21codepoints, normalizedBasis);
 
-    // Stage 2: pre-tokenization — produces the codepoint stream that feeds
-    // BPE. Two paths:
+    // Stage 2: pre-tokenization — produces the byte stream that feeds the
+    // byte-mode BPE trie. Two paths:
     //   (a) --pretokenizer flag was given  → buildPreTokenizerBoundaries
-    //       (full HF-equivalent pretokenizer pipeline from pretokenizer.cpp).
+    //       (U21-domain regex split) → U21_to_UTF8 → byte basis.
     //   (b) no --pretokenizer flag in BPE mode → inline newline mode
     //       (input is one-pretoken-per-line bytelevel text from
-    //        compare_bpe.py step 1; '\n' marks separators).
-    StreamSet * bpeU21;
+    //        compare_bpe.py step 1; 0x0A bytes mark separators).
+    StreamSet * bpeBasis;
     if (PreTokenizer.getNumOccurrences() == 0) {
-        bpeU21 = buildLinePretokens(P, U21codepoints);
+        bpeBasis = buildLinePretokens(P, normalizedBasis);
     } else {
         PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
             P, normalizedBasis, U21codepoints,
             PreTokenizer, SplitBehavior, DelimiterString);
-        bpeU21 = ptResult.U21codepoints;
+        bpeBasis = P.CreateStreamSet(8, 1);
+        U21_to_UTF8(P, ptResult.U21codepoints, bpeBasis);
     }
 
-    // Stage 3: vocab-trie longest-match scan across all (cp0,cp1) buckets.
-    BPETrieResult tr = runBPETrie(P, bpeU21, bpe);
+    // Stage 3: bucket-fold pipeline — single-byte vocab kernel + per
+    // (b0, b1) trie kernels, all OR-merged into a single (matchEnd, vocabID)
+    // pair via BPETriePairMergeKernel.
+    BPETrieResult tr = runBPETrie(P, bpeBasis, bpe);
     StreamSet * matchEnd = tr.matchEnd;
     StreamSet * vocabID  = tr.vocabID;
 
     // Stage 4: emit a token ID at every matchEnd position.
-    //
-    // vocabID is a 16×1 BixNum (16 parallel 1-bit streams). The scan::Reader
-    // pattern requires a byte-width source stream and a 64-bit index stream.
-    //
     //   1. Split vocabID into bits 0-7 (lo) and bits 8-15 (hi).
     //   2. Pack each half to a byte stream via P2SKernel.
-    //   3. matchEnd marks the right-most codepoint of every matched vocab
-    //      word — use it directly as the per-token scan mark.
-    //   4. ScanIndexGenerator → one index per match.
-    //   5. scan::Reader calls bpe_emit_token(lo_ptr, hi_byte) per match.
+    //   3. matchEnd drives ScanIndexGenerator — one index per matched position.
+    //   4. scan::Reader calls bpe_emit_token(lo_ptr, hi_byte) per match.
     namespace su = kernel::streamutils;
     StreamSet * lo8basis = su::Select(P, vocabID,
                                std::vector<uint32_t>{0,1,2,3,4,5,6,7});

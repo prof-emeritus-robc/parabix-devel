@@ -17,19 +17,20 @@ namespace kernel {
     class StreamSet;
 }
 
-// Vocabulary trie node — one entry per codepoint along a vocab word's spelling.
+// Vocabulary trie node — one entry per byte along a vocab word's spelling.
 // vocabID >= 0 marks a complete vocab word ending at this trie depth.
 struct TrieNode {
-    std::map<uint32_t, TrieNode> children;
+    std::map<uint8_t, TrieNode> children;
     int vocabID = -1;
 };
 
-// One bucket per distinct (cp0, cp1) two-codepoint prefix found in vocab.
-// prefixVocabID holds the vocab ID when (cp0, cp1) IS itself a two-codepoint
-// vocab word; root.children carry suffixes for vocab words of length >= 3.
+// One bucket per distinct (b0, b1) two-byte prefix found in vocab.
+// prefixVocabID holds the vocab ID when (b0, b1) IS itself a two-byte
+// vocab word; root.children carry suffixes for vocab words of length >= 3
+// bytes.
 struct VocabBucket {
-    uint32_t cp0 = 0;
-    uint32_t cp1 = 0;
+    uint8_t b0 = 0;
+    uint8_t b1 = 0;
     int prefixVocabID = -1;
     TrieNode root;
 };
@@ -43,10 +44,18 @@ public:
 
     std::string decodeToken(int id) const;
 
-    // Bucketed trie covering vocab words of length >= 2. One bucket per
-    // distinct (cp0, cp1) prefix; each bucket carries a suffix trie for words
-    // of length >= 3.
+    // (byte_value, vocab_ID) for every single-byte vocab token. Drives
+    // BPESingleByteKernel (treated as a (single-byte) bucket alongside the
+    // (b0, b1) trie buckets).
+    std::vector<std::pair<unsigned,unsigned>> buildInitialVocabMap() const;
+
+    // Bucketed trie covering vocab words of byte length >= 2.
     std::vector<VocabBucket> buildVocabBuckets() const;
+
+    // Largest byte length of any token in the loaded vocab. Drives the
+    // LookAhead window in BPEAssembleKernel — positions further away than
+    // (max-1) bytes cannot be inside any vocab match's span.
+    unsigned maxTokenByteLen() const;
 
 private:
     std::unordered_map<std::string, int> vocab_;
@@ -54,16 +63,15 @@ private:
 };
 
 // runBPETrie
-//   Builds one BPETrieKernel per (cp0, cp1) prefix bucket. Each kernel emits
-//   a per-position matchEnd bit (1 at the last codepoint of any vocab word
-//   that ended there) and a 16-bit vocabID BixNum (the matched token's ID
-//   at matchEnd positions; 0 elsewhere). Within a single bucket, longer
-//   matches override shorter ones at their own end position via nested
-//   Pablo scopes. Across buckets, outputs are bitwise OR-merged pairwise.
+//   Builds a uniform pipeline of "bucket" kernels:
+//     - BPESingleByteKernel — emits (matchEnd, vocabID) for every 1-byte
+//       vocab token.
+//     - BPETrieKernel per (b0, b1) — emits (matchEnd, vocabID) for every
+//       byte-length-≥2 vocab word in that bucket.
+//   All bucket outputs are OR-folded pairwise via BPETriePairMergeKernel.
 //
-//   Phase-1 limitation: cross-bucket conflicts at the same end position are
-//   resolved by simple OR, NOT by longest-match. A separate resolution layer
-//   will handle that.
+//   Phase-1 limitation: cross-bucket conflicts at the same end position OR
+//   into a corrupted ID (no length tracking yet).
 struct BPETrieResult {
     kernel::StreamSet * matchEnd;   //  1×1
     kernel::StreamSet * vocabID;    // 16×1 BixNum
@@ -71,12 +79,12 @@ struct BPETrieResult {
 
 BPETrieResult runBPETrie(
     kernel::PipelineBuilder & P,
-    kernel::StreamSet       * u21,
+    kernel::StreamSet       * basis,
     const BPETokenizer      & bpe);
 
 // Line-delimited pretokenizer used when --vocab is given without
 // --pretokenizer (compare_bpe.py step-2 input format).
-// Returns the u21 stream with '\n' codepoints removed via FilterByMask.
+// Returns the basis byte stream with '\n' bytes removed via FilterByMask.
 kernel::StreamSet * buildLinePretokens(
     kernel::PipelineBuilder & P,
-    kernel::StreamSet       * u21);
+    kernel::StreamSet       * basis);

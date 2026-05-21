@@ -50,12 +50,11 @@ static bool                  gOutputStrings = false;
 
 // bpe_emit_token
 // Called once per surviving BPE token by the scan::Reader stage.
-// lo_ptr points into the lo-byte stream at the token's compressed position;
-// hi is the matching high byte of the 16-bit vocab ID.
-// Reconstructs the full token ID and writes it (or its string) to stdout.
-extern "C" void bpe_emit_token(const uint8_t * lo_ptr, uint8_t hi) {
-    uint16_t id = static_cast<uint16_t>(*lo_ptr)
-                | (static_cast<uint16_t>(hi) << 8);
+// id_ptr points into the 16-bit vocab-ID stream at the match-end byte
+// position. The reader passes a single source pointer indexed by the
+// match-end byte offset, so we just deref to recover the full ID.
+extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
+    uint16_t id = *id_ptr;
     if (gOutputStrings && gBPE)
         llvm::outs() << gBPE->decodeToken(static_cast<int>(id)) << "\n";
     else
@@ -222,26 +221,24 @@ static BPEPipelineFunctionType buildBPEPipeline(
     StreamSet * vocabID  = tr.vocabID;
 
     // Stage 4: emit a token ID at every matchEnd position.
-    //   1. Split vocabID into bits 0-7 (lo) and bits 8-15 (hi).
-    //   2. Pack each half to a byte stream via P2SKernel.
-    //   3. matchEnd drives ScanIndexGenerator — one index per matched position.
-    //   4. scan::Reader calls bpe_emit_token(lo_ptr, hi_byte) per match.
-    namespace su = kernel::streamutils;
-    StreamSet * lo8basis = su::Select(P, vocabID,
-                               std::vector<uint32_t>{0,1,2,3,4,5,6,7});
-    StreamSet * hi8basis = su::Select(P, vocabID,
-                               std::vector<uint32_t>{8,9,10,11,12,13,14,15});
-
-    StreamSet * loBytes = P.CreateStreamSet(1, 8);
-    StreamSet * hiBytes = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<P2SKernel>(lo8basis, loBytes);
-    P.CreateKernelCall<P2SKernel>(hi8basis, hiBytes);
+    //   1. Pack the full 16-bit vocabID BixNum into a single 16-bit-per-
+    //      position stream via P2S16Kernel.
+    //   2. matchEnd drives ScanIndexGenerator — one index per matched
+    //      byte position.
+    //   3. scan::Reader passes that byte position as the source pointer
+    //      so bpe_emit_token sees the full ID in one deref. (The earlier
+    //      design split lo/hi into two byte streams and read hi via the
+    //      additionalStreams channel — that channel indexes by scan-
+    //      iteration counter, not match-end byte position, which silently
+    //      zeroed the high byte.)
+    StreamSet * idBytes16 = P.CreateStreamSet(1, 16);
+    P.CreateKernelCall<P2S16Kernel>(vocabID, idBytes16);
 
     StreamSet * scanIndices = P.CreateStreamSet(1, 64);
     P.CreateKernelCall<ScanIndexGenerator>(matchEnd, scanIndices);
 
     scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),
-                 loBytes, scanIndices, {hiBytes});
+                 idBytes16, scanIndices);
 
     return reinterpret_cast<BPEPipelineFunctionType>(P.compile());
 }

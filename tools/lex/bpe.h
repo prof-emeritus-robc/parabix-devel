@@ -6,7 +6,6 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -17,22 +16,12 @@ namespace kernel {
     class StreamSet;
 }
 
-// Vocabulary trie node — one entry per byte along a vocab word's spelling.
-// vocabID >= 0 marks a complete vocab word ending at this trie depth.
-struct TrieNode {
-    std::map<uint8_t, TrieNode> children;
-    int vocabID = -1;
-};
-
-// One bucket per distinct (b0, b1) two-byte prefix found in vocab.
-// prefixVocabID holds the vocab ID when (b0, b1) IS itself a two-byte
-// vocab word; root.children carry suffixes for vocab words of length >= 3
-// bytes.
-struct VocabBucket {
-    uint8_t b0 = 0;
-    uint8_t b1 = 0;
-    int prefixVocabID = -1;
-    TrieNode root;
+// Group of vocab tokens that all share a fixed byte length. The BPE pipeline
+// uses one BPELengthKernel per non-empty group, processed in descending length
+// order so first-write-wins gives the longest match at every end position.
+struct VocabLengthGroup {
+    unsigned length;
+    std::vector<std::pair<std::string, unsigned>> tokens;  // (token bytes, vocabID)
 };
 
 class BPETokenizer {
@@ -44,13 +33,10 @@ public:
 
     std::string decodeToken(int id) const;
 
-    // (byte_value, vocab_ID) for every single-byte vocab token. Drives
-    // BPESingleByteKernel (treated as a (single-byte) bucket alongside the
-    // (b0, b1) trie buckets).
-    std::vector<std::pair<unsigned,unsigned>> buildInitialVocabMap() const;
-
-    // Bucketed trie covering vocab words of byte length >= 2.
-    std::vector<VocabBucket> buildVocabBuckets() const;
+    // Partition the vocab by token byte length. Returned groups are sorted
+    // by length DESCENDING — the pipeline folds them in that order so the
+    // first-wins merge surfaces the longest match at each end position.
+    std::vector<VocabLengthGroup> buildVocabByLength() const;
 
     // Largest byte length of any token in the loaded vocab. Drives the
     // LookAhead window in BPEAssembleKernel — positions further away than
@@ -63,15 +49,16 @@ private:
 };
 
 // runBPETrie
-//   Builds a uniform pipeline of "bucket" kernels:
-//     - BPESingleByteKernel — emits (matchEnd, vocabID) for every 1-byte
-//       vocab token.
-//     - BPETrieKernel per (b0, b1) — emits (matchEnd, vocabID) for every
-//       byte-length-≥2 vocab word in that bucket.
-//   All bucket outputs are OR-folded pairwise via BPETriePairMergeKernel.
-//
-//   Phase-1 limitation: cross-bucket conflicts at the same end position OR
-//   into a corrupted ID (no length tracking yet).
+//   Builds a flat per-length pipeline:
+//     - One BPELengthKernel per distinct token byte length present in vocab.
+//       Each emits (matchEnd, vocabID, matchLen=L-constant) for every vocab
+//       word of that length that ends in the input.
+//     - Length groups are folded by BPELengthFirstWinsMerge in DESCENDING
+//       length order — first hit wins, so longer matches naturally outrank
+//       shorter ones at the same end position with no UGE/UGT compare.
+//     - A final BPEAssembleKernel uses LookAhead over matchLen to suppress
+//       shorter matches that fall inside the span of a longer match ending
+//       later in the stream.
 struct BPETrieResult {
     kernel::StreamSet * matchEnd;   //  1×1
     kernel::StreamSet * vocabID;    // 16×1 BixNum

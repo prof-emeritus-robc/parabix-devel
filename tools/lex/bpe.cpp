@@ -2,48 +2,44 @@
  *  Part of the Parabix Project, under the Open Software License 3.0.
  *  SPDX-License-Identifier: OSL-3.0
  *
- *  BPE tokenizer — vocabulary-trie longest-match scan (byte mode).
+ *  BPE tokenizer — vocab longest-match scan over raw bytes, per-length kernels.
  *
  *  Algorithm
  *  ─────────
- *  Vocab words of byte length >= 2 are bucketed by their first two bytes
- *  (b0, b1). One PabloKernel is emitted per (b0, b1) bucket. Inside the
- *  kernel a nested-scope trie walks the bucket's suffix bytes (byte index
- *  2 onward). Each trie level uses
+ *  Vocabulary tokens are grouped by byte length. One PabloKernel is emitted
+ *  per non-empty length group. Inside a length-L kernel, every length-L token
+ *  is matched independently as
  *
- *      childMark = Advance(parentMark, 1) & EQ(symBN, child_byte)
+ *      m = AND over i in 0..L-1 of Advance(EQ(symBN, token[i]), L-1-i)
  *
- *  to extend the match one byte to the right. Pablo `createIf` on the
- *  child marker runtime-skips dead subtries.
+ *  Common EQ results across tokens at the same length are memoized so each
+ *  distinct byte value is compared against the input once per length kernel.
  *
- *  Per-kernel longest match wins: deeper trie nodes overwrite the per-Var
- *  vocab-ID slots via createSel(parentMark, …, prevVal). Because each match
- *  fires at the right-most byte of its word, distinct word byte-lengths
- *  land at distinct end positions — overwrite competition is only between
- *  vocab words ending at the same position via this bucket's trie.
+ *  The pipeline folds length groups in DESCENDING length order using
+ *  BPELengthFirstWinsMerge — a position that already has a (longer) match
+ *  passes through unchanged, otherwise the new (shorter) match's tuple takes
+ *  over. No UGE/UGT compare is needed because the fold order alone enforces
+ *  longest-wins at any given end position.
  *
- *  Why bytes, not codepoints
- *  ─────────────────────────
- *  GPT-2 vocab.json stores tokens as UTF-8 byte strings. Matching directly
- *  on bytes:
- *    * skips the UTF-8 → U21 decode stage (no applyNormalizationU21);
- *    * skips per-token decodeUTF8 in vocab loading;
- *    * cuts EQ cost from ~log2(21) AND-tree levels to ~log2(8);
- *    * matches HF tokenizers' internal representation exactly.
+ *  After the fold, BPEAssembleKernel uses LookAhead over the carried matchLen
+ *  stream to drop matches that fall inside the span of a later, longer match
+ *  (e.g. the single-byte `l` at position 2 inside `Ġlove` ending at position
+ *  5 with length 6).
  *
- *  Phase-1 limitations
- *  ───────────────────
- *   - Single-byte vocab tokens are not in the trie; a fallback layer
- *     covering positions where no >=2-byte match fires is not wired.
- *   - Cross-bucket conflicts at the same end position are OR-merged. A
- *     subsequent resolution kernel (longest-across-buckets) is not yet
- *     wired here.
+ *  Why per-length kernels?
+ *  ─────────────────────
+ *  GPT-2 max token byte length is ~30, so the pipeline JITs ≤ 30 length
+ *  kernels + ≤ 30 merges + 1 assembly — far fewer than the previous
+ *  per-(b0,b1)-bucket structure which spawned thousands of small kernels.
+ *  Cache keys are derived from a rolling hash of the length group's token
+ *  list so different vocab files do not collide.
  */
 
 #include "bpe.h"
 #include <fstream>
 #include <iostream>
 #include <cstdint>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <pablo/pablo_kernel.h>
 #include <pablo/builder.hpp>
@@ -57,61 +53,78 @@ using namespace kernel;
 
 namespace {
 
-// Rolling hash of a trie node — used to disambiguate JIT cache entries when
-// two buckets share (b0, b1) across different vocab files.
-uint64_t hashTrieNode(const TrieNode & n, uint64_t seed = 0) {
-    seed ^= 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(n.vocabID + 1);
-    seed = (seed << 13) | (seed >> 51);
-    for (const auto & kv : n.children) {
-        seed ^= static_cast<uint64_t>(kv.first) + 0x9E3779B97F4A7C15ull;
-        seed = hashTrieNode(kv.second, seed);
+// Rolling hash over a length group — used to disambiguate JIT cache entries
+// when different vocab files share a length but different token contents.
+uint64_t hashLengthGroup(unsigned L,
+                         const std::vector<std::pair<std::string,unsigned>> & tokens) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    h ^= L;
+    h *= 1099511628211ull;
+    for (const auto & [tok, id] : tokens) {
+        for (unsigned char c : tok) {
+            h ^= static_cast<uint64_t>(c);
+            h *= 1099511628211ull;
+        }
+        h ^= static_cast<uint64_t>(id);
+        h *= 1099511628211ull;
     }
-    return seed;
+    return h;
 }
 
 }
 
-// ─── BPETrieKernel ──────────────────────────────────────────────────────────
+// ─── BPELengthKernel ───────────────────────────────────────────────────────
 //
-// One PabloKernel per (b0, b1) byte bucket. Input: 8×1 basis bit streams of
-// the byte-encoded text. Outputs: matchEnd (1×1, marks the right-most byte
-// of every vocab word in this bucket that ended there) and vocabID (16×1
-// BixNum, the matched word's ID at matchEnd positions; 0 elsewhere within
-// this bucket's output).
-class BPETrieKernel : public PabloKernel {
+// One PabloKernel per token byte length L. Inputs: 8×1 basis bit streams of
+// the byte-encoded text. Outputs:
+//   matchEnd (1×1) — fires at the right-most byte of every length-L vocab
+//                   word that ended there.
+//   vocabID  (16×1 BixNum) — the matched word's ID at matchEnd positions.
+//   matchLen (8×1  BixNum) — constant L at matchEnd positions, 0 elsewhere.
+class BPELengthKernel : public PabloKernel {
 public:
-    BPETrieKernel(LLVMTypeSystemInterface & ts,
-                  StreamSet * basis,
-                  StreamSet * matchEnd,
-                  StreamSet * vocabID,
-                  StreamSet * matchLen,
-                  VocabBucket bucket,
-                  unsigned tag,
-                  uint64_t shapeHash)
+    BPELengthKernel(LLVMTypeSystemInterface & ts,
+                    StreamSet * basis,  // 8×1 byte streams of the input text
+                    StreamSet * matchEnd,  // 1×1 stream to fire at end positions of matched tokens
+                    StreamSet * vocabID,  // 16×1 BixNum stream to hold the matched token's ID at matchEnd positions
+                    StreamSet * matchLen, // 8×1 BixNum stream to hold constant L at matchEnd positions, 0 elsewhere
+                    unsigned L,
+                    std::vector<std::pair<std::string,unsigned>> tokens,
+                    uint64_t shapeHash)
     : PabloKernel(ts,
-                  "BPETrie_t" + std::to_string(tag)
-                       + "_b" + std::to_string(bucket.b0)
-                       + "_" + std::to_string(bucket.b1)
+                  "BPELength_L" + std::to_string(L)
                        + "_h" + std::to_string(shapeHash),
                   {Binding{"basis", basis}},
                   {Binding{"matchEnd", matchEnd},
                    Binding{"vocabID",  vocabID},
                    Binding{"matchLen", matchLen}}),
-      mBucket(std::move(bucket)) {}
+      mLength(L), mTokens(std::move(tokens)) {}
 
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
 
-        // symBN is the 8-bit BixNum of the input byte stream; used for
-        // matching against b0 and b1 in the trie walk.
+        // symBN = Pack basis bits into a BixNum for byte-wise comparison.
         std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
         BixNum symBN(basisBits.begin(), basisBits.end());
 
+        // Pre-create common constants.
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
 
+        // Memoize EQ(symBN, b) per distinct byte appearing in any token at
+        // this length — each byte value compared against input only once.
+        std::map<uint8_t, PabloAST*> byteEQ; 
+        auto getEQ = [&](uint8_t b) {
+            auto it = byteEQ.find(b);
+            if (it != byteEQ.end()) return it->second;
+            PabloAST * eq = bnc.EQ(symBN, b);
+            byteEQ.emplace(b, eq);
+            return eq;
+        };
+
+        // matchEndV = OR over tokens of m, where m = AND over i of Advance(EQ(symBN, tok[i]), L-1-i).
         Var * matchEndV = pb.createVar("matchEnd", zeroes);
         std::vector<Var*> idBits;
         idBits.reserve(16);
@@ -119,132 +132,79 @@ protected:
             idBits.push_back(pb.createVar(
                 "id_" + std::to_string(i), zeroes));
         }
-        // matchLen: 8-bit BixNum, length in bytes of the matched word at
-        // each end position. 0 elsewhere. Longest-wins semantics enforced
-        // by overwriting deeper (longer) matches over shallower ones via
-        // Sel(mark, …, current) — same pattern as idBits.
-        std::vector<Var*> lenBits;
-        lenBits.reserve(8);
-        for (unsigned i = 0; i < 8; i++) {
-            lenBits.push_back(pb.createVar(
-                "len_" + std::to_string(i), zeroes));
+
+        for (const auto & [tok, vid] : mTokens) {
+            // Build m = AND over i of Advance(EQ(symBN, tok[i]), L-1-i).
+            // At end-position p, Advance(eq, k) reads eq at p-k, so each
+            // factor checks the byte at position p-(L-1-i) = p-L+1+i — that
+            // is the i-th byte of the token aligned with the right-most
+            // byte landing at p.
+            PabloAST * m = ones;
+            for (unsigned i = 0; i < mLength; i++) {
+                uint8_t b = static_cast<uint8_t>(tok[i]);
+                PabloAST * eq = getEQ(b);
+                unsigned k = mLength - 1 - i;
+                PabloAST * factor = (k == 0) ? eq : pb.createAdvance(eq, k);
+                m = pb.createAnd(m, factor);
+            }
+            pb.createAssign(matchEndV, pb.createOr(matchEndV, m));
+            for (unsigned i = 0; i < 16; i++) {
+                unsigned bit = (vid >> i) & 1u;
+                pb.createAssign(
+                    idBits[i],
+                    pb.createSel(m, bit ? ones : zeroes, idBits[i]));
+            }
         }
 
-        // First match stage: check the bucket's (b0, b1) against the input
-        // byte stream. Only positions where both match can possibly match
-        // any token in this bucket.
-        PabloAST * c0 = bnc.EQ(symBN, mBucket.b0);
-        PabloAST * c1 = bnc.EQ(symBN, mBucket.b1);
-        //  pairMark[p] = 1  iff  symBN[p-1]==b0 AND symBN[p]==b1
-        //  → marks the b1 (right-hand) byte of every (b0,b1) pair.
-        PabloAST * pairMark = pb.createAnd(
-            pb.createAdvance(c0, 1), c1);
-
-        auto pairScope = pb.createScope();
-        pb.createIf(pairMark, pairScope);
-
-        // 2-byte vocab word case: bucket's prefix IS itself a vocab token.
-        if (mBucket.prefixVocabID >= 0) {
-            recordMatch(pairScope, pairMark, mBucket.prefixVocabID, /*len=*/2,
-                        matchEndV, idBits, lenBits, ones, zeroes);
-        }
-        // Walk the suffix trie for vocab words of byte length >= 3.
-        // currentLen is the length of a word ending at parentMark = 2 here
-        // (b0 + b1). emitTrie increments per recursion level.
-        emitTrie(pairScope, pairMark, mBucket.root, /*currentLen=*/2, basisBits,
-                 matchEndV, idBits, lenBits, ones, zeroes);
-
+        // collect all matches into the output streams:
+        // Where words end
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("matchEnd"),
                              pb.getInteger(0)),
             matchEndV);
+        // vocabID = the matched token's ID at matchEnd positions, 0 elsewhere.
+        // Which word matched
         Var * idOut = getOutputStreamVar("vocabID");
         for (unsigned i = 0; i < 16; i++) {
             pb.createAssign(
                 pb.createExtract(idOut, pb.getInteger(i)),
                 idBits[i]);
         }
+        // matchLen = constant L at matchEnd positions, 0 elsewhere.
+        // Length of word
         Var * lenOut = getOutputStreamVar("matchLen");
         for (unsigned i = 0; i < 8; i++) {
+            PabloAST * v = ((mLength >> i) & 1u)
+                               ? static_cast<PabloAST*>(matchEndV)
+                               : zeroes;
+            // Advance v by i to align with the correct bit position in the output BixNum stream, then assign to the output.    
             pb.createAssign(
                 pb.createExtract(lenOut, pb.getInteger(i)),
-                lenBits[i]);
+                v);
         }
     }
 
 private:
-    VocabBucket mBucket;
-
-    static void recordMatch(PabloBuilder & pb, PabloAST * mark,
-                            int vocabID, unsigned len,
-                            Var * matchEndV,
-                            std::vector<Var*> & idBits,
-                            std::vector<Var*> & lenBits,
-                            PabloAST * ones, PabloAST * zeroes) {
-        pb.createAssign(matchEndV, pb.createOr(matchEndV, mark));
-        for (unsigned i = 0; i < 16; i++) {
-            unsigned bit = (static_cast<unsigned>(vocabID) >> i) & 1u;
-            pb.createAssign(
-                idBits[i],
-                pb.createSel(mark, bit ? ones : zeroes, idBits[i]));
-        }
-        for (unsigned i = 0; i < 8; i++) {
-            unsigned bit = (len >> i) & 1u;
-            pb.createAssign(
-                lenBits[i],
-                pb.createSel(mark, bit ? ones : zeroes, lenBits[i]));
-        }
-    }
-
-    // Recursive trie emitter — extends parentMark one byte to the right per
-    // level and creates a guarded scope for each child branch.
-    // currentLen: length of a word ending at parentMark. Each child match
-    // has length currentLen + 1.
-    static void emitTrie(PabloBuilder & pb, PabloAST * parentMark,
-                         const TrieNode & node, unsigned currentLen,
-                         const std::vector<PabloAST*> & basisBits,
-                         Var * matchEndV,
-                         std::vector<Var*> & idBits,
-                         std::vector<Var*> & lenBits,
-                         PabloAST * ones, PabloAST * zeroes) {
-        if (node.children.empty()) return;
-        BixNumCompiler bnc(pb);
-        BixNum symBN(basisBits.begin(), basisBits.end());
-        unsigned childLen = currentLen + 1;
-        for (const auto & kv : node.children) {
-            uint8_t b = kv.first;
-            const TrieNode & child = kv.second;
-            PabloAST * byteMark  = bnc.EQ(symBN, b);
-            PabloAST * childMark = pb.createAnd(
-                pb.createAdvance(parentMark, 1), byteMark);
-            auto childScope = pb.createScope();
-            pb.createIf(childMark, childScope);
-            if (child.vocabID >= 0) {
-                recordMatch(childScope, childMark, child.vocabID, childLen,
-                            matchEndV, idBits, lenBits, ones, zeroes);
-            }
-            emitTrie(childScope, childMark, child, childLen, basisBits,
-                     matchEndV, idBits, lenBits, ones, zeroes);
-        }
-    }
+    unsigned mLength;
+    std::vector<std::pair<std::string,unsigned>> mTokens;
 };
 
 
-// ─── BPETriePairMergeKernel ─────────────────────────────────────────────────
+// ─── BPELengthFirstWinsMerge ───────────────────────────────────────────────
 //
-// Longest-wins merge of two (matchEnd, vocabID, matchLen) bucket outputs.
-// At positions where exactly one input fires, that input's tuple passes
-// through. At positions where both fire, the input with the larger matchLen
-// wins (ties go to input #1 — the caller folds buckets in deterministic
-// order, so this gives stable cross-bucket disambiguation). Cache-keyed by
-// name alone; semantics are bucket-independent.
-class BPETriePairMergeKernel : public PabloKernel {
+// First-wins merge of two (matchEnd, vocabID, matchLen) tuples. 
+// Fold length groups in DESCENDING length order — so "first" already
+// holds the longer match and the new one only fills in positions the first
+// did not cover. No length comparison needed.
+
+// which word survives when multiple detectors shout at the same position.
+class BPELengthFirstWinsMerge : public PabloKernel {
 public:
-    BPETriePairMergeKernel(LLVMTypeSystemInterface & ts,
-                           StreamSet * me1, StreamSet * id1, StreamSet * len1,
-                           StreamSet * me2, StreamSet * id2, StreamSet * len2,
-                           StreamSet * meOut, StreamSet * idOut, StreamSet * lenOut)
-    : PabloKernel(ts, "BPETriePairMerge",
+    BPELengthFirstWinsMerge(LLVMTypeSystemInterface & ts,
+                            StreamSet * me1, StreamSet * id1, StreamSet * len1,
+                            StreamSet * me2, StreamSet * id2, StreamSet * len2,
+                            StreamSet * meOut, StreamSet * idOut, StreamSet * lenOut)
+    : PabloKernel(ts, "BPELengthFirstWinsMerge",
                   {Binding{"me1", me1},   Binding{"id1", id1},  Binding{"len1", len1},
                    Binding{"me2", me2},   Binding{"id2", id2},  Binding{"len2", len2}},
                   {Binding{"meOut", meOut}, Binding{"idOut", idOut},
@@ -253,7 +213,6 @@ public:
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        BixNumCompiler bnc(pb);
 
         PabloAST * me1 = getInputStreamSet("me1")[0];
         PabloAST * me2 = getInputStreamSet("me2")[0];
@@ -261,34 +220,35 @@ protected:
         std::vector<PabloAST*> id2  = getInputStreamSet("id2");
         std::vector<PabloAST*> len1 = getInputStreamSet("len1");
         std::vector<PabloAST*> len2 = getInputStreamSet("len2");
-        BixNum lenBN1(len1.begin(), len1.end());
-        BixNum lenBN2(len2.begin(), len2.end());
 
-        // Tie-break to input #1: m1Wins on >= , m2Wins on strict >.
-        PabloAST * ge = bnc.UGE(lenBN1, lenBN2);
-        PabloAST * gt = bnc.UGT(lenBN2, lenBN1);
-        PabloAST * m1Wins = pb.createAnd(me1, pb.createOr(pb.createNot(me2), ge));
-        PabloAST * m2Wins = pb.createAnd(me2, pb.createOr(pb.createNot(me1), gt));
+        // me2 wins only where me1 hasn't already fired.
+        PabloAST * me2Wins = pb.createAnd(me2, pb.createNot(me1));
 
+        // me1 wins if it fired, otherwise me2 wins if it fired, otherwise no match.
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("meOut"),
                              pb.getInteger(0)),
+            // me1 OR (NOT me1 AND me2) simplifies to me1 OR me2.
             pb.createOr(me1, me2));
+        // Where a match ended, which word ID and length to output — me1's if it fired, else me2's if it fired, else 0.
         Var * idOut = getOutputStreamVar("idOut");
+        // For each bit of the vocabID and matchLen BixNums, pick me1's bit if me1 won, else me2's bit if me2 won, else 0.
         for (unsigned i = 0; i < 16; i++) {
-            // mux: m1Wins ? id1[i] : (m2Wins ? id2[i] : 0)
-            PabloAST * picked = pb.createSel(m1Wins, id1[i],
-                                   pb.createSel(m2Wins, id2[i],
+            PabloAST * picked = pb.createSel(me1, id1[i],
+                                   pb.createSel(me2Wins, id2[i],
                                                 pb.createZeroes()));
+            // Assign the picked bit to the output vocabID stream at position i.
             pb.createAssign(
                 pb.createExtract(idOut, pb.getInteger(i)),
                 picked);
         }
+        // Sum for matchLen bits.
         Var * lenOut = getOutputStreamVar("lenOut");
         for (unsigned i = 0; i < 8; i++) {
-            PabloAST * picked = pb.createSel(m1Wins, len1[i],
-                                   pb.createSel(m2Wins, len2[i],
+            PabloAST * picked = pb.createSel(me1, len1[i],
+                                   pb.createSel(me2Wins, len2[i],
                                                 pb.createZeroes()));
+            // 
             pb.createAssign(
                 pb.createExtract(lenOut, pb.getInteger(i)),
                 picked);
@@ -299,18 +259,11 @@ protected:
 
 // ─── BPEAssembleKernel ──────────────────────────────────────────────────────
 //
-// Suppress matches that fall inside the span of a longer match ending later.
-// Inputs: matchEnd, vocabID, matchLen — already longest-wins-merged across
-// buckets. Output: keep_matchEnd, keep_vocabID — both zeroed at positions
-// covered by a longer match's span.
-//
-// A match ending at position e with length L covers byte positions
-// [e-L+1 .. e]. For each position p, p is covered by some future match iff
-// there exists k in [1 .. maxLen-1] such that matchEnd(p+k) AND matchLen(p+k) > k.
-// We unroll the LookAhead over k = 1..maxLen-1.
-//
-// We do NOT suppress matchEnd at its own end position (k=0 case), since by
-// construction longest-wins already picked the right token there.
+// Suppress matches that fall inside the byte span of a longer match ending
+// later. A match ending at e with length L covers positions [e-L+1 .. e]; so
+// position p is covered iff there exists k in [1 .. maxLen-1] with
+// matchEnd(p+k)=1 AND matchLen(p+k) > k. Bindings declare LookAhead(maxLen-1)
+// on matchEnd and matchLen so Pablo can peek forward.
 class BPEAssembleKernel : public PabloKernel {
 public:
     BPEAssembleKernel(LLVMTypeSystemInterface & ts,
@@ -332,12 +285,18 @@ protected:
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
 
+        // A position p is covered by a later, longer match if there exists k in [1 .. maxLen-1] with matchEnd(p+k)=1 AND matchLen(p+k) > k.
         PabloAST * me0 = getInputStreamSet("matchEndIn")[0];
+        // vocabIDIn and matchLenIn are LookAhead streams so we can access future positions without Advance.
         std::vector<PabloAST*> idIn  = getInputStreamSet("vocabIDIn");
         std::vector<PabloAST*> lenIn = getInputStreamSet("matchLenIn");
 
+        // coverMask = OR over k in [1 .. maxLen-1] of (matchEnd(p+k) AND UGT(matchLen(p+k), k)).
         PabloAST * coverMask = pb.createZeroes();
 
+        // For each k in [1 .. maxLen-1], 
+        //compute a mask of positions covered by a match ending at p+k with length > k, 
+        //then OR them together to get the final coverMask.
         for (unsigned k = 1; k < mMaxLen; k++) {
             PabloAST * futureEnd = pb.createLookahead(me0, k);
             std::vector<PabloAST*> futureLenBits;
@@ -345,19 +304,27 @@ protected:
             for (unsigned i = 0; i < 8; i++) {
                 futureLenBits.push_back(pb.createLookahead(lenIn[i], k));
             }
+            // futureLenBN = BixNum of the lookahead bits for matchLen at position p+k.
             BixNum futureLenBN(futureLenBits.begin(), futureLenBits.end());
-            // p covered by match ending at p+k iff len(p+k) > k.
+            // covered_k = matchEnd(p+k) AND UGT(matchLen(p+k), k) 
+            // fires at positions p where a match ending at p+k would cover p.
             PabloAST * covered_k = pb.createAnd(
                 futureEnd, bnc.UGT(futureLenBN, k));
+            // OR covered_k into the cumulative coverMask.
             coverMask = pb.createOr(coverMask, covered_k);
         }
 
+        // keep = matchEnd(p) AND NOT coverMask 
+        // fires at positions where a match ends that is not covered by a later, longer match.
         PabloAST * keep = pb.createAnd(me0, pb.createNot(coverMask));
 
+        // Assign the kept matches to the output streams. 
+        // Where a match end is kept, copy the vocabID from the input to the output; otherwise output 0.
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("matchEndOut"),
                              pb.getInteger(0)),
             keep);
+        // For each bit of the vocabID BixNum, copy it to the output if keep=1, else output 0.
         Var * idOut = getOutputStreamVar("vocabIDOut");
         for (unsigned i = 0; i < 16; i++) {
             pb.createAssign(
@@ -365,11 +332,10 @@ protected:
                 pb.createAnd(idIn[i], keep));
         }
     }
-
+// max token byte length in the vocab, used for LookAhead in the assembly kernel.
 private:
     unsigned mMaxLen;
 };
-
 
 // ─── InvertStreamKernel ─────────────────────────────────────────────────────
 //
@@ -396,7 +362,7 @@ protected:
 // ─── LinePtBoundKernel ──────────────────────────────────────────────────────
 //
 // Inline pretokenizer for compare_bpe.py step 2. Marks each newline (0x0A)
-// byte position so callers can FilterByMask it out of the downstream stream.
+// byte position, to FilterByMask it out of the downstream stream.
 class LinePtBoundKernel : public PabloKernel {
 public:
     LinePtBoundKernel(LLVMTypeSystemInterface & ts,
@@ -409,9 +375,13 @@ protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
+        // symBN = Pack basis bits into a BixNum for byte-wise comparison.
         std::vector<PabloAST*> bits = getInputStreamSet("basis");
+        // symBN is unused here since we only care about one byte value, so just pack the bits into a BixNum for convenient EQ against 0x0A.
         BixNum bn(bits.begin(), bits.end());
+        // isNL = EQ(symBN, 0x0A) — fires at newline byte positions.
         PabloAST * isNL = bnc.EQ(bn, 0x0A);
+        // Assign isNL to the output newlineMask stream at position 0.
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("newlineMask"),
                              pb.getInteger(0)),
@@ -420,207 +390,138 @@ protected:
 };
 
 
-// ─── BPESingleByteKernel ────────────────────────────────────────────────────
-//
-// Treats every single-byte vocab token as a length-1 "bucket". For each
-// (byte, vocabID) pair, EQ + Sel writes the vocab ID at matching positions
-// and ORs into matchEnd. Output shape matches BPETrieKernel so the
-// downstream pair-merge fold sees uniform tuples.
-class BPESingleByteKernel : public PabloKernel {
-public:
-    BPESingleByteKernel(LLVMTypeSystemInterface & ts,
-                        StreamSet * basis,
-                        StreamSet * matchEnd,
-                        StreamSet * vocabID,
-                        StreamSet * matchLen,
-                        std::vector<std::pair<unsigned,unsigned>> byteToVocab,
-                        uint64_t shapeHash)
-    : PabloKernel(ts,
-                  "BPE_SingleByte_h" + std::to_string(shapeHash),
-                  {Binding{"basis", basis}},
-                  {Binding{"matchEnd", matchEnd},
-                   Binding{"vocabID",  vocabID},
-                   Binding{"matchLen", matchLen}}),
-      mByteToVocab(std::move(byteToVocab)) {}
-
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        BixNumCompiler bnc(pb);
-
-        std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
-        BixNum byteBN(basisBits.begin(), basisBits.end());
-
-        PabloAST * zeroes = pb.createZeroes();
-        PabloAST * ones   = pb.createNot(zeroes);
-
-        Var * matchEndV = pb.createVar("matchEnd", zeroes);
-        std::vector<Var*> idBits;
-        idBits.reserve(16);
-        for (unsigned i = 0; i < 16; i++) {
-            idBits.push_back(pb.createVar(
-                "id_" + std::to_string(i), zeroes));
-        }
-
-        for (const auto & [byte, vid] : mByteToVocab) {
-            PabloAST * match = bnc.EQ(byteBN, byte);
-            pb.createAssign(matchEndV, pb.createOr(matchEndV, match));
-            for (unsigned i = 0; i < 16; i++) {
-                unsigned bit = (vid >> i) & 1u;
-                pb.createAssign(
-                    idBits[i],
-                    pb.createSel(match, bit ? ones : zeroes, idBits[i]));
-            }
-        }
-
-        pb.createAssign(
-            pb.createExtract(getOutputStreamVar("matchEnd"),
-                             pb.getInteger(0)),
-            matchEndV);
-        Var * idOut = getOutputStreamVar("vocabID");
-        for (unsigned i = 0; i < 16; i++) {
-            pb.createAssign(
-                pb.createExtract(idOut, pb.getInteger(i)),
-                idBits[i]);
-        }
-        // matchLen = 1 wherever matchEnd fires; 0 elsewhere. (binary 0000_0001)
-        Var * lenOut = getOutputStreamVar("matchLen");
-        pb.createAssign(
-            pb.createExtract(lenOut, pb.getInteger(0)),
-            matchEndV);
-        for (unsigned i = 1; i < 8; i++) {
-            pb.createAssign(
-                pb.createExtract(lenOut, pb.getInteger(i)),
-                zeroes);
-        }
-    }
-
-private:
-    std::vector<std::pair<unsigned,unsigned>> mByteToVocab;
-};
-
-
 // ─── Pipeline ─────────────────────────────────────────────────────────
 // runBPETrie
 //
-// Treats single-byte vocab + every (b0, b1) trie bucket uniformly. Each
-// bucket emits (matchEnd, vocabID, matchLen). Longest-wins pair-merge folds
-// them into one combined stream. A final BPEAssembleKernel uses LookAhead
-// over matchLen to suppress shorter matches that fall inside the span of a
-// longer match ending later — so single-byte tokens emit only at positions
-// not covered by a multi-byte vocab word.
+// Builds a per-length pipeline:
+//   1. One BPELengthKernel per non-empty token length, emitting
+//      (matchEnd, vocabID, matchLen=L) for every length-L vocab word.
+//   2. Pair-merge fold in DESCENDING length order using
+//      BPELengthFirstWinsMerge — longest match at each end position
+//      survives without any length compare.
+//   3. BPEAssembleKernel suppresses matches lying inside a later, longer
+//      match's byte span by LookAheading over matchLen.
+//
+// Set BPE_NO_ASSEMBLE in the environment to skip the final assembly stage
+// (returns the raw pair-merged streams) — useful for isolating the source
+// of unexpected token output during debugging.
 BPETrieResult runBPETrie(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
         const BPETokenizer & bpe) {
-    auto byteMap = bpe.buildInitialVocabMap();
-    auto buckets = bpe.buildVocabBuckets();
+    auto byLength = bpe.buildVocabByLength();   // descending by length
 
+    // curMe/curId/curLen hold the folded streams for all length groups processed so far, 
+    // to merge with the next group. Initially null, then set to the first group's output, 
+    // then updated with each merge.
     StreamSet * curMe  = nullptr;
     StreamSet * curId  = nullptr;
     StreamSet * curLen = nullptr;
 
-    // First "bucket" — single-byte vocab tokens.
-    if (!byteMap.empty()) {
-        uint64_t h = 0xCBF29CE484222325ull;
-        for (const auto & [b, v] : byteMap) {
-            h ^= (static_cast<uint64_t>(b) << 16) ^ static_cast<uint64_t>(v);
-            h = (h << 13) | (h >> 51);
-        }
+    // For each length group, emit a BPELengthKernel to detect matches of that length, 
+    // then merge with the cumulative streams from previous groups using BPELengthFirstWinsMerge.
+    unsigned groupCount = 0;
+    for (auto & group : byLength) {
+        if (group.tokens.empty()) continue;
+        uint64_t shape = hashLengthGroup(group.length, group.tokens);
+
+        // Emit a BPELengthKernel for this length group, producing (me, id, len) streams for the matches of this length.
         StreamSet * me  = P.CreateStreamSet(1, 1);
         StreamSet * id  = P.CreateStreamSet(16, 1);
         StreamSet * len = P.CreateStreamSet(8, 1);
-        P.CreateKernelCall<BPESingleByteKernel>(
-            basis, me, id, len, std::move(byteMap), h);
-        curMe  = me;
-        curId  = id;
-        curLen = len;
-    }
-
-    // 2+ byte trie buckets.
-    unsigned tag = 0;
-    for (auto & bucket : buckets) {
-        uint64_t shape = hashTrieNode(bucket.root,
-            (static_cast<uint64_t>(bucket.b0) << 32) ^ bucket.b1
-                ^ static_cast<uint64_t>(bucket.prefixVocabID + 1));
-
-        StreamSet * me  = P.CreateStreamSet(1, 1);
-        StreamSet * id  = P.CreateStreamSet(16, 1);
-        StreamSet * len = P.CreateStreamSet(8, 1);
-        P.CreateKernelCall<BPETrieKernel>(
-            basis, me, id, len, std::move(bucket), tag, shape);
-        tag++;
+        P.CreateKernelCall<BPELengthKernel>(
+            basis, me, id, len, group.length, std::move(group.tokens), shape);
+        groupCount++;
         if (curMe == nullptr) {
             curMe  = me;
             curId  = id;
             curLen = len;
             continue;
         }
+        // Merge the new length group's streams with the cumulative streams from previous groups using BPELengthFirstWinsMerge, 
+        //producing updated cumulative streams in outMe/outId/outLen.
         StreamSet * outMe  = P.CreateStreamSet(1, 1);
         StreamSet * outId  = P.CreateStreamSet(16, 1);
         StreamSet * outLen = P.CreateStreamSet(8, 1);
-        P.CreateKernelCall<BPETriePairMergeKernel>(
+        P.CreateKernelCall<BPELengthFirstWinsMerge>(
             curMe, curId, curLen, me, id, len, outMe, outId, outLen);
         curMe  = outMe;
         curId  = outId;
         curLen = outLen;
     }
-    std::cerr << "BPE: trie pipeline built with " << tag
-              << " (b0,b1) buckets + single-byte bucket\n";
+    // After processing all length groups, curMe/curId/curLen hold the merged matchEnd/vocabID/matchLen streams for all tokens.
+    std::cerr << "BPE: per-length pipeline built with " << groupCount
+              << " length kernels\n";
 
+    // If the vocab is empty, no length kernels were built and curMe is still null. 
+    // In that case, create dummy output streams that will never fire, 
+    //to avoid null pointers in the downstream assembly kernel.
     if (curMe == nullptr) {
-        // Empty vocab — emit zero streams.
         std::cerr << "BPE: vocabulary empty; emitting zero streams\n";
         StreamSet * me = P.CreateStreamSet(1, 1);
         StreamSet * id = P.CreateStreamSet(16, 1);
         return {me, id};
     }
 
-    // Final assembly: suppress positions inside a longer match's span.
+    // Finally, run the BPEAssembleKernel to suppress matches that fall inside the byte span of a later, longer match.
     unsigned maxLen = bpe.maxTokenByteLen();
     if (maxLen < 2) {
-        // Nothing longer than 1 byte exists — no assembly needed.
         return {curMe, curId};
     }
+    // If the longest token is only 1 byte, no assembly needed since single-byte matches cannot be covered by a longer match. 
+    // Skip the assembly kernel to save JIT time.
     if (getenv("BPE_NO_ASSEMBLE")) {
         std::cerr << "BPE: skipping assembly stage (BPE_NO_ASSEMBLE set)\n";
         return {curMe, curId};
     }
+    // Run the assembly kernel with LookAhead(maxLen-1) on the input streams so it can peek forward to check for covering matches.
     StreamSet * outMe = P.CreateStreamSet(1, 1);
     StreamSet * outId = P.CreateStreamSet(16, 1);
     P.CreateKernelCall<BPEAssembleKernel>(
         curMe, curId, curLen, outMe, outId, maxLen);
     return {outMe, outId};
 }
-
+// buildLinePretokens
 kernel::StreamSet * buildLinePretokens(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis) {
 
+    // basisBits is the number of bits in the basis StreamSet, which should be 8 for byte streams.
     const unsigned basisBits = basis->getNumElements();
 
+    // Create a mask for newline characters.
     StreamSet * newlineMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<LinePtBoundKernel>(basis, newlineMask);
 
+    // Invert the newline mask to get a keep mask for FilterByMask, 
+    // which will keep positions that are not newlines.
     StreamSet * keepMask = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<InvertStreamKernel>(newlineMask, keepMask);
 
+    // Use FilterByMask to filter the basis stream, 
+    // keeping only positions that are not newlines, and output the compressed basis stream.
     StreamSet * compressedBasis = P.CreateStreamSet(basisBits, 1);
     FilterByMask(P, keepMask, basis, compressedBasis);
 
+    // Return the compressed basis stream, 
+    // which has newlines filtered out and can be used as input to the BPE trie.
     return compressedBasis;
 }
-// ─── BPETokenizer — file I/O ────────────────────────────────────────────────
-// 1
-//
-// string → id
-// id → string
+
+
+// ─── BPETokenizer — file I/O + vocab partitioning ──────────────────────────
+
+// BPETokenizer loads a vocab file mapping tokens to IDs, decodes token IDs back to strings,
+// and partitions the vocab by token byte length for the per-length kernels.
 bool BPETokenizer::loadVocab(const std::string & path) {
     std::ifstream file(path);
+    // If the file cannot be opened, print an error message and return false.
     if (!file.is_open()) {
         std::cerr << "BPE: cannot open vocab file: " << path << "\n";
         return false;
     }
+    // Parse the JSON vocab file into a nlohmann::json object. 
+    //If parsing fails, print an error message and return false.
     nlohmann::json j;
     try {
         file >> j;
@@ -628,26 +529,31 @@ bool BPETokenizer::loadVocab(const std::string & path) {
         std::cerr << "BPE: failed to parse vocab file: " << e.what() << "\n";
         return false;
     }
+    // Iterate over the items in the JSON object, where each item is a key-value pair of token and ID.
     for (auto & [key, val] : j.items()) {
         int id = val.get<int>();
         vocab_[key] = id;
+        // If the ID is non-negative, ensure that idToToken_ has enough space to hold the token at index id, 
+        // and then store the token string at that index.
         if (id >= 0) {
             if (static_cast<size_t>(id) >= idToToken_.size())
                 idToToken_.resize(static_cast<size_t>(id) + 1);
             idToToken_[static_cast<size_t>(id)] = key;
         }
     }
+    // After loading the vocab, print the number of tokens loaded and return true if the vocab is not empty.
     std::cerr << "BPE: loaded vocab with " << vocab_.size() << " tokens\n";
     return !vocab_.empty();
 }
 
+// decodeToken takes an integer token ID and returns the corresponding token string from the idToToken_ vector.
 std::string BPETokenizer::decodeToken(int id) const {
     if (id < 0 || static_cast<size_t>(id) >= idToToken_.size()) return "";
     return idToToken_[static_cast<size_t>(id)];
 }
 
-// maxTokenByteLen — largest token byte length across the loaded vocab.
-// Drives the LookAhead window in BPEAssembleKernel.
+// maxTokenByteLen iterates over all tokens in the vocab and returns the maximum byte length of any token, 
+// which is used to determine the LookAhead window size in the assembly kernel.
 unsigned BPETokenizer::maxTokenByteLen() const {
     unsigned m = 0;
     for (const auto & [token, id] : vocab_) {
@@ -657,60 +563,20 @@ unsigned BPETokenizer::maxTokenByteLen() const {
     return m;
 }
 
-// buildInitialVocabMap — list (byte, vocabID) for every single-byte vocab
-// token. Drives InitialSymIDKernel's per-position fallback.
-std::vector<std::pair<unsigned,unsigned>>
-BPETokenizer::buildInitialVocabMap() const {
-    std::vector<std::pair<unsigned,unsigned>> result;
-    result.reserve(256);
+// Partition the vocab by token byte length. Tokens are placed into the
+// group whose `length` equals `token.size()`. Output is sorted in DESCENDING
+// length order so the pipeline folds the longest group first.
+std::vector<VocabLengthGroup> BPETokenizer::buildVocabByLength() const {
+    std::map<unsigned, std::vector<std::pair<std::string,unsigned>>> byLen;
     for (const auto & [token, id] : vocab_) {
-        if (token.size() != 1) continue;
-        result.push_back({static_cast<unsigned>(static_cast<uint8_t>(token[0])),
-                          static_cast<unsigned>(id)});
+        if (token.empty()) continue;
+        byLen[static_cast<unsigned>(token.size())].push_back(
+            {token, static_cast<unsigned>(id)});
+    }
+    std::vector<VocabLengthGroup> result;
+    result.reserve(byLen.size());
+    for (auto it = byLen.rbegin(); it != byLen.rend(); ++it) {
+        result.push_back({it->first, std::move(it->second)});
     }
     return result;
 }
-
-// buildVocabBuckets — byte mode.
-// Iterates each vocab token as raw bytes (vocab.json stores tokens in
-// UTF-8 byte form already). Tokens of byte length < 2 are skipped.
-// Tokens of byte length 2 land in the bucket's prefixVocabID slot;
-// longer tokens insert into the byte-keyed trie under the (b0, b1) bucket.
-std::vector<VocabBucket> BPETokenizer::buildVocabBuckets() const {
-    std::map<std::pair<uint8_t,uint8_t>, VocabBucket> byPrefix;
-    for (const auto & [token, id] : vocab_) {
-        if (token.size() < 2) continue;
-        uint8_t b0 = static_cast<uint8_t>(token[0]);
-        uint8_t b1 = static_cast<uint8_t>(token[1]);
-        auto key = std::make_pair(b0, b1);
-        auto & b = byPrefix[key];
-        b.b0 = b0;
-        b.b1 = b1;
-        if (token.size() == 2) {
-            b.prefixVocabID = id;
-        } else {
-            TrieNode * cur = &b.root;
-            for (size_t i = 2; i < token.size(); i++) {
-                cur = &cur->children[static_cast<uint8_t>(token[i])];
-            }
-            // if the same token appears multiple times with different vocabIDs, the last one wins; 
-            // this is not a well-defined scenario but we should at least be deterministic about it
-            cur->vocabID = id;
-        }
-    }
-    // convert from map to vector; the order doesn't matter but we want it to be deterministic
-    std::vector<VocabBucket> result;
-    result.reserve(byPrefix.size());
-    for (auto & kv : byPrefix) result.push_back(std::move(kv.second));
-    return result;
-}
-
-// use bytes, decodeUTF8 not needed 
-// work with bytes ?
-// single bytes ?
-// kernel for first and second byte. kernel that finds all the single bytes - look at every first byte and - look at two bytes and confirms no two bytes - second bytes confirms 
-// 
-
-// run with a small vocab?
-// Bixnum - 8 bit input - 16 bit output - vocabID is 16 bits, so we need 16 output bits to represent it in the BixNum stream.
-

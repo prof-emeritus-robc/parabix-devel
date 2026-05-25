@@ -144,15 +144,25 @@ protected:
                 uint8_t b = static_cast<uint8_t>(tok[i]);
                 PabloAST * eq = getEQ(b);
                 unsigned k = mLength - 1 - i;
-                PabloAST * factor = (k == 0) ? eq : pb.createAdvance(eq, k);
-                m = pb.createAnd(m, factor);
+                PabloAST * factor = (k == 0)
+                    ? eq
+                    : pb.createAdvance(eq, k,
+                          "adv_byte" + std::to_string(static_cast<unsigned>(b))
+                              + "_k" + std::to_string(k));
+                m = pb.createAnd(m, factor,
+                          "m_tok" + std::to_string(vid)
+                              + "_factor" + std::to_string(i));
             }
-            pb.createAssign(matchEndV, pb.createOr(matchEndV, m));
+            pb.createAssign(matchEndV,
+                pb.createOr(matchEndV, m,
+                    "matchEndV_or_tok" + std::to_string(vid)));
             for (unsigned i = 0; i < 16; i++) {
                 unsigned bit = (vid >> i) & 1u;
                 pb.createAssign(
                     idBits[i],
-                    pb.createSel(m, bit ? ones : zeroes, idBits[i]));
+                    pb.createSel(m, bit ? ones : zeroes, idBits[i],
+                        "idsel_tok" + std::to_string(vid)
+                            + "_bit" + std::to_string(i)));
             }
         }
 
@@ -222,36 +232,40 @@ protected:
         std::vector<PabloAST*> len2 = getInputStreamSet("len2");
 
         // me2 wins only where me1 hasn't already fired.
-        PabloAST * me2Wins = pb.createAnd(me2, pb.createNot(me1));
+        PabloAST * notMe1   = pb.createNot(me1, "not_me1");
+        PabloAST * me2Wins  = pb.createAnd(me2, notMe1, "me2Wins");
 
         // me1 wins if it fired, otherwise me2 wins if it fired, otherwise no match.
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("meOut"),
                              pb.getInteger(0)),
             // me1 OR (NOT me1 AND me2) simplifies to me1 OR me2.
-            pb.createOr(me1, me2));
+            pb.createOr(me1, me2, "meOut_me1_or_me2"));
         // Where a match ended, which word ID and length to output — me1's if it fired, else me2's if it fired, else 0.
         Var * idOut = getOutputStreamVar("idOut");
         // For each bit of the vocabID and matchLen BixNums, pick me1's bit if me1 won, else me2's bit if me2 won, else 0.
         for (unsigned i = 0; i < 16; i++) {
-            PabloAST * picked = pb.createSel(me1, id1[i],
-                                   pb.createSel(me2Wins, id2[i],
-                                                pb.createZeroes()));
+            PabloAST * idM2Pick = pb.createSel(me2Wins, id2[i],
+                                       pb.createZeroes(),
+                                       "id_m2pick_bit" + std::to_string(i));
+            PabloAST * idPicked = pb.createSel(me1, id1[i], idM2Pick,
+                                       "id_pick_bit" + std::to_string(i));
             // Assign the picked bit to the output vocabID stream at position i.
             pb.createAssign(
                 pb.createExtract(idOut, pb.getInteger(i)),
-                picked);
+                idPicked);
         }
-        // Sum for matchLen bits.
+        // Same first-wins fold for matchLen bits.
         Var * lenOut = getOutputStreamVar("lenOut");
         for (unsigned i = 0; i < 8; i++) {
-            PabloAST * picked = pb.createSel(me1, len1[i],
-                                   pb.createSel(me2Wins, len2[i],
-                                                pb.createZeroes()));
-            // 
+            PabloAST * lenM2Pick = pb.createSel(me2Wins, len2[i],
+                                       pb.createZeroes(),
+                                       "len_m2pick_bit" + std::to_string(i));
+            PabloAST * lenPicked = pb.createSel(me1, len1[i], lenM2Pick,
+                                       "len_pick_bit" + std::to_string(i));
             pb.createAssign(
                 pb.createExtract(lenOut, pb.getInteger(i)),
-                picked);
+                lenPicked);
         }
     }
 };
@@ -291,32 +305,42 @@ protected:
         std::vector<PabloAST*> idIn  = getInputStreamSet("vocabIDIn");
         std::vector<PabloAST*> lenIn = getInputStreamSet("matchLenIn");
 
-        // coverMask = OR over k in [1 .. maxLen-1] of (matchEnd(p+k) AND UGT(matchLen(p+k), k)).
+        // coverMask = OR over k in [1 .. maxLen-1] of
+        //   (matchEnd(p+k) AND UGT(matchLen(p+k), k)).
+        // Position p is covered if some future match's span reaches back to p.
         PabloAST * coverMask = pb.createZeroes();
 
-        // For each k in [1 .. maxLen-1], 
-        //compute a mask of positions covered by a match ending at p+k with length > k, 
+        // For each k in [1 .. maxLen-1],
+        //compute a mask of positions covered by a match ending at p+k with length > k,
         //then OR them together to get the final coverMask.
         for (unsigned k = 1; k < mMaxLen; k++) {
-            PabloAST * futureEnd = pb.createLookahead(me0, k);
+            PabloAST * futureEnd = pb.createLookahead(me0, k,
+                                       "futureEnd_k" + std::to_string(k));
             std::vector<PabloAST*> futureLenBits;
             futureLenBits.reserve(8);
             for (unsigned i = 0; i < 8; i++) {
-                futureLenBits.push_back(pb.createLookahead(lenIn[i], k));
+                futureLenBits.push_back(
+                    pb.createLookahead(lenIn[i], k,
+                        "futureLen_k" + std::to_string(k)
+                            + "_bit" + std::to_string(i)));
             }
             // futureLenBN = BixNum of the lookahead bits for matchLen at position p+k.
             BixNum futureLenBN(futureLenBits.begin(), futureLenBits.end());
-            // covered_k = matchEnd(p+k) AND UGT(matchLen(p+k), k) 
+            // covered_k = matchEnd(p+k) AND UGT(matchLen(p+k), k)
             // fires at positions p where a match ending at p+k would cover p.
             PabloAST * covered_k = pb.createAnd(
-                futureEnd, bnc.UGT(futureLenBN, k));
+                futureEnd, bnc.UGT(futureLenBN, k),
+                "covered_k" + std::to_string(k));
             // OR covered_k into the cumulative coverMask.
-            coverMask = pb.createOr(coverMask, covered_k);
+            coverMask = pb.createOr(coverMask, covered_k,
+                            "coverMask_thru_k" + std::to_string(k));
         }
 
-        // keep = matchEnd(p) AND NOT coverMask 
+        // keep = matchEnd(p) AND NOT coverMask
         // fires at positions where a match ends that is not covered by a later, longer match.
-        PabloAST * keep = pb.createAnd(me0, pb.createNot(coverMask));
+        PabloAST * notCover = pb.createNot(coverMask, "not_coverMask");
+        PabloAST * keep     = pb.createAnd(me0, notCover,
+                                  "keep_m" + std::to_string(mMaxLen));
 
         // Assign the kept matches to the output streams. 
         // Where a match end is kept, copy the vocabID from the input to the output; otherwise output 0.
@@ -329,7 +353,8 @@ protected:
         for (unsigned i = 0; i < 16; i++) {
             pb.createAssign(
                 pb.createExtract(idOut, pb.getInteger(i)),
-                pb.createAnd(idIn[i], keep));
+                pb.createAnd(idIn[i], keep,
+                    "idOut_bit" + std::to_string(i) + "_kept"));
         }
     }
 // max token byte length in the vocab, used for LookAhead in the assembly kernel.
@@ -354,7 +379,7 @@ protected:
         PabloBuilder pb(getEntryScope());
         PabloAST * in = getInputStreamSet("input")[0];
         writeOutputStreamSet("output",
-                             std::vector<PabloAST*>{pb.createNot(in)});
+                             std::vector<PabloAST*>{pb.createNot(in, "notNewline")});
     }
 };
 

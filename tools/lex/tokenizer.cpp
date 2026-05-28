@@ -167,7 +167,7 @@ static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
 //   Stage 0  I/O + S2P
 //   Stage 1  Normalization     → U21codepoints
 //   Stage 2  Pre-tokenization  → codepoint stream feeding BPE
-//   Stage 3  runBPETrie        → (matchEnd, vocabID)  bucket fold of single-byte + 2+byte tries
+//   Stage 3  buildBPEPassPipeline → (matchEnd, vocabID)  bucket fold of single-byte + 2+byte tries
 //   Stage 4  Emit token IDs at every matchEnd position
 //
 // Phase-1: only trie matches (length >= 2) are emitted. Positions where no
@@ -216,7 +216,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
     // Stage 3: bucket-fold pipeline — single-byte vocab kernel + per
     // (b0, b1) trie kernels, all OR-merged into a single (matchEnd, vocabID)
     // pair via BPETriePairMergeKernel.
-    BPETrieResult tr = runBPETrie(P, bpeBasis, bpe);
+    BPEPassResult tr = buildBPEPassPipeline(P, bpeBasis, bpe);
     StreamSet * matchEnd = tr.matchEnd;
     StreamSet * vocabID  = tr.vocabID;
 

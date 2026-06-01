@@ -48,8 +48,10 @@
 #include "bpe.h"
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <cstdint>
+#include <queue>
 #include <nlohmann/json.hpp>
 #include <pablo/pablo_kernel.h>
 #include <pablo/builder.hpp>
@@ -57,6 +59,7 @@
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
+#include <stdexcept>
 
 using namespace pablo;
 using namespace kernel;
@@ -161,90 +164,145 @@ protected:
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
 
-        // Load the basis bits into a BixNum for convenient per-byte access.
         std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
         BixNum symBN(basisBits.begin(), basisBits.end());
 
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
-        // liveIn is optional for pass 0; treat nullptr as all-ones. 
-        // Later passes get the live mask from the previous pass's output.
         PabloAST * liveIn = mHasLive ? getInputStreamSet("liveIn")[0] : ones;
 
-        // Memoize EQ(symBN, b): each distinct byte compared against input once.
+        // All factors computed in ROOT scope so they are visible inside any
+        // nested if-scope without scope ordering violations.
         std::unordered_map<uint8_t, PabloAST*> byteEQ;
-        auto getEQ = [&](uint8_t b) {
+        auto getEQ = [&](uint8_t b) -> PabloAST* {
             auto it = byteEQ.find(b);
             if (it != byteEQ.end()) return it->second;
-            PabloAST * eq = bnc.EQ(symBN, b);
-            byteEQ.emplace(b, eq);
+            PabloAST* eq = bnc.EQ(symBN, b);
+            byteEQ[b] = eq;
             return eq;
         };
-        // Memoize Advance(liveIn, k): liveIn at the byte k positions back.
-        std::unordered_map<unsigned, PabloAST*> liveAdv;
-        auto getLive = [&](unsigned k) {
-            if (k == 0) return liveIn;
-            auto it = liveAdv.find(k);
-            if (it != liveAdv.end()) return it->second;
-            PabloAST * a = pb.createAdvance(liveIn, k, "liveAdv_k" + std::to_string(k));
-            liveAdv.emplace(k, a);
-            return a;
+
+        // byteAndLive[b] = (symBN == b) AND liveIn, pre-computed in root scope for safe reference from any nested if-scope.
+        // Because the same byte can appear at different positions in different tokens, we want to compute each (byte, live) factor once and reuse it across the trie rather than recomputing it at every position.
+        std::unordered_map<uint8_t, PabloAST*> byteAndLive;
+        auto getByteAndLive = [&](uint8_t b) -> PabloAST* {
+            auto it = byteAndLive.find(b);
+            if (it != byteAndLive.end()) return it->second;
+            PabloAST* bal = mHasLive
+                ? pb.createAnd(getEQ(b), liveIn, "bal_b" + std::to_string((unsigned)b))
+                : getEQ(b);
+            byteAndLive[b] = bal;
+            return bal;
+        };
+
+        // factor[b,d] = byteAndLive[b] ADV d, pre-computed in root scope for safe reference from any nested if-scope.
+        std::unordered_map<uint64_t, PabloAST*> advCache;
+        auto getAdvFactor = [&](uint8_t b, unsigned d) -> PabloAST* {
+            if (d == 0) return getByteAndLive(b);
+            uint64_t key = (static_cast<uint64_t>(b) << 32) | d;
+            auto it = advCache.find(key);
+            if (it != advCache.end()) return it->second;
+            PabloAST* result = pb.createAdvance(
+                getByteAndLive(b), d,
+                "adv_b" + std::to_string((unsigned)b) + "_d" + std::to_string(d));
+            advCache[key] = result;
+            return result;
         };
 
         Var * matchEndV = pb.createVar("matchEnd", zeroes);
         std::vector<Var*> idBits, lenBits;
         idBits.reserve(16);
         lenBits.reserve(8);
-        // 16-bit vocab ID output
         for (unsigned i = 0; i < 16; i++)
             idBits.push_back(pb.createVar("id_" + std::to_string(i), zeroes));
-        // 8-bit match length output.
         for (unsigned i = 0; i < 8; i++)
             lenBits.push_back(pb.createVar("len_" + std::to_string(i), zeroes));
 
-        // 
+        // Build reversed trie over mTokens.
+        // Last byte of each token is at depth 1 (advance=0); deeper nodes
+        // need larger Advance distances — end-anchored backward detection.
+        struct TrieNode {
+            std::unordered_map<uint8_t, unsigned> children;
+            int      tokenID  = -1;
+            unsigned tokenLen = 0;
+        };
+        std::vector<TrieNode> trie(1);
         for (const auto & [tok, vid] : mTokens) {
-            const unsigned L = static_cast<unsigned>(tok.size());
-            // m = AND over i of [ Advance(EQ(byte i), L-1-i) AND live there ].
-            // At end-position p, factor i checks byte p-(L-1-i) and that the
-            // byte is still live.
-            PabloAST * m = ones;
-            for (unsigned i = 0; i < L; i++) {
+            unsigned cur = 0;
+            for (int i = static_cast<int>(tok.size()) - 1; i >= 0; i--) {
                 uint8_t b = static_cast<uint8_t>(tok[i]);
-                unsigned k = L - 1 - i;  // look back from the end position: 0 for the last byte, L-1 for the first
-                PabloAST * eq = getEQ(b);  // EQ(symBN, b) for this byte value
-                PabloAST * eqA = (k == 0)  // no Advance for the last byte. 
-                    ? eq
-                    : pb.createAdvance(eq, k,
-                          "adv_byte" + std::to_string(static_cast<unsigned>(b))
-                              + "_k" + std::to_string(k));
-                PabloAST * factor = pb.createAnd(eqA, getLive(k),
-                          "live_tok" + std::to_string(vid)
-                              + "_factor" + std::to_string(i));
-                m = pb.createAnd(m, factor,
-                          "m_tok" + std::to_string(vid)
-                              + "_factor" + std::to_string(i));
+                auto cit = trie[cur].children.find(b);
+                if (cit == trie[cur].children.end()) {
+                    unsigned next = static_cast<unsigned>(trie.size());
+                    trie[cur].children[b] = next;
+                    trie.emplace_back();
+                    cur = next;
+                } else {
+                    cur = cit->second;
+                }
             }
-            pb.createAssign(matchEndV,
-                pb.createOr(matchEndV, m, "matchEndV_or_tok" + std::to_string(vid)));
-            // T2: third arg is the current Var, not zeroes, so a later token in
-            // this pass with bit i = 0 cannot clobber an earlier token's bit.
-            for (unsigned i = 0; i < 16; i++) {
-                unsigned bit = (vid >> i) & 1u;
-                pb.createAssign(idBits[i],
-                    pb.createSel(m, bit ? ones : zeroes, idBits[i],
-                        "idsel_tok" + std::to_string(vid)
-                            + "_bit" + std::to_string(i)));
-            }
-            // matchLen = this token's length L wherever it matched.
-            for (unsigned i = 0; i < 8; i++) {
-                unsigned bit = (L >> i) & 1u;
-                pb.createAssign(lenBits[i],
-                    pb.createSel(m, bit ? ones : zeroes, lenBits[i],
-                        "lensel_tok" + std::to_string(vid)
-                            + "_bit" + std::to_string(i)));
+            trie[cur].tokenID  = static_cast<int>(vid);
+            trie[cur].tokenLen = static_cast<unsigned>(tok.size());
+        }
+
+        // Pre-compute ALL (b,d) factors in root scope before any createIf.
+        // Ensures factor nodes are defined in outer scope and safe to reference
+        // from any nested if-scope (no scope ordering violation).
+        {
+            std::vector<std::pair<unsigned,unsigned>> preStack;
+            preStack.push_back({0u, 0u});
+            while (!preStack.empty()) {
+                auto [ni, d] = preStack.back(); preStack.pop_back();
+                for (const auto & [b, ci] : trie[ni].children) {
+                    getAdvFactor(b, d);
+                    preStack.push_back({ci, d + 1});
+                }
             }
         }
+
+        // Recursive DFS with createIf guards (mirrors old emitTrie pattern).
+        // Each child branch is wrapped in if(childStream) — SIMD blocks where
+        // childStream=0 skip the entire subtrie at runtime.
+        std::function<void(PabloBuilder&, PabloAST*, unsigned, unsigned)> emitNode;
+        emitNode = [&](PabloBuilder & pb_cur, PabloAST* stream,
+                       unsigned nodeIdx, unsigned depth) {
+            const TrieNode & node = trie[nodeIdx];
+
+            // Terminal: emit match (T2: Sel third arg = current Var).
+            if (node.tokenID >= 0) {
+                unsigned vid = static_cast<unsigned>(node.tokenID);
+                unsigned L   = node.tokenLen;
+                pb_cur.createAssign(matchEndV,
+                    pb_cur.createOr(matchEndV, stream,
+                        "matchEndV_tok" + std::to_string(vid)));
+                for (unsigned i = 0; i < 16; i++) {
+                    unsigned bit = (vid >> i) & 1u;
+                    pb_cur.createAssign(idBits[i],
+                        pb_cur.createSel(stream, bit ? ones : zeroes, idBits[i],
+                            "idsel_tok" + std::to_string(vid) + "_bit" + std::to_string(i)));
+                }
+                for (unsigned i = 0; i < 8; i++) {
+                    unsigned bit = (L >> i) & 1u;
+                    pb_cur.createAssign(lenBits[i],
+                        pb_cur.createSel(stream, bit ? ones : zeroes, lenBits[i],
+                            "lensel_tok" + std::to_string(vid) + "_bit" + std::to_string(i)));
+                }
+            }
+
+            for (const auto & [b, childIdx] : node.children) {
+                // factor was pre-computed in root scope — safe to reference here.
+                PabloAST* factor      = getAdvFactor(b, depth);
+                // childStream computed in pb_cur (parent scope of the if).
+                PabloAST* childStream = pb_cur.createAnd(stream, factor,
+                    "cs_d" + std::to_string(depth) + "_b" + std::to_string((unsigned)b));
+                // createIf: skip subtrie where childStream=0 (dead branch).
+                auto childScope = pb_cur.createScope();
+                pb_cur.createIf(childStream, childScope);
+                emitNode(childScope, childStream, childIdx, depth + 1);
+            }
+        };
+
+        emitNode(pb, ones, 0, 0);
 
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("matchEnd"), pb.getInteger(0)),
@@ -579,74 +637,92 @@ std::string BPETokenizer::decodeToken(int id) const {
 //
 // multi-pass scheduling system for BPE vocabulary matching
 //
-// Layer the vocab into passes. Words are sorted by length DESCENDING (ties by
-// bytes for determinism), then each word's pass is 1 + the max pass of any
-// strictly longer word whose span can overlap it (0 if none). Processing in
-// descending order guarantees every strictly-longer word already has its final
-// pass assigned when a shorter word is considered.
-// passes :
-// Pass 0 = strongest/longest words
-// Pass 1 = words blocked by pass 0
-// Pass 2 = words blocked by pass 1
+// Layer the vocab into passes by pure longest-match priority: a strictly
+// longer word that can overlap a shorter one must run in an earlier pass so
+// it consumes the shared bytes first (greedy longest-match segmentation).
 //
-// 1. Take all vocab words
-// 2. Sort longest first
-// 3. Find which longer words overlap smaller words
-// 4. Put smaller overlapping words into later passes
-// 5. Return the layered groups
-// assignment to disk keyed by a vocab-content hash.
+//   pass(w) = 1 + max( pass(w') : len(w') > len(w) and overlaps(w,w') )
 //
-// recommendaton?
-// NOTE: this is O(N^2 · L) in the vocab size. Instant for the truncated dev
-// vocab; slow to build for the full ~50k GPT-2 vocab. TODO: accelerate the
-// overlap query with an Aho-Corasick / suffix structure and/or cache the pass
-
-std::vector<VocabPass> BPETokenizer::buildVocabPasses() const {  // A list of passes, each containing a list of (token, vocabID) pairs.
-    std::vector<std::pair<std::string,unsigned>> words;  // word storage 
-    words.reserve(vocab_.size());  // reserve memory for all vocab entries
-    // loop over the vocab map and populate the words vector with (token, vocabID) pairs, skipping empty tokens
+// The blocking relation (k blocks i → k must run in an earlier pass than i):
+//   overlaps(k,i)  AND  len(k) > len(i)
+//
+// Length is a strict order, so the relation is acyclic by construction and a
+// DAG longest-path gives the pass numbers (Kahn's BFS; pass = longest
+// predecessor path).
+//
+// NOTE on the abandoned dual-rule (straddle = vocab-ID priority): mixing a
+// second ordering key (ID for edge-straddles) with the length key produced a
+// massively cyclic relation on the real GPT-2 vocab (~99% of tokens in cycles)
+// — two disagreeing sort keys cannot both hold across overlap chains, so the
+// pass layering has no valid topological order. Rank-accurate straddle
+// resolution belongs in a sequential rank-merge design (see commit 9264dc131),
+// not in conflict-free pass layering. Longest-match therefore diverges from HF
+// on edge-straddles (e.g. `inst`/`struction`); this is a documented limitation.
+//
+// NOTE: O(N^2 · L) to build the DAG.
+std::vector<VocabPass> BPETokenizer::buildVocabPasses() const {
+    std::vector<std::pair<std::string,unsigned>> words;
+    words.reserve(vocab_.size());
     for (const auto & [tok, id] : vocab_) {
         if (tok.empty()) continue;
-        words.push_back({tok, static_cast<unsigned>(id)}); // store the token and its corresponding ID as a pair in the words vector
-    }
-    // Sort words by length DESCENDING, then by bytes for deterministic tie-break. Longer words get higher priority.
-    std::sort(words.begin(), words.end(),
-        // comparison function
-        [](const auto & x, const auto & y) {
-            if (x.first.size() != y.first.size())         // longer first
-                return x.first.size() > y.first.size();   // longer first
-            return x.first < y.first;                     // deterministic tie-break
-        });
-    // Store number of words in n
-    const size_t n = words.size();
-    std::vector<int> passOf(n, 0);  // Which pass each word belongs to
-    int maxPass = 0;
-    // loop through each word in n, They are already sorted longest → shortest
-    for (size_t i = 0; i < n; i++) {
-        // word length Li
-        const size_t Li = words[i].first.size();
-        // highest pass of overlapping longer words.
-        int best = -1;
-        // check all earlier words 
-        for (size_t k = 0; k < i; k++) {
-            // skip same length words, they can't block each other
-            if (words[k].first.size() == Li) continue;
-            // check if the words overlap
-            if (overlaps(words[i].first, words[k].first)) {
-                // if they do, update best to the max pass of the overlapping longer word
-                if (passOf[k] > best) best = passOf[k];
-            }
-        }
-        // Current word goes AFTER highest overlapping longer word.
-        passOf[i] = best + 1;
-        // keep track of highest pass index assigned. 
-        if (passOf[i] > maxPass) maxPass = passOf[i];
+        words.push_back({tok, static_cast<unsigned>(id)});
     }
 
-    // pass containers 
-    // Group words by pass into the final output structure. Each pass contains a list of (token, vocabID) pairs.
+    const size_t n = words.size();
+
+    // blocks_fn(k, i): true iff word k must run in an earlier pass than word i.
+    // Pure longest-match: a strictly longer overlapping word blocks the shorter.
+    auto blocks_fn = [&](size_t k, size_t i) -> bool {
+        const auto & [tokK, idK] = words[k];
+        const auto & [tokI, idI] = words[i];
+        (void)idK; (void)idI;
+        if (tokK.size() <= tokI.size()) return false;   // only strictly-longer blocks
+        return overlaps(tokK, tokI);
+    };
+
+    // Build successor lists and in-degree counts for Kahn's algorithm.
+    std::vector<std::vector<size_t>> successors(n);
+    std::vector<int> inDegree(n, 0);
+    for (size_t k = 0; k < n; k++) {
+        for (size_t i = 0; i < n; i++) {
+            if (k == i) continue;
+            if (blocks_fn(k, i)) {
+                successors[k].push_back(i);
+                inDegree[i]++;
+            }
+        }
+    }
+
+    // Kahn's topological BFS with longest-path (pass number) tracking.
+    std::vector<int> passOf(n, 0);
+    std::queue<size_t> ready;
+    for (size_t i = 0; i < n; i++) {
+        if (inDegree[i] == 0) ready.push(i);
+    }
+    int maxPass = 0;
+    size_t processed = 0;
+    while (!ready.empty()) {
+        size_t k = ready.front(); ready.pop();
+        ++processed;
+        for (size_t i : successors[k]) {
+            if (passOf[k] + 1 > passOf[i]) passOf[i] = passOf[k] + 1;
+            if (passOf[i] > maxPass) maxPass = passOf[i];
+            if (--inDegree[i] == 0) ready.push(i);
+        }
+    }
+    // The blocking relation is acyclic by construction, so Kahn's BFS must
+    // drain every node. If not, a cycle exists and the surviving nodes would
+    // silently stay at pass 0 — a wrong segmentation with no error. Fail loud.
+    if (processed != n) {
+        std::cerr << "BPE: buildVocabPasses cycle — " << (n - processed)
+                  << " of " << n << " tokens unresolved\n";
+        throw std::runtime_error(
+            "buildVocabPasses: blocking relation has a cycle (" +
+            std::to_string(n - processed) +
+            " tokens unresolved) — pass layering invalid");
+    }
+
     std::vector<VocabPass> passes(static_cast<size_t>(maxPass) + 1);
-    // loop through each word and add it to the appropriate pass based on its assigned pass index in passOf
     for (size_t i = 0; i < n; i++) {
         passes[static_cast<size_t>(passOf[i])].tokens.push_back(std::move(words[i]));
     }

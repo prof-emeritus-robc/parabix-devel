@@ -16,13 +16,13 @@ namespace kernel {
     class StreamSet;
 }
 
-// One pass of the pass-layered longest-match scheme. Each pass is realised by
-// a single BPEPassKernel that detects every word in `tokens` and masks off the
-// bytes it consumes. Passes are ordered so a word never lands in the same (or
-// earlier) pass as a strictly longer word whose match could overlap it — see
-// BPETokenizer::buildVocabPasses.
-struct VocabPass {
-    std::vector<std::pair<std::string, unsigned>> tokens;  // (token bytes, vocabID)
+// All vocab tokens of one specific byte length L. One BPELengthDetect kernel
+// is instantiated per LengthGroup. The kernels are INDEPENDENT — each reads
+// only `basis`, never another kernel's output. All overlap resolution
+// (cross-length AND intra-length) happens in BPELengthResolve, downstream.
+struct LengthGroup {
+    unsigned length;                                       // L in bytes
+    std::vector<std::pair<std::string, unsigned>> tokens;  // (token bytes, vocabID), all of size L
 };
 
 class BPETokenizer {
@@ -34,12 +34,10 @@ public:
 
     std::string decodeToken(int id) const;
 
-    // Layer the vocab into ordered passes for the aligned-mask longest-match
-    // scan. A word w0 is placed in pass = 1 + max(pass of any strictly longer
-    // word whose byte span can overlap w0), or pass 0 if no such word exists.
-    // Result[0] holds the highest-priority (never-overridden) words; later
-    // entries hold words that a longer overlapping word could consume first.
-    std::vector<VocabPass> buildVocabPasses() const;
+    // Partition the vocab by token length. Result is sorted by length
+    // ascending. Empty tokens are skipped. Each entry's `tokens` vector is
+    // sorted by bytes for deterministic JIT cache keys.
+    std::vector<LengthGroup> buildLengthGroups() const;
 
 private:
     std::unordered_map<std::string, int> vocab_;
@@ -47,17 +45,15 @@ private:
 };
 
 // buildBPEPassPipeline
-//   Builds a pass-layered longest-match pipeline:
-//     - buildVocabPasses() layers the vocab so a word never shares a pass with
-//       (or precedes) a strictly longer word whose span could overlap it.
-//     - One BPEPassKernel per pass. Each detects all its words against the
-//       basis AND a carried `live` byte mask (a word fires only if every byte
-//       it covers is still live), emits (matchEnd, vocabID), then clears the
-//       consumed spans from `live` for the next pass.
-//     - Because longer overlapping words always run in earlier passes and
-//       consume their bytes, no later pass can re-fire inside them — the
-//       per-position OR of all passes is the longest-match segmentation. No
-//       LookAhead suppression stage is needed.
+//   Builds a length-grouped, longest-wins BPE pipeline:
+//     - buildLengthGroups() partitions the vocab by token length.
+//     - One BPELengthDetect kernel per distinct length L. Each reads `basis`
+//       and emits (matchEnd_L, vocabID_L) for every L-byte vocab word match.
+//       Detection kernels are independent and run in parallel.
+//     - BPELengthResolve takes every length's (matchEnd_L, vocabID_L) stream
+//       and suppresses any match whose span overlaps a STRICTLY LONGER match.
+//       Outputs the cleaned (matchEnd, vocabID) where the longest overlapping
+//       match always wins.
 struct BPEPassResult {
     kernel::StreamSet * matchEnd;   //  1×1
     kernel::StreamSet * vocabID;    // 16×1 BixNum

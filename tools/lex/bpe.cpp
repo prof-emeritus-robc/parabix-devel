@@ -103,24 +103,29 @@ uint64_t hashTokenSet(const std::vector<std::pair<std::string,unsigned>> & token
 //                     within one length kernel matchEnd has at most one
 //                     winning token per position.
 //   vocabID  (16×1) — the token's vocab ID at every matchEnd position.
+//   matchLen (8×1)  — constant L at every matchEnd position, 0 elsewhere.
+//                     Carried downstream so BPEAssembleKernel can drop a short
+//                     match contained in a longer one via a single LookAhead
+//                     sweep (no all-pairs length compare).
 //
 // for each position p:
 //     check backwards:
 //         does basis[p - k] == token_char[L - 1 - k]?
 //     if all L bytes match:
 //         mark matchEnd[p] = 1
-//         emit vocabID[p]
+//         emit vocabID[p], matchLen[p] = L
 //
-// Overlap resolution is handled downstream by BPELengthResolve — this kernel
-// does NOT suppress conflicts. Two overlapping matches from different lengths
-// (or two same-length matches at adjacent end positions with overlapping
-// spans) will both fire here; the resolver keeps the longest.
+// Overlap resolution is handled downstream — this kernel does NOT suppress
+// conflicts. BPELengthFirstWinsMerge keeps the longest match ending at each
+// position (descending fold); BPEAssembleKernel then drops matches contained
+// in a longer match ending later.
 class BPELengthDetect : public PabloKernel {
 public:
     BPELengthDetect(LLVMTypeSystemInterface & ts,
                     StreamSet * basis,
                     StreamSet * matchEnd,
                     StreamSet * vocabID,
+                    StreamSet * matchLen,
                     unsigned length,
                     std::vector<std::pair<std::string,unsigned>> tokens,
                     uint64_t shapeHash)
@@ -129,8 +134,9 @@ public:
                        + "_h" + std::to_string(shapeHash),
                   {Binding{"basis", basis}},
                   {Binding{"matchEnd", matchEnd},
-                   Binding{"vocabID",  vocabID}}),
-      mTokens(std::move(tokens)) {}
+                   Binding{"vocabID",  vocabID},
+                   Binding{"matchLen", matchLen}}),
+      mLength(length), mTokens(std::move(tokens)) {}
 
 protected:
     void generatePabloMethod() override {
@@ -272,171 +278,153 @@ protected:
         Var * idOut = getOutputStreamVar("vocabID");
         for (unsigned i = 0; i < 16; i++)
             pb.createAssign(pb.createExtract(idOut, pb.getInteger(i)), idBits[i]);
+
+        // matchLen = constant mLength at matchEnd positions, 0 elsewhere. All
+        // tokens in this kernel share length mLength, so bit i is matchEndV
+        // wherever ((mLength>>i)&1), zeroes otherwise.
+        Var * lenOut = getOutputStreamVar("matchLen");
+        for (unsigned i = 0; i < 8; i++) {
+            PabloAST * v = ((mLength >> i) & 1u)
+                               ? static_cast<PabloAST*>(matchEndV)
+                               : zeroes;
+            pb.createAssign(pb.createExtract(lenOut, pb.getInteger(i)), v);
+        }
     }
 
 private:
+    unsigned mLength;
     std::vector<std::pair<std::string,unsigned>> mTokens;
 };
 
 
-// ─── BPELengthResolve ────────────────────────────────────────────────────────
+// ─── BPELengthFirstWinsMerge ───────────────────────────────────────────────
 //
-// Longest-wins overlap resolution.
+// First-wins merge of two (matchEnd, vocabID, matchLen) tuples. Length groups
+// are folded in DESCENDING length order, so the accumulated "1" side already
+// holds the longer match and the "2" side only fills positions the first did
+// not cover. Resolves the SAME-end-position conflict (two tokens ending at p):
+// fold order alone keeps the longer — no length compare needed.
 //
-// For each candidate match of length L_a ending at p with id_a:
-//
-//     killed_a[p] = OR over (L_b > L_a, d in [-(L_a-1) .. L_b-1]) of
-//                       shift(matchEnd_b, d)[p]
-//
-// i.e. any STRICTLY LONGER match whose span overlaps a's span kills a.
-// No ID compare — strictly-longer always wins (the rule we had under the
-// old pass-layered design). Same-length overlapping matches at different
-// end positions both emit — documented limitation.
-//
-// Why this approximates HF better than ID-priority across spans:
-//   - HF emits longer merges where they exist (e.g. `inst`+`ruction`).
-//   - Longest-wins picks `inst` over its sub-pieces, matching HF on most
-//     non-straddle inputs.
-//   - Edge-straddles (where HF would split differently across a boundary)
-//     still diverge; those need a separate scalar pass downstream.
-//
-// Cost in Pablo ops is also much smaller than ID-priority:
-//   - No 16-bit ULT compare per (a, b, d).
-//   - No shiftN over 16 ID bits per (a, b, d) — only shift1 on the
-//     matchEnd_b stream is needed.
-//   - LookAhead requirement on inputs unchanged (LookAhead(maxL-1) on the
-//     matchEnd bindings; id bindings declared but not LookAhead'd here).
-class BPELengthResolve : public PabloKernel {
+// Cost: ~1 + 16 + 8 Sel/Or ops, independent of vocab size — O(1) per merge,
+// O(#lengths) merges total. (Replaces the old monolithic resolver whose ONE
+// kernel held O(#lengths^2 * maxLen) ≈ 47k ops and OOM-killed the JIT.)
+class BPELengthFirstWinsMerge : public PabloKernel {
 public:
-    BPELengthResolve(LLVMTypeSystemInterface & ts,
-                     const std::vector<unsigned> & lengths,
-                     const std::vector<StreamSet*> & matchEnds,
-                     const std::vector<StreamSet*> & vocabIDs,
-                     StreamSet * matchEndOut,
-                     StreamSet * vocabIDOut)
-    : PabloKernel(ts,
-                  makeName(lengths),
-                  makeInputBindings(lengths, matchEnds, vocabIDs),
-                  {Binding{"matchEndOut", matchEndOut},
-                   Binding{"vocabIDOut",  vocabIDOut}}),
-      mLengths(lengths) {}
-
-private:
-    static std::string makeName(const std::vector<unsigned> & lengths) {
-        std::string n = "BPELengthResolve";
-        for (unsigned L : lengths) n += "_" + std::to_string(L);
-        return n;
-    }
-    static std::vector<Binding> makeInputBindings(
-            const std::vector<unsigned> & lengths,
-            const std::vector<StreamSet*> & mes,
-            const std::vector<StreamSet*> & ids) {
-        std::vector<Binding> b;
-        unsigned maxL = 0;
-        // LookAhead requirement: every input binding declares LookAhead(maxL - 1).
-        for (unsigned L : lengths) if (L > maxL) maxL = L;
-        unsigned LA = (maxL > 1) ? (maxL - 1) : 0;
-        // Inputs are (matchEnd_L, vocabID_L) for every length L. 
-        // Every input stream declares LookAhead(maxL - 1) to cover the full offset range of any potential overlap conflict.
-        for (size_t i = 0; i < lengths.size(); i++) {
-            std::string suf = "_L" + std::to_string(lengths[i]);
-            if (LA > 0) {
-                // matchEnd is the only input we LookAhead on. id is read
-                // identity-only (at the candidate's own end position).
-                b.push_back(Binding{"me" + suf, mes[i], FixedRate(), LookAhead(LA)});
-                b.push_back(Binding{"id" + suf, ids[i]});
-            } else {
-                b.push_back(Binding{"me" + suf, mes[i]});
-                b.push_back(Binding{"id" + suf, ids[i]});
-            }
-        }
-        return b;
-    }
+    BPELengthFirstWinsMerge(LLVMTypeSystemInterface & ts,
+                            StreamSet * me1, StreamSet * id1, StreamSet * len1,
+                            StreamSet * me2, StreamSet * id2, StreamSet * len2,
+                            StreamSet * meOut, StreamSet * idOut, StreamSet * lenOut)
+    : PabloKernel(ts, "BPELengthFirstWinsMerge",
+                  {Binding{"me1", me1}, Binding{"id1", id1}, Binding{"len1", len1},
+                   Binding{"me2", me2}, Binding{"id2", id2}, Binding{"len2", len2}},
+                  {Binding{"meOut", meOut}, Binding{"idOut", idOut},
+                   Binding{"lenOut", lenOut}}) {}
 
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
 
-        PabloAST * zeroes = pb.createZeroes();
+        PabloAST * me1 = getInputStreamSet("me1")[0];
+        PabloAST * me2 = getInputStreamSet("me2")[0];
+        std::vector<PabloAST*> id1  = getInputStreamSet("id1");
+        std::vector<PabloAST*> id2  = getInputStreamSet("id2");
+        std::vector<PabloAST*> len1 = getInputStreamSet("len1");
+        std::vector<PabloAST*> len2 = getInputStreamSet("len2");
 
-        auto shift1 = [&](PabloAST* s, int d, const std::string & tag) -> PabloAST* {
-            if (d == 0) return s;
-            if (d > 0)  return pb.createLookahead(s, d, tag + "_la");
-            return pb.createAdvance(s, -d, tag + "_adv");
-        };
+        // me2 wins only where me1 has not already fired (me1 = longer side).
+        PabloAST * me2Wins = pb.createAnd(me2, pb.createNot(me1));
 
-        const unsigned N = static_cast<unsigned>(mLengths.size());
+        pb.createAssign(
+            pb.createExtract(getOutputStreamVar("meOut"), pb.getInteger(0)),
+            pb.createOr(me1, me2));
 
-        std::vector<PabloAST*> meIn(N);
-        std::vector<std::vector<PabloAST*>> idIn(N);
-        // Pull all (matchEnd_L, vocabID_L) inputs in. meIn[a] = matchEnd_a; idIn[a] = vocabID_a for every length a.
-        for (unsigned a = 0; a < N; a++) {
-            std::string suf = "_L" + std::to_string(mLengths[a]);
-            meIn[a] = getInputStreamSet("me" + suf)[0];
-            idIn[a] = getInputStreamSet("id" + suf);
+        // id/len: side-1 bits where me1 fired, else side-2 bits where me2 won,
+        // else 0.
+        Var * idOut = getOutputStreamVar("idOut");
+        for (unsigned i = 0; i < 16; i++) {
+            PabloAST * picked = pb.createSel(me1, id1[i],
+                                   pb.createSel(me2Wins, id2[i], pb.createZeroes()));
+            pb.createAssign(pb.createExtract(idOut, pb.getInteger(i)), picked);
+        }
+        Var * lenOut = getOutputStreamVar("lenOut");
+        for (unsigned i = 0; i < 8; i++) {
+            PabloAST * picked = pb.createSel(me1, len1[i],
+                                   pb.createSel(me2Wins, len2[i], pb.createZeroes()));
+            pb.createAssign(pb.createExtract(lenOut, pb.getInteger(i)), picked);
+        }
+    }
+};
+
+
+// ─── BPEAssembleKernel ──────────────────────────────────────────────────────
+//
+// Drops matches contained in the byte span of a longer match ending later.
+// A match ending at e with length L covers positions [e-L+1 .. e]; so position
+// p is covered iff there exists k in [1 .. maxLen-1] with
+//     matchEnd(p+k) = 1  AND  matchLen(p+k) > k.
+// matchEnd and matchLen are kernel INPUTS declaring LookAhead(maxLen-1), so the
+// forward peek is a legal LookAhead.
+//
+// Single forward sweep: O(maxLen) iterations, each ~1 + 8 LookAhead + one UGT +
+// AND/OR. ~5k ops at maxLen=256 — an order of magnitude below the old all-pairs
+// resolver, and it does NOT OOM the JIT.
+//
+// Example: single-byte `l` at position 2 inside `Ġlove` ending at position 5
+// with length 6 — at p=2, k=3: matchEnd(5)=1 and matchLen(5)=6 > 3, so `l` is
+// covered and suppressed.
+class BPEAssembleKernel : public PabloKernel {
+public:
+    BPEAssembleKernel(LLVMTypeSystemInterface & ts,
+                      StreamSet * matchEndIn, StreamSet * vocabIDIn,
+                      StreamSet * matchLenIn,
+                      StreamSet * matchEndOut, StreamSet * vocabIDOut,
+                      unsigned maxLen)
+    : PabloKernel(ts,
+                  "BPEAssemble_m" + std::to_string(maxLen),
+                  {Binding{"matchEndIn", matchEndIn, FixedRate(), LookAhead(maxLen - 1)},
+                   Binding{"vocabIDIn",  vocabIDIn},
+                   Binding{"matchLenIn", matchLenIn, FixedRate(), LookAhead(maxLen - 1)}},
+                  {Binding{"matchEndOut", matchEndOut},
+                   Binding{"vocabIDOut",  vocabIDOut}}),
+      mMaxLen(maxLen) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+
+        PabloAST * me0 = getInputStreamSet("matchEndIn")[0];
+        std::vector<PabloAST*> idIn  = getInputStreamSet("vocabIDIn");
+        std::vector<PabloAST*> lenIn = getInputStreamSet("matchLenIn");
+
+        // coverMask = OR over k in [1 .. maxLen-1] of
+        //             ( matchEnd(p+k) AND UGT(matchLen(p+k), k) ).
+        PabloAST * coverMask = pb.createZeroes();
+        for (unsigned k = 1; k < mMaxLen; k++) {
+            PabloAST * futureEnd = pb.createLookahead(me0, k);
+            std::vector<PabloAST*> futureLenBits;
+            futureLenBits.reserve(8);
+            for (unsigned i = 0; i < 8; i++)
+                futureLenBits.push_back(pb.createLookahead(lenIn[i], k));
+            BixNum futureLenBN(futureLenBits.begin(), futureLenBits.end());
+            PabloAST * covered_k = pb.createAnd(futureEnd, bnc.UGT(futureLenBN, k));
+            coverMask = pb.createOr(coverMask, covered_k);
         }
 
-        // Per-length cleaned streams.
-        std::vector<PabloAST*> cleanedMe(N);
-        std::vector<std::vector<PabloAST*>> cleanedId(N);
-
-        // For each length L_a and position p with matchEnd_a[p]=1, check every other length L_b > L_a and 
-        //offset d for an overlapping match at q=p+d. If any found, kill matchEnd_a[p].
-        for (unsigned a = 0; a < N; a++) {
-            const unsigned La = mLengths[a];
-
-            PabloAST * killed = zeroes;
-            // For every other length b > a and offset d where an L_b match would overlap an L_a match at p, check if there's a matchEnd_b[q]. If so, kill the L_a match at p.
-            for (unsigned b = 0; b < N; b++) {
-                const unsigned Lb = mLengths[b];
-                if (Lb <= La) continue;   // only strictly-longer kills
-
-                const int dMin = -static_cast<int>(La - 1);
-                const int dMax =  static_cast<int>(Lb - 1);
-                for (int d = dMin; d <= dMax; d++) {
-                    const std::string tag = "a" + std::to_string(La)
-                                          + "_b" + std::to_string(Lb)
-                                          + "_d" + std::to_string(d < 0 ? -d : d)
-                                          + (d < 0 ? "n" : "");
-                    PabloAST* meB = shift1(meIn[b], d, "me_" + tag);
-                    killed = pb.createOr(killed, meB, "killed_" + tag);
-                }
-            }
-            cleanedMe[a] = pb.createAnd(meIn[a],
-                                        pb.createNot(killed, "nk_a" + std::to_string(La)),
-                                        "cleanMe_L" + std::to_string(La));
-            cleanedId[a].resize(idIn[a].size());
-            for (size_t i = 0; i < idIn[a].size(); i++) {
-                cleanedId[a][i] = pb.createAnd(idIn[a][i], cleanedMe[a],
-                    "cleanId_L" + std::to_string(La) + "_b" + std::to_string(i));
-            }
-        }
-
-        // Final OR-fold. Cleaned streams are disjoint at each position by
-        // longest-wins reasoning: if two distinct lengths both survived at p,
-        // the longer would have killed the shorter. (Same-length overlapping
-        // matches at different end positions can both fire — known limitation.)
-        PabloAST * finalMe = zeroes;
-        std::vector<PabloAST*> finalId(16, zeroes);
-        for (unsigned a = 0; a < N; a++) {
-            finalMe = pb.createOr(finalMe, cleanedMe[a],
-                                  "finalMe_L" + std::to_string(mLengths[a]));
-            for (size_t i = 0; i < 16; i++) {
-                finalId[i] = pb.createOr(finalId[i], cleanedId[a][i],
-                    "finalId_L" + std::to_string(mLengths[a]) + "_b" + std::to_string(i));
-            }
-        }
+        // keep = matchEnd(p) AND NOT coverMask.
+        PabloAST * keep = pb.createAnd(me0, pb.createNot(coverMask));
 
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("matchEndOut"), pb.getInteger(0)),
-            finalMe);
+            keep);
         Var * idOut = getOutputStreamVar("vocabIDOut");
         for (unsigned i = 0; i < 16; i++)
-            pb.createAssign(pb.createExtract(idOut, pb.getInteger(i)), finalId[i]);
+            pb.createAssign(pb.createExtract(idOut, pb.getInteger(i)),
+                            pb.createAnd(idIn[i], keep));
     }
 
 private:
-    std::vector<unsigned> mLengths;
+    unsigned mMaxLen;
 };
 
 // ─── InvertStreamKernel ─────────────────────────────────────────────────────
@@ -488,21 +476,25 @@ protected:
 
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
-// buildBPEPassPipeline assembles the length-grouped, ID-priority BPE pipeline:
+// buildBPEPassPipeline assembles the length-grouped, longest-wins BPE pipeline:
 //   1. One BPELengthDetect kernel per distinct token length L. All kernels
-//      read `basis` only and run independently.
-//   2. One BPELengthResolve kernel that takes every (matchEnd_L, vocabID_L)
-//      stream and produces the final (matchEnd, vocabID) with longest-wins
-//      overlap arbitration: a strictly-longer match's span kills any shorter
-//      match that overlaps. Same-length overlapping matches at different end
-//      positions both emit (documented limitation). The disabled
-//      BPEIDResolve below kept the alternative ID-priority rule for
-//      reference — see comments above that class.
+//      read `basis` only and run independently; each emits
+//      (matchEnd_L, vocabID_L, matchLen_L).
+//   2. A chain of BPELengthFirstWinsMerge kernels folds the length groups in
+//      DESCENDING length order into one (matchEnd, vocabID, matchLen). At any
+//      single end position the longest match wins (fold order — no compare).
+//   3. One BPEAssembleKernel drops matches contained in a longer match ending
+//      later, via a single O(maxLen) LookAhead sweep over matchLen. Produces
+//      the final (matchEnd, vocabID).
+//
+// This replaces the old monolithic BPELengthResolve, whose single kernel held
+// O(#lengths^2 * maxLen) ≈ 47k Pablo ops on the full GPT-2 vocab and OOM-killed
+// the JIT. The biggest kernel here is BPEAssemble at O(maxLen) ≈ 5k ops.
 BPEPassResult buildBPEPassPipeline(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
         const BPETokenizer & bpe) {
-    auto groups = bpe.buildLengthGroups();
+    auto groups = bpe.buildLengthGroups();   // ascending by length
 
     if (groups.empty()) {
         std::cerr << "BPE: vocabulary empty; emitting zero streams\n";
@@ -511,27 +503,27 @@ BPEPassResult buildBPEPassPipeline(
         return {me, id};
     }
 
-    // Per-length detect kernels (parallel).
+    // Per-length detect kernels (parallel), each emitting (me, id, len).
     std::vector<unsigned> lengths;
-    std::vector<StreamSet*> mes;
-    std::vector<StreamSet*> ids;
+    std::vector<StreamSet*> mes, ids, lens;
     lengths.reserve(groups.size());
     mes.reserve(groups.size());
     ids.reserve(groups.size());
+    lens.reserve(groups.size());
 
-    // Each BPELengthDetect emits (matchEnd_L, vocabID_L) for every token of length L
     for (auto & g : groups) {
-        StreamSet * me = P.CreateStreamSet(1, 1);
-        StreamSet * id = P.CreateStreamSet(16, 1);
+        StreamSet * me  = P.CreateStreamSet(1, 1);
+        StreamSet * id  = P.CreateStreamSet(16, 1);
+        StreamSet * len = P.CreateStreamSet(8, 1);
         uint64_t shape = hashTokenSet(g.tokens);
         P.CreateKernelCall<BPELengthDetect>(
-            basis, me, id, g.length, std::move(g.tokens), shape);
+            basis, me, id, len, g.length, std::move(g.tokens), shape);
         lengths.push_back(g.length);
         mes.push_back(me);
         ids.push_back(id);
+        lens.push_back(len);
     }
 
-    // Debug info: print the length distribution of the vocab, which determines the number of detect kernels and the lookahead requirements.
     std::cerr << "BPE: length-grouped detection — " << groups.size()
               << " length kernels (";
     for (size_t i = 0; i < lengths.size(); i++) {
@@ -540,10 +532,36 @@ BPEPassResult buildBPEPassPipeline(
     }
     std::cerr << ")\n";
 
-    // Longest-wins overlap resolution (single kernel).
+    // FirstWins fold in DESCENDING length order. groups is ascending, so walk
+    // it in reverse; the accumulator always holds the longer-length side, so a
+    // shorter match only fills end positions the longer one left empty.
+    const size_t N = groups.size();
+    StreamSet * curMe  = mes [N - 1];
+    StreamSet * curId  = ids [N - 1];
+    StreamSet * curLen = lens[N - 1];
+    for (size_t i = N - 1; i-- > 0; ) {
+        StreamSet * outMe  = P.CreateStreamSet(1, 1);
+        StreamSet * outId  = P.CreateStreamSet(16, 1);
+        StreamSet * outLen = P.CreateStreamSet(8, 1);
+        P.CreateKernelCall<BPELengthFirstWinsMerge>(
+            curMe, curId, curLen,        // side 1 = accumulated (longer)
+            mes[i], ids[i], lens[i],     // side 2 = next shorter length
+            outMe, outId, outLen);
+        curMe  = outMe;
+        curId  = outId;
+        curLen = outLen;
+    }
+
+    // Containment suppression. If the longest token is a single byte, nothing
+    // can contain anything → skip the sweep.
+    unsigned maxLen = bpe.maxTokenByteLen();
+    if (maxLen < 2)
+        return {curMe, curId};
+
     StreamSet * finalMe = P.CreateStreamSet(1, 1);
     StreamSet * finalId = P.CreateStreamSet(16, 1);
-    P.CreateKernelCall<BPELengthResolve>(lengths, mes, ids, finalMe, finalId);
+    P.CreateKernelCall<BPEAssembleKernel>(
+        curMe, curId, curLen, finalMe, finalId, maxLen);
     return {finalMe, finalId};
 }
 
@@ -603,6 +621,16 @@ bool BPETokenizer::loadVocab(const std::string & path) {
 std::string BPETokenizer::decodeToken(int id) const {
     if (id < 0 || static_cast<size_t>(id) >= idToToken_.size()) return "";
     return idToToken_[static_cast<size_t>(id)];
+}
+
+// Largest token byte length — sets the BPEAssemble LookAhead window.
+unsigned BPETokenizer::maxTokenByteLen() const {
+    unsigned m = 0;
+    for (const auto & [tok, id] : vocab_) {
+        (void)id;
+        if (tok.size() > m) m = static_cast<unsigned>(tok.size());
+    }
+    return m;
 }
 //
 // Length grouping for the BPE vocab.

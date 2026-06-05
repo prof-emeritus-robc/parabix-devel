@@ -216,14 +216,16 @@ protected:
             }
         }
 
-        // DFS emit. For shallow depths we wrap each child in createIf so SIMD
-        // blocks where childStream=0 skip the subtree at runtime. Beyond
-        // IF_DEPTH_CAP we emit the child inline in the current scope —
-        // long-token kernels (e.g. L=256) would otherwise nest 256 createIf
-        // scopes deep, and the resulting LLVM IR triggers super-linear work
-        // in the optimizer (multi-minute JIT). The cap keeps SIMD skip on
-        // the high-fanout top of the trie where it matters most.
-        const unsigned IF_DEPTH_CAP = 8;
+        // DFS emit, re_compiler-style sparse createIf gating.
+        // Only the FIRST level of the trie (depth == 0, one createIf per
+        // distinct last-byte) wraps its subtree in createIf — gives SIMD
+        // block-level skip on the cheap, high-selectivity first byte
+        // (256 possible values, most absent from any given SIMD block).
+        // All deeper levels emit FLAT in the same nested scope. No
+        // createIf nesting beyond depth 0 → LLVM optimizer sees a shallow
+        // function (one outer scope + N small flat sub-scopes) instead of
+        // a recursive control-flow tree, so JIT compile stays linear in
+        // trie node count instead of super-linear in nesting depth.
         std::function<void(PabloBuilder&, PabloAST*, unsigned, unsigned)> emitNode;
         emitNode = [&](PabloBuilder & pb_cur, PabloAST* stream,
                        unsigned nodeIdx, unsigned depth) {
@@ -243,16 +245,20 @@ protected:
                 }
             }
 
+            // Recurse on children. Each child's stream = parentStream AND factor(byte, depth).
             for (const auto & [b, childIdx] : node.children) {
                 PabloAST* factor      = getAdvFactor(b, depth);
+                // trie extension 
                 PabloAST* childStream = pb_cur.createAnd(stream, factor,
                     "cs_d" + std::to_string(depth) + "_b" + std::to_string((unsigned)b));
-                if (depth < IF_DEPTH_CAP) {
+                if (depth == 0) {
+                    // Top-level gate: one createIf per distinct first byte
+                    // (last byte of token, since trie is reversed).
                     auto childScope = pb_cur.createScope();
                     pb_cur.createIf(childStream, childScope);
                     emitNode(childScope, childStream, childIdx, depth + 1);
                 } else {
-                    // Flat: same scope, no createIf.
+                    // Deeper levels: flat in current scope, no createIf.
                     emitNode(pb_cur, childStream, childIdx, depth + 1);
                 }
             }
@@ -634,3 +640,9 @@ std::vector<LengthGroup> BPETokenizer::buildLengthGroups() const {
               });
     return groups;
 }
+
+
+// flatenning the if structure 
+// Master/lib/re/compile//re_compiler  - 28, 603 making the if structure depending on the Gap
+// kernel for the particular vocab
+// then the trie logic that goes through the whole vocab + the overlap and mask at tt

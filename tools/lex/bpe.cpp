@@ -8,7 +8,7 @@
  *  ─────────
  *  Stage 1: Detection (parallel, one kernel per distinct token length L).
  *      buildLengthGroups() buckets the vocab by length. For each L:
- *      BPELengthDetect emits matchEnd_L (1 at right-most byte of any L-byte
+ *      BPETokenDetect emits matchEnd_L (1 at right-most byte of any L-byte
  *      vocab match) and vocabID_L (the token's ID at that position). No
  *      `live` mask, no inter-kernel dependency — every detect kernel reads
  *      only `basis`, runs in parallel.
@@ -43,7 +43,7 @@
  *
  *  Cache keys
  *  ──────────
- *  BPELengthDetect name encodes (length L, hashTokenSet(tokens of length L)).
+ *  BPETokenDetect name encodes (length L, hashTokenSet(tokens of length L)).
  *  Two vocab files with the same length distribution but different tokens
  *  still produce distinct cache entries.
  */
@@ -87,11 +87,12 @@ uint64_t hashTokenSet(const std::vector<std::pair<std::string,unsigned>> & token
 }
 
 
-// ─── BPELengthDetect ─────────────────────────────────────────────────────────
+// ─── BPETokenDetect ─────────────────────────────────────────────────────────
 //
+// # 04
 // Detects every L-byte vocab token in the input, end-anchored. NO live mask —
 // detection is unconditional. All tokens in `mTokens` have byte length
-// `mLength`. One BPELengthDetect kernel is instantiated per distinct vocab
+// `mLength`. One BPETokenDetect kernel is instantiated per distinct vocab
 // length; the kernels are mutually independent.
 //
 // Inputs:
@@ -119,9 +120,9 @@ uint64_t hashTokenSet(const std::vector<std::pair<std::string,unsigned>> & token
 // conflicts. BPELengthFirstWinsMerge keeps the longest match ending at each
 // position (descending fold); BPEAssembleKernel then drops matches contained
 // in a longer match ending later.
-class BPELengthDetect : public PabloKernel {
+class BPETokenDetect : public PabloKernel {
 public:
-    BPELengthDetect(LLVMTypeSystemInterface & ts,
+    BPETokenDetect(LLVMTypeSystemInterface & ts,
                     StreamSet * basis,
                     StreamSet * matchEnd,
                     StreamSet * vocabID,
@@ -130,7 +131,7 @@ public:
                     std::vector<std::pair<std::string,unsigned>> tokens,
                     uint64_t shapeHash)
     : PabloKernel(ts,
-                  "BPELengthDetect_L" + std::to_string(length)
+                  "BPETokenDetect_L" + std::to_string(length)
                        + "_h" + std::to_string(shapeHash),
                   {Binding{"basis", basis}},
                   {Binding{"matchEnd", matchEnd},
@@ -190,6 +191,8 @@ protected:
             int tokenID = -1;
         };
         std::vector<TrieNode> trie(1);
+        // trie 
+        // Loop over every token in this length group. Insert it into the trie, reversed (last byte at depth 1, first byte at depth L).
         for (const auto & [tok, vid] : mTokens) {
             unsigned cur = 0;
             for (int i = static_cast<int>(tok.size()) - 1; i >= 0; i--) {
@@ -243,6 +246,7 @@ protected:
                 pb_cur.createAssign(matchEndV,
                     pb_cur.createOr(matchEndV, stream,
                         "matchEndV_tok" + std::to_string(vid)));
+                // Emit vocab ID bits. Each bit i of the token's ID is set at every match position.
                 for (unsigned i = 0; i < 16; i++) {
                     unsigned bit = (vid >> i) & 1u;
                     pb_cur.createAssign(idBits[i],
@@ -427,6 +431,219 @@ private:
     unsigned mMaxLen;
 };
 
+// ─── BPEOverlapSplit — the "find the two groups" pass O(overlap), N(independent) ────────────────────────
+//
+// Splits the longest-per-end-position match stream into two DISJOINT groups:
+//   • overlap     — matches whose byte span intersects another match's span.
+//   • independent — matches that touch nothing else (loners).
+//
+// A match A ends at p with length La = matchLen(p), span [p-La+1 .. p].
+//   overlapsLater(p)   = some match ends at p+k (k≥1) and reaches back over p:
+//                        matchEnd(p+k) AND matchLen(p+k) > k.        (other's length)
+//   overlapsEarlier(p) = some match ends strictly inside A's span:
+//                        matchEnd(p-k) AND La > k  (i.e. k < La).    (A's own length)
+//   overlap(p)      = matchEnd(p) AND (overlapsLater OR overlapsEarlier)
+//   independent(p)  = matchEnd(p) AND NOT (overlapsLater OR overlapsEarlier)
+//
+// Forward peek = LookAhead (inputs declare LookAhead(maxLen-1)); backward = Advance.
+// The two output match-end streams partition the input matchEnd exactly.
+class BPEOverlapSplit : public PabloKernel {
+public:
+    BPEOverlapSplit(LLVMTypeSystemInterface & ts,
+                    StreamSet * matchEndIn, StreamSet * vocabIDIn, StreamSet * matchLenIn,
+                    StreamSet * overlapEnd, StreamSet * overlapID,
+                    StreamSet * indepEnd,   StreamSet * indepID,
+                    unsigned maxLen)
+    : PabloKernel(ts,
+                  "BPEOverlapSplit_m" + std::to_string(maxLen),
+                  {Binding{"matchEndIn", matchEndIn, FixedRate(), LookAhead(maxLen - 1)},
+                   Binding{"vocabIDIn",  vocabIDIn},
+                   Binding{"matchLenIn", matchLenIn, FixedRate(), LookAhead(maxLen - 1)}},
+                  {Binding{"overlapEnd", overlapEnd}, Binding{"overlapID", overlapID},
+                   Binding{"indepEnd",   indepEnd},   Binding{"indepID",   indepID}}),
+      mMaxLen(maxLen) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+
+        // For each match ending at position p, look forward to every match ending at p+k (k≥1) and check if it overlaps p. 
+        // Look backward to every match ending at p-k (k≥1) and check if it overlaps p. 
+        // If either overlaps, p is in the overlap group; else it's independent.
+
+        PabloAST * me0 = getInputStreamSet("matchEndIn")[0];
+        std::vector<PabloAST*> idIn      = getInputStreamSet("vocabIDIn");
+        std::vector<PabloAST*> lenInBits = getInputStreamSet("matchLenIn");
+        const unsigned lenBits = static_cast<unsigned>(lenInBits.size());
+        BixNum lenIn(lenInBits.begin(), lenInBits.end());
+
+        // A match ending later (p+k) overlaps p iff its own length > k.
+        PabloAST * later = pb.createZeroes();
+        // LookAhead is legal since inputs declare LookAhead(maxLen-1).
+        for (unsigned k = 1; k < mMaxLen; k++) {
+            PabloAST * futEnd = pb.createLookahead(me0, k);
+            std::vector<PabloAST*> fBits;
+            fBits.reserve(lenBits);
+            // LookAhead every bit of matchLen at p+k, compare the whole thing to k via UGT. If matchLen(p+k) > k, 
+            // then the future match overlaps p and p is not independent.
+            for (unsigned i = 0; i < lenBits; i++)
+                fBits.push_back(pb.createLookahead(lenInBits[i], k));
+            BixNum futLen(fBits.begin(), fBits.end());
+            later = pb.createOr(later, pb.createAnd(futEnd, bnc.UGT(futLen, k)));
+        }
+
+        // A match ending earlier (p-k) overlaps p iff THIS match's length > k.
+        PabloAST * earlier = pb.createZeroes();
+        for (unsigned k = 1; k < mMaxLen; k++) {
+            PabloAST * pastEnd = pb.createAdvance(me0, k);
+            earlier = pb.createOr(earlier, pb.createAnd(pastEnd, bnc.UGT(lenIn, k)));
+        }
+
+        // overlap = me0 AND (later OR earlier); independent = me0 AND NOT (later OR earlier).
+        PabloAST * touches = pb.createOr(later, earlier);
+        PabloAST * overlap = pb.createAnd(me0, touches);
+        PabloAST * indep   = pb.createAnd(me0, pb.createNot(touches));
+
+        pb.createAssign(
+            pb.createExtract(getOutputStreamVar("overlapEnd"), pb.getInteger(0)), overlap);
+        pb.createAssign(
+            pb.createExtract(getOutputStreamVar("indepEnd"), pb.getInteger(0)), indep);
+
+        Var * ovID = getOutputStreamVar("overlapID");
+        Var * inID = getOutputStreamVar("indepID");
+        for (unsigned i = 0; i < 16; i++) {
+            pb.createAssign(pb.createExtract(ovID, pb.getInteger(i)),
+                            pb.createAnd(idIn[i], overlap));
+            pb.createAssign(pb.createExtract(inID, pb.getInteger(i)),
+                            pb.createAnd(idIn[i], indep));
+        }
+    }
+
+private:
+    unsigned mMaxLen;
+};
+
+
+// ─── BPEResolveOverlaps — LONGEST-WINS inside the overlap group ──────────────
+//
+// Efficient revival of the old (OOM-killed) BPELengthResolve: same rule — kill A
+// if a STRICTLY LONGER match overlaps A's span — but O(maxLen·lenBits) instead of
+// O(#lengths²·maxLen). Runs only on the overlap stream. matchLen is the FULL
+// length stream; every read is gated on overlapEnd, so independent matches
+// (overlapEnd=0) never contribute — sound because an independent match shares no
+// byte with any overlap match (else it would be in the overlap group).
+//
+//   coverLenMax[i] = max over k in [0..maxLen-1] of
+//                    (overlapEnd(i+k) AND matchLen(i+k) > k) ? matchLen(i+k) : 0
+//   killed[p]      = OR over j in [0..maxLen-1] of
+//                    (matchLen(p) > j) AND (coverLenMax(p-j) > matchLen(p))
+//   keep           = overlapEnd AND NOT killed
+//
+// Straddle: ĠMun@6(L5) span{2..6} coverLenMax=5 → survives; uni@7(L3) span{5,6,7}
+// coverLenMax[5]=5>3 → killed; iza@9(L3) survives. Longest wins.
+class BPEResolveOverlaps : public PabloKernel {
+public:
+    BPEResolveOverlaps(LLVMTypeSystemInterface & ts,
+                       StreamSet * overlapEnd, StreamSet * overlapID, StreamSet * matchLen,
+                       StreamSet * resEnd, StreamSet * resID,
+                       unsigned maxLen)
+    : PabloKernel(ts,
+                  "BPEResolveOverlaps_m" + std::to_string(maxLen),
+                  {Binding{"overlapEnd", overlapEnd, FixedRate(), LookAhead(maxLen - 1)},
+                   Binding{"overlapID",  overlapID},
+                   Binding{"matchLen",   matchLen, FixedRate(), LookAhead(maxLen - 1)}},
+                  {Binding{"resEnd", resEnd}, Binding{"resID", resID}}),
+      mMaxLen(maxLen) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+
+        PabloAST * me0 = getInputStreamSet("overlapEnd")[0];
+        std::vector<PabloAST*> idIn      = getInputStreamSet("overlapID");
+        std::vector<PabloAST*> lenInBits = getInputStreamSet("matchLen");
+        const unsigned lenBits = static_cast<unsigned>(lenInBits.size());
+        BixNum lenIn(lenInBits.begin(), lenInBits.end());
+
+        // Stage A: coverLenMax[i] = longest OVERLAP match covering byte i.
+        BixNum coverLenMax = bnc.Select(me0, lenIn, 0u);
+        for (unsigned k = 1; k < mMaxLen; k++) {
+            PabloAST * futEnd = pb.createLookahead(me0, k);
+            std::vector<PabloAST*> fBits;
+            fBits.reserve(lenBits);
+            for (unsigned i = 0; i < lenBits; i++)
+                fBits.push_back(pb.createLookahead(lenInBits[i], k));
+            BixNum futLen(fBits.begin(), fBits.end());
+            PabloAST * covers = pb.createAnd(futEnd, bnc.UGT(futLen, k));
+            BixNum cand = bnc.Select(covers, futLen, 0u);
+            coverLenMax = bnc.Select(bnc.UGT(cand, coverLenMax), cand, coverLenMax);
+        }
+
+        // Stage B: kill A if a strictly longer overlap match covers a byte of its span.
+        PabloAST * killed = pb.createZeroes();
+        for (unsigned j = 0; j < mMaxLen; j++) {
+            std::vector<PabloAST*> shBits;
+            shBits.reserve(lenBits);
+            for (unsigned i = 0; i < lenBits; i++)
+                shBits.push_back(j == 0 ? coverLenMax[i]
+                                        : pb.createAdvance(coverLenMax[i], j));
+            BixNum covShift(shBits.begin(), shBits.end());
+            PabloAST * inSpan       = bnc.UGT(lenIn, j);
+            PabloAST * longerCovers = bnc.UGT(covShift, lenIn);
+            killed = pb.createOr(killed, pb.createAnd(inSpan, longerCovers));
+        }
+
+        PabloAST * keep = pb.createAnd(me0, pb.createNot(killed));
+        pb.createAssign(
+            pb.createExtract(getOutputStreamVar("resEnd"), pb.getInteger(0)), keep);
+        Var * resID = getOutputStreamVar("resID");
+        for (unsigned i = 0; i < 16; i++)
+            pb.createAssign(pb.createExtract(resID, pb.getInteger(i)),
+                            pb.createAnd(idIn[i], keep));
+    }
+
+private:
+    unsigned mMaxLen;
+};
+
+
+// ─── BPEMergeFinal — OR the two groups back together ─────────────────────────
+//
+// independent (loners, untouched) OR resolved-overlap survivors. The two
+// match-end streams are disjoint (BPEOverlapSplit partitions matchEnd), so
+// plain OR is exact.
+class BPEMergeFinal : public PabloKernel {
+public:
+    BPEMergeFinal(LLVMTypeSystemInterface & ts,
+                  StreamSet * indepEnd, StreamSet * indepID,
+                  StreamSet * resEnd,   StreamSet * resID,
+                  StreamSet * finalEnd, StreamSet * finalID)
+    : PabloKernel(ts, "BPEMergeFinal",
+                  {Binding{"indepEnd", indepEnd}, Binding{"indepID", indepID},
+                   Binding{"resEnd",   resEnd},   Binding{"resID",   resID}},
+                  {Binding{"finalEnd", finalEnd}, Binding{"finalID", finalID}}) {}
+
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * inEnd = getInputStreamSet("indepEnd")[0];
+        PabloAST * rEnd  = getInputStreamSet("resEnd")[0];
+        std::vector<PabloAST*> inID = getInputStreamSet("indepID");
+        std::vector<PabloAST*> rID  = getInputStreamSet("resID");
+
+        pb.createAssign(
+            pb.createExtract(getOutputStreamVar("finalEnd"), pb.getInteger(0)),
+            pb.createOr(inEnd, rEnd));
+        Var * fID = getOutputStreamVar("finalID");
+        for (unsigned i = 0; i < 16; i++)
+            pb.createAssign(pb.createExtract(fID, pb.getInteger(i)),
+                            pb.createOr(inID[i], rID[i]));
+    }
+};
+
+
 // ─── InvertStreamKernel ─────────────────────────────────────────────────────
 //
 // Flips every bit of a 1×1 stream. Used by buildLinePretokens to convert a
@@ -474,10 +691,10 @@ protected:
     }
 };
 
-
+// # 03
 // ─── Pipeline ────────────────────────────────────────────────────────────────
 // buildBPEPassPipeline assembles the length-grouped, longest-wins BPE pipeline:
-//   1. One BPELengthDetect kernel per distinct token length L. All kernels
+//   1. One BPETokenDetect kernel per distinct token length L. All kernels
 //      read `basis` only and run independently; each emits
 //      (matchEnd_L, vocabID_L, matchLen_L).
 //   2. A chain of BPELengthFirstWinsMerge kernels folds the length groups in
@@ -511,12 +728,14 @@ BPEPassResult buildBPEPassPipeline(
     ids.reserve(groups.size());
     lens.reserve(groups.size());
 
+    // Walk groups in ascending length order. 
     for (auto & g : groups) {
         StreamSet * me  = P.CreateStreamSet(1, 1);
         StreamSet * id  = P.CreateStreamSet(16, 1);
         StreamSet * len = P.CreateStreamSet(8, 1);
         uint64_t shape = hashTokenSet(g.tokens);
-        P.CreateKernelCall<BPELengthDetect>(
+        // kernel creation encodes both length and token set hash in the name → distinct cache
+        P.CreateKernelCall<BPETokenDetect>(
             basis, me, id, len, g.length, std::move(g.tokens), shape);
         lengths.push_back(g.length);
         mes.push_back(me);
@@ -552,16 +771,40 @@ BPEPassResult buildBPEPassPipeline(
         curLen = outLen;
     }
 
-    // Containment suppression. If the longest token is a single byte, nothing
-    // can contain anything → skip the sweep.
+    // Single-byte vocab → no two matches can overlap → everything independent.
     unsigned maxLen = bpe.maxTokenByteLen();
     if (maxLen < 2)
         return {curMe, curId};
 
+    // Split matches: overlap group vs independent loners.
+    StreamSet * overlapEnd = P.CreateStreamSet(1, 1);
+    StreamSet * overlapID  = P.CreateStreamSet(16, 1);
+    StreamSet * indepEnd   = P.CreateStreamSet(1, 1);
+    StreamSet * indepID    = P.CreateStreamSet(16, 1);
+    P.CreateKernelCall<BPEOverlapSplit>(
+        curMe, curId, curLen,
+        overlapEnd, overlapID, indepEnd, indepID, maxLen);
+
+    // test the two groups of overlaps and the independent vocab
+    // TEMP visualization: emit ONE group so we can eyeball the split.
+    //   true  → overlap group (tangled matches, unresolved)
+    //   false → independent group (loners)
+    // const bool SHOW_OVERLAP_GROUP = true;
+    // if (SHOW_OVERLAP_GROUP)
+    //     return {overlapEnd, overlapID};
+    // return {indepEnd, indepID};
+
+    // Resolve the overlap group by LONGEST-WINS (loners need no resolution).
+    StreamSet * resEnd = P.CreateStreamSet(1, 1);
+    StreamSet * resID  = P.CreateStreamSet(16, 1);
+    P.CreateKernelCall<BPEResolveOverlaps>(
+        overlapEnd, overlapID, curLen, resEnd, resID, maxLen);
+
+    // Final tiling = independent loners OR resolved-overlap survivors (disjoint → OR).
     StreamSet * finalMe = P.CreateStreamSet(1, 1);
     StreamSet * finalId = P.CreateStreamSet(16, 1);
-    P.CreateKernelCall<BPEAssembleKernel>(
-        curMe, curId, curLen, finalMe, finalId, maxLen);
+    P.CreateKernelCall<BPEMergeFinal>(
+        indepEnd, indepID, resEnd, resID, finalMe, finalId);
     return {finalMe, finalId};
 }
 
@@ -585,7 +828,7 @@ kernel::StreamSet * buildLinePretokens(
     return compressedBasis;
 }
 
-
+// # 01
 // ─── BPETokenizer — file I/O + pass partitioning ───────────────────────────
 // loadVocab reads a vocab.json file mapping token strings to integer IDs. 
 // decodeToken looks up an ID in the reverse map built by loadVocab.  
@@ -632,7 +875,7 @@ unsigned BPETokenizer::maxTokenByteLen() const {
     }
     return m;
 }
-//
+// # 02
 // Length grouping for the BPE vocab.
 //
 // Bucket every vocab token by its byte length. Result is sorted by length
@@ -654,7 +897,7 @@ std::vector<LengthGroup> BPETokenizer::buildLengthGroups() const {
     // Sort each length group by byte content for stable JIT cache keys, then sort groups by length ascending.
     std::vector<LengthGroup> groups;
     groups.reserve(byLen.size());
-    // Each BPELengthDetect emits (matchEnd_L, vocabID_L) for every token of length L
+    // Each BPETokenDetect emits (matchEnd_L, vocabID_L) for every token of length L
     for (auto & [L, toks] : byLen) {
         // Deterministic order for stable cache keys.
         std::sort(toks.begin(), toks.end(),

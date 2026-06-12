@@ -16,7 +16,7 @@ namespace kernel {
     class StreamSet;
 }
 
-// All vocab tokens of one specific byte length L. One BPELengthDetect kernel
+// All vocab tokens of one specific byte length L. One BPETokenDetect kernel
 // is instantiated per LengthGroup. The kernels are INDEPENDENT — each reads
 // only `basis`, never another kernel's output. All overlap resolution
 // (cross-length AND intra-length) happens in BPELengthResolve, downstream.
@@ -39,6 +39,10 @@ public:
     // sorted by bytes for deterministic JIT cache keys.
     std::vector<LengthGroup> buildLengthGroups() const;
 
+    // Largest token byte length in the vocab — sets the LookAhead window for
+    // the BPEAssemble containment sweep.
+    unsigned maxTokenByteLen() const;
+
 private:
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string>             idToToken_;
@@ -47,7 +51,7 @@ private:
 // buildBPEPassPipeline
 //   Builds a length-grouped, longest-wins BPE pipeline:
 //     - buildLengthGroups() partitions the vocab by token length.
-//     - One BPELengthDetect kernel per distinct length L. Each reads `basis`
+//     - One BPETokenDetect kernel per distinct length L. Each reads `basis`
 //       and emits (matchEnd_L, vocabID_L) for every L-byte vocab word match.
 //       Detection kernels are independent and run in parallel.
 //     - BPELengthResolve takes every length's (matchEnd_L, vocabID_L) stream

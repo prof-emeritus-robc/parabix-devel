@@ -16,13 +16,19 @@ namespace kernel {
     class StreamSet;
 }
 
-// All vocab tokens of one specific byte length L. One BPETokenDetect kernel
-// is instantiated per LengthGroup. The kernels are INDEPENDENT — each reads
-// only `basis`, never another kernel's output. All overlap resolution
-// (cross-length AND intra-length) happens in BPELengthResolve, downstream.
+// All vocab tokens of one specific byte length L, within one pass. One
+// BPETokenDetect kernel is instantiated per (pass, LengthGroup). Overlap
+// resolution is NOT here — it is pass/length run order + the consumed mask
+// (BPEMaskGate / BPEOccupy).
 struct LengthGroup {
     unsigned length;                                       // L in bytes
     std::vector<std::pair<std::string, unsigned>> tokens;  // (token bytes, vocabID), all of size L
+};
+
+// One pass of the pass design: the tokens placed in this priority tier, grouped
+// by byte length (descending) so within-pass kernels run longest → shortest.
+struct VocabPass {
+    std::vector<LengthGroup> byLength;
 };
 
 class BPETokenizer {
@@ -34,14 +40,21 @@ public:
 
     std::string decodeToken(int id) const;
 
-    // Partition the vocab by token length. Result is sorted by length
-    // ascending. Empty tokens are skipped. Each entry's `tokens` vector is
-    // sorted by bytes for deterministic JIT cache keys.
-    std::vector<LengthGroup> buildLengthGroups() const;
-
-    // Largest token byte length in the vocab — sets the LookAhead window for
-    // the BPEAssemble containment sweep.
-    unsigned maxTokenByteLen() const;
+    // Partition the vocab into conflict-ordered PASSES (the pass design).
+    //
+    // Priority = LOWER vocab id wins. Two words "can overlap" if their match
+    // spans could intersect in SOME input (one is a substring of the other, or
+    // a suffix of one equals a prefix of the other — a purely static, input-free
+    // relation). A word is placed in the current pass iff NO higher-priority
+    // (lower-id) word it can overlap remains; otherwise it is deferred to the
+    // next pass. Repeat on the leftovers until none remain.
+    //
+    // Result: passes[p].byLength holds that pass's tokens grouped by byte length
+    // (so kernels can run longest→shortest within a pass). Pass order encodes
+    // priority; within a pass no two words can be contested by a higher-priority
+    // word, so resolution is handled entirely by run order + a consumed-byte
+    // mask — the kernels themselves carry NO overlap logic.
+    std::vector<VocabPass> buildVocabPasses() const;
 
 private:
     std::unordered_map<std::string, int> vocab_;
@@ -49,15 +62,16 @@ private:
 };
 
 // buildBPEPassPipeline
-//   Builds a length-grouped, longest-wins BPE pipeline:
-//     - buildLengthGroups() partitions the vocab by token length.
-//     - One BPETokenDetect kernel per distinct length L. Each reads `basis`
-//       and emits (matchEnd_L, vocabID_L) for every L-byte vocab word match.
-//       Detection kernels are independent and run in parallel.
-//     - BPELengthResolve takes every length's (matchEnd_L, vocabID_L) stream
-//       and suppresses any match whose span overlaps a STRICTLY LONGER match.
-//       Outputs the cleaned (matchEnd, vocabID) where the longest overlapping
-//       match always wins.
+//   Builds the pass-design BPE pipeline (direct from the pseudocode):
+//     - buildVocabPasses() partitions the vocab into priority passes VP[p][i]
+//       (preprocessing; lower vocab id = higher priority).
+//     - For each pass p, length i (max..2): BPETokenDetect → BPEMaskGate (drop
+//       matches whose span hits an already-consumed byte) → BPEOccupy (mark the
+//       surviving span consumed). The consumed mask chains kernel→kernel, so
+//       overlaps are resolved purely by pass/length order — kernels carry no
+//       overlap logic.
+//     - BPEFinalOr ORs every pass's survivors into the final (matchEnd, vocabID).
+//   Single bytes (length 1) are not partitioned (byte-fallback is a TODO).
 struct BPEPassResult {
     kernel::StreamSet * matchEnd;   //  1×1
     kernel::StreamSet * vocabID;    // 16×1 BixNum

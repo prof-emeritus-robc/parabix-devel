@@ -392,6 +392,57 @@ private:
 };
 
 
+// ─── BPEByteFallback — single-byte tokens for uncovered bytes ────────────────
+//
+// After all passes, every byte not under a length>=2 match is uncovered. Emit
+// that byte's own 1-byte vocab token there, so output has no gaps. byteIds[b] is
+// the vocab id of the single-byte token for byte value b (-1 if none).
+//   uncovered = NOT consumed
+//   fbEnd     = uncovered AND (byte b has a 1-byte token)
+//   fbID      = byteIds[basis]  (masked by uncovered)
+// Fires only on uncovered bytes → disjoint from every pass survivor (which ends
+// on a consumed byte), so BPEFinalOr's OR stays exact.
+class BPEByteFallback : public PabloKernel {
+public:
+    BPEByteFallback(LLVMTypeSystemInterface & ts,
+                    StreamSet * basis, StreamSet * consumed,
+                    StreamSet * fbEnd, StreamSet * fbID,
+                    std::vector<int> byteIds)
+    : PabloKernel(ts, "BPEByteFallback",
+                  {Binding{"basis", basis}, Binding{"consumed", consumed}},
+                  {Binding{"fbEnd", fbEnd}, Binding{"fbID", fbID}}),
+      mByteIds(std::move(byteIds)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+        std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
+        BixNum symBN(basisBits.begin(), basisBits.end());
+        PabloAST * uncovered = pb.createNot(getInputStreamSet("consumed")[0]);
+
+        PabloAST * zeroes = pb.createZeroes();
+        std::vector<PabloAST*> idBits(16, zeroes);
+        PabloAST * hasTok = zeroes;
+        for (unsigned b = 0; b < 256; b++) {
+            int v = mByteIds[b];
+            if (v < 0) continue;
+            PabloAST * eq = bnc.EQ(symBN, b);
+            hasTok = pb.createOr(hasTok, eq);
+            for (unsigned bit = 0; bit < 16; bit++)
+                if ((v >> bit) & 1) idBits[bit] = pb.createOr(idBits[bit], eq);
+        }
+        pb.createAssign(pb.createExtract(getOutputStreamVar("fbEnd"), pb.getInteger(0)),
+                        pb.createAnd(hasTok, uncovered));
+        Var * fbID = getOutputStreamVar("fbID");
+        for (unsigned bit = 0; bit < 16; bit++)
+            pb.createAssign(pb.createExtract(fbID, pb.getInteger(bit)),
+                            pb.createAnd(idBits[bit], uncovered));
+    }
+private:
+    std::vector<int> mByteIds;
+};
+
+
 // ─── InvertStreamKernel ─────────────────────────────────────────────────────
 // Flips every bit of a 1×1 stream. Used by buildLinePretokens to convert a
 // newline mask into a keep mask for FilterByMask.
@@ -496,11 +547,15 @@ BPEPassResult buildBPEPassPipeline(
         }
     }
 
-    if (ends.empty()) {                              // no length>=2 tokens
-        StreamSet * me = P.CreateStreamSet(1, 1);
-        StreamSet * id = P.CreateStreamSet(16, 1);
-        return {me, id};
-    }
+    // Single-byte fallback: emit a 1-byte token at every byte still uncovered by
+    // a length>=2 match. `consumed` holds the final mask after all passes (or the
+    // zero seed if there were none → pure byte-level output).
+    StreamSet * fbEnd = P.CreateStreamSet(1, 1);
+    StreamSet * fbID  = P.CreateStreamSet(16, 1);
+    P.CreateKernelCall<BPEByteFallback>(basis, consumed, fbEnd, fbID, bpe.singleByteIds());
+    ends.push_back(fbEnd);
+    ids.push_back(fbID);
+
     if (ends.size() == 1) return {ends[0], ids[0]};
 
     StreamSet * finalMe = P.CreateStreamSet(1, 1);
@@ -564,6 +619,14 @@ bool BPETokenizer::loadVocab(const std::string & path) {
 std::string BPETokenizer::decodeToken(int id) const {
     if (id < 0 || static_cast<size_t>(id) >= idToToken_.size()) return "";
     return idToToken_[static_cast<size_t>(id)];
+}
+
+// byte value b -> id of the single-byte token "b" (-1 if the vocab has none).
+std::vector<int> BPETokenizer::singleByteIds() const {
+    std::vector<int> t(256, -1);
+    for (const auto & [tok, id] : vocab_)
+        if (tok.size() == 1) t[static_cast<uint8_t>(tok[0])] = id;
+    return t;
 }
 
 

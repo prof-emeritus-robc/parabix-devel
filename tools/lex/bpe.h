@@ -40,6 +40,10 @@ public:
 
     std::string decodeToken(int id) const;
 
+    // byte value -> vocab id of its single-byte token (-1 if none). Drives the
+    // BPEByteFallback stage that fills bytes left uncovered by length>=2 tokens.
+    std::vector<int> singleByteIds() const;
+
     // Partition the vocab into conflict-ordered PASSES (the pass design).
     //
     // Priority = LOWER vocab id wins. Two words "can overlap" if their match

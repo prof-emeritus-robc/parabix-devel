@@ -393,10 +393,8 @@ private:
 
 
 // ─── BPEByteFallback — single-byte tokens for uncovered bytes ────────────────
-//
 // After all passes, every byte not under a length>=2 match is uncovered. Emit
-// that byte's own 1-byte vocab token there, so output has no gaps. byteIds[b] is
-// the vocab id of the single-byte token for byte value b (-1 if none).
+// that byte's own 1-byte vocab token there. 
 //   uncovered = NOT consumed
 //   fbEnd     = uncovered AND (byte b has a 1-byte token)
 //   fbID      = byteIds[basis]  (masked by uncovered)
@@ -423,6 +421,9 @@ protected:
         PabloAST * zeroes = pb.createZeroes();
         std::vector<PabloAST*> idBits(16, zeroes);
         PabloAST * hasTok = zeroes;
+        // Loop over every possible byte value b = 0..255. If b has a 1-byte token, 
+        // OR its byte-eq into hasTok and OR its ID bits into idBits. 
+        // Mask all outputs by uncovered, so this kernel only fires on bytes with no length>=2 match.
         for (unsigned b = 0; b < 256; b++) {
             int v = mByteIds[b];
             if (v < 0) continue;
@@ -434,6 +435,8 @@ protected:
         pb.createAssign(pb.createExtract(getOutputStreamVar("fbEnd"), pb.getInteger(0)),
                         pb.createAnd(hasTok, uncovered));
         Var * fbID = getOutputStreamVar("fbID");
+        // Each bit of the output ID is set iff the byte has a 1-byte token with that bit set, 
+        // AND this byte is uncovered (not consumed by any length>=2 match).
         for (unsigned bit = 0; bit < 16; bit++)
             pb.createAssign(pb.createExtract(fbID, pb.getInteger(bit)),
                             pb.createAnd(idBits[bit], uncovered));
@@ -628,13 +631,10 @@ std::vector<int> BPETokenizer::singleByteIds() const {
         if (tok.size() == 1) t[static_cast<uint8_t>(tok[0])] = id;
     return t;
 }
-
-
-
-// ─── Pass partitioning (the pass design — Step 1) ────────────────────────────
-// canOverlap(a,b): can the two words' match spans intersect in SOME input?
-// Captures containment (one is a substring of the other)
-// and boundary overlap (a suffix of one equals a prefix of the other).
+// ─── Pass partitioning ────────────────────────────
+// PROPER overlap = the two spans CROSS: a suffix of one equals a prefix of the
+// other, and each token sticks out past the shared region on opposite ends.
+// The tokens share some bytes but neither contains the other.
 static bool canOverlap(const std::string & a, const std::string & b) {
     const int la = static_cast<int>(a.size());
     const int lb = static_cast<int>(b.size());
@@ -642,13 +642,19 @@ static bool canOverlap(const std::string & a, const std::string & b) {
         const int lo = std::max(0, d);
         const int hi = std::min(la, d + lb);
         if (lo >= hi) continue;                       // windows don't intersect here
+        // Skip containment: one window fully inside the other = nesting, not a cross.
+        const bool aContainsB = (d >= 0) && (d + lb <= la);
+        const bool bContainsA = (d <= 0) && (d + lb >= la);
+        if (aContainsB || bContainsA) continue;
         bool agree = true;
         for (int x = lo; x < hi; x++)
             if (a[x] != b[x - d]) { agree = false; break; }
-        if (agree) return true;
+        if (agree) return true;                       // proper crossing with shared bytes
     }
     return false;
 }
+
+
 
 // ─── Preprocessing ────────────────────────────
 // Literal 4-loop partition (length-stratified). Priority = LOWER vocab id wins.
@@ -735,3 +741,11 @@ std::vector<VocabPass> BPETokenizer::buildVocabPasses() const {
     }
     return passes;
 }
+
+
+// passes from longest to shortest?
+// longest wins priority? not needed 
+// no subset overlap ? TODO?
+// each kernel one pass and each pass is of a specific length ?
+// kernel generation should make one kernel for each pass - of each length group in the pass design. 
+// Each kernel gets the tokens for that pass+length, generates the trie, and detects them all together. The kernels are mutually independent, so no overlap logic is needed in them — the pass design guarantees that within one pass, no two tokens can match at the same end position (their byte values would have to be identical), so the first match is the only match. The mask gate and occupy kernels then resolve overlaps across passes by pass/length order + the mask, so no overlap logic is needed in them either.

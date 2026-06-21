@@ -338,9 +338,10 @@ protected:
         PabloAST * validEnd   = getInputStreamSet("validEnd")[0];
         PabloAST * consumedIn = getInputStreamSet("consumedIn")[0];
 
-        PabloAST * fill = pb.createZeroes();
-        for (unsigned m = 0; m < mLength; m++)
-            fill = pb.createOr(fill, m == 0 ? validEnd : pb.createLookahead(validEnd, m));
+        PabloAST * validStart = pb.createLookahead(validEnd, mLength-1);
+
+        PabloAST * fill = pb.createIntrinsicCall(pablo::Intrinsic::InclusiveSpan, {validStart, validEnd});
+
         pb.createAssign(pb.createExtract(getOutputStreamVar("consumedOut"), pb.getInteger(0)),
                         pb.createOr(consumedIn, fill));
     }

@@ -298,7 +298,13 @@ public:
     : PabloKernel(ts, "BPEMaskGate_L" + std::to_string(length),
                   {Binding{"rawEnd", rawEnd}, Binding{"vocabID", vocabID},
                    Binding{"consumedIn", consumedIn}},
-                  {Binding{"validEnd", validEnd}, Binding{"validID", validID}}),
+                  // InOut: rawEnd/vocabID are read ONLY by this gate, then dead, so
+                  // validEnd reuses rawEnd's buffer and validID reuses vocabID's —
+                  // no fresh allocation. Each gate is independent (alias depth 1),
+                  // so this avoids the deep-chain compile blowup that killed InOut
+                  // on the FinalOr fold / consumed-mask chain.
+                  {Binding{"validEnd", validEnd, FixedRate(), InOut("rawEnd")},
+                   Binding{"validID",  validID,  FixedRate(), InOut("vocabID")}}),
       mLength(length) {}
 protected:
     void generatePabloMethod() override {

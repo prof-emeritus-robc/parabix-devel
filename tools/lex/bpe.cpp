@@ -36,6 +36,7 @@
 
 #include "bpe.h"
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -47,6 +48,7 @@
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
+#include <kernel/bitwise/bixlogic.h>
 #include <stdexcept>
 
 using namespace pablo;
@@ -172,7 +174,8 @@ protected:
         };
         std::vector<TrieNode> trie(1);
         // trie 
-        // Loop over every token in this length group. Insert it into the trie, reversed (last byte at depth 1, first byte at depth L).
+        // Loop over every token in this length group. Insert it into the trie, 
+        // reversed (last byte at depth 1, first byte at depth L).
         for (const auto & [tok, vid] : mTokens) {
             unsigned cur = 0;
             for (int i = static_cast<int>(tok.size()) - 1; i >= 0; i--) {
@@ -204,7 +207,6 @@ protected:
                 }
             }
         }
-
         // DFS emit, re_compiler-style sparse createIf gating.
         // Only the FIRST level of the trie (depth == 0, one createIf per
         // distinct last-byte) wraps its subtree in createIf — gives SIMD
@@ -348,51 +350,6 @@ protected:
 private:
     unsigned mLength;
 };
-// ─── Final Output Merged ─────────────────────────────────────────────────────
-// BPEFinalOr — N-ary OR of every pass-kernel's (validEnd, validID) into the
-// final (matchEnd, vocabID). Survivors across passes are byte-disjoint (the mask
-// guarantees it), so plain OR is exact.
-class BPEFinalOr : public PabloKernel {
-public:
-    BPEFinalOr(LLVMTypeSystemInterface & ts,
-               const std::vector<StreamSet*> & ends, const std::vector<StreamSet*> & ids,
-               StreamSet * finalEnd, StreamSet * finalID)
-    : PabloKernel(ts, "BPEFinalOr_n" + std::to_string(ends.size()),
-                  buildIn(ends, ids),
-                  {Binding{"finalEnd", finalEnd}, Binding{"finalID", finalID}}),
-      mN(static_cast<unsigned>(ends.size())) {}
-protected:
-    static std::vector<Binding> buildIn(const std::vector<StreamSet*> & ends,
-                                        const std::vector<StreamSet*> & ids) {
-        std::vector<Binding> b;
-        b.reserve(ends.size() * 2);
-        for (size_t i = 0; i < ends.size(); i++) {
-            b.push_back(Binding{"end_" + std::to_string(i), ends[i]});
-            b.push_back(Binding{"id_"  + std::to_string(i), ids[i]});
-        }
-        return b;
-    }
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * endAcc = pb.createZeroes();
-        std::vector<std::vector<PabloAST*>> idv(mN);
-        for (unsigned i = 0; i < mN; i++) {
-            endAcc = pb.createOr(endAcc, getInputStreamSet("end_" + std::to_string(i))[0]);
-            idv[i] = getInputStreamSet("id_" + std::to_string(i));
-        }
-        pb.createAssign(pb.createExtract(getOutputStreamVar("finalEnd"), pb.getInteger(0)), endAcc);
-        Var * fID = getOutputStreamVar("finalID");
-        for (unsigned bit = 0; bit < 16; bit++) {
-            PabloAST * acc = pb.createZeroes();
-            for (unsigned i = 0; i < mN; i++) acc = pb.createOr(acc, idv[i][bit]);
-            pb.createAssign(pb.createExtract(fID, pb.getInteger(bit)), acc);
-        }
-    }
-private:
-    unsigned mN;
-};
-
-
 // ─── BPEByteFallback — single-byte tokens for uncovered bytes ────────────────
 // After all passes, every byte not under a length>=2 match is uncovered. Emit
 // that byte's own 1-byte vocab token there. 
@@ -467,7 +424,6 @@ protected:
     }
 };
 
-
 // ─── LinePtBoundKernel ──────────────────────────────────────────────────────
 // Inline pretokenizer for compare_bpe.py. Marks each newline (0x0A)
 // byte position, to FilterByMask it out of the downstream stream.
@@ -510,15 +466,17 @@ BPEPassResult buildBPEPassPipeline(
     // Preprocessing (buildVocabPasses) runs before any kernel; resolution is
     // pass/length order + the consumed mask, so kernels carry no overlap logic.
     auto passes = bpe.buildVocabPasses();
-    std::cerr << "BPE pass-partition: " << passes.size() << " passes\n";
-    for (size_t p = 0; p < passes.size(); p++) {
+
+    // Print the pass partition: which lengths/counts land in each pass.
+    std::cerr << "[BPE] " << passes.size() << " passes\n";
+    for (size_t p = 0; p < passes.size(); ++p) {
         size_t total = 0;
-        std::cerr << "  pass " << p << ": ";
+        std::cerr << "  pass " << p << ":";
         for (const auto & g : passes[p].byLength) {
-            std::cerr << "L" << g.length << "x" << g.tokens.size() << " ";
+            std::cerr << " L" << g.length << "x" << g.tokens.size();
             total += g.tokens.size();
         }
-        std::cerr << " (" << total << " tokens)\n";
+        std::cerr << "  (" << total << " tokens)\n";
     }
 
     // Seed an all-zero consumed mask.
@@ -562,10 +520,21 @@ BPEPassResult buildBPEPassPipeline(
 
     if (ends.size() == 1) return {ends[0], ids[0]};
 
-    StreamSet * finalMe = P.CreateStreamSet(1, 1);
-    StreamSet * finalId = P.CreateStreamSet(16, 1);
-    P.CreateKernelCall<BPEFinalOr>(ends, ids, finalMe, finalId);
-    return {finalMe, finalId};
+    // N-ary OR via a fold of library OrCombine kernels. Survivors are byte-disjoint
+    // (consumed mask + fallback's uncovered gate guarantee it), so plain OR is exact.
+    // OrCombine ORs all 16 ID streams in one call (it loops over streams).
+    StreamSet * accEnd = ends[0];
+    StreamSet * accId  = ids[0];
+    for (size_t i = 1; i < ends.size(); ++i) {
+        StreamSet * nextEnd = P.CreateStreamSet(1, 1);
+        OrCombine(P, accEnd, ends[i], nextEnd);
+        accEnd = nextEnd;
+
+        StreamSet * nextId = P.CreateStreamSet(16, 1);
+        OrCombine(P, accId, ids[i], nextId);
+        accId = nextId;
+    }
+    return {accEnd, accId};
 }
 
 // buildLinePretokens
@@ -632,6 +601,7 @@ std::vector<int> BPETokenizer::singleByteIds() const {
         if (tok.size() == 1) t[static_cast<uint8_t>(tok[0])] = id;
     return t;
 }
+
 // ─── Pass partitioning ────────────────────────────
 // PROPER overlap = the two spans CROSS: a suffix of one equals a prefix of the
 // other, and each token sticks out past the shared region on opposite ends.
@@ -654,8 +624,6 @@ static bool canOverlap(const std::string & a, const std::string & b) {
     }
     return false;
 }
-
-
 
 // ─── Preprocessing ────────────────────────────
 // Literal 4-loop partition (length-stratified). Priority = LOWER vocab id wins.

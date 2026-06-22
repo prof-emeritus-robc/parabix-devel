@@ -48,7 +48,6 @@
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
-#include <kernel/bitwise/bixlogic.h>
 #include <stdexcept>
 
 using namespace pablo;
@@ -356,6 +355,52 @@ protected:
 private:
     unsigned mLength;
 };
+// ─── Final Output Merged ─────────────────────────────────────────────────────
+// BPEFinalOr — N-ary OR of every pass-kernel's (validEnd, validID) into the
+// final (matchEnd, vocabID). Survivors across passes are byte-disjoint (the mask
+// guarantees it), so plain OR is exact. ONE kernel ORs all inputs in a single
+// shot — preferred over a deep fold of binary OrCombine kernels (432 serial
+// stages, 432 buffers, slow cold-compile, and InOut on the fold is unreachable
+// because the alias chain is too deep).
+class BPEFinalOr : public PabloKernel {
+public:
+    BPEFinalOr(LLVMTypeSystemInterface & ts,
+               const std::vector<StreamSet*> & ends, const std::vector<StreamSet*> & ids,
+               StreamSet * finalEnd, StreamSet * finalID)
+    : PabloKernel(ts, "BPEFinalOr_n" + std::to_string(ends.size()),
+                  buildIn(ends, ids),
+                  {Binding{"finalEnd", finalEnd}, Binding{"finalID", finalID}}),
+      mN(static_cast<unsigned>(ends.size())) {}
+protected:
+    static std::vector<Binding> buildIn(const std::vector<StreamSet*> & ends,
+                                        const std::vector<StreamSet*> & ids) {
+        std::vector<Binding> b;
+        b.reserve(ends.size() * 2);
+        for (size_t i = 0; i < ends.size(); i++) {
+            b.push_back(Binding{"end_" + std::to_string(i), ends[i]});
+            b.push_back(Binding{"id_"  + std::to_string(i), ids[i]});
+        }
+        return b;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * endAcc = pb.createZeroes();
+        std::vector<std::vector<PabloAST*>> idv(mN);
+        for (unsigned i = 0; i < mN; i++) {
+            endAcc = pb.createOr(endAcc, getInputStreamSet("end_" + std::to_string(i))[0]);
+            idv[i] = getInputStreamSet("id_" + std::to_string(i));
+        }
+        pb.createAssign(pb.createExtract(getOutputStreamVar("finalEnd"), pb.getInteger(0)), endAcc);
+        Var * fID = getOutputStreamVar("finalID");
+        for (unsigned bit = 0; bit < 16; bit++) {
+            PabloAST * acc = pb.createZeroes();
+            for (unsigned i = 0; i < mN; i++) acc = pb.createOr(acc, idv[i][bit]);
+            pb.createAssign(pb.createExtract(fID, pb.getInteger(bit)), acc);
+        }
+    }
+private:
+    unsigned mN;
+};
 // ─── BPEByteFallback — single-byte tokens for uncovered bytes ────────────────
 // After all passes, every byte not under a length>=2 match is uncovered. Emit
 // that byte's own 1-byte vocab token there. 
@@ -526,21 +571,12 @@ BPEPassResult buildBPEPassPipeline(
 
     if (ends.size() == 1) return {ends[0], ids[0]};
 
-    // N-ary OR via a fold of library OrCombine kernels. Survivors are byte-disjoint
-    // (consumed mask + fallback's uncovered gate guarantee it), so plain OR is exact.
-    // OrCombine ORs all 16 ID streams in one call (it loops over streams).
-    StreamSet * accEnd = ends[0];
-    StreamSet * accId  = ids[0];
-    for (size_t i = 1; i < ends.size(); ++i) {
-        StreamSet * nextEnd = P.CreateStreamSet(1, 1);
-        OrCombine(P, accEnd, ends[i], nextEnd);
-        accEnd = nextEnd;
-
-        StreamSet * nextId = P.CreateStreamSet(16, 1);
-        OrCombine(P, accId, ids[i], nextId);
-        accId = nextId;
-    }
-    return {accEnd, accId};
+    // One N-ary OR kernel merges all survivors + fallback. Byte-disjoint inputs
+    // (consumed mask + fallback's uncovered gate) → plain OR is exact.
+    StreamSet * finalMe = P.CreateStreamSet(1, 1);
+    StreamSet * finalId = P.CreateStreamSet(16, 1);
+    P.CreateKernelCall<BPEFinalOr>(ends, ids, finalMe, finalId);
+    return {finalMe, finalId};
 }
 
 // buildLinePretokens

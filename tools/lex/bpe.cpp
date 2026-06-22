@@ -518,16 +518,13 @@ BPEPassResult buildBPEPassPipeline(
     // pass/length order + the consumed mask, so kernels carry no overlap logic.
     auto passes = bpe.buildVocabPasses();
 
-    // Print the pass partition: which lengths/counts land in each pass.
+    // Print the pass partition, one length-group per token:
+    //   p{pass}L{length}x{count}   e.g. p538L15x1 = pass 538, length 15, 1 token.
     std::cerr << "[BPE] " << passes.size() << " passes\n";
     for (size_t p = 0; p < passes.size(); ++p) {
-        size_t total = 0;
-        std::cerr << "  pass " << p << ":";
-        for (const auto & g : passes[p].byLength) {
-            std::cerr << " L" << g.length << "x" << g.tokens.size();
-            total += g.tokens.size();
-        }
-        std::cerr << "  (" << total << " tokens)\n";
+        for (const auto & g : passes[p].byLength)
+            std::cerr << "p" << p << "L" << g.length << "x" << g.tokens.size() << " ";
+        std::cerr << "\n";
     }
 
     // Seed an all-zero consumed mask.

@@ -16,19 +16,12 @@ namespace kernel {
     class StreamSet;
 }
 
-// All vocab tokens of one specific byte length L, within one pass. One
-// BPETokenDetect kernel is instantiated per (pass, LengthGroup). Overlap
-// resolution is NOT here — it is pass/length run order + the consumed mask
-// (BPEMaskGate / BPEOccupy).
-struct LengthGroup {
-    unsigned length;                                       // L in bytes
-    std::vector<std::pair<std::string, unsigned>> tokens;  // (token bytes, vocabID), all of size L
-};
-
-// One pass of the pass design: the tokens placed in this priority tier, grouped
-// by byte length (descending) so within-pass kernels run longest → shortest.
-struct VocabPass {
-    std::vector<LengthGroup> byLength;
+// One id-range for the range-kernel design (BPERangeKernel). Tokens are sorted
+// by id ASC; maxLen drives the kernel's LookAhead binding.
+struct RangeGroup {
+    unsigned lo = 0, hi = 0;                                // id range [lo, hi)
+    unsigned maxLen = 0;                                    // longest token byte length
+    std::vector<std::pair<std::string, unsigned>> tokens;   // len>=2, sorted by id ASC
 };
 
 class BPETokenizer {
@@ -40,25 +33,18 @@ public:
 
     std::string decodeToken(int id) const;
 
-    // byte value -> vocab id of its single-byte token (-1 if none). Drives the
-    // BPEByteFallback stage that fills bytes left uncovered by length>=2 tokens.
+    // byte value -> vocab id of its single-byte token (-1 if none). Seeds the
+    // range-kernel `source` so every unconsumed byte carries its single-byte id
+    // (the byte-level fallback).
     std::vector<int> singleByteIds() const;
 
-    // Partition the vocab into conflict-ordered PASSES (the pass design).
-    //
-    // Priority = LOWER vocab id wins. Two words "can overlap" if their match
-    // spans could intersect in SOME input (one is a substring of the other, or
-    // a suffix of one equals a prefix of the other — a purely static, input-free
-    // relation). A word is placed in the current pass iff NO higher-priority
-    // (lower-id) word it can overlap remains; otherwise it is deferred to the
-    // next pass. Repeat on the leftovers until none remain.
-    //
-    // Result: passes[p].byLength holds that pass's tokens grouped by byte length
-    // (so kernels can run longest→shortest within a pass). Pass order encodes
-    // priority; within a pass no two words can be contested by a higher-priority
-    // word, so resolution is handled entirely by run order + a consumed-byte
-    // mask — the kernels themselves carry NO overlap logic.
-    std::vector<VocabPass> buildVocabPasses() const;
+    // Partition the vocab into id-RANGES for the range-kernel design. One
+    // BPERangeKernel handles one RangeGroup, kernels run lowest-id range first,
+    // so lower id wins. Ranges are 256-wide over [256,1024) (the 256_511,
+    // 512_767, 768_1023 kernels) then RANGE_WIDTH-wide above that. Only length>=2
+    // tokens are partitioned (single bytes are seeded as the byte-level fallback).
+    // tokens within a group are sorted by id ASC.
+    std::vector<RangeGroup> buildVocabRanges() const;
 
 private:
     std::unordered_map<std::string, int> vocab_;
@@ -66,16 +52,12 @@ private:
 };
 
 // buildBPEPassPipeline
-//   Builds the pass-design BPE pipeline (direct from the pseudocode):
-//     - buildVocabPasses() partitions the vocab into priority passes VP[p][i]
-//       (preprocessing; lower vocab id = higher priority).
-//     - For each pass p, length i (max..2): BPETokenDetect → BPEMaskGate (drop
-//       matches whose span hits an already-consumed byte) → BPEOccupy (mark the
-//       surviving span consumed). The consumed mask chains kernel→kernel, so
-//       overlaps are resolved purely by pass/length order — kernels carry no
-//       overlap logic.
-//     - BPEFinalOr ORs every pass's survivors into the final (matchEnd, vocabID).
-//   Single bytes (length 1) are not partitioned (byte-fallback is a TODO).
+//   Builds the range-kernel BPE pipeline:
+//     - buildVocabRanges() groups length>=2 tokens by id-range (lower id wins).
+//     - BPERangeSeed seeds (source, active, end); one BPERangeKernel per range
+//       (lowest first) detects, gates, and accumulates ids into `source`.
+//     - BPEEmitTrigger derives matchEnd = active OR end.
+//   Returns (matchEnd, vocabID=source). Single bytes are seeded as the fallback.
 struct BPEPassResult {
     kernel::StreamSet * matchEnd;   //  1×1
     kernel::StreamSet * vocabID;    // 16×1 BixNum

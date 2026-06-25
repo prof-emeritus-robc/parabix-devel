@@ -30,6 +30,7 @@
 #include <kernel/scan/reader.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <string>
@@ -180,6 +181,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
         CPUDriver & driver,
         const BPETokenizer & bpe) {
 
+    auto __tBuild0 = std::chrono::steady_clock::now();
     auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
 
@@ -240,7 +242,17 @@ static BPEPipelineFunctionType buildBPEPipeline(
     scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),
                  idBytes16, scanIndices);
 
-    return reinterpret_cast<BPEPipelineFunctionType>(P.compile());
+    auto __tBuild1 = std::chrono::steady_clock::now();
+    auto fn = reinterpret_cast<BPEPipelineFunctionType>(P.compile());
+    auto __tCompile1 = std::chrono::steady_clock::now();
+
+    std::cerr << "[BPE] pipeline graph build: "
+              << std::chrono::duration<double, std::milli>(__tBuild1 - __tBuild0).count()
+              << " ms (includes buildVocabRanges above)\n";
+    std::cerr << "[BPE] P.compile() JIT+LLVM: "
+              << std::chrono::duration<double, std::milli>(__tCompile1 - __tBuild1).count()
+              << " ms\n";
+    return fn;
 }
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
@@ -315,7 +327,12 @@ int main(int argc, char *argv[]) {
             llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
             return 1;
         }
+        auto __tRun0 = std::chrono::steady_clock::now();
         bpeFn(fd);
+        auto __tRun1 = std::chrono::steady_clock::now();
+        std::cerr << "[BPE] run (execute pipeline): "
+                  << std::chrono::duration<double, std::milli>(__tRun1 - __tRun0).count()
+                  << " ms\n";
         close(fd);
         return 0;
     }

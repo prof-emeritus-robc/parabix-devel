@@ -28,7 +28,16 @@ class BPETokenizer {
 public:
     bool loadVocab(const std::string & path);
 
+    // loadMerges reads a HuggingFace merges.txt. Each non-header line "A B"
+    // defines a merge producing token AB (concat of the two already-formed
+    // parts). The line index (0-based, after the #version header) is the merge
+    // RANK = priority (lower rank wins). In GPT-2 the merged token's vocab id
+    // == 256 + rank exactly, so we store id = 256 + rank and the rank-ordered
+    // partition matches the vocab-id partition for length>=2 tokens.
+    bool loadMerges(const std::string & path);
+
     bool   isLoaded()  const { return !vocab_.empty(); }
+    bool   hasMerges() const { return !merges_.empty(); }
     size_t vocabSize() const { return vocab_.size(); }
 
     std::string decodeToken(int id) const;
@@ -46,9 +55,18 @@ public:
     // tokens within a group are sorted by id ASC.
     std::vector<RangeGroup> buildVocabRanges() const;
 
+    // Same id-range partition as buildVocabRanges, but the length>=2 token set +
+    // priority come from merges.txt (token = merged pair, id = 256 + rank)
+    // instead of the vocab.json keys. Lower rank wins. Single-byte tokens are
+    // not present in merges.txt — they remain the seeded byte-level fallback
+    // (singleByteIds(), still sourced from vocab.json).
+    std::vector<RangeGroup> buildMergeRanges() const;
+
 private:
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string>             idToToken_;
+    // (mergedToken, id = 256 + rank), in rank order. Populated by loadMerges.
+    std::vector<std::pair<std::string, unsigned>> merges_;
 };
 
 // buildBPEPassPipeline

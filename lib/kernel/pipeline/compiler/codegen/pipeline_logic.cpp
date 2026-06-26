@@ -172,10 +172,6 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
 
     const auto syncLockType = allowDataParallelExecution ? SYNC_LOCK_PRE_INVOCATION : SYNC_LOCK_FULL;
     mTarget->addInternalScalar(sizeTy, name + LOGICAL_SEGMENT_SUFFIX[syncLockType], groupId);
-    if (isRoot) {
-        addSegmentLengthSlidingWindowKernelProperties(b, kernelId, groupId);
-    }
-
     addConsumerKernelProperties(b, kernelId);
 
     const auto isStateFree = allowDataParallelExecution & !isInternallySynchronized;
@@ -214,6 +210,10 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     addBufferHandlesToPipelineKernel(b, kernelId, groupId);
 
     addFamilyKernelProperties(b, kernelId, groupId);
+
+    if (isRoot) {
+        addThreadLocalPartitionProperties(b, KernelPartitionId[kernelId], groupId);
+    }
 
     if (LLVM_UNLIKELY(isInternallySynchronized || (mKernel->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject) || kernelHasAnyPipelineIllustratedStreamSet(kernelId))) {
         // TODO: only needed if its possible to loop back or if we are not guaranteed that this kernel will always fire
@@ -396,8 +396,6 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
 
     getABIAlignments(b);
 
-    initializeInitialSlidingWindowSegmentLengths(b, segmentSize);
-
     assert (PartitionPhaseBoundaries.size() >= 2);
 
     bool getInputSize = false;
@@ -432,6 +430,8 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
         }
         if (bufferScaling) {
             expectedSourceOutputSize = b.CreateCeilUDivRational(bufferScaling, b.getBitBlockWidth());
+        } else {
+            expectedSourceOutputSize = segmentSize;
         }
     }
 
@@ -495,7 +495,7 @@ void PipelineCompiler::generateAllocateThreadLocalInternalStreamSetsMethod(Kerne
     assert (PartitionCount > 0);
     initializeThreadLocalMemory(b, segmentSize);
     const Rational T{mTarget->getStride(), b.getBitBlockWidth()};
-    allocateOwnedBuffers(b, b.CreateCeilUMulRational(segmentSize, T), nullptr, false);
+    allocateOwnedBuffers(b,  b.CreateCeilUMulRational(segmentSize, T), nullptr, false);
     resetInternalBufferHandles();
 }
 

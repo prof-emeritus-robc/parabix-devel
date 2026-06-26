@@ -65,6 +65,7 @@ public:
 
         // Finish annotating the buffer graph
         P.identifyOwnedBuffers();
+
         P.identifyZeroExtendedStreamSets();
 
         P.identifyLinearBuffers();
@@ -93,6 +94,8 @@ public:
         P.scanFamilyKernelBindings();
 
         P.setStreamSetLockIds();
+
+        P.calculateUnwrittenDataZeroLength(b);
 
         P.identifyManagedBufferStructIds(rng);
 
@@ -194,6 +197,8 @@ private:
 
     void buildZeroInputGraph();
 
+    void calculateUnwrittenDataZeroLength(KernelBuilder & b);
+
     void setStreamSetLockIds();
 
     void identifyManagedBufferStructIds(pipeline_random_engine & rng);
@@ -287,6 +292,8 @@ public:
     unsigned                        PartitionCount = 0;
     unsigned                        ManagedBufferStructCount = 0;
 
+    size_t                          MinimumThreadLocalSegmentSize = 0;
+
     bool                            HasZeroExtendedStream = false;
     bool                            RequiresIllustratorObject = false;
 
@@ -315,8 +322,6 @@ public:
     ConsumerGraph                   mConsumerGraph;
 
     PartialSumStepFactorGraph       mPartialSumStepFactorGraph;
-
-    flat_set<unsigned>              mNonThreadLocalStreamSets;
 
     TerminationChecks               mTerminationCheck;
 

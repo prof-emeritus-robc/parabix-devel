@@ -78,7 +78,7 @@ void PipelineCompiler::makePartitionEntryPoints(KernelBuilder & b) {
             const auto k = streamSet - FirstStreamSet;
 
             auto lastReader = producer;
-            for (const auto input : make_iterator_range(out_edges(streamSet, mBufferGraph))) {
+            for (const auto input : make_iterator_range(out_edges(mConsumerGraph[streamSet], mConsumerGraph))) {
                 const auto consumer = target(input, mBufferGraph);
                 if (lastReader < consumer && consumer < oneAfterLastComputeKernel) {
                     lastReader = consumer;
@@ -581,7 +581,7 @@ void PipelineCompiler::writeInitiallyTerminatedPartitionExit(KernelBuilder & b) 
             mProducedAtJumpPhi[port]->addIncoming(produced, mKernelInitiallyTerminatedExit);
         }
 
-        mMaximumNumOfStridesAtJumpPhi->addIncoming(b.getSize(0), mKernelInitiallyTerminatedExit);
+//        mMaximumNumOfStridesAtJumpPhi->addIncoming(b.getSize(0), mKernelInitiallyTerminatedExit);
         b.CreateBr(mKernelJumpToNextUsefulPartition);
     } else {
         #ifdef PRINT_DEBUG_MESSAGES
@@ -618,8 +618,6 @@ void PipelineCompiler::writeJumpToNextPartition(KernelBuilder & b) {
     #ifdef PRINT_DEBUG_MESSAGES
     debugPrint(b, "** " + makeKernelName(mKernelId) + ".jumping = %" PRIu64, mSegNo);
     #endif
-
-    updateNextSlidingWindowSize(b, mMaximumNumOfStridesAtJumpPhi, b.getSize(0));
 
     if (targetKernelId != firstKernelInNextPhase) {
         acquirePartitionSynchronizationLock(b, targetKernelId, mSegNo);
@@ -738,15 +736,16 @@ void PipelineCompiler::checkForPartitionExit(KernelBuilder & b) {
 
         const auto n = LastStreamSet - FirstStreamSet + 1U;
 
-        for (unsigned i = 0; i != n; ++i) {
-            PHINode * const phi = mPartitionProducedItemCountPhi[nextPartitionId][i];
+        for (auto streamSet = FirstStreamSet; streamSet <= LastStreamSet; ++streamSet) {
+            PHINode * const phi = mPartitionProducedItemCountPhi[nextPartitionId][streamSet - FirstStreamSet];
             if (phi) {
                 assert (isFromCurrentFunction(b, phi, false));
-                const auto streamSet = FirstStreamSet + i;
                 assert (isFromCurrentFunction(b, mLocallyAvailableItems[streamSet], false));
                 phi->addIncoming(mLocallyAvailableItems[streamSet], exitBlock);
                 mLocallyAvailableItems[streamSet] = phi;
             }
+
+
         }
 
         const auto firstKernelOfNextPartition = FirstKernelInPartition[nextPartitionId];

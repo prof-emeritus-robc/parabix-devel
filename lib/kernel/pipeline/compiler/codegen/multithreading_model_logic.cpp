@@ -294,7 +294,6 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
             assert (threadStruct->getType() == threadStructPtrTy);
             readThreadStructObject(b, threadStructTy, threadStruct);
             assert (isFromCurrentFunction(b, getHandle(), !mTarget->isStateful()));
-
             readDoSegmentState(b, threadStructTy, threadStruct);
             initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
             mSegNo = &*args++;
@@ -999,7 +998,6 @@ void PipelineCompiler::start(KernelBuilder & b) {
 
     mExpectedNumOfStridesMultiplier = ns; // b.CreateCeilUMulRational(ns, mTarget->getStride());
 
-    initializeFlowControl(b);
     loadInternalStreamSetHandles(b, true);
     loadInternalStreamSetHandles(b, false);
 

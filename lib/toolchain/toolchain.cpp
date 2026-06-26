@@ -120,6 +120,10 @@ static cl::opt<std::string, true> optPreserveAllStreamSetDataOption("preserve-al
   cl::desc("Comma delimited list of which streamsets to permit to be thread local (default=all)"),
   cl::value_desc("regex"), cl::cat(CodeGenOptions));
 
+std::string DoubleStreamSetSizeOptions = "";
+static cl::opt<std::string, true> optDoubleStreamSetSizeOptions("double-streamset-size", cl::location(DoubleStreamSetSizeOptions), cl::ValueOptional,
+  cl::desc("Comma delimited list of which streamsets to permit to be thread local (default=all)"),
+  cl::value_desc("regex"), cl::cat(CodeGenOptions));
 
 #ifdef ENABLE_PAPI
 std::string PapiCounterOptions = OmittedOption;
@@ -221,7 +225,7 @@ MaxTaskThreadsOption("max-task-threads", cl::location(TaskThreads),
                      cl::value_desc("positive integer"));
 
 static cl::opt<unsigned, true>
-ThreadNumOption("thread-num", cl::location(SegmentThreads), cl::init(2),
+ThreadNumOption("thread-num", cl::location(SegmentThreads), cl::init(3),
                 cl::desc("Number of threads used for segment pipeline parallel"),
                 cl::value_desc("positive integer"));
 

@@ -449,6 +449,9 @@ std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(Kernel
  * @brief isCachable
  ** ------------------------------------------------------------------------------------------------------------- */
 bool PipelineKernel::isCachable() const {
+    if (codegen::DebugOptionIsSet(codegen::ForcePipelineRecompilation)) {
+        return false;
+    }
     return (getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject) == 0;
 }
 
@@ -660,7 +663,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
             segmentArgs[segmentArgCount++] = b.CreateGEP(streamSetTy, streamSetArg, fields);
             // produced output items
-            assert (canSetTerminateSignal());
+//            assert (canSetTerminateSignal());
             fields[1] = i32_ONE;
             Value * const itemPtr = b.CreateGEP(streamSetTy, streamSetArg, fields);
             assert (segmentArgCount < doSegment->arg_size());
@@ -918,11 +921,14 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     if (codegen::UseProcessThreadForIO) {
         out << "+IOT";
     }
-    if (!codegen::PreserveAllStreamSetDataOptions.empty()) {
+    if (!codegen::ThreadLocalPermittedOptions.empty()) {
         out << "+TLP:" << codegen::ThreadLocalPermittedOptions;
     }
     if (!codegen::PreserveAllStreamSetDataOptions.empty()) {
         out << "+PAS:" << codegen::PreserveAllStreamSetDataOptions;
+    }
+    if (!codegen::DoubleStreamSetSizeOptions.empty()) {
+        out << "+DSS:" << codegen::DoubleStreamSetSizeOptions;
     }
     if (LLVM_UNLIKELY(codegen::AnyDebugOptionIsSet())) {
         if (LLVM_UNLIKELY(StatisticsOptionIsSet(codegen::EnableCycleCounter))) {

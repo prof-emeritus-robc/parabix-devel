@@ -2,32 +2,34 @@
  *  Part of the Parabix Project, under the Open Software License 3.0.
  *  SPDX-License-Identifier: OSL-3.0
  *
- *  BPE tokenizer — range-kernel design (id-range accumulator).
+ *  BPE tokenizer — merge-kernel design (real BPE merge on the id stream).
  *
  *  Algorithm
  *  ─────────
- *  Preprocessing (buildVocabRanges, before any kernel):
- *      Group length>=2 tokens by id-RANGE (256-wide over [0,1024) → the
- *      256_511 / 512_767 / 768_1023 kernels, then 1000-wide above). Single bytes
- *      (length 1) are not grouped — they seed the byte-level fallback. Tokens
- *      within a range are sorted by id ASC. Priority = LOWER vocab id wins.
+ *  Preprocessing (buildMergeRuleRanges, before any kernel):
+ *      Read merges.txt; each line "A B" is a merge A+B→AB with rank = line index
+ *      and id = 256 + rank (lower rank wins). Resolve parts → MergeRule
+ *      {idA, idB, lenB, idAB} via the base alphabet + earlier merge outputs (no
+ *      vocab.json needed). Group rules by idAB-RANGE (256-wide over [0,1024),
+ *      1000-wide above → 53 groups), sorted by idAB ASC = rank ASC.
  *
- *  Runtime pipeline (one BPERangeKernel per id-range, lowest range first):
- *      BPERangeSeed   — source = single-byte id per byte, active = 1s, end = 0s.
- *      BPERangeKernel — per range: detect its tokens START-anchored, drop a match
- *                       whose span touches a byte an EARLIER range consumed (the
- *                       `active` mask) or one a lower-id token in the SAME range
- *                       already took (in-kernel `fill`), write the id at the match
- *                       END into `source`, shrink `active`, grow `end`.
- *                       (source, active, end) thread kernel→kernel (fresh buffers).
- *      BPEEmitTrigger — matchEnd = active OR end. `source` already holds the
- *                       single-byte id at every unconsumed byte → free fallback.
+ *  Runtime pipeline (one BPEMergeKernel per id-range, lowest range first):
+ *      BPERangeSeed   — source = base id of each RAW byte, active = 1s, end = 0s.
+ *      BPEMergeKernel — per range, per rule (rank order): Aend = EQ(source,idA);
+ *                       merge = Advance(Aend,lenB) AND EQ(source,idB); stamp idAB
+ *                       at the merge end via Sel. `source` threads kernel→kernel,
+ *                       so a higher-rank merge sees ids stamped by lower-rank ones
+ *                       (the Ġthe→Ġthey cascade). All ops forward — no LookAhead.
+ *
+ *  Emission (Stage-B debug): matchEnd = active (all ones) → the id at EVERY byte
+ *  is printed, so stale interior ids of swallowed parts still show. Correct
+ *  emission (consume swallowed ends) is Stage C — not done.
  *
  *  Cache keys
  *  ──────────
- *  BPERangeKernel name encodes hashTokenSet(the range's (token,id) list), so two
- *  vocab files producing the same range shape but different tokens still get
- *  distinct cache entries.
+ *  BPEMergeKernel name encodes hashRuleSet(the group's rule list), so two merges
+ *  files producing the same range shape but different rules still get distinct
+ *  cache entries.
  */
 
 #include "bpe.h"
@@ -51,22 +53,6 @@ using namespace pablo;
 using namespace kernel;
 
 namespace {
-
-// Rolling hash over a pass's token list — disambiguates JIT cache entries when
-// different vocab files produce a pass whose Pablo body differs but whose shape
-// (pass index, token count) would otherwise collide.
-uint64_t hashTokenSet(const std::vector<std::pair<std::string,unsigned>> & tokens) {
-    uint64_t h = 0xCBF29CE484222325ull;
-    for (const auto & [tok, id] : tokens) {
-        for (unsigned char c : tok) {
-            h ^= static_cast<uint64_t>(c);
-            h *= 1099511628211ull;
-        }
-        h ^= static_cast<uint64_t>(id);
-        h *= 1099511628211ull;
-    }
-    return h;
-}
 
 // Hash the byte->single-byte-id table so BPERangeSeed's cache name is unique per
 // vocab. Without this the seed kernel (name has no token data) collides across
@@ -165,197 +151,119 @@ private:
     std::vector<int> mByteIds;
 };
 
-// BPERangeKernel — one id-range (e.g. tokens 256..511). Tokens are sorted by id
-// ASC: lower id wins, occupying its span first; a higher-id token starting on an
-// already-filled byte is dropped (in-range), and any token whose span touches a
-// byte an EARLIER range consumed is dropped (cross-range, via `active`).
-// detect tokens → validate spans → resolve conflicts → emit updated state
-class BPERangeKernel : public PabloKernel {
+// Hash a rule group's (idA,idB,idAB,lenB) list → unique cache name per kernel,
+// since the Pablo body is data-dependent (same shape, different rules).
+uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    auto mix = [&](uint64_t x){ h = (h ^ x) * 0x100000001B3ull; };
+    for (const auto & r : rules) { mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenB); }
+    return h;
+}
+
+// BPEMergeKernel — one id-range, REAL BPE merge on the id stream (Stage B).
+// `source` carries a token id at each token's END byte (seeded = base id per
+// raw byte). For each rule (A,B → AB), in idAB-ASC = rank-ASC order:
+//     Aend  = EQ(source, idA)                 // where token A currently ends
+//     merge = Advance(Aend, lenB) AND EQ(source, idB)   // B ends lenB bytes later
+//     source ← Sel(merge, idAB, source)       // stamp merged id at AB's end (B-end)
+// The accumulator (idAcc) threads through the rules, so a merge sees ids stamped
+// by earlier (lower-rank) merges in the SAME kernel (e.g. Ġthe before Ġthey).
+// All ops are forward (Advance on a derived stream — legal); no LookAhead needed.
+// NOTE (Stage C, not done): the swallowed A-end is NOT cleared here, so emission
+// double-counts until a follow-up consume kernel removes interior ends.
+class BPEMergeKernel : public PabloKernel {
 public:
-    BPERangeKernel(LLVMTypeSystemInterface & ts,
-                   StreamSet * basis, StreamSet * sourceIn, StreamSet * activeIn, StreamSet * endIn,
-                   StreamSet * sourceOut, StreamSet * activeOut, StreamSet * endOut,
-                   std::vector<std::pair<std::string,unsigned>> tokens,
-                   unsigned maxLen, uint64_t shapeHash)
-    : PabloKernel(ts, "BPERange_h" + std::to_string(shapeHash),
-                  {Binding{"basis",    basis,    FixedRate(), LookAhead(maxLen > 1 ? maxLen - 1 : 1)},
-                   Binding{"sourceIn", sourceIn},
-                   Binding{"activeIn", activeIn, FixedRate(), LookAhead(maxLen > 1 ? maxLen - 1 : 1)},
-                   Binding{"endIn",    endIn}},
-                  {Binding{"sourceOut", sourceOut},
-                   Binding{"activeOut", activeOut},
-                   Binding{"endOut",    endOut}}),
-      mTokens(std::move(tokens)) {}
+    BPEMergeKernel(LLVMTypeSystemInterface & ts,
+                   StreamSet * sourceIn, StreamSet * sourceOut,
+                   std::vector<MergeRule> rules, uint64_t shapeHash)
+    : PabloKernel(ts, "BPEMerge_h" + std::to_string(shapeHash),
+                  {Binding{"sourceIn", sourceIn}},
+                  {Binding{"sourceOut", sourceOut}}),
+      mRules(std::move(rules)) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
-        std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
-        std::vector<PabloAST*> srcBits   = getInputStreamSet("sourceIn");
-        PabloAST * activeIn = getInputStreamSet("activeIn")[0];
-        PabloAST * endIn    = getInputStreamSet("endIn")[0];
-
+        std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
-        BixNum sym0(basisBits.begin(), basisBits.end());
 
-        // laByte(i) = byte at offset +i from the start, as a BixNum built from
-        // LookAhead of the INPUT basis bits (legal). Memoized per offset.
-        std::unordered_map<unsigned, BixNum> laByteCache;
-        auto laByte = [&](unsigned i) -> const BixNum & {
-            auto it = laByteCache.find(i);
-            if (it != laByteCache.end()) return it->second;
-            BixNum b;
-            if (i == 0) b = sym0;
-            else for (PabloAST * bit : basisBits) b.push_back(pb.createLookahead(bit, i));
-            return laByteCache.emplace(i, std::move(b)).first->second;
-        };
-        // factor(b,i) = (byte[start+i] == b). Memoized per (b,i).
-        // Give me a bitstream that is 1 wherever the byte at offset i equals value b
-        std::unordered_map<uint64_t, PabloAST*> factorCache;
-        auto factor = [&](uint8_t b, unsigned i) -> PabloAST* {
-            uint64_t key = (static_cast<uint64_t>(b) << 32) | i;
-            auto it = factorCache.find(key);
-            if (it != factorCache.end()) return it->second;
-            PabloAST * f = bnc.EQ(laByte(i), b);
-            factorCache[key] = f;
-            return f;
-        };
-        // spanActive(L) = full span [s..s+L-1] all active (no byte consumed by an
-        // earlier range). LookAhead on the input activeIn — legal. Memoized per L.
-        // checks the entire span for availibility 
-        std::unordered_map<unsigned, PabloAST*> spanCache;
-        auto spanActive = [&](unsigned L) -> PabloAST* {
-            auto it = spanCache.find(L);
-            if (it != spanCache.end()) return it->second;
-            PabloAST * acc = activeIn;
-            for (unsigned k = 1; k < L; k++) acc = pb.createAnd(acc, pb.createLookahead(activeIn, k));
-            spanCache[L] = acc;
-            return acc;
-        };
-
-        // Plain dataflow accumulators (expression DAG, assigned to outputs once).
-        PabloAST * fill   = zeroes;                      // Mask of bytes this range consumes
-        PabloAST * endAcc = endIn;                       // token-end positions (threaded)
-        std::vector<PabloAST*> idAcc(16);                // source bixnum (threaded)
+        std::vector<PabloAST*> idAcc(16);                 // threaded id stream
         for (unsigned i = 0; i < 16; i++)
             idAcc[i] = (i < srcBits.size()) ? srcBits[i] : zeroes;
 
-        // mTokens is sorted by id ASC → lower id wins: it occupies its span first,
-        // and a higher-id token whose start lands on an already-filled byte is
-        // dropped (start-bit `fill` gate). Cross-range conflicts are dropped by
-        // the `active` span gate (a span touching an earlier range's byte fails).
-        for (const auto & [tok, vid] : mTokens) {
-            unsigned L = static_cast<unsigned>(tok.size());
-            PabloAST * startM = ones;                       // start-anchored detect
-            for (unsigned i = 0; i < L; i++)
-                startM = pb.createAnd(startM, factor(static_cast<uint8_t>(tok[i]), i));
-            PabloAST * validStart = pb.createAnd(pb.createAnd(startM, spanActive(L)), pb.createNot(fill));
-            PabloAST * span = validStart;                   // occupy [s..s+L-1]
-            for (unsigned k = 1; k < L; k++) span = pb.createOr(span, pb.createAdvance(validStart, k));
-            fill = pb.createOr(fill, span);
-            PabloAST * endM = (L <= 1) ? validStart : pb.createAdvance(validStart, L - 1);
-            endAcc = pb.createOr(endAcc, endM);
-            for (unsigned i = 0; i < 16; i++)               // write id at end (T2-style Sel)
-                idAcc[i] = pb.createSel(endM, ((vid >> i) & 1u) ? ones : zeroes, idAcc[i]);
+        for (const auto & r : mRules) {
+            BixNum cur(idAcc.begin(), idAcc.end());        // current (mutated) id stream
+            PabloAST * Aend  = bnc.EQ(cur, r.idA);         // A ends here
+            PabloAST * Bend  = bnc.EQ(cur, r.idB);         // B ends here
+            PabloAST * merge = pb.createAnd(pb.createAdvance(Aend, r.lenB), Bend); // AB ends here
+            for (unsigned i = 0; i < 16; i++)              // stamp idAB at merge (T2-style Sel)
+                idAcc[i] = pb.createSel(merge, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
         }
 
-        pb.createAssign(pb.createExtract(getOutputStreamVar("activeOut"), pb.getInteger(0)),
-                        pb.createAnd(activeIn, pb.createNot(fill)));
-        pb.createAssign(pb.createExtract(getOutputStreamVar("endOut"), pb.getInteger(0)), endAcc);
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < 16; i++)
             pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);
     }
 private:
-    std::vector<std::pair<std::string,unsigned>> mTokens;
-};
-// where tokens should be emitted (output).
-// BPEEmitTrigger — matchEnd = end OR active. At an end position `source` holds a
-// multi-byte token id; at an active (unconsumed) position it holds a single-byte
-// id; interior consumed bytes are neither, so they are not emitted.
-class BPEEmitTrigger : public PabloKernel {
-public:
-    BPEEmitTrigger(LLVMTypeSystemInterface & ts, StreamSet * active, StreamSet * end, StreamSet * matchEnd)
-    : PabloKernel(ts, "BPEEmitTrigger",
-                  {Binding{"active", active}, Binding{"end", end}},
-                  {Binding{"matchEnd", matchEnd}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        pb.createAssign(pb.createExtract(getOutputStreamVar("matchEnd"), pb.getInteger(0)),
-                        pb.createOr(getInputStreamSet("active")[0], getInputStreamSet("end")[0]));
-    }
+    std::vector<MergeRule> mRules;
 };
 
-// ─── Pipeline (range-kernel design) ──────────────────────────────────────────
-// buildBPEPassPipeline
-//   1. buildVocabRanges() groups length>=2 tokens by id-RANGE, ascending
-//      (preprocessing; lower vocab id = higher priority). Ranges run lowest first.
-//   2. BPERangeSeed seeds (source = single-byte id per byte, active = 1s, end = 0s).
-//   3. For each range (ascending): one BPERangeKernel detects its tokens
-//      start-anchored, drops a match whose span touches a byte an earlier range
-//      consumed (active) or a lower-id token in the same range took (fill), writes
-//      the id at the match end into `source`, shrinks `active`, grows `end`.
-//      (source, active, end) thread kernel→kernel via fresh buffers.
-//   4. BPEEmitTrigger derives matchEnd = active OR end; vocabID = source.
+// ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
+// buildBPEPassPipeline — real BPE merge on the id stream.
+//   1. buildMergeRuleRanges() groups merges into 53 id-ranges (rank order).
+//   2. BPERangeSeed seeds source = base id of each RAW byte (active=1s, end=0s).
+//   3. One BPEMergeKernel per range (ascending = rank order) glues adjacent ids:
+//      for each rule (A,B→AB) it detects A's end, checks B at +lenB, stamps idAB.
+//      `source` threads kernel→kernel; lower-rank merges feed higher-rank ones.
+//   Returns (matchEnd, vocabID=source). NOTE: emission is Stage-B debug —
+//   matchEnd = active (all ones) prints the id at EVERY byte, so stale interior
+//   ids of swallowed parts still show. Correct emission (consume) is Stage C.
 BPEPassResult buildBPEPassPipeline(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
         const BPETokenizer & bpe) {
 
-    // Range-kernel design (Kernel256_511, Kernel512_767, …). buildVocabRanges
-    // groups tokens by id-range; one BPERangeKernel per range accumulates ids
-    // into `source`, shrinks `active`, grows `end`, lowest-id range first. The
-    // unconsumed-byte id already lives in `source` (seeded) → free byte-level
-    // fallback, no FinalOr.
-    // Build the length>=2 priority ranges from merges.txt when --merges is
-    // supplied (rank-ordered, lower rank wins); else fall back to the vocab-id
-    // partition. Single bytes always seed the fallback (singleByteIds, vocab).
-    auto ranges = bpe.hasMerges() ? bpe.buildMergeRanges() : bpe.buildVocabRanges();
+    auto ruleRanges = bpe.buildMergeRuleRanges();
 
-    // debug: dump the merge-range groups to stderr (merges path only)
-    if (bpe.hasMerges()) {
-        std::cerr << "[BPE] " << ranges.size() << " merge-range kernels\n";
-        for (const auto & g : ranges)
-            std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.tokens.size()
-                      << " maxLen=" << g.maxLen << "\n";
+    // debug: dump the merge-range groups to stderr
+    std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels\n";
+    for (const auto & g : ruleRanges)
+        std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.rules.size()
+                  << " maxLen=" << g.maxLen << "\n";
+
+    // BPE_RULES=1: dump the resolved merge rules. BPE_RULES_N caps per group (4).
+    if (std::getenv("BPE_RULES")) {
+        unsigned cap = 4;
+        if (const char * n = std::getenv("BPE_RULES_N")) cap = std::atoi(n);
+        for (const auto & g : ruleRanges)
+            for (unsigned i = 0; i < g.rules.size() && i < cap; i++) {
+                const auto & r = g.rules[i];
+                std::cerr << "    idA=" << r.idA << " idB=" << r.idB
+                          << " lenB=" << r.lenB << " -> idAB=" << r.idAB << "\n";
+            }
     }
 
-    // Seed: source = single-byte id per byte, active = ones, end = zeroes.
-    // source - stores token IDs
-    // active - bitmask: “this position is still usable”
-    // end - marks token endings
+    // Seed: source = base id of each raw byte, active = ones, end = zeroes.
     StreamSet * source = P.CreateStreamSet(16, 1);
     StreamSet * active = P.CreateStreamSet(1, 1);
     StreamSet * end    = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<BPERangeSeed>(basis, source, active, end, bpe.singleByteIds());
     if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "seed")
-        return {active, source};   // dump seed source at every (seed-active) position
+        return {active, source};   // dump seed source at every byte
 
-    // One kernel per id-range, threaded in order. Fresh buffers (NOT InOut): the
-    // multi-byte detection + span mask need LookAhead, which is illegal on an
-    // InOut/derived stream and on a deep alias chain; fresh buffers carry the
-    // identical source/active/end dataflow the spec describes.
-    for (auto & g : ranges) {
-        if (g.tokens.empty()) continue;
-        uint64_t shape = hashTokenSet(g.tokens);
+    // One BPEMergeKernel per id-range, ascending = rank order. Fresh buffers
+    // thread `source` kernel→kernel so a higher-rank merge sees ids stamped by
+    // lower-rank merges (the Ġthe→Ġthey cascade).
+    for (auto & g : ruleRanges) {
+        if (g.rules.empty()) continue;
         StreamSet * sOut = P.CreateStreamSet(16, 1);
-        StreamSet * aOut = P.CreateStreamSet(1, 1);
-        StreamSet * eOut = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<BPERangeKernel>(basis, source, active, end,
-                                           sOut, aOut, eOut, g.tokens, g.maxLen, shape);
-        source = sOut; active = aOut; end = eOut;
+        P.CreateKernelCall<BPEMergeKernel>(source, sOut, g.rules, hashRuleSet(g.rules));
+        source = sOut;
     }
 
-    // matchEnd = active OR end; vocabID = source.
-    // BPE_DBG=active|end routes that stream alone into matchEnd for debugging.
-    const char * dbg = std::getenv("BPE_DBG");
-    if (dbg && std::string(dbg) == "active") return {active, source};
-    if (dbg && std::string(dbg) == "end")    return {end, source};
-    StreamSet * matchEnd = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<BPEEmitTrigger>(active, end, matchEnd);
-    return {matchEnd, source};
+    // matchEnd = active (all ones) → emit every byte (Stage-B debug). vocabID = source.
+    return {active, source};
 }
 
 // buildLinePretokens
@@ -419,6 +327,39 @@ bool BPETokenizer::loadVocab(const std::string & path) {
     return !vocab_.empty();
 }
 
+// buildBaseAlphabet generates the GPT-2 byte-level base alphabet
+// (bytes_to_unicode): 256 tokens, each the UTF-8 encoding of a code point, with
+// id == its position in the alphabet. Reproduces vocab.json ids 0..255 exactly,
+// so merges.txt + this table need no vocab.json. Also fills baseByteId_[v] = id
+// of the single-byte token for raw byte value v (the byte-level fallback).
+void BPETokenizer::buildBaseAlphabet() {
+    if (!baseByteId_.empty()) return;                // build once
+    bool printable[256] = {false};                   // bytes kept as their own code point
+    for (int b = 33;  b <= 126; ++b) printable[b] = true;
+    for (int b = 161; b <= 172; ++b) printable[b] = true;
+    for (int b = 174; b <= 255; ++b) printable[b] = true;
+    std::vector<int> cps, bytes;                      // code point + raw byte per position
+    for (int b = 0; b < 256; ++b) if (printable[b]) { cps.push_back(b); bytes.push_back(b); }
+    int n = 0;                                        // non-printables map to 256+n
+    for (int b = 0; b < 256; ++b) if (!printable[b]) { cps.push_back(256 + n++); bytes.push_back(b); }
+
+    auto utf8 = [](int cp) {                          // all cps < 0x800 here → ≤ 2 bytes
+        std::string s;
+        if (cp < 0x80) s.push_back(static_cast<char>(cp));
+        else { s.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+               s.push_back(static_cast<char>(0x80 | (cp & 0x3F))); }
+        return s;
+    };
+    baseByteId_.assign(256, -1);
+    for (size_t i = 0; i < cps.size(); ++i) {         // i == base id
+        std::string tok = utf8(cps[i]);
+        vocab_[tok] = static_cast<int>(i);
+        if (i >= idToToken_.size()) idToToken_.resize(i + 1);
+        idToToken_[i] = tok;
+        baseByteId_[bytes[i]] = static_cast<int>(i);
+    }
+}
+
 // loadMerges reads a HuggingFace merges.txt. Each non-header line "A B" defines a
 // merge producing token AB (concat). The line index (0-based, after the #version
 // header) is the merge RANK = priority — lower rank wins. In GPT-2 the merged
@@ -432,6 +373,7 @@ bool BPETokenizer::loadMerges(const std::string & path) {
         return false;
     }
     constexpr unsigned BYTE_BASE = 256;          // ids 0..255 = byte-level base alphabet
+    buildBaseAlphabet();                         // seed the 256 base tokens (self-sufficient)
     std::string line;
     unsigned rank = 0;
     while (std::getline(file, line)) {
@@ -444,9 +386,11 @@ bool BPETokenizer::loadMerges(const std::string & path) {
         // literal space (it is encoded as Ġ), so the first space is the boundary.
         auto sp = line.find(' ');
         if (sp == std::string::npos) continue;
-        std::string tok = line.substr(0, sp) + line.substr(sp + 1);
+        std::string a = line.substr(0, sp);
+        std::string b = line.substr(sp + 1);
+        std::string tok = a + b;
         unsigned id = BYTE_BASE + rank;
-        merges_.push_back({tok, id});
+        merges_.push_back({a, b, id});                   // keep parts for the merge loop
         // Also feed the forward/reverse maps so isLoaded()/decodeToken work when
         // merges.txt is the sole source (e.g. --vocab=merges.txt). Idempotent
         // when vocab.json was already loaded: same token → same id (= 256+rank).
@@ -466,6 +410,10 @@ std::string BPETokenizer::decodeToken(int id) const {
 
 // byte value b -> id of the single-byte token "b" (-1 if the vocab has none).
 std::vector<int> BPETokenizer::singleByteIds() const {
+    // Merges/base-alphabet path: every raw byte 0..255 has a base id (covers the
+    // 2-byte base tokens like Ġ that a tok.size()==1 scan would miss).
+    if (!baseByteId_.empty()) return baseByteId_;
+    // Legacy --vocab-only path: only ASCII printables are size-1 tokens.
     std::vector<int> t(256, -1);
     for (const auto & [tok, id] : vocab_)
         if (tok.size() == 1) t[static_cast<uint8_t>(tok[0])] = id;
@@ -473,89 +421,50 @@ std::vector<int> BPETokenizer::singleByteIds() const {
 }
 
 
-// ─── Range partitioning (range-kernel design) ────────────────────────────────
-// Group length>=2 tokens by id-range. Ranges: 256-wide over [0,1024)
-// (→ 256_511, 512_767, 768_1023), then RANGE_WIDTH-wide above. One BPERangeKernel
-// per group, run lowest-id-range first (so lower id wins).
-std::vector<RangeGroup> BPETokenizer::buildVocabRanges() const {
-    constexpr unsigned RANGE_WIDTH = 1000;          // width of ranges above id 1024
-
-    // rangeLo(id): lower bound of id's range.
+// ─── Range partitioning (merge-kernel design) ────────────────────────────────
+// buildMergeRuleRanges — resolve each raw merge (parts A,B + idAB) into a
+// MergeRule {idA,idB,idAB,lenA,lenB} via the base alphabet + earlier merge
+// outputs, then group by idAB-range (256-wide over [0,1024), 1000-wide above),
+// sorted by idAB ASC = rank ASC. This is the data the merge-loop kernel consumes.
+std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
+    constexpr unsigned RANGE_WIDTH = 1000;
     auto rangeLo = [](unsigned id) -> unsigned {
-        if (id < 1024) return (id / 256) * 256;     // 0, 256, 512, 768
-        return 1024 + ((id - 1024) / RANGE_WIDTH) * RANGE_WIDTH;
-    };
-    // rangeHi(lo): upper bound of id's range (exclusive).
-    auto rangeHi = [&](unsigned lo) -> unsigned {
-        return lo < 1024 ? lo + 256 : lo + RANGE_WIDTH;
-    };
-
-    // create map of ranges 
-    std::map<unsigned, RangeGroup> byRange;          // keyed by lo, ascending
-    // loop through vocab, group tokens by their id-range, and populate the RangeGroup structure
-    for (const auto & [tok, id] : vocab_) {
-        if (tok.size() < 2) continue;                // single bytes = seeded fallback
-        unsigned lo = rangeLo(static_cast<unsigned>(id));
-        RangeGroup & g = byRange[lo];
-        g.lo = lo;
-        g.hi = rangeHi(lo);
-        // fine the maximum token length in this range for LookAhead purposes
-        // it sets the kernel's LookAhead binding size later 
-        if (tok.size() > g.maxLen) g.maxLen = static_cast<unsigned>(tok.size());
-        // add the token and its id to the range's token list
-        g.tokens.push_back({tok, static_cast<unsigned>(id)});
-    }
-
-    // final result 
-    std::vector<RangeGroup> ranges;
-    // sort each range's tokens by id ascending (lower id wins in-range)
-    for (auto & [lo, g] : byRange) {
-        std::sort(g.tokens.begin(), g.tokens.end(),  
-                  [](const auto & a, const auto & b) { return a.second < b.second; });
-        ranges.push_back(std::move(g));
-    }
-    return ranges;
-}
-
-
-// buildMergeRanges — same id-range partition as buildVocabRanges, but the
-// length>=2 token set + priority come from merges.txt (merges_: token, id =
-// 256 + rank) instead of the vocab.json keys. Lower rank (= lower id) wins.
-std::vector<RangeGroup> BPETokenizer::buildMergeRanges() const {
-    constexpr unsigned RANGE_WIDTH = 1000;          // width of ranges above id 1024
-
-    auto rangeLo = [](unsigned id) -> unsigned {
-        if (id < 1024) return (id / 256) * 256;     // 0, 256, 512, 768
+        if (id < 1024) return (id / 256) * 256;
         return 1024 + ((id - 1024) / RANGE_WIDTH) * RANGE_WIDTH;
     };
     auto rangeHi = [&](unsigned lo) -> unsigned {
         return lo < 1024 ? lo + 256 : lo + RANGE_WIDTH;
     };
 
-    std::map<unsigned, RangeGroup> byRange;          // keyed by lo, ascending
-    for (const auto & [tok, id] : merges_) {
-        if (tok.size() < 2) continue;                // merges are always len>=2; guard
-        unsigned lo = rangeLo(id);
-        RangeGroup & g = byRange[lo];
+    std::map<unsigned, MergeRuleGroup> byRange;
+    unsigned skipped = 0;                            // parts not found in the vocab
+    for (const auto & m : merges_) {
+        auto ia = vocab_.find(m.a);
+        auto ib = vocab_.find(m.b);
+        if (ia == vocab_.end() || ib == vocab_.end()) { ++skipped; continue; }
+        MergeRule r;
+        r.idA  = static_cast<unsigned>(ia->second);
+        r.idB  = static_cast<unsigned>(ib->second);
+        r.idAB = m.idAB;
+        r.lenA = static_cast<unsigned>(m.a.size());
+        r.lenB = static_cast<unsigned>(m.b.size());
+        unsigned lo = rangeLo(r.idAB);
+        MergeRuleGroup & g = byRange[lo];
         g.lo = lo;
         g.hi = rangeHi(lo);
-        if (tok.size() > g.maxLen) g.maxLen = static_cast<unsigned>(tok.size());
-        g.tokens.push_back({tok, id});
+        unsigned mergedLen = r.lenA + r.lenB;
+        if (mergedLen > g.maxLen) g.maxLen = mergedLen;
+        g.rules.push_back(r);
     }
+    if (skipped)
+        std::cerr << "BPE: buildMergeRuleRanges skipped " << skipped
+                  << " merges whose parts are not in the vocab\n";
 
-    std::vector<RangeGroup> ranges;
-    for (auto & [lo, g] : byRange) {                 // sort by id ASC = rank ASC
-        std::sort(g.tokens.begin(), g.tokens.end(),
-                  [](const auto & a, const auto & b) { return a.second < b.second; });
+    std::vector<MergeRuleGroup> ranges;
+    for (auto & [lo, g] : byRange) {                 // sort by idAB ASC = rank ASC
+        std::sort(g.rules.begin(), g.rules.end(),
+                  [](const MergeRule & a, const MergeRule & b) { return a.idAB < b.idAB; });
         ranges.push_back(std::move(g));
     }
     return ranges;
 }
-
-
-// passes from longest to shortest?
-// longest wins priority? not needed 
-// no subset overlap ? TODO?
-// each kernel one pass and each pass is of a specific length ?
-// kernel generation should make one kernel for each pass - of each length group in the pass design. 
-// Each kernel gets the tokens for that pass+length, generates the trie, and detects them all together. The kernels are mutually independent, so no overlap logic is needed in them — the pass design guarantees that within one pass, no two tokens can match at the same end position (their byte values would have to be identical), so the first match is the only match. The mask gate and occupy kernels then resolve overlaps across passes by pass/length order + the mask, so no overlap logic is needed in them either.

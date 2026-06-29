@@ -16,12 +16,27 @@ namespace kernel {
     class StreamSet;
 }
 
-// One id-range for the range-kernel design (BPERangeKernel). Tokens are sorted
-// by id ASC; maxLen drives the kernel's LookAhead binding.
-struct RangeGroup {
-    unsigned lo = 0, hi = 0;                                // id range [lo, hi)
-    unsigned maxLen = 0;                                    // longest token byte length
-    std::vector<std::pair<std::string, unsigned>> tokens;   // len>=2, sorted by id ASC
+// Raw merge rule as read from merges.txt: the two already-formed parts A,B and
+// the merged token id (== 256 + rank). Part ids/lengths are resolved later
+// against the full vocab (base-byte parts like "y" live only in vocab.json).
+struct MergeRaw {
+    std::string a, b;        // the two merged parts (byte strings)
+    unsigned    idAB = 0;    // id of A+B  (= 256 + rank)
+};
+
+// One resolved merge for the merge-loop kernel: detect idA-end, check idB at
+// +lenB, stamp idAB at the merge end. lenB = byte length of B = Advance distance.
+struct MergeRule {
+    unsigned idA = 0, idB = 0, idAB = 0;
+    unsigned lenA = 0, lenB = 0;        // byte lengths of the two parts
+};
+
+// One id-range group of merge rules, sorted by idAB ASC (= rank ASC). maxLen =
+// longest merged-token byte length in the group.
+struct MergeRuleGroup {
+    unsigned lo = 0, hi = 0;
+    unsigned maxLen = 0;
+    std::vector<MergeRule> rules;
 };
 
 class BPETokenizer {
@@ -42,40 +57,43 @@ public:
 
     std::string decodeToken(int id) const;
 
-    // byte value -> vocab id of its single-byte token (-1 if none). Seeds the
-    // range-kernel `source` so every unconsumed byte carries its single-byte id
-    // (the byte-level fallback).
+    // raw byte value -> base-alphabet id (the byte-level fallback). Seeds the
+    // merge accumulator `source` so every byte starts as its single base token.
     std::vector<int> singleByteIds() const;
 
-    // Partition the vocab into id-RANGES for the range-kernel design. One
-    // BPERangeKernel handles one RangeGroup, kernels run lowest-id range first,
-    // so lower id wins. Ranges are 256-wide over [256,1024) (the 256_511,
-    // 512_767, 768_1023 kernels) then RANGE_WIDTH-wide above that. Only length>=2
-    // tokens are partitioned (single bytes are seeded as the byte-level fallback).
-    // tokens within a group are sorted by id ASC.
-    std::vector<RangeGroup> buildVocabRanges() const;
-
-    // Same id-range partition as buildVocabRanges, but the length>=2 token set +
-    // priority come from merges.txt (token = merged pair, id = 256 + rank)
-    // instead of the vocab.json keys. Lower rank wins. Single-byte tokens are
-    // not present in merges.txt — they remain the seeded byte-level fallback
-    // (singleByteIds(), still sourced from vocab.json).
-    std::vector<RangeGroup> buildMergeRanges() const;
+    // Resolve each raw merge (parts A,B + idAB) into a MergeRule (idA, idB,
+    // lenA, lenB, idAB) via the base alphabet + earlier merge outputs, then group
+    // by idAB-range, sorted by idAB ASC = rank ASC. This is the data the
+    // merge-loop kernel consumes: per rule it detects idA's end, checks idB at
+    // +lenB, and stamps idAB. Rules whose parts are unresolvable are skipped
+    // (with a count on stderr).
+    std::vector<MergeRuleGroup> buildMergeRuleRanges() const;
 
 private:
+    // Generate the 256-entry GPT-2 byte-level base alphabet (bytes_to_unicode)
+    // into vocab_/idToToken_ and baseByteId_. Base id == position in the
+    // alphabet (matches vocab.json ids 0..255 exactly). Lets merges.txt be
+    // self-sufficient: every merge part is a base byte or an earlier merge
+    // output, so no vocab.json is required.
+    void buildBaseAlphabet();
+
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string>             idToToken_;
-    // (mergedToken, id = 256 + rank), in rank order. Populated by loadMerges.
-    std::vector<std::pair<std::string, unsigned>> merges_;
+    // Raw merges (parts A,B + idAB = 256 + rank), in rank order. Set by loadMerges.
+    std::vector<MergeRaw>                merges_;
+    // raw byte value (0..255) -> its base-alphabet id. Set by buildBaseAlphabet;
+    // drives singleByteIds() (the byte-level fallback) without vocab.json.
+    std::vector<int>                     baseByteId_;
 };
 
 // buildBPEPassPipeline
-//   Builds the range-kernel BPE pipeline:
-//     - buildVocabRanges() groups length>=2 tokens by id-range (lower id wins).
-//     - BPERangeSeed seeds (source, active, end); one BPERangeKernel per range
-//       (lowest first) detects, gates, and accumulates ids into `source`.
-//     - BPEEmitTrigger derives matchEnd = active OR end.
-//   Returns (matchEnd, vocabID=source). Single bytes are seeded as the fallback.
+//   Builds the merge-kernel BPE pipeline:
+//     - buildMergeRuleRanges() groups merges into id-ranges (rank order).
+//     - BPERangeSeed seeds source = base id of each raw byte (active=1s, end=0s).
+//     - One BPEMergeKernel per range (lowest first) glues adjacent ids into
+//       `source`, threaded kernel→kernel (the Ġthe→Ġthey cascade).
+//   Returns (matchEnd=active, vocabID=source). Emission is Stage-B debug
+//   (emit-all); correct emission (consume swallowed ends) is Stage C.
 struct BPEPassResult {
     kernel::StreamSet * matchEnd;   //  1×1
     kernel::StreamSet * vocabID;    // 16×1 BixNum

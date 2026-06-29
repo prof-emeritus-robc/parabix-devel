@@ -248,7 +248,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
 
     std::cerr << "[BPE] pipeline graph build: "
               << std::chrono::duration<double, std::milli>(__tBuild1 - __tBuild0).count()
-              << " ms (includes buildVocabRanges above)\n";
+              << " ms (includes buildMergeRuleRanges above)\n";
     std::cerr << "[BPE] P.compile() JIT+LLVM: "
               << std::chrono::duration<double, std::milli>(__tCompile1 - __tBuild1).count()
               << " ms\n";
@@ -305,15 +305,21 @@ int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, 
         {&wordBreakerFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
-    // BPE pipeline mode — enabled when --vocab is supplied. --merges is
-    // accepted for CLI compatibility but ignored in the trie pipeline.
-    if (!VocabFile.empty()) {
+    // BPE pipeline mode — enabled when --vocab OR --merges is supplied. merges.txt
+    // is self-sufficient (it generates the 256 base tokens internally), so
+    // --merges alone works without vocab.json.
+    if (!VocabFile.empty() || !MergesFile.empty()) {
         BPETokenizer bpe;
-        if (!bpe.loadVocab(VocabFile))
+        // Optional explicit vocab.json (legacy / id cross-check).
+        if (!VocabFile.empty() && !bpe.loadVocab(VocabFile))
             return 1;
-
-        if (!MergesFile.empty()) {
-            std::cerr << "BPE: --merges is ignored in trie pipeline\n";
+        // --merges: build the priority ranges from merge rank (lower rank wins).
+        // Seeds the base alphabet for the single-byte fallback + --strings decode.
+        if (!MergesFile.empty() && !bpe.loadMerges(MergesFile))
+            return 1;
+        if (!bpe.isLoaded()) {
+            std::cerr << "BPE: no tokens loaded from --vocab/--merges\n";
+            return 1;
         }
 
         gBPE           = &bpe;

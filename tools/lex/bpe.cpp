@@ -188,22 +188,32 @@ protected:
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
 
-        std::vector<PabloAST*> idAcc(16);                 // threaded id stream
+        // idAcc threaded as Pablo Vars (not plain values) so each rule's body can
+        // live inside a createIf scope and carry its mutations out across the gate.
+        std::vector<Var*> idAcc(16);                       // threaded id stream
         for (unsigned i = 0; i < 16; i++)
-            idAcc[i] = (i < srcBits.size()) ? srcBits[i] : zeroes;
+            idAcc[i] = pb.createVar("id" + std::to_string(i),
+                                    (i < srcBits.size()) ? srcBits[i] : zeroes);
 
+        // if a rule's A is not present in the input, the body is skipped 
+        // Single-level createIf only (nested createIf).
         for (const auto & r : mRules) {
-            BixNum cur(idAcc.begin(), idAcc.end());        // current (mutated) id stream
-            PabloAST * Aend  = bnc.EQ(cur, r.idA);         // A ends here
-            PabloAST * Bend  = bnc.EQ(cur, r.idB);         // B ends here
-            PabloAST * merge = pb.createAnd(pb.createAdvance(Aend, r.lenB), Bend); // AB ends here
-            for (unsigned i = 0; i < 16; i++)              // stamp idAB at merge (T2-style Sel)
-                idAcc[i] = pb.createSel(merge, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
+            BixNum cur(idAcc.begin(), idAcc.end());          // current (mutated) id stream
+            PabloAST * Aend = bnc.EQ(cur, r.idA);            // gate: token A ends here
+            auto body = pb.createScope();
+            BixNumCompiler bncB(body);
+            BixNum curB(idAcc.begin(), idAcc.end());
+            PabloAST * Bend  = bncB.EQ(curB, r.idB);         // B ends here
+            PabloAST * merge = body.createAnd(body.createAdvance(Aend, r.lenB), Bend); // AB ends here
+            for (unsigned i = 0; i < 16; i++)                // stamp idAB at merge (B's end)
+                body.createAssign(idAcc[i],
+                    body.createSel(merge, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]));
+            pb.createIf(Aend, body);                         // skip body in blocks with no idA
         }
 
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < 16; i++)
-            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);
+            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // final 16-bit token ID stream
     }
 private:
     std::vector<MergeRule> mRules;
@@ -422,6 +432,7 @@ std::vector<int> BPETokenizer::singleByteIds() const {
 
 
 // ─── Range partitioning (merge-kernel design) ────────────────────────────────
+// creating range groups
 // buildMergeRuleRanges — resolve each raw merge (parts A,B + idAB) into a
 // MergeRule {idA,idB,idAB,lenA,lenB} via the base alphabet + earlier merge
 // outputs, then group by idAB-range (256-wide over [0,1024), 1000-wide above),

@@ -57,7 +57,7 @@ static bool                  gOutputStrings = false;
 extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
     uint16_t id = *id_ptr;
     if (gOutputStrings && gBPE)
-        llvm::outs() << gBPE->decodeToken(static_cast<int>(id)) << "\n";
+        llvm::outs() << id << '\t' << gBPE->decodeToken(static_cast<int>(id)) << "\n";
     else
         llvm::outs() << id << "\n";
 }

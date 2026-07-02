@@ -188,6 +188,15 @@ protected:
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
 
+        //
+        // WITHIN A KERNEL - Out put Stream from one step goes to the next.
+        // cur reads from idAcc and sees the effects of earlier merges in the SAME kernel.
+        //
+        // idAcc starts as a copy of the input (srcBits)
+        // Each rule reads cur from the current idAcc → sees stamps from earlier rules in this same kernel. 
+        // That's the intra-kernel carry.
+        // Final idAcc written to sourceOut → becomes next kernel's input.
+                
         // idAcc threaded as Pablo Vars (not plain values) so each rule's body can
         // live inside a createIf scope and carry its mutations out across the gate.
         std::vector<Var*> idAcc(16);                       // threaded id stream
@@ -262,6 +271,15 @@ BPEPassResult buildBPEPassPipeline(
     if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "seed")
         return {active, source};   // dump seed source at every byte
 
+    //
+    // BETWEEN KERNELS, the source is an input and sOut is the output. 
+    // kernel reads source (seed = raw byte ids), writes sOut. Then source = sOut.
+    // kernel reads that SAME sOut as its input, writes a new one. And so on.
+    // The next kernel's input = the previous kernel's output. 
+    // So kernel N receives the id stream already stamped by kernels 1..N−1. 
+    // It does not re-run their rules — their merges are baked into the ids it reads. 
+    // Each kernel only applies its own range's rules once → no duplicated work.
+    //
     // One BPEMergeKernel per id-range, ascending = rank order. Fresh buffers
     // thread `source` kernel→kernel so a higher-rank merge sees ids stamped by
     // lower-rank merges (the Ġthe→Ġthey cascade).

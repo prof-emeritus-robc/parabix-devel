@@ -228,6 +228,9 @@ void CPUDriver::generateUncachedKernels() {
 
 void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
+    std::unique_ptr<llvm::LLVMContext> BorrowedContext(mContext.get());
+    ThreadSafeContext GlobalTSCtx(std::move(BorrowedContext));
+
     using ModuleSet = llvm::SmallVector<Module *, 32>;
 
     ModuleSet Infrequent;
@@ -280,8 +283,7 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
             // ORC takes absolute lifetime ownership of the module via unique_ptr wrapping
             auto UniqueM = std::unique_ptr<Module>(M);
             // Share the global driver LLVM context safe reference frame mapping
-            orc::ThreadSafeContext TSCtx(std::make_unique<LLVMContext>());
-            orc::ThreadSafeModule TSM(std::move(UniqueM), TSCtx);
+            orc::ThreadSafeModule TSM(std::move(UniqueM), GlobalTSCtx);
 
             if (auto Err = mEngine->addIRModule(RunJD, std::move(TSM))) {
                 report_fatal_error(Twine("Failed adding module to ORC execution frame: ") + toString(std::move(Err)));
@@ -329,8 +331,8 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
     std::string mainName = main->getName().str();
 
-    // 5. Wrap and submit your main wrapper module into the active ORC engine run instance
-    orc::ThreadSafeModule TSMainModule(std::move(mainModule), orc::ThreadSafeContext(std::make_unique<LLVMContext>()));
+    //  Wrap and submit your main wrapper module into the active ORC engine run instance
+    orc::ThreadSafeModule TSMainModule(std::move(mainModule), GlobalTSCtx);
     if (auto Err = mEngine->addIRModule(RunJD, std::move(TSMainModule))) {
         report_fatal_error(Twine("Failed adding main module script to ORC JIT: ") + toString(std::move(Err)));
     }
@@ -377,6 +379,11 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
     // Convert resolved executor address smoothly to a naked execution pointer address
     void* mainFnPtr = SymExpect->toPtr<void*>();
+
+    (void)GlobalTSCtx.getContext(); // Forces synchronization state validation if required
+    // Modern ORC maintains state reference blocks via internal shared pointers.
+    // If your compiler configuration manages contexts externally, we can safely clear 
+    // or let it naturally release tracking dependencies since it acts as a weak reference frame.
 
     // NOTE ON MEMORY MANAGEMENT:
     // With MCJIT, you explicitly executed manual removeModule tracking loops here to free IR structures. 

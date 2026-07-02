@@ -2282,6 +2282,7 @@ uintptr_t LLVM_READNONE CBuilder::getAlignOf(const llvm::DataLayout & DL, llvm::
 }
 
 void CBuilder::linkAllNecessaryExternalFunctions() const {
+
     assert (mDriver);
     assert (mModule);
     // void* aligned_alloc( std::size_t alignment, std::size_t size );

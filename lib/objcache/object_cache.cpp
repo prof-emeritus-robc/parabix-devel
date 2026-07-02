@@ -89,6 +89,18 @@ inline bool isNonMatchingSignature(const MDString * const received, const String
     return expected.compare(received->getString()) != 0;
 }
 
+// Helper utility to safely strip off our ORC finalize_run salt modifiers
+// and extract the original immutable moduleId string.
+static std::string getCleanCacheKey(const llvm::Module *M) {
+    if (!M) return "";
+    std::string Key = M->getModuleIdentifier();
+    size_t pos = Key.find("_run_");
+    if (pos != std::string::npos) {
+        Key = Key.substr(0, pos);
+    }
+    return Key;
+}
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedObjectFile
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -105,7 +117,11 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
             const auto moduleId = kernel->makeCacheName(b);
             errs() << "Already compiled: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
         }
-        kernel->setModule(f->second);
+        // ORC JIT FIX: Under MCJIT, we reused the raw f->second pointer layout.
+        // Under ORC, the compiler physically claims absolute lifetime ownership of the module
+        // and destroys it upon compilation completion. We must instantiate a clean structural
+        // stub declaration module wrapper to safely satisfy the pipeline driver's state expectations.
+        kernel->makeModule(b);
         kernel->setCompilationStatus(kernel::Kernel::CompilationStatus::UnownedModule);
         return CacheObjectResult::COMPILED;
     }
@@ -119,7 +135,6 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
         auto kernelBuffer = MemoryBuffer::getFile(fileName, false, false, false);
         if (kernelBuffer) {
             auto loadedFile = getOwningLazyBitcodeModule(std::move(kernelBuffer.get()), b.getContext());
-            // if there was no error when parsing the bitcode
             if (LLVM_LIKELY(loadedFile)) {
 
                 std::unique_ptr<Module> M(std::move(loadedFile.get()));
@@ -144,13 +159,16 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
                     m->setModuleIdentifier(moduleId);
                     b.setModule(m);
                     kernel->loadCachedKernel(b);
+
                     mCachedObject.emplace(moduleId, objectBuffer.get().release());
                     mKnownSignatures.emplace(signature, m);
+
                     // update the modified time of the .o and .kernel files
                     const auto access_time = currentTime();
                     fs::last_write_time(fileName.c_str(), access_time);
                     sys::path::replace_extension(fileName, KERNEL_FILE_EXTENSION);
                     fs::last_write_time(fileName.c_str(), access_time);
+
                     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
                         errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
                     }
@@ -159,16 +177,12 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
             } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
                 errs() << "Failed to load cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
             }
-
         }
 
 invalid:
-
         kernel->makeModule(b);
         Module * const module = kernel->getModule();
-        // mark this module as cachable
         module->getOrInsertNamedMetadata(CACHEABLE);
-        // if this module has a signature, add it to the metadata
         if (LLVM_UNLIKELY(kernel->hasSignature())) {
             NamedMDNode * const md = module->getOrInsertNamedMetadata(SIGNATURE);
             assert (md->getNumOperands() == 0);
@@ -177,9 +191,10 @@ invalid:
             md->addOperand(MDNode::get(module->getContext(), {sig}));
         }
 
-    } else { // uncachable
+    } else {
         kernel->makeModule(b);
     }
+
     mKnownSignatures.emplace(signature, kernel->getModule());
     return CacheObjectResult::UNCACHED;
 }
@@ -191,75 +206,78 @@ invalid:
  ** ------------------------------------------------------------------------------------------------------------- */
 void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef Obj) {
 
-    if (LLVM_LIKELY(M->getNamedMetadata(CACHEABLE) != nullptr)) {
+    if (M->getNamedMetadata(CACHEABLE) == nullptr) return;
 
-        const StringRef moduleId(M->getModuleIdentifier());
+    std::string moduleId = getCleanCacheKey(M);
 
-        Path objectName(mCachePath);
-        sys::path::append(objectName, CACHE_PREFIX);
-        objectName.append(moduleId);
-        objectName.append(OBJECT_FILE_EXTENSION);
+    // Store back into the memory buffer cache system
+    auto CachedBuffer = MemoryBuffer::getMemBufferCopy(Obj.getBuffer(), Obj.getBufferIdentifier());
+    mCachedObject[moduleId] = std::move(CachedBuffer);
 
-        // Write the object code
-        std::error_code EC;
-        raw_fd_ostream objFile(objectName, EC, sys::fs::OF_None);
-        if (LLVM_UNLIKELY(EC)) {
-            SmallVector<char, 512> tmp;
-            llvm::raw_svector_ostream msg(tmp);
-            msg << "Could not write to \""
-                << objectName.str()
-                << "\" in object cache directory.\n\n"
-                "Reason: " << EC.message() << "\n\n"
-                "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
-            report_fatal_error(Twine(msg.str()));
+    Path objectName(mCachePath);
+    sys::path::append(objectName, CACHE_PREFIX);
+    objectName.append(moduleId);
+    objectName.append(OBJECT_FILE_EXTENSION);
+
+    // Write the object code
+    std::error_code EC;
+    raw_fd_ostream objFile(objectName, EC, sys::fs::OF_None);
+    if (LLVM_UNLIKELY(EC)) {
+        SmallVector<char, 512> tmp;
+        llvm::raw_svector_ostream msg(tmp);
+        msg << "Could not write to \""
+            << objectName.str()
+            << "\" in object cache directory.\n\n"
+            "Reason: " << EC.message() << "\n\n"
+            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
+        report_fatal_error(Twine(msg.str()));
+    }
+    objFile.write(Obj.getBufferStart(), Obj.getBufferSize());
+    objFile.close();
+
+    sys::path::replace_extension(objectName, KERNEL_FILE_EXTENSION);
+    raw_fd_ostream kernelFile(objectName.str(), EC, sys::fs::OF_None);
+
+    if (LLVM_UNLIKELY(EC)) {
+        SmallVector<char, 512> tmp;
+        llvm::raw_svector_ostream msg(tmp);
+        msg << "Could not write to \""
+            << objectName.str()
+            << "\" in object cache directory.\n\n"
+            "Reason: " << EC.message() << "\n\n"
+            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
+        report_fatal_error(Twine(msg.str()));
+    }
+
+    // Clone the function prototypes and metadata to minimize the size of the stored .kernel file.
+    std::unique_ptr<Module> H(new Module(moduleId, M->getContext()));
+    H->setTargetTriple(M->getTargetTriple());
+    H->setDataLayout(M->getDataLayout());
+    for (const Function & f : M->getFunctionList()) {
+        if (f.hasExternalLinkage() && !f.empty()) {
+            Function::Create(f.getFunctionType(), Function::ExternalLinkage, f.getName(), H.get());
         }
-        objFile.write(Obj.getBufferStart(), Obj.getBufferSize());
-        objFile.close();
-
-        sys::path::replace_extension(objectName, KERNEL_FILE_EXTENSION);
-        raw_fd_ostream kernelFile(objectName.str(), EC, sys::fs::OF_None);
-
-        if (LLVM_UNLIKELY(EC)) {
-            SmallVector<char, 512> tmp;
-            llvm::raw_svector_ostream msg(tmp);
-            msg << "Could not write to \""
-                << objectName.str()
-                << "\" in object cache directory.\n\n"
-                "Reason: " << EC.message() << "\n\n"
-                "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
-            report_fatal_error(Twine(msg.str()));
+    }
+    for (const auto & og : M->named_metadata()) {
+        NamedMDNode * const md = H->getOrInsertNamedMetadata(og.getName());
+        const auto n = og.getNumOperands();
+        for (unsigned i = 0; i < n; ++i) {
+            md->addOperand(og.getOperand(i));
         }
+    }
+    #ifndef NDEBUG
+    assert ((getSignature(M) == nullptr) ^ (getSignature(H.get()) != nullptr));
+    if (getSignature(M)) {
+        assert (getSignature(H.get()));
+        assert (getSignature(M)->getString() == getSignature(H.get())->getString());
+    }
+    #endif
 
-        // Clone the function prototypes and metadata to minimize the size of the stored .kernel file.
-        std::unique_ptr<Module> H(new Module(moduleId, M->getContext()));
-        H->setTargetTriple(M->getTargetTriple());
-        H->setDataLayout(M->getDataLayout());
-        for (const Function & f : M->getFunctionList()) {
-            if (f.hasExternalLinkage() && !f.empty()) {
-                Function::Create(f.getFunctionType(), Function::ExternalLinkage, f.getName(), H.get());
-            }
-        }
-        for (const auto & og : M->named_metadata()) {
-            NamedMDNode * const md = H->getOrInsertNamedMetadata(og.getName());
-            const auto n = og.getNumOperands();
-            for (unsigned i = 0; i < n; ++i) {
-                md->addOperand(og.getOperand(i));
-            }
-        }
-        #ifndef NDEBUG
-        assert ((getSignature(M) == nullptr) ^ (getSignature(H.get()) != nullptr));
-        if (getSignature(M)) {
-            assert (getSignature(H.get()));
-            assert (getSignature(M)->getString() == getSignature(H.get())->getString());
-        }
-        #endif
+    WriteBitcodeToFile(*H, kernelFile);
+    kernelFile.close();
 
-        WriteBitcodeToFile(*H, kernelFile);
-        kernelFile.close();
-
-        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-            errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
-        }
+    if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+        errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
     }
 }
 
@@ -267,25 +285,17 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
  * @brief getObject
  ** ------------------------------------------------------------------------------------------------------------- */
 std::unique_ptr<MemoryBuffer> ParabixObjectCache::getObject(const Module * module) {
-    const auto moduleId = module->getModuleIdentifier();
-    const auto f = mCachedObject.find(moduleId);
-    if (f == mCachedObject.end()) {
-        return nullptr;
+    // FIX: Extract the core moduleId string by removing JIT execution run salt decorators
+    std::string moduleId = getCleanCacheKey(module);
+    auto f = mCachedObject.find(moduleId);
+    if (f != mCachedObject.end() && f->second != nullptr) {
+        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            errs() << "Object Cache Hit: " << moduleId << "\n";
+        }
+        // Return a copy clone buffer wrapper block to the compiler engine subsystem
+        return MemoryBuffer::getMemBuffer(f->second->getMemBufferRef());
     }
-    llvm::MemoryBuffer * const buffer = f->second.release();
-    #ifndef NDEBUG
-    if (LLVM_UNLIKELY(buffer == nullptr)) {
-        SmallVector<char, 512> tmp;
-        llvm::raw_svector_ostream msg(tmp);
-        msg << "getObject called multiple times for \""
-            << moduleId
-            << "\".\n\n";
-        report_fatal_error(Twine(msg.str()));
-    }
-    #else
-    mCachedObject.erase(f);
-    #endif
-    return std::unique_ptr<llvm::MemoryBuffer>(buffer);
+    return nullptr;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

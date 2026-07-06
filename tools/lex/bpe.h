@@ -57,10 +57,6 @@ public:
 
     std::string decodeToken(int id) const;
 
-    // raw byte value -> base-alphabet id (the byte-level fallback). Seeds the
-    // merge accumulator `source` so every byte starts as its single base token.
-    std::vector<int> singleByteIds() const;
-
     // Resolve each raw merge (parts A,B + idAB) into a MergeRule (idA, idB,
     // lenA, lenB, idAB) via the base alphabet + earlier merge outputs, then group
     // by idAB-range, sorted by idAB ASC = rank ASC. This is the data the
@@ -71,19 +67,17 @@ public:
 
 private:
     // Generate the 256-entry GPT-2 byte-level base alphabet (bytes_to_unicode)
-    // into vocab_/idToToken_ and baseByteId_. Base id == position in the
-    // alphabet (matches vocab.json ids 0..255 exactly). Lets merges.txt be
-    // self-sufficient: every merge part is a base byte or an earlier merge
-    // output, so no vocab.json is required.
+    // into vocab_/idToToken_. Base id == position in the alphabet (matches
+    // vocab.json ids 0..255 exactly). Lets merges.txt be self-sufficient: every
+    // merge part is a base byte or an earlier merge output → no vocab.json
+    // required. (The seed computes base ids arithmetically, so no byte→id table.)
     void buildBaseAlphabet();
 
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string>             idToToken_;
     // Raw merges (parts A,B + idAB = 256 + rank), in rank order. Set by loadMerges.
     std::vector<MergeRaw>                merges_;
-    // raw byte value (0..255) -> its base-alphabet id. Set by buildBaseAlphabet;
-    // drives singleByteIds() (the byte-level fallback) without vocab.json.
-    std::vector<int>                     baseByteId_;
+    bool                                 baseBuilt_ = false;  // buildBaseAlphabet run once
 };
 
 // buildBPEPassPipeline

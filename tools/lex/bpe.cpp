@@ -54,18 +54,6 @@ using namespace kernel;
 
 namespace {
 
-// Hash the byte->single-byte-id table so BPERangeSeed's cache name is unique per
-// vocab. Without this the seed kernel (name has no token data) collides across
-// vocabs in ~/.parabix/objcache/ — the first vocab's seed poisons the rest.
-uint64_t hashByteIds(const std::vector<int> & ids) {
-    uint64_t h = 0xCBF29CE484222325ull;
-    for (int v : ids) {
-        h ^= static_cast<uint64_t>(static_cast<int64_t>(v));
-        h *= 1099511628211ull;
-    }
-    return h;
-}
-
 }
 
 // ─── InvertStreamKernel ─────────────────────────────────────────────────────
@@ -112,43 +100,77 @@ protected:
     }
 };
 
-// BPERangeSeed — seed the accumulator. source = single-byte id of each byte,
-// active = all ones, end = all zeroes.
+// BPERangeSeed — the FIRST BPE kernel. It turns each raw input byte into its
+// base-alphabet token id: the starting single-byte token, before any merge.
+// Outputs:
+//   source (16-bit) — base id of each byte   (the id stream the merges build on)
+//   active (1-bit)  — all 1s                  (reused downstream as emit-all)
+//   end    (1-bit)  — all 0s                  (legacy; unused)
+//
+// GPT-2's byte-level alphabet (encoder.py bytes_to_unicode) maps
+// each raw byte to a printable char, then encoder.json assigns each char an id =
+// its POSITION in the alphabet. The alphabet lists the 188 "printable" bytes
+// first (ids 0..187), then the 68 remaining bytes (ids 188..255). So a byte's id
+// is NOT its value and NOT its unicode code point — it is its position.
+//
+// Composing byte→char→id gives a closed-form piecewise map: id = byte + offset,
+// one offset per contiguous byte range. We compute it by ARITHMETIC (a few range
+// masks + Sel) instead of a 256-way EQ lookup table — far fewer Pablo ops. The
+// alphabet is a fixed spec, so this kernel is data-independent (constant cache
+// name). 
+//
+//   byte range   offset   id            byte range   offset   id
+//   0..32        +188     188..220      161..172     −67      94..105
+//   33..126      −33      0..93         173          →255     255
+//   127..160     +94      221..254      174..255     −68      106..187
+// (e.g. space 32 → 220 = 'Ġ', 'y' 121 → 88, 't' 116 → 83.)
 class BPERangeSeed : public PabloKernel {
 public:
     BPERangeSeed(LLVMTypeSystemInterface & ts, StreamSet * basis,
-                 StreamSet * source, StreamSet * active, StreamSet * end,
-                 std::vector<int> byteIds)
-    : PabloKernel(ts, "BPERangeSeed_h" + std::to_string(hashByteIds(byteIds)),
+                 StreamSet * source, StreamSet * active, StreamSet * end)
+    : PabloKernel(ts, "BPERangeSeed",
                   {Binding{"basis", basis}},
-                  {Binding{"source", source}, Binding{"active", active}, Binding{"end", end}}),
-      mByteIds(std::move(byteIds)) {}
+                  {Binding{"source", source}, Binding{"active", active}, Binding{"end", end}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
+        // `b` = the input byte value at each position, as an 8-bit BixNum built
+        // from the 8 basis bit-streams.
         std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
-        BixNum symBN(basisBits.begin(), basisBits.end());
+        BixNum b(basisBits.begin(), basisBits.end());
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
 
-        // source bit i = OR over bytes b whose single-byte id has bit i set.
-        std::vector<PabloAST*> idBits(16, zeroes);
-        for (unsigned b = 0; b < 256; b++) {
-            int v = mByteIds[b];
-            if (v < 0) continue;
-            PabloAST * eq = bnc.EQ(symBN, b);
-            for (unsigned i = 0; i < 16; i++)
-                if ((v >> i) & 1) idBits[i] = pb.createOr(idBits[i], eq);
-        }
+        // One 1-bit mask per byte range — 1 wherever the byte falls in that range.
+        // The six ranges are mutually exclusive and cover all of 0..255; 174..255
+        // is the default (else) arm of the Select below, so it needs no mask.
+        PabloAST * m_0_32    = bnc.ULE(b, 32);                                  // control block 1
+        PabloAST * m_33_126  = pb.createAnd(bnc.UGE(b, 33),  bnc.ULE(b, 126));  // printable ASCII
+        PabloAST * m_127_160 = pb.createAnd(bnc.UGE(b, 127), bnc.ULE(b, 160));  // control block 2
+        PabloAST * m_161_172 = pb.createAnd(bnc.UGE(b, 161), bnc.ULE(b, 172));  // printable Latin-1 lo
+        PabloAST * m_173     = bnc.EQ(b, 173);                                  // the lone non-printable
+
+        // id = byte + per-range offset (173 is a fixed 255). AddModular/SubModular
+        // are modular on 8 bits; every SELECTED range lands in 0..255 with no
+        // wrap, so the values are exact (unselected arms may wrap but are discarded
+        // by the Select). Nested Select picks the arm for each position's range.
+        BixNum id = bnc.Select(m_0_32,    bnc.AddModular(b, 188),   // 0..32   → +188
+                    bnc.Select(m_33_126,  bnc.SubModular(b, 33),    // 33..126 → −33
+                    bnc.Select(m_127_160, bnc.AddModular(b, 94),    // 127..160→ +94
+                    bnc.Select(m_161_172, bnc.SubModular(b, 67),    // 161..172→ −67
+                    bnc.Select(m_173,     bnc.Create(255),          // 173     → 255
+                                          bnc.SubModular(b, 68))))));// 174..255→ −68 (default)
+
+        // Write the id into the 16-bit `source` stream (ids ≤255 → high bits 0),
+        // active = all 1s, end = all 0s.
         Var * sOut = getOutputStreamVar("source");
         for (unsigned i = 0; i < 16; i++)
-            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idBits[i]);
+            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)),
+                            (i < id.size()) ? id[i] : zeroes);
         pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)), ones);
         pb.createAssign(pb.createExtract(getOutputStreamVar("end"),    pb.getInteger(0)), zeroes);
     }
-private:
-    std::vector<int> mByteIds;
 };
 
 // Hash a rule group's (idA,idB,idAB,lenB) list → unique cache name per kernel,
@@ -189,35 +211,35 @@ protected:
         PabloAST * ones   = pb.createNot(zeroes);
 
         //
-        // WITHIN A KERNEL - Out put Stream from one step goes to the next.
+        // WITHIN A KERNEL - output stream from one step goes to the next.
         // cur reads from idAcc and sees the effects of earlier merges in the SAME kernel.
+        // idAcc threads rule→rule as PLAIN VALUES (an expression DAG) so the
+        // cascade's reaching-def is exact. Final idAcc → sourceOut → next kernel.
         //
-        // idAcc starts as a copy of the input (srcBits)
-        // Each rule reads cur from the current idAcc → sees stamps from earlier rules in this same kernel. 
-        // That's the intra-kernel carry.
-        // Final idAcc written to sourceOut → becomes next kernel's input.
-                
-        // idAcc threaded as Pablo Vars (not plain values) so each rule's body can
-        // live inside a createIf scope and carry its mutations out across the gate.
-        std::vector<Var*> idAcc(16);                       // threaded id stream
+        // createIf block-skip is KEPT for performance: where token A is absent in
+        // a block, the detection work (Bend/Advance/merge) is skipped. The catch:
+        // idAcc must NOT be a self-assigned Var (`idAcc[i] = Sel(merge,…,idAcc[i])`
+        // inside createIf) — that self-ref breaks reaching-def and silently kills
+        // every merge whose idA is itself a merged id (cascade dies past level 1).
+        // Fix: the createIf body writes `merge` into a fresh NON-self-ref Var; the
+        // plain-value stamp of idAB happens OUTSIDE the gate.
+        std::vector<PabloAST*> idAcc(16);                  // threaded id stream (plain values)
         for (unsigned i = 0; i < 16; i++)
-            idAcc[i] = pb.createVar("id" + std::to_string(i),
-                                    (i < srcBits.size()) ? srcBits[i] : zeroes);
+            idAcc[i] = (i < srcBits.size()) ? srcBits[i] : zeroes;
 
-        // if a rule's A is not present in the input, the body is skipped 
-        // Single-level createIf only (nested createIf).
         for (const auto & r : mRules) {
             BixNum cur(idAcc.begin(), idAcc.end());          // current (mutated) id stream
             PabloAST * Aend = bnc.EQ(cur, r.idA);            // gate: token A ends here
-            auto body = pb.createScope();
+            Var * mergeVar  = pb.createVar("merge", zeroes); // 0 in blocks with no idA
+            auto body = pb.createScope();                    // skipped where no idA in block
             BixNumCompiler bncB(body);
             BixNum curB(idAcc.begin(), idAcc.end());
-            PabloAST * Bend  = bncB.EQ(curB, r.idB);         // B ends here
-            PabloAST * merge = body.createAnd(body.createAdvance(Aend, r.lenB), Bend); // AB ends here
-            for (unsigned i = 0; i < 16; i++)                // stamp idAB at merge (B's end)
-                body.createAssign(idAcc[i],
-                    body.createSel(merge, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]));
-            pb.createIf(Aend, body);                         // skip body in blocks with no idA
+            PabloAST * Bend = bncB.EQ(curB, r.idB);          // B ends here
+            body.createAssign(mergeVar,                      // NON-self-ref Var assign
+                body.createAnd(body.createAdvance(Aend, r.lenB), Bend)); // AB ends here
+            pb.createIf(Aend, body);                         // skip detection where no idA
+            for (unsigned i = 0; i < 16; i++)                // stamp idAB (plain value, outside gate)
+                idAcc[i] = pb.createSel(mergeVar, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
         }
 
         Var * sOut = getOutputStreamVar("sourceOut");
@@ -267,7 +289,7 @@ BPEPassResult buildBPEPassPipeline(
     StreamSet * source = P.CreateStreamSet(16, 1);
     StreamSet * active = P.CreateStreamSet(1, 1);
     StreamSet * end    = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<BPERangeSeed>(basis, source, active, end, bpe.singleByteIds());
+    P.CreateKernelCall<BPERangeSeed>(basis, source, active, end);
     if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "seed")
         return {active, source};   // dump seed source at every byte
 
@@ -291,6 +313,7 @@ BPEPassResult buildBPEPassPipeline(
     }
 
     // matchEnd = active (all ones) → emit every byte (Stage-B debug). vocabID = source.
+    // Swallowed part-ends never cleared
     return {active, source};
 }
 
@@ -358,18 +381,20 @@ bool BPETokenizer::loadVocab(const std::string & path) {
 // buildBaseAlphabet generates the GPT-2 byte-level base alphabet
 // (bytes_to_unicode): 256 tokens, each the UTF-8 encoding of a code point, with
 // id == its position in the alphabet. Reproduces vocab.json ids 0..255 exactly,
-// so merges.txt + this table need no vocab.json. Also fills baseByteId_[v] = id
-// of the single-byte token for raw byte value v (the byte-level fallback).
+// so merges.txt needs no vocab.json. Fills vocab_/idToToken_ (base parts must be
+// resolvable by buildMergeRuleRanges + decodeToken). The seed computes base ids
+// arithmetically, so no byte→id table is produced here.
 void BPETokenizer::buildBaseAlphabet() {
-    if (!baseByteId_.empty()) return;                // build once
+    if (baseBuilt_) return;                          // build once
+    baseBuilt_ = true;
     bool printable[256] = {false};                   // bytes kept as their own code point
-    for (int b = 33;  b <= 126; ++b) printable[b] = true;
-    for (int b = 161; b <= 172; ++b) printable[b] = true;
-    for (int b = 174; b <= 255; ++b) printable[b] = true;
-    std::vector<int> cps, bytes;                      // code point + raw byte per position
-    for (int b = 0; b < 256; ++b) if (printable[b]) { cps.push_back(b); bytes.push_back(b); }
+    for (int b = 33;  b <= 126; ++b) printable[b] = true;   // printable ASCII characters.
+    for (int b = 161; b <= 172; ++b) printable[b] = true;   // printable Latin-1 characters.
+    for (int b = 174; b <= 255; ++b) printable[b] = true;   // printable Latin-1 characters.
+    std::vector<int> cps;                             // code point per alphabet position
+    for (int b = 0; b < 256; ++b) if (printable[b]) cps.push_back(b);
     int n = 0;                                        // non-printables map to 256+n
-    for (int b = 0; b < 256; ++b) if (!printable[b]) { cps.push_back(256 + n++); bytes.push_back(b); }
+    for (int b = 0; b < 256; ++b) if (!printable[b]) cps.push_back(256 + n++);
 
     auto utf8 = [](int cp) {                          // all cps < 0x800 here → ≤ 2 bytes
         std::string s;
@@ -378,13 +403,12 @@ void BPETokenizer::buildBaseAlphabet() {
                s.push_back(static_cast<char>(0x80 | (cp & 0x3F))); }
         return s;
     };
-    baseByteId_.assign(256, -1);
+    // Each position i is the base-alphabet id of the UTF-8 token utf8(cps[i]).
     for (size_t i = 0; i < cps.size(); ++i) {         // i == base id
         std::string tok = utf8(cps[i]);
         vocab_[tok] = static_cast<int>(i);
         if (i >= idToToken_.size()) idToToken_.resize(i + 1);
         idToToken_[i] = tok;
-        baseByteId_[bytes[i]] = static_cast<int>(i);
     }
 }
 
@@ -434,18 +458,6 @@ bool BPETokenizer::loadMerges(const std::string & path) {
 std::string BPETokenizer::decodeToken(int id) const {
     if (id < 0 || static_cast<size_t>(id) >= idToToken_.size()) return "";
     return idToToken_[static_cast<size_t>(id)];
-}
-
-// byte value b -> id of the single-byte token "b" (-1 if the vocab has none).
-std::vector<int> BPETokenizer::singleByteIds() const {
-    // Merges/base-alphabet path: every raw byte 0..255 has a base id (covers the
-    // 2-byte base tokens like Ġ that a tok.size()==1 scan would miss).
-    if (!baseByteId_.empty()) return baseByteId_;
-    // Legacy --vocab-only path: only ASCII printables are size-1 tokens.
-    std::vector<int> t(256, -1);
-    for (const auto & [tok, id] : vocab_)
-        if (tok.size() == 1) t[static_cast<uint8_t>(tok[0])] = id;
-    return t;
 }
 
 

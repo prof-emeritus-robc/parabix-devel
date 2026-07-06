@@ -211,35 +211,35 @@ protected:
         PabloAST * ones   = pb.createNot(zeroes);
 
         //
-        // WITHIN A KERNEL - output stream from one step goes to the next.
+        // WITHIN A KERNEL - Out put Stream from one step goes to the next.
         // cur reads from idAcc and sees the effects of earlier merges in the SAME kernel.
-        // idAcc threads rule→rule as PLAIN VALUES (an expression DAG) so the
-        // cascade's reaching-def is exact. Final idAcc → sourceOut → next kernel.
         //
-        // createIf block-skip is KEPT for performance: where token A is absent in
-        // a block, the detection work (Bend/Advance/merge) is skipped. The catch:
-        // idAcc must NOT be a self-assigned Var (`idAcc[i] = Sel(merge,…,idAcc[i])`
-        // inside createIf) — that self-ref breaks reaching-def and silently kills
-        // every merge whose idA is itself a merged id (cascade dies past level 1).
-        // Fix: the createIf body writes `merge` into a fresh NON-self-ref Var; the
-        // plain-value stamp of idAB happens OUTSIDE the gate.
-        std::vector<PabloAST*> idAcc(16);                  // threaded id stream (plain values)
+        // idAcc starts as a copy of the input (srcBits)
+        // Each rule reads cur from the current idAcc → sees stamps from earlier rules in this same kernel. 
+        // That's the intra-kernel carry.
+        // Final idAcc written to sourceOut → becomes next kernel's input.
+                
+        // idAcc threaded as Pablo Vars (not plain values) so each rule's body can
+        // live inside a createIf scope and carry its mutations out across the gate.
+        std::vector<Var*> idAcc(16);                       // threaded id stream
         for (unsigned i = 0; i < 16; i++)
-            idAcc[i] = (i < srcBits.size()) ? srcBits[i] : zeroes;
+            idAcc[i] = pb.createVar("id" + std::to_string(i),
+                                    (i < srcBits.size()) ? srcBits[i] : zeroes);
 
+        // if a rule's A is not present in the input, the body is skipped 
+        // Single-level createIf only (nested createIf).
         for (const auto & r : mRules) {
             BixNum cur(idAcc.begin(), idAcc.end());          // current (mutated) id stream
             PabloAST * Aend = bnc.EQ(cur, r.idA);            // gate: token A ends here
-            Var * mergeVar  = pb.createVar("merge", zeroes); // 0 in blocks with no idA
-            auto body = pb.createScope();                    // skipped where no idA in block
+            auto body = pb.createScope();
             BixNumCompiler bncB(body);
             BixNum curB(idAcc.begin(), idAcc.end());
-            PabloAST * Bend = bncB.EQ(curB, r.idB);          // B ends here
-            body.createAssign(mergeVar,                      // NON-self-ref Var assign
-                body.createAnd(body.createAdvance(Aend, r.lenB), Bend)); // AB ends here
-            pb.createIf(Aend, body);                         // skip detection where no idA
-            for (unsigned i = 0; i < 16; i++)                // stamp idAB (plain value, outside gate)
-                idAcc[i] = pb.createSel(mergeVar, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
+            PabloAST * Bend  = bncB.EQ(curB, r.idB);         // B ends here
+            PabloAST * merge = body.createAnd(body.createAdvance(Aend, r.lenB), Bend); // AB ends here
+            for (unsigned i = 0; i < 16; i++)                // stamp idAB at merge (B's end)
+                body.createAssign(idAcc[i],
+                    body.createSel(merge, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]));
+            pb.createIf(Aend, body);                         // skip body in blocks with no idA
         }
 
         Var * sOut = getOutputStreamVar("sourceOut");
@@ -249,7 +249,6 @@ protected:
 private:
     std::vector<MergeRule> mRules;
 };
-
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
 //   1. buildMergeRuleRanges() groups merges into 53 id-ranges (rank order).

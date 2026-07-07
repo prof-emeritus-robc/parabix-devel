@@ -164,3 +164,34 @@ def subrange_conflict_analysis(maps, lo, hi):
 			if not has_common_prefix(tokA_1, tokB_1): continue
 			# conflict
 			print("%i = %s(%i) %s(%i) X %i = %s(%i) %s(%i) " %(idA, tokA_0, idA_0, tokA_1, idA_1, idB, tokB_0, idB_0, tokB_1, idB_1))
+
+#
+#  Generate the expansion of a token_id into a merge of
+#  tokens whose IDs are all less than the given lo value.
+def expand_token(maps, token_id, lo):
+	(vocab_, idToToken_) = maps
+	tok = idToToken_[token_id]
+	if token_id < 256:
+		return "%s (%i)" % (tok, token_id)
+	if token_id < lo:
+		return "%s%s (%i)" % (tok[0], tok[1], token_id)
+	else:
+		id0 = vocab_[tok[0]]
+		id1 = vocab_[tok[1]]
+		return "%s %s"% (expand_token(maps, id0, lo), expand_token(maps, id1, lo))
+
+#
+#  For all merges in a particular range such that the right token id
+#  is also in the range:  generate an expanded merge such that all but
+#  the first one token is guaranteed to be lower than the lo value.
+#
+def subrange_right_factor_analysis(maps, lo, hi):
+	(vocab_, idToToken_) = maps
+	id0_in_range = 0
+	id1_in_range = 0
+	for vocab_id in range(lo, hi):
+		merge = idToToken_[vocab_id]
+		id0 = vocab_[merge[0]]
+		id1 = vocab_[merge[1]]
+		if id1 > lo:
+			print("%i = %s(%i) %s" %(vocab_id, merge[0], id0, expand_token(maps, id1, lo)))

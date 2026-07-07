@@ -57,12 +57,6 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
     // NOTE: both the shared and thread local objects are parameters to the kernel.
     // They get automatically set by reading in the appropriate params.
 
-    if (HasZeroExtendedStream) {
-        PointerType * const voidPtrTy = b.getVoidPtrTy();
-        mTarget->addThreadLocalScalar(voidPtrTy, ZERO_EXTENDED_BUFFER);
-        mTarget->addThreadLocalScalar(sizeTy, ZERO_EXTENDED_SPACE);
-    }
-
     mKernelId = 0;
     mKernel = mTarget;
     auto currentPartitionId = -1U;
@@ -612,9 +606,6 @@ void PipelineCompiler::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
     if (LLVM_LIKELY(num_edges(ThreadLocalPlacement) > 0)) {
         Value * tlptr = b.getScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY);
         b.CreateFree(tlptr);
-    }
-    if (LLVM_UNLIKELY(HasZeroExtendedStream)) {
-        b.CreateFree(b.getScalarField(ZERO_EXTENDED_BUFFER));
     }
     freeZeroedInputBuffers(b);
 }

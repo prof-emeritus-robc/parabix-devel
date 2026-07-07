@@ -198,6 +198,9 @@ void PipelineAnalysis::generateInitialBufferGraph(KernelBuilder & b) {
                         bn.Type |= BufferType::RequiresEmptyOverflow;
                         END_SCOPED_REGION
                         break;
+                    case AttrId::ZeroExtended:
+                        bp.Flags |= BufferPortType::IsZeroExtended;
+                        break;
                     case AttrId::InOut:
                         if (LLVM_LIKELY(!codegen::DebugOptionIsSet(codegen::DisableInOutAttributes))) {
                             if (LLVM_UNLIKELY(port.Type == PortType::Input)) {

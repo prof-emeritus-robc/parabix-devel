@@ -24,16 +24,17 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <boost/filesystem.hpp>
 #include <boost/format.hpp>
+#include <boost/icl/interval_set.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <boost/intrusive/detail/math.hpp>
-#include <boost/filesystem.hpp>
+#include <boost/predef.h>
 #include <cxxabi.h>
 using boost::intrusive::detail::floor_log2;
 #include <llvm/Support/Alignment.h>
 #include <unistd.h>
 
-#include <boost/icl/interval_set.hpp>
 using IntervalSet = boost::icl::interval_set<uintptr_t>;
 
 using Interval = IntervalSet::interval_type;
@@ -1157,9 +1158,13 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
 
         Value * const vaList = CreatePointerCast(CreateAlignedAlloca(vaListTy, mCacheLineAlignment), int8PtrTy);
         FunctionType * vaFuncTy = FunctionType::get(voidTy, { int8PtrTy }, false);
+        #if BOOST_ARCH_ARM > 0
+        Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start.p0", m);
+        Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end.p0", m);
+        #else
         Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start", m);
         Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end", m);
-
+        #endif
         CreateCondBr(assertion, success, failure);
 
         SetInsertPoint(failure);

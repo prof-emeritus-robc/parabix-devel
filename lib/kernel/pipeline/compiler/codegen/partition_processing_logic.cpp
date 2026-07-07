@@ -225,6 +225,7 @@ void PipelineCompiler::checkForPartitionEntry(KernelBuilder & b) {
         assert (FirstKernelInPartition[partitionId] == mKernelId);
         mNextPartitionEntryPoint = getPartitionExitPoint(b);
         determinePartitionStrideRateScalingFactor();
+        identifyAllThreadLocalStreamSetsInCurrentPartition();
         #ifdef PRINT_DEBUG_MESSAGES
         debugPrint(b, "  *** entering partition %" PRIu64, b.getSize(mCurrentPartitionId));
         #endif

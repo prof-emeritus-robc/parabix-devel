@@ -64,9 +64,6 @@ const static std::string BASE_THREAD_LOCAL_STREAMSET_MEMORY_BYTES = "LSMb";
 
 const static std::string PARTITION_THREAD_LOCAL_STREAMSET_MAX_STRIDE_COUNT = "@PTlS";
 
-const static std::string ZERO_EXTENDED_BUFFER = "ZeB";
-const static std::string ZERO_EXTENDED_SPACE = "ZeS";
-
 const static std::string KERNEL_THREAD_LOCAL_SUFFIX = ".KTL";
 const static std::string NEXT_LOGICAL_SEGMENT_NUMBER = "@NLSN";
 
@@ -296,8 +293,6 @@ public:
     void zeroInputAfterFinalItemCount(KernelBuilder & b, const Vec<Value *> & accessibleItems, Vec<Value *> & inputBufferCapacity, Vec<Value *> & inputBaseAddresses);
     void freeZeroedInputBuffers(KernelBuilder & b);
 
-    Value * allocateLocalZeroExtensionSpace(KernelBuilder & b, Vec<Value *> & zeroExtendedInputBufferCapacity,  BasicBlock * const insertBefore) const;
-
     void writeKernelCall(KernelBuilder & b);
     void buildKernelCallArgumentList(KernelBuilder & b, ArgVec & args);
     void updateProcessedAndProducedItemCounts(KernelBuilder & b, Value * rejectedTermSignal);
@@ -392,7 +387,7 @@ public:
 
     Value * getVirtualBaseAddress(KernelBuilder & b, const BufferPort & rateData, const BufferNode & bn, Value * position, const bool prefetch, const bool write) const;
     void getInputVirtualBaseAddresses(KernelBuilder & b, Vec<Value *> & baseAddresses) const;
-    void getZeroExtendedInputVirtualBaseAddresses(KernelBuilder & b, const Vec<Value *> & baseAddresses, Value * const zeroExtendAddress, Vec<Value *> & zeroExtendedVirtualBaseAddress) const;
+    void updateZeroExtendedInputVirtualBaseAddresses(KernelBuilder & b);
 
     void addZeroInputStructProperties(KernelBuilder & b) const;
 
@@ -495,8 +490,11 @@ public:
     void initializeThreadLocalMemoryPhiNodes(KernelBuilder & b);
     void updateThreadLocalMemoryLoopEntryPhiNodes(KernelBuilder & b);
     void updateThreadLocalMemoryLoopExitPhiNodes(KernelBuilder & b);
+    void updateThreadLocalMemoryAtInsufficentIOPhiNodes(KernelBuilder & b);
+    void updateThreadLocalMemoryAfterTerminationPhiNodes(KernelBuilder & b);
     void allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBuilder & b, Value * const maximumNumOfStrides, Value * const nonCountableNumOfStrides);
     void remapThreadLocalBufferMemory(KernelBuilder & b);
+    void identifyAllThreadLocalStreamSetsInCurrentPartition();
 
 // optimization branch functions
     bool isEitherOptimizationBranchKernelInternallySynchronized() const;
@@ -664,7 +662,6 @@ protected:
     #endif
 
     const bool                                  PipelineHasTerminationSignal;
-    const bool                                  HasZeroExtendedStream;
     const bool                                  EnableCycleCounter;
     const bool                                  TraceIO;
     const bool                                  TraceUnconsumedItemCounts;
@@ -736,9 +733,11 @@ protected:
     FixedVector<PHINode *>                      mThreadLocalStartOffsetAtEntryPhi;
     FixedVector<PHINode *>                      mThreadLocalEndOffsetAtEntryPhi;
     FixedVector<PHINode *>                      mThreadLocalStartOffsetAtExitPhi;
+    FixedVector<PHINode *>                      mThreadLocalEndOffsetAtExitPhi;
 
     BitVector                                   mIsStatelessKernel;
     BitVector                                   mIsInternallySynchronized;
+    flat_set<unsigned>                          mIsThreadLocalStreamSet;
 
     // partition state
     FixedVector<BasicBlock *>                   mPartitionEntryPoint;
@@ -977,7 +976,6 @@ inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel,
 }())
 #endif
 , PipelineHasTerminationSignal(pipelineKernel->canSetTerminateSignal())
-, HasZeroExtendedStream(P.HasZeroExtendedStream)
 , EnableCycleCounter(StatisticsOptionIsSet(codegen::EnableCycleCounter))
 , TraceIO(StatisticsOptionIsSet(codegen::EnableBlockingIOCounter) || StatisticsOptionIsSet(codegen::TraceBlockedIO))
 , TraceUnconsumedItemCounts(StatisticsOptionIsSet(codegen::TraceUnconsumedItemCounts))
@@ -1013,14 +1011,16 @@ inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel,
 , mLocallyAvailableItems(FirstStreamSet, LastStreamSet, mAllocator)
 
 , mScalarValue(FirstKernel, LastScalar, mAllocator)
-, mThreadLocalStartOffset(FirstStreamSet, LastStreamSet, mAllocator)
-, mThreadLocalEndOffset(FirstStreamSet, LastStreamSet, mAllocator)
-, mThreadLocalStartOffsetAtEntryPhi(FirstStreamSet, LastStreamSet, mAllocator)
-, mThreadLocalEndOffsetAtEntryPhi(P.MaxNumOfOutputPorts, mAllocator)
+, mThreadLocalStartOffset(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
+, mThreadLocalEndOffset(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
+, mThreadLocalStartOffsetAtEntryPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
+, mThreadLocalEndOffsetAtEntryPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
+, mThreadLocalStartOffsetAtExitPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
+, mThreadLocalEndOffsetAtExitPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
 
-, mThreadLocalStartOffsetAtExitPhi(FirstStreamSet, LastStreamSet, mAllocator)
 , mIsStatelessKernel(PipelineOutput - PipelineInput + 1)
 , mIsInternallySynchronized(PipelineOutput - PipelineInput + 1)
+, mIsThreadLocalStreamSet()
 , mPartitionEntryPoint(PartitionCount, mAllocator)
 
 , mKernelTerminationSignal(FirstKernel, LastKernel, mAllocator)

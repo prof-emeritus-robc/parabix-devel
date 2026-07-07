@@ -294,7 +294,6 @@ public:
 
     size_t                          MinimumThreadLocalSegmentSize = 0;
 
-    bool                            HasZeroExtendedStream = false;
     bool                            RequiresIllustratorObject = false;
 
     unsigned                        MaxNumOfInputPorts = 0;
@@ -313,7 +312,6 @@ public:
     BufferGraph                     mBufferGraph;
     InOutGraph                      InOutStreamSetReplacement;
     ThreadLocalPlacementGraph       ThreadLocalPlacement;
-
     ThreadLocalConflictGraphType    ThreadLocalConflictGraph;
 
     std::vector<unsigned>           PartitionJumpTargetId;

@@ -702,7 +702,20 @@ using ZeroInputGraph = adjacency_list<vecS, vecS, directedS, no_property, unsign
 
 using InOutGraph = adjacency_list<vecS, vecS, bidirectionalS, no_property, no_property>;
 
-using ThreadLocalPlacementGraph = adjacency_list<vecS, vecS, bidirectionalS, bool, Rational>;
+struct ThreadLocalPlacementData {
+    size_t OverflowStrideAdjustment = 0;
+    bool Terminal = false;
+
+    ThreadLocalPlacementData() = default;
+
+    ThreadLocalPlacementData(const ThreadLocalPlacementData & D)
+    : OverflowStrideAdjustment(D.OverflowStrideAdjustment)
+    , Terminal(D.Terminal) {
+
+    }
+};
+
+using ThreadLocalPlacementGraph = adjacency_list<vecS, vecS, bidirectionalS, ThreadLocalPlacementData, Rational>;
 
 using ThreadLocalConflictGraphType = adjacency_list<vecS, vecS, undirectedS>;
 

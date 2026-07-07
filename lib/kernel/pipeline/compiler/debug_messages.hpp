@@ -31,7 +31,25 @@ BOOST_NOINLINE void PipelineCompiler::debugPrint(KernelBuilder & b, Twine format
     }
     #endif
     #ifdef PRINT_DEBUG_MESSAGES_FOR_KERNEL_NAME
-    if (mKernel == nullptr || mKernel->getName().compare(PRINT_DEBUG_MESSAGES_FOR_KERNEL_NAME) != 0) return;
+    if (mKernel == nullptr) return;
+    const StringRef S{mKernel->getName()};
+    StringRef labels{PRINT_DEBUG_MESSAGES_FOR_KERNEL_NAME};
+    for (size_t start = 0;;) {
+        const auto end = labels.find(',', start);
+        if (end == StringRef::npos) {
+            const StringRef L{labels.substr(start)};
+            if (S.contains(L)) {
+                break;
+            } else {
+                return;
+            }
+        }
+        const StringRef L{labels.substr(start, end - start)};
+        if (S.contains(L)) {
+            break;
+        }
+        start = end + 1;
+    }
     #endif
     #ifdef PRINT_DEBUG_MESSAGES_FOR_MARKED_KERNELS_ONLY
     if (LLVM_LIKELY(mKernel == nullptr || !mKernel->hasEnabledPipelineDebugMessages())) return;

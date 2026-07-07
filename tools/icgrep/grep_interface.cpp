@@ -187,11 +187,7 @@ static cl::alias ColorAlias("colours", cl::desc("Alias for -color"), cl::aliasop
 // Handler for errors reported through llvm::report_fatal_error.  Report
 // and signal error the InternalFailure exit code.
 //
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(14, 0, 0)
-static void icgrep_error_handler(void *UserData, const std::string &Message, bool GenCrashDiag) {
-#else
-    static void icgrep_error_handler(void *UserData, const char * Message, bool GenCrashDiag) {
-#endif
+static void icgrep_error_handler(void *UserData, const char * Message, bool GenCrashDiag) {
     // Modified from LLVM's internal report_fatal_error logic.
     SmallVector<char, 64> Buffer;
     raw_svector_ostream OS(Buffer);

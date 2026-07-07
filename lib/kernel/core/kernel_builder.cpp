@@ -986,13 +986,7 @@ KernelBuilder::AddressableValue KernelBuilder::makeAddressableValue(Type * type,
             elemTy = cast<VectorType>(vecTy)->getElementType();
         }
 
-        #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(11, 0, 0)
-        const auto b = elemTy->getPrimitiveSizeInBits();
-        #elif LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(16, 0, 0)
-        const auto b = elemTy->getPrimitiveSizeInBits().getFixedSize();
-        #else
         const auto b = elemTy->getPrimitiveSizeInBits().getFixedValue();
-        #endif
 
         Rational R{a, b};
         assert (R.denominator() == 1);

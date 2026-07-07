@@ -21,9 +21,6 @@
 #include <llvm/Support/ToolOutputFile.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/Scalar/GVN.h>
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(7, 0, 0)
-#define OF_None F_None
-#endif
 
 using namespace llvm;
 

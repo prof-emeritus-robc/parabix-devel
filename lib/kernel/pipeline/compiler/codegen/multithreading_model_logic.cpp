@@ -62,11 +62,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
     FunctionType * const threadFuncType = FunctionType::get(voidPtrTy, {voidPtrTy}, false);
     Function * const threadFunc = Function::Create(threadFuncType, Function::InternalLinkage, threadName, m);
     if (LLVM_UNLIKELY(CheckAssertions())) {
-        #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-        threadFunc->setHasUWTable();
-        #else
         threadFunc->setUWTableKind(UWTableKind::Default);
-        #endif
     }
     Value * const initialSharedState = getHandle();
     Value * const initialThreadLocal = getThreadLocalHandle();
@@ -282,11 +278,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
             }
 
             if (LLVM_UNLIKELY(CheckAssertions())) {
-                #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-                csFunc->setHasUWTable();
-                #else
                 csFunc->setUWTableKind(UWTableKind::Default);
-                #endif
             }
             b.SetInsertPoint(BasicBlock::Create(m->getContext(), "entry", csFunc));
             auto args = csFunc->arg_begin();
@@ -501,11 +493,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
                 BasicBlock * rethrowException = b.WriteDefaultRethrowBlock();
                 const auto prefix = makeKernelName(mKernelId);
                 BasicBlock * const invokeOk = b.CreateBasicBlock(prefix + "_invokeOk");
-                #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(11, 0, 0)
                 csRetVal = b.CreateInvoke(doSegmentComputeFuncType, doSegmentComputeThreadFunc, invokeOk, rethrowException, args);
-                #else
-                csRetVal = b.CreateInvoke(ddoSegmentComputeThreadFunc, invokeOk, mRethrowException, args);
-                #endif
                 b.SetInsertPoint(invokeOk);
             } else {
                 csRetVal = b.CreateCall(doSegmentComputeFuncType, doSegmentComputeThreadFunc, args);

@@ -16,7 +16,7 @@ To build Parabix, you need a development environment that meets a few requiremen
 -  The [`cmake`](https://cmake.org/download/) build system version 3.12 or better.
 -  [`Boost`](https://www.boost.org/users/download/) libraries version `1.61` or better (Ubuntu `libboost-all-dev`).
 -  [`Z3`](https://github.com/Z3Prover/z3) Theorem Prover (Ubuntu `libz3-dev`).
--  [`LLVM`](https://releases.llvm.org/download.html) system version `12` or later (built in Release mode).  
+-  [`LLVM`](https://releases.llvm.org/download.html) system version `16` or later (built in Release mode).  
 
 ### Build
 

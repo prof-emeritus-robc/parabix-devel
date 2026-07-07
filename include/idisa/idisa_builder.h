@@ -15,11 +15,7 @@ namespace llvm { class Value; }
 namespace llvm { class StringRef; }
 
 namespace IDISA {
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(11, 0, 0)
-    using FixedVectorType = llvm::VectorType;
-#else
-    using FixedVectorType = llvm::FixedVectorType;
-#endif
+using FixedVectorType = llvm::FixedVectorType;
 
 bool isStreamTy(const llvm::Type * const t);
 

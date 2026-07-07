@@ -228,11 +228,7 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
     if (mRethrowException) {
         const auto prefix = makeKernelName(mKernelId);
         BasicBlock * const invokeOk = b.CreateBasicBlock(prefix + "_invokeOk", mKernelCompletionCheck);
-        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(11, 0, 0)
         doSegmentRetVal = b.CreateInvoke(doSegFuncType, doSegment, invokeOk, mRethrowException, args);
-        #else
-        doSegmentRetVal = b.CreateInvoke(doSegment, invokeOk, mRethrowException, args);
-        #endif
         b.SetInsertPoint(invokeOk);
     } else {
         doSegmentRetVal = b.CreateCall(doSegFuncType, doSegment, args);

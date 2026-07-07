@@ -27,6 +27,7 @@ using namespace pablo;
 using namespace kernel;
 
 static cl::opt<bool> ElemSpread("ElemSpread", cl::desc("Use ElemSpreadKernel in place of byte spread by mask"), cl::init(true), cl::cat(codegen::CodeGenOptions));
+static cl::opt<bool> ShortStrides("short-strides", cl::desc("Use short stride kernels"), cl::init(false), cl::cat(codegen::CodeGenOptions));
 static cl::opt<bool> SeparatedMergeByMask("separated-merge-by-mask", cl::desc("implement merge-by-mask by combining two spread-by-mask steps"), cl::init(false), cl::cat(codegen::CodeGenOptions));
 static cl::opt<bool> UnalignedLoads("UnalignedLoads", cl::desc("Use unaligned loads in ElemSpread"), cl::init(false), cl::cat(codegen::CodeGenOptions));
 static cl::opt<bool> RecursiveSpreadMaskCalculation("RecursiveSpreadMaskCalculation", cl::desc("Use recursive multi-kernel approach to insertion spread mask calculation (legacy)"), cl::init(false), cl::cat(codegen::CodeGenOptions));
@@ -36,6 +37,18 @@ namespace kernel {
 class ElemSpreadKernel final  : public MultiBlockKernel {
 public:
     ElemSpreadKernel(LLVMTypeSystemInterface & ts,
+                       StreamSet * mask,
+                       StreamSet * source,
+                       StreamSet * spread);
+protected:
+    void generateMultiBlockLogic(KernelBuilder & kb, llvm::Value * const numOfStrides) override;
+private:
+    const unsigned mElemWidth;
+};
+
+class ElemSpreadShortStrides final  : public MultiBlockKernel {
+public:
+    ElemSpreadShortStrides(LLVMTypeSystemInterface & ts,
                        StreamSet * mask,
                        StreamSet * source,
                        StreamSet * spread);
@@ -66,7 +79,11 @@ void SpreadByMask(PipelineBuilder & P,
             useElemSpread = false;
         }
         if (useElemSpread) {
-            P.CreateKernelCall<ElemSpreadKernel>(mask, toSpread, outputs);
+            if (ShortStrides) {
+                P.CreateKernelCall<ElemSpreadShortStrides>(mask, toSpread, outputs);
+            } else {
+                P.CreateKernelCall<ElemSpreadKernel>(mask, toSpread, outputs);
+            }
         } else {
             P.CreateKernelCall<ByteSpreadByMaskKernel>(toSpread, mask, outputs, offset);
         }
@@ -435,6 +452,160 @@ void ElemMergeKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * c
     b.CreateCondBr(moreToDo, elemMergeLoop, elemMergeDone);
 
     b.SetInsertPoint(elemMergeDone);
+}
+
+#define USE_SHORT_STRIDE_POPCOUNT
+ElemSpreadShortStrides::ElemSpreadShortStrides(LLVMTypeSystemInterface & ts,
+                                       StreamSet * mask,
+                                       StreamSet * source,
+                                       StreamSet * spread)
+: MultiBlockKernel(ts, [&]() -> std::string {
+                        std::string tmp;
+                        raw_string_ostream nm(tmp);
+                        nm << "ElemSpread_ShortStrides";
+                        nm << '_' << source->getFieldWidth();
+                        if (UnalignedLoads) nm << "u";
+                        nm.flush();
+                        return tmp;
+                    }(),
+{Binding("mask", mask, FixedRate(1), Principal()),
+ // The following would be preferred, but is currently buggy.
+#ifdef USE_SHORT_STRIDE_POPCOUNT
+ Binding("source", source, PopcountOf("mask"), EmptyReadOverflow())},
+#else
+ Binding("source", source, BoundedRate(0, 1), ZeroExtended())},
+#endif
+{Binding{"spread", spread}},
+{}, {}, {}), mElemWidth(source->getFieldWidth()) {
+    setStride(ts.getBitBlockWidth()/mElemWidth);
+}
+
+void ElemSpreadShortStrides::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) {
+    const unsigned maskWidth = b.getBitBlockWidth()/mElemWidth;
+    IntegerType * const sizeTy = b.getSizeTy();
+    IntegerType * const maskTy = b.getIntNTy(maskWidth);
+    IntegerType * const elemTy = b.getIntNTy(mElemWidth);
+    Type * const elemVecTy = b.fwVectorType(mElemWidth);
+    Constant * zeroElemVec = Constant::getNullValue(elemVecTy);
+
+    Constant * const ZERO = b.getSize(0);
+    Constant * const ELEMS_PER_STRIDE = ConstantInt::get(sizeTy, maskWidth);
+    Constant * const UREM_MASK = ConstantInt::get(sizeTy, maskWidth - 1);
+
+    BasicBlock * const entry = b.GetInsertBlock();
+    BasicBlock * const strideAtATimeLoop = b.CreateBasicBlock("strideAtATimeLoop");
+    BasicBlock * const strideLoopContinue = b.CreateBasicBlock("strideLoopContinue");
+    BasicBlock * const spreadAndWrite = b.CreateBasicBlock("spreadAndWrite");
+    BasicBlock * const multiStrideExit = b.CreateBasicBlock("multiStrideExit");
+
+    // Set up the pointers for mask input and spread output,
+    // indexed by stride number.
+    Value * const processedMaskItems = b.getProcessedItemCount("mask");
+    Value * const rawMaskPtr = b.getRawInputPointer("mask", processedMaskItems);
+    Value * const maskBasePtr = b.CreatePointerCast(rawMaskPtr, maskTy->getPointerTo());
+    Value * const producedItems = b.getProducedItemCount("spread");
+    Value * const rawOutputPtr = b.getRawOutputPointer("spread", producedItems);
+    Value * const outputBasePtr = b.CreatePointerCast(rawOutputPtr, elemVecTy->getPointerTo());
+
+
+    Value * processedSourceBase = b.getProcessedItemCount("source");
+    Value * initialSourceOffset = nullptr;
+    Value * sourcePtr = nullptr;
+    Value * initialPendingData = nullptr;
+    if (UnalignedLoads) {
+        initialSourceOffset = ZERO;
+        Value * const sourceBasePtr = b.getRawInputPointer("source", processedSourceBase);
+        sourcePtr = b.CreatePointerCast(sourceBasePtr, elemTy->getPointerTo());
+    } else {
+        initialSourceOffset = b.CreateURem(processedSourceBase, ELEMS_PER_STRIDE);
+        processedSourceBase = b.CreateSub(processedSourceBase, initialSourceOffset);
+        Value * const sourceBasePtr = b.getRawInputPointer("source", processedSourceBase);
+        sourcePtr = b.CreatePointerCast(sourceBasePtr, elemVecTy->getPointerTo());
+        initialPendingData = b.CreateLoad(elemVecTy, sourcePtr);
+    }
+
+    b.CreateBr(strideAtATimeLoop);
+
+    b.SetInsertPoint(strideAtATimeLoop);
+    PHINode * strideNoPhi = b.CreatePHI(b.getSizeTy(), 3);
+    strideNoPhi->addIncoming(ZERO, entry);
+    PHINode * const sourceOffsetPhi = b.CreatePHI(sizeTy, 3);
+    PHINode * pendingDataPhi = nullptr;
+    if (UnalignedLoads) {
+        sourceOffsetPhi->addIncoming(ZERO, entry);
+    } else {
+        sourceOffsetPhi->addIncoming(initialSourceOffset, entry);
+        pendingDataPhi = b.CreatePHI(elemVecTy, 3);
+        pendingDataPhi->addIncoming(initialPendingData, entry);
+    }
+
+    Value * const nextStride = b.CreateAdd(strideNoPhi, b.getSize(1));
+    Value * const moreStridesToDo = b.CreateICmpNE(nextStride, numOfStrides);
+
+
+    Value * maskPtr = b.CreateGEP(maskTy, maskBasePtr, strideNoPhi);
+    Value * outputPtr = b.CreateGEP(elemVecTy, outputBasePtr, strideNoPhi);
+    Value * mask = b.CreateLoad(maskTy, maskPtr);
+    // Store an initial zero to output, in case no mask bits are set.
+    Value * maskIsEmpty = b.CreateIsNull(mask);
+    b.CreateStore(zeroElemVec, outputPtr);
+
+    b.CreateUnlikelyCondBr(b.CreateAnd(maskIsEmpty, b.CreateNot(moreStridesToDo)), multiStrideExit, strideLoopContinue);
+
+    b.SetInsertPoint(strideLoopContinue);
+
+    BasicBlock * thisBB = b.GetInsertBlock();
+    strideNoPhi->addIncoming(nextStride, thisBB);
+    sourceOffsetPhi->addIncoming(sourceOffsetPhi, thisBB);
+    if (!UnalignedLoads) {
+        pendingDataPhi->addIncoming(pendingDataPhi, thisBB);
+    }
+    b.CreateCondBr(maskIsEmpty, strideAtATimeLoop, spreadAndWrite);
+
+    b.SetInsertPoint(spreadAndWrite);
+
+    Value * const maskPopCount = b.CreateZExtOrTrunc(b.CreatePopcount(mask), sizeTy);
+    Value * const updatedSourceOffset = b.CreateAdd(sourceOffsetPhi, maskPopCount);
+
+    Value * newPack = nullptr;
+    Value * spreadableData = nullptr;
+    if (UnalignedLoads) {
+        Value * const sourceItemPtr = b.CreateGEP(elemTy, sourcePtr, sourceOffsetPhi);
+        Value * const packPtr = b.CreatePointerCast(sourceItemPtr, elemVecTy->getPointerTo());
+        spreadableData = b.CreateAlignedLoad(elemVecTy, packPtr, 1);
+    } else {
+        Value * const pendingPackNo = b.CreateUDiv(sourceOffsetPhi, ELEMS_PER_STRIDE);
+        // Elements in the pending pack may already have been processed.
+        Value * const pendingElemsDone = b.CreateAnd(sourceOffsetPhi, UREM_MASK);
+        // If the offset within the pack is nonzero, we have pending data elements to keep.
+        Value * pendingElemsToKeep = b.CreateAnd(b.CreateSub(ELEMS_PER_STRIDE, pendingElemsDone), UREM_MASK);
+        Value * const nextPackNo = b.CreateUDiv(updatedSourceOffset, ELEMS_PER_STRIDE);
+        Value * const nextPackElems = b.CreateAnd(updatedSourceOffset, UREM_MASK);
+        // We can only safely load a pack if our mask tells us that there are new elements to load.
+        Value * const packToLoad = b.CreateSelect(b.CreateIsNull(nextPackElems), pendingPackNo, nextPackNo);
+        Value * const packPtr = b.CreateGEP(elemVecTy, sourcePtr, packToLoad);
+        newPack = b.CreateLoad(elemVecTy, packPtr);
+        spreadableData = b.mvmd_dsll(mElemWidth, newPack, pendingDataPhi, pendingElemsToKeep);
+    }
+
+    Value * const spread = b.mvmd_expand(mElemWidth, spreadableData, mask);
+    b.CreateStore(spread, outputPtr);
+
+    strideNoPhi->addIncoming(nextStride, spreadAndWrite);
+    sourceOffsetPhi->addIncoming(updatedSourceOffset, spreadAndWrite);
+    if (!UnalignedLoads) {
+        pendingDataPhi->addIncoming(newPack, spreadAndWrite);
+    }
+    b.CreateCondBr(moreStridesToDo, strideAtATimeLoop, multiStrideExit);
+
+    b.SetInsertPoint(multiStrideExit);
+#ifdef USE_SHORT_STRIDE_POPCOUNT
+    PHINode * const finalOffsetPhi = b.CreatePHI(sizeTy, 2);
+    finalOffsetPhi->addIncoming(sourceOffsetPhi, strideAtATimeLoop);
+    finalOffsetPhi->addIncoming(updatedSourceOffset, spreadAndWrite);
+
+    b.setProcessedItemCount("source", b.CreateAdd(processedSourceBase, finalOffsetPhi));
+#endif
 }
 
 ElemSpreadKernel::ElemSpreadKernel(LLVMTypeSystemInterface & ts,

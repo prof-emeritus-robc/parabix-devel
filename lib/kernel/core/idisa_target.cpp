@@ -8,9 +8,7 @@
 #include <toolchain/toolchain.h>
 #include <idisa/idisa_i64_builder.h>
 #ifdef PARABIX_ARM_TARGET
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
 #include <llvm/TargetParser/AArch64TargetParser.h>
-#endif
 #include <idisa/idisa_arm_builder.h>
 #endif
 #ifdef PARABIX_X86_TARGET
@@ -22,11 +20,7 @@
 #endif
 #include <llvm/IR/Module.h>
 
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
 #include <llvm/TargetParser/Triple.h>
-#else
-#include <llvm/ADT/Triple.h>
-#endif
 
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
@@ -34,7 +28,7 @@
 
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
-#elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(11, 0, 0)
+#else
 #include <llvm/Support/Host.h>
 #endif
 
@@ -60,7 +54,6 @@ Features getHostCPUFeatures(const StringMap<bool> & features) {
 
 bool ARM_available() {
 #ifdef PARABIX_ARM_TARGET
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
     auto info = llvm::AArch64::parseCpu(sys::getHostCPUName());
     std::vector<StringRef> extNames;
@@ -77,13 +70,6 @@ bool ARM_available() {
         if (eName == "+neon") return true;
     }
     return false;
-#else
-    StringMap<bool> features;
-    if (LLVM_UNLIKELY(!sys::getHostCPUFeatures(features))) {
-        return false;
-    }
-    return features.lookup("neon");
-#endif
 #endif
     return false;
 }

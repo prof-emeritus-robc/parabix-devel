@@ -116,11 +116,7 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
         sys::path::append(fileName, CACHE_PREFIX);
         fileName.append(moduleId);
         fileName.append(KERNEL_FILE_EXTENSION);
-        #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-        auto kernelBuffer = MemoryBuffer::getFile(fileName, -1, false);
-        #else
         auto kernelBuffer = MemoryBuffer::getFile(fileName, false, false, false);
-        #endif
         if (kernelBuffer) {
             auto loadedFile = getOwningLazyBitcodeModule(std::move(kernelBuffer.get()), b.getContext());
             // if there was no error when parsing the bitcode
@@ -140,11 +136,7 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
                     }
                 }
                 sys::path::replace_extension(fileName, OBJECT_FILE_EXTENSION);
-                #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-                auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), -1, false);
-                #else
                 auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), false, false, false);
-                #endif
                 if (LLVM_LIKELY(objectBuffer)) {
                     Module * const m = M.release();
                     assert ("object cache file returned null module?" && m);
@@ -197,9 +189,6 @@ invalid:
  *
  * A new module has been compiled. If it is cacheable and no conflicting module exists, write it out.
  ** ------------------------------------------------------------------------------------------------------------- */
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(7, 0, 0)
-#define OF_None F_None
-#endif
 void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef Obj) {
 
     if (LLVM_LIKELY(M->getNamedMetadata(CACHEABLE) != nullptr)) {
@@ -265,11 +254,7 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
         }
         #endif
 
-        #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(7, 0, 0)
-        WriteBitcodeToFile(H.get(), kernelFile);
-        #else
         WriteBitcodeToFile(*H, kernelFile);
-        #endif
         kernelFile.close();
 
         if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {

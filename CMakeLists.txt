@@ -47,24 +47,27 @@ endif()
 # Target for single shared library
 set(PARABIX_MONO_TARGET parabix)
 
-
 # Ensure custom FindXYZ.cmake files are found
 set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 ###   Versioning   ###
-set(Parabix_REVISION "svn")
+set(Parabix_REVISION "parabix")
 include(VersionFromVCS)
 add_version_info_from_vcs(Parabix_REVISION)
 message(STATUS "Parabix Revision: ${Parabix_REVISION}")
 
 
 ###   Import Dependency: LLVM   ###
+set (MIN_LLVM_VERSION "16")
 if (LLVM_PATH)
 find_package(LLVM REQUIRED CONFIG PATHS ${LLVM_PATH} NO_DEFAULT_PATH)
 else()
 find_package(LLVM REQUIRED CONFIG)
 endif()
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} in: ${LLVM_DIR}")
+if (${LLVM_PACKAGE_VERSION} VERSION_LESS MIN_LLVM_VERSION)
+message(FATAL_ERROR "LLVM ${MIN_LLVM_VERSION} or greater required.  ${LLVM_PACKAGE_VERSION} unsupported.")
+endif()
 message(STATUS "Host Processor ${CMAKE_HOST_SYSTEM_PROCESSOR}")
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64") 
@@ -75,10 +78,7 @@ set(PARABIX_TARGETS_TO_BUILD X86)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_X86_TARGET")
 endif()
 
-if (LLVM_VERSION_MAJOR STRGREATER 13)
-    set(LLVM_IR_PRINTER IRPrinter)
-endif()
-llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} mcjit native IRReader Linker ${LLVM_IR_PRINTER})
+llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} mcjit native IRReader Linker IRPrinter)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 link_directories(${LLVM_LIBRARY_DIRS})
@@ -87,8 +87,6 @@ math(EXPR LLVM_VERSION_INTEGER "${LLVM_VERSION_MAJOR} * 10000 + ${LLVM_VERSION_M
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_VERSION_INTEGER=${LLVM_VERSION_INTEGER}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_VERSION_MAJOR=${LLVM_VERSION_MAJOR} -DLLVM_VERSION_MINOR=${LLVM_VERSION_MINOR}")
 message(STATUS "LLVM Version Integer: ${LLVM_VERSION_INTEGER}")
-
-
 
 ###   Import Dependency: Boost   ###
 
@@ -99,8 +97,6 @@ find_package(Boost 1.61 REQUIRED COMPONENTS system filesystem iostreams regex)
 message(STATUS "Found Boost_LIBRARY_DIRS: ${Boost_LIBRARY_DIRS}")
 include_directories("${Boost_INCLUDE_DIRS}")
 link_directories(${Boost_LIBRARY_DIRS})
-
-
 
 ###   Import Dependency: Z3   ###
 
@@ -202,10 +198,6 @@ set(CMAKE_MACOSX_RPATH ON)
 
 # Enable all warnings
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -pedantic") # -Werror=global-constructors
-if (${LLVM_PACKAGE_VERSION} VERSION_LESS "6.0")
-# LLVM 5 and earlier generate many warnings about deprecated declarations; suppress these.
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
-endif()
 
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-fvisibility-inlines-hidden" SUPPORTS_FVISIBILITY_INLINES_HIDDEN_FLAG)

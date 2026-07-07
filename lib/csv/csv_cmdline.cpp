@@ -180,11 +180,7 @@ std::vector<unsigned> getColumnArgs(std::vector<std::string> & headers) {
 // and signal error the InternalFailure exit code.
 //
 static void csv_error_handler(void *UserData,
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(14, 0, 0)
-							  const std::string &Message,
-#else
 							  const char * Message,
-#endif
 							  bool GenCrashDiag) {
     // Modified from LLVM's internal report_fatal_error logic.
     SmallVector<char, 64> Buffer;

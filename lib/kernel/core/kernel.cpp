@@ -247,11 +247,7 @@ inline StringRef concat(StringRef A, StringRef B, SmallVector<char, 256> & tmp) 
 }
 
 inline StructType * getTypeByName(Module * const m, StringRef name) {
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(12, 0, 0)
     return StructType::getTypeByName(m->getContext(), name);
-#else
-    return m->getTypeByName(name);
-#endif
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -643,11 +639,7 @@ Function * Kernel::addInitializeDeclaration(KernelBuilder & b) const {
         initFunc->setCallingConv(CallingConv::C);
         initFunc->setDoesNotRecurse();
         if (LLVM_UNLIKELY(ea)) {
-            #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-            initFunc->setHasUWTable();
-            #else
             initFunc->setUWTableKind(UWTableKind::Default);
-            #endif
         }
 
         auto arg = initFunc->arg_begin();
@@ -763,11 +755,7 @@ Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b) const 
             func->setCallingConv(CallingConv::C);
             func->setDoesNotRecurse();
             if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-                #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-                func->setHasUWTable();
-                #else
                 func->setUWTableKind(UWTableKind::Default);
-                #endif
             }
 
             auto arg = func->arg_begin();
@@ -831,11 +819,7 @@ Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder 
             func->setCallingConv(CallingConv::C);
             func->setDoesNotRecurse();
             if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-                #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-                func->setHasUWTable();
-                #else
                 func->setUWTableKind(UWTableKind::Default);
-                #endif
             }
 
             auto arg = func->arg_begin();
@@ -910,11 +894,7 @@ Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBui
             func->setCallingConv(CallingConv::C);
             func->setDoesNotRecurse();
             if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-                #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-                func->setHasUWTable();
-                #else
                 func->setUWTableKind(UWTableKind::Default);
-                #endif
             }
 
             auto arg = func->arg_begin();
@@ -1088,11 +1068,7 @@ Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b) const {
         doSegment->setCallingConv(CallingConv::C);
         doSegment->setDoesNotRecurse();
         if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-            #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-            doSegment->setHasUWTable();
-            #else
             doSegment->setUWTableKind(UWTableKind::Default);
-            #endif
         }
         auto arg = doSegment->arg_begin();
         auto setNextArgName = [&](const StringRef name) {
@@ -1234,11 +1210,7 @@ Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b) const {
             func->setCallingConv(CallingConv::C);
             func->setDoesNotRecurse();
             if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-                #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-                func->setHasUWTable();
-                #else
                 func->setUWTableKind(UWTableKind::Default);
-                #endif
             }
 
             auto arg = func->arg_begin();
@@ -1308,11 +1280,7 @@ Function * Kernel::addFinalizeDeclaration(KernelBuilder & b) const {
         terminateFunc->setCallingConv(CallingConv::C);
         terminateFunc->setDoesNotRecurse();
         if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-            #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-            terminateFunc->setHasUWTable();
-            #else
             terminateFunc->setUWTableKind(UWTableKind::Default);
-            #endif
         }
 
         auto args = terminateFunc->arg_begin();

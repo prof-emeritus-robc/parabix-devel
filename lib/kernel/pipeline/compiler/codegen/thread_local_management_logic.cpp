@@ -27,7 +27,7 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
     using Vertex = ThreadLocalPlacementGraph::vertex_descriptor;
     using Edge = ThreadLocalPlacementGraph::edge_descriptor;
 
-    const auto n = (LastStreamSet - FirstStreamSet) + 1;
+    const auto n = (LastStreamSet - FirstStreamSet) + 1 + PartitionCount;
 
     const auto bw = b.getBitBlockWidth();
 
@@ -38,29 +38,29 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
 
     const Rational T{mTarget->getStride(), b.getBitBlockWidth()};
 
+    const auto m = PartitionCount + n;
+    assert (num_vertices(ThreadLocalPlacement) == m + 1);
+    assert (in_degree(m, ThreadLocalPlacement) > 0);
+
     std::function<Value *(Vertex)> calculatePlacement = [&](const Vertex v) -> Value * {
         assert (v >= PartitionCount);
-
-        Value * offset = precalculatedOffset[v - PartitionCount];
+        const auto streamSet = v - PartitionCount;
+        assert (streamSet < m);
+        Value * offset = precalculatedOffset[streamSet];
         if (offset) {
             return offset;
         }
-        const auto streamSet = FirstStreamSet + v - PartitionCount;
-        assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
-        const auto & bn = mBufferGraph[streamSet];
-        assert (bn.isThreadLocal());
-        Value * maxStrides = segmentSize;
-        const BufferPort & bp = mBufferGraph[in_edge(streamSet, mBufferGraph)];
-        if (LLVM_UNLIKELY(bp.RequiredOverflowSpace)) {
-            const auto producer = parent(streamSet, mBufferGraph);
-            const auto k = ceiling((bp.Maximum * StrideStepLength[producer] + Rational{bp.RequiredOverflowSpace}) / bw);
-            maxStrides = b.CreateAdd(maxStrides, b.getSize(k));
-        }
-
+        const auto & Tv = ThreadLocalPlacement[v];
+        Value * const maxStrides = b.CreateAdd(segmentSize, b.getSize(Tv.OverflowStrideAdjustment));
         assert (in_degree(v, ThreadLocalPlacement) > 0);
         ThreadLocalPlacementGraph::in_edge_iterator begin, end;
         std::tie(begin, end) = in_edges(v, ThreadLocalPlacement);
-        Value * off = b.CreateCeilUMulRational(maxStrides, bn.RelativeIORate * ThreadLocalPlacement[*begin]);
+        Rational r = ThreadLocalPlacement[*begin];
+//        if (streamSet <= LastStreamSet) {
+//            const BufferNode & bn = mBufferGraph[streamSet];
+//            r *= bn.RelativeIORate;
+//        }
+        Value * off = b.CreateCeilUMulRational(maxStrides, r);
         const auto first = source(*begin, ThreadLocalPlacement);
         if (first < PartitionCount) {
             assert (in_degree(v, ThreadLocalPlacement) == 1);
@@ -72,13 +72,10 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
             assert (prior);
             off = b.CreateAdd(off, prior);
         }
-        precalculatedOffset[v - PartitionCount] = off;
+        precalculatedOffset[streamSet] = off;
         return off;
     };
 
-    const auto m = PartitionCount + (LastStreamSet - FirstStreamSet) + 1;
-    assert (num_vertices(ThreadLocalPlacement) == m + 1);
-    assert (in_degree(m, ThreadLocalPlacement) > 0);
     ThreadLocalPlacementGraph::in_edge_iterator ei, end;
     std::tie(ei, end) = in_edges(m, ThreadLocalPlacement);
     Value * memorySize = calculatePlacement(source(*ei, ThreadLocalPlacement));
@@ -91,7 +88,6 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
     const auto pageSize = getPageSize();
     assert (is_pow2(pageSize));
     memorySize = b.CreateShl(memorySize, b.getSize(floor_log2(pageSize)));
-
     assert (mTarget->hasThreadLocal());
     Value * const base = b.CreateAlignedMalloc(memorySize, pageSize);
     PointerType * const int8PtrTy = b.getInt8PtrTy();
@@ -126,43 +122,25 @@ void PipelineCompiler::initializeThreadLocalMemoryPhiNodes(KernelBuilder & b) {
     mThreadLocalStreamSetBaseAddress = mThreadLocalStreamSetBaseAddressAtEntryPhi;
 
     #ifndef NDEBUG
-    mThreadLocalStartOffsetAtEntryPhi.reset(FirstStreamSet, LastStreamSet);
-    mThreadLocalStartOffsetAtExitPhi.reset(FirstStreamSet, LastStreamSet);
+    mThreadLocalStartOffsetAtEntryPhi.reset(FirstStreamSet, LastStreamSet + PartitionCount);
+    mThreadLocalStartOffsetAtExitPhi.reset(FirstStreamSet, LastStreamSet + PartitionCount);
     #endif
 
     Constant * const undefVal = UndefValue::get(sizeTy);
+    for (auto streamSet : mIsThreadLocalStreamSet) {
+        assert (FirstStreamSet <= streamSet && streamSet <= (LastStreamSet + PartitionCount));
+        PHINode * const entryPhi = PHINode::Create(sizeTy, 2, prefix + "_threadLocalOffsetAtLoopEntry", mKernelLoopEntry);
+        mThreadLocalStartOffsetAtEntryPhi[streamSet] = entryPhi;
+        entryPhi->addIncoming(undefVal, mKernelLoopStart);
 
-    for (auto output : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
-        const auto streamSet = target(output, mBufferGraph);
-        const BufferNode & bn = mBufferGraph[streamSet];
-        if (bn.isThreadLocal()) {
-            const auto prefix = makeBufferName(mKernelId, mBufferGraph[output].Port);
-            PHINode * const entryPhi = PHINode::Create(sizeTy, 2, prefix + "_threadLocalOffsetAtLoopEntry", mKernelLoopEntry);
-            mThreadLocalStartOffsetAtEntryPhi[streamSet] = entryPhi;
-            entryPhi->addIncoming(undefVal, mKernelLoopStart);
+        PHINode * const entryEndPhi = PHINode::Create(sizeTy, 2, prefix + "_threadLocalEndOffsetAtLoopEntry", mKernelLoopEntry);
+        mThreadLocalEndOffsetAtEntryPhi[streamSet] = entryEndPhi;
+        entryEndPhi->addIncoming(undefVal, mKernelLoopStart);
 
-            const BufferPort & bp = mBufferGraph[output];
-            PHINode * const entryEndPhi = PHINode::Create(sizeTy, 2, prefix + "_threadLocalEndOffsetAtLoopEntry", mKernelLoopEntry);
-            mThreadLocalEndOffsetAtEntryPhi[bp.Port.Number] = entryEndPhi;
-            entryEndPhi->addIncoming(undefVal, mKernelLoopStart);
-
-            mThreadLocalStartOffsetAtExitPhi[streamSet] = PHINode::Create(sizeTy, 2, prefix + "_threadLocalOffsetAtLoopExit", mKernelLoopExit);
-        }
+        mThreadLocalStartOffsetAtExitPhi[streamSet] = PHINode::Create(sizeTy, 2, prefix + "_threadLocalStartOffsetAtLoopExit", mKernelLoopExit);
+        mThreadLocalEndOffsetAtExitPhi[streamSet] = PHINode::Create(sizeTy, 2, prefix + "_threadLocalEndOffsetAtLoopExit", mKernelLoopExit);
     }
 
-    for (auto kernel = mKernelId + 1U; kernel < oneAfterLastKernel; ++kernel) {
-        for (auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
-            const auto streamSet = target(output, mBufferGraph);
-            const BufferNode & bn = mBufferGraph[streamSet];
-            if (bn.isThreadLocal()) {
-                const auto prefix = makeBufferName(kernel, mBufferGraph[output].Port);
-                PHINode * const entryPhi = PHINode::Create(sizeTy, 2, prefix + "_threadLocalOffsetAtLoopEntry", mKernelLoopEntry);
-                mThreadLocalStartOffsetAtEntryPhi[streamSet] = entryPhi;
-                entryPhi->addIncoming(undefVal, mKernelLoopStart);
-                mThreadLocalStartOffsetAtExitPhi[streamSet] = PHINode::Create(sizeTy, 2, prefix + "_threadLocalOffsetAtLoopExit", mKernelLoopExit);
-            }
-        }
-    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -179,27 +157,11 @@ void PipelineCompiler::updateThreadLocalMemoryLoopEntryPhiNodes(KernelBuilder & 
 
     mThreadLocalStreamSetBaseAddressAtEntryPhi->addIncoming(mThreadLocalStreamSetBaseAddress, exitBlock);
 
-    for (auto output : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
-        const auto streamSet = target(output, mBufferGraph);
-        const BufferNode & bn = mBufferGraph[streamSet];
-        if (bn.isThreadLocal()) {
-            mThreadLocalStartOffsetAtEntryPhi[streamSet]->addIncoming(mThreadLocalStartOffset[streamSet], exitBlock);
-            const BufferPort & bp = mBufferGraph[output];
-            mThreadLocalEndOffsetAtEntryPhi[bp.Port.Number]->addIncoming(mThreadLocalEndOffset[streamSet], exitBlock);
-        }
+    for (auto streamSet : mIsThreadLocalStreamSet) {
+        mThreadLocalStartOffsetAtEntryPhi[streamSet]->addIncoming(mThreadLocalStartOffset[streamSet], exitBlock);
+        mThreadLocalEndOffsetAtEntryPhi[streamSet]->addIncoming(mThreadLocalEndOffset[streamSet], exitBlock);
     }
 
-    const auto oneAfterLastKernel = FirstKernelInPartition[mCurrentPartitionId + 1];
-
-    for (auto kernel = mKernelId + 1; kernel < oneAfterLastKernel; ++kernel) {
-        for (auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
-            const auto streamSet = target(output, mBufferGraph);
-            const BufferNode & bn = mBufferGraph[streamSet];
-            if (bn.isThreadLocal()) {
-                mThreadLocalStartOffsetAtEntryPhi[streamSet]->addIncoming(mThreadLocalStartOffset[streamSet], exitBlock);
-            }
-        }
-    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -215,15 +177,37 @@ void PipelineCompiler::updateThreadLocalMemoryLoopExitPhiNodes(KernelBuilder & b
 
     mThreadLocalStreamSetBaseAddressAtExitPhi->addIncoming(mThreadLocalStreamSetBaseAddress, exitBlock);
 
-    const auto oneAfterLastKernel = FirstKernelInPartition[mCurrentPartitionId + 1];
-    for (auto kernel = mKernelId; kernel < oneAfterLastKernel; ++kernel) {
-        for (auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
-            const auto streamSet = target(output, mBufferGraph);
-            const BufferNode & bn = mBufferGraph[streamSet];
-            if (bn.isThreadLocal()) {
-                mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalStartOffset[streamSet], exitBlock);
-            }
-        }
+    for (auto streamSet : mIsThreadLocalStreamSet) {
+        mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalStartOffset[streamSet], exitBlock);
+        mThreadLocalEndOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalEndOffset[streamSet], exitBlock);
+    }
+
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief updateThreadLocalMemoryAtInsufficentIOPhiNodes
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::updateThreadLocalMemoryAtInsufficentIOPhiNodes(KernelBuilder & b) {
+    BasicBlock * const exitBlock = b.GetInsertBlock();
+    mThreadLocalStreamSetBaseAddressAtExitPhi->addIncoming(UndefValue::get(b.getInt8PtrTy()), exitBlock);
+    Constant * undefVal = UndefValue::get(b.getSizeTy());
+    for (auto streamSet : mIsThreadLocalStreamSet) {
+        mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(undefVal, exitBlock);
+        mThreadLocalEndOffsetAtExitPhi[streamSet]->addIncoming(undefVal, exitBlock);
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief updateThreadLocalMemoryAfterTermination
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::updateThreadLocalMemoryAfterTerminationPhiNodes(KernelBuilder & b) {
+    BasicBlock * const exitBlock = b.GetInsertBlock();
+    mThreadLocalStreamSetBaseAddressAtExitPhi->addIncoming(mThreadLocalStreamSetBaseAddress, exitBlock);
+    for (auto streamSet : mIsThreadLocalStreamSet) {
+        mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalStartOffset[streamSet], exitBlock);
+        mThreadLocalStartOffset[streamSet] = mThreadLocalStartOffsetAtExitPhi[streamSet];
+        mThreadLocalEndOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalEndOffset[streamSet], exitBlock);
+        mThreadLocalEndOffset[streamSet] = mThreadLocalEndOffsetAtExitPhi[streamSet];
     }
 }
 
@@ -235,8 +219,10 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
     assert (mIsPartitionRoot);
 
     if (out_degree(mCurrentPartitionId, ThreadLocalPlacement) == 0) {
+        assert (mIsThreadLocalStreamSet.size() == 0);
         return;
     }
+    assert (mIsThreadLocalStreamSet.size() > 0);
 
     BasicBlock * const allocateThreadLocal = b.CreateBasicBlock("allocateThreadLocal", mKernelLoopCall);
     BasicBlock * const expandThreadLocalMemory = b.CreateBasicBlock("expandThreadLocalMemory", mKernelLoopCall);
@@ -283,7 +269,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
 
     b.SetInsertPoint(allocateThreadLocal);
 
-    const auto m = PartitionCount + LastStreamSet - FirstStreamSet + 1;
+    const auto m = PartitionCount + (LastStreamSet - FirstStreamSet) + 1 + PartitionCount;
     assert (num_vertices(ThreadLocalPlacement) == m + 1);
     std::vector<unsigned> toVisit(m + 1, 0);
     for (unsigned i = PartitionCount; i < m; ++i) {
@@ -318,6 +304,11 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
 
     std::vector<size_t> selected;
 
+    #ifndef NDEBUG
+    mThreadLocalStartOffset.reset(FirstStreamSet, LastStreamSet + PartitionCount);
+    mThreadLocalEndOffset.reset(FirstStreamSet, LastStreamSet + PartitionCount);
+    #endif
+
     Value * memoryForSegment = nullptr;
     for (auto u = mCurrentPartitionId;;) {
         for (auto e : make_iterator_range(out_edges(u, ThreadLocalPlacement))) {
@@ -327,27 +318,25 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
             auto & T = toVisit[v];
             assert (T > 0);
             if (--T == 0) {
-                const auto streamSet = v + FirstStreamSet - PartitionCount;
-                const BufferNode & bn = mBufferGraph[streamSet];
+                #ifndef NDEBUG
+                assert (visited.count(v) == 0);
+                visited.emplace(v);
+                #endif
 
-                assert (bn.isThreadLocal());
-                assert (mThreadLocalStartOffset[streamSet] == nullptr);
-                assert (mThreadLocalEndOffset[streamSet] == nullptr);
+                const auto streamSet = v + FirstStreamSet - PartitionCount;
+                assert (mIsThreadLocalStreamSet.count(streamSet));
+                const auto & Tv = ThreadLocalPlacement[v];
 
                 Value * start = nullptr;
                 Value * end = nullptr;
 
-                const auto output = in_edge(streamSet, mBufferGraph);
-                const BufferPort & bp = mBufferGraph[output];
-                const auto producer = parent(streamSet, mBufferGraph);
-                const auto strideSize = getKernel(producer)->getStride();
-                const auto overflow = (bp.Maximum * StrideStepLength[producer] + Rational{bp.RequiredOverflowSpace}) / strideSize;
-
-                Value * const maxStrides = b.CreateAdd(maximumNumOfStrides, b.getSize(ceiling(overflow)));
-
-                assert (FirstKernelInPartition[mCurrentPartitionId] <= producer && producer < FirstKernelInPartition[mCurrentPartitionId + 1]);
-                if (producer == mKernelId) {
-                    selected.push_back(streamSet);
+                Value * const maxStrides = b.CreateAdd(maximumNumOfStrides, b.getSize(Tv.OverflowStrideAdjustment));
+                if (streamSet <= LastStreamSet) {
+                    const auto producer = parent(streamSet, mBufferGraph);
+                    assert (FirstKernelInPartition[mCurrentPartitionId] <= producer && producer < FirstKernelInPartition[mCurrentPartitionId + 1]);
+                    if (producer == mKernelId) {
+                        selected.push_back(streamSet);
+                    }
                 }
 
                 Value * const off = b.CreateShl(b.CreateCeilUMulRational(maxStrides, ThreadLocalPlacement[e]), LOG_2_PAGE_SIZE);
@@ -366,30 +355,30 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
                 mThreadLocalStartOffset[streamSet] = start;
                 mThreadLocalEndOffset[streamSet] = end;
 
-                if (LLVM_UNLIKELY(mCheckStreamSets)) {
-                    auto & dl = b.getModule()->getDataLayout();
-                    ExternalBuffer * const buf = cast<ExternalBuffer>(bn.Buffer);
-                    const auto ts = b.getTypeSize(dl, buf->getType());
-                    buf->setCapacity(b, b.CreateMulRational(off, Rational{bw, ts}));
-                }
+                if (streamSet <= LastStreamSet) {
 
-                for (auto inOut = streamSet; LLVM_UNLIKELY(out_degree(inOut, InOutStreamSetReplacement)); ) {
-                    inOut = child(inOut, InOutStreamSetReplacement);
-                    mThreadLocalStartOffset[inOut] = start;
-                    mThreadLocalEndOffset[inOut] = end;
+                    if (LLVM_UNLIKELY(mCheckStreamSets)) {
+                        auto & dl = b.getModule()->getDataLayout();
+                        const auto & bn = mBufferGraph[streamSet];
+                        ExternalBuffer * const buf = cast<ExternalBuffer>(bn.Buffer);
+                        const auto ts = b.getTypeSize(dl, buf->getType());
+                        buf->setCapacity(b, b.CreateMulRational(off, Rational{bw, ts}));
+                    }
+
+                    for (auto inOut = streamSet; LLVM_UNLIKELY(out_degree(inOut, InOutStreamSetReplacement)); ) {
+                        inOut = child(inOut, InOutStreamSetReplacement);
+                        mThreadLocalStartOffset[inOut] = start;
+                        mThreadLocalEndOffset[inOut] = end;
+                    }
                 }
 
                 #if defined(PRINT_DEBUG_MESSAGES) && !defined(PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY)
                 debugPrint(b, "mappedAddrRange%" PRIu64 " = [%" PRIx64 ", %" PRIx64 ")", b.getSize(streamSet), start, end);
                 #endif
 
-                if (ThreadLocalPlacement[v]) {
+                if (Tv.Terminal) {
                     memoryForSegment = b.CreateUMax(memoryForSegment, end);
                 } else if (out_degree(v, ThreadLocalPlacement) > 0) {
-                    #ifndef NDEBUG
-                    assert (visited.count(v) == 0);
-                    visited.emplace(v);
-                    #endif
                     Q.push(v);
                 }
             }
@@ -403,6 +392,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
     }
 
     assert (memoryForSegment);
+    assert ((mIsThreadLocalStreamSet.size() + 1) == visited.size() && mIsThreadLocalStreamSet.count(mCurrentPartitionId) == 0);
 
     if (LLVM_UNLIKELY(CheckAssertions())) {
 
@@ -462,10 +452,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
     #endif
     for (auto i = selected.rbegin(); i != selected.rend(); ++i) {
         const auto streamSet = *i;
-        assert (mBufferGraph[streamSet].isThreadLocal());
-        const auto output = in_edge(streamSet, mBufferGraph);
-        const BufferPort & bp = mBufferGraph[output];
-        Value * const priorEnd = mThreadLocalEndOffsetAtEntryPhi[bp.Port.Number];
+        Value * const priorEnd = mThreadLocalEndOffsetAtEntryPhi[streamSet];
         Value * const priorStart = mThreadLocalStartOffsetAtEntryPhi[streamSet];
         Value * const priorLength = b.CreateSub(priorEnd, priorStart);
         Value * const priorPtr = b.CreateGEP(int8Ty, mThreadLocalStreamSetBaseAddress, priorStart);
@@ -498,42 +485,19 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
     threadLocalBaseAttrPhi->addIncoming(newThreadLocalBaseAddressPhi, afterExpansion);
     mThreadLocalStreamSetBaseAddress = threadLocalBaseAttrPhi;
 
-    for (auto output : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
-        const auto streamSet = target(output, mBufferGraph);
-        const BufferNode & bn = mBufferGraph[streamSet];
-        if (bn.isThreadLocal()) {
+    for (auto streamSet : mIsThreadLocalStreamSet) {
+        PHINode * const startPhi = b.CreatePHI(sizeTy, 2);
+        startPhi->addIncoming(mThreadLocalStartOffsetAtEntryPhi[streamSet], entryBlock);
+        startPhi->addIncoming(mThreadLocalStartOffset[streamSet], afterExpansion);
+        mThreadLocalStartOffset[streamSet] = startPhi;
 
-            PHINode * const phi = b.CreatePHI(sizeTy, 2);
-            phi->addIncoming(mThreadLocalStartOffsetAtEntryPhi[streamSet], entryBlock);
-            phi->addIncoming(mThreadLocalStartOffset[streamSet], afterExpansion);
-            mThreadLocalStartOffset[streamSet] = phi;
-
-            const BufferPort & bp = mBufferGraph[output];
-            PHINode * const phi2 = b.CreatePHI(sizeTy, 2);
-            phi2->addIncoming(mThreadLocalEndOffsetAtEntryPhi[bp.Port.Number], entryBlock);
-            phi2->addIncoming(mThreadLocalEndOffset[streamSet], afterExpansion);
-            mThreadLocalEndOffset[streamSet] = phi2;
-
-        }
-    }
-
-    const auto oneAfterLastKernel = FirstKernelInPartition[mCurrentPartitionId + 1];
-
-    for (auto kernel = mKernelId + 1U; kernel < oneAfterLastKernel; ++kernel) {
-        for (auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
-            const auto streamSet = target(output, mBufferGraph);
-            const BufferNode & bn = mBufferGraph[streamSet];
-            if (bn.isThreadLocal()) {
-                PHINode * const phi = b.CreatePHI(sizeTy, 2);
-                phi->addIncoming(mThreadLocalStartOffsetAtEntryPhi[streamSet], entryBlock);
-                phi->addIncoming(mThreadLocalStartOffset[streamSet], afterExpansion);
-                mThreadLocalStartOffset[streamSet] = phi;
-            }
-        }
+        PHINode * const endPhi = b.CreatePHI(sizeTy, 2);
+        endPhi->addIncoming(mThreadLocalEndOffsetAtEntryPhi[streamSet], entryBlock);
+        endPhi->addIncoming(mThreadLocalEndOffset[streamSet], afterExpansion);
+        mThreadLocalEndOffset[streamSet] = endPhi;
     }
 
     remapThreadLocalBufferMemory(b);
-
 }
 
 
@@ -577,11 +541,46 @@ void PipelineCompiler::remapThreadLocalBufferMemory(KernelBuilder & b) {
             Value * const startOffset = mThreadLocalStartOffset[streamSet]; assert (startOffset);
             Value * const virtualBaseOffset = b.CreateSub(startOffset, offsetBytes);
             Value * const ba = b.CreateGEP(b.getInt8Ty(), mThreadLocalStreamSetBaseAddress, virtualBaseOffset);
-
             buffer->setBaseAddress(b, b.CreatePointerCast(ba, ptrTy));
 
         }
     }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief identifyAllThreadLocalStreamSetsInCurrentPartition
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::identifyAllThreadLocalStreamSetsInCurrentPartition() {
+
+    const auto n = (LastStreamSet - FirstStreamSet) + 1 + PartitionCount;
+    const auto m = PartitionCount + n;
+    assert (num_vertices(ThreadLocalPlacement) == m + 1);
+
+
+    std::queue<unsigned> Q;
+    mIsThreadLocalStreamSet.clear();
+    for (auto u = mCurrentPartitionId;;) {
+        for (auto e : make_iterator_range(out_edges(u, ThreadLocalPlacement))) {
+            const auto v = target(e, ThreadLocalPlacement);
+            assert (PartitionCount <= v && v <= m);
+            if (LLVM_UNLIKELY(v == m)) {
+                continue;
+            }
+            const auto streamSet = v + FirstStreamSet - PartitionCount;
+            assert (FirstStreamSet <= streamSet && streamSet <= (LastStreamSet + PartitionCount));
+            if (mIsThreadLocalStreamSet.count(streamSet) == 0) {
+                mIsThreadLocalStreamSet.insert(streamSet);
+                Q.push(v);
+            }
+        }
+        if (Q.empty()) {
+            break;
+        }
+        u = Q.front();
+        Q.pop();
+    }
+    assert (mIsThreadLocalStreamSet.size() > 0 || out_degree(mCurrentPartitionId, ThreadLocalPlacement) == 0);
+
 }
 
 }

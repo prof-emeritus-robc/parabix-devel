@@ -266,7 +266,10 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
     struct TLVertData {
         size_t Value = 0;
+        size_t Overflow = 0;
+        size_t PartitionId = 0;
         Z3_ast UnitCost = nullptr;
+        Z3_ast Start = nullptr;
         Z3_ast End = nullptr;
     };
 
@@ -276,26 +279,27 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
     // streamsets. (2) determine how many the number of pages to assign each streamset based on the
     // number of strides executed by the parition root.
 
-    const auto n = LastStreamSet - FirstStreamSet + 1U;
+    const auto n = PartitionCount + LastStreamSet - FirstStreamSet + 1U;
 
-    std::vector<unsigned> mapStreamSetToThreadLocal(n);
-    std::vector<Rational> unscaledUnitWeight(n);
-
+    std::vector<unsigned> mapStreamSetToThreadLocal(n, 0);
+    std::vector<Rational> unscaledUnitWeight(n, Rational{0});
+    std::vector<size_t> overflowStrideAdjustment(n, 0);
     std::vector<unsigned> streamSetPartitionId(n);
-//    std::vector<SmallVector<unsigned, 2>> linkedStreamSets(n);
+    std::vector<unsigned> mappedPartitionId;
+    mappedPartitionId.reserve(PartitionCount);
 
     auto & dl = b.getModule()->getDataLayout();
 
     const auto bw = b.getBitBlockWidth();
 
     size_t numOfThreadLocalStreamSets = 0U;
-    size_t packedPartitionCount = 0;
+
 
     #ifdef PRINT_Z3_OPTIMIZATION
     errs() << " -- starting thread local layout\n";
     #endif
 
-    Rational::int_type unscaledUnitWeightDenomLCM = 1U;
+    size_t unscaledUnitWeightDenomLCM = 1U;
 
     const auto pageSize = getPageSize();
 
@@ -305,7 +309,29 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
         const auto startThreadLocalStreamSetCount = numOfThreadLocalStreamSets;
 
+        Rational zeroExtensionSpace{0,1};
+        Rational zeroExtensionOverflow{0,1};
+
+        const auto packedPartitionId = mappedPartitionId.size();
+
         for (auto kernel = firstKernel; kernel < firstKernelOfNextPartition; ++kernel) {
+
+            for (const auto input : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                const BufferPort & bp = mBufferGraph[input];
+                if (LLVM_UNLIKELY(bp.isZeroExtended())) {
+                    const auto streamSet = source(input, mBufferGraph);
+                    const BufferNode & bn = mBufferGraph[streamSet];
+                    Type * const type = bn.Buffer->getType();
+                    const size_t typeSize = b.getTypeSize(dl, type);
+                    const auto W = bp.Maximum * Rational{typeSize * StrideRepetitionVector[kernel],
+                                   bw * pageSize * StrideRepetitionVector[firstKernel]};
+                    zeroExtensionSpace = std::max(zeroExtensionSpace, W);
+
+                    const auto strideSize = getKernel(kernel)->getStride();
+                    const auto O = (bp.Maximum * StrideRepetitionVector[kernel] + Rational{bp.RequiredOverflowSpace}) / strideSize;
+                    zeroExtensionOverflow = std::max(zeroExtensionOverflow, O);
+                }
+            }
 
             for (const auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
                 const auto streamSet = target(output, mBufferGraph);
@@ -313,29 +339,51 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
                 if (bn.isThreadLocal()) {
                     const auto src = mConsumerGraph[streamSet];
+
+                    const BufferPort & bp = mBufferGraph[output];
+                    const auto strideSize = getKernel(kernel)->getStride();
+                    const auto O = (bp.Maximum * StrideRepetitionVector[kernel] + Rational{bp.RequiredOverflowSpace}) / strideSize;
+                    const size_t overflow = ceiling(O);
+
                     if (src == 0) {
                         const auto k = streamSet - FirstStreamSet;
+                        assert (mapStreamSetToThreadLocal[k] == 0);
                         mapStreamSetToThreadLocal[k] = numOfThreadLocalStreamSets;
-                        streamSetPartitionId[numOfThreadLocalStreamSets] = packedPartitionCount;
+                        streamSetPartitionId[numOfThreadLocalStreamSets] = packedPartitionId;
+
                         Type * const type = bn.Buffer->getType();
                         const size_t typeSize = b.getTypeSize(dl, type);
-                        const BufferPort & bp = mBufferGraph[output];
                         const auto W = bp.Maximum * Rational{typeSize * StrideRepetitionVector[kernel],
                                        bw * pageSize * StrideRepetitionVector[firstKernel]};
                         unscaledUnitWeightDenomLCM = boost::lcm(unscaledUnitWeightDenomLCM, W.denominator());
                         unscaledUnitWeight[numOfThreadLocalStreamSets] = W;
+
+                        overflowStrideAdjustment[numOfThreadLocalStreamSets] = overflow;
+
                         ++numOfThreadLocalStreamSets;
-//                        linkedStreamSets[k].push_back(k);
                     } else {
                         assert (mConsumerGraph[src] == 0);
-//                        linkedStreamSets[src - FirstStreamSet].push_back(streamSet - FirstStreamSet);
+                        const auto j = mapStreamSetToThreadLocal[src - FirstStreamSet];
+                        assert (j < numOfThreadLocalStreamSets);
+                        overflowStrideAdjustment[j] = std::max(overflowStrideAdjustment[j], overflow);
                     }
                 }
             }
         }
 
+        if (zeroExtensionSpace.numerator() > 0) {
+            const auto k = LastStreamSet - FirstStreamSet + partitionId + 1U;
+            assert (mapStreamSetToThreadLocal[k] == 0);
+            mapStreamSetToThreadLocal[k] = numOfThreadLocalStreamSets;
+            streamSetPartitionId[numOfThreadLocalStreamSets] = packedPartitionId;
+            unscaledUnitWeightDenomLCM = boost::lcm(unscaledUnitWeightDenomLCM, (size_t)zeroExtensionSpace.denominator());
+            unscaledUnitWeight[numOfThreadLocalStreamSets] = zeroExtensionSpace;
+            overflowStrideAdjustment[numOfThreadLocalStreamSets] = ceiling(zeroExtensionOverflow);
+            ++numOfThreadLocalStreamSets;
+        }
+
         if (startThreadLocalStreamSetCount != numOfThreadLocalStreamSets) {
-            ++packedPartitionCount;
+            mappedPartitionId.push_back(partitionId);
         }
 
     }
@@ -343,8 +391,11 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
     const auto m = PartitionCount + n;
 
     ThreadLocalPlacementGraph T(m + 1U);
-    for (size_t i = 0; i <= m; ++i) {
-        T[i] = false;
+
+    for (unsigned i = 0; i <= m; ++i) {
+        auto & Ti = T[i];
+        Ti.OverflowStrideAdjustment = 0;
+        Ti.Terminal = false;
     }
 
     if (numOfThreadLocalStreamSets) {
@@ -352,7 +403,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         ConflictGraph I(numOfThreadLocalStreamSets);
 
         std::vector<unsigned> remaining(numOfThreadLocalStreamSets, 0);
-        std::vector<unsigned> mapThreadLocalToStreamSet(numOfThreadLocalStreamSets);
+        std::vector<unsigned> mapThreadLocalToStreamSet(numOfThreadLocalStreamSets, 0);
 
         for (unsigned partitionId = 0; partitionId < PartitionCount; ++partitionId) {
             const auto firstKernel = FirstKernelInPartition[partitionId];
@@ -390,6 +441,26 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             // Determine which streamsets are no longer alive
             for (auto kernel = firstKernel; kernel < firstKernelOfNextPartition; ++kernel) {
 
+                bool hasZeroExtendedInput = false;
+
+                // TODO: if only one thread-local input is zero extended, we technically do not
+                // need to mark the zero extension buffer as conflicting with that input. We do
+                // conflict with all other thread-local inputs.
+
+                for (const auto input : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                    const BufferPort & bp = mBufferGraph[input];
+                    if (LLVM_UNLIKELY(bp.isZeroExtended())) {
+                        assert (mBufferGraph[source(input, mBufferGraph)].isNonThreadLocal());
+                        const auto k = LastStreamSet + partitionId + 1U;
+                        const auto j = mapStreamSetToThreadLocal[k - FirstStreamSet];
+                        assert (mapThreadLocalToStreamSet[j] == 0 || mapThreadLocalToStreamSet[j] == k);
+                        mapThreadLocalToStreamSet[j] = k;
+                        remaining[j] = 1U;
+                        hasZeroExtendedInput = true;
+                        break;
+                    }
+                }
+
                 for (const auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
                     const auto streamSet = target(output, mBufferGraph);
                     assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
@@ -402,8 +473,10 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                         const auto j = mapStreamSetToThreadLocal[v - FirstStreamSet];
                         assert (j < numOfThreadLocalStreamSets);
                         if (src == 0) {
+                            assert (mapThreadLocalToStreamSet[j] == 0);
                             mapThreadLocalToStreamSet[j] = streamSet;
                         }
+                        assert (mapThreadLocalToStreamSet[j] != 0);
                         remaining[j] += 1U;
                     }
                 }
@@ -435,6 +508,14 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                     }
                 }
 
+                if (LLVM_UNLIKELY(hasZeroExtendedInput)) {
+                    const auto k = LastStreamSet + partitionId + 1U;
+                    const auto j = mapStreamSetToThreadLocal[k - FirstStreamSet];
+                    assert (mapThreadLocalToStreamSet[j] == k);
+                    assert (remaining[j] == 1);
+                    remaining[j] = 0U;
+                }
+
                 for (const auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
                     const auto streamSet = target(output, mBufferGraph);
                     assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
@@ -458,18 +539,22 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         }
         #endif
 
-        ThreadLocalConflictGraph = ThreadLocalConflictGraphType(n);
+        const auto l = LastStreamSet - FirstStreamSet + 1U;
+
+        ThreadLocalConflictGraph = ThreadLocalConflictGraphType(l);
 
         for (auto e : make_iterator_range(edges(I))) {
             auto getVertex = [&](const size_t u) {
-                assert (u < numOfThreadLocalStreamSets);
+                assert (u < mapThreadLocalToStreamSet.size());
                 const auto v = mapThreadLocalToStreamSet[u];
-                assert (FirstStreamSet <= v && v <= LastStreamSet);
-                assert (mConsumerGraph[v] == 0);
-                assert (mBufferGraph[v].isThreadLocal());
+                assert (v >= FirstStreamSet);
                 return v - FirstStreamSet;
             };
-            add_edge(getVertex(source(e, I)), getVertex(target(e, I)), ThreadLocalConflictGraph);
+            const auto u = getVertex(source(e, I));
+            const auto v = getVertex(target(e, I));
+            if (u < l && v < l) {
+                add_edge(u, v, ThreadLocalConflictGraph);
+            }
         }
 
         #ifdef PRINT_Z3_OPTIMIZATION
@@ -490,7 +575,6 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         END_SCOPED_REGION
         #endif
 
-
         std::vector<size_t> unitWeight(n + 1);
         for (unsigned i = 0; i < numOfThreadLocalStreamSets; ++i) {
             const auto W = unscaledUnitWeight[i] * unscaledUnitWeightDenomLCM;
@@ -500,7 +584,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         unitWeight[n] = 0;
 
         BufferLayoutOptimizer BA(numOfThreadLocalStreamSets,
-                                 packedPartitionCount,
+                                 mappedPartitionId.size(),
                                  I, unitWeight, streamSetPartitionId,
                                  rng);
 
@@ -515,24 +599,30 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         const auto intervals = BA.translate(O, rng);
         assert (intervals.size() == numOfThreadLocalStreamSets);
 
-        ThreadLocalDataGraph D(m + 1U);
+        const auto w = m + PartitionCount + 1U;
+
+        ThreadLocalDataGraph D(w);
 
         for (unsigned i = 0; i < numOfThreadLocalStreamSets; ++i) {
             const auto streamSet = mapThreadLocalToStreamSet[i];
-            assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
-            assert (mConsumerGraph[streamSet] == 0);
-            TLVertData & N = D[PartitionCount + streamSet - FirstStreamSet];
+            assert (FirstStreamSet <= streamSet && streamSet < (LastStreamSet + PartitionCount));
+            assert (mapStreamSetToThreadLocal[streamSet - FirstStreamSet] == i);
+            const auto j = PartitionCount + streamSet - FirstStreamSet; assert (j < w);
+            TLVertData & N = D[j];
             N.Value = unitWeight[i];
+            N.Overflow = overflowStrideAdjustment[i];
+            const auto k = streamSetPartitionId[i];
+            const auto partId = mappedPartitionId[k];
+            assert (partId < PartitionCount);
+            N.PartitionId = partId;
+            assert (T[j].OverflowStrideAdjustment == 0);
+            T[j].OverflowStrideAdjustment = overflowStrideAdjustment[i];
             const auto & C = intervals[i];
             #ifndef NDEBUG
             assert (C.upper() > C.lower());
             #endif
             if (C.lower() == 0) {
-                const auto producer = parent(streamSet, mBufferGraph);
-                assert (FirstKernel <= producer && producer <= LastKernel);
-                const auto partId = KernelPartitionId[producer];
-                assert (partId < PartitionCount);
-                add_edge(partId, PartitionCount + streamSet - FirstStreamSet, D);
+                add_edge(partId, j, D);
             }
         }
 
@@ -548,7 +638,9 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
             auto make_edge = [&](const size_t i, const size_t j) {
                 const auto u = mapThreadLocalToStreamSet[i];
+                assert (u >= FirstStreamSet);
                 const auto v = mapThreadLocalToStreamSet[j];
+                assert (v >= FirstStreamSet);
                 add_edge(PartitionCount + u - FirstStreamSet, PartitionCount + v - FirstStreamSet, D);
             };
 
@@ -571,33 +663,28 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             unvisitedAncestors[i] = a;
             if (a != 0 && out_degree(i, D) == 0) {
                 const auto streamSet = FirstStreamSet + i - PartitionCount;
-                assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
-                const auto producer = parent(streamSet, mBufferGraph);
-                assert (FirstKernel <= producer && producer <= LastKernel);
-                const auto partId = KernelPartitionId[producer];
-                assert (partId < PartitionCount);
-                add_edge(i, partId, D);
+                const TLVertData & N = D[PartitionCount + streamSet - FirstStreamSet];
+                add_edge(i, N.PartitionId, D);
             }
         }
 
         for (size_t i = 0; i < PartitionCount; ++i) {
-            const auto a = in_degree(i, D);
-            unvisitedAncestors[i] = a;
+            unvisitedAncestors[i] = in_degree(i, D);
         }
 
         #ifdef PRINT_Z3_OPTIMIZATION
         BEGIN_SCOPED_REGION
         auto & out = errs();
         out << "digraph \"" << "D" << "\" {\n";
-
-
-        for (unsigned i = 0; i < PartitionCount + n; ++i) {
+        for (unsigned i = 0; i < w; ++i) {
             if (degree(i, D) > 0) {
                 out << "v" << i << " [label=\"";
                 if (i < PartitionCount) {
                     out << "P_" << i;
-                } else if (i < m) {
+                } else if (i < n) {
                     out << "S_" << (FirstStreamSet + i - PartitionCount);
+                } else if (i < m) {
+                    out << "Z_" << (i - n);
                 } else {
                     out << 'X';
                 }
@@ -683,6 +770,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
         std::vector<Z3_ast> controlVar(PartitionCount, nullptr);
 
+        SmallVector<Z3_ast, 16> startOffset;
         SmallVector<Z3_ast, 16> endOffset;
 
         // Because each buffer is paged aligned, different num of stride counts can change which thread-local buffer
@@ -695,12 +783,15 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                 const Z3_ast rv = Z3_mk_fresh_const(ctx, nullptr, intType);
                 // the initial stride count is always set to the max during allocation
                 const auto max = MaximumNumOfStrides[FirstKernelInPartition[partId]];
+
                 hard_assert(Z3_mk_ge(ctx, rv, constant_int(max)));
                 controlVar[partId] = rv;
 
                 auto & Dp = D[partId];
                 Dp.UnitCost = z3_ZERO;
+                Dp.Start = z3_ZERO;
                 Dp.End = z3_ZERO;
+                Dp.Overflow = max;
 
                 assert (S.empty());
                 for (auto u = partId;;) {
@@ -709,7 +800,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
                     for (auto e : make_iterator_range(out_edges(u, D))) {
                         const auto v = target(e, D);
-                        assert (PartitionCount <= v && v <= m || v == partId);
+                        assert (PartitionCount <= v || v == partId);
                         assert (v != u);
                         auto & U = unvisitedAncestors[v];
                         assert (U > 0);
@@ -724,34 +815,60 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
                              Z3_ast maxPriorEnd = nullptr;
 
+
                              endOffset.resize(d);
 
                              if (d == 1) {
 
                                  const auto s = source(*ei_begin, D);
+                                 assert (s < num_vertices(D));
                                  maxPriorEnd = D[s].End;
                                  endOffset[0] = maxPriorEnd;
 
                              } else {
 
+                                 auto canRemoveFirst = [&](const size_t i, const size_t j) -> bool {
+
+                                     assert (startOffset[i] && endOffset[i]);
+                                     assert (startOffset[j] && endOffset[j]);
+
+                                     // If I cannot start within the range of J and I cannot end
+                                     // after J ends, return true.
+
+                                     Z3_solver_push(ctx, solver);
+                                     Z3_ast args[2];
+                                     args[0] = Z3_mk_ge(ctx, startOffset[i], startOffset[j]);
+                                     args[1] = Z3_mk_lt(ctx, startOffset[i], endOffset[j]);
+                                     args[0] = Z3_mk_and(ctx, 2, args);
+                                     args[1] = Z3_mk_gt(ctx, endOffset[i], endOffset[j]);
+                                     hard_assert(Z3_mk_or(ctx, 2, args));
+                                     const Z3_lbool r = check();
+                                     Z3_solver_pop(ctx, solver, 1);
+                                     return r == Z3_L_FALSE;
+                                 };
+
                                  size_t c = 0;
-                                 for (auto ei = ei_begin; ei != ei_end; ++ei) {
+                                 startOffset.resize(d);
+                                 for (auto ei = ei_begin; ei != ei_end; ++ei, ++c) {
                                      const auto s = source(*ei, D);
-                                     endOffset[c++] = D[s].End; assert (D[s].End);
+                                     const auto & Ds = D[s];
+                                     startOffset[c] = Ds.Start; assert (Ds.Start);
+                                     endOffset[c] = Ds.End; assert (Ds.End);
                                  }
                                  assert (c == d);
 
                                  assert (check() == Z3_L_TRUE);
 
                                  for (size_t i = 1; i < d; ++i ) {
+                                     assert (endOffset[i]);
                                      for (size_t j = 0; j < i; ++j) {
                                          if (endOffset[j]) {
-                                             if (neverGreaterThan(endOffset[i], endOffset[j])) {
+                                             if (canRemoveFirst(i, j)) {
                                                  endOffset[i] = nullptr;
                                                  break;
                                              }
 
-                                             if (neverGreaterThan(endOffset[j], endOffset[i])) {
+                                             if (canRemoveFirst(j, i)) {
                                                  endOffset[j] = nullptr;
                                              }
                                          }
@@ -776,7 +893,9 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
                                 for (size_t i = 0; i < d; ++i ) {
                                     if (endOffset[i]) {
-                                        add_edge(source(*(ei_begin + i), D), m, D);
+                                        const auto s = source(*(ei_begin + i), D);
+                                        assert (s < m);
+                                        add_edge(s, m, D);
                                     }
                                 }
 
@@ -788,23 +907,18 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                                 assert (V.numerator() > 0);
                                 for (size_t i = 0; i < d; ++i ) {
                                     if (endOffset[i]) {
-                                        add_edge(source(*(ei_begin + i), D), v, V, T);
+                                        const auto s = source(*(ei_begin + i), D);
+                                        assert (s < m);
+                                        assert (v <= m);
+                                        add_edge(s, v, V, T);
                                     }
                                 }
 
-                                const auto streamSet = FirstStreamSet + v - PartitionCount;
-                                const auto output = in_edge(streamSet, mBufferGraph);
-                                const BufferPort & bp = mBufferGraph[output];
-                                const auto producer = source(output, mBufferGraph);
-                                const auto strideSize = getKernel(producer)->getStride();
-                                const auto numOfStridesInOverflow =
-                                    (bp.Maximum * StrideRepetitionVector[producer] + Rational{bp.RequiredOverflowSpace}) / strideSize;
-
-                                Z3_ast cost = add(rv, constant_int(ceiling(numOfStridesInOverflow)));
+                                Z3_ast cost = add(rv, constant_int(Dv.Overflow));
                                 cost = multiply(cost, constant_int(Dv.Value));
                                 cost = round_up_to_nearest_lcm_of_denom_multiple(cost);
                                 Dv.UnitCost = cost;
-
+                                Dv.Start = maxPriorEnd;
                                 Dv.End = add(maxPriorEnd, cost);
 
                                 S.push(v);
@@ -838,14 +952,12 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         size_t c = 0;
         for (auto ei = ei_begin; ei != ei_end; ++ei, ++c) {
             const auto s = source(*ei, D);
-            T[s] = true;
-            endOffset[c] = D[s].End;
+            T[s].Terminal = true;
+            const auto & Ds = D[s];
+            endOffset[c] = Ds.End;
             assert (endOffset[c]);
             assert (endOffset[c] != z3_ZERO);
-            const auto streamSet = FirstStreamSet + s - PartitionCount;
-            const auto producer = parent(streamSet, mBufferGraph);
-            const auto partId = KernelPartitionId[producer];
-            cVar[c] = controlVar[partId];
+            cVar[c] = controlVar[Ds.PartitionId];
         }
         assert (c == d);
 
@@ -891,9 +1003,14 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
                 minSegmentSize = std::max(minSegmentSize, num);
 
-                add_edge(source(*(ei_begin + i), D), m, Rational{}, T);
+                const auto s = source(*(ei_begin + i), D);
+                assert (s < m);
+                assert (m < num_vertices(T));
+                add_edge(s, m, Rational{0,1}, T);
             }
         }
+
+
 
         Z3_model_dec_ref(ctx, model);
         Z3_solver_dec_ref(ctx, solver);
@@ -916,11 +1033,23 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                 out << "v" << i << " [label=\"";
                 if (i < PartitionCount) {
                     out << "P_" << i;
-                } else {
+                } else if (i < n) {
                     out << "S_" << (FirstStreamSet + i - PartitionCount);
-                    if (T[i]) {
+                    const auto & Ti = T[i];
+                    if (Ti.OverflowStrideAdjustment) {
+                        out << '+' << Ti.OverflowStrideAdjustment;
+                    }
+                    if (Ti.Terminal) {
                         out << '*';
                     }
+                } else if (i < m) {
+                    out << "Z_" << (i - n);
+                    const auto & Ti = T[i];
+                    if (Ti.OverflowStrideAdjustment) {
+                        out << '+' << Ti.OverflowStrideAdjustment;
+                    }
+                } else {
+                    out << "X";
                 }
                 out << "\"];\n";
             }

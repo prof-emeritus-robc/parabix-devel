@@ -21,12 +21,6 @@
 #include <toolchain/toolchain.h>
 #include <array>
 
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(11, 0, 0)
-    using FixedVectorType = llvm::VectorType;
-#else
-    using FixedVectorType = llvm::FixedVectorType;
-#endif
-
 enum NonCarryCollapsingMode {
     NestedCapacity = 0,
     LastIncomingCarryLoopIteration = 1,
@@ -74,13 +68,7 @@ static Type * toSummaryType(KernelBuilder & b, int32_t summarySize) {
 }
 
 inline unsigned getVectorBitWidth(const Type * const ty) {
-    #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(11, 0, 0)
-    return cast<FixedVectorType>(ty)->getPrimitiveSizeInBits();
-    #elif LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(16, 0, 0)
-    return cast<FixedVectorType>(ty)->getPrimitiveSizeInBits().getFixedSize();
-    #else
     return cast<FixedVectorType>(ty)->getPrimitiveSizeInBits().getFixedValue();
-    #endif
 }
 
 inline unsigned getTypeBitWidth(const Type * const ty) {

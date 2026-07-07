@@ -35,7 +35,6 @@ void PipelineCompiler::executeKernel(KernelBuilder & b) {
             || ((mRecordHistogramData || mKernelRequiresIllustratorObject || mHasPipelineIllustratedStreamSet) && !hasAnyGreedyInput(mKernelId));
     mAllowDataParallelExecution = isDataParallel(mKernelId);
     mHasPrincipalInputRate = hasPrincipalInputRate();
-
     bool checkInputChannels = false;
     for (const auto input : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
         const BufferPort & port = mBufferGraph[input];
@@ -641,9 +640,6 @@ void PipelineCompiler::writeInsufficientIOExit(KernelBuilder & b) {
         }
         b.CreateBr(mKernelLoopExit);
     }
-    if (mIsPartitionRoot) {
-
-    }
 
     BasicBlock * const exitBlock = b.GetInsertBlock();
     for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
@@ -667,18 +663,7 @@ void PipelineCompiler::writeInsufficientIOExit(KernelBuilder & b) {
     if (mIsPartitionRoot) {
         mFinalPartitionSegmentAtLoopExitPhi->addIncoming(b.getFalse(), exitBlock);
         mTotalNumOfStridesAtLoopExitPhi->addIncoming(currentNumOfStrides, exitBlock);
-        mThreadLocalStreamSetBaseAddressAtExitPhi->addIncoming(UndefValue::get(b.getInt8PtrTy()), exitBlock);
-        const auto oneAfterLastKernel = FirstKernelInPartition[mCurrentPartitionId + 1];
-        Constant * undefVal = UndefValue::get(b.getSizeTy());
-        for (auto kernel = mKernelId; kernel < oneAfterLastKernel; ++kernel) {
-            for (auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
-                const auto streamSet = target(output, mBufferGraph);
-                const BufferNode & bn = mBufferGraph[streamSet];
-                if (bn.isThreadLocal()) {
-                    mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(undefVal, exitBlock);
-                }
-            }
-        }
+        updateThreadLocalMemoryAtInsufficentIOPhiNodes(b);
     }
 
     assert (isFromCurrentFunction(b, mAlreadyProgressedPhi, false));
@@ -801,20 +786,7 @@ void PipelineCompiler::updatePhisAfterTermination(KernelBuilder & b) {
         }
         mTotalNumOfStridesAtLoopExitPhi->addIncoming(finalNumOfStrides, exitBlock);
         mFinalPartitionSegmentAtLoopExitPhi->addIncoming(b.getTrue(), exitBlock);
-//        mPotentialSegmentLengthAtLoopExitPhi->addIncoming(mPotentialSegmentLengthAtTerminationPhi, exitBlock);
-        mThreadLocalStreamSetBaseAddressAtExitPhi->addIncoming(mThreadLocalStreamSetBaseAddress, exitBlock);
-        const auto oneAfterLastKernel = FirstKernelInPartition[mCurrentPartitionId + 1];
-        for (auto kernel = mKernelId; kernel < oneAfterLastKernel; ++kernel) {
-            for (auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
-                const auto streamSet = target(output, mBufferGraph);
-                const BufferNode & bn = mBufferGraph[streamSet];
-                if (bn.isThreadLocal()) {
-                    mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalStartOffset[streamSet], exitBlock);
-                    mThreadLocalStartOffset[streamSet] = mThreadLocalStartOffsetAtExitPhi[streamSet];
-                }
-            }
-        }
-
+        updateThreadLocalMemoryAfterTerminationPhiNodes(b);
     }
     for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
         const auto port = mBufferGraph[e].Port;

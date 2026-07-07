@@ -166,13 +166,9 @@ void PipelineCompiler::releaseSynchronizationLock(KernelBuilder & b, const unsig
         Value * const nextSegNo = b.CreateAdd(segNo, b.getSize(1));
         if (LLVM_UNLIKELY(CheckAssertions())) {
             DataLayout DL(b.getModule());
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(13, 0, 0)
             llvm::MaybeAlign align = Align(DL.getTypeStoreSize(nextSegNo->getType()));
-#endif
             Value * const updated = b.CreateAtomicCmpXchg(waitingOnPtr, segNo, nextSegNo,
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(13, 0, 0)
                                                            *align,
-#endif
                                                            AtomicOrdering::Release, AtomicOrdering::Acquire);
             Value * const observed = b.CreateExtractValue(updated, { 0 });
             Value * const success = b.CreateExtractValue(updated, { 1 });

@@ -6,10 +6,8 @@
 #include <idisa/idisa_sse_builder.h>
 
 #include <llvm/IR/Intrinsics.h>
-#include <llvm/IR/Module.h>
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(10, 0, 0)
 #include <llvm/IR/IntrinsicsX86.h>
-#endif
+#include <llvm/IR/Module.h>
 
 using namespace llvm;
 

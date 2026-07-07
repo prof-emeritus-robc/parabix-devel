@@ -9,11 +9,7 @@
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Constants.h>
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
 #include <llvm/TargetParser/Triple.h>
-#else
-#include <llvm/ADT/Triple.h>
-#endif
 #ifndef NDEBUG
 #include <llvm/IR/Function.h>
 #endif
@@ -377,14 +373,6 @@ public:
     virtual llvm::LoadInst * CreateLoad(llvm::Type * type, llvm::Value * Ptr, bool isVolatile, const llvm::Twine Name = "");
 
     virtual llvm::StoreInst * CreateStore(llvm::Value * Val, llvm::Value * Ptr, bool isVolatile = false);
-
-    #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-    llvm::Value * CreateGEP(llvm::Type * Ty, llvm::Value * Ptr, llvm::ArrayRef<llvm::Value *> IdxList, const llvm::Twine & Name = "", bool IsInBounds = false);
-
-    llvm::Value * CreateInBoundsGEP(llvm::Type *Ty, llvm::Value *Ptr, llvm::ArrayRef<llvm::Value *> IdxList, const llvm::Twine &Name = "") {
-        return CreateGEP(Ty, Ptr, IdxList, Name, /* IsInBounds */ true);
-    }
-    #endif
 
     llvm::LoadInst * CreateAlignedLoad(llvm::Type * type, llvm::Value * Ptr, const unsigned Align, const char * Name);
 

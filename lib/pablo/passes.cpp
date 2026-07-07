@@ -19,11 +19,6 @@
 #include <pablo/pablo_illustratorpass.h>
 #include <boost/regex.hpp>
 
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(7, 0, 0)
-#define OF_Append F_Append
-#endif
-
-
 using namespace llvm;
 
 namespace pablo {

@@ -48,11 +48,7 @@
 #include <llvm/Transforms/Scalar/NewGVN.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <llvm/Transforms/Utils/Local.h>
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(14, 0, 0)
 #include <llvm/IRPrinter/IRPrintingPasses.h>
-#else
-#include <llvm/IR/IRPrintingPasses.h>
-#endif
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(19, 0, 0)
 #include <llvm/IR/PassInstrumentation.h>
 #endif
@@ -66,10 +62,8 @@
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Scalar/SROA.h>
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(7, 0, 0)
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Utils.h>
-#endif
 
 #if BOOST_VERSION >= 107600
 #include <boost/core/bit.hpp>
@@ -304,21 +298,11 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
         FPM.addPass(TracePass(b));
     }
 
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
     FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
-    #elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(14, 0, 0)
-    FPM.addPass(SROAPass());
-    #else
-    FPM.addPass(SROA());
-    #endif
     FPM.addPass(InstCombinePass());
     FPM.addPass(DCEPass());
     FPM.addPass(ReassociatePass());
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(14, 0, 0)
     FPM.addPass(GVNPass());
-    #else
-    FPM.addPass(GVN());
-    #endif
 
     using P = Kernel::OptimizationPass;
 

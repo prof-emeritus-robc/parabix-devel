@@ -63,11 +63,7 @@ generate_function:
 
     Function * const f = Function::Create(funcTy, Function::InternalLinkage, name.str(), m);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-        #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(15, 0, 0)
-        f->setHasUWTable();
-        #else
         f->setUWTableKind(UWTableKind::Default);
-        #endif
     }
 
     LLVMContext & C = m->getContext();

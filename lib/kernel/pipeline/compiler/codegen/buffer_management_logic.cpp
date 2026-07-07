@@ -862,11 +862,7 @@ void PipelineCompiler::prefetchAtLeastThreeCacheLinesFrom(KernelBuilder & b, Val
 
     DataLayout dl(m);
     Type * const elemTy = addr->getType()->getPointerElementType();
-    #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(11, 0, 0)
-    const auto typeSize = dl.getTypeAllocSize(elemTy);
-    #else
     const auto typeSize = dl.getTypeAllocSize(elemTy).getFixedSize();
-    #endif
     assert (typeSize > 0);
 
     IntegerType * const int32Ty = b.getInt32Ty();

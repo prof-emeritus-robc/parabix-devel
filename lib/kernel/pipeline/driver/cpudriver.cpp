@@ -21,18 +21,11 @@
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/CommandLine.h>
 
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(7, 0, 0)
-#define OF_None F_None
-#endif
 #include <llvm/ADT/Statistic.h>
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(8, 0, 0)
-#include <llvm/IR/LegacyPassManager.h>
-#else
 #include <llvm/IR/PassTimingInfo.h>
-#endif
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
-#elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(11, 0, 0)
+#else
 #include <llvm/Support/Host.h>
 #endif
 
@@ -257,12 +250,8 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
         #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
         const auto r = mTarget->addPassesToEmitFile(*pm, *mASMOutputStream, nullptr, CodeGenFileType::AssemblyFile);
-        #elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(10, 0, 0)
-        const auto r = mTarget->addPassesToEmitFile(*pm, *mASMOutputStream, nullptr, CGFT_AssemblyFile);
-        #elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(7, 0, 0)
-        const auto r = mTarget->addPassesToEmitFile(*mPassManager, *mASMOutputStream, nullptr, TargetMachine::CGFT_AssemblyFile);
         #else
-        const auto r = mTarget->addPassesToEmitFile(*mPassManager, *mASMOutputStream, TargetMachine::CGFT_AssemblyFile);
+        const auto r = mTarget->addPassesToEmitFile(*pm, *mASMOutputStream, nullptr, CGFT_AssemblyFile);
         #endif
         if (r) {
             report_fatal_error("LLVM error: could not add emit assembly pass");
@@ -282,26 +271,16 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     mCompiledKernel.clear();
 
     mEngine->finalizeObject();
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(11, 0, 0)
     auto mainFnPtr = mEngine->getFunctionAddress(main->getName().str());
-    #else
-    auto mainFnPtr = mEngine->getFunctionAddress(main->getName());
-    #endif
     removeModules(Normal);
     removeModules(Infrequent);
-    //#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(12, 0, 0)
     mEngine->removeModule(mainModulePtr);
     mEngine->removeModule(mMainModule);
-    //#endif
     return reinterpret_cast<void *>(mainFnPtr);
 }
 
 bool CPUDriver::hasExternalFunction(llvm::StringRef functionName) const {
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(11, 0, 0)
     return RTDyldMemoryManager::getSymbolAddressInProcess(functionName.str());
-    #else
-    return RTDyldMemoryManager::getSymbolAddressInProcess(functionName);
-    #endif
 }
 
 CPUDriver::~CPUDriver() {

@@ -51,10 +51,6 @@ namespace pablo {
 using TypeId = PabloAST::ClassTypeId;
 using IllustratorTypeId = Illustrate::IllustratorTypeId;
 
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(12, 0, 0)
-using FixedVectorType = llvm::VectorType;
-#endif
-
 using Vars = boost::container::flat_set<const Var *>;
 
 template <typename T>

@@ -4,9 +4,7 @@
 #include <llvm/IR/Function.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/core/streamset.h>
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(15, 0, 0)
 #include <llvm/Analysis/ConstantFolding.h>
-#endif
 #ifdef ENABLE_PAPI
 #include <papi.h>
 #include <boost/tokenizer.hpp>
@@ -473,11 +471,7 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(const Relation
     auto getJthOffset = [&](const unsigned j) -> size_t {
         FixedArray<unsigned, 1> off;
         off[0] = j;
-        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(15, 0, 0)
         const Constant * const v = ConstantFoldExtractValueInstruction(ar, off);
-        #else
-        const Constant * const v = ConstantExpr::getExtractValue(ar, off);
-        #endif
         return (cast<ConstantInt>(v)->getLimitedValue() * scale);
     };
 

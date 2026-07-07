@@ -10,10 +10,6 @@
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/raw_ostream.h>
 
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(7, 0, 0)
-#define OF_None F_None
-#endif
-
 using namespace llvm;
 
 namespace pablo {

@@ -13,9 +13,7 @@
 #endif
 #include <llvm/Support/raw_ostream.h>
 #include <boost/interprocess/mapped_region.hpp>
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
 #include <thread>
-#endif
 
 using namespace llvm;
 
@@ -216,11 +214,7 @@ static cl::opt<bool, true> OptSplitTransposition("enable-split-s2p", cl::locatio
 
 static cl::opt<unsigned, true>
 MaxTaskThreadsOption("max-task-threads", cl::location(TaskThreads),
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
                      cl::init(std::thread::hardware_concurrency()),
-#else
-                     cl::init(llvm::sys::getHostNumPhysicalCores()),
-#endif
                      cl::desc("Maximum number of threads to assign for separate pipeline tasks."),
                      cl::value_desc("positive integer"));
 
@@ -374,9 +368,7 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
 void printParabixVersion (raw_ostream & outs) {
     outs << "Parabix revision " << PARABIX_VERSION << "\n";
     outs << "Unicode version " << UCD::UnicodeVersion << "\n";
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
     llvm::sys::printDefaultTargetAndDetectedCPU(outs);
-#endif
 }
 
 void AddParabixVersionPrinter() {
@@ -385,11 +377,7 @@ void AddParabixVersionPrinter() {
 
 void setTaskThreads(unsigned taskThreads) {
     TaskThreads = std::max(taskThreads, 1u);
-#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(16, 0, 0)
     unsigned coresPerTask = std::thread::hardware_concurrency()/TaskThreads;
-#else
-    unsigned coresPerTask = llvm::sys::getHostNumPhysicalCores()/TaskThreads;
-#endif
     SegmentThreads = std::min(coresPerTask, SegmentThreads);
 }
 

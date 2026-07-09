@@ -129,10 +129,12 @@ protected:
 class BPERangeSeed : public PabloKernel {
 public:
     BPERangeSeed(LLVMTypeSystemInterface & ts, StreamSet * basis,
-                 StreamSet * source, StreamSet * active, StreamSet * end)
+                 StreamSet * source, StreamSet * active, StreamSet * end,
+                 unsigned outW)
     : PabloKernel(ts, "BPERangeSeed",
                   {Binding{"basis", basis}},
-                  {Binding{"source", source}, Binding{"active", active}, Binding{"end", end}}) {}
+                  {Binding{"source", source}, Binding{"active", active}, Binding{"end", end}}),
+      mOutW(outW) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -164,15 +166,17 @@ protected:
                     bnc.Select(m_173,     bnc.Create(255),          // 173     → 255
                                           bnc.SubModular(b, 68))))));// 174..255→ −68 (default)
 
-        // Write the id into the 16-bit `source` stream (ids ≤255 → high bits 0),
-        // active = all 1s, end = all 0s.
+        // Write the id into the `source` stream (mOutW bits — base ids ≤255 fit in
+        // 8; any extra declared bits are zero). active = all 1s, end = all 0s.
         Var * sOut = getOutputStreamVar("source");
-        for (unsigned i = 0; i < 16; i++)
+        for (unsigned i = 0; i < mOutW; i++)
             pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)),
                             (i < id.size()) ? id[i] : zeroes);
         pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)), ones);
         pb.createAssign(pb.createExtract(getOutputStreamVar("end"),    pb.getInteger(0)), zeroes);
     }
+private:
+    unsigned mOutW;
 };
 
 // Hash a rule group's (idA,idB,idAB,lenB) list → unique cache name per kernel,
@@ -182,7 +186,41 @@ uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
     auto mix = [&](uint64_t x){ h = (h ^ x) * 0x100000001B3ull; };
     for (const auto & r : rules) { mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenB); }
     return h;
-}// BPEMergeKernel — one id-range, REAL BPE merge on the id stream (Stage B).
+}
+
+// Minimum bit-width to represent ids 0..maxId (>=1). Lets each range kernel run a
+// narrow id BixNum instead of a fixed 16 bits: fewer per-bit EQ/Sel ops → smaller
+// LLVM IR → faster JIT. Width grows down the pipeline as ids get bigger.
+//   maxId 255→8, 511→9, 1023→10, 2047→11, 4095→12, 50256→16.
+static unsigned bitsFor(unsigned maxId) {
+    unsigned b = 1;
+    while (b < 16 && (1u << b) <= maxId) ++b;
+    return b;
+}
+// this kernel pads a narrow id stream back up to 16 bits 
+// Zero-extend an N-bit id stream to 16 bits. The pipeline runs narrow interior
+// streams; emission (P2S16Kernel) needs a 16-bit BixNum, so the final source is
+// widened once here. Shape-only (no token data) → constant cache name.
+class BPEWidenKernel : public PabloKernel {
+public:
+    BPEWidenKernel(LLVMTypeSystemInterface & ts, StreamSet * in, StreamSet * out)
+    : PabloKernel(ts, "BPEWiden16", {Binding{"in", in}}, {Binding{"out", out}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        // Widen the input stream to 16 bits. The input may be narrower than 16 bits, so
+        // we zero-extend it. The output is a 16-bit BixNum. 
+        std::vector<PabloAST*> in = getInputStreamSet("in");
+        PabloAST * zeroes = pb.createZeroes();
+        Var * out = getOutputStreamVar("out");
+        // Write the input bits to the output, zero-extending if necessary.
+        for (unsigned i = 0; i < 16; i++)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)),
+                            (i < in.size()) ? in[i] : zeroes);
+    }
+};
+
+// BPEMergeKernel — one id-range, REAL BPE merge on the id stream (Stage B).
 // `source` carries a token id at each token's END byte (seeded = base id per
 // raw byte). For each rule (A,B → AB), in idAB-ASC = rank-ASC order:
 //     Aend  = EQ(source, idA)                 // where token A currently ends
@@ -199,12 +237,12 @@ public:
                    StreamSet * sourceIn, StreamSet * meIn,
                    StreamSet * sourceOut, StreamSet * meOut,
                    std::vector<MergeRule> rules, uint64_t shapeHash,
-                   unsigned maxLen)
+                   unsigned maxLen, unsigned outW)
     : PabloKernel(ts, "BPEMerge_h" + std::to_string(shapeHash),
                   {Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
                    Binding{"meIn", meIn}},
                   {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
-      mRules(std::move(rules)) {}
+      mRules(std::move(rules)), mOutW(outW) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -225,14 +263,15 @@ protected:
         // idAcc threaded as PLAIN values, NOT Pablo Vars: each
         // rule reassigns idAcc[i] = Sel(...) so a later rule reads the just-stamped
         // id.
-        std::vector<PabloAST*> idAcc(16);                  // threaded id stream
-        for (unsigned i = 0; i < 16; i++)
-            idAcc[i] = (i < srcBits.size()) ? srcBits[i] : zeroes;
+        const unsigned inW = srcBits.size();               // input id width (prev kernel's outW)
+        std::vector<PabloAST*> idAcc(mOutW);               // threaded id stream at THIS range's width
+        for (unsigned i = 0; i < mOutW; i++)
+            idAcc[i] = (i < inW) ? srcBits[i] : zeroes;     // zero-extend input up to outW
 
         // matchEnd — 1-bit boundary mask, threaded kernel→kernel (seeded all-ones =
         // every byte ends a base token). Each fired merge A+B→AB clears the swallowed
         // seam (A's last byte) so only outermost token ends survive.
-        PabloAST * matchEnd = getInputStreamSet("meIn")[0];
+        PabloAST * matchEnd = getInputStreamSet("meIn")[0];   // 1-bit boundary mask, ones from active
 
         // One looked-ahead copy of sourceIn per DISTINCT lenB. LookAhead(d) reads
         // position p+d — legal only on an INPUT (sourceIn declares LookAhead(maxLen)).
@@ -240,10 +279,9 @@ protected:
         std::map<unsigned, BixNum> aheadByLen;
         for (const auto & r : mRules) {
             if (aheadByLen.count(r.lenB)) continue;
-            std::vector<PabloAST*> bits(16, zeroes);
-            for (unsigned i = 0; i < 16; i++)
-                if (i < srcBits.size())
-                    bits[i] = pb.createLookahead(srcBits[i], (int64_t) r.lenB);
+            std::vector<PabloAST*> bits(inW, zeroes);
+            for (unsigned i = 0; i < inW; i++)
+                bits[i] = pb.createLookahead(srcBits[i], (int64_t) r.lenB);
             aheadByLen.emplace(r.lenB, BixNum(bits.begin(), bits.end()));
         }
 
@@ -254,7 +292,7 @@ protected:
             BixNum cur(idAcc.begin(), idAcc.end());          // current (cascaded) id stream
             PabloAST * Aend = bnc.EQ(cur, r.idA);            // token A ends here
 
-            Var * mergeV = pb.createVar("merge", zeroes);    // non-self-ref carry out of the If
+            Var * mergeV = pb.createVar("merge", zeroes);    // temporary variable to indicate where a merge should happen
             auto body = pb.createScope();
             BixNumCompiler bncB(body);
             BixNum curB(idAcc.begin(), idAcc.end());
@@ -263,27 +301,27 @@ protected:
                 body.createAnd(body.createAdvance(Aend, r.lenB), Bend));
             pb.createIf(Aend, body);                         // skip body in blocks with no idA
 
-            for (unsigned i = 0; i < 16; i++)                // stamp idAB at the merge 
+            for (unsigned i = 0; i < mOutW; i++)             // stamp idAB at the merge
                 idAcc[i] = pb.createSel(mergeV, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
 
-            // ── clear the swallowed A|B seam at A's end (boundary mask, approximate) 
-            // Bahead = idB sits lenB bytes ahead of A's end (LookAhead on the INPUT).
-            // mergedAend = A ends here AND B follows → drop that seam from matchEnd.
-            // NOTE (design choice): B read from the kernel INPUT, so a B produced by
-            // an earlier rule in THIS kernel is invisible → that one seam stays
-            // (accepted approximation).
-            PabloAST * Bahead     = bnc.EQ(aheadByLen.at(r.lenB), r.idB);
-            PabloAST * mergedAend = pb.createAnd(Aend, Bahead);
-            matchEnd = pb.createAnd(matchEnd, pb.createNot(mergedAend), "meClear");
+            // Mask logic to clear the swallowed A-end from matchEnd. The merge is detected at
+            // A's end, but the A-end is swallowed by the merge → clear that bit from matchEnd. 
+            // The B-end is where the merged token AB ends, so it stays.
+            PabloAST * Bahead     = bnc.EQ(aheadByLen.at(r.lenB), r.idB);  // is idB lenB bytes ahead of A's end?
+            PabloAST * mergedAend = pb.createAnd(Aend, Bahead);            // A ends here AND B follows = swallowed seam
+            matchEnd = pb.createAnd(matchEnd, pb.createNot(mergedAend), "meClear");   // erase that seam bit
         }
 
+        // Write the final idAcc into the mOutW-bit `sourceOut` stream and matchEnd
+        // into the 1-bit `meOut`. The next kernel reads these.
         Var * sOut = getOutputStreamVar("sourceOut");
-        for (unsigned i = 0; i < 16; i++)
-            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // final 16-bit token ID stream
+        for (unsigned i = 0; i < mOutW; i++)
+            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // mOutW-bit token ID stream
         pb.createAssign(pb.createExtract(getOutputStreamVar("meOut"), pb.getInteger(0)), matchEnd);
     }
 private:
     std::vector<MergeRule> mRules;
+    unsigned mOutW;
 };
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
@@ -320,13 +358,29 @@ BPEPassResult buildBPEPassPipeline(
             }
     }
 
+    // Id width grows down the pipeline: the seed holds base ids (≤255 → 8 bits),
+    // each range kernel widens to fit its top id (bitsFor(hi-1)), the final source is
+    // widened to 16 for emission. Narrow interiors = fewer per-bit EQ/Sel = faster JIT.
+    // Base alphabet (bytes_to_unicode) assigns ids 0..255 → 8 bits.
+    unsigned seedW = bitsFor(255);
+
     // Seed: source = base id of each raw byte, active = ones, end = zeroes.
-    StreamSet * source = P.CreateStreamSet(16, 1);
+    StreamSet * source = P.CreateStreamSet(seedW, 1);
     StreamSet * active = P.CreateStreamSet(1, 1);
     StreamSet * end    = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<BPERangeSeed>(basis, source, active, end);
+    P.CreateKernelCall<BPERangeSeed>(basis, source, active, end, seedW);
+
+    // Widen an id stream of width w to the 16-bit BixNum emission expects (P2S16).
+    auto widen16 = [&](StreamSet * s, unsigned w) -> StreamSet * {
+        // If the final width is already 16 (full GPT-2 vocab), it skips the kernel entirely
+        if (w >= 16) return s;
+        StreamSet * s16 = P.CreateStreamSet(16, 1);
+        P.CreateKernelCall<BPEWidenKernel>(s, s16);
+        return s16;
+    };
+
     if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "seed")
-        return {active, source};   // dump seed source at every byte
+        return {active, widen16(source, seedW)};   // dump seed source at every byte
 
     //
     // BETWEEN KERNELS, the source is an input and sOut is the output. 
@@ -343,18 +397,21 @@ BPEPassResult buildBPEPassPipeline(
     // matchEnd seed = active (all ones = every byte ends a base token); each kernel
     // clears the seams its merges swallow, so the final stream marks only real ends.
     StreamSet * matchEnd = active;
+    unsigned curW = seedW;                               // current source id width
     for (auto & g : ruleRanges) {
         if (g.rules.empty()) continue;
-        StreamSet * sOut  = P.CreateStreamSet(16, 1);
+        unsigned outW = std::max(curW, bitsFor(g.hi - 1)); // widen to hold this range's ids
+        StreamSet * sOut  = P.CreateStreamSet(outW, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<BPEMergeKernel>(source, matchEnd, sOut, meOut,
-                                           g.rules, hashRuleSet(g.rules), g.maxLen);
+                                           g.rules, hashRuleSet(g.rules), g.maxLen, outW);
         source   = sOut;
         matchEnd = meOut;
+        curW     = outW;
     }
 
-    // matchEnd now marks real (outermost) token ends; vocabID = source.
-    return {matchEnd, source};
+    // matchEnd now marks real (outermost) token ends; vocabID = source (widened to 16).
+    return {matchEnd, widen16(source, curW)};
 }
 
 // buildLinePretokens

@@ -211,10 +211,8 @@ def independent_range_limit(maps, lo):
 		vocab_id += 1
 		if not vocab_id in idToToken_.keys(): return vocab_id
 		merge = idToToken_[vocab_id]
-		if vocab_id > 43659: print(vocab_id, merge)
 		id0 = vocab_[merge[0]]
 		id1 = vocab_[merge[1]]
-	print("(%i, %i)" % (lo, vocab_id))
 	return vocab_id
 
 #  Partition the merge data into independent ranges such that

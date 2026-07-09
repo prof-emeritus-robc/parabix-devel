@@ -7,7 +7,7 @@ def load_merges_raw(file_path):
 		for line in f:
 			line = line.strip()
 			# Skip comments or version headers (e.g., #version: 0.2)
-			if not line or line.startswith("#"):
+			if not line or line.startswith("#version"):
 			    continue
 			# Split the paired tokens by whitespace
 			token_pair = line.split()
@@ -195,3 +195,38 @@ def subrange_right_factor_analysis(maps, lo, hi):
 		id1 = vocab_[merge[1]]
 		if id1 > lo:
 			print("%i = %s(%i) %s" %(vocab_id, merge[0], id0, expand_token(maps, id1, lo)))
+
+#
+#  Find the largest contiguous range of merges starting at lo
+#  such that none of the merges is dependent on any id >= lo.
+#  
+def independent_range_limit(maps, lo):
+	(vocab_, idToToken_) = maps
+	vocab_id = lo
+	if not vocab_id in idToToken_.keys(): return lo
+	merge = idToToken_[vocab_id]
+	id0 = vocab_[merge[0]]
+	id1 = vocab_[merge[1]]
+	while id0 < lo and id1 < lo:
+		vocab_id += 1
+		if not vocab_id in idToToken_.keys(): return vocab_id
+		merge = idToToken_[vocab_id]
+		if vocab_id > 43659: print(vocab_id, merge)
+		id0 = vocab_[merge[0]]
+		id1 = vocab_[merge[1]]
+	print("(%i, %i)" % (lo, vocab_id))
+	return vocab_id
+
+#  Partition the merge data into independent ranges such that
+#  in any such range, no merge depends on any id greater that
+#  is produced within the range (or a higher range).
+def independent_range_analysis(maps):
+	base_id = 256
+	ranges = []
+	cur_id = base_id
+	limit = independent_range_limit(maps, cur_id)
+	while limit != cur_id:
+		ranges.append((cur_id, limit))
+		cur_id = limit
+		limit = independent_range_limit(maps, cur_id)
+	return ranges

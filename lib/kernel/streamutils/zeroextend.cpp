@@ -60,16 +60,14 @@ void ZeroExtend::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfS
     Value * const ZERO = b.getSize(0);
 
     VectorType * const inputTy = b.fwVectorType(inputFieldWidth);
-    PointerType * const inputPtrTy = inputTy->getPointerTo();
 
     VectorType * const outputTy = b.fwVectorType(outputFieldWidth);
-    PointerType * const outputPtrTy = outputTy->getPointerTo();
 
     Value * const processed = b.getProcessedItemCount(input.getName());
-    Value * const baseInputPtr = b.CreatePointerCast(b.getRawInputPointer(input.getName(), processed), inputPtrTy);
+    Value * const baseInputPtr = b.getRawInputPointer(input.getName(), processed);
 
     Value * const produced = b.getProducedItemCount(output.getName());
-    Value * const baseOutputPtr = b.CreatePointerCast(b.getRawOutputPointer(output.getName(), produced), outputPtrTy);
+    Value * const baseOutputPtr = b.getRawOutputPointer(output.getName(), produced);
 
     BasicBlock * const entry = b.GetInsertBlock();
     BasicBlock * const loop = b.CreateBasicBlock("Loop");

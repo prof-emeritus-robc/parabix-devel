@@ -383,8 +383,7 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
         new GlobalVariable(mod, arrTy, true, GlobalValue::ExternalLinkage, patternVec);
     const auto align = blockWidth / 8;
     patternData->setAlignment(MaybeAlign{align});
-    Value * const ptr = b.CreatePointerCast(patternData, b.getVoidPtrTy());
-    return ParamMap::PairEntry{ptr, b.getSize(patternLength)};
+    return ParamMap::PairEntry{patternData, b.getSize(patternLength)};
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -539,7 +538,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         fields[0] = voidPtrTy;
         fields[1] = int64Ty;
         streamSetTy = StructType::get(b.getContext(), fields);
-        streamSetPtrTy = streamSetTy->getPointerTo();
+        streamSetPtrTy = PointerType::getUnqual(b.getContext());
     }
 
     // The initial params of doSegment are its shared handle, thread-local handle and numOfStrides.
@@ -625,7 +624,6 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
         for (auto i = mInputStreamSets.size(); i--; ) {
             Value * const streamSetArg = nextArg();
-            assert (streamSetArg->getType() == streamSetPtrTy);
             // virtual base input address
             fields[1] = i32_ZERO;
             Value * const vbaPtr = b.CreateGEP(streamSetTy, streamSetArg, fields);
@@ -650,7 +648,6 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         for (auto i = mOutputStreamSets.size(); i--; ) {
 
             Value * const streamSetArg = nextArg();
-            assert (streamSetArg->getType() == streamSetPtrTy);
             // shared dynamic buffer handle or virtual base output address
             fields[1] = i32_ZERO;
             assert (segmentArgCount < doSegment->arg_size());
@@ -772,7 +769,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         if (LLVM_LIKELY(isStateful())) {
             args.push_back(sharedHandle);
         }
-        args.push_back(ConstantPointerNull::get(getThreadLocalStateType()->getPointerTo()));
+        args.push_back(ConstantPointerNull::get(PointerType::getUnqual(b.getContext())));
         threadLocalHandle = initializeThreadLocalInstance(b, args);
         segmentArgs[argCount++] = threadLocalHandle;
         toFree.push_back(threadLocalHandle);

@@ -299,7 +299,7 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
     }
 
     FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
-    FPM.addPass(InstCombinePass());
+    //FPM.addPass(InstCombinePass());
     FPM.addPass(DCEPass());
     FPM.addPass(ReassociatePass());
     FPM.addPass(GVNPass());
@@ -608,8 +608,8 @@ inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilde
             setHandle(nextArg());
         }
         StructType * const threadLocalTy = mTarget->getThreadLocalStateType();
-        PointerType * const threadLocalPtrTy = threadLocalTy->getPointerTo();
-        Value * const providedState = b.CreatePointerCast(nextArg(), threadLocalPtrTy);
+        PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
+        Value * const providedState = nextArg();
         BasicBlock * const allocThreadLocal = BasicBlock::Create(b.getContext(), "allocThreadLocalState", mCurrentMethod);
         BasicBlock * const initThreadLocal = BasicBlock::Create(b.getContext(), "initThreadLocalState", mCurrentMethod);
         b.CreateCondBr(b.CreateIsNull(providedState), allocThreadLocal, initThreadLocal);
@@ -621,11 +621,10 @@ inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilde
         assert (boost::gcd<size_t>(align, b.getPageSize()) == align);
         Value * allocedState = b.CreatePageAlignedMalloc(threadLocalTySize);
         b.CreateMemZero(allocedState, threadLocalTySize, align);
-        allocedState = b.CreatePointerCast(allocedState, threadLocalPtrTy);
         b.CreateBr(initThreadLocal);
 
         b.SetInsertPoint(initThreadLocal);
-        PHINode * const threadLocal = b.CreatePHI(threadLocalPtrTy, 2);
+        PHINode * const threadLocal = b.CreatePHI(ptrTy, 2);
         threadLocal->addIncoming(providedState, mEntryPoint);
         threadLocal->addIncoming(allocedState, allocThreadLocal);
 
@@ -845,7 +844,7 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
         StreamSetBuffer * const buffer = mStreamSetInputBuffers[i].get();
 
         const Binding & input = mInputStreamSets[i];
-        Value * const virtualBaseAddress = b.CreatePointerCast(nextArg(), buffer->getPointerType());
+        Value * const virtualBaseAddress = nextArg();
         Value * const localHandle = b.CreateAllocaAtEntryPoint(buffer->getHandleType(b));
         buffer->setHandle(localHandle); assert (localHandle);
         buffer->setBaseAddress(b, virtualBaseAddress);
@@ -937,7 +936,7 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
         if (LLVM_UNLIKELY(isLocal.isShared())) {
             Value * const handle = nextArg();
             assert (buffer->isDynamic());
-            buffer->setHandle(b.CreatePointerCast(handle, buffer->getHandlePointerType(b)));
+            buffer->setHandle(handle);
         } else if (LLVM_UNLIKELY(isMainPipeline || isLocal.any())) {
             // If an output is a managed buffer, the address is stored within the state instead
             // of being passed in through the function call.
@@ -946,8 +945,7 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
             buffer->setHandle(handle);
         } else {
             assert (isa<ExternalBuffer>(buffer));
-            Value * const ptr = nextArg(); assert (ptr->getType()->isPointerTy());
-            Value * const virtualBaseAddress = b.CreatePointerCast(ptr, buffer->getPointerType());
+            Value * const virtualBaseAddress = nextArg(); assert (virtualBaseAddress->getType()->isPointerTy());
             Value * const localHandle = b.CreateAllocaAtEntryPoint(buffer->getHandleType(b));
             buffer->setHandle(localHandle);
             buffer->setBaseAddress(b, virtualBaseAddress);
@@ -1094,7 +1092,6 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
 
     const auto checkStreamSet = codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnableStreamSetAsserts);
 
-    PointerType * const voidPtrTy = b.getVoidPtrTy();
     IntegerType * const sizeTy = b.getSizeTy();
     const auto numOfInputs = getNumOfStreamInputs();
     for (unsigned i = 0; i < numOfInputs; i++) {
@@ -1102,7 +1099,7 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
         /// logical buffer base address
         /// ----------------------------------------------------
         const auto & buffer = mStreamSetInputBuffers[i];
-        props.push_back(b.CreatePointerCast(buffer->getBaseAddress(b), voidPtrTy));
+        props.push_back(buffer->getBaseAddress(b));
         /// ----------------------------------------------------
         /// is closed
         /// ----------------------------------------------------
@@ -1143,14 +1140,13 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
 
         Value * handle = nullptr;
         if (LLVM_UNLIKELY(isLocal.isShared())) {
-            handle = b.CreatePointerCast(buffer->getHandle(), voidPtrTy);
+            handle = buffer->getHandle();
         } else if (LLVM_UNLIKELY(isMainPipeline || isLocal.any())) {
             // If an output is a managed buffer, the address is stored within the state instead
             // of being passed in through the function call.
-            PointerType * const voidPtrPtrTy = voidPtrTy->getPointerTo();
-            handle = b.CreatePointerCast(mUpdatableOutputBaseVirtualAddressPtr[i], voidPtrPtrTy);
+            handle = mUpdatableOutputBaseVirtualAddressPtr[i];
         } else {
-            handle = b.CreatePointerCast(buffer->getBaseAddress(b), voidPtrTy);
+            handle = buffer->getBaseAddress(b);
         }
         props.push_back(handle);
 
@@ -1237,7 +1233,6 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
                 b.CreateAssert(baseAddress, out.str(), b.GetString(output.getName()));
             }
             Value * vba = buffer->getVirtualBasePtr(b, baseAddress, mConsumedOutputItems[i]);
-            vba = b.CreatePointerCast(vba, b.getVoidPtrTy());
 
             assert (isFromCurrentFunction(b, mUpdatableOutputBaseVirtualAddressPtr[i], true));
 
@@ -1396,9 +1391,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
             return true;
         }
         if (handle == nullptr || stateType == nullptr) {
-            return false;
-        }
-        if (handle->getType() != stateType->getPointerTo()) {
             return false;
         }
         assert (!stateType->isOpaque());
@@ -1689,9 +1681,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
             return true;
         }
         if (handle == nullptr || stateType == nullptr) {
-            return false;
-        }
-        if (handle->getType() != stateType->getPointerTo()) {
             return false;
         }
         assert (!stateType->isOpaque());
@@ -2454,10 +2443,10 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
 
     Function * regFunc = b.getModule()->getFunction(KERNEL_REGISTER_ILLUSTRATOR_CALLBACK); assert (regFunc);
     FixedArray<Value *, 12> args;
-    args[0] = b.CreatePointerCast(illustratorObject, b.getVoidPtrTy());
+    args[0] = illustratorObject;
     args[1] = kernelName;
     args[2] = streamName;
-    args[3] = b.CreatePointerCast(handle, b.getVoidPtrTy());
+    args[3] = handle;
     args[4] = b.getSize(rows);
     args[5] = b.getSize(cols);
     args[6] = b.getSize(itemWidth);
@@ -2467,10 +2456,9 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
     args[10] = b.getInt8(replacement1);
 
     IntegerType * const sizeTy = b.getSizeTy();
-    PointerType * const sizePtrTy = sizeTy->getPointerTo();
     Constant * loopIdConstant = nullptr;
     if (loopIds.empty()) {
-        loopIdConstant = ConstantPointerNull::get(sizePtrTy);
+        loopIdConstant = ConstantPointerNull::get(PointerType::getUnqual(b.getContext()));
     } else {
         const auto n = loopIds.size();
         SmallVector<Constant *, 8> ids(n + 1);
@@ -2482,7 +2470,7 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
         ArrayType * arTy = ArrayType::get(sizeTy, n + 1);
         Constant * ar = ConstantArray::get(arTy, ids);
         GlobalVariable * const gv = new GlobalVariable(*b.getModule(), arTy, true, GlobalValue::ExternalLinkage, ar);
-        loopIdConstant = ConstantExpr::getPointerCast(gv, sizePtrTy);
+        loopIdConstant = gv;
     }
     args[11] = loopIdConstant;
     b.CreateCall(regFunc->getFunctionType(), regFunc, args);
@@ -2497,12 +2485,12 @@ void KernelCompiler::captureStreamData(KernelBuilder & b, Constant * kernelName,
                                        Value * streamData, Value * from, Value * to)  const {
 
     FixedArray<Value *, 9> args;
-    args[0] = b.CreatePointerCast(b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT), b.getVoidPtrTy());
+    args[0] = b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT);
     args[1] = kernelName;
     args[2] = streamName;
-    args[3] = b.CreatePointerCast(handle, b.getVoidPtrTy());
+    args[3] = handle;
     args[4] = strideNum;
-    args[5] = b.CreatePointerCast(streamData, b.getVoidPtrTy());
+    args[5] = streamData;
     args[6] = from;
     args[7] = to;
     args[8] = b.getSize(b.getBitBlockWidth());
@@ -2545,6 +2533,7 @@ PreservedAnalyses RemoveRedundantAllocaAndGEPInstructions::run(Function &F,
 
     BasicBlock & bb = F.getEntryBlock();
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
     Instruction * inst = bb.getFirstNonPHIOrDbgOrLifetime();
     while (inst) {
         #ifndef NDEBUG
@@ -2570,6 +2559,25 @@ PreservedAnalyses RemoveRedundantAllocaAndGEPInstructions::run(Function &F,
         }
         inst = nextNode;
     }
+#else
+    BasicBlock::iterator it = bb.getFirstNonPHIOrDbgOrLifetime();
+    while (it != bb.end()) {
+        Instruction &inst = *it++;
+
+        if (isa<AllocaInst>(inst) || isa<GetElementPtrInst>(inst)) {
+            if (LLVM_UNLIKELY(inst.use_empty())) {
+                inst.eraseFromParent();
+                continue;
+            }
+        }
+
+        if (auto *allocaInst = dyn_cast<AllocaInst>(&inst)) {
+            if (isAllocaPromotable(allocaInst)) {
+                allocas.push_back(allocaInst);
+            }
+        }
+    }
+#endif
 
     if (!allocas.empty()) {
         auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
@@ -2680,6 +2688,7 @@ PreservedAnalyses TracePass::run(Function &F, FunctionAnalysisManager & AM) {
         }
 
         for (Instruction * I : toTrace) {
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
             Instruction * N = I;
             if (LLVM_UNLIKELY(isa<PHINode>(I))) {
                 N = B.getFirstNonPHIOrDbgOrLifetime();
@@ -2687,15 +2696,23 @@ PreservedAnalyses TracePass::run(Function &F, FunctionAnalysisManager & AM) {
                 assert (I->getNextNode());
                 N = I->getNextNode();
             }
+#else
+            BasicBlock::iterator N = I->getIterator();
+            if (LLVM_UNLIKELY(isa<PHINode>(I))) {
+                N = B.getFirstNonPHIOrDbgOrLifetime();
+            } else if (LLVM_LIKELY(I != B.getTerminator())) {
+                assert(N != B.end() && "Iterator out of bounds unexpectedly");
+                ++N;
+            }
+#endif
             b.SetInsertPoint(N);
-            const Type * ty = I->getType();
+            const Type *ty = I->getType();
             if (ty->isIntOrPtrTy()) {
                 b.CallPrintInt(I->getName(), I);
             } else if (ty->isVectorTy()) {
                 b.CallPrintRegister(I->getName(), I);
             }
         }
-
         toTrace.clear();
     }
 

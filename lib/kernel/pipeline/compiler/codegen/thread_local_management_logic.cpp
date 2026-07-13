@@ -25,14 +25,11 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
     }
 
     using Vertex = ThreadLocalPlacementGraph::vertex_descriptor;
-    using Edge = ThreadLocalPlacementGraph::edge_descriptor;
+    //using Edge = ThreadLocalPlacementGraph::edge_descriptor;
 
     const auto n = (LastStreamSet - FirstStreamSet) + 1 + PartitionCount;
 
-    const auto bw = b.getBitBlockWidth();
-
     std::vector<Value *> precalculatedOffset(n, nullptr);
-    ConstantInt * const sz_ZERO = b.getSize(0);
 
     segmentSize = b.CreateUMax(segmentSize, b.getSize(MinimumThreadLocalSegmentSize));
 
@@ -90,8 +87,7 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
     memorySize = b.CreateShl(memorySize, b.getSize(floor_log2(pageSize)));
     assert (mTarget->hasThreadLocal());
     Value * const base = b.CreateAlignedMalloc(memorySize, pageSize);
-    PointerType * const int8PtrTy = b.getInt8PtrTy();
-    b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY, b.CreatePointerCast(base, int8PtrTy));
+    b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY, base);
     b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY_BYTES, memorySize);
     for (size_t partId = 1; partId < PartitionCount; ++partId) {
         if (out_degree(partId, ThreadLocalPlacement) > 0) {
@@ -111,7 +107,7 @@ void PipelineCompiler::initializeThreadLocalMemoryPhiNodes(KernelBuilder & b) {
 
     assert (mIsPartitionRoot);
 
-    const auto oneAfterLastKernel = FirstKernelInPartition[mCurrentPartitionId + 1];
+    //const auto oneAfterLastKernel = FirstKernelInPartition[mCurrentPartitionId + 1];
 
     IntegerType * const sizeTy = b.getSizeTy();
 
@@ -520,7 +516,6 @@ void PipelineCompiler::remapThreadLocalBufferMemory(KernelBuilder & b) {
 
             ExternalBuffer * const buffer = cast<ExternalBuffer>(bn.Buffer);
             Value * const produced = mInitiallyProducedItemCount[streamSet];
-            PointerType * const ptrTy = buffer->getPointerType();
 
             const auto typeWidth = b.getTypeSize(DL, buffer->getType());
 
@@ -541,7 +536,7 @@ void PipelineCompiler::remapThreadLocalBufferMemory(KernelBuilder & b) {
             Value * const startOffset = mThreadLocalStartOffset[streamSet]; assert (startOffset);
             Value * const virtualBaseOffset = b.CreateSub(startOffset, offsetBytes);
             Value * const ba = b.CreateGEP(b.getInt8Ty(), mThreadLocalStreamSetBaseAddress, virtualBaseOffset);
-            buffer->setBaseAddress(b, b.CreatePointerCast(ba, ptrTy));
+            buffer->setBaseAddress(b, ba);
 
         }
     }

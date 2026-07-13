@@ -97,7 +97,11 @@ CPUDriver::CPUDriver(std::string && moduleName)
     mEngine->DisableLazyCompilation(true);
     mEngine->DisableGVCompilation(true);
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     auto triple = mTarget->getTargetTriple().getTriple();
+#else
+    auto triple = mTarget->getTargetTriple();
+#endif
     const DataLayout DL(mTarget->createDataLayout());
     mMainModule->setTargetTriple(triple);
     mMainModule->setDataLayout(DL);
@@ -116,8 +120,6 @@ Function * CPUDriver::addLinkFunction(Module * mod, llvm::StringRef name, Functi
         #ifndef ORCJIT
         mEngine->updateGlobalMapping(f, functionPtr);
         #endif
-    } else if (LLVM_UNLIKELY(f->getType() != type->getPointerTo())) {
-        report_fatal_error("Cannot link " + name + ": a function with a different signature already exists with that name in " + mod->getName());
     }
     return f;
 }

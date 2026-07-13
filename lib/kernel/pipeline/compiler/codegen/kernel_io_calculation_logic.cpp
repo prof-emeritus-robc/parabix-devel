@@ -168,7 +168,7 @@ no_static_max:
 
     mNumOfLinearStrides = calculateTransferableItemCounts(b, maxNumOfStrides, numOfNonConstantCountableStrides, numOfNonCountableStrides);
 
-    bool isFirstLock = true;
+    //bool isFirstLock = true;
 
     for (const auto e : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
         const BufferPort & port = mBufferGraph[e];
@@ -1463,7 +1463,7 @@ void PipelineCompiler::ensureSufficientOutputSpace(KernelBuilder & b, const Buff
     Value * mustExpand = nullptr;
     if (LLVM_UNLIKELY(bn.canTrackBufferExpansionData())) {
         assert (mBufferExpansionFunction);
-        Value * sharedHandle = b.CreatePointerCast(getHandle(), b.getVoidPtrTy());
+        Value * sharedHandle = getHandle();
         mustExpand = buffer->reserveCapacity(b, produced, consumed, required, mBufferExpansionFunction, sharedHandle, b.getSize(outputPort.Number));
     } else {
         mustExpand = buffer->reserveCapacity(b, produced, consumed, required, nullptr, nullptr, nullptr);
@@ -2014,10 +2014,9 @@ Value * PipelineCompiler::getPartialSumItemCount(KernelBuilder & b, const Buffer
 
     if (buffer->isDynamic()) {
         IntegerType * const sizeTy = b.getSizeTy();
-        PointerType * const ptrTy = sizeTy->getPointerTo(buffer->getAddressSpace());
         assert (srcBufferNode.ManagedStructId < ManagedBufferStructCount);
         Value * const addr = b.getScalarField(MANAGED_STREAMSET_LOCAL_VIRTUAL_BASE_ADDRESS + std::to_string(srcBufferNode.ManagedStructId));
-        currentPtr = b.CreateGEP(sizeTy, b.CreatePointerCast(addr, ptrTy), position);
+        currentPtr = b.CreateGEP(sizeTy, addr, position);
     } else {
         currentPtr = buffer->getRawItemPointer(b, sz_ZERO, position);
     }
@@ -2095,10 +2094,8 @@ Value * PipelineCompiler::getMaximumNumOfPartialSumStrides(KernelBuilder & b,
     Value * inputBaseAddr = nullptr;
 
     if (popCountBuffer->isDynamic()) {
-        PointerType * const ptrTy = sizeTy->getPointerTo(popCountBuffer->getAddressSpace());
         assert (bn.ManagedStructId < ManagedBufferStructCount);
         inputBaseAddr = b.getScalarField(MANAGED_STREAMSET_LOCAL_VIRTUAL_BASE_ADDRESS + std::to_string(bn.ManagedStructId));
-        inputBaseAddr = b.CreatePointerCast(inputBaseAddr, ptrTy);
     }
 
     BasicBlock * const popCountLoop =
@@ -2231,7 +2228,6 @@ void PipelineCompiler::splatMultiStepPartialSumValues(KernelBuilder & b) {
         const BufferNode & bn = mBufferGraph[streamSet];
         StreamSetBuffer * const buffer = bn.Buffer;
         VectorType * const vecTy = b.fwVectorType(fw);
-        PointerType * const vecPtrTy = vecTy->getPointerTo();
 
         const auto spanLength = bn.PartialSumSpanLength;
 
@@ -2246,9 +2242,8 @@ void PipelineCompiler::splatMultiStepPartialSumValues(KernelBuilder & b) {
         Value * const index = b.CreateSelect(unchanged, produced, b.CreateSub(produced, sz_ONE));
         Value * const offset = b.CreateURem(index, sz_stepsPerBlock);
         Value * const start = b.CreateSub(index, offset);
-        Value * const addr = buffer->getRawItemPointer(b, sz_ZERO, start);
+        Value * const vecAddr = buffer->getRawItemPointer(b, sz_ZERO, start);
 
-        Value * const vecAddr = b.CreatePointerCast(addr, vecPtrTy);
         Value * const baseValue = b.CreateBlockAlignedLoad(vecTy, vecAddr);
         Value * const total = b.CreateExtractElement(baseValue, offset);
 

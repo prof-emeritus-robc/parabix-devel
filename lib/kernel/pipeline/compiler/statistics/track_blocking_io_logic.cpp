@@ -42,7 +42,7 @@ void PipelineCompiler::addTrackBlockingIOHistoryProperties(KernelBuilder & b, co
 
     FixedArray<Type *, 3> fields;
     IntegerType * const sizeTy = b.getSizeTy();
-    fields[0] = sizeTy->getPointerTo();
+    fields[0] = PointerType::getUnqual(b.getContext());
     fields[1] = sizeTy;
     fields[2] = sizeTy;
     StructType * const historyTy = StructType::get(b.getContext(), fields);
@@ -90,7 +90,7 @@ void PipelineCompiler::recordBlockingIO(KernelBuilder & b, const BufferPort & po
         IntegerType * sizeTy = b.getSizeTy();
 
         Value * const traceLogArrayField = b.CreateGEP(ty, historyPtr, {ZERO, ZERO});
-        Value * const traceLogArray = b.CreateAlignedLoad(sizeTy->getPointerTo(), traceLogArrayField, PtrTyABIAlignment);
+        Value * const traceLogArray = b.CreateAlignedLoad(PointerType::getUnqual(b.getContext()), traceLogArrayField, PtrTyABIAlignment);
 
         Value * const traceLogCountField = b.CreateGEP(ty, historyPtr, {ZERO, ONE});
         Value * const traceLogCount = b.CreateAlignedLoad(sizeTy, traceLogCountField, SizeTyABIAlignment);
@@ -306,7 +306,7 @@ void PipelineCompiler::printOptionalBlockedIOPerSegment(KernelBuilder & b) const
     if (LLVM_UNLIKELY(codegen::StatisticsOptionIsSet(codegen::TraceBlockedIO))) {
 
         IntegerType * const sizeTy = b.getSizeTy();
-        PointerType * const sizePtrTy = sizeTy->getPointerTo();
+        PointerType * const sizePtrTy = PointerType::getUnqual(b.getContext());
 
         Constant * const ZERO = b.getInt32(0);
         Constant * const ONE = b.getInt32(1);

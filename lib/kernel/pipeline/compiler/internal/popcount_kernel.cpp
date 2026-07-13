@@ -172,8 +172,6 @@ void PopCountKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * co
 
         const auto vecTyAlign = b.getAlignOf(DL, vecTy);
 
-        PointerType * const ptrVecTy = vecTy->getPointerTo();
-
         VectorType * const sizeVecTy = VectorType::get(sizeTy, outputFieldsPerBlock, false);
 
         auto generateIterativePopCountCode = [&](Value * const writeStart,
@@ -213,7 +211,7 @@ void PopCountKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * co
                 GlobalVariable * const stepEntryTargetArray =
                     new GlobalVariable(*m, stepEntryPointAddrTy, true, GlobalValue::InternalLinkage, stepEntryPointAddrArray);
 
-                Value * const inputPtr = b.CreatePointerCast(b.getInputStreamBlockPtr(INPUT, sz_ZERO, inputIndex), intTy->getPointerTo());
+                Value * const inputPtr = b.getInputStreamBlockPtr(INPUT, sz_ZERO, inputIndex);
 
                 FixedArray<Value *, 2> jumpIndex;
                 jumpIndex[0] = sz_ZERO;
@@ -390,7 +388,7 @@ void PopCountKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * co
                     newPositiveSum = b.CreateAdd(sum, positiveSumPhi);
                     Value * const idx = b.CreateAdd(writePosPhi, b.getSize(i * outputFieldsPerBlock));
                     Value * const ptr = b.CreateInBoundsGEP(sizeTy, positiveArray, idx);
-                    b.CreateAlignedStore(newPositiveSum, b.CreatePointerCast(ptr, ptrVecTy), vecTyAlign);
+                    b.CreateAlignedStore(newPositiveSum, ptr, vecTyAlign);
                 }
                 newPositiveSum = b.mvmd_srli(sizeWidth, newPositiveSum, outputFieldsPerBlock - 1);
                 for (unsigned j = 1; j < outputFieldsPerBlock; j *= 2) {
@@ -413,7 +411,7 @@ void PopCountKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * co
                     newNegativeSum = b.CreateAdd(sum, negativeSumPhi);
                     Value * const idx = b.CreateAdd(writePosPhi, b.getSize(i * outputFieldsPerBlock));
                     Value * const ptr = b.CreateInBoundsGEP(sizeTy, negativeArray, idx);
-                    b.CreateAlignedStore(newNegativeSum, b.CreatePointerCast(ptr, ptrVecTy), vecTyAlign);
+                    b.CreateAlignedStore(newNegativeSum, ptr, vecTyAlign);
                 }
                 newNegativeSum = b.mvmd_srli(sizeWidth, newNegativeSum, outputFieldsPerBlock - 1);
                 for (unsigned j = 1; j < outputFieldsPerBlock; j *= 2) {

@@ -38,7 +38,6 @@ void RandomStreamKernel::generateDoSegmentMethod(KernelBuilder & b) {
     Constant * segmentRandIntConst = ConstantInt::get(b.getSizeTy(), segmentRandInts);
     Value * produced = b.getProducedItemCount("randomValues");
     Value * rvBuffer = b.getRawOutputPointer("randomValues", b.getInt32(0));
-    rvBuffer = b.CreateBitCast(rvBuffer, b.getInt32Ty()->getPointerTo());
     Value * addFullSegment = b.CreateAdd(produced, segmentItemConst);
     Value * moreToDoLater = b.CreateICmpULT(addFullSegment, strmLgthConst);
     b.CreateCondBr(moreToDoLater, genNextRVsegment, genFinalRVsegment);

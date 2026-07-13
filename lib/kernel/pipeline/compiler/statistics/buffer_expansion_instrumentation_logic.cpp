@@ -33,7 +33,7 @@ generate_function:
 
     Function * const f0 = m->getFunction(name.str());
     if (f0) {
-        return b.CreatePointerCast(f0, voidPtrTy, name.str());
+        return f0;
     }
 
     auto ip = b.saveIP();
@@ -48,10 +48,6 @@ generate_function:
     PointerType * const i8PtrTy = b.getInt8PtrTy();
 
     const auto int8PtrTyAlign = DL.getABITypeAlign(i8PtrTy).value();
-
-    StructType * handleTy = mTarget->getSharedStateType();
-    PointerType * handlePtrTy = handleTy->getPointerTo();
-
 
     FixedArray<Type *, 4> paramTypes;
     paramTypes[0] = voidPtrTy; // pipeline handle
@@ -88,7 +84,6 @@ generate_function:
 
     Value * handle = nextArg();
     handle->setName("handle");
-    handle = b.CreatePointerCast(handle, handlePtrTy);
     Value * outputPortNum = nextArg();
     outputPortNum->setName("outputPortNum");
     Value * produced = nextArg();
@@ -188,7 +183,7 @@ generate_function:
             indices[1] = i32_ZERO;
 
             Value * const traceLogArrayField = b.CreateGEP(traceDataTy, traceData, indices);
-            PointerType * const entryPtrTy = entryTy->getPointerTo();
+            PointerType * const entryPtrTy = PointerType::getUnqual(b.getContext());
             assert (traceDataTy->getStructElementType(0) == entryPtrTy);
 
             Value * const entryArray = b.CreateAlignedLoad(entryPtrTy, traceLogArrayField, PtrTyABIAlignment);
@@ -214,7 +209,6 @@ generate_function:
             Value * const newTraceSizeBytes = b.CreateMul(newTraceSize, sz_TraceDataTySize);
             Value * newEntryArray = b.CreateAlignedMalloc(newTraceSizeBytes, traceDataTyAlign);
             b.CreateMemCpy(newEntryArray, entryArray, b.CreateMul(traceIndex, sz_TraceDataTySize), traceDataTyAlign);
-            newEntryArray = b.CreatePointerCast(newEntryArray, entryPtrTy);
             b.CreateAlignedStore(newEntryArray, traceLogArrayField, PtrTyABIAlignment);
             b.CreateFree(entryArray);
 
@@ -276,7 +270,7 @@ generate_function:
 
     b.restoreIP(ip);
 
-    return b.CreatePointerCast(f, voidPtrTy, name.str());
+    return f;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -432,7 +426,9 @@ void PipelineCompiler::printOptionalBufferExpansionHistory(KernelBuilder & b) {
                     const auto numOfConsumers = std::max(out_degree(streamSet, mConsumerGraph), 1UL);
 
                     Type * const arrayTy = ArrayType::get(sizeTy, numOfConsumers + 3);
-                    Value * const entryArray = b.CreateAlignedLoad(arrayTy->getPointerTo(), traceArrayField, PtrTyABIAlignment);
+                    Value * const entryArray =
+                        b.CreateAlignedLoad(PointerType::getUnqual(b.getContext()),
+                                            traceArrayField, PtrTyABIAlignment);
 
                     indices[1] = i32_ONE;
 

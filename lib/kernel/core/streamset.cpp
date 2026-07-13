@@ -274,7 +274,6 @@ Value * StreamSetBuffer::getRawItemPointer(KernelBuilder & b, Value * streamInde
         pos = b.CreateUDivRational(pos, itemsPerByte);
         itemTy = b.getInt8Ty();
     }
-    addr = b.CreatePointerCast(addr, itemTy->getPointerTo(mAddressSpace));
     return b.CreateInBoundsGEP(itemTy, addr, pos);
 }
 
@@ -407,7 +406,7 @@ Value * ExternalBuffer::getBaseAddress(KernelBuilder & b) const {
     auto & DL = m->getDataLayout();
     PointerType * const voidPtrTy = b.getVoidPtrTy();
     const auto ptrTyAlign = DL.getABITypeAlign(voidPtrTy).value();
-    return b.CreatePointerCast(b.CreateAlignedLoad(voidPtrTy, p, ptrTyAlign), getPointerType());
+    return b.CreateAlignedLoad(voidPtrTy, p, ptrTyAlign);
 }
 
 void ExternalBuffer::setCapacity(KernelBuilder & b, Value * const capacity) const {
@@ -454,7 +453,7 @@ Value * ExternalBuffer::getLinearlyWritableItems(KernelBuilder & b, Value * cons
 Value * ExternalBuffer::getVirtualBasePtr(KernelBuilder & b, Value * baseAddress, Value * const /* transferredItems */) const {
     Constant * const sz_ZERO = b.getSize(0);
     Value * const addr = StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, sz_ZERO);
-    return b.CreatePointerCast(addr, getPointerType());
+    return addr;
 }
 
 inline void ExternalBuffer::assertValidBlockIndex(KernelBuilder & b, Value * blockIndex) const {
@@ -508,7 +507,7 @@ Value * InternalBuffer::getVirtualBasePtr(KernelBuilder & b, Value * const baseA
         baseBlockIndex = b.CreateSub(modByCapacity(b, blockIndex), blockIndex);
     }
     Value * addr = StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, baseBlockIndex);
-    return b.CreatePointerCast(addr, getPointerType());
+    return addr;
 }
 
 Value * InternalBuffer::getLinearlyAccessibleItems(KernelBuilder & b, Value * const processedItems, Value * const totalItems, Value * const requiredOverflow) const {
@@ -582,7 +581,7 @@ Value * ManagedDynamicBuffer::getVirtualBasePtr(KernelBuilder & b, Value * const
         Value * const baseBlockIndex = b.CreateSub(modByCapacity(b, blockIndex), blockIndex);
         addr = StreamSetBuffer::getStreamBlockPtr(b, baseAddress, b.getSize(0), baseBlockIndex);
     }
-    return b.CreatePointerCast(addr, getPointerType());
+    return addr;
 }
 
 void ManagedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capacityMultiplier, Value *reportCallback, Value *pipelineHandle, Value *portNum) {
@@ -616,8 +615,6 @@ void ManagedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capac
         LLVMContext & C = m->getContext();
 
         StructType * handleTy = getHandleType(b);
-        PointerType * const handlePtrTy = handleTy->getPointerTo(mAddressSpace);
-
 
         PointerType * const addrPtrTy = b.getVoidPtrTy();
         IntegerType * const intPtrTy = b.getIntPtrTy(DL);
@@ -660,7 +657,6 @@ void ManagedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capac
 
         Value * handle = nextArg();
         handle->setName("handle");
-        handle = b.CreatePointerCast(handle, handlePtrTy);
         Value * capacity = nextArg();
         capacity->setName("capacity");
         Value * typeSize = nextArg();
@@ -764,7 +760,7 @@ void ManagedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capac
             callbackArgs[2] = sz_ZERO;
             callbackArgs[3] = b.CreateMul(capacity, b.getSize(b.getBitBlockWidth()));
 
-            b.CreateCall(funcTy, b.CreatePointerCast(reportCallback, funcTy->getPointerTo()), callbackArgs);
+            b.CreateCall(funcTy, reportCallback, callbackArgs);
         }
 
         b.CreateRetVoid();
@@ -783,7 +779,7 @@ void ManagedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capac
     Rational stridesPerPage{getPageSize(), typeSize};
     Value * capacity = b.CreateRoundUpRational(capacityMultiplier, stridesPerPage.numerator());
     SmallVector<Value *, 6> args(traceDynamicBuffer ? 6 : 3);
-    args[0] = b.CreatePointerCast(getHandle(), voidPtrTy);
+    args[0] = getHandle();
     args[1] = capacity;
     args[2] = b.getSize(typeSize);
     if (LLVM_UNLIKELY(traceDynamicBuffer)) {
@@ -803,7 +799,7 @@ void ManagedDynamicBuffer::releaseBuffer(KernelBuilder & b) const {
 
     auto & DL = m->getDataLayout();
 
-    PointerType * const addrPtrTy = mType->getPointerTo(mAddressSpace);
+    PointerType * const addrPtrTy = PointerType::get(b.getContext(), mAddressSpace);
     const auto voidPtrTyAlign = DL.getABITypeAlign(addrPtrTy).value();
 
     IntegerType * const intPtrTy = b.getIntPtrTy(DL);
@@ -816,7 +812,7 @@ void ManagedDynamicBuffer::releaseBuffer(KernelBuilder & b) const {
         indices[1] = b.getInt32(LinearMallocedAddress);
         Value * const addrField = b.CreateInBoundsGEP(handleTy, handle, indices);
         Value * const addr = b.CreateAlignedLoad(addrPtrTy, addrField, voidPtrTyAlign);
-        b.CreateFree(b.CreatePointerCast(addr, b.getInt8PtrTy()));
+        b.CreateFree(addr);
         b.CreateAlignedStore(ConstantPointerNull::get(addrPtrTy), addrField, voidPtrTyAlign);
     } else {
 
@@ -830,7 +826,7 @@ void ManagedDynamicBuffer::releaseBuffer(KernelBuilder & b) const {
         Value * const capacity = b.CreateAlignedLoad(intPtrTy, capacityField, intPtrTyAlign);
 
         FixedArray<Value *, 2> args;
-        args[0] = b.CreatePointerCast(addr, b.getInt8PtrTy());
+        args[0] = addr;
         args[1] = b.CreateMul(b.getTypeSize(mType), b.CreateShl(capacity, 1));
 
         Function * const fMunmap = m->getFunction(__MUNMAP); assert (fMunmap);
@@ -845,7 +841,7 @@ void ManagedDynamicBuffer::releaseBuffer(KernelBuilder & b) const {
 Value * ManagedDynamicBuffer::getBaseAddress(KernelBuilder & b) const {
     assert (mHandle && "has not been set prior to calling setBaseAddress");
     auto & DL = b.getModule()->getDataLayout();
-    PointerType * const addrPtrTy = mType->getPointerTo(mAddressSpace);
+    PointerType * const addrPtrTy = PointerType::get(b.getContext(), mAddressSpace);
     const auto voidPtrTyAlign = DL.getABITypeAlign(addrPtrTy).value();
     FixedArray<Value *, 2> indices;
     indices[0] = b.getInt32(0);
@@ -858,7 +854,7 @@ Value * ManagedDynamicBuffer::getBaseAddress(KernelBuilder & b) const {
 Value * ManagedDynamicBuffer::getMallocAddress(KernelBuilder & b) const {
     assert (mHandle && "has not been set prior to calling setBaseAddress");
     auto & DL = b.getModule()->getDataLayout();
-    PointerType * const addrPtrTy = mType->getPointerTo(mAddressSpace);
+    PointerType * const addrPtrTy = PointerType::get(b.getContext(), mAddressSpace);
     const auto voidPtrTyAlign = DL.getABITypeAlign(addrPtrTy).value();
     FixedArray<Value *, 2> indices;
     indices[0] = b.getInt32(0);
@@ -899,7 +895,7 @@ Value * ManagedDynamicBuffer::getInternalCapacity(KernelBuilder & b) const {
 void ManagedDynamicBuffer::setBaseAddress(KernelBuilder & b, Value * const addr) const {
     assert (mHandle && "has not been set prior to calling setBaseAddress");
     auto & DL = b.getModule()->getDataLayout();
-    PointerType * const addrPtrTy = mType->getPointerTo(mAddressSpace);
+    PointerType * const addrPtrTy = PointerType::get(b.getContext(), mAddressSpace);
     const auto voidPtrTyAlign = DL.getABITypeAlign(addrPtrTy).value();
     FixedArray<Value *, 2> indices;
     indices[0] = b.getInt32(0);
@@ -965,7 +961,7 @@ static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingS
         auto & C = m->getContext();
 
         StructType * const handleTy = makePendingDeletionStructTy(b);
-        PointerType * const handlePtrTy = handleTy->getPointerTo(addrSpace);
+        PointerType * const handlePtrTy = PointerType::get(b.getContext(), addrSpace);
 
         PointerType * const voidPtrTy = b.getVoidPtrTy();
         IntegerType * const intPtrTy = DL.getIntPtrType(C);
@@ -981,8 +977,6 @@ static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingS
         pendingDeletionFields[PendingDeletionConsumed] = intPtrTy;
         pendingDeletionFields[PendingDeletionNextLink] = voidPtrTy;
         StructType * const pendingDeletionTy = StructType::get(C, pendingDeletionFields);
-        PointerType * const pendingDeletionPtrTy = pendingDeletionTy->getPointerTo(addrSpace);
-
 
         ConstantInt * const i32_ZERO = b.getInt32(0);
         ConstantInt * const i32_ONE = b.getInt32(1);
@@ -1120,7 +1114,7 @@ static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingS
         b.SetInsertPoint(checkLinkedList);
         PHINode * const currentLinkPhi = b.CreatePHI(voidPtrTy, 2);
         currentLinkPhi->addIncoming(pendingLink, removeSecondFixed);
-        Value * const currentLink = b.CreatePointerCast(currentLinkPhi, pendingDeletionPtrTy);
+        Value * const currentLink = currentLinkPhi;
         indices2[0] = i32_ZERO;
         indices2[1] = i32_PendingConsumed;
         Value * const pendingConsumedField = b.CreateGEP(pendingDeletionTy, currentLink, indices2);
@@ -1162,9 +1156,9 @@ static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingS
         PHINode * const fixedIndexPhi = b.CreatePHI(b.getInt32Ty(), 3);
         fixedIndexPhi->addIncoming(i32_ONE, copySecondToFirst);
         fixedIndexPhi->addIncoming(i32_ZERO, checkLinkedList);
-        Value * const nextPendingDeletionLink = b.CreatePointerCast(nextLinkPhi, pendingDeletionPtrTy);
+        Value * const nextPendingDeletionLink = nextLinkPhi;
         indices2[1] = i32_PendingAddress;
-        Value * const linkAddrField = b.CreateGEP(pendingDeletionTy, nextPendingDeletionLink, indices2);
+        Value * const linkAddrField = b.CreateGEP(pendingDeletionTy, nextLinkPhi, indices2);
         Value * const linkAddr = b.CreateAlignedLoad(voidPtrTy, linkAddrField, voidPtrTyAlign);
         indices4[2] = fixedIndexPhi;
         indices4[3] = i32_PendingAddress;
@@ -1309,7 +1303,7 @@ static void addToPendingDeletions(KernelBuilder & b, Value * const pendingStruct
         const auto intPtrTyAlign = DL.getABITypeAlign(intPtrTy).value();
 
         StructType * const handleTy = makePendingDeletionStructTy(b);
-        PointerType * const handlePtrTy = handleTy->getPointerTo();
+        PointerType * const handlePtrTy = PointerType::getUnqual(b.getContext());
 
         FixedArray<Type *, 4> paramTypes;
         paramTypes[0] = handlePtrTy; // pending struct ptr
@@ -1343,7 +1337,7 @@ static void addToPendingDeletions(KernelBuilder & b, Value * const pendingStruct
 
         Constant * const nilVoidPtr = ConstantPointerNull::get(voidPtrTy);
 
-        PointerType * const voidPtrPtrTy = voidPtrTy->getPointerTo(addrSpace);
+        PointerType * const voidPtrPtrTy = PointerType::get(b.getContext(), addrSpace);
 
 
         b.SetInsertPoint(entry);
@@ -1411,7 +1405,6 @@ static void addToPendingDeletions(KernelBuilder & b, Value * const pendingStruct
         indices2[0] = i32_ZERO;
         indices2[1] = i32_ONE;
         Value * const initialAdditionalStructPtrField = b.CreateGEP(handleTy, handle, indices2);
-        Value * const voidPtrStructPtr = b.CreatePointerCast(initialAdditionalStructPtrField, voidPtrPtrTy);
         Value * const firstLinkAddr = b.CreateAlignedLoad(voidPtrTy, initialAdditionalStructPtrField, voidPtrTyAlign);
         Value * const emptyFirstLink = b.CreateICmpEQ(firstLinkAddr, nilVoidPtr);
         b.CreateLikelyCondBr(emptyFirstLink, appendLinkedList, scanLinkedList);
@@ -1426,14 +1419,11 @@ static void addToPendingDeletions(KernelBuilder & b, Value * const pendingStruct
         pendingDeletionFields[PendingDeletionConsumed] = intPtrTy;
         pendingDeletionFields[PendingDeletionNextLink] = voidPtrTy;
         StructType * const pendingDeletionTy = StructType::get(C, pendingDeletionFields);
-        PointerType * const pendingDeletionPtrTy = pendingDeletionTy->getPointerTo(addrSpace);
 
         indices2[0] = i32_ZERO;
         indices2[1] = i32_PendingDeletionNextLink;
 
-        Value * const linkPtr = b.CreatePointerCast(linkPtrPhi, pendingDeletionPtrTy);
-        Value * const nextLinkField = b.CreateGEP(pendingDeletionTy, linkPtr, indices2);
-        Value * const voidPtrNextLinkField = b.CreatePointerCast(nextLinkField, voidPtrPtrTy);
+        Value * const nextLinkField = b.CreateGEP(pendingDeletionTy, linkPtrPhi, indices2);
         Value * const currentLinkAddr = b.CreateAlignedLoad(voidPtrTy, nextLinkField, voidPtrTyAlign);
 
         linkPtrPhi->addIncoming(currentLinkAddr, scanLinkedList);
@@ -1445,31 +1435,30 @@ static void addToPendingDeletions(KernelBuilder & b, Value * const pendingStruct
 
         b.SetInsertPoint(appendLinkedList);
         PHINode * const storeLinkPtrPhi = b.CreatePHI(voidPtrPtrTy, 2);
-        storeLinkPtrPhi->addIncoming(voidPtrStructPtr, entry1Used);
-        storeLinkPtrPhi->addIncoming(voidPtrNextLinkField, scanLinkedList);
+        storeLinkPtrPhi->addIncoming(initialAdditionalStructPtrField, entry1Used);
+        storeLinkPtrPhi->addIncoming(nextLinkField, scanLinkedList);
 
         const auto linkNodeSize = b.getTypeSize(DL, pendingDeletionTy);
         const auto linkNodeAlign = b.getAlignOf(DL, pendingDeletionTy);
         Value * const newLink = b.CreateAlignedMalloc(b.getSize(linkNodeSize), linkNodeAlign);
         indices2[0] = i32_ZERO;
         indices2[1] = i32_PendingDeletionAddress;
-        Value * const link = b.CreatePointerCast(newLink, pendingDeletionPtrTy);
-        Value * const newAddrField = b.CreateGEP(pendingDeletionTy, link, indices2);
+        Value * const newAddrField = b.CreateGEP(pendingDeletionTy, newLink, indices2);
         b.CreateAlignedStore(addr, newAddrField, voidPtrTyAlign);
 
         indices2[1] = i32_PendingDeletionCapacity;
-        Value * const newCapField = b.CreateGEP(pendingDeletionTy, link, indices2);
+        Value * const newCapField = b.CreateGEP(pendingDeletionTy, newLink, indices2);
         b.CreateAlignedStore(size, newCapField, intPtrTyAlign);
 
         indices2[1] = i32_PendingDeletionConsumed;
-        Value * const newConsumedField = b.CreateGEP(pendingDeletionTy, link, indices2);
+        Value * const newConsumedField = b.CreateGEP(pendingDeletionTy, newLink, indices2);
         b.CreateAlignedStore(safeToDeleteAt, newConsumedField, intPtrTyAlign);
 
         indices2[1] = i32_PendingDeletionNextLink;
-        Value * const newNextLink = b.CreateGEP(pendingDeletionTy, link, indices2);
+        Value * const newNextLink = b.CreateGEP(pendingDeletionTy, newLink, indices2);
         b.CreateAlignedStore(nilVoidPtr, newNextLink, voidPtrTyAlign);
 
-        b.CreateAlignedStore(b.CreatePointerCast(newLink, voidPtrTy), storeLinkPtrPhi, voidPtrTyAlign);
+        b.CreateAlignedStore(newLink, storeLinkPtrPhi, voidPtrTyAlign);
         b.CreateBr(exit);
 
         b.SetInsertPoint(exit);
@@ -1524,9 +1513,6 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
         const auto ip = b.saveIP();
 
         StructType * const handleTy = getHandleType(b);
-        PointerType * const handlePtrTy = handleTy->getPointerTo(mAddressSpace);
-
-        PointerType * const addrPtrTy = mType->getPointerTo(mAddressSpace);
 
         IntegerType * const i8Ty = b.getInt8Ty();
 
@@ -1584,7 +1570,7 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
             return v;
         };
 
-        Value * const handle = b.CreatePointerCast(nextArg(), handlePtrTy);
+        Value * const handle = nextArg();
         handle->setName("handle");
         Value * const produced = nextArg();
         produced->setName("produced");
@@ -1669,7 +1655,7 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
             makeArgs[0] = expandedBytes;
             makeArgs[1] = sz_ZERO;
             Function * const makeBuffer = m->getFunction(__MAKE_CIRCULAR_BUFFER); assert (makeBuffer);
-            expandedAddr = b.CreatePointerCast(b.CreateCall(makeBuffer, makeArgs), i8PtrTy);
+            expandedAddr = b.CreateCall(makeBuffer, makeArgs);
         }
 
         // copy the data over to the new/reused buffer
@@ -1708,8 +1694,6 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
             GlobalVariable * const copyLoopTargetArray =
                 new GlobalVariable(*m, copyLoopArrayAddrTy, true, GlobalValue::ExternalLinkage, copyLoopAddrArray);
 
-            PointerType * const vecPtrTy = vecTy->getPointerTo(mAddressSpace);
-
             const auto vecAlign = DL.getABITypeAlign(vecTy).value();
 
             const auto i8PtrAlign = DL.getABITypeAlign(i8PtrTy).value();
@@ -1721,8 +1705,6 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
             FixedArray<Value *, 2> jumpIndex;
             jumpIndex[0] = sz_ZERO;
             jumpIndex[1] = b.CreateURemRational(maxNumOfBlocks, DUFF_STEPS);
-            unreadDataPtr = b.CreatePointerCast(unreadDataPtr, vecPtrTy);
-            toCopyPtr = b.CreatePointerCast(toCopyPtr, vecPtrTy);
 
             Value * const initialJumpTargetPtr = b.CreateGEP(copyLoopArrayAddrTy, copyLoopTargetArray, jumpIndex);
             Value * const initialJumpTarget = b.CreateAlignedLoad(i8PtrTy, initialJumpTargetPtr, i8PtrAlign);
@@ -1766,7 +1748,7 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
         if (mLinear) {
             Value * consumedOffset =  b.CreateNeg(b.CreateMul(consumedChunks, bytesPerChunk));
             Value * const newVirtualAddress = b.CreateInBoundsGEP(b.getInt8Ty(), expandedAddr, consumedOffset);
-            b.CreateAlignedStore(b.CreatePointerCast(newVirtualAddress, addrPtrTy), virtualBaseAddrField, voidPtrTyAlign);
+            b.CreateAlignedStore(newVirtualAddress, virtualBaseAddrField, voidPtrTyAlign);
         } else {
             indices[1] = b.getInt32(LinearBaseAddress);
             virtualBaseAddrField = b.CreateInBoundsGEP(handleTy, handle, indices);
@@ -1803,7 +1785,7 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
             callbackArgs[2] = produced;
             callbackArgs[3] = b.CreateMul(expandedCapacity, BLOCK_WIDTH);
 
-            b.CreateCall(funcTy, b.CreatePointerCast(reportExpansionCallback, funcTy->getPointerTo()), callbackArgs);
+            b.CreateCall(funcTy, reportExpansionCallback, callbackArgs);
 
         }
 
@@ -1830,7 +1812,7 @@ Value * ManagedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produce
     }
 
     SmallVector<Value *, 8> args(traceDynamicBuffer ? 8 : 5);
-    args[0] = b.CreatePointerCast(mHandle, voidPtrTy);
+    args[0] = mHandle;
     args[1] = produced;
     args[2] = consumed;
     args[3] = required;
@@ -1870,7 +1852,7 @@ void ManagedDynamicBuffer::assertAccessIsWithinStreamSetMemory(KernelBuilder & b
     if (mLinear) {
         endPtr = getStreamBlockPtr(b, ba, sz_ZERO, endIndex);
     } else {
-        endPtr = StreamSetBuffer::getStreamBlockPtr(b, b.CreatePointerCast(startPtr, ba->getType()), sz_ZERO, b.CreateSub(endIndex, startIndex));
+        endPtr = StreamSetBuffer::getStreamBlockPtr(b, startPtr, sz_ZERO, b.CreateSub(endIndex, startIndex));
     }
 
     auto & dl = b.getModule()->getDataLayout();
@@ -1930,7 +1912,6 @@ void FdBackedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capa
         LLVMContext & C = m->getContext();
 
         StructType * handleTy = getHandleType(b);
-        PointerType * const handlePtrTy = handleTy->getPointerTo(mAddressSpace);
 
         PointerType * const addrPtrTy = b.getVoidPtrTy();
         IntegerType * const intPtrTy = b.getIntPtrTy(DL);
@@ -1972,7 +1953,6 @@ void FdBackedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capa
 
         Value * handle = nextArg();
         handle->setName("handle");
-        handle = b.CreatePointerCast(handle, handlePtrTy);
         Value * capacity = nextArg();
         capacity->setName("capacity");
         Value * typeSize = nextArg();
@@ -2059,7 +2039,7 @@ void FdBackedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capa
             callbackArgs[2] = b.getSize(0);
             callbackArgs[3] = b.CreateMul(capacity, b.getSize(b.getBitBlockWidth()));
 
-            b.CreateCall(funcTy, b.CreatePointerCast(reportCallback, funcTy->getPointerTo()), callbackArgs);
+            b.CreateCall(funcTy, reportCallback, callbackArgs);
         }
 
         b.CreateRetVoid();
@@ -2078,7 +2058,7 @@ void FdBackedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capa
     Rational stridesPerPage{getPageSize(), typeSize};
     Value * capacity = b.CreateRoundUpRational(capacityMultiplier, stridesPerPage.numerator());
     SmallVector<Value *, 6> args(traceDynamicBuffer ? 6 : 3);
-    args[0] = b.CreatePointerCast(getHandle(), voidPtrTy);
+    args[0] = getHandle();
     args[1] = capacity;
     args[2] = b.getSize(typeSize);
     if (LLVM_UNLIKELY(traceDynamicBuffer)) {
@@ -2101,7 +2081,7 @@ void FdBackedDynamicBuffer::releaseBuffer(KernelBuilder & b) const {
 
     IntegerType * const intTy = b.getIntNTy(8 * sizeof(int));
 
-    PointerType * const addrPtrTy = mType->getPointerTo(mAddressSpace);
+    PointerType * const addrPtrTy = PointerType::get(b.getContext(), mAddressSpace);
     const auto voidPtrTyAlign = DL.getABITypeAlign(addrPtrTy).value();
 
     IntegerType * const intPtrTy = b.getIntPtrTy(DL);
@@ -2120,7 +2100,7 @@ void FdBackedDynamicBuffer::releaseBuffer(KernelBuilder & b) const {
     Value * const capacity = b.CreateAlignedLoad(intPtrTy, capacityField, intPtrTyAlign);
 
     FixedArray<Value *, 2> args2;
-    args2[0] = b.CreatePointerCast(addr, b.getInt8PtrTy());
+    args2[0] = addr;
     args2[1] = b.CreateMul(b.getTypeSize(mType), capacity);
     b.CreateCall(m->getFunction(__MUNMAP), args2);
 
@@ -2171,7 +2151,6 @@ Value * FdBackedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produc
         const auto ip = b.saveIP();
 
         StructType * const handleTy = getHandleType(b);
-        PointerType * const handlePtrTy = handleTy->getPointerTo(mAddressSpace);
 
         PointerType * const i8PtrTy = b.getInt8PtrTy();
         const auto voidPtrTyAlign = DL.getABITypeAlign(i8PtrTy).value();
@@ -2216,7 +2195,7 @@ Value * FdBackedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produc
             return v;
         };
 
-        Value * const handle = b.CreatePointerCast(nextArg(), handlePtrTy);
+        Value * const handle = nextArg();
         handle->setName("handle");
         Value * const produced = nextArg();
         produced->setName("produced");
@@ -2267,7 +2246,7 @@ Value * FdBackedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produc
         args[3] = expandedBytes;
 
         Function * const makeBuffer = m->getFunction(__RESIZE_FD_BACKED_BUFFER); assert (makeBuffer);
-        Value * const expandedAddr = b.CreatePointerCast(b.CreateCall(makeBuffer, args), i8PtrTy);
+        Value * const expandedAddr = b.CreateCall(makeBuffer, args);
 
         b.CreateAlignedStore(expandedAddr, addrField, voidPtrTyAlign);
         b.CreateAlignedStore(expandedCapacity, capacityField, intPtrTyAlign);
@@ -2292,7 +2271,7 @@ Value * FdBackedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produc
             callbackArgs[2] = produced;
             callbackArgs[3] = b.CreateMul(expandedCapacity, BLOCK_WIDTH);
 
-            b.CreateCall(funcTy, b.CreatePointerCast(reportExpansionCallback, funcTy->getPointerTo()), callbackArgs);
+            b.CreateCall(funcTy, reportExpansionCallback, callbackArgs);
 
         }
 
@@ -2313,7 +2292,7 @@ Value * FdBackedDynamicBuffer::reserveCapacity(KernelBuilder & b, Value * produc
     }
 
     SmallVector<Value *, 7> args(traceDynamicBuffer ? 7 : 4);
-    args[0] = b.CreatePointerCast(mHandle, voidPtrTy);
+    args[0] = mHandle;
     args[1] = produced;
     args[2] = required;
     args[3] = b.getSize(b.getTypeSize(DL, mType));
@@ -2428,15 +2407,12 @@ Value * RepeatingBuffer::getVirtualBasePtr(KernelBuilder & b, Value * const base
         Type * const elemTy = cast<ArrayType>(mBaseType)->getElementType();
         Type * itemTy = cast<VectorType>(elemTy)->getElementType();
         const unsigned itemWidth = itemTy->getPrimitiveSizeInBits().getFixedValue();
-        PointerType * itemPtrTy = nullptr;
         if (LLVM_UNLIKELY(itemWidth < 8)) {
             const Rational itemsPerByte{8, itemWidth};
             offset = b.CreateUDivRational(offset, itemsPerByte);
             itemTy = b.getInt8Ty();
         }
-        itemPtrTy = itemTy->getPointerTo(mAddressSpace);
-        addr = b.CreatePointerCast(baseAddress, itemPtrTy);
-        addr = b.CreateInBoundsGEP(itemTy, addr, b.CreateNeg(offset));
+        addr = b.CreateInBoundsGEP(itemTy, baseAddress, b.CreateNeg(offset));
     } else {
         Value * const transferredBlocks = b.CreateLShr(transferredItems, LOG_2_BLOCK_WIDTH);
         Constant * const BLOCK_WIDTH = b.getSize(b.getBitBlockWidth());
@@ -2446,7 +2422,7 @@ Value * RepeatingBuffer::getVirtualBasePtr(KernelBuilder & b, Value * const base
         Constant * const sz_ZERO = b.getSize(0);
         addr = StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, offset);
     }
-    return b.CreatePointerCast(addr, getPointerType());
+    return addr;
 }
 
 Value * RepeatingBuffer::getBaseAddress(KernelBuilder & b) const {

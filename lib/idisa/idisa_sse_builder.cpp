@@ -9,6 +9,10 @@
 #include <llvm/IR/IntrinsicsX86.h>
 #include <llvm/IR/Module.h>
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
+#define getOrInsertDeclaration getDeclaration
+#endif
+
 using namespace llvm;
 
 namespace IDISA {
@@ -34,7 +38,7 @@ Value * IDISA_SSE_Builder::hsimd_signmask(const unsigned fw, Value * a) {
     // }
     // SSE special cases using Intrinsic::x86_sse_movmsk_ps (fw=32 only)
     if (fw == 32) {
-        Function * signmask_f32func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_sse_movmsk_ps);
+        Function * signmask_f32func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_sse_movmsk_ps);
         Type * bitBlock_f32type = FixedVectorType::get(getFloatTy(), mBitBlockWidth/32);
         Value * a_as_ps = CreateBitCast(a, bitBlock_f32type);
         if (getVectorBitWidth(a) == SSE_width) {
@@ -85,7 +89,7 @@ Value * IDISA_SSE_Builder::mvmd_compress(unsigned fw, Value * a, Value * selecto
 
 Value * IDISA_SSE2_Builder::hsimd_packh(unsigned fw, Value * a, Value * b) {
     if ((fw == 16) && (getVectorBitWidth(a) == SSE_width)) {
-        Function * packuswb_func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_sse2_packuswb_128);
+        Function * packuswb_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_sse2_packuswb_128);
         return CreateCall(packuswb_func->getFunctionType(), packuswb_func, {simd_srli(16, a, 8), simd_srli(16, b, 8)});
     }
     // Otherwise use default logic.
@@ -103,7 +107,7 @@ Value * IDISA_SSE2_Builder::hsimd_packl(unsigned fw, Value * a, Value * b) {
 
 Value * IDISA_SSE2_Builder::hsimd_packus(unsigned fw, Value * a, Value * b) {
     if ((fw == 16) && (getVectorBitWidth(a) == SSE_width)) {
-        Function * packuswb_func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_sse2_packuswb_128);
+        Function * packuswb_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_sse2_packuswb_128);
         return CreateCall(packuswb_func->getFunctionType(), packuswb_func, {fwCast(16, a), fwCast(16, b)});
     }
     // Otherwise use default logic.
@@ -114,13 +118,13 @@ Value * IDISA_SSE2_Builder::hsimd_signmask(unsigned fw, Value * a) {
     // SSE2 special case using Intrinsic::x86_sse2_movmsk_pd (fw=32 only)
     if (getVectorBitWidth(a) == SSE_width) {
         if (fw == 64) {
-            Function * signmask_f64func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_sse2_movmsk_pd);
+            Function * signmask_f64func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_sse2_movmsk_pd);
             Type * bitBlock_f64type = FixedVectorType::get(getDoubleTy(), mBitBlockWidth/64);
             Value * a_as_pd = CreateBitCast(a, bitBlock_f64type);
             return CreateCall(signmask_f64func->getFunctionType(), signmask_f64func, a_as_pd);
         }
         if (fw == 8) {
-            Function * pmovmskb_func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_sse2_pmovmskb_128);
+            Function * pmovmskb_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_sse2_pmovmskb_128);
             return CreateCall(pmovmskb_func->getFunctionType(), pmovmskb_func, fwCast(8, a));
         }
     }
@@ -310,7 +314,7 @@ Value * IDISA_SSSE3_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_
             index_vector = CreateOr(A, getSplat(fieldCount, addition));
             return fwCast(fw, mvmd_shuffle(8, a, index_vector));
         } else if (fw == 8) {
-            Function * shuf8Func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_ssse3_pshuf_b_128);
+            Function * shuf8Func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_ssse3_pshuf_b_128);
             return CreateCall(shuf8Func->getFunctionType(), shuf8Func, {fwCast(8, a), fwCast(8, simd_and(index_vector, simd_lomask(8)))});
         }
     }

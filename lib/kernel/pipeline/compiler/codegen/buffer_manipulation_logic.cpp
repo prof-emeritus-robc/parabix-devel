@@ -22,7 +22,6 @@ void PipelineCompiler::updateZeroExtendedInputVirtualBaseAddresses(KernelBuilder
     b.CreateUnlikelyCondBr(mHasZeroExtendedInput, clearZeroExtension, clearZeroExtensionExit);
 
     b.SetInsertPoint(clearZeroExtension);
-    IntegerType * const intPtrTy = b.getIntPtrTy(b.getModule()->getDataLayout());
     const auto k = LastStreamSet + mCurrentPartitionId + 1U;
 
 
@@ -53,14 +52,12 @@ void PipelineCompiler::updateZeroExtendedInputVirtualBaseAddresses(KernelBuilder
 
             Constant * const LOG_2_BLOCK_WIDTH = b.getSize(floor_log2(b.getBitBlockWidth()));
             Constant * const ZERO = b.getSize(0);
-            PointerType * const bufferType = buffer->getPointerType();
             Value * const blockIndex = b.CreateLShr(processed, LOG_2_BLOCK_WIDTH);
 
             // allocateLocalZeroExtensionSpace guarantees this will be large enough to satisfy the kernel
             ExternalBuffer tmp(0, b, binding.getType(), buffer->getAddressSpace());
-            Value * zeroExtension = b.CreatePointerCast(start, bufferType);
+            Value * zeroExtension = start;
             Value * addr = tmp.getStreamBlockPtr(b, zeroExtension, ZERO, b.CreateNeg(blockIndex));
-            addr = b.CreatePointerCast(addr, bufferType);
             assert (addr->getType() == mInputVirtualBaseAddressPhi[rt.Port]->getType());
 
             addr = b.CreateSelect(zeroExtended, addr, mInputVirtualBaseAddressPhi[rt.Port], "zeroExtendAddr");
@@ -270,7 +267,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             params[3] = sizeTy; // end
             params[4] = sizeTy; // overflow
             params[5] = sizeTy; // numOfStreams
-            params[6] = truncTy->getPointerTo(); // masked buffer storage ptr
+            params[6] = PointerType::getUnqual(b.getContext()); // masked buffer storage ptr
 
             LLVMContext & C = m->getContext();
 
@@ -319,9 +316,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             Type * const singleElementStreamSetTy = ArrayType::get(FixedVectorType::get(IntegerType::get(C, itemWidth), 0U), 1U);
             ExternalBuffer tmp(0, b, singleElementStreamSetTy, 0);
 
-            PointerType * const bufferPtrTy = tmp.getPointerType();
-
-            Value * const inputAddress = b.CreatePointerCast(inputBuffer, bufferPtrTy);
+            Value * const inputAddress = inputBuffer;
             Value * const initial = b.CreateMul(b.CreateLShr(start, LOG_2_BLOCK_WIDTH), numOfStreams);
             Value * const initialPtr = tmp.getStreamBlockPtr(b, inputAddress, sz_ZERO, initial);
             Value * const initialPtrInt = b.CreatePtrToInt(initialPtr, intPtrTy);
@@ -363,10 +358,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             maskedBufferSize->addIncoming(existingSize, entry);
             maskedBufferSize->addIncoming(allocedBytes, allocateNewBuffer);
 
-            Value * const mallocedAddress = b.CreatePointerCast(maskedBuffer, bufferPtrTy);
-            Value * const outputVBA = tmp.getStreamBlockPtr(b, mallocedAddress, sz_ZERO, b.CreateNeg(initial));
-            Value * const maskedAddress = b.CreatePointerCast(outputVBA, bufferPtrTy);
-            assert (maskedAddress->getType() == inputAddress->getType());
+            Value * const maskedAddress = tmp.getStreamBlockPtr(b, maskedBuffer, sz_ZERO, b.CreateNeg(initial));
             b.CreateCondBr(b.CreateIsNull(mallocBytes), maskedInputExit, hasDataToCopy);
 
             b.SetInsertPoint(hasDataToCopy);
@@ -439,7 +431,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             b.CreateCondBr(notDone, maskedInputLoop, maskedInputExit);
 
             b.SetInsertPoint(maskedInputExit);
-            Value * const retAddress = b.CreatePointerCast(maskedAddress, int8PtrTy);
+            Value * const retAddress = maskedAddress;
 
             if (LLVM_UNLIKELY(mCheckStreamSets)) {
                 FixedArray<Value *, 2> fields;
@@ -454,7 +446,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
 
         FixedArray<Value *, 7> args;
 
-        args[0] = b.CreatePointerCast(inputBaseAddresses[inputPort.Number], int8PtrTy);
+        args[0] = inputBaseAddresses[inputPort.Number];
 
         const auto ic = port.Maximum * StrideStepLength[mKernelId];
         assert (ic.denominator() == 1);
@@ -497,7 +489,6 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
         }
         assert (maskedAddress->getType()->isPointerTy());
 
-        maskedAddress = b.CreatePointerCast(maskedAddress, bufferType);
         BasicBlock * const maskedInputLoopExit = b.GetInsertBlock();
         b.CreateBr(selectedInput);
 
@@ -608,7 +599,8 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
 
             Value * const baseAddress = buffer->getBaseAddress(b);
 
-            DataLayout DL(b.getModule());
+            auto & DL = b.getModule()->getDataLayout();
+
             Type * const intPtrTy = DL.getIntPtrType(baseAddress->getType());
 
 
@@ -670,7 +662,7 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
             b.SetInsertPoint(maskExit);
 
             // Zero out any blocks we could potentially touch
-            const auto doUnaryPack = (isUnary && itemWidth > 1);
+            // const auto doUnaryPack = (isUnary && itemWidth > 1);
 
             if (rt.RequiredOverflowSpace > 0 || bn.UnwrittenAlignment > 1) { // doUnaryPack ||
 

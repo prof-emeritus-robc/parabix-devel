@@ -233,14 +233,14 @@ static BPEPipelineFunctionType buildBPEPipeline(
     //      additionalStreams channel — that channel indexes by scan-
     //      iteration counter, not match-end byte position, which silently
     //      zeroed the high byte.)
-    StreamSet * idBytes16 = P.CreateStreamSet(1, 16);
+    StreamSet * idBytes16 = P.CreateStreamSet(1, 16); 
     P.CreateKernelCall<P2S16Kernel>(vocabID, idBytes16);
 
-    StreamSet * scanIndices = P.CreateStreamSet(1, 64);
-    P.CreateKernelCall<ScanIndexGenerator>(matchEnd, scanIndices);
+    StreamSet * scanIndices = P.CreateStreamSet(1, 64); 
+    P.CreateKernelCall<ScanIndexGenerator>(matchEnd, scanIndices);  //  picks positions to print
 
-    scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),
-                 idBytes16, scanIndices);
+    scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),  
+                 idBytes16, scanIndices);   // emit token IDs at every matchEnd position 
 
     auto __tBuild1 = std::chrono::steady_clock::now();
     auto fn = reinterpret_cast<BPEPipelineFunctionType>(P.compile());

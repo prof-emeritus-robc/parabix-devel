@@ -194,7 +194,7 @@ Value * PipelineCompiler::callKernelInitializeFunction(KernelBuilder & b, const 
     }
     Value * const retVal = b.CreateCall(fty, func, args);
     if (isKernelFamilyCall(mKernelId)) {
-        b.CreateAlignedStore(b.CreatePointerCast(retVal, b.getVoidPtrTy()), threadLocal, PtrTyABIAlignment);
+        b.CreateAlignedStore(retVal, threadLocal, PtrTyABIAlignment);
     }
 }
 
@@ -281,7 +281,7 @@ Value * PipelineCompiler::getFamilyFunctionFromKernelState(KernelBuilder & b, Ty
     if (LLVM_UNLIKELY(CheckAssertions())) {
         b.CreateAssert(funcPtr, prefix + suffix + " is null");
     }
-    return b.CreatePointerCast(funcPtr, type);
+    return funcPtr;
 }
 
 }

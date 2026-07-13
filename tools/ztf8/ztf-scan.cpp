@@ -39,7 +39,6 @@ struct ScanWordParameters {
     unsigned width;
     unsigned indexWidth;
     Type * const Ty;
-    Type * const pointerTy;
     Constant * const WIDTH;
     Constant * const ix_MAXBIT;
     Constant * WORDS_PER_BLOCK;
@@ -53,7 +52,6 @@ struct ScanWordParameters {
 #endif
         indexWidth(stride/width),
         Ty(b.getIntNTy(width)),
-        pointerTy(Ty->getPointerTo()),
         WIDTH(b.getSize(width)),
         ix_MAXBIT(b.getSize(indexWidth - 1)),
         WORDS_PER_BLOCK(b.getSize(b.getBitBlockWidth()/width)),
@@ -70,7 +68,6 @@ struct LengthGroupParameters {
     Constant * SUFFIX_MASK;
     unsigned const groupHalfLength;
     Type * halfLengthTy;
-    Type * halfSymPtrTy;
     Constant * HALF_LENGTH;
     Constant * LO;
     Constant * HI;
@@ -93,7 +90,6 @@ struct LengthGroupParameters {
         SUFFIX_MASK(b.getSize(0x7F)),
         groupHalfLength(1UL << boost::intrusive::detail::floor_log2(groupInfo.lo)),
         halfLengthTy(b.getIntNTy(8U * groupHalfLength)),
-        halfSymPtrTy(halfLengthTy->getPointerTo()),
         HALF_LENGTH(b.getSize(groupHalfLength)),
         LO(b.getSize(groupInfo.lo)),
         HI(b.getSize(groupInfo.hi)),
@@ -218,7 +214,6 @@ void LengthGroupCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     Constant * sz_BITS = b.getSize(SIZE_T_BITS);
     Constant * sz_BLOCKWIDTH = b.getSize(b.getBitBlockWidth());
     Type * sizeTy = b.getSizeTy();
-    Type * bitBlockPtrTy = b.getBitBlockType()->getPointerTo();
 
     BasicBlock * const entryBlock = b.GetInsertBlock();
     BasicBlock * const stridePrologue = b.CreateBasicBlock("stridePrologue");
@@ -237,13 +232,13 @@ void LengthGroupCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     Value * const avail = b.getAvailableItemCount("symbolMarks");
     Value * const initialProduced = b.getProducedItemCount("compressionMask");
     Value * pendingMask = b.CreateNot(b.getScalarField("pendingMaskInverted"));
-    Value * producedPtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", initialProduced), bitBlockPtrTy);
+    Value * producedPtr = b.getRawOutputPointer("compressionMask", initialProduced);
     b.CreateStore(pendingMask, producedPtr);
-    Value * compressMaskPtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", initialPos), bitBlockPtrTy);
+    Value * compressMaskPtr = b.getRawOutputPointer("compressionMask", initialPos);
     Value * hash; Type * hashTy;
     std::tie(hash, hashTy) = b.getScalarFieldPtr("hashTable");
 
-    Value * hashTableBasePtr = b.CreateBitCast(b.getScalarFieldPtr("hashTable").first, b.getInt8PtrTy());
+    Value * hashTableBasePtr = b.getScalarFieldPtr("hashTable").first;
     if (!DelayedAttribute) {
         // Copy pending output data.
         Value * const initialProduced = b.getProducedItemCount("result");
@@ -279,7 +274,6 @@ void LengthGroupCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     //       symbol.
     //
     Value * keyWordBasePtr = b.getInputStreamBlockPtr("symbolMarks", sz_ZERO, strideBlockOffset);
-    keyWordBasePtr = b.CreatePointerCast(keyWordBasePtr, sw.pointerTy);
     b.CreateUnlikelyCondBr(b.CreateICmpEQ(keyMask, sz_ZERO), keysDone, keyProcessingLoop);
 
     b.SetInsertPoint(keyProcessingLoop);
@@ -308,10 +302,10 @@ void LengthGroupCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     Value * tblEntryPtr = b.CreateGEP(b.getInt8Ty(), hashTablePtr, b.CreateMul(keyHash, lg.HI));
     // Use two 8-byte loads to get hash and symbol values.
     //b.CallPrintInt("tblEntryPtr", tblEntryPtr);
-    Value * tblPtr1 = b.CreateBitCast(tblEntryPtr, lg.halfSymPtrTy);
-    Value * tblPtr2 = b.CreateBitCast(b.CreateGEP(b.getInt8Ty(), tblEntryPtr, keyOffset), lg.halfSymPtrTy);
-    Value * symPtr1 = b.CreateBitCast(b.getRawInputPointer("byteData", keyStartPos), lg.halfSymPtrTy);
-    Value * symPtr2 = b.CreateBitCast(b.getRawInputPointer("byteData", b.CreateAdd(keyStartPos, keyOffset)), lg.halfSymPtrTy);
+    Value * tblPtr1 = tblEntryPtr;
+    Value * tblPtr2 = b.CreateGEP(b.getInt8Ty(), tblEntryPtr, keyOffset);
+    Value * symPtr1 = b.getRawInputPointer("byteData", keyStartPos);
+    Value * symPtr2 = b.getRawInputPointer("byteData", b.CreateAdd(keyStartPos, keyOffset));
     // Check to see if the hash table entry is nonzero (already assigned).
     Value * sym1 = b.CreateAlignedLoad(lg.halfLengthTy, symPtr1, 1);
     Value * sym2 = b.CreateAlignedLoad(lg.halfLengthTy, symPtr2, 1);
@@ -340,12 +334,12 @@ void LengthGroupCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
         Value * pfxHash = b.CreateAnd(pfxHashValue, lg.HASH_MASK, "pfxHash");
         Value * pfxTablePtr = b.CreateGEP(lg.halfLengthTy, hashTableBasePtr, b.CreateMul(b.CreateSub(pfxLength, lg.LO), lg.SUBTABLE_SIZE));
         Value * pfxEntryPtr = b.CreateGEP(lg.halfLengthTy, pfxTablePtr, b.CreateMul(pfxHash, lg.HI));
-        Value * pfxPtr1 = b.CreateBitCast(pfxEntryPtr, lg.halfSymPtrTy);
-        Value * pfxPtr2 = b.CreateBitCast(b.CreateGEP(lg.halfLengthTy, pfxEntryPtr, pfxOffset), lg.halfSymPtrTy);
+        Value * pfxPtr1 = pfxEntryPtr;
+        Value * pfxPtr2 = b.CreateGEP(lg.halfLengthTy, pfxEntryPtr, pfxOffset);
         Value * pfx1 = b.CreateMonitoredScalarFieldLoad("hashTable", pfxPtr1);
         Value * pfx2 = b.CreateMonitoredScalarFieldLoad("hashTable", pfxPtr2);
         // Only the second half of the symbol needs to be loaded.
-        Value * symPfxPtr2 = b.CreateBitCast(b.getRawInputPointer("byteData", b.CreateAdd(keyStartPos, pfxOffset)), lg.halfSymPtrTy);
+        Value * symPfxPtr2 = b.getRawInputPointer("byteData", b.CreateAdd(keyStartPos, pfxOffset));
         Value * pfxSym2 = b.CreateAlignedLoad(lg.halfLengthTy, symPfxPtr2, 1);
         symIsEqEntry = b.CreateAnd(b.CreateICmpEQ(pfx1, sym1), b.CreateICmpEQ(pfx2, pfxSym2));
         b.CreateCondBr(symIsEqEntry, markCompression, tryStore);
@@ -376,7 +370,7 @@ void LengthGroupCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     //b.CallPrintInt("bitOffset", bitOffset);
     mask = b.CreateShl(mask, bitOffset);
     //b.CallPrintInt("mask", mask);
-    Value * const keyBasePtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", keyBase), sizeTy->getPointerTo());
+    Value * const keyBasePtr = b.getRawOutputPointer("compressionMask", keyBase);
 
     Value * initialMask = b.CreateAlignedLoad(sizeTy, keyBasePtr, 1);
     //b.CallPrintInt("initialMask", initialMask);
@@ -442,7 +436,7 @@ void LengthGroupCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     b.setProducedItemCount("compressionMask", produced);
     b.CreateCondBr(b.isFinal(), compressionMaskDone, updatePending);
     b.SetInsertPoint(updatePending);
-    Value * pendingPtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", produced), bitBlockPtrTy);
+    Value * pendingPtr = b.getRawOutputPointer("compressionMask", produced);
     //b.CallPrintInt("pendingPtr", pendingPtr);
     Value * lastMask = b.CreateBlockAlignedLoad(b.getBitBlockType(), pendingPtr);
     b.setScalarField("pendingMaskInverted", b.CreateNot(lastMask));
@@ -561,7 +555,7 @@ void LengthGroupDecompression::generateMultiBlockLogic(KernelBuilder & b, Value 
     // overwritten when and as necessary for decompression of ZTF codes.
     Value * toCopy = b.CreateMul(numOfStrides, sz_STRIDE);
     b.CreateMemCpy(b.getRawOutputPointer("result", initialPos), b.getRawInputPointer("byteData", initialPos), toCopy, 1);
-    Value * hashTableBasePtr = b.CreateBitCast(b.getScalarFieldPtr("hashTable").first, b.getInt8PtrTy());
+    Value * hashTableBasePtr = b.getScalarFieldPtr("hashTable").first;
     b.CreateBr(stridePrologue);
 
     b.SetInsertPoint(stridePrologue);
@@ -583,7 +577,6 @@ void LengthGroupDecompression::generateMultiBlockLogic(KernelBuilder & b, Value 
     // appropriate.   Each key is hashed, and is entered into the hash
     // table if there is not already an entry for that hash code.
     Value * keyWordBasePtr = b.getInputStreamBlockPtr("keyMarks0", sz_ZERO, strideBlockOffset);
-    keyWordBasePtr = b.CreateBitCast(keyWordBasePtr, sw.pointerTy);
     DEBUG_PRINT("keyMask", keyMask);
     b.CreateUnlikelyCondBr(b.CreateICmpEQ(keyMask, sz_ZERO), keysDone, keyProcessingLoop);
 
@@ -613,10 +606,10 @@ void LengthGroupDecompression::generateMultiBlockLogic(KernelBuilder & b, Value 
     Value * hashTablePtr = b.CreateGEP(b.getInt8Ty(), hashTableBasePtr, b.CreateMul(b.CreateSub(keyLength, lg.LO), lg.SUBTABLE_SIZE));
     Value * tblEntryPtr = b.CreateGEP(b.getInt8Ty(), hashTablePtr, b.CreateMul(keyHash, lg.HI));
     // Use two 8-byte loads to get hash and symbol values.
-    Value * tblPtr1 = b.CreateBitCast(tblEntryPtr, lg.halfSymPtrTy);
-    Value * tblPtr2 = b.CreateBitCast(b.CreateGEP(b.getInt8Ty(), tblEntryPtr, keyOffset), lg.halfSymPtrTy);
-    Value * symPtr1 = b.CreateBitCast(b.getRawInputPointer("byteData", keyStartPos), lg.halfSymPtrTy);
-    Value * symPtr2 = b.CreateBitCast(b.getRawInputPointer("byteData", b.CreateAdd(keyStartPos, keyOffset)), lg.halfSymPtrTy);
+    Value * tblPtr1 = tblEntryPtr;
+    Value * tblPtr2 = b.CreateGEP(b.getInt8Ty(), tblEntryPtr, keyOffset);
+    Value * symPtr1 = b.getRawInputPointer("byteData", keyStartPos);
+    Value * symPtr2 = b.getRawInputPointer("byteData", b.CreateAdd(keyStartPos, keyOffset));
 
     // Check to see if the hash table entry is nonzero (already assigned).
     Value * sym1 = b.CreateLoad(lg.halfLengthTy, symPtr1);
@@ -654,7 +647,6 @@ void LengthGroupDecompression::generateMultiBlockLogic(KernelBuilder & b, Value 
 
     b.SetInsertPoint(keysDone);
     Value * hashWordBasePtr = b.getInputStreamBlockPtr("hashMarks0", sz_ZERO, strideBlockOffset);
-    hashWordBasePtr = b.CreateBitCast(hashWordBasePtr, sw.pointerTy);
     b.CreateUnlikelyCondBr(b.CreateICmpEQ(hashMask, sz_ZERO), hashesDone, hashProcessingLoop);
 
     b.SetInsertPoint(hashProcessingLoop);
@@ -693,14 +685,14 @@ void LengthGroupDecompression::generateMultiBlockLogic(KernelBuilder & b, Value 
     tblEntryPtr = b.CreateGEP(b.getInt8Ty(), hashTablePtr, b.CreateMul(hashCode, lg.HI));
     // Use two 8-byte loads to get hash and symbol values.
     // b.CallPrintInt("tblEntryPtr", tblEntryPtr);
-    tblPtr1 = b.CreateBitCast(tblEntryPtr, lg.halfSymPtrTy);
-    tblPtr2 = b.CreateBitCast(b.CreateGEP(b.getInt8Ty(), tblEntryPtr, symOffset), lg.halfSymPtrTy);
+    tblPtr1 = tblEntryPtr;
+    tblPtr2 = b.CreateGEP(b.getInt8Ty(), tblEntryPtr, symOffset);
     entry1 = b.CreateAlignedLoad(lg.halfLengthTy, tblPtr1, 1);
     entry2 = b.CreateAlignedLoad(lg.halfLengthTy, tblPtr2, 1);
     DEBUG_PRINT("symStartPos", symStartPos);
-    symPtr1 = b.CreateBitCast(b.getRawOutputPointer("result", symStartPos), lg.halfSymPtrTy);
+    symPtr1 = b.getRawOutputPointer("result", symStartPos);
     DEBUG_PRINT("symOffset", symOffset);
-    symPtr2 = b.CreateBitCast(b.getRawOutputPointer("result", b.CreateAdd(symStartPos, symOffset)), lg.halfSymPtrTy);
+    symPtr2 = b.getRawOutputPointer("result", b.CreateAdd(symStartPos, symOffset));
     DEBUG_PRINT("entry1", entry1);
     b.CreateAlignedStore(entry1, symPtr1, 1);
     DEBUG_PRINT("entry2", entry2);
@@ -748,54 +740,50 @@ unsigned hashTableSize(EncodingInfo info, unsigned lgth) {
 //
 std::vector<Value *> MonitoredScalarLoadSymbol(KernelBuilder & b, std::string scalarName, Value * sourcePtr, unsigned length) {
     unsigned load_length = 1U << boost::intrusive::detail::floor_log2(length);
-    Type * loadPtrTy = b.getIntNTy(load_length * 8)->getPointerTo();
-    Value * load1 = b.CreateMonitoredScalarFieldLoad(scalarName, b.CreateBitCast(sourcePtr, loadPtrTy));
+    Value * load1 = b.CreateMonitoredScalarFieldLoad(scalarName, sourcePtr);
     if (load_length == length) {
         return std::vector<Value *>{load1};
     }
     Constant * offset = b.getInt32(length - load_length);
-    Value * srcPtr2 = b.CreateGEP(b.getInt8Ty(), b.CreateBitCast(sourcePtr, b.getInt8PtrTy()), offset);
-    Value * load2 = b.CreateMonitoredScalarFieldLoad(scalarName, b.CreateBitCast(srcPtr2, loadPtrTy));
+    Value * srcPtr2 = b.CreateGEP(b.getInt8Ty(), sourcePtr, offset);
+    Value * load2 = b.CreateMonitoredScalarFieldLoad(scalarName, srcPtr2);
     return std::vector<Value *>{load1, load2};
 }
 
 std::vector<Value *> loadSymbol(KernelBuilder & b, Value * sourcePtr, unsigned length) {
     unsigned load_length = 1U << boost::intrusive::detail::floor_log2(length);
     Type * loadTy = b.getIntNTy(load_length * 8);
-    Type * loadPtrTy = loadTy->getPointerTo();
-    Value * load1 = b.CreateAlignedLoad(loadTy, b.CreateBitCast(sourcePtr, loadPtrTy), 1);
+    Value * load1 = b.CreateAlignedLoad(loadTy, sourcePtr, 1);
     if (load_length == length) {
         return std::vector<Value *>{load1};
     }
     Constant * offset = b.getInt32(length - load_length);
-    Value * srcPtr2 = b.CreateGEP(b.getInt8Ty(), b.CreateBitCast(sourcePtr, b.getInt8PtrTy()), offset);
-    Value * load2 = b.CreateAlignedLoad(loadTy, b.CreateBitCast(srcPtr2, loadPtrTy), 1);
+    Value * srcPtr2 = b.CreateGEP(b.getInt8Ty(), sourcePtr, offset);
+    Value * load2 = b.CreateAlignedLoad(loadTy, srcPtr2, 1);
     return std::vector<Value *>{load1, load2};
 }
 
 void MonitoredScalarStoreSymbol(KernelBuilder & b, std::string scalarName, std::vector<Value *> toStore, Value * ptr, unsigned length) {
     unsigned store_length = 1U << boost::intrusive::detail::floor_log2(length);
     //b.CallPrintInt("ptr" + std::to_string(length), ptr);
-    Type * storePtrTy = b.getIntNTy(store_length * 8)->getPointerTo();
-    b.CreateMonitoredScalarFieldStore(scalarName, toStore[0], b.CreateBitCast(ptr, storePtrTy));
+    b.CreateMonitoredScalarFieldStore(scalarName, toStore[0], ptr);
     if (store_length == length) {
         return;
     }
     Constant * offset = b.getInt32(length - store_length);
-    Value * ptr2 = b.CreateGEP(b.getInt8Ty(), b.CreateBitCast(ptr, b.getInt8PtrTy()), offset);
-    b.CreateMonitoredScalarFieldStore(scalarName, toStore[1], b.CreateBitCast(ptr2, storePtrTy));
+    Value * ptr2 = b.CreateGEP(b.getInt8Ty(), ptr, offset);
+    b.CreateMonitoredScalarFieldStore(scalarName, toStore[1], ptr2);
 }
 
 void storeSymbol(KernelBuilder & b, std::vector<Value *> toStore, Value * ptr, unsigned length) {
     unsigned store_length = 1U << boost::intrusive::detail::floor_log2(length);
-    Type * storePtrTy = b.getIntNTy(store_length * 8)->getPointerTo();
-    b.CreateAlignedStore(toStore[0], b.CreateBitCast(ptr, storePtrTy), 1);
+    b.CreateAlignedStore(toStore[0], ptr, 1);
     if (store_length == length) {
         return;
     }
     Constant * offset = b.getInt32(length - store_length);
-    Value * ptr2 = b.CreateGEP(b.getInt8Ty(), b.CreateBitCast(ptr, b.getInt8PtrTy()), offset);
-    b.CreateAlignedStore(toStore[1], b.CreateBitCast(ptr2, storePtrTy), 1);
+    Value * ptr2 = b.CreateGEP(b.getInt8Ty(), ptr, offset);
+    b.CreateAlignedStore(toStore[1], ptr2, 1);
 }
 
 Value * compareSymbols (KernelBuilder & b, std::vector<Value *> sym1, std::vector<Value *> sym2) {
@@ -851,7 +839,6 @@ void generateKeyProcessingLoops(KernelBuilder & b,
         Value * extensionMapPtr; Type * extMapTy;
         std::tie(extensionMapPtr, extMapTy) = b.getScalarFieldPtr("prefixMapTable");
         Value * keyWordBasePtr = b.getInputStreamBlockPtr("symbolMarks" + (length > lo ? std::to_string(length-lo) : ""), sz_ZERO, strideBlockOffset);
-        keyWordBasePtr = b.CreateBitCast(keyWordBasePtr, sw.pointerTy);
         b.CreateUnlikelyCondBr(b.CreateICmpEQ(keyMasks[length-lo], sz_ZERO), loopExit, keyProcessingLoop);
 
         b.SetInsertPoint(keyProcessingLoop);
@@ -932,7 +919,7 @@ void generateKeyProcessingLoops(KernelBuilder & b,
         Value * bitOffset = b.CreateSub(keyStartPos, keyBase);
         Value * mask = b.CreateShl(sz_COMPRESSION_MASK, bitOffset);
         //b.CallPrintInt("mask", mask);
-        Value * const keyBasePtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", keyBase), sizeTy->getPointerTo());
+        Value * const keyBasePtr = b.getRawOutputPointer("compressionMask", keyBase);
         Value * initialMask = b.CreateAlignedLoad(sizeTy, keyBasePtr, 1);
         //b.CallPrintInt("initialMask", initialMask);
         Value * updated = b.CreateAnd(initialMask, b.CreateNot(mask));
@@ -1039,7 +1026,6 @@ void FixedLengthCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
 
     Constant * sz_BLOCKWIDTH = b.getSize(b.getBitBlockWidth());
     Type * sizeTy = b.getSizeTy();
-    Type * bitBlockPtrTy = b.getBitBlockType()->getPointerTo();
 
     BasicBlock * const entryBlock = b.GetInsertBlock();
     BasicBlock * const stridePrologue = b.CreateBasicBlock("stridePrologue");
@@ -1053,9 +1039,9 @@ void FixedLengthCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     Value * const avail = b.getAvailableItemCount("symbolMarks");
     Value * const initialProduced = b.getProducedItemCount("compressionMask");
     Value * pendingMask = b.CreateNot(b.getScalarField("pendingMaskInverted"));
-    Value * producedPtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", initialProduced), bitBlockPtrTy);
+    Value * producedPtr = b.getRawOutputPointer("compressionMask", initialProduced);
     b.CreateStore(pendingMask, producedPtr);
-    Value * compressMaskPtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", initialPos), bitBlockPtrTy);
+    Value * compressMaskPtr = b.getRawOutputPointer("compressionMask", initialPos);
     if (!DelayedAttribute) {
         // Copy pending output data.
         Value * const initialProduced = b.getProducedItemCount("result");
@@ -1108,7 +1094,7 @@ void FixedLengthCompression::generateMultiBlockLogic(KernelBuilder & b, Value * 
     b.setProducedItemCount("compressionMask", produced);
     b.CreateCondBr(b.isFinal(), compressionMaskDone, updatePending);
     b.SetInsertPoint(updatePending);
-    Value * pendingPtr = b.CreateBitCast(b.getRawOutputPointer("compressionMask", produced), bitBlockPtrTy);
+    Value * pendingPtr = b.getRawOutputPointer("compressionMask", produced);
     //b.CallPrintInt("pendingPtr", pendingPtr);
     Value * lastMask = b.CreateBlockAlignedLoad(b.getBitBlockType(), pendingPtr);
     b.setScalarField("pendingMaskInverted", b.CreateNot(lastMask));
@@ -1145,7 +1131,6 @@ void generateDecompKeyProcessingLoops(KernelBuilder & b,
             loopExit = b.CreateBasicBlock("loopExit");
         }
         Value * keyWordBasePtr = b.getInputStreamBlockPtr("keyMarks" + std::to_string(length-lo), sz_ZERO, strideBlockOffset);
-        keyWordBasePtr = b.CreateBitCast(keyWordBasePtr, sw.pointerTy);
         Value * hashTablePtr; Type * hashTy;
         std::tie(hashTablePtr, hashTy) = b.getScalarFieldPtr("hashTable");
         b.CreateUnlikelyCondBr(b.CreateICmpEQ(keyMasks[length-lo], sz_ZERO), loopExit, keyProcessingLoop);
@@ -1227,7 +1212,6 @@ void generateHashProcessingLoops(KernelBuilder & b,
         Value * hashTablePtr; Type * hashTy;
         std::tie(hashTablePtr, hashTy) = b.getScalarFieldPtr("hashTable");
         Value * hashWordBasePtr = b.getInputStreamBlockPtr("hashMarks" + std::to_string(length-lo), sz_ZERO, strideBlockOffset);
-        hashWordBasePtr = b.CreateBitCast(hashWordBasePtr, sw.pointerTy);
         b.CreateUnlikelyCondBr(b.CreateICmpEQ(hashMasks[length-lo], sz_ZERO), loopExit, hashProcessingLoop);
 
         b.SetInsertPoint(hashProcessingLoop);

@@ -86,7 +86,7 @@ LoadInst * KernelBuilder::CreateMonitoredScalarFieldLoad(const StringRef fieldNa
  * @brief CreateMonitoredScalarFieldStore
  ** ------------------------------------------------------------------------------------------------------------- */
 StoreInst * KernelBuilder::CreateMonitoredScalarFieldStore(const StringRef fieldName, Value * toStore, Value * internalPtr) {
-    DataLayout DL(getModule());
+    auto & DL = getModule()->getDataLayout();
     Type * scalarTy;
     Value * scalarPtr;
     std::tie(scalarPtr, scalarTy) = getScalarFieldPtr(fieldName);
@@ -371,7 +371,6 @@ Value * KernelBuilder::readRawInputPointer(Type * ty, const StringRef name, Valu
     const auto fw = buf->getFieldWidth();
     if (fw < 8) {
         IntegerType * const int8Ty = getInt8Ty();
-        ptr = CreatePointerCast(ptr, int8Ty->getPointerTo(buf->getAddressSpace()));
         Value * val = CreateZExt(CreateAlignedLoad(int8Ty, ptr, 1), getSizeTy());
         const auto fieldsPerByte = 8U / fw;
         Value * pos = CreateZExtOrTrunc(absolutePosition, getSizeTy());
@@ -381,7 +380,6 @@ Value * KernelBuilder::readRawInputPointer(Type * ty, const StringRef name, Valu
         val = CreateAnd(val, getSize((1UL << fw) - 1UL));
         return CreateTrunc(val, ty);
     } else {
-        ptr = CreatePointerCast(ptr, ty->getPointerTo(buf->getAddressSpace()));
         const auto dataWidth = fw > 8 ? fw >> 3 : 1U;
         const auto alignment = boost::gcd<size_t>(dl.getABITypeAlign(ty).value(), dataWidth);
         return CreateAlignedLoad(ty, ptr, alignment);
@@ -407,7 +405,6 @@ Value * KernelBuilder::readRawInputPointer(Type * ty, const StringRef name, Valu
     const auto fw = buf->getFieldWidth();
     if (fw < 8) {
         IntegerType * const int8Ty = getInt8Ty();
-        ptr = CreatePointerCast(ptr, int8Ty->getPointerTo(buf->getAddressSpace()));
         Value * val = CreateZExt(CreateAlignedLoad(int8Ty, ptr, 1), getSizeTy());
         const auto fieldsPerByte = 8U / fw;
         Value * pos = CreateZExtOrTrunc(absolutePosition, getSizeTy());
@@ -417,7 +414,6 @@ Value * KernelBuilder::readRawInputPointer(Type * ty, const StringRef name, Valu
         val = CreateAnd(val, getSize((1UL << fw) - 1UL));
         return CreateTrunc(val, ty);
     } else {
-        ptr = CreatePointerCast(ptr, ty->getPointerTo(buf->getAddressSpace()));
         const auto dataWidth = fw > 8 ? fw >> 3 : 1U;
         const auto alignment = boost::gcd<size_t>(dl.getABITypeAlign(ty).value(), dataWidth);
         return CreateAlignedLoad(ty, ptr, alignment);
@@ -454,7 +450,6 @@ Value * KernelBuilder::writeRawOutputPointer(const StringRef name, Value * absol
         Value * const end = buf->getCapacity(*this);
         buf->assertAccessIsWithinStreamSetMemory(*this, GetString(name), ptr, getTypeSize(dl, ty), start, end);
     }
-    ptr = CreatePointerCast(ptr, ty->getPointerTo(buf->getAddressSpace()));
     const auto fw = buf->getFieldWidth();
     const auto dataWidth = fw > 8 ? fw >> 3 : 1U;
     const auto alignment = boost::gcd<size_t>(dl.getABITypeAlign(ty).value(), dataWidth);
@@ -477,7 +472,6 @@ Value * KernelBuilder::writeRawOutputPointer(const StringRef name, Value * const
         Value * const end = buf->getCapacity(*this);
         buf->assertAccessIsWithinStreamSetMemory(*this, GetString(name), ptr, getTypeSize(dl, ty), start, end);
     }
-    ptr = CreatePointerCast(ptr, ty->getPointerTo(buf->getAddressSpace()));
     const auto fw = buf->getFieldWidth();
     const auto dataWidth = fw > 8 ? fw >> 3 : 1U;
     const auto alignment = boost::gcd<size_t>(dl.getABITypeAlign(ty).value(), dataWidth);
@@ -536,10 +530,6 @@ void KernelBuilder::reserveCapacity(const StringRef name, Value * capacity) {
             Function * f = m->getFunction(name.str());
 
             if (f == nullptr) {
-
-                StructType * const handleTy = buffer->getHandleType(*this);
-                PointerType * const handlePtrTy = handleTy->getPointerTo(buffer->getAddressSpace());
-
                 SmallVector<Type *, 7> paramTypes(traceDynamicBuffers ? 7 : 4);
                 paramTypes[0] = voidPtrTy; // shared struct ptr
                 paramTypes[1] = intPtrTy;
@@ -573,7 +563,7 @@ void KernelBuilder::reserveCapacity(const StringRef name, Value * capacity) {
                     return v;
                 };
 
-                Value * const handle = CreatePointerCast(nextArg(), handlePtrTy);
+                Value * const handle = nextArg();
                 buffer->setHandle(handle);
                 handle->setName("handle");
                 Value * const produced = nextArg();
@@ -618,7 +608,7 @@ void KernelBuilder::reserveCapacity(const StringRef name, Value * capacity) {
             }
 
             SmallVector<Value *, 7> args(traceDynamicBuffers ? 7 : 4);
-            args[0] = CreatePointerCast(buffer->getHandle(), voidPtrTy);
+            args[0] = buffer->getHandle();
             args[1] = producedItems;
             args[2] = consumedItems;
             args[3] = capacity;
@@ -947,13 +937,12 @@ KernelBuilder::AddressableValue KernelBuilder::makeAddressableValue(Type * type,
     AddressableValue av;
 
     if (LLVM_UNLIKELY(value->getType()->isPointerTy())) {
-        assert (type->getPointerTo() == value->getType());
         av.Address = value;
         av.From = from;
         av.To = to;
     } else {
 
-        DataLayout DL(getModule());
+        auto & DL = getModule()->getDataLayout();
         Type * vecTy = type;
         size_t rowCount = 1;
         assert (type->canLosslesslyBitCastTo(value->getType()));

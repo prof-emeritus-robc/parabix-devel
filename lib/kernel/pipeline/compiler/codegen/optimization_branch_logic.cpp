@@ -127,7 +127,6 @@ Value * PipelineCompiler::checkOptimizationBranchSpanLength(KernelBuilder & b, V
     optNumOfStridesPhi->addIncoming(totalExecutedNumOfStrides, entry);
     Value * const optIdx = b.CreateMul(optNumOfStridesPhi, BLOCKS_PER_STRIDE);
     Value * optAddr = buffer->getStreamBlockPtr(b, baseAddress, sz_ZERO, optIdx);
-    optAddr = b.CreatePointerCast(optAddr, bitBlockTy->getPointerTo());
     Value * optCondVal = b.CreateLoad(bitBlockTy, optAddr);
     for (unsigned i = 1; i < blocksPerStride; ++i) {
         Value * const val = b.CreateLoad(bitBlockTy, b.CreateGEP(bitBlockTy, optAddr, b.getInt32(i)));
@@ -150,7 +149,6 @@ Value * PipelineCompiler::checkOptimizationBranchSpanLength(KernelBuilder & b, V
 
     Value * const regIdx = b.CreateMul(regNumOfStridesPhi, BLOCKS_PER_STRIDE);
     Value * regAddr = buffer->getStreamBlockPtr(b, baseAddress, sz_ZERO, regIdx);
-    regAddr = b.CreatePointerCast(regAddr, bitBlockTy->getPointerTo());
     Value * regCondVal = b.CreateLoad(bitBlockTy, regAddr);
     for (unsigned i = 1; i < blocksPerStride; ++i) {
         Value * const val = b.CreateLoad(bitBlockTy, b.CreateGEP(bitBlockTy, regAddr, b.getInt32(i)));

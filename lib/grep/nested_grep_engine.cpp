@@ -42,11 +42,10 @@ public:
 
 protected:
     void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
-        PointerType * const int8PtrTy = b.getInt8PtrTy();
         Value * const processed = b.getProcessedItemCount("breaks");
-        Value * const source = b.CreatePointerCast(b.getRawInputPointer("breaks", processed), int8PtrTy);
+        Value * const source = b.getRawInputPointer("breaks", processed);
         Value * const produced = b.getProducedItemCount("matches");
-        Value * const target = b.CreatePointerCast(b.getRawOutputPointer("matches", produced), int8PtrTy);
+        Value * const target = b.getRawOutputPointer("matches", produced);
         Value * const toCopy = b.CreateMul(numOfStrides, b.getSize(getStride()));
         b.CreateMemCpy(target, source, toCopy, b.getBitBlockWidth() / 8);
     }

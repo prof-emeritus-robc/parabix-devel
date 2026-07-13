@@ -48,14 +48,13 @@ void MMapSourceKernel::generateInitializeMethod(KernelBuilder & b, const unsigne
     BasicBlock * const exit = b.CreateBasicBlock("Exit");
     IntegerType * const sizeTy = b.getSizeTy();
     Value * const fd = b.getScalarField("fileDescriptor");
-    PointerType * const codeUnitPtrTy = b.getIntNTy(codeUnitWidth)->getPointerTo();
     Function * const fileSizeFn = b.getModule()->getFunction("file_size"); assert (fileSizeFn);
     FunctionType * fTy = fileSizeFn->getFunctionType();
     Value * fileSize = b.CreateZExtOrTrunc(b.CreateCall(fTy, fileSizeFn, fd), sizeTy);
     b.CreateLikelyCondBr(b.CreateIsNotNull(fileSize), nonEmptyFile, emptyFile);
 
     b.SetInsertPoint(nonEmptyFile);
-    Value * const fileBuffer = b.CreatePointerCast(b.CreateFileSourceMMap(fd, fileSize), codeUnitPtrTy);
+    Value * const fileBuffer = b.CreateFileSourceMMap(fd, fileSize);
     b.setScalarField("buffer", fileBuffer);
     b.setBaseAddress("sourceBuffer", fileBuffer);
     Value * fileItems = fileSize;
@@ -68,7 +67,7 @@ void MMapSourceKernel::generateInitializeMethod(KernelBuilder & b, const unsigne
 
     b.SetInsertPoint(emptyFile);
     const auto pageSize = getPageSize();
-    Value * const emptyFilePtr = b.CreatePointerCast(b.CreateAnonymousMMap(b.getSize(pageSize)), codeUnitPtrTy);
+    Value * const emptyFilePtr = b.CreateAnonymousMMap(b.getSize(pageSize));
     b.setScalarField("buffer", emptyFilePtr);
     b.setBaseAddress("sourceBuffer", emptyFilePtr);
     b.setScalarField("fileItems", b.getSize(pageSize * 8 / codeUnitWidth));
@@ -144,7 +143,7 @@ void MMapSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned
     Value * const producedBytes = b.CreateMul(producedPhi, CODE_UNIT_BYTES);
     Value * const length = b.CreateSub(producedBytes, consumedPageOffset);
 
-    args[0] = b.CreatePointerCast(consumedBuffer, cast<PointerType>(MAdviseFunc->getArg(0)->getType()));
+    args[0] = consumedBuffer;
     args[1] = length;
     args[2] = b.getInt32(MADV_WILLNEED);
     b.CreateCall(MAdviseFunc, args);
@@ -158,7 +157,7 @@ void MMapSourceKernel::freeBuffer(KernelBuilder & b, const unsigned codeUnitWidt
     Function * MUnmapFunc = m->getFunction("munmap");
     assert (MUnmapFunc);
     FixedArray<Value *, 2> args;
-    args[0] = b.CreatePointerCast(b.getBaseAddress("sourceBuffer"), b.getVoidPtrTy());
+    args[0] = b.getBaseAddress("sourceBuffer");
     args[1] = fileSize;
     b.CreateCall(MUnmapFunc, args);
 }
@@ -215,7 +214,7 @@ void ReadSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned
     bytesToRead->addIncoming(segmentBytes, entryBlock);
     PHINode * const producedSoFar = b.CreatePHI(sizeTy, 2);
     producedSoFar->addIncoming(produced, entryBlock);
-    Value * const sourceBuffer = b.CreatePointerCast(b.getRawOutputPointer("sourceBuffer", producedSoFar), b.getInt8PtrTy());
+    Value * const sourceBuffer = b.getRawOutputPointer("sourceBuffer", producedSoFar);
     Function *  const preadFunc = b.getModule()->getFunction("read");
     FixedArray<Value *, 3> args;
     args[0] = fd;
@@ -424,7 +423,7 @@ MMapSourceKernel::MMapSourceKernel(LLVMTypeSystemInterface & ts, Scalar * const 
 // internal scalars
 ,{})
 , mCodeUnitWidth(outputStream->getFieldWidth()) {
-    PointerType * const codeUnitPtrTy = ts.getIntNTy(mCodeUnitWidth)->getPointerTo();
+    PointerType * const codeUnitPtrTy =  PointerType::getUnqual(ts.getContext());
     addInternalScalar(codeUnitPtrTy, "buffer");
     addAttribute(MustExplicitlyTerminate());
     addAttribute(SideEffecting());
@@ -465,7 +464,7 @@ FDSourceKernel::FDSourceKernel(LLVMTypeSystemInterface & ts, Scalar * const useM
 // internal scalars
 ,{})
 , mCodeUnitWidth(outputStream->getFieldWidth()) {
-    PointerType * const codeUnitPtrTy = ts.getIntNTy(mCodeUnitWidth)->getPointerTo();
+    PointerType * const codeUnitPtrTy =  PointerType::getUnqual(ts.getContext());
     addInternalScalar(codeUnitPtrTy, "buffer");
     addAttribute(MustExplicitlyTerminate());
     addAttribute(SideEffecting());

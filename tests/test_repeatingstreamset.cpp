@@ -1,4 +1,4 @@
-﻿/*
+/*
  *  Copyright (c) 2018 International Characters.
  *  This software is licensed to the public under the Open Software License 3.0.
  *  icgrep is a trademark of International Characters.
@@ -193,7 +193,6 @@ void RepeatingSourceKernel::generateDoSegmentMethod(KernelBuilder & b) {
         Constant * const patternVal = ConstantArray::get(streamTy, dataVectorArray);
         GlobalVariable * const gv = new GlobalVariable(mod, streamTy, true, GlobalValue::PrivateLinkage, patternVal);
         gv->setAlignment(MaybeAlign{blockWidth /8});
-        assert (streamTy->getPointerTo() == gv->getType());
 
         streamVal[p] = gv;
     }
@@ -347,7 +346,7 @@ void RepeatingSourceKernel::generateDoSegmentMethod(KernelBuilder & b) {
     Value * const startPtr = outputBuffer->getStreamBlockPtr(b, baseAddress, sz_ZERO, nextIndex);
     Value * const endPtr = outputBuffer->getStreamBlockPtr(b, baseAddress, sz_ZERO, endIndex);
 
-    DataLayout DL(b.getModule());
+    auto & DL = b.getModule()->getDataLayout();
     Type * const intPtrTy = DL.getIntPtrType(startPtr->getType());
     Value * const startPtrInt = b.CreatePtrToInt(startPtr, intPtrTy);
     Value * const endPtrInt = b.CreatePtrToInt(endPtr, intPtrTy);

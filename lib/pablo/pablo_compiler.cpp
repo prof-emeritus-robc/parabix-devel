@@ -154,8 +154,8 @@ void PabloCompiler::compile(KernelBuilder & b) {
         b.CreateStore(val, ptr);
         Function * enterKernel = b.getModule()->getFunction(KERNEL_ILLUSTRATOR_ENTER_KERNEL);
         FixedArray<Value *, 2> args;
-        args[0] = b.CreatePointerCast(b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT), b.getVoidPtrTy());
-        args[1] = b.CreatePointerCast(getHandle(), b.getVoidPtrTy());
+        args[0] = b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT);
+        args[1] = getHandle();
         b.CreateCall(enterKernel, args);
     }
     compileBlock(b, entryBlock);
@@ -163,8 +163,8 @@ void PabloCompiler::compile(KernelBuilder & b) {
     if (LLVM_UNLIKELY(mKernel->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject && !mContainsIllustratedValue.empty())) {
         Function * exitKernel = b.getModule()->getFunction(KERNEL_ILLUSTRATOR_EXIT_KERNEL);
         FixedArray<Value *, 2> args;
-        args[0] = b.CreatePointerCast(b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT), b.getVoidPtrTy());
-        args[1] = b.CreatePointerCast(getHandle(), b.getVoidPtrTy());
+        args[0] = b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT);
+        args[1] = getHandle();
         b.CreateCall(exitKernel, args);
     }
 }
@@ -427,11 +427,11 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
     if (LLVM_UNLIKELY(mKernel->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject)) {
         const auto f = std::find(mContainsIllustratedValue.begin(), mContainsIllustratedValue.end(), whileStatement);
         if (LLVM_UNLIKELY(f != mContainsIllustratedValue.end())) {
-            illustratorObj = b.CreatePointerCast(b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT), b.getVoidPtrTy());
+            illustratorObj = b.getScalarField(KERNEL_ILLUSTRATOR_CALLBACK_OBJECT);
             Function * fIllustratorEnterLoop = b.getModule()->getFunction(KERNEL_ILLUSTRATOR_ENTER_LOOP);
             FixedArray<Value *, 2> args;
             args[0] = illustratorObj;
-            args[1] = b.CreatePointerCast(getHandle(), b.getVoidPtrTy());
+            args[1] = getHandle();
             b.CreateCall(fIllustratorEnterLoop, args);
         }
     }
@@ -503,7 +503,7 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
         assert (fIllustratorIterateLoop);
         FixedArray<Value *, 2> args;
         args[0] = illustratorObj;
-        args[1] = b.CreatePointerCast(getHandle(), b.getVoidPtrTy());
+        args[1] = getHandle();
         b.CreateCall(fIllustratorIterateLoop, args);
     }
     compileBlock(b, whileStatement->getBody());
@@ -580,7 +580,7 @@ void PabloCompiler::compileWhile(KernelBuilder & b, const While * const whileSta
         assert (fIllustratorExitLoop);
         FixedArray<Value *, 2> args;
         args[0] = illustratorObj;
-        args[1] = b.CreatePointerCast(getHandle(), b.getVoidPtrTy());
+        args[1] = getHandle();
         b.CreateCall(fIllustratorExitLoop, args);
     }
 
@@ -946,10 +946,18 @@ Value * PabloCompiler::compileExpression(KernelBuilder & b, const PabloAST * con
             const Var * const var = cast<Var>(expr);
             if (LLVM_LIKELY(var->isKernelParameter())) {
                 const auto ip = b.saveIP();
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
                 Instruction * const inst = mEntryBlock->getFirstNonPHI();
                 if (inst) {
                     b.SetInsertPoint(mEntryBlock, inst->getIterator());
                 }
+#else
+                BasicBlock::iterator instIt = mEntryBlock->getFirstNonPHIIt();
+                b.SetInsertPoint(mEntryBlock, instIt);
+                if (instIt != mEntryBlock->end()) {
+                    b.SetInsertPoint(mEntryBlock, instIt);
+                }
+#endif
                 if (var->isScalar()) {
                     value = b.getScalarFieldPtr(var->getName()).first;
                 } else if (var->isReadOnly()) {
@@ -957,7 +965,11 @@ Value * PabloCompiler::compileExpression(KernelBuilder & b, const PabloAST * con
                 } else if (var->isReadNone()) {
                     value = b.getOutputStreamBlockPtr(var->getName(), b.getInt32(0));
                 }
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
                 if (inst) {
+#else
+                if (instIt != mEntryBlock->end()) {
+#endif
                     b.restoreIP(ip);
                 }
             } else { // use before def error
@@ -1137,9 +1149,6 @@ Value * PabloCompiler::compileExpression(KernelBuilder & b, const PabloAST * con
             type = b.getBitBlockType();
             align = b.getBitBlockWidth() / 8;
         }
-
-        assert (type->getPointerTo() == value->getType());
-
         value = b.CreateAlignedLoad(type, value, align);
     }
     return value;
@@ -1151,10 +1160,18 @@ Value * PabloCompiler::getPointerToVar(KernelBuilder & b, const Var * var, Value
     if (LLVM_LIKELY(var->isKernelParameter())) {
         Value * ptr = nullptr;
         const auto ip = b.saveIP();
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
         Instruction * const inst = mEntryBlock->getFirstNonPHI();
         if (inst) {
             b.SetInsertPoint(mEntryBlock, inst->getIterator());
         }
+#else
+        BasicBlock::iterator instIt = mEntryBlock->getFirstNonPHIIt();
+        b.SetInsertPoint(mEntryBlock, instIt);
+        if (instIt != mEntryBlock->end()) {
+            b.SetInsertPoint(mEntryBlock, instIt);
+        }
+#endif
         if (LLVM_UNLIKELY(var->isScalar())) {
             std::string tmp;
             raw_string_ostream out(tmp);
@@ -1183,7 +1200,11 @@ Value * PabloCompiler::getPointerToVar(KernelBuilder & b, const Var * var, Value
             out << " cannot be read from or written to";
             report_fatal_error(StringRef(out.str()));
         }
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
         if (inst) {
+#else
+        if (instIt != mEntryBlock->end()) {
+#endif
             b.restoreIP(ip);
         }
         return ptr;

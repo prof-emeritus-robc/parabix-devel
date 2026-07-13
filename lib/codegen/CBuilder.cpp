@@ -35,6 +35,10 @@ using boost::intrusive::detail::floor_log2;
 #include <llvm/Support/Alignment.h>
 #include <unistd.h>
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
+#define getOrInsertDeclaration getDeclaration
+#endif
+
 using IntervalSet = boost::icl::interval_set<uintptr_t>;
 
 using Interval = IntervalSet::interval_type;
@@ -172,7 +176,7 @@ Value * CBuilder::CreateRoundUp(Value * const number, Value * const divisor, con
 
 Value * CBuilder::CreateUnsignedSaturatingAdd(Value * const a, Value * const b, const Twine Name) {
     assert (a->getType() == b->getType());
-    Function * const uaddSat = Intrinsic::getDeclaration(getModule(), Intrinsic::uadd_sat, a->getType()); assert (uaddSat);
+    Function * const uaddSat = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::uadd_sat, a->getType()); assert (uaddSat);
     FixedArray<Value *, 2> args;
     args[0] = a;
     args[1] = b;
@@ -181,7 +185,7 @@ Value * CBuilder::CreateUnsignedSaturatingAdd(Value * const a, Value * const b, 
 
 Value * CBuilder::CreateUnsignedSaturatingSub(Value * const a, Value * const b, const Twine Name) {
     assert (a->getType() == b->getType() && a->getType()->isIntOrIntVectorTy());
-    Function * const usubSat = Intrinsic::getDeclaration(getModule(), Intrinsic::usub_sat, a->getType()); assert (usubSat);
+    Function * const usubSat = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::usub_sat, a->getType()); assert (usubSat);
     FixedArray<Value *, 2> args;
     args[0] = a;
     args[1] = b;
@@ -212,7 +216,6 @@ Value * CBuilder::CreateWriteCall(Value * fileDescriptor, Value * buf, Value * n
         write = Function::Create(writeTy, Function::ExternalLinkage, "write", m);
         write->addParamAttr(1U, Attribute::NoAlias);
     }
-    buf = CreatePointerCast(buf, voidPtrTy);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CheckAddress(buf, nbyte, "CreateWriteCall");
     }
@@ -230,7 +233,6 @@ Value * CBuilder::CreateReadCall(Value * fileDescriptor, Value * buf, Value * nb
         readFn = Function::Create(readTy, Function::ExternalLinkage, "read", m);
         readFn->addParamAttr(1U, Attribute::NoAlias);
     }
-    buf = CreatePointerCast(buf, voidPtrTy);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CheckAddress(buf, nbyte, "CreateReadCall");
     }
@@ -489,7 +491,7 @@ Value * CBuilder::CreateAlignedMalloc(Type * const type, Value * const ArraySize
     }
     ConstantInt * const align = ConstantInt::get(sizeTy, alignment);
     size = CreateRoundUp(size, align);
-    return CreatePointerCast(CreateAlignedMalloc(size, alignment), type->getPointerTo(addressSpace));
+    return CreateAlignedMalloc(size, alignment);
 }
 
 Value * CBuilder::CreateAlignedMalloc(Value * size, const unsigned alignment) {
@@ -528,7 +530,7 @@ Value * CBuilder::CreateRealloc(Type * const type, Value * const base, Value * c
     if (ArraySize) {
         size = CreateMul(size, CreateZExtOrTrunc(ArraySize, size->getType()));
     }
-    return CreatePointerCast(CreateRealloc(base, size), type->getPointerTo());
+    return CreateRealloc(base, size);
 }
 
 Value * CBuilder::CreateRealloc(Value * const base, Value * const size) {
@@ -544,17 +546,14 @@ Value * CBuilder::CreateRealloc(Value * const base, Value * const size) {
         f->setCallingConv(CallingConv::C);
         f->setReturnDoesNotAlias();
     }    
-    Value * basePtr = CreatePointerCast(base, voidPtrTy);
-    CallInst * const ci = CreateCall(fty, f, {basePtr, CreateZExtOrTrunc(size, sizeTy)});
-    Value * ptr = CreatePointerCast(ci, base->getType());
-    return ptr;
+    CallInst * const ci = CreateCall(fty, f, {base, CreateZExtOrTrunc(size, sizeTy)});
+    return ci;
 }
 
 void CBuilder::CreateFree(Value * const ptr) {
     assert (ptr->getType()->isPointerTy());
     Module * const m = getModule();
     Type * const voidPtrTy =  getVoidPtrTy();
-    Value * castPtr = CreatePointerCast(ptr, voidPtrTy);
     if (codegen::FreeCallBisectLimit >= 0) {
         FunctionType * fty = FunctionType::get(getVoidTy(), {voidPtrTy}, false);
         Function * dispatcher = m->getFunction("free_debug_wrapper");
@@ -562,7 +561,7 @@ void CBuilder::CreateFree(Value * const ptr) {
             dispatcher = Function::Create(fty, Function::ExternalLinkage, "free_debug_wrapper", m);
             dispatcher->setCallingConv(CallingConv::C);
             assert (dispatcher);
-            CreateCall(fty, dispatcher, castPtr);
+            CreateCall(fty, dispatcher, ptr);
         }
     } else {
         FunctionType * fty = FunctionType::get(getVoidTy(), {voidPtrTy}, false);
@@ -571,7 +570,7 @@ void CBuilder::CreateFree(Value * const ptr) {
             f = Function::Create(fty, Function::ExternalLinkage, "free", m);
             f->setCallingConv(CallingConv::C);
         }
-        CreateCall(fty, f, castPtr);
+        CreateCall(fty, f, ptr);
     }
 }
 
@@ -632,7 +631,7 @@ Value * CBuilder::CreateMMap(Value * const addr, Value * size, Value * const pro
 
     Value * ptr = CreateCall(fMMap->getFunctionType(), fMMap, args);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-        DataLayout DL(m);
+        auto & DL = m->getDataLayout();
         IntegerType * const intTy = getIntPtrTy(DL);
         Value * success = CreateICmpNE(CreatePtrToInt(addr, intTy), ConstantInt::get(intTy, (uint64_t)MAP_FAILED));
         CreateAssert(success, "CreateMMap: mmap failed to allocate memory");
@@ -650,7 +649,6 @@ Value * CBuilder::CreateMemFdCreate(Value * const name, Value * const flags) {
     }
     Value * retVal = CreateCall(fShmOpen->getFunctionType(), fShmOpen, {name, flags});
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-        DataLayout DL(m);
         Value * success = CreateICmpNE(retVal, ConstantInt::get(getInt32Ty(), -1ULL));
         CreateAssert(success, "CreateMemFdCreate: failed to create anonymous memory file");
     }
@@ -669,7 +667,6 @@ Value * CBuilder::CreateFTruncate(Value * const fd, Value * size) {
     }
     Value * retVal = CreateCall(fTruncate->getFunctionType(), fTruncate, {fd, size});
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-        DataLayout DL(m);
         Value * success = CreateICmpNE(retVal, ConstantInt::get(getInt32Ty(), -1ULL));
         __CreateAssert(success, "CreateFTruncate: failed to truncate fd", {});
     }
@@ -716,7 +713,6 @@ Value * CBuilder::CreateMAdvise(Value * addr, Value * length, const int advice) 
         if (LLVM_UNLIKELY(MAdviseFunc == nullptr)) {
             MAdviseFunc = Function::Create(fty, Function::ExternalLinkage, "madvise", m);
         }
-        addr = CreatePointerCast(addr, voidPtrTy);
         length = CreateZExtOrTrunc(length, sizeTy);
         result = CreateCall(fty, MAdviseFunc, {addr, length, ConstantInt::get(intTy, advice)});
     }
@@ -732,7 +728,7 @@ Value * CBuilder::CreateMRemap(Value * addr, Value * oldSize, Value * newSize) {
     Value * ptr = nullptr;
     if (T.isOSLinux()) {
         Module * const m = getModule();
-        DataLayout DL(m);
+        auto & DL = m->getDataLayout();
         PointerType * const voidPtrTy = getVoidPtrTy();
         IntegerType * const sizeTy = getSizeTy();
         IntegerType * const intTy = getIntPtrTy(DL);
@@ -741,7 +737,6 @@ Value * CBuilder::CreateMRemap(Value * addr, Value * oldSize, Value * newSize) {
         if (LLVM_UNLIKELY(fMRemap == nullptr)) {
             fMRemap = Function::Create(fty, Function::ExternalLinkage, "mremap", m);
         }
-        addr = CreatePointerCast(addr, voidPtrTy);
         oldSize = CreateZExtOrTrunc(oldSize, sizeTy);
         newSize = CreateZExtOrTrunc(newSize, sizeTy);
         ConstantInt * const flags = ConstantInt::get(intTy, MREMAP_MAYMOVE);
@@ -768,7 +763,6 @@ Value * CBuilder::CreateMUnmap(Value * addr, Value * len) {
         munmapFunc = Function::Create(fty, Function::ExternalLinkage, "munmap", m);
     }
     len = CreateZExtOrTrunc(len, sizeTy);
-    addr = CreatePointerCast(addr, voidPtrTy);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         auto & DL = getModule()->getDataLayout();
         IntegerType * const intPtrTy = getIntPtrTy(DL);
@@ -813,7 +807,6 @@ Value * CBuilder::CreateMProtect(Value * addr, Value * size, const Protect prote
     if (LLVM_UNLIKELY(mprotectFunc == nullptr)) {
         mprotectFunc = Function::Create(fty, Function::ExternalLinkage, "mprotect", m);
     }
-    addr = CreatePointerCast(addr, voidPtrTy);
     size = CreateZExtOrTrunc(size, sizeTy);
     Value * const result = CreateCall(fty, mprotectFunc, {addr, size, ConstantInt::get(int32Ty, (int)protect)});
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
@@ -827,8 +820,7 @@ IntegerType * LLVM_READNONE CBuilder::getIntAddrTy() const {
 }
 
 PointerType * LLVM_READNONE CBuilder::getVoidPtrTy(const unsigned AddressSpace) const {
-    //return PointerType::get(Type::getVoidTy(getContext()), AddressSpace);
-    return PointerType::get(Type::getInt8Ty(getContext()), AddressSpace);
+    return PointerType::get(getContext(), AddressSpace);
 }
 
 
@@ -868,26 +860,24 @@ void CBuilder::setNontemporal(StoreInst * s) {
 }
 
 Value * CBuilder::CreatePrefetch(Value * ptr, PrefetchRW mode, unsigned locality, CacheType c) {
-    Function * prefetchIntrin = Intrinsic::getDeclaration(getModule(), Intrinsic::prefetch);
+    Function * prefetchIntrin = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::prefetch);
     Value * modeVal = getInt32(mode == PrefetchRW::Read ? 0 : 1);
     Value * localityVal = getInt32(locality > 3 ? 3 : locality);
     Value * cacheKind = getInt32(c == CacheType::Instruction ? 0 : 1);
-    return CreateCall(prefetchIntrin->getFunctionType(), prefetchIntrin, {CreateBitCast(ptr, getInt8PtrTy()), modeVal, localityVal, cacheKind});
+    return CreateCall(prefetchIntrin->getFunctionType(), prefetchIntrin, {ptr, modeVal, localityVal, cacheKind});
 }
 
 PointerType * LLVM_READNONE CBuilder::getFILEptrTy() {
-    if (mFILEtype == nullptr) {
-        mFILEtype = StructType::create(getContext(), "struct._IO_FILE");
-    }
-    return mFILEtype->getPointerTo();
+    return PointerType::getUnqual(getContext());
 }
 
 Value * CBuilder::CreateFOpenCall(Value * filename, Value * mode) {
     Module * const m = getModule();
-    FunctionType * fty = FunctionType::get(getFILEptrTy(), {getInt8Ty()->getPointerTo(), getInt8Ty()->getPointerTo()}, false);
+    PointerType * int8PtrTy = PointerType::getUnqual(getContext());
+    FunctionType * fty = FunctionType::get(getFILEptrTy(), {int8PtrTy, int8PtrTy}, false);
     Function * fOpenFunc = m->getFunction("fopen");
     if (fOpenFunc == nullptr) {
-        FunctionType * fty = FunctionType::get(getFILEptrTy(), {getInt8Ty()->getPointerTo(), getInt8Ty()->getPointerTo()}, false);
+        FunctionType * fty = FunctionType::get(getFILEptrTy(), {int8PtrTy, int8PtrTy}, false);
         fOpenFunc = Function::Create(fty, Function::ExternalLinkage, "fopen", m);
         fOpenFunc->setCallingConv(CallingConv::C);
     }
@@ -904,7 +894,6 @@ Value * CBuilder::CreateFReadCall(Value * ptr, Value * size, Value * nitems, Val
         fReadFunc = Function::Create(fty, Function::ExternalLinkage, "fread", m);
         fReadFunc->setCallingConv(CallingConv::C);
     }
-    ptr = CreatePointerCast(ptr, voidPtrTy);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CheckAddress(ptr, CreateMul(size, nitems), "CreateFReadCall");
     }
@@ -921,7 +910,6 @@ Value * CBuilder::CreateFWriteCall(Value * ptr, Value * size, Value * nitems, Va
         fWriteFunc = Function::Create(fty, Function::ExternalLinkage, "fwrite", m);
         fWriteFunc->setCallingConv(CallingConv::C);
     }
-    ptr = CreatePointerCast(ptr, voidPtrTy);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CheckAddress(ptr, CreateMul(size, nitems), "CreateFReadCall");
     }
@@ -1114,7 +1102,6 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
         IntegerType * const int1Ty = getInt1Ty();
         IntegerType * const int32Ty = getInt32Ty();
         PointerType * const int8PtrTy = getInt8PtrTy();
-        PointerType * const int8PtrPtrTy = int8PtrTy->getPointerTo();
         // va_list is platform specific but since we are not directly modifying
         // any use of this type in LLVM code, just ensure it is large enough.
         ArrayType * const vaListTy = ArrayType::get(getInt8Ty(), sizeof(va_list));
@@ -1124,10 +1111,11 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
         fields[0] = int8PtrTy;
         fields[1] = int8PtrTy;
         fields[2] = getSizeTy();
+#ifndef NDEBUG
         StructType * const structTy = StructType::create(C, fields, __BACKTRACE_STRUCT_NAME, true);
         assert (getTypeSize(structTy)->getLimitedValue() == sizeof(__backtrace_data));
-
-        PointerType * const structPtrTy = structTy->getPointerTo();
+#endif
+        PointerType * const structPtrTy = PointerType::getUnqual(getContext());
 
         FixedArray<Type *, 5> params;
         params[0] = int1Ty;
@@ -1195,7 +1183,7 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
         Function * alloc_exception = getAllocateException();
         Value * const exception = CreateCall(alloc_exception->getFunctionType(), alloc_exception, { getTypeSize(int8PtrTy) } );
         Constant * const nil = ConstantPointerNull::get(int8PtrTy);
-        IRBuilder<>::CreateStore(nil, CreateBitCast(exception, int8PtrPtrTy));
+        IRBuilder<>::CreateStore(nil, exception);
         // NOTE: the second argument is supposed to point to a std::type_info object.
         // The external value Clang passes into it resolves to "null" when RTTI is disabled.
         // This appears to work here but ought to be verified.
@@ -1294,7 +1282,6 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
         assert (getTypeSize(traceTy)->getLimitedValue() == sizeof(__backtrace_data *) * n);
         trace = ConstantArray::get(traceTy, traceArray);
         trace = new GlobalVariable(*m, trace->getType(), true, GlobalVariable::PrivateLinkage, trace);
-        trace = ConstantExpr::getPointerCast(trace, structPtrTy);
         depth = getInt32(n);
         free(demangled);
     } else {
@@ -1350,7 +1337,7 @@ BranchInst * CBuilder::CreateLikelyCondBr(Value * Cond, BasicBlock * True, Basic
 }
 
 Value * CBuilder::CreatePopcount(Value * bits) {
-    Function * ctpopFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::ctpop, bits->getType());
+    Function * ctpopFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::ctpop, bits->getType());
     return CreateCall(ctpopFunc->getFunctionType(), ctpopFunc, bits);
 }
 
@@ -1358,7 +1345,7 @@ Value * CBuilder::CreateCountForwardZeroes(Value * value, const Twine Name, cons
     if (LLVM_UNLIKELY(guaranteedNonZero && codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CreateAssert(value, "CreateCountForwardZeroes: value cannot be zero!");
     }
-    Function * cttzFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::cttz, value->getType());
+    Function * cttzFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::cttz, value->getType());
     return CreateCall(cttzFunc->getFunctionType(), cttzFunc, {value, getInt1(guaranteedNonZero)}, Name);
 }
 
@@ -1366,7 +1353,7 @@ Value * CBuilder::CreateCountReverseZeroes(Value * value, const Twine Name, cons
     if (LLVM_UNLIKELY(guaranteedNonZero && codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CreateAssert(value, "CreateCountReverseZeroes: value cannot be zero!");
     }
-    Function * ctlzFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::ctlz, value->getType());
+    Function * ctlzFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::ctlz, value->getType());
     return CreateCall(ctlzFunc->getFunctionType(), ctlzFunc, {value, getInt1(guaranteedNonZero)}, Name);
 }
 
@@ -1416,12 +1403,12 @@ Constant * CBuilder::GetString(StringRef Str) {
     if (ptr == nullptr) {
         ptr = CreateGlobalString(Str, Str, 0, m);
     }
-    return ConstantExpr::getPointerCast(ptr, getInt8PtrTy());
+    return ptr;
 }
 
 Value * CBuilder::CreateReadCycleCounter() {
     Module * const m = getModule();
-    Function * cycleCountFunc = Intrinsic::getDeclaration(m, Intrinsic::readcyclecounter);
+    Function * cycleCountFunc = Intrinsic::getOrInsertDeclaration(m, Intrinsic::readcyclecounter);
     return CreateCall(cycleCountFunc->getFunctionType(), cycleCountFunc, std::vector<Value *>({}));
 }
 
@@ -1551,10 +1538,21 @@ CallInst * CBuilder::CreateMemMove(Value * Dst, Value * Src, Value *Size, const 
             ConstantInt * align = ConstantInt::get(intPtrTy, Align);
             CreateAssertZero(CreateURem(intSrc, align), "CreateMemMove: Src pointer is misaligned");
             CreateAssertZero(CreateURem(intDst, align), "CreateMemMove: Dst pointer is misaligned");
-
         }
     }
-    return IRBuilder<>::CreateMemMove(Dst, AlignType{Align}, Src, AlignType{Align}, Size, isVolatile, TBAATag, ScopeTag, NoAliasTag);}
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
+    return IRBuilder<>::CreateMemMove(Dst, AlignType{Align}, Src, AlignType{Align}, Size, isVolatile, TBAATag, ScopeTag, NoAliasTag);
+#else
+    llvm::AAMDNodes AAInfo;
+    AAInfo.TBAA = TBAATag;
+    AAInfo.Scope = ScopeTag;
+    AAInfo.NoAlias = NoAliasTag;
+    return IRBuilder<>::CreateMemMove(Dst, AlignType{Align},
+                                      Src, AlignType{Align},
+                                      Size, isVolatile,
+                                      AAInfo);
+#endif
+}
 
 CallInst * CBuilder::CreateMemCpy(Value *Dst, Value *Src, Value *Size, const unsigned Align, bool isVolatile,
                                   MDNode *TBAATag, MDNode *TBAAStructTag, MDNode *ScopeTag, MDNode *NoAliasTag) {
@@ -1578,7 +1576,19 @@ CallInst * CBuilder::CreateMemCpy(Value *Dst, Value *Src, Value *Size, const uns
         Value * const nonOverlapping = CreateOr(srcEndsBeforeDst, dstEndsBeforeSrc);
         CreateAssert(nonOverlapping, "CreateMemCpy: overlapping ranges is undefined");
     }
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemCpy(Dst, AlignType{Align}, Src, AlignType{Align}, Size, isVolatile, TBAATag, TBAAStructTag, ScopeTag, NoAliasTag);
+#else
+    llvm::AAMDNodes AAInfo;
+    AAInfo.TBAA = TBAATag;
+    AAInfo.TBAAStruct = TBAAStructTag;
+    AAInfo.Scope = ScopeTag;
+    AAInfo.NoAlias = NoAliasTag;
+    return IRBuilder<>::CreateMemCpy(Dst, AlignType{Align},
+                                     Src, AlignType{Align},
+                                     Size, isVolatile,
+                                     AAInfo);
+#endif
 }
 
 CallInst * CBuilder::CreateMemSet(Value * Ptr, Value * Val, Value * Size, const unsigned Align,
@@ -1593,7 +1603,15 @@ CallInst * CBuilder::CreateMemSet(Value * Ptr, Value * Val, Value * Size, const 
             CreateAssertZero(CreateURem(intPtr, align), "CreateMemSet: Ptr is misaligned");
         }
     }
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemSet(Ptr, Val, Size, AlignType{Align}, isVolatile, TBAATag, ScopeTag, NoAliasTag);
+#else
+    llvm::AAMDNodes AAInfo;
+    AAInfo.TBAA = TBAATag;
+    AAInfo.Scope = ScopeTag;
+    AAInfo.NoAlias = NoAliasTag;
+    return IRBuilder<>::CreateMemSet(Ptr, Val, Size, AlignType{Align}, isVolatile, AAInfo);
+#endif
 }
 
 CallInst * CBuilder::CreateMemCmp(Value * Ptr1, Value * Ptr2, Value * Num) {
@@ -1610,8 +1628,6 @@ CallInst * CBuilder::CreateMemCmp(Value * Ptr1, Value * Ptr2, Value * Num) {
         f = Function::Create(fty, Function::ExternalLinkage, "memcmp", m);
         f->setCallingConv(CallingConv::C);
     }
-    Ptr1 = CreatePointerCast(Ptr1, voidPtrTy);
-    Ptr2 = CreatePointerCast(Ptr2, voidPtrTy);
     Num = CreateZExtOrTrunc(Num, sizeTy);
     return CreateCall(f->getFunctionType(), f, {Ptr1, Ptr2, Num});
 }
@@ -1629,7 +1645,11 @@ AllocaInst * CBuilder::CreateAllocaAtEntryPoint(Type * Ty, Value * ArraySize, co
     const auto addrSize = DL.getAllocaAddrSpace();
     auto const first = entryBlock->getFirstNonPHIOrDbgOrLifetime();
     AllocaInst * alloca = nullptr;
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
     if (LLVM_UNLIKELY(first == nullptr)) {
+#else
+    if (LLVM_UNLIKELY(first == entryBlock->end())) {
+#endif
         alloca = new AllocaInst(Ty, addrSize, ArraySize, Name, &*entryBlock);
     } else {
         alloca = new AllocaInst(Ty, addrSize, ArraySize, Name, first);
@@ -1655,7 +1675,11 @@ AllocaInst * CBuilder::CreateAlignedAllocaAtEntryPoint(llvm::Type * const Ty, co
     const auto addrSize = DL.getAllocaAddrSpace();
     auto const first = entryBlock->getFirstNonPHIOrDbgOrLifetime();
     AllocaInst * alloca = nullptr;
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
     if (LLVM_UNLIKELY(first == nullptr)) {
+#else
+    if (LLVM_UNLIKELY(first == entryBlock->end())) {
+#endif
         alloca = new AllocaInst(Ty, addrSize, ArraySize, "", &*entryBlock);
     } else {
         alloca = new AllocaInst(Ty, addrSize, ArraySize, "", first);
@@ -1908,8 +1932,7 @@ void CBuilder::CheckAddress(Value * const Ptr, Value * const Size, Constant * co
             isPoisoned->setCallingConv(CallingConv::C);
             isPoisoned->setReturnDoesNotAlias();
         }
-        Value * const addr = CreatePointerCast(Ptr, voidPtrTy);
-        Value * const firstPoisoned = CreateCall(isPoisoned->getFunctionType(), isPoisoned, { addr, CreateTrunc(Size, sizeTy) });
+        Value * const firstPoisoned = CreateCall(isPoisoned->getFunctionType(), isPoisoned, { Ptr, CreateTrunc(Size, sizeTy) });
         Value * const valid = CreateICmpEQ(firstPoisoned, ConstantPointerNull::get(voidPtrTy));
         IntegerType * const intPtrTy = getIntPtrTy(getModule()->getDataLayout());
         Value * const startInt = CreatePtrToInt(Ptr, intPtrTy);
@@ -1941,7 +1964,6 @@ CBuilder::CBuilder(LLVMContext & C)
 : IRBuilder<>(C)
 , mCacheLineAlignment(64)
 , mSizeType(IntegerType::get(getContext(), sizeof(size_t) * 8))
-, mFILEtype(nullptr)
 , mDriver(nullptr) {
     #ifdef ENABLE_LIBBACKTRACE
     if (LLVM_UNLIKELY(codegen::AnyAssertionOptionIsSet())) {

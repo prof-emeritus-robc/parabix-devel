@@ -362,7 +362,7 @@ void ElemMergeKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * c
         assert ((getStride() % b.getBitBlockWidth()) == 0);
         numOfIterations = b.CreateMul(numOfStrides, b.getSize(getStride() / maskWidth));
     }
-    Value * const maskBasePtr = b.CreatePointerCast(b.getInputStreamBlockPtr("mask", sz_ZERO), maskTy->getPointerTo());
+    Value * const maskBasePtr = b.getInputStreamBlockPtr("mask", sz_ZERO);
 
     const auto elemVecTyAlign = b.getAlignOf(DL, elemVecTy);
 
@@ -374,13 +374,11 @@ void ElemMergeKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * c
         Value * const processedSourceItems = b.getProcessedItemCount(source[i]);
         initialSourceOffset[i] = b.CreateAnd(processedSourceItems, UREM_MASK);
         Value * const sourceItemBase = b.CreateSub(processedSourceItems, initialSourceOffset[i]);
-        Value * const sourceBasePtr = b.getRawInputPointer(source[i], sourceItemBase);
-        sourcePackPtr[i] = b.CreatePointerCast(sourceBasePtr, elemVecTy->getPointerTo());
+        sourcePackPtr[i] = b.getRawInputPointer(source[i], sourceItemBase);
         initialPendingData[i] = b.CreateAlignedLoad(elemVecTy, sourcePackPtr[i], elemVecTyAlign);
     }
 
-    Value * const rawOutputPtr = b.getOutputStreamBlockPtr("merged", sz_ZERO);
-    Value * const outputPackPtr = b.CreatePointerCast(rawOutputPtr, elemVecTy->getPointerTo());
+    Value * const outputPackPtr = b.getOutputStreamBlockPtr("merged", sz_ZERO);
     const auto maskTyAlign = b.getAlignOf(DL, maskTy);
 
     b.CreateBr(elemMergeLoop);
@@ -454,7 +452,6 @@ void ElemMergeKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * c
     b.SetInsertPoint(elemMergeDone);
 }
 
-#define USE_SHORT_STRIDE_POPCOUNT
 ElemSpreadShortStrides::ElemSpreadShortStrides(LLVMTypeSystemInterface & ts,
                                        StreamSet * mask,
                                        StreamSet * source,
@@ -470,11 +467,7 @@ ElemSpreadShortStrides::ElemSpreadShortStrides(LLVMTypeSystemInterface & ts,
                     }(),
 {Binding("mask", mask, FixedRate(1), Principal()),
  // The following would be preferred, but is currently buggy.
-#ifdef USE_SHORT_STRIDE_POPCOUNT
  Binding("source", source, PopcountOf("mask"), EmptyReadOverflow())},
-#else
- Binding("source", source, BoundedRate(0, 1), ZeroExtended())},
-#endif
 {Binding{"spread", spread}},
 {}, {}, {}), mElemWidth(source->getFieldWidth()) {
     setStride(ts.getBitBlockWidth()/mElemWidth);
@@ -501,12 +494,9 @@ void ElemSpreadShortStrides::generateMultiBlockLogic(KernelBuilder & b, llvm::Va
     // Set up the pointers for mask input and spread output,
     // indexed by stride number.
     Value * const processedMaskItems = b.getProcessedItemCount("mask");
-    Value * const rawMaskPtr = b.getRawInputPointer("mask", processedMaskItems);
-    Value * const maskBasePtr = b.CreatePointerCast(rawMaskPtr, maskTy->getPointerTo());
+    Value * const maskBasePtr = b.getRawInputPointer("mask", processedMaskItems);
     Value * const producedItems = b.getProducedItemCount("spread");
-    Value * const rawOutputPtr = b.getRawOutputPointer("spread", producedItems);
-    Value * const outputBasePtr = b.CreatePointerCast(rawOutputPtr, elemVecTy->getPointerTo());
-
+    Value * const outputBasePtr = b.getRawOutputPointer("spread", producedItems);
 
     Value * processedSourceBase = b.getProcessedItemCount("source");
     Value * initialSourceOffset = nullptr;
@@ -514,13 +504,11 @@ void ElemSpreadShortStrides::generateMultiBlockLogic(KernelBuilder & b, llvm::Va
     Value * initialPendingData = nullptr;
     if (UnalignedLoads) {
         initialSourceOffset = ZERO;
-        Value * const sourceBasePtr = b.getRawInputPointer("source", processedSourceBase);
-        sourcePtr = b.CreatePointerCast(sourceBasePtr, elemTy->getPointerTo());
+        sourcePtr = b.getRawInputPointer("source", processedSourceBase);
     } else {
         initialSourceOffset = b.CreateURem(processedSourceBase, ELEMS_PER_STRIDE);
         processedSourceBase = b.CreateSub(processedSourceBase, initialSourceOffset);
-        Value * const sourceBasePtr = b.getRawInputPointer("source", processedSourceBase);
-        sourcePtr = b.CreatePointerCast(sourceBasePtr, elemVecTy->getPointerTo());
+        sourcePtr = b.getRawInputPointer("source", processedSourceBase);
         initialPendingData = b.CreateLoad(elemVecTy, sourcePtr);
     }
 
@@ -570,8 +558,7 @@ void ElemSpreadShortStrides::generateMultiBlockLogic(KernelBuilder & b, llvm::Va
     Value * newPack = nullptr;
     Value * spreadableData = nullptr;
     if (UnalignedLoads) {
-        Value * const sourceItemPtr = b.CreateGEP(elemTy, sourcePtr, sourceOffsetPhi);
-        Value * const packPtr = b.CreatePointerCast(sourceItemPtr, elemVecTy->getPointerTo());
+        Value * const packPtr = b.CreateGEP(elemTy, sourcePtr, sourceOffsetPhi);
         spreadableData = b.CreateAlignedLoad(elemVecTy, packPtr, 1);
     } else {
         Value * const pendingPackNo = b.CreateUDiv(sourceOffsetPhi, ELEMS_PER_STRIDE);
@@ -599,13 +586,6 @@ void ElemSpreadShortStrides::generateMultiBlockLogic(KernelBuilder & b, llvm::Va
     b.CreateCondBr(moreStridesToDo, strideAtATimeLoop, multiStrideExit);
 
     b.SetInsertPoint(multiStrideExit);
-#ifdef USE_SHORT_STRIDE_POPCOUNT
-    PHINode * const finalOffsetPhi = b.CreatePHI(sizeTy, 2);
-    finalOffsetPhi->addIncoming(sourceOffsetPhi, strideAtATimeLoop);
-    finalOffsetPhi->addIncoming(updatedSourceOffset, spreadAndWrite);
-
-    b.setProcessedItemCount("source", b.CreateAdd(processedSourceBase, finalOffsetPhi));
-#endif
 }
 
 ElemSpreadKernel::ElemSpreadKernel(LLVMTypeSystemInterface & ts,
@@ -652,13 +632,11 @@ void ElemSpreadKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * 
     Value * initialPendingData = nullptr;
     if (UnalignedLoads) {
         initialSourceOffset = processedSourceItems;
-        Value * const sourceBasePtr = b.getRawInputPointer("source", initialSourceOffset);
-        sourcePtr = b.CreatePointerCast(sourceBasePtr, elemTy->getPointerTo());
+        sourcePtr = b.getRawInputPointer("source", initialSourceOffset);
     } else {
         initialSourceOffset = b.CreateURem(processedSourceItems, ELEMS_PER_PACK);
         Value * const sourceItemBase = b.CreateSub(processedSourceItems, initialSourceOffset);
-        Value * const sourceBasePtr = b.getRawInputPointer("source", sourceItemBase);
-        sourcePtr = b.CreatePointerCast(sourceBasePtr, elemVecTy->getPointerTo());
+        sourcePtr = b.getRawInputPointer("source", sourceItemBase);
         initialPendingData = b.CreateLoad(elemVecTy, sourcePtr);
     }
 
@@ -691,10 +669,8 @@ void ElemSpreadKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * 
     Value * const metaMask = b.CreateZExtOrTrunc(b.hsimd_signmask(maskWidth, b.simd_any(maskWidth, maskVector)), metaMaskTy);
 
     // I/O pointers for the current block
-    Value * const rawMaskPtr = b.getInputStreamBlockPtr("mask", ZERO, blockNoPhi);
-    Value * const maskBasePtr = b.CreatePointerCast(rawMaskPtr, maskTy->getPointerTo());
-    Value * const rawOutputPtr = b.getOutputStreamBlockPtr("spread", ZERO, blockNoPhi);
-    Value * const outputPackPtr = b.CreatePointerCast(rawOutputPtr, elemVecTy->getPointerTo());
+    Value * const maskBasePtr = b.getInputStreamBlockPtr("mask", ZERO, blockNoPhi);
+    Value * const outputPackPtr = b.getOutputStreamBlockPtr("spread", ZERO, blockNoPhi);
 
     // Store zeroes for the entire block, in case we skip packs with
     // an empty mask.
@@ -726,8 +702,7 @@ void ElemSpreadKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * 
     Value * newPack = nullptr;
     Value * spreadableData = nullptr;
     if (UnalignedLoads) {
-        Value * const sourceItemPtr = b.CreateGEP(elemTy, sourcePtr, sourceOffsetPhi);
-        Value * const packPtr = b.CreatePointerCast(sourceItemPtr, elemVecTy->getPointerTo());
+        Value * const packPtr = b.CreateGEP(elemTy, sourcePtr, sourceOffsetPhi);
         spreadableData = b.CreateAlignedLoad(elemVecTy, packPtr, 1);
     } else {
         Value * const pendingPackNo = b.CreateUDiv(sourceOffsetPhi, ELEMS_PER_PACK);
@@ -1038,7 +1013,6 @@ void PDEPFieldDepositLogic(KernelBuilder & b, llvm::Value * const numOfStrides, 
     //
 #ifdef PREFER_FIELD_LOADS_OVER_EXTRACT_ELEMENT
     Value * depositMaskPtr = b.getInputStreamBlockPtr("depositMask", ZERO, blockOffsetPhi);
-    depositMaskPtr = b.CreatePointerCast(depositMaskPtr, fieldPtrTy);
     for (unsigned i = 0; i < fieldsPerBlock; i++) {
         mask[i] = b.CreateLoad(fieldTy, b.CreateGEP(fiedlTy, depositMaskPtr, b.getInt32(i)));
     }
@@ -1052,14 +1026,12 @@ void PDEPFieldDepositLogic(KernelBuilder & b, llvm::Value * const numOfStrides, 
     for (unsigned j = 0; j < streamCount; ++j) {
 #ifdef PREFER_FIELD_LOADS_OVER_EXTRACT_ELEMENT
         Value * inputPtr = b.getInputStreamBlockPtr("inputStreamSet", b.getInt32(j), blockOffsetPhi);
-        inputPtr = b.CreatePointerCast(inputPtr, fieldPtrTy);
 #else
         Value * const input = b.loadInputStreamBlock("inputStreamSet", b.getInt32(j), blockOffsetPhi);
         Value * inputStrm = b.fwCast(fieldWidth, input);
 #endif
 #ifdef PREFER_FIELD_STORES_OVER_INSERT_ELEMENT
         Value * outputPtr = b.getOutputStreamBlockPtr("outputStreamSet", b.getInt32(j), blockOffsetPhi);
-        outputPtr = b.CreatePointerCast(outputPtr, fieldPtrTy);
 #else
         // Value * outputStrm = b.fwCast(mPDEPWidth, b.allZeroes());
         Value * outputStrm = UndefValue::get(b.fwVectorType(fieldWidth));
@@ -1318,7 +1290,6 @@ UnitInsertionSpreadMaskKernel::UnitInsertionSpreadMaskKernel(LLVMTypeSystemInter
 void UnitInsertionSpreadMaskKernel::generateDoBlockMethod(KernelBuilder & b) {
     const unsigned packs_per_block = b.getBitBlockWidth()/pack_width;
     Type * packTy = b.getIntNTy(pack_width);
-    Type * packPtrTy = packTy->getPointerTo();
     Type * sizeTy = b.getSizeTy();
     Constant * pONE = b.getIntN(pack_width, 1);
     Constant * PACK_BITS = b.getSize(pack_width);
@@ -1332,7 +1303,6 @@ void UnitInsertionSpreadMaskKernel::generateDoBlockMethod(KernelBuilder & b) {
     Value * offset = b.CreateURem(produced, PACK_BITS);
     Value * produced_base = b.CreateSub(produced, offset);
     Value * spread_mask_pack_ptr = b.getRawOutputPointer("spread_mask", produced_base);
-    spread_mask_pack_ptr = b.CreatePointerCast(spread_mask_pack_ptr, packPtrTy);
     Value * initial_pending = b.CreateLoad(packTy, spread_mask_pack_ptr);
     Value * pending_bit_mask = b.CreateSub(b.CreateShl(pONE, b.CreateZExtOrTrunc(offset, packTy)), pONE);
     Value * pending = b.CreateAnd(initial_pending, pending_bit_mask);
@@ -1472,7 +1442,6 @@ void InsertionSpreadMaskKernel::initialize(KernelBuilder & b) {
     Value * sm_offset = b.CreateURem(initialProduced, SCANWORD_WIDTH);
     Value * sm_base = b.CreateSub(initialProduced, sm_offset);
     Value * sm_base_ptr = b.getRawOutputPointer("spread_mask", sm_base);
-    sm_base_ptr = b.CreatePointerCast(sm_base_ptr, scanWordTy->getPointerTo());
     Value * sm_initial = b.CreateLoad(scanWordTy, sm_base_ptr);
     Constant * sw_ONE = b.getIntN(ScanWordWidth, 1);
     Value * offset_mask = b.CreateSub(b.CreateShl(sw_ONE, b.CreateZExtOrTrunc(sm_offset, scanWordTy)), sw_ONE);
@@ -1505,7 +1474,6 @@ void InsertionSpreadMaskKernel::wordPrologueLogic(KernelBuilder & b,
     Value * sm_offset = b.CreateURem(loopVars[sm_produced], SCANWORD_BITS);
     Value * sm_base = b.CreateSub(loopVars[sm_produced], sm_offset);
     Value * sm_word_ptr = b.getRawOutputPointer("spread_mask", sm_base);
-    sm_word_ptr = b.CreatePointerCast(sm_word_ptr, scanWordTy->getPointerTo());
 
     Value * offset_mask = b.CreateSub(b.CreateShl(ONE, sm_offset), ONE);
     offset_mask = b.CreateZExtOrTrunc(offset_mask, scanWordTy);
@@ -1555,7 +1523,6 @@ void InsertionSpreadMaskKernel::generateProcessingLogic(KernelBuilder & b,
     Value * sm_offset = b.CreateURem(loopVars[sm_produced], SCANWORD_BITS);
     Value * sm_base = b.CreateSub(loopVars[sm_produced], sm_offset);
     Value * sm_word_ptr = b.getRawOutputPointer("spread_mask", sm_base);
-    sm_word_ptr = b.CreatePointerCast(sm_word_ptr, scanWordTy->getPointerTo());
     // Determine how far we have advanced the input, and generate this many
     // 1 bits to the output spread mask.
     Value * advanceAmt = b.CreateSub(absItemPos, loopVars[bn_processed]);
@@ -1633,7 +1600,6 @@ void InsertionSpreadMaskKernel::finalize(KernelBuilder & b, std::vector<Value *>
     Value * sm_offset = b.CreateURem(loopVarFinalValues[sm_produced], SCANWORD_BITS);
     Value * sm_base = b.CreateSub(loopVarFinalValues[sm_produced], sm_offset);
     Value * sm_word_ptr = b.getRawOutputPointer("spread_mask", sm_base);
-    sm_word_ptr = b.CreatePointerCast(sm_word_ptr, scanWordTy->getPointerTo());
 
     Value * offset_mask = b.CreateSub(b.CreateShl(ONE, sm_offset), ONE);
     offset_mask = b.CreateZExtOrTrunc(offset_mask, scanWordTy);
@@ -1762,7 +1728,6 @@ void ByteReplaceByMask::generateMultiBlockLogic(KernelBuilder & b, Value * const
 
         // Get a pointer to the next unprocessed item
         Value * toReadPtr = b.getRawInputPointer("Filler", toReadPos);
-        toReadPtr = b.CreatePointerCast(toReadPtr, dataVecTy->getPointerTo());
         Value * data = b.CreateAlignedLoad(dataVecTy, toReadPtr, 1);
 
         // Expand the loaded data
@@ -1876,7 +1841,6 @@ void ByteSpreadByMaskKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
 
             // Get a pointer to the next unprocessed item
             Value * toReadPtr = b.getRawInputPointer("byteStream", toReadPos);
-            toReadPtr = b.CreatePointerCast(toReadPtr, dataVecTy->getPointerTo());
             Value * data = b.CreateAlignedLoad(dataVecTy, toReadPtr, 1);
 
             // Expand the loaded data

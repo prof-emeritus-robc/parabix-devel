@@ -88,11 +88,7 @@ public:
 
     /// Fetch the type representing a pointer to an 8-bit integer value.
     llvm::PointerType * LLVM_READNONE getInt8PtrTy(unsigned AddrSpace = 0) {
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
-        return llvm::PointerType::getUnqual(getContext());
-    #else
-        return llvm::PointerType::getInt8PtrTy(getContext(), AddrSpace);
-    #endif
+        return llvm::PointerType::get(getContext(), AddrSpace);
     }
 
     /// Fetch the type representing a 16-bit integer.
@@ -100,27 +96,9 @@ public:
       return llvm::Type::getInt16Ty(getContext());
     }
 
-    /// Fetch the type representing a pointer to an 8-bit integer value.
-    llvm::PointerType * LLVM_READNONE getInt16PtrTy(unsigned AddrSpace = 0) {
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
-        return llvm::PointerType::getUnqual(getContext());
-    #else
-        return llvm::PointerType::getInt16PtrTy(getContext(), AddrSpace);
-    #endif
-    }
-
     /// Fetch the type representing a 32-bit integer.
     llvm::IntegerType * LLVM_READNONE getInt32Ty() {
       return llvm::Type::getInt32Ty(getContext());
-    }
-
-    /// Fetch the type representing a pointer to an 8-bit integer value.
-    llvm::PointerType * LLVM_READNONE getInt32PtrTy(unsigned AddrSpace = 0) {
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
-        return llvm::PointerType::getUnqual(getContext());
-    #else
-        return llvm::PointerType::getInt32PtrTy(getContext(), AddrSpace);
-    #endif
     }
 
     /// Fetch the type representing a 64-bit integer.
@@ -131,15 +109,6 @@ public:
     /// Fetch the type representing a 64-bit integer.
     llvm::IntegerType * LLVM_READNONE getSizeTy() {
       return llvm::IntegerType::get(getContext(), sizeof(size_t) * 8);
-    }
-
-    /// Fetch the type representing a pointer to an 8-bit integer value.
-    llvm::PointerType * LLVM_READNONE getInt64PtrTy(unsigned AddrSpace = 0) {
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
-        return llvm::PointerType::getUnqual(getContext());
-    #else
-        return llvm::PointerType::getInt64PtrTy(getContext(), AddrSpace);
-    #endif
     }
 
     /// Fetch the type representing a 128-bit integer.
@@ -174,7 +143,7 @@ public:
 
     /// Fetch the type representing an untyped pointer.
     llvm::PointerType * LLVM_READNONE getVoidPtrTy(const unsigned AddressSpace = 0) const {
-        return llvm::PointerType::get(llvm::Type::getInt8Ty(getContext()), AddressSpace);
+        return llvm::PointerType::get(getContext(), AddressSpace);
     }
 
     /// Fetch the type of an integer with size at least as big as that of a

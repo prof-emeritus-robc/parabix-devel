@@ -25,7 +25,6 @@ ScanKernelBase::ScanWordContext::ScanWordContext(KernelBuilder & b, unsigned str
 , wordsPerStride(strideMaskWidth)
 , fieldWidth(width)
 , Ty(b->getIntNTy(width))
-, PointerTy(Ty->getPointerTo())
 , StrideMaskTy(b->getIntNTy(strideMaskWidth))
 , WIDTH(b->getSize(width))
 , WORDS_PER_BLOCK(b->getSize(wordsPerBlock))

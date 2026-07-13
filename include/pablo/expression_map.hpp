@@ -11,10 +11,12 @@
 
 namespace pablo {
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
 template<typename T>
 inline bool operator < (const llvm::ArrayRef<T> & A, const llvm::ArrayRef<T> & B) noexcept {
     return std::lexicographical_compare(A.begin(), A.end(), B.begin(), B.end());
 }
+#endif
 
 namespace {
 

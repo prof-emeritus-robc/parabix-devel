@@ -441,9 +441,7 @@ void PipelineCompiler::printOptionalCycleCounter(KernelBuilder & b) {
 
         IntegerType * int64Ty = b.getInt64Ty();
 
-        PointerType * const int64PtrTy = int64Ty->getPointerTo();
-
-        Value * const values = b.CreatePointerCast(b.CreateAlignedMalloc(requiredSpace, sizeof(uint64_t)), int64PtrTy);
+        Value * const values = b.CreateAlignedMalloc(requiredSpace, sizeof(uint64_t));
 
         auto currentPartitionId = -1U;
 
@@ -609,7 +607,7 @@ void PipelineCompiler::recordStridesPerSegment(KernelBuilder & b, const unsigned
             auto ip = b.saveIP();
             LLVMContext & C = b.getContext();
             Type * const sizeTy = b.getSizeTy();
-            Type * const tracePtrTy = traceTy->getPointerTo();
+            Type * const tracePtrTy = PointerType::getUnqual(b.getContext());
             FunctionType * fty = FunctionType::get(b.getVoidTy(), { tracePtrTy, sizeTy, sizeTy }, false);
             updateSegmentsPerStrideTrace = Function::Create(fty, Function::PrivateLinkage, "$trace_strides_per_segment", m);
 
@@ -635,7 +633,7 @@ void PipelineCompiler::recordStridesPerSegment(KernelBuilder & b, const unsigned
 //            FixedArray<Type *, 4> traceStruct;
 //            traceStruct[0] = sizeTy; // last num of strides (to avoid unnecessary loads of the trace
 //                                     // log and simplify the logic for first stride)
-//            traceStruct[1] = recordStructTy->getPointerTo(); // pointer to trace log
+//            traceStruct[1] = PointerType::getUnqual(b.getContext()); // pointer to trace log
 //            traceStruct[2] = sizeTy; // trace length
 //            traceStruct[3] = sizeTy; // trace capacity (for realloc)
 
@@ -653,7 +651,7 @@ void PipelineCompiler::recordStridesPerSegment(KernelBuilder & b, const unsigned
             Value * const traceLogField = b.CreateGEP(traceTy, traceData, {ZERO, ONE});
             assert (traceLogField->getType()->isPointerTy());
             Type * const recordStructTy = ArrayType::get(sizeTy, 2);
-            Type * const recordStructPtrTy = recordStructTy->getPointerTo();
+            Type * const recordStructPtrTy = PointerType::getUnqual(b.getContext());
             Value * const traceLog = b.CreateAlignedLoad(recordStructPtrTy, traceLogField, PtrTyABIAlignment);
             Value * const traceLengthField = b.CreateGEP(traceTy, traceData, {ZERO, TWO});
             Value * const traceLength = b.CreateAlignedLoad(sizeTy, traceLengthField, SizeTyABIAlignment);
@@ -791,7 +789,7 @@ void PipelineCompiler::printOptionalStridesPerSegment(KernelBuilder & b) const {
         SmallVector<Value *, 64> traceLengthArray(PartitionCount - 1);
 
         Type * const recordStructTy = ArrayType::get(sizeTy, 2);
-        Type * const recordStructPtrTy = recordStructTy->getPointerTo();
+        Type * const recordStructPtrTy = PointerType::getUnqual(b.getContext());
 
         for (unsigned i = 0; i < (PartitionCount - 2); ++i) {
             const auto prefix = makeKernelName(partitionRootIds[i]);
@@ -992,7 +990,7 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
     Function * logFunc = m->getFunction(logName);
     if (logFunc == nullptr) {
 
-        PointerType * const sizePtrTy = sizeTy->getPointerTo();
+        PointerType * const sizePtrTy = PointerType::getUnqual(b.getContext());
 
         FixedArray<Type *, 4> params;
         params[0] = voidPtrTy;
@@ -1025,10 +1023,9 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
         fields[2] = ArrayType::get(sizeTy, ITEM_COUNT_DELTA_CHUNK_LENGTH); // Int array of size N * ITEM_COUNT_DELTA_CHUNK_LENGTH
 
         StructType * const logChunkTy = StructType::get(C, fields);
-        PointerType * const logChunkPtrTy = logChunkTy->getPointerTo();
-        PointerType * const logChunkPtrPtrTy = logChunkPtrTy->getPointerTo();
+        PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
 
-        Value * const logChunkPtrPtr = b.CreatePointerCast(nextArg(), logChunkPtrPtrTy);
+        Value * const logChunkPtrPtr = nextArg();
         Value * const segNo = nextArg();
         Value * const N = nextArg();
         Value * const currentArray = nextArg();
@@ -1036,10 +1033,11 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
 
         ConstantInt * const CHUNK_LENGTH =  ConstantInt::get(sizeTy, ITEM_COUNT_DELTA_CHUNK_LENGTH);
 
-        DataLayout DL(b.getModule());
+        auto & DL = b.getModule()->getDataLayout();
+
         const auto sizeTySize = b.getTypeSize(DL, sizeTy);
         const auto voidPtrTySize = b.getTypeSize(DL, voidPtrTy);
-        Value * const currentLog = b.CreateAlignedLoad(logChunkPtrTy, logChunkPtrPtr, voidPtrTySize);
+        Value * const currentLog = b.CreateAlignedLoad(ptrTy, logChunkPtrPtr, voidPtrTySize);
         BasicBlock * const checkLogOffset = b.CreateBasicBlock("checkLogOffset");
         BasicBlock * const allocateNewLogChunk = b.CreateBasicBlock("allocateNewLogChunk");
         BasicBlock * const writeLogEntry = b.CreateBasicBlock("writeLogEntry");
@@ -1067,7 +1065,7 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
         b.SetInsertPoint(allocateNewLogChunk);
         Value * const m = b.CreateAdd(b.CreateMul(N, CHUNK_LENGTH), b.getSize(1));
         Value * const sizeLength = b.CreateAdd(b.CreateMul(m, b.getSize(sizeTySize)), b.getSize(voidPtrTySize));
-        Value * const newLog = b.CreatePointerCast(b.CreatePageAlignedMalloc(sizeLength), logChunkPtrTy);
+        Value * const newLog = b.CreatePageAlignedMalloc(sizeLength);
         b.CreateAlignedStore(b.CreateSub(segNo, segIndex), b.CreateGEP(logChunkTy, newLog, offset), SizeTyABIAlignment);
         offset[1] = i32_ONE;
         b.CreateAlignedStore(currentLog, b.CreateGEP(logChunkTy, newLog, offset), PtrTyABIAlignment);
@@ -1081,11 +1079,11 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
         PHINode * const indexPhi = b.CreatePHI(sizeTy, 2);
         indexPhi->addIncoming(sz_ZERO, checkLogOffset);
         indexPhi->addIncoming(sz_ZERO, allocateNewLogChunk);
-        PHINode * const logPhi = b.CreatePHI(logChunkPtrTy, 2);
+        PHINode * const logPhi = b.CreatePHI(ptrTy, 2);
         logPhi->addIncoming(currentLog, checkLogOffset);
         logPhi->addIncoming(newLog, allocateNewLogChunk);
 
-        Value * const inputPtr = b.CreateGEP(sizeTy->getPointerTo(), currentArray, indexPhi);
+        Value * const inputPtr = b.CreateGEP(PointerType::getUnqual(b.getContext()), currentArray, indexPhi);
         Value * const val = b.CreateAlignedLoad(sizeTy, inputPtr, SizeTyABIAlignment);
 
         FixedArray<Value *, 3> offset3;
@@ -1109,7 +1107,7 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
     }
 
     FixedArray<Value *, 4> args;
-    args[0] = b.CreatePointerCast(trace, voidPtrTy);
+    args[0] = trace;
     const auto n = out_degree(mKernelId, mBufferGraph);
     args[1] = mSegNo;
     ConstantInt * N = b.getSize(n);
@@ -1133,11 +1131,9 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
 void PipelineCompiler::addItemCountDeltaProperties(KernelBuilder & b, const unsigned kernel, const StringRef suffix) const {
     const auto n = out_degree(kernel, mBufferGraph);
     LLVMContext & C = b.getContext();
-    IntegerType * const sizeTy = b.getSizeTy();
-    PointerType * const voidPtrTy = b.getVoidPtrTy();
-    ArrayType * const logTy = ArrayType::get(ArrayType::get(sizeTy, n), ITEM_COUNT_DELTA_CHUNK_LENGTH);
-    StructType * const logChunkTy = StructType::get(C, { sizeTy, voidPtrTy, logTy } );
-    PointerType * const traceTy = logChunkTy->getPointerTo();
+    //IntegerType * const sizeTy = b.getSizeTy();
+    //ArrayType * const logTy = ArrayType::get(ArrayType::get(sizeTy, n), ITEM_COUNT_DELTA_CHUNK_LENGTH);
+    PointerType * const traceTy = PointerType::getUnqual(C);
     const auto fieldName = (makeKernelName(kernel) + suffix).str();
     const auto groupId = getCacheLineGroupId(kernel);
     mTarget->addInternalScalar(traceTy, fieldName, groupId);
@@ -1268,12 +1264,12 @@ void PipelineCompiler::printItemCountDeltas(KernelBuilder & b, const StringRef t
         BasicBlock * const entry = b.GetInsertBlock();
         BasicBlock * const loop = b.CreateBasicBlock("getNextLogChunk", printLogEntryLoop);
         BasicBlock * const exit = b.CreateBasicBlock("getNextLogChunkExit", printLogEntryLoop);
-        PointerType * logChunkPtrTy = traceLogType[i]->getPointerTo();
-        Constant * nullPtr = ConstantPointerNull::get(logChunkPtrTy);
+        PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
+        Constant * nullPtr = ConstantPointerNull::get(ptrTy);
         b.CreateBr(loop);
 
         b.SetInsertPoint(loop);
-        PHINode * current = b.CreatePHI(logChunkPtrTy, 2);
+        PHINode * current = b.CreatePHI(ptrTy, 2);
         current->addIncoming(traceLogArray[i], entry);
         offset[1] = i32_ZERO;
         Value * const chunkStart = b.CreateAlignedLoad(sizeTy, b.CreateGEP(traceLogType[i], current, offset), SizeTyABIAlignment);
@@ -1281,7 +1277,7 @@ void PipelineCompiler::printItemCountDeltas(KernelBuilder & b, const StringRef t
         Value * const B = b.CreateICmpULT(baseSegNoPhi, b.CreateAdd(chunkStart, CHUNK_LENGTH));
         Value * const found = b.CreateAnd(A, B);
         offset[1] = i32_ONE;
-        Value * const nextChunkPtr = b.CreateAlignedLoad(logChunkPtrTy, b.CreateGEP(traceLogType[i], current, offset), PtrTyABIAlignment);
+        Value * const nextChunkPtr = b.CreateAlignedLoad(ptrTy, b.CreateGEP(traceLogType[i], current, offset), PtrTyABIAlignment);
         Value * const noMore = b.CreateICmpEQ(nextChunkPtr, nullPtr);
         current->addIncoming(nextChunkPtr, loop);
         currentChunk[i] = b.CreateSelect(noMore, nullPtr, current);
@@ -1385,17 +1381,17 @@ void PipelineCompiler::printItemCountDeltas(KernelBuilder & b, const StringRef t
         BasicBlock * const freeLoop = b.CreateBasicBlock("freeLoop");
         BasicBlock * const freeExit = b.CreateBasicBlock("freeExit");
 
-        PointerType * const traceLogPtrTy = cast<PointerType>(traceLogType[i]->getPointerTo());
-        Constant * nil = ConstantPointerNull::get(traceLogPtrTy);
+        PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
+        Constant * nil = ConstantPointerNull::get(ptrTy);
 
         BasicBlock * const entry = b.GetInsertBlock();
 
         b.CreateLikelyCondBr(b.CreateICmpNE(traceLogArray[i], nil), freeLoop, freeExit);
 
         b.SetInsertPoint(freeLoop);
-        PHINode * logArray = b.CreatePHI(traceLogPtrTy, 2);
+        PHINode * logArray = b.CreatePHI(ptrTy, 2);
         logArray->addIncoming(traceLogArray[i], entry);
-        Value * const nextArray = b.CreateAlignedLoad(traceLogPtrTy, b.CreateGEP(traceLogType[i], logArray, offset), PtrTyABIAlignment);
+        Value * const nextArray = b.CreateAlignedLoad(ptrTy, b.CreateGEP(traceLogType[i], logArray, offset), PtrTyABIAlignment);
         b.CreateFree(logArray);
         logArray->addIncoming(nextArray, freeLoop);
         b.CreateLikelyCondBr(b.CreateICmpNE(nextArray, nil), freeLoop, freeExit);

@@ -261,7 +261,6 @@ void base64Kernel::generateFinalBlockMethod(KernelBuilder & b, Value * remaining
 
     b.SetInsertPoint(doPadding);
     Value * i8output_ptr = b.getOutputStreamBlockPtr("base64stream", ZERO);
-    i8output_ptr = b.CreatePointerCast(i8output_ptr, b.getInt8PtrTy());
     b.CreateStore(PADDING, b.CreateGEP(b.getInt8Ty(), i8output_ptr, remainingBytes));
     b.CreateCondBr(b.CreateICmpEQ(remainMod4, THREE), fbExit, doPadding2);
 

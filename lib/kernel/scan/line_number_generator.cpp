@@ -46,7 +46,7 @@ void LineNumberGenerator::generateProcessingLogic(KernelBuilder & b, Value * con
     // which come after the scan-bit position but are included in the value
     // of lineCount. We need to subtract the number of such break positions to
     // get the correct line number.
-    Value * const breaksBlockPtr = b.CreateBitCast(b.getInputStreamBlockPtr("lines", b.getInt32(0), blockIndex), mSW.PointerTy);
+    Value * const breaksBlockPtr = b.getInputStreamBlockPtr("lines", b.getInt32(0), blockIndex);
     Value * const breaksWord = b.CreateLoad(mSW.Ty, b.CreateGEP(mSW.Ty, breaksBlockPtr, wordIndex));
     Value * const highMask = b.CreateNot(b.CreateMaskToLowestBitExclusive(mProcessingWord));
     Value * const maskedBreaksWord = b.CreateAnd(breaksWord, highMask);

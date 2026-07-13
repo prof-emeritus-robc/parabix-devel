@@ -50,9 +50,8 @@ void PipelineCompiler::addBufferHandlesToPipelineKernel(KernelBuilder & b, const
             // produced item count 2
             // consumer processed item count [3,n)
             IntegerType * const sizeTy = b.getSizeTy();
-            Type * const traceStructTy = ArrayType::get(sizeTy, numOfConsumers + 3);
             FixedArray<Type *, 2> traceStruct;
-            traceStruct[0] = traceStructTy->getPointerTo(); // pointer to trace log
+            traceStruct[0] = PointerType::getUnqual(b.getContext()); // pointer to trace log
             traceStruct[1] = sizeTy; // length of trace log
             mTarget->addInternalScalar(StructType::get(b.getContext(), traceStruct),
                                                prefix + STATISTICS_BUFFER_EXPANSION_SUFFIX, groupId);
@@ -194,7 +193,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                 params.push_back(b.CreateMulRational(allocScale, factor));
                 if (LLVM_UNLIKELY(mTraceDynamicBuffers && (kernelObj->getKernelFlags() & Kernel::KernelFlags::HasInternallyManagedStreamSet) && nonLocal)) {
                     params.push_back(generateBufferExpansionFunctionForCurrentKernel(b, i));
-                    params.push_back(b.CreatePointerCast(getHandle(), b.getVoidPtrTy()));
+                    params.push_back(getHandle());
                 }
                 b.CreateCall(funcTy, func, params);
             }
@@ -209,7 +208,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
 
     Value * sharedHandle = nullptr;
     if (LLVM_UNLIKELY(mTraceDynamicBuffers)) {
-        sharedHandle = b.CreatePointerCast(getHandle(), b.getVoidPtrTy());
+        sharedHandle = getHandle();
     }
 
     flat_set<size_t> doubleSize;
@@ -295,7 +294,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                             const auto byteSize = b.getTypeSize(dl, buffer->getType());
                             Value * length = b.CreateMulRational(buffer->getInternalCapacity(b), Rational{byteSize, b.getBitBlockWidth()});
                             Constant * ts = b.getSize(byteSize);
-                            Value * end = b.CreateGEP(b.getInt8Ty(), b.CreatePointerCast(start, b.getInt8PtrTy()), length);
+                            Value * end = b.CreateGEP(b.getInt8Ty(), start, length);
                             debugPrint(b, prefix + ".inital malloc range = [%" PRIx64 ",%" PRIx64 ") [typeSize=%" PRIu64 "]", start, end, ts);
                             #endif
 
@@ -411,7 +410,6 @@ void PipelineCompiler::updateLocalDynamicBufferStructsUntil(KernelBuilder & b, c
                         }
                         Value * const ba = buffer->getBaseAddress(b);
                         Value * vba = buffer->getVirtualBasePtr(b, ba, consumed);
-                        vba = b.CreatePointerCast(vba, b.getVoidPtrTy());
                         assert (bn.ManagedStructId < ManagedBufferStructCount);
                         b.setScalarField(MANAGED_STREAMSET_LOCAL_VIRTUAL_BASE_ADDRESS + std::to_string(bn.ManagedStructId), vba);
                         break;
@@ -829,7 +827,6 @@ Value * PipelineCompiler::getVirtualBaseAddress(KernelBuilder & b,
     Value * addr = nullptr;
     if (buffer->isDynamic() && rateData.Port.Type == PortType::Input && bufferNode.ProducedPhaseId == mCurrentPipelinePhase) {
         addr = b.getScalarField(MANAGED_STREAMSET_LOCAL_VIRTUAL_BASE_ADDRESS + std::to_string(bufferNode.ManagedStructId));
-        addr = b.CreatePointerCast(addr, buffer->getPointerType());
     } else {
         assert (isFromCurrentFunction(b, buffer->getHandle(), false));
         assert (position);
@@ -858,9 +855,9 @@ Value * PipelineCompiler::getVirtualBaseAddress(KernelBuilder & b,
 void PipelineCompiler::prefetchAtLeastThreeCacheLinesFrom(KernelBuilder & b, Value * const addr, const bool write) const {
 #if 0
     Module * const m = b.getModule();
-    Function * const prefetchFunc = Intrinsic::getDeclaration(m, Intrinsic::prefetch);
+    Function * const prefetchFunc = Intrinsic::getOrInsertDeclaration(m, Intrinsic::prefetch);
 
-    DataLayout dl(m);
+    auto & dl = m->getDataLayout();
     Type * const elemTy = addr->getType()->getPointerElementType();
     const auto typeSize = dl.getTypeAllocSize(elemTy).getFixedSize();
     assert (typeSize > 0);
@@ -873,9 +870,8 @@ void PipelineCompiler::prefetchAtLeastThreeCacheLinesFrom(KernelBuilder & b, Val
 
     const auto cl = b.getCacheAlignment();
     const auto toFetch = round_up_to<unsigned>(cl * 3, typeSize);
-    Value * const baseAddr = b.CreatePointerCast(addr, b.getInt8PtrTy());
     for (unsigned i = 0; i < toFetch; i += cl) {
-        args[0] = b.CreateGEP0(baseAddr, b.getSize(i));
+        args[0] = b.CreateGEP0(addr, b.getSize(i));
         b.CreateCall(prefetchFunc->getFunctionType(), prefetchFunc, args);
     }
 #endif

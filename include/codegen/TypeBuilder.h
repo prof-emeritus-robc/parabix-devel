@@ -223,10 +223,12 @@ template<bool cross> class TypeBuilder<types::ppc_fp128, cross> {
 public:
   static Type *get(LLVMContext& C) { return Type::getPPC_FP128Ty(C); }
 };
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
 template<bool cross> class TypeBuilder<types::x86_mmx, cross> {
 public:
   static Type *get(LLVMContext& C) { return Type::getX86_MMXTy(C); }
 };
+#endif
 
 template<bool cross> class TypeBuilder<void, cross> {
 public:

@@ -16,6 +16,10 @@
 #endif
 using boost::intrusive::detail::floor_log2;
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
+#define getOrInsertDeclaration getDeclaration
+#endif
+
 #define ADD_IF_FOUND(Flag, Value) if (features.lookup(Value)) featureSet.set((size_t)Feature::Flag)
 
 using namespace llvm;
@@ -30,12 +34,12 @@ Value * IDISA_AVX_Builder::hsimd_signmask(unsigned fw, Value * a) {
     // AVX2 special cases
     if (mBitBlockWidth == 256) {
         if (fw == 64) {
-            Function * signmask_f64func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx_movmsk_pd_256);
+            Function * signmask_f64func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx_movmsk_pd_256);
             Type * bitBlock_f64type = FixedVectorType::get(getDoubleTy(), 256 / 64);
             Value * a_as_pd = CreateBitCast(a, bitBlock_f64type);
             return CreateCall(signmask_f64func->getFunctionType(), signmask_f64func, a_as_pd);
         } else if (fw == 32) {
-            Function * signmask_f32func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx_movmsk_ps_256);
+            Function * signmask_f32func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx_movmsk_ps_256);
             Type * bitBlock_f32type = FixedVectorType::get(getFloatTy(), 256 / 32);
             Value * a_as_ps = CreateBitCast(a, bitBlock_f32type);
             return CreateCall(signmask_f32func->getFunctionType(), signmask_f32func, a_as_ps);
@@ -51,7 +55,7 @@ Value * IDISA_AVX_Builder::hsimd_signmask(unsigned fw, Value * a) {
             Value * packh = CreateShuffleVector(a_as_ps, UndefValue::get(bitBlock_f32type), ConstantVector::get({indicies, 8}));
             Type * halfBlock_f32type = FixedVectorType::get(getFloatTy(), mBitBlockWidth/64);
             Value * pack_as_ps = CreateBitCast(packh, halfBlock_f32type);
-            Function * signmask_f32func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx_movmsk_ps_256);
+            Function * signmask_f32func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx_movmsk_ps_256);
             return CreateCall(signmask_f32func->getFunctionType(), signmask_f32func, pack_as_ps);
         }
     }
@@ -63,11 +67,11 @@ Value * IDISA_AVX_Builder::CreateZeroHiBitsFrom(Value * bits, Value * pos, const
     if (hasFeature(Feature::AVX_BMI)) {
         Type * const Ty = bits->getType();
         if (Ty == getInt64Ty()) {
-            Function * bzhi_64 = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_bzhi_64);
+            Function * bzhi_64 = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_bzhi_64);
             return CreateCall(bzhi_64->getFunctionType(), bzhi_64, {bits, pos}, Name);
         }
         if (Ty == getInt32Ty()) {
-            Function * bzhi_32 = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_bzhi_32);
+            Function * bzhi_32 = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_bzhi_32);
             return CreateCall(bzhi_32->getFunctionType(), bzhi_32, {bits, pos}, Name);
         }
     }
@@ -79,11 +83,11 @@ Value * IDISA_AVX_Builder::CreatePextract(Value * bits, Value * mask, const Twin
         Type * Ty = bits->getType();
         unsigned width = Ty->getPrimitiveSizeInBits();
         if (width == 64) {
-            Function * pext64 = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_64);
+            Function * pext64 = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_64);
             return CreateCall(pext64->getFunctionType(), pext64, {bits, mask}, Name);
         }
         if (width <= 32) {
-            Function * pext32 = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
+            Function * pext32 = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
             if (width < 32) {
                 assert (bits->getType()->getIntegerBitWidth() <= 32);
                 bits = CreateZExt(bits, getInt32Ty());
@@ -103,11 +107,11 @@ Value * IDISA_AVX_Builder::CreatePdeposit(Value * bits, Value * mask, const Twin
         Type * Ty = bits->getType();
         unsigned width = Ty->getPrimitiveSizeInBits();
         if (width == 64) {
-            Function * pdep64 = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64);
+            Function * pdep64 = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64);
             return CreateCall(pdep64->getFunctionType(), pdep64, {bits, mask}, Name);
         }
         if (width <= 32) {
-            Function * pdep32 = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
+            Function * pdep32 = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
             if (width < 32) {
                 assert (bits->getType()->getIntegerBitWidth() <= 32);
                 bits = CreateZExt(bits, getInt32Ty());
@@ -176,7 +180,7 @@ Value * IDISA_AVX2_Builder::esimd_mergeh(unsigned fw, Value * a, Value * b) {
     if (getVectorBitWidth(a) == mNativeBitBlockWidth) {
         if ((fw == 1) || (fw == 2)) {
             // Bit interleave using shuffle.
-            Function * shufFn = Intrinsic::getDeclaration(getModule(),  Intrinsic::x86_avx2_pshuf_b);
+            Function * shufFn = Intrinsic::getOrInsertDeclaration(getModule(),  Intrinsic::x86_avx2_pshuf_b);
             // Make a shuffle table that translates the lower 4 bits of each byte in
             // order to spread out the bits: xxxxdcba => .d.c.b.a
             // We use two copies of the table for the AVX2 _mm256_shuffle_epi8
@@ -200,7 +204,7 @@ Value * IDISA_AVX2_Builder::esimd_mergel(unsigned fw, Value * a, Value * b) {
     if (getVectorBitWidth(a) == mNativeBitBlockWidth) {
         if ((fw == 1) || (fw == 2)) {
             // Bit interleave using shuffle.
-            Function * shufFn = Intrinsic::getDeclaration(getModule(),  Intrinsic::x86_avx2_pshuf_b);
+            Function * shufFn = Intrinsic::getOrInsertDeclaration(getModule(),  Intrinsic::x86_avx2_pshuf_b);
             // Make a shuffle table that translates the lower 4 bits of each byte in
             // order to spread out the bits: xxxxdcba => .d.c.b.a
             // We use two copies of the table for the AVX2 _mm256_shuffle_epi8
@@ -222,7 +226,7 @@ Value * IDISA_AVX2_Builder::esimd_mergel(unsigned fw, Value * a, Value * b) {
 
 Value * IDISA_AVX2_Builder::hsimd_packl_in_lanes(unsigned lanes, unsigned fw, Value * a, Value * b) {
     if ((fw == 16)  && (lanes == 2)) {
-        Function * vpackuswbfunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_packuswb);
+        Function * vpackuswbfunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_packuswb);
         Value * a_low = fwCast(16, simd_and(a, simd_lomask(fw)));
         Value * b_low = fwCast(16, simd_and(b, simd_lomask(fw)));
         return CreateCall(vpackuswbfunc->getFunctionType(), vpackuswbfunc, {a_low, b_low});
@@ -233,7 +237,7 @@ Value * IDISA_AVX2_Builder::hsimd_packl_in_lanes(unsigned lanes, unsigned fw, Va
 
 Value * IDISA_AVX2_Builder::hsimd_packh_in_lanes(unsigned lanes, unsigned fw, Value * a, Value * b) {
     if ((fw == 16)  && (lanes == 2)) {
-        Function * vpackuswbfunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_packuswb);
+        Function * vpackuswbfunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_packuswb);
         Value * a_low = simd_srli(fw, a, fw/2);
         Value * b_low = simd_srli(fw, b, fw/2);
         return CreateCall(vpackuswbfunc->getFunctionType(), vpackuswbfunc, {a_low, b_low});
@@ -245,7 +249,7 @@ Value * IDISA_AVX2_Builder::hsimd_packh_in_lanes(unsigned lanes, unsigned fw, Va
 
 Value * IDISA_AVX2_Builder::hsimd_packus(unsigned fw, Value * a, Value * b) {
     if (((fw == 32) || (fw == 16)) && (getVectorBitWidth(a) == AVX_width)) {
-        Function * pack_func = Intrinsic::getDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx2_packuswb : Intrinsic::x86_avx2_packusdw);
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx2_packuswb : Intrinsic::x86_avx2_packusdw);
         Value * packed = fwCast(64, CreateCall(pack_func->getFunctionType(), pack_func, {fwCast(fw, a), fwCast(fw, b)}));
         auto field_count = AVX_width/64;
         SmallVector<Constant *, 4> Idxs(field_count);
@@ -262,7 +266,7 @@ Value * IDISA_AVX2_Builder::hsimd_packus(unsigned fw, Value * a, Value * b) {
 
 Value * IDISA_AVX2_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
     if (((fw == 32) || (fw == 16)) && (getVectorBitWidth(a) == AVX_width)) {
-        Function * pack_func = Intrinsic::getDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx2_packsswb : Intrinsic::x86_avx2_packssdw);
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx2_packsswb : Intrinsic::x86_avx2_packssdw);
         Value * packed = fwCast(64, CreateCall(pack_func->getFunctionType(), pack_func, {fwCast(fw, a), fwCast(fw, b)}));
         auto field_count = AVX_width/64;
         SmallVector<Constant *, 4> Idxs(field_count);
@@ -368,11 +372,11 @@ Value * IDISA_AVX2_Builder::simd_pdep(unsigned fieldwidth, Value * v, Value * de
 std::pair<Value *, Value *> IDISA_AVX2_Builder::bitblock_indexed_advance(Value * strm, Value * index_strm, Value * shiftIn, unsigned shiftAmount) {
     const unsigned bitWidth = getSizeTy()->getBitWidth();
     if (hasFeature(Feature::AVX_BMI2) && ((bitWidth == 64) || (bitWidth == 32))) {
-        Function * PEXT_f = (bitWidth == 64) ? Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_64)
-                                          : Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
-        Function * PDEP_f = (bitWidth == 64) ? Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64)
-                                          : Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
-        Function * const popcount = Intrinsic::getDeclaration(getModule(), Intrinsic::ctpop, getSizeTy());
+        Function * PEXT_f = (bitWidth == 64) ? Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_64)
+                                          : Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
+        Function * PDEP_f = (bitWidth == 64) ? Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64)
+                                          : Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
+        Function * const popcount = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::ctpop, getSizeTy());
         Type * iBitBlock = getIntNTy(getBitBlockWidth());
         Value * shiftVal = getSize(shiftAmount);
         const auto n = getBitBlockWidth() / bitWidth;
@@ -440,7 +444,7 @@ Value * IDISA_AVX2_Builder::hsimd_signmask(unsigned fw, Value * a) {
     // AVX2 special cases
     if (mBitBlockWidth == 256) {
         if (fw == 8) {
-            Function * signmask_f8func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_pmovmskb);
+            Function * signmask_f8func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_pmovmskb);
             Type * bitBlock_i8type = FixedVectorType::get(getInt8Ty(), mBitBlockWidth/8);
             Value * a_as_ps = CreateBitCast(a, bitBlock_i8type);
             return CreateCall(signmask_f8func->getFunctionType(), signmask_f8func, a_as_ps);
@@ -457,7 +461,7 @@ Value * IDISA_AVX2_Builder::mvmd_srl(unsigned fw, Value * a, Value * shift, cons
         if (fw > 32) {
             return fwCast(fw, mvmd_srl(32, a, CreateMul(shift, ConstantInt::get(shift->getType(), fw/32)), safe));
         } else if (fw == 32) {
-            Function * permuteFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_permd);
+            Function * permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_permd);
             const unsigned fieldCount = mBitBlockWidth/fw;
             Type * fieldTy = getIntNTy(fw);
             SmallVector<Constant *, 16> indexes(fieldCount);
@@ -486,7 +490,7 @@ Value * IDISA_AVX2_Builder::mvmd_sll(unsigned fw, Value * a, Value * shift, cons
         if (fw > 32) {
             return fwCast(fw, mvmd_sll(32, a, CreateMul(shift, ConstantInt::get(shift->getType(), fw/32)), safe));
         } else if (fw == 32) {
-            Function * permuteFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_permd);
+            Function * permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_permd);
             const unsigned fieldCount = mBitBlockWidth/fw;
             Type * fieldTy = getIntNTy(fw);
             SmallVector<Constant *, 16> indexes(fieldCount);
@@ -535,7 +539,7 @@ Value * IDISA_AVX2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_v
             return fwCast(64, mvmd_shuffle(32, a, index_vector));
 #endif
         } else if (fw == 32) {
-            Function * shuf32Func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_permd);
+            Function * shuf32Func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_permd);
             return CreateCall(shuf32Func->getFunctionType(), shuf32Func, {fwCast(32, a), fwCast(32, index_vector)});
         } else if (fw == 16) {
             // TODO: if we can use vpshuflw and vpshufhw, we may be able to do this a bit more efficiently
@@ -564,10 +568,10 @@ Value * IDISA_AVX2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_v
             // TODO: I want to call vpermq directly since LLVM 15 shufflevector doesn't produce it but LLVM doesn't
             // seem to support the instruction or intrinsic? check if later versions do.
 
-            // Function * permuteFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_permq);
+            // Function * permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_permq);
 
             FixedVectorType * vec64Ty = FixedVectorType::get(getInt64Ty(), 256 / 64);
-            Function * shufFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx2_pshuf_b);
+            Function * shufFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_pshuf_b);
             Value * const a64 = CreateBitCast(a, vec64Ty);
             FixedVectorType * vecTy = FixedVectorType::get(int8Ty, 256 / 8);
             index_vector = CreateBitCast(index_vector, vecTy);
@@ -598,7 +602,7 @@ Value * IDISA_AVX2_Builder::mvmd_compress(unsigned fw, Value * a, Value * select
     if (hasFeature(Feature::AVX_BMI2) && (mBitBlockWidth == 256)) {
 
         if (fw == 64) {
-            Function * PDEP_func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
+            Function * PDEP_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
             Value * mask = CreateZExtOrTrunc(select_mask, getInt32Ty());
             Value * mask32 = CreateMul(CreateCall(PDEP_func->getFunctionType(), PDEP_func, {mask, getInt32(0x55)}), getInt32(3));
             Value * result = fwCast(fw, mvmd_compress(32, fwCast(32, a), CreateTrunc(mask32, getInt8Ty())));
@@ -608,9 +612,9 @@ Value * IDISA_AVX2_Builder::mvmd_compress(unsigned fw, Value * a, Value * select
             Type * v8xi32Ty = FixedVectorType::get(getInt32Ty(), 8);
             Type * v8xi1Ty = FixedVectorType::get(getInt1Ty(), 8);
             Constant * mask0000000Fsplaat = getSplat(8, ConstantInt::get(getInt32Ty(), 0xF));
-            Function * PEXT_func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
-            Function * PDEP_func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
-            Function * const popcount_func = Intrinsic::getDeclaration(getModule(), Intrinsic::ctpop, getInt32Ty());
+            Function * PEXT_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
+            Function * PDEP_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
+            Function * const popcount_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::ctpop, getInt32Ty());
             // First duplicate each mask bit to select 4-bit fields
             Value * mask = CreateZExtOrTrunc(select_mask, getInt32Ty());
             Value * field_count = CreateCall(popcount_func->getFunctionType(), popcount_func, mask);
@@ -649,10 +653,10 @@ Value * IDISA_AVX2_Builder::mvmd_compress(unsigned fw, Value * a, Value * select
             // Step 2: Use PEXT instruction to select only the bixnum values for the bytes to be selected
             Function * pextFunc = nullptr;
             if (LLVM_LIKELY(fieldCount == 64)) {
-                pextFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_64);
+                pextFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_64);
             } else {
                 assert (fieldCount <= 32);
-                pextFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
+                pextFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
                 if (LLVM_UNLIKELY(fieldCount < 32)) {
                     assert (select_mask->getType()->getIntegerBitWidth() <= 32);
                     select_mask = CreateZExt(select_mask, getInt32Ty());
@@ -712,10 +716,10 @@ Value * IDISA_AVX2_Builder::mvmd_expand(unsigned fw, Value * a, Value * select_m
 
              Function * pdepFunc = nullptr;
              if (LLVM_LIKELY(fieldCount == 64)) {
-                 pdepFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64);
+                 pdepFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64);
              } else {
                  assert (fieldCount <= 32);
-                 pdepFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
+                 pdepFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
                  if (LLVM_UNLIKELY(fieldCount < 32)) {
                      assert (select_mask->getType()->getIntegerBitWidth() <= 32);
                      select_mask = CreateZExt(select_mask, getInt32Ty());
@@ -786,7 +790,7 @@ Value * IDISA_AVX512F_Builder::hsimd_packl(unsigned fw, Value * a, Value * b) {
 
 Value * IDISA_AVX512F_Builder::hsimd_packus(unsigned fw, Value * a, Value * b) {
     if (hasFeature(Feature::AVX512_BW) && ((fw == 16) || (fw == 32)) && (getVectorBitWidth(a) == AVX512_width)) {
-        Function * pack_func = Intrinsic::getDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx512_packuswb_512 : Intrinsic::x86_avx512_packusdw_512);
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx512_packuswb_512 : Intrinsic::x86_avx512_packusdw_512);
         Value * packed = CreateCall(pack_func->getFunctionType(), pack_func, {fwCast(fw, a), fwCast(fw, b)});
         auto field_count = AVX512_width/64;
         SmallVector<Constant *, 16> Idxs(field_count);
@@ -803,7 +807,7 @@ Value * IDISA_AVX512F_Builder::hsimd_packus(unsigned fw, Value * a, Value * b) {
 
 Value * IDISA_AVX512F_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
     if (hasFeature(Feature::AVX512_BW) && ((fw == 16) || (fw == 32)) && (getVectorBitWidth(a) == AVX512_width)) {
-        Function * pack_func = Intrinsic::getDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx512_packsswb_512 : Intrinsic::x86_avx512_packssdw_512);
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), fw == 16 ? Intrinsic::x86_avx512_packsswb_512 : Intrinsic::x86_avx512_packssdw_512);
         Value * packed = CreateCall(pack_func->getFunctionType(), pack_func, {fwCast(fw, a), fwCast(fw, b)});
         auto field_count = AVX512_width/64;
         SmallVector<Constant *, 16> Idxs(field_count);
@@ -868,14 +872,14 @@ Value * IDISA_AVX512F_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value 
     if (mBitBlockWidth == 512) {
         Function * permuteFunc = nullptr;
         if (fw == 32) {
-            permuteFunc = Intrinsic::getDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_d_512));
+            permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_d_512));
         } else if (fw == 64) {
-            permuteFunc = Intrinsic::getDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_q_512));
+            permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_q_512));
         } else if (fw == 16 && hasFeature(Feature::AVX512_BW)) {
-            permuteFunc = Intrinsic::getDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_hi_512));
+            permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_hi_512));
         } else if (fw == 8) {
             if (hasFeature(Feature::AVX512_VBMI)) {
-                permuteFunc = Intrinsic::getDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_qi_512));
+                permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_qi_512));
             } else if (hasFeature(Feature::AVX512_BW)) {
 
                 // If we have AVX512BW but not AVX512VBMI, we can use 16 bit shuffles to replicate an 8 bit shuffle.
@@ -936,19 +940,19 @@ Value * IDISA_AVX512F_Builder::mvmd_compress(unsigned fw, Value * a, Value * sel
     Value * mask = CreateZExtOrTrunc(select_mask, getIntNTy(fieldCount));
     if (mBitBlockWidth == 512 && fw == 32) {
         Type * maskTy = FixedVectorType::get(getInt1Ty(), fieldCount);
-        Function * compressFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx512_mask_compress, fwVectorType(fw));
+        Function * compressFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx512_mask_compress, fwVectorType(fw));
         return CreateCall(compressFunc->getFunctionType(), compressFunc, {fwCast(32, a), fwCast(32, allZeroes()), CreateBitCast(mask, maskTy)});
     }
     if (mBitBlockWidth == 512 && fw == 64) {
         Type * maskTy = FixedVectorType::get(getInt1Ty(), fieldCount);
-        Function * compressFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx512_mask_compress, fwVectorType(fw));
+        Function * compressFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx512_mask_compress, fwVectorType(fw));
         return CreateCall(compressFunc->getFunctionType(), compressFunc, {fwCast(64, a), fwCast(64, allZeroes()), CreateBitCast(mask, maskTy)});
     }
 
     if (mBitBlockWidth == 512 && fw == 8) {
         if (hasFeature(Feature::AVX512_VBMI2)){
             Type * maskTy = FixedVectorType::get(getInt1Ty(), fieldCount);
-            Function * compressFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx512_mask_compress, fwVectorType(fw));
+            Function * compressFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx512_mask_compress, fwVectorType(fw));
             return CreateCall(compressFunc->getFunctionType(), compressFunc, {fwCast(8, a), fwCast(8, allZeroes()), CreateBitCast(mask, maskTy)});
         } else if (hasFeature(Feature::AVX512_VBMI) || hasFeature(Feature::AVX512_BW)) {
 
@@ -965,10 +969,10 @@ Value * IDISA_AVX512F_Builder::mvmd_compress(unsigned fw, Value * a, Value * sel
             // Step 2: Use PEXT instruction to select only the bixnum values for the bytes to be selected
             Function * pextFunc = nullptr;
             if (LLVM_LIKELY(fieldCount == 64)) {
-                pextFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_64);
+                pextFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_64);
             } else {
                 assert (fieldCount <= 32);
-                pextFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
+                pextFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pext_32);
                 if (LLVM_UNLIKELY(fieldCount < 32)) {
                     mask = CreateZExt(mask, getInt32Ty());
                 }
@@ -1022,7 +1026,7 @@ Value * IDISA_AVX512F_Builder::mvmd_expand(unsigned fw, Value * a, Value * selec
     bool has_avx_512_mask_expand = (fw == 32) || (fw == 64) || (hasFeature(Feature::AVX512_VBMI2) && ((fw == 16) | (fw == 8)));
     if (has_avx_512_mask_expand) {
         Type * maskTy = FixedVectorType::get(getInt1Ty(), fieldCount);
-        Function * expandFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx512_mask_expand, fwVectorType(fw));
+        Function * expandFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx512_mask_expand, fwVectorType(fw));
         return CreateCall(expandFunc->getFunctionType(), expandFunc, {fwCast(fw, a), fwCast(fw, allZeroes()), CreateBitCast(mask, maskTy)});
     } else if ((fw == 8) || (fw == 16)) {
 #ifdef MVMD_EXPAND_BY_INDUCTIVE_DOUBLING
@@ -1048,10 +1052,10 @@ Value * IDISA_AVX512F_Builder::mvmd_expand(unsigned fw, Value * a, Value * selec
 
         Function * pdepFunc = nullptr;
         if (LLVM_LIKELY(fieldCount == 64)) {
-            pdepFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64);
+            pdepFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64);
         } else {
             assert (fieldCount <= 32);
-            pdepFunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
+            pdepFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
             if (LLVM_UNLIKELY(fieldCount < 32)) {
                 mask = CreateZExt(mask, getInt32Ty());
             }
@@ -1140,11 +1144,11 @@ Value * IDISA_AVX512F_Builder::simd_popcount(unsigned fw, Value * a) {
          Constant * zeroInt32 = Constant::getNullValue(getInt32Ty());
          Value * c = simd_popcount(64, a);
          //  Should probably use _mm512_reduce_add_epi64, but not found in LLVM 3.8
-         Function * pack64_8_func = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx512_mask_pmov_qb_512);
+         Function * pack64_8_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx512_mask_pmov_qb_512);
          // popcounts of 64 bit fields will always fit in 8 bit fields.
          // We don't need the masked version of this, but the unmasked intrinsic was not found.
          c = CreateCall(pack64_8_func->getFunctionType(), pack64_8_func, {c, zero16xi8, Constant::getAllOnesValue(getInt8Ty())});
-         Function * horizSADfunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_sse2_psad_bw);
+         Function * horizSADfunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_sse2_psad_bw);
          c = CreateCall(horizSADfunc->getFunctionType(), horizSADfunc, {c, zero16xi8});
          return CreateInsertElement(allZeroes(), CreateExtractElement(c, zeroInt32), zeroInt32);
     }
@@ -1153,7 +1157,7 @@ Value * IDISA_AVX512F_Builder::simd_popcount(unsigned fw, Value * a) {
         return CreatePopcount(fwCast(fw, a));
     }
     if (hasFeature(Feature::AVX512_BW) && (fw == 64)) {
-        Function * horizSADfunc = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx512_psad_bw_512);
+        Function * horizSADfunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx512_psad_bw_512);
         return CreateCall(horizSADfunc->getFunctionType(), horizSADfunc, {fwCast(8, simd_popcount(8, a)), fwCast(8, allZeroes())});
     }
     //https://en.wikipedia.org/wiki/Hamming_weight#Efficient_implementation
@@ -1210,7 +1214,7 @@ Value * IDISA_AVX512F_Builder::esimd_mergeh(unsigned fw, Value * a, Value * b) {
         Constant * interleave_table = bit_interleave_byteshuffle_table(fw);
         // Merge the bytes.
         Value * byte_merge = esimd_mergeh(8, a, b);
-        Function * shufFn = Intrinsic::getDeclaration(getModule(),  Intrinsic::x86_avx512_pshuf_b_512);
+        Function * shufFn = Intrinsic::getOrInsertDeclaration(getModule(),  Intrinsic::x86_avx512_pshuf_b_512);
         Value * low_bits = CreateCall(shufFn->getFunctionType(), shufFn, {interleave_table, fwCast(8, simd_and(byte_merge, simd_lomask(8)))});
         Value * high_bits = simd_slli(16, CreateCall(shufFn->getFunctionType(), shufFn, {interleave_table, fwCast(8, simd_srli(8, byte_merge, 4))}), fw);
         Value * lo_move_back = simd_srli(16, low_bits, 8-fw);
@@ -1244,7 +1248,7 @@ Value * IDISA_AVX512F_Builder::esimd_mergel(unsigned fw, Value * a, Value * b) {
         Constant * interleave_table = bit_interleave_byteshuffle_table(fw);
         // Merge the bytes.
         Value * byte_merge = esimd_mergel(8, a, b);
-        Function * shufFn = Intrinsic::getDeclaration(getModule(),  Intrinsic::x86_avx512_pshuf_b_512);
+        Function * shufFn = Intrinsic::getOrInsertDeclaration(getModule(),  Intrinsic::x86_avx512_pshuf_b_512);
         Value * low_bits = CreateCall(shufFn->getFunctionType(), shufFn, {interleave_table, fwCast(8, simd_and(byte_merge, simd_lomask(8)))});
         Value * high_bits = simd_slli(16, CreateCall(shufFn->getFunctionType(), shufFn, {interleave_table, fwCast(8, simd_srli(8, byte_merge, 4))}), fw);
         Value * lo_move_back = simd_srli(16, low_bits, 8-fw);
@@ -1309,7 +1313,7 @@ Value * IDISA_AVX512F_Builder::simd_ternary(unsigned char mask, Value * a, Value
     }
 
     Constant * simd_mask = ConstantInt::get(getInt32Ty(), mask);
-    Function * ternLogicFn = Intrinsic::getDeclaration(getModule(), Intrinsic::x86_avx512_pternlog_d_512);
+    Function * ternLogicFn = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx512_pternlog_d_512);
     Value * args[4] = {fwCast(32, a), fwCast(32, b), fwCast(32, c), simd_mask};
     return bitCast(CreateCall(ternLogicFn->getFunctionType(), ternLogicFn, args));
 }

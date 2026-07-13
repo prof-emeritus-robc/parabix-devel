@@ -1,4 +1,4 @@
-﻿#include "../pipeline_compiler.hpp"
+#include "../pipeline_compiler.hpp"
 
 namespace kernel {
 
@@ -14,7 +14,7 @@ void PipelineCompiler::setActiveKernel(KernelBuilder & b, const unsigned kernelI
     if (LLVM_LIKELY(mKernel->isStateful())) {
         Value * handle = b.getScalarFieldPtr(makeKernelName(kernelId)).first;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
-            PointerType * pty = mKernel->getSharedStateType()->getPointerTo();
+            PointerType * pty = PointerType::getUnqual(b.getContext());
             handle = b.CreateAlignedLoad(pty, handle, PtrTyABIAlignment);
         }
         mKernelSharedHandle = handle;
@@ -158,11 +158,10 @@ Value * PipelineCompiler::getThreadLocalHandlePtr(KernelBuilder & b, const unsig
         handle = getScalarFieldPtr(b, prefix + KERNEL_THREAD_LOCAL_SUFFIX).first;
     }
     if (LLVM_UNLIKELY(isKernelFamilyCall(kernelIndex))) {
-        StructType * const localStateTy = kernel->getThreadLocalStateType();
         if (LLVM_UNLIKELY(CheckAssertions())) {
             b.CreateAssert(handle, "null handle load");
         }
-        handle = b.CreateAlignedLoad(localStateTy->getPointerTo(), handle, PtrTyABIAlignment);
+        handle = b.CreateAlignedLoad(PointerType::getUnqual(b.getContext()), handle, PtrTyABIAlignment);
     }
     assert (handle->getType()->isPointerTy());
     return handle;

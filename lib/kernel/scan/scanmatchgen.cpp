@@ -20,7 +20,6 @@ struct ScanWordParameters {
     unsigned width;
     unsigned indexWidth;
     Type * const Ty;
-    Type * const pointerTy;
     Constant * const WIDTH;
     Constant * const ix_MAXBIT;
     Constant * const WORDS_PER_BLOCK;
@@ -34,7 +33,6 @@ struct ScanWordParameters {
 #endif
     indexWidth(stride/width),
     Ty(b.getIntNTy(width)),
-    pointerTy(Ty->getPointerTo()),
     WIDTH(b.getSize(width)),
     ix_MAXBIT(b.getSize(indexWidth - 1)),
     WORDS_PER_BLOCK(b.getSize(b.getBitBlockWidth()/width)),
@@ -78,15 +76,12 @@ void ScanMatchKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const n
     Value * const avail = b.getAvailableItemCount("InputStream");
     Value * const initialLineStart = b.getProcessedItemCount("InputStream");
     Value * initialLineNum = nullptr;
-    Value * lineCountArrayBlockPtr = nullptr;
     Value * lineCountArrayWordPtr = nullptr;
     if (mLineNumbering) {
         initialLineNum = b.getScalarField("LineNum");
-        lineCountArrayBlockPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
+        lineCountArrayWordPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
                                                         b.getBitBlockWidth()/BITS_PER_BYTE,
                                                         sz_BLOCKS_PER_STRIDE);
-        // Bitcast the lineNumberArrayptr to access by scanWord number
-        lineCountArrayWordPtr = b.CreateBitCast(lineCountArrayBlockPtr, sw.pointerTy);
     }
     b.CreateBr(stridePrologue);
 
@@ -130,7 +125,7 @@ void ScanMatchKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const n
     if (mLineNumbering) {
         Value * breakCounts = b.hsimd_partial_sum(sw.width, b.simd_popcount(sw.width, breakBitBlock));
         breakCounts = b.simd_add(sw.width, breakCounts, baseCounts);
-        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayBlockPtr, blockNo));
+        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayWordPtr, blockNo));
         Value * baseCountsNext = b.bitCast(b.simd_fill(sw.width, b.mvmd_extract(sw.width, breakCounts, b.getBitBlockWidth()/sw.width - 1)));
         baseCounts->addIncoming(baseCountsNext, stridePrecomputation);
     }
@@ -154,9 +149,7 @@ void ScanMatchKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const n
     // We have at least one line break.   Determine the end-of-stride line start position
     // and line number, if needed.
     Value * matchWordBasePtr = b.getInputStreamBlockPtr("matchResult", sz_ZERO, strideBlockOffset);
-    matchWordBasePtr = b.CreatePointerCast(matchWordBasePtr, sw.pointerTy);
     Value * breakWordBasePtr = b.getInputStreamBlockPtr("lineBreak", sz_ZERO, strideBlockOffset);
-    breakWordBasePtr = b.CreatePointerCast(breakWordBasePtr, sw.pointerTy);
 
     Value * finalBreakIdx = b.CreateSub(sz_MAXBIT, b.CreateCountReverseZeroes(breakMask), "finalBreakIdx");
     Value * finalBreakWord = b.CreateZExtOrTrunc(b.CreateLoad(sw.Ty, b.CreateGEP(sw.Ty, breakWordBasePtr, finalBreakIdx)), sizeTy);
@@ -353,15 +346,12 @@ void ScanBatchKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const n
     Value * maxFileNum = b.CreateSub(fileCount, b.getSize(1));
     Value * const initialLineStart = b.getProcessedItemCount("InputStream");
     Value * initialLineNum = nullptr;
-    Value * lineCountArrayBlockPtr = nullptr;
     Value * lineCountArrayWordPtr = nullptr;
     if (mLineNumbering) {
         initialLineNum = b.getScalarField("LineNum");
-        lineCountArrayBlockPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
+        lineCountArrayWordPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
                                                         b.getBitBlockWidth()/BITS_PER_BYTE,
                                                         sz_BLOCKS_PER_STRIDE);
-        // Bitcast the lineNumberArrayptr to access by scanWord number
-        lineCountArrayWordPtr = b.CreateBitCast(lineCountArrayBlockPtr, sw.pointerTy);
     }
     b.CreateBr(stridePrologue);
 
@@ -379,9 +369,7 @@ void ScanBatchKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const n
     Value * stridePos = b.CreateAdd(initialPos, b.CreateMul(strideNo, sz_STRIDE));
     Value * strideBlockOffset = b.CreateMul(strideNo, sz_BLOCKS_PER_STRIDE);
     Value * matchWordBasePtr = b.getInputStreamBlockPtr("matchResult", sz_ZERO, strideBlockOffset);
-    matchWordBasePtr = b.CreatePointerCast(matchWordBasePtr, sw.pointerTy);
     Value * breakWordBasePtr = b.getInputStreamBlockPtr("lineBreak", sz_ZERO, strideBlockOffset);
-    breakWordBasePtr = b.CreatePointerCast(breakWordBasePtr, sw.pointerTy);
     Value * nextStrideNo = b.CreateAdd(strideNo, sz_ONE);
     Value * batchFileNum = b.getScalarField("batchFileNum");
     Value * inFinalFile = b.CreateICmpEQ(batchFileNum, maxFileNum);
@@ -416,7 +404,7 @@ void ScanBatchKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const n
     if (mLineNumbering) {
         Value * breakCounts = b.hsimd_partial_sum(sw.width, b.simd_popcount(sw.width, breakBitBlock));
         breakCounts = b.simd_add(sw.width, breakCounts, baseCounts);
-        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayBlockPtr, blockNo));
+        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayWordPtr, blockNo));
         Value * baseCountsNext = b.bitCast(b.simd_fill(sw.width, b.mvmd_extract(sw.width, breakCounts, b.getBitBlockWidth()/sw.width - 1)));
         baseCounts->addIncoming(baseCountsNext, stridePrecomputation);
     }
@@ -727,15 +715,12 @@ void MatchCoordinatesKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
     Value * const initialPos = b.getProcessedItemCount("matchResult");
     Value * const initialLineStart = b.getScalarField("LineStart");
     Value * initialLineNum = nullptr;
-    Value * lineCountArrayBlockPtr = nullptr;
     Value * lineCountArrayWordPtr = nullptr;
     if (mLineNumbering) {
         initialLineNum = b.getScalarField("LineNum");
-        lineCountArrayBlockPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
+        lineCountArrayWordPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
                                                         b.getBitBlockWidth()/BITS_PER_BYTE,
                                                         sz_BLOCKS_PER_STRIDE);
-        // Bitcast the lineNumberArrayptr to access by scanWord number
-        lineCountArrayWordPtr = b.CreateBitCast(lineCountArrayBlockPtr, sw.pointerTy);
     }
     Value * const initialMatchCount = b.getProducedItemCount("Coordinates");
     b.CreateBr(stridePrologue);
@@ -779,7 +764,7 @@ void MatchCoordinatesKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
     if (mLineNumbering) {
         Value * breakCounts = b.hsimd_partial_sum(sw.width, b.simd_popcount(sw.width, breakBitBlock));
         breakCounts = b.simd_add(sw.width, breakCounts, baseCounts);
-        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayBlockPtr, blockNo));
+        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayWordPtr, blockNo));
         Value * baseCountsNext = b.bitCast(b.simd_fill(sw.width, b.mvmd_extract(sw.width, breakCounts, b.getBitBlockWidth()/sw.width - 1)));
         baseCounts->addIncoming(baseCountsNext, stridePrecomputation);
     }
@@ -802,9 +787,7 @@ void MatchCoordinatesKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
     // We have at least one line break.   Determine the end-of-stride line start position
     // and line number, if needed.
     Value * matchWordBasePtr = b.getInputStreamBlockPtr("matchResult", sz_ZERO, strideBlockOffset);
-    matchWordBasePtr = b.CreateBitCast(matchWordBasePtr, sw.pointerTy);
     Value * breakWordBasePtr = b.getInputStreamBlockPtr("lineBreak", sz_ZERO, strideBlockOffset);
-    breakWordBasePtr = b.CreateBitCast(breakWordBasePtr, sw.pointerTy);
 
     Value * finalBreakIdx = b.CreateSub(sz_MAXBIT, b.CreateCountReverseZeroes(breakMask), "finalBreakIdx");
     Value * finalBreakWord = b.CreateZExtOrTrunc(b.CreateLoad(sw.Ty, b.CreateGEP(sw.Ty, breakWordBasePtr, finalBreakIdx)), sizeTy);
@@ -958,15 +941,12 @@ void BatchCoordinatesKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
     Value * const accumulator = b.getScalarField("accumulator_address");
     Value * maxFileNum = b.CreateSub(b.CreateCall(getFileCount->getFunctionType(), getFileCount, {accumulator}), b.getSize(1));
     Value * initialLineNum = nullptr;
-    Value * lineCountArrayBlockPtr = nullptr;
     Value * lineCountArrayWordPtr = nullptr;
     if (mLineNumbering) {
         initialLineNum = b.getScalarField("pendingLineNum");
-        lineCountArrayBlockPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
+        lineCountArrayWordPtr = b.CreateAlignedAllocaAtEntryPoint(blockTy,
                                                         b.getBitBlockWidth()/BITS_PER_BYTE,
                                                         sz_BLOCKS_PER_STRIDE);
-        // Bitcast the lineNumberArrayptr to access by scanWord number
-        lineCountArrayWordPtr = b.CreateBitCast(lineCountArrayBlockPtr, sw.pointerTy);
     }
     Value * const initialMatchCount = b.getProducedItemCount("Coordinates");
     b.CreateBr(stridePrologue);
@@ -985,9 +965,7 @@ void BatchCoordinatesKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
     Value * stridePos = b.CreateAdd(initialPos, b.CreateMul(strideNo, sz_STRIDE));
     Value * strideBlockOffset = b.CreateMul(strideNo, sz_BLOCKS_PER_STRIDE);
     Value * matchWordBasePtr = b.getInputStreamBlockPtr("matchResult", sz_ZERO, strideBlockOffset);
-    matchWordBasePtr = b.CreatePointerCast(matchWordBasePtr, sw.pointerTy);
     Value * breakWordBasePtr = b.getInputStreamBlockPtr("lineBreak", sz_ZERO, strideBlockOffset);
-    breakWordBasePtr = b.CreatePointerCast(breakWordBasePtr, sw.pointerTy);
     Value * nextStrideNo = b.CreateAdd(strideNo, sz_ONE);
     Value * batchFileNum = b.getScalarField("batchFileNum");
     Value * inFinalFile = b.CreateICmpEQ(batchFileNum, maxFileNum);
@@ -1022,7 +1000,7 @@ void BatchCoordinatesKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
     if (mLineNumbering) {
         Value * breakCounts = b.hsimd_partial_sum(sw.width, b.simd_popcount(sw.width, breakBitBlock));
         breakCounts = b.simd_add(sw.width, breakCounts, baseCounts);
-        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayBlockPtr, blockNo));
+        b.CreateBlockAlignedStore(b.bitCast(breakCounts), b.CreateGEP(blockTy, lineCountArrayWordPtr, blockNo));
         Value * baseCountsNext = b.bitCast(b.simd_fill(sw.width, b.mvmd_extract(sw.width, breakCounts, b.getBitBlockWidth()/sw.width - 1)));
         baseCounts->addIncoming(baseCountsNext, stridePrecomputation);
     }
@@ -1429,9 +1407,7 @@ void MatchFilterKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
 
     b.SetInsertPoint(strideMatchProcessing);
     Value * matchWordBasePtr = b.getInputStreamBlockPtr("matchStarts", sz_ZERO, strideBlockOffset);
-    matchWordBasePtr = b.CreateBitCast(matchWordBasePtr, sw.pointerTy);
     Value * breakWordBasePtr = b.getInputStreamBlockPtr("lineBreak", sz_ZERO, strideBlockOffset);
-    breakWordBasePtr = b.CreateBitCast(breakWordBasePtr, sw.pointerTy);
 
     // Do we have a pending matched line continuing from the previous stride?
     b.CreateUnlikelyCondBr(b.CreateIsNotNull(pendingMatchPhi), pendingMatchProcessing, strideMatchLoop);
@@ -1509,7 +1485,6 @@ void MatchFilterKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
 
     b.SetInsertPoint(writeLF);
     Value * finalBytePtr = b.getRawOutputPointer("Output", b.CreateSub(producedPos1, sz_ONE));
-    finalBytePtr = b.CreateBitCast(finalBytePtr, b.getInt8PtrTy());
     b.CreateStore(b.getInt8(0x0A), finalBytePtr);
     b.CreateBr(strideInitialDone);
 

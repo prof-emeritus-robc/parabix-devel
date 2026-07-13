@@ -20,7 +20,6 @@ SingleStreamScanKernelTemplate::ScanWordContext::ScanWordContext(LLVMTypeSystemI
 , wordsPerStride(strideMaskWidth)
 , fieldWidth(width)
 , Ty(ts.getIntNTy(width))
-, PointerTy(Ty->getPointerTo())
 , StrideMaskTy(ts.getIntNTy(strideMaskWidth))
 , WIDTH(ts.getSize(width))
 , WORDS_PER_BLOCK(ts.getSize(wordsPerBlock))
@@ -90,7 +89,7 @@ void SingleStreamScanKernelTemplate::generateMultiBlockLogic(KernelBuilder & b, 
     Value * const blockNumOfWord = b.CreateUDiv(wordOffset, mSW.WORDS_PER_BLOCK);
     Value * const blockOffset = b.CreateURem(wordOffset, mSW.WORDS_PER_BLOCK);
     Value * const processingBlockIndex = b.CreateAdd(strideOffset, blockNumOfWord);
-    Value * const stridePtr = b.CreateBitCast(b.getInputStreamBlockPtr("scan", b.getInt32(0), processingBlockIndex), mSW.PointerTy);
+    Value * const stridePtr = b.getInputStreamBlockPtr("scan", b.getInt32(0), processingBlockIndex);
     Value * const wordPtr = b.CreateGEP(mSW.Ty, stridePtr, blockOffset);
     Value * const word = b.CreateLoad(mSW.Ty, wordPtr);
     willProcessWord(b, word);
@@ -270,7 +269,6 @@ void TwoLevelScanKernel::strideLogic(KernelBuilder & b,
     std::vector<Value *> indexWord(streamCount);
     for (unsigned i = 0; i < streamCount; i++) {
         Value * base_ptr = b.getInputStreamBlockPtr(mScanStreamName, b.getSize(i), scanWordBlock);
-        base_ptr = b.CreatePointerCast(base_ptr, scanWordTy->getPointerTo());
         indexWord[i] = b.CreateLoad(scanWordTy, b.CreateGEP(scanWordTy, base_ptr, wordPosInBlock));
         if (i == 0) {
             scanWord = indexWord[i];

@@ -9,6 +9,7 @@
 #include <pablo/codegenstate.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <pablo/branch.h>
 #include <pablo/pablo_intrinsic.h>
@@ -347,13 +348,8 @@ void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const e
     }
 
     if (LLVM_UNLIKELY(mCarryInfo->nonCarryCollapsingMode())) {
-
         assert (mCarryInfo->getNestedCarryStateType());
-
-        DataLayout DL(b.getModule());
-
         IntegerType * const sizeTy = b.getSizeTy();
-
         ConstantInt * const ZERO = b.getSize(0);
 
         NonCarryCollapsingFrame & frame = mNonCarryCollapsingModeStack.back();
@@ -407,9 +403,8 @@ void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const e
         Value * newCarryStateArray = b.CreatePageAlignedMalloc(newCapacitySize);
         b.CreateMemCpy(newCarryStateArray, carryStateArray, capacitySize, b.getCacheAlignment());
         b.CreateFree(carryStateArray);
-        Value * const startNewArrayPtr = b.CreateGEP(b.getInt8Ty(), b.CreatePointerCast(newCarryStateArray, b.getInt8PtrTy()), capacitySize);
+        Value * const startNewArrayPtr = b.CreateGEP(b.getInt8Ty(), newCarryStateArray, capacitySize);
         b.CreateMemZero(startNewArrayPtr, capacitySize, blockSize);
-        newCarryStateArray = b.CreatePointerCast(newCarryStateArray, nestedCarryPtrTy);
         b.CreateStore(newCarryStateArray, carryStateArrayPtr);
         b.CreateBr(resumeKernel);
 
@@ -418,10 +413,14 @@ void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const e
         Constant * const initialCarryStateCapacity = b.getSize(8); // 2^3
         b.CreateStore(initialCarryStateCapacity, capacityPtr);
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(19, 0, 0)
         Constant * const initialCapacitySize = ConstantExpr::getMul(initialCarryStateCapacity, carryStateTySize);
+#else
+        Constant * const initialCapacitySize = ConstantFoldBinaryOpOperands(
+            Instruction::Mul, initialCarryStateCapacity, carryStateTySize, b.getModule()->getDataLayout());
+#endif
         Value * initialArray = b.CreatePageAlignedMalloc(initialCapacitySize);
         b.CreateMemZero(initialArray, initialCapacitySize, blockSize);
-        initialArray = b.CreatePointerCast(initialArray, nestedCarryPtrTy);
         b.CreateStore(initialArray, carryStateArrayPtr);
         b.CreateBr(resumeKernel);
 
@@ -438,7 +437,6 @@ void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const e
 
         mCurrentFrame = b.CreateGEP(nestedCarryTy, updatedCarryStateArrayPhi, indexPhi);
         assert (mCurrentFrameType->getStructElementType(NestedCarryState)->isPointerTy());
-        assert (nestedCarryTy->getPointerTo() == mCurrentFrameType->getStructElementType(NestedCarryState));
         mCurrentFrameType = nestedCarryTy;
         mCurrentFrameIndex = 0;
 
@@ -1231,7 +1229,7 @@ StructType * CarryManager::analyse(kernel::KernelBuilder & b, const PabloBlock *
         FixedArray<Type *, 3> fields;
         fields[NestedCapacity] = b.getSizeTy();
         fields[LastIncomingCarryLoopIteration] = b.getSizeTy();
-        fields[NestedCarryState] = carryState->getPointerTo();
+        fields[NestedCarryState] = PointerType::getUnqual(b.getContext());
         carryState = StructType::get(b.getContext(), fields);
         assert (isDynamicallyAllocatedType(carryState));
     }

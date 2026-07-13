@@ -31,7 +31,6 @@ void StdOutKernel::generateDoSegmentMethod(KernelBuilder & b) {
     Value * codeUnitBuffer = b.getRawInputPointer("codeUnitBuffer", bytesDone);
     Value * bytesToDo = b.getAccessibleItemCount("codeUnitBuffer");
     if (mCodeUnitWidth != 8) {
-        codeUnitBuffer = b.CreatePointerCast(codeUnitBuffer, b.getInt8PtrTy());
         if (LLVM_UNLIKELY(mCodeUnitWidth > 8)) {
             bytesToDo = b.CreateMul(bytesToDo, b.getSize(mCodeUnitWidth / 8));
         } else if (LLVM_UNLIKELY(mCodeUnitWidth < 8)) {
@@ -79,7 +78,7 @@ void FileSink::generateInitializeMethod(KernelBuilder & b) {
     b.SetInsertPoint(nonEmptyFileName);
     // Make a temporary file name template with the characters "XXXXXX" appended as required by mkstemp.
     Constant * suffixPlusNullLength = b.getSize(7);
-    Value * const temporaryFileName = b.CreatePointerCast(b.CreateMalloc(b.CreateAdd(fileNameLength, suffixPlusNullLength)), b.getInt8PtrTy());
+    Value * const temporaryFileName = b.CreateMalloc(b.CreateAdd(fileNameLength, suffixPlusNullLength));
     b.CreateMemCpy(temporaryFileName, fileName, fileNameLength, 1);
     #ifdef BACKUP_OLDFILE
     b.CreateMemCpy(b.CreateGEP0(tmpFileNamePtr, fileNameLength), b.GetString(".saved"), suffixPlusNullLength, 1);
@@ -124,7 +123,6 @@ void FileSink::generateDoSegmentMethod(KernelBuilder & b) {
     Value * codeUnitBuffer = b.getRawInputPointer("codeUnitBuffer", bytesDone);
     Value * bytesToDo = b.getAccessibleItemCount("codeUnitBuffer");
     if (mCodeUnitWidth != 8) {
-        codeUnitBuffer = b.CreatePointerCast(codeUnitBuffer, b.getInt8PtrTy());
         if (LLVM_UNLIKELY(mCodeUnitWidth > 8)) {
             bytesToDo = b.CreateMul(bytesToDo, b.getSize(mCodeUnitWidth / 8));
         } else if (LLVM_UNLIKELY(mCodeUnitWidth < 8)) {

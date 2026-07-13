@@ -36,7 +36,6 @@ protected:
         const unsigned fieldWidth;
 
         llvm::Type * const Ty;
-        llvm::Type * const PointerTy;
         llvm::Type * const StrideMaskTy;
 
         llvm::Constant * const WIDTH;

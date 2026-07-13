@@ -17,6 +17,7 @@ namespace kernel { class KernelBuilder; }
 namespace kernel { class PipelineAnalysis; }
 namespace kernel { class PipelineBuilder; }
 namespace kernel { class ProgramBuilder; }
+namespace llvm { class TargetMachine; }
 namespace kernel {template<typename ... Args> class TypedProgramBuilder; }
 
 class CBuilder;
@@ -61,6 +62,10 @@ public:
 
     unsigned getBitBlockWidth() const final;
 
+    llvm::TargetMachine * getTargetMachine() {
+        return mTarget.get();
+    }
+
 protected:
 
     kernel::StreamSet * CreateStreamSet(const unsigned NumElements = 1, const unsigned FieldWidth = 1) noexcept;
@@ -99,6 +104,7 @@ protected:
 protected:
 
     std::unique_ptr<llvm::LLVMContext>                      mContext;
+    std::unique_ptr<llvm::TargetMachine>                    mTarget;
     llvm::Module * const                                    mMainModule;
     std::unique_ptr<kernel::KernelBuilder>                  mBuilder;
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;

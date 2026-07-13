@@ -180,6 +180,7 @@ ArrayType * BaseDriver::getStreamSetTy(const unsigned NumElements, const unsigne
  ** ------------------------------------------------------------------------------------------------------------- */
 BaseDriver::BaseDriver(std::string && moduleName)
 : mContext(new LLVMContext())
+, mTarget(nullptr)
 , mMainModule(new Module(moduleName, *mContext))
 , mBuilder(nullptr)
 , mObjectCache(nullptr) {

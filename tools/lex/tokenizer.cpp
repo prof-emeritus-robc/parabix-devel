@@ -147,6 +147,13 @@ static cl::opt<bool> OutputStrings(
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
+static cl::opt<unsigned> MergesLimit(
+    "merges-limit",
+    cl::desc("BPE mode: use only the first N merges by rank (0 = all). "
+             "Fewer merges = smaller kernels = faster JIT, for size sweeps."),
+    cl::init(0),
+    cl::cat(wordBreakerFlags));
+
 using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 // writeToStdout — convert 8x1 parallel basis bits to serial bytes and write
@@ -311,11 +318,11 @@ int main(int argc, char *argv[]) {
     if (!VocabFile.empty() || !MergesFile.empty()) {
         BPETokenizer bpe;
         // Optional explicit vocab.json (legacy / id cross-check).
-        if (!VocabFile.empty() && !bpe.loadVocab(VocabFile))
+        if (!VocabFile.empty() && !bpe.loadVocab(VocabFile, MergesLimit))
             return 1;
         // --merges: build the priority ranges from merge rank (lower rank wins).
         // Seeds the base alphabet for the single-byte fallback + --strings decode.
-        if (!MergesFile.empty() && !bpe.loadMerges(MergesFile))
+        if (!MergesFile.empty() && !bpe.loadMerges(MergesFile, MergesLimit))
             return 1;
         if (!bpe.isLoaded()) {
             std::cerr << "BPE: no tokens loaded from --vocab/--merges\n";

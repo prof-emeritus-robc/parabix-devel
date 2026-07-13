@@ -41,7 +41,9 @@ struct MergeRuleGroup {
 
 class BPETokenizer {
 public:
-    bool loadVocab(const std::string & path);
+    // `limit` (0 = all) caps the number of merges read to the first N by rank —
+    // fewer rules = smaller kernels = faster JIT, for size sweeps / smoke tests.
+    bool loadVocab(const std::string & path, unsigned limit = 0);
 
     // loadMerges reads a HuggingFace merges.txt. Each non-header line "A B"
     // defines a merge producing token AB (concat of the two already-formed
@@ -49,7 +51,8 @@ public:
     // RANK = priority (lower rank wins). In GPT-2 the merged token's vocab id
     // == 256 + rank exactly, so we store id = 256 + rank and the rank-ordered
     // partition matches the vocab-id partition for length>=2 tokens.
-    bool loadMerges(const std::string & path);
+    // `limit` (0 = all) keeps only the first N merges by rank.
+    bool loadMerges(const std::string & path, unsigned limit = 0);
 
     bool   isLoaded()  const { return !vocab_.empty(); }
     bool   hasMerges() const { return !merges_.empty(); }

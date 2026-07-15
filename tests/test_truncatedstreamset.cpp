@@ -90,8 +90,9 @@ void CopyKernel::generateDoSegmentMethod(KernelBuilder & b) {
     Value * const toCopy = b.CreateSelect(needsPartialCopy, blockIndex, b.getNumOfStrides());
     Value * const endInputPtr = b.getInputStreamBlockPtr("input", sz_ZERO, toCopy);
 
-    DataLayout dl(b.getModule());
-    Type * const intPtrTy = dl.getIntPtrType(b.getContext());
+    auto & DL = b.getModule()->getDataLayout();
+
+    Type * const intPtrTy = DL.getIntPtrType(b.getContext());
     Value * const inputPtrInt = b.CreatePtrToInt(inputPtr, intPtrTy);
     Value * const endInputPtrInt = b.CreatePtrToInt(endInputPtr, intPtrTy);
     Value * const numBytes = b.CreateSub(endInputPtrInt, inputPtrInt);

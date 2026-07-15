@@ -500,7 +500,6 @@ protected:
     llvm::Module *                  mModule;
     unsigned                        mCacheLineAlignment;
     llvm::IntegerType * const       mSizeType;
-    llvm::StructType *              mFILEtype;
     BaseDriver *                    mDriver;
     llvm::LLVMContext               mContext;
     const std::string               mTriple;

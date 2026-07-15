@@ -67,7 +67,6 @@ void UntilNkernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * cons
         b.CreateCondBr(b.CreateICmpULT(observedSoFar, N), strideLoop, memZeroSegment);
         b.SetInsertPoint(memZeroSegment);
         Value * outputPtr = b.getOutputStreamBlockPtr("uptoN", ZERO, ZERO);
-        outputPtr = b.CreatePointerCast(outputPtr, b.getInt8PtrTy());
         Value * bytesToZero = b.CreateMul(numOfBlocks, BLOCK_BYTES);
         b.CreateMemZero(outputPtr, bytesToZero, /* alignment = */ b.getBitBlockWidth()/8);
         b.CreateBr(segmentDone);
@@ -196,7 +195,6 @@ void UntilNkernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * cons
 
         b.SetInsertPoint(memZeroRemaining);
         Value * outputPtr = b.getOutputStreamBlockPtr("uptoN", ZERO, nextBlk);
-        outputPtr = b.CreatePointerCast(outputPtr, b.getInt8PtrTy());
         Value * bytesToZero = b.CreateMul(b.CreateSub(numOfBlocks, nextBlk), BLOCK_BYTES);
         b.CreateMemZero(outputPtr, bytesToZero, /* alignment = */ b.getBitBlockWidth()/8);
     }

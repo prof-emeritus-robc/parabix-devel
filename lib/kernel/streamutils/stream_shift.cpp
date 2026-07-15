@@ -76,7 +76,6 @@ struct ScanWordParameters {
     unsigned width;
     unsigned indexWidth;
     Type * const Ty;
-    Type * const pointerTy;
     Constant * const WIDTH;
     Constant * const ix_MAXBIT;
     Constant * const WORDS_PER_BLOCK;
@@ -90,7 +89,6 @@ struct ScanWordParameters {
 #endif
     indexWidth(stride/width),
     Ty(b.getIntNTy(width)),
-    pointerTy(Ty->getPointerTo()),
     WIDTH(b.getSize(width)),
     ix_MAXBIT(b.getSize(indexWidth - 1)),
     WORDS_PER_BLOCK(b.getSize(b.getBitBlockWidth()/width)),
@@ -279,8 +277,7 @@ void IndexedShiftBack::generateMultiBlockLogic(KernelBuilder & b, Value * const 
 
     b.SetInsertPoint(strideFinalize);
     //  Determining the producedItemCount == the position prior to the last index bit
-    Value * const indexStreamPtr = b.getInputStreamBlockPtr("indexStream", sz_ZERO, strideBlockOffset);
-    Value * const indexWordBasePtr = b.CreateBitCast(indexStreamPtr, sw.pointerTy);
+    Value * const indexWordBasePtr = b.getInputStreamBlockPtr("indexStream", sz_ZERO, strideBlockOffset);
     //
     // Make sure that we are counting zeroes confined to the index width.
     Value * emptyWordsAtEnd = b.CreateCountReverseZeroes(b.CreateTrunc(indexMask, b.getIntNTy(sw.indexWidth)));

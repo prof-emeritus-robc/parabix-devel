@@ -73,7 +73,7 @@ Scalar * BaseDriver::CreateCommandLineScalar(CommandLineScalarType type) noexcep
 
         #ifdef ENABLE_PAPI
         case CommandLineScalarType::PAPIEventList:
-            scalarTy = mBuilder->getInt32Ty()->getPointerTo(); break;
+            scalarTy = PointerType::getUnqual(mBuilder->getContext()); break;
         #endif
         case CommandLineScalarType::ParabixIllustratorObject:
             scalarTy = mBuilder->getVoidPtrTy(); break;

@@ -56,6 +56,14 @@ constexpr static auto STATE_TYPE_METADATA_SUFFIX = "_state_types";
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
 
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
+#define addNoCaptureAttr(arg) \
+            arg->addAttr(llvm::Attribute::get(b.getContext(), llvm::Attribute::NoCapture))
+#else
+#define addNoCaptureAttr(arg) \
+            arg->addAttr(llvm::Attribute::getWithCaptureInfo(b.getContext(), llvm::CaptureInfo::none()))
+#endif
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief isLocalBuffer
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -306,7 +314,7 @@ void Kernel::linkExternalMethods(KernelBuilder & b) {
         params[8] = int8Ty; // illustrator type
         params[9] = int8Ty; // replacement 0
         params[10] = int8Ty; // replacement 1
-        params[11] = sizeTy->getPointerTo(); // loopId array
+        params[11] = PointerType::getUnqual(b.getContext()); // loopId array
         FunctionType * regFunc = FunctionType::get(voidTy, params, false);
         driver.addLinkFunction(m, KERNEL_REGISTER_ILLUSTRATOR_CALLBACK, regFunc, (void*)&illustratorRegisterCapturedData);
         END_SCOPED_REGION
@@ -628,7 +636,7 @@ Function * Kernel::addInitializeDeclaration(KernelBuilder & b) const {
         }
 
         if (LLVM_LIKELY(isStateful())) {
-            params.push_back(getSharedStateType()->getPointerTo());
+            params.push_back(PointerType::getUnqual(b.getContext()));
         }
         for (const Binding & binding : mInputScalars) {
             params.push_back(binding.getType());
@@ -655,7 +663,7 @@ Function * Kernel::addInitializeDeclaration(KernelBuilder & b) const {
         }
 
         if (LLVM_LIKELY(isStateful())) {
-            arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+            addNoCaptureAttr(arg);
             setNextArgName("shared");
         }
         for (const Binding & binding : mInputScalars) {
@@ -689,7 +697,7 @@ Function * Kernel::addExpectedOutputSizeDeclaration(KernelBuilder & b) const {
     if (LLVM_LIKELY(func == nullptr)) {
         SmallVector<Type *, 1> params;
         if (LLVM_LIKELY(isStateful())) {
-            params.push_back(getSharedStateType()->getPointerTo());
+            params.push_back(PointerType::getUnqual(b.getContext()));
         }
         FunctionType * const funcType = FunctionType::get(b.getSizeTy(), params, false);
         func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
@@ -703,7 +711,7 @@ Function * Kernel::addExpectedOutputSizeDeclaration(KernelBuilder & b) const {
             std::advance(arg, 1);
         };
         if (LLVM_LIKELY(isStateful())) {
-            arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+            addNoCaptureAttr(arg);
             setNextArgName("shared");
         }
     }
@@ -746,10 +754,10 @@ Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b) const 
         if (LLVM_LIKELY(func == nullptr)) {
             SmallVector<Type *, 2> params;
             if (LLVM_LIKELY(isStateful())) {
-                params.push_back(getSharedStateType()->getPointerTo());
+                params.push_back(PointerType::getUnqual(b.getContext()));
             }
-            params.push_back(getThreadLocalStateType()->getPointerTo());
-            PointerType * const retTy = getThreadLocalStateType()->getPointerTo();
+            params.push_back(PointerType::getUnqual(b.getContext()));
+            PointerType * const retTy = PointerType::getUnqual(b.getContext());
             FunctionType * const funcType = FunctionType::get(retTy, params, false);
             func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
             func->setCallingConv(CallingConv::C);
@@ -765,10 +773,10 @@ Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b) const 
                 std::advance(arg, 1);
             };
             if (LLVM_LIKELY(isStateful())) {
-                arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+                addNoCaptureAttr(arg);
                 setNextArgName("shared");
             }
-            arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+            addNoCaptureAttr(arg);
             setNextArgName("threadlocal");
             assert (arg == func->arg_end());
         }
@@ -805,7 +813,7 @@ Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder 
 
             SmallVector<Type *, 6> params;
             if (LLVM_LIKELY(isStateful())) {
-                params.push_back(getSharedStateType()->getPointerTo());
+                params.push_back(PointerType::getUnqual(b.getContext()));
             }
             params.push_back(b.getSizeTy());
             const auto tdb = (getKernelFlags() & KernelFlags::HasInternallyManagedStreamSet) && codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers);
@@ -829,7 +837,7 @@ Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder 
                 std::advance(arg, 1);
             };
             if (LLVM_LIKELY(isStateful())) {
-                arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+                addNoCaptureAttr(arg);
                 setNextArgName("shared");
             }
             setNextArgName("expectedNumOfStrides");
@@ -885,9 +893,9 @@ Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBui
 
             SmallVector<Type *, 3> params;
             if (LLVM_LIKELY(isStateful())) {
-                params.push_back(getSharedStateType()->getPointerTo());
+                params.push_back(PointerType::getUnqual(b.getContext()));
             }
-            params.push_back(getThreadLocalStateType()->getPointerTo());
+            params.push_back(PointerType::getUnqual(b.getContext()));
             params.push_back(b.getSizeTy());
             FunctionType * const funcType = FunctionType::get(b.getVoidTy(), params, false);
             func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
@@ -904,7 +912,7 @@ Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBui
                 std::advance(arg, 1);
             };
             if (LLVM_LIKELY(isStateful())) {
-                arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+                addNoCaptureAttr(arg);
                 setNextArgName("shared");
             }
             setNextArgName("threadLocal");
@@ -933,17 +941,17 @@ std::vector<Type *> Kernel::getDoSegmentFields(KernelBuilder & b) const {
     // PipelineCompiler::buildKernelCallArgumentList and PipelineKernel::addOrDeclareMainFunction
 
     IntegerType * const sizeTy = b.getSizeTy();
-    PointerType * const sizePtrTy = sizeTy->getPointerTo();
+    PointerType * const sizePtrTy = PointerType::getUnqual(b.getContext());
     const auto n = mInputStreamSets.size();
     const auto m = mOutputStreamSets.size();
 
     std::vector<Type *> fields;
     fields.reserve(4 + 3 * (n + m));
     if (LLVM_LIKELY(isStateful())) {
-        fields.push_back(getSharedStateType()->getPointerTo());  // handle
+        fields.push_back(PointerType::getUnqual(b.getContext()));  // handle
     }
     if (LLVM_UNLIKELY(hasThreadLocal())) {
-        fields.push_back(getThreadLocalStateType()->getPointerTo());  // handle
+        fields.push_back(PointerType::getUnqual(b.getContext()));  // handle
     }
     const auto internallySynchronized = hasAttribute(AttrId::InternallySynchronized);
     const auto isPipeline = (getTypeId() == TypeId::Pipeline);
@@ -1003,7 +1011,7 @@ std::vector<Type *> Kernel::getDoSegmentFields(KernelBuilder & b) const {
         if (LLVM_UNLIKELY(isLocal.isShared())) {
             fields.push_back(voidPtrTy);
         } else if (LLVM_UNLIKELY(isMainPipeline || isLocal.any())) {
-            fields.push_back(voidPtrTy->getPointerTo());
+            fields.push_back(PointerType::getUnqual(b.getContext()));
         } else {
             fields.push_back(voidPtrTy);
         }
@@ -1079,11 +1087,11 @@ Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b) const {
             std::advance(arg, 1);
         };
         if (LLVM_LIKELY(isStateful())) {
-            arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+            addNoCaptureAttr(arg);
             setNextArgName("shared");
         }
         if (LLVM_UNLIKELY(hasThreadLocal())) {
-            arg->addAttr(llvm::Attribute::AttrKind::NoCapture);
+            addNoCaptureAttr(arg);
             setNextArgName("threadLocal");
         }
 
@@ -1200,9 +1208,9 @@ Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b) const {
         if (LLVM_LIKELY(func == nullptr)) {
             SmallVector<Type *, 2> params;
             if (LLVM_LIKELY(isStateful())) {
-                params.push_back(getSharedStateType()->getPointerTo());
+                params.push_back(PointerType::getUnqual(b.getContext()));
             }
-            PointerType * const threadLocalPtrTy = getThreadLocalStateType()->getPointerTo();
+            PointerType * const threadLocalPtrTy = PointerType::getUnqual(b.getContext());
             params.push_back(threadLocalPtrTy);
             params.push_back(threadLocalPtrTy);
             FunctionType * const funcType = FunctionType::get(b.getVoidTy(), params, false);
@@ -1270,10 +1278,10 @@ Function * Kernel::addFinalizeDeclaration(KernelBuilder & b) const {
         }
         std::vector<Type *> params;
         if (LLVM_LIKELY(isStateful())) {
-            params.push_back(getSharedStateType()->getPointerTo());
+            params.push_back(PointerType::getUnqual(b.getContext()));
         }
         if (LLVM_LIKELY(hasThreadLocal())) {
-            params.push_back(getThreadLocalStateType()->getPointerTo());
+            params.push_back(PointerType::getUnqual(b.getContext()));
         }
         FunctionType * const terminateType = FunctionType::get(resultType, params, false);
         terminateFunc = Function::Create(terminateType, GlobalValue::ExternalLinkage, funcName, m);
@@ -1313,7 +1321,7 @@ Value * Kernel::createInstance(KernelBuilder & b) const {
         Value * const stateObj = b.CreatePageAlignedMalloc(stateTySize);
         const auto align = DL.getABITypeAlign(stateTy).value();
         b.CreateMemZero(stateObj, stateTySize, align);
-        return b.CreatePointerCast(stateObj, stateTy->getPointerTo());
+        return stateObj;
     }
     llvm_unreachable("createInstance should not be called on stateless kernels");
     return nullptr;
@@ -1434,7 +1442,7 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
         if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
             b.CreateAssert(ptr, "constructFamilyKernels cannot pass a null value to pipeline");
         }
-        hostArgs.push_back(b.CreatePointerCast(ptr, voidPtrTy));
+        hostArgs.push_back(ptr);
     };
 
     auto addHostVoidArg = [&]() {

@@ -1,4 +1,4 @@
-﻿#if 1 // def ENABLE_PAPI
+#if 1 // def ENABLE_PAPI
 
 #include "../pipeline_compiler.hpp"
 #include <papi.h>
@@ -97,8 +97,7 @@ void PipelineCompiler::readPAPIMeasurement(KernelBuilder & b, Value * const meas
     Function * const PAPIReadFn = m->getFunction("PAPI_read"); assert (PAPIReadFn);
     FixedArray<Value *, 2> args;
     args[0] = PAPIEventSetId; assert (PAPIEventSetId);
-    PointerType * const papiCounterPtrTy = TypeBuilder<papi_counter_t, false>::get(b.getContext())->getPointerTo();
-    args[1] = b.CreatePointerCast(measurementArray, papiCounterPtrTy); assert (measurementArray);
+    args[1] = measurementArray; assert (measurementArray);
     // TODO: should probably check the error code here but if we do get an error,
     // what can we avoid contaminating the results but also inform the user something
     // went wrong?
@@ -696,7 +695,7 @@ void PipelineCompiler::printPAPIReportIfRequested(KernelBuilder & b) {
     if (LLVM_UNLIKELY(NumOfPAPIEvents)) {
 
         IntegerType * const papiCounterTy = TypeBuilder<papi_counter_t, false>::get(b.getContext());
-        PointerType * const counterPtrTy = papiCounterTy->getPointerTo();
+        PointerType * const counterPtrTy = PointerType::getUnqual(b.getContext());
 
         IntegerType * const intTy = TypeBuilder<unsigned, false>::get(b.getContext());
 
@@ -728,7 +727,7 @@ void PipelineCompiler::printPAPIReportIfRequested(KernelBuilder & b) {
             args[0] = b.CreateTrunc(b.getScalarField(MAXIMUM_NUM_OF_THREADS), intTy);
             args[1] = countOfEventCodes;
             args[2] = arrayOfEventCodes;
-            args[3] = b.CreatePointerCast(totals, counterPtrTy);
+            args[3] = totals;
 
             Function * const reportPrinter = b.getModule()->getFunction("__print_pipeline_totals_PAPI_report");
             assert (reportPrinter);
@@ -760,7 +759,7 @@ void PipelineCompiler::printPAPIReportIfRequested(KernelBuilder & b) {
                 Value * base; Type * ty;
                 std::tie(base, ty) = b.getScalarFieldPtr(makeKernelName(i) + STATISTICS_PAPI_COUNT_ARRAY_SUFFIX);
                 indices[1] = b.getInt32(i - FirstKernel);
-                b.CreateAlignedStore(b.CreatePointerCast(base, counterPtrTy), b.CreateGEP(arTy, pointerArray, indices), PtrTyABIAlignment);
+                b.CreateAlignedStore(base, b.CreateGEP(arTy, pointerArray, indices), PtrTyABIAlignment);
             }
 
             Function * const reportPrinter = b.getModule()->getFunction("__print_pipeline_PAPI_report");
@@ -771,8 +770,8 @@ void PipelineCompiler::printPAPIReportIfRequested(KernelBuilder & b) {
             args[1] = arrayOfKernelNames;
             args[2] = countOfEventCodes;
             args[3] = arrayOfEventCodes;
-            args[4] = b.CreatePointerCast(pointerArray, counterPtrTy->getPointerTo()); // values
-            args[5] = b.CreatePointerCast(totals, counterPtrTy);
+            args[4] = pointerArray; // values
+            args[5] = totals;
 
 
             b.CreateCall(reportPrinter->getFunctionType(), reportPrinter, args);

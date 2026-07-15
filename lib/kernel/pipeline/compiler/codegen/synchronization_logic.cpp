@@ -165,7 +165,7 @@ void PipelineCompiler::releaseSynchronizationLock(KernelBuilder & b, const unsig
         Value * const waitingOnPtr = getSynchronizationLockPtrForKernel(b, kernelId, type);
         Value * const nextSegNo = b.CreateAdd(segNo, b.getSize(1));
         if (LLVM_UNLIKELY(CheckAssertions())) {
-            DataLayout DL(b.getModule());
+            auto & DL = b.getModule()->getDataLayout();
             llvm::MaybeAlign align = Align(DL.getTypeStoreSize(nextSegNo->getType()));
             Value * const updated = b.CreateAtomicCmpXchg(waitingOnPtr, segNo, nextSegNo,
                                                            *align,

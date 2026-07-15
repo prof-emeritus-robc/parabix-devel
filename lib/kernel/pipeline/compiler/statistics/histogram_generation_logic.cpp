@@ -269,7 +269,7 @@ void PipelineCompiler::freeHistogramProperties(KernelBuilder & b) {
                 fields[2] = voidPtrTy;
                 StructType * const listTy = StructType::get(b.getContext(), fields);
 
-                PointerType * const listPtrTy = listTy->getPointerTo();
+                PointerType * const listPtrTy = PointerType::getUnqual(b.getContext());
 
                 FunctionType * const funcTy = FunctionType::get(b.getVoidTy(), {listPtrTy}, false);
 
@@ -310,7 +310,7 @@ void PipelineCompiler::freeHistogramProperties(KernelBuilder & b) {
                 b.SetInsertPoint(freeLoop);
                 PHINode * const current = b.CreatePHI(voidPtrTy, 2);
                 current->addIncoming(first, entry);
-                Value * const currentList = b.CreatePointerCast(current, listPtrTy);
+                Value * const currentList = current;
                 Value * const next = b.CreateAlignedLoad(voidPtrTy, b.CreateGEP(listTy, currentList, offset), PtrTyABIAlignment);
                 b.CreateFree(currentList);
                 current->addIncoming(next, freeLoop);
@@ -363,7 +363,6 @@ void PipelineCompiler::updateTransferredItemsForHistogramData(KernelBuilder & b)
     ConstantInt * const sz_ONE = b.getSize(1);
 
     IntegerType * const i64Ty = b.getInt64Ty();
-    PointerType * const voidPtrTy = b.getVoidPtrTy();
 
     const auto anyGreedy = hasAnyGreedyInput(mKernelId);
 
@@ -374,10 +373,9 @@ void PipelineCompiler::updateTransferredItemsForHistogramData(KernelBuilder & b)
         Function * func = m->getFunction("updateHistogramList");
         if (func == nullptr) {
 
-          //  PointerType * const entryPtrTy = type->getPointerTo();
             IntegerType * const sizeTy = b.getSizeTy();
 
-            PointerType * const listPtrTy = listTy->getPointerTo();
+            PointerType * const listPtrTy = PointerType::getUnqual(b.getContext());
 
             FunctionType * funcTy = FunctionType::get(b.getVoidTy(), {listPtrTy, sizeTy}, false);
 
@@ -448,14 +446,14 @@ void PipelineCompiler::updateTransferredItemsForHistogramData(KernelBuilder & b)
 
             b.SetInsertPoint(insertNewEntry);
             Value * const size = b.getTypeSize(listTy);
-            Value * const newEntry = b.CreatePointerCast(b.CreateAlignedMalloc(size, sizeof(uint64_t)), listPtrTy);
+            Value * const newEntry = b.CreateAlignedMalloc(size, sizeof(uint64_t));
             offset[1] = i32_ZERO;
             b.CreateAlignedStore(itemCount, b.CreateGEP(listTy, newEntry, offset), SizeTyABIAlignment);
             offset[1] = i32_ONE;
             b.CreateAlignedStore(i64_ONE, b.CreateGEP(listTy, newEntry, offset), Int64TyABIAlignment);
             offset[1] = i32_TWO;
-            b.CreateAlignedStore(b.CreatePointerCast(currentEntry, voidPtrTy), b.CreateGEP(listTy, newEntry, offset), PtrTyABIAlignment);
-            b.CreateAlignedStore(b.CreatePointerCast(newEntry, voidPtrTy), b.CreateGEP(listTy, lastEntry, offset), PtrTyABIAlignment);
+            b.CreateAlignedStore(currentEntry, b.CreateGEP(listTy, newEntry, offset), PtrTyABIAlignment);
+            b.CreateAlignedStore(newEntry, b.CreateGEP(listTy, lastEntry, offset), PtrTyABIAlignment);
             b.CreateRetVoid();
 
             b.SetInsertPoint(updateEntry);
@@ -568,12 +566,12 @@ void PipelineCompiler::printHistogramReport(KernelBuilder & b, HistogramReportTy
     hkdFields[0] = b.getInt32Ty(); // Id
     hkdFields[1] = b.getInt32Ty(); // NumOfPorts
     hkdFields[2] = b.getInt8PtrTy(); // KernelName
-    hkdFields[3] = hpdTy->getPointerTo(); // PortData
+    hkdFields[3] = PointerType::getUnqual(b.getContext()); // PortData
     StructType * const hkdTy = StructType::get(b.getContext(), hkdFields);
 
     #ifndef NDEBUG
     BEGIN_SCOPED_REGION
-    DataLayout dl(b.getModule());
+    auto & dl = b.getModule()->getDataLayout();
     assert (CBuilder::getTypeSize(dl, hpdTy) == sizeof(HistogramPortData));
     assert (CBuilder::getTypeSize(dl, hkdTy) == sizeof(HistogramKernelData));
     END_SCOPED_REGION
@@ -584,8 +582,6 @@ void PipelineCompiler::printHistogramReport(KernelBuilder & b, HistogramReportTy
     ConstantInt * const i32_TWO = b.getInt32(2);
     ConstantInt * const i32_THREE = b.getInt32(3);
     ConstantInt * const i32_FOUR = b.getInt32(4);
-
-    PointerType * const voidPtrTy = b.getVoidPtrTy();
 
     unsigned numOfKernels = 0;
 
@@ -744,7 +740,7 @@ void PipelineCompiler::printHistogramReport(KernelBuilder & b, HistogramReportTy
             b.CreateAlignedStore(b.getInt64(maxSize), b.CreateGEP(hpdTy, portData, offset), Int64TyABIAlignment);
 
             offset[1] = i32_FOUR;
-            b.CreateAlignedStore(b.CreatePointerCast(data, voidPtrTy), b.CreateGEP(hpdTy, portData, offset), PtrTyABIAlignment);
+            b.CreateAlignedStore(data, b.CreateGEP(hpdTy, portData, offset), PtrTyABIAlignment);
 
         };
 
@@ -759,7 +755,7 @@ void PipelineCompiler::printHistogramReport(KernelBuilder & b, HistogramReportTy
 
     // call the report function
     FixedArray<Value *, 3> args;
-    args[0] = b.CreatePointerCast(kernelData, voidPtrTy);
+    args[0] = kernelData;
     args[1] = b.getInt64(numOfKernels);
     args[2] = b.getInt32((unsigned)type);
 
@@ -807,7 +803,7 @@ free_port_data:
         FixedArray<Value *, 2> offset;
         offset[0] = b.getInt32(index++);
         offset[1] = i32_THREE;
-        b.CreateFree(b.CreateAlignedLoad(hpdTy->getPointerTo(), b.CreateGEP(hkdTy, kernelData, offset), PtrTyABIAlignment));
+        b.CreateFree(b.CreateAlignedLoad(PointerType::getUnqual(b.getContext()), b.CreateGEP(hkdTy, kernelData, offset), PtrTyABIAlignment));
     }
     b.CreateFree(kernelData);
 

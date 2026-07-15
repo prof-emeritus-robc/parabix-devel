@@ -126,10 +126,8 @@ void ElemFilterKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * 
     //b.CallPrintInt("metaMask", metaMask);
 
     // Input pointers for the current block
-    Value * const rawMaskPtr = b.getInputStreamBlockPtr("mask", ZERO, blockNoPhi);
-    Value * const maskBasePtr = b.CreatePointerCast(rawMaskPtr, maskTy->getPointerTo());
-    Value * const rawSourcePtr = b.getInputStreamBlockPtr("source", ZERO, blockNoPhi);
-    Value * const sourcePackPtr = b.CreatePointerCast(rawSourcePtr, elemVecTy->getPointerTo());
+    Value * const maskBasePtr = b.getInputStreamBlockPtr("mask", ZERO, blockNoPhi);
+    Value * const sourcePackPtr = b.getInputStreamBlockPtr("source", ZERO, blockNoPhi);
 
     b.CreateCondBr(b.CreateIsNull(metaMask), packsDone, scanPackLoop);
 
@@ -146,8 +144,7 @@ void ElemFilterKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * 
     Value * const sourcePtr = b.CreateGEP(elemVecTy, sourcePackPtr, nextNonEmptyMaskNo);
     Value * const newPack = b.CreateLoad(elemVecTy, sourcePtr);
     Value * const compressed = b.mvmd_compress(mElemWidth, newPack, mask);
-    Value * const ptr = b.getRawOutputPointer("filtered", outputPosPhi);
-    Value * const toStorePtr = b.CreatePointerCast(ptr, elemVecTy->getPointerTo());
+    Value * const toStorePtr = b.getRawOutputPointer("filtered", outputPosPhi);
     b.CreateAlignedStore(compressed, toStorePtr, 1);
 
     Value * newOutputPos = b.CreateAdd(outputPosPhi, maskPopCount);
@@ -316,7 +313,6 @@ FieldCompressKernel::FieldCompressKernel(LLVMTypeSystemInterface & ts,
 
 void PEXTFieldCompressKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) {
     Type * fieldTy = b.getIntNTy(mPEXTWidth);
-    Type * fieldPtrTy = PointerType::get(fieldTy, 0);
     BasicBlock * entry = b.GetInsertBlock();
     BasicBlock * processBlock = b.CreateBasicBlock("processBlock");
     BasicBlock * done = b.CreateBasicBlock("done");
@@ -333,15 +329,12 @@ void PEXTFieldCompressKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::V
     blockOffsetPhi->addIncoming(ZERO, entry);
     std::vector<Value *> mask(fieldsPerBlock);
     Value * extractionMaskPtr = b.getInputStreamBlockPtr("extractionMask", ZERO, blockOffsetPhi);
-    extractionMaskPtr = b.CreatePointerCast(extractionMaskPtr, fieldPtrTy);
     for (unsigned i = 0; i < fieldsPerBlock; i++) {
         mask[i] = b.CreateLoad(fieldTy, b.CreateGEP(fieldTy, extractionMaskPtr, b.getInt32(i)));
     }
     for (unsigned j = 0; j < mStreamCount; ++j) {
         Value * inputPtr = b.getInputStreamBlockPtr("inputStreamSet", b.getInt32(j), blockOffsetPhi);
-        inputPtr = b.CreatePointerCast(inputPtr, fieldPtrTy);
         Value * outputPtr = b.getOutputStreamBlockPtr("outputStreamSet", b.getInt32(j), blockOffsetPhi);
-        outputPtr = b.CreatePointerCast(outputPtr, fieldPtrTy);
         for (unsigned i = 0; i < fieldsPerBlock; i++) {
             Value * field = b.CreateLoad(fieldTy, b.CreateGEP(fieldTy, inputPtr, b.getInt32(i)));
             Value * compressed = b.CreatePextract(field, mask[i]);
@@ -1263,8 +1256,7 @@ void SwizzledBitstreamCompressByCount::generateDoBlockMethod(KernelBuilder & b) 
 
     Type * fieldTy = b.getIntNTy(mFieldWidth);
     Type * blockTy = b.getBitBlockType();
-    Value * countsPerStridePtr = b.getInputStreamBlockPtr("countsPerStride", b.getInt32(0));
-    Value * countStreamPtr = b.CreatePointerCast(countsPerStridePtr, fieldTy->getPointerTo());
+    Value * countStreamPtr = b.getInputStreamBlockPtr("countsPerStride", b.getInt32(0));
 
     // Output is written and committed to the output buffer one swizzle at a time.
     //
@@ -1388,7 +1380,6 @@ void FilterByMaskKernel::generateMultiBlockLogic(KernelBuilder & kb, llvm::Value
     Constant * const sz_ONE = kb.getSize(1);
     Type * const sizeTy = kb.getSizeTy();
     Type * const fieldTy = kb.getIntNTy(mFW);
-    Type * const FieldPtrTy = fieldTy->getPointerTo();
     Type * blockTy = kb.getBitBlockType();
 
     ConstantInt * const LOG_2_BLOCK_WIDTH = kb.getSize(floor_log2(kb.getBitBlockWidth()));
@@ -1481,7 +1472,6 @@ void FilterByMaskKernel::generateMultiBlockLogic(KernelBuilder & kb, llvm::Value
                 Value * const shiftedItems = kb.CreateShl(compressed, kb.CreateZExtOrTrunc(pendingOffset, fieldTy));
                 Value * const combined = kb.CreateOr(pendingData[j], shiftedItems);
                 Value * outputPtr = kb.getOutputStreamBlockPtr("filteredOutput", kb.getInt32(j), outputBlock);
-                outputPtr = kb.CreatePointerCast(outputPtr, FieldPtrTy);
                 outputPtr = kb.CreateGEP(fieldTy, outputPtr, fieldIndex);
                 kb.CreateStore(combined, outputPtr);
                 Value * overFlow = kb.CreateLShr(compressed, kb.CreateZExtOrTrunc(maskedSpace, fieldTy));
@@ -1517,7 +1507,6 @@ void FilterByMaskKernel::generateMultiBlockLogic(KernelBuilder & kb, llvm::Value
                 for (unsigned k = 0; k < mFieldsPerBlock; k++) {
                     unsigned strmIdx = j * mFieldsPerBlock + k;
                     Value * outputPtr = kb.getOutputStreamBlockPtr("filteredOutput", kb.getInt32(strmIdx), outputBlock);
-                    outputPtr = kb.CreatePointerCast(outputPtr, FieldPtrTy);
                     outputPtr = kb.CreateGEP(fieldTy, outputPtr, fieldIndex);
                     kb.CreateStore(kb.CreateExtractElement(combinedGroup, kb.getInt32(k)), outputPtr);
                 }
@@ -1559,7 +1548,6 @@ void FilterByMaskKernel::generateMultiBlockLogic(KernelBuilder & kb, llvm::Value
     if (mStreamCount < MIN_STREAMS_TO_SWIZZLE) {
         for (unsigned j = 0; j < mStreamCount; j++) {
             Value * outputPtr = kb.getOutputStreamBlockPtr("filteredOutput", kb.getInt32(j), finalBlock);
-            outputPtr = kb.CreatePointerCast(outputPtr, FieldPtrTy);
             outputPtr = kb.CreateGEP(fieldTy, outputPtr, finalField);
             Value * pending = kb.CreateLoad(mPendingType, pendingDataPtr[j]);
             kb.CreateStore(pending, outputPtr);
@@ -1570,7 +1558,6 @@ void FilterByMaskKernel::generateMultiBlockLogic(KernelBuilder & kb, llvm::Value
             for (unsigned k = 0; k < mFieldsPerBlock; k++) {
                 unsigned strmIdx = j * mFieldsPerBlock + k;
                 Value * outputPtr = kb.getOutputStreamBlockPtr("filteredOutput", kb.getInt32(strmIdx), finalBlock);
-                outputPtr = kb.CreatePointerCast(outputPtr, FieldPtrTy);
                 outputPtr = kb.CreateGEP(fieldTy, outputPtr, finalField);
                 kb.CreateStore(kb.CreateExtractElement(pending, kb.getInt32(k)), outputPtr);
             }
@@ -1660,19 +1647,17 @@ void ByteFilterByMaskKernel::generateMultiBlockLogic(KernelBuilder & b, Value * 
 
         Value * filter = nullptr;
         if (popCountSize < 8) {
-            Value * ptr = b.CreatePointerCast(baseFilterPtr, b.getInt8Ty()->getPointerTo());
             const auto packsPerByte = (8 / popCountSize);
             assert (packsPerByte > 1);
             Value * pos = b.CreateLShr(blockOffsetPhi, b.getSize(floor_log2(packsPerByte)));
-            filter = b.CreateAlignedLoad(b.getInt8Ty(), b.CreateGEP(b.getInt8Ty(), ptr, pos), 1);
+            filter = b.CreateAlignedLoad(b.getInt8Ty(), b.CreateGEP(b.getInt8Ty(), baseFilterPtr, pos), 1);
             filter = b.CreateZExt(filter, b.getSizeTy());
             Value * off = b.CreateAnd(blockOffsetPhi, b.getSize(packsPerByte - 1));
             filter = b.CreateLShr(filter, b.CreateShl(off, b.getSize(floor_log2(popCountSize))));
             filter = b.CreateAnd(filter, b.getSize((1UL << popCountSize) - 1UL));
         } else {
             IntegerType * const popCountTy = b.getIntNTy(popCountSize);
-            Value * ptr = b.CreatePointerCast(baseFilterPtr, popCountTy->getPointerTo());
-            filter = b.CreateAlignedLoad(popCountTy, b.CreateGEP(popCountTy, ptr, blockOffsetPhi), popCountSize / 8);
+            filter = b.CreateAlignedLoad(popCountTy, b.CreateGEP(popCountTy, baseFilterPtr, blockOffsetPhi), popCountSize / 8);
         }
 
         Value * const data = b.CreateAlignedLoad(dataVecTy, b.CreateGEP(dataVecTy, baseDataPtr, blockOffsetPhi), b.getBitBlockWidth() / 8);

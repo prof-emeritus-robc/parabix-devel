@@ -121,8 +121,7 @@ void PipelineCompiler::bindRepeatingStreamSetInitializationArguments(KernelBuild
                 // external buffers already have a buffer handle
                 RepeatingBuffer * const buffer = cast<RepeatingBuffer>(bn.Buffer);
                 buffer->setHandle(handle);
-                Value * const ba = b.CreatePointerCast(addr, buffer->getPointerType());
-                buffer->setBaseAddress(b, ba);
+                buffer->setBaseAddress(b, addr);
                 buffer->setModulus(runLength);
                 const auto lengthName = REPEATING_STREAMSET_LENGTH_PREFIX + std::to_string(streamSet);
                 b.setScalarField(lengthName, runLength);
@@ -209,7 +208,7 @@ void PipelineCompiler::generateGlobalDataForRepeatingStreamSet(KernelBuilder & b
     } else {
         const auto maxStrideLength = getGuaranteedRepeatingStreamSetLength(b, streamSet, true);
         auto info = cast<PipelineKernel>(mTarget)->createRepeatingStreamSet(b, ss, maxStrideLength);
-        Value * const ba = b.CreatePointerCast(info.first, buffer->getPointerType());
+        Value * const ba = info.first;
         buffer->setBaseAddress(b, ba);
         buffer->setModulus(info.second);
     }

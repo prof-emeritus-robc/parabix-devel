@@ -145,7 +145,11 @@ CPUDriver::CPUDriver(std::string && moduleName)
 
     // 5. Establish Layout Attributes matching your primary Module Context references
     const DataLayout DL = mEngine->getDataLayout();
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     auto triple = mTarget->getTargetTriple().getTriple();
+#else
+    auto triple = mTarget->getTargetTriple()
+#endif
     mMainModule->setTargetTriple(triple);
     mMainModule->setDataLayout(DL);
 

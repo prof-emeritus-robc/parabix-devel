@@ -228,3 +228,86 @@ def independent_range_analysis(maps):
 		cur_id = limit
 		limit = independent_range_limit(maps, cur_id)
 	return ranges
+
+#
+#  Shared-byte competition
+#  ------------------------
+#  Two merges compete for the SAME input byte when the LEFT token of one is
+#  the RIGHT token of the other. In one kernel both fire (neither sees the
+#  other's write this pass) and the later one's clear wipes the earlier one's
+#  start -> the merge chain breaks. 
+#
+#  Byte-grid aware: a shorter token can be the tail of a longer one, so a
+#  suffix match counts as competition too (e.g. left "Ġo" vs right "o").
+#
+#  NOT a competition (do not split):
+#    - same left factor  (om=(o,m) vs ok=(o,k)) — right neighbour disambiguates
+#    - same right factor (xo=(x,o) vs ro=(r,o)) — left  neighbour disambiguates
+def merges_share_byte(maps, id1, id2):
+	(vocab_, idToToken_) = maps
+	m1 = idToToken_[id1]; m2 = idToToken_[id2]
+	a1 = idToStr(maps, vocab_[m1[0]]); b1 = idToStr(maps, vocab_[m1[1]])
+	a2 = idToStr(maps, vocab_[m2[0]]); b2 = idToStr(maps, vocab_[m2[1]])
+	# m1's left vs m2's right, and m1's right vs m2's left
+	return has_common_suffix(a1, b2) or has_common_suffix(b1, a2)
+
+#
+#  Largest contiguous range starting at lo that is BOTH
+#    (1) dependency-independent — no merge uses an id >= lo (as before), AND
+#    (2) conflict-free          — no two merges compete for the same byte.
+#  Stop at the first merge that violates either.
+def clean_range_limit(maps, lo):
+	(vocab_, idToToken_) = maps
+	accepted = []
+	vocab_id = lo
+	while vocab_id in idToToken_.keys():
+		merge = idToToken_[vocab_id]
+		id0 = vocab_[merge[0]]
+		id1 = vocab_[merge[1]]
+		if id0 >= lo or id1 >= lo:            # dependency violation
+			break
+		conflict = False                       # shared-byte competition
+		for prior in accepted:
+			if merges_share_byte(maps, prior, vocab_id):
+				conflict = True
+				break
+		if conflict:
+			break
+		accepted.append(vocab_id)
+		vocab_id += 1
+	# the first merge at lo always fits (its parts precede it and set is empty),
+	# so this never stalls
+	return vocab_id
+
+#  Partition the merge data into ranges that are independent AND conflict-free.
+def clean_range_analysis(maps):
+	base_id = 256
+	ranges = []
+	cur_id = base_id
+	limit = clean_range_limit(maps, cur_id)
+	while limit != cur_id:
+		ranges.append((cur_id, limit))
+		cur_id = limit
+		limit = clean_range_limit(maps, cur_id)
+	return ranges
+
+#  Which range (index) does a given merge id fall in?
+def range_index_of(ranges, vocab_id):
+	for i, (lo, hi) in enumerate(ranges):
+		if lo <= vocab_id < hi:
+			return i
+	return None
+
+#  Which range does a token STRING fall in? Looks up the id, then the range.
+def range_for_token(maps, ranges, tok):
+	(vocab_, idToToken_) = maps
+	if tok not in vocab_:
+		print("token %r not in vocab" % tok)
+		return None
+	vid = vocab_[tok]
+	for (lo, hi) in ranges:
+		if lo <= vid < hi:
+			print("%r  id=%d  range=(%d, %d)  index=%d" % (tok, vid, lo, hi, ranges.index((lo, hi))))
+			return (lo, hi)
+	print("%r  id=%d  not in any range" % (tok, vid))
+	return None

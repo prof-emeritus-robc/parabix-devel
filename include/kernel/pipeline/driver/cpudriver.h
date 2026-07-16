@@ -2,7 +2,6 @@
 #include <kernel/pipeline/driver/driver.h>
 #include <toolchain/toolchain.h>
 namespace llvm { class ExecutionEngine; }
-namespace llvm { class TargetMachine; }
 namespace llvm { class raw_fd_ostream; }
 namespace llvm { class ModulePass; }
 namespace kernel { class KernelBuilder; }
@@ -36,6 +35,5 @@ private:
     std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
     std::vector<std::pair<llvm::Function *, void *>>        mCachedFunctionMappings;
     std::unique_ptr<llvm::ExecutionEngine>                  mEngine;
-    std::unique_ptr<llvm::TargetMachine>                    mTarget;
 };
 

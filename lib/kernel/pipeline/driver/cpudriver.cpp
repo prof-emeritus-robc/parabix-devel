@@ -52,8 +52,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
 , mUnoptimizedIROutputStream{}
 , mIROutputStream{}
 , mASMOutputStream{}
-, mEngine(nullptr)
-, mTarget(nullptr) {
+, mEngine(nullptr) {
 
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();

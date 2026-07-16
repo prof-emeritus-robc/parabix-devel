@@ -1,5 +1,6 @@
 #include <kernel/core/kernel_compiler.h>
 #include <kernel/core/kernel_builder.h>
+#include <kernel/pipeline/driver/driver.h>
 #include <llvm/IR/CallingConv.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Constants.h>
@@ -32,6 +33,7 @@
 #include <llvm/Analysis/PostDominators.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Analysis/TargetTransformInfo.h>
+#include <llvm/Passes/PassBuilder.h>
 #include <llvm/Transforms/AggressiveInstCombine/AggressiveInstCombine.h>
 #include <llvm/Transforms/IPO.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -237,8 +239,27 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
         _VerifierAnalysis
     };
 
+    llvm::PipelineTuningOptions PTO;
+    PTO.LoopVectorization = false; // Massive time saver
+    PTO.SLPVectorization = false;  // Massive time saver
+    PTO.LoopUnrolling = false;
 
+    LoopAnalysisManager LAM;
+    FunctionAnalysisManager FAM;
+    CGSCCAnalysisManager CGAM;
+    ModuleAnalysisManager MAM;
 
+    auto & driver = b.getDriver();
+    PassBuilder PB(driver.getTargetMachine());
+
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
+    /*
     ModuleAnalysisManager MAM;
     MAM.registerPass([&] { return ProfileSummaryAnalysis(); });
 
@@ -258,6 +279,7 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
     FAM.registerPass([&] { return ModuleAnalysisManagerFunctionProxy(MAM); });
 
     FAM.registerPass([&] { return OptimizationRemarkEmitterAnalysis(); });
+    */
 
     FunctionPassManager FPM;
 
@@ -299,7 +321,13 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
     }
 
     FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
-    //FPM.addPass(InstCombinePass());
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
+    FPM.addPass(llvm::InstCombinePass());
+#else
+    llvm::InstCombineOptions Opts;
+    //Opts.VerifyFixpoint = false;
+    FPM.addPass(llvm::InstCombinePass(Opts));
+#endif
     FPM.addPass(DCEPass());
     FPM.addPass(ReassociatePass());
     FPM.addPass(GVNPass());

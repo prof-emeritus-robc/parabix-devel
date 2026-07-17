@@ -111,18 +111,6 @@ def subrange_left_factor_analysis(maps, lo, hi):
 		if left_factor_count[lfid] > 1:
 			print(left_factor_group[lfid])
 
-def has_common_suffix(s1, s2):
-	if len(s2) > len(s1):
-		return has_common_suffix(s2, s1)
-	else:
-		return s1[-len(s2):] == s2
-
-def has_common_prefix(s1, s2):
-	if len(s2) > len(s1):
-		return has_common_prefix(s2, s1)
-	else:
-		return s1[:len(s2)] == s2
-
 def idToStr(maps, id_):
 	(vocab_, idToToken_) = maps
 	tok = idToToken_[id_]
@@ -131,39 +119,39 @@ def idToStr(maps, id_):
 	else:
 		return tok[0] + tok[1]
 
-#  
-#  find all pairs of merges in a range such that the two merges
-#  could both trigger at the same point, assuming that 
-#  (a) left-factoring handles cases where the left tokens are equal, and
-#  (b) merges lower than the range have been fully realized and marked off.
+#  suffix_matches_prefix(x, y): True if a NON-EMPTY suffix of x equals the
+#  same-length prefix of y (so x and y can be placed overlapping, x first).
+def suffix_matches_prefix(x, y):
+	for k in range(min(len(x), len(y)), 0, -1):
+		if x[-k:] == y[:k]:
+			return True
+	return False
+
+#  Two merges OVERLAP (could both trigger over a shared byte) when the merged
+#  byte-string of one has a non-empty suffix equal to a prefix of the other's, in
+#  EITHER direction: suffix(strA)==prefix(strB) OR suffix(strB)==prefix(strA).
+def merges_overlap(strA, strB):
+	return suffix_matches_prefix(strA, strB) or suffix_matches_prefix(strB, strA)
+
+#
+#  find all pairs of merges in a range that OVERLAP — i.e. could both trigger over
+#  a shared byte (merges_overlap on their merged byte-strings).
 #
 def subrange_conflict_analysis(maps, lo, hi):
 	(vocab_, idToToken_) = maps
-	left_factor_map = {}
 	for idA in range(lo, hi - 1):
 		mergeA = idToToken_[idA]
 		idA_0 = vocab_[mergeA[0]]
-		tokA_0 = idToStr(maps, idA_0)
-		idA_1 = vocab_[mergeA[1]]
-		tokA_1 = idToStr(maps, idA_1)
+		strA = idToStr(maps, idA)                 # full merged byte-string of A
 		for idB in range(idA + 1, hi):
 			mergeB = idToToken_[idB]
 			idB_0 = vocab_[mergeB[0]]
-			# skip if common left factors
+			# skip if common left factors (left-factoring handles equal left tokens)
 			if idA_0 == idB_0: continue
-			tokB_0 = idToStr(maps, idB_0)
-			# tok_B_0 may be masked off from prior range processing
-			if idA_0 < lo and len(tokB_0) < len(tokA_0): continue
-			# tok_A_0 may be masked off from prior range processing
-			if idB_0 < lo and len(tokA_0) < len(tokB_0): continue
-			if not has_common_suffix(tokA_0, tokB_0): continue
-			idB_1 = vocab_[mergeB[1]]
-			tokB_1 = idToStr(maps, idB_1)
-			if idA_1 < lo and len(tokB_1) < len(tokA_1): continue
-			if idB_1 < lo and len(tokA_1) < len(tokB_1): continue
-			if not has_common_prefix(tokA_1, tokB_1): continue
+			strB = idToStr(maps, idB)             # full merged byte-string of B
+			if not merges_overlap(strA, strB): continue
 			# conflict
-			print("%i = %s(%i) %s(%i) X %i = %s(%i) %s(%i) " %(idA, tokA_0, idA_0, tokA_1, idA_1, idB, tokB_0, idB_0, tokB_1, idB_1))
+			print("%i = %s  X  %i = %s" % (idA, strA, idB, strB))
 
 #
 #  Generate the expansion of a token_id into a merge of
@@ -230,35 +218,15 @@ def independent_range_analysis(maps):
 	return ranges
 
 #
-#  Shared-byte competition
-#  ------------------------
-#  Two merges compete for the SAME input byte when the LEFT token of one is
-#  the RIGHT token of the other. In one kernel both fire (neither sees the
-#  other's write this pass) and the later one's clear wipes the earlier one's
-#  start -> the merge chain breaks. 
-#
-#  Byte-grid aware: a shorter token can be the tail of a longer one, so a
-#  suffix match counts as competition too (e.g. left "Ġo" vs right "o").
-#
-#  NOT a competition (do not split):
-#    - same left factor  (om=(o,m) vs ok=(o,k)) — right neighbour disambiguates
-#    - same right factor (xo=(x,o) vs ro=(r,o)) — left  neighbour disambiguates
-def merges_share_byte(maps, id1, id2):
-	(vocab_, idToToken_) = maps
-	m1 = idToToken_[id1]; m2 = idToToken_[id2]
-	a1 = idToStr(maps, vocab_[m1[0]]); b1 = idToStr(maps, vocab_[m1[1]])
-	a2 = idToStr(maps, vocab_[m2[0]]); b2 = idToStr(maps, vocab_[m2[1]])
-	# m1's left vs m2's right, and m1's right vs m2's left
-	return has_common_suffix(a1, b2) or has_common_suffix(b1, a2)
-
-#
 #  Largest contiguous range starting at lo that is BOTH
 #    (1) dependency-independent — no merge uses an id >= lo (as before), AND
-#    (2) conflict-free          — no two merges compete for the same byte.
+#    (2) overlap-free           — no two merges in the range overlap, i.e. no pair
+#        (A,B) with merges_overlap(strA, strB): a non-empty suffix of one merged
+#        byte-string equals a prefix of the other's (either direction).
 #  Stop at the first merge that violates either.
 def clean_range_limit(maps, lo):
 	(vocab_, idToToken_) = maps
-	accepted = []
+	accepted = []                             # merged byte-strings already in this range
 	vocab_id = lo
 	while vocab_id in idToToken_.keys():
 		merge = idToToken_[vocab_id]
@@ -266,14 +234,10 @@ def clean_range_limit(maps, lo):
 		id1 = vocab_[merge[1]]
 		if id0 >= lo or id1 >= lo:            # dependency violation
 			break
-		conflict = False                       # shared-byte competition
-		for prior in accepted:
-			if merges_share_byte(maps, prior, vocab_id):
-				conflict = True
-				break
-		if conflict:
+		strC = idToStr(maps, vocab_id)        # this merge's merged byte-string
+		if any(merges_overlap(strC, s) for s in accepted):   # overlap violation
 			break
-		accepted.append(vocab_id)
+		accepted.append(strC)
 		vocab_id += 1
 	# the first merge at lo always fits (its parts precede it and set is empty),
 	# so this never stalls

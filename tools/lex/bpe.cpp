@@ -48,6 +48,8 @@
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
 #include <stdexcept>
+#include <boost/intrusive/detail/math.hpp>
+using boost::intrusive::detail::ceil_log2;
 
 using namespace pablo;
 using namespace kernel;
@@ -165,9 +167,9 @@ protected:
         // Write the id into the 16-bit `source` stream (ids ≤255 → high bits 0),
         // active = all 1s, end = all 0s.
         Var * sOut = getOutputStreamVar("source");
-        for (unsigned i = 0; i < 16; i++)
-            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)),
-                            (i < id.size()) ? id[i] : zeroes);
+        for (unsigned i = 0; i < 8; i++) {
+            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), id[i]);
+        }
         pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)), ones);
         pb.createAssign(pb.createExtract(getOutputStreamVar("end"),    pb.getInteger(0)), zeroes);
     }
@@ -200,18 +202,19 @@ public:
     BPEMergeKernel(LLVMTypeSystemInterface & ts,
                    StreamSet * sourceIn, StreamSet * meIn,
                    StreamSet * sourceOut, StreamSet * meOut,
-                   std::vector<MergeRule> rules, uint64_t shapeHash, unsigned maxLen)
+                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
     : PabloKernel(ts, "BPEMerge_h" + std::to_string(shapeHash),
                   {Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
                    Binding{"meIn", meIn}},
                   {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
-      mRules(std::move(rules)) {}
+      mRuleGroup(group) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         BixNumCompiler bnc(pb);
         std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
-        const unsigned W = srcBits.size();                 // id width (fixed 16)
+        const unsigned W = srcBits.size();
+        const unsigned W_out = ceil_log2(mRuleGroup.hi + 1);
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
 
@@ -219,6 +222,10 @@ protected:
         // PLAIN values (functional SSA), reassigned OUTSIDE any createIf. A self-ref
         // Var assign v=f(v) inside a scope breaks Pablo reaching-def — see memory note.
         std::vector<PabloAST*> idAcc(srcBits.begin(), srcBits.end());
+        if (W_out > W) {
+            //llvm::errs() << "mRuleGroup.hi = " <<  mRuleGroup.hi << "\n";
+            idAcc = bnc.ZeroExtend(idAcc, W_out);
+        }
 
         // inPlayMask — 1-bit mask: which byte positions are still live token starts.
         // Threaded kernel→kernel (meIn/meOut), seeded all-ones. Each fired merge clears
@@ -231,7 +238,7 @@ protected:
         // to check what token starts right after A. LookAhead is legal only on an INPUT
         // (sourceIn declares LookAhead(maxLen), and lenA < mergedLen ≤ maxLen).
         std::map<unsigned, BixNum> aheadByLenA;
-        for (const auto & r : mRules) {
+        for (const auto & r : mRuleGroup.rules) {
             if (aheadByLenA.count(r.lenA)) continue;
             std::vector<PabloAST*> bits(W);
             for (unsigned i = 0; i < W; i++)
@@ -243,7 +250,7 @@ protected:
         // +lenA. Detect inside createIf(Astart & inPlayMask), carry the fire out via a
         // NON-self-ref Var mergeV, then OUTSIDE the gate stamp idAB at A's start and
         // clear B's start from inPlayMask.
-        for (const auto & r : mRules) {
+        for (const auto & r : mRuleGroup.rules) {
             BixNum cur(idAcc.begin(), idAcc.end());
             PabloAST * Astart = bnc.EQ(cur, r.idA);        // token A starts here
 
@@ -254,7 +261,7 @@ protected:
             body.createAssign(mergeV, body.createAnd3(inPlayMask, Astart, BstartAtA));
             pb.createIf(pb.createAnd(Astart, inPlayMask), body);
 
-            for (unsigned i = 0; i < W; i++)               // stamp idAB at A's start
+            for (unsigned i = 0; i < W_out; i++)               // stamp idAB at A's start
                 idAcc[i] = pb.createSel(mergeV, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
 
             // Consume B's start (lenA ahead of each fired merge). Use
@@ -264,12 +271,12 @@ protected:
         }
 
         Var * sOut = getOutputStreamVar("sourceOut");
-        for (unsigned i = 0; i < W; i++)
+        for (unsigned i = 0; i < W_out; i++)
             pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // 16-bit token ID stream
         pb.createAssign(pb.createExtract(getOutputStreamVar("meOut"), pb.getInteger(0)), inPlayMask);
     }
 private:
-    std::vector<MergeRule> mRules;
+    MergeRuleGroup mRuleGroup;
 };
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
@@ -307,7 +314,7 @@ BPEPassResult buildBPEPassPipeline(
     }
 
     // Seed: source = base id of each raw byte, active = ones, end = zeroes.
-    StreamSet * source = P.CreateStreamSet(16, 1);
+    StreamSet * source = P.CreateStreamSet(8, 1);
     StreamSet * active = P.CreateStreamSet(1, 1);
     StreamSet * end    = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<BPERangeSeed>(basis, source, active, end);
@@ -329,10 +336,11 @@ BPEPassResult buildBPEPassPipeline(
     StreamSet * inPlayMask = active;
     for (auto & g : ruleRanges) {
         if (g.rules.empty()) continue;
-        StreamSet * sOut  = P.CreateStreamSet(16, 1);
+        unsigned output_bits = ceil_log2(g.hi+1);
+        StreamSet * sOut  = P.CreateStreamSet(output_bits, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, sOut, meOut,
-                                           g.rules, hashRuleSet(g.rules), g.maxLen);
+                                           g, hashRuleSet(g.rules), g.maxLen);
         source     = sOut;
         inPlayMask = meOut;
     }

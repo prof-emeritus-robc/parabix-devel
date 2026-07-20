@@ -117,7 +117,7 @@ def idToStr(maps, id_):
 	if id_ < 256:
 		return tok
 	else:
-		return tok[0] + tok[1]
+		return tok[0] + " " + tok[1]
 
 #  Two merges OVERLAP by TOKEN-ID (token-adjacency): the RIGHT part token of one
 #  equals the LEFT part token of the other, so on the id stream they fight over
@@ -147,6 +147,28 @@ def subrange_conflict_analysis(maps, lo, hi):
 			if not merges_overlap((idA_0, idA_1), (idB_0, idB_1)): continue
 			# conflict
 			print("%i = %s  X  %i = %s" % (idA, idToStr(maps, idA), idB, idToStr(maps, idB)))
+
+#
+#  Given a range of merges, 
+#  (1) identify conflicts between any pair of merge ids idA and idB such that
+#      (a) idA < idB and
+#      (b) leftID[idA] = rightID[idB]
+#  (2) resolve the conflict by adding a negative assertion for idB for the rightId[idA]
+
+def subrange_conflict_resolution(maps, lo, hi):
+	(vocab_, idToToken_) = maps
+	byLeftID = {}
+	for idA in range(lo, hi - 1):
+		mergeA = idToToken_[idA]
+		idA_0 = vocab_[mergeA[0]]; idA_1 = vocab_[mergeA[1]]
+		if idA_1 in byLeftID.keys():
+			excluded = ", ".join([idToStr(maps, x) for x in byLeftID[idA_1]])
+			print("%i = %s (?! %s )" % (idA, idToStr(maps, idA), excluded))
+		if not idA_0 in byLeftID.keys():
+			byLeftID[idA_0] = [idA_1]
+		else:
+			byLeftID[idA_0].append(idA_1)
+
 
 #
 #  Generate the expansion of a token_id into a merge of

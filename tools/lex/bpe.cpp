@@ -280,7 +280,8 @@ private:
 };
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
-//   1. buildMergeRuleRanges() partitions merges into independent id-ranges (rank order).
+//   1. buildMergeRuleRanges() partitions merges into clean id-ranges (dependency-independent
+//      + token-adjacency-overlap-free, rank order).
 //   2. BPERangeSeed seeds source = base id of each RAW byte (active=1s, end=0s).
 //   3. One BPEMergeKernel per range (ascending = rank order) glues adjacent ids:
 //      for each rule (A,B→AB) it detects A's end, checks B at +lenB, stamps idAB.
@@ -507,38 +508,23 @@ static unsigned rawByteLen(const std::string & s) {
 }
 
 // ─── Range partitioning (merge-kernel design) ────────────────────────────────
-// Shared-byte competition: two merges contend for the SAME input byte when the
-// LEFT token of one is (a byte-suffix of) the RIGHT token of the other — e.g.
-// om=(o,m) vs ro=(r,o) both claim the o on input "r o m". In one kernel both
-// fire (neither sees the other's write this pass) and the later one's clear
-// wipes the earlier one's start, breaking the merge chain (the "Ġfrom" bug).
-// Byte-grid aware: a shorter token can be the tail of a longer one, so a suffix
-// match counts. Mirrors merge_analysis.py: merges_share_byte / has_common_suffix.
-static bool sharedByteConflict(const std::string & a1, const std::string & b1,
-                               const std::string & a2, const std::string & b2) {
-    auto commonSuffix = [](const std::string & s, const std::string & t) {
-        const std::string & lo = (s.size() <= t.size()) ? s : t;
-        const std::string & hi = (s.size() <= t.size()) ? t : s;
-        return hi.compare(hi.size() - lo.size(), lo.size(), lo) == 0;
-    };
-    return commonSuffix(a1, b2) || commonSuffix(b1, a2);
-}
-
 // buildMergeRuleRanges — resolve each raw merge (parts A,B + idAB) into a
 // MergeRule {idA,idB,idAB,lenA,lenB}, then partition into ranges that are BOTH
 //   (1) dependency-independent — a range [lo,hi) holds only rules whose BOTH part
 //       ids are < lo, so every part was already stamped by a lower kernel
 //       (`source` threading resolves cross-range deps; no intra-kernel cascade), AND
-//   (2) conflict-free          — no two rules in a range compete for the same byte.
-// (1) alone (the old independent_range_analysis) let om and ro share a kernel and
-// mis-merge; (2) splits competitors into separate rank-ordered kernels so the
-// lower-rank one's write reaches the later kernel's input and starves the other.
-// Mirrors merge_analysis.py clean_range_analysis. Rules stay idAB-ASC = rank-ASC.
+//   (2) overlap-free by TOKEN-ID — no two rules in a range compete for a shared
+//       middle token: the RIGHT part id of one == the LEFT part id of the other
+//       (cur.idB==p.idA || p.idB==cur.idA). e.g. Ġt=(Ġ,t) and ter=(t,er) both
+//       claim the 't' token → split into separate rank-ordered kernels so the
+//       lower-rank one's write reaches the later kernel's input and starves the other.
+// (1) alone (independent_range_analysis) let competitors share a kernel; (2) is
+// the token-grid conflict test (interior sub-token byte overlaps are NOT counted —
+// interior bytes are not live token starts). Mirrors merge_analysis.py
+// clean_range_analysis (id-based merges_overlap). Rules stay idAB-ASC = rank-ASC.
 std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
-    // 1. Resolve every raw merge → MergeRule, keeping the part strings for the
-    //    shared-byte conflict test.
-    struct RuleStr { MergeRule r; std::string a, b; };
-    std::vector<RuleStr> rules;
+    // 1. Resolve every raw merge → MergeRule.
+    std::vector<MergeRule> rules;
     unsigned skipped = 0;                            // parts not found in the vocab
     for (const auto & m : merges_) {
         auto ia = vocab_.find(m.a);
@@ -550,7 +536,7 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
         r.idAB = m.idAB;
         r.lenA = rawByteLen(m.a);   // RAW byte length (codepoints), not display byte size
         r.lenB = rawByteLen(m.b);
-        rules.push_back({r, m.a, m.b});
+        rules.push_back(r);
     }
     if (skipped)
         std::cerr << "BPE: buildMergeRuleRanges skipped " << skipped
@@ -558,32 +544,30 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
 
     // 2. Rank order (idAB ASC == 256 + rank).
     std::sort(rules.begin(), rules.end(),
-              [](const RuleStr & x, const RuleStr & y) { return x.r.idAB < y.r.idAB; });
+              [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
 
     // 3. clean_range partition: lo = first rule's idAB (its parts always precede
     //    it, so it always fits); extend while the rule is dependency-independent
-    //    (idA<lo && idB<lo) AND conflict-free vs every rule already in the group.
-    //    The first rule violating either starts the next range (tiles contiguously).
+    //    (idA<lo && idB<lo) AND token-adjacency-overlap-free vs every rule already
+    //    in the group. The first rule violating either starts the next range.
     std::vector<MergeRuleGroup> ranges;
     size_t i = 0, n = rules.size();
     while (i < n) {
         MergeRuleGroup g;
-        g.lo = rules[i].r.idAB;                      // new range starts here
-        std::vector<const RuleStr *> accepted;       // rules already in this group
-        while (i < n && rules[i].r.idA < g.lo && rules[i].r.idB < g.lo) {
-            const RuleStr & cur = rules[i];
-            bool conflict = false;                   // shared-byte competition
-            for (const RuleStr * p : accepted)
-                if (sharedByteConflict(p->a, p->b, cur.a, cur.b)) { conflict = true; break; }
-            if (conflict) break;
-            unsigned mergedLen = cur.r.lenA + cur.r.lenB;
+        g.lo = rules[i].idAB;                        // new range starts here
+        while (i < n && rules[i].idA < g.lo && rules[i].idB < g.lo) {
+            const MergeRule & cur = rules[i];
+            bool overlap = false;                    // token-adjacency: right == left
+            for (const MergeRule & p : g.rules)
+                if (cur.idB == p.idA || p.idB == cur.idA) { overlap = true; break; }
+            if (overlap) break;
+            unsigned mergedLen = cur.lenA + cur.lenB;
             if (mergedLen > g.maxLen) g.maxLen = mergedLen;
-            g.rules.push_back(cur.r);
-            accepted.push_back(&cur);
+            g.rules.push_back(cur);
             ++i;
         }
-        g.hi = (i < n) ? rules[i].r.idAB             // next range's lo
-                       : rules[n - 1].r.idAB + 1;    // last range: past top id
+        g.hi = (i < n) ? rules[i].idAB               // next range's lo
+                       : rules[n - 1].idAB + 1;      // last range: past top id
         ranges.push_back(std::move(g));
     }
     return ranges;

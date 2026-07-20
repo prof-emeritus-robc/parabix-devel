@@ -119,39 +119,34 @@ def idToStr(maps, id_):
 	else:
 		return tok[0] + tok[1]
 
-#  suffix_matches_prefix(x, y): True if a NON-EMPTY suffix of x equals the
-#  same-length prefix of y (so x and y can be placed overlapping, x first).
-def suffix_matches_prefix(x, y):
-	for k in range(min(len(x), len(y)), 0, -1):
-		if x[-k:] == y[:k]:
-			return True
-	return False
-
-#  Two merges OVERLAP (could both trigger over a shared byte) when the merged
-#  byte-string of one has a non-empty suffix equal to a prefix of the other's, in
-#  EITHER direction: suffix(strA)==prefix(strB) OR suffix(strB)==prefix(strA).
-def merges_overlap(strA, strB):
-	return suffix_matches_prefix(strA, strB) or suffix_matches_prefix(strB, strA)
+#  Two merges OVERLAP by TOKEN-ID (token-adjacency): the RIGHT part token of one
+#  equals the LEFT part token of the other, so on the id stream they fight over
+#  that shared middle token's start. Pure id equality; a = (leftId, rightId).
+#      right(A) == left(B)   OR   right(B) == left(A)
+#  Matches the start-anchored kernel's token-grid competition (not raw bytes).
+#  Same-left / same-right factors never match here (only the two CROSS pairs are
+#  compared), so left-factoring / right-factoring cases are excluded by design.
+def merges_overlap(a, b):
+	return a[1] == b[0] or b[1] == a[0]
 
 #
 #  find all pairs of merges in a range that OVERLAP — i.e. could both trigger over
-#  a shared byte (merges_overlap on their merged byte-strings).
+#  a shared middle token (merges_overlap on their part ids: right of one == left
+#  of the other).
 #
 def subrange_conflict_analysis(maps, lo, hi):
 	(vocab_, idToToken_) = maps
 	for idA in range(lo, hi - 1):
 		mergeA = idToToken_[idA]
-		idA_0 = vocab_[mergeA[0]]
-		strA = idToStr(maps, idA)                 # full merged byte-string of A
+		idA_0 = vocab_[mergeA[0]]; idA_1 = vocab_[mergeA[1]]
 		for idB in range(idA + 1, hi):
 			mergeB = idToToken_[idB]
-			idB_0 = vocab_[mergeB[0]]
+			idB_0 = vocab_[mergeB[0]]; idB_1 = vocab_[mergeB[1]]
 			# skip if common left factors (left-factoring handles equal left tokens)
 			if idA_0 == idB_0: continue
-			strB = idToStr(maps, idB)             # full merged byte-string of B
-			if not merges_overlap(strA, strB): continue
+			if not merges_overlap((idA_0, idA_1), (idB_0, idB_1)): continue
 			# conflict
-			print("%i = %s  X  %i = %s" % (idA, strA, idB, strB))
+			print("%i = %s  X  %i = %s" % (idA, idToStr(maps, idA), idB, idToStr(maps, idB)))
 
 #
 #  Generate the expansion of a token_id into a merge of
@@ -220,13 +215,13 @@ def independent_range_analysis(maps):
 #
 #  Largest contiguous range starting at lo that is BOTH
 #    (1) dependency-independent — no merge uses an id >= lo (as before), AND
-#    (2) overlap-free           — no two merges in the range overlap, i.e. no pair
-#        (A,B) with merges_overlap(strA, strB): a non-empty suffix of one merged
-#        byte-string equals a prefix of the other's (either direction).
+#    (2) overlap-free by TOKEN-ID — no two merges compete for a shared middle
+#        token: merges_overlap on their part ids (right of one == left of other).
+#        Matches the start-anchored kernel's token-grid competition.
 #  Stop at the first merge that violates either.
 def clean_range_limit(maps, lo):
 	(vocab_, idToToken_) = maps
-	accepted = []                             # merged byte-strings already in this range
+	accepted = []                             # (leftId, rightId) part-id pairs in this range
 	vocab_id = lo
 	while vocab_id in idToToken_.keys():
 		merge = idToToken_[vocab_id]
@@ -234,10 +229,10 @@ def clean_range_limit(maps, lo):
 		id1 = vocab_[merge[1]]
 		if id0 >= lo or id1 >= lo:            # dependency violation
 			break
-		strC = idToStr(maps, vocab_id)        # this merge's merged byte-string
-		if any(merges_overlap(strC, s) for s in accepted):   # overlap violation
+		cur = (id0, id1)
+		if any(merges_overlap(cur, p) for p in accepted):   # token-adjacency overlap
 			break
-		accepted.append(strC)
+		accepted.append(cur)
 		vocab_id += 1
 	# the first merge at lo always fits (its parts precede it and set is empty),
 	# so this never stalls

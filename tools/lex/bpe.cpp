@@ -221,17 +221,20 @@ protected:
         // idAcc — the id stream we mutate; starts as a copy of the input ids.
         // PLAIN values (functional SSA), reassigned OUTSIDE any createIf. A self-ref
         // Var assign v=f(v) inside a scope breaks Pablo reaching-def — see memory note.
-        std::vector<PabloAST*> idAcc(srcBits.begin(), srcBits.end());
-        if (W_out > W) {
-            //llvm::errs() << "mRuleGroup.hi = " <<  mRuleGroup.hi << "\n";
-            idAcc = bnc.ZeroExtend(idAcc, W_out);
+        std::vector<Var *> idAcc(W_out);
+        for (unsigned i = 0; i < W_out; i++) {
+            if (i < W) {
+                idAcc[i] = pb.createVar("idAcc_" + std::to_string(i), srcBits[i]);
+            } else {
+                idAcc[i] = pb.createVar("idAcc_" + std::to_string(i), zeroes);
+            }
         }
 
         // inPlayMask — 1-bit mask: which byte positions are still live token starts.
         // Threaded kernel→kernel (meIn/meOut), seeded all-ones. Each fired merge clears
         // B's start (interior seam); A's start survives as AB's start. Final mask marks
         // the surviving (outermost) token STARTS — the stream emission scans.
-        PabloAST * inPlayMask = getInputStreamSet("meIn")[0];
+        Var * inPlayMask = pb.createVar("inPlayMask", getInputStreamSet("meIn")[0]);
 
         // aheadByLenA[len] = the source id stream shifted so position p reads the id
         // `len` bytes ahead. One copy per distinct lenA; a rule uses aheadByLenA[lenA]
@@ -253,23 +256,22 @@ protected:
         for (const auto & r : mRuleGroup.rules) {
             BixNum cur(idAcc.begin(), idAcc.end());
             PabloAST * Astart = bnc.EQ(cur, r.idA);        // token A starts here
-
-            Var * mergeV = pb.createVar("merge", zeroes);
             auto body = pb.createScope();
             BixNumCompiler bncB(body);
             PabloAST * BstartAtA = bncB.EQ(aheadByLenA.at(r.lenA), r.idB);  // B starts lenA ahead
-            body.createAssign(mergeV, body.createAnd3(inPlayMask, Astart, BstartAtA));
+            PabloAST * mergeV = body.createAnd3(inPlayMask, Astart, BstartAtA);
+            PabloAST * notMergeV = body.createNot(mergeV);
+            for (unsigned i = 0; i < W_out; i++) {
+                if ((r.idAB >> i) & 1u) {
+                    body.createAssign(idAcc[i], body.createOr(idAcc[i], mergeV));
+                } else {
+                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notMergeV));
+                }
+            }
+            PabloAST * maskOff = body.createNot(body.createAdvance(mergeV, r.lenA));
+            body.createAssign(inPlayMask, body.createAnd(inPlayMask, maskOff));
             pb.createIf(pb.createAnd(Astart, inPlayMask), body);
-
-            for (unsigned i = 0; i < W_out; i++)               // stamp idAB at A's start
-                idAcc[i] = pb.createSel(mergeV, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
-
-            // Consume B's start (lenA ahead of each fired merge). Use
-            // Not(Advance(mergeV,lenA)), NOT Advance(Not mergeV,lenA): Advance fills the
-            // leading lenA bytes with 0, so the latter would wrongly clear position 0.
-            inPlayMask = pb.createAnd(inPlayMask, pb.createNot(pb.createAdvance(mergeV, r.lenA)), "inPlayClear");
         }
-
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
             pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // 16-bit token ID stream

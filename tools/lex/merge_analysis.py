@@ -292,3 +292,17 @@ def range_for_token(maps, ranges, tok):
 			return (lo, hi)
 	print("%r  id=%d  not in any range" % (tok, vid))
 	return None
+
+def self_merges(maps):
+	(vocab_, idToToken_) = maps
+	selfies = []
+	for merge_id in idToToken_.keys():
+		merge = idToToken_[merge_id]
+		if len(merge) == 2:
+			id0 = vocab_[merge[0]]
+			id1 = vocab_[merge[1]]
+			if id0 == id1:
+				selfies.append(merge_id)
+	for selfie in sorted(selfies):
+		print("%i = (%s %s)" % (selfie, idToToken_[selfie][0], idToToken_[selfie][1]))
+

@@ -38,6 +38,7 @@ public:
         , Seq
         , Start
         , Permute
+        , Interleavable
     };
     inline ClassTypeId getClassTypeId() const {
         return mClassTypeId;

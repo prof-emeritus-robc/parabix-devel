@@ -105,8 +105,8 @@ RE * RE_Parser::parse_seq() {
     return makeSeq(seq.begin(), seq.end());
 }
 
-RE * RE_Parser::parse_next_item() {
-    if (mCursor.noMore() || atany("*?+{|")) return nullptr;
+RE * RE_Parser::parse_next_item(std::string break_chars) {
+    if (mCursor.noMore() || atany(break_chars)) return nullptr;
     else if (((mGroupsOpen > 0) && at(')')) || (fNested && at('}'))) return nullptr;
     else if (accept('^')) return Start::Create();
     else if (accept('$')) return End::Create();
@@ -120,6 +120,10 @@ RE * RE_Parser::parse_next_item() {
         if (radicalSet == nullptr) return createCC(cp);
         return makeCC(*radicalSet);
     }
+}
+
+RE * RE_Parser::parse_next_item() {
+    return parse_next_item("*?+{|");
 }
 
 RE * RE_Parser::parse_mode_group(bool & closing_paren_parsed) {
@@ -541,14 +545,37 @@ RE * RE_Parser::parse_permute() {
     auto alreadyNested = fNested;
     fNested = true;
     accept('{');
-    RE * e = parse_alt();
+    std::vector<RE *> terms;
+    do {
+        terms.push_back(parse_interleavable());
+    }
+    while (accept('|'));
     require('}');
     fNested = alreadyNested;
-    if (Alt * a = dyn_cast<Alt>(e)) {
-        return Permute::Create(a->begin(), a->end());
-    } else {
-        return e;
+    return Permute::Create(terms.begin(), terms.end());
+}
+
+RE * RE_Parser::parse_interleavable() {
+    std::vector<RE *> factors;
+    for (;;) {
+        std::vector<RE *> seq;
+        for (;;) {
+            RE * re = parse_next_item("*?+{|<}");
+            if (re == nullptr) {
+                break;
+            }
+            re = extend_item(re);
+            seq.push_back(re);
+        }
+        factors.push_back(makeSeq(seq.begin(), seq.end()));
+        if (!accept("<")) {
+            break;
+        }
     }
+    if (factors.size() == 1) {
+        return factors[0];
+    }
+    return makeInterleavable(factors.begin(), factors.end());
 }
 
 RE * RE_Parser::parseNamePatternExpression(){

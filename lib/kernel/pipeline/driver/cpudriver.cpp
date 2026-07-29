@@ -74,9 +74,6 @@ public:
         const auto f = InternalMapping.find(M.getName());
 
         auto optLevel = CodeGenOptLevel::Default;
-
-        errs() << "Compiling Module Code " << M.getName() << " (" << (f != InternalMapping.end()) << ")\n";
-
         if (LLVM_LIKELY(f != InternalMapping.end())) {
 
             Kernel * const K = f->getValue();
@@ -94,20 +91,16 @@ public:
             if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
                 optLevel = codegen::BackEndOptLevel;
             }
-
-            errs() << "Generated Kernel Code " << K->getName() << "\n";
         }
 
-
+        NamedRegionTimer T(M.getModuleIdentifier(), "",
+                           "Module", "Object Generation",
+                           codegen::TimeKernelsIsEnabled);
 
         auto TM = cantFail(JTMB.createTargetMachine());
         TM->setOptLevel(optLevel);
         SimpleCompiler C(*TM, ObjCache);
-        auto r = C(M);
-
-        errs() << "* Compiled Module Code " << M.getName() << " (" << (f != InternalMapping.end()) << ")\n";
-
-        return r;
+        return C(M);
     }
 
 private:
@@ -171,7 +164,6 @@ CPUDriver::CPUDriver(std::string && moduleName)
 , mUnoptimizedIROutputStream{}
 , mIROutputStream{}
 , mASMOutputStream{}
-, mTarget(nullptr)
 , mEngine(nullptr) {
 
     InitializeNativeTarget();
@@ -203,7 +195,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
 
     TargetOptions Options = codegen::target_Options;
 
-    mTarget.reset(TheTarget->createTargetMachine(
+    mTarget = TheTarget->createTargetMachine(
         TripleStr,               // Target Triple
         CPUStr,                  // Host CPU Name
         llvm::join(attrs, ","),  // Flattened features string list
@@ -211,7 +203,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
         std::nullopt,            // Fixes error! Expresses 'Default' relocation model
         CodeModel::Small,        // Standard Code Model
         codegen::BackEndOptLevel // Optimization configurations
-    ));
+    );
 
     if (mTarget == nullptr) {
         throw std::runtime_error("Could not allocate TargetMachine wrapper profile structure layout");

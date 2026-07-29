@@ -18,6 +18,7 @@ namespace kernel { class KernelBuilder; }
 namespace kernel { class PipelineAnalysis; }
 namespace kernel { class PipelineBuilder; }
 namespace kernel { class ProgramBuilder; }
+namespace llvm { class TargetMachine; }
 namespace kernel {template<typename ... Args> class TypedProgramBuilder; }
 
 class CBuilder;
@@ -70,6 +71,10 @@ public:
 
     virtual void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) = 0;
 
+    llvm::TargetMachine * getTargetMachine() {
+        return mTarget;
+    }
+
 protected:
 
     kernel::StreamSet * CreateStreamSet(const unsigned NumElements = 1, const unsigned FieldWidth = 1) noexcept;
@@ -101,16 +106,16 @@ protected:
 
     virtual llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const = 0;
 
-//    kernel::KernelBuilder & getBuilder() {
-//        return *mBuilder;
-//    }
-
 protected:
 
     llvm::LLVMContext * const                               mContext;
+
     llvm::Module * const                                    mMainModule;
+
     std::unique_ptr<kernel::KernelBuilder>                  mBuilder;
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;
+
+    llvm::TargetMachine *                                   mTarget;
 
     bool                                                    mPreservesKernels = false;
     KernelSet                                               mUncachedKernel;

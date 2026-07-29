@@ -166,6 +166,37 @@ static bool lessThan(const PropertyExpression * const lh, const PropertyExpressi
     return lh->getValueString() < rh->getValueString();
 }
 
+static bool lessThan(const Permute * const lh, const Permute * const rh) {
+    if (LLVM_LIKELY(lh->size() != rh->size())) {
+        return lh->size() < rh->size();
+    }
+    for (auto i = lh->begin(), j = rh->begin(); i != lh->end(); ++i, ++j) {
+        assert (*i && *j);
+        if (compare(*i, *j)) {
+            return true;
+        } else if (compare(*j, *i)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static bool lessThan(const Interleavable * const lh, const Interleavable * const rh) {
+    if (LLVM_LIKELY(lh->size() != rh->size())) {
+        return lh->size() < rh->size();
+    }
+    for (auto i = lh->begin(), j = rh->begin(); i != lh->end(); ++i, ++j) {
+        assert (*i && *j);
+        if (compare(*i, *j)) {
+            return true;
+        } else if (compare(*j, *i)) {
+            return false;
+        }
+    }
+    return false;
+}
+
+
 static bool compare(const RE * const lh, const RE * const rh) {
     using Type = RE::ClassTypeId;
     assert (lh && rh);
@@ -201,6 +232,10 @@ static bool compare(const RE * const lh, const RE * const rh) {
             return lessThan(cast<Intersect>(lh), cast<Intersect>(rh));
         case Type::Rep:
             return lessThan(cast<Rep>(lh), cast<Rep>(rh));
+        case Type::Permute:
+            return lessThan(cast<Permute>(lh), cast<Permute>(rh));
+        case Type::Interleavable:
+            return lessThan(cast<Interleavable>(lh), cast<Interleavable>(rh));
         case Type::PropertyExpression:
             return lessThan(cast<PropertyExpression>(lh), cast<PropertyExpression>(rh));
         default:

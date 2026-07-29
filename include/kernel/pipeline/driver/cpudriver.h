@@ -3,7 +3,6 @@
 #include <kernel/pipeline/driver/driver.h>
 #include <toolchain/toolchain.h>
 
-namespace llvm { class TargetMachine; }
 namespace llvm { class raw_fd_ostream; }
 namespace llvm { class ModulePass; }
 namespace kernel { class KernelBuilder; }
@@ -41,10 +40,9 @@ private:
     std::unique_ptr<llvm::raw_fd_ostream>                   mUnoptimizedIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
-    std::vector<std::pair<llvm::Function *, void *>>        mCachedFunctionMappings;
+
     std::vector<llvm::orc::ThreadSafeContext>               mContexts;
     std::unique_ptr<llvm::orc::SymbolLookupSet>             mSymbolLookupSet;
-    std::unique_ptr<llvm::TargetMachine>                    mTarget;
     std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
 };
 

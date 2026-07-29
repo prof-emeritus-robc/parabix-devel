@@ -31,6 +31,8 @@ static cl::opt<bool> ShortStrides("short-strides", cl::desc("Use short stride ke
 static cl::opt<bool> SeparatedMergeByMask("separated-merge-by-mask", cl::desc("implement merge-by-mask by combining two spread-by-mask steps"), cl::init(false), cl::cat(codegen::CodeGenOptions));
 static cl::opt<bool> UnalignedLoads("UnalignedLoads", cl::desc("Use unaligned loads in ElemSpread"), cl::init(false), cl::cat(codegen::CodeGenOptions));
 static cl::opt<bool> RecursiveSpreadMaskCalculation("RecursiveSpreadMaskCalculation", cl::desc("Use recursive multi-kernel approach to insertion spread mask calculation (legacy)"), cl::init(false), cl::cat(codegen::CodeGenOptions));
+static cl::opt<bool> PreferFieldLoads("PreferFieldLoads", cl::desc("Use field loads in preference to extract element"), cl::init(false), cl::cat(codegen::CodeGenOptions));
+static cl::opt<bool> PreferFieldStores("PreferFieldStores", cl::desc("Use field stores in preference to insert element"), cl::init(false), cl::cat(codegen::CodeGenOptions));
 
 namespace kernel {
 
@@ -945,256 +947,34 @@ FieldDepositKernel::FieldDepositKernel(LLVMTypeSystemInterface & ts
 
 }
 
-void PDEPFieldDepositLogic(KernelBuilder & b, llvm::Value * const numOfStrides, unsigned fieldWidth, unsigned streamCount, unsigned stride);
-
 void FieldDepositKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) {
-    if (b.hasFeature(IDISA::Feature::AVX_BMI2) && ((mFieldWidth == 32) || (mFieldWidth == 64))) {
-        PDEPFieldDepositLogic(b, numOfStrides, mFieldWidth, mStreamCount, getStride());
-    } else {
-        BasicBlock * entry = b.GetInsertBlock();
-        BasicBlock * processBlock = b.CreateBasicBlock("processBlock");
-        BasicBlock * done = b.CreateBasicBlock("done");
-        Constant * const ZERO = b.getSize(0);
-        Value * numOfBlocks = numOfStrides;
-        if (getStride() != b.getBitBlockWidth()) {
-            numOfBlocks = b.CreateShl(numOfStrides, b.getSize(floor_log2(getStride()/b.getBitBlockWidth())));
-        }
-        b.CreateBr(processBlock);
-
-        b.SetInsertPoint(processBlock);
-        PHINode * blockOffsetPhi = b.CreatePHI(b.getSizeTy(), 2);
-        blockOffsetPhi->addIncoming(ZERO, entry);
-        Value * depositMask = b.loadInputStreamBlock("depositMask", ZERO, blockOffsetPhi);
-        for (unsigned j = 0; j < mStreamCount; ++j) {
-            Value * input = b.loadInputStreamBlock("inputStreamSet", b.getInt32(j), blockOffsetPhi);
-            Value * output = b.simd_pdep(mFieldWidth, input, depositMask);
-            b.storeOutputStreamBlock("outputStreamSet", b.getInt32(j), blockOffsetPhi, output);
-        }
-        Value * nextBlk = b.CreateAdd(blockOffsetPhi, b.getSize(1));
-        blockOffsetPhi->addIncoming(nextBlk, processBlock);
-        Value * moreToDo = b.CreateICmpNE(nextBlk, numOfBlocks);
-        b.CreateCondBr(moreToDo, processBlock, done);
-
-        b.SetInsertPoint(done);
-    }
-}
-
-//#define PREFER_FIELD_STORES_OVER_INSERT_ELEMENT
-
-void PDEPFieldDepositLogic(KernelBuilder & b, llvm::Value * const numOfStrides, unsigned fieldWidth, unsigned streamCount, unsigned stride) {
-    Type * fieldTy = b.getIntNTy(fieldWidth);
     BasicBlock * entry = b.GetInsertBlock();
     BasicBlock * processBlock = b.CreateBasicBlock("processBlock");
     BasicBlock * done = b.CreateBasicBlock("done");
     Constant * const ZERO = b.getSize(0);
-    const unsigned fieldsPerBlock = b.getBitBlockWidth()/fieldWidth;
     Value * numOfBlocks = numOfStrides;
-    if (stride != b.getBitBlockWidth()) {
-        numOfBlocks = b.CreateShl(numOfStrides, b.getSize(floor_log2(stride/b.getBitBlockWidth())));
+    if (getStride() != b.getBitBlockWidth()) {
+        numOfBlocks = b.CreateShl(numOfStrides, b.getSize(floor_log2(getStride()/b.getBitBlockWidth())));
     }
     b.CreateBr(processBlock);
+
     b.SetInsertPoint(processBlock);
     PHINode * blockOffsetPhi = b.CreatePHI(b.getSizeTy(), 2);
     blockOffsetPhi->addIncoming(ZERO, entry);
-
-    SmallVector<Value *, 16> mask(fieldsPerBlock);
-    //  When operating on fields individually, we can use vector load/store with
-    //  extract/insert element operations, or we can use individual field load
-    //  and stores.   Individual field operations require fewer total operations,
-    //  but more memory instructions.   It may be that vector load/extract is better,
-    //  while field store is better.   Vector insert then store creates long dependence
-    //  chains.
-    //
-#ifdef PREFER_FIELD_LOADS_OVER_EXTRACT_ELEMENT
-    Value * depositMaskPtr = b.getInputStreamBlockPtr("depositMask", ZERO, blockOffsetPhi);
-    for (unsigned i = 0; i < fieldsPerBlock; i++) {
-        mask[i] = b.CreateLoad(fieldTy, b.CreateGEP(fiedlTy, depositMaskPtr, b.getInt32(i)));
-    }
-#else
-
-    Value * depositMask = b.fwCast(fieldWidth, b.loadInputStreamBlock("depositMask", ZERO, blockOffsetPhi));
-    for (unsigned i = 0; i < fieldsPerBlock; i++) {
-        mask[i] = b.CreateExtractElement(depositMask, b.getInt32(i));
-    }
-#endif
-    for (unsigned j = 0; j < streamCount; ++j) {
-#ifdef PREFER_FIELD_LOADS_OVER_EXTRACT_ELEMENT
-        Value * inputPtr = b.getInputStreamBlockPtr("inputStreamSet", b.getInt32(j), blockOffsetPhi);
-#else
-        Value * const input = b.loadInputStreamBlock("inputStreamSet", b.getInt32(j), blockOffsetPhi);
-        Value * inputStrm = b.fwCast(fieldWidth, input);
-#endif
-#ifdef PREFER_FIELD_STORES_OVER_INSERT_ELEMENT
-        Value * outputPtr = b.getOutputStreamBlockPtr("outputStreamSet", b.getInt32(j), blockOffsetPhi);
-#else
-        // Value * outputStrm = b.fwCast(mPDEPWidth, b.allZeroes());
-        Value * outputStrm = UndefValue::get(b.fwVectorType(fieldWidth));
-#endif
-        for (unsigned i = 0; i < fieldsPerBlock; i++) {
-#ifdef PREFER_FIELD_LOADS_OVER_EXTRACT_ELEMENT
-            Value * field = b.CreateLoad(fieldTy, b.CreateGEP(fieldTy, inputPtr, b.getInt32(i)));
-#else
-            Value * field = b.CreateExtractElement(inputStrm, b.getInt32(i));
-#endif
-            Value * compressed = b.CreatePdeposit(field, mask[i]);
-#ifdef PREFER_FIELD_STORES_OVER_INSERT_ELEMENT
-            b.CreateStore(compressed, b.CreateGEP(fieldTy, outputPtr, b.getInt32(i)));
-        }
-#else
-        outputStrm = b.CreateInsertElement(outputStrm, compressed, b.getInt32(i));
-    }
-    b.storeOutputStreamBlock("outputStreamSet", b.getInt32(j), blockOffsetPhi, outputStrm);
-#endif
+    Value * depositMask = b.loadInputStreamBlock("depositMask", ZERO, blockOffsetPhi);
+    for (unsigned j = 0; j < mStreamCount; ++j) {
+        Value * input = b.loadInputStreamBlock("inputStreamSet", b.getInt32(j), blockOffsetPhi);
+        Value * output = b.simd_pdep(mFieldWidth, input, depositMask);
+        b.storeOutputStreamBlock("outputStreamSet", b.getInt32(j), blockOffsetPhi, output);
     }
     Value * nextBlk = b.CreateAdd(blockOffsetPhi, b.getSize(1));
     blockOffsetPhi->addIncoming(nextBlk, processBlock);
     Value * moreToDo = b.CreateICmpNE(nextBlk, numOfBlocks);
     b.CreateCondBr(moreToDo, processBlock, done);
+
     b.SetInsertPoint(done);
 }
 
-PDEPFieldDepositKernel::PDEPFieldDepositKernel(LLVMTypeSystemInterface & ts
-                                               , StreamSet * mask, StreamSet * input, StreamSet * output
-                                               , const unsigned fieldWidth)
-: MultiBlockKernel(ts, "PDEPFieldDeposit" + std::to_string(fieldWidth) + "_" + std::to_string(input->getNumElements()) ,
-                   {Binding{"depositMask", mask},
-                    Binding{"inputStreamSet", input}},
-                   {Binding{"outputStreamSet", output}},
-                   {}, {}, {})
-, mPDEPWidth(fieldWidth)
-, mStreamCount(input->getNumElements()) {
-    if ((fieldWidth != 32) && (fieldWidth != 64))
-        llvm::report_fatal_error("Unsupported PDEP width for PDEPFieldDepositKernel");
-}
-
-void PDEPFieldDepositKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) {
-    PDEPFieldDepositLogic(b, numOfStrides, mPDEPWidth, mStreamCount, getStride());
-}
-
-
-PDEPkernel::PDEPkernel(LLVMTypeSystemInterface & ts, const unsigned swizzleFactor, std::string name)
-: MultiBlockKernel(ts, std::move(name),
-                   // input stream sets
-{Binding{ts.getStreamSetTy(), "marker", FixedRate(), Principal()},
-    Binding{ts.getStreamSetTy(swizzleFactor), "source", PopcountOf("marker"), BlockSize(ts.getBitBlockWidth() / swizzleFactor) }},
-                   // output stream set
-{Binding{ts.getStreamSetTy(swizzleFactor), "output", FixedRate(), BlockSize(ts.getBitBlockWidth() / swizzleFactor)}},
-{}, {}, {})
-, mSwizzleFactor(swizzleFactor) {
-}
-
-void PDEPkernel::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) {
-    BasicBlock * const entry = b.GetInsertBlock();
-    BasicBlock * const processBlock = b.CreateBasicBlock("processBlock");
-    BasicBlock * const finishedStrides = b.CreateBasicBlock("finishedStrides");
-    const auto pdepWidth = b.getBitBlockWidth() / mSwizzleFactor;
-    ConstantInt * const BLOCK_WIDTH = b.getSize(b.getBitBlockWidth());
-    ConstantInt * const PDEP_WIDTH = b.getSize(pdepWidth);
-
-    Constant * const ZERO = b.getSize(0);
-    Value * const sourceItemCount = b.getProcessedItemCount("source");
-
-    Value * numOfBlocks = numOfStrides;
-    if (getStride() != b.getBitBlockWidth()) {
-        numOfBlocks = b.CreateShl(numOfStrides, b.getSize(floor_log2(getStride()/b.getBitBlockWidth())));
-    }
-    Value * const initialSourceOffset = b.CreateURem(sourceItemCount, BLOCK_WIDTH);
-    b.CreateBr(processBlock);
-
-    b.SetInsertPoint(processBlock);
-    PHINode * const strideIndex = b.CreatePHI(b.getSizeTy(), 2);
-    strideIndex->addIncoming(ZERO, entry);
-    PHINode * const bufferPhi = b.CreatePHI(b.getBitBlockType(), 2);
-    bufferPhi->addIncoming(Constant::getNullValue(b.getBitBlockType()), entry);
-    PHINode * const sourceOffsetPhi = b.CreatePHI(b.getSizeTy(), 2);
-    sourceOffsetPhi->addIncoming(initialSourceOffset, entry);
-    PHINode * const bufferSizePhi = b.CreatePHI(b.getSizeTy(), 2);
-    bufferSizePhi->addIncoming(ZERO, entry);
-
-    // Extract the values we will use in the main processing loop
-    Value * const markerStream = b.getInputStreamBlockPtr("marker", ZERO, strideIndex);
-    Type * const vecType = b.fwVectorType(pdepWidth);
-    Value * const selectors = b.CreateBlockAlignedLoad(vecType, markerStream);
-    Value * const numOfSelectors = b.simd_popcount(pdepWidth, selectors);
-
-    // For each element of the marker block
-    Value * bufferSize = bufferSizePhi;
-    Value * sourceOffset = sourceOffsetPhi;
-    Value * buffer = bufferPhi;
-    for (unsigned i = 0; i < mSwizzleFactor; i++) {
-
-        // How many bits will we deposit?
-        Value * const required = b.CreateExtractElement(numOfSelectors, b.getSize(i));
-
-        // Aggressively enqueue any additional bits
-        BasicBlock * const entry = b.GetInsertBlock();
-        BasicBlock * const enqueueBits = b.CreateBasicBlock();
-        b.CreateBr(enqueueBits);
-
-        b.SetInsertPoint(enqueueBits);
-        PHINode * const updatedBufferSize = b.CreatePHI(bufferSize->getType(), 2);
-        updatedBufferSize->addIncoming(bufferSize, entry);
-        PHINode * const updatedSourceOffset = b.CreatePHI(sourceOffset->getType(), 2);
-        updatedSourceOffset->addIncoming(sourceOffset, entry);
-        PHINode * const updatedBuffer = b.CreatePHI(buffer->getType(), 2);
-        updatedBuffer->addIncoming(buffer, entry);
-
-        // Calculate the block and swizzle index of the current swizzle row
-        Value * const blockOffset = b.CreateUDiv(updatedSourceOffset, BLOCK_WIDTH);
-        Value * const swizzleIndex = b.CreateUDiv(b.CreateURem(updatedSourceOffset, BLOCK_WIDTH), PDEP_WIDTH);
-        Value * const swizzle = b.CreateBlockAlignedLoad(b.getBitBlockType(), b.getInputStreamBlockPtr("source", swizzleIndex, blockOffset));
-        Value * const swizzleOffset = b.CreateURem(updatedSourceOffset, PDEP_WIDTH);
-
-        // Shift the swizzle to the right to clear off any used bits ...
-        Value * const swizzleShift = b.simd_fill(pdepWidth, swizzleOffset);
-        Value * const unreadBits = b.CreateLShr(swizzle, swizzleShift);
-
-        // ... then to the left to align the bits with the buffer and combine them.
-        Value * const bufferShift = b.simd_fill(pdepWidth, updatedBufferSize);
-        Value * const pendingBits = b.CreateShl(unreadBits, bufferShift);
-
-        buffer = b.CreateOr(updatedBuffer, pendingBits);
-        updatedBuffer->addIncoming(buffer, enqueueBits);
-
-        // Update the buffer size with the number of bits we have actually enqueued
-        Value * const maxBufferSize = b.CreateAdd(b.CreateSub(PDEP_WIDTH, swizzleOffset), updatedBufferSize);
-        bufferSize = b.CreateUMin(maxBufferSize, PDEP_WIDTH);
-        updatedBufferSize->addIncoming(bufferSize, enqueueBits);
-
-        // ... and increment the source offset by the number we actually inserted
-        Value * const inserted = b.CreateSub(bufferSize, updatedBufferSize);
-        sourceOffset = b.CreateAdd(updatedSourceOffset, inserted);
-        updatedSourceOffset->addIncoming(sourceOffset, enqueueBits);
-
-        // INVESTIGATE: we can branch at most once here. I'm not sure whether the potential
-        // branch misprediction is better or worse than always filling from two swizzles to
-        // ensure that we have enough bits to deposit.
-        BasicBlock * const depositBits = b.CreateBasicBlock();
-        b.CreateUnlikelyCondBr(b.CreateICmpULT(bufferSize, required), enqueueBits, depositBits);
-
-        b.SetInsertPoint(depositBits);
-        // Apply PDEP to each element of the combined swizzle using the current PDEP mask
-        Value * const mask = b.CreateExtractElement(selectors, i);
-        Value* result = b.simd_pdep(pdepWidth, buffer, b.simd_fill(pdepWidth, mask));
-        // Store the result
-        Value * const outputStreamPtr = b.getOutputStreamBlockPtr("output", b.getSize(i), strideIndex);
-        b.CreateBlockAlignedStore(result, outputStreamPtr);
-        // Shift away any used bits from the buffer and decrement our buffer size by the number we used
-        Value * const usedShift = b.simd_fill(pdepWidth, required);
-        buffer = b.CreateLShr(buffer, usedShift);
-        bufferSize = b.CreateSub(bufferSize, required);
-    }
-
-    BasicBlock * const finishedBlock = b.GetInsertBlock();
-    sourceOffsetPhi->addIncoming(sourceOffset, finishedBlock);
-    bufferSizePhi->addIncoming(bufferSize, finishedBlock);
-    bufferPhi->addIncoming(buffer, finishedBlock);
-    Value * const nextStrideIndex = b.CreateAdd(strideIndex, b.getSize(1));
-    strideIndex->addIncoming(nextStrideIndex, finishedBlock);
-    b.CreateLikelyCondBr(b.CreateICmpNE(nextStrideIndex, numOfBlocks), processBlock, finishedStrides);
-
-    b.SetInsertPoint(finishedStrides);
-}
 
 std::string InsertString(StreamSet * mask, InsertPosition p) {
     std::string s = std::to_string(mask->getNumElements()) + "x1_";
@@ -1250,7 +1030,6 @@ void UnitInsertionExtractionMasks::generateFinalBlockMethod(KernelBuilder & b, V
     RepeatDoBlockLogic(b);
 }
 
-#define USE_FILTER_BY_MASK_KERNEL
 void UnitInsertionSpreadMask(PipelineBuilder & P,
                              StreamSet * insertion_mask,
                              StreamSet * spread_mask,
@@ -1259,14 +1038,7 @@ void UnitInsertionSpreadMask(PipelineBuilder & P,
         auto stream01 = P.CreateStreamSet(1);
         auto valid01 = P.CreateStreamSet(1);
         P.CreateKernelCall<UnitInsertionExtractionMasks>(insertion_mask, stream01, valid01, p);
-#ifndef USE_FILTER_BY_MASK_KERNEL
-        FilterByMask(P, valid01, stream01, spread_mask, spreadCountDensity);
-#else
-        P.CreateKernelCall<FilterByMaskKernel>
-            (Select(valid01, {0}),
-             SelectOperationList{Select(stream01, {0})},
-             spread_mask, 64);
-#endif
+        FilterByMask(P, valid01, stream01, spread_mask);
     } else {
         P.CreateKernelCall<UnitInsertionSpreadMaskKernel>(insertion_mask, spread_mask, p);
     }

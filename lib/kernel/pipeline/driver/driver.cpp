@@ -183,7 +183,8 @@ BaseDriver::BaseDriver(std::string && moduleName)
 : mContext(new LLVMContext())
 , mMainModule(new Module(moduleName, *mContext))
 , mBuilder(nullptr)
-, mObjectCache(nullptr) {
+, mObjectCache(nullptr)
+, mTarget(nullptr) {
     if (LLVM_UNLIKELY(codegen::EnableObjectCache)) {
         mObjectCache.reset(new ParabixObjectCache());
     }

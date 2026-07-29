@@ -144,6 +144,38 @@ std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexAlph
             return std::make_pair(1, 4);
         }
         return std::make_pair(1, INT_MAX);
+    } else if (const Permute * p = dyn_cast<Permute>(re)) {
+        std::pair<int, int> range = std::make_pair(0, 0);
+        for (const RE * term : *p) {
+            auto tmp = getLengthRange(term, indexAlphabet);
+            if (LLVM_LIKELY(tmp.first < (INT_MAX - range.first))) {
+                range.first += tmp.first;
+            } else {
+                range.first = INT_MAX;
+            }
+            if (LLVM_LIKELY(tmp.second < (INT_MAX - range.second))) {
+                range.second += tmp.second;
+            } else {
+                range.second = INT_MAX;
+            }
+        }
+        return range;
+    } else if (const Interleavable * s = dyn_cast<Interleavable>(re)) {
+        std::pair<int, int> range = std::make_pair(0, 0);
+        for (const RE * term : *s) {
+            auto tmp = getLengthRange(term, indexAlphabet);
+            if (LLVM_LIKELY(tmp.first < (INT_MAX - range.first))) {
+                range.first += tmp.first;
+            } else {
+                range.first = INT_MAX;
+            }
+            if (LLVM_LIKELY(tmp.second < (INT_MAX - range.second))) {
+                range.second += tmp.second;
+            } else {
+                range.second = INT_MAX;
+            }
+        }
+        return range;
     } else if (const Name * n = dyn_cast<Name>(re)) {
         RE * defn = n->getDefinition();
         if (defn) return getLengthRange(defn, indexAlphabet);

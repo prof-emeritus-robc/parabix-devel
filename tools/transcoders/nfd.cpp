@@ -78,7 +78,7 @@ void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, Strea
 
     P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
 
-    P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
+    Selected_S2P(P, ByteStream, BasisBits);
     SHOW_BIXNUM(BasisBits);
 }
 

@@ -173,6 +173,7 @@ flag_map = {'-CarryMode' : ['Compressed', 'BitBlock'],
             '-ccc-type' : ['ternary'],
             '-colors' : ['always', 'never'],
             '-EnableTernaryOpt' : [],
+            '-S2P_Mode' : ['BytePack', 'Split', 'Ideal'],
             '-maxlimit-termination-mode' : ['report', 'terminate', 'zero']}
 
 def add_random_flags(flags, fileLength):

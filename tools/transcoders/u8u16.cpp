@@ -45,13 +45,8 @@ static cl::OptionCategory u8u16Options("u8u16 Options", "Transcoding control opt
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(u8u16Options));
 static cl::opt<std::string> outputFile(cl::Positional, cl::desc("<output file>"), cl::cat(u8u16Options));
 static cl::opt<std::string> OutputEncoding("encoding", cl::desc("Output encoding (default: UTF-16BE)"), cl::init("UTF-16BE"), cl::cat(u8u16Options));
-static cl::opt<bool> enableAVXdel("enable-AVX-deletion", cl::desc("Enable AVX2 deletion algorithms."), cl::cat(u8u16Options));
 
 static cl::opt<bool> BranchingMode("branch", cl::desc("Use Experimental branching pipeline mode"), cl::cat(u8u16Options));
-
-inline bool useAVX2() {
-    return enableAVXdel && AVX2_available() && codegen::BlockSize == 256;
-}
 
 class U8U16Kernel final: public pablo::PabloKernel {
 public:
@@ -284,27 +279,12 @@ u8u16FunctionType generatePipeline(CPUDriver & driver, cc::ByteNumbering byteNum
     StreamSet * selectors = P.CreateStreamSet();
     P.CreateKernelCall<U8U16Kernel>(BasisBits, u8bits, selectors);
     StreamSet * u16bytes = P.CreateStreamSet(1, 16);
-    if (useAVX2()) {
-        // Allocate space for fully compressed swizzled UTF-16 bit streams
-        std::vector<StreamSet *> u16Swizzles(4);
-        u16Swizzles[0] = P.CreateStreamSet(4);
-        u16Swizzles[1] = P.CreateStreamSet(4);
-        u16Swizzles[2] = P.CreateStreamSet(4);
-        u16Swizzles[3] = P.CreateStreamSet(4);
-        // Apply a deletion algorithm to discard all but the final position of the UTF-8
-        // sequences (bit streams) for each UTF-16 code unit. Also compresses and swizzles the result.
-        P.CreateKernelCall<SwizzledDeleteByPEXTkernel>(selectors, u8bits, u16Swizzles);
-        // Produce unswizzled UTF-16 bit streams
-        P.CreateKernelCall<SwizzleGenerator>(u16Swizzles, std::vector<StreamSet *>{u16bits});
-        P.CreateKernelCall<P2S16Kernel>(u16bits, u16bytes);
-    } else {
-        const auto fieldWidth = P.getBitBlockWidth() / 16;
-        P.CreateKernelCall<FieldCompressKernel>(Select(selectors, {0}),
-                                                 SelectOperationList{Select(u8bits, streamutils::Range(0, 16))},
-                                                 u16bits,
-                                                 fieldWidth);
-        P.CreateKernelCall<P2S16KernelWithCompressedOutput>(u16bits, selectors, u16bytes, byteNumbering);
-    }
+    const auto fieldWidth = P.getBitBlockWidth() / 16;
+    P.CreateKernelCall<FieldCompressKernel>(Select(selectors, {0}),
+                                             SelectOperationList{Select(u8bits, streamutils::Range(0, 16))},
+                                             u16bits,
+                                             fieldWidth);
+    P.CreateKernelCall<P2S16KernelWithCompressedOutput>(u16bits, selectors, u16bytes, byteNumbering);
 
     Scalar * outputFileName = P.getInputScalar("outputFileName");
     P.CreateKernelCall<FileSink>(outputFileName, u16bytes);
@@ -327,27 +307,12 @@ void makeNonAsciiBranch(LLVMTypeSystemInterface & driver,
     P.CreateKernelCall<U8U16Kernel>(BasisBits, u8bits, selectors);
 
     StreamSet * u16bits = P.CreateStreamSet(16);
-    if (useAVX2()) {
-        // Allocate space for fully compressed swizzled UTF-16 bit streams
-        std::vector<StreamSet *> u16Swizzles(4);
-        u16Swizzles[0] = P.CreateStreamSet(4);
-        u16Swizzles[1] = P.CreateStreamSet(4);
-        u16Swizzles[2] = P.CreateStreamSet(4);
-        u16Swizzles[3] = P.CreateStreamSet(4);
-        // Apply a deletion algorithm to discard all but the final position of the UTF-8
-        // sequences (bit streams) for each UTF-16 code unit. Also compresses and swizzles the result.
-        P.CreateKernelCall<SwizzledDeleteByPEXTkernel>(selectors, u8bits, u16Swizzles);
-        // Produce unswizzled UTF-16 bit streams
-        P.CreateKernelCall<SwizzleGenerator>(u16Swizzles, std::vector<StreamSet *>{u16bits});
-        P.CreateKernelCall<P2S16Kernel>(u16bits, u16bytes);
-    } else {
-        const auto fieldWidth = driver.getBitBlockWidth() / 16;
-        P.CreateKernelCall<FieldCompressKernel>(Select(selectors, {0}),
-                                                 SelectOperationList{Select(u8bits, streamutils::Range(0, 16))},
-                                                 u16bits,
-                                                 fieldWidth);
-        P.CreateKernelCall<P2S16KernelWithCompressedOutput>(u16bits, selectors, u16bytes, byteNumbering);
-    }
+    const auto fieldWidth = driver.getBitBlockWidth() / 16;
+    P.CreateKernelCall<FieldCompressKernel>(Select(selectors, {0}),
+                                             SelectOperationList{Select(u8bits, streamutils::Range(0, 16))},
+                                             u16bits,
+                                             fieldWidth);
+    P.CreateKernelCall<P2S16KernelWithCompressedOutput>(u16bits, selectors, u16bytes, byteNumbering);
 }
 
 void makeAllAsciiBranch(PipelineBuilder & P, StreamSet * const ByteStream, StreamSet * const u16bytes, cc::ByteNumbering byteNumbering) {

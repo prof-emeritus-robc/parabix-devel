@@ -37,4 +37,32 @@ RE * makePermute(const iterator begin, const iterator end) {
 inline RE * makePermute(std::initializer_list<RE *> list) {
     return makePermute(list.begin(), list.end());
 }
+
+class Interleavable : public RE, public std::vector<RE*, ProxyAllocator<RE *>> {
+public:
+    static inline bool classof(const RE * re) {
+        return re->getClassTypeId() == ClassTypeId::Interleavable;
+    }
+    static inline bool classof(const void *) {
+        return false;
+    }
+    template<typename iterator> static Interleavable * Create(const iterator begin, const iterator end) {return new Interleavable(begin, end);}
+protected:
+    template<typename iterator> friend RE * makeInterleavable(iterator, iterator);
+    Interleavable() : RE(ClassTypeId::Interleavable), std::vector<RE*, ProxyAllocator<RE *>>(mAllocator) {}
+    template<typename iterator>
+    Interleavable(const iterator begin, const iterator end)
+    : RE(ClassTypeId::Interleavable), std::vector<RE*, ProxyAllocator<RE *>>(begin, end, mAllocator) { }
+};
+
+template<typename iterator>
+RE * makeInterleavable(const iterator begin, const iterator end) {
+    return new Interleavable(begin, end);
 }
+
+inline RE * makeInterleavable(std::initializer_list<RE *> list) {
+    return makeInterleavable(list.begin(), list.end());
+}
+
+}
+

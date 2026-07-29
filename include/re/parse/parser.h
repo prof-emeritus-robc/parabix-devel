@@ -169,9 +169,13 @@ protected:
     
     virtual RE * parse_permute();
 
+    virtual RE * parse_interleavable();
+
     virtual RE * parse_seq();
 
     virtual RE * parse_next_item();
+
+    RE * parse_next_item(std::string breakchars);
 
     virtual RE * parse_group();
     

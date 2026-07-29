@@ -76,9 +76,6 @@ enum PipelineCompilationModeOptions {
     , Expensive
 };
 
-extern bool PabloTransposition;
-extern bool SplitTransposition;
-
 bool LLVM_READONLY DebugOptionIsSet(const DebugFlags flag);
 
 bool LLVM_READONLY DebugOptionIsSet(const DebugFlags flag1, const DebugFlags flag2);

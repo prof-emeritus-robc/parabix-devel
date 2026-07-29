@@ -22,32 +22,52 @@ private:
 };
 
 RE * ExpandPermutes::transformPermute(Permute * p) {
-    unsigned perm_size = p->size();
-    unsigned total_length = 0;
-    std::vector<RE *> alts(perm_size);
-    std::vector<unsigned> alt_lgth(perm_size);
-    unsigned i = 0;
+    auto rg =  getLengthRange(p, mLengthAlphabet);
+    if (rg.first != rg.second) {
+        llvm::report_fatal_error("Variable length permutation terms are prohibited.");
+    }
+    unsigned total_length = rg.first;
+    unsigned total_size = 0;
     for (auto perm : *p) {
-        alts[i] = perm;
-        auto rg =  getLengthRange(perm, mLengthAlphabet);
-        if (rg.first != rg.second) {
-            llvm::report_fatal_error("Variable length permutation terms are prohibited.");
+        if (Interleavable * s = dyn_cast<Interleavable>(perm)) {
+            total_size += s->size();
+        } else {
+            total_size += 1;
         }
-        alt_lgth[i] = rg.first;
-        total_length += rg.first;
-        i++;
     }
-    std::vector<RE *> elems(perm_size + 1);
-    RE * anyAlt = makeAlt(alts.begin(), alts.end());
-    elems[0] = makeRep(anyAlt, perm_size, perm_size);
-    i = 0;
+    std::vector<RE *> elems(total_size);
+    std::vector<RE *> clauses(total_size + 1);
+    unsigned i = 0;
+    RE * anyOne = makeAny(mLengthAlphabet);
     for (auto perm : *p) {
-        unsigned remlgth = total_length - alt_lgth[i];
-        RE * r = makeSeq({perm, makeRep(makeAny(mLengthAlphabet), 0, remlgth)});
-        elems[i+1] = makeLookBehindAssertion(r);
-        i++;
+        if (Interleavable * s = dyn_cast<Interleavable>(perm)) {
+            std::vector<RE *> prior;
+            unsigned rem_lgth = total_length;
+            RE * repeatable = anyOne;
+            for (auto term : * s) {
+                unsigned term_lgth = getLengthRange(term, mLengthAlphabet).first;
+                rem_lgth = rem_lgth - term_lgth;
+                if (!prior.empty()) {
+                    RE * anyPrior = makeAlt(prior.begin(), prior.end());
+                    repeatable = makeSeq({anyOne, makeNegativeLookBehindAssertion(anyPrior)});
+                }
+                RE * constraint = makeLookBehindAssertion(makeSeq({term, makeRep(repeatable, 0, rem_lgth)}));
+                prior.push_back(term);
+                elems[i] = term;
+                clauses[i+1] = constraint;
+                i++;
+            }
+        } else {
+            unsigned term_lgth = getLengthRange(perm, mLengthAlphabet).first;
+            unsigned rem_lgth = total_length - term_lgth;
+            RE * constraint = makeLookBehindAssertion(makeSeq({perm, makeRep(anyOne, 0, rem_lgth)}));
+            elems[i] = perm;
+            clauses[i+1] = constraint;
+            i++;
+        }
     }
-    return makeSeq(elems.begin(), elems.end());
+    clauses[0] = makeRep(makeAlt(elems.begin(), elems.end()), elems.size(), elems.size());
+    return makeSeq(clauses.begin(), clauses.end());
 }
 
 RE * expandPermutes(RE * r, const cc::Alphabet * lengthAlpha) {

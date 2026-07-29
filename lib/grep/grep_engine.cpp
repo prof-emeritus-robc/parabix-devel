@@ -787,13 +787,9 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
             P.captureBitstream("FilteredMatchSpans", FilteredMatchSpans);
         }
         StreamSet * FilteredBasis = P.CreateStreamSet(8, 1);
-        if (codegen::SplitTransposition) {
-            Staged_S2P(P, Filtered, FilteredBasis);
-        } else {
-            P.CreateKernelCall<S2PKernel>(Filtered, FilteredBasis);
-            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-                P.captureBixNum("FilteredBasis", FilteredBasis);
-            }
+        Selected_S2P(P, Filtered, FilteredBasis);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBixNum("FilteredBasis", FilteredBasis);
         }
 
         applyColorization(P, SourceCoords, FilteredMatchSpans, FilteredBasis);

@@ -49,6 +49,7 @@ protected:
     virtual void inspectGroup(Group * g);
     virtual void inspectAssertion(Assertion * a);
     virtual void inspectPermute(Permute * p);
+    virtual void inspectInterleavable(Interleavable * s);
     virtual void inspectPropertyExpression(PropertyExpression * pe);
 private:
     const NameProcessingMode mNameMode;

@@ -12,10 +12,13 @@ std::vector<Value *> PipelineCompiler::getFinalOutputScalars(KernelBuilder & b) 
         const RelationshipNode & rn = mScalarGraph[call];
         const CallBinding & C = rn.Callee;
         Function * const f = cast<Function>(C.Callee);
+        assert (&f->getContext() == &b.getContext());
         auto i = f->arg_begin();
         for (auto j = args.begin(); j != args.end(); ++i, ++j) {
             assert (i != f->arg_end());
-            *j = b.CreateZExtOrTrunc(*j, i->getType());
+            Type * ty = i->getType();
+            ty = CBuilder::convertTypeToLLVMContext(b.getContext(), ty);
+            *j = b.CreateZExtOrTrunc(*j, ty);
         }
         assert (i == f->arg_end());
         mScalarValue[call] = b.CreateCall(f, args);
@@ -33,7 +36,9 @@ void PipelineCompiler::writeOutputScalars(KernelBuilder & b, const size_t index,
     for (const auto e : make_iterator_range(in_edges(index, mScalarGraph))) {
         const auto scalar = source(e, mScalarGraph);
         const RelationshipType & rt = mScalarGraph[e];
-        args[rt.Number] = getScalar(b, scalar);
+        Value * val = getScalar(b, scalar);
+        assert (&val->getContext() == &b.getContext());
+        args[rt.Number] = val;
     }
 }
 
@@ -51,6 +56,7 @@ Value * PipelineCompiler::getScalar(KernelBuilder & b, const size_t index) {
     assert (index >= FirstKernel && index <= LastScalar);
     Value * value = mScalarValue[index];
     if (value) {
+        assert (&value->getContext() == &b.getContext());
         return value;
     }
 

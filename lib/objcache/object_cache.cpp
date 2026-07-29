@@ -3,6 +3,7 @@
 #include <objcache/object_cache_util.hpp>
 #include <kernel/core/kernel.h>
 #include <kernel/core/kernel_builder.h>
+#include <kernel/pipeline/driver/driver.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/ADT/Twine.h>
@@ -89,18 +90,6 @@ inline bool isNonMatchingSignature(const MDString * const received, const String
     return expected.compare(received->getString()) != 0;
 }
 
-// Helper utility to safely strip off our ORC finalize_run salt modifiers
-// and extract the original immutable moduleId string.
-static std::string getCleanCacheKey(const llvm::Module *M) {
-    if (!M) return "";
-    std::string Key = M->getModuleIdentifier();
-    size_t pos = Key.find("_run_");
-    if (pos != std::string::npos) {
-        Key = Key.substr(0, pos);
-    }
-    return Key;
-}
-
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedObjectFile
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -121,7 +110,7 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
         // Under ORC, the compiler physically claims absolute lifetime ownership of the module
         // and destroys it upon compilation completion. We must instantiate a clean structural
         // stub declaration module wrapper to safely satisfy the pipeline driver's state expectations.
-        kernel->makeModule(b);
+        kernel->setModule(f->second);
         kernel->setCompilationStatus(kernel::Kernel::CompilationStatus::UnownedModule);
         return CacheObjectResult::COMPILED;
     }
@@ -152,15 +141,15 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
                 }
                 sys::path::replace_extension(fileName, OBJECT_FILE_EXTENSION);
                 auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), false, false, false);
-                if (LLVM_LIKELY(objectBuffer)) {
+                if (LLVM_LIKELY(!!objectBuffer)) {
                     Module * const m = M.release();
                     assert ("object cache file returned null module?" && m);
                     // defaults to <path>/<moduleId>.kernel
                     m->setModuleIdentifier(moduleId);
                     b.setModule(m);
-                    kernel->loadCachedKernel(b);
-
-                    mCachedObject.emplace(moduleId, objectBuffer.get().release());
+                    kernel->loadCachedKernel(b); 
+                    std::unique_ptr<MemoryBuffer> obj(std::move(objectBuffer.get()));
+                    mCachedObject.emplace(moduleId, MemoryBufferRef(*obj));
                     mKnownSignatures.emplace(signature, m);
 
                     // update the modified time of the .o and .kernel files
@@ -168,6 +157,8 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
                     fs::last_write_time(fileName.c_str(), access_time);
                     sys::path::replace_extension(fileName, KERNEL_FILE_EXTENSION);
                     fs::last_write_time(fileName.c_str(), access_time);
+
+                    b.getDriver().addCachedObjectFile(m, std::move(obj));
 
                     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
                         errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
@@ -208,11 +199,10 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
 
     if (M->getNamedMetadata(CACHEABLE) == nullptr) return;
 
-    std::string moduleId = getCleanCacheKey(M);
+    auto moduleId = M->getModuleIdentifier();
 
     // Store back into the memory buffer cache system
-    auto CachedBuffer = MemoryBuffer::getMemBufferCopy(Obj.getBuffer(), Obj.getBufferIdentifier());
-    mCachedObject[moduleId] = std::move(CachedBuffer);
+    mCachedObject[moduleId] = Obj;
 
     Path objectName(mCachePath);
     sys::path::append(objectName, CACHE_PREFIX);
@@ -285,15 +275,13 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
  * @brief getObject
  ** ------------------------------------------------------------------------------------------------------------- */
 std::unique_ptr<MemoryBuffer> ParabixObjectCache::getObject(const Module * module) {
-    // FIX: Extract the core moduleId string by removing JIT execution run salt decorators
-    std::string moduleId = getCleanCacheKey(module);
-    auto f = mCachedObject.find(moduleId);
-    if (f != mCachedObject.end() && f->second != nullptr) {
-        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-            errs() << "Object Cache Hit: " << moduleId << "\n";
-        }
+    errs() << "peeking " << module->getModuleIdentifier() << "\n";
+    auto f = mCachedObject.find(module->getModuleIdentifier());
+    if (f != mCachedObject.end()) {
+        errs() << "getObject " << module->getModuleIdentifier() << "\n";
         // Return a copy clone buffer wrapper block to the compiler engine subsystem
-        return MemoryBuffer::getMemBuffer(f->second->getMemBufferRef());
+        auto ref = f->second;
+        return MemoryBuffer::getMemBufferCopy(ref.getBuffer(), ref.getBufferIdentifier());
     }
     return nullptr;
 }

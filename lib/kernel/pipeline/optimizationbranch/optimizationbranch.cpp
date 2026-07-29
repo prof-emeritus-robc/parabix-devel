@@ -9,17 +9,17 @@ namespace kernel {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(KernelBuilder & b) const {
+std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(KernelBuilder & b) {
     return std::make_unique<OptimizationBranchCompiler>(b, const_cast<OptimizationBranch *>(this));
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::addKernelDeclarations(KernelBuilder & b) {
-    mAllZeroKernel->addKernelDeclarations(b);
-    mNonZeroKernel->addKernelDeclarations(b);
-    Kernel::addKernelDeclarations(b);
+void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody) {
+    mAllZeroKernel->addKernelDeclarations(b, false);
+    mNonZeroKernel->addKernelDeclarations(b, false);
+    Kernel::addKernelDeclarations(b, addStubFunctionBody);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

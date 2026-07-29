@@ -166,10 +166,10 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
 
         const auto prefix = makeBufferName(mKernelId, inputPort);
 
-        const auto itemWidth = getItemWidth(buffer->getBaseType());
+        const auto itemWidth = buffer->getFieldWidth();
         Constant * const ITEM_WIDTH = b.getSize(itemWidth);
 
-        PointerType * const bufferType = buffer->getPointerType();
+        PointerType * const bufferType = buffer->getPointerType(b);
 
         BasicBlock * const maskedInput = b.CreateBasicBlock(prefix + "_maskInput", mKernelCheckOutputSpace);
         BasicBlock * const selectedInput = b.CreateBasicBlock(prefix + "_selectInput", mKernelCheckOutputSpace);
@@ -317,6 +317,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             ExternalBuffer tmp(0, b, singleElementStreamSetTy, 0);
 
             Value * const inputAddress = inputBuffer;
+
             Value * const initial = b.CreateMul(b.CreateLShr(start, LOG_2_BLOCK_WIDTH), numOfStreams);
             Value * const initialPtr = tmp.getStreamBlockPtr(b, inputAddress, sz_ZERO, initial);
             Value * const initialPtrInt = b.CreatePtrToInt(initialPtr, intPtrTy);
@@ -483,7 +484,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             maskedAddress = b.CreateExtractValue(maskVal, {0});
             Value * const maskedBytes = b.CreateExtractValue(maskVal, {1});
             const auto & DL = m->getDataLayout();
-            const auto ts = b.getTypeSize(DL, buffer->getType());
+            const auto ts = b.getTypeSize(DL, buffer->getType(b));
             maskedCapacity = b.CreateMulRational(maskedBytes, Rational{b.getBitBlockWidth(), ts});
             maskedCapacity = b.CreateAdd(processedItems, maskedCapacity);
         }
@@ -560,7 +561,7 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
             assert (rt.Port.Type == PortType::Output);
             const auto port = rt.Port;
 
-            const auto itemWidth = getItemWidth(buffer->getBaseType());
+            const auto itemWidth = buffer->getFieldWidth();
 
             const auto prefix = makeBufferName(mKernelId, port);
 
@@ -699,6 +700,7 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
 
                 #ifdef PRINT_DEBUG_MESSAGES
                 #ifndef PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY
+                constexpr auto doUnaryPack = 0;
                 debugPrint(b, prefix + "_zeroUnwritten_clearRange%" PRIu8 ",%" PRIu64 " = [0x%" PRIx64 ",0x%" PRIx64 ")",
                            b.getInt8(doUnaryPack),  b.getInt64(rt.RequiredOverflowSpace), startPtrInt, endPtrInt);
                 #endif

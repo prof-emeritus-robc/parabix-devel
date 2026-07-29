@@ -11,7 +11,9 @@ namespace kernel {
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::addThreadLocalPartitionProperties(KernelBuilder & b, const size_t partitionId, const size_t groupId) {
     if (out_degree(partitionId, ThreadLocalPlacement) > 0) {
-        mTarget->addThreadLocalScalar(b.getSizeTy(), PARTITION_THREAD_LOCAL_STREAMSET_MAX_STRIDE_COUNT + std::to_string(partitionId), groupId);
+        auto & C = b.getContext();
+        IntegerType * const sizeTy = IntegerType::getIntNTy(C, sizeof(size_t) * 8);
+        mTarget->addThreadLocalScalar(sizeTy, PARTITION_THREAD_LOCAL_STREAMSET_MAX_STRIDE_COUNT + std::to_string(partitionId), groupId);
     }
 }
 
@@ -357,7 +359,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
                         auto & dl = b.getModule()->getDataLayout();
                         const auto & bn = mBufferGraph[streamSet];
                         ExternalBuffer * const buf = cast<ExternalBuffer>(bn.Buffer);
-                        const auto ts = b.getTypeSize(dl, buf->getType());
+                        const auto ts = b.getTypeSize(dl, buf->getType(b));
                         buf->setCapacity(b, b.CreateMulRational(off, Rational{bw, ts}));
                     }
 
@@ -517,7 +519,7 @@ void PipelineCompiler::remapThreadLocalBufferMemory(KernelBuilder & b) {
             ExternalBuffer * const buffer = cast<ExternalBuffer>(bn.Buffer);
             Value * const produced = mInitiallyProducedItemCount[streamSet];
 
-            const auto typeWidth = b.getTypeSize(DL, buffer->getType());
+            const auto typeWidth = b.getTypeSize(DL, buffer->getType(b));
 
             const auto fieldWidth = buffer->getFieldWidth();
 

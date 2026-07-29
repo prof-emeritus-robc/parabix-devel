@@ -143,7 +143,7 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     bool allowDataParallelExecution = false;
 
     #ifndef DISABLE_ALL_DATA_PARALLEL_SYNCHRONIZATION
-    if (LLVM_UNLIKELY(isKernelStateFree(kernelId))) {
+    if (LLVM_UNLIKELY(isKernelStateFree(b, kernelId))) {
         if (LLVM_LIKELY((mKernel->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject) == 0)) {
             allowDataParallelExecution = true;
             mIsStatelessKernel.set(kernelId);
@@ -156,7 +156,9 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
         mIsInternallySynchronized.set(kernelId);
     }
 
-    IntegerType * const sizeTy = b.getSizeTy();
+    auto & C = b.getContext();
+
+    IntegerType * const sizeTy = IntegerType::getIntNTy(C, sizeof(size_t) * 8);
 
     const auto groupId = getCacheLineGroupId(kernelId);
 
@@ -217,9 +219,9 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     if (LLVM_LIKELY(mKernel->isStateful())) {
         Type * sharedStateTy = nullptr;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
-            sharedStateTy = b.getVoidPtrTy();
+            sharedStateTy = PointerType::getUnqual(C);
         } else {
-            sharedStateTy = mKernel->getSharedStateType();
+            sharedStateTy = mKernel->getSharedStateType(b);
             assert (!sharedStateTy->isEmptyTy());
         }
         mTarget->addInternalScalar(sharedStateTy, name, groupId);
@@ -229,9 +231,9 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
         // we cannot statically allocate a "family" thread local object.
         Type * localStateTy = nullptr;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
-            localStateTy = b.getVoidPtrTy();
+            localStateTy = PointerType::getUnqual(C);
         } else {
-            localStateTy = mKernel->getThreadLocalStateType();
+            localStateTy = mKernel->getThreadLocalStateType(b);
             assert (!localStateTy->isEmptyTy());
         }
         mTarget->addThreadLocalScalar(localStateTy, name + KERNEL_THREAD_LOCAL_SUFFIX, groupId);
@@ -246,14 +248,13 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     }
 
     if (LLVM_UNLIKELY(isRoot && StatisticsOptionIsSet(codegen::TraceStridesPerSegment))) {
-        LLVMContext & C = b.getContext();
 //        FixedArray<Type *, 2> recordStruct;
 //        recordStruct[0] = sizeTy; // segment num
 //        recordStruct[1] = sizeTy; // # of strides
         FixedArray<Type *, 4> traceStruct;
         traceStruct[0] = sizeTy; // last num of strides (to avoid unnecessary loads of the trace
                                  // log and simplify the logic for first stride)
-        traceStruct[1] = PointerType::getUnqual(b.getContext()); // pointer to trace log
+        traceStruct[1] = PointerType::getUnqual(C); // pointer to trace log
         traceStruct[2] = sizeTy; // trace length
         traceStruct[3] = sizeTy; // trace capacity (for realloc)
 
@@ -308,7 +309,7 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 
                 Constant * sharedStateTySize = nullptr;
                 if (mKernel->isStateful()) {
-                    sharedStateTySize = b.getTypeSize(mKernel->getSharedStateType());
+                    sharedStateTySize = b.getTypeSize(mKernel->getSharedStateType(b));
                 } else {
                     sharedStateTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
                 }
@@ -316,7 +317,7 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 
                 Constant * threadLocalTySize = nullptr;
                 if (mKernel->hasThreadLocal()) {
-                    threadLocalTySize = b.getTypeSize(mKernel->getThreadLocalStateType());
+                    threadLocalTySize = b.getTypeSize(mKernel->getThreadLocalStateType(b));
                 } else {
                     threadLocalTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
                 }

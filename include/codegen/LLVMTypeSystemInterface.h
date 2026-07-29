@@ -142,7 +142,7 @@ public:
     }
 
     /// Fetch the type representing an untyped pointer.
-    llvm::PointerType * LLVM_READNONE getVoidPtrTy(const unsigned AddressSpace = 0) const {
+    llvm::PointerType * LLVM_READNONE getVoidPtrTy(const unsigned AddressSpace = 0) {
         return llvm::PointerType::get(getContext(), AddressSpace);
     }
 
@@ -160,7 +160,9 @@ public:
 
     virtual llvm::VectorType * getBitBlockType() const = 0;
 
-    virtual llvm::LLVMContext & getContext() const = 0;
+    virtual llvm::LLVMContext & getContext() = 0;
+
+    virtual const llvm::LLVMContext & getContext() const = 0;
 
 protected:
 

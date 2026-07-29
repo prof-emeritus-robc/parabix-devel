@@ -26,7 +26,9 @@ unsigned PipelineCompiler::getTruncatedStreamSetSourceId(const unsigned streamSe
  * @brief addConsumerKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::addConsumerKernelProperties(KernelBuilder & b, const unsigned kernelId) {
-    IntegerType * const sizeTy = b.getSizeTy();
+    auto & C = b.getContext();
+
+    IntegerType * const sizeTy = IntegerType::getIntNTy(C, sizeof(size_t) * 8);
 
 //    const auto addInternallySynchronizedInternalCounters = mIsInternallySynchronized.test(kernelId) && !mIsStatelessKernel.test(kernelId) ;
 

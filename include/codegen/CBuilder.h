@@ -451,6 +451,8 @@ public:
 
     void CheckAddress(llvm::Value * const Ptr, llvm::Value * const Size, llvm::Constant * const Name);
 
+    static llvm::Type * convertTypeToLLVMContext(llvm::LLVMContext & C, llvm::Type * type);
+
     // LLVM 18 removed all qualified pointer types but if we want to support earlier LLVM versions, we must still still allow kernels to
     // construct them.
     #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
@@ -501,7 +503,6 @@ protected:
     unsigned                        mCacheLineAlignment;
     llvm::IntegerType * const       mSizeType;
     BaseDriver *                    mDriver;
-    llvm::LLVMContext               mContext;
     const std::string               mTriple;
     #ifdef ENABLE_LIBBACKTRACE
     void *                          mBacktraceState = nullptr;

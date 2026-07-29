@@ -7,6 +7,7 @@
 
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ExecutionEngine/ObjectCache.h>
+#include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/ADT/StringRef.h>
 #include <boost/container/flat_set.hpp>
 #include <boost/container/flat_map.hpp>
@@ -15,7 +16,7 @@
 #include <string>
 
 namespace llvm { 
-    class Module;  class MemoryBuffer;  class MemoryBufferRef;  class LLVMContext;
+    class Module;  class MemoryBuffer;  class LLVMContext;
     namespace orc {class TMOwningSimpleCompiler;}
 }
 
@@ -43,7 +44,7 @@ class ParabixObjectCache final : public llvm::ObjectCache {
     template <typename K>
     using Set = boost::container::flat_set<K>;
     using KnownSignatures = Map<std::string, llvm::Module *>;
-    using ModuleCache = Map<std::string, std::unique_ptr<llvm::MemoryBuffer>>;
+    using ModuleCache = Map<std::string, llvm::MemoryBufferRef>;
     using Instance = std::unique_ptr<ParabixObjectCache>;
 public:
 

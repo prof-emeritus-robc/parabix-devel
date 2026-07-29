@@ -3,6 +3,7 @@
 #include <codegen/FunctionTypeBuilder.h>
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
+#include <llvm/ExecutionEngine/Orc/SymbolStringPool.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/relationship.h>
 #include <util/slab_allocator.h>
@@ -47,8 +48,12 @@ public:
 
     virtual ~BaseDriver();
 
-    llvm::LLVMContext & getContext() const final {
-        return *mContext.get();
+    const llvm::LLVMContext & getContext() const final {
+        return mContext;
+    }
+
+    llvm::LLVMContext & getContext() final {
+        return mContext;
     }
 
     bool getPreservesKernels() const {
@@ -60,6 +65,10 @@ public:
     }
 
     unsigned getBitBlockWidth() const final;
+
+    virtual llvm::orc::SymbolStringPtr declareFunctionSymbol(llvm::Function * function) const = 0;
+
+    virtual void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) = 0;
 
 protected:
 
@@ -92,13 +101,13 @@ protected:
 
     virtual llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const = 0;
 
-    kernel::KernelBuilder & getBuilder() {
-        return *mBuilder;
-    }
+//    kernel::KernelBuilder & getBuilder() {
+//        return *mBuilder;
+//    }
 
 protected:
 
-    std::unique_ptr<llvm::LLVMContext>                      mContext;
+    llvm::LLVMContext                                       mContext;
     llvm::Module * const                                    mMainModule;
     std::unique_ptr<kernel::KernelBuilder>                  mBuilder;
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;

@@ -1882,6 +1882,7 @@ Function * CBuilder::getRethrow() {
 
 AllocaInst * CBuilder::resolveStackAddress(Value * Ptr) {
     for (;;) {
+        assert (Ptr);
         if (GetElementPtrInst * gep = dyn_cast<GetElementPtrInst>(Ptr)) {
             Ptr = gep->getPointerOperand();
         } else if (CastInst * ci = dyn_cast<CastInst>(Ptr)) {
@@ -2327,6 +2328,97 @@ void CBuilder::linkAllNecessaryExternalFunctions() const {
 std::string CBuilder::getKernelName() const {
     return "cbuilder";
 }
+
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertTypeToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
+
+    using LT = Type::TypeID;
+
+    std::function<Type *(const Type *)> convertType = [&](const Type * type) -> Type * {
+
+        auto convertStructType = [&](const StructType * const type) -> StructType * {
+            // If this struct type already exists, reuse it. If we simply recreated it,
+            // we'd end up with a structurally identical but different type.
+            if (!type->isLiteral()) {
+                StructType * const st = StructType::getTypeByName(C, type->getName());
+                if (st) {
+                    assert (st->getNumElements() == type->getNumElements());
+                    return st;
+                }
+            }
+            const auto count = type->getNumElements();
+            SmallVector<Type *, 128> elemTypes(count);
+            for (unsigned i = 0; i < count; ++i) {
+                elemTypes[i] = convertType(type->getStructElementType(i));
+            }
+            StructType * st = nullptr;
+            if (type->isLiteral()) {
+                // an identical unnamed struct type may exist
+                st = StructType::get(C, elemTypes, type->isPacked());
+            } else {
+                st = StructType::create(C, elemTypes, type->getName(), type->isPacked());
+            }
+            return st;
+        };
+
+        auto convertFunctionType = [&](const FunctionType * const type) -> FunctionType * {
+            const auto n = type->getNumParams();
+            SmallVector<Type *, 32> paramTypes(n);
+            for (unsigned i = 0; i < n; ++i) {
+                paramTypes[i] = convertType(type->getParamType(i));
+            }
+            return FunctionType::get(convertType(type->getReturnType()), paramTypes, type->isVarArg());
+        };
+
+        switch (type->getTypeID()) {
+            case LT::ArrayTyID:
+                BEGIN_SCOPED_REGION
+                const ArrayType * const ar = cast<ArrayType>(type);
+                return ArrayType::get(convertType(ar->getElementType()), ar->getNumElements());
+                END_SCOPED_REGION
+            case LT::FixedVectorTyID:
+            case LT::ScalableVectorTyID:
+                BEGIN_SCOPED_REGION
+                const VectorType * const vt = cast<VectorType>(type);
+                return VectorType::get(convertType(vt->getElementType()), vt->getElementCount());
+                END_SCOPED_REGION
+            case LT::PointerTyID:
+                BEGIN_SCOPED_REGION
+                #if LLVM_VERSION_INTEGER <= LLVM_VERSION_CODE(16, 0, 0)
+                const PointerType * const pt = cast<PointerType>(type);
+                return PointerType::get(convertType(pt->getPointerElementType()), pt->getAddressSpace());
+                #else
+                return PointerType::getUnqual(C);
+                #endif
+                END_SCOPED_REGION
+            case LT::StructTyID:
+                return convertStructType(cast<StructType>(type));
+            case LT::IntegerTyID:
+                return IntegerType::get(C, cast<IntegerType>(type)->getBitWidth());
+            case LT::VoidTyID:
+                return Type::getVoidTy(C);
+            case LT::DoubleTyID:
+                return Type::getDoubleTy(C);
+            case LT::FloatTyID:
+                return Type::getFloatTy(C);
+            case LT::FunctionTyID:
+                return convertFunctionType(cast<FunctionType>(type));
+            default:
+                errs() << "Unexpected FuncTypeId: " << (size_t)(type->getTypeID()) << "\n";
+                llvm_unreachable("unexpected type");
+        }
+    };
+
+    if (LLVM_UNLIKELY(sourceType == nullptr || &sourceType->getContext() == &C)) {
+        return sourceType;
+    } else {
+        return convertType(sourceType);
+    }
+}
+
 
 
 #ifndef NDEBUG

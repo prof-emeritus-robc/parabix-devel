@@ -280,14 +280,14 @@ void PipelineAnalysis::printBufferGraph(KernelBuilder & b, raw_ostream & out) co
             out << '*';
         }
 
-        if (buffer) {
-            Type * ty = buffer->getBaseType();
-            out << ':'
-                << ty->getArrayNumElements() << 'x';
-            ty = ty->getArrayElementType();
-            ty = cast<IDISA::FixedVectorType>(ty)->getElementType();
-            out << ty->getIntegerBitWidth();
-        }
+//        if (buffer) {
+//            Type * ty = buffer->getBaseType(b.getContext());
+//            out << ':'
+//                << buffer->getFieldWidth() << 'x';
+//            ty = ty->getArrayElementType();
+//            ty = cast<IDISA::FixedVectorType>(ty)->getElementType();
+//            out << ty->getIntegerBitWidth();
+//        }
 
         out << "}|{IO:";
         print_rational(bn.RelativeIORate);
@@ -447,7 +447,7 @@ void PipelineAnalysis::printBufferGraph(KernelBuilder & b, raw_ostream & out) co
         if (kernelObj->canSetTerminateSignal()) {
             out << "<CanTerminateEarly>\\n";
         }
-        if (isKernelStateFree(kernel)) {
+        if (isKernelStateFree(b, kernel)) {
             out << "<StateFree>\\n";
         }
 

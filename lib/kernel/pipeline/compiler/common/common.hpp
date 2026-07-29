@@ -341,7 +341,7 @@ public:
 
     LLVM_READNONE bool mayHaveNonLinearIO(const size_t kernel) const;
 
-    LLVM_READNONE bool isKernelStateFree(const size_t kernel) const;
+    LLVM_READNONE bool isKernelStateFree(KernelBuilder & b, const size_t kernel) const;
 
     LLVM_READNONE bool isKernelFamilyCall(const size_t kernel) const;
 

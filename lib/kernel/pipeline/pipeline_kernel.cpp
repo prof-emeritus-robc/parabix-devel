@@ -128,11 +128,11 @@ void PipelineKernel::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::addKernelDeclarations(KernelBuilder & b) {
+void PipelineKernel::addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody) {
     for (const auto & k : mKernels) {
-        k.Object->addKernelDeclarations(b);
+        k.Object->addKernelDeclarations(b, false);
     }
-    Kernel::addKernelDeclarations(b);
+    Kernel::addKernelDeclarations(b, addStubFunctionBody);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -158,8 +158,11 @@ void PipelineKernel::linkExternalMethods(KernelBuilder & b) {
     for (const auto & k : mKernels) {
         k.Object->linkExternalMethods(b);
     }
+    auto & C = b.getContext();
+    assert (&C == &b.getContext());
     for (const CallBinding & call : mCallBindings) {
-        call.Callee = b.LinkFunction(call.Name, call.Type, call.FunctionPointer);
+        Type * funcTy = CBuilder::convertTypeToLLVMContext(C, call.Type);
+        call.Callee = b.LinkFunction(call.Name, cast<FunctionType>(funcTy), call.FunctionPointer);
     }
     #ifdef ENABLE_PAPI
     if (LLVM_UNLIKELY(codegen::PapiCounterOptions.compare(codegen::OmittedOption) != 0)) {
@@ -236,6 +239,7 @@ void PipelineKernel::addAdditionalInitializationArgTypes(KernelBuilder & b, Init
 void PipelineKernel::recursivelyConstructFamilyKernels(KernelBuilder & b, InitArgs & args, ParamMap & params, NestedStateObjs & toFree) const {
     for (const auto & k : mKernels) {
         const Kernel * const kernel = k.Object;
+        assert (kernel->getCompilationStatus() >= CompilationStatus::StateConstructed);
         if (LLVM_UNLIKELY(k.isFamilyCall())) {
             kernel->constructFamilyKernels(b, args, params, toFree);
         } else if (LLVM_UNLIKELY(kernel->getNumOfNestedKernelFamilyCalls() > 0)) {
@@ -438,7 +442,7 @@ void PipelineKernel::setOutputScalarAt(const unsigned i, Scalar * const value) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b) const {
+std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b) {
     return std::make_unique<PipelineCompiler>(b, const_cast<PipelineKernel *>(this));
 }
 
@@ -528,30 +532,31 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     params.reserve(getNumOfScalarInputs() + numOfStreamSets);
 
     StructType * streamSetTy = nullptr;
-    PointerType * streamSetPtrTy = nullptr;
     PointerType * voidPtrTy = b.getVoidPtrTy();
     IntegerType * int64Ty = b.getInt64Ty();
     IntegerType * sizeTy = b.getSizeTy();
+    PointerType * unqualPtrTy = PointerType::getUnqual(b.getContext());
     if (numOfStreamSets) {
         // must match streamsetptr.h
         FixedArray<Type *, 2> fields;
         fields[0] = voidPtrTy;
         fields[1] = int64Ty;
         streamSetTy = StructType::get(b.getContext(), fields);
-        streamSetPtrTy = PointerType::getUnqual(b.getContext());
     }
 
     // The initial params of doSegment are its shared handle, thread-local handle and numOfStrides.
     // (assuming the kernel has both handles). The remaining are the stream set params.
 
     for (unsigned i = 0; i < numOfStreamSets; ++i) {
-        params.push_back(streamSetPtrTy);
+        params.push_back(unqualPtrTy);
     }
     for (const auto & input : getInputScalarBindings()) {
         if (isa<CommandLineScalar>(input.getRelationship())) {
             continue;
         }
-        params.push_back(input.getType());
+        Type * ty = input.getType();
+        assert (&ty->getContext() == &b.getContext());
+        params.push_back(ty);
     }
 
     Function * createIllustrator = nullptr;
@@ -575,10 +580,8 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         END_SCOPED_REGION
     }
 
-    const auto linkageType = (method == AddInternal) ? Function::InternalLinkage : Function::ExternalLinkage;
-
-    SmallVector<char, 256> tmp;
-    raw_svector_ostream funcNameGen(tmp);
+    std::string tmp;
+    raw_string_ostream funcNameGen(tmp);
     funcNameGen << getName() << "_main";
     const auto funcName = funcNameGen.str();
 
@@ -586,9 +589,17 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     if (LLVM_LIKELY(main == nullptr)) {
         // get the finalize method output type and set its return type as this function's return type
         FunctionType * const mainFunctionType = FunctionType::get(terminate->getReturnType(), params, false);
-        main = Function::Create(mainFunctionType, linkageType, funcName, m);
-        main->setCallingConv(CallingConv::C);
+        main = Function::Create(mainFunctionType, Function::ExternalLinkage, funcName, m);
+        main->setVisibility(GlobalValue::DefaultVisibility);
     }
+
+    assert (main->getName().size() > 0);
+
+    assert (main->getName().size() == funcName.length());
+
+    assert (main->getName().compare(funcName) == 0);
+
+    assert (main->getName().data() != funcName.data());
 
     // declaration only; exit
     if (method == DeclareExternal) {
@@ -602,6 +613,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     auto nextArg = [&]() -> Value * {
         assert (arg != main->arg_end());
         Value * const v = &*arg;
+        assert (&v->getContext() == &b.getContext());
         std::advance(arg, 1);
         return v;
     };
@@ -769,7 +781,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         if (LLVM_LIKELY(isStateful())) {
             args.push_back(sharedHandle);
         }
-        args.push_back(ConstantPointerNull::get(PointerType::getUnqual(b.getContext())));
+        args.push_back(ConstantPointerNull::get(unqualPtrTy));
         threadLocalHandle = initializeThreadLocalInstance(b, args);
         segmentArgs[argCount++] = threadLocalHandle;
         toFree.push_back(threadLocalHandle);
@@ -782,7 +794,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     segmentArgs[argCount++] = b.getSize(segLength);
 
     if (LLVM_UNLIKELY(tdb)) {
-        Constant * const nil = ConstantPointerNull::get(b.getVoidPtrTy());
+        Constant * const nil = ConstantPointerNull::get(unqualPtrTy);
         segmentArgs[argCount++] = nil;
         segmentArgs[argCount++] = nil;
     }
@@ -806,7 +818,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         // pass in the desired number of segments
         allocArgs.push_back(sz_BufferSize);
         if (LLVM_UNLIKELY(codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers))) {
-            Constant * nil = ConstantPointerNull::get(b.getVoidPtrTy());
+            Constant * nil = ConstantPointerNull::get(unqualPtrTy);
             allocArgs.push_back(nil);
             allocArgs.push_back(nil);
         }

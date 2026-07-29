@@ -11,7 +11,7 @@
 
 namespace pablo {
 
-String * SymbolGenerator::makeString(const llvm::StringRef prefix) noexcept {
+String * SymbolGenerator::makeString(llvm::LLVMContext &ctx, const llvm::StringRef prefix) noexcept {
     auto f = mPrefixMap.find(prefix);
     if (f == mPrefixMap.end()) {
         char * const data = mAllocator.allocate<char>(prefix.size() + 1);
@@ -20,9 +20,9 @@ String * SymbolGenerator::makeString(const llvm::StringRef prefix) noexcept {
         llvm::StringRef name(data, prefix.size());
         mPrefixMap.insert(std::make_pair(name, 1));
         #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
-        llvm::PointerType * const ptrTy = llvm::PointerType::getUnqual(mContext);
+        llvm::PointerType * const ptrTy = llvm::PointerType::getUnqual(ctx);
         #else
-        llvm::PointerType * const ptrTy = llvm::IntegerType::getInt8PtrTy(mContext);
+        llvm::PointerType * const ptrTy = llvm::IntegerType::getInt8PtrTy(ctx);
         #endif
         return new (mAllocator) String(ptrTy, name, mAllocator);
     } else { // this string already exists; make a new string using the given prefix
@@ -45,16 +45,16 @@ String * SymbolGenerator::makeString(const llvm::StringRef prefix) noexcept {
             count /= 10;
         }
         *p = '_';
-        return makeString(llvm::StringRef(name.data(), length));
+        return makeString(ctx, llvm::StringRef(name.data(), length));
     }
 }
 
-Integer * SymbolGenerator::getInteger(const IntTy value, unsigned intWidth) noexcept {
+Integer * SymbolGenerator::getInteger(llvm::LLVMContext & ctx, const IntTy value, unsigned intWidth) noexcept {
     auto key = std::make_pair(value, intWidth);
     auto f = mIntegerMap.find(key);
     Integer * result;
     if (f == mIntegerMap.end()) {
-        result = new (mAllocator) Integer(value, llvm::IntegerType::getIntNTy(mContext, intWidth), mAllocator);
+        result = new (mAllocator) Integer(value, llvm::IntegerType::getIntNTy(ctx, intWidth), mAllocator);
         assert (result->value() == value);
         mIntegerMap.emplace(key, result);
     } else {

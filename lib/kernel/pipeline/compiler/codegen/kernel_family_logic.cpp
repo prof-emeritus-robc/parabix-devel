@@ -10,7 +10,8 @@ void PipelineCompiler::addFamilyKernelProperties(KernelBuilder & b,
                                                  const unsigned groupId) const {
     if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
 
-        PointerType * const voidPtrTy = b.getVoidPtrTy();
+        auto & C = b.getContext();
+        PointerType * const voidPtrTy = PointerType::getUnqual(C);
         const auto prefix = makeKernelName(kernelId);
         const auto tl = mKernel->hasThreadLocal();
         const auto ai = mKernel->allocatesInternalStreamSets();

@@ -36,7 +36,7 @@ public:
         return mCondition;
     }
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) const final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
 protected:
 
@@ -50,7 +50,7 @@ protected:
                        Bindings && scalar_inputs,
                        Bindings && scalar_outputs);
 
-    void addKernelDeclarations(KernelBuilder & b) override;
+    void addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody) override;
 
     void addInternalProperties(KernelBuilder & b) override;
 

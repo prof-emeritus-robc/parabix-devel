@@ -432,7 +432,6 @@ void OptimizationBranchCompiler::generateInitializeThreadLocalMethod(KernelBuild
                 args.push_back(shared);
             }
             args.push_back(ConstantPointerNull::get(PointerType::getUnqual(b.getContext())));
-
             Value * const handle = kernel->initializeThreadLocalInstance(b, args);
             b.setScalarField(THREAD_LOCAL_PREFIX + std::to_string(i), handle);
         }

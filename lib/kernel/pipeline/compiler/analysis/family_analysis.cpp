@@ -2,7 +2,7 @@
 
 namespace kernel {
 
-void PipelineAnalysis::scanFamilyKernelBindings() {
+void PipelineAnalysis::scanFamilyKernelBindings(KernelBuilder & b) {
 
     // Any non-call-by-family kernel K initialization (termination) function ought to be compiled into the
     // initialization (termination) of its parent pipeline P but when K contains call-by-family kernels itself,
@@ -38,7 +38,7 @@ void PipelineAnalysis::scanFamilyKernelBindings() {
                 if (ref.isFamilyCall() || m > 0) {
                     if (ref.isFamilyCall()) {
 
-                        obj->ensureLoaded();
+                        obj->ensureLoaded(b);
 
                         unsigned flags = 0;
                         if (LLVM_LIKELY(obj->isStateful())) {
@@ -102,7 +102,7 @@ void PipelineAnalysis::scanFamilyKernelBindings() {
 found_kernel_in_graph:
                 if (ref.isFamilyCall()) {
 
-                    obj->ensureLoaded();
+                    obj->ensureLoaded(b);
 
                     unsigned flags = FamilyScalarData::CaptureStoreInKernelState;
                     if (LLVM_LIKELY(obj->isStateful())) {

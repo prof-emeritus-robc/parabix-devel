@@ -496,7 +496,7 @@ void PipelineCompiler::initializeKernelCheckOutputSpacePhis(KernelBuilder & b) {
             mInputBufferCapacityPhi[inputPort] = capacityPhi;
         }
         mCurrentLinearInputItems[inputPort] = phi;
-        Type * const bufferTy = getInputBuffer(inputPort)->getPointerType();
+        Type * const bufferTy = getInputBuffer(inputPort)->getPointerType(b);
         mInputVirtualBaseAddressPhi[inputPort] = b.CreatePHI(bufferTy, 2, prefix + "_baseAddress");
         if (LLVM_UNLIKELY(makeExhaustedInputPhi)) {
             mExhaustedInputPortPhi[inputPort] = b.CreatePHI(b.getInt1Ty(), 2, prefix + "_isExhaustedPhi");

@@ -127,8 +127,10 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         }
     }
 
+
+
     if (LLVM_LIKELY(mObjectCache.get())) {
-        switch (mObjectCache->loadCachedObjectFile(getBuilder(), kernel)) {
+        switch (mObjectCache->loadCachedObjectFile(*mBuilder, kernel)) {
             case CacheObjectResult::CACHED:
                 mCachedKernel.emplace_back(kernel.get());
                 break;
@@ -139,9 +141,8 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
                 mUncachedKernel.emplace_back(kernel.get());
                 break;
         }
-        assert ("kernel does not contain a module?" && kernel->getModule());
     } else {
-        kernel->makeModule(getBuilder());
+        kernel->makeModule(*mBuilder);
         mUncachedKernel.emplace_back(kernel.get());
     }
 
@@ -179,8 +180,8 @@ ArrayType * BaseDriver::getStreamSetTy(const unsigned NumElements, const unsigne
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 BaseDriver::BaseDriver(std::string && moduleName)
-: mContext(new LLVMContext())
-, mMainModule(new Module(moduleName, *mContext))
+: mContext()
+, mMainModule(new Module(moduleName, mContext))
 , mBuilder(nullptr)
 , mObjectCache(nullptr) {
     if (LLVM_UNLIKELY(codegen::EnableObjectCache)) {

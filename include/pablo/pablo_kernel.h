@@ -180,7 +180,7 @@ protected:
 
     void linkExternalMethods(KernelBuilder & b) final;
 
-    std::unique_ptr<kernel::KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) const override;
+    std::unique_ptr<kernel::KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) override;
 
 private:
 

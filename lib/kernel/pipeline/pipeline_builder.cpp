@@ -247,7 +247,7 @@ Kernel * PipelineBuilder::makeKernel() {
         for (unsigned i = 0; i < numOfKernels; ++i) {
             const auto & K = kernels[i];
             auto obj = K.Object;
-            obj->ensureLoaded();
+          //  obj->ensureLoaded(mDriver.getBuilder());
             sig << '\n';
             if (LLVM_UNLIKELY(obj->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject)) {
                 requiresIllustratorObj = true;
@@ -320,7 +320,7 @@ Kernel * PipelineBuilder::makeKernel() {
         enumerateProducerBindings(pipelineInput, mTarget->mInputStreamSets);
         for (unsigned i = 0; i < numOfKernels; ++i) {
             const auto & k = kernels[i].Object;
-            k->ensureLoaded();
+           // k->ensureLoaded(mDriver.getBuilder());
             enumerateProducerBindings(firstKernel + i, k->getOutputScalarBindings());
             enumerateProducerBindings(firstKernel + i, k->getOutputStreamSetBindings());
         }
@@ -528,7 +528,7 @@ Kernel * PipelineBuilder::makeKernel() {
         for (unsigned i = 0; i < numOfKernels; ++i) {
             const auto & K = kernels[i];
             Kernel * const obj = K.Object;
-            obj->ensureLoaded();
+         //   obj->ensureLoaded(mDriver.getBuilder());
             if (LLVM_UNLIKELY(obj->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject)) {
                 requiresIllustratorObj = true;
             }
@@ -630,6 +630,7 @@ Kernel * OptimizationBranchBuilder::makeKernel() {
 StreamSet * PipelineBuilder::getInputStreamSet(const StringRef name) {
     for (Binding & input : mTarget->mInputStreamSets) {
         assert (input.getRelationship());
+        assert (&input.getType()->getContext() == &mDriver.getContext());
         if (name.compare(input.getName()) == 0) {
             return cast<StreamSet>(input.getRelationship());
         }
@@ -640,6 +641,7 @@ StreamSet * PipelineBuilder::getInputStreamSet(const StringRef name) {
 StreamSet * PipelineBuilder::getOutputStreamSet(const StringRef name) {
     for (Binding & output : mTarget->mOutputStreamSets) {
         assert (output.getRelationship());
+        assert (&output.getType()->getContext() == &mDriver.getContext());
         if (name.compare(output.getName()) == 0) {
             return cast<StreamSet>(output.getRelationship());
         }
@@ -650,6 +652,7 @@ StreamSet * PipelineBuilder::getOutputStreamSet(const StringRef name) {
 Scalar * PipelineBuilder::getInputScalar(const StringRef name) {
     for (Binding & input : mTarget->mInputScalars) {
         assert (input.getRelationship());
+        assert (&input.getType()->getContext() == &mDriver.getContext());
         if (name.compare(input.getName()) == 0) {
             return cast<Scalar>(input.getRelationship());
         }
@@ -660,6 +663,7 @@ Scalar * PipelineBuilder::getInputScalar(const StringRef name) {
 Scalar * PipelineBuilder::getOutputScalar(const StringRef name) {
     for (Binding & output : mTarget->mOutputScalars) {
         assert (output.getRelationship());
+        assert (&output.getType()->getContext() == &mDriver.getContext());
         if (name.compare(output.getName()) == 0) {
             return cast<Scalar>(output.getRelationship());
         }

@@ -55,7 +55,7 @@ namespace pablo {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> PabloKernel::instantiateKernelCompiler(KernelBuilder & /* b */) const {
+std::unique_ptr<KernelCompiler> PabloKernel::instantiateKernelCompiler(KernelBuilder & /* b */) {
     return std::make_unique<PabloCompiler>(const_cast<PabloKernel *>(this));
 }
 
@@ -180,25 +180,31 @@ Ones * PabloKernel::getAllOnesValue(Type * type) {
 
 void PabloKernel::addInternalProperties(KernelBuilder & b) {
     mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
+    auto & C = b.getContext();
+    mContext = &C;
     mSizeTy = b.getSizeTy();
     mStreamTy = b.getStreamTy();
-    mSymbolTable.reset(new SymbolGenerator(b.getContext(), mAllocator));
+    mSymbolTable.reset(new SymbolGenerator(mAllocator));
     mEntryScope = new (mAllocator) PabloBlock(this, mAllocator);
-    mContext = &b.getContext();
+
+
     for (const Binding & ss : mInputStreamSets) {
-        Var * param = new (mAllocator) Var(ss.getType(), makeName(ss.getName()), mAllocator, Var::KernelInputStream);
+        Type * ty = CBuilder::convertTypeToLLVMContext(C, ss.getType());
+        Var * param = new (mAllocator) Var(ty, makeName(ss.getName()), mAllocator, Var::KernelInputStream);
         param->addUser(this);
         mInputs.push_back(param);
         mVariables.push_back(param);
     }
     for (const Binding & ss : mOutputStreamSets) {
-        Var * result = new (mAllocator) Var(ss.getType(), makeName(ss.getName()), mAllocator, Var::KernelOutputStream);
+        Type * ty = CBuilder::convertTypeToLLVMContext(C, ss.getType());
+        Var * result = new (mAllocator) Var(ty, makeName(ss.getName()), mAllocator, Var::KernelOutputStream);
         result->addUser(this);
         mOutputs.push_back(result);
         mVariables.push_back(result);
     }
     for (const Binding & ss : mOutputScalars) {
-        Var * result = new (mAllocator) Var(ss.getType(), makeName(ss.getName()), mAllocator, Var::KernelOutputScalar);
+        Type * ty = CBuilder::convertTypeToLLVMContext(C, ss.getType());
+        Var * result = new (mAllocator) Var(ty, makeName(ss.getName()), mAllocator, Var::KernelOutputScalar);
         result->addUser(this);
         mOutputs.push_back(result);
         mVariables.push_back(result);
@@ -218,7 +224,6 @@ bool PabloKernel::isCachable() const {
 
 void PabloKernel::linkExternalMethods(KernelBuilder & b) {
     if (LLVM_UNLIKELY(mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
-        assert (mSharedStateType);
         BEGIN_SCOPED_REGION
         FixedArray<Type *, 2> params;
         params[0] = b.getVoidPtrTy();
@@ -236,6 +241,8 @@ void PabloKernel::linkExternalMethods(KernelBuilder & b) {
 
 void PabloKernel::generateInitializeMethod(KernelBuilder & b) {
     if (LLVM_UNLIKELY(mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
+        auto & C = b.getContext();
+        mContext = &C;
         mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
         mPabloCompiler->initializeIllustrator(b);
         mPabloCompiler = nullptr;
@@ -243,6 +250,8 @@ void PabloKernel::generateInitializeMethod(KernelBuilder & b) {
 }
 
 void PabloKernel::generateDoBlockMethod(KernelBuilder & b) {
+    auto & C = b.getContext();
+    mContext = &C;
     mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
     mSizeTy = b.getSizeTy();
     mStreamTy = b.getStreamTy();
@@ -255,6 +264,8 @@ void PabloKernel::generateDoBlockMethod(KernelBuilder & b) {
 void PabloKernel::generateFinalBlockMethod(KernelBuilder & b, Value * const remainingBytes) {
     // Standard Pablo convention for final block processing: set a bit marking
     // the position just past EOF, as well as a mask marking all positions past EOF.
+    auto & C = b.getContext();
+    mContext = &C;
     assert (remainingBytes);
     assert (remainingBytes->getType()->isIntegerTy());
     if (LLVM_UNLIKELY(mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
@@ -266,6 +277,8 @@ void PabloKernel::generateFinalBlockMethod(KernelBuilder & b, Value * const rema
 }
 
 void PabloKernel::generateFinalizeMethod(KernelBuilder & b) {
+    auto & C = b.getContext();
+    mContext = &C;
     mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
     mPabloCompiler->releaseKernelData(b);
     if (CompileOptionIsSet(PabloCompilationFlags::EnableProfiling)) {
@@ -310,11 +323,11 @@ bool PabloKernel::requiresExplicitPartialFinalStride() const {
 }
 
 String * PabloKernel::makeName(const llvm::StringRef prefix) const {
-    return mSymbolTable->makeString(prefix);
+    return mSymbolTable->makeString(getContext(), prefix);
 }
 
 Integer * PabloKernel::getInteger(const int64_t value, unsigned intWidth) const {
-    return mSymbolTable->getInteger(value, intWidth);
+    return mSymbolTable->getInteger(getContext(), value, intWidth);
 }
 
 llvm::IntegerType * PabloKernel::getInt1Ty() const {

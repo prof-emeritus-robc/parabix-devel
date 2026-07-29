@@ -189,7 +189,11 @@ public:
 
     void captureBixNum(llvm::StringRef streamName, StreamSet * bixnum, char hexBase = 'A');
 
-    llvm::LLVMContext & getContext() const final {
+    const llvm::LLVMContext & getContext() const final {
+        return mDriver.getContext();
+    }
+
+    llvm::LLVMContext & getContext() final {
         return mDriver.getContext();
     }
 

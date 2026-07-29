@@ -121,9 +121,9 @@ public:
         return mLengthAssertions;
     }
 
-    void addKernelDeclarations(KernelBuilder & b) final;
+    void addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody) final;
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) const final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
     ~PipelineKernel() override;
 

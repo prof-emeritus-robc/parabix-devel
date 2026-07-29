@@ -281,7 +281,6 @@ public:
 
     void captureBixNum(llvm::StringRef streamName, llvm::Type * type, llvm::Value * bixnum, llvm::Value * from = nullptr, llvm::Value * to = nullptr, const MemoryOrdering ordering = MemoryOrdering::RowMajor, const char hexBase = 'A');
 
-
 private:
 
     struct AddressableValue {
@@ -306,7 +305,6 @@ protected:
 protected:
 
     KernelCompiler * mCompiler = nullptr;
-
 };
 
 template <class SpecifiedArchitectureBuilder>

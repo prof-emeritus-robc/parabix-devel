@@ -91,7 +91,7 @@ public:
 
         P.determineInitialThreadLocalBufferLayout(b, rng);
 
-        P.scanFamilyKernelBindings();
+        P.scanFamilyKernelBindings(b);
 
         P.setStreamSetLockIds();
 
@@ -250,7 +250,7 @@ private:
 
     // Family analysis functions
 
-    void scanFamilyKernelBindings();
+    void scanFamilyKernelBindings(KernelBuilder & b);
 
     // Internally generated streamsets
 

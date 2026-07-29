@@ -144,6 +144,10 @@ struct Binding : public detail::AnnotatedProcessingRate {
         return mType;
     }
 
+    void setType(llvm::Type * type)  {
+        mType = type;
+    }
+
     Relationship * getRelationship() const {
         return mRelationship;
     }

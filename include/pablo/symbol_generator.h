@@ -22,17 +22,15 @@ class SymbolGenerator {
     using Allocator = PabloAST::Allocator;
 public:
     using IntTy = uint64_t;
-    String * makeString(const llvm::StringRef prefix) noexcept;
-    Integer * getInteger(const IntTy value, unsigned intWidth = 64) noexcept;
+    String * makeString(llvm::LLVMContext & ctx,const llvm::StringRef prefix) noexcept;
+    Integer * getInteger(llvm::LLVMContext & ctx, const IntTy value, unsigned intWidth = 64) noexcept;
     ~SymbolGenerator() { }
 protected:
-    SymbolGenerator(llvm::LLVMContext & C, Allocator & allocator)
-    : mContext(C)
-    , mAllocator(allocator) {
+    SymbolGenerator(Allocator & allocator)
+    : mAllocator(allocator) {
 
     }
 private:
-    llvm::LLVMContext &                          mContext;
     Allocator &                                  mAllocator;
     llvm::StringMap<IntTy>                       mPrefixMap;
     llvm::StringMap<String *>                    mStringMap;

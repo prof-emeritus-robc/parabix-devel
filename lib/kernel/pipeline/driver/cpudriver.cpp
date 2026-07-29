@@ -5,6 +5,7 @@
 #include <llvm/Support/DynamicLibrary.h>           // for LoadLibraryPermanently
 #include <llvm/ExecutionEngine/ExecutionEngine.h>  // for EngineBuilder
 #include <llvm/ExecutionEngine/RTDyldMemoryManager.h>
+#include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/InitializePasses.h>                 // for initializeCodeGencd .
 #include <llvm/PassRegistry.h>                     // for PassRegistry
 #include <llvm/Support/CodeGen.h>                  // for Level, Level::None
@@ -17,12 +18,10 @@
 #include <kernel/pipeline/pipeline_builder.h>
 #include <llvm/IR/Verifier.h>
 #include "llvm/IR/Mangler.h"
-#include <llvm/ExecutionEngine/MCJIT.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/ADT/StringExtras.h>
-
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
@@ -43,11 +42,228 @@
     #define ATTRIBUTE_NO_SANITIZE_ADDRESS
 #endif
 
+#define BEGIN_SCOPED_REGION {
+#define END_SCOPED_REGION }
+
 using namespace llvm;
 using namespace llvm::orc;
 using namespace kernel;
 
 using AttrId = kernel::Attribute::KindId;
+
+
+// Modified version of llvm ConcurrentIRCompiler
+class InternalCompiler : public orc::IRCompileLayer::IRCompiler {
+
+public:
+
+    InternalCompiler(CPUDriver & driver, JITTargetMachineBuilder JTMB, const StringMap<bool> && features, ObjectCache *ObjCache)
+    : orc::IRCompileLayer::IRCompiler(irManglingOptionsFromTargetOptions(JTMB.getOptions()))
+    , Driver(driver), ObjCache(ObjCache), JTMB(std::move(JTMB)), CPUFeatures(std::move(features)) {
+
+    }
+
+    void registerKernel(Kernel * const kernel) {
+        Module * const m = kernel->getModule(); assert (m);
+        InternalMapping.insert(std::make_pair(m->getName(), kernel));
+    };
+
+    // override the actual orc compiler routine to
+    Expected<std::unique_ptr<MemoryBuffer>> operator()(Module & M) override {
+        // TODO: use a threadpool with a fixed number of expected threads to avoid reconstructing the builder and compiler objects
+        const auto f = InternalMapping.find(M.getName());
+
+        auto optLevel = CodeGenOptLevel::Default;
+
+        errs() << "Compiling Module Code " << M.getName() << " (" << (f != InternalMapping.end()) << ")\n";
+
+        if (LLVM_LIKELY(f != InternalMapping.end())) {
+
+            //        NamedRegionTimer T(kernel->getSignature(), kernel->getName(),
+            //                           "kernel", "Kernel Generation",
+            //                           codegen::TimeKernelsIsEnabled);
+
+            Kernel * const K = f->getValue();
+
+            std::unique_ptr<KernelBuilder> builder(IDISA::GetIDISA_Builder(M.getContext(), CPUFeatures));
+            builder->setDriver(Driver);
+            builder->setModule(&M);
+            K->setModule(&M); // the module may have changed
+
+            K->generateKernel(*builder);
+            if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
+                optLevel = codegen::BackEndOptLevel;
+            }
+
+            errs() << "Generated Kernel Code " << K->getName() << "\n";
+        }
+
+
+
+        auto TM = cantFail(JTMB.createTargetMachine());
+        TM->setOptLevel(optLevel);
+        SimpleCompiler C(*TM, ObjCache);
+        auto r = C(M);
+
+        errs() << "* Compiled Module Code " << M.getName() << " (" << (f != InternalMapping.end()) << ")\n";
+
+        return r;
+    }
+
+private:
+
+
+    CPUDriver & Driver;
+    ObjectCache * const ObjCache;
+    JITTargetMachineBuilder JTMB;
+    StringMap<Kernel *> InternalMapping;
+    const StringMap<bool> CPUFeatures;
+};
+
+class KernelGenerationMU : public orc::MaterializationUnit {
+public:
+    KernelGenerationMU(Kernel * kernel, MangleAndInterner & mangler, orc::SymbolLookupSet & lookupSet,
+                       IRCompileLayer & targetLayer, std::vector<ThreadSafeContext> & contexts)
+    : MaterializationUnit(createInterface(kernel, mangler, lookupSet))
+    , Kernel(kernel)
+    , TargetLayer(targetLayer)
+    , Contexts(contexts) {
+
+    }
+
+    StringRef getName() const override { return "<KernelGenerationMU>"; }
+
+    void materialize(std::unique_ptr<MaterializationResponsibility> R) override {
+        Module * const M = Kernel->getModule(); assert (M);
+        ThreadSafeContext ctx(std::unique_ptr<LLVMContext>{&M->getContext()});
+        ThreadSafeModule TSM(std::unique_ptr<Module>{M}, ctx);
+        Contexts.emplace_back(ctx);
+        TargetLayer.emit(std::move(R), std::move(TSM));
+    }
+
+    void discard(const JITDylib &, const SymbolStringPtr &) override {
+        /* this MU adds the symbols for the IR it has yet to generate. do not discard any symbols. */
+    }
+
+    static Interface createInterface(Kernel * kernel, MangleAndInterner & mangler, orc::SymbolLookupSet & lookupSet)  {
+        SymbolFlagsMap map;
+        kernel->addSymbols(mangler, map, lookupSet);
+        return Interface(std::move(map), nullptr);
+    }
+
+private:
+
+    Kernel * const Kernel;
+    IRCompileLayer & TargetLayer;
+    std::vector<ThreadSafeContext> & Contexts;
+};
+
+//class KernelSymbolResolver : public orc::DefinitionGenerator {
+//    Error tryToGenerate(LookupState &LS, LookupKind K, JITDylib &JD, JITDylibLookupFlags JDLookupFlags, const SymbolLookupSet &LookupSet) override {
+
+//        auto & ES = JD.getExecutionSession();
+
+
+
+//    }
+//};
+
+class KernelObjRemappingPlugin : public orc::ObjectLinkingLayer::Plugin {
+public:
+
+    // KernelObjRemappingPlugin(std::unique_ptr<SymbolMap> & redef) : Redefinitions(redef) {}
+
+    void modifyPassConfig(MaterializationResponsibility &MR,
+                          jitlink::LinkGraph &G,
+                          jitlink::PassConfiguration & Config) override {
+        Config.PostFixupPasses.push_back([&](jitlink::LinkGraph & G) -> llvm::Error {
+
+            errs() << " *** PostPrunePasses\n";
+
+            auto & ES = MR.getExecutionSession();
+            auto S = makeJITDylibSearchOrder({&MR.getTargetJITDylib()}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
+
+            SymbolLookupSet L;
+            for (const auto & sym : MR.getSymbols()) {
+                L.add(sym.getFirst());
+            }
+
+            auto funcMap = cantFail(ES.lookup(S, L, LookupKind::Static, SymbolState::Ready));
+
+            for (auto * sym : G.defined_symbols()) {
+                auto f = funcMap.find(ES.intern(sym->getName()))->getSecond();
+                G.makeAbsolute(*sym, f.getAddress());
+            }
+
+            return Error::success();
+        });
+
+    }
+
+    Error notifyEmitted(MaterializationResponsibility & MR) override {
+
+        errs() << " *** KernelObjRemappingPlugin\n";
+
+//        auto & ES = MR.getExecutionSession();
+
+//        SymbolLookupSet LS;
+//        for (const auto & sym : MR.getSymbols()) {
+//            LS.add(sym.first);
+//        }
+
+//        auto S = makeJITDylibSearchOrder({&MR.getTargetJITDylib()}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
+
+//        ES.lookup(LookupKind::Static, S, std::move(LS), SymbolState::Resolved, [&](Expected<SymbolMap> Result) {
+
+//            if (!Result) return;
+
+//            SymbolMap redefs;
+//            for (const auto & sym : *Result) {
+//                redefs.insert(std::make_pair(sym.first, ExecutorSymbolDef{sym.second.getAddress(), JITSymbolFlags::Exported | JITSymbolFlags::Callable}));
+//            }
+//            MR.getTargetJITDylib().define(absoluteSymbols(redefs), );
+
+
+
+
+//        }, NoDependenciesToRegister);
+
+//        std::vector<SymbolMap::value_type> redefs;
+//        redefs.reserve(MR.getSymbols().size());
+//        for (const auto & sym : MR.getSymbols()) {
+//            auto name = sym.getFirst();
+//            auto addr = cantFail(ES.lookup(S, name, SymbolState::Resolved));
+//            ExecutorSymbolDef def(addr.getAddress(), JITSymbolFlags::Exported | JITSymbolFlags::Callable);
+//            redefs.emplace_back(name, def);
+//        }
+//        BEGIN_SCOPED_REGION
+////        std::lock_guard<std::mutex> L(RedefLock);
+//        for (auto && def : redefs) {
+//            Redefinitions->insert(std::move(def));
+//        }
+//        END_SCOPED_REGION
+        return Error::success();
+    }
+
+    Error notifyFailed(MaterializationResponsibility &MR) override { return Error::success(); }
+    Error notifyRemovingResources(JITDylib &JD, ResourceKey K) override { return Error::success(); }
+    void notifyTransferringResources(JITDylib &JD, ResourceKey DstKey, ResourceKey SrcKey) override { };
+
+private:
+
+//    JITDylib & mTarget;
+
+//    std::unique_ptr<SymbolMap> & Redefinitions;
+    std::mutex RedefLock;
+
+};
+
+inline void removeAll(SymbolLookupSet & S) {
+    auto k = S.size();
+    while (k) {
+        S.remove(--k);
+    }
+}
 
 ATTRIBUTE_NO_SANITIZE_ADDRESS
 CPUDriver::CPUDriver(std::string && moduleName)
@@ -55,12 +271,12 @@ CPUDriver::CPUDriver(std::string && moduleName)
 , mUnoptimizedIROutputStream{}
 , mIROutputStream{}
 , mASMOutputStream{}
-, mEngine(nullptr)
-, mTarget(nullptr) {
+, mTarget(nullptr)
+, mEngine(nullptr) {
 
     InitializeNativeTarget();
     InitializeNativeTargetAsmPrinter();
-    llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
+    sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
 
     #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(19, 0, 0)
     StringMap<bool> features;
@@ -75,6 +291,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
             attrs.push_back("+" + flag.first().str());
         }
     }
+
 
     std::string errMessage;
     auto TripleStr = sys::getDefaultTargetTriple();
@@ -105,57 +322,55 @@ CPUDriver::CPUDriver(std::string && moduleName)
     JTMB.setCPU(CPUStr.str())
         .addFeatures(attrs)
         .setOptions(Options)
+        .setRelocationModel(Reloc::Static)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
     auto Builder = orc::LLJITBuilder();
     Builder.setJITTargetMachineBuilder(std::move(JTMB));
+    Builder.setNumCompileThreads(1);
+
+
 
     // Safely route the compilation process through your customized Parabix caching system
-    if (mObjectCache) {
-        Builder.setCompileFunctionCreator([this](llvm::orc::JITTargetMachineBuilder InnerJTMB) 
-            -> Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
-                auto TM = InnerJTMB.createTargetMachine();
-                if (!TM) return TM.takeError();
+    Builder.setCompileFunctionCreator([&](llvm::orc::JITTargetMachineBuilder InnerJTMB)
+        -> Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+            return std::make_unique<InternalCompiler>(
+                *this,
+                std::move(InnerJTMB),
+                std::move(features),
+                mObjectCache.get()
+            );
+    });
 
-                // TMOwningSimpleCompiler intercepts compilation and automatically coordinates
-                // with your mObjectCache->getObject() and notifyObjectCompiled() methods!
-                return std::make_unique<llvm::orc::TMOwningSimpleCompiler>(
-                    std::move(*TM),
-                    mObjectCache.get()
-                );
-        });
-    }
+//    mSymbolRedefinitions = std::make_unique<SymbolMap>();
 
-    auto JITExpect = Builder.create();
-    if (!JITExpect) {
-        std::string errMessage;
-        handleAllErrors(JITExpect.takeError(), [&](const ErrorInfoBase &EIB) {
-            errMessage += EIB.message();
-        });
-        throw std::runtime_error("Could not create LLJIT instance: " + errMessage);
-    }
-    mEngine = std::move(*JITExpect);
+//    Builder.setObjectLinkingLayerCreator([&](ExecutionSession & ES, const Triple & T)
+//        -> Expected<std::unique_ptr<ObjectLinkingLayer>> {
+//        auto obj = std::make_unique<ObjectLinkingLayer>(ES);
+//        obj->addPlugin(std::make_unique<KernelObjRemappingPlugin>());
+//        return obj;
+//    });
 
-    auto &MainJD = mEngine->getMainJITDylib();
+    mEngine = cantFail(Builder.create());
+
+//    mSymbolStubs = &cantFail(mEngine->createJITDylib("final"));
+
+    mMainModule->setTargetTriple(mEngine->getTargetTriple().getTriple());
+    mMainModule->setDataLayout(mEngine->getDataLayout());
+
+    auto & MainJD = mEngine->getMainJITDylib();
+
     MainJD.addGenerator(
         cantFail(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
             mEngine->getDataLayout().getGlobalPrefix()
         ))
     );
 
-    // 5. Establish Layout Attributes matching your primary Module Context references
-    const DataLayout DL = mEngine->getDataLayout();
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
-    auto triple = mTarget->getTargetTriple().getTriple();
-#else
-    auto triple = mTarget->getTargetTriple()
-#endif
-    mMainModule->setTargetTriple(triple);
-    mMainModule->setDataLayout(DL);
+    mSymbolLookupSet = std::make_unique<SymbolLookupSet>();
 
-    mBuilder.reset(IDISA::GetIDISA_Builder(*mContext, features));
-    mBuilder->setDriver(*this);
+    mBuilder.reset(IDISA::GetIDISA_Builder(mContext, features));
     mBuilder->setModule(mMainModule);
+    mBuilder->setDriver(*this);
 }
 
 Function * CPUDriver::addLinkFunction(Module * mod, llvm::StringRef name, FunctionType * type, void * functionPtr) const {
@@ -167,14 +382,9 @@ Function * CPUDriver::addLinkFunction(Module * mod, llvm::StringRef name, Functi
         f = Function::Create(type, Function::ExternalLinkage, name, mod);
 
         // Define symbol mapping inside the primary ORC library environment
-        auto &MainJD = mEngine->getMainJITDylib();
-        Mangler Mangle;
-        std::string MangledName;
-        raw_string_ostream MangledStream(MangledName);
-        Mangle.getNameWithPrefix(MangledStream, name, mEngine->getDataLayout());
-        MangledStream.flush();
+        auto & MainJD = mEngine->getMainJITDylib();
 
-        auto InternedSymbol = mEngine->getExecutionSession().intern(MangledName);
+        auto InternedSymbol = mEngine->mangleAndIntern(name);
 
         auto SymbolAddress = orc::ExecutorAddr::fromPtr(functionPtr);
 
@@ -190,7 +400,7 @@ Function * CPUDriver::addLinkFunction(Module * mod, llvm::StringRef name, Functi
                 // This means the symbol was already registered by a prior kernel pass.
                 // We mark it as a duplicate and safely drop the error.
                 IsDuplicate = true;
-            }, [&](const ErrorInfoBase &EIB) {
+            }, [&](const ErrorInfoBase & EIB) {
                 // If it's a completely different linkage error, throw it up to the runtime
                 report_fatal_error(Twine("Failed to map external helper linkage symbol '") +
                                    name + "': " + EIB.message());
@@ -203,6 +413,9 @@ Function * CPUDriver::addLinkFunction(Module * mod, llvm::StringRef name, Functi
 }
 
 void CPUDriver::generateUncachedKernels() {
+
+    errs() << "generateUncachedKernels() " << mUncachedKernel.size() << "\n";
+
     if (mUncachedKernel.empty()) return;
 
     // TODO: we may be able to reduce unnecessary optimization work by having kernel specific optimization passes.
@@ -211,103 +424,94 @@ void CPUDriver::generateUncachedKernels() {
     // mappings made by the base KernelCompiler. That could be done in a more focused manner, however, as each
     // mapping is known.
 
-    mCachedKernel.reserve(mUncachedKernel.size());
-    for (unsigned i = 0; i < mUncachedKernel.size(); ++i) {
+    const auto numKernels = mUncachedKernel.size();
+
+    auto & CL = mEngine->getIRCompileLayer();
+    auto & CC = reinterpret_cast<InternalCompiler &>(CL.getCompiler());
+
+    auto & MainJD = mEngine->getMainJITDylib();
+
+//    cantFail(MainJD.define(orc::absoluteSymbols(*mSymbolRedefinitions), MainJD.getDefaultResourceTracker()));
+//    mSymbolRedefinitions->clear();
+
+    auto & ES = mEngine->getExecutionSession();
+
+    ES.setErrorReporter([](Error err) {
+        logAllUnhandledErrors(std::move(err), errs(), "LLJIT Session Error: ");
+    });
+
+    for (unsigned i = 0; i < numKernels; ++i) {
+        CC.registerKernel(mUncachedKernel[i].get());
+   }
+
+    MangleAndInterner Mangler(ES, mEngine->getDataLayout());
+
+
+    mCachedKernel.reserve(numKernels);
+    for (unsigned i = 0; i < numKernels; ++i) {
         auto & kernel = mUncachedKernel[i];
-        NamedRegionTimer T(kernel->getSignature(), kernel->getName(),
-                           "kernel", "Kernel Generation",
-                           codegen::TimeKernelsIsEnabled);
-        kernel->generateKernel(getBuilder());
-        Module * const module = kernel->getModule(); assert (module);
-        module->setTargetTriple(mMainModule->getTargetTriple());
-        module->setDataLayout(mMainModule->getDataLayout());
+        cantFail(MainJD.define(std::make_unique<KernelGenerationMU>(kernel.get(), Mangler, *mSymbolLookupSet, CL, mContexts)));
         mCachedKernel.emplace_back(kernel.release());
     }
 
     mUncachedKernel.clear();
 
-    llvm::reportAndResetTimings();
-    llvm::PrintStatistics();
+    assert (!mSymbolLookupSet->containsDuplicates());
+
+    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly); // mSymbolStubs,
+    auto funcMap = cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
+
+    errs() << " --- POST LOOKUP --- !\n\n";
+
+    for (auto & sym : *mSymbolLookupSet) {
+        ExecutorSymbolDef def = funcMap.find(sym.first)->getSecond();
+        errs() << sym.first << " -> "; errs().write_hex(def.getAddress().getValue()) << "\n";
+
+    }
+
+    errs() << " ---\n";
+
+//    SymbolLookupSet L;
+//    for (const auto & sym : *mSymbolLookupSet) {
+//        L.add(sym.first);
+//    }
+
+//    SymbolMap M;
+//    for (auto & sym : *mSymbolLookupSet) {
+//        ExecutorSymbolDef def = funcMap.find(sym.first)->getSecond();
+//        M.insert(std::make_pair(sym.first, def));
+//    }
+//    cantFail(mSymbolStubs->define(absoluteSymbols(std::move(M))));
+
+//    errs() << "POST SYM REDEF!\n";
+
+    removeAll(*mSymbolLookupSet);
+
+}
+
+SymbolStringPtr CPUDriver::declareFunctionSymbol(llvm::Function * function) const {
+    // this may require modulename_functionname ?
+    assert (function);
+    MangleAndInterner MI(mEngine->getExecutionSession(), mEngine->getDataLayout());
+    SymbolStringPtr symbolPtr = MI(function->getName());
+    mSymbolLookupSet->add(symbolPtr, SymbolLookupFlags::RequiredSymbol);
+    return symbolPtr;
+}
+
+void CPUDriver::addCachedObjectFile(llvm::Module * module, std::unique_ptr<MemoryBuffer> &&object) {
+    auto & JITLib = mEngine->getMainJITDylib();
+    cantFail(mEngine->addObjectFile(JITLib, std::move(object)));
 }
 
 void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
-    std::unique_ptr<llvm::LLVMContext> BorrowedContext(mContext.get());
-    ThreadSafeContext GlobalTSCtx(std::move(BorrowedContext));
 
-    using ModuleSet = llvm::SmallVector<Module *, 32>;
 
-    ModuleSet Infrequent;
-    ModuleSet Normal;
 
-    for (const auto & kernel : mCompiledKernel) {
-        kernel->ensureLoaded();
-    }
-
-    for (const auto & kernel : mCachedKernel) {
-        if (LLVM_UNLIKELY(kernel->getModule() == nullptr)) {
-            report_fatal_error(llvm::StringRef(kernel->getName()) + " was neither loaded from cache nor generated prior to finalizeObject");
-        }
-        Module * const m = kernel->getModule();
-        assert ("cached kernel has no module?" && m);
-        if (LLVM_UNLIKELY(kernel->hasAttribute(AttrId::InfrequentlyUsed))) {
-            assert ("pipeline cannot be infrequently compiled" && !isa<PipelineKernel>(kernel));
-            Infrequent.emplace_back(m);
-        } else {
-            Normal.emplace_back(m);
-        }
-    }
-
-    auto &ES = mEngine->getExecutionSession();
-    auto &MainJD = mEngine->getMainJITDylib();
-
-    auto RunJID_Expect = ES.createJITDylib("finalize_run_" + std::to_string(reinterpret_cast<uintptr_t>(pk)));
-    if (!RunJID_Expect) {
-        report_fatal_error(Twine("ORC failed to allocate an execution sandbox: ") + toString(RunJID_Expect.takeError()));
-    }
-    auto &RunJD = *RunJID_Expect;
-
-    // Link this temporary run context to inherit process symbols and prior links from MainJD
-    RunJD.addToLinkOrder(MainJD);
-
-    // Helper lambda to safely thread-wrap and register your generated kernel structures
-    auto addModulesToORC = [&](const ModuleSet & S, const CodeGenOptLevel level) {
-        if (S.empty()) return;
-
-        unsigned moduleCounter = 0;
-
-        // NOTE: In ORC, Optimization Levels are ideally configured per-JITDylib or via custom IR transform layers.
-        // For standard transitions, compiling into the Engine instance functions directly:
-        for (Module * M : S) {
-            std::string uniqueID = M->getName().str() + "_run_" + 
-                                   std::to_string(reinterpret_cast<uintptr_t>(pk)) + "_" + 
-                                   std::to_string(moduleCounter++);
-            M->setModuleIdentifier(uniqueID);
-
-            // ORC takes absolute lifetime ownership of the module via unique_ptr wrapping
-            auto UniqueM = std::unique_ptr<Module>(M);
-            // Share the global driver LLVM context safe reference frame mapping
-            orc::ThreadSafeModule TSM(std::move(UniqueM), GlobalTSCtx);
-
-            if (auto Err = mEngine->addIRModule(RunJD, std::move(TSM))) {
-                report_fatal_error(Twine("Failed adding module to ORC execution frame: ") + toString(std::move(Err)));
-            }
-        }
-    };
-
-    // Add uncompiled modules straight into our JIT run scope
-    addModulesToORC(Infrequent, codegen::BackEndOptLevel);
-    addModulesToORC(Normal, CodeGenOptLevel::Default);
+    mBuilder->setModule(mMainModule);
 
     // Build the "main" module frame context execution pipeline
-    auto mainModule = std::make_unique<Module>("main", *mContext);
-    mainModule->setTargetTriple(mMainModule->getTargetTriple());
-    mainModule->setDataLayout(mMainModule->getDataLayout());
-    mBuilder->setModule(mainModule.get());
-
-
-
-    //pk->addKernelDeclarations(getBuilder());
+    pk->addKernelDeclarations(*mBuilder, false);
 
     // Finalize compiling and extracting the entry address pointer context out of your JIT
     // Assuming you look up your main wrapper method afterwards using mEngine->lookup("main")
@@ -316,31 +520,25 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     // main method until we add the thread count as a parameter. Investigate whether we can make a
     // better "wrapper" method for that that allows easier access to the output scalars.
 
-    const auto e = true; // pk->containsKernelFamilyCalls() || pk->generatesDynamicRepeatingStreamSets();
-    const auto method = e ? Kernel::AddInternal : Kernel::DeclareExternal;
-    Function * const main = pk->addOrDeclareMainFunction(getBuilder(), method);
-    mBuilder->setModule(mMainModule);
+    Function * const main = pk->addOrDeclareMainFunction(*mBuilder, Kernel::AddInternal);
 
     // NOTE: the pipeline kernel is destructed after calling clear unless this driver preserves kernels!
-    if (getPreservesKernels()) {
-        for (auto & kernel : mCachedKernel) {
-            mPreservedKernel.emplace_back(kernel.release());
-        }
-        for (auto & kernel : mCompiledKernel) {
-            mPreservedKernel.emplace_back(kernel.release());
-        }
-    } else {
-        mPreservedKernel.clear();
-    }
 
-    std::string mainName = main->getName().str();
 
     //  Wrap and submit your main wrapper module into the active ORC engine run instance
-    orc::ThreadSafeModule TSMainModule(std::move(mainModule), GlobalTSCtx);
-    if (auto Err = mEngine->addIRModule(RunJD, std::move(TSMainModule))) {
-        report_fatal_error(Twine("Failed adding main module script to ORC JIT: ") + toString(std::move(Err)));
-    }
 
+    MangleAndInterner MI(mEngine->getExecutionSession(), mEngine->getDataLayout());
+    SymbolStringPtr mainSymbol = MI(main->getName());
+    mSymbolLookupSet->add(mainSymbol, SymbolLookupFlags::RequiredSymbol);
+
+    auto & MainJD = mEngine->getMainJITDylib();
+    ThreadSafeContext ctx(std::unique_ptr<LLVMContext>{&mMainModule->getContext()});
+    ThreadSafeModule TSM(std::unique_ptr<Module>{mMainModule}, ctx);
+    mContexts.emplace_back(ctx);
+    cantFail(mEngine->addIRModule(MainJD, std::move(TSM)));
+
+
+#if 0
     if (LLVM_UNLIKELY(codegen::ShowASMOption != codegen::OmittedOption)) {
         if (!codegen::ShowASMOption.empty()) {
             std::error_code error;
@@ -370,24 +568,25 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
         }
 
     }
+#endif
 
-    mCachedKernel.clear();
-    mCompiledKernel.clear();
+
 
     // 7. Look up and resolve symbols using standard target data layout policies.
     // Compilation triggers on-demand here during lookup, bypassing the old explicit finalizeObject() call.
-    auto SymExpect = mEngine->lookup(RunJD, mainName);
-    if (!SymExpect) {
-        report_fatal_error(Twine("ORC Lookup failed for entry point ") + mainName + ": " + toString(SymExpect.takeError()));
-    }
 
-    // Convert resolved executor address smoothly to a naked execution pointer address
-    void* mainFnPtr = SymExpect->toPtr<void*>();
+    assert (!mSymbolLookupSet->containsDuplicates());
 
-    (void)GlobalTSCtx.getContext(); // Forces synchronization state validation if required
-    // Modern ORC maintains state reference blocks via internal shared pointers.
-    // If your compiler configuration manages contexts externally, we can safely clear 
-    // or let it naturally release tracking dependencies since it acts as a weak reference frame.
+    auto & ES = mEngine->getExecutionSession();
+    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly); // mSymbolStubs,
+    auto funcMap = cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
+    auto mainFuncPtr = funcMap.find(mainSymbol)->getSecond().getAddress().toPtr<void*>();
+
+    errs() << "mainFuncPtr: "; errs().write_hex((uintptr_t)mainFuncPtr); errs() << "\n";
+
+    assert (mainFuncPtr);
+
+    removeAll(*mSymbolLookupSet);
 
     // NOTE ON MEMORY MANAGEMENT:
     // With MCJIT, you explicitly executed manual removeModule tracking loops here to free IR structures. 
@@ -395,10 +594,31 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     // these compiled structures will sit immutably in memory until the base mEngine layout drops, 
     // eliminating the risk of accidental premature cross-module lookups while your code executes.
 
-    return mainFnPtr;
+    if (getPreservesKernels()) {
+        for (auto & kernel : mCachedKernel) {
+            mPreservedKernel.emplace_back(kernel.release());
+        }
+        for (auto & kernel : mCompiledKernel) {
+            mPreservedKernel.emplace_back(kernel.release());
+        }
+    } else {
+        mPreservedKernel.clear();
+    }
+
+    mCachedKernel.clear();
+    mCompiledKernel.clear();
+
+    //    llvm::reportAndResetTimings();
+    //    llvm::PrintStatistics();
+
+    return mainFuncPtr;
 }
 
 bool CPUDriver::hasExternalFunction(llvm::StringRef functionName) const {
+//    auto & ES = mEngine->getExecutionSession();
+//    auto ss = ES.intern(functionName);
+//    auto r = ES.lookup(mEngine->defaultLinkOrder(), ss, SymbolState::Ready);
+//    return r.operator bool();
     return RTDyldMemoryManager::getSymbolAddressInProcess(functionName.str());
 }
 

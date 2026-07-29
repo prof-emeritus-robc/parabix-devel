@@ -83,7 +83,7 @@ void PipelineCompiler::illustrateStreamSet(KernelBuilder & b, const size_t strea
                               b.GetString(bind.Name),
                               handle,
                               mInternallySynchronizedSubsegmentNumber,
-                              buffer->getType(), MemoryOrdering::RowMajor,
+                              buffer->getType(b), MemoryOrdering::RowMajor,
                               vba, initial, current);
         }
     }

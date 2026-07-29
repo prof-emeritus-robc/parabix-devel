@@ -180,8 +180,8 @@ ArrayType * BaseDriver::getStreamSetTy(const unsigned NumElements, const unsigne
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 BaseDriver::BaseDriver(std::string && moduleName)
-: mContext()
-, mMainModule(new Module(moduleName, mContext))
+: mContext(new LLVMContext())
+, mMainModule(new Module(moduleName, *mContext))
 , mBuilder(nullptr)
 , mObjectCache(nullptr) {
     if (LLVM_UNLIKELY(codegen::EnableObjectCache)) {

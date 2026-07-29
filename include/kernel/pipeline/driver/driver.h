@@ -49,11 +49,11 @@ public:
     virtual ~BaseDriver();
 
     const llvm::LLVMContext & getContext() const final {
-        return mContext;
+        return *mContext;
     }
 
     llvm::LLVMContext & getContext() final {
-        return mContext;
+        return *mContext;
     }
 
     bool getPreservesKernels() const {
@@ -107,7 +107,7 @@ protected:
 
 protected:
 
-    llvm::LLVMContext                                       mContext;
+    llvm::LLVMContext * const                               mContext;
     llvm::Module * const                                    mMainModule;
     std::unique_ptr<kernel::KernelBuilder>                  mBuilder;
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;

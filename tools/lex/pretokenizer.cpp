@@ -450,7 +450,127 @@ private:
     uint32_t mDelimCodepoint;
 };
 
-//  Helper functions 
+// GPT2PretokenBoundaryKernel — GPT-2 pretoken STARTS via CHARACTER-CLASS transitions
+// (parallel leftmost-longest), replacing the RE_Kernel route which over-marks (it
+// matches all positions in parallel, so overlapping arms like " '" vs "'t" and
+// " star" vs "star" produce spurious boundaries). A GPT-2 pretoken is: an optional
+// SINGLE leading space + a maximal run of ONE class (Letter/Number/Other), or a
+// whitespace run, plus the 'contraction glue. For disjoint class-runs, leftmost-longest
+// == "boundary at each class transition", computable in one parallel pass.
+// Inputs (codepoint domain, 1-bit): space (LookAhead 1 to peek the next codepoint),
+//   letter, number, apostrophe. Output: boundary (1 at each pretoken's first codepoint).
+class GPT2PretokenBoundaryKernel : public PabloKernel {
+public:
+    // space    = full \p{White_Space} (the HF \s class: 0x20, tab/newline, NBSP U+00A0,
+    //            and the other Unicode White_Space codepoints) — drives run-splitting.
+    // spaceLit = the literal 0x20 ONLY (HF's " ?" optional-leading-space is 0x20, not \s)
+    //            — the only whitespace that attaches FORWARD to the following word.
+    // sdmt/cl/cvr/ce: single-codepoint classes for the contraction suffixes — [sdmt]
+    // (single), l, [vr], e (for ll / ve / re). LookAhead(2) so the apostrophe can peek
+    // its next 1–2 codepoints. HF's '(?:[sdmt]|ll|ve|re) is lowercase / case-sensitive.
+    GPT2PretokenBoundaryKernel(LLVMTypeSystemInterface & ts,
+                               StreamSet * space, StreamSet * spaceLit,
+                               StreamSet * letter, StreamSet * number,
+                               StreamSet * apostrophe,
+                               StreamSet * sdmt, StreamSet * cl,
+                               StreamSet * cvr, StreamSet * ce,
+                               StreamSet * boundary)
+    : PabloKernel(ts, "GPT2PretokenBoundary",
+                  {Binding{"space", space, FixedRate(), LookAhead(1)},
+                   Binding{"spaceLit", spaceLit},
+                   Binding{"letter", letter}, Binding{"number", number},
+                   Binding{"apostrophe", apostrophe},
+                   Binding{"sdmt", sdmt, FixedRate(), LookAhead(2)},
+                   Binding{"cl",   cl,   FixedRate(), LookAhead(2)},
+                   Binding{"cvr",  cvr,  FixedRate(), LookAhead(2)},
+                   Binding{"ce",   ce,   FixedRate(), LookAhead(2)}},
+                  {Binding{"boundary", boundary}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * space    = getInputStreamSet("space")[0];      // full \p{White_Space}
+        PabloAST * spaceLit = getInputStreamSet("spaceLit")[0];   // literal 0x20 only
+        PabloAST * letter   = getInputStreamSet("letter")[0];
+        PabloAST * number   = getInputStreamSet("number")[0];
+        PabloAST * apos     = getInputStreamSet("apostrophe")[0];
+        PabloAST * sdmt     = getInputStreamSet("sdmt")[0];   // [sdmt]  (single-letter suffix)
+        PabloAST * cl       = getInputStreamSet("cl")[0];     // 'l'     (ll)
+        PabloAST * cvr      = getInputStreamSet("cvr")[0];    // [vr]    (ve / re first letter)
+        PabloAST * ce       = getInputStreamSet("ce")[0];     // 'e'     (ve / re second letter)
+
+        PabloAST * nonspace = pb.createNot(space);
+        PabloAST * other    = pb.createAnd(nonspace, pb.createNot(pb.createOr(letter, number)));
+
+        // previous-codepoint values (Advance = delay by 1)
+        PabloAST * Lp     = pb.createAdvance(letter,   1);
+        PabloAST * Np     = pb.createAdvance(number,   1);
+        PabloAST * Op     = pb.createAdvance(other,    1);
+        PabloAST * Wp     = pb.createAdvance(space,    1);   // prev codepoint is whitespace
+        PabloAST * SpLitP = pb.createAdvance(spaceLit, 1);   // prev codepoint is a literal 0x20
+
+        // same non-space class as the previous codepoint (L→L / N→N / O→O = no boundary)
+        PabloAST * sameClass = pb.createOr(pb.createAnd(letter, Lp),
+                               pb.createOr(pb.createAnd(number, Np),
+                                           pb.createAnd(other,  Op)));
+
+        PabloAST * nsAhead = pb.createNot(pb.createLookahead(space, 1));   // nonspace[i+1] (or EOF)
+
+        // A) LAST whitespace char of a run before a nonspace ALWAYS opens a token. A
+        //    literal 0x20 attaches FORWARD into the word (HF " ?\p{L/N}+" / " ?[^\s..]+");
+        //    a non-0x20 whitespace (e.g. NBSP U+00A0) CANNOT attach (" ?" is 0x20 only),
+        //    so it is a lone "\s+" token. Both cases start a new token at this position.
+        PabloAST * wsBeforeNS  = pb.createAnd(space, nsAhead);
+        // B) whitespace-run START (prev not whitespace) — opens the run's leading token.
+        PabloAST * spaceStart  = pb.createAnd(space, pb.createNot(Wp));
+        // C) non-space run start: a class transition, UNLESS the prev codepoint is an
+        //    attaching literal 0x20 (then the word joins that space's " ?word" token).
+        //    Prev being a non-0x20 whitespace (NBSP) or a different nonspace class → the
+        //    word starts fresh (NBSP does not attach), so wordStart fires there.
+        PabloAST * wordStart   = pb.createAnd(nonspace,
+                                 pb.createAnd(pb.createNot(sameClass), pb.createNot(SpLitP)));
+
+        PabloAST * boundary = pb.createOr(wsBeforeNS, pb.createOr(spaceStart, wordStart));
+
+        // Contraction 's|'t|'d|'m|'ll|'ve|'re — HF's '(?:[sdmt]|ll|ve|re), LOWERCASE and
+        // CASE-SENSITIVE, exactly 1 or 2 suffix letters. Because the contraction arm is
+        // FIRST in HF's alternation, it wins whenever the scanner RESUMES at the
+        // apostrophe. It resumes there unless the previous codepoint swallowed it, which
+        // happens in exactly two cases:
+        //   prev == literal 0x20 → " ?[^\s\p{L}\p{N}]+" takes " '" (e.g. " 'there")
+        //   prev is Other        → that arm's maximal run already absorbed it ("x?'s" → "?'","s")
+        // Everything else resumes at the apostrophe and forms a contraction:
+        //   prev L / N            → \p{L}+ / \p{N}+ stop before it ("don't", "3's")
+        //   prev non-0x20 \s      → " ?" is 0x20-ONLY so it cannot attach; that whitespace
+        //                           is a lone "\s+" token ("a\n'default" → "'d","efault";
+        //                           same for tab and NBSP)
+        //   BOF                   → nothing precedes ("'default" → "'d","efault")
+        // Stating it as a NEGATIVE covers BOF for free: at position 0 every Advance is 0,
+        // so neither exclusion fires. (The earlier form required prev L|N, which silently
+        // dropped the newline / tab / NBSP / BOF cases — one such site was the ONLY
+        // divergence in 5.4M tokens over 24 MB of openwebtext: Django "'default':".)
+        PabloAST * aposSwallowed = pb.createOr(SpLitP, Op);   // prev 0x20, or prev Other
+        PabloAST * wordApos = pb.createAnd(apos, pb.createNot(aposSwallowed));
+        // Peek the 1–2 codepoints after the apostrophe (LookAhead on the suffix classes).
+        PabloAST * single = pb.createAnd(wordApos, pb.createLookahead(sdmt, 1));   // 's 't 'd 'm  (span = 2 cp)
+        PabloAST * dbl    = pb.createAnd(wordApos,                                  // 'll 've 're  (span = 3 cp)
+                            pb.createOr(pb.createAnd(pb.createLookahead(cl,  1), pb.createLookahead(cl, 2)),
+                                        pb.createAnd(pb.createLookahead(cvr, 1), pb.createLookahead(ce, 2))));
+        // Suppress the boundary INSIDE the contraction span (its suffix letters join the
+        // apostrophe token): +1 for single/double, +2 for the 2nd letter of a double.
+        PabloAST * cSuppress = pb.createOr(pb.createAdvance(pb.createOr(single, dbl), 1),
+                                           pb.createAdvance(dbl, 2));
+        // FORCE a boundary right AFTER the span — the next letter starts a fresh word
+        // ("Ne've"+"r", "word's"+"tuff") which sameClass would otherwise glue. Past-EOF
+        // Advance yields 0, so a contraction at end of input forces nothing.
+        PabloAST * cForce = pb.createOr(pb.createAdvance(single, 2),
+                                        pb.createAdvance(dbl, 3));
+        boundary = pb.createOr(pb.createAnd(boundary, pb.createNot(cSuppress)), cForce);
+
+        writeOutputStreamSet("boundary", std::vector<PabloAST*>{boundary});
+    }
+};
+
+//  Helper functions
 
 static void whiteSpaceLogic(PipelineBuilder & P,
                              StreamSet * U21Basis,
@@ -554,8 +674,46 @@ PreTokenizerResult buildPreTokenizerBoundaries(
         SHOW_STREAM(WordBoundaries);
     }
     else if (preTokenizer == bytelevel) {
-        WordBoundaries = buildREBasedTokenizer(P, "BL",
-            re::generateRE_TokenizerRule(re::ByteLevelBoundary), U21codepoints);
+        // GPT-2 pretoken boundaries via CHARACTER-CLASS transitions (parallel
+        // leftmost-longest), NOT RE_Kernel (which over-marks — see kernel comment).
+        // Classes are on the ORIGINAL codepoints (before the byte-level Ġ remap below),
+        // since \p{L}/\p{N}/\s apply to the source text, not the remapped bytes.
+        auto letterProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Letter");
+        letterProp = cast<re::PropertyExpression>(UCD::linkAndResolve(letterProp));
+        StreamSet * BL_Letter = P.CreateStreamSet(1);
+        P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterProp, U21codepoints, BL_Letter);
+        StreamSet * BL_Apostrophe = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(
+            std::vector<re::CC *>{re::makeCC((codepoint_t)0x27)}, U21codepoints, BL_Apostrophe);
+        // Contraction-suffix classes (HF's '(?:[sdmt]|ll|ve|re), lowercase): [sdmt] for
+        // the single-letter suffix, l / [vr] / e for the double-letter ll / ve / re.
+        StreamSet * BL_sdmt = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{
+            re::makeCC(re::makeCC((codepoint_t)0x64),                     // d
+            re::makeCC(re::makeCC((codepoint_t)0x6D),                     // m
+                       re::makeCC((codepoint_t)0x73, (codepoint_t)0x74)))// s, t
+            }, U21codepoints, BL_sdmt);
+        StreamSet * BL_l = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(
+            std::vector<re::CC *>{re::makeCC((codepoint_t)0x6C)}, U21codepoints, BL_l);   // l
+        StreamSet * BL_vr = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(
+            std::vector<re::CC *>{re::makeCC(re::makeCC((codepoint_t)0x72),
+                                             re::makeCC((codepoint_t)0x76))}, U21codepoints, BL_vr); // r, v
+        StreamSet * BL_e = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(
+            std::vector<re::CC *>{re::makeCC((codepoint_t)0x65)}, U21codepoints, BL_e);   // e
+        // Full \p{White_Space} (HF's \s): 0x20, tab/newline, NBSP U+00A0, etc. Drives
+        // run-splitting. WhitespaceMask (from WhitespaceDetector) is the literal 0x20
+        // ONLY, which is HF's " ?" attaching space — pass it as spaceLit.
+        auto wsProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "White_Space");
+        wsProp = cast<re::PropertyExpression>(UCD::linkAndResolve(wsProp));
+        StreamSet * BL_WSpace = P.CreateStreamSet(1);
+        P.CreateKernelCall<UnicodePropertyKernelBuilder>(wsProp, U21codepoints, BL_WSpace);
+        WordBoundaries = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<GPT2PretokenBoundaryKernel>(
+            BL_WSpace, WhitespaceMask, BL_Letter, NumberStream, BL_Apostrophe,
+            BL_sdmt, BL_l, BL_vr, BL_e, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
 
         StreamSet * GPT2Codepoints = P.CreateStreamSet(21, 1);
@@ -758,3 +916,4 @@ StreamSet * applyByteLevelEncoding(PipelineBuilder & P, StreamSet * BasisBits) {
     P.CreateKernelCall<ByteLevelGPT2Kernel>(BasisBits, GPT2Codepoints, FirstByteMask);
     return GPT2Codepoints;
 }
+

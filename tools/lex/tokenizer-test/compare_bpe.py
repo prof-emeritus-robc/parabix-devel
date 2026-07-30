@@ -18,13 +18,17 @@ Usage:
     python compare_bpe.py --verbose                    # full token-by-token table always
     python compare_bpe.py --parabix-only               # skip HF, show Parabix output only
     python compare_bpe.py --hf-only                    # skip Parabix, show HF output only
+    python compare_bpe.py --runs 10                    # timed runs per side (default 5)
+    python compare_bpe.py --no-timing                  # skip the timing section
 """
 
 import sys
 import subprocess
 import tempfile
 import os
+import re
 import argparse
+import time
 from tokenizers import Tokenizer
 
 # ---------------------------------------------------------------------------
@@ -36,9 +40,11 @@ TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
-DEFAULT_INPUT  = os.path.join(REPO_ROOT, "build19/test.txt")
+DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/webtext_sample.txt")
 OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "compare_bpe_output.txt")
+
+DEFAULT_RUNS = 5
 
 SEP  = "=" * 70
 DASH = "-" * 70
@@ -64,44 +70,42 @@ class Tee:
 # Runners
 # ---------------------------------------------------------------------------
 
-def run_parabix_bpe(text: str) -> tuple[list[int], list[str]]:
-    """Two-step Parabix BPE: bytelevel pretokenizer then BPE merge + vocab lookup."""
+def _parabix_ids_cmd(input_path: str, strings: bool = False):
+    """Spawn the tokenizer binary on a pre-written input file. One subprocess."""
+    cmd = [TOKENIZER, "--pretokenizer=bytelevel", f"--vocab={VOCAB}", f"--merges={MERGES}"]
+    if strings:
+        cmd.append("--strings")
+    cmd.append(input_path)
+    return subprocess.run(cmd, capture_output=True, encoding="utf-8")
 
-    # Step 1: bytelevel pretokenizer → byte-encoded pre-tokens (one per line)
+
+def run_parabix_bpe(text: str) -> tuple[list[int], list[str]]:
+    """Parabix BPE: feed raw text straight to the merge stage.
+
+    The BPE seed (BPERangeSeed) already applies GPT-2 bytes_to_unicode to the raw
+    input bytes, so running --pretokenizer=bytelevel FIRST double-encodes: a space
+    0x20 becomes Ġ, emitted as its UTF-8 bytes 0xC4 0xA0, which the seed then
+    re-maps to ids 128/254 instead of the correct Ġ id 220. Skip step 1 and let the
+    seed do the byte-level encode once (matches HF).
+
+    NOTE: --pretokenizer=bytelevel boundary-gating was tried and reverted — the raw
+    RE_Kernel boundary stream over-marks (optional-space + contraction overlaps),
+    detaching Ġ from words and splitting words. Raw-byte path is the good baseline;
+    only the 't/quote contraction diverges (no pretoken boundaries block it)."""
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
                                      encoding="utf-8", delete=False) as f:
         f.write(text)
         input_path = f.name
     try:
-        r1 = subprocess.run(
-            [TOKENIZER, "--pretokenizer=bytelevel", input_path],
-            capture_output=True, encoding="utf-8"
-        )
-        pretokens_text = r1.stdout
+        r_ids  = _parabix_ids_cmd(input_path)
+        r_strs = _parabix_ids_cmd(input_path, strings=True)
     finally:
         os.unlink(input_path)
 
-    # Step 2: BPE merge + vocab lookup → integer IDs
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
-                                     encoding="utf-8", delete=False) as f:
-        f.write(pretokens_text)
-        pretokens_path = f.name
-    try:
-        r_ids = subprocess.run(
-            [TOKENIZER, f"--vocab={VOCAB}", f"--merges={MERGES}", pretokens_path],
-            capture_output=True, encoding="utf-8"
-        )
-        r_strs = subprocess.run(
-            [TOKENIZER, f"--vocab={VOCAB}", f"--merges={MERGES}",
-             "--strings", pretokens_path],
-            capture_output=True, encoding="utf-8"
-        )
-    finally:
-        os.unlink(pretokens_path)
-        
-   # lists of typed values to be compared 
+    # lists of typed values to be compared
     ids     = [int(x) for x in r_ids.stdout.split() if x.lstrip("-").isdigit()]
-    strings = [s for s in r_strs.stdout.split("\n") if s]
+    strings = [s.split("\t", 1)[-1] for s in r_strs.stdout.split("\n") if s]
     return ids, strings
 
 
@@ -109,6 +113,88 @@ def run_hf_bpe(tokenizer_obj, text: str) -> tuple[list[int], list[str]]:
     """Run HuggingFace tokenizer (loaded from local tokenizer.json)."""
     output = tokenizer_obj.encode(text)
     return output.ids, output.tokens
+
+
+# ---------------------------------------------------------------------------
+# Timing — FAIR: pure tokenization, one-time setup excluded on BOTH sides.
+#
+#   Parabix : tokenizer --bench-loop=N runs the already-built, JIT-compiled
+#             pipeline N times inside ONE process (no per-iter process spawn,
+#             merges.txt load, or pipeline build/JIT), token output suppressed.
+#             The binary prints a machine-readable BENCH_RESULT stderr line we
+#             parse. This is Parabix's tokenize-only cost.
+#   HF      : tokenizer.encode(text) in a warm best-of-N in-process loop; the
+#             model was loaded ONCE by Tokenizer.from_file() before timing.
+#
+# HF's from_file() (load tokenizer.json + build vocab/merge tables) is the
+# counterpart of Parabix's spawn + merges load + compile/link — one-time, and
+# excluded on BOTH sides. So we compare tokenize-vs-tokenize, not process-vs-
+# preloaded (the earlier version timed the whole Parabix subprocess = unfair).
+# ---------------------------------------------------------------------------
+
+# BENCH_RESULT bytes=848 iters=50 min_ms=.. median_ms=.. mean_ms=.. mbps=..
+BENCH_RE = re.compile(
+    r"BENCH_RESULT\s+bytes=(\d+)\s+iters=(\d+)\s+min_ms=([\d.]+)\s+"
+    r"median_ms=([\d.]+)\s+mean_ms=([\d.]+)\s+mbps=([\d.]+)"
+)
+
+
+def bench_parabix(input_path: str, runs: int):
+    """Fair Parabix tokenize time via in-process --bench-loop. Returns a stats
+    dict (min/median/mean ms + mbps) or None if no BENCH_RESULT was produced."""
+    r = subprocess.run(
+        [TOKENIZER, f"--bench-loop={runs}", f"--vocab={VOCAB}",
+         f"--merges={MERGES}", input_path],
+        capture_output=True, encoding="utf-8"
+    )
+    m = BENCH_RE.search(r.stderr or "")
+    if not m:
+        return None
+    return {
+        "bytes":     int(m.group(1)),
+        "iters":     int(m.group(2)),
+        "min_ms":    float(m.group(3)),
+        "median_ms": float(m.group(4)),
+        "mean_ms":   float(m.group(5)),
+        "mbps":      float(m.group(6)),
+    }
+
+
+def bench_hf(tokenizer_obj, text: str, runs: int) -> dict:
+    """Fair HF tokenize time: warm best-of-N in-process encode() (model preloaded)."""
+    tokenizer_obj.encode(text)                       # one discarded warm-up
+    times_ms = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        tokenizer_obj.encode(text)
+        times_ms.append((time.perf_counter() - t0) * 1e3)
+    times_ms.sort()
+    nbytes = len(text.encode("utf-8"))
+    minv   = times_ms[0]
+    median = times_ms[len(times_ms) // 2]
+    mean   = sum(times_ms) / len(times_ms)
+    mbps   = (nbytes / (minv / 1e3)) / 1e6 if minv > 0 else 0.0
+    return {"bytes": nbytes, "iters": runs, "min_ms": minv,
+            "median_ms": median, "mean_ms": mean, "mbps": mbps}
+
+
+def measure_timing(tokenizer_obj, text: str, runs: int) -> dict:
+    """Fair tokenize-vs-tokenize timing (setup excluded both sides)."""
+    result = {}
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
+                                     encoding="utf-8", delete=False) as f:
+        f.write(text)
+        ppath = f.name
+    try:
+        result["parabix"] = bench_parabix(ppath, runs)
+    finally:
+        os.unlink(ppath)
+
+    if tokenizer_obj is not None:
+        result["hf"] = bench_hf(tokenizer_obj, text, runs)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +229,48 @@ def write_diff_detail(out, parabix_ids, hf_ids) -> None:
                   f"Parabix={parabix_ids[first]}, HF={hf_ids[first]}\n")
 
 
+def write_timing(out, timing: dict, text: str, runs: int, ntokens: int) -> None:
+    nbytes = len(text.encode("utf-8"))
+    out.write(SEP + "\n")
+    out.write(f"TIMING  (FAIR — pure tokenize, one-time setup excluded both sides; N={runs})\n")
+    out.write(SEP + "\n")
+    out.write(f"  Input size:  {nbytes} bytes, {ntokens} tokens\n\n")
+
+    def row(label, s):
+        out.write(f"  {label:<9}  min {s['min_ms']:9.4f} ms   "
+                  f"median {s['median_ms']:9.4f} ms   mean {s['mean_ms']:9.4f} ms   "
+                  f"{s['mbps']:8.3f} MB/s\n")
+
+    p = timing.get("parabix")
+    h = timing.get("hf")
+    if p:
+        row("Parabix", p)
+    else:
+        out.write("  Parabix    <no BENCH_RESULT — rebuild tokenizer with --bench-loop support>\n")
+    if h:
+        row("HF", h)
+
+    if p and h and p["min_ms"] > 0 and h["min_ms"] > 0:
+        ratio = p["min_ms"] / h["min_ms"]
+        faster, slower = ("HF", "Parabix") if ratio >= 1 else ("Parabix", "HF")
+        out.write(f"\n  Speedup (min): {faster} is {max(ratio, 1 / ratio):.1f}x "
+                  f"faster than {slower}  (pure tokenize)\n")
+
+    out.write("\n  Fair: Parabix via --bench-loop (N iters in ONE process — no per-iter\n"
+              "        spawn / merges-load / compile, output suppressed); HF via preloaded\n"
+              "        in-process encode() loop (from_file excluded). Setup excluded both.\n"
+              "  Caveats: Parabix 'run' still includes the input file read; Parabix runs\n"
+              "        without the regex pre-tokenizer HF applies; use MB-scale input\n"
+              "        (tokenizer_files/webtext_100.txt) for a meaningful MB/s.\n")
+    out.write(SEP + "\n\n")
+
+
 # ---------------------------------------------------------------------------
 # Run modes
 # ---------------------------------------------------------------------------
 
-def run_compare(out, tokenizer_obj, cases: list[tuple[int, str]], verbose: bool) -> dict:
+def run_compare(out, tokenizer_obj, cases: list[tuple[int, str]], verbose: bool,
+                runs: int = 0) -> dict:
     results = {}
     for num, (lineno, text) in enumerate(cases, 1):
         parabix_ids, parabix_strs = run_parabix_bpe(text)
@@ -175,6 +298,10 @@ def run_compare(out, tokenizer_obj, cases: list[tuple[int, str]], verbose: bool)
             out.write(f"  IDs: {parabix_ids[:12]}{'...' if len(parabix_ids) > 12 else ''}\n")
 
         out.write("\n")
+
+        if runs > 0:
+            timing = measure_timing(tokenizer_obj, text, runs)
+            write_timing(out, timing, text, runs, len(hf_ids))
 
     return results
 
@@ -237,6 +364,10 @@ def main() -> None:
                         help="Run Parabix tokenizer only")
     parser.add_argument("--verbose",      action="store_true",
                         help="Always show full token-by-token table (default: only on mismatch)")
+    parser.add_argument("--runs",         type=int, default=DEFAULT_RUNS,
+                        help=f"Timed runs per side in compare mode (default: {DEFAULT_RUNS})")
+    parser.add_argument("--no-timing",    action="store_true",
+                        help="Skip the timing section")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -273,7 +404,8 @@ def main() -> None:
         elif args.parabix_only:
             run_parabix_only(out, cases)
         else:
-            results = run_compare(out, tokenizer_obj, cases, args.verbose)
+            runs = 0 if args.no_timing else args.runs
+            results = run_compare(out, tokenizer_obj, cases, args.verbose, runs)
             write_summary(out, results)
 
     print(f"\nOutput written to: {OUTPUT_FILE}")
@@ -281,3 +413,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

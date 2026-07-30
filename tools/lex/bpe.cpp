@@ -9,27 +9,38 @@
  *  Preprocessing (buildMergeRuleRanges, before any kernel):
  *      Read merges.txt; each line "A B" is a merge A+B→AB with rank = line index
  *      and id = 256 + rank (lower rank wins). Resolve parts → MergeRule
- *      {idA, idB, lenB, idAB} via the base alphabet + earlier merge outputs (no
- *      vocab.json needed). Group rules by idAB-RANGE (256-wide over [0,1024),
- *      1000-wide above → 53 groups), sorted by idAB ASC = rank ASC.
+ *      {idA, idB, idAB, lenA, lenB} via the base alphabet + earlier merge outputs
+ *      (no vocab.json needed; lenA/lenB = RAW-byte length = codepoint count, see
+ *      rawByteLen — NOT display-byte size). Partition into CLEAN ranges (idAB/rank
+ *      ASC): a range [lo,hi) holds only rules that are BOTH dependency-independent
+ *      (idA,idB < lo) AND token-adjacency-overlap-free (no two rules share a middle
+ *      token: right id of one == left id of the other). Full GPT-2 → 1123 ranges.
+ *      Mirrors merge_analysis.py::clean_range_analysis.
  *
- *  Runtime pipeline (one BPEMergeKernel per id-range, lowest range first):
- *      BPERangeSeed   — source = base id of each RAW byte, active = 1s, end = 0s.
- *      BPEMergeKernel — per range, per rule (rank order): Aend = EQ(source,idA);
- *                       merge = Advance(Aend,lenB) AND EQ(source,idB); stamp idAB
- *                       at the merge end via Sel. `source` threads kernel→kernel,
- *                       so a higher-rank merge sees ids stamped by lower-rank ones
- *                       (the Ġthe→Ġthey cascade). All ops forward — no LookAhead.
+ *  Runtime pipeline (one BPEMergeKernel per clean range, lowest range first):
+ *      BPERangeSeed   — source = base id of each RAW byte (8-bit), active = 1s,
+ *                       end = 0s (end is legacy/unused).
+ *      BPEMergeKernel — START-anchored, per rule (rank order):
+ *                         Astart    = EQ(source, idA)                  // A starts here
+ *                         BstartAtA = EQ(LookAhead(source, lenA), idB) // B lenA ahead
+ *                         merge     = inPlayMask AND Astart AND BstartAtA
+ *                       stamp idAB at A's START via Sel; consume B's start via
+ *                       inPlayMask &= NOT(Advance(merge, lenA)). B is read from the
+ *                       INPUT via LookAhead (forward reads are input-only; sourceIn
+ *                       declares LookAhead(maxLen)). `source` threads kernel→kernel
+ *                       (width grows to ceil_log2(hi+1) bits per range), so a
+ *                       higher-rank merge sees ids stamped by lower-rank ones (the
+ *                       Ġthe→Ġthey cascade).
  *
- *  Emission (Stage-B debug): matchEnd = active (all ones) → the id at EVERY byte
- *  is printed, so stale interior ids of swallowed parts still show. Correct
- *  emission (consume swallowed ends) is Stage C — not done.
+ *  Emission (Stage-B): matchEnd = the final inPlayMask (surviving token STARTS) —
+ *  each fired merge clears the consumed B-start, so the id at each surviving start
+ *  prints. Full HF-equivalence not yet validated (Stage C).
  *
  *  Cache keys
  *  ──────────
  *  BPEMergeKernel name encodes hashRuleSet(the group's rule list), so two merges
  *  files producing the same range shape but different rules still get distinct
- *  cache entries.
+ *  cache entries. BPERangeSeed is shape-only (constant name).
  */
 
 #include "bpe.h"
@@ -45,6 +56,9 @@
 #include <pablo/builder.hpp>
 #include <pablo/pe_zeroes.h>
 #include <pablo/bixnum/bixnum.h>
+#include <re/cc/cc_compiler.h>
+#include <re/cc/cc_compiler_target.h>
+#include <re/adt/re_cc.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
 #include <stdexcept>
@@ -92,10 +106,10 @@ public:
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        BixNumCompiler bnc(pb);
         std::vector<PabloAST*> bits = getInputStreamSet("basis");
-        BixNum bn(bits.begin(), bits.end());
-        PabloAST * isNL = bnc.EQ(bn, 0x0A);
+        // newline (0x0A) is a byte-value test on the input basis → character class.
+        cc::Parabix_CC_Compiler_Builder ccc(bits);
+        PabloAST * isNL = ccc.compileCC(re::makeByte(0x0A), pb);
         pb.createAssign(
             pb.createExtract(getOutputStreamVar("newlineMask"), pb.getInteger(0)),
             isNL);
@@ -147,11 +161,15 @@ protected:
         // One 1-bit mask per byte range — 1 wherever the byte falls in that range.
         // The six ranges are mutually exclusive and cover all of 0..255; 174..255
         // is the default (else) arm of the Select below, so it needs no mask.
-        PabloAST * m_0_32    = bnc.ULE(b, 32);                                  // control block 1
-        PabloAST * m_33_126  = pb.createAnd(bnc.UGE(b, 33),  bnc.ULE(b, 126));  // printable ASCII
-        PabloAST * m_127_160 = pb.createAnd(bnc.UGE(b, 127), bnc.ULE(b, 160));  // control block 2
-        PabloAST * m_161_172 = pb.createAnd(bnc.UGE(b, 161), bnc.ULE(b, 172));  // printable Latin-1 lo
-        PabloAST * m_173     = bnc.EQ(b, 173);                                  // the lone non-printable
+        // Each range is a byte-value character class over the input basis, so compileCC
+        // replaces the BixNum ULE/UGE/EQ comparisons 1:1. The id arithmetic below stays
+        // BixNum (CC yields only a 1-bit mask, not the multi-bit id).
+        cc::Parabix_CC_Compiler_Builder ccc(basisBits);
+        PabloAST * m_0_32    = ccc.compileCC(re::makeByte(0,   32),  pb);       // control block 1
+        PabloAST * m_33_126  = ccc.compileCC(re::makeByte(33,  126), pb);       // printable ASCII
+        PabloAST * m_127_160 = ccc.compileCC(re::makeByte(127, 160), pb);       // control block 2
+        PabloAST * m_161_172 = ccc.compileCC(re::makeByte(161, 172), pb);       // printable Latin-1 lo
+        PabloAST * m_173     = ccc.compileCC(re::makeByte(173),      pb);       // the lone non-printable
 
         // id = byte + per-range offset (173 is a fixed 255). AddModular/SubModular
         // are modular on 8 bits; every SELECTED range lands in 0..255 with no
@@ -184,6 +202,43 @@ uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
     return h;
 }
 
+// selfMergeFireStarts — non-overlapping pairing for a SELF-merge X+X→XX (idA==idB).
+// X is ANY repeated token, not just dots: a single byte (l+l→ll, 0+0→00, .+.→..,
+// ' '+' '→two-space), or an already-merged multi-byte token (--+--→----, ..+..→....,
+// ==+==→====). `isX` = the mask of X-token START positions; L = X's raw-byte length,
+// so consecutive X starts sit L bytes apart. Returns the subset that should FIRE the
+// merge: the 1st, 3rd, 5th, … X in EACH maximal run of consecutive X tokens (per-run
+// parity, reset at every run start).
+//
+// Why: a self-merge fired at EVERY X-start over-consumes — position i glues (i,i+L)
+// while position i+L glues (i+L,i+2L), so the shared token is pulled two ways and
+// the whole run collapses to one surviving start (the repeated-run bug: any run of a
+// repeated token — "lllll", "00000", "     ", "....." — implodes to one token). True
+// BPE pairs left-to-right, using each token once. Firing only at per-run-odd positions
+// reproduces that: (0,1)(2,3)(4,5)…
+//
+// Idiom ported from lib/kernel/unicode/normalization.cpp::SelfComposableLogic:
+// EveryNth gives GLOBAL parity of the X starts; MatchStar spreads each run's
+// starting parity across the run so the odd/even choice RESETS per run (otherwise a
+// preceding odd-length run would flip the next run's pairing).
+static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigned L) {
+    // X-token body: the L bytes each X covers (start .. start+L-1). For L==1 this is
+    // just isX; the body connects consecutive X tokens so MatchStar spans the gaps.
+    PabloAST * body = isX;
+    for (unsigned k = 1; k < L; k++)
+        body = pb.createOr(body, pb.createAdvance(isX, (int64_t) k));
+    // A run starts at an X with no X-token ending immediately L bytes before it.
+    PabloAST * runStart = pb.createAnd(isX, pb.createNot(pb.createAdvance(isX, (int64_t) L)));
+    PabloAST * A1 = pb.createEveryNth(isX, pb.getInteger(2));  // global 1st,3rd,5th…
+    PabloAST * A2 = pb.createXor(isX, A1);                     // global 2nd,4th,6th…
+    PabloAST * A1_start = pb.createAnd(runStart, A1);
+    PabloAST * A2_start = pb.createAnd(runStart, A2);
+    PabloAST * A1_runs = pb.createMatchStar(A1_start, body);   // runs whose 1st X is global-odd
+    PabloAST * A2_runs = pb.createMatchStar(A2_start, body);   // runs whose 1st X is global-even
+    // Per-run 1st,3rd,5th X = the fire (A-start) positions.
+    return pb.createOr(pb.createAnd(A1_runs, A1), pb.createAnd(A2_runs, A2));
+}
+
 // BPEMergeKernel — one id-range, REAL BPE merge on the id stream (START-anchored).
 // `source` carries a token id at each token's START byte (a base byte is a 1-byte
 // token → start == end; seeded = base id per raw byte). For each rule (A,B → AB),
@@ -199,15 +254,27 @@ uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
 // token STARTS — the stream emission scans (id read at each start byte).
 class BPEMergeKernel : public PabloKernel {
 public:
+    // boundaryIn (optional, may be null): 1-bit per-byte mask of pretoken STARTS.
+    // When present, a merge is blocked if B starts a new pretoken (boundary at
+    // A_start+lenA), so merges never cross a pretoken boundary (the 't/quote bug).
     BPEMergeKernel(LLVMTypeSystemInterface & ts,
-                   StreamSet * sourceIn, StreamSet * meIn,
+                   StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
                    StreamSet * sourceOut, StreamSet * meOut,
                    MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
-    : PabloKernel(ts, "BPEMerge_h" + std::to_string(shapeHash),
-                  {Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
-                   Binding{"meIn", meIn}},
+    : PabloKernel(ts, std::string("BPEMerge_") + (boundaryIn ? "b1_" : "") + "h" + std::to_string(shapeHash),
+                  mergeInputs(sourceIn, meIn, boundaryIn, maxLen),
                   {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
-      mRuleGroup(group) {}
+      mRuleGroup(group), mHasBoundary(boundaryIn != nullptr) {}
+protected:
+    static std::vector<kernel::Binding> mergeInputs(
+            StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn, unsigned maxLen) {
+        std::vector<kernel::Binding> in {
+            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
+            Binding{"meIn", meIn} };
+        if (boundaryIn)
+            in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
+        return in;
+    }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -221,12 +288,12 @@ protected:
         // idAcc — the id stream we mutate; starts as a copy of the input ids.
         // PLAIN values (functional SSA), reassigned OUTSIDE any createIf. A self-ref
         // Var assign v=f(v) inside a scope breaks Pablo reaching-def — see memory note.
-        std::vector<Var *> idAcc(W_out);
+        std::vector<PabloAST *> idAcc(W_out);
         for (unsigned i = 0; i < W_out; i++) {
             if (i < W) {
-                idAcc[i] = pb.createVar("idAcc_" + std::to_string(i), srcBits[i]);
+                idAcc[i] = srcBits[i];
             } else {
-                idAcc[i] = pb.createVar("idAcc_" + std::to_string(i), zeroes);
+                idAcc[i] = zeroes;
             }
         }
 
@@ -234,7 +301,7 @@ protected:
         // Threaded kernel→kernel (meIn/meOut), seeded all-ones. Each fired merge clears
         // B's start (interior seam); A's start survives as AB's start. Final mask marks
         // the surviving (outermost) token STARTS — the stream emission scans.
-        Var * inPlayMask = pb.createVar("inPlayMask", getInputStreamSet("meIn")[0]);
+        PabloAST * inPlayMask = getInputStreamSet("meIn")[0];
 
         // aheadByLenA[len] = the source id stream shifted so position p reads the id
         // `len` bytes ahead. One copy per distinct lenA; a rule uses aheadByLenA[lenA]
@@ -249,6 +316,19 @@ protected:
             aheadByLenA.emplace(r.lenA, BixNum(bits.begin(), bits.end()));
         }
 
+        // boundaryAheadByLen[lenA] = is a pretoken START lenA bytes ahead (= at B's
+        // start)? If so the merge would cross a pretoken boundary → block it. Read via
+        // LookAhead on the boundaryIn input (declares LookAhead(maxLen)). Null when no
+        // boundary stream was supplied → no gating (mHasBoundary == false).
+        PabloAST * boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
+        std::map<unsigned, PabloAST*> boundaryAheadByLen;
+        if (mHasBoundary) {
+            for (const auto & r : mRuleGroup.rules) {
+                if (boundaryAheadByLen.count(r.lenA)) continue;
+                boundaryAheadByLen[r.lenA] = pb.createLookahead(boundaryBit, (int64_t) r.lenA);
+            }
+        }
+
         // Each rule (rank order): merge = inPlayMask AND A-starts-here AND B-starts-at
         // +lenA. Detect inside createIf(Astart & inPlayMask), carry the fire out via a
         // NON-self-ref Var mergeV, then OUTSIDE the gate stamp idAB at A's start and
@@ -256,21 +336,42 @@ protected:
         for (const auto & r : mRuleGroup.rules) {
             BixNum cur(idAcc.begin(), idAcc.end());
             PabloAST * Astart = bnc.EQ(cur, r.idA);        // token A starts here
+
+            // Self-merge X+X→XX (idA==idB) fired at EVERY X-start over-consumes: a run
+            // of X collapses to one token (the repeated-run bug). Restrict the fire to
+            // per-run non-overlapping starts (1st,3rd,5th X of each run) so the run
+            // pairs left-to-right. Non-self merges have no self-overlap → every A-start.
+            PabloAST * fireStart = Astart;
+            if (r.idA == r.idB)   // self-merge: pair per-run on the LIVE starts. A
+                                  // lower-rank neighbor merge (e.g. Ġb, Ġw, Ġ2) may have
+                                  // already consumed the run's head; using raw Astart would
+                                  // count that dead position and flip the odd/even parity.
+                fireStart = selfMergeFireStarts(pb, pb.createAnd(Astart, inPlayMask), r.lenA);
+
+            Var * mergeV = pb.createVar("merge", zeroes);
             auto body = pb.createScope();
             BixNumCompiler bncB(body);
             PabloAST * BstartAtA = bncB.EQ(aheadByLenA.at(r.lenA), r.idB);  // B starts lenA ahead
-            PabloAST * mergeV = body.createAnd3(inPlayMask, Astart, BstartAtA);
-            PabloAST * notMergeV = body.createNot(mergeV);
-            for (unsigned i = 0; i < W_out; i++) {
-                if ((r.idAB >> i) & 1u) {
-                    body.createAssign(idAcc[i], body.createOr(idAcc[i], mergeV));
-                } else {
-                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notMergeV));
-                }
-            }
-            PabloAST * maskOff = body.createNot(body.createAdvance(mergeV, r.lenA));
-            body.createAssign(inPlayMask, body.createAnd(inPlayMask, maskOff));
-            pb.createIf(pb.createAnd(Astart, inPlayMask), body);
+            PabloAST * fire = body.createAnd3(inPlayMask, fireStart, BstartAtA);
+            if (mHasBoundary)   // block merges where B begins a new pretoken (cross-boundary)
+                fire = body.createAnd(fire, body.createNot(boundaryAheadByLen.at(r.lenA)));
+            body.createAssign(mergeV, fire);
+            pb.createIf(pb.createAnd(fireStart, inPlayMask), body);
+
+            // Stamp idAB at A's START — OUTSIDE the gate, plain functional reassignment.
+            // idAcc are PLAIN values (not Vars); the fire leaves the scope via mergeV
+            // (zeroes where the block was skipped, so the Sel keeps the old id there).
+            // A self-ref Var assign idAcc=f(idAcc) INSIDE the scope breaks Pablo
+            // reaching-def and mis-stamps the cascade — see memory note.
+            for (unsigned i = 0; i < W_out; i++)
+                idAcc[i] = pb.createSel(mergeV, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
+
+            // Consume B's start (lenA ahead of each fired merge) — OUTSIDE the gate: B is
+            // lenA bytes ahead of A, possibly in a later block the gate skips, so the clear
+            // must run in the top scope (uses mergeV carried out of the body). Use
+            // Not(Advance(mergeV,lenA)), NOT Advance(Not mergeV,lenA): Advance fills the
+            // leading lenA bytes with 0, so the latter would wrongly clear position 0.
+            inPlayMask = pb.createAnd(inPlayMask, pb.createNot(pb.createAdvance(mergeV, r.lenA)), "inPlayClear");
         }
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
@@ -279,6 +380,7 @@ protected:
     }
 private:
     MergeRuleGroup mRuleGroup;
+    bool mHasBoundary;
 };
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
@@ -294,7 +396,8 @@ private:
 BPEPassResult buildBPEPassPipeline(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
-        const BPETokenizer & bpe) {
+        const BPETokenizer & bpe,
+        kernel::StreamSet * boundary) {
 
     auto ruleRanges = bpe.buildMergeRuleRanges();
 
@@ -323,6 +426,10 @@ BPEPassResult buildBPEPassPipeline(
     P.CreateKernelCall<BPERangeSeed>(basis, source, active, end);
     if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "seed")
         return {active, source};   // dump seed source at every byte
+    // BPE_DBG=bound: dump the pretoken-boundary mask — prints the base id at each
+    // boundary byte (matchEnd = boundary). Verifies boundary placement on a tiny input.
+    if (boundary && std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "bound")
+        return {boundary, source};
 
     //
     // BETWEEN KERNELS, the source is an input and sOut is the output. 
@@ -342,7 +449,7 @@ BPEPassResult buildBPEPassPipeline(
         unsigned output_bits = ceil_log2(g.hi+1);
         StreamSet * sOut  = P.CreateStreamSet(output_bits, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, sOut, meOut,
+        P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, sOut, meOut,
                                            g, hashRuleSet(g.rules), g.maxLen);
         source     = sOut;
         inPlayMask = meOut;

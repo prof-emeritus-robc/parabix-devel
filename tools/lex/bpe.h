@@ -96,10 +96,14 @@ struct BPEPassResult {
     kernel::StreamSet * vocabID;    // 16×1 BixNum
 };
 
+// `boundary` (optional, may be null): a 1-bit per-byte mask marking pretoken
+// STARTS (GPT-2 regex boundaries). When present, merges are blocked from crossing
+// a pretoken boundary (B starting a new pretoken). Null = no boundary gating.
 BPEPassResult buildBPEPassPipeline(
     kernel::PipelineBuilder & P,
     kernel::StreamSet       * basis,
-    const BPETokenizer      & bpe);
+    const BPETokenizer      & bpe,
+    kernel::StreamSet       * boundary = nullptr);
 
 // Line-delimited pretokenizer used when --vocab is given without
 // --pretokenizer (compare_bpe.py step-2 input format).

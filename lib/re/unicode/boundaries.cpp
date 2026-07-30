@@ -436,7 +436,7 @@ const static std::map<RE_TokenizerKind, std::string> PreTokenizerPatterns =
         {WhitespaceSplitBoundary, R"(\S+(?!\S)|\s+(?!\s))"},
         {PunctuationBoundary, R"([[:punct:]]|[^[:punct:]]++)"},
         {DigitBoundary, R"(\d++|[^\d\s]++|\s++)"},
-        {ByteLevelBoundary, R"GPT('(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++)GPT"},
+        {ByteLevelBoundary, R"GPT('(?:[sdmt]|ll|ve|re)| ?\p{L}++| ?\p{N}++| ?[^\s\p{L}\p{N}]++|\s+(?!\S)|\s+)GPT"},
         {BertPreTokenizer, R"(\w++|[^\w\s]++)"},
         {SequenceWhitespacePunctuation, R"(\w++|[^\w\s]++)"}};
 

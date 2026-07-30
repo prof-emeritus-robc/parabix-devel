@@ -31,10 +31,15 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include "normalize.h"
 #include "pretokenizer.h"
 #include "bpe.h"
@@ -48,6 +53,9 @@ using namespace pablo;
 // Both are set in main() before invoking the compiled BPE pipeline function.
 static const BPETokenizer * gBPE           = nullptr;
 static bool                  gOutputStrings = false;
+// --bench-loop: when true the emit callback drops its output so timing loops
+// measure pure tokenization, not millions of stdout writes.
+static bool                  gBenchQuiet    = false;
 
 // bpe_emit_token
 // Called once per surviving BPE token by the scan::Reader stage.
@@ -55,7 +63,13 @@ static bool                  gOutputStrings = false;
 // position. The reader passes a single source pointer indexed by the
 // match-end byte offset, so we just deref to recover the full ID.
 extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
+    if (gBenchQuiet) return;   // timing loop: skip output, measure tokenization only
     uint16_t id = *id_ptr;
+    if (getenv("BPE_EMIT_DBG")) {
+        const uint8_t * bp = reinterpret_cast<const uint8_t *>(id_ptr);
+        std::fprintf(stderr, "[emit] id=%u  lo=%u hi=%u  ptr=%p\n",
+                     (unsigned)id, (unsigned)bp[0], (unsigned)bp[1], (const void*)id_ptr);
+    }
     if (gOutputStrings && gBPE)
         llvm::outs() << id << '\t' << gBPE->decodeToken(static_cast<int>(id)) << "\n";
     else
@@ -154,6 +168,22 @@ static cl::opt<unsigned> MergesLimit(
     cl::init(0),
     cl::cat(wordBreakerFlags));
 
+static cl::opt<bool> StripNewlines(
+    "strip-newlines",
+    cl::desc("BPE mode, no --pretokenizer: drop '\\n' bytes as pretoken separators "
+             "(legacy line-delimited input). Default OFF: '\\n' is real content and "
+             "seeds to id 198 (GPT-2 'Ċ'), matching HuggingFace byte-level BPE."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
+static cl::opt<unsigned> BenchLoop(
+    "bench-loop",
+    cl::desc("BPE mode: tokenize the input N times inside one process (excludes OS "
+             "process spawn + merges load + pipeline build/JIT), suppress token "
+             "output, and print machine-readable timing to stderr. 0 = off (normal run)."),
+    cl::init(0),
+    cl::cat(wordBreakerFlags));
+
 using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 // writeToStdout — convert 8x1 parallel basis bits to serial bytes and write
@@ -182,19 +212,26 @@ static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
 // vocab word ended are silently skipped; single-codepoint fallback will be
 // added in a later phase.
 //
-using BPEPipelineFunctionType = void (*)(uint32_t fd);
+// The pipeline consumes an in-memory buffer (pointer + byte count) rather than a
+// file descriptor, so the caller can load the file ONCE and invoke the compiled
+// function repeatedly over the resident bytes with zero per-call I/O — matching
+// HuggingFace's benchmark, which tokenizes an already-loaded in-memory string.
+using BPEPipelineFunctionType = void (*)(const char * buffer, size_t length);
 
 static BPEPipelineFunctionType buildBPEPipeline(
         CPUDriver & driver,
         const BPETokenizer & bpe) {
 
     auto __tBuild0 = std::chrono::steady_clock::now();
-    auto P = CreatePipeline(driver, Input<uint32_t>{"fileDescriptor"});
-    Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
+    auto P = CreatePipeline(driver,
+                            Input<const char*>{"buffer"}, Input<size_t>{"length"});
+    Scalar * const buffer = P.getInputScalar("buffer");
+    Scalar * const length = P.getInputScalar("length");
 
-    // Stage 0: I/O
+    // Stage 0: in-memory source — no fd, no per-call read(). The caller loads the
+    // file once (see main) and passes the resident pointer + length each call.
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
@@ -212,20 +249,44 @@ static BPEPipelineFunctionType buildBPEPipeline(
     //       (input is one-pretoken-per-line bytelevel text from
     //        compare_bpe.py step 1; 0x0A bytes mark separators).
     StreamSet * bpeBasis;
+    StreamSet * bpeBoundary = nullptr;   // pretoken-start mask fed to BPE (gates merges)
     if (PreTokenizer.getNumOccurrences() == 0) {
-        bpeBasis = buildLinePretokens(P, normalizedBasis);
+        // No pretokenizer. By default treat '\n' as real content — it seeds to
+        // id 198 (GPT-2 'Ċ') and flows through the merges, matching HuggingFace
+        // byte-level BPE. --strip-newlines restores the legacy behavior where
+        // '\n' is only a pretoken separator and is filtered out.
+        bpeBasis = StripNewlines ? buildLinePretokens(P, normalizedBasis)
+                                 : normalizedBasis;
+    } else if (PreTokenizer == bytelevel) {
+        // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to
+        // mark pretoken STARTS. Feed BPE the RAW bytes (BPERangeSeed does bytes_to_unicode
+        // ONCE — using ptResult's Ġ-remapped bytes would double-encode) plus the
+        // byte-domain boundary mask (ptResult.U21tokenBoundaries, already 1-per-byte for
+        // bytelevel) so merges can't cross a pretoken boundary .
+        PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
+            P, normalizedBasis, U21codepoints,
+            PreTokenizer, SplitBehavior, DelimiterString);
+        bpeBasis    = normalizedBasis;
+        bpeBoundary = ptResult.U21tokenBoundaries;    // clean class-transition pretoken
+                                                       // starts (GPT2PretokenBoundaryKernel),
+                                                       // byte-domain, aligned to normalizedBasis
     } else {
         PreTokenizerResult ptResult = buildPreTokenizerBoundaries(
             P, normalizedBasis, U21codepoints,
             PreTokenizer, SplitBehavior, DelimiterString);
+        // Finalize like the non-BPE path (wordBreakerPipeline): the raw
+        // ptResult.U21codepoints is an intermediate — applyTokenSeparatorInsertion
+        // spreads/filters it into the usable stream. Feeding the raw stream to
+        // U21_to_UTF8 produced an empty basis (0 BPE tokens).
+        StreamSet * finalU21 = applyTokenSeparatorInsertion(P, ptResult);
         bpeBasis = P.CreateStreamSet(8, 1);
-        U21_to_UTF8(P, ptResult.U21codepoints, bpeBasis);
+        U21_to_UTF8(P, finalU21, bpeBasis);
     }
 
     // Stage 3: bucket-fold pipeline — single-byte vocab kernel + per
     // (b0, b1) trie kernels, all OR-merged into a single (matchEnd, vocabID)
     // pair via BPETriePairMergeKernel.
-    BPEPassResult tr = buildBPEPassPipeline(P, bpeBasis, bpe);
+    BPEPassResult tr = buildBPEPassPipeline(P, bpeBasis, bpe, bpeBoundary);
     StreamSet * matchEnd = tr.matchEnd;
     StreamSet * vocabID  = tr.vocabID;
 
@@ -340,12 +401,79 @@ int main(int argc, char *argv[]) {
             llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
             return 1;
         }
+
+        // Load the whole file ONCE into memory (before any timing). mmap gives a
+        // page-aligned pointer, which satisfies MemorySourceKernel's alignment
+        // requirement and is zero-copy. Every pipeline call reads these resident
+        // bytes with no fd access — so --bench-loop times pure tokenization, and
+        // file I/O is excluded from the timed region exactly as HuggingFace does.
+        struct stat st;
+        const size_t nbytes = (fstat(fd, &st) == 0) ? (size_t)st.st_size : 0;
+        void * mapping = MAP_FAILED;
+        const char * buf = nullptr;
+        if (nbytes > 0) {
+            mapping = mmap(nullptr, nbytes, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (mapping == MAP_FAILED) {
+                llvm::errs() << "Error: cannot mmap " << inputFile << ".\n";
+                close(fd);
+                return 1;
+            }
+            buf = static_cast<const char *>(mapping);
+        }
+        // Empty-file / degenerate case: MemorySourceKernel asserts the buffer is
+        // 64-byte aligned even when length == 0, so hand it an aligned dummy.
+        alignas(64) static const char emptyBuf[64] = {0};
+        if (buf == nullptr) buf = emptyBuf;
+
+        // --bench-loop=N: run the (already built + JIT-compiled) pipeline N times
+        // in this one process over the resident buffer. Pipeline build AND file
+        // I/O are both excluded, so we measure pure tokenization throughput — the
+        // fair counterpart to HuggingFace's in-process criterion loop. Token
+        // emission is suppressed via gBenchQuiet.
+        if (BenchLoop > 0) {
+            gBenchQuiet = true;
+            const unsigned N = BenchLoop;
+
+            // One discarded warm-up run (first pass pays page-fault / cache-fill cost).
+            bpeFn(buf, nbytes);
+
+            std::vector<double> ms;   // per-iteration wall time, milliseconds
+            ms.reserve(N);
+            for (unsigned i = 0; i < N; ++i) {
+                auto t0 = std::chrono::steady_clock::now();
+                bpeFn(buf, nbytes);
+                auto t1 = std::chrono::steady_clock::now();
+                ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+            if (mapping != MAP_FAILED) munmap(mapping, nbytes);
+            close(fd);
+
+            std::sort(ms.begin(), ms.end());
+            const double minv    = ms.front();
+            const double median  = ms[N / 2];
+            double sum = 0.0; for (double v : ms) sum += v;
+            const double mean    = sum / N;
+            // Throughput on the best (min) run — the steady-state peak, like criterion.
+            const double mbps    = (minv > 0.0) ? (nbytes / (minv / 1e3)) / 1e6 : 0.0;
+
+            std::cerr << "[BENCH] iters=" << N << " bytes=" << nbytes
+                      << " min=" << minv << "ms median=" << median << "ms mean=" << mean
+                      << "ms  peak=" << mbps << " MB/s\n";
+            // Single machine-readable line for bench_bpe.py to parse (grep BENCH_RESULT).
+            std::fprintf(stderr,
+                         "BENCH_RESULT bytes=%zu iters=%u min_ms=%.6f median_ms=%.6f "
+                         "mean_ms=%.6f mbps=%.4f\n",
+                         nbytes, N, minv, median, mean, mbps);
+            return 0;
+        }
+
         auto __tRun0 = std::chrono::steady_clock::now();
-        bpeFn(fd);
+        bpeFn(buf, nbytes);
         auto __tRun1 = std::chrono::steady_clock::now();
         std::cerr << "[BPE] run (execute pipeline): "
                   << std::chrono::duration<double, std::milli>(__tRun1 - __tRun0).count()
                   << " ms\n";
+        if (mapping != MAP_FAILED) munmap(mapping, nbytes);
         close(fd);
         return 0;
     }

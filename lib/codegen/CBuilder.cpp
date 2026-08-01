@@ -1164,7 +1164,8 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
         params[4] = int8PtrTy;
 
         FunctionType * const rfTy = FunctionType::get(voidTy, params, false);
-        Function * const reportFn = mDriver->addLinkFunction(m, "__report_failure_v", rfTy,
+
+        Function * const reportFn = mDriver->addLinkFunction(nullptr, "__report_failure_v", rfTy,
                                                              reinterpret_cast<void *>(&__report_failure_v));
         reportFn->setCallingConv(CallingConv::C);
 
@@ -1414,7 +1415,7 @@ Value * CBuilder::CreateReadCycleCounter() {
 
 Function * CBuilder::LinkFunction(StringRef name, FunctionType * type, void * functionPtr) const {
     assert (mDriver);
-    return mDriver->addLinkFunction(getModule(), name, type, functionPtr);
+    return mDriver->addLinkFunction(nullptr, name, type, functionPtr);
 }
 
 LoadInst * CBuilder::CreateLoad(Type * type, Value * Ptr, const char * Name) {
@@ -2309,10 +2310,8 @@ uintptr_t LLVM_READNONE CBuilder::getAlignOf(const llvm::DataLayout & DL, llvm::
     }
 }
 
-void CBuilder::linkAllNecessaryExternalFunctions() const {
+void CBuilder::LinkAllNecessaryExternalFunctions() const {
 
-    assert (mDriver);
-    assert (mModule);
     // void* aligned_alloc( std::size_t alignment, std::size_t size );
 
     IntegerType * const sizeTy = getSizeTy();
@@ -2321,7 +2320,7 @@ void CBuilder::linkAllNecessaryExternalFunctions() const {
     params[0] = sizeTy;
     params[1] = sizeTy;
     FunctionType * fty = FunctionType::get(getVoidPtrTy(), params, false);
-    mDriver->addLinkFunction(mModule, ALIGNED_ALLOC_NAME, fty, (void*)std::aligned_alloc);
+    mDriver->addLinkFunction(nullptr, ALIGNED_ALLOC_NAME, fty, (void*)std::aligned_alloc);
 
 }
 
@@ -2419,7 +2418,54 @@ Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
     }
 }
 
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertConstantToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Constant * CBuilder::convertConstantToLLVMContext(LLVMContext & C, Constant * constant) {
 
+    std::function<Constant *(const Constant *)> convertConstant = [&](const Constant * constant) -> Constant * {
+        Type * newType = convertTypeToLLVMContext(C, constant->getType());
+        if (isa<ConstantInt>(constant)) {
+            return ConstantInt::get(newType, cast<ConstantInt>(constant)->getValue());
+        }
+        if (isa<ConstantAggregateZero>(constant)) {
+            return ConstantAggregateZero::get(newType);
+        }
+        if (isa<ConstantPointerNull>(constant)) {
+            assert (isa<PointerType>(newType));
+            return ConstantPointerNull::get(reinterpret_cast<PointerType *>(newType));
+        }
+        if (isa<ConstantAggregate>(constant)) {
+            const ConstantAggregate * const cv = cast<ConstantAggregate>(constant);
+            const auto numElements = cv->getNumOperands();
+            SmallVector<Constant *, 16> ops(numElements);
+            for (unsigned i = 0; i < numElements; ++i) {
+                ops[i] = convertConstant(cv->getOperand(i));
+            }
+            if (isa<ConstantArray>(constant)) {
+                return ConstantArray::get(cast<ArrayType>(newType), ops);
+            }
+            if (isa<ConstantStruct>(constant)) {
+                return ConstantStruct::get(cast<StructType>(newType), ops);
+            }
+            if (isa<ConstantVector>(constant)) {
+                return ConstantVector::get(ops);
+            }
+        }
+        if (isa<UndefValue>(constant)) {
+            return UndefValue::get(newType);
+        }
+        if (isa<ConstantFP>(constant)) {
+            return ConstantFP::get(newType, cast<ConstantFP>(constant)->getValue());
+        }
+        llvm_unreachable("Unhandled Constant type?");
+    };
+
+    if (&constant->getContext() == &C) {
+        return constant;
+    }
+    return convertConstant(constant);
+}
 
 #ifndef NDEBUG
 /** ------------------------------------------------------------------------------------------------------------- *

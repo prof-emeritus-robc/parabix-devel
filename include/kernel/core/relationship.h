@@ -236,9 +236,8 @@ public:
     static bool classof(const void *) {
         return false;
     }
-    llvm::Constant * value() const {
-        return mConstant;
-    }
+    llvm::Constant * value(llvm::LLVMContext & C) const;
+
     ScalarConstant(not_null<llvm::Constant *> constant) noexcept;
 private:
     llvm::Constant * const mConstant;

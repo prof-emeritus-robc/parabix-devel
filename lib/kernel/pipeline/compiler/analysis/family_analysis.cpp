@@ -102,7 +102,7 @@ void PipelineAnalysis::scanFamilyKernelBindings(KernelBuilder & b) {
 found_kernel_in_graph:
                 if (ref.isFamilyCall()) {
 
-                    obj->ensureLoaded(b);
+                   // obj->ensureLoaded(b);
 
                     unsigned flags = FamilyScalarData::CaptureStoreInKernelState;
                     if (LLVM_LIKELY(obj->isStateful())) {

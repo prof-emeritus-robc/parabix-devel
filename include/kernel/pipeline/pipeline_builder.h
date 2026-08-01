@@ -213,14 +213,20 @@ public:
         return mDriver.getStreamSetTy(NumElements, FieldWidth);
     }
 
+    template <typename ExternalFunctionType>
+    void LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) const {
+        mDriver.LinkFunction<ExternalFunctionType>(kernel.get(), name, functionPtr);
+    }
+
+
 protected:
 
     PipelineBuilder(BaseDriver & driver, PipelineKernel * const kernel);
 
     Kernel * initializeKernel(Kernel * const kernel, const unsigned flags);
 
-    llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const {
-        return mDriver.addLinkFunction(mod, name, type, functionPtr);
+    llvm::Function * addLinkFunction(Kernel * kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) {
+        return mDriver.addLinkFunction(kernel, name, type, functionPtr);
     }
 
     bool hasExternalFunction(const llvm::StringRef functionName) const {

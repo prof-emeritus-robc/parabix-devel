@@ -168,5 +168,5 @@ protected:
 
     virtual bool hasExternalFunction(const llvm::StringRef functionName) const = 0;
 
-    virtual llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const = 0;
+    virtual llvm::Function * addLinkFunction(kernel::Kernel * const kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) = 0;
 };

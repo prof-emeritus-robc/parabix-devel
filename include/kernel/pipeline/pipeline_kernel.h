@@ -191,8 +191,6 @@ private:
 
     void recursivelyListFamilyKernels(llvm::raw_ostream & familyName) const final;
 
-    void linkExternalMethods(KernelBuilder & b) final;
-
     void generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides) final;
 
     void generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides) final;
@@ -223,7 +221,7 @@ protected:
         return mInternallyGeneratedStreamSets;
     }
 
-    void writeInternallyGeneratedStreamSetScaleVector(const Relationships & R, MetadataScaleVector & V, const size_t scale) const final;
+    void writeInternallyGeneratedStreamSetScaleVector(KernelBuilder & b, const Relationships & R, MetadataScaleVector & V, const size_t scale) const final;
 
     ParamMap::PairEntry createRepeatingStreamSet(KernelBuilder & b, const RepeatingStreamSet * streamSet, const size_t maxStrideLength) const;
 
@@ -244,6 +242,9 @@ private:
 
     }
 
+public:
+
+     void linkExternalMethods(KernelBuilder & b) final;
 
 protected:
 

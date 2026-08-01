@@ -302,7 +302,7 @@ void editdPipeline(ProgramBuilder & P, const std::vector<std::string> & patterns
     StreamSet * const MatchResults = P.CreateStreamSet(editDistance + 1);
     P.CreateKernelFamilyCall<PatternKernel>(patterns, ChStream, MatchResults);
     Kernel * const scan = P.CreateKernelCall<editdScanKernel>(MatchResults);
-    scan->link("wrapped_report_pos", wrapped_report_pos);
+    P.LinkFunction(scan, "wrapped_report_pos", wrapped_report_pos);
 }
 
 editdFunctionType editdPipeline(CPUDriver & driver, const std::vector<std::string> & patterns) {
@@ -371,7 +371,7 @@ void multiEditdPipeline(ProgramBuilder & P) {
         #endif
     }
     Kernel * const scan = P.CreateKernelCall<editdScanKernel>(finalResults);
-    scan->link("wrapped_report_pos", wrapped_report_pos);
+    P.LinkFunction(scan, "wrapped_report_pos", wrapped_report_pos);
 }
 
 multiEditdFunctionType multiEditdPipeline(CPUDriver & driver) {
@@ -387,7 +387,7 @@ void editdIndexPatternPipeline(ProgramBuilder & P, unsigned patternLen, StreamSe
     StreamSet * const MatchResults = P.CreateStreamSet(editDistance + 1);
     P.CreateKernelCall<editdCPUKernel>(editDistance, patternLen, groupSize, pattStream, ChStream, MatchResults);
     Kernel * const scan = P.CreateKernelCall<editdScanKernel>(MatchResults);
-    scan->link("wrapped_report_pos", wrapped_report_pos);
+    P.LinkFunction(scan, "wrapped_report_pos", wrapped_report_pos);
 }
 
 

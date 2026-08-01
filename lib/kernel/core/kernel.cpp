@@ -222,15 +222,19 @@ void Kernel::makeModule(KernelBuilder & b) {
     Module * const prior = b.getModule();
     m->setTargetTriple(prior->getTargetTriple());
     m->setDataLayout(prior->getDataLayout());
-    mModule = m;
+    setModule(m);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::generateKernel(KernelBuilder & b) {
-    assert (mCompilationStatus <= CompilationStatus::StateConstructed);
+    assert (mCompilationStatus <= CompilationStatus::StateConstructed || mCompilationStatus == CompilationStatus::UnownedModule);
     assert (b.getModule());
+    setModule(b.getModule());
+    if (mCompilationStatus == CompilationStatus::UnownedModule) {
+        return;
+    }
     instantiateKernelCompiler(b)->generateKernel(b);
     mCompilationStatus = CompilationStatus::LoadedOrCompiled;
 }
@@ -275,6 +279,7 @@ void Kernel::ensureLoaded(KernelBuilder & b) {
 void Kernel::loadCachedKernel(KernelBuilder & b) {
     assert (mCompilationStatus < CompilationStatus::StateConstructed || mCompilationStatus == CompilationStatus::UnownedModule);
     Module * m = b.getModule(); assert (m);
+    setModule(m);
     assert (m->getOrInsertNamedMetadata(getName() + STATE_TYPE_METADATA_SUFFIX)->getNumOperands() == 1);
     SmallVector<char, 256> tmp;
     StructType * sharedTy = nullIfEmpty(getTypeByName(m, concat(getName(), SHARED_SUFFIX, tmp)));
@@ -291,10 +296,6 @@ void Kernel::loadCachedKernel(KernelBuilder & b) {
 void Kernel::linkExternalMethods(KernelBuilder & b) {
     auto & driver = b.getDriver();
     Module * const m = b.getModule(); assert (m);
-    b.linkAllNecessaryExternalFunctions();
-    for (const LinkedFunction & linked : mLinkedFunctions) {
-        driver.addLinkFunction(m, linked.Name, linked.Type, linked.FunctionPtr);
-    }
     if (LLVM_UNLIKELY(getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject)) {
         PointerType * voidPtrTy = PointerType::getUnqual(b.getContext());
         IntegerType * int8Ty = b.getInt8Ty();
@@ -317,7 +318,7 @@ void Kernel::linkExternalMethods(KernelBuilder & b) {
         params[10] = int8Ty; // replacement 1
         params[11] = PointerType::getUnqual(b.getContext()); // loopId array
         FunctionType * regFunc = FunctionType::get(voidTy, params, false);
-        driver.addLinkFunction(m, KERNEL_REGISTER_ILLUSTRATOR_CALLBACK, regFunc, (void*)&illustratorRegisterCapturedData);
+        driver.addLinkFunction(this, KERNEL_REGISTER_ILLUSTRATOR_CALLBACK, regFunc, (void*)&illustratorRegisterCapturedData);
         END_SCOPED_REGION
 
         BEGIN_SCOPED_REGION
@@ -332,7 +333,7 @@ void Kernel::linkExternalMethods(KernelBuilder & b) {
         params[7] = sizeTy;
         params[8] = sizeTy;
         FunctionType * func = FunctionType::get(voidTy, params, false);
-        driver.addLinkFunction(m, KERNEL_ILLUSTRATOR_CAPTURE_CALLBACK, func, (void*)&illustratorCaptureStreamData);
+        driver.addLinkFunction(this, KERNEL_ILLUSTRATOR_CAPTURE_CALLBACK, func, (void*)&illustratorCaptureStreamData);
         END_SCOPED_REGION
     }
 }
@@ -474,6 +475,7 @@ Kernel::StateTypes Kernel::constructStateTypes(KernelBuilder & b) const {
                         const auto padding = (offset == 0ULL) ? 0ULL : (align - offset);
                         byteOffset += padding + CBuilder::getTypeSize(dl, type);
                         Type * const paddingTy = ArrayType::get(int8Ty, padding);
+                        assert (&paddingTy->getContext() == &b.getContext());
                         assert (k < fields.size());
                         fields[k++] = paddingTy;
                         assert (k < fields.size());
@@ -489,6 +491,7 @@ Kernel::StateTypes Kernel::constructStateTypes(KernelBuilder & b) const {
                 if (st == nullptr) {
                     st = StructType::create(C, fields, name, true);
                 } else {
+                    assert (&st->getContext() == &b.getContext());
                     assert (st->isOpaque());
                     st->setBody(fields);
                     assert (!st->isOpaque() && st->isPacked());
@@ -575,8 +578,9 @@ void Kernel::generateOrLoadKernel(KernelBuilder & b) {
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::addKernelDeclarations(KernelBuilder & b, const bool /* addStubFunctionBody */) {
     if (mCompilationStatus == CompilationStatus::UnownedModule) {
-        ensureLoaded(b);
+        return;
     }
+    constructStateTypes(b);
     const auto addStubFunctionBody = false;
     addInitializeDeclaration(b, addStubFunctionBody);
     if (LLVM_UNLIKELY(mInputStreamSets.empty())) {
@@ -588,14 +592,15 @@ void Kernel::addKernelDeclarations(KernelBuilder & b, const bool /* addStubFunct
     addDoSegmentDeclaration(b, addStubFunctionBody);
     addFinalizeThreadLocalDeclaration(b, addStubFunctionBody);
     addFinalizeDeclaration(b, addStubFunctionBody);
-    linkExternalMethods(b);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addSymbols
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::addSymbols(orc::MangleAndInterner & mangler, orc::SymbolFlagsMap & symbols, orc::SymbolLookupSet & lookupSet) const {
-//    assert (mCompilationStatus >= CompilationStatus::StateConstructed);
+    if (mCompilationStatus == CompilationStatus::UnownedModule) {
+        return;
+    }
     SmallVector<char, 256> tmp;
     auto addSym = [&](StringRef suffix) {
         auto sym = mangler(concat(getName(), suffix, tmp));
@@ -658,7 +663,8 @@ Function * Kernel::addInitializeDeclaration(KernelBuilder & b, const bool addStu
         }
         addAdditionalInitializationArgTypes(b, params);
         FunctionType * const initType = FunctionType::get(b.getSizeTy(), params, false);
-        initFunc = Function::Create(initType, GlobalValue::ExternalLinkage, funcName, m);
+        const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+        initFunc = Function::Create(initType, linkage, funcName, m);
         initFunc->setCallingConv(CallingConv::C);
         initFunc->setVisibility(GlobalValue::DefaultVisibility);
         initFunc->setDoesNotRecurse();
@@ -724,7 +730,8 @@ Function * Kernel::addExpectedOutputSizeDeclaration(KernelBuilder & b, const boo
             params.push_back(PointerType::getUnqual(b.getContext()));
         }
         FunctionType * const funcType = FunctionType::get(b.getSizeTy(), params, false);
-        func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
+        const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+        func = Function::Create(funcType, linkage, funcName, m);
         func->setCallingConv(CallingConv::C);
         func->setVisibility(GlobalValue::DefaultVisibility);
         func->setDoesNotRecurse();
@@ -793,7 +800,8 @@ Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b, const 
             params.push_back(ptrTy);
         }
         FunctionType * const funcType = FunctionType::get(ptrTy, params, false);
-        func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
+        const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+        func = Function::Create(funcType, linkage, funcName, m);
         func->setCallingConv(CallingConv::C);
         func->setVisibility(GlobalValue::DefaultVisibility);
         func->setDoesNotRecurse();
@@ -867,7 +875,8 @@ Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder 
                 params.push_back(voidPtrTy);
             }
             FunctionType * const funcType = FunctionType::get(b.getVoidTy(), params, false);
-            func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
+            const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+            func = Function::Create(funcType, linkage, funcName, m);
             func->setCallingConv(CallingConv::C);
             func->setVisibility(GlobalValue::DefaultVisibility);
             func->setDoesNotRecurse();
@@ -956,7 +965,8 @@ Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBui
             }
 
             FunctionType * const funcType = FunctionType::get(b.getVoidTy(), params, false);
-            func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
+            const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+            func = Function::Create(funcType, linkage, funcName, m);
             func->setCallingConv(CallingConv::C);
             func->setVisibility(GlobalValue::DefaultVisibility);
             func->setDoesNotRecurse();
@@ -1141,7 +1151,8 @@ Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b, const bool addStub
 
         Type * const retTy = (internallySynchronized || canSetTerminateSignal()) ? b.getSizeTy() : b.getVoidTy();
         FunctionType * const doSegmentType = FunctionType::get(retTy, getDoSegmentFields(b), false);
-        doSegment = Function::Create(doSegmentType, GlobalValue::ExternalLinkage, funcName, m);
+        const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+        doSegment = Function::Create(doSegmentType, linkage, funcName, m);
         doSegment->setCallingConv(CallingConv::C);
         doSegment->setVisibility(GlobalValue::DefaultVisibility);
         doSegment->setDoesNotRecurse();
@@ -1297,7 +1308,8 @@ Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b, const bo
             params.push_back(ptrTy); // current thread local
         }
         FunctionType * const funcType = FunctionType::get(b.getVoidTy(), params, false);
-        func = Function::Create(funcType, GlobalValue::ExternalLinkage, funcName, m);
+        const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+        func = Function::Create(funcType, linkage, funcName, m);
         func->setCallingConv(CallingConv::C);
         func->setVisibility(GlobalValue::DefaultVisibility);
         func->setDoesNotRecurse();
@@ -1380,7 +1392,8 @@ Function * Kernel::addFinalizeDeclaration(KernelBuilder & b, const bool addStubF
             params.push_back(PointerType::getUnqual(b.getContext()));
         }
         FunctionType * const terminateType = FunctionType::get(resultType, params, false);
-        terminateFunc = Function::Create(terminateType, GlobalValue::ExternalLinkage, funcName, m);
+        const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
+        terminateFunc = Function::Create(terminateType, linkage, funcName, m);
         terminateFunc->setCallingConv(CallingConv::C);
         terminateFunc->setVisibility(GlobalValue::DefaultVisibility);
         terminateFunc->setDoesNotRecurse();
@@ -1895,6 +1908,32 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
     }
     #endif
 }
+
+const static auto CACHEABLE = "cacheable";
+
+const static auto SIGNATURE = "signature";
+
+const llvm::MDString * Kernel::readSignatureFromModule(const llvm::Module * const M) {
+    NamedMDNode * const sig = M->getNamedMetadata(SIGNATURE);
+    if (sig) {
+        assert ("empty metadata node" && sig->getNumOperands() > 0);
+        assert ("metadata should contain precisely one node" && sig->getNumOperands() == 1);
+        assert ("no signature payload" && sig->getOperand(0)->getNumOperands() == 1);
+        return cast<MDString>(sig->getOperand(0)->getOperand(0));
+    }
+    return nullptr;
+}
+
+void Kernel::writeSignatureToModule(const Kernel * const kernel, llvm::Module * const M) {
+    if (LLVM_UNLIKELY(kernel->hasSignature())) {
+        NamedMDNode * const md = M->getOrInsertNamedMetadata(SIGNATURE);
+        assert (md->getNumOperands() == 0);
+        const auto signature = kernel->getSignature();
+        MDString * const sig = MDString::get(M->getContext(), kernel->getSignature());
+        md->addOperand(MDNode::get(M->getContext(), {sig}));
+    }
+}
+
 
 Kernel::Kernel(LLVMTypeSystemInterface & ts,
                const TypeId typeId,

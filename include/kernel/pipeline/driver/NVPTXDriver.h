@@ -22,8 +22,6 @@ public:
 
     bool hasExternalFunction(const llvm::StringRef /* functionName */) const override { return false; }
 
-    llvm::orc::SymbolStringPtr declareFunctionSymbol(llvm::Function * function) const final { return llvm::orc::SymbolStringPtr{}; }
-
     void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) final {}
 
 protected:
@@ -32,7 +30,7 @@ protected:
 
 protected:
 
-    llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const override;
+    llvm::Function * addLinkFunction(kernel::Kernel * const kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) override;
 
 };
 

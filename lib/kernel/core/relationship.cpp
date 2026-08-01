@@ -34,6 +34,10 @@ unsigned Scalar::getFieldWidth() const {
     return mType->getIntegerBitWidth();
 }
 
+llvm::Constant * ScalarConstant::value(llvm::LLVMContext & C) const {
+    return CBuilder::convertConstantToLLVMContext(C, mConstant);
+}
+
 StreamSet::StreamSet(LLVMContext & C, const ClassTypeId typeId, const unsigned NumElements, const unsigned FieldWidth) noexcept
 : Relationship(typeId, getStreamSetTy(C, NumElements, FieldWidth)) {
 
@@ -49,16 +53,17 @@ Scalar::Scalar(not_null<Type *> type) noexcept
 
 }
 
+CommandLineScalar::CommandLineScalar(const CommandLineScalarType clType, llvm::Type * type) noexcept
+: Scalar(Relationship::ClassTypeId::CommandLineScalar, type)
+, mCLType(clType) {
+
+}
+
 ScalarConstant::ScalarConstant(not_null<Constant *> constant) noexcept
 : Scalar(Relationship::ClassTypeId::ScalarConstant, constant->getType())
 , mConstant(constant.get()) {
 
 }
 
-CommandLineScalar::CommandLineScalar(const CommandLineScalarType clType, llvm::Type * type) noexcept
-: Scalar(Relationship::ClassTypeId::CommandLineScalar, type)
-, mCLType(clType) {
-
-}
 
 }

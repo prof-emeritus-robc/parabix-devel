@@ -128,7 +128,7 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
 
                 std::unique_ptr<Module> M(std::move(loadedFile.get()));
                 if (LLVM_UNLIKELY(kernel->hasSignature())) {
-                    const MDString * const sig = getSignature(M.get());
+                    const MDString * const sig = kernel::Kernel::readSignatureFromModule(M.get());
                     assert ("signature is missing from kernel file: possible module naming conflict or change in the LLVM metadata storage policy?" && sig);
                     if (LLVM_UNLIKELY(isNonMatchingSignature(sig, signature))) {
                         if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
@@ -188,6 +188,20 @@ invalid:
 
     mKnownSignatures.emplace(signature, kernel->getModule());
     return CacheObjectResult::UNCACHED;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief markModuleAsCacheable
+ ** ------------------------------------------------------------------------------------------------------------- */
+void ParabixObjectCache::markModuleAsCacheable(kernel::Kernel * const kernel, Module * module) {
+//    module->getOrInsertNamedMetadata(CACHEABLE);
+//    if (LLVM_UNLIKELY(kernel->hasSignature())) {
+//        NamedMDNode * const md = module->getOrInsertNamedMetadata(SIGNATURE);
+//        assert (md->getNumOperands() == 0);
+//        MDString * const sig = MDString::get(module->getContext(), signature);
+//        assert (!isNonMatchingSignature(sig, signature));
+//        md->addOperand(MDNode::get(module->getContext(), {sig}));
+//    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -275,13 +289,10 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
  * @brief getObject
  ** ------------------------------------------------------------------------------------------------------------- */
 std::unique_ptr<MemoryBuffer> ParabixObjectCache::getObject(const Module * module) {
-    errs() << "peeking " << module->getModuleIdentifier() << "\n";
     auto f = mCachedObject.find(module->getModuleIdentifier());
     if (f != mCachedObject.end()) {
-        errs() << "getObject " << module->getModuleIdentifier() << "\n";
-        // Return a copy clone buffer wrapper block to the compiler engine subsystem
         auto ref = f->second;
-        return MemoryBuffer::getMemBufferCopy(ref.getBuffer(), ref.getBufferIdentifier());
+        return MemoryBuffer::getMemBuffer(ref.getBuffer(), ref.getBufferIdentifier(), false);
     }
     return nullptr;
 }

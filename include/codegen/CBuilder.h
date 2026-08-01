@@ -453,6 +453,8 @@ public:
 
     static llvm::Type * convertTypeToLLVMContext(llvm::LLVMContext & C, llvm::Type * type);
 
+    static llvm::Constant * convertConstantToLLVMContext(llvm::LLVMContext & C, llvm::Constant * constant);
+
     // LLVM 18 removed all qualified pointer types but if we want to support earlier LLVM versions, we must still still allow kernels to
     // construct them.
     #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
@@ -466,6 +468,10 @@ public:
 
     #undef ADD_POINTER_TYPE
     #endif
+
+public:
+
+    void LinkAllNecessaryExternalFunctions() const;
 
 protected:
 
@@ -494,8 +500,6 @@ protected:
     virtual std::string getKernelName() const;
 
     void __CreateAssert(llvm::Value * assertion, const llvm::Twine failureMessage, std::initializer_list<llvm::Value *> args);
-
-    virtual void linkAllNecessaryExternalFunctions() const;
 
 protected:
 

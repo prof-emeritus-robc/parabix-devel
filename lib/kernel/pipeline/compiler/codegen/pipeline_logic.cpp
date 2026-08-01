@@ -14,7 +14,6 @@ void PipelineCompiler::bindAdditionalInitializationArguments(KernelBuilder & b, 
  * @brief generateImplicitKernels
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::generateImplicitKernels(KernelBuilder & b) {
-    assert (b.getModule() == mTarget->getModule());
     for (auto i = FirstKernel; i <= LastKernel; ++i) {
         const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b);
     }
@@ -334,7 +333,7 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
                 assert (expected++ == mScalarGraph[e].Number);
                 const auto scalar = source(e, mScalarGraph);
                 Value * const scalarVal = getScalar(b, scalar);
-
+                assert (&scalarVal->getContext() == &b.getContext());
                 args.push_back(scalarVal);
             }
             addFamilyCallInitializationArguments(b, i, args);

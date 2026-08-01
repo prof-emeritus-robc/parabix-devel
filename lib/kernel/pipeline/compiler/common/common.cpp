@@ -283,11 +283,10 @@ bool PipelineCommonGraphFunctions::isKernelStateFree(KernelBuilder & b, const si
         return false;
     } else if (kernelObj->isStateful()) { // check if we have only a (non-mutable) input scalar
         StructType * const st = kernelObj->getSharedStateType(b); assert (st);
+        // If this state object only contains input scalars then it has no run-time mutable state
         const auto n = st->getStructNumElements();
-        assert ((n % 2) == 0 && n >= 4);
-//        assert ((kernelObj->getNumOfScalarInputs() > 0) ^ st->getStructElementType(0)->isEmptyTy());
-//        assert ((kernelObj->getNumOfScalarOutputs() > 0) ^ st->getStructElementType(n - 2)->isEmptyTy());
-        return (n == 4) && st->getStructElementType(2)->isEmptyTy();
+        assert ((n % 2) == 0);
+        return (n == 2) && st->getStructElementType(1)->isEmptyTy();
     } else {
         return true;
     }

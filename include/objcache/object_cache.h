@@ -17,7 +17,6 @@
 
 namespace llvm { 
     class Module;  class MemoryBuffer;  class LLVMContext;
-    namespace orc {class TMOwningSimpleCompiler;}
 }
 
 // The ParabixObjectCache is a two-level cache compatible with the requirements
@@ -49,16 +48,16 @@ class ParabixObjectCache final : public llvm::ObjectCache {
 public:
 
     friend class BaseDriver;
-    friend class llvm::orc::TMOwningSimpleCompiler;
 
     using Path = llvm::SmallString<128>;
 
     CacheObjectResult loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * const kernel) noexcept;
 
-    // Overridden methods used internally by orc::TMOwningSimpleCompiler during JIT pipeline passes
     void notifyObjectCompiled(const llvm::Module * M, llvm::MemoryBufferRef Obj) override;
 
     std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module * M) override;
+
+    static void markModuleAsCacheable(kernel::Kernel * const kernel, llvm::Module * module);
 
     virtual ~ParabixObjectCache();
 

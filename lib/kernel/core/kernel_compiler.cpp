@@ -142,12 +142,9 @@ void KernelCompiler::generateKernel(KernelBuilder & b) {
     // reuse the same KernelBuilder to do so; this could result in unexpected behaviour if the this function
     // exits without restoring the original compiler state.
     assert (mTarget->getCompilationStatus() < Kernel::CompilationStatus::StateConstructed);
-    assert (mTarget->getModule() == b.getModule());
     auto const oc = b.getCompiler();
     b.setCompiler(this);
-
     constructStreamSetBuffers(b);
-    assert (&mTarget->getModule()->getContext() == &b.getContext());
     #ifndef NDEBUG
     for (const auto & buffer : mStreamSetInputBuffers) {
         assert ("input buffer not set by constructStreamSetBuffers" && buffer.get());
@@ -165,8 +162,6 @@ void KernelCompiler::generateKernel(KernelBuilder & b) {
     mTarget->setKernelFlags(flags);
     mTarget->setCompilationStatus(Kernel::CompilationStatus::StateConstructed);
     mTarget->addKernelDeclarations(b, false);
-    b.linkAllNecessaryExternalFunctions();
-    StreamSetBuffer::linkFunctions(b);
     callGenerateInitializeMethod(b);
     if (LLVM_UNLIKELY(mStreamSetInputBuffers.empty())) {
         callGenerateExpectedOutputSizeMethod(b);
@@ -797,8 +792,6 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
     // WARNING: any change to this must be reflected in Kernel::addDoSegmentDeclaration,
     // Kernel::getDoSegmentFields, KernelCompiler::getDoSegmentProperties,
     // PipelineCompiler::buildKernelCallArgumentList and PipelineKernel::addOrDeclareMainFunction
-
-    assert (&mTarget->getModule()->getContext() == &b.getContext());
 
     auto arg = args.begin();
     auto nextArg = [&]() {

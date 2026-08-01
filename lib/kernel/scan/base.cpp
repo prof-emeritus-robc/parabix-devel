@@ -177,11 +177,14 @@ void MultiStrideKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
     b.CreateBr(multiStrideLoop);
 
     b.SetInsertPoint(multiStrideLoop);
+    assert (&sizeTy->getContext() == &b.getContext());
     PHINode * const priorBlocksDone = b.CreatePHI(sizeTy, 2);
     priorBlocksDone->addIncoming(ZERO, loopPredecessor);
     std::vector<PHINode *> loopVarPhi(loopVariableCount);
     for (unsigned i = 0; i < loopVariableCount; i++) {
+        mLoopVars[i].Ty = b.convertTypeToLLVMContext(b.getContext(), mLoopVars[i].Ty);
         loopVarPhi[i] = b.CreatePHI(mLoopVars[i].Ty, 2, mLoopVars[i].Name);
+        assert (&mLoopVarInitialValues[i]->getContext() == &b.getContext());
         loopVarPhi[i]->addIncoming(mLoopVarInitialValues[i], loopPredecessor);
     }
 
@@ -255,6 +258,7 @@ void TwoLevelScanKernel::strideLogic(KernelBuilder & b,
     outerItemsProcessed->addIncoming(priorProcessed, loopPredecessor);
     std::vector<PHINode *> outerLoopPhi(loopVariableCount);
     for (unsigned i = 0; i < loopVariableCount; i++) {
+        mLoopVars[i].Ty = b.convertTypeToLLVMContext(b.getContext(), mLoopVars[i].Ty);
         outerLoopPhi[i] = b.CreatePHI(mLoopVars[i].Ty, 2);
         outerLoopPhi[i]->addIncoming(loopVarPhi[i], loopPredecessor);
     }

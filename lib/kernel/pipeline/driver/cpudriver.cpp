@@ -51,13 +51,18 @@ using namespace kernel;
 
 using AttrId = kernel::Attribute::KindId;
 
+class KernelGenerationContainer {
+
+private:
+    ThreadSafeContext Context;
+};
 
 // Modified version of llvm ConcurrentIRCompiler
-class InternalCompiler : public orc::IRCompileLayer::IRCompiler {
+class CPUDriverIRCompiler : public orc::IRCompileLayer::IRCompiler {
 
 public:
 
-    InternalCompiler(CPUDriver & driver, JITTargetMachineBuilder JTMB, const StringMap<bool> && features, ObjectCache *ObjCache)
+    CPUDriverIRCompiler(CPUDriver & driver, JITTargetMachineBuilder JTMB, const StringMap<bool> && features, ObjectCache *ObjCache)
     : orc::IRCompileLayer::IRCompiler(irManglingOptionsFromTargetOptions(JTMB.getOptions()))
     , Driver(driver), ObjCache(ObjCache), JTMB(std::move(JTMB)), CPUFeatures(std::move(features)) {
 
@@ -65,18 +70,24 @@ public:
 
     void registerKernel(Kernel * const kernel) {
         Module * const m = kernel->getModule(); assert (m);
-        InternalMapping.insert(std::make_pair(m->getName(), kernel));
+        InternalMapping.insert(std::make_pair(m, kernel));
     };
 
     // override the actual orc compiler routine to
     Expected<std::unique_ptr<MemoryBuffer>> operator()(Module & M) override {
         // TODO: use a threadpool with a fixed number of expected threads to avoid reconstructing the builder and compiler objects
-        const auto f = InternalMapping.find(M.getName());
+        const auto f = InternalMapping.find(&M);
+
+
 
         auto optLevel = CodeGenOptLevel::Default;
         if (LLVM_LIKELY(f != InternalMapping.end())) {
 
-            Kernel * const K = f->getValue();
+            Kernel * const K = f->getSecond();
+
+            errs() << " ----- generating " << K->getName() << "\n";
+
+            assert (M.empty());
 
             NamedRegionTimer T(K->getSignature(), K->getName(),
                                "Kernel", "Kernel Generation",
@@ -85,8 +96,13 @@ public:
             std::unique_ptr<KernelBuilder> builder(IDISA::GetIDISA_Builder(M.getContext(), CPUFeatures));
             builder->setDriver(Driver);
             builder->setModule(&M);
+            for (const auto & link : Driver.mLinkedFunctions) {
+                if (link.Target == K || link.Target == nullptr) {
+                    Type * funcType = CBuilder::convertTypeToLLVMContext(M.getContext(), link.FunctionDecl->getFunctionType());
+                    Function::Create(cast<FunctionType>(funcType), Function::ExternalLinkage, link.FunctionDecl->getName(), &M);
+                }
+            }
             K->setModule(&M); // the module may have changed
-
             K->generateKernel(*builder);
             if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
                 optLevel = codegen::BackEndOptLevel;
@@ -109,7 +125,7 @@ private:
     CPUDriver & Driver;
     ObjectCache * const ObjCache;
     JITTargetMachineBuilder JTMB;
-    StringMap<Kernel *> InternalMapping;
+    DenseMap<const Module *, Kernel *> InternalMapping;
     const StringMap<bool> CPUFeatures;
 };
 
@@ -128,6 +144,8 @@ public:
 
     void materialize(std::unique_ptr<MaterializationResponsibility> R) override {
         Module * const M = Target->getModule(); assert (M);
+        // TODO: using a null context may allow us to select from a pool of contexts and builders
+        // but I need to remove Kernel::makeModule, getModule, and setModule first.
         ThreadSafeContext ctx(std::unique_ptr<LLVMContext>{&M->getContext()});
         ThreadSafeModule TSM(std::unique_ptr<Module>{M}, ctx);
         Contexts.emplace_back(ctx);
@@ -223,7 +241,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
     // Safely route the compilation process through your customized Parabix caching system
     Builder.setCompileFunctionCreator([&](llvm::orc::JITTargetMachineBuilder InnerJTMB)
         -> Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
-            return std::make_unique<InternalCompiler>(
+            return std::make_unique<CPUDriverIRCompiler>(
                 *this,
                 std::move(InnerJTMB),
                 std::move(features),
@@ -253,48 +271,48 @@ CPUDriver::CPUDriver(std::string && moduleName)
 
     mSymbolLookupSet = std::make_unique<SymbolLookupSet>();
 
+    mAllLinkedSymbols = std::make_unique<SymbolMap>();
+
     mBuilder.reset(IDISA::GetIDISA_Builder(getContext(), features));
     mBuilder->setModule(mMainModule);
     mBuilder->setDriver(*this);
+
+    StreamSetBuffer::linkFunctions(*mBuilder);
+    mBuilder->LinkAllNecessaryExternalFunctions();
 }
 
-Function * CPUDriver::addLinkFunction(Module * mod, llvm::StringRef name, FunctionType * type, void * functionPtr) const {
-    if (LLVM_UNLIKELY(mod == nullptr)) {
-        report_fatal_error("addLinkFunction(" + name + ") cannot be called until after addKernel");
-    }
-    Function * f = mod->getFunction(name);
+Function * CPUDriver::addLinkFunction(Kernel * kernel, llvm::StringRef name, FunctionType * type, void * functionPtr) {
+    // TODO: this will need a main context lock
+    assert (&mMainModule->getContext() == mContext);
+    assert (&type->getContext() == mContext);
+    Function * f = mMainModule->getFunction(name);
     if (LLVM_UNLIKELY(f == nullptr)) {
-        f = Function::Create(type, Function::ExternalLinkage, name, mod);
-
-        // Define symbol mapping inside the primary ORC library environment
-        auto & MainJD = mEngine->getMainJITDylib();
-
-        auto InternedSymbol = mEngine->mangleAndIntern(name);
-
-        auto SymbolAddress = orc::ExecutorAddr::fromPtr(functionPtr);
-
-        // Attempt to define the absolute symbol directly into MainJD
-        auto Err = MainJD.define(orc::absoluteSymbols({
-            { InternedSymbol, { SymbolAddress, JITSymbolFlags::Exported } }
-        }));
-
-        if (Err) {
-            // Check if the error is due to a duplicate definition
-            bool IsDuplicate = false;
-            handleAllErrors(std::move(Err), [&](const orc::DuplicateDefinition &DD) {
-                // This means the symbol was already registered by a prior kernel pass.
-                // We mark it as a duplicate and safely drop the error.
-                IsDuplicate = true;
-            }, [&](const ErrorInfoBase & EIB) {
-                // If it's a completely different linkage error, throw it up to the runtime
-                report_fatal_error(Twine("Failed to map external helper linkage symbol '") +
-                                   name + "': " + EIB.message());
-            });
-        }
-    } else if (LLVM_UNLIKELY(f->getType() != type->getPointerTo())) {
-        report_fatal_error("Cannot link " + name + ": a function with a different signature already exists with that name in " + mod->getName());
+        f = Function::Create(type, Function::ExternalLinkage, name, mMainModule);
+        MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
+        auto symbol = M(name);
+        auto addr = orc::ExecutorAddr::fromPtr(functionPtr);
+        mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
     }
+    mLinkedFunctions.emplace_back(kernel, f);
     return f;
+}
+
+void CPUDriver::linkAllExternalSymbols() {
+    auto & MainJD = mEngine->getMainJITDylib();
+    auto err = MainJD.define(orc::absoluteSymbols(*mAllLinkedSymbols));
+    if (err) {
+        handleAllErrors(std::move(err),
+            [](const DuplicateDefinition &) {
+                /* ignored */
+            },
+            [](const ErrorInfoBase & err) {
+                SmallVector<char, 100> tmp;
+                raw_svector_ostream msg(tmp);
+                msg << "Cannot link symbol: " << err.message();
+                report_fatal_error(msg.str());
+            });
+    }
+    mAllLinkedSymbols->clear();
 }
 
 void CPUDriver::generateUncachedKernels() {
@@ -310,7 +328,7 @@ void CPUDriver::generateUncachedKernels() {
     const auto numKernels = mUncachedKernel.size();
 
     auto & CL = mEngine->getIRCompileLayer();
-    auto & CC = reinterpret_cast<InternalCompiler &>(CL.getCompiler());
+    auto & CC = reinterpret_cast<CPUDriverIRCompiler &>(CL.getCompiler());
 
     auto & MainJD = mEngine->getMainJITDylib();
 
@@ -322,7 +340,7 @@ void CPUDriver::generateUncachedKernels() {
 
     for (unsigned i = 0; i < numKernels; ++i) {
         CC.registerKernel(mUncachedKernel[i].get());
-   }
+    }
 
     MangleAndInterner Mangler(ES, mEngine->getDataLayout());
 
@@ -337,19 +355,12 @@ void CPUDriver::generateUncachedKernels() {
 
     assert (!mSymbolLookupSet->containsDuplicates());
 
+    linkAllExternalSymbols();
+
     auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
     cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
     removeAll(*mSymbolLookupSet);
 
-}
-
-SymbolStringPtr CPUDriver::declareFunctionSymbol(llvm::Function * function) const {
-    // this may require modulename_functionname ?
-    assert (function);
-    MangleAndInterner MI(mEngine->getExecutionSession(), mEngine->getDataLayout());
-    SymbolStringPtr symbolPtr = MI(function->getName());
-    mSymbolLookupSet->add(symbolPtr, SymbolLookupFlags::RequiredSymbol);
-    return symbolPtr;
 }
 
 void CPUDriver::addCachedObjectFile(llvm::Module * module, std::unique_ptr<MemoryBuffer> &&object) {
@@ -427,6 +438,8 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     // Compilation triggers on-demand here during lookup, bypassing the old explicit finalizeObject() call.
 
     assert (!mSymbolLookupSet->containsDuplicates());
+
+    linkAllExternalSymbols();
 
     auto & ES = mEngine->getExecutionSession();
     auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly); // mSymbolStubs,

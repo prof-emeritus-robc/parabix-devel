@@ -102,7 +102,6 @@ public:
         P.gatherInfo();
 
         if (codegen::InfoOptionIsSet(codegen::PrintPipelineGraph)) {
-            assert (b.getModule() == pipelineKernel->getModule());
             P.printBufferGraph(b, errs());
         }
 

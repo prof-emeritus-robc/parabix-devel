@@ -65,7 +65,7 @@ Value * PipelineCompiler::getScalar(KernelBuilder & b, const size_t index) {
     const Relationship * const rel = rn.Relationship; assert (rel);
 
     if (LLVM_UNLIKELY(in_degree(index, mScalarGraph) == 0)) {
-        value = cast<ScalarConstant>(rel)->value();
+        value = cast<ScalarConstant>(rel)->value(b.getContext());
     } else {
         const auto producer = in_edge(index, mScalarGraph);
         const auto i = source(producer, mScalarGraph);
@@ -73,19 +73,23 @@ Value * PipelineCompiler::getScalar(KernelBuilder & b, const size_t index) {
         if (i == PipelineInput) {
             const Binding & input = mTarget->getInputScalarBinding(rt.Number);
             value = b.getScalarField(input.getName());
+            assert (&value->getContext() == &b.getContext());
         } else { // output scalar of some kernel
             Value * const outputScalars = getScalar(b, i);
+            assert (&outputScalars->getContext() == &b.getContext());
             if (LLVM_UNLIKELY(outputScalars == nullptr)) {
                 report_fatal_error("Internal error: pipeline is unable to locate valid output scalar");
             }
             if (outputScalars->getType()->isAggregateType()) {
                 value = b.CreateExtractValue(outputScalars, {rt.Number});
+                assert (&value->getContext() == &b.getContext());
             } else { assert (rt.Number == 0 && "scalar type is not an aggregate");
                 value = outputScalars;
             }
         }
     }
     assert (value);
+    assert (&value->getContext() == &b.getContext());
     mScalarValue[index] = value;
     return value;
 }

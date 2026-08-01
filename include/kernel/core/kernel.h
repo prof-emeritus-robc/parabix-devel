@@ -141,17 +141,6 @@ public:
         std::array<llvm::Value *, (unsigned)CommandLineScalarType::CommandLineScalarCount> mCommandLineMap{};
     };
 
-    struct LinkedFunction {
-        const std::string  Name;
-        llvm::FunctionType * const Type;
-        void * const FunctionPtr;
-
-        LinkedFunction(std::string && Name, llvm::FunctionType * Type, void * FunctionPtr)
-        : Name(Name), Type(Type), FunctionPtr(FunctionPtr) { }
-    };
-
-    using LinkedFunctions = llvm::SmallVector<LinkedFunction, 0>;
-
     enum MainMethodGenerationType {
         AddInternal
         , DeclareExternal
@@ -456,9 +445,6 @@ public:
 
     void loadCachedKernel(KernelBuilder & b);
 
-    template <typename ExternalFunctionType>
-    void link(std::string name, ExternalFunctionType & functionPtr);
-
     struct LocalBufferFlagSet {
         enum LocalBufferFlagType : uint32_t {
             LBF_Shared = 1,
@@ -567,7 +553,7 @@ protected:
 
     using MetadataScaleVector = llvm::SmallVector<size_t, 8>;
 
-    virtual void writeInternallyGeneratedStreamSetScaleVector(const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
+    virtual void writeInternallyGeneratedStreamSetScaleVector(KernelBuilder & b, const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
         llvm_unreachable("not supported");
     }
 
@@ -607,8 +593,6 @@ protected:
 
     virtual void addAdditionalFunctions(KernelBuilder &) { }
 
-    virtual void linkExternalMethods(KernelBuilder & b);
-
     struct StateTypes {
         llvm::StructType * const Shared;
         llvm::StructType * const ThreadLocal;
@@ -637,6 +621,16 @@ protected:
 
     void setKernelFlags(unsigned flags) { mFlags = flags; };
 
+public:
+
+    static const llvm::MDString * readSignatureFromModule(const llvm::Module * const M);
+
+    static void writeSignatureToModule(const Kernel * const kernel, llvm::Module * const M);
+
+public:
+
+    virtual void linkExternalMethods(KernelBuilder & b);
+
 protected:
 
     // Constructor
@@ -659,6 +653,10 @@ protected:
 
     static std::string annotateKernelNameWithDebugFlags(const TypeId id, const unsigned flags, std::string && name);
 
+    bool isInternalKernel() const {
+        return (mTypeId >= TypeId::PopCountKernel);
+    }
+
 protected:
 
     using ModulePtr = std::unique_ptr<llvm::orc::ThreadSafeModule>;
@@ -674,17 +672,7 @@ protected:
     Bindings                            mOutputScalars;
     InternalScalars                     mInternalScalars;
     std::string                         mKernelName;
-    LinkedFunctions                     mLinkedFunctions;
 };
-
-template <typename ExternalFunctionType>
-inline void Kernel::link(std::string name, ExternalFunctionType & functionPtr) {
-    assert ("Kernel does not have a module?" && mModule);
-    auto & C = mModule->getContext();
-    auto * const type = FunctionTypeBuilder<ExternalFunctionType>::get(C);
-    assert ("FunctionTypeBuilder did not resolve a function type." && type);
-    mLinkedFunctions.emplace_back(std::move(name), type, reinterpret_cast<void *>(functionPtr));
-}
 
 class SegmentOrientedKernel : public Kernel {
 public:

@@ -8,8 +8,18 @@ namespace llvm { class ModulePass; }
 namespace kernel { class KernelBuilder; }
 
 #include <llvm/IR/LegacyPassManager.h>
-
 class CPUDriver final : public BaseDriver {
+
+    struct LinkedFunction {
+        const kernel::Kernel * const Target;
+        llvm::Function * const FunctionDecl;
+
+        LinkedFunction(const kernel::Kernel * const target, llvm::Function * decl)
+        : Target(target), FunctionDecl(decl) { }
+    };
+
+    friend class CPUDriverIRCompiler;
+
 public:
 
     CPUDriver(std::string && moduleName);
@@ -24,17 +34,17 @@ public:
 
     llvm::ModulePass * createTracePass(kernel::KernelBuilder * kb, llvm::StringRef to_trace);
 
-    llvm::orc::SymbolStringPtr declareFunctionSymbol(llvm::Function * function) const final;
-
     void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) final;
 
 private:
 
     void preparePassManager();
 
+    void linkAllExternalSymbols();
+
 protected:
 
-    llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const override;
+    llvm::Function * addLinkFunction(kernel::Kernel * const kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) override;
 
 private:
     std::unique_ptr<llvm::raw_fd_ostream>                   mUnoptimizedIROutputStream;
@@ -43,6 +53,8 @@ private:
 
     std::vector<llvm::orc::ThreadSafeContext>               mContexts;
     std::unique_ptr<llvm::orc::SymbolLookupSet>             mSymbolLookupSet;
+    std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
     std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
+    llvm::SmallVector<LinkedFunction, 16>                   mLinkedFunctions;
 };
 

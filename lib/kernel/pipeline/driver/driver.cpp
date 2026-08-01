@@ -127,8 +127,6 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         }
     }
 
-
-
     if (LLVM_LIKELY(mObjectCache.get())) {
         switch (mObjectCache->loadCachedObjectFile(*mBuilder, kernel)) {
             case CacheObjectResult::CACHED:
@@ -136,7 +134,7 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
                 break;
             case CacheObjectResult::COMPILED:
                 mCompiledKernel.emplace_back(kernel.get());
-                break;
+                return;
             case CacheObjectResult::UNCACHED:
                 mUncachedKernel.emplace_back(kernel.get());
                 break;
@@ -145,6 +143,8 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         kernel->makeModule(*mBuilder);
         mUncachedKernel.emplace_back(kernel.get());
     }
+
+    kernel->linkExternalMethods(*mBuilder);
 
 }
 

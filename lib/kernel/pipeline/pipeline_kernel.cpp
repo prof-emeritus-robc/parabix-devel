@@ -154,7 +154,6 @@ void PipelineKernel::generateAllocateThreadLocalInternalStreamSetsMethod(KernelB
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::linkExternalMethods(KernelBuilder & b) {
     PipelineCompiler::linkPipelineExternalMethods(b);
-    StreamSetBuffer::linkFunctions(b);
     for (const auto & k : mKernels) {
         k.Object->linkExternalMethods(b);
     }
@@ -459,10 +458,10 @@ bool PipelineKernel::isCachable() const {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief writeInternallyGeneratedStreamSetScaleVector
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
+void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder & b, const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
     assert (hasInternallyGeneratedStreamSets());
 
-    Module * const M = getModule();
+    Module * const M = b.getModule();
     NamedMDNode * const msl = M->getNamedMetadata("rsl");
     assert (msl);
     assert (msl->getNumOperands() > 0);
@@ -483,7 +482,7 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(const Relation
     for (unsigned i = 0; i != m; ++i) {
         const Kernel * const kernel = mKernels[i].Object;
         if (LLVM_UNLIKELY(kernel->hasInternallyGeneratedStreamSets())) {
-            kernel->writeInternallyGeneratedStreamSetScaleVector(R, V, getJthOffset(j++));
+            kernel->writeInternallyGeneratedStreamSetScaleVector(b, R, V, getJthOffset(j++));
         }
     }
 
@@ -704,7 +703,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     if (hasInternallyGeneratedStreamSets()) {
         const auto & I = getInternallyGeneratedStreamSets();
         MetadataScaleVector scaleVector(I.size(), 0U);
-        writeInternallyGeneratedStreamSetScaleVector(I, scaleVector, 1U);
+        writeInternallyGeneratedStreamSetScaleVector(b, I, scaleVector, 1U);
         const auto n = I.size();
         for (unsigned i = 0; i < n; ++i) {
             assert (scaleVector[i] > 0);

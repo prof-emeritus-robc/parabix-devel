@@ -249,7 +249,6 @@ void CarryManager::initializeCodeGen(kernel::KernelBuilder & b) {
  * @brief finalizeCodeGen
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::finalizeCodeGen(kernel::KernelBuilder & b) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     if (mHasLoop) {
         b.setScalarField("selector", mNextLoopSelector);
     }

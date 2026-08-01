@@ -45,7 +45,7 @@ void PipelineCompiler::generateMetaDataForRepeatingStreamSets(KernelBuilder & b)
             maxStrides.push_back(ms);
         }
 
-        Module * const module = mTarget->getModule();
+        Module * const module = b.getModule();
         NamedMDNode * const md = module->getOrInsertNamedMetadata("rsl");
         assert (md->getNumOperands() == 0);
         Constant * ar = ConstantArray::get(ArrayType::get(b.getSizeTy(), maxStrides.size()), maxStrides);

@@ -67,8 +67,6 @@ public:
 
     unsigned getBitBlockWidth() const final;
 
-    virtual llvm::orc::SymbolStringPtr declareFunctionSymbol(llvm::Function * function) const = 0;
-
     virtual void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) = 0;
 
     llvm::TargetMachine * getTargetMachine() {
@@ -102,9 +100,9 @@ protected:
     BaseDriver(std::string && moduleName);
 
     template <typename ExternalFunctionType>
-    void LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) const;
+    void LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr);
 
-    virtual llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const = 0;
+    virtual llvm::Function * addLinkFunction(kernel::Kernel * const kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) = 0;
 
 protected:
 
@@ -126,7 +124,9 @@ protected:
 };
 
 template <typename ExternalFunctionType>
-void BaseDriver::LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) const {
-    kernel->link<ExternalFunctionType>(name, functionPtr);
+void BaseDriver::LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) {
+    auto * const type = FunctionTypeBuilder<ExternalFunctionType>::get(*mContext);
+    assert ("FunctionTypeBuilder did not resolve a function type." && type);
+    addLinkFunction(kernel.get(), name, type, reinterpret_cast<void *>(functionPtr));
 }
 

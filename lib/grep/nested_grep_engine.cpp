@@ -207,12 +207,12 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
         StreamSet * const MatchCoords = P.CreateStreamSet(3, sizeof(size_t) * 8);
         P.CreateKernelCall<MatchCoordinatesKernel>(matches, breaks, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = P.CreateKernelCall<MatchReporter>(byteStream, MatchCoords, accumulator);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
         Kernel * const scanMatchK = P.CreateKernelCall<ScanMatchKernel>(matches, breaks, byteStream, accumulator, ScanMatchBlocks);
-        scanMatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        scanMatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        P.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        P.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mNested.push_back(kernel);

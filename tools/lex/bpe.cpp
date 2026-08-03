@@ -193,19 +193,6 @@ protected:
     }
 };
 
-// Hash a rule group's (idA,idB,idAB,lenA,lenB) list → unique cache name per kernel,
-// since the Pablo body is data-dependent (same shape, different rules). lenA MUST be
-// in the hash: it is the LookAhead/Advance distance, and applyCompactionSchedule
-// rewrites it from byte distance to slot distance, so two schedules give identical
-// (idA,idB,idAB) with different bodies. Conversely, two schedules that yield the same
-// lenA set for a group produce the same body and correctly share a cache entry.
-uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
-    uint64_t h = 0xCBF29CE484222325ull;
-    auto mix = [&](uint64_t x){ h = (h ^ x) * 0x100000001B3ull; };
-    for (const auto & r : rules) { mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenA); mix(r.lenB); }
-    return h;
-}
-
 // ─── BPEOnesKernel ──────────────────────────────────────────────────────────
 // Emit an all-ones 1-bit stream at the rate of `anchor` (consumed for its RATE
 // only, never read). Used right after a FilterByMask compaction: every position
@@ -220,9 +207,9 @@ uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
 // the EOF trailing-whitespace fix in InFileNonSpaceKernel (pretokenizer.cpp).
 class BPEOnesKernel : public PabloKernel {
 public:
+    BPEOnesKernel(LLVMTypeSystemInterface & ts, StreamSet * anchor, StreamSet * ones)
     // Name says InFile: the body is data-independent so the cache key is the name
     // alone, and the pre-InFile version would otherwise be served from objcache.
-    BPEOnesKernel(LLVMTypeSystemInterface & ts, StreamSet * anchor, StreamSet * ones)
     : PabloKernel(ts, "BPE_OnesInFile",
                   {Binding{"anchor", anchor}},
                   {Binding{"ones",   ones}}) {}
@@ -234,60 +221,37 @@ protected:
     }
 };
 
+// Hash a rule group's (idA,idB,idAB,lenA,lenB) list → unique cache name per kernel,
+// since the Pablo body is data-dependent (same shape, different rules). lenA MUST be
+// in the hash: it is the LookAhead/Advance distance, and applyCompactionSchedule
+// rewrites it from byte distance to slot distance, so two schedules give identical
+// (idA,idB,idAB) with different bodies. Conversely, two schedules that yield the same
+// lenA set for a group produce the same body and correctly share a cache entry.
+uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    auto mix = [&](uint64_t x){ h = (h ^ x) * 0x100000001B3ull; };
+    for (const auto & r : rules) { mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenA); mix(r.lenB); }
+    return h;
+}
+
 // ─── applyCompactionSchedule (BPE_COMPACT_EVERY=K) ──────────────────────────
 // Decide WHERE to inject a FilterByMask compaction into the merge-kernel chain, and
 // rewrite every rule's merge distance to match the resulting coordinate space. This
-// is pure preprocessing — BPEMergeKernel is untouched and never learns it happened.
+// is pure preprocessing.
 //
-// WHY compact. Without it, all 1123 merge kernels run over BYTE positions, even
-// though most of those positions are dead: 24 MB of input collapses to 5.45 M tokens
-// (4.4x), and the common (low-rank) merges do most of that collapsing early. A
-// FilterByMask(inPlayMask, source) drops the dead positions, so every later kernel
-// does proportionally less per-position work. It also shrinks the Pablo IR: distances
-// get smaller and collide, so the shared `aheadByLenA` LookAhead map shrinks (mean
-// 7.24 distinct distances per kernel in byte space).
-//
-// THE COORDINATE CHANGE. After a compaction, one position = one LIVE token. Call the
-// set of ids alive at that moment the FRONTIER: ranges tile contiguously, so
-// compacting after kernel i means every live id is < hi_i, and F = hi_i identifies
-// the frame exactly. In that frame, a token's width is not its byte length but the
-// number of FRONTIER tokens it is built from:
-//
-//     slotSpan(id, F) = 1                                       if id < F
-//                     = slotSpan(idA,F) + slotSpan(idB,F)       otherwise
-//
-// A merge's parts sit at fixed positions in a fixed frame, so this distance is
-// STATIC, not data-dependent — the same property byte space relies on. Byte space is
-// just the F = 256 case: slotSpan(id, 256) == lenA == the codepoint count. So all we
-// do per block is recompute lenA against the block's frontier; the kernel keeps using
-// r.lenA for its LookAhead, its Advance and its self-merge stride, unchanged.
-//
-// Worked example, K=1 (compact after every kernel) on `Ġthey`, once `Ġ t`→`Ġt` fired:
-//
-//   byte frame (F=256):   pos  0     1      2     3      4
-//     ids                    [Ġt] [dead] [he] [dead]  [y]
-//     rule Ġt+he: slotSpan(Ġt,256) = 2   → LookAhead(source,2) reads pos 2   ✓
-//   slot frame (F=hi):    pos  0     1      2
-//     ids                    [Ġt]  [he]   [y]
-//     rule Ġt+he: slotSpan(Ġt,F)   = 1   → LookAhead(source,1) reads pos 1   ✓
-//
-// With K=10 the frontier is 10 kernels back, so a token assembled INSIDE the block
-// spans 2..K slots and gets a distance in that range — still one distance per rule.
-//
-// NOTE the pipeline's Z3 dataflow analysis fails above roughly 44 chained PopcountOf
-// rate changes ("Unexpected Z3 error when attempting to convert model value to
-// number!"), so with 1123 kernels only K >= ~25 is feasible.
-//
+// This is a preprocessing step that prepares the merge pipeline before any kernels are created.
 // Returns compactAfter[i] = inject a compaction after merge kernel i. K = 0 returns
 // all-false and leaves every lenA untouched, so the byte-space path stays bit-exact.
 static std::vector<bool> applyCompactionSchedule(
         std::vector<MergeRuleGroup> & ruleRanges, unsigned K) {
 
+    //  Compact after every K kernels. The first block is always byte space (F=256),
+    //  so the first K kernels see the original lenA = byte distance. 
     std::vector<bool> compactAfter(ruleRanges.size(), false);
     if (K == 0) return compactAfter;
 
     // parts[idAB] = (idA, idB) for every merged token. Base ids (< 256) are absent —
-    // they are atomic and terminate the recursion.
+    // they are atomic and terminate the recursion. lookup table
     std::map<unsigned, std::pair<unsigned,unsigned>> parts;
     for (const auto & g : ruleRanges)
         for (const auto & r : g.rules)
@@ -295,7 +259,9 @@ static std::vector<bool> applyCompactionSchedule(
 
     unsigned frontier = 256;                 // before any compaction: byte space
     std::map<unsigned, unsigned> memo;        // valid for the CURRENT frontier only
+    // slotSpan(id) = the number of tokens that id spans. 
     std::function<unsigned(unsigned)> slotSpan = [&](unsigned id) -> unsigned {
+        // 
         if (id < frontier) return 1;
         auto m = memo.find(id);
         if (m != memo.end()) return m->second;
@@ -306,6 +272,9 @@ static std::vector<bool> applyCompactionSchedule(
         return v;
     };
 
+    // Walk the rule ranges in order, counting kernels since the last compaction. When
+    // we hit K, mark this range for compaction and reset the frontier to hi_i. 
+    //Recompute every rule's lenA in the new frontier space. 
     unsigned sinceCompact = 0, nCompact = 0, firstBlockDisagree = 0;
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
@@ -313,14 +282,15 @@ static std::vector<bool> applyCompactionSchedule(
         unsigned maxDist = 0;
         for (auto & r : g.rules) {
             unsigned d = slotSpan(r.idA);
-            // Self-check: in the FIRST block the frontier is still 256, so the slot
-            // distance must reproduce the byte distance exactly. A disagreement means
-            // the merge table or rawByteLen is inconsistent.
             if (nCompact == 0 && d != r.lenA) firstBlockDisagree++;
             r.lenA = d;
             if (d > maxDist) maxDist = d;
         }
+        // Update the maximum length in the current rule range.
         g.maxLen = maxDist;                   // LookAhead binding must cover every lenA
+        // Decide whether to compact after this range. If we do, the next frontier is
+        // the hi of this range, and we reset the memoization table. Otherwise, the
+        // frontier stays the same and we keep memoizing.   
         if (++sinceCompact < K) continue;
         compactAfter[i] = true;
         frontier = g.hi;                      // every live id after kernel i is < hi_i
@@ -395,19 +365,10 @@ public:
                    StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
                    StreamSet * sourceOut, StreamSet * meOut,
                    MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
-    // maxLen MUST be in the cache name, not just hashRuleSet: it is the LookAhead
-    // declaration (T5), and applyCompactionSchedule recomputes it per compaction
-    // schedule. First-block groups keep their byte-space lenA, so they hash
-    // identically at K=0 and K>0 while their maxLen differs — without maxLen in the
-    // name the objcache serves one schedule's kernel to the other, silently
-    // miscompiling the LookAhead distance.
-    //
-    // ...and the two STREAM WIDTHS: W_out = ceil_log2(hi+1) sizes the id accumulator
-    // and W = sourceIn's width sizes the LookAhead reads, yet neither is derivable
-    // from `rules`. Two merges files can hold a group with identical rules and maxLen
-    // at different id widths (dev merges top out at 12 bits, full GPT-2 at 16), so
-    // without them in the name the objcache serves a 16-bit body to a 12-bit pipeline
-    // — observed as impossible out-of-vocab ids.
+    // name must encode every body-shaping param hashRuleSet omits 
+    // — LookAhead distance (L=maxLen, changes with compaction), input width (w) and accumulator width (o, dev 12-bit vs full 16-bit) 
+    // — else objcache serves a mismatched compiled body.
+
     : PabloKernel(ts, std::string("BPEMerge_") + (boundaryIn ? "b1_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))

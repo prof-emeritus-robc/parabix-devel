@@ -450,6 +450,30 @@ private:
     uint32_t mDelimCodepoint;
 };
 
+// InFileNonSpaceKernel — nonspace = InFile(NOT space).
+//
+// GPT2PretokenBoundaryKernel must distinguish "the next codepoint IS a non-space"
+// from "there IS no next codepoint". Pablo LookAhead past end-of-input yields 0, so
+// NOT(LookAhead(space,1)) is TRUE at the final position — which wrongly splits a
+// TRAILING whitespace run, because HF's "\s+(?!\S)" succeeds at EOF and keeps the
+// whole run as one pretoken ("a  " → HF "a","ĠĠ"; the buggy form gave "a","Ġ","Ġ").
+// InFile() masks the padding past EOF to 0 (it ANDs with NOT EOFmask), so
+// LookAhead(nonspace, 1) is 0 at the last codepoint and the run stays intact.
+class InFileNonSpaceKernel : public PabloKernel {
+public:
+    InFileNonSpaceKernel(LLVMTypeSystemInterface & ts,
+                         StreamSet * space, StreamSet * nonspace)
+    : PabloKernel(ts, "InFileNonSpace",
+                  {Binding{"space", space}}, {Binding{"nonspace", nonspace}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * sp = getInputStreamSet("space")[0];
+        pb.createAssign(pb.createExtract(getOutputStreamVar("nonspace"), pb.getInteger(0)),
+                        pb.createInFile(pb.createNot(sp)));
+    }
+};
+
 // GPT2PretokenBoundaryKernel — GPT-2 pretoken STARTS via CHARACTER-CLASS transitions
 // (parallel leftmost-longest), replacing the RE_Kernel route which over-marks (it
 // matches all positions in parallel, so overlapping arms like " '" vs "'t" and
@@ -468,8 +492,12 @@ public:
     // sdmt/cl/cvr/ce: single-codepoint classes for the contraction suffixes — [sdmt]
     // (single), l, [vr], e (for ll / ve / re). LookAhead(2) so the apostrophe can peek
     // its next 1–2 codepoints. HF's '(?:[sdmt]|ll|ve|re) is lowercase / case-sensitive.
+    // nonspace = InFile(NOT space), supplied by InFileNonSpaceKernel. Used INSTEAD of
+    // NOT(LookAhead(space,1)) so that "no next codepoint" (EOF) is distinguishable
+    // from "next codepoint is a non-space" — see InFileNonSpaceKernel above.
     GPT2PretokenBoundaryKernel(LLVMTypeSystemInterface & ts,
-                               StreamSet * space, StreamSet * spaceLit,
+                               StreamSet * space, StreamSet * nonspace,
+                               StreamSet * spaceLit,
                                StreamSet * letter, StreamSet * number,
                                StreamSet * apostrophe,
                                StreamSet * sdmt, StreamSet * cl,
@@ -477,6 +505,7 @@ public:
                                StreamSet * boundary)
     : PabloKernel(ts, "GPT2PretokenBoundary",
                   {Binding{"space", space, FixedRate(), LookAhead(1)},
+                   Binding{"nonspace", nonspace, FixedRate(), LookAhead(1)},
                    Binding{"spaceLit", spaceLit},
                    Binding{"letter", letter}, Binding{"number", number},
                    Binding{"apostrophe", apostrophe},
@@ -513,7 +542,11 @@ protected:
                                pb.createOr(pb.createAnd(number, Np),
                                            pb.createAnd(other,  Op)));
 
-        PabloAST * nsAhead = pb.createNot(pb.createLookahead(space, 1));   // nonspace[i+1] (or EOF)
+        // nonspace[i+1], and FALSE when there is no i+1 at all. The earlier form
+        // NOT(LookAhead(space,1)) also fired at end-of-input (LookAhead past EOF is 0),
+        // splitting trailing whitespace runs that HF keeps whole via "\s+(?!\S)".
+        PabloAST * nonspaceIn = getInputStreamSet("nonspace")[0];
+        PabloAST * nsAhead = pb.createLookahead(nonspaceIn, 1);
 
         // A) LAST whitespace char of a run before a nonspace ALWAYS opens a token. A
         //    literal 0x20 attaches FORWARD into the word (HF " ?\p{L/N}+" / " ?[^\s..]+");
@@ -710,9 +743,14 @@ PreTokenizerResult buildPreTokenizerBoundaries(
         wsProp = cast<re::PropertyExpression>(UCD::linkAndResolve(wsProp));
         StreamSet * BL_WSpace = P.CreateStreamSet(1);
         P.CreateKernelCall<UnicodePropertyKernelBuilder>(wsProp, U21codepoints, BL_WSpace);
+        // nonspace = InFile(NOT space): lets the boundary kernel tell "next codepoint
+        // is a non-space" apart from "no next codepoint", so a TRAILING whitespace run
+        // is not split (HF's "\s+(?!\S)" matches the whole run at end-of-input).
+        StreamSet * BL_NonSpace = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<InFileNonSpaceKernel>(BL_WSpace, BL_NonSpace);
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<GPT2PretokenBoundaryKernel>(
-            BL_WSpace, WhitespaceMask, BL_Letter, NumberStream, BL_Apostrophe,
+            BL_WSpace, BL_NonSpace, WhitespaceMask, BL_Letter, NumberStream, BL_Apostrophe,
             BL_sdmt, BL_l, BL_vr, BL_e, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
 

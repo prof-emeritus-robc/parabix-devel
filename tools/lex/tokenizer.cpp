@@ -57,6 +57,56 @@ static bool                  gOutputStrings = false;
 // measure pure tokenization, not millions of stdout writes.
 static bool                  gBenchQuiet    = false;
 
+// ─── --offsets: per-token source spans (HuggingFace `Encoding.offsets`) ───────
+//
+// No extra pipeline stage is needed. GPT-2 byte-level tokens TILE the input
+// exactly — every input byte belongs to exactly one token, no gaps, no overlaps
+// (verified: sum of token byte-lengths == input length, multibyte included). So a
+// token's start offset is just the running sum of the byte-lengths of the tokens
+// before it, and the scan callback already fires once per token in input order.
+//
+// A token's byte length is the CODEPOINT COUNT of its display string, not that
+// string's size(): byte-level remapping is a byte↔codepoint bijection, so "Ġ" is
+// 2 display bytes (0xC4 0xA0) but 1 source byte.
+//
+// byte mode reports raw byte spans. char mode reproduces HuggingFace exactly,
+// which means two extra rules:
+//   * offsets are CHARACTER indices, not byte indices;
+//   * a token that covers only part of a character reports that whole
+//     character's span. So the 3 bytes of "日" split across two tokens make BOTH
+//     tokens report (0,1) — offsets are NOT a partition in char space and may
+//     overlap or nest.
+enum OffsetMode { OffNone, OffByte, OffChar };
+static OffsetMode            gOffsetMode    = OffNone;
+static const char *          gBuf           = nullptr;   // the mmap'd input
+static size_t                gBufLen        = 0;
+static size_t                gPos           = 0;   // running byte offset (next token's start)
+static size_t                gLeads         = 0;   // # lead bytes in gBuf[0, gPos)
+static bool                  gOffsetWarned  = false;
+
+static inline bool isContByte(unsigned char c) { return (c & 0xC0) == 0x80; }
+
+// Walk the cursor forward to byte p, maintaining gLeads = lead bytes in [0, p).
+// Monotonic: tokens arrive in input order, so this is O(total bytes) overall.
+static inline void offsetAdvanceTo(size_t p) {
+    while (gPos < p && gPos < gBufLen) {
+        if (!isContByte((unsigned char) gBuf[gPos])) ++gLeads;
+        ++gPos;
+    }
+}
+
+// Index of the character CONTAINING byte p. gLeads counts lead bytes strictly
+// before p, so a lead byte at p starts character gLeads, while a continuation
+// byte at p belongs to the character that started earlier — gLeads - 1.
+static inline size_t charContaining(size_t p) {
+    offsetAdvanceTo(p);
+    if (p < gBufLen && isContByte((unsigned char) gBuf[p]))
+        return gLeads > 0 ? gLeads - 1 : 0;
+    return gLeads;
+}
+
+static void resetOffsetState() { gPos = 0; gLeads = 0; }
+
 // bpe_emit_token
 // Called once per surviving BPE token by the scan::Reader stage.
 // id_ptr points into the 16-bit vocab-ID stream at the match-end byte
@@ -70,8 +120,39 @@ extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
         std::fprintf(stderr, "[emit] id=%u  lo=%u hi=%u  ptr=%p\n",
                      (unsigned)id, (unsigned)bp[0], (unsigned)bp[1], (const void*)id_ptr);
     }
+
+    const std::string tokStr = gBPE ? gBPE->decodeToken(static_cast<int>(id)) : std::string();
+
+    if (gOffsetMode != OffNone) {
+        // Source byte length = codepoint count of the display string.
+        size_t len = 0;
+        for (unsigned char c : tokStr) if (!isContByte(c)) ++len;
+        if (len == 0 && !gOffsetWarned) {
+            gOffsetWarned = true;
+            llvm::errs() << "Warning: --offsets saw id " << id
+                         << " with no vocab entry; spans after this point will drift.\n";
+        }
+        const size_t sByte = gPos;                 // this token starts where the last ended
+        const size_t eByte = sByte + len;
+        size_t s, e;
+        if (gOffsetMode == OffByte) {
+            s = sByte; e = eByte;
+            offsetAdvanceTo(eByte);                // keep the cursor in step
+        } else {
+            // Expand outward to whole characters, matching HuggingFace.
+            s = charContaining(sByte);
+            e = (eByte > sByte) ? charContaining(eByte - 1) + 1 : s;
+            offsetAdvanceTo(eByte);
+        }
+        if (gOutputStrings)
+            llvm::outs() << id << '\t' << s << '\t' << e << '\t' << tokStr << "\n";
+        else
+            llvm::outs() << id << '\t' << s << '\t' << e << "\n";
+        return;
+    }
+
     if (gOutputStrings && gBPE)
-        llvm::outs() << id << '\t' << gBPE->decodeToken(static_cast<int>(id)) << "\n";
+        llvm::outs() << id << '\t' << tokStr << "\n";
     else
         llvm::outs() << id << "\n";
 }
@@ -174,6 +255,17 @@ static cl::opt<bool> StripNewlines(
              "(legacy line-delimited input). Default OFF: '\\n' is real content and "
              "seeds to id 198 (GPT-2 'Ċ'), matching HuggingFace byte-level BPE."),
     cl::init(false),
+    cl::cat(wordBreakerFlags));
+
+static cl::opt<OffsetMode> OffsetsFlag(
+    "offsets",
+    cl::desc("BPE mode: also print each token's span in the source:"),
+    cl::values(
+        clEnumValN(OffNone, "none", "No spans (default)"),
+        clEnumValN(OffByte, "byte", "Raw BYTE spans [start,end)"),
+        clEnumValN(OffChar, "char", "CHARACTER spans, matching HuggingFace Encoding.offsets "
+                                    "(a token splitting a character reports that whole character)")),
+    cl::init(OffNone),
     cl::cat(wordBreakerFlags));
 
 static cl::opt<unsigned> BenchLoop(
@@ -392,6 +484,23 @@ int main(int argc, char *argv[]) {
 
         gBPE           = &bpe;
         gOutputStrings = OutputStrings;
+        gOffsetMode    = OffsetsFlag;
+
+        // --offsets reports spans into the byte stream the BPE stage consumed, so
+        // anything that ADDS or REMOVES bytes relative to the mmap'd file breaks the
+        // tiling the running sum depends on.
+        if (gOffsetMode != OffNone && StripNewlines) {
+            llvm::errs() << "Error: --offsets cannot be combined with --strip-newlines "
+                            "(dropping '\\n' bytes breaks the token/byte tiling spans rely on).\n";
+            return 1;
+        }
+        if (gOffsetMode != OffNone) {
+            bool activeNorm = false;
+            for (auto m : Normalization) if (m != NormNone) { activeNorm = true; break; }
+            if (activeNorm)
+                llvm::errs() << "Warning: --offsets with --normalize reports spans in the "
+                                "NORMALIZED text, which may not align with the input file.\n";
+        }
 
         CPUDriver driver("bpe_tokenizer");
         BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe);
@@ -425,6 +534,11 @@ int main(int argc, char *argv[]) {
         alignas(64) static const char emptyBuf[64] = {0};
         if (buf == nullptr) buf = emptyBuf;
 
+        // --offsets: point the span cursor at the same resident bytes the pipeline
+        // reads, so char mode can tell lead bytes from continuation bytes.
+        gBuf    = buf;
+        gBufLen = nbytes;
+
         // --bench-loop=N: run the (already built + JIT-compiled) pipeline N times
         // in this one process over the resident buffer. Pipeline build AND file
         // I/O are both excluded, so we measure pure tokenization throughput — the
@@ -435,11 +549,13 @@ int main(int argc, char *argv[]) {
             const unsigned N = BenchLoop;
 
             // One discarded warm-up run (first pass pays page-fault / cache-fill cost).
+            resetOffsetState();
             bpeFn(buf, nbytes);
 
             std::vector<double> ms;   // per-iteration wall time, milliseconds
             ms.reserve(N);
             for (unsigned i = 0; i < N; ++i) {
+                resetOffsetState();   // spans are cumulative — rewind per iteration
                 auto t0 = std::chrono::steady_clock::now();
                 bpeFn(buf, nbytes);
                 auto t1 = std::chrono::steady_clock::now();
@@ -468,6 +584,7 @@ int main(int argc, char *argv[]) {
         }
 
         auto __tRun0 = std::chrono::steady_clock::now();
+        resetOffsetState();
         bpeFn(buf, nbytes);
         auto __tRun1 = std::chrono::steady_clock::now();
         std::cerr << "[BPE] run (execute pipeline): "

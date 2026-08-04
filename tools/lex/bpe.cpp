@@ -512,10 +512,10 @@ BPEPassResult buildBPEPassPipeline(
 
     auto ruleRanges = bpe.buildMergeRuleRanges();
 
-    // BPE_COMPACT_EVERY=K: inject a FilterByMask compaction after every K merge
-    // kernels and rewrite the rules' merge distances into the compacted (slot) frame.
-    // K=0 (default) = off, byte space, bit-exact with the pre-compaction path.
-    unsigned compactEvery = 0;
+    // Inject a FilterByMask compaction after every K merge kernels and rewrite the
+    // rules' merge distances into the compacted (slot) frame. Default K = 40, so
+    // compactions land after kernel 40, 80, 120, ... (28 points for 1123 kernels).
+    unsigned compactEvery = 40;
     if (const char * ce = std::getenv("BPE_COMPACT_EVERY")) compactEvery = (unsigned) std::atoi(ce);
     auto compactAfter = applyCompactionSchedule(ruleRanges, compactEvery);
 

@@ -215,7 +215,9 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
         mTarget->addInternalScalar(sizeTy, name + INTERNALLY_SYNCHRONIZED_SUB_SEGMENT_SUFFIX, groupId);
     }
 
-    if (LLVM_LIKELY(mKernel->isStateful())) {
+    const auto flags = mKernel->getInternalStateTypeFlags();
+
+    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
         Type * sharedStateTy = nullptr;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
             sharedStateTy = PointerType::getUnqual(C);
@@ -226,7 +228,7 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
         mTarget->addInternalScalar(sharedStateTy, name, groupId);
     }
 
-    if (mKernel->hasThreadLocal()) {
+    if (flags & Kernel::KernelHasThreadLocal) {
         // we cannot statically allocate a "family" thread local object.
         Type * localStateTy = nullptr;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
@@ -306,23 +308,27 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 
             if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
 
+                StructType * sharedStateTy = mKernel->getSharedStateType(b);
+
                 Constant * sharedStateTySize = nullptr;
-                if (mKernel->isStateful()) {
-                    sharedStateTySize = b.getTypeSize(mKernel->getSharedStateType(b));
+                if (sharedStateTy) {
+                    sharedStateTySize = b.getTypeSize(sharedStateTy);
                 } else {
                     sharedStateTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
                 }
                 args.push_back(sharedStateTySize);
 
+                StructType * threadLocalStateTy = mKernel->getSharedStateType(b);
+
                 Constant * threadLocalTySize = nullptr;
-                if (mKernel->hasThreadLocal()) {
-                    threadLocalTySize = b.getTypeSize(mKernel->getThreadLocalStateType(b));
+                if (threadLocalStateTy) {
+                    threadLocalTySize = b.getTypeSize(threadLocalStateTy);
                 } else {
                     threadLocalTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
                 }
                 args.push_back(threadLocalTySize);
             }
-            if (LLVM_LIKELY(mKernel->isStateful())) {
+            if (LLVM_LIKELY(mKernelSharedHandle)) {
                 args.push_back(mKernelSharedHandle);
             }
             #ifndef NDEBUG
@@ -445,7 +451,6 @@ void PipelineCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
         return;
     }
     getABIAlignments(b);
-    assert (mTarget->hasThreadLocal());
 
     const auto numOfPhases = PartitionPhaseBoundaries.size(); assert (numOfPhases >= 2);
 
@@ -464,7 +469,8 @@ void PipelineCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
 
         for (auto i = firstKernelInCurrentPhase; i < oneAfterLastKernelInCurrentPhase; ++i) {
             const Kernel * const kernel = getKernel(i);
-            if (kernel->hasThreadLocal()) {
+            const auto flags = kernel->getInternalStateTypeFlags();
+            if (flags & Kernel::KernelHasThreadLocal) {
                 setActiveKernel(b, i, true);
                 assert (mKernel == kernel);
                 callKernelInitializeThreadLocalFunction(b);
@@ -546,12 +552,10 @@ void PipelineCompiler::generateFinalizeMethod(KernelBuilder & b) {
     for (unsigned i = FirstKernel; i <= LastKernel; ++i) {
         setActiveKernel(b, i, true);
         SmallVector<Value *, 1> args;
-        if (LLVM_LIKELY(mKernel->isStateful())) {
-            assert (mTarget->isStateful());
+        if (LLVM_LIKELY(mKernelSharedHandle)) {
             args.push_back(mKernelSharedHandle);
         }
-        if (LLVM_UNLIKELY(mKernel->hasThreadLocal())) {
-            assert (mTarget->hasThreadLocal());
+        if (LLVM_UNLIKELY(mKernelThreadLocalHandle)) {
             args.push_back(mKernelThreadLocalHandle);
         }
         mScalarValue[i] = callKernelFinalizeFunction(b, args);
@@ -577,12 +581,10 @@ void PipelineCompiler::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
     }
 
     getABIAlignments(b);
-    assert (mTarget->hasThreadLocal());
 
     for (unsigned i = FirstKernel; i <= LastKernel; ++i) {
         const Kernel * const kernel = getKernel(i);
-        assert (kernel->hasThreadLocal() || !isa<PipelineKernel>(kernel));
-        if (kernel->hasThreadLocal()) {
+        if (mKernelThreadLocalHandle) {
             setActiveKernel(b, i, true, true);
             assert (mKernel == kernel);
             SmallVector<Value *, 2> args;

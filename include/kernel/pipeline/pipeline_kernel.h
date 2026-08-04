@@ -121,7 +121,7 @@ public:
         return mLengthAssertions;
     }
 
-    void addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody) final;
+    void addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) final;
 
     std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 

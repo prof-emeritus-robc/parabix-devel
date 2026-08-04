@@ -78,45 +78,51 @@ public:
         // TODO: use a threadpool with a fixed number of expected threads to avoid reconstructing the builder and compiler objects
         const auto f = InternalMapping.find(&M);
 
-
+        Module * current = &M;
 
         auto optLevel = CodeGenOptLevel::Default;
         if (LLVM_LIKELY(f != InternalMapping.end())) {
 
             Kernel * const K = f->getSecond();
 
-            errs() << " ----- generating " << K->getName() << "\n";
-
-            assert (M.empty());
-
             NamedRegionTimer T(K->getSignature(), K->getName(),
                                "Kernel", "Kernel Generation",
                                codegen::TimeKernelsIsEnabled);
 
-            std::unique_ptr<KernelBuilder> builder(IDISA::GetIDISA_Builder(M.getContext(), CPUFeatures));
+            auto C = std::make_unique<LLVMContext>();
+            std::unique_ptr<KernelBuilder> builder(IDISA::GetIDISA_Builder(*C, CPUFeatures));
             builder->setDriver(Driver);
-            builder->setModule(&M);
+
+            K->makeTemporaryModule(*builder);
+
+            current = K->getModule();
+
+            builder->setModule(current);
             for (const auto & link : Driver.mLinkedFunctions) {
                 if (link.Target == K || link.Target == nullptr) {
-                    Type * funcType = CBuilder::convertTypeToLLVMContext(M.getContext(), link.FunctionDecl->getFunctionType());
-                    Function::Create(cast<FunctionType>(funcType), Function::ExternalLinkage, link.FunctionDecl->getName(), &M);
+                    Type * funcType = CBuilder::convertTypeToLLVMContext(*C, link.FunctionDecl->getFunctionType());
+                    Function::Create(cast<FunctionType>(funcType), Function::ExternalLinkage, link.FunctionDecl->getName(), current);
                 }
             }
-            K->setModule(&M); // the module may have changed
             K->generateKernel(*builder);
             if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
                 optLevel = codegen::BackEndOptLevel;
             }
+            K->setModule(&M);
         }
 
-        NamedRegionTimer T(M.getModuleIdentifier(), "",
+        NamedRegionTimer T(current->getModuleIdentifier(), "",
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
         auto TM = cantFail(JTMB.createTargetMachine());
         TM->setOptLevel(optLevel);
         SimpleCompiler C(*TM, ObjCache);
-        return C(M);
+        auto result = C(*current);
+        if (current != &M) {
+            delete current;
+        }
+        return result;
     }
 
 private:
@@ -146,9 +152,9 @@ public:
         Module * const M = Target->getModule(); assert (M);
         // TODO: using a null context may allow us to select from a pool of contexts and builders
         // but I need to remove Kernel::makeModule, getModule, and setModule first.
-        ThreadSafeContext ctx(std::unique_ptr<LLVMContext>{&M->getContext()});
+        ThreadSafeContext ctx(std::unique_ptr<LLVMContext>{nullptr}); // &M->getContext()
         ThreadSafeModule TSM(std::unique_ptr<Module>{M}, ctx);
-        Contexts.emplace_back(ctx);
+        // Contexts.emplace_back(ctx);
         TargetLayer.emit(std::move(R), std::move(TSM));
     }
 
@@ -373,7 +379,7 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     mBuilder->setModule(mMainModule);
 
     // Build the "main" module frame context execution pipeline
-    pk->addKernelDeclarations(*mBuilder, false);
+    pk->addKernelDeclarations(*mBuilder);
 
     // Finalize compiling and extracting the entry address pointer context out of your JIT
     // Assuming you look up your main wrapper method afterwards using mEngine->lookup("main")
@@ -398,7 +404,6 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     ThreadSafeModule TSM(std::unique_ptr<Module>{mMainModule}, ctx);
     mContexts.emplace_back(ctx);
     cantFail(mEngine->addIRModule(MainJD, std::move(TSM)));
-
 
 #if 0
     if (LLVM_UNLIKELY(codegen::ShowASMOption != codegen::OmittedOption)) {

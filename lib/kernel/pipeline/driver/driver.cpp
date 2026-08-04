@@ -93,10 +93,6 @@ Scalar * BaseDriver::CreateCommandLineScalar(CommandLineScalarType type) noexcep
  ** ------------------------------------------------------------------------------------------------------------- */
 void BaseDriver::addKernel(not_null<Kernel *> kernel) {
 
-    if (LLVM_UNLIKELY(kernel->getCompilationStatus() > Kernel::CompilationStatus::FullyInitialized)) {
-        return;
-    }
-
     // Verify the I/O relationships were properly set / defaulted in.
 
     for (Binding & input : kernel->getInputScalarBindings()) {
@@ -127,22 +123,13 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         }
     }
 
-    if (LLVM_LIKELY(mObjectCache.get())) {
-        switch (mObjectCache->loadCachedObjectFile(*mBuilder, kernel)) {
-            case CacheObjectResult::CACHED:
-                mCachedKernel.emplace_back(kernel.get());
-                break;
-            case CacheObjectResult::COMPILED:
-                mCompiledKernel.emplace_back(kernel.get());
-                return;
-            case CacheObjectResult::UNCACHED:
-                mUncachedKernel.emplace_back(kernel.get());
-                break;
-        }
-    } else {
-        kernel->makeModule(*mBuilder);
-        mUncachedKernel.emplace_back(kernel.get());
+    auto sig = kernel->hasSignature() ? kernel->getSignature() : kernel->getName();
+
+    if (mCompiledIdentifiers.insert(sig).second) {
+        return;
     }
+
+    kernel->makeTemporaryModule(*mBuilder);
 
     kernel->linkExternalMethods(*mBuilder);
 
@@ -186,7 +173,7 @@ BaseDriver::BaseDriver(std::string && moduleName)
 , mObjectCache(nullptr)
 , mTarget(nullptr) {
     if (LLVM_UNLIKELY(codegen::EnableObjectCache)) {
-        mObjectCache.reset(new ParabixObjectCache());
+        mObjectCache.reset(new ParabixObjectCache(*this));
     }
 }
 

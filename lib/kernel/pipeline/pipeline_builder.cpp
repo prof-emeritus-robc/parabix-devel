@@ -556,10 +556,6 @@ Kernel * PipelineBuilder::makeKernel() {
     mTarget->mKernelName =
         Kernel::annotateKernelNameWithDebugFlags(Kernel::TypeId::Pipeline, mTarget->mFlags, PipelineKernel::makePipelineHashName(signature));
 
-    mTarget->setCompilationStatus(Kernel::CompilationStatus::FullyInitialized);
-
-
-
     return mTarget;
 }
 

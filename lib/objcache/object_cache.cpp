@@ -90,6 +90,8 @@ inline bool isNonMatchingSignature(const MDString * const received, const String
     return expected.compare(received->getString()) != 0;
 }
 
+#if 0
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedObjectFile
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -111,7 +113,6 @@ CacheObjectResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder
         // and destroys it upon compilation completion. We must instantiate a clean structural
         // stub declaration module wrapper to safely satisfy the pipeline driver's state expectations.
         kernel->setModule(f->second);
-        kernel->setCompilationStatus(kernel::Kernel::CompilationStatus::UnownedModule);
         return CacheObjectResult::COMPILED;
     }
 
@@ -190,6 +191,8 @@ invalid:
     return CacheObjectResult::UNCACHED;
 }
 
+#endif
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief markModuleAsCacheable
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -211,12 +214,12 @@ void ParabixObjectCache::markModuleAsCacheable(kernel::Kernel * const kernel, Mo
  ** ------------------------------------------------------------------------------------------------------------- */
 void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef Obj) {
 
-    if (M->getNamedMetadata(CACHEABLE) == nullptr) return;
-
     auto moduleId = M->getModuleIdentifier();
 
     // Store back into the memory buffer cache system
     mCachedObject[moduleId] = Obj;
+
+    if (M->getNamedMetadata(CACHEABLE) == nullptr) return;
 
     Path objectName(mCachePath);
     sys::path::append(objectName, CACHE_PREFIX);
@@ -289,11 +292,72 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
  * @brief getObject
  ** ------------------------------------------------------------------------------------------------------------- */
 std::unique_ptr<MemoryBuffer> ParabixObjectCache::getObject(const Module * module) {
-    auto f = mCachedObject.find(module->getModuleIdentifier());
+
+    auto moduleId = module->getModuleIdentifier();
+
+    auto f = mCachedObject.find(moduleId);
     if (f != mCachedObject.end()) {
         auto ref = f->second;
         return MemoryBuffer::getMemBuffer(ref.getBuffer(), ref.getBufferIdentifier(), false);
     }
+    if (module->getNamedMetadata(CACHEABLE) == nullptr) return nullptr;
+
+    Path objectName(mCachePath);
+    sys::path::append(objectName, CACHE_PREFIX);
+    objectName.append(moduleId);
+    objectName.append(KERNEL_FILE_EXTENSION);
+    auto kernelBuffer = MemoryBuffer::getFile(objectName, false, false, false);
+    if (kernelBuffer) {
+        auto loadedFile = getOwningLazyBitcodeModule(std::move(kernelBuffer.get()), module->getContext());
+        if (LLVM_LIKELY(loadedFile)) {
+            std::unique_ptr<Module> M(std::move(loadedFile.get()));
+
+            const MDString * const srcSig = kernel::Kernel::readSignatureFromModule(module);
+
+            assert ("object cache file returned null module?" && M.get());
+
+            const MDString * const fileSig = kernel::Kernel::readSignatureFromModule(M.get());
+
+            if (srcSig && fileSig) {
+
+                const auto & A = srcSig->getString();
+                const auto & B = fileSig->getString();
+
+                if (LLVM_UNLIKELY(!A.equals(B))) {
+                    if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+                        errs() << "Mismatched signature in cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n"
+                                  "Expected: " << A << "\n"
+                                  "Loaded:   " << B<< "\n";
+                    }
+                    return nullptr;
+                }
+            } else if (LLVM_UNLIKELY(srcSig || fileSig)) {
+                return nullptr;
+            }
+
+            sys::path::replace_extension(objectName, OBJECT_FILE_EXTENSION);
+            auto objectBuffer = MemoryBuffer::getFile(objectName.c_str(), false, false, false);
+            if (LLVM_LIKELY(!!objectBuffer)) {
+                Module * const m = M.release();
+                assert ("object cache file returned null module?" && m);
+                // defaults to <path>/<moduleId>.kernel
+
+                std::unique_ptr<MemoryBuffer> obj(std::move(objectBuffer.get()));
+                mCachedObject[moduleId] = *obj;
+
+                // update the modified time of the .o and .kernel files
+                const auto access_time = currentTime();
+                fs::last_write_time(objectName.c_str(), access_time);
+                sys::path::replace_extension(objectName, KERNEL_FILE_EXTENSION);
+                fs::last_write_time(objectName.c_str(), access_time);
+
+                return obj;
+            }
+        } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            errs() << "Failed to load cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
+        }
+    }
+
     return nullptr;
 }
 
@@ -448,7 +512,8 @@ inline void ParabixObjectCache::saveCacheSettings() noexcept {
 
 }
 
-ParabixObjectCache::ParabixObjectCache() {
+ParabixObjectCache::ParabixObjectCache(BaseDriver & driver)
+: mDriver(driver) {
     loadCacheSettings();
     initiateCacheCleanUp();
 }

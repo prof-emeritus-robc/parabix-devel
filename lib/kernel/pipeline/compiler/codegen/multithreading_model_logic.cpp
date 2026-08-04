@@ -156,7 +156,8 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
 
     Value * const cThreadState = b.CreateGEP(threadStructTy, threadStateArray, threadIndex);
     Value * cThreadLocal = nullptr;
-    if (LLVM_LIKELY(mTarget->hasThreadLocal())) {
+    const auto flags = mTarget->getInternalStateTypeFlags();
+    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
         SmallVector<Value *, 2> args;
         if (initialSharedState) {
             args.push_back(initialSharedState);
@@ -166,7 +167,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         if (LLVM_LIKELY(mTarget->allocatesInternalStreamSets())) {
             Function * const allocInternal = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, false);
             SmallVector<Value *, 3> allocArgs;
-            if (LLVM_LIKELY(mTarget->isStateful())) {
+            if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
                 allocArgs.push_back(initialSharedState);
             }
             allocArgs.push_back(cThreadLocal);
@@ -283,7 +284,6 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
             Value * const threadStruct = &*args++;
             assert (threadStruct->getType() == threadStructPtrTy);
             readThreadStructObject(b, threadStructTy, threadStruct);
-            assert (isFromCurrentFunction(b, getHandle(), !mTarget->isStateful()));
             readDoSegmentState(b, threadStructTy, threadStruct);
             initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
             mSegNo = &*args++;
@@ -361,8 +361,6 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         b.SetInsertPoint(BasicBlock::Create(m->getContext(), "entry", threadFunc));
         Value * const threadStruct = arg;
         readThreadStructObject(b, threadStructTy, threadStruct);
-        assert (isFromCurrentFunction(b, getHandle(), !mTarget->isStateful()));
-        assert (isFromCurrentFunction(b, getThreadLocalHandle(), !mTarget->hasThreadLocal()));
         initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
 
         #ifdef ENABLE_PAPI
@@ -722,8 +720,6 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
             }
 
             b.SetInsertPoint(pipelineEnd);
-            assert (isFromCurrentFunction(b, getHandle(), !mTarget->isStateful()));
-            assert (isFromCurrentFunction(b, getThreadLocalHandle(), !mTarget->hasThreadLocal()));
             Value * done = b.CreateIsNotNull(terminated);
             if (allPhasesDone) {
                 assert (numOfPhases > 2);
@@ -894,12 +890,12 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
     }
 
     Value * const jThreadState = b.CreateGEP(threadStructTy, threadStateArray, joinThreadIndex);
-    if (LLVM_LIKELY(mTarget->hasThreadLocal())) {
+    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
         fieldIndex[1] = b.getInt32(THREAD_LOCAL_PARAM);
         Type * const handlePtrTy = getThreadLocalHandle()->getType();
         Value * const jThreadLocal = b.CreateAlignedLoad(handlePtrTy, b.CreateGEP(threadStructTy, threadStateArray, fieldIndex), PtrTyABIAlignment);
         SmallVector<Value *, 3> threadLocalArgs;
-        if (LLVM_LIKELY(mTarget->isStateful())) {
+        if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
             threadLocalArgs.push_back(initialSharedState);
         }
         threadLocalArgs.push_back(initialThreadLocal);
@@ -1010,18 +1006,18 @@ StructType * PipelineCompiler::getThreadStuctType(KernelBuilder & b, const std::
     size_t currentOffset = 0;
     auto & dl = b.getModule()->getDataLayout();
 
-    if (LLVM_LIKELY(mTarget->isStateful())) {
-        fields[SHARED_STATE_PARAM] = getHandle()->getType();
+    const auto flags = mTarget->getInternalStateTypeFlags();
+
+    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+        fields[SHARED_STATE_PARAM] = PointerType::getUnqual(C);
         currentOffset +=  b.getTypeSize(dl, fields[SHARED_STATE_PARAM]);
-        assert (fields[SHARED_STATE_PARAM]->isPointerTy());
     } else {
         fields[SHARED_STATE_PARAM] = emptyTy;
     }
 
-    if (LLVM_LIKELY(mTarget->hasThreadLocal())) {
-        fields[THREAD_LOCAL_PARAM] = getThreadLocalHandle()->getType();
+    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
+        fields[THREAD_LOCAL_PARAM] = PointerType::getUnqual(C);
         currentOffset +=  b.getTypeSize(dl, fields[THREAD_LOCAL_PARAM]);
-        assert (fields[THREAD_LOCAL_PARAM]->isPointerTy());
     } else {
         fields[THREAD_LOCAL_PARAM] = emptyTy;
     }
@@ -1092,12 +1088,15 @@ void PipelineCompiler::writeThreadStructObject(KernelBuilder & b,
 
     FixedArray<Value *, 2> indices2;
     indices2[0] = b.getInt32(0);
-    if (LLVM_LIKELY(mTarget->isStateful())) {
+
+    const auto flags = mTarget->getInternalStateTypeFlags();
+
+    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
         indices2[1] = b.getInt32(SHARED_STATE_PARAM);
         assert (threadStateTy->getStructElementType(SHARED_STATE_PARAM) == shared->getType());
         b.CreateAlignedStore(shared, b.CreateInBoundsGEP(threadStateTy, threadState, indices2), PtrTyABIAlignment);
     }
-    if (LLVM_LIKELY(mTarget->hasThreadLocal())) {
+    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
         indices2[1] = b.getInt32(THREAD_LOCAL_PARAM);
         assert (threadStateTy->getStructElementType(THREAD_LOCAL_PARAM) == threadLocal->getType());
         b.CreateAlignedStore(threadLocal, b.CreateInBoundsGEP(threadStateTy, threadState, indices2), PtrTyABIAlignment);
@@ -1143,12 +1142,13 @@ void PipelineCompiler::readThreadStructObject(KernelBuilder & b, StructType * co
     IntegerType * const sizeTy = b.getSizeTy();
     FixedArray<Value *, 2> indices2;
     indices2[0] = i32_ZERO;
-    if (mTarget->isStateful()) {
+    const auto flags = mTarget->getInternalStateTypeFlags();
+    if (flags & Kernel::KernelIsStateful) {
         indices2[1] = b.getInt32(SHARED_STATE_PARAM);
         Type * ty = PointerType::getUnqual(b.getContext());
         setHandle(b.CreateAlignedLoad(ty, b.CreateInBoundsGEP(threadStateTy, threadState, indices2), PtrTyABIAlignment));
     }
-    if (mTarget->hasThreadLocal()) {
+    if (flags & Kernel::KernelHasThreadLocal) {
         indices2[1] = b.getInt32(THREAD_LOCAL_PARAM);
         Type * ty = PointerType::getUnqual(b.getContext());
         setThreadLocalHandle(b.CreateAlignedLoad(ty, b.CreateInBoundsGEP(threadStateTy, threadState, indices2), PtrTyABIAlignment));

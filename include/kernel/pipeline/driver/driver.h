@@ -4,6 +4,7 @@
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
 #include <llvm/ExecutionEngine/Orc/SymbolStringPool.h>
+#include <llvm/ADT/StringSet.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/relationship.h>
 #include <util/slab_allocator.h>
@@ -73,6 +74,10 @@ public:
         return mTarget;
     }
 
+    const std::unique_ptr<kernel::KernelBuilder> & getMainBuilder() const {
+        return mBuilder;
+    }
+
 protected:
 
     kernel::StreamSet * CreateStreamSet(const unsigned NumElements = 1, const unsigned FieldWidth = 1) noexcept;
@@ -114,6 +119,8 @@ protected:
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;
 
     llvm::TargetMachine *                                   mTarget;
+
+    llvm::StringSet<>                                       mCompiledIdentifiers;
 
     bool                                                    mPreservesKernels = false;
     KernelSet                                               mUncachedKernel;

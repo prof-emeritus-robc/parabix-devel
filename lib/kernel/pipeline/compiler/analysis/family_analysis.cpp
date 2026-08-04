@@ -38,13 +38,14 @@ void PipelineAnalysis::scanFamilyKernelBindings(KernelBuilder & b) {
                 if (ref.isFamilyCall() || m > 0) {
                     if (ref.isFamilyCall()) {
 
-                        obj->ensureLoaded(b);
+                        #warning store state types in graph and check existance here?
+                        const auto stateTypeFlags = obj->getInternalStateTypeFlags();
 
                         unsigned flags = 0;
-                        if (LLVM_LIKELY(obj->isStateful())) {
+                        if (LLVM_LIKELY(stateTypeFlags & Kernel::KernelIsStateful)) {
                             flags |= FamilyScalarData::CaptureSharedStateObject;
                         }
-                        if (obj->hasThreadLocal()) {
+                        if (stateTypeFlags & Kernel::KernelHasThreadLocal) {
                             flags |= FamilyScalarData::CaptureThreadLocal;
                         }
                         if (obj->allocatesInternalStreamSets()) {
@@ -101,14 +102,14 @@ void PipelineAnalysis::scanFamilyKernelBindings(KernelBuilder & b) {
                 END_SCOPED_REGION
 found_kernel_in_graph:
                 if (ref.isFamilyCall()) {
-
-                   // obj->ensureLoaded(b);
+                    #warning store state types in graph and check existance here?
+                    const auto stateTypeFlags = obj->getInternalStateTypeFlags();
 
                     unsigned flags = FamilyScalarData::CaptureStoreInKernelState;
-                    if (LLVM_LIKELY(obj->isStateful())) {
+                    if (LLVM_LIKELY(stateTypeFlags & Kernel::KernelIsStateful)) {
                         flags |= FamilyScalarData::CaptureSharedStateObject;
                     }
-                    if (obj->hasThreadLocal()) {
+                    if (stateTypeFlags & Kernel::KernelHasThreadLocal) {
                         flags |= FamilyScalarData::CaptureThreadLocal;
                     }
                     if (obj->allocatesInternalStreamSets()) {

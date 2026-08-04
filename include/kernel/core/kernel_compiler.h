@@ -417,6 +417,9 @@ protected:
     const Bindings &                mOutputScalars;
     const InternalScalars &         mInternalScalars;
 
+    llvm::StructType *              mSharedStateType = nullptr;
+    llvm::StructType *              mThreadLocalStateType = nullptr;
+
     llvm::Function *                mCurrentMethod = nullptr;
 
     llvm::BasicBlock *              mEntryPoint = nullptr;

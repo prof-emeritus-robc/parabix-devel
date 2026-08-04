@@ -82,10 +82,9 @@ public:
     enum KernelFlags {
         KernelIsStateful = 1
         , KernelHasThreadLocal = 2
-
+        , HasInternallyManagedStreamSet = 4
         , RequiresIllustratorObject = 8
-        , HasInternallyManagedStreamSet = 16
-        , HasInOutStreamSet = 32
+        , HasInOutStreamSet = 16
     };
 
     using InitArgs = llvm::SmallVector<llvm::Value *, 32>;
@@ -279,15 +278,15 @@ public:
         return getName();
     }
 
-    LLVM_READNONE bool isStateful() const {
-        assert (mCompilationStatus >= CompilationStatus::StateConstructed);
-        return (mFlags & KernelIsStateful) != 0;
-    }
+//    LLVM_READNONE bool isStateful() const {
+//        assert (mCompilationStatus >= CompilationStatus::StateConstructed);
+//        return (mFlags & KernelIsStateful) != 0;
+//    }
 
-    LLVM_READNONE bool hasThreadLocal() const {
-        assert (mCompilationStatus >= CompilationStatus::StateConstructed);
-        return (mFlags & KernelHasThreadLocal) != 0;
-    }
+//    LLVM_READNONE bool hasThreadLocal() const {
+//        assert (mCompilationStatus >= CompilationStatus::StateConstructed);
+//        return (mFlags & KernelHasThreadLocal) != 0;
+//    }
 
     LLVM_READNONE bool allocatesInternalStreamSets() const {
         return (mFlags & Kernel::KernelFlags::HasInternallyManagedStreamSet) != 0;
@@ -427,17 +426,17 @@ public:
         return (mModule != nullptr);
     }
 
-    CompilationStatus getCompilationStatus() const {
-        return mCompilationStatus;
-    }
+//    CompilationStatus getCompilationStatus() const {
+//        return mCompilationStatus;
+//    }
 
-    void setCompilationStatus(const CompilationStatus status) {
-        mCompilationStatus = status;
-    }
+//    void setCompilationStatus(const CompilationStatus status) {
+//        mCompilationStatus = status;
+//    }
 
     std::string makeCacheName(KernelBuilder & b);
 
-    void makeModule(KernelBuilder & b);
+    void makeTemporaryModule(KernelBuilder & b);
 
     void ensureLoaded(KernelBuilder & b);
 
@@ -475,7 +474,11 @@ public:
 
     LLVM_READNONE bool canSetTerminateSignal() const;
 
-    virtual void addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody);
+    void addKernelDeclarations(KernelBuilder & b) {
+        addKernelDeclarations(b, getInternalStateTypeFlags());
+    }
+
+    virtual void addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags);
 
     virtual std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b);
 
@@ -491,43 +494,49 @@ public:
 
     bool noMutableSharedScalars() const;
 
-public:
+    unsigned getInternalStateTypeFlags() const;
 
-    llvm::Function * getInitializeFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+protected:
 
-    llvm::Function * addInitializeDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    struct StateTypes {
+        llvm::StructType * const Shared;
+        llvm::StructType * const ThreadLocal;
+        StateTypes(llvm::StructType * shared, llvm::StructType * threadLocal) : Shared(shared), ThreadLocal(threadLocal) {}
+    };
 
-    llvm::Function * getExpectedOutputSizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getInitializeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
 
-    llvm::Function * addExpectedOutputSizeDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    llvm::Function * addInitializeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getExpectedOutputSizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
 
-    llvm::Function * addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    llvm::Function * addExpectedOutputSizeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getInitializeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
 
-    llvm::Function * addInitializeThreadLocalDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    llvm::Function * addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getInitializeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
 
-    llvm::Function * addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    llvm::Function * addInitializeThreadLocalDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * addDoSegmentDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    llvm::Function * getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
 
-    std::vector<llvm::Type *> getDoSegmentFields(KernelBuilder & b) const;
+    llvm::Function * addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getDoSegmentFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+    std::vector<llvm::Type *> getDoSegmentFields(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getFinalizeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getDoSegmentFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
 
-    llvm::Function * addFinalizeThreadLocalDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    llvm::Function * addDoSegmentDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getFinalizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getFinalizeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
 
-    llvm::Function * addFinalizeDeclaration(KernelBuilder & b, const bool addStubFunctionBody) const;
+    llvm::Function * addFinalizeThreadLocalDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    void addSymbols(llvm::orc::MangleAndInterner &mangler, llvm::orc::SymbolFlagsMap & symbols, llvm::orc::SymbolLookupSet & lookupSet) const;
+    llvm::Function * getFinalizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+
+    llvm::Function * addFinalizeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
     enum class OptimizationPass {
         DCEPass,
@@ -593,12 +602,6 @@ protected:
 
     virtual void addAdditionalFunctions(KernelBuilder &) { }
 
-    struct StateTypes {
-        llvm::StructType * const Shared;
-        llvm::StructType * const ThreadLocal;
-        StateTypes(llvm::StructType * shared, llvm::StructType * threadLocal) : Shared(shared), ThreadLocal(threadLocal) {}
-    };
-
     StateTypes constructStateTypes(KernelBuilder & b) const;
 
     void generateOrLoadKernel(KernelBuilder & b);
@@ -622,6 +625,8 @@ protected:
     void setKernelFlags(unsigned flags) { mFlags = flags; };
 
 public:
+
+    void addSymbols(llvm::orc::MangleAndInterner &mangler, llvm::orc::SymbolFlagsMap & symbols, llvm::orc::SymbolLookupSet & lookupSet) const;
 
     static const llvm::MDString * readSignatureFromModule(const llvm::Module * const M);
 

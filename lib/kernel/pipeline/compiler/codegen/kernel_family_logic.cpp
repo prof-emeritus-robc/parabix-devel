@@ -11,24 +11,25 @@ void PipelineCompiler::addFamilyKernelProperties(KernelBuilder & b,
     if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
 
         auto & C = b.getContext();
-        PointerType * const voidPtrTy = PointerType::getUnqual(C);
+        PointerType * const ptrTy = PointerType::getUnqual(C);
         const auto prefix = makeKernelName(kernelId);
-        const auto tl = mKernel->hasThreadLocal();
+        const auto flags = mKernel->getInternalStateTypeFlags();
+        const auto tl = (flags & Kernel::KernelHasThreadLocal) != 0;
         const auto ai = mKernel->allocatesInternalStreamSets();
         if (ai) {
-            mTarget->addInternalScalar(voidPtrTy, prefix + ALLOCATE_SHARED_INTERNAL_STREAMSETS_FUNCTION_POINTER_SUFFIX, groupId);
+            mTarget->addInternalScalar(ptrTy, prefix + ALLOCATE_SHARED_INTERNAL_STREAMSETS_FUNCTION_POINTER_SUFFIX, groupId);
         }
         if (tl) {
-            mTarget->addInternalScalar(voidPtrTy, prefix + INITIALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX, groupId);
+            mTarget->addInternalScalar(ptrTy, prefix + INITIALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX, groupId);
             if (ai) {
-                mTarget->addInternalScalar(voidPtrTy, prefix + ALLOCATE_THREAD_LOCAL_INTERNAL_STREAMSETS_FUNCTION_POINTER_SUFFIX, groupId);
+                mTarget->addInternalScalar(ptrTy, prefix + ALLOCATE_THREAD_LOCAL_INTERNAL_STREAMSETS_FUNCTION_POINTER_SUFFIX, groupId);
             }
         }
-        mTarget->addInternalScalar(voidPtrTy, prefix + DO_SEGMENT_FUNCTION_POINTER_SUFFIX, groupId);
+        mTarget->addInternalScalar(ptrTy, prefix + DO_SEGMENT_FUNCTION_POINTER_SUFFIX, groupId);
         if (tl) {
-            mTarget->addInternalScalar(voidPtrTy, prefix + FINALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX, groupId);
+            mTarget->addInternalScalar(ptrTy, prefix + FINALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX, groupId);
         }
-        mTarget->addInternalScalar(voidPtrTy, prefix + FINALIZE_FUNCTION_POINTER_SUFFIX, groupId);
+        mTarget->addInternalScalar(ptrTy, prefix + FINALIZE_FUNCTION_POINTER_SUFFIX, groupId);
     }
 }
 
@@ -155,7 +156,8 @@ void PipelineCompiler::addFamilyCallInitializationArguments(KernelBuilder & b, c
  * @brief getInitializationFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelInitializeFunction(KernelBuilder & b, const ArgVec & args) const {
-    Function * const init = mKernel->getInitializeFunction(b);
+    const auto flags = mKernel->getInternalStateTypeFlags();
+    Function * const init = mKernel->getInitializeFunction(b, flags);
     assert (init->getFunctionType()->getNumParams() == args.size());
     return b.CreateCall(init->getFunctionType(), init, args);
 }
@@ -164,7 +166,8 @@ Value * PipelineCompiler::callKernelInitializeFunction(KernelBuilder & b, const 
  * @brief getInitializationThreadLocalFunction
  ** ------------------------------------------------------------------------------------------------------------- */
  void PipelineCompiler::callKernelInitializeThreadLocalFunction(KernelBuilder & b) const {
-    Function * const init = mKernel->getInitializeThreadLocalFunction(b);
+    const auto flags = mKernel->getInternalStateTypeFlags();
+    Function * const init = mKernel->getInitializeThreadLocalFunction(b, flags);
     Value * func = init;
     if (isKernelFamilyCall(mKernelId)) {
         func = getFamilyFunctionFromKernelState(b, init->getType(), INITIALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX);
@@ -203,7 +206,8 @@ Value * PipelineCompiler::callKernelInitializeFunction(KernelBuilder & b, const 
  * @brief getKernelAllocateSharedInternalStreamSetsFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 std::pair<Value *, FunctionType *> PipelineCompiler::getKernelAllocateSharedInternalStreamSetsFunction(KernelBuilder & b) const {
-    Function * const term = mKernel->getAllocateSharedInternalStreamSetsFunction(b, false);
+    const auto flags = mKernel->getInternalStateTypeFlags();
+    Function * const term = mKernel->getAllocateSharedInternalStreamSetsFunction(b, flags, false);
     FunctionType * funcTy = term->getFunctionType();
     Value * func = term;
     if (isKernelFamilyCall(mKernelId)) {
@@ -229,7 +233,8 @@ std::pair<Value *, FunctionType *> PipelineCompiler::getKernelAllocateThreadLoca
  * @brief getDoSegmentFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 std::pair<Value *, FunctionType *> PipelineCompiler::getKernelDoSegmentFunction(KernelBuilder & b) const {
-    Function * const doSegment = mKernel->getDoSegmentFunction(b);
+    const auto flags = mKernel->getInternalStateTypeFlags();
+    Function * const doSegment = mKernel->getDoSegmentFunction(b, flags);
     FunctionType * const funcTy = doSegment->getFunctionType();
     Value * funcPtr = doSegment;
     if (isKernelFamilyCall(mKernelId)) {
@@ -243,7 +248,8 @@ std::pair<Value *, FunctionType *> PipelineCompiler::getKernelDoSegmentFunction(
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelExpectedSourceOutputSizeFunction(KernelBuilder & b, ArrayRef<Value *> args) const {
     // TODO: need to make this support a family function call
-    Function * const func = mKernel->getExpectedOutputSizeFunction(b);
+    const auto flags = mKernel->getInternalStateTypeFlags();
+    Function * const func = mKernel->getExpectedOutputSizeFunction(b, flags);
     assert (func->getFunctionType()->getNumParams() == args.size());
     return b.CreateCall(func->getFunctionType(), func, args);
 }
@@ -252,7 +258,8 @@ Value * PipelineCompiler::callKernelExpectedSourceOutputSizeFunction(KernelBuild
  * @brief getInitializationThreadLocalFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelFinalizeThreadLocalFunction(KernelBuilder & b, const SmallVector<Value *, 2> & args) const {
-    Function * const finalize = mKernel->getFinalizeThreadLocalFunction(b);
+    const auto flags = mKernel->getInternalStateTypeFlags();
+    Function * const finalize = mKernel->getFinalizeThreadLocalFunction(b, flags);
     Value * func = finalize;
     if (isKernelFamilyCall(mKernelId)) {
         func = getFamilyFunctionFromKernelState(b, finalize->getType(), FINALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX);
@@ -264,7 +271,8 @@ Value * PipelineCompiler::callKernelFinalizeThreadLocalFunction(KernelBuilder & 
  * @brief getFinalizeFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelFinalizeFunction(KernelBuilder & b, const SmallVector<Value *, 1> & args) const {
-    Function * const term = mKernel->getFinalizeFunction(b);
+    const auto flags = mKernel->getInternalStateTypeFlags();
+    Function * const term = mKernel->getFinalizeFunction(b, flags);
     Value * func = term;
     if (isKernelFamilyCall(mKernelId)) {
         func = getFamilyFunctionFromKernelState(b, term->getType(), FINALIZE_FUNCTION_POINTER_SUFFIX);

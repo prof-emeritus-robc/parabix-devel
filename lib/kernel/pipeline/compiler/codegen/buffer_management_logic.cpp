@@ -163,7 +163,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
         const Kernel * const kernelObj = getKernel(i);
 
         if (LLVM_UNLIKELY(kernelObj->allocatesInternalStreamSets())) {
-            if (nonLocal || kernelObj->hasThreadLocal()) {
+            if (nonLocal || mKernelThreadLocalHandle) {
                 setActiveKernel(b, i, !nonLocal);
                 assert (mKernel == kernelObj);
                 SmallVector<Value *, 5> params;

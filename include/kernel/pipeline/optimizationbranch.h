@@ -50,7 +50,7 @@ protected:
                        Bindings && scalar_inputs,
                        Bindings && scalar_outputs);
 
-    void addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody) override;
+    void addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) override;
 
     void addInternalProperties(KernelBuilder & b) override;
 

@@ -87,7 +87,7 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
     const auto pageSize = getPageSize();
     assert (is_pow2(pageSize));
     memorySize = b.CreateShl(memorySize, b.getSize(floor_log2(pageSize)));
-    assert (mTarget->hasThreadLocal());
+
     Value * const base = b.CreateAlignedMalloc(memorySize, pageSize);
     b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY, base);
     b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY_BYTES, memorySize);

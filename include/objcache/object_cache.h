@@ -13,6 +13,7 @@
 #include <boost/container/flat_map.hpp>
 #include <util/not_null.h>
 #include <kernel/core/kernel.h>
+#include <kernel/pipeline/driver/driver.h>
 #include <string>
 
 namespace llvm { 
@@ -42,8 +43,7 @@ class ParabixObjectCache final : public llvm::ObjectCache {
     using Map = boost::container::flat_map<K, V>;
     template <typename K>
     using Set = boost::container::flat_set<K>;
-    using KnownSignatures = Map<std::string, llvm::Module *>;
-    using ModuleCache = Map<std::string, llvm::MemoryBufferRef>;
+    using ObjectBufferCache = llvm::StringMap<llvm::MemoryBufferRef>;
     using Instance = std::unique_ptr<ParabixObjectCache>;
 public:
 
@@ -51,7 +51,7 @@ public:
 
     using Path = llvm::SmallString<128>;
 
-    CacheObjectResult loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * const kernel) noexcept;
+//    CacheObjectResult loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * const kernel) noexcept;
 
     void notifyObjectCompiled(const llvm::Module * M, llvm::MemoryBufferRef Obj) override;
 
@@ -63,7 +63,7 @@ public:
 
 protected:
 
-    ParabixObjectCache();
+    ParabixObjectCache(BaseDriver & driver);
     void loadCacheSettings() noexcept;
     void saveCacheSettings() noexcept;
 
@@ -72,8 +72,8 @@ private:
     bool requiresCacheCleanUp() noexcept;
 private:
     static bool         mStartedCacheCleanupDaemon;
-    KnownSignatures     mKnownSignatures;
-    ModuleCache         mCachedObject;
+    BaseDriver &        mDriver;
+    ObjectBufferCache   mCachedObject;
     Path                mCachePath;
 };
 

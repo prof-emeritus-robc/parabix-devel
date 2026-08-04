@@ -16,10 +16,10 @@ std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(Ke
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, const bool addStubFunctionBody) {
-    mAllZeroKernel->addKernelDeclarations(b, false);
-    mNonZeroKernel->addKernelDeclarations(b, false);
-    Kernel::addKernelDeclarations(b, addStubFunctionBody);
+void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) {
+    mAllZeroKernel->addKernelDeclarations(b);
+    mNonZeroKernel->addKernelDeclarations(b);
+    Kernel::addKernelDeclarations(b, kernelStateFlags);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

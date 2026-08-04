@@ -306,6 +306,8 @@ void OptimizationBranchCompiler::addBranchProperties(KernelBuilder & b) {
 
     IntegerType * const sizeTy = b.getSizeTy();
 
+    Type * ptrType = PointerType::getUnqual(b.getContext());
+
     mTarget->addInternalScalar(sizeTy, EXTERNAL_SEGMENT_NUMBER, 0);
 
     mTarget->addInternalScalar(sizeTy, ALL_ZERO_PATH_TAKEN_COUNT, 0);
@@ -316,15 +318,13 @@ void OptimizationBranchCompiler::addBranchProperties(KernelBuilder & b) {
 
     for (unsigned i = ALL_ZERO_BRANCH; i <= NON_ZERO_BRANCH; ++i) {
         const Kernel * const kernel = mBranches[i]; assert (kernel);
-
-        if (LLVM_LIKELY(kernel->isStateful())) {
-            Type * handlePtrType = PointerType::getUnqual(b.getContext());
-            mTarget->addInternalScalar(handlePtrType, SHARED_PREFIX + std::to_string(i), i + 2);
+        const auto flags = kernel->getInternalStateTypeFlags();
+        if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+            mTarget->addInternalScalar(ptrType, SHARED_PREFIX + std::to_string(i), i + 2);
         }
 
-        if (kernel->hasThreadLocal()) {
-            Type * handlePtrType = PointerType::getUnqual(b.getContext());
-            mTarget->addThreadLocalScalar(handlePtrType, THREAD_LOCAL_PREFIX + std::to_string(i));
+        if (flags & Kernel::KernelHasThreadLocal) {
+            mTarget->addThreadLocalScalar(ptrType, THREAD_LOCAL_PREFIX + std::to_string(i));
         }
     }
 }
@@ -371,7 +371,8 @@ void OptimizationBranchCompiler::generateInitializeMethod(KernelBuilder & b) {
     for (unsigned i = ALL_ZERO_BRANCH; i <= NON_ZERO_BRANCH; ++i) {
         const Kernel * const kernel = mBranches[i];
         if (LLVM_UNLIKELY(kernel == nullptr)) continue;
-        const bool hasSharedState = kernel->isStateful();
+        const auto flags = kernel->getInternalStateTypeFlags();
+        const bool hasSharedState = (flags & Kernel::KernelIsStateful) != 0;
         const auto firstArgIndex = hasSharedState ? 1U : 0U;
         args.resize(firstArgIndex + in_degree(i, mScalarGraph));
         if (LLVM_LIKELY(hasSharedState)) {
@@ -389,7 +390,7 @@ void OptimizationBranchCompiler::generateInitializeMethod(KernelBuilder & b) {
             const auto j = ref.Index + firstArgIndex;
             args[j] = getInputScalar(b, source(e, mScalarGraph));
         }
-        Function * initFn = kernel->getInitializeFunction(b);
+        Function * initFn = kernel->getInitializeFunction(b, flags);
         FunctionType * fTy = initFn->getFunctionType();
         assert (fTy->getNumParams() == args.size());
         Value * const terminatedOnInit = b.CreateCall(fTy, initFn, args);
@@ -424,8 +425,8 @@ void OptimizationBranchCompiler::generateAllocateSharedInternalStreamSetsMethod(
 void OptimizationBranchCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
     for (unsigned i = ALL_ZERO_BRANCH; i <= NON_ZERO_BRANCH; ++i) {
         const Kernel * const kernel = mBranches[i]; assert (kernel);
-        if (kernel->hasThreadLocal()) {
-
+        const auto flags = kernel->getInternalStateTypeFlags();
+        if (flags & Kernel::KernelHasThreadLocal) {
             SmallVector<Value *, 2> args;
             Value * const shared = loadSharedHandle(b, i);
             if (shared) {
@@ -450,8 +451,9 @@ void OptimizationBranchCompiler::generateAllocateThreadLocalInternalStreamSetsMe
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * OptimizationBranchCompiler::loadSharedHandle(KernelBuilder & b, const unsigned branchType) const {
     const Kernel * const kernel = mBranches[branchType]; assert (kernel);
+    const auto flags = kernel->getInternalStateTypeFlags();
     Value * handle = nullptr;
-    if (LLVM_LIKELY(kernel->isStateful())) {
+    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
         handle = b.getScalarField(SHARED_PREFIX + std::to_string(branchType));
     }
     return handle;
@@ -462,8 +464,9 @@ Value * OptimizationBranchCompiler::loadSharedHandle(KernelBuilder & b, const un
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * OptimizationBranchCompiler::loadThreadLocalHandle(KernelBuilder & b, const unsigned branchType) const {
     const Kernel * const kernel = mBranches[branchType]; assert (kernel);
+    const auto flags = kernel->getInternalStateTypeFlags();
     Value * handle = nullptr;
-    if (LLVM_LIKELY(kernel->hasThreadLocal())) {
+    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
         handle = b.getScalarField(THREAD_LOCAL_PREFIX + std::to_string(branchType));
     }
     return handle;
@@ -749,9 +752,10 @@ inline Value * OptimizationBranchCompiler::getInputScalar(KernelBuilder & b, con
 void OptimizationBranchCompiler::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
     for (unsigned i = ALL_ZERO_BRANCH; i <= NON_ZERO_BRANCH; ++i) {
         const Kernel * const kernel = mBranches[i];
-        if (kernel->hasThreadLocal()) {
+        const auto flags = kernel->getInternalStateTypeFlags();
+        if (flags & Kernel::KernelHasThreadLocal) {
             SmallVector<Value *, 2> args;
-            if (LLVM_LIKELY(kernel->isStateful())) {
+            if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
                 args.push_back(loadSharedHandle(b, i));
             }
             args.push_back(loadThreadLocalHandle(b, i));
@@ -767,10 +771,11 @@ void OptimizationBranchCompiler::generateFinalizeMethod(KernelBuilder & b) {
     for (unsigned i = ALL_ZERO_BRANCH; i <= NON_ZERO_BRANCH; ++i) {
         const Kernel * const kernel = mBranches[i];
         SmallVector<Value *, 2> args;
-        if (LLVM_LIKELY(kernel->isStateful())) {
+        const auto flags = kernel->getInternalStateTypeFlags();
+        if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
             args.push_back(loadSharedHandle(b, i));
         }
-        if (LLVM_LIKELY(kernel->hasThreadLocal())) {
+        if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
             args.push_back(loadThreadLocalHandle(b, i));
         }
         kernel->finalizeInstance(b, args);
@@ -805,10 +810,11 @@ void OptimizationBranchCompiler::allocateOwnedBranchBuffers(KernelBuilder & b, V
     for (unsigned i = ALL_ZERO_BRANCH; i <= NON_ZERO_BRANCH; ++i) {
         const Kernel * const kernelObj = mBranches[i];
         if (LLVM_UNLIKELY(kernelObj == nullptr)) continue;
+        const auto flags = kernelObj->getInternalStateTypeFlags();
         if (LLVM_UNLIKELY(kernelObj->allocatesInternalStreamSets())) {
-            if (nonLocal || kernelObj->hasThreadLocal()) {
+            if (nonLocal || (flags & Kernel::KernelHasThreadLocal)) {
                 SmallVector<Value *, 3> params;
-                if (LLVM_LIKELY(kernelObj->isStateful())) {
+                if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
                     params.push_back(loadSharedHandle(b, i));
                 }
                 Function * func = nullptr;

@@ -117,27 +117,31 @@ CallInst * IDISA_Builder::CallPrintRegister(StringRef name, Value * const value,
 }
 
 Constant *IDISA_Builder::getSplat(const unsigned fieldCount, Constant *Elt) {
-return ConstantVector::getSplat(ElementCount::get(fieldCount, false), Elt);
+    return ConstantVector::getSplat(ElementCount::get(fieldCount, false), Elt);
 }
 
 Constant * IDISA_Builder::simd_himask(unsigned fw) {
-    return getSplat(mBitBlockWidth/fw, Constant::getIntegerValue(getIntNTy(fw), APInt::getHighBitsSet(fw, fw/2)));
+    return simd_himask(mBitBlockWidth, fw);
 }
 
 Constant * IDISA_Builder::simd_lomask(unsigned fw) {
-    return getSplat(mBitBlockWidth/fw, Constant::getIntegerValue(getIntNTy(fw), APInt::getLowBitsSet(fw, fw/2)));
+    return simd_lomask(mBitBlockWidth, fw);
+}
+
+Constant * IDISA_Builder::simd_himask(unsigned vector_width, unsigned fw) {
+    return getSplat(vector_width/fw, Constant::getIntegerValue(getIntNTy(fw), APInt::getHighBitsSet(fw, fw/2)));
+}
+
+Constant * IDISA_Builder::simd_lomask(unsigned vector_width, unsigned fw) {
+    return getSplat(vector_width/fw, Constant::getIntegerValue(getIntNTy(fw), APInt::getLowBitsSet(fw, fw/2)));
 }
 
 Value * IDISA_Builder::simd_select_hi(unsigned fw, Value * a) {
-    const unsigned vectorWidth = getVectorBitWidth(a);
-    Constant * maskField = Constant::getIntegerValue(getIntNTy(fw), APInt::getHighBitsSet(fw, fw/2));
-    return simd_and(a, getSplat(vectorWidth/fw, maskField));
+    return simd_and(a, simd_himask(getVectorBitWidth(a), fw));
 }
 
 Value * IDISA_Builder::simd_select_lo(unsigned fw, Value * a) {
-    const unsigned vectorWidth = getVectorBitWidth(a);
-    Constant * maskField = Constant::getIntegerValue(getIntNTy(fw), APInt::getLowBitsSet(fw, fw/2));
-    return simd_and(a, getSplat(vectorWidth/fw, maskField));
+    return simd_and(a, simd_lomask(getVectorBitWidth(a), fw));
 }
 
 Constant * IDISA_Builder::getConstantVectorSequence(unsigned fw, unsigned first, unsigned last, unsigned by) {
@@ -183,8 +187,12 @@ Value * IDISA_Builder::CreateDoubleVector(Value * lo, Value * hi) {
 }
 
 Value * IDISA_Builder::simd_fill(unsigned fw, Value * a) {
+    return simd_fill(mBitBlockWidth, fw, a);
+}
+
+Value * IDISA_Builder::simd_fill(unsigned vec_width, unsigned fw, Value * a) {
     if (fw < 8) UnsupportedFieldWidthError(fw, "simd_fill");
-    const unsigned field_count = mBitBlockWidth/fw;
+    const unsigned field_count = vec_width/fw;
     Type * singleFieldVecTy = FixedVectorType::get(getIntNTy(fw), 1);
     Value * aVec = CreateBitCast(CreateZExtOrTrunc(a, getIntNTy(fw)), singleFieldVecTy);
     return CreateShuffleVector(aVec, UndefValue::get(singleFieldVecTy), Constant::getNullValue(FixedVectorType::get(getInt32Ty(), field_count)));
@@ -395,13 +403,14 @@ Value * IDISA_Builder::mvmd_sll(unsigned fw, Value * value, Value * shift, const
 
 Value * IDISA_Builder::mvmd_dsll(unsigned fw, Value * a, Value * b, Value * shift) {
     if (fw < 8) UnsupportedFieldWidthError(fw, "mvmd_dsll");
-    const auto field_count = mBitBlockWidth/fw;
+    unsigned vec_width = getVectorBitWidth(a);
+    const auto field_count = vec_width/fw;
     Type * fwTy = getIntNTy(fw);
     SmallVector<Constant *, 16> Idxs(field_count);
     for (unsigned i = 0; i < field_count; i++) {
         Idxs[i] = ConstantInt::get(fwTy, i + field_count);
     }
-    Value * shuffle_indexes = simd_sub(fw, ConstantVector::get(Idxs), simd_fill(fw, shift));
+    Value * shuffle_indexes = simd_sub(fw, ConstantVector::get(Idxs), simd_fill(vec_width, fw, shift));
     return mvmd_shuffle2(fw, fwCast(fw, b), fwCast(fw, a), shuffle_indexes);
 }
 
@@ -859,61 +868,11 @@ Value * IDISA_Builder::esimd_mergel(unsigned fw, Value * a, Value * b) {
     return CreateShuffleVector(fwCast(fw, a), fwCast(fw, b), ConstantVector::get(Idxs));
 }
 
-Value * IDISA_Builder::esimd_bitspread(unsigned fw, Value * bitmask) {
-    if (LLVM_UNLIKELY(fw < 8)) {
-        UnsupportedFieldWidthError(fw, "esimd_bitspread");
-    }
-    const auto field_count = mBitBlockWidth / fw;
-    IntegerType * field_type = getIntNTy(fw);
-    Value * broadcast = nullptr;
-    Constant * bitSelVec = nullptr;
-    Constant * bitShiftVec = nullptr;
-    if (field_count <= fw) {
-        Value * spread_field = CreateBitCast(CreateZExtOrTrunc(bitmask, field_type), FixedVectorType::get(getIntNTy(fw), 1));
-        Value * undefVec = UndefValue::get(FixedVectorType::get(getIntNTy(fw), 1));
-        broadcast = CreateShuffleVector(spread_field, undefVec, Constant::getNullValue(FixedVectorType::get(getInt32Ty(), field_count)));
-        SmallVector<Constant *, 16> bitSel(field_count);
-        SmallVector<Constant *, 16> bitShift(field_count);
-        for (unsigned i = 0; i < field_count; i++) {
-            bitSel[i] = ConstantInt::get(field_type, 1ULL << i);
-            bitShift[i] = ConstantInt::get(field_type, i);
-        }
-        bitSelVec = ConstantVector::get(bitSel);
-        bitShiftVec = ConstantVector::get(bitShift);
-    } else {
-        assert ((field_count % fw) == 0);
-        const auto m = field_count / fw;
-        IntegerType * const intFieldCountTy = getIntNTy(field_count);
-        VectorType * const intFieldCountVecTy = FixedVectorType::get(field_type, m);
-        Value * spread_field = CreateBitCast(CreateZExtOrTrunc(bitmask, intFieldCountTy), intFieldCountVecTy);
-        SmallVector<Constant *, 16> shuffle(field_count);
-        for (unsigned i = 0; i < m; ++i) {
-            ConstantInt * I = getInt32(i);
-            for (unsigned j = 0; j < fw; ++j) {
-                const auto k = i * fw + j;
-                assert (k < field_count);
-                shuffle[k] = I;
-            }
-        }
-        Constant * shuffleVec = ConstantVector::get(shuffle);
-        Constant * undefVec = UndefValue::get(intFieldCountVecTy);
-        broadcast = CreateShuffleVector(spread_field, undefVec, shuffleVec);
-        SmallVector<Constant *, 16> bitSel(field_count);
-        SmallVector<Constant *, 16> bitShift(field_count);
-        for (unsigned j = 0; j < fw; ++j) {
-            ConstantInt * sel = ConstantInt::get(field_type, 1ULL << j);
-            ConstantInt * shift = ConstantInt::get(field_type, j);
-            for (unsigned i = 0; i < m; ++i) {
-                const auto k = i * fw + j;
-                assert (k < field_count);
-                bitSel[k] = sel;
-                bitShift[k] = shift;
-            }
-        }
-        bitSelVec = ConstantVector::get(bitSel);
-        bitShiftVec = ConstantVector::get(bitShift);
-    }
-    return CreateLShr(CreateAnd(bitSelVec, broadcast), bitShiftVec);
+Value * IDISA_Builder::esimd_bitspread(unsigned vec_width, unsigned fw, Value * bitmask) {
+    const size_t fieldCount = vec_width/fw;
+    Type * maskVecTy = FixedVectorType::get(getInt1Ty(), fieldCount);
+    Type * spreadVecTy = FixedVectorType::get(getIntNTy(fw), fieldCount);
+    return CreateZExt(CreateBitCast(CreateZExtOrTrunc(bitmask, getIntNTy(fieldCount)), maskVecTy), spreadVecTy);
 }
 
 Value * IDISA_Builder::hsimd_packh(unsigned fw, Value * a, Value * b) {
@@ -925,7 +884,7 @@ Value * IDISA_Builder::hsimd_packh(unsigned fw, Value * a, Value * b) {
     }
     Value * aVec = fwCast(fw/2, a);
     Value * bVec = fwCast(fw/2, b);
-    const auto field_count = 2 * mBitBlockWidth / fw;
+    const auto field_count = 2 * getVectorBitWidth(a) / fw;
     SmallVector<Constant *, 16> Idxs(field_count);
     for (unsigned i = 0; i < field_count; i++) {
         Idxs[i] = getInt32(2 * i + 1);
@@ -944,7 +903,7 @@ Value * IDISA_Builder::hsimd_packl(unsigned fw, Value * a, Value * b) {
     }
     Value * aVec = fwCast(fw/2, a);
     Value * bVec = fwCast(fw/2, b);
-    const auto field_count = 2 * mBitBlockWidth / fw;
+    const auto field_count = 2 *  getVectorBitWidth(a) / fw;
     SmallVector<Constant *, 16> Idxs(field_count);
     for (unsigned i = 0; i < field_count; i++) {
         Idxs[i] = getInt32(2 * i);
@@ -953,8 +912,9 @@ Value * IDISA_Builder::hsimd_packl(unsigned fw, Value * a, Value * b) {
 }
 
 Value * IDISA_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
-    Constant * top_bit = Constant::getIntegerValue(getIntNTy(mBitBlockWidth),
-                                                  APInt::getSplat(mBitBlockWidth, APInt::getHighBitsSet(fw/2, 1)));
+    const unsigned vectorWidth = getVectorBitWidth(a);
+    Constant * top_bit = Constant::getIntegerValue(getIntNTy(vectorWidth),
+                                                  APInt::getSplat(vectorWidth, APInt::getHighBitsSet(fw/2, 1)));
     Value * hi = hsimd_packh(fw, a, b);
     Value * lo = hsimd_packl(fw, a, b);
     Value * bits_that_must_match_sign = simd_if(1, top_bit, lo, hi);
@@ -1083,18 +1043,65 @@ Value * IDISA_Builder::mvmd_dslli(unsigned fw, Value * a, Value * b, unsigned sh
     }
 }
 
-
-Value * IDISA_Builder::mvmd_shuffle(unsigned fw, Value * table, Value * index_vector) {
-    if (fw == mBitBlockWidth) {
+//
+//  Generic mvmd_shuffle reduces to byte shuffling at the native SIMD width.
+Value * IDISA_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector) {
+    auto vec_width = getVectorBitWidth(data_table);
+    if (vec_width == fw) {
+        // Special case for a vector with a single field.
         Value * isIndex0 = CreateIsNull(index_vector);
-        return CreateSelect(isIndex0, table, ConstantInt::getNullValue(mBitBlockType));
+        return CreateSelect(isIndex0, data_table, ConstantInt::getNullValue(mBitBlockType));
+    }
+    if (vec_width > mNativeBitBlockWidth) {
+        if (fw >= 16) {
+            Value * t0 = CreateHalfVectorLow(data_table);
+            Value * t1 = CreateHalfVectorHigh(data_table);
+            Value * hi_fields = hsimd_packh(fw, t0, t1);
+            Value * lo_fields = hsimd_packl(fw, t0, t1);
+            Value * ix0 = CreateHalfVectorLow(index_vector);
+            Value * ix1 = CreateHalfVectorHigh(index_vector);
+            Value * packed_ix = hsimd_packl(fw, ix0, ix1);
+            Value * shuf_lo = mvmd_shuffle(fw/2, lo_fields, packed_ix);
+            Value * shuf_hi = mvmd_shuffle(fw/2, hi_fields, packed_ix);
+            Value * merge0 = esimd_mergel(fw/2, shuf_lo, shuf_hi);
+            Value * merge1 = esimd_mergeh(fw/2, shuf_lo, shuf_hi);
+            return fwCast(fw, CreateDoubleVector(merge0, merge1));
+        } else if (fw == 8) {
+            Value * t0 = CreateHalfVectorLow(data_table);
+            Value * t1 = CreateHalfVectorHigh(data_table);
+            Value * ix0 = CreateHalfVectorLow(index_vector);
+            Value * ix1 = CreateHalfVectorHigh(index_vector);
+            Value * shuf0 = mvmd_shuffle2(fw, t0, t1, ix0);
+            Value * shuf1 = mvmd_shuffle2(fw, t0, t1, ix1);
+            return fwCast(fw, CreateDoubleVector(shuf0, shuf1));
+        }
+    }
+    if ((vec_width == mNativeBitBlockWidth) && ((fw == 16) || (fw == 32) || (fw == 64))) {
+        // Create a table for shuffling with smaller field widths.
+        const unsigned fieldCount = vec_width/fw;
+        ConstantInt * multiplier = 0;
+        ConstantInt * addition = 0;
+        if (fw == 64) {
+            multiplier = getInt64(0x0808080808080808ULL);
+            addition =   getInt64(0x0706050403020100ULL);
+        } else if (fw == 32) {
+            multiplier = getInt32(0x04040404);
+            addition =   getInt32(0x03020100);
+        } else if (fw == 16) {
+            multiplier = getInt16(0x0202);
+            addition =   getInt16(0x0100);
+        }
+        Value * A = CreateMul(fwCast(fw, index_vector), getSplat(fieldCount, multiplier));
+        index_vector = CreateOr(A, getSplat(fieldCount, addition));
+        return fwCast(fw, mvmd_shuffle(8, data_table, index_vector));
     }
     UnsupportedFieldWidthError(fw, "mvmd_shuffle");
 }
 
 Value * IDISA_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value * table1, Value * index_vector) {
+    auto vec_width = getVectorBitWidth(table0);
     //  Use two shuffles, with selection by the bit value within the shuffle_table.
-    const auto field_count = mBitBlockWidth/fw;
+    const auto field_count = vec_width/fw;
     Constant * selectorSplat = getSplat(field_count, ConstantInt::get(getIntNTy(fw), field_count));
     Value * selectMask = simd_eq(fw, simd_and(index_vector, selectorSplat), selectorSplat);
     Value * idx = simd_and(index_vector, simd_not(selectorSplat));
@@ -1103,11 +1110,12 @@ Value * IDISA_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value * table1
 
 
 Value * IDISA_Builder::mvmd_compress(unsigned fw, Value * v, Value * select_mask) {
+    unsigned vec_width = getVectorBitWidth(v);
     if (LLVM_UNLIKELY(fw < 8)) {
         UnsupportedFieldWidthError(fw, "mvmd_compress");
     } else {
         IntegerType *  const fieldTy = getIntNTy(fw);
-        const auto fieldCount = mBitBlockWidth / fw;
+        const auto fieldCount = vec_width / fw;
         Type * maskTy = select_mask->getType();
         if (maskTy->isIntegerTy()) {
             if (fieldCount <= fw) {
@@ -1118,7 +1126,7 @@ Value * IDISA_Builder::mvmd_compress(unsigned fw, Value * v, Value * select_mask
                 Constant * seq = ConstantVector::get(elements);
                 select_mask = simd_eq(fw, simd_and(simd_fill(fw, select_mask), seq), seq);
             } else {
-                Value * const spread_mask = esimd_bitspread(fw, select_mask);
+                Value * const spread_mask = esimd_bitspread(vec_width, fw, select_mask);
                 select_mask = simd_any(fw, spread_mask);
             }
         }
@@ -1142,57 +1150,18 @@ Value * IDISA_Builder::mvmd_compress(unsigned fw, Value * v, Value * select_mask
 }
 
 Value * IDISA_Builder::mvmd_expand(unsigned fw, Value * v, Value * select_mask) {
-    if (LLVM_UNLIKELY(fw < 8)) {
-        UnsupportedFieldWidthError(fw, "mvmd_compress");
+    unsigned vec_width = getVectorBitWidth(v);
+    unsigned field_count = vec_width/fw;
+    Type * maskTy = select_mask->getType();
+    if (maskTy->isIntegerTy()) {
+        select_mask = esimd_bitspread(vec_width, fw, select_mask);
     } else {
-
-        IntegerType *  const fieldTy = getIntNTy(fw);
-        const auto fieldCount = mBitBlockWidth / fw;
-        Type * maskTy = select_mask->getType();
-        if (maskTy->isIntegerTy()) {
-            select_mask = esimd_bitspread(fw, select_mask);
-        }
-
-        Constant * oneSplat = getSplat(fieldCount, ConstantInt::get(fieldTy, 1));
-        Value * movements_remaining = hsimd_partial_sum(fw, CreateXor(select_mask, oneSplat));
-        assert (movements_remaining->getType() == oneSplat->getType());
-        Value * result = nullptr;
-
-        Value * pending = v;
-        assert (v->getType() == oneSplat->getType());
-
-        unsigned shiftAmount = fieldCount;
-        while (shiftAmount > 0) {
-
-            shiftAmount /= 2;
-
-            Value * shift_splat = getSplat(fieldCount, ConstantInt::get(fieldTy, shiftAmount));
-            assert (shift_splat->getType() == oneSplat->getType());
-            Value * shift_select = CreateAnd(movements_remaining, shift_splat);
-            assert (shift_select->getType() == oneSplat->getType());
-            Value * shift_mask = simd_eq(fw, shift_select, shift_splat);
-            assert (shift_mask->getType() == oneSplat->getType());
-            Value * shifted = CreateAnd(mvmd_slli(fw, pending, shiftAmount), shift_mask);
-            assert (shifted->getType() == oneSplat->getType());
-            movements_remaining = CreateXor(movements_remaining, shift_select);
-            assert (movements_remaining->getType() == oneSplat->getType());
-            Value * keep_mask = simd_eq(fw, movements_remaining, shift_select);
-            assert (keep_mask->getType() == oneSplat->getType());
-            Value * newVals = CreateAnd(pending, keep_mask);
-            assert (newVals->getType() == oneSplat->getType());
-            if (result) {
-                assert (result->getType() == newVals->getType());
-                result = CreateOr(result, newVals);
-            } else {
-                result = newVals;
-            }
-            Value * A = CreateAnd(pending, CreateNot(shift_mask));
-            assert (A->getType() == oneSplat->getType());
-            pending = CreateOr(A, shifted);
-            assert (pending->getType() == oneSplat->getType());
-        }
-        return CreateAnd(result, simd_any(fw, select_mask));
+        Constant * oneSplat = getSplat(field_count, ConstantInt::get(getIntNTy(fw), 1));
+        select_mask = simd_and(select_mask, oneSplat);
     }
+    Value * prior_counts = mvmd_slli(fw, hsimd_partial_sum(fw, select_mask), 1);
+    Value * spread_data = mvmd_shuffle(fw, v, prior_counts);
+    return CreateAnd(spread_data, simd_any(fw, select_mask));
 }
 
 Value * IDISA_Builder::bitblock_any(Value * a) {

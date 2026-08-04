@@ -105,10 +105,15 @@ public:
     llvm::Constant * simd_himask(unsigned fw);
     llvm::Constant * simd_lomask(unsigned fw);
 
+    llvm::Constant * simd_himask(unsigned vector_width, unsigned fw);
+    llvm::Constant * simd_lomask(unsigned vector_width, unsigned fw);
+
     llvm::Value * simd_select_hi(unsigned fw, llvm::Value * a);
     llvm::Value * simd_select_lo(unsigned fw, llvm::Value * a);
 
     virtual llvm::Value * simd_fill(unsigned fw, llvm::Value * a);
+
+    virtual llvm::Value * simd_fill(unsigned vector_width, unsigned fw, llvm::Value * a);
 
     virtual llvm::Value * simd_add(unsigned fw, llvm::Value * a, llvm::Value * b);
     virtual llvm::Value * simd_sub(unsigned fw, llvm::Value * a, llvm::Value * b);
@@ -178,7 +183,7 @@ public:
 
     virtual llvm::Value * esimd_mergeh(unsigned fw, llvm::Value * a, llvm::Value * b);
     virtual llvm::Value * esimd_mergel(unsigned fw, llvm::Value * a, llvm::Value * b);
-    virtual llvm::Value * esimd_bitspread(unsigned fw, llvm::Value * bitmask);
+    virtual llvm::Value * esimd_bitspread(unsigned vec_width, unsigned fw, llvm::Value * bitmask);
 
     virtual llvm::Value * hsimd_packh(unsigned fw, llvm::Value * a, llvm::Value * b);
     virtual llvm::Value * hsimd_packl(unsigned fw, llvm::Value * a, llvm::Value * b);

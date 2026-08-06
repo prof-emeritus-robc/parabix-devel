@@ -61,6 +61,7 @@
 #include <re/adt/re_cc.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/stream_shift.h>   // IndexedShiftBack (BPE_INDEXED_SHIFT)
 #include <stdexcept>
 #include <boost/intrusive/detail/math.hpp>
 using boost::intrusive::detail::ceil_log2;
@@ -361,29 +362,39 @@ public:
     // boundaryIn (optional, may be null): 1-bit per-byte mask of pretoken STARTS.
     // When present, a merge is blocked if B starts a new pretoken (boundary at
     // A_start+lenA), so merges never cross a pretoken boundary (the 't/quote bug).
+    // nextIdIn (optional, may be null): the id of the NEXT LIVE token brought back to
+    // each live position, precomputed OUTSIDE the kernel by IndexedShiftBack(inPlayMask,
+    // source). When present (BPE_INDEXED_SHIFT), B-detection reads EQ(nextId, idB) at A's
+    // position instead of EQ(LookAhead(source, lenA), idB) — one shifted stream replaces
+    // every per-lenA multi-bit LookAhead — and B is consumed via the inline forward
+    // createIndexedAdvance(mergeV, inPlayMask, 1) instead of Advance(mergeV, lenA).
     BPEMergeKernel(LLVMTypeSystemInterface & ts,
                    StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
+                   StreamSet * nextIdIn,
                    StreamSet * sourceOut, StreamSet * meOut,
                    MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
-    // name must encode every body-shaping param hashRuleSet omits 
-    // — LookAhead distance (L=maxLen, changes with compaction), input width (w) and accumulator width (o, dev 12-bit vs full 16-bit) 
-    // — else objcache serves a mismatched compiled body.
+    // name must encode every body-shaping param hashRuleSet omits
+    // — LookAhead distance (L=maxLen, changes with compaction), input width (w) and accumulator width (o, dev 12-bit vs full 16-bit)
+    // — else objcache serves a mismatched compiled body. x1_ = indexed-shift body.
 
-    : PabloKernel(ts, std::string("BPEMerge_") + (boundaryIn ? "b1_" : "")
+    : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
-                  mergeInputs(sourceIn, meIn, boundaryIn, maxLen),
+                  mergeInputs(sourceIn, meIn, boundaryIn, nextIdIn, maxLen),
                   {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
-      mRuleGroup(group), mHasBoundary(boundaryIn != nullptr) {}
+      mRuleGroup(group), mHasBoundary(boundaryIn != nullptr), mUseNextId(nextIdIn != nullptr) {}
 protected:
     static std::vector<kernel::Binding> mergeInputs(
-            StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn, unsigned maxLen) {
+            StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
+            StreamSet * nextIdIn, unsigned maxLen) {
         std::vector<kernel::Binding> in {
             Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
             Binding{"meIn", meIn} };
         if (boundaryIn)
             in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
+        if (nextIdIn)   // Deferred producer (IndexedShiftBack) → FixedRate consume, pipeline reconciles
+            in.push_back(Binding{"nextIdIn", nextIdIn});
         return in;
     }
 protected:
@@ -413,12 +424,27 @@ protected:
         // B's start (interior seam); A's start survives as AB's start. Final mask marks
         // the surviving (outermost) token STARTS — the stream emission scans.
         PabloAST * inPlayMask = getInputStreamSet("meIn")[0];
+        // Frozen input mask — the index for createIndexedAdvance (B-consume) in indexed
+        // mode. Must be the INPUT mask (not the mutating accumulator) so "next live" is
+        // fixed for the whole kernel, matching the frozen nextId.
+        PabloAST * inPlayFrozen = inPlayMask;
+
+        // nextIdBN — indexed mode: the NEXT LIVE token's id at each position (precomputed
+        // by IndexedShiftBack outside). B-detection reads EQ(nextIdBN, idB) — one shifted
+        // stream for every rule, no per-lenA LookAhead.
+        BixNum nextIdBN;
+        if (mUseNextId) {
+            auto nb = getInputStreamSet("nextIdIn");
+            nextIdBN = BixNum(nb.begin(), nb.end());
+        }
 
         // aheadByLenA[len] = the source id stream shifted so position p reads the id
         // `len` bytes ahead. One copy per distinct lenA; a rule uses aheadByLenA[lenA]
         // to check what token starts right after A. LookAhead is legal only on an INPUT
         // (sourceIn declares LookAhead(maxLen), and lenA < mergedLen ≤ maxLen).
+        // Skipped in indexed mode — nextIdBN replaces every source LookAhead.
         std::map<unsigned, BixNum> aheadByLenA;
+        if (!mUseNextId)
         for (const auto & r : mRuleGroup.rules) {
             if (aheadByLenA.count(r.lenA)) continue;
             std::vector<PabloAST*> bits(W);
@@ -462,7 +488,11 @@ protected:
             Var * mergeV = pb.createVar("merge", zeroes);
             auto body = pb.createScope();
             BixNumCompiler bncB(body);
-            PabloAST * BstartAtA = bncB.EQ(aheadByLenA.at(r.lenA), r.idB);  // B starts lenA ahead
+            // B-detection: indexed mode reads the next-live id (frozen), byte mode reads
+            // lenA ahead via LookAhead. Both frozen → identical semantics.
+            PabloAST * BstartAtA = mUseNextId
+                ? bncB.EQ(nextIdBN, r.idB)
+                : bncB.EQ(aheadByLenA.at(r.lenA), r.idB);  // B starts lenA ahead
             PabloAST * fire = body.createAnd3(inPlayMask, fireStart, BstartAtA);
             if (mHasBoundary)   // block merges where B begins a new pretoken (cross-boundary)
                 fire = body.createAnd(fire, body.createNot(boundaryAheadByLen.at(r.lenA)));
@@ -482,7 +512,13 @@ protected:
             // must run in the top scope (uses mergeV carried out of the body). Use
             // Not(Advance(mergeV,lenA)), NOT Advance(Not mergeV,lenA): Advance fills the
             // leading lenA bytes with 0, so the latter would wrongly clear position 0.
-            inPlayMask = pb.createAnd(inPlayMask, pb.createNot(pb.createAdvance(mergeV, r.lenA)), "inPlayClear");
+            // Indexed mode: B is the NEXT LIVE token, so move the fire forward one live
+            // index position via the inline createIndexedAdvance over the FROZEN mask
+            // (no lenA) — lands on B's start regardless of byte distance.
+            PabloAST * clearB = mUseNextId
+                ? pb.createIndexedAdvance(mergeV, inPlayFrozen, 1)
+                : pb.createAdvance(mergeV, r.lenA);
+            inPlayMask = pb.createAnd(inPlayMask, pb.createNot(clearB), "inPlayClear");
         }
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
@@ -492,6 +528,7 @@ protected:
 private:
     MergeRuleGroup mRuleGroup;
     bool mHasBoundary;
+    bool mUseNextId;
 };
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
@@ -517,6 +554,23 @@ BPEPassResult buildBPEPassPipeline(
     // compactions land after kernel 40, 80, 120, ... (28 points for 1123 kernels).
     unsigned compactEvery = 40;
     if (const char * ce = std::getenv("BPE_COMPACT_EVERY")) compactEvery = (unsigned) std::atoi(ce);
+    // BPE_INDEXED_SHIFT: replace each kernel's multi-bit source LookAheads with ONE
+    // IndexedShiftBack(inPlayMask, source) → next-live id, and consume via inline
+    // createIndexedAdvance. Mutually exclusive with compaction (both rewrite the
+    // "distance to B"); indexed wins and forces K=0 so lenA stays byte-space (still
+    // used by the 1-bit boundary LookAhead + selfMergeFireStarts stride).
+    // Value = how many kernels (from the start) to convert to indexed-shift. Lets us
+    // isolate the mechanism on 1 kernel before scaling to all 1123 (Deferred-rate chain).
+    unsigned indexedShiftN = 0;
+    if (const char * is = std::getenv("BPE_INDEXED_SHIFT")) indexedShiftN = (unsigned) std::atoi(is);
+    bool useIndexedShift = indexedShiftN > 0;
+    if (useIndexedShift && compactEvery) {
+        std::cerr << "[BPE] BPE_INDEXED_SHIFT: compaction disabled (interacts via lenA)\n";
+        compactEvery = 0;
+    }
+    if (useIndexedShift)
+        std::cerr << "[BPE] BPE_INDEXED_SHIFT: first " << indexedShiftN
+                  << " kernels via IndexedShiftBack (1 shift/kernel)\n";
     auto compactAfter = applyCompactionSchedule(ruleRanges, compactEvery);
 
     // debug: dump the merge-range groups to stderr
@@ -568,7 +622,14 @@ BPEPassResult buildBPEPassPipeline(
         unsigned output_bits = ceil_log2(g.hi+1);
         StreamSet * sOut  = P.CreateStreamSet(output_bits, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, sOut, meOut,
+        // Indexed mode: precompute next-live id for this kernel (frozen source+mask).
+        // Only the first indexedShiftN kernels convert (isolation); rest stay byte-space.
+        StreamSet * nextId = nullptr;
+        if (useIndexedShift && i < indexedShiftN) {
+            nextId = P.CreateStreamSet(source->getNumElements(), 1);
+            P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
+        }
+        P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
                                            g, hashRuleSet(g.rules), g.maxLen);
         source     = sOut;
         inPlayMask = meOut;

@@ -556,18 +556,25 @@ BPEPassResult buildBPEPassPipeline(
     if (const char * ce = std::getenv("BPE_COMPACT_EVERY")) compactEvery = (unsigned) std::atoi(ce);
     // BPE_INDEXED_SHIFT: replace each kernel's multi-bit source LookAheads with ONE
     // IndexedShiftBack(inPlayMask, source) → next-live id, and consume via inline
-    // createIndexedAdvance. Mutually exclusive with compaction (both rewrite the
-    // "distance to B"); indexed wins and forces K=0 so lenA stays byte-space (still
-    // used by the 1-bit boundary LookAhead + selfMergeFireStarts stride).
+    // createIndexedAdvance.
     // Value = how many kernels (from the start) to convert to indexed-shift. Lets us
     // isolate the mechanism on 1 kernel before scaling to all 1123 (Deferred-rate chain).
+    //
+    // INDEPENDENT of BPE_COMPACT_EVERY — the two compose, and the FilterByMask
+    // schedule is identical whether a kernel uses LookAhead or IndexedShiftBack:
+    //   - B-detection needs no distance at all in indexed mode (reads nextId at p),
+    //     so the slot-space lenA that applyCompactionSchedule computes is simply
+    //     unused there;
+    //   - the 1-bit boundary LookAhead and selfMergeFireStarts DO still use lenA,
+    //     and slot-space lenA is the correct distance for them: boundary is filtered
+    //     by the same mask, so its positions are slots too;
+    //   - createIndexedAdvance(mergeV, inPlayFrozen, 1) is "one live position
+    //     forward" in whatever space the stream is in, compacted or not.
+    // Right after a compaction the mask is all-ones, so IndexedShiftBack there
+    // degenerates to a plain 1-position shift — correct, and cheaper.
     unsigned indexedShiftN = 0;
     if (const char * is = std::getenv("BPE_INDEXED_SHIFT")) indexedShiftN = (unsigned) std::atoi(is);
     bool useIndexedShift = indexedShiftN > 0;
-    if (useIndexedShift && compactEvery) {
-        std::cerr << "[BPE] BPE_INDEXED_SHIFT: compaction disabled (interacts via lenA)\n";
-        compactEvery = 0;
-    }
     if (useIndexedShift)
         std::cerr << "[BPE] BPE_INDEXED_SHIFT: first " << indexedShiftN
                   << " kernels via IndexedShiftBack (1 shift/kernel)\n";

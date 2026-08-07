@@ -7,17 +7,19 @@ namespace kernel {
  ** ------------------------------------------------------------------------------------------------------------- */
 std::vector<Value *> PipelineCompiler::getFinalOutputScalars(KernelBuilder & b) {
     std::vector<Value *> args;
+    Module * m = b.getModule();
+
     for (unsigned call = FirstCall; call <= LastCall; ++call) {
         writeOutputScalars(b, call, args);
         const RelationshipNode & rn = mScalarGraph[call];
         const CallBinding & C = rn.Callee;
-        Function * const f = cast<Function>(C.Callee);
+        Function * const f = m->getFunction(C.Callee->getName()); assert (f);
         assert (&f->getContext() == &b.getContext());
         auto i = f->arg_begin();
         for (auto j = args.begin(); j != args.end(); ++i, ++j) {
             assert (i != f->arg_end());
-            Type * ty = i->getType();
-            ty = CBuilder::convertTypeToLLVMContext(b.getContext(), ty);
+            Type * ty = i->getType(); assert (&ty->getContext() == &b.getContext());
+           // ty = CBuilder::convertTypeToLLVMContext(b.getContext(), ty);
             *j = b.CreateZExtOrTrunc(*j, ty);
         }
         assert (i == f->arg_end());

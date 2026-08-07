@@ -47,14 +47,6 @@ public:
     virtual ~CBuilder() {}
 
     llvm::Module * getModule() const {
-        #ifndef NDEBUG
-        llvm::BasicBlock * const bb = GetInsertBlock();
-        if (bb) {
-            llvm::Function * const f = bb->getParent();
-            assert ("CBuilder has an insert point that is not contained within a Function" && f);
-            assert ("CBuilder module differs from insertion point module" && (mModule == f->getParent()));
-        }
-        #endif
         return mModule;
     }
 

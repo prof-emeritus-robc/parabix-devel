@@ -216,17 +216,14 @@ std::string Kernel::makeCacheName(KernelBuilder & b) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief makeTemporaryModule
+ * @brief makeEmptyModule
  ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::makeTemporaryModule(KernelBuilder & b) {
+Module * Kernel::makeEmptyModule(KernelBuilder & b) {
     // NOTE: this assumes that the KernelBuilder used to make the module has the same config as the
     // one that generates it later. Would be better if this didn't but that will require redesigning
     // the compilation and object cache interface.
     auto & C = b.getContext();
     Module * const m = new Module(makeCacheName(b), C);
-    Module * const prior = b.getModule();
-    m->setTargetTriple(prior->getTargetTriple());
-    m->setDataLayout(prior->getDataLayout());
     if (LLVM_LIKELY(isCachable())) {
         m->getOrInsertNamedMetadata(CACHEABLE);
          if (LLVM_UNLIKELY(hasSignature())) {
@@ -238,6 +235,7 @@ void Kernel::makeTemporaryModule(KernelBuilder & b) {
          }
     }
     setModule(m);
+    return m;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

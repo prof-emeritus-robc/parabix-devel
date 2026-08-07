@@ -1,5 +1,6 @@
 #pragma once
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <kernel/pipeline/driver/driver.h>
 #include <toolchain/toolchain.h>
 
@@ -7,7 +8,10 @@ namespace llvm { class raw_fd_ostream; }
 namespace llvm { class ModulePass; }
 namespace kernel { class KernelBuilder; }
 
-#include <llvm/IR/LegacyPassManager.h>
+namespace {
+class CPUDriverContextPool;
+}
+
 class CPUDriver final : public BaseDriver {
 
     struct LinkedFunction {
@@ -18,7 +22,10 @@ class CPUDriver final : public BaseDriver {
         : Target(target), FunctionDecl(decl) { }
     };
 
-    friend class CPUDriverIRCompiler;
+    friend class CPUDriverKernelCompiler;
+    friend class KernelGenerationMU;
+
+    using LinkedFunctionVector = llvm::SmallVector<LinkedFunction, 16>;
 
 public:
 
@@ -51,10 +58,10 @@ private:
     std::unique_ptr<llvm::raw_fd_ostream>                   mIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
 
-    std::vector<llvm::orc::ThreadSafeContext>               mContexts;
+    std::unique_ptr<CPUDriverContextPool>                   mContextPool;
     std::unique_ptr<llvm::orc::SymbolLookupSet>             mSymbolLookupSet;
     std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
     std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
-    llvm::SmallVector<LinkedFunction, 16>                   mLinkedFunctions;
+    LinkedFunctionVector                                    mLinkedFunctions;
 };
 

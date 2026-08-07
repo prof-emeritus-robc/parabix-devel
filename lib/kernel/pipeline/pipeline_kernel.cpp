@@ -553,8 +553,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         if (isa<CommandLineScalar>(input.getRelationship())) {
             continue;
         }
-        Type * ty = input.getType();
-        assert (&ty->getContext() == &b.getContext());
+        Type * ty = CBuilder::convertTypeToLLVMContext(b.getContext(), input.getType());
         params.push_back(ty);
     }
 

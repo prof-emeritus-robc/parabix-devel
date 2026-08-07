@@ -125,13 +125,13 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
 
     auto sig = kernel->hasSignature() ? kernel->getSignature() : kernel->getName();
 
-    if (mCompiledIdentifiers.insert(sig).second) {
+    if (!mCompiledIdentifiers.insert(sig).second) {
         return;
     }
 
-    kernel->makeTemporaryModule(*mBuilder);
-
     kernel->linkExternalMethods(*mBuilder);
+
+    mUncachedKernel.emplace_back(kernel);
 
 }
 

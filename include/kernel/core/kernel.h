@@ -436,7 +436,7 @@ public:
 
     std::string makeCacheName(KernelBuilder & b);
 
-    void makeTemporaryModule(KernelBuilder & b);
+    llvm::Module * makeEmptyModule(KernelBuilder & b);
 
     void ensureLoaded(KernelBuilder & b);
 

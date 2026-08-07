@@ -1475,8 +1475,8 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
     Module * const m = b.getModule();
     StructType * const sharedTy =  mSharedStateType;
     StructType * const threadLocalTy = mThreadLocalStateType;
-    assert (&sharedTy->getContext() == &b.getContext());
-    assert (&threadLocalTy->getContext() == &b.getContext());
+    assert (sharedTy == nullptr || &sharedTy->getContext() == &b.getContext());
+    assert (threadLocalTy == nullptr || &threadLocalTy->getContext() == &b.getContext());
 
     auto & DL = m->getDataLayout();
 

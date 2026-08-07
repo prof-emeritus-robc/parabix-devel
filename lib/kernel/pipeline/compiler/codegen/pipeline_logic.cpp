@@ -15,7 +15,18 @@ void PipelineCompiler::bindAdditionalInitializationArguments(KernelBuilder & b, 
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::generateImplicitKernels(KernelBuilder & b) {
     for (auto i = FirstKernel; i <= LastKernel; ++i) {
-        const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b);
+
+        auto & S = mStreamGraph[i];
+
+        if (S.Flags & RelationshipNodeFlag::ImplicitlyAdded) {
+            const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b);
+        }
+
+
+        // G.add(RelationshipNode::IsKernel, popCountKernel, RelationshipNodeFlag::ImplicitlyAdded);
+
+
+
     }
 }
 

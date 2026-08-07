@@ -575,13 +575,16 @@ Kernel::StateTypes Kernel::constructStateTypes(KernelBuilder & b) const {
  * @brief generateOrLoadKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::generateOrLoadKernel(KernelBuilder & b) {
-    if (LLVM_LIKELY(mCompilationStatus >= CompilationStatus::LoadedOrCompiled)) {
-        /* do nothing */
-    } else if (getInitializeFunction(b, false)) {
-        loadCachedKernel(b);
-    } else {
+    if (b.getModule()->getNamedMetadata(getName() + STATE_TYPE_METADATA_SUFFIX) == nullptr) {
         generateKernel(b);
     }
+//    if (LLVM_LIKELY(mCompilationStatus >= CompilationStatus::LoadedOrCompiled)) {
+//        /* do nothing */
+//    } else if (getInitializeFunction(b, false)) {
+//        loadCachedKernel(b);
+//    } else {
+//        generateKernel(b);
+//    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

@@ -204,8 +204,14 @@ public:
     virtual llvm::Value * mvmd_srli(unsigned fw, llvm::Value * a, unsigned shift);
     virtual llvm::Value * mvmd_dslli(unsigned fw, llvm::Value * a, llvm::Value * b, unsigned shift);
     virtual llvm::Value * mvmd_dsll(unsigned fw, llvm::Value * a, llvm::Value * b, llvm::Value * shift);
-    virtual llvm::Value * mvmd_shuffle(unsigned fw, llvm::Value * data_table, llvm::Value * index_vector);
-    virtual llvm::Value * mvmd_shuffle2(unsigned fw, llvm::Value * table0, llvm::Value * table1, llvm::Value * index_vector);
+    //
+    // The following shuffle modes control what happens when an index value exceeds
+    // the number of entries in the given table.
+    enum class ShuffleMode {TruncateIndex, ZeroOnIndexOver, ZeroOnHighIndexBit};
+    virtual llvm::Value * mvmd_shuffle(unsigned fw, llvm::Value * data_table, llvm::Value * index_vector,
+                                       ShuffleMode m = ShuffleMode::TruncateIndex);
+    virtual llvm::Value * mvmd_shuffle2(unsigned fw, llvm::Value * table0, llvm::Value * table1, llvm::Value * index_vector,
+                                        ShuffleMode m = ShuffleMode::TruncateIndex);
     virtual llvm::Value * mvmd_compress(unsigned fw, llvm::Value * a, llvm::Value * select_mask);
     virtual llvm::Value * mvmd_expand(unsigned fw, llvm::Value * a, llvm::Value * select_mask);
 

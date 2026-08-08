@@ -503,71 +503,72 @@ Value * IDISA_AVX2_Builder::mvmd_sll(unsigned fw, Value * a, Value * shift, cons
 }
 
 
-Value * IDISA_AVX2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_vector) {
-    if (getVectorBitWidth(a) == AVX_width) {
-        if (fw == 64) {
-            constexpr auto fieldCount = AVX_width / 64;
-            Value * A = CreateMul(fwCast(64, index_vector), getSplat(fieldCount, getInt64(0x0000000200000002ULL)));
-            index_vector = CreateOr(A, getSplat(fieldCount, getInt64(0x0000000100000000ULL)));
-            return fwCast(64, mvmd_shuffle(32, a, index_vector));
-        } else if (fw == 32) {
-            Function * shuf32Func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_permd);
-            return CreateCall(shuf32Func->getFunctionType(), shuf32Func, {fwCast(32, a), fwCast(32, index_vector)});
-        } else if (fw == 16) {
-            // TODO: if we can use vpshuflw and vpshufhw, we may be able to do this a bit more efficiently
-            // but LLVM doesn't seem to have intrinsics for them? Check whether shufflevector can deduce them.
-            // For now, we simply transform the 16-bit indices into pairs of adjacent 8-bit ones
-            constexpr auto fieldCount = 256 / 16;
-            Value * A = CreateMul(fwCast(16, index_vector), getSplat(fieldCount, getInt16(0x0202)));
-            index_vector = CreateOr(A, getSplat(fieldCount, getInt16(0x0100)));
-            return fwCast(16, mvmd_shuffle(8, fwCast(8, a), fwCast(8, index_vector)));
-        } else if (fw == 8) {
-            constexpr unsigned fieldCount = 256 / 8;
-
-            IntegerType * const int8Ty = getInt8Ty();
-
-            Constant * SIXTEEN = getSplat(fieldCount, ConstantInt::get(int8Ty, 16));
-
-            auto createShuffleVec = [&](int a, int b, int c, int d) {
-                FixedArray<Constant *, 4> idx;
-                idx[0] = getInt32(a);
-                idx[1] = getInt32(b);
-                idx[2] = getInt32(c);
-                idx[3] = getInt32(d);
-                return ConstantVector::get(idx);
-            };
-
-            // TODO: I want to call vpermq directly since LLVM 15 shufflevector doesn't produce it but LLVM doesn't
-            // seem to support the instruction or intrinsic? check if later versions do.
-
-            // Function * permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_permq);
-
-            FixedVectorType * vec64Ty = FixedVectorType::get(getInt64Ty(), 256 / 64);
-            Function * shufFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_pshuf_b);
-            Value * const a64 = CreateBitCast(a, vec64Ty);
-            FixedVectorType * vecTy = FixedVectorType::get(int8Ty, 256 / 8);
-            index_vector = CreateBitCast(index_vector, vecTy);
-
-            FixedArray<Value *, 2> args;
-            Value * a0 = CreateShuffleVector(a64, UndefValue::get(vec64Ty), createShuffleVec(0, 1, 0, 1));
-            args[0] = CreateBitCast(a0, vecTy);
-            args[1] = CreateOr(index_vector, CreateSExt(CreateICmpUGE(index_vector, SIXTEEN), vecTy));
-            Value * a1 = CreateCall(shufFunc->getFunctionType(), shufFunc, args);
-            assert (a1->getType() == vecTy);
-            Value * b0 = CreateShuffleVector(a64, UndefValue::get(vec64Ty), createShuffleVec(2, 3, 2, 3));
-            assert (b0->getType() == vec64Ty);
-            args[0] = CreateBitCast(b0, vecTy);
-            args[1] = CreateSub(index_vector, SIXTEEN); // sets sign bit automatically if selected in a0
-            Value * b1 = CreateCall(shufFunc->getFunctionType(), shufFunc, args);
-            assert (b1->getType() == vecTy);
-            return CreateOr(a1, b1);
+Value * IDISA_AVX2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_vector, ShuffleMode mode) {
+    if (getVectorBitWidth(a) == AVX_width && (fw == 32)) {
+        auto fieldCount = AVX_width/fw;
+        // x86_avx2_permd truncates indices to 3 bits, does not zero.
+        Function * shuf32Func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_permd);
+        Value * shuf = CreateCall(shuf32Func->getFunctionType(), shuf32Func, {fwCast(32, a), fwCast(32, index_vector)});
+        if (mode == ShuffleMode::ZeroOnHighIndexBit) {
+            Constant * high_bit = Constant::getIntegerValue(getInt32Ty(), APInt::getHighBitsSet(fw, 1));
+            Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, high_bit));
+            return simd_and(shuf, enable_shuf);
+        } else if (mode == ShuffleMode::ZeroOnIndexOver) {
+            Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, getInt32(fieldCount)));
+            return simd_and(shuf, enable_shuf);
         }
+        return shuf;  // if (mode == ShuffleMode::TruncateIndex)
     }
-    return IDISA_Builder::mvmd_shuffle(fw, a, index_vector);
+    if (getVectorBitWidth(a) == AVX_width && (fw == 8)) {
+        // x86_avx2_pshuf_b shuffles within 128 bit lanes, zeroing if the high bit is set.
+        constexpr unsigned fieldCount = 256 / 8;
+        
+        if (mode == ShuffleMode::TruncateIndex) {
+            // Clear high bits
+            index_vector = simd_and(index_vector, getSplat(fieldCount, getInt8(fieldCount - 1)));
+        } else if (mode == ShuffleMode::ZeroOnIndexOver) {
+            Value * over = simd_ugt(fw, index_vector, getSplat(fieldCount, getInt8(fieldCount - 1)));
+            index_vector = simd_or(index_vector, over);
+        }
+        
+        IntegerType * const int8Ty = getInt8Ty();
+        
+        Constant * SIXTEEN = getSplat(fieldCount, ConstantInt::get(int8Ty, 16));
+        
+        auto createShuffleVec = [&](int a, int b, int c, int d) {
+            FixedArray<Constant *, 4> idx;
+            idx[0] = getInt32(a);
+            idx[1] = getInt32(b);
+            idx[2] = getInt32(c);
+            idx[3] = getInt32(d);
+            return ConstantVector::get(idx);
+        };
+        
+        FixedVectorType * vec64Ty = FixedVectorType::get(getInt64Ty(), 256 / 64);
+        Function * shufFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_pshuf_b);
+        Value * const a64 = CreateBitCast(a, vec64Ty);
+        FixedVectorType * vecTy = FixedVectorType::get(int8Ty, 256 / 8);
+        index_vector = CreateBitCast(index_vector, vecTy);
+        
+        FixedArray<Value *, 2> args;
+        Value * a0 = CreateShuffleVector(a64, UndefValue::get(vec64Ty), createShuffleVec(0, 1, 0, 1));
+        args[0] = CreateBitCast(a0, vecTy);
+        args[1] = CreateOr(index_vector, CreateSExt(CreateICmpUGE(index_vector, SIXTEEN), vecTy));
+        Value * a1 = CreateCall(shufFunc->getFunctionType(), shufFunc, args);
+        assert (a1->getType() == vecTy);
+        Value * b0 = CreateShuffleVector(a64, UndefValue::get(vec64Ty), createShuffleVec(2, 3, 2, 3));
+        assert (b0->getType() == vec64Ty);
+        args[0] = CreateBitCast(b0, vecTy);
+        args[1] = CreateSub(index_vector, SIXTEEN); // sets sign bit automatically if selected in a0
+        Value * b1 = CreateCall(shufFunc->getFunctionType(), shufFunc, args);
+        assert (b1->getType() == vecTy);
+        return CreateOr(a1, b1);
+    }
+    return IDISA_Builder::mvmd_shuffle(fw, a, index_vector, mode);
 }
 
-llvm::Value * IDISA_AVX2_Builder::mvmd_shuffle2(unsigned fw, llvm::Value * table0, llvm::Value * table1, llvm::Value * index_vector) {
-    return IDISA_Builder::mvmd_shuffle2(fw, table0, table1, index_vector);
+llvm::Value * IDISA_AVX2_Builder::mvmd_shuffle2(unsigned fw, llvm::Value * table0, llvm::Value * table1, llvm::Value * index_vector, ShuffleMode mode) {
+    return IDISA_Builder::mvmd_shuffle2(fw, table0, table1, index_vector, mode);
 }
 
 Value * IDISA_AVX2_Builder::mvmd_compress(unsigned fw, Value * a, Value * select_mask) {
@@ -827,77 +828,109 @@ Value * IDISA_AVX512F_Builder::mvmd_sll(unsigned fw, Value * a, Value * shift, c
     return IDISA_Builder::mvmd_sll(fw, a, shift);
 }
 
-Value * IDISA_AVX512F_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector) {
-    return mvmd_shuffle2(fw, data_table, data_table, index_vector);
+Value * IDISA_AVX512F_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector, ShuffleMode mode) {
+    if (getVectorBitWidth(data_table) == AVX512_width) {
+        auto fieldCount = AVX512_width/fw;
+        Type * fwTy = getIntNTy(fw);
+        Value * shuf = mvmd_shuffle2(fw, data_table, data_table, index_vector, ShuffleMode::TruncateIndex);
+        if (mode == ShuffleMode::ZeroOnHighIndexBit) {
+            Constant * high_bit = Constant::getIntegerValue(fwTy, APInt::getHighBitsSet(fw, 1));
+            Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, high_bit));
+            return simd_and(shuf, enable_shuf);
+        } else if (mode == ShuffleMode::ZeroOnIndexOver) {
+            Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, ConstantInt::get(fwTy, fieldCount)));
+            return simd_and(shuf, enable_shuf);
+        }
+        return shuf;
+    }
+    return IDISA_AVX_Builder::mvmd_shuffle(fw, data_table, index_vector, mode);
 }
 
 #define AVX512_MASK_PERMUTE_INTRINSIC(i) Intrinsic::x86_avx512_vpermi2##i
 
-Value * IDISA_AVX512F_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value * table1, Value * index_vector) {
+Value * IDISA_AVX512F_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value * table1, Value * index_vector, ShuffleMode mode) {
     if (getVectorBitWidth(table0) == AVX512_width) {
+        auto fieldCount = 2 * AVX512_width/fw;
+        Type * fwTy = getIntNTy(fw);
         Function * permuteFunc = nullptr;
+        // First consider the family of x86_avx512_vpermi2 intrinsics
         if (fw == 32) {
             permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_d_512));
         } else if (fw == 64) {
             permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_q_512));
         } else if (fw == 16 && hasFeature(Feature::AVX512_BW)) {
             permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_hi_512));
-        } else if (fw == 8) {
-            if (hasFeature(Feature::AVX512_VBMI)) {
-                permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_qi_512));
-            } else if (hasFeature(Feature::AVX512_BW)) {
-
-                // If we have AVX512BW but not AVX512VBMI, we can use 16 bit shuffles to replicate an 8 bit shuffle.
-                // This requires us to split the table look up into a lower and higher "half" table and index vectors
-                // since we need to zero extend each field.
-
-                // Although the tables can be easily zero extended, the indices are a bit trickier since we could have:
-                // <0, 63, 1, 62, ...> as a pattern. Thus we build up both the results from selecting the lower and higher
-                // tables separately then OR them together.
-
-
-                VectorType * vty = fwVectorType(8);
-
-                assert (index_vector->getType() == vty);
-
-                Constant * const ZEROES = ConstantVector::getNullValue(vty);
-
-                #define ZEXT16L(T) esimd_mergel(8, (T), ZEROES)
-                #define ZEXT16H(T) esimd_mergeh(8, (T), ZEROES)
-
-                Constant * const ALL_64 = getSplat(512 / 8, getInt8(64));
-                Value * const InL = simd_lt(8, index_vector, ALL_64);
-                assert (InL->getType() == vty);
-                Value * IndexVectorL = CreateAnd(index_vector, InL);
-                Value * const InH = CreateNot(InL);
-                Value * IndexVectorH = CreateAnd(CreateSub(index_vector, ALL_64), InH);
-                Value * IndexVector = CreateOr(IndexVectorL, IndexVectorH);
-                Value * const IL = ZEXT16L(IndexVector);
-                Value * const IH = ZEXT16H(IndexVector);
-                auto SelectFromHalfTable = [&](Value * table, Value * Mask) {
-                    Value * T0 = ZEXT16L(table);
-                    Value * T1 = ZEXT16H(table);
-                    Value * const A = mvmd_shuffle2(16, T0, T1, IL);
-                    Value * const B = mvmd_shuffle2(16, T0, T1, IH);
-                    Value * packed = fwCast(8, hsimd_packl(16, A, B));
-                    return CreateAnd(packed, Mask);
-                };
-                #undef ZEXT16L
-                #undef ZEXT16H
-
-                Value * const L = SelectFromHalfTable(table0, InL);
-                assert (L->getType() == vty);
-                Value * const H = SelectFromHalfTable(table1, InH);
-                assert (H->getType() == vty);
-                return CreateOr(L, H);
-            }
+        } else if (fw == 8 && hasFeature(Feature::AVX512_VBMI)) {
+            permuteFunc = Intrinsic::getOrInsertDeclaration(getModule(), AVX512_MASK_PERMUTE_INTRINSIC(var_qi_512));
         }
-
         if (permuteFunc) {
-            return CreateCall(permuteFunc->getFunctionType(), permuteFunc, {fwCast(fw, table0), fwCast(fw, index_vector), fwCast(fw, table1)});
+            Value * shuf = CreateCall(permuteFunc->getFunctionType(), permuteFunc, {fwCast(fw, table0), fwCast(fw, index_vector), fwCast(fw, table1)});
+            if (mode == ShuffleMode::ZeroOnHighIndexBit) {
+                Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, ConstantInt::get(fwTy, 1<<(fw-1))));
+                return simd_and(shuf, enable_shuf);
+            } else if (mode == ShuffleMode::ZeroOnIndexOver) {
+                Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, ConstantInt::get(fwTy, fieldCount)));
+                return simd_and(shuf, enable_shuf);
+            }
+            return shuf; // if (mode == ShuffleMode::TruncateIndex)
+        }
+        if (fw == 8 && hasFeature(Feature::AVX512_BW)) {
+
+            // If we have AVX512BW but not AVX512VBMI, we can use 16 bit shuffles to replicate an 8 bit shuffle.
+            // This requires us to split the table look up into a lower and higher "half" table and index vectors
+            // since we need to zero extend each field.
+
+            // Although the tables can be easily zero extended, the indices are a bit trickier since we could have:
+            // <0, 63, 1, 62, ...> as a pattern. Thus we build up both the results from selecting the lower and higher
+            // tables separately then OR them together.
+
+            VectorType * vty = fwVectorType(8);
+
+            assert (index_vector->getType() == vty);
+
+            Constant * const ZEROES = ConstantVector::getNullValue(vty);
+
+            #define ZEXT16L(T) esimd_mergel(8, (T), ZEROES)
+            #define ZEXT16H(T) esimd_mergeh(8, (T), ZEROES)
+
+            Constant * const ALL_64 = getSplat(512 / 8, getInt8(64));
+            Value * const InL = simd_lt(8, index_vector, ALL_64);
+            assert (InL->getType() == vty);
+            Value * IndexVectorL = CreateAnd(index_vector, InL);
+            Value * const InH = CreateNot(InL);
+            Value * IndexVectorH = CreateAnd(CreateSub(index_vector, ALL_64), InH);
+            Value * IndexVector = CreateOr(IndexVectorL, IndexVectorH);
+            Value * const IL = ZEXT16L(IndexVector);
+            Value * const IH = ZEXT16H(IndexVector);
+            auto SelectFromHalfTable = [&](Value * table, Value * Mask) {
+                Value * T0 = ZEXT16L(table);
+                Value * T1 = ZEXT16H(table);
+                Value * const A = mvmd_shuffle2(16, T0, T1, IL);
+                Value * const B = mvmd_shuffle2(16, T0, T1, IH);
+                Value * packed = fwCast(8, hsimd_packl(16, A, B));
+                return CreateAnd(packed, Mask);
+            };
+            #undef ZEXT16L
+            #undef ZEXT16H
+
+            Value * const L = SelectFromHalfTable(table0, InL);
+            assert (L->getType() == vty);
+            Value * const H = SelectFromHalfTable(table1, InH);
+
+            assert (H->getType() == vty);
+            Value * shuf = CreateOr(L, H);
+            if (mode == ShuffleMode::ZeroOnHighIndexBit) {
+                Constant * high_bit = Constant::getIntegerValue(fwTy, APInt::getHighBitsSet(fw, 1));
+                Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, high_bit));
+                return simd_and(shuf, enable_shuf);
+            } else if (mode == ShuffleMode::ZeroOnIndexOver) {
+                Value * enable_shuf = simd_ult(fw, index_vector, getSplat(fieldCount, ConstantInt::get(fwTy, fieldCount)));
+                return simd_and(shuf, enable_shuf);
+            }
+            return shuf; // if (mode == ShuffleMode::TruncateIndex)
         }
     }
-    return IDISA_Builder::mvmd_shuffle2(fw, table0, table1, index_vector);
+    return IDISA_AVX_Builder::mvmd_shuffle2(fw, table0, table1, index_vector, mode);
 }
 
 Value * IDISA_AVX512F_Builder::mvmd_compress(unsigned fw, Value * a, Value * select_mask) {

@@ -1346,12 +1346,14 @@ void MatchFilterKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
     BasicBlock * const strideMatchLoop = b.CreateBasicBlock("strideMatchLoop");
     BasicBlock * const pendingMatchProcessing = b.CreateBasicBlock("pendingMatchProcessing");
     BasicBlock * const strideInitialMatch = b.CreateBasicBlock("strideInitialMatch");
-    BasicBlock * const writeLF = b.CreateBasicBlock("writeLF");
     BasicBlock * const strideInitialDone = b.CreateBasicBlock("strideInitialDone");
     BasicBlock * const inStrideMatch = b.CreateBasicBlock("inStrideMatch");
+    BasicBlock * const inStrideContinue = b.CreateBasicBlock("inStrideContinue");
     BasicBlock * const strideEndMatch = b.CreateBasicBlock("strideEndMatch");
     BasicBlock * const strideMatchesDone = b.CreateBasicBlock("strideMatchesDone");
     BasicBlock * const stridesDone = b.CreateBasicBlock("stridesDone");
+    BasicBlock * const writeFinalUnterminatedLine = b.CreateBasicBlock("writeFinalUnterminatedLine");
+    BasicBlock * const matchFilterDone = b.CreateBasicBlock("matchFilterDone");
 
     Value * const initialPos = b.getProcessedItemCount("matchStarts");
     Value * const pendingMatch = b.getScalarField("pendingMatch");
@@ -1446,14 +1448,17 @@ void MatchFilterKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
     Value * nextBreakWord = b.CreateZExtOrTrunc(b.CreateLoad(sw.Ty, b.CreateGEP(sw.Ty, breakWordBasePtr, breakWordIdx)), sizeTy);
     Value * breakWord = b.CreateSelect(b.CreateIsNull(breaksInWord), nextBreakWord, breaksInWord);
     Value * breakPosInWord = b.CreateCountForwardZeroes(breakWord);
-    Value * matchEndPos = b.CreateAdd(breakWordPos, breakPosInWord, "breakPos");
-    Value * const bufLimit = b.CreateSub(avail, sz_ONE);
-    matchEndPos = b.CreateUMin(matchEndPos, bufLimit);
-    Value * lineLength = b.CreateAdd(b.CreateSub(matchEndPos, matchPos), sz_ONE);
-    Value * const matchStartPtr = b.getRawInputPointer("InputStream", matchPos);
+    Value * breakPos = b.CreateAdd(breakWordPos, breakPosInWord, "breakPos");
     Value * const outputPtr = b.getRawOutputPointer("Output", producedPosPhi);
-    b.CreateMemCpy(outputPtr, matchStartPtr, lineLength, 1);
+    Value * lineDataLength = b.CreateSub(breakPos, matchPos);
+
+    b.CreateUnlikelyCondBr(b.CreateICmpUGE(breakPos, avail), writeFinalUnterminatedLine, inStrideContinue);
+
+    b.SetInsertPoint(inStrideContinue);
+    Value * const matchStartPtr = b.getRawInputPointer("InputStream", matchPos);
+    Value * lineLength = b.CreateAdd(lineDataLength, sz_ONE);
     Value * nextProducedPos = b.CreateAdd(producedPosPhi, lineLength);
+    b.CreateMemCpy(outputPtr, matchStartPtr, lineLength, 1);
 
     //  We've dealt with the match, now prepare for the next one, if any.
     // There may be more matches in the current word.
@@ -1476,19 +1481,16 @@ void MatchFilterKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
     Value * breakWord1 = b.CreateZExtOrTrunc(b.CreateLoad(sw.Ty, b.CreateGEP(sw.Ty, breakWordBasePtr, breakWordIdx1)), sizeTy);
     Value * breakWord1Pos = b.CreateAdd(stridePos, b.CreateMul(breakWordIdx1, sw.WIDTH));
     Value * break1Pos = b.CreateAdd(breakWord1Pos, b.CreateCountForwardZeroes(breakWord1));
-    Value * initialLineLgth = b.CreateAdd(b.CreateSub(break1Pos, stridePos), sz_ONE);
-    Value * const strideStartPtr = b.getRawInputPointer("InputStream", stridePos);
-    Value * const outputPtr1 = b.getRawOutputPointer("Output", strideProducedPhi);
-    b.CreateMemCpy(outputPtr1, strideStartPtr, initialLineLgth, 1);
-    Value * producedPos1 = b.CreateAdd(strideProducedPhi, initialLineLgth);
-    b.CreateCondBr(b.CreateICmpUGE(break1Pos, avail), writeLF, strideInitialDone);
-
-    b.SetInsertPoint(writeLF);
-    Value * finalBytePtr = b.getRawOutputPointer("Output", b.CreateSub(producedPos1, sz_ONE));
-    b.CreateStore(b.getInt8(0x0A), finalBytePtr);
-    b.CreateBr(strideInitialDone);
+    Value * initialDataLgth = b.CreateSub(break1Pos, stridePos);
+    b.CreateCondBr(b.CreateICmpUGE(break1Pos, avail), writeFinalUnterminatedLine, strideInitialDone);
 
     b.SetInsertPoint(strideInitialDone);
+    Value * const strideStartPtr = b.getRawInputPointer("InputStream", stridePos);
+    Value * const outputPtr1 = b.getRawOutputPointer("Output", strideProducedPhi);
+    Value * initialLineLgth = b.CreateAdd(initialDataLgth, sz_ONE);
+    b.CreateMemCpy(outputPtr1, strideStartPtr, initialLineLgth, 1);
+    Value * producedPos1 = b.CreateAdd(strideProducedPhi, initialLineLgth);
+
     matchMaskPhi->addIncoming(matchMask, strideInitialDone);
     matchWordPhi->addIncoming(sz_ZERO, strideInitialDone);
     producedPosPhi->addIncoming(producedPos1, strideInitialDone);
@@ -1513,7 +1515,7 @@ void MatchFilterKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
 
     b.SetInsertPoint(strideMatchesDone);
     PHINode * const strideFinalProduced = b.CreatePHI(sizeTy, 3);
-    strideFinalProduced->addIncoming(nextProducedPos, inStrideMatch);
+    strideFinalProduced->addIncoming(nextProducedPos, inStrideContinue);
     strideFinalProduced->addIncoming(producedPos1, strideInitialDone);
     strideFinalProduced->addIncoming(strideProducedPhi, strideMasksReady);
     strideNo->addIncoming(nextStrideNo, strideMatchesDone);
@@ -1530,6 +1532,28 @@ void MatchFilterKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
     finalPendingPhi->addIncoming(Constant::getNullValue(pendingMatch->getType()), strideMatchesDone);
     b.setScalarField("pendingMatch", finalPendingPhi);
     b.setProducedItemCount("Output", finalProducedPhi);
+    b.CreateBr(matchFilterDone);
+
+    b.SetInsertPoint(writeFinalUnterminatedLine);
+    PHINode * const finalLineStartPhi = b.CreatePHI(sizeTy, 2);
+    finalLineStartPhi->addIncoming(matchPos, inStrideMatch);
+    finalLineStartPhi->addIncoming(stridePos, strideInitialMatch);
+    PHINode * const dataLengthPhi = b.CreatePHI(sizeTy, 2);
+    dataLengthPhi->addIncoming(lineDataLength, inStrideMatch);
+    dataLengthPhi->addIncoming(initialDataLgth, strideInitialMatch);
+    PHINode * const outputPosPhi = b.CreatePHI(sizeTy, 2);
+    outputPosPhi->addIncoming(producedPosPhi, inStrideMatch);
+    outputPosPhi->addIncoming(strideProducedPhi, strideInitialMatch);
+
+    Value * const finalMatchStartPtr = b.getRawInputPointer("InputStream", finalLineStartPhi);
+    Value * const finalOutputPtr = b.getRawOutputPointer("Output", outputPosPhi);
+    b.CreateMemCpy(finalOutputPtr, finalMatchStartPtr, dataLengthPhi, 1);
+    Value * extraLF_pos = b.CreateAdd(outputPosPhi, dataLengthPhi);
+    b.CreateStore(b.getInt8(0x0A), b.getRawOutputPointer("Output", extraLF_pos));
+    b.setProducedItemCount("Output", b.CreateAdd(extraLF_pos, sz_ONE));
+    b.CreateBr(matchFilterDone);
+
+    b.SetInsertPoint(matchFilterDone);
 }
 
 ColorizedReporter::ColorizedReporter(LLVMTypeSystemInterface & ts, StreamSet * ByteStream, StreamSet * const SourceCoords, StreamSet * const ColorizedCoords, Scalar * const callbackObject)

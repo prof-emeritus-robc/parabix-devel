@@ -140,22 +140,43 @@ Value * IDISA_ARM_Builder::simd_bitreverse(unsigned fw, Value * a) {
     return CreateCall(refBytesInFields->getFunctionType(), refBytesInFields, fwCast(fw, bitsInBytesRevsd));
 }
 
-Value * IDISA_ARM_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector) {
+Value * IDISA_ARM_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector, ShuffleMode mode) {
     auto vec_width = getVectorBitWidth(data_table);
     if (vec_width == mNativeBitBlockWidth && fw == 8) {
+        auto fieldCount = vec_width/fw;
+        // Default for ARM is ShuffleMode::ZeroOnIndexOver
+        if (mode == ShuffleMode::TruncateIndex) {
+            Constant * fieldMask = ConstantInt::get(getIntNTy(fw), fieldCount - 1);
+            index_vector = simd_and(index_vector, getSplat(fieldCount, fieldMask));
+        } else if (mode == ShuffleMode::ZeroOnHighIndexBit) {
+            // Preserve high bit for zeroing, but clear others.
+            Constant * fieldMask = ConstantInt::get(getIntNTy(fw), (1<<(fw-1)) + fieldCount - 1);
+            index_vector = simd_and(index_vector, getSplat(fieldCount, fieldMask));
+        }
         Function * shuf8Func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_tbl1, FixedVectorType::get(getInt8Ty(), 16));
-        return fwCast(8, CreateCall(shuf8Func->getFunctionType(), shuf8Func, {fwCast(8, data_table), fwCast(8, simd_select_lo(fw, index_vector))}));
+        return fwCast(8, CreateCall(shuf8Func->getFunctionType(), shuf8Func, {fwCast(8, data_table), fwCast(8, index_vector)}));
     }
-    return IDISA_Builder::mvmd_shuffle(fw, data_table, index_vector);
+    return IDISA_Builder::mvmd_shuffle(fw, data_table, index_vector, mode);
 }
 
-Value * IDISA_ARM_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value * table1, Value * index_vector) {
-    if (getVectorBitWidth(table0) == mNativeBitBlockWidth && fw == 8) {
+Value * IDISA_ARM_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value * table1, Value * index_vector, ShuffleMode mode) {
+    auto vec_width = getVectorBitWidth(table0);
+    if (vec_width == mNativeBitBlockWidth && fw == 8) {
+        auto fieldCount = 2*vec_width/fw;
         Function * shuf8Func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_tbl2, FixedVectorType::get(getInt8Ty(), 16));
+        // Default for ARM is ShuffleMode::ZeroOnIndexOver
+        if (mode == ShuffleMode::TruncateIndex) {
+            Constant * fieldMask = ConstantInt::get(getIntNTy(fw), fieldCount - 1);
+            index_vector = simd_and(index_vector, getSplat(fieldCount, fieldMask));
+        } else if (mode == ShuffleMode::ZeroOnHighIndexBit) {
+            // Preserve high bit for zeroing, but clear others.
+            Constant * fieldMask = ConstantInt::get(getIntNTy(fw), (1<<(fw-1)) + fieldCount - 1);
+            index_vector = simd_and(index_vector, getSplat(fieldCount, fieldMask));
+        }        
         Value * rslt = CreateCall(shuf8Func->getFunctionType(), shuf8Func, {fwCast(8, table0), fwCast(8, table1), fwCast(8, index_vector)});
             return rslt;
     }
-    return IDISA_Builder::mvmd_shuffle2(fw, table0, table1, index_vector);
+    return IDISA_Builder::mvmd_shuffle2(fw, table0, table1, index_vector, mode);
 }
 
 Value * IDISA_ARM_Builder::expandFieldMaskToBytes(Value * select_mask, unsigned fw) {
@@ -178,7 +199,7 @@ Value * IDISA_ARM_Builder::expandFieldMaskToBytes(Value * select_mask, unsigned 
 
 // raw TBL1: indexes >= 16 yield zero lanes, unlike mvmd_shuffle which reduces them mod 16
 Value * IDISA_ARM_Builder::tbl1(Value * table, Value * index_vector) {
-    Function * fn = Intrinsic::getDeclaration(getModule(), Intrinsic::aarch64_neon_tbl1,
+    Function * fn = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_tbl1,
                                               FixedVectorType::get(getInt8Ty(), 16));
     return CreateCall(fn->getFunctionType(), fn, {fwCast(8, table), fwCast(8, index_vector)});
 }

@@ -40,6 +40,11 @@ static cl::opt<std::string> TestOutputFile("o", cl::desc("Test output file."), c
 static cl::opt<bool> QuietMode("q", cl::desc("Suppress output, set the return code only."), cl::cat(testFlags));
 static cl::opt<int> ShiftMask("ShiftMask", cl::desc("Mask applied to the shift operand (2nd operand) of simd_sllv, srlv, srav, rotl, rotr"), cl::init(0));
 static cl::opt<int> Immediate("i", cl::desc("Immediate value for mvmd_dslli"), cl::init(1));
+static cl::opt<IDISA::IDISA_Builder::ShuffleMode> ShuffleIndex("ShuffleIndex",
+cl::values(clEnumValN(IDISA::IDISA_Builder::ShuffleMode::TruncateIndex, "Truncate", "Truncate out-of-bound shuffle indexes."),
+           clEnumValN(IDISA::IDISA_Builder::ShuffleMode::ZeroOnIndexOver, "ZeroOnOver", "Select zero for shuffle indexes out of bound."),
+           clEnumValN(IDISA::IDISA_Builder::ShuffleMode::ZeroOnHighIndexBit, "ZeroOnHighBit", "Select zero if high index bit set, otherwise truncate.")),
+                                cl::init(IDISA::IDISA_Builder::ShuffleMode::TruncateIndex));
 
 class ShiftMaskKernel : public BlockOrientedKernel {
 public:
@@ -79,9 +84,19 @@ private:
     const unsigned mImmediateShift;
 };
 
+std::string OpName(std::string idisa_op) {
+    if (idisa_op == "mvmd_shuffle") {
+        if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnIndexOver) {
+            return "mvmd_shuffleH";
+        } else if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnHighIndexBit)
+            return "mvmd_shuffleO";
+    }
+    return idisa_op;
+}
+
 IdisaBinaryOpTestKernel::IdisaBinaryOpTestKernel(LLVMTypeSystemInterface & ts, std::string idisa_op, unsigned fw, unsigned imm,
                                                  StreamSet *Operand1, StreamSet *Operand2, StreamSet *result)
-: MultiBlockKernel(ts, idisa_op + std::to_string(fw) + "_test",
+: MultiBlockKernel(ts, OpName(idisa_op) + std::to_string(fw) + "_test",
      {Binding{"operand1", Operand1}, Binding{"operand2", Operand2}},
      {Binding{"result", result}},
      {}, {}, {}),
@@ -164,7 +179,7 @@ void IdisaBinaryOpTestKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::V
     } else if (mIdisaOperation == "esimd_mergel") {
         result = b.esimd_mergel(mTestFw, operand1, operand2);
     } else if (mIdisaOperation == "mvmd_shuffle") {
-        result = b.mvmd_shuffle(mTestFw, operand1, operand2);
+        result = b.mvmd_shuffle(mTestFw, operand1, operand2, ShuffleIndex);
     } else if (mIdisaOperation == "mvmd_compress") {
         // Real callers (e.g. deletion.cpp) pass a scalar bitmask built with
         // hsimd_signmask, not a raw data block. Derive a realistic one from
@@ -203,7 +218,7 @@ private:
 IdisaBinaryOpCheckKernel::IdisaBinaryOpCheckKernel(LLVMTypeSystemInterface & ts, std::string idisa_op, unsigned fw, unsigned imm,
                                                    StreamSet *Operand1, StreamSet *Operand2, StreamSet *result,
                                                    StreamSet *expected, Scalar *failures)
-: BlockOrientedKernel(ts, idisa_op + std::to_string(fw) + "_check" + std::to_string(QuietMode),
+: BlockOrientedKernel(ts, OpName(idisa_op) + std::to_string(fw) + "_check" + std::to_string(QuietMode),
                            {Binding{"operand1", Operand1},
                             Binding{"operand2", Operand2},
                             Binding{"test_result", result}},
@@ -224,9 +239,20 @@ void IdisaBinaryOpCheckKernel::generateDoBlockMethod(KernelBuilder & b) {
         operand2Block = b.simd_srai(mTestFw, operand2Block, mTestFw/2 - 1);
     }
     if (mIdisaOperation == "mvmd_shuffle") {
+        Constant * fieldLimit = ConstantInt::get(fwTy, fieldCount);
         for (unsigned i = 0; i < fieldCount; i++) {
-            Value * idx = b.CreateURem(b.mvmd_extract(mTestFw, operand2Block, i), ConstantInt::get(fwTy, fieldCount));
+            Value * idx_field = b.mvmd_extract(mTestFw, operand2Block, i);
+            Value * idx = b.CreateURem(idx_field, ConstantInt::get(fwTy, fieldCount));
             Value * elt = b.CreateExtractElement(b.fwCast(mTestFw, operand1Block), b.CreateZExtOrTrunc(idx, b.getInt32Ty()));
+            if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnIndexOver) {
+                elt = b.CreateSelect(b.CreateICmpUGE(idx_field, fieldLimit),
+                                     ConstantInt::getNullValue(fwTy),
+                                     elt);
+            } else if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnHighIndexBit) {
+                elt = b.CreateSelect(b.CreateICmpSLT(idx_field, ConstantInt::getNullValue(fwTy)),
+                                     ConstantInt::getNullValue(fwTy),
+                                     elt);
+            }
             expectedBlock = b.mvmd_insert(mTestFw, expectedBlock, elt, i);
         }
     } else if (mIdisaOperation == "mvmd_compress") {

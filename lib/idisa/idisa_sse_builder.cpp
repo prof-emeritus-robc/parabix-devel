@@ -130,8 +130,8 @@ Value * IDISA_SSE2_Builder::hsimd_signmask(unsigned fw, Value * a) {
     return IDISA_SSE_Builder::hsimd_signmask(fw, a);
 }
 
-Value * IDISA_SSE2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_vector) {
-    if ((getVectorBitWidth(a) == SSE_width) && (fw == 64)) {
+Value * IDISA_SSE2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_vector, ShuffleMode mode) {
+    if ((getVectorBitWidth(a) == SSE_width) && (fw == 64) && (mode == ShuffleMode::TruncateIndex)) {
         // First create a vector with exchanged values of the 2 fields.
         Constant * idx[2] = {ConstantInt::get(getInt32Ty(), 1), ConstantInt::get(getInt32Ty(), 0)};
         Value * exchanged = CreateShuffleVector(a, UndefValue::get(fwVectorType(fw)), ConstantVector::get({idx, 2}));
@@ -145,7 +145,7 @@ Value * IDISA_SSE2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_v
         Value * rslt = simd_xor(simd_and(changed, exchange_mask), a);
         return rslt;
     }
-    return IDISA_SSE_Builder::mvmd_shuffle(fw, a, index_vector);
+    return IDISA_Builder::mvmd_shuffle(fw, a, index_vector, mode);
 }
     
 std::vector<Value *> IDISA_SSE2_Builder::simd_pext(unsigned fw, std::vector<Value *> v, Value * extract_mask) {
@@ -198,12 +198,22 @@ Value * IDISA_SSSE3_Builder::esimd_mergel(unsigned fw, Value * a, Value * b) {
     return IDISA_SSE2_Builder::esimd_mergel(fw, a, b);
 }
 
-Value * IDISA_SSSE3_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_vector) {
-    if ((getVectorBitWidth(a) == SSE_width) && (fw == 8)) {
+Value * IDISA_SSSE3_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector, ShuffleMode mode) {
+    auto vec_width = getVectorBitWidth(data_table);
+    if ((vec_width == SSE_width) && (fw == 8)) {
+        auto fieldCount = vec_width/fw;
         Function * shuf8Func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_ssse3_pshuf_b_128);
-        return CreateCall(shuf8Func->getFunctionType(), shuf8Func, {fwCast(8, a), fwCast(8, simd_and(index_vector, simd_lomask(8)))});
+        // Default for SSSE3 is ShuffleMode::ZeroOnHighBit
+        if (mode == ShuffleMode::TruncateIndex) {
+            Constant * fieldMask = ConstantInt::get(getIntNTy(fw), fieldCount - 1);
+            index_vector = simd_and(index_vector, getSplat(fieldCount, fieldMask));
+        } else if (mode == ShuffleMode::ZeroOnIndexOver) {
+            Constant * fieldMask = ConstantInt::get(getIntNTy(fw), fieldCount - 1);
+            index_vector = simd_and(index_vector, simd_ugt(fw, index_vector, getSplat(fieldCount, fieldMask)));
+        }
+        return CreateCall(shuf8Func->getFunctionType(), shuf8Func, {fwCast(8, data_table), fwCast(8, index_vector)});
     }
-    return IDISA_Builder::mvmd_shuffle(fw, a, index_vector);
+    return IDISA_Builder::mvmd_shuffle(fw, data_table, index_vector, mode);
 }
 
 Value * IDISA_SSSE3_Builder::mvmd_compress(unsigned fw, Value * a, Value * select_mask) {

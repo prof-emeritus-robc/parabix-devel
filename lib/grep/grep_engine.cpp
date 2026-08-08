@@ -773,6 +773,8 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
 
         StreamSet * Filtered = P.CreateStreamSet(1, 8);
         if (UseByteFilterByMask) {
+            // Warning: a phantom null byte may be produced in the event
+            // of input files with no final line break.
             FilterByMask(P, MatchedLineSpans, ByteStream, Filtered, 0, 64);
         } else {
             P.CreateKernelCall<MatchFilterKernel>(MatchedLineStarts, mLineBreakStream, ByteStream, Filtered);

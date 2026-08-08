@@ -52,6 +52,7 @@
 #include <map>
 #include <cstdint>
 #include <nlohmann/json.hpp>
+#include <llvm/Support/CommandLine.h>
 #include <pablo/pablo_kernel.h>
 #include <pablo/builder.hpp>
 #include <pablo/pe_zeroes.h>
@@ -65,6 +66,17 @@
 #include <stdexcept>
 #include <boost/intrusive/detail/math.hpp>
 using boost::intrusive::detail::ceil_log2;
+
+using namespace llvm;
+static cl::opt<unsigned> CompactionBase(
+    "compact-base",
+    cl::desc("The base kernel at which filter-by-mask compaction is first applied (init 40)."),
+    cl::init(40));
+
+static cl::opt<bool> GeometricCompaction(
+    "geometric-compaction",
+    cl::desc("Use a geometric rather than an arithmetic compaction schecule."),
+    cl::init(false));
 
 using namespace pablo;
 using namespace kernel;
@@ -245,11 +257,12 @@ uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
 // all-false and leaves every lenA untouched, so the byte-space path stays bit-exact.
 static std::vector<bool> applyCompactionSchedule(
         std::vector<MergeRuleGroup> & ruleRanges, unsigned K) {
+    unsigned nextCompaction = K;
 
     //  Compact after every K kernels. The first block is always byte space (F=256),
     //  so the first K kernels see the original lenA = byte distance. 
     std::vector<bool> compactAfter(ruleRanges.size(), false);
-    if (K == 0) return compactAfter;
+    if (nextCompaction == 0) return compactAfter;
 
     // parts[idAB] = (idA, idB) for every merged token. Base ids (< 256) are absent —
     // they are atomic and terminate the recursion. lookup table
@@ -292,11 +305,14 @@ static std::vector<bool> applyCompactionSchedule(
         // Decide whether to compact after this range. If we do, the next frontier is
         // the hi of this range, and we reset the memoization table. Otherwise, the
         // frontier stays the same and we keep memoizing.   
-        if (++sinceCompact < K) continue;
+        if (++sinceCompact < nextCompaction) continue;
         compactAfter[i] = true;
         frontier = g.hi;                      // every live id after kernel i is < hi_i
         memo.clear();
         sinceCompact = 0;
+        if (GeometricCompaction) {
+            nextCompaction *=2;
+        }
         nCompact++;
     }
     std::cerr << "[BPE] compaction: BPE_COMPACT_EVERY=" << K << " -> "
@@ -408,14 +424,12 @@ protected:
         PabloAST * ones   = pb.createNot(zeroes);
 
         // idAcc — the id stream we mutate; starts as a copy of the input ids.
-        // PLAIN values (functional SSA), reassigned OUTSIDE any createIf. A self-ref
-        // Var assign v=f(v) inside a scope breaks Pablo reaching-def — see memory note.
-        std::vector<PabloAST *> idAcc(W_out);
+        std::vector<Var *> idAcc(W_out);
         for (unsigned i = 0; i < W_out; i++) {
             if (i < W) {
-                idAcc[i] = srcBits[i];
+                idAcc[i] = pb.createVar("idAcc_" + std::to_string(i), srcBits[i]);
             } else {
-                idAcc[i] = zeroes;
+                idAcc[i] = pb.createVar("idAcc_" + std::to_string(i), zeroes);
             }
         }
 
@@ -423,7 +437,8 @@ protected:
         // Threaded kernel→kernel (meIn/meOut), seeded all-ones. Each fired merge clears
         // B's start (interior seam); A's start survives as AB's start. Final mask marks
         // the surviving (outermost) token STARTS — the stream emission scans.
-        PabloAST * inPlayMask = getInputStreamSet("meIn")[0];
+        Var * inPlayMask = pb.createVar("inPlayMask", getInputStreamSet("meIn")[0]);
+
         // Frozen input mask — the index for createIndexedAdvance (B-consume) in indexed
         // mode. Must be the INPUT mask (not the mutating accumulator) so "next live" is
         // fixed for the whole kernel, matching the frozen nextId.
@@ -485,7 +500,6 @@ protected:
                                   // count that dead position and flip the odd/even parity.
                 fireStart = selfMergeFireStarts(pb, pb.createAnd(Astart, inPlayMask), r.lenA);
 
-            Var * mergeV = pb.createVar("merge", zeroes);
             auto body = pb.createScope();
             BixNumCompiler bncB(body);
             // B-detection: indexed mode reads the next-live id (frozen), byte mode reads
@@ -496,29 +510,23 @@ protected:
             PabloAST * fire = body.createAnd3(inPlayMask, fireStart, BstartAtA);
             if (mHasBoundary)   // block merges where B begins a new pretoken (cross-boundary)
                 fire = body.createAnd(fire, body.createNot(boundaryAheadByLen.at(r.lenA)));
-            body.createAssign(mergeV, fire);
-            pb.createIf(pb.createAnd(fireStart, inPlayMask), body);
 
-            // Stamp idAB at A's START — OUTSIDE the gate, plain functional reassignment.
-            // idAcc are PLAIN values (not Vars); the fire leaves the scope via mergeV
-            // (zeroes where the block was skipped, so the Sel keeps the old id there).
-            // A self-ref Var assign idAcc=f(idAcc) INSIDE the scope breaks Pablo
-            // reaching-def and mis-stamps the cascade — see memory note.
-            for (unsigned i = 0; i < W_out; i++)
-                idAcc[i] = pb.createSel(mergeV, ((r.idAB >> i) & 1u) ? ones : zeroes, idAcc[i]);
+            PabloAST * notFire = body.createNot(fire);
+            for (unsigned i = 0; i < W_out; i++) {
+                if ((r.idAB >> i) & 1u) {
+                    body.createAssign(idAcc[i], body.createOr(idAcc[i], fire));
+                } else {
+                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notFire));
+                }
+            }
 
-            // Consume B's start (lenA ahead of each fired merge) — OUTSIDE the gate: B is
-            // lenA bytes ahead of A, possibly in a later block the gate skips, so the clear
-            // must run in the top scope (uses mergeV carried out of the body). Use
-            // Not(Advance(mergeV,lenA)), NOT Advance(Not mergeV,lenA): Advance fills the
-            // leading lenA bytes with 0, so the latter would wrongly clear position 0.
-            // Indexed mode: B is the NEXT LIVE token, so move the fire forward one live
-            // index position via the inline createIndexedAdvance over the FROZEN mask
-            // (no lenA) — lands on B's start regardless of byte distance.
             PabloAST * clearB = mUseNextId
-                ? pb.createIndexedAdvance(mergeV, inPlayFrozen, 1)
-                : pb.createAdvance(mergeV, r.lenA);
-            inPlayMask = pb.createAnd(inPlayMask, pb.createNot(clearB), "inPlayClear");
+                ? body.createIndexedAdvance(fire, inPlayFrozen, 1)
+                : body.createAdvance(fire, r.lenA);
+
+            body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(clearB)));
+
+            pb.createIf(pb.createAnd(fireStart, inPlayMask), body);
         }
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
@@ -552,7 +560,7 @@ BPEPassResult buildBPEPassPipeline(
     // Inject a FilterByMask compaction after every K merge kernels and rewrite the
     // rules' merge distances into the compacted (slot) frame. Default K = 40, so
     // compactions land after kernel 40, 80, 120, ... (28 points for 1123 kernels).
-    unsigned compactEvery = 40;
+    unsigned compactEvery = CompactionBase;
     if (const char * ce = std::getenv("BPE_COMPACT_EVERY")) compactEvery = (unsigned) std::atoi(ce);
     // BPE_INDEXED_SHIFT: replace each kernel's multi-bit source LookAheads with ONE
     // IndexedShiftBack(inPlayMask, source) → next-live id, and consume via inline

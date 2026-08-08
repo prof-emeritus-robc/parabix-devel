@@ -390,7 +390,7 @@ void OptimizationBranchCompiler::generateInitializeMethod(KernelBuilder & b) {
             const auto j = ref.Index + firstArgIndex;
             args[j] = getInputScalar(b, source(e, mScalarGraph));
         }
-        Function * initFn = kernel->getInitializeFunction(b, flags);
+        Function * initFn = kernel->getInitializeFunction(b, flags, true);
         FunctionType * fTy = initFn->getFunctionType();
         assert (fTy->getNumParams() == args.size());
         Value * const terminatedOnInit = b.CreateCall(fTy, initFn, args);
@@ -819,9 +819,9 @@ void OptimizationBranchCompiler::allocateOwnedBranchBuffers(KernelBuilder & b, V
                 }
                 Function * func = nullptr;
                 if (nonLocal) {
-                    func = kernelObj->getAllocateSharedInternalStreamSetsFunction(b, false);
+                    func = kernelObj->getAllocateSharedInternalStreamSetsFunction(b,  flags,false);
                 } else {
-                    func = kernelObj->getAllocateThreadLocalInternalStreamSetsFunction(b, false);
+                    func = kernelObj->getAllocateThreadLocalInternalStreamSetsFunction(b, flags, false);
                     params.push_back(loadThreadLocalHandle(b, i));
                 }
                 params.push_back(expectedNumOfStrides);

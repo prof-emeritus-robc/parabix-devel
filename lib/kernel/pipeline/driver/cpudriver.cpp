@@ -54,6 +54,11 @@ using AttrId = kernel::Attribute::KindId;
 
 class KernelGenerationMU;
 
+// TODO: if a task dependency system exists, we could split the task of state identification from codegen but
+// could not guarantee that the same thread/context would process it. Most kernel state types are defined fully
+// in their constructors. The pipeline is the only know exception. Thus very few dependencies would be needed.
+
+
 namespace {
 
 struct CPUDriverContext {

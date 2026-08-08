@@ -276,7 +276,6 @@ bool PipelineCommonGraphFunctions::isKernelStateFree(KernelBuilder & b, const si
             return false;
         }
     }
-    assert (kernelObj->isGenerated());
     if (LLVM_UNLIKELY(isKernelFamilyCall(kernel))) {
         // Even if this kernel object has no mutable scalars, we cannot determine whether a different kernel
         // belonging to the same family would have none too.

@@ -484,7 +484,7 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
 
-    mCurrentMethod = mTarget->getInitializeFunction(b, flags);
+    mCurrentMethod = mTarget->getInitializeFunction(b, flags, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -588,7 +588,7 @@ void KernelCompiler::callGenerateExpectedOutputSizeMethod(KernelBuilder & b) {
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
 
-    mCurrentMethod = mTarget->getExpectedOutputSizeFunction(b, flags);
+    mCurrentMethod = mTarget->getExpectedOutputSizeFunction(b, flags, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -636,7 +636,7 @@ inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilde
     assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-    mCurrentMethod = mTarget->getInitializeThreadLocalFunction(b, flags);
+    mCurrentMethod = mTarget->getInitializeThreadLocalFunction(b, flags, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -710,7 +710,7 @@ inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelB
         assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
         auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
         flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-        mCurrentMethod = mTarget->getAllocateSharedInternalStreamSetsFunction(b, flags);
+        mCurrentMethod = mTarget->getAllocateSharedInternalStreamSetsFunction(b, flags, true);
         assert (mCurrentMethod->empty());
         mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
         b.SetInsertPoint(mEntryPoint);
@@ -749,7 +749,7 @@ inline void KernelCompiler::callGenerateAllocateThreadLocalInternalStreamSets(Ke
         assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
         auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
         flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-        mCurrentMethod = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, flags);
+        mCurrentMethod = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, flags, true);
         assert (mCurrentMethod->empty());
         mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
         b.SetInsertPoint(mEntryPoint);
@@ -1132,7 +1132,7 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
 
-    Function * const doSegFunc = mTarget->getDoSegmentFunction(b, flags);
+    Function * const doSegFunc = mTarget->getDoSegmentFunction(b, flags, true);
 
     props.reserve(doSegFunc->getNumOperands());
     if (LLVM_LIKELY(mSharedStateType)) {
@@ -1267,7 +1267,7 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
 
-    mCurrentMethod = mTarget->getDoSegmentFunction(b, flags);
+    mCurrentMethod = mTarget->getDoSegmentFunction(b, flags, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -1344,7 +1344,7 @@ inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder 
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
 
-    mCurrentMethod = mTarget->getFinalizeThreadLocalFunction(b, flags);
+    mCurrentMethod = mTarget->getFinalizeThreadLocalFunction(b, flags, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -1377,7 +1377,7 @@ inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder 
 inline void KernelCompiler::callGenerateFinalizeMethod(KernelBuilder & b) {
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-    mCurrentMethod = mTarget->getFinalizeFunction(b, flags);
+    mCurrentMethod = mTarget->getFinalizeFunction(b, flags, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -2117,7 +2117,7 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
     auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
     flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
 
-    auto init = mTarget->getInitializeFunction(b, flags);
+    auto init = mTarget->getInitializeFunction(b, flags, true);
     assert (init);
     auto arg = init->arg_begin();
     auto nextArg = [&]() {

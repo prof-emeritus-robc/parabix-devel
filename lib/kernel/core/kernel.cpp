@@ -1437,7 +1437,7 @@ void Kernel::finalizeThreadLocalInstance(KernelBuilder & b, ArrayRef<Value *> ar
 Value * Kernel::finalizeInstance(KernelBuilder & b, ArrayRef<Value *> args) const {
 #warning TODO: remove this?
     const auto flags = getInternalStateTypeFlags();
-    Function * const termFunc = getFinalizeFunction(b, flags);
+    Function * const termFunc = getFinalizeFunction(b, flags, true);
     Value * result = b.CreateCall(termFunc->getFunctionType(), termFunc, args);
     if (mOutputScalars.empty()) {
         assert (!result || result->getType()->isVoidTy());
@@ -1501,7 +1501,7 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
     }
 
 
-    Function * const init = getInitializeFunction(b, stateTypeFlags);
+    Function * const init = getInitializeFunction(b, stateTypeFlags, true);
     assert (&init->getContext() == &b.getContext());
 
     // If we're calling this with a family call, then the family kernels associated with it
@@ -1555,14 +1555,14 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
     const auto tl = (stateTypeFlags & KernelHasThreadLocal) != 0;
     const auto ai = allocatesInternalStreamSets();
     if (ai) {
-        addHostArg(getAllocateSharedInternalStreamSetsFunction(b, stateTypeFlags));
+        addHostArg(getAllocateSharedInternalStreamSetsFunction(b, stateTypeFlags, true));
     } else {
         addHostVoidArg();
     }
     if (tl) {
-        addHostArg(getInitializeThreadLocalFunction(b, stateTypeFlags));
+        addHostArg(getInitializeThreadLocalFunction(b, stateTypeFlags, true));
         if (ai) {
-            addHostArg(getAllocateThreadLocalInternalStreamSetsFunction(b, stateTypeFlags));
+            addHostArg(getAllocateThreadLocalInternalStreamSetsFunction(b, stateTypeFlags, true));
         } else {
             addHostVoidArg();
         }
@@ -1570,15 +1570,15 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
         addHostVoidArg();
         addHostVoidArg();
     }
-    addHostArg(getDoSegmentFunction(b, stateTypeFlags));
+    addHostArg(getDoSegmentFunction(b, stateTypeFlags, true));
     if (tl) {
-        addHostArg(getFinalizeThreadLocalFunction(b, stateTypeFlags));
+        addHostArg(getFinalizeThreadLocalFunction(b, stateTypeFlags, true));
     } else {
         addHostVoidArg();
     }
 
     // TODO: queue these in a list of termination functions to add to main?
-    addHostArg(getFinalizeFunction(b, stateTypeFlags));
+    addHostArg(getFinalizeFunction(b, stateTypeFlags, true));
 
     assert (hostArgs.size() == (originalNumOfHoseArgs + 7));
 

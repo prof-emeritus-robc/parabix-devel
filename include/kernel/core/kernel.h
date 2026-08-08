@@ -422,9 +422,9 @@ public:
 
     llvm::StructType * getThreadLocalStateType(KernelBuilder & b) const;
 
-    bool isGenerated() const {
-        return (mModule != nullptr);
-    }
+//    bool isGenerated() const {
+//        return (mModule != nullptr);
+//    }
 
 //    CompilationStatus getCompilationStatus() const {
 //        return mCompilationStatus;
@@ -504,37 +504,37 @@ protected:
         StateTypes(llvm::StructType * shared, llvm::StructType * threadLocal) : Shared(shared), ThreadLocal(threadLocal) {}
     };
 
-    llvm::Function * getInitializeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getInitializeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addInitializeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getExpectedOutputSizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getExpectedOutputSizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addExpectedOutputSizeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getInitializeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getInitializeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addInitializeThreadLocalDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
     std::vector<llvm::Type *> getDoSegmentFields(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getDoSegmentFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getDoSegmentFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addDoSegmentDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getFinalizeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getFinalizeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addFinalizeThreadLocalDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 
-    llvm::Function * getFinalizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration = true) const;
+    llvm::Function * getFinalizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const;
 
     llvm::Function * addFinalizeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const;
 

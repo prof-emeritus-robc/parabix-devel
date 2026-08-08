@@ -148,7 +148,6 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     assert (FirstKernel <= kernelId && kernelId <= LastKernel);
     mKernelId = kernelId;
     mKernel = getKernel(kernelId);
-    assert (mKernel->isGenerated());
 
     bool allowDataParallelExecution = false;
 
@@ -309,7 +308,6 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
         // Family kernels must be initialized in the "main" method.
         setActiveKernel(b, i, false);
         assert (mKernelId == i);
-        assert (mKernel->isGenerated());
         if (isRoot) {
             initializeStridesPerSegment(b);
         }
@@ -430,7 +428,6 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
         for (auto kernel = FirstKernel; kernel <= LastKernel; ++kernel) {
             if (LLVM_UNLIKELY(in_degree(kernel, mBufferGraph) == 0)) {
                 setActiveKernel(b, kernel, false);
-                assert (mKernel->isGenerated());
                 FixedArray<Value *, 1> args;
                 args[0] = mKernelSharedHandle;
                 Value * eosVal = callKernelExpectedSourceOutputSizeFunction(b, args);
@@ -594,10 +591,8 @@ void PipelineCompiler::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
     getABIAlignments(b);
 
     for (unsigned i = FirstKernel; i <= LastKernel; ++i) {
-        const Kernel * const kernel = getKernel(i);
+        setActiveKernel(b, i, true, true);
         if (mKernelThreadLocalHandle) {
-            setActiveKernel(b, i, true, true);
-            assert (mKernel == kernel);
             SmallVector<Value *, 2> args;
             if (LLVM_LIKELY(mKernelSharedHandle != nullptr)) {
                 args.push_back(mKernelSharedHandle);

@@ -518,10 +518,10 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     }
 
     Module * const m = b.getModule();
-    Function * const doSegment = getDoSegmentFunction(b, flags, false); assert (doSegment);
+    Function * const doSegment = getDoSegmentFunction(b, flags, true);
     assert (doSegment->arg_size() >= suppliedArgs);
    //  const auto numOfDoSegArgs = doSegment->arg_size() - suppliedArgs;
-    Function * const terminate = getFinalizeFunction(b, flags);
+    Function * const terminate = getFinalizeFunction(b, flags, true);
 
     const auto numOfStreamSets = mInputStreamSets.size() + mOutputStreamSets.size();
 
@@ -808,7 +808,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
         ConstantInt * const sz_BufferSize = b.getSize(segLength * codegen::BufferSegments);
 
-        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b, flags);
+        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b, flags, true);
         SmallVector<Value *, 4> allocArgs;
         if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
             allocArgs.push_back(sharedHandle);
@@ -822,7 +822,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         }
         b.CreateCall(allocShared->getFunctionType(), allocShared, allocArgs);
         if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
-            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b, flags);
+            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b, flags, true);
             SmallVector<Value *, 3> allocArgs;
             if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
                 allocArgs.push_back(sharedHandle);

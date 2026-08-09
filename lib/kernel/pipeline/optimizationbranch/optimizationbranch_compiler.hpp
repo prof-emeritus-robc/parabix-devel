@@ -78,7 +78,7 @@ class OptimizationBranchCompiler final : public KernelCompiler {
 
 public:
 
-    OptimizationBranchCompiler(KernelBuilder & b, OptimizationBranch * const branch) noexcept;
+    OptimizationBranchCompiler(KernelBuilder & b, OptimizationBranch * const branch, TargetMachine * TM) noexcept;
 
     void addBranchProperties(KernelBuilder & b);
     void constructStreamSetBuffers(KernelBuilder & b) override;
@@ -860,8 +860,8 @@ inline std::array<const Kernel *, 4> makeBranches(const OptimizationBranch * con
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
-OptimizationBranchCompiler::OptimizationBranchCompiler(KernelBuilder & b, OptimizationBranch * const branch) noexcept
-: KernelCompiler(branch)
+OptimizationBranchCompiler::OptimizationBranchCompiler(KernelBuilder & b, OptimizationBranch * const branch, TargetMachine *TM) noexcept
+: KernelCompiler(branch, TM)
 , mCondition(branch->getCondition())
 , mBranches(makeBranches(branch))
 , mStreamSetGraph(makeRelationshipGraph(RelationshipType::StreamSet))

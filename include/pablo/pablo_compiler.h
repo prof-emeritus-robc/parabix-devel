@@ -33,7 +33,7 @@ public:
 
     using KernelBuilder = kernel::KernelBuilder;
 
-    PabloCompiler(PabloKernel * kernel);
+    PabloCompiler(PabloKernel * kernel, llvm::TargetMachine * TM);
 
 protected:
 

@@ -2322,6 +2322,8 @@ void CBuilder::LinkAllNecessaryExternalFunctions() const {
     FunctionType * fty = FunctionType::get(getVoidPtrTy(), params, false);
     mDriver->addLinkFunction(nullptr, ALIGNED_ALLOC_NAME, fty, (void*)std::aligned_alloc);
 
+
+
 }
 
 std::string CBuilder::getKernelName() const {

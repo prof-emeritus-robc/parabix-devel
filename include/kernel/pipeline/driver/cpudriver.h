@@ -57,11 +57,10 @@ private:
     std::unique_ptr<llvm::raw_fd_ostream>                   mUnoptimizedIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
-
-    std::unique_ptr<CPUDriverContextPool>                   mContextPool;
     std::unique_ptr<llvm::orc::SymbolLookupSet>             mSymbolLookupSet;
     std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
-    std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
+    std::unique_ptr<CPUDriverContextPool>                   mContextPool;
     LinkedFunctionVector                                    mLinkedFunctions;
+    std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
 };
 

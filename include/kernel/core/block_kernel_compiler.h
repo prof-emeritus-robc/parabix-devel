@@ -7,7 +7,7 @@ namespace kernel {
 class BlockKernelCompiler : public KernelCompiler {
 public:
 
-    BlockKernelCompiler(BlockOrientedKernel * const kernel) noexcept;
+    BlockKernelCompiler(BlockOrientedKernel * const kernel, llvm::TargetMachine * TM) noexcept;
 
     void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfBlocks);
 

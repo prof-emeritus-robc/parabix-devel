@@ -417,7 +417,7 @@ void PipelineAnalysis::printBufferGraph(KernelBuilder & b, raw_ostream & out) co
         // and compiled, however, so not only is this the wrong place for this but its also
         // more than necessary.
 
-        kernelObj->generateOrLoadKernel(b);
+      //  kernelObj->generateOrLoadKernel(b, getTargetMachine());
 
         const auto nonLinear = mayHaveNonLinearIO(kernel);
 

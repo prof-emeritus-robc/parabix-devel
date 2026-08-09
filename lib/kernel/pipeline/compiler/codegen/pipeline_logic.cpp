@@ -19,7 +19,7 @@ void PipelineCompiler::generateImplicitKernels(KernelBuilder & b) {
         auto & S = mStreamGraph[i];
 
         if (S.Flags & RelationshipNodeFlag::ImplicitlyAdded) {
-            const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b);
+            const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b, getTargetMachine());
         }
 
 

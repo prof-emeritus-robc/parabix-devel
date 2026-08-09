@@ -176,8 +176,8 @@ bool Kernel::canSetTerminateSignal() const {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> Kernel::instantiateKernelCompiler(KernelBuilder & /* b */) {
-    return std::make_unique<KernelCompiler>(const_cast<Kernel *>(this));
+std::unique_ptr<KernelCompiler> Kernel::instantiateKernelCompiler(KernelBuilder & /* b */, TargetMachine * TM) {
+    return std::make_unique<KernelCompiler>(const_cast<Kernel *>(this), TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -234,22 +234,14 @@ Module * Kernel::makeEmptyModule(KernelBuilder & b) {
              md->addOperand(MDNode::get(m->getContext(), {sig}));
          }
     }
-    setModule(m);
     return m;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernel
  ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::generateKernel(KernelBuilder & b) {
-    assert (mCompilationStatus <= CompilationStatus::StateConstructed || mCompilationStatus == CompilationStatus::UnownedModule);
-    assert (b.getModule());
-    setModule(b.getModule());
-    if (mCompilationStatus == CompilationStatus::UnownedModule) {
-        return;
-    }
-    instantiateKernelCompiler(b)->generateKernel(b);
-    mCompilationStatus = CompilationStatus::LoadedOrCompiled;
+void Kernel::generateKernel(KernelBuilder & b, llvm::TargetMachine * TM) {
+    instantiateKernelCompiler(b, TM)->generateKernel(b);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -290,17 +282,13 @@ void Kernel::ensureLoaded(KernelBuilder & b) {
  * @brief loadCachedKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::loadCachedKernel(KernelBuilder & b) {
-    assert (mCompilationStatus < CompilationStatus::StateConstructed || mCompilationStatus == CompilationStatus::UnownedModule);
     Module * m = b.getModule(); assert (m);
-    setModule(m);
-    assert (m->getOrInsertNamedMetadata(getName() + STATE_TYPE_METADATA_SUFFIX)->getNumOperands() == 1);
     SmallVector<char, 256> tmp;
     StructType * sharedTy = nullIfEmpty(getTypeByName(m, concat(getName(), SHARED_SUFFIX, tmp)));
     StructType * threadLocalTy = nullIfEmpty(getTypeByName(m, concat(getName(), THREAD_LOCAL_SUFFIX, tmp)));
     if (sharedTy) mFlags |= Kernel::KernelIsStateful;
     if (threadLocalTy) mFlags |= Kernel::KernelHasThreadLocal;
     linkExternalMethods(b);
-    mCompilationStatus = CompilationStatus::LoadedOrCompiled;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -574,9 +562,9 @@ Kernel::StateTypes Kernel::constructStateTypes(KernelBuilder & b) const {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateOrLoadKernel
  ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::generateOrLoadKernel(KernelBuilder & b) {
+void Kernel::generateOrLoadKernel(KernelBuilder & b, TargetMachine * TM) {
     if (b.getModule()->getNamedMetadata(getName() + STATE_TYPE_METADATA_SUFFIX) == nullptr) {
-        generateKernel(b);
+        generateKernel(b, TM);
     }
 //    if (LLVM_LIKELY(mCompilationStatus >= CompilationStatus::LoadedOrCompiled)) {
 //        /* do nothing */
@@ -1826,7 +1814,6 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
 : mTypeId(typeId)
 , mStride(ts.getBitBlockWidth())
 , mFlags(flags | collectOutputFlags(stream_outputs))
-, mCompilationStatus(status)
 , mInputStreamSets(std::move(stream_inputs))
 , mOutputStreamSets(std::move(stream_outputs))
 , mInputScalars(std::move(scalar_inputs))
@@ -1886,7 +1873,6 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
 , mTypeId(typeId)
 , mStride(ts.getBitBlockWidth())
 , mFlags(flags | collectOutputFlags(stream_outputs))
-, mCompilationStatus(status)
 , mInputStreamSets(std::move(stream_inputs))
 , mOutputStreamSets(std::move(stream_outputs))
 , mInputScalars(std::move(scalar_inputs))

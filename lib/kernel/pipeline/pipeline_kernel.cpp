@@ -440,8 +440,8 @@ void PipelineKernel::setOutputScalarAt(const unsigned i, Scalar * const value) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b) {
-    return std::make_unique<PipelineCompiler>(b, const_cast<PipelineKernel *>(this));
+std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine *TM) {
+    return std::make_unique<PipelineCompiler>(b, const_cast<PipelineKernel *>(this), TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

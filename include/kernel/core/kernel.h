@@ -27,6 +27,7 @@
 namespace llvm { namespace orc { class LLJIT; } }
 namespace llvm { class IndirectBrInst; }
 namespace llvm { class PHINode; }
+namespace llvm { class TargetMachine; }
 
 namespace kernel {
 
@@ -395,44 +396,21 @@ public:
     virtual void setOutputScalarAt(const unsigned i, Scalar * value);
 
     void addInternalScalar(llvm::Type * type, const llvm::StringRef name, const unsigned group = 0) {
-        assert ("cannot modify state types after initialization" && mCompilationStatus < CompilationStatus::StateConstructed);
         mInternalScalars.emplace_back(ScalarType::Internal, type, name, group, ThreadLocalScalarAccumulationRule::DoNothing);
     }
 
     void addNonPersistentScalar(llvm::Type * type, const llvm::StringRef name) {
-        assert ("cannot modify state types after initialization" && mCompilationStatus < CompilationStatus::StateConstructed);
         mInternalScalars.emplace_back(ScalarType::NonPersistent, type, name, 0, ThreadLocalScalarAccumulationRule::DoNothing);
     }
 
     void addThreadLocalScalar(llvm::Type * type, const llvm::StringRef name, const unsigned group = 0,
                               const ThreadLocalScalarAccumulationRule rule = ThreadLocalScalarAccumulationRule::DoNothing) {
-        assert ("cannot modify state types after initialization" && mCompilationStatus < CompilationStatus::StateConstructed);
         mInternalScalars.emplace_back(ScalarType::ThreadLocal, type, name, group, rule);
-    }
-
-    void setModule(llvm::Module * const module) {
-        mModule = module;
-    }
-
-    llvm::Module * getModule() const {
-        return mModule;
     }
 
     llvm::StructType * getSharedStateType(KernelBuilder & b) const;
 
     llvm::StructType * getThreadLocalStateType(KernelBuilder & b) const;
-
-//    bool isGenerated() const {
-//        return (mModule != nullptr);
-//    }
-
-//    CompilationStatus getCompilationStatus() const {
-//        return mCompilationStatus;
-//    }
-
-//    void setCompilationStatus(const CompilationStatus status) {
-//        mCompilationStatus = status;
-//    }
 
     std::string makeCacheName(KernelBuilder & b);
 
@@ -440,7 +418,7 @@ public:
 
     void ensureLoaded(KernelBuilder & b);
 
-    void generateKernel(KernelBuilder & b);
+    void generateKernel(KernelBuilder & b, llvm::TargetMachine * TM);
 
     void loadCachedKernel(KernelBuilder & b);
 
@@ -480,7 +458,7 @@ public:
 
     virtual void addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags);
 
-    virtual std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b);
+    virtual std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine * TM);
 
     virtual ~Kernel();
 
@@ -604,7 +582,7 @@ protected:
 
     StateTypes constructStateTypes(KernelBuilder & b) const;
 
-    void generateOrLoadKernel(KernelBuilder & b);
+    void generateOrLoadKernel(KernelBuilder & b, llvm::TargetMachine * TM);
 
     virtual void generateInitializeMethod(KernelBuilder &) { }
 
@@ -664,13 +642,9 @@ protected:
 
 protected:
 
-    using ModulePtr = std::unique_ptr<llvm::orc::ThreadSafeModule>;
-
     const TypeId                        mTypeId;
     unsigned                            mStride;
     unsigned                            mFlags;
-    llvm::Module *                      mModule = nullptr;
-    CompilationStatus                   mCompilationStatus;
     Bindings                            mInputStreamSets;
     Bindings                            mOutputStreamSets;
     Bindings                            mInputScalars;
@@ -757,7 +731,7 @@ public:
 
     static bool classof(const void *) { return false; }
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b);
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine *TM) override;
 
 protected:
 

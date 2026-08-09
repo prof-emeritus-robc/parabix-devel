@@ -36,7 +36,7 @@ public:
         return mCondition;
     }
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
 protected:
 

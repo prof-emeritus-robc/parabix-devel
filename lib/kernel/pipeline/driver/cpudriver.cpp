@@ -24,7 +24,7 @@
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
-#include <boost/lockfree/queue.hpp>
+#include <queue>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
 #else
@@ -61,20 +61,25 @@ class KernelGenerationMU;
 
 namespace {
 
-struct CPUDriverContext {
+struct CPUDriverContext : public ThreadSafeContext {
     Kernel *                                TargetKernel;
     size_t                                  IsCompilingMainFunction;
     std::unique_ptr<llvm::TargetMachine>    TargetMachine;
     std::unique_ptr<KernelBuilder>          Builder;
-    ThreadSafeContext                       Context;
+    std::unique_ptr<SimpleCompiler>         Compiler;
 
-    CPUDriverContext(std::unique_ptr<LLVMContext> ctx, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, CPUDriver * const driver)
-    : TargetKernel(nullptr)
+    CPUDriverContext(std::unique_ptr<LLVMContext> ctx, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, CPUDriver * const driver)
+    : ThreadSafeContext(std::move(ctx))
+    , TargetKernel(nullptr)
     , IsCompilingMainFunction(0)
     , TargetMachine(cantFail(JTMB.createTargetMachine()))
-    , Builder(IDISA::GetIDISA_Builder(*ctx, features))
-    , Context(std::move(ctx)) {
+    , Builder(IDISA::GetIDISA_Builder(*getContext(), features))
+    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, ObjCache)) {
         Builder->setDriver(*driver);
+
+
+        // TODO: does LLVM16 still use setDiagnosticContext?
+        getContext()->setDiagnosticHandlerCallBack(nullptr, static_cast<void*>(this));
     }
 
 };
@@ -82,36 +87,30 @@ struct CPUDriverContext {
 class CPUDriverContextPool {
 public:
 
-    CPUDriverContextPool(const size_t count, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, CPUDriver * const driver)
-    : NextContextIndex(0) {
-        Contexts.reserve(count);
+    CPUDriverContextPool(const size_t count, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, CPUDriver * const driver) {
         for (size_t i = 0; i < count; ++i) {
-            Contexts.emplace_back(std::make_unique<LLVMContext>(), JTMB, features, driver);
+            Contexts.push(std::make_unique<CPUDriverContext>(std::make_unique<LLVMContext>(), JTMB, features, ObjCache, driver));
         }
     }
 
-    void setInitialModule(Module * const m) {
-//        for (auto & c : Contexts) {
-//            c.Builder->setModule(m);
-//        }
+    CPUDriverContext * acquire() {
+        std::unique_lock<std::mutex> lock(Mutex);
+        Cond.wait(lock, [this](){ return !Contexts.empty(); });
+        auto next = Contexts.front().release();
+        Contexts.pop();
+        return next;
     }
 
-    CPUDriverContext & getContext() {
-        thread_local CPUDriverContext * current = nullptr;
-        if (LLVM_UNLIKELY(current == nullptr)) {
-            const auto idx = NextContextIndex.fetch_add(1);
-            current = &Contexts[idx % Contexts.size()];
-        }
-        return *current;
-    }
-
-    size_t count() const {
-        return Contexts.size();
+    void release(CPUDriverContext * const ctx) {
+        std::unique_lock<std::mutex> lock(Mutex);
+        Contexts.push(std::unique_ptr<CPUDriverContext>(ctx));
+        Cond.notify_one();
     }
 
 private:
-    std::atomic<size_t> NextContextIndex;
-    std::vector<CPUDriverContext> Contexts;
+    std::mutex Mutex;
+    std::condition_variable Cond;
+    std::queue<std::unique_ptr<CPUDriverContext>> Contexts;
 };
 
 
@@ -126,11 +125,9 @@ public:
 
     CPUDriverKernelCompiler(CPUDriverContextPool & pool,
                             JITTargetMachineBuilder & JTMB,
-                            ObjectCache *ObjCache,
                             CPUDriver::LinkedFunctionVector & linkedFunctionVector)
     : orc::IRCompileLayer::IRCompiler(irManglingOptionsFromTargetOptions(JTMB.getOptions()))
     , Pool(pool)
-    , ObjCache(ObjCache)
     , LinkedFunctions(linkedFunctionVector) {
 
     }
@@ -146,17 +143,13 @@ public:
     // override the actual orc compiler routine to
     Expected<std::unique_ptr<MemoryBuffer>> operator()(Module & M) override {
         // TODO: use a threadpool with a fixed number of expected threads to avoid reconstructing the builder and compiler objects
-        auto & ctx = Pool.getContext();
+        auto ctx = static_cast<CPUDriverContext *>(M.getContext().getDiagnosticContext()); assert (ctx);
 
-        Kernel * const K = ctx.TargetKernel;
+        // TODO: need to do the IR lookup from the object cache here
 
-        errs() << "Compiling Module " << M.getName() << " ("; errs().write_hex((uintptr_t)&ctx) << ")\n";
-
-        assert (ctx.TargetKernel->getModule() == &M || ctx.IsCompilingMainFunction != 0);
-
+        Kernel * const K = ctx->TargetKernel;
         auto & C = M.getContext();
-
-        assert (ctx.Context.getContext() == &C);
+        assert (ctx->getContext() == &C);
 
         for (const auto & link : LinkedFunctions) {
             if (link.Target == K || link.Target == nullptr) {
@@ -165,7 +158,7 @@ public:
             }
         }
 
-        auto & builder = *ctx.Builder;
+        auto & builder = *ctx->Builder;
 
         builder.setModule(&M);
 
@@ -173,17 +166,12 @@ public:
         M.setDataLayout(*TargetDataLayout);
 
         auto optLevel = CodeGenOptLevel::Default;
-        if (LLVM_LIKELY(ctx.IsCompilingMainFunction == 0)) {
-
-            errs() << "Compiling Kernel " << K->getName() << "\n";
+        if (LLVM_LIKELY(ctx->IsCompilingMainFunction == 0)) {
 
             NamedRegionTimer T(K->getSignature(), K->getName(),
                                "Kernel", "Kernel Generation",
                                codegen::TimeKernelsIsEnabled);
-
-            K->setModule(&M);
-
-            K->generateKernel(builder);
+            K->generateKernel(builder, ctx->TargetMachine.get());
             if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
                 optLevel = codegen::BackEndOptLevel;
             }
@@ -197,21 +185,22 @@ public:
 
         }
 
+
+
         NamedRegionTimer T(M.getModuleIdentifier(), "",
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        auto & TM = ctx.TargetMachine;
-        TM->setOptLevel(optLevel);
-        SimpleCompiler compiler(*TM, ObjCache);
-        return compiler(M);
+        ctx->TargetMachine->setOptLevel(optLevel);
+        auto result = ctx->Compiler->operator()(M);
+        M.dropAllReferences();
+        Pool.release(ctx);
+        return result;
     }
 
 private:
 
-
     CPUDriverContextPool & Pool;
-    ObjectCache * const ObjCache;
     StringRef TargetTriple;
     const DataLayout * TargetDataLayout;
     CPUDriver::LinkedFunctionVector & LinkedFunctions;
@@ -232,12 +221,12 @@ public:
     StringRef getName() const override { return "<KernelGenerationMU>"; }
 
     void materialize(std::unique_ptr<MaterializationResponsibility> R) override {
-        auto & ctx = Pool.getContext();
-        ctx.TargetKernel = Target; assert (Target);
-        Module * const M = Target->makeEmptyModule(*ctx.Builder);
-        // TODO: can we just add this kernel to the pool context? when does the emit fire?
-        assert (ctx.Context.getContext());
-        ThreadSafeModule TSM(std::unique_ptr<Module>(M), ctx.Context);
+        auto ctx = Pool.acquire();
+        assert (&ctx->Builder->getContext() == ctx->getContext());
+        ctx->TargetKernel = Target; assert (Target);
+        ctx->IsCompilingMainFunction = 0;
+        Module * const M = Target->makeEmptyModule(*ctx->Builder);
+        ThreadSafeModule TSM(std::unique_ptr<Module>(M), *ctx);
         TargetLayer.emit(std::move(R), std::move(TSM));
     }
 
@@ -272,10 +261,11 @@ public:
     StringRef getName() const override { return "<MainGenerationMU>"; }
 
     void materialize(std::unique_ptr<MaterializationResponsibility> R) override {
-        auto & ctx = Pool.getContext();
-        ctx.TargetKernel = Target; assert (Target);
-        ctx.IsCompilingMainFunction = 1;
-        ThreadSafeModule TSM(std::make_unique<Module>("main", *ctx.Context.getContext()), ctx.Context);
+        auto ctx = Pool.acquire();
+        assert (&ctx->Builder->getContext() == ctx->getContext());
+        ctx->TargetKernel = Target; assert (Target);
+        ctx->IsCompilingMainFunction = 1;
+        ThreadSafeModule TSM(std::make_unique<Module>("main", *ctx->getContext()), *ctx);
         TargetLayer.emit(std::move(R), std::move(TSM));
     }
 
@@ -330,41 +320,17 @@ CPUDriver::CPUDriver(std::string && moduleName)
         }
     }
 
-    std::string errMessage;
-    auto TripleStr = sys::getDefaultTargetTriple();
-    auto CPUStr = sys::getHostCPUName();
-    const Target *TheTarget = TargetRegistry::lookupTarget(TripleStr, errMessage);
-
-    if (!TheTarget) {
-        throw std::runtime_error("Could not lookup target for triple " + TripleStr + ": " + errMessage);
-    }
-
-    TargetOptions Options = codegen::target_Options;
-
-    mTarget = TheTarget->createTargetMachine(
-        TripleStr,               // Target Triple
-        CPUStr,                  // Host CPU Name
-        llvm::join(attrs, ","),  // Flattened features string list
-        Options,                 // Pipeline CodeGen target configurations
-        std::nullopt,            // Fixes error! Expresses 'Default' relocation model
-        CodeModel::Small,        // Standard Code Model
-        codegen::BackEndOptLevel // Optimization configurations
-    );
-
-    if (mTarget == nullptr) {
-        throw std::runtime_error("Could not allocate TargetMachine wrapper profile structure layout");
-    }
-
-    auto JTMB = orc::JITTargetMachineBuilder(mTarget->getTargetTriple());
-    JTMB.setCPU(CPUStr.str())
+    auto JTMB = orc::JITTargetMachineBuilder(Triple{sys::getDefaultTargetTriple()});
+    JTMB.setCPU(sys::getHostCPUName().str())
         .addFeatures(attrs)
-        .setOptions(Options)
+        .setOptions(codegen::target_Options)
         .setRelocationModel(Reloc::Static)
+        .setCodeModel(CodeModel::Small)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
-    const size_t numOfThreads = 1;
+    const size_t numOfThreads = 4;
 
-    mContextPool = std::make_unique<CPUDriverContextPool>(numOfThreads, JTMB, features, this);
+    mContextPool = std::make_unique<CPUDriverContextPool>(numOfThreads, JTMB, features, mObjectCache.get(), this);
 
     auto Builder = orc::LLJITBuilder();
     Builder.setJITTargetMachineBuilder(std::move(JTMB));
@@ -376,7 +342,6 @@ CPUDriver::CPUDriver(std::string && moduleName)
             return std::make_unique<CPUDriverKernelCompiler>(
                 *mContextPool,
                 InnerJTMB,
-                mObjectCache.get(),
                 mLinkedFunctions
             );
     });
@@ -387,8 +352,6 @@ CPUDriver::CPUDriver(std::string && moduleName)
     auto & CC = reinterpret_cast<CPUDriverKernelCompiler &>(CL.getCompiler());
     CC.setTargetTriple(mEngine->getTargetTriple().getTriple());
     CC.setDataLayout(mEngine->getDataLayout());
-
-    mContextPool->setInitialModule(mMainModule);
 
     auto & MainJD = mEngine->getMainJITDylib();
 
@@ -412,8 +375,6 @@ CPUDriver::CPUDriver(std::string && moduleName)
 
 Function * CPUDriver::addLinkFunction(Kernel * kernel, llvm::StringRef name, FunctionType * type, void * functionPtr) {
     // TODO: this will need a main context lock
-    assert (&mMainModule->getContext() == mContext);
-    assert (&type->getContext() == mContext);
     Function * f = mMainModule->getFunction(name);
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(type, Function::ExternalLinkage, name, mMainModule);
@@ -466,10 +427,6 @@ void CPUDriver::generateUncachedKernels() {
         logAllUnhandledErrors(std::move(err), errs(), "LLJIT Session Error: ");
     });
 
-//    for (unsigned i = 0; i < numKernels; ++i) {
-//        CC.registerKernel(mUncachedKernel[i].get());
-//    }
-
     MangleAndInterner Mangler(ES, mEngine->getDataLayout());
 
     mCachedKernel.reserve(numKernels);
@@ -481,13 +438,13 @@ void CPUDriver::generateUncachedKernels() {
 
     mUncachedKernel.clear();
 
-    assert (!mSymbolLookupSet->containsDuplicates());
+//    assert (!mSymbolLookupSet->containsDuplicates());
 
-    linkAllExternalSymbols();
+//    linkAllExternalSymbols();
 
-    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
-    cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
-    removeAll(*mSymbolLookupSet);
+//    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
+//    cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
+//    removeAll(*mSymbolLookupSet);
 
 }
 
@@ -510,34 +467,6 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     auto & CL = mEngine->getIRCompileLayer();
 
     cantFail(MainJD.define(std::make_unique<MainGenerationMU>(pk, mainSymbol, *mSymbolLookupSet, CL, *mContextPool)));
-
-//    mBuilder->setModule(mMainModule);
-
-//    // Build the "main" module frame context execution pipeline
-//    pk->addKernelDeclarations(*mBuilder);
-
-//    // Finalize compiling and extracting the entry address pointer context out of your JIT
-//    // Assuming you look up your main wrapper method afterwards using mEngine->lookup("main")
-
-//    // TODO: to ensure that we can pass the correct num of threads, we cannot statically compile the
-//    // main method until we add the thread count as a parameter. Investigate whether we can make a
-//    // better "wrapper" method for that that allows easier access to the output scalars.
-
-//    Function * const main = pk->addOrDeclareMainFunction(*mBuilder, Kernel::AddInternal);
-
-//    // NOTE: the pipeline kernel is destructed after calling clear unless this driver preserves kernels!
-
-
-//    //  Wrap and submit your main wrapper module into the active ORC engine run instance
-
-
-//    SymbolStringPtr mainSymbol = MI(main->getName());
-//    mSymbolLookupSet->add(mainSymbol, SymbolLookupFlags::RequiredSymbol);
-
-
-//    ThreadSafeContext ctx(std::unique_ptr<LLVMContext>{&mMainModule->getContext()});
-//    ThreadSafeModule TSM(std::unique_ptr<Module>{mMainModule}, ctx);
-//    cantFail(mEngine->addIRModule(MainJD, std::move(TSM)));
 
 #if 0
     if (LLVM_UNLIKELY(codegen::ShowASMOption != codegen::OmittedOption)) {
@@ -585,6 +514,8 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     auto funcMap = cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
     auto mainFuncPtr = funcMap.find(mainSymbol)->getSecond().getAddress().toPtr<void*>();
 
+
+
     assert (mainFuncPtr);
 
     removeAll(*mSymbolLookupSet);
@@ -624,6 +555,6 @@ bool CPUDriver::hasExternalFunction(llvm::StringRef functionName) const {
 }
 
 CPUDriver::~CPUDriver() {
-
+    cantFail(mEngine->getExecutionSession().endSession());
 }
 

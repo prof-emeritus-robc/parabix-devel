@@ -19,8 +19,8 @@ namespace kernel {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> BlockOrientedKernel::instantiateKernelCompiler(KernelBuilder & /* b */) {
-    return std::make_unique<BlockKernelCompiler>(const_cast<BlockOrientedKernel *>(this));
+std::unique_ptr<KernelCompiler> BlockOrientedKernel::instantiateKernelCompiler(KernelBuilder & /* b */, llvm::TargetMachine * TM) {
+    return std::make_unique<BlockKernelCompiler>(const_cast<BlockOrientedKernel *>(this), TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

@@ -163,7 +163,7 @@ class PipelineCompiler final : public KernelCompiler, public PipelineCommonGraph
 
 public:
 
-    PipelineCompiler(KernelBuilder & b, PipelineKernel * const pipelineKernel);
+    PipelineCompiler(KernelBuilder & b, PipelineKernel * const pipelineKernel, llvm::TargetMachine * TM);
 
     void generateImplicitKernels(KernelBuilder & b);
     void addPipelineKernelProperties(KernelBuilder & b);
@@ -197,7 +197,7 @@ public:
 
 private:
 
-    PipelineCompiler(PipelineKernel * const pipelineKernel, PipelineAnalysis && P);
+    PipelineCompiler(PipelineKernel * const pipelineKernel, PipelineAnalysis && P, TargetMachine *TM);
 
 // internal pipeline state construction functions
 
@@ -924,8 +924,8 @@ protected:
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
-inline PipelineCompiler::PipelineCompiler(KernelBuilder & b, PipelineKernel * const pipelineKernel)
-: PipelineCompiler(pipelineKernel, PipelineAnalysis::analyze(b, pipelineKernel)) {
+inline PipelineCompiler::PipelineCompiler(KernelBuilder & b, PipelineKernel * const pipelineKernel, TargetMachine *TM)
+: PipelineCompiler(pipelineKernel, PipelineAnalysis::analyze(b, pipelineKernel), TM) {
     // Use a delegating constructor to compute the pipeline graph data once and pass it to
     // the compiler. Although a const function attribute ought to suffice, gcc 8.2 does not
     // resolve it correctly and clang requires -O2 or better.
@@ -937,8 +937,8 @@ inline PipelineCompiler::PipelineCompiler(KernelBuilder & b, PipelineKernel * co
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
-inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel, PipelineAnalysis && P)
-: KernelCompiler(pipelineKernel)
+inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel, PipelineAnalysis && P, TargetMachine * TM)
+: KernelCompiler(pipelineKernel, TM)
 , PipelineCommonGraphFunctions(mStreamGraph, mBufferGraph)
 , mCheckAssertions(codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnablePipelineAsserts))
 , mCheckStreamSets(codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnableStreamSetAsserts))

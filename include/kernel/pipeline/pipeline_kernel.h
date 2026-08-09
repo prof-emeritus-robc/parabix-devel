@@ -123,7 +123,7 @@ public:
 
     void addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) final;
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
     ~PipelineKernel() override;
 

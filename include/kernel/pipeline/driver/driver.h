@@ -70,9 +70,9 @@ public:
 
     virtual void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) = 0;
 
-    llvm::TargetMachine * getTargetMachine() {
-        return mTarget;
-    }
+//    llvm::TargetMachine * getTargetMachine() {
+//        return mTarget;
+//    }
 
     const std::unique_ptr<kernel::KernelBuilder> & getMainBuilder() const {
         return mBuilder;
@@ -117,8 +117,6 @@ protected:
 
     std::unique_ptr<kernel::KernelBuilder>                  mBuilder;
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;
-
-    llvm::TargetMachine *                                   mTarget;
 
     llvm::StringSet<>                                       mCompiledIdentifiers;
 

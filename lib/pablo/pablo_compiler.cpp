@@ -1234,8 +1234,8 @@ inline std::unique_ptr<CarryManager> makeCarryManager() {
     llvm_unreachable("Unknown CarryManager type!");
 }
 
-PabloCompiler::PabloCompiler(PabloKernel * const kernel)
-: BlockKernelCompiler(kernel)
+PabloCompiler::PabloCompiler(PabloKernel * const kernel, llvm::TargetMachine * TM)
+: BlockKernelCompiler(kernel, TM)
 , mKernel(kernel)
 , mCarryManager(makeCarryManager())
 , mBranchCount(0) {

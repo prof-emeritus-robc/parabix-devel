@@ -251,8 +251,8 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
     CGSCCAnalysisManager CGAM;
     ModuleAnalysisManager MAM;
 
-    auto & driver = b.getDriver();
-    PassBuilder PB(driver.getTargetMachine());
+
+    PassBuilder PB(mTargetMachine);
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -2235,8 +2235,9 @@ void KernelCompiler::captureStreamData(KernelBuilder & b, Constant * kernelName,
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
-KernelCompiler::KernelCompiler(not_null<Kernel *> kernel) noexcept
+KernelCompiler::KernelCompiler(not_null<Kernel *> kernel, TargetMachine * TM) noexcept
 : mTarget(kernel)
+, mTargetMachine(TM)
 , mInputStreamSets(kernel->mInputStreamSets)
 , mOutputStreamSets(kernel->mOutputStreamSets)
 , mInputScalars(kernel->mInputScalars)

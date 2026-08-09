@@ -61,7 +61,7 @@ public:
 public:
 
     // constructor
-    KernelCompiler(not_null<Kernel *> kernel) noexcept;
+    KernelCompiler(not_null<Kernel *> kernel, llvm::TargetMachine * TM) noexcept;
 
     void generateKernel(KernelBuilder & b);
 
@@ -378,6 +378,10 @@ public:
 
     static Rational getLCMOfFixedRateInputs(const Kernel * const target);
 
+    llvm::TargetMachine * getTargetMachine() const {
+        return mTargetMachine;
+    }
+
 protected:
 
     void registerIllustrator(KernelBuilder & b, llvm::Constant * kernelName, llvm::Constant * streamName, const size_t rows, const size_t cols, const size_t itemWidth, const MemoryOrdering ordering, IllustratorTypeId illustratorTypeId, const char replacement0, const char replacement1, const llvm::ArrayRef<size_t> loopIds) const;
@@ -409,6 +413,7 @@ private:
 protected:
 
     Kernel * const                  mTarget;
+    llvm::TargetMachine * const     mTargetMachine;
 
     const Bindings &                mInputStreamSets;
     const Bindings &                mOutputStreamSets;

@@ -409,7 +409,7 @@ protected:
             Binding{"meIn", meIn} };
         if (boundaryIn)
             in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
-        if (nextIdIn)   // Deferred producer (IndexedShiftBack) → FixedRate consume, pipeline reconciles
+        if (nextIdIn)   // Deferred producer (IndexedShiftBack), 2. Kernel receives both as input bindings
             in.push_back(Binding{"nextIdIn", nextIdIn});
         return in;
     }
@@ -439,11 +439,7 @@ protected:
         // the surviving (outermost) token STARTS — the stream emission scans.
         Var * inPlayMask = pb.createVar("inPlayMask", getInputStreamSet("meIn")[0]);
 
-        // Frozen input mask — the index for createIndexedAdvance (B-consume) in indexed
-        // mode. Must be the INPUT mask (not the mutating accumulator) so "next live" is
-        // fixed for the whole kernel, matching the frozen nextId.
-        PabloAST * inPlayFrozen = inPlayMask;
-
+        // 3. Read the copy inside the body
         // nextIdBN — indexed mode: the NEXT LIVE token's id at each position (precomputed
         // by IndexedShiftBack outside). B-detection reads EQ(nextIdBN, idB) — one shifted
         // stream for every rule, no per-lenA LookAhead.
@@ -458,6 +454,7 @@ protected:
         // to check what token starts right after A. LookAhead is legal only on an INPUT
         // (sourceIn declares LookAhead(maxLen), and lenA < mergedLen ≤ maxLen).
         // Skipped in indexed mode — nextIdBN replaces every source LookAhead.
+        // 4. Because of the copy → NO LookAhead built into the body, so the kernel's body is identical for every rule (no per-lenA LookAhead).
         std::map<unsigned, BixNum> aheadByLenA;
         if (!mUseNextId)
         for (const auto & r : mRuleGroup.rules) {
@@ -481,24 +478,40 @@ protected:
             }
         }
 
-        // Each rule (rank order): merge = inPlayMask AND A-starts-here AND B-starts-at
-        // +lenA. Detect inside createIf(Astart & inPlayMask), carry the fire out via a
-        // NON-self-ref Var mergeV, then OUTSIDE the gate stamp idAB at A's start and
-        // clear B's start from inPlayMask.
-        for (const auto & r : mRuleGroup.rules) {
-            BixNum cur(idAcc.begin(), idAcc.end());
-            PabloAST * Astart = bnc.EQ(cur, r.idA);        // token A starts here
+        // Range-constant-bit stamp fold. Every idAB in this kernel lies in [lo,hi), so
+        // their high bits are identical — varyMask marks the bits that actually differ
+        // across the range. Stamp only the VARYING bits per rule; fold the CONSTANT bits
+        // into ONE Or/AndNot per bit per kernel via anyMerge (OR of every fire, and ≤1
+        // rule fires per position so the shared constant value is exact). The N
+        // B-consumes fold the same way into clearAll → one final mask update.
+        //
+        // Every Astart / fire / mask read comes from the FROZEN kernel input (srcFrozen =
+        // entry ids, meInFrozen = entry live-start mask), NOT the mutating idAcc /
+        // inPlayMask. Independence (T4) + clean-range conflict-freedom make frozen == live
+        // for every such read; deferring the constant (high) bits would otherwise leave
+        // idAcc a partial value mid-kernel that could alias another rule's idA. Per-rule
+        // createIf still gates on the frozen Astart, so block-skip is preserved.
+        unsigned andAll = ~0u, orAll = 0u;
+        for (const auto & r : mRuleGroup.rules) { andAll &= r.idAB; orAll |= r.idAB; }
+        const unsigned varyMask = orAll ^ andAll;      // bit i set ⇔ idAB bit i varies
 
-            // Self-merge X+X→XX (idA==idB) fired at EVERY X-start over-consumes: a run
-            // of X collapses to one token (the repeated-run bug). Restrict the fire to
-            // per-run non-overlapping starts (1st,3rd,5th X of each run) so the run
-            // pairs left-to-right. Non-self merges have no self-overlap → every A-start.
+        std::vector<PabloAST*> frozenBits(W_out);       // entry idAcc value, immutable
+        for (unsigned i = 0; i < W_out; i++) frozenBits[i] = (i < W) ? srcBits[i] : zeroes;
+        BixNum      srcFrozen(frozenBits.begin(), frozenBits.end());
+        PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
+
+        Var * anyMerge = pb.createVar("anyMerge", zeroes);   // OR of every fire
+        Var * clearAll = pb.createVar("clearAll", zeroes);   // OR of every B-consume
+
+        for (const auto & r : mRuleGroup.rules) {
+            PabloAST * Astart = bnc.EQ(srcFrozen, r.idA);    // A starts here (frozen input)
+
+            // Self-merge X+X→XX (idA==idB): pair per-run on the frozen live starts. No
+            // same-kernel rule can have consumed an X-run position — that would overlap
+            // the self-merge, which the clean-range partition forbids — so frozen == live.
             PabloAST * fireStart = Astart;
-            if (r.idA == r.idB)   // self-merge: pair per-run on the LIVE starts. A
-                                  // lower-rank neighbor merge (e.g. Ġb, Ġw, Ġ2) may have
-                                  // already consumed the run's head; using raw Astart would
-                                  // count that dead position and flip the odd/even parity.
-                fireStart = selfMergeFireStarts(pb, pb.createAnd(Astart, inPlayMask), r.lenA);
+            if (r.idA == r.idB)
+                fireStart = selfMergeFireStarts(pb, pb.createAnd(Astart, meInFrozen), r.lenA);
 
             auto body = pb.createScope();
             BixNumCompiler bncB(body);
@@ -506,28 +519,46 @@ protected:
             // lenA ahead via LookAhead. Both frozen → identical semantics.
             PabloAST * BstartAtA = mUseNextId
                 ? bncB.EQ(nextIdBN, r.idB)
-                : bncB.EQ(aheadByLenA.at(r.lenA), r.idB);  // B starts lenA ahead
-            PabloAST * fire = body.createAnd3(inPlayMask, fireStart, BstartAtA);
+                : bncB.EQ(aheadByLenA.at(r.lenA), r.idB);
+            PabloAST * fire = body.createAnd3(meInFrozen, fireStart, BstartAtA);
             if (mHasBoundary)   // block merges where B begins a new pretoken (cross-boundary)
                 fire = body.createAnd(fire, body.createNot(boundaryAheadByLen.at(r.lenA)));
 
-            PabloAST * notFire = body.createNot(fire);
+            body.createAssign(anyMerge, body.createOr(anyMerge, fire));
+            PabloAST * clearB = mUseNextId
+                ? body.createIndexedAdvance(fire, meInFrozen, 1)
+                : body.createAdvance(fire, r.lenA);
+            body.createAssign(clearAll, body.createOr(clearAll, clearB));
+
+            // Stamp ONLY the varying bits (constant bits folded once, after the loop).
+            PabloAST * notFire = nullptr;
             for (unsigned i = 0; i < W_out; i++) {
+                if (!((varyMask >> i) & 1u)) continue;
                 if ((r.idAB >> i) & 1u) {
                     body.createAssign(idAcc[i], body.createOr(idAcc[i], fire));
                 } else {
+                    if (!notFire) notFire = body.createNot(fire);
                     body.createAssign(idAcc[i], body.createAnd(idAcc[i], notFire));
                 }
             }
-
-            PabloAST * clearB = mUseNextId
-                ? body.createIndexedAdvance(fire, inPlayFrozen, 1)
-                : body.createAdvance(fire, r.lenA);
-
-            body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(clearB)));
-
-            pb.createIf(pb.createAnd(fireStart, inPlayMask), body);
+            pb.createIf(pb.createAnd(fireStart, meInFrozen), body);
         }
+
+        // Constant bits: identical across [lo,hi) → one Or/AndNot per bit, gated by
+        // anyMerge. v = (andAll>>i)&1. idAcc[i] here still holds its frozen entry value.
+        PabloAST * notAny = nullptr;
+        for (unsigned i = 0; i < W_out; i++) {
+            if ((varyMask >> i) & 1u) continue;              // varying → already stamped
+            if ((andAll >> i) & 1u) {
+                pb.createAssign(idAcc[i], pb.createOr(idAcc[i], anyMerge));
+            } else {
+                if (!notAny) notAny = pb.createNot(anyMerge);
+                pb.createAssign(idAcc[i], pb.createAnd(idAcc[i], notAny));
+            }
+        }
+
+        // Fold all B-consumes: final live-start mask = frozen input AND NOT every cleared B.
+        pb.createAssign(inPlayMask, pb.createAnd(meInFrozen, pb.createNot(clearAll)));
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
             pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // 16-bit token ID stream
@@ -637,6 +668,7 @@ BPEPassResult buildBPEPassPipeline(
         unsigned output_bits = ceil_log2(g.hi+1);
         StreamSet * sOut  = P.CreateStreamSet(output_bits, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
+        // 1. Make the copied/shifted stream
         // Indexed mode: precompute next-live id for this kernel (frozen source+mask).
         // Only the first indexedShiftN kernels convert (isolation); rest stay byte-space.
         StreamSet * nextId = nullptr;

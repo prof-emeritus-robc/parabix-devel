@@ -40,7 +40,7 @@ TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
-DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/webtext_sample.txt")
+DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/val_1gb.txt")
 OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "compare_bpe_output.txt")
 
@@ -69,6 +69,18 @@ class Tee:
 # ---------------------------------------------------------------------------
 # Runners
 # ---------------------------------------------------------------------------
+
+# Printing repr(text) for every case buries the result — one openwebtext line can
+# be thousands of characters. Default to a size summary; --show-input restores the
+# full text when a specific case needs eyeballing.
+SHOW_INPUT = False
+
+
+def input_line(text: str, pad: str = "") -> str:
+    if SHOW_INPUT:
+        return f"  Input:{pad} {repr(text)}\n"
+    return f"  Input:{pad} <{len(text)} chars, {len(text.encode())} bytes>\n"
+
 
 def _parabix_ids_cmd(input_path: str, strings: bool = False):
     """Spawn the tokenizer binary on a pre-written input file. One subprocess."""
@@ -284,7 +296,7 @@ def run_compare(out, tokenizer_obj, cases: list[tuple[int, str]], verbose: bool,
         out.write(SEP + "\n")
         out.write(f"Test {num} (line {lineno})  →  {status}\n")
         out.write(SEP + "\n")
-        out.write(f"  Input:          {repr(text)}\n")
+        out.write(input_line(text, "         "))
         out.write(f"  Parabix tokens: {len(parabix_ids)}\n")
         out.write(f"  HF tokens:      {len(hf_ids)}\n\n")
 
@@ -312,7 +324,7 @@ def run_hf_only(out, tokenizer_obj, cases: list[tuple[int, str]]) -> None:
         out.write(SEP + "\n")
         out.write(f"Test {num} (line {lineno}) — HuggingFace\n")
         out.write(SEP + "\n")
-        out.write(f"  Input: {repr(text)}\n")
+        out.write(input_line(text))
         out.write(f"  Tokens ({len(ids)}):\n")
         for i, (tid, tok) in enumerate(zip(ids, tokens), 1):
             out.write(f"    {i:3}. {tid:<7} {repr(tok)}\n")
@@ -325,7 +337,7 @@ def run_parabix_only(out, cases: list[tuple[int, str]]) -> None:
         out.write(SEP + "\n")
         out.write(f"Test {num} (line {lineno}) — Parabix\n")
         out.write(SEP + "\n")
-        out.write(f"  Input: {repr(text)}\n")
+        out.write(input_line(text))
         out.write(f"  Tokens ({len(ids)}):\n")
         for i, (tid, tok) in enumerate(zip(ids, strings), 1):
             out.write(f"    {i:3}. {tid:<7} {repr(tok)}\n")
@@ -362,6 +374,9 @@ def main() -> None:
                         help="Run HuggingFace tokenizer only")
     parser.add_argument("--parabix-only", action="store_true",
                         help="Run Parabix tokenizer only")
+    parser.add_argument("--show-input",   action="store_true",
+                        help="Print each case's full input text (off by default: "
+                             "only a char/byte count is shown)")
     parser.add_argument("--verbose",      action="store_true",
                         help="Always show full token-by-token table (default: only on mismatch)")
     parser.add_argument("--runs",         type=int, default=DEFAULT_RUNS,
@@ -369,6 +384,8 @@ def main() -> None:
     parser.add_argument("--no-timing",    action="store_true",
                         help="Skip the timing section")
     args = parser.parse_args()
+    global SHOW_INPUT
+    SHOW_INPUT = args.show_input
 
     if not os.path.isfile(args.input):
         print(f"Error: input file not found: {args.input}")

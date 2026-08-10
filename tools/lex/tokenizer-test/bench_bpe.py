@@ -39,6 +39,7 @@ Usage
 import argparse
 import os
 import re
+import shlex
 import statistics
 import subprocess
 import sys
@@ -151,12 +152,14 @@ _BENCH_RE = re.compile(
 )
 
 
-def run_parabix(path: str, iters: int) -> dict | None:
+def run_parabix(path: str, iters: int, extra: list | None = None) -> dict | None:
     """Invoke the tokenizer with --bench-loop and parse its BENCH_RESULT line.
 
     Pipeline build + JIT happen once, before the timed loop, so the parsed
-    numbers are pure tokenization (matches HF's in-process criterion loop)."""
-    cmd = [TOKENIZER, f"--merges={MERGES}", f"--bench-loop={iters}", path]
+    numbers are pure tokenization (matches HF's in-process criterion loop).
+    `extra` are raw tokenizer flags (e.g. --geometric-compaction) from
+    --parabix-args, appended before the input path."""
+    cmd = [TOKENIZER, f"--merges={MERGES}", f"--bench-loop={iters}", *(extra or []), path]
     r = subprocess.run(cmd, capture_output=True, encoding="utf-8")
     m = _BENCH_RE.search(r.stderr)
     if not m:
@@ -425,7 +428,11 @@ def main():
                     help=f"openwebtext sample byte cap (default {OWT_BYTES})")
     ap.add_argument("--owt-docs", type=int, default=OWT_DOCS,
                     help=f"openwebtext sample doc cap (default {OWT_DOCS})")
+    ap.add_argument("--parabix-args", default="",
+                    help="Extra flags forwarded verbatim to the tokenizer binary, "
+                         "e.g. --parabix-args=\"--geometric-compaction --compact-base=15\"")
     args = ap.parse_args()
+    parabix_extra = shlex.split(args.parabix_args)
 
     owt_path = None
     if args.openwebtext:
@@ -510,7 +517,7 @@ def main():
         for path in files:
             it = iters_for(os.path.getsize(path), args.iters,
                            adaptive=not args.no_adaptive_iters)
-            p = None if args.hf_only else run_parabix(path, it)
+            p = None if args.hf_only else run_parabix(path, it, parabix_extra)
             h = None
             if not args.parabix_only:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:

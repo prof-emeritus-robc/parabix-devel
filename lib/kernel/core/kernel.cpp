@@ -295,8 +295,11 @@ void Kernel::loadCachedKernel(KernelBuilder & b) {
  * @brief linkExternalMethods
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::linkExternalMethods(KernelBuilder & b) {
-    auto & driver = b.getDriver();
     Module * const m = b.getModule(); assert (m);
+    if (mFlags & Kernel::KernelFlags::HasInternallyManagedStreamSet) {
+        StreamSetBuffer::linkFunctions(b);
+    }
+    b.LinkAllNecessaryExternalFunctions();
     if (LLVM_UNLIKELY(getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject)) {
         PointerType * voidPtrTy = PointerType::getUnqual(b.getContext());
         IntegerType * int8Ty = b.getInt8Ty();
@@ -319,7 +322,7 @@ void Kernel::linkExternalMethods(KernelBuilder & b) {
         params[10] = int8Ty; // replacement 1
         params[11] = PointerType::getUnqual(b.getContext()); // loopId array
         FunctionType * regFunc = FunctionType::get(voidTy, params, false);
-        driver.addLinkFunction(this, KERNEL_REGISTER_ILLUSTRATOR_CALLBACK, regFunc, (void*)&illustratorRegisterCapturedData);
+        b.LinkFunction(KERNEL_REGISTER_ILLUSTRATOR_CALLBACK, regFunc, (void*)&illustratorRegisterCapturedData);
         END_SCOPED_REGION
 
         BEGIN_SCOPED_REGION
@@ -334,8 +337,12 @@ void Kernel::linkExternalMethods(KernelBuilder & b) {
         params[7] = sizeTy;
         params[8] = sizeTy;
         FunctionType * func = FunctionType::get(voidTy, params, false);
-        driver.addLinkFunction(this, KERNEL_ILLUSTRATOR_CAPTURE_CALLBACK, func, (void*)&illustratorCaptureStreamData);
+        b.LinkFunction(KERNEL_ILLUSTRATOR_CAPTURE_CALLBACK, func, (void*)&illustratorCaptureStreamData);
         END_SCOPED_REGION
+    }
+    for (const auto & link : mPendingFunctionLinks) {
+        Type * const funcTy = CBuilder::convertTypeToLLVMContext(b.getContext(), link.FuncType);
+        b.LinkFunction(link.UnmanagedName, cast<FunctionType>(funcTy), link.FuncPointer);
     }
 }
 
@@ -362,10 +369,12 @@ Kernel::StateTypes Kernel::constructStateTypes(KernelBuilder & b) const {
         SmallVector<char, 256> tmpShared;
         auto strShared = concat(getName(), SHARED_SUFFIX, tmpShared);
         sharedStateType = StructType::getTypeByName(C, strShared);
+        assert (sharedStateType == nullptr || &sharedStateType->getContext() == &b.getContext());
 
         SmallVector<char, 256> tmpThreadLocal;
         auto strThreadLocal = concat(getName(), THREAD_LOCAL_SUFFIX, tmpThreadLocal);
         threadLocalStateType = StructType::getTypeByName(C, strThreadLocal);
+        assert (threadLocalStateType == nullptr || &threadLocalStateType->getContext() == &b.getContext());
 
         auto isOpaqueType = [&](StructType * const st) -> bool {
             return st ? st->isOpaque() : false;
@@ -492,7 +501,7 @@ Kernel::StateTypes Kernel::constructStateTypes(KernelBuilder & b) const {
                 } else {
                     assert (&st->getContext() == &b.getContext());
                     assert (st->isOpaque());
-                    st->setBody(fields);
+                    st->setBody(fields, true);
                     assert (!st->isOpaque() && st->isPacked());
                 }
 
@@ -1820,23 +1829,7 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
 , mOutputScalars(std::move(scalar_outputs))
 , mInternalScalars( std::move(internal_scalars))
 , mKernelName(annotateKernelNameWithDebugFlags(typeId, mFlags, std::move(kernelName))) {
-    #ifndef NDEBUG
-    for (const auto & binding : mInputStreamSets) {
-        assert (&binding.getType()->getContext() == &ts.getContext());
-    }
-    for (const auto & binding : mOutputStreamSets) {
-        assert (&binding.getType()->getContext() == &ts.getContext());
-    }
-    for (const auto & binding : mInputScalars) {
-        assert (&binding.getType()->getContext() == &ts.getContext());
-    }
-    for (const auto & binding : mOutputScalars) {
-        assert (&binding.getType()->getContext() == &ts.getContext());
-    }
-    for (const auto & binding : mInternalScalars) {
-        assert (&binding.getValueType()->getContext() == &ts.getContext());
-    }
-    #endif
+
 }
 
 const llvm::MDString * Kernel::readSignatureFromModule(const llvm::Module * const M) {

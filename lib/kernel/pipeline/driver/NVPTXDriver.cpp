@@ -49,10 +49,6 @@ NVPTXDriver::NVPTXDriver(std::string && moduleName)
     mBuilder->CreateBaseFunctions();
 }
 
-Function * NVPTXDriver::addLinkFunction(Kernel *, llvm::StringRef, FunctionType *, void *) const {
-    report_fatal_error("NVPTX does not support linked functions");
-}
-
 static int llvm2ptx(Module * M, std::string PTXFilename) {
 
     std::unique_ptr<MIRParser> MIR;

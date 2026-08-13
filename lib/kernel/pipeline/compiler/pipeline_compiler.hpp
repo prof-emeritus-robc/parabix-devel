@@ -940,6 +940,7 @@ inline PipelineCompiler::PipelineCompiler(KernelBuilder & b, PipelineKernel * co
 inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel, PipelineAnalysis && P, TargetMachine * TM)
 : KernelCompiler(pipelineKernel, TM)
 , PipelineCommonGraphFunctions(mStreamGraph, mBufferGraph)
+, mAllocator(std::move(P.mAllocator))
 , mCheckAssertions(codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnablePipelineAsserts))
 , mCheckStreamSets(codegen::DebugOptionIsSet(codegen::EnableAsserts, codegen::EnableStreamSetAsserts))
 , mTraceProcessedProducedItemCounts(P.mTraceProcessedProducedItemCounts)

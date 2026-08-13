@@ -168,6 +168,7 @@ Value * MMapSourceKernel::generateExpectedOutputSizeMethod(KernelBuilder & b, co
 
 void MMapSourceKernel::linkExternalMethods(KernelBuilder & b) {
     MMapSourceKernel::generatLinkExternalFunctions(b);
+    Kernel::linkExternalMethods(b);
 }
 
 /// READ SOURCE KERNEL
@@ -262,6 +263,7 @@ Value * ReadSourceKernel::generateExpectedOutputSizeMethod(KernelBuilder & b, co
 
 void ReadSourceKernel::linkExternalMethods(KernelBuilder & b) {
     ReadSourceKernel::generatLinkExternalFunctions(b);
+    Kernel::linkExternalMethods(b);
 }
 
 /// Hybrid MMap/Read source kernel
@@ -352,6 +354,7 @@ void FDSourceKernel::generateFinalizeMethod(KernelBuilder & b) {
 void FDSourceKernel::linkExternalMethods(KernelBuilder & b) {
     MMapSourceKernel::generatLinkExternalFunctions(b);
     ReadSourceKernel::generatLinkExternalFunctions(b);
+    Kernel::linkExternalMethods(b);
 }
 
 /// MEMORY SOURCE KERNEL

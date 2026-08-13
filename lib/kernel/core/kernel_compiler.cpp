@@ -1517,16 +1517,16 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
             report_fatal_error(Twine(out.str()));
         }
         #ifndef NDEBUG
-//        Type * const ty = CBuilder::convertTypeToLLVMContext(b.getContext(), expectedType);
-//        if (LLVM_UNLIKELY(actualType->canLosslesslyBitCastTo(ty))) {
-//            SmallVector<char, 256> tmp;
-//            raw_svector_ostream out(tmp);
-//            out << "Scalar " << getName() << '.' << bindingName << " was expected to be a ";
-//            ty->print(out);
-//            out << " but was stored as a ";
-//            actualType->print(out);
-//            report_fatal_error(Twine(out.str()));
-//        }
+        Type * const ty = CBuilder::convertTypeToLLVMContext(b.getContext(), expectedType);
+        if (LLVM_UNLIKELY(actualType != ty)) {
+            SmallVector<char, 256> tmp;
+            raw_svector_ostream out(tmp);
+            out << "Scalar " << getName() << '.' << bindingName << " was expected to be a ";
+            ty->print(out);
+            out << " but was stored as a ";
+            actualType->print(out);
+            report_fatal_error(Twine(out.str()));
+        }
         #endif
     };
 

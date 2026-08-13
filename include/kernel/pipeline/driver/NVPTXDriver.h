@@ -20,17 +20,11 @@ public:
 
     void * finalizeObject(kernel::PipelineKernel * pipeline) override;
 
-    bool hasExternalFunction(const llvm::StringRef /* functionName */) const override { return false; }
-
     void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) final {}
 
 protected:
 
     NVPTXDriver(std::string && moduleName);
-
-protected:
-
-    llvm::Function * addLinkFunction(kernel::Kernel * const kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) override;
 
 };
 

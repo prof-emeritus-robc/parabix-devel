@@ -37,11 +37,14 @@ public:
 
     void * finalizeObject(kernel::Kernel * const pipeline) override;
 
-    bool hasExternalFunction(const llvm::StringRef functionName) const override;
-
     llvm::ModulePass * createTracePass(kernel::KernelBuilder * kb, llvm::StringRef to_trace);
 
     void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) final;
+
+    llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) final;
+
+    bool HasExternalFunction(llvm::StringRef unmangledName) const final;
+
 
 private:
 
@@ -49,18 +52,13 @@ private:
 
     void linkAllExternalSymbols();
 
-protected:
-
-    llvm::Function * addLinkFunction(kernel::Kernel * const kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) override;
-
 private:
     std::unique_ptr<llvm::raw_fd_ostream>                   mUnoptimizedIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
-    std::unique_ptr<llvm::orc::SymbolLookupSet>             mSymbolLookupSet;
-    std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
-    std::unique_ptr<CPUDriverContextPool>                   mContextPool;
-    LinkedFunctionVector                                    mLinkedFunctions;
     std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
+    std::unique_ptr<CPUDriverContextPool>                   mContextPool;
+    std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
+    std::unique_ptr<llvm::orc::SymbolLookupSet>             mSymbolLookupSet;
 };
 

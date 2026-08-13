@@ -5,6 +5,7 @@
 
 #include <kernel/core/kernel.h>
 #include <kernel/core/block_kernel_compiler.h>
+#include <codegen/LLVMTypeSystemInterface.h>
 
 namespace kernel {
 

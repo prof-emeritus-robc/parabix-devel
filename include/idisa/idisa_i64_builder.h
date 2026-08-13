@@ -15,7 +15,8 @@ public:
     static const unsigned NativeBitBlockWidth = I64_width;
   
     IDISA_I64_Builder(llvm::LLVMContext & C, const FeatureSet & featureSet, unsigned bitBlockWidth, unsigned laneWidth)
-    : IDISA_Builder(C, featureSet, I64_width, bitBlockWidth, laneWidth) {
+    : llvm::IRBuilder<>(C)
+    , IDISA_Builder(C, featureSet, I64_width, bitBlockWidth, laneWidth) {
 
     } 
 

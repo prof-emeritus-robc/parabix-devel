@@ -1,7 +1,7 @@
 #pragma once
 
 #include <codegen/FunctionTypeBuilder.h>
-#include <codegen/LLVMTypeSystemInterface.h>
+#include <codegen/CBuilder.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
 #include <llvm/ExecutionEngine/Orc/SymbolStringPool.h>
 #include <llvm/ADT/StringSet.h>
@@ -25,7 +25,7 @@ namespace kernel {template<typename ... Args> class TypedProgramBuilder; }
 class CBuilder;
 class ParabixObjectCache;
 
-class BaseDriver : public LLVMTypeSystemInterface {
+class BaseDriver : public FunctionLinkCallback {
     friend class CBuilder;
     friend class kernel::PipelineAnalysis;
     friend class kernel::PipelineBuilder;
@@ -42,21 +42,11 @@ public:
 
     void addKernel(not_null<Kernel *> kernel);
 
-    virtual bool hasExternalFunction(const llvm::StringRef functionName) const = 0;
-
     virtual void generateUncachedKernels() = 0;
 
     virtual void * finalizeObject(kernel::Kernel * pipeline) = 0;
 
     virtual ~BaseDriver();
-
-    const llvm::LLVMContext & getContext() const final {
-        return *mContext;
-    }
-
-    llvm::LLVMContext & getContext() final {
-        return *mContext;
-    }
 
     bool getPreservesKernels() const {
         return mPreservesKernels;
@@ -66,16 +56,18 @@ public:
         mPreservesKernels = value;
     }
 
-    unsigned getBitBlockWidth() const final;
-
     virtual void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) = 0;
-
-//    llvm::TargetMachine * getTargetMachine() {
-//        return mTarget;
-//    }
 
     const std::unique_ptr<kernel::KernelBuilder> & getMainBuilder() const {
         return mBuilder;
+    }
+
+    llvm::LLVMContext & getContext() {
+        return *mContext;
+    }
+
+    const llvm::LLVMContext & getContext() const {
+        return *mContext;
     }
 
 protected:
@@ -94,20 +86,9 @@ protected:
 
     kernel::Scalar * CreateCommandLineScalar(kernel::CommandLineScalarType type) noexcept;
 
-    llvm::VectorType * getBitBlockType() const final;
-
-    llvm::VectorType * getStreamTy(const unsigned FieldWidth = 1) final;
-
-    llvm::ArrayType * getStreamSetTy(const unsigned NumElements = 1, const unsigned FieldWidth = 1) final;
-
 protected:
 
     BaseDriver(std::string && moduleName);
-
-    template <typename ExternalFunctionType>
-    void LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr);
-
-    virtual llvm::Function * addLinkFunction(kernel::Kernel * const kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) = 0;
 
 protected:
 
@@ -127,11 +108,4 @@ protected:
     KernelSet                                               mPreservedKernel;
     SlabAllocator<>                                         mAllocator;
 };
-
-template <typename ExternalFunctionType>
-void BaseDriver::LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) {
-    auto * const type = FunctionTypeBuilder<ExternalFunctionType>::get(*mContext);
-    assert ("FunctionTypeBuilder did not resolve a function type." && type);
-    addLinkFunction(kernel.get(), name, type, reinterpret_cast<void *>(functionPtr));
-}
 

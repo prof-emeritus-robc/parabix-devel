@@ -17,7 +17,7 @@ using RelationshipAllocator = Relationship::Allocator;
  ** ------------------------------------------------------------------------------------------------------------- */
 StreamSet * BaseDriver::CreateStreamSet(const unsigned NumElements, const unsigned FieldWidth) noexcept {
     RelationshipAllocator A(mAllocator);
-    return new (A) StreamSet(getContext(), NumElements, FieldWidth);
+    return new (A) StreamSet(mBuilder->getContext(), NumElements, FieldWidth);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -26,7 +26,7 @@ StreamSet * BaseDriver::CreateStreamSet(const unsigned NumElements, const unsign
 RepeatingStreamSet * BaseDriver::CreateRepeatingStreamSet(const unsigned FieldWidth, std::vector<std::vector<uint64_t>> && stringSet, const bool isDynamic) noexcept {
     RelationshipAllocator A(mAllocator);
     // TODO: the stringSet will probably cause a memleak
-    return new (A) RepeatingStreamSet(getContext(), FieldWidth, std::move(stringSet), isDynamic, false);
+    return new (A) RepeatingStreamSet(mBuilder->getContext(), FieldWidth, std::move(stringSet), isDynamic, false);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -35,7 +35,7 @@ RepeatingStreamSet * BaseDriver::CreateRepeatingStreamSet(const unsigned FieldWi
 RepeatingStreamSet * BaseDriver::CreateUnalignedRepeatingStreamSet(const unsigned FieldWidth, std::vector<std::vector<uint64_t>> && stringSet, const bool isDynamic) noexcept {
     RelationshipAllocator A(mAllocator);
     // TODO: the stringSet will probably cause a memleak
-    return new (A) RepeatingStreamSet(getContext(), FieldWidth, std::move(stringSet), isDynamic, true);
+    return new (A) RepeatingStreamSet(mBuilder->getContext(), FieldWidth, std::move(stringSet), isDynamic, true);
 }
 
 
@@ -44,7 +44,7 @@ RepeatingStreamSet * BaseDriver::CreateUnalignedRepeatingStreamSet(const unsigne
  ** ------------------------------------------------------------------------------------------------------------- */
 TruncatedStreamSet * BaseDriver::CreateTruncatedStreamSet(const StreamSet * data) noexcept {
     RelationshipAllocator A(mAllocator);
-    return new (A) TruncatedStreamSet(getContext(), data);
+    return new (A) TruncatedStreamSet(mBuilder->getContext(), data);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -129,38 +129,8 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         return;
     }
 
-    kernel->linkExternalMethods(*mBuilder);
-
     mUncachedKernel.emplace_back(kernel);
 
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getBitBlockWidth
- ** ------------------------------------------------------------------------------------------------------------- */
-unsigned BaseDriver::getBitBlockWidth() const {
-    return mBuilder->getBitBlockWidth();
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getBitBlockType
- ** ------------------------------------------------------------------------------------------------------------- */
-VectorType * BaseDriver::getBitBlockType() const {
-    return mBuilder->getBitBlockType();
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getStreamTy
- ** ------------------------------------------------------------------------------------------------------------- */
-VectorType * BaseDriver::getStreamTy(const unsigned FieldWidth) {
-    return mBuilder->getStreamTy(FieldWidth);
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getStreamSetTy
- ** ------------------------------------------------------------------------------------------------------------- */
-ArrayType * BaseDriver::getStreamSetTy(const unsigned NumElements, const unsigned FieldWidth) {
-    return mBuilder->getStreamSetTy(NumElements, FieldWidth);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -170,8 +140,7 @@ BaseDriver::BaseDriver(std::string && moduleName)
 : mContext(new LLVMContext())
 , mMainModule(new Module(moduleName, *mContext))
 , mBuilder(nullptr)
-, mObjectCache(nullptr)
-, mTarget(nullptr) {
+, mObjectCache(nullptr) {
     if (LLVM_UNLIKELY(codegen::EnableObjectCache)) {
         mObjectCache.reset(new ParabixObjectCache(*this));
     }

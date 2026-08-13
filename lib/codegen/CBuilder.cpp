@@ -815,15 +815,6 @@ Value * CBuilder::CreateMProtect(Value * addr, Value * size, const Protect prote
     return result;
 }
 
-IntegerType * LLVM_READNONE CBuilder::getIntAddrTy() const {
-    return IntegerType::get(getContext(), sizeof(intptr_t) * 8);
-}
-
-PointerType * LLVM_READNONE CBuilder::getVoidPtrTy(const unsigned AddressSpace) const {
-    return PointerType::get(getContext(), AddressSpace);
-}
-
-
 Value * CBuilder::CreateAtomicFetchAndAdd(Value * const val, Value * const ptr, MaybeAlign align) {
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         Constant * const Size = getTypeSize(val->getType());
@@ -1165,8 +1156,7 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
 
         FunctionType * const rfTy = FunctionType::get(voidTy, params, false);
 
-        Function * const reportFn = mDriver->addLinkFunction(nullptr, "__report_failure_v", rfTy,
-                                                             reinterpret_cast<void *>(&__report_failure_v));
+        Function * const reportFn = LinkFunction("__report_failure_v", rfTy, reinterpret_cast<void *>(&__report_failure_v));
         reportFn->setCallingConv(CallingConv::C);
 
         CreateCall(vaFuncTy, vaStart, vaList);
@@ -1413,11 +1403,6 @@ Value * CBuilder::CreateReadCycleCounter() {
     return CreateCall(cycleCountFunc->getFunctionType(), cycleCountFunc, std::vector<Value *>({}));
 }
 
-Function * CBuilder::LinkFunction(StringRef name, FunctionType * type, void * functionPtr) const {
-    assert (mDriver);
-    return mDriver->addLinkFunction(nullptr, name, type, functionPtr);
-}
-
 LoadInst * CBuilder::CreateLoad(Type * type, Value * Ptr, const char * Name) {
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CheckAddress(Ptr, getTypeSize(type), "CreateLoad");
@@ -1449,7 +1434,7 @@ StoreInst * CBuilder::CreateStore(Value * Val, Value * Ptr, bool isVolatile) {
 }
 
 inline bool CBuilder::hasAddressSanitizer() const {
-    return mDriver && mDriver->hasExternalFunction("__asan_region_is_poisoned");
+    return mLinkCallback->HasExternalFunction("__asan_region_is_poisoned");
 }
 
 LoadInst * CBuilder::CreateAlignedLoad(Type * type, Value * Ptr, const unsigned Align, const char * Name) {
@@ -1964,9 +1949,8 @@ void __backtrace_set_true_on_error_callback(void *data, const char *msg, int err
 
 CBuilder::CBuilder(LLVMContext & C)
 : IRBuilder<>(C)
-, mCacheLineAlignment(64)
-, mSizeType(IntegerType::get(getContext(), sizeof(size_t) * 8))
-, mDriver(nullptr) {
+, LLVMTypeSystemInterface(C)
+, mCacheLineAlignment(64) {
     #ifdef ENABLE_LIBBACKTRACE
     if (LLVM_UNLIKELY(codegen::AnyAssertionOptionIsSet())) {
         auto p = boost::filesystem::absolute(codegen::ProgramName).lexically_normal().native();
@@ -2310,9 +2294,7 @@ uintptr_t LLVM_READNONE CBuilder::getAlignOf(const llvm::DataLayout & DL, llvm::
     }
 }
 
-void CBuilder::LinkAllNecessaryExternalFunctions() const {
-
-    // void* aligned_alloc( std::size_t alignment, std::size_t size );
+void CBuilder::LinkAllNecessaryExternalFunctions() {
 
     IntegerType * const sizeTy = getSizeTy();
 
@@ -2320,9 +2302,7 @@ void CBuilder::LinkAllNecessaryExternalFunctions() const {
     params[0] = sizeTy;
     params[1] = sizeTy;
     FunctionType * fty = FunctionType::get(getVoidPtrTy(), params, false);
-    mDriver->addLinkFunction(nullptr, ALIGNED_ALLOC_NAME, fty, (void*)std::aligned_alloc);
-
-
+    LinkFunction(ALIGNED_ALLOC_NAME, fty, (void*)std::aligned_alloc);
 
 }
 

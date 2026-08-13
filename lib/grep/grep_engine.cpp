@@ -830,7 +830,7 @@ void EmitMatchesEngine::grepCodeGen() {
 
     P.CreateKernelCall<MemorySourceKernel>(buffer, length, InternalBytes);
     grepPipeline(P, InternalBytes);
-    P.setOutputScalar("countResult", P.CreateConstant(mGrepDriver.getInt64(0)));
+    P.setOutputScalar("countResult", P.CreateConstant(P.getInt64(0)));
     mBatchMethod = P.compile();
 }
 

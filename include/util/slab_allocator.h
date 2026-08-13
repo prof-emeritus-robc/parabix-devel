@@ -71,6 +71,7 @@ public:
     }
     inline SlabAllocator() noexcept {}
     inline SlabAllocator(const SlabAllocator &) noexcept = delete;
+    inline SlabAllocator(SlabAllocator &&) noexcept = default;
     template <class U> inline SlabAllocator (const SlabAllocator<U> &) noexcept { }
 protected:
     LLVMAllocator mAllocator;

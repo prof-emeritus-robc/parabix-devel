@@ -471,13 +471,13 @@ struct RelationshipGraphBuilder {
             return;
         }
 
-        BaseDriver & driver = reinterpret_cast<BaseDriver &>(b.getDriver());
-
         IntegerType * const sizeTy = b.getSizeTy();
 
         assert (n > numOfKernels);
 
         kernels.reserve(n - numOfKernels);
+
+        Relationship::Allocator A(mAllocator);
 
         for (auto i = numOfKernels; i < n; ++i) {
 
@@ -500,25 +500,26 @@ struct RelationshipGraphBuilder {
 
             StreamSet * positive = nullptr;
             if (LLVM_LIKELY(type & CountingType::Positive)) {
-                positive = driver.CreateStreamSet(1, sizeTy->getBitWidth());
+                positive = new (A) StreamSet(b.getContext(), 1, sizeTy->getBitWidth());
             }
 
             StreamSet * negative = nullptr;
             if (LLVM_UNLIKELY(type & CountingType::Negative)) {
-                negative = driver.CreateStreamSet(1, sizeTy->getBitWidth());
+                negative = new (A) StreamSet(b.getContext(), 1, sizeTy->getBitWidth());
             }
             assert (H[i]->isStreamSet());
             StreamSet * const input = static_cast<StreamSet *>(H[i]); assert (input);
             PopCountKernel * popCountKernel = nullptr;
+            // reinterpret_cast<LLVMTypeSystemInterface &>(b)
             switch (type) {
                 case CountingType::Positive:
-                    popCountKernel = new PopCountKernel(b.getDriver(), PopCountKernel::POSITIVE, strideLength, input, positive);
+                    popCountKernel = new PopCountKernel(b, PopCountKernel::POSITIVE, strideLength, input, positive);
                     break;
                 case CountingType::Negative:
-                    popCountKernel = new PopCountKernel(b.getDriver(), PopCountKernel::NEGATIVE, strideLength, input, negative);
+                    popCountKernel = new PopCountKernel(b, PopCountKernel::NEGATIVE, strideLength, input, negative);
                     break;
                 case CountingType::Both:
-                    popCountKernel = new PopCountKernel(b.getDriver(), PopCountKernel::BOTH, strideLength, input, positive, negative);
+                    popCountKernel = new PopCountKernel(b, PopCountKernel::BOTH, strideLength, input, positive, negative);
                     break;
                 default: llvm_unreachable("unknown counting type?");
             }
@@ -928,7 +929,8 @@ struct RelationshipGraphBuilder {
     , mInternalKernels(P.mInternalKernels)
     , mInternalBindings(P.mInternalBindings)
     , mInternalBuffers(P.mInternalBuffers)
-    , RemappedStreamSets(P.RemappedStreamSets) {
+    , RemappedStreamSets(P.RemappedStreamSets)
+    , mAllocator(P.mAllocator) {
         std::fill_n(CommandLineScalars.begin(), CommandLineScalars.size(), nullptr);
     }
 
@@ -939,6 +941,7 @@ struct RelationshipGraphBuilder {
     OwningVector<Binding> &         mInternalBindings;
     OwningVector<StreamSetBuffer> & mInternalBuffers;
     RedundantStreamSetMap &         RemappedStreamSets;
+    CompilerAllocator &             mAllocator;
     CommandLineScalarVec            CommandLineScalars;
     TruncatedStreamSetVec           TruncatedStreamSets;
     StreamSetVertexMap              RepeatingStreamSets;

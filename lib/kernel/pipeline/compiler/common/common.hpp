@@ -54,6 +54,9 @@ struct CompilerAllocator : public SlabAllocator<> {
         assert ("allocator returned a null pointer. Function was likely called before Allocator creation!" && ptr);
         return ptr;
     }
+
+    CompilerAllocator() = default;
+    CompilerAllocator(CompilerAllocator &&) = default;
 };
 
 using pipeline_random_engine = std::default_random_engine;

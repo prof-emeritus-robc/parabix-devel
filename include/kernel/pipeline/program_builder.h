@@ -385,7 +385,7 @@ private:
         assert (config.OutputStreamSets.size() == outputStreamSetCount);
 
         PipelineKernel * const pipeline =
-            new PipelineKernel(driver,
+            new PipelineKernel(*driver.getMainBuilder(),
                                std::move(config.Signature),
                                std::move(config.Attributes),
                                std::move(config.InputStreamSets), std::move(config.OutputStreamSets),

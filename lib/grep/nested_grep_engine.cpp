@@ -106,7 +106,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             kernel = mNested.back(); assert (kernel);
             mNested.push_back(kernel);
         } else {
-            kernel = new CopyBreaksToMatches(mGrepDriver,
+            kernel = new CopyBreaksToMatches(P.getTypeSystem(),
                                              basisBits, U8index, breaks,
                                              matches);
         }
@@ -120,7 +120,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             Output<streamset_t>{"matches", matches, Add1(), ManagedBuffer()},
             InternallySynchronized());
 
-        E.setStride(E.getBitBlockWidth());
+        E.setStride(E.getTypeSystem().getBitBlockWidth());
 
         std::string tmp;
         raw_string_ostream name(tmp);

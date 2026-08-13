@@ -43,6 +43,8 @@
 #include <llvm/IR/Verifier.h>
 #endif
 
+#include <codegen/LLVMTypeSystemInterface.h>
+
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
 

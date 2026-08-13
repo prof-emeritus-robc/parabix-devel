@@ -8,6 +8,8 @@
 #include <llvm/IR/Type.h>  // for Type
 #include <llvm/IR/DerivedTypes.h>  // for Type
 #include <boost/rational.hpp>
+#include <kernel/core/kernel.h>
+#include <kernel/core/kernel_builder.h>
 
 namespace IDISA { class IDISA_Builder; }
 namespace llvm { class Value; }
@@ -15,7 +17,6 @@ namespace llvm { class Constant; }
 
 namespace kernel {
 
-class Kernel;
 class PipelineKernel;
 class KernelBuilder;
 

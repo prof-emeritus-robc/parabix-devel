@@ -3,6 +3,7 @@
 #include "compiler/pipeline_compiler.hpp"
 #include <llvm/IR/Function.h>
 #include <kernel/pipeline/pipeline_builder.h>
+#include <codegen/LLVMTypeSystemInterface.h>
 #include <kernel/core/streamset.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #ifdef ENABLE_PAPI
@@ -153,7 +154,9 @@ void PipelineKernel::generateAllocateThreadLocalInternalStreamSetsMethod(KernelB
  * @brief linkExternalMethods
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::linkExternalMethods(KernelBuilder & b) {
+    errs() << "PipelineKernel::linkExternalMethods " << getName() << "\n";
     PipelineCompiler::linkPipelineExternalMethods(b);
+    StreamSetBuffer::linkFunctions(b);
     for (const auto & k : mKernels) {
         k.Object->linkExternalMethods(b);
     }

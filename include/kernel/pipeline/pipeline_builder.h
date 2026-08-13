@@ -10,7 +10,7 @@ namespace kernel {
 
 class OptimizationBranchBuilder;
 
-class PipelineBuilder : public LLVMTypeSystemInterface {
+class PipelineBuilder {
     friend class PipelineKernel;
     friend class PipelineAnalysis;
     friend class PipelineCompiler;
@@ -24,16 +24,14 @@ public:
     using LengthAssertion = PipelineKernel::LengthAssertion;
     using LengthAssertions = PipelineKernel::LengthAssertions;
 
-    BaseDriver & getDriver() { return mDriver;}
-
     template<typename KernelType, typename... Args>
     Kernel * CreateKernelCall(Args &&... args) {
-        return initializeKernel(new KernelType(mDriver, std::forward<Args>(args) ...), PipelineKernel::KernelBindingFlag::None);
+        return initializeKernel(new KernelType(getTypeSystem(), std::forward<Args>(args) ...), PipelineKernel::KernelBindingFlag::None);
     }
 
     template<typename KernelType, typename... Args>
     Kernel * CreateKernelFamilyCall(Args &&... args) {
-        return initializeKernel(new KernelType(mDriver, std::forward<Args>(args) ...), PipelineKernel::KernelBindingFlag::Family);
+        return initializeKernel(new KernelType(getTypeSystem(), std::forward<Args>(args) ...), PipelineKernel::KernelBindingFlag::Family);
     }
 
     Kernel * AddKernelCall(Kernel * kernel) {
@@ -111,7 +109,7 @@ public:
 
     template <typename ExternalFunctionType>
     void CreateCall(std::string name, ExternalFunctionType & functionPtr, std::initializer_list<Scalar *> args) {
-        llvm::FunctionType * const type = FunctionTypeBuilder<ExternalFunctionType>::get(mDriver.getContext());
+        llvm::FunctionType * const type = FunctionTypeBuilder<ExternalFunctionType>::get(getTypeSystem().getContext());
         assert ("FunctionTypeBuilder did not resolve a function type." && type);
         assert ("Function was not provided the correct number of args" && type->getNumParams() == args.size());
         // Since the pipeline kernel module has not been made yet, just record the function info and its arguments.
@@ -189,35 +187,33 @@ public:
 
     void captureBixNum(llvm::StringRef streamName, StreamSet * bixnum, char hexBase = 'A');
 
-    const llvm::LLVMContext & getContext() const final {
-        return mDriver.getContext();
-    }
-
-    llvm::LLVMContext & getContext() final {
-        return mDriver.getContext();
-    }
-
-    unsigned getBitBlockWidth() const final {
-        return mDriver.getBitBlockWidth();
-    }
-
-    llvm::VectorType * getBitBlockType() const final {
-        return mDriver.getBitBlockType();
-    }
-
-    llvm::VectorType * getStreamTy(const unsigned FieldWidth = 1) final {
-        return mDriver.getStreamTy(FieldWidth);
-    }
-
-    llvm::ArrayType * getStreamSetTy(const unsigned NumElements = 1, const unsigned FieldWidth = 1) final {
-        return mDriver.getStreamSetTy(NumElements, FieldWidth);
-    }
-
     template <typename ExternalFunctionType>
-    void LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) const {
-        mDriver.LinkFunction<ExternalFunctionType>(kernel.get(), name, functionPtr);
+    void LinkFunction(Kernel * kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) {
+        llvm::FunctionType * const type = FunctionTypeBuilder<ExternalFunctionType>::get(getTypeSystem().getContext());
+        assert ("FunctionTypeBuilder did not resolve a function type." && type);
+        LinkFunction(kernel, name, type, reinterpret_cast<void *>(&functionPtr));
     }
 
+    void LinkFunction(Kernel * kernel, llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
+        kernel->addFunctionLink(unmangledName, functionType, functionPointer);
+    }
+
+    bool HasExternalFunction(llvm::StringRef unmangledName) const {
+        return mDriver.HasExternalFunction(unmangledName);
+    };
+
+    llvm::Constant * getSize(const size_t v) {
+        return getTypeSystem().getSize(v);
+    }
+
+    llvm::Constant * getInt64(const uint64_t v) {
+        return getTypeSystem().getInt64(v);
+    }
+
+
+    LLVMTypeSystemInterface & getTypeSystem() {
+        return *mDriver.getMainBuilder();
+    }
 
 protected:
 
@@ -225,13 +221,6 @@ protected:
 
     Kernel * initializeKernel(Kernel * const kernel, const unsigned flags);
 
-    llvm::Function * addLinkFunction(Kernel * kernel, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) {
-        return mDriver.addLinkFunction(kernel, name, type, functionPtr);
-    }
-
-    bool hasExternalFunction(const llvm::StringRef functionName) const {
-        return mDriver.hasExternalFunction(functionName);
-    }
 
 protected:
 

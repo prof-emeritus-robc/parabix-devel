@@ -29,6 +29,8 @@ namespace llvm { class IndirectBrInst; }
 namespace llvm { class PHINode; }
 namespace llvm { class TargetMachine; }
 
+class LLVMTypeSystemInterface;
+
 namespace kernel {
 
 class KernelBuilder;
@@ -278,16 +280,6 @@ public:
     virtual llvm::StringRef getSignature() const {
         return getName();
     }
-
-//    LLVM_READNONE bool isStateful() const {
-//        assert (mCompilationStatus >= CompilationStatus::StateConstructed);
-//        return (mFlags & KernelIsStateful) != 0;
-//    }
-
-//    LLVM_READNONE bool hasThreadLocal() const {
-//        assert (mCompilationStatus >= CompilationStatus::StateConstructed);
-//        return (mFlags & KernelHasThreadLocal) != 0;
-//    }
 
     LLVM_READNONE bool allocatesInternalStreamSets() const {
         return (mFlags & Kernel::KernelFlags::HasInternallyManagedStreamSet) != 0;
@@ -640,6 +632,23 @@ protected:
         return (mTypeId >= TypeId::PopCountKernel);
     }
 
+    struct FunctionLink {
+        const llvm::StringRef       UnmanagedName;
+        llvm::FunctionType * const  FuncType;
+        void * const                FuncPointer;
+
+        FunctionLink(llvm::StringRef unmanagedName, llvm::FunctionType * funcType, void * funcPtr)
+        : UnmanagedName(unmanagedName)
+        , FuncType(funcType)
+        , FuncPointer(funcPtr) {
+
+        }
+    };
+
+    void addFunctionLink(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
+        mPendingFunctionLinks.emplace_back(unmangledName, functionType, functionPointer);
+    }
+
 protected:
 
     const TypeId                        mTypeId;
@@ -651,6 +660,7 @@ protected:
     Bindings                            mOutputScalars;
     InternalScalars                     mInternalScalars;
     std::string                         mKernelName;
+    llvm::SmallVector<FunctionLink, 0>  mPendingFunctionLinks;
 };
 
 class SegmentOrientedKernel : public Kernel {

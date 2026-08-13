@@ -61,25 +61,56 @@ class KernelGenerationMU;
 
 namespace {
 
-struct CPUDriverContext : public ThreadSafeContext {
+struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback {
     Kernel *                                TargetKernel;
     size_t                                  IsCompilingMainFunction;
     std::unique_ptr<llvm::TargetMachine>    TargetMachine;
     std::unique_ptr<KernelBuilder>          Builder;
     std::unique_ptr<SimpleCompiler>         Compiler;
+    llvm::Module *                          CurrentModule;
+    llvm::orc::LLJIT *                      Engine;
+    llvm::orc::SymbolMap &                  SharedSymbolList;
+    llvm::orc::SymbolMap                    NewSymbolList;
 
-    CPUDriverContext(std::unique_ptr<LLVMContext> ctx, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, CPUDriver * const driver)
+    CPUDriverContext(std::unique_ptr<LLVMContext> ctx, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, SymbolMap & symbolList)
     : ThreadSafeContext(std::move(ctx))
     , TargetKernel(nullptr)
     , IsCompilingMainFunction(0)
     , TargetMachine(cantFail(JTMB.createTargetMachine()))
     , Builder(IDISA::GetIDISA_Builder(*getContext(), features))
-    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, ObjCache)) {
-        Builder->setDriver(*driver);
-
-
+    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, ObjCache))
+    , CurrentModule(nullptr)
+    , Engine(nullptr)
+    , SharedSymbolList(symbolList) {
+        Builder->setFunctionLinkCallback(this);
         // TODO: does LLVM16 still use setDiagnosticContext?
         getContext()->setDiagnosticHandlerCallBack(nullptr, static_cast<void*>(this));
+    }
+
+    llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
+        assert (CurrentModule && (&functionType->getContext() == &CurrentModule->getContext()));
+        Function * f = CurrentModule->getFunction(unmangledName);
+        if (LLVM_UNLIKELY(f == nullptr)) {
+            f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, CurrentModule);
+            assert (Engine);
+            auto & ES = Engine->getExecutionSession();
+            auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
+            SymbolStringPtr symbol = nullptr;
+            bool added = false;
+            ES.runSessionLocked([&]{
+                MangleAndInterner M(ES, Engine->getDataLayout());
+                symbol = M(unmangledName);
+                added = SharedSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported})).second;
+            });
+            if (added) {
+                NewSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
+            }
+        }
+        return f;
+    }
+
+    bool HasExternalFunction(llvm::StringRef unmangledName) const {
+        return RTDyldMemoryManager::getSymbolAddressInProcess(unmangledName.str());
     }
 
 };
@@ -87,13 +118,14 @@ struct CPUDriverContext : public ThreadSafeContext {
 class CPUDriverContextPool {
 public:
 
-    CPUDriverContextPool(const size_t count, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, CPUDriver * const driver) {
+    CPUDriverContextPool(const size_t count, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, SymbolMap & symbolList) {
         for (size_t i = 0; i < count; ++i) {
-            Contexts.push(std::make_unique<CPUDriverContext>(std::make_unique<LLVMContext>(), JTMB, features, ObjCache, driver));
+            Contexts.push(std::move(std::make_unique<CPUDriverContext>(std::make_unique<LLVMContext>(), JTMB, features, ObjCache, symbolList)));
         }
     }
 
     CPUDriverContext * acquire() {
+        // TODO: use session lock?
         std::unique_lock<std::mutex> lock(Mutex);
         Cond.wait(lock, [this](){ return !Contexts.empty(); });
         auto next = Contexts.front().release();
@@ -114,7 +146,7 @@ private:
 };
 
 
-}
+} // end of anon namespace
 
 
 
@@ -123,21 +155,18 @@ class CPUDriverKernelCompiler : public orc::IRCompileLayer::IRCompiler {
 
 public:
 
-    CPUDriverKernelCompiler(CPUDriverContextPool & pool,
-                            JITTargetMachineBuilder & JTMB,
-                            CPUDriver::LinkedFunctionVector & linkedFunctionVector)
+    CPUDriverKernelCompiler(JITTargetMachineBuilder & JTMB)
     : orc::IRCompileLayer::IRCompiler(irManglingOptionsFromTargetOptions(JTMB.getOptions()))
-    , Pool(pool)
-    , LinkedFunctions(linkedFunctionVector) {
+    , Pool(nullptr) {
 
     }
 
-    void setTargetTriple(StringRef targetTriple) {
-        TargetTriple = targetTriple;
+    void setPool(CPUDriverContextPool * pool) {
+        Pool = pool;
     }
 
-    void setDataLayout(const DataLayout & dl) {
-        TargetDataLayout = &dl;
+    void setEngine(LLJIT * engine) {
+        Engine = engine;
     }
 
     // override the actual orc compiler routine to
@@ -151,19 +180,16 @@ public:
         auto & C = M.getContext();
         assert (ctx->getContext() == &C);
 
-        for (const auto & link : LinkedFunctions) {
-            if (link.Target == K || link.Target == nullptr) {
-                Type * funcType = CBuilder::convertTypeToLLVMContext(C, link.FunctionDecl->getFunctionType());
-                Function::Create(cast<FunctionType>(funcType), Function::ExternalLinkage, link.FunctionDecl->getName(), &M);
-            }
-        }
-
         auto & builder = *ctx->Builder;
 
+        ctx->CurrentModule = &M;
+        ctx->Engine = Engine;
         builder.setModule(&M);
 
-        M.setTargetTriple(TargetTriple);
-        M.setDataLayout(*TargetDataLayout);
+        M.setTargetTriple(Engine->getTargetTriple().getTriple());
+        M.setDataLayout(Engine->getDataLayout());
+
+        K->linkExternalMethods(builder);
 
         auto optLevel = CodeGenOptLevel::Default;
         if (LLVM_LIKELY(ctx->IsCompilingMainFunction == 0)) {
@@ -180,7 +206,6 @@ public:
 
             // Build the "main" module frame context execution pipeline
             K->addKernelDeclarations(builder);
-
             K->addOrDeclareMainFunction(builder, Kernel::AddInternal);
 
         }
@@ -191,19 +216,37 @@ public:
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
+        auto & SL = ctx->NewSymbolList;
+
+        if (!SL.empty()) {
+            auto & MainJD = Engine->getMainJITDylib();
+            auto err = MainJD.define(orc::absoluteSymbols(SL));
+            if (err) {
+                handleAllErrors(std::move(err),
+                    [](const DuplicateDefinition &) {
+                        /* ignored */
+                    },
+                    [](const ErrorInfoBase & err) {
+                        SmallVector<char, 100> tmp;
+                        raw_svector_ostream msg(tmp);
+                        msg << "Cannot link symbol: " << err.message();
+                        report_fatal_error(msg.str());
+                    });
+            }
+            SL.clear();
+        }
+
         ctx->TargetMachine->setOptLevel(optLevel);
         auto result = ctx->Compiler->operator()(M);
         M.dropAllReferences();
-        Pool.release(ctx);
+        Pool->release(ctx);
         return result;
     }
 
 private:
 
-    CPUDriverContextPool & Pool;
-    StringRef TargetTriple;
-    const DataLayout * TargetDataLayout;
-    CPUDriver::LinkedFunctionVector & LinkedFunctions;
+    CPUDriverContextPool * Pool = nullptr;
+    LLJIT * Engine = nullptr;
 
 };
 
@@ -265,6 +308,7 @@ public:
         assert (&ctx->Builder->getContext() == ctx->getContext());
         ctx->TargetKernel = Target; assert (Target);
         ctx->IsCompilingMainFunction = 1;
+       // R->addDependencies()
         ThreadSafeModule TSM(std::make_unique<Module>("main", *ctx->getContext()), *ctx);
         TargetLayer.emit(std::move(R), std::move(TSM));
     }
@@ -320,7 +364,10 @@ CPUDriver::CPUDriver(std::string && moduleName)
         }
     }
 
-    auto JTMB = orc::JITTargetMachineBuilder(Triple{sys::getDefaultTargetTriple()});
+    auto TripleStr = Triple{sys::getProcessTriple()}.normalize();
+
+    auto JTMB = orc::JITTargetMachineBuilder(Triple{TripleStr});
+
     JTMB.setCPU(sys::getHostCPUName().str())
         .addFeatures(attrs)
         .setOptions(codegen::target_Options)
@@ -328,9 +375,12 @@ CPUDriver::CPUDriver(std::string && moduleName)
         .setCodeModel(CodeModel::Small)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
+
     const size_t numOfThreads = 4;
 
-    mContextPool = std::make_unique<CPUDriverContextPool>(numOfThreads, JTMB, features, mObjectCache.get(), this);
+    mAllLinkedSymbols = std::make_unique<SymbolMap>();
+
+    mContextPool = std::make_unique<CPUDriverContextPool>(numOfThreads, JTMB, features, mObjectCache.get(), *mAllLinkedSymbols);
 
     auto Builder = orc::LLJITBuilder();
     Builder.setJITTargetMachineBuilder(std::move(JTMB));
@@ -339,19 +389,18 @@ CPUDriver::CPUDriver(std::string && moduleName)
     // Safely route the compilation process through your customized Parabix caching system
     Builder.setCompileFunctionCreator([&](llvm::orc::JITTargetMachineBuilder InnerJTMB)
         -> Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
-            return std::make_unique<CPUDriverKernelCompiler>(
-                *mContextPool,
-                InnerJTMB,
-                mLinkedFunctions
-            );
+            return std::make_unique<CPUDriverKernelCompiler>(InnerJTMB);
     });
 
     mEngine = cantFail(Builder.create());
 
+
+
     auto & CL = mEngine->getIRCompileLayer();
     auto & CC = reinterpret_cast<CPUDriverKernelCompiler &>(CL.getCompiler());
-    CC.setTargetTriple(mEngine->getTargetTriple().getTriple());
-    CC.setDataLayout(mEngine->getDataLayout());
+
+    CC.setPool(mContextPool.get());
+    CC.setEngine(mEngine.get());
 
     auto & MainJD = mEngine->getMainJITDylib();
 
@@ -363,32 +412,16 @@ CPUDriver::CPUDriver(std::string && moduleName)
 
     mSymbolLookupSet = std::make_unique<SymbolLookupSet>();
 
-    mAllLinkedSymbols = std::make_unique<SymbolMap>();
+
 
     mBuilder.reset(IDISA::GetIDISA_Builder(mMainModule->getContext(), features));
     mBuilder->setModule(mMainModule);
-    mBuilder->setDriver(*this);
-
-    StreamSetBuffer::linkFunctions(*mBuilder);
-    mBuilder->LinkAllNecessaryExternalFunctions();
-}
-
-Function * CPUDriver::addLinkFunction(Kernel * kernel, llvm::StringRef name, FunctionType * type, void * functionPtr) {
-    // TODO: this will need a main context lock
-    Function * f = mMainModule->getFunction(name);
-    if (LLVM_UNLIKELY(f == nullptr)) {
-        f = Function::Create(type, Function::ExternalLinkage, name, mMainModule);
-        MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
-        auto symbol = M(name);
-        auto addr = orc::ExecutorAddr::fromPtr(functionPtr);
-        mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
-    }
-    mLinkedFunctions.emplace_back(kernel, f);
-    return f;
+    mBuilder->setFunctionLinkCallback(this);
 }
 
 void CPUDriver::linkAllExternalSymbols() {
     auto & MainJD = mEngine->getMainJITDylib();
+
     auto err = MainJD.define(orc::absoluteSymbols(*mAllLinkedSymbols));
     if (err) {
         handleAllErrors(std::move(err),
@@ -414,6 +447,8 @@ void CPUDriver::generateUncachedKernels() {
     // NOTE: we currently require DCE and Mem2Reg for each kernel to eliminate any unnecessary scalar -> value
     // mappings made by the base KernelCompiler. That could be done in a more focused manner, however, as each
     // mapping is known.
+
+    // TODO: we don't want to have more contexts than our thread count will allow
 
     const auto numKernels = mUncachedKernel.size();
 
@@ -442,9 +477,9 @@ void CPUDriver::generateUncachedKernels() {
 
 //    linkAllExternalSymbols();
 
-//    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
-//    cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
-//    removeAll(*mSymbolLookupSet);
+    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
+    cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
+    removeAll(*mSymbolLookupSet);
 
 }
 
@@ -546,11 +581,23 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     return mainFuncPtr;
 }
 
-bool CPUDriver::hasExternalFunction(llvm::StringRef functionName) const {
-//    auto & ES = mEngine->getExecutionSession();
-//    auto ss = ES.intern(functionName);
-//    auto r = ES.lookup(mEngine->defaultLinkOrder(), ss, SymbolState::Ready);
-//    return r.operator bool();
+llvm::Function * CPUDriver::LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
+    assert (&functionType->getContext() == &mMainModule->getContext());
+    Function * f = mMainModule->getFunction(unmangledName);
+    if (LLVM_UNLIKELY(f == nullptr)) {
+        f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mMainModule);
+        auto & ES = mEngine->getExecutionSession();
+        ES.runSessionLocked([&]{
+            MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
+            auto symbol = M(unmangledName);
+            auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
+            mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
+        });
+    }
+    return f;
+}
+
+bool CPUDriver::HasExternalFunction(llvm::StringRef functionName) const {
     return RTDyldMemoryManager::getSymbolAddressInProcess(functionName.str());
 }
 

@@ -750,17 +750,17 @@ std::shared_ptr<OptimizationBranchBuilder> PipelineBuilder::CreateOptimizationBr
     auto allZeroScalarOutputs = nonZeroScalarOutputs;
 
     PipelineKernel * const allZero =
-        new PipelineKernel(mDriver, "", {},
+        new PipelineKernel(*mDriver.getMainBuilder(), "", {},
                            std::move(allZeroStreamInputs), std::move(allZeroStreamOutputs),
                            std::move(allZeroScalarInputs), std::move(allZeroScalarOutputs));
 
     PipelineKernel * const nonZero =
-        new PipelineKernel(mDriver, "", {},
+        new PipelineKernel(*mDriver.getMainBuilder(), "", {},
                            std::move(nonZeroStreamInputs), std::move(nonZeroStreamOutputs),
                            std::move(nonZeroScalarInputs), std::move(nonZeroScalarOutputs));
 
     PipelineKernel * const branch =
-        new PipelineKernel(mDriver, "", {},
+        new PipelineKernel(*mDriver.getMainBuilder(), "", {},
                            std::move(stream_inputs), std::move(stream_outputs),
                            std::move(scalar_inputs), std::move(scalar_outputs));
 

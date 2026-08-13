@@ -334,6 +334,8 @@ public:
 
     IllustratedStreamSetMap         mIllustratedStreamSetBindings;
 
+    CompilerAllocator               mAllocator;
+
     OwningVector<Kernel>            mInternalKernels;
     OwningVector<Binding>           mInternalBindings;
     OwningVector<StreamSetBuffer>   mInternalBuffers;

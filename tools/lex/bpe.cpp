@@ -78,6 +78,17 @@ static cl::opt<bool> GeometricCompaction(
     cl::desc("Use a geometric rather than an arithmetic compaction schecule."),
     cl::init(false));
 
+// Grouped-if: rules sharing a first id (idA) collapse under ONE createIf gate
+// (shared Astart EQ) instead of one per rule. Single-level (no nested if → T6).
+// Applied only to kernels with index >= IfGroupLowerLimit — the early kernels
+// fire on almost every block (grouping there saves gates but never skips), so
+// grouping is aimed at the later kernels. -1 = off (per-rule everywhere).
+static cl::opt<int> IfGroupLowerLimit(
+    "if-group-lower-limit",
+    cl::desc("Group merge rules by first id under one createIf, for kernels at/after "
+             "this index (-1 = off)."),
+    cl::init(-1));
+
 using namespace pablo;
 using namespace kernel;
 
@@ -388,18 +399,21 @@ public:
                    StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
                    StreamSet * nextIdIn,
                    StreamSet * sourceOut, StreamSet * meOut,
-                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
+                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen,
+                   bool grouped = false)
     // name must encode every body-shaping param hashRuleSet omits
     // — LookAhead distance (L=maxLen, changes with compaction), input width (w) and accumulator width (o, dev 12-bit vs full 16-bit)
-    // — else objcache serves a mismatched compiled body. x1_ = indexed-shift body.
+    // — else objcache serves a mismatched compiled body. x1_ = indexed-shift body, g1_ = grouped-if body.
 
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
+                        + (grouped ? "g1_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
                   mergeInputs(sourceIn, meIn, boundaryIn, nextIdIn, maxLen),
                   {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
-      mRuleGroup(group), mHasBoundary(boundaryIn != nullptr), mUseNextId(nextIdIn != nullptr) {}
+      mRuleGroup(group), mHasBoundary(boundaryIn != nullptr), mUseNextId(nextIdIn != nullptr),
+      mGrouped(grouped) {}
 protected:
     static std::vector<kernel::Binding> mergeInputs(
             StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
@@ -503,17 +517,11 @@ protected:
         Var * anyMerge = pb.createVar("anyMerge", zeroes);   // OR of every fire
         Var * clearAll = pb.createVar("clearAll", zeroes);   // OR of every B-consume
 
-        for (const auto & r : mRuleGroup.rules) {
-            PabloAST * Astart = bnc.EQ(srcFrozen, r.idA);    // A starts here (frozen input)
-
-            // Self-merge X+X→XX (idA==idB): pair per-run on the frozen live starts. No
-            // same-kernel rule can have consumed an X-run position — that would overlap
-            // the self-merge, which the clean-range partition forbids — so frozen == live.
-            PabloAST * fireStart = Astart;
-            if (r.idA == r.idB)
-                fireStart = selfMergeFireStarts(pb, pb.createAnd(Astart, meInFrozen), r.lenA);
-
-            auto body = pb.createScope();
+        // One rule's fire → B-detect + anyMerge/clearAll accumulate + varying-bit stamp,
+        // all inside `body` (the gated scope). fireStart is supplied by the caller
+        // (per-rule Astart, or the shared group Astart). Constant bits + the final mask
+        // are folded once after the loop, so this only stamps the varying bits.
+        auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart) {
             BixNumCompiler bncB(body);
             // B-detection: indexed mode reads the next-live id (frozen), byte mode reads
             // lenA ahead via LookAhead. Both frozen → identical semantics.
@@ -530,7 +538,6 @@ protected:
                 : body.createAdvance(fire, r.lenA);
             body.createAssign(clearAll, body.createOr(clearAll, clearB));
 
-            // Stamp ONLY the varying bits (constant bits folded once, after the loop).
             PabloAST * notFire = nullptr;
             for (unsigned i = 0; i < W_out; i++) {
                 if (!((varyMask >> i) & 1u)) continue;
@@ -541,7 +548,54 @@ protected:
                     body.createAssign(idAcc[i], body.createAnd(idAcc[i], notFire));
                 }
             }
+        };
+
+        // Self-merge X+X→XX (idA==idB): pair per-run on the frozen live starts. No
+        // same-kernel rule can have consumed an X-run position — that would overlap the
+        // self-merge, which the clean-range partition forbids — so frozen == live.
+        auto emitRule = [&](const MergeRule & r) {
+            PabloAST * Astart = bnc.EQ(srcFrozen, r.idA);
+            PabloAST * fireStart = Astart;
+            if (r.idA == r.idB)
+                fireStart = selfMergeFireStarts(pb, pb.createAnd(Astart, meInFrozen), r.lenA);
+            auto body = pb.createScope();
+            emitBody(body, r, fireStart);
             pb.createIf(pb.createAnd(fireStart, meInFrozen), body);
+        };
+
+        if (!mGrouped) {
+            for (const auto & r : mRuleGroup.rules) emitRule(r);
+        } else {
+            // Grouped-if (numeric-range): sort rules by first id (idA), chop into chunks
+            // of GROUP_SIZE, and gate each chunk with ONE createIf on the id RANGE
+            // [gLo,gHi] it spans (2 compares) instead of one if per rule. A block with no
+            // live id in the chunk's range skips all its per-rule EQs. Sorted → the high
+            // (rare) chunks have narrow high ranges → skipped most blocks, while the low
+            // (common) chunk stays lit. Per-rule EQ is flat inside the gate → single level
+            // (T6-safe). Reorder is safe (T4 independence). GROUP_SIZE=5 → N/5 groups.
+            const unsigned GROUP_SIZE = 1;
+            std::vector<const MergeRule*> sorted;
+            sorted.reserve(mRuleGroup.rules.size());
+            for (const auto & r : mRuleGroup.rules) sorted.push_back(&r);
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const MergeRule* a, const MergeRule* b){ return a->idA < b->idA; });
+            for (size_t s = 0; s < sorted.size(); s += GROUP_SIZE) {
+                size_t e = std::min(sorted.size(), s + GROUP_SIZE);
+                unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
+                PabloAST * inRange = pb.createAnd(bnc.UGE(srcFrozen, gLo),
+                                                  bnc.ULE(srcFrozen, gHi));
+                auto body = pb.createScope();
+                BixNumCompiler bncBody(body);
+                for (size_t k = s; k < e; k++) {
+                    const MergeRule & r = *sorted[k];
+                    PabloAST * Astart = bncBody.EQ(srcFrozen, r.idA);    // per-rule, inside the gate
+                    PabloAST * fireStart = Astart;
+                    if (r.idA == r.idB)
+                        fireStart = selfMergeFireStarts(body, body.createAnd(Astart, meInFrozen), r.lenA);
+                    emitBody(body, r, fireStart);
+                }
+                pb.createIf(pb.createAnd(inRange, meInFrozen), body);
+            }
         }
 
         // Constant bits: identical across [lo,hi) → one Or/AndNot per bit, gated by
@@ -568,6 +622,7 @@ private:
     MergeRuleGroup mRuleGroup;
     bool mHasBoundary;
     bool mUseNextId;
+    bool mGrouped;
 };
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
@@ -676,8 +731,10 @@ BPEPassResult buildBPEPassPipeline(
             nextId = P.CreateStreamSet(source->getNumElements(), 1);
             P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
         }
+        // Grouped-if for kernels at/after the lower limit (later kernels); -1 = off.
+        bool grouped = (IfGroupLowerLimit >= 0) && ((long) i >= (long) IfGroupLowerLimit);
         P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
-                                           g, hashRuleSet(g.rules), g.maxLen);
+                                           g, hashRuleSet(g.rules), g.maxLen, grouped);
         source     = sOut;
         inPlayMask = meOut;
 

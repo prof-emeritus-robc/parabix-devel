@@ -7,6 +7,7 @@
 #include <codegen/CBuilder.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <bitset>
+#include <string>
 
 namespace llvm { class Constant; }
 namespace llvm { class LoadInst; }
@@ -15,6 +16,9 @@ namespace llvm { class Value; }
 namespace llvm { class StringRef; }
 
 namespace IDISA {
+
+extern std::string IDISA_Experiment;
+
 using FixedVectorType = llvm::FixedVectorType;
 
 bool isStreamTy(const llvm::Type * const t);

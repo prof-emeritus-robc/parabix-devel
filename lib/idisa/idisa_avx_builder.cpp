@@ -9,6 +9,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicsX86.h>
+#include <sstream>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
 #else
@@ -27,7 +28,15 @@ using namespace llvm;
 namespace IDISA {
 
 std::string IDISA_AVX_Builder::getBuilderUniqueName() {
-    return mBitBlockWidth != AVX_width ? "AVX_" + std::to_string(mBitBlockWidth) : "AVX";
+    std::stringstream uname;
+    uname << "AVX";
+    if (mBitBlockWidth != AVX_width) {
+        uname << "_" << mBitBlockWidth;
+    }
+    if (IDISA::IDISA_Experiment != "") {
+        uname << IDISA::IDISA_Experiment;
+    }
+    return uname.str();
 }
 
 Value * IDISA_AVX_Builder::hsimd_signmask(unsigned fw, Value * a) {
@@ -732,7 +741,15 @@ Value * IDISA_AVX2_Builder::mvmd_expand(unsigned fw, Value * a, Value * select_m
 }
 
 std::string IDISA_AVX512F_Builder::getBuilderUniqueName() {
-    return mBitBlockWidth != AVX512_width ? "AVX512F_" + std::to_string(mBitBlockWidth) : "AVX512F";
+    std::stringstream uname;
+    uname << "AVX512F";
+    if (mBitBlockWidth != AVX512_width) {
+        uname << "_" << mBitBlockWidth;
+    }
+    if (IDISA::IDISA_Experiment != "") {
+        uname << IDISA::IDISA_Experiment;
+    }
+    return uname.str();
 }
 
 Value * IDISA_AVX512F_Builder::hsimd_packh(unsigned fw, Value * a, Value * b) {

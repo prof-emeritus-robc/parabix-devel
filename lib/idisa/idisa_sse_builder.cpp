@@ -8,6 +8,7 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IntrinsicsX86.h>
 #include <llvm/IR/Module.h>
+#include <sstream>
 
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
 #define getOrInsertDeclaration getDeclaration
@@ -17,9 +18,41 @@ using namespace llvm;
 
 namespace IDISA {
 
-std::string IDISA_SSE_Builder::getBuilderUniqueName() { return mBitBlockWidth != 128 ? "SSE_" + std::to_string(mBitBlockWidth) : "SSE";}
-std::string IDISA_SSE2_Builder::getBuilderUniqueName() { return mBitBlockWidth != 128 ? "SSE2_" + std::to_string(mBitBlockWidth) : "SSE2";}
-std::string IDISA_SSSE3_Builder::getBuilderUniqueName() { return mBitBlockWidth != 128 ? "SSSE3_" + std::to_string(mBitBlockWidth) : "SSSE3";}
+std::string IDISA_SSE_Builder::getBuilderUniqueName() {
+    std::stringstream uname;
+    uname << "SSE2";
+    if (mBitBlockWidth != SSE_width) {
+        uname << "_" << mBitBlockWidth;
+    }
+    if (IDISA::IDISA_Experiment != "") {
+        uname << IDISA::IDISA_Experiment;
+    }
+    return uname.str();
+}
+
+std::string IDISA_SSE2_Builder::getBuilderUniqueName() {
+    std::stringstream uname;
+    uname << "SSE2";
+    if (mBitBlockWidth != SSE_width) {
+        uname << "_" << mBitBlockWidth;
+    }
+    if (IDISA::IDISA_Experiment != "") {
+        uname << IDISA::IDISA_Experiment;
+    }
+    return uname.str();
+}
+
+std::string IDISA_SSSE3_Builder::getBuilderUniqueName() {
+    std::stringstream uname;
+    uname << "SSSE3";
+    if (mBitBlockWidth != SSE_width) {
+        uname << "_" << mBitBlockWidth;
+    }
+    if (IDISA::IDISA_Experiment != "") {
+        uname << IDISA::IDISA_Experiment;
+    }
+    return uname.str();
+}
 
 Value * IDISA_SSE_Builder::hsimd_signmask(const unsigned fw, Value * a) {
     // Produces wrong result on AVX2 with fw = 16

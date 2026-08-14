@@ -51,7 +51,7 @@ public:
 
     using Path = llvm::SmallString<128>;
 
-//    CacheObjectResult loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * const kernel) noexcept;
+    std::unique_ptr<llvm::MemoryBuffer> loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * kernel, llvm::Module & M) noexcept;
 
     void notifyObjectCompiled(const llvm::Module * M, llvm::MemoryBufferRef Obj) override;
 

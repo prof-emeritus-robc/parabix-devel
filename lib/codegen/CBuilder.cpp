@@ -2323,9 +2323,10 @@ Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
         auto convertStructType = [&](const StructType * const type) -> StructType * {
             // If this struct type already exists, reuse it. If we simply recreated it,
             // we'd end up with a structurally identical but different type.
+            StructType * st = nullptr;
             if (!type->isLiteral()) {
-                StructType * const st = StructType::getTypeByName(C, type->getName());
-                if (st) {
+                st = StructType::getTypeByName(C, type->getName());
+                if (st && !st->isOpaque()) {
                     assert (st->getNumElements() == type->getNumElements());
                     return st;
                 }
@@ -2335,10 +2336,12 @@ Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
             for (unsigned i = 0; i < count; ++i) {
                 elemTypes[i] = convertType(type->getStructElementType(i));
             }
-            StructType * st = nullptr;
             if (type->isLiteral()) {
                 // an identical unnamed struct type may exist
                 st = StructType::get(C, elemTypes, type->isPacked());
+            } else if (st) {
+                assert (st->isOpaque());
+                st->setBody(elemTypes, type->isPacked());
             } else {
                 st = StructType::create(C, elemTypes, type->getName(), type->isPacked());
             }

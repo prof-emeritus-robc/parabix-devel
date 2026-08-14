@@ -97,13 +97,14 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
             auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
             SymbolStringPtr symbol = nullptr;
             bool added = false;
+            const auto flags = JITSymbolFlags::Exported | JITSymbolFlags::Callable;
             ES.runSessionLocked([&]{
                 MangleAndInterner M(ES, Engine->getDataLayout());
                 symbol = M(unmangledName);
-                added = SharedSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported})).second;
+                added = SharedSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, flags})).second;
             });
             if (added) {
-                NewSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
+                NewSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, flags}));
             }
         }
         return f;
@@ -113,6 +114,7 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
         return RTDyldMemoryManager::getSymbolAddressInProcess(unmangledName.str());
     }
 
+    virtual ~CPUDriverContext() {}
 };
 
 class CPUDriverContextPool {
@@ -120,7 +122,7 @@ public:
 
     CPUDriverContextPool(const size_t count, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, SymbolMap & symbolList) {
         for (size_t i = 0; i < count; ++i) {
-            Contexts.push(std::move(std::make_unique<CPUDriverContext>(std::make_unique<LLVMContext>(), JTMB, features, ObjCache, symbolList)));
+            Contexts.push(std::make_unique<CPUDriverContext>(std::make_unique<LLVMContext>(), JTMB, features, ObjCache, symbolList));
         }
     }
 
@@ -155,9 +157,10 @@ class CPUDriverKernelCompiler : public orc::IRCompileLayer::IRCompiler {
 
 public:
 
-    CPUDriverKernelCompiler(JITTargetMachineBuilder & JTMB)
+    CPUDriverKernelCompiler(JITTargetMachineBuilder & JTMB, ParabixObjectCache * const objCache)
     : orc::IRCompileLayer::IRCompiler(irManglingOptionsFromTargetOptions(JTMB.getOptions()))
-    , Pool(nullptr) {
+    , Pool(nullptr)
+    , ObjectCache(objCache) {
 
     }
 
@@ -191,31 +194,6 @@ public:
 
         K->linkExternalMethods(builder);
 
-        auto optLevel = CodeGenOptLevel::Default;
-        if (LLVM_LIKELY(ctx->IsCompilingMainFunction == 0)) {
-
-            NamedRegionTimer T(K->getSignature(), K->getName(),
-                               "Kernel", "Kernel Generation",
-                               codegen::TimeKernelsIsEnabled);
-            K->generateKernel(builder, ctx->TargetMachine.get());
-            if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
-                optLevel = codegen::BackEndOptLevel;
-            }
-
-        } else {
-
-            // Build the "main" module frame context execution pipeline
-            K->addKernelDeclarations(builder);
-            K->addOrDeclareMainFunction(builder, Kernel::AddInternal);
-
-        }
-
-
-
-        NamedRegionTimer T(M.getModuleIdentifier(), "",
-                           "Module", "Object Generation",
-                           codegen::TimeKernelsIsEnabled);
-
         auto & SL = ctx->NewSymbolList;
 
         if (!SL.empty()) {
@@ -236,9 +214,41 @@ public:
             SL.clear();
         }
 
+        auto optLevel = CodeGenOptLevel::Default;
+        if (LLVM_LIKELY(ctx->IsCompilingMainFunction == 0)) {
+
+            NamedRegionTimer T(K->getSignature(), K->getName(),
+                               "Kernel", "Kernel Generation",
+                               codegen::TimeKernelsIsEnabled);
+
+            if (LLVM_LIKELY(ObjectCache && K->isCachable())) {
+                auto cached = ObjectCache->loadCachedObjectFile(builder, K, M);
+                if (cached) {
+                    Pool->release(ctx);
+                    return cached;
+                }
+            }
+
+            K->generateKernel(builder, ctx->TargetMachine.get());
+            if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
+                optLevel = codegen::BackEndOptLevel;
+            }
+
+        } else {
+
+            // Build the "main" module frame context execution pipeline
+            K->addKernelDeclarations(builder);
+            K->addOrDeclareMainFunction(builder, Kernel::AddInternal);
+
+        }
+
+        NamedRegionTimer T(M.getModuleIdentifier(), "",
+                           "Module", "Object Generation",
+                           codegen::TimeKernelsIsEnabled);
+
         ctx->TargetMachine->setOptLevel(optLevel);
         auto result = ctx->Compiler->operator()(M);
-        M.dropAllReferences();
+        // M.dropAllReferences();
         Pool->release(ctx);
         return result;
     }
@@ -246,6 +256,7 @@ public:
 private:
 
     CPUDriverContextPool * Pool = nullptr;
+    ParabixObjectCache * const ObjectCache;
     LLJIT * Engine = nullptr;
 
 };
@@ -389,7 +400,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
     // Safely route the compilation process through your customized Parabix caching system
     Builder.setCompileFunctionCreator([&](llvm::orc::JITTargetMachineBuilder InnerJTMB)
         -> Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
-            return std::make_unique<CPUDriverKernelCompiler>(InnerJTMB);
+            return std::make_unique<CPUDriverKernelCompiler>(InnerJTMB, mObjectCache.get());
     });
 
     mEngine = cantFail(Builder.create());
@@ -468,14 +479,11 @@ void CPUDriver::generateUncachedKernels() {
     for (unsigned i = 0; i < numKernels; ++i) {
         auto & kernel = mUncachedKernel[i];
         cantFail(MainJD.define(std::make_unique<KernelGenerationMU>(kernel.get(), Mangler, *mSymbolLookupSet, CL, *mContextPool)));
+        assert (!mSymbolLookupSet->containsDuplicates());
         mCachedKernel.emplace_back(kernel.release());
     }
 
     mUncachedKernel.clear();
-
-//    assert (!mSymbolLookupSet->containsDuplicates());
-
-//    linkAllExternalSymbols();
 
     auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
     cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
@@ -502,6 +510,7 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     auto & CL = mEngine->getIRCompileLayer();
 
     cantFail(MainJD.define(std::make_unique<MainGenerationMU>(pk, mainSymbol, *mSymbolLookupSet, CL, *mContextPool)));
+    assert (!mSymbolLookupSet->containsDuplicates());
 
 #if 0
     if (LLVM_UNLIKELY(codegen::ShowASMOption != codegen::OmittedOption)) {
@@ -540,9 +549,6 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     // 7. Look up and resolve symbols using standard target data layout policies.
     // Compilation triggers on-demand here during lookup, bypassing the old explicit finalizeObject() call.
 
-    assert (!mSymbolLookupSet->containsDuplicates());
-
-    linkAllExternalSymbols();
 
     auto & ES = mEngine->getExecutionSession();
     auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly); // mSymbolStubs,

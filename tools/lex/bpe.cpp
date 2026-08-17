@@ -68,10 +68,13 @@
 using boost::intrusive::detail::ceil_log2;
 
 using namespace llvm;
+// Every optional BPE optimization defaults OFF — a bare run is the plain, unoptimized
+// pipeline, and each optimization is opted into on the command line. 
 static cl::opt<unsigned> CompactionBase(
     "compact-base",
-    cl::desc("The base kernel at which filter-by-mask compaction is first applied (init 40)."),
-    cl::init(40));
+    cl::desc("Base kernel at which filter-by-mask compaction is first applied "
+             "(0 = off, the default)."),
+    cl::init(0));
 
 static cl::opt<bool> GeometricCompaction(
     "geometric-compaction",
@@ -88,6 +91,24 @@ static cl::opt<int> IfGroupLowerLimit(
     cl::desc("Group merge rules by first id under one createIf, for kernels at/after "
              "this index (-1 = off)."),
     cl::init(-1));
+
+
+// FIXED COUNT: give every kernel exactly K grouped-if gates. Gate SIZE then VARIES per
+// kernel = rules/K (a 900-rule kernel -> 900/K rules per gate, a 10-rule kernel -> 10/K).
+// Same gate structure everywhere, scales with kernel size. Only active with
+// --if-group-lower-limit >= 0. Default 1 = one gate covering all the kernel's rules.
+static cl::opt<unsigned> IfGroupCount(
+    "if-group-count",
+    cl::desc("Grouped-if gates per kernel (only with --if-group-lower-limit >= 0). "
+             "Gate size = rules/count; count scales with kernel. Default 1."),
+    cl::init(1));
+
+// Effective grouped-if chunk size for a kernel with n rules: n/IfGroupCount rules per gate.
+// Used by BOTH the cache-name tag and the Pablo body so they never disagree (stale-cache hazard).
+static unsigned effGroupSize(size_t n) {
+    return std::max<unsigned>(1u, (unsigned)(n / std::max(1u, IfGroupCount.getValue())));
+}
+
 
 using namespace pablo;
 using namespace kernel;
@@ -406,7 +427,7 @@ public:
     // — else objcache serves a mismatched compiled body. x1_ = indexed-shift body, g1_ = grouped-if body.
 
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
-                        + (grouped ? "g1_" : "")
+                        + (grouped ? "g" + std::to_string(effGroupSize(group.rules.size())) + "_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -435,7 +456,6 @@ protected:
         const unsigned W = srcBits.size();
         const unsigned W_out = ceil_log2(mRuleGroup.hi + 1);
         PabloAST * zeroes = pb.createZeroes();
-        PabloAST * ones   = pb.createNot(zeroes);
 
         // idAcc — the id stream we mutate; starts as a copy of the input ids.
         std::vector<Var *> idAcc(W_out);
@@ -492,35 +512,30 @@ protected:
             }
         }
 
-        // Range-constant-bit stamp fold. Every idAB in this kernel lies in [lo,hi), so
-        // their high bits are identical — varyMask marks the bits that actually differ
-        // across the range. Stamp only the VARYING bits per rule; fold the CONSTANT bits
-        // into ONE Or/AndNot per bit per kernel via anyMerge (OR of every fire, and ≤1
-        // rule fires per position so the shared constant value is exact). The N
-        // B-consumes fold the same way into clearAll → one final mask update.
-        //
-        // Every Astart / fire / mask read comes from the FROZEN kernel input (srcFrozen =
-        // entry ids, meInFrozen = entry live-start mask), NOT the mutating idAcc /
-        // inPlayMask. Independence (T4) + clean-range conflict-freedom make frozen == live
-        // for every such read; deferring the constant (high) bits would otherwise leave
-        // idAcc a partial value mid-kernel that could alias another rule's idA. Per-rule
-        // createIf still gates on the frozen Astart, so block-skip is preserved.
-        unsigned andAll = ~0u, orAll = 0u;
-        for (const auto & r : mRuleGroup.rules) { andAll &= r.idAB; orAll |= r.idAB; }
-        const unsigned varyMask = orAll ^ andAll;      // bit i set ⇔ idAB bit i varies
-
+        // Frozen kernel input, shared by the Astart compare and the per-rule stamps:
+        // srcFrozen = entry ids, meInFrozen = entry live-start mask. Reading the frozen
+        // input (not the mutating idAcc/inPlayMask) is safe by T4 independence +
+        // clean-range conflict-freedom.
         std::vector<PabloAST*> frozenBits(W_out);       // entry idAcc value, immutable
         for (unsigned i = 0; i < W_out; i++) frozenBits[i] = (i < W) ? srcBits[i] : zeroes;
         BixNum      srcFrozen(frozenBits.begin(), frozenBits.end());
         PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
 
-        Var * anyMerge = pb.createVar("anyMerge", zeroes);   // OR of every fire
-        Var * clearAll = pb.createVar("clearAll", zeroes);   // OR of every B-consume
+        // ── Astart decode ────────────────────────────────────────────────────────
+        // Astart(idA) = EQ(srcFrozen, idA) AND meInFrozen — a W_out-deep AND/OR chain.
+        // Every rule pays it OUTSIDE its createIf gate (the gate condition IS Astart),
+        // so it is the dominant never-skipped per-byte cost. eqAstart already folds in
+        // meInFrozen, so the returned value IS the gate value — callers hand it straight
+        // to emitBody, whose fire is a 2-input And.
+        auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
+            BixNumCompiler bncL(bld);
+            return bld.createAnd(bncL.EQ(srcFrozen, id), meInFrozen);
+        };
 
-        // One rule's fire → B-detect + anyMerge/clearAll accumulate + varying-bit stamp,
-        // all inside `body` (the gated scope). fireStart is supplied by the caller
-        // (per-rule Astart, or the shared group Astart). Constant bits + the final mask
-        // are folded once after the loop, so this only stamps the varying bits.
+        // One rule's fire → B-detect + stamp all idAB bits + consume B, all inside `body`
+        // (the gated scope, so it's block-skippable). fireStart is supplied by the caller
+        // (per-rule Astart) and MUST already be AND-ed with meInFrozen — eqAstart does
+        // that (its result is EQ AND meInFrozen).
         auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart) {
             BixNumCompiler bncB(body);
             // B-detection: indexed mode reads the next-live id (frozen), byte mode reads
@@ -528,39 +543,37 @@ protected:
             PabloAST * BstartAtA = mUseNextId
                 ? bncB.EQ(nextIdBN, r.idB)
                 : bncB.EQ(aheadByLenA.at(r.lenA), r.idB);
-            PabloAST * fire = body.createAnd3(meInFrozen, fireStart, BstartAtA);
+            PabloAST * fire = body.createAnd(fireStart, BstartAtA);
             if (mHasBoundary)   // block merges where B begins a new pretoken (cross-boundary)
                 fire = body.createAnd(fire, body.createNot(boundaryAheadByLen.at(r.lenA)));
 
-            body.createAssign(anyMerge, body.createOr(anyMerge, fire));
+            // Stamp all W_out bits of idAB at A's start (inside the gate → block-skippable).
+            PabloAST * notFire = body.createNot(fire);
+            for (unsigned i = 0; i < W_out; i++) {
+                if ((r.idAB >> i) & 1u)
+                    body.createAssign(idAcc[i], body.createOr(idAcc[i], fire));
+                else
+                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notFire));
+            }
+            // Consume B's start from the live-start mask (per rule).
             PabloAST * clearB = mUseNextId
                 ? body.createIndexedAdvance(fire, meInFrozen, 1)
                 : body.createAdvance(fire, r.lenA);
-            body.createAssign(clearAll, body.createOr(clearAll, clearB));
-
-            PabloAST * notFire = nullptr;
-            for (unsigned i = 0; i < W_out; i++) {
-                if (!((varyMask >> i) & 1u)) continue;
-                if ((r.idAB >> i) & 1u) {
-                    body.createAssign(idAcc[i], body.createOr(idAcc[i], fire));
-                } else {
-                    if (!notFire) notFire = body.createNot(fire);
-                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notFire));
-                }
-            }
+            body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(clearB)));
         };
 
         // Self-merge X+X→XX (idA==idB): pair per-run on the frozen live starts. No
         // same-kernel rule can have consumed an X-run position — that would overlap the
         // self-merge, which the clean-range partition forbids — so frozen == live.
         auto emitRule = [&](const MergeRule & r) {
-            PabloAST * Astart = bnc.EQ(srcFrozen, r.idA);
-            PabloAST * fireStart = Astart;
+            // eqAstart already includes meInFrozen, and selfMergeFireStarts returns a
+            // subset of its input, so fireStart IS the gate value — no extra And.
+            PabloAST * fireStart = eqAstart(pb, r.idA);
             if (r.idA == r.idB)
-                fireStart = selfMergeFireStarts(pb, pb.createAnd(Astart, meInFrozen), r.lenA);
+                fireStart = selfMergeFireStarts(pb, fireStart, r.lenA);
             auto body = pb.createScope();
             emitBody(body, r, fireStart);
-            pb.createIf(pb.createAnd(fireStart, meInFrozen), body);
+            pb.createIf(fireStart, body);
         };
 
         if (!mGrouped) {
@@ -573,7 +586,7 @@ protected:
             // (rare) chunks have narrow high ranges → skipped most blocks, while the low
             // (common) chunk stays lit. Per-rule EQ is flat inside the gate → single level
             // (T6-safe). Reorder is safe (T4 independence). GROUP_SIZE=5 → N/5 groups.
-            const unsigned GROUP_SIZE = 1;
+            const unsigned GROUP_SIZE = effGroupSize(mRuleGroup.rules.size());
             std::vector<const MergeRule*> sorted;
             sorted.reserve(mRuleGroup.rules.size());
             for (const auto & r : mRuleGroup.rules) sorted.push_back(&r);
@@ -585,34 +598,19 @@ protected:
                 PabloAST * inRange = pb.createAnd(bnc.UGE(srcFrozen, gLo),
                                                   bnc.ULE(srcFrozen, gHi));
                 auto body = pb.createScope();
-                BixNumCompiler bncBody(body);
+                // Per-rule Astart EQ stays INSIDE the gate body so the range gate can
+                // block-skip it. Single level (T6-safe).
                 for (size_t k = s; k < e; k++) {
                     const MergeRule & r = *sorted[k];
-                    PabloAST * Astart = bncBody.EQ(srcFrozen, r.idA);    // per-rule, inside the gate
-                    PabloAST * fireStart = Astart;
+                    PabloAST * fireStart = eqAstart(body, r.idA);
                     if (r.idA == r.idB)
-                        fireStart = selfMergeFireStarts(body, body.createAnd(Astart, meInFrozen), r.lenA);
+                        fireStart = selfMergeFireStarts(body, fireStart, r.lenA);
                     emitBody(body, r, fireStart);
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }
         }
 
-        // Constant bits: identical across [lo,hi) → one Or/AndNot per bit, gated by
-        // anyMerge. v = (andAll>>i)&1. idAcc[i] here still holds its frozen entry value.
-        PabloAST * notAny = nullptr;
-        for (unsigned i = 0; i < W_out; i++) {
-            if ((varyMask >> i) & 1u) continue;              // varying → already stamped
-            if ((andAll >> i) & 1u) {
-                pb.createAssign(idAcc[i], pb.createOr(idAcc[i], anyMerge));
-            } else {
-                if (!notAny) notAny = pb.createNot(anyMerge);
-                pb.createAssign(idAcc[i], pb.createAnd(idAcc[i], notAny));
-            }
-        }
-
-        // Fold all B-consumes: final live-start mask = frozen input AND NOT every cleared B.
-        pb.createAssign(inPlayMask, pb.createAnd(meInFrozen, pb.createNot(clearAll)));
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
             pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // 16-bit token ID stream

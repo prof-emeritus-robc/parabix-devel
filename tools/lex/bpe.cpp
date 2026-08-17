@@ -109,6 +109,16 @@ static unsigned effGroupSize(size_t n) {
     return std::max<unsigned>(1u, (unsigned)(n / std::max(1u, IfGroupCount.getValue())));
 }
 
+// move the B-detection LookAhead INSIDE each rule's createIf gate instead of
+// hoisting one shared shift per distinct lenA outside all gates. Inside = skippable on cold
+// blocks but DUPLICATED per rule (loses the per-lenA dedup); outside (default) = shared but
+// runs every block. 
+static cl::opt<bool> LookaheadInGate(
+    "lookahead-in-gate",
+    cl::desc("Build the B-detection LookAhead inside each rule's if-gate (per-rule, "
+             "skippable) instead of one shared hoisted shift per lenA (default)."),
+    cl::init(false));
+
 
 using namespace pablo;
 using namespace kernel;
@@ -428,6 +438,7 @@ public:
 
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
                         + (grouped ? "g" + std::to_string(effGroupSize(group.rules.size())) + "_" : "")
+                        + (LookaheadInGate ? "la1_" : "la0_")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -489,8 +500,9 @@ protected:
         // (sourceIn declares LookAhead(maxLen), and lenA < mergedLen ≤ maxLen).
         // Skipped in indexed mode — nextIdBN replaces every source LookAhead.
         // 4. Because of the copy → NO LookAhead built into the body, so the kernel's body is identical for every rule (no per-lenA LookAhead).
+        // Skipped when --lookahead-in-gate: emitBody builds the shift per rule instead.
         std::map<unsigned, BixNum> aheadByLenA;
-        if (!mUseNextId)
+        if (!mUseNextId && !LookaheadInGate)
         for (const auto & r : mRuleGroup.rules) {
             if (aheadByLenA.count(r.lenA)) continue;
             std::vector<PabloAST*> bits(W);
@@ -505,7 +517,7 @@ protected:
         // boundary stream was supplied → no gating (mHasBoundary == false).
         PabloAST * boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
         std::map<unsigned, PabloAST*> boundaryAheadByLen;
-        if (mHasBoundary) {
+        if (mHasBoundary && !LookaheadInGate) {   // in-gate mode builds it per rule in emitBody
             for (const auto & r : mRuleGroup.rules) {
                 if (boundaryAheadByLen.count(r.lenA)) continue;
                 boundaryAheadByLen[r.lenA] = pb.createLookahead(boundaryBit, (int64_t) r.lenA);
@@ -540,12 +552,26 @@ protected:
             BixNumCompiler bncB(body);
             // B-detection: indexed mode reads the next-live id (frozen), byte mode reads
             // lenA ahead via LookAhead. Both frozen → identical semantics.
-            PabloAST * BstartAtA = mUseNextId
-                ? bncB.EQ(nextIdBN, r.idB)
-                : bncB.EQ(aheadByLenA.at(r.lenA), r.idB);
+            // --lookahead-in-gate: build the shift HERE (inside body, per rule, skippable)
+            // instead of the hoisted shared aheadByLenA/boundaryAheadByLen maps.
+            PabloAST * BstartAtA;
+            if (mUseNextId) {
+                BstartAtA = bncB.EQ(nextIdBN, r.idB);
+            } else if (LookaheadInGate) {
+                std::vector<PabloAST*> bits(W);
+                for (unsigned i = 0; i < W; i++)
+                    bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
+                BstartAtA = bncB.EQ(BixNum(bits.begin(), bits.end()), r.idB);
+            } else {
+                BstartAtA = bncB.EQ(aheadByLenA.at(r.lenA), r.idB);
+            }
             PabloAST * fire = body.createAnd(fireStart, BstartAtA);
-            if (mHasBoundary)   // block merges where B begins a new pretoken (cross-boundary)
-                fire = body.createAnd(fire, body.createNot(boundaryAheadByLen.at(r.lenA)));
+            if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
+                PabloAST * bAhead = LookaheadInGate
+                    ? body.createLookahead(boundaryBit, (int64_t) r.lenA)
+                    : boundaryAheadByLen.at(r.lenA);
+                fire = body.createAnd(fire, body.createNot(bAhead));
+            }
 
             // Stamp all W_out bits of idAB at A's start (inside the gate → block-skippable).
             PabloAST * notFire = body.createNot(fire);

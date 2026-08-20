@@ -236,12 +236,14 @@ The Python ground truth for this partition is
 
 A `source` id stream and a 1-bit `inPlayMask` thread kernel → kernel.
 
-**1. `BPERangeSeed`** turns each raw byte into its base-alphabet id. It computes
-this **arithmetically**, not with a 256-way lookup: GPT-2's `bytes_to_unicode`
-composes to a piecewise `id = byte + offset`, so a few range masks plus nested
-`Select` suffice. That keeps the kernel data-independent, so its cache name is
-constant. It also seeds `active` (all ones — every byte starts as a live token
-start) and `end` (all zeros, legacy and unused).
+**1. `BPERangeSeed`** turns each raw byte into its base-alphabet id. `id(byte)` is
+a fixed byte→id bijection (GPT-2's `bytes_to_unicode`, a piecewise
+`id = byte + offset`). It is compiled as **character classes**: for each of the 8
+id output bits, the set of bytes whose id has that bit set is a byte character
+class, so `compileCC` over the byte basis yields each id-bit stream directly — no
+BixNum arithmetic and no 256-way lookup. The mapping is constant, so the kernel is
+data-independent and its cache name is constant. It also seeds `active` (all ones
+— every byte starts as a live token start) and `end` (all zeros, legacy/unused).
 
 **2. One `BPEMergeKernel` per clean range**, ascending = rank order. Each keeps a
 mutable id accumulator `idAcc` (starting from the input `source`) and the 1-bit
@@ -249,13 +251,20 @@ mutable id accumulator `idAcc` (starting from the input `source`) and the 1-bit
 **start-anchored** — the merged id is written at A's start:
 
 ```
-Astart    = EQ(idAcc, idA)                     // A starts here, read from the LIVE idAcc
-BstartAtA = EQ(LookAhead(sourceIn, lenA), idB) // B starts lenA bytes ahead, read from the
-                                               //   FROZEN kernel input (no same-pass stamps)
-merge     = inPlayMask AND fireStart AND BstartAtA
-idAcc[i]  = Sel(merge, idAB_bit_i, idAcc[i])   // stamp idAB at A's start
-inPlayMask &= NOT(Advance(merge, lenA))        // consume B's start; A's start survives as AB's
+Astart    = compileCC(idA) AND meInFrozen      // A starts here; read from the FROZEN entry ids
+                                               //   (srcFrozen), not the mutating idAcc
+BstartAtA = compileCC(idB) over LookAhead(sourceIn, lenA)  // B starts lenA bytes ahead, also
+                                               //   read frozen (no same-kernel stamps)
+fire      = Astart AND BstartAtA               // (Astart already AND-ed meInFrozen)
+idAcc[i]  = fire ? idAB_bit_i : idAcc[i]       // stamp idAB at A's start (inside createIf(Astart))
+inPlayMask &= NOT(Advance(fire, lenA))         // consume B's start; A's start survives as AB's
 ```
+
+Both compares are `compileCC` character classes over the id bit-planes (the
+frozen entry ids), replacing BixNum `EQ`. Reading the **frozen** entry state
+(`srcFrozen` / `meInFrozen`) rather than the mutating `idAcc` / `inPlayMask` is
+what makes the rules within a kernel order-independent — guaranteed safe by the
+clean-range partition's independence + conflict-freedom.
 
 `lenA` is A's **raw-byte length = codepoint count** (`rawByteLen` counts
 non-continuation bytes), not its display byte size. The id stream carries one id
@@ -391,6 +400,98 @@ Note that `bpe.cpp`'s top-of-file header comment and part of `bpe.h`'s comment o
 `BPEPassResult` still describe an older end-anchored, emit-everything design
 (`matchEnd = active`, "Stage-B"). The kernel code no longer implements that —
 trust this document and the code over those comments.
+
+## BPE optimization parameters
+
+The `BPEMergeKernel` design has several **optional, opt-in** optimizations, each
+behind a CLI flag. **All default OFF**, so a bare `--merges=…` run is the plain,
+unoptimized pipeline; every flag is added on the command line to turn one on.
+This keeps a clean baseline to A/B against, and lets each optimization be
+benchmarked in isolation. They are experimental — measure before trusting.
+
+> Note: **character-class (CC) compilation is always on, not a flag.** Every id
+> comparison (Astart, B-detection, the grouped-if range gate) and the seed id
+> derivation are compiled with `re::cc::Parabix_CC_Compiler_Builder` /
+> `compileCC` over the id (or byte) bit-planes, replacing the earlier BixNum
+> `EQ`/`UGE`/`ULE`/`Select`/`AddModular` arithmetic. Output is byte-identical;
+> this was a straight port, not a tunable.
+
+Each flag encodes itself into the kernel cache name (tags below) so switching a
+flag never serves a stale compiled body from `~/.parabix/objcache/`. You can
+therefore A/B two flag settings back-to-back **without** wiping the cache.
+
+| Flag | Default | Cache tag | What it does |
+|---|---|---|---|
+| `--compact-base=N` | `0` (off) | `L{maxLen}` | Base kernel index at which `FilterByMask` compaction first shrinks the inter-kernel streams. `0` = no compaction. Larger streams stay full-width; compaction trades a per-point compact/expand cost for cheaper downstream kernels. |
+| `--geometric-compaction` | off | (via `L`) | Space the compaction points geometrically instead of arithmetically (denser early, sparser later). Only meaningful with `--compact-base > 0`. |
+| `--if-group-lower-limit=N` | `-1` (off) | `g{size}_` | **Master switch for grouped-if.** For kernels at/after index `N`, replace the one-`createIf`-per-rule structure with range-gated group gates (rules sorted by `idA`, chopped into chunks, one `createIf` per chunk on the id range it spans). A block with no live id in a chunk's range skips that whole chunk. `-1` = per-rule ifs everywhere. |
+| `--if-group-count=K` | `1` | `g{rules/K}_` | Grouped kernels get **K gates each**; gate size = `rules/K` (scales with kernel). Only active with `--if-group-lower-limit >= 0`. |
+| `--if-group-size=S` | `1` | `g{S}_` | **Fixed** `S` rules per gate regardless of kernel size (gate count = `rules/S`). **Overrides `--if-group-count` when `!= 1`.** `1` = defer to `--if-group-count`. |
+| `--lookahead-in-gate` | off | `la1_` | Build the B-detection `LookAhead` **inside each rule's** `createIf` (skippable on cold blocks) instead of one shared shift hoisted outside all gates. Skippable but **duplicated per rule** (loses the per-lenA dedup). Works with or without grouping. |
+| `--lookahead-in-group` | off | `lg1_` | **Grouped kernels only.** Build the B-detection `LookAhead` **inside each group's** `createIf`, **cached per distinct `lenA`** so the chunk's rules share it. Combines dedup (unlike `--lookahead-in-gate`) with cold-chunk skip (unlike the hoisted shift). Needs `--if-group-lower-limit >= 0`; no effect on ungrouped kernels. |
+
+### How grouping is meant to help
+
+The early (low-rank) kernels fire on almost every block — common merges — so
+gating them saves nothing; the late (high-rank) kernels rarely fire, so a range
+gate lets most blocks skip them. `--if-group-lower-limit` therefore groups only
+kernels at/after an index. `--lookahead-in-group` follows the same logic: it
+moves the peek-ahead work inside those gates so cold chunks skip it too, while
+`--lookahead-in-gate` moves the peek inside but per-rule (no sharing). The three
+peek placements are mutually exclusive — precedence in the kernel body is
+indexed-nextId > in-group > in-gate > hoisted (default).
+
+### Correctness testing
+
+Every optimization must be **byte-identical** to the baseline. Two ways to check.
+
+**1. Differential vs HuggingFace** (the ground truth), full GPT-2 vocab:
+
+```bash
+cd tokenizer-test
+python3 compare_bpe.py                       # baseline
+# add the flags under test to the parabix invocation and re-run; must stay PASS
+```
+
+**2. Self-consistency** (fast, dev merges) — the same input through two flag
+settings must produce identical tokens:
+
+```bash
+IN=tokenizer_files/val_2MB.txt
+build19/bin/tokenizer --merges=tools/lex/merges.txt "$IN" > /tmp/a.txt
+build19/bin/tokenizer --merges=tools/lex/merges.txt \
+    --if-group-lower-limit=0 --if-group-count=3 --lookahead-in-group "$IN" > /tmp/b.txt
+diff -q /tmp/a.txt /tmp/b.txt && echo IDENTICAL
+```
+
+### Performance testing
+
+`tokenizer-test/bench_bpe.py --sweep` drives the binary's `--bench-loop` and
+reports MB/s. Pass the optimization flags through `--parabix-args`:
+
+```bash
+cd tokenizer-test
+BASE="--geometric-compaction --compact-base=15 --if-group-lower-limit=50 --if-group-count=3"
+
+# baseline (hoisted peek)
+python3 bench_bpe.py --sweep \
+    --sweep-source tokenizer_files/val_8MB.txt --sweep-sizes 4 \
+    --parabix-args="$BASE"
+
+# variant under test (in-group cached peek)
+python3 bench_bpe.py --sweep \
+    --sweep-source tokenizer_files/val_8MB.txt --sweep-sizes 4 \
+    --parabix-args="$BASE --lookahead-in-group"
+```
+
+Notes:
+- Distinct cache tags mean the two runs do **not** collide — no wipe needed
+  between them. Wipe (`rm -rf ~/.parabix/objcache/`) only after a **rebuild**.
+- `--lookahead-in-group` / `--if-group-*` are no-ops without
+  `--if-group-lower-limit >= 0` — always include it when testing grouping.
+- Cross-run absolute MB/s is noisy; trust only **back-to-back** A/B deltas.
+- Confirm a flag engaged by inspecting the IR on a debug build:
+  `build_debug/bin/tokenizer --ShowOptimizedPablo --ToShow="BPEMerge*" --merges=tools/lex/merges.txt <flags> build19/test.txt`.
 
 ## Testing
 

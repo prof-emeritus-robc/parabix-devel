@@ -21,6 +21,7 @@ enable_testing()
 ###   Build Options   ###
 
 option(USE_ADDRESS_SANITIZER "Enables use of address sanitizer in debug mode if available" OFF)
+option(ENABLE_ICU "Enable ICU support if available" ON)
 option(ENABLE_PAPI "Enable PAPI support if available" OFF)
 option(REPORT_PAPI_TESTS "Report PAPI testing results" OFF)
 option(LLVM_PATH "LLVM root directory")
@@ -108,6 +109,23 @@ string(REGEX REPLACE "[0-9]+[.]([0-9]+).*" "\\1" Z3_VERSION_MINOR "${Z3_VERSION_
 string(REGEX REPLACE "[0-9]+[.][0-9]+[.]([0-9]+).*" "\\1" Z3_VERSION_PATCH "${Z3_VERSION_STRING}")
 math(EXPR Z3_VERSION_INTEGER "${Z3_VERSION_MAJOR} * 10000 + ${Z3_VERSION_MINOR} * 100 + ${Z3_VERSION_PATCH}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DZ3_VERSION_INTEGER=${Z3_VERSION_INTEGER}")
+
+###   Import Dependency: ICU   ###
+
+if (ENABLE_ICU)
+    if(APPLE)
+        execute_process(
+            COMMAND brew --prefix icu4c
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            OUTPUT_VARIABLE BREW_ICU_ROOT
+            ERROR_QUIET
+        )
+        if(BREW_ICU_ROOT)
+            set(ICU_ROOT "${BREW_ICU_ROOT}")
+            message(STATUS "Found ICU: ${ICU_ROOT}")
+        endif()
+    endif()
+endif()
 
 ###   Import Dependency: PAPI   ###
 

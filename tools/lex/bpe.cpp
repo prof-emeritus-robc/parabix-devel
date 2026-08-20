@@ -103,9 +103,20 @@ static cl::opt<unsigned> IfGroupCount(
              "Gate size = rules/count; count scales with kernel. Default 1."),
     cl::init(1));
 
-// Effective grouped-if chunk size for a kernel with n rules: n/IfGroupCount rules per gate.
-// Used by BOTH the cache-name tag and the Pablo body so they never disagree (stale-cache hazard).
+// FIXED SIZE: force exactly this many rules per grouped-if gate, regardless of how many
+// rules a kernel has (gate COUNT then varies = rules/size). Overrides --if-group-count
+// when set (!= 1). Default 1 = defer to --if-group-count.
+static cl::opt<unsigned> IfGroupSize(
+    "if-group-size",
+    cl::desc("Rules per grouped-if gate, fixed regardless of kernel size. Overrides "
+             "--if-group-count when != 1. Default 1 = use --if-group-count."),
+    cl::init(1));
+
+// Effective grouped-if chunk size for a kernel with n rules. Fixed --if-group-size wins
+// when set (!= 1); otherwise derive from --if-group-count (n/count). Used by BOTH the
+// cache-name tag and the Pablo body so they never disagree (stale-cache hazard).
 static unsigned effGroupSize(size_t n) {
+    if (IfGroupSize.getValue() != 1) return IfGroupSize.getValue();
     return std::max<unsigned>(1u, (unsigned)(n / std::max(1u, IfGroupCount.getValue())));
 }
 

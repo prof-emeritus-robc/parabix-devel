@@ -130,6 +130,17 @@ static cl::opt<bool> LookaheadInGate(
              "skippable) instead of one shared hoisted shift per lenA (default)."),
     cl::init(false));
 
+// Grouped-only: build the B-detection LookAhead inside each GROUP's createIf, cached
+// (deduped) per distinct lenA within that chunk so the chunk's rules SHARE it. Combines
+// dedup (unlike --lookahead-in-gate's per-rule build) with block-skip (unlike the hoisted
+// shared build that runs every block): a cold chunk skips building its peeks entirely.
+// Only takes effect on grouped kernels (--if-group-lower-limit >= 0). Cache tag lg1_/lg0_.
+static cl::opt<bool> LookaheadInGroup(
+    "lookahead-in-group",
+    cl::desc("Grouped kernels: build the B-detection LookAhead inside each group's if-gate, "
+             "cached per lenA within the chunk (shared by the chunk's rules, skippable)."),
+    cl::init(false));
+
 
 using namespace pablo;
 using namespace kernel;
@@ -452,6 +463,7 @@ public:
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
                         + (grouped ? "g" + std::to_string(effGroupSize(group.rules.size())) + "_" : "")
                         + (LookaheadInGate ? "la1_" : "la0_")
+                        + (LookaheadInGroup ? "lg1_" : "lg0_")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -512,9 +524,11 @@ protected:
         // (sourceIn declares LookAhead(maxLen), and lenA < mergedLen ≤ maxLen).
         // Skipped in indexed mode — nextIdBN replaces every source LookAhead.
         // 4. Because of the copy → NO LookAhead built into the body, so the kernel's body is identical for every rule (no per-lenA LookAhead).
-        // Skipped when --lookahead-in-gate: emitBody builds the shift per rule instead.
+        // Skipped when --lookahead-in-gate (emitBody builds per rule) or when a grouped
+        // kernel uses --lookahead-in-group (each chunk builds its own cached peeks below).
+        const bool grpCache = LookaheadInGroup && mGrouped;
         std::map<unsigned, BixNum> aheadByLenA;
-        if (!mUseNextId && !LookaheadInGate)
+        if (!mUseNextId && !LookaheadInGate && !grpCache)
         for (const auto & r : mRuleGroup.rules) {
             if (aheadByLenA.count(r.lenA)) continue;
             std::vector<PabloAST*> bits(W);
@@ -529,7 +543,7 @@ protected:
         // boundary stream was supplied → no gating (mHasBoundary == false).
         PabloAST * boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
         std::map<unsigned, PabloAST*> boundaryAheadByLen;
-        if (mHasBoundary && !LookaheadInGate) {   // in-gate mode builds it per rule in emitBody
+        if (mHasBoundary && !LookaheadInGate && !grpCache) {   // in-gate/in-group build it below
             for (const auto & r : mRuleGroup.rules) {
                 if (boundaryAheadByLen.count(r.lenA)) continue;
                 boundaryAheadByLen[r.lenA] = pb.createLookahead(boundaryBit, (int64_t) r.lenA);
@@ -560,14 +574,20 @@ protected:
         // (the gated scope, so it's block-skippable). fireStart is supplied by the caller
         // (per-rule Astart) and MUST already be AND-ed with meInFrozen — eqAstart does
         // that (its result is EQ AND meInFrozen).
-        auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart) {
+        // grpAhead/grpBoundary (non-null only on the --lookahead-in-group path) are the
+        // chunk-local cached peeks, deduped per lenA and built inside this gate body.
+        auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart,
+                            const std::map<unsigned, BixNum> * grpAhead = nullptr,
+                            const std::map<unsigned, PabloAST*> * grpBoundary = nullptr) {
             //indexed mode reads the next-live id, byte mode reads lenA ahead via LookAhead.
-            // --lookahead-in-gate: build the shift HERE (inside body, per rule, skippable)
-            // instead of the hoisted shared aheadByLenA/boundaryAheadByLen maps.
+            // Peek source precedence: indexed nextId > group-cache > per-rule in-gate > hoisted.
             PabloAST * BstartAtA;
-            if (mUseNextId) {   
+            if (mUseNextId) {
                 cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
                 BstartAtA = ccNext.compileCC(re::makeCC(r.idB), body);
+            } else if (grpAhead) {   // chunk-cached shared peek (built once per lenA in the gate)
+                cc::Parabix_CC_Compiler_Builder ccAhead(grpAhead->at(r.lenA));
+                BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
             } else if (LookaheadInGate) {
                 std::vector<PabloAST*> bits(W);
                 for (unsigned i = 0; i < W; i++)
@@ -580,8 +600,8 @@ protected:
             }
             PabloAST * fire = body.createAnd(fireStart, BstartAtA);
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
-                PabloAST * bAhead = LookaheadInGate
-                    ? body.createLookahead(boundaryBit, (int64_t) r.lenA)
+                PabloAST * bAhead = grpBoundary ? grpBoundary->at(r.lenA)
+                    : LookaheadInGate ? body.createLookahead(boundaryBit, (int64_t) r.lenA)
                     : boundaryAheadByLen.at(r.lenA);
                 fire = body.createAnd(fire, body.createNot(bAhead));
             }
@@ -637,6 +657,26 @@ protected:
                 cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
                 PabloAST * inRange = ccId.compileCC(re::makeCC(gLo, gHi), pb);
                 auto body = pb.createScope();
+                // --lookahead-in-group: build this chunk's B-detection peeks INSIDE the gate,
+                // cached (deduped) per distinct lenA so the chunk's rules share them. Cold
+                // chunk → the whole gate (peeks included) is block-skipped.
+                std::map<unsigned, BixNum> chunkAhead;
+                std::map<unsigned, PabloAST*> chunkBoundary;
+                if (LookaheadInGroup && !mUseNextId) {
+                    for (size_t k = s; k < e; k++) {
+                        const unsigned lenA = sorted[k]->lenA;
+                        if (!chunkAhead.count(lenA)) {
+                            std::vector<PabloAST*> bits(W);
+                            for (unsigned i = 0; i < W; i++)
+                                bits[i] = body.createLookahead(srcBits[i], (int64_t) lenA);
+                            chunkAhead.emplace(lenA, BixNum(bits.begin(), bits.end()));
+                        }
+                        if (mHasBoundary && !chunkBoundary.count(lenA))
+                            chunkBoundary[lenA] = body.createLookahead(boundaryBit, (int64_t) lenA);
+                    }
+                }
+                const std::map<unsigned, BixNum> * grpAhead = chunkAhead.empty() ? nullptr : &chunkAhead;
+                const std::map<unsigned, PabloAST*> * grpBoundary = chunkBoundary.empty() ? nullptr : &chunkBoundary;
                 // Per-rule Astart EQ stays INSIDE the gate body so the range gate can
                 // block-skip it. Single level (T6-safe).
                 for (size_t k = s; k < e; k++) {
@@ -644,7 +684,7 @@ protected:
                     PabloAST * fireStart = eqAstart(body, r.idA);
                     if (r.idA == r.idB)
                         fireStart = selfMergeFireStarts(body, fireStart, r.lenA);
-                    emitBody(body, r, fireStart);
+                    emitBody(body, r, fireStart, grpAhead, grpBoundary);
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }

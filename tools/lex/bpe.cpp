@@ -205,43 +205,45 @@ public:
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        BixNumCompiler bnc(pb);
-        // `b` = the input byte value at each position, as an 8-bit BixNum built
-        // from the 8 basis bit-streams.
         std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
-        BixNum b(basisBits.begin(), basisBits.end());
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
 
-        // One 1-bit mask per byte range — 1 wherever the byte falls in that range.
-        // The six ranges are mutually exclusive and cover all of 0..255; 174..255
-        // is the default (else) arm of the Select below, so it needs no mask.
-        // Each range is a byte-value character class over the input basis, so compileCC
-        // replaces the BixNum ULE/UGE/EQ comparisons 1:1. The id arithmetic below stays
-        // BixNum (CC yields only a 1-bit mask, not the multi-bit id).
+        // id(byte) is a fixed byte->id bijection: piecewise byte + offset (T1). Expressed
+        // as CC instead of BixNum arithmetic: for each id output bit k, the SET of bytes
+        // whose id has bit k set is a byte character class, so compileCC over the byte
+        // basis yields that id-bit stream directly — no Select/AddModular/SubModular.
+        // Data-independent (constant) → cache name stays constant. Ranges (must stay a
+        // bijection over 0..255): 0..32→+188  33..126→-33  127..160→+94  161..172→-67
+        // 173→255  174..255→-68.
         cc::Parabix_CC_Compiler_Builder ccc(basisBits);
-        PabloAST * m_0_32    = ccc.compileCC(re::makeByte(0,   32),  pb);       // control block 1
-        PabloAST * m_33_126  = ccc.compileCC(re::makeByte(33,  126), pb);       // printable ASCII
-        PabloAST * m_127_160 = ccc.compileCC(re::makeByte(127, 160), pb);       // control block 2
-        PabloAST * m_161_172 = ccc.compileCC(re::makeByte(161, 172), pb);       // printable Latin-1 lo
-        PabloAST * m_173     = ccc.compileCC(re::makeByte(173),      pb);       // the lone non-printable
-
-        // id = byte + per-range offset (173 is a fixed 255). AddModular/SubModular
-        // are modular on 8 bits; every SELECTED range lands in 0..255 with no
-        // wrap, so the values are exact (unselected arms may wrap but are discarded
-        // by the Select). Nested Select picks the arm for each position's range.
-        BixNum id = bnc.Select(m_0_32,    bnc.AddModular(b, 188),   // 0..32   → +188
-                    bnc.Select(m_33_126,  bnc.SubModular(b, 33),    // 33..126 → −33
-                    bnc.Select(m_127_160, bnc.AddModular(b, 94),    // 127..160→ +94
-                    bnc.Select(m_161_172, bnc.SubModular(b, 67),    // 161..172→ −67
-                    bnc.Select(m_173,     bnc.Create(255),          // 173     → 255
-                                          bnc.SubModular(b, 68))))));// 174..255→ −68 (default)
-
+        auto idOf = [](unsigned by) -> unsigned {
+            if (by <= 32)  return by + 188;
+            if (by <= 126) return by - 33;
+            if (by <= 160) return by + 94;
+            if (by <= 172) return by - 67;
+            if (by == 173) return 255;
+            return by - 68;                        // 174..255
+        };
+        const unsigned IDBITS = 8;                 // base ids are 0..255
+        std::vector<PabloAST*> idBits(IDBITS);
+        for (unsigned k = 0; k < IDBITS; k++) {
+            re::CC * cc = nullptr;                  // bytes whose id has bit k set
+            for (unsigned by = 0; by < 256; ) {
+                if ((idOf(by) >> k) & 1u) {
+                    unsigned lo = by;
+                    while (by < 256 && ((idOf(by) >> k) & 1u)) by++;
+                    re::CC * part = re::makeByte(lo, by - 1);
+                    cc = cc ? re::makeCC(cc, part) : part;
+                } else ++by;
+            }
+            idBits[k] = cc ? ccc.compileCC(cc, pb) : zeroes;
+        }
         // Write the id into the 16-bit `source` stream (ids ≤255 → high bits 0),
-        // active = all 1s, end = all 0s.
+        // active = all 1s, end = all 0s. idBits[i] = the i-th id bit (a compiled CC).
         Var * sOut = getOutputStreamVar("source");
         for (unsigned i = 0; i < 8; i++) {
-            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), id[i]);
+            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idBits[i]);
         }
         pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)), ones);
         pb.createAssign(pb.createExtract(getOutputStreamVar("end"),    pb.getInteger(0)), zeroes);
@@ -462,7 +464,6 @@ protected:
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        BixNumCompiler bnc(pb);
         std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
         const unsigned W = srcBits.size();
         const unsigned W_out = ceil_log2(mRuleGroup.hi + 1);
@@ -540,8 +541,8 @@ protected:
         // meInFrozen, so the returned value IS the gate value — callers hand it straight
         // to emitBody, whose fire is a 2-input And.
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
-            BixNumCompiler bncL(bld);
-            return bld.createAnd(bncL.EQ(srcFrozen, id), meInFrozen);
+            cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);   
+            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), meInFrozen);
         };
 
         // One rule's fire → B-detect + stamp all idAB bits + consume B, all inside `body`
@@ -549,21 +550,22 @@ protected:
         // (per-rule Astart) and MUST already be AND-ed with meInFrozen — eqAstart does
         // that (its result is EQ AND meInFrozen).
         auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart) {
-            BixNumCompiler bncB(body);
-            // B-detection: indexed mode reads the next-live id (frozen), byte mode reads
-            // lenA ahead via LookAhead. Both frozen → identical semantics.
+            //indexed mode reads the next-live id, byte mode reads lenA ahead via LookAhead.
             // --lookahead-in-gate: build the shift HERE (inside body, per rule, skippable)
             // instead of the hoisted shared aheadByLenA/boundaryAheadByLen maps.
             PabloAST * BstartAtA;
-            if (mUseNextId) {
-                BstartAtA = bncB.EQ(nextIdBN, r.idB);
+            if (mUseNextId) {   
+                cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
+                BstartAtA = ccNext.compileCC(re::makeCC(r.idB), body);
             } else if (LookaheadInGate) {
                 std::vector<PabloAST*> bits(W);
                 for (unsigned i = 0; i < W; i++)
                     bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
-                BstartAtA = bncB.EQ(BixNum(bits.begin(), bits.end()), r.idB);
+                cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
+                BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
             } else {
-                BstartAtA = bncB.EQ(aheadByLenA.at(r.lenA), r.idB);
+                cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
+                BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
             }
             PabloAST * fire = body.createAnd(fireStart, BstartAtA);
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
@@ -621,8 +623,8 @@ protected:
             for (size_t s = 0; s < sorted.size(); s += GROUP_SIZE) {
                 size_t e = std::min(sorted.size(), s + GROUP_SIZE);
                 unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
-                PabloAST * inRange = pb.createAnd(bnc.UGE(srcFrozen, gLo),
-                                                  bnc.ULE(srcFrozen, gHi));
+                cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
+                PabloAST * inRange = ccId.compileCC(re::makeCC(gLo, gHi), pb);
                 auto body = pb.createScope();
                 // Per-rule Astart EQ stays INSIDE the gate body so the range gate can
                 // block-skip it. Single level (T6-safe).

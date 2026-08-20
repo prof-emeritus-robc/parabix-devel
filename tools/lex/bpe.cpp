@@ -141,6 +141,18 @@ static cl::opt<bool> LookaheadInGroup(
              "cached per lenA within the chunk (shared by the chunk's rules, skippable)."),
     cl::init(false));
 
+// Replace the first N kernels' multi-bit source LookAhead with an IndexedShiftBack
+// (next-live id) + IndexedAdvance consume. N=0 (default) = pure LookAhead. Adds one
+// IndexedShiftBack kernel per converted merge kernel (doubles their count). Measured
+// slower (~2.75x) and SIGSEGVs at full merges — kept as an A/B knob. Env var
+// BPE_INDEXED_SHIFT still overrides this flag when set.
+static cl::opt<unsigned> IndexedShift(
+    "indexed-shift",
+    cl::desc("Convert the first N merge kernels to IndexedShiftBack (next-live id) + "
+             "IndexedAdvance instead of LookAhead. 0 = off (default, pure LookAhead)."),
+    cl::init(0));
+
+
 
 using namespace pablo;
 using namespace kernel;
@@ -606,19 +618,30 @@ protected:
                 fire = body.createAnd(fire, body.createNot(bAhead));
             }
 
-            // Stamp all W_out bits of idAB at A's start (inside the gate → block-skippable).
-            PabloAST * notFire = body.createNot(fire);
+            // Anchor. Indexed path (--indexed-shift) is END-anchored: stamp idAB at B's
+            // position (2nd part) and remove A. `fire` is at A; IndexedAdvance moves it one
+            // live position forward → B. LookAhead path stays START-anchored (stamp at A,
+            // remove B) — end-anchoring there needs a backward consume, illegal on a body
+            // stream. Output is byte-identical either way (id at token end vs start).
+            PabloAST * stampAt;   // where idAB is written
+            PabloAST * removeAt;  // which start is cleared from the live mask
+            if (mUseNextId) {
+                PabloAST * fireB = body.createIndexedAdvance(fire, meInFrozen, 1);
+                stampAt  = fireB;   // merged id lands at B (2nd position)
+                removeAt = fire;    // A's start removed; B survives as AB
+            } else {
+                stampAt  = fire;                        // merged id at A's start
+                removeAt = body.createAdvance(fire, r.lenA);  // B's start removed; A survives
+            }
+            // Stamp all W_out bits of idAB at stampAt (inside the gate → block-skippable).
+            PabloAST * notStamp = body.createNot(stampAt);
             for (unsigned i = 0; i < W_out; i++) {
                 if ((r.idAB >> i) & 1u)
-                    body.createAssign(idAcc[i], body.createOr(idAcc[i], fire));
+                    body.createAssign(idAcc[i], body.createOr(idAcc[i], stampAt));
                 else
-                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notFire));
+                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notStamp));
             }
-            // Consume B's start from the live-start mask (per rule).
-            PabloAST * clearB = mUseNextId
-                ? body.createIndexedAdvance(fire, meInFrozen, 1)
-                : body.createAdvance(fire, r.lenA);
-            body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(clearB)));
+            body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(removeAt)));
         };
 
         // Self-merge X+X→XX (idA==idB): pair per-run on the frozen live starts. No
@@ -743,11 +766,11 @@ BPEPassResult buildBPEPassPipeline(
     //     forward" in whatever space the stream is in, compacted or not.
     // Right after a compaction the mask is all-ones, so IndexedShiftBack there
     // degenerates to a plain 1-position shift — correct, and cheaper.
-    unsigned indexedShiftN = 0;
+    unsigned indexedShiftN = IndexedShift;
     if (const char * is = std::getenv("BPE_INDEXED_SHIFT")) indexedShiftN = (unsigned) std::atoi(is);
     bool useIndexedShift = indexedShiftN > 0;
     if (useIndexedShift)
-        std::cerr << "[BPE] BPE_INDEXED_SHIFT: first " << indexedShiftN
+        std::cerr << "[BPE] --indexed-shift: first " << indexedShiftN
                   << " kernels via IndexedShiftBack (1 shift/kernel)\n";
     auto compactAfter = applyCompactionSchedule(ruleRanges, compactEvery);
 

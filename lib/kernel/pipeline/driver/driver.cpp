@@ -142,7 +142,7 @@ BaseDriver::BaseDriver(std::string && moduleName)
 , mBuilder(nullptr)
 , mObjectCache(nullptr) {
     if (LLVM_UNLIKELY(codegen::EnableObjectCache)) {
-        mObjectCache.reset(new ParabixObjectCache(*this));
+        mObjectCache.reset(new ParabixObjectCache());
     }
 }
 

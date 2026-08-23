@@ -13,13 +13,13 @@ void PipelineCompiler::bindAdditionalInitializationArguments(KernelBuilder & b, 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateImplicitKernels
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::generateImplicitKernels(KernelBuilder & b) {
+void PipelineCompiler::generateImplicitKernels(KernelBuilder & b, llvm::TargetMachine * TM) {
     for (auto i = FirstKernel; i <= LastKernel; ++i) {
 
         auto & S = mStreamGraph[i];
 
         if (S.Flags & RelationshipNodeFlag::ImplicitlyAdded) {
-            const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b, getTargetMachine());
+            const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b, TM);
         }
 
 
@@ -225,27 +225,25 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
         mTarget->addInternalScalar(sizeTy, name + INTERNALLY_SYNCHRONIZED_SUB_SEGMENT_SUFFIX, groupId);
     }
 
-    const auto flags = mKernel->getInternalStateTypeFlags();
-
-    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+    if (LLVM_LIKELY(mKernel->getSharedStateType())) {
         Type * sharedStateTy = nullptr;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
             sharedStateTy = PointerType::getUnqual(C);
         } else {
-            sharedStateTy = mKernel->getSharedStateType(b);
-            assert (!sharedStateTy->isEmptyTy());
+            sharedStateTy = mKernel->getSharedStateType(b.getContext());
+            assert (sharedStateTy && !sharedStateTy->isEmptyTy() && &sharedStateTy->getContext() == &b.getContext());
         }
         mTarget->addInternalScalar(sharedStateTy, name, groupId);
     }
 
-    if (flags & Kernel::KernelHasThreadLocal) {
+    if (mKernel->getThreadLocalStateType()) {
         // we cannot statically allocate a "family" thread local object.
         Type * localStateTy = nullptr;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
             localStateTy = PointerType::getUnqual(C);
         } else {
-            localStateTy = mKernel->getThreadLocalStateType(b);
-            assert (!localStateTy->isEmptyTy());
+            localStateTy = mKernel->getThreadLocalStateType(b.getContext());
+            assert (localStateTy && !localStateTy->isEmptyTy() && &localStateTy->getContext() == &b.getContext());
         }
         mTarget->addThreadLocalScalar(localStateTy, name + KERNEL_THREAD_LOCAL_SUFFIX, groupId);
     }
@@ -317,7 +315,7 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 
             if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
 
-                StructType * sharedStateTy = mKernel->getSharedStateType(b);
+                StructType * sharedStateTy = mKernel->getSharedStateType();
 
                 Constant * sharedStateTySize = nullptr;
                 if (sharedStateTy) {
@@ -327,7 +325,7 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
                 }
                 args.push_back(sharedStateTySize);
 
-                StructType * threadLocalStateTy = mKernel->getSharedStateType(b);
+                StructType * threadLocalStateTy = mKernel->getSharedStateType();
 
                 Constant * threadLocalTySize = nullptr;
                 if (threadLocalStateTy) {
@@ -477,8 +475,7 @@ void PipelineCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
 
         for (auto i = firstKernelInCurrentPhase; i < oneAfterLastKernelInCurrentPhase; ++i) {
             const Kernel * const kernel = getKernel(i);
-            const auto flags = kernel->getInternalStateTypeFlags();
-            if (flags & Kernel::KernelHasThreadLocal) {
+            if (kernel->getThreadLocalStateType()) {
                 setActiveKernel(b, i, true);
                 assert (mKernel == kernel);
                 callKernelInitializeThreadLocalFunction(b);

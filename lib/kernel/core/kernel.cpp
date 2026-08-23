@@ -47,8 +47,6 @@ constexpr static auto DO_SEGMENT_SUFFIX = "_DoSegment";
 constexpr static auto FINALIZE_THREAD_LOCAL_SUFFIX = "_FinalizeThreadLocal";
 constexpr static auto FINALIZE_SUFFIX = "_Finalize";
 
-constexpr static auto CACHEABLE = "cacheable";
-
 constexpr static auto SIGNATURE = "signature";
 
 #ifdef ENABLE_PAPI
@@ -176,8 +174,8 @@ bool Kernel::canSetTerminateSignal() const {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> Kernel::instantiateKernelCompiler(KernelBuilder & /* b */, TargetMachine * TM) {
-    return std::make_unique<KernelCompiler>(const_cast<Kernel *>(this), TM);
+std::unique_ptr<KernelCompiler> Kernel::instantiateKernelCompiler(KernelBuilder & /* b */) {
+    return std::make_unique<KernelCompiler>(const_cast<Kernel *>(this));
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -224,24 +222,32 @@ Module * Kernel::makeEmptyModule(KernelBuilder & b) {
     // the compilation and object cache interface.
     auto & C = b.getContext();
     Module * const m = new Module(makeCacheName(b), C);
-    if (LLVM_LIKELY(isCachable())) {
-        m->getOrInsertNamedMetadata(CACHEABLE);
-         if (LLVM_UNLIKELY(hasSignature())) {
-             NamedMDNode * const md = m->getOrInsertNamedMetadata(SIGNATURE);
-             assert (md->getNumOperands() == 0);
-             const auto signature = getSignature();
-             MDString * const sig = MDString::get(C, signature);
-             md->addOperand(MDNode::get(m->getContext(), {sig}));
-         }
+    if (LLVM_UNLIKELY(hasSignature() && isCachable())) {
+         NamedMDNode * const md = m->getOrInsertNamedMetadata(SIGNATURE);
+         assert (md->getNumOperands() == 0);
+         const auto signature = getSignature();
+         MDString * const sig = MDString::get(C, signature);
+         md->addOperand(MDNode::get(m->getContext(), {sig}));
     }
     return m;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief declareKernel
+ ** ------------------------------------------------------------------------------------------------------------- */
+void Kernel::declareKernel(KernelBuilder & b, TargetMachine * TM) {
+    mCompiler = instantiateKernelCompiler(b);
+    b.setCompiler(mCompiler.get());
+    mCompiler->declareKernel(b, TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::generateKernel(KernelBuilder & b, llvm::TargetMachine * TM) {
-    instantiateKernelCompiler(b, TM)->generateKernel(b);
+    assert (mCompiler.get());
+    b.setCompiler(mCompiler.get());
+    mCompiler->generateKernel(b, TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -266,29 +272,19 @@ inline StructType * getTypeByName(Module * const m, StringRef name) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief ensureLoaded
- ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::ensureLoaded(KernelBuilder & b) {
-    Module * const m = b.getModule();
-    SmallVector<char, 256> tmp;
-    assert (m->getOrInsertNamedMetadata(getName() + STATE_TYPE_METADATA_SUFFIX)->getNumOperands() == 1);
-    StructType * sharedTy = nullIfEmpty(getTypeByName(m, concat(getName(), SHARED_SUFFIX, tmp)));
-    StructType * threadLocalTy = nullIfEmpty(getTypeByName(m, concat(getName(), THREAD_LOCAL_SUFFIX, tmp)));
-    if (sharedTy) mFlags |= Kernel::KernelIsStateful;
-    if (threadLocalTy) mFlags |= Kernel::KernelHasThreadLocal;
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedKernel
  ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::loadCachedKernel(KernelBuilder & b) {
-    Module * m = b.getModule(); assert (m);
+void Kernel::loadCachedKernel(const Module *m) {
     SmallVector<char, 256> tmp;
-    StructType * sharedTy = nullIfEmpty(getTypeByName(m, concat(getName(), SHARED_SUFFIX, tmp)));
-    StructType * threadLocalTy = nullIfEmpty(getTypeByName(m, concat(getName(), THREAD_LOCAL_SUFFIX, tmp)));
-    if (sharedTy) mFlags |= Kernel::KernelIsStateful;
-    if (threadLocalTy) mFlags |= Kernel::KernelHasThreadLocal;
-    linkExternalMethods(b);
+    auto & C = m->getContext();
+    #ifndef NDEBUG
+    auto md = m->getNamedMetadata(getName() + STATE_TYPE_METADATA_SUFFIX);
+    assert (md && md->getNumOperands() == 1);
+    #endif
+    mSharedStateType = nullIfEmpty(StructType::getTypeByName(C, concat(getName(), SHARED_SUFFIX, tmp)));
+    mThreadLocalStateType = nullIfEmpty(StructType::getTypeByName(C, concat(getName(), THREAD_LOCAL_SUFFIX, tmp)));
+    if (mSharedStateType) mFlags |= Kernel::KernelIsStateful;
+    if (mThreadLocalStateType) mFlags |= Kernel::KernelHasThreadLocal;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -587,50 +583,36 @@ void Kernel::generateOrLoadKernel(KernelBuilder & b, TargetMachine * TM) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) {
-    addInitializeDeclaration(b, kernelStateFlags);
+void Kernel::addKernelDeclarations(KernelBuilder & b, TargetMachine * TM) {
+    auto st = constructStateTypes(b);
+    mSharedStateType = st.Shared;
+    mThreadLocalStateType = st.ThreadLocal;
+    addInitializeDeclaration(b);
     if (LLVM_UNLIKELY(mInputStreamSets.empty())) {
-        addExpectedOutputSizeDeclaration(b, kernelStateFlags);
+        addExpectedOutputSizeDeclaration(b);
     }
-    addAllocateSharedInternalStreamSetsDeclaration(b, kernelStateFlags);
-    addInitializeThreadLocalDeclaration(b, kernelStateFlags);
-    addAllocateThreadLocalInternalStreamSetsDeclaration(b, kernelStateFlags);
-    addDoSegmentDeclaration(b, kernelStateFlags);
-    addFinalizeThreadLocalDeclaration(b, kernelStateFlags);
-    addFinalizeDeclaration(b, kernelStateFlags);
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getInternalStateTypeFlags
- ** ------------------------------------------------------------------------------------------------------------- */
-unsigned Kernel::getInternalStateTypeFlags() const {
-    unsigned flags = (mInputScalars.empty() && mOutputScalars.empty()) ? 0 : Kernel::KernelIsStateful;
-    for (const auto & scalar : mInternalScalars) {
-        switch (scalar.getScalarType()) {
-            case ScalarType::Internal:
-                flags |= Kernel::KernelIsStateful;
-                break;
-            case ScalarType::ThreadLocal:
-                flags |= Kernel::KernelHasThreadLocal;
-                break;
-            default: break;
-        }
-        if (flags == (Kernel::KernelIsStateful | Kernel::KernelHasThreadLocal)) {
-            break;
-        }
+    if (LLVM_UNLIKELY(allocatesInternalStreamSets())) {
+        addAllocateSharedInternalStreamSetsDeclaration(b);
     }
-    return flags;
+    addDoSegmentDeclaration(b);
+    if (mThreadLocalStateType) {
+        addInitializeThreadLocalDeclaration(b);
+        if (LLVM_UNLIKELY(allocatesInternalStreamSets())) {
+            addAllocateThreadLocalInternalStreamSetsDeclaration(b);
+        }
+        addFinalizeThreadLocalDeclaration(b);
+    }
+    addFinalizeDeclaration(b);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addSymbols
  ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::addSymbols(orc::MangleAndInterner & mangler, orc::SymbolFlagsMap & symbols, orc::SymbolLookupSet & lookupSet) const {
+void Kernel::addSymbols(orc::MangleAndInterner & mangler, orc::SymbolFlagsMap & symbols) const {
     SmallVector<char, 256> tmp;
     auto addSym = [&](StringRef suffix) {
         auto sym = mangler(concat(getName(), suffix, tmp));
         symbols.insert(std::make_pair(sym, JITSymbolFlags::Exported | JITSymbolFlags::Callable));
-        lookupSet.add(sym, orc::SymbolLookupFlags::RequiredSymbol);
     };
     addSym(INITIALIZE_SUFFIX);
     addSym(DO_SEGMENT_SUFFIX);
@@ -641,24 +623,24 @@ void Kernel::addSymbols(orc::MangleAndInterner & mangler, orc::SymbolFlagsMap & 
     if (LLVM_UNLIKELY(allocatesInternalStreamSets())) {
         addSym(ALLOCATE_SHARED_INTERNAL_STREAMSETS_SUFFIX);
     }
-//    if (hasThreadLocal()) {
+    if (mThreadLocalStateType) {
         addSym(INITIALIZE_THREAD_LOCAL_SUFFIX);
         if (LLVM_UNLIKELY(allocatesInternalStreamSets())) {
             addSym(ALLOCATE_THREAD_LOCAL_INTERNAL_STREAMSETS_SUFFIX);
         }
         addSym(FINALIZE_THREAD_LOCAL_SUFFIX);
-//    }
+    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getInitializeFunction
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getInitializeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getInitializeFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), INITIALIZE_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addInitializeDeclaration(b, stateTypeFlags);
+        f = addInitializeDeclaration(b);
     }
     return f;
 }
@@ -666,7 +648,7 @@ Function * Kernel::getInitializeFunction(KernelBuilder & b, const unsigned state
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInitializeDeclaration
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::addInitializeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addInitializeDeclaration(KernelBuilder & b) const {
     SmallVector<char, 256> tmp;
     const auto funcName = concat(getName(), INITIALIZE_SUFFIX, tmp);
     Module * const m = b.getModule();
@@ -681,7 +663,7 @@ Function * Kernel::addInitializeDeclaration(KernelBuilder & b, const unsigned st
             params.push_back(sizeTy);
         }
 
-        if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             params.push_back(PointerType::getUnqual(b.getContext()));
         }
         for (const Binding & binding : mInputScalars) {
@@ -710,7 +692,7 @@ Function * Kernel::addInitializeDeclaration(KernelBuilder & b, const unsigned st
             setNextArgName(".threadLocal");
         }
 
-        if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             addNoCaptureAttr(arg);
             setNextArgName("shared");
         }
@@ -725,12 +707,12 @@ Function * Kernel::addInitializeDeclaration(KernelBuilder & b, const unsigned st
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getExpectedOutputSizeFunction
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getExpectedOutputSizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getExpectedOutputSizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), GET_EXPECTED_OUTPUT_SIZE_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addExpectedOutputSizeDeclaration(b, stateTypeFlags);
+        f = addExpectedOutputSizeDeclaration(b);
     }
     return f;
 }
@@ -738,14 +720,14 @@ Function * Kernel::getExpectedOutputSizeFunction(KernelBuilder & b, const unsign
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addExpectedOutputSizeDeclaration
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::addExpectedOutputSizeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addExpectedOutputSizeDeclaration(KernelBuilder & b) const {
     SmallVector<char, 256> tmp;
     const auto funcName = concat(getName(), GET_EXPECTED_OUTPUT_SIZE_SUFFIX, tmp);
     Module * const m = b.getModule();
     Function * func = m->getFunction(funcName);
     if (LLVM_LIKELY(func == nullptr)) {
         SmallVector<Type *, 1> params;
-        if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             params.push_back(PointerType::getUnqual(b.getContext()));
         }
         FunctionType * const funcType = FunctionType::get(b.getSizeTy(), params, false);
@@ -761,7 +743,7 @@ Function * Kernel::addExpectedOutputSizeDeclaration(KernelBuilder & b, const uns
             arg->setName(name);
             std::advance(arg, 1);
         };
-        if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             addNoCaptureAttr(arg);
             setNextArgName("shared");
         }
@@ -780,12 +762,12 @@ void Kernel::addAdditionalInitializationArgTypes(KernelBuilder & /* b */, InitAr
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getInitializeThreadLocalFunction
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getInitializeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getInitializeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), INITIALIZE_THREAD_LOCAL_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addInitializeThreadLocalDeclaration(b, stateTypeFlags);
+        f = addInitializeThreadLocalDeclaration(b);
     }
     return f;
 }
@@ -793,9 +775,9 @@ Function * Kernel::getInitializeThreadLocalFunction(KernelBuilder & b, const uns
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInitializeThreadLocalDeclaration
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b) const {
     Function * func = nullptr;
-
+    assert (mThreadLocalStateType);
     SmallVector<char, 256> tmp;
     const auto funcName = concat(getName(), INITIALIZE_THREAD_LOCAL_SUFFIX, tmp);
     Module * const m = b.getModule();
@@ -803,12 +785,10 @@ Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b, const 
     if (LLVM_LIKELY(func == nullptr)) {
         SmallVector<Type *, 2> params;
         PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
-        if (stateTypeFlags & KernelHasThreadLocal) {
-            if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
-                params.push_back(ptrTy);
-            }
+        if (LLVM_LIKELY(mSharedStateType)) {
             params.push_back(ptrTy);
         }
+        params.push_back(ptrTy);
         FunctionType * const funcType = FunctionType::get(ptrTy, params, false);
         const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
         func = Function::Create(funcType, linkage, funcName, m);
@@ -825,14 +805,12 @@ Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b, const 
             arg->setName(name);
             std::advance(arg, 1);
         };
-        if (stateTypeFlags & KernelHasThreadLocal) {
-            if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
-                addNoCaptureAttr(arg);
-                setNextArgName("shared");
-            }
+        if (LLVM_LIKELY(mSharedStateType)) {
             addNoCaptureAttr(arg);
-            setNextArgName("threadlocal");
+            setNextArgName("shared");
         }
+        addNoCaptureAttr(arg);
+        setNextArgName("threadlocal");
         assert (arg == func->arg_end());
     }
     assert (func);
@@ -843,12 +821,12 @@ Function * Kernel::addInitializeThreadLocalDeclaration(KernelBuilder & b, const 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getAllocateInternalStreamSets
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), ALLOCATE_SHARED_INTERNAL_STREAMSETS_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addAllocateSharedInternalStreamSetsDeclaration(b, stateTypeFlags);
+        f = addAllocateSharedInternalStreamSetsDeclaration(b);
     }
     return f;
 }
@@ -856,7 +834,7 @@ Function * Kernel::getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addAllocateInternalStreamSets
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder & b) const {
     Function * func = nullptr;
     if (allocatesInternalStreamSets()) {
         SmallVector<char, 256> tmp;
@@ -868,7 +846,7 @@ Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder 
 
             PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
             SmallVector<Type *, 6> params;
-            if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+            if (LLVM_LIKELY(mSharedStateType)) {
                 params.push_back(ptrTy);
             }
             params.push_back(b.getSizeTy());
@@ -893,7 +871,7 @@ Function * Kernel::addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder 
                 arg->setName(name);
                 std::advance(arg, 1);
             };
-            if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+            if (LLVM_LIKELY(mSharedStateType)) {
                 addNoCaptureAttr(arg);
                 setNextArgName("shared");
             }
@@ -927,12 +905,12 @@ Value * Kernel::generateExpectedOutputSizeMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getAllocateThreadLocalInternalStreamSetsFunction
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), ALLOCATE_THREAD_LOCAL_INTERNAL_STREAMSETS_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addAllocateThreadLocalInternalStreamSetsDeclaration(b, stateTypeFlags);
+        f = addAllocateThreadLocalInternalStreamSetsDeclaration(b);
     }
     return f;
 }
@@ -940,7 +918,7 @@ Function * Kernel::getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilde
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addAllocateThreadLocalInternalStreamSetsDeclaration
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBuilder & b) const {
     Function * func = nullptr;
     if (allocatesInternalStreamSets()) {
         SmallVector<char, 256> tmp;
@@ -951,9 +929,9 @@ Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBui
 
             SmallVector<Type *, 3> params;
 
-            if (stateTypeFlags & KernelHasThreadLocal) {
+            if (mThreadLocalStateType) {
                 PointerType * ptrTy = PointerType::getUnqual(b.getContext());
-                if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+                if (LLVM_LIKELY(mSharedStateType)) {
                     params.push_back(ptrTy);
                 }
                 params.push_back(ptrTy);
@@ -976,8 +954,8 @@ Function * Kernel::addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBui
                 std::advance(arg, 1);
             };
 
-            if (stateTypeFlags & KernelHasThreadLocal) {
-                if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+            if (mThreadLocalStateType) {
+                if (LLVM_LIKELY(mSharedStateType)) {
                     addNoCaptureAttr(arg);
                     setNextArgName("shared");
                 }
@@ -1002,7 +980,7 @@ void Kernel::generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder &
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getDoSegmentFields
  ** ------------------------------------------------------------------------------------------------------------- */
-std::vector<Type *> Kernel::getDoSegmentFields(KernelBuilder & b, const unsigned stateTypeFlags) const {
+std::vector<Type *> Kernel::getDoSegmentFields(KernelBuilder & b) const {
 
     // WARNING: any change to this must be reflected in addDoSegmentDeclaration,
     // KernelCompiler::getDoSegmentProperties, KernelCompiler::setDoSegmentProperties,
@@ -1015,10 +993,10 @@ std::vector<Type *> Kernel::getDoSegmentFields(KernelBuilder & b, const unsigned
 
     std::vector<Type *> fields;
     fields.reserve(4 + 3 * (n + m));
-    if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         fields.push_back(ptrTy);  // handle
     }
-    if (LLVM_UNLIKELY(stateTypeFlags & KernelHasThreadLocal)) {
+    if (LLVM_UNLIKELY(mThreadLocalStateType)) {
         fields.push_back(ptrTy);  // handle
     }
     const auto internallySynchronized = hasAttribute(AttrId::InternallySynchronized);
@@ -1118,7 +1096,7 @@ std::vector<Type *> Kernel::getDoSegmentFields(KernelBuilder & b, const unsigned
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addDoSegmentDeclaration
  ** ------------------------------------------------------------------------------------------------------------ */
-Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b) const {
 
     // WARNING: any change to this must be reflected in getDoSegmentProperties, setDoSegmentProperties,
     // getDoSegmentFields, and PipelineCompiler::writeKernelCall
@@ -1132,7 +1110,7 @@ Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b, const unsigned sta
         const auto internallySynchronized = hasAttribute(AttrId::InternallySynchronized);
 
         Type * const retTy = (internallySynchronized || canSetTerminateSignal()) ? b.getSizeTy() : b.getVoidTy();
-        FunctionType * const doSegmentType = FunctionType::get(retTy, getDoSegmentFields(b, stateTypeFlags), false);
+        FunctionType * const doSegmentType = FunctionType::get(retTy, getDoSegmentFields(b), false);
         const auto linkage = isInternalKernel() ? GlobalValue::InternalLinkage : GlobalValue::ExternalLinkage;
         doSegment = Function::Create(doSegmentType, linkage, funcName, m);
         doSegment->setCallingConv(CallingConv::C);
@@ -1149,11 +1127,11 @@ Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b, const unsigned sta
             // TODO: add WriteOnly attributes for the appropriate I/O parameters?
             std::advance(arg, 1);
         };
-        if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             addNoCaptureAttr(arg);
             setNextArgName("shared");
         }
-        if (LLVM_UNLIKELY(stateTypeFlags & KernelHasThreadLocal)) {
+        if (LLVM_UNLIKELY(mThreadLocalStateType)) {
             addNoCaptureAttr(arg);
             setNextArgName("threadLocal");
         }
@@ -1235,12 +1213,12 @@ Function * Kernel::addDoSegmentDeclaration(KernelBuilder & b, const unsigned sta
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getDoSegmentFunction
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getDoSegmentFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getDoSegmentFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), DO_SEGMENT_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addDoSegmentDeclaration(b, stateTypeFlags);
+        f = addDoSegmentDeclaration(b);
     }
     return f;
 }
@@ -1248,12 +1226,12 @@ Function * Kernel::getDoSegmentFunction(KernelBuilder & b, const unsigned stateT
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getFinalizeThreadLocalFunction
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getFinalizeThreadLocalFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getFinalizeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), FINALIZE_THREAD_LOCAL_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addFinalizeThreadLocalDeclaration(b, stateTypeFlags);
+        f = addFinalizeThreadLocalDeclaration(b);
     }
     return f;
 }
@@ -1261,7 +1239,7 @@ Function * Kernel::getFinalizeThreadLocalFunction(KernelBuilder & b, const unsig
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addFinalizeThreadLocalDeclaration
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b) const {
     Function * func = nullptr;
 
     SmallVector<char, 256> tmp;
@@ -1271,8 +1249,8 @@ Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b, const un
     if (LLVM_LIKELY(func == nullptr)) {
         SmallVector<Type *, 2> params;
         PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
-        if (stateTypeFlags & KernelHasThreadLocal) {
-            if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (mThreadLocalStateType) {
+            if (LLVM_LIKELY(mSharedStateType)) {
                 params.push_back(ptrTy);
             }
             params.push_back(ptrTy); // common/main thread local
@@ -1294,8 +1272,8 @@ Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b, const un
             arg->setName(name);
             std::advance(arg, 1);
         };
-        if (stateTypeFlags & KernelHasThreadLocal) {
-            if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (mThreadLocalStateType) {
+            if (LLVM_LIKELY(mSharedStateType)) {
                 setNextArgName("shared");
             }
             setNextArgName("main_thread_local");
@@ -1311,12 +1289,12 @@ Function * Kernel::addFinalizeThreadLocalDeclaration(KernelBuilder & b, const un
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getFinalizeFunction
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::getFinalizeFunction(KernelBuilder & b, const unsigned stateTypeFlags, const bool alwayReturnDeclaration) const {
+Function * Kernel::getFinalizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const {
     const Module * const module = b.getModule();
     SmallVector<char, 256> tmp;
     Function * f = module->getFunction(concat(getName(), FINALIZE_SUFFIX, tmp));
     if (LLVM_UNLIKELY(f == nullptr && alwayReturnDeclaration)) {
-        f = addFinalizeDeclaration(b, stateTypeFlags);
+        f = addFinalizeDeclaration(b);
     }
     assert (b.getModule() == f->getParent());
     assert (&b.getContext() == &f->getContext());
@@ -1326,7 +1304,7 @@ Function * Kernel::getFinalizeFunction(KernelBuilder & b, const unsigned stateTy
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addFinalizeDeclaration
  ** ------------------------------------------------------------------------------------------------------------- */
-Function * Kernel::addFinalizeDeclaration(KernelBuilder & b, const unsigned stateTypeFlags) const {
+Function * Kernel::addFinalizeDeclaration(KernelBuilder & b) const {
     SmallVector<char, 256> tmp;
     const auto funcName = concat(getName(), FINALIZE_SUFFIX, tmp);
     Module * const m = b.getModule();
@@ -1350,10 +1328,10 @@ Function * Kernel::addFinalizeDeclaration(KernelBuilder & b, const unsigned stat
         }
         PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
         std::vector<Type *> params;
-        if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             params.push_back(ptrTy);
         }
-        if (LLVM_LIKELY(stateTypeFlags & KernelHasThreadLocal)) {
+        if (LLVM_LIKELY(mThreadLocalStateType)) {
             params.push_back(ptrTy);
         }
         FunctionType * const terminateType = FunctionType::get(resultType, params, false);
@@ -1367,10 +1345,10 @@ Function * Kernel::addFinalizeDeclaration(KernelBuilder & b, const unsigned stat
         }
 
         auto args = terminateFunc->arg_begin();
-        if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             (args++)->setName("shared");
         }
-        if (LLVM_LIKELY(stateTypeFlags & KernelHasThreadLocal)) {
+        if (LLVM_LIKELY(mThreadLocalStateType)) {
             (args++)->setName("threadLocal");
         }
         assert (args == terminateFunc->arg_end());
@@ -1391,12 +1369,11 @@ Function * Kernel::addOrDeclareMainFunction(KernelBuilder & /* b */, const MainM
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * Kernel::createInstance(KernelBuilder & b) const {
 
-    StructType * const stateTy = getSharedStateType(b);
-    if (LLVM_LIKELY(stateTy)) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         auto & DL = b.getModule()->getDataLayout();
-        Constant *  const stateTySize = b.getSize(b.getTypeSize(DL, stateTy));
+        Constant *  const stateTySize = b.getSize(b.getTypeSize(DL, mSharedStateType));
         Value * const stateObj = b.CreatePageAlignedMalloc(stateTySize);
-        const auto align = DL.getABITypeAlign(stateTy).value();
+        const auto align = DL.getABITypeAlign(mSharedStateType).value();
         b.CreateMemZero(stateObj, stateTySize, align);
         return stateObj;
     }
@@ -1410,9 +1387,8 @@ Value * Kernel::createInstance(KernelBuilder & b) const {
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * Kernel::initializeThreadLocalInstance(KernelBuilder & b, ArrayRef<Value *> args) const {
     Value * instance = nullptr;
-    const auto flags = getInternalStateTypeFlags();
-    if (flags & KernelHasThreadLocal) {
-        Function * const init = getInitializeThreadLocalFunction(b, flags, true);
+    if (mThreadLocalStateType) {
+        Function * const init = getInitializeThreadLocalFunction(b, true);
         instance = b.CreateCall(init->getFunctionType(), init, args);
     }
     return instance;
@@ -1422,19 +1398,17 @@ Value * Kernel::initializeThreadLocalInstance(KernelBuilder & b, ArrayRef<Value 
  * @brief finalizeThreadLocalInstance
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::finalizeThreadLocalInstance(KernelBuilder & b, ArrayRef<Value *> args) const {
-#warning TODO: remove this?
-    const auto flags = getInternalStateTypeFlags();
-    Function * const init = getFinalizeThreadLocalFunction(b, flags, true); assert (init);
-    b.CreateCall(init->getFunctionType(), init, args);
+    if (mThreadLocalStateType) {
+        Function * const init = getFinalizeThreadLocalFunction(b, true); assert (init);
+        b.CreateCall(init->getFunctionType(), init, args);
+    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief finalizeInstance
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * Kernel::finalizeInstance(KernelBuilder & b, ArrayRef<Value *> args) const {
-#warning TODO: remove this?
-    const auto flags = getInternalStateTypeFlags();
-    Function * const termFunc = getFinalizeFunction(b, flags, true);
+    Function * const termFunc = getFinalizeFunction(b, true);
     Value * result = b.CreateCall(termFunc->getFunctionType(), termFunc, args);
     if (mOutputScalars.empty()) {
         assert (!result || result->getType()->isVoidTy());
@@ -1451,7 +1425,6 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
     // TODO: need to test for termination on init call
 
     Value * handle = nullptr;
-    const auto stateTypeFlags = getInternalStateTypeFlags();
     BEGIN_SCOPED_REGION
     InitArgs initArgs;
 
@@ -1461,18 +1434,17 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
     };
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
-        const auto stateTypes = constructStateTypes(b);
         Constant * sharedStateTySize = nullptr;
-        if (stateTypes.Shared) {
-            sharedStateTySize = b.getTypeSize(stateTypes.Shared);
+        if (mSharedStateType) {
+            sharedStateTySize = b.getTypeSize(mSharedStateType);
         } else {
             sharedStateTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
         }
         addInitArg(sharedStateTySize);
 
         Constant * threadLocalTySize = nullptr;
-        if (stateTypes.ThreadLocal) {
-            threadLocalTySize = b.getTypeSize(stateTypes.ThreadLocal);
+        if (mThreadLocalStateType) {
+            threadLocalTySize = b.getTypeSize(mThreadLocalStateType);
         } else {
             threadLocalTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
         }
@@ -1480,7 +1452,7 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
     }
 
 
-    if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         handle = createInstance(b);
         addInitArg(handle);
         toFree.push_back(handle);
@@ -1498,7 +1470,7 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
     }
 
 
-    Function * const init = getInitializeFunction(b, stateTypeFlags, true);
+    Function * const init = getInitializeFunction(b, true);
     assert (&init->getContext() == &b.getContext());
 
     // If we're calling this with a family call, then the family kernels associated with it
@@ -1544,22 +1516,22 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
     #ifndef NDEBUG
     const auto originalNumOfHoseArgs = hostArgs.size();
     #endif
-    if (LLVM_LIKELY(stateTypeFlags & KernelIsStateful)) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         addHostArg(handle);
     } else {
         addHostVoidArg();
     }
-    const auto tl = (stateTypeFlags & KernelHasThreadLocal) != 0;
+    const auto tl = (mThreadLocalStateType) != 0;
     const auto ai = allocatesInternalStreamSets();
     if (ai) {
-        addHostArg(getAllocateSharedInternalStreamSetsFunction(b, stateTypeFlags, true));
+        addHostArg(getAllocateSharedInternalStreamSetsFunction(b, true));
     } else {
         addHostVoidArg();
     }
     if (tl) {
-        addHostArg(getInitializeThreadLocalFunction(b, stateTypeFlags, true));
+        addHostArg(getInitializeThreadLocalFunction(b, true));
         if (ai) {
-            addHostArg(getAllocateThreadLocalInternalStreamSetsFunction(b, stateTypeFlags, true));
+            addHostArg(getAllocateThreadLocalInternalStreamSetsFunction(b, true));
         } else {
             addHostVoidArg();
         }
@@ -1567,15 +1539,15 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
         addHostVoidArg();
         addHostVoidArg();
     }
-    addHostArg(getDoSegmentFunction(b, stateTypeFlags, true));
+    addHostArg(getDoSegmentFunction(b, true));
     if (tl) {
-        addHostArg(getFinalizeThreadLocalFunction(b, stateTypeFlags, true));
+        addHostArg(getFinalizeThreadLocalFunction(b, true));
     } else {
         addHostVoidArg();
     }
 
     // TODO: queue these in a list of termination functions to add to main?
-    addHostArg(getFinalizeFunction(b, stateTypeFlags, true));
+    addHostArg(getFinalizeFunction(b, true));
 
     assert (hostArgs.size() == (originalNumOfHoseArgs + 7));
 
@@ -1636,6 +1608,28 @@ std::string Kernel::getStringHash(const StringRef str) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getSharedStateType
+ ** ------------------------------------------------------------------------------------------------------------- */
+llvm::StructType * Kernel::getSharedStateType(llvm::LLVMContext & C) const {
+    if (mSharedStateType) {
+        return static_cast<llvm::StructType *>(CBuilder::convertTypeToLLVMContext(C, mSharedStateType));
+    } else {
+        return nullptr;
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getThreadLocalStateType
+ ** ------------------------------------------------------------------------------------------------------------- */
+llvm::StructType * Kernel::getThreadLocalStateType(llvm::LLVMContext & C) const {
+    if (mThreadLocalStateType) {
+        return static_cast<llvm::StructType *>(CBuilder::convertTypeToLLVMContext(C, mThreadLocalStateType));
+    } else {
+        return nullptr;
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief setInputStreamSetAt
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::setInputStreamSetAt(const unsigned i, StreamSet * const value) {
@@ -1683,38 +1677,18 @@ bool Kernel::noMutableSharedScalars() const {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief getSharedStateType
- ** ------------------------------------------------------------------------------------------------------------- */
-StructType * Kernel::getSharedStateType(KernelBuilder & b) const {
-    SmallVector<char, 256> tmp;
-    StructType * stateType = getTypeByName(b.getModule(), concat(getName(), SHARED_SUFFIX, tmp));
-    if (stateType == nullptr) {
-        stateType = constructStateTypes(b).Shared;
-    }
-    assert (stateType == nullptr || (&stateType->getContext() == &b.getContext()));
-    return stateType;
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getThreadLocalStateType
- ** ------------------------------------------------------------------------------------------------------------- */
-StructType * Kernel::getThreadLocalStateType(KernelBuilder & b) const {
-    SmallVector<char, 256> tmp;
-    StructType * stateType = getTypeByName(b.getModule(), concat(getName(), THREAD_LOCAL_SUFFIX, tmp));
-    if (stateType == nullptr) {
-        stateType = constructStateTypes(b).ThreadLocal;
-    }
-    assert (stateType == nullptr || (&stateType->getContext() == &b.getContext()));
-    return stateType;
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
  * @brief getFamilyName
  ** ------------------------------------------------------------------------------------------------------------- */
 std::string Kernel::getFamilyName() const {
     std::string tmp;
     raw_string_ostream out(tmp);
-    char flags = getInternalStateTypeFlags();
+    char flags = '0';
+    if (getSharedStateType()) {
+        flags += 1;
+    }
+    if (getThreadLocalStateType()) {
+        flags += 2;
+    }
     if (LLVM_UNLIKELY(allocatesInternalStreamSets())) {
         flags |= 4;
     }

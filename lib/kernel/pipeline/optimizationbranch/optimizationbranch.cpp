@@ -9,23 +9,23 @@ namespace kernel {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine *TM) {
-    return std::make_unique<OptimizationBranchCompiler>(b, const_cast<OptimizationBranch *>(this), TM);
+std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(KernelBuilder & b) {
+    return std::make_unique<OptimizationBranchCompiler>(b, const_cast<OptimizationBranch *>(this));
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) {
-    mAllZeroKernel->addKernelDeclarations(b);
-    mNonZeroKernel->addKernelDeclarations(b);
-    Kernel::addKernelDeclarations(b, kernelStateFlags);
+void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, TargetMachine * TM) {
+    mAllZeroKernel->addKernelDeclarations(b, TM);
+    mNonZeroKernel->addKernelDeclarations(b, TM);
+    Kernel::addKernelDeclarations(b, TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInternalKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::addInternalProperties(KernelBuilder & b) {
+void OptimizationBranch::addInternalProperties(KernelBuilder & b, TargetMachine * TM) {
     COMPILER->addBranchProperties(b);
 }
 

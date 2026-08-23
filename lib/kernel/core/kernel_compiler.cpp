@@ -135,12 +135,9 @@ constexpr static auto TERMINATION_SIGNAL = "__termination_signal";
 // the "main" method.
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief generateKernel
+ * @brief declareKernel
  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::generateKernel(KernelBuilder & b) {
-    // NOTE: make sure to keep and reset the original compiler here. A kernel could generate new kernels and
-    // reuse the same KernelBuilder to do so; this could result in unexpected behaviour if the this function
-    // exits without restoring the original compiler state.
+void KernelCompiler::declareKernel(KernelBuilder & b, TargetMachine * TM) {
     auto const oc = b.getCompiler();
     b.setCompiler(this);
     constructStreamSetBuffers(b);
@@ -153,24 +150,35 @@ void KernelCompiler::generateKernel(KernelBuilder & b) {
     }
     #endif
     addBaseInternalProperties(b);
-    mTarget->addInternalProperties(b);
-    auto st = mTarget->constructStateTypes(b);
-    mSharedStateType = st.Shared;
-    mThreadLocalStateType = st.ThreadLocal;
+    mTarget->addInternalProperties(b, TM);
+    mTarget->addKernelDeclarations(b, TM);
+    b.setCompiler(oc);
+}
 
-    unsigned flags = 0;
-    if (st.Shared) flags |= Kernel::KernelIsStateful;
-    if (st.ThreadLocal) flags |= Kernel::KernelHasThreadLocal;
-    mTarget->addKernelDeclarations(b, flags);
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief generateKernel
+ ** ------------------------------------------------------------------------------------------------------------- */
+void KernelCompiler::generateKernel(KernelBuilder & b, TargetMachine * TM) {
+    // NOTE: make sure to keep and reset the original compiler here. A kernel could generate new kernels and
+    // reuse the same KernelBuilder to do so; this could result in unexpected behaviour if the this function
+    // exits without restoring the original compiler state.
+    auto const oc = b.getCompiler();
+    b.setCompiler(this);
     callGenerateInitializeMethod(b);
     if (LLVM_UNLIKELY(mStreamSetInputBuffers.empty())) {
         callGenerateExpectedOutputSizeMethod(b);
     }
-    callGenerateAllocateSharedInternalStreamSets(b);
-    callGenerateInitializeThreadLocalMethod(b);
-    callGenerateAllocateThreadLocalInternalStreamSets(b);
+    if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
+        callGenerateAllocateSharedInternalStreamSets(b);
+    }
     callGenerateDoSegmentMethod(b);
-    callGenerateFinalizeThreadLocalMethod(b);
+    if (LLVM_UNLIKELY(mTarget->getThreadLocalStateType())) {
+        callGenerateInitializeThreadLocalMethod(b);
+        if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
+            callGenerateAllocateThreadLocalInternalStreamSets(b);
+        }
+        callGenerateFinalizeThreadLocalMethod(b);
+    }
     callGenerateFinalizeMethod(b);
     mTarget->addAdditionalFunctions(b);
 
@@ -194,10 +202,37 @@ void KernelCompiler::generateKernel(KernelBuilder & b) {
 
     Kernel::SelectedOptimizationPasses passes;
     mTarget->addOptimizationPasses(b, passes);
-    runAllOptimizationPasses(b, passes);
+    runAllOptimizationPasses(b, passes, TM);
     b.setCompiler(oc);
 
 }
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief addBaseInternalProperties
+  ** ------------------------------------------------------------------------------------------------------------- */
+void KernelCompiler::addBaseInternalProperties(KernelBuilder & b) {
+     // If an output is a managed buffer, store its handle.
+    auto & C = b.getContext();
+    const auto n = mOutputStreamSets.size();
+    for (unsigned i = 0; i < n; ++i) {
+        const Binding & output = mOutputStreamSets[i];
+        Type * const handleTy = CBuilder::convertTypeToLLVMContext(C, mStreamSetOutputBuffers[i]->getHandleType(b));
+        const auto isLocal = Kernel::isLocalBuffer(output);
+        if (LLVM_UNLIKELY(isLocal.any())) {
+            mTarget->addInternalScalar(handleTy, output.getName() + BUFFER_HANDLE_SUFFIX);
+        } else {
+            mTarget->addNonPersistentScalar(handleTy, output.getName() + BUFFER_HANDLE_SUFFIX);
+        }
+    }
+    IntegerType * const sizeTy = b.getSizeTy();
+    if (mTarget->hasAttribute(AttrId::InternallySynchronized) || mTarget->canSetTerminateSignal()) {
+        mTarget->addInternalScalar(sizeTy, TERMINATION_SIGNAL);
+    } else {
+        mTarget->addNonPersistentScalar(sizeTy, TERMINATION_SIGNAL);
+    }
+}
+
+
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief FilteredPrintFunctionPass
@@ -228,7 +263,7 @@ private:
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief runAllOptimizationPasses
  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes) {
+void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes, TargetMachine * TM) {
 
     enum AnalysisPass : uint64_t {
 //        _AAManager,
@@ -252,7 +287,7 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
     ModuleAnalysisManager MAM;
 
 
-    PassBuilder PB(mTargetMachine);
+    PassBuilder PB(TM);
 
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
@@ -442,30 +477,6 @@ void KernelCompiler::constructStreamSetBuffers(KernelBuilder & b) {
     }
 }
 
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief addBaseInternalProperties
-  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::addBaseInternalProperties(KernelBuilder & b) {
-     // If an output is a managed buffer, store its handle.
-    auto & C = b.getContext();
-    const auto n = mOutputStreamSets.size();
-    for (unsigned i = 0; i < n; ++i) {
-        const Binding & output = mOutputStreamSets[i];
-        Type * const handleTy = CBuilder::convertTypeToLLVMContext(C, mStreamSetOutputBuffers[i]->getHandleType(b));
-        const auto isLocal = Kernel::isLocalBuffer(output);
-        if (LLVM_UNLIKELY(isLocal.any())) {
-            mTarget->addInternalScalar(handleTy, output.getName() + BUFFER_HANDLE_SUFFIX);
-        } else {
-            mTarget->addNonPersistentScalar(handleTy, output.getName() + BUFFER_HANDLE_SUFFIX);
-        }
-    }
-    IntegerType * const sizeTy = IntegerType::getIntNTy(C, sizeof(size_t) * 8);
-    if (mTarget->hasAttribute(AttrId::InternallySynchronized) || mTarget->canSetTerminateSignal()) {
-        mTarget->addInternalScalar(sizeTy, TERMINATION_SIGNAL);
-    } else {
-        mTarget->addNonPersistentScalar(sizeTy, TERMINATION_SIGNAL);
-    }
-}
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief reset
@@ -481,10 +492,7 @@ inline void reset(Vec & vec, const size_t n) {
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
 
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-
-    mCurrentMethod = mTarget->getInitializeFunction(b, flags, true);
+    mCurrentMethod = mTarget->getInitializeFunction(b, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -502,13 +510,15 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
 
     const auto ea = codegen::DebugOptionIsSet(codegen::EnableAsserts);
 
+    StructType * const sharedStateTy = mTarget->getSharedStateType(b.getContext());
+
     if (LLVM_UNLIKELY(ea)) {
 
         Value * const providedSharedStateTySize = nextArg();
 
         Constant * sharedStateTySize = nullptr;
-        if (LLVM_LIKELY(mSharedStateType)) {
-            sharedStateTySize = b.getTypeSize(mSharedStateType);
+        if (LLVM_LIKELY(sharedStateTy)) {
+            sharedStateTySize = b.getTypeSize(sharedStateTy);
         } else {
             sharedStateTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
         }
@@ -521,8 +531,8 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
         Value * const providedThreadLocalTySize = nextArg();
 
         Constant * threadLocalTySize = nullptr;
-        if (mThreadLocalStateType) {
-            threadLocalTySize = b.getTypeSize(mThreadLocalStateType);
+        if (mTarget->getThreadLocalStateType()) {
+            threadLocalTySize = b.getTypeSize(mTarget->getThreadLocalStateType());
         } else {
             threadLocalTySize = ConstantInt::getAllOnesValue(b.getSizeTy());
         }
@@ -537,12 +547,14 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
     mSharedHandle = nullptr;
     mThreadLocalHandle = nullptr;
 
-    if (LLVM_LIKELY(mSharedStateType)) {
+
+
+    if (LLVM_LIKELY(sharedStateTy)) {
         setHandle(nextArg());
         if (LLVM_UNLIKELY(ea)) {
             auto & dl = b.getModule()->getDataLayout();
 
-            const auto align = CBuilder::getAlignOf(dl, mSharedStateType);
+            const auto align = CBuilder::getAlignOf(dl, sharedStateTy);
             if (LLVM_LIKELY(align > 1U)) {
             Value * handleInt = b.CreatePtrToInt(getHandle(), b.getSizeTy());
             b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
@@ -559,8 +571,8 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
     }
     bindAdditionalInitializationArguments(b, arg, arg_end);
     assert (arg == arg_end);
-    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && mSharedStateType)) {
-        b.CreateMProtect(mSharedStateType, mSharedHandle, CBuilder::Protect::WRITE);
+    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && sharedStateTy)) {
+        b.CreateMProtect(sharedStateTy, mSharedHandle, CBuilder::Protect::WRITE);
     }
     // TODO: we could permit shared managed buffers here if we passed in the buffer
     // into the init method. However, since there are no uses of this in any written
@@ -571,11 +583,10 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
     std::tie(mTerminationSignalPtr, termSignalTy) = getScalarFieldPtr(b, TERMINATION_SIGNAL);
     b.CreateStore(b.getSize(KernelBuilder::TerminationCode::None), mTerminationSignalPtr);
     mTarget->generateInitializeMethod(b);
-    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && mSharedStateType)) {
-        b.CreateMProtect(mSharedStateType, mSharedHandle, CBuilder::Protect::READ);
+    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && sharedStateTy)) {
+        b.CreateMProtect(sharedStateTy, mSharedHandle, CBuilder::Protect::READ);
     }
     b.CreateRet(b.CreateLoad(termSignalTy, mTerminationSignalPtr));
-    // b.getDriver().declareFunctionSymbol(mCurrentMethod);
     clearInternalStateAfterCodeGen();
 }
 
@@ -584,11 +595,7 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
  ** ------------------------------------------------------------------------------------------------------------- */
 void KernelCompiler::callGenerateExpectedOutputSizeMethod(KernelBuilder & b) {
     assert (mTarget->getNumOfStreamInputs() == 0);
-
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-
-    mCurrentMethod = mTarget->getExpectedOutputSizeFunction(b, flags, true);
+    mCurrentMethod = mTarget->getExpectedOutputSizeFunction(b, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -604,20 +611,19 @@ void KernelCompiler::callGenerateExpectedOutputSizeMethod(KernelBuilder & b) {
         std::advance(arg, 1);
         return v;
     };
-    if (LLVM_LIKELY(mSharedStateType)) {
+    StructType * sharedStateTy = mTarget->getSharedStateType(b.getContext());
+    if (LLVM_LIKELY(sharedStateTy)) {
         setHandle(nextArg());
     }
     initializeScalarMap(b, InitializeOptions::DoNotIncludeThreadLocalScalars);
-    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && mSharedStateType)) {
-        b.CreateMProtect(mSharedStateType, mSharedHandle, CBuilder::Protect::WRITE);
+    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && sharedStateTy)) {
+        b.CreateMProtect(sharedStateTy, mSharedHandle, CBuilder::Protect::WRITE);
     }
     Value * const retVal = mTarget->generateExpectedOutputSizeMethod(b);
-    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && mSharedStateType)) {
-        b.CreateMProtect(mSharedStateType, mSharedHandle, CBuilder::Protect::READ);
+    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && sharedStateTy)) {
+        b.CreateMProtect(sharedStateTy, mSharedHandle, CBuilder::Protect::READ);
     }
-    assert (retVal);
     b.CreateRet(retVal);
-    // b.getDriver().declareFunctionSymbol(mCurrentMethod);
     clearInternalStateAfterCodeGen();
 }
 
@@ -634,9 +640,7 @@ void KernelCompiler::bindAdditionalInitializationArguments(KernelBuilder & /* b 
 inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilder & b) {
 
     assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-    mCurrentMethod = mTarget->getInitializeThreadLocalFunction(b, flags, true);
+    mCurrentMethod = mTarget->getInitializeThreadLocalFunction(b, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -650,54 +654,45 @@ inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilde
         return v;
     };
     PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
-    if (mThreadLocalStateType) {
-        if (LLVM_LIKELY(mSharedStateType)) {
-            setHandle(nextArg());
-        }
-        StructType * const threadLocalTy = mThreadLocalStateType;
-        Value * const providedState = nextArg();
-        BasicBlock * const allocThreadLocal = BasicBlock::Create(b.getContext(), "allocThreadLocalState", mCurrentMethod);
-        BasicBlock * const initThreadLocal = BasicBlock::Create(b.getContext(), "initThreadLocalState", mCurrentMethod);
-        b.CreateCondBr(b.CreateIsNull(providedState), allocThreadLocal, initThreadLocal);
-
-        b.SetInsertPoint(allocThreadLocal);
-        auto & DL = b.getModule()->getDataLayout();
-        Constant * const threadLocalTySize = b.getTypeSize(threadLocalTy);
-        const auto align = DL.getABITypeAlign(threadLocalTy).value();
-        assert (boost::gcd<size_t>(align, b.getPageSize()) == align);
-        Value * allocedState = b.CreatePageAlignedMalloc(threadLocalTySize);
-        b.CreateMemZero(allocedState, threadLocalTySize, align);
-        b.CreateBr(initThreadLocal);
-
-        b.SetInsertPoint(initThreadLocal);
-        PHINode * const threadLocal = b.CreatePHI(ptrTy, 2);
-        threadLocal->addIncoming(providedState, mEntryPoint);
-        threadLocal->addIncoming(allocedState, allocThreadLocal);
-
-        const auto ea = codegen::DebugOptionIsSet(codegen::EnableAsserts);
-        if (LLVM_UNLIKELY(ea)) {
-            auto & dl = b.getModule()->getDataLayout();
-            const auto align = CBuilder::getAlignOf(dl, threadLocalTy);
-            if (LLVM_LIKELY(align > 1U)) {
-            Value * handleInt = b.CreatePtrToInt(threadLocal, b.getSizeTy());
-            b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
-                               "%s thread local handle addresss (x%" PRIx64 ") is misaligned for state type (%" PRIu64 ")",
-                               b.GetString("InitializeThreadLocal"), handleInt, b.getSize(align));
-            }
-        }
-
-        b.CreatePrintfCall(" -- initializing thread local for %s (%" PRIx64 ")\n", b.GetString(mTarget->getName()), threadLocal);
-
-        mThreadLocalHandle = threadLocal;
-        initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
-        mTarget->generateInitializeThreadLocalMethod(b);
-        b.CreateRet(threadLocal);
-    } else {
-
-        b.CreatePrintfCall(" -- no thread local for %s\n", b.GetString(mTarget->getName()));
-
-        b.CreateRet(ConstantPointerNull::get(ptrTy));
+    if (LLVM_LIKELY(mTarget->getSharedStateType())) {
+        setHandle(nextArg());
     }
+    StructType * const threadLocalTy = mTarget->getThreadLocalStateType();
+    Value * const providedState = nextArg();
+    BasicBlock * const allocThreadLocal = BasicBlock::Create(b.getContext(), "allocThreadLocalState", mCurrentMethod);
+    BasicBlock * const initThreadLocal = BasicBlock::Create(b.getContext(), "initThreadLocalState", mCurrentMethod);
+    b.CreateCondBr(b.CreateIsNull(providedState), allocThreadLocal, initThreadLocal);
+
+    b.SetInsertPoint(allocThreadLocal);
+    auto & DL = b.getModule()->getDataLayout();
+    Constant * const threadLocalTySize = b.getTypeSize(threadLocalTy);
+    const auto align = DL.getABITypeAlign(threadLocalTy).value();
+    assert (boost::gcd<size_t>(align, b.getPageSize()) == align);
+    Value * allocedState = b.CreatePageAlignedMalloc(threadLocalTySize);
+    b.CreateMemZero(allocedState, threadLocalTySize, align);
+    b.CreateBr(initThreadLocal);
+
+    b.SetInsertPoint(initThreadLocal);
+    PHINode * const threadLocal = b.CreatePHI(ptrTy, 2);
+    threadLocal->addIncoming(providedState, mEntryPoint);
+    threadLocal->addIncoming(allocedState, allocThreadLocal);
+
+    const auto ea = codegen::DebugOptionIsSet(codegen::EnableAsserts);
+    if (LLVM_UNLIKELY(ea)) {
+        auto & dl = b.getModule()->getDataLayout();
+        const auto align = CBuilder::getAlignOf(dl, threadLocalTy);
+        if (LLVM_LIKELY(align > 1U)) {
+        Value * handleInt = b.CreatePtrToInt(threadLocal, b.getSizeTy());
+        b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
+                           "%s thread local handle addresss (x%" PRIx64 ") is misaligned for state type (%" PRIu64 ")",
+                           b.GetString("InitializeThreadLocal"), handleInt, b.getSize(align));
+        }
+    }
+    mThreadLocalHandle = threadLocal;
+    initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
+    mTarget->generateInitializeThreadLocalMethod(b);
+    b.CreateRet(threadLocal);
+
     clearInternalStateAfterCodeGen();
 }
 
@@ -708,9 +703,7 @@ inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelB
     // NOTE: the kernel compiler must call this AFTER initialization
     if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
         assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
-        auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-        flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-        mCurrentMethod = mTarget->getAllocateSharedInternalStreamSetsFunction(b, flags, true);
+        mCurrentMethod = mTarget->getAllocateSharedInternalStreamSetsFunction(b, true);
         assert (mCurrentMethod->empty());
         mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
         b.SetInsertPoint(mEntryPoint);
@@ -723,7 +716,7 @@ inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelB
             std::advance(arg, 1);
             return v;
         };
-        if (LLVM_LIKELY(mSharedStateType)) {
+        if (LLVM_LIKELY(mTarget->getSharedStateType())) {
             setHandle(nextArg());
         }
         Value * const expectedNumOfStrides = nextArg();
@@ -747,9 +740,7 @@ inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelB
 inline void KernelCompiler::callGenerateAllocateThreadLocalInternalStreamSets(KernelBuilder & b) {
     if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
         assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
-        auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-        flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-        mCurrentMethod = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, flags, true);
+        mCurrentMethod = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, true);
         assert (mCurrentMethod->empty());
         mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
         b.SetInsertPoint(mEntryPoint);
@@ -762,16 +753,14 @@ inline void KernelCompiler::callGenerateAllocateThreadLocalInternalStreamSets(Ke
             std::advance(arg, 1);
             return v;
         };
-        if (mThreadLocalStateType) {
-            if (LLVM_LIKELY(mSharedStateType)) {
-                setHandle(nextArg());
-            }
-            setThreadLocalHandle(nextArg());
-            Value * const expectedNumOfStrides = nextArg();
-            initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
-            initializeOwnedBufferHandles(b, InitializeOptions::IncludeThreadLocalScalars);
-            mTarget->generateAllocateThreadLocalInternalStreamSetsMethod(b, expectedNumOfStrides);
+        if (LLVM_LIKELY(mTarget->getSharedStateType())) {
+            setHandle(nextArg());
         }
+        setThreadLocalHandle(nextArg());
+        Value * const expectedNumOfStrides = nextArg();
+        initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
+        initializeOwnedBufferHandles(b, InitializeOptions::IncludeThreadLocalScalars);
+        mTarget->generateAllocateThreadLocalInternalStreamSetsMethod(b, expectedNumOfStrides);
         b.CreateRetVoid();
         // b.getDriver().declareFunctionSymbol(mCurrentMethod);
         clearInternalStateAfterCodeGen();
@@ -819,13 +808,15 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
 
     const auto enableAsserts = codegen::DebugOptionIsSet(codegen::EnableAsserts);
 
-    if (LLVM_LIKELY(mSharedStateType)) {
+    StructType * sharedStateTy = mTarget->getSharedStateType();
+
+    if (LLVM_LIKELY(sharedStateTy)) {
         setHandle(nextArg());
         if (LLVM_UNLIKELY(enableAsserts)) {
             b.CreateAssert(getHandle(), "%s: shared handle cannot be null", b.GetString(getName()));
 
             auto & dl = b.getModule()->getDataLayout();
-            const auto align = CBuilder::getAlignOf(dl, mSharedStateType);
+            const auto align = CBuilder::getAlignOf(dl, sharedStateTy);
             if (LLVM_LIKELY(align > 1U)) {
             Value * handleInt = b.CreatePtrToInt(getHandle(), b.getSizeTy());
             b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
@@ -834,13 +825,16 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
             }
         }
     }
-    if (LLVM_UNLIKELY(mThreadLocalStateType)) {
+
+    StructType * threadLocalStateTy = mTarget->getThreadLocalStateType();
+
+    if (LLVM_UNLIKELY(threadLocalStateTy)) {
         setThreadLocalHandle(nextArg());
         if (LLVM_UNLIKELY(enableAsserts)) {
             b.CreateAssert(getThreadLocalHandle(), "%s: thread local handle cannot be null", b.GetString(getName()));
 
             auto & dl = b.getModule()->getDataLayout();
-            const auto align = CBuilder::getAlignOf(dl, mThreadLocalStateType);
+            const auto align = CBuilder::getAlignOf(dl, threadLocalStateTy);
             if (LLVM_LIKELY(align > 1U)) {
             Value * handleInt = b.CreatePtrToInt(getThreadLocalHandle(), b.getSizeTy());
             b.CreateAssertZero(b.CreateURem(handleInt, b.getSize(align)),
@@ -1129,16 +1123,13 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
 
     std::vector<Value *> props;
 
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-
-    Function * const doSegFunc = mTarget->getDoSegmentFunction(b, flags, true);
+    Function * const doSegFunc = mTarget->getDoSegmentFunction(b, true);
 
     props.reserve(doSegFunc->getNumOperands());
-    if (LLVM_LIKELY(mSharedStateType)) {
+    if (LLVM_LIKELY(mSharedHandle)) {
         props.push_back(mSharedHandle); assert (mSharedHandle);
     }
-    if (LLVM_UNLIKELY(mThreadLocalStateType)) {
+    if (LLVM_UNLIKELY(mThreadLocalHandle)) {
         props.push_back(mThreadLocalHandle); assert (mThreadLocalHandle);
     }
     const auto internallySynchronized = mTarget->hasAttribute(AttrId::InternallySynchronized);
@@ -1264,10 +1255,7 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
     assert (mInputStreamSets.size() == mStreamSetInputBuffers.size());
     assert (mOutputStreamSets.size() == mStreamSetOutputBuffers.size());
 
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-
-    mCurrentMethod = mTarget->getDoSegmentFunction(b, flags, true);
+    mCurrentMethod = mTarget->getDoSegmentFunction(b, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -1283,14 +1271,14 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
     END_SCOPED_REGION
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
-        b.CreateMProtect(mSharedStateType, mSharedHandle, CBuilder::Protect::WRITE);
+        b.CreateMProtect(mTarget->getSharedStateType(), mSharedHandle, CBuilder::Protect::WRITE);
     }
     assert (mCurrentMethod == b.GetInsertBlock()->getParent());
     mTarget->generateKernelMethod(b);
     assert (mCurrentMethod == b.GetInsertBlock()->getParent());
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
-        b.CreateMProtect(mSharedStateType, mSharedHandle, CBuilder::Protect::READ);
+        b.CreateMProtect(mTarget->getSharedStateType(), mSharedHandle, CBuilder::Protect::READ);
     }
 
     const auto numOfOutputs = getNumOfStreamOutputs();
@@ -1341,10 +1329,7 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder & b) {
 
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-
-    mCurrentMethod = mTarget->getFinalizeThreadLocalFunction(b, flags, true);
+    mCurrentMethod = mTarget->getFinalizeThreadLocalFunction(b, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -1357,15 +1342,13 @@ inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder 
         std::advance(arg, 1);
         return v;
     };
-    if (mThreadLocalStateType) {
-        if (LLVM_LIKELY(mSharedStateType)) {
-            setHandle(nextArg());
-        }
-        mCommonThreadLocalHandle = nextArg();
-        mThreadLocalHandle = nextArg();
-        initializeScalarMap(b, InitializeOptions::IncludeAndAutomaticallyAccumulateThreadLocalScalars);
-        mTarget->generateFinalizeThreadLocalMethod(b);
+    if (LLVM_LIKELY(mTarget->getSharedStateType())) {
+        setHandle(nextArg());
     }
+    mCommonThreadLocalHandle = nextArg();
+    mThreadLocalHandle = nextArg();
+    initializeScalarMap(b, InitializeOptions::IncludeAndAutomaticallyAccumulateThreadLocalScalars);
+    mTarget->generateFinalizeThreadLocalMethod(b);
     b.CreateRetVoid();
     // b.getDriver().declareFunctionSymbol(mCurrentMethod);
     clearInternalStateAfterCodeGen();
@@ -1375,9 +1358,7 @@ inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder 
  * @brief callGenerateFinalizeMethod
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void KernelCompiler::callGenerateFinalizeMethod(KernelBuilder & b) {
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
-    mCurrentMethod = mTarget->getFinalizeFunction(b, flags, true);
+    mCurrentMethod = mTarget->getFinalizeFunction(b, true);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -1390,16 +1371,16 @@ inline void KernelCompiler::callGenerateFinalizeMethod(KernelBuilder & b) {
         std::advance(arg, 1);
         return v;
     };
-    if (LLVM_LIKELY(mSharedStateType)) {
+    if (LLVM_LIKELY(mTarget->getSharedStateType())) {
         setHandle(nextArg());
     }
-    if (LLVM_LIKELY(mThreadLocalStateType)) {
+    if (LLVM_LIKELY(mTarget->getThreadLocalStateType())) {
         setThreadLocalHandle(nextArg());
     }
     assert (arg == mCurrentMethod->arg_end());
     initializeScalarMap(b, InitializeOptions::IncludeThreadLocalScalars);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
-        b.CreateMProtect(mSharedStateType, mSharedHandle,CBuilder::Protect::WRITE);
+        b.CreateMProtect(mTarget->getSharedStateType(), mSharedHandle,CBuilder::Protect::WRITE);
     }
     initializeOwnedBufferHandles(b, InitializeOptions::DoNotIncludeThreadLocalScalars);
     mTarget->generateFinalizeMethod(b); // may be overridden by the Kernel subtype
@@ -1473,8 +1454,8 @@ static size_t computePartialSumOfGroupCounts(flat_map<size_t, size_t> & groups, 
 void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOptions options) {
 
     Module * const m = b.getModule();
-    StructType * const sharedTy =  mSharedStateType;
-    StructType * const threadLocalTy = mThreadLocalStateType;
+    StructType * const sharedTy =  mTarget->getSharedStateType(b.getContext());
+    StructType * const threadLocalTy = mTarget->getThreadLocalStateType(b.getContext());
     assert (sharedTy == nullptr || &sharedTy->getContext() == &b.getContext());
     assert (threadLocalTy == nullptr || &threadLocalTy->getContext() == &b.getContext());
 
@@ -1911,7 +1892,6 @@ StreamSetPort KernelCompiler::getStreamPort(const StringRef name) const {
  * @brief getScalarFieldPtr
  ** ------------------------------------------------------------------------------------------------------------- */
 KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, const StringRef name) const {
-    assert (this);
     if (LLVM_UNLIKELY(mScalarFieldMap.empty())) {
         SmallVector<char, 256> tmp;
         raw_svector_ostream out(tmp);
@@ -1969,6 +1949,7 @@ KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, V
 
         computePartialSumOfGroupCounts(groups, mInputScalars.size());
 
+
         for (const auto & binding : mInternalScalars) {
 
             if (type == binding.getScalarType()) {
@@ -1980,9 +1961,9 @@ KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, V
                 if (name.compare(binding.getName()) == 0) {
                     StructType * stateTy = nullptr;
                     if (type == ScalarType::Internal) {
-                        stateTy = mSharedStateType; assert(stateTy);
+                        stateTy = mTarget->getSharedStateType(b.getContext()); assert(stateTy);
                     } else {
-                        stateTy = mThreadLocalStateType; assert(stateTy);
+                        stateTy = mTarget->getThreadLocalStateType(b.getContext()); assert(stateTy);
                     }
 
                     const auto k = index * 2 + 1;
@@ -2114,10 +2095,8 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
                                          IllustratorTypeId illustratorTypeId, const char replacement0, const char replacement1,
                                          const ArrayRef<size_t> loopIds) const {
 
-    auto flags = mSharedStateType ? Kernel::KernelIsStateful : 0;
-    flags = mThreadLocalStateType ? (flags | Kernel::KernelHasThreadLocal) : flags;
 
-    auto init = mTarget->getInitializeFunction(b, flags, true);
+    auto init = mTarget->getInitializeFunction(b, true);
     assert (init);
     auto arg = init->arg_begin();
     auto nextArg = [&]() {
@@ -2128,7 +2107,7 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
         std::advance(arg, 1);
         return v;
     };
-    assert (mSharedStateType);
+    assert (mTarget->getSharedStateType());
     Value * handle = nextArg();
     Instruction * ret = nullptr;
     for (auto & bb : *init) {
@@ -2235,9 +2214,8 @@ void KernelCompiler::captureStreamData(KernelBuilder & b, Constant * kernelName,
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
-KernelCompiler::KernelCompiler(not_null<Kernel *> kernel, TargetMachine * TM) noexcept
+KernelCompiler::KernelCompiler(not_null<Kernel *> kernel) noexcept
 : mTarget(kernel)
-, mTargetMachine(TM)
 , mInputStreamSets(kernel->mInputStreamSets)
 , mOutputStreamSets(kernel->mOutputStreamSets)
 , mInputScalars(kernel->mInputScalars)

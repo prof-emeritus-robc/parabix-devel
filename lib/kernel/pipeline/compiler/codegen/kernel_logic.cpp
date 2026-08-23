@@ -11,9 +11,7 @@ void PipelineCompiler::setActiveKernel(KernelBuilder & b, const unsigned kernelI
     mKernel = getKernel(kernelId);
     mKernelSharedHandle = nullptr;
 
-    const auto flags = mKernel->getInternalStateTypeFlags();
-
-    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+    if (LLVM_LIKELY(mKernel->getSharedStateType())) {
         Value * handle = b.getScalarFieldPtr(makeKernelName(kernelId)).first;
         if (LLVM_UNLIKELY(isKernelFamilyCall(kernelId))) {
             PointerType * pty = PointerType::getUnqual(b.getContext());
@@ -22,7 +20,7 @@ void PipelineCompiler::setActiveKernel(KernelBuilder & b, const unsigned kernelI
         mKernelSharedHandle = handle;
     }
     mKernelThreadLocalHandle = nullptr;
-    if (flags & Kernel::KernelHasThreadLocal && allowThreadLocal) {
+    if (mKernel->getThreadLocalStateType() && allowThreadLocal) {
         mKernelThreadLocalHandle = getThreadLocalHandlePtr(b, mKernelId);
         if (getCommonThreadLocal) {
             mKernelCommonThreadLocalHandle = getThreadLocalHandlePtr(b, mKernelId, true);

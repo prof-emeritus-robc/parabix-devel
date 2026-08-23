@@ -176,11 +176,11 @@ protected:
     // A custom method for preparing kernel declarations is needed,
     // so that the carry data requirements may be accommodated before
     // finalizing the KernelStateType.
-    void addInternalProperties(KernelBuilder & b) final;
+    void addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
     void linkExternalMethods(KernelBuilder & b) final;
 
-    std::unique_ptr<kernel::KernelCompiler> instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine * TM) override;
+    std::unique_ptr<kernel::KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) override;
 
 private:
 

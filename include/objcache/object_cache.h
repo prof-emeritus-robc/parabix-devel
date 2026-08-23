@@ -38,7 +38,7 @@ enum class CacheObjectResult {
     , UNCACHED
 };
 
-class ParabixObjectCache final : public llvm::ObjectCache {
+class ParabixObjectCache {
     template <typename K, typename V>
     using Map = boost::container::flat_map<K, V>;
     template <typename K>
@@ -51,19 +51,13 @@ public:
 
     using Path = llvm::SmallString<128>;
 
-    std::unique_ptr<llvm::MemoryBuffer> loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * kernel, llvm::Module & M) noexcept;
+    std::unique_ptr<llvm::MemoryBuffer> loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept;
 
-    void notifyObjectCompiled(const llvm::Module * M, llvm::MemoryBufferRef Obj) override;
-
-    std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module * M) override;
-
-    static void markModuleAsCacheable(kernel::Kernel * const kernel, llvm::Module * module);
-
-    virtual ~ParabixObjectCache();
+    void saveCachedObjectFile(const llvm::Module & M, llvm::MemoryBufferRef Obj) noexcept;
 
 protected:
 
-    ParabixObjectCache(BaseDriver & driver);
+    ParabixObjectCache();
     void loadCacheSettings() noexcept;
     void saveCacheSettings() noexcept;
 
@@ -72,7 +66,6 @@ private:
     bool requiresCacheCleanUp() noexcept;
 private:
     static bool         mStartedCacheCleanupDaemon;
-    BaseDriver &        mDriver;
     ObjectBufferCache   mCachedObject;
     Path                mCachePath;
 };

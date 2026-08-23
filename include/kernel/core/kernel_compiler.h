@@ -61,9 +61,11 @@ public:
 public:
 
     // constructor
-    KernelCompiler(not_null<Kernel *> kernel, llvm::TargetMachine * TM) noexcept;
+    KernelCompiler(not_null<Kernel *> kernel) noexcept;
 
-    void generateKernel(KernelBuilder & b);
+    void declareKernel(KernelBuilder & b, llvm::TargetMachine * TM);
+
+    void generateKernel(KernelBuilder & b, llvm::TargetMachine * TM);
 
     virtual ~KernelCompiler();
 
@@ -378,10 +380,6 @@ public:
 
     static Rational getLCMOfFixedRateInputs(const Kernel * const target);
 
-    llvm::TargetMachine * getTargetMachine() const {
-        return mTargetMachine;
-    }
-
 protected:
 
     void registerIllustrator(KernelBuilder & b, llvm::Constant * kernelName, llvm::Constant * streamName, const size_t rows, const size_t cols, const size_t itemWidth, const MemoryOrdering ordering, IllustratorTypeId illustratorTypeId, const char replacement0, const char replacement1, const llvm::ArrayRef<size_t> loopIds) const;
@@ -408,12 +406,11 @@ private:
 
     void clearInternalStateAfterCodeGen();
 
-    void runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes);
+    void runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes, llvm::TargetMachine *TM);
 
 protected:
 
     Kernel * const                  mTarget;
-    llvm::TargetMachine * const     mTargetMachine;
 
     const Bindings &                mInputStreamSets;
     const Bindings &                mOutputStreamSets;
@@ -421,9 +418,6 @@ protected:
     const Bindings &                mInputScalars;
     const Bindings &                mOutputScalars;
     const InternalScalars &         mInternalScalars;
-
-    llvm::StructType *              mSharedStateType = nullptr;
-    llvm::StructType *              mThreadLocalStateType = nullptr;
 
     llvm::Function *                mCurrentMethod = nullptr;
 

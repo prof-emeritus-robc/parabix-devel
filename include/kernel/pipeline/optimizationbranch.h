@@ -36,7 +36,7 @@ public:
         return mCondition;
     }
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine * TM) final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
 protected:
 
@@ -50,9 +50,9 @@ protected:
                        Bindings && scalar_inputs,
                        Bindings && scalar_outputs);
 
-    void addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) override;
+    void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM) override;
 
-    void addInternalProperties(KernelBuilder & b) override;
+    void addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) override;
 
     void generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides) override;
 

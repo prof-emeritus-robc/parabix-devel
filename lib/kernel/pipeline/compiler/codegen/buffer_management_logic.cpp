@@ -166,9 +166,6 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
             setActiveKernel(b, i, !nonLocal);
             if (nonLocal || mKernelThreadLocalHandle) {
                 assert (mKernel == kernelObj);
-                const auto flags = kernelObj->getInternalStateTypeFlags();
-                assert (((flags & Kernel::KernelIsStateful) != 0) == (mKernelSharedHandle != nullptr));
-
 
                 SmallVector<Value *, 5> params;
                 if (LLVM_LIKELY(mKernelSharedHandle)) {
@@ -179,7 +176,6 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                 if (nonLocal) {
                     std::tie(func, funcTy) = getKernelAllocateSharedInternalStreamSetsFunction(b);
                 } else {
-                    assert (((flags & Kernel::KernelHasThreadLocal) != 0) == (mKernelThreadLocalHandle != nullptr));
                     std::tie(func, funcTy) = getKernelAllocateThreadLocalInternalStreamSetsFunction(b);
                     params.push_back(mKernelThreadLocalHandle);
                 }
@@ -204,19 +200,6 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                     params.push_back(generateBufferExpansionFunctionForCurrentKernel(b, i));
                     params.push_back(getHandle());
                 }
-
-                func->print(errs()); errs() << "\n\n";
-                for (unsigned i = 0; i < params.size(); ++i) {
-                    if (i < funcTy->getNumParams()) {
-                        params[i]->getType()->print(errs());
-                    } else {
-                        errs() << "??";
-                    }
-
-
-                    errs() << "\n";
-                }
-                errs() << "\n";
 
                 b.CreateCall(funcTy, func, params);
             }

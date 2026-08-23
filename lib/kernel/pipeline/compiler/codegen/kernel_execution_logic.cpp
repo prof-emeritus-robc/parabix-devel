@@ -20,7 +20,7 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
     #endif
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
-        b.CreateMProtect(mKernel->getSharedStateType(b), mKernelSharedHandle, CBuilder::Protect::WRITE);
+        b.CreateMProtect(mKernel->getSharedStateType(b.getContext()), mKernelSharedHandle, CBuilder::Protect::WRITE);
     }
 
     if (LLVM_UNLIKELY(mKernelIsInternallySynchronized || mKernelRequiresIllustratorObject || mHasPipelineIllustratedStreamSet)) {
@@ -333,7 +333,7 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
     }
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
-        b.CreateMProtect(mKernel->getSharedStateType(b), mKernelSharedHandle, CBuilder::Protect::NONE);
+        b.CreateMProtect(mKernel->getSharedStateType(b.getContext()), mKernelSharedHandle, CBuilder::Protect::NONE);
     }
 
 }
@@ -370,8 +370,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
             SmallVector<char, 256> tmp;
             raw_svector_ostream out(tmp);
 
-            const auto flags = mKernel->getInternalStateTypeFlags();
-            Function * const func = mKernel->getDoSegmentFunction(b, flags, true);
+            Function * const func = mKernel->getDoSegmentFunction(b, true);
 
             out << mKernel->getName() << ": "
                 "invalid argument type for ";
@@ -428,7 +427,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
             offset[0] = i32_ZERO;
             offset[1] = i32_ZERO;
             offset[2] = i32_ZERO;
-            Value * const branchTypePtr = b.CreateGEP(mKernel->getThreadLocalStateType(b), mKernelThreadLocalHandle, offset);
+            Value * const branchTypePtr = b.CreateGEP(mKernel->getThreadLocalStateType(b.getContext()), mKernelThreadLocalHandle, offset);
             b.CreateStore(mOptimizationBranchSelectedBranch, branchTypePtr);
         }
         addNextArg(mKernelThreadLocalHandle);

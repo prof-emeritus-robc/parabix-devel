@@ -57,8 +57,8 @@ namespace pablo {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> PabloKernel::instantiateKernelCompiler(KernelBuilder & /* b */, llvm::TargetMachine * TM) {
-    return std::make_unique<PabloCompiler>(const_cast<PabloKernel *>(this), TM);
+std::unique_ptr<KernelCompiler> PabloKernel::instantiateKernelCompiler(KernelBuilder & /* b */) {
+    return std::make_unique<PabloCompiler>(const_cast<PabloKernel *>(this));
 }
 
 Var * PabloKernel::getInputStreamVar(const std::string & name) {
@@ -180,7 +180,7 @@ Ones * PabloKernel::getAllOnesValue(Type * type) {
     return value;
 }
 
-void PabloKernel::addInternalProperties(KernelBuilder & b) {
+void PabloKernel::addInternalProperties(KernelBuilder & b, TargetMachine *TM) {
     mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
     auto & C = b.getContext();
     mContext = &C;

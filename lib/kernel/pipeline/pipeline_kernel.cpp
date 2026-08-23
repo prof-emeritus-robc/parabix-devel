@@ -86,8 +86,8 @@ void terminatePAPI(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInternalKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::addInternalProperties(KernelBuilder & b) {
-    COMPILER->generateImplicitKernels(b);
+void PipelineKernel::addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) {
+    COMPILER->generateImplicitKernels(b, TM);
     COMPILER->addPipelineKernelProperties(b);
 }
 
@@ -129,11 +129,11 @@ void PipelineKernel::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) {
+void PipelineKernel::addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM) {
     for (const auto & k : mKernels) {
-        k.Object->addKernelDeclarations(b);
+        k.Object->addKernelDeclarations(b, TM);
     }
-    Kernel::addKernelDeclarations(b, kernelStateFlags);
+    Kernel::addKernelDeclarations(b, TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -443,8 +443,8 @@ void PipelineKernel::setOutputScalarAt(const unsigned i, Scalar * const value) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine *TM) {
-    return std::make_unique<PipelineCompiler>(b, const_cast<PipelineKernel *>(this), TM);
+std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b) {
+    return std::make_unique<PipelineCompiler>(b, const_cast<PipelineKernel *>(this));
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -507,12 +507,11 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder 
  ** ------------------------------------------------------------------------------------------------------------- */
 Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const MainMethodGenerationType method) const {
 
-    const auto flags = getInternalStateTypeFlags();
     unsigned suppliedArgs = 1; // segment size
-    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         suppliedArgs += 1;
     }
-    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
+    if (LLVM_LIKELY(mThreadLocalStateType)) {
         suppliedArgs += 1;
     }
     const auto tdb = allocatesInternalStreamSets() && codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers);
@@ -521,10 +520,10 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     }
 
     Module * const m = b.getModule();
-    Function * const doSegment = getDoSegmentFunction(b, flags, true);
+    Function * const doSegment = getDoSegmentFunction(b, true);
     assert (doSegment->arg_size() >= suppliedArgs);
    //  const auto numOfDoSegArgs = doSegment->arg_size() - suppliedArgs;
-    Function * const terminate = getFinalizeFunction(b, flags, true);
+    Function * const terminate = getFinalizeFunction(b, true);
 
     const auto numOfStreamSets = mInputStreamSets.size() + mOutputStreamSets.size();
 
@@ -770,16 +769,16 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
     InitArgs args;
     sharedHandle = constructFamilyKernels(b, args, paramMap, toFree);
-    assert (((flags & Kernel::KernelIsStateful) != 0) == (sharedHandle != nullptr));
+    assert (((mSharedStateType) != 0) == (sharedHandle != nullptr));
 
     size_t argCount = 0;
-    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         segmentArgs[argCount++] = sharedHandle;
     }
     Value * threadLocalHandle = nullptr;
-    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
+    if (LLVM_LIKELY(mThreadLocalStateType)) {
         SmallVector<Value *, 2> args;
-        if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             args.push_back(sharedHandle);
         }
         args.push_back(ConstantPointerNull::get(unqualPtrTy));
@@ -811,9 +810,9 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
         ConstantInt * const sz_BufferSize = b.getSize(segLength * codegen::BufferSegments);
 
-        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b, flags, true);
+        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b, true);
         SmallVector<Value *, 4> allocArgs;
-        if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             allocArgs.push_back(sharedHandle);
         }
         // pass in the desired number of segments
@@ -824,10 +823,10 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
             allocArgs.push_back(nil);
         }
         b.CreateCall(allocShared->getFunctionType(), allocShared, allocArgs);
-        if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
-            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b, flags, true);
+        if (LLVM_LIKELY(mThreadLocalStateType)) {
+            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b, true);
             SmallVector<Value *, 3> allocArgs;
-            if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+            if (LLVM_LIKELY(mSharedStateType)) {
                 allocArgs.push_back(sharedHandle);
             }
             allocArgs.push_back(threadLocalHandle);
@@ -883,10 +882,10 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         END_SCOPED_REGION
     }
     SmallVector<Value *, 3> finalizeArgs;
-    if (LLVM_LIKELY(flags & Kernel::KernelIsStateful)) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         finalizeArgs.push_back(sharedHandle);
     }
-    if (LLVM_LIKELY(flags & Kernel::KernelHasThreadLocal)) {
+    if (LLVM_LIKELY(mThreadLocalStateType)) {
         finalizeArgs.push_back(threadLocalHandle);
         finalizeArgs.push_back(threadLocalHandle);
         finalizeThreadLocalInstance(b, finalizeArgs);

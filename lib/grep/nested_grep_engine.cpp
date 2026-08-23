@@ -181,8 +181,13 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
         mGrepDriver.generateUncachedKernels();
 
         for (Kernel * K : pipeline) {
-            const auto kernelFlags = K->getInternalStateTypeFlags();
-            char flags = '0' + kernelFlags;
+            char flags = '0';
+            if (K->getSharedStateType()) {
+                flags += 1;
+            }
+            if (LLVM_UNLIKELY(K->getThreadLocalStateType())) {
+                flags += 2;
+            }
             if (LLVM_UNLIKELY(K->allocatesInternalStreamSets())) {
                 flags += 4;
             }

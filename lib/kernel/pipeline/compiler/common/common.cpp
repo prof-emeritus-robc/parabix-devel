@@ -281,7 +281,7 @@ bool PipelineCommonGraphFunctions::isKernelStateFree(KernelBuilder & b, const si
         // belonging to the same family would have none too.
         return false;
     } else { // check if we have only a (non-mutable) input scalar
-        StructType * const st = kernelObj->getSharedStateType(b);
+        StructType * const st = kernelObj->getSharedStateType();
         if (st) {
             // If this state object only contains input scalars then it has no run-time mutable state
             const auto n = st->getStructNumElements();

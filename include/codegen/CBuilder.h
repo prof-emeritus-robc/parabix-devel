@@ -428,6 +428,10 @@ public:
 
     static llvm::Type * convertTypeToLLVMContext(llvm::LLVMContext & C, llvm::Type * type);
 
+    static llvm::Value * convertValueToLLVMContext(llvm::Module * M, llvm::Value * value);
+
+    static llvm::Metadata * convertMetadataToLLVMContext(llvm::Module * M, llvm::Metadata * meta);
+
     static llvm::Constant * convertConstantToLLVMContext(llvm::LLVMContext & C, llvm::Constant * constant);
 
 public:
@@ -497,7 +501,7 @@ protected:
 
     llvm::Module *                  mModule;
     unsigned                        mCacheLineAlignment;
-    FunctionLinkCallback *          mLinkCallback;
+    FunctionLinkCallback *          mLinkCallback = nullptr;
     const std::string               mTriple;
     #ifdef ENABLE_LIBBACKTRACE
     void *                          mBacktraceState = nullptr;

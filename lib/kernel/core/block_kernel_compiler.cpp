@@ -317,8 +317,8 @@ void BlockKernelCompiler::generateDefaultFinalBlockMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
-BlockKernelCompiler::BlockKernelCompiler(BlockOrientedKernel * const kernel, TargetMachine * TM) noexcept
-: KernelCompiler(kernel, TM) {
+BlockKernelCompiler::BlockKernelCompiler(BlockOrientedKernel * const kernel) noexcept
+: KernelCompiler(kernel) {
 
 }
 

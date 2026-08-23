@@ -121,9 +121,9 @@ public:
         return mLengthAssertions;
     }
 
-    void addKernelDeclarations(KernelBuilder & b, const unsigned kernelStateFlags) final;
+    void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b, llvm::TargetMachine * TM) final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
     ~PipelineKernel() override;
 
@@ -197,7 +197,7 @@ private:
 
     void addAdditionalFunctions(KernelBuilder & b) final;
 
-    void addInternalProperties(KernelBuilder & b) final;
+    void addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
     void generateInitializeMethod(KernelBuilder & b) final;
 

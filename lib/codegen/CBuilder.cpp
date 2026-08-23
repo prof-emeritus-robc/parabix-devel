@@ -78,7 +78,7 @@ static constexpr auto ALIGNED_ALLOC_NAME = "std_aligned_alloc";
 #endif
 #endif
 
-typedef llvm::Align         AlignType;
+using AlignType = llvm::Align;
 
 using FixedVectorType = llvm::FixedVectorType;
 
@@ -1529,7 +1529,7 @@ CallInst * CBuilder::CreateMemMove(Value * Dst, Value * Src, Value *Size, const 
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemMove(Dst, AlignType{Align}, Src, AlignType{Align}, Size, isVolatile, TBAATag, ScopeTag, NoAliasTag);
 #else
-    llvm::AAMDNodes AAInfo;
+    AAMDNodes AAInfo;
     AAInfo.TBAA = TBAATag;
     AAInfo.Scope = ScopeTag;
     AAInfo.NoAlias = NoAliasTag;
@@ -1565,7 +1565,7 @@ CallInst * CBuilder::CreateMemCpy(Value *Dst, Value *Src, Value *Size, const uns
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemCpy(Dst, AlignType{Align}, Src, AlignType{Align}, Size, isVolatile, TBAATag, TBAAStructTag, ScopeTag, NoAliasTag);
 #else
-    llvm::AAMDNodes AAInfo;
+    AAMDNodes AAInfo;
     AAInfo.TBAA = TBAATag;
     AAInfo.TBAAStruct = TBAAStructTag;
     AAInfo.Scope = ScopeTag;
@@ -1592,7 +1592,7 @@ CallInst * CBuilder::CreateMemSet(Value * Ptr, Value * Val, Value * Size, const 
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemSet(Ptr, Val, Size, AlignType{Align}, isVolatile, TBAATag, ScopeTag, NoAliasTag);
 #else
-    llvm::AAMDNodes AAInfo;
+    AAMDNodes AAInfo;
     AAInfo.TBAA = TBAATag;
     AAInfo.Scope = ScopeTag;
     AAInfo.NoAlias = NoAliasTag;
@@ -1650,7 +1650,7 @@ AllocaInst * CBuilder::CreateAlignedAlloca(Type * const Ty, const unsigned Align
     return alloca;
 }
 
-AllocaInst * CBuilder::CreateAlignedAllocaAtEntryPoint(llvm::Type * const Ty, const unsigned alignment, llvm::Value * const ArraySize) {
+AllocaInst * CBuilder::CreateAlignedAllocaAtEntryPoint(Type * const Ty, const unsigned alignment, Value * const ArraySize) {
     auto BB = GetInsertBlock();
     auto F = BB->getParent();
     auto entryBlock = F->begin();
@@ -2023,7 +2023,7 @@ bool RemoveRedundantAssertionsPass::runOnModule(Module & M) {
                         return ci.isIndirectCall();
                     };
                     if (!(ci.getCalledFunction() || isIndirectCall())) {
-                        auto & out = llvm::errs();
+                        auto & out = errs();
                         B.print(out);
                         errs() << "\n\n";
                         ci.print(out);
@@ -2264,7 +2264,7 @@ ConstantInt * LLVM_READNONE CBuilder::getTypeSize(Type * type, IntegerType * val
     return ConstantInt::get(valType, getTypeSize(dl, type));
 }
 
-uintptr_t LLVM_READNONE CBuilder::getTypeSize(const llvm::DataLayout & DL, llvm::Type * type) {
+uintptr_t LLVM_READNONE CBuilder::getTypeSize(const DataLayout & DL, Type * type) {
     uintptr_t size = 0;
     if (LLVM_LIKELY(type != nullptr)) {
         size = DL.getTypeAllocSize(type).getFixedValue();
@@ -2272,7 +2272,7 @@ uintptr_t LLVM_READNONE CBuilder::getTypeSize(const llvm::DataLayout & DL, llvm:
     return size;
 }
 
-uintptr_t LLVM_READNONE CBuilder::getAlignOf(const llvm::DataLayout & DL, llvm::Type * type) {
+uintptr_t LLVM_READNONE CBuilder::getAlignOf(const DataLayout & DL, Type * type) {
     assert (type);
     if (isa<StructType>(type)) {
         const auto l = cast<StructType>(type)->getStructNumElements();
@@ -2404,6 +2404,51 @@ Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertValueToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * CBuilder::convertValueToLLVMContext(Module * M, Value * value) {
+    auto & C = M->getContext();
+    if (&value->getContext() == &C) {
+        return value;
+    }
+    if (isa<Constant>(value)) {
+        return convertConstantToLLVMContext(C, cast<Constant>(value));
+    }
+    llvm_unreachable("unknown value type?");
+    return nullptr;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertMetadataToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Metadata * CBuilder::convertMetadataToLLVMContext(Module * M, Metadata * meta) {
+    auto & C = M->getContext();
+    if (isa<MDString>(meta)) {
+       return  MDString::get(C, cast<MDString>(meta)->getString());
+    }
+    if (isa<ConstantAsMetadata>(meta)) {
+        Constant * value = convertConstantToLLVMContext(C, cast<ConstantAsMetadata>(meta)->getValue());
+        return (Metadata *)ConstantAsMetadata::get(value);
+    }
+    if (isa<ValueAsMetadata>(meta)) {
+        Value * value = convertValueToLLVMContext(M, cast<ValueAsMetadata>(meta)->getValue());
+        return (Metadata *)ValueAsMetadata::get(value);
+    }
+    if (isa<MDNode>(meta)) {
+        SmallVector<Metadata *, 8> ops;
+        for (Metadata * op : cast<MDNode>(meta)->operands()) {
+            ops.push_back(convertMetadataToLLVMContext(M, op));
+        }
+        if (cast<MDNode>(meta)->isDistinct()) {
+            return MDNode::getDistinct(C, ops);
+        } else {
+            return MDNode::get(C, ops);
+        }
+    }
+    llvm_unreachable("unknown metadata type?");
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief convertConstantToLLVMContext
  ** ------------------------------------------------------------------------------------------------------------- */
 Constant * CBuilder::convertConstantToLLVMContext(LLVMContext & C, Constant * constant) {
@@ -2442,6 +2487,16 @@ Constant * CBuilder::convertConstantToLLVMContext(LLVMContext & C, Constant * co
         }
         if (isa<ConstantFP>(constant)) {
             return ConstantFP::get(newType, cast<ConstantFP>(constant)->getValue());
+        }
+        if (isa<ConstantExpr>(constant)) {
+            const ConstantExpr * const cv = cast<ConstantExpr>(constant);
+            const auto numElements = cv->getNumOperands();
+            assert (numElements <= 2);
+            FixedArray<Constant *, 2> ops;
+            for (unsigned i = 0; i < numElements; ++i) {
+                ops[i] = convertConstant(cv->getOperand(i));
+            }
+            return ConstantExpr::get(cv->getOpcode(), ops[0], ops[1]);
         }
         llvm_unreachable("Unhandled Constant type?");
     };

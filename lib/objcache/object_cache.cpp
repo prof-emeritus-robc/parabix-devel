@@ -68,8 +68,6 @@ const static auto CACHE_PREFIX = PARABIX_VERSION +
                           HOUR_1, HOUR_2, MINUTE_1, MINUTE_2, SECOND_1, SECOND_2,
                           '_'};
 
-const static auto CACHEABLE = "cacheable";
-
 const static auto SIGNATURE = "signature";
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -93,24 +91,22 @@ inline bool isNonMatchingSignature(const MDString * const received, const String
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedObjectFile
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * kernel, Module & M) noexcept {
-
-
+std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept {
 
     // Have we already seen this signature before? if so, we can safely assume that the ExecutionEngine
     // will have a compiled module for this kernel when we execute the pipeline.
 
     Path fileName(mCachePath);
     sys::path::append(fileName, CACHE_PREFIX);
-    const auto & moduleId = M.getModuleIdentifier();
+    const auto moduleId = kernel->makeCacheName(builder);
     fileName.append(moduleId);
     fileName.append(KERNEL_FILE_EXTENSION);
     auto kernelBuffer = MemoryBuffer::getFile(fileName, false, false, false);
     if (kernelBuffer) {
-        auto loadedFile = getOwningLazyBitcodeModule(std::move(kernelBuffer.get()), M.getContext());
+        auto loadedFile = getOwningLazyBitcodeModule(std::move(kernelBuffer.get()), builder.getContext());
         if (LLVM_LIKELY(loadedFile)) {
 
-            const Module * const H = loadedFile.get().get();
+            Module * const H = loadedFile.get().get();
 
             if (LLVM_UNLIKELY(kernel->hasSignature())) {
                 const MDString * const sig = kernel::Kernel::readSignatureFromModule(H);
@@ -127,16 +123,8 @@ std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(ker
             sys::path::replace_extension(fileName, OBJECT_FILE_EXTENSION);
             auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), false, false, false);
             if (LLVM_LIKELY(objectBuffer)) {
-                for (const Function & f : H->getFunctionList()) {
-                    Function::Create(f.getFunctionType(), Function::ExternalLinkage, f.getName(), M);
-                }
-                for (const auto & og : H->named_metadata()) {
-                    NamedMDNode * const md = M.getOrInsertNamedMetadata(og.getName());
-                    const auto n = og.getNumOperands();
-                    for (unsigned i = 0; i < n; ++i) {
-                        md->addOperand(og.getOperand(i));
-                    }
-                }
+
+                kernel->loadCachedKernel(H);
 
                 // defaults to <path>/<moduleId>.kernel
                 auto obj = std::move(*objectBuffer);
@@ -159,35 +147,17 @@ std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(ker
     return nullptr;
 }
 
-
-
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief markModuleAsCacheable
- ** ------------------------------------------------------------------------------------------------------------- */
-void ParabixObjectCache::markModuleAsCacheable(kernel::Kernel * const kernel, Module * module) {
-//    module->getOrInsertNamedMetadata(CACHEABLE);
-//    if (LLVM_UNLIKELY(kernel->hasSignature())) {
-//        NamedMDNode * const md = module->getOrInsertNamedMetadata(SIGNATURE);
-//        assert (md->getNumOperands() == 0);
-//        MDString * const sig = MDString::get(module->getContext(), signature);
-//        assert (!isNonMatchingSignature(sig, signature));
-//        md->addOperand(MDNode::get(module->getContext(), {sig}));
-//    }
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief notifyObjectCompiled
+ * @brief saveCachedObjectFile
  *
  * A new module has been compiled. If it is cacheable and no conflicting module exists, write it out.
  ** ------------------------------------------------------------------------------------------------------------- */
-void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef Obj) {
+void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBufferRef Obj) noexcept {
 
-    auto moduleId = M->getModuleIdentifier();
+    auto moduleId = M.getModuleIdentifier();
 
     // Store back into the memory buffer cache system
     mCachedObject[moduleId] = Obj;
-
-    if (M->getNamedMetadata(CACHEABLE) == nullptr) return;
 
     Path objectName(mCachePath);
     sys::path::append(objectName, CACHE_PREFIX);
@@ -225,28 +195,21 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
     }
 
     // Clone the function prototypes and metadata to minimize the size of the stored .kernel file.
-    std::unique_ptr<Module> H(new Module(moduleId, M->getContext()));
-    H->setTargetTriple(M->getTargetTriple());
-    H->setDataLayout(M->getDataLayout());
-    for (const Function & f : M->getFunctionList()) {
+    std::unique_ptr<Module> H(new Module(moduleId, M.getContext()));
+    H->setTargetTriple(M.getTargetTriple());
+    H->setDataLayout(M.getDataLayout());
+    for (const Function & f : M.getFunctionList()) {
         if (f.hasExternalLinkage() && !f.empty()) {
             Function::Create(f.getFunctionType(), Function::ExternalLinkage, f.getName(), H.get());
         }
     }
-    for (const auto & og : M->named_metadata()) {
+    for (const auto & og : M.named_metadata()) {
         NamedMDNode * const md = H->getOrInsertNamedMetadata(og.getName());
         const auto n = og.getNumOperands();
         for (unsigned i = 0; i < n; ++i) {
             md->addOperand(og.getOperand(i));
         }
     }
-    #ifndef NDEBUG
-    assert ((getSignature(M) == nullptr) ^ (getSignature(H.get()) != nullptr));
-    if (getSignature(M)) {
-        assert (getSignature(H.get()));
-        assert (getSignature(M)->getString() == getSignature(H.get())->getString());
-    }
-    #endif
 
     WriteBitcodeToFile(*H, kernelFile);
     kernelFile.close();
@@ -254,19 +217,6 @@ void ParabixObjectCache::notifyObjectCompiled(const Module * M, MemoryBufferRef 
     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
         errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
     }
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getObject
- ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<MemoryBuffer> ParabixObjectCache::getObject(const Module * module) {
-//    auto moduleId = module->getModuleIdentifier();
-//    auto f = mCachedObject.find(moduleId);
-//    if (f != mCachedObject.end()) {
-//        auto ref = f->second;
-//        return MemoryBuffer::getMemBuffer(ref.getBuffer(), ref.getBufferIdentifier(), false);
-//    }
-    return nullptr;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -420,13 +370,7 @@ inline void ParabixObjectCache::saveCacheSettings() noexcept {
 
 }
 
-ParabixObjectCache::ParabixObjectCache(BaseDriver & driver)
-: mDriver(driver) {
+ParabixObjectCache::ParabixObjectCache() {
     loadCacheSettings();
     initiateCacheCleanUp();
 }
-
-/** ------------------------------------------------------------------------------------------------------------- *
-+* @brief destructor
-+** ------------------------------------------------------------------------------------------------------------- */
-ParabixObjectCache::~ParabixObjectCache() { }

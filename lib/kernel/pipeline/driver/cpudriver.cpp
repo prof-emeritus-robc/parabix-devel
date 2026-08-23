@@ -6,6 +6,7 @@
 #include <llvm/ExecutionEngine/ExecutionEngine.h>  // for EngineBuilder
 #include <llvm/ExecutionEngine/RTDyldMemoryManager.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
+#include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/InitializePasses.h>                 // for initializeCodeGencd .
 #include <llvm/PassRegistry.h>                     // for PassRegistry
 #include <llvm/Support/CodeGen.h>                  // for Level, Level::None
@@ -13,6 +14,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/FileSystem.h>
 #include <llvm/Support/Timer.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <objcache/object_cache.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/pipeline_builder.h>
@@ -72,13 +74,13 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
     llvm::orc::SymbolMap &                  SharedSymbolList;
     llvm::orc::SymbolMap                    NewSymbolList;
 
-    CPUDriverContext(std::unique_ptr<LLVMContext> ctx, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, SymbolMap & symbolList)
+    CPUDriverContext(std::unique_ptr<LLVMContext> ctx, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, SymbolMap & symbolList)
     : ThreadSafeContext(std::move(ctx))
     , TargetKernel(nullptr)
     , IsCompilingMainFunction(0)
     , TargetMachine(cantFail(JTMB.createTargetMachine()))
     , Builder(IDISA::GetIDISA_Builder(*getContext(), features))
-    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, ObjCache))
+    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, nullptr))
     , CurrentModule(nullptr)
     , Engine(nullptr)
     , SharedSymbolList(symbolList) {
@@ -88,10 +90,11 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
     }
 
     llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
-        assert (CurrentModule && (&functionType->getContext() == &CurrentModule->getContext()));
         Function * f = CurrentModule->getFunction(unmangledName);
         if (LLVM_UNLIKELY(f == nullptr)) {
-            f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, CurrentModule);
+            auto & C = CurrentModule->getContext();
+            FunctionType * funcTy = cast<FunctionType>(CBuilder::convertTypeToLLVMContext(C, functionType));
+            f = Function::Create(funcTy, Function::ExternalLinkage, unmangledName, CurrentModule);
             assert (Engine);
             auto & ES = Engine->getExecutionSession();
             auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
@@ -120,9 +123,9 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
 class CPUDriverContextPool {
 public:
 
-    CPUDriverContextPool(const size_t count, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, ObjectCache * ObjCache, SymbolMap & symbolList) {
+    CPUDriverContextPool(const size_t count, JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, SymbolMap & symbolList) {
         for (size_t i = 0; i < count; ++i) {
-            Contexts.push(std::make_unique<CPUDriverContext>(std::make_unique<LLVMContext>(), JTMB, features, ObjCache, symbolList));
+            Contexts.push(std::make_unique<CPUDriverContext>(std::make_unique<LLVMContext>(), JTMB, features, symbolList));
         }
     }
 
@@ -150,49 +153,77 @@ private:
 
 } // end of anon namespace
 
+struct CPUDriverMaterializationData {
+    IRCompileLayer & TargetLayer;
+    SymbolDependenceMap & PriorSymbolLayer;
+    CPUDriverContextPool & Pool;
+    ParabixObjectCache * const ObjectCache;
+    LLJIT * const Engine;
+};
 
+using PriorityType = uint32_t;
 
-// Modified version of llvm ConcurrentIRCompiler
-class CPUDriverKernelCompiler : public orc::IRCompileLayer::IRCompiler {
+// TODO using InitSymbol for the interface, we can return a result using getInitializerSymbol for the MU.
+// Split the kernel gen to have a decl phase and add dependencies between the gen and decl plus the decl and
+// all pipeline decl phases. Need to carry kernel compiler with context. This means two or more materialiationunits
+// would have to move the same thread safe module. However since we cannot construct the TSM until after the decl unit
 
+class KernelGenerationMU : public orc::MaterializationUnit {
 public:
-
-    CPUDriverKernelCompiler(JITTargetMachineBuilder & JTMB, ParabixObjectCache * const objCache)
-    : orc::IRCompileLayer::IRCompiler(irManglingOptionsFromTargetOptions(JTMB.getOptions()))
-    , Pool(nullptr)
-    , ObjectCache(objCache) {
-
+    KernelGenerationMU(Kernel * target, Module * module,
+                       ParabixObjectCache * objCache,
+                       LLJIT * engine,
+                       SymbolFlagsMap && symbols,
+                       CPUDriverContextPool & pool)
+    : MaterializationUnit(createInterface(target, std::move(symbols)))
+    , Target(target)
+    , TargetModule(module)
+    , ObjectCache(objCache)
+    , Engine(engine)
+    , Pool(pool) {
+        assert (TargetModule);
     }
 
-    void setPool(CPUDriverContextPool * pool) {
-        Pool = pool;
+    StringRef getName() const override {
+        return StringRef{"0_", 1};
     }
 
-    void setEngine(LLJIT * engine) {
-        Engine = engine;
-    }
+    void materialize(std::unique_ptr<MaterializationResponsibility> R) override {
 
-    // override the actual orc compiler routine to
-    Expected<std::unique_ptr<MemoryBuffer>> operator()(Module & M) override {
-        // TODO: use a threadpool with a fixed number of expected threads to avoid reconstructing the builder and compiler objects
-        auto ctx = static_cast<CPUDriverContext *>(M.getContext().getDiagnosticContext()); assert (ctx);
+        auto ctx = Pool.acquire();
 
-        // TODO: need to do the IR lookup from the object cache here
+        auto & C = *ctx->getContext();
 
-        Kernel * const K = ctx->TargetKernel;
-        auto & C = M.getContext();
-        assert (ctx->getContext() == &C);
+        // We can't be sure that the context associated with the decl is the same
+        // one that we acquired here. However since we cannot control the order of
+        // which materialization tasks will fire, it's better to just regenerate the
+        // state type metadata as needed or we risk deadlocking the system.
+        Module * M = TargetModule; assert (M);
+        if (&M->getContext() != &C) {
+            M = new Module(TargetModule->getModuleIdentifier(), C);
+            for (const auto & og : TargetModule->named_metadata()) {
+                NamedMDNode * const md = M->getOrInsertNamedMetadata(og.getName());
+                const auto n = og.getNumOperands();
+                for (unsigned i = 0; i < n; ++i) {
+                    auto val = CBuilder::convertMetadataToLLVMContext(M, og.getOperand(i));
+                    md->addOperand(cast<MDNode>(val));
+                }
+            }
+            delete TargetModule;
+        }
 
         auto & builder = *ctx->Builder;
-
-        ctx->CurrentModule = &M;
+        assert (&builder.getContext() == &C);
+        builder.setModule(M);
+        ctx->CurrentModule = M;
         ctx->Engine = Engine;
-        builder.setModule(&M);
 
-        M.setTargetTriple(Engine->getTargetTriple().getTriple());
-        M.setDataLayout(Engine->getDataLayout());
+        errs() << "0: K_" << M->getModuleIdentifier() << "\n";
 
-        K->linkExternalMethods(builder);
+        M->setTargetTriple(Engine->getTargetTriple().getTriple());
+        M->setDataLayout(Engine->getDataLayout());
+
+        Target->linkExternalMethods(builder);
 
         auto & SL = ctx->NewSymbolList;
 
@@ -214,74 +245,132 @@ public:
             SL.clear();
         }
 
-        auto optLevel = CodeGenOptLevel::Default;
-        if (LLVM_LIKELY(ctx->IsCompilingMainFunction == 0)) {
+        BEGIN_SCOPED_REGION
+        NamedRegionTimer T(Target->getSignature(), Target->getName(),
+                           "Kernel", "Kernel Generation",
+                           codegen::TimeKernelsIsEnabled);
 
-            NamedRegionTimer T(K->getSignature(), K->getName(),
-                               "Kernel", "Kernel Generation",
-                               codegen::TimeKernelsIsEnabled);
+        Target->generateKernel(builder, ctx->TargetMachine.get());
+        END_SCOPED_REGION
 
-            if (LLVM_LIKELY(ObjectCache && K->isCachable())) {
-                auto cached = ObjectCache->loadCachedObjectFile(builder, K, M);
-                if (cached) {
-                    Pool->release(ctx);
-                    return cached;
-                }
-            }
+        BEGIN_SCOPED_REGION
 
-            K->generateKernel(builder, ctx->TargetMachine.get());
-            if (LLVM_UNLIKELY(K->hasAttribute(AttrId::InfrequentlyUsed))) {
-                optLevel = codegen::BackEndOptLevel;
-            }
-
-        } else {
-
-            // Build the "main" module frame context execution pipeline
-            K->addKernelDeclarations(builder);
-            K->addOrDeclareMainFunction(builder, Kernel::AddInternal);
-
-        }
-
-        NamedRegionTimer T(M.getModuleIdentifier(), "",
+        NamedRegionTimer T(M->getModuleIdentifier(), "",
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
+        auto optLevel = CodeGenOptLevel::Default;
+        if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
+            optLevel = codegen::BackEndOptLevel;
+        }
         ctx->TargetMachine->setOptLevel(optLevel);
-        auto result = ctx->Compiler->operator()(M);
-        // M.dropAllReferences();
-        Pool->release(ctx);
-        return result;
+        auto result = ctx->Compiler->operator()(*M);
+        Pool.release(ctx);
+
+        if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
+            ObjectCache->saveCachedObjectFile(*M, MemoryBufferRef{*result.get()});
+        }
+
+        delete M;
+
+        auto & JITLib = Engine->getMainJITDylib();
+        cantFail(Engine->addObjectFile(JITLib, std::move(*result)));
+
+        cantFail(R->notifyEmitted());
+
+        END_SCOPED_REGION
+
+    }
+
+    void discard(const JITDylib &, const SymbolStringPtr &) override {
+        /* this MU adds the symbols for the IR it has yet to generate. do not discard any symbols. */
+    }
+
+    static Interface createInterface(Kernel * const target, SymbolFlagsMap && symbols)  {
+        return Interface(std::move(symbols), nullptr);
     }
 
 private:
 
-    CPUDriverContextPool * Pool = nullptr;
+    Kernel * const Target;
+    Module * const TargetModule;
     ParabixObjectCache * const ObjectCache;
-    LLJIT * Engine = nullptr;
-
+    LLJIT * const Engine;
+    CPUDriverContextPool & Pool;
 };
 
-class KernelGenerationMU : public orc::MaterializationUnit {
+class KernelDeclarationMU : public orc::MaterializationUnit {
 public:
-    KernelGenerationMU(Kernel * target, MangleAndInterner & mangler, orc::SymbolLookupSet & lookupSet,
-                       IRCompileLayer & targetLayer, CPUDriverContextPool & pool)
+    KernelDeclarationMU(const PriorityType declLayer,
+                        Kernel * target, MangleAndInterner & mangler,
+                        orc::SymbolLookupSet & lookupSet,
+                        ParabixObjectCache * objCache,
+                        LLJIT * engine,
+                        CPUDriverContextPool & pool)
     : MaterializationUnit(createInterface(target, mangler, lookupSet))
     , Target(target)
-    , TargetLayer(targetLayer)
-    , Pool(pool) {
+    , ObjectCache(objCache)
+    , Engine(engine)
+    , Pool(pool)
+    , DeclLayer(std::to_string(declLayer) + "_") {
 
     }
 
-    StringRef getName() const override { return "<KernelGenerationMU>"; }
+    StringRef getName() const override {
+        return StringRef{DeclLayer};
+    }
 
     void materialize(std::unique_ptr<MaterializationResponsibility> R) override {
+
+        // TODO: is this safe? we may end up executing this MU many times before the emit'ed layer?
+
         auto ctx = Pool.acquire();
         assert (&ctx->Builder->getContext() == ctx->getContext());
-        ctx->TargetKernel = Target; assert (Target);
-        ctx->IsCompilingMainFunction = 0;
-        Module * const M = Target->makeEmptyModule(*ctx->Builder);
-        ThreadSafeModule TSM(std::unique_ptr<Module>(M), *ctx);
-        TargetLayer.emit(std::move(R), std::move(TSM));
+
+        auto & builder = *ctx->Builder;
+
+        if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
+            auto cached = ObjectCache->loadCachedObjectFile(builder, Target);
+            if (cached) {
+                Pool.release(ctx);
+                auto & JITLib = Engine->getMainJITDylib();
+                cantFail(Engine->addObjectFile(JITLib, std::move(cached)));
+//                SymbolFlagsMap map;
+//                Target->addSymbols(mangler, map, lookupSet);
+//                R->notifyResolved(map);
+                return;
+            }
+        }
+
+        Module * const M = Target->makeEmptyModule(builder); assert (M);
+
+        errs() << DeclLayer << ": D_" << M->getModuleIdentifier() << "\n";
+
+        builder.setModule(M);
+        ctx->CurrentModule = M;
+        ctx->Engine = Engine;
+
+        Target->declareKernel(builder, ctx->TargetMachine.get());
+
+        cantFail(R->notifyEmitted());
+
+        Pool.release(ctx);
+
+        auto & ES = R->getExecutionSession();
+
+        MangleAndInterner mangler(ES, Engine->getDataLayout());
+        SymbolFlagsMap symbols;
+        Target->addSymbols(mangler, symbols);
+
+       // cantFail(R->defineMaterializing(symbols));
+
+        auto genTask = std::make_unique<KernelGenerationMU>(Target, M, ObjectCache, Engine, std::move(symbols), Pool);
+
+//        auto & MainJD = Engine->getMainJITDylib();
+//        cantFail(MainJD.define(std::move(genTask)));
+
+        ES.dispatchTask(std::make_unique<MaterializationTask>(std::move(genTask), std::move(R)));
+
     }
 
     void discard(const JITDylib &, const SymbolStringPtr &) override {
@@ -289,39 +378,109 @@ public:
     }
 
     static Interface createInterface(Kernel * const target, MangleAndInterner & mangler, orc::SymbolLookupSet & lookupSet)  {
-        SymbolFlagsMap map;
-        target->addSymbols(mangler, map, lookupSet);
-        return Interface(std::move(map), nullptr);
+        auto sym = mangler(target->getName());
+        lookupSet.add(sym, orc::SymbolLookupFlags::WeaklyReferencedSymbol);
+        SymbolFlagsMap symbols{};
+        symbols.insert(std::make_pair(sym, JITSymbolFlags::Exported | JITSymbolFlags::MaterializationSideEffectsOnly));
+        return Interface(std::move(symbols), sym);
     }
 
 private:
 
     Kernel * const Target;
-    IRCompileLayer & TargetLayer;
+    ParabixObjectCache * const ObjectCache;
+    LLJIT * const Engine;
     CPUDriverContextPool & Pool;
+    const std::string DeclLayer;
 };
+
 
 class MainGenerationMU : public orc::MaterializationUnit {
 public:
-    MainGenerationMU(Kernel * target, SymbolStringPtr mainSymbol, orc::SymbolLookupSet & lookupSet,
-                       IRCompileLayer & targetLayer, CPUDriverContextPool & pool)
+    MainGenerationMU(const PriorityType declLayer,
+                     Kernel * target, SymbolStringPtr mainSymbol, orc::SymbolLookupSet & lookupSet,
+                     LLJIT * engine,
+                     CPUDriverContextPool & pool)
     : MaterializationUnit(createInterface(mainSymbol, lookupSet))
     , Target(target)
-    , TargetLayer(targetLayer)
-    , Pool(pool) {
+    , Engine(engine)
+    , Pool(pool)
+    , DeclLayer(std::to_string(declLayer) + "_") {
 
     }
 
-    StringRef getName() const override { return "<MainGenerationMU>"; }
+    StringRef getName() const override {
+        return StringRef{DeclLayer};
+    }
 
     void materialize(std::unique_ptr<MaterializationResponsibility> R) override {
         auto ctx = Pool.acquire();
         assert (&ctx->Builder->getContext() == ctx->getContext());
-        ctx->TargetKernel = Target; assert (Target);
-        ctx->IsCompilingMainFunction = 1;
-       // R->addDependencies()
-        ThreadSafeModule TSM(std::make_unique<Module>("main", *ctx->getContext()), *ctx);
-        TargetLayer.emit(std::move(R), std::move(TSM));
+
+        auto M = std::make_unique<Module>("main", *ctx->getContext());
+        M->setTargetTriple(Engine->getTargetTriple().getTriple());
+        M->setDataLayout(Engine->getDataLayout());
+
+        errs() << DeclLayer << ": M_" << M->getModuleIdentifier() << "\n";
+
+        auto & builder = *ctx->Builder;
+        builder.setModule(M.get());
+        ctx->CurrentModule = M.get();
+        ctx->Engine = Engine;
+
+        Target->linkExternalMethods(builder);
+
+        auto & SL = ctx->NewSymbolList;
+
+        if (!SL.empty()) {
+            auto & MainJD = Engine->getMainJITDylib();
+            auto err = MainJD.define(orc::absoluteSymbols(SL));
+            if (err) {
+                handleAllErrors(std::move(err),
+                    [](const DuplicateDefinition &) {
+                        /* ignored */
+                    },
+                    [](const ErrorInfoBase & err) {
+                        SmallVector<char, 100> tmp;
+                        raw_svector_ostream msg(tmp);
+                        msg << "Cannot link symbol: " << err.message();
+                        report_fatal_error(msg.str());
+                    });
+            }
+            SL.clear();
+        }
+
+        // Build the "main" module frame context execution pipeline
+        Target->addKernelDeclarations(builder, ctx->TargetMachine.get());
+        Target->addOrDeclareMainFunction(builder, Kernel::AddInternal);
+
+        BEGIN_SCOPED_REGION
+
+        NamedRegionTimer T(M->getModuleIdentifier(), "",
+                           "Module", "Object Generation",
+                           codegen::TimeKernelsIsEnabled);
+
+        ctx->TargetMachine->setOptLevel(CodeGenOptLevel::Default);
+        auto result = ctx->Compiler->operator()(*M);
+        Pool.release(ctx);
+
+        auto & JITLib = Engine->getMainJITDylib();
+        auto err = Engine->addObjectFile(JITLib, std::move(*result));
+        if (err) {
+            handleAllErrors(std::move(err),
+                [](const DuplicateDefinition &) {
+                    /* ignored */
+                },
+                [](const ErrorInfoBase & err) {
+                    SmallVector<char, 100> tmp;
+                    raw_svector_ostream msg(tmp);
+                    msg << "Cannot link symbol: " << err.message();
+                    report_fatal_error(msg.str());
+                });
+        }
+        END_SCOPED_REGION
+
+        cantFail(R->notifyEmitted());
     }
 
     void discard(const JITDylib &, const SymbolStringPtr &) override {
@@ -329,17 +488,18 @@ public:
     }
 
     static Interface createInterface(SymbolStringPtr mainSymbol, orc::SymbolLookupSet & lookupSet)  {
-        SymbolFlagsMap symbols;
-        symbols.insert(std::make_pair(mainSymbol, JITSymbolFlags::Exported | JITSymbolFlags::Callable));
         lookupSet.add(mainSymbol, orc::SymbolLookupFlags::RequiredSymbol);
-        return Interface(std::move(symbols), nullptr);
+        SymbolFlagsMap symbols{};
+        symbols.insert(std::make_pair(mainSymbol, JITSymbolFlags::Exported));
+        return Interface(std::move(symbols), mainSymbol);
     }
 
 private:
 
     Kernel * const Target;
-    IRCompileLayer & TargetLayer;
+    LLJIT * const Engine;
     CPUDriverContextPool & Pool;
+    const std::string DeclLayer;
 };
 
 inline void removeAll(SymbolLookupSet & S) {
@@ -347,6 +507,248 @@ inline void removeAll(SymbolLookupSet & S) {
     while (k) {
         S.remove(--k);
     }
+}
+
+namespace {
+
+class CPUDriverTaskDispatcher : public TaskDispatcher {
+    struct TaskQueue {
+
+        TaskQueue(size_t initialCapacity = 64)
+        : Head(0), Tail(0), Buffer(initialCapacity, nullptr) {
+
+        }
+
+        void push(Task * task) {
+            //std::lock_guard<std::mutex> L(Mutex);
+            if (LLVM_UNLIKELY(((Tail + 1U) % Buffer.size()) == Head)) {
+                Buffer.resize(Buffer.size() * 2, nullptr);
+            }
+            Buffer[Tail] = task; assert (task);
+            Tail = (Tail + 1U) % Buffer.size();
+        }
+
+        bool pop(Task *& out) {
+            //std::lock_guard<std::mutex> L(Mutex);
+            if (Head == Tail) {
+                return false;
+            }
+            out = Buffer[Head]; assert (out);
+            Head = (Head + 1U) % Buffer.size();
+            return true;
+        }
+
+
+    private:
+        size_t Head;
+        size_t Tail;
+        std::vector<Task *> Buffer;
+        //std::mutex Mutex;
+    };
+
+    struct TaskLane {
+        TaskQueue Tasks;
+        size_t InFlight = 0;
+    };
+
+    class ParsePriority : public raw_ostream {
+    public:
+        ParsePriority() {
+            SetUnbuffered();
+        }
+
+        void write_impl(const char *Ptr, size_t Size) final {
+            assert (Size >= sizeof(PriorityType));
+            assert (Pos == 0 && Size >= sizeof(PriorityType) || Pos > 0);
+            if (Pos == 0) {
+                Value = *reinterpret_cast<const PriorityType*>(Ptr);
+            }
+            Pos += Size;
+        }
+
+        virtual uint64_t current_pos() const final {
+            return Pos;
+        }
+
+        PriorityType getValue() const {
+            return Value;
+        }
+    private:
+        PriorityType Value = 0;
+        uint64_t Pos = 0;
+    };
+
+public:
+
+    CPUDriverTaskDispatcher(ThreadPoolStrategy strategy)
+    : LaneCount(1)
+    , Tasks(strategy.ThreadsRequested) {
+
+        // TODO: is a linked list better than the mutex here? we could use an immutable list for the task lane array
+
+        for (size_t i = 0; i < strategy.ThreadsRequested; ++i) {
+            Threads.emplace_back([this]() {
+                while (Shutdown.load(std::memory_order_acquire) == 0) {
+
+                    Task * toExecute = nullptr;
+
+                    std::unique_lock<std::mutex> L(Mutex);
+
+                    size_t taskIndex = 0;
+
+                    TaskCV.wait(L, [&]{
+
+                        errs() << "TaskCV ...\n";
+
+                        std::lock_guard<std::mutex> R(LaneMutex);
+
+                        errs() << "TaskCV: got read lock\n";
+
+                        assert (LaneCount > 0);
+
+                        for (size_t j = 1; j < LaneCount; ++j) {
+                            auto & cur = Tasks[j];
+                            if (cur.InFlight) {
+                                const auto any = cur.Tasks.pop(toExecute);
+                                assert (any == (toExecute != nullptr));
+                                errs() << "TaskCV: found " << j << "\n";
+                                taskIndex = j;
+                                return true;
+                            }
+                        }
+
+                        auto & cur = Tasks[0];
+                        if (cur.InFlight == 0) {
+                            return false;
+                        }
+                        taskIndex = 0;
+                        const auto any = cur.Tasks.pop(toExecute);
+                        assert (any == (toExecute != nullptr));
+                        if (any) {
+                            errs() << "TaskCV: found " << 0 << "\n";
+                        }
+                        return true;
+                    });
+
+
+                    if (toExecute) {
+
+                        errs() << "toExec p_" << taskIndex << "\n";
+
+                        toExecute->run();
+                        delete toExecute;
+                        std::lock_guard<std::mutex> R(LaneMutex);
+                        auto & cur = Tasks[taskIndex];
+                        cur.InFlight--;
+                    }
+
+                }
+            });
+        }
+    }
+
+    void dispatch(std::unique_ptr<Task> T) override {
+
+        constexpr auto taskPrefix = std::string_view("Materialization task: ");
+
+        SmallVector<char, 256> tmp;
+        raw_svector_ostream m(tmp);
+
+        T->printDescription(m);
+
+        const auto str = m.str();
+
+        errs() << "task " << str << "\n";
+
+        if (str.compare(taskPrefix) == 0) {
+            const auto s = taskPrefix.length() + 1;
+            const auto f = str.find(s, '_');
+            const auto num = str.substr(s, f - s);
+
+            const auto priority = std::stoi(num.data());
+
+            // const auto priority = prior.getValue();
+            errs() << "dispatch " << priority << "\n";
+            BEGIN_SCOPED_REGION
+            std::lock_guard<std::mutex> R(LaneMutex);
+
+            errs() << "TaskCV: got dispatch lock\n";
+
+            assert (priority < Tasks.size());
+            auto & D = Tasks[priority];
+            D.Tasks.push(T.release());
+            D.InFlight++;
+            END_SCOPED_REGION
+            TaskCV.notify_one();
+            return;
+
+        }
+
+        T->run();
+    }
+
+    size_t addNewTaskGroup() {
+        const auto m = Tasks.size();
+        if (LaneCount < m) {
+            return LaneCount++;
+        }
+        std::lock_guard<std::mutex> R(LaneMutex);
+        Tasks.resize(m * 2);
+        return LaneCount++;
+    }
+
+    void enqueue(const size_t taskGroupId, std::unique_ptr<MaterializationTask> T) {
+
+
+    }
+
+    void start() {
+
+    }
+
+    void shutdown() override {
+        Shutdown.store(1, std::memory_order_release);
+        TaskCV.notify_all();
+        for (auto & w : Threads) {
+            if (w.joinable()) w.join();
+        }
+    }
+
+    ~CPUDriverTaskDispatcher() {
+        shutdown();
+    }
+
+private:
+
+
+
+
+private:
+
+    std::atomic<size_t>  Shutdown{0};
+
+    std::mutex Mutex;
+    std::condition_variable TaskCV;
+
+    std::mutex LaneMutex;
+    size_t LaneCount;
+    std::vector<TaskLane> Tasks;
+
+    size_t TotalPending = 0;
+
+    std::vector<std::thread> Threads;
+};
+
+class TaskPlatform : public Platform {
+
+/// MaterializationUnit is added to a JITDylib.
+Error notifyAdding(ResourceTracker &RT, const MaterializationUnit &MU) override {
+
+
+}
+
+};
+
 }
 
 ATTRIBUTE_NO_SANITIZE_ADDRESS
@@ -387,31 +789,45 @@ CPUDriver::CPUDriver(std::string && moduleName)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
 
-    const size_t numOfThreads = 4;
+    const size_t numOfThreads = 1;
 
     mAllLinkedSymbols = std::make_unique<SymbolMap>();
 
-    mContextPool = std::make_unique<CPUDriverContextPool>(numOfThreads, JTMB, features, mObjectCache.get(), *mAllLinkedSymbols);
+    mContextPool = std::make_unique<CPUDriverContextPool>(numOfThreads, JTMB, features, *mAllLinkedSymbols);
 
     auto Builder = orc::LLJITBuilder();
     Builder.setJITTargetMachineBuilder(std::move(JTMB));
-    Builder.setNumCompileThreads(numOfThreads);
+    Builder.setNumCompileThreads(0);
+    Builder.setCompileFunctionCreator(nullptr);
+    auto dispatcher = std::make_unique<CPUDriverTaskDispatcher>(llvm::hardware_concurrency(numOfThreads));
+    mTaskDispatcher = dispatcher.get();
+    auto epc = SelfExecutorProcessControl::Create(nullptr, std::move(dispatcher));
+    Builder.setExecutorProcessControl(std::move(*epc));
+
+
 
     // Safely route the compilation process through your customized Parabix caching system
-    Builder.setCompileFunctionCreator([&](llvm::orc::JITTargetMachineBuilder InnerJTMB)
-        -> Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
-            return std::make_unique<CPUDriverKernelCompiler>(InnerJTMB, mObjectCache.get());
-    });
+//    Builder.setCompileFunctionCreator([&](llvm::orc::JITTargetMachineBuilder InnerJTMB)
+//        -> Expected<std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+//            return std::make_unique<CPUDriverKernelCompiler>(InnerJTMB, mObjectCache.get());
+//    });
 
     mEngine = cantFail(Builder.create());
 
 
+    auto & ES = mEngine->getExecutionSession();
 
-    auto & CL = mEngine->getIRCompileLayer();
-    auto & CC = reinterpret_cast<CPUDriverKernelCompiler &>(CL.getCompiler());
+    ES.setDispatchTask([this](std::unique_ptr<Task> T){
+        mTaskDispatcher->dispatch(std::move(T));
+    });
 
-    CC.setPool(mContextPool.get());
-    CC.setEngine(mEngine.get());
+
+
+//    auto & CL = mEngine->getIRCompileLayer();
+//    auto & CC = reinterpret_cast<CPUDriverKernelCompiler &>(CL.getCompiler());
+
+//    CC.setPool(mContextPool.get());
+//    CC.setEngine(mEngine.get());
 
     auto & MainJD = mEngine->getMainJITDylib();
 
@@ -422,8 +838,6 @@ CPUDriver::CPUDriver(std::string && moduleName)
     );
 
     mSymbolLookupSet = std::make_unique<SymbolLookupSet>();
-
-
 
     mBuilder.reset(IDISA::GetIDISA_Builder(mMainModule->getContext(), features));
     mBuilder->setModule(mMainModule);
@@ -463,8 +877,6 @@ void CPUDriver::generateUncachedKernels() {
 
     const auto numKernels = mUncachedKernel.size();
 
-    auto & CL = mEngine->getIRCompileLayer();
-
     auto & MainJD = mEngine->getMainJITDylib();
 
     auto & ES = mEngine->getExecutionSession();
@@ -476,18 +888,31 @@ void CPUDriver::generateUncachedKernels() {
     MangleAndInterner Mangler(ES, mEngine->getDataLayout());
 
     mCachedKernel.reserve(numKernels);
+
+    const auto layerId = mTaskDispatcher->addNewTaskGroup();
+
+    errs() << "Generating " << numKernels << " Layer " << layerId << " Kernels\n";
+
     for (unsigned i = 0; i < numKernels; ++i) {
         auto & kernel = mUncachedKernel[i];
-        cantFail(MainJD.define(std::make_unique<KernelGenerationMU>(kernel.get(), Mangler, *mSymbolLookupSet, CL, *mContextPool)));
+
+        errs() << "ADDING " << layerId << "  " << kernel->getName() << "\n";
+
+
+
+        auto declTask = std::make_unique<KernelDeclarationMU>(layerId, kernel.get(), Mangler, *mSymbolLookupSet, mObjectCache.get(), mEngine.get(), *mContextPool);
+        cantFail(MainJD.define(declTask));
         assert (!mSymbolLookupSet->containsDuplicates());
         mCachedKernel.emplace_back(kernel.release());
     }
 
+
+
     mUncachedKernel.clear();
 
-    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
-    cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
-    removeAll(*mSymbolLookupSet);
+//    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
+//    cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
+//    removeAll(*mSymbolLookupSet);
 
 }
 
@@ -507,10 +932,18 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     mainName << pk->getName() << "_main";
     auto mainSymbol = mangler(mainName.str());
 
-    auto & CL = mEngine->getIRCompileLayer();
+    const auto layerId = mTaskDispatcher->addNewTaskGroup();
 
-    cantFail(MainJD.define(std::make_unique<MainGenerationMU>(pk, mainSymbol, *mSymbolLookupSet, CL, *mContextPool)));
+    errs() << "Generating main at Layer " << layerId << "\n";
+
+    auto & ES = mEngine->getExecutionSession();
+
+    auto mainDecl = std::make_unique<MainGenerationMU>(layerId, pk, mainSymbol, *mSymbolLookupSet, mEngine.get(), *mContextPool);
+  //  ES.dispatchTask(std::make_unique<MaterializationTask>(std::move(mainDecl), std::make_unique<MaterializationResponsibility>()));
+
+    cantFail(MainJD.define(mainDecl));
     assert (!mSymbolLookupSet->containsDuplicates());
+
 
 #if 0
     if (LLVM_UNLIKELY(codegen::ShowASMOption != codegen::OmittedOption)) {
@@ -544,14 +977,10 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     }
 #endif
 
-
-
     // 7. Look up and resolve symbols using standard target data layout policies.
     // Compilation triggers on-demand here during lookup, bypassing the old explicit finalizeObject() call.
 
-
-    auto & ES = mEngine->getExecutionSession();
-    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly); // mSymbolStubs,
+    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
     auto funcMap = cantFail(ES.lookup(S, *mSymbolLookupSet, LookupKind::Static, SymbolState::Ready));
     auto mainFuncPtr = funcMap.find(mainSymbol)->getSecond().getAddress().toPtr<void*>();
 

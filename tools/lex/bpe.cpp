@@ -50,6 +50,7 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <unordered_map>
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <llvm/Support/CommandLine.h>
@@ -124,6 +125,34 @@ static unsigned effGroupSize(size_t n) {
 // hoisting one shared shift per distinct lenA outside all gates. Inside = skippable on cold
 // blocks but DUPLICATED per rule (loses the per-lenA dedup); outside (default) = shared but
 // runs every block. 
+// --level-partition: schedule merge rules into the MINIMUM number of kernels instead
+// of cutting the rank-sorted rule list into contiguous id ranges.
+//
+// The clean-range walk (buildMergeRuleRanges, step 3) closes a group at the FIRST rule
+// that violates either constraint, so a group is necessarily a consecutive interval of
+// rank. Measured over full GPT-2: 1098 of its 1123 groups close on a seam conflict, and
+// at each break ~179 of the next 200 rules would still have fit in the group being
+// closed — ~90% of the available packing is discarded purely to keep groups contiguous.
+// Group size therefore saturates near 44 (a new rule must clash with NONE of the ~44
+// already present) and 50000/44.5 = 1123.
+//
+// Level scheduling drops contiguity only. Each rule takes its EARLIEST legal kernel:
+//     level(r) = 1 + max( level(producer of idA), level(producer of idB),
+//                         level of any lower-rank rule seaming with r )
+// A violator no longer ends the group — it defers ITSELF while the rest keep filling the
+// current level. Kernel count becomes the constraint DAG's longest path (a provable
+// minimum, nothing can go earlier than its own dependencies) rather than a function of
+// how often violations occur: 1123 -> 283, mean group size 44.5 -> 176.7.
+//
+// BOTH correctness constraints are preserved exactly (T4 + the clean-range conflict
+// test); only the packing changes. Levels are NOT rank intervals — level 1 legitimately
+// holds rank 0 alongside rank 47815.
+static cl::opt<bool> LevelPartition(
+    "level-partition",
+    cl::desc("Partition merge rules by ASAP level scheduling (minimum kernel count) "
+             "instead of contiguous clean id ranges."),
+    cl::init(false));
+
 static cl::opt<bool> LookaheadInGate(
     "lookahead-in-gate",
     cl::desc("Build the B-detection LookAhead inside each rule's if-gate (per-rule, "
@@ -344,17 +373,37 @@ static std::vector<bool> applyCompactionSchedule(
 
     // parts[idAB] = (idA, idB) for every merged token. Base ids (< 256) are absent —
     // they are atomic and terminate the recursion. lookup table
+    // kernelOf[idAB] = the index of the kernel that STAMPS that id — the authoritative
+    // answer to "had this token been built yet when we compacted?".
     std::map<unsigned, std::pair<unsigned,unsigned>> parts;
-    for (const auto & g : ruleRanges)
-        for (const auto & r : g.rules)
+    std::map<unsigned, size_t> kernelOf;
+    for (size_t gi = 0; gi < ruleRanges.size(); gi++)
+        for (const auto & r : ruleRanges[gi].rules) {
             parts.emplace(r.idAB, std::make_pair(r.idA, r.idB));
+            kernelOf.emplace(r.idAB, gi);
+        }
 
-    unsigned frontier = 256;                 // before any compaction: byte space
-    std::map<unsigned, unsigned> memo;        // valid for the CURRENT frontier only
-    // slotSpan(id) = the number of tokens that id spans. 
+    // -1 = no compaction has happened yet, so nothing but a base byte occupies one slot.
+    long lastCompactKernel = -1;
+    std::map<unsigned, unsigned> memo;        // valid for the CURRENT compaction point only
+    // slotSpan(id) = how many SLOTS this token occupies in the current compacted frame.
+    //
+    // A token occupies one slot iff it already existed when the last FilterByMask ran —
+    // the filter kept exactly the live token starts, one position each. Anything built
+    // AFTER that point was assembled out of several of those slots, so its span is the
+    // sum of its parts'.
+    //
+    // This asks that question directly, via kernelOf. It used to be approximated by a
+    // numeric watermark (`id < frontier`, frontier = the compacting group's hi), which is
+    // equivalent ONLY when groups tile the id axis in rank order — true for the contiguous
+    // clean-range partition, FALSE for --level-partition, whose `hi` is a running max, so
+    // nearly every id tested as "already built" and every lenA collapsed to 1. Symptom:
+    // late merges of long tokens silently never fire (Ġrestaur + ant stayed two tokens).
     std::function<unsigned(unsigned)> slotSpan = [&](unsigned id) -> unsigned {
-        // 
-        if (id < frontier) return 1;
+        if (id < 256) return 1;               // base byte — the seed supplies it
+        auto k = kernelOf.find(id);
+        if (k != kernelOf.end() && (long) k->second <= lastCompactKernel)
+            return 1;                         // stamped at or before the last compaction
         auto m = memo.find(id);
         if (m != memo.end()) return m->second;
         auto p = parts.find(id);
@@ -365,8 +414,8 @@ static std::vector<bool> applyCompactionSchedule(
     };
 
     // Walk the rule ranges in order, counting kernels since the last compaction. When
-    // we hit K, mark this range for compaction and reset the frontier to hi_i. 
-    //Recompute every rule's lenA in the new frontier space. 
+    // we hit K, mark this range for compaction and advance lastCompactKernel to i.
+    // Recompute every rule's lenA as a SLOT distance in the resulting compacted frame.
     unsigned sinceCompact = 0, nCompact = 0, firstBlockDisagree = 0;
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
@@ -380,12 +429,12 @@ static std::vector<bool> applyCompactionSchedule(
         }
         // Update the maximum length in the current rule range.
         g.maxLen = maxDist;                   // LookAhead binding must cover every lenA
-        // Decide whether to compact after this range. If we do, the next frontier is
-        // the hi of this range, and we reset the memoization table. Otherwise, the
-        // frontier stays the same and we keep memoizing.   
+        // Decide whether to compact after this range. If we do, every token stamped by
+        // kernel <= i is now one slot wide, so the memo (computed against the previous
+        // compaction point) is stale and must be dropped.
         if (++sinceCompact < nextCompaction) continue;
         compactAfter[i] = true;
-        frontier = g.hi;                      // every live id after kernel i is < hi_i
+        lastCompactKernel = (long) i;
         memo.clear();
         sinceCompact = 0;
         if (GeometricCompaction) {
@@ -621,8 +670,7 @@ protected:
             // Anchor. Indexed path (--indexed-shift) is END-anchored: stamp idAB at B's
             // position (2nd part) and remove A. `fire` is at A; IndexedAdvance moves it one
             // live position forward → B. LookAhead path stays START-anchored (stamp at A,
-            // remove B) — end-anchoring there needs a backward consume, illegal on a body
-            // stream. Output is byte-identical either way (id at token end vs start).
+            // remove B) 
             PabloAST * stampAt;   // where idAB is written
             PabloAST * removeAt;  // which start is cleared from the live mask
             if (mUseNextId) {
@@ -775,7 +823,8 @@ BPEPassResult buildBPEPassPipeline(
     auto compactAfter = applyCompactionSchedule(ruleRanges, compactEvery);
 
     // debug: dump the merge-range groups to stderr
-    std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels\n";
+    std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels ("
+              << (LevelPartition ? "ASAP level schedule" : "contiguous clean ranges") << ")\n";
     for (const auto & g : ruleRanges)
         std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.rules.size()
                   << " maxLen=" << g.maxLen << "\n";
@@ -1033,6 +1082,72 @@ static unsigned rawByteLen(const std::string & s) {
 // the token-grid conflict test (interior sub-token byte overlaps are NOT counted —
 // interior bytes are not live token starts). Mirrors merge_analysis.py
 // clean_range_analysis (id-based merges_overlap). Rules stay idAB-ASC = rank-ASC.
+// levelPartition — ASAP level schedule of the rank-sorted rules (see --level-partition).
+// Same two constraints as the clean-range walk, minus the contiguity requirement:
+//   dependency — a rule's parts must be stamped by a STRICTLY earlier kernel (T4), so
+//                level(r) > level(producer(idA)) and > level(producer(idB));
+//   seam       — two rules sharing a token (one's right part == the other's left part)
+//                must land in different kernels, lower rank first, so the lower-rank
+//                write reaches the later kernel's input and starves the other.
+// Walking in rank order, the seam constraint needs only two lookups: maxRight[t] is the
+// highest level of an already-scheduled rule using token t as its RIGHT part, maxLeft[t]
+// the same for its LEFT part. Rule r must sit after maxRight[r.idA] and maxLeft[r.idB].
+//
+// Group bookkeeping: `hi` must exceed every id that can appear in the kernel's OUTPUT =
+// the ids already present at its input (every idAB from a lower level) plus the idABs it
+// stamps itself, so it is a RUNNING maximum over levels. That keeps it monotonically
+// non-decreasing, which the threaded `source` width requires (W_out never shrinks).
+// NOTE `hi` is a WIDTH BOUND ONLY. It is deliberately NOT a "everything below this is
+// already stamped" watermark — under levels it is ~50k from the first kernel on. That is
+// exactly why applyCompactionSchedule asks kernelOf[] instead of comparing against `hi`.
+// `lo` is the level's lowest idAB — informational only (the debug dump).
+static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules) {
+    std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps it
+    std::unordered_map<unsigned, unsigned> maxLeft;     // token -> highest level using it as idA
+    std::unordered_map<unsigned, unsigned> maxRight;    // token -> highest level using it as idB
+    std::vector<std::vector<MergeRule>> levels;
+
+    for (const auto & r : rules) {                      // rank order
+        unsigned lvl = 1;
+        auto after = [&](const std::unordered_map<unsigned, unsigned> & m, unsigned key) {
+            auto it = m.find(key);
+            if (it != m.end() && it->second + 1u > lvl) lvl = it->second + 1u;
+        };
+        after(prodLevel, r.idA);      // dependency: idA stamped by a lower kernel
+        after(prodLevel, r.idB);      // dependency: idB stamped by a lower kernel
+        after(maxRight,  r.idA);      // seam: an earlier rule consumed this token as its B
+        after(maxLeft,   r.idB);      // seam: an earlier rule claimed this token as its A
+        // Base ids (< 256) are absent from prodLevel — the seed supplies them, so they
+        // impose no constraint and such a rule can sit in level 1.
+        if (levels.size() < lvl) levels.resize(lvl);
+        levels[lvl - 1].push_back(r);
+        prodLevel[r.idAB] = lvl;
+        auto keepMax = [](std::unordered_map<unsigned, unsigned> & m, unsigned k, unsigned v) {
+            unsigned & slot = m[k];
+            if (v > slot) slot = v;
+        };
+        keepMax(maxLeft,  r.idA, lvl);
+        keepMax(maxRight, r.idB, lvl);
+    }
+
+    std::vector<MergeRuleGroup> ranges;
+    unsigned runningMax = 255;                          // base alphabet occupies 0..255
+    for (auto & lv : levels) {
+        if (lv.empty()) continue;
+        MergeRuleGroup g;
+        g.rules = std::move(lv);
+        g.lo = g.rules.front().idAB;                    // pushed in rank order -> lowest
+        for (const auto & r : g.rules) {
+            unsigned mergedLen = r.lenA + r.lenB;
+            if (mergedLen > g.maxLen) g.maxLen = mergedLen;
+            if (r.idAB > runningMax) runningMax = r.idAB;
+        }
+        g.hi = runningMax + 1;
+        ranges.push_back(std::move(g));
+    }
+    return ranges;
+}
+
 std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     // 1. Resolve every raw merge → MergeRule.
     std::vector<MergeRule> rules;
@@ -1057,10 +1172,14 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     std::sort(rules.begin(), rules.end(),
               [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
 
-    // 3. clean_range partition: lo = first rule's idAB (its parts always precede
-    //    it, so it always fits); extend while the rule is dependency-independent
-    //    (idA<lo && idB<lo) AND token-adjacency-overlap-free vs every rule already
-    //    in the group. The first rule violating either starts the next range.
+    // 3. Partition. --level-partition takes the ASAP level schedule (minimum kernel
+    //    count, same constraints); the default is the clean_range walk: lo = first
+    //    rule's idAB (its parts always precede it, so it always fits); extend while the
+    //    rule is dependency-independent (idA<lo && idB<lo) AND token-adjacency-overlap-
+    //    free vs every rule already in the group. The first rule violating either
+    //    starts the next range.
+    if (LevelPartition) return levelPartition(rules);
+
     std::vector<MergeRuleGroup> ranges;
     size_t i = 0, n = rules.size();
     while (i < n) {

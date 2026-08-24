@@ -1,9 +1,10 @@
 # Tokenizer Test Suite
 
 This directory holds the test and benchmark harness for the **Parabix tokenizer**
-(`tools/lex`). Every script compares Parabix against the **HuggingFace
+(`tools/lex`). Scripts 1–4 compare Parabix against the **HuggingFace
 `tokenizers` library** running the same GPT-2 model, so HuggingFace is the ground
-truth for both correctness and performance.
+truth for both correctness and performance. Script 5 is the exception: it
+benchmarks Parabix configurations against **each other** and never loads HF.
 
 None of these are wired into `make check` — run them directly from this directory
 with the repo venv active.
@@ -14,8 +15,9 @@ with the repo venv active.
 | 2 | `compare_pretokenizers.py` | correctness | Pre-tokenization / word splitting (whitespace, bytelevel, punctuation, …) |
 | 3 | `compare_bpe.py`           | correctness + timing | Full BPE encoding → token IDs, plus a fair head-to-head timing section |
 | 4 | `bench_bpe.py`             | performance | Throughput (MB/s), size sweep, fixed-floor vs marginal-rate fit, SVG charts |
+| 5 | `bench_configs.py`         | performance (Parabix only) | N flag configurations timed against each other — interleaved rounds, per-config floor/marginal fit, output-identity check |
 
-Scripts 1–3 print `MATCH` / `MISMATCH` per case; all four tee their output to
+Scripts 1–3 print `MATCH` / `MISMATCH` per case; all five tee their output to
 `<script>_output.txt` in this directory (those result files are not committed).
 
 ---
@@ -298,6 +300,94 @@ Output → `bench_bpe_output.txt`, plus an SVG chart when `--svg` is given.
 
 ---
 
+## 5. `bench_configs.py`
+
+Parabix **against itself** — no HuggingFace, no `tokenizers` import, no
+`vocab.json`. `bench_bpe.py --parabix-only --parabix-args "…"` times ONE config
+per invocation; this script times N configs in one run and tabulates them, which
+is what you want when the question is "which flag combination is fastest", not
+"are we faster than HF".
+
+Three things it does that repeating `bench_bpe.py` cannot:
+
+- **Interleaving.** Sequential benchmark runs are minutes apart and laptop
+  clocks drift (thermal throttle, background load), so the config that runs last
+  is penalised. Each round here round-robins every config, and each config keeps
+  its **min across rounds** — drift hits all configs alike.
+- **Floor vs marginal rate.** With `--sizes`, each config is timed at several
+  prefix sizes and `min_ms = floor + slope·bytes` is fitted per config, so the
+  fixed per-call dispatch floor (kernel-count driven) is separated from the
+  floor-free per-byte rate. A single MB/s number at one size is mostly the
+  floor — see [Peak MB/s vs marginal MB/s](#peak-mbs-vs-marginal-mbs).
+- **Output identity.** `--verify` re-runs each config *without* `--bench-loop`
+  (so ids actually print) and hashes stdout against the baseline config. A
+  config that is faster but prints different tokens is flagged `DIFFERS` — a
+  faster-but-wrong config is not a win.
+
+```bash
+# default pair: no flags vs --level-partition, on val_2MB
+python bench_configs.py
+
+# explicit configs — NAME=FLAGS, first one is the speedup baseline
+python bench_configs.py \
+    --config 'baseline=' \
+    --config 'level=--level-partition' \
+    --config 'level+compact=--level-partition --compact-base=40'
+
+# floor / marginal split + output-identity check
+python bench_configs.py --input ../tokenizer_files/val_4MB.txt \
+    --sizes 0.25,1,4 --verify
+
+# noisy machine: more interleaved rounds, fewer in-process iterations
+python bench_configs.py --rounds 5 --iters 3
+
+# time the raw-byte path instead of the boundary-gated one
+python bench_configs.py --common-flags=''
+```
+
+`--iters` is the in-process `--bench-loop` count (default 5), `--rounds` the
+number of interleaved passes (default 3). A warm-up run per (config, size) pays
+the JIT and fills `~/.parabix/objcache/` before any timing starts. Prefix sizes
+larger than the input are skipped with a reason on stderr. Output →
+`bench_configs_output.txt`.
+
+`--common-flags` (default `--pretokenizer=bytelevel`) is prepended to every
+config, so all of them share a pipeline shape and only the flags under test
+differ. That default is the boundary-gated pipeline `compare_bpe.py` verifies;
+`--common-flags=''` selects the raw-byte path instead. The banner records what
+was applied.
+
+The `vs base` column and the relative marginal rate are against the **first
+named** config, looked up by name — if it produces no result at some size, that
+table says so and omits the speedups rather than promoting another config to
+denominator. With `--sizes`, `--verify` hashes the smallest prefix: it runs
+without `--bench-loop` so every token id prints, and two configs that tokenize
+identically do so at any size.
+
+The run that answers "which lever does what":
+
+```bash
+python3 bench_configs.py \
+    --input ../tokenizer_files/val_8MB.txt \
+    --sizes 0.25,1,2,4,7.5 \
+    --config 'baseline=' \
+    --config 'level=--level-partition' \
+    --config 'level+compact=--level-partition --geometric-compaction --compact-base=15' \
+    --verify
+```
+
+Read the floor/marginal table, not the per-size MB/s. `--level-partition` cuts
+kernel count, so it moves the **floor** roughly in proportion; compaction shrinks
+the stream every kernel scans, so it moves the **marginal MB/s**. A flag that
+moves neither is doing nothing. `floor @ largest` says how much of the biggest
+run is still dispatch overhead — while that is high, end-to-end speedups mostly
+measure the floor and will shrink as the input grows.
+
+Sweeping the compaction interval is the same command with several
+`--compact-base=N` configs.
+
+---
+
 ## Tokenizer flags
 
 The binary's CLI is documented once, in the parent
@@ -309,8 +399,10 @@ The binary's CLI is documented once, in the parent
 - **[BPE optimization parameters](../README.md#bpe-optimization-parameters)** —
   `--compact-base`, `--geometric-compaction`, `--if-group-lower-limit`,
   `--if-group-count`, `--if-group-size`, `--lookahead-in-gate`,
-  `--lookahead-in-group`, each with its objcache-name tag. All default OFF.
-  Sweep them here via `bench_bpe.py --parabix-args`; the parent's
+  `--lookahead-in-group`, `--level-partition`, `--indexed-shift`, each with its
+  objcache-name tag. All default OFF. Sweep them against HF via
+  `bench_bpe.py --parabix-args`, or against each other via
+  [`bench_configs.py --config`](#5-bench_configspy); the parent's
   [Correctness testing](../README.md#correctness-testing) and
   [Performance testing](../README.md#performance-testing) sections have the
   A/B recipe.

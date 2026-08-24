@@ -40,11 +40,15 @@ TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
-DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/val_1gb.txt")
+DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/val.txt")
 OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "compare_bpe_output.txt")
 
 DEFAULT_RUNS = 5
+
+# Extra flags forwarded verbatim to build19/bin/tokenizer on every invocation
+# (both the correctness run and the --bench-loop timing run). Set by --tok-flag.
+EXTRA_ARGS: list[str] = []
 
 SEP  = "=" * 70
 DASH = "-" * 70
@@ -85,6 +89,7 @@ def input_line(text: str, pad: str = "") -> str:
 def _parabix_ids_cmd(input_path: str, strings: bool = False):
     """Spawn the tokenizer binary on a pre-written input file. One subprocess."""
     cmd = [TOKENIZER, "--pretokenizer=bytelevel", f"--vocab={VOCAB}", f"--merges={MERGES}"]
+    cmd += EXTRA_ARGS
     if strings:
         cmd.append("--strings")
     cmd.append(input_path)
@@ -156,7 +161,7 @@ def bench_parabix(input_path: str, runs: int):
     dict (min/median/mean ms + mbps) or None if no BENCH_RESULT was produced."""
     r = subprocess.run(
         [TOKENIZER, f"--bench-loop={runs}", f"--vocab={VOCAB}",
-         f"--merges={MERGES}", input_path],
+         f"--merges={MERGES}", *EXTRA_ARGS, input_path],
         capture_output=True, encoding="utf-8"
     )
     m = BENCH_RE.search(r.stderr or "")
@@ -383,9 +388,15 @@ def main() -> None:
                         help=f"Timed runs per side in compare mode (default: {DEFAULT_RUNS})")
     parser.add_argument("--no-timing",    action="store_true",
                         help="Skip the timing section")
+    parser.add_argument("--tok-flag",     action="append", default=[], metavar="FLAG",
+                        help="Extra flag passed straight to build19/bin/tokenizer "
+                             "(repeatable), e.g. --tok-flag=--level-partition")
     args = parser.parse_args()
-    global SHOW_INPUT
+    global SHOW_INPUT, EXTRA_ARGS
     SHOW_INPUT = args.show_input
+    EXTRA_ARGS = list(args.tok_flag)
+    if EXTRA_ARGS:
+        print(f"Extra tokenizer flags: {' '.join(EXTRA_ARGS)}")
 
     if not os.path.isfile(args.input):
         print(f"Error: input file not found: {args.input}")

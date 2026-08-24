@@ -373,8 +373,7 @@ static std::vector<bool> applyCompactionSchedule(
 
     // parts[idAB] = (idA, idB) for every merged token. Base ids (< 256) are absent —
     // they are atomic and terminate the recursion. lookup table
-    // kernelOf[idAB] = the index of the kernel that STAMPS that id — the authoritative
-    // answer to "had this token been built yet when we compacted?".
+    // kernelOf[idAB] = index of the kernel that STAMPS that id, i.e. WHEN it is built.
     std::map<unsigned, std::pair<unsigned,unsigned>> parts;
     std::map<unsigned, size_t> kernelOf;
     for (size_t gi = 0; gi < ruleRanges.size(); gi++)
@@ -383,27 +382,20 @@ static std::vector<bool> applyCompactionSchedule(
             kernelOf.emplace(r.idAB, gi);
         }
 
-    // -1 = no compaction has happened yet, so nothing but a base byte occupies one slot.
-    long lastCompactKernel = -1;
+    long lastCompactKernel = -1;              // -1 = nothing compacted yet
     std::map<unsigned, unsigned> memo;        // valid for the CURRENT compaction point only
     // slotSpan(id) = how many SLOTS this token occupies in the current compacted frame.
-    //
-    // A token occupies one slot iff it already existed when the last FilterByMask ran —
-    // the filter kept exactly the live token starts, one position each. Anything built
-    // AFTER that point was assembled out of several of those slots, so its span is the
-    // sum of its parts'.
-    //
-    // This asks that question directly, via kernelOf. It used to be approximated by a
-    // numeric watermark (`id < frontier`, frontier = the compacting group's hi), which is
-    // equivalent ONLY when groups tile the id axis in rank order — true for the contiguous
-    // clean-range partition, FALSE for --level-partition, whose `hi` is a running max, so
-    // nearly every id tested as "already built" and every lenA collapsed to 1. Symptom:
-    // late merges of long tokens silently never fire (Ġrestaur + ant stayed two tokens).
+    // A token owns one slot iff it already existed when the last FilterByMask ran (the
+    // filter kept exactly the live token starts, one position each); anything built after
+    // sits on top of several, so its span is the sum of its parts'. Kernels run in order
+    // and a compaction happens after a specific kernel, so kernelOf IS the build time.
+    // Testing `id < hi` instead is equivalent only when groups tile the id axis in rank
+    // order, which --level-partition does not.
     std::function<unsigned(unsigned)> slotSpan = [&](unsigned id) -> unsigned {
         if (id < 256) return 1;               // base byte — the seed supplies it
         auto k = kernelOf.find(id);
         if (k != kernelOf.end() && (long) k->second <= lastCompactKernel)
-            return 1;                         // stamped at or before the last compaction
+            return 1;                         // built at or before the last compaction
         auto m = memo.find(id);
         if (m != memo.end()) return m->second;
         auto p = parts.find(id);
@@ -430,7 +422,7 @@ static std::vector<bool> applyCompactionSchedule(
         // Update the maximum length in the current rule range.
         g.maxLen = maxDist;                   // LookAhead binding must cover every lenA
         // Decide whether to compact after this range. If we do, every token stamped by
-        // kernel <= i is now one slot wide, so the memo (computed against the previous
+        // kernel <= i is now one slot wide, so the memo (built against the previous
         // compaction point) is stale and must be dropped.
         if (++sinceCompact < nextCompaction) continue;
         compactAfter[i] = true;
@@ -1097,20 +1089,25 @@ static unsigned rawByteLen(const std::string & s) {
 // the ids already present at its input (every idAB from a lower level) plus the idABs it
 // stamps itself, so it is a RUNNING maximum over levels. That keeps it monotonically
 // non-decreasing, which the threaded `source` width requires (W_out never shrinks).
-// NOTE `hi` is a WIDTH BOUND ONLY. It is deliberately NOT a "everything below this is
-// already stamped" watermark — under levels it is ~50k from the first kernel on. That is
-// exactly why applyCompactionSchedule asks kernelOf[] instead of comparing against `hi`.
-// `lo` is the level's lowest idAB — informational only (the debug dump).
+// NOTE `hi` is a WIDTH BOUND ONLY — under levels it is ~50k from the first kernel on, so
+// it is NOT an "everything below is already stamped" watermark; applyCompactionSchedule
+// asks kernelOf[] instead. `lo` is the level's lowest idAB — informational (debug dump).
 static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules) {
-    std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps it
-    std::unordered_map<unsigned, unsigned> maxLeft;     // token -> highest level using it as idA
-    std::unordered_map<unsigned, unsigned> maxRight;    // token -> highest level using it as idB
-    std::vector<std::vector<MergeRule>> levels;
+    std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps i
+    // token -> highest level using it as idA  
+    // maxLeft[68] = 1      <- token e(68) was last used as a LEFT part in kernel 1
+    std::unordered_map<unsigned, unsigned> maxLeft; 
+    // token -> highest level using it as idB
+    //  // maxRight[98] = 2      <- token e(98) was last used as a RIGHT part in kernel 1
+    std::unordered_map<unsigned, unsigned> maxRight;    
+    std::vector<std::vector<MergeRule>> levels;  // what rules are in each level (rank order)
 
-    for (const auto & r : rules) {                      // rank order
-        unsigned lvl = 1;
+    for (const auto & r : rules) {                      // rank order, Take every rule one at a time.
+        unsigned lvl = 1;    // lets assume the rule can sit in level 1 (no deps, no seams). Then check the constraints.
         auto after = [&](const std::unordered_map<unsigned, unsigned> & m, unsigned key) {
-            auto it = m.find(key);
+            auto it = m.find(key);  // search/find if the token was used as a part in a lower kernel
+            // If it was, the rule must sit after that kernel (level = that kernel's level + 1). 
+            // If not, the rule can sit in level 1 (no constraint).
             if (it != m.end() && it->second + 1u > lvl) lvl = it->second + 1u;
         };
         after(prodLevel, r.idA);      // dependency: idA stamped by a lower kernel
@@ -1119,27 +1116,34 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         after(maxLeft,   r.idB);      // seam: an earlier rule claimed this token as its A
         // Base ids (< 256) are absent from prodLevel — the seed supplies them, so they
         // impose no constraint and such a rule can sit in level 1.
+        // If the number of levels we currently have is LESS than the level needed for this rule, create more level slots.
         if (levels.size() < lvl) levels.resize(lvl);
+
         levels[lvl - 1].push_back(r);
         prodLevel[r.idAB] = lvl;
         auto keepMax = [](std::unordered_map<unsigned, unsigned> & m, unsigned k, unsigned v) {
             unsigned & slot = m[k];
             if (v > slot) slot = v;
         };
+        // Mask for at what level this rule used idA and idB.
+        // so that later rules can respect those dependencies.
         keepMax(maxLeft,  r.idA, lvl);
         keepMax(maxRight, r.idB, lvl);
     }
-
+    // map the level-partitioned rules into MergeRuleGroups, 
+    // each level will be a MergeRuleGroup, and compute the lo/hi/maxLen for each group.
     std::vector<MergeRuleGroup> ranges;
-    unsigned runningMax = 255;                          // base alphabet occupies 0..255
-    for (auto & lv : levels) {
+    unsigned runningMax = 255;                          // base alphabet occupies 0..255, the largest token ID we've seen so far is 255
+    // go through each level's rules. 
+    for (auto & lv : levels) {                         
         if (lv.empty()) continue;
         MergeRuleGroup g;
+        // Move the level's rules into the group
         g.rules = std::move(lv);
-        g.lo = g.rules.front().idAB;                    // pushed in rank order -> lowest
+        g.lo = g.rules.front().idAB;                    // pushed in rank order -> lowest, first rule in g.rules
         for (const auto & r : g.rules) {
             unsigned mergedLen = r.lenA + r.lenB;
-            if (mergedLen > g.maxLen) g.maxLen = mergedLen;
+            if (mergedLen > g.maxLen) g.maxLen = mergedLen;   // maximum merged length among all rules in the group, the longest resulting token
             if (r.idAB > runningMax) runningMax = r.idAB;
         }
         g.hi = runningMax + 1;

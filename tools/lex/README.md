@@ -251,30 +251,39 @@ The Python ground truth for this partition is
 
 ### Alternative partition — ASAP level scheduling (`--level-partition`)
 
-`levelPartition()` assigns each rule its earliest legal kernel:
+The clean-range walk closes a group at the **first** violating rule and never
+rewinds, so groups are contiguous rank intervals. That contiguity, not the two
+conditions, sets the kernel count: 1098 of the 1123 groups close on a conflict,
+and at each break ~179 of the next 200 rules would still have fit. Group size
+saturates near 44, and 50000 / 44.5 = 1123.
+
+`--level-partition` drops contiguity only. Each rule takes its earliest legal
+kernel:
 
 ```
 level(r) = 1 + max( level(producer of idA), level(producer of idB),
                     level of any lower-rank rule sharing a seam with r )
 ```
 
-Rules with equal level share a kernel. Both conditions above still hold; the
-kernel count is the constraint DAG's longest path, a provable minimum. Full
-GPT-2: **283 kernels**, mean group size 176.7.
+A violator defers itself instead of ending the group, so the count becomes the
+constraint DAG's longest path — a provable minimum. **1123 → 283 kernels**, mean
+group size 44.5 → 176.7. Levels are not rank intervals: level 1 holds rank 0
+alongside rank 47815.
 
-Levels are not rank intervals — level 1 holds rank 0 alongside rank 47815 — so
-the two conditions are tested directly rather than through id order:
+Both conditions are preserved; only the packing changes. Two mechanics follow:
 
-* condition 1 — `prodLevel[id]` gives the kernel that stamps each id.
-* condition 2 — `maxLeft[tok]` / `maxRight[tok]` give the highest level using
-  that token as a left / right part, tested in O(1) against every rule scheduled
-  so far. Only `maxRight[idA]` and `maxLeft[idB]` are consulted; same-side
-  sharing is harmless, since those rules' B parts differ.
+* `idA < lo` tests condition 1 only because `idAB == 256 + rank` **and** groups
+  are contiguous make id order equal kernel order. Without contiguity it becomes
+  an explicit `prodLevel[id]` lookup.
+* Condition 2 must consider all prior rules, not just the current group, so
+  `maxLeft[tok]` / `maxRight[tok]` hold the highest level using that token as a
+  left / right part. Only `maxRight[idA]` and `maxLeft[idB]` are consulted —
+  same-side sharing is harmless, since those rules' B parts differ.
 
-Group `hi` is a running maximum across levels, since a kernel's output carries
-ids from every lower level. This keeps `W_out` monotonic, at 16 bits throughout
-rather than the clean-range mean of 14.2. `hi` is a **width bound only** — not an
-"already stamped" watermark (see [Compaction and slot distances](#compaction-and-slot-distances)).
+Group `hi` becomes a running maximum across levels (a kernel's output carries ids
+from every lower level), keeping `W_out` monotonic at the cost of the narrow early
+streams (mean 14.2 → 16.0 bits). `hi` is now a **width bound only**, not an
+"already stamped" watermark — see [Compaction and slot distances](#compaction-and-slot-distances).
 
 ### Runtime pipeline — `buildBPEPassPipeline()`
 
@@ -439,27 +448,6 @@ the input `Ġthe`, should cascade `Ġ`+`t` → `Ġt` then `Ġt`+`he` → `Ġthe`
   (`'d` inside `'default'`). The contraction-context rule described above was
   added to fix that case and is verified on targeted probes; **re-verification
   over the full 24 MB corpus is still pending.**
-- `--level-partition` (283 kernels) is byte-identical to the default partition
-  (1123) and matches HuggingFace on `webtext_10`, `val_2MB` and `val_4MB`; with
-  compaction it matches on `webtext_10` and `val_4MB`. **Untested:**
-  `--level-partition` with grouped-if.
-
-Throughput on `val_2MB`, `--pretokenizer=bytelevel --bench-loop=5`, min of 5, all
-cells from one session (the same config drifts ~16% between sessions, so only
-compare within a run):
-
-| config | kernels | min ms | vs plain |
-|---|---|---|---|
-| plain | 1123 | 2172.7 | 1.00x |
-| `--compact-base=40` | 1123 | 1207.6 | 1.80x |
-| `--level-partition` | 283 | 1178.2 | 1.84x |
-| `--level-partition --compact-base=40` | 283 | 541.7 | 4.01x |
-| `--level-partition --geometric-compaction --compact-base=15` | 283 | 523.4 | **4.15x** |
-
-They compose super-multiplicatively (1.80 x 1.84 = 3.3, actual 4.15). The levers
-are separable: level-partition cuts the fixed dispatch floor (measured 167.5 →
-43.0 ms, matching the 4x kernel drop) while costing ~13% marginal rate from the
-wider streams; compaction raises the marginal rate.
 
 Note that `bpe.cpp`'s top-of-file header comment and part of `bpe.h`'s comment on
 `BPEPassResult` still describe an older end-anchored, emit-everything design
@@ -487,7 +475,7 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 
 | Flag | Default | Cache tag | What it does |
 |---|---|---|---|
-| `--level-partition` | off | (via rule set + `o{bits}`) | Partition merge rules by **ASAP level scheduling**: each rule takes the earliest kernel its dependencies and seam conflicts allow. Full GPT-2: **283 kernels** (clean ranges: 1123). Output byte-identical — see [Alternative partition](#alternative-partition--asap-level-scheduling---level-partition). |
+| `--level-partition` | off | (via rule set + `o{bits}`) | Partition merge rules by **ASAP level scheduling** (minimum kernel count) instead of contiguous clean id ranges. Full GPT-2: **1123 → 283 kernels**. Same two correctness conditions, only the packing changes — see [Alternative partition](#alternative-partition--asap-level-scheduling---level-partition). Verified byte-identical output. |
 | `--compact-base=N` | `0` (off) | `L{maxLen}` | Base kernel index at which `FilterByMask` compaction first shrinks the inter-kernel streams. `0` = no compaction. Larger streams stay full-width; compaction trades a per-point compact/expand cost for cheaper downstream kernels. |
 | `--geometric-compaction` | off | (via `L`) | Space the compaction points geometrically instead of arithmetically (denser early, sparser later). Only meaningful with `--compact-base > 0`. |
 | `--if-group-lower-limit=N` | `-1` (off) | `g{size}_` | **Master switch for grouped-if.** For kernels at/after index `N`, replace the one-`createIf`-per-rule structure with range-gated group gates (rules sorted by `idA`, chopped into chunks, one `createIf` per chunk on the id range it spans). A block with no live id in a chunk's range skips that whole chunk. `-1` = per-rule ifs everywhere. |
@@ -499,19 +487,19 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 ### Compaction and slot distances
 
 `--compact-base=N` inserts a `FilterByMask` after every N kernels. Merges kill
-positions without shrinking the stream, so later kernels otherwise keep scanning
-dead bytes. The filter keeps exactly the live token starts, one position each —
-call those **slots**.
+positions but do not shrink the stream, so without it every later kernel keeps
+scanning dead bytes. The filter keeps exactly the live token starts, one position
+each — call those **slots**.
 
-A rule's `LookAhead` distance is the width of its left part, and past a squeeze
-that width is in slots. `applyCompactionSchedule` rewrites every `lenA`
-accordingly. A token that already existed at the squeeze owns one position, so it
-is 1 slot wide; one built later sits on top of several, so its width is the sum of
-its parts, recursively, stopping at the first part that was present or is a base
-byte.
+Distances then change meaning: a rule's `LookAhead` distance is the width of its
+left part, and after a squeeze that must be a slot distance.
+`applyCompactionSchedule` rewrites every `lenA`, which needs one fact per token —
+*was it already built when we compacted?* Yes → it owns a position → 1 slot.
+No → it sits on top of several, so sum its parts recursively, stopping at the
+first part that was present (or is a base byte).
 
-Kernels run in order and a compaction happens after a specific kernel, so the
-kernel that builds a token is also when it was built:
+Kernels run in order and a compaction happens after a specific kernel, so "which
+kernel built this token" is "when was it built":
 
 ```cpp
 if (id < 256) return 1;                              // base byte, from the seed
@@ -521,13 +509,16 @@ if (k != kernelOf.end() && (long) k->second <= lastCompactKernel)
 // otherwise: slotSpan(left part) + slotSpan(right part)
 ```
 
-`kernelOf[idAB]` is built alongside `parts` in the same walk over the groups, so
-it is valid for either partition. Testing `id < hi` instead would only be
-equivalent when groups tile the id axis in rank order, which `--level-partition`
-does not.
+This was previously approximated by `id < frontier` (`frontier = g.hi`), which is
+equivalent **only** when groups tile the id axis in rank order — true for clean
+ranges, false under `--level-partition` where `hi` is a running max. Every id then
+tested as already built, every `lenA` collapsed to 1, and merges whose left part
+postdates the squeeze silently never fired (`Ġrestaurant` → `Ġrestaur` + `ant`;
+3134 tokens instead of 2708 on `webtext_10`). Word prefixes stayed correct because
+their left parts predate the squeeze, which made the failure look selective.
 
-Slot width is a property of a token measured against a particular squeeze, so the
-memo is cleared at every compaction point.
+Slot width is a property of a token *measured against a particular squeeze*, so
+the memo is cleared at every compaction point.
 
 ### How grouping is meant to help
 

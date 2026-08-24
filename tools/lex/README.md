@@ -16,6 +16,23 @@ Parabix project requirements:
 - The cmake build system version 3.12 or better.
 - Boost libraries version 1.61 or better (Ubuntu: `libboost-all-dev`).
 - LLVM system version 12 or later (built in Release mode).
+- ICU development libraries, components `uc` and `i18n` (Ubuntu:
+  `libicu-dev`; macOS/Homebrew: `brew install icu4c`). `tools/lex/CMakeLists.txt`
+  does `find_package(ICU REQUIRED COMPONENTS uc i18n)` and links `ICU::uc` +
+  `ICU::i18n` — `ICU_Boundaries.cpp` uses ICU's `BreakIterator` for locale-aware
+  word boundaries, so the tokenizer does not build without it. If Homebrew's
+  keg-only `icu4c` is not found, configure with
+  `-DCMAKE_PREFIX_PATH=$(brew --prefix icu4c)`.
+- A JSON parser: [nlohmann/json](https://github.com/nlohmann/json) (header-only).
+  `bpe.cpp` does `#include <nlohmann/json.hpp>` to parse `vocab.json`, and
+  `CMakeLists.txt` puts `tools/lex/third_party` on the include path — so the
+  single header must be present at `tools/lex/third_party/nlohmann/json.hpp`:
+
+  ```bash
+  mkdir -p tools/lex/third_party/nlohmann
+  curl -L -o tools/lex/third_party/nlohmann/json.hpp \
+      https://github.com/nlohmann/json/releases/latest/download/json.hpp
+  ```
 
 ## Build
 
@@ -232,6 +249,33 @@ many more kernels, which is what drives the fixed per-call dispatch floor (see
 The Python ground truth for this partition is
 `tools/lex/merge_analysis.py::clean_range_analysis`.
 
+### Alternative partition — ASAP level scheduling (`--level-partition`)
+
+`levelPartition()` assigns each rule its earliest legal kernel:
+
+```
+level(r) = 1 + max( level(producer of idA), level(producer of idB),
+                    level of any lower-rank rule sharing a seam with r )
+```
+
+Rules with equal level share a kernel. Both conditions above still hold; the
+kernel count is the constraint DAG's longest path, a provable minimum. Full
+GPT-2: **283 kernels**, mean group size 176.7.
+
+Levels are not rank intervals — level 1 holds rank 0 alongside rank 47815 — so
+the two conditions are tested directly rather than through id order:
+
+* condition 1 — `prodLevel[id]` gives the kernel that stamps each id.
+* condition 2 — `maxLeft[tok]` / `maxRight[tok]` give the highest level using
+  that token as a left / right part, tested in O(1) against every rule scheduled
+  so far. Only `maxRight[idA]` and `maxLeft[idB]` are consulted; same-side
+  sharing is harmless, since those rules' B parts differ.
+
+Group `hi` is a running maximum across levels, since a kernel's output carries
+ids from every lower level. This keeps `W_out` monotonic, at 16 bits throughout
+rather than the clean-range mean of 14.2. `hi` is a **width bound only** — not an
+"already stamped" watermark (see [Compaction and slot distances](#compaction-and-slot-distances)).
+
 ### Runtime pipeline — `buildBPEPassPipeline()`
 
 A `source` id stream and a 1-bit `inPlayMask` thread kernel → kernel.
@@ -395,6 +439,27 @@ the input `Ġthe`, should cascade `Ġ`+`t` → `Ġt` then `Ġt`+`he` → `Ġthe`
   (`'d` inside `'default'`). The contraction-context rule described above was
   added to fix that case and is verified on targeted probes; **re-verification
   over the full 24 MB corpus is still pending.**
+- `--level-partition` (283 kernels) is byte-identical to the default partition
+  (1123) and matches HuggingFace on `webtext_10`, `val_2MB` and `val_4MB`; with
+  compaction it matches on `webtext_10` and `val_4MB`. **Untested:**
+  `--level-partition` with grouped-if.
+
+Throughput on `val_2MB`, `--pretokenizer=bytelevel --bench-loop=5`, min of 5, all
+cells from one session (the same config drifts ~16% between sessions, so only
+compare within a run):
+
+| config | kernels | min ms | vs plain |
+|---|---|---|---|
+| plain | 1123 | 2172.7 | 1.00x |
+| `--compact-base=40` | 1123 | 1207.6 | 1.80x |
+| `--level-partition` | 283 | 1178.2 | 1.84x |
+| `--level-partition --compact-base=40` | 283 | 541.7 | 4.01x |
+| `--level-partition --geometric-compaction --compact-base=15` | 283 | 523.4 | **4.15x** |
+
+They compose super-multiplicatively (1.80 x 1.84 = 3.3, actual 4.15). The levers
+are separable: level-partition cuts the fixed dispatch floor (measured 167.5 →
+43.0 ms, matching the 4x kernel drop) while costing ~13% marginal rate from the
+wider streams; compaction raises the marginal rate.
 
 Note that `bpe.cpp`'s top-of-file header comment and part of `bpe.h`'s comment on
 `BPEPassResult` still describe an older end-anchored, emit-everything design
@@ -422,6 +487,7 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 
 | Flag | Default | Cache tag | What it does |
 |---|---|---|---|
+| `--level-partition` | off | (via rule set + `o{bits}`) | Partition merge rules by **ASAP level scheduling**: each rule takes the earliest kernel its dependencies and seam conflicts allow. Full GPT-2: **283 kernels** (clean ranges: 1123). Output byte-identical — see [Alternative partition](#alternative-partition--asap-level-scheduling---level-partition). |
 | `--compact-base=N` | `0` (off) | `L{maxLen}` | Base kernel index at which `FilterByMask` compaction first shrinks the inter-kernel streams. `0` = no compaction. Larger streams stay full-width; compaction trades a per-point compact/expand cost for cheaper downstream kernels. |
 | `--geometric-compaction` | off | (via `L`) | Space the compaction points geometrically instead of arithmetically (denser early, sparser later). Only meaningful with `--compact-base > 0`. |
 | `--if-group-lower-limit=N` | `-1` (off) | `g{size}_` | **Master switch for grouped-if.** For kernels at/after index `N`, replace the one-`createIf`-per-rule structure with range-gated group gates (rules sorted by `idA`, chopped into chunks, one `createIf` per chunk on the id range it spans). A block with no live id in a chunk's range skips that whole chunk. `-1` = per-rule ifs everywhere. |
@@ -429,6 +495,39 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 | `--if-group-size=S` | `1` | `g{S}_` | **Fixed** `S` rules per gate regardless of kernel size (gate count = `rules/S`). **Overrides `--if-group-count` when `!= 1`.** `1` = defer to `--if-group-count`. |
 | `--lookahead-in-gate` | off | `la1_` | Build the B-detection `LookAhead` **inside each rule's** `createIf` (skippable on cold blocks) instead of one shared shift hoisted outside all gates. Skippable but **duplicated per rule** (loses the per-lenA dedup). Works with or without grouping. |
 | `--lookahead-in-group` | off | `lg1_` | **Grouped kernels only.** Build the B-detection `LookAhead` **inside each group's** `createIf`, **cached per distinct `lenA`** so the chunk's rules share it. Combines dedup (unlike `--lookahead-in-gate`) with cold-chunk skip (unlike the hoisted shift). Needs `--if-group-lower-limit >= 0`; no effect on ungrouped kernels. |
+
+### Compaction and slot distances
+
+`--compact-base=N` inserts a `FilterByMask` after every N kernels. Merges kill
+positions without shrinking the stream, so later kernels otherwise keep scanning
+dead bytes. The filter keeps exactly the live token starts, one position each —
+call those **slots**.
+
+A rule's `LookAhead` distance is the width of its left part, and past a squeeze
+that width is in slots. `applyCompactionSchedule` rewrites every `lenA`
+accordingly. A token that already existed at the squeeze owns one position, so it
+is 1 slot wide; one built later sits on top of several, so its width is the sum of
+its parts, recursively, stopping at the first part that was present or is a base
+byte.
+
+Kernels run in order and a compaction happens after a specific kernel, so the
+kernel that builds a token is also when it was built:
+
+```cpp
+if (id < 256) return 1;                              // base byte, from the seed
+auto k = kernelOf.find(id);
+if (k != kernelOf.end() && (long) k->second <= lastCompactKernel)
+    return 1;                                        // built at/before the squeeze
+// otherwise: slotSpan(left part) + slotSpan(right part)
+```
+
+`kernelOf[idAB]` is built alongside `parts` in the same walk over the groups, so
+it is valid for either partition. Testing `id < hi` instead would only be
+equivalent when groups tile the id axis in rank order, which `--level-partition`
+does not.
+
+Slot width is a property of a token measured against a particular squeeze, so the
+memo is cleared at every compaction point.
 
 ### How grouping is meant to help
 
@@ -449,9 +548,16 @@ Every optimization must be **byte-identical** to the baseline. Two ways to check
 
 ```bash
 cd tokenizer-test
-python3 compare_bpe.py                       # baseline
-# add the flags under test to the parabix invocation and re-run; must stay PASS
+python3 compare_bpe.py --no-timing                              # baseline
+python3 compare_bpe.py --no-timing --tok-flag=--level-partition # flag under test
 ```
+
+`--tok-flag` is repeatable and forwards verbatim to the binary; use the `=` form
+or argparse swallows the next `--...` token. The run prints
+`Extra tokenizer flags: …` when any are active — no such line means the default
+path was tested. `--no-timing` skips the throughput section, which builds its
+command *without* `--pretokenizer=bytelevel` and would otherwise JIT and measure a
+different pipeline than the one just verified.
 
 **2. Self-consistency** (fast, dev merges) — the same input through two flag
 settings must produce identical tokens:
@@ -463,6 +569,10 @@ build19/bin/tokenizer --merges=tools/lex/merges.txt \
     --if-group-lower-limit=0 --if-group-count=3 --lookahead-in-group "$IN" > /tmp/b.txt
 diff -q /tmp/a.txt /tmp/b.txt && echo IDENTICAL
 ```
+
+`tokenizer-test/bench_configs.py --verify` automates this — it hashes each
+config's tokens against the baseline and reports `IDENTICAL` / `DIFFERS` beside
+the timings, so "faster but wrong" is flagged rather than read as a win.
 
 ### Performance testing
 

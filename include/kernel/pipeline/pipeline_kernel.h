@@ -121,7 +121,7 @@ public:
         return mLengthAssertions;
     }
 
-    void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM) final;
+    void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType) final;
 
     std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
@@ -197,13 +197,13 @@ private:
 
     void addAdditionalFunctions(KernelBuilder & b) final;
 
-    void addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) final;
+    void addInternalProperties(KernelBuilder & b) final;
 
     void generateInitializeMethod(KernelBuilder & b) final;
 
     void generateInitializeThreadLocalMethod(KernelBuilder & b) final;
 
-    void generateKernelMethod(KernelBuilder & b) final;
+    void generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
     void generateFinalizeThreadLocalMethod(KernelBuilder & b) final;
 

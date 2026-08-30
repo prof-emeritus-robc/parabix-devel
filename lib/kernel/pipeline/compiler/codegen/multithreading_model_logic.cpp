@@ -165,7 +165,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
         args.push_back(ConstantPointerNull::get(cast<PointerType>(initialThreadLocal->getType())));
         cThreadLocal = mTarget->initializeThreadLocalInstance(b, args);
         if (LLVM_LIKELY(mTarget->allocatesInternalStreamSets())) {
-            Function * const allocInternal = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, true);
+            Function * const allocInternal = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, true, getKernelLinkageType(mKernelId));
             SmallVector<Value *, 3> allocArgs;
             if (LLVM_LIKELY(mTarget->getSharedStateType())) {
                 allocArgs.push_back(initialSharedState);

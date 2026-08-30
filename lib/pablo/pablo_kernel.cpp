@@ -180,7 +180,7 @@ Ones * PabloKernel::getAllOnesValue(Type * type) {
     return value;
 }
 
-void PabloKernel::addInternalProperties(KernelBuilder & b, TargetMachine *TM) {
+void PabloKernel::addInternalProperties(KernelBuilder & b) {
     mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
     auto & C = b.getContext();
     mContext = &C;

@@ -91,7 +91,7 @@ inline bool isNonMatchingSignature(const MDString * const received, const String
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedObjectFile
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept {
+ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept {
 
     // Have we already seen this signature before? if so, we can safely assume that the ExecutionEngine
     // will have a compiled module for this kernel when we execute the pipeline.
@@ -103,13 +103,13 @@ std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(ker
     fileName.append(KERNEL_FILE_EXTENSION);
     auto kernelBuffer = MemoryBuffer::getFile(fileName, false, false, false);
     if (kernelBuffer) {
-        auto loadedFile = getOwningLazyBitcodeModule(std::move(kernelBuffer.get()), builder.getContext());
+        auto loadedFile = parseBitcodeFile((*kernelBuffer)->getMemBufferRef(), builder.getContext());
         if (LLVM_LIKELY(loadedFile)) {
 
-            Module * const H = loadedFile.get().get();
+            std::unique_ptr<Module> H{std::move(*loadedFile)};
 
             if (LLVM_UNLIKELY(kernel->hasSignature())) {
-                const MDString * const sig = kernel::Kernel::readSignatureFromModule(H);
+                const MDString * const sig = kernel::Kernel::readSignatureFromModule(H.get());
                 assert ("signature is missing from kernel file: possible module naming conflict or change in the LLVM metadata storage policy?" && sig);
                 if (LLVM_UNLIKELY(isNonMatchingSignature(sig, kernel->getSignature()))) {
                     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
@@ -117,14 +117,12 @@ std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(ker
                                   "Expected: " << kernel->getSignature() << "\n"
                                   "Loaded:   " << sig->getString() << "\n";
                     }
-                    return nullptr;
+                    return LoadResult{nullptr, nullptr};
                 }
             }
             sys::path::replace_extension(fileName, OBJECT_FILE_EXTENSION);
             auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), false, false, false);
             if (LLVM_LIKELY(objectBuffer)) {
-
-                kernel->loadCachedKernel(H);
 
                 // defaults to <path>/<moduleId>.kernel
                 auto obj = std::move(*objectBuffer);
@@ -138,13 +136,14 @@ std::unique_ptr<llvm::MemoryBuffer> ParabixObjectCache::loadCachedObjectFile(ker
                 if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
                     errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
                 }
-                return obj;
+
+                return std::make_pair(std::move(obj), std::move(H));
             }
         } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
             errs() << "Failed to load cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
         }
     }
-    return nullptr;
+    return LoadResult{nullptr, nullptr};
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

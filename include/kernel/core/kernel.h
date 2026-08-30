@@ -83,11 +83,9 @@ public:
     };
 
     enum KernelFlags {
-        KernelIsStateful = 1
-        , KernelHasThreadLocal = 2
-        , HasInternallyManagedStreamSet = 4
-        , RequiresIllustratorObject = 8
-        , HasInOutStreamSet = 16
+        HasInternallyManagedStreamSet = 1
+        , RequiresIllustratorObject = 2
+        , HasInOutStreamSet = 4
     };
 
     using InitArgs = llvm::SmallVector<llvm::Value *, 32>;
@@ -404,10 +402,18 @@ public:
         return mSharedStateType;
     }
 
+    void setSharedStateType(llvm::StructType * stateTy) {
+        mSharedStateType = stateTy;
+    }
+
     llvm::StructType * getSharedStateType(llvm::LLVMContext & C) const;
 
     llvm::StructType * getThreadLocalStateType() const {
         return mThreadLocalStateType;
+    }
+
+    void setThreadLocalStateType(llvm::StructType * stateTy) {
+        mThreadLocalStateType = stateTy;
     }
 
     llvm::StructType * getThreadLocalStateType(llvm::LLVMContext & C) const;
@@ -416,9 +422,11 @@ public:
 
     llvm::Module * makeEmptyModule(KernelBuilder & b);
 
-    void declareKernel(KernelBuilder & b, llvm::TargetMachine * TM);
+    void declareStateTypes(KernelBuilder & b);
 
-    void generateKernel(KernelBuilder & b, llvm::TargetMachine * TM);
+    void declareKernel(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType);
+
+    void generateKernel(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType);
 
     void loadCachedKernel(const llvm::Module * m);
 
@@ -452,7 +460,7 @@ public:
 
     LLVM_READNONE bool canSetTerminateSignal() const;
 
-    virtual void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM);
+    virtual void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType);
 
     virtual std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b);
 
@@ -476,39 +484,39 @@ protected:
         StateTypes(llvm::StructType * shared, llvm::StructType * threadLocal) : Shared(shared), ThreadLocal(threadLocal) {}
     };
 
-    llvm::Function * getInitializeFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getInitializeFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addInitializeDeclaration(KernelBuilder & b) const;
+    llvm::Function * addInitializeDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * getExpectedOutputSizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getExpectedOutputSizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addExpectedOutputSizeDeclaration(KernelBuilder & b) const;
+    llvm::Function * addExpectedOutputSizeDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getAllocateSharedInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder & b) const;
+    llvm::Function * addAllocateSharedInternalStreamSetsDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * getInitializeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getInitializeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addInitializeThreadLocalDeclaration(KernelBuilder & b) const;
+    llvm::Function * addInitializeThreadLocalDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBuilder & b) const;
+    llvm::Function * addAllocateThreadLocalInternalStreamSetsDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
     std::vector<llvm::Type *> getDoSegmentFields(KernelBuilder & b) const;
 
-    llvm::Function * getDoSegmentFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getDoSegmentFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addDoSegmentDeclaration(KernelBuilder & b) const;
+    llvm::Function * addDoSegmentDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * getFinalizeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getFinalizeThreadLocalFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addFinalizeThreadLocalDeclaration(KernelBuilder & b) const;
+    llvm::Function * addFinalizeThreadLocalDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * getFinalizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration) const;
+    llvm::Function * getFinalizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
-    llvm::Function * addFinalizeDeclaration(KernelBuilder & b) const;
+    llvm::Function * addFinalizeDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
     enum class OptimizationPass {
         DCEPass,
@@ -570,13 +578,11 @@ protected:
 
     LLVM_READNONE bool hasFixedRateIO() const;
 
-    virtual void addInternalProperties(KernelBuilder &, llvm::TargetMachine *) { }
+    virtual void addInternalProperties(KernelBuilder &) { }
 
     virtual void addAdditionalFunctions(KernelBuilder &) { }
 
-    StateTypes constructStateTypes(KernelBuilder & b) const;
-
-    void generateOrLoadKernel(KernelBuilder & b, llvm::TargetMachine * TM);
+    void constructStateTypes(KernelBuilder & b);
 
     virtual void generateInitializeMethod(KernelBuilder &) { }
 
@@ -588,7 +594,7 @@ protected:
 
     virtual void generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides);
 
-    virtual void generateKernelMethod(KernelBuilder &) = 0;
+    virtual void generateKernelMethod(KernelBuilder &, llvm::TargetMachine *) = 0;
 
     virtual void generateFinalizeThreadLocalMethod(KernelBuilder &) { }
 
@@ -598,7 +604,7 @@ protected:
 
 public:
 
-    void addSymbols(llvm::orc::MangleAndInterner &mangler, llvm::orc::SymbolFlagsMap & symbols) const;
+    void addSymbols(llvm::orc::MangleAndInterner &mangler, llvm::orc::SymbolLookupSet & symbols) const;
 
     static const llvm::MDString * readSignatureFromModule(const llvm::Module * const M);
 
@@ -629,10 +635,6 @@ protected:
            unsigned flags = 0);
 
     static std::string annotateKernelNameWithDebugFlags(const TypeId id, const unsigned flags, std::string && name);
-
-    bool isInternalKernel() const {
-        return (mTypeId >= TypeId::PopCountKernel);
-    }
 
     struct FunctionLink {
         const llvm::StringRef       UnmanagedName;
@@ -693,7 +695,7 @@ public:
 
 protected:
 
-    void generateKernelMethod(KernelBuilder & b) final;
+    void generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
 };
 
@@ -731,7 +733,7 @@ protected:
 
 private:
 
-    void generateKernelMethod(KernelBuilder & b) final;
+    void generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
 };
 

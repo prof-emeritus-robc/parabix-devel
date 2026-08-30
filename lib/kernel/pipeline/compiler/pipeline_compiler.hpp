@@ -165,14 +165,15 @@ public:
 
     PipelineCompiler(KernelBuilder & b, PipelineKernel * const pipelineKernel);
 
-    void generateImplicitKernels(KernelBuilder & b, TargetMachine *TM);
+    void constructImplicitKernelStateTypes(KernelBuilder & b);
+    void generateImplicitKernels(KernelBuilder & b, TargetMachine * TM);
     void addPipelineKernelProperties(KernelBuilder & b);
     void constructStreamSetBuffers(KernelBuilder & b) override;
     void generateInitializeMethod(KernelBuilder & b);
     void generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, Value * const segmentSize);
     void generateInitializeThreadLocalMethod(KernelBuilder & b);
     void generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder & b, Value * segmentSize);
-    void generateKernelMethod(KernelBuilder & b);
+    void generateKernelMethod(KernelBuilder & b, TargetMachine *TM);
     void generateFinalizeMethod(KernelBuilder & b);
     void generateFinalizeThreadLocalMethod(KernelBuilder & b);
     std::vector<Value *> getFinalOutputScalars(KernelBuilder & b) override;
@@ -232,6 +233,8 @@ public:
     inline Value * isProcessThread(KernelBuilder & b, StructType * const threadStateTy, Value * const threadState) const;
     void updateExternalProducedItemCounts(KernelBuilder & b);
     void writeMaximumStrideLengthMetadata(KernelBuilder & b) const;
+
+    GlobalValue::LinkageTypes getKernelLinkageType(const size_t kernelId) const;
 
 // partitioning codegen functions
 
@@ -691,6 +694,8 @@ protected:
     const InOutGraph                            InOutStreamSetReplacement;
     const ThreadLocalPlacementGraph             ThreadLocalPlacement;
     const ThreadLocalConflictGraphType          ThreadLocalConflictGraph;
+
+    StringMap<Kernel *>                         UniqueImplicitKernelInstances;
 
     // pipeline state
     bool                                        mKernelRequiresIllustratorObject = false;

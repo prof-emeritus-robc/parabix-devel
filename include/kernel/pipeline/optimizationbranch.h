@@ -50,9 +50,9 @@ protected:
                        Bindings && scalar_inputs,
                        Bindings && scalar_outputs);
 
-    void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM) override;
+    void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType) override;
 
-    void addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) override;
+    void addInternalProperties(KernelBuilder & b) override;
 
     void generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides) override;
 
@@ -62,7 +62,7 @@ protected:
 
     void generateInitializeThreadLocalMethod(KernelBuilder & b) override;
 
-    void generateKernelMethod(KernelBuilder & b) override;
+    void generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) override;
 
     void generateFinalizeThreadLocalMethod(KernelBuilder & b) override;
 

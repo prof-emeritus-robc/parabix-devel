@@ -370,7 +370,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
             SmallVector<char, 256> tmp;
             raw_svector_ostream out(tmp);
 
-            Function * const func = mKernel->getDoSegmentFunction(b, true);
+            Function * const func = mKernel->getDoSegmentFunction(b, true, getKernelLinkageType(mKernelId));
 
             out << mKernel->getName() << ": "
                 "invalid argument type for ";

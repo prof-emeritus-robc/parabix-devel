@@ -152,10 +152,22 @@ void PipelineCompiler::addFamilyCallInitializationArguments(KernelBuilder & b, c
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getKernelLinkageType
+ ** ------------------------------------------------------------------------------------------------------------- */
+GlobalValue::LinkageTypes PipelineCompiler::getKernelLinkageType(const size_t kernelId) const {
+    auto & S = mStreamGraph[kernelId];
+    if (S.Flags & RelationshipNodeFlag::ImplicitlyAdded) {
+        return GlobalValue::InternalLinkage;
+    } else {
+        return GlobalValue::ExternalLinkage;
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief getInitializationFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelInitializeFunction(KernelBuilder & b, const ArgVec & args) const {
-    Function * const init = mKernel->getInitializeFunction(b, true);
+    Function * const init = mKernel->getInitializeFunction(b, true, getKernelLinkageType(mKernelId));
     assert (init->getFunctionType()->getNumParams() == args.size());
     return b.CreateCall(init->getFunctionType(), init, args);
 }
@@ -164,7 +176,7 @@ Value * PipelineCompiler::callKernelInitializeFunction(KernelBuilder & b, const 
  * @brief getInitializationThreadLocalFunction
  ** ------------------------------------------------------------------------------------------------------------- */
  void PipelineCompiler::callKernelInitializeThreadLocalFunction(KernelBuilder & b) const {
-    Function * const init = mKernel->getInitializeThreadLocalFunction(b, true);
+    Function * const init = mKernel->getInitializeThreadLocalFunction(b, true, getKernelLinkageType(mKernelId));
     Value * func = init;
     if (isKernelFamilyCall(mKernelId)) {
         func = getFamilyFunctionFromKernelState(b, init->getType(), INITIALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX);
@@ -203,7 +215,7 @@ Value * PipelineCompiler::callKernelInitializeFunction(KernelBuilder & b, const 
  * @brief getKernelAllocateSharedInternalStreamSetsFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 std::pair<Value *, FunctionType *> PipelineCompiler::getKernelAllocateSharedInternalStreamSetsFunction(KernelBuilder & b) const {
-    Function * const term = mKernel->getAllocateSharedInternalStreamSetsFunction(b, true);
+    Function * const term = mKernel->getAllocateSharedInternalStreamSetsFunction(b, true, getKernelLinkageType(mKernelId));
     FunctionType * funcTy = term->getFunctionType(); assert (funcTy);
     Value * func = term;
     if (isKernelFamilyCall(mKernelId)) {
@@ -216,7 +228,7 @@ std::pair<Value *, FunctionType *> PipelineCompiler::getKernelAllocateSharedInte
  * @brief getKernelAllocateThreadLocalInternalStreamSetsFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 std::pair<Value *, FunctionType *> PipelineCompiler::getKernelAllocateThreadLocalInternalStreamSetsFunction(KernelBuilder & b) const {
-    Function * const term = mKernel->getAllocateThreadLocalInternalStreamSetsFunction(b, true);
+    Function * const term = mKernel->getAllocateThreadLocalInternalStreamSetsFunction(b, true, getKernelLinkageType(mKernelId));
     FunctionType * funcTy = term->getFunctionType();
     Value * func = term;
     if (isKernelFamilyCall(mKernelId)) {
@@ -229,7 +241,7 @@ std::pair<Value *, FunctionType *> PipelineCompiler::getKernelAllocateThreadLoca
  * @brief getDoSegmentFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 std::pair<Value *, FunctionType *> PipelineCompiler::getKernelDoSegmentFunction(KernelBuilder & b) const {
-    Function * const doSegment = mKernel->getDoSegmentFunction(b, true);
+    Function * const doSegment = mKernel->getDoSegmentFunction(b, true, getKernelLinkageType(mKernelId));
     FunctionType * const funcTy = doSegment->getFunctionType();
     Value * funcPtr = doSegment;
     if (isKernelFamilyCall(mKernelId)) {
@@ -243,7 +255,7 @@ std::pair<Value *, FunctionType *> PipelineCompiler::getKernelDoSegmentFunction(
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelExpectedSourceOutputSizeFunction(KernelBuilder & b, ArrayRef<Value *> args) const {
     // TODO: need to make this support a family function call
-    Function * const func = mKernel->getExpectedOutputSizeFunction(b, true);
+    Function * const func = mKernel->getExpectedOutputSizeFunction(b, true, getKernelLinkageType(mKernelId));
     assert (func->getFunctionType()->getNumParams() == args.size());
     return b.CreateCall(func->getFunctionType(), func, args);
 }
@@ -252,7 +264,7 @@ Value * PipelineCompiler::callKernelExpectedSourceOutputSizeFunction(KernelBuild
  * @brief getInitializationThreadLocalFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelFinalizeThreadLocalFunction(KernelBuilder & b, const SmallVector<Value *, 2> & args) const {
-    Function * const finalize = mKernel->getFinalizeThreadLocalFunction(b, true);
+    Function * const finalize = mKernel->getFinalizeThreadLocalFunction(b, true, getKernelLinkageType(mKernelId));
     Value * func = finalize;
     if (isKernelFamilyCall(mKernelId)) {
         func = getFamilyFunctionFromKernelState(b, finalize->getType(), FINALIZE_THREAD_LOCAL_FUNCTION_POINTER_SUFFIX);
@@ -264,7 +276,7 @@ Value * PipelineCompiler::callKernelFinalizeThreadLocalFunction(KernelBuilder & 
  * @brief getFinalizeFunction
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::callKernelFinalizeFunction(KernelBuilder & b, const SmallVector<Value *, 1> & args) const {
-    Function * const term = mKernel->getFinalizeFunction(b, true);
+    Function * const term = mKernel->getFinalizeFunction(b, true, getKernelLinkageType(mKernelId));
     Value * func = term;
     if (isKernelFamilyCall(mKernelId)) {
         func = getFamilyFunctionFromKernelState(b, term->getType(), FINALIZE_FUNCTION_POINTER_SUFFIX);

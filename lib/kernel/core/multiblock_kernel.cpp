@@ -19,7 +19,7 @@ using Rational = ProcessingRate::Rational;
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernelMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void MultiBlockKernel::generateKernelMethod(KernelBuilder & b) {
+void MultiBlockKernel::generateKernelMethod(KernelBuilder & b, TargetMachine *TM) {
     generateMultiBlockLogic(b, b.getNumOfStrides());
 }
 

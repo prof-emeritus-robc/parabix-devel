@@ -86,8 +86,7 @@ void terminatePAPI(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInternalKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) {
-    COMPILER->generateImplicitKernels(b, TM);
+void PipelineKernel::addInternalProperties(KernelBuilder & b) {
     COMPILER->addPipelineKernelProperties(b);
 }
 
@@ -108,8 +107,8 @@ void PipelineKernel::generateInitializeThreadLocalMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernelMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::generateKernelMethod(KernelBuilder & b) {
-    COMPILER->generateKernelMethod(b);
+void PipelineKernel::generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) {
+    COMPILER->generateKernelMethod(b, TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -129,11 +128,11 @@ void PipelineKernel::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM) {
+void PipelineKernel::addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType) {
+    Kernel::addKernelDeclarations(b, TM, linkageType);
     for (const auto & k : mKernels) {
-        k.Object->addKernelDeclarations(b, TM);
+        k.Object->addKernelDeclarations(b, TM, GlobalValue::ExternalLinkage);
     }
-    Kernel::addKernelDeclarations(b, TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -154,7 +153,6 @@ void PipelineKernel::generateAllocateThreadLocalInternalStreamSetsMethod(KernelB
  * @brief linkExternalMethods
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::linkExternalMethods(KernelBuilder & b) {
-    errs() << "PipelineKernel::linkExternalMethods " << getName() << "\n";
     PipelineCompiler::linkPipelineExternalMethods(b);
     StreamSetBuffer::linkFunctions(b);
     for (const auto & k : mKernels) {
@@ -520,10 +518,10 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     }
 
     Module * const m = b.getModule();
-    Function * const doSegment = getDoSegmentFunction(b, true);
+    Function * const doSegment = getDoSegmentFunction(b, true, GlobalValue::ExternalLinkage);
     assert (doSegment->arg_size() >= suppliedArgs);
    //  const auto numOfDoSegArgs = doSegment->arg_size() - suppliedArgs;
-    Function * const terminate = getFinalizeFunction(b, true);
+    Function * const terminate = getFinalizeFunction(b, true, GlobalValue::ExternalLinkage);
 
     const auto numOfStreamSets = mInputStreamSets.size() + mOutputStreamSets.size();
 
@@ -810,7 +808,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
         ConstantInt * const sz_BufferSize = b.getSize(segLength * codegen::BufferSegments);
 
-        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b, true);
+        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b, true, GlobalValue::ExternalLinkage);
         SmallVector<Value *, 4> allocArgs;
         if (LLVM_LIKELY(mSharedStateType)) {
             allocArgs.push_back(sharedHandle);
@@ -824,7 +822,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         }
         b.CreateCall(allocShared->getFunctionType(), allocShared, allocArgs);
         if (LLVM_LIKELY(mThreadLocalStateType)) {
-            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b, true);
+            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b, true, GlobalValue::ExternalLinkage);
             SmallVector<Value *, 3> allocArgs;
             if (LLVM_LIKELY(mSharedStateType)) {
                 allocArgs.push_back(sharedHandle);

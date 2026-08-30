@@ -11,23 +11,41 @@ void PipelineCompiler::bindAdditionalInitializationArguments(KernelBuilder & b, 
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief constructImplicitKernelStateTypes
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::constructImplicitKernelStateTypes(KernelBuilder & b) {
+    assert (UniqueImplicitKernelInstances.empty());
+    for (auto i = FirstKernel; i <= LastKernel; ++i) {
+        auto & S = mStreamGraph[i];
+        if (S.Flags & RelationshipNodeFlag::ImplicitlyAdded) {
+            Kernel * const K = const_cast<Kernel *>(getKernel(i));
+            const auto sig = K->hasSignature() ? K->getSignature() : StringRef{K->getName()};
+            auto entry = UniqueImplicitKernelInstances.insert(std::make_pair(sig, K));
+            if (entry.second) {
+                K->declareStateTypes(b);
+            } else {
+                Kernel * const other = entry.first->getValue();
+                K->setSharedStateType(other->getSharedStateType());
+                K->setThreadLocalStateType(other->getThreadLocalStateType());
+            }
+        }
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateImplicitKernels
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::generateImplicitKernels(KernelBuilder & b, llvm::TargetMachine * TM) {
-    for (auto i = FirstKernel; i <= LastKernel; ++i) {
-
-        auto & S = mStreamGraph[i];
-
-        if (S.Flags & RelationshipNodeFlag::ImplicitlyAdded) {
-            const_cast<Kernel *>(getKernel(i))->generateOrLoadKernel(b, TM);
-        }
-
-
-        // G.add(RelationshipNode::IsKernel, popCountKernel, RelationshipNodeFlag::ImplicitlyAdded);
-
-
-
+    if (UniqueImplicitKernelInstances.empty()) {
+        return;
     }
+    BasicBlock * bb = b.GetInsertBlock();
+    auto ip = b.saveIP();
+    for (auto & itr : UniqueImplicitKernelInstances) {
+        itr.getValue()->generateKernel(b, TM, GlobalValue::InternalLinkage);
+    }
+    b.restoreIP(ip);
+    assert (b.GetInsertBlock() == bb);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -51,6 +69,8 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
     // pipeline to pass an input scalar to a kernel rather than recording it needlessly?
     // Non-family kernels can be contained within the shared state but family ones
     // must be allocated dynamically.
+
+    constructImplicitKernelStateTypes(b);
 
     IntegerType * const sizeTy = b.getSizeTy();
 
@@ -148,6 +168,7 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
     assert (FirstKernel <= kernelId && kernelId <= LastKernel);
     mKernelId = kernelId;
     mKernel = getKernel(kernelId);
+
 
     bool allowDataParallelExecution = false;
 
@@ -325,7 +346,7 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
                 }
                 args.push_back(sharedStateTySize);
 
-                StructType * threadLocalStateTy = mKernel->getSharedStateType();
+                StructType * threadLocalStateTy = mKernel->getThreadLocalStateType();
 
                 Constant * threadLocalTySize = nullptr;
                 if (threadLocalStateTy) {
@@ -356,6 +377,9 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
                 assert (isFromCurrentFunction(b, args[j], false));
             }
             #endif
+
+
+
             Value * const signal = callKernelInitializeFunction(b, args);
             Value * const terminatedOnInit = b.CreateICmpNE(signal, unterminated);
 
@@ -505,12 +529,13 @@ void PipelineCompiler::generateAllocateThreadLocalInternalStreamSetsMethod(Kerne
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernelMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineCompiler::generateKernelMethod(KernelBuilder & b) {
+void PipelineCompiler::generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) {
     if (LLVM_UNLIKELY(FirstKernel == PipelineInput)) {
         assert (FirstKernel == LastKernel);
         return;
     }
     getABIAlignments(b);
+    generateImplicitKernels(b, TM);
     initializeKernelAssertions(b);
     initializeScalarValues(b);
     if (mIsNestedPipeline) {

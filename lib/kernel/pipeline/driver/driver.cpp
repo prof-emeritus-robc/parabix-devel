@@ -123,12 +123,6 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         }
     }
 
-    auto sig = kernel->hasSignature() ? kernel->getSignature() : kernel->getName();
-
-    if (!mCompiledIdentifiers.insert(sig).second) {
-        return;
-    }
-
     mUncachedKernel.emplace_back(kernel);
 
 }

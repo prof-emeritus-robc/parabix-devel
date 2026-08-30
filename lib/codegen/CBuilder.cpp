@@ -2327,7 +2327,11 @@ Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
             if (!type->isLiteral()) {
                 st = StructType::getTypeByName(C, type->getName());
                 if (st && !st->isOpaque()) {
+                    #ifndef NDEBUG
+                    assert (&st->getContext() == &C);
                     assert (st->getNumElements() == type->getNumElements());
+                    assert (st->isPacked() == type->isPacked());
+                    #endif
                     return st;
                 }
             }

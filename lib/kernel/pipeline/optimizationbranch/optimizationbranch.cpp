@@ -16,16 +16,16 @@ std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(Ke
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addKernelDeclarations
  ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, TargetMachine * TM) {
-    mAllZeroKernel->addKernelDeclarations(b, TM);
-    mNonZeroKernel->addKernelDeclarations(b, TM);
-    Kernel::addKernelDeclarations(b, TM);
+void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType) {
+    mAllZeroKernel->addKernelDeclarations(b, TM, GlobalValue::WeakAnyLinkage);
+    mNonZeroKernel->addKernelDeclarations(b, TM, GlobalValue::WeakAnyLinkage);
+    Kernel::addKernelDeclarations(b, TM, linkageType);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInternalKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::addInternalProperties(KernelBuilder & b, TargetMachine * TM) {
+void OptimizationBranch::addInternalProperties(KernelBuilder & b) {
     COMPILER->addBranchProperties(b);
 }
 
@@ -60,7 +60,7 @@ void OptimizationBranch::generateInitializeThreadLocalMethod(KernelBuilder & b) 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateDoSegmentMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::generateKernelMethod(KernelBuilder & b) {
+void OptimizationBranch::generateKernelMethod(KernelBuilder & b, llvm::TargetMachine *TM) {
     COMPILER->generateKernelMethod(b);
 }
 

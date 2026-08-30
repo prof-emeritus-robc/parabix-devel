@@ -176,7 +176,7 @@ protected:
     // A custom method for preparing kernel declarations is needed,
     // so that the carry data requirements may be accommodated before
     // finalizing the KernelStateType.
-    void addInternalProperties(KernelBuilder & b, llvm::TargetMachine * TM) final;
+    void addInternalProperties(KernelBuilder & b) final;
 
     void linkExternalMethods(KernelBuilder & b) final;
 

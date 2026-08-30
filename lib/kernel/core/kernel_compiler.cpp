@@ -73,6 +73,8 @@
 #include <boost/core/bit.hpp>
 #endif
 
+#include <sys/file.h>
+
 #if BOOST_VERSION < 107600
 template <typename T> int scan_forward_zeroes(const T x) noexcept;
 template <> inline int scan_forward_zeroes<unsigned int>(const unsigned int x) noexcept { return __builtin_ctz(x); }
@@ -135,9 +137,9 @@ constexpr static auto TERMINATION_SIGNAL = "__termination_signal";
 // the "main" method.
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief declareKernel
+ * @brief constructStateTypes
  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::declareKernel(KernelBuilder & b, TargetMachine * TM) {
+void KernelCompiler::constructStateTypes(KernelBuilder & b) {
     auto const oc = b.getCompiler();
     b.setCompiler(this);
     constructStreamSetBuffers(b);
@@ -150,36 +152,37 @@ void KernelCompiler::declareKernel(KernelBuilder & b, TargetMachine * TM) {
     }
     #endif
     addBaseInternalProperties(b);
-    mTarget->addInternalProperties(b, TM);
-    mTarget->addKernelDeclarations(b, TM);
+    mTarget->addInternalProperties(b);
+    mTarget->constructStateTypes(b);
     b.setCompiler(oc);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernel
  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::generateKernel(KernelBuilder & b, TargetMachine * TM) {
+void KernelCompiler::generateKernel(KernelBuilder & b, TargetMachine * TM, GlobalValue::LinkageTypes linkageType) {
     // NOTE: make sure to keep and reset the original compiler here. A kernel could generate new kernels and
     // reuse the same KernelBuilder to do so; this could result in unexpected behaviour if the this function
     // exits without restoring the original compiler state.
     auto const oc = b.getCompiler();
     b.setCompiler(this);
-    callGenerateInitializeMethod(b);
+//    mTarget->addKernelDeclarations(b, TM, linkageType);
+    callGenerateInitializeMethod(b, linkageType);
     if (LLVM_UNLIKELY(mStreamSetInputBuffers.empty())) {
-        callGenerateExpectedOutputSizeMethod(b);
+        callGenerateExpectedOutputSizeMethod(b, linkageType);
     }
     if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
-        callGenerateAllocateSharedInternalStreamSets(b);
+        callGenerateAllocateSharedInternalStreamSets(b, linkageType);
     }
-    callGenerateDoSegmentMethod(b);
+    callGenerateDoSegmentMethod(b, TM, linkageType);
     if (LLVM_UNLIKELY(mTarget->getThreadLocalStateType())) {
-        callGenerateInitializeThreadLocalMethod(b);
+        callGenerateInitializeThreadLocalMethod(b, linkageType);
         if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
-            callGenerateAllocateThreadLocalInternalStreamSets(b);
+            callGenerateAllocateThreadLocalInternalStreamSets(b, linkageType);
         }
-        callGenerateFinalizeThreadLocalMethod(b);
+        callGenerateFinalizeThreadLocalMethod(b, linkageType);
     }
-    callGenerateFinalizeMethod(b);
+    callGenerateFinalizeMethod(b, linkageType);
     mTarget->addAdditionalFunctions(b);
 
     // TODO: we could create a LLVM optimization pass manager here and execute it on this kernel;
@@ -190,19 +193,26 @@ void KernelCompiler::generateKernel(KernelBuilder & b, TargetMachine * TM) {
     // What is the cost of generating a pass manager instance for each compiled kernel vs.
     // the complexity of using a factory?
 
-    #ifndef NDEBUG
-    SmallVector<char, 256> tmp;
-    raw_svector_ostream msg(tmp);
-    bool BrokenDebugInfo = false;
-    if (LLVM_UNLIKELY(llvm::verifyModule(*b.getModule(), &msg, &BrokenDebugInfo))) {
-        b.getModule()->print(errs(), nullptr);
-        report_fatal_error(StringRef(msg.str()));
-    }
-    #endif
+//    #ifndef NDEBUG
+//    SmallVector<char, 256> tmp;
+//    raw_svector_ostream msg(tmp);
+//    bool BrokenDebugInfo = false;
+//    if (LLVM_UNLIKELY(llvm::verifyModule(*b.getModule(), &msg, &BrokenDebugInfo))) {
+//        std::string tmp;
+//        raw_string_ostream errmsg(tmp);
+//        b.getModule()->print(errmsg, nullptr);
+//        errmsg << "\n\n" << mTarget->getName() << ": " << msg.str();
+////        while (flock(STDERR_FILENO, LOCK_EX) < 0) {
+////            if (errno != EINTR) break;
+////        }
+//        report_fatal_error(StringRef{errmsg.str()});
+////        flock(STDERR_FILENO, LOCK_UN);
+//    }
+//    #endif
 
-    Kernel::SelectedOptimizationPasses passes;
-    mTarget->addOptimizationPasses(b, passes);
-    runAllOptimizationPasses(b, passes, TM);
+//    Kernel::SelectedOptimizationPasses passes;
+//    mTarget->addOptimizationPasses(b, passes);
+//    runAllOptimizationPasses(b, passes, TM);
     b.setCompiler(oc);
 
 }
@@ -231,8 +241,6 @@ void KernelCompiler::addBaseInternalProperties(KernelBuilder & b) {
         mTarget->addNonPersistentScalar(sizeTy, TERMINATION_SIGNAL);
     }
 }
-
-
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief FilteredPrintFunctionPass
@@ -490,9 +498,8 @@ inline void reset(Vec & vec, const size_t n) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief callGenerateInitializeMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
-
-    mCurrentMethod = mTarget->getInitializeFunction(b, true);
+inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b, GlobalValue::LinkageTypes linkageType) {
+    mCurrentMethod = mTarget->getInitializeFunction(b, true, linkageType);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -593,9 +600,9 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief bindFamilyInitializationArguments
  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::callGenerateExpectedOutputSizeMethod(KernelBuilder & b) {
+void KernelCompiler::callGenerateExpectedOutputSizeMethod(KernelBuilder & b, GlobalValue::LinkageTypes linkageType) {
     assert (mTarget->getNumOfStreamInputs() == 0);
-    mCurrentMethod = mTarget->getExpectedOutputSizeFunction(b, true);
+    mCurrentMethod = mTarget->getExpectedOutputSizeFunction(b, true, linkageType);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -637,10 +644,10 @@ void KernelCompiler::bindAdditionalInitializationArguments(KernelBuilder & /* b 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief callGenerateInitializeThreadLocalMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilder & b) {
+inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilder & b, GlobalValue::LinkageTypes linkageType) {
 
     assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
-    mCurrentMethod = mTarget->getInitializeThreadLocalFunction(b, true);
+    mCurrentMethod = mTarget->getInitializeThreadLocalFunction(b, true, linkageType);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -699,11 +706,11 @@ inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilde
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief callAllocateSharedInternalStreamSets
  ** ------------------------------------------------------------------------------------------------------------- */
-inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelBuilder & b) {
+inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelBuilder & b, GlobalValue::LinkageTypes linkageType) {
     // NOTE: the kernel compiler must call this AFTER initialization
     if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
         assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
-        mCurrentMethod = mTarget->getAllocateSharedInternalStreamSetsFunction(b, true);
+        mCurrentMethod = mTarget->getAllocateSharedInternalStreamSetsFunction(b, true, linkageType);
         assert (mCurrentMethod->empty());
         mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
         b.SetInsertPoint(mEntryPoint);
@@ -737,10 +744,10 @@ inline void KernelCompiler::callGenerateAllocateSharedInternalStreamSets(KernelB
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief callAllocateThreadLocalInternalStreamSets
  ** ------------------------------------------------------------------------------------------------------------- */
-inline void KernelCompiler::callGenerateAllocateThreadLocalInternalStreamSets(KernelBuilder & b) {
+inline void KernelCompiler::callGenerateAllocateThreadLocalInternalStreamSets(KernelBuilder & b, GlobalValue::LinkageTypes linkageType) {
     if (LLVM_UNLIKELY(mTarget->allocatesInternalStreamSets())) {
         assert (mSharedHandle == nullptr && mThreadLocalHandle == nullptr);
-        mCurrentMethod = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, true);
+        mCurrentMethod = mTarget->getAllocateThreadLocalInternalStreamSetsFunction(b, true, linkageType);
         assert (mCurrentMethod->empty());
         mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
         b.SetInsertPoint(mEntryPoint);
@@ -1123,7 +1130,7 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
 
     std::vector<Value *> props;
 
-    Function * const doSegFunc = mTarget->getDoSegmentFunction(b, true);
+    Function * const doSegFunc = mTarget->getDoSegmentFunction(b, true, GlobalValue::ExternalLinkage);
 
     props.reserve(doSegFunc->getNumOperands());
     if (LLVM_LIKELY(mSharedHandle)) {
@@ -1250,12 +1257,12 @@ std::vector<Value *> KernelCompiler::getDoSegmentProperties(KernelBuilder & b) c
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief callGenerateDoSegmentMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
+inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b, llvm::TargetMachine * TM, GlobalValue::LinkageTypes linkageType) {
 
     assert (mInputStreamSets.size() == mStreamSetInputBuffers.size());
     assert (mOutputStreamSets.size() == mStreamSetOutputBuffers.size());
 
-    mCurrentMethod = mTarget->getDoSegmentFunction(b, true);
+    mCurrentMethod = mTarget->getDoSegmentFunction(b, true, linkageType);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -1274,7 +1281,7 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
         b.CreateMProtect(mTarget->getSharedStateType(), mSharedHandle, CBuilder::Protect::WRITE);
     }
     assert (mCurrentMethod == b.GetInsertBlock()->getParent());
-    mTarget->generateKernelMethod(b);
+    mTarget->generateKernelMethod(b, TM);
     assert (mCurrentMethod == b.GetInsertBlock()->getParent());
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
@@ -1327,9 +1334,8 @@ inline void KernelCompiler::callGenerateDoSegmentMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief callGenerateFinalizeThreadLocalMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder & b) {
-
-    mCurrentMethod = mTarget->getFinalizeThreadLocalFunction(b, true);
+inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder & b, GlobalValue::LinkageTypes linkageType) {
+    mCurrentMethod = mTarget->getFinalizeThreadLocalFunction(b, true, linkageType);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -1357,8 +1363,8 @@ inline void KernelCompiler::callGenerateFinalizeThreadLocalMethod(KernelBuilder 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief callGenerateFinalizeMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-inline void KernelCompiler::callGenerateFinalizeMethod(KernelBuilder & b) {
-    mCurrentMethod = mTarget->getFinalizeFunction(b, true);
+inline void KernelCompiler::callGenerateFinalizeMethod(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType) {
+    mCurrentMethod = mTarget->getFinalizeFunction(b, true, linkageType);
     assert (mCurrentMethod->empty());
     mEntryPoint = BasicBlock::Create(b.getContext(), "entry", mCurrentMethod);
     b.SetInsertPoint(mEntryPoint);
@@ -2096,7 +2102,7 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
                                          const ArrayRef<size_t> loopIds) const {
 
 
-    auto init = mTarget->getInitializeFunction(b, true);
+    auto init = mTarget->getInitializeFunction(b, true, GlobalValue::ExternalLinkage);
     assert (init);
     auto arg = init->arg_begin();
     auto nextArg = [&]() {

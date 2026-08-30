@@ -11,6 +11,7 @@ namespace kernel { class KernelBuilder; }
 namespace {
 class CPUDriverContextPool;
 class CPUDriverTaskDispatcher;
+class CPUDriverCompiler;
 }
 
 class CPUDriver final : public BaseDriver {
@@ -58,10 +59,13 @@ private:
     std::unique_ptr<llvm::raw_fd_ostream>                   mIROutputStream;
     std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
     std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
-    std::unique_ptr<CPUDriverContextPool>                   mContextPool;
-    CPUDriverTaskDispatcher *                               mTaskDispatcher = nullptr;
+    std::unique_ptr<CPUDriverCompiler>                      mCPUDriverCompiler;
+
+//    std::unique_ptr<CPUDriverContextPool>                   mContextPool;
+//    CPUDriverTaskDispatcher *                               mTaskDispatcher = nullptr;
+
     std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
     std::unique_ptr<llvm::orc::SymbolLookupSet>             mSymbolLookupSet;
-    std::unique_ptr<llvm::orc::SymbolDependenceMap>         mPriorSymbolLayer;
+//    std::unique_ptr<llvm::orc::SymbolDependenceMap>         mPriorSymbolLayer;
 };
 

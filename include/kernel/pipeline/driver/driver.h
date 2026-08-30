@@ -99,8 +99,6 @@ protected:
     std::unique_ptr<kernel::KernelBuilder>                  mBuilder;
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;
 
-    llvm::StringSet<>                                       mCompiledIdentifiers;
-
     bool                                                    mPreservesKernels = false;
     KernelSet                                               mUncachedKernel;
     KernelSet                                               mCachedKernel;

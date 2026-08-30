@@ -78,7 +78,7 @@ return fd;
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
 
-
+extern "C"
 uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
 
     assert (size > 0);
@@ -115,6 +115,7 @@ uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
     return base + (hasUnderflow * size);
 }
 
+extern "C"
 uint8_t * make_fd_backed_buffer(const size_t size, int & memfd) {
 
     assert (size > 0);
@@ -140,6 +141,7 @@ uint8_t * make_fd_backed_buffer(const size_t size, int & memfd) {
     return p;
 }
 
+extern "C"
 uint8_t * resize_fd_backed_buffer(const int memfd, uint8_t * const buffer, const size_t priorSize, const size_t newSize) {
 
     assert (newSize > 0);

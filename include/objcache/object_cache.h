@@ -45,13 +45,14 @@ class ParabixObjectCache {
     using Set = boost::container::flat_set<K>;
     using ObjectBufferCache = llvm::StringMap<llvm::MemoryBufferRef>;
     using Instance = std::unique_ptr<ParabixObjectCache>;
+    using LoadResult = std::pair<std::unique_ptr<llvm::MemoryBuffer>, std::unique_ptr<llvm::Module>>;
 public:
 
     friend class BaseDriver;
 
     using Path = llvm::SmallString<128>;
 
-    std::unique_ptr<llvm::MemoryBuffer> loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept;
+    LoadResult loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept;
 
     void saveCachedObjectFile(const llvm::Module & M, llvm::MemoryBufferRef Obj) noexcept;
 

@@ -32,7 +32,12 @@ public:
     using llvm::IRBuilder<>::getIntN;
     using llvm::IRBuilder<>::getIntNTy;
 
+    #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(18, 0, 0)
     using llvm::IRBuilder<>::getInt8PtrTy;
+    using llvm::IRBuilder<>::getInt16PtrTy;
+    using llvm::IRBuilder<>::getInt32PtrTy;
+    using llvm::IRBuilder<>::getInt64PtrTy;
+    #endif
 
     using llvm::IRBuilder<>::getHalfTy;
     using llvm::IRBuilder<>::getBFloatTy;

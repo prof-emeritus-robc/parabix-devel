@@ -126,16 +126,6 @@ void PipelineKernel::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief addKernelDeclarations
- ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType) {
-    Kernel::addKernelDeclarations(b, TM, linkageType);
-    for (const auto & k : mKernels) {
-        k.Object->addKernelDeclarations(b, TM, GlobalValue::ExternalLinkage);
-    }
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateAllocateSharedInternalStreamSetsMethod
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, Value * expectedNumOfStrides) {

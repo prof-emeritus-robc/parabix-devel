@@ -359,14 +359,6 @@ private:
             if (M) {
 
                 auto & JITLib = Engine->getMainJITDylib();
-//                auto & ES = JITLib.getExecutionSession();
-//                auto interface = cantFail(orc::getObjectFileInterface(ES, cached->getMemBufferRef()));
-//                SymbolLookupSet symbols;
-//                for (auto &[mangled, flags] : interface.SymbolFlags) {
-//                    if (LLVM_LIKELY(flags.isExported() && flags.isStrong())) {
-//                        symbols.add(mangled);
-//                    }
-//                }
 
                 M->setTargetTriple(Engine->getTargetTriple().getTriple());
                 M->setDataLayout(Engine->getDataLayout());
@@ -381,7 +373,6 @@ private:
                 linkExternalFunctions(ctx, Target);
 
                 cantFail(Engine->addObjectFile(JITLib, std::move(cached)));
-              //  cantFail(ES.lookup(makeJITDylibSearchOrder({&JITLib}), std::move(symbols), LookupKind::Static, SymbolState::Ready));
                 goto record_decl;
             }
         }
@@ -474,21 +465,8 @@ record_decl:
             ObjectCache->saveCachedObjectFile(*M, result->getMemBufferRef());
         }
 
-//        auto & ES = Engine->getExecutionSession();
-//        MangleAndInterner mangler(ES, Engine->getDataLayout());
-//        SymbolLookupSet symbols;
-//        Target->addSymbols(mangler, symbols);
-
-//        auto interface = cantFail(orc::getObjectFileInterface(ES, result->getMemBufferRef()));
-//        for (auto &[mangled, flags] : interface.SymbolFlags) {
-//            if (LLVM_LIKELY(flags.isExported() && flags.isStrong())) {
-//                symbols.add(mangled);
-//            }
-//        }
-
         auto & JITLib = Engine->getMainJITDylib();
         cantFail(Engine->addObjectFile(JITLib, std::move(result)));
-//        cantFail(ES.lookup(makeJITDylibSearchOrder({&JITLib}), std::move(symbols), LookupKind::Static, SymbolState::Ready));
 
         delete M;
 
@@ -513,8 +491,6 @@ record_decl:
 
         linkExternalFunctions(ctx, Target);
 
-        // Build the "main" module frame context execution pipeline
-//        Target->addKernelDeclarations(builder, ctx.TargetMachine.get(), GlobalValue::ExternalLinkage);
         Target->addOrDeclareMainFunction(builder, Kernel::AddInternal);
 
         BEGIN_SCOPED_REGION
@@ -597,6 +573,9 @@ private:
 
     std::mutex LaneMutex;
 
+    // TODO: decl queue needs to be a priority queue so that we can force more complex
+    // kernels (such as the pipeline) to be started sooner.
+
     std::vector<CPUDriverTaskQueue> Tasks;
 
     std::vector<std::thread> Threads;
@@ -677,30 +656,9 @@ CPUDriver::CPUDriver(std::string && moduleName)
         ))
     );
 
-    mSymbolLookupSet = std::make_unique<SymbolLookupSet>();
-
     mBuilder.reset(IDISA::GetIDISA_Builder(mMainModule->getContext(), features));
     mBuilder->setModule(mMainModule);
     mBuilder->setFunctionLinkCallback(this);
-}
-
-void CPUDriver::linkAllExternalSymbols() {
-//    auto & MainJD = mEngine->getMainJITDylib();
-
-//    auto err = MainJD.define(orc::absoluteSymbols(*mAllLinkedSymbols));
-//    if (err) {
-//        handleAllErrors(std::move(err),
-//            [](const DuplicateDefinition &) {
-//                /* ignored */
-//            },
-//            [](const ErrorInfoBase & err) {
-//                SmallVector<char, 100> tmp;
-//                raw_svector_ostream msg(tmp);
-//                msg << "Cannot link symbol: " << err.message();
-//                report_fatal_error(msg.str());
-//            });
-//    }
-//    mAllLinkedSymbols->clear();
 }
 
 void CPUDriver::generateUncachedKernels() {
@@ -721,8 +679,6 @@ void CPUDriver::generateUncachedKernels() {
 
     const auto layerId = mCPUDriverCompiler->addNewTaskGroup();
 
-    errs() << "Generating " << numKernels << " Layer " << layerId << " Kernels\n";
-
     for (unsigned i = 0; i < numKernels; ++i) {
         auto & kernel = mUncachedKernel[i];
         mCPUDriverCompiler->addCompilationTask(1, layerId, kernel.get());
@@ -742,11 +698,7 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
     auto & MainJD = mEngine->getMainJITDylib();
 
-
-
     const auto layerId = mCPUDriverCompiler->addNewTaskGroup();
-
-    errs() << "Generating main at Layer " << layerId << "\n";
 
     mCPUDriverCompiler->addCompilationTask(2, layerId, pk);
 
@@ -784,26 +736,7 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     }
 #endif
 
-    // 7. Look up and resolve symbols using standard target data layout policies.
-    // Compilation triggers on-demand here during lookup, bypassing the old explicit finalizeObject() call.
-
-//    auto & ES = mEngine->getExecutionSession();
-
-//    auto S = makeJITDylibSearchOrder({&MainJD}, JITDylibLookupFlags::MatchExportedSymbolsOnly);
-
-//    SymbolLookupSet mainLookUpSet(mainSymbol, orc::SymbolLookupFlags::RequiredSymbol);
-//    auto funcMap = cantFail(ES.lookup(S, mainLookUpSet, LookupKind::Static, SymbolState::Ready));
-//    auto mainFuncPtr = funcMap.find(mainSymbol)->getSecond().getAddress().toPtr<void*>();
-
     assert (mainFuncPtr);
-
-//    removeAll(*mSymbolLookupSet);
-
-    // NOTE ON MEMORY MANAGEMENT:
-    // With MCJIT, you explicitly executed manual removeModule tracking loops here to free IR structures. 
-    // In ORC, because compilation happens inside our standalone 'RunJD' sandbox partition, 
-    // these compiled structures will sit immutably in memory until the base mEngine layout drops, 
-    // eliminating the risk of accidental premature cross-module lookups while your code executes.
 
     if (getPreservesKernels()) {
         for (auto & kernel : mCachedKernel) {

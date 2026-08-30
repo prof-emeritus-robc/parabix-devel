@@ -1,7 +1,6 @@
 #pragma once
 
 #include <codegen/FunctionTypeBuilder.h>
-#include <codegen/CBuilder.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
 #include <llvm/ExecutionEngine/Orc/SymbolStringPool.h>
 #include <llvm/ADT/StringSet.h>

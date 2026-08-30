@@ -565,28 +565,6 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief addKernelDeclarations
- ** ------------------------------------------------------------------------------------------------------------- */
-void Kernel::addKernelDeclarations(KernelBuilder & b, TargetMachine * TM, GlobalValue::LinkageTypes linkageType) {
-    addInitializeDeclaration(b, linkageType);
-    if (LLVM_UNLIKELY(mInputStreamSets.empty())) {
-        addExpectedOutputSizeDeclaration(b, linkageType);
-    }
-    if (LLVM_UNLIKELY(allocatesInternalStreamSets())) {
-        addAllocateSharedInternalStreamSetsDeclaration(b, linkageType);
-    }
-    addDoSegmentDeclaration(b, linkageType);
-    if (mThreadLocalStateType) {
-        addInitializeThreadLocalDeclaration(b, linkageType);
-        if (LLVM_UNLIKELY(allocatesInternalStreamSets())) {
-            addAllocateThreadLocalInternalStreamSetsDeclaration(b, linkageType);
-        }
-        addFinalizeThreadLocalDeclaration(b, linkageType);
-    }
-    addFinalizeDeclaration(b, linkageType);
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
  * @brief addSymbols
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::addSymbols(orc::MangleAndInterner & mangler, orc::SymbolLookupSet &symbols) const {
@@ -1444,8 +1422,6 @@ Value * Kernel::constructFamilyKernels(KernelBuilder & b, InitArgs & hostArgs, P
         }
         addInitArg(val);
     }
-
-    errs() << " FAMILY " << getName() << " -> " << b.getModule()->getModuleIdentifier() << "\n";
     Function * const init = getInitializeFunction(b, true, GlobalValue::ExternalLinkage);
     assert (&init->getContext() == &b.getContext());
 

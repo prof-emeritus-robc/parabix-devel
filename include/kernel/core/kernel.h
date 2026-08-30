@@ -460,8 +460,6 @@ public:
 
     LLVM_READNONE bool canSetTerminateSignal() const;
 
-    virtual void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType);
-
     virtual std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b);
 
     virtual ~Kernel();

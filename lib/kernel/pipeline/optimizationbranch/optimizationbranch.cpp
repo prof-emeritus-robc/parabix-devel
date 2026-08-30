@@ -14,15 +14,6 @@ std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(Ke
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
- * @brief addKernelDeclarations
- ** ------------------------------------------------------------------------------------------------------------- */
-void OptimizationBranch::addKernelDeclarations(KernelBuilder & b, TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType) {
-    mAllZeroKernel->addKernelDeclarations(b, TM, GlobalValue::WeakAnyLinkage);
-    mNonZeroKernel->addKernelDeclarations(b, TM, GlobalValue::WeakAnyLinkage);
-    Kernel::addKernelDeclarations(b, TM, linkageType);
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInternalKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
 void OptimizationBranch::addInternalProperties(KernelBuilder & b) {

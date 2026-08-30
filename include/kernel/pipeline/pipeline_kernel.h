@@ -121,8 +121,6 @@ public:
         return mLengthAssertions;
     }
 
-    void addKernelDeclarations(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType) final;
-
     std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
     ~PipelineKernel() override;

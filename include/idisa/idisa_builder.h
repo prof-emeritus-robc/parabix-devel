@@ -4,7 +4,7 @@
  *  Part of the Parabix Project, under the Open Software License 3.0.
  *  SPDX-License-Identifier: OSL-3.0
  */
-#include <codegen/CBuilder.h>
+#include <idisa/CBuilder.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <bitset>
 #include <string>

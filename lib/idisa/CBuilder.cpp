@@ -3,7 +3,7 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
-#include <codegen/CBuilder.h>
+#include <idisa/CBuilder.h>
 #include <kernel/pipeline/driver/driver.h>
 #include <llvm/IR/Mangler.h>
 #include <llvm/IR/Module.h>

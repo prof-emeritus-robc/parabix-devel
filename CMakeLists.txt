@@ -48,7 +48,7 @@ endif()
 set(PARABIX_MONO_TARGET parabix)
 
 # Ensure custom FindXYZ.cmake files are found
-set(CMAKE_MODULE_PATH "${CMAKE_MODULE_PATH};${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 ###   Versioning   ###
 set(Parabix_REVISION "parabix")
@@ -93,7 +93,7 @@ message(STATUS "LLVM Version Integer: ${LLVM_VERSION_INTEGER}")
 set(Boost_USE_STATIC_LIBS ${USE_STATIC_LIBS})
 set(Boost_USE_MULTITHREADED OFF)
 set(Boost_USE_STATIC_RUNTIME OFF)
-find_package(Boost 1.61 REQUIRED COMPONENTS system filesystem iostreams regex)
+find_package(Boost 1.61 REQUIRED COMPONENTS filesystem iostreams regex)
 message(STATUS "Found Boost_LIBRARY_DIRS: ${Boost_LIBRARY_DIRS}")
 include_directories("${Boost_INCLUDE_DIRS}")
 link_directories(${Boost_LIBRARY_DIRS})
@@ -375,7 +375,6 @@ if(ARTIFACT_MODE STREQUAL "Single")
 endif()
 
 # Framework Libraries
-add_subdirectory(lib/codegen)
 add_subdirectory(lib/fileselect)
 add_subdirectory(lib/grep)
 add_subdirectory(lib/idisa)

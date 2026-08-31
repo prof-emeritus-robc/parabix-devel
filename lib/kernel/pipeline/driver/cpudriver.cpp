@@ -446,6 +446,11 @@ record_decl:
                            codegen::TimeKernelsIsEnabled);
 
         Target->generateKernel(builder, ctx.TargetMachine.get(), GlobalValue::ExternalLinkage);
+
+        Kernel::SelectedOptimizationPasses passes;
+        Target->addOptimizationPasses(builder, passes);
+        BaseDriver::runAllOptimizationPasses(builder, passes, ctx.TargetMachine.get());
+
         END_SCOPED_REGION
 
         BEGIN_SCOPED_REGION
@@ -687,11 +692,6 @@ void CPUDriver::generateUncachedKernels() {
 
     mUncachedKernel.clear();
 
-}
-
-void CPUDriver::addCachedObjectFile(llvm::Module * module, std::unique_ptr<MemoryBuffer> &&object) {
-    auto & JITLib = mEngine->getMainJITDylib();
-    cantFail(mEngine->addObjectFile(JITLib, std::move(object)));
 }
 
 void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {

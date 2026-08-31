@@ -34,9 +34,6 @@ public:
 
     #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(18, 0, 0)
     using llvm::IRBuilder<>::getInt8PtrTy;
-    using llvm::IRBuilder<>::getInt16PtrTy;
-    using llvm::IRBuilder<>::getInt32PtrTy;
-    using llvm::IRBuilder<>::getInt64PtrTy;
     #endif
 
     using llvm::IRBuilder<>::getHalfTy;
@@ -57,11 +54,10 @@ public:
     // construct them.
     #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
     ADD_POINTER_TYPE_ALIAS(Int8)
+    #endif
     ADD_POINTER_TYPE_ALIAS(Int16)
     ADD_POINTER_TYPE_ALIAS(Int32)
     ADD_POINTER_TYPE_ALIAS(Int64)
-    #endif
-
     ADD_POINTER_TYPE_ALIAS(Void)
     #undef ADD_POINTER_TYPE
 

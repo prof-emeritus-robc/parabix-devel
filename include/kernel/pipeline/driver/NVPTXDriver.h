@@ -20,8 +20,6 @@ public:
 
     void * finalizeObject(kernel::PipelineKernel * pipeline) override;
 
-    void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) final {}
-
 protected:
 
     NVPTXDriver(std::string && moduleName);

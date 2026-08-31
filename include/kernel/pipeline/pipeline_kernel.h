@@ -167,6 +167,8 @@ protected:
 
     unsigned getNumOfNestedKernelFamilyCalls() const override;
 
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
+
 private:
 
     struct Internal {};
@@ -206,8 +208,6 @@ private:
     void generateFinalizeThreadLocalMethod(KernelBuilder & b) final;
 
     void generateFinalizeMethod(KernelBuilder & b) final;
-
-    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
 
 protected:
 

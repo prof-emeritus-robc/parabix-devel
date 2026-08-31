@@ -474,6 +474,20 @@ public:
 
     bool noMutableSharedScalars() const;
 
+    enum class OptimizationPass {
+        DCEPass,
+        SimplifyCFGPass,
+        EarlyCSEPass,
+        MemCpyOptPass,
+        AggressiveInstCombinePass,
+        NewGVNPass,
+        PHICanonicalizerPass
+    };
+
+    using SelectedOptimizationPasses = llvm::SmallVector<OptimizationPass, 6>;
+
+    virtual void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const;
+
 protected:
 
     struct StateTypes {
@@ -515,20 +529,6 @@ protected:
     llvm::Function * getFinalizeFunction(KernelBuilder & b, const bool alwayReturnDeclaration, const llvm::GlobalValue::LinkageTypes linkageType) const;
 
     llvm::Function * addFinalizeDeclaration(KernelBuilder & b, const llvm::GlobalValue::LinkageTypes linkageType) const;
-
-    enum class OptimizationPass {
-        DCEPass,
-        SimplifyCFGPass,
-        EarlyCSEPass,
-        MemCpyOptPass,
-        AggressiveInstCombinePass,
-        NewGVNPass,
-        PHICanonicalizerPass
-    };
-
-    using SelectedOptimizationPasses = llvm::SmallVector<OptimizationPass, 6>;
-
-    virtual void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const;
 
 protected:
 

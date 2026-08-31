@@ -144,6 +144,8 @@ public:
 
     bool requiresExplicitPartialFinalStride() const override;
 
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
+
 protected:
 
     PabloKernel(LLVMTypeSystemInterface & ts,
@@ -194,8 +196,6 @@ private:
     void generateFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingBytes) final;
 
     void generateFinalizeMethod(KernelBuilder & b) final;
-
-    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
 
 private:
 

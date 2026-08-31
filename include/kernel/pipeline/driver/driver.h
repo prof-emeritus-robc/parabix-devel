@@ -55,8 +55,6 @@ public:
         mPreservesKernels = value;
     }
 
-    virtual void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) = 0;
-
     const std::unique_ptr<kernel::KernelBuilder> & getMainBuilder() const {
         return mBuilder;
     }
@@ -68,6 +66,8 @@ public:
     const llvm::LLVMContext & getContext() const {
         return *mContext;
     }
+
+    static void runAllOptimizationPasses(kernel::KernelBuilder & b, kernel::Kernel::SelectedOptimizationPasses & passes, llvm::TargetMachine * TM);
 
 protected:
 

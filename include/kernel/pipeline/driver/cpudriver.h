@@ -41,8 +41,6 @@ public:
 
     llvm::ModulePass * createTracePass(kernel::KernelBuilder * kb, llvm::StringRef to_trace);
 
-    void addCachedObjectFile(llvm::Module * module, std::unique_ptr<llvm::MemoryBuffer> && object) final;
-
     llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) final;
 
     bool HasExternalFunction(llvm::StringRef unmangledName) const final;

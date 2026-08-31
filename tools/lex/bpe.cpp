@@ -181,6 +181,36 @@ static cl::opt<unsigned> IndexedShift(
              "IndexedAdvance instead of LookAhead. 0 = off (default, pure LookAhead)."),
     cl::init(0));
 
+// Batch the write-back: instead of one Advance (carry op) + a full W_out-bit stamp
+// inside EVERY rule's createIf gate, each gate only ORs its `fire` into shared
+// entry-scope accumulators (anyFire, setBit[i], fireByLen[lenA]); the kernel then
+// applies ONE Advance per DISTINCT lenA and ONE Sel per id bit at the end.
+//
+// Carry ops per kernel: one per RULE (~177 under --level-partition) → one per
+// distinct lenA (≤ maxLen; 8 under --compact-base=2 --geometric-compaction).
+// Gate body drops from ~20 ops + 1 carry + W_out+1 mutated Vars to
+// popcount(idAB)+2 Ors, 0 carries — so createIf also drops its carry save/restore.
+//
+// Exact, three legs:
+//  (a) Advance is linear over Or — Advance(a|b,L) == Advance(a,L)|Advance(b,L) — and
+//      NOT(a|b) == NOT a AND NOT b; AND is commutative + idempotent, so deferring the
+//      inPlayMask clears reorders nothing.
+//  (b) At most ONE rule fires per position in a kernel: the id stream is single-valued
+//      so at most one rule's idA matches, and rules sharing an idA share its lenA and
+//      therefore probe the SAME B slot, where only one idB can sit. So setBit[i] and
+//      the anyFire clear can never disagree (T3 preserved).
+//  (c) No rule reads the mutating idAcc/inPlayMask — gates and compares read the FROZEN
+//      kernel input (srcFrozen/meInFrozen) — so the deferred writes have no in-kernel
+//      readers.
+// Not applied on the --indexed-shift path (END-anchored via createIndexedAdvance).
+// Cache tag bw1_/bw0_.
+static cl::opt<bool> BatchWriteback(
+    "batch-writeback",
+    cl::desc("Accumulate merge fires into shared Vars and apply ONE Advance per "
+             "distinct lenA + ONE Sel per id bit at the end of each merge kernel, "
+             "instead of one Advance + a full stamp per rule."),
+    cl::init(false));
+
 
 
 using namespace pablo;
@@ -517,6 +547,7 @@ public:
                         + (grouped ? "g" + std::to_string(effGroupSize(group.rules.size())) + "_" : "")
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
+                        + (BatchWriteback ? "bw1_" : "bw0_")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -612,6 +643,26 @@ protected:
         BixNum      srcFrozen(frozenBits.begin(), frozenBits.end());
         PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
 
+        // ── Batched write-back accumulators (--batch-writeback) ──────────────────
+        // Each rule's gate only ORs its fire in here; the writes are applied once at
+        // the end of the kernel. setBit[i] = positions where id bit i must become 1,
+        // anyFire = positions where SOME rule fired (drives the bit clear),
+        // fireByLen[lenA] = fires needing a consume Advance of lenA.
+        const bool batch = BatchWriteback && !mUseNextId;
+        std::vector<Var *> setBit;
+        std::map<unsigned, Var *> fireByLen;
+        Var * anyFire = nullptr;
+        if (batch) {
+            setBit.resize(W_out);
+            for (unsigned i = 0; i < W_out; i++)
+                setBit[i] = pb.createVar("setBit_" + std::to_string(i), zeroes);
+            anyFire = pb.createVar("anyFire", zeroes);
+            for (const auto & r : mRuleGroup.rules)
+                if (fireByLen.find(r.lenA) == fireByLen.end())
+                    fireByLen.emplace(r.lenA,
+                        pb.createVar("fireByLen_" + std::to_string(r.lenA), zeroes));
+        }
+
         // ── Astart decode ────────────────────────────────────────────────────────
         // Astart(idA) = EQ(srcFrozen, idA) AND meInFrozen — a W_out-deep AND/OR chain.
         // Every rule pays it OUTSIDE its createIf gate (the gate condition IS Astart),
@@ -657,6 +708,18 @@ protected:
                     : LookaheadInGate ? body.createLookahead(boundaryBit, (int64_t) r.lenA)
                     : boundaryAheadByLen.at(r.lenA);
                 fire = body.createAnd(fire, body.createNot(bAhead));
+            }
+
+            // Batched: no Advance and no stamp in the gate — just OR the fire into the
+            // shared accumulators. Applied once per kernel below (see BatchWriteback).
+            if (batch) {
+                body.createAssign(anyFire, body.createOr(anyFire, fire));
+                for (unsigned i = 0; i < W_out; i++)
+                    if ((r.idAB >> i) & 1u)
+                        body.createAssign(setBit[i], body.createOr(setBit[i], fire));
+                Var * fl = fireByLen.at(r.lenA);
+                body.createAssign(fl, body.createOr(fl, fire));
+                return;
             }
 
             // Anchor. Indexed path (--indexed-shift) is END-anchored: stamp idAB at B's
@@ -751,6 +814,20 @@ protected:
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }
+        }
+
+        // ── Apply the batched write-back ────────────────────────────────────────
+        // One Advance per distinct lenA (instead of one per rule), then one Sel per id
+        // bit. Advance(a|b,L) == Advance(a,L)|Advance(b,L) makes the merge exact.
+        if (batch) {
+            for (const auto & kv : fireByLen)
+                pb.createAssign(inPlayMask,
+                    pb.createAnd(inPlayMask,
+                        pb.createNot(pb.createAdvance(kv.second, (int64_t) kv.first))));
+            PabloAST * notAny = pb.createNot(anyFire);
+            for (unsigned i = 0; i < W_out; i++)
+                pb.createAssign(idAcc[i],
+                    pb.createOr(pb.createAnd(idAcc[i], notAny), setBit[i]));
         }
 
         Var * sOut = getOutputStreamVar("sourceOut");

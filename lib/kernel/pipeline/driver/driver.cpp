@@ -26,6 +26,7 @@
 
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/PassManager.h>
+#include <llvm/IR/LegacyPassManager.h>
 
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Target/TargetMachine.h>             // for TargetMachine, Tar...
@@ -230,14 +231,12 @@ private:
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief runAllOptimizationPasses
  ** ------------------------------------------------------------------------------------------------------------- */
-void BaseDriver::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes, TargetMachine * TM) {
+void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
+                                          Kernel::SelectedOptimizationPasses & passes,
+                                          TargetMachine * TM,
+                                          SmallVector<char, 0> & UnoptimizedIROutput,
+                                          SmallVector<char, 0> & OptimizedIROutput) {
 
-
-    #ifndef NDEBUG
-    #define ADD_VERIFY_IR_PASS true
-    #else
-    #define ADD_VERIFY_IR_PASS  LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::VerifyIR))
-    #endif
 
     PassInstrumentationCallbacks PIC;
 
@@ -246,6 +245,13 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOpt
     ModuleAnalysisManager MAM;
 
     CGAM.registerPass([&] { return PassInstrumentationAnalysis(&PIC); });
+
+    #ifndef NDEBUG
+    #define ADD_VERIFY_IR_PASS true
+    #else
+    const auto __verifyIR = codegen::DebugOptionIsSet(codegen::VerifyIR);
+    #define ADD_VERIFY_IR_PASS  LLVM_UNLIKELY(__verifyIR)
+    #endif
 
     if (ADD_VERIFY_IR_PASS) {
         MAM.registerPass([&] { return VerifierAnalysis(); });
@@ -287,44 +293,35 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOpt
     ModulePassManager MPM;
     FunctionPassManager FPM;
 
-    #define FLAG(x) (1ULL << (x))
-
-    uint64_t requiredPasses = 0;
-
-    std::unique_ptr<raw_fd_ostream> unoptimizedOut;
+    Module & M = *b.getModule();
 
     if (LLVM_UNLIKELY(codegen::ShowUnoptimizedIROption != codegen::OmittedOption)) {
-        const auto & options = codegen::ShowUnoptimizedIROption;
-        if (options.empty()) {
-            unoptimizedOut = std::make_unique<raw_fd_ostream>(STDERR_FILENO, false, true);
-        } else {
-            std::error_code unoptimizedErr;
-            unoptimizedOut = std::make_unique<raw_fd_ostream>(options, unoptimizedErr, sys::fs::OpenFlags::OF_None);
-        }
+        UnoptimizedIROutput.reserve(M.getInstructionCount() * 256);
+        raw_svector_ostream out(UnoptimizedIROutput);
         if (codegen::ShowIRFilter.empty()) {
-            FPM.addPass(PrintFunctionPass(*unoptimizedOut));
+            FPM.addPass(PrintFunctionPass(out));
         } else {
-            FPM.addPass(FilteredPrintFunctionPass(*unoptimizedOut));
+            FPM.addPass(FilteredPrintFunctionPass(out));
         }
-    }
-    if (LLVM_UNLIKELY(!codegen::TraceOption.empty())) {
-        FPM.addPass(TracePass(b));
     }
     if (ADD_VERIFY_IR_PASS) {
         MPM.addPass(VerifierPass());
+    }
+    if (LLVM_UNLIKELY(!codegen::TraceOption.empty())) {
+        FPM.addPass(TracePass(b));
     }
     MPM.addPass(ModuleInlinerPass());
 
     FPM.addPass(RemoveRedundantAllocaAndGEPInstructions());
     FPM.addPass(SimplifyCFGPass());
     FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
-#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
+    #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
     FPM.addPass(llvm::InstCombinePass());
-#else
+    #else
     llvm::InstCombineOptions Opts;
     //Opts.VerifyFixpoint = false;
     FPM.addPass(llvm::InstCombinePass(Opts));
-#endif
+    #endif
     FPM.addPass(DCEPass());
     FPM.addPass(ReassociatePass());
     FPM.addPass(GVNPass());
@@ -357,22 +354,14 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOpt
         }
     }
 
-    std::unique_ptr<raw_fd_ostream> optimizedOut;
-
     // ShowIRFilter
-
     if (LLVM_UNLIKELY(codegen::ShowIROption != codegen::OmittedOption)) {
-        const auto & options = codegen::ShowIROption;
-        if (options.empty()) {
-            optimizedOut = std::make_unique<raw_fd_ostream>(STDERR_FILENO, false, true);
-        } else {
-            std::error_code optimizedErr;
-            optimizedOut = std::make_unique<raw_fd_ostream>(options, optimizedErr, sys::fs::OpenFlags::OF_None);
-        }
+        OptimizedIROutput.reserve(M.getInstructionCount() * 256);
+        raw_svector_ostream out(OptimizedIROutput);
         if (codegen::ShowIRFilter.empty()) {
-            FPM.addPass(PrintFunctionPass(*optimizedOut));
+            FPM.addPass(PrintFunctionPass(out));
         } else {
-            FPM.addPass(FilteredPrintFunctionPass(*optimizedOut));
+            FPM.addPass(FilteredPrintFunctionPass(out));
         }
     }
 
@@ -384,7 +373,7 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOpt
 
     #undef ADD_VERIFY_IR_PASS
 
-    MPM.run(*b.getModule(), MAM);
+    MPM.run(M, MAM);
 
 }
 

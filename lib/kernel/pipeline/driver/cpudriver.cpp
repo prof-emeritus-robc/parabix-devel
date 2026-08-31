@@ -21,18 +21,19 @@
 #include <kernel/pipeline/pipeline_builder.h>
 #include <llvm/IR/Verifier.h>
 #include "llvm/IR/Mangler.h"
-#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
+#include <llvm/Support/SmallVectorMemoryBuffer.h>
 #include <queue>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
 #else
 #include <llvm/Support/Host.h>
 #endif
+#include <numeric>
 
 #ifndef NDEBUG
 #define IN_DEBUG_MODE true
@@ -69,7 +70,7 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
 //    size_t                                  IsCompilingMainFunction;
     std::unique_ptr<llvm::TargetMachine>    TargetMachine;
     std::unique_ptr<KernelBuilder>          Builder;
-    std::unique_ptr<SimpleCompiler>         Compiler;
+//    std::unique_ptr<SimpleCompiler>         Compiler;
     llvm::Module *                          CurrentModule;
     llvm::orc::LLJIT *                      Engine;
     llvm::orc::SymbolMap &                  SharedSymbolList;
@@ -79,7 +80,7 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
     : ThreadSafeContext(std::make_unique<LLVMContext>())
     , TargetMachine(cantFail(JTMB.createTargetMachine()))
     , Builder(IDISA::GetIDISA_Builder(*getContext(), features))
-    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, nullptr))
+//    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, nullptr))
     , CurrentModule(nullptr)
     , Engine(nullptr)
     , SharedSymbolList(symbolList) {
@@ -172,6 +173,22 @@ private:
     std::vector<CPUDriverTask> Buffer;
     size_t InFlight;
 };
+
+struct DebugPrintingResult {
+    const Kernel * Target;
+    SmallVector<char, 0> UnoptimizedIR;
+    SmallVector<char, 0> OptimizedIR;
+    SmallVector<char, 0> ASM;
+
+    DebugPrintingResult(const Kernel * target, SmallVector<char, 0> && unoptIR, SmallVector<char, 0> && optIR, SmallVector<char, 0> && asmOutput)
+    : Target(target)
+    , UnoptimizedIR(std::move(unoptIR))
+    , OptimizedIR(std::move(optIR))
+    , ASM(std::move(asmOutput)) {
+
+    }
+};
+
 
 class CPUDriverCompiler {
 public:
@@ -298,7 +315,6 @@ public:
         }
 
         auto & JITLib = Engine->getMainJITDylib();
-
         SmallVector<char, 256> tmp;
         raw_svector_ostream mainName(tmp);
         mainName << Target->getName() << "_main";
@@ -306,6 +322,7 @@ public:
         if (!sym) {
             report_fatal_error(sym.takeError());
         }
+        printDebugOutput();
         return sym->toPtr<void*>();
 
     }
@@ -363,7 +380,7 @@ private:
                 M->setTargetTriple(Engine->getTargetTriple().getTriple());
                 M->setDataLayout(Engine->getDataLayout());
 
-                cantFail(M->materializeAll());
+                // cantFail(M->materializeAll());
 
                 Target->loadCachedKernel(M.get());
                 builder.setModule(M.get());
@@ -440,18 +457,35 @@ record_decl:
 
         linkExternalFunctions(ctx, Target);
 
+        SmallVector<char, 0> IROutput;
+        SmallVector<char, 0> OptIROutput;
+
+        TargetMachine * const TM = ctx.TargetMachine.get();
+
         BEGIN_SCOPED_REGION
         NamedRegionTimer T(Target->getSignature(), Target->getName(),
                            "Kernel", "Kernel Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        Target->generateKernel(builder, ctx.TargetMachine.get(), GlobalValue::ExternalLinkage);
+
+        Target->generateKernel(builder, TM, GlobalValue::ExternalLinkage);
 
         Kernel::SelectedOptimizationPasses passes;
         Target->addOptimizationPasses(builder, passes);
-        BaseDriver::runAllOptimizationPasses(builder, passes, ctx.TargetMachine.get());
+        BaseDriver::runAllOptimizationPasses(builder, passes, TM, IROutput, OptIROutput);
 
         END_SCOPED_REGION
+
+        auto optLevel = CodeGenOptLevel::Default;
+        if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
+            optLevel = codegen::BackEndOptLevel;
+        }
+        ctx.TargetMachine->setOptLevel(optLevel);
+
+        legacy::PassManager PM;
+
+        SmallVector<char, 0> ASMOutput;
+        SmallVector<char, 0> objBuffer;
 
         BEGIN_SCOPED_REGION
 
@@ -459,12 +493,42 @@ record_decl:
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        auto optLevel = CodeGenOptLevel::Default;
-        if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
-            optLevel = codegen::BackEndOptLevel;
+        const auto ic = M->getInstructionCount();
+
+        if (LLVM_UNLIKELY(codegen::ShowASMOption != codegen::OmittedOption)) {
+
+            ASMOutput.reserve(ic * 64);
+
+            raw_svector_ostream out(ASMOutput);
+
+            #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
+            constexpr auto ASMFile = CodeGenFileType::AssemblyFile;
+            #else
+            constexpr auto ASMFile = CGFT_AssemblyFile;
+            #endif
+            if (LLVM_UNLIKELY(TM->addPassesToEmitFile(PM, out, nullptr, ASMFile))) {
+                report_fatal_error(Twine{"Failed to generate ASM for ", M->getModuleIdentifier()});
+            }
+
         }
-        ctx.TargetMachine->setOptLevel(optLevel);
-        auto result = cantFail(ctx.Compiler->operator()(*M));
+
+        objBuffer.reserve(4096 + ic * 16);
+        raw_svector_ostream out(objBuffer);
+
+
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
+        constexpr auto ObjFile = CodeGenFileType::ObjectFile;
+        #else
+        constexpr auto ObjFile = CGFT_ObjectFile;
+        #endif
+
+        if (LLVM_UNLIKELY(TM->addPassesToEmitFile(PM, out, nullptr, ObjFile))) {
+            report_fatal_error(Twine{"Failed to generate object file for ", M->getModuleIdentifier()});
+        }
+
+        PM.run(*M);
+
+        auto result = std::make_unique<SmallVectorMemoryBuffer>(std::move(objBuffer), false);
 
         if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
             ObjectCache->saveCachedObjectFile(*M, result->getMemBufferRef());
@@ -477,7 +541,12 @@ record_decl:
 
         END_SCOPED_REGION
 
+        if (LLVM_UNLIKELY(IROutput.size() || OptIROutput.size() || ASMOutput.size())) {
+            recordDebugPrintResult(Target, std::move(IROutput), std::move(OptIROutput), std::move(ASMOutput));
+        }
+
     }
+
 
     void materializeMain(CPUDriverContext & ctx, Kernel * Target) {
 
@@ -505,8 +574,29 @@ record_decl:
                            codegen::TimeKernelsIsEnabled);
 
         ctx.TargetMachine->setOptLevel(CodeGenOptLevel::Default);
-        auto result = cantFail(ctx.Compiler->operator()(*M));
 
+        SmallVector<char, 0> objBuffer;
+        objBuffer.reserve(4096 + M->getInstructionCount() * 16);
+        raw_svector_ostream out(objBuffer);
+
+
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
+        constexpr auto ObjFile = CodeGenFileType::ObjectFile;
+        #else
+        constexpr auto ObjFile = CGFT_ObjectFile;
+        #endif
+
+        legacy::PassManager PM;
+
+        TargetMachine * const TM = ctx.TargetMachine.get();
+
+        if (LLVM_UNLIKELY(TM->addPassesToEmitFile(PM, out, nullptr, ObjFile))) {
+            report_fatal_error(Twine{"Failed to generate object file for ", M->getModuleIdentifier()});
+        }
+
+        PM.run(*M);
+
+        auto result = std::make_unique<SmallVectorMemoryBuffer>(std::move(objBuffer), false);
 
         auto & JITLib = Engine->getMainJITDylib();
         auto err = Engine->addObjectFile(JITLib, std::move(result));
@@ -553,6 +643,54 @@ record_decl:
 
     }
 
+    void recordDebugPrintResult(Kernel * const kernel, SmallVector<char, 0> && UnoptIR, SmallVector<char, 0> && OptIR, SmallVector<char, 0> && ASM) {
+        std::lock_guard<std::mutex> L(DebugPrintMutex);
+        DebugPrintResults.emplace_back(kernel, std::move(UnoptIR), std::move(OptIR), std::move(ASM));
+    }
+
+    void printDebugOutput() const {
+        const auto m = DebugPrintResults.size();
+        if (m == 0) {
+            return;
+        }
+        std::vector<size_t> indices(m);
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(indices.begin(), indices.end(), [this](const size_t i, const size_t j) -> bool {
+            const auto & A = DebugPrintResults[i];
+            const auto & B = DebugPrintResults[j];
+            return A.Target->getName().compare(B.Target->getName()) < 0;
+        });
+
+        auto makeFdStream = [](const std::string & option) {
+            if (LLVM_UNLIKELY(option!= codegen::OmittedOption)) {
+                if (option.empty()) {
+                    return std::make_unique<raw_fd_ostream>(STDERR_FILENO, false, true);
+                } else {
+                    std::error_code unoptimizedErr;
+                    return std::make_unique<raw_fd_ostream>(option, unoptimizedErr, sys::fs::OpenFlags::OF_None);
+                }
+            }
+            return std::unique_ptr<raw_fd_ostream>();
+        };
+
+        auto unoptimizedOut = makeFdStream(codegen::ShowUnoptimizedIROption);
+        auto optimizedOut = makeFdStream(codegen::ShowIROption);
+        auto asmOut = makeFdStream(codegen::ShowASMOption);
+
+        for (size_t i = 0; i < m; ++i) {
+            const auto & R = DebugPrintResults[indices[i]];
+            if (R.UnoptimizedIR.size()) {
+                *unoptimizedOut << R.UnoptimizedIR << "\n\n";
+            }
+            if (R.OptimizedIR.size()) {
+                *optimizedOut << R.OptimizedIR << "\n\n";
+            }
+            if (R.ASM.size()) {
+                *asmOut << R.ASM << "\n\n";
+            }
+        }
+    }
+
 private:
 
     llvm::orc::LLJIT *                              Engine;
@@ -568,22 +706,26 @@ private:
 
     std::vector<CPUDriverContext *>                 Contexts;
 
-    std::mutex PrecompiledStateObjectMutex;
+    std::mutex                                      PrecompiledStateObjectMutex;
 
-    std::mutex TaskMutex;
-    std::condition_variable TaskCV;
+    std::mutex                                      TaskMutex;
+    std::condition_variable                         TaskCV;
 
-    std::mutex ShutdownMutex;
-    std::condition_variable ShutdownCV;
+    std::mutex                                      ShutdownMutex;
+    std::condition_variable                         ShutdownCV;
 
-    std::mutex LaneMutex;
+    std::mutex                                      LaneMutex;
 
     // TODO: decl queue needs to be a priority queue so that we can force more complex
     // kernels (such as the pipeline) to be started sooner.
 
-    std::vector<CPUDriverTaskQueue> Tasks;
+    std::vector<CPUDriverTaskQueue>                 Tasks;
 
-    std::vector<std::thread> Threads;
+    std::vector<std::thread>                        Threads;
+
+
+    std::mutex                                      DebugPrintMutex;
+    SmallVector<DebugPrintingResult, 0>             DebugPrintResults;
 
 };
 
@@ -704,37 +846,6 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
     auto mainFuncPtr = mCPUDriverCompiler->waitUntilCompleted(pk);
 
-#if 0
-    if (LLVM_UNLIKELY(codegen::ShowASMOption != codegen::OmittedOption)) {
-        if (!codegen::ShowASMOption.empty()) {
-            std::error_code error;
-            mASMOutputStream = std::make_unique<raw_fd_ostream>(codegen::ShowASMOption, error, sys::fs::OpenFlags::OF_None);
-        } else {
-            mASMOutputStream = std::make_unique<raw_fd_ostream>(STDERR_FILENO, false, true);
-        }
-
-        // TODO: there does not seem to be an ASM printer for the new PassManager?
-        auto pm = std::make_unique<legacy::PassManager>();
-
-        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
-        const auto r = mTarget->addPassesToEmitFile(*pm, *mASMOutputStream, nullptr, CodeGenFileType::AssemblyFile);
-        #else
-        const auto r = mTarget->addPassesToEmitFile(*pm, *mASMOutputStream, nullptr, CGFT_AssemblyFile);
-        #endif
-        if (r) {
-            report_fatal_error("LLVM error: could not add emit assembly pass");
-        }
-
-        for (const auto & kernel : mCachedKernel) {
-            pm->run(*kernel->getModule());
-        }
-
-        for (const auto & kernel : mCompiledKernel) {
-            pm->run(*kernel->getModule());
-        }
-
-    }
-#endif
 
     assert (mainFuncPtr);
 

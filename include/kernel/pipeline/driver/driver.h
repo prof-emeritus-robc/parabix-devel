@@ -67,7 +67,10 @@ public:
         return *mContext;
     }
 
-    static void runAllOptimizationPasses(kernel::KernelBuilder & b, kernel::Kernel::SelectedOptimizationPasses & passes, llvm::TargetMachine * TM);
+    static void runAllOptimizationPasses(kernel::KernelBuilder & b, kernel::Kernel::SelectedOptimizationPasses & passes,
+                                         llvm::TargetMachine * TM,
+                                         llvm::SmallVector<char, 0> & UnoptimizedIROutput,
+                                         llvm::SmallVector<char, 0> & OptimizedIROutput);
 
 protected:
 

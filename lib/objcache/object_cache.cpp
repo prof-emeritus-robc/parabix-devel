@@ -197,11 +197,11 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
     std::unique_ptr<Module> H(new Module(moduleId, M.getContext()));
     H->setTargetTriple(M.getTargetTriple());
     H->setDataLayout(M.getDataLayout());
-    for (const Function & f : M.getFunctionList()) {
-        if (f.hasExternalLinkage() && !f.empty()) {
-            Function::Create(f.getFunctionType(), Function::ExternalLinkage, f.getName(), H.get());
-        }
-    }
+//    for (const Function & f : M.getFunctionList()) {
+//        if (f.hasExternalLinkage() && !f.empty()) {
+//            Function::Create(f.getFunctionType(), Function::ExternalLinkage, f.getName(), H.get());
+//        }
+//    }
     for (const auto & og : M.named_metadata()) {
         NamedMDNode * const md = H->getOrInsertNamedMetadata(og.getName());
         const auto n = og.getNumOperands();

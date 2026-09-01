@@ -65,14 +65,6 @@ public:
 
     using Relationships = std::vector<const Relationship *>;
 
-    enum class CompilationStatus {
-        Uninitialized = 0
-        , FullyInitialized = 1
-        , StateConstructed = 2
-        , LoadedOrCompiled = 3
-        , UnownedModule = 4
-    };
-
     enum class TypeId {
         SegmentOriented
         , MultiBlock
@@ -86,6 +78,12 @@ public:
         HasInternallyManagedStreamSet = 1
         , RequiresIllustratorObject = 2
         , HasInOutStreamSet = 4
+    };
+
+    enum KernelCompilationPriority {
+        Normal = 0
+        , Medium = 1
+        , High = 2
     };
 
     using InitArgs = llvm::SmallVector<llvm::Value *, 32>;
@@ -274,6 +272,8 @@ public:
     virtual bool isCachable() const { return true; }
 
     virtual bool hasSignature() const { return false; }
+
+    virtual KernelCompilationPriority getCompilationPriority() const { return KernelCompilationPriority::Normal; }
 
     virtual llvm::StringRef getSignature() const {
         return getName();
@@ -620,7 +620,6 @@ protected:
            Bindings &&stream_inputs, Bindings &&stream_outputs,
            Bindings &&scalar_inputs, Bindings &&scalar_outputs,
            InternalScalars && internal_scalars,
-           CompilationStatus status = CompilationStatus::FullyInitialized,
            unsigned flags = 0);
 
     // Constructor used by pipeline
@@ -629,7 +628,6 @@ protected:
            AttributeSet && attributes,
            Bindings &&stream_inputs, Bindings &&stream_outputs,
            Bindings &&scalar_inputs, Bindings &&scalar_outputs,
-           CompilationStatus status = CompilationStatus::Uninitialized,
            unsigned flags = 0);
 
     static std::string annotateKernelNameWithDebugFlags(const TypeId id, const unsigned flags, std::string && name);

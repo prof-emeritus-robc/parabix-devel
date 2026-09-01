@@ -97,6 +97,8 @@ public:
 
     bool isCachable() const override;
 
+    KernelCompilationPriority getCompilationPriority() const final { return KernelCompilationPriority::High; }
+
     void setInputStreamSetAt(const unsigned i, StreamSet * const value) final;
 
     void setOutputStreamSetAt(const unsigned i, StreamSet * const value) final;

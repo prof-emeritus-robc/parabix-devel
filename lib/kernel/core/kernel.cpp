@@ -1744,8 +1744,7 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
                Bindings && stream_outputs,
                Bindings && scalar_inputs,
                Bindings && scalar_outputs,
-               InternalScalars && internal_scalars,
-               CompilationStatus status, unsigned flags)
+               InternalScalars && internal_scalars, unsigned flags)
 : mTypeId(typeId)
 , mStride(ts.getBitBlockWidth())
 , mFlags(flags | collectOutputFlags(stream_outputs))
@@ -1786,7 +1785,7 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
                Bindings && stream_outputs,
                Bindings && scalar_inputs,
                Bindings && scalar_outputs,
-               CompilationStatus status, unsigned flags)
+               unsigned flags)
 : AttributeSet(std::move(attributes))
 , mTypeId(typeId)
 , mStride(ts.getBitBlockWidth())
@@ -1816,7 +1815,7 @@ TypeId::SegmentOriented, std::move(kernelName),
 std::move(stream_inputs), std::move(stream_outputs),
 std::move(scalar_parameters), std::move(scalar_outputs),
 std::move(internal_scalars),
-CompilationStatus::FullyInitialized, flags) {
+flags) {
 
 }
 

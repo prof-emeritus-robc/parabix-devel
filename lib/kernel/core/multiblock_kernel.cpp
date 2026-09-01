@@ -59,7 +59,7 @@ MultiBlockKernel::MultiBlockKernel(LLVMTypeSystemInterface & ts,
      std::move(scalar_parameters),
      std::move(scalar_outputs),
      std::move(internal_scalars),
-     CompilationStatus::FullyInitialized, flags) {
+     flags) {
 
 }
 

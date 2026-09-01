@@ -56,8 +56,6 @@ using namespace kernel;
 
 using AttrId = kernel::Attribute::KindId;
 
-class KernelGenerationMU;
-
 // TODO: if a task dependency system exists, we could split the task of state identification from codegen but
 // could not guarantee that the same thread/context would process it. Most kernel state types are defined fully
 // in their constructors. The pipeline is the only know exception. Thus very few dependencies would be needed.
@@ -65,22 +63,17 @@ class KernelGenerationMU;
 
 namespace {
 
-struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback {
-//    Kernel *                                TargetKernel;
-//    size_t                                  IsCompilingMainFunction;
+struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
     std::unique_ptr<llvm::TargetMachine>    TargetMachine;
     std::unique_ptr<KernelBuilder>          Builder;
-//    std::unique_ptr<SimpleCompiler>         Compiler;
     llvm::Module *                          CurrentModule;
     llvm::orc::LLJIT *                      Engine;
     llvm::orc::SymbolMap &                  SharedSymbolList;
     llvm::orc::SymbolMap                    NewSymbolList;
 
     CPUDriverContext(JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, SymbolMap & symbolList)
-    : ThreadSafeContext(std::make_unique<LLVMContext>())
-    , TargetMachine(cantFail(JTMB.createTargetMachine()))
-    , Builder(IDISA::GetIDISA_Builder(*getContext(), features))
-//    , Compiler(std::make_unique<SimpleCompiler>(*TargetMachine, nullptr))
+    : TargetMachine(cantFail(JTMB.createTargetMachine()))
+    , Builder(IDISA::GetIDISA_Builder(*this, features))
     , CurrentModule(nullptr)
     , Engine(nullptr)
     , SharedSymbolList(symbolList) {
@@ -90,8 +83,7 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
     llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
         Function * f = CurrentModule->getFunction(unmangledName);
         if (LLVM_UNLIKELY(f == nullptr)) {
-            auto & C = CurrentModule->getContext();
-            FunctionType * funcTy = cast<FunctionType>(CBuilder::convertTypeToLLVMContext(C, functionType));
+            FunctionType * funcTy = cast<FunctionType>(CBuilder::convertTypeToLLVMContext(*this, functionType));
             f = Function::Create(funcTy, Function::ExternalLinkage, unmangledName, CurrentModule);
             assert (Engine);
             auto & ES = Engine->getExecutionSession();
@@ -118,45 +110,94 @@ struct CPUDriverContext : public ThreadSafeContext, public FunctionLinkCallback 
     virtual ~CPUDriverContext() {}
 };
 
+enum class CPUDriverTaskType : size_t {
+    ObjectCode = 0,
+    Declaration = 1,
+    MainFunction = 2
+};
+
 struct CPUDriverTask {
     Kernel * Target;
     Module * TargetModule;
-    size_t   TypeId;
+    CPUDriverTaskType   TypeId;
 
     CPUDriverTask() = default;
 
-    CPUDriverTask(size_t typeId, Kernel * target, Module * module) : TypeId(typeId), Target(target), TargetModule(module) { }
+    CPUDriverTask(CPUDriverTaskType typeId, Kernel * target, Module * module) : Target(target), TargetModule(module), TypeId(typeId) { }
 
     CPUDriverTask & operator=(const CPUDriverTask&) = default;
 
-
 };
 
-struct CPUDriverTaskQueue {
+struct TaskQueue {
 
-    CPUDriverTaskQueue(size_t initialCapacity = 64)
-    : Head(0), Tail(0), Buffer(initialCapacity), InFlight(0) {
+    TaskQueue(size_t initialCapacity)
+    : Head(0), Tail(0), Buffer(initialCapacity) {
 
     }
 
     void push(CPUDriverTask & task) {
-        //std::lock_guard<std::mutex> L(Mutex);
         if (LLVM_UNLIKELY(((Tail + 1U) % Buffer.size()) == Head)) {
-            Buffer.resize(Buffer.size() * 2);
+            const auto m = Buffer.size();
+            Buffer.resize(m * 2);
+            for (size_t i = 0; i < Head; ++i) {
+                Buffer[m + i] = Buffer[i];
+            }
         }
         Buffer[Tail] = task; assert (task.Target);
         Tail = (Tail + 1U) % Buffer.size();
-        InFlight++;
     }
 
     bool pop(CPUDriverTask & out) {
-        //std::lock_guard<std::mutex> L(Mutex);
         if (Head == Tail) {
             return false;
         }
         out = Buffer[Head]; assert (out.Target);
         Head = (Head + 1U) % Buffer.size();
         return true;
+    }
+
+private:
+    size_t Head;
+    size_t Tail;
+    std::vector<CPUDriverTask> Buffer;
+};
+
+struct CPUDriverObjectQueue {
+
+    using Priority = Kernel::KernelCompilationPriority;
+
+    CPUDriverObjectQueue()
+    : Queues({{TaskQueue(64), TaskQueue(8), TaskQueue(2)}}) {
+
+    }
+
+    void push(CPUDriverTask & task) {
+        const size_t idx = task.Target->getCompilationPriority();
+        assert (idx < Queues.size());
+        Queues[idx].push(task);
+    }
+
+    bool pop(CPUDriverTask & out) {
+        if (Queues[(unsigned)Priority::High].pop(out)) return true;
+        if (Queues[(unsigned)Priority::Medium].pop(out)) return true;
+        return Queues[(unsigned)Priority::Normal].pop(out);
+    }
+
+    std::array<TaskQueue, 3> Queues;
+
+};
+
+struct CPUDriverTaskQueue : public TaskQueue {
+
+    CPUDriverTaskQueue(size_t initialCapacity = 64)
+    : TaskQueue(initialCapacity), InFlight(0) {
+
+    }
+
+    void push(CPUDriverTask & task) {
+        TaskQueue::push(task);
+        InFlight++;
     }
 
     bool any() const {
@@ -168,9 +209,6 @@ struct CPUDriverTaskQueue {
     }
 
 private:
-    size_t Head;
-    size_t Tail;
-    std::vector<CPUDriverTask> Buffer;
     size_t InFlight;
 };
 
@@ -198,7 +236,7 @@ public:
                       ParabixObjectCache * objCache)
     : Engine(nullptr)
     , ObjectCache(objCache)
-    , LaneCount(1)
+    , TaskGroupCount(0)
     , ActiveThreads(strategy.ThreadsRequested)
     , Tasks(ActiveThreads)
     , Contexts(ActiveThreads, nullptr) {
@@ -221,9 +259,8 @@ public:
                     auto checkQueue = [&]() -> bool {
 
                         std::lock_guard<std::mutex> L(LaneMutex);
-                        assert (LaneCount > 0);
 
-                        for (taskIndex = 1; taskIndex < LaneCount; ++taskIndex) {
+                        for (; taskIndex < TaskGroupCount; ++taskIndex) {
                             auto & cur = Tasks[taskIndex];
                             if (cur.any()) {
                                 hasTask = cur.pop(toExecute);
@@ -234,9 +271,7 @@ public:
                             }
                         }
 
-                        taskIndex = 0;
-                        auto & cur = Tasks[0];
-                        hasTask = cur.pop(toExecute);
+                        hasTask = ObjectQueue.pop(toExecute);
                         return hasTask;
                     };
 
@@ -250,13 +285,13 @@ public:
                     if (hasTask) {
 
                         switch (toExecute.TypeId) {
-                            case 0:
+                            case CPUDriverTaskType::ObjectCode:
                                 materializeObject(ctx, toExecute.Target, toExecute.TargetModule);
-                                break;
-                            case 1:
+                                continue;
+                            case CPUDriverTaskType::Declaration:
                                 materializeDecl(ctx, taskIndex, toExecute.Target);
                                 break;
-                            case 2:
+                            case CPUDriverTaskType::MainFunction:
                                 materializeMain(ctx, toExecute.Target);
                                 break;
                         }
@@ -265,6 +300,7 @@ public:
                         std::lock_guard<std::mutex> T(TaskMutex);
                         // we need an immutable DS for the tasks array. use linked list?
                         std::lock_guard<std::mutex> L(LaneMutex);
+                        assert (taskIndex < TaskGroupCount);
                         Tasks[taskIndex].markCompleted();
                         END_SCOPED_REGION
 
@@ -284,21 +320,26 @@ public:
 
     size_t addNewTaskGroup() {
         const auto m = Tasks.size();
-        if (LaneCount < m) {
-            return LaneCount++;
+        if (TaskGroupCount < m) {
+            return TaskGroupCount++;
         }
         std::lock_guard<std::mutex> L(LaneMutex);
         Tasks.resize(m * 2);
-        return LaneCount++;
+        return TaskGroupCount++;
     }
 
-    void addCompilationTask(const size_t typeId, const size_t taskLayer, Kernel * const kernel, Module * const module = nullptr) {
+    void addCompilationTask(const CPUDriverTaskType typeId, const size_t taskLayer, Kernel * const kernel, Module * const module = nullptr) {
         BEGIN_SCOPED_REGION
         std::lock_guard<std::mutex> R(TaskMutex);
-        assert (taskLayer < Tasks.size());
-        auto & T = Tasks[taskLayer];
-        CPUDriverTask S{typeId, kernel, module};
-        T.push(S);
+        if (typeId == CPUDriverTaskType::ObjectCode) {
+            CPUDriverTask S{typeId, kernel, module};
+            ObjectQueue.push(S);
+        } else {
+            std::lock_guard<std::mutex> L(LaneMutex);
+            assert (taskLayer < TaskGroupCount);
+            CPUDriverTask S{typeId, kernel, nullptr};
+            Tasks[taskLayer].push(S);
+        }
         END_SCOPED_REGION
         TaskCV.notify_one();
     }
@@ -358,14 +399,14 @@ private:
             } else {
                 // We haven't yet finished declaring the other instance of this one. Re-add this
                 // to the queue and hope we can continue processing after.
-                addCompilationTask(1, declLayer, Target);
+                addCompilationTask(CPUDriverTaskType::Declaration, declLayer, Target);
             }
             return;
         }
         L.unlock();
         END_SCOPED_REGION
 
-        assert (&ctx.Builder->getContext() == ctx.getContext());
+        assert (&ctx.Builder->getContext() == &ctx);
 
         auto & builder = *ctx.Builder;
 
@@ -400,7 +441,7 @@ private:
         ctx.CurrentModule = M;
         ctx.Engine = Engine;
         Target->declareStateTypes(builder);
-        addCompilationTask(0, 0, Target, M);
+        addCompilationTask(CPUDriverTaskType::ObjectCode, 0, Target, M);
         END_SCOPED_REGION
 record_decl:
         BEGIN_SCOPED_REGION
@@ -413,11 +454,7 @@ record_decl:
 
     }
 
-
-
-    void materializeObject(CPUDriverContext & ctx, Kernel * Target, Module * TargetModule) {
-
-        auto & C = *ctx.getContext();
+    void materializeObject(CPUDriverContext & C, Kernel * Target, Module * TargetModule) {
 
         // We can't be sure that the context associated with the decl is the same
         // one that we acquired here. However since we cannot control the order of
@@ -446,21 +483,21 @@ record_decl:
             delete TargetModule;
         }
 
-        auto & builder = *ctx.Builder;
+        auto & builder = *C.Builder;
         assert (&builder.getContext() == &C);
         builder.setModule(M);
-        ctx.CurrentModule = M;
-        ctx.Engine = Engine; assert (Engine);
+        C.CurrentModule = M;
+        C.Engine = Engine; assert (Engine);
 
         M->setTargetTriple(Engine->getTargetTriple().getTriple());
         M->setDataLayout(Engine->getDataLayout());
 
-        linkExternalFunctions(ctx, Target);
+        linkExternalFunctions(C, Target);
 
         SmallVector<char, 0> IROutput;
         SmallVector<char, 0> OptIROutput;
 
-        TargetMachine * const TM = ctx.TargetMachine.get();
+        TargetMachine * const TM = C.TargetMachine.get();
 
         BEGIN_SCOPED_REGION
         NamedRegionTimer T(Target->getSignature(), Target->getName(),
@@ -480,7 +517,7 @@ record_decl:
         if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
             optLevel = codegen::BackEndOptLevel;
         }
-        ctx.TargetMachine->setOptLevel(optLevel);
+        TM->setOptLevel(optLevel);
 
         legacy::PassManager PM;
 
@@ -548,22 +585,19 @@ record_decl:
     }
 
 
-    void materializeMain(CPUDriverContext & ctx, Kernel * Target) {
-
-        assert (&ctx.Builder->getContext() == ctx.getContext());
+    void materializeMain(CPUDriverContext & C, Kernel * Target) {
 
 
-
-        auto M = std::make_unique<Module>("main", *ctx.getContext());
+        auto M = std::make_unique<Module>("main", C);
         M->setTargetTriple(Engine->getTargetTriple().getTriple());
         M->setDataLayout(Engine->getDataLayout());
 
-        KernelBuilder & builder = *ctx.Builder;
+        KernelBuilder & builder = *C.Builder;
         builder.setModule(M.get());
-        ctx.CurrentModule = M.get();
-        ctx.Engine = Engine;
+        C.CurrentModule = M.get();
+        C.Engine = Engine;
 
-        linkExternalFunctions(ctx, Target);
+        linkExternalFunctions(C, Target);
 
         Target->addOrDeclareMainFunction(builder, Kernel::AddInternal);
 
@@ -573,7 +607,7 @@ record_decl:
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        ctx.TargetMachine->setOptLevel(CodeGenOptLevel::Default);
+        C.TargetMachine->setOptLevel(CodeGenOptLevel::Default);
 
         SmallVector<char, 0> objBuffer;
         objBuffer.reserve(4096 + M->getInstructionCount() * 16);
@@ -588,7 +622,7 @@ record_decl:
 
         legacy::PassManager PM;
 
-        TargetMachine * const TM = ctx.TargetMachine.get();
+        TargetMachine * const TM = C.TargetMachine.get();
 
         if (LLVM_UNLIKELY(TM->addPassesToEmitFile(PM, out, nullptr, ObjFile))) {
             report_fatal_error(Twine{"Failed to generate object file for ", M->getModuleIdentifier()});
@@ -617,11 +651,11 @@ record_decl:
 
     }
 
-    inline void linkExternalFunctions(CPUDriverContext & ctx, Kernel * Target) {
+    inline void linkExternalFunctions(CPUDriverContext & C, Kernel * Target) {
 
-        Target->linkExternalMethods(*ctx.Builder);
+        Target->linkExternalMethods(*C.Builder);
 
-        auto & SL = ctx.NewSymbolList;
+        auto & SL = C.NewSymbolList;
 
         if (!SL.empty()) {
             auto & MainJD = Engine->getMainJITDylib();
@@ -666,8 +700,8 @@ record_decl:
                 if (option.empty()) {
                     return std::make_unique<raw_fd_ostream>(STDERR_FILENO, false, true);
                 } else {
-                    std::error_code unoptimizedErr;
-                    return std::make_unique<raw_fd_ostream>(option, unoptimizedErr, sys::fs::OpenFlags::OF_None);
+                    std::error_code err;
+                    return std::make_unique<raw_fd_ostream>(option, err, sys::fs::OpenFlags::OF_None);
                 }
             }
             return std::unique_ptr<raw_fd_ostream>();
@@ -696,7 +730,7 @@ private:
     llvm::orc::LLJIT *                              Engine;
     ParabixObjectCache * const                      ObjectCache;
 
-    size_t                                          LaneCount;
+    size_t                                          TaskGroupCount;
 
     std::atomic<size_t>                             NoMoreNewTasks{0};
 
@@ -719,17 +753,18 @@ private:
     // TODO: decl queue needs to be a priority queue so that we can force more complex
     // kernels (such as the pipeline) to be started sooner.
 
+    CPUDriverObjectQueue                            ObjectQueue;
     std::vector<CPUDriverTaskQueue>                 Tasks;
 
     std::vector<std::thread>                        Threads;
 
-
+\
     std::mutex                                      DebugPrintMutex;
     SmallVector<DebugPrintingResult, 0>             DebugPrintResults;
 
 };
 
-}
+} // end of anon namespace
 
 ATTRIBUTE_NO_SANITIZE_ADDRESS
 CPUDriver::CPUDriver(std::string && moduleName)
@@ -828,7 +863,7 @@ void CPUDriver::generateUncachedKernels() {
 
     for (unsigned i = 0; i < numKernels; ++i) {
         auto & kernel = mUncachedKernel[i];
-        mCPUDriverCompiler->addCompilationTask(1, layerId, kernel.get());
+        mCPUDriverCompiler->addCompilationTask(CPUDriverTaskType::Declaration, layerId, kernel.get());
         mCachedKernel.emplace_back(kernel.release());
     }
 
@@ -842,7 +877,7 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
     const auto layerId = mCPUDriverCompiler->addNewTaskGroup();
 
-    mCPUDriverCompiler->addCompilationTask(2, layerId, pk);
+    mCPUDriverCompiler->addCompilationTask(CPUDriverTaskType::MainFunction, layerId, pk);
 
     auto mainFuncPtr = mCPUDriverCompiler->waitUntilCompleted(pk);
 

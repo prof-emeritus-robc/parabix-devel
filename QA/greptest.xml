@@ -1061,6 +1061,7 @@ Unterminated</datafile>
 <grepcase regexp="\p{script=/(kata|Hira).ana/}" datafile="hiragana_and_katakana" greplines="1 2 3"/>
 <grepcase regexp="(?:\p{greek}\p{greek}\p{greek})" datafile="upper_lower_greek" greplines="1 2 3"/>
 <grepcase regexp="\P{slc=@lc@}" datafile="../All_good" greplines="272"/>
+<grepcase regexp="\p{slc!=@lc@}" datafile="../All_good" greplines="272"/>
 <grepcase regexp="\P{lc=@slc@}" datafile="../All_good" greplines="272"/>
 
 

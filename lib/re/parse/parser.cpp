@@ -465,7 +465,7 @@ std::string RE_Parser::canonicalize(const cursor_t begin, const cursor_t end) {
 
 RE * RE_Parser::parsePropertyExpression(PropertyExpression::Kind k) {
     const auto start = mCursor.pos();
-    while (mCursor.more() && !atany("}:=")) {
+    while (mCursor.more() && !atany("}:=!")) {
         get1();
     }
     const auto prop_end = mCursor.pos();

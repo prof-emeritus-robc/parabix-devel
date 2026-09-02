@@ -7,6 +7,7 @@
 #include <llvm/ExecutionEngine/RTDyldMemoryManager.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/ExecutionEngine/Orc/ObjectFileInterface.h>
+#include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
 #include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/InitializePasses.h>                 // for initializeCodeGencd .
 #include <llvm/PassRegistry.h>                     // for PassRegistry
@@ -34,6 +35,12 @@
 #include <llvm/Support/Host.h>
 #endif
 #include <numeric>
+
+#include <boost/interprocess/mapped_region.hpp>
+
+inline unsigned getPageSize() {
+    return boost::interprocess::mapped_region::get_page_size();
+}
 
 #ifndef NDEBUG
 #define IN_DEBUG_MODE true
@@ -88,23 +95,25 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
             assert (Engine);
             auto & ES = Engine->getExecutionSession();
             auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
-            SymbolStringPtr symbol = nullptr;
-            bool added = false;
+            MangleAndInterner M(ES, Engine->getDataLayout());
             const auto flags = JITSymbolFlags::Exported | JITSymbolFlags::Callable;
-            ES.runSessionLocked([&]{
-                MangleAndInterner M(ES, Engine->getDataLayout());
-                symbol = M(unmangledName);
-                added = SharedSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, flags})).second;
-            });
-            if (added) {
-                NewSymbolList.insert(std::make_pair(symbol, ExecutorSymbolDef{addr, flags}));
-            }
+            NewSymbolList.insert(std::make_pair(M(unmangledName), ExecutorSymbolDef{addr, flags}));
         }
         return f;
     }
 
     bool HasExternalFunction(llvm::StringRef unmangledName) const {
-        return RTDyldMemoryManager::getSymbolAddressInProcess(unmangledName.str());
+        auto & ES = Engine->getExecutionSession();
+        MangleAndInterner mangler(ES, Engine->getDataLayout());
+        SymbolLookupSet syms;
+        syms.add(mangler(unmangledName));
+        auto result = ES.lookup(makeJITDylibSearchOrder({&Engine->getMainJITDylib()}), syms,
+                                LookupKind::Static, SymbolState::Ready, NoDependenciesToRegister);
+        if (!result) {
+            consumeError(result.takeError());
+            return false;
+        }
+        return true;
     }
 
     virtual ~CPUDriverContext() {}
@@ -229,6 +238,9 @@ struct DebugPrintingResult {
 
 
 class CPUDriverCompiler {
+
+    using MemoryBufferVector = std::vector<std::unique_ptr<MemoryBuffer>>;
+
 public:
 
     CPUDriverCompiler(ThreadPoolStrategy strategy,
@@ -252,6 +264,10 @@ public:
             Threads.emplace_back([this, &ctx]() {
                 for (;;) {
 
+                    if (addFinalObjectCodeToLLJIT()){
+                        continue;
+                    }
+
                     CPUDriverTask toExecute;
                     size_t taskIndex = 0;
                     bool hasTask = false;
@@ -259,7 +275,6 @@ public:
                     auto checkQueue = [&]() -> bool {
 
                         std::lock_guard<std::mutex> L(LaneMutex);
-
                         for (; taskIndex < TaskGroupCount; ++taskIndex) {
                             auto & cur = Tasks[taskIndex];
                             if (cur.any()) {
@@ -295,6 +310,8 @@ public:
                                 materializeMain(ctx, toExecute.Target);
                                 break;
                         }
+
+                        assert (toExecute.TypeId != CPUDriverTaskType::ObjectCode);
 
                         BEGIN_SCOPED_REGION
                         std::lock_guard<std::mutex> T(TaskMutex);
@@ -355,6 +372,28 @@ public:
             if (t.joinable()) t.join();
         }
 
+        for (auto & C : Contexts) {
+            auto & S = C->NewSymbolList;
+            DriverLinkedSymbols->insert(S.begin(), S.end());
+        }
+
+        if (!DriverLinkedSymbols->empty()) {
+            auto & MainJD = Engine->getMainJITDylib();
+            auto err = MainJD.define(orc::absoluteSymbols(*DriverLinkedSymbols));
+            if (err) {
+                handleAllErrors(std::move(err),
+                    [](const DuplicateDefinition &) {
+                        /* ignored */
+                    },
+                    [Target](const ErrorInfoBase & err) {
+                        SmallVector<char, 100> tmp;
+                        raw_svector_ostream msg(tmp);
+                        msg << Target->getName() << ": cannot link symbol: " << err.message();
+                        report_fatal_error(msg.str());
+                    });
+            }
+        }
+
         auto & JITLib = Engine->getMainJITDylib();
         SmallVector<char, 256> tmp;
         raw_svector_ostream mainName(tmp);
@@ -370,6 +409,10 @@ public:
 
     void setEngine(orc::LLJIT * engine) {
         Engine = engine;
+    }
+
+    void setDriverLinkedSymbolMap(llvm::orc::SymbolMap * symMap) {
+        DriverLinkedSymbols = symMap;
     }
 
     ~CPUDriverCompiler() {
@@ -428,7 +471,8 @@ private:
                 ctx.CurrentModule = M.get();
                 ctx.Engine = Engine;
 
-                linkExternalFunctions(ctx, Target);
+                Target->linkExternalMethods(builder);
+                // linkExternalFunctions(ctx, Target);
 
                 cantFail(Engine->addObjectFile(JITLib, std::move(cached)));
                 goto record_decl;
@@ -492,7 +536,8 @@ record_decl:
         M->setTargetTriple(Engine->getTargetTriple().getTriple());
         M->setDataLayout(Engine->getDataLayout());
 
-        linkExternalFunctions(C, Target);
+        Target->linkExternalMethods(builder);
+        //linkExternalFunctions(C, Target);
 
         SmallVector<char, 0> IROutput;
         SmallVector<char, 0> OptIROutput;
@@ -523,6 +568,9 @@ record_decl:
 
         SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> objBuffer;
+
+
+        std::unique_ptr<SmallVectorMemoryBuffer> objCode;
 
         BEGIN_SCOPED_REGION
 
@@ -565,25 +613,27 @@ record_decl:
 
         PM.run(*M);
 
-        auto result = std::make_unique<SmallVectorMemoryBuffer>(std::move(objBuffer), false);
+        objCode = std::make_unique<SmallVectorMemoryBuffer>(std::move(objBuffer), false);
+
+        END_SCOPED_REGION
+
+        assert (objCode.get());
 
         if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
-            ObjectCache->saveCachedObjectFile(*M, result->getMemBufferRef());
+            ObjectCache->saveCachedObjectFile(*M, objCode->getMemBufferRef());
         }
-
-        auto & JITLib = Engine->getMainJITDylib();
-        cantFail(Engine->addObjectFile(JITLib, std::move(result)));
 
         delete M;
 
+        BEGIN_SCOPED_REGION
+        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+        AddObjectCodeList.emplace_back(std::move(objCode));
         END_SCOPED_REGION
 
         if (LLVM_UNLIKELY(IROutput.size() || OptIROutput.size() || ASMOutput.size())) {
             recordDebugPrintResult(Target, std::move(IROutput), std::move(OptIROutput), std::move(ASMOutput));
         }
-
     }
-
 
     void materializeMain(CPUDriverContext & C, Kernel * Target) {
 
@@ -597,7 +647,8 @@ record_decl:
         C.CurrentModule = M.get();
         C.Engine = Engine;
 
-        linkExternalFunctions(C, Target);
+        Target->linkExternalMethods(builder);
+        //linkExternalFunctions(C, Target);
 
         Target->addOrDeclareMainFunction(builder, Kernel::AddInternal);
 
@@ -632,50 +683,61 @@ record_decl:
 
         auto result = std::make_unique<SmallVectorMemoryBuffer>(std::move(objBuffer), false);
 
-        auto & JITLib = Engine->getMainJITDylib();
-        auto err = Engine->addObjectFile(JITLib, std::move(result));
-        if (err) {
-            handleAllErrors(std::move(err),
-                [](const DuplicateDefinition &) {
-                    /* ignored */
-                },
-                [](const ErrorInfoBase & err) {
-                    SmallVector<char, 100> tmp;
-                    raw_svector_ostream msg(tmp);
-                    msg << "Cannot link symbol: " << err.message();
-                    report_fatal_error(msg.str());
-                });
-        }
+        BEGIN_SCOPED_REGION
+        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+        AddObjectCodeList.emplace_back(std::move(result));
+        END_SCOPED_REGION
 
         END_SCOPED_REGION
 
     }
 
-    inline void linkExternalFunctions(CPUDriverContext & C, Kernel * Target) {
-
-        Target->linkExternalMethods(*C.Builder);
-
-        auto & SL = C.NewSymbolList;
-
-        if (!SL.empty()) {
-            auto & MainJD = Engine->getMainJITDylib();
-            auto err = MainJD.define(orc::absoluteSymbols(SL));
-            if (err) {
-                handleAllErrors(std::move(err),
-                    [](const DuplicateDefinition &) {
-                        /* ignored */
-                    },
-                    [Target](const ErrorInfoBase & err) {
-                        SmallVector<char, 100> tmp;
-                        raw_svector_ostream msg(tmp);
-                        msg << Target->getName() << ": cannot link symbol: " << err.message();
-                        report_fatal_error(msg.str());
-                    });
-            }
-            SL.clear();
+    bool addFinalObjectCodeToLLJIT() {
+        if (AddObjectCodeList.empty()) {
+            return false;
         }
-
+        size_t e = 0;
+        if (!AddObjectCodeInProcess.compare_exchange_weak(e, 1, std::memory_order_release, std::memory_order_relaxed)) {
+            return false;
+        }
+        MemoryBufferVector objCodeList;
+        BEGIN_SCOPED_REGION
+        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+        objCodeList.swap(AddObjectCodeList);
+        END_SCOPED_REGION
+        for (auto & buffer : objCodeList) {
+            cantFail(Engine->addObjectFile(std::move(buffer)));
+        }
+        AddObjectCodeInProcess.store(0, std::memory_order_release);
+        return true;
     }
+
+
+//    inline void linkExternalFunctions(CPUDriverContext & C, Kernel * Target) {
+
+//        Target->linkExternalMethods(*C.Builder);
+
+//        auto & SL = C.NewSymbolList;
+
+//        if (!SL.empty()) {
+//            auto & MainJD = Engine->getMainJITDylib();
+//            auto err = MainJD.define(orc::absoluteSymbols(SL));
+//            if (err) {
+//                handleAllErrors(std::move(err),
+//                    [](const DuplicateDefinition &) {
+//                        /* ignored */
+//                    },
+//                    [Target](const ErrorInfoBase & err) {
+//                        SmallVector<char, 100> tmp;
+//                        raw_svector_ostream msg(tmp);
+//                        msg << Target->getName() << ": cannot link symbol: " << err.message();
+//                        report_fatal_error(msg.str());
+//                    });
+//            }
+//            SL.clear();
+//        }
+
+//    }
 
     void recordDebugPrintResult(Kernel * const kernel, SmallVector<char, 0> && UnoptIR, SmallVector<char, 0> && OptIR, SmallVector<char, 0> && ASM) {
         std::lock_guard<std::mutex> L(DebugPrintMutex);
@@ -730,9 +792,9 @@ private:
     llvm::orc::LLJIT *                              Engine;
     ParabixObjectCache * const                      ObjectCache;
 
-    size_t                                          TaskGroupCount;
+    llvm::orc::SymbolMap *                          DriverLinkedSymbols;
 
-    std::atomic<size_t>                             NoMoreNewTasks{0};
+    size_t                                          TaskGroupCount;
 
     size_t                                          ActiveThreads;
 
@@ -745,20 +807,22 @@ private:
     std::mutex                                      TaskMutex;
     std::condition_variable                         TaskCV;
 
+    std::atomic<size_t>                             NoMoreNewTasks{0};
     std::mutex                                      ShutdownMutex;
     std::condition_variable                         ShutdownCV;
 
     std::mutex                                      LaneMutex;
 
-    // TODO: decl queue needs to be a priority queue so that we can force more complex
-    // kernels (such as the pipeline) to be started sooner.
-
     CPUDriverObjectQueue                            ObjectQueue;
     std::vector<CPUDriverTaskQueue>                 Tasks;
 
+    std::atomic<size_t>                             AddObjectCodeInProcess;
+    std::mutex                                      AddObjectCodeMutex;
+    MemoryBufferVector                              AddObjectCodeList;
+
+
     std::vector<std::thread>                        Threads;
 
-\
     std::mutex                                      DebugPrintMutex;
     SmallVector<DebugPrintingResult, 0>             DebugPrintResults;
 
@@ -769,9 +833,6 @@ private:
 ATTRIBUTE_NO_SANITIZE_ADDRESS
 CPUDriver::CPUDriver(std::string && moduleName)
 : BaseDriver(std::move(moduleName))
-, mUnoptimizedIROutputStream{}
-, mIROutputStream{}
-, mASMOutputStream{}
 , mEngine(nullptr) {
 
     InitializeNativeTarget();
@@ -814,6 +875,12 @@ CPUDriver::CPUDriver(std::string && moduleName)
     Builder.setNumCompileThreads(0);
     Builder.setCompileFunctionCreator(nullptr);
 
+    Builder.setObjectLinkingLayerCreator([](ExecutionSession & ES, const Triple & TT) {
+        auto objLinker = std::make_unique<ObjectLinkingLayer>(ES, std::make_unique<jitlink::InProcessMemoryManager>(getPageSize()));
+        objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
+        return objLinker;
+    });
+
     mCPUDriverCompiler = std::make_unique<CPUDriverCompiler>(
                                   llvm::hardware_concurrency(numOfThreads),
                                   *Builder.getJITTargetMachineBuilder(), features, *mAllLinkedSymbols,
@@ -824,14 +891,15 @@ CPUDriver::CPUDriver(std::string && moduleName)
 
     mCPUDriverCompiler->setEngine(mEngine.get());
 
+    mCPUDriverCompiler->setDriverLinkedSymbolMap(mAllLinkedSymbols.get());
+
     auto & ES = mEngine->getExecutionSession();
 
-    ES.setDispatchTask([](std::unique_ptr<Task> T){
+    ES.setDispatchTask([](std::unique_ptr<Task> T) {
         T->run();
     });
 
     auto & MainJD = mEngine->getMainJITDylib();
-
     MainJD.addGenerator(
         cantFail(orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
             mEngine->getDataLayout().getGlobalPrefix()
@@ -910,18 +978,26 @@ llvm::Function * CPUDriver::LinkFunction(llvm::StringRef unmangledName, llvm::Fu
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mMainModule);
         auto & ES = mEngine->getExecutionSession();
-        ES.runSessionLocked([&]{
-            MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
-            auto symbol = M(unmangledName);
-            auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
-            mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
-        });
+        MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
+        auto symbol = M(unmangledName);
+        auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
+        mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
     }
     return f;
 }
 
 bool CPUDriver::HasExternalFunction(llvm::StringRef functionName) const {
-    return RTDyldMemoryManager::getSymbolAddressInProcess(functionName.str());
+    auto & ES = mEngine->getExecutionSession();
+    MangleAndInterner mangler(ES, mEngine->getDataLayout());
+    SymbolLookupSet syms;
+    syms.add(mangler(functionName));
+    auto result = ES.lookup(makeJITDylibSearchOrder({&mEngine->getMainJITDylib()}), syms,
+                            LookupKind::Static, SymbolState::Ready, NoDependenciesToRegister);
+    if (!result) {
+        consumeError(result.takeError());
+        return false;
+    }
+    return true;
 }
 
 CPUDriver::~CPUDriver() {

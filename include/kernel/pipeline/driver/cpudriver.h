@@ -16,18 +16,7 @@ class CPUDriverCompiler;
 
 class CPUDriver final : public BaseDriver {
 
-    struct LinkedFunction {
-        const kernel::Kernel * const Target;
-        llvm::Function * const FunctionDecl;
-
-        LinkedFunction(const kernel::Kernel * const target, llvm::Function * decl)
-        : Target(target), FunctionDecl(decl) { }
-    };
-
     friend class CPUDriverKernelCompiler;
-    friend class KernelGenerationMU;
-
-    using LinkedFunctionVector = llvm::SmallVector<LinkedFunction, 16>;
 
 public:
 
@@ -39,21 +28,12 @@ public:
 
     void * finalizeObject(kernel::Kernel * const pipeline) override;
 
-    llvm::ModulePass * createTracePass(kernel::KernelBuilder * kb, llvm::StringRef to_trace);
-
     llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) final;
 
     bool HasExternalFunction(llvm::StringRef unmangledName) const final;
 
-
 private:
 
-    void preparePassManager();
-
-private:
-    std::unique_ptr<llvm::raw_fd_ostream>                   mUnoptimizedIROutputStream;
-    std::unique_ptr<llvm::raw_fd_ostream>                   mIROutputStream;
-    std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
     std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
     std::unique_ptr<CPUDriverCompiler>                      mCPUDriverCompiler;
     std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;

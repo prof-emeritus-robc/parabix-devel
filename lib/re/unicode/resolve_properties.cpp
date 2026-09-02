@@ -44,25 +44,25 @@ private:
 };
 
 RE * PropertyResolver::resolveCC (std::string value, bool is_negated) {
-    RE * resolved = nullptr;
+    UnicodeSet resolved;
     if ((value.length() > 0) && (value[0] == '/')) {
         if (mGrep == nullptr)
             llvm::report_fatal_error("Recursive property expression found, but no grep function supplied");
         re::RE * propValueRe = re::RE_Parser::parse(value.substr(1), re::DEFAULT_MODE, re::PCRE, false);
-        return makeCC(mPropObj->GetCodepointSetMatchingPattern(propValueRe, mGrep), &cc::Unicode);
+        resolved = mPropObj->GetCodepointSetMatchingPattern(propValueRe, mGrep);
     }
     else if ((value.length() > 0) && (value[0] == '@')) {
         // resolve a @property@ or @identity@ expression.
         std::string otherProp = canonicalize_value_name(value.substr(1));
         auto propObj2 = getPropertyObject(getPropertyCode(otherProp));
-        resolved = makeCC(mPropObj->GetPropertyIntersection(propObj2), &cc::Unicode);
+        resolved = mPropObj->GetPropertyIntersection(propObj2);
     } else {
-        resolved = makeCC(mPropObj->GetCodepointSet(value), &cc::Unicode);
+        resolved = mPropObj->GetCodepointSet(value);
     }
     if (is_negated) {
-        resolved = makeDiff(makeAny(), resolved);
+        resolved = ~resolved;
     }
-    return resolved;
+    return makeCC(resolved, &cc::Unicode);
 }
 
 RE * PropertyResolver::resolveBoundary (std::string val, bool is_negated) {

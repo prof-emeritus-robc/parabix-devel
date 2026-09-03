@@ -97,18 +97,16 @@ def _parabix_ids_cmd(input_path: str, strings: bool = False):
 
 
 def run_parabix_bpe(text: str) -> tuple[list[int], list[str]]:
-    """Parabix BPE: feed raw text straight to the merge stage.
+    """Parabix BPE: --pretokenizer=bytelevel + BPE merge stage in one pipeline.
 
-    The BPE seed (BPERangeSeed) already applies GPT-2 bytes_to_unicode to the raw
-    input bytes, so running --pretokenizer=bytelevel FIRST double-encodes: a space
-    0x20 becomes Ġ, emitted as its UTF-8 bytes 0xC4 0xA0, which the seed then
-    re-maps to ids 128/254 instead of the correct Ġ id 220. Skip step 1 and let the
-    seed do the byte-level encode once (matches HF).
-
-    NOTE: --pretokenizer=bytelevel boundary-gating was tried and reverted — the raw
-    RE_Kernel boundary stream over-marks (optional-space + contraction overlaps),
-    detaching Ġ from words and splitting words. Raw-byte path is the good baseline;
-    only the 't/quote contraction diverges (no pretoken boundaries block it)."""
+    tokenizer.cpp's --pretokenizer=bytelevel path (buildBPEPipeline, PreTokenizer
+    == bytelevel branch) feeds the merge stage the RAW input bytes as bpeBasis —
+    NOT the Ġ-remapped pretokenizer output, which would double-encode (BPERangeSeed
+    already applies GPT-2 bytes_to_unicode once) — and separately threads the
+    regex pretoken-boundary mask through as bpeBoundary, so BPEMergeKernel blocks
+    merges that would cross a pretoken boundary. This is the actual HF-equivalent
+    configuration: verified byte-identical (ids + token count) against HF on a
+    49MB / 15.75M-token openwebtext run (2026-09-03)."""
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
                                      encoding="utf-8", delete=False) as f:
@@ -158,10 +156,16 @@ BENCH_RE = re.compile(
 
 def bench_parabix(input_path: str, runs: int):
     """Fair Parabix tokenize time via in-process --bench-loop. Returns a stats
-    dict (min/median/mean ms + mbps) or None if no BENCH_RESULT was produced."""
+    dict (min/median/mean ms + mbps) or None if no BENCH_RESULT was produced.
+
+    Carries --pretokenizer=bytelevel so this times the SAME pipeline shape that
+    _parabix_ids_cmd checks for correctness. Without it the run takes the raw-byte
+    path with no pretoken boundary gating, which is both cheaper (one fewer And per
+    rule, across all 50,000) and not the configuration anything validates — so the
+    reported MB/s would describe a pipeline nobody has checked."""
     r = subprocess.run(
-        [TOKENIZER, f"--bench-loop={runs}", f"--vocab={VOCAB}",
-         f"--merges={MERGES}", *EXTRA_ARGS, input_path],
+        [TOKENIZER, "--pretokenizer=bytelevel", f"--bench-loop={runs}",
+         f"--vocab={VOCAB}", f"--merges={MERGES}", *EXTRA_ARGS, input_path],
         capture_output=True, encoding="utf-8"
     )
     m = BENCH_RE.search(r.stderr or "")
@@ -276,9 +280,8 @@ def write_timing(out, timing: dict, text: str, runs: int, ntokens: int) -> None:
     out.write("\n  Fair: Parabix via --bench-loop (N iters in ONE process — no per-iter\n"
               "        spawn / merges-load / compile, output suppressed); HF via preloaded\n"
               "        in-process encode() loop (from_file excluded). Setup excluded both.\n"
-              "  Caveats: Parabix 'run' still includes the input file read; Parabix runs\n"
-              "        without the regex pre-tokenizer HF applies; use MB-scale input\n"
-              "        (tokenizer_files/webtext_100.txt) for a meaningful MB/s.\n")
+              "  Caveats: Parabix 'run' still includes the input file read; use MB-scale\n"
+              "        input (tokenizer_files/webtext_100.txt) for a meaningful MB/s.\n")
     out.write(SEP + "\n\n")
 
 

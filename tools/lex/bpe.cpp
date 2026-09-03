@@ -891,12 +891,15 @@ BPEPassResult buildBPEPassPipeline(
                   << " kernels via IndexedShiftBack (1 shift/kernel)\n";
     auto compactAfter = applyCompactionSchedule(ruleRanges, compactEvery);
 
-    // debug: dump the merge-range groups to stderr
+    // debug: dump the merge-range groups to stderr. BPE_GROUPS=1 for the
+    // per-group [lo,hi) xN maxLen=M lines too (verbose, 1 line/kernel).
     std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels ("
               << (LevelPartition ? "ASAP level schedule" : "contiguous clean ranges") << ")\n";
-    for (const auto & g : ruleRanges)
-        std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.rules.size()
-                  << " maxLen=" << g.maxLen << "\n";
+    if (std::getenv("BPE_GROUPS")) {
+        for (const auto & g : ruleRanges)
+            std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.rules.size()
+                      << " maxLen=" << g.maxLen << "\n";
+    }
 
     // BPE_RULES=1: dump the resolved merge rules. BPE_RULES_N caps per group (4).
     if (std::getenv("BPE_RULES")) {

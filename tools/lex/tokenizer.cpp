@@ -328,10 +328,20 @@ static BPEPipelineFunctionType buildBPEPipeline(
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
     // Stage 1: normalization → U21
+    // Skip the UTF8<->U21 round-trip entirely when there's no active
+    // normalization and no --pretokenizer flag (the only two consumers of
+    // U21codepoints below) — otherwise it's a pure-overhead identity
+    // transform (UTF8_Decoder + UTF8_index + U21_to_UTF8, all for nothing).
     std::vector<NormalizationMode> normModes(Normalization.begin(), Normalization.end());
-    StreamSet * U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
-    StreamSet * normalizedBasis = P.CreateStreamSet(8, 1);
-    U21_to_UTF8(P, U21codepoints, normalizedBasis);
+    bool hasActiveNorm = false;
+    for (auto m : normModes) if (m != NormNone) { hasActiveNorm = true; break; }
+    StreamSet * U21codepoints = nullptr;
+    StreamSet * normalizedBasis = BasisBits;
+    if (hasActiveNorm || PreTokenizer.getNumOccurrences() != 0) {
+        U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
+        normalizedBasis = P.CreateStreamSet(8, 1);
+        U21_to_UTF8(P, U21codepoints, normalizedBasis);
+    }
 
     // Stage 2: pre-tokenization — produces the byte stream that feeds the
     // byte-mode BPE trie. Two paths:

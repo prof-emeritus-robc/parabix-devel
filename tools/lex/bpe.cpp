@@ -153,6 +153,25 @@ static cl::opt<bool> LevelPartition(
              "instead of contiguous clean id ranges."),
     cl::init(false));
 
+// Asymmetric seam (--level-partition only): drop the maxRight/idA seam constraint,
+// keep maxLeft/idB. Two rules sharing token t where an earlier (lower-rank) rule used
+// t as ITS right/B part and a later rule uses t as ITS left/A part (e.g. rank11 "Ġ+o"
+// vs rank17 "o+r" on "Ġor") no longer need separate levels: rank11's fire clears t's
+// live-start bit in inPlayMask, and eqAstart's gate now reads that mask LIVE (see
+// below), so rank17 correctly sees t already consumed even inside the same kernel.
+// The other direction (maxLeft/idB — e.g. rank40 "o+m" vs rank49 "r+o" on "from")
+// stays a hard separation: rank49's B-detect is a forward LookAhead on the FROZEN
+// kernel input (Pablo: LookAhead legal only on a declared input binding, T5), so it
+// can never observe rank40's same-kernel restamp of o's position. Needs a real kernel
+// boundary. Cuts 283 -> 76 kernels (measured via merge_analysis.py's scheduling model;
+// this flag is the first C++ implementation — verify byte-identical vs HF before
+// trusting it for anything beyond experimentation).
+static cl::opt<bool> AsymmetricSeam(
+    "asymmetric-seam",
+    cl::desc("With --level-partition, drop the maxRight seam constraint (keep maxLeft) "
+             "for a tighter (but less battle-tested) level schedule."),
+    cl::init(false));
+
 static cl::opt<bool> LookaheadInGate(
     "lookahead-in-gate",
     cl::desc("Build the B-detection LookAhead inside each rule's if-gate (per-rule, "
@@ -664,20 +683,34 @@ protected:
         }
 
         // ── Astart decode ────────────────────────────────────────────────────────
-        // Astart(idA) = EQ(srcFrozen, idA) AND meInFrozen — a W_out-deep AND/OR chain.
+        // Astart(idA) = EQ(srcFrozen, idA) AND inPlayMask — a W_out-deep AND/OR chain.
         // Every rule pays it OUTSIDE its createIf gate (the gate condition IS Astart),
         // so it is the dominant never-skipped per-byte cost. eqAstart already folds in
-        // meInFrozen, so the returned value IS the gate value — callers hand it straight
+        // the mask, so the returned value IS the gate value — callers hand it straight
         // to emitBody, whose fire is a 2-input And.
+        //
+        // The id-compare term stays FROZEN (srcFrozen) — a token's id value at a given
+        // position never changes except via this kernel's OWN stamp at that SAME
+        // position (which only a self-merge or an already-forbidden overlap could hit),
+        // so re-reading srcFrozen is always correct. The MASK term reads the LIVE
+        // `inPlayMask` Var instead of the frozen kernel-input snapshot: Pablo's
+        // createIf auto-joins Var reassignments as a Sel when a gated scope closes, so
+        // by the time a later rule in this same kernel calls eqAstart again (back at
+        // the outer scope), inPlayMask already reflects every earlier rule's consume in
+        // THIS kernel. Under the shipped partition schemes (clean-range default,
+        // --level-partition symmetric seam) this is a no-op — conflict-freedom already
+        // guarantees no rule's fire touches a position another same-kernel rule reads —
+        // but it's what makes --level-partition --asymmetric-seam correct: rank11 "Ġo"
+        // clearing "o"'s start must be visible to rank17 "or" even inside one kernel.
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
-            cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);   
-            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), meInFrozen);
+            cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);
+            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask);
         };
 
         // One rule's fire → B-detect + stamp all idAB bits + consume B, all inside `body`
         // (the gated scope, so it's block-skippable). fireStart is supplied by the caller
-        // (per-rule Astart) and MUST already be AND-ed with meInFrozen — eqAstart does
-        // that (its result is EQ AND meInFrozen).
+        // (per-rule Astart) and MUST already be AND-ed with the live mask — eqAstart
+        // does that (its result is EQ AND inPlayMask).
         // grpAhead/grpBoundary (non-null only on the --lookahead-in-group path) are the
         // chunk-local cached peeks, deduped per lenA and built inside this gate body.
         auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart,
@@ -750,8 +783,9 @@ protected:
         // Self-merge X+X→XX (idA==idB): pair per-run on the frozen live starts. No
         // same-kernel rule can have consumed an X-run position — that would overlap the
         // self-merge, which the clean-range partition forbids — so frozen == live.
+        unsigned maskGen = 0;
         auto emitRule = [&](const MergeRule & r) {
-            // eqAstart already includes meInFrozen, and selfMergeFireStarts returns a
+            // eqAstart already includes the live mask, and selfMergeFireStarts returns a
             // subset of its input, so fireStart IS the gate value — no extra And.
             PabloAST * fireStart = eqAstart(pb, r.idA);
             if (r.idA == r.idB)
@@ -759,6 +793,20 @@ protected:
             auto body = pb.createScope();
             emitBody(body, r, fireStart);
             pb.createIf(fireStart, body);
+            // Rebind inPlayMask to a FRESH Var after every rule. Pablo's PabloBuilder
+            // memoizes createAnd(a,b) by OPERAND POINTER IDENTITY (mExprTable), with no
+            // awareness that a Var's value changes across an intervening createAssign
+            // inside a closed createIf scope. Two rules sharing idA call eqAstart with
+            // the SAME idpart AND the SAME inPlayMask pointer — the second call hits the
+            // cache and silently gets back the FIRST rule's pre-fire (stale) gate, so it
+            // can fire on a position the first rule already consumed (found empirically
+            // 2026-09-03: rules "0+0","0+1","1+2" sharing a kernel, "0+1" reusing "0+0"'s
+            // stale gate, misfiring on "0"'s already-consumed position and stealing "1"
+            // out from under "1+2"). A fresh Var* per rule is a new cache key, so the
+            // next eqAstart call is forced to rebuild against the truly-current mask.
+            Var * freshMask = pb.createVar("inPlayMask_" + std::to_string(maskGen++), zeroes);
+            pb.createAssign(freshMask, inPlayMask);
+            inPlayMask = freshMask;
         };
 
         if (!mGrouped) {
@@ -1186,14 +1234,36 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         unsigned lvl = 1;    // lets assume the rule can sit in level 1 (no deps, no seams). Then check the constraints.
         auto after = [&](const std::unordered_map<unsigned, unsigned> & m, unsigned key) {
             auto it = m.find(key);  // search/find if the token was used as a part in a lower kernel
-            // If it was, the rule must sit after that kernel (level = that kernel's level + 1). 
+            // If it was, the rule must sit after that kernel (level = that kernel's level + 1).
             // If not, the rule can sit in level 1 (no constraint).
             if (it != m.end() && it->second + 1u > lvl) lvl = it->second + 1u;
         };
+        // sameOrAfter: like `after`, but level ITSELF is acceptable (not level+1). Used
+        // only for the --asymmetric-seam maxRight relaxation: the live-mask read makes
+        // same-kernel coexistence correct (rank order inside the kernel still runs the
+        // consumer before the dependent), but the rule must never land STRICTLY EARLIER
+        // than the token's consumer.
+        auto sameOrAfter = [&](const std::unordered_map<unsigned, unsigned> & m, unsigned key) {
+            auto it = m.find(key);
+            if (it != m.end() && it->second > lvl) lvl = it->second;
+        };
         after(prodLevel, r.idA);      // dependency: idA stamped by a lower kernel
         after(prodLevel, r.idB);      // dependency: idB stamped by a lower kernel
-        after(maxRight,  r.idA);      // seam: an earlier rule consumed this token as its B
+        // seam: an earlier rule consumed this token as its B. Under --asymmetric-seam,
+        // softened to same-level-or-after — the runtime gate now reads inPlayMask LIVE
+        // (see eqAstart), so a same-kernel earlier consume is visible without a level
+        // split, but the rule still can't jump to an EARLIER level than its consumer.
+        // EXCEPT self-merges (idA==idB): selfMergeFireStarts' run-parity math assumes a
+        // STATIC isX (see its call site comment — "no same-kernel rule can have
+        // consumed an X-run position... so frozen==live"). A live, same-kernel-gapped
+        // isX breaks that assumption (found empirically 2026-09-03: val_2MB mismatch
+        // inside a repeated-'0' run once the softened path was in use), so self-merges
+        // keep the strict, always-separate-kernel constraint regardless of this flag.
+        if (AsymmetricSeam && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
+        else after(maxRight, r.idA);
         after(maxLeft,   r.idB);      // seam: an earlier rule claimed this token as its A
+                                      // — unfixable in-kernel (forward LookAhead reads
+                                      // frozen input only, T5); always enforced.
         // Base ids (< 256) are absent from prodLevel — the seed supplies them, so they
         // impose no constraint and such a rule can sit in level 1.
         // If the number of levels we currently have is LESS than the level needed for this rule, create more level slots.

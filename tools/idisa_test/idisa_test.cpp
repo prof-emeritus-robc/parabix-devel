@@ -40,11 +40,11 @@ static cl::opt<std::string> TestOutputFile("o", cl::desc("Test output file."), c
 static cl::opt<bool> QuietMode("q", cl::desc("Suppress output, set the return code only."), cl::cat(testFlags));
 static cl::opt<int> ShiftMask("ShiftMask", cl::desc("Mask applied to the shift operand (2nd operand) of simd_sllv, srlv, srav, rotl, rotr"), cl::init(0));
 static cl::opt<int> Immediate("i", cl::desc("Immediate value for mvmd_dslli"), cl::init(1));
-static cl::opt<IDISA::IDISA_Builder::ShuffleMode> ShuffleIndex("ShuffleIndex",
-cl::values(clEnumValN(IDISA::IDISA_Builder::ShuffleMode::TruncateIndex, "Truncate", "Truncate out-of-bound shuffle indexes."),
-           clEnumValN(IDISA::IDISA_Builder::ShuffleMode::ZeroOnIndexOver, "ZeroOnOver", "Select zero for shuffle indexes out of bound."),
-           clEnumValN(IDISA::IDISA_Builder::ShuffleMode::ZeroOnHighIndexBit, "ZeroOnHighBit", "Select zero if high index bit set, otherwise truncate.")),
-                                cl::init(IDISA::IDISA_Builder::ShuffleMode::TruncateIndex));
+static cl::opt<IDISA::ShuffleMode> ShuffleIndex("ShuffleIndex",
+cl::values(clEnumValN(IDISA::ShuffleMode::TruncateIndex, "Truncate", "Truncate out-of-bound shuffle indexes."),
+           clEnumValN(IDISA::ShuffleMode::ZeroOnIndexOver, "ZeroOnOver", "Select zero for shuffle indexes out of bound."),
+           clEnumValN(IDISA::ShuffleMode::ZeroOnHighIndexBit, "ZeroOnHighBit", "Select zero if high index bit set, otherwise truncate.")),
+                                cl::init(IDISA::ShuffleMode::TruncateIndex));
 
 class ShiftMaskKernel : public BlockOrientedKernel {
 public:
@@ -86,9 +86,9 @@ private:
 
 std::string OpName(std::string idisa_op) {
     if (idisa_op == "mvmd_shuffle") {
-        if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnIndexOver) {
+        if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnIndexOver) {
             return "mvmd_shuffleH";
-        } else if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnHighIndexBit)
+        } else if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnHighIndexBit)
             return "mvmd_shuffleO";
     }
     return idisa_op;
@@ -244,11 +244,11 @@ void IdisaBinaryOpCheckKernel::generateDoBlockMethod(KernelBuilder & b) {
             Value * idx_field = b.mvmd_extract(mTestFw, operand2Block, i);
             Value * idx = b.CreateURem(idx_field, ConstantInt::get(fwTy, fieldCount));
             Value * elt = b.CreateExtractElement(b.fwCast(mTestFw, operand1Block), b.CreateZExtOrTrunc(idx, b.getInt32Ty()));
-            if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnIndexOver) {
+            if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnIndexOver) {
                 elt = b.CreateSelect(b.CreateICmpUGE(idx_field, fieldLimit),
                                      ConstantInt::getNullValue(fwTy),
                                      elt);
-            } else if (ShuffleIndex == IDISA::IDISA_Builder::ShuffleMode::ZeroOnHighIndexBit) {
+            } else if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnHighIndexBit) {
                 elt = b.CreateSelect(b.CreateICmpSLT(idx_field, ConstantInt::getNullValue(fwTy)),
                                      ConstantInt::getNullValue(fwTy),
                                      elt);

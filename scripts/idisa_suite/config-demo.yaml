@@ -1,0 +1,145 @@
+# Rename this file to config.yaml to use it
+
+default:
+  modes: i64
+  operations:
+  - simd_select_hi                          #   ok
+  - simd_select_lo                          #   ok
+  - simd_fill                               #   ok
+  - simd_any                                #
+  - simd_popcount                           #
+  - simd_cttz                               #
+  - simd_bitreverse                         #
+  - hsimd_partial_sum                       #
+  - esimd_bitspread                         #   ok
+  - bitblock_any                            #   ok
+  - bitblock_popcount                       #   ok
+  - simd_not                                #   ok
+  - bitblock_mask_from                      #   ok
+  - bitblock_mask_to                        #   ok
+  - bitblock_set_bit                        #   ok
+  - simd_slli                               #   ok
+  - simd_srli                               #   ok
+  - simd_srai                               #   ok
+  - mvmd_slli                               #   ok
+  - mvmd_srli                               #   ok
+  - simd_add                                #   ok
+  - simd_sub                                #   ok
+  - simd_mult                               #   ok
+  - simd_eq                                 #   ok
+  - simd_ne                                 #   ok
+  - simd_gt                                 #   ok
+  - simd_ugt                                #   ok
+  - simd_ge                                 #   ok
+  - simd_uge                                #   ok
+  - simd_lt                                 #   ok
+  - simd_le                                 #   ok
+  - simd_ult                                #   ok
+  - simd_ule                                #   ok
+  - simd_max                                #   ok
+  - simd_min                                #   ok
+  - simd_umax                               #   ok
+  - simd_umin                               #   ok
+  - simd_sllv                               #   ok
+  - simd_srlv                               #   ok
+  - simd_rotl                               #   ok
+  - simd_rotr                               #   ok
+  - simd_pext                               #   ok
+  - simd_pdep                               #   ok
+  - esimd_mergeh                            #   ok
+  - esimd_mergel                            #   ok
+  - hsimd_packh                             #   ok
+  - hsimd_packl                             #   ok
+  - hsimd_packus                            #   ok
+  - hsimd_packss                            #   was never ok?
+  - mvmd_sll                                #   ok
+  - mvmd_srl                                #   ok
+  - mvmd_shuffle                            #   1, 2, 4 (intentional)
+  - mvmd_shuffle:over                       #   1, 2, 4 (intentional)
+  - mvmd_shuffle:highbit                    #   1, 2, 4 (intentional)
+  - mvmd_compress                           #   1, 2, 4 (intentional)
+  - mvmd_expand                             #   1, 2, 4 (intentional)
+  - simd_and                                #   ok
+  - simd_or                                 #   ok
+  - simd_xor                                #   ok
+  - simd_binary                             #   ok
+  - mvmd_extract                            #   ok
+  - mvmd_insert                             #   ok
+  - mvmd_dslli                              #   ok
+  - simd_if                                 #   ok
+  - simd_ternary                            #   ok
+  # - bitblock_advance.shiftout               #
+  # - bitblock_advance.shifted                #
+  # - bitblock_add_with_carry.sum             #
+  # - bitblock_add_with_carry.carry           #
+  # - bitblock_subtract_with_borrow.diff      #
+  # - bitblock_subtract_with_borrow.borrow    #
+  # - bitblock_indexed_advance.shiftout       #
+  # - bitblock_indexed_advance.shifted        #
+  # field-widths: 8
+  field-widths: 1,2,4,8,16,32,64
+  immediates: 5
+
+test:
+  ir-path: QA/IDISA_test/TestOutput/%mode%_%bw%/%op%/%op%-f%fw%%imm-i%%imm%.ll
+  unopt-ir-path: QA/IDISA_test/TestOutput/%mode%_%bw%/%op%/%op%-f%fw%%imm-i%%imm%-unopt.ll
+  asm-path: QA/IDISA_test/TestOutput/%mode%_%bw%/%op%/%op%-f%fw%%imm-i%%imm%.asm
+  output-path:
+  log-path: QA/IDISA_test/TestOutput/%mode%_%bw%/%op%/%op%-f%fw%%imm-i%%imm%.log
+  vectors:
+  - QA/IDISA_test/TestFiles/randvec1.bin
+  - QA/IDISA_test/TestFiles/randvec1.bin
+  - QA/IDISA_test/TestFiles/randvec3.bin
+
+timing:
+  warmup: 2
+  repeat: 1000
+  drop-worst: 250
+  drop-best: 250
+  log-path:
+  vectors:
+  - QA/IDISA_test/TestFiles/randvec1.bin
+  - QA/IDISA_test/TestFiles/randvec1.bin
+  - QA/IDISA_test/TestFiles/randvec3.bin
+
+modes:
+- name: sse2
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 128
+  extra-args: [--BlockSize=128, "--cpu-features=-avx,-avx2,-avx512f,-ssse3"]
+
+- name: ssse3
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 128
+  extra-args: [--BlockSize=128, "--cpu-features=-avx,-avx2,-avx512f"]
+
+- name: avx2
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 256
+  extra-args: [--BlockSize=256, "--cpu-features=-avx512f"]
+
+- name: i64
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 64
+  extra-args: [--BlockSize=64]
+
+- name: arm-i64
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 64
+  extra-args: [--BlockSize=64]
+
+- name: neon
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 128
+  extra-args: [--BlockSize=128, --cpu-features=-sve]
+
+- name: sve-128
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 128
+  extra-args: [--BlockSize=128, --aarch64-sve-vector-bits-min=128]
+
+- name: sve-512
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 512
+  extra-args: [--BlockSize=512, --aarch64-sve-vector-bits-min=512]
+

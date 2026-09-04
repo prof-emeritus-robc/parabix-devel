@@ -6,14 +6,21 @@
 #include <toolchain/toolchain.h>
 #include <ucd/core/UCD_Config.h>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/FileSystem.h>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
 #else
 #include <llvm/Support/Host.h>
 #endif
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/ADT/StringRef.h>
+#include <boost/algorithm/string.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <thread>
+
+#if defined(PARABIX_ARM_TARGET)
+#include <arm_sve.h>
+#endif
 
 using namespace llvm;
 
@@ -31,6 +38,95 @@ namespace codegen {
 
 inline unsigned getPageSize() {
     return boost::interprocess::mapped_region::get_page_size();
+}
+
+llvm::StringMap<bool> GetFeatureNames() {
+    StringMap<bool> features;
+#if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(19, 0, 0)
+    if (!sys::getHostCPUFeatures(features)) {
+        llvm::report_fatal_error(
+            "codegen::GetFeatureNames() failed to get host CPU features");
+    }
+#else
+    features = sys::getHostCPUFeatures();
+#endif
+
+    // Parse a list of feature options basically like "mattrs", comma-separated +X or -X strings, adding them to the map
+    // with true/false depending on whether they are +/-. That is, "+sse,-bmi" would map to "sse"=true, "bmi"=false.
+    if (!CPUFeatureOptions.empty()) {
+        llvm::StringRef ref(CPUFeatureOptions);
+        while (!ref.empty()) {
+            llvm::StringRef raw;
+            std::tie(raw, ref) = ref.split(',');
+            llvm::StringRef feature = raw.trim().lower();
+            if (feature.size() > 1) {
+                char op = feature[0];
+                if (op == '+' || op == '-') {
+                    features[feature.drop_front(1)] = (op == '+');
+                }
+            }
+        }
+    }
+
+    return features;
+}
+
+FeatureSet MapFeatureNames(llvm::StringMap<bool> const &namedFeatures) {
+    FeatureSet featureSet;
+
+    StringMap<Feature> namesToFeatures = {
+#ifdef PARABIX_X86_TARGET
+        {"ssse3", Feature::SSSE3},
+        {"avx", Feature::AVX},
+        {"avx2", Feature::AVX2},
+        // if (HasAVX || HasAVX2)...
+        {"bmi", Feature::AVX_BMI},
+        {"bmi2", Feature::AVX_BMI2},
+        // if (HasAVX512F)...
+        {"avx512f", Feature::AVX512F},
+        {"avx512cd", Feature::AVX512_CD},
+        {"avx512bw", Feature::AVX512_BW},
+        {"avx512dq", Feature::AVX512_DQ},
+        {"avx512vl", Feature::AVX512_VL},
+        // AVX512_VBMI, AVX512_VBMI2 and AVX512_VPOPCNTDQ  have not been tested as we
+        //did not have hardware support. It should work in theory (tm)
+        {"avx512vbmi", Feature::AVX512_VBMI},
+        {"avx512vbmi2", Feature::AVX512_VBMI2},
+        {"avx512vpopcntdq", Feature::AVX512_VPOPCNTDQ},
+#elif defined(PARABIX_ARM_TARGET)
+        {"sve", Feature::SVE},
+        {"sve2", Feature::SVE2},
+#endif
+    };
+
+    // Translate feature list to bit flags
+    for (auto const &f : namedFeatures) {
+        auto found = namesToFeatures.find(f.first());
+        if (f.second && found != namesToFeatures.end()) {
+            featureSet.set((size_t)found->second);
+        }
+    }
+
+    return featureSet;
+}
+
+unsigned DefaultBlockSizeForFeatures(const FeatureSet &featureSet) {
+#if defined(PARABIX_X86_TARGET)
+    if (featureSet.test((size_t)Feature::AVX512F)) {
+        return 512;
+    } else if (featureSet.test((size_t)Feature::AVX2)) {
+        return 256;
+    } else {
+        return 128;
+    }
+#elif defined(PARABIX_ARM_TARGET)
+    if (featureSet.test((size_t)Feature::SVE)) {
+        return HostSVEBitWidth();
+    }
+    return 128;
+#else
+    return 64;
+#endif
 }
 
 cl::OptionCategory JIT_InfoOptions("J.  JIT Information Options", 
@@ -111,17 +207,26 @@ static cl::opt<std::string, true> ToShowIRFilerOption("ToShow", cl::location(Sho
 std::string ThreadLocalPermittedOptions = "";
 static cl::opt<std::string, true> optThreadLocalPermittedOption("permitted-thread-local-streamsets", cl::location(ThreadLocalPermittedOptions), cl::ValueOptional,
   cl::desc("Comma delimited list of which streamsets to permit to be thread local (default=all)"),
-  cl::value_desc("regex"), cl::cat(CodeGenOptions));
+  cl::value_desc("streamsets"), cl::cat(CodeGenOptions));
 
 std::string PreserveAllStreamSetDataOptions = "";
 static cl::opt<std::string, true> optPreserveAllStreamSetDataOption("preserve-all-streamset-data", cl::location(PreserveAllStreamSetDataOptions), cl::ValueOptional,
   cl::desc("Comma delimited list of which streamsets to permit to be thread local (default=all)"),
-  cl::value_desc("regex"), cl::cat(CodeGenOptions));
+  cl::value_desc("streamsets"), cl::cat(CodeGenOptions));
 
 std::string DoubleStreamSetSizeOptions = "";
 static cl::opt<std::string, true> optDoubleStreamSetSizeOptions("double-streamset-size", cl::location(DoubleStreamSetSizeOptions), cl::ValueOptional,
   cl::desc("Comma delimited list of which streamsets to permit to be thread local (default=all)"),
-  cl::value_desc("regex"), cl::cat(CodeGenOptions));
+  cl::value_desc("streamsets"), cl::cat(CodeGenOptions));
+
+std::string CPUFeatureOptions = "";
+static cl::opt<std::string, true> optCPUFeatureOptions("cpu-features", cl::location(CPUFeatureOptions), cl::ValueOptional,
+  cl::desc("Comma delimited list of CPU features to enable or disable"),
+  cl::value_desc("attrs"), cl::cat(CodeGenOptions));
+
+bool UseI64Builder = false;
+static cl::opt<bool, true> optUseI64Builder("i64-builder", cl::location(UseI64Builder),
+  cl::desc("Force fallback (scalar) path even at larger bit block size"), cl::cat(CodeGenOptions));
 
 #ifdef ENABLE_PAPI
 std::string PapiCounterOptions = OmittedOption;
@@ -315,7 +420,7 @@ bool LLVM_READONLY AnyAssertionOptionIsSet() {
 
 const char * ProgramName;
 
-inline bool disableObjectCacheDueToCommandLineOptions() {
+static inline bool disableObjectCacheDueToCommandLineOptions() {
     if (!TraceOption.empty()) return true;
     if (JIT_InfoFlags.isSet(PrintKernelSizes)) return true;
     if (JIT_InfoFlags.isSet(PrintPipelineGraph)) return true;
@@ -327,7 +432,7 @@ inline bool disableObjectCacheDueToCommandLineOptions() {
     return false;
 }
 
-inline bool disablePipelineObjectCacheDueToCommandLineOptions() {
+static inline bool disablePipelineObjectCacheDueToCommandLineOptions() {
     if (JIT_InfoFlags.isSet(PrintPipelineGraph)) return true;
     if (KernelFlags.isSet(EnablePipelineAsserts)) return true;
     if (KernelFlags.isSet(DisableThreadLocalStreamSets)) return true;
@@ -355,10 +460,21 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
 
     codegen::ProgramName = argv[0];
     if (hiding.size() != 0) {
-        //cl::HideUnrelatedOptions(ArrayRef<const cl::OptionCategory *>(hiding));
         gentlyHideUnrelatedOptions(ArrayRef<const cl::OptionCategory *>(hiding));
     }
     cl::ParseCommandLineOptions(argc, argv, overview);
+    if(BlockSize == 0) {
+        BlockSize = DefaultBlockSizeForFeatures(MapFeatureNames(GetFeatureNames()));
+    }
+    if ((ShowUnoptimizedIROption != OmittedOption) && !ShowUnoptimizedIROption.empty()) {
+        llvm::sys::fs::remove(ShowUnoptimizedIROption);
+    }
+    if ((ShowIROption != OmittedOption) && !ShowIROption.empty()) {
+        llvm::sys::fs::remove(ShowIROption);
+    }
+    if ((ShowASMOption != OmittedOption) && !ShowASMOption.empty()) {
+        llvm::sys::fs::remove(ShowASMOption);
+    }
 //    if (LLVM_UNLIKELY(!PabloIllustrateBitstreamRegEx.empty() || IllustratorDisplay != 0)) {
 //        EnableIllustrator = true;
 //    }

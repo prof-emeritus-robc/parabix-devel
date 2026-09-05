@@ -88,7 +88,7 @@ test:
   log-path: QA/IDISA_test/TestOutput/%mode%_%bw%/%op%/%op%-f%fw%%imm-i%%imm%.log
   vectors:
   - QA/IDISA_test/TestFiles/randvec1.bin
-  - QA/IDISA_test/TestFiles/randvec1.bin
+  - QA/IDISA_test/TestFiles/randvec2.bin
   - QA/IDISA_test/TestFiles/randvec3.bin
 
 timing:
@@ -99,7 +99,7 @@ timing:
   log-path:
   vectors:
   - QA/IDISA_test/TestFiles/randvec1.bin
-  - QA/IDISA_test/TestFiles/randvec1.bin
+  - QA/IDISA_test/TestFiles/randvec2.bin
   - QA/IDISA_test/TestFiles/randvec3.bin
 
 modes:

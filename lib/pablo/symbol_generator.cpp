@@ -14,7 +14,7 @@ namespace pablo {
 String * SymbolGenerator::makeString(llvm::LLVMContext &ctx, const llvm::StringRef prefix) noexcept {
     auto f = mPrefixMap.find(prefix);
     if (f == mPrefixMap.end()) {
-        char * const data = mAllocator.allocate<char>(prefix.size() + 1);
+        char * const data = ThreadSafeSlabAllocator::allocate_array_of<char>(prefix.size() + 1);
         std::memcpy(data, prefix.data(), prefix.size());
         data[prefix.size()] = '\0';
         llvm::StringRef name(data, prefix.size());
@@ -24,7 +24,7 @@ String * SymbolGenerator::makeString(llvm::LLVMContext &ctx, const llvm::StringR
         #else
         llvm::PointerType * const ptrTy = llvm::IntegerType::getInt8PtrTy(ctx);
         #endif
-        return new (mAllocator) String(ptrTy, name, mAllocator);
+        return new String(ptrTy, name);
     } else { // this string already exists; make a new string using the given prefix
 
         // TODO: check FormatInt from "https://github.com/fmtlib/fmt/blob/master/fmt/format.h" for faster integer conversion
@@ -54,7 +54,7 @@ Integer * SymbolGenerator::getInteger(llvm::LLVMContext & ctx, const IntTy value
     auto f = mIntegerMap.find(key);
     Integer * result;
     if (f == mIntegerMap.end()) {
-        result = new (mAllocator) Integer(value, llvm::IntegerType::getIntNTy(ctx, intWidth), mAllocator);
+        result = new Integer(value, llvm::IntegerType::getIntNTy(ctx, intWidth));
         assert (result->value() == value);
         mIntegerMap.emplace(key, result);
     } else {

@@ -8,7 +8,6 @@
 #include <kernel/core/kernel.h>
 #include <pablo/pabloAST.h>
 #include <pablo/symbol_generator.h>
-#include <util/slab_allocator.h>
 #include <llvm/ADT/StringRef.h>
 
 namespace llvm { class Type; }
@@ -35,8 +34,6 @@ class PabloKernel : public kernel::BlockOrientedKernel, public PabloAST {
 public:
 
     using KernelBuilder = kernel::KernelBuilder;
-
-    using Allocator = SlabAllocator<PabloAST *>;
 
     template <typename T, unsigned n>
     using Vec = llvm::SmallVector<T, n>;
@@ -199,7 +196,6 @@ private:
 
 private:
 
-    Allocator                        mAllocator;
     mutable PabloCompiler *          mPabloCompiler = nullptr;
     std::unique_ptr<SymbolGenerator> mSymbolTable;
     PabloBlock *                     mEntryScope = nullptr;

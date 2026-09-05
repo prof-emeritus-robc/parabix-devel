@@ -68,5 +68,6 @@ SRC
 DEPS
     objcache
     toolchain
+    slaballocator
     kernel.illustrator
 )

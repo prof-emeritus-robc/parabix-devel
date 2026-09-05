@@ -4,7 +4,7 @@
 #include <vector>
 #include <boost/iterator/iterator_facade.hpp>
 #include <ucd/core/UCD_Config.h>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 
 //
 // unicode_set.h - representing and manipulating sets of Unicode
@@ -166,10 +166,6 @@ public:
 
     UnicodeSet(std::initializer_list<run_t> r, std::initializer_list<bitquad_t> q) noexcept;
 
-    inline static void Reset() {
-        GlobalAllocator.Reset();
-    }
-
 protected:
 
     class quad_iterator : public boost::iterator_facade<quad_iterator, quad_iterator_return_t, boost::random_access_traversal_tag, quad_iterator_return_t> {
@@ -248,8 +244,6 @@ private:
 
     uint32_t                mRunCapacity;
     uint32_t                mQuadCapacity;
-
-    static SlabAllocator<>  GlobalAllocator;
 };
 
 }

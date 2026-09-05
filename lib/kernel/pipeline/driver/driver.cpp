@@ -62,32 +62,27 @@
 using namespace kernel;
 using namespace llvm;
 
-using RelationshipAllocator = Relationship::Allocator;
-
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief CreateStreamSet
  ** ------------------------------------------------------------------------------------------------------------- */
 StreamSet * BaseDriver::CreateStreamSet(const unsigned NumElements, const unsigned FieldWidth) noexcept {
-    RelationshipAllocator A(mAllocator);
-    return new (A) StreamSet(mBuilder->getContext(), NumElements, FieldWidth);
+    return new StreamSet(mBuilder->getContext(), NumElements, FieldWidth);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief CreateRepeatingStreamSet
  ** ------------------------------------------------------------------------------------------------------------- */
 RepeatingStreamSet * BaseDriver::CreateRepeatingStreamSet(const unsigned FieldWidth, std::vector<std::vector<uint64_t>> && stringSet, const bool isDynamic) noexcept {
-    RelationshipAllocator A(mAllocator);
     // TODO: the stringSet will probably cause a memleak
-    return new (A) RepeatingStreamSet(mBuilder->getContext(), FieldWidth, std::move(stringSet), isDynamic, false);
+    return new RepeatingStreamSet(mBuilder->getContext(), FieldWidth, std::move(stringSet), isDynamic, false);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief CreateUnalignedRepeatingStreamSet
  ** ------------------------------------------------------------------------------------------------------------- */
 RepeatingStreamSet * BaseDriver::CreateUnalignedRepeatingStreamSet(const unsigned FieldWidth, std::vector<std::vector<uint64_t>> && stringSet, const bool isDynamic) noexcept {
-    RelationshipAllocator A(mAllocator);
     // TODO: the stringSet will probably cause a memleak
-    return new (A) RepeatingStreamSet(mBuilder->getContext(), FieldWidth, std::move(stringSet), isDynamic, true);
+    return new RepeatingStreamSet(mBuilder->getContext(), FieldWidth, std::move(stringSet), isDynamic, true);
 }
 
 
@@ -95,31 +90,27 @@ RepeatingStreamSet * BaseDriver::CreateUnalignedRepeatingStreamSet(const unsigne
  * @brief CreateTruncatedStreamSet
  ** ------------------------------------------------------------------------------------------------------------- */
 TruncatedStreamSet * BaseDriver::CreateTruncatedStreamSet(const StreamSet * data) noexcept {
-    RelationshipAllocator A(mAllocator);
-    return new (A) TruncatedStreamSet(mBuilder->getContext(), data);
+    return new TruncatedStreamSet(mBuilder->getContext(), data);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief CreateConstant
  ** ------------------------------------------------------------------------------------------------------------- */
 Scalar * BaseDriver::CreateScalar(not_null<Type *> scalarType) noexcept {
-    RelationshipAllocator A(mAllocator);
-    return new (A) Scalar(scalarType);
+    return new Scalar(scalarType);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief CreateConstant
  ** ------------------------------------------------------------------------------------------------------------- */
 Scalar * BaseDriver::CreateConstant(not_null<Constant *> value) noexcept {
-    RelationshipAllocator A(mAllocator);
-    return new (A) ScalarConstant(value);
+    return new ScalarConstant(value);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief CreateCommandLineScalar
  ** ------------------------------------------------------------------------------------------------------------- */
 Scalar * BaseDriver::CreateCommandLineScalar(CommandLineScalarType type) noexcept {
-    RelationshipAllocator A(mAllocator);
     Type * scalarTy = nullptr;
     switch (type) {
 
@@ -137,7 +128,7 @@ Scalar * BaseDriver::CreateCommandLineScalar(CommandLineScalarType type) noexcep
     }
 
 
-    return new (A) CommandLineScalar(type, scalarTy);
+    return new CommandLineScalar(type, scalarTy);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

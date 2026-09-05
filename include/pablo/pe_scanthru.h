@@ -27,8 +27,8 @@ public:
         return getOperand(1);
     }
 protected:
-    ScanThru(PabloAST * from, PabloAST * thru, const String * name, Allocator & allocator)
-    : CarryProducingStatement(ClassTypeId::ScanThru, from->getType(), {from, thru}, name, allocator) {
+    ScanThru(PabloAST * from, PabloAST * thru, const String * name)
+    : CarryProducingStatement(ClassTypeId::ScanThru, from->getType(), {from, thru}, name) {
 
     }
 };
@@ -51,8 +51,8 @@ public:
         return getOperand(1);
     }
 protected:
-    ScanTo(PabloAST * from, PabloAST * to, const String * name, Allocator & allocator)
-    : CarryProducingStatement(ClassTypeId::ScanTo, from->getType(), {from, to}, name, allocator) {
+    ScanTo(PabloAST * from, PabloAST * to, const String * name)
+    : CarryProducingStatement(ClassTypeId::ScanTo, from->getType(), {from, to}, name) {
 
     }
 };
@@ -75,8 +75,8 @@ public:
         return getOperand(1);
     }
 protected:
-    AdvanceThenScanThru(PabloAST * from, PabloAST * thru, const String * name, Allocator & allocator)
-    : CarryProducingStatement(ClassTypeId::AdvanceThenScanThru, from->getType(), {from, thru}, name, allocator) {
+    AdvanceThenScanThru(PabloAST * from, PabloAST * thru, const String * name)
+    : CarryProducingStatement(ClassTypeId::AdvanceThenScanThru, from->getType(), {from, thru}, name) {
 
     }
 };
@@ -99,8 +99,8 @@ public:
         return getOperand(1);
     }
 protected:
-    AdvanceThenScanTo(PabloAST * from, PabloAST * to, const String * name, Allocator & allocator)
-    : CarryProducingStatement(ClassTypeId::AdvanceThenScanTo, from->getType(), {from, to}, name, allocator) {
+    AdvanceThenScanTo(PabloAST * from, PabloAST * to, const String * name)
+    : CarryProducingStatement(ClassTypeId::AdvanceThenScanTo, from->getType(), {from, to}, name) {
 
     }
 };

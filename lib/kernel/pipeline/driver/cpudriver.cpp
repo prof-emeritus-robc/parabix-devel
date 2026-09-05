@@ -37,6 +37,7 @@
 #include <numeric>
 
 #include <boost/interprocess/mapped_region.hpp>
+#include <allocator/threadsafe_slaballocator.h>
 
 inline unsigned getPageSize() {
     return boost::interprocess::mapped_region::get_page_size();
@@ -262,11 +263,11 @@ public:
         for (size_t i = 0; i < ActiveThreads; ++i) {
             CPUDriverContext & ctx = *(Contexts[i]);
             Threads.emplace_back([this, &ctx]() {
-                for (;;) {
+                // NOTE: the ThreadSafeSlabAllocator itself is not passed into any class but is used invisibly
+                // behind the scenes. Do not remove this!
 
-                    if (addFinalObjectCodeToLLJIT()){
-                        continue;
-                    }
+                ThreadSafeSlabAllocator _allocator;
+                for (;;) {
 
                     CPUDriverTask toExecute;
                     size_t taskIndex = 0;
@@ -302,6 +303,7 @@ public:
                         switch (toExecute.TypeId) {
                             case CPUDriverTaskType::ObjectCode:
                                 materializeObject(ctx, toExecute.Target, toExecute.TargetModule);
+                                addFinalObjectCodeToLLJIT();
                                 continue;
                             case CPUDriverTaskType::Declaration:
                                 materializeDecl(ctx, taskIndex, toExecute.Target);
@@ -371,7 +373,7 @@ public:
         for (auto & t : Threads) {
             if (t.joinable()) t.join();
         }
-
+        addFinalObjectCodeToLLJIT();
         for (auto & C : Contexts) {
             auto & S = C->NewSymbolList;
             DriverLinkedSymbols->insert(S.begin(), S.end());
@@ -693,9 +695,6 @@ record_decl:
     }
 
     bool addFinalObjectCodeToLLJIT() {
-        if (AddObjectCodeList.empty()) {
-            return false;
-        }
         size_t e = 0;
         if (!AddObjectCodeInProcess.compare_exchange_weak(e, 1, std::memory_order_release, std::memory_order_relaxed)) {
             return false;
@@ -703,6 +702,9 @@ record_decl:
         MemoryBufferVector objCodeList;
         BEGIN_SCOPED_REGION
         std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+        if (AddObjectCodeList.empty()) {
+            return false;
+        }
         objCodeList.swap(AddObjectCodeList);
         END_SCOPED_REGION
         for (auto & buffer : objCodeList) {
@@ -711,33 +713,6 @@ record_decl:
         AddObjectCodeInProcess.store(0, std::memory_order_release);
         return true;
     }
-
-
-//    inline void linkExternalFunctions(CPUDriverContext & C, Kernel * Target) {
-
-//        Target->linkExternalMethods(*C.Builder);
-
-//        auto & SL = C.NewSymbolList;
-
-//        if (!SL.empty()) {
-//            auto & MainJD = Engine->getMainJITDylib();
-//            auto err = MainJD.define(orc::absoluteSymbols(SL));
-//            if (err) {
-//                handleAllErrors(std::move(err),
-//                    [](const DuplicateDefinition &) {
-//                        /* ignored */
-//                    },
-//                    [Target](const ErrorInfoBase & err) {
-//                        SmallVector<char, 100> tmp;
-//                        raw_svector_ostream msg(tmp);
-//                        msg << Target->getName() << ": cannot link symbol: " << err.message();
-//                        report_fatal_error(msg.str());
-//                    });
-//            }
-//            SL.clear();
-//        }
-
-//    }
 
     void recordDebugPrintResult(Kernel * const kernel, SmallVector<char, 0> && UnoptIR, SmallVector<char, 0> && OptIR, SmallVector<char, 0> && ASM) {
         std::lock_guard<std::mutex> L(DebugPrintMutex);

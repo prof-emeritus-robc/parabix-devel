@@ -19,19 +19,14 @@ namespace pablo {
 
 class SymbolGenerator {
     friend class PabloKernel;
-    using Allocator = PabloAST::Allocator;
 public:
     using IntTy = uint64_t;
     String * makeString(llvm::LLVMContext & ctx,const llvm::StringRef prefix) noexcept;
     Integer * getInteger(llvm::LLVMContext & ctx, const IntTy value, unsigned intWidth = 64) noexcept;
-    ~SymbolGenerator() { }
+    ~SymbolGenerator() = default;
 protected:
-    SymbolGenerator(Allocator & allocator)
-    : mAllocator(allocator) {
-
-    }
+    SymbolGenerator() = default;
 private:
-    Allocator &                                  mAllocator;
     llvm::StringMap<IntTy>                       mPrefixMap;
     llvm::StringMap<String *>                    mStringMap;
     boost::container::flat_map<std::pair<IntTy, unsigned>, Integer *> mIntegerMap;

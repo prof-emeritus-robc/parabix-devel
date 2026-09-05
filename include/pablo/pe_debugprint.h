@@ -24,8 +24,8 @@ public:
         return getOperand(0);
     }
 protected:
-    DebugPrint(PabloAST * expr, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::DebugPrint, expr->getType(), {expr}, name, allocator) {
+    DebugPrint(PabloAST * expr, const String * name)
+    : Statement(ClassTypeId::DebugPrint, expr->getType(), {expr}, name) {
         setSideEffecting(true);
     }
 };

@@ -2,7 +2,7 @@
 
 #include <pablo/pabloAST.h>
 #include <pablo/pablo_intrinsic.h>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 #include <llvm/ADT/ArrayRef.h>
 #include <type_traits>
 #include <boost/functional/hash.hpp>
@@ -21,26 +21,26 @@ inline bool operator < (const llvm::ArrayRef<T> & A, const llvm::ArrayRef<T> & B
 namespace {
 
 template <typename T>
-inline void __byval(llvm::ArrayRef<T> & t, ProxyAllocator<uint8_t> & alloc) noexcept {
-    ProxyAllocator<T> A{alloc};
+inline void __byval(llvm::ArrayRef<T> & t) noexcept {
+    StdSlabAllocatorProxy<T> A;
     t = t.copy(A);
 }
 
 template <typename T>
-inline void __byval(T &, ProxyAllocator<uint8_t> &) noexcept { }
+inline void __byval(T &) noexcept { }
 
 template<unsigned I, typename Tuple>
 struct __make_byval_impl {
-    static void doit(Tuple & t, ProxyAllocator<uint8_t> & alloc) noexcept {
-        __make_byval_impl<I - 1, Tuple>::doit(t, alloc);
-        __byval(std::get<I>(t), alloc);
+    static void doit(Tuple & t) noexcept {
+        __make_byval_impl<I - 1, Tuple>::doit(t);
+        __byval(std::get<I>(t));
     }
 };
 
 template<typename Tuple>
 struct __make_byval_impl<0, Tuple> {
-    static void doit(Tuple & t, ProxyAllocator<uint8_t> & alloc) noexcept {
-        __byval(std::get<0>(t), alloc);
+    static void doit(Tuple & t) noexcept {
+        __byval(std::get<0>(t));
     }
 };
 
@@ -88,19 +88,18 @@ class ExpressionTable {
         using Type = FixedArgMap<Args...>;
         using TypeId = PabloAST::ClassTypeId;
         using Key = std::tuple<TypeId, Args...>;
-        using Allocator = SlabAllocator<uint8_t>;
-        using MapAllocator = ProxyAllocator<typename std::pair<const Key, PabloAST *>>;
+        using MapAllocator = StdSlabAllocatorProxy<typename std::pair<const Key, PabloAST *>>;
         using Map = std::map<Key, PabloAST *, std::less<Key>, MapAllocator>;
 
-        explicit FixedArgMap(Allocator & allocator, const Type * predecessor = nullptr) noexcept
+        explicit FixedArgMap(const Type * predecessor = nullptr) noexcept
         : mPredecessor(predecessor)
-        , mMap(MapAllocator{allocator}) {
+        , mMap() {
 
         }
 
-        explicit FixedArgMap(Type && other, Allocator & allocator) noexcept
+        explicit FixedArgMap(Type && other) noexcept
         : mPredecessor(other.mPredecessor)
-        , mMap(MapAllocator{allocator}) {
+        , mMap() {
             // This is called due to RVO when returning a new nested builder.
             // If the map is not empty, it's an error.
             assert (other.mMap.empty());
@@ -137,8 +136,7 @@ class ExpressionTable {
     private:
 
         void insert(Key && key, PabloAST * const object) noexcept {
-            ProxyAllocator<uint8_t> alloc{mMap.get_allocator()};
-            __make_byval_impl<std::tuple_size<Key>::value - 1, Key>::doit(key, alloc);
+            __make_byval_impl<std::tuple_size<Key>::value - 1, Key>::doit(key);
             mMap.insert(std::make_pair(std::move(key), object));
         }
 
@@ -174,7 +172,6 @@ class ExpressionTable {
         Map                mMap;
     };
 
-    using Allocator = SlabAllocator<uint8_t>;
     using UnaryT = FixedArgMap<PabloAST *>;
     using BinaryT = FixedArgMap<PabloAST *, PabloAST *>;
     using TernaryT = FixedArgMap<PabloAST *, PabloAST *, PabloAST *>;
@@ -184,7 +181,7 @@ class ExpressionTable {
 
 public:
 
-    #define INIT(Type) m##Type(get_allocator(), predecessor ? &(predecessor->m##Type) : nullptr)
+    #define INIT(Type) m##Type(predecessor ? &(predecessor->m##Type) : nullptr)
     explicit ExpressionTable(ExpressionTable * predecessor = nullptr) noexcept
     : INIT(Unary)
     , INIT(Binary)
@@ -197,7 +194,7 @@ public:
 
     ExpressionTable(ExpressionTable & other) = delete;
 
-    #define MOVE(Type) m##Type(std::move(other.m##Type), get_allocator())
+    #define MOVE(Type) m##Type(std::move(other.m##Type))
     ExpressionTable(ExpressionTable && other)
     : MOVE(Unary)
     , MOVE(Binary)
@@ -294,12 +291,7 @@ public:
          mTernary.clear();
          mQuaternary.clear();
          mIntrinsic.clear();
-         mAllocator.Reset();
      }
-
-    Allocator & get_allocator() {
-        return mAllocator;
-    }
 
 private:
 
@@ -308,7 +300,6 @@ private:
     TernaryT        mTernary;
     QuaternaryT     mQuaternary;
     IntrinsicT      mIntrinsic;
-    Allocator       mAllocator;
 };
 
 }

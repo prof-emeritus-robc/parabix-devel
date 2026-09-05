@@ -106,8 +106,8 @@ PabloBlock * Branch::setBody(PabloBlock * const body) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructor
  ** ------------------------------------------------------------------------------------------------------------- */
-Branch::Branch(const ClassTypeId typeId, PabloAST * condition, PabloBlock * body, Allocator &allocator)
-: Statement(typeId, nullptr, {condition}, nullptr, allocator)
+Branch::Branch(const ClassTypeId typeId, PabloAST * condition, PabloBlock * body)
+: Statement(typeId, nullptr, {condition}, nullptr)
 , mBody(body)
 , mRegular(true)
 {

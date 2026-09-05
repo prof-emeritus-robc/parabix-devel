@@ -64,7 +64,9 @@ std::unique_ptr<KernelCompiler> PabloKernel::instantiateKernelCompiler(KernelBui
 Var * PabloKernel::getInputStreamVar(const std::string & name) {
     const auto port = mPabloCompiler->getStreamPort(name);
     assert (port.Type == PortType::Input);
-    return mInputs[port.Number];
+    Var * const input = mInputs[port.Number];
+    assert (&input->getType()->getContext() == mContext);
+    return input;
 }
 
 std::vector<PabloAST *> PabloKernel::getInputStreamSet(const std::string & name) {
@@ -74,7 +76,9 @@ std::vector<PabloAST *> PabloKernel::getInputStreamSet(const std::string & name)
     const auto numOfStreams = IDISA::getNumOfStreams(input.getType());
     std::vector<PabloAST *> inputSet(numOfStreams);
     for (unsigned i = 0; i < numOfStreams; i++) {
-        inputSet[i] = mEntryScope->createExtract(mInputs[port.Number], mEntryScope->getInteger(i));
+        Var * const input = mInputs[port.Number];
+        assert (&input->getType()->getContext() == mContext);
+        inputSet[i] = mEntryScope->createExtract(input, mEntryScope->getInteger(i));
     }
     return inputSet;
 }
@@ -86,6 +90,7 @@ template <class T> void PabloKernel::writeOutputStreamSet(const std::string & na
     const auto port = mPabloCompiler->getStreamPort(name);
     assert (port.Type == PortType::Output);
     Var * outputVar = mOutputs[port.Number];
+    assert (&outputVar->getType()->getContext() == mContext);
     for (unsigned i = 0; i < s.size(); i++) {
         mEntryScope->createAssign(mEntryScope->createExtract(outputVar, mEntryScope->getInteger(i)), s[i]);
     }
@@ -94,12 +99,15 @@ template <class T> void PabloKernel::writeOutputStreamSet(const std::string & na
 Var * PabloKernel::getOutputStreamVar(const std::string & name) {
     const auto port = mPabloCompiler->getStreamPort(name);
     assert (port.Type == PortType::Output);
-    return mOutputs[port.Number];
+    Var * const output = mOutputs[port.Number];
+    assert (&output->getType()->getContext() == mContext);
+    return output;
 }
 
 Var * PabloKernel::getOutputScalarVar(const std::string & name) {
     for (Var * out : mScalarOutputVars) {
         if (out->getName().compare(name) == 0) {
+            assert (&out->getType()->getContext() == mContext);
             return out;
         }
     }
@@ -107,28 +115,34 @@ Var * PabloKernel::getOutputScalarVar(const std::string & name) {
 }
 
 Var * PabloKernel::makeVariable(const String * const name, Type * const type) {
+    assert (type && &type->getContext() == mContext);
     for (Var * const var : mVariables) {
         if (var->getClassTypeId() == ClassTypeId::Var) {
             if (LLVM_UNLIKELY(&var->getName() == name)) {
+                assert (&var->getType()->getContext() == mContext);
                 return var;
             }
         }
     }
-    Var * const var = new (mAllocator) Var(type, name, mAllocator);
+    Var * const var = new Var(type, name);
     mVariables.push_back(var);
     return var;
 }
 
 Extract * PabloKernel::makeExtract(Var * const array, PabloAST * const index) {
+    assert (array && &array->getType()->getContext() == mContext);
+    assert (array && &array->getType()->getContext() == mContext);
     for (Var * const var : mVariables) {
         if (var->getClassTypeId() == ClassTypeId::Extract) {
             Extract * const ext = cast<Extract>(var);
+            assert (&ext->getType()->getContext() == mContext);
             if (ext->getArray() == array && ext->getIndex() == index) {
                 return ext;
             }
         }
     }
     Type * type = array->getType(); assert (type);
+    assert (&type->getContext() == mContext);
     if (LLVM_LIKELY(isa<ArrayType>(type))) {
         type = cast<ArrayType>(type)->getArrayElementType();
     } else {
@@ -141,7 +155,7 @@ Extract * PabloKernel::makeExtract(Var * const array, PabloAST * const index) {
         out << " is not an array type";
         throw std::runtime_error(out.str());
     }
-    Extract * const ext = new (mAllocator) Extract(type, array, index, mAllocator);
+    Extract * const ext = new Extract(type, array, index);
     for (auto const & user : array->users()) {
         if (isa<PabloKernel>(user)) {
             ext->addUser(this);
@@ -156,12 +170,13 @@ Zeroes * PabloKernel::getNullValue(Type * type) {
     if (LLVM_LIKELY(type == nullptr)) {
         type = getStreamTy();
     }
+    assert (&type->getContext() == mContext);
     for (PabloAST * constant : mConstants) {
         if (isa<Zeroes>(constant) && constant->getType() == type) {
             return cast<Zeroes>(constant);
         }
     }
-    Zeroes * value = new (mAllocator) Zeroes(type, mAllocator);
+    Zeroes * value = new Zeroes(type);
     mConstants.push_back(value);
     return value;
 }
@@ -170,12 +185,13 @@ Ones * PabloKernel::getAllOnesValue(Type * type) {
     if (LLVM_LIKELY(type == nullptr)) {
         type = getStreamTy();
     }
+    assert (&type->getContext() == mContext);
     for (PabloAST * constant : mConstants) {
         if (isa<Ones>(constant) && constant->getType() == type) {
             return cast<Ones>(constant);
         }
     }
-    Ones * value = new (mAllocator) Ones(type, mAllocator);
+    Ones * value = new Ones(type);
     mConstants.push_back(value);
     return value;
 }
@@ -186,27 +202,27 @@ void PabloKernel::addInternalProperties(KernelBuilder & b) {
     mContext = &C;
     mSizeTy = b.getSizeTy();
     mStreamTy = b.getStreamTy();
-    mSymbolTable.reset(new SymbolGenerator(mAllocator));
-    mEntryScope = new (mAllocator) PabloBlock(this, mAllocator);
+    mSymbolTable.reset(new SymbolGenerator());
+    mEntryScope = new PabloBlock(this);
 
 
     for (const Binding & ss : mInputStreamSets) {
         Type * ty = CBuilder::convertTypeToLLVMContext(C, ss.getType());
-        Var * param = new (mAllocator) Var(ty, makeName(ss.getName()), mAllocator, Var::KernelInputStream);
+        Var * param = new Var(ty, makeName(ss.getName()), Var::KernelInputStream);
         param->addUser(this);
         mInputs.push_back(param);
         mVariables.push_back(param);
     }
     for (const Binding & ss : mOutputStreamSets) {
         Type * ty = CBuilder::convertTypeToLLVMContext(C, ss.getType());
-        Var * result = new (mAllocator) Var(ty, makeName(ss.getName()), mAllocator, Var::KernelOutputStream);
+        Var * result = new Var(ty, makeName(ss.getName()), Var::KernelOutputStream);
         result->addUser(this);
         mOutputs.push_back(result);
         mVariables.push_back(result);
     }
     for (const Binding & ss : mOutputScalars) {
         Type * ty = CBuilder::convertTypeToLLVMContext(C, ss.getType());
-        Var * result = new (mAllocator) Var(ty, makeName(ss.getName()), mAllocator, Var::KernelOutputScalar);
+        Var * result = new Var(ty, makeName(ss.getName()), Var::KernelOutputScalar);
         result->addUser(this);
         mOutputs.push_back(result);
         mVariables.push_back(result);
@@ -269,6 +285,7 @@ void PabloKernel::generateFinalBlockMethod(KernelBuilder & b, Value * const rema
     auto & C = b.getContext();
     mContext = &C;
     assert (remainingBytes);
+    assert (&remainingBytes->getType()->getContext() == mContext);
     assert (remainingBytes->getType()->isIntegerTy());
     if (LLVM_UNLIKELY(mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
         b.setScalarField("EOFUnnecessaryData", b.CreateSub(b.getSize(b.getBitBlockWidth()), remainingBytes));
@@ -405,7 +422,7 @@ PabloKernel::PabloKernel(LLVMTypeSystemInterface & ts,
                       std::move(stream_inputs), std::move(stream_outputs),
                       std::move(scalar_parameters), std::move(scalar_outputs), {},
                       PabloIllustrateBitstreamRegEx.empty() && PabloIllustrateKernelRegEx.empty() ? 0 : Kernel::KernelFlags::RequiresIllustratorObject)
-, PabloAST(PabloAST::ClassTypeId::Kernel, nullptr, mAllocator)
+, PabloAST(PabloAST::ClassTypeId::Kernel, nullptr)
 , mPabloCompiler()
 , mSymbolTable()
 , mEntryScope(nullptr)

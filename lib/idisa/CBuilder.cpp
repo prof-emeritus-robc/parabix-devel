@@ -2307,7 +2307,7 @@ void CBuilder::LinkAllNecessaryExternalFunctions() {
 }
 
 std::string CBuilder::getKernelName() const {
-    return "cbuilder";
+    llvm_unreachable("CBuilder does not have an associated kernel binding");
 }
 
 

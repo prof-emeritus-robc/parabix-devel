@@ -272,7 +272,6 @@ void CarryManager::finalizeCodeGen(kernel::KernelBuilder & b) {
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::enterLoopScope(kernel::KernelBuilder & b) {
     assert (mHasLoop);
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     ++mLoopDepth;
     enterScope(b);
     if (LLVM_UNLIKELY(mCarryInfo->nonCarryCollapsingMode())) {
@@ -292,7 +291,6 @@ void CarryManager::enterLoopScope(kernel::KernelBuilder & b) {
  * @brief generateSummaryTest
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::generateEntrySummaryTest(kernel::KernelBuilder & b, Value * condition) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     if (LLVM_UNLIKELY(mCarryInfo->nonCarryCollapsingMode())) {
         if (LLVM_LIKELY(condition->getType() == b.getBitBlockType())) {
             condition = b.bitblock_any(condition);
@@ -324,7 +322,6 @@ Value * CarryManager::generateEntrySummaryTest(kernel::KernelBuilder & b, Value 
  * @brief enterLoopBody
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const entryBlock) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mLoopDepth > 0);
     Type * const carryTy = getSummaryTypeFromCurrentFrame(b);
     if (mLoopDepth == 1) {
@@ -453,7 +450,6 @@ void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const e
  * @brief leaveLoopBody
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::leaveLoopBody(kernel::KernelBuilder & b) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mLoopDepth > 0);
     if (LLVM_UNLIKELY(mCarryInfo->nonCarryCollapsingMode())) {
 
@@ -513,7 +509,6 @@ void CarryManager::leaveLoopBody(kernel::KernelBuilder & b) {
  * @brief generateSummaryTest
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::generateExitSummaryTest(kernel::KernelBuilder & b, Value * condition) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     if (LLVM_LIKELY(condition->getType() == b.getBitBlockType())) {
         condition = b.bitblock_any(condition);
     }
@@ -532,7 +527,6 @@ Value * CarryManager::generateExitSummaryTest(kernel::KernelBuilder & b, Value *
  * @brief leaveLoopScope
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::leaveLoopScope(kernel::KernelBuilder & b, BasicBlock * const entryBlock, BasicBlock * const exitBlock) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     PHINode * nonZeroCarryOutPhi = nullptr;
     if (LLVM_UNLIKELY(mCarryInfo->nonCarryCollapsingMode())) {
         nonZeroCarryOutPhi = b.CreatePHI(b.getSizeTy(), 2);
@@ -570,7 +564,6 @@ void CarryManager::leaveLoopScope(kernel::KernelBuilder & b, BasicBlock * const 
  * @brief enterIfScope
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::enterIfScope(kernel::KernelBuilder & b) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     ++mIfDepth;
     enterScope(b);
     // We zero-initialized the nested summary value and later OR in the current summary into the escaping summary
@@ -595,7 +588,6 @@ void CarryManager::enterIfBody(kernel::KernelBuilder & /* b */, BasicBlock * con
  * @brief leaveIfBody
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::leaveIfBody(kernel::KernelBuilder & b, BasicBlock * const exitBlock) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mIfDepth > 0);
     assert (exitBlock);
     writeCurrentCarryOutSummary(b);
@@ -606,7 +598,6 @@ void CarryManager::leaveIfBody(kernel::KernelBuilder & b, BasicBlock * const exi
  * @brief leaveIfScope
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::leaveIfScope(kernel::KernelBuilder & b, BasicBlock * const entryBlock, BasicBlock * const exitBlock) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mIfDepth > 0);
     --mIfDepth;
     phiOuterCarryOutSummary(b, entryBlock, exitBlock);
@@ -620,7 +611,6 @@ void CarryManager::enterScope(kernel::KernelBuilder & b) {
     if (LLVM_UNLIKELY(mCarryFrameType == nullptr)) {
         return;
     }
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     // Store the state of the current frame and update the scope state
     mCarryFrameStack.emplace_back(mCurrentFrame, mCurrentFrameType, mCurrentFrameIndex + 1);
     mCarryScopeIndex.push_back(++mCarryScopes);
@@ -669,7 +659,6 @@ void CarryManager::leaveScope() {
  * @brief combineCarryOutSummary
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::combineCarryOutSummary(kernel::KernelBuilder & b, const unsigned offset) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     if (LLVM_LIKELY(mCarryInfo->hasSummary())) {
         const auto n = mCarrySummaryStack.size(); assert (n > 0);
         // combine the outer summary with the nested summary so that when
@@ -688,7 +677,6 @@ void CarryManager::combineCarryOutSummary(kernel::KernelBuilder & b, const unsig
  * @brief writeCurrentCarryOutSummary
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::writeCurrentCarryOutSummary(kernel::KernelBuilder & b) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     if (LLVM_LIKELY(mCarryInfo->hasExplicitSummary())) {
         const auto n = mCarrySummaryStack.size(); assert (n > 0);
         writeCarryOutSummary(b, mCarrySummaryStack[n - 1]);
@@ -699,7 +687,6 @@ void CarryManager::writeCurrentCarryOutSummary(kernel::KernelBuilder & b) {
  * @brief phiCurrentCarryOutSummary
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void CarryManager::phiCurrentCarryOutSummary(kernel::KernelBuilder & b, BasicBlock * const entryBlock, BasicBlock * const exitBlock) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     if (LLVM_LIKELY(mCarryInfo->hasSummary())) {
         const auto n = mCarrySummaryStack.size(); assert (n > 0);
         Value * const nested = mCarrySummaryStack[n - 1];
@@ -716,7 +703,6 @@ inline void CarryManager::phiCurrentCarryOutSummary(kernel::KernelBuilder & b, B
  * @brief phiOuterCarryOutSummary
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void CarryManager::phiOuterCarryOutSummary(kernel::KernelBuilder & b, BasicBlock * const entryBlock, BasicBlock * const exitBlock) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     if (LLVM_LIKELY(mCarryInfo->hasSummary())) {
         const auto n = mCarrySummaryStack.size(); assert (n > 0);
         if (n > 2) {
@@ -743,7 +729,6 @@ inline void CarryManager::phiOuterCarryOutSummary(kernel::KernelBuilder & b, Bas
  * @brief addCarryInCarryOut
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::addCarryInCarryOut(kernel::KernelBuilder & b, const Statement * const operation, Value * const e1, Value * const e2) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (operation && (isNonAdvanceCarryGeneratingStatement(operation)));
     Value * const carryIn = getNextCarryIn(b);
     Value * carryOut, * result;
@@ -757,7 +742,6 @@ Value * CarryManager::addCarryInCarryOut(kernel::KernelBuilder & b, const Statem
  * @brief subBorrowInBorrowOut
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::subBorrowInBorrowOut(kernel::KernelBuilder & b, const Statement * operation, Value * const e1, Value * const e2) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (operation);
     Value * const borrowIn = getNextCarryIn(b);
     Value * borrowOut, * result;
@@ -771,7 +755,6 @@ Value * CarryManager::subBorrowInBorrowOut(kernel::KernelBuilder & b, const Stat
  * @brief advanceCarryInCarryOut
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::advanceCarryInCarryOut(kernel::KernelBuilder & b, const Advance * const advance, Value * const value) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     const auto shiftAmount = advance->getAmount();
     if (LLVM_LIKELY(shiftAmount < LONG_ADVANCE_BREAKPOINT)) {
         Value * const carryIn = getNextCarryIn(b);
@@ -788,7 +771,6 @@ Value * CarryManager::advanceCarryInCarryOut(kernel::KernelBuilder & b, const Ad
  * @brief indexedAdvanceCarryInCarryOut
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::indexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, const IndexedAdvance * const advance, Value * const strm, Value * const index_strm) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     const auto shiftAmount = advance->getAmount();
     if (LLVM_LIKELY(shiftAmount < LONG_ADVANCE_BREAKPOINT)) {
         return shortIndexedAdvanceCarryInCarryOut(b, shiftAmount, strm, index_strm);
@@ -873,7 +855,6 @@ Value * CarryManager::indexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, c
  * @brief shortIndexedAdvanceCarryInCarryOut
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::shortIndexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, const unsigned shiftAmount, Value * const strm, Value * const index_strm) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     Value * const carryIn = getNextCarryIn(b);
     Value * carryOut, * result;
     std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
@@ -885,7 +866,6 @@ Value * CarryManager::shortIndexedAdvanceCarryInCarryOut(kernel::KernelBuilder &
  * @brief longAdvanceCarryInCarryOut
  ** ------------------------------------------------------------------------------------------------------------- */
 inline Value * CarryManager::longAdvanceCarryInCarryOut(kernel::KernelBuilder & b, Value * const value, const unsigned shiftAmount) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mHasLongAdvance);
     assert (shiftAmount >= LONG_ADVANCE_BREAKPOINT);
     assert (value);
@@ -1017,7 +997,6 @@ inline Value * CarryManager::longAdvanceCarryInCarryOut(kernel::KernelBuilder & 
  * @brief getNextCarryIn
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::getNextCarryIn(kernel::KernelBuilder & b) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mCurrentFrameIndex < mCurrentFrameType->getStructNumElements());
     Constant * const ZERO = b.getInt32(0);
     FixedArray<Value *, 3> indices;
@@ -1037,7 +1016,6 @@ Value * CarryManager::getNextCarryIn(kernel::KernelBuilder & b) {
  * @brief setNextCarryOut
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::setNextCarryOut(kernel::KernelBuilder & b, Value * carryOut) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mCurrentFrameIndex < mCurrentFrameType->getStructNumElements());
 //    assert("carry out type does not match carry location type" && carryOut->getType() == mCarryPackPtr->getType()->getPointerElementType());
     if (mCarryInfo->hasSummary()) {
@@ -1064,7 +1042,6 @@ void CarryManager::setNextCarryOut(kernel::KernelBuilder & b, Value * carryOut) 
  * @brief readCarryInSummary
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::readCarryInSummary(kernel::KernelBuilder & b) const {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mCarryInfo->hasSummary());
     unsigned count = 2;
     if (LLVM_UNLIKELY(mCarryInfo->hasBorrowedSummary())) {
@@ -1094,7 +1071,6 @@ Value * CarryManager::readCarryInSummary(kernel::KernelBuilder & b) const {
  * @brief writeCarryOutSummary
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::writeCarryOutSummary(kernel::KernelBuilder & b, Value * const summary) const {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mCarryInfo->hasExplicitSummary());
     Constant * const ZERO = b.getInt32(0);
     FixedArray<Value *, 3> indices;
@@ -1110,7 +1086,6 @@ void CarryManager::writeCarryOutSummary(kernel::KernelBuilder & b, Value * const
  * @brief addToCarryOutSummary
  ** ------------------------------------------------------------------------------------------------------------- */
 void CarryManager::addToCarryOutSummary(kernel::KernelBuilder & b, Value * const value) {
-    assert (&mCarryFrameType->getContext() == &b.getContext());
     assert (mCarryInfo->hasSummary());
     // No need to add to summary if using an implicit summary
     if (mCarryInfo->hasSummary()) {

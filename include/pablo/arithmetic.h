@@ -34,8 +34,8 @@ public:
     void replaceUsesOfWith(PabloAST * const from, PabloAST * const to, const bool recursive = false) final;
     virtual ~Operator() { }
 protected:
-    Operator(const ClassTypeId typeId, llvm::Type * const type, PabloAST * const expr1, PabloAST * const expr2, Allocator & allocator)
-    : PabloAST(typeId, type, allocator)
+    Operator(const ClassTypeId typeId, llvm::Type * const type, PabloAST * const expr1, PabloAST * const expr2)
+    : PabloAST(typeId, type)
     , mOperand{expr1, expr2} {
         mOperand[0]->addUser(this);
         mOperand[1]->addUser(this);
@@ -52,8 +52,8 @@ public: \
         return e->getClassTypeId() == ClassTypeId::Name; \
     } \
 protected: \
-    Name(llvm::Type * const type, PabloAST * const expr1, PabloAST * const expr2, Allocator & allocator) \
-    : Operator(ClassTypeId::Name, type, expr1, expr2, allocator) { \
+    Name(llvm::Type * const type, PabloAST * const expr1, PabloAST * const expr2) \
+    : Operator(ClassTypeId::Name, type, expr1, expr2) { \
     } \
 };
 

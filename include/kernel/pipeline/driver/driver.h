@@ -6,7 +6,6 @@
 #include <llvm/ADT/StringSet.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/relationship.h>
-#include <util/slab_allocator.h>
 #include <llvm/IR/Constants.h>
 #include <kernel/illustrator/illustrator.h>
 #include <string>
@@ -106,6 +105,5 @@ protected:
     KernelSet                                               mCachedKernel;
     KernelSet                                               mCompiledKernel;
     KernelSet                                               mPreservedKernel;
-    SlabAllocator<>                                         mAllocator;
 };
 

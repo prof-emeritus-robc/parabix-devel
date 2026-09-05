@@ -9,7 +9,7 @@
 #include "relationship.h"
 #include "streamset.h"
 #include <util/not_null.h>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
@@ -52,7 +52,7 @@ constexpr static auto KERNEL_ILLUSTRATOR_ENTER_LOOP = "__illustrator_enter_loop"
 constexpr static auto KERNEL_ILLUSTRATOR_ITERATE_LOOP = "__illustrator_iterate_loop";
 constexpr static auto KERNEL_ILLUSTRATOR_EXIT_LOOP = "__illustrator_exit_loop";
 
-class Kernel : public AttributeSet {
+class Kernel : public SlabAllocatedObject, public AttributeSet {
     friend class KernelCompiler;
     friend class PipelineAnalysis;
     friend class PipelineCompiler;
@@ -62,6 +62,8 @@ class Kernel : public AttributeSet {
     friend class OptimizationBranch;
     friend class BaseDriver;
 public:
+
+    USE_SLAB_ALLOCATED_OBJECT_MEMORY_OPERATORS
 
     using Relationships = std::vector<const Relationship *>;
 

@@ -477,8 +477,6 @@ struct RelationshipGraphBuilder {
 
         kernels.reserve(n - numOfKernels);
 
-        Relationship::Allocator A(mAllocator);
-
         for (auto i = numOfKernels; i < n; ++i) {
 
             size_t strideLength = 0;
@@ -500,12 +498,12 @@ struct RelationshipGraphBuilder {
 
             StreamSet * positive = nullptr;
             if (LLVM_LIKELY(type & CountingType::Positive)) {
-                positive = new (A) StreamSet(b.getContext(), 1, sizeTy->getBitWidth());
+                positive = new StreamSet(b.getContext(), 1, sizeTy->getBitWidth());
             }
 
             StreamSet * negative = nullptr;
             if (LLVM_UNLIKELY(type & CountingType::Negative)) {
-                negative = new (A) StreamSet(b.getContext(), 1, sizeTy->getBitWidth());
+                negative = new StreamSet(b.getContext(), 1, sizeTy->getBitWidth());
             }
             assert (H[i]->isStreamSet());
             StreamSet * const input = static_cast<StreamSet *>(H[i]); assert (input);
@@ -929,8 +927,7 @@ struct RelationshipGraphBuilder {
     , mInternalKernels(P.mInternalKernels)
     , mInternalBindings(P.mInternalBindings)
     , mInternalBuffers(P.mInternalBuffers)
-    , RemappedStreamSets(P.RemappedStreamSets)
-    , mAllocator(P.mAllocator) {
+    , RemappedStreamSets(P.RemappedStreamSets) {
         std::fill_n(CommandLineScalars.begin(), CommandLineScalars.size(), nullptr);
     }
 
@@ -941,7 +938,6 @@ struct RelationshipGraphBuilder {
     OwningVector<Binding> &         mInternalBindings;
     OwningVector<StreamSetBuffer> & mInternalBuffers;
     RedundantStreamSetMap &         RemappedStreamSets;
-    CompilerAllocator &             mAllocator;
     CommandLineScalarVec            CommandLineScalars;
     TruncatedStreamSetVec           TruncatedStreamSets;
     StreamSetVertexMap              RepeatingStreamSets;

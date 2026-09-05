@@ -4,7 +4,7 @@
 #include <memory>
 #include <llvm/Support/Compiler.h>
 #include <util/not_null.h>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 
 namespace llvm { class Constant; }
 namespace llvm { class LLVMContext; }
@@ -22,12 +22,11 @@ class Kernel;
 // considered them independently. Moreover, maintaining this information only adds additional bookkeeping work
 // when the appropriate cached pipeline kernel already exists.
 
-class Relationship {
+class Relationship : public SlabAllocatedObject {
     friend class Kernel;
     friend class PipelineKernel;
 public:
-
-    using Allocator = ProxyAllocator<Relationship>;
+    USE_SLAB_ALLOCATED_OBJECT_MEMORY_OPERATORS
 
     static inline bool classof(const Relationship *) {
         return true;
@@ -65,10 +64,6 @@ public:
         return (mClassTypeId < ClassTypeId::Scalar);
     }
 
-    void* operator new (std::size_t size, Allocator & A) noexcept {
-        return A.allocate<uint8_t>(size);
-    }
-
     bool isConstant() const {
         return mClassTypeId == ClassTypeId::ScalarConstant;
     }
@@ -76,7 +71,8 @@ public:
 protected:
 
     Relationship(const ClassTypeId typeId, llvm::Type * type) noexcept
-    : mClassTypeId(typeId)
+    : SlabAllocatedObject()
+    , mClassTypeId(typeId)
     , mType(type) {
     }
 
@@ -113,6 +109,7 @@ protected:
 
 class RepeatingStreamSet : public StreamSet {
 public:
+
     static bool classof(const Relationship * e) {
         return e->getClassTypeId() == ClassTypeId::RepeatingStreamSet;
     }
@@ -150,6 +147,7 @@ private:
 
 class TruncatedStreamSet : public StreamSet {
 public:
+
     static bool classof(const Relationship * e) {
         return e->getClassTypeId() == ClassTypeId::TruncatedStreamSet;
     }
@@ -177,6 +175,7 @@ using StreamSets = std::vector<StreamSet *>;
 
 class Scalar : public Relationship {
 public:
+
     static bool classof(const Relationship * e) { assert (e);
         return e->getClassTypeId() == ClassTypeId::Scalar;
     }
@@ -230,6 +229,7 @@ private:
 
 class ScalarConstant : public Scalar {
 public:
+
     static bool classof(const Relationship * e) {
         return e->getClassTypeId() == ClassTypeId::ScalarConstant;
     }

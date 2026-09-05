@@ -12,7 +12,6 @@
 #include <re/analysis/re_name_gather.h>
 #include <re/transforms/to_utf8.h>
 #include <kernel/pipeline/program_builder.h>
-#include <util/slab_allocator.h>
 
 namespace IDISA { class IDISA_Builder; }
 namespace cc { class Alphabet; }

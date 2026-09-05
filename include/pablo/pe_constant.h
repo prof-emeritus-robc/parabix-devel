@@ -24,8 +24,8 @@ public:
         return isa<Ones>(other);
     }
 protected:
-    Constant(Type * type, const PabloAST * const value, Allocator & allocator)
-    : PabloAST(ClassTypeId::Ones, type, allocators)
+    Constant(Type * type, const PabloAST * const value)
+    : PabloAST(ClassTypeId::Ones, type)
     , mValue(value) {
     }
 private:

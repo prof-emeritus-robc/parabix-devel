@@ -7,7 +7,7 @@
 
 #include <string>
 #include <vector>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 
 namespace re {
 
@@ -16,10 +16,8 @@ namespace re {
 static inline bool classof(const RE * re) {return re->getClassTypeId() == ClassTypeId::kind;}\
 static inline bool classof(const void *) {return false;}
 
-class RE {
+class RE : public SlabAllocatedObject {
 public:
-    using Allocator = SlabAllocator<RE *>;
-    using VectorAllocator = ProxyAllocator<RE *>;
     enum class ClassTypeId : unsigned {
         Alt
         , Any
@@ -43,28 +41,21 @@ public:
     inline ClassTypeId getClassTypeId() const {
         return mClassTypeId;
     }
-    inline static void Reset() {
-        mAllocator.Reset();
-    }
-    inline static void PrintStats() {
-        mAllocator.PrintStats();
-    }
     typedef std::initializer_list<RE *> InitializerList;
 
 protected:
+
+    USE_SLAB_ALLOCATED_OBJECT_MEMORY_OPERATORS
+
     inline RE(const ClassTypeId id)
     : mClassTypeId(id) {
 
     }
-    void* operator new (std::size_t size) noexcept {
-        return mAllocator.allocate<uint8_t>(size);
-    }
     const ClassTypeId mClassTypeId;
-    static Allocator mAllocator;
     using length_t = std::string::size_type;
     inline const char * replicateString(const char * string, const length_t length) {
         if (string && (length > 0)) {
-            char * allocated = reinterpret_cast<char*>(mAllocator.allocate(length));
+            char * allocated = ThreadSafeSlabAllocator::allocate_array_of<char>(length);
             std::memcpy(allocated, string, length);
             return allocated;
         }

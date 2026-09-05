@@ -47,9 +47,6 @@ template <> inline unsigned popcount<unsigned int>(const unsigned int x) noexcep
 template <> inline unsigned popcount<unsigned long>(const unsigned long x) noexcept { return __builtin_popcountl(x); }
 template <> inline unsigned popcount<unsigned long long>(const unsigned long long x) noexcept { return __builtin_popcountll(x); }
 
-
-SlabAllocator<> UnicodeSet::GlobalAllocator;
-
 constexpr auto QUAD_BITS = (8UL * sizeof(bitquad_t));
 constexpr auto QUAD_LIMIT = (QUAD_BITS - 1UL);
 constexpr auto UNICODE_QUAD_COUNT = (UNICODE_MAX + 1) / QUAD_BITS;
@@ -84,8 +81,8 @@ inline void move_(T * dst, const T * src, const size_t n) {
 }
 
 template<typename T>
-T * copyOf(const T * base, const uint32_t length, SlabAllocator<> & allocator) {
-    T * const ptr = allocator.allocate<T>(length);
+T * copyOf(const T * base, const uint32_t length) {
+    T * const ptr = ThreadSafeSlabAllocator::allocate_array_of<T>(length);
     copy_(ptr, base, length);
     return ptr;
 }
@@ -99,8 +96,7 @@ void assign(UnicodeSet * const self, const RunVector & runs, const QuadVector & 
     const unsigned n = runs.size();
     assert (n > 0 && n < UNICODE_QUAD_COUNT);
     if (self->mRunCapacity < n) {
-        UnicodeSet::GlobalAllocator.deallocate<run_t>(self->mRuns, self->mRunCapacity);
-        self->mRuns = UnicodeSet::GlobalAllocator.allocate<run_t>(n);
+        self->mRuns = ThreadSafeSlabAllocator::allocate_array_of<run_t>(n);
         self->mRunCapacity = n;
     }
     copy_(self->mRuns, runs.data(), n);
@@ -109,8 +105,7 @@ void assign(UnicodeSet * const self, const RunVector & runs, const QuadVector & 
     assert (m < UNICODE_QUAD_COUNT);
     if (m > 0) {
         if (self->mQuadCapacity < m) {
-            UnicodeSet::GlobalAllocator.deallocate<bitquad_t>(self->mQuads, self->mQuadCapacity);
-            self->mQuads = UnicodeSet::GlobalAllocator.allocate<bitquad_t>(m);
+            self->mQuads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(m);
             self->mQuadCapacity = m;
         }
         copy_(self->mQuads, quads.data(), m);
@@ -323,7 +318,7 @@ void UnicodeSet::dump(llvm::raw_ostream & out) const noexcept {
  * @brief complement
  ** ------------------------------------------------------------------------------------------------------------- */
 UnicodeSet UnicodeSet::operator~() const noexcept {
-    run_t * const runs = GlobalAllocator.allocate<run_t>(mRunLength);
+    run_t * const runs = ThreadSafeSlabAllocator::allocate_array_of<run_t>(mRunLength);
     run_t * ri = runs;
     for (unsigned i = 0; i < mRunLength; ++i) {
         const auto & run = mRuns[i];
@@ -337,7 +332,7 @@ UnicodeSet UnicodeSet::operator~() const noexcept {
     }
     bitquad_t * quads = nullptr;
     if (mQuadLength > 0) {
-        quads = GlobalAllocator.allocate<bitquad_t>(mQuadLength);
+        quads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(mQuadLength);
         bitquad_t * qi = quads;
         for (unsigned i = 0; i < mQuadLength; ++i) {
             *qi++ = ~mQuads[i];
@@ -399,9 +394,9 @@ UnicodeSet UnicodeSet::operator&(const UnicodeSet & other) const noexcept {
     }
     assert (i1 == quad_end() && i2 == other.quad_end());
     const auto runsLength = runs.size();
-    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength, GlobalAllocator);
+    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength);
     const auto quadsLength = quads.size();
-    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength, GlobalAllocator) : nullptr;
+    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength) : nullptr;
     return UnicodeSet(runsCopy, runsLength, runsLength, quadsCopy, quadsLength, quadsLength);
 }
 
@@ -447,9 +442,9 @@ UnicodeSet UnicodeSet::operator+(const UnicodeSet & other) const noexcept {
     }
     assert (i1 == quad_end() && i2 == other.quad_end());
     const auto runsLength = runs.size();
-    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength, GlobalAllocator);
+    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength);
     const auto quadsLength = quads.size();
-    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength, GlobalAllocator) : nullptr;
+    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength) : nullptr;
     return UnicodeSet(runsCopy, runsLength, runsLength, quadsCopy, quadsLength, quadsLength);
 }
 
@@ -494,9 +489,9 @@ UnicodeSet UnicodeSet::operator-(const UnicodeSet & other) const noexcept {
     }
     assert (i1 == quad_end() && i2 == other.quad_end());
     const auto runsLength = runs.size();
-    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength, GlobalAllocator);
+    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength);
     const auto quadsLength = quads.size();
-    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength, GlobalAllocator) : nullptr;
+    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength) : nullptr;
     return UnicodeSet(runsCopy, runsLength, runsLength, quadsCopy, quadsLength, quadsLength);
 }
 
@@ -546,9 +541,9 @@ UnicodeSet UnicodeSet::operator^(const UnicodeSet & other) const noexcept {
     }
     assert (i1 == quad_end() && i2 == other.quad_end());
     const auto runsLength = runs.size();
-    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength, GlobalAllocator);
+    const auto runsCopy = copyOf<run_t>(runs.data(), runsLength);
     const auto quadsLength = quads.size();
-    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength, GlobalAllocator) : nullptr;
+    const auto quadsCopy = quadsLength ? copyOf<bitquad_t>(quads.data(), quadsLength) : nullptr;
     return UnicodeSet(runsCopy, runsLength, runsLength, quadsCopy, quadsLength, quadsLength);
 }
 
@@ -631,7 +626,7 @@ void UnicodeSet::insert(const codepoint_t cp) {
     if (LLVM_LIKELY(type == Mixed)) {
         quadIndex += offset;
         if (LLVM_UNLIKELY(mQuadCapacity == 0)) {
-            bitquad_t * const quads = GlobalAllocator.allocate<bitquad_t>(mQuadLength - 1);
+            bitquad_t * const quads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(mQuadLength - 1);
             copy_(quads, mQuads, (quadIndex - 1));
             quads[quadIndex] = mQuads[quadIndex] | value;
             const unsigned quadOffset = (quads[quadIndex] == FULL_QUAD_MASK) ? 1 : 0;
@@ -660,11 +655,10 @@ void UnicodeSet::insert(const codepoint_t cp) {
         // insert a new quad
         const auto l = mQuadLength + 1;
         if (l > mQuadCapacity) {
-            bitquad_t * const quads = GlobalAllocator.allocate<bitquad_t>(l);
+            bitquad_t * const quads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(l);
             copy_(quads, mQuads, quadIndex);
             quads[quadIndex] = value;
             copy_(quads + quadIndex + 1, mQuads + quadIndex, (mQuadLength - quadIndex));
-            GlobalAllocator.deallocate<bitquad_t>(mQuads, mQuadCapacity);
             mQuads = quads;
             mQuadCapacity = l;
         } else { // reuse the same buffer
@@ -685,10 +679,9 @@ void UnicodeSet::insert(const codepoint_t cp) {
         const auto l = mRunLength + m;
         const auto k = runIndex + ((offset != 0) ? 1 : 0);
         if (l > mRunCapacity) {
-            run_t * const newRun = GlobalAllocator.allocate<run_t>(l);
+            run_t * const newRun = ThreadSafeSlabAllocator::allocate_array_of<run_t>(l);
             copy_(newRun, mRuns, k);
             copy_(newRun + k + m, mRuns + k, (mRunLength - k));
-            GlobalAllocator.deallocate<run_t>(mRuns, mRunCapacity);
             mRuns = newRun;
             mRunCapacity = l;
         } else { // reuse the same buffer
@@ -763,7 +756,7 @@ void UnicodeSet::insert(const UnicodeSet & other) noexcept {
 void UnicodeSet::invert() noexcept {
 
     if (LLVM_UNLIKELY(mRunCapacity == 0)) {
-        run_t * const runs = GlobalAllocator.allocate<run_t>(mRunLength);
+        run_t * const runs = ThreadSafeSlabAllocator::allocate_array_of<run_t>(mRunLength);
         for (unsigned i = 0; i < mRunLength; ++i) {
             auto & run = mRuns[i];
             const auto l = lengthOf(run);
@@ -790,7 +783,7 @@ void UnicodeSet::invert() noexcept {
 
     if (mQuadLength) {
         if (mQuadCapacity == 0) {
-            bitquad_t * const quads = GlobalAllocator.allocate<bitquad_t>(mQuadLength);
+            bitquad_t * const quads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(mQuadLength);
             for (unsigned i = 0; i != mQuadLength; ++i) {
                 quads[i] = ~mQuads[i];
             }
@@ -1180,7 +1173,7 @@ found_hi:
  * @brief Empty/Full Set Constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 UnicodeSet::UnicodeSet() noexcept
-: mRuns(GlobalAllocator.allocate<run_t>(1))
+: mRuns(ThreadSafeSlabAllocator::allocate_array_of<run_t>(1))
 , mQuads(nullptr)
 , mRunLength(1)
 , mQuadLength(0)
@@ -1194,8 +1187,8 @@ UnicodeSet::UnicodeSet() noexcept
  * @brief Singleton Set Constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 UnicodeSet::UnicodeSet(const codepoint_t codepoint) noexcept
-: mRuns(GlobalAllocator.allocate<run_t>(3))
-, mQuads(GlobalAllocator.allocate<bitquad_t>(1))
+: mRuns(ThreadSafeSlabAllocator::allocate_array_of<run_t>(3))
+, mQuads(ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(1))
 , mRunLength(0)
 , mQuadLength(1)
 , mRunCapacity(3)
@@ -1223,8 +1216,8 @@ UnicodeSet::UnicodeSet(const codepoint_t codepoint) noexcept
  * @brief Range Set Constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 UnicodeSet::UnicodeSet(const codepoint_t lo, const codepoint_t hi) noexcept
-: mRuns(GlobalAllocator.allocate<run_t>(5))
-, mQuads(GlobalAllocator.allocate<bitquad_t>(2))
+: mRuns(ThreadSafeSlabAllocator::allocate_array_of<run_t>(5))
+, mQuads(ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(2))
 , mRunLength(0)
 , mQuadLength(0)
 , mRunCapacity(5)
@@ -1378,7 +1371,7 @@ UnicodeSet::UnicodeSet(std::initializer_list<interval_t>::iterator begin, std::i
 
     const auto n = runs.size();
     assert (n > 0 && n < UNICODE_QUAD_COUNT);
-    mRuns = GlobalAllocator.allocate<run_t>(n);
+    mRuns = ThreadSafeSlabAllocator::allocate_array_of<run_t>(n);
     mRunCapacity = n;
     mRunLength = n;
     copy_(mRuns, runs.data(), n);
@@ -1386,7 +1379,7 @@ UnicodeSet::UnicodeSet(std::initializer_list<interval_t>::iterator begin, std::i
     const auto m = quads.size();
     assert (m < UNICODE_QUAD_COUNT);
     if (m) {
-        mQuads = GlobalAllocator.allocate<bitquad_t>(m);
+        mQuads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(m);
         mQuadCapacity = m;
         mQuadLength = m;
         copy_(mQuads, quads.data(), m);
@@ -1412,7 +1405,7 @@ UnicodeSet::UnicodeSet(const std::vector<interval_t>::iterator begin, const std:
 
     const auto n = runs.size();
     assert (n > 0 && n < UNICODE_QUAD_COUNT);
-    mRuns = GlobalAllocator.allocate<run_t>(n);
+    mRuns = ThreadSafeSlabAllocator::allocate_array_of<run_t>(n);
     mRunCapacity = n;
     mRunLength = n;
     copy_(mRuns, runs.data(), n);
@@ -1420,7 +1413,7 @@ UnicodeSet::UnicodeSet(const std::vector<interval_t>::iterator begin, const std:
     const auto m = quads.size();
     assert (m < UNICODE_QUAD_COUNT);
     if (m) {
-        mQuads = GlobalAllocator.allocate<bitquad_t>(m);
+        mQuads = ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(m);
         mQuadCapacity = m;
         mQuadLength = m;
         copy_(mQuads, quads.data(), m);
@@ -1446,12 +1439,6 @@ UnicodeSet::UnicodeSet(const UnicodeSet && other) noexcept
  * @brief Move Assignment Constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 UnicodeSet & UnicodeSet::operator=(const UnicodeSet && other) noexcept {
-    if (mRunCapacity) {
-        GlobalAllocator.deallocate<run_t>(mRuns, mRunCapacity);
-    }
-    if (mQuadCapacity) {
-        GlobalAllocator.deallocate<bitquad_t>(mQuads, mQuadCapacity);
-    }
     mRuns = other.mRuns;
     mQuads = other.mQuads;
     mRunLength = other.mRunLength;
@@ -1477,7 +1464,7 @@ UnicodeSet::UnicodeSet(const UnicodeSet & other) noexcept
         mRuns = other.mRuns;
         mRunCapacity = 0;
     } else {
-        mRuns = copyOf<run_t>(other.mRuns, other.mRunLength, GlobalAllocator);
+        mRuns = copyOf<run_t>(other.mRuns, other.mRunLength);
         mRunCapacity = other.mRunLength;
     }
     mRunLength = other.mRunLength;
@@ -1485,7 +1472,7 @@ UnicodeSet::UnicodeSet(const UnicodeSet & other) noexcept
         mQuads = other.mQuads;
         mQuadCapacity = 0;
     } else {
-        mQuads = copyOf<bitquad_t>(other.mQuads, other.mQuadCapacity, GlobalAllocator);
+        mQuads = copyOf<bitquad_t>(other.mQuads, other.mQuadCapacity);
         mQuadCapacity = other.mQuadLength;
     }
     mQuadLength = other.mQuadLength;
@@ -1496,18 +1483,12 @@ UnicodeSet::UnicodeSet(const UnicodeSet & other) noexcept
  * @brief Copy Assignment Constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 UnicodeSet & UnicodeSet::operator=(const UnicodeSet & other) noexcept {
-    if (mRunCapacity) {
-        GlobalAllocator.deallocate<run_t>(mRuns, mRunCapacity);
-    }
-    if (mQuadCapacity) {
-        GlobalAllocator.deallocate<bitquad_t>(mQuads, mQuadCapacity);
-    }
     // lazily ensure reallocation on modification if and only if the source cannot modify it
     if (other.mRunCapacity == 0) {
         mRuns = other.mRuns;
         mRunCapacity = 0;
     } else {
-        mRuns = copyOf<run_t>(other.mRuns, other.mRunLength, GlobalAllocator);
+        mRuns = copyOf<run_t>(other.mRuns, other.mRunLength);
         mRunCapacity = other.mRunLength;
     }
     mRunLength = other.mRunLength;
@@ -1515,7 +1496,7 @@ UnicodeSet & UnicodeSet::operator=(const UnicodeSet & other) noexcept {
         mQuads = other.mQuads;
         mQuadCapacity = 0;
     } else {
-        mQuads = copyOf<bitquad_t>(other.mQuads, other.mQuadCapacity, GlobalAllocator);
+        mQuads = copyOf<bitquad_t>(other.mQuads, other.mQuadCapacity);
         mQuadCapacity = other.mQuadLength;
     }
     mQuadLength = other.mQuadLength;
@@ -1552,8 +1533,8 @@ UnicodeSet::UnicodeSet(const run_t * const runs, const uint32_t runLength,
  * @brief Deprecated Constructor
  ** ------------------------------------------------------------------------------------------------------------- */
 UnicodeSet::UnicodeSet(std::initializer_list<run_t> r, std::initializer_list<bitquad_t> q) noexcept
-: mRuns(GlobalAllocator.allocate<run_t>(r.size()))
-, mQuads(q.size() == 0 ? nullptr : GlobalAllocator.allocate<bitquad_t>(q.size()))
+: mRuns(ThreadSafeSlabAllocator::allocate_array_of<run_t>(r.size()))
+, mQuads(q.size() == 0 ? nullptr : ThreadSafeSlabAllocator::allocate_array_of<bitquad_t>(q.size()))
 , mRunLength(r.size())
 , mQuadLength(q.size())
 , mRunCapacity(r.size())

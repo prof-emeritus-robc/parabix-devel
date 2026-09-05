@@ -24,8 +24,8 @@ public:
         return getOperand(1);
     }
 protected:
-    PackH(Integer * width, PabloAST * const value, const String * name, llvm::Type * type, Allocator & allocator)
-    : Statement(ClassTypeId::PackH, type, { width, value }, name, allocator) {
+    PackH(Integer * width, PabloAST * const value, const String * name, llvm::Type * type)
+    : Statement(ClassTypeId::PackH, type, { width, value }, name) {
 
     }
 };
@@ -48,8 +48,8 @@ public:
         return getOperand(1);
     }
 protected:
-    PackL(Integer * width, PabloAST * const value, const String * name, llvm::Type * type, Allocator & allocator)
-    : Statement(ClassTypeId::PackL, type, { width, value }, name, allocator) {
+    PackL(Integer * width, PabloAST * const value, const String * name, llvm::Type * type)
+    : Statement(ClassTypeId::PackL, type, { width, value }, name) {
 
     }
 };

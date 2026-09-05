@@ -24,8 +24,8 @@ public:
         return getOperand(1);
     }
 protected:
-    Repeat(Integer * const fieldWidth, PabloAST * const value, llvm::Type * type, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Repeat, type, { fieldWidth, value }, name, allocator) {
+    Repeat(Integer * const fieldWidth, PabloAST * const value, llvm::Type * type, const String * name)
+    : Statement(ClassTypeId::Repeat, type, { fieldWidth, value }, name) {
 
     }
 };

@@ -12,8 +12,6 @@
 namespace pablo {
 namespace parse {
 
-Token::Allocator Token::mAllocator;
-
 std::string to_string(TokenType const & type) {
     switch (type) {
         CASE_AS_STRING(IDENTIFIER);
@@ -50,7 +48,7 @@ std::string to_string(TokenType const & type) {
 }
 
 llvm::StringRef copyText(const llvm::StringRef & text, Token::Allocator & alloc) {
-    ProxyAllocator<char> A(alloc);
+    StdSlabAllocatorProxy<char> A;
     return text.copy(A);
 }
 

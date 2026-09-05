@@ -15,7 +15,7 @@ PabloType::Allocator PabloType::mAllocator;
 size_t PabloType::mNextAnonId = 0;
 
 inline llvm::StringRef copyText(llvm::StringRef text, PabloType::Allocator & alloc) {
-    ProxyAllocator<char> A(alloc);
+    StdSlabAllocatorProxy<char> A;
     return text.copy(A);
 }
 
@@ -26,7 +26,7 @@ inline llvm::ArrayRef<llvm::StringRef> copyArray(std::vector<std::string> array,
         tmp[i] = copyText(array[i], alloc);
     }
     llvm::ArrayRef<llvm::StringRef> out(tmp);
-    ProxyAllocator<llvm::StringRef> A(alloc);
+    StdSlabAllocatorProxy<llvm::StringRef> A;
     return out.copy(A);
 }
 

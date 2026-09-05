@@ -77,7 +77,6 @@ void KernelCompiler::generateKernel(KernelBuilder & b, TargetMachine * TM, Globa
     // exits without restoring the original compiler state.
     auto const oc = b.getCompiler();
     b.setCompiler(this);
-//    mTarget->addKernelDeclarations(b, TM, linkageType);
     callGenerateInitializeMethod(b, linkageType);
     if (LLVM_UNLIKELY(mStreamSetInputBuffers.empty())) {
         callGenerateExpectedOutputSizeMethod(b, linkageType);

@@ -8,6 +8,7 @@
 #include <random>
 #include <kernel/core/kernel_compiler.h>
 #include <boost/interprocess/mapped_region.hpp>
+#include <allocator/threadsafe_slaballocator.h>
 
 using boost::intrusive::detail::floor_log2;
 using boost::intrusive::detail::ceil_log2;
@@ -29,35 +30,6 @@ using namespace llvm;
 
 template <typename T, unsigned n = 16>
 using Vec = SmallVector<T, n>;
-
-
-struct CompilerAllocator : public SlabAllocator<> {
-    template<typename Type = uint8_t>
-    inline Type * allocate(const size_type n, const_pointer = nullptr) noexcept {
-        static_assert(sizeof(Type) > 0, "Cannot allocate a zero-length type.");
-        if (LLVM_UNLIKELY(n == 0)) {
-            return nullptr;
-        }
-        assert ("A memory leak will occur whenever the SlabAllocator allocates 0 items" && n > 0);
-        auto ptr = static_cast<Type *>(mAllocator.Allocate(n * sizeof(Type), sizeof(void*)));
-        assert ("allocator returned a null pointer. Function was likely called before Allocator creation!" && ptr);
-        return ptr;
-    }
-
-    template<typename Type = uint8_t>
-    inline Type * aligned_allocate(const size_type n, const size_t align, const_pointer = nullptr) noexcept {
-        static_assert(sizeof(Type) > 0, "Cannot allocate a zero-length type.");
-        if (LLVM_UNLIKELY(n == 0)) {
-            return nullptr;
-        }
-        auto ptr = static_cast<Type *>(mAllocator.Allocate(n * sizeof(Type), align));
-        assert ("allocator returned a null pointer. Function was likely called before Allocator creation!" && ptr);
-        return ptr;
-    }
-
-    CompilerAllocator() = default;
-    CompilerAllocator(CompilerAllocator &&) = default;
-};
 
 using pipeline_random_engine = std::default_random_engine;
 
@@ -162,8 +134,8 @@ private:
 
 template <typename T>
 struct FixedVector {
-    FixedVector(const size_t First, const size_t Last, CompilerAllocator & A)
-    : mArray(A.allocate<T>(Last - First + 1U) - First)
+    FixedVector(const size_t First, const size_t Last)
+    : mArray(ThreadSafeSlabAllocator::allocate_array_of<T>(Last - First + 1U) - First)
     #ifndef NDEBUG
     , mFirst(First)
     , mLast(Last)
@@ -172,8 +144,8 @@ struct FixedVector {
         reset(First, Last);
     }
 
-    FixedVector(const size_t Size, CompilerAllocator & A)
-    : mArray(A.allocate<T>(Size))
+    FixedVector(const size_t Size)
+    : mArray(ThreadSafeSlabAllocator::allocate_array_of<T>(Size))
     #ifndef NDEBUG
     , mFirst(0)
     , mLast(Size - 1U)
@@ -259,8 +231,8 @@ struct StreamSetOutputPort {
 
 template <typename T>
 struct InputPortVector {
-    inline InputPortVector(const size_t n, CompilerAllocator & A)
-    : mArray(0, n, A) {
+    inline InputPortVector(const size_t n)
+    : mArray(0, n) {
     }
     inline T operator[](const StreamSetPort port) const {
         assert (port.Type == PortType::Input);
@@ -285,8 +257,8 @@ private:
 
 template <typename T>
 struct OutputPortVector {
-    inline OutputPortVector(const size_t n, CompilerAllocator & A)
-    : mArray(0, n, A) {
+    inline OutputPortVector(const size_t n)
+    : mArray(0, n) {
     }
     inline T operator[](const StreamSetPort port) const {
         assert (port.Type == PortType::Output);

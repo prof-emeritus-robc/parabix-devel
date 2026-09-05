@@ -28,8 +28,8 @@ public:
         return llvm::isa<Ones>(other);
     }
 protected:
-    Ones(llvm::Type * const type, Allocator & allocator)
-    : PabloAST(ClassTypeId::Ones, type, allocator) {
+    Ones(llvm::Type * const type)
+    : PabloAST(ClassTypeId::Ones, type) {
     }
 };
 

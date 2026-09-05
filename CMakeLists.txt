@@ -375,6 +375,7 @@ if(ARTIFACT_MODE STREQUAL "Single")
 endif()
 
 # Framework Libraries
+add_subdirectory(lib/allocator)
 add_subdirectory(lib/fileselect)
 add_subdirectory(lib/grep)
 add_subdirectory(lib/idisa)

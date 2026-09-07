@@ -51,6 +51,7 @@
 #include <iostream>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <llvm/Support/CommandLine.h>
@@ -663,11 +664,24 @@ protected:
         PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
 
         // ── Batched write-back accumulators (--batch-writeback) ──────────────────
-        // Each rule's gate only ORs its fire in here; the writes are applied once at
-        // the end of the kernel. setBit[i] = positions where id bit i must become 1,
-        // anyFire = positions where SOME rule fired (drives the bit clear),
+        // Each rule's gate only ORs its fire in here; the writes are normally applied
+        // once at the end of the kernel. setBit[i] = positions where id bit i must
+        // become 1, anyFire = positions where SOME rule fired (drives the bit clear),
         // fireByLen[lenA] = fires needing a consume Advance of lenA.
-        const bool batch = BatchWriteback && !mUseNextId;
+        //
+        // --asymmetric-seam can put a rule in the SAME group as the earlier rule that
+        // consumes its idA (MergeRule::needsFlush, set by tagFlushPoints) — that rule's
+        // eqAstart MUST see the producer's consume, so a mid-kernel flush point is
+        // required before its gate (see flushWriteback below). The grouped-if path
+        // (--if-group-lower-limit) builds all of a chunk's rules inside ONE createIf
+        // body, so a flush can't land between two rules of the same chunk without
+        // splitting it — unsupported for now, so batching is disabled for any grouped
+        // kernel that actually contains such a dependency (falls back to per-rule
+        // writes for that kernel only; ungrouped kernels are unaffected).
+        const bool groupHasUnsupportedFlush = mGrouped &&
+            std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
+                        [](const MergeRule & r) { return r.needsFlush; });
+        const bool batch = BatchWriteback && !mUseNextId && !groupHasUnsupportedFlush;
         std::vector<Var *> setBit;
         std::map<unsigned, Var *> fireByLen;
         Var * anyFire = nullptr;
@@ -699,9 +713,7 @@ protected:
         // the outer scope), inPlayMask already reflects every earlier rule's consume in
         // THIS kernel. Under the shipped partition schemes (clean-range default,
         // --level-partition symmetric seam) this is a no-op — conflict-freedom already
-        // guarantees no rule's fire touches a position another same-kernel rule reads —
-        // but it's what makes --level-partition --asymmetric-seam correct: rank11 "Ġo"
-        // clearing "o"'s start must be visible to rank17 "or" even inside one kernel.
+        // guarantees no rule's fire touches a position another same-kernel rule reads 
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
             cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);
             return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask);
@@ -784,7 +796,51 @@ protected:
         // same-kernel rule can have consumed an X-run position — that would overlap the
         // self-merge, which the clean-range partition forbids — so frozen == live.
         unsigned maskGen = 0;
+
+        // Apply the batch accumulators to inPlayMask/idAcc, then reset them to zero so
+        // accumulation can resume for the next segment. Normally called once at the end
+        // of the kernel; a rule flagged needsFlush (--asymmetric-seam same-kernel
+        // dependency) forces an EARLY call so its eqAstart sees the producer's consume
+        // instead of the accumulated-but-not-yet-applied fires sitting in fireByLen/
+        // setBit. One Advance per distinct lenA + one Sel per id bit either way —
+        // Advance(a|b,L) == Advance(a,L)|Advance(b,L) makes each partial application
+        // exact, same proof as the single end-of-kernel flush.
+        // Called at most once per kernel in the original design, so a stale-pointer
+        // read was never possible. Now called MID-kernel too (needsFlush), so every
+        // accumulator this reads via a fixed (Var*, constant) signature — createAdvance
+        // (kv.second, lenA) and createNot(anyFire) — must be REBOUND to a fresh Var*
+        // after use: createAssign(var, zeroes) changes the bound VALUE but not the
+        // POINTER, and Pablo's builder memoizes by operand pointer identity (mExprTable),
+        // so a later flush's createAdvance/createNot call with the SAME pointer + SAME
+        // constant would hit the cache and silently return THIS flush's stale result —
+        // the exact inPlayMask hazard documented at the per-rule rebind below, applied
+        // to the batch accumulators themselves.
+        auto flushWriteback = [&]() {
+            for (auto & kv : fireByLen) {
+                pb.createAssign(inPlayMask,
+                    pb.createAnd(inPlayMask,
+                        pb.createNot(pb.createAdvance(kv.second, (int64_t) kv.first))));
+                kv.second = pb.createVar("fireByLen_" + std::to_string(kv.first)
+                                          + "_" + std::to_string(maskGen), zeroes);
+            }
+            PabloAST * notAny = pb.createNot(anyFire);
+            for (unsigned i = 0; i < W_out; i++) {
+                pb.createAssign(idAcc[i],
+                    pb.createOr(pb.createAnd(idAcc[i], notAny), setBit[i]));
+                setBit[i] = pb.createVar("setBit_" + std::to_string(i)
+                                          + "_" + std::to_string(maskGen), zeroes);
+            }
+            anyFire = pb.createVar("anyFire_" + std::to_string(maskGen), zeroes);
+            // Same CSE-staleness hazard for inPlayMask itself (pre-existing pattern,
+            // see the per-rule rebind below).
+            Var * freshMask = pb.createVar("inPlayMask_flush" + std::to_string(maskGen), zeroes);
+            pb.createAssign(freshMask, inPlayMask);
+            inPlayMask = freshMask;
+            maskGen++;
+        };
+
         auto emitRule = [&](const MergeRule & r) {
+            if (batch && r.needsFlush) flushWriteback();
             // eqAstart already includes the live mask, and selfMergeFireStarts returns a
             // subset of its input, so fireStart IS the gate value — no extra And.
             PabloAST * fireStart = eqAstart(pb, r.idA);
@@ -799,8 +855,9 @@ protected:
             // inside a closed createIf scope. Two rules sharing idA call eqAstart with
             // the SAME idpart AND the SAME inPlayMask pointer — the second call hits the
             // cache and silently gets back the FIRST rule's pre-fire (stale) gate, so it
-            // can fire on a position the first rule already consumed (found empirically
-            // 2026-09-03: rules "0+0","0+1","1+2" sharing a kernel, "0+1" reusing "0+0"'s
+            // can fire on a position the first rule already consumed. This is particularly
+            // problematic for self-merges where the same position can be consumed by multiple
+            // rules. For example, rules "0+0","0+1","1+2" sharing a kernel, "0+1" reusing "0+0"'s
             // stale gate, misfiring on "0"'s already-consumed position and stealing "1"
             // out from under "1+2"). A fresh Var* per rule is a new cache key, so the
             // next eqAstart call is forced to rebuild against the truly-current mask.
@@ -864,19 +921,8 @@ protected:
             }
         }
 
-        // ── Apply the batched write-back ────────────────────────────────────────
-        // One Advance per distinct lenA (instead of one per rule), then one Sel per id
-        // bit. Advance(a|b,L) == Advance(a,L)|Advance(b,L) makes the merge exact.
-        if (batch) {
-            for (const auto & kv : fireByLen)
-                pb.createAssign(inPlayMask,
-                    pb.createAnd(inPlayMask,
-                        pb.createNot(pb.createAdvance(kv.second, (int64_t) kv.first))));
-            PabloAST * notAny = pb.createNot(anyFire);
-            for (unsigned i = 0; i < W_out; i++)
-                pb.createAssign(idAcc[i],
-                    pb.createOr(pb.createAnd(idAcc[i], notAny), setBit[i]));
-        }
+        // ── Apply whatever's left in the batch accumulators ─────────────────────
+        if (batch) flushWriteback();
 
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
@@ -1255,10 +1301,7 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         // split, but the rule still can't jump to an EARLIER level than its consumer.
         // EXCEPT self-merges (idA==idB): selfMergeFireStarts' run-parity math assumes a
         // STATIC isX (see its call site comment — "no same-kernel rule can have
-        // consumed an X-run position... so frozen==live"). A live, same-kernel-gapped
-        // isX breaks that assumption (found empirically 2026-09-03: val_2MB mismatch
-        // inside a repeated-'0' run once the softened path was in use), so self-merges
-        // keep the strict, always-separate-kernel constraint regardless of this flag.
+        // consumed an X-run position... so frozen==live"). 
         if (AsymmetricSeam && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
         else after(maxRight, r.idA);
         after(maxLeft,   r.idB);      // seam: an earlier rule claimed this token as its A
@@ -1302,6 +1345,34 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
     return ranges;
 }
 
+// Mark rules whose gate needs a POST-write live mask: an earlier (lower-rank) rule
+// in the SAME group already consumed this rule's idA as its own idB. Under the
+// default symmetric seam test (clean-range and --level-partition without
+// --asymmetric-seam) this can never occur — the seam test forbids both overlap
+// directions within one group — so this pass is a no-op there. Under
+// --asymmetric-seam it is exactly the ONE relaxed direction (see AsymmetricSeam's
+// `sameOrAfter(maxRight, r.idA)` in levelPartition). --batch-writeback defers the
+// inPlayMask clear to the end of the kernel; a flagged rule must force a flush of
+// the pending write-back first, or its eqAstart sees the kernel's frozen entry
+// mask instead of the producer's consume and misfires.
+static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
+    unsigned totalFlags = 0, totalRules = 0, groupsWithFlags = 0;
+    for (auto & g : groups) {
+        std::unordered_set<unsigned> consumedAsB;   // idB values used by earlier rules in this group
+        unsigned before = totalFlags;
+        for (auto & r : g.rules) {
+            if (consumedAsB.count(r.idA)) { r.needsFlush = true; totalFlags++; }
+            consumedAsB.insert(r.idB);
+        }
+        totalRules += g.rules.size();
+        if (totalFlags > before) groupsWithFlags++;
+    }
+    if (std::getenv("BPE_FLUSH_STATS"))
+        std::cerr << "[BPE] tagFlushPoints: " << totalFlags << "/" << totalRules
+                  << " rules flagged needsFlush across " << groupsWithFlags << "/"
+                  << groups.size() << " groups\n";
+}
+
 std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     // 1. Resolve every raw merge → MergeRule.
     std::vector<MergeRule> rules;
@@ -1332,7 +1403,11 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     //    rule is dependency-independent (idA<lo && idB<lo) AND token-adjacency-overlap-
     //    free vs every rule already in the group. The first rule violating either
     //    starts the next range.
-    if (LevelPartition) return levelPartition(rules);
+    if (LevelPartition) {
+        auto groups = levelPartition(rules);
+        tagFlushPoints(groups);
+        return groups;
+    }
 
     std::vector<MergeRuleGroup> ranges;
     size_t i = 0, n = rules.size();
@@ -1354,5 +1429,6 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
                        : rules[n - 1].idAB + 1;      // last range: past top id
         ranges.push_back(std::move(g));
     }
+    tagFlushPoints(ranges);
     return ranges;
 }

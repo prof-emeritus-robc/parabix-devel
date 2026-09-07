@@ -29,6 +29,12 @@ struct MergeRaw {
 struct MergeRule {
     unsigned idA = 0, idB = 0, idAB = 0;
     unsigned lenA = 0, lenB = 0;        // byte lengths of the two parts
+    // Set when an EARLIER (lower-rank) rule in the SAME group consumed this rule's
+    // idA as ITS idB (p.idB == idA) — only possible under --asymmetric-seam, which
+    // permits that one overlap direction to share a kernel. --batch-writeback must
+    // flush its pending write-back before such a rule's gate so it sees the
+    // producer's consume instead of the kernel's frozen entry mask.
+    bool needsFlush = false;
 };
 
 // One id-range group of merge rules, sorted by idAB ASC (= rank ASC). maxLen =

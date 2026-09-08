@@ -664,24 +664,39 @@ protected:
         PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
 
         // ── Batched write-back accumulators (--batch-writeback) ──────────────────
-        // Each rule's gate only ORs its fire in here; the writes are normally applied
+        // Each rule's gate only ORs its fire in here; the id-stamp write is applied
         // once at the end of the kernel. setBit[i] = positions where id bit i must
-        // become 1, anyFire = positions where SOME rule fired (drives the bit clear),
-        // fireByLen[lenA] = fires needing a consume Advance of lenA.
+        // become 1, anyFire = positions where SOME rule fired (drives the bit clear).
         //
-        // --asymmetric-seam can put a rule in the SAME group as the earlier rule that
-        // consumes its idA (MergeRule::needsFlush, set by tagFlushPoints) — that rule's
-        // eqAstart MUST see the producer's consume, so a mid-kernel flush point is
-        // required before its gate (see flushWriteback below). The grouped-if path
-        // (--if-group-lower-limit) builds all of a chunk's rules inside ONE createIf
-        // body, so a flush can't land between two rules of the same chunk without
-        // splitting it — unsupported for now, so batching is disabled for any grouped
-        // kernel that actually contains such a dependency (falls back to per-rule
-        // writes for that kernel only; ungrouped kernels are unaffected).
-        const bool groupHasUnsupportedFlush = mGrouped &&
-            std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
-                        [](const MergeRule & r) { return r.needsFlush; });
-        const bool batch = BatchWriteback && !mUseNextId && !groupHasUnsupportedFlush;
+        // --asymmetric-seam can put two rules in the SAME kernel where the second
+        // one's idA is the first one's idB (MergeRule::needsFlush, set by
+        // tagFlushPoints) — the second rule's eqAstart MUST see the first rule's
+        // consume, or it wrongly fires on a position that's already been taken.
+        //
+        // We tried making that work by keeping BOTH mask and stamp batched and
+        // inserting extra "flush now" points mid-kernel wherever a dependency like
+        // this shows up. It was correct, but expensive: every flush point is its own
+        // unshared block of IR, and a kernel can have dozens of them.
+        //
+        // What we do instead is simpler: split the mask and the stamp apart, and only
+        // ever defer the mask when it's safe to.
+        //   - MASK (inPlayMask): if this kernel has NO such dependency, defer it —
+        //     batch every rule's consume and apply one Advance per length at the end,
+        //     same as before. If the kernel DOES have a dependency, don't defer it at
+        //     all — update it immediately, rule by rule, exactly like the pre-batching
+        //     (non-batch) design always did. That makes the mask always up to date,
+        //     so the live-read asymmetric-seam needs is satisfied for free — no
+        //     mid-kernel flush needed anywhere.
+        //   - STAMP (idAcc): always deferred, in every kernel, no exception. Unlike
+        //     the mask, one rule's stamp write can never depend on another rule's —
+        //     at most one rule can ever fire at a given position (the id stream only
+        //     has one value there, checked against the FROZEN input), so there's no
+        //     ordering to get wrong. Deferring it is always safe, including inside
+        //     grouped-if kernels.
+        const bool groupNeedsLiveMask = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
+                                                     [](const MergeRule & r) { return r.needsFlush; });
+        const bool batch     = BatchWriteback && !mUseNextId;      // defer the id-stamp
+        const bool deferMask = batch && !groupNeedsLiveMask;       // also defer the mask consume
         std::vector<Var *> setBit;
         std::map<unsigned, Var *> fireByLen;
         Var * anyFire = nullptr;
@@ -690,10 +705,11 @@ protected:
             for (unsigned i = 0; i < W_out; i++)
                 setBit[i] = pb.createVar("setBit_" + std::to_string(i), zeroes);
             anyFire = pb.createVar("anyFire", zeroes);
-            for (const auto & r : mRuleGroup.rules)
-                if (fireByLen.find(r.lenA) == fireByLen.end())
-                    fireByLen.emplace(r.lenA,
-                        pb.createVar("fireByLen_" + std::to_string(r.lenA), zeroes));
+            if (deferMask)
+                for (const auto & r : mRuleGroup.rules)
+                    if (fireByLen.find(r.lenA) == fireByLen.end())
+                        fireByLen.emplace(r.lenA,
+                            pb.createVar("fireByLen_" + std::to_string(r.lenA), zeroes));
         }
 
         // ── Astart decode ────────────────────────────────────────────────────────
@@ -755,15 +771,23 @@ protected:
                 fire = body.createAnd(fire, body.createNot(bAhead));
             }
 
-            // Batched: no Advance and no stamp in the gate — just OR the fire into the
-            // shared accumulators. Applied once per kernel below (see BatchWriteback).
+            // Batched: no stamp in the gate — just OR the fire into the shared
+            // accumulators; the id-stamp write is applied once per kernel below (see
+            // flushWriteback). The mask consume is ALSO deferred (accumulate into
+            // fireByLen) when deferMask allows it; otherwise it's applied right here,
+            // eagerly, exactly like the non-batch path below — see groupNeedsLiveMask.
             if (batch) {
                 body.createAssign(anyFire, body.createOr(anyFire, fire));
                 for (unsigned i = 0; i < W_out; i++)
                     if ((r.idAB >> i) & 1u)
                         body.createAssign(setBit[i], body.createOr(setBit[i], fire));
-                Var * fl = fireByLen.at(r.lenA);
-                body.createAssign(fl, body.createOr(fl, fire));
+                if (deferMask) {
+                    Var * fl = fireByLen.at(r.lenA);
+                    body.createAssign(fl, body.createOr(fl, fire));
+                } else {
+                    PabloAST * removeAt = body.createAdvance(fire, r.lenA);
+                    body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(removeAt)));
+                }
                 return;
             }
 
@@ -797,50 +821,23 @@ protected:
         // self-merge, which the clean-range partition forbids — so frozen == live.
         unsigned maskGen = 0;
 
-        // Apply the batch accumulators to inPlayMask/idAcc, then reset them to zero so
-        // accumulation can resume for the next segment. Normally called once at the end
-        // of the kernel; a rule flagged needsFlush (--asymmetric-seam same-kernel
-        // dependency) forces an EARLY call so its eqAstart sees the producer's consume
-        // instead of the accumulated-but-not-yet-applied fires sitting in fireByLen/
-        // setBit. One Advance per distinct lenA + one Sel per id bit either way —
-        // Advance(a|b,L) == Advance(a,L)|Advance(b,L) makes each partial application
-        // exact, same proof as the single end-of-kernel flush.
-        // Called at most once per kernel in the original design, so a stale-pointer
-        // read was never possible. Now called MID-kernel too (needsFlush), so every
-        // accumulator this reads via a fixed (Var*, constant) signature — createAdvance
-        // (kv.second, lenA) and createNot(anyFire) — must be REBOUND to a fresh Var*
-        // after use: createAssign(var, zeroes) changes the bound VALUE but not the
-        // POINTER, and Pablo's builder memoizes by operand pointer identity (mExprTable),
-        // so a later flush's createAdvance/createNot call with the SAME pointer + SAME
-        // constant would hit the cache and silently return THIS flush's stale result —
-        // the exact inPlayMask hazard documented at the per-rule rebind below, applied
-        // to the batch accumulators themselves.
+        // Apply the deferred id-stamp (and, when deferMask, the deferred mask consume
+        // too) once at the very end of the kernel — no mid-kernel calls, since the
+        // mask is either fully eager (groupNeedsLiveMask) or fully deferred for the
+        // whole kernel, never a mix that needs an early catch-up point.
         auto flushWriteback = [&]() {
-            for (auto & kv : fireByLen) {
-                pb.createAssign(inPlayMask,
-                    pb.createAnd(inPlayMask,
-                        pb.createNot(pb.createAdvance(kv.second, (int64_t) kv.first))));
-                kv.second = pb.createVar("fireByLen_" + std::to_string(kv.first)
-                                          + "_" + std::to_string(maskGen), zeroes);
-            }
+            if (deferMask)
+                for (auto & kv : fireByLen)
+                    pb.createAssign(inPlayMask,
+                        pb.createAnd(inPlayMask,
+                            pb.createNot(pb.createAdvance(kv.second, (int64_t) kv.first))));
             PabloAST * notAny = pb.createNot(anyFire);
-            for (unsigned i = 0; i < W_out; i++) {
+            for (unsigned i = 0; i < W_out; i++)
                 pb.createAssign(idAcc[i],
                     pb.createOr(pb.createAnd(idAcc[i], notAny), setBit[i]));
-                setBit[i] = pb.createVar("setBit_" + std::to_string(i)
-                                          + "_" + std::to_string(maskGen), zeroes);
-            }
-            anyFire = pb.createVar("anyFire_" + std::to_string(maskGen), zeroes);
-            // Same CSE-staleness hazard for inPlayMask itself (pre-existing pattern,
-            // see the per-rule rebind below).
-            Var * freshMask = pb.createVar("inPlayMask_flush" + std::to_string(maskGen), zeroes);
-            pb.createAssign(freshMask, inPlayMask);
-            inPlayMask = freshMask;
-            maskGen++;
         };
 
         auto emitRule = [&](const MergeRule & r) {
-            if (batch && r.needsFlush) flushWriteback();
             // eqAstart already includes the live mask, and selfMergeFireStarts returns a
             // subset of its input, so fireStart IS the gate value — no extra And.
             PabloAST * fireStart = eqAstart(pb, r.idA);

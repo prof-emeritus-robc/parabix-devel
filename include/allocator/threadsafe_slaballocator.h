@@ -5,6 +5,7 @@
 #include <boost/intrusive/detail/math.hpp>
 #include <new>
 #include <iostream>
+#include <limits>
 
 #ifdef _MSC_VER
 #define EXPORT __declspec(dllexport)
@@ -238,7 +239,7 @@ public:
     }
 
     inline StdSlabAllocatorProxy() noexcept {}
-    inline StdSlabAllocatorProxy(const StdSlabAllocatorProxy &) noexcept = delete;
+    inline StdSlabAllocatorProxy(const StdSlabAllocatorProxy &) noexcept = default;
     inline StdSlabAllocatorProxy(StdSlabAllocatorProxy &&) noexcept = default;
     template <class U> inline StdSlabAllocatorProxy (const StdSlabAllocatorProxy<U> &) noexcept { }
 };

@@ -466,15 +466,6 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     if(BlockSize == 0) {
         BlockSize = DefaultBlockSizeForFeatures(MapFeatureNames(GetFeatureNames()));
     }
-    if ((ShowUnoptimizedIROption != OmittedOption) && !ShowUnoptimizedIROption.empty()) {
-        llvm::sys::fs::remove(ShowUnoptimizedIROption);
-    }
-    if ((ShowIROption != OmittedOption) && !ShowIROption.empty()) {
-        llvm::sys::fs::remove(ShowIROption);
-    }
-    if ((ShowASMOption != OmittedOption) && !ShowASMOption.empty()) {
-        llvm::sys::fs::remove(ShowASMOption);
-    }
 //    if (LLVM_UNLIKELY(!PabloIllustrateBitstreamRegEx.empty() || IllustratorDisplay != 0)) {
 //        EnableIllustrator = true;
 //    }

@@ -80,7 +80,7 @@ public:
     llvm::Constant * allZeroes() const {
         return mZeroInitializer;
     }
-    
+
     unsigned getLaneWidth() const { return mLaneWidth; }
 
     llvm::IntegerType * getLaneTy() const { return llvm::Type::getIntNTy(getContext(), mLaneWidth); }

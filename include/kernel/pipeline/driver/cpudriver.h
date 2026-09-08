@@ -1,16 +1,9 @@
 #pragma once
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
-#include <llvm/IR/LegacyPassManager.h>
-#include <kernel/pipeline/driver/driver.h>
-#include <toolchain/toolchain.h>
 
-namespace llvm { class raw_fd_ostream; }
-namespace llvm { class ModulePass; }
-namespace kernel { class KernelBuilder; }
+#include <kernel/pipeline/driver/driver.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
 
 namespace {
-class CPUDriverContextPool;
-class CPUDriverTaskDispatcher;
 class CPUDriverCompiler;
 }
 

@@ -41,10 +41,6 @@ public:
         return mClassTypeId;
     }
 
-    void * operator new(size_t size) noexcept {
-        return mAllocator.allocate<uint8_t>(size);
-    }
-
     static std::string GenerateAnonymousTypeName() {
         return "__anonymous_type_name_" + std::to_string(mNextAnonId++);
     }

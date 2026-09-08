@@ -47,11 +47,6 @@ std::string to_string(TokenType const & type) {
     }
 }
 
-llvm::StringRef copyText(const llvm::StringRef & text, Token::Allocator & alloc) {
-    StdSlabAllocatorProxy<char> A;
-    return text.copy(A);
-}
-
 Token::Token(TokenType type, std::string text, std::weak_ptr<SourceFile> source, size_t lineNum, size_t colNum, uint64_t value)
 : mType(type)
 , mText(std::move(text))

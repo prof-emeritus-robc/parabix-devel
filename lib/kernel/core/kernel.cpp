@@ -472,35 +472,42 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
 
             const auto n = structTypeVec.size();
 
-            std::vector<Type *> fields(count * 2);
+            std::vector<Type *> fields(count * 2 + 1);
 
             uintptr_t byteOffset = 0;
+            uintptr_t ghostPadding = 0;
             size_t k = 0;
 
             for (unsigned i = 0; i < n; ++i) {
                 const auto & L = structTypeVec[i];
                 const auto m = L.size();
+                auto padToCacheLine = addGroupCacheLinePadding;
                 for (size_t j = 0; j != m; ++j) {
                     Type * const type = L[j]; assert(type);
                     assert (&type->getContext() == &b.getContext());
-                    uintptr_t align = CBuilder::getAlignOf(dl, type);
-                    assert (align > 0);
-                    if (j == 0 && addGroupCacheLinePadding) {
-                        align = boost::lcm(align, cacheAlignment);
+                    const auto storeSize = dl.getTypeStoreSize(type).getFixedValue();
+                    const auto allocSize = dl.getTypeAllocSize(type).getFixedValue();
+                    assert (storeSize <= allocSize);
+                    uintptr_t align = 1;
+                    if (storeSize) {
+                        align = CBuilder::getAlignOf(dl, type);
+                        if (padToCacheLine) {
+                            align = std::max(cacheAlignment, align);
+                            padToCacheLine = false;
+                        }
                     }
-                    const auto offset = (byteOffset % align);
-                    assert (i != 0 || j != 0 || offset == 0);
-                    const auto padding = (offset == 0ULL) ? 0ULL : (align - offset);
-                    byteOffset += padding + CBuilder::getTypeSize(dl, type);
-                    Type * const paddingTy = ArrayType::get(int8Ty, padding);
-                    assert (&paddingTy->getContext() == &b.getContext());
+                    const auto alignedOffset = llvm::alignTo(byteOffset, align);
+                    const auto paddingBytes = ghostPadding + alignedOffset - byteOffset;
+                    Type * const paddingTy = ArrayType::get(int8Ty, paddingBytes);
                     assert (k < fields.size());
                     fields[k++] = paddingTy;
                     assert (k < fields.size());
                     fields[k++] = type;
+                    ghostPadding = allocSize - storeSize;
+                    byteOffset += allocSize + paddingBytes;
                 }
             }
-
+            fields[k++] = ArrayType::get(int8Ty, ghostPadding);
 
             assert (k == fields.size());
 
@@ -518,9 +525,8 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
             #ifndef NDEBUG
             assert (st->getStructNumElements() == k);
             const StructLayout * const sl = dl.getStructLayout(st);
-            const auto structTypeSize = CBuilder::getTypeSize(dl, st);
-            assert ("expected stuct size does not match type size?" && sl->getSizeInBytes() == structTypeSize);
-            assert ("expected stuct size does not match byte offset?" && structTypeSize == byteOffset);
+            const auto structTypeSize = sl->getSizeInBytes();
+            assert ("expected stuct size does not match LLVM struct size?" && structTypeSize == byteOffset);
             for (size_t i = 0; i < k; ++i) {
                 const auto align = CBuilder::getAlignOf(dl, st->getElementType(i));
                 assert ((sl->getElementOffset(i) %  align) == 0);

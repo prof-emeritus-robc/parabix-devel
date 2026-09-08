@@ -25,6 +25,12 @@ public:
 
     using ScalarValueMap = llvm::StringMap<ScalarRef>;
 
+    #ifndef NDEBUG
+    using ScalarPositionVal = std::pair<Kernel::ScalarType, size_t>;
+
+    using ScalarPositionMap = llvm::StringMap<ScalarPositionVal>;
+    #endif
+
     using ScalarAliasMap = std::vector<std::pair<std::string, std::string>>;
 
     using ScalarType = Kernel::ScalarType;
@@ -459,6 +465,9 @@ protected:
 
     ScalarValueMap                  mScalarFieldMap;
     ScalarAliasMap                  mScalarAliasMap;
+    #ifndef NDEBUG
+    ScalarPositionMap               mScalarPositionMap;
+    #endif
     BindingMap                      mBindingMap;
 
     OwnedStreamSetBuffers           mStreamSetInputBuffers;

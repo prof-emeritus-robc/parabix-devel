@@ -83,7 +83,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
     IntegerType * const pThreadTy = IntegerType::getIntNTy(b.getContext(), sizeof(pthread_t) * CHAR_BIT);
 
     const DataLayout & DL = m->getDataLayout();
-    const auto pThreadAlign = DL.getABITypeAlign(pThreadTy).value();
+    const auto pThreadAlign = CBuilder::getAlignOf(DL, pThreadTy);
 
     Value * minimumNumOfThreads = nullptr;
 
@@ -1107,7 +1107,7 @@ void PipelineCompiler::writeThreadStructObject(KernelBuilder & b,
     const DataLayout & DL = b.getModule()->getDataLayout();
     for (unsigned i = 0; i < n; ++i) {
         indices3[2] = b.getInt32(i * 2 + 1);
-        const auto align = DL.getABITypeAlign(paramStructTy->getStructElementType(i * 2 + 1)).value();
+        const auto align = CBuilder::getAlignOf(DL, paramStructTy->getStructElementType(i * 2 + 1));
         assert (props[i]->getType() == paramStructTy->getStructElementType(i * 2 + 1));
         b.CreateAlignedStore(props[i], b.CreateInBoundsGEP(threadStateTy, threadState, indices3), align);
     }

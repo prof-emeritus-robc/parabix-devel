@@ -182,7 +182,7 @@ void PopCountKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::Value * co
             if (LLVM_LIKELY(b.supportsIndirectBr())) {
 
                 PointerType * const i8PtrTy = b.getInt8PtrTy();
-                const auto i8PtrTyAlign = DL.getABITypeAlign(i8PtrTy).value();
+                const auto i8PtrTyAlign = CBuilder::getAlignOf(DL, i8PtrTy);
 
                 SmallVector<BasicBlock *, 32> stepEntryPoint(steps);
                 for (unsigned i = 1; i < steps; ++i) {

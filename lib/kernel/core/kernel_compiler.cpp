@@ -1134,6 +1134,8 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
     assert (threadLocalTy == nullptr || &threadLocalTy->getContext() == &b.getContext());
 
     auto & DL = m->getDataLayout();
+    const StructLayout * const sharedLayout = sharedTy ? DL.getStructLayout(sharedTy) : nullptr;
+    const StructLayout * const threadLocalLayout = threadLocalTy ? DL.getStructLayout(threadLocalTy) : nullptr;
 
     #ifndef NDEBUG
     auto verifyStateType = [&](Value * const handle, StructType * const stateType) {
@@ -1161,6 +1163,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
 
     mScalarFieldMap.clear();
     mScalarAliasMap.clear();
+
 
     auto addToScalarFieldMap = [&](StringRef bindingName, Value * const scalar, Type * const expectedType, Type * const actualType) {
         assert (&b.getContext() == &actualType->getContext());
@@ -1218,8 +1221,22 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         combineToMainThreadLocal = b.CreateBasicBlock("combineToMainThreadLocal");
     }
 
-    FixedArray<Value *, 2> indices;
-    indices[0] = b.getInt32(0);
+    FixedArray<Value *, 1> idx;
+    IntegerType * i8Ty = b.getInt8Ty();
+
+    auto getScalar = [&](const StructLayout * const layout, Value * const handle, size_t k, StructType * stateTy, Type * elemTy) {
+        const auto off = layout->getElementOffset(k);
+        assert (stateTy->getStructElementType(k) == elemTy);
+        assert ((off % CBuilder::getAlignOf(DL, elemTy)) == 0);
+        idx[0] = b.getSize(off);
+        return b.CreateInBoundsGEP(i8Ty, handle, idx);
+    };
+
+    IntegerType * const intPtrTy = DL.getIntPtrType(b.getContext());
+
+
+
+
     auto enumerate = [&](const Bindings & bindings, const size_t initialIndex) {
         auto index = initialIndex;
         for (const auto & binding : bindings) {
@@ -1228,9 +1245,40 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
             assert (k < sharedTy->getStructNumElements());
             Type * const actualType = sharedTy->getStructElementType(k);
             assert (&actualType->getContext() == &sharedTy->getContext());
-            indices[1] = b.getInt32(k);
-            Value * const scalar = b.CreateInBoundsGEP(sharedTy, mSharedHandle, indices);
+            assert (actualType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getType()));
+            Value * const scalar = getScalar(sharedLayout, mSharedHandle, k, sharedTy, actualType);
             addToScalarFieldMap(binding.getName(), scalar, binding.getType(), actualType);
+
+
+//            Value * positionInt = b.CreatePtrToInt(scalar, intPtrTy);
+//            const auto align = CBuilder::getAlignOf(DL, actualType);
+//            Constant * alignInt = ConstantInt::get(intPtrTy, align);
+//            Value * correctAlign = b.CreateIsNull(b.CreateURem(positionInt, alignInt));
+
+//            SmallVector<char, 256> tmp;
+//            raw_svector_ostream sharedStr(tmp);
+
+//            const auto lastGood = (k > 2) ? (k - 2) : 0;
+
+
+
+//            for (auto i = lastGood; i <= k; ++i) {
+//                sharedStr << '\n';
+//                sharedTy->getStructElementType(i)->print(sharedStr);
+//            }
+
+
+//            b.CreateAssert (correctAlign, "%" PRIu64 " %s.%s is misaligned %" PRIx64 " align=%" PRIu64 " :%s",
+//                            b.getSize(k),
+//                            b.GetString(mTarget->getName()),
+//                            b.GetString(binding.getName()),
+//                            positionInt, alignInt,
+//                            b.GetString(sharedStr.str())
+//                            );
+
+            #ifndef NDEBUG
+            mScalarPositionMap.insert(std::make_pair(binding.getName(), std::make_pair(ScalarType::Internal, k)));
+            #endif
             ++index;
         }
     };
@@ -1253,8 +1301,38 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 const auto k = index * 2 + 1;
                 assert (k < sharedTy->getStructNumElements());
                 scalarType = sharedTy->getStructElementType(k);
-                indices[1] = b.getInt32(k);
-                scalar = b.CreateInBoundsGEP(sharedTy, mSharedHandle, indices);
+                assert (scalarType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType()));
+                scalar = getScalar(sharedLayout, mSharedHandle, k, sharedTy, scalarType);
+
+//                Value * positionInt = b.CreatePtrToInt(scalar, intPtrTy);
+//                const auto align = CBuilder::getAlignOf(DL, scalarType);
+//                Constant * alignInt = ConstantInt::get(intPtrTy, align);
+//                Value * correctAlign = b.CreateIsNull(b.CreateURem(positionInt, alignInt));
+
+//                SmallVector<char, 256> tmp;
+//                raw_svector_ostream sharedStr(tmp);
+
+//                const auto lastGood = (k > 2) ? (k - 2) : 0;
+
+
+
+//                for (auto i = lastGood; i <= k; ++i) {
+//                    sharedStr << '\n';
+//                    sharedTy->getStructElementType(i)->print(sharedStr);
+//                }
+
+
+//                b.CreateAssert (correctAlign, "%" PRIu64 " %s.%s is misaligned %" PRIx64 " align=%" PRIu64 " :%s",
+//                                b.getSize(k),
+//                                b.GetString(mTarget->getName()),
+//                                b.GetString(binding.getName()),
+//                                positionInt, alignInt,
+//                                b.GetString(sharedStr.str())
+//                                );
+
+                #ifndef NDEBUG
+                mScalarPositionMap.insert(std::make_pair(binding.getName(), std::make_pair(ScalarType::Internal, k)));
+                #endif
                 END_SCOPED_REGION
                 break;
             case ScalarType::ThreadLocal:
@@ -1268,12 +1346,42 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 const auto k = index * 2 + 1;
                 assert (k < threadLocalTy->getStructNumElements());
                 scalarType = threadLocalTy->getStructElementType(k);
-                indices[1] = b.getInt32(k);
-                scalar = b.CreateInBoundsGEP(threadLocalTy, mThreadLocalHandle, indices);
+                assert (scalarType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType()));
+                scalar = getScalar(threadLocalLayout, mThreadLocalHandle, k, threadLocalTy, scalarType);
+                #ifndef NDEBUG
+                mScalarPositionMap.insert(std::make_pair(binding.getName(), std::make_pair(ScalarType::ThreadLocal, k)));
+                #endif
+
+//                Value * positionInt = b.CreatePtrToInt(scalar, intPtrTy);
+//                const auto align = CBuilder::getAlignOf(DL, scalarType);
+//                Constant * alignInt = ConstantInt::get(intPtrTy, align);
+//                Value * correctAlign = b.CreateIsNull(b.CreateURem(positionInt, alignInt));
+
+//                SmallVector<char, 256> tmp;
+//                raw_svector_ostream stateStr(tmp);
+
+//                const auto lastGood = (k > 2) ? (k - 2) : 0;
+
+
+
+//                for (auto i = lastGood; i <= k; ++i) {
+//                    stateStr << '\n';
+//                    threadLocalTy->getStructElementType(i)->print(stateStr);
+//                }
+
+
+//                b.CreateAssert (correctAlign, "%" PRIu64 " %s.%s is misaligned %" PRIx64 " align=%" PRIu64 " :%s",
+//                                b.getSize(k),
+//                                b.GetString(mTarget->getName()),
+//                                b.GetString(binding.getName()),
+//                                positionInt, alignInt,
+//                                b.GetString(stateStr.str())
+//                                );
+
 
                 if (LLVM_UNLIKELY(options == InitializeOptions::IncludeAndAutomaticallyAccumulateThreadLocalScalars)) {
 
-                    Value * const mainScalar = b.CreateGEP(threadLocalTy, mCommonThreadLocalHandle, indices);
+                    Value * const mainScalar = getScalar(threadLocalLayout, mCommonThreadLocalHandle, k, threadLocalTy, scalarType);
 
                     using AccumRule = Kernel::ThreadLocalScalarAccumulationRule;
 
@@ -1382,9 +1490,9 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 BEGIN_SCOPED_REGION
                 scalarType = CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType());
                 scalar = b.CreateAlloca(scalarType);
-                const auto align = DL.getABITypeAlign(scalarType);
-                cast<AllocaInst>(scalar)->setAlignment(align);
-                b.CreateAlignedStore(Constant::getNullValue(scalarType), cast<AllocaInst>(scalar), align.value());
+                const auto align = CBuilder::getAlignOf(DL, scalarType);
+                cast<AllocaInst>(scalar)->setAlignment(llvm::Align{align});
+                b.CreateAlignedStore(Constant::getNullValue(scalarType), cast<AllocaInst>(scalar), align);
                 END_SCOPED_REGION
                 break;
             default: llvm_unreachable("I/O scalars cannot be internal");
@@ -1595,8 +1703,104 @@ KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, c
             assert (false);
             #endif
         }
+
+
         ScalarRef result = f->second;
         assert (isFromCurrentFunction(b, result.first, false));
+
+
+//        #ifndef NDEBUG
+//        auto p = mScalarPositionMap.find(name);
+//        if (p != mScalarPositionMap.end()) {
+//            const auto c = p->getValue();
+//            StructType * stateTy = nullptr;
+//            Value * handle = nullptr;
+//            if (c.first == ScalarType::Internal) {
+//                stateTy = mTarget->getSharedStateType();
+//                handle = mSharedHandle;
+//            } else {
+//                stateTy = mTarget->getThreadLocalStateType();
+//                handle = mThreadLocalHandle;
+//            }
+//            assert (stateTy);
+//            auto & DL = b.getModule()->getDataLayout();
+//            auto layout = DL.getStructLayout(stateTy);
+//            const auto k = c.second;
+//            const auto off = layout->getElementOffset(k);
+
+//            IntegerType * const intPtrTy = DL.getIntPtrType(b.getContext());
+//            Value * positionInt = b.CreatePtrToInt(result.first, intPtrTy);
+//            Value * expectedInt = b.CreateAdd(b.CreatePtrToInt(handle, intPtrTy), ConstantInt::get(intPtrTy, off));
+//            Value * atCorrectOffset = b.CreateICmpEQ(positionInt, expectedInt);
+//            const auto align = CBuilder::getAlignOf(DL, result.second);
+//            Constant * alignInt = ConstantInt::get(intPtrTy, align);
+//            Value * correctAlign = b.CreateIsNull(b.CreateURem(positionInt, alignInt));
+
+////            SmallVector<char, 256> tmp;
+////            raw_svector_ostream ir(tmp);
+////            result.first->print(ir);
+
+//            SmallVector<char, 2048> tmp2;
+//            raw_svector_ostream type2(tmp2);
+
+//            if (k < 2) {
+//                Type * ty = stateTy->getElementType(k);
+//                ty->print(type2);
+//                type2 << '\n';
+
+//            } else {
+
+//                for (int i = 0; i <= 2; ++i) {
+//                    Type * ty = stateTy->getElementType(k + i - 2);
+//                    ty->print(type2);
+//                    type2 << '\n';
+//                }
+
+//            }
+
+
+//            Value * prior = b.getSize(-1UL);
+
+//            for (unsigned j = 2; j < k; j += 2) {
+
+//                for (auto & ref : mScalarPositionMap) {
+//                    const auto r = ref.getValue();
+//                    if (r.second == (c.second - j) && r.first == c.first) {
+//                        Value * pVal; Type * pTy;
+
+//                        const auto f = mScalarFieldMap.find(ref.getKey());
+//                        assert (f != mScalarFieldMap.end());
+//                        std::tie(pVal, pTy) = f->second;
+//                        Value * positionInt2 = b.CreatePtrToInt(pVal, intPtrTy);
+//                        const auto align2 = CBuilder::getAlignOf(DL, pTy);
+//                        Constant * alignInt2 = ConstantInt::get(intPtrTy, align2);
+//                        Value * r = b.CreateURem(positionInt2, alignInt2);
+//                        Value * o = b.CreateSelect(b.CreateIsNull(r), b.getSize(j), prior);
+//                        prior = b.CreateUMin(prior, o);
+//                        break;
+//                    }
+//                }
+
+//            }
+
+//            prior = b.CreateSub(b.getSize(k), prior);
+
+
+//            b.CreateAssert(b.CreateAnd(atCorrectOffset, correctAlign),
+//                           "%s.%s is incorrectly aligned (addr=%" PRIx64 ", align=%" PRIu64 ") at field index %" PRIx64
+//                           "\n%s"
+//                           "\nlast good index %" PRIx64,
+//                           b.GetString(mTarget->getName()), b.GetString(name), positionInt, alignInt, b.getSize(k),
+//                           b.GetString(type2.str()),
+//                           prior
+//                           );
+
+
+//        } else {
+
+//        }
+//        #endif
+
         return result;
     }
 }
@@ -1633,6 +1837,7 @@ KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, V
                 const auto index = f->second++;
 
                 if (name.compare(binding.getName()) == 0) {
+
                     StructType * stateTy = nullptr;
                     if (type == ScalarType::Internal) {
                         stateTy = mTarget->getSharedStateType(b.getContext()); assert(stateTy);
@@ -1640,15 +1845,14 @@ KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, V
                         stateTy = mTarget->getThreadLocalStateType(b.getContext()); assert(stateTy);
                     }
 
+                    auto & DL = b.getModule()->getDataLayout();
+                    const StructLayout * const layout = DL.getStructLayout(stateTy);
                     const auto k = index * 2 + 1;
-
-                    FixedArray<Value *, 2> indices;
-                    indices[0] = b.getInt32(0);
-                    indices[1] = b.getInt32(k);
                     assert (k < stateTy->getStructNumElements());
-
+                    FixedArray<Value *, 1> idx;
+                    idx[0] = b.getSize(layout->getElementOffset(k));
                     assert (isFromCurrentFunction(b, handle, false));
-                    Value * ptr = b.CreateGEP(stateTy, handle, indices); assert (ptr);
+                    Value * ptr = b.CreateGEP(b.getInt8Ty(), handle, idx);
                     assert (stateTy->getStructElementType(k) == binding.getValueType());
                     return ScalarRef{ptr, binding.getValueType()};
                 }
@@ -1662,18 +1866,7 @@ KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, V
         if (LLVM_UNLIKELY(f == mScalarFieldMap.end())) {
             return ScalarRef{nullptr, nullptr};
         }
-        const auto & ref = f->second;
-
-        GetElementPtrInst * const gep = cast<GetElementPtrInst>(ref.first);
-        assert (gep->getNumIndices() == 2);
-        assert (gep->hasAllConstantIndices());
-
-        FixedArray<Value *, 2> indices;
-        indices[0] = gep->getOperand(1);
-        indices[1] = gep->getOperand(2);
-        Value * ptr = b.CreateGEP(gep->getSourceElementType(), handle, indices); assert (ptr);
-
-        return ScalarRef{ptr, cast<Type>(ref.second)};
+        return f->second;
 
     }
 

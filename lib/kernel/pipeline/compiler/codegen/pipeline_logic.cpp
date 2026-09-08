@@ -24,7 +24,7 @@ void PipelineCompiler::constructImplicitKernelStateTypes(KernelBuilder & b) {
             if (entry.second) {
                 K->declareStateTypes(b);
             } else {
-                Kernel * const other = entry.first->getValue();
+                Kernel * const other = entry.first->getValue(); assert (other);
                 K->setSharedStateType(other->getSharedStateType());
                 K->setThreadLocalStateType(other->getThreadLocalStateType());
             }
@@ -253,6 +253,8 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
         } else {
             sharedStateTy = mKernel->getSharedStateType(b.getContext());
             assert (sharedStateTy && !sharedStateTy->isEmptyTy() && &sharedStateTy->getContext() == &b.getContext());
+            assert (!cast<StructType>(sharedStateTy)->isLiteral());
+            assert (!cast<StructType>(sharedStateTy)->isOpaque());
         }
         mTarget->addInternalScalar(sharedStateTy, name, groupId);
     }
@@ -265,6 +267,8 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
         } else {
             localStateTy = mKernel->getThreadLocalStateType(b.getContext());
             assert (localStateTy && !localStateTy->isEmptyTy() && &localStateTy->getContext() == &b.getContext());
+            assert (!cast<StructType>(localStateTy)->isLiteral());
+            assert (!cast<StructType>(localStateTy)->isOpaque());
         }
         mTarget->addThreadLocalScalar(localStateTy, name + KERNEL_THREAD_LOCAL_SUFFIX, groupId);
     }
@@ -320,12 +324,12 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
     auto partitionId = KernelPartitionId[PipelineInput];
 
     for (auto i = FirstKernel; i <= LastKernel; ++i) {
-
         const auto curPartitionId = KernelPartitionId[i];
         const auto isRoot = (curPartitionId != partitionId);
         partitionId = curPartitionId;
         // Family kernels must be initialized in the "main" method.
         setActiveKernel(b, i, false);
+
         assert (mKernelId == i);
         if (isRoot) {
             initializeStridesPerSegment(b);
@@ -378,8 +382,6 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
             }
             #endif
 
-
-
             Value * const signal = callKernelInitializeFunction(b, args);
             Value * const terminatedOnInit = b.CreateICmpNE(signal, unterminated);
 
@@ -422,7 +424,6 @@ void PipelineCompiler::generateAllocateSharedInternalStreamSetsMethod(KernelBuil
         assert (FirstKernel == LastKernel);
         return;
     }
-
     getABIAlignments(b);
 
     assert (PartitionPhaseBoundaries.size() >= 2);
@@ -480,6 +481,7 @@ void PipelineCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
         assert (FirstKernel == LastKernel);
         return;
     }
+
     getABIAlignments(b);
 
     const auto numOfPhases = PartitionPhaseBoundaries.size(); assert (numOfPhases >= 2);
@@ -506,7 +508,6 @@ void PipelineCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
             }
         }
     }
-
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -555,6 +556,7 @@ void PipelineCompiler::generateFinalizeMethod(KernelBuilder & b) {
         assert (LastKernel == PipelineInput);
         return;
     }
+
     getABIAlignments(b);
     if (LLVM_UNLIKELY(codegen::AnyDebugOptionIsSet() || NumOfPAPIEvents > 0)) {
         printOptionalCycleCounter(b);

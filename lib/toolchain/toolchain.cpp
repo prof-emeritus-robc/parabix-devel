@@ -19,6 +19,7 @@
 #include <thread>
 
 #if defined(PARABIX_ARM_TARGET)
+#include <llvm/TargetParser/AArch64TargetParser.h>
 #include <arm_sve.h>
 #endif
 
@@ -44,8 +45,30 @@ llvm::StringMap<bool> GetFeatureNames() {
     StringMap<bool> features;
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(19, 0, 0)
     if (!sys::getHostCPUFeatures(features)) {
+#ifdef PARABIX_ARM_TARGET
+        std::vector<StringRef> extNames;
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
+            auto info = llvm::AArch64::parseCpu(sys::getHostCPUName());
+            if (info) {
+                llvm::AArch64::getExtensionFeatures(info->Arch.DefaultExts | info->DefaultExtensions, extNames);
+            }
+        #else
+            const llvm::AArch64::CpuInfo & info = llvm::AArch64::parseCpu(sys::getHostCPUName());
+            llvm::AArch64::getExtensionFeatures(info.Arch.DefaultExts | info.DefaultExtensions, extNames);
+        #endif
+        for (const auto eName : extNames) {
+            //llvm::errs() << "Extension: " << eName << "\n";
+            if (eName.size() > 1) {
+                char op = eName[0];
+                if (op == '+' || op == '-') {
+                    features[eName.drop_front(1)] = (op == '+');
+                }
+            }
+        }
+#else
         llvm::report_fatal_error(
             "codegen::GetFeatureNames() failed to get host CPU features");
+#endif
     }
 #else
     features = sys::getHostCPUFeatures();
@@ -58,11 +81,11 @@ llvm::StringMap<bool> GetFeatureNames() {
         while (!ref.empty()) {
             llvm::StringRef raw;
             std::tie(raw, ref) = ref.split(',');
-            llvm::StringRef feature = raw.trim().lower();
+            std::string feature = raw.trim().lower();
             if (feature.size() > 1) {
                 char op = feature[0];
                 if (op == '+' || op == '-') {
-                    features[feature.drop_front(1)] = (op == '+');
+                    features[feature.substr(1)] = (op == '+');
                 }
             }
         }

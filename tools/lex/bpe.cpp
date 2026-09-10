@@ -173,6 +173,39 @@ static cl::opt<bool> AsymmetricSeam(
              "for a tighter (but less battle-tested) level schedule."),
     cl::init(false));
 
+// Chain partition (--level-partition only): let a rule whose idA was STAMPED by an
+// earlier (lower-rank) rule in the SAME level share that level instead of taking the
+// next one — a dependency chain A+B->AB, AB+C->ABC, ABC+D->ABCD... collapses into ONE
+// kernel instead of one per link. Same mechanism as --asymmetric-seam, one level up:
+// there, a same-kernel rule's MASK read goes live (inPlayMask) so it sees an earlier
+// rule's consume; here, a same-kernel rule's ID read goes live (idAcc) so it sees an
+// earlier rule's STAMP. Both rely on the same Pablo property — createIf auto-joins a
+// Var's reassignment as a Sel when the gated scope closes, so a LATER sibling
+// createIf reading that Var outward-of-scope already observes it. No nested createIf
+// (T6) — chain rules stay SIBLING ifs in rank order, just reading a live Var instead
+// of a frozen one.
+//
+// The other producer (idB, the RIGHT part) stays a hard separation, same as maxLeft
+// under --asymmetric-seam: B-detection is a forward LookAhead on the FROZEN kernel
+// input (T5), so a same-kernel producer of idB can never be seen — that side always
+// needs a real kernel boundary.
+//
+// A chained rule's Astart must decode against idAcc (mutates per rule) instead of
+// srcFrozen (immutable per kernel) — same expression-cache staleness hazard already
+// fixed for inPlayMask (Pablo memoizes by OPERAND POINTER, oblivious to intervening
+// reassignment), so idAcc is rebound to a fresh Var after every rule in a group that
+// has any chain rule. That also means --batch-writeback cannot defer the stamp for
+// such a group (deferred = no stamp exists to read until kernel end) — batching is
+// disabled there, same fallback --asymmetric-seam already uses for the mask.
+// Self-merges (idA==idB) are excluded from the relaxation: selfMergeFireStarts'
+// run-parity math assumes a STATIC isX, same carve-out as --asymmetric-seam.
+static cl::opt<bool> ChainPartition(
+    "chain-partition",
+    cl::desc("With --level-partition, let a rule whose idA was stamped by an earlier "
+             "same-level rule share that level (dependency chains collapse into one "
+             "kernel) instead of taking the next level."),
+    cl::init(false));
+
 static cl::opt<bool> LookaheadInGate(
     "lookahead-in-gate",
     cl::desc("Build the B-detection LookAhead inside each rule's if-gate (per-rule, "
@@ -568,6 +601,7 @@ public:
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
                         + (BatchWriteback ? "bw1_" : "bw0_")
+                        + (ChainPartition ? "cp1_" : "cp0_")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -695,7 +729,14 @@ protected:
         //     grouped-if kernels.
         const bool groupNeedsLiveMask = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
                                                      [](const MergeRule & r) { return r.needsFlush; });
-        const bool batch     = BatchWriteback && !mUseNextId;      // defer the id-stamp
+        // groupNeedsLiveId (--chain-partition): some rule is nested inside its
+        // producer's gate (see emitChain below) — batching's deferred, end-of-kernel
+        // stamp write doesn't compose with that structure, so batching is off
+        // entirely for the whole group, same fallback groupNeedsLiveMask uses for
+        // the mask.
+        const bool groupNeedsLiveId = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
+                                                   [](const MergeRule & r) { return r.needsLiveId; });
+        const bool batch     = BatchWriteback && !mUseNextId && !groupNeedsLiveId;  // defer the id-stamp
         const bool deferMask = batch && !groupNeedsLiveMask;       // also defer the mask consume
         std::vector<Var *> setBit;
         std::map<unsigned, Var *> fireByLen;
@@ -863,8 +904,99 @@ protected:
             inPlayMask = freshMask;
         };
 
+        // ── --chain-partition: REAL nested createIf ─────────────────────────────
+        // A rule flagged needsLiveId (its idA was stamped by an earlier SAME-level
+        // rule — see levelPartition's ChainPartition branch) is emitted physically
+        // INSIDE that producer's gate, instead of as a sibling createIf reading a
+        // live Var. Isolated from emitBody/emitRule (used by every other path,
+        // including plain-sibling non-chain rules in the SAME kernel) so no other
+        // flag's behavior changes.
+        //
+        // Why no idA re-check is needed for a nested child: being inside the
+        // producer's gate body, predicated on the producer's `fire`, already proves
+        // the producer matched (both its A and B parts) at this exact position —
+        // that's precisely when idAB now holds here. So the child only needs its OWN
+        // B-detect (is idB `lenA` bytes ahead, where lenA is the FULL chain-so-far
+        // length) — no id-compare, no read of idAcc at all, live or frozen. This is
+        // simpler than a sibling-if + live-read design would need (no expression-
+        // cache staleness risk — see eqAstart's comment on that hazard — since
+        // nothing ever RE-READS idAcc through a cached compileCC call).
+        //
+        // idAcc/inPlayMask mutations still happen via plain createAssign inside each
+        // nested scope; Pablo's createIf auto-joins those as a Sel at every scope
+        // close, cascading correctly through however many levels are nested — same
+        // mechanism the rest of the file already relies on, just applied at more
+        // than one depth. T6 (no nested createIf) is intentionally set aside HERE
+        // ONLY, behind this one opt-in flag, specifically to test whether the IR-size
+        // cost it warns about is bearable for real merge chains.
+        //
+        // childrenOf[idAB] = the rules in THIS group whose idA == idAB (i.e. every
+        // rule that should nest inside idAB's own gate). Empty (all rules go through
+        // the untouched emitRule path below) whenever --chain-partition is off,
+        // since needsLiveId is never set in that case.
+        std::unordered_map<unsigned, std::vector<const MergeRule*>> childrenOf;
+        for (const auto & r : mRuleGroup.rules)
+            if (r.needsLiveId) childrenOf[r.idA].push_back(&r);
+
+        // One rule's B-detect + stamp + consume, built fresh (not shared with
+        // emitBody — deliberately isolated). Returns `fire` (Astart AND B-detect) so
+        // a nested child can use it as ITS gate condition directly.
+        auto emitChainBody = [&](PabloBuilder & body, const MergeRule & r,
+                                  PabloAST * fireStart) -> PabloAST * {
+            std::vector<PabloAST*> bits(W);
+            for (unsigned i = 0; i < W; i++)
+                bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
+            cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
+            PabloAST * BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
+            PabloAST * fire = body.createAnd(fireStart, BstartAtA);
+            if (mHasBoundary) {
+                PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
+                fire = body.createAnd(fire, body.createNot(bAhead));
+            }
+            PabloAST * notStamp = body.createNot(fire);
+            for (unsigned i = 0; i < W_out; i++) {
+                if ((r.idAB >> i) & 1u)
+                    body.createAssign(idAcc[i], body.createOr(idAcc[i], fire));
+                else
+                    body.createAssign(idAcc[i], body.createAnd(idAcc[i], notStamp));
+            }
+            PabloAST * removeAt = body.createAdvance(fire, r.lenA);
+            body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(removeAt)));
+            return fire;
+        };
+
+        // Recurse: build r's gate, then nest every one of r's chain-children INSIDE
+        // it (using r's `fire`, not a fresh Astart) before closing r's createIf.
+        std::function<void(PabloBuilder&, const MergeRule&, PabloAST*)> emitChain =
+            [&](PabloBuilder & bld, const MergeRule & r, PabloAST * fireStart) {
+                auto body = bld.createScope();
+                PabloAST * fire = emitChainBody(body, r, fireStart);
+                auto it = childrenOf.find(r.idAB);
+                if (it != childrenOf.end())
+                    for (const MergeRule * child : it->second)
+                        emitChain(body, *child, fire);   // physically nested inside `body`
+                bld.createIf(fireStart, body);
+            };
+
         if (!mGrouped) {
-            for (const auto & r : mRuleGroup.rules) emitRule(r);
+            for (const auto & r : mRuleGroup.rules) {
+                if (r.needsLiveId) continue;      // emitted as a nested child above, not a root
+                if (!childrenOf.count(r.idAB)) {
+                    emitRule(r);                   // no chain involved — untouched path
+                    continue;
+                }
+                // Root of a chain: same Astart as emitRule, then nest the dependents
+                // inside via emitChain instead of a flat sibling loop.
+                PabloAST * fireStart = eqAstart(pb, r.idA);
+                if (r.idA == r.idB)
+                    fireStart = selfMergeFireStarts(pb, fireStart, r.lenA);
+                emitChain(pb, r, fireStart);
+                // Same rebind emitRule does after every rule — a later sibling's
+                // eqAstart must not reuse the pre-chain inPlayMask pointer.
+                Var * freshMask = pb.createVar("inPlayMask_" + std::to_string(maskGen++), zeroes);
+                pb.createAssign(freshMask, inPlayMask);
+                inPlayMask = freshMask;
+            }
         } else {
             // Grouped-if (numeric-range): sort rules by first id (idA), chop into chunks
             // of GROUP_SIZE, and gate each chunk with ONE createIf on the id RANGE
@@ -1044,7 +1176,13 @@ BPEPassResult buildBPEPassPipeline(
             P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
         }
         // Grouped-if for kernels at/after the lower limit (later kernels); -1 = off.
-        bool grouped = (IfGroupLowerLimit >= 0) && ((long) i >= (long) IfGroupLowerLimit);
+        // Excludes any group with a --chain-partition rule: eqAstart's live-idAcc read
+        // (and its per-rule idAcc rebind) is only wired into the per-rule (!mGrouped)
+        // loop below, not the grouped-if chunk loop.
+        bool groupHasChain = std::any_of(g.rules.begin(), g.rules.end(),
+                                          [](const MergeRule & r) { return r.needsLiveId; });
+        bool grouped = (IfGroupLowerLimit >= 0) && ((long) i >= (long) IfGroupLowerLimit)
+                       && !groupHasChain;
         P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
                                            g, hashRuleSet(g.rules), g.maxLen, grouped);
         source     = sOut;
@@ -1290,7 +1428,11 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
             auto it = m.find(key);
             if (it != m.end() && it->second > lvl) lvl = it->second;
         };
-        after(prodLevel, r.idA);      // dependency: idA stamped by a lower kernel
+        // dependency: idA must be stamped by a lower-OR-SAME kernel under
+        // --chain-partition (excluding self-merges, see ChainPartition's comment);
+        // otherwise (default) strictly a lower kernel, same as idB below.
+        if (ChainPartition && r.idA != r.idB) sameOrAfter(prodLevel, r.idA);
+        else after(prodLevel, r.idA);
         after(prodLevel, r.idB);      // dependency: idB stamped by a lower kernel
         // seam: an earlier rule consumed this token as its B. Under --asymmetric-seam,
         // softened to same-level-or-after — the runtime gate now reads inPlayMask LIVE
@@ -1309,7 +1451,16 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         // If the number of levels we currently have is LESS than the level needed for this rule, create more level slots.
         if (levels.size() < lvl) levels.resize(lvl);
 
-        levels[lvl - 1].push_back(r);
+        // needsLiveId: true exactly when idA's producer landed at THIS SAME level —
+        // only possible via the sameOrAfter(prodLevel, r.idA) branch above (the plain
+        // after() branch always forces a STRICTLY later level), so this is a no-op
+        // (always false) whenever --chain-partition is off.
+        MergeRule rc = r;
+        {
+            auto it = prodLevel.find(r.idA);
+            rc.needsLiveId = (it != prodLevel.end() && it->second == lvl);
+        }
+        levels[lvl - 1].push_back(rc);
         prodLevel[r.idAB] = lvl;
         auto keepMax = [](std::unordered_map<unsigned, unsigned> & m, unsigned k, unsigned v) {
             unsigned & slot = m[k];
@@ -1403,6 +1554,15 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     if (LevelPartition) {
         auto groups = levelPartition(rules);
         tagFlushPoints(groups);
+        if (std::getenv("BPE_CHAIN_STATS")) {
+            unsigned n = 0, total = 0;
+            for (auto & g : groups) {
+                total += g.rules.size();
+                for (auto & r : g.rules) if (r.needsLiveId) n++;
+            }
+            std::cerr << "[BPE] chain-partition: " << n << "/" << total
+                       << " rules flagged needsLiveId\n";
+        }
         return groups;
     }
 

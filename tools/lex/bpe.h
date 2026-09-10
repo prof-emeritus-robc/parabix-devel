@@ -35,6 +35,13 @@ struct MergeRule {
     // flush its pending write-back before such a rule's gate so it sees the
     // producer's consume instead of the kernel's frozen entry mask.
     bool needsFlush = false;
+    // Set when an EARLIER (lower-rank) rule in the SAME group STAMPS this rule's
+    // idA (p.idAB == idA) — only possible under --chain-partition, which lets a
+    // dependency chain (A+B->AB, AB+C->ABC, ...) share one kernel. Such a rule's
+    // Astart must be decoded against the LIVE idAcc (not the frozen kernel input),
+    // so it sees the producer's stamp; --batch-writeback is disabled for the whole
+    // group (stamp must be eager, not deferred to kernel end).
+    bool needsLiveId = false;
 };
 
 // One id-range group of merge rules, sorted by idAB ASC (= rank ASC). maxLen =

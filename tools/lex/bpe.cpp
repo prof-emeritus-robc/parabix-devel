@@ -190,15 +190,6 @@ static cl::opt<bool> AsymmetricSeam(
 // input (T5), so a same-kernel producer of idB can never be seen — that side always
 // needs a real kernel boundary.
 //
-// A chained rule's Astart must decode against idAcc (mutates per rule) instead of
-// srcFrozen (immutable per kernel) — same expression-cache staleness hazard already
-// fixed for inPlayMask (Pablo memoizes by OPERAND POINTER, oblivious to intervening
-// reassignment), so idAcc is rebound to a fresh Var after every rule in a group that
-// has any chain rule. That also means --batch-writeback cannot defer the stamp for
-// such a group (deferred = no stamp exists to read until kernel end) — batching is
-// disabled there, same fallback --asymmetric-seam already uses for the mask.
-// Self-merges (idA==idB) are excluded from the relaxation: selfMergeFireStarts'
-// run-parity math assumes a STATIC isX, same carve-out as --asymmetric-seam.
 static cl::opt<bool> ChainPartition(
     "chain-partition",
     cl::desc("With --level-partition, let a rule whose idA was stamped by an earlier "
@@ -1124,16 +1115,26 @@ BPEPassResult buildBPEPassPipeline(
                       << " maxLen=" << g.maxLen << "\n";
     }
 
-    // BPE_RULES=1: dump the resolved merge rules. BPE_RULES_N caps per group (4).
+    // BPE_RULES=1: dump the resolved merge rules, one "-- kernel i --" header per
+    // group so you can see exactly which ids/rules share a kernel (BPE_RULES_N
+    // raises the per-kernel cap, default 4; BPE_RULES_N=999999 for "all of them").
     if (std::getenv("BPE_RULES")) {
         unsigned cap = 4;
         if (const char * n = std::getenv("BPE_RULES_N")) cap = std::atoi(n);
-        for (const auto & g : ruleRanges)
+        for (size_t gi = 0; gi < ruleRanges.size(); gi++) {
+            const auto & g = ruleRanges[gi];
+            std::cerr << "-- kernel " << gi << ": [" << g.lo << "," << g.hi << ") x"
+                      << g.rules.size() << " maxLen=" << g.maxLen << " --\n";
             for (unsigned i = 0; i < g.rules.size() && i < cap; i++) {
                 const auto & r = g.rules[i];
                 std::cerr << "    idA=" << r.idA << " idB=" << r.idB
-                          << " lenB=" << r.lenB << " -> idAB=" << r.idAB << "\n";
+                          << " lenB=" << r.lenB << " -> idAB=" << r.idAB
+                          << "  (" << bpe.decodeToken(r.idA) << "+" << bpe.decodeToken(r.idB)
+                          << "->" << bpe.decodeToken(r.idAB) << ")\n";
             }
+            if (g.rules.size() > cap)
+                std::cerr << "    ... (" << (g.rules.size() - cap) << " more, raise BPE_RULES_N)\n";
+        }
     }
 
     // Seed: source = base id of each raw byte, active = ones, end = zeroes.

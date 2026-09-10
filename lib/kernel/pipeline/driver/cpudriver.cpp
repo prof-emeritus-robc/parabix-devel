@@ -36,13 +36,7 @@
 #include <llvm/Support/Host.h>
 #endif
 #include <numeric>
-
-#include <boost/interprocess/mapped_region.hpp>
 #include <allocator/threadsafe_slaballocator.h>
-
-inline unsigned getPageSize() {
-    return boost::interprocess::mapped_region::get_page_size();
-}
 
 #ifndef NDEBUG
 #define IN_DEBUG_MODE true
@@ -78,16 +72,14 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
     llvm::Module *                          CurrentModule;
     llvm::orc::LLJIT *                      Engine;
     llvm::DataLayout                        DataLayout;
-    llvm::orc::SymbolMap &                  SharedSymbolList;
     llvm::orc::SymbolMap                    NewSymbolList;
 
-    CPUDriverContext(JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, SymbolMap & symbolList)
+    CPUDriverContext(JITTargetMachineBuilder & JTMB, const StringMap<bool> & features)
     : TargetMachine(cantFail(JTMB.createTargetMachine()))
     , Builder(IDISA::GetIDISA_Builder(*this, features))
     , CurrentModule(nullptr)
     , Engine(nullptr)
-    , DataLayout(TargetMachine->createDataLayout())
-    , SharedSymbolList(symbolList) {
+    , DataLayout(TargetMachine->createDataLayout()) {
         Builder->setFunctionLinkCallback(this);
     }
 
@@ -154,22 +146,13 @@ struct CircularBuffer {
     void push(CPUDriverTask & task) {
         assert (task.Target);
         assert (Count <= Buffer.size());
-        const auto m = Buffer.size();
+        const auto m = Buffer.size(); assert (m);
         if (LLVM_UNLIKELY(Count == m)) {
-            std::vector<CPUDriverTask> buffer2(m * 2);
-            assert (Head < m);
-            for (size_t i = 0; i < m; ++i) {
-                buffer2[Head + i] = Buffer[(Head + i) % m];
+            Buffer.resize(m * 2);
+            if (Head <= Tail) {
+                std::move_backward(Buffer.begin() + Tail, Buffer.begin() + m, Buffer.begin() + m * 2);
+                Tail += m;
             }
-            Buffer.swap(buffer2);
-            Tail = Head + m;
-
-//            Buffer.resize(m * 2);
-//            for (size_t i = m; i-- > Head; ) {
-//                Buffer[m + i] = Buffer[i];
-//            }
-//            Head += m;
-//            Tail = Count;
         }
         Buffer[Tail] = task;
         Tail = (Tail + 1) % Buffer.size();
@@ -337,7 +320,7 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
         SlabNode(const size_t size)
         : Slab([size](){
             std::error_code EC;
-            const auto alignedSize = llvm::alignToPowerOf2(size, getPageSize());
+            const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PAGE_SIZE);
             auto slab = Mem::allocateMappedMemory(alignedSize, nullptr, Mem::MF_READ | Mem::MF_WRITE, EC);
             if (EC) {
                 SmallVector<char, 256> tmp;
@@ -362,10 +345,10 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
 public:
 
     CPUDriverJITMemoryManager()
-    : DataSlab(DEFAULT_SLAB_SIZE)
-    , CurrentDataSlab(&DataSlab)
-    , ExecSlab(DEFAULT_SLAB_SIZE)
-    , CurrentExecSlab(&ExecSlab) {
+    : ExecSlab(DEFAULT_SLAB_SIZE)
+    , CurrentExecSlab(&ExecSlab)
+    , DataSlab(DEFAULT_SLAB_SIZE)
+    , CurrentDataSlab(&DataSlab) {
 
     }
 
@@ -481,14 +464,16 @@ public:
         std::lock_guard<std::mutex> L(ExecSlabAllocationMutex);
         SlabNode * n = &ExecSlab;
         for (;;) {
-            const auto start = reinterpret_cast<uintptr_t>(n->Slab.base());
+            auto & S = n->Slab;
+            const auto start = reinterpret_cast<uintptr_t>(S.base());
             const auto end = n->AllocatedOffset.load(std::memory_order_relaxed);
             if (LLVM_LIKELY(start != end)) {
-                const auto ec = Mem::protectMappedMemory(n->Slab, Mem::MF_READ | Mem::MF_EXEC);
+                const auto ec = Mem::protectMappedMemory(S, Mem::MF_READ | Mem::MF_EXEC);
                 if (ec) {
                     report_fatal_error(errorCodeToError(ec));
                     return;
                 }
+                Mem::InvalidateInstructionCache(S.base(), S.allocatedSize());
             }
             n = n->Next;
             if (LLVM_LIKELY(n == nullptr)) {
@@ -541,8 +526,8 @@ private:
                     std::lock_guard<std::mutex> L(mutex);
                     SlabNode * nextSlab = CurrentSlab.load(std::memory_order_acquire);
                     if (nextSlab == currentSlab) {
-                        const auto minSize = llvm::alignToPowerOf2(totalSize * 4, getPageSize());
-                        const auto allocSize = std::max<uintptr_t>(DEFAULT_SLAB_SIZE, minSize);
+                        const auto minSize = std::max<uintptr_t>(currentSlab->Slab.allocatedSize(), totalSize * 4);
+                        const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PAGE_SIZE);
                         nextSlab = new SlabNode(allocSize);
                         assert (currentSlab->Next == nullptr);
                         currentSlab->Next = nextSlab;
@@ -577,7 +562,7 @@ class CPUDriverCompiler {
 public:
 
     CPUDriverCompiler(ThreadPoolStrategy strategy,
-                      JITTargetMachineBuilder & JTMB, const StringMap<bool> & features, SymbolMap & symbolList,
+                      JITTargetMachineBuilder & JTMB, const StringMap<bool> & features,
                       ParabixObjectCache * objCache)
     : Engine(nullptr)
     , ObjectCache(objCache)
@@ -588,7 +573,7 @@ public:
         // NOTE: The pipeline may read information from other kernels to determine their state types and convert them
         // to its own LLVMContext as needed. We preserve the contexts as long as this compiler exists.
         for (size_t i = 0; i < strategy.ThreadsRequested; ++i) {
-            Contexts[i] = new CPUDriverContext(JTMB, features, symbolList);
+            Contexts[i] = new CPUDriverContext(JTMB, features);
         }
 
         for (size_t i = 0; i < strategy.ThreadsRequested; ++i) {
@@ -609,7 +594,6 @@ public:
                             case CPUDriverTaskType::ObjectCode:
                                 assert (taskIndex == std::numeric_limits<size_t>::max());
                                 materializeObject(ctx, toExecute.Target, toExecute.TargetModule);
-                          //      addFinalObjectCodeToLLJIT();
                                 break;
                             case CPUDriverTaskType::Declaration:
                                 assert (taskIndex != std::numeric_limits<size_t>::max());
@@ -653,7 +637,6 @@ public:
         for (auto & t : Threads) {
             if (t.joinable()) t.join();
         }
-//        addFinalObjectCodeToLLJIT();
         for (auto & C : Contexts) {
             auto & S = C->NewSymbolList;
             DriverLinkedSymbols->insert(S.begin(), S.end());
@@ -771,11 +754,6 @@ private:
                 auto & linker = Engine->getObjLinkingLayer();
                 auto & JITLib = Engine->getMainJITDylib();
                 cantFail(linker.add(JITLib, std::move(cached)));
-
-//                BEGIN_SCOPED_REGION
-//                std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-//                AddObjectCodeList.emplace_back(std::move(cached));
-//                END_SCOPED_REGION
                 goto record_decl;
             }
         }
@@ -840,12 +818,7 @@ record_decl:
         C.Engine = Engine; assert (Engine);
         M->setTargetTriple(TM->getTargetTriple().getTriple());
         M->setDataLayout(C.DataLayout);
-
-//        M->setTargetTriple(Engine->getTargetTriple().getTriple());
-//        M->setDataLayout(Engine->getDataLayout());
-
         Target->linkExternalMethods(builder);
-        //linkExternalFunctions(C, Target);
 
         SmallVector<char, 0> IROutput;
         SmallVector<char, 0> OptIROutput;
@@ -935,11 +908,6 @@ record_decl:
         auto & JITLib = Engine->getMainJITDylib();
         cantFail(linker.add(JITLib, std::move(objCode)));
 
-//        BEGIN_SCOPED_REGION
-//        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-//        AddObjectCodeList.emplace_back(std::move(objCode));
-//        END_SCOPED_REGION
-
         if (LLVM_UNLIKELY(IROutput.size() || OptIROutput.size() || ASMOutput.size())) {
             recordDebugPrintResult(Target, std::move(IROutput), std::move(OptIROutput), std::move(ASMOutput));
         }
@@ -949,8 +917,6 @@ record_decl:
 
         TargetMachine * const TM = C.TargetMachine.get();
         auto M = std::make_unique<Module>("main", C);
-//        M->setTargetTriple(Engine->getTargetTriple().getTriple());
-//        M->setDataLayout(Engine->getDataLayout());
         M->setTargetTriple(TM->getTargetTriple().getTriple());
         M->setDataLayout(C.DataLayout);
 
@@ -998,34 +964,9 @@ record_decl:
         auto & JITLib = Engine->getMainJITDylib();
         cantFail(linker.add(JITLib, std::move(result)));
 
-//        BEGIN_SCOPED_REGION
-//        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-//        AddObjectCodeList.emplace_back(std::move(result));
-//        END_SCOPED_REGION
-
         END_SCOPED_REGION
 
     }
-
-//    bool addFinalObjectCodeToLLJIT() {
-//        size_t e = 0;
-//        if (!AddObjectCodeInProcess.compare_exchange_weak(e, 1, std::memory_order_release, std::memory_order_relaxed)) {
-//            return false;
-//        }
-//        MemoryBufferVector objCodeList;
-//        BEGIN_SCOPED_REGION
-//        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-//        if (AddObjectCodeList.empty()) {
-//            return false;
-//        }
-//        objCodeList.swap(AddObjectCodeList);
-//        END_SCOPED_REGION
-//        for (auto & buffer : objCodeList) {
-//            cantFail(Engine->addObjectFile(std::move(buffer)));
-//        }
-//        AddObjectCodeInProcess.store(0, std::memory_order_release);
-//        return true;
-//    }
 
     void recordDebugPrintResult(Kernel * const kernel, SmallVector<char, 0> && UnoptIR, SmallVector<char, 0> && OptIR, SmallVector<char, 0> && ASM) {
         std::lock_guard<std::mutex> L(DebugPrintMutex);
@@ -1100,10 +1041,6 @@ private:
 
     std::mutex                                      PrecompiledStateObjectMutex;
 
-//    std::atomic<size_t>                             AddObjectCodeInProcess;
-//    std::mutex                                      AddObjectCodeMutex;
-//    MemoryBufferVector                              AddObjectCodeList;
-
     std::vector<std::thread>                        Threads;
 
     std::mutex                                      DebugPrintMutex;
@@ -1144,7 +1081,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
         .addFeatures(attrs)
         .setOptions(codegen::target_Options)
         .setRelocationModel(Reloc::Static)
-        .setCodeModel(CodeModel::Small)
+        .setCodeModel(CodeModel::Large)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
 
@@ -1155,23 +1092,21 @@ CPUDriver::CPUDriver(std::string && moduleName)
 
     auto Builder = orc::LLJITBuilder();
     Builder.setJITTargetMachineBuilder(std::move(JTMB));
-    Builder.setNumCompileThreads(0);
+   // Builder.setNumCompileThreads(0);
     Builder.setCompileFunctionCreator(nullptr);
 
     mCPUDriverCompiler = std::make_unique<CPUDriverCompiler>(
                                   llvm::hardware_concurrency(numOfThreads),
-                                  *Builder.getJITTargetMachineBuilder(), features, *mAllLinkedSymbols,
+                                  *Builder.getJITTargetMachineBuilder(), features,
                                   mObjectCache.get());
 
     Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES, const Triple & TT) {
-        // jitlink::InProcessMemoryManager
         auto objLinker = std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager());
         objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
         return objLinker;
     });
 
     mEngine = cantFail(Builder.create());
-
 
     mCPUDriverCompiler->setEngine(mEngine.get());
 
@@ -1204,8 +1139,6 @@ void CPUDriver::generateUncachedKernels() {
     // NOTE: we currently require DCE and Mem2Reg for each kernel to eliminate any unnecessary scalar -> value
     // mappings made by the base KernelCompiler. That could be done in a more focused manner, however, as each
     // mapping is known.
-
-    // TODO: we don't want to have more contexts than our thread count will allow
 
     const auto numKernels = mUncachedKernel.size();
 

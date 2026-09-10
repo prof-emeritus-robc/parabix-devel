@@ -15,10 +15,6 @@ using boost::intrusive::detail::ceil_log2;
 using boost::intrusive::detail::ceil_pow2;
 using boost::intrusive::detail::is_pow2;
 
-inline unsigned getPageSize() {
-    return boost::interprocess::mapped_region::get_page_size();
-}
-
 using IntervalSet = boost::icl::interval_set<size_t>;
 
 using Interval = IntervalSet::interval_type;

@@ -29,6 +29,7 @@
 #include <boost/icl/interval_set.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <boost/intrusive/detail/math.hpp>
+#include <llvm/Support/Process.h>
 #include <boost/predef.h>
 #include <cxxabi.h>
 using boost::intrusive::detail::floor_log2;
@@ -90,6 +91,8 @@ using FixedVectorType = llvm::FixedVectorType;
 using namespace llvm;
 
 static int accumulatedFreeCalls = 0;
+
+const size_t CBuilder::PAGE_SIZE = sys::Process::getPageSizeEstimate();
 
 extern "C" void free_debug_wrapper(void * ptr) {
     if (accumulatedFreeCalls < codegen::FreeCallBisectLimit) {
@@ -747,7 +750,7 @@ Value * CBuilder::CreateMRemap(Value * addr, Value * oldSize, Value * newSize) {
         }
     } else { // no OS mremap support
         ptr = CreateAnonymousMMap(newSize);
-        CreateMemCpy(ptr, addr, oldSize, getPageSize());
+        CreateMemCpy(ptr, addr, oldSize, CBuilder::PAGE_SIZE);
         CreateMUnmap(addr, oldSize);
     }
     return ptr;
@@ -768,7 +771,7 @@ Value * CBuilder::CreateMUnmap(Value * addr, Value * len) {
         IntegerType * const intPtrTy = getIntPtrTy(DL);
         CreateAssert(len, "CreateMUnmap: length cannot be 0");
         Value * const addrValue = CreatePtrToInt(addr, intPtrTy);
-        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, getPageSize()));
+        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE));
         CreateAssertZero(pageOffset, "CreateMUnmap: addr must be a multiple of the page size");
         Value * const boundCheck = CreateICmpULT(addrValue, CreateSub(ConstantInt::getAllOnesValue(intPtrTy), CreateZExtOrTrunc(len, intPtrTy)));
         CreateAssert(boundCheck, "CreateMUnmap: addresses in [addr, addr+len) are outside the valid address space range");
@@ -793,7 +796,7 @@ Value * CBuilder::CreateMProtect(Value * addr, Value * size, const Protect prote
 
         auto & DL = getModule()->getDataLayout();
         IntegerType * const intPtrTy = getIntPtrTy(DL);
-        Constant * const pageSize = ConstantInt::get(intPtrTy, getPageSize());
+        Constant * const pageSize = ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE);
         CreateAssertZero(CreateURem(CreatePtrToInt(addr, intPtrTy), pageSize), "CreateMProtect: addr must be aligned to page boundary");
     }
 
@@ -1721,10 +1724,6 @@ CallInst * CBuilder::CreateRandCall() {
         randFunc->setCallingConv(CallingConv::C);
     }
     return CreateCall(randFunc->getFunctionType(), randFunc, {});
-}
-
-unsigned CBuilder::getPageSize() {
-    return boost::interprocess::mapped_region::get_page_size();
 }
 
 BasicBlock * CBuilder::WriteDefaultRethrowBlock() {

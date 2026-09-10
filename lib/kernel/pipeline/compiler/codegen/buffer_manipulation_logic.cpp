@@ -344,7 +344,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             b.CreateCondBr(needsRealloc, allocateNewBuffer, allocateNewBufferExit);
 
             b.SetInsertPoint(allocateNewBuffer);
-            Value * const allocedBytes = b.CreateRoundUpRational(mallocBytes, getPageSize());
+            Value * const allocedBytes = b.CreateRoundUpRational(mallocBytes, CBuilder::PAGE_SIZE);
             b.CreateFree(existingBuffer);
             Value * const newBuffer = b.CreateAlignedMalloc(allocedBytes, blockSize);
             b.CreateAlignedStore(newBuffer, mallocedPtr, PtrTyABIAlignment);

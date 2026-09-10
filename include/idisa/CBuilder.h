@@ -51,6 +51,8 @@ class CBuilder : public virtual llvm::IRBuilder<>, public LLVMTypeSystemInterfac
 
 public:
 
+    const static size_t PAGE_SIZE;
+
     CBuilder(llvm::LLVMContext & C);
 
     virtual ~CBuilder() {}
@@ -272,8 +274,6 @@ public:
     inline unsigned getCacheAlignment() const {
         return mCacheLineAlignment;
     }
-
-    static LLVM_READNONE unsigned getPageSize();
 
     virtual llvm::LoadInst* CreateAtomicLoadAcquire(llvm::Type * type, llvm::Value * ptr);
 

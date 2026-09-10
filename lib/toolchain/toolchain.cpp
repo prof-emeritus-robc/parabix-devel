@@ -36,10 +36,6 @@ using namespace llvm;
 
 namespace codegen {
 
-inline unsigned getPageSize() {
-    return boost::interprocess::mapped_region::get_page_size();
-}
-
 llvm::StringMap<bool> GetFeatureNames() {
     StringMap<bool> features;
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(19, 0, 0)

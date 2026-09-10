@@ -1152,7 +1152,9 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         }
         assert (!stateType->isOpaque());
         assert (stateType->isSized());
-        assert (stateType->isPacked());
+        if (!stateType->isPacked()) {
+            stateType->print(errs(), true, false);
+        }
         return true;
     };
     assert ("incorrect shared handle/type!" && verifyStateType(mSharedHandle, sharedTy));

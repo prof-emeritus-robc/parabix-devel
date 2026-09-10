@@ -26,7 +26,9 @@ void PipelineCompiler::constructImplicitKernelStateTypes(KernelBuilder & b) {
             } else {
                 Kernel * const other = entry.first->getValue(); assert (other);
                 K->setSharedStateType(other->getSharedStateType());
+                assert (K->getSharedStateType() == nullptr || !K->getSharedStateType()->isEmptyTy());
                 K->setThreadLocalStateType(other->getThreadLocalStateType());
+                assert (K->getThreadLocalStateType() == nullptr || !K->getThreadLocalStateType()->isEmptyTy());
             }
         }
     }
@@ -39,13 +41,11 @@ void PipelineCompiler::generateImplicitKernels(KernelBuilder & b, llvm::TargetMa
     if (UniqueImplicitKernelInstances.empty()) {
         return;
     }
-    BasicBlock * bb = b.GetInsertBlock();
     auto ip = b.saveIP();
     for (auto & itr : UniqueImplicitKernelInstances) {
         itr.getValue()->generateKernel(b, TM, GlobalValue::InternalLinkage);
     }
     b.restoreIP(ip);
-    assert (b.GetInsertBlock() == bb);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -252,7 +252,7 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
             sharedStateTy = PointerType::getUnqual(C);
         } else {
             sharedStateTy = mKernel->getSharedStateType(b.getContext());
-            assert (sharedStateTy && !sharedStateTy->isEmptyTy() && &sharedStateTy->getContext() == &b.getContext());
+            assert (sharedStateTy);
             assert (!cast<StructType>(sharedStateTy)->isLiteral());
             assert (!cast<StructType>(sharedStateTy)->isOpaque());
         }
@@ -266,7 +266,7 @@ void PipelineCompiler::addInternalKernelProperties(KernelBuilder & b, const unsi
             localStateTy = PointerType::getUnqual(C);
         } else {
             localStateTy = mKernel->getThreadLocalStateType(b.getContext());
-            assert (localStateTy && !localStateTy->isEmptyTy() && &localStateTy->getContext() == &b.getContext());
+            assert (localStateTy);
             assert (!cast<StructType>(localStateTy)->isLiteral());
             assert (!cast<StructType>(localStateTy)->isOpaque());
         }

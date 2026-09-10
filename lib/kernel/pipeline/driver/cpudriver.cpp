@@ -297,7 +297,6 @@ public:
         if (Sleeping) cv.notify_all();
     }
 
-
 private:
     std::array<CircularBuffer, OBJECT_QUEUE_PRIORITY_LEVELS> ObjectQueues;
     std::vector<CircularTaskBuffer> TaskQueues;
@@ -324,6 +323,253 @@ struct DebugPrintingResult {
 };
 
 
+class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
+    using Mem = llvm::sys::Memory;
+    using Block = llvm::sys::MemoryBlock;
+
+    constexpr static uintptr_t DEFAULT_SLAB_SIZE = 10ULL * 1024ULL * 1024ULL;
+
+    struct SlabNode {
+        Block Slab;
+        std::atomic<uintptr_t> AllocatedOffset;
+        SlabNode * Next;
+
+        SlabNode(const size_t size)
+        : Slab([size](){
+            std::error_code EC;
+            const auto alignedSize = llvm::alignToPowerOf2(size, getPageSize());
+            auto slab = Mem::allocateMappedMemory(alignedSize, nullptr, Mem::MF_READ | Mem::MF_WRITE, EC);
+            if (EC) {
+                SmallVector<char, 256> tmp;
+                raw_svector_ostream msg(tmp);
+                msg << "JITMemoryManager: failed to allocate "
+                    << size << " bytes: " << llvm::errorCodeToError(EC);
+                report_fatal_error(msg.str());
+            }
+            return slab;
+        }())
+        , AllocatedOffset(reinterpret_cast<uintptr_t>(Slab.base()))
+        , Next(nullptr) {
+
+        }
+
+        ~SlabNode() {
+            Mem::releaseMappedMemory(Slab);
+        }
+
+    };
+
+public:
+
+    CPUDriverJITMemoryManager()
+    : DataSlab(DEFAULT_SLAB_SIZE)
+    , CurrentDataSlab(&DataSlab)
+    , ExecSlab(DEFAULT_SLAB_SIZE)
+    , CurrentExecSlab(&ExecSlab) {
+
+    }
+
+    void allocate(const jitlink::JITLinkDylib * JD, jitlink::LinkGraph & G, OnAllocatedFunction onAllocated) override {
+        size_t totalDataSize = 0;
+        uint64_t firstDataAlign = 0;
+        size_t totalExecSize = 0;
+        uint64_t firstExecAlign = 0;
+
+        std::vector<const char*> originalPosition;
+
+        for (auto & S : G.sections()) {
+
+            const auto isExec = (S.getMemProt() & MemProt::Exec) != MemProt::None;
+
+            auto firstAlign = isExec ? firstExecAlign : firstDataAlign;
+            auto totalSize = isExec ? totalExecSize : totalDataSize;
+
+
+            for (auto & B : S.blocks()) {
+
+                originalPosition.push_back(B->getContent().data());
+
+
+                const auto align = B->getAlignment(); assert (align);
+                if (firstAlign == 0) {
+                    assert (totalSize == 0);
+                    firstAlign = align;
+                } else {
+                    totalSize = llvm::alignTo(totalSize, align);
+                }
+                totalSize += B->getSize();
+            }
+
+            if (isExec) {
+                firstExecAlign = firstAlign;
+                totalExecSize = totalSize;
+            } else {
+                firstDataAlign = firstAlign;
+                totalDataSize = totalSize;
+            }
+
+        }
+
+        assert (totalExecSize == 0 || firstExecAlign);
+        assert (totalDataSize == 0 || firstDataAlign);
+
+
+        uintptr_t execOffset = 0;
+        if (totalExecSize) {
+            execOffset = allocateFromSlab(CurrentExecSlab, firstExecAlign, totalExecSize, ExecSlabAllocationMutex);
+        }
+
+        uintptr_t dataOffset = 0;
+        if (totalDataSize) {
+            dataOffset = allocateFromSlab(CurrentDataSlab, firstDataAlign, totalDataSize, DataSlabAllocationMutex);
+        }
+
+        auto checkItr = originalPosition.begin();
+
+        for (auto & S : G.sections()) {
+
+            const auto isExec = (S.getMemProt() & MemProt::Exec) != MemProt::None;
+            auto offset = isExec ? execOffset : dataOffset;
+
+            for (auto & B : S.blocks()) {
+                offset = llvm::alignTo(offset, B->getAlignment());
+                const auto s = B->getSize();
+                char * const p = reinterpret_cast<char*>(offset);
+                assert (*checkItr == B->getContent().data());
+                if (B->isZeroFill()) {
+                    std::memset(p, 0, s);
+                } else if (LLVM_LIKELY(s > 0)) {
+                    const char * const existing = B->getContent().data();
+                    assert (*checkItr == existing);
+                    assert (existing);
+                    std::memcpy(p, existing, s);
+                    B->setMutableContent(MutableArrayRef{p, s});
+                }
+                B->setAddress(orc::ExecutorAddr(offset));
+                offset += s;
+                ++checkItr;
+            }
+            if (isExec) {
+                execOffset = offset;
+            } else {
+                dataOffset = offset;
+            }
+        }
+
+
+        class NoOpInFlightAlloc : public InFlightAlloc {
+        public:
+            void finalize(OnFinalizedFunction onFinalize) override {
+                onFinalize(FinalizedAlloc());
+            }
+            void abandon(OnAbandonedFunction onAbandon) override {
+                onAbandon(Error::success());
+            }
+        };
+
+        onAllocated(std::make_unique<NoOpInFlightAlloc>());
+
+    }
+
+
+
+    void deallocate(std::vector<FinalizedAlloc> Allocs, OnDeallocatedFunction OnDeallocated) override {
+        OnDeallocated(Error::success());
+    }
+
+    void finalizeExecSlabs() {
+        std::lock_guard<std::mutex> L(ExecSlabAllocationMutex);
+        SlabNode * n = &ExecSlab;
+        for (;;) {
+            const auto start = reinterpret_cast<uintptr_t>(n->Slab.base());
+            const auto end = n->AllocatedOffset.load(std::memory_order_relaxed);
+            if (LLVM_LIKELY(start != end)) {
+                const auto ec = Mem::protectMappedMemory(n->Slab, Mem::MF_READ | Mem::MF_EXEC);
+                if (ec) {
+                    report_fatal_error(errorCodeToError(ec));
+                    return;
+                }
+            }
+            n = n->Next;
+            if (LLVM_LIKELY(n == nullptr)) {
+                break;
+            }
+        }
+    };
+
+
+    ~CPUDriverJITMemoryManager() override {
+        BEGIN_SCOPED_REGION
+        SlabNode * slab = ExecSlab.Next;
+        while (slab) {
+            SlabNode * next = slab->Next;
+            delete slab;
+            slab = next;
+        }
+        ExecSlab.Next = nullptr;
+        END_SCOPED_REGION
+        BEGIN_SCOPED_REGION
+        SlabNode * slab = DataSlab.Next;
+        while (slab) {
+            SlabNode * next = slab->Next;
+            delete slab;
+            slab = next;
+        }
+        DataSlab.Next = nullptr;
+        END_SCOPED_REGION
+    }
+
+private:
+
+    inline uintptr_t allocateFromSlab(std::atomic<SlabNode *> & CurrentSlab,
+                                      const uintptr_t firstBlockAlign, const uintptr_t totalSize,
+                                      std::mutex & mutex) {
+
+        SlabNode * currentSlab = CurrentSlab.load(std::memory_order_acquire);
+
+        for (;;) {
+
+            const auto & S = currentSlab->Slab;
+            const auto endAddress = reinterpret_cast<uintptr_t>(S.base()) + S.allocatedSize();
+
+            auto & allocatedOffset = currentSlab->AllocatedOffset;
+            auto current = allocatedOffset.load(std::memory_order_relaxed);
+            for (;;) {
+                const auto offset = llvm::alignTo(current, firstBlockAlign);
+                const auto nextOffset = offset + totalSize;
+                if (LLVM_UNLIKELY(nextOffset > endAddress)) {
+                    std::lock_guard<std::mutex> L(mutex);
+                    SlabNode * nextSlab = CurrentSlab.load(std::memory_order_acquire);
+                    if (nextSlab == currentSlab) {
+                        const auto minSize = llvm::alignToPowerOf2(totalSize * 4, getPageSize());
+                        const auto allocSize = std::max<uintptr_t>(DEFAULT_SLAB_SIZE, minSize);
+                        nextSlab = new SlabNode(allocSize);
+                        assert (currentSlab->Next == nullptr);
+                        currentSlab->Next = nextSlab;
+                        CurrentSlab.store(nextSlab, std::memory_order_relaxed);
+                    }
+                    currentSlab = nextSlab;
+                    break;
+                }
+
+                if (allocatedOffset.compare_exchange_weak(current, nextOffset, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    return offset;
+                }
+            }
+        }
+    }
+
+private:
+    SlabNode ExecSlab;
+    std::atomic<SlabNode *> CurrentExecSlab;
+    std::mutex ExecSlabAllocationMutex;
+
+    SlabNode DataSlab;
+    std::atomic<SlabNode *> CurrentDataSlab;
+    std::mutex DataSlabAllocationMutex;
+
+};
+
 class CPUDriverCompiler {
 
     using MemoryBufferVector = std::vector<std::unique_ptr<MemoryBuffer>>;
@@ -336,9 +582,10 @@ public:
     : Engine(nullptr)
     , ObjectCache(objCache)
     , WorkQueue(8)
-    , Contexts(strategy.ThreadsRequested, nullptr) {
+    , Contexts(strategy.ThreadsRequested, nullptr)
+    , JITMemoryManager() {
 
-        // NOTE: THe pipeline may read information from other kernels to determine their state types and convert them
+        // NOTE: The pipeline may read information from other kernels to determine their state types and convert them
         // to its own LLVMContext as needed. We preserve the contexts as long as this compiler exists.
         for (size_t i = 0; i < strategy.ThreadsRequested; ++i) {
             Contexts[i] = new CPUDriverContext(JTMB, features, symbolList);
@@ -362,7 +609,7 @@ public:
                             case CPUDriverTaskType::ObjectCode:
                                 assert (taskIndex == std::numeric_limits<size_t>::max());
                                 materializeObject(ctx, toExecute.Target, toExecute.TargetModule);
-                                addFinalObjectCodeToLLJIT();
+                          //      addFinalObjectCodeToLLJIT();
                                 break;
                             case CPUDriverTaskType::Declaration:
                                 assert (taskIndex != std::numeric_limits<size_t>::max());
@@ -406,7 +653,7 @@ public:
         for (auto & t : Threads) {
             if (t.joinable()) t.join();
         }
-        addFinalObjectCodeToLLJIT();
+//        addFinalObjectCodeToLLJIT();
         for (auto & C : Contexts) {
             auto & S = C->NewSymbolList;
             DriverLinkedSymbols->insert(S.begin(), S.end());
@@ -437,6 +684,7 @@ public:
         if (!sym) {
             report_fatal_error(sym.takeError());
         }
+        JITMemoryManager.finalizeExecSlabs();
         printDebugOutput();
         return sym->toPtr<void*>();
 
@@ -454,6 +702,10 @@ public:
         for (auto & C : Contexts) {
             delete C;
         }
+    }
+
+    CPUDriverJITMemoryManager & getJITMemoryManager() {
+        return JITMemoryManager;
     }
 
 private:
@@ -516,10 +768,14 @@ private:
 
                 Target->linkExternalMethods(builder);
 
-                BEGIN_SCOPED_REGION
-                std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-                AddObjectCodeList.emplace_back(std::move(cached));
-                END_SCOPED_REGION
+                auto & linker = Engine->getObjLinkingLayer();
+                auto & JITLib = Engine->getMainJITDylib();
+                cantFail(linker.add(JITLib, std::move(cached)));
+
+//                BEGIN_SCOPED_REGION
+//                std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+//                AddObjectCodeList.emplace_back(std::move(cached));
+//                END_SCOPED_REGION
                 goto record_decl;
             }
         }
@@ -675,10 +931,14 @@ record_decl:
 
         delete M;
 
-        BEGIN_SCOPED_REGION
-        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-        AddObjectCodeList.emplace_back(std::move(objCode));
-        END_SCOPED_REGION
+        auto & linker = Engine->getObjLinkingLayer();
+        auto & JITLib = Engine->getMainJITDylib();
+        cantFail(linker.add(JITLib, std::move(objCode)));
+
+//        BEGIN_SCOPED_REGION
+//        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+//        AddObjectCodeList.emplace_back(std::move(objCode));
+//        END_SCOPED_REGION
 
         if (LLVM_UNLIKELY(IROutput.size() || OptIROutput.size() || ASMOutput.size())) {
             recordDebugPrintResult(Target, std::move(IROutput), std::move(OptIROutput), std::move(ASMOutput));
@@ -734,34 +994,38 @@ record_decl:
 
         auto result = std::make_unique<SmallVectorMemoryBuffer>(std::move(objBuffer), false);
 
-        BEGIN_SCOPED_REGION
-        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-        AddObjectCodeList.emplace_back(std::move(result));
-        END_SCOPED_REGION
+        auto & linker = Engine->getObjLinkingLayer();
+        auto & JITLib = Engine->getMainJITDylib();
+        cantFail(linker.add(JITLib, std::move(result)));
+
+//        BEGIN_SCOPED_REGION
+//        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+//        AddObjectCodeList.emplace_back(std::move(result));
+//        END_SCOPED_REGION
 
         END_SCOPED_REGION
 
     }
 
-    bool addFinalObjectCodeToLLJIT() {
-        size_t e = 0;
-        if (!AddObjectCodeInProcess.compare_exchange_weak(e, 1, std::memory_order_release, std::memory_order_relaxed)) {
-            return false;
-        }
-        MemoryBufferVector objCodeList;
-        BEGIN_SCOPED_REGION
-        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
-        if (AddObjectCodeList.empty()) {
-            return false;
-        }
-        objCodeList.swap(AddObjectCodeList);
-        END_SCOPED_REGION
-        for (auto & buffer : objCodeList) {
-            cantFail(Engine->addObjectFile(std::move(buffer)));
-        }
-        AddObjectCodeInProcess.store(0, std::memory_order_release);
-        return true;
-    }
+//    bool addFinalObjectCodeToLLJIT() {
+//        size_t e = 0;
+//        if (!AddObjectCodeInProcess.compare_exchange_weak(e, 1, std::memory_order_release, std::memory_order_relaxed)) {
+//            return false;
+//        }
+//        MemoryBufferVector objCodeList;
+//        BEGIN_SCOPED_REGION
+//        std::lock_guard<std::mutex> L(AddObjectCodeMutex);
+//        if (AddObjectCodeList.empty()) {
+//            return false;
+//        }
+//        objCodeList.swap(AddObjectCodeList);
+//        END_SCOPED_REGION
+//        for (auto & buffer : objCodeList) {
+//            cantFail(Engine->addObjectFile(std::move(buffer)));
+//        }
+//        AddObjectCodeInProcess.store(0, std::memory_order_release);
+//        return true;
+//    }
 
     void recordDebugPrintResult(Kernel * const kernel, SmallVector<char, 0> && UnoptIR, SmallVector<char, 0> && OptIR, SmallVector<char, 0> && ASM) {
         std::lock_guard<std::mutex> L(DebugPrintMutex);
@@ -832,11 +1096,13 @@ private:
 
     std::vector<CPUDriverContext *>                 Contexts;
 
+    CPUDriverJITMemoryManager                       JITMemoryManager;
+
     std::mutex                                      PrecompiledStateObjectMutex;
 
-    std::atomic<size_t>                             AddObjectCodeInProcess;
-    std::mutex                                      AddObjectCodeMutex;
-    MemoryBufferVector                              AddObjectCodeList;
+//    std::atomic<size_t>                             AddObjectCodeInProcess;
+//    std::mutex                                      AddObjectCodeMutex;
+//    MemoryBufferVector                              AddObjectCodeList;
 
     std::vector<std::thread>                        Threads;
 
@@ -892,16 +1158,17 @@ CPUDriver::CPUDriver(std::string && moduleName)
     Builder.setNumCompileThreads(0);
     Builder.setCompileFunctionCreator(nullptr);
 
-    Builder.setObjectLinkingLayerCreator([](ExecutionSession & ES, const Triple & TT) {
-        auto objLinker = std::make_unique<ObjectLinkingLayer>(ES, std::make_unique<jitlink::InProcessMemoryManager>(getPageSize()));
-        objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
-        return objLinker;
-    });
-
     mCPUDriverCompiler = std::make_unique<CPUDriverCompiler>(
                                   llvm::hardware_concurrency(numOfThreads),
                                   *Builder.getJITTargetMachineBuilder(), features, *mAllLinkedSymbols,
                                   mObjectCache.get());
+
+    Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES, const Triple & TT) {
+        // jitlink::InProcessMemoryManager
+        auto objLinker = std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager());
+        objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
+        return objLinker;
+    });
 
     mEngine = cantFail(Builder.create());
 
@@ -991,7 +1258,6 @@ llvm::Function * CPUDriver::LinkFunction(llvm::StringRef unmangledName, llvm::Fu
     Function * f = mMainModule->getFunction(unmangledName);
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mMainModule);
-        auto & ES = mEngine->getExecutionSession();
         MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
         auto symbol = M(unmangledName);
         auto addr = orc::ExecutorAddr::fromPtr(functionPointer);

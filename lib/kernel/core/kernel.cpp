@@ -284,11 +284,6 @@ void Kernel::generateKernel(KernelBuilder & b, llvm::TargetMachine * TM, llvm::G
 void Kernel::loadCachedKernel(const Module * m) {
 
     SmallVector<char, 256> tmp;
-//    auto strShared = concat(getName(), SHARED_SUFFIX, tmp);
-//    mSharedStateType = StructType::getTypeByName(m->getContext(), strShared);
-//    auto strThreadLocal= concat(getName(), THREAD_LOCAL_SUFFIX, tmp);
-//    mThreadLocalStateType = StructType::getTypeByName(m->getContext(), strThreadLocal);
-
     auto structTypeMetadata = m->getNamedMetadata(getName() + STATE_TYPE_METADATA_SUFFIX);
     assert (structTypeMetadata);
     assert (structTypeMetadata->getNumOperands() == 1);

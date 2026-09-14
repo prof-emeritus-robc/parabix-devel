@@ -795,7 +795,7 @@ protected:
                 cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
                 BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
             }
-            PabloAST * fire = body.createAnd(fireStart, BstartAtA);
+            PabloAST * fire = body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
                 PabloAST * bAhead = grpBoundary ? grpBoundary->at(r.lenA)
                     : LookaheadInGate ? body.createLookahead(boundaryBit, (int64_t) r.lenA)
@@ -939,7 +939,7 @@ protected:
                 bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
             cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
             PabloAST * BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
-            PabloAST * fire = body.createAnd(fireStart, BstartAtA);
+            PabloAST * fire = body.createAnd(fireStart, BstartAtA, "chainfire_" + std::to_string(r.idA) + "_"  + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {
                 PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
                 fire = body.createAnd(fire, body.createNot(bAhead));

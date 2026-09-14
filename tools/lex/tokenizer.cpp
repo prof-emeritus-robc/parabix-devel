@@ -36,6 +36,8 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <string_view>
+#include <cstring>
 #include <vector>
 #include <algorithm>
 #include <sys/stat.h>
@@ -107,21 +109,12 @@ static inline size_t charContaining(size_t p) {
 
 static void resetOffsetState() { gPos = 0; gLeads = 0; }
 
-// bpe_emit_token
-// Called once per surviving BPE token by the scan::Reader stage.
-// id_ptr points into the 16-bit vocab-ID stream at the match-end byte
-// position. The reader passes a single source pointer indexed by the
-// match-end byte offset, so we just deref to recover the full ID.
-extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
+// Shared print/offset logic for one token (id + its decoded display string).
+// Used both by the scan callback (bpe_emit_token, below) and by the special-
+// token splice in runBPEWithSpecialTokens (<|endoftext|> is spliced directly
+// into the output, never seen by the compiled pipeline).
+static void emitToken(uint16_t id, const std::string & tokStr) {
     if (gBenchQuiet) return;   // timing loop: skip output, measure tokenization only
-    uint16_t id = *id_ptr;
-    if (getenv("BPE_EMIT_DBG")) {
-        const uint8_t * bp = reinterpret_cast<const uint8_t *>(id_ptr);
-        std::fprintf(stderr, "[emit] id=%u  lo=%u hi=%u  ptr=%p\n",
-                     (unsigned)id, (unsigned)bp[0], (unsigned)bp[1], (const void*)id_ptr);
-    }
-
-    const std::string tokStr = gBPE ? gBPE->decodeToken(static_cast<int>(id)) : std::string();
 
     if (gOffsetMode != OffNone) {
         // Source byte length = codepoint count of the display string.
@@ -155,6 +148,72 @@ extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
         llvm::outs() << id << '\t' << tokStr << "\n";
     else
         llvm::outs() << id << "\n";
+}
+
+// bpe_emit_token
+// Called once per surviving BPE token by the scan::Reader stage.
+// id_ptr points into the 16-bit vocab-ID stream at the match-end byte
+// position. The reader passes a single source pointer indexed by the
+// match-end byte offset, so we just deref to recover the full ID.
+extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
+    if (gBenchQuiet) return;   // timing loop: skip output, measure tokenization only
+    uint16_t id = *id_ptr;
+    if (getenv("BPE_EMIT_DBG")) {
+        const uint8_t * bp = reinterpret_cast<const uint8_t *>(id_ptr);
+        std::fprintf(stderr, "[emit] id=%u  lo=%u hi=%u  ptr=%p\n",
+                     (unsigned)id, (unsigned)bp[0], (unsigned)bp[1], (const void*)id_ptr);
+    }
+    const std::string tokStr = gBPE ? gBPE->decodeToken(static_cast<int>(id)) : std::string();
+    emitToken(id, tokStr);
+}
+
+// ─── Special-token bypass: "<|endoftext|>" ─────────────────────────────────
+// GPT-2's tokenizer.json has exactly one `added_tokens` entry: "<|endoftext|>",
+// id 50256. HuggingFace's AddedVocabulary matches it as a literal string BEFORE
+// byte-level BPE runs, splitting it out of the text so ordinary merges never
+// see it. Reproduced here at the host level — no pipeline/kernel changes —
+// since it's a one-off literal match, not worth a dedicated Pablo kernel:
+// find each occurrence, run the compiled BPE pipeline independently on the
+// plain-text segments around it, and splice the fixed id in between.
+static constexpr char     kSpecialTokenText[] = "<|endoftext|>";
+static constexpr size_t   kSpecialTokenLen    = sizeof(kSpecialTokenText) - 1;  // 13
+static constexpr uint16_t kSpecialTokenId     = 50256;
+
+static void emitSpecialToken() {
+    static const std::string tokStr(kSpecialTokenText);
+    emitToken(kSpecialTokenId, tokStr);
+}
+
+// bpeFn requires a 64-byte aligned input buffer (see the mmap comment in main:
+// "MemorySourceKernel's alignment requirement"). A mid-file segment's raw
+// pointer (buf + offset) has no such guarantee, so copy each segment into a
+// freshly aligned buffer before calling into the pipeline.
+using BPEFnPtr = void (*)(const char *, size_t);
+static void runBPESegment(BPEFnPtr bpeFn, const char * data, size_t len) {
+    if (len == 0) return;
+    void * aligned = nullptr;
+    if (posix_memalign(&aligned, 64, len) != 0) {
+        llvm::errs() << "Error: aligned allocation failed for a " << len << "-byte BPE segment.\n";
+        return;
+    }
+    std::memcpy(aligned, data, len);
+    bpeFn(static_cast<const char *>(aligned), len);
+    free(aligned);
+}
+
+static void runBPEWithSpecialTokens(BPEFnPtr bpeFn, const char * buf, size_t nbytes) {
+    std::string_view text(buf, nbytes);
+    size_t pos = 0;
+    for (;;) {
+        size_t hit = text.find(kSpecialTokenText, pos);
+        if (hit == std::string_view::npos) {
+            runBPESegment(bpeFn, buf + pos, nbytes - pos);
+            return;
+        }
+        if (hit > pos) runBPESegment(bpeFn, buf + pos, hit - pos);
+        emitSpecialToken();
+        pos = hit + kSpecialTokenLen;
+    }
 }
 
 static cl::OptionCategory wordBreakerFlags("Command Flags", "Unicode word breaker options");
@@ -595,7 +654,7 @@ int main(int argc, char *argv[]) {
 
         auto __tRun0 = std::chrono::steady_clock::now();
         resetOffsetState();
-        bpeFn(buf, nbytes);
+        runBPEWithSpecialTokens(bpeFn, buf, nbytes);
         auto __tRun1 = std::chrono::steady_clock::now();
         std::cerr << "[BPE] run (execute pipeline): "
                   << std::chrono::duration<double, std::milli>(__tRun1 - __tRun0).count()

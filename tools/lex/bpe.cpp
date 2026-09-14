@@ -764,7 +764,7 @@ protected:
         // guarantees no rule's fire touches a position another same-kernel rule reads 
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
             cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);
-            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask);
+            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask, "Astart_" + std::to_string(id));
         };
 
         // One rule's fire → B-detect + stamp all idAB bits + consume B, all inside `body`
@@ -779,21 +779,22 @@ protected:
             //indexed mode reads the next-live id, byte mode reads lenA ahead via LookAhead.
             // Peek source precedence: indexed nextId > group-cache > per-rule in-gate > hoisted.
             PabloAST * BstartAtA;
+            const std::string bstartName = "Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB);
             if (mUseNextId) {
                 cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
-                BstartAtA = ccNext.compileCC(re::makeCC(r.idB), body);
+                BstartAtA = ccNext.compileCC(bstartName, re::makeCC(r.idB), body);
             } else if (grpAhead) {   // chunk-cached shared peek (built once per lenA in the gate)
                 cc::Parabix_CC_Compiler_Builder ccAhead(grpAhead->at(r.lenA));
-                BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
+                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
             } else if (LookaheadInGate) {
                 std::vector<PabloAST*> bits(W);
                 for (unsigned i = 0; i < W; i++)
                     bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
                 cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-                BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
+                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
             } else {
                 cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
-                BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
+                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
             }
             PabloAST * fire = body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
@@ -809,15 +810,16 @@ protected:
             // fireByLen) when deferMask allows it; otherwise it's applied right here,
             // eagerly, exactly like the non-batch path below — see groupNeedsLiveMask.
             if (batch) {
-                body.createAssign(anyFire, body.createOr(anyFire, fire));
+                const std::string ruleTag = std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB);
+                body.createAssign(anyFire, body.createOr(anyFire, fire, "anyFire_" + ruleTag));
                 for (unsigned i = 0; i < W_out; i++)
                     if ((r.idAB >> i) & 1u)
-                        body.createAssign(setBit[i], body.createOr(setBit[i], fire));
+                        body.createAssign(setBit[i], body.createOr(setBit[i], fire, "setBit" + std::to_string(i) + "_" + ruleTag));
                 if (deferMask) {
                     Var * fl = fireByLen.at(r.lenA);
-                    body.createAssign(fl, body.createOr(fl, fire));
+                    body.createAssign(fl, body.createOr(fl, fire, "fireByLen" + std::to_string(r.lenA) + "_" + ruleTag));
                 } else {
-                    PabloAST * removeAt = body.createAdvance(fire, r.lenA);
+                    PabloAST * removeAt = body.createAdvance(fire, r.lenA, "removeAt_" + ruleTag);
                     body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(removeAt)));
                 }
                 return;
@@ -829,13 +831,14 @@ protected:
             // remove B) 
             PabloAST * stampAt;   // where idAB is written
             PabloAST * removeAt;  // which start is cleared from the live mask
+            const std::string ruleTag = std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB);
             if (mUseNextId) {
-                PabloAST * fireB = body.createIndexedAdvance(fire, meInFrozen, 1);
+                PabloAST * fireB = body.createIndexedAdvance(fire, meInFrozen, 1, "fireB_" + ruleTag);
                 stampAt  = fireB;   // merged id lands at B (2nd position)
                 removeAt = fire;    // A's start removed; B survives as AB
             } else {
                 stampAt  = fire;                        // merged id at A's start
-                removeAt = body.createAdvance(fire, r.lenA);  // B's start removed; A survives
+                removeAt = body.createAdvance(fire, r.lenA, "removeAt_" + ruleTag);  // B's start removed; A survives
             }
             // Stamp all W_out bits of idAB at stampAt (inside the gate → block-skippable).
             PabloAST * notStamp = body.createNot(stampAt);
@@ -938,7 +941,7 @@ protected:
             for (unsigned i = 0; i < W; i++)
                 bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
             cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-            PabloAST * BstartAtA = ccAhead.compileCC(re::makeCC(r.idB), body);
+            PabloAST * BstartAtA = ccAhead.compileCC("Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB), re::makeCC(r.idB), body);
             PabloAST * fire = body.createAnd(fireStart, BstartAtA, "chainfire_" + std::to_string(r.idA) + "_"  + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {
                 PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
@@ -951,7 +954,7 @@ protected:
                 else
                     body.createAssign(idAcc[i], body.createAnd(idAcc[i], notStamp));
             }
-            PabloAST * removeAt = body.createAdvance(fire, r.lenA);
+            PabloAST * removeAt = body.createAdvance(fire, r.lenA, "removeAt_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             body.createAssign(inPlayMask, body.createAnd(inPlayMask, body.createNot(removeAt)));
             return fire;
         };

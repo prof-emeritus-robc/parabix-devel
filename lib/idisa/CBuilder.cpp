@@ -1140,13 +1140,13 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
 
         Value * const vaList = CreatePointerCast(CreateAlignedAlloca(vaListTy, mCacheLineAlignment), int8PtrTy);
         FunctionType * vaFuncTy = FunctionType::get(voidTy, { int8PtrTy }, false);
-        #ifdef BOOST_ARCH_ARM_AVAILABLE
-        Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start.p0", m);
-        Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end.p0", m);
-        #else
+//        #ifdef BOOST_ARCH_ARM_AVAILABLE
+//        Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start.p0", m);
+//        Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end.p0", m);
+//        #else
         Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start", m);
         Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end", m);
-        #endif
+//        #endif
         CreateCondBr(assertion, success, failure);
 
         SetInsertPoint(failure);

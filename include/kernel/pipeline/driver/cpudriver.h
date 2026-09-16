@@ -3,9 +3,7 @@
 #include <kernel/pipeline/driver/driver.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 
-namespace {
 class CPUDriverCompiler;
-}
 
 class CPUDriver final : public BaseDriver {
 

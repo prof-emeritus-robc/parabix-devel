@@ -697,7 +697,7 @@ int main(int argc, char *argv[]) {
     } else {
         fn(xlated, fd);
         close(fd);
-        write(STDOUT_FILENO, xlated.data(), xlated.length());
+        std::ignore = write(STDOUT_FILENO, xlated.data(), xlated.length());
     }
     return 0;
 }

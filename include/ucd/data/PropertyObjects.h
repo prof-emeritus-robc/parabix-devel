@@ -8,6 +8,7 @@
 #include "PropertyAliases.h"
 #include "PropertyValueAliases.h"
 #include <ucd/core/unicode_set.h>
+#include <memory>
 #include <string>
 #include <vector>
 #include <ucd/utf/transchar.h>

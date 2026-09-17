@@ -67,8 +67,6 @@ using AttrId = kernel::Attribute::KindId;
 // in their constructors. The pipeline is the only know exception. Thus very few dependencies would be needed.
 
 
-namespace {
-
 struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
     std::unique_ptr<llvm::TargetMachine>    TargetMachine;
     std::unique_ptr<KernelBuilder>          Builder;
@@ -1055,8 +1053,6 @@ private:
     SmallVector<DebugPrintingResult, 0>             DebugPrintResults;
 
 };
-
-} // end of anon namespace
 
 ATTRIBUTE_NO_SANITIZE_ADDRESS
 CPUDriver::CPUDriver(std::string && moduleName)

@@ -276,7 +276,7 @@ Value * IDISA_AVX2_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
         return CreateShuffleVector(packed, UndefValue::get(fwVectorType(64)), shuffleMask);
     }
     // Otherwise use default logic.
-    return IDISA_Builder::hsimd_packus(fw, a, b);
+    return IDISA_Builder::hsimd_packss(fw, a, b);
 }
 
 std::pair<Value *, Value *> IDISA_AVX2_Builder::bitblock_add_with_carry(Value * e1, Value * e2, Value * carryin) {

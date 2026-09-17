@@ -1137,17 +1137,8 @@ Value * IDISA_Builder::mvmd_dslli(unsigned fw, Value * a, Value * b, unsigned sh
 //  Generic mvmd_shuffle reduces to byte shuffling at the native SIMD width.
 Value * IDISA_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector, ShuffleMode mode) {
     auto vec_width = getVectorBitWidth(data_table);
-    //llvm::errs() << "IDISA_Builder::mvmd_shuffle , vec_width = " << vec_width << ", fw = " << fw << "\n";
-    if (vec_width == fw) {
-        // Special case for a vector with a single field.
-        if (mode == ShuffleMode::TruncateIndex) {
-            return data_table;
-        }
-        Value * isIndex0 = CreateIsNull(index_vector);
-        return CreateSelect(isIndex0, data_table, ConstantInt::getNullValue(data_table->getType()));
-    }
+    auto fieldCount = vec_width/fw;
     if (vec_width > mNativeBitBlockWidth) {
-        auto fieldCount = vec_width/fw;
         if (fw >= 16) {
             Value * t0 = CreateHalfVectorLow(data_table);
             Value * t1 = CreateHalfVectorHigh(data_table);
@@ -1182,9 +1173,8 @@ Value * IDISA_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * ind
             return fwCast(fw, CreateDoubleVector(shuf0, shuf1));
         }
     }
-    if ((vec_width == mNativeBitBlockWidth) && ((fw == 16) || (fw == 32) || (fw == 64))) {
+    if ((fieldCount > 2) && ((fw == 16) || (fw == 32) || (fw == 64))) {
         // Create a table for shuffling with smaller field widths.
-        const unsigned fieldCount = vec_width/fw;
         Constant * fieldMask = getSplat(fieldCount, ConstantInt::get(getIntNTy(fw), fieldCount - 1));
         Value * inbounds_idx = simd_and(index_vector, fieldMask);
         ConstantInt * multiplier = 0;
@@ -1209,7 +1199,36 @@ Value * IDISA_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * ind
         }
         return fwCast(fw, mvmd_shuffle(8, data_table, narrowed_idx, mode));
     }
-    UnsupportedFieldWidthError(fw, "mvmd_shuffle");
+    data_table = fwCast(fw, data_table);
+    index_vector = fwCast(fw, index_vector);
+    Value * outMask = nullptr;
+    Value * fnMaskVec = ConstantVector::getSplat(ElementCount::getFixed(fieldCount),
+                                                 ConstantInt::get(getContext(), APInt(fw, fieldCount - 1)));
+    switch (mode) {
+    default:
+    case ShuffleMode::TruncateIndex:
+        assert(mode == ShuffleMode::TruncateIndex || "Bad ShuffleMode");
+        assert(floor_log2(fieldCount) <= fw);
+        break;
+    case ShuffleMode::ZeroOnIndexOver:
+        assert(floor_log2(fieldCount) < fw);
+        outMask = CreateSExt(CreateICmpULE(index_vector, fnMaskVec), fwVectorType(fw));
+        break;
+    case ShuffleMode::ZeroOnHighIndexBit:
+        assert(floor_log2(fieldCount) < fw);
+        outMask = CreateNot(CreateAShr(index_vector, fw - 1));
+        break;
+    }
+    Value *result = PoisonValue::get(fwVectorType(fw));
+    index_vector = CreateAnd(index_vector, fnMaskVec);
+    for (unsigned i = 0; i < fieldCount; ++i) {
+        Value *idx = CreateExtractElement(index_vector, i);
+        result = CreateInsertElement(result, CreateExtractElement(data_table, idx), i);
+    }
+    if (outMask) {
+        result = CreateAnd(result, outMask);
+    }
+    return result;
 }
 
 Value * IDISA_Builder::mvmd_shuffle2(unsigned fw, Value * table0, Value * table1, Value * index_vector, ShuffleMode mode) {

@@ -21,8 +21,6 @@ public:
 
     virtual std::string getBuilderUniqueName() override;
 
-    llvm::Value * hsimd_packh(unsigned fw, llvm::Value * a, llvm::Value * b) override;
-    llvm::Value * hsimd_packl(unsigned fw, llvm::Value * a, llvm::Value * b) override;
     ~IDISA_I64_Builder() {}
 
 };

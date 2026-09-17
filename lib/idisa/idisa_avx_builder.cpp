@@ -378,10 +378,15 @@ std::pair<Value *, Value *> IDISA_AVX2_Builder::bitblock_indexed_advance(Value *
         Function * PDEP_f = (bitWidth == 64) ? Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_64)
                                           : Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_bmi_pdep_32);
         Function * const popcount = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::ctpop, getSizeTy());
+
         Type * iBitBlock = getIntNTy(getBitBlockWidth());
         Value * shiftVal = getSize(shiftAmount);
         const auto n = getBitBlockWidth() / bitWidth;
         FixedVectorType * const vecTy = FixedVectorType::get(getSizeTy(), n);
+
+
+
+
         if (LLVM_LIKELY(shiftAmount < bitWidth)) {
             Value * carry = mvmd_extract(bitWidth, shiftIn, 0);
             Value * result = UndefValue::get(vecTy);

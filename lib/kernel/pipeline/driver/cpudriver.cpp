@@ -29,6 +29,9 @@
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
 #include <llvm/Support/SmallVectorMemoryBuffer.h>
+#include <llvm/CodeGen/TargetPassConfig.h>
+#include <idisa/passes/function_snippet.h>
+#include <llvm/CodeGen/Passes.h>
 #include <queue>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
@@ -820,6 +823,7 @@ record_decl:
         M->setDataLayout(C.DataLayout);
         Target->linkExternalMethods(builder);
 
+
         SmallVector<char, 0> IROutput;
         SmallVector<char, 0> OptIROutput;
 
@@ -837,13 +841,17 @@ record_decl:
 
         END_SCOPED_REGION
 
-        auto optLevel = CodeGenOptLevel::Default;
+        auto optLevel = llvm::CodeGenOptLevel::Default;
         if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
             optLevel = codegen::BackEndOptLevel;
         }
         TM->setOptLevel(optLevel);
 
         legacy::PassManager PM;
+
+        const auto atLeastOpt1 = optLevel != llvm::CodeGenOptLevel::None;
+
+        FunctionSnippetPassManagerProxy FPM(M, PM, atLeastOpt1);
 
         SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> objBuffer;
@@ -870,7 +878,7 @@ record_decl:
             #else
             constexpr auto ASMFile = CGFT_AssemblyFile;
             #endif
-            if (LLVM_UNLIKELY(TM->addPassesToEmitFile(PM, out, nullptr, ASMFile))) {
+            if (LLVM_UNLIKELY(TM->addPassesToEmitFile(FPM, out, nullptr, ASMFile))) {
                 report_fatal_error(Twine{"Failed to generate ASM for ", M->getModuleIdentifier()});
             }
 
@@ -886,7 +894,7 @@ record_decl:
         constexpr auto ObjFile = CGFT_ObjectFile;
         #endif
 
-        if (LLVM_UNLIKELY(TM->addPassesToEmitFile(PM, out, nullptr, ObjFile))) {
+        if (LLVM_UNLIKELY(TM->addPassesToEmitFile(FPM, out, nullptr, ObjFile))) {
             report_fatal_error(Twine{"Failed to generate object file for ", M->getModuleIdentifier()});
         }
 
@@ -1083,7 +1091,6 @@ CPUDriver::CPUDriver(std::string && moduleName)
         .setRelocationModel(Reloc::Static)
         .setCodeModel(CodeModel::Large)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
-
 
     const size_t numOfThreads = 4;
 

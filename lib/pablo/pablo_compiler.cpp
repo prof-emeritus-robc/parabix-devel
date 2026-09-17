@@ -41,6 +41,7 @@
 #include <boost/container/flat_set.hpp>
 #include <kernel/core/streamset.h>
 #include <pablo/printer_pablos.h>
+#include <idisa/passes/function_snippet.h>
 #include <tuple>
 
 using namespace llvm;
@@ -711,26 +712,62 @@ void PabloCompiler::compileStatement(KernelBuilder & b, const Statement * const 
             std::tie(ptr, ty) = b.getScalarFieldPtr(stmt->getName().str());
             const auto alignment = getAlignment(ty);
             Value * const pending = b.CreateAlignedLoad(ty, ptr, alignment, e->getName() + "_accumulator");
-            const auto fieldWidth = b.getSizeTy()->getBitWidth();
-            const auto blockWidth = b.getBitBlockWidth();
-            const auto hiBlock = (blockWidth / fieldWidth) - 1;
+
             const uint64_t n = e->getN()->value();
-            size_t mask = 0x0;
-            for (unsigned i = 0; i < sizeof(size_t) * 8; i += n) { mask = (mask << n) | 0x1; }
-            Value * const vmask = b.getIntN(fieldWidth, mask);
-            Value * const vn = b.getIntN(fieldWidth, n);
-            Value * const fieldCounts = b.simd_popcount(fieldWidth, to_count);
-            Value * const sumCounts = b.hsimd_partial_sum(fieldWidth, fieldCounts);
-            Value * const splatPending = b.simd_fill(fieldWidth, pending);
-            Value * const sumCountPend = b.simd_add(fieldWidth, sumCounts, splatPending);
-            Value * const splatN = b.simd_fill(fieldWidth, vn);
-            Value * const finalSumCounts = b.mvmd_dslli(fieldWidth, sumCountPend, splatPending, 1);
-            Value * const shift = b.CreateURem(b.CreateSub(splatN, b.CreateURem(finalSumCounts, splatN)), splatN);
-            Value * const splatMask = b.simd_fill(fieldWidth, vmask);
-            Value * const finalNthMask = b.simd_sllv(fieldWidth, splatMask, shift);
-            value = b.simd_pdep(fieldWidth, finalNthMask, to_count);
-            Value * const pendingOut = b.CreateURem(b.mvmd_extract(fieldWidth, sumCountPend, hiBlock), vn);
+
+            SmallVector<char, 128> tmp;
+            raw_svector_ostream nm(tmp);
+            nm << "__everynth" << n;
+
+            std::array<Value *, 2> args;
+            args[0] = to_count;
+            args[1] = pending;
+
+            FixedVectorType * bTy = b.getBitBlockType();
+
+            FixedArray<Type *, 2> retTy;
+            retTy[0] = bTy;
+            retTy[1] = bTy;
+            StructType * const resultType = StructType::get(b.getContext(), retTy);
+
+            Value * retVal = CallFunctionByToken(b, resultType, nm.str(), args, [&](ArrayRef<Value *> params) -> Value *{
+
+                const auto fieldWidth = b.getSizeTy()->getBitWidth();
+                const auto blockWidth = b.getBitBlockWidth();
+                const auto hiBlock = (blockWidth / fieldWidth) - 1;
+
+                Value * to_count = params[0];
+                Value * pending = params[1];
+
+                size_t mask = 0x0;
+                for (unsigned i = 0; i < sizeof(size_t) * 8; i += n) {
+                    mask = (mask << n) | 0x1;
+                }
+                Value * const vmask = b.getIntN(fieldWidth, mask);
+                Value * const vn = b.getIntN(fieldWidth, n);
+                Value * const fieldCounts = b.simd_popcount(fieldWidth, to_count);
+                Value * const sumCounts = b.hsimd_partial_sum(fieldWidth, fieldCounts);
+                Value * const splatPending = b.simd_fill(fieldWidth, pending);
+                Value * const sumCountPend = b.simd_add(fieldWidth, sumCounts, splatPending);
+                Value * const splatN = b.simd_fill(fieldWidth, vn);
+                Value * const finalSumCounts = b.mvmd_dslli(fieldWidth, sumCountPend, splatPending, 1);
+                Value * const shift = b.CreateURem(b.CreateSub(splatN, b.CreateURem(finalSumCounts, splatN)), splatN);
+                Value * const splatMask = b.simd_fill(fieldWidth, vmask);
+                Value * const finalNthMask = b.simd_sllv(fieldWidth, splatMask, shift);
+
+                Value * const value = b.simd_pdep(fieldWidth, finalNthMask, to_count);
+                Value * const pendingOut = b.CreateURem(b.mvmd_extract(fieldWidth, sumCountPend, hiBlock), vn);
+
+                Value * retArg = UndefValue::get(resultType);
+                retArg = b.CreateInsertValue(retArg, pendingOut, 0);
+                retArg = b.CreateInsertValue(retArg, value, 1);
+                return retArg;
+            });
+
+            Value * pendingOut = b.CreateExtractValue(retVal, {0});
             b.CreateAlignedStore(pendingOut, ptr, alignment);
+            value = b.CreateExtractValue(retVal, {1});
+
         } else if (const Lookahead * l = dyn_cast<Lookahead>(stmt)) {
             const Var * stream = findInputParam(l, cast<Var>(l->getExpression()));
             Value * index = nullptr;
@@ -740,15 +777,29 @@ void PabloCompiler::compileStatement(KernelBuilder & b, const Statement * const 
             } else {
                 index = b.getInt32(0);
             }
-            const auto bit_shift = (l->getAmount() % b.getBitBlockWidth());
-            const auto block_shift = (l->getAmount() / b.getBitBlockWidth());
+            const auto bw = b.getBitBlockWidth();
+            const auto bit_shift = (l->getAmount() % bw);
+            const auto block_shift = (l->getAmount() / bw);
             Value * lookAhead = b.loadInputStreamBlock(stream->getName(), index, b.getSize(block_shift));
             if (LLVM_UNLIKELY(bit_shift == 0)) {  // Simple case with no intra-block shifting.
                 value = lookAhead;
             } else { // Need to form shift result from two adjacent blocks.
                 Value * lookAhead1 = b.loadInputStreamBlock(stream->getName(), index, b.getSize(block_shift + 1));
-                value = b.mvmd_dslli(1, lookAhead1, lookAhead, b.getBitBlockWidth() - bit_shift);
-                value = b.CreateBitCast(value, b.getBitBlockType());
+                const auto n = bw - bit_shift;
+
+                std::array<Value *, 2> args;
+                args[0] = lookAhead1;
+                args[1] = lookAhead;
+
+                SmallVector<char, 128> tmp;
+                raw_svector_ostream nm(tmp);
+                nm << "__lookahead" << n;
+
+                FixedVectorType * bbTy = b.getBitBlockType();
+                value = CallFunctionByToken(b, bbTy, nm.str(), args, [&](ArrayRef<Value *> params) -> Value *{
+                    return b.CreateBitCast(b.mvmd_dslli(1, params[0], params[1], n), b.getBitBlockType());
+                });
+
             }
         } else if (const Repeat * const s = dyn_cast<Repeat>(stmt)) {
             value = compileExpression(b, s->getValue()); 
@@ -770,7 +821,6 @@ void PabloCompiler::compileStatement(KernelBuilder & b, const Statement * const 
                 value = b.CreateAllocaAtEntryPoint(ArrayType::get(bt, result_packs));
             }
             Constant * const ZERO = b.getInt32(0);
-
             for (unsigned i = 0; i < result_packs; ++i) {
                 Value * A = b.CreateLoad(bt, b.CreateGEP(bt, base, {ZERO, b.getInt32(i * 2)}));
                 Value * B = b.CreateLoad(bt, b.CreateGEP(bt, base, {ZERO, b.getInt32(i * 2 + 1)}));

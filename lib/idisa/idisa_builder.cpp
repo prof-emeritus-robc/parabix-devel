@@ -16,6 +16,7 @@
 #include <toolchain/toolchain.h>
 #include <unistd.h>
 #include <boost/intrusive/detail/math.hpp>
+#include <idisa/passes/function_snippet.h>
 #include <pthread.h>
 
 using boost::intrusive::detail::floor_log2;

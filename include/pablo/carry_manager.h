@@ -134,6 +134,10 @@ protected:
     static bool hasNonEmptyCarryStruct(const llvm::Type * const frameTy);
     static bool isEmptyCarryStruct(const std::vector<llvm::Type *> & frameTys);
 
+    static void callIndexedAdvCarryInCarryOut(kernel::KernelBuilder & b, const size_t shiftAmount,
+                                              llvm::Value * const strm, llvm::Value * const index_strm, llvm::Value * carryIn,
+                                              llvm::Value *& result, llvm::Value *& carryOut);
+
 protected:
 
     const PabloKernel *                             mKernel;

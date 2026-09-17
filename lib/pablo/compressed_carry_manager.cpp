@@ -19,6 +19,7 @@
 #include <pablo/pe_var.h>
 #include <kernel/core/kernel_builder.h>
 #include <toolchain/toolchain.h>
+#include <idisa/passes/function_snippet.h>
 #include <array>
 
 enum NonCarryCollapsingMode {
@@ -145,7 +146,8 @@ Value * CompressedCarryManager::shortIndexedAdvanceCarryInCarryOut(kernel::Kerne
     }
     carryIn = b.CreateBitCast(b.CreateZExt(carryIn, b.getIntNTy(b.getBitBlockWidth())), b.getBitBlockType());
     Value * carryOut, * result;
-    std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
+    callIndexedAdvCarryInCarryOut(b, shiftAmount, strm, index_strm, carryIn, result, carryOut);
+//    std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
     const auto fw = (shiftAmount < 8) ? 8U : 64U;
     carryOut = b.mvmd_extract(fw, carryOut, 0);
     setNextCarryOut(b, carryOut);

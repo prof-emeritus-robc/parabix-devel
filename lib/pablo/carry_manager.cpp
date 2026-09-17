@@ -19,6 +19,7 @@
 #include <pablo/pe_var.h>
 #include <kernel/core/kernel_builder.h>
 #include <toolchain/toolchain.h>
+#include <idisa/passes/function_snippet.h>
 #include <array>
 
 using namespace llvm;
@@ -731,9 +732,45 @@ inline void CarryManager::phiOuterCarryOutSummary(kernel::KernelBuilder & b, Bas
 Value * CarryManager::addCarryInCarryOut(kernel::KernelBuilder & b, const Statement * const operation, Value * const e1, Value * const e2) {
     assert (operation && (isNonAdvanceCarryGeneratingStatement(operation)));
     Value * const carryIn = getNextCarryIn(b);
-    Value * carryOut, * result;
-    std::tie(carryOut, result) = b.bitblock_add_with_carry(e1, e2, carryIn);
-    assert (carryIn->getType() == carryOut->getType());
+    Type * const cTy = carryIn->getType();
+
+    assert (e1->getType() == b.getBitBlockType());
+    assert (e1->getType() == e2->getType());
+
+    SmallVector<char, 128> tmp;
+    raw_svector_ostream nm(tmp);
+    nm << "__addCarryInCarryOut";
+    cTy->print(nm);
+    std::array<Value *, 3> args;
+    args[0] = e1;
+    args[1] = e2;
+    args[2] = carryIn;
+
+    FixedVectorType * bTy = b.getBitBlockType();
+
+    FixedArray<Type *, 2> retTy;
+    retTy[0] = cTy;
+    retTy[1] = bTy;
+    StructType * const resultType = StructType::get(b.getContext(), retTy);
+
+    Value * retVal = CallFunctionByToken(b, resultType, nm.str(), args, [&](ArrayRef<Value *> params) -> Value *{
+
+        Value * e1 = params[0];
+        Value * e2 = params[1];
+        Value * carryIn = params[2];
+
+        Value * carryOut, * result;
+        std::tie(carryOut, result) = b.bitblock_add_with_carry(e1, e2, carryIn);
+        assert (carryIn->getType() == carryOut->getType());
+
+        Value * retArg = UndefValue::get(resultType);
+        retArg = b.CreateInsertValue(retArg, carryOut, 0);
+        retArg = b.CreateInsertValue(retArg, result, 1);
+        return retArg;
+    });
+
+    Value * carryOut = b.CreateExtractValue(retVal, {0});
+    Value * result = b.CreateExtractValue(retVal, {1});
     setNextCarryOut(b, carryOut);
     return result;
 }
@@ -744,11 +781,89 @@ Value * CarryManager::addCarryInCarryOut(kernel::KernelBuilder & b, const Statem
 Value * CarryManager::subBorrowInBorrowOut(kernel::KernelBuilder & b, const Statement * operation, Value * const e1, Value * const e2) {
     assert (operation);
     Value * const borrowIn = getNextCarryIn(b);
-    Value * borrowOut, * result;
-    std::tie(borrowOut, result) = b.bitblock_subtract_with_borrow(e1, e2, borrowIn);
-    assert (borrowIn->getType() == borrowOut->getType());
+
+    Type * const cTy = borrowIn->getType();
+    SmallVector<char, 128> tmp;
+    raw_svector_ostream nm(tmp);
+    nm << "__subBorrowInBorrowOut";
+    cTy->print(nm);
+
+    std::array<Value *, 3> args;
+    args[0] = e1;
+    args[1] = e2;
+    args[2] = borrowIn;
+
+    FixedVectorType * bTy = b.getBitBlockType();
+
+    FixedArray<Type *, 2> retTy;
+    retTy[0] = cTy;
+    retTy[1] = bTy;
+    StructType * const resultType = StructType::get(b.getContext(), retTy);
+
+    Value * retVal = CallFunctionByToken(b, resultType, nm.str(), args, [&](ArrayRef<Value *> params) -> Value *{
+
+        Value * e1 = params[0];
+        Value * e2 = params[1];
+        Value * borrowIn = params[2];
+
+        // TODO: move this to IDISA? we would need to move the pass out of the kernel
+
+        Value * borrowOut, * result;
+        std::tie(borrowOut, result) = b.bitblock_subtract_with_borrow(e1, e2, borrowIn);
+        assert (borrowIn->getType() == borrowOut->getType());
+
+        Value * retArg = UndefValue::get(resultType);
+        retArg = b.CreateInsertValue(retArg, borrowOut, 0);
+        retArg = b.CreateInsertValue(retArg, result, 1);
+        return retArg;
+    });
+
+    Value * borrowOut = b.CreateExtractValue(retVal, {0});
+    Value * result = b.CreateExtractValue(retVal, {1});
     setNextCarryOut(b, borrowOut);
     return result;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief callAdvCarryInCarryOut
+ ** ------------------------------------------------------------------------------------------------------------- */
+void callAdvCarryInCarryOut(kernel::KernelBuilder & b, const size_t shiftAmount, Value * value, Value * carryIn, Value *& result, Value *& carryOut) {
+
+    Type * const cTy = carryIn->getType();
+    SmallVector<char, 128> tmp;
+    raw_svector_ostream nm(tmp);
+    nm << "__advance" << shiftAmount;
+    cTy->print(nm);
+
+    std::array<Value *, 2> args;
+    args[0] = value;
+    args[1] = carryIn;
+
+    FixedVectorType * bTy = b.getBitBlockType();
+
+    FixedArray<Type *, 2> retTy;
+    retTy[0] = cTy;
+    retTy[1] = bTy;
+    StructType * const resultType = StructType::get(b.getContext(), retTy);
+
+    Value * retVal = CallFunctionByToken(b, resultType, nm.str(), args, [&](ArrayRef<Value *> params) -> Value *{
+
+        Value * value = params[0];
+        Value * carryIn = params[1];
+
+        Value * carryOut, * result;
+        std::tie(carryOut, result) = b.bitblock_advance(value, carryIn, shiftAmount);
+        assert (carryIn->getType() == carryOut->getType());
+
+        Value * retArg = UndefValue::get(resultType);
+        retArg = b.CreateInsertValue(retArg, carryOut, 0);
+        retArg = b.CreateInsertValue(retArg, result, 1);
+        return retArg;
+    });
+
+    carryOut = b.CreateExtractValue(retVal, {0});
+    result = b.CreateExtractValue(retVal, {1});
+
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -759,13 +874,60 @@ Value * CarryManager::advanceCarryInCarryOut(kernel::KernelBuilder & b, const Ad
     if (LLVM_LIKELY(shiftAmount < LONG_ADVANCE_BREAKPOINT)) {
         Value * const carryIn = getNextCarryIn(b);
         Value * carryOut, * result;
-        std::tie(carryOut, result) = b.bitblock_advance(value, carryIn, shiftAmount);
+        callAdvCarryInCarryOut(b, shiftAmount, value, carryIn, result, carryOut);
         setNextCarryOut(b, carryOut);
         return result;
     } else {
         return longAdvanceCarryInCarryOut(b, value, shiftAmount);
     }
 }
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief callIndexedAdvCarryInCarryOut
+ ** ------------------------------------------------------------------------------------------------------------- */
+void CarryManager::callIndexedAdvCarryInCarryOut(kernel::KernelBuilder & b, const size_t shiftAmount,
+                                                 Value * const strm, Value * const index_strm, Value * carryIn,
+                                                 Value *& result, Value *& carryOut) {
+
+    Type * const cTy = carryIn->getType();
+    SmallVector<char, 128> tmp;
+    raw_svector_ostream nm(tmp);
+    nm << "__indexedAdvance" << shiftAmount;
+    cTy->print(nm);
+
+    std::array<Value *, 3> args;
+    args[0] = strm;
+    args[1] = index_strm;
+    args[2] = carryIn;
+
+    FixedVectorType * bTy = b.getBitBlockType();
+
+    FixedArray<Type *, 2> retTy;
+    retTy[0] = cTy;
+    retTy[1] = bTy;
+    StructType * const resultType = StructType::get(b.getContext(), retTy);
+
+    Value * retVal = CallFunctionByToken(b, resultType, nm.str(), args, [&](ArrayRef<Value *> params) -> Value *{
+
+        Value * strm = params[0];
+        Value * index_strm = params[1];
+        Value * carryIn = params[2];
+
+        Value * carryOut, * result;
+        std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
+        assert (carryIn->getType() == carryOut->getType());
+
+        Value * retArg = UndefValue::get(resultType);
+        retArg = b.CreateInsertValue(retArg, carryOut, 0);
+        retArg = b.CreateInsertValue(retArg, result, 1);
+        return retArg;
+    });
+
+    carryOut = b.CreateExtractValue(retVal, {0});
+    result = b.CreateExtractValue(retVal, {1});
+
+}
+
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief indexedAdvanceCarryInCarryOut
@@ -787,7 +949,8 @@ Value * CarryManager::indexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, c
         mCurrentFrameIndex++;
 
         Value * carryOut, * result;
-        std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
+        callIndexedAdvCarryInCarryOut(b, shiftAmount, strm, index_strm, carryIn, result, carryOut);
+        // std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
         b.CreateStore(carryOut, carryPtr);
         if (mCarryInfo->hasExplicitSummary()) {
             addToCarryOutSummary(b, strm);
@@ -818,7 +981,8 @@ Value * CarryManager::indexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, c
         Value * hi_shift = b.CreateZExt(b.CreateSub(blockWidth_1, b.CreateURem(carryBlockEndPos, blockWidth)), iBitBlock);
         Value * carryIn = b.CreateOr(b.CreateLShr(c_lo, lo_shift), b.CreateShl(c_hi, hi_shift));
         Value * carryOut, * result;
-        std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
+        callIndexedAdvCarryInCarryOut(b, shiftAmount, strm, index_strm, carryIn, result, carryOut);
+        // std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
         carryOut = b.CreateBitCast(carryOut, iBitBlock);
         Value * adv = b.mvmd_extract(sizeof(size_t) * 8, b.simd_popcount(b.getBitBlockWidth(), index_strm), 0);
         b.setScalarField("IndexedAdvancePosition" + std::to_string(mIndexedLongAdvanceIndex), b.CreateAdd(carryPosition, adv));
@@ -834,6 +998,7 @@ Value * CarryManager::indexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, c
         c_hi = b.CreateLShr(carryOut, hi_shift);
         b.CreateStore(b.CreateBitCast(c_lo, b.getBitBlockType()), lo_GEP);
         b.CreateStore(b.CreateBitCast(c_hi, b.getBitBlockType()), hi_GEP);
+
         mIndexedLongAdvanceIndex++;
         mCurrentFrameIndex++;
         // Now handle the summary.
@@ -857,7 +1022,8 @@ Value * CarryManager::indexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, c
 Value * CarryManager::shortIndexedAdvanceCarryInCarryOut(kernel::KernelBuilder & b, const unsigned shiftAmount, Value * const strm, Value * const index_strm) {
     Value * const carryIn = getNextCarryIn(b);
     Value * carryOut, * result;
-    std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
+    callIndexedAdvCarryInCarryOut(b, shiftAmount, strm, index_strm, carryIn, result, carryOut);
+    // std::tie(carryOut, result) = b.bitblock_indexed_advance(strm, index_strm, carryIn, shiftAmount);
     setNextCarryOut(b, carryOut);
     return result;
 }
@@ -910,7 +1076,8 @@ inline Value * CarryManager::longAdvanceCarryInCarryOut(kernel::KernelBuilder & 
                     advanced = b.CreateOr(b.CreateShl(prior, 1), carry);
                     carry = b.CreateLShr(prior, summaryBlocks - 1);
                 } else {
-                    std::tie(carry, advanced) = b.bitblock_advance(b.bitCast(prior), carry, 1);
+                    callAdvCarryInCarryOut(b, 1, b.bitCast(prior), carry, advanced, carry);
+//                    std::tie(carry, advanced) = b.bitblock_advance(b.bitCast(prior), carry, 1);
                 }
                 Value * stream = b.CreateBitCast(advanced, bitBlockTy);
                 if (LLVM_LIKELY(i == summarySize)) {

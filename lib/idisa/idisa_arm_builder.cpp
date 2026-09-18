@@ -169,31 +169,12 @@ Value* IDISA_ARM_Builder::simd_popcount(unsigned fw, Value * a) {
 }
 
 Value * IDISA_ARM_Builder::simd_bitreverse(unsigned fw, Value * a) {
-
-    if (fw < 8 || getVectorBitWidth(a) != ARM_width) {
-        return IDISA_Builder::simd_bitreverse(fw, a);
+    if ((fw >= 8) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
+        Value * a_ = fwCast(fw, a);
+        Function * func = Intrinsic::getDeclaration(getModule(), Intrinsic::bitreverse, a_->getType());
+        return CreateCall(func->getFunctionType(), func, a_);
     }
-
-    // First reverse the bits in each byte
-    auto rbit = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_rbit, fwVectorType(fw));
-    if (fw == 8) {
-        return CreateCall(rbit->getFunctionType(), rbit, fwCast(8, a));
-    }
-    Function* refBytesInFields = nullptr;
-
-    // Then reverse the bytes in each field
-    if (fw == 64) {
-        refBytesInFields = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_revw);
-    } else if (fw == 32) {
-        refBytesInFields = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_revh);
-    } else if (fw == 16) {
-        refBytesInFields = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_revb);
-    } else {
-        return IDISA_Builder::simd_bitreverse(fw, a);
-    }
-
-    auto bitsInBytesRevsd = CreateCall(rbit->getFunctionType(), rbit, fwCast(8, a));
-    return CreateCall(refBytesInFields->getFunctionType(), refBytesInFields, fwCast(fw, bitsInBytesRevsd));
+    return IDISA_Builder::simd_bitreverse(fw, a);
 }
 
 Value * IDISA_ARM_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector, ShuffleMode mode) {

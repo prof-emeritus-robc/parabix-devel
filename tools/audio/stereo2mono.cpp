@@ -108,10 +108,10 @@ int main(int argc, char *argv[])
         } else {
             if (isWav) {
                 auto header = createWAVHeader(1, sampleRate, bitsPerSample, numSamples);
-                write(fd_out, header.c_str(), header.size());
+                std::ignore = write(fd_out, header.c_str(), header.size());
             }
             // NOTE: Despite a sample can be 8, 16, 32, etc. we treat the stream as bytestream (8-bit) to make it consistent with existing kernels.
-            write(fd_out, wavStream.data<8>(), wavStream.length() * (bitsPerSample / 8));
+            std::ignore = write(fd_out, wavStream.data<8>(), wavStream.length() * (bitsPerSample / 8));
             close(fd_out);
         }
     }

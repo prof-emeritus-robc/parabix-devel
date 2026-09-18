@@ -1140,13 +1140,17 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
 
         Value * const vaList = CreatePointerCast(CreateAlignedAlloca(vaListTy, mCacheLineAlignment), int8PtrTy);
         FunctionType * vaFuncTy = FunctionType::get(voidTy, { int8PtrTy }, false);
-//        #ifdef BOOST_ARCH_ARM_AVAILABLE
-//        Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start.p0", m);
-//        Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end.p0", m);
-//        #else
+        // Intrinsic::getOrInsertDeclaration mangles the overloaded pointer type into the
+        // symbol name (e.g. "llvm.va_start.p0"). That's what LLVM 19+'s backend expects,
+        // but under LLVM 17/18 the ISel intrinsic-matching table still expects the plain,
+        // unmangled name, so the mangled declaration is left unresolved at JIT link time.
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(19, 0, 0)
+        Function * vaStart = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vastart, {int8PtrTy});
+        Function * vaEnd = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vaend, {int8PtrTy});
+        #else
         Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start", m);
         Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end", m);
-//        #endif
+        #endif
         CreateCondBr(assertion, success, failure);
 
         SetInsertPoint(failure);

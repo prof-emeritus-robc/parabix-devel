@@ -94,7 +94,7 @@ namespace IDISA {
 
 std::string IDISA_ARM_Builder::getBuilderUniqueName() { 
     std::stringstream uname;
-    uname << "ARM";
+    uname << "ARM_Neon";
     if (mBitBlockWidth != ARM_width) {
         uname << "_" << mBitBlockWidth;
     }
@@ -133,7 +133,7 @@ Value* IDISA_ARM_Builder::simd_popcount(unsigned fw, Value * a) {
                                    CreateZExt(popcnt, getInt64Ty()),
                                    Constant::getNullValue(getInt32Ty()));
     } else {
-        // addParirsW: pairwise widening add
+        // addPairsW: pairwise widening add
         // Adds each pair of fields in a vector together and stores
         // the result in a vector whose fields are twice as wide as
         // the source vector
@@ -169,31 +169,12 @@ Value* IDISA_ARM_Builder::simd_popcount(unsigned fw, Value * a) {
 }
 
 Value * IDISA_ARM_Builder::simd_bitreverse(unsigned fw, Value * a) {
-
-    if (fw < 8 || getVectorBitWidth(a) != ARM_width) {
-        return IDISA_Builder::simd_bitreverse(fw, a);
+    if ((fw >= 8) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
+        Value * a_ = fwCast(fw, a);
+        Function * func = Intrinsic::getDeclaration(getModule(), Intrinsic::bitreverse, a_->getType());
+        return CreateCall(func->getFunctionType(), func, a_);
     }
-
-    // First reverse the bits in each byte
-    auto rbit = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_rbit, fwVectorType(fw));
-    if (fw == 8) {
-        return CreateCall(rbit->getFunctionType(), rbit, fwCast(8, a));
-    }
-    Function* refBytesInFields = nullptr;
-
-    // Then reverse the bytes in each field
-    if (fw == 64) {
-        refBytesInFields = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_revw);
-    } else if (fw == 32) {
-        refBytesInFields = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_revh);
-    } else if (fw == 16) {
-        refBytesInFields = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_sve_revb);
-    } else {
-        return IDISA_Builder::simd_bitreverse(fw, a);
-    }
-
-    auto bitsInBytesRevsd = CreateCall(rbit->getFunctionType(), rbit, fwCast(8, a));
-    return CreateCall(refBytesInFields->getFunctionType(), refBytesInFields, fwCast(fw, bitsInBytesRevsd));
+    return IDISA_Builder::simd_bitreverse(fw, a);
 }
 
 Value * IDISA_ARM_Builder::mvmd_shuffle(unsigned fw, Value * data_table, Value * index_vector, ShuffleMode mode) {
@@ -346,15 +327,26 @@ Value * IDISA_ARM_Builder::hsimd_packh(unsigned fw, Value * a, Value * b) {
     return IDISA_Builder::hsimd_packh(fw, a, b);
 }
 
+Value * IDISA_ARM_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
+    if ((fw >= 16) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_sqxtn, FixedVectorType::get(getIntNTy(fw/2), ARM_width/fw));
+        Value * sat_a = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, a));
+        Value * sat_b = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, b));
+        return fwCast(fw/2, CreateDoubleVector(sat_a, sat_b));
+    }
+    // Otherwise use default logic.
+    return IDISA_Builder::hsimd_packss(fw, a, b);
+}
+
 Value * IDISA_ARM_Builder::hsimd_packus(unsigned fw, Value * a, Value * b) {
-  if ((fw == 16) && (getVectorBitWidth(a) == ARM_width)) {
-    Function * vqmovun_s16_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_uqxtn, FixedVectorType::get(getInt8Ty(), 8));
-    Value * sat_a = CreateCall(vqmovun_s16_func->getFunctionType(), vqmovun_s16_func, fwCast(16, a));
-    Value * sat_b = CreateCall(vqmovun_s16_func->getFunctionType(), vqmovun_s16_func, fwCast(16, b));
-    return fwCast(8, CreateDoubleVector(sat_a, sat_b));
-  }
-  // Otherwise use default logic.
-  return IDISA_Builder::hsimd_packus(fw, a, b);
+    if ((fw >= 16) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_sqxtun, FixedVectorType::get(getIntNTy(fw/2), ARM_width/fw));
+        Value * sat_a = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, a));
+        Value * sat_b = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, b));
+        return fwCast(fw/2, CreateDoubleVector(sat_a, sat_b));
+    }
+    // Otherwise use default logic.
+    return IDISA_Builder::hsimd_packus(fw, a, b);
 }
 
 Value * IDISA_ARM_Builder::esimd_mergeh(unsigned fw, Value * a, Value * b) {

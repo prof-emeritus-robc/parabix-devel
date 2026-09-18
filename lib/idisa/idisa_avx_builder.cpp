@@ -801,7 +801,7 @@ Value * IDISA_AVX512F_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
         return CreateShuffleVector(fwCast(64, packed), UndefValue::get(fwVectorType(64)), shuffleMask);
     }
     // Otherwise use default logic.
-    return IDISA_Builder::hsimd_packus(fw, a, b);
+    return IDISA_Builder::hsimd_packss(fw, a, b);
 }
 
 Value * IDISA_AVX512F_Builder::mvmd_srl(unsigned fw, Value * a, Value * shift, const bool safe) {

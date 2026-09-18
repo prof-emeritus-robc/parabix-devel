@@ -94,7 +94,7 @@ namespace IDISA {
 
 std::string IDISA_ARM_Builder::getBuilderUniqueName() { 
     std::stringstream uname;
-    uname << "ARM";
+    uname << "ARM_Neon";
     if (mBitBlockWidth != ARM_width) {
         uname << "_" << mBitBlockWidth;
     }
@@ -133,7 +133,7 @@ Value* IDISA_ARM_Builder::simd_popcount(unsigned fw, Value * a) {
                                    CreateZExt(popcnt, getInt64Ty()),
                                    Constant::getNullValue(getInt32Ty()));
     } else {
-        // addParirsW: pairwise widening add
+        // addPairsW: pairwise widening add
         // Adds each pair of fields in a vector together and stores
         // the result in a vector whose fields are twice as wide as
         // the source vector
@@ -346,15 +346,26 @@ Value * IDISA_ARM_Builder::hsimd_packh(unsigned fw, Value * a, Value * b) {
     return IDISA_Builder::hsimd_packh(fw, a, b);
 }
 
+Value * IDISA_ARM_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
+    if ((fw >= 16) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_sqxtn, FixedVectorType::get(getIntNTy(fw/2), ARM_width/fw));
+        Value * sat_a = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, a));
+        Value * sat_b = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, b));
+        return fwCast(fw/2, CreateDoubleVector(sat_a, sat_b));
+    }
+    // Otherwise use default logic.
+    return IDISA_Builder::hsimd_packss(fw, a, b);
+}
+
 Value * IDISA_ARM_Builder::hsimd_packus(unsigned fw, Value * a, Value * b) {
-  if ((fw == 16) && (getVectorBitWidth(a) == ARM_width)) {
-    Function * vqmovun_s16_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_uqxtn, FixedVectorType::get(getInt8Ty(), 8));
-    Value * sat_a = CreateCall(vqmovun_s16_func->getFunctionType(), vqmovun_s16_func, fwCast(16, a));
-    Value * sat_b = CreateCall(vqmovun_s16_func->getFunctionType(), vqmovun_s16_func, fwCast(16, b));
-    return fwCast(8, CreateDoubleVector(sat_a, sat_b));
-  }
-  // Otherwise use default logic.
-  return IDISA_Builder::hsimd_packus(fw, a, b);
+    if ((fw >= 16) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
+        Function * pack_func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_sqxtun, FixedVectorType::get(getIntNTy(fw/2), ARM_width/fw));
+        Value * sat_a = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, a));
+        Value * sat_b = CreateCall(pack_func->getFunctionType(), pack_func, fwCast(fw, b));
+        return fwCast(fw/2, CreateDoubleVector(sat_a, sat_b));
+    }
+    // Otherwise use default logic.
+    return IDISA_Builder::hsimd_packus(fw, a, b);
 }
 
 Value * IDISA_ARM_Builder::esimd_mergeh(unsigned fw, Value * a, Value * b) {

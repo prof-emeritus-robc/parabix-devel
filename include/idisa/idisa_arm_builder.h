@@ -22,6 +22,7 @@ public:
     llvm::Value * esimd_mergel(unsigned fw, llvm::Value * a, llvm::Value * b) override;
     llvm::Value * hsimd_packh(unsigned fw, llvm::Value * a, llvm::Value * b) override;
     llvm::Value * hsimd_packl(unsigned fw, llvm::Value * a, llvm::Value * b) override;
+    llvm::Value * hsimd_packss(unsigned fw, llvm::Value * a, llvm::Value * b) override;
     llvm::Value * hsimd_packus(unsigned fw, llvm::Value * a, llvm::Value * b) override;
     llvm::Value * mvmd_shuffle(unsigned fw, llvm::Value * data_table, llvm::Value * index_vector,
                                ShuffleMode m = ShuffleMode::TruncateIndex) override;

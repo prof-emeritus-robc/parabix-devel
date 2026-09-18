@@ -171,7 +171,7 @@ Value* IDISA_ARM_Builder::simd_popcount(unsigned fw, Value * a) {
 Value * IDISA_ARM_Builder::simd_bitreverse(unsigned fw, Value * a) {
     if ((fw >= 8) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
         Value * a_ = fwCast(fw, a);
-        Function * func = Intrinsic::getDeclaration(getModule(), Intrinsic::bitreverse, a_->getType());
+        Function * func = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::bitreverse, a_->getType());
         return CreateCall(func->getFunctionType(), func, a_);
     }
     return IDISA_Builder::simd_bitreverse(fw, a);

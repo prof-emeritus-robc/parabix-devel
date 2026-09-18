@@ -154,8 +154,8 @@ def execute_grep_test(flags, regexp, datafile, expected_result):
     if filtered_out != expected_result:
         msg = u"Test failure: {%s} expecting {%s} got {%s}" % (grep_cmd, expected_result, grep_out)
         print(msg, file=sys.stderr)
-        print(expected_result.encode('utf-8').hex(sep=' '))
-        print(grep_out.encode('utf-8').hex(sep=' '))
+        #print(expected_result.encode('utf-8').hex(sep=' '))
+        #print(grep_out.encode('utf-8').hex(sep=' '))
         failure_count += 1
     else:
         if options.verbose:

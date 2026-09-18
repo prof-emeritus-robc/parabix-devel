@@ -238,6 +238,7 @@ public:
         std::lock_guard<std::mutex> L(mutex);
         auto & Q = ObjectQueues[task.Target->getCompilationPriority()];
         Q.push(task);
+        ObjectsInFlight++;
         if (Sleeping) cv.notify_one();
     }
 
@@ -258,15 +259,20 @@ public:
                 }
             }
 
-            for (size_t i = OBJECT_QUEUE_PRIORITY_LEVELS; i--; ) {
-                auto & Q = ObjectQueues[i];
-                if (Q.pop(task)) {
-                    assert (task.TypeId == CPUDriverTaskType::ObjectCode);
-                    #ifndef NDEBUG
-                    level = std::numeric_limits<size_t>::max();
-                    #endif
-                    return true;
+            if (ObjectsInFlight) {
+                for (size_t i = OBJECT_QUEUE_PRIORITY_LEVELS; i--; ) {
+                    auto & Q = ObjectQueues[i];
+                    if (Q.pop(task)) {
+                        assert (task.TypeId == CPUDriverTaskType::ObjectCode);
+                        #ifndef NDEBUG
+                        level = std::numeric_limits<size_t>::max();
+                        #endif
+                        return true;
+                    }
                 }
+                // An object task is currently being processed by another thread
+                // (popped from the queue but not yet completed); don't shut down.
+                done = false;
             }
 
             if (LLVM_UNLIKELY(done)) {
@@ -286,10 +292,35 @@ public:
         auto & Q = TaskQueues[level];
         assert (Q.InFlight > 0);
         Q.InFlight--;
-        if (Sleeping) cv.notify_all();
+        cv.notify_all();
     }
 
-    void noMoreTasks() {
+    void decrementObjectFlightCount() {
+        std::lock_guard<std::mutex> L(mutex);
+        assert (ObjectsInFlight > 0);
+        ObjectsInFlight--;
+        cv.notify_all();
+    }
+
+    // Blocks until every currently queued/in-flight task (across all Declaration/
+    // MainFunction levels and the ObjectCode queues) has completed, without telling
+    // worker threads to exit. Unlike shutdown(), this may be called repeatedly over
+    // the compiler's lifetime -- e.g. once per nested grep sub-pipeline compilation --
+    // since the worker pool remains alive and ready for further work afterward.
+    void waitForDrain() {
+        std::unique_lock<std::mutex> L(mutex);
+        cv.wait(L, [this]{
+            if (ObjectsInFlight) return false;
+            for (auto & Q : TaskQueues) {
+                if (Q.InFlight) return false;
+            }
+            return true;
+        });
+    }
+
+    // Permanently stops all worker threads. Only call once, when no further
+    // compilation will ever be requested (i.e. at CPUDriverCompiler teardown).
+    void shutdown() {
         std::lock_guard<std::mutex> L(mutex);
         StopRequested = 1;
         if (Sleeping) cv.notify_all();
@@ -302,6 +333,7 @@ private:
     std::condition_variable cv;
     size_t Sleeping = 0;
     size_t StopRequested = 0;
+    size_t ObjectsInFlight = 0;
 };
 
 
@@ -330,6 +362,9 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
     struct SlabNode {
         Block Slab;
         std::atomic<uintptr_t> AllocatedOffset;
+        // How far into this slab has already been mprotect'd to R+X (only meaningful
+        // for exec slabs; see finalizeExecSlabs()).
+        uintptr_t ProtectedOffset;
         SlabNode * Next;
 
         // A nearby hint address is critical here: exec and data content for the same
@@ -353,6 +388,7 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
             return slab;
         }())
         , AllocatedOffset(reinterpret_cast<uintptr_t>(Slab.base()))
+        , ProtectedOffset(reinterpret_cast<uintptr_t>(Slab.base()))
         , Next(nullptr) {
 
         }
@@ -481,20 +517,31 @@ public:
         OnDeallocated(Error::success());
     }
 
+    // May be called repeatedly (once per waitUntilCompleted(), which itself may run
+    // more than once over the compiler's lifetime -- e.g. nested grep compiles and
+    // immediately runs a sub-pipeline per directory). Each call only protects the
+    // portion of each exec slab written since the previous call, rounded up to a full
+    // page, and advances that slab's bump pointer past the now-protected (and thus
+    // non-writable) pages so later allocations never target already-executable memory.
     void finalizeExecSlabs() {
         std::lock_guard<std::mutex> L(ExecSlabAllocationMutex);
         SlabNode * n = &ExecSlab;
         for (;;) {
             auto & S = n->Slab;
-            const auto start = reinterpret_cast<uintptr_t>(S.base());
-            const auto end = n->AllocatedOffset.load(std::memory_order_relaxed);
-            if (LLVM_LIKELY(start != end)) {
-                const auto ec = Mem::protectMappedMemory(S, Mem::MF_READ | Mem::MF_EXEC);
+            const auto slabEnd = reinterpret_cast<uintptr_t>(S.base()) + S.allocatedSize();
+            const auto used = n->AllocatedOffset.load(std::memory_order_relaxed);
+            const auto alreadyProtected = n->ProtectedOffset;
+            if (LLVM_LIKELY(used > alreadyProtected)) {
+                const auto protectEnd = std::min<uintptr_t>(llvm::alignTo(used, CBuilder::PAGE_SIZE), slabEnd);
+                const Block toProtect(reinterpret_cast<void*>(alreadyProtected), protectEnd - alreadyProtected);
+                const auto ec = Mem::protectMappedMemory(toProtect, Mem::MF_READ | Mem::MF_EXEC);
                 if (ec) {
                     report_fatal_error(errorCodeToError(ec));
                     return;
                 }
-                Mem::InvalidateInstructionCache(S.base(), S.allocatedSize());
+                Mem::InvalidateInstructionCache(toProtect.base(), toProtect.allocatedSize());
+                n->ProtectedOffset = protectEnd;
+                n->AllocatedOffset.store(protectEnd, std::memory_order_relaxed);
             }
             n = n->Next;
             if (LLVM_LIKELY(n == nullptr)) {
@@ -617,6 +664,7 @@ public:
                             case CPUDriverTaskType::ObjectCode:
                                 assert (taskIndex == std::numeric_limits<size_t>::max());
                                 materializeObject(ctx, toExecute.Target, toExecute.TargetModule);
+                                WorkQueue.decrementObjectFlightCount();
                                 break;
                             case CPUDriverTaskType::Declaration:
                                 assert (taskIndex != std::numeric_limits<size_t>::max());
@@ -656,10 +704,11 @@ public:
 
     void * waitUntilCompleted(Kernel * const Target) {
 
-        WorkQueue.noMoreTasks();
-        for (auto & t : Threads) {
-            if (t.joinable()) t.join();
-        }
+        // Drain currently-pending work but leave the worker pool running: this may be
+        // called more than once over the compiler's lifetime (e.g. nested grep compiles
+        // and immediately runs a small sub-pipeline per directory/.gitignore file, so
+        // waitUntilCompleted() is invoked repeatedly against the same shared pool).
+        WorkQueue.waitForDrain();
         for (auto & C : Contexts) {
             auto & S = C->NewSymbolList;
             DriverLinkedSymbols->insert(S.begin(), S.end());
@@ -705,6 +754,13 @@ public:
     }
 
     ~CPUDriverCompiler() {
+        // No further compilation will be requested at this point; permanently stop the
+        // worker pool (waitUntilCompleted() only drains, it never does this) and wait
+        // for every thread to actually exit before tearing down their contexts.
+        WorkQueue.shutdown();
+        for (auto & t : Threads) {
+            if (t.joinable()) t.join();
+        }
         for (auto & C : Contexts) {
             delete C;
         }

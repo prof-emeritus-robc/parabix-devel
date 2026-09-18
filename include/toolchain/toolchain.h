@@ -165,6 +165,7 @@ extern unsigned ScanBlocks;
 extern bool EnableObjectCache;
 extern bool EnablePipelineObjectCache;
 extern bool UseCustomJITMemoryManager;
+extern unsigned CompileThreads;
 extern bool EnableDynamicMultithreading;
 extern bool TraceObjectCache;
 extern unsigned GroupNum;

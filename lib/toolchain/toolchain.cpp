@@ -306,6 +306,12 @@ static cl::opt<bool, true> UseCustomJITMemoryManagerOption("use-custom-jit-memor
     cl::desc("Use the custom slab-based JIT memory manager instead of LLVM's default in-process memory manager."),
     cl::cat(CodeGenOptions));
 
+unsigned CompileThreads;
+static cl::opt<unsigned, true>
+CompileThreadsOption("compile-threads", cl::location(CompileThreads), cl::init(4),
+                     cl::desc("Number of threads used for JIT compilation."),
+                     cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
+
 bool EnableDynamicMultithreading;
 static cl::opt<bool, true> EnableDynamicMultithreadingOption("dynamic-multithreading", cl::location(EnableDynamicMultithreading), cl::init(false),
                                                    cl::desc("Dynamic multithreading."), cl::cat(CodeGenOptions));

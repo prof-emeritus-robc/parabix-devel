@@ -1162,7 +1162,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
 
-    const size_t numOfThreads = 4;
+    const size_t numOfThreads = std::max(codegen::CompileThreads, 1U);
 
     mAllLinkedSymbols = std::make_unique<SymbolMap>();
 

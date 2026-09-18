@@ -146,11 +146,15 @@ struct CircularBuffer {
         assert (Count <= Buffer.size());
         const auto m = Buffer.size(); assert (m);
         if (LLVM_UNLIKELY(Count == m)) {
+            // Buffer is full, so Head == Tail (the buffer has wrapped exactly once).
+            // Valid data spans [Head, m) then wraps to [0, Head). After growing the
+            // backing vector to 2m (which preserves [0, m) and leaves [m, 2m) unused),
+            // relocate the wrapped prefix [0, Head) into the newly available space at
+            // [m, m + Head) so the whole buffer becomes contiguous starting at Head.
+            assert (Head == Tail);
             Buffer.resize(m * 2);
-            if (Head <= Tail) {
-                std::move_backward(Buffer.begin() + Tail, Buffer.begin() + m, Buffer.begin() + m * 2);
-                Tail += m;
-            }
+            std::move(Buffer.begin(), Buffer.begin() + Head, Buffer.begin() + m);
+            Tail = Head + m;
         }
         Buffer[Tail] = task;
         Tail = (Tail + 1) % Buffer.size();
@@ -529,7 +533,7 @@ private:
                         nextSlab = new SlabNode(allocSize);
                         assert (currentSlab->Next == nullptr);
                         currentSlab->Next = nextSlab;
-                        CurrentSlab.store(nextSlab, std::memory_order_relaxed);
+                        CurrentSlab.store(nextSlab, std::memory_order_release);
                     }
                     currentSlab = nextSlab;
                     break;

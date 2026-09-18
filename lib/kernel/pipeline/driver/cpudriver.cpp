@@ -352,9 +352,9 @@ public:
 
     void allocate(const jitlink::JITLinkDylib * JD, jitlink::LinkGraph & G, OnAllocatedFunction onAllocated) override {
         size_t totalDataSize = 0;
-        uint64_t firstDataAlign = 0;
+        uint64_t maxDataAlign = 0;
         size_t totalExecSize = 0;
-        uint64_t firstExecAlign = 0;
+        uint64_t maxExecAlign = 0;
 
         std::vector<const char*> originalPosition;
 
@@ -362,7 +362,7 @@ public:
 
             const auto isExec = (S.getMemProt() & MemProt::Exec) != MemProt::None;
 
-            auto firstAlign = isExec ? firstExecAlign : firstDataAlign;
+            auto maxAlign = isExec ? maxExecAlign : maxDataAlign;
             auto totalSize = isExec ? totalExecSize : totalDataSize;
 
 
@@ -372,37 +372,37 @@ public:
 
 
                 const auto align = B->getAlignment(); assert (align);
-                if (firstAlign == 0) {
+                if (maxAlign == 0) {
                     assert (totalSize == 0);
-                    firstAlign = align;
                 } else {
                     totalSize = llvm::alignTo(totalSize, align);
                 }
+                maxAlign = std::max<uint64_t>(maxAlign, align);
                 totalSize += B->getSize();
             }
 
             if (isExec) {
-                firstExecAlign = firstAlign;
+                maxExecAlign = maxAlign;
                 totalExecSize = totalSize;
             } else {
-                firstDataAlign = firstAlign;
+                maxDataAlign = maxAlign;
                 totalDataSize = totalSize;
             }
 
         }
 
-        assert (totalExecSize == 0 || firstExecAlign);
-        assert (totalDataSize == 0 || firstDataAlign);
+        assert (totalExecSize == 0 || maxExecAlign);
+        assert (totalDataSize == 0 || maxDataAlign);
 
 
         uintptr_t execOffset = 0;
         if (totalExecSize) {
-            execOffset = allocateFromSlab(CurrentExecSlab, firstExecAlign, totalExecSize, ExecSlabAllocationMutex);
+            execOffset = allocateFromSlab(CurrentExecSlab, maxExecAlign, totalExecSize, ExecSlabAllocationMutex);
         }
 
         uintptr_t dataOffset = 0;
         if (totalDataSize) {
-            dataOffset = allocateFromSlab(CurrentDataSlab, firstDataAlign, totalDataSize, DataSlabAllocationMutex);
+            dataOffset = allocateFromSlab(CurrentDataSlab, maxDataAlign, totalDataSize, DataSlabAllocationMutex);
         }
 
         auto checkItr = originalPosition.begin();
@@ -505,7 +505,7 @@ public:
 private:
 
     inline uintptr_t allocateFromSlab(std::atomic<SlabNode *> & CurrentSlab,
-                                      const uintptr_t firstBlockAlign, const uintptr_t totalSize,
+                                      const uintptr_t requiredAlign, const uintptr_t totalSize,
                                       std::mutex & mutex) {
 
         SlabNode * currentSlab = CurrentSlab.load(std::memory_order_acquire);
@@ -518,7 +518,7 @@ private:
             auto & allocatedOffset = currentSlab->AllocatedOffset;
             auto current = allocatedOffset.load(std::memory_order_relaxed);
             for (;;) {
-                const auto offset = llvm::alignTo(current, firstBlockAlign);
+                const auto offset = llvm::alignTo(current, requiredAlign);
                 const auto nextOffset = offset + totalSize;
                 if (LLVM_UNLIKELY(nextOffset > endAddress)) {
                     std::lock_guard<std::mutex> L(mutex);

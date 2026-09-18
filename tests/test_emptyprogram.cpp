@@ -72,7 +72,7 @@ bool testEmptyPrograms(CPUDriver & driver) {
     BEGIN_SCOPED_REGION
     auto P = CreatePipeline(driver, Output<uint64_t>("b"));
     const uint64_t a = dist(rng);
-    Scalar * const A = P.CreateConstant(ConstantInt::get(P.getInt64Ty(), a));
+    Scalar * const A = P.CreateConstant(ConstantInt::get(P.getTypeSystem().getInt64Ty(), a));
     assert (isa<ScalarConstant>(A));
     P.setOutputScalar("b", A);
     const auto f = P.compile();

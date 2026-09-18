@@ -595,7 +595,7 @@ bool runRepeatingStreamSetTest(CPUDriver & driver, std::default_random_engine & 
 
     size_t repetitionLength = optRepetitionLength;
     if (repetitionLength == 0) {
-        const auto bw = P.getBitBlockWidth();
+        const auto bw = P.getTypeSystem().getBitBlockWidth();
         const auto v = boost::lcm<unsigned>(patternLength, bw) * 3U;
         repetitionLength = std::max(v, 4567U);
     }

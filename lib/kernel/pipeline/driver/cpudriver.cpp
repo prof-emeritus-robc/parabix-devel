@@ -1106,17 +1106,27 @@ CPUDriver::CPUDriver(std::string && moduleName)
         return objLinker;
     });
 
+    // CPUDriverCompiler manages its own worker-thread pool for compilation, so ORC's
+    // own task dispatch must run tasks synchronously in-place rather than on a
+    // separate internal thread pool.
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
+    Builder.setExecutorProcessControl(
+        cantFail(SelfExecutorProcessControl::Create(nullptr, std::make_unique<InPlaceTaskDispatcher>())));
+    #endif
+
     mEngine = cantFail(Builder.create());
 
     mCPUDriverCompiler->setEngine(mEngine.get());
 
     mCPUDriverCompiler->setDriverLinkedSymbolMap(mAllLinkedSymbols.get());
 
+    #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(18, 0, 0)
     auto & ES = mEngine->getExecutionSession();
 
     ES.setDispatchTask([](std::unique_ptr<Task> T) {
         T->run();
     });
+    #endif
 
     auto & MainJD = mEngine->getMainJITDylib();
     MainJD.addGenerator(

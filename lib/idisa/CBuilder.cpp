@@ -2489,6 +2489,23 @@ Constant * CBuilder::convertConstantToLLVMContext(LLVMContext & C, Constant * co
                 return ConstantVector::get(ops);
             }
         }
+        // ConstantArray::get()/ConstantVector::get() transparently return a more compact
+        // ConstantDataArray/ConstantDataVector instead of an actual ConstantAggregate
+        // subclass when every element is a simple integer or float constant (e.g. an
+        // array of size_t constants), so that case must be handled separately here.
+        if (isa<ConstantDataSequential>(constant)) {
+            const ConstantDataSequential * const cv = cast<ConstantDataSequential>(constant);
+            const auto numElements = cv->getNumElements();
+            SmallVector<Constant *, 16> ops(numElements);
+            for (unsigned i = 0; i < numElements; ++i) {
+                ops[i] = convertConstant(cv->getElementAsConstant(i));
+            }
+            if (isa<ConstantDataArray>(constant)) {
+                return ConstantArray::get(cast<ArrayType>(newType), ops);
+            }
+            assert (isa<ConstantDataVector>(constant));
+            return ConstantVector::get(ops);
+        }
         if (isa<UndefValue>(constant)) {
             return UndefValue::get(newType);
         }

@@ -10,10 +10,12 @@ class StreamSet;
 class StreamSetBuffer;
 class Kernel;
 class KernelCompiler;
+class PipelineKernel;
 
 class KernelBuilder : public virtual IDISA::IDISA_Builder {
     friend class Kernel;
     friend class KernelCompiler;
+    friend class PipelineKernel;
 public:
 
     using Rational = ProcessingRate::Rational;

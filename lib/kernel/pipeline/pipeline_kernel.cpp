@@ -442,6 +442,17 @@ bool PipelineKernel::isCachable() const {
     if (codegen::DebugOptionIsSet(codegen::ForcePipelineRecompilation)) {
         return false;
     }
+    if (hasInternallyGeneratedStreamSets()) {
+        // addOrDeclareMainFunction()/writeInternallyGeneratedStreamSetScaleVector()
+        // regenerate the "rsl" (repeating streamset length) metadata against whichever
+        // module is current when the main function is actually built, using this
+        // pipeline's own live PipelineCompiler (mCompiler). A cache-hit kernel never
+        // goes through declareStateTypes() (loadCachedKernel() only restores its shared/
+        // thread-local state types from metadata, not mCompiler), so mCompiler would be
+        // null and that regeneration cannot happen. Keep such kernels uncachable rather
+        // than risk that null dereference.
+        return false;
+    }
     return (getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject) == 0;
 }
 
@@ -452,7 +463,29 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder 
     assert (hasInternallyGeneratedStreamSets());
 
     Module * const M = b.getModule();
-    NamedMDNode * const msl = M->getNamedMetadata("rsl");
+    NamedMDNode * msl = M->getNamedMetadata("rsl");
+    if (LLVM_UNLIKELY(msl == nullptr)) {
+        // The "rsl" metadata is normally written once, into the module current when
+        // addPipelineKernelProperties() ran (during kernel property declaration). But
+        // this function can also be reached from addOrDeclareMainFunction() against a
+        // different, later module (e.g. materializeMain's "main" module) that never
+        // went through that pass, so regenerate it here if it's missing. This must be
+        // called on the outermost pipeline kernel (the only one COMPILER is bracketed
+        // to be valid for here), which is always the case: recursive calls to this
+        // function only happen after the outer call already ensured the metadata
+        // exists. Regeneration needs a live PipelineCompiler (COMPILER, bracketed to
+        // mCompiler by addOrDeclareMainFunction's CompilerScope), which only exists for
+        // kernels that went through declareStateTypes -- i.e. never for a cache hit, so
+        // isCachable() keeps kernels with internally generated streamsets uncachable to
+        // guarantee that here.
+        if (LLVM_UNLIKELY(COMPILER == nullptr)) {
+            report_fatal_error("PipelineKernel::writeInternallyGeneratedStreamSetScaleVector: "
+                               "cannot regenerate \"rsl\" metadata without a live PipelineCompiler "
+                               "(is this kernel cached despite having internally generated streamsets?)");
+        }
+        COMPILER->generateMetaDataForRepeatingStreamSets(b);
+        msl = M->getNamedMetadata("rsl");
+    }
     assert (msl);
     assert (msl->getNumOperands() > 0);
     assert (msl->getOperand(0)->getNumOperands() > 0);
@@ -493,7 +526,30 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addOrDeclareMainFunction
  ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineKernel::setBuilderCompiler(KernelBuilder & b, KernelCompiler * const compiler) const {
+    b.setCompiler(compiler);
+}
+
 Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const MainMethodGenerationType method) const {
+
+    // Bracket the builder's "current compiler" for the duration of this call, matching
+    // how Kernel::generateKernel()/declareStateTypes() do it. Some codegen below (via
+    // the COMPILER macro, e.g. regenerating repeating-streamset metadata for whichever
+    // module `b` is currently pointed at) needs b.getCompiler() to resolve to this
+    // pipeline's own compiler. addOrDeclareMainFunction is invoked directly (not
+    // through generateKernel), and can run against a fresh module -- e.g.
+    // materializeMain's "main" module -- that never went through a path that set this,
+    // so without this bracket COMPILER resolves to whatever was last left on `b`.
+    struct CompilerScope {
+        const PipelineKernel * const Self;
+        KernelBuilder & B;
+        KernelCompiler * const Prior;
+        CompilerScope(const PipelineKernel * const self, KernelBuilder & b, KernelCompiler * const compiler)
+        : Self(self), B(b), Prior(b.getCompiler()) {
+            Self->setBuilderCompiler(B, compiler);
+        }
+        ~CompilerScope() { Self->setBuilderCompiler(B, Prior); }
+    } compilerScope(this, b, mCompiler.get());
 
     unsigned suppliedArgs = 1; // segment size
     if (LLVM_LIKELY(mSharedStateType)) {

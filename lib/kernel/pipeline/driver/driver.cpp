@@ -1,5 +1,6 @@
 #include <kernel/pipeline/driver/driver.h>
 
+#include <optional>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include <llvm/IR/Module.h>
@@ -301,13 +302,20 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
 
     Module & M = *b.getModule();
 
+    // PrintFunctionPass/FilteredPrintFunctionPass only store a raw_ostream&, and the
+    // passes aren't actually run until MPM.run() at the end of this function, so the
+    // backing raw_svector_ostream must outlive that call -- it cannot be scoped to
+    // just the "if" block that constructs it.
+    std::optional<raw_svector_ostream> unoptimizedIROut;
+    std::optional<raw_svector_ostream> optimizedIROut;
+
     if (LLVM_UNLIKELY(codegen::ShowUnoptimizedIROption != codegen::OmittedOption)) {
         UnoptimizedIROutput.reserve(M.getInstructionCount() * 256);
-        raw_svector_ostream out(UnoptimizedIROutput);
+        unoptimizedIROut.emplace(UnoptimizedIROutput);
         if (codegen::ShowIRFilter.empty()) {
-            FPM.addPass(PrintFunctionPass(out));
+            FPM.addPass(PrintFunctionPass(*unoptimizedIROut));
         } else {
-            FPM.addPass(FilteredPrintFunctionPass(out));
+            FPM.addPass(FilteredPrintFunctionPass(*unoptimizedIROut));
         }
     }
     if (ADD_VERIFY_IR_PASS) {
@@ -363,11 +371,11 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
     // ShowIRFilter
     if (LLVM_UNLIKELY(codegen::ShowIROption != codegen::OmittedOption)) {
         OptimizedIROutput.reserve(M.getInstructionCount() * 256);
-        raw_svector_ostream out(OptimizedIROutput);
+        optimizedIROut.emplace(OptimizedIROutput);
         if (codegen::ShowIRFilter.empty()) {
-            FPM.addPass(PrintFunctionPass(out));
+            FPM.addPass(PrintFunctionPass(*optimizedIROut));
         } else {
-            FPM.addPass(FilteredPrintFunctionPass(out));
+            FPM.addPass(FilteredPrintFunctionPass(*optimizedIROut));
         }
     }
 

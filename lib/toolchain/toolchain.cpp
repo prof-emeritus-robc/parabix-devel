@@ -292,6 +292,20 @@ static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::loca
 static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""),
                                                  cl::desc("Path to the object cache diretory"), cl::cat(CodeGenOptions));
 
+// The custom allocator keeps persistent, long-lived exec/data slab pools rather than
+// allocating a small dedicated region per compiled object as LLVM's default in-process
+// memory manager does. That's a deliberate linking-speed optimization, but under LLVM 21
+// it can place exec and data content too far apart for Mach-O compact-unwind info's
+// 32-bit deltas, so it defaults to off there; LLVM < 21 is unaffected and defaults to on.
+static cl::opt<bool, true> UseCustomJITMemoryManagerOption("use-custom-jit-memory-manager", cl::location(UseCustomJITMemoryManager),
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    cl::init(false),
+    #else
+    cl::init(true),
+    #endif
+    cl::desc("Use the custom slab-based JIT memory manager instead of LLVM's default in-process memory manager."),
+    cl::cat(CodeGenOptions));
+
 bool EnableDynamicMultithreading;
 static cl::opt<bool, true> EnableDynamicMultithreadingOption("dynamic-multithreading", cl::location(EnableDynamicMultithreading), cl::init(false),
                                                    cl::desc("Dynamic multithreading."), cl::cat(CodeGenOptions));
@@ -385,6 +399,7 @@ unsigned ScanBlocks;
 bool EnableObjectCache = true;
 bool EnablePipelineObjectCache = true;
 bool TraceObjectCache;
+bool UseCustomJITMemoryManager = true;
 
 unsigned CacheDaysLimit;
 

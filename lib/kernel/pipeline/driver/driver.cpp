@@ -281,6 +281,21 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
     FAM.registerPass([&] { return ModuleAnalysisManagerFunctionProxy(MAM); });
     FAM.registerPass([&] { return CGSCCAnalysisManagerFunctionProxy(CGAM); });
 
+    // The passes above (in particular ModuleInlinerPass, added below) can depend on
+    // additional analyses that vary by LLVM version and are otherwise easy to miss
+    // registering by hand; a stale/missing registration corrupts silently in a
+    // Release build since AnalysisManager::lookUpPass only asserts in debug builds.
+    // PassBuilder::register*Analyses only fills in analyses that aren't already
+    // registered above, so our explicit choices (e.g. PassInstrumentationAnalysis
+    // bound to our own PIC) are preserved.
+    LoopAnalysisManager LAM;
+    PassBuilder PB(TM, PipelineTuningOptions(), std::nullopt, &PIC);
+    PB.registerModuleAnalyses(MAM);
+    PB.registerCGSCCAnalyses(CGAM);
+    PB.registerFunctionAnalyses(FAM);
+    PB.registerLoopAnalyses(LAM);
+    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+
     ModulePassManager MPM;
     FunctionPassManager FPM;
 

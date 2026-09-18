@@ -8,6 +8,9 @@
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/ExecutionEngine/Orc/ObjectFileInterface.h>
 #include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+#include <llvm/ExecutionEngine/Orc/SelfExecutorProcessControl.h>
+#endif
 #include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/InitializePasses.h>                 // for initializeCodeGencd .
 #include <llvm/PassRegistry.h>                     // for PassRegistry
@@ -58,6 +61,16 @@ using namespace llvm::orc;
 using namespace kernel;
 
 using AttrId = kernel::Attribute::KindId;
+
+// Module::setTargetTriple took a StringRef prior to LLVM 21 and takes a Triple from LLVM 21 onward.
+template <typename ModulePtr>
+inline void setModuleTargetTriple(ModulePtr && M, const Triple & T) {
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    M->setTargetTriple(T);
+    #else
+    M->setTargetTriple(T.getTriple());
+    #endif
+}
 
 // TODO: if a task dependency system exists, we could split the task of state identification from codegen but
 // could not guarantee that the same thread/context would process it. Most kernel state types are defined fully
@@ -319,11 +332,17 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
         std::atomic<uintptr_t> AllocatedOffset;
         SlabNode * Next;
 
-        SlabNode(const size_t size)
-        : Slab([size](){
+        // A nearby hint address is critical here: exec and data content for the same
+        // object can end up referencing each other (e.g. Mach-O compact unwind info
+        // encodes function offsets as 32-bit deltas), so if the exec slab and data
+        // slab were allocated independently with no hint, ASLR could place them more
+        // than 4GB apart and JIT linking would fail outright. Keeping every slab
+        // within a bounded distance of the very first one avoids that.
+        SlabNode(const size_t size, const Block * near = nullptr)
+        : Slab([size, near](){
             std::error_code EC;
             const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PAGE_SIZE);
-            auto slab = Mem::allocateMappedMemory(alignedSize, nullptr, Mem::MF_READ | Mem::MF_WRITE, EC);
+            auto slab = Mem::allocateMappedMemory(alignedSize, near, Mem::MF_READ | Mem::MF_WRITE, EC);
             if (EC) {
                 SmallVector<char, 256> tmp;
                 raw_svector_ostream msg(tmp);
@@ -349,7 +368,7 @@ public:
     CPUDriverJITMemoryManager()
     : ExecSlab(DEFAULT_SLAB_SIZE)
     , CurrentExecSlab(&ExecSlab)
-    , DataSlab(DEFAULT_SLAB_SIZE)
+    , DataSlab(DEFAULT_SLAB_SIZE, &ExecSlab.Slab)
     , CurrentDataSlab(&DataSlab) {
 
     }
@@ -530,7 +549,9 @@ private:
                     if (nextSlab == currentSlab) {
                         const auto minSize = std::max<uintptr_t>(currentSlab->Slab.allocatedSize(), totalSize * 4);
                         const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PAGE_SIZE);
-                        nextSlab = new SlabNode(allocSize);
+                        // Hint near the original exec slab (rather than currentSlab) so growth keeps
+                        // accumulating close to the anchor point instead of drifting slab by slab.
+                        nextSlab = new SlabNode(allocSize, &ExecSlab.Slab);
                         assert (currentSlab->Next == nullptr);
                         currentSlab->Next = nextSlab;
                         CurrentSlab.store(nextSlab, std::memory_order_release);
@@ -743,7 +764,7 @@ private:
             std::tie(cached, M) = ObjectCache->loadCachedObjectFile(builder, Target);
             if (M) {
 
-                M->setTargetTriple(TM->getTargetTriple().getTriple());
+                setModuleTargetTriple(M, TM->getTargetTriple());
                 M->setDataLayout(ctx.DataLayout);
 
                 Target->loadCachedKernel(M.get());
@@ -762,7 +783,7 @@ private:
 
         BEGIN_SCOPED_REGION
         Module * const M = Target->makeEmptyModule(builder); assert (M);
-        M->setTargetTriple(TM->getTargetTriple().getTriple());
+        setModuleTargetTriple(M, TM->getTargetTriple());
         M->setDataLayout(ctx.DataLayout);
         builder.setModule(M);
         ctx.CurrentModule = M;
@@ -818,7 +839,7 @@ record_decl:
         builder.setModule(M);
         C.CurrentModule = M;
         C.Engine = Engine; assert (Engine);
-        M->setTargetTriple(TM->getTargetTriple().getTriple());
+        setModuleTargetTriple(M, TM->getTargetTriple());
         M->setDataLayout(C.DataLayout);
         Target->linkExternalMethods(builder);
 
@@ -919,7 +940,7 @@ record_decl:
 
         TargetMachine * const TM = C.TargetMachine.get();
         auto M = std::make_unique<Module>("main", C);
-        M->setTargetTriple(TM->getTargetTriple().getTriple());
+        setModuleTargetTriple(M, TM->getTargetTriple());
         M->setDataLayout(C.DataLayout);
 
         KernelBuilder & builder = *C.Builder;
@@ -1100,11 +1121,30 @@ CPUDriver::CPUDriver(std::string && moduleName)
                                   *Builder.getJITTargetMachineBuilder(), features,
                                   mObjectCache.get());
 
-    Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES, const Triple & TT) {
-        auto objLinker = std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager());
+    // Our custom CPUDriverJITMemoryManager's persistent exec/data slab pools are a
+    // linking-speed optimization, but under LLVM 21 they can trigger "__TEXT,__unwind_info,
+    // delta to end of functions ... exceeds 32 bits" JIT session errors from JITLink's
+    // Mach-O/arm64 compact-unwind handling (confirmed specific to our allocator; LLVM's own
+    // InProcessMemoryManager, which allocates a small dedicated region per object rather
+    // than long-lived shared pools, does not hit it). --use-custom-jit-memory-manager
+    // controls which is used; see toolchain.cpp for its LLVM-version-dependent default.
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES) {
+        auto objLinker = codegen::UseCustomJITMemoryManager
+            ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())
+            : std::make_unique<ObjectLinkingLayer>(ES, cantFail(jitlink::InProcessMemoryManager::Create()));
         objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
         return objLinker;
     });
+    #else
+    Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES, const Triple & TT) {
+        auto objLinker = codegen::UseCustomJITMemoryManager
+            ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())
+            : std::make_unique<ObjectLinkingLayer>(ES, cantFail(jitlink::InProcessMemoryManager::Create()));
+        objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
+        return objLinker;
+    });
+    #endif
 
     // CPUDriverCompiler manages its own worker-thread pool for compilation, so ORC's
     // own task dispatch must run tasks synchronously in-place rather than on a

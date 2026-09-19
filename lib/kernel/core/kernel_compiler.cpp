@@ -20,6 +20,7 @@
 #include <kernel/illustrator/illustrator.h>
 #include <llvm/IR/Verifier.h>
 #include <boost/regex.hpp>
+#include <set>
 
 #include <llvm/IR/PassManager.h>
 #include <llvm/Analysis/AliasAnalysis.h>
@@ -224,6 +225,20 @@ private:
 
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getShowIROpenFlags
+ *
+ * KernelCompiler::compile (and thus runAllOptimizationPasses) is invoked once per kernel in the pipeline, so
+ * a -ShowIR=<file>/-ShowUnoptimizedIR=<file> path gets reopened many times over the course of a single run.
+ * Opening with the default (truncating) flags every time would leave only the last-compiled kernel's IR in
+ * the file. Truncate the first time a given path is opened in this process and append thereafter, so IR from
+ * every kernel accumulates in the file just as it would if printed to the terminal.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static sys::fs::OpenFlags getShowIROpenFlags(const std::string & path) {
+    static std::set<std::string> alreadyOpened;
+    return alreadyOpened.insert(path).second ? sys::fs::OpenFlags::OF_None : sys::fs::OpenFlags::OF_Append;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief runAllOptimizationPasses
  ** ------------------------------------------------------------------------------------------------------------- */
 void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes) {
@@ -302,7 +317,7 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
             unoptimizedOut = std::make_unique<raw_fd_ostream>(STDERR_FILENO, false, true);
         } else {
             std::error_code unoptimizedErr;
-            unoptimizedOut = std::make_unique<raw_fd_ostream>(options, unoptimizedErr, sys::fs::OpenFlags::OF_None);
+            unoptimizedOut = std::make_unique<raw_fd_ostream>(options, unoptimizedErr, getShowIROpenFlags(options));
         }
         if (codegen::ShowIRFilter.empty()) {
             FPM.addPass(PrintFunctionPass(*unoptimizedOut));
@@ -388,7 +403,7 @@ void KernelCompiler::runAllOptimizationPasses(KernelBuilder & b, Kernel::Selecte
             optimizedOut = std::make_unique<raw_fd_ostream>(STDERR_FILENO, false, true);
         } else {
             std::error_code optimizedErr;
-            optimizedOut = std::make_unique<raw_fd_ostream>(options, optimizedErr, sys::fs::OpenFlags::OF_None);
+            optimizedOut = std::make_unique<raw_fd_ostream>(options, optimizedErr, getShowIROpenFlags(options));
         }
         if (codegen::ShowIRFilter.empty()) {
             FPM.addPass(PrintFunctionPass(*optimizedOut));

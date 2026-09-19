@@ -581,7 +581,7 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
             }
             mPB.CreateKernelCall<LongestSpan>(pfxLgth + pfxOffset - 1, endOffset, pfxStrm, endBack, matchEnd, spans);
         } else {
-            mPB.CreateKernelFamilyCall<FixedMatchSpansKernel>(minlgth, endOffset, matchEnd, spans);
+            mPB.CreateKernelCall<FixedMatchSpansKernel>(minlgth, endOffset, matchEnd, spans);
         }
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             auto spanName = name + "Span";
@@ -592,7 +592,7 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, matchEnd);
         auto minlgth = getLengthRange(re, mCtxt.mLengthAlphabet).first;
         auto offset = grepOffset(re);
-        mPB.CreateKernelFamilyCall<FixedMatchSpansKernel>(minlgth, offset, matchEnd, spans);
+        mPB.CreateKernelCall<FixedMatchSpansKernel>(minlgth, offset, matchEnd, spans);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             auto spanName = "minlen" + std::to_string(minlgth + offset);
             mPB.captureBitstream(spanName, spans);

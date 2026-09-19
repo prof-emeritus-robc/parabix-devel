@@ -635,12 +635,12 @@ protected:
     static std::string annotateKernelNameWithDebugFlags(const TypeId id, const unsigned flags, std::string && name);
 
     struct FunctionLink {
-        const llvm::StringRef       UnmanagedName;
+        const std::string           UnmanagedName;
         llvm::FunctionType * const  FuncType;
         void * const                FuncPointer;
 
         FunctionLink(llvm::StringRef unmanagedName, llvm::FunctionType * funcType, void * funcPtr)
-        : UnmanagedName(unmanagedName)
+        : UnmanagedName(unmanagedName.str())
         , FuncType(funcType)
         , FuncPointer(funcPtr) {
 

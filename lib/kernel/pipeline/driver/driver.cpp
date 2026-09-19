@@ -324,7 +324,9 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
     if (LLVM_UNLIKELY(!codegen::TraceOption.empty())) {
         FPM.addPass(TracePass(b));
     }
-    MPM.addPass(ModuleInlinerPass());
+    if (codegen::EnableModuleInliner) {
+        MPM.addPass(ModuleInlinerPass());
+    }
 
     FPM.addPass(RemoveRedundantAllocaAndGEPInstructions());
     FPM.addPass(SimplifyCFGPass());

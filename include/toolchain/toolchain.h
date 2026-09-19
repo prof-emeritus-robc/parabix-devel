@@ -163,6 +163,7 @@ extern unsigned TaskThreads;
 extern unsigned SegmentThreads;
 extern unsigned ScanBlocks;
 extern bool EnableObjectCache;
+extern bool EnableModuleInliner;
 extern bool EnablePipelineObjectCache;
 extern bool UseCustomJITMemoryManager;
 extern unsigned CompileThreads;

@@ -286,6 +286,9 @@ PipelineCompilationModeOption("pipeline-optimization-level", cl::location(Pipeli
 static cl::opt<bool, true> EnableObjectCacheOption("enable-object-cache", cl::location(EnableObjectCache), cl::init(true),
                                                    cl::desc("Enable object caching"), cl::cat(CodeGenOptions));
 
+static cl::opt<bool, true> EnableModuleInlinerOption("enable-kernel-module-inliner", cl::location(EnableModuleInliner), cl::init(false),
+                                                   cl::desc("Run a whole-module inliner pass over each kernel's IR before object generation."), cl::cat(CodeGenOptions));
+
 static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::location(TraceObjectCache), cl::init(false),
                                                    cl::desc("Trace object cache retrieval."), cl::cat(JIT_InfoOptions));
 
@@ -403,6 +406,7 @@ unsigned SegmentThreads;
 unsigned ScanBlocks;
 
 bool EnableObjectCache = true;
+bool EnableModuleInliner = false;
 bool EnablePipelineObjectCache = true;
 bool TraceObjectCache;
 bool UseCustomJITMemoryManager = true;

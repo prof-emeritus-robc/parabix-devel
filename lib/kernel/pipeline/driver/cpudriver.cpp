@@ -849,7 +849,7 @@ record_decl:
 
         const auto atLeastOpt1 = optLevel != llvm::CodeGenOptLevel::None;
 
-        FunctionSnippetPassManagerProxy FPM(M, PM, atLeastOpt1);
+        FunctionSnippetPassManagerProxy FPM(*M, PM, atLeastOpt1);
 
         SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> objBuffer;
@@ -1088,7 +1088,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
         .setCodeModel(CodeModel::Large)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
-    const size_t numOfThreads = 4;
+    const size_t numOfThreads = 1;
 
     mAllLinkedSymbols = std::make_unique<SymbolMap>();
 

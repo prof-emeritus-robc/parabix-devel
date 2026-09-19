@@ -55,7 +55,10 @@ private:
     struct CacheOperand {
         MachineOperand MO;
         unsigned Flags = 0;
-        const TargetRegisterClass * RegClass = nullptr;
+        union {
+            const TargetRegisterClass * RegClass = nullptr;
+            size_t BasicBlockId;
+        };
 
         CacheOperand(const MachineOperand & src)
         : MO(src) {
@@ -68,6 +71,8 @@ private:
         uint64_t Flags;
         DebugLoc DL;
         SmallVector<CacheOperand, 2> Operands;
+        SmallVector<std::pair<unsigned, unsigned>, 0> TiedOperands;
+        SmallVector<unsigned, 0> EarlyClobberOperands;
 
         CacheInst() = default;
 
@@ -82,12 +87,12 @@ private:
     using RegMappingList = std::vector<std::pair<MCRegister, Register>>;
 
     struct CacheBasicBlock {
-        BasicBlock * Source = nullptr;
+        const BasicBlock * Source = nullptr;
         std::vector<CacheInst> Instructions;
         SmallVector<std::pair<size_t, BranchProbability>, 2> Successors;
         RegMappingList LiveOuts;
 
-        CacheBasicBlock(BasicBlock * bb = nullptr) : Source(bb) {}
+        CacheBasicBlock(const BasicBlock * bb = nullptr) : Source(bb) {}
     };
 
     struct CachedMachineFunction {
@@ -104,7 +109,6 @@ private:
 
 private:
     DenseMap<Function *, CachedMachineFunction, DenseMapInfo<Function *>> Cache;
-    std::unique_ptr<MachineFunction> CacheContainer;
 };
 
 bool FunctionSnippetTokenReplacerPass::doInitialization(Module & M)  {
@@ -148,19 +152,24 @@ bool FunctionSnippetTokenReplacerPass::runOnMachineFunction(MachineFunction & MF
     auto & MBPI = getAnalysis<MachineBranchProbabilityInfo>();
     auto & MRI = MF.getRegInfo();
 
+
     const TargetInstrInfo * const TII = MF.getSubtarget().getInstrInfo();
 
     RegisterMap CallerRetMap;
 
     RegisterMap GlobalRegMap;
 
+    RegisterMap LocalRegMap;
+
     SmallVector<MachineBasicBlock *, 0> BBMap;
 
     errs() << "Running FunctionSnippetTokenReplacerPass on " << MF.getName() << "\n";
 
+    using InstrIterator = MachineBasicBlock::iterator;
+
     auto doSplice = [&](const Function * const callee,
-            MachineBasicBlock & MBB, MachineBasicBlock::iterator callsite,
-            const CachedMachineFunction & cachedMF) {
+            MachineBasicBlock & MBB, InstrIterator callsite,
+            const CachedMachineFunction & cachedMF) -> InstrIterator {
 
         assert (callsite->isCall());
 
@@ -262,44 +271,73 @@ bool FunctionSnippetTokenReplacerPass::runOnMachineFunction(MachineFunction & MF
             }
         }
 
-
         const auto & CBBs = cachedMF.BasicBlock;
 
-        errs() << "snippet.size()=" << CBBs.size() << "\n";
-
         auto & HRI = MF.getRegInfo();
+
+        MachineBasicBlock * exitBlock = nullptr;
+        InstrIterator exitPoint;
+        auto ImplicitDef = TII->get(TargetOpcode::INLINEASM);
 
         if (LLVM_LIKELY(CBBs.size() == 1)) {
 
             const auto & CBB = CBBs[0];
+
+            for (auto & ret : CBB.LiveOuts) {
+                auto & phyReg = ret.first;
+                auto f = CallerRetMap.find(phyReg);
+                if (LLVM_LIKELY(f != CallerRetMap.end())) {
+                    GlobalRegMap[phyReg] = ret.second;
+                }
+            }
 
             assert (cachedMF.NumOfExitBlocks == 1);
 
             for (const CacheInst & CI : CBB.Instructions) {
 
                 if (LLVM_UNLIKELY(CI.Opcode == TargetOpcode::PATCHABLE_RET)) {
-                    for (auto & op : MI.operands()) {
-                        if (op.isReg() && op.isUse()) {
-                            const auto r = op.getReg();
-                            HRI.replaceRegWith(r, getRegister(r));
-                        }
-                    }
+                    exitBlock = &MBB;
                 } else {
 
-                    auto MIB = BuildMI(MBB, callsiteItr, CI.DL, TII->get(CI.Opcode));
-                    MIB.setMIFlags(CI.Flags);
+                    auto opDesc = TII->get(CI.Opcode);
+                    assert (!opDesc.isReturn());
 
-                    for (auto & op : CI.Operands) {
-                        const auto & MO = op.MO;
+                    MachineInstr * const MI = MF.CreateMachineInstr(ImplicitDef, CI.DL, true);
+
+                    const auto n = CI.Operands.size();
+
+                    for (size_t i = 0; i < n; ++i) {
+                        auto & op = CI.Operands[i];
+                        const MachineOperand & MO = op.MO;
                         if (MO.isReg()) {
-                            const auto r = getRegister(MO.getReg());
-                            MIB.addReg(r, op.Flags, MO.getSubReg());
+                            const auto r = getRegister(GlobalRegMap, MO.getReg());
+
+
+                            auto newReg = MachineOperand::CreateReg(r,
+                                                      MO.isDef(), MO.isImplicit(), MO.isKill(),
+                                                      MO.isDead(), MO.isUndef(), false,
+                                                      MO.getSubReg());
+
+                            assert (!newReg.isEarlyClobber());
+                            MI->addOperand(MF, newReg);
                         } else {
-                            MIB.add(MO);
+                            assert (!MO.isMBB());
+                            MI->addOperand(MF, MO);
                         }
                     }
 
-                    MBB.insert(callsite, MIB);
+                    MI->setDesc(opDesc);
+                    MI->setFlags(CI.Flags);
+
+                    for (auto ec : CI.EarlyClobberOperands) {
+                        MI->getOperand(ec).setIsEarlyClobber();
+                    }
+                    for (auto tied : CI.TiedOperands) {
+                        MI->tieOperands(tied.first, tied.second);
+                    }
+
+                    MBB.insert(callsite, MI);
+
                 }
             }
 
@@ -308,24 +346,19 @@ bool FunctionSnippetTokenReplacerPass::runOnMachineFunction(MachineFunction & MF
             MachineBasicBlock * const entryBlock = &MBB;
 
             const auto n = CBBs.size();
-
             BBMap.resize(n);
             BBMap[0] = entryBlock;
 
-            MachineBasicBlock * exitBlock = nullptr;
-            if (LLVM_UNLIKELY(cachedMF.NumOfExitBlocks > 1)) {
-
-            }
-
-
-            MachineBasicBlock * const exitBlock = MF.CreateMachineBasicBlock();
-            exitBlock->transferSuccessorsAndUpdatePHIs(entryBlock);
-            auto exitBlockItr = exitBlock->getIterator();
-
+            auto insertPoint = std::next(MBB.getIterator());
             for (unsigned i = 1; i < n; ++i) {
                 auto newBB = MF.CreateMachineBasicBlock(CBBs[i].Source);
                 BBMap[i] = entryBlock;
-                MF.insert(exitBlockItr, newBB);
+                MF.insert(insertPoint, newBB);
+            }
+            if (LLVM_LIKELY(cachedMF.NumOfExitBlocks > 1)) {
+                exitBlock = MF.CreateMachineBasicBlock();
+                entryBlock->splice(exitBlock->begin(), exitBlock, callsite);
+                MF.insert(insertPoint, exitBlock);
             }
 
             for (unsigned i = 0; i < n; ++i) {
@@ -337,57 +370,122 @@ bool FunctionSnippetTokenReplacerPass::runOnMachineFunction(MachineFunction & MF
                     targetBB->addSuccessor(BBMap[succ.first], succ.second);
                 }
 
-                RegisterMap LocalMap = GlobalRegMap;
+                LocalRegMap = GlobalRegMap;
 
                 for (auto & ret : CBB.LiveOuts) {
-
-
-
-
+                    auto & phyReg = ret.first;
+                    auto f = CallerRetMap.find(phyReg);
+                    if (LLVM_LIKELY(f != CallerRetMap.end())) {
+                        LocalRegMap[phyReg] = ret.second;
+                    }
                 }
 
-                for (auto & MI : *snippetBB) {
-                    if (LLVM_UNLIKELY(MI.isReturn())) {
+                for (const CacheInst & CI : CBB.Instructions) {
 
-                        for (auto & op : MI.operands()) {
-                            if (op.isReg() && op.isUse()) {
-                                const auto r = op.getReg();
-                                auto f = RegMap.find(r);
-                                assert (f != RegMap.end());
-                                HRI.replaceRegWith(r, f->second);
-                            }
+                    if (LLVM_UNLIKELY(CI.Opcode == TargetOpcode::PATCHABLE_RET)) {
+
+                        if (LLVM_LIKELY(cachedMF.NumOfExitBlocks == 1)) {
+                            targetBB->splice(targetBB->end(), targetBB, callsite);
+                            exitBlock = targetBB;
+                        } else {
+                            assert (exitBlock);
+                            targetBB->addSuccessor(exitBlock);
+                            BuildMI(targetBB, callsite->getDebugLoc(), TII->get(TargetOpcode::G_BR)).addMBB(exitBlock);
                         }
-
-                        targetBB->addSuccessor(exitBlock);
-                        const auto CallFrameSetup = TII->getCallFrameSetupOpcode();
-                        BuildMI(targetBB, callsite.getDebugLoc(), TII->get(CallFrameSetup)).addMBB(exitBlock);
-                        exitBlock->transferSuccessorsAndUpdatePHIs(entryBlock);
 
                     } else {
 
+                        auto opDesc = TII->get(CI.Opcode);
+                        assert (!opDesc.isReturn());
 
-                        MachineInstr * const cloned = MF.CloneMachineInstr(&MI);
-                        cloned->setDebugLoc(MI.getDebugLoc());
-                        for (auto & op : cloned->operands()) {
-                            if (op.isReg()) {
-                                op.setReg(getRegister(op.getReg()));
-                            } else if (op.isMBB()) {
-                                const auto bbf = BBMap.find(op.getMBB());
-                                if (LLVM_LIKELY(bbf != BBMap.end())) {
-                                    op.setMBB(bbf->second);
-                                }
+                        MachineInstr * const MI = MF.CreateMachineInstr(ImplicitDef, CI.DL, true);
+
+                        const auto n = CI.Operands.size();
+
+                        for (size_t i = 0; i < n; ++i) {
+                            auto & op = CI.Operands[i];
+                            const MachineOperand & MO = op.MO;
+                            if (MO.isReg()) {
+                                const auto r = getRegister(GlobalRegMap, MO.getReg());
+
+                                auto newReg = MachineOperand::CreateReg(r,
+                                                          MO.isDef(), MO.isImplicit(), MO.isKill(),
+                                                          MO.isDead(), MO.isUndef(), false,
+                                                          MO.getSubReg());
+                                assert (!newReg.isEarlyClobber());
+                                MI->addOperand(MF, newReg);
+                            } else if (MO.isMBB()) {
+                                auto newMBB = MachineOperand::CreateMBB(BBMap[op.BasicBlockId], MO.getTargetFlags());
+                                MI->addOperand(MF, newMBB);
+                            } else {
+                                assert (!MO.isMBB());
+                                MI->addOperand(MF, MO);
                             }
                         }
-                        targetBB->push_back(cloned);
+
+                        MI->setDesc(opDesc);
+                        MI->setFlags(CI.Flags);
+
+                        for (auto ec : CI.EarlyClobberOperands) {
+                            MI->getOperand(ec).setIsEarlyClobber();
+                        }
+                        for (auto tied : CI.TiedOperands) {
+                            MI->tieOperands(tied.first, tied.second);
+                        }
+
+                        MBB.insert(targetBB->end(), MI);
                     }
                 }
+
+                GlobalRegMap.clear();
+
             }
 
             BBMap.clear();
+
+            assert (exitBlock != entryBlock);
+
+
         }
 
         GlobalRegMap.clear();
 
+        assert (callsite->getParent() == exitBlock);
+
+        if (callsite->getParent() != &MBB) {
+            callsite->getParent()->transferSuccessorsAndUpdatePHIs(&MBB);
+        }
+
+        auto remaining = CallerRetMap.size();
+
+        if (remaining) {
+            auto deadCopyItr = std::next(callsite);
+            for (;;) {
+                while (deadCopyItr != exitBlock->end() ) {
+                    auto next = std::next(deadCopyItr);
+                    if (deadCopyItr->isCopy()) {
+                        auto reg = deadCopyItr->getOperand(0).getReg();
+                        if (reg.isVirtual()) {
+                            for (auto v : CallerRetMap) {
+                                if (v.second == reg) {
+                                    deadCopyItr->eraseFromParent();
+                                    if (--remaining == 0) {
+                                        goto no_more_dead_copies;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    deadCopyItr = next;
+                }
+            }
+        }
+no_more_dead_copies:
+        auto next = std::next(callsite);
+        callsite->eraseFromParent();
+        return next;
     };
 
 
@@ -412,53 +510,87 @@ bool FunctionSnippetTokenReplacerPass::runOnMachineFunction(MachineFunction & MF
         Module * const M = F.getParent();
 
         for (auto & MBB : MF) {
-            auto itr = MBB.begin();
-            while (itr != MBB.end()) {
-                MachineInstr & I = *itr++;
+
+            for (auto itr = MBB.begin(); itr != MBB.end(); ) {
+                MachineInstr & I = *itr;
                 if (I.isCall()) {
                     const Function * const callee = getCalleeFunction(M, MF, I);
                     if (callee == nullptr) continue;
-                    const auto f = Cache.find(callee);
-                    assert (f != Cache.end());
-                    doSplice(callee, MBB, itr, f->second);
-                    I.eraseFromParent();
-                    Changed = true;
+                    errs() << "callee=" << callee->getName() << "\n";
+                    if (callee->hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
+                        const auto f = Cache.find(callee);
+                        assert (f != Cache.end());
+                        itr = doSplice(callee, MBB, itr, f->second);
+                        Changed = true;
+                        continue;
+                    }
                 }
+                ++itr;
             }
         }
 
+
+
     }
+
+    MF.verify(nullptr, "Function Snippet Replacement error", true);
 
     return Changed;
 }
 
-inline const Function * FunctionSnippetTokenReplacerPass::getCalleeFunction(Module * M, MachineFunction & MF, MachineInstr & call) const {
-    assert (call.isCall());
-    for (auto & callee : call.operands()) {
-        if (callee.isReg()) {
-            auto reg = callee.getReg();
-            if (reg.isVirtual()) {
-                auto & MRI = MF.getRegInfo();
-                auto defMI = MRI.getVRegDef(reg);
-                if (defMI) {
-                    for (auto & callee : defMI->operands()) {
-                        if (callee.isGlobal()) {
-                            const Function * f = dyn_cast_or_null<Function>(callee.getGlobal());
-                            if (f && f->hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
-                                return f;
+const Function * FunctionSnippetTokenReplacerPass::getCalleeFunction(Module * M, MachineFunction & MF, MachineInstr & call) const {
+    if (call.getNumOperands() == 0) {
+        return nullptr;
+    }
+    const auto & targetOp = call.getOperand(0);
+    if (targetOp.isReg()) {
+        auto reg = targetOp.getReg();
+        if (reg.isVirtual()) {
+
+            SmallVector<MachineInstr *, 4> potential;
+            SmallPtrSet<MachineInstr *, 4> visited;
+
+            auto & MRI = MF.getRegInfo();
+            auto defMI = MRI.getVRegDef(reg);
+            if (defMI) {
+
+                visited.insert(defMI);
+
+                for (;;) {
+
+                    const auto n = defMI->getNumOperands();
+                    if (LLVM_UNLIKELY(defMI->isPHI())) {
+                        for (size_t i = 1; i < n; i += 2) {
+                            auto reg = defMI->getOperand(i).getReg();
+                            if (reg.isVirtual()) {
+                                auto nextDefMI = MRI.getVRegDef(reg);
+                                if (nextDefMI && visited.insert(nextDefMI).second) {
+                                    potential.push_back(nextDefMI);
+                                }
                             }
                         }
-                        if (callee.isCPI()) {
-                            const MachineConstantPool * P = MF.getConstantPool();
-                            const auto & Constants = P->getConstants();
-                            const auto idx = callee.getCFIIndex();
-                            if (idx < Constants.size()) {
-                                auto & C = Constants[idx];
-                                if (C.isMachineConstantPoolEntry()) {
-                                    continue;
+                    } else {
+
+                        for (size_t i = 0; i < n; ++i) {
+                            const auto & callee = defMI->getOperand(i);
+                            if (callee.isGlobal()) {
+                                const Function * const f = dyn_cast<Function>(callee.getGlobal());
+                                if (f) {
+                                    return f;
                                 }
-                                auto f = dyn_cast_or_null<Function>(C.Val.ConstVal);
-                                if (f && f->hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
+                            }
+                            if (callee.isSymbol()) {
+                                auto symbolName = callee.getSymbolName();
+                                assert (symbolName);
+                                errs() << "isSymbol\n";
+                                const auto prefix = MF.getDataLayout().getGlobalPrefix();
+                                if (prefix && *symbolName == prefix)  {
+                                    ++symbolName;
+                                }
+                                // Any SymbolName over 4K is almost-certainly malicious
+                                StringRef nm{symbolName, strnlen(symbolName, MAXIMUM_SYMBOL_LENGTH)};
+                                const Function * const f = M->getFunction(nm);
+                                if (f) {
                                     return f;
                                 }
                             }
@@ -466,38 +598,27 @@ inline const Function * FunctionSnippetTokenReplacerPass::getCalleeFunction(Modu
 
                     }
 
+                    if (potential.empty()) {
+                        break;
+                    }
+
+                    defMI = potential.pop_back_val();
                 }
             }
         }
-        if (callee.isGlobal()) {
-            const Function * const f = dyn_cast<Function>(callee.getGlobal());
-            if (f && f->hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
-                return f;
-            }
-        }
-        if (callee.isSymbol()) {
-            auto symbolName = callee.getSymbolName();
-            if (LLVM_UNLIKELY(symbolName == nullptr)) {
-
-            }
-            const auto prefix = MF.getDataLayout().getGlobalPrefix();
-            if (prefix && *symbolName == prefix)  {
-                ++symbolName;
-            }
-            // Any SymbolName over 4K is almost-certainly malicious
-            StringRef nm{symbolName, strnlen(symbolName, MAXIMUM_SYMBOL_LENGTH)};
-            const Function * const f = M->getFunction(nm);
-            if (f && f->hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
-                return f;
-            }
-        }
     }
+
+
     return nullptr;
 }
 
 inline void FunctionSnippetTokenReplacerPass::serializeToCache(Function &F, MachineFunction &MF, MachineModuleInfo & MMI) {
 
-    asser (F.getCallingConv() == CallingConv::Fast);
+    assert (F.getCallingConv() == CallingConv::Fast);
+
+    errs() << "===============================\n";
+    MF.dump();
+    errs() << "===============================\n";
 
     const MachineRegisterInfo & MRI = MF.getRegInfo();
     const TargetRegisterInfo * TRI = MF.getSubtarget().getRegisterInfo();
@@ -583,6 +704,9 @@ inline void FunctionSnippetTokenReplacerPass::serializeToCache(Function &F, Mach
         }
         END_SCOPED_REGION
 
+        SmallVector<size_t, 4> ImplicitOperands;
+        SmallVector<size_t, 4> OperandOutIndex;
+
         for (MachineInstr & MI : MBB) {
             if (MI.getFlag(MachineInstr::FrameSetup) || MI.getFlag(MachineInstr::FrameDestroy)) {
                 continue;
@@ -629,14 +753,38 @@ inline void FunctionSnippetTokenReplacerPass::serializeToCache(Function &F, Mach
                 // at this state of the compilation process and acts as a clear IsReturn flag. It must not be
                 // used as an actual OpCode by the inlining function.
                 ret.Opcode = TargetOpcode::PATCHABLE_RET;
-                CBB.Instructions.emplace_back(CacheInst(MI));
+                CBB.Instructions.emplace_back(ret);
 
                 cache.NumOfExitBlocks++;
-                break;
 
             } else {
                 CacheInst cinst(MI);
-                for (const MachineOperand & op : MI.operands()) {
+                const auto m = MI.getNumOperands();
+
+                OperandOutIndex.resize(m);
+                assert (ImplicitOperands.empty());
+
+                size_t j = 0;
+
+                for (size_t i = 0; i < m; ++i) {
+                    const MachineOperand & op = MI.getOperand(i);
+                    if (op.isReg() && op.isImplicit()) {
+                        ImplicitOperands.push_back(i);
+                    } else {
+                        OperandOutIndex[j++] = i;
+                    }
+                }
+                for (auto i : ImplicitOperands) {
+                    OperandOutIndex[j++] = i;
+                }
+                ImplicitOperands.clear();
+                assert (j == m);
+
+
+                for (size_t i : OperandOutIndex) {
+                    const MachineOperand & op = MI.getOperand(i);
+
+
                     CacheOperand CO(op);
                     if (op.isReg()) {
                         auto reg = op.getReg();
@@ -647,16 +795,38 @@ inline void FunctionSnippetTokenReplacerPass::serializeToCache(Function &F, Mach
                         }
 
                         unsigned Flags = 0;
-                        if (op.isDef()) Flags |= RegState::Define;
-                        if (op.isImplicit()) Flags |= RegState::Define;
-                        if (op.isKill()) Flags |= RegState::Kill;
-                        if (op.isDead()) Flags |= RegState::Dead;
-                        if (op.isUndef()) Flags |= RegState::Undef;
-                        if (op.isEarlyClobber()) Flags |= RegState::EarlyClobber;
+//                        if (op.isDef()) Flags |= RegState::Define;
+//                        if (op.isImplicit()) Flags |= RegState::Implicit;
+//                        if (op.isKill()) Flags |= RegState::Kill;
+//                        if (op.isDead()) Flags |= RegState::Dead;
+//                        if (op.isUndef()) Flags |= RegState::Undef;
+//                        if (op.isEarlyClobber()) Flags |= RegState::EarlyClobber;
+//                        if (op.isDebug()) Flags |= RegState::Debug;
+//                        if (op.isInternalRead()) Flags |= RegState::InternalRead;
+
+
                         CO.Flags = Flags;
 
+                        if (op.isEarlyClobber()) {
+                            cinst.EarlyClobberOperands.push_back(i);
+                        }
+
+                        if (op.isTied()) {
+                            const auto tiedIdx = OperandOutIndex[MI.findTiedOperandIdx(i)];
+                            if (i > tiedIdx) {
+                                cinst.TiedOperands.emplace_back(tiedIdx, i);
+                            }
+                        }
+
+                    } else if (op.isMBB()) {
+                        auto f = BBIndex.find(op.getMBB());
+                        assert (f != BBIndex.end());
+                        CO.BasicBlockId = f->second;
                     }
                     cinst.Operands.emplace_back(CO);
+
+
+
                 }
                 CBB.Instructions.emplace_back(cinst);
             }
@@ -718,7 +888,7 @@ Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef na
 
         //        snippetFunction->setVisibility(Function::HiddenVisibility);
                 snippetFunction->setCallingConv(CallingConv::Fast);
-                snippetFunction->addFnAttr(Attribute::NoInline);
+
         //        appendToCompilerUsed(*m, {snippetFunction});
 
         std::array<Metadata *, 1> C;
@@ -804,36 +974,53 @@ Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef na
     return retStruct;
 }
 
-FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(llvm::Module * M, llvm::PassManagerBase & pm, const bool addPostOptimizations)
+FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(Module & M, llvm::PassManagerBase & pm, const bool addPostOptimizations)
 : BasePM(pm)
-, AddPostOptimizations(addPostOptimizations) {
+, AddPostOptimizations(addPostOptimizations)
+, AlreadyInsertedFunctionSnippetPass(false) {
     // TODO: we need to scan through the function declarations in M to see if any snippets are single use ones.
     // We can add a LLVM AlwaysInline attribute to those to let LLVM deal with them completely. Only if we have a
     // multi-use snippet do we need to run the snippet inliner pass on M. This has the added benefit of the pass
     // knowing it will have some work to do on at least one function in M.
+//    AlreadyInsertedFunctionSnippetPass = true;
+//    for (Function & F : M) {
+//        if (F.hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
+//            if (F.getNumUses() > 1) {
+//                F.addFnAttr(Attribute::NoInline);
+//                AlreadyInsertedFunctionSnippetPass = false;
+//            } else {
+//                F.addFnAttr(Attribute::AlwaysInline);
+//            }
+//        }
+//    }
+
 }
 
 
 void FunctionSnippetPassManagerProxy::add(Pass * P) {
-    if (LLVM_UNLIKELY(P == nullptr)) return;
-    if (P->getPassID() == &TargetPassConfig::ID) {
-        auto * TPC = static_cast<TargetPassConfig *>(P);
-        TPC->setRequiresCodeGenSCCOrder();
-    }
-    BasePM.add(P);
-    if (P->getPassID() == &FinalizeISelID) {
-        BasePM.add(createFunctionSnippetTokenReplacerPass());
-        if (AddPostOptimizations) {
-            const PassRegistry & PR = *PassRegistry::getPassRegistry();
-            auto addPassById = [&](AnalysisID PassId) {
-                auto * PI = PR.getPassInfo(&PassId);
-                if (PI) {
-                    BasePM.add(PI->createPass());
-                }
-            };
-            addPassById(&MachineCSEID);
-            addPassById(&PeepholeOptimizerID);
-            addPassById(&DeadMachineInstructionElimID);
+//    if (AlreadyInsertedFunctionSnippetPass) {
+//        BasePM.add(P);
+//    } else {
+        if (P->getPassID() == &TargetPassConfig::ID) {
+            auto * TPC = static_cast<TargetPassConfig *>(P);
+            TPC->setRequiresCodeGenSCCOrder();
         }
-    }
+        BasePM.add(P);
+        if (P->getPassID() == &FinalizeISelID) {
+            BasePM.add(createFunctionSnippetTokenReplacerPass());
+            if (AddPostOptimizations) {
+                const PassRegistry & PR = *PassRegistry::getPassRegistry();
+                auto addPassById = [&](AnalysisID PassId) {
+                    auto * PI = PR.getPassInfo(&PassId);
+                    if (PI) {
+                        BasePM.add(PI->createPass());
+                    }
+                };
+                addPassById(&MachineCSEID);
+                addPassById(&PeepholeOptimizerID);
+                addPassById(&DeadMachineInstructionElimID);
+            }
+        }
+        AlreadyInsertedFunctionSnippetPass = true;
+//    }
 }

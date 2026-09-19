@@ -14,13 +14,14 @@ llvm::Value * CallFunctionByToken(IDISA::IDISA_Builder & b,
 class FunctionSnippetPassManagerProxy final : public llvm::PassManagerBase {
 public:
 
-    FunctionSnippetPassManagerProxy(llvm::Module * M, llvm::PassManagerBase & pm, const bool addPostOptimizations);
+    FunctionSnippetPassManagerProxy(llvm::Module & M, llvm::PassManagerBase & pm, const bool addPostOptimizations);
 
     void add(llvm::Pass * P) override;
 
 private:
     llvm::PassManagerBase & BasePM;
     const bool AddPostOptimizations;
+    bool AlreadyInsertedFunctionSnippetPass;
 };
 
 

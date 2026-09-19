@@ -13,6 +13,7 @@
 #include <toolchain/toolchain.h>
 #include "compiler/pipeline_compiler.hpp"
 #include <boost/format.hpp>
+#include <atomic>
 
 // TODO: the builders should detect if there is only one kernel in a pipeline / both branches are equivalent and return the single kernel. Modify addOrDeclareMainFunction.
 
@@ -552,6 +553,21 @@ Kernel * PipelineBuilder::makeKernel() {
     }
 
     signature = PipelineKernel::annotateSignatureWithPipelineFlags(std::move(signature));
+
+    if (LLVM_UNLIKELY(mTarget->hasInternallyGeneratedStreamSets())) {
+        // A dynamic RepeatingStreamSet's actual pattern data is deliberately left out of
+        // the signature above (it's substituted in later, when addOrDeclareMainFunction
+        // bakes it into the compiled "main" as an LLVM Constant -- see
+        // PipelineKernel::createRepeatingStreamSet), so two pipelines that are otherwise
+        // structurally identical but carry different pattern content hash the same. That's
+        // fine for a signature used only to test structural equivalence, but this hash also
+        // becomes this pipeline's exported "_main" symbol name, which must be unique across
+        // everything ever JIT-linked together: two independently-compiled pipelines sharing
+        // that name is a hard duplicate-symbol link failure, not just a missed cache hit.
+        // Mix in a process-wide counter so it always is.
+        static std::atomic<uint64_t> nextId{0};
+        signature += '#' + std::to_string(nextId.fetch_add(1, std::memory_order_relaxed));
+    }
 
     mTarget->mKernelName =
         Kernel::annotateKernelNameWithDebugFlags(Kernel::TypeId::Pipeline, mTarget->mFlags, PipelineKernel::makePipelineHashName(signature));

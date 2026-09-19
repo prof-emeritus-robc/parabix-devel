@@ -371,9 +371,17 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
 
     Constant * const patternVec = ConstantArray::get(arrTy, dataVectorArray);
 
+    // PrivateLinkage: this global is only ever read as an LLVM Value* within the
+    // same "main" module it's created in (via paramMap, during construction of
+    // nested/family kernel calls in this same function). Every pipeline's main
+    // module restarts LLVM's anonymous-global numbering from scratch, so leaving
+    // this unnamed with ExternalLinkage gave two different pipelines' pattern
+    // globals the same auto-generated external symbol name (e.g. "___unnamed_1"),
+    // which ORC's linker then rejected as a duplicate definition once both were
+    // materialized into the same JITDylib.
     Module & mod = *b.getModule();
     GlobalVariable * const patternData =
-        new GlobalVariable(mod, arrTy, true, GlobalValue::ExternalLinkage, patternVec);
+        new GlobalVariable(mod, arrTy, true, GlobalValue::PrivateLinkage, patternVec);
     const auto align = blockWidth / 8;
     patternData->setAlignment(MaybeAlign{align});
     return ParamMap::PairEntry{patternData, b.getSize(patternLength)};

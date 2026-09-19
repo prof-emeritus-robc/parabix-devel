@@ -802,6 +802,19 @@ private:
         if (Target->hasSignature()) {
             nm << '\0' << Target->getSignature();
         }
+        if (LLVM_UNLIKELY(!Target->isCachable())) {
+            // Signature-based dedup assumes the signature captures everything that
+            // affects the compiled artifact. isCachable() being false means the
+            // opposite for kernels with internally generated (e.g. repeating)
+            // streamsets: their actual runtime pattern data isn't folded into the
+            // signature, so two structurally-identical-but-content-different
+            // instances hash the same. Mix in the Target's own address so this
+            // instance never gets deduped against an unrelated one -- deduping
+            // them shared the wrong pattern data (silent wrong output) and could
+            // leave this Target without a live PipelineCompiler when it later
+            // needed to regenerate metadata (fatal error).
+            nm << '\0' << Target;
+        }
         const auto sig = nm.str();
 
         BEGIN_SCOPED_REGION

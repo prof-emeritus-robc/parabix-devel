@@ -202,8 +202,11 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     };
 
     // compile any uncompiled kernels
-    addModules(Infrequent, codegen::BackEndOptLevel);
-    addModules(Normal, CodeGenOptLevel::Default);
+    {
+        NamedRegionTimer T("object-generation", "object-generation", "object", "Object Generation", codegen::TimeKernelsIsEnabled);
+        addModules(Infrequent, codegen::BackEndOptLevel);
+        addModules(Normal, CodeGenOptLevel::Default);
+    }
 
     // write/declare the "main" method
     auto mainModule = std::make_unique<Module>("main", *mContext);

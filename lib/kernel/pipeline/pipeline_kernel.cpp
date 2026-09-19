@@ -482,28 +482,36 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder 
     assert (hasInternallyGeneratedStreamSets());
 
     Module * const M = b.getModule();
-    NamedMDNode * msl = M->getNamedMetadata("rsl");
+    // Named per this kernel (RSL_METADATA_PREFIX + getName()), not a shared "rsl": a nested
+    // pipeline kernel's recursive call below can land in the same module as an outer one
+    // that already (re)wrote its own metadata there (e.g. addOrDeclareMainFunction()
+    // regenerating the outer kernel's "rsl" into materializeMain's "main" module before
+    // recursing into a nested kernel that also has internally generated streamsets). An
+    // unqualified, shared name would let this lookup find the outer kernel's array --
+    // present, so never regenerated -- and silently misread it as this kernel's own,
+    // producing a far-too-small scale factor for any nested kernel beyond the first level.
+    const auto mdName = RSL_METADATA_PREFIX + getName();
+    NamedMDNode * msl = M->getNamedMetadata(mdName);
     if (LLVM_UNLIKELY(msl == nullptr)) {
-        // The "rsl" metadata is normally written once, into the module current when
+        // The metadata is normally written once, into the module current when
         // addPipelineKernelProperties() ran (during kernel property declaration). But
         // this function can also be reached from addOrDeclareMainFunction() against a
         // different, later module (e.g. materializeMain's "main" module) that never
-        // went through that pass, so regenerate it here if it's missing. This must be
-        // called on the outermost pipeline kernel (the only one COMPILER is bracketed
-        // to be valid for here), which is always the case: recursive calls to this
-        // function only happen after the outer call already ensured the metadata
-        // exists. Regeneration needs a live PipelineCompiler (COMPILER, bracketed to
-        // mCompiler by addOrDeclareMainFunction's CompilerScope), which only exists for
-        // kernels that went through declareStateTypes -- i.e. never for a cache hit, so
-        // isCachable() keeps kernels with internally generated streamsets uncachable to
-        // guarantee that here.
+        // went through that pass, so regenerate it here if it's missing. Regeneration
+        // needs a live PipelineCompiler (COMPILER, bracketed to mCompiler by
+        // addOrDeclareMainFunction's CompilerScope for the outermost kernel, and by
+        // this kernel's own declareStateTypes()/generateKernel() bracket otherwise),
+        // which only exists for kernels that went through declareStateTypes -- i.e.
+        // never for a cache hit, so isCachable() keeps kernels with internally
+        // generated streamsets uncachable to guarantee that here.
         if (LLVM_UNLIKELY(COMPILER == nullptr)) {
-            report_fatal_error("PipelineKernel::writeInternallyGeneratedStreamSetScaleVector: "
-                               "cannot regenerate \"rsl\" metadata without a live PipelineCompiler "
-                               "(is this kernel cached despite having internally generated streamsets?)");
+            report_fatal_error(Twine("PipelineKernel::writeInternallyGeneratedStreamSetScaleVector: "
+                               "cannot regenerate \"") + mdName + "\" metadata without a live "
+                               "PipelineCompiler (is this kernel cached despite having "
+                               "internally generated streamsets?)");
         }
         COMPILER->generateMetaDataForRepeatingStreamSets(b);
-        msl = M->getNamedMetadata("rsl");
+        msl = M->getNamedMetadata(mdName);
     }
     assert (msl);
     assert (msl->getNumOperands() > 0);
@@ -524,7 +532,22 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder 
     for (unsigned i = 0; i != m; ++i) {
         const Kernel * const kernel = mKernels[i].Object;
         if (LLVM_UNLIKELY(kernel->hasInternallyGeneratedStreamSets())) {
-            kernel->writeInternallyGeneratedStreamSetScaleVector(b, R, V, getJthOffset(j++));
+            // COMPILER (see the macro above) resolves to b.getCompiler(), whichever
+            // PipelineCompiler is currently installed on b -- normally this kernel's own,
+            // for the duration of its own compile. If the recursive call below needs to
+            // regenerate its metadata (see the mdName lookup above), it must find *its
+            // own* PipelineCompiler there, or generateMetaDataForRepeatingStreamSets runs
+            // against the wrong mTarget and (re)writes this (outer) kernel's own data
+            // under the nested kernel's name instead. Swap in the nested kernel's own
+            // compiler for the duration of its call. hasInternallyGeneratedStreamSets()
+            // only returns true for PipelineKernel, and isCachable() keeps such kernels
+            // uncachable, so they always go through declareStateTypes and thus always
+            // have a live mCompiler by this point.
+            const auto * const nested = cast<PipelineKernel>(kernel);
+            KernelCompiler * const savedCompiler = b.getCompiler();
+            b.setCompiler(nested->mCompiler.get());
+            nested->writeInternallyGeneratedStreamSetScaleVector(b, R, V, getJthOffset(j++));
+            b.setCompiler(savedCompiler);
         }
     }
 

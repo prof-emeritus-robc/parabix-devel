@@ -60,7 +60,14 @@ void PipelineCompiler::generateMetaDataForRepeatingStreamSets(KernelBuilder & b)
         }
 
         Module * const module = b.getModule();
-        NamedMDNode * const md = module->getOrInsertNamedMetadata("rsl");
+        // Qualify the metadata node by the owning kernel's name: a nested pipeline kernel's
+        // own "rsl" data can end up sharing a module with its parent's (e.g. the parent's
+        // addOrDeclareMainFunction() regenerating its own "rsl" into the same "main" module
+        // a nested kernel's recursive writeInternallyGeneratedStreamSetScaleVector() call
+        // later inspects). A single, unqualified "rsl" name meant that lookup found the
+        // parent's array -- present, so never regenerated -- and silently misread it as this
+        // kernel's own, producing a far-too-small scale factor.
+        NamedMDNode * const md = module->getOrInsertNamedMetadata(RSL_METADATA_PREFIX + mTarget->getName());
         assert (md->getNumOperands() == 0);
         Constant * ar = ConstantArray::get(ArrayType::get(b.getSizeTy(), maxStrides.size()), maxStrides);
         md->addOperand(MDNode::get(module->getContext(), {ConstantAsMetadata::get(ar)}));

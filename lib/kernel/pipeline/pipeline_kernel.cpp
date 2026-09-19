@@ -313,19 +313,21 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
 
     unsigned runLength = 0;
     unsigned copyableLength = 0;
+    // Round up patternLength and maxStrideLength separately, then sum: a consumer accessed
+    // via a "virtual base pointer" (see PipelineCompiler::getVirtualBaseAddress) only
+    // recomputes that pointer once per doSegment() call, then indexes it linearly for every
+    // stride within that call -- so this buffer must physically hold enough padding blocks
+    // to cover the worst case, even when maxStrideLength is far smaller than blockWidth.
+    // Rounding up the *sum* (patternLength + maxStrideLength) instead, as opposed to each
+    // term, can round down relative to this: e.g. patternLength=6, maxStrideLength=4,
+    // blockWidth=512 needs ceil(6/512)+ceil(4/512) = 2 blocks, but ceil((6+4)/512) = 1 --
+    // one block short, causing out-of-bounds reads (silently wrong data, not a crash) on
+    // any stride past the first within such a call -- reproducible via
+    // test_repeatingstreamset -nested=1 with an unaligned, single-element streamset.
     if (numElements == 1 && ss->isUnaligned()) {
-        runLength = ((patternLength + maxStrideLength + blockWidth - 1UL) / blockWidth);
+        runLength = ((patternLength + blockWidth - 1UL) / blockWidth) + ((maxStrideLength + blockWidth - 1UL) / blockWidth);
     } else {
         runLength = (patternLength / blockWidth);
-        // Round up: a consumer accessed via a "virtual base pointer" (see
-        // PipelineCompiler::getVirtualBaseAddress) only recomputes that pointer once
-        // per doSegment() call, then indexes it linearly for every stride within that
-        // call -- so this buffer must physically hold `copyableLength` extra blocks of
-        // (repeated) padding to cover the worst case, even when maxStrideLength is far
-        // smaller than blockWidth. Truncating instead of rounding up left the buffer
-        // with zero padding blocks whenever maxStrideLength < blockWidth, causing
-        // out-of-bounds reads (silently wrong data, not a crash) on any stride past the
-        // first within such a call -- reproducible via test_repeatingstreamset -nested=1.
         copyableLength = ((maxStrideLength + blockWidth - 1UL) / blockWidth);
     }
 

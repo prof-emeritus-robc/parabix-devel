@@ -324,7 +324,16 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
         runLength = ((patternLength + maxStrideLength + blockWidth - 1UL) / blockWidth);
     } else {
         runLength = (patternLength / blockWidth);
-        copyableLength = (maxStrideLength / blockWidth);
+        // Round up: a consumer accessed via a "virtual base pointer" (see
+        // PipelineCompiler::getVirtualBaseAddress) only recomputes that pointer once
+        // per doSegment() call, then indexes it linearly for every stride within that
+        // call -- so this buffer must physically hold `copyableLength` extra blocks of
+        // (repeated) padding to cover the worst case, even when maxStrideLength is far
+        // smaller than blockWidth. Truncating instead of rounding up left the buffer
+        // with zero padding blocks whenever maxStrideLength < blockWidth, causing
+        // out-of-bounds reads (silently wrong data, not a crash) on any stride past the
+        // first within such a call -- reproducible via test_repeatingstreamset -nested=1.
+        copyableLength = ((maxStrideLength + blockWidth - 1UL) / blockWidth);
     }
 
     const auto totalStrides = runLength + copyableLength;
@@ -378,9 +387,17 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
 
     Constant * const patternVec = ConstantArray::get(arrTy, dataVectorArray);
 
+    // PrivateLinkage: this global is only ever read as an LLVM Value* within the same
+    // "main" module it's created in (via paramMap, during construction of nested/family
+    // kernel calls in this same function). Every pipeline's main module restarts LLVM's
+    // anonymous-global numbering from scratch, so leaving this unnamed with
+    // ExternalLinkage gave two different pipelines' pattern globals the same
+    // auto-generated external symbol name (e.g. "___unnamed_1"), which the JIT's linker
+    // then rejected as a duplicate definition once both were added to the same engine
+    // (e.g. across multiple P.compile() calls against the same driver).
     Module & mod = *b.getModule();
     GlobalVariable * const patternData =
-        new GlobalVariable(mod, arrTy, true, GlobalValue::ExternalLinkage, patternVec);
+        new GlobalVariable(mod, arrTy, true, GlobalValue::PrivateLinkage, patternVec);
     const auto align = blockWidth / 8;
     patternData->setAlignment(MaybeAlign{align});
     return ParamMap::PairEntry{patternData, b.getSize(patternLength)};
@@ -455,11 +472,28 @@ bool PipelineKernel::isCachable() const {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief writeInternallyGeneratedStreamSetScaleVector
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
+void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder & b, const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
     assert (hasInternallyGeneratedStreamSets());
 
     Module * const M = getModule();
-    NamedMDNode * const msl = M->getNamedMetadata("rsl");
+    NamedMDNode * msl = M->getNamedMetadata("rsl");
+    if (LLVM_UNLIKELY(msl == nullptr)) {
+        // The "rsl" metadata is normally written once, into the module current when
+        // addPipelineKernelProperties() ran (during kernel property declaration). But
+        // this function can also be reached from addOrDeclareMainFunction() against a
+        // different, later module (the standalone "main" module built in
+        // CPUDriver::finalizeObject) that never went through that pass, so regenerate
+        // it here if it's missing. This must be called on the outermost pipeline kernel,
+        // which is always the case: recursive calls to this function only happen after
+        // the outer call already ensured the metadata exists. mKernels (the graph this
+        // depends on) is fixed at pipeline-construction time and is unaffected by
+        // whether this instance's own kernel body was a cache hit, so a freshly
+        // instantiated PipelineCompiler -- the same one-shot pattern Kernel::
+        // generateKernel() itself uses -- can redo this analysis here.
+        auto compiler = instantiateKernelCompiler(b);
+        static_cast<PipelineCompiler *>(compiler.get())->generateMetaDataForRepeatingStreamSets(b);
+        msl = M->getNamedMetadata("rsl");
+    }
     assert (msl);
     assert (msl->getNumOperands() > 0);
     assert (msl->getOperand(0)->getNumOperands() > 0);
@@ -479,7 +513,7 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(const Relation
     for (unsigned i = 0; i != m; ++i) {
         const Kernel * const kernel = mKernels[i].Object;
         if (LLVM_UNLIKELY(kernel->hasInternallyGeneratedStreamSets())) {
-            kernel->writeInternallyGeneratedStreamSetScaleVector(R, V, getJthOffset(j++));
+            kernel->writeInternallyGeneratedStreamSetScaleVector(b, R, V, getJthOffset(j++));
         }
     }
 
@@ -692,7 +726,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     if (hasInternallyGeneratedStreamSets()) {
         const auto & I = getInternallyGeneratedStreamSets();
         MetadataScaleVector scaleVector(I.size(), 0U);
-        writeInternallyGeneratedStreamSetScaleVector(I, scaleVector, 1U);
+        writeInternallyGeneratedStreamSetScaleVector(b, I, scaleVector, 1U);
         const auto n = I.size();
         for (unsigned i = 0; i < n; ++i) {
             assert (scaleVector[i] > 0);

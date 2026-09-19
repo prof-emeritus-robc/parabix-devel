@@ -223,7 +223,7 @@ protected:
         return mInternallyGeneratedStreamSets;
     }
 
-    void writeInternallyGeneratedStreamSetScaleVector(const Relationships & R, MetadataScaleVector & V, const size_t scale) const final;
+    void writeInternallyGeneratedStreamSetScaleVector(KernelBuilder & b, const Relationships & R, MetadataScaleVector & V, const size_t scale) const final;
 
     ParamMap::PairEntry createRepeatingStreamSet(KernelBuilder & b, const RepeatingStreamSet * streamSet, const size_t maxStrideLength) const;
 

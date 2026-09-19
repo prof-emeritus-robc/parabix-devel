@@ -555,7 +555,7 @@ protected:
 
     using MetadataScaleVector = llvm::SmallVector<size_t, 8>;
 
-    virtual void writeInternallyGeneratedStreamSetScaleVector(const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
+    virtual void writeInternallyGeneratedStreamSetScaleVector(KernelBuilder & b, const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
         llvm_unreachable("not supported");
     }
 

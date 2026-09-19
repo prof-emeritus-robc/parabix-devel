@@ -317,7 +317,16 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
         runLength = ((patternLength + maxStrideLength + blockWidth - 1UL) / blockWidth);
     } else {
         runLength = (patternLength / blockWidth);
-        copyableLength = (maxStrideLength / blockWidth);
+        // Round up: a consumer accessed via a "virtual base pointer" (see
+        // PipelineCompiler::getVirtualBaseAddress) only recomputes that pointer once
+        // per doSegment() call, then indexes it linearly for every stride within that
+        // call -- so this buffer must physically hold `copyableLength` extra blocks of
+        // (repeated) padding to cover the worst case, even when maxStrideLength is far
+        // smaller than blockWidth. Truncating instead of rounding up left the buffer
+        // with zero padding blocks whenever maxStrideLength < blockWidth, causing
+        // out-of-bounds reads (silently wrong data, not a crash) on any stride past the
+        // first within such a call -- reproducible via test_repeatingstreamset -nested=1.
+        copyableLength = ((maxStrideLength + blockWidth - 1UL) / blockWidth);
     }
 
     const auto totalStrides = runLength + copyableLength;

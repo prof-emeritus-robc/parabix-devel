@@ -18,12 +18,26 @@ void PipelineCompiler::generateMetaDataForRepeatingStreamSets(KernelBuilder & b)
         std::vector<Constant *> maxStrides;
 
         // the ordering of the kernels may differ between the input ordering of the
-        // pipeline kernel and what was actually compiled by the program.
+        // pipeline kernel and what was actually compiled by the program, so look
+        // each kernel up by identity against the compiled FirstKernel..LastKernel
+        // vertex range rather than assuming kernels[i] corresponds to vertex i (or
+        // FirstKernel + i): MaximumNumOfStrides is indexed by that vertex id, and
+        // using the wrong index here silently produced a bogus (far too small)
+        // scale factor for the "rsl" metadata, corrupting the RunLength value
+        // threaded down to a nested kernel's RepeatingBuffer.
 
         for (unsigned i = 0; i < m; ++i) {
             const Kernel * const kernel = kernels[i].Object;
             if (LLVM_UNLIKELY(kernel->hasInternallyGeneratedStreamSets())) {
-                maxStrides.push_back(b.getSize(MaximumNumOfStrides[i]));
+                bool found = false;
+                for (auto k = FirstKernel; k <= LastKernel; ++k) {
+                    if (getKernel(k) == kernel) {
+                        maxStrides.push_back(b.getSize(MaximumNumOfStrides[k]));
+                        found = true;
+                        break;
+                    }
+                }
+                assert (found);
             }
         }
 

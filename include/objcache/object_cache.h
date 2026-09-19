@@ -14,6 +14,7 @@
 #include <util/not_null.h>
 #include <kernel/core/kernel.h>
 #include <kernel/pipeline/driver/driver.h>
+#include <mutex>
 #include <string>
 
 namespace llvm { 
@@ -69,5 +70,9 @@ private:
     static bool         mStartedCacheCleanupDaemon;
     ObjectBufferCache   mCachedObject;
     Path                mCachePath;
+    // CPUDriverCompiler's worker threads call loadCachedObjectFile/saveCachedObjectFile
+    // concurrently for different kernels; mCachedObject (an llvm::StringMap) and the
+    // on-disk .o/.kernel files it mirrors are not otherwise safe against that.
+    std::mutex          mCacheMutex;
 };
 

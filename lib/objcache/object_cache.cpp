@@ -96,6 +96,8 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
     // Have we already seen this signature before? if so, we can safely assume that the ExecutionEngine
     // will have a compiled module for this kernel when we execute the pipeline.
 
+    std::lock_guard<std::mutex> L(mCacheMutex);
+
     Path fileName(mCachePath);
     sys::path::append(fileName, CACHE_PREFIX);
     const auto moduleId = kernel->makeCacheName(builder);
@@ -152,6 +154,8 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
  * A new module has been compiled. If it is cacheable and no conflicting module exists, write it out.
  ** ------------------------------------------------------------------------------------------------------------- */
 void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBufferRef Obj) noexcept {
+
+    std::lock_guard<std::mutex> L(mCacheMutex);
 
     auto moduleId = M.getModuleIdentifier();
 

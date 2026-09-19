@@ -16,6 +16,7 @@
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/ADT/STLFunctionalExtras.h>
 #include <system_error>
 
 using namespace llvm;
@@ -149,6 +150,48 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief writeCacheFileAtomically
+ *
+ * Writes to a uniquely-named temporary file in the same directory as finalPath, then renames it into
+ * place. saveCachedObjectFile can run concurrently in unrelated processes that share this cache
+ * directory (e.g. parallel test targets), and rename() on the same filesystem is atomic: a concurrent
+ * loadCachedObjectFile() in another process only ever sees the old (or absent) file or the fully-written
+ * new one, never a partially-written one. Writing straight to finalPath let a reader observe a torn
+ * object file mid-write (e.g. "section header table goes past the end of the file", or missing symbols).
+ ** ------------------------------------------------------------------------------------------------------------- */
+static void writeCacheFileAtomically(const ParabixObjectCache::Path & finalPath, llvm::function_ref<void(raw_fd_ostream &)> write) {
+    SmallString<256> tempPath;
+    int tempFD;
+    std::error_code EC = sys::fs::createUniqueFile(Twine(finalPath) + ".tmp-%%%%%%", tempFD, tempPath);
+    if (LLVM_UNLIKELY(EC)) {
+        SmallVector<char, 512> tmp;
+        llvm::raw_svector_ostream msg(tmp);
+        msg << "Could not create a temporary file for \""
+            << finalPath.str()
+            << "\" in object cache directory.\n\n"
+            "Reason: " << EC.message() << "\n\n"
+            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
+        report_fatal_error(Twine(msg.str()));
+    }
+    {
+        raw_fd_ostream out(tempFD, true);
+        write(out);
+    }
+    EC = sys::fs::rename(tempPath, finalPath);
+    if (LLVM_UNLIKELY(EC)) {
+        sys::fs::remove(tempPath);
+        SmallVector<char, 512> tmp;
+        llvm::raw_svector_ostream msg(tmp);
+        msg << "Could not finalize \""
+            << finalPath.str()
+            << "\" in object cache directory.\n\n"
+            "Reason: " << EC.message() << "\n\n"
+            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
+        report_fatal_error(Twine(msg.str()));
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief saveCachedObjectFile
  *
  * A new module has been compiled. If it is cacheable and no conflicting module exists, write it out.
@@ -167,35 +210,11 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
     objectName.append(moduleId);
     objectName.append(OBJECT_FILE_EXTENSION);
 
-    // Write the object code
-    std::error_code EC;
-    raw_fd_ostream objFile(objectName, EC, sys::fs::OF_None);
-    if (LLVM_UNLIKELY(EC)) {
-        SmallVector<char, 512> tmp;
-        llvm::raw_svector_ostream msg(tmp);
-        msg << "Could not write to \""
-            << objectName.str()
-            << "\" in object cache directory.\n\n"
-            "Reason: " << EC.message() << "\n\n"
-            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
-        report_fatal_error(Twine(msg.str()));
-    }
-    objFile.write(Obj.getBufferStart(), Obj.getBufferSize());
-    objFile.close();
+    writeCacheFileAtomically(objectName, [&](raw_fd_ostream & out) {
+        out.write(Obj.getBufferStart(), Obj.getBufferSize());
+    });
 
     sys::path::replace_extension(objectName, KERNEL_FILE_EXTENSION);
-    raw_fd_ostream kernelFile(objectName.str(), EC, sys::fs::OF_None);
-
-    if (LLVM_UNLIKELY(EC)) {
-        SmallVector<char, 512> tmp;
-        llvm::raw_svector_ostream msg(tmp);
-        msg << "Could not write to \""
-            << objectName.str()
-            << "\" in object cache directory.\n\n"
-            "Reason: " << EC.message() << "\n\n"
-            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
-        report_fatal_error(Twine(msg.str()));
-    }
 
     // Clone the function prototypes and metadata to minimize the size of the stored .kernel file.
     std::unique_ptr<Module> H(new Module(moduleId, M.getContext()));
@@ -214,8 +233,9 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
         }
     }
 
-    WriteBitcodeToFile(*H, kernelFile);
-    kernelFile.close();
+    writeCacheFileAtomically(objectName, [&](raw_fd_ostream & out) {
+        WriteBitcodeToFile(*H, out);
+    });
 
     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
         errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";

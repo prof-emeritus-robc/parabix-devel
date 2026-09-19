@@ -149,9 +149,8 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
 };
 
 enum class CPUDriverTaskType : size_t {
-    ObjectCode = 0,
-    Declaration = 1,
-    MainFunction = 2
+    Declaration = 0,
+    MainFunction = 1
 };
 
 struct CPUDriverTask {
@@ -225,10 +224,8 @@ struct CircularTaskBuffer : public CircularBuffer {
 };
 
 class CPUDriverWorkQueue {
-    constexpr static size_t OBJECT_QUEUE_PRIORITY_LEVELS = 3;
 public:
-    CPUDriverWorkQueue(size_t initialCapacity)
-    : ObjectQueues({{CircularBuffer(32), CircularBuffer(8), CircularBuffer(2)}}) {
+    CPUDriverWorkQueue(size_t initialCapacity) {
         TaskQueues.reserve(initialCapacity);
     }
 
@@ -256,14 +253,6 @@ public:
         if (Sleeping) cv.notify_one();
     }
 
-    inline void pushObject(CPUDriverTask task) {
-        std::lock_guard<std::mutex> L(mutex);
-        auto & Q = ObjectQueues[task.Target->getCompilationPriority()];
-        Q.push(task);
-        ObjectsInFlight++;
-        if (Sleeping) cv.notify_one();
-    }
-
     bool pop(CPUDriverTask & task, size_t & level) {
         std::unique_lock<std::mutex> L(mutex);
         for (;;) {
@@ -279,22 +268,6 @@ public:
                     done = false;
                     break;
                 }
-            }
-
-            if (ObjectsInFlight) {
-                for (size_t i = OBJECT_QUEUE_PRIORITY_LEVELS; i--; ) {
-                    auto & Q = ObjectQueues[i];
-                    if (Q.pop(task)) {
-                        assert (task.TypeId == CPUDriverTaskType::ObjectCode);
-                        #ifndef NDEBUG
-                        level = std::numeric_limits<size_t>::max();
-                        #endif
-                        return true;
-                    }
-                }
-                // An object task is currently being processed by another thread
-                // (popped from the queue but not yet completed); don't shut down.
-                done = false;
             }
 
             if (LLVM_UNLIKELY(done)) {
@@ -317,22 +290,14 @@ public:
         cv.notify_all();
     }
 
-    void decrementObjectFlightCount() {
-        std::lock_guard<std::mutex> L(mutex);
-        assert (ObjectsInFlight > 0);
-        ObjectsInFlight--;
-        cv.notify_all();
-    }
-
     // Blocks until every currently queued/in-flight task (across all Declaration/
-    // MainFunction levels and the ObjectCode queues) has completed, without telling
-    // worker threads to exit. Unlike shutdown(), this may be called repeatedly over
-    // the compiler's lifetime -- e.g. once per nested grep sub-pipeline compilation --
-    // since the worker pool remains alive and ready for further work afterward.
+    // MainFunction levels) has completed, without telling worker threads to exit.
+    // Unlike shutdown(), this may be called repeatedly over the compiler's lifetime
+    // -- e.g. once per nested grep sub-pipeline compilation -- since the worker pool
+    // remains alive and ready for further work afterward.
     void waitForDrain() {
         std::unique_lock<std::mutex> L(mutex);
         cv.wait(L, [this]{
-            if (ObjectsInFlight) return false;
             for (auto & Q : TaskQueues) {
                 if (Q.InFlight) return false;
             }
@@ -349,13 +314,11 @@ public:
     }
 
 private:
-    std::array<CircularBuffer, OBJECT_QUEUE_PRIORITY_LEVELS> ObjectQueues;
     std::vector<CircularTaskBuffer> TaskQueues;
     std::mutex mutex;
     std::condition_variable cv;
     size_t Sleeping = 0;
     size_t StopRequested = 0;
-    size_t ObjectsInFlight = 0;
 };
 
 
@@ -683,11 +646,6 @@ public:
                     if (LLVM_LIKELY(WorkQueue.pop(toExecute, taskIndex))) {
 
                         switch (toExecute.TypeId) {
-                            case CPUDriverTaskType::ObjectCode:
-                                assert (taskIndex == std::numeric_limits<size_t>::max());
-                                materializeObject(ctx, toExecute.Target, toExecute.TargetModule);
-                                WorkQueue.decrementObjectFlightCount();
-                                break;
                             case CPUDriverTaskType::Declaration:
                                 assert (taskIndex != std::numeric_limits<size_t>::max());
                                 if (LLVM_LIKELY(materializeDecl(ctx, taskIndex, toExecute.Target))) {
@@ -849,6 +807,8 @@ private:
 
         TargetMachine * const TM = ctx.TargetMachine.get();
 
+        Module * pendingObjectModule = nullptr;
+
         if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
             std::unique_ptr<MemoryBuffer> cached;
             std::unique_ptr<Module> M;
@@ -880,8 +840,7 @@ private:
         ctx.CurrentModule = M;
         ctx.Engine = Engine;
         Target->declareStateTypes(builder);
-        CPUDriverTask task(CPUDriverTaskType::ObjectCode, Target, M);
-        WorkQueue.pushObject(task);
+        pendingObjectModule = M;
         END_SCOPED_REGION
 
 record_decl:
@@ -892,6 +851,21 @@ record_decl:
         assert (f->second == nullptr);
         f->second = Target;
         END_SCOPED_REGION
+
+        // Materialize the object body on this same thread/context right away instead of
+        // queueing it as a separate ObjectCode task for another worker thread to pick up.
+        // declareStateTypes() above can cache raw llvm::Type*/Value* pointers inside the
+        // Kernel (e.g. CarryManager's per-scope summary types), and those are only valid
+        // in the LLVMContext that created them. A different worker thread has a different
+        // LLVMContext, so materializing the body there would silently mix types across
+        // contexts -- e.g. CarryManager::castToSummaryType's `carryOutTy == summaryTy`
+        // pointer check fails for two structurally-identical i8 types from different
+        // contexts, producing an invalid same-width "zext i8 to i8" that only a debug
+        // build's IR verifier catches (a release build emits it unnoticed).
+        if (pendingObjectModule) {
+            materializeObject(ctx, Target, pendingObjectModule);
+        }
+
         return true;
     }
 

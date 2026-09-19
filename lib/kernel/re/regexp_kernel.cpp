@@ -526,7 +526,7 @@ void RE_PipelineBuilder::matchSearchPipeline(RE * re, StreamSet * results) {
     mRE = prepareRE(re);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
-    mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, results);
+    mPB.CreateKernelCall<RE_Kernel>(mCtxt, mRE, results);
 }
 
 void RE_PipelineBuilder::matchSpanPipeline(RE * re, StreamSet * matches, StreamSet * spans) {

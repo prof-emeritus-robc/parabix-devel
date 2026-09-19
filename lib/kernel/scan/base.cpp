@@ -19,17 +19,22 @@ SingleStreamScanKernelTemplate::ScanWordContext::ScanWordContext(LLVMTypeSystemI
 , wordsPerBlock(ts.getBitBlockWidth() / width)
 , wordsPerStride(strideMaskWidth)
 , fieldWidth(width)
-, Ty(ts.getIntNTy(width))
-, StrideMaskTy(ts.getIntNTy(strideMaskWidth))
-, WIDTH(ts.getSize(width))
-, WORDS_PER_BLOCK(ts.getSize(wordsPerBlock))
-, WORDS_PER_STRIDE(ts.getSize(wordsPerStride))
-, NUM_BLOCKS_PER_STRIDE(ts.getSize(strideWidth / ts.getBitBlockWidth()))
+, numBlocksPerStride(strideWidth / ts.getBitBlockWidth())
 {
     assert (IS_POW_2(strideWidth) && strideWidth >= ts.getBitBlockWidth() && strideWidth <= MaxStrideWidth);
 }
 
+void SingleStreamScanKernelTemplate::ScanWordContext::rebind(KernelBuilder & b) {
+    Ty = b.getIntNTy(width);
+    StrideMaskTy = b.getIntNTy(strideMaskWidth);
+    WIDTH = b.getSize(width);
+    WORDS_PER_BLOCK = b.getSize(wordsPerBlock);
+    WORDS_PER_STRIDE = b.getSize(wordsPerStride);
+    NUM_BLOCKS_PER_STRIDE = b.getSize(numBlocksPerStride);
+}
+
 void SingleStreamScanKernelTemplate::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) {
+    mSW.rebind(b);
     Type * const sizeTy = b.getSizeTy();
     Value * const sz_ZERO = b.getSize(0);
     Value * const sz_ONE = b.getSize(1);

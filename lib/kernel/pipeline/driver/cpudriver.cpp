@@ -1050,7 +1050,24 @@ record_decl:
 
         auto & linker = Engine->getObjLinkingLayer();
         auto & JITLib = Engine->getMainJITDylib();
-        cantFail(linker.add(JITLib, std::move(result)));
+        // Unlike kernel declarations (deduplicated via AlreadyCompiled), a top-level
+        // Program's "_main" is materialized here unconditionally on every compile() call.
+        // Two independently-constructed Programs with the same structural signature (e.g.
+        // repeated trials in a test harness picking the same parameters) hash to the same
+        // name and thus the same "_main" symbol; tolerate that the way the other JITDylib
+        // symbol definitions in this file already do, keeping whichever definition linked
+        // first since they're compiled from identical IR.
+        auto err = linker.add(JITLib, std::move(result));
+        if (err) {
+            handleAllErrors(std::move(err),
+                [](const DuplicateDefinition &) { /* an identical Program was already linked; fine */ },
+                [Target](const ErrorInfoBase & err) {
+                    SmallVector<char, 100> tmp;
+                    raw_svector_ostream msg(tmp);
+                    msg << Target->getName() << ": cannot link main function: " << err.message();
+                    report_fatal_error(msg.str());
+                });
+        }
 
         END_SCOPED_REGION
 

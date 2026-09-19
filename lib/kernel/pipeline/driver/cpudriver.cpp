@@ -104,7 +104,29 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
             auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
             MangleAndInterner M(ES, Engine->getDataLayout());
             const auto flags = JITSymbolFlags::Exported | JITSymbolFlags::Callable;
-            NewSymbolList.insert(std::make_pair(M(unmangledName), ExecutorSymbolDef{addr, flags}));
+            auto mangled = M(unmangledName);
+            ExecutorSymbolDef def{addr, flags};
+            NewSymbolList.insert(std::make_pair(mangled, def));
+            // Under ORC's on-request materialization, a kernel belonging to a *different*,
+            // later-compiled pipeline can end up linked (and thus have its external symbol
+            // dependencies resolved) while an *earlier* pipeline's own lookup() is still
+            // pulling in its transitive dependencies -- e.g. via kernel deduplication or
+            // simply because both pipelines were constructed before either's compile()
+            // waited on completion. If that happens, this symbol must already be visible in
+            // the JITDylib right now: batching all definitions until this pipeline's own
+            // waitUntilCompleted() (as DriverLinkedSymbols does) is too late for an object
+            // that gets added to the linker from a *different* pipeline's materialization
+            // first, since ORC resolves/fails a materialization unit's external references
+            // once, and a later definition doesn't retroactively unstick that failure. This
+            // is unlike MCJIT's fully on-demand external symbol callback, which didn't care
+            // about definition-vs-link ordering at all.
+            auto & MainJD = Engine->getMainJITDylib();
+            orc::SymbolMap single;
+            single.insert(std::make_pair(mangled, def));
+            auto err = MainJD.define(orc::absoluteSymbols(std::move(single)));
+            if (err) {
+                handleAllErrors(std::move(err), [](const DuplicateDefinition &) { /* already visible; fine */ });
+            }
         }
         return f;
     }

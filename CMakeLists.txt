@@ -568,8 +568,14 @@ add_custom_target (abc_test
     COMMAND ./run_abc "${BIN_DIR}/icgrep")
 
 add_custom_target (check
-    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS icgrep u8u16 u32u8 base64 editd gb18030 idisa_test json csv2json kernel-test-suite)
+    # Build everything before testing, rather than a hand-maintained DEPENDS
+    # list of the binaries individual `add_test` entries happen to invoke --
+    # that list has drifted out of sync before (nfd/nfc were missing, so
+    # nfd_test/nfc_test silently ran against whatever nfd/nfc binary was
+    # already sitting in the build directory, stale or absent) and is a
+    # standing risk for every future test/tool addition.
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure)
 
 add_custom_target (perf_icgrep
     COMMAND python3 perf.py icgrep

@@ -927,11 +927,14 @@ record_decl:
 
         END_SCOPED_REGION
 
-        auto optLevel = CodeGenOptLevel::Default;
-        if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
-            optLevel = codegen::BackEndOptLevel;
-        }
-        TM->setOptLevel(optLevel);
+        // All kernel bodies compile at codegen::BackEndOptLevel (default None/-O0;
+        // override with --backend-optimization-level). InfrequentlyUsed kernels used to
+        // get this level unconditionally while other kernels got a hardcoded Default --
+        // that hardcoded Default was itself the source of a long-standing, previously
+        // undiagnosed compile-time/runtime-quality mismatch on the MCJIT backend (see
+        // MCJITBackend's EngineBuilder::create() fix); using one configurable level for
+        // every kernel avoids reintroducing that kind of silent inconsistency.
+        TM->setOptLevel(codegen::BackEndOptLevel);
 
         legacy::PassManager PM;
 
@@ -1035,7 +1038,7 @@ record_decl:
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        C.TargetMachine->setOptLevel(CodeGenOptLevel::Default);
+        C.TargetMachine->setOptLevel(codegen::BackEndOptLevel);
 
         SmallVector<char, 0> objBuffer;
         objBuffer.reserve(4096 + M->getInstructionCount() * 16);

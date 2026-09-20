@@ -600,9 +600,9 @@ class GenericOpConfig : public BaseOpConfig {
 using UnaryOpConfig = NaryOpConfig<1>;
 using BinaryOpConfig = NaryOpConfig<2>;
 using TernaryOpConfig = NaryOpConfig<3>;
-using ImmedUnOpConfig = ImmediateOpConfig<UnaryOpConfig, 0, 256>;
-using ImmedBinOpConfig = ImmediateOpConfig<BinaryOpConfig, 0, 256>;
-using ImmedTernOpConfig = ImmediateOpConfig<TernaryOpConfig, 0, 256>;
+using ImmedUnOpConfig = ImmediateOpConfig<UnaryOpConfig, 0, 512>;
+using ImmedBinOpConfig = ImmediateOpConfig<BinaryOpConfig, 0, 512>;
+using ImmedTernOpConfig = ImmediateOpConfig<TernaryOpConfig, 0, 512>;
 
 //////////////////////////////////////////////////////////////////////////////////
 // And now, the actual index of operations...

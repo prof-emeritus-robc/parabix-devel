@@ -166,7 +166,7 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mU8index(nullptr),
     mU21(nullptr),
     mU21_LB(nullptr),
-    mEngineThread(pthread_self()) {
+    mEngineThread(std::this_thread::get_id()) {
 
     }
 
@@ -1050,35 +1050,24 @@ int32_t GrepEngine::openFile(const std::string & fileName, std::ostringstream & 
 // The process of searching a group of files may use a sequential or a task
 // parallel approach.
 
-void * DoGrepThreadFunction(void *args) {
-    assert (args);
-    return reinterpret_cast<GrepEngine *>(args)->DoGrepThreadMethod();
-}
-
 bool GrepEngine::searchAllFiles() {
 
-    std::vector<pthread_t> threads(codegen::TaskThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(codegen::TaskThreads - 1);
 
     for(unsigned long i = 1; i < codegen::TaskThreads; ++i) {
-        const int rc = pthread_create(&threads[i], nullptr, DoGrepThreadFunction, (void *)this);
-        if (rc) {
-            llvm::report_fatal_error(llvm::StringRef("Failed to create thread: code ") + std::to_string(rc));
-        }
+        threads.emplace_back([this]() { this->DoGrepThreadMethod(); });
     }
     // Main thread also does the work;
     DoGrepThreadMethod();
-    for(unsigned i = 1; i < codegen::TaskThreads; ++i) {
-        void * status = nullptr;
-        const int rc = pthread_join(threads[i], &status);
-        if (rc) {
-            llvm::report_fatal_error(llvm::StringRef("Failed to join thread: code ") + std::to_string(rc));
-        }
+    for (auto & t : threads) {
+        t.join();
     }
     return grepMatchFound;
 }
 
 // DoGrep thread function.
-void * GrepEngine::DoGrepThreadMethod() {
+void GrepEngine::DoGrepThreadMethod() {
 
     unsigned fileIdx = mNextFileToGrep++;
     while (fileIdx < mFileGroups.size()) {
@@ -1089,13 +1078,10 @@ void * GrepEngine::DoGrepThreadMethod() {
             grepMatchFound = true;
         }
         if ((mEngineKind == EngineKind::QuietMode) && grepMatchFound) {
-            if (pthread_self() != mEngineThread) {
-                pthread_exit(nullptr);
-            }
-            return nullptr;
+            return;
         }
         fileIdx = mNextFileToGrep++;
-        if (pthread_self() == mEngineThread) {
+        if (std::this_thread::get_id() == mEngineThread) {
             while ((mNextFileToPrint < mFileGroups.size()) && (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete)) {
                 const auto output = mResultStrs[mNextFileToPrint].str();
                 if (!output.empty()) {
@@ -1106,8 +1092,8 @@ void * GrepEngine::DoGrepThreadMethod() {
             }
         }
     }
-    if (pthread_self() != mEngineThread) {
-        pthread_exit(nullptr);
+    if (std::this_thread::get_id() != mEngineThread) {
+        return;
     }
     while (mNextFileToPrint < mFileGroups.size()) {
         const bool readyToPrint = (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete);
@@ -1128,7 +1114,6 @@ void * GrepEngine::DoGrepThreadMethod() {
         llvm::outs() << s.str();
         if (grepResult) grepMatchFound = true;
     }
-    return nullptr;
 }
 
 InternalSearchEngine::InternalSearchEngine(BaseDriver &driver) :

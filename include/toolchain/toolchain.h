@@ -167,6 +167,7 @@ extern bool EnableModuleInliner;
 extern bool EnablePipelineObjectCache;
 extern bool UseCustomJITMemoryManager;
 extern unsigned CompileThreads;
+extern bool UseMCJIT;
 extern bool EnableDynamicMultithreading;
 extern bool TraceObjectCache;
 extern unsigned GroupNum;

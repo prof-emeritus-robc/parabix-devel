@@ -5,6 +5,7 @@
 #include <llvm/Support/DynamicLibrary.h>           // for LoadLibraryPermanently
 #include <llvm/ExecutionEngine/ExecutionEngine.h>  // for EngineBuilder
 #include <llvm/ExecutionEngine/RTDyldMemoryManager.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/SectionMemoryManager.h>
 #include <llvm/ExecutionEngine/Orc/ObjectFileInterface.h>
 #include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
@@ -40,6 +41,7 @@
 #endif
 #include <numeric>
 #include <allocator/threadsafe_slaballocator.h>
+#include <kernel/pipeline/driver/mcjit_backend.h>
 
 #ifndef NDEBUG
 #define IN_DEBUG_MODE true
@@ -1163,9 +1165,37 @@ private:
 
 };
 
-ATTRIBUTE_NO_SANITIZE_ADDRESS
-CPUDriver::CPUDriver(std::string && moduleName)
-: BaseDriver(std::move(moduleName))
+// OrcJITBackend: the default, multi-threaded ORC JIT backend. This is a mechanical
+// extraction of what used to be CPUDriver's own members/methods directly -- no logic
+// changes versus the pre-extraction implementation, just BaseDriver field accesses
+// rewritten through mDriver (OrcJITBackend is a composed object, not a BaseDriver
+// subclass, so it needs the friend-class access granted in driver.h).
+class OrcJITBackend final : public CPUJITBackend {
+public:
+
+    ATTRIBUTE_NO_SANITIZE_ADDRESS
+    explicit OrcJITBackend(CPUDriver & driver);
+
+    ~OrcJITBackend() override;
+
+    void generateUncachedKernels() override;
+
+    void * finalizeObject(kernel::Kernel * const pk) override;
+
+    llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) override;
+
+    bool HasExternalFunction(llvm::StringRef functionName) const override;
+
+private:
+
+    CPUDriver &                                             mDriver;
+    std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
+    std::unique_ptr<CPUDriverCompiler>                      mCPUDriverCompiler;
+    std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
+};
+
+OrcJITBackend::OrcJITBackend(CPUDriver & driver)
+: mDriver(driver)
 , mEngine(nullptr) {
 
     InitializeNativeTarget();
@@ -1211,7 +1241,7 @@ CPUDriver::CPUDriver(std::string && moduleName)
     mCPUDriverCompiler = std::make_unique<CPUDriverCompiler>(
                                   llvm::hardware_concurrency(numOfThreads),
                                   *Builder.getJITTargetMachineBuilder(), features,
-                                  mObjectCache.get());
+                                  mDriver.mObjectCache.get());
 
     // Our custom CPUDriverJITMemoryManager's persistent exec/data slab pools are a
     // linking-speed optimization, but under LLVM 21 they can trigger "__TEXT,__unwind_info,
@@ -1267,14 +1297,14 @@ CPUDriver::CPUDriver(std::string && moduleName)
         ))
     );
 
-    mBuilder.reset(IDISA::GetIDISA_Builder(mMainModule->getContext(), features));
-    mBuilder->setModule(mMainModule);
-    mBuilder->setFunctionLinkCallback(this);
+    mDriver.mBuilder.reset(IDISA::GetIDISA_Builder(mDriver.mMainModule->getContext(), features));
+    mDriver.mBuilder->setModule(mDriver.mMainModule);
+    mDriver.mBuilder->setFunctionLinkCallback(&mDriver);
 }
 
-void CPUDriver::generateUncachedKernels() {
+void OrcJITBackend::generateUncachedKernels() {
 
-    if (mUncachedKernel.empty()) return;
+    if (mDriver.mUncachedKernel.empty()) return;
 
     // TODO: we may be able to reduce unnecessary optimization work by having kernel specific optimization passes.
 
@@ -1282,22 +1312,22 @@ void CPUDriver::generateUncachedKernels() {
     // mappings made by the base KernelCompiler. That could be done in a more focused manner, however, as each
     // mapping is known.
 
-    const auto numKernels = mUncachedKernel.size();
+    const auto numKernels = mDriver.mUncachedKernel.size();
 
-    mCachedKernel.reserve(numKernels);
+    mDriver.mCachedKernel.reserve(numKernels);
 
     const auto layerId = mCPUDriverCompiler->addNewTaskGroup(numKernels);
     for (unsigned i = 0; i < numKernels; ++i) {
-        auto & kernel = mUncachedKernel[i];
+        auto & kernel = mDriver.mUncachedKernel[i];
         mCPUDriverCompiler->addCompilationTask(layerId, kernel.get());
-        mCachedKernel.emplace_back(kernel.release());
+        mDriver.mCachedKernel.emplace_back(kernel.release());
     }
 
-    mUncachedKernel.clear();
+    mDriver.mUncachedKernel.clear();
 
 }
 
-void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
+void * OrcJITBackend::finalizeObject(kernel::Kernel * const pk) {
 
     const auto layerId = mCPUDriverCompiler->addNewTaskGroup(1);
 
@@ -1308,19 +1338,19 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
 
     assert (mainFuncPtr);
 
-    if (getPreservesKernels()) {
-        for (auto & kernel : mCachedKernel) {
-            mPreservedKernel.emplace_back(kernel.release());
+    if (mDriver.getPreservesKernels()) {
+        for (auto & kernel : mDriver.mCachedKernel) {
+            mDriver.mPreservedKernel.emplace_back(kernel.release());
         }
-        for (auto & kernel : mCompiledKernel) {
-            mPreservedKernel.emplace_back(kernel.release());
+        for (auto & kernel : mDriver.mCompiledKernel) {
+            mDriver.mPreservedKernel.emplace_back(kernel.release());
         }
     } else {
-        mPreservedKernel.clear();
+        mDriver.mPreservedKernel.clear();
     }
 
-    mCachedKernel.clear();
-    mCompiledKernel.clear();
+    mDriver.mCachedKernel.clear();
+    mDriver.mCompiledKernel.clear();
 
     //    llvm::reportAndResetTimings();
     //    llvm::PrintStatistics();
@@ -1328,11 +1358,11 @@ void * CPUDriver::finalizeObject(kernel::Kernel * const pk) {
     return mainFuncPtr;
 }
 
-llvm::Function * CPUDriver::LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
-    assert (&functionType->getContext() == &mMainModule->getContext());
-    Function * f = mMainModule->getFunction(unmangledName);
+llvm::Function * OrcJITBackend::LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
+    assert (&functionType->getContext() == &mDriver.mMainModule->getContext());
+    Function * f = mDriver.mMainModule->getFunction(unmangledName);
     if (LLVM_UNLIKELY(f == nullptr)) {
-        f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mMainModule);
+        f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mDriver.mMainModule);
         MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
         auto symbol = M(unmangledName);
         auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
@@ -1341,7 +1371,7 @@ llvm::Function * CPUDriver::LinkFunction(llvm::StringRef unmangledName, llvm::Fu
     return f;
 }
 
-bool CPUDriver::HasExternalFunction(llvm::StringRef functionName) const {
+bool OrcJITBackend::HasExternalFunction(llvm::StringRef functionName) const {
     auto & ES = mEngine->getExecutionSession();
     MangleAndInterner mangler(ES, mEngine->getDataLayout());
     SymbolLookupSet syms;
@@ -1355,7 +1385,35 @@ bool CPUDriver::HasExternalFunction(llvm::StringRef functionName) const {
     return true;
 }
 
-CPUDriver::~CPUDriver() {
+OrcJITBackend::~OrcJITBackend() {
     cantFail(mEngine->getExecutionSession().endSession());
+}
+
+CPUDriver::CPUDriver(std::string && moduleName)
+: BaseDriver(std::move(moduleName)) {
+    if (codegen::UseMCJIT) {
+        mBackend = std::make_unique<MCJITBackend>(*this);
+    } else {
+        mBackend = std::make_unique<OrcJITBackend>(*this);
+    }
+}
+
+CPUDriver::~CPUDriver() {
+}
+
+void CPUDriver::generateUncachedKernels() {
+    mBackend->generateUncachedKernels();
+}
+
+void * CPUDriver::finalizeObject(kernel::Kernel * const pipeline) {
+    return mBackend->finalizeObject(pipeline);
+}
+
+llvm::Function * CPUDriver::LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
+    return mBackend->LinkFunction(unmangledName, functionType, functionPointer);
+}
+
+bool CPUDriver::HasExternalFunction(llvm::StringRef unmangledName) const {
+    return mBackend->HasExternalFunction(unmangledName);
 }
 

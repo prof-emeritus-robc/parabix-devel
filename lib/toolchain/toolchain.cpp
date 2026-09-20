@@ -315,6 +315,11 @@ CompileThreadsOption("compile-threads", cl::location(CompileThreads), cl::init(4
                      cl::desc("Number of threads used for JIT compilation."),
                      cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
 
+bool UseMCJIT = false;
+static cl::opt<bool, true> UseMCJITOption("use-mcjit", cl::location(UseMCJIT), cl::init(false),
+    cl::desc("Use classic single-threaded MCJIT instead of the default multi-threaded ORC JIT backend."),
+    cl::cat(CodeGenOptions));
+
 bool EnableDynamicMultithreading;
 static cl::opt<bool, true> EnableDynamicMultithreadingOption("dynamic-multithreading", cl::location(EnableDynamicMultithreading), cl::init(false),
                                                    cl::desc("Dynamic multithreading."), cl::cat(CodeGenOptions));
@@ -520,6 +525,18 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     }
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
     target_Options.MCOptions.AsmVerbose = true;
+
+    if (UseMCJIT) {
+        // --compile-threads and --use-custom-jit-memory-manager only affect the default
+        // ORC JIT backend's worker-thread pool and its custom JITLink memory manager;
+        // MCJIT compiles single-threaded and has no equivalent knobs, so both are ignored.
+        if (CompileThreadsOption.getNumOccurrences() > 0) {
+            errs() << "warning: --compile-threads is ignored under --use-mcjit (MCJIT compiles single-threaded)\n";
+        }
+        if (UseCustomJITMemoryManagerOption.getNumOccurrences() > 0) {
+            errs() << "warning: --use-custom-jit-memory-manager is ignored under --use-mcjit\n";
+        }
+    }
 
 }
 

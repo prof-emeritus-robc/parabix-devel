@@ -1,13 +1,10 @@
 #pragma once
 
 #include <kernel/pipeline/driver/driver.h>
-#include <llvm/ExecutionEngine/Orc/LLJIT.h>
-
-class CPUDriverCompiler;
+#include <kernel/pipeline/driver/cpu_jit_backend.h>
+#include <memory>
 
 class CPUDriver final : public BaseDriver {
-
-    friend class CPUDriverKernelCompiler;
 
 public:
 
@@ -25,8 +22,5 @@ public:
 
 private:
 
-    std::unique_ptr<llvm::orc::LLJIT>                       mEngine;
-    std::unique_ptr<CPUDriverCompiler>                      mCPUDriverCompiler;
-    std::unique_ptr<llvm::orc::SymbolMap>                   mAllLinkedSymbols;
+    std::unique_ptr<CPUJITBackend>                          mBackend;
 };
-

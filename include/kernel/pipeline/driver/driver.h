@@ -29,6 +29,8 @@ class BaseDriver : public FunctionLinkCallback {
     friend class kernel::PipelineBuilder;
     friend class kernel::ProgramBuilder;
     friend class kernel::Kernel;
+    friend class OrcJITBackend;
+    friend class MCJITBackend;
     template<typename ... Args> friend class kernel::TypedProgramBuilder;
 
 public:

@@ -13,9 +13,7 @@
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/algo/normalization.h>
 #include <ucd/utf/utf_compiler.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/streamutils/stream_shift.h>
 #include <toolchain/toolchain.h>

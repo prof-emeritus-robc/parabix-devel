@@ -23,6 +23,6 @@ DEPS
     kernel.pipeline
     kernel.streamutils
     re.unicode
-    pablo
+    pablo.compiler
     pablo.bixnum
 )

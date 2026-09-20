@@ -5,7 +5,7 @@
 #pragma once
 
 #include <re/alphabet/alphabet.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <kernel/pipeline/driver/driver.h>
 #include <string>
 

@@ -20,11 +20,8 @@
 #include <kernel/streamutils/swizzle.h>
 #include <kernel/streamutils/zeroextend.h>
 #include <kernel/streamutils/stream_select.h>
-#include <pablo/builder.hpp>
-#include <pablo/boolean.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
-#include <pablo/pe_zeroes.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
 #include <llvm/Support/CommandLine.h>

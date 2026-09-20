@@ -6,7 +6,7 @@
 #include <pablo/parse/pablo_source_kernel.h>
 
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/printer_pablos.h>
+#include <pablo/compiler/printer_pablos.h>
 #include <pablo/parse/error.h>
 #include <pablo/parse/pablo_parser.h>
 #include <pablo/parse/source_file.h>

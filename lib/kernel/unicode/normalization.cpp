@@ -7,16 +7,13 @@
 #include <ucd/core/unicode_set.h>
 #include <ucd/algo/normalization.h>
 #include <ucd/utf/utf_compiler.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/unicode/charclasses.h>
 #include <toolchain/toolchain.h>
 #include <kernel/bitwise/bixlogic.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
-#include <pablo/pablo_kernel.h>
 
 using namespace pablo;
 using namespace kernel;

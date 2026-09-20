@@ -10,9 +10,7 @@
 #include <llvm/IR/Module.h>
 #include <re/adt/re_name.h>
 #include <re/adt/re_re.h>
-#include <pablo/codegenstate.h>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
@@ -43,7 +41,7 @@
 #include <re/unicode/resolve_properties.h>
 #include <string>
 #include <toolchain/toolchain.h>
-#include <pablo/pablo_toolchain.h>
+#include <pablo/toolchain/pablo_toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <ucd/algo/normalization.h>
 #include <ucd/core/unicode_set.h>

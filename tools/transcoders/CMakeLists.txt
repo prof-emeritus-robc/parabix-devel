@@ -87,7 +87,7 @@ NAME
 SRC
     xch.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.io
@@ -104,7 +104,7 @@ NAME
 SRC
     nfd.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.bitwise
@@ -122,7 +122,7 @@ NAME
 SRC
     nfkd.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.bitwise
@@ -140,7 +140,7 @@ NAME
 SRC
     nfc.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.bitwise

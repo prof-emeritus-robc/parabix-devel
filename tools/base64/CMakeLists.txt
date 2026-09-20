@@ -9,7 +9,6 @@ NAME
 SRC
     base64.cpp
 DEPS
-    pablo
     kernel.io
     kernel.pipeline
     kernel.util

@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#include <pablo/pablo_kernel.h>  // for PabloKernel
-#include <pablo/pablo_toolchain.h>
+#include <pablo/pablo.h>
+#include <pablo/toolchain/pablo_toolchain.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <ucd/utf/utf_encoder.h>
 #include <ucd/utf/transchar.h>

@@ -43,9 +43,7 @@
 #include <grep/grep_kernel.h>
 #include <string>
 #include <toolchain/toolchain.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <fcntl.h>
 #include <iostream>
 #include <kernel/pipeline/driver/cpudriver.h>

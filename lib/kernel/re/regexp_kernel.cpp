@@ -11,9 +11,7 @@
 #include <kernel/unicode/boundary_kernels.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/UCD_property_kernel.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_var.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <re/adt/adt.h>
 #include <re/alphabet/alphabet.h>
 #include <re/alphabet/multiplex_CCs.h>

@@ -10,7 +10,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/pipeline/program_builder.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <re/transforms/name_intro.h>
 #include <map>
 

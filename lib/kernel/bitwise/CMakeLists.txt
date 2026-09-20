@@ -10,7 +10,7 @@ SRC
     bixnum_kernel.cpp
     bixlogic.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.pipeline
 )

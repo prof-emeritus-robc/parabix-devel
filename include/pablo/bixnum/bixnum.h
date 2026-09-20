@@ -5,8 +5,8 @@
 
 #pragma once
 
-#include <pablo/pabloAST.h>
-#include <pablo/builder.hpp>
+#include <pablo/ast/pabloAST.h>
+#include <pablo/ast/builder.hpp>
 
 namespace pablo {
 

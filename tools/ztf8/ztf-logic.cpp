@@ -7,9 +7,7 @@
 #include <re/adt/re_name.h>
 #include <re/adt/re_re.h>
 #include <pablo/bixnum/bixnum.h>
-#include <pablo/pe_zeroes.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>
+#include <pablo/pablo.h>
 #include <ucd/utf/utf_compiler.h>
 #include <re/unicode/resolve_properties.h>
 #include <re/cc/cc_compiler.h>

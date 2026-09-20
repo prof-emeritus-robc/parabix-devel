@@ -12,8 +12,7 @@
 #include "audio/stream_manipulation.h"
 #include <llvm/IR/Intrinsics.h>
 #include <pablo/bixnum/bixnum.h>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <kernel/pipeline/program_builder.h>
 
 #define SHOW_STREAM(name)           \

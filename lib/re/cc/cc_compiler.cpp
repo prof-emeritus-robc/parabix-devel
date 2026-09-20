@@ -6,13 +6,7 @@
 #include <re/cc/cc_compiler.h>
 
 #include <re/alphabet/alphabet.h>
-#include <pablo/codegenstate.h>
-#include <pablo/boolean.h>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_infile.h>
-#include <pablo/builder.hpp>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>

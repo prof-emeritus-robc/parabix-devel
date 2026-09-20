@@ -6,9 +6,8 @@
 #include <llvm/IR/Type.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Constants.h>
-#include <pablo/pablo_toolchain.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>
+#include <pablo/toolchain/pablo_toolchain.h>
+#include <pablo/pablo.h>
 
 using namespace pablo;
 using namespace kernel;

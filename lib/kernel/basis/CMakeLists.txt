@@ -10,6 +10,6 @@ SRC
     p2s_kernel.cpp
     s2p_kernel.cpp
 DEPS
-    pablo
+    pablo.compiler
     kernel.pipeline
 )

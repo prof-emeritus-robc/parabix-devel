@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#include <pablo/pablo_kernel.h>  // for PabloKernel
-#include <pablo/pablo_toolchain.h>
+#include <pablo/pablo.h>
+#include <pablo/toolchain/pablo_toolchain.h>
 
 namespace kernel {
 

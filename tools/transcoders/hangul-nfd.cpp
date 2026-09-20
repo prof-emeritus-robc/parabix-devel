@@ -11,8 +11,7 @@
 #include <llvm/IR/Module.h>
 #include <re/adt/re_name.h>
 #include <re/adt/re_re.h>
-#include <pablo/codegenstate.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <grep/grep_kernel.h>
 #include <kernel/core/kernel_builder.h>
@@ -29,7 +28,7 @@
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <toolchain/toolchain.h>
-#include <pablo/pablo_toolchain.h>
+#include <pablo/toolchain/pablo_toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/algo/normalization.h>

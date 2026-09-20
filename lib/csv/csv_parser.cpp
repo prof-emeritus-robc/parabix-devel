@@ -1,12 +1,8 @@
 #include <csv/csv_cmdline.h>
 #include <csv/csv_parser.h>
 #include <kernel/unicode/charclasses.h>
-#include <pablo/builder.hpp>
-#include <pablo/pablo_kernel.h>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
-#include <pablo/pe_ones.h>
 #include <pablo/bixnum/bixnum.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>

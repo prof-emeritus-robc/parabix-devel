@@ -7,7 +7,7 @@
 
 #include <vector>                       // for vector<>::iterator
 #include <boost/container/flat_map.hpp>
-#include <pablo/builder.hpp>
+#include <pablo/pablo.h>
 #include <re/adt/adt.h>              // for Seq
 #include <re/alphabet/alphabet.h>
 

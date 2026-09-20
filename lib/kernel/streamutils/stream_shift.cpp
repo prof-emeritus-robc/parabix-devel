@@ -4,7 +4,7 @@
  */
 
 #include <kernel/streamutils/stream_shift.h>
-#include <pablo/builder.hpp>
+#include <pablo/pablo.h>
 #include <kernel/core/kernel_builder.h>
 
 using namespace llvm;

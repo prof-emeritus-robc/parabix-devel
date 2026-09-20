@@ -12,8 +12,7 @@
 #include <llvm/IR/Module.h>
 #include <re/adt/re_name.h>
 #include <re/adt/re_re.h>
-#include <pablo/codegenstate.h>
-#include <pablo/pe_zeroes.h>        // for Zeroes
+#include <pablo/pablo.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>

@@ -9,7 +9,7 @@ NAME
 SRC
     tokenizer.cpp
 DEPS
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.unicode

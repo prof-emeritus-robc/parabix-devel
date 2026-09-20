@@ -6,7 +6,7 @@
 
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/pipeline_builder.h>
-#include <pablo/builder.hpp>
+#include <pablo/pablo.h>
 
 using namespace kernel;
 //

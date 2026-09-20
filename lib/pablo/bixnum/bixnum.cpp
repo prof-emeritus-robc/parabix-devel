@@ -4,8 +4,8 @@
  */
 
 #include <pablo/bixnum/bixnum.h>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_ones.h>
+#include <pablo/ast/pe_zeroes.h>
+#include <pablo/ast/pe_ones.h>
 #include <re/alphabet/alphabet.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>

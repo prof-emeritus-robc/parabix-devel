@@ -19,10 +19,8 @@
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/streamutils/swizzle.h>
 #include <kernel/streamutils/zeroextend.h>
-#include <pablo/builder.hpp>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
-#include <pablo/pe_zeroes.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
 #include <llvm/Support/raw_ostream.h>

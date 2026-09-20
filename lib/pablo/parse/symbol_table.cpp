@@ -5,9 +5,9 @@
 
 #include <pablo/parse/symbol_table.h>
 
-#include <pablo/builder.hpp>
-#include <pablo/pabloAST.h>
-#include <pablo/ps_assign.h>
+#include <pablo/ast/builder.hpp>
+#include <pablo/ast/pabloAST.h>
+#include <pablo/ast/ps_assign.h>
 #include <pablo/parse/error_text.h>
 #include <pablo/parse/pablo_source_kernel.h>
 #include <pablo/parse/pablo_type.h>

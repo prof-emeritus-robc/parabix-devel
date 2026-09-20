@@ -15,7 +15,7 @@ SRC
     radix64.cpp
     random_stream.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     re.cc
     kernel.pipeline

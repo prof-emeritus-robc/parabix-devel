@@ -9,7 +9,7 @@ NAME
 SRC
     hexlines.cpp
 DEPS
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline
@@ -26,7 +26,7 @@ SRC
     hashdemo.cpp
 DEPS
     grep
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline

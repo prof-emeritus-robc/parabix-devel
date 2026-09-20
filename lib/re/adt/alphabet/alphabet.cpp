@@ -9,14 +9,15 @@
 
 namespace cc {
 
-Alphabet::Allocator Alphabet::mAllocator;
-
 UnicodeMappableAlphabet::UnicodeMappableAlphabet
         (const std::string alphabetName, const std::string code,
          unsigned unicodeCommon,
-         std::vector <UCD::codepoint_t> aboveCommon) :
-    Alphabet(alphabetName, code, ClassTypeId::UnicodeMappableAlphabet), mUnicodeCommon(unicodeCommon),
-        mAboveCommon(std::move(aboveCommon)) {}
+         std::vector <UCD::codepoint_t> aboveCommon)
+: Alphabet(alphabetName, code, ClassTypeId::UnicodeMappableAlphabet)
+, mUnicodeCommon(unicodeCommon)
+, mAboveCommon(std::move(aboveCommon)) {
+
+}
 
 UCD::codepoint_t UnicodeMappableAlphabet::toUnicode(const unsigned n) const {
     UCD::codepoint_t cp = n;

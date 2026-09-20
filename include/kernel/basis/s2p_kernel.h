@@ -22,6 +22,7 @@ public:
               StreamSet * const BasisBits,
               StreamSet * zeroMask = nullptr);
 protected:
+    std::string makeCacheName(StreamSet * const BasisBits, StreamSet * zeroMask);
     Bindings makeInputBindings(StreamSet * codeUnitStream, StreamSet * zeroMask);
     Bindings makeOutputBindings(StreamSet * const BasisBits);
     void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) override;

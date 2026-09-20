@@ -33,8 +33,8 @@ public:
     }
 
 protected:
-    explicit Illustrate(IllustratorTypeId illustratorType, const char replacement0, const char replacement1, PabloAST * expr, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Illustrator, expr->getType(), {expr}, name, allocator)
+    explicit Illustrate(IllustratorTypeId illustratorType, const char replacement0, const char replacement1, PabloAST * expr, const String * name)
+    : Statement(ClassTypeId::Illustrator, expr->getType(), {expr}, name)
     , IllustratorType(illustratorType)
     , ReplacementCharacter({replacement0, replacement1}) {
         setSideEffecting(true);

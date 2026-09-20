@@ -12,11 +12,10 @@
 #include <re/adt/re_seq.h>
 #include <re/adt/re_rep.h>
 #include <re/printer/re_printer.h>
-#include <util/slab_allocator.h>
 
 namespace re {
 
-class Alt : public RE, public std::vector<RE*, ProxyAllocator<RE *>> {
+class Alt : public RE, public std::vector<RE*, StdSlabAllocatorProxy<RE *>> {
 public:
     static inline bool classof(const RE * re) {
         return re->getClassTypeId() == ClassTypeId::Alt;
@@ -28,10 +27,10 @@ public:
 protected:
     friend Alt * makeAlt();
     template<typename iterator> friend RE * makeAlt(iterator, iterator);
-    Alt() : RE(ClassTypeId::Alt), std::vector<RE*, ProxyAllocator<RE *>>(mAllocator) {}
+    Alt() : RE(ClassTypeId::Alt), std::vector<RE*, StdSlabAllocatorProxy<RE *>>() {}
     template<typename iterator>
     Alt(const iterator begin, const iterator end)
-    : RE(ClassTypeId::Alt), std::vector<RE*, ProxyAllocator<RE *>>(begin, end, mAllocator) { }
+    : RE(ClassTypeId::Alt), std::vector<RE*, StdSlabAllocatorProxy<RE *>>(begin, end) { }
 };
 
 /**

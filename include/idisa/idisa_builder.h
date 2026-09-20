@@ -4,9 +4,10 @@
  *  Part of the Parabix Project, under the Open Software License 3.0.
  *  SPDX-License-Identifier: OSL-3.0
  */
-#include <codegen/CBuilder.h>
+#include <idisa/CBuilder.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <bitset>
+#include <string>
 
 namespace llvm { class Constant; }
 namespace llvm { class LoadInst; }
@@ -15,6 +16,9 @@ namespace llvm { class Value; }
 namespace llvm { class StringRef; }
 
 namespace IDISA {
+
+extern std::string IDISA_Experiment;
+
 using FixedVectorType = llvm::FixedVectorType;
 
 bool isStreamTy(const llvm::Type * const t);
@@ -42,6 +46,11 @@ enum class Feature : size_t {
     // ---------------
     __Count
 };
+
+//
+// The following shuffle modes control what happens when an index value exceeds
+// the number of entries in the given table.
+enum class ShuffleMode {TruncateIndex, ZeroOnIndexOver, ZeroOnHighIndexBit};
 
 class IDISA_Builder : public CBuilder {
 
@@ -76,6 +85,10 @@ public:
         return mZeroInitializer;
     }
 
+    unsigned getLaneWidth() const { return mLaneWidth; }
+
+    llvm::IntegerType * getLaneTy() const { return llvm::Type::getIntNTy(getContext(), mLaneWidth); }
+
     llvm::Constant * allOnes() const {
         return mOneInitializer;
     }
@@ -109,10 +122,15 @@ public:
     llvm::Constant * simd_himask(unsigned fw);
     llvm::Constant * simd_lomask(unsigned fw);
 
+    llvm::Constant * simd_himask(unsigned vector_width, unsigned fw);
+    llvm::Constant * simd_lomask(unsigned vector_width, unsigned fw);
+
     llvm::Value * simd_select_hi(unsigned fw, llvm::Value * a);
     llvm::Value * simd_select_lo(unsigned fw, llvm::Value * a);
 
     virtual llvm::Value * simd_fill(unsigned fw, llvm::Value * a);
+
+    virtual llvm::Value * simd_fill(unsigned vector_width, unsigned fw, llvm::Value * a);
 
     virtual llvm::Value * simd_add(unsigned fw, llvm::Value * a, llvm::Value * b);
     virtual llvm::Value * simd_sub(unsigned fw, llvm::Value * a, llvm::Value * b);
@@ -182,7 +200,7 @@ public:
 
     virtual llvm::Value * esimd_mergeh(unsigned fw, llvm::Value * a, llvm::Value * b);
     virtual llvm::Value * esimd_mergel(unsigned fw, llvm::Value * a, llvm::Value * b);
-    virtual llvm::Value * esimd_bitspread(unsigned fw, llvm::Value * bitmask);
+    virtual llvm::Value * esimd_bitspread(unsigned vec_width, unsigned fw, llvm::Value * bitmask);
 
     virtual llvm::Value * hsimd_packh(unsigned fw, llvm::Value * a, llvm::Value * b);
     virtual llvm::Value * hsimd_packl(unsigned fw, llvm::Value * a, llvm::Value * b);
@@ -203,8 +221,10 @@ public:
     virtual llvm::Value * mvmd_srli(unsigned fw, llvm::Value * a, unsigned shift);
     virtual llvm::Value * mvmd_dslli(unsigned fw, llvm::Value * a, llvm::Value * b, unsigned shift);
     virtual llvm::Value * mvmd_dsll(unsigned fw, llvm::Value * a, llvm::Value * b, llvm::Value * shift);
-    virtual llvm::Value * mvmd_shuffle(unsigned fw, llvm::Value * data_table, llvm::Value * index_vector);
-    virtual llvm::Value * mvmd_shuffle2(unsigned fw, llvm::Value * table0, llvm::Value * table1, llvm::Value * index_vector);
+    virtual llvm::Value * mvmd_shuffle(unsigned fw, llvm::Value * data_table, llvm::Value * index_vector,
+                                       ShuffleMode m = ShuffleMode::TruncateIndex);
+    virtual llvm::Value * mvmd_shuffle2(unsigned fw, llvm::Value * table0, llvm::Value * table1, llvm::Value * index_vector,
+                                        ShuffleMode m = ShuffleMode::TruncateIndex);
     virtual llvm::Value * mvmd_compress(unsigned fw, llvm::Value * a, llvm::Value * select_mask);
     virtual llvm::Value * mvmd_expand(unsigned fw, llvm::Value * a, llvm::Value * select_mask);
 

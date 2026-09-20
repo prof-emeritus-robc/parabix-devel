@@ -42,6 +42,7 @@ case T::Type: return validate##Type(llvm::cast<Type>(re)); break
             VALIDATE(Seq);
             VALIDATE(Start);
             VALIDATE(Permute);
+            VALIDATE(Interleavable);
             VALIDATE(PropertyExpression);
         default: llvm_unreachable("Unknown RE type");
     }
@@ -122,6 +123,13 @@ bool RE_Validator::validateAssertion(const Assertion * a) {
 
 bool RE_Validator::validatePermute(const Permute * p) {
     for (RE * e : *p) {
+        if (!validate(e)) return false;
+    }
+    return true;
+}
+
+bool RE_Validator::validateInterleavable(const Interleavable * s) {
+    for (RE * e : *s) {
         if (!validate(e)) return false;
     }
     return true;

@@ -40,6 +40,7 @@ void RE_Inspector::inspect(RE * const re) {
         INSPECT(Seq);
         INSPECT(Start);
         INSPECT(Permute);
+        INSPECT(Interleavable);
         INSPECT(PropertyExpression);
         default: llvm_unreachable("Unknown RE type");
     }
@@ -116,6 +117,12 @@ void RE_Inspector::inspectAssertion(Assertion * a) {
 
 void RE_Inspector::inspectPermute(Permute * p) {
     for (RE * e : *p) {
+        inspect(e);
+    }
+}
+
+void RE_Inspector::inspectInterleavable(Interleavable * s) {
+    for (RE * e : *s) {
         inspect(e);
     }
 }

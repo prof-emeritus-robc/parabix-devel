@@ -41,6 +41,7 @@ protected:
     virtual RE * transformGroup(Group * g);
     virtual RE * transformAssertion(Assertion * a);
     virtual RE * transformPermute(Permute * p);
+    virtual RE * transformInterleavable(Interleavable * s);
     virtual RE * transformPropertyExpression(PropertyExpression * pe);
     virtual void showProcessing();
 protected:

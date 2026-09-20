@@ -5,8 +5,6 @@
 #include <boost/graph/bron_kerbosch_all_cliques.hpp>
 #include <chrono>
 
-#include <util/slab_allocator.h>
-
 namespace kernel {
 
 namespace {
@@ -148,10 +146,6 @@ struct SimulationPort {
         QueueLength -= pending;
     }
 
-    void * operator new (std::size_t size, CompilerAllocator & allocator) noexcept {
-        return allocator.allocate<uint8_t>(size);
-    }
-
     virtual void reset(const length_t delay) {
         QueueLength = -delay;
     }
@@ -229,7 +223,7 @@ struct BasePartialSumGenerator {
             const auto r = (required + Capacity * 2 - 1);
             const auto newCapacity = r - (r % required);
             assert (newCapacity >= Capacity * 2);
-            uint64_t * const newHistory = Allocator.allocate<uint64_t>(newCapacity);
+            uint64_t * const newHistory = ThreadSafeSlabAllocator::allocate_array_of<uint64_t>(newCapacity);
 
             size_t k = 0;
             for (;;) {
@@ -239,7 +233,6 @@ struct BasePartialSumGenerator {
                 ++k;
                 assert (k < Capacity);
             }
-            Allocator.deallocate(History);
             HeadOffset = 0;
             TailOffset = k;
             History = newHistory;
@@ -277,15 +270,14 @@ struct BasePartialSumGenerator {
         HeadPosition = min;
     }
 
-    BasePartialSumGenerator(const unsigned users, const unsigned historyLength, CompilerAllocator & allocator)
+    BasePartialSumGenerator(const unsigned users, const unsigned historyLength)
     : Users(users)
     , HeadOffset(0)
     , HeadPosition(0)
     , TailOffset(0)
     , Capacity(std::min<unsigned>(historyLength * 2, 32))
-    , History(allocator.allocate<uint64_t>(Capacity))
-    , UserReadPosition(allocator.allocate<uint64_t>(users))
-    , Allocator(allocator) {
+    , History(ThreadSafeSlabAllocator::allocate_array_of<uint64_t>(Capacity))
+    , UserReadPosition(ThreadSafeSlabAllocator::allocate_array_of<uint64_t>(users)) {
         assert (historyLength > 0);
     }
 
@@ -302,10 +294,6 @@ struct BasePartialSumGenerator {
         }
     }
 
-    void * operator new (std::size_t size, CompilerAllocator & allocator) noexcept {
-        return allocator.allocate<uint8_t>(size);
-    }
-
 protected:
 
     virtual uint32_t generateStepValue(pipeline_random_engine & rng) const HOT = 0;
@@ -319,9 +307,6 @@ private:
 
     uint64_t * History;
     uint64_t * const UserReadPosition;
-
-
-    CompilerAllocator & Allocator;
 };
 
 template<typename DistributionModel>
@@ -329,9 +314,8 @@ struct PartialSumGenerator : public BasePartialSumGenerator {
 
     PartialSumGenerator(const DistributionModel model,
                         const uint32_t users,
-                        const unsigned historyLength,
-                        CompilerAllocator & allocator)
-    : BasePartialSumGenerator(users, historyLength, allocator)
+                        const unsigned historyLength)
+    : BasePartialSumGenerator(users, historyLength)
     , Model(model) {
 
     }
@@ -451,17 +435,13 @@ struct SimulationNode {
 
     virtual void fire(length_t * const pendingArray, pipeline_random_engine & rng, uint64_t *& history) = 0;
 
-    void * operator new (std::size_t size, CompilerAllocator & allocator) noexcept {
-        return allocator.allocate<uint8_t>(size);
-    }
-
     virtual void reset() {}
 
 protected:
 
-    SimulationNode(const unsigned inputs, const unsigned outputs, CompilerAllocator & allocator)
-    : Input(inputs ? allocator.allocate<SimulationPort *>(inputs) : nullptr),
-      Output(outputs ? allocator.allocate<SimulationPort *>(outputs) : nullptr),
+    SimulationNode(const unsigned inputs, const unsigned outputs)
+    : Input(inputs ? ThreadSafeSlabAllocator::allocate_array_of<SimulationPort *>(inputs) : nullptr),
+      Output(outputs ? ThreadSafeSlabAllocator::allocate_array_of<SimulationPort *>(outputs) : nullptr),
       Inputs(inputs), Outputs(outputs) {
 
     }
@@ -470,8 +450,8 @@ protected:
 // we use a fork for both streamsets and relative rates
 struct SimulationFork final : public SimulationNode {
 
-    SimulationFork(const unsigned outputs, CompilerAllocator & allocator)
-    : SimulationNode(1, outputs, allocator) {
+    SimulationFork(const unsigned outputs)
+    : SimulationNode(1, outputs) {
 
     }
 
@@ -507,8 +487,8 @@ struct SimulationFork final : public SimulationNode {
 
 struct BlockSizedSimulationFork final : public SimulationNode {
 
-    BlockSizedSimulationFork(const unsigned blockSize, const unsigned outputs, CompilerAllocator & allocator)
-    : SimulationNode(1, outputs, allocator)
+    BlockSizedSimulationFork(const unsigned blockSize, const unsigned outputs)
+    : SimulationNode(1, outputs)
     , BlockSize(blockSize) { }
 
 
@@ -568,8 +548,8 @@ private:
 
 struct SimulationActor : public SimulationNode {
 
-    SimulationActor(const unsigned inputs, const unsigned outputs, CompilerAllocator & allocator)
-    : SimulationNode(inputs, outputs, allocator)
+    SimulationActor(const unsigned inputs, const unsigned outputs)
+    : SimulationNode(inputs, outputs)
     , SumOfStrides(0)
     , SumOfStridesSquared(0) {
 
@@ -662,9 +642,8 @@ no_more_pending_input:
 
 struct SimulationSourceActor final : public SimulationActor {
 
-    SimulationSourceActor(const unsigned outputs,
-                          CompilerAllocator & allocator)
-    : SimulationActor(0, outputs, allocator)
+    SimulationSourceActor(const unsigned outputs)
+    : SimulationActor(0, outputs)
     , RequiredIterations(1) {
 
     }
@@ -711,8 +690,8 @@ struct SimulationSourceActor final : public SimulationActor {
 
 struct SimulationSinkActor final : public SimulationActor {
 
-    SimulationSinkActor(const unsigned inputs, CompilerAllocator & allocator)
-    : SimulationActor(inputs, 0, allocator) {
+    SimulationSinkActor(const unsigned inputs)
+    : SimulationActor(inputs, 0) {
 
     }
 
@@ -1609,7 +1588,7 @@ equivalent_relationship_already_exists:
 
     flat_map<Graph::edge_descriptor, SimulationPort *> portMap;
 
-    auto makePortNode = [&](const Graph::edge_descriptor e, length_t * const pendingArray, CompilerAllocator & allocator) HOT {
+    auto makePortNode = [&](const Graph::edge_descriptor e, length_t * const pendingArray) HOT {
         PartitionPort & p = G[e];
         SimulationPort * port = nullptr;
 
@@ -1638,15 +1617,15 @@ equivalent_relationship_already_exists:
         };
 
         #define MAKE_BP(DistributionModel,...) \
-            new (allocator) BoundedPort<DistributionModel>(DistributionModel{__VA_ARGS__})
+            new BoundedPort<DistributionModel>(DistributionModel{__VA_ARGS__})
 
         #define MAKE_PSG(DistributionModel,...) \
-            new (allocator) PartialSumGenerator<DistributionModel>(DistributionModel{__VA_ARGS__}, \
-                data.Count,capacity,allocator)
+            new PartialSumGenerator<DistributionModel>(DistributionModel{__VA_ARGS__}, \
+                data.Count,capacity)
 
         switch (p.Type) {
             case RateId::Fixed:
-                port = new (allocator) FixedPort(p.LowerBound);
+                port = new FixedPort(p.LowerBound);
                 break;
             case RateId::Bounded:
                 BEGIN_SCOPED_REGION
@@ -1759,14 +1738,14 @@ equivalent_relationship_already_exists:
                 assert (stepLength <= data.RequiredCapacity);
                 assert ((stepLength % data.GCD) == 0);
                 assert (stepLength >= data.GCD);
-                port = new (allocator) PartialSumPort(*gen, userId, stepLength / data.GCD);
+                port = new PartialSumPort(*gen, userId, stepLength / data.GCD);
                 END_SCOPED_REGION
                 break;
             case kernel::ProcessingRate::Relative:
-                port = new (allocator) RelativePort(pendingArray[p.Reference]);
+                port = new RelativePort(pendingArray[p.Reference]);
                 break;
             case kernel::ProcessingRate::Greedy:
-                port = new (allocator) GreedyPort(p.LowerBound);
+                port = new GreedyPort(p.LowerBound);
                 break;
             default:
                 llvm_unreachable("unhandled processing rate");
@@ -1783,11 +1762,9 @@ equivalent_relationship_already_exists:
     errs() << "BUILT NETWORK\n";
     #endif
 
-    CompilerAllocator allocator;
+    SimulationNode ** const nodes = ThreadSafeSlabAllocator::allocate_array_of<SimulationNode *>(nodeCount);
 
-    SimulationNode ** const nodes = allocator.allocate<SimulationNode *>(nodeCount);
-
-    length_t * const pendingArray = allocator.allocate<length_t>(maxInDegree);
+    length_t * const pendingArray = ThreadSafeSlabAllocator::allocate_array_of<length_t>(maxInDegree);
 
     #ifdef NDEBUG
     for (unsigned i = 0; i < nodeCount; ++i) {
@@ -1809,20 +1786,20 @@ equivalent_relationship_already_exists:
         SimulationNode * sn = nullptr;
         if (u < numOfPartitions) {
             if (inputs == 0) {
-                sn = new (allocator) SimulationSourceActor(outputs, allocator);
+                sn = new SimulationSourceActor(outputs);
             } else if (outputs == 0) {
-                sn = new (allocator) SimulationSinkActor(inputs, allocator);
+                sn = new SimulationSinkActor(inputs);
             } else {
-                sn = new (allocator) SimulationActor(inputs, outputs, allocator);
+                sn = new SimulationActor(inputs, outputs);
             }
             actorNodes.push_back(u);
         } else {
             assert (inputs == 1 && outputs > 0);
             const auto bs = G[u].BlockSize;
             if (LLVM_LIKELY(bs == 0)) {
-                sn = new (allocator) SimulationFork(outputs, allocator);
+                sn = new SimulationFork(outputs);
             } else {
-                sn = new (allocator) BlockSizedSimulationFork(bs, outputs, allocator);
+                sn = new BlockSizedSimulationFork(bs, outputs);
             }
         }
         nodes[i] = sn;
@@ -1838,7 +1815,7 @@ equivalent_relationship_already_exists:
         unsigned outputIdx = 0;
         for (const auto e : make_iterator_range(out_edges(u, G))) {
             assert (outputIdx < outputs);
-            sn->Output[outputIdx++] = makePortNode(e, pendingArray, allocator);
+            sn->Output[outputIdx++] = makePortNode(e, pendingArray);
         }
         assert (outputIdx == outputs);
     }
@@ -1968,7 +1945,7 @@ equivalent_relationship_already_exists:
 
     const auto numOfActors = actorNodes.size();
 
-    uint64_t * const segmentLength = allocator.allocate<uint64_t>(numOfActors);
+    uint64_t * const segmentLength = ThreadSafeSlabAllocator::allocate_array_of<uint64_t>(numOfActors);
 
     LinkingGraph L(numOfActors);
 

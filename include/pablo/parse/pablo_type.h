@@ -7,7 +7,7 @@
 
 #include <string>
 #include <vector>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/ADT/ArrayRef.h>
 
@@ -18,10 +18,8 @@ static inline bool classof(const void *) {return false;}
 namespace pablo {
 namespace parse {
 
-class PabloType {
+class PabloType : public SlabAllocatedObject {
 public:
-    using Allocator = SlabAllocator<PabloType *>;
-
     enum class ClassTypeId {
         SCALAR,
         STREAM,
@@ -43,10 +41,6 @@ public:
         return mClassTypeId;
     }
 
-    void * operator new(size_t size) noexcept {
-        return mAllocator.allocate<uint8_t>(size);
-    }
-
     static std::string GenerateAnonymousTypeName() {
         return "__anonymous_type_name_" + std::to_string(mNextAnonId++);
     }
@@ -54,7 +48,6 @@ public:
 protected:
     const ClassTypeId mClassTypeId;
     static size_t     mNextAnonId;
-    static Allocator  mAllocator;
 };
 
 
@@ -158,7 +151,7 @@ public:
     }
 
     void setTypeName(llvm::StringRef name) noexcept {
-        ProxyAllocator<char> A(PabloType::mAllocator);
+        StdSlabAllocatorProxy<char> A;
         mTypeName = name.copy(A);
     }
 

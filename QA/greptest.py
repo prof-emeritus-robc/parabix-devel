@@ -18,10 +18,9 @@
 # </greptest>
 
 
-import sys, subprocess, os, optparse, re, codecs, stat
+import sys, subprocess, os, optparse, re, stat
 import xml.parsers.expat
 import sys
-import codecs
 import random
 
 
@@ -34,9 +33,8 @@ fileContents = {}
 def getFileContents(fileName):
     if not fileName in fileContents:
         outfpath = os.path.join(options.datafile_dir, fileName)
-        f = codecs.open(outfpath, encoding='utf-8', mode='r')
-        fileContents[fileName] = f.read()
-        f.close()
+        with open(outfpath, encoding='utf-8', mode='r', newline='') as f:
+            fileContents[fileName] = f.read()
     return fileContents[fileName]
 
 def start_element_open_file(name, attrs):
@@ -54,8 +52,8 @@ def start_element_open_file(name, attrs):
             print("Expecting id attribute for datafile, but none found.", file=sys.stderr)
             exit(-1)
         outfpath = os.path.join(options.datafile_dir, dataFileName)
-        if options.utf16: outf = codecs.open(outfpath, encoding='utf-16BE', mode='w')
-        else: outf = codecs.open(outfpath, encoding='utf-8', mode='w')
+        if options.utf16: outf = open(outfpath, encoding='utf-16BE', mode='w')
+        else: outf = open(outfpath, encoding='utf-8', mode='w')
         in_datafile = True
 
 def char_data_write_contents(data):
@@ -143,9 +141,9 @@ def execute_grep_test(flags, regexp, datafile, expected_result):
         print("Doing: " + grep_cmd, file=sys.stderr)
     try:
         raw_output = subprocess.check_output(grep_cmd.encode('utf-8'), cwd=options.exec_dir, shell=True)
-        grep_out = codecs.decode(raw_output, 'utf-8')
+        grep_out = raw_output.decode()
     except subprocess.CalledProcessError as e:
-        grep_out = codecs.decode(e.output, 'utf-8')
+        grep_out = e.output.decode()
     except UnicodeDecodeError:
         msg = u"Test failure: {%s} expecting {%s} got malformed UTF-8" % (grep_cmd, expected_result)
         print(msg.encode('utf-8'), file=sys.stderr)
@@ -156,6 +154,8 @@ def execute_grep_test(flags, regexp, datafile, expected_result):
     if filtered_out != expected_result:
         msg = u"Test failure: {%s} expecting {%s} got {%s}" % (grep_cmd, expected_result, grep_out)
         print(msg, file=sys.stderr)
+        #print(expected_result.encode('utf-8').hex(sep=' '))
+        #print(grep_out.encode('utf-8').hex(sep=' '))
         failure_count += 1
     else:
         if options.verbose:
@@ -173,6 +173,8 @@ flag_map = {'-CarryMode' : ['Compressed', 'BitBlock'],
             '-ccc-type' : ['ternary'],
             '-colors' : ['always', 'never'],
             '-EnableTernaryOpt' : [],
+            '-S2P_Mode' : ['BytePack', 'Split', 'Ideal'],
+            '-use-mcjit' : [],
             '-maxlimit-termination-mode' : ['report', 'terminate', 'zero']}
 
 def add_random_flags(flags, fileLength):

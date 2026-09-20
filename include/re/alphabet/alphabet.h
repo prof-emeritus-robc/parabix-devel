@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 #include <ucd/core/unicode_set.h>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 
 namespace cc {
     
@@ -24,9 +24,9 @@ inline std::string numberingSuffix(ByteNumbering numbering) {
 // numerical character codes.
 //
 
-class Alphabet {
+class Alphabet : public SlabAllocatedObject {
 public:
-    using Allocator = SlabAllocator<Alphabet *>;
+    USE_SLAB_ALLOCATED_OBJECT_MEMORY_OPERATORS
     const std::string & getName() const { return mAlphabetName;}
     const std::string & getCode() const { return mCode;}
     virtual const unsigned getSize() const = 0;
@@ -36,11 +36,10 @@ public:
     }
     virtual ~Alphabet() {}
 protected:
-    Alphabet(const std::string name, const std::string code, ClassTypeId k) : mAlphabetName(name), mCode(code), mClassTypeId(k) {}
-    void* operator new (std::size_t size) noexcept {
-        return mAllocator.allocate<uint8_t>(size);
+    Alphabet(const std::string name, const std::string code, ClassTypeId k)
+    : mAlphabetName(name), mCode(code), mClassTypeId(k) {
+
     }
-    static Allocator mAllocator;
 private:
     const std::string mAlphabetName;
     const std::string mCode;

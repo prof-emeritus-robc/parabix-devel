@@ -19,7 +19,7 @@ using Rational = ProcessingRate::Rational;
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernelMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void MultiBlockKernel::generateKernelMethod(KernelBuilder & b) {
+void MultiBlockKernel::generateKernelMethod(KernelBuilder & b, TargetMachine *TM) {
     generateMultiBlockLogic(b, b.getNumOfStrides());
 }
 
@@ -59,7 +59,7 @@ MultiBlockKernel::MultiBlockKernel(LLVMTypeSystemInterface & ts,
      std::move(scalar_parameters),
      std::move(scalar_outputs),
      std::move(internal_scalars),
-     CompilationStatus::FullyInitialized, flags) {
+     flags) {
 
 }
 

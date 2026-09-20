@@ -299,10 +299,20 @@ void wrapped_report_pos(size_t match_pos, int dist) {
 typedef void (*editdFunctionType)(const StreamSetPtr & chStream);
 
 void editdPipeline(ProgramBuilder & P, const std::vector<std::string> & patterns, StreamSet * const ChStream) {
+    // The pipeline's auto-computed signature deliberately excludes family-called sub-kernel
+    // content (it assumes such kernels are bound at runtime, so the parent's compiled code
+    // can be shared regardless of which family kernel is bound). That assumption doesn't hold
+    // here: PatternKernel is constructed *inline* by this very call, with these specific
+    // patterns baked directly into its compiled pablo logic, so two calls with different
+    // patterns produce genuinely different compiled code. Without a unique signature, separate
+    // editdPipeline() compiles for different pattern groups collide on the same dedup key and
+    // JIT symbol name, so a later group's compiled pipeline is silently discarded in favour of
+    // an earlier group's -- see nested_grep_engine.cpp's setUniqueName() for the same pattern.
+    P.setUniqueName("editd_" + Kernel::getStringHash(createName(patterns)));
     StreamSet * const MatchResults = P.CreateStreamSet(editDistance + 1);
     P.CreateKernelFamilyCall<PatternKernel>(patterns, ChStream, MatchResults);
     Kernel * const scan = P.CreateKernelCall<editdScanKernel>(MatchResults);
-    scan->link("wrapped_report_pos", wrapped_report_pos);
+    P.LinkFunction(scan, "wrapped_report_pos", wrapped_report_pos);
 }
 
 editdFunctionType editdPipeline(CPUDriver & driver, const std::vector<std::string> & patterns) {
@@ -371,7 +381,7 @@ void multiEditdPipeline(ProgramBuilder & P) {
         #endif
     }
     Kernel * const scan = P.CreateKernelCall<editdScanKernel>(finalResults);
-    scan->link("wrapped_report_pos", wrapped_report_pos);
+    P.LinkFunction(scan, "wrapped_report_pos", wrapped_report_pos);
 }
 
 multiEditdFunctionType multiEditdPipeline(CPUDriver & driver) {
@@ -387,7 +397,7 @@ void editdIndexPatternPipeline(ProgramBuilder & P, unsigned patternLen, StreamSe
     StreamSet * const MatchResults = P.CreateStreamSet(editDistance + 1);
     P.CreateKernelCall<editdCPUKernel>(editDistance, patternLen, groupSize, pattStream, ChStream, MatchResults);
     Kernel * const scan = P.CreateKernelCall<editdScanKernel>(MatchResults);
-    scan->link("wrapped_report_pos", wrapped_report_pos);
+    P.LinkFunction(scan, "wrapped_report_pos", wrapped_report_pos);
 }
 
 

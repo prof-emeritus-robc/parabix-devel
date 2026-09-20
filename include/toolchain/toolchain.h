@@ -5,10 +5,17 @@
 
 #pragma once
 
+#if defined(PARABIX_ARM_TARGET)
+#include <arm_sve.h>
+#endif
+
+#include <llvm/ADT/StringMap.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/CodeGen.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/Target/TargetMachine.h>
+
+#include <bitset>
 
 #ifndef LLVM_VERSION_CODE
 // #defines for comparison with LLVM_VERSION_INTEGER
@@ -76,8 +83,43 @@ enum PipelineCompilationModeOptions {
     , Expensive
 };
 
-extern bool PabloTransposition;
-extern bool SplitTransposition;
+// not an exhaustive list; can be extended but keep __Count as the last entry
+enum class Feature : size_t {
+    SSSE3,
+    // ---------------
+    AVX,
+    AVX_BMI,
+    AVX_BMI2,
+    // ---------------
+    AVX2,
+    // ---------------
+    AVX512F,
+    AVX512_CD,
+    AVX512_BW,
+    AVX512_DQ,
+    AVX512_VL,
+    AVX512_VBMI,
+    AVX512_VBMI2,
+    AVX512_VPOPCNTDQ,
+    // ---------------
+    SVE,
+    // ---------------
+    SVE2,
+    __Count
+};
+
+using FeatureSet = std::bitset<(size_t)Feature::__Count>;
+
+#if defined(PARABIX_ARM_TARGET)
+__attribute__((target ("+sve")))
+static inline unsigned HostSVEBitWidth() {
+    return svcntb() * 8;
+}
+#endif
+
+llvm::StringMap<bool> GetFeatureNames();
+FeatureSet MapFeatureNames(llvm::StringMap<bool> const &namedFeatures);
+unsigned DefaultBlockSizeForFeatures(const FeatureSet &featureSet);
 
 bool LLVM_READONLY DebugOptionIsSet(const DebugFlags flag);
 
@@ -101,6 +143,8 @@ extern std::string CCCOption;
 extern std::string ThreadLocalPermittedOptions;
 extern std::string PreserveAllStreamSetDataOptions;
 extern std::string DoubleStreamSetSizeOptions;
+extern std::string CPUFeatureOptions;
+extern bool UseI64Builder;
 extern PipelineCompilationModeOptions PipelineCompilationMode;
 #ifdef ENABLE_PAPI
 extern std::string PapiCounterOptions;
@@ -119,7 +163,11 @@ extern unsigned TaskThreads;
 extern unsigned SegmentThreads;
 extern unsigned ScanBlocks;
 extern bool EnableObjectCache;
+extern bool EnableModuleInliner;
 extern bool EnablePipelineObjectCache;
+extern bool UseCustomJITMemoryManager;
+extern unsigned CompileThreads;
+extern bool UseMCJIT;
 extern bool EnableDynamicMultithreading;
 extern bool TraceObjectCache;
 extern unsigned GroupNum;
@@ -134,7 +182,7 @@ extern float DynamicMultithreadingRemoveThreshold;
 extern size_t DynamicMultithreadingPeriod;
 extern bool UseProcessThreadForIO;
 
-void ParseCommandLineOptions(int argc, const char *const *argv, std::initializer_list<const llvm::cl::OptionCategory *> hiding = {});
+void ParseCommandLineOptions(int argc, const char *const *argv, std::initializer_list<const llvm::cl::OptionCategory *> hiding = {}, llvm::StringRef overview = "");
 
 void AddParabixVersionPrinter();
 

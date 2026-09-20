@@ -22,4 +22,5 @@ SRC
 DEPS
     re.toolchain
     unicode.core
+    slaballocator
 )

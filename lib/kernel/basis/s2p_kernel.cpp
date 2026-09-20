@@ -4,6 +4,7 @@
  */
 
 #include <kernel/basis/s2p_kernel.h>
+#include <sstream>
 #include <kernel/core/callback.h>
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pabloAST.h>
@@ -16,10 +17,21 @@
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
 #include <boost/intrusive/detail/math.hpp>
+#include <llvm/Support/CommandLine.h>
 
 using boost::intrusive::detail::floor_log2;
 
 using namespace llvm;
+
+enum TranspositionMode {BytePack, Ideal, Split, Pablo};
+static cl::opt<TranspositionMode>
+S2P_Mode("S2P_Mode", cl::ValueOptional,
+         cl::values(clEnumValN(BytePack, "BytePack", "Bytepack transposition algorithm (default)."),
+                    clEnumValN(Ideal, "Ideal", "Idealized transposition algorithm."),
+                    clEnumValN(Split, "Split", "Split 3-stage transposition algorithm."),
+                    clEnumValN(Pablo, "Pablo", "Pablo transposition algorithm.")),
+         cl::cat(codegen::CodeGenOptions), cl::init(BytePack));
+
 
 namespace kernel {
 
@@ -83,7 +95,6 @@ void s2p(KernelBuilder & b, Value * input[], Value * output[]) {
 }
 
 /* Alternative transposition model, but small field width packs are problematic. */
-#if 0
 void s2p_ideal(KernelBuilder & b, Value * input[], Value * output[]) {
     Value * hi_nybble[4];
     Value * lo_nybble[4];
@@ -112,7 +123,6 @@ void s2p_ideal(KernelBuilder & b, Value * input[], Value * output[]) {
     output[1] = b.hsimd_packh(2, pair10[0], pair10[1]);
     output[0] = b.hsimd_packl(2, pair10[0], pair10[1]);
 }
-#endif
 
 // Transposition of each group of 64 bits.
 Value * s2p_bytes(KernelBuilder & b, Value * r) {
@@ -168,7 +178,11 @@ void S2PKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfSt
     for (unsigned i = 0; i < 8; i++) {
         bytepack[i] = b.loadInputStreamPack("byteStream", sz_ZERO, b.getInt32(i), blockOffsetPhi);
     }
-    s2p(b, bytepack, basisbits);
+    if (S2P_Mode == Ideal) {
+        s2p_ideal(b, bytepack, basisbits);
+    } else {
+        s2p(b, bytepack, basisbits);
+    }
     if (mZeroMask) {
         b.CreateBr(s2pStore);
         b.SetInsertPoint(s2pStore);
@@ -201,11 +215,23 @@ inline Bindings S2PKernel::makeOutputBindings(StreamSet * const BasisBits) {
     return {Binding("basisBits", BasisBits)};
 }
 
+inline std::string S2PKernel::makeCacheName(StreamSet * const BasisBits,
+                                           StreamSet * zeroMask) {
+    std::stringstream ss;
+    ss << "s2p";
+    if (zeroMask) ss << "z";
+    ss << BasisBits->getNumElements();
+    if (S2P_Mode == Ideal) {
+        ss << "_ideal";
+    }
+    return ss.str();
+}
+
 S2PKernel::S2PKernel(LLVMTypeSystemInterface & ts,
                      StreamSet * const codeUnitStream,
                      StreamSet * const BasisBits,
                      StreamSet * zeroMask)
-: MultiBlockKernel(ts, (zeroMask ? "s2pz" : "s2p") + std::to_string(BasisBits->getNumElements())
+: MultiBlockKernel(ts, makeCacheName(BasisBits, zeroMask)
 , makeInputBindings(codeUnitStream, zeroMask)
 , makeOutputBindings(BasisBits)
 , {}, {}, {})
@@ -382,15 +408,14 @@ void Staged_S2P(PipelineBuilder &P,
 }
 
 void Selected_S2P(PipelineBuilder & P, StreamSet * ByteStream, StreamSet * BasisBits) {
-    if (codegen::PabloTransposition) {
+    if (S2P_Mode == Pablo) {
         P.CreateKernelCall<S2P_PabloKernel>(ByteStream, BasisBits);
-    } else if (codegen::SplitTransposition) {
+    } else if (S2P_Mode == Split) {
         Staged_S2P(P, ByteStream, BasisBits);
     } else {
         P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
     }
 }
-
 
 S2P_i21_3xi8::S2P_i21_3xi8(LLVMTypeSystemInterface & ts, StreamSet * const i32Stream, StreamSet * const i8stream0, StreamSet * const i8stream1, StreamSet * const i8stream2)
 : MultiBlockKernel(ts, "s2p_i21_3xi8",

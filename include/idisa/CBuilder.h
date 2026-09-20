@@ -26,7 +26,16 @@ namespace llvm { class PointerType; }
 namespace llvm { class Type; }
 namespace llvm { class Value; }
 
-class BaseDriver;
+class FunctionLinkCallback {
+public:
+
+    virtual llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) = 0;
+
+    virtual bool HasExternalFunction(llvm::StringRef unmangledName) const = 0;
+
+};
+
+
 
 inline bool is_power_2(const uint64_t n) {
     return ((n & (n - 1)) == 0) && n;
@@ -36,25 +45,19 @@ extern "C" void free_debug_wrapper(void * ptr);
 
 
 
-class CBuilder : public llvm::IRBuilder<> {
+class CBuilder : public virtual llvm::IRBuilder<>, public LLVMTypeSystemInterface, public FunctionLinkCallback {
 
     friend class kernel::PipelineKernel;
 
 public:
+
+    const static size_t PAGE_SIZE;
 
     CBuilder(llvm::LLVMContext & C);
 
     virtual ~CBuilder() {}
 
     llvm::Module * getModule() const {
-        #ifndef NDEBUG
-        llvm::BasicBlock * const bb = GetInsertBlock();
-        if (bb) {
-            llvm::Function * const f = bb->getParent();
-            assert ("CBuilder has an insert point that is not contained within a Function" && f);
-            assert ("CBuilder module differs from insertion point module" && (mModule == f->getParent()));
-        }
-        #endif
         return mModule;
     }
 
@@ -260,19 +263,6 @@ public:
 
     llvm::Constant * GetString(llvm::StringRef Str);
 
-    inline llvm::IntegerType * getSizeTy() const {
-        assert (mSizeType);
-        return mSizeType;
-    }
-
-    inline llvm::ConstantInt * LLVM_READNONE getSize(const size_t value) {
-        return llvm::ConstantInt::get(getSizeTy(), value);
-    }
-
-    llvm::IntegerType * LLVM_READNONE getIntAddrTy() const;
-
-    llvm::PointerType * LLVM_READNONE getVoidPtrTy(const unsigned AddressSpace = 0) const;
-
     llvm::PointerType * LLVM_READNONE getFILEptrTy();
 
     llvm::ConstantInt * LLVM_READNONE getTypeSize(llvm::Type * type, llvm::IntegerType * valType = nullptr) const;
@@ -284,8 +274,6 @@ public:
     inline unsigned getCacheAlignment() const {
         return mCacheLineAlignment;
     }
-
-    static LLVM_READNONE unsigned getPageSize();
 
     virtual llvm::LoadInst* CreateAtomicLoadAcquire(llvm::Type * type, llvm::Value * ptr);
 
@@ -353,11 +341,6 @@ public:
     llvm::Value * CreateLog2(llvm::Value * value, const llvm::Twine Name = "");
 
     llvm::Value * CreateReadCycleCounter();
-
-    template <typename ExternalFunctionType>
-    llvm::Function * LinkFunction(llvm::StringRef name, ExternalFunctionType & functionPtr) const;
-
-    llvm::Function * LinkFunction(llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const;
 
     // Set the nontemporal metadata attribute for a store instruction.
     void setNontemporal(llvm::StoreInst * s);
@@ -435,14 +418,6 @@ public:
     llvm::CallInst * CreateSRandCall(llvm::Value * randomSeed);
     llvm::CallInst * CreateRandCall();
 
-    void setDriver(BaseDriver & ts) {
-        mDriver = &ts;
-    }
-
-    BaseDriver & getDriver() const {
-        return *mDriver;
-    }
-
     llvm::BasicBlock * WriteDefaultRethrowBlock();
 
     void CheckAddress(llvm::Value * const Ptr, llvm::Value * const Size, llvm::StringRef Name) {
@@ -451,19 +426,48 @@ public:
 
     void CheckAddress(llvm::Value * const Ptr, llvm::Value * const Size, llvm::Constant * const Name);
 
-    // LLVM 18 removed all qualified pointer types but if we want to support earlier LLVM versions, we must still still allow kernels to
-    // construct them.
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(18, 0, 0)
-    #define ADD_POINTER_TYPE_ALIAS(Name) llvm::PointerType * get##Name##PtrTy(unsigned = 0) { return llvm::PointerType::getUnqual(getContext()); }
+    static llvm::Type * convertTypeToLLVMContext(llvm::LLVMContext & C, llvm::Type * type);
 
-    ADD_POINTER_TYPE_ALIAS(Int8)
-    ADD_POINTER_TYPE_ALIAS(Int16)
-    ADD_POINTER_TYPE_ALIAS(Int32)
-    ADD_POINTER_TYPE_ALIAS(Int64)
-    ADD_POINTER_TYPE_ALIAS(Void)
+    static llvm::Value * convertValueToLLVMContext(llvm::Module * M, llvm::Value * value);
 
-    #undef ADD_POINTER_TYPE
-    #endif
+    static llvm::Metadata * convertMetadataToLLVMContext(llvm::Module * M, llvm::Metadata * meta);
+
+    static llvm::Constant * convertConstantToLLVMContext(llvm::LLVMContext & C, llvm::Constant * constant);
+
+public:
+
+    unsigned getBitBlockWidth() const override {
+        llvm_unreachable("CBuilder getBitBlockWidth should not be called");
+    }
+
+    llvm::FixedVectorType * getBitBlockType() const override {
+        llvm_unreachable("CBuilder getBitBlockType should not be called");
+    }
+
+    std::string getBuilderUniqueName() override {
+        llvm_unreachable("CBuilder getBuilderUniqueName should not be called");
+    }
+
+public:
+
+    void LinkAllNecessaryExternalFunctions();
+
+    template <typename ExternalFunctionType>
+    llvm::Function * LinkFunction(llvm::StringRef name, ExternalFunctionType & functionPtr);
+
+    llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) final {
+        assert (mLinkCallback);
+        return mLinkCallback->LinkFunction(unmangledName, functionType, functionPointer);
+    }
+
+    bool HasExternalFunction(llvm::StringRef unmangledName) const final {
+        assert (mLinkCallback);
+        return mLinkCallback->HasExternalFunction(unmangledName);
+    }
+
+    void setFunctionLinkCallback(FunctionLinkCallback * obj) {
+        mLinkCallback = obj;
+    }
 
 protected:
 
@@ -493,15 +497,11 @@ protected:
 
     void __CreateAssert(llvm::Value * assertion, const llvm::Twine failureMessage, std::initializer_list<llvm::Value *> args);
 
-    virtual void linkAllNecessaryExternalFunctions() const;
-
 protected:
 
     llvm::Module *                  mModule;
     unsigned                        mCacheLineAlignment;
-    llvm::IntegerType * const       mSizeType;
-    BaseDriver *                    mDriver;
-    llvm::LLVMContext               mContext;
+    FunctionLinkCallback *          mLinkCallback = nullptr;
     const std::string               mTriple;
     #ifdef ENABLE_LIBBACKTRACE
     void *                          mBacktraceState = nullptr;
@@ -509,7 +509,7 @@ protected:
 };
 
 template <typename ExternalFunctionType>
-llvm::Function * CBuilder::LinkFunction(llvm::StringRef name, ExternalFunctionType & functionPtr) const {
+llvm::Function * CBuilder::LinkFunction(llvm::StringRef name, ExternalFunctionType & functionPtr) {
     llvm::FunctionType * const type = FunctionTypeBuilder<ExternalFunctionType>::get(getContext());
     assert ("FunctionTypeBuilder did not resolve a function type." && type);
     return LinkFunction(name, type, reinterpret_cast<void *>(&functionPtr));

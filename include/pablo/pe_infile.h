@@ -24,8 +24,8 @@ public:
         return getOperand(0);
     }
 protected:
-    InFile(PabloAST * expr, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::InFile, expr->getType(), {expr}, name, allocator) {
+    InFile(PabloAST * expr, const String * name)
+    : Statement(ClassTypeId::InFile, expr->getType(), {expr}, name) {
 
     }
 };
@@ -45,8 +45,8 @@ public:
         return getOperand(0);
     }
 protected:
-    AtEOF(PabloAST * expr, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::AtEOF, expr->getType(), {expr}, name, allocator) {
+    AtEOF(PabloAST * expr, const String * name)
+    : Statement(ClassTypeId::AtEOF, expr->getType(), {expr}, name) {
 
     }
 };

@@ -65,13 +65,13 @@ public:
     }
 
 protected:
-    Var(llvm::Type * const type, const String * name, Allocator & allocator, const Attribute attr = Attribute::None)
-    : Var(ClassTypeId::Var, type, name, allocator, attr) {
+    Var(llvm::Type * const type, const String * name, const Attribute attr = Attribute::None)
+    : Var(ClassTypeId::Var, type, name, attr) {
 
     }
 
-    explicit Var(const ClassTypeId typeId, llvm::Type * const type, const String * name, Allocator & allocator, const Attribute attr)
-    : NamedPabloAST(typeId, type, name, allocator)
+    explicit Var(const ClassTypeId typeId, llvm::Type * const type, const String * name, const Attribute attr)
+    : NamedPabloAST(typeId, type, name)
     , mAttribute(attr) {
 
     }
@@ -105,8 +105,8 @@ public:
     }
 
 protected:
-    Extract(llvm::Type * type, Var * array, PabloAST * const index, Allocator & allocator)
-    : Var(ClassTypeId::Extract, type, nullptr, allocator, array->getAttribute())
+    Extract(llvm::Type * type, Var * array, PabloAST * const index)
+    : Var(ClassTypeId::Extract, type, nullptr, array->getAttribute())
     , mArray(array)
     , mIndex(index) {
 

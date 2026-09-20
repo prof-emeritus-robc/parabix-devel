@@ -20,7 +20,7 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
     #endif
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
-        b.CreateMProtect(mKernel->getSharedStateType(), mKernelSharedHandle, CBuilder::Protect::WRITE);
+        b.CreateMProtect(mKernel->getSharedStateType(b.getContext()), mKernelSharedHandle, CBuilder::Protect::WRITE);
     }
 
     if (LLVM_UNLIKELY(mKernelIsInternallySynchronized || mKernelRequiresIllustratorObject || mHasPipelineIllustratedStreamSet)) {
@@ -333,7 +333,7 @@ void PipelineCompiler::writeKernelCall(KernelBuilder & b) {
     }
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect))) {
-        b.CreateMProtect(mKernel->getSharedStateType(), mKernelSharedHandle, CBuilder::Protect::NONE);
+        b.CreateMProtect(mKernel->getSharedStateType(b.getContext()), mKernelSharedHandle, CBuilder::Protect::NONE);
     }
 
 }
@@ -370,7 +370,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
             SmallVector<char, 256> tmp;
             raw_svector_ostream out(tmp);
 
-            Function * const func = mKernel->getDoSegmentFunction(b, true);
+            Function * const func = mKernel->getDoSegmentFunction(b, true, getKernelLinkageType(mKernelId));
 
             out << mKernel->getName() << ": "
                 "invalid argument type for ";
@@ -427,7 +427,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
             offset[0] = i32_ZERO;
             offset[1] = i32_ZERO;
             offset[2] = i32_ZERO;
-            Value * const branchTypePtr = b.CreateGEP(mKernel->getThreadLocalStateType(), mKernelThreadLocalHandle, offset);
+            Value * const branchTypePtr = b.CreateGEP(mKernel->getThreadLocalStateType(b.getContext()), mKernelThreadLocalHandle, offset);
             b.CreateStore(mOptimizationBranchSelectedBranch, branchTypePtr);
         }
         addNextArg(mKernelThreadLocalHandle);
@@ -474,7 +474,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
                 Value * start = bf->getMallocAddress(b);
                 Value * const cap = bf->getInternalCapacity(b);
                 auto & dl = b.getModule()->getDataLayout();
-                Value * const bytes = b.CreateMulRational(cap, Rational{b.getTypeSize(dl, bf->getType()), b.getBitBlockWidth()});
+                Value * const bytes = b.CreateMulRational(cap, Rational{b.getTypeSize(dl, bf->getType(b)), b.getBitBlockWidth()});
                 Value * end = b.CreateGEP(b.getInt8Ty(), start, bytes);
                 debugPrint(b, "< " + makeBufferName(mKernelId, inputPort) + "_memoryRange = [%" PRIx64 ",%" PRIx64 ")", start, end);
             }
@@ -568,7 +568,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
         Value * start = buffer->getMallocAddress(b);
         Value * const cap = buffer->getInternalCapacity(b);
         auto & dl = b.getModule()->getDataLayout();
-        Value * const bytes = b.CreateMulRational(cap, Rational{b.getTypeSize(dl, buffer->getType()), b.getBitBlockWidth()});
+        Value * const bytes = b.CreateMulRational(cap, Rational{b.getTypeSize(dl, buffer->getType(b)), b.getBitBlockWidth()});
         Value * end = b.CreateGEP(b.getInt8Ty(), start, bytes);
         debugPrint(b, "> " + makeBufferName(mKernelId,  rt.Port) + "_memoryRange = [%" PRIx64 ",%" PRIx64 ")", start, end);
         }
@@ -769,7 +769,7 @@ void PipelineCompiler::updateProcessedAndProducedItemCounts(KernelBuilder & b, V
             assert (bn.isNonThreadLocal());
             Value * const ptr = mReturnedOutputVirtualBaseAddressPtr[outputPort]; assert (ptr);
             ExternalBuffer * const buffer = cast<ExternalBuffer>(bn.Buffer);
-            Value * const vba = b.CreateAlignedLoad(buffer->getPointerType(), ptr, PtrTyABIAlignment);
+            Value * const vba = b.CreateAlignedLoad(buffer->getPointerType(b), ptr, PtrTyABIAlignment);
             buffer->setBaseAddress(b, vba);
             if (LLVM_UNLIKELY(mCheckStreamSets && !rt.isShared())) {
                 Value * const ptr = mReturnedProducedCapacityPtr[outputPort];  assert (ptr);

@@ -215,7 +215,7 @@ void source_logic(PipelineBuilder & P, StreamSet * ByteStream, StreamSet * Basis
     Scalar * const length = P.getInputScalar("length");
     P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
 
-    P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
+    Selected_S2P(P, ByteStream, BasisBits);
     SHOW_BIXNUM(BasisBits);
 }
 
@@ -272,7 +272,7 @@ void working_space_logic(PipelineBuilder & P, StreamSet * SelectedWorkBasis, Str
     StreamSet * BasisBits = nullptr;
     if (ByteFiltering) {
         BasisBits = P.CreateStreamSet(8, 1);
-        P.CreateKernelCall<S2PKernel>(SelectedWorkBasis, BasisBits);
+        Selected_S2P(P, SelectedWorkBasis, BasisBits);
         SHOW_BIXNUM(BasisBits);
     } else {
         BasisBits = SelectedWorkBasis;
@@ -330,7 +330,7 @@ void final_stage_logic(PipelineBuilder & P, StreamSet * ByteStream, StreamSet * 
 
     if (BasisBits == nullptr) {
         BasisBits = P.CreateStreamSet(8, 1);
-        P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
+        Selected_S2P(P, ByteStream, BasisBits);
     }
 
     StreamSet * FinalInsertionBixNum = P.CreateStreamSet(4, 1);

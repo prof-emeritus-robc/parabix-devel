@@ -167,7 +167,7 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mU8index(nullptr),
     mU21(nullptr),
     mU21_LB(nullptr),
-    mEngineThread(pthread_self()) {
+    mEngineThread(std::this_thread::get_id()) {
 
     }
 
@@ -340,7 +340,7 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
         if (mGrepRecordBreak == GrepRecordBreakKind::LF) {
             Kernel * k = P.CreateKernelCall<UnixLinesKernelBuilder>(Source, mLineBreakStream, UnterminatedLineAtEOF::Add1, mNullMode, callbackObject);
             if (mNullMode == NullCharMode::Abort) {
-                k->link("signal_dispatcher", signal_dispatcher);
+                P.LinkFunction(k, "signal_dispatcher", signal_dispatcher);
             }
         } else { // if (mGrepRecordBreak == GrepRecordBreakKind::Null) {
             P.CreateKernelCall<NullDelimiterKernel>(Source, mLineBreakStream, UnterminatedLineAtEOF::Add1);
@@ -651,8 +651,8 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
         // E.AssertEqualLength(SourceCoords, ColorizedCoords);
 
         Kernel * const matchK = E.CreateKernelCall<ColorizedReporter>(ColorizedBytes, SourceCoords, ColorizedCoords, callbackObject);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     };
 
 
@@ -755,9 +755,9 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
         StreamSet * SourceCoords = P.CreateStreamSet(1, sizeof(size_t) * 8);
         Scalar * const callbackObject = P.getInputScalar("callbackObject");
         Kernel * const batchK = P.CreateKernelCall<BatchCoordinatesKernel>(MatchedLineEnds, mLineBreakStream, SourceCoords, callbackObject);
-        batchK->link("get_file_count_wrapper", get_file_count_wrapper);
-        batchK->link("get_file_start_pos_wrapper", get_file_start_pos_wrapper);
-        batchK->link("set_batch_line_number_wrapper", set_batch_line_number_wrapper);
+        P.LinkFunction(batchK, "get_file_count_wrapper", get_file_count_wrapper);
+        P.LinkFunction(batchK, "get_file_start_pos_wrapper", get_file_start_pos_wrapper);
+        P.LinkFunction(batchK, "set_batch_line_number_wrapper", set_batch_line_number_wrapper);
 
         StreamSet * MatchedLineStarts = P.CreateStreamSet(1, 1);
         StreamSet * lineStarts = P.CreateStreamSet(1, 1);
@@ -774,6 +774,8 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
 
         StreamSet * Filtered = P.CreateStreamSet(1, 8);
         if (UseByteFilterByMask) {
+            // Warning: a phantom null byte may be produced in the event
+            // of input files with no final line break.
             FilterByMask(P, MatchedLineSpans, ByteStream, Filtered, 0, 64);
         } else {
             P.CreateKernelCall<MatchFilterKernel>(MatchedLineStarts, mLineBreakStream, ByteStream, Filtered);
@@ -788,13 +790,9 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
             P.captureBitstream("FilteredMatchSpans", FilteredMatchSpans);
         }
         StreamSet * FilteredBasis = P.CreateStreamSet(8, 1);
-        if (codegen::SplitTransposition) {
-            Staged_S2P(P, Filtered, FilteredBasis);
-        } else {
-            P.CreateKernelCall<S2PKernel>(Filtered, FilteredBasis);
-            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-                P.captureBixNum("FilteredBasis", FilteredBasis);
-            }
+        Selected_S2P(P, Filtered, FilteredBasis);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBixNum("FilteredBasis", FilteredBasis);
         }
 
         applyColorization(P, SourceCoords, FilteredMatchSpans, FilteredBasis);
@@ -805,16 +803,16 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
             P.CreateKernelCall<MatchCoordinatesKernel>(MatchedLineEnds, mLineBreakStream, MatchCoords, MatchCoordinateBlocks);
             Scalar * const callbackObject = P.getInputScalar("callbackObject");
             Kernel * const matchK = P.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-            matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-            matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+            P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+            P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
         } else {
             Scalar * const callbackObject = P.getInputScalar("callbackObject");
             Kernel * const scanBatchK = P.CreateKernelCall<ScanBatchKernel>(MatchedLineEnds, mLineBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-            scanBatchK->link("get_file_count_wrapper", get_file_count_wrapper);
-            scanBatchK->link("get_file_start_pos_wrapper", get_file_start_pos_wrapper);
-            scanBatchK->link("set_batch_line_number_wrapper", set_batch_line_number_wrapper);
-            scanBatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-            scanBatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+            P.LinkFunction(scanBatchK, "get_file_count_wrapper", get_file_count_wrapper);
+            P.LinkFunction(scanBatchK, "get_file_start_pos_wrapper", get_file_start_pos_wrapper);
+            P.LinkFunction(scanBatchK, "set_batch_line_number_wrapper", set_batch_line_number_wrapper);
+            P.LinkFunction(scanBatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+            P.LinkFunction(scanBatchK, "finalize_match_wrapper", finalize_match_wrapper);
         }
     }
 }
@@ -833,7 +831,7 @@ void EmitMatchesEngine::grepCodeGen() {
 
     P.CreateKernelCall<MemorySourceKernel>(buffer, length, InternalBytes);
     grepPipeline(P, InternalBytes);
-    P.setOutputScalar("countResult", P.CreateConstant(mGrepDriver.getInt64(0)));
+    P.setOutputScalar("countResult", P.CreateConstant(P.getInt64(0)));
     mBatchMethod = P.compile();
 }
 
@@ -1053,35 +1051,24 @@ int32_t GrepEngine::openFile(const std::string & fileName, std::ostringstream & 
 // The process of searching a group of files may use a sequential or a task
 // parallel approach.
 
-void * DoGrepThreadFunction(void *args) {
-    assert (args);
-    return reinterpret_cast<GrepEngine *>(args)->DoGrepThreadMethod();
-}
-
 bool GrepEngine::searchAllFiles() {
 
-    std::vector<pthread_t> threads(codegen::TaskThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(codegen::TaskThreads - 1);
 
     for(unsigned long i = 1; i < codegen::TaskThreads; ++i) {
-        const int rc = pthread_create(&threads[i], nullptr, DoGrepThreadFunction, (void *)this);
-        if (rc) {
-            llvm::report_fatal_error(llvm::StringRef("Failed to create thread: code ") + std::to_string(rc));
-        }
+        threads.emplace_back([this]() { this->DoGrepThreadMethod(); });
     }
     // Main thread also does the work;
     DoGrepThreadMethod();
-    for(unsigned i = 1; i < codegen::TaskThreads; ++i) {
-        void * status = nullptr;
-        const int rc = pthread_join(threads[i], &status);
-        if (rc) {
-            llvm::report_fatal_error(llvm::StringRef("Failed to join thread: code ") + std::to_string(rc));
-        }
+    for (auto & t : threads) {
+        t.join();
     }
     return grepMatchFound;
 }
 
 // DoGrep thread function.
-void * GrepEngine::DoGrepThreadMethod() {
+void GrepEngine::DoGrepThreadMethod() {
 
     unsigned fileIdx = mNextFileToGrep++;
     while (fileIdx < mFileGroups.size()) {
@@ -1092,13 +1079,10 @@ void * GrepEngine::DoGrepThreadMethod() {
             grepMatchFound = true;
         }
         if ((mEngineKind == EngineKind::QuietMode) && grepMatchFound) {
-            if (pthread_self() != mEngineThread) {
-                pthread_exit(nullptr);
-            }
-            return nullptr;
+            return;
         }
         fileIdx = mNextFileToGrep++;
-        if (pthread_self() == mEngineThread) {
+        if (std::this_thread::get_id() == mEngineThread) {
             while ((mNextFileToPrint < mFileGroups.size()) && (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete)) {
                 const auto output = mResultStrs[mNextFileToPrint].str();
                 if (!output.empty()) {
@@ -1109,8 +1093,8 @@ void * GrepEngine::DoGrepThreadMethod() {
             }
         }
     }
-    if (pthread_self() != mEngineThread) {
-        pthread_exit(nullptr);
+    if (std::this_thread::get_id() != mEngineThread) {
+        return;
     }
     while (mNextFileToPrint < mFileGroups.size()) {
         const bool readyToPrint = (mFileStatus[mNextFileToPrint] == FileStatus::GrepComplete);
@@ -1131,7 +1115,6 @@ void * GrepEngine::DoGrepThreadMethod() {
         llvm::outs() << s.str();
         if (grepResult) grepMatchFound = true;
     }
-    return nullptr;
 }
 
 InternalSearchEngine::InternalSearchEngine(BaseDriver &driver) :
@@ -1189,12 +1172,12 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
         StreamSet * MatchCoords = E.CreateStreamSet(3, sizeof(size_t) * 8);
         E.CreateKernelCall<MatchCoordinatesKernel>(MatchingRecords, RecordBreakStream, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = E.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
         Kernel * const scanMatchK = E.CreateKernelCall<ScanMatchKernel>(MatchingRecords, RecordBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-        scanMatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        scanMatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mMainMethod = E.compile();
@@ -1278,12 +1261,12 @@ void InternalMultiSearchEngine::grepCodeGen(const re::PatternVector & patterns) 
         StreamSet * MatchCoords = E.CreateStreamSet(3, sizeof(size_t) * 8);
         E.CreateKernelCall<MatchCoordinatesKernel>(resultsSoFar, RecordBreakStream, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = E.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
         Kernel * const scanMatchK = E.CreateKernelCall<ScanMatchKernel>(resultsSoFar, RecordBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-        scanMatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        scanMatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mMainMethod = E.compile();

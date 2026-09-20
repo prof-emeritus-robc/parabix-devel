@@ -259,7 +259,7 @@ void IndexedShiftBack::generateMultiBlockLogic(KernelBuilder & b, Value * const 
         //  Identify the scanwords in this block that will receive new high markers.
         Value * const newHighMarkerGroup = b.CreateTrunc(highMarkerPhi[i], b.getIntNTy(b.getBitBlockWidth()/sw.width));
         // Align the new high markers in their scanwords.
-        Value * const spreadHighMarkers = b.esimd_bitspread(sw.width, newHighMarkerGroup);
+        Value * const spreadHighMarkers = b.esimd_bitspread(b.getBitBlockWidth(), sw.width, newHighMarkerGroup);
         //b.CallPrintRegister("spreadHighMarkers", spreadHighMarkers);
         // Move them into position
         Value * const newMarkersInPackedPosition = b.simd_sllv(sw.width, spreadHighMarkers, packedHighIndexPosition);

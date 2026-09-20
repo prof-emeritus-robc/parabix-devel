@@ -301,7 +301,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
     size_t unscaledUnitWeightDenomLCM = 1U;
 
-    const auto pageSize = getPageSize();
+    const auto pageSize = CBuilder::PAGE_SIZE;
 
     for (unsigned partitionId = 0; partitionId < PartitionCount; ++partitionId) {
         const auto firstKernel = FirstKernelInPartition[partitionId];
@@ -321,7 +321,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                 if (LLVM_UNLIKELY(bp.isZeroExtended())) {
                     const auto streamSet = source(input, mBufferGraph);
                     const BufferNode & bn = mBufferGraph[streamSet];
-                    Type * const type = bn.Buffer->getType();
+                    Type * const type = bn.Buffer->getType(b);
                     const size_t typeSize = b.getTypeSize(dl, type);
                     const auto W = bp.Maximum * Rational{typeSize * StrideRepetitionVector[kernel],
                                    bw * pageSize * StrideRepetitionVector[firstKernel]};
@@ -351,7 +351,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                         mapStreamSetToThreadLocal[k] = numOfThreadLocalStreamSets;
                         streamSetPartitionId[numOfThreadLocalStreamSets] = packedPartitionId;
 
-                        Type * const type = bn.Buffer->getType();
+                        Type * const type = bn.Buffer->getType(b);
                         const size_t typeSize = b.getTypeSize(dl, type);
                         const auto W = bp.Maximum * Rational{typeSize * StrideRepetitionVector[kernel],
                                        bw * pageSize * StrideRepetitionVector[firstKernel]};

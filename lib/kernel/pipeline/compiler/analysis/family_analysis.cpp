@@ -2,7 +2,7 @@
 
 namespace kernel {
 
-void PipelineAnalysis::scanFamilyKernelBindings() {
+void PipelineAnalysis::scanFamilyKernelBindings(KernelBuilder & b) {
 
     // Any non-call-by-family kernel K initialization (termination) function ought to be compiled into the
     // initialization (termination) of its parent pipeline P but when K contains call-by-family kernels itself,
@@ -38,13 +38,11 @@ void PipelineAnalysis::scanFamilyKernelBindings() {
                 if (ref.isFamilyCall() || m > 0) {
                     if (ref.isFamilyCall()) {
 
-                        obj->ensureLoaded();
-
                         unsigned flags = 0;
-                        if (LLVM_LIKELY(obj->isStateful())) {
+                        if (LLVM_LIKELY(obj->getSharedStateType())) {
                             flags |= FamilyScalarData::CaptureSharedStateObject;
                         }
-                        if (obj->hasThreadLocal()) {
+                        if (obj->getThreadLocalStateType()) {
                             flags |= FamilyScalarData::CaptureThreadLocal;
                         }
                         if (obj->allocatesInternalStreamSets()) {
@@ -102,13 +100,11 @@ void PipelineAnalysis::scanFamilyKernelBindings() {
 found_kernel_in_graph:
                 if (ref.isFamilyCall()) {
 
-                    obj->ensureLoaded();
-
                     unsigned flags = FamilyScalarData::CaptureStoreInKernelState;
-                    if (LLVM_LIKELY(obj->isStateful())) {
+                    if (LLVM_LIKELY(obj->getSharedStateType())) {
                         flags |= FamilyScalarData::CaptureSharedStateObject;
                     }
-                    if (obj->hasThreadLocal()) {
+                    if (obj->getThreadLocalStateType()) {
                         flags |= FamilyScalarData::CaptureThreadLocal;
                     }
                     if (obj->allocatesInternalStreamSets()) {

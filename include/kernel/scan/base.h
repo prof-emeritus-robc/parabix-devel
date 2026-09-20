@@ -34,16 +34,24 @@ protected:
         const unsigned wordsPerBlock;
         const unsigned wordsPerStride;
         const unsigned fieldWidth;
+        const unsigned numBlocksPerStride;
 
-        llvm::Type * const Ty;
-        llvm::Type * const StrideMaskTy;
+        llvm::Type * Ty = nullptr;
+        llvm::Type * StrideMaskTy = nullptr;
 
-        llvm::Constant * const WIDTH;
-        llvm::Constant * const WORDS_PER_BLOCK;
-        llvm::Constant * const WORDS_PER_STRIDE;
-        llvm::Constant * const NUM_BLOCKS_PER_STRIDE;
+        llvm::Constant * WIDTH = nullptr;
+        llvm::Constant * WORDS_PER_BLOCK = nullptr;
+        llvm::Constant * WORDS_PER_STRIDE = nullptr;
+        llvm::Constant * NUM_BLOCKS_PER_STRIDE = nullptr;
 
         ScanWordContext(LLVMTypeSystemInterface & ts, unsigned strideWidth);
+
+        // The constructor runs at pipeline-construction time, in the driver's own
+        // LLVMContext; kernel bodies are compiled later, on a worker thread with its
+        // own separate LLVMContext, so the Ty/StrideMaskTy/WIDTH/... pointers above
+        // are not valid there. rebind() (re)derives them in b's current context; call
+        // it before using any of them during codegen.
+        void rebind(KernelBuilder & b);
     };
 
     void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) final override;

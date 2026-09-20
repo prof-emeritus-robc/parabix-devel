@@ -57,6 +57,7 @@ case T::Type: to = transform##Type(llvm::cast<Type>(from)); break
         TRANSFORM(Seq);
         TRANSFORM(Start);
         TRANSFORM(Permute);
+        TRANSFORM(Interleavable);
         TRANSFORM(PropertyExpression);
         default: llvm_unreachable("Unknown RE type");
     }
@@ -209,6 +210,19 @@ RE * RE_Transformer::transformPermute(Permute * p) {
     }
     if (!any_changed) return p;
     return makePermute(elems.begin(), elems.end());
+}
+
+RE * RE_Transformer::transformInterleavable(Interleavable * s) {
+    SmallVector<RE *, 16> elems;
+    elems.reserve(s->size());
+    bool any_changed = false;
+    for (RE * e : *s) {
+        RE * e1 = transform(e);
+        if (e1 != e) any_changed = true;
+        elems.push_back(e1);
+    }
+    if (!any_changed) return s;
+    return makeInterleavable(elems.begin(), elems.end());
 }
 
 RE * RE_Transformer::transformPropertyExpression(PropertyExpression * pe) {

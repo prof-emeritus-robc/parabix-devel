@@ -7,7 +7,7 @@
 #include <kernel/illustrator/illustrator_binding.h>
 #include <llvm/Support/raw_os_ostream.h>
 #include <kernel/core/kernel_builder.h>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 #include <boost/intrusive/detail/math.hpp>
 #include <boost/container/flat_map.hpp>
 #include <boost/container/flat_set.hpp>
@@ -80,8 +80,6 @@ struct StreamDataStateObject;
 
 struct StreamDataCapture;
 
-struct StreamDataStateObject;
-
 struct StreamDataElement {
     size_t StrideNum;
     size_t From;
@@ -99,11 +97,9 @@ struct StreamDataChunk {
     StreamDataChunk * Next = nullptr;
 };
 
-using StreamDataAllocator = SlabAllocator<uint8_t, 1024 * 1024>;
-
 using LoopVector = SmallVector<size_t, 8 + 1>;
 
-struct StreamDataCapture {
+struct StreamDataCapture : public SlabAllocatedObject {
     const char * const StreamName;
     StreamDataCapture * Next = nullptr;
 
@@ -139,7 +135,7 @@ struct StreamDataCapture {
     }
 };
 
-struct StreamDataStateObject {
+struct StreamDataStateObject : public SlabAllocatedObject {
     const char * KernelName;
     StreamDataCapture First;
     size_t SequenceLength = 0;
@@ -183,15 +179,11 @@ struct StreamDataStateObject {
 
     }
 
-    // Even when executed in multi-threaded mode, each kernel instance is guaranteed to be executed
-    // in lock step manner. To ensure this, the pipeline disables state-free/data-parallel execution
-    // when anything is illustrated. Thus we can safely use a single allocator per instance.
-    StreamDataAllocator InternalAllocator;
 };
 
 using StreamDataEntry = std::tuple<const char *, const void *, const StreamDataCapture *>;
 
-class StreamDataIllustrator {
+class StreamDataIllustrator : public SlabAllocatedObject {
 public:
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -209,8 +201,8 @@ inline void registerStreamDataCapture(const char * kernelName, const char * stre
     #endif
     auto r = RegisteredStateObjects.find(stateObject);
     if (r == RegisteredStateObjects.end()) {
-        StreamDataStateObject * newStateObjectEntry = GroupAllocator.allocate<StreamDataStateObject>(1);
-        new (newStateObjectEntry) StreamDataStateObject(kernelName, streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
+        StreamDataStateObject * newStateObjectEntry =
+            new StreamDataStateObject(kernelName, streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
         #ifndef NDEBUG
         so = newStateObjectEntry;
         #endif
@@ -237,8 +229,7 @@ inline void registerStreamDataCapture(const char * kernelName, const char * stre
             }
             current = next;
         }
-        newCapture = GroupAllocator.allocate<StreamDataCapture>(1);
-        new (newCapture) StreamDataCapture(streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
+        newCapture = new StreamDataCapture(streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
         current->Next = newCapture;
     }
     assert (newCapture);
@@ -1037,7 +1028,6 @@ updated_trie:
 
 private:
 
-SlabAllocator<StreamDataStateObject, sizeof(StreamDataStateObject) * 64> GroupAllocator;
 flat_map<StreamDataKey, StreamDataStateObject *> RegisteredStateObjects;
 std::vector<StreamDataEntry> InstallOrderCaptures;
 
@@ -1047,11 +1037,9 @@ inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
                    const size_t strideNum, const uint8_t * streamData, const size_t from, const size_t to, const size_t blockWidth) {
     assert (to >= from);
 
-    auto & A = stateObjectEntry->InternalAllocator;
-
     StreamDataChunk * C = Current;
     if (LLVM_UNLIKELY(CurrentIndex == ELEMENTS_PER_ALLOCATION)) {
-        StreamDataChunk * N = new (A.aligned_allocate(sizeof(StreamDataChunk), sizeof(size_t))) StreamDataChunk{};
+        StreamDataChunk * N = new StreamDataChunk;
         assert (N);
         C->Next = N;
         Current = N;
@@ -1082,7 +1070,7 @@ inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
         const auto ItemBytes = (ItemWidth / CHAR_BIT);
         const size_t length  = (to - from) * ItemBytes;
         assert ((length % ItemBytes) == 0);
-        E.Data = A.aligned_allocate(length, ItemBytes);
+        E.Data = (uint8_t*)ThreadSafeSlabAllocator::allocate(length, ItemBytes);
         assert (E.Data);
         std::memcpy(E.Data, start, length);
     } else {
@@ -1097,7 +1085,7 @@ inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
             const auto end = (modFrom & (blockWidth - 1)) + (to - modFrom);
             const auto length = udiv(end + blockWidth - 1, blockWidth) * blockSize;
             assert (length > 0);
-            E.Data = A.aligned_allocate(length, blockWidth / CHAR_BIT);
+            E.Data = (uint8_t*)ThreadSafeSlabAllocator::allocate(length, blockWidth / CHAR_BIT);
             assert (E.Data);
             std::memcpy(E.Data, start, length);
         }
@@ -1108,7 +1096,7 @@ inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
     if (stateObjectEntry->InKernel) {
         const auto & L = stateObjectEntry->LoopIteration;
         const auto n = L.size();
-        size_t * const V = (size_t*)A.aligned_allocate(n + 1, sizeof(size_t));
+        size_t * const V = ThreadSafeSlabAllocator::allocate_array_of<size_t>(n + 1);
         assert (V);
         for (size_t i = 0; i < n; ++i) {
             V[i] = L[i]; assert (L[i]);

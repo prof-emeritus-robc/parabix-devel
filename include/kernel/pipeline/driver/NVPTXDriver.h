@@ -20,15 +20,9 @@ public:
 
     void * finalizeObject(kernel::PipelineKernel * pipeline) override;
 
-    bool hasExternalFunction(const llvm::StringRef /* functionName */) const override { return false; }
-
 protected:
 
     NVPTXDriver(std::string && moduleName);
-
-private:
-
-    llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const override;
 
 };
 

@@ -48,9 +48,9 @@ void testUsers(const PabloAST * expr, const ScopeSet & validScopes) {
                 str << " but ";
                 PabloPrinter::print(use, str);
                 if (user->getParent() == nullptr) {
-                    str << " is not defined in any scope.";
+                    str << " is not defined in any scope";
                 } else {
-                    str << " is in an unreachable scope.";
+                    str << " is in an unreachable scope";
                 }
                 throw std::runtime_error(str.str());
             }

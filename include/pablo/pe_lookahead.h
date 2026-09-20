@@ -29,8 +29,8 @@ public:
         return llvm::cast<Integer>(getOperand(1))->value();
     }
 protected:
-    Lookahead(PabloAST * expr, PabloAST * shiftAmount, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Lookahead, expr->getType(), {expr, shiftAmount}, name, allocator) {
+    Lookahead(PabloAST * expr, PabloAST * shiftAmount, const String * name)
+    : Statement(ClassTypeId::Lookahead, expr->getType(), {expr, shiftAmount}, name) {
         assert(llvm::isa<Integer>(shiftAmount) && llvm::cast<Integer>(shiftAmount)->value() >= 0);
     }
 };

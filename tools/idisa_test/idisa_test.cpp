@@ -40,6 +40,12 @@ static cl::opt<std::string> TestOutputFile("o", cl::desc("Test output file."), c
 static cl::opt<bool> QuietMode("q", cl::desc("Suppress output, set the return code only."), cl::cat(testFlags));
 static cl::opt<int> ShiftMask("ShiftMask", cl::desc("Mask applied to the shift operand (2nd operand) of simd_sllv, srlv, srav, rotl, rotr"), cl::init(0));
 static cl::opt<int> Immediate("i", cl::desc("Immediate value for mvmd_dslli"), cl::init(1));
+static cl::opt<IDISA::ShuffleMode> ShuffleIndex("ShuffleIndex",
+cl::values(clEnumValN(IDISA::ShuffleMode::TruncateIndex, "Truncate", "Truncate out-of-bound shuffle indexes."),
+           clEnumValN(IDISA::ShuffleMode::ZeroOnIndexOver, "ZeroOnOver", "Select zero for shuffle indexes out of bound."),
+           clEnumValN(IDISA::ShuffleMode::ZeroOnHighIndexBit, "ZeroOnHighBit", "Select zero if high index bit set, otherwise truncate.")),
+                                cl::init(IDISA::ShuffleMode::TruncateIndex));
+static cl::opt<bool> ReportTiming("report-timing", cl::desc("Report pipeline compilation and kernel execution time"), cl::init(false), cl::cat(testFlags));
 
 class ShiftMaskKernel : public BlockOrientedKernel {
 public:
@@ -79,9 +85,19 @@ private:
     const unsigned mImmediateShift;
 };
 
+std::string OpName(std::string idisa_op) {
+    if (idisa_op == "mvmd_shuffle") {
+        if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnIndexOver) {
+            return "mvmd_shuffleH";
+        } else if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnHighIndexBit)
+            return "mvmd_shuffleO";
+    }
+    return idisa_op;
+}
+
 IdisaBinaryOpTestKernel::IdisaBinaryOpTestKernel(LLVMTypeSystemInterface & ts, std::string idisa_op, unsigned fw, unsigned imm,
                                                  StreamSet *Operand1, StreamSet *Operand2, StreamSet *result)
-: MultiBlockKernel(ts, idisa_op + std::to_string(fw) + "_test",
+: MultiBlockKernel(ts, OpName(idisa_op) + std::to_string(fw) + "_test",
      {Binding{"operand1", Operand1}, Binding{"operand2", Operand2}},
      {Binding{"result", result}},
      {}, {}, {}),
@@ -150,7 +166,13 @@ void IdisaBinaryOpTestKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::V
     } else if (mIdisaOperation == "hsimd_packl") {
         result = b.hsimd_packl(mTestFw, operand1, operand2);
     } else if (mIdisaOperation == "hsimd_packus") {
+        operand1 = b.simd_srai(mTestFw, operand1, mTestFw/2 - 1);
+        operand2 = b.simd_srai(mTestFw, operand2, mTestFw/2 - 1);
         result = b.hsimd_packus(mTestFw, operand1, operand2);
+    } else if (mIdisaOperation == "hsimd_packss") {
+        operand1 = b.simd_srai(mTestFw, operand1, mTestFw/2 - 1);
+        operand2 = b.simd_srai(mTestFw, operand2, mTestFw/2 - 1);
+        result = b.hsimd_packss(mTestFw, operand1, operand2);
     } else if (mIdisaOperation == "hsimd_packss") {
         result = b.hsimd_packss(mTestFw, operand1, operand2);
     } else if (mIdisaOperation == "esimd_mergeh") {
@@ -158,9 +180,16 @@ void IdisaBinaryOpTestKernel::generateMultiBlockLogic(KernelBuilder & b, llvm::V
     } else if (mIdisaOperation == "esimd_mergel") {
         result = b.esimd_mergel(mTestFw, operand1, operand2);
     } else if (mIdisaOperation == "mvmd_shuffle") {
-        result = b.mvmd_shuffle(mTestFw, operand1, operand2);
+        result = b.mvmd_shuffle(mTestFw, operand1, operand2, ShuffleIndex);
     } else if (mIdisaOperation == "mvmd_compress") {
-        result = b.mvmd_compress(mTestFw, operand1, operand2);
+        // Real callers (e.g. deletion.cpp) pass a scalar bitmask built with
+        // hsimd_signmask, not a raw data block. Derive a realistic one from
+        // operand2 here so this test actually matches production usage.
+        Value * scalarMask = b.hsimd_signmask(mTestFw, operand2);
+        result = b.mvmd_compress(mTestFw, operand1, scalarMask);
+    } else if (mIdisaOperation == "mvmd_expand") {
+        Value * scalarMask = b.hsimd_signmask(mTestFw, operand2);
+        result = b.mvmd_expand(mTestFw, operand1, scalarMask);
     } else if (mIdisaOperation == "mvmd_dslli") {
         result = b.mvmd_dslli(mTestFw, operand1, operand2, mImmediateShift);
     } else {
@@ -190,7 +219,7 @@ private:
 IdisaBinaryOpCheckKernel::IdisaBinaryOpCheckKernel(LLVMTypeSystemInterface & ts, std::string idisa_op, unsigned fw, unsigned imm,
                                                    StreamSet *Operand1, StreamSet *Operand2, StreamSet *result,
                                                    StreamSet *expected, Scalar *failures)
-: BlockOrientedKernel(ts, idisa_op + std::to_string(fw) + "_check" + std::to_string(QuietMode),
+: BlockOrientedKernel(ts, OpName(idisa_op) + std::to_string(fw) + "_check" + std::to_string(QuietMode),
                            {Binding{"operand1", Operand1},
                             Binding{"operand2", Operand2},
                             Binding{"test_result", result}},
@@ -200,19 +229,83 @@ mIdisaOperation(idisa_op), mTestFw(fw), mImmediateShift(imm) {}
 
 void IdisaBinaryOpCheckKernel::generateDoBlockMethod(KernelBuilder & b) {
     Type * fwTy = b.getIntNTy(mTestFw);
-    BasicBlock * reportFailure = b.CreateBasicBlock("reportFailure");
-    BasicBlock * continueTest = b.CreateBasicBlock("continueTest");
     Constant * const ZeroConst = b.getSize(0);
     Value * operand1Block = b.loadInputStreamBlock("operand1", ZeroConst);
     Value * operand2Block = b.loadInputStreamBlock("operand2", ZeroConst);
     Value * resultBlock = b.loadInputStreamBlock("test_result", ZeroConst);
     unsigned fieldCount = b.getBitBlockWidth()/mTestFw;
     Value * expectedBlock = b.allZeroes();
+    if ((mIdisaOperation == "hsimd_packus") || (mIdisaOperation == "hsimd_packss")) {
+        operand1Block = b.simd_srai(mTestFw, operand1Block, mTestFw/2 - 1);
+        operand2Block = b.simd_srai(mTestFw, operand2Block, mTestFw/2 - 1);
+    }
     if (mIdisaOperation == "mvmd_shuffle") {
+        Constant * fieldLimit = ConstantInt::get(fwTy, fieldCount);
         for (unsigned i = 0; i < fieldCount; i++) {
-            Value * idx = b.CreateURem(b.mvmd_extract(mTestFw, operand2Block, i), ConstantInt::get(fwTy, fieldCount));
+            Value * idx_field = b.mvmd_extract(mTestFw, operand2Block, i);
+            Value * idx = b.CreateURem(idx_field, ConstantInt::get(fwTy, fieldCount));
             Value * elt = b.CreateExtractElement(b.fwCast(mTestFw, operand1Block), b.CreateZExtOrTrunc(idx, b.getInt32Ty()));
+            if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnIndexOver) {
+                elt = b.CreateSelect(b.CreateICmpUGE(idx_field, fieldLimit),
+                                     ConstantInt::getNullValue(fwTy),
+                                     elt);
+            } else if (ShuffleIndex == IDISA::ShuffleMode::ZeroOnHighIndexBit) {
+                elt = b.CreateSelect(b.CreateICmpSLT(idx_field, ConstantInt::getNullValue(fwTy)),
+                                     ConstantInt::getNullValue(fwTy),
+                                     elt);
+            }
             expectedBlock = b.mvmd_insert(mTestFw, expectedBlock, elt, i);
+        }
+    } else if (mIdisaOperation == "mvmd_compress") {
+        // Match the scalar bitmask built in IdisaBinaryOpTestKernel above.
+        Value * scalarMask = b.hsimd_signmask(mTestFw, operand2Block);
+        Type * maskTy = scalarMask->getType();
+        // For each input field i, precompute whether it's selected and its
+        // rank (how many selected fields come before it) - this is the
+        // output slot it should land in if selected.
+        std::vector<Value *> isSelected(fieldCount);
+        std::vector<Value *> rank(fieldCount);
+        Value * runningCount = ConstantInt::get(b.getInt32Ty(), 0);
+        for (unsigned i = 0; i < fieldCount; i++) {
+            Value * bit = b.CreateAnd(b.CreateLShr(scalarMask, ConstantInt::get(maskTy, i)), ConstantInt::get(maskTy, 1));
+            isSelected[i] = b.CreateICmpNE(bit, ConstantInt::get(maskTy, 0));
+            rank[i] = runningCount;
+            runningCount = b.CreateAdd(runningCount, b.CreateZExt(isSelected[i], b.getInt32Ty()));
+        }
+        // For each output slot j, find the (at most one) selected input
+        // field whose rank equals j, and place its value there.
+        for (unsigned j = 0; j < fieldCount; j++) {
+            Value * chosen = ConstantInt::get(fwTy, 0);
+            for (unsigned i = 0; i < fieldCount; i++) {
+                Value * matches = b.CreateAnd(isSelected[i], b.CreateICmpEQ(rank[i], ConstantInt::get(b.getInt32Ty(), j)));
+                Value * elt = b.mvmd_extract(mTestFw, operand1Block, i);
+                chosen = b.CreateSelect(matches, elt, chosen);
+            }
+            expectedBlock = b.mvmd_insert(mTestFw, expectedBlock, chosen, j);
+        }
+    } else if (mIdisaOperation == "mvmd_expand") {
+        // Mirror image of mvmd_compress's reference above: for each output
+        // slot j, if it's selected, it should hold operand1's field at
+        // rank(j) (how many selected slots come before j); otherwise 0.
+        Value * scalarMask = b.hsimd_signmask(mTestFw, operand2Block);
+        Type * maskTy = scalarMask->getType();
+        std::vector<Value *> isSelected(fieldCount);
+        std::vector<Value *> rank(fieldCount);
+        Value * runningCount = ConstantInt::get(b.getInt32Ty(), 0);
+        for (unsigned j = 0; j < fieldCount; j++) {
+            Value * bit = b.CreateAnd(b.CreateLShr(scalarMask, ConstantInt::get(maskTy, j)), ConstantInt::get(maskTy, 1));
+            isSelected[j] = b.CreateICmpNE(bit, ConstantInt::get(maskTy, 0));
+            rank[j] = runningCount;
+            runningCount = b.CreateAdd(runningCount, b.CreateZExt(isSelected[j], b.getInt32Ty()));
+        }
+        for (unsigned j = 0; j < fieldCount; j++) {
+            Value * chosen = ConstantInt::get(fwTy, 0);
+            for (unsigned k = 0; k < fieldCount; k++) {
+                Value * matches = b.CreateAnd(isSelected[j], b.CreateICmpEQ(rank[j], ConstantInt::get(b.getInt32Ty(), k)));
+                Value * elt = b.mvmd_extract(mTestFw, operand1Block, k);
+                chosen = b.CreateSelect(matches, elt, chosen);
+            }
+            expectedBlock = b.mvmd_insert(mTestFw, expectedBlock, chosen, j);
         }
     } else if (mIdisaOperation == "mvmd_dslli") {
         for (unsigned i = 0; i < fieldCount; i++) {
@@ -323,6 +416,19 @@ void IdisaBinaryOpCheckKernel::generateDoBlockMethod(KernelBuilder & b) {
                 Value * testVal = ConstantInt::get(b.getContext(), APInt::getLowBitsSet(mTestFw, mTestFw/2));
                 operand1 = b.CreateSelect(b.CreateICmpSGT(operand1, testVal), testVal, operand1);
                 operand2 = b.CreateSelect(b.CreateICmpSGT(operand2, testVal), testVal, operand2);
+                operand1 = b.CreateTrunc(operand1, b.getIntNTy(mTestFw/2));
+                operand2 = b.CreateTrunc(operand2, b.getIntNTy(mTestFw/2));
+                expectedBlock = b.mvmd_insert(mTestFw/2, expectedBlock, operand1, i);
+                expectedBlock = b.bitCast(b.mvmd_insert(mTestFw/2, expectedBlock, operand2, fieldCount + i));
+            } else if (mIdisaOperation == "hsimd_packss") {
+                Value * maxVal = ConstantInt::get(b.getContext(), APInt::getLowBitsSet(mTestFw, mTestFw/2 - 1));
+                operand1 = b.CreateSelect(b.CreateICmpSGT(operand1, maxVal), maxVal, operand1);
+                operand2 = b.CreateSelect(b.CreateICmpSGT(operand2, maxVal), maxVal, operand2);
+                Value * minVal = ConstantInt::get(b.getContext(), APInt::getHighBitsSet(mTestFw, mTestFw/2 + 1));
+                operand1 = b.CreateSelect(b.CreateICmpSLT(operand1, minVal), minVal, operand1);
+                operand2 = b.CreateSelect(b.CreateICmpSLT(operand2, minVal), minVal, operand2);
+                operand1 = b.CreateTrunc(operand1, b.getIntNTy(mTestFw/2));
+                operand2 = b.CreateTrunc(operand2, b.getIntNTy(mTestFw/2));
                 expectedBlock = b.mvmd_insert(mTestFw/2, expectedBlock, operand1, i);
                 expectedBlock = b.bitCast(b.mvmd_insert(mTestFw/2, expectedBlock, operand2, fieldCount + i));
             } else if (mIdisaOperation == "hsimd_packss") {
@@ -353,6 +459,9 @@ void IdisaBinaryOpCheckKernel::generateDoBlockMethod(KernelBuilder & b) {
     Value * failure_count = b.CreateUDiv(b.bitblock_popcount(failures), b.getSize(mTestFw));
     b.setScalarField("totalFailures", b.CreateAdd(b.getScalarField("totalFailures"), failure_count));
     if (!QuietMode) {
+        // created here so they always get terminators; unterminated blocks crash the JIT under -q
+        BasicBlock * reportFailure = b.CreateBasicBlock("reportFailure");
+        BasicBlock * continueTest = b.CreateBasicBlock("continueTest");
         b.CreateCondBr(anyFailure, reportFailure, continueTest);
         b.SetInsertPoint(reportFailure);
         b.CallPrintRegister("operand1", b.bitCast(operand1Block));
@@ -447,14 +556,26 @@ IDISAtestFunctionType pipelineGen(CPUDriver & driver) {
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&testFlags, codegen::codegen_flags()});
     CPUDriver driver("idisa_test");
-    if (ShiftMask == 0) {
+    // only shift ops need the operand2 limit; elsewhere it strips sign bits the tests need
+    const bool isShiftOp = TestOperation == "simd_sllv" || TestOperation == "simd_srlv"
+                        || TestOperation == "simd_rotl" || TestOperation == "simd_rotr";
+    if (ShiftMask == 0 && isShiftOp) {
         ShiftMask = TestFieldWidth - 1;
     }
+
+    std::chrono::steady_clock::time_point compileStart, compileEnd;
+    if (ReportTiming) compileStart = std::chrono::steady_clock::now();
     auto idisaTestFunction = pipelineGen(driver);
+    if (ReportTiming) compileEnd = std::chrono::steady_clock::now();
 
     const int32_t fd1 = openFile(Operand1TestFile, llvm::outs());
     const int32_t fd2 = openFile(Operand2TestFile, llvm::outs());
+
+    std::chrono::steady_clock::time_point execStart, execEnd;
+    if (ReportTiming) execStart = std::chrono::steady_clock::now();
     const size_t failure_count = idisaTestFunction(fd1, fd2, TestOutputFile.ValueStr.data());
+    if (ReportTiming) execEnd = std::chrono::steady_clock::now();
+
     if (!QuietMode) {
         if (failure_count == 0) {
             llvm::outs() << "Test success: " << TestOperation << "<" << TestFieldWidth << ">\n";
@@ -462,6 +583,13 @@ int main(int argc, char *argv[]) {
             llvm::outs() << "Test failure: " << TestOperation << "<" << TestFieldWidth << "> failed " << failure_count << " tests!\n";
         }
     }
+    if (ReportTiming) {
+        const auto compileUs = std::chrono::duration_cast<std::chrono::microseconds>(compileEnd - compileStart).count();
+        const auto execUs = std::chrono::duration_cast<std::chrono::microseconds>(execEnd - execStart).count();
+        llvm::outs() << "Pipeline compile time: " << compileUs << " us\n";
+        llvm::outs() << "Kernel execution time: " << execUs << " us\n";
+    }
+
     close(fd1);
     close(fd2);
     return failure_count > 0;

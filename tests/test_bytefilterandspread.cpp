@@ -92,7 +92,7 @@ uint32_t runTestCase(CPUDriver & driver, const size_t streamCount, const size_t 
         return 0U;
     }
 
-    const auto blockWidth = driver.getBitBlockWidth();
+    const auto blockWidth = driver.getMainBuilder()->getBitBlockWidth();
 
     assert ((blockWidth % 64) == 0 && blockWidth > 64);
 

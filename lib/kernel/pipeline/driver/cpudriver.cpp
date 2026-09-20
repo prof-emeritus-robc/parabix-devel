@@ -958,9 +958,19 @@ record_decl:
             #else
             constexpr auto ASMFile = CGFT_AssemblyFile;
             #endif
-            if (LLVM_UNLIKELY(TM->addPassesToEmitFile(PM, out, nullptr, ASMFile))) {
+            // Use a separate PassManager (and a separate run()) for ASM emission.
+            // TargetMachine::addPassesToEmitFile installs a full codegen pipeline
+            // (isel, regalloc, AsmPrinter); appending a second one for the object
+            // file below onto this same PM ran the whole pipeline over every
+            // function twice within one PM.run(), and the second (object) pass's
+            // AsmPrinter then tried to redefine every symbol the first (ASM) pass
+            // had already emitted -- "symbol '...' is already defined". Reproducible
+            // with idisa_exerciser --ShowASM=<path>.
+            legacy::PassManager asmPM;
+            if (LLVM_UNLIKELY(TM->addPassesToEmitFile(asmPM, out, nullptr, ASMFile))) {
                 report_fatal_error(Twine{"Failed to generate ASM for ", M->getModuleIdentifier()});
             }
+            asmPM.run(*M);
 
         }
 

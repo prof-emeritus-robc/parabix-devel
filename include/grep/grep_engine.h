@@ -11,6 +11,7 @@
 #include <sstream>
 #include <atomic>
 #include <set>
+#include <thread>
 #include <boost/filesystem.hpp>
 #include <re/analysis/capture-ref.h>
 #include <re/alphabet/multiplex_CCs.h>
@@ -106,7 +107,7 @@ public:
     void initRE(re::RE * re);
     virtual void grepCodeGen();
     bool searchAllFiles();
-    void * DoGrepThreadMethod();
+    void DoGrepThreadMethod();
     virtual void showResult(uint64_t grepResult, const std::string & fileName, std::ostringstream & strm);
 
 protected:
@@ -171,7 +172,7 @@ protected:
     kernel::StreamSet * mU21_LB;
     std::vector<std::string> mSpanNames;
     re::UTF8_Transformer mUTF8_Transformer;
-    pthread_t mEngineThread;
+    std::thread::id mEngineThread;
 };
 
 

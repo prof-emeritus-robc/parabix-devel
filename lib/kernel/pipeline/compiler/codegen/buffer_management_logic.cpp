@@ -7,6 +7,8 @@ namespace kernel {
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::addBufferHandlesToPipelineKernel(KernelBuilder & b, const unsigned kernelId, const unsigned groupId) {
 
+    auto & C = b.getContext();
+
     bool hasAnyInternalStreamSets = false;
     for (const auto output : make_iterator_range(out_edges(kernelId, mBufferGraph))) {
         const auto streamSet = target(output, mBufferGraph);
@@ -22,7 +24,7 @@ void PipelineCompiler::addBufferHandlesToPipelineKernel(KernelBuilder & b, const
 
         // external buffers already have a buffer handle
         if (LLVM_LIKELY(bn.isInternal() || bn.isConstant())) {
-            Type * const handleType = buffer->getHandleType(b);
+            Type * const handleType = CBuilder::convertTypeToLLVMContext(C, buffer->getHandleType(b));
             // We automatically assign the buffer memory according to the buffer start position
             if (LLVM_UNLIKELY(bn.isConstant())) {
                 const auto rs = cast<RepeatingStreamSet>(mStreamGraph[streamSet].Relationship);
@@ -49,11 +51,13 @@ void PipelineCompiler::addBufferHandlesToPipelineKernel(KernelBuilder & b, const
             // new capacity 1
             // produced item count 2
             // consumer processed item count [3,n)
-            IntegerType * const sizeTy = b.getSizeTy();
+
+            IntegerType * const sizeTy = IntegerType::getIntNTy(C, sizeof(size_t) * 8);
+            Type * const traceStructTy = ArrayType::get(sizeTy, numOfConsumers + 3);
             FixedArray<Type *, 2> traceStruct;
             traceStruct[0] = PointerType::getUnqual(b.getContext()); // pointer to trace log
             traceStruct[1] = sizeTy; // length of trace log
-            mTarget->addInternalScalar(StructType::get(b.getContext(), traceStruct),
+            mTarget->addInternalScalar(StructType::get(C, traceStruct),
                                                prefix + STATISTICS_BUFFER_EXPANSION_SUFFIX, groupId);
         }
 
@@ -159,9 +163,10 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
         const Kernel * const kernelObj = getKernel(i);
 
         if (LLVM_UNLIKELY(kernelObj->allocatesInternalStreamSets())) {
-            if (nonLocal || kernelObj->hasThreadLocal()) {
-                setActiveKernel(b, i, !nonLocal);
+            setActiveKernel(b, i, !nonLocal);
+            if (nonLocal || mKernelThreadLocalHandle) {
                 assert (mKernel == kernelObj);
+
                 SmallVector<Value *, 5> params;
                 if (LLVM_LIKELY(mKernelSharedHandle)) {
                     params.push_back(mKernelSharedHandle);
@@ -195,6 +200,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                     params.push_back(generateBufferExpansionFunctionForCurrentKernel(b, i));
                     params.push_back(getHandle());
                 }
+
                 b.CreateCall(funcTy, func, params);
             }
         }
@@ -291,7 +297,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                             const BufferPort & rd = mBufferGraph[pe];
                             const auto prefix = makeBufferName(producer, rd.Port);
                             Value * start = buffer->getMallocAddress(b);
-                            const auto byteSize = b.getTypeSize(dl, buffer->getType());
+                            const auto byteSize = b.getTypeSize(dl, buffer->getType(b));
                             Value * length = b.CreateMulRational(buffer->getInternalCapacity(b), Rational{byteSize, b.getBitBlockWidth()});
                             Constant * ts = b.getSize(byteSize);
                             Value * end = b.CreateGEP(b.getInt8Ty(), start, length);

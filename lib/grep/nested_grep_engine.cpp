@@ -106,7 +106,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             kernel = mNested.back(); assert (kernel);
             mNested.push_back(kernel);
         } else {
-            kernel = new CopyBreaksToMatches(mGrepDriver,
+            kernel = new CopyBreaksToMatches(P.getTypeSystem(),
                                              basisBits, U8index, breaks,
                                              matches);
         }
@@ -120,7 +120,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             Output<streamset_t>{"matches", matches, Add1(), ManagedBuffer()},
             InternallySynchronized());
 
-        E.setStride(E.getBitBlockWidth());
+        E.setStride(E.getTypeSystem().getBitBlockWidth());
 
         std::string tmp;
         raw_string_ostream name(tmp);
@@ -181,16 +181,15 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
         mGrepDriver.generateUncachedKernels();
 
         for (Kernel * K : pipeline) {
-            assert (K->getCompilationStatus() >= Kernel::CompilationStatus::StateConstructed);
             char flags = '0';
-            if (LLVM_LIKELY(K->isStateful())) {
-                flags |= 1;
+            if (K->getSharedStateType()) {
+                flags += 1;
             }
-            if (LLVM_UNLIKELY(K->hasThreadLocal())) {
-                flags |= 2;
+            if (LLVM_UNLIKELY(K->getThreadLocalStateType())) {
+                flags += 2;
             }
             if (LLVM_UNLIKELY(K->allocatesInternalStreamSets())) {
-                flags |= 4;
+                flags += 4;
             }
             name << flags;
         }
@@ -207,12 +206,12 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
         StreamSet * const MatchCoords = P.CreateStreamSet(3, sizeof(size_t) * 8);
         P.CreateKernelCall<MatchCoordinatesKernel>(matches, breaks, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = P.CreateKernelCall<MatchReporter>(byteStream, MatchCoords, accumulator);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
         Kernel * const scanMatchK = P.CreateKernelCall<ScanMatchKernel>(matches, breaks, byteStream, accumulator, ScanMatchBlocks);
-        scanMatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        scanMatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        P.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        P.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mNested.push_back(kernel);

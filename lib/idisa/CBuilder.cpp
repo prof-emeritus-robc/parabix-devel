@@ -29,6 +29,7 @@
 #include <boost/icl/interval_set.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <boost/intrusive/detail/math.hpp>
+#include <llvm/Support/Process.h>
 #include <boost/predef.h>
 #include <cxxabi.h>
 using boost::intrusive::detail::floor_log2;
@@ -78,7 +79,7 @@ static constexpr auto ALIGNED_ALLOC_NAME = "std_aligned_alloc";
 #endif
 #endif
 
-typedef llvm::Align         AlignType;
+using AlignType = llvm::Align;
 
 using FixedVectorType = llvm::FixedVectorType;
 
@@ -90,6 +91,8 @@ using FixedVectorType = llvm::FixedVectorType;
 using namespace llvm;
 
 static int accumulatedFreeCalls = 0;
+
+const size_t CBuilder::PAGE_SIZE = sys::Process::getPageSizeEstimate();
 
 extern "C" void free_debug_wrapper(void * ptr) {
     if (accumulatedFreeCalls < codegen::FreeCallBisectLimit) {
@@ -747,7 +750,7 @@ Value * CBuilder::CreateMRemap(Value * addr, Value * oldSize, Value * newSize) {
         }
     } else { // no OS mremap support
         ptr = CreateAnonymousMMap(newSize);
-        CreateMemCpy(ptr, addr, oldSize, getPageSize());
+        CreateMemCpy(ptr, addr, oldSize, CBuilder::PAGE_SIZE);
         CreateMUnmap(addr, oldSize);
     }
     return ptr;
@@ -768,7 +771,7 @@ Value * CBuilder::CreateMUnmap(Value * addr, Value * len) {
         IntegerType * const intPtrTy = getIntPtrTy(DL);
         CreateAssert(len, "CreateMUnmap: length cannot be 0");
         Value * const addrValue = CreatePtrToInt(addr, intPtrTy);
-        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, getPageSize()));
+        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE));
         CreateAssertZero(pageOffset, "CreateMUnmap: addr must be a multiple of the page size");
         Value * const boundCheck = CreateICmpULT(addrValue, CreateSub(ConstantInt::getAllOnesValue(intPtrTy), CreateZExtOrTrunc(len, intPtrTy)));
         CreateAssert(boundCheck, "CreateMUnmap: addresses in [addr, addr+len) are outside the valid address space range");
@@ -793,7 +796,7 @@ Value * CBuilder::CreateMProtect(Value * addr, Value * size, const Protect prote
 
         auto & DL = getModule()->getDataLayout();
         IntegerType * const intPtrTy = getIntPtrTy(DL);
-        Constant * const pageSize = ConstantInt::get(intPtrTy, getPageSize());
+        Constant * const pageSize = ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE);
         CreateAssertZero(CreateURem(CreatePtrToInt(addr, intPtrTy), pageSize), "CreateMProtect: addr must be aligned to page boundary");
     }
 
@@ -814,15 +817,6 @@ Value * CBuilder::CreateMProtect(Value * addr, Value * size, const Protect prote
     }
     return result;
 }
-
-IntegerType * LLVM_READNONE CBuilder::getIntAddrTy() const {
-    return IntegerType::get(getContext(), sizeof(intptr_t) * 8);
-}
-
-PointerType * LLVM_READNONE CBuilder::getVoidPtrTy(const unsigned AddressSpace) const {
-    return PointerType::get(getContext(), AddressSpace);
-}
-
 
 Value * CBuilder::CreateAtomicFetchAndAdd(Value * const val, Value * const ptr, MaybeAlign align) {
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
@@ -1146,8 +1140,17 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
 
         Value * const vaList = CreatePointerCast(CreateAlignedAlloca(vaListTy, mCacheLineAlignment), int8PtrTy);
         FunctionType * vaFuncTy = FunctionType::get(voidTy, { int8PtrTy }, false);
-        Function * vaStart = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vastart);
-        Function * vaEnd = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vaend);
+        // Intrinsic::getOrInsertDeclaration mangles the overloaded pointer type into the
+        // symbol name (e.g. "llvm.va_start.p0"). That's what LLVM 19+'s backend expects,
+        // but under LLVM 17/18 the ISel intrinsic-matching table still expects the plain,
+        // unmangled name, so the mangled declaration is left unresolved at JIT link time.
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(19, 0, 0)
+        Function * vaStart = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vastart, {int8PtrTy});
+        Function * vaEnd = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vaend, {int8PtrTy});
+        #else
+        Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start", m);
+        Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end", m);
+        #endif
         CreateCondBr(assertion, success, failure);
 
         SetInsertPoint(failure);
@@ -1159,8 +1162,8 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
         params[4] = int8PtrTy;
 
         FunctionType * const rfTy = FunctionType::get(voidTy, params, false);
-        Function * const reportFn = mDriver->addLinkFunction(m, "__report_failure_v", rfTy,
-                                                             reinterpret_cast<void *>(&__report_failure_v));
+
+        Function * const reportFn = LinkFunction("__report_failure_v", rfTy, reinterpret_cast<void *>(&__report_failure_v));
         reportFn->setCallingConv(CallingConv::C);
 
         CreateCall(vaFuncTy, vaStart, vaList);
@@ -1407,11 +1410,6 @@ Value * CBuilder::CreateReadCycleCounter() {
     return CreateCall(cycleCountFunc->getFunctionType(), cycleCountFunc, std::vector<Value *>({}));
 }
 
-Function * CBuilder::LinkFunction(StringRef name, FunctionType * type, void * functionPtr) const {
-    assert (mDriver);
-    return mDriver->addLinkFunction(getModule(), name, type, functionPtr);
-}
-
 LoadInst * CBuilder::CreateLoad(Type * type, Value * Ptr, const char * Name) {
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         CheckAddress(Ptr, getTypeSize(type), "CreateLoad");
@@ -1443,7 +1441,7 @@ StoreInst * CBuilder::CreateStore(Value * Val, Value * Ptr, bool isVolatile) {
 }
 
 inline bool CBuilder::hasAddressSanitizer() const {
-    return mDriver && mDriver->hasExternalFunction("__asan_region_is_poisoned");
+    return mLinkCallback->HasExternalFunction("__asan_region_is_poisoned");
 }
 
 LoadInst * CBuilder::CreateAlignedLoad(Type * type, Value * Ptr, const unsigned Align, const char * Name) {
@@ -1538,7 +1536,7 @@ CallInst * CBuilder::CreateMemMove(Value * Dst, Value * Src, Value *Size, const 
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemMove(Dst, AlignType{Align}, Src, AlignType{Align}, Size, isVolatile, TBAATag, ScopeTag, NoAliasTag);
 #else
-    llvm::AAMDNodes AAInfo;
+    AAMDNodes AAInfo;
     AAInfo.TBAA = TBAATag;
     AAInfo.Scope = ScopeTag;
     AAInfo.NoAlias = NoAliasTag;
@@ -1574,7 +1572,7 @@ CallInst * CBuilder::CreateMemCpy(Value *Dst, Value *Src, Value *Size, const uns
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemCpy(Dst, AlignType{Align}, Src, AlignType{Align}, Size, isVolatile, TBAATag, TBAAStructTag, ScopeTag, NoAliasTag);
 #else
-    llvm::AAMDNodes AAInfo;
+    AAMDNodes AAInfo;
     AAInfo.TBAA = TBAATag;
     AAInfo.TBAAStruct = TBAAStructTag;
     AAInfo.Scope = ScopeTag;
@@ -1601,7 +1599,7 @@ CallInst * CBuilder::CreateMemSet(Value * Ptr, Value * Val, Value * Size, const 
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(21, 0, 0)
     return IRBuilder<>::CreateMemSet(Ptr, Val, Size, AlignType{Align}, isVolatile, TBAATag, ScopeTag, NoAliasTag);
 #else
-    llvm::AAMDNodes AAInfo;
+    AAMDNodes AAInfo;
     AAInfo.TBAA = TBAATag;
     AAInfo.Scope = ScopeTag;
     AAInfo.NoAlias = NoAliasTag;
@@ -1659,7 +1657,7 @@ AllocaInst * CBuilder::CreateAlignedAlloca(Type * const Ty, const unsigned Align
     return alloca;
 }
 
-AllocaInst * CBuilder::CreateAlignedAllocaAtEntryPoint(llvm::Type * const Ty, const unsigned alignment, llvm::Value * const ArraySize) {
+AllocaInst * CBuilder::CreateAlignedAllocaAtEntryPoint(Type * const Ty, const unsigned alignment, Value * const ArraySize) {
     auto BB = GetInsertBlock();
     auto F = BB->getParent();
     auto entryBlock = F->begin();
@@ -1730,10 +1728,6 @@ CallInst * CBuilder::CreateRandCall() {
         randFunc->setCallingConv(CallingConv::C);
     }
     return CreateCall(randFunc->getFunctionType(), randFunc, {});
-}
-
-unsigned CBuilder::getPageSize() {
-    return boost::interprocess::mapped_region::get_page_size();
 }
 
 BasicBlock * CBuilder::WriteDefaultRethrowBlock() {
@@ -1877,6 +1871,7 @@ Function * CBuilder::getRethrow() {
 
 AllocaInst * CBuilder::resolveStackAddress(Value * Ptr) {
     for (;;) {
+        assert (Ptr);
         if (GetElementPtrInst * gep = dyn_cast<GetElementPtrInst>(Ptr)) {
             Ptr = gep->getPointerOperand();
         } else if (CastInst * ci = dyn_cast<CastInst>(Ptr)) {
@@ -1957,9 +1952,8 @@ void __backtrace_set_true_on_error_callback(void *data, const char *msg, int err
 
 CBuilder::CBuilder(LLVMContext & C)
 : IRBuilder<>(C)
-, mCacheLineAlignment(64)
-, mSizeType(IntegerType::get(getContext(), sizeof(size_t) * 8))
-, mDriver(nullptr) {
+, LLVMTypeSystemInterface(C)
+, mCacheLineAlignment(64) {
     #ifdef ENABLE_LIBBACKTRACE
     if (LLVM_UNLIKELY(codegen::AnyAssertionOptionIsSet())) {
         auto p = boost::filesystem::absolute(codegen::ProgramName).lexically_normal().native();
@@ -2032,7 +2026,7 @@ bool RemoveRedundantAssertionsPass::runOnModule(Module & M) {
                         return ci.isIndirectCall();
                     };
                     if (!(ci.getCalledFunction() || isIndirectCall())) {
-                        auto & out = llvm::errs();
+                        auto & out = errs();
                         B.print(out);
                         errs() << "\n\n";
                         ci.print(out);
@@ -2273,7 +2267,7 @@ ConstantInt * LLVM_READNONE CBuilder::getTypeSize(Type * type, IntegerType * val
     return ConstantInt::get(valType, getTypeSize(dl, type));
 }
 
-uintptr_t LLVM_READNONE CBuilder::getTypeSize(const llvm::DataLayout & DL, llvm::Type * type) {
+uintptr_t LLVM_READNONE CBuilder::getTypeSize(const DataLayout & DL, Type * type) {
     uintptr_t size = 0;
     if (LLVM_LIKELY(type != nullptr)) {
         size = DL.getTypeAllocSize(type).getFixedValue();
@@ -2281,32 +2275,29 @@ uintptr_t LLVM_READNONE CBuilder::getTypeSize(const llvm::DataLayout & DL, llvm:
     return size;
 }
 
-uintptr_t LLVM_READNONE CBuilder::getAlignOf(const llvm::DataLayout & DL, llvm::Type * type) {
+uintptr_t LLVM_READNONE CBuilder::getAlignOf(const DataLayout & DL, Type * type) {
     assert (type);
-    if (isa<StructType>(type)) {
-        const auto l = cast<StructType>(type)->getStructNumElements();
-        if (l == 0) {
-            return 1;
+    if (auto sty = dyn_cast<StructType>(type)) {
+        if (sty->isPacked()) {
+            const auto l = sty->getStructNumElements();
+            if (l == 0) {
+                return 1;
+            }
+            auto align = getAlignOf(DL, sty->getStructElementType(0));
+            for (unsigned j = 1; j < l; ++j) {
+                align = boost::lcm(align, getAlignOf(DL, sty->getStructElementType(j)));
+            }
+            return align;
         }
-        auto align = getAlignOf(DL, type->getStructElementType(0));
-        for (unsigned j = 1; j < l; ++j) {
-            align = boost::lcm(align, getAlignOf(DL, type->getStructElementType(j)));
-        }
-        return align;
     } else if (isa<ArrayType>(type)) {
         return getAlignOf(DL, type->getArrayElementType());
-    } else {
-        //    return DL.getPrefTypeAlign(type).value();
-        const auto align = DL.getABITypeAlign(type).value();
-        assert (align > 0);
-        return align;
     }
+    const auto align = DL.getABITypeAlign(type).value();
+    assert (align > 0);
+    return align;
 }
 
-void CBuilder::linkAllNecessaryExternalFunctions() const {
-    assert (mDriver);
-    assert (mModule);
-    // void* aligned_alloc( std::size_t alignment, std::size_t size );
+void CBuilder::LinkAllNecessaryExternalFunctions() {
 
     IntegerType * const sizeTy = getSizeTy();
 
@@ -2314,14 +2305,231 @@ void CBuilder::linkAllNecessaryExternalFunctions() const {
     params[0] = sizeTy;
     params[1] = sizeTy;
     FunctionType * fty = FunctionType::get(getVoidPtrTy(), params, false);
-    mDriver->addLinkFunction(mModule, ALIGNED_ALLOC_NAME, fty, (void*)std::aligned_alloc);
+    LinkFunction(ALIGNED_ALLOC_NAME, fty, (void*)std::aligned_alloc);
 
 }
 
 std::string CBuilder::getKernelName() const {
-    return "cbuilder";
+    llvm_unreachable("CBuilder does not have an associated kernel binding");
 }
 
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertTypeToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
+
+    using LT = Type::TypeID;
+
+    std::function<Type *(const Type *)> convertType = [&](const Type * type) -> Type * {
+
+        auto convertStructType = [&](const StructType * const type) -> StructType * {
+            // If this struct type already exists, reuse it. If we simply recreated it,
+            // we'd end up with a structurally identical but different type.
+            StructType * st = nullptr;
+            if (!type->isLiteral()) {
+                st = StructType::getTypeByName(C, type->getName());
+                if (st && !st->isOpaque()) {
+                    #ifndef NDEBUG
+                    assert (&st->getContext() == &C);
+                    assert (st->getNumElements() == type->getNumElements());
+                    assert (st->isPacked() == type->isPacked());
+                    #endif
+                    return st;
+                }
+            }
+            const auto count = type->getNumElements();
+            SmallVector<Type *, 128> elemTypes(count);
+            for (unsigned i = 0; i < count; ++i) {
+                elemTypes[i] = convertType(type->getStructElementType(i));
+            }
+            if (type->isLiteral()) {
+                // an identical unnamed struct type may exist
+                st = StructType::get(C, elemTypes, type->isPacked());
+            } else if (st) {
+                assert (st->isOpaque());
+                st->setBody(elemTypes, type->isPacked());
+            } else {
+                st = StructType::create(C, elemTypes, type->getName(), type->isPacked());
+            }
+            return st;
+        };
+
+        auto convertFunctionType = [&](const FunctionType * const type) -> FunctionType * {
+            const auto n = type->getNumParams();
+            SmallVector<Type *, 32> paramTypes(n);
+            for (unsigned i = 0; i < n; ++i) {
+                paramTypes[i] = convertType(type->getParamType(i));
+            }
+            return FunctionType::get(convertType(type->getReturnType()), paramTypes, type->isVarArg());
+        };
+
+        switch (type->getTypeID()) {
+            case LT::ArrayTyID:
+                BEGIN_SCOPED_REGION
+                const ArrayType * const ar = cast<ArrayType>(type);
+                return ArrayType::get(convertType(ar->getElementType()), ar->getNumElements());
+                END_SCOPED_REGION
+            case LT::FixedVectorTyID:
+            case LT::ScalableVectorTyID:
+                BEGIN_SCOPED_REGION
+                const VectorType * const vt = cast<VectorType>(type);
+                return VectorType::get(convertType(vt->getElementType()), vt->getElementCount());
+                END_SCOPED_REGION
+            case LT::PointerTyID:
+                BEGIN_SCOPED_REGION
+                #if LLVM_VERSION_INTEGER <= LLVM_VERSION_CODE(16, 0, 0)
+                const PointerType * const pt = cast<PointerType>(type);
+                return PointerType::get(convertType(pt->getPointerElementType()), pt->getAddressSpace());
+                #else
+                return PointerType::getUnqual(C);
+                #endif
+                END_SCOPED_REGION
+            case LT::StructTyID:
+                return convertStructType(cast<StructType>(type));
+            case LT::IntegerTyID:
+                return IntegerType::get(C, cast<IntegerType>(type)->getBitWidth());
+            case LT::VoidTyID:
+                return Type::getVoidTy(C);
+            case LT::DoubleTyID:
+                return Type::getDoubleTy(C);
+            case LT::FloatTyID:
+                return Type::getFloatTy(C);
+            case LT::FunctionTyID:
+                return convertFunctionType(cast<FunctionType>(type));
+            default:
+                errs() << "Unexpected FuncTypeId: " << (size_t)(type->getTypeID()) << "\n";
+                llvm_unreachable("unexpected type");
+        }
+    };
+
+    if (LLVM_UNLIKELY(sourceType == nullptr || &sourceType->getContext() == &C)) {
+        return sourceType;
+    } else {
+        return convertType(sourceType);
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertValueToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * CBuilder::convertValueToLLVMContext(Module * M, Value * value) {
+    auto & C = M->getContext();
+    if (&value->getContext() == &C) {
+        return value;
+    }
+    if (isa<Constant>(value)) {
+        return convertConstantToLLVMContext(C, cast<Constant>(value));
+    }
+    llvm_unreachable("unknown value type?");
+    return nullptr;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertMetadataToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Metadata * CBuilder::convertMetadataToLLVMContext(Module * M, Metadata * meta) {
+    auto & C = M->getContext();
+    if (isa<MDString>(meta)) {
+       return  MDString::get(C, cast<MDString>(meta)->getString());
+    }
+    if (isa<ConstantAsMetadata>(meta)) {
+        Constant * value = convertConstantToLLVMContext(C, cast<ConstantAsMetadata>(meta)->getValue());
+        return (Metadata *)ConstantAsMetadata::get(value);
+    }
+    if (isa<ValueAsMetadata>(meta)) {
+        Value * value = convertValueToLLVMContext(M, cast<ValueAsMetadata>(meta)->getValue());
+        return (Metadata *)ValueAsMetadata::get(value);
+    }
+    if (isa<MDNode>(meta)) {
+        SmallVector<Metadata *, 8> ops;
+        for (Metadata * op : cast<MDNode>(meta)->operands()) {
+            ops.push_back(convertMetadataToLLVMContext(M, op));
+        }
+        if (cast<MDNode>(meta)->isDistinct()) {
+            return MDNode::getDistinct(C, ops);
+        } else {
+            return MDNode::get(C, ops);
+        }
+    }
+    llvm_unreachable("unknown metadata type?");
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief convertConstantToLLVMContext
+ ** ------------------------------------------------------------------------------------------------------------- */
+Constant * CBuilder::convertConstantToLLVMContext(LLVMContext & C, Constant * constant) {
+
+    std::function<Constant *(const Constant *)> convertConstant = [&](const Constant * constant) -> Constant * {
+        Type * newType = convertTypeToLLVMContext(C, constant->getType());
+        if (isa<ConstantInt>(constant)) {
+            return ConstantInt::get(newType, cast<ConstantInt>(constant)->getValue());
+        }
+        if (isa<ConstantAggregateZero>(constant)) {
+            return ConstantAggregateZero::get(newType);
+        }
+        if (isa<ConstantPointerNull>(constant)) {
+            assert (isa<PointerType>(newType));
+            return ConstantPointerNull::get(reinterpret_cast<PointerType *>(newType));
+        }
+        if (isa<ConstantAggregate>(constant)) {
+            const ConstantAggregate * const cv = cast<ConstantAggregate>(constant);
+            const auto numElements = cv->getNumOperands();
+            SmallVector<Constant *, 16> ops(numElements);
+            for (unsigned i = 0; i < numElements; ++i) {
+                ops[i] = convertConstant(cv->getOperand(i));
+            }
+            if (isa<ConstantArray>(constant)) {
+                return ConstantArray::get(cast<ArrayType>(newType), ops);
+            }
+            if (isa<ConstantStruct>(constant)) {
+                return ConstantStruct::get(cast<StructType>(newType), ops);
+            }
+            if (isa<ConstantVector>(constant)) {
+                return ConstantVector::get(ops);
+            }
+        }
+        // ConstantArray::get()/ConstantVector::get() transparently return a more compact
+        // ConstantDataArray/ConstantDataVector instead of an actual ConstantAggregate
+        // subclass when every element is a simple integer or float constant (e.g. an
+        // array of size_t constants), so that case must be handled separately here.
+        if (isa<ConstantDataSequential>(constant)) {
+            const ConstantDataSequential * const cv = cast<ConstantDataSequential>(constant);
+            const auto numElements = cv->getNumElements();
+            SmallVector<Constant *, 16> ops(numElements);
+            for (unsigned i = 0; i < numElements; ++i) {
+                ops[i] = convertConstant(cv->getElementAsConstant(i));
+            }
+            if (isa<ConstantDataArray>(constant)) {
+                return ConstantArray::get(cast<ArrayType>(newType), ops);
+            }
+            assert (isa<ConstantDataVector>(constant));
+            return ConstantVector::get(ops);
+        }
+        if (isa<UndefValue>(constant)) {
+            return UndefValue::get(newType);
+        }
+        if (isa<ConstantFP>(constant)) {
+            return ConstantFP::get(newType, cast<ConstantFP>(constant)->getValue());
+        }
+        if (isa<ConstantExpr>(constant)) {
+            const ConstantExpr * const cv = cast<ConstantExpr>(constant);
+            const auto numElements = cv->getNumOperands();
+            assert (numElements <= 2);
+            FixedArray<Constant *, 2> ops;
+            for (unsigned i = 0; i < numElements; ++i) {
+                ops[i] = convertConstant(cv->getOperand(i));
+            }
+            return ConstantExpr::get(cv->getOpcode(), ops[0], ops[1]);
+        }
+        llvm_unreachable("Unhandled Constant type?");
+    };
+
+    if (&constant->getContext() == &C) {
+        return constant;
+    }
+    return convertConstant(constant);
+}
 
 #ifndef NDEBUG
 /** ------------------------------------------------------------------------------------------------------------- *

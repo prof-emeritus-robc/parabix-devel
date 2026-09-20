@@ -277,7 +277,8 @@ Value * PipelineCompiler::readTerminationSignal(KernelBuilder & b, const unsigne
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::writeTerminationSignal(KernelBuilder & b, const unsigned kernelId, Value * const signal) const {
     assert (HasTerminationSignal.test(kernelId));
-    Value * const ptr = b.getScalarFieldPtr(TERMINATION_PREFIX + std::to_string(kernelId)).first;
+    Value * ptr; Type * ty;
+    std::tie(ptr, ty) = b.getScalarFieldPtr(TERMINATION_PREFIX + std::to_string(kernelId));
     b.CreateAlignedStore(signal, ptr, SizeTyABIAlignment, true);
 }
 

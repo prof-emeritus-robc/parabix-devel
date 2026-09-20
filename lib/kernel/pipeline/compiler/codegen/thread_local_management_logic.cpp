@@ -11,7 +11,9 @@ namespace kernel {
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::addThreadLocalPartitionProperties(KernelBuilder & b, const size_t partitionId, const size_t groupId) {
     if (out_degree(partitionId, ThreadLocalPlacement) > 0) {
-        mTarget->addThreadLocalScalar(b.getSizeTy(), PARTITION_THREAD_LOCAL_STREAMSET_MAX_STRIDE_COUNT + std::to_string(partitionId), groupId);
+        auto & C = b.getContext();
+        IntegerType * const sizeTy = IntegerType::getIntNTy(C, sizeof(size_t) * 8);
+        mTarget->addThreadLocalScalar(sizeTy, PARTITION_THREAD_LOCAL_STREAMSET_MAX_STRIDE_COUNT + std::to_string(partitionId), groupId);
     }
 }
 
@@ -82,10 +84,10 @@ void PipelineCompiler::initializeThreadLocalMemory(KernelBuilder & b, Value * se
     }
 
     assert (memorySize);
-    const auto pageSize = getPageSize();
+    const auto pageSize = CBuilder::PAGE_SIZE;
     assert (is_pow2(pageSize));
     memorySize = b.CreateShl(memorySize, b.getSize(floor_log2(pageSize)));
-    assert (mTarget->hasThreadLocal());
+
     Value * const base = b.CreateAlignedMalloc(memorySize, pageSize);
     b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY, base);
     b.setScalarField(BASE_THREAD_LOCAL_STREAMSET_MEMORY_BYTES, memorySize);
@@ -274,7 +276,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
     assert (in_degree(m, ThreadLocalPlacement) < -1U);
     toVisit[m] = -1U;
 
-    const auto pageSize = getPageSize();
+    const auto pageSize = CBuilder::PAGE_SIZE;
     assert (is_pow2(pageSize));
 
     ConstantInt * const LOG_2_PAGE_SIZE = b.getSize(floor_log2(pageSize));
@@ -357,7 +359,7 @@ void PipelineCompiler::allocateThreadLocalMemoryForMaximumNumOfStrides(KernelBui
                         auto & dl = b.getModule()->getDataLayout();
                         const auto & bn = mBufferGraph[streamSet];
                         ExternalBuffer * const buf = cast<ExternalBuffer>(bn.Buffer);
-                        const auto ts = b.getTypeSize(dl, buf->getType());
+                        const auto ts = b.getTypeSize(dl, buf->getType(b));
                         buf->setCapacity(b, b.CreateMulRational(off, Rational{bw, ts}));
                     }
 
@@ -517,7 +519,7 @@ void PipelineCompiler::remapThreadLocalBufferMemory(KernelBuilder & b) {
             ExternalBuffer * const buffer = cast<ExternalBuffer>(bn.Buffer);
             Value * const produced = mInitiallyProducedItemCount[streamSet];
 
-            const auto typeWidth = b.getTypeSize(DL, buffer->getType());
+            const auto typeWidth = b.getTypeSize(DL, buffer->getType(b));
 
             const auto fieldWidth = buffer->getFieldWidth();
 

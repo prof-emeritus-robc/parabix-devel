@@ -10,7 +10,7 @@
 #include <memory>
 #include <string>
 #include <pablo/parse/source_file.h>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 #include <llvm/ADT/StringRef.h>
 
 namespace pablo {
@@ -65,7 +65,7 @@ std::string to_string(TokenType const & type);
  * Also exposes static methods for constructing new token instances. New token
  * instances are allocated using a slab allocater.
  */
-class Token {
+class Token : public SlabAllocatedObject {
 public:
 
     static Token * Create(TokenType type, std::string const & text, size_t lineNum, size_t colNum, std::shared_ptr<SourceFile> const & source, uint64_t value = 0) {
@@ -194,8 +194,6 @@ public:
     }
 
 public:
-    using Allocator = SlabAllocator<Token *>;
-
     Token() = delete;
 
     TokenType getType() const { return mType; }
@@ -208,18 +206,12 @@ private:
 
     Token(TokenType type, std::string text, std::weak_ptr<SourceFile> source, size_t lineNum, size_t colNum, uint64_t value);
 
-    void * operator new (size_t size) {
-        return mAllocator.allocate<uint8_t>(size);
-    }
-
     const TokenType             mType;
     const std::string           mText;
     std::weak_ptr<SourceFile>   mSourceRef;
     size_t                      mLineNum;
     size_t                      mColNum;
     uint64_t                    mValue;
-
-    static Allocator mAllocator;
 };
 
 } // namespace pablo::parse

@@ -178,7 +178,7 @@ Value * CompressedCarryManager::readCarryInSummary(kernel::KernelBuilder & b) co
 }
 
 Type * CompressedCarryManager::getSummaryTypeFromCurrentFrame(kernel::KernelBuilder & b) const {
-    return mCarryInfo->getSummarySizeTy();
+    return CBuilder::convertTypeToLLVMContext(b.getContext(), mCarryInfo->getSummarySizeTy());
 }
 
 inline static bool isCarryGeneratingStatement(const Statement * const stmt) {

@@ -57,16 +57,16 @@ inline void __checkSameType(const PabloAST * const A, const PabloAST * const B) 
 
 Count * PabloBlock::createCount(PabloAST * const expr, const String * const name) {
     IntegerType * const type = getParent()->getSizeTy();
-    return insertAtInsertionPoint(new (mAllocator) Count(expr, name, type, mAllocator));
+    return insertAtInsertionPoint(new Count(expr, name, type));
 }
 
 EveryNth * PabloBlock::createEveryNth(PabloAST * const expr, Integer * n, const String * const name) {
-    return insertAtInsertionPoint(new (mAllocator) EveryNth(expr, n, name, mAllocator));
+    return insertAtInsertionPoint(new EveryNth(expr, n, name));
 }
 
 Not * PabloBlock::createNot(PabloAST * expr, const String * const name) {
     assert (expr);
-    return insertAtInsertionPoint(new (mAllocator) Not(expr, name, mAllocator));
+    return insertAtInsertionPoint(new Not(expr, name));
 }
 
 Var * PabloBlock::createVar(const String * const name, Type * type) {
@@ -81,37 +81,37 @@ Var * PabloBlock::createVar(const String * const name, Type * type) {
 
 InFile * PabloBlock::createInFile(PabloAST * expr, const String * const name) {
     assert (expr);
-    return insertAtInsertionPoint(new (mAllocator) InFile(expr, name, mAllocator));
+    return insertAtInsertionPoint(new InFile(expr, name));
 }
 
 AtEOF * PabloBlock::createAtEOF(PabloAST * expr, const String * const name) {
     assert (expr);
-    return insertAtInsertionPoint(new (mAllocator) AtEOF(expr, name, mAllocator));
+    return insertAtInsertionPoint(new AtEOF(expr, name));
 }
 
 TerminateAt * PabloBlock::createTerminateAt(PabloAST * strm, Integer *  code, const String * const name) {
     assert (strm); assert(code);
-    return insertAtInsertionPoint(new (mAllocator) TerminateAt(strm, code, name, mAllocator));
+    return insertAtInsertionPoint(new TerminateAt(strm, code, name));
 }
 
 Illustrate * PabloBlock::createIllustrateBitstream(PabloAST * value, const String * const name) {
     assert (value); assert(name);
-    return insertAtInsertionPoint(new (mAllocator) Illustrate(Illustrate::IllustratorTypeId::Bitstream, '.', '1', value, name, mAllocator));
+    return insertAtInsertionPoint(new Illustrate(Illustrate::IllustratorTypeId::Bitstream, '.', '1', value, name));
 }
 
 DebugPrint * PabloBlock::createDebugPrint(PabloAST * expr, const String * const name) {
     assert (expr);
-    return insertAtInsertionPoint(new (mAllocator) DebugPrint(expr, name, mAllocator));
+    return insertAtInsertionPoint(new DebugPrint(expr, name));
 }
 
 /// BINARY CREATE FUNCTIONS
 
 Advance * PabloBlock::createAdvance(PabloAST * expr, Integer * shiftAmount, const String * const name) {
-    return insertAtInsertionPoint(new (mAllocator) Advance(expr, shiftAmount, name, mAllocator));
+    return insertAtInsertionPoint(new Advance(expr, shiftAmount, name));
 }
 
 Lookahead * PabloBlock::createLookahead(PabloAST * expr, Integer * shiftAmount, const String * const name) {
-    return insertAtInsertionPoint(new (mAllocator) Lookahead(expr, shiftAmount, name, mAllocator));
+    return insertAtInsertionPoint(new Lookahead(expr, shiftAmount, name));
 }
 
 Extract * PabloBlock::createExtract(Var * const array, Integer * const index) {
@@ -121,27 +121,27 @@ Extract * PabloBlock::createExtract(Var * const array, Integer * const index) {
 
 And * PabloBlock::createAnd(PabloAST * expr1, PabloAST * expr2, const String * const name) {
     CHECK_SAME_TYPE(expr1, expr2);
-    return insertAtInsertionPoint(new (mAllocator) And(expr1->getType(), expr1, expr2, name, mAllocator));
+    return insertAtInsertionPoint(new And(expr1->getType(), expr1, expr2, name));
 }
 
 Or * PabloBlock::createOr(PabloAST * expr1, PabloAST * expr2, const String * const name) {
     CHECK_SAME_TYPE(expr1, expr2);
-    return insertAtInsertionPoint(new (mAllocator) Or(expr1->getType(), expr1, expr2, name, mAllocator));
+    return insertAtInsertionPoint(new Or(expr1->getType(), expr1, expr2, name));
 }
 
 Xor * PabloBlock::createXor(PabloAST * expr1, PabloAST * expr2, const String * const name) {
     CHECK_SAME_TYPE(expr1, expr2);
-    return insertAtInsertionPoint(new (mAllocator) Xor(expr1->getType(), expr1, expr2, name, mAllocator));
+    return insertAtInsertionPoint(new Xor(expr1->getType(), expr1, expr2, name));
 }
 
 Add * PabloBlock::createAdd(PabloAST * expr1, PabloAST * expr2) {
     CHECK_SAME_TYPE(expr1, expr2);
-    return new (mAllocator) Add(expr1->getType(), expr1, expr2, mAllocator);
+    return new Add(expr1->getType(), expr1, expr2);
 }
 
 Subtract * PabloBlock::createSubtract(PabloAST * expr1, PabloAST * expr2) {
     CHECK_SAME_TYPE(expr1, expr2);
-    return new (mAllocator) Subtract(expr1->getType(), expr1, expr2, mAllocator);
+    return new Subtract(expr1->getType(), expr1, expr2);
 }
 
 LessThan * PabloBlock::createLessThan(PabloAST * expr1, PabloAST * expr2) {
@@ -152,7 +152,7 @@ LessThan * PabloBlock::createLessThan(PabloAST * expr1, PabloAST * expr2) {
     if (t1->isVectorTy() || t2->isVectorTy()) {
         ty = FixedVectorType::get(ty,  static_cast<unsigned>(0));
     }
-    return new (mAllocator) LessThan(ty, expr1, expr2, mAllocator);
+    return new LessThan(ty, expr1, expr2);
 }
 
 Equals * PabloBlock::createEquals(PabloAST * expr1, PabloAST * expr2) {
@@ -163,7 +163,7 @@ Equals * PabloBlock::createEquals(PabloAST * expr1, PabloAST * expr2) {
     if (t1->isVectorTy() || t2->isVectorTy()) {
         ty = FixedVectorType::get(ty,  static_cast<unsigned>(0));
     }
-    return new (mAllocator) Equals(ty, expr1, expr2, mAllocator);
+    return new Equals(ty, expr1, expr2);
 }
 
 Assign * PabloBlock::createAssign(Var * const var, PabloAST * const value) {
@@ -179,44 +179,44 @@ Assign * PabloBlock::createAssign(Var * const var, PabloAST * const value) {
         out << " is read only";
         report_fatal_error(Twine(out.str()));
     }
-    return insertAtInsertionPoint(new (mAllocator) Assign(var, value, mAllocator));
+    return insertAtInsertionPoint(new Assign(var, value));
 }
 
 MatchStar * PabloBlock::createMatchStar(PabloAST * marker, PabloAST * charclass, const String * const name) {
     CHECK_SAME_TYPE(marker, charclass);
-    return insertAtInsertionPoint(new (mAllocator) MatchStar(marker, charclass, name, mAllocator));
+    return insertAtInsertionPoint(new MatchStar(marker, charclass, name));
 }
 
 ScanThru * PabloBlock::createScanThru(PabloAST * from, PabloAST * thru, const String * const name) {
     CHECK_SAME_TYPE(from, thru);
-    return insertAtInsertionPoint(new (mAllocator) ScanThru(from, thru, name, mAllocator));
+    return insertAtInsertionPoint(new ScanThru(from, thru, name));
 }
 
 ScanTo * PabloBlock::createScanTo(PabloAST * from, PabloAST * to, const String * const name) {
     CHECK_SAME_TYPE(from, to);
-    return insertAtInsertionPoint(new (mAllocator) ScanTo(from, to, name, mAllocator));
+    return insertAtInsertionPoint(new ScanTo(from, to, name));
 }
 
 AdvanceThenScanThru * PabloBlock::createAdvanceThenScanThru(PabloAST * from, PabloAST * thru, const String * const name) {
     CHECK_SAME_TYPE(from, thru);
-    return insertAtInsertionPoint(new (mAllocator) AdvanceThenScanThru(from, thru, name, mAllocator));
+    return insertAtInsertionPoint(new AdvanceThenScanThru(from, thru, name));
 }
 
 AdvanceThenScanTo * PabloBlock::createAdvanceThenScanTo(PabloAST * from, PabloAST * to, const String * const name) {
     CHECK_SAME_TYPE(from, to);
-    return insertAtInsertionPoint(new (mAllocator) AdvanceThenScanTo(from, to, name, mAllocator));
+    return insertAtInsertionPoint(new AdvanceThenScanTo(from, to, name));
 }
 
 If * PabloBlock::createIf(PabloAST * condition, PabloBlock * body) {
     assert (condition && body);
-    If * const node = insertAtInsertionPoint(new (mAllocator) If(condition, body, mAllocator));
+    If * const node = insertAtInsertionPoint(new If(condition, body));
     body->setBranch(node);
     return node;
 }
 
 While * PabloBlock::createWhile(PabloAST * condition, PabloBlock * body) {
     assert (condition && body);
-    While * const node = insertAtInsertionPoint(new (mAllocator) While(condition, body, mAllocator));
+    While * const node = insertAtInsertionPoint(new While(condition, body));
     body->setBranch(node);
     return node;
 }
@@ -224,30 +224,30 @@ While * PabloBlock::createWhile(PabloAST * condition, PabloBlock * body) {
 Repeat * PabloBlock::createRepeat(Integer * fieldWidth, PabloAST * value, const String * const name) {
     assert (fieldWidth && value);
     Type * const type = FixedVectorType::get(IntegerType::get(value->getType()->getContext(), fieldWidth->value()),  static_cast<unsigned>(0));
-    return insertAtInsertionPoint(new (mAllocator) Repeat(fieldWidth, value, type, name, mAllocator));
+    return insertAtInsertionPoint(new Repeat(fieldWidth, value, type, name));
 }
 
 PackH * PabloBlock::createPackH(Integer * fieldWidth, PabloAST * value, const String * const name) {
     assert (fieldWidth && value);
     Type * const type = FixedVectorType::get(IntegerType::get(value->getType()->getContext(), fieldWidth->value()/2),  static_cast<unsigned>(0));
-    return insertAtInsertionPoint(new (mAllocator) PackH(fieldWidth, value, name, type, mAllocator));
+    return insertAtInsertionPoint(new PackH(fieldWidth, value, name, type));
 }
 
 PackL * PabloBlock::createPackL(Integer * fieldWidth, PabloAST * value, const String * const name) {
     assert (fieldWidth && value);
     Type * const type = FixedVectorType::get(IntegerType::get(value->getType()->getContext(), fieldWidth->value()/2),  static_cast<unsigned>(0));
-    return insertAtInsertionPoint(new (mAllocator) PackL(fieldWidth, value, name, type, mAllocator));
+    return insertAtInsertionPoint(new PackL(fieldWidth, value, name, type));
 }
 
 /// TERNARY CREATE FUNCTIONS
 
 Sel * PabloBlock::createSel(PabloAST * condition, PabloAST * trueExpr, PabloAST * falseExpr, const String * const name) {
     CHECK_SAME_TYPE(trueExpr, falseExpr);
-    return insertAtInsertionPoint(new (mAllocator) Sel(condition, trueExpr, falseExpr, name, mAllocator));
+    return insertAtInsertionPoint(new Sel(condition, trueExpr, falseExpr, name));
 }
 
 IndexedAdvance * PabloBlock::createIndexedAdvance(PabloAST * expr, PabloAST * indexStream, Integer * shiftAmount, const String * const name) {
-    return insertAtInsertionPoint(new (mAllocator) IndexedAdvance(expr, indexStream, shiftAmount, name, mAllocator));
+    return insertAtInsertionPoint(new IndexedAdvance(expr, indexStream, shiftAmount, name));
 }
 
 /// QUARTERNARY FUNCTIONS
@@ -336,20 +336,20 @@ Ternary * PabloBlock::createTernary(Integer * mask, PabloAST * a, PabloAST * b, 
     CHECK_SAME_TYPE(a, b);
     CHECK_SAME_TYPE(b, c);
     assert (mask->value() <= 0xFF);
-    return insertAtInsertionPoint(new (mAllocator) Ternary(mask, a, b, c, name, mAllocator));
+    return insertAtInsertionPoint(new Ternary(mask, a, b, c, name));
 }
 
 
 
 IntrinsicCall * PabloBlock::createIntrinsicCall(Intrinsic intrinsic, llvm::Type * type, llvm::ArrayRef<PabloAST *> argv, const String * name) {
-    return insertAtInsertionPoint(new (mAllocator) IntrinsicCall(intrinsic, type, argv, name, mAllocator));
+    return insertAtInsertionPoint(new IntrinsicCall(intrinsic, type, argv, name));
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief createScope
  ** ------------------------------------------------------------------------------------------------------------- */
 PabloBlock * PabloBlock::createScope() noexcept {
-    return new (mAllocator) PabloBlock(mParent, mAllocator);
+    return new PabloBlock(mParent);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

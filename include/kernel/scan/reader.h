@@ -212,7 +212,7 @@ void Reader(
     assert(scanIndices->getFieldWidth() == 64);
     assert(source->getFieldWidth() != 1);
     Kernel * const reader = P. template CreateKernelCall<ScanReader>(source, scanIndices, callback.name);
-    reader->link<Fn>(callback.name, *callback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
 }
 
 template<typename... Args, typename... Args2>
@@ -230,8 +230,8 @@ void Reader(
     assert(scanIndices->getFieldWidth() == 64);
     assert(source->getFieldWidth() != 1);
     Kernel * const reader = P. template CreateKernelCall<ScanReader>(source, scanIndices, callback.name, doneCallback.name);
-    reader->link<Fn>(callback.name, *callback.func);
-    reader->link<Fn2>(doneCallback.name, &doneCallback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
+    P. template LinkFunction<Fn2>(reader, doneCallback.name, &doneCallback.func);
 }
 
 /**
@@ -271,7 +271,7 @@ void Reader(
 {
     using Fn = typename CallbackPair<Args...>::FunctionType;
     Kernel * const reader = P. template CreateKernelCall<ScanReader>(source, scanIndices, callback.name, std::move(additionalStreams));
-    reader->link<Fn>(callback.name, *callback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
 }
 
 /**
@@ -294,8 +294,8 @@ void Reader(
     using Fn = typename CallbackPair<Args...>::FunctionType;
     using Fn2 = typename CallbackPair<Args2...>::FunctionType;
     Kernel * const reader = P. template CreateKernelCall<ScanReader>(source, scanIndices, callback.name, doneCallback.name, std::move(additionalStreams));
-    reader->link<Fn>(callback.name, *callback.func);
-    reader->link<Fn2>(doneCallback.name, *doneCallback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
+    P. template LinkFunction<Fn2>(reader, doneCallback.name, *doneCallback.func);
 }
 
 /**
@@ -318,7 +318,7 @@ void Reader(
     using Fn = typename CallbackPair<Args...>::FunctionType;
     StreamSet * const indices = su::Select(P, std::vector<StreamSet *>(ptrStreams));
     Kernel * const reader = P. template CreateKernelCall<ScanReader>(source, indices, callback.name);
-    reader->link<Fn>(callback.name, *callback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
 }
 
 /**
@@ -342,8 +342,8 @@ void Reader(
     using Fn2 = typename CallbackPair<Args2...>::FunctionType;
     StreamSet * const indices = su::Select(P, std::vector<StreamSet *>(ptrStreams));
     Kernel * const reader = P. template CreateKernelCall<ScanReader>(source, indices, callback.name, doneCallback.name);
-    reader->link<Fn>(callback.name, *callback.func);
-    reader->link<Fn2>(doneCallback.name, *doneCallback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
+    P. template LinkFunction<Fn2>(reader, doneCallback.name, *doneCallback.func);
 }
 
 /**
@@ -367,7 +367,7 @@ void Reader(
     using Fn = typename CallbackPair<Args...>::FunctionType;
     StreamSet * const indices = su::Select(P, std::move(ptrStreams));
     Kernel * const reader = P. template CreateKernelCall<ScanReader>(source, indices, callback.name, std::move(additionalStreams));
-    reader->link<Fn>(callback.name, *callback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
 }
 
 /**
@@ -392,8 +392,8 @@ void Reader(
     using Fn2 = typename CallbackPair<Args2...>::FunctionType;
     StreamSet * const indices = su::Select(P, std::move(ptrStreams));
     Kernel * const reader = P.template CreateKernelCall<ScanReader>(source, indices, callback.name, doneCallback.name, std::move(additionalStreams));
-    reader->link<Fn>(callback.name, *callback.func);
-    reader->link<Fn2>(doneCallback.name, *doneCallback.func);
+    P. template LinkFunction<Fn>(reader, callback.name, *callback.func);
+    P. template LinkFunction<Fn2>(reader, doneCallback.name, *doneCallback.func);
 }
 
 } // namespace kernel::scan

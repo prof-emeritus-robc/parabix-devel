@@ -3,6 +3,7 @@
 #include "compiler/pipeline_compiler.hpp"
 #include <llvm/IR/Function.h>
 #include <kernel/pipeline/pipeline_builder.h>
+#include <codegen/LLVMTypeSystemInterface.h>
 #include <kernel/core/streamset.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #ifdef ENABLE_PAPI
@@ -86,7 +87,6 @@ void terminatePAPI(KernelBuilder & b) {
  * @brief addInternalKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::addInternalProperties(KernelBuilder & b) {
-    COMPILER->generateImplicitKernels(b);
     COMPILER->addPipelineKernelProperties(b);
 }
 
@@ -107,8 +107,8 @@ void PipelineKernel::generateInitializeThreadLocalMethod(KernelBuilder & b) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief generateKernelMethod
  ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::generateKernelMethod(KernelBuilder & b) {
-    COMPILER->generateKernelMethod(b);
+void PipelineKernel::generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) {
+    COMPILER->generateKernelMethod(b, TM);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -123,16 +123,6 @@ void PipelineKernel::generateFinalizeMethod(KernelBuilder & b) {
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::generateFinalizeThreadLocalMethod(KernelBuilder & b) {
     COMPILER->generateFinalizeThreadLocalMethod(b);
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief addKernelDeclarations
- ** ------------------------------------------------------------------------------------------------------------- */
-void PipelineKernel::addKernelDeclarations(KernelBuilder & b) {
-    for (const auto & k : mKernels) {
-        k.Object->addKernelDeclarations(b);
-    }
-    Kernel::addKernelDeclarations(b);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -158,8 +148,11 @@ void PipelineKernel::linkExternalMethods(KernelBuilder & b) {
     for (const auto & k : mKernels) {
         k.Object->linkExternalMethods(b);
     }
+    auto & C = b.getContext();
+    assert (&C == &b.getContext());
     for (const CallBinding & call : mCallBindings) {
-        call.Callee = b.LinkFunction(call.Name, call.Type, call.FunctionPointer);
+        Type * funcTy = CBuilder::convertTypeToLLVMContext(C, call.Type);
+        call.Callee = b.LinkFunction(call.Name, cast<FunctionType>(funcTy), call.FunctionPointer);
     }
     #ifdef ENABLE_PAPI
     if (LLVM_UNLIKELY(codegen::PapiCounterOptions.compare(codegen::OmittedOption) != 0)) {
@@ -389,14 +382,14 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
 
     Constant * const patternVec = ConstantArray::get(arrTy, dataVectorArray);
 
-    // PrivateLinkage: this global is only ever read as an LLVM Value* within the same
-    // "main" module it's created in (via paramMap, during construction of nested/family
-    // kernel calls in this same function). Every pipeline's main module restarts LLVM's
-    // anonymous-global numbering from scratch, so leaving this unnamed with
-    // ExternalLinkage gave two different pipelines' pattern globals the same
-    // auto-generated external symbol name (e.g. "___unnamed_1"), which the JIT's linker
-    // then rejected as a duplicate definition once both were added to the same engine
-    // (e.g. across multiple P.compile() calls against the same driver).
+    // PrivateLinkage: this global is only ever read as an LLVM Value* within the
+    // same "main" module it's created in (via paramMap, during construction of
+    // nested/family kernel calls in this same function). Every pipeline's main
+    // module restarts LLVM's anonymous-global numbering from scratch, so leaving
+    // this unnamed with ExternalLinkage gave two different pipelines' pattern
+    // globals the same auto-generated external symbol name (e.g. "___unnamed_1"),
+    // which ORC's linker then rejected as a duplicate definition once both were
+    // materialized into the same JITDylib.
     Module & mod = *b.getModule();
     GlobalVariable * const patternData =
         new GlobalVariable(mod, arrTy, true, GlobalValue::PrivateLinkage, patternVec);
@@ -457,7 +450,7 @@ void PipelineKernel::setOutputScalarAt(const unsigned i, Scalar * const value) {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b) const {
+std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(KernelBuilder & b) {
     return std::make_unique<PipelineCompiler>(b, const_cast<PipelineKernel *>(this));
 }
 
@@ -466,6 +459,17 @@ std::unique_ptr<KernelCompiler> PipelineKernel::instantiateKernelCompiler(Kernel
  ** ------------------------------------------------------------------------------------------------------------- */
 bool PipelineKernel::isCachable() const {
     if (codegen::DebugOptionIsSet(codegen::ForcePipelineRecompilation)) {
+        return false;
+    }
+    if (hasInternallyGeneratedStreamSets()) {
+        // addOrDeclareMainFunction()/writeInternallyGeneratedStreamSetScaleVector()
+        // regenerate the "rsl" (repeating streamset length) metadata against whichever
+        // module is current when the main function is actually built, using this
+        // pipeline's own live PipelineCompiler (mCompiler). A cache-hit kernel never
+        // goes through declareStateTypes() (loadCachedKernel() only restores its shared/
+        // thread-local state types from metadata, not mCompiler), so mCompiler would be
+        // null and that regeneration cannot happen. Keep such kernels uncachable rather
+        // than risk that null dereference.
         return false;
     }
     return (getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject) == 0;
@@ -477,24 +481,37 @@ bool PipelineKernel::isCachable() const {
 void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder & b, const Relationships & R, MetadataScaleVector & V, const size_t scale) const {
     assert (hasInternallyGeneratedStreamSets());
 
-    Module * const M = getModule();
-    NamedMDNode * msl = M->getNamedMetadata("rsl");
+    Module * const M = b.getModule();
+    // Named per this kernel (RSL_METADATA_PREFIX + getName()), not a shared "rsl": a nested
+    // pipeline kernel's recursive call below can land in the same module as an outer one
+    // that already (re)wrote its own metadata there (e.g. addOrDeclareMainFunction()
+    // regenerating the outer kernel's "rsl" into materializeMain's "main" module before
+    // recursing into a nested kernel that also has internally generated streamsets). An
+    // unqualified, shared name would let this lookup find the outer kernel's array --
+    // present, so never regenerated -- and silently misread it as this kernel's own,
+    // producing a far-too-small scale factor for any nested kernel beyond the first level.
+    const auto mdName = RSL_METADATA_PREFIX + getName();
+    NamedMDNode * msl = M->getNamedMetadata(mdName);
     if (LLVM_UNLIKELY(msl == nullptr)) {
-        // The "rsl" metadata is normally written once, into the module current when
+        // The metadata is normally written once, into the module current when
         // addPipelineKernelProperties() ran (during kernel property declaration). But
         // this function can also be reached from addOrDeclareMainFunction() against a
-        // different, later module (the standalone "main" module built in
-        // CPUDriver::finalizeObject) that never went through that pass, so regenerate
-        // it here if it's missing. This must be called on the outermost pipeline kernel,
-        // which is always the case: recursive calls to this function only happen after
-        // the outer call already ensured the metadata exists. mKernels (the graph this
-        // depends on) is fixed at pipeline-construction time and is unaffected by
-        // whether this instance's own kernel body was a cache hit, so a freshly
-        // instantiated PipelineCompiler -- the same one-shot pattern Kernel::
-        // generateKernel() itself uses -- can redo this analysis here.
-        auto compiler = instantiateKernelCompiler(b);
-        static_cast<PipelineCompiler *>(compiler.get())->generateMetaDataForRepeatingStreamSets(b);
-        msl = M->getNamedMetadata("rsl");
+        // different, later module (e.g. materializeMain's "main" module) that never
+        // went through that pass, so regenerate it here if it's missing. Regeneration
+        // needs a live PipelineCompiler (COMPILER, bracketed to mCompiler by
+        // addOrDeclareMainFunction's CompilerScope for the outermost kernel, and by
+        // this kernel's own declareStateTypes()/generateKernel() bracket otherwise),
+        // which only exists for kernels that went through declareStateTypes -- i.e.
+        // never for a cache hit, so isCachable() keeps kernels with internally
+        // generated streamsets uncachable to guarantee that here.
+        if (LLVM_UNLIKELY(COMPILER == nullptr)) {
+            report_fatal_error(Twine("PipelineKernel::writeInternallyGeneratedStreamSetScaleVector: "
+                               "cannot regenerate \"") + mdName + "\" metadata without a live "
+                               "PipelineCompiler (is this kernel cached despite having "
+                               "internally generated streamsets?)");
+        }
+        COMPILER->generateMetaDataForRepeatingStreamSets(b);
+        msl = M->getNamedMetadata(mdName);
     }
     assert (msl);
     assert (msl->getNumOperands() > 0);
@@ -515,7 +532,22 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder 
     for (unsigned i = 0; i != m; ++i) {
         const Kernel * const kernel = mKernels[i].Object;
         if (LLVM_UNLIKELY(kernel->hasInternallyGeneratedStreamSets())) {
-            kernel->writeInternallyGeneratedStreamSetScaleVector(b, R, V, getJthOffset(j++));
+            // COMPILER (see the macro above) resolves to b.getCompiler(), whichever
+            // PipelineCompiler is currently installed on b -- normally this kernel's own,
+            // for the duration of its own compile. If the recursive call below needs to
+            // regenerate its metadata (see the mdName lookup above), it must find *its
+            // own* PipelineCompiler there, or generateMetaDataForRepeatingStreamSets runs
+            // against the wrong mTarget and (re)writes this (outer) kernel's own data
+            // under the nested kernel's name instead. Swap in the nested kernel's own
+            // compiler for the duration of its call. hasInternallyGeneratedStreamSets()
+            // only returns true for PipelineKernel, and isCachable() keeps such kernels
+            // uncachable, so they always go through declareStateTypes and thus always
+            // have a live mCompiler by this point.
+            const auto * const nested = cast<PipelineKernel>(kernel);
+            KernelCompiler * const savedCompiler = b.getCompiler();
+            b.setCompiler(nested->mCompiler.get());
+            nested->writeInternallyGeneratedStreamSetScaleVector(b, R, V, getJthOffset(j++));
+            b.setCompiler(savedCompiler);
         }
     }
 
@@ -536,13 +568,36 @@ void PipelineKernel::writeInternallyGeneratedStreamSetScaleVector(KernelBuilder 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addOrDeclareMainFunction
  ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineKernel::setBuilderCompiler(KernelBuilder & b, KernelCompiler * const compiler) const {
+    b.setCompiler(compiler);
+}
+
 Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const MainMethodGenerationType method) const {
 
+    // Bracket the builder's "current compiler" for the duration of this call, matching
+    // how Kernel::generateKernel()/declareStateTypes() do it. Some codegen below (via
+    // the COMPILER macro, e.g. regenerating repeating-streamset metadata for whichever
+    // module `b` is currently pointed at) needs b.getCompiler() to resolve to this
+    // pipeline's own compiler. addOrDeclareMainFunction is invoked directly (not
+    // through generateKernel), and can run against a fresh module -- e.g.
+    // materializeMain's "main" module -- that never went through a path that set this,
+    // so without this bracket COMPILER resolves to whatever was last left on `b`.
+    struct CompilerScope {
+        const PipelineKernel * const Self;
+        KernelBuilder & B;
+        KernelCompiler * const Prior;
+        CompilerScope(const PipelineKernel * const self, KernelBuilder & b, KernelCompiler * const compiler)
+        : Self(self), B(b), Prior(b.getCompiler()) {
+            Self->setBuilderCompiler(B, compiler);
+        }
+        ~CompilerScope() { Self->setBuilderCompiler(B, Prior); }
+    } compilerScope(this, b, mCompiler.get());
+
     unsigned suppliedArgs = 1; // segment size
-    if (LLVM_LIKELY(isStateful())) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         suppliedArgs += 1;
     }
-    if (LLVM_LIKELY(hasThreadLocal())) {
+    if (LLVM_LIKELY(mThreadLocalStateType)) {
         suppliedArgs += 1;
     }
     const auto tdb = allocatesInternalStreamSets() && codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers);
@@ -551,10 +606,10 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     }
 
     Module * const m = b.getModule();
-    Function * const doSegment = getDoSegmentFunction(b, false); assert (doSegment);
+    Function * const doSegment = getDoSegmentFunction(b, true, GlobalValue::ExternalLinkage);
     assert (doSegment->arg_size() >= suppliedArgs);
    //  const auto numOfDoSegArgs = doSegment->arg_size() - suppliedArgs;
-    Function * const terminate = getFinalizeFunction(b);
+    Function * const terminate = getFinalizeFunction(b, true, GlobalValue::ExternalLinkage);
 
     const auto numOfStreamSets = mInputStreamSets.size() + mOutputStreamSets.size();
 
@@ -564,30 +619,30 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     params.reserve(getNumOfScalarInputs() + numOfStreamSets);
 
     StructType * streamSetTy = nullptr;
-    PointerType * streamSetPtrTy = nullptr;
     PointerType * voidPtrTy = b.getVoidPtrTy();
     IntegerType * int64Ty = b.getInt64Ty();
     IntegerType * sizeTy = b.getSizeTy();
+    PointerType * unqualPtrTy = PointerType::getUnqual(b.getContext());
     if (numOfStreamSets) {
         // must match streamsetptr.h
         FixedArray<Type *, 2> fields;
         fields[0] = voidPtrTy;
         fields[1] = int64Ty;
         streamSetTy = StructType::get(b.getContext(), fields);
-        streamSetPtrTy = PointerType::getUnqual(b.getContext());
     }
 
     // The initial params of doSegment are its shared handle, thread-local handle and numOfStrides.
     // (assuming the kernel has both handles). The remaining are the stream set params.
 
     for (unsigned i = 0; i < numOfStreamSets; ++i) {
-        params.push_back(streamSetPtrTy);
+        params.push_back(unqualPtrTy);
     }
     for (const auto & input : getInputScalarBindings()) {
         if (isa<CommandLineScalar>(input.getRelationship())) {
             continue;
         }
-        params.push_back(input.getType());
+        Type * ty = CBuilder::convertTypeToLLVMContext(b.getContext(), input.getType());
+        params.push_back(ty);
     }
 
     Function * createIllustrator = nullptr;
@@ -611,10 +666,8 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         END_SCOPED_REGION
     }
 
-    const auto linkageType = (method == AddInternal) ? Function::InternalLinkage : Function::ExternalLinkage;
-
-    SmallVector<char, 256> tmp;
-    raw_svector_ostream funcNameGen(tmp);
+    std::string tmp;
+    raw_string_ostream funcNameGen(tmp);
     funcNameGen << getName() << "_main";
     const auto funcName = funcNameGen.str();
 
@@ -622,9 +675,17 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     if (LLVM_LIKELY(main == nullptr)) {
         // get the finalize method output type and set its return type as this function's return type
         FunctionType * const mainFunctionType = FunctionType::get(terminate->getReturnType(), params, false);
-        main = Function::Create(mainFunctionType, linkageType, funcName, m);
-        main->setCallingConv(CallingConv::C);
+        main = Function::Create(mainFunctionType, Function::ExternalLinkage, funcName, m);
+        main->setVisibility(GlobalValue::DefaultVisibility);
     }
+
+    assert (main->getName().size() > 0);
+
+    assert (main->getName().size() == funcName.length());
+
+    assert (main->getName().compare(funcName) == 0);
+
+    assert (main->getName().data() != funcName.data());
 
     // declaration only; exit
     if (method == DeclareExternal) {
@@ -638,6 +699,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     auto nextArg = [&]() -> Value * {
         assert (arg != main->arg_end());
         Value * const v = &*arg;
+        assert (&v->getContext() == &b.getContext());
         std::advance(arg, 1);
         return v;
     };
@@ -793,19 +855,19 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
     InitArgs args;
     sharedHandle = constructFamilyKernels(b, args, paramMap, toFree);
-    assert (isStateful() == (sharedHandle != nullptr));
+    assert (((mSharedStateType) != 0) == (sharedHandle != nullptr));
 
     size_t argCount = 0;
-    if (LLVM_LIKELY(isStateful())) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         segmentArgs[argCount++] = sharedHandle;
     }
     Value * threadLocalHandle = nullptr;
-    if (LLVM_LIKELY(hasThreadLocal())) {
+    if (LLVM_LIKELY(mThreadLocalStateType)) {
         SmallVector<Value *, 2> args;
-        if (LLVM_LIKELY(isStateful())) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             args.push_back(sharedHandle);
         }
-        args.push_back(ConstantPointerNull::get(PointerType::getUnqual(b.getContext())));
+        args.push_back(ConstantPointerNull::get(unqualPtrTy));
         threadLocalHandle = initializeThreadLocalInstance(b, args);
         segmentArgs[argCount++] = threadLocalHandle;
         toFree.push_back(threadLocalHandle);
@@ -818,7 +880,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
     segmentArgs[argCount++] = b.getSize(segLength);
 
     if (LLVM_UNLIKELY(tdb)) {
-        Constant * const nil = ConstantPointerNull::get(b.getVoidPtrTy());
+        Constant * const nil = ConstantPointerNull::get(unqualPtrTy);
         segmentArgs[argCount++] = nil;
         segmentArgs[argCount++] = nil;
     }
@@ -834,23 +896,23 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
 
         ConstantInt * const sz_BufferSize = b.getSize(segLength * codegen::BufferSegments);
 
-        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b);
+        Function * const allocShared = getAllocateSharedInternalStreamSetsFunction(b, true, GlobalValue::ExternalLinkage);
         SmallVector<Value *, 4> allocArgs;
-        if (LLVM_LIKELY(isStateful())) {
+        if (LLVM_LIKELY(mSharedStateType)) {
             allocArgs.push_back(sharedHandle);
         }
         // pass in the desired number of segments
         allocArgs.push_back(sz_BufferSize);
         if (LLVM_UNLIKELY(codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers))) {
-            Constant * nil = ConstantPointerNull::get(b.getVoidPtrTy());
+            Constant * nil = ConstantPointerNull::get(unqualPtrTy);
             allocArgs.push_back(nil);
             allocArgs.push_back(nil);
         }
         b.CreateCall(allocShared->getFunctionType(), allocShared, allocArgs);
-        if (LLVM_LIKELY(hasThreadLocal())) {
-            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b);
+        if (LLVM_LIKELY(mThreadLocalStateType)) {
+            Function * const allocThreadLocal = getAllocateThreadLocalInternalStreamSetsFunction(b, true, GlobalValue::ExternalLinkage);
             SmallVector<Value *, 3> allocArgs;
-            if (LLVM_LIKELY(isStateful())) {
+            if (LLVM_LIKELY(mSharedStateType)) {
                 allocArgs.push_back(sharedHandle);
             }
             allocArgs.push_back(threadLocalHandle);
@@ -906,10 +968,10 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         END_SCOPED_REGION
     }
     SmallVector<Value *, 3> finalizeArgs;
-    if (LLVM_LIKELY(isStateful())) {
+    if (LLVM_LIKELY(mSharedStateType)) {
         finalizeArgs.push_back(sharedHandle);
     }
-    if (LLVM_LIKELY(hasThreadLocal())) {
+    if (LLVM_LIKELY(mThreadLocalStateType)) {
         finalizeArgs.push_back(threadLocalHandle);
         finalizeArgs.push_back(threadLocalHandle);
         finalizeThreadLocalInstance(b, finalizeArgs);
@@ -1062,7 +1124,6 @@ PipelineKernel::PipelineKernel(Internal, LLVMTypeSystemInterface & ts,
          std::move(stream_inputs), std::move(stream_outputs),
          std::move(scalar_inputs), std::move(scalar_outputs),
          {} /* Internal scalars are generated by the PipelineCompiler */,
-         CompilationStatus::FullyInitialized,
          KernelFlags::HasInternallyManagedStreamSet)
 , mNumOfKernelFamilyCalls(numOfKernelFamilyCalls)
 , mSignature(std::move(signature))
@@ -1086,7 +1147,6 @@ PipelineKernel::PipelineKernel(LLVMTypeSystemInterface & ts,
          std::move(attributes),
          std::move(stream_inputs), std::move(stream_outputs),
          std::move(scalar_inputs), std::move(scalar_outputs),
-         CompilationStatus::Uninitialized,
          KernelFlags::HasInternallyManagedStreamSet)
 , mSignature(std::move(signature)) {
     setStride(ts.getBitBlockWidth());

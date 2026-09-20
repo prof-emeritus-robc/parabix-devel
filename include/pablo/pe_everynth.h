@@ -28,8 +28,8 @@ public:
         return llvm::cast<Integer>(getOperand(1));
     }
 protected:
-    explicit EveryNth(PabloAST * expr, PabloAST * n, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::EveryNth, expr->getType(), {expr, n}, name, allocator) {
+    explicit EveryNth(PabloAST * expr, PabloAST * n, const String * name)
+    : Statement(ClassTypeId::EveryNth, expr->getType(), {expr, n}, name) {
         assert(llvm::isa<Integer>(n) && llvm::cast<Integer>(n)->value() != 0);
     }
 private:

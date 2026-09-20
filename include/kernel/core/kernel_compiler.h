@@ -25,6 +25,12 @@ public:
 
     using ScalarValueMap = llvm::StringMap<ScalarRef>;
 
+    #ifndef NDEBUG
+    using ScalarPositionVal = std::pair<Kernel::ScalarType, size_t>;
+
+    using ScalarPositionMap = llvm::StringMap<ScalarPositionVal>;
+    #endif
+
     using ScalarAliasMap = std::vector<std::pair<std::string, std::string>>;
 
     using ScalarType = Kernel::ScalarType;
@@ -63,7 +69,9 @@ public:
     // constructor
     KernelCompiler(not_null<Kernel *> kernel) noexcept;
 
-    void generateKernel(KernelBuilder & b);
+    void constructStateTypes(KernelBuilder & b);
+
+    void generateKernel(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType);
 
     virtual ~KernelCompiler();
 
@@ -354,27 +362,27 @@ protected:
 
 public:
 
-    void callGenerateInitializeMethod(KernelBuilder & b);
+    void callGenerateInitializeMethod(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType);
 
-    virtual void callGenerateExpectedOutputSizeMethod(KernelBuilder & b);
+    virtual void callGenerateExpectedOutputSizeMethod(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType);
 
     virtual void bindAdditionalInitializationArguments(KernelBuilder & b, ArgIterator & arg, const ArgIterator & arg_end);
 
-    void callGenerateInitializeThreadLocalMethod(KernelBuilder & b);
+    void callGenerateInitializeThreadLocalMethod(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType);
 
-    void callGenerateAllocateSharedInternalStreamSets(KernelBuilder & b);
+    void callGenerateAllocateSharedInternalStreamSets(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType);
 
-    void callGenerateAllocateThreadLocalInternalStreamSets(KernelBuilder & b);
+    void callGenerateAllocateThreadLocalInternalStreamSets(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType);
 
     std::vector<llvm::Value *> getDoSegmentProperties(KernelBuilder & b) const;
 
     void setDoSegmentProperties(KernelBuilder & b, const llvm::ArrayRef<llvm::Value *> args);
 
-    void callGenerateDoSegmentMethod(KernelBuilder & b);
+    void callGenerateDoSegmentMethod(KernelBuilder & b, llvm::TargetMachine *TM, llvm::GlobalValue::LinkageTypes linkageType);
 
-    void callGenerateFinalizeThreadLocalMethod(KernelBuilder & b);
+    void callGenerateFinalizeThreadLocalMethod(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType);
 
-    void callGenerateFinalizeMethod(KernelBuilder & b);
+    void callGenerateFinalizeMethod(KernelBuilder & b, llvm::GlobalValue::LinkageTypes linkageType);
 
     static Rational getLCMOfFixedRateInputs(const Kernel * const target);
 
@@ -404,7 +412,7 @@ private:
 
     void clearInternalStateAfterCodeGen();
 
-    void runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes);
+    void runAllOptimizationPasses(KernelBuilder & b, Kernel::SelectedOptimizationPasses & passes, llvm::TargetMachine *TM);
 
 protected:
 
@@ -457,6 +465,9 @@ protected:
 
     ScalarValueMap                  mScalarFieldMap;
     ScalarAliasMap                  mScalarAliasMap;
+    #ifndef NDEBUG
+    ScalarPositionMap               mScalarPositionMap;
+    #endif
     BindingMap                      mBindingMap;
 
     OwnedStreamSetBuffers           mStreamSetInputBuffers;

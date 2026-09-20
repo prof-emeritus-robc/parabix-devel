@@ -202,7 +202,7 @@ bool PipelineCommonGraphFunctions::mayHaveNonLinearIO(const size_t kernel) const
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief isKernelStateFree
  ** ------------------------------------------------------------------------------------------------------------- */
-bool PipelineCommonGraphFunctions::isKernelStateFree(const size_t kernel) const {
+bool PipelineCommonGraphFunctions::isKernelStateFree(KernelBuilder & b, const size_t kernel) const {
 #ifdef DISABLE_ALL_DATA_PARALLEL_SYNCHRONIZATION
     return false;
 #else
@@ -276,23 +276,21 @@ bool PipelineCommonGraphFunctions::isKernelStateFree(const size_t kernel) const 
             return false;
         }
     }
-    assert (kernelObj->isGenerated());
-    StructType * const st = kernelObj->getSharedStateType();
-    if (st == nullptr) {
-        return true;
-    }
-    return false;
     if (LLVM_UNLIKELY(isKernelFamilyCall(kernel))) {
         // Even if this kernel object has no mutable scalars, we cannot determine whether a different kernel
         // belonging to the same family would have none too.
         return false;
     } else { // check if we have only a (non-mutable) input scalar
-        const auto n = st->getStructNumElements();
-        assert ((n % 2) == 0 && n >= 4);
-        assert ((kernelObj->getNumOfScalarInputs() > 0) ^ st->getStructElementType(0)->isEmptyTy());
-        assert ((kernelObj->getNumOfScalarOutputs() > 0) ^ st->getStructElementType(n - 2)->isEmptyTy());
-        return (n == 4) && st->getStructElementType(2)->isEmptyTy();
+        StructType * const st = kernelObj->getSharedStateType();
+        if (st) {
+            // If this state object only contains input scalars then it has no run-time mutable state
+            // (NOTE: final block is padding)
+            const auto n = st->getStructNumElements();
+            assert ((n % 2) == 1 && n > 0);
+            return (n == 3) && st->getStructElementType(1)->isEmptyTy();
+        }
     }
+    return true;
 #endif
 }
 

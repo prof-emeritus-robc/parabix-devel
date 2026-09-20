@@ -5,6 +5,7 @@
 
 #include <kernel/core/kernel.h>
 #include <kernel/core/block_kernel_compiler.h>
+#include <codegen/LLVMTypeSystemInterface.h>
 
 namespace kernel {
 
@@ -19,7 +20,7 @@ namespace kernel {
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief instantiateKernelCompiler
  ** ------------------------------------------------------------------------------------------------------------- */
-std::unique_ptr<KernelCompiler> BlockOrientedKernel::instantiateKernelCompiler(KernelBuilder & /* b */) const {
+std::unique_ptr<KernelCompiler> BlockOrientedKernel::instantiateKernelCompiler(KernelBuilder & /* b */) {
     return std::make_unique<BlockKernelCompiler>(const_cast<BlockOrientedKernel *>(this));
 }
 

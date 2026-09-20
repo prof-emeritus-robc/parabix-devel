@@ -225,6 +225,9 @@ void CarryManager::initializeCodeGen(kernel::KernelBuilder & b) {
     if (LLVM_UNLIKELY(mCarryFrameType == nullptr)) {
         return;
     }
+
+    mCarryFrameType = (StructType*)CBuilder::convertTypeToLLVMContext(b.getContext(), mCarryFrameType);
+
     mCurrentFrame = b.getScalarFieldPtr("carries").first;
     mCurrentFrameIndex = 0;
     mCarryScopes = 0;
@@ -569,6 +572,7 @@ void CarryManager::enterIfScope(kernel::KernelBuilder & b) {
     if (mCarryInfo->hasSummary()) {
         assert (mNextSummaryTest);
         Type * const summaryTy = getSummaryTypeFromCurrentFrame(b);
+        assert (&summaryTy->getContext() == &b.getContext());
         mCarrySummaryStack.push_back(Constant::getNullValue(summaryTy)); // new carry out summary accumulator
     }
 }
@@ -862,7 +866,6 @@ Value * CarryManager::shortIndexedAdvanceCarryInCarryOut(kernel::KernelBuilder &
  * @brief longAdvanceCarryInCarryOut
  ** ------------------------------------------------------------------------------------------------------------- */
 inline Value * CarryManager::longAdvanceCarryInCarryOut(kernel::KernelBuilder & b, Value * const value, const unsigned shiftAmount) {
-
     assert (mHasLongAdvance);
     assert (shiftAmount >= LONG_ADVANCE_BREAKPOINT);
     assert (value);

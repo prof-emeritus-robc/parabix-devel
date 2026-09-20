@@ -31,4 +31,5 @@ SRC
 DEPS
     kernel.core
     toolchain
+    slaballocator
 )

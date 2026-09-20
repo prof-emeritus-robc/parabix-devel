@@ -27,8 +27,8 @@ public:
         return llvm::cast<Integer>(getOperand(1))->value();
     }
 protected:
-    explicit TerminateAt(PabloAST * strm, PabloAST * code, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::TerminateAt, strm->getType(), {strm, code}, name, allocator) {
+    explicit TerminateAt(PabloAST * strm, PabloAST * code, const String * name)
+    : Statement(ClassTypeId::TerminateAt, strm->getType(), {strm, code}, name) {
         setSideEffecting();
         assert(llvm::isa<Integer>(code));
     }

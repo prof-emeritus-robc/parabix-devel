@@ -23,7 +23,6 @@
 #include <boost/container/flat_set.hpp>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/Support/raw_ostream.h>
-#include <util/slab_allocator.h>
 #include <pablo/printer_pablos.h>
 
 using namespace boost;
@@ -34,7 +33,6 @@ namespace pablo {
 
 using TypeId = PabloAST::ClassTypeId;
 using EscapedVars = Branch::EscapedVars;
-using Allocator = SlabAllocator<uint8_t>;
 using KeySet = SmallVector<const Var *, 64>;
 
 #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
@@ -57,7 +55,7 @@ struct VariableTable {
 
     using Map = llvm::DenseMap<const Var *, PabloAST *>;
 
-    VariableTable(Allocator & allocator) noexcept
+    VariableTable() noexcept
     : mOuter(nullptr) {
 
     }
@@ -185,7 +183,7 @@ bool reevaluateRedundancyElimination = false;
  ** ------------------------------------------------------------------------------------------------------------- */
 void redundancyElimination(PabloKernel * const kernel) {
     ExpressionTable expressions;
-    VariableTable variables(expressions.get_allocator());
+    VariableTable variables;
     const auto n = kernel->getNumOfInputs();
     for (unsigned i = 0; i < n; ++i) {
         Var * const input = kernel->getInput(i);

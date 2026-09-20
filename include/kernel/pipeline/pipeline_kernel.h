@@ -97,6 +97,8 @@ public:
 
     bool isCachable() const override;
 
+    KernelCompilationPriority getCompilationPriority() const final { return KernelCompilationPriority::High; }
+
     void setInputStreamSetAt(const unsigned i, StreamSet * const value) final;
 
     void setOutputStreamSetAt(const unsigned i, StreamSet * const value) final;
@@ -121,13 +123,19 @@ public:
         return mLengthAssertions;
     }
 
-    void addKernelDeclarations(KernelBuilder & b) final;
-
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) const final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
     ~PipelineKernel() override;
 
     llvm::Function * addOrDeclareMainFunction(KernelBuilder & b, const MainMethodGenerationType method) const final;
+
+private:
+    // KernelBuilder::setCompiler is protected, with friendship granted to PipelineKernel
+    // specifically so this wrapper can bracket it around addOrDeclareMainFunction (see
+    // its definition for why that's needed); a struct local to that function can't use
+    // the friendship directly since it isn't itself a PipelineKernel member.
+    void setBuilderCompiler(KernelBuilder & b, KernelCompiler * const compiler) const;
+public:
 
     PipelinePhaseBoundary * InsertPhaseBoundary() {
         auto boundary = std::make_unique<PipelinePhaseBoundary>();
@@ -169,6 +177,8 @@ protected:
 
     unsigned getNumOfNestedKernelFamilyCalls() const override;
 
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
+
 private:
 
     struct Internal {};
@@ -191,8 +201,6 @@ private:
 
     void recursivelyListFamilyKernels(llvm::raw_ostream & familyName) const final;
 
-    void linkExternalMethods(KernelBuilder & b) final;
-
     void generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides) final;
 
     void generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides) final;
@@ -205,13 +213,11 @@ private:
 
     void generateInitializeThreadLocalMethod(KernelBuilder & b) final;
 
-    void generateKernelMethod(KernelBuilder & b) final;
+    void generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) final;
 
     void generateFinalizeThreadLocalMethod(KernelBuilder & b) final;
 
     void generateFinalizeMethod(KernelBuilder & b) final;
-
-    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
 
 protected:
 
@@ -244,6 +250,9 @@ private:
 
     }
 
+public:
+
+     void linkExternalMethods(KernelBuilder & b) final;
 
 protected:
 

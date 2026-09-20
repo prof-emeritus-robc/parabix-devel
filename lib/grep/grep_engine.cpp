@@ -339,7 +339,7 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
         if (mGrepRecordBreak == GrepRecordBreakKind::LF) {
             Kernel * k = P.CreateKernelCall<UnixLinesKernelBuilder>(Source, mLineBreakStream, UnterminatedLineAtEOF::Add1, mNullMode, callbackObject);
             if (mNullMode == NullCharMode::Abort) {
-                k->link("signal_dispatcher", signal_dispatcher);
+                P.LinkFunction(k, "signal_dispatcher", signal_dispatcher);
             }
         } else { // if (mGrepRecordBreak == GrepRecordBreakKind::Null) {
             P.CreateKernelCall<NullDelimiterKernel>(Source, mLineBreakStream, UnterminatedLineAtEOF::Add1);
@@ -650,8 +650,8 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
         // E.AssertEqualLength(SourceCoords, ColorizedCoords);
 
         Kernel * const matchK = E.CreateKernelCall<ColorizedReporter>(ColorizedBytes, SourceCoords, ColorizedCoords, callbackObject);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     };
 
 
@@ -754,9 +754,9 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
         StreamSet * SourceCoords = P.CreateStreamSet(1, sizeof(size_t) * 8);
         Scalar * const callbackObject = P.getInputScalar("callbackObject");
         Kernel * const batchK = P.CreateKernelCall<BatchCoordinatesKernel>(MatchedLineEnds, mLineBreakStream, SourceCoords, callbackObject);
-        batchK->link("get_file_count_wrapper", get_file_count_wrapper);
-        batchK->link("get_file_start_pos_wrapper", get_file_start_pos_wrapper);
-        batchK->link("set_batch_line_number_wrapper", set_batch_line_number_wrapper);
+        P.LinkFunction(batchK, "get_file_count_wrapper", get_file_count_wrapper);
+        P.LinkFunction(batchK, "get_file_start_pos_wrapper", get_file_start_pos_wrapper);
+        P.LinkFunction(batchK, "set_batch_line_number_wrapper", set_batch_line_number_wrapper);
 
         StreamSet * MatchedLineStarts = P.CreateStreamSet(1, 1);
         StreamSet * lineStarts = P.CreateStreamSet(1, 1);
@@ -802,16 +802,16 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
             P.CreateKernelCall<MatchCoordinatesKernel>(MatchedLineEnds, mLineBreakStream, MatchCoords, MatchCoordinateBlocks);
             Scalar * const callbackObject = P.getInputScalar("callbackObject");
             Kernel * const matchK = P.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-            matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-            matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+            P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+            P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
         } else {
             Scalar * const callbackObject = P.getInputScalar("callbackObject");
             Kernel * const scanBatchK = P.CreateKernelCall<ScanBatchKernel>(MatchedLineEnds, mLineBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-            scanBatchK->link("get_file_count_wrapper", get_file_count_wrapper);
-            scanBatchK->link("get_file_start_pos_wrapper", get_file_start_pos_wrapper);
-            scanBatchK->link("set_batch_line_number_wrapper", set_batch_line_number_wrapper);
-            scanBatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-            scanBatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+            P.LinkFunction(scanBatchK, "get_file_count_wrapper", get_file_count_wrapper);
+            P.LinkFunction(scanBatchK, "get_file_start_pos_wrapper", get_file_start_pos_wrapper);
+            P.LinkFunction(scanBatchK, "set_batch_line_number_wrapper", set_batch_line_number_wrapper);
+            P.LinkFunction(scanBatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+            P.LinkFunction(scanBatchK, "finalize_match_wrapper", finalize_match_wrapper);
         }
     }
 }
@@ -830,7 +830,7 @@ void EmitMatchesEngine::grepCodeGen() {
 
     P.CreateKernelCall<MemorySourceKernel>(buffer, length, InternalBytes);
     grepPipeline(P, InternalBytes);
-    P.setOutputScalar("countResult", P.CreateConstant(mGrepDriver.getInt64(0)));
+    P.setOutputScalar("countResult", P.CreateConstant(P.getInt64(0)));
     mBatchMethod = P.compile();
 }
 
@@ -1171,12 +1171,12 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
         StreamSet * MatchCoords = E.CreateStreamSet(3, sizeof(size_t) * 8);
         E.CreateKernelCall<MatchCoordinatesKernel>(MatchingRecords, RecordBreakStream, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = E.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
         Kernel * const scanMatchK = E.CreateKernelCall<ScanMatchKernel>(MatchingRecords, RecordBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-        scanMatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        scanMatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mMainMethod = E.compile();
@@ -1260,12 +1260,12 @@ void InternalMultiSearchEngine::grepCodeGen(const re::PatternVector & patterns) 
         StreamSet * MatchCoords = E.CreateStreamSet(3, sizeof(size_t) * 8);
         E.CreateKernelCall<MatchCoordinatesKernel>(resultsSoFar, RecordBreakStream, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = E.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-        matchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        matchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
         Kernel * const scanMatchK = E.CreateKernelCall<ScanMatchKernel>(resultsSoFar, RecordBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-        scanMatchK->link("accumulate_match_wrapper", accumulate_match_wrapper);
-        scanMatchK->link("finalize_match_wrapper", finalize_match_wrapper);
+        E.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+        E.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mMainMethod = E.compile();

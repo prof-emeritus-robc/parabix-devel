@@ -10,5 +10,6 @@ SRC
     illustrator.cpp
 DEPS
     toolchain
+    slaballocator
     ${Boost_LIBRARIES}
 )

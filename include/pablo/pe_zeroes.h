@@ -29,8 +29,8 @@ public:
         return llvm::isa<Zeroes>(other);
     }
 protected:
-    Zeroes(llvm::Type * const type, Allocator & allocator)
-    : PabloAST(ClassTypeId::Zeroes, type, allocator) {
+    Zeroes(llvm::Type * const type)
+    : PabloAST(ClassTypeId::Zeroes, type) {
     }
 };
 

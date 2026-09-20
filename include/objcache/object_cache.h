@@ -7,17 +7,19 @@
 
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ExecutionEngine/ObjectCache.h>
+#include <llvm/Support/MemoryBufferRef.h>
 #include <llvm/ADT/StringRef.h>
 #include <boost/container/flat_set.hpp>
 #include <boost/container/flat_map.hpp>
 #include <util/not_null.h>
 #include <kernel/core/kernel.h>
+#include <kernel/pipeline/driver/driver.h>
+#include <mutex>
 #include <string>
 
-namespace llvm { class Module; }
-namespace llvm { class MemoryBuffer; }
-namespace llvm { class MemoryBufferRef; }
-namespace llvm { class LLVMContext; }
+namespace llvm { 
+    class Module;  class MemoryBuffer;  class LLVMContext;
+}
 
 // The ParabixObjectCache is a two-level cache compatible with the requirements
 // of the LLVM ExecutionEngine as well as the Parabix Kernel builder infrastructure.
@@ -37,27 +39,23 @@ enum class CacheObjectResult {
     , UNCACHED
 };
 
-class ParabixObjectCache final : public llvm::ObjectCache {
+class ParabixObjectCache {
     template <typename K, typename V>
     using Map = boost::container::flat_map<K, V>;
     template <typename K>
     using Set = boost::container::flat_set<K>;
-    using KnownSignatures = Map<std::string, llvm::Module *>;
-    using ModuleCache = Map<std::string, std::unique_ptr<llvm::MemoryBuffer>>;
+    using ObjectBufferCache = llvm::StringMap<llvm::MemoryBufferRef>;
     using Instance = std::unique_ptr<ParabixObjectCache>;
+    using LoadResult = std::pair<std::unique_ptr<llvm::MemoryBuffer>, std::unique_ptr<llvm::Module>>;
 public:
 
     friend class BaseDriver;
 
     using Path = llvm::SmallString<128>;
 
-    CacheObjectResult loadCachedObjectFile(kernel::KernelBuilder & b, kernel::Kernel * const kernel) noexcept;
+    LoadResult loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept;
 
-    void notifyObjectCompiled(const llvm::Module * M, llvm::MemoryBufferRef Obj) override;
-
-    std::unique_ptr<llvm::MemoryBuffer> getObject(const llvm::Module * M) override;
-
-    virtual ~ParabixObjectCache();
+    void saveCachedObjectFile(const llvm::Module & M, llvm::MemoryBufferRef Obj) noexcept;
 
 protected:
 
@@ -70,8 +68,11 @@ private:
     bool requiresCacheCleanUp() noexcept;
 private:
     static bool         mStartedCacheCleanupDaemon;
-    KnownSignatures     mKnownSignatures;
-    ModuleCache         mCachedObject;
+    ObjectBufferCache   mCachedObject;
     Path                mCachePath;
+    // CPUDriverCompiler's worker threads call loadCachedObjectFile/saveCachedObjectFile
+    // concurrently for different kernels; mCachedObject (an llvm::StringMap) and the
+    // on-disk .o/.kernel files it mirrors are not otherwise safe against that.
+    std::mutex          mCacheMutex;
 };
 

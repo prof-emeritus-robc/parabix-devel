@@ -23,4 +23,5 @@ SRC
 DEPS
     idisa
     kernel.illustrator
+    slaballocator
 )

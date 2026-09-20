@@ -37,10 +37,6 @@ using namespace llvm;
 
 namespace codegen {
 
-inline unsigned getPageSize() {
-    return boost::interprocess::mapped_region::get_page_size();
-}
-
 llvm::StringMap<bool> GetFeatureNames() {
     StringMap<bool> features;
 #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(19, 0, 0)
@@ -290,11 +286,39 @@ PipelineCompilationModeOption("pipeline-optimization-level", cl::location(Pipeli
 static cl::opt<bool, true> EnableObjectCacheOption("enable-object-cache", cl::location(EnableObjectCache), cl::init(true),
                                                    cl::desc("Enable object caching"), cl::cat(CodeGenOptions));
 
+static cl::opt<bool, true> EnableModuleInlinerOption("enable-kernel-module-inliner", cl::location(EnableModuleInliner), cl::init(false),
+                                                   cl::desc("Run a whole-module inliner pass over each kernel's IR before object generation."), cl::cat(CodeGenOptions));
+
 static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::location(TraceObjectCache), cl::init(false),
                                                    cl::desc("Trace object cache retrieval."), cl::cat(JIT_InfoOptions));
 
 static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""),
                                                  cl::desc("Path to the object cache diretory"), cl::cat(CodeGenOptions));
+
+// The custom allocator keeps persistent, long-lived exec/data slab pools rather than
+// allocating a small dedicated region per compiled object as LLVM's default in-process
+// memory manager does. That's a deliberate linking-speed optimization, but under LLVM 21
+// it can place exec and data content too far apart for Mach-O compact-unwind info's
+// 32-bit deltas, so it defaults to off there; LLVM < 21 is unaffected and defaults to on.
+static cl::opt<bool, true> UseCustomJITMemoryManagerOption("use-custom-jit-memory-manager", cl::location(UseCustomJITMemoryManager),
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    cl::init(false),
+    #else
+    cl::init(true),
+    #endif
+    cl::desc("Use the custom slab-based JIT memory manager instead of LLVM's default in-process memory manager."),
+    cl::cat(CodeGenOptions));
+
+unsigned CompileThreads;
+static cl::opt<unsigned, true>
+CompileThreadsOption("compile-threads", cl::location(CompileThreads), cl::init(4),
+                     cl::desc("Number of threads used for JIT compilation."),
+                     cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
+
+bool UseMCJIT = false;
+static cl::opt<bool, true> UseMCJITOption("use-mcjit", cl::location(UseMCJIT), cl::init(false),
+    cl::desc("Use classic single-threaded MCJIT instead of the default multi-threaded ORC JIT backend."),
+    cl::cat(CodeGenOptions));
 
 bool EnableDynamicMultithreading;
 static cl::opt<bool, true> EnableDynamicMultithreadingOption("dynamic-multithreading", cl::location(EnableDynamicMultithreading), cl::init(false),
@@ -387,8 +411,10 @@ unsigned SegmentThreads;
 unsigned ScanBlocks;
 
 bool EnableObjectCache = true;
+bool EnableModuleInliner = false;
 bool EnablePipelineObjectCache = true;
 bool TraceObjectCache;
+bool UseCustomJITMemoryManager = true;
 
 unsigned CacheDaysLimit;
 
@@ -499,6 +525,18 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     }
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
     target_Options.MCOptions.AsmVerbose = true;
+
+    if (UseMCJIT) {
+        // --compile-threads and --use-custom-jit-memory-manager only affect the default
+        // ORC JIT backend's worker-thread pool and its custom JITLink memory manager;
+        // MCJIT compiles single-threaded and has no equivalent knobs, so both are ignored.
+        if (CompileThreadsOption.getNumOccurrences() > 0) {
+            errs() << "warning: --compile-threads is ignored under --use-mcjit (MCJIT compiles single-threaded)\n";
+        }
+        if (UseCustomJITMemoryManagerOption.getNumOccurrences() > 0) {
+            errs() << "warning: --use-custom-jit-memory-manager is ignored under --use-mcjit\n";
+        }
+    }
 
 }
 

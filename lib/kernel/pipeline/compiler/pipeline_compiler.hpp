@@ -108,6 +108,13 @@ const static std::string REPEATING_STREAMSET_HANDLE_PREFIX = "@RSS.";
 const static std::string REPEATING_STREAMSET_LENGTH_PREFIX = "@RSSL.";
 const static std::string REPEATING_STREAMSET_MALLOCED_DATA_PREFIX = "@RSSD.";
 
+// Named per owning kernel (see generateMetaDataForRepeatingStreamSets /
+// PipelineKernel::writeInternallyGeneratedStreamSetScaleVector): a nested pipeline
+// kernel's own repeating-streamset length metadata can end up in the same module as
+// its parent's, and an unqualified name would let one kernel's lookup silently find
+// and misread another's.
+const static std::string RSL_METADATA_PREFIX = "rsl.";
+
 const static std::string STATISTICS_CYCLE_COUNT_SUFFIX = ".SCy";
 const static std::string STATISTICS_CYCLE_COUNT_TOTAL = "!SCT";
 
@@ -165,14 +172,15 @@ public:
 
     PipelineCompiler(KernelBuilder & b, PipelineKernel * const pipelineKernel);
 
-    void generateImplicitKernels(KernelBuilder & b);
+    void constructImplicitKernelStateTypes(KernelBuilder & b);
+    void generateImplicitKernels(KernelBuilder & b, TargetMachine * TM);
     void addPipelineKernelProperties(KernelBuilder & b);
     void constructStreamSetBuffers(KernelBuilder & b) override;
     void generateInitializeMethod(KernelBuilder & b);
     void generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, Value * const segmentSize);
     void generateInitializeThreadLocalMethod(KernelBuilder & b);
     void generateAllocateThreadLocalInternalStreamSetsMethod(KernelBuilder & b, Value * segmentSize);
-    void generateKernelMethod(KernelBuilder & b);
+    void generateKernelMethod(KernelBuilder & b, TargetMachine *TM);
     void generateFinalizeMethod(KernelBuilder & b);
     void generateFinalizeThreadLocalMethod(KernelBuilder & b);
     std::vector<Value *> getFinalOutputScalars(KernelBuilder & b) override;
@@ -232,6 +240,8 @@ public:
     inline Value * isProcessThread(KernelBuilder & b, StructType * const threadStateTy, Value * const threadState) const;
     void updateExternalProducedItemCounts(KernelBuilder & b);
     void writeMaximumStrideLengthMetadata(KernelBuilder & b) const;
+
+    GlobalValue::LinkageTypes getKernelLinkageType(const size_t kernelId) const;
 
 // partitioning codegen functions
 
@@ -618,8 +628,6 @@ public:
 
 protected:
 
-    CompilerAllocator                           mAllocator;
-
     const bool                                  mCheckAssertions;
     const bool                                  mCheckStreamSets;
     const bool                                  mTraceProcessedProducedItemCounts;
@@ -691,6 +699,8 @@ protected:
     const InOutGraph                            InOutStreamSetReplacement;
     const ThreadLocalPlacementGraph             ThreadLocalPlacement;
     const ThreadLocalConflictGraphType          ThreadLocalConflictGraph;
+
+    StringMap<Kernel *>                         UniqueImplicitKernelInstances;
 
     // pipeline state
     bool                                        mKernelRequiresIllustratorObject = false;
@@ -1006,89 +1016,89 @@ inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel,
 
 , ThreadLocalConflictGraph(std::move(P.ThreadLocalConflictGraph))
 
-, mInitiallyAvailableItemsPhi(FirstStreamSet, LastStreamSet, mAllocator)
-, mKernelIsClosed(FirstKernel, LastKernel, mAllocator)
-, mLocallyAvailableItems(FirstStreamSet, LastStreamSet, mAllocator)
+, mInitiallyAvailableItemsPhi(FirstStreamSet, LastStreamSet)
+, mKernelIsClosed(FirstKernel, LastKernel)
+, mLocallyAvailableItems(FirstStreamSet, LastStreamSet)
 
-, mScalarValue(FirstKernel, LastScalar, mAllocator)
-, mThreadLocalStartOffset(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
-, mThreadLocalEndOffset(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
-, mThreadLocalStartOffsetAtEntryPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
-, mThreadLocalEndOffsetAtEntryPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
-, mThreadLocalStartOffsetAtExitPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
-, mThreadLocalEndOffsetAtExitPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1, mAllocator)
+, mScalarValue(FirstKernel, LastScalar)
+, mThreadLocalStartOffset(FirstStreamSet, LastStreamSet + PartitionCount + 1)
+, mThreadLocalEndOffset(FirstStreamSet, LastStreamSet + PartitionCount + 1)
+, mThreadLocalStartOffsetAtEntryPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1)
+, mThreadLocalEndOffsetAtEntryPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1)
+, mThreadLocalStartOffsetAtExitPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1)
+, mThreadLocalEndOffsetAtExitPhi(FirstStreamSet, LastStreamSet + PartitionCount + 1)
 
 , mIsStatelessKernel(PipelineOutput - PipelineInput + 1)
 , mIsInternallySynchronized(PipelineOutput - PipelineInput + 1)
 , mIsThreadLocalStreamSet()
-, mPartitionEntryPoint(PartitionCount, mAllocator)
+, mPartitionEntryPoint(PartitionCount)
 
-, mKernelTerminationSignal(FirstKernel, LastKernel, mAllocator)
-, mKernelConsumedItemCount(P.MaxNumOfOutputPorts, mAllocator)
+, mKernelTerminationSignal(FirstKernel, LastKernel)
+, mKernelConsumedItemCount(P.MaxNumOfOutputPorts)
 
 , mPartitionProducedItemCountPhi(extents[PartitionCount][LastStreamSet - FirstStreamSet + 1])
 , mPartitionConsumedItemCountPhi(extents[PartitionCount][LastStreamSet - FirstStreamSet + 1])
 , mPartitionTerminationSignalPhi(extents[PartitionCount][LastKernel - FirstKernel + 1])
-, mPartitionPipelineProgressPhi(PartitionCount, mAllocator)
+, mPartitionPipelineProgressPhi(PartitionCount)
 
-, mInitiallyProcessedItemCount(P.MaxNumOfInputPorts, mAllocator)
-, mInitiallyProcessedDeferredItemCount(P.MaxNumOfInputPorts, mAllocator)
-, mAlreadyProcessedPhi(P.MaxNumOfInputPorts, mAllocator)
-, mAlreadyProcessedDeferredPhi(P.MaxNumOfInputPorts, mAllocator)
-, mIsInputZeroExtended(P.MaxNumOfInputPorts, mAllocator)
-, mInputVirtualBaseAddressPhi(P.MaxNumOfInputPorts, mAllocator)
-, mFirstInputStrideLength(P.MaxNumOfInputPorts, mAllocator)
-, mInternalAccessibleInputItems(P.MaxNumOfInputPorts, mAllocator)
-, mLinearInputItemsPhi(P.MaxNumOfInputPorts, mAllocator)
-, mInputBufferCapacityPhi(P.MaxNumOfInputPorts, mAllocator)
-, mReturnedProcessedItemCountPtr(P.MaxNumOfInputPorts, mAllocator)
-, mProcessedItemCountPtr(P.MaxNumOfInputPorts, mAllocator)
-, mProcessedItemCount(P.MaxNumOfInputPorts, mAllocator)
-, mProcessedItemCountAtTerminationPhi(P.MaxNumOfInputPorts, mAllocator)
-, mProcessedDeferredItemCountPtr(P.MaxNumOfInputPorts, mAllocator)
-, mProcessedDeferredItemCount(P.MaxNumOfInputPorts, mAllocator)
-, mExhaustedInputPort(P.MaxNumOfInputPorts, mAllocator)
-, mExhaustedInputPortPhi(P.MaxNumOfInputPorts, mAllocator)
-, mCurrentProcessedItemCountPhi(P.MaxNumOfInputPorts, mAllocator)
-, mCurrentProcessedDeferredItemCountPhi(P.MaxNumOfInputPorts, mAllocator)
-, mCurrentLinearInputItems(P.MaxNumOfInputPorts, mAllocator)
-, mConsumedItemCountsAtLoopExitPhi(P.MaxNumOfInputPorts, mAllocator)
-, mUpdatedProcessedPhi(P.MaxNumOfInputPorts, mAllocator)
-, mUpdatedProcessedDeferredPhi(P.MaxNumOfInputPorts, mAllocator)
-, mFullyProcessedItemCount(P.MaxNumOfInputPorts, mAllocator)
+, mInitiallyProcessedItemCount(P.MaxNumOfInputPorts)
+, mInitiallyProcessedDeferredItemCount(P.MaxNumOfInputPorts)
+, mAlreadyProcessedPhi(P.MaxNumOfInputPorts)
+, mAlreadyProcessedDeferredPhi(P.MaxNumOfInputPorts)
+, mIsInputZeroExtended(P.MaxNumOfInputPorts)
+, mInputVirtualBaseAddressPhi(P.MaxNumOfInputPorts)
+, mFirstInputStrideLength(P.MaxNumOfInputPorts)
+, mInternalAccessibleInputItems(P.MaxNumOfInputPorts)
+, mLinearInputItemsPhi(P.MaxNumOfInputPorts)
+, mInputBufferCapacityPhi(P.MaxNumOfInputPorts)
+, mReturnedProcessedItemCountPtr(P.MaxNumOfInputPorts)
+, mProcessedItemCountPtr(P.MaxNumOfInputPorts)
+, mProcessedItemCount(P.MaxNumOfInputPorts)
+, mProcessedItemCountAtTerminationPhi(P.MaxNumOfInputPorts)
+, mProcessedDeferredItemCountPtr(P.MaxNumOfInputPorts)
+, mProcessedDeferredItemCount(P.MaxNumOfInputPorts)
+, mExhaustedInputPort(P.MaxNumOfInputPorts)
+, mExhaustedInputPortPhi(P.MaxNumOfInputPorts)
+, mCurrentProcessedItemCountPhi(P.MaxNumOfInputPorts)
+, mCurrentProcessedDeferredItemCountPhi(P.MaxNumOfInputPorts)
+, mCurrentLinearInputItems(P.MaxNumOfInputPorts)
+, mConsumedItemCountsAtLoopExitPhi(P.MaxNumOfInputPorts)
+, mUpdatedProcessedPhi(P.MaxNumOfInputPorts)
+, mUpdatedProcessedDeferredPhi(P.MaxNumOfInputPorts)
+, mFullyProcessedItemCount(P.MaxNumOfInputPorts)
 
-, mInitiallyProducedItemCount(FirstStreamSet, LastStreamSet, mAllocator)
-, mInitiallyProducedDeferredItemCount(FirstStreamSet, LastStreamSet, mAllocator)
+, mInitiallyProducedItemCount(FirstStreamSet, LastStreamSet)
+, mInitiallyProducedDeferredItemCount(FirstStreamSet, LastStreamSet)
 
-, mAlreadyProducedPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mAlreadyProducedDelayedPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mAlreadyProducedDeferredPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mFirstOutputStrideLength(P.MaxNumOfOutputPorts, mAllocator)
-, mInternalWritableOutputItems(P.MaxNumOfOutputPorts, mAllocator)
-, mLinearOutputItemsPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mReturnedOutputVirtualBaseAddressPtr(P.MaxNumOfOutputPorts, mAllocator)
-, mOutputVirtualBaseAddress(P.MaxNumOfOutputPorts, mAllocator)
-, mReturnedProducedItemCountPtr(P.MaxNumOfOutputPorts, mAllocator)
-, mReturnedProducedCapacityPtr(P.MaxNumOfOutputPorts, mAllocator)
-, mProducedItemCountPtr(P.MaxNumOfOutputPorts, mAllocator)
-, mProducedItemCount(P.MaxNumOfOutputPorts, mAllocator)
-, mProducedDeferredItemCountPtr(P.MaxNumOfOutputPorts, mAllocator)
-, mProducedDeferredItemCount(P.MaxNumOfOutputPorts, mAllocator)
+, mAlreadyProducedPhi(P.MaxNumOfOutputPorts)
+, mAlreadyProducedDelayedPhi(P.MaxNumOfOutputPorts)
+, mAlreadyProducedDeferredPhi(P.MaxNumOfOutputPorts)
+, mFirstOutputStrideLength(P.MaxNumOfOutputPorts)
+, mInternalWritableOutputItems(P.MaxNumOfOutputPorts)
+, mLinearOutputItemsPhi(P.MaxNumOfOutputPorts)
+, mReturnedOutputVirtualBaseAddressPtr(P.MaxNumOfOutputPorts)
+, mOutputVirtualBaseAddress(P.MaxNumOfOutputPorts)
+, mReturnedProducedItemCountPtr(P.MaxNumOfOutputPorts)
+, mReturnedProducedCapacityPtr(P.MaxNumOfOutputPorts)
+, mProducedItemCountPtr(P.MaxNumOfOutputPorts)
+, mProducedItemCount(P.MaxNumOfOutputPorts)
+, mProducedDeferredItemCountPtr(P.MaxNumOfOutputPorts)
+, mProducedDeferredItemCount(P.MaxNumOfOutputPorts)
 
-, mCurrentProducedItemCountPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mCurrentProducedDeferredItemCountPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mCurrentLinearOutputItems(P.MaxNumOfOutputPorts, mAllocator)
+, mCurrentProducedItemCountPhi(P.MaxNumOfOutputPorts)
+, mCurrentProducedDeferredItemCountPhi(P.MaxNumOfOutputPorts)
+, mCurrentLinearOutputItems(P.MaxNumOfOutputPorts)
 
-, mProducedAtJumpPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mProducedAtTerminationPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mProducedAtTermination(P.MaxNumOfOutputPorts, mAllocator)
-, mUpdatedProducedPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mUpdatedProducedDeferredPhi(P.MaxNumOfOutputPorts, mAllocator)
-, mFullyProducedItemCount(P.MaxNumOfOutputPorts, mAllocator)
+, mProducedAtJumpPhi(P.MaxNumOfOutputPorts)
+, mProducedAtTerminationPhi(P.MaxNumOfOutputPorts)
+, mProducedAtTermination(P.MaxNumOfOutputPorts)
+, mUpdatedProducedPhi(P.MaxNumOfOutputPorts)
+, mUpdatedProducedDeferredPhi(P.MaxNumOfOutputPorts)
+, mFullyProducedItemCount(P.MaxNumOfOutputPorts)
 
-, mPartitionStartTimePhi(PartitionCount, mAllocator)
+, mPartitionStartTimePhi(PartitionCount)
 
-, mKernelName(PipelineInput, LastKernel, mAllocator)
+, mKernelName(PipelineInput, LastKernel)
 
 , mInternalKernels(std::move(P.mInternalKernels))
 , mInternalBindings(std::move(P.mInternalBindings))

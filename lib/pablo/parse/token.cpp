@@ -12,8 +12,6 @@
 namespace pablo {
 namespace parse {
 
-Token::Allocator Token::mAllocator;
-
 std::string to_string(TokenType const & type) {
     switch (type) {
         CASE_AS_STRING(IDENTIFIER);
@@ -47,11 +45,6 @@ std::string to_string(TokenType const & type) {
         assert ("illegal token type" && false);
         return "";
     }
-}
-
-llvm::StringRef copyText(const llvm::StringRef & text, Token::Allocator & alloc) {
-    ProxyAllocator<char> A(alloc);
-    return text.copy(A);
 }
 
 Token::Token(TokenType type, std::string text, std::weak_ptr<SourceFile> source, size_t lineNum, size_t colNum, uint64_t value)

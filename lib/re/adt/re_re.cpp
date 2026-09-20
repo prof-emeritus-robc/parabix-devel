@@ -5,8 +5,6 @@ using namespace llvm;
 
 namespace re {
 
-RE::Allocator RE::mAllocator;
-
 bool matchesEmptyString(const RE * re) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         for (const RE * re : *alt) {

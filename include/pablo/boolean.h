@@ -22,8 +22,8 @@ public:
     }
     virtual ~And() { }
 protected:
-    And(llvm::Type * const type, PabloAST * expr1, PabloAST * expr2, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::And, type, BOOLEAN_CANONICALIZE(expr1, expr2), name, allocator)
+    And(llvm::Type * const type, PabloAST * expr1, PabloAST * expr2, const String * name)
+    : Statement(ClassTypeId::And, type, BOOLEAN_CANONICALIZE(expr1, expr2), name)
     {
 
     }
@@ -40,8 +40,8 @@ public:
     }
     virtual ~Or() { }
 protected:
-    Or(llvm::Type * const type, PabloAST * expr1, PabloAST * expr2, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Or, type, BOOLEAN_CANONICALIZE(expr1, expr2), name, allocator)
+    Or(llvm::Type * const type, PabloAST * expr1, PabloAST * expr2, const String * name)
+    : Statement(ClassTypeId::Or, type, BOOLEAN_CANONICALIZE(expr1, expr2), name)
     {
 
     }
@@ -57,8 +57,8 @@ public:
         return false;
     }
 protected:
-    Xor(llvm::Type * const type, PabloAST * expr1, PabloAST * expr2, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Xor, type, BOOLEAN_CANONICALIZE(expr1, expr2), name, allocator)
+    Xor(llvm::Type * const type, PabloAST * expr1, PabloAST * expr2, const String * name)
+    : Statement(ClassTypeId::Xor, type, BOOLEAN_CANONICALIZE(expr1, expr2), name)
     {
 
     }
@@ -79,8 +79,8 @@ public:
         return getOperand(0);
     }
 protected:
-    Not(PabloAST * expr, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Not, expr->getType(), {expr}, name, allocator)
+    Not(PabloAST * expr, const String * name)
+    : Statement(ClassTypeId::Not, expr->getType(), {expr}, name)
     {
 
     }
@@ -107,8 +107,8 @@ public:
         return getOperand(2);
     }
 protected:
-    Sel(PabloAST * condExpr, PabloAST * trueExpr, PabloAST * falseExpr, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Sel, trueExpr->getType(), {condExpr, trueExpr, falseExpr}, name, allocator) {
+    Sel(PabloAST * condExpr, PabloAST * trueExpr, PabloAST * falseExpr, const String * name)
+    : Statement(ClassTypeId::Sel, trueExpr->getType(), {condExpr, trueExpr, falseExpr}, name) {
 
     }
 };
@@ -141,8 +141,8 @@ public:
         return getOperand(3);
     }
 protected:
-    Ternary(PabloAST * mask, PabloAST * a, PabloAST * b, PabloAST * c, const String * name, Allocator & allocator)
-    : Statement(ClassTypeId::Ternary, a->getType(), {mask, a, b, c}, name, allocator) {
+    Ternary(PabloAST * mask, PabloAST * a, PabloAST * b, PabloAST * c, const String * name)
+    : Statement(ClassTypeId::Ternary, a->getType(), {mask, a, b, c}, name) {
         assert(llvm::isa<Integer>(mask));
         assert(llvm::cast<Integer>(mask)->value() <= 0xFF);
     }

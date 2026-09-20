@@ -299,7 +299,7 @@ void UnicodeLinesLogic(kernel::PipelineBuilder & P,
     Kernel * k = P.CreateKernelCall<UnicodeLinesKernelBuilder>
          (Basis, LF, UnicodeLB, u8index, m, nullMode, signalNullObject);
     if (nullMode == NullCharMode::Abort) {
-        k->link("signal_dispatcher", kernel::signal_dispatcher);
+        P.LinkFunction(k, "signal_dispatcher", kernel::signal_dispatcher);
     }
 }
 

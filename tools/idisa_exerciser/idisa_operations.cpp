@@ -175,7 +175,7 @@ class DummyCheckKernel : public Kernel {
                  {Binding{OperationConfig::failureCountIdent, failureCount}}, {}) {}
 
   protected:
-    void generateKernelMethod(KernelBuilder &b) override {}
+    void generateKernelMethod(KernelBuilder &b, llvm::TargetMachine *) override {}
 
     void generateFinalizeMethod(KernelBuilder &b) override {
         b.setScalarField(OperationConfig::failureCountIdent, b.getSize(0));

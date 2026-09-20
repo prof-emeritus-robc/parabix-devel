@@ -24,8 +24,8 @@ public:
         return getOperand(0);
     }
 protected:
-    explicit Count(PabloAST * expr, const String * name, llvm::Type * type, Allocator & allocator)
-    : Statement(ClassTypeId::Count, type, {expr}, name, allocator) {
+    explicit Count(PabloAST * expr, const String * name, llvm::Type * type)
+    : Statement(ClassTypeId::Count, type, {expr}, name) {
 
     }
 private:

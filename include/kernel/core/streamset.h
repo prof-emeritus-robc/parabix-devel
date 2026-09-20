@@ -8,6 +8,8 @@
 #include <llvm/IR/Type.h>  // for Type
 #include <llvm/IR/DerivedTypes.h>  // for Type
 #include <boost/rational.hpp>
+#include <kernel/core/kernel.h>
+#include <kernel/core/kernel_builder.h>
 
 namespace IDISA { class IDISA_Builder; }
 namespace llvm { class Value; }
@@ -15,7 +17,6 @@ namespace llvm { class Constant; }
 
 namespace kernel {
 
-class Kernel;
 class PipelineKernel;
 class KernelBuilder;
 
@@ -29,6 +30,15 @@ public:
         , FdBackedDynamicBuffer
     };
 
+
+    struct StreamSetShape {
+        const size_t FieldWidth;
+        const size_t ElementCount;
+        const size_t AddressSpace;
+        StreamSetShape(size_t fw, size_t ec, size_t as)
+        : FieldWidth(fw), ElementCount(ec), AddressSpace(as) {}
+    };
+
     using Rational = boost::rational<size_t>;
 
     using ScalarRef = std::pair<llvm::Value *, llvm::Type *>;
@@ -37,21 +47,13 @@ public:
         return mBufferKind;
     }
 
-    llvm::Type * getType() const {
-        return mType;
-    }
-
-    llvm::Type * getBaseType() const {
-        return mBaseType;
-    }
+    llvm::Type * getType(KernelBuilder & b) const __attribute__((const));
 
     unsigned getAddressSpace() const {
-        return mAddressSpace;
+        return mShape.AddressSpace;
     }
 
-    __attribute__((const)) llvm::PointerType * getPointerType()  const {
-        return llvm::PointerType::get(getType()->getContext(), getAddressSpace());
-    }
+    llvm::PointerType * getPointerType(kernel::KernelBuilder & b)  const;
 
     bool isLinear() const {
         return mLinear;
@@ -83,7 +85,6 @@ public:
 
     void setHandle(ScalarRef handle) const {
         mHandle = handle.first;
-        assert (handle.second == mHandleType);
     }
 
     virtual void allocateBuffer(kernel::KernelBuilder & b, llvm::Value * const capacityMultiplier, llvm::Value * reportCallback, llvm::Value * pipelineHandle, llvm::Value * portNum) = 0;
@@ -95,7 +96,9 @@ public:
 
     virtual llvm::Value * getLinearlyWritableItems(kernel::KernelBuilder & b, llvm::Value * fromPosition, llvm::Value * consumedItems, llvm::Value * requiredOverflow) const = 0;
 
-    virtual llvm::StructType * getHandleType(kernel::KernelBuilder & b) const = 0;
+    virtual llvm::StructType * getHandleType(kernel::KernelBuilder & b) const __attribute__((const)) = 0;
+
+    llvm::PointerType * getHandlePointerType(kernel::KernelBuilder & b) const;
 
     virtual llvm::Value * getStreamBlockPtr(kernel::KernelBuilder & b, llvm::Value * baseAddress, llvm::Value * streamIndex, llvm::Value * blockIndex) const;
 
@@ -125,7 +128,7 @@ public:
 
     virtual llvm::Value * reserveCapacity(kernel::KernelBuilder & b, llvm::Value * produced, llvm::Value * consumed, llvm::Value * required, llvm::Value * reportCallback, llvm::Value * pipelineHandle, llvm::Value * portNum) const = 0;
 
-    static llvm::Type * resolveType(kernel::KernelBuilder & b, llvm::Type * const streamSetType);
+    static StreamSetShape resolveType(llvm::Type * const streamSetType, size_t AddressSpace);
 
     static void linkFunctions(kernel::KernelBuilder & b); // temporary function
 
@@ -146,10 +149,8 @@ protected:
     // Each StreamSetBuffer object is local to the Kernel (or pipeline) object at (pre-JIT) "compile time" but
     // by sharing the same handle will refer to the same stream set at (post-JIT) run time.
     mutable llvm::Value *           mHandle;
-    llvm::Type * const              mType;
-    llvm::Type * const              mBaseType;
-    mutable llvm::StructType *      mHandleType;
-    const unsigned                  mAddressSpace;
+//    llvm::Type * const              mType;
+    const StreamSetShape            mShape;
     const bool                      mLinear;
 };
 
@@ -172,8 +173,6 @@ public:
     llvm::Value * getLinearlyAccessibleItems(kernel::KernelBuilder & b, llvm::Value * fromPosition, llvm::Value * totalItems, llvm::Value * requiredOverflow) const override;
 
     llvm::Value * getLinearlyWritableItems(kernel::KernelBuilder & b, llvm::Value * fromPosition, llvm::Value * consumedItems, llvm::Value * requiredOverflow) const override;
-
-    static llvm::StructType * getExternalHandleType(kernel::KernelBuilder & b);
 
     llvm::StructType * getHandleType(kernel::KernelBuilder & b) const override;
 

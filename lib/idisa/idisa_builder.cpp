@@ -1597,7 +1597,8 @@ Constant * IDISA_Builder::bit_interleave_byteshuffle_table(unsigned fw) {
 
 IDISA_Builder::IDISA_Builder(LLVMContext & C, const FeatureSet &featureSet, unsigned nativeVectorWidth,
                              unsigned vectorWidth, unsigned laneWidth, unsigned maxShiftFw, unsigned minShiftFw)
-: CBuilder(C)
+: IRBuilder<>(C)
+, CBuilder(C)
 , mNativeBitBlockWidth(nativeVectorWidth)
 , mBitBlockWidth(vectorWidth)
 , mLaneWidth(laneWidth)

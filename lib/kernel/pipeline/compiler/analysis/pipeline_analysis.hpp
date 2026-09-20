@@ -91,7 +91,7 @@ public:
 
         P.determineInitialThreadLocalBufferLayout(b, rng);
 
-        P.scanFamilyKernelBindings();
+        P.scanFamilyKernelBindings(b);
 
         P.setStreamSetLockIds();
 
@@ -102,7 +102,6 @@ public:
         P.gatherInfo();
 
         if (codegen::InfoOptionIsSet(codegen::PrintPipelineGraph)) {
-            assert (b.getModule() == pipelineKernel->getModule());
             P.printBufferGraph(b, errs());
         }
 
@@ -250,7 +249,7 @@ private:
 
     // Family analysis functions
 
-    void scanFamilyKernelBindings();
+    void scanFamilyKernelBindings(KernelBuilder & b);
 
     // Internally generated streamsets
 

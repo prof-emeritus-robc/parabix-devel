@@ -1,14 +1,11 @@
 #pragma once
-#include <kernel/pipeline/driver/driver.h>
-#include <toolchain/toolchain.h>
-namespace llvm { class ExecutionEngine; }
-namespace llvm { class raw_fd_ostream; }
-namespace llvm { class ModulePass; }
-namespace kernel { class KernelBuilder; }
 
-#include <llvm/IR/LegacyPassManager.h>
+#include <kernel/pipeline/driver/driver.h>
+#include <kernel/pipeline/driver/cpu_jit_backend.h>
+#include <memory>
 
 class CPUDriver final : public BaseDriver {
+
 public:
 
     CPUDriver(std::string && moduleName);
@@ -19,21 +16,11 @@ public:
 
     void * finalizeObject(kernel::Kernel * const pipeline) override;
 
-    bool hasExternalFunction(const llvm::StringRef functionName) const override;
+    llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) final;
 
-    llvm::ModulePass * createTracePass(kernel::KernelBuilder * kb, llvm::StringRef to_trace);
-
-private:
-
-    void preparePassManager();
-
-    llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const override;
+    bool HasExternalFunction(llvm::StringRef unmangledName) const final;
 
 private:
-    std::unique_ptr<llvm::raw_fd_ostream>                   mUnoptimizedIROutputStream;
-    std::unique_ptr<llvm::raw_fd_ostream>                   mIROutputStream;
-    std::unique_ptr<llvm::raw_fd_ostream>                   mASMOutputStream;
-    std::vector<std::pair<llvm::Function *, void *>>        mCachedFunctionMappings;
-    std::unique_ptr<llvm::ExecutionEngine>                  mEngine;
+
+    std::unique_ptr<CPUJITBackend>                          mBackend;
 };
-

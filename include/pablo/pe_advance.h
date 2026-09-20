@@ -28,8 +28,8 @@ public:
         return llvm::cast<Integer>(getOperand(1))->value();
     }
 protected:
-    Advance(PabloAST * expr, PabloAST * shiftAmount, const String * name, Allocator & allocator)
-    : CarryProducingStatement(ClassTypeId::Advance, expr->getType(), {expr, shiftAmount}, name, allocator) {
+    Advance(PabloAST * expr, PabloAST * shiftAmount, const String * name)
+    : CarryProducingStatement(ClassTypeId::Advance, expr->getType(), {expr, shiftAmount}, name) {
         assert(llvm::isa<Integer>(shiftAmount));
     }
 };
@@ -55,8 +55,8 @@ public:
         return llvm::cast<Integer>(getOperand(2))->value();
     }
 protected:
-    IndexedAdvance(PabloAST * strm, PabloAST * index_strm, PabloAST * shiftAmount, const String * name, Allocator & allocator)
-    : CarryProducingStatement(ClassTypeId::IndexedAdvance, strm->getType(), {strm, index_strm, shiftAmount}, name, allocator) {
+    IndexedAdvance(PabloAST * strm, PabloAST * index_strm, PabloAST * shiftAmount, const String * name)
+    : CarryProducingStatement(ClassTypeId::IndexedAdvance, strm->getType(), {strm, index_strm, shiftAmount}, name) {
         assert(llvm::isa<Integer>(shiftAmount));
     }
 };

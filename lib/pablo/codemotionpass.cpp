@@ -175,7 +175,7 @@ struct CodeMotionPassContainer {
             }
             mUsers.clear();
         } else { // test whether the LCA scope is nested within this scope.
-            PabloBlock * temp = scope;
+            PabloBlock * temp = scope; assert (scope);
             for (;;) {
                 temp = temp->getPredecessor();
                 if (temp == nullptr) {

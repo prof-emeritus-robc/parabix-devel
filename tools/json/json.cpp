@@ -204,7 +204,7 @@ jsonFunctionType json_parsing_gen(
         StreamSet * const Errs = su::Collapse(P, Errors);
         auto simpleErrFn = SCAN_CALLBACK(postproc_parensError);
 
-        Scalar * const errCount = P.CreateScalar(P.getInt64Ty());
+        Scalar * const errCount = P.CreateScalar(P.getTypeSystem().getInt64Ty());
         P.CreateKernelCall<PopcountKernel>(Errs, errCount);
         P.CreateCall(simpleErrFn.name, *simpleErrFn.func, { errCount });
 

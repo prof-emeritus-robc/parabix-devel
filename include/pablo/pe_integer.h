@@ -20,8 +20,8 @@ public:
     }
     virtual ~Integer(){ }
 protected:
-    Integer(const IntTy value, llvm::Type * type, Allocator & allocator) noexcept
-    : PabloAST(ClassTypeId::Integer, type, allocator)
+    Integer(const IntTy value, llvm::Type * type) noexcept
+    : PabloAST(ClassTypeId::Integer, type)
     , mValue(value)
     {
 

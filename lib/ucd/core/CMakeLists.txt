@@ -10,4 +10,5 @@ SRC
     unicode_set.cpp
 DEPS
     toolchain
+    slaballocator
 )

@@ -78,7 +78,7 @@ set(PARABIX_TARGETS_TO_BUILD X86)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_X86_TARGET")
 endif()
 
-llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} mcjit native IRReader Linker IRPrinter Passes)
+llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} orcjit jitlink mcjit native IRReader Linker IRPrinter Passes)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 link_directories(${LLVM_LIBRARY_DIRS})
@@ -375,6 +375,7 @@ if(ARTIFACT_MODE STREQUAL "Single")
 endif()
 
 # Framework Libraries
+add_subdirectory(lib/allocator)
 add_subdirectory(lib/fileselect)
 add_subdirectory(lib/grep)
 add_subdirectory(lib/idisa)

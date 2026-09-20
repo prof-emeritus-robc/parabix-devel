@@ -12,11 +12,11 @@
 #include <re/adt/re_re.h>
 #include <re/adt/re_empty_set.h>
 #include <ucd/core/unicode_set.h>
-#include <util/slab_allocator.h>
+#include <llvm/ADT/SmallVector.h>
 
 namespace re {
 
-class Seq : public RE, public std::vector<RE*, ProxyAllocator<RE *>> {
+class Seq : public RE, public std::vector<RE*, StdSlabAllocatorProxy<RE *>> {
 public:
     static inline bool classof(const RE * re) {
         return re->getClassTypeId() == ClassTypeId::Seq;
@@ -27,10 +27,10 @@ public:
 protected:
     friend Seq * makeSeq();
     template<typename iterator> friend RE * makeSeq(const iterator, const iterator);
-    Seq() : RE(ClassTypeId::Seq), std::vector<RE*, ProxyAllocator<RE *>>(mAllocator) {}
+    Seq() : RE(ClassTypeId::Seq), std::vector<RE*, StdSlabAllocatorProxy<RE *>>() {}
     template<typename iterator>
     Seq(const iterator begin, const iterator end)
-    : RE(ClassTypeId::Seq), std::vector<RE*, ProxyAllocator<RE *>>(begin, end, mAllocator) { }
+    : RE(ClassTypeId::Seq), std::vector<RE*, StdSlabAllocatorProxy<RE *>>(begin, end) { }
 };
 
 inline Seq * makeSeq() {

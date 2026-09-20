@@ -1,11 +1,11 @@
 #pragma once
 
 #include <codegen/FunctionTypeBuilder.h>
-#include <codegen/LLVMTypeSystemInterface.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
+#include <llvm/ExecutionEngine/Orc/SymbolStringPool.h>
+#include <llvm/ADT/StringSet.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/relationship.h>
-#include <util/slab_allocator.h>
 #include <llvm/IR/Constants.h>
 #include <kernel/illustrator/illustrator.h>
 #include <string>
@@ -23,12 +23,14 @@ namespace kernel {template<typename ... Args> class TypedProgramBuilder; }
 class CBuilder;
 class ParabixObjectCache;
 
-class BaseDriver : public LLVMTypeSystemInterface {
+class BaseDriver : public FunctionLinkCallback {
     friend class CBuilder;
     friend class kernel::PipelineAnalysis;
     friend class kernel::PipelineBuilder;
     friend class kernel::ProgramBuilder;
     friend class kernel::Kernel;
+    friend class OrcJITBackend;
+    friend class MCJITBackend;
     template<typename ... Args> friend class kernel::TypedProgramBuilder;
 
 public:
@@ -40,17 +42,11 @@ public:
 
     void addKernel(not_null<Kernel *> kernel);
 
-    virtual bool hasExternalFunction(const llvm::StringRef functionName) const = 0;
-
     virtual void generateUncachedKernels() = 0;
 
     virtual void * finalizeObject(kernel::Kernel * pipeline) = 0;
 
     virtual ~BaseDriver();
-
-    llvm::LLVMContext & getContext() const final {
-        return *mContext.get();
-    }
 
     bool getPreservesKernels() const {
         return mPreservesKernels;
@@ -60,11 +56,22 @@ public:
         mPreservesKernels = value;
     }
 
-    unsigned getBitBlockWidth() const final;
-
-    llvm::TargetMachine * getTargetMachine() {
-        return mTarget.get();
+    const std::unique_ptr<kernel::KernelBuilder> & getMainBuilder() const {
+        return mBuilder;
     }
+
+    llvm::LLVMContext & getContext() {
+        return *mContext;
+    }
+
+    const llvm::LLVMContext & getContext() const {
+        return *mContext;
+    }
+
+    static void runAllOptimizationPasses(kernel::KernelBuilder & b, kernel::Kernel::SelectedOptimizationPasses & passes,
+                                         llvm::TargetMachine * TM,
+                                         llvm::SmallVector<char, 0> & UnoptimizedIROutput,
+                                         llvm::SmallVector<char, 0> & OptimizedIROutput);
 
 protected:
 
@@ -82,30 +89,16 @@ protected:
 
     kernel::Scalar * CreateCommandLineScalar(kernel::CommandLineScalarType type) noexcept;
 
-    llvm::VectorType * getBitBlockType() const final;
-
-    llvm::VectorType * getStreamTy(const unsigned FieldWidth = 1) final;
-
-    llvm::ArrayType * getStreamSetTy(const unsigned NumElements = 1, const unsigned FieldWidth = 1) final;
-
 protected:
 
     BaseDriver(std::string && moduleName);
 
-    template <typename ExternalFunctionType>
-    void LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) const;
-
-    virtual llvm::Function * addLinkFunction(llvm::Module * mod, llvm::StringRef name, llvm::FunctionType * type, void * functionPtr) const = 0;
-
-    kernel::KernelBuilder & getBuilder() {
-        return *mBuilder;
-    }
-
 protected:
 
-    std::unique_ptr<llvm::LLVMContext>                      mContext;
-    std::unique_ptr<llvm::TargetMachine>                    mTarget;
+    llvm::LLVMContext * const                               mContext;
+
     llvm::Module * const                                    mMainModule;
+
     std::unique_ptr<kernel::KernelBuilder>                  mBuilder;
     std::unique_ptr<ParabixObjectCache>                     mObjectCache;
 
@@ -114,11 +107,5 @@ protected:
     KernelSet                                               mCachedKernel;
     KernelSet                                               mCompiledKernel;
     KernelSet                                               mPreservedKernel;
-    SlabAllocator<>                                         mAllocator;
 };
-
-template <typename ExternalFunctionType>
-void BaseDriver::LinkFunction(not_null<Kernel *> kernel, llvm::StringRef name, ExternalFunctionType & functionPtr) const {
-    kernel->link<ExternalFunctionType>(name, functionPtr);
-}
 

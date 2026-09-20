@@ -1333,19 +1333,22 @@ std::pair<Value *, Value *> IDISA_AVX512F_Builder::bitblock_advance(Value * a, V
 }
 
 IDISA_AVX_Builder::IDISA_AVX_Builder(LLVMContext & C, const FeatureSet & featureSet, unsigned vectorWidth, unsigned laneWidth)
-: IDISA_Builder(C, featureSet, AVX_width, vectorWidth, laneWidth)
+: llvm::IRBuilder<>(C)
+, IDISA_Builder(C, featureSet, AVX_width, vectorWidth, laneWidth)
 , IDISA_SSE2_Builder(C, featureSet, vectorWidth, laneWidth) {
 
 }
 
 IDISA_AVX2_Builder::IDISA_AVX2_Builder(LLVMContext & C, const FeatureSet & featureSet, unsigned vectorWidth, unsigned laneWidth)
-: IDISA_Builder(C, featureSet, AVX_width, vectorWidth, laneWidth)
+: llvm::IRBuilder<>(C)
+, IDISA_Builder(C, featureSet, AVX_width, vectorWidth, laneWidth)
 , IDISA_AVX_Builder(C, featureSet, vectorWidth, laneWidth) {
 
 }
 
 IDISA_AVX512F_Builder::IDISA_AVX512F_Builder(LLVMContext & C, const FeatureSet & featureSet, unsigned vectorWidth, unsigned laneWidth)
-: IDISA_Builder(C, featureSet, AVX512_width, vectorWidth, laneWidth)
+: llvm::IRBuilder<>(C)
+, IDISA_Builder(C, featureSet, AVX512_width, vectorWidth, laneWidth)
 , IDISA_AVX2_Builder(C, featureSet, vectorWidth, laneWidth) {
 
 }

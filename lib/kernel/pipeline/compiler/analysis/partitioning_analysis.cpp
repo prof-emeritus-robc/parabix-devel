@@ -1,7 +1,6 @@
 #include "pipeline_analysis.hpp"
 #include "lexographic_ordering.hpp"
 #include <toolchain/toolchain.h>
-#include <util/slab_allocator.h>
 
 // #define PRINT_GRAPH_BITSETS
 

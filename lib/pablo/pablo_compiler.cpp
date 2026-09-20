@@ -242,7 +242,8 @@ void PabloCompiler::examineBlock(KernelBuilder & b, const PabloBlock * const blo
             ++mBranchCount;
             examineBlock(b, cast<Branch>(stmt)->getBody());
         } else if (LLVM_UNLIKELY(isa<Count>(stmt))) {
-            mKernel->addInternalScalar(stmt->getType(), stmt->getName().str());
+            Type * const type = CBuilder::convertTypeToLLVMContext(b.getContext(), stmt->getType());
+            mKernel->addInternalScalar(type, stmt->getName().str());
         } else if (LLVM_UNLIKELY(isa<EveryNth>(stmt))) {
             const auto fieldWidth = b.getSizeTy()->getBitWidth();
             mKernel->addInternalScalar(b.getIntNTy(fieldWidth), stmt->getName().str());
@@ -750,8 +751,8 @@ void PabloCompiler::compileStatement(KernelBuilder & b, const Statement * const 
                 value = b.CreateBitCast(value, b.getBitBlockType());
             }
         } else if (const Repeat * const s = dyn_cast<Repeat>(stmt)) {
-            value = compileExpression(b, s->getValue());
-            Type * const ty = s->getType();
+            value = compileExpression(b, s->getValue()); 
+            Type * const ty = CBuilder::convertTypeToLLVMContext(b.getContext(), s->getType());
             if (LLVM_LIKELY(ty->isVectorTy())) {
                 const auto repeatWidth = value->getType()->getIntegerBitWidth();
                 value = b.bitCast(b.simd_fill(repeatWidth, value));
@@ -780,7 +781,7 @@ void PabloCompiler::compileStatement(KernelBuilder & b, const Statement * const 
                 }
                 b.CreateStore(P, b.CreateGEP(bt, value, {ZERO, b.getInt32(i)}));
             }
-        } else if (const PackL * const p = dyn_cast<PackL>(stmt)) {
+        } else if (const PackL * const p = dyn_cast<PackL>(stmt)) {   
             const auto sourceWidth = cast<FixedVectorType>(p->getValue()->getType())->getElementType()->getIntegerBitWidth();
             const auto packWidth = p->getFieldWidth()->value();
             assert (sourceWidth == packWidth);
@@ -932,7 +933,8 @@ Value * PabloCompiler::compileExpression(KernelBuilder & b, const PabloAST * con
         value = f->second;
     } else {
         if (isa<Integer>(expr)) {
-            value = ConstantInt::get(cast<Integer>(expr)->getType(), cast<Integer>(expr)->value());
+            Type * intTy = CBuilder::convertTypeToLLVMContext(b.getContext(), cast<Integer>(expr)->getType());
+            value = ConstantInt::get(intTy, cast<Integer>(expr)->value());
         } else if (isa<Zeroes>(expr)) {
             value = b.allZeroes();
         } else if (LLVM_UNLIKELY(isa<Ones>(expr))) {
@@ -1142,7 +1144,7 @@ Value * PabloCompiler::compileExpression(KernelBuilder & b, const PabloAST * con
     if (LLVM_UNLIKELY(value->getType()->isPointerTy() && ensureLoaded)) {
 
         size_t align = 0;
-        Type * type = expr->getType();
+        Type * type = CBuilder::convertTypeToLLVMContext(b.getContext(), expr->getType());
         if (type->isIntegerTy()) {
             align = cast<IntegerType>(type)->getBitWidth() / 8;
         } else {
@@ -1216,10 +1218,8 @@ Value * PabloCompiler::getPointerToVar(KernelBuilder & b, const Var * var, Value
         if (index2) {
             offsets.push_back(index2);
         }
-        Type * type = var->getType();
-        if (type->isVectorTy()) {
-            type = kernel::StreamSetBuffer::resolveType(b, type);
-        }
+
+        Type * type = CBuilder::convertTypeToLLVMContext(b.getContext(), var->getType());
         return b.CreateGEP(type, ptr, offsets);
     }
 }

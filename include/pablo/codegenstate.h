@@ -375,11 +375,10 @@ public:
 
 protected:
 
-    PabloBlock(PabloKernel * const parent, Allocator & allocator) noexcept
-    : PabloAST(PabloAST::ClassTypeId::Block, nullptr, allocator)
+    PabloBlock(PabloKernel * const parent) noexcept
+    : PabloAST(PabloAST::ClassTypeId::Block, nullptr)
     , mParent(parent)
-    , mBranch(nullptr)
-    , mAllocator(allocator) {
+    , mBranch(nullptr) {
 
     }
 
@@ -394,7 +393,6 @@ protected:
 private:
     PabloKernel * const         mParent;
     Branch *                    mBranch;
-    Allocator &                 mAllocator;
 };
 
 }

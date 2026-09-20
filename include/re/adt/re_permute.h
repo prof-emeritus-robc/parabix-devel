@@ -8,11 +8,10 @@
 #include <vector>
 #include <llvm/Support/Casting.h>
 #include <re/adt/re_re.h>
-#include <util/slab_allocator.h>
 
 namespace re {
 
-class Permute : public RE, public std::vector<RE*, ProxyAllocator<RE *>> {
+class Permute : public RE, public std::vector<RE*, StdSlabAllocatorProxy<RE *>> {
 public:
     static inline bool classof(const RE * re) {
         return re->getClassTypeId() == ClassTypeId::Permute;
@@ -23,10 +22,10 @@ public:
     template<typename iterator> static Permute * Create(const iterator begin, const iterator end) {return new Permute(begin, end);}
 protected:
     template<typename iterator> friend RE * makePermute(iterator, iterator);
-    Permute() : RE(ClassTypeId::Permute), std::vector<RE*, ProxyAllocator<RE *>>(mAllocator) {}
+    Permute() : RE(ClassTypeId::Permute), std::vector<RE*, StdSlabAllocatorProxy<RE *>>() {}
     template<typename iterator>
     Permute(const iterator begin, const iterator end)
-    : RE(ClassTypeId::Permute), std::vector<RE*, ProxyAllocator<RE *>>(begin, end, mAllocator) { }
+    : RE(ClassTypeId::Permute), std::vector<RE*, StdSlabAllocatorProxy<RE *>>(begin, end) { }
 };
 
 template<typename iterator>
@@ -38,7 +37,7 @@ inline RE * makePermute(std::initializer_list<RE *> list) {
     return makePermute(list.begin(), list.end());
 }
 
-class Interleavable : public RE, public std::vector<RE*, ProxyAllocator<RE *>> {
+class Interleavable : public RE, public std::vector<RE*, StdSlabAllocatorProxy<RE *>> {
 public:
     static inline bool classof(const RE * re) {
         return re->getClassTypeId() == ClassTypeId::Interleavable;
@@ -49,10 +48,10 @@ public:
     template<typename iterator> static Interleavable * Create(const iterator begin, const iterator end) {return new Interleavable(begin, end);}
 protected:
     template<typename iterator> friend RE * makeInterleavable(iterator, iterator);
-    Interleavable() : RE(ClassTypeId::Interleavable), std::vector<RE*, ProxyAllocator<RE *>>(mAllocator) {}
+    Interleavable() : RE(ClassTypeId::Interleavable), std::vector<RE*, StdSlabAllocatorProxy<RE *>>() {}
     template<typename iterator>
     Interleavable(const iterator begin, const iterator end)
-    : RE(ClassTypeId::Interleavable), std::vector<RE*, ProxyAllocator<RE *>>(begin, end, mAllocator) { }
+    : RE(ClassTypeId::Interleavable), std::vector<RE*, StdSlabAllocatorProxy<RE *>>(begin, end) { }
 };
 
 template<typename iterator>

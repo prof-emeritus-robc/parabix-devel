@@ -36,7 +36,7 @@ public:
         return mCondition;
     }
 
-    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) const final;
+    std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
 protected:
 
@@ -50,8 +50,6 @@ protected:
                        Bindings && scalar_inputs,
                        Bindings && scalar_outputs);
 
-    void addKernelDeclarations(KernelBuilder & b) override;
-
     void addInternalProperties(KernelBuilder & b) override;
 
     void generateAllocateSharedInternalStreamSetsMethod(KernelBuilder & b, llvm::Value * expectedNumOfStrides) override;
@@ -62,7 +60,7 @@ protected:
 
     void generateInitializeThreadLocalMethod(KernelBuilder & b) override;
 
-    void generateKernelMethod(KernelBuilder & b) override;
+    void generateKernelMethod(KernelBuilder & b, llvm::TargetMachine * TM) override;
 
     void generateFinalizeThreadLocalMethod(KernelBuilder & b) override;
 

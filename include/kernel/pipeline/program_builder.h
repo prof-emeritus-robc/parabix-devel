@@ -385,7 +385,7 @@ private:
         assert (config.OutputStreamSets.size() == outputStreamSetCount);
 
         PipelineKernel * const pipeline =
-            new PipelineKernel(driver,
+            new PipelineKernel(*driver.getMainBuilder(),
                                std::move(config.Signature),
                                std::move(config.Attributes),
                                std::move(config.InputStreamSets), std::move(config.OutputStreamSets),
@@ -441,7 +441,7 @@ constexpr bool ordering_constraints() {
 } /* end of anonymous namespace */
 
 template<typename ... Args>
-TypedProgramBuilder<Args...> CreatePipeline(BaseDriver & driver, Args... args) {
+TypedProgramBuilder<Args...> CreatePipeline(::BaseDriver & driver, Args... args) {
     static_assert(ordering_constraints<0, Args...>(),
     "Program I/O orderings must be ordered in <Signature??, <Input StreamSet>*, <Output StreamSet>*, <Input Scalar>*, <Output Scalar>*, <Pipeline Attribute>*.");
     return TypedProgramBuilder<Args...>{driver, std::forward<Args>(args)...};

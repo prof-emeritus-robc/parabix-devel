@@ -8,7 +8,7 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/Compiler.h>
 #include <boost/iterator/iterator_facade.hpp>
-#include <util/slab_allocator.h>
+#include <allocator/threadsafe_slaballocator.h>
 #include <type_traits>
 #include <vector>
 namespace llvm { class Type; }
@@ -20,7 +20,7 @@ namespace pablo { class String; }
 
 namespace pablo {
 
-class PabloAST {
+class PabloAST : public SlabAllocatedObject {
     #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
     static size_t __AST_NODE_COUNT;
     #endif
@@ -34,8 +34,9 @@ class PabloAST {
     friend class Operator;
 public:
 
-    using Allocator = SlabAllocator<PabloAST *>;
-    using Users = std::vector<PabloAST *, ProxyAllocator<PabloAST *>>;
+    USE_SLAB_ALLOCATED_OBJECT_MEMORY_OPERATORS
+
+    using Users = std::vector<PabloAST *, StdSlabAllocatorProxy<PabloAST *>>;
     using user_iterator = Users::iterator;
     using const_user_iterator = Users::const_iterator;
 
@@ -157,14 +158,6 @@ public:
         mSideEffecting = value;
     }
 
-    void * operator new (std::size_t size, Allocator & allocator) noexcept {
-        return allocator.allocate<uint8_t>(size);
-    }
-
-//    void operator delete (void * ptr) {
-//        mAllocator.deallocate(static_cast<Allocator::value_type *>(ptr));
-//    }
-
     void print(llvm::raw_ostream & O) const;
 
     #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
@@ -173,7 +166,7 @@ public:
 
 protected:
 
-    PabloAST(const ClassTypeId id, llvm::Type * const type, Allocator & allocator) noexcept
+    PabloAST(const ClassTypeId id, llvm::Type * const type) noexcept
     : mClassTypeId(id)
     #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
     , mNodeId(__AST_NODE_COUNT++)
@@ -189,7 +182,7 @@ protected:
                 return false;
         }
     }())
-    , mUsers(allocator) {
+    , mUsers() {
         #ifndef NDEBUG
         // is nullary type?
         switch (id) {
@@ -244,8 +237,8 @@ public:
     virtual const String & getName() const = 0;
     void setName(const String * const name);
 protected:
-    explicit NamedPabloAST(const ClassTypeId id, llvm::Type * const type, const String * const name, Allocator & allocator)
-    : PabloAST(id, type, allocator)
+    explicit NamedPabloAST(const ClassTypeId id, llvm::Type * const type, const String * const name)
+    : PabloAST(id, type)
     , mName(name) {
 
     }
@@ -307,10 +300,10 @@ public:
 
 protected:
 
-    explicit Statement(const ClassTypeId id, llvm::Type * const type, std::initializer_list<PabloAST *> operands, const String * const name, Allocator & allocator)
-    : NamedPabloAST(id, type, name, allocator)
+    explicit Statement(const ClassTypeId id, llvm::Type * const type, std::initializer_list<PabloAST *> operands, const String * const name)
+    : NamedPabloAST(id, type, name)
     , mOperands(operands.size())
-    , mOperand(allocator.allocate(mOperands))
+    , mOperand(ThreadSafeSlabAllocator::allocate_array_of<PabloAST *>(mOperands))
     , mNext(nullptr)
     , mPrev(nullptr)
     , mParent(nullptr) {
@@ -323,10 +316,10 @@ protected:
         }
     }
 
-    explicit Statement(const ClassTypeId id, llvm::Type * const type, std::vector<PabloAST *> operands, const String * const name, Allocator & allocator)
-    : NamedPabloAST(id, type, name, allocator)
+    explicit Statement(const ClassTypeId id, llvm::Type * const type, std::vector<PabloAST *> operands, const String * const name)
+    : NamedPabloAST(id, type, name)
     , mOperands(operands.size())
-    , mOperand(allocator.allocate(mOperands))
+    , mOperand(ThreadSafeSlabAllocator::allocate_array_of<PabloAST *>(mOperands))
     , mNext(nullptr)
     , mPrev(nullptr)
     , mParent(nullptr) {
@@ -390,8 +383,8 @@ public:
 
 protected:
 
-    explicit CarryProducingStatement(const ClassTypeId id, llvm::Type * const type, std::initializer_list<PabloAST *> operands, const String * const name, Allocator & allocator)
-    : Statement(id, type, operands, name, allocator)
+    explicit CarryProducingStatement(const ClassTypeId id, llvm::Type * const type, std::initializer_list<PabloAST *> operands, const String * const name)
+    : Statement(id, type, operands, name)
     , mCarryGroup(0)
     , mCarryWidth(0) {
 

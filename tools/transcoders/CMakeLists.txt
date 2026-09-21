@@ -111,7 +111,7 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.unicode
+    kernel.unicode.normalization
     re.cc
     toolchain
 )
@@ -129,7 +129,7 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.unicode
+    kernel.unicode.normalization
     re.cc
     toolchain
 )
@@ -147,7 +147,7 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.unicode
+    kernel.unicode.normalization
     re.cc
     toolchain
 )

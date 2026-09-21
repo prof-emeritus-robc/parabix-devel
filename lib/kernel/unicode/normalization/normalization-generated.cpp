@@ -8,7 +8,7 @@
  *  normalization-generated
  */
 
-#include <kernel/unicode/normalization.h>
+#include <kernel/unicode/normalization/normalization.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/algo/normalization.h>

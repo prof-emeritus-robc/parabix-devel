@@ -3,7 +3,7 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
-#include <kernel/unicode/normalization.h>
+#include <kernel/unicode/normalization/normalization.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/algo/normalization.h>
 #include <ucd/utf/utf_compiler.h>

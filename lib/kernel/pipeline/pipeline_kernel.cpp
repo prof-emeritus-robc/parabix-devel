@@ -402,6 +402,26 @@ Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuild
  * @brief runOptimizationPasses
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineKernel::addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const {
+
+    // Bracket the builder's "current compiler" for the duration of this call, matching
+    // addOrDeclareMainFunction()/Kernel::generateKernel(). This is invoked after
+    // generateKernel() returns, and generateKernel() already restored b's compiler to
+    // whatever it held before (typically null) by then, so without this bracket
+    // COMPILER resolves to null here -- a null-pointer dereference that only actually
+    // touches memory (and so only actually crashes) once there are real optimization
+    // passes to add, i.e. under any non-default --optimization-level/
+    // --backend-optimization-level.
+    struct CompilerScope {
+        const PipelineKernel * const Self;
+        KernelBuilder & B;
+        KernelCompiler * const Prior;
+        CompilerScope(const PipelineKernel * const self, KernelBuilder & b, KernelCompiler * const compiler)
+        : Self(self), B(b), Prior(b.getCompiler()) {
+            Self->setBuilderCompiler(B, compiler);
+        }
+        ~CompilerScope() { Self->setBuilderCompiler(B, Prior); }
+    } compilerScope(this, b, mCompiler.get());
+
     COMPILER->addOptimizationPasses(b, passes);
 }
 

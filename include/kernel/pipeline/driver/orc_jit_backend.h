@@ -1,7 +1,9 @@
 #pragma once
 
 #include <kernel/pipeline/driver/cpu_jit_backend.h>
-#include <llvm/ExecutionEngine/Orc/CoreContainers.h>
+// SymbolMap is defined in CoreContainers.h on newer LLVM (split out of Core.h)
+// but only in Core.h itself on older LLVM (e.g. 17); Core.h works on both.
+#include <llvm/ExecutionEngine/Orc/Core.h>
 #include <memory>
 
 namespace llvm {

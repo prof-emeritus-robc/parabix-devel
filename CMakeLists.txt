@@ -472,27 +472,27 @@ endif()
 add_test(
   NAME abc_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND ./run_abc ${BIN_DIR}/icgrep)
+  COMMAND python3 abc_test.py ${BIN_DIR}/icgrep)
 
 add_test(
   NAME u8u16_test
   WORKING_DIRECTORY ${QA_DIR}/u8u16
-  COMMAND ./run_all "${BIN_DIR}/u8u16 -thread-num=2")
+  COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")
 
 add_test(
   NAME u32u8_test
   WORKING_DIRECTORY ${QA_DIR}/
-  COMMAND ./test_u32u8 "${BIN_DIR}/u32u8")
+  COMMAND python3 u32u8_test.py "${BIN_DIR}/u32u8")
 
 add_test(
   NAME nfd_test
   WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND ./test_nfd "${BIN_DIR}/nfd")
+  COMMAND python3 nfd_test.py "${BIN_DIR}/nfd")
 
 add_test(
   NAME nfc_test
   WORKING_DIRECTORY ${QA_DIR}/nfc
-  COMMAND ./test_nfc "${BIN_DIR}/nfc")
+  COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")
 
 add_test(
     NAME editd_test
@@ -507,17 +507,17 @@ add_test(
 add_test(
   NAME gb18030_test
   WORKING_DIRECTORY ${QA_DIR}/gb18030
-  COMMAND ./run_all "${BIN_DIR}/gb18030")
+  COMMAND python3 gb18030_test.py "${BIN_DIR}/gb18030")
 
 add_test(
   NAME json_test
   WORKING_DIRECTORY ${QA_DIR}/json
-  COMMAND ./run_all "${BIN_DIR}/json")
+  COMMAND python3 json_test.py "${BIN_DIR}/json")
 
 add_test(
   NAME csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
-  COMMAND ./run_csv2json "${BIN_DIR}/csv2json")
+  COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")
 
 
 SET_PROPERTY(TEST proptest PROPERTY TIMEOUT 1500)
@@ -535,11 +535,11 @@ add_custom_target (proptest
 
 add_custom_target (u8u16_test
     WORKING_DIRECTORY ${QA_DIR}/u8u16
-    COMMAND ./run_all "${BIN_DIR}/u8u16 -thread-num=2")
+    COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")
 
 add_custom_target (u32u8_test
     WORKING_DIRECTORY ${QA_DIR}
-    COMMAND ./test_u32u8 "${BIN_DIR}/u32u8 -EnableAsserts -VerifyIR")
+    COMMAND python3 u32u8_test.py "--flags=-EnableAsserts -VerifyIR" "${BIN_DIR}/u32u8")
 
 add_custom_target (editd_test
     WORKING_DIRECTORY ${QA_DIR}/editd
@@ -551,15 +551,15 @@ add_custom_target (base64_test
 
 add_custom_target(gb18030_test
   WORKING_DIRECTORY ${QA_DIR}/gb18030
-  COMMAND ./run_all "${BIN_DIR}/gb18030")
+  COMMAND python3 gb18030_test.py "${BIN_DIR}/gb18030")
 
 add_custom_target(nfd_test
   WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND ./test_nfd "${BIN_DIR}/nfd")
+  COMMAND python3 nfd_test.py "${BIN_DIR}/nfd")
 
 add_custom_target(nfc_test
   WORKING_DIRECTORY ${QA_DIR}/nfc
-  COMMAND ./test_nfc "${BIN_DIR}/nfc")
+  COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")
 
 add_custom_target (abc_gen
     WORKING_DIRECTORY ${QA_DIR}
@@ -567,7 +567,7 @@ add_custom_target (abc_gen
 
 add_custom_target (abc_test
     WORKING_DIRECTORY ${QA_DIR}
-    COMMAND ./run_abc "${BIN_DIR}/icgrep")
+    COMMAND python3 abc_test.py "${BIN_DIR}/icgrep")
 
 add_custom_target (check
     # Build everything before testing, rather than a hand-maintained DEPENDS
@@ -598,12 +598,12 @@ add_custom_target (xml_test
 
 add_custom_target (json_test
     WORKING_DIRECTORY ${QA_DIR}/json
-    COMMAND ./run_all "${BIN_DIR}/json")
+    COMMAND python3 json_test.py "${BIN_DIR}/json")
 
 add_custom_target (json_perf
     WORKING_DIRECTORY ${QA_DIR}/json_perf
-    COMMAND ./run_all "${BIN_DIR}/json")
+    COMMAND python3 json_perf_test.py "${BIN_DIR}/json")
 
 add_custom_target (csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
-  COMMAND ./run_csv2json "${BIN_DIR}/csv2json")
+  COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")

@@ -23,6 +23,7 @@ DEPS
     kernel.basis
     kernel.io
     kernel.unicode
+    kernel.unicode.normalization
     kernel.pipeline
     kernel.streamutils
     kernel.scan

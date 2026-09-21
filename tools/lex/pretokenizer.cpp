@@ -23,10 +23,7 @@
 #include <kernel/unicode/boundary_kernels.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
-#include <pablo/pablo_kernel.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_ones.h>
+#include <pablo/pablo.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
 #include <vector>

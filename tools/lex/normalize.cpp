@@ -15,9 +15,7 @@
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/sentinel.h>
 #include <kernel/streamutils/stream_shift.h>
-#include <pablo/pablo_kernel.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <llvm/Support/Casting.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <ucd/utf/transchar.h>

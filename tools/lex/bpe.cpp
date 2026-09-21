@@ -55,9 +55,7 @@
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <llvm/Support/CommandLine.h>
-#include <pablo/pablo_kernel.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>

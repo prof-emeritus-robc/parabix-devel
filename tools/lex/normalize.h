@@ -6,7 +6,7 @@
 #pragma once
 
 #include <kernel/pipeline/pipeline_builder.h>
-#include <kernel/unicode/normalization.h>
+#include <kernel/unicode/normalization/normalization.h>
 #include <vector>
 
 using StreamSet = kernel::StreamSet;

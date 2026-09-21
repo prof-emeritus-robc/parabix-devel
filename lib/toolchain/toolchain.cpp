@@ -286,6 +286,12 @@ PipelineCompilationModeOption("pipeline-optimization-level", cl::location(Pipeli
 static cl::opt<bool, true> EnableObjectCacheOption("enable-object-cache", cl::location(EnableObjectCache), cl::init(true),
                                                    cl::desc("Enable object caching"), cl::cat(CodeGenOptions));
 
+bool UpdateObjectCache = false;
+static cl::opt<bool, true> UpdateObjectCacheOption("update-object-cache", cl::location(UpdateObjectCache), cl::init(false),
+                                                   cl::desc("Force existing object cache entries to be recompiled and replaced, "
+                                                            "rather than reused. Implied if --optimization-level or "
+                                                            "--backend-optimization-level is explicitly set."), cl::cat(CodeGenOptions));
+
 static cl::opt<bool, true> EnableModuleInlinerOption("enable-kernel-module-inliner", cl::location(EnableModuleInliner), cl::init(false),
                                                    cl::desc("Run a whole-module inliner pass over each kernel's IR before object generation."), cl::cat(CodeGenOptions));
 
@@ -415,6 +421,7 @@ bool EnableModuleInliner = false;
 bool EnablePipelineObjectCache = true;
 bool TraceObjectCache;
 bool UseCustomJITMemoryManager = true;
+bool ObjectCacheForceUpdate = false;
 
 unsigned CacheDaysLimit;
 
@@ -523,6 +530,15 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     } else if (disablePipelineObjectCacheDueToCommandLineOptions()) {
         EnablePipelineObjectCache = false;
     }
+    // A cache entry compiled under one --optimization-level/--backend-optimization-level
+    // setting is not distinguished from one compiled under another (they share the same
+    // cache key), so silently reusing it would serve code built at the wrong opt level.
+    // Rather than growing the cache with a separate entry per opt level, explicitly
+    // setting either flag (or passing --update-object-cache directly) forces existing
+    // entries to be recompiled and replaced in place.
+    ObjectCacheForceUpdate = UpdateObjectCache
+        || (OptimizationLevel.getNumOccurrences() > 0)
+        || (BackEndOptOption.getNumOccurrences() > 0);
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
     target_Options.MCOptions.AsmVerbose = true;
 

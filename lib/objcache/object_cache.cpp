@@ -99,6 +99,15 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
 
     std::lock_guard<std::mutex> L(mCacheMutex);
 
+    if (LLVM_UNLIKELY(codegen::ObjectCacheForceUpdate)) {
+        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            errs() << "Forcing recompilation (--update-object-cache, or --optimization-level"
+                      "/--backend-optimization-level set): " << kernel->makeCacheName(builder)
+                   << KERNEL_FILE_EXTENSION << "\n";
+        }
+        return LoadResult{nullptr, nullptr};
+    }
+
     Path fileName(mCachePath);
     sys::path::append(fileName, CACHE_PREFIX);
     const auto moduleId = kernel->makeCacheName(builder);

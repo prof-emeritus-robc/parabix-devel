@@ -166,6 +166,13 @@ extern bool EnableObjectCache;
 extern bool EnableModuleInliner;
 extern bool EnablePipelineObjectCache;
 extern bool UseCustomJITMemoryManager;
+extern bool UpdateObjectCache;  // set from command line: --update-object-cache
+// True if UpdateObjectCache is set, or --optimization-level/--backend-optimization-level
+// were explicitly given on the command line; derived once in ParseCommandLineOptions.
+// When true, the object cache is bypassed on load (forcing recompilation) and the
+// resulting object replaces whatever was previously cached, so a cache built under one
+// optimization setting is never silently reused after the setting changes.
+extern bool ObjectCacheForceUpdate;
 extern unsigned CompileThreads;
 extern bool UseMCJIT;
 extern bool EnableDynamicMultithreading;

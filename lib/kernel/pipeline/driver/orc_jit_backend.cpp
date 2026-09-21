@@ -768,14 +768,21 @@ private:
         BEGIN_SCOPED_REGION
         bool added;
         StringMap<Kernel *>::iterator itr;
+        Kernel * other = nullptr;
 
         BEGIN_SCOPED_REGION
         std::lock_guard<std::mutex> L(PrecompiledStateObjectMutex);
         std::tie(itr, added) = AlreadyCompiled.insert(std::make_pair(sig, nullptr));
+        // Read the existing entry's value under the same lock that protects its
+        // write below (record_decl:, f->second = Target) -- ThreadSanitizer
+        // confirmed a genuine data race here when this read was done after the
+        // lock had already been released.
+        if (!added) {
+            other = itr->getValue();
+        }
         END_SCOPED_REGION
 
         if (LLVM_UNLIKELY(!added)) {
-            const auto other = itr->getValue();
             // TODO: this isn't safe if we want to discard kernels on restart
             if (other) {
                 Target->setSharedStateType(other->getSharedStateType());

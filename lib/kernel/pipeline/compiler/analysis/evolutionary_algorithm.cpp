@@ -86,7 +86,10 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
 
     CandidateQueue workQueue;
 
-    bool finishedProcessing = false;
+    // Written once by the calling thread and polled by every worker thread's exit
+    // check below; must be atomic (ThreadSanitizer confirmed a genuine data race
+    // here when this was a plain bool).
+    std::atomic<bool> finishedProcessing{false};
 
     TASLock candidateMapLock;
     TASLock nextGenLock;

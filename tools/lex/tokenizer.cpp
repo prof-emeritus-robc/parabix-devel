@@ -38,6 +38,7 @@
 #include <cstring>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include "normalize.h"
@@ -107,12 +108,23 @@ static inline size_t charContaining(size_t p) {
 
 static void resetOffsetState() { gPos = 0; gLeads = 0; }
 
+// bpe_emit_token (below) is registered as a scan::Reader callback, invoked from
+// the compiled pipeline's own segment-processing threads -- potentially several
+// of them concurrently, one per segment in flight. emitToken mutates plain
+// global state (gPos, gLeads, gOffsetWarned) and writes to the shared
+// llvm::outs()/errs() streams with no synchronization of its own, so every call
+// (including the special-token splice in runBPEWithSpecialTokens, which runs on
+// the main thread) must serialize through this mutex.
+static std::mutex gEmitMutex;
+
 // Shared print/offset logic for one token (id + its decoded display string).
 // Used both by the scan callback (bpe_emit_token, below) and by the special-
 // token splice in runBPEWithSpecialTokens (<|endoftext|> is spliced directly
 // into the output, never seen by the compiled pipeline).
 static void emitToken(uint16_t id, const std::string & tokStr) {
     if (gBenchQuiet) return;   // timing loop: skip output, measure tokenization only
+
+    std::lock_guard<std::mutex> lock(gEmitMutex);
 
     if (gOffsetMode != OffNone) {
         // Source byte length = codepoint count of the display string.

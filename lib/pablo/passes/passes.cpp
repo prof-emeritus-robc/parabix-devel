@@ -18,10 +18,50 @@
 #include <pablo/toolchain/pablo_toolchain.h>
 #include <pablo/compiler/pablo_illustratorpass.h>
 #include <boost/regex.hpp>
+#include <mutex>
 
 using namespace llvm;
 
 namespace pablo {
+
+namespace {
+
+// pablo_function_passes() runs per-kernel on whichever compile thread happens
+// to process that kernel, so under multi-threaded compilation, multiple
+// kernels' -ShowPablo/-ShowOptimizedPablo dumps can be in flight at once.
+// PabloPrinter::print() makes an unbounded number of separate writes to its
+// raw_ostream, none of which are atomic with respect to each other, so
+// writing straight to errs() (or to the same output file, in the file-output
+// case) interleaves those writes into corrupted, unreadable output. Format
+// each kernel's dump into an in-memory buffer first -- no locking needed for
+// that, since it doesn't touch shared state -- then take this lock only to
+// perform the actual write (and, for the file-output case, the
+// create-vs-append flag toggle, which was also an unguarded data race) as a
+// single atomic step.
+std::mutex PabloPrintMutex;
+
+void printPabloKernelAtomically(PabloKernel * const kernel, const StringRef banner,
+                                 const std::string & outputPath, sys::fs::OpenFlags & appendFlag) {
+    std::string buffer;
+    raw_string_ostream buf(buffer);
+    if (outputPath.empty()) {
+        buf << banner;
+    }
+    PabloPrinter::print(kernel, buf);
+    buf.flush();
+
+    std::lock_guard<std::mutex> lock(PabloPrintMutex);
+    if (outputPath.empty()) {
+        errs() << buffer;
+    } else {
+        std::error_code error;
+        llvm::raw_fd_ostream out(outputPath, error, appendFlag);
+        out << buffer;
+        appendFlag = sys::fs::OpenFlags::OF_Append;   // append subsequent Pablo kernels
+    }
+}
+
+} // anonymous namespace
 
 void pablo_function_passes(PabloKernel * kernel) {
 
@@ -34,15 +74,7 @@ void pablo_function_passes(PabloKernel * kernel) {
             print_kernel = boost::regex_search(kernelName, RegexFilter);
         }
         if (print_kernel) {
-            if (ShowPabloOption.empty()) {
-                errs() << "### Initial Pablo AST ###\n";
-                PabloPrinter::print(kernel, errs());
-            } else {
-                std::error_code error;
-                llvm::raw_fd_ostream out(ShowPabloOption, error, PabloOutputFileFlag);
-                PabloPrinter::print(kernel, out);
-                PabloOutputFileFlag = sys::fs::OpenFlags::OF_Append;   // append subsequent Pablo kernels
-            }
+            printPabloKernelAtomically(kernel, "### Initial Pablo AST ###\n", ShowPabloOption, PabloOutputFileFlag);
         }
     }
 
@@ -94,16 +126,7 @@ void pablo_function_passes(PabloKernel * kernel) {
         }
     }
     if (ShowOptimizedPabloOption != codegen::OmittedOption) {
-        if (ShowOptimizedPabloOption.empty()) {
-            //Print to the terminal the final Pablo AST after optimization.
-            errs() << "### Final Pablo AST ###\n";
-            PabloPrinter::print(kernel, errs());
-        } else {
-            std::error_code error;
-            llvm::raw_fd_ostream out(ShowOptimizedPabloOption, error, PabloOptimizedOutputFileFlag);
-            PabloPrinter::print(kernel, out);
-            PabloOptimizedOutputFileFlag = sys::fs::OpenFlags::OF_Append;  // append subsequent Pablo kernels
-        }
+        printPabloKernelAtomically(kernel, "### Final Pablo AST ###\n", ShowOptimizedPabloOption, PabloOptimizedOutputFileFlag);
     }
 }
 

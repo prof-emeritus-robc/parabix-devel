@@ -35,15 +35,9 @@ using TypeId = PabloAST::ClassTypeId;
 using EscapedVars = Branch::EscapedVars;
 using KeySet = SmallVector<const Var *, 64>;
 
-#ifdef USE_THREAD_UNSAFE_CANONICALIZATION
 inline bool lessThan(const PabloAST * a, const PabloAST * b) {
     return a->getNodeId() < b->getNodeId();
 }
-#else
-inline bool lessThan(const PabloAST * a, const PabloAST * b) {
-    return a < b;
-}
-#endif
 
 
 // #define EXPERIMENTAL

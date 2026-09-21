@@ -9,6 +9,7 @@
 #include <llvm/Support/Compiler.h>
 #include <boost/iterator/iterator_facade.hpp>
 #include <allocator/threadsafe_slaballocator.h>
+#include <atomic>
 #include <type_traits>
 #include <vector>
 namespace llvm { class Type; }
@@ -16,14 +17,18 @@ namespace llvm { class raw_ostream; }
 namespace pablo { class PabloBlock; }
 namespace pablo { class String; }
 
-// #define USE_THREAD_UNSAFE_CANONICALIZATION
-
 namespace pablo {
 
+// Every PabloAST node gets a monotonically increasing, process-lifetime-unique
+// id at construction (via an atomic counter, safe under the multi-threaded
+// ORC-JIT compiler). Commutative-operand canonicalization (see
+// BOOLEAN_CANONICALIZE in boolean.h and the operand-ordering swaps in
+// builder.cpp) orders operands by this id rather than by raw pointer value:
+// pointer values depend on allocator/ASLR layout and vary nondeterministically
+// between runs, which previously made otherwise-identical pipelines print
+// different (but semantically equivalent) Pablo IR under -ShowPablo.
 class PabloAST : public SlabAllocatedObject {
-    #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
-    static size_t __AST_NODE_COUNT;
-    #endif
+    static std::atomic<size_t> __AST_NODE_COUNT;
     friend class Statement;
     friend class StatementList;
     friend class Branch;
@@ -160,17 +165,13 @@ public:
 
     void print(llvm::raw_ostream & O) const;
 
-    #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
     size_t getNodeId() const { return mNodeId; }
-    #endif
 
 protected:
 
     PabloAST(const ClassTypeId id, llvm::Type * const type) noexcept
     : mClassTypeId(id)
-    #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
-    , mNodeId(__AST_NODE_COUNT++)
-    #endif
+    , mNodeId(__AST_NODE_COUNT.fetch_add(1, std::memory_order_relaxed))
     , mType(type)
     , mSideEffecting([&]() -> bool {
         switch (id) {
@@ -208,9 +209,7 @@ protected:
 
 private:
     const ClassTypeId       mClassTypeId;
-    #ifdef USE_THREAD_UNSAFE_CANONICALIZATION
     const size_t            mNodeId;
-    #endif
     llvm::Type * const      mType;
     bool                    mSideEffecting;
     Users                   mUsers;

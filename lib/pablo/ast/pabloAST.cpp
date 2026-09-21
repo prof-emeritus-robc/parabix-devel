@@ -18,6 +18,7 @@
 #include <pablo/compiler/printer_pablos.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_os_ostream.h>
+#include <atomic>
 
 using namespace boost::container;
 using namespace llvm;
@@ -30,9 +31,7 @@ size_t constexpr __length(const char * const str) {
     return *str ? 1 + __length(str + 1) : 0;
 }
 
-#ifdef USE_THREAD_UNSAFE_CANONICALIZATION
-size_t PabloAST::__AST_NODE_COUNT = 0;
-#endif
+std::atomic<size_t> PabloAST::__AST_NODE_COUNT{0};
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief equals

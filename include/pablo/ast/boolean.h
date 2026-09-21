@@ -5,11 +5,7 @@
 
 namespace pablo {
 
-#ifdef USE_THREAD_UNSAFE_CANONICALIZATION
 #define BOOLEAN_CANONICALIZE(x, y) {(x->getNodeId() < y->getNodeId()) ? x : y, (x->getNodeId() < y->getNodeId()) ? y : x}
-#else
-#define BOOLEAN_CANONICALIZE(x, y) {x, y}
-#endif
 
 class And final : public Statement {
     friend class PabloBlock;
@@ -113,9 +109,7 @@ protected:
     }
 };
 
-#ifdef USE_THREAD_UNSAFE_CANONICALIZATION
 #undef BOOLEAN_CANONICALIZE
-#endif
 
 class Ternary final : public Statement {
     friend class PabloBlock;

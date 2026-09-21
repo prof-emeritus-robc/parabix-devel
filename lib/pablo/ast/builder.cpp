@@ -313,7 +313,7 @@ PabloAST * PabloBuilder::createAnd(PabloAST * expr1, PabloAST * expr2) {
             return expr1;
         }
     }
-    if (expr1 > expr2) {
+    if (expr1->getNodeId() > expr2->getNodeId()) {
         std::swap(expr1, expr2);
     }
     return MAKE_BINARY(And, expr1, expr2);
@@ -343,7 +343,7 @@ PabloAST * PabloBuilder::createAnd(PabloAST * expr1, PabloAST * expr2, const llv
             return expr1;
         }
     }
-    if (expr1 > expr2) {
+    if (expr1->getNodeId() > expr2->getNodeId()) {
         std::swap(expr1, expr2);
     }
     return MAKE_NAMED_BINARY(And, prefix, expr1, expr2);
@@ -389,7 +389,7 @@ PabloAST * PabloBuilder::createOr(PabloAST * expr1, PabloAST * expr2) {
             return expr1;
         }
     }
-    if (expr1 > expr2) {
+    if (expr1->getNodeId() > expr2->getNodeId()) {
         std::swap(expr1, expr2);
     }
     return MAKE_BINARY(Or, expr1, expr2);
@@ -435,7 +435,7 @@ PabloAST * PabloBuilder::createOr(PabloAST * expr1, PabloAST * expr2, const llvm
             return expr1;
         }
     }
-    if (expr1 > expr2) {
+    if (expr1->getNodeId() > expr2->getNodeId()) {
         std::swap(expr1, expr2);
     }
     return MAKE_NAMED_BINARY(Or, prefix, expr1, expr2);
@@ -457,7 +457,7 @@ PabloAST * PabloBuilder::createXor(PabloAST * expr1, PabloAST * expr2) {
             return createXor(not1->getOperand(0), not2->getOperand(0));
         }
     }
-    if (expr1 > expr2) {
+    if (expr1->getNodeId() > expr2->getNodeId()) {
         std::swap(expr1, expr2);
     }
     return MAKE_BINARY(Xor, expr1, expr2);
@@ -479,7 +479,7 @@ PabloAST * PabloBuilder::createXor(PabloAST * expr1, PabloAST * expr2, const llv
             return createXor(not1->getOperand(0), not2->getOperand(0), prefix);
         }
     }
-    if (expr1 > expr2) {
+    if (expr1->getNodeId() > expr2->getNodeId()) {
         std::swap(expr1, expr2);
     }
     return MAKE_NAMED_BINARY(Xor, prefix, expr1, expr2);

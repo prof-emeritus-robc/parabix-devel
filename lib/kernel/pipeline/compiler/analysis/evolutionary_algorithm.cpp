@@ -205,6 +205,20 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
         goto enumerated_entire_search_space;
     }
 
+    // The crossover/selection logic below assumes at least two candidates to
+    // operate on (it asserts populationSize > 1), but nothing upstream actually
+    // guarantees that many were produced -- the population-initialization phase
+    // above only asserts nextGeneration.size() > 0. Under heavy CPU contention
+    // (e.g. many kernels' thread-local buffer layouts being optimized
+    // concurrently), that phase's wall-clock init budget can be starved enough
+    // to leave exactly one candidate, which previously tripped the assert in a
+    // debug build and was undefined behaviour in a release build. getResult()
+    // already handles a population of exactly one correctly, so just skip the
+    // generational loop in that case too.
+    if (LLVM_UNLIKELY(population.size() <= 1)) {
+        goto enumerated_entire_search_space;
+    }
+
     permutation_bitset bitString(candidateLength);
 
     BitVector uncopied(candidateLength);

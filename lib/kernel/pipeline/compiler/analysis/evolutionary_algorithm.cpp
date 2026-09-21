@@ -107,9 +107,24 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
 
     std::atomic<size_t> activeThreads{0};
 
+    // Pre-seed each worker thread's RNG on this (the calling) thread, before any
+    // worker thread is spawned. Previously each worker thread called the shared
+    // `rng` itself (via `pipeline_random_engine threadRng(rng());`) right after
+    // starting, racing with this thread's own -- extensive, main-loop-long -- use
+    // of that same `rng` below (e.g. zeroToOneReal(rng), bitString.randomize(rng),
+    // std::shuffle(..., rng)). ThreadSanitizer confirmed this as a genuine,
+    // unsynchronized data race on rng's internal state. Seeding up front here
+    // means `rng` itself is only ever touched by this thread, and each worker
+    // thread gets its own independent, already-seeded generator.
+    std::vector<pipeline_random_engine::result_type> threadSeeds;
+    threadSeeds.reserve(threadCount > 0 ? threadCount - 1 : 0);
     for (unsigned i = 1; i < threadCount; ++i) {
-        threads.emplace_back([&]() {
-            pipeline_random_engine threadRng(rng());
+        threadSeeds.push_back(rng());
+    }
+
+    for (unsigned i = 1; i < threadCount; ++i) {
+        threads.emplace_back([&, i]() {
+            pipeline_random_engine threadRng(threadSeeds[i - 1]);
             auto worker = makeWorker(threadRng);
             for (;;) {
                 Candidate C;

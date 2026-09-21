@@ -42,8 +42,34 @@ struct WorkQueue {
     }
 
     inline void push(T && item) {
-       std::lock_guard<TASLock> lock(_lock);
+        std::lock_guard<TASLock> lock(_lock);
         _queue.push(std::move(item));
+        ++_pending;
+    }
+
+    // Call once the item popped by a successful pop() has been fully processed.
+    // _pending is incremented inside push() (before the item is ever visible to a
+    // popper) and decremented here (after processing completes), both under the
+    // same lock as pop() itself -- so hasPendingWork() returning false is a real
+    // happens-before guarantee that every push has been fully processed, unlike
+    // a separately-incremented "active worker count" that isn't updated in the
+    // same atomic step as the pop that makes it active (that gap let the main
+    // thread conclude "no worker is active" while a worker had already removed
+    // an item from the queue but not yet finished/been counted as processing
+    // it -- confirmed via ThreadSanitizer as a genuine race on nextGeneration
+    // between a worker still inside processCandidate and the main thread moving
+    // on to mutate it directly).
+    inline void markDone() {
+        std::lock_guard<TASLock> lock(_lock);
+        assert (_pending > 0);
+        --_pending;
+    }
+
+    // True if any pushed item has not yet been popped, or has been popped but
+    // not yet markDone()'d.
+    inline bool hasPendingWork() const {
+        std::lock_guard<TASLock> lock(_lock);
+        return !_queue.empty() || _pending > 0;
     }
 
     inline size_t size() {
@@ -53,7 +79,8 @@ struct WorkQueue {
 
 private:
     mutable std::queue<T> _queue;
-    TASLock _lock;
+    mutable TASLock _lock;
+    size_t _pending = 0;
 };
 
 using CandidateQueue = WorkQueue<Candidate>;
@@ -108,8 +135,6 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
         nextGenLock.unlock();
     };
 
-    std::atomic<size_t> activeThreads{0};
-
     // Pre-seed each worker thread's RNG on this (the calling) thread, before any
     // worker thread is spawned. Previously each worker thread called the shared
     // `rng` itself (via `pipeline_random_engine threadRng(rng());`) right after
@@ -133,12 +158,10 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
                 Candidate C;
                 if (workQueue.pop(C)) {
                     assert (C.size() == candidateLength);
-                    activeThreads.fetch_add(1, std::memory_order_seq_cst);
                     processCandidate(worker, std::move(C), threadRng);
-                    activeThreads.fetch_add(-1, std::memory_order_seq_cst);
+                    workQueue.markDone();
                 } else { // sleep 1/10 ms then check if we're finished.
                     std::this_thread::sleep_for(nanoseconds(100));
-                    assert (activeThreads.load(std::memory_order_relaxed) < threadCount);
                     if (finishedProcessing) {
                         break;
                     }
@@ -178,13 +201,8 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
         if (workQueue.pop(C)) {
             assert (C.size() == candidateLength);
             processCandidate(mainWorker, std::move(C), rng);
-        } else {
-            assert (workQueue.empty());
-            for (;;) {
-                const auto c = activeThreads.load(std::memory_order_relaxed);
-                assert (c < threadCount);
-                if (c == 0) break;
-            }
+            workQueue.markDone();
+        } else if (!workQueue.hasPendingWork()) {
             break;
         }
     }
@@ -360,13 +378,8 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
             if (workQueue.pop(C)) {
                 assert (C.size() == candidateLength);
                 processCandidate(mainWorker, std::move(C), rng);
-            } else {
-                assert (workQueue.empty());
-                for (;;) {
-                    const auto c = activeThreads.load(std::memory_order_relaxed);
-                    assert (c < threadCount);
-                    if (c == 0) break;
-                }
+                workQueue.markDone();
+            } else if (!workQueue.hasPendingWork()) {
                 break;
             }
         }

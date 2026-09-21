@@ -81,23 +81,6 @@ private:
     const unsigned          mAfterContext;
 };
 
-// white space boundary rule, pretokenizer implementation
-void WhitespaceBoundaryLogic(PipelineBuilder & P,
-                              StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_stream);
-// whitespacesplit logic, pretokenizer implementation
-void WhitespaceSplitLogic(PipelineBuilder & P,
-                              StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_split_stream);
-// punctuation boundary rule, pretokenizer implementation
-void PunctuationBoundaryLogic(PipelineBuilder & P,
-                              StreamSet * Source, StreamSet * U8index, StreamSet * punctuation_stream);
-// digits boundary rule, pretokenizer implementation
-void DigitBoundaryLogic(PipelineBuilder & P,
-                              StreamSet * Source, StreamSet * U8index, StreamSet * digit_stream);
-//DigitSplit logic, pretokenizer implementation
-void DigitSplitLogic(PipelineBuilder & P,
-                              StreamSet * Source, StreamSet * U8index, StreamSet * digit_split_stream);
-                              //  The LongestMatchMarks kernel computes longest-match spans in start-end space.
-
 void GraphemeClusterLogic(PipelineBuilder & P,
                           StreamSet * Source, StreamSet * U8index, StreamSet * GCBstream);
 

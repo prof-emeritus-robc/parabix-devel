@@ -56,10 +56,13 @@ using namespace pablo;
 using namespace re;
 using namespace llvm;
 
+
+
 unsigned round_up_to_blocksize(int lgth) {
     unsigned lookahead_blocks = (codegen::BlockSize - 1 + lgth)/codegen::BlockSize;
     return lookahead_blocks * codegen::BlockSize;
 }
+
 
 void MatchedLinesKernel::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
@@ -273,60 +276,6 @@ void ContextSpan::generatePabloMethod() {
     }
     pb.createAssign(pb.createExtract(getOutputStreamVar("contextStream"), pb.getInteger(0)), pb.createInFile(consecutive));
 }
-
-// do this for the gpt2 ?
-void kernel::SimpleWordBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * wordBoundary_stream) {
-    re::RE * wordProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "word");
-    wordProp = UCD::linkAndResolve(wordProp);
-    re::Name * word = re::makeName("word");
-    word->setDefinition(wordProp);
-    StreamSet * WordStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(word, Source, WordStream);
-    P.CreateKernelCall<BoundaryKernel>(WordStream, U8index, wordBoundary_stream);
-}
-// whitespace boundary logic(pretokenizer)
-// do i have to use rthe boundary kernel here for all?
-
-void kernel::WhitespaceBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_stream) {
-    re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
-    whitespaceProp = UCD::linkAndResolve(whitespaceProp);
-    re::Name * whitespace = re::makeName("whitespace");
-    whitespace->setDefinition(whitespaceProp);
-    StreamSet * WhitespaceStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(whitespace, Source, WhitespaceStream);
-    P.CreateKernelCall<BoundaryKernel>(WhitespaceStream, U8index, whitespace_stream);
-}
-// whitespacesplit logic (pretokenizer)
-void kernel::WhitespaceSplitLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * whitespace_split_stream) {
-    re::RE * whitespaceProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "space");
-    whitespaceProp = UCD::linkAndResolve(whitespaceProp);
-    re::Name * whitespace = re::makeName("whitespace");
-    whitespace->setDefinition(whitespaceProp);
-    StreamSet * WhitespaceStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(whitespace, Source, WhitespaceStream);
-    P.CreateKernelCall<BoundaryKernel>(WhitespaceStream, U8index, whitespace_split_stream);
-}
-// punctuation boundary logic (pretokenizer)
-void kernel::PunctuationBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * punctuation_stream) {
-    re::RE * punctProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "punctuation");
-    punctProp = UCD::linkAndResolve(punctProp);
-    re::Name * punctuation = re::makeName("punctuation");
-    punctuation->setDefinition(punctProp);
-    StreamSet * PunctuationStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(punctuation, Source, PunctuationStream);
-    P.CreateKernelCall<BoundaryKernel>(PunctuationStream, U8index, punctuation_stream);
-}
-// digit boundary logic (pretokenizer)
-void kernel::DigitBoundaryLogic(PipelineBuilder & P, StreamSet * Source, StreamSet * U8index, StreamSet * digit_stream) {
-    re::RE * digitProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "digit");
-    digitProp = UCD::linkAndResolve(digitProp);
-    re::Name * digit = re::makeName("digit");
-    digit->setDefinition(digitProp);
-    StreamSet * DigitStream = P.CreateStreamSet(1);
-    P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(digit, Source, DigitStream);
-    P.CreateKernelCall<BoundaryKernel>(DigitStream, U8index, digit_stream);
-}
-
 LongestMatchMarks::LongestMatchMarks(LLVMTypeSystemInterface & ts, StreamSet * start_ends, StreamSet * marks)
 : PabloKernel(ts, "LongestMatchMarks"  + std::to_string(marks->getNumElements()) + "x1",
               {Binding{"start_ends", start_ends, FixedRate(1), LookAhead(1)}},

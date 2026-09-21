@@ -112,7 +112,13 @@ MCJITBackend::MCJITBackend(CPUDriver & driver)
     if (LLVM_UNLIKELY(mTarget == nullptr)) {
         report_fatal_error("Could not selectTarget for MCJIT");
     }
-    mEngine.reset(builder.create());
+    // EngineBuilder::create() (no args) is `return create(selectTarget());` -- calling
+    // it with no argument would invoke selectTarget() a SECOND time, handing the engine
+    // a different TargetMachine instance than the one we're holding as mTarget, so every
+    // later mTarget->setOptLevel(...) call (per-kernel opt-level selection, see
+    // finalizeObject) would silently affect the wrong, unused TargetMachine. Pass mTarget
+    // explicitly so the engine takes ownership of the SAME instance we mutate.
+    mEngine.reset(builder.create(mTarget));
     if (LLVM_UNLIKELY(mEngine == nullptr)) {
         report_fatal_error(Twine("Could not create MCJIT ExecutionEngine: ") + errMessage);
     }
@@ -245,10 +251,15 @@ void * MCJITBackend::finalizeObject(kernel::Kernel * const pk) {
         }
     };
 
+    // Both tiers compile at codegen::BackEndOptLevel (default None/-O0; override with
+    // --backend-optimization-level). Normal kernels used to get a hardcoded Default here
+    // while Infrequent ones got BackEndOptLevel -- see OrcJITBackend::materializeObject
+    // for why that hardcoded Default was itself a bug source, now avoided by using one
+    // configurable level for every kernel.
     {
         NamedRegionTimer T("object-generation", "object-generation", "object", "Object Generation", codegen::TimeKernelsIsEnabled);
         addModules(Infrequent, codegen::BackEndOptLevel);
-        addModules(Normal, CodeGenOptLevel::Default);
+        addModules(Normal, codegen::BackEndOptLevel);
     }
 
     auto mainModule = std::make_unique<Module>("main", mDriver.getContext());
@@ -272,7 +283,7 @@ void * MCJITBackend::finalizeObject(kernel::Kernel * const pk) {
         mDriver.mPreservedKernel.clear();
     }
 
-    mTarget->setOptLevel(CodeGenOptLevel::None);
+    mTarget->setOptLevel(codegen::BackEndOptLevel);
     Module * const mainModulePtr = mainModule.get();
     mEngine->addModule(std::move(mainModule));
 

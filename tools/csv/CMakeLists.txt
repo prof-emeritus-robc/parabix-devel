@@ -11,7 +11,7 @@ SRC
 DEPS
     csv
     jsonlib
-    pablo
+    pablo.compiler
     grep
     kernel.basis
     kernel.bitwise
@@ -30,7 +30,7 @@ SRC
     csvcut.cpp
 DEPS
     csv
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline
@@ -46,7 +46,7 @@ SRC
     csvgrep.cpp
 DEPS
     csv
-    pablo
+    pablo.compiler
     grep
     kernel.basis
     kernel.io

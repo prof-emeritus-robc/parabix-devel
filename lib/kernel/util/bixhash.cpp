@@ -4,7 +4,7 @@
  */
 
 #include <kernel/util/bixhash.h>
-#include <pablo/builder.hpp>
+#include <pablo/pablo.h>
 #include <vector>
 #include <algorithm>
 #include <random>

@@ -4,9 +4,7 @@
  */
 #include <kernel/bitwise/bixlogic.h>
 #include <kernel/core/kernel_builder.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 
 using namespace llvm;
 using namespace pablo;

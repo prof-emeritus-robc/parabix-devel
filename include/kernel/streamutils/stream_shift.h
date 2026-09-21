@@ -5,7 +5,7 @@
 #pragma once
 
 #include <kernel/core/kernel.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 
 namespace IDISA { class IDISA_Builder; }
 

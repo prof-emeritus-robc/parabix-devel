@@ -20,8 +20,8 @@
 #include <kernel/core/streamset.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/streamutils/streams_merge.h>
-#include <pablo/pablo_compiler.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/compiler/pablo_compiler.h>
+#include <pablo/pablo.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
 #include <re/cc/cc_kernel.h>

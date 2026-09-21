@@ -11,8 +11,7 @@
 #include <re/cc/cc_compiler_target.h>
 #include <re/adt/re_name.h>
 #include <ucd/utf/utf_compiler.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>

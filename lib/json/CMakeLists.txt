@@ -10,7 +10,7 @@ SRC
     json_support.cpp
 DEPS
     re.adt
-    pablo
+    pablo.compiler
     grep
     kernel.bitwise
     kernel.io

@@ -13,7 +13,7 @@ SRC
     editdscan_kernel.cpp
     pattern_compiler.cpp
 DEPS
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline

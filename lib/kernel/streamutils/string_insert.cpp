@@ -5,12 +5,7 @@
 
 #include <kernel/streamutils/string_insert.h>
 #include <kernel/core/kernel_builder.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_var.h>
-#include <pablo/pe_infile.h>
-#include <pablo/pe_lookahead.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <re/cc/cc_compiler_target.h>
 #include <re/cc/cc_compiler.h>

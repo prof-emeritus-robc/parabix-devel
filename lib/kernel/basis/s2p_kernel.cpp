@@ -7,9 +7,7 @@
 #include <sstream>
 #include <kernel/core/callback.h>
 #include <kernel/core/kernel_builder.h>
-#include <pablo/pabloAST.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_pack.h>
+#include <pablo/pablo.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_ostream.h>
 #include <kernel/pipeline/pipeline_builder.h>

@@ -4,7 +4,7 @@
 #include <ucd/core/unicode_set.h>
 #include <ucd/utf/utf_encoder.h>
 #include <vector>
-#include <pablo/pablo_toolchain.h>
+#include <pablo/toolchain/pablo_toolchain.h>
 
 namespace re {
     class CC;

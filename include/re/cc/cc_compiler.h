@@ -7,9 +7,12 @@
 
 
 #include <stdint.h>
-#include <pablo/builder.hpp>
+#include <pablo/ast/pabloAST.h>
 #include <re/adt/re_cc.h>
 #include <re/alphabet/alphabet.h>
+
+namespace pablo { class PabloBlock; }
+namespace pablo { class PabloBuilder; }
 
 namespace cc {
 

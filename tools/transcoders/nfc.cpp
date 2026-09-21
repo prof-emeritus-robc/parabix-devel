@@ -11,9 +11,7 @@
 #include <llvm/IR/Module.h>
 #include <re/adt/re_name.h>
 #include <re/adt/re_re.h>
-#include <pablo/codegenstate.h>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_ones.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <grep/grep_kernel.h>
 #include <kernel/core/kernel_builder.h>
@@ -29,7 +27,7 @@
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
 #include <kernel/unicode/charclasses.h>
-#include <kernel/unicode/normalization.h>
+#include <kernel/unicode/normalization/normalization.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>

@@ -16,9 +16,8 @@
 #include <llvm/IR/Module.h>                        // for Module
 #include <llvm/Support/CommandLine.h>              // for ParseCommandLineOp...
 #include <llvm/Support/Debug.h>                    // for dbgs
-#include <pablo/pablo_kernel.h>                    // for PabloKernel
 #include <kernel/core/kernel_builder.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
@@ -30,7 +29,6 @@
 #include <llvm/IR/Value.h>
 #include <llvm/Support/Compiler.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/builder.hpp>
 #include <fcntl.h>
 #include <kernel/pipeline/program_builder.h>
 #ifdef ENABLE_PAPI

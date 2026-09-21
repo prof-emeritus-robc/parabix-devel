@@ -1,7 +1,7 @@
 #include <pablo/pablo_automultiplexing.hpp>
 
-#include <pablo/builder.hpp>
-#include <pablo/printer_pablos.h>
+#include <pablo/ast/builder.hpp>
+#include <pablo/compiler/printer_pablos.h>
 #include <boost/container/flat_set.hpp>
 #include <boost/container/flat_map.hpp>
 #include <boost/numeric/ublas/matrix.hpp>
@@ -12,7 +12,7 @@
 #include <pablo/analysis/pabloverifier.hpp>
 #endif
 #include <pablo/optimizers/pablo_simplifier.hpp>
-#include <pablo/builder.hpp>
+#include <pablo/ast/builder.hpp>
 #include <stack>
 #include <queue>
 #include <unordered_set>

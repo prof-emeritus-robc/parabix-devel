@@ -4,9 +4,7 @@
  */
 
 #include <kernel/unicode/utf8_support.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_var.h>           // for Var
-#include <pablo/pe_zeroes.h>        // for Zeroes
+#include <pablo/pablo.h>
 #include <re/cc/cc_compiler.h>         // for CC_Compiler
 #include <re/cc/cc_compiler_target.h>
 #include <re/cc/cc_kernel.h>

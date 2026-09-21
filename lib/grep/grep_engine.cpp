@@ -47,7 +47,7 @@
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/io/stdout_kernel.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <re/adt/adt.h>
 #include <re/adt/re_utility.h>
 #include <re/adt/re_empty_set.h>

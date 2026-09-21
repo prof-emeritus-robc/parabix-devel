@@ -18,5 +18,5 @@ SRC
     symbol_table.cpp
     token.cpp
 DEPS
-    pablo
+    pablo.compiler
 )

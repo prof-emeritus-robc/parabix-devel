@@ -4,7 +4,7 @@
  */
 #pragma once
 
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <kernel/core/kernel_builder.h>
 #include "ztf-logic.h"
 

@@ -87,7 +87,7 @@ NAME
 SRC
     xch.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.io
@@ -104,14 +104,14 @@ NAME
 SRC
     nfd.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.bitwise
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.unicode
+    kernel.unicode.normalization
     re.cc
     toolchain
 )
@@ -122,14 +122,14 @@ NAME
 SRC
     nfkd.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.bitwise
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.unicode
+    kernel.unicode.normalization
     re.cc
     toolchain
 )
@@ -140,14 +140,14 @@ NAME
 SRC
     nfc.cpp
 DEPS
-    pablo
+    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.bitwise
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.unicode
+    kernel.unicode.normalization
     re.cc
     toolchain
 )

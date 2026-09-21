@@ -1,6 +1,6 @@
 #pragma once
 
-#include <pablo/codegenstate.h>
+#include <pablo/ast/codegenstate.h>
 #include <util/slab_allocator.h>
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/type_traits/ice.hpp>

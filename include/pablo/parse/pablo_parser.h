@@ -9,8 +9,8 @@
 #include <memory>
 #include <vector>
 #include <boost/optional.hpp>
-#include <pablo/pablo_kernel.h>
-#include <pablo/builder.hpp>
+#include <pablo/compiler/pablo_kernel.h>
+#include <pablo/ast/builder.hpp>
 #include <pablo/parse/pablo_source_kernel.h>
 #include <pablo/parse/kernel_signature.h>
 

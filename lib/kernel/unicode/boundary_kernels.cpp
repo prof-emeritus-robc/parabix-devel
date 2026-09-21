@@ -15,8 +15,7 @@
 #include <re/unicode/boundaries.h>
 #include <re/unicode/resolve_properties.h>
 #include <kernel/core/kernel_builder.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 
 using namespace kernel;
 using namespace pablo;

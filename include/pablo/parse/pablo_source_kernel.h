@@ -7,7 +7,7 @@
 
 #include <memory>
 #include <vector>
-#include <pablo/pablo_kernel.h>
+#include <pablo/compiler/pablo_kernel.h>
 
 namespace pablo {
 

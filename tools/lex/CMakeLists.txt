@@ -19,7 +19,7 @@ SRC
     ICU_Boundaries.cpp
     bpe.cpp
 DEPS
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.unicode

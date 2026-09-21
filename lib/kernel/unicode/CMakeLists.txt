@@ -10,9 +10,6 @@ SRC
     charclasses.cpp
     char_replacement.cpp
     boundary_kernels.cpp
-    normalization.cpp
-    nfd.cpp
-    normalization-generated.cpp
     UCD_property_kernel.cpp
     utf8gen.cpp
     utf8_decoder.cpp
@@ -23,6 +20,6 @@ DEPS
     kernel.pipeline
     kernel.streamutils
     re.unicode
-    pablo
+    pablo.compiler
     pablo.bixnum
 )

@@ -182,21 +182,14 @@ static void emitSpecialToken() {
     emitToken(kSpecialTokenId, tokStr);
 }
 
-// bpeFn requires a 64-byte aligned input buffer (see the mmap comment in main:
-// "MemorySourceKernel's alignment requirement"). A mid-file segment's raw
-// pointer (buf + offset) has no such guarantee, so copy each segment into a
-// freshly aligned buffer before calling into the pipeline.
+// MemorySourceKernel now copies its input into its own safely-padded, aligned
+// buffer during initialization (see source_kernel.cpp), so a mid-file segment's
+// raw pointer (buf + offset) -- of arbitrary alignment, with no overflow past
+// len -- can simply be passed straight through.
 using BPEFnPtr = void (*)(const char *, size_t);
 static void runBPESegment(BPEFnPtr bpeFn, const char * data, size_t len) {
     if (len == 0) return;
-    void * aligned = nullptr;
-    if (posix_memalign(&aligned, 64, len) != 0) {
-        llvm::errs() << "Error: aligned allocation failed for a " << len << "-byte BPE segment.\n";
-        return;
-    }
-    std::memcpy(aligned, data, len);
-    bpeFn(static_cast<const char *>(aligned), len);
-    free(aligned);
+    bpeFn(data, len);
 }
 
 static void runBPEWithSpecialTokens(BPEFnPtr bpeFn, const char * buf, size_t nbytes) {

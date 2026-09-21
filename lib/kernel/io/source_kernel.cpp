@@ -357,12 +357,66 @@ void FDSourceKernel::linkExternalMethods(KernelBuilder & b) {
 
 void MemorySourceKernel::generateInitializeMethod(KernelBuilder & b) {
     Value * const fileSource = b.getScalarField("fileSource");
-    b.setBaseAddress("sourceBuffer", fileSource);
 
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         b.CreateAssert(fileSource, getName() + " fileSource cannot be null");
     }
     Value * const fileItems = b.getScalarField("fileItems");
+
+    // A single-element streamset is addressed as a flat array (see
+    // StreamSetBuffer::getRawItemPointer's ElementCount == 1 case): fileItems
+    // items of mCodeUnitWidth bits each, packed sequentially. Round up since
+    // mCodeUnitWidth may be sub-byte (e.g. 1 for a bit stream), where truncating
+    // mCodeUnitWidth/8 to 0 first (as MMapSourceKernel's byte-stream callers can
+    // get away with) would silently make fileBytes 0 regardless of fileItems.
+    //
+    // A multi-element streamset is addressed block-major/stream-minor instead
+    // (StreamSetBuffer::getStreamBlockPtr): every full block holds
+    // getTypeSize(getType(b)) bytes covering all elements together, so the
+    // caller's buffer must be sized (and read) in whole blocks, not flat items.
+    Value * fileBytes;
+    if (mNumElements == 1) {
+        Value * const fileBits = b.CreateMul(fileItems, b.getSize(mCodeUnitWidth));
+        fileBytes = b.CreateUDiv(b.CreateAdd(fileBits, b.getSize(7)), b.getSize(8));
+    } else {
+        const auto blockWidth = b.getBitBlockWidth();
+        Value * const numBlocks = b.CreateUDiv(b.CreateAdd(fileItems, b.getSize(blockWidth - 1)), b.getSize(blockWidth));
+        StreamSetBuffer * const sourceBuffer = b.getOutputStreamSetBuffer("sourceBuffer");
+        Constant * const bytesPerBlock = b.getTypeSize(sourceBuffer->getType(b));
+        fileBytes = b.CreateMul(numBlocks, bytesPerBlock);
+    }
+
+    // A prior call to this same compiled pipeline (e.g. a --bench-loop rerun, or
+    // this kernel simply being invoked more than once) may have already left a
+    // buffer allocated below; free it now rather than in generateFinalizeMethod,
+    // since a "kept"/exposed output streamset may still be pointing callers at
+    // that memory when finalize runs -- freeing it there broke exactly that case
+    // (tests/test_emptyprogram's "Kept MemorySource"). Leaving the final call's
+    // buffer unfreed is deliberate: we don't know when the caller is done with it.
+    BasicBlock * const freePrior = b.CreateBasicBlock("freePriorMemorySourceBuffer");
+    BasicBlock * const afterFree = b.CreateBasicBlock("afterFreePriorMemorySourceBuffer");
+    Value * const priorBuffer = b.getScalarField("buffer");
+    b.CreateUnlikelyCondBr(b.CreateIsNotNull(priorBuffer), freePrior, afterFree);
+    b.SetInsertPoint(freePrior);
+    b.CreateFree(priorBuffer);
+    b.CreateBr(afterFree);
+    b.SetInsertPoint(afterFree);
+
+    // fileSource may have arbitrary alignment and no overflow past fileBytes, but
+    // like every block-based Parabix kernel this one may read a full block past
+    // the logical end of the final (partial) stride. Copy into our own buffer,
+    // sized with a full extra page of zeroed overflow, rather than relying on
+    // the caller to have provided any. The extra page (beyond rounding fileBytes
+    // up to a page) covers the case where fileBytes is itself an exact multiple
+    // of the page size.
+    const auto pageSize = CBuilder::PAGE_SIZE;
+    Value * const allocBytes = b.CreateAdd(b.CreateRoundUpRational(fileBytes, pageSize), b.getSize(pageSize));
+    Value * const ownedBuffer = b.CreateAlignedMalloc(allocBytes, 64);
+    b.CreateMemCpy(ownedBuffer, fileSource, fileBytes, 1);
+    Value * const paddingStart = b.CreateGEP(b.getInt8Ty(), ownedBuffer, fileBytes);
+    b.CreateMemZero(paddingStart, b.CreateSub(allocBytes, fileBytes), 1);
+    b.setScalarField("buffer", ownedBuffer);
+    b.setBaseAddress("sourceBuffer", ownedBuffer);
     b.setCapacity("sourceBuffer", fileItems);
 }
 
@@ -479,8 +533,12 @@ MemorySourceKernel::MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fi
 // input scalar
 {Binding{"fileSource", fileSource}, Binding{"fileItems", fileItems}},
 {},
-// internal scalar
-{}) {
+// internal scalars
+{})
+, mCodeUnitWidth(outputStream->getFieldWidth())
+, mNumElements(outputStream->getNumElements()) {
+    PointerType * const codeUnitPtrTy = PointerType::getUnqual(ts.getContext());
+    addInternalScalar(codeUnitPtrTy, "buffer");
     addAttribute(MustExplicitlyTerminate());
     setStride(1);
 }

@@ -156,7 +156,6 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mGrepDriver(driver),
     mMainMethod(nullptr),
     mBatchSize(FileBatchSegments * codegen::SegmentSize),
-    //mBatchSize(10 * 1024 * 1024),
     mBatchMethod(nullptr),
     mNextFileToGrep(0),
     mNextFileToPrint(0),

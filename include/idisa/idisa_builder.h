@@ -76,10 +76,6 @@ public:
     unsigned getBitBlockWidth() const {
         return mBitBlockWidth;
     }
-    
-    //Pairwise addition
-    virtual llvm::Value * hsimd_pairwisesum(unsigned fw, llvm::Value * Val_a, llvm::Value * Val_b);
-
 
     llvm::Constant * allZeroes() const {
         return mZeroInitializer;

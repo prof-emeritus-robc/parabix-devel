@@ -79,11 +79,43 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
     Function * const pthreadCreateFn = m->getFunction("pthread_create");
     Function * const pthreadExitFn = m->getFunction("pthread_exit");
     Function * const pthreadJoinFn = m->getFunction("pthread_join");
+    Function * const pthreadAttrInitFn = m->getFunction("pthread_attr_init");
+    Function * const pthreadAttrSetStackSizeFn = m->getFunction("pthread_attr_setstacksize");
+    Function * const pthreadAttrDestroyFn = m->getFunction("pthread_attr_destroy");
 
     IntegerType * const pThreadTy = IntegerType::getIntNTy(b.getContext(), sizeof(pthread_t) * CHAR_BIT);
 
     const DataLayout & DL = m->getDataLayout();
     const auto pThreadAlign = CBuilder::getAlignOf(DL, pThreadTy);
+
+    // A worker thread's default stack (512KB on macOS, vs. 8MB for the main thread) can be
+    // too small for a large enough JIT-compiled pipeline; give every spawned thread an
+    // explicit stack matching the main thread's default instead. pthread_attr_t is opaque
+    // to us -- a byte buffer of its actual size, passed only by address to the pthread_attr_*
+    // calls below, is all we need. Re-init/destroy this same buffer around each
+    // pthread_create call (see createThreadWithLargerStack) rather than keeping one
+    // long-lived attr object, since dynamic multithreading may spawn threads at more than
+    // one point in this function.
+    constexpr size_t WORKER_THREAD_STACK_SIZE = 8 * 1024 * 1024;
+    Type * const pthreadAttrTy = ArrayType::get(b.getInt8Ty(), sizeof(pthread_attr_t));
+    Value * const pthreadAttr = b.CreateAllocaAtEntryPoint(pthreadAttrTy);
+
+    auto createThreadWithLargerStack = [&](Value * const threadPtr, Value * const threadFuncArg, Value * const argArg) {
+        FixedArray<Value *, 1> attrArgs;
+        attrArgs[0] = pthreadAttr;
+        b.CreateCall(pthreadAttrInitFn->getFunctionType(), pthreadAttrInitFn, attrArgs);
+        FixedArray<Value *, 2> setStackSizeArgs;
+        setStackSizeArgs[0] = pthreadAttr;
+        setStackSizeArgs[1] = b.getSize(WORKER_THREAD_STACK_SIZE);
+        b.CreateCall(pthreadAttrSetStackSizeFn->getFunctionType(), pthreadAttrSetStackSizeFn, setStackSizeArgs);
+        FixedArray<Value *, 4> pthreadCreateArgs;
+        pthreadCreateArgs[0] = threadPtr;
+        pthreadCreateArgs[1] = pthreadAttr;
+        pthreadCreateArgs[2] = threadFuncArg;
+        pthreadCreateArgs[3] = argArg;
+        b.CreateCall(pthreadCreateFn->getFunctionType(), pthreadCreateFn, pthreadCreateArgs);
+        b.CreateCall(pthreadAttrDestroyFn->getFunctionType(), pthreadAttrDestroyFn, attrArgs);
+    };
 
     Value * minimumNumOfThreads = nullptr;
 
@@ -188,7 +220,6 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
 
         b.SetInsertPoint(startThread);
     }
-    FixedArray<Value *, 4> pthreadCreateArgs;
     if (mUseDynamicMultithreading) {
         fieldIndex[1] = b.getInt32(CURRENT_THREAD_STATUS_FLAG);
         Value * initThreadStateFlagPtr = b.CreateInBoundsGEP(threadStructTy, threadStateArray, fieldIndex);
@@ -196,11 +227,8 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
     }
     fieldIndex[1] = b.getInt32(CURRENT_THREAD_ID);
 
-    pthreadCreateArgs[0] = b.CreateInBoundsGEP(threadStructTy, threadStateArray, fieldIndex);
-    pthreadCreateArgs[1] = ConstantPointerNull::get(voidPtrTy);
-    pthreadCreateArgs[2] = threadFunc;
-    pthreadCreateArgs[3] = cThreadState;
-    b.CreateCall(pthreadCreateFn->getFunctionType(), pthreadCreateFn, pthreadCreateArgs);
+    Value * const threadPtr = b.CreateInBoundsGEP(threadStructTy, threadStateArray, fieldIndex);
+    createThreadWithLargerStack(threadPtr, threadFunc, cThreadState);
     if (mUseDynamicMultithreading) {
         b.CreateBr(constructNextThread);
 
@@ -617,10 +645,8 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
 
                 b.SetInsertPoint(addThread);
                 b.CreateAlignedStore(sz_ONE, addThreadStateFlagPtr, SizeTyABIAlignment);
-                pthreadCreateArgs[0] = threadIdPtr;
                 Value * const ts = b.CreateInBoundsGEP(threadStructTy, threadStruct, selectToAddPhi);
-                pthreadCreateArgs[3] = ts;
-                b.CreateCall(pthreadCreateFn->getFunctionType(), pthreadCreateFn, pthreadCreateArgs);
+                createThreadWithLargerStack(threadIdPtr, threadFunc, ts);
                 Value * numOfThreadsAfterAdd = b.CreateAdd(activeThreadsPhi, sz_ONE);
                 b.CreateBr(recordBeforeNextSegment);
 
@@ -1197,6 +1223,34 @@ void PipelineCompiler::linkPipelineExternalMethods(KernelBuilder & b) {
     params[3] = voidPtrTy;
     FunctionType * funTy = FunctionType::get(intTy, params, false);
     b.LinkFunction("pthread_create", funTy, (void*)&pthread_create);
+    END_SCOPED_REGION
+
+    // pthread_create is called with an explicit, generously-sized stack attribute (see
+    // generateMultiThreadKernelMethod) rather than NULL/default attributes: on macOS, a
+    // secondary thread's default stack is only 512KB (vs. 8MB for the main thread), which
+    // a large enough JIT-compiled pipeline (many chained/inlined kernels) can genuinely
+    // overflow -- reproduced as a SIGBUS deep in JIT-compiled code, worker threads only,
+    // single-threaded execution unaffected.
+    BEGIN_SCOPED_REGION
+    FixedArray<Type *, 1> params;
+    params[0] = voidPtrTy;
+    FunctionType * funTy = FunctionType::get(intTy, params, false);
+    b.LinkFunction("pthread_attr_init", funTy, (void*)&pthread_attr_init);
+    END_SCOPED_REGION
+
+    BEGIN_SCOPED_REGION
+    FixedArray<Type *, 2> params;
+    params[0] = voidPtrTy;
+    params[1] = IntegerType::getIntNTy(b.getContext(), sizeof(size_t) * CHAR_BIT);
+    FunctionType * funTy = FunctionType::get(intTy, params, false);
+    b.LinkFunction("pthread_attr_setstacksize", funTy, (void*)&pthread_attr_setstacksize);
+    END_SCOPED_REGION
+
+    BEGIN_SCOPED_REGION
+    FixedArray<Type *, 1> params;
+    params[0] = voidPtrTy;
+    FunctionType * funTy = FunctionType::get(intTy, params, false);
+    b.LinkFunction("pthread_attr_destroy", funTy, (void*)&pthread_attr_destroy);
     END_SCOPED_REGION
 
     BEGIN_SCOPED_REGION

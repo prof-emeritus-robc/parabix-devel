@@ -454,7 +454,13 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
     SmallVector<char, 256> tmpMeta;
     auto strMeta = concat(getName(), STATE_TYPE_METADATA_SUFFIX, tmpMeta);
     NamedMDNode * const structTypeMetadata = m->getOrInsertNamedMetadata(strMeta);
-    assert (structTypeMetadata->getNumOperands() == 0);
+    assert (structTypeMetadata->getNumOperands() <= 1);
+    // This function is re-entrant per kernel name within a module by design (see the
+    // comment below) -- a distinct Kernel object sharing an already-declared name still
+    // needs its own field indices recorded, even though the LLVM type itself is reused.
+    // But the metadata node this function writes at the end is a once-per-name-per-module
+    // fact, read back elsewhere assuming exactly one operand; only write it the first time.
+    const bool stateTypeMetadataAlreadyWritten = structTypeMetadata->getNumOperands() != 0;
 
     StructType * sharedStateType = nullptr;
     StructType * threadLocalStateType = nullptr;
@@ -676,17 +682,19 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
         }
     }
 
-    auto makeTypeMetadata = [&](StructType * st, StringRef name) -> Metadata * {
-        if (st == nullptr) {
-            st = StructType::create(b.getContext(), name);
-        }
-        return ConstantAsMetadata::get(Constant::getNullValue(st));
-    };
+    if (!stateTypeMetadataAlreadyWritten) {
+        auto makeTypeMetadata = [&](StructType * st, StringRef name) -> Metadata * {
+            if (st == nullptr) {
+                st = StructType::create(b.getContext(), name);
+            }
+            return ConstantAsMetadata::get(Constant::getNullValue(st));
+        };
 
-    FixedArray<Metadata *, 2> stateTypes;
-    stateTypes[0] = makeTypeMetadata(sharedStateType, strShared);
-    stateTypes[1] = makeTypeMetadata(threadLocalStateType, strThreadLocal);
-    structTypeMetadata->addOperand(MDNode::get(m->getContext(), stateTypes));
+        FixedArray<Metadata *, 2> stateTypes;
+        stateTypes[0] = makeTypeMetadata(sharedStateType, strShared);
+        stateTypes[1] = makeTypeMetadata(threadLocalStateType, strThreadLocal);
+        structTypeMetadata->addOperand(MDNode::get(m->getContext(), stateTypes));
+    }
     assert (structTypeMetadata->getNumOperands() == 1);
 
     mSharedStateType = sharedStateType;
@@ -1865,6 +1873,16 @@ static inline unsigned collectOutputFlags(const Bindings & streamSets) {
     return flags;
 }
 
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief addBaseInternalScalars
+ ** ------------------------------------------------------------------------------------------------------------- */
+void Kernel::addBaseInternalScalars(LLVMTypeSystemInterface & ts) {
+    for (const Binding & output : mOutputStreamSets) {
+        addInternalScalar(ts.getVoidPtrTy(), output.getName() + BUFFER_HANDLE_SUFFIX);
+    }
+    addInternalScalar(ts.getSizeTy(), TERMINATION_SIGNAL);
+}
+
 // CONSTRUCTOR
 Kernel::Kernel(LLVMTypeSystemInterface & ts,
                const TypeId typeId,
@@ -1883,7 +1901,7 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
 , mOutputScalars(std::move(scalar_outputs))
 , mInternalScalars( std::move(internal_scalars))
 , mKernelName(annotateKernelNameWithDebugFlags(typeId, mFlags, std::move(kernelName))) {
-
+    addBaseInternalScalars(ts);
 }
 
 const llvm::MDString * Kernel::readSignatureFromModule(const llvm::Module * const M) {
@@ -1925,7 +1943,7 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
 , mOutputScalars(std::move(scalar_outputs))
 , mInternalScalars()
 , mKernelName() {
-
+    addBaseInternalScalars(ts);
 }
 
 Kernel::~Kernel() { }

@@ -450,23 +450,26 @@ public:
         mThreadLocalStateType = stateTy;
     }
 
-    // When two distinct Kernel instances share one already-constructed state type
-    // (e.g. PipelineCompiler::constructImplicitKernelStateTypes deduplicating implicit
-    // kernels by signature), only the ORIGINAL instance's constructStateTypes call ever
-    // records field indices (see InternalScalar::getFieldIndex). The instance that
-    // merely reuses the type must have those same indices copied onto its own scalars,
-    // or they are left at NO_FIELD_INDEX. `other` must have identical scalar composition
-    // (guaranteed by the caller having matched on signature).
-    void copyScalarFieldIndicesFrom(const Kernel & other) {
-        assert (mInputScalars.size() == other.mInputScalars.size());
-        assert (mOutputScalars.size() == other.mOutputScalars.size());
-        assert (mInternalScalars.size() == other.mInternalScalars.size());
+    // For a Target that's about to fully reuse another, already-declared kernel's state
+    // type (e.g. across LLVMContexts, via setSharedStateType/setThreadLocalStateType) but
+    // still needs its own mInternalScalars list (and input/output scalar field indices)
+    // populated to match: copies other's already-computed scalar list (including each
+    // entry's recorded field index) wholesale, rather than independently recomputing it
+    // via addInternalProperties(). A matching cache-name/signature already guarantees
+    // Target and other were built identically (same kernel class, same construction
+    // arguments), so recomputing would just reproduce the same result -- and for some
+    // kernel classes (e.g. a PabloKernel's carry-structure analysis) recomputing it is
+    // expensive enough to be a real cost, paid for nothing, every time a kernel with a
+    // large enough body is deduplicated this way. mInputScalars/mOutputScalars (the
+    // Bindings, fixed at construction time from the kernel's own declared I/O) are
+    // asserted to already match, since those aren't copied here -- only the field
+    // indices that locate them within the now-shared state type are.
+    void copyInternalScalarsFrom(const Kernel & other) {
+        assert (mInputScalars.size() == other.mInputScalars.size()
+             && mOutputScalars.size() == other.mOutputScalars.size());
+        mInternalScalars = InternalScalars(other.mInternalScalars.begin(), other.mInternalScalars.end());
         mInputScalarFieldIndex = other.mInputScalarFieldIndex;
         mOutputScalarFieldIndex = other.mOutputScalarFieldIndex;
-        const auto n = mInternalScalars.size();
-        for (unsigned i = 0; i < n; ++i) {
-            mInternalScalars[i].setFieldIndex(other.mInternalScalars[i].getFieldIndex());
-        }
     }
 
     llvm::StructType * getThreadLocalStateType(llvm::LLVMContext & C) const;
@@ -686,6 +689,35 @@ protected:
            unsigned flags = 0);
 
     static std::string annotateKernelNameWithDebugFlags(const TypeId id, const unsigned flags, std::string && name);
+
+    // Names of the two internal scalars every kernel unconditionally reserves at
+    // construction time (see addBaseInternalScalars below): a per-output owned-buffer
+    // handle and a termination-signal flag. Shared between kernel.cpp (which adds them)
+    // and kernel_compiler.cpp (which looks them up), so both sides can never drift out of
+    // sync on the name. Scoped as class members, not namespace-scope constants, so they
+    // can't collide with an unrelated identifier of the same name declared unscoped
+    // elsewhere in namespace kernel (as happened with an enumerator also named
+    // TERMINATION_SIGNAL in multithreading_model_logic.cpp).
+    static constexpr auto BUFFER_HANDLE_SUFFIX = "_buffer";
+    static constexpr auto TERMINATION_SIGNAL = "__termination_signal";
+
+    // Unconditionally reserves the buffer-handle (per output) and termination-signal
+    // internal scalars at construction time, rather than at pipeline-compile time (the
+    // old KernelCompiler::addBaseInternalProperties). This makes a kernel's scalar
+    // composition fixed the moment it's constructed, before any pipeline-specific
+    // buffer-layout analysis (which mutates output Binding attributes, e.g. promoting a
+    // buffer to Shared/Managed) can change what used to be a conditional field count --
+    // two structurally-identical kernel instances used in different, independently-
+    // analyzed pipelines now always agree on scalar composition, which the driver's
+    // kernel-declaration dedup (orc_jit_backend.cpp's materializeDecl) requires.
+    //
+    // The buffer handle field is only a pointer here, not the buffer's actual handle
+    // struct: that struct's LLVM type depends on which concrete StreamSetBuffer subclass
+    // the pipeline later picks (ExternalBuffer vs. ManagedDynamicBuffer, etc; see
+    // KernelCompiler::constructStreamSetBuffers), which isn't known until then. The real
+    // struct is heap-allocated once, lazily, the first time the kernel runs; see
+    // KernelCompiler::allocateOwnedBufferHandleStorage.
+    void addBaseInternalScalars(LLVMTypeSystemInterface & ts);
 
     struct FunctionLink {
         const std::string           UnmanagedName;

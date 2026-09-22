@@ -1,4 +1,5 @@
 #include "../pipeline_compiler.hpp"
+#include <unordered_set>
 
 namespace kernel {
 
@@ -15,22 +16,27 @@ void PipelineCompiler::bindAdditionalInitializationArguments(KernelBuilder & b, 
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::constructImplicitKernelStateTypes(KernelBuilder & b) {
     assert (UniqueImplicitKernelInstances.empty());
+    // Every implicitly-added kernel instance must run its OWN declareStateTypes(), even
+    // when its signature matches an earlier instance: a subclass's own addInternalProperties()
+    // override is decided per Kernel object, not once per signature, so skipping it for
+    // "duplicate" instances left them with an incomplete mInternalScalars list while still
+    // sharing the first instance's (now too-small) compiled state type -- a real, silent,
+    // pre-existing bug this refactor's cross-checks surfaced. constructStateTypes()
+    // itself already finds and reuses an earlier instance's built LLVM type by name when
+    // the freshly recomputed layout actually matches (and asserts loudly if it doesn't),
+    // so this still preserves sharing the compiled body below for the common case where
+    // every instance's needs are genuinely identical -- it just no longer trusts that
+    // blindly.
+    std::unordered_set<const Kernel *> declared;
     for (auto i = FirstKernel; i <= LastKernel; ++i) {
         auto & S = mStreamGraph[i];
         if (S.Flags & RelationshipNodeFlag::ImplicitlyAdded) {
             Kernel * const K = const_cast<Kernel *>(getKernel(i));
-            const auto sig = K->hasSignature() ? K->getSignature() : StringRef{K->getName()};
-            auto entry = UniqueImplicitKernelInstances.insert(std::make_pair(sig, K));
-            if (entry.second) {
+            if (declared.insert(K).second) {
                 K->declareStateTypes(b);
-            } else {
-                Kernel * const other = entry.first->getValue(); assert (other);
-                K->setSharedStateType(other->getSharedStateType());
-                assert (K->getSharedStateType() == nullptr || !K->getSharedStateType()->isEmptyTy());
-                K->setThreadLocalStateType(other->getThreadLocalStateType());
-                assert (K->getThreadLocalStateType() == nullptr || !K->getThreadLocalStateType()->isEmptyTy());
-                K->copyScalarFieldIndicesFrom(*other);
             }
+            const auto sig = K->hasSignature() ? K->getSignature() : StringRef{K->getName()};
+            UniqueImplicitKernelInstances.insert(std::make_pair(sig, K));
         }
     }
 }

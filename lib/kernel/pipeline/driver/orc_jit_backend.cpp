@@ -679,6 +679,7 @@ public:
         // and immediately runs a small sub-pipeline per directory/.gitignore file, so
         // waitUntilCompleted() is invoked repeatedly against the same shared pool).
         WorkQueue.waitForDrain();
+
         for (auto & C : Contexts) {
             auto & S = C->NewSymbolList;
             DriverLinkedSymbols->insert(S.begin(), S.end());
@@ -717,6 +718,35 @@ public:
 
     void setEngine(orc::LLJIT * engine) {
         Engine = engine;
+    }
+
+    // AlreadyCompiled holds raw Kernel* pointers keyed by cache-name, deduplicating
+    // declarations across every P.compile() call sharing this compiler (e.g. nested
+    // grep's one sub-pipeline per directory -- see waitUntilCompleted's comment). A
+    // kernel it references must not be destroyed while this compiler (and thus the map)
+    // is still alive: a later, unrelated compile whose own kernel happens to produce the
+    // same cache-name (common for generic utility kernels like MemorySourceKernel) would
+    // otherwise dedup against a dangling pointer to an already-destroyed kernel -- a
+    // genuine, previously silent use-after-free. But the map can't simply be cleared
+    // between compiles either: the JIT engine's symbol table is just as driver-lifetime
+    // and shared, and a second, independently compiled kernel with the same name would
+    // then fatal-error on a duplicate symbol definition. So instead, move every kernel
+    // this map still references out of the caller's normal (per-compile-destroyed)
+    // ownership and into this compiler's own, for as long as the compiler exists.
+    // Called from OrcJITBackend::finalizeObject, once per P.compile(), on each of
+    // mDriver.mCachedKernel/mCompiledKernel, before those are cleared.
+    void preserveDedupedKernels(std::vector<std::unique_ptr<Kernel>> & kernels) {
+        std::lock_guard<std::mutex> L(PrecompiledStateObjectMutex);
+        if (AlreadyCompiled.empty()) return;
+        for (auto & k : kernels) {
+            if (!k) continue;
+            for (auto & entry : AlreadyCompiled) {
+                if (entry.second == k.get()) {
+                    PreservedForDedup.emplace_back(std::move(k));
+                    break;
+                }
+            }
+        }
     }
 
     void setDriverLinkedSymbolMap(llvm::orc::SymbolMap * symMap) {
@@ -785,9 +815,28 @@ private:
         if (LLVM_UNLIKELY(!added)) {
             // TODO: this isn't safe if we want to discard kernels on restart
             if (other) {
+                // other's state types live in a (possibly different) LLVMContext, so
+                // Target can't just declareStateTypes() itself -- its own by-name struct
+                // reuse only searches its own context. Populate Target's own scalar list
+                // to match other's, then point it at other's already-built type.
+                //
+                // This assumes a matching cache-name/signature guarantees identical scalar
+                // composition. That used to be false for kernel classes that don't override
+                // hasSignature() (e.g. MemorySourceKernel): two independently-analyzed
+                // pipelines could give the "same" kernel different managed-buffer/
+                // termination-signal needs, since those scalars used to be added during
+                // pipeline compilation (KernelCompiler::addBaseInternalProperties), driven by
+                // that pipeline's own buffer-layout analysis. Both scalars are now reserved
+                // unconditionally at kernel construction time instead (Kernel::
+                // addBaseInternalScalars), so composition is fixed before any pipeline ever
+                // sees the kernel, and this assumption actually holds. Given that, Target's
+                // scalar list can just be copied from other's (Kernel::copyInternalScalarsFrom)
+                // instead of independently recomputed via addInternalProperties() -- avoiding
+                // redoing potentially expensive per-kernel analysis (e.g. a PabloKernel's
+                // carry-structure analysis) purely to reproduce a result we already have.
+                Target->copyInternalScalarsFrom(*other);
                 Target->setSharedStateType(other->getSharedStateType());
                 Target->setThreadLocalStateType(other->getThreadLocalStateType());
-                Target->copyScalarFieldIndicesFrom(*other);
                 return true;
             } else {
                 // We haven't yet finished declaring the other instance of this one. Re-add this
@@ -1153,6 +1202,9 @@ private:
 
     StringMap<Kernel *>                             AlreadyCompiled;
 
+    // See preserveDedupedKernels.
+    std::vector<std::unique_ptr<Kernel>>            PreservedForDedup;
+
     std::vector<CPUDriverContext *>                 Contexts;
 
     CPUDriverJITMemoryManager                       JITMemoryManager;
@@ -1321,6 +1373,13 @@ void * OrcJITBackend::finalizeObject(kernel::Kernel * const pk) {
     } else {
         mDriver.mPreservedKernel.clear();
     }
+
+    // Whatever's left (i.e. wasn't already moved to mPreservedKernel above) is about to
+    // be destroyed by the clears below; keep alive anything AlreadyCompiled's dedup
+    // cache still points to, since that cache -- and this compiler -- outlive this one
+    // compile. See preserveDedupedKernels.
+    mCPUDriverCompiler->preserveDedupedKernels(mDriver.mCachedKernel);
+    mCPUDriverCompiler->preserveDedupedKernels(mDriver.mCompiledKernel);
 
     mDriver.mCachedKernel.clear();
     mDriver.mCompiledKernel.clear();

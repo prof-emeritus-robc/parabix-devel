@@ -1,6 +1,7 @@
 #include <kernel/core/kernel_compiler.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/driver/driver.h>
+#include <functional>
 #include <llvm/IR/CallingConv.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Constants.h>
@@ -1239,11 +1240,26 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
 
 
 
-    auto enumerate = [&](const Bindings & bindings, const size_t initialIndex) {
+    auto enumerate = [&](const Bindings & bindings, const size_t initialIndex,
+                         const std::function<unsigned(unsigned)> & getRecordedIndex) {
         auto index = initialIndex;
-        for (const auto & binding : bindings) {
+        for (unsigned bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+            const auto & binding = bindings[bindingIndex];
             assert (sharedTy);
-            const auto k = index * 2 + 1;
+            const auto oldK = index * 2 + 1;
+            const auto k = getRecordedIndex(bindingIndex);
+            // TEMPORARY cross-check while migrating scalar-field access onto the index
+            // Kernel::constructStateTypes records at construction: this independently
+            // recomputed index (the sole source of truth prior to this change) must
+            // still agree, or construction and access have diverged.
+            if (LLVM_UNLIKELY(oldK != k)) {
+                SmallVector<char, 256> tmp;
+                raw_svector_ostream out(tmp);
+                out << "Kernel " << getName() << " scalar '" << binding.getName()
+                    << "': constructStateTypes recorded field index " << k
+                    << " but independent recomputation gave " << oldK;
+                report_fatal_error(Twine(out.str()));
+            }
             assert (k < sharedTy->getStructNumElements());
             Type * const actualType = sharedTy->getStructElementType(k);
             assert (&actualType->getContext() == &sharedTy->getContext());
@@ -1287,7 +1303,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
 
     BasicBlock * combineExit = combineToMainThreadLocal;
 
-    enumerate(mInputScalars, 0U);
+    enumerate(mInputScalars, 0U, [&](unsigned i) { return mTarget->getInputScalarFieldIndex(i); });
 
     for (const auto & binding : mInternalScalars) {
         Value * scalar = nullptr;
@@ -1300,7 +1316,17 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 auto f = sharedGroups.find(binding.getGroup());
                 assert (f != sharedGroups.end());
                 const auto index = f->second++;
-                const auto k = index * 2 + 1;
+                const auto oldK = index * 2 + 1;
+                const auto k = binding.getFieldIndex();
+                // TEMPORARY cross-check; see the comment in enumerate() above.
+                if (LLVM_UNLIKELY(oldK != k)) {
+                    SmallVector<char, 256> tmp;
+                    raw_svector_ostream out(tmp);
+                    out << "Kernel " << getName() << " internal scalar '" << binding.getName()
+                        << "': constructStateTypes recorded field index " << k
+                        << " but independent recomputation gave " << oldK;
+                    report_fatal_error(Twine(out.str()));
+                }
                 assert (k < sharedTy->getStructNumElements());
                 scalarType = sharedTy->getStructElementType(k);
                 assert (scalarType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType()));
@@ -1345,7 +1371,17 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 auto f = threadLocalGroups.find(binding.getGroup());
                 assert (f != threadLocalGroups.end());
                 const auto index = f->second++;
-                const auto k = index * 2 + 1;
+                const auto oldK = index * 2 + 1;
+                const auto k = binding.getFieldIndex();
+                // TEMPORARY cross-check; see the comment in enumerate() above.
+                if (LLVM_UNLIKELY(oldK != k)) {
+                    SmallVector<char, 256> tmp;
+                    raw_svector_ostream out(tmp);
+                    out << "Kernel " << getName() << " thread-local scalar '" << binding.getName()
+                        << "': constructStateTypes recorded field index " << k
+                        << " but independent recomputation gave " << oldK;
+                    report_fatal_error(Twine(out.str()));
+                }
                 assert (k < threadLocalTy->getStructNumElements());
                 scalarType = threadLocalTy->getStructElementType(k);
                 assert (scalarType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType()));
@@ -1505,7 +1541,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         addToScalarFieldMap(binding.getName(), scalar, binding.getValueType(), scalarType);
     }
 
-    enumerate(mOutputScalars, totalSharedGroupCount);
+    enumerate(mOutputScalars, totalSharedGroupCount, [&](unsigned i) { return mTarget->getOutputScalarFieldIndex(i); });
 
     // finally add any aliases
     for (const auto & alias : mScalarAliasMap) {

@@ -171,6 +171,7 @@ void MCJITBackend::generateUncachedKernels() {
                 M->setTargetTriple(mDriver.mMainModule->getTargetTriple());
                 M->setDataLayout(mDriver.mMainModule->getDataLayout());
                 Target->loadCachedKernel(M);
+                Target->recordScalarFieldIndices();
                 builder.setModule(M);
                 Target->linkExternalMethods(builder);
                 mObjectCacheAdapter->registerPrecompiled(M, std::move(cached));

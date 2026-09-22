@@ -787,6 +787,7 @@ private:
             if (other) {
                 Target->setSharedStateType(other->getSharedStateType());
                 Target->setThreadLocalStateType(other->getThreadLocalStateType());
+                Target->copyScalarFieldIndicesFrom(*other);
                 return true;
             } else {
                 // We haven't yet finished declaring the other instance of this one. Re-add this
@@ -816,6 +817,7 @@ private:
                 M->setDataLayout(ctx.DataLayout);
 
                 Target->loadCachedKernel(M.get());
+                Target->recordScalarFieldIndices();
                 builder.setModule(M.get());
                 ctx.CurrentModule = M.get();
                 ctx.Engine = Engine;
@@ -889,6 +891,7 @@ record_decl:
             StructType * const threadLocalTy = Target->getThreadLocalStateType();
             #endif
             Target->loadCachedKernel(M);
+            Target->recordScalarFieldIndices();
             assert ((sharedTy == nullptr) == (Target->getSharedStateType() == nullptr));
             assert ((sharedTy == nullptr) || (Target->getSharedStateType() != sharedTy));
             assert ((threadLocalTy == nullptr) == (Target->getThreadLocalStateType() == nullptr));

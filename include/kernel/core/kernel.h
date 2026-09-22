@@ -185,6 +185,17 @@ public:
             return mAccumulationRule;
         }
 
+        // The flat field index of this scalar within its owning kernel's constructed
+        // state struct (mSharedStateType or mThreadLocalStateType, per getScalarType()).
+        // Set exactly once, by Kernel::constructStateTypes, as it lays out that struct;
+        // every other consumer (e.g. KernelCompiler's scalar-field-pointer lookup) must
+        // read this value rather than independently recompute a struct position, so
+        // construction and access can never silently diverge.
+        unsigned getFieldIndex() const {
+            assert (mFieldIndex != NO_FIELD_INDEX && "field index read before state type construction");
+            return mFieldIndex;
+        }
+
         explicit InternalScalar(llvm::Type * const valueType,
                                 const llvm::StringRef name, const unsigned group = 0,
                                 const ThreadLocalScalarAccumulationRule rule = ThreadLocalScalarAccumulationRule::DoNothing)
@@ -206,12 +217,19 @@ public:
             mValueType = type;
         }
 
+        static constexpr unsigned NO_FIELD_INDEX = ~0U;
+
+        void setFieldIndex(const unsigned index) {
+            mFieldIndex = index;
+        }
+
     private:
         const ScalarType                        mScalarType;
         llvm::Type *                            mValueType;
         const std::string                       mName;
         const unsigned                          mGroup;
         const ThreadLocalScalarAccumulationRule mAccumulationRule;
+        unsigned                                mFieldIndex = NO_FIELD_INDEX;
     };
 
     using InternalScalars = std::vector<InternalScalar>;
@@ -362,6 +380,14 @@ public:
         return mInputScalars.size();
     }
 
+    // The flat field index of input scalar i within mSharedStateType, recorded once by
+    // constructStateTypes as it lays out the struct. See InternalScalar::getFieldIndex
+    // for why this must be read rather than independently recomputed.
+    unsigned getInputScalarFieldIndex(const unsigned i) const {
+        assert (i < mInputScalarFieldIndex.size());
+        return mInputScalarFieldIndex[i];
+    }
+
     virtual void setInputScalarAt(const unsigned i, Scalar * value);
 
     const Bindings & getOutputScalarBindings() const {
@@ -379,6 +405,12 @@ public:
 
     LLVM_READNONE unsigned getNumOfScalarOutputs() const {
         return mOutputScalars.size();
+    }
+
+    // See getInputScalarFieldIndex.
+    unsigned getOutputScalarFieldIndex(const unsigned i) const {
+        assert (i < mOutputScalarFieldIndex.size());
+        return mOutputScalarFieldIndex[i];
     }
 
     Scalar * getOutputScalarAt(const unsigned i) const {
@@ -418,6 +450,25 @@ public:
         mThreadLocalStateType = stateTy;
     }
 
+    // When two distinct Kernel instances share one already-constructed state type
+    // (e.g. PipelineCompiler::constructImplicitKernelStateTypes deduplicating implicit
+    // kernels by signature), only the ORIGINAL instance's constructStateTypes call ever
+    // records field indices (see InternalScalar::getFieldIndex). The instance that
+    // merely reuses the type must have those same indices copied onto its own scalars,
+    // or they are left at NO_FIELD_INDEX. `other` must have identical scalar composition
+    // (guaranteed by the caller having matched on signature).
+    void copyScalarFieldIndicesFrom(const Kernel & other) {
+        assert (mInputScalars.size() == other.mInputScalars.size());
+        assert (mOutputScalars.size() == other.mOutputScalars.size());
+        assert (mInternalScalars.size() == other.mInternalScalars.size());
+        mInputScalarFieldIndex = other.mInputScalarFieldIndex;
+        mOutputScalarFieldIndex = other.mOutputScalarFieldIndex;
+        const auto n = mInternalScalars.size();
+        for (unsigned i = 0; i < n; ++i) {
+            mInternalScalars[i].setFieldIndex(other.mInternalScalars[i].getFieldIndex());
+        }
+    }
+
     llvm::StructType * getThreadLocalStateType(llvm::LLVMContext & C) const;
 
     std::string makeCacheName(KernelBuilder & b);
@@ -431,6 +482,8 @@ public:
     void generateKernel(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType);
 
     void loadCachedKernel(const llvm::Module * m);
+
+    void recordScalarFieldIndices();
 
     struct LocalBufferFlagSet {
         enum LocalBufferFlagType : uint32_t {
@@ -661,6 +714,11 @@ protected:
     Bindings                            mInputScalars;
     Bindings                            mOutputScalars;
     InternalScalars                     mInternalScalars;
+    // Parallel to mInputScalars/mOutputScalars (Binding carries no kernel-state-layout
+    // bookkeeping of its own, unlike InternalScalar); recorded once by
+    // constructStateTypes. See InternalScalar::getFieldIndex.
+    std::vector<unsigned>               mInputScalarFieldIndex;
+    std::vector<unsigned>               mOutputScalarFieldIndex;
     std::string                         mKernelName;
     llvm::StructType *                  mSharedStateType = nullptr;
     llvm::StructType *                  mThreadLocalStateType = nullptr;

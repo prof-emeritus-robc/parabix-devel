@@ -29,6 +29,7 @@ void PipelineCompiler::constructImplicitKernelStateTypes(KernelBuilder & b) {
                 assert (K->getSharedStateType() == nullptr || !K->getSharedStateType()->isEmptyTy());
                 K->setThreadLocalStateType(other->getThreadLocalStateType());
                 assert (K->getThreadLocalStateType() == nullptr || !K->getThreadLocalStateType()->isEmptyTy());
+                K->copyScalarFieldIndicesFrom(*other);
             }
         }
     }

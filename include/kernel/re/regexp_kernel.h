@@ -78,24 +78,26 @@ private:
 
 class FixedDistanceMatchesKernel : public pablo::PabloKernel {
 public:
-    FixedDistanceMatchesKernel(LLVMTypeSystemInterface & ts, unsigned distance, 
+    FixedDistanceMatchesKernel(LLVMTypeSystemInterface & ts, unsigned distance, unsigned length,
                                kernel::StreamSet * Basis, kernel::StreamSet * Matches, kernel::StreamSet * ToCheck  = nullptr);
 protected:
     void generatePabloMethod() override;
 private:
     unsigned mMatchDistance;
+    unsigned mMatchLength;
     bool mHasCheckStream;
 };
 
 class CodePointMatchKernel : public pablo::PabloKernel {
 public:
-    CodePointMatchKernel(LLVMTypeSystemInterface & ts, 
-                         UCD::property_t prop, unsigned distance, 
+    CodePointMatchKernel(LLVMTypeSystemInterface & ts,
+                         UCD::property_t prop, unsigned distance, unsigned length,
                          kernel::StreamSet * Basis, kernel::StreamSet * Matches);
 protected:
     void generatePabloMethod() override;
 private:
     unsigned mMatchDistance;
+    unsigned mMatchLength;
     UCD::property_t mProperty;
 };
 

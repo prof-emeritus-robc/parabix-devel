@@ -14,9 +14,6 @@ namespace re {
 RE * FixedReferenceTransformer::transformReference(Reference * r) {
     auto rg1 = getLengthRange(r->getCapture(), &cc::Unicode);
     if (rg1.first != rg1.second) return r;
-    if (rg1.first != 1) {
-        llvm::report_fatal_error("Capture length > 1 is a future extension");
-    }
     std::string instanceName = r->getInstanceName();
     auto mapping = mRefInfo.twixtREs.find(instanceName);
     if (mapping == mRefInfo.twixtREs.end()) return r;
@@ -26,7 +23,7 @@ RE * FixedReferenceTransformer::transformReference(Reference * r) {
     std::string pname = p == UCD::identity ? "Unicode" : UCD::getPropertyFullName(p);
     auto fixed_dist = std::to_string(rg1.first + rg2.first);
     auto matchLen = std::to_string(rg1.first);
-    std::string externalName = pname + "@-" + fixed_dist + "_" + matchLen;
+    std::string externalName = pname + "_dist_" + fixed_dist + "_" + matchLen;
     return createName(externalName, r);
 }
 }

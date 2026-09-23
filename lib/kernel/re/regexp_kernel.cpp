@@ -260,38 +260,48 @@ void RE_Kernel::generatePabloMethod() {
     pb.createAssign(output, value);
 }
 
-PabloAST * matchDistanceCheck(PabloBuilder & b, unsigned distance, std::vector<PabloAST *> basis1, std::vector<PabloAST *> basis2) {
+// Checks a `length`-character (fixed) window at fixed `distance`: basis1
+// advanced by distance is XOR'd against basis2 to give a single per-character
+// mismatch signal (differ). A match of the whole length-character capture
+// requires `length` consecutive 0 bits in differ; OR-ing `length - 1` shifted
+// copies of differ collapses that run down to a single 0 bit at the position
+// where the whole window matches.
+PabloAST * matchDistanceCheck(PabloBuilder & b, unsigned distance, unsigned length, std::vector<PabloAST *> basis1, std::vector<PabloAST *> basis2) {
     PabloAST * differ = b.createZeroes();
     for (unsigned i = 0; i < basis1.size(); i++) {
         PabloAST * advanced = b.createAdvance(basis1[i], distance);
         differ = b.createOr(differ, b.createXor(advanced, basis2[i]));
     }
-    return differ;
+    PabloAST * match = b.createInFile(b.createNot(differ));
+    for (unsigned j = 1; j < length; j++) {
+        match = b.createAnd(match, b.createAdvance(match, 1), "dist_match_" + std::to_string(distance) + "_len_" + std::to_string(j+1));
+    }
+    return match;
 }
 
 void FixedDistanceMatchesKernel::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
     auto basis = getInputStreamSet("Basis");
-    Var * mismatch = pb.createVar("mismatch", pb.createZeroes());
+    Var * match = pb.createVar("match", pb.createZeroes());
     if (mHasCheckStream) {
         auto ToCheck = getInputStreamSet("ToCheck")[0];
         auto it = pb.createScope();
         pb.createIf(ToCheck, it);
-        PabloAST * differ = matchDistanceCheck(it, mMatchDistance, basis, basis);
-        it.createAssign(mismatch, it.createAnd(ToCheck, differ));
+        PabloAST * m = matchDistanceCheck(it, mMatchDistance, mMatchLength, basis, basis);
+        it.createAssign(match, it.createAnd(ToCheck, m));
     } else {
-        pb.createAssign(mismatch, matchDistanceCheck(pb, mMatchDistance, basis, basis));
+        pb.createAssign(match, matchDistanceCheck(pb, mMatchDistance, mMatchLength, basis, basis));
     }
     Var * const MatchVar = getOutputStreamVar("Matches");
-    pb.createAssign(pb.createExtract(MatchVar, pb.getInteger(0)), pb.createNot(mismatch, "matches"));
+    pb.createAssign(pb.createExtract(MatchVar, pb.getInteger(0)), match);
 }
 
-FixedDistanceMatchesKernel::FixedDistanceMatchesKernel (LLVMTypeSystemInterface & ts, unsigned distance, StreamSet * Basis, StreamSet * Matches, StreamSet * ToCheck)
-: PabloKernel(ts, "Distance_" + std::to_string(distance) + "_Matches_" + std::to_string(Basis->getNumElements()) + "x1" + (ToCheck == nullptr ? "" : "_withCheck"),
+FixedDistanceMatchesKernel::FixedDistanceMatchesKernel (LLVMTypeSystemInterface & ts, unsigned distance, unsigned length, StreamSet * Basis, StreamSet * Matches, StreamSet * ToCheck)
+: PabloKernel(ts, "Distance_" + std::to_string(distance) + "_len" + std::to_string(length) + "_Matches_" + std::to_string(Basis->getNumElements()) + "x1" + (ToCheck == nullptr ? "" : "_withCheck"),
 // inputs
 {Binding{"Basis", Basis}},
 // output
-{Binding{"Matches", Matches}}), mMatchDistance(distance), mHasCheckStream(ToCheck != nullptr) {
+{Binding{"Matches", Matches}}), mMatchDistance(distance), mMatchLength(length), mHasCheckStream(ToCheck != nullptr) {
     if (mHasCheckStream) {
         mInputStreamSets.push_back({"ToCheck", ToCheck});
     }
@@ -324,17 +334,17 @@ void CodePointMatchKernel::generatePabloMethod() {
                 transformed[i] = basis[i];
             }
         }
-        PabloAST * mismatch;
+        PabloAST * match;
         bool involution = ((mProperty == UCD::bpb) || (mProperty == UCD::bmg));
         if (involution) {
-            mismatch = matchDistanceCheck(pb, mMatchDistance, transformed, basis);
+            match = matchDistanceCheck(pb, mMatchDistance, mMatchLength, transformed, basis);
         } else {
-            mismatch = matchDistanceCheck(pb, mMatchDistance, transformed, transformed);
+            match = matchDistanceCheck(pb, mMatchDistance, mMatchLength, transformed, transformed);
         }
         if (!nullSet.empty()) {
-            mismatch = pb.createOr(mismatch, nullVar);
+            match = pb.createAnd(match, pb.createNot(nullVar));
         }
-        PabloAST * matches = pb.createInFile(pb.createNot(mismatch));
+        PabloAST * matches = pb.createInFile(match);
         Var * const MatchVar = getOutputStreamVar("Matches");
         pb.createAssign(pb.createExtract(MatchVar, pb.getInteger(0)), matches);
     } else {
@@ -342,13 +352,14 @@ void CodePointMatchKernel::generatePabloMethod() {
     }
 }
 
-CodePointMatchKernel::CodePointMatchKernel (LLVMTypeSystemInterface & ts, UCD::property_t prop, unsigned distance, StreamSet * Basis, StreamSet * Matches)
-: PabloKernel(ts, getPropertyEnumName(prop) + "_dist_" + std::to_string(distance) + "_Matches_" + std::to_string(Basis->getNumElements()) + "x1" + UTF::kernelAnnotation(),
+CodePointMatchKernel::CodePointMatchKernel (LLVMTypeSystemInterface & ts, UCD::property_t prop, unsigned distance, unsigned length, StreamSet * Basis, StreamSet * Matches)
+: PabloKernel(ts, getPropertyEnumName(prop) + "_dist_" + std::to_string(distance) + "_len" + std::to_string(length) + "_Matches_" + std::to_string(Basis->getNumElements()) + "x1" + UTF::kernelAnnotation(),
 // inputs
 {Binding{"Basis", Basis}},
 // output
 {Binding{"Matches", Matches}}),
     mMatchDistance(distance),
+    mMatchLength(length),
     mProperty(prop) {
 }
 
@@ -654,10 +665,7 @@ RE * RE_PipelineBuilder::processReferences(RE * re) {
             re::Reference * ref = cast<re::Reference>(m.second);
             UCD::property_t p = ref->getReferencedProperty();
             std::string instanceName = ref->getInstanceName();
-            auto captureLen = getLengthRange(ref->getCapture(), &cc::Unicode).first;
-            if (captureLen != 1) {
-                llvm::report_fatal_error("Capture length > 1 is a future extension");
-            }
+            unsigned captureLen = static_cast<unsigned>(getLengthRange(ref->getCapture(), &cc::Unicode).first);
             auto mapping = mRefInfo.twixtREs.find(instanceName);
             auto twixtLen = getLengthRange(mapping->second, &cc::Unicode).first;
             auto dist = captureLen + twixtLen;
@@ -670,13 +678,13 @@ RE * RE_PipelineBuilder::processReferences(RE * re) {
                 StreamSet * propertyBasis = mPB.CreateStreamSet(ccs.size());
                 mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, mCtxt.mCodeUnitStream, propertyBasis);
                 StreamSet * distStrm = mPB.CreateStreamSet(1);
-                mPB.CreateKernelCall<FixedDistanceMatchesKernel>(dist, propertyBasis, distStrm);
+                mPB.CreateKernelCall<FixedDistanceMatchesKernel>(dist, captureLen, propertyBasis, distStrm);
                 addExternal(name, ExternalStream{ExternalStreamKind::FixedLength, 0u, {1, 1}, distStrm});
             } else if (isa<UCD::CodePointPropertyObject>(propObj)) {
                 // Identity or other codepoint properties
                 StreamSet * distStrm = mPB.CreateStreamSet(1);
-                mPB.CreateKernelCall<CodePointMatchKernel>(p, dist, mCtxt.mCodeUnitStream, distStrm);
-                addExternal(name, ExternalStream{ExternalStreamKind::FixedLength, 0u, {1, 1}, distStrm});
+                mPB.CreateKernelCall<CodePointMatchKernel>(p, dist, captureLen, mCtxt.mCodeUnitStream, distStrm);
+                addExternal(name, ExternalStream{ExternalStreamKind::FixedLength, 0u, {captureLen, captureLen}, distStrm});
             } else {
                 llvm::report_fatal_error("Property reference must be an enumerated or codepoint property.");
             }

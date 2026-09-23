@@ -1159,4 +1159,52 @@ xzwy
 <grepcase regexp="\A{xy|wz}" datafile="permuted" greplines="5 9"/>
 <grepcase regexp="\A{xy|w}" datafile="permuted" greplines="1 9"/>
 <grepcase regexp="\A{x|y&lt;z|w}" datafile="permuted" greplines="1 3 4 7 9 10"/>
+
+<!-- Multi-character fixed-length backreferences (capture length > 1). -->
+<datafile id="ascii_multichar_backref">abab
+abcd
+abcabc
+abcxyz
+foo bar foo
+abcabd
+abcdabc
+wordsword extra
+foo bar
+wxyzwxyz
+wxyzwxya
+aa
+ab
+abc_abc
+The cat catcat sat
+</datafile>
+<grepcase regexp="(ab)\1" datafile="ascii_multichar_backref" greplines="1"/>
+<grepcase regexp="(abc)\1" datafile="ascii_multichar_backref" greplines="3"/>
+<grepcase regexp="(word)s\1" datafile="ascii_multichar_backref" greplines="8"/>
+<grepcase regexp="(wxyz)\1" datafile="ascii_multichar_backref" greplines="10"/>
+<grepcase regexp="(a)\1" datafile="ascii_multichar_backref" greplines="12"/>
+<grepcase regexp="(cat)\1" datafile="ascii_multichar_backref" greplines="15"/>
+
+<!-- Multi-character backreferences with non-ASCII (multi-byte UTF-8) capture content. -->
+<datafile id="unicode_multichar_backref">你你
+你坏
+你X你
+你X坏
+你好你好
+你好你坏
+你好X你好
+你好X你坏
+рере
+реды
+😀😀
+😀😢
+a你a你
+a你a坏
+</datafile>
+<grepcase regexp="(你)\1" datafile="unicode_multichar_backref" greplines="1"/>
+<grepcase regexp="(你).\1" datafile="unicode_multichar_backref" greplines="3 5 6 13"/>
+<grepcase regexp="(你好)\1" datafile="unicode_multichar_backref" greplines="5"/>
+<grepcase regexp="(你好)X\1" datafile="unicode_multichar_backref" greplines="7"/>
+<grepcase regexp="(ре)\1" datafile="unicode_multichar_backref" greplines="9"/>
+<grepcase regexp="(😀)\1" datafile="unicode_multichar_backref" greplines="11"/>
+<grepcase regexp="(a你)\1" datafile="unicode_multichar_backref" greplines="13"/>
 </greptest>

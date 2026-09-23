@@ -278,7 +278,7 @@ void GrepEngine::initRE(re::RE * re) {
     // fixed length UTF-8 sequences only, then UTF-8 can be used
     // for most efficient processing.   Otherwise we must use full
     // Unicode length calculations.
-    bool useFixedUTF8 = !UnicodeIndexing && validateFixedUTF8(mRE);
+    bool useFixedUTF8 = !UnicodeIndexing && validateFixedUTF8(mRE) && !hasReference(mRE);
     useFixedUTF8 = useFixedUTF8 && !(mGrepRecordBreak == GrepRecordBreakKind::Unicode);
     if (useFixedUTF8) {
         mLengthAlphabet = &cc::UTF8;
@@ -310,7 +310,7 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         P.captureByteData("Source", ByteStream);
     }
-    if ((mLengthAlphabet == &cc::Unicode) || !byteTestsWithinLimit(mRE, ByteCClimit)) {
+    if ((mLengthAlphabet == &cc::Unicode) || hasReference(mRE) || !byteTestsWithinLimit(mRE, ByteCClimit)) {
         StreamSet * BasisBits = P.CreateStreamSet(ENCODING_BITS, 1);
         Selected_S2P(P, ByteStream, BasisBits);
         Source = BasisBits;

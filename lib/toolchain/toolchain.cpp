@@ -17,6 +17,7 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <thread>
+#include <cstdlib>
 
 #if defined(PARABIX_ARM_TARGET)
 #include <llvm/TargetParser/AArch64TargetParser.h>
@@ -518,7 +519,30 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     if (hiding.size() != 0) {
         gentlyHideUnrelatedOptions(ArrayRef<const cl::OptionCategory *>(hiding));
     }
-    cl::ParseCommandLineOptions(argc, argv, overview);
+
+    // Every Parabix tool and test binary funnels its argv through here, so this is a
+    // single choke point to uniformly inject extra flags via the TEST_FLAGS environment
+    // variable, e.g. `TEST_FLAGS="--use-mcjit" make check` to run the whole test suite
+    // under a different backend/setting without editing every test script or
+    // CMakeLists.txt COMMAND. Whitespace-separated; appended after argv's own flags, so
+    // an explicit flag on the command line still takes precedence for any option where
+    // cl::opt keeps the first occurrence. A no-op when unset, which is the overwhelming
+    // majority of invocations, including every normal (non-test) run of any of these
+    // programs -- quoted values containing spaces are not supported, matching the same
+    // naive whitespace-splitting convention as CFLAGS/CXXFLAGS-style environment variables
+    // elsewhere in the C/C++ build ecosystem.
+    std::vector<std::string> extraArgStorage;
+    std::vector<const char *> expandedArgv(argv, argv + argc);
+    if (const char * const testFlags = std::getenv("TEST_FLAGS")) {
+        boost::split(extraArgStorage, std::string(testFlags), boost::is_any_of(" \t"), boost::token_compress_on);
+        for (const auto & arg : extraArgStorage) {
+            if (!arg.empty()) {
+                expandedArgv.push_back(arg.c_str());
+            }
+        }
+    }
+
+    cl::ParseCommandLineOptions((int)expandedArgv.size(), expandedArgv.data(), overview);
     if(BlockSize == 0) {
         BlockSize = DefaultBlockSizeForFeatures(MapFeatureNames(GetFeatureNames()));
     }

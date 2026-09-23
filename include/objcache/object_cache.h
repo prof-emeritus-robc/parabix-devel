@@ -66,6 +66,7 @@ protected:
 private:
     void initiateCacheCleanUp() noexcept;
     bool requiresCacheCleanUp() noexcept;
+    bool cachejanitordAppearsAlive() noexcept;
 private:
     static bool         mStartedCacheCleanupDaemon;
     ObjectBufferCache   mCachedObject;

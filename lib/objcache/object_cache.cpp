@@ -18,6 +18,7 @@
 #include <llvm/IR/Verifier.h>
 #include <llvm/ADT/STLFunctionalExtras.h>
 #include <system_error>
+#include <csignal>
 
 using namespace llvm;
 using namespace boost;
@@ -252,10 +253,36 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief cachejanitordAppearsAlive
+ *
+ * A cheap, best-effort check for whether a cachejanitord is already running, to avoid
+ * needlessly forking+exec'ing+daemonizing a redundant one. This is NOT airtight: two
+ * processes launched close enough together can still both pass it before either's
+ * daemon has actually relocked the pid file (see requiresCacheCleanUp's own fcntl-based
+ * check, which is race-prone the same way -- the daemon's own internal lock is the only
+ * thing that actually guarantees at most one janitor ever runs its cleanup loop). But
+ * since ParabixObjectCache's constructor runs once per process, and this repo's test
+ * suite launches many short-lived tool invocations in quick succession, this closes the
+ * overwhelmingly common case: a prior janitor from an earlier invocation is still alive,
+ * so nothing needs to be spawned at all.
+ ** ------------------------------------------------------------------------------------------------------------- */
+inline bool ParabixObjectCache::cachejanitordAppearsAlive() noexcept {
+    std::ifstream in((fs::path{mCachePath.c_str()} / DAEMON_FILE).string());
+    if (!in) return false;
+    pid_t pid = 0;
+    in >> pid;
+    if (pid <= 0) return false;
+    return kill(pid, 0) == 0;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief requiresCacheCleanUp
  ** ------------------------------------------------------------------------------------------------------------- */
 inline bool ParabixObjectCache::requiresCacheCleanUp() noexcept {
     if (LLVM_UNLIKELY(mStartedCacheCleanupDaemon)) {
+        return false;
+    }
+    if (cachejanitordAppearsAlive()) {
         return false;
     }
     // if we cannot lock the pid file then an earlier process

@@ -658,16 +658,16 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
 RE * RE_PipelineBuilder::processReferences(RE * re) {
     re::ReferenceInfo mRefInfo = re::buildReferenceInfo(re);
     if (!mRefInfo.twixtREs.empty()) {
-        re::FixedReferenceTransformer FRT(mRefInfo);
+        re::FixedReferenceTransformer FRT(mRefInfo, *mCtxt.mLengthAlphabet);
         RE * xfrmed = FRT.transformRE(re);
         for (auto m : FRT.mNameMap) {
             auto name = m.first;
             re::Reference * ref = cast<re::Reference>(m.second);
             UCD::property_t p = ref->getReferencedProperty();
             std::string instanceName = ref->getInstanceName();
-            unsigned captureLen = static_cast<unsigned>(getLengthRange(ref->getCapture(), &cc::Unicode).first);
+            unsigned captureLen = static_cast<unsigned>(getLengthRange(ref->getCapture(), mCtxt.mLengthAlphabet).first);
             auto mapping = mRefInfo.twixtREs.find(instanceName);
-            auto twixtLen = getLengthRange(mapping->second, &cc::Unicode).first;
+            auto twixtLen = getLengthRange(mapping->second, mCtxt.mLengthAlphabet).first;
             auto dist = captureLen + twixtLen;
             UCD::PropertyObject * propObj = UCD::getPropertyObject(p);
             if (auto * obj = dyn_cast<UCD::EnumeratedPropertyObject>(propObj)) {

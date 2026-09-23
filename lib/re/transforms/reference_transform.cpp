@@ -12,12 +12,12 @@ namespace re {
 
 
 RE * FixedReferenceTransformer::transformReference(Reference * r) {
-    auto rg1 = getLengthRange(r->getCapture(), &cc::Unicode);
+    auto rg1 = getLengthRange(r->getCapture(), &mAlphabet);
     if (rg1.first != rg1.second) return r;
     std::string instanceName = r->getInstanceName();
     auto mapping = mRefInfo.twixtREs.find(instanceName);
     if (mapping == mRefInfo.twixtREs.end()) return r;
-    auto rg2 = getLengthRange(mapping->second, &cc::Unicode);
+    auto rg2 = getLengthRange(mapping->second, &mAlphabet);
     if (rg2.first != rg2.second) return r;
     UCD::property_t p = r->getReferencedProperty();
     std::string pname = p == UCD::identity ? "Unicode" : UCD::getPropertyFullName(p);

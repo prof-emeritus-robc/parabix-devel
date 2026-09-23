@@ -403,7 +403,7 @@ void __print_pipeline_cycle_counter_report(const uint64_t numOfKernels,
  * @brief printOptionalCycleCounter
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::printOptionalCycleCounter(KernelBuilder & b) {
-#warning not right for phases yet
+    // TODO: not right for phases yet
 #if 1
     if (LLVM_UNLIKELY(EnableCycleCounter)) {
         ConstantInt * const ZERO = b.getInt32(0);
@@ -939,7 +939,7 @@ void PipelineCompiler::addUnconsumedItemCountProperties(KernelBuilder & b, unsig
  * @brief recordStridesPerSegment
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::recordUnconsumedItemCounts(KernelBuilder & b) {
-#warning fix me
+    // TODO: fix me
     if (LLVM_UNLIKELY(TraceUnconsumedItemCounts)) {
         const auto n = out_degree(mKernelId, mBufferGraph);
         if (LLVM_UNLIKELY(n == 0)) {
@@ -1129,7 +1129,6 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
  * @brief addItemCountDeltaProperties
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::addItemCountDeltaProperties(KernelBuilder & b, const unsigned kernel, const StringRef suffix) const {
-    const auto n = out_degree(kernel, mBufferGraph);
     LLVMContext & C = b.getContext();
     //IntegerType * const sizeTy = b.getSizeTy();
     //ArrayType * const logTy = ArrayType::get(ArrayType::get(sizeTy, n), ITEM_COUNT_DELTA_CHUNK_LENGTH);

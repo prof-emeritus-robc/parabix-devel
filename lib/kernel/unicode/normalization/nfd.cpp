@@ -57,10 +57,6 @@ using namespace kernel;
 using namespace llvm;
 using namespace pablo;
 
-#define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
-#define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
-#define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
-
 const unsigned S_Index_bits = 14;
 const unsigned L_Index_bits = 5;
 const unsigned V_Index_bits = 5;

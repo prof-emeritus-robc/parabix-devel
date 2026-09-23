@@ -29,7 +29,7 @@ void PipelineCompiler::generateMetaDataForRepeatingStreamSets(KernelBuilder & b)
         for (unsigned i = 0; i < m; ++i) {
             const Kernel * const kernel = kernels[i].Object;
             if (LLVM_UNLIKELY(kernel->hasInternallyGeneratedStreamSets())) {
-                bool found = false;
+                [[maybe_unused]] bool found = false;
                 for (auto k = FirstKernel; k <= LastKernel; ++k) {
                     if (getKernel(k) == kernel) {
                         maxStrides.push_back(b.getSize(MaximumNumOfStrides[k]));

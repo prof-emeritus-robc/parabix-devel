@@ -72,7 +72,6 @@ extern "C" size_t find_icu_word_boundaries(const uint8_t* utf8Text, int32_t utf8
     // the break positions are byte offsets into the UTF-8 buffer.
         int32_t pos = ubrk_first(bi);  // pos is a byte offset (index) reported by ICU for a word boundary.
         while (pos != UBRK_DONE) { // iterate through all boundaries, there are no more boundaries
-        int32_t rule = ubrk_getRuleStatus(bi); // get the rule status for this boundary(whether the break is a word boundary and its kind)
 
             // Map rule statuses to readable names for debug output.
             // We'll only print statuses that correspond to real word

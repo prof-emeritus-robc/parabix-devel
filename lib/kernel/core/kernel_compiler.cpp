@@ -1234,9 +1234,6 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         return b.CreateInBoundsGEP(i8Ty, handle, idx);
     };
 
-    IntegerType * const intPtrTy = DL.getIntPtrType(b.getContext());
-
-
 
 
     auto enumerate = [&](const Bindings & bindings, const size_t initialIndex,

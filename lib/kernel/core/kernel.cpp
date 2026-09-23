@@ -306,7 +306,7 @@ void Kernel::loadCachedKernel(const Module * m) {
  * @brief linkExternalMethods
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::linkExternalMethods(KernelBuilder & b) {
-    Module * const m = b.getModule(); assert (m);
+    [[maybe_unused]] Module * const m = b.getModule(); assert (m);
     if (mFlags & Kernel::KernelFlags::HasInternallyManagedStreamSet) {
         StreamSetBuffer::linkFunctions(b);
     }

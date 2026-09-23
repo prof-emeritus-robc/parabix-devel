@@ -784,7 +784,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
                 segmentArgs[segmentArgCount++] = b.getSize(0);
                 if (LLVM_UNLIKELY(checkStreamSet)) {
                     assert (segmentArgCount < doSegment->arg_size());
-#warning keep this in array to read out
+                    // TODO: keep this in array to read out
                     segmentArgs[segmentArgCount++] = b.CreateAllocaAtEntryPoint(sizeTy, nullptr);
                 }
             } else {
@@ -893,7 +893,7 @@ Function * PipelineKernel::addOrDeclareMainFunction(KernelBuilder & b, const Mai
         toFree.push_back(threadLocalHandle);
     }
 
-#warning this is being compiled into the kernel, not passed in
+    // TODO: this is being compiled into the kernel, not passed in
 
     const auto segLength = (codegen::SegmentSize + getStride()  - 1U) / getStride();
 

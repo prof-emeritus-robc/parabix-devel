@@ -541,7 +541,7 @@ void PipelineCompiler::writeInitiallyTerminatedPartitionExit(KernelBuilder & b) 
     // NOTE: this branches to the next partition regardless of the jump target destination.
 
     const auto nextPartitionId = mCurrentPartitionId + 1U;
-    const auto oneAfterLastPartition = PartitionPhaseBoundaries[mCurrentPipelinePhase];
+    [[maybe_unused]] const auto oneAfterLastPartition = PartitionPhaseBoundaries[mCurrentPipelinePhase];
     assert (nextPartitionId <= oneAfterLastPartition);
     const auto jumpTargetId = PartitionJumpTargetId[mCurrentPartitionId];
     assert (nextPartitionId <= jumpTargetId);
@@ -734,8 +734,6 @@ void PipelineCompiler::checkForPartitionExit(KernelBuilder & b) {
             mPartitionStartTimePhi[nextPartitionId]->addIncoming(mCycleCounters[TOTAL_TIME], exitBlock);
             mCycleCounters[TOTAL_TIME] = mPartitionStartTimePhi[nextPartitionId];
         }
-
-        const auto n = LastStreamSet - FirstStreamSet + 1U;
 
         for (auto streamSet = FirstStreamSet; streamSet <= LastStreamSet; ++streamSet) {
             PHINode * const phi = mPartitionProducedItemCountPhi[nextPartitionId][streamSet - FirstStreamSet];

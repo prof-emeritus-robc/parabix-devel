@@ -371,7 +371,7 @@ namespace audio
         : PabloKernel(b, "AmplifyPabloKernel_" + std::to_string(factor) + "_" + std::to_string(inputStreams->getNumElements()) + "_" + std::to_string(bitsPerSample),
                       {Binding{"inputStreams", inputStreams}},
                       {Binding{"outputStreams", outputStreams}}),
-          bitsPerSample(bitsPerSample), numInputStreams(inputStreams->getNumElements()), factor(factor)
+          factor(factor)
     {
         if (inputStreams->getNumElements() != outputStreams->getNumElements())
         {

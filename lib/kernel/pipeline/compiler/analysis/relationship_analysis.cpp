@@ -855,7 +855,7 @@ struct RelationshipGraphBuilder {
         }
         for (const auto & K : mKernels) {
             const Kernel * kernel = K.Object;
-            #warning replace kernelflags with attribute?
+            // TODO: replace kernelflags with attribute?
             if (LLVM_UNLIKELY(kernel->hasAttribute(AttrId::SideEffecting) || kernel->getKernelFlags() & Kernel::KernelFlags::RequiresIllustratorObject)) {
                 const auto k = G.find(RelationshipNode::IsKernel, kernel);
                 if (visited.insert(k).second) {

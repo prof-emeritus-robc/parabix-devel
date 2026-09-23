@@ -1244,7 +1244,7 @@ start_of_transfer_loop:
     PartitionGraph partGraph(finalComponentCount);
 
     size_t currentCompId = 0;
-    size_t priorPhaseId = 0;
+    [[maybe_unused]] size_t priorPhaseId = 0;
 
     for (unsigned compId = 0; compId < componentCount; ++compId) {
         const auto index = ordering[compId];

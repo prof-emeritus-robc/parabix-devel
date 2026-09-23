@@ -203,7 +203,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
                 allocArgs.push_back(initialSharedState);
             }
             allocArgs.push_back(cThreadLocal);
-#warning this needs to be scaled by buffer-segments
+            // TODO: this needs to be scaled by buffer-segments
             allocArgs.push_back(getNumOfStrides());
             b.CreateCall(allocInternal->getFunctionType(), allocInternal, allocArgs);
         }
@@ -723,7 +723,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
                     nextCheckSegmentPhi->addIncoming(startOfNextPeriodPhi, exitBlock);
                     activeThreadsPhi->addIncoming(currentNumOfThreadsPhi, exitBlock);
                 } else if (mUseDynamicMultithreading) {
-                    #warning fix this for phases
+                    // TODO: fix this for phases
                     FixedArray<Value *, 2> indices2;
                     indices2[0] = sz_ZERO;
                     indices2[1] = b.getInt32(CURRENT_THREAD_STATUS_FLAG);
@@ -733,7 +733,7 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
                 }
                 assert (hasTermSignal);
 
-#warning need to change pipeline stall detection logic for layers
+                // TODO: need to change pipeline stall detection logic for layers
 
                 #ifndef PHASES_RUN_TO_COMPLETION
                 // We may have passed the phase limit if multiple threads are processing this phase

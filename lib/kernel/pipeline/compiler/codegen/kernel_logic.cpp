@@ -146,7 +146,6 @@ Value * PipelineCompiler::subtractLookahead(KernelBuilder & b, const BufferPort 
  * @brief getThreadLocalHandlePtr
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::getThreadLocalHandlePtr(KernelBuilder & b, const unsigned kernelIndex, const bool commonThreadLocal) const {
-    const Kernel * const kernel = getKernel(kernelIndex);
     const auto prefix = makeKernelName(kernelIndex);
     Value * handle = nullptr;
     if (LLVM_UNLIKELY(commonThreadLocal)) {

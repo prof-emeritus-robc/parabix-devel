@@ -104,8 +104,6 @@ namespace audio
         void generatePabloMethod() override;
 
     private:
-        unsigned int bitsPerSample;
-        unsigned int numInputStreams;
         unsigned int factor;
     };
 

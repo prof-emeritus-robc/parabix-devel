@@ -262,7 +262,7 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
     const auto maxTimeVal = maxTime.count();
     const auto limit = start + maxTime;
 
-    for (unsigned g = 0; ; ++g) {
+    for (;;) {
 
         const auto now = system_clock::now();
         if (now >= limit) break;

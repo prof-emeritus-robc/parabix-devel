@@ -1076,7 +1076,9 @@ __unwind_callback (struct _Unwind_Context *context, void *data) {
 
 #endif // ENABLE_LIBBACKTRACE
 
-constexpr StringRef __BACKTRACE_STRUCT_NAME{"__bkstruct"};
+// Only referenced under !NDEBUG (below) and, separately, under ENABLE_LIBBACKTRACE
+// (generateBacktraceMethod); a release build without libbacktrace uses neither.
+[[maybe_unused]] constexpr StringRef __BACKTRACE_STRUCT_NAME{"__bkstruct"};
 
 void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::initializer_list<Value *> params) {
 

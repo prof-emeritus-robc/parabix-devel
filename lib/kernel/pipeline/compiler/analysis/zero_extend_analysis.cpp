@@ -72,9 +72,8 @@ void PipelineAnalysis::identifyZeroExtendedStreamSets() {
         // enumerate the input relations
         for (const auto e : make_iterator_range(in_edges(kernel, mStreamGraph))) {
             const auto k = source(e, mStreamGraph);
-            const RelationshipNode & rn = mStreamGraph[k];
+            [[maybe_unused]] const RelationshipNode & rn = mStreamGraph[k];
             assert (rn.Type == RelationshipNode::IsBinding);
-            const Binding & binding = rn.Binding;
             const RelationshipType & port = mStreamGraph[e];
 
             if (LLVM_UNLIKELY(in_degree(k, mStreamGraph) != 1)) {

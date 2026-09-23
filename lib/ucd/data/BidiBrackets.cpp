@@ -21,24 +21,24 @@ namespace UCD {
         [2047, 207c], [207f, 208c], [208f, 2307], [230c, 2328],
         [232b, 2767], [2776, 27c4], [27c7, 27e5], [27f0, 2982],
         [2999, 29d7], [29dc, 29fb], [29fe, 2e21], [2e2a, 2e54],
-        [2e5d, 3007], [3012, 3013], [301c, fe58], [fe5f, ff07],
-        [ff0a, ff3a], [ff3c, ff3c], [ff3e, ff5a], [ff5c, ff5c],
-        [ff5e, ff5e], [ff61, ff61], [ff64, 10ffff]*/
+        [2e5d, 2e61], [2e64, 3007], [3012, 3013], [301c, fe58],
+        [fe5f, ff07], [ff0a, ff3a], [ff3c, ff3c], [ff3e, ff5a],
+        [ff5c, ff5c], [ff5e, ff5e], [ff61, ff61], [ff64, 10ffff]*/
 
         const static UnicodeSet::run_t __null_codepoint_set_runs[] = {
         {Full, 1}, {Mixed, 3}, {Full, 117}, {Mixed, 1}, {Full, 58},
         {Mixed, 1}, {Full, 77}, {Mixed, 3}, {Full, 19}, {Mixed, 2},
         {Full, 33}, {Mixed, 1}, {Full, 2}, {Mixed, 2}, {Full, 12},
-        {Mixed, 1}, {Full, 1}, {Mixed, 2}, {Full, 33}, {Mixed, 2},
-        {Full, 13}, {Mixed, 1}, {Full, 1649}, {Mixed, 1}, {Full, 5},
+        {Mixed, 1}, {Full, 1}, {Mixed, 2}, {Full, 33}, {Mixed, 3},
+        {Full, 12}, {Mixed, 1}, {Full, 1649}, {Mixed, 1}, {Full, 5},
         {Mixed, 4}, {Full, 32772}};
         const static UnicodeSet::bitquad_t __null_codepoint_set_quads[] = {
         0xfffffcff, 0xd7ffffff, 0xd7ffffff, 0xc3ffffff, 0xe7ffffff,
         0xffffff9f, 0x9fffffff, 0xffff9fff, 0xfffff0ff, 0xfffff9ff,
         0xffc000ff, 0xffffff9f, 0xffff003f, 0xfe000007, 0xf0ffffff,
-        0xcfffffff, 0xfffffc03, 0xe01fffff, 0xf00c00ff, 0x81ffffff,
-        0xfffffcff, 0xd7ffffff, 0x57ffffff, 0xfffffff2};
-        const static UnicodeSet null_codepoint_set{__null_codepoint_set_runs, 27, __null_codepoint_set_quads, 24};
+        0xcfffffff, 0xfffffc03, 0xe01fffff, 0xfffffff3, 0xf00c00ff,
+        0x81ffffff, 0xfffffcff, 0xd7ffffff, 0x57ffffff, 0xfffffff2};
+        const static UnicodeSet null_codepoint_set{__null_codepoint_set_runs, 27, __null_codepoint_set_quads, 25};
 
 
         /* Code Point Ranges for bpb mapping to <codepoint>
@@ -81,18 +81,19 @@ namespace UCD {
         {0x2e28, 0x2e29}, {0x2e29, 0x2e28}, {0x2e55, 0x2e56},
         {0x2e56, 0x2e55}, {0x2e57, 0x2e58}, {0x2e58, 0x2e57},
         {0x2e59, 0x2e5a}, {0x2e5a, 0x2e59}, {0x2e5b, 0x2e5c},
-        {0x2e5c, 0x2e5b}, {0x3008, 0x3009}, {0x3009, 0x3008},
-        {0x300a, 0x300b}, {0x300b, 0x300a}, {0x300c, 0x300d},
-        {0x300d, 0x300c}, {0x300e, 0x300f}, {0x300f, 0x300e},
-        {0x3010, 0x3011}, {0x3011, 0x3010}, {0x3014, 0x3015},
-        {0x3015, 0x3014}, {0x3016, 0x3017}, {0x3017, 0x3016},
-        {0x3018, 0x3019}, {0x3019, 0x3018}, {0x301a, 0x301b},
-        {0x301b, 0x301a}, {0xfe59, 0xfe5a}, {0xfe5a, 0xfe59},
-        {0xfe5b, 0xfe5c}, {0xfe5c, 0xfe5b}, {0xfe5d, 0xfe5e},
-        {0xfe5e, 0xfe5d}, {0xff08, 0xff09}, {0xff09, 0xff08},
-        {0xff3b, 0xff3d}, {0xff3d, 0xff3b}, {0xff5b, 0xff5d},
-        {0xff5d, 0xff5b}, {0xff5f, 0xff60}, {0xff60, 0xff5f},
-        {0xff62, 0xff63}, {0xff63, 0xff62}};
+        {0x2e5c, 0x2e5b}, {0x2e62, 0x2e63}, {0x2e63, 0x2e62},
+        {0x3008, 0x3009}, {0x3009, 0x3008}, {0x300a, 0x300b},
+        {0x300b, 0x300a}, {0x300c, 0x300d}, {0x300d, 0x300c},
+        {0x300e, 0x300f}, {0x300f, 0x300e}, {0x3010, 0x3011},
+        {0x3011, 0x3010}, {0x3014, 0x3015}, {0x3015, 0x3014},
+        {0x3016, 0x3017}, {0x3017, 0x3016}, {0x3018, 0x3019},
+        {0x3019, 0x3018}, {0x301a, 0x301b}, {0x301b, 0x301a},
+        {0xfe59, 0xfe5a}, {0xfe5a, 0xfe59}, {0xfe5b, 0xfe5c},
+        {0xfe5c, 0xfe5b}, {0xfe5d, 0xfe5e}, {0xfe5e, 0xfe5d},
+        {0xff08, 0xff09}, {0xff09, 0xff08}, {0xff3b, 0xff3d},
+        {0xff3d, 0xff3b}, {0xff5b, 0xff5d}, {0xff5d, 0xff5b},
+        {0xff5f, 0xff60}, {0xff60, 0xff5f}, {0xff62, 0xff63},
+        {0xff63, 0xff62}};
         static CodePointPropertyObject property_object(bpb,
                                                     std::move(null_codepoint_set),
                                                     std::move(reflexive_set),
@@ -107,21 +108,22 @@ PropertyObject * get_BPB_PropertyObject() {  return & BPB_ns::property_object; }
     [007e, 0f39], [0f3e, 169a], [169d, 2044], [2047, 207c], [207f, 208c],
     [208f, 2307], [230c, 2328], [232b, 2767], [2776, 27c4], [27c7, 27e5],
     [27f0, 2982], [2999, 29d7], [29dc, 29fb], [29fe, 2e21], [2e2a, 2e54],
-    [2e5d, 3007], [3012, 3013], [301c, fe58], [fe5f, ff07], [ff0a, ff3a],
-    [ff3c, ff3c], [ff3e, ff5a], [ff5c, ff5c], [ff5e, ff5e], [ff61, ff61],
-    [ff64, 10ffff] */
+    [2e5d, 2e61], [2e64, 3007], [3012, 3013], [301c, fe58], [fe5f, ff07],
+    [ff0a, ff3a], [ff3c, ff3c], [ff3e, ff5a], [ff5c, ff5c], [ff5e, ff5e],
+    [ff61, ff61], [ff64, 10ffff] */
     const static UnicodeSet::run_t __n_Set_runs[] = {
     {Full, 1}, {Mixed, 3}, {Full, 117}, {Mixed, 1}, {Full, 58}, {Mixed, 1},
     {Full, 77}, {Mixed, 3}, {Full, 19}, {Mixed, 2}, {Full, 33}, {Mixed, 1},
     {Full, 2}, {Mixed, 2}, {Full, 12}, {Mixed, 1}, {Full, 1}, {Mixed, 2},
-    {Full, 33}, {Mixed, 2}, {Full, 13}, {Mixed, 1}, {Full, 1649},
+    {Full, 33}, {Mixed, 3}, {Full, 12}, {Mixed, 1}, {Full, 1649},
     {Mixed, 1}, {Full, 5}, {Mixed, 4}, {Full, 32772}};
     const static UnicodeSet::bitquad_t __n_Set_quads[] = {
     0xfffffcff, 0xd7ffffff, 0xd7ffffff, 0xc3ffffff, 0xe7ffffff, 0xffffff9f,
     0x9fffffff, 0xffff9fff, 0xfffff0ff, 0xfffff9ff, 0xffc000ff, 0xffffff9f,
     0xffff003f, 0xfe000007, 0xf0ffffff, 0xcfffffff, 0xfffffc03, 0xe01fffff,
-    0xf00c00ff, 0x81ffffff, 0xfffffcff, 0xd7ffffff, 0x57ffffff, 0xfffffff2};
-    const static UnicodeSet n_Set{__n_Set_runs, 27, __n_Set_quads, 24};
+    0xfffffff3, 0xf00c00ff, 0x81ffffff, 0xfffffcff, 0xd7ffffff, 0x57ffffff,
+    0xfffffff2};
+    const static UnicodeSet n_Set{__n_Set_runs, 27, __n_Set_quads, 25};
 
     /* Code Point Ranges for o
     [0028, 0028], [005b, 005b], [007b, 007b], [0f3a, 0f3a], [0f3c, 0f3c],
@@ -133,23 +135,24 @@ PropertyObject * get_BPB_PropertyObject() {  return & BPB_ns::property_object; }
     [298d, 298d], [298f, 298f], [2991, 2991], [2993, 2993], [2995, 2995],
     [2997, 2997], [29d8, 29d8], [29da, 29da], [29fc, 29fc], [2e22, 2e22],
     [2e24, 2e24], [2e26, 2e26], [2e28, 2e28], [2e55, 2e55], [2e57, 2e57],
-    [2e59, 2e59], [2e5b, 2e5b], [3008, 3008], [300a, 300a], [300c, 300c],
-    [300e, 300e], [3010, 3010], [3014, 3014], [3016, 3016], [3018, 3018],
-    [301a, 301a], [fe59, fe59], [fe5b, fe5b], [fe5d, fe5d], [ff08, ff08],
-    [ff3b, ff3b], [ff5b, ff5b], [ff5f, ff5f], [ff62, ff62] */
+    [2e59, 2e59], [2e5b, 2e5b], [2e62, 2e62], [3008, 3008], [300a, 300a],
+    [300c, 300c], [300e, 300e], [3010, 3010], [3014, 3014], [3016, 3016],
+    [3018, 3018], [301a, 301a], [fe59, fe59], [fe5b, fe5b], [fe5d, fe5d],
+    [ff08, ff08], [ff3b, ff3b], [ff5b, ff5b], [ff5f, ff5f], [ff62, ff62] */
     const static UnicodeSet::run_t __o_Set_runs[] = {
     {Empty, 1}, {Mixed, 3}, {Empty, 117}, {Mixed, 1}, {Empty, 58},
     {Mixed, 1}, {Empty, 77}, {Mixed, 3}, {Empty, 19}, {Mixed, 2},
     {Empty, 33}, {Mixed, 1}, {Empty, 2}, {Mixed, 2}, {Empty, 12},
-    {Mixed, 1}, {Empty, 1}, {Mixed, 2}, {Empty, 33}, {Mixed, 2},
-    {Empty, 13}, {Mixed, 1}, {Empty, 1649}, {Mixed, 1}, {Empty, 5},
+    {Mixed, 1}, {Empty, 1}, {Mixed, 2}, {Empty, 33}, {Mixed, 3},
+    {Empty, 12}, {Mixed, 1}, {Empty, 1649}, {Mixed, 1}, {Empty, 5},
     {Mixed, 4}, {Empty, 32772}};
     const static UnicodeSet::bitquad_t __o_Set_quads[] = {
     0x00000100, 0x08000000, 0x08000000, 0x14000000, 0x08000000, 0x00000020,
     0x20000000, 0x00002000, 0x00000500, 0x00000200, 0x00155500, 0x00000020,
     0x00005540, 0x00aaaaa8, 0x05000000, 0x10000000, 0x00000154, 0x0aa00000,
-    0x05515500, 0x2a000000, 0x00000100, 0x08000000, 0x88000000, 0x00000004};
-    const static UnicodeSet o_Set{__o_Set_runs, 27, __o_Set_quads, 24};
+    0x00000004, 0x05515500, 0x2a000000, 0x00000100, 0x08000000, 0x88000000,
+    0x00000004};
+    const static UnicodeSet o_Set{__o_Set_runs, 27, __o_Set_quads, 25};
 
     /* Code Point Ranges for c
     [0029, 0029], [005d, 005d], [007d, 007d], [0f3b, 0f3b], [0f3d, 0f3d],
@@ -161,23 +164,24 @@ PropertyObject * get_BPB_PropertyObject() {  return & BPB_ns::property_object; }
     [298e, 298e], [2990, 2990], [2992, 2992], [2994, 2994], [2996, 2996],
     [2998, 2998], [29d9, 29d9], [29db, 29db], [29fd, 29fd], [2e23, 2e23],
     [2e25, 2e25], [2e27, 2e27], [2e29, 2e29], [2e56, 2e56], [2e58, 2e58],
-    [2e5a, 2e5a], [2e5c, 2e5c], [3009, 3009], [300b, 300b], [300d, 300d],
-    [300f, 300f], [3011, 3011], [3015, 3015], [3017, 3017], [3019, 3019],
-    [301b, 301b], [fe5a, fe5a], [fe5c, fe5c], [fe5e, fe5e], [ff09, ff09],
-    [ff3d, ff3d], [ff5d, ff5d], [ff60, ff60], [ff63, ff63] */
+    [2e5a, 2e5a], [2e5c, 2e5c], [2e63, 2e63], [3009, 3009], [300b, 300b],
+    [300d, 300d], [300f, 300f], [3011, 3011], [3015, 3015], [3017, 3017],
+    [3019, 3019], [301b, 301b], [fe5a, fe5a], [fe5c, fe5c], [fe5e, fe5e],
+    [ff09, ff09], [ff3d, ff3d], [ff5d, ff5d], [ff60, ff60], [ff63, ff63] */
     const static UnicodeSet::run_t __c_Set_runs[] = {
     {Empty, 1}, {Mixed, 3}, {Empty, 117}, {Mixed, 1}, {Empty, 58},
     {Mixed, 1}, {Empty, 77}, {Mixed, 3}, {Empty, 19}, {Mixed, 2},
     {Empty, 33}, {Mixed, 1}, {Empty, 2}, {Mixed, 2}, {Empty, 12},
-    {Mixed, 1}, {Empty, 1}, {Mixed, 2}, {Empty, 33}, {Mixed, 2},
-    {Empty, 13}, {Mixed, 1}, {Empty, 1649}, {Mixed, 1}, {Empty, 5},
+    {Mixed, 1}, {Empty, 1}, {Mixed, 2}, {Empty, 33}, {Mixed, 3},
+    {Empty, 12}, {Mixed, 1}, {Empty, 1649}, {Mixed, 1}, {Empty, 5},
     {Mixed, 4}, {Empty, 32772}};
     const static UnicodeSet::bitquad_t __c_Set_quads[] = {
     0x00000200, 0x20000000, 0x20000000, 0x28000000, 0x10000000, 0x00000040,
     0x40000000, 0x00004000, 0x00000a00, 0x00000400, 0x002aaa00, 0x00000040,
     0x0000aa80, 0x01555550, 0x0a000000, 0x20000000, 0x000002a8, 0x15400000,
-    0x0aa2aa00, 0x54000000, 0x00000200, 0x20000000, 0x20000000, 0x00000009};
-    const static UnicodeSet c_Set{__c_Set_runs, 27, __c_Set_quads, 24};
+    0x00000008, 0x0aa2aa00, 0x54000000, 0x00000200, 0x20000000, 0x20000000,
+    0x00000009};
+    const static UnicodeSet c_Set{__c_Set_runs, 27, __c_Set_quads, 25};
     static EnumeratedPropertyObject property_object
         {bpt,
         BPT_ns::independent_prop_values,

@@ -6084,6 +6084,10 @@ const static BranchMap NFKD_3014_map {
     {0x70B9, NFKD_3014_70B9},
     {0x76D7, NFKD_3014_76D7}};
 const static Trie NFKD_3014(NFKD_3014_map);
+const static Trie NFKD_3053_3068(0x1B123);
+const static BranchMap NFKD_3053_map {
+    {0x3068, NFKD_3053_3068}};
+const static Trie NFKD_3053(NFKD_3053_map);
 const static Trie NFKD_307B_304B(0x1F200);
 const static BranchMap NFKD_307B_map {
     {0x304B, NFKD_307B_304B}};
@@ -6421,9 +6425,13 @@ const static Trie NFKD_30C8_3099_30EB(0x3326);
 const static BranchMap NFKD_30C8_3099_map {
     {0x30EB, NFKD_30C8_3099_30EB}};
 const static Trie NFKD_30C8_3099(NFKD_30C8_3099_map);
+const static Trie NFKD_30C8_30AD(0x1B124);
+const static Trie NFKD_30C8_30C6(0x1B125);
 const static Trie NFKD_30C8_30F3(0x3327);
 const static BranchMap NFKD_30C8_map {
     {0x3099, NFKD_30C8_3099},
+    {0x30AD, NFKD_30C8_30AD},
+    {0x30C6, NFKD_30C8_30C6},
     {0x30F3, NFKD_30C8_30F3}};
 const static Trie NFKD_30C8(NFKD_30C8_map);
 const static Trie NFKD_30CA_30CE(0x3328);
@@ -6726,6 +6734,10 @@ const static Trie NFKD_30E6_30A2(NFKD_30E6_30A2_map);
 const static BranchMap NFKD_30E6_map {
     {0x30A2, NFKD_30E6_30A2}};
 const static Trie NFKD_30E6(NFKD_30E6_map);
+const static Trie NFKD_30E8_30EA(0x1B126);
+const static BranchMap NFKD_30E8_map {
+    {0x30EA, NFKD_30E8_30EA}};
+const static Trie NFKD_30E8(NFKD_30E8_map);
 const static Trie NFKD_30EA_30C3_30C8_30EB(0x3351);
 const static BranchMap NFKD_30EA_30C3_30C8_map {
     {0x30EB, NFKD_30EA_30C3_30C8_30EB}};
@@ -6933,6 +6945,7 @@ const static BranchMap NFKD_map {
     {0x222B, NFKD_222B},
     {0x222E, NFKD_222E},
     {0x3014, NFKD_3014},
+    {0x3053, NFKD_3053},
     {0x307B, NFKD_307B},
     {0x3088, NFKD_3088},
     {0x30A2, NFKD_30A2},
@@ -6963,6 +6976,7 @@ const static BranchMap NFKD_map {
     {0x30E1, NFKD_30E1},
     {0x30E4, NFKD_30E4},
     {0x30E6, NFKD_30E6},
+    {0x30E8, NFKD_30E8},
     {0x30EA, NFKD_30EA},
     {0x30EB, NFKD_30EB},
     {0x30EC, NFKD_30EC},

@@ -47,18 +47,19 @@ PropertyObject * get_LC_PropertyObject() {  return & LC_ns::property_object; }
         [1fb2, 1fb4], [1fb6, 1fb7], [1fbc, 1fbc], [1fc2, 1fc4],
         [1fc6, 1fc7], [1fcc, 1fcc], [1fd2, 1fd3], [1fd6, 1fd7],
         [1fe2, 1fe4], [1fe6, 1fe7], [1ff2, 1ff4], [1ff6, 1ff7],
-        [1ffc, 1ffc], [fb00, fb06], [fb13, fb17]*/
+        [1ffc, 1ffc], [fb00, fb06], [fb13, fb17], [1df95, 1df95]*/
 
         const static UnicodeSet::run_t __explicitly_defined_set_runs[] = {
         {Empty, 6}, {Mixed, 1}, {Empty, 3}, {Mixed, 1}, {Empty, 4},
         {Mixed, 1}, {Empty, 12}, {Mixed, 2}, {Empty, 14}, {Mixed, 1},
         {Empty, 199}, {Mixed, 1}, {Empty, 5}, {Mixed, 1}, {Empty, 1},
-        {Full, 1}, {Mixed, 3}, {Empty, 1752}, {Mixed, 1}, {Empty, 32807}};
+        {Full, 1}, {Mixed, 3}, {Empty, 1752}, {Mixed, 1}, {Empty, 1827},
+        {Mixed, 1}, {Empty, 30979}};
         const static UnicodeSet::bitquad_t __explicitly_defined_set_quads[] = {
         0x80000000, 0x00000200, 0x00010000, 0x00010000, 0x00010000,
         0x00000080, 0x07c00000, 0x00550000, 0x10dcffff, 0x00cc10dc,
-        0x10dc00dc, 0x00f8007f};
-        const static UnicodeSet explicitly_defined_set{__explicitly_defined_set_runs, 20, __explicitly_defined_set_quads, 12};
+        0x10dc00dc, 0x00f8007f, 0x00200000};
+        const static UnicodeSet explicitly_defined_set{__explicitly_defined_set_runs, 22, __explicitly_defined_set_quads, 13};
 
 
         const static std::vector<unsigned> buffer_offsets = {
@@ -69,7 +70,7 @@ PropertyObject * get_LC_PropertyObject() {  return & LC_ns::property_object; }
         334, 340, 346, 352, 358, 364, 370, 375, 380, 385, 392, 397, 403,
         408, 413, 418, 425, 430, 437, 444, 449, 456, 463, 470, 475, 480,
         487, 493, 498, 503, 508, 515, 520, 523, 526, 529, 533, 537, 540,
-        543, 548, 553, 558, 563, 568};
+        543, 548, 553, 558, 563, 568, 571};
         const static char string_buffer alignas(64) [768] = u8R"__(SS
 ʼN
 J̌
@@ -172,6 +173,7 @@ ST
 ՄԻ
 ՎՆ
 ՄԽ
+SS
 )__";
         const unsigned maxLgth = 3;
         const static std::vector<codepoint_t> defined_cps{
@@ -187,7 +189,7 @@ ST
         0x1fc6, 0x1fc7, 0x1fcc, 0x1fd2, 0x1fd3, 0x1fd6, 0x1fd7, 0x1fe2,
         0x1fe3, 0x1fe4, 0x1fe6, 0x1fe7, 0x1ff2, 0x1ff3, 0x1ff4, 0x1ff6,
         0x1ff7, 0x1ffc, 0xfb00, 0xfb01, 0xfb02, 0xfb03, 0xfb04, 0xfb05,
-        0xfb06, 0xfb13, 0xfb14, 0xfb15, 0xfb16, 0xfb17};
+        0xfb06, 0xfb13, 0xfb14, 0xfb15, 0xfb16, 0xfb17, 0x1df95};
         static StringOverridePropertyObject property_object(uc,
                                                     suc,
                                                     std::move(explicitly_defined_set),
@@ -205,25 +207,26 @@ PropertyObject * get_UC_PropertyObject() {  return & UC_ns::property_object; }
         [1fb4, 1fb4], [1fb6, 1fb7], [1fc2, 1fc2], [1fc4, 1fc4],
         [1fc6, 1fc7], [1fd2, 1fd3], [1fd6, 1fd7], [1fe2, 1fe4],
         [1fe6, 1fe7], [1ff2, 1ff2], [1ff4, 1ff4], [1ff6, 1ff7],
-        [fb00, fb06], [fb13, fb17]*/
+        [fb00, fb06], [fb13, fb17], [1df95, 1df95]*/
 
         const static UnicodeSet::run_t __explicitly_defined_set_runs[] = {
         {Empty, 6}, {Mixed, 1}, {Empty, 3}, {Mixed, 1}, {Empty, 4},
         {Mixed, 1}, {Empty, 12}, {Mixed, 2}, {Empty, 14}, {Mixed, 1},
         {Empty, 199}, {Mixed, 1}, {Empty, 5}, {Mixed, 1}, {Empty, 2},
-        {Mixed, 3}, {Empty, 1752}, {Mixed, 1}, {Empty, 32807}};
+        {Mixed, 3}, {Empty, 1752}, {Mixed, 1}, {Empty, 1827}, {Mixed, 1},
+        {Empty, 30979}};
         const static UnicodeSet::bitquad_t __explicitly_defined_set_quads[] = {
         0x80000000, 0x00000200, 0x00010000, 0x00010000, 0x00010000,
         0x00000080, 0x07c00000, 0x00550000, 0x00d40000, 0x00cc00d4,
-        0x00d400dc, 0x00f8007f};
-        const static UnicodeSet explicitly_defined_set{__explicitly_defined_set_runs, 19, __explicitly_defined_set_quads, 12};
+        0x00d400dc, 0x00f8007f, 0x00200000};
+        const static UnicodeSet explicitly_defined_set{__explicitly_defined_set_runs, 21, __explicitly_defined_set_quads, 13};
 
 
         const static std::vector<unsigned> buffer_offsets = {
         0, 3, 7, 11, 18, 25, 30, 34, 38, 42, 46, 50, 55, 62, 69, 76, 82, 87,
         92, 99, 105, 110, 115, 122, 129, 136, 141, 148, 155, 162, 167, 172,
         179, 185, 190, 195, 202, 205, 208, 211, 215, 219, 222, 225, 230,
-        235, 240, 245, 250};
+        235, 240, 245, 250, 253};
         const static char string_buffer alignas(64) [256] = u8R"__(Ss
 ʼN
 J̌
@@ -272,6 +275,7 @@ St
 Մի
 Վն
 Մխ
+Ss
 )__";
         const unsigned maxLgth = 3;
         const static std::vector<codepoint_t> defined_cps{
@@ -280,7 +284,8 @@ St
         0x1fb4, 0x1fb6, 0x1fb7, 0x1fc2, 0x1fc4, 0x1fc6, 0x1fc7, 0x1fd2,
         0x1fd3, 0x1fd6, 0x1fd7, 0x1fe2, 0x1fe3, 0x1fe4, 0x1fe6, 0x1fe7,
         0x1ff2, 0x1ff4, 0x1ff6, 0x1ff7, 0xfb00, 0xfb01, 0xfb02, 0xfb03,
-        0xfb04, 0xfb05, 0xfb06, 0xfb13, 0xfb14, 0xfb15, 0xfb16, 0xfb17};
+        0xfb04, 0xfb05, 0xfb06, 0xfb13, 0xfb14, 0xfb15, 0xfb16, 0xfb17,
+        0x1df95};
         static StringOverridePropertyObject property_object(tc,
                                                     stc,
                                                     std::move(explicitly_defined_set),

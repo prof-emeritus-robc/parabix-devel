@@ -452,6 +452,19 @@ bool hasCodepointReference(const RE * r) {
     return !CodepointReferenceFree().validateRE(r);
 }
 
+struct PropertyReferenceFree : public RE_Validator {
+    PropertyReferenceFree() : RE_Validator("PropertyReferenceFree") {}
+
+    bool validateReference(const Reference * ref) override {
+        UCD::property_t p = ref->getReferencedProperty();
+        return p != UCD::identity;
+    }
+};
+
+bool hasPropertyReference(const RE * r) {
+    return !PropertyReferenceFree().validateRE(r);
+}
+
 bool hasAssertion(const RE * re) {
     if (isa<CC>(re) || isa<Any>(re)) {
         return false;

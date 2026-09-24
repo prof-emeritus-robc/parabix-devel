@@ -278,7 +278,7 @@ void GrepEngine::initRE(re::RE * re) {
     // fixed length UTF-8 sequences only, then UTF-8 can be used
     // for most efficient processing.   Otherwise we must use full
     // Unicode length calculations.
-    bool useFixedUTF8 = !UnicodeIndexing && validateFixedUTF8(mRE) && !hasReference(mRE);
+    bool useFixedUTF8 = !UnicodeIndexing && validateFixedUTF8(mRE) && !hasPropertyReference(mRE);
     useFixedUTF8 = useFixedUTF8 && !(mGrepRecordBreak == GrepRecordBreakKind::Unicode);
     if (useFixedUTF8) {
         mLengthAlphabet = &cc::UTF8;

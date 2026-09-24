@@ -494,7 +494,20 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
                 // ELITISM: always keep the fittest candidate for the next generation
                 chosen.insert(fittestIndividual);
                 std::uniform_real_distribution<double> selector(0, sumX);
-                while (chosen.size() < maxCandidates) {
+                // A wide enough fitness spread makes some candidates' exp()-weighted
+                // contributions to sumX numerically insignificant (more than double
+                // precision's ~1e16x dynamic range smaller than the running total),
+                // silently lost by sumX += y above -- their weights[] slot then differs
+                // from its neighbour by nothing a random draw can land between, making
+                // that index effectively unreachable here. Confirmed in practice as a
+                // reproducible hang (csv2json_test under make check): unbounded retries
+                // waiting for a random draw that may never come. Bound the attempts and
+                // deterministically fill any remaining slots, so termination doesn't
+                // depend on how skewed the fitness distribution happens to be.
+                unsigned selectionAttempts = 0;
+                const unsigned maxSelectionAttempts = 100 * maxCandidates;
+                while (chosen.size() < maxCandidates && selectionAttempts < maxSelectionAttempts) {
+                    ++selectionAttempts;
                     const auto d = selector(rng);
                     assert (d < sumX);
                     const auto f = std::upper_bound(weights.begin(), weights_end, d);
@@ -502,6 +515,9 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
                     const unsigned j = std::distance(weights.begin(), f);
                     assert (j < newPopulationSize);
                     chosen.insert(j);
+                }
+                for (unsigned i = 0; i < newPopulationSize && chosen.size() < maxCandidates; ++i) {
+                    chosen.insert(i);
                 }
                 for (unsigned i : chosen) {
                     assert (i < newPopulationSize);

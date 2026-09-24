@@ -1055,7 +1055,7 @@ start_of_transfer_loop:
 
                         auto & C = CurrentPart.AllKernels;
                         auto toErase = std::lower_bound(C.begin(), C.end(), potentiallyTransferedKernel);
-                        assert (toErase != T.end() && *toErase == potentiallyTransferedKernel);
+                        assert (toErase != C.end() && *toErase == potentiallyTransferedKernel);
                         C.erase(toErase);
 
                         assert (potentiallyTransferedKernel != root || C.empty());

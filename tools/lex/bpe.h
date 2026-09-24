@@ -42,6 +42,17 @@ struct MergeRule {
     // so it sees the producer's stamp; --batch-writeback is disabled for the whole
     // group (stamp must be eager, not deferred to kernel end).
     bool needsLiveId = false;
+    // --chain-veto. A COMPETITOR is a lower-rank rule claiming this rule's idB as ITS
+    // idA: on the same bytes it fires first, so this merge must not happen. vetoIdB
+    // holds those competitors' RIGHT part ids; at runtime the rule reads the id one
+    // slot past idB (vetoOff) from the FROZEN kernel input and stands down when it
+    // matches any of them. Empty = no veto emitted for this rule.
+    std::vector<unsigned> vetoIdB;
+    // Distance from A's start to that probe slot: lenA + lenB in byte space. But
+    // --compact-base rewrites lenA into a SLOT distance while lenB stays a raw byte
+    // count, so applyCompactionSchedule recomputes this as slotSpan(idA)+slotSpan(idB)
+    // and widens the group's LookAhead bound to cover it (T5). 0 when vetoIdB is empty.
+    unsigned vetoOff = 0;
 };
 
 // One id-range group of merge rules, sorted by idAB ASC (= rank ASC). maxLen =

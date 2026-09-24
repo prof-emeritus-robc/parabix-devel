@@ -195,6 +195,44 @@ static cl::opt<bool> ChainPartition(
              "kernel) instead of taking the next level."),
     cl::init(false));
 
+// Chain veto (--level-partition): relax the maxLeft/idB seam — "a lower-rank rule
+// already claims my idB as ITS idA" — and pay for it with a runtime test instead of a
+// kernel boundary.
+//
+// Rules A+B->AB (rank 1), C+D->CD (rank 2), AB+C->ABC (rank 3). maxLeft[C] == CD's
+// level forces ABC one level later, because on "ABCD" the lower-rank CD must consume C
+// first and ABC must NOT fire. Instead of the split, ABC checks CD itself: the id one
+// slot PAST the merged token (offset lenA+lenB, i.e. right after C) is read from the
+// FROZEN kernel input and compared against D.
+//     veto     = EQ(LookAhead(src, lenA+lenB), idD)   // ... OR idE, one per competitor
+//     fire_ABC = fire_AB AND hasC AND NOT veto
+// "ABCD" -> veto=1, ABC suppressed, CD fires in the same kernel. "ABCX" -> veto=0, ABC
+// fires. Both match HF.
+//
+// Competitor set is exact and small. Rules are scheduled in rank order, so every
+// lower-rank rule with idA == this rule's idB is already placed when this rule lands:
+//   - competitor at a STRICTLY EARLIER level already stamped its merged id over idB's
+//     slot, so this rule's own B-detect fails on its own — no veto term needed;
+//   - a LATER-level competitor cannot exist, rank order places it first;
+//   - a SAME-level competitor is exactly what this flag creates, and exactly what
+//     vetoIdB lists.
+//
+// Veto recursion is handled by REFUSING the relaxation, never by approximating it. A
+// competitor can itself be beaten (D+E at a lower rank kills C+D, so ABC SHOULD fire —
+// a depth-1 veto would wrongly suppress it). Such a competitor carries a non-empty
+// vetoIdB of its own, so if any candidate is itself vetoed, this rule falls back to the
+// strict level and takes the kernel split.
+//
+// Independent of --chain-partition: the veto reads ONLY the frozen kernel input, never
+// the producer's fire or a live idAcc, so it is emitted identically for a flat sibling
+// rule (emitBody) and a nested chain child (emitChainBody).
+static cl::opt<bool> ChainVeto(
+    "chain-veto",
+    cl::desc("With --level-partition, let a rule share its level with the lower-rank "
+             "rules claiming its idB, suppressing the merge at runtime when such a "
+             "competitor applies, instead of splitting the kernel."),
+    cl::init(false));
+
 static cl::opt<bool> LookaheadInGate(
     "lookahead-in-gate",
     cl::desc("Build the B-detection LookAhead inside each rule's if-gate (per-rule, "
@@ -422,7 +460,13 @@ protected:
 uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
     uint64_t h = 0xCBF29CE484222325ull;
     auto mix = [&](uint64_t x){ h = (h ^ x) * 0x100000001B3ull; };
-    for (const auto & r : rules) { mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenA); mix(r.lenB); }
+    // vetoOff/vetoIdB shape the Pablo body (an extra peek + one EQ per competitor)
+    // without touching any field above, so they must be mixed in too — T7.
+    for (const auto & r : rules) {
+        mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenA); mix(r.lenB);
+        mix(r.vetoOff);
+        for (unsigned v : r.vetoIdB) mix(v | 0x8000000000000000ull);
+    }
     return h;
 }
 
@@ -490,6 +534,14 @@ static std::vector<bool> applyCompactionSchedule(
             if (nCompact == 0 && d != r.lenA) firstBlockDisagree++;
             r.lenA = d;
             if (d > maxDist) maxDist = d;
+            // --chain-veto: the probe sits one slot past idB, so its slot-space distance
+            // is slotSpan(idA) + slotSpan(idB) — lenB alone is still a BYTE count here.
+            // It can exceed every lenA in the group, so it must widen maxDist too, or the
+            // LookAhead binding comes up short and the kernel refuses to compile (T5).
+            if (!r.vetoIdB.empty()) {
+                r.vetoOff = d + slotSpan(r.idB);
+                if (r.vetoOff > maxDist) maxDist = r.vetoOff;
+            }
         }
         // Update the maximum length in the current rule range.
         g.maxLen = maxDist;                   // LookAhead binding must cover every lenA
@@ -591,6 +643,7 @@ public:
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
                         + (BatchWriteback ? "bw1_" : "bw0_")
                         + (ChainPartition ? "cp1_" : "cp0_")
+                        + (ChainVeto ? "cv1_" : "cv0_")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -765,6 +818,45 @@ protected:
             return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask, "Astart_" + std::to_string(id));
         };
 
+        // --chain-veto: suppress this rule where a lower-rank competitor claims its idB.
+        // Reads the id one slot PAST idB (r.vetoOff) from the frozen kernel input; if it
+        // is that competitor's right part, the competitor applies here, wins on rank, and
+        // this merge must not fire. One peek serves every competitor (all probe the same
+        // slot), one EQ each. Returns `fire` untouched when the rule carries no veto, so
+        // both emission paths call it unconditionally. Reads nothing but the kernel
+        // input, which is why it needs neither nesting nor --chain-partition.
+        auto applyVeto = [&](auto & body, const MergeRule & r, PabloAST * fire) -> PabloAST * {
+            if (r.vetoIdB.empty()) return fire;
+            if (mUseNextId)   // --indexed-shift: no byte-distance LookAhead exists here
+                llvm::report_fatal_error("--chain-veto is incompatible with --indexed-shift");
+            std::vector<PabloAST*> vbits(W);
+            for (unsigned i = 0; i < W; i++)
+                vbits[i] = body.createLookahead(srcBits[i], (int64_t) r.vetoOff);
+            cc::Parabix_CC_Compiler_Builder ccVeto(BixNum(vbits.begin(), vbits.end()));
+            PabloAST * veto = nullptr;
+            for (unsigned vid : r.vetoIdB) {
+                PabloAST * hit = ccVeto.compileCC("veto_" + std::to_string(r.idB) + "_" + std::to_string(vid),
+                                                  re::makeCC(vid), body);
+                veto = veto ? body.createOr(veto, hit) : hit;
+            }
+            // The competitor only wins if it could actually FIRE, and it is subject to
+            // the same pretoken-boundary rule this kernel applies to every merge: a
+            // merge whose right part begins a new pretoken is blocked. The competitor's
+            // right part sits at vetoOff, so a boundary there means the competitor can
+            // never run and must not suppress anything.
+            //
+            // GPT-2's regex splits contractions, which makes this reachable rather than
+            // theoretical: in "al-Mu'minin", "'m" is its own pretoken and "inin" the
+            // next, so the lower-rank competitor m+in straddles the boundary and is
+            // blocked — HF merges '+m. Without this gate the veto killed that merge
+            // (first mismatch at token 2687270 of the 49MB val.txt run).
+            if (mHasBoundary) {
+                PabloAST * bAtVeto = body.createLookahead(boundaryBit, (int64_t) r.vetoOff);
+                veto = body.createAnd(veto, body.createNot(bAtVeto), "vetoLive_" + std::to_string(r.idAB));
+            }
+            return body.createAnd(fire, body.createNot(veto), "vetoed_" + std::to_string(r.idAB));
+        };
+
         // One rule's fire → B-detect + stamp all idAB bits + consume B, all inside `body`
         // (the gated scope, so it's block-skippable). fireStart is supplied by the caller
         // (per-rule Astart) and MUST already be AND-ed with the live mask — eqAstart
@@ -801,6 +893,7 @@ protected:
                     : boundaryAheadByLen.at(r.lenA);
                 fire = body.createAnd(fire, body.createNot(bAhead));
             }
+            fire = applyVeto(body, r, fire);
 
             // Batched: no stamp in the gate — just OR the fire into the shared
             // accumulators; the id-stamp write is applied once per kernel below (see
@@ -945,6 +1038,7 @@ protected:
                 PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
                 fire = body.createAnd(fire, body.createNot(bAhead));
             }
+            fire = applyVeto(body, r, fire);   // same helper the flat path uses
             PabloAST * notStamp = body.createNot(fire);
             for (unsigned i = 0; i < W_out; i++) {
                 if ((r.idAB >> i) & 1u)
@@ -1403,6 +1497,10 @@ static unsigned rawByteLen(const std::string & s) {
 // NOTE `hi` is a WIDTH BOUND ONLY — under levels it is ~50k from the first kernel on, so
 // it is NOT an "everything below is already stamped" watermark; applyCompactionSchedule
 // asks kernelOf[] instead. `lo` is the level's lowest idAB — informational (debug dump).
+// --chain-veto bookkeeping, reported on the [BPE] stderr dump.
+static unsigned gChainVetoRelaxed = 0;   // rules carrying a runtime veto
+static unsigned gChainVetoTerms   = 0;   // total competitor EQs those rules emit
+
 static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules) {
     std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps i
     // token -> highest level using it as idA  
@@ -1445,9 +1543,39 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         // consumed an X-run position... so frozen==live"). 
         if (AsymmetricSeam && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
         else after(maxRight, r.idA);
-        after(maxLeft,   r.idB);      // seam: an earlier rule claimed this token as its A
-                                      // — unfixable in-kernel (forward LookAhead reads
-                                      // frozen input only, T5); always enforced.
+        // seam: an earlier rule claimed this token as its A. Without --chain-veto this is
+        // a hard split — the forward LookAhead reads frozen input only (T5), so a
+        // same-kernel competitor's consume of idB is invisible. With it, the rule tests
+        // the competitor itself and stands down at runtime (see ChainVeto).
+        std::vector<unsigned> veto;
+        bool relaxed = false;
+        if (ChainVeto && r.idA != r.idB) {
+            unsigned lvlStrict = lvl, lvlRelaxed = lvl;      // lvl = level ignoring maxLeft
+            auto ml = maxLeft.find(r.idB);
+            if (ml != maxLeft.end()) {
+                if (ml->second + 1u > lvlStrict)  lvlStrict  = ml->second + 1u;
+                if (ml->second      > lvlRelaxed) lvlRelaxed = ml->second;
+            }
+            if (lvlRelaxed < lvlStrict && lvlRelaxed >= 1 && lvlRelaxed <= levels.size()) {
+                bool competitorItselfVetoed = false;
+                for (const auto & c : levels[lvlRelaxed - 1]) {
+                    if (c.idA != r.idB) continue;            // not a competitor
+                    if (c.idA == c.idB || !c.vetoIdB.empty()) {
+                        competitorItselfVetoed = true;       // beatable → depth-1 veto
+                        break;                               // would be wrong; take split
+                    }
+                    veto.push_back(c.idB);
+                }
+                if (!competitorItselfVetoed && !veto.empty()) {
+                    lvl = lvlRelaxed;          // share the competitor's kernel
+                    relaxed = true;
+                    gChainVetoRelaxed++;
+                    gChainVetoTerms += veto.size();
+                }
+            }
+        }
+        if (!relaxed) { veto.clear(); after(maxLeft, r.idB); }
+
         // Base ids (< 256) are absent from prodLevel — the seed supplies them, so they
         // impose no constraint and such a rule can sit in level 1.
         // If the number of levels we currently have is LESS than the level needed for this rule, create more level slots.
@@ -1461,6 +1589,10 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         {
             auto it = prodLevel.find(r.idA);
             rc.needsLiveId = (it != prodLevel.end() && it->second == lvl);
+        }
+        if (relaxed) {
+            rc.vetoIdB = std::move(veto);
+            rc.vetoOff = rc.lenA + rc.lenB;   // byte space; rewritten under compaction
         }
         levels[lvl - 1].push_back(rc);
         prodLevel[r.idAB] = lvl;
@@ -1511,7 +1643,15 @@ static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
         std::unordered_set<unsigned> consumedAsB;   // idB values used by earlier rules in this group
         unsigned before = totalFlags;
         for (auto & r : g.rules) {
-            if (consumedAsB.count(r.idA)) { r.needsFlush = true; totalFlags++; }
+            // Two reasons a rule's gate must read the LIVE mask rather than the kernel's
+            // frozen entry mask:
+            //  1. --asymmetric-seam: an earlier rule in this group consumed this rule's
+            //     idA as ITS idB, so idA is already gone and the gate has to see that.
+            //  2. --chain-veto: this rule now shares its kernel with the lower-rank rules
+            //     claiming its idB — that sharing is exactly what the veto buys. Those
+            //     competitors fire first and clear starts around this rule's B, so the
+            //     same staleness applies and the frozen entry mask would hide it.
+            if (consumedAsB.count(r.idA) || !r.vetoIdB.empty()) { r.needsFlush = true; totalFlags++; }
             consumedAsB.insert(r.idB);
         }
         totalRules += g.rules.size();
@@ -1565,6 +1705,10 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             std::cerr << "[BPE] chain-partition: " << n << "/" << total
                        << " rules flagged needsLiveId\n";
         }
+        if (ChainVeto)
+            std::cerr << "[BPE] chain-veto: " << gChainVetoRelaxed
+                      << " rules kept their level via a runtime veto ("
+                      << gChainVetoTerms << " competitor EQs)\n";
         return groups;
     }
 

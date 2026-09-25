@@ -426,6 +426,7 @@ add_subdirectory(lib/ucd/utf)
 add_subdirectory(lib/audio)
 add_subdirectory(lib/csv)
 add_subdirectory(lib/json)
+add_subdirectory(lib/ldml)
 
 # Kernel Libraries
 add_subdirectory(lib/kernel/basis)
@@ -456,6 +457,7 @@ if (GENERATE_TOOLS)
     add_subdirectory(tools/audio)
     add_subdirectory(tools/util)
     add_subdirectory(tools/csv)
+    add_subdirectory(tools/ldml)
 endif()
 
 # Kernel Tests
@@ -491,6 +493,10 @@ add_test(
   NAME abc_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 abc_test.py ${BIN_DIR}/icgrep)
+
+add_test(
+  NAME ldml_trules_test
+  COMMAND ${BIN_DIR}/ldml_trules --self-test)
 
 add_test(
   NAME u8u16_test

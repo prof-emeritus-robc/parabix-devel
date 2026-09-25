@@ -112,6 +112,17 @@ static cl::opt<unsigned> IfGroupSize(
              "--if-group-count when != 1. Default 1 = use --if-group-count."),
     cl::init(1));
 
+// HIGH-BIT PREFIX: instead of chunking the idA-sorted rules by size or count, group rules
+// whose idA share the same top K bits (of the kernel's W_out-bit id). The group's gate
+// tests only those K high bits; inside the gate each rule's Astart ANDs in the test of the
+// remaining W_out-K low bits (shared by rules with the same idA). Only active with
+// --if-group-lower-limit >= 0; overrides --if-group-count/--if-group-size when > 0.
+static cl::opt<unsigned> IfTestSignificantBits(
+    "if-test-significant-bits",
+    cl::desc("Grouped kernels: group rules by the top K bits of idA; the if-gate tests those "
+             "K bits and each rule completes its idA test inside the gate. 0 = off (default)."),
+    cl::init(0));
+
 // Effective grouped-if chunk size for a kernel with n rules. Fixed --if-group-size wins
 // when set (!= 1); otherwise derive from --if-group-count (n/count). Used by BOTH the
 // cache-name tag and the Pablo body so they never disagree (stale-cache hazard).
@@ -638,7 +649,9 @@ public:
     // — else objcache serves a mismatched compiled body. x1_ = indexed-shift body, g1_ = grouped-if body.
 
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
-                        + (grouped ? "g" + std::to_string(effGroupSize(group.rules.size())) + "_" : "")
+                        + (grouped ? (IfTestSignificantBits > 0
+                                        ? "sb" + std::to_string(IfTestSignificantBits) + "_"
+                                        : "g" + std::to_string(effGroupSize(group.rules.size())) + "_") : "")
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
                         + (BatchWriteback ? "bw1_" : "bw0_")
@@ -1091,17 +1104,50 @@ protected:
             // (rare) chunks have narrow high ranges → skipped most blocks, while the low
             // (common) chunk stays lit. Per-rule EQ is flat inside the gate → single level
             // (T6-safe). Reorder is safe (T4 independence). GROUP_SIZE=5 → N/5 groups.
-            const unsigned GROUP_SIZE = effGroupSize(mRuleGroup.rules.size());
+            //
+            // --if-test-significant-bits=K (high-bit prefix): groups are instead the runs of
+            // sorted rules whose idA share the same top K bits. The gate tests only those K
+            // bits; inside the gate each rule's Astart ANDs in the EQ of the remaining low
+            // bits, so the id test is split across the gate and the body rather than paid
+            // in full outside (range gate) and again inside (per-rule EQ).
             std::vector<const MergeRule*> sorted;
             sorted.reserve(mRuleGroup.rules.size());
             for (const auto & r : mRuleGroup.rules) sorted.push_back(&r);
             std::sort(sorted.begin(), sorted.end(),
                       [](const MergeRule* a, const MergeRule* b){ return a->idA < b->idA; });
-            for (size_t s = 0; s < sorted.size(); s += GROUP_SIZE) {
-                size_t e = std::min(sorted.size(), s + GROUP_SIZE);
-                unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
-                cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
-                PabloAST * inRange = ccId.compileCC(re::makeCC(gLo, gHi), pb);
+
+            const unsigned hiBits = std::min<unsigned>(IfTestSignificantBits, W_out);
+            const unsigned loBits = W_out - hiBits;
+            const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
+            const BixNum loFrozen(frozenBits.begin(), frozenBits.begin() + loBits);
+
+            // [s,e) ranges of `sorted` forming each gate.
+            std::vector<std::pair<size_t, size_t>> groups;
+            if (hiBits > 0) {
+                for (size_t s = 0; s < sorted.size(); ) {
+                    const unsigned prefix = sorted[s]->idA >> loBits;
+                    size_t e = s + 1;
+                    while (e < sorted.size() && (sorted[e]->idA >> loBits) == prefix) e++;
+                    groups.emplace_back(s, e);
+                    s = e;
+                }
+            } else {
+                const unsigned GROUP_SIZE = effGroupSize(mRuleGroup.rules.size());
+                for (size_t s = 0; s < sorted.size(); s += GROUP_SIZE)
+                    groups.emplace_back(s, std::min(sorted.size(), s + GROUP_SIZE));
+            }
+
+            for (const auto & [s, e] : groups) {
+                PabloAST * inRange;
+                if (hiBits > 0) {
+                    const unsigned prefix = sorted[s]->idA >> loBits;
+                    cc::Parabix_CC_Compiler_Builder ccHi(hiFrozen);
+                    inRange = ccHi.compileCC("idHi_" + std::to_string(prefix), re::makeCC(prefix), pb);
+                } else {
+                    unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
+                    cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
+                    inRange = ccId.compileCC(re::makeCC(gLo, gHi), pb);
+                }
                 auto body = pb.createScope();
                 // --lookahead-in-group: build this chunk's B-detection peeks INSIDE the gate,
                 // cached (deduped) per distinct lenA so the chunk's rules share them. Cold
@@ -1125,9 +1171,25 @@ protected:
                 const std::map<unsigned, PabloAST*> * grpBoundary = chunkBoundary.empty() ? nullptr : &chunkBoundary;
                 // Per-rule Astart EQ stays INSIDE the gate body so the range gate can
                 // block-skip it. Single level (T6-safe).
+                // High-bit prefix: Astart = hiMatch AND EQ(low bits) AND inPlayMask, with the
+                // low-bit EQ built once per distinct idA in the group.
+                std::map<unsigned, PabloAST*> idMatchInGroup;
+                auto prefixAstart = [&](unsigned idA) -> PabloAST * {
+                    auto f = idMatchInGroup.find(idA);
+                    if (f == idMatchInGroup.end()) {
+                        PabloAST * m = inRange;
+                        if (loBits > 0) {
+                            const unsigned lo = idA & ((1u << loBits) - 1u);
+                            cc::Parabix_CC_Compiler_Builder ccLo(loFrozen);
+                            m = body.createAnd(m, ccLo.compileCC(re::makeCC(lo), body), "idMatch_" + std::to_string(idA));
+                        }
+                        f = idMatchInGroup.emplace(idA, m).first;
+                    }
+                    return body.createAnd(f->second, inPlayMask, "Astart_" + std::to_string(idA));
+                };
                 for (size_t k = s; k < e; k++) {
                     const MergeRule & r = *sorted[k];
-                    PabloAST * fireStart = eqAstart(body, r.idA);
+                    PabloAST * fireStart = (hiBits > 0) ? prefixAstart(r.idA) : eqAstart(body, r.idA);
                     if (r.idA == r.idB)
                         fireStart = selfMergeFireStarts(body, fireStart, r.lenA);
                     emitBody(body, r, fireStart, grpAhead, grpBoundary);

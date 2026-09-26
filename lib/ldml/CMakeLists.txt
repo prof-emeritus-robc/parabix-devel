@@ -8,6 +8,7 @@ NAME
     ldml.transforms
 SRC
     transform_rules.cpp
+    transform_rules_captures.cpp
     transform_rules_direction.cpp
     transform_rules_parser.cpp
     transform_rules_printer.cpp

@@ -5,12 +5,17 @@
 
 //  ldml_trules: parse LDML transform rules and print them in canonical form.
 //
-//  ldml_trules [--xml] [--quiet] [--forward | --backward] file ...
+//  ldml_trules [--xml] [--quiet] [--forward | --backward]
+//              [--eliminate-nullable-captures] file ...
 //      Parse the rules of each file (plain rule text, or with --xml, the
 //      <tRule> elements of an LDML transform file), print the canonical
 //      form of the rules and check that the canonical form reparses to
 //      the same canonical form.  With --forward or --backward, the rules
 //      extracted for that direction (as forward rules) are printed.
+//      With --eliminate-nullable-captures, nullable capture elimination
+//      is applied to the (forward) rules before printing.
+//  ldml_trules [--xml] --count-nullable-captures file ...
+//      Report the nullable captures in the source sides of conversion rules.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 
@@ -94,9 +99,10 @@ static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extr
 }
 
 // Parse, print, and check that the printed form reparses to the same form.
-static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e) {
+static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e, bool eliminate) {
     try {
-        const std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
+        std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
+        if (eliminate) rules = NullableCaptureElimination(rules);
         const std::string printed = printRules(rules);
         if (!quiet) std::cout << printed;
         const std::string reprinted = printRules(parseTransformRules({printed}));
@@ -202,6 +208,76 @@ static const TestCase testCases[] = {
     {"[z-a] → b ;", nullptr},               // invalid range
     {"[a^] → b ;", nullptr},                // unescaped ^ in set
     {"[a-\\x{62 63}] → b ;", nullptr},      // range end is not a single codepoint
+};
+
+struct NullableCounts {
+    unsigned captures = 0;      // nullable captures not within repetitions
+    unsigned repeated = 0;      // nullable captures within repetitions
+    unsigned rules = 0;         // rule directions with eliminable captures
+    unsigned forwardAdded = 0;  // rules added by elimination
+    unsigned backwardAdded = 0;
+    unsigned files = 0;
+};
+
+static void countNullableCaptures(const std::vector<std::string> & tRules, const std::string & label, NullableCounts & total) {
+    const std::vector<Rule *> rules = parseTransformRules(tRules);
+    NullableCounts n;
+    for (const Rule * r : rules) {
+        if (const ConversionRule * c = llvm::dyn_cast<ConversionRule>(r)) {
+            for (const Direction d : {Direction::Forward, Direction::Backward}) {
+                if (d == Direction::Forward ? !appliesForward(c->getDirection()) : !appliesBackward(c->getDirection())) continue;
+                const RuleSide * source = c->getSourceSide(d);
+                const auto eliminable = findNullableCaptures(source).size();
+                n.captures += eliminable;
+                n.repeated += findNullableCaptures(source, true).size() - eliminable;
+                n.rules += eliminable > 0;
+            }
+        }
+    }
+    const std::vector<Rule *> fwd = ExtractForwardRules(rules);
+    const std::vector<Rule *> bwd = ExtractReverseBackwardRules(rules);
+    n.forwardAdded = NullableCaptureElimination(fwd).size() - fwd.size();
+    n.backwardAdded = NullableCaptureElimination(bwd).size() - bwd.size();
+    if (n.captures + n.repeated > 0) {
+        std::cout << label << ": " << n.captures << " nullable captures in " << n.rules << " rules"
+                  << " (+" << n.forwardAdded << " forward rules, +" << n.backwardAdded << " backward rules)";
+        if (n.repeated) std::cout << ", " << n.repeated << " within repetitions";
+        std::cout << "\n";
+        total.files++;
+    }
+    total.captures += n.captures;
+    total.repeated += n.repeated;
+    total.rules += n.rules;
+    total.forwardAdded += n.forwardAdded;
+    total.backwardAdded += n.backwardAdded;
+}
+
+struct EliminationTestCase {
+    const char * input;
+    const char * expected;
+};
+
+static const EliminationTestCase eliminationTestCases[] = {
+    {"(a*) b → $1 x ;", "(a+) b → $1 x ;\nb → x ;\n"},
+    // A capture of a single character is replaced by the character.
+    {"(a?) b → $1 ;", "ab → a ;\nb → ;\n"},
+    {"$m = m ; ($m?) z → $1 $1 ;", "$m = m ;\n$m z → $m $m ;\nz → ;\n"},
+    {"([ab]?) z → $1 ;", "([ab]) z → $1 ;\nz → ;\n"},
+    // Multiple nullable captures; remaining captures are renumbered.
+    {"(a*) (b?) c → $2 $1 ;", "(a+) bc → b $1 ;\n(a+) c → $1 ;\nbc → b ;\nc → ;\n"},
+    {"(x) (a*) (y) → $3 $2 $1 ;", "(x) (a+) (y) → $3 $2 $1 ;\n(x) (y) → $2 $1 ;\n"},
+    {"(x) (a?) (y) → $3 $2 $1 ;", "(x) a (y) → $2 a $1 ;\n(x) (y) → $2 $1 ;\n"},
+    // References within function calls and cursors.
+    {"$v = [ab] ; x ($v*) → &Any-Hex($1) | y ;",
+     "$v = [ab] ;\nx ($v+) → &Any-Hex($1) | y ;\nx → &Any-Hex() | y ;\n"},
+    // Deleting a capture deletes the captures within it.
+    {"((a)*) b → $2 $1 ;", "((a)+) b → $2 $1 ;\nb → ;\n"},
+    // Captures in contexts.
+    {"(x*) { y → z $1 ;", "(x+) { y → z $1 ;\ny → z ;\n"},
+    // Unchanged: captures within repetitions, non-nullable captures, non-forward rules.
+    {"((a*) b)* → x ;", "((a*) b)* → x ;\n"},
+    {"(a+) b → $1 ;", "(a+) b → $1 ;\n"},
+    {"(a*) ↔ b ;", "(a*) ↔ b ;\n"},
 };
 
 struct DirectionTestCase {
@@ -310,6 +386,16 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const EliminationTestCase & t : eliminationTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = NullableCaptureElimination(parseTransformRules({t.input}));
+            failures += !checkOutput("elimination", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     std::cout << (count - failures) << "/" << count << " tests passed\n";
     return failures == 0 ? 0 : 1;
 }
@@ -318,6 +404,8 @@ int main(int argc, char * argv[]) {
     bool xml = false;
     bool quiet = false;
     Extract e = Extract::All;
+    bool eliminate = false;
+    bool count = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -326,22 +414,36 @@ int main(int argc, char * argv[]) {
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--forward") e = Extract::Forward;
         else if (arg == "--backward") e = Extract::Backward;
+        else if (arg == "--eliminate-nullable-captures") eliminate = true;
+        else if (arg == "--count-nullable-captures") count = true;
         else files.push_back(arg);
     }
     if (files.empty()) {
-        std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward] file ... | --self-test\n";
+        std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward] [--eliminate-nullable-captures] file ...\n"
+                  << "       " << argv[0] << " [--xml] --count-nullable-captures file ...\n"
+                  << "       " << argv[0] << " --self-test\n";
         return 2;
     }
     bool ok = true;
+    NullableCounts total;
     for (const std::string & f : files) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            ok &= processRules(tRules, f, quiet, e);
+            if (count) {
+                countNullableCaptures(tRules, f, total);
+            } else {
+                ok &= processRules(tRules, f, quiet, e, eliminate);
+            }
         } catch (const std::exception & e) {
             std::cerr << f << ": " << e.what() << "\n";
             ok = false;
         }
+    }
+    if (count) {
+        std::cout << "Total: " << total.captures << " nullable captures in " << total.rules << " rules of "
+                  << total.files << " files (+" << total.forwardAdded << " forward rules, +"
+                  << total.backwardAdded << " backward rules); " << total.repeated << " within repetitions\n";
     }
     return ok ? 0 : 1;
 }

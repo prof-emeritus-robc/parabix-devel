@@ -46,7 +46,7 @@
 #include <allocator/threadsafe_slaballocator.h>
 #include <re/adt/re_re.h>
 
-namespace re { class Name; }
+namespace re { class Name; class Capture; }
 
 namespace ldml {
 
@@ -348,5 +348,35 @@ std::vector<Rule *> ExtractForwardRules(const std::vector<Rule *> & rules);
 //  Variable definitions are placed after the filter rule, before all
 //  other rules.
 std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rules);
+
+//  Nullable capture elimination.
+//
+//  A nullable capture is a segment whose content is a repetition with a
+//  lower bound of 0, such as (x*) or (x?).   Each forward conversion rule
+//  whose source side has a nullable capture is replaced by two rules:
+//  first, the rule with the capture's repetition given a lower bound of 1,
+//  (x+) or (x), and second, the rule with the capture deleted and all
+//  references to it replaced by the empty string.   If the capture of the
+//  first rule is of a single character, e.g., (x) from (x?), the capture and
+//  all references to it are replaced by that character (or by the variable
+//  defined as that character).   The first rule must
+//  precede the second, as a nonempty match is preferred.   Remaining
+//  captures are renumbered and their references updated.   Rules with
+//  several nullable captures are split repeatedly.
+//
+//  Captures within a repetition, e.g. ((x*) y)*, are not eliminated, as
+//  each repetition may match differently.  Rules other than forward
+//  conversion rules are unchanged; apply ExtractForwardRules or
+//  ExtractReverseBackwardRules first.
+//
+//  As quantifiers are possessive, the rules are equivalent to the original
+//  except when the text following the capture can only match after zero
+//  repetitions, e.g., (a*) a → x ; never matches, but its replacement
+//  a → x ; does.
+std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules);
+
+//  The nullable captures of a side of a conversion rule, in order.  Unless
+//  includeRepeated, captures within repetitions are excluded.
+std::vector<re::Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated = false);
 
 }

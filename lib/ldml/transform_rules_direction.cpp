@@ -4,7 +4,9 @@
  */
 
 #include <ldml/transform_rules.h>
+#include <re/adt/adt.h>
 #include <algorithm>
+#include <set>
 
 using namespace llvm;
 using namespace re;
@@ -88,6 +90,80 @@ void UnitList::emit(std::vector<Rule *> & result) const {
     }
 }
 
+//  Collect the variables used in a pattern, including the variables used
+//  in the definitions of used variables.
+class VariableUseCollector {
+public:
+    VariableUseCollector(const std::set<const Name *> & variables) : mVariables(variables) {}
+    void collect(const RE * re);
+    void collect(const RuleSide * side) {
+        if (side->hasBeforeContext()) collect(side->getBeforeContext());
+        collect(side->getCompletedResult());
+        collect(side->getResultToRevisit());
+        if (side->hasAfterContext()) collect(side->getAfterContext());
+    }
+    bool isUsed(const Name * variable) const {return mUsed.count(variable) != 0;}
+private:
+    const std::set<const Name *> & mVariables;
+    std::set<const Name *> mUsed;
+};
+
+void VariableUseCollector::collect(const RE * re) {
+    if (re == nullptr) return;
+    if (const Name * n = dyn_cast<Name>(re)) {
+        if (mVariables.count(n) != 0) {
+            if (!mUsed.insert(n).second) return;  // already collected
+        }
+        // A variable definition, or the argument of a function call.
+        collect(n->getDefinition());
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) collect(e);
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) collect(e);
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        collect(rep->getRE());
+    } else if (const Diff * d = dyn_cast<Diff>(re)) {
+        collect(d->getLH());
+        collect(d->getRH());
+    } else if (const Intersect * x = dyn_cast<Intersect>(re)) {
+        collect(x->getLH());
+        collect(x->getRH());
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        collect(c->getCapturedRE());
+    }
+}
+
+//  Remove the definitions of variables not used in any other rule.
+std::vector<Rule *> removeUnusedVariables(const std::vector<Rule *> & rules) {
+    std::set<const Name *> variables;
+    for (const Rule * r : rules) {
+        if (const VariableDefinitionRule * v = dyn_cast<VariableDefinitionRule>(r)) {
+            variables.insert(v->getVariable());
+        }
+    }
+    if (variables.empty()) return rules;
+    VariableUseCollector uses(variables);
+    for (const Rule * r : rules) {
+        if (const FilterRule * f = dyn_cast<FilterRule>(r)) {
+            uses.collect(f->getFilterSet());
+        } else if (const TransformRule * t = dyn_cast<TransformRule>(r)) {
+            uses.collect(t->getForwardFilter());
+            uses.collect(t->getBackwardFilter());
+        } else if (const ConversionRule * c = dyn_cast<ConversionRule>(r)) {
+            uses.collect(c->getLeftSide());
+            uses.collect(c->getRightSide());
+        }
+    }
+    std::vector<Rule *> result;
+    for (Rule * r : rules) {
+        if (const VariableDefinitionRule * v = dyn_cast<VariableDefinitionRule>(r)) {
+            if (!uses.isUsed(v->getVariable())) continue;
+        }
+        result.push_back(r);
+    }
+    return result;
+}
+
 } // end anonymous namespace
 
 std::vector<Rule *> ExtractForwardRules(const std::vector<Rule *> & rules) {
@@ -111,7 +187,7 @@ std::vector<Rule *> ExtractForwardRules(const std::vector<Rule *> & rules) {
         }
     }
     units.emit(result);
-    return result;
+    return removeUnusedVariables(result);
 }
 
 std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rules) {
@@ -139,7 +215,7 @@ std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rule
     result.insert(result.end(), variables.begin(), variables.end());
     units.reverse();
     units.emit(result);
-    return result;
+    return removeUnusedVariables(result);
 }
 
 }

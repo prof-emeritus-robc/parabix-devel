@@ -231,6 +231,14 @@ static const DirectionTestCase directionTestCases[] = {
      "a → b ;\n:: X ;\nc → d ;\n:: Null ;\ne → f ;\n",
      "f → e ;\n:: Y ;\nd → c ;\n:: Null ;\nb → a ;\n"},
     {"a → b ; :: (Lower) ; c → d ;", "a → b ;\n:: Null ;\nc → d ;\n", ":: Lower ;\n"},
+    // Only the variables used in each direction are retained, including
+    // variables used in the definitions of used variables.
+    {"$a = x ; $b = [$a y] ; $c = z ; $u = u ; $b → q ; r ← $c ;",
+     "$a = x ;\n$b = [$a y] ;\n$b → q ;\n", "$c = z ;\n$c → r ;\n"},
+    {"$t = [a-z] ; :: [$t] Upper () ; $n = n ; n ← $n ;",
+     "$t = [a-z] ;\n:: [$t] Upper ;\n", "$n = n ;\n$n → n ;\n"},
+    {"$h = h ; $g = [:L:] ; (x) → &Any-Hex($1 $h) ; $g { y ← z ;",
+     "$h = h ;\n(x) → &Any-Hex($1 $h) ;\n", "z → y ;\n"},
     // Variable definitions precede the reversed rules.
     {"$v = [ab] ; $v ↔ x ; $w = y ; :: Null ; $w ↔ z ; :: ([:L:]) ;",
      "$v = [ab] ;\n$v → x ;\n$w = y ;\n:: Null ;\n$w → z ;\n",

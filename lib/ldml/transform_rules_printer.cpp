@@ -275,9 +275,15 @@ void appendPart(std::string & s, const std::string & part) {
     s += part;
 }
 
+// A set standing alone as a filter: a variable must be within brackets.
+std::string printFilterSet(const RE * re) {
+    if (isa<Name>(re)) return "[" + printSet(re) + "]";
+    return printSet(re);
+}
+
 std::string printTransformPart(const TransformID & id, const RE * filter) {
     std::string s;
-    if (filter) appendPart(s, printSet(filter));
+    if (filter) appendPart(s, printFilterSet(filter));
     appendPart(s, id.getText());
     return s;
 }
@@ -319,9 +325,9 @@ std::string printRule(const Rule * rule) {
     std::string s;
     if (const FilterRule * f = dyn_cast<FilterRule>(rule)) {
         if (f->isInverse()) {
-            s = ":: (" + printSet(f->getFilterSet()) + ")";
+            s = ":: (" + printFilterSet(f->getFilterSet()) + ")";
         } else {
-            s = ":: " + printSet(f->getFilterSet());
+            s = ":: " + printFilterSet(f->getFilterSet());
         }
     } else if (const TransformRule * t = dyn_cast<TransformRule>(rule)) {
         s = "::";

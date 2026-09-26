@@ -327,7 +327,9 @@ bool appliesInDirection(const Rule * r, Direction d);
 //  In the extracted rules, each conversion rule is a forward (→) rule whose
 //  source side has its contexts but no cursor, and whose result side has
 //  its cursor but no contexts.   Transform rules are given with the single
-//  transform applying in that direction.   Variable definitions are retained.
+//  transform applying in that direction.   Variable definitions are retained
+//  only for the variables used in the extracted rules, directly or within
+//  the definitions of other used variables.
 //
 //  A transform rule not applying in the direction still separates the
 //  conversion rules before and after it into two groups; where needed,

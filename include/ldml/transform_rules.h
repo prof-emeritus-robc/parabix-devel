@@ -351,18 +351,28 @@ std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rule
 
 //  Nullable capture elimination.
 //
-//  A nullable capture is a segment whose content is a repetition with a
-//  lower bound of 0, such as (x*) or (x?).   Each forward conversion rule
-//  whose source side has a nullable capture is replaced by two rules:
-//  first, the rule with the capture's repetition given a lower bound of 1,
-//  (x+) or (x), and second, the rule with the capture deleted and all
-//  references to it replaced by the empty string.   If the capture of the
-//  first rule is of a single character, e.g., (x) from (x?), the capture and
-//  all references to it are replaced by that character (or by the variable
-//  defined as that character).   The first rule must
-//  precede the second, as a nonempty match is preferred.   Remaining
-//  captures are renumbered and their references updated.   Rules with
-//  several nullable captures are split repeatedly.
+//  A nullable capture is a segment whose content consists of optional
+//  items: repetitions with a lower bound of 0, such as x* or x?, or
+//  variables defined as such repetitions.  The content is either a single
+//  optional item, as in (x*), (x?) or ($v) with $v = [ab]*, or a sequence
+//  of optional items, as in (x? y*).
+//
+//  Each forward conversion rule whose source side has a nullable capture
+//  with k optional items is replaced by 2^k rules, one for each combination
+//  of the items being present or absent, ordered from all items present to
+//  none present, with the first item varying slowest.  For example, the
+//  rules for (x? y*) have captures (x y+), (x), (y+) and none.   A present
+//  item is given a lower bound of 1 (a variable is replaced by its
+//  definition); an absent item is deleted, and references to captures
+//  within it are replaced by the empty string.  If all items are absent,
+//  the capture is deleted and its references replaced by the empty string.
+//  If the capture is of a fixed string, e.g., (x) from (x?) or ($m $d)
+//  from ($m? $d?) where $m and $d are defined as characters, the capture
+//  and all references to it are replaced by that string (including any
+//  variables defined as fixed strings).  Rules with present items
+//  precede those with absent items, as nonempty matches are preferred.
+//  Remaining captures are renumbered and their references updated.  Rules
+//  with several nullable captures are split repeatedly.
 //
 //  Captures within a repetition, e.g. ((x*) y)*, are not eliminated, as
 //  each repetition may match differently.  Rules other than forward
@@ -370,8 +380,8 @@ std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rule
 //  ExtractReverseBackwardRules first.
 //
 //  As quantifiers are possessive, the rules are equivalent to the original
-//  except when the text following the capture can only match after zero
-//  repetitions, e.g., (a*) a → x ; never matches, but its replacement
+//  except when the text following an optional item can only match after
+//  zero repetitions, e.g., (a*) a → x ; never matches, but its replacement
 //  a → x ; does.
 std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules);
 

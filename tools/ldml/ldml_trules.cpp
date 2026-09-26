@@ -259,7 +259,7 @@ struct EliminationTestCase {
 
 static const EliminationTestCase eliminationTestCases[] = {
     {"(a*) b → $1 x ;", "(a+) b → $1 x ;\nb → x ;\n"},
-    // A capture of a single character is replaced by the character.
+    // A capture of a fixed string is replaced by the string.
     {"(a?) b → $1 ;", "ab → a ;\nb → ;\n"},
     {"$m = m ; ($m?) z → $1 $1 ;", "$m = m ;\n$m z → $m $m ;\nz → ;\n"},
     {"([ab]?) z → $1 ;", "([ab]) z → $1 ;\nz → ;\n"},
@@ -274,9 +274,24 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"((a)*) b → $2 $1 ;", "((a)+) b → $2 $1 ;\nb → ;\n"},
     // Captures in contexts.
     {"(x*) { y → z $1 ;", "(x+) { y → z $1 ;\ny → z ;\n"},
+    // Variables defined as optional items.
+    {"$v = [ab]* ; ($v) c → $1 ;", "$v = [ab]* ;\n([ab]+) c → $1 ;\nc → ;\n"},
+    // Sequences of optional items: all combinations, from all present to none present.
+    {"(a* b*) c → $1 ;", "(a+ b+) c → $1 ;\n(a+) c → $1 ;\n(b+) c → $1 ;\nc → ;\n"},
+    {"$m = m ; $d = d ; (x) ($m? $d?) y → $2 $1 ;",
+     "$m = m ;\n$d = d ;\n(x) $m $d y → $m $d $1 ;\n(x) $m y → $m $1 ;\n(x) $d y → $d $1 ;\n(x) y → $1 ;\n"},
+    {"$V = [aeiou] ; z ([jw]? $V?) → $1 ;",
+     "$V = [aeiou] ;\nz ([jw] $V) → $1 ;\nz ([jw]) → $1 ;\nz ($V) → $1 ;\nz → ;\n"},
+    {"((a)* b*) c → $2 $1 ;", "((a)+ b+) c → $2 $1 ;\n((a)+) c → $2 $1 ;\n(b+) c → $1 ;\nc → ;\n"},
+    {"z { (a? b? c?) → $1 ;",
+     "z { abc → abc ;\nz { ab → ab ;\nz { ac → ac ;\nz { a → a ;\n"
+     "z { bc → bc ;\nz { b → b ;\nz { c → c ;\nz { → ;\n"},
+    {"(x? y?) (z*) → $2 $1 ;",
+     "xy (z+) → $1 xy ;\nxy → xy ;\nx (z+) → $1 x ;\nx → x ;\ny (z+) → $1 y ;\ny → y ;\n(z+) → $1 ;\n→ ;\n"},
     // Unchanged: captures within repetitions, non-nullable captures, non-forward rules.
     {"((a*) b)* → x ;", "((a*) b)* → x ;\n"},
     {"(a+) b → $1 ;", "(a+) b → $1 ;\n"},
+    {"(a b?) c → $1 ;", "(a b?) c → $1 ;\n"},
     {"(a*) ↔ b ;", "(a*) ↔ b ;\n"},
 };
 

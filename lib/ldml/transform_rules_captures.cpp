@@ -15,17 +15,47 @@ namespace ldml {
 
 namespace {
 
-bool isNullableCapture(const Capture * c) {
-    if (const Rep * rep = dyn_cast<Rep>(c->getCapturedRE())) {
+// An optional item: a repetition with a lower bound of 0, or a variable
+// defined as one.
+bool isOptionalItem(const RE * re) {
+    if (const Rep * rep = dyn_cast<Rep>(re)) {
         return rep->getLB() == 0;
     }
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && isOptionalItem(n->getDefinition());
+    }
     return false;
+}
+
+// The optional item with a lower bound of 1.
+RE * presentForm(RE * item) {
+    if (Name * n = dyn_cast<Name>(item)) {
+        return presentForm(n->getDefinition());
+    }
+    Rep * rep = cast<Rep>(item);
+    return makeRep(rep->getRE(), 1, rep->getUB());
+}
+
+// The optional items of a nullable capture: either the captured RE itself,
+// or all the items of a captured sequence of optional items.  Empty if
+// the capture is not nullable in this sense.
+std::vector<RE *> optionalItems(const Capture * c) {
+    RE * captured = c->getCapturedRE();
+    if (isOptionalItem(captured)) return {captured};
+    std::vector<RE *> items;
+    if (const Seq * seq = dyn_cast<Seq>(captured)) {
+        for (RE * e : *seq) {
+            if (!isOptionalItem(e)) return {};
+            items.push_back(e);
+        }
+    }
+    return items;
 }
 
 void findNullableCaptures(RE * re, bool withinRep, bool includeRepeated, std::vector<Capture *> & found) {
     if (re == nullptr) return;
     if (Capture * c = dyn_cast<Capture>(re)) {
-        if (isNullableCapture(c) && (includeRepeated || !withinRep)) found.push_back(c);
+        if (!optionalItems(c).empty() && (includeRepeated || !withinRep)) found.push_back(c);
         findNullableCaptures(c->getCapturedRE(), withinRep, includeRepeated, found);
     } else if (Seq * seq = dyn_cast<Seq>(re)) {
         for (RE * e : *seq) findNullableCaptures(e, withinRep, includeRepeated, found);
@@ -34,13 +64,20 @@ void findNullableCaptures(RE * re, bool withinRep, bool includeRepeated, std::ve
     }
 }
 
-// A single character: a single codepoint, or a variable defined as one.
-bool isSingleCharacter(const RE * re) {
+// A fixed string: a single codepoint, a variable defined as a fixed string,
+// or a nonempty sequence of fixed strings.
+bool isFixedString(const RE * re) {
     if (const CC * cc = dyn_cast<CC>(re)) {
         return cc->size() == 1 && lo_codepoint(cc->front()) == hi_codepoint(cc->front());
     }
     if (const Name * n = dyn_cast<Name>(re)) {
-        return !isFunctionCall(n) && n->getDefinition() && isSingleCharacter(n->getDefinition());
+        return !isFunctionCall(n) && n->getDefinition() && isFixedString(n->getDefinition());
+    }
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) {
+            if (!isFixedString(e)) return false;
+        }
+        return !seq->empty();
     }
     return false;
 }
@@ -56,16 +93,21 @@ void collectCaptures(RE * re, std::set<const Capture *> & captures) {
     }
 }
 
-//  Rewrites a rule, either deleting a target capture or giving its
-//  repetition a lower bound of 1.  In the latter case, if the capture is
-//  then of a single character, the capture and its references are replaced
-//  by that character.  All captures of the source side are renumbered in
-//  order and the references of the result side updated.
+//  Rewrites a rule, replacing the content of a target capture.  If the new
+//  content is empty, the capture is deleted and its references replaced by
+//  the empty string; if it is a fixed string, the capture and its
+//  references are replaced by that string.  References to deleted
+//  captures are replaced by the empty string.  All captures of the source
+//  side are renumbered in order and the references of the result side updated.
 class CaptureRewriter {
 public:
-    enum class Mode {Delete, NonNull};
-    CaptureRewriter(Capture * target, Mode mode) : mTarget(target), mMode(mode) {
-        if (mode == Mode::Delete) collectCaptures(target, mDeleted);
+    CaptureRewriter(Capture * target, RE * newContent, std::set<const Capture *> deleted)
+    : mTarget(target), mNewContent(newContent), mDeleted(std::move(deleted)) {
+        if (isEmptySeq(newContent)) {
+            mDeleted.insert(target);
+        } else if (isFixedString(newContent)) {
+            mReplacement = newContent;
+        }
     }
     ConversionRule * rewrite(const ConversionRule * r) {
         const RuleSide * src = r->getLeftSide();
@@ -91,27 +133,21 @@ private:
     RE * rewriteResult(RE * re);
 
     Capture * const mTarget;
-    const Mode mMode;
+    RE * const mNewContent;
     std::set<const Capture *> mDeleted;
+    RE * mReplacement = nullptr;    // the fixed string replacing the target
     std::map<const Capture *, Capture *> mRenumbered;
-    RE * mReplacement = nullptr;    // the single character replacing the target
     unsigned mCaptureCount = 0;
 };
 
 RE * CaptureRewriter::rewriteSource(RE * re) {
     if (re == nullptr) return nullptr;
     if (Capture * c = dyn_cast<Capture>(re)) {
-        if (c == mTarget && mMode == Mode::Delete) {
-            return makeSeq();
-        }
         RE * captured = c->getCapturedRE();
         if (c == mTarget) {
-            Rep * rep = cast<Rep>(captured);
-            captured = makeRep(rep->getRE(), 1, rep->getUB());
-            if (isSingleCharacter(captured)) {
-                mReplacement = captured;
-                return captured;
-            }
+            if (mDeleted.count(c) != 0) return makeSeq();
+            if (mReplacement) return mReplacement;
+            captured = mNewContent;
         }
         const std::string name = std::to_string(++mCaptureCount);
         Capture * renumbered = makeCapture(name, rewriteSource(captured));
@@ -168,11 +204,26 @@ void eliminate(ConversionRule * r, std::vector<Rule *> & result) {
         result.push_back(r);
         return;
     }
-    // Split on the first nullable capture; the new rules are split further
-    // on any remaining nullable captures.
+    // Split on the first nullable capture into a rule for each combination
+    // of its optional items being present or absent, from all present to
+    // none present, the first item varying slowest.   The new rules are
+    // split further on any remaining nullable captures.
     Capture * target = nullable.front();
-    eliminate(CaptureRewriter(target, CaptureRewriter::Mode::NonNull).rewrite(r), result);
-    eliminate(CaptureRewriter(target, CaptureRewriter::Mode::Delete).rewrite(r), result);
+    const std::vector<RE *> items = optionalItems(target);
+    const size_t k = items.size();
+    for (size_t absent = 0; absent < (size_t{1} << k); absent++) {
+        std::vector<RE *> content;
+        std::set<const Capture *> deleted;
+        for (size_t i = 0; i < k; i++) {
+            if ((absent >> (k - 1 - i)) & 1) {
+                collectCaptures(items[i], deleted);
+            } else {
+                content.push_back(presentForm(items[i]));
+            }
+        }
+        RE * newContent = makeSeq(content.begin(), content.end());
+        eliminate(CaptureRewriter(target, newContent, std::move(deleted)).rewrite(r), result);
+    }
 }
 
 } // end anonymous namespace

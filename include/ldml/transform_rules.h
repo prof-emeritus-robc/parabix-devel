@@ -321,4 +321,30 @@ TransformID getFunctionID(const re::Name * call);
 // Does the rule apply in the given direction?
 bool appliesInDirection(const Rule * r, Direction d);
 
+//  Extraction of the rules for one direction, expressed as forward rules
+//  (see "Inverse Summary" in UTS #35 Part 2).
+//
+//  In the extracted rules, each conversion rule is a forward (→) rule whose
+//  source side has its contexts but no cursor, and whose result side has
+//  its cursor but no contexts.   Transform rules are given with the single
+//  transform applying in that direction.   Variable definitions are retained.
+//
+//  A transform rule not applying in the direction still separates the
+//  conversion rules before and after it into two groups; where needed,
+//  this is preserved by a ":: Null ;" rule.
+
+//  The rules applying in the forward direction, in the original order,
+//  omitting the backward conversion rules, backward-only transform rules
+//  and the inverse filter rule.
+std::vector<Rule *> ExtractForwardRules(const std::vector<Rule *> & rules);
+
+//  The rules applying in the backward direction, restated as forward rules:
+//  the inverse filter rule becomes the (forward) filter rule, the transform
+//  rules and groups of conversion rules are in reverse order (the rules
+//  within each group keep their order), the sides of each conversion rule
+//  are exchanged and each transform rule is replaced by its inverse.
+//  Variable definitions are placed after the filter rule, before all
+//  other rules.
+std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rules);
+
 }

@@ -5,11 +5,12 @@
 
 //  ldml_trules: parse LDML transform rules and print them in canonical form.
 //
-//  ldml_trules [--xml] [--quiet] file ...
+//  ldml_trules [--xml] [--quiet] [--forward | --backward] file ...
 //      Parse the rules of each file (plain rule text, or with --xml, the
 //      <tRule> elements of an LDML transform file), print the canonical
 //      form of the rules and check that the canonical form reparses to
-//      the same canonical form.
+//      the same canonical form.  With --forward or --backward, the rules
+//      extracted for that direction (as forward rules) are printed.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 
@@ -82,10 +83,20 @@ static std::vector<std::string> extractTRules(const std::string & xml) {
     return rules;
 }
 
+enum class Extract {All, Forward, Backward};
+
+static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extract e) {
+    switch (e) {
+        case Extract::Forward: return ExtractForwardRules(rules);
+        case Extract::Backward: return ExtractReverseBackwardRules(rules);
+        default: return rules;
+    }
+}
+
 // Parse, print, and check that the printed form reparses to the same form.
-static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet) {
+static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e) {
     try {
-        const std::vector<Rule *> rules = parseTransformRules(tRules);
+        const std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
         const std::string printed = printRules(rules);
         if (!quiet) std::cout << printed;
         const std::string reprinted = printRules(parseTransformRules({printed}));
@@ -193,6 +204,58 @@ static const TestCase testCases[] = {
     {"[a-\\x{62 63}] → b ;", nullptr},      // range end is not a single codepoint
 };
 
+struct DirectionTestCase {
+    const char * input;
+    const char * forward;
+    const char * backward;
+};
+
+static const DirectionTestCase directionTestCases[] = {
+    // The Inverse Summary example of UTS #35.
+    {":: [:Uppercase Letter:] ; :: latin-greek ; :: greek-japanese ; x ↔ y ; z → w ; r ← m ;"
+     " :: upper; a → b ; c ↔ d ; :: any-publishing ; :: ([:Number:]) ;",
+     ":: [:uppercaseletter:] ;\n:: latin-greek ;\n:: greek-japanese ;\nx → y ;\nz → w ;\n"
+     ":: upper ;\na → b ;\nc → d ;\n:: any-publishing ;\n",
+     ":: [:number:] ;\n:: publishing-any ;\nd → c ;\n:: Lower ;\ny → x ;\nm → r ;\n"
+     ":: japanese-greek ;\n:: greek-latin ;\n"},
+    // Contexts and cursors are ignored on the sides where they do not belong.
+    {"a { b | c } d ↔ e { f | g } h ;", "a { bc } d → f | g ;\n", "e { fg } h → b | c ;\n"},
+    {"x → Ab@| ; |@ab ← [a-z] { y ;", "x → Ab @| ;\n", "[a-z] { y → |@ ab ;\n"},
+    // Segments and references.
+    {"$1 ← (x) ; (y) → &Any-Hex($1) ;", "(y) → &Any-Hex($1) ;\n", "(x) → $1 ;\n"},
+    // Explicit inverses and filters of transform rules.
+    {":: NFD (NFC) ; :: [a-z] Upper () ; :: ([A-Z] Lower) ;",
+     ":: NFD ;\n:: [a-z] Upper ;\n", ":: [A-Z] Lower ;\n:: NFC ;\n"},
+    // Transform rules not applying in a direction still separate groups.
+    {"a ↔ b ; :: X () ; c ↔ d ; :: (Y) ; e ↔ f ;",
+     "a → b ;\n:: X ;\nc → d ;\n:: Null ;\ne → f ;\n",
+     "f → e ;\n:: Y ;\nd → c ;\n:: Null ;\nb → a ;\n"},
+    {"a → b ; :: (Lower) ; c → d ;", "a → b ;\n:: Null ;\nc → d ;\n", ":: Lower ;\n"},
+    // Variable definitions precede the reversed rules.
+    {"$v = [ab] ; $v ↔ x ; $w = y ; :: Null ; $w ↔ z ; :: ([:L:]) ;",
+     "$v = [ab] ;\n$v → x ;\n$w = y ;\n:: Null ;\n$w → z ;\n",
+     ":: [:l:] ;\n$v = [ab] ;\n$w = y ;\nz → $w ;\n:: Null ;\nx → $v ;\n"},
+};
+
+static bool checkOutput(const char * label, const char * input, const std::string & actual, const char * expected) {
+    bool ok = actual == expected;
+    std::string reprinted;
+    if (ok) {
+        // The extracted rules must reparse to themselves.
+        try {
+            reprinted = printRules(parseTransformRules({actual}));
+        } catch (const TransformRuleParseError & e) {
+            reprinted = std::string("reparse failed: ") + e.what() + "\n";
+        }
+        ok = reprinted == actual;
+    }
+    if (!ok) {
+        std::cerr << "FAIL (" << label << "): " << input << "\n  expected: " << expected
+                  << "  actual:   " << actual << (reprinted.empty() ? "" : "  reprinted: " + reprinted);
+    }
+    return ok;
+}
+
 static int runSelfTest() {
     unsigned failures = 0;
     unsigned count = 0;
@@ -228,6 +291,17 @@ static int runSelfTest() {
                       << "  actual:   " << actual << (error ? "\n" : "");
         }
     }
+    for (const DirectionTestCase & t : directionTestCases) {
+        count += 2;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.input});
+            failures += !checkOutput("forward", t.input, printRules(ExtractForwardRules(rules)), t.forward);
+            failures += !checkOutput("backward", t.input, printRules(ExtractReverseBackwardRules(rules)), t.backward);
+        } catch (const TransformRuleParseError & e) {
+            failures += 2;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     std::cout << (count - failures) << "/" << count << " tests passed\n";
     return failures == 0 ? 0 : 1;
 }
@@ -235,16 +309,19 @@ static int runSelfTest() {
 int main(int argc, char * argv[]) {
     bool xml = false;
     bool quiet = false;
+    Extract e = Extract::All;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
         if (arg == "--self-test") return runSelfTest();
         else if (arg == "--xml") xml = true;
         else if (arg == "--quiet") quiet = true;
+        else if (arg == "--forward") e = Extract::Forward;
+        else if (arg == "--backward") e = Extract::Backward;
         else files.push_back(arg);
     }
     if (files.empty()) {
-        std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] file ... | --self-test\n";
+        std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward] file ... | --self-test\n";
         return 2;
     }
     bool ok = true;
@@ -252,7 +329,7 @@ int main(int argc, char * argv[]) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            ok &= processRules(tRules, f, quiet);
+            ok &= processRules(tRules, f, quiet, e);
         } catch (const std::exception & e) {
             std::cerr << f << ": " << e.what() << "\n";
             ok = false;

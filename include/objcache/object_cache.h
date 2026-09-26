@@ -67,7 +67,6 @@ private:
     bool requiresCacheCleanUp() noexcept;
 private:
     static bool         mStartedCacheCleanupDaemon;
-    ObjectBufferCache   mCachedObject;
     Path                mCachePath;
 };
 

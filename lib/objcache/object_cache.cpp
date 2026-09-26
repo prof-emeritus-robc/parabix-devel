@@ -155,9 +155,6 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
 
     auto moduleId = M.getModuleIdentifier();
 
-    // Store back into the memory buffer cache system
-    mCachedObject[moduleId] = Obj;
-
     Path objectName(mCachePath);
     sys::path::append(objectName, CACHE_PREFIX);
     objectName.append(moduleId);

@@ -56,6 +56,10 @@ public:
     // rule and an inverse filter rule may only be the last rule.
     // Throws TransformRuleParseError.
     void validateRuleOrder() const;
+    // A conversion rule whose text to match (in a direction in which it
+    // applies) may be empty, without contexts, would match again at the
+    // same position indefinitely: the rules are ill-formed.
+    void validateInsertions() const;
 
     // The variable of the given name, or nullptr if not defined.
     re::Name * lookupVariable(const std::string & name) const;

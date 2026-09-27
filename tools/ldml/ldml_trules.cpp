@@ -222,7 +222,7 @@ static const TestCase testCases[] = {
      "$makeRight = [[:separator:][:startpunctuation:][:initialpunctuation:]] ;\n"},
     {"'--' ↔ — ;", "\\-\\- ↔ — ;\n"},
     {"a?b → c ; a+b → c ; a*b → c ;", "a? b → c ;\na+ b → c ;\na* b → c ;\n"},
-    {"'ab'* → c ;", "'ab'* → c ;\n"},
+    {"'ab'+ → c ;", "'ab'+ → c ;\n"},
     {"([a-b]) > &hex($1);", "([ab]) → &hex($1) ;\n"},
     {"([a-b]) > &Any-Hex/Unicode($1);", "([ab]) → &Any-Hex/Unicode($1) ;\n"},
     {"$1 ← (x) ;", "$1 ← (x) ;\n"},
@@ -275,6 +275,10 @@ static const TestCase testCases[] = {
     {"\\u12 → a ;", nullptr},               // short hex escape
     {":: ;", nullptr},                      // empty transform rule
     {"[z-a] → b ;", nullptr},               // invalid range
+    {"[:separator:]* → ' ' ;", nullptr},    // matches the empty text without contexts
+    {"$e = ; $e → x ;", nullptr},
+    {"x ← (a?) ;", nullptr},
+    {"(a*) ↔ b ;", nullptr},
     {"[a^] → b ;", nullptr},                // unescaped ^ in set
     {"[a-\\x{62 63}] → b ;", nullptr},      // range end is not a single codepoint
 };
@@ -550,13 +554,13 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"z { (a? b? c?) → $1 ;",
      "z { abc → abc ;\nz { ab → ab ;\nz { ac → ac ;\nz { a → a ;\n"
      "z { bc → bc ;\nz { b → b ;\nz { c → c ;\nz { → ;\n"},
-    {"(x? y?) (z*) → $2 $1 ;",
-     "xy (z+) → $1 xy ;\nxy → xy ;\nx (z+) → $1 x ;\nx → x ;\ny (z+) → $1 y ;\ny → y ;\n(z+) → $1 ;\n→ ;\n"},
+    {"(x? y?) (z*) w → $2 $1 ;",
+     "xy (z+) w → $1 xy ;\nxyw → xy ;\nx (z+) w → $1 x ;\nxw → x ;\ny (z+) w → $1 y ;\nyw → y ;\n(z+) w → $1 ;\nw → ;\n"},
     // Unchanged: captures within repetitions, non-nullable captures, non-forward rules.
-    {"((a*) b)* → x ;", "((a*) b)* → x ;\n"},
+    {"((a*) b)+ → x ;", "((a*) b)+ → x ;\n"},
     {"(a+) b → $1 ;", "(a+) b → $1 ;\n"},
     {"(a b?) c → $1 ;", "(a b?) c → $1 ;\n"},
-    {"(a*) ↔ b ;", "(a*) ↔ b ;\n"},
+    {"(a*) ← b ;", "(a*) ← b ;\n"},
 };
 
 static const EliminationTestCase trivialTestCases[] = {
@@ -614,7 +618,7 @@ static const OverlapTestCase overlapTestCases[] = {
     {"a } [bc] → x ; a } c → y ;", true},
     {"a } [$] → x ; a } \\. → y ;", false},
     {"a } $ → x ; ab → y ;", false},
-    {"a } $ → x ; a* → y ;", true},
+    {"a } $ → x ; a+ → y ;", true},
     {"x { a → 1 ; y { a → 2 ;", false},
     {"[xy] { a → 1 ; y { a → 2 ;", true},
     {"^ { a → 1 ; b { a → 2 ;", false},
@@ -647,7 +651,7 @@ static const EliminationTestCase partitionTestCases[] = {
     {"$d = [:Nd:] ; $d → 1 ;", "# group 1: rules 1-2\n# literal characters: 1\n$d_1 = [02-9٠-٩۰-۹߀-߉"},
     // Inline sets, including sets within variable definitions that are not
     // sets; inline sets that are not divided remain as written.
-    {"$v = [a-e] ; $v [cx] → 1 ; $sp = [fg]* ; $sp → 2 ;",
+    {"$v = [a-e] ; $v [cx] → 1 ; $sp = [fg]+ ; $sp → 2 ;",
      "# group 1: rules 1-4\n# literal characters: 1 2\n$v_1 = [abde] ;\n$v_2 = c ;\n$set_1 = x ;\n$v = [$v_1 $v_2] ;\n"
      "# [cx] = [$v_2 $set_1]\n"},
     {"$v = [a-e] ; $v → 1 ; [cd] → 2 ;", "# group 1: rules 1-3\n# literal characters: 1 2\n$v_1 = [abe] ;\n$v = [$v_1 [cd]] ;\n"},
@@ -773,7 +777,6 @@ static const EliminationTestCase disambiguationTestCases[] = {
      "$h = h ;\n$u = u ;\n$e = ;\n$h $u → x ;\n$h } [^$u] → y ;\n"},
     {"$s = hu ; $s → x ; h → y ;", "$s = hu ;\n$s → x ;\nh } [^u] → y ;\n"},
     {"$c = cd ; $c { a → x ; a → y ;", "$c = cd ;\n$c { a → x ;\n[^d] { a → y ;\n[^c] d { a → y ;\n"},
-    {"$e = ; $e → x ; a → y ;", "$e = ;\n$e → x ;\na → y ;\n"},
     // Not handled: repetitions through several classes, possessive differences.
     {"a } [{bc}{de}]* f → x ; a → y ;", "a } [{bc}{de}]* f → x ;\na → y ;\n"},
     {"a } b* b → x ; a → y ;", "a } b* b → x ;\na } b* [^b] → y ;\n"},

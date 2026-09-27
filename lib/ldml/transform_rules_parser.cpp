@@ -5,6 +5,7 @@
 
 #include <ldml/transform_rules_parser.h>
 #include <re/adt/adt.h>
+#include <algorithm>
 #include <re/adt/re_utility.h>
 #include <ldml/transform_rules_printer.h>
 
@@ -998,6 +999,38 @@ void TransformRuleParser::validateRuleOrder() const {
     }
 }
 
+// Whether an item of a rule may match the empty text (anchors constrain
+// the position, and do not count as empty).
+static bool matchesEmpty(RE * re) {
+    if (re == nullptr) return true;
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        return std::all_of(seq->begin(), seq->end(), [](RE * e) {return matchesEmpty(e);});
+    }
+    if (const Alt * alt = dyn_cast<Alt>(re)) {
+        return std::any_of(alt->begin(), alt->end(), [](RE * e) {return matchesEmpty(e);});
+    }
+    if (const Rep * rep = dyn_cast<Rep>(re)) return rep->getLB() == 0 || matchesEmpty(rep->getRE());
+    if (const Capture * c = dyn_cast<Capture>(re)) return matchesEmpty(c->getCapturedRE());
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() != nullptr && matchesEmpty(n->getDefinition());
+    }
+    return false;
+}
+
+void TransformRuleParser::validateInsertions() const {
+    auto check = [](const ConversionRule * r, const RuleSide * side) {
+        if (side->hasBeforeContext() || side->hasAfterContext() || !matchesEmpty(side->getText())) return;
+        throw TransformRuleParseError("Rule " + printRule(r) + " matches the empty text without contexts, indefinitely");
+    };
+    for (const Rule * rule : mRules) {
+        if (const ConversionRule * r = dyn_cast<ConversionRule>(rule)) {
+            const unsigned d = static_cast<unsigned>(r->getDirection());
+            if (d & static_cast<unsigned>(Direction::Forward)) check(r, r->getLeftSide());
+            if (d & static_cast<unsigned>(Direction::Backward)) check(r, r->getRightSide());
+        }
+    }
+}
+
 Name * TransformRuleParser::lookupVariable(const std::string & name) const {
     auto f = mVariables.find(name);
     return f == mVariables.end() ? nullptr : f->second;
@@ -1009,6 +1042,7 @@ std::vector<Rule *> parseTransformRules(const std::vector<std::string> & tRules)
         parser.parse(r);
     }
     parser.validateRuleOrder();
+    parser.validateInsertions();
     return parser.getRules();
 }
 

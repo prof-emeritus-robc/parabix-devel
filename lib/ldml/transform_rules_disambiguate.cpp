@@ -610,8 +610,19 @@ private:
     }
     bool possessiveIsExact(const std::vector<Element> & elements, std::string & reason);
     RE * unionOf(const std::vector<RE *> & sets) {
-        if (sets.empty()) return makeCC();
-        return sets.size() == 1 ? sets[0] : makeAlt(sets.begin(), sets.end());
+        // (Without repetitions of a set or a variable.)
+        std::vector<RE *> distinct;
+        for (RE * set : sets) {
+            const bool repeated = std::any_of(distinct.begin(), distinct.end(), [set](RE * d) {
+                if (d == set) return true;
+                const Name * a = dyn_cast<Name>(d);
+                const Name * b = dyn_cast<Name>(set);
+                return a && b && a->getFullName() == b->getFullName();
+            });
+            if (!repeated) distinct.push_back(set);
+        }
+        if (distinct.empty()) return makeCC();
+        return distinct.size() == 1 ? distinct[0] : makeAlt(distinct.begin(), distinct.end());
     }
     // A negated set, which also matches beyond the ends of the text unless
     // excluding the boundary.
@@ -1393,7 +1404,7 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         return false;
     }
     if (src->hasBeforeContext()) {
-        if (!parseL(src->getBeforeContext(), mBefore, false, why)) {
+        if (!parseL(src->getBeforeContext(), mBefore, true, why)) {
             unresolved("L: before context has a " + why, earlier.size());
             return false;
         }
@@ -1470,12 +1481,23 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         for (size_t j = mKeyLength; j < mAfter.size(); j++) afterItems.insert(afterItems.end(), following[j].begin(), following[j].end());
         afterItems.insert(afterItems.end(), beyond.begin(), beyond.end());
         RE * afterContext = afterItems.empty() ? nullptr : makeSeq(afterItems.begin(), afterItems.end());
+        // (The before context is explored outward: its items, and the
+        // classes of each, are reversed; the classes beyond L's items
+        // precede it.)
         const std::vector<std::vector<RE *>> preceding = lReplacement(mBefore, side.first.path, side.first.l, beyond);
-        std::vector<RE *> beforeItems;
-        for (const std::vector<RE *> & r : preceding) beforeItems.insert(beforeItems.end(), r.begin(), r.end());
-        beforeItems.insert(beforeItems.end(), beyond.begin(), beyond.end());
-        std::reverse(beforeItems.begin(), beforeItems.end());
-        RE * beforeContext = beforeItems.empty() ? nullptr : makeSeq(beforeItems.begin(), beforeItems.end());
+        std::vector<RE *> beforeItems(beyond.rbegin(), beyond.rend());
+        if (src->hasBeforeContext()) {
+            std::vector<RE *> items;
+            for (auto r = preceding.rbegin(); r != preceding.rend(); ++r) items.push_back(makeSeq(r->rbegin(), r->rend()));
+            size_t next = 0;
+            beforeItems.push_back(rebuildKey(src->getBeforeContext(), items, next, captures));
+        } else {
+            for (auto r = preceding.rbegin(); r != preceding.rend(); ++r) beforeItems.insert(beforeItems.end(), r->rbegin(), r->rend());
+        }
+        RE * beforeContext = makeSeq(beforeItems.begin(), beforeItems.end());
+        if (const Seq * seq = dyn_cast<Seq>(beforeContext)) {
+            if (seq->empty()) beforeContext = nullptr;
+        }
         RuleSide * rs = RuleSide::Create(beforeContext, key, false, nullptr, 0, afterContext);
         RuleSide * result = captures.empty() ? L->getRightSide() : remapReferences(L->getRightSide(), captures);
         pieces.push_back(makeConversionRule(rs, Direction::Forward, result));

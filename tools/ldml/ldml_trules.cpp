@@ -781,6 +781,9 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"a } [{bc}b] c → x ; a → y ;", "a } [{bc}b] c → x ;\na } [^b] → y ;\na } b [^c] → y ;\na } bc [^c] → y ;\n"},
     {"[{ab}ac] d? → x ; c → y ;", "[{ab}ac] d? → x ;\n"},
     {"yw } [{m̥}bm]* [$] → ɨu ; yw → əu ; y → ə ;", "yw } [{m̥}bm]* [$] → ɨu ;\nyw → əu ;\ny } [^w] → ə ;\n"},
+    {"b a { b → y ; ([a-c] a) { b → $1 ;", "ba { b → y ;\n([ac] a) { b → $1 ;\n"},
+    {"a b { c → y ; (a+ [bd]) { c → $1 ;", "ab { c → y ;\n(a+ d) { c → $1 ;\n"},
+    {"b } c → y ; ([a-c] (a)) { b → $1 $2 ;", "b } c → y ;\n([a-c] (a)) { b } [^c] → $1 $2 ;\n"},
     {"a } [{bc}{bcd}] e → x ; a → y ;", "a } [{bc}{bcd}] e → x ;\na } [^b] → y ;\na } b [^c] → y ;\na } bc [^de] → y ;\na } bcd [^e] → y ;\n"},
 };
 

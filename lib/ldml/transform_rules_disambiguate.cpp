@@ -1522,17 +1522,23 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
 //  rules for their alternatives, in ICU's order of preference (the longest
 //  strings, the characters, then the text boundary), e.g.
 //  [{ch}{qu}ckq] → k ; into ch → k ; qu → k ; [ckq] → k ;.  As ICU does
-//  not backtrack into a set, a set is split only if no alternative is a
-//  prefix (or, preceding the position, a suffix) of another, or it is the
-//  outermost item of its side.
+//  not backtrack into a set, an alternative that is a prefix (or, preceding
+//  the position, a suffix) of a longer one applies only where the longer
+//  one does not match: each alternative rule comes with blocking rules, which
+//  match where a longer alternative of one of its sets matches (unless the
+//  set is the outermost item of its side).
 class AlternativeSplitter {
 public:
-    // The rules replacing r, or empty if r is not split.
-    std::vector<Rule *> split(const ConversionRule * r);
+    // The rules replacing r, or empty if r is not split, with the blocking
+    // rules of each.
+    std::vector<Rule *> split(const ConversionRule * r, std::vector<std::vector<ConversionRule *>> & blockers);
 private:
     struct Leaf {
         RE * re;
         std::vector<RE *> alternatives;     // empty if not split
+        // For each alternative, the longer strings of the set that it may
+        // begin (or, preceding the position, end).
+        std::vector<std::vector<std::vector<codepoint_t>>> longer;
     };
     bool splittable(RE * re) {
         return CharSetAnalysis::isSet(re) && hasStringsOrBoundary(re) && !isa<Start>(re) && !isa<End>(re)
@@ -1570,24 +1576,38 @@ bool AlternativeSplitter::alternatives(Leaf & leaf, bool reversed, bool outermos
         return a.size() > b.size();
     });
     const UCD::UnicodeSet chars = mAnalysis.setOf(re, false);
-    if (!outermost) {
-        // No alternative may be a prefix (suffix) of another.
+    // The strings longer than t that t begins (ends, if reversed).
+    auto longerThan = [&](const std::vector<codepoint_t> & t) {
+        std::vector<std::vector<codepoint_t>> longer;
+        if (outermost) return longer;
         for (const auto & s : strings) {
-            const codepoint_t first = reversed ? s.back() : s.front();
-            if (chars.contains(first)) return false;
-            for (const auto & t : strings) {
-                if (&t == &s || t.size() >= s.size()) continue;
-                if (reversed ? std::equal(t.rbegin(), t.rend(), s.rbegin()) : std::equal(t.begin(), t.end(), s.begin())) return false;
+            if (s.size() <= t.size()) continue;
+            if (reversed ? std::equal(t.rbegin(), t.rend(), s.rbegin()) : std::equal(t.begin(), t.end(), s.begin())) {
+                longer.push_back(s);
             }
         }
-    }
+        return longer;
+    };
     for (const auto & s : strings) {
         std::vector<RE *> cps;
         for (const codepoint_t c : s) cps.push_back(makeCC(c));
         leaf.alternatives.push_back(cps.size() == 1 ? cps[0] : makeSeq(cps.begin(), cps.end()));
+        leaf.longer.push_back(longerThan(s));
     }
-    if (!chars.empty()) leaf.alternatives.push_back(charPart(re, chars));
-    if (hasBoundary(re)) leaf.alternatives.push_back(makeTextBoundary());
+    if (!chars.empty()) {
+        leaf.alternatives.push_back(charPart(re, chars));
+        std::vector<std::vector<codepoint_t>> longer;
+        if (!outermost) {
+            for (const auto & s : strings) {
+                if (s.size() > 1 && chars.contains(reversed ? s.back() : s.front())) longer.push_back(s);
+            }
+        }
+        leaf.longer.push_back(longer);
+    }
+    if (hasBoundary(re)) {
+        leaf.alternatives.push_back(makeTextBoundary());
+        leaf.longer.emplace_back();
+    }
     return true;
 }
 
@@ -1620,7 +1640,8 @@ RE * AlternativeSplitter::rebuild(RE * re, bool segments, const std::vector<RE *
     return chosen ? chosen : re;
 }
 
-std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r) {
+std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r, std::vector<std::vector<ConversionRule *>> & blockers) {
+    blockers.clear();
     if (r->getDirection() != Direction::Forward) return {};
     const RuleSide * src = r->getLeftSide();
     // The leaves preceding the position (in text order; the first is
@@ -1669,6 +1690,41 @@ std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r) {
         RuleSide * side = RuleSide::Create(beforeContext, text, false, nullptr, 0, afterContext);
         RuleSide * result = captures.empty() ? r->getRightSide() : remapReferences(r->getRightSide(), captures);
         rules.push_back(makeConversionRule(side, Direction::Forward, result));
+        // The blocking rules: the rule up to a leaf (following the position,
+        // or preceding it from within) with a longer string in its place.
+        blockers.emplace_back();
+        for (size_t i = 0; i < leaves.size(); i++) {
+            if (leaves[i]->alternatives.empty()) continue;
+            for (const std::vector<codepoint_t> & str : leaves[i]->longer[index[i]]) {
+                std::vector<RE *> cps;
+                for (const codepoint_t c : str) cps.push_back(makeCC(c));
+                std::vector<RE *> cut = choice;
+                cut[i] = makeSeq(cps.begin(), cps.end());
+                if (i < following.size()) {
+                    for (size_t j = i + 1; j < following.size(); j++) cut[j] = makeSeq();
+                } else {
+                    // Preceding the position: the key (matched after the
+                    // before context) and the outer leaves are not needed.
+                    for (size_t j = 0; j < following.size(); j++) cut[j] = makeSeq();
+                    for (size_t j = following.size(); j < i; j++) cut[j] = makeSeq();
+                }
+                std::map<const Capture *, Capture *> c;
+                size_t n = 0;
+                const std::vector<RE *> f(cut.begin(), cut.begin() + following.size());
+                const std::vector<RE *> b(cut.begin() + following.size(), cut.end());
+                RE * t = rebuild(src->getText(), true, f, n, c);
+                RE * a = rebuild(src->getAfterContext(), false, f, n, c);
+                n = 0;
+                RE * bc = rebuild(src->getBeforeContext(), false, b, n, c);
+                auto nonEmpty = [](RE * x) -> RE * {
+                    if (x == nullptr) return nullptr;
+                    if (const Seq * seq = dyn_cast<Seq>(x)) return seq->empty() ? nullptr : x;
+                    return x;
+                };
+                RuleSide * bs = RuleSide::Create(nonEmpty(bc), t, false, nullptr, 0, nonEmpty(a));
+                blockers.back().push_back(makeConversionRule(bs, Direction::Forward, RuleSide::Create(nullptr, makeSeq(), false, nullptr, 0, nullptr)));
+            }
+        }
         // The next combination (the last leaf varying fastest).
         size_t i = leaves.size();
         while (i > 0) {
@@ -1714,7 +1770,8 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
             // strings or the text boundary into rules for their alternatives,
             // each disambiguated from the earlier rules and the preceding
             // alternatives that it overlaps; used only if all are resolved.
-            const std::vector<Rule *> alternatives = splitter.split(L);
+            std::vector<std::vector<ConversionRule *>> blockers;
+            const std::vector<Rule *> alternatives = splitter.split(L, blockers);
             if (!alternatives.empty()) {
                 const DisambiguationStats first = s;
                 s = initial;
@@ -1730,6 +1787,14 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
                         ConversionRule * B = cast<ConversionRule>(alternatives[j]);
                         if (analysis.mayOverlap(B, A)) earlier.push_back(B);
                     }
+                    // (The blocking rules are not counted as pairs resolved.)
+                    size_t blocking = 0;
+                    for (ConversionRule * B : blockers[k]) {
+                        if (analysis.mayOverlap(B, A)) {
+                            earlier.push_back(B);
+                            blocking++;
+                        }
+                    }
                     if (earlier.empty()) {
                         altPieces.push_back(A);
                         continue;
@@ -1737,6 +1802,7 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
                     const size_t unresolved = s.pairsUnresolved;
                     std::vector<Rule *> p;
                     ok = d.disambiguate(A, earlier, p) && s.pairsUnresolved == unresolved;
+                    if (ok) s.pairsResolved -= blocking;
                     altPieces.insert(altPieces.end(), p.begin(), p.end());
                 }
                 if (ok) {

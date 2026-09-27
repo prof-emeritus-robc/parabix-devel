@@ -22,6 +22,7 @@
 
 #include <ldml/transform_rules.h>
 #include "charset_analysis.h"
+#include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
 #include <algorithm>
 #include <functional>
@@ -100,22 +101,37 @@ NFA buildNFA(const std::vector<Element> & elements) {
     n.start = n.addState();
     unsigned cur = n.start;
     for (const Element & e : elements) {
+        // The characters and strings of the element are repeated; the text
+        // boundary (a zero-width match) counts as one more repetition, and
+        // then ends the element (as ICU's quantifiers stop on no progress).
+        Element body = e;
+        body.boundary = false;
+        std::vector<unsigned> counts{cur};     // the states after c repetitions (c < ub)
         for (int i = 0; i < e.lb; i++) {
             const unsigned next = n.addState();
-            addElement(n, e, cur, next);
+            addElement(n, body, cur, next);
             cur = next;
+            counts.push_back(cur);
         }
         if (e.ub < 0) {
             const unsigned loop = n.addState();
             n.addEdge(cur, loop, NFA::Kind::Epsilon);
-            addElement(n, e, loop, loop);
+            addElement(n, body, loop, loop);
             cur = loop;
+            counts.push_back(loop);
         } else {
             for (int i = e.lb; i < e.ub; i++) {
                 const unsigned next = n.addState();
-                addElement(n, e, cur, next);
+                addElement(n, body, cur, next);
                 n.addEdge(cur, next, NFA::Kind::Epsilon);
                 cur = next;
+                counts.push_back(cur);
+            }
+            counts.pop_back();      // ub repetitions: no more
+        }
+        if (e.boundary) {
+            for (size_t c = 0; c < counts.size(); c++) {
+                if (static_cast<int>(c) + 1 >= e.lb) n.addEdge(counts[c], cur, NFA::Kind::Boundary);
             }
         }
     }
@@ -367,8 +383,10 @@ NFA ICUAutomatonBuilder::build() {
                     }
                 }
                 // The text boundary (the conditions are satisfied there).
-                if (e.boundary) {
-                    mNFA.addEdge(from, stateOf(State{j, next, -1, {}}), NFA::Kind::Boundary);
+                // The text boundary (the conditions are satisfied there): a
+                // zero-width match, counted, which ends the element.
+                if (e.boundary && c + 1 >= e.lb) {
+                    mNFA.addEdge(from, stateOf(State{j + 1, 0, -1, {}}), NFA::Kind::Boundary);
                 }
             }
             if (c < e.lb) break;
@@ -514,6 +532,10 @@ NFA emptyNFA() {
     return n;
 }
 
+static void collectSetStrings(RE * re, std::vector<std::vector<codepoint_t>> & strings);
+static bool hasBoundary(const RE * re);
+static RE * charPart(RE * re, const UCD::UnicodeSet & chars);
+
 class Disambiguator {
 public:
     Disambiguator(DisambiguationStats & stats) : mStats(stats) {}
@@ -554,6 +576,9 @@ private:
         int lb;
         int ub;
         bool boundary;      // the text boundary (^, $ or [$]), the outermost item of its side
+        // A repeated set that also matches the text boundary (as negated
+        // sets do); valid only if a following item requires a character.
+        bool setBoundary = false;
     };
     // The progress of L on one side: its current item and the repetitions
     // of it matched (capped, so that repetitions return to the same state),
@@ -655,6 +680,7 @@ private:
     size_t mKeyLength = 0;          // the number of key items
     std::vector<LItem> mBefore;     // the items of L's before context, outward
     std::string mFailure;           // why the exploration failed
+    std::set<const Capture *> mReferenced;  // the segments of L referenced in its result
 };
 
 // The limits of the exploration.
@@ -706,13 +732,21 @@ bool Disambiguator::parseL(RE * re, std::vector<LItem> & items, bool segments, s
             continue;
         }
         if (Rep * rep = dyn_cast<Rep>(e)) {
-            if (!isCharItem(rep->getRE())) {
+            // Segments within repetitions that are not referenced are ignored.
+            RE * set = rep->getRE();
+            while (isa<Capture>(set) && mReferenced.count(cast<Capture>(set)) == 0) {
+                set = cast<Capture>(set)->getCapturedRE();
+            }
+            std::vector<std::vector<codepoint_t>> strings;
+            collectSetStrings(set, strings);
+            if (!CharSetAnalysis::isSet(set) || !strings.empty() || mAnalysis.setOf(set, false).empty()) {
                 reason = itemReason(e);
                 return false;
             }
-            RE * set = rep->getRE();
-            items.push_back(LItem{set, mAnalysis.setOf(set, false), rep->getLB(),
-                                  rep->getUB() == Rep::UNBOUNDED_REP ? -1 : rep->getUB(), false});
+            LItem item{set, mAnalysis.setOf(set, false), rep->getLB(),
+                       rep->getUB() == Rep::UNBOUNDED_REP ? -1 : rep->getUB(), false};
+            item.setBoundary = hasBoundary(set);
+            items.push_back(item);
             continue;
         }
         if (isa<Start>(e) || isa<End>(e) || (isTextBoundary(e))) {
@@ -855,6 +889,24 @@ static RE * remapReferences(RE * re, const std::map<const Capture *, Capture *> 
     return re;
 }
 
+//  The segments referenced in a result.
+static void collectReferences(const RE * re, std::set<const Capture *> & referenced) {
+    if (re == nullptr) return;
+    if (const Reference * ref = dyn_cast<Reference>(re)) {
+        referenced.insert(ref->getCapture());
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n)) collectReferences(n->getDefinition(), referenced);
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) collectReferences(e, referenced);
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) collectReferences(e, referenced);
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        collectReferences(rep->getRE(), referenced);
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        collectReferences(c->getCapturedRE(), referenced);
+    }
+}
+
 static RuleSide * remapReferences(const RuleSide * s, const std::map<const Capture *, Capture *> & captures) {
     return RuleSide::Create(remapReferences(s->getBeforeContext(), captures), remapReferences(s->getCompletedResult(), captures),
                             s->hasCursor(), remapReferences(s->getResultToRevisit(), captures), s->getCursorOffset(),
@@ -951,16 +1003,19 @@ bool Disambiguator::parseElements(RE * re, std::vector<Element> & elements, bool
         }
         Element e;
         if (Rep * rep = dyn_cast<Rep>(item)) {
-            bool ok = setElement(rep->getRE(), reversed, e);
-            if (!ok && isSequenceVariable(rep->getRE())) {
+            // (Segments do not affect matching.)
+            RE * body = rep->getRE();
+            while (Capture * c = dyn_cast<Capture>(body)) body = c->getCapturedRE();
+            bool ok = setElement(body, reversed, e);
+            if (!ok && isSequenceVariable(body)) {
                 // A repeated variable must expand to a single set.
                 std::vector<Element> expanded;
                 std::string why;
-                ok = parseElements(cast<Name>(rep->getRE())->getDefinition(), expanded, reversed, why)
+                ok = parseElements(cast<Name>(body)->getDefinition(), expanded, reversed, why)
                     && expanded.size() == 1 && expanded[0].lb == 1 && expanded[0].ub == 1;
                 if (ok) e = expanded[0];
             }
-            if (!ok || e.boundary) {
+            if (!ok || isa<Start>(e.set) || isa<End>(e.set)) {
                 reason = itemReason(item);
                 return false;
             }
@@ -1103,7 +1158,9 @@ bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::str
 
 // The set x without the characters k, preserving the structure of unions.
 RE * Disambiguator::subtract(RE * x, const UCD::UnicodeSet & k) {
+    // (Of the characters of x only: not its strings or the text boundary.)
     const UCD::UnicodeSet xs = mAnalysis.setOf(x, false);
+    x = charPart(x, xs);
     if ((xs - k).empty()) return nullptr;
     if (!xs.intersects(k)) return x;
     if (const CC * cc = dyn_cast<CC>(x)) {
@@ -1380,6 +1437,11 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         return false;
     }
     mAfter.clear();
+    mReferenced.clear();
+    const RuleSide * res = L->getRightSide();
+    for (const RE * part : {res->getBeforeContext(), res->getCompletedResult(), res->getResultToRevisit(), res->getAfterContext()}) {
+        collectReferences(part, mReferenced);
+    }
     mBefore.clear();
     std::string why;
     // ^ at the start of the text to replace (without a before context) is a
@@ -1420,6 +1482,20 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     if (!boundaryOutermost(mAfter) || !boundaryOutermost(mBefore) ||
             std::any_of(mAfter.begin(), mAfter.begin() + mKeyLength, [](const LItem & i) {return i.boundary;})) {
         unresolved("L: text boundary within its items", earlier.size());
+        return false;
+    }
+    // A repeated set with the text boundary must be followed by an item
+    // requiring a character (the boundary then never leads to a match).
+    auto deadBoundaries = [](const std::vector<LItem> & items) {
+        for (size_t i = 0; i < items.size(); i++) {
+            if (!items[i].setBoundary) continue;
+            if (std::none_of(items.begin() + i + 1, items.end(), [](const LItem & x) {
+                    return x.lb > 0 && !x.boundary && !x.chars.empty();})) return false;
+        }
+        return true;
+    };
+    if (!deadBoundaries(mAfter) || !deadBoundaries(mBefore)) {
+        unresolved("L: repeated set with the text boundary as its outermost required item", earlier.size());
         return false;
     }
     // L is followed possessively in the exploration; the replacement rules
@@ -1502,6 +1578,12 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         RuleSide * result = captures.empty() ? L->getRightSide() : remapReferences(L->getRightSide(), captures);
         pieces.push_back(makeConversionRule(rs, Direction::Forward, result));
     }
+    // Paths differing only in the (capped) repetitions of L's items may give
+    // the same rule.
+    std::set<std::string> printed;
+    pieces.erase(std::remove_if(pieces.begin(), pieces.end(), [&](Rule * piece) {
+        return !printed.insert(printRule(piece)).second;
+    }), pieces.end());
     // Verify that no piece overlaps a resolved rule.
     for (Rule * piece : pieces) {
         for (const Earlier & e : rules) {

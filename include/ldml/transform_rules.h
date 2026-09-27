@@ -496,7 +496,10 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  ^ or $, or a repeated set (x?, x*, x+); segments are disregarded, and
 //  variables that are not sets (e.g. $v = oa ;) are expanded into their
 //  items, in L's key as well.  An E with items on both sides blocks L only
-//  where both its following and preceding items match:
+//  where both its following and preceding items match.  E and L may have
+//  empty (or optional) texts to replace: an insertion rule E matching where
+//  L matches inserts its result first, and L applies after the insertion
+//  where E does not match again, as the replacement rules of L do:
 //      E:  k c1 c2 ... cn   or   k } c1 ... cn → ...    (after the position)
 //      E:  c1 ... cn { k → ...                          (before the position)
 //  The earlier rules are explored together: L is replaced by rules for the
@@ -544,6 +547,7 @@ struct DisambiguationStats {
     size_t rulesAdded = 0;           // replacement rules
     size_t overlapsAfter = 0;        // overlapping pairs remaining
     size_t verificationFailures = 0; // replacement rules still overlapping a resolved E (an internal error)
+    std::vector<std::pair<const Rule *, const Rule *>> failedPairs;  // (E, replacement rule) failing verification
     std::map<std::string, size_t> unresolvedReasons;   // the unresolved pairs by reason
 };
 std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, DisambiguationStats * stats = nullptr);

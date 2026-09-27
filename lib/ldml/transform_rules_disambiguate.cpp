@@ -601,25 +601,60 @@ bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::str
     std::vector<Element> text;
     std::string why;
     p.rule = e;
-    if (!parseElements(src->getText(), text, false, why)) {
+    // ^ at the start of the text to replace (without a before context) is a
+    // condition preceding the position.
+    RE * textRE = src->getText();
+    RE * leadingStart = nullptr;
+    if (!src->hasBeforeContext()) {
+        if (isa<Start>(textRE)) {
+            leadingStart = textRE;
+            textRE = makeSeq();
+        } else if (const Seq * seq = dyn_cast<Seq>(textRE)) {
+            if (!seq->empty() && isa<Start>(seq->front())) {
+                leadingStart = seq->front();
+                textRE = makeSeq(seq->begin() + 1, seq->end());
+            }
+        }
+    }
+    if (!parseElements(textRE, text, false, why)) {
         reason = "E: text to replace has a " + why;
         return false;
     }
-    if (text.empty() || text[0].lb == 0 || (text[0].boundary && !text[0].chars)) {
-        reason = "E: text to replace is empty or optional";
+    if (std::all_of(text.begin(), text.end(), [](const Element & e) {return e.lb == 0;})
+            && !src->hasBeforeContext() && !src->hasAfterContext() && !leadingStart) {
+        // An insertion everywhere (repeating indefinitely).
+        reason = "E: empty text to replace without contexts";
         return false;
     }
     if (!parseElements(src->getAfterContext(), text, false, why)) {
         reason = "E: after context has a " + why;
         return false;
     }
+    // The anchors ^ and $ must be on their own sides of the position.
+    auto anchored = [](const std::vector<Element> & elements, bool start) {
+        return std::any_of(elements.begin(), elements.end(), [start](const Element & e) {
+            return start ? isa<Start>(e.set) : isa<End>(e.set);
+        });
+    };
+    if (anchored(text, true)) {
+        reason = "E: ^ following the position";
+        return false;
+    }
     if (!possessiveIsExact(text, reason)) return false;
     p.forward = buildNFA(text);
-    p.after = !src->hasBeforeContext();
-    if (src->hasBeforeContext()) {
+    p.after = !src->hasBeforeContext() && !leadingStart;
+    if (!p.after) {
         std::vector<Element> before;
-        if (!parseElements(src->getBeforeContext(), before, true, why)) {
+        if (leadingStart) {
+            Element start;
+            setElement(leadingStart, true, start);
+            before.push_back(start);
+        } else if (!parseElements(src->getBeforeContext(), before, true, why)) {
             reason = "E: before context has a " + why;
+            return false;
+        }
+        if (anchored(before, false)) {
+            reason = "E: $ preceding the position";
             return false;
         }
         if (!possessiveIsExact(before, reason)) return false;
@@ -897,10 +932,6 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         unresolved("L: text to replace has a " + why, earlier.size());
         return false;
     }
-    if (mAfter.empty()) {
-        unresolved("L: text to replace is empty", earlier.size());
-        return false;
-    }
     mKeyLength = mAfter.size();
     if (src->hasAfterContext() && !parseL(src->getAfterContext(), mAfter, false, why)) {
         unresolved("L: after context has a " + why, earlier.size());
@@ -991,7 +1022,10 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     // Verify that no piece overlaps a resolved rule.
     for (Rule * piece : pieces) {
         for (const Earlier & e : rules) {
-            if (mOverlaps.mayOverlap(e.rule, cast<ConversionRule>(piece))) mStats.verificationFailures++;
+            if (mOverlaps.mayOverlap(e.rule, cast<ConversionRule>(piece))) {
+                mStats.verificationFailures++;
+                mStats.failedPairs.emplace_back(e.rule, piece);
+            }
         }
     }
     mStats.pairsResolved += rules.size();

@@ -150,6 +150,9 @@ static bool processRules(const std::vector<std::string> & tRules, const std::str
             rules = DisambiguateOrder(rules, &dstats);
             if (dstats.verificationFailures) {
                 std::cerr << label << ": " << dstats.verificationFailures << " replacement rules overlap resolved rules\n";
+                for (const auto & f : dstats.failedPairs) {
+                    std::cerr << "    " << printRule(f.first) << "   |   " << printRule(f.second) << "\n";
+                }
                 return false;
             }
         }
@@ -723,6 +726,15 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"c → x ; [{ch}{qu}ckq] → k ;", "c → x ;\nqu → k ;\nk → k ;\nq } [^u] → k ;\n"},
     {"a { b → x ; [a$] { b → y ;", "a { b → x ;\n[$] { b → y ;\n"},
     {"a } b → x ; a } [b$] → y ;", "a } b → x ;\na } [$] → y ;\n"},
+    // Insertion rules (empty texts to replace), earlier and later.
+    {"a { } b → x ; b → y ;", "a { } b → x ;\n[^a] { b → y ;\n"},
+    {"} b → x ; b → y ;", "} b → x ;\n"},
+    {"a? { } b → x ; bc → y ;", "a? { } b → x ;\n"},
+    {"ab → x ; a { } b → y ;", "ab → x ;\na { } b → y ;\n"},
+    {"a } c → x ; { } b → y ;", "a } c → x ;\n} b → y ;\n"},
+    {"b → x ; a { } → y ;", "b → x ;\na { } [^b] → y ;\n"},
+    // ^ at the start of the text to replace of E is a condition preceding it.
+    {"^ k → g ; k → y ;", "^ k → g ;\n[:any:] { k → y ;\n"},
     // The text boundary as an item of L.
     {"a } b → x ; ^ a → y ;", "a } b → x ;\n^ { a } [^b] → y ;\n"},
     {"a } [b$] → x ; a } $ → y ;", "a } [b$] → x ;\n"},

@@ -1456,11 +1456,34 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
             }
         }
     }
+    // Likewise $ at the end of the text to replace (without an after
+    // context) is a condition following it.
+    // (A segment of the boundary alone becomes an empty segment.)
+    RE * trailing = nullptr;
+    const Capture * trailingSegment = nullptr;
+    Capture * emptySegment = nullptr;
+    if (!src->hasAfterContext()) {
+        if (const Seq * seq = dyn_cast<Seq>(text)) {
+            auto isBoundary = [](const RE * e) {return isa<End>(e) || isTextBoundary(e);};
+            if (seq->size() > 1 && isBoundary(seq->back())) {
+                trailing = seq->back();
+                text = makeSeq(seq->begin(), seq->end() - 1);
+            } else if (seq->size() > 1 && isa<Capture>(seq->back()) && isBoundary(cast<Capture>(seq->back())->getCapturedRE())) {
+                trailingSegment = cast<Capture>(seq->back());
+                trailing = trailingSegment->getCapturedRE();
+                emptySegment = makeCapture(trailingSegment->getName(), makeSeq());
+                std::vector<RE *> elements(seq->begin(), seq->end() - 1);
+                elements.push_back(emptySegment);
+                text = makeSeq(elements.begin(), elements.end());
+            }
+        }
+    }
     if (!parseL(text, mAfter, true, why)) {
         unresolved("L: text to replace has a " + why, earlier.size());
         return false;
     }
     mKeyLength = mAfter.size();
+    if (trailing) mAfter.push_back(LItem{trailing, UCD::UnicodeSet(), 1, 1, true});
     if (src->hasAfterContext() && !parseL(src->getAfterContext(), mAfter, false, why)) {
         unresolved("L: after context has a " + why, earlier.size());
         return false;
@@ -1553,6 +1576,7 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         std::map<const Capture *, Capture *> captures;
         size_t next = 0;
         RE * key = rebuildKey(text, keyItems, next, captures);
+        if (trailingSegment) captures.emplace(trailingSegment, captures.at(emptySegment));
         std::vector<RE *> afterItems;
         for (size_t j = mKeyLength; j < mAfter.size(); j++) afterItems.insert(afterItems.end(), following[j].begin(), following[j].end());
         afterItems.insert(afterItems.end(), beyond.begin(), beyond.end());
@@ -1709,6 +1733,13 @@ RE * AlternativeSplitter::rebuild(RE * re, bool segments, const std::vector<RE *
         Capture * c = cast<Capture>(re);
         RE * captured = rebuild(c->getCapturedRE(), segments, choice, next, captures);
         if (captured == c->getCapturedRE()) return re;
+        if (isa<Start>(captured) || isa<End>(captured) || isTextBoundary(captured)) {
+            // A segment of the text boundary alone is empty (keeping the
+            // numbering of the segments).
+            Capture * rebuilt = makeCapture(c->getName(), makeSeq());
+            captures.emplace(c, rebuilt);
+            return makeSeq({rebuilt, captured});
+        }
         Capture * rebuilt = makeCapture(c->getName(), captured);
         captures.emplace(c, rebuilt);
         return rebuilt;
@@ -1890,6 +1921,8 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
                 if (ok) {
                     pieces = altPieces;
                     replaced = true;
+                    s.rulesReplaced = initial.rulesReplaced + 1;
+                    s.rulesAdded = initial.rulesAdded + pieces.size();
                     s.rulesSplit++;
                     s.splitRules += alternatives.size();
                 } else {

@@ -487,8 +487,9 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  overlapping rule E matches; the rules of the group may then be reordered
 //  without changing their meaning, as far as the overlaps are resolved.
 //
-//  The case handled is that of L having a key of single character items
-//  l1 ... lm (characters or sets) and no contexts, and each earlier
+//  The case handled is that of L having a key and contexts of single
+//  character items (characters or sets, with variables that are not sets
+//  expanded), and each earlier
 //  overlapping rule E being a sequence of items on one side of its position,
 //  each a set (possibly with strings and the text boundary [$]), the anchor
 //  ^ or $, or a repeated set (x?, x*, x+); segments are disregarded, and
@@ -498,10 +499,10 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //      E:  c1 ... cn { k → ...                          (before the position)
 //  The earlier rules are explored together: L is replaced by rules for the
 //  ways in which all of them fail to match (as ICU's possessive matching
-//  does), each with L's key (restricted to classes of characters) and
-//  contexts ending with a negated set (which also matches beyond the end of
-//  the text) or a set within the key, e.g., for E1 = k } s? t and E2 = k } u
-//  and L = [k x]:
+//  does), each with L's key and contexts (restricted to classes of
+//  characters) extended by a negated set (which also matches beyond the end
+//  of the text) or ending with a set within L's items, e.g., for
+//  E1 = k } s? t and E2 = k } u and L = [k x]:
 //      x → result ;   k } [^s t u] → result ;   k } s [^t] → result ;
 //  and, for E1 = ab and L = a, a } [^b] → result, and for E = a } b* c and
 //  L = a, a } b* [^bc] → result.  The text boundary is a class of its own
@@ -509,8 +510,8 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  rules with items before the position contribute before contexts.  An L
 //  masked by its earlier rules is removed.
 //
-//  Not handled (the pairs remain in order): L with contexts or with items
-//  that are not single characters, E with items on both sides or with items
+//  Not handled (the pairs remain in order): L with items that are not
+//  single characters, E with items on both sides or with items
 //  that are not sets or repeated sets, repetitions through several classes
 //  (e.g. [{bc}]*), and cases where ICU's possessive matching differs from
 //  the regular expression interpretation: repeated or optional items whose

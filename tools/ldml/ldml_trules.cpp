@@ -698,7 +698,6 @@ static const EliminationTestCase disambiguationTestCases[] = {
     // Not handled: contexts on both sides, a later rule with a context,
     // shared keys, optional items overlapping following items.
     {"c { a } b → x ; a → y ;", "c { a } b → x ;\na → y ;\n"},
-    {"a } b → x ; c { a → y ;", "a } b → x ;\nc { a → y ;\n"},
     // Earlier rules with shared keys are explored together.
     {"a } b → x ; a } c → z ; a → y ;", "a } b → x ;\na } c → z ;\na } [^bc] → y ;\n"},
     {"ab → x ; ac → z ; a → y ;", "ab → x ;\nac → z ;\na } [^bc] → y ;\n"},
@@ -708,9 +707,16 @@ static const EliminationTestCase disambiguationTestCases[] = {
     // Segments of earlier rules are disregarded.
     {"(a) } b → $1 x ; a → y ;", "(a) } b → $1 x ;\na } [^b] → y ;\n"},
     // Earlier rules on both sides of the position.
-    {"a } b → x ; c { a → z ; a → y ;", "a } b → x ;\nc { a → z ;\n[^c] { a } [^b] → y ;\n"},
+    {"a } b → x ; c { a → z ; a → y ;", "a } b → x ;\nc { a } [^b] → z ;\n[^c] { a } [^b] → y ;\n"},
+    // Later rules with contexts: the pieces are within the contexts of L.
+    {"ab → x ; a } [bc] → y ;", "ab → x ;\na } c → y ;\n"},
+    {"b { a → x ; [bc] { a → y ;", "b { a → x ;\nc { a → y ;\n"},
+    {"a } b → x ; c { a → y ;", "a } b → x ;\nc { a } [^b] → y ;\n"},
+    {"b { a → x ; d { a } e → y ;", "b { a → x ;\nd { a } e → y ;\n"},
+    {"a } b → x ; a } b c → y ;", "a } b → x ;\n"},
+    {"a } b c → x ; a } b → y ;", "a } bc → x ;\na } b [^c] → y ;\n"},
     // A later rule masked by its earlier rules is removed.
-    {"a → x ; a } b → z ; a → y ;", "a → x ;\na } b → z ;\n"},
+    {"a → x ; a } b → z ; a → y ;", "a → x ;\n"},
     {"a } [bc]? c → x ; a → y ;", "a } [bc]? c → x ;\na → y ;\n"},
     // Groups are independent.
     {"ab → x ; :: Null ; a → y ;", "ab → x ;\n:: Null ;\na → y ;\n"},

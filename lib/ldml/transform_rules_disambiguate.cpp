@@ -186,7 +186,9 @@ private:
     DisambiguationStats & mStats;
     CharSetAnalysis mAnalysis;
     RuleOverlapAnalysis mOverlaps;
-    std::vector<RE *> mKey;         // the key items of L
+    std::vector<RE *> mAfter;       // the items of L following its position: its key, then its after context
+    size_t mKeyLength = 0;          // the number of key items
+    std::vector<RE *> mBefore;      // the items of L's before context, outward
     std::string mFailure;           // why the exploration failed
 };
 
@@ -518,7 +520,9 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, size
             }
         }
     }
-    const bool inKey = after && k < mKey.size();
+    // Within the items of L, the characters are restricted to those of L.
+    const std::vector<RE *> & lItems = after ? mAfter : mBefore;
+    const bool inKey = k < lItems.size();
     if (inKey) boundaryNext.clear();
     if (atBoundary) {
         // Beyond the end of the text, only the text boundary may match.
@@ -546,7 +550,7 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, size
         seen.push_back(states);
     }
     // The classes of characters: those in the same transition sets.
-    const UCD::UnicodeSet universe = inKey ? mAnalysis.setOf(mKey[k], false) : UCD::UnicodeSet(0, UCD::UNICODE_MAX);
+    const UCD::UnicodeSet universe = inKey ? mAnalysis.setOf(lItems[k], false) : UCD::UnicodeSet(0, UCD::UNICODE_MAX);
     UCD::UnicodeSet covered;
     for (const UCD::UnicodeSet & c : edgeChars) covered = covered + c;
     std::vector<UCD::UnicodeSet> parts;
@@ -572,7 +576,7 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, size
         for (size_t i = 0; i < edgeSets.size() && cls == nullptr; i++) {
             if (edgeChars[i] == part) cls = edgeSets[i];
         }
-        if (cls == nullptr && inKey && part == universe) cls = mKey[k];
+        if (cls == nullptr && inKey && part == universe) cls = lItems[k];
         if (cls == nullptr) cls = makeCC(part);
         std::set<State> next;
         for (const State & s : active) {
@@ -594,7 +598,7 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, size
     }
     // The characters of no transition: all the rules fail.
     if (inKey) {
-        if (RE * rest = subtract(mKey[k], covered)) {
+        if (RE * rest = subtract(lItems[k], covered)) {
             std::vector<RE *> p = path;
             p.push_back(rest);
             out.emplace_back(p, pending);
@@ -625,20 +629,28 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         unresolved("L: not a forward rule", earlier.size());
         return false;
     }
-    if (src->hasBeforeContext() || src->hasAfterContext()) {
-        unresolved(std::string("L: has ") + (src->hasBeforeContext() && src->hasAfterContext() ? "before and after contexts"
-                                             : src->hasBeforeContext() ? "a before context" : "an after context"), earlier.size());
-        return false;
-    }
-    mKey.clear();
+    mAfter.clear();
+    mBefore.clear();
     std::string why;
-    if (!parseKey(src->getText(), mKey, why)) {
+    if (!parseKey(src->getText(), mAfter, why)) {
         unresolved("L: text to replace has a " + why, earlier.size());
         return false;
     }
-    if (mKey.empty()) {
+    if (mAfter.empty()) {
         unresolved("L: text to replace is empty", earlier.size());
         return false;
+    }
+    mKeyLength = mAfter.size();
+    if (src->hasAfterContext() && !parseKey(src->getAfterContext(), mAfter, why)) {
+        unresolved("L: after context has a " + why, earlier.size());
+        return false;
+    }
+    if (src->hasBeforeContext()) {
+        if (!parseKey(src->getBeforeContext(), mBefore, why)) {
+            unresolved("L: before context has a " + why, earlier.size());
+            return false;
+        }
+        std::reverse(mBefore.begin(), mBefore.end());
     }
     std::vector<Earlier> rules;
     for (const ConversionRule * e : earlier) {
@@ -676,15 +688,17 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     }
     pieces.clear();
     for (auto & side : sides) {
-        const std::vector<RE *> & following = side.second;
-        // The key: the classes of the path within the key, then the rest of the key.
-        std::vector<RE *> key(following.begin(), following.begin() + std::min(following.size(), mKey.size()));
-        for (size_t i = key.size(); i < mKey.size(); i++) key.push_back(mKey[i]);
+        // The classes of the paths within the items of L, then the rest of
+        // the items of L: the key, the after context and the before context.
+        std::vector<RE *> following = side.second;
+        for (size_t i = following.size(); i < mAfter.size(); i++) following.push_back(mAfter[i]);
+        std::vector<RE *> key(following.begin(), following.begin() + mKeyLength);
         RE * afterContext = nullptr;
-        if (following.size() > mKey.size()) {
-            afterContext = makeSeq(following.begin() + mKey.size(), following.end());
+        if (following.size() > mKeyLength) {
+            afterContext = makeSeq(following.begin() + mKeyLength, following.end());
         }
         std::vector<RE *> before = side.first;
+        for (size_t i = before.size(); i < mBefore.size(); i++) before.push_back(mBefore[i]);
         RE * beforeContext = nullptr;
         if (!before.empty()) {
             std::reverse(before.begin(), before.end());

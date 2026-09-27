@@ -777,7 +777,11 @@ static const EliminationTestCase disambiguationTestCases[] = {
     // Not handled: repetitions through several classes, possessive differences.
     {"a } [{bc}{de}]* f → x ; a → y ;", "a } [{bc}{de}]* f → x ;\na → y ;\n"},
     {"a } b* b → x ; a → y ;", "a } b* b → x ;\na } b* [^b] → y ;\n"},
-    {"a } [{b}{bc}] → x ; a → y ;", "a } [{bc}b] → x ;\na → y ;\n"},
+    {"a } [{b}{bc}] → x ; a → y ;", "a } [{bc}b] → x ;\na } [^b] → y ;\n"},
+    {"a } [{bc}b] c → x ; a → y ;", "a } [{bc}b] c → x ;\na } [^b] → y ;\na } b [^c] → y ;\na } bc [^c] → y ;\n"},
+    {"[{ab}ac] d? → x ; c → y ;", "[{ab}ac] d? → x ;\n"},
+    {"yw } [{m̥}bm]* [$] → ɨu ; yw → əu ; y → ə ;", "yw } [{m̥}bm]* [$] → ɨu ;\nyw → əu ;\ny } [^w] → ə ;\n"},
+    {"a } [{bc}{bcd}] e → x ; a → y ;", "a } [{bc}{bcd}] e → x ;\na } [^b] → y ;\na } b [^c] → y ;\na } bc [^de] → y ;\na } bcd [^e] → y ;\n"},
 };
 
 struct DirectionTestCase {

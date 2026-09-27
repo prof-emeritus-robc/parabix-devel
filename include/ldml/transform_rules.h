@@ -551,7 +551,7 @@ struct DisambiguationStats {
     size_t pairsUnresolved = 0;      // pairs (E, L) not handled
     size_t rulesReplaced = 0;        // rules L replaced
     size_t rulesAdded = 0;           // replacement rules
-    size_t overlapsAfter = 0;        // overlapping pairs remaining
+    size_t overlapsAfter = 0;        // overlapping pairs remaining (of the original rules, under ICU matching)
     size_t verificationFailures = 0; // replacement rules still overlapping a resolved E (an internal error)
     std::vector<std::pair<const Rule *, const Rule *>> failedPairs;  // (E, replacement rule) failing verification
     std::map<std::string, size_t> unresolvedReasons;   // the unresolved pairs by reason

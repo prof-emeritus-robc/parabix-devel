@@ -24,6 +24,7 @@
 #include "charset_analysis.h"
 #include <re/adt/adt.h>
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <set>
 
@@ -122,70 +123,342 @@ NFA buildNFA(const std::vector<Element> & elements) {
     return n;
 }
 
-//  An automaton for elements under ICU's possessive matching: a repeated or
-//  optional element takes each character (or the text boundary) it can,
-//  so that it may be passed over only on characters it cannot take.  The
-//  states are (element, repetitions matched); the elements must not have
-//  strings.
-NFA buildPossessiveNFA(const std::vector<Element> & elements) {
-    NFA n;
-    n.accept = n.addState();
-    std::map<std::pair<size_t, int>, unsigned> ids;
-    std::vector<std::pair<size_t, int>> work;
-    // A canonical state: fully repeated elements are passed.
-    auto normalize = [&](size_t i, int c) {
-        while (i < elements.size() && elements[i].ub >= 0 && c >= elements[i].ub) {
-            i++;
-            c = 0;
+//  An automaton for elements under ICU's matching.  A repeated or optional
+//  element takes each alternative it can (it is passed over only where it
+//  matches nothing), and a set with strings takes its longest matching
+//  string, or else a character.  These choices are expressed as conditions
+//  on the following text: choosing an alternative a (a string, or a
+//  character) of a set requires that no longer string of the set extending
+//  a follows, and passing over an element requires that none of its
+//  alternatives follows.  A condition is tracked in the trie of the strings
+//  of its set: it is satisfied when the text departs from the trie (or at
+//  the text boundary) and violated when a string (or, for passing over, a
+//  character of the set) is completed.  The states are (element,
+//  repetitions matched, the node of a string being matched, the pending
+//  conditions); the pattern is matched when its elements are matched and
+//  no conditions are pending.
+class ICUAutomatonBuilder {
+public:
+    ICUAutomatonBuilder(const std::vector<Element> & elements) : mElements(elements) {
+        for (const Element & e : elements) {
+            Trie t;
+            t.nodes.emplace_back();
+            for (const auto & str : e.strings) {
+                int node = 0;
+                for (const codepoint_t c : str) {
+                    auto f = t.nodes[node].children.find(c);
+                    if (f == t.nodes[node].children.end()) {
+                        const int child = static_cast<int>(t.nodes.size());
+                        t.nodes[node].children.emplace(c, child);
+                        t.nodes.emplace_back();
+                        node = child;
+                    } else {
+                        node = f->second;
+                    }
+                }
+                t.nodes[node].terminal = true;
+            }
+            mTries.push_back(std::move(t));
         }
-        return std::make_pair(i, c);
+    }
+    NFA build();
+private:
+    struct TrieNode {
+        std::map<codepoint_t, int> children;
+        bool terminal = false;
     };
-    auto stateOf = [&](std::pair<size_t, int> s) {
-        if (s.first == elements.size()) return n.accept;
-        auto f = ids.find(s);
-        if (f != ids.end()) return f->second;
-        const unsigned id = n.addState();
-        ids.emplace(s, id);
-        work.push_back(s);
-        return id;
+    struct Trie {
+        std::vector<TrieNode> nodes;
     };
-    auto cap = [&](size_t j, int c) {
-        const Element & e = elements[j];
+    // A condition: no string of element's set below node (nor, if chars,
+    // a character of the set) follows.
+    struct Condition {
+        size_t element;
+        int node;
+        bool chars;
+        bool operator<(const Condition & o) const {
+            return std::tie(element, node, chars) < std::tie(o.element, o.node, o.chars);
+        }
+        bool operator==(const Condition & o) const {
+            return element == o.element && node == o.node && chars == o.chars;
+        }
+    };
+    struct State {
+        size_t i;           // the current element (elements.size(): matched)
+        int c;              // repetitions matched
+        int node;           // the node of a string being matched, or -1
+        std::vector<Condition> pending;
+        bool operator<(const State & o) const {
+            return std::tie(i, c, node, pending) < std::tie(o.i, o.c, o.node, o.pending);
+        }
+    };
+    unsigned stateOf(State s);
+    // The conditions after a codepoint: false if one is violated.
+    bool advance(const std::vector<Condition> & pending, codepoint_t cp, std::vector<Condition> & next) const;
+    // The codepoint sets on which the conditions behave uniformly.
+    void refine(const std::vector<Condition> & pending, std::vector<UCD::UnicodeSet> & parts) const;
+    // Add the transitions on the characters of chars to the state with the
+    // conditions pending, then (for each class, on which the conditions and
+    // the sets of split behave uniformly) to target(cp, conditions).
+    void addCharEdges(unsigned from, const UCD::UnicodeSet & chars, const std::vector<Condition> & pending,
+                      const std::function<State(codepoint_t, std::vector<Condition>)> & target,
+                      const std::vector<UCD::UnicodeSet> & split = {});
+    int cap(size_t j, int c) const {
+        const Element & e = mElements[j];
         return e.ub < 0 ? std::min(c + 1, e.lb) : c + 1;
-    };
-    n.start = stateOf(normalize(0, 0));
-    while (!work.empty()) {
-        const auto s = work.back();
-        work.pop_back();
-        const unsigned from = ids.at(s);
-        // The elements that may take the next character, in order of priority.
-        UCD::UnicodeSet taken;
-        bool boundaryTaken = false;
-        size_t j = s.first;
-        int c = s.second;
+    }
+    State normalize(State s) const {
+        while (s.node < 0 && s.i < mElements.size() && mElements[s.i].ub >= 0 && s.c >= mElements[s.i].ub) {
+            s.i++;
+            s.c = 0;
+        }
+        return s;
+    }
+    // The condition for choosing an alternative ending at node (none if the
+    // node has no children).
+    void choose(size_t j, int node, std::vector<Condition> & pending) const {
+        if (!mTries[j].nodes[node].children.empty()) pending.push_back(Condition{j, node, false});
+    }
+
+    const std::vector<Element> & mElements;
+    std::vector<Trie> mTries;
+    NFA mNFA;
+    std::map<State, unsigned> mIds;
+    std::vector<State> mWork;
+};
+
+unsigned ICUAutomatonBuilder::stateOf(State s) {
+    std::sort(s.pending.begin(), s.pending.end());
+    s.pending.erase(std::unique(s.pending.begin(), s.pending.end()), s.pending.end());
+    s = normalize(s);
+    if (s.i == mElements.size() && s.node < 0 && s.pending.empty()) return mNFA.accept;
+    auto f = mIds.find(s);
+    if (f != mIds.end()) return f->second;
+    const unsigned id = mNFA.addState();
+    mIds.emplace(s, id);
+    mWork.push_back(s);
+    return id;
+}
+
+bool ICUAutomatonBuilder::advance(const std::vector<Condition> & pending, codepoint_t cp, std::vector<Condition> & next) const {
+    next.clear();
+    for (const Condition & cond : pending) {
+        if (cond.chars && mElements[cond.element].charSet.contains(cp)) return false;
+        const TrieNode & n = mTries[cond.element].nodes[cond.node];
+        auto f = n.children.find(cp);
+        if (f == n.children.end()) continue;    // satisfied
+        const TrieNode & child = mTries[cond.element].nodes[f->second];
+        if (child.terminal) return false;
+        next.push_back(Condition{cond.element, f->second, false});
+    }
+    return true;
+}
+
+void ICUAutomatonBuilder::refine(const std::vector<Condition> & pending, std::vector<UCD::UnicodeSet> & parts) const {
+    std::vector<UCD::UnicodeSet> sets;
+    for (const Condition & cond : pending) {
+        if (cond.chars) sets.push_back(mElements[cond.element].charSet);
+        for (const auto & child : mTries[cond.element].nodes[cond.node].children) sets.emplace_back(child.first);
+    }
+    for (const UCD::UnicodeSet & set : sets) {
+        std::vector<UCD::UnicodeSet> refined;
+        for (const UCD::UnicodeSet & part : parts) {
+            UCD::UnicodeSet in = part & set;
+            UCD::UnicodeSet notIn = part - set;
+            if (!in.empty()) refined.push_back(in);
+            if (!notIn.empty()) refined.push_back(notIn);
+        }
+        parts = std::move(refined);
+    }
+}
+
+void ICUAutomatonBuilder::addCharEdges(unsigned from, const UCD::UnicodeSet & chars, const std::vector<Condition> & pending,
+                                       const std::function<State(codepoint_t, std::vector<Condition>)> & target,
+                                       const std::vector<UCD::UnicodeSet> & split) {
+    std::vector<UCD::UnicodeSet> parts;
+    if (!chars.empty()) parts.push_back(chars);
+    refine(pending, parts);
+    for (const UCD::UnicodeSet & set : split) {
+        std::vector<UCD::UnicodeSet> refined;
+        for (const UCD::UnicodeSet & part : parts) {
+            UCD::UnicodeSet in = part & set;
+            UCD::UnicodeSet notIn = part - set;
+            if (!in.empty()) refined.push_back(in);
+            if (!notIn.empty()) refined.push_back(notIn);
+        }
+        parts = std::move(refined);
+    }
+    for (const UCD::UnicodeSet & part : parts) {
+        const codepoint_t cp = part.front().first;
+        std::vector<Condition> next;
+        if (!advance(pending, cp, next)) continue;
+        const unsigned to = stateOf(target(cp, next));
+        mNFA.addEdge(from, to, NFA::Kind::Chars, makeCC(part), part);
+    }
+}
+
+NFA ICUAutomatonBuilder::build() {
+    mNFA.accept = mNFA.addState();
+    mNFA.start = stateOf(State{0, 0, -1, {}});
+    while (!mWork.empty()) {
+        const State s = mWork.back();
+        mWork.pop_back();
+        const unsigned from = mIds.at(s);
+        if (s.node >= 0) {
+            // Within a string of the set of element s.i.
+            const TrieNode & n = mTries[s.i].nodes[s.node];
+            for (const auto & child : n.children) {
+                const codepoint_t cp = child.first;
+                const int node = child.second;
+                addCharEdges(from, UCD::UnicodeSet(cp), s.pending, [&](codepoint_t, std::vector<Condition> next) {
+                    return State{s.i, s.c, node, next};
+                });
+                if (mTries[s.i].nodes[node].terminal) {
+                    // The string is chosen: no longer string may follow.
+                    addCharEdges(from, UCD::UnicodeSet(cp), s.pending, [&](codepoint_t, std::vector<Condition> next) {
+                        choose(s.i, node, next);
+                        return State{s.i, cap(s.i, s.c), -1, next};
+                    });
+                }
+            }
+            continue;
+        }
+        if (s.i == mElements.size()) {
+            // Matched, with conditions pending on the following text.
+            addCharEdges(from, UCD::UnicodeSet(0, UCD::UNICODE_MAX), s.pending, [&](codepoint_t, std::vector<Condition> next) {
+                return State{s.i, 0, -1, next};
+            });
+            mNFA.addEdge(from, mNFA.accept, NFA::Kind::Boundary);
+            continue;
+        }
+        // The elements that may match next: passing over an element requires
+        // that none of its alternatives follows.
+        std::vector<Condition> pending = s.pending;
+        size_t j = s.i;
+        int c = s.c;
         for (;;) {
-            if (j == elements.size()) {
-                n.addEdge(from, n.accept, NFA::Kind::Epsilon);
+            if (j == mElements.size()) {
+                mNFA.addEdge(from, stateOf(State{j, 0, -1, pending}), NFA::Kind::Epsilon);
                 break;
             }
-            const Element & e = elements[j];
+            const Element & e = mElements[j];
             if (e.ub < 0 || c < e.ub) {
-                const unsigned to = stateOf(normalize(j, cap(j, c)));
-                const UCD::UnicodeSet chars = e.charSet - taken;
-                if (!chars.empty()) {
-                    RE * set = (chars == e.charSet) ? e.chars : makeCC(chars);
-                    n.addEdge(from, to, NFA::Kind::Chars, set, chars);
+                const int next = cap(j, c);
+                // A character of the set: no string starting with it may follow.
+                std::vector<UCD::UnicodeSet> firsts;
+                for (const auto & child : mTries[j].nodes[0].children) firsts.emplace_back(child.first);
+                addCharEdges(from, e.charSet, pending, [&](codepoint_t cp, std::vector<Condition> after) {
+                    auto f = mTries[j].nodes[0].children.find(cp);
+                    if (f != mTries[j].nodes[0].children.end()) choose(j, f->second, after);
+                    return State{j, next, -1, after};
+                }, firsts);
+                // The first character of a string of the set.
+                for (const auto & child : mTries[j].nodes[0].children) {
+                    const codepoint_t cp = child.first;
+                    const int node = child.second;
+                    addCharEdges(from, UCD::UnicodeSet(cp), pending, [&](codepoint_t, std::vector<Condition> after) {
+                        return State{j, c, node, after};
+                    });
+                    if (mTries[j].nodes[node].terminal) {
+                        addCharEdges(from, UCD::UnicodeSet(cp), pending, [&](codepoint_t, std::vector<Condition> after) {
+                            choose(j, node, after);
+                            return State{j, next, -1, after};
+                        });
+                    }
                 }
-                if (e.boundary && !boundaryTaken) n.addEdge(from, to, NFA::Kind::Boundary);
-                taken = taken + e.charSet;
-                boundaryTaken |= e.boundary;
+                // The text boundary (the conditions are satisfied there).
+                if (e.boundary) {
+                    mNFA.addEdge(from, stateOf(State{j, next, -1, {}}), NFA::Kind::Boundary);
+                }
             }
             if (c < e.lb) break;
+            pending.push_back(Condition{j, 0, true});
             j++;
             c = 0;
         }
     }
-    return n;
+    return mNFA;
+}
+
+// Merge the states of an automaton with the same behaviour: the coarsest
+// partition in which the states of a block have transitions of the same
+// kinds on the same characters into the same blocks.  (The conditions of
+// ICUAutomatonBuilder distinguish states that may nevertheless behave alike,
+// which would otherwise form cycles of several steps.)
+NFA reduce(const NFA & n) {
+    const size_t N = n.out.size();
+    struct Transition {
+        NFA::Kind kind;
+        unsigned to;
+        UCD::UnicodeSet chars;
+    };
+    // The transitions of a state into the blocks, merged by kind and block.
+    auto transitions = [&](unsigned s, const std::vector<unsigned> & block) {
+        std::vector<Transition> t;
+        for (const NFA::Edge & e : n.out[s]) {
+            const unsigned to = block[e.to];
+            if (e.kind == NFA::Kind::Epsilon && to == block[s]) continue;
+            auto f = std::find_if(t.begin(), t.end(), [&](const Transition & x) {return x.kind == e.kind && x.to == to;});
+            if (f == t.end()) {
+                t.push_back(Transition{e.kind, to, e.chars});
+            } else {
+                f->chars = f->chars + e.chars;
+            }
+        }
+        std::sort(t.begin(), t.end(), [](const Transition & a, const Transition & b) {
+            return std::make_pair(a.kind, a.to) < std::make_pair(b.kind, b.to);
+        });
+        return t;
+    };
+    auto less = [](const std::pair<unsigned, std::vector<Transition>> & a, const std::pair<unsigned, std::vector<Transition>> & b) {
+        if (a.first != b.first) return a.first < b.first;
+        if (a.second.size() != b.second.size()) return a.second.size() < b.second.size();
+        for (size_t i = 0; i < a.second.size(); i++) {
+            const Transition & x = a.second[i];
+            const Transition & y = b.second[i];
+            if (x.kind != y.kind) return x.kind < y.kind;
+            if (x.to != y.to) return x.to < y.to;
+            const int c = x.chars.compare(y.chars);
+            if (c != 0) return c < 0;
+        }
+        return false;
+    };
+    std::vector<unsigned> block(N);
+    for (unsigned s = 0; s < N; s++) block[s] = (s == n.accept) ? 1 : 0;
+    size_t blocks = 0;
+    for (;;) {
+        std::map<std::pair<unsigned, std::vector<Transition>>, unsigned, decltype(less)> ids(less);
+        std::vector<unsigned> next(N);
+        for (unsigned s = 0; s < N; s++) {
+            auto key = std::make_pair(block[s], transitions(s, block));
+            auto f = ids.find(key);
+            if (f == ids.end()) f = ids.emplace(std::move(key), static_cast<unsigned>(ids.size())).first;
+            next[s] = f->second;
+        }
+        block = std::move(next);
+        if (ids.size() == blocks) break;
+        blocks = ids.size();
+    }
+    NFA r;
+    for (size_t b = 0; b < blocks; b++) r.addState();
+    std::vector<bool> done(blocks, false);
+    for (unsigned s = 0; s < N; s++) {
+        if (done[block[s]]) continue;
+        done[block[s]] = true;
+        for (const Transition & t : transitions(s, block)) {
+            RE * set = nullptr;
+            if (t.kind == NFA::Kind::Chars) {
+                for (const NFA::Edge & e : n.out[s]) {
+                    if (e.kind == t.kind && block[e.to] == t.to && e.chars == t.chars) set = e.set;
+                }
+                if (set == nullptr) set = makeCC(t.chars);
+            }
+            r.addEdge(block[s], t.to, t.kind, set, t.chars);
+        }
+    }
+    r.start = block[n.start];
+    r.accept = block[n.accept];
+    return r;
 }
 
 // Is there a text beginning with a match of each automaton?
@@ -248,6 +521,15 @@ public:
     // Whether rule L is replaced (by the pieces, possibly none if L is
     // masked by its earlier rules), given its earlier overlapping rules.
     bool disambiguate(ConversionRule * L, const std::vector<ConversionRule *> & earlier, std::vector<Rule *> & pieces);
+
+    // Whether an earlier rule e may match where r matches under ICU's
+    // matching, given that they overlap as regular expressions.
+    bool mayOverlapUnderICU(const ConversionRule * e, const ConversionRule * r) {
+        Earlier p;
+        std::string reason;
+        if (!parseEarlier(e, p, reason, true)) return true;
+        return mayOverlapPossessive(p, r);
+    }
 
 private:
     // An earlier rule: an automaton for its items following the position
@@ -352,6 +634,8 @@ private:
     bool explore(const std::vector<Earlier> & rules, bool after, std::set<State> states, LState l,
                  std::vector<Step> path, std::set<unsigned> pending, bool atBoundary,
                  std::vector<std::pair<std::set<State>, LState>> seen, Paths & out);
+    // The (preceding, following) paths on which all the rules fail.
+    bool exploreSides(const std::vector<Earlier> & rules, std::vector<std::pair<Found, Found>> & sides);
 
     DisambiguationStats & mStats;
     CharSetAnalysis mAnalysis;
@@ -728,11 +1012,7 @@ bool Disambiguator::automaton(const std::vector<Element> & elements, bool posses
         n = buildNFA(elements);
         return true;
     }
-    if (std::any_of(elements.begin(), elements.end(), [](const Element & e) {return !e.strings.empty();})) {
-        reason = why.empty() ? "E: set with strings under possessive matching" : why;
-        return false;
-    }
-    n = buildPossessiveNFA(elements);
+    n = reduce(ICUAutomatonBuilder(elements).build());
     isPossessive = true;
     return true;
 }
@@ -1027,11 +1307,15 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         p.push_back(Step{subtract(lItems[item].set, covered), item});
         out.push_back(Found{p, pending, lNext});
     }
-    if (canEnd) {
+    const bool boundaryFails = boundaryNext.empty() && boundaryItem < 0;
+    UCD::UnicodeSet excludedChars = covered;
+    for (const auto & cand : candidates) excludedChars = excludedChars + lItems[cand.first].chars;
+    // (Unless the negated set is empty.)
+    if (canEnd && (boundaryFails || !(excludedChars == UCD::UnicodeSet(0, UCD::UNICODE_MAX)))) {
         std::vector<RE *> excluded = edgeSets;
         excluded.insert(excluded.end(), candidateSets.begin(), candidateSets.end());
         std::vector<Step> p = path;
-        p.push_back(Step{negated(excluded, boundaryNext.empty() && boundaryItem < 0), -1});
+        p.push_back(Step{negated(excluded, boundaryFails), -1});
         out.push_back(Found{p, pending, done});
     }
     // The text boundary: matched by a boundary item of L, or beyond L.
@@ -1052,6 +1336,30 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         if (!explore(rules, after, nexts[i], lNexts[i], p, pending, false, seen, out)) return false;
     }
     return true;
+}
+
+bool Disambiguator::exploreSides(const std::vector<Earlier> & rules, std::vector<std::pair<Found, Found>> & sides) {
+    sides.clear();
+    mFailure.clear();
+    // The paths following the position on which all the rules fail.
+    Paths paths;
+    std::set<State> initial;
+    for (unsigned j = 0; j < rules.size(); j++) initial.insert(State{j, rules[j].forward.start});
+    bool ok = explore(rules, true, initial, lNormalize(mAfter, LState{0, 0, false}), {}, {}, false, {}, paths);
+    for (Found & path : paths) {
+        if (!ok) break;
+        // The paths preceding the position on which the pending rules fail.
+        Paths befores;
+        if (path.pending.empty()) {
+            befores.push_back(Found{{}, {}, LState{0, 0, false}});
+        } else {
+            std::set<State> pendingStates;
+            for (unsigned j : path.pending) pendingStates.insert(State{j, rules[j].backward.start});
+            ok = explore(rules, false, pendingStates, lNormalize(mBefore, LState{0, 0, false}), {}, {}, false, {}, befores);
+        }
+        for (Found & before : befores) sides.emplace_back(before, path);
+    }
+    return ok;
 }
 
 bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<ConversionRule *> & earlier, std::vector<Rule *> & pieces) {
@@ -1117,28 +1425,35 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         }
     }
     if (rules.empty()) return false;
-    // The paths following the position on which all the rules fail.
-    Paths paths;
-    std::set<State> initial;
-    for (unsigned j = 0; j < rules.size(); j++) initial.insert(State{j, rules[j].forward.start});
     std::vector<std::pair<Found, Found>> sides;     // (preceding, following) paths
-    bool ok = explore(rules, true, initial, lNormalize(mAfter, LState{0, 0, false}), {}, {}, false, {}, paths);
-    for (Found & path : paths) {
-        if (!ok) break;
-        // The paths preceding the position on which the pending rules fail.
-        Paths befores;
-        if (path.pending.empty()) {
-            befores.push_back(Found{{}, {}, LState{0, 0, false}});
-        } else {
-            std::set<State> pendingStates;
-            for (unsigned j : path.pending) pendingStates.insert(State{j, rules[j].backward.start});
-            ok = explore(rules, false, pendingStates, lNormalize(mBefore, LState{0, 0, false}), {}, {}, false, {}, befores);
+    auto failure = [this]() {
+        return mFailure.compare(0, 3, "E: ") == 0 ? mFailure : "E: " + mFailure;
+    };
+    if (!exploreSides(rules, sides)) {
+        // The rules that cannot be explored alone remain unresolved; the
+        // others may still be resolved together.
+        if (rules.size() == 1) {
+            unresolved(failure());
+            return false;
         }
-        for (Found & before : befores) sides.emplace_back(before, path);
-    }
-    if (!ok) {
-        unresolved(mFailure.compare(0, 3, "E: ") == 0 ? mFailure : "E: " + mFailure, rules.size());
-        return false;
+        const std::string joint = failure();
+        std::vector<Earlier> alone;
+        for (Earlier & e : rules) {
+            std::vector<Earlier> one{e};
+            std::vector<std::pair<Found, Found>> s;
+            if (exploreSides(one, s)) {
+                alone.push_back(std::move(e));
+            } else {
+                unresolved(failure());
+            }
+        }
+        const size_t dropped = rules.size() - alone.size();
+        rules = std::move(alone);
+        if (dropped == 0 || rules.empty() || !exploreSides(rules, sides)) {
+            if (dropped == 0) mFailure = joint;
+            if (!rules.empty()) unresolved(failure(), rules.size());
+            return false;
+        }
     }
     pieces.clear();
     for (auto & side : sides) {
@@ -1360,10 +1675,12 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
     AlternativeSplitter splitter;
     RuleOverlapAnalysis analysis;
     std::vector<Rule *> result;
+    std::vector<size_t> origin;     // the index of the rule each result rule replaces
     for (size_t i = 0; i < rules.size(); i++) {
         auto f = earlierOf.find(i);
         if (f == earlierOf.end()) {
             result.push_back(rules[i]);
+            origin.push_back(i);
             continue;
         }
         ConversionRule * L = cast<ConversionRule>(rules[i]);
@@ -1413,11 +1730,23 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
         if (replaced) {
             // No pieces: L is masked by its earlier rules.
             result.insert(result.end(), pieces.begin(), pieces.end());
+            origin.insert(origin.end(), pieces.size(), i);
         } else {
             result.push_back(L);
+            origin.push_back(i);
         }
     }
-    s.overlapsAfter = findRuleOverlaps(result).size();
+    // The remaining overlaps, under ICU's matching (pieces may be disjoint
+    // from an earlier rule only under its longest-match or possessive
+    // matching), counted as pairs of the original rules.
+    std::set<std::pair<size_t, size_t>> remaining;
+    for (const RuleOverlap & o : findRuleOverlaps(result)) {
+        const std::pair<size_t, size_t> pair(origin[o.earlier], origin[o.later]);
+        if (remaining.count(pair) == 0 && d.mayOverlapUnderICU(cast<ConversionRule>(result[o.earlier]), cast<ConversionRule>(result[o.later]))) {
+            remaining.insert(pair);
+        }
+    }
+    s.overlapsAfter = remaining.size();
     return result;
 }
 

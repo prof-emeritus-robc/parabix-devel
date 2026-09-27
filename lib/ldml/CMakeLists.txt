@@ -11,6 +11,7 @@ SRC
     transform_rules.cpp
     transform_rules_captures.cpp
     transform_rules_direction.cpp
+    transform_rules_disambiguate.cpp
     transform_rules_exclusive.cpp
     transform_rules_overlap.cpp
     transform_rules_partition.cpp

@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -477,6 +478,49 @@ struct RuleOverlap {
     size_t later;
 };
 std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
+
+//  Order disambiguation (single character contexts).
+//
+//  At a position where several conversion rules of a group match, the
+//  earliest applies.  DisambiguateOrder rewrites a later rule L so that its
+//  replacement rules match exactly where L matches and no earlier
+//  overlapping rule E matches; the rules of the group may then be reordered
+//  without changing their meaning, as far as the overlaps are resolved.
+//
+//  The case handled is that of L having a key of single character items
+//  l1 ... lm (characters or sets) and no contexts, and each earlier
+//  overlapping rule E being a sequence of single character items
+//  (characters or sets, optionally with ?; segments are disregarded) on one
+//  side of its position:
+//      E:  k c1 c2 ... cn   or   k } c1 ... cn → ...    (after the position)
+//      E:  c1 ... cn { k → ...                          (before the position)
+//  The earlier rules are explored together: L is replaced by rules for the
+//  ways in which all of them fail to match (as ICU's possessive matching
+//  does), each with L's key (restricted to classes of characters) and
+//  contexts ending with a negated set (which also matches beyond the end of
+//  the text) or a set within the key, e.g., for E1 = k } s? t and E2 = k } u
+//  and L = [k x]:
+//      x → result ;   k } [^s t u] → result ;   k } s [^t] → result ;
+//  and, for E1 = ab and L = a, a } [^b] → result.  Earlier rules with items
+//  before the position contribute before contexts.  An L masked by its
+//  earlier rules is removed.
+//
+//  Not handled (the pairs remain in order): L with contexts or with
+//  segments, optional or other items that are not single characters, E
+//  with items on both sides, E with items that are not single characters,
+//  and optional items whose sets intersect the sets that may match the same
+//  character when the item is skipped (where possessive matching differs).
+struct DisambiguationStats {
+    size_t overlapsBefore = 0;       // overlapping pairs of rules
+    size_t pairsResolved = 0;        // pairs (E, L) resolved
+    size_t pairsUnresolved = 0;      // pairs (E, L) not handled
+    size_t rulesReplaced = 0;        // rules L replaced
+    size_t rulesAdded = 0;           // replacement rules
+    size_t overlapsAfter = 0;        // overlapping pairs remaining
+    size_t verificationFailures = 0; // replacement rules still overlapping a resolved E (an internal error)
+    std::map<std::string, size_t> unresolvedReasons;   // the unresolved pairs by reason
+};
+std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, DisambiguationStats * stats = nullptr);
 
 //  Trivial capture elimination.
 //

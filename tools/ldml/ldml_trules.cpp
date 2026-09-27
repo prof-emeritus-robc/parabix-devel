@@ -16,7 +16,8 @@
 //      trivial and then nullable capture elimination are applied to the
 //      (forward) rules before printing.  With --mutually-exclusive, the
 //      rules are then expressed in terms of the mutually exclusive
-//      character classes of each group.
+//      character classes of each group.  With --disambiguate-order, the
+//      order dependencies of the rules are then resolved where possible.
 //  ldml_trules [--xml] [--quiet] --overlaps file ...
 //      Report the pairs of rules of the same group that may match at the
 //      same position, in the forward and backward rules (listing the pairs
@@ -131,7 +132,7 @@ static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extr
 
 // Parse, print, and check that the printed form reparses to the same form.
 static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e,
-                         bool eliminateTrivial, bool eliminateNullable, bool exclusive) {
+                         bool eliminateTrivial, bool eliminateNullable, bool exclusive, bool disambiguate) {
     try {
         std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
         if (eliminateTrivial) rules = TrivialCaptureElimination(rules);
@@ -141,6 +142,14 @@ static bool processRules(const std::vector<std::string> & tRules, const std::str
             rules = MutuallyExclusivePartitioning(rules, &stats);
             if (stats.mismatches) {
                 std::cerr << label << ": " << stats.mismatches << " sets replaced by classes with different characters\n";
+                return false;
+            }
+        }
+        DisambiguationStats dstats;
+        if (disambiguate) {
+            rules = DisambiguateOrder(rules, &dstats);
+            if (dstats.verificationFailures) {
+                std::cerr << label << ": " << dstats.verificationFailures << " replacement rules overlap resolved rules\n";
                 return false;
             }
         }
@@ -156,6 +165,14 @@ static bool processRules(const std::vector<std::string> & tRules, const std::str
             if (exclusive) {
                 std::cout << " (" << stats.groups << " groups, " << stats.setsRewritten << " sets rewritten, "
                           << stats.classDefinitions << " class variables, " << stats.variableCopies << " variable copies)";
+            }
+            if (disambiguate) {
+                std::cout << " (overlaps " << dstats.overlapsBefore << " -> " << dstats.overlapsAfter << ", "
+                          << dstats.pairsResolved << " pairs resolved, " << dstats.pairsUnresolved << " unresolved, "
+                          << dstats.rulesReplaced << " rules replaced by " << dstats.rulesAdded << ")";
+                for (const auto & r : dstats.unresolvedReasons) {
+                    std::cout << "\n    unresolved: " << r.second << " " << r.first;
+                }
             }
             std::cout << "\n";
         }
@@ -662,6 +679,43 @@ static const EliminationTestCase exclusiveTestCases[] = {
      "$v = [a-d] ;\n$v_1 = [acd] ;\n([$v_1 b]) b → $1 ;\n:: Null ;\n$v → 2 ;\n"},
 };
 
+static const EliminationTestCase disambiguationTestCases[] = {
+    // The Han-Latin case: an optional item then a required item.
+    {"a } \\u0020? b → x ; [ac] → y ;",
+     "a } \\u0020? b → x ;\nc → y ;\na } [^\\u0020b] → y ;\na } \\u0020 [^b] → y ;\n"},
+    // A longer key: the longest match idiom.
+    {"ab → x ; a → y ;", "ab → x ;\na } [^b] → y ;\n"},
+    {"abc → x ; a → y ;", "abc → x ;\na } [^b] → y ;\na } b [^c] → y ;\n"},
+    // Before contexts.
+    {"b { a → x ; [ac] → y ;", "b { a → x ;\nc → y ;\n[^b] { a → y ;\n"},
+    {"c b? { a → x ; a → y ;", "c b? { a → x ;\n[^bc] { a → y ;\n[^c] b { a → y ;\n"},
+    // A rule without context masks its key.
+    {"a → x ; [ab] → y ;", "a → x ;\nb → y ;\n"},
+    // Several earlier rules with distinct keys.
+    {"a } b → x ; c } d → z ; [ac] → y ;", "a } b → x ;\nc } d → z ;\na } [^b] → y ;\nc } [^d] → y ;\n"},
+    // Sets and variables.
+    {"$v = [bc] ; a } $v → x ; [ae] → y ;", "$v = [bc] ;\na } $v → x ;\ne → y ;\na } [^$v] → y ;\n"},
+    // Not handled: contexts on both sides, a later rule with a context,
+    // shared keys, optional items overlapping following items.
+    {"c { a } b → x ; a → y ;", "c { a } b → x ;\na → y ;\n"},
+    {"a } b → x ; c { a → y ;", "a } b → x ;\nc { a → y ;\n"},
+    // Earlier rules with shared keys are explored together.
+    {"a } b → x ; a } c → z ; a → y ;", "a } b → x ;\na } c → z ;\na } [^bc] → y ;\n"},
+    {"ab → x ; ac → z ; a → y ;", "ab → x ;\nac → z ;\na } [^bc] → y ;\n"},
+    // Later rules with longer keys.
+    {"abc → x ; ab → y ;", "abc → x ;\nab } [^c] → y ;\n"},
+    {"abcd → x ; ab → y ;", "abcd → x ;\nab } [^c] → y ;\nab } c [^d] → y ;\n"},
+    // Segments of earlier rules are disregarded.
+    {"(a) } b → $1 x ; a → y ;", "(a) } b → $1 x ;\na } [^b] → y ;\n"},
+    // Earlier rules on both sides of the position.
+    {"a } b → x ; c { a → z ; a → y ;", "a } b → x ;\nc { a → z ;\n[^c] { a } [^b] → y ;\n"},
+    // A later rule masked by its earlier rules is removed.
+    {"a → x ; a } b → z ; a → y ;", "a → x ;\na } b → z ;\n"},
+    {"a } [bc]? c → x ; a → y ;", "a } [bc]? c → x ;\na → y ;\n"},
+    // Groups are independent.
+    {"ab → x ; :: Null ; a → y ;", "ab → x ;\n:: Null ;\na → y ;\n"},
+};
+
 struct DirectionTestCase {
     const char * input;
     const char * forward;
@@ -794,6 +848,21 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const EliminationTestCase & t : disambiguationTestCases) {
+        count++;
+        try {
+            DisambiguationStats stats;
+            const std::vector<Rule *> rules = DisambiguateOrder(parseTransformRules({t.input}), &stats);
+            failures += !checkOutput("disambiguate", t.input, printRules(rules), t.expected);
+            if (stats.verificationFailures) {
+                failures++;
+                std::cerr << "FAIL (disambiguate verification): " << t.input << "\n";
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     for (const OverlapTestCase & t : overlapTestCases) {
         count++;
         try {
@@ -861,6 +930,7 @@ int main(int argc, char * argv[]) {
     bool eliminate = false;
     bool eliminateTrivial = false;
     bool exclusive = false;
+    bool disambiguate = false;
     bool countTrivial = false;
     bool overlaps = false;
     bool partition = false;
@@ -876,6 +946,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--eliminate-nullable-captures") eliminate = true;
         else if (arg == "--eliminate-trivial-captures") eliminateTrivial = true;
         else if (arg == "--mutually-exclusive") exclusive = true;
+        else if (arg == "--disambiguate-order") disambiguate = true;
         else if (arg == "--count-trivial-captures") countTrivial = true;
         else if (arg == "--overlaps") overlaps = true;
         else if (arg == "--partition") partition = true;
@@ -884,7 +955,8 @@ int main(int argc, char * argv[]) {
     }
     if (files.empty()) {
         std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward]\n"
-                  << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] [--mutually-exclusive] file ...\n"
+                  << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] [--mutually-exclusive]\n"
+                  << "           [--disambiguate-order] file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --overlaps file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --partition file ...\n"
                   << "       " << argv[0] << " [--xml] --count-trivial-captures file ...\n"
@@ -910,7 +982,7 @@ int main(int argc, char * argv[]) {
             } else if (count) {
                 countNullableCaptures(tRules, f, total);
             } else {
-                ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate, exclusive);
+                ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate, exclusive, disambiguate);
             }
         } catch (const std::exception & e) {
             std::cerr << f << ": " << e.what() << "\n";

@@ -14,7 +14,9 @@
 //      extracted for that direction (as forward rules) are printed.
 //      With --eliminate-trivial-captures and --eliminate-nullable-captures,
 //      trivial and then nullable capture elimination are applied to the
-//      (forward) rules before printing.
+//      (forward) rules before printing.  With --mutually-exclusive, the
+//      rules are then expressed in terms of the mutually exclusive
+//      character classes of each group.
 //  ldml_trules [--xml] [--quiet] --overlaps file ...
 //      Report the pairs of rules of the same group that may match at the
 //      same position, in the forward and backward rules (listing the pairs
@@ -129,19 +131,34 @@ static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extr
 
 // Parse, print, and check that the printed form reparses to the same form.
 static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e,
-                         bool eliminateTrivial, bool eliminateNullable) {
+                         bool eliminateTrivial, bool eliminateNullable, bool exclusive) {
     try {
         std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
         if (eliminateTrivial) rules = TrivialCaptureElimination(rules);
         if (eliminateNullable) rules = NullableCaptureElimination(rules);
+        MutuallyExclusiveStats stats;
+        if (exclusive) {
+            rules = MutuallyExclusivePartitioning(rules, &stats);
+            if (stats.mismatches) {
+                std::cerr << label << ": " << stats.mismatches << " sets replaced by classes with different characters\n";
+                return false;
+            }
+        }
         const std::string printed = printRules(rules);
         if (!quiet) std::cout << printed;
         std::string reprinted;
-        if (!reparses(printed, true, reprinted)) {
+        if (!reparses(printed, !exclusive, reprinted)) {
             std::cerr << label << ": round trip mismatch\n--- printed\n" << printed << "--- reprinted\n" << reprinted;
             return false;
         }
-        if (quiet) std::cout << label << ": " << rules.size() << " rules OK\n";
+        if (quiet) {
+            std::cout << label << ": " << rules.size() << " rules OK";
+            if (exclusive) {
+                std::cout << " (" << stats.groups << " groups, " << stats.setsRewritten << " sets rewritten, "
+                          << stats.classDefinitions << " class variables, " << stats.variableCopies << " variable copies)";
+            }
+            std::cout << "\n";
+        }
         return true;
     } catch (const std::exception & e) {
         std::cerr << label << ": " << e.what() << "\n";
@@ -627,6 +644,24 @@ static const EliminationTestCase partitionTestCases[] = {
      "# group 3: rules 7-7\n# literal characters: 2\n"},
 };
 
+static const EliminationTestCase exclusiveTestCases[] = {
+    // Divided variables are replaced by the unions of their classes.
+    {"$A = [a-d] ; $B = [c-f] ; $A $B → x ;",
+     "$A = [a-d] ;\n$B = [c-f] ;\n$A_1 = [ab] ;\n$A_2 = [cd] ;\n$B_1 = [ef] ;\n[$A_1$A_2] [$A_2$B_1] → x ;\n"},
+    // Variables that are exactly one class, and inline sets that are not divided, remain.
+    {"$v = [a-e] ; $w = [xy] ; $v $w → 1 ; [cd] → 2 ; [pq] → 3 ;",
+     "$v = [a-e] ;\n$w = [xy] ;\n$v_1 = [abe] ;\n[$v_1 cd] $w → 1 ;\n[cd] → 2 ;\n[pq] → 3 ;\n"},
+    // Literal characters are classes; strings and the text boundary are retained.
+    {"$v = [{ch}a-c] ; $v → x ; [a-d$] { y → z ;",
+     "$v = [{ch}a-c] ;\n$v_1 = [ab] ;\n$set_1 = d ;\n[$v_1{ch}c] → x ;\n[$v_1$set_1 c$] { y → z ;\n"},
+    // Variables that are not sets are copied with their sets rewritten.
+    {"$v = [a-d] ; $s = $v+ x ; $s → 1 ; [bc] → 2 ;",
+     "$v = [a-d] ;\n$s = $v+ x ;\n$v_1 = [ad] ;\n$s_g1 = [$v_1 bc]+ x ;\n$s_g1 → 1 ;\n[bc] → 2 ;\n"},
+    // Groups are rewritten separately; captures and references are retained.
+    {"$v = [a-d] ; ($v) b → $1 ; :: Null ; $v → 2 ;",
+     "$v = [a-d] ;\n$v_1 = [acd] ;\n([$v_1 b]) b → $1 ;\n:: Null ;\n$v → 2 ;\n"},
+};
+
 struct DirectionTestCase {
     const char * input;
     const char * forward;
@@ -744,6 +779,21 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const EliminationTestCase & t : exclusiveTestCases) {
+        count++;
+        try {
+            MutuallyExclusiveStats stats;
+            const std::vector<Rule *> rules = MutuallyExclusivePartitioning(parseTransformRules({t.input}), &stats);
+            failures += !checkOutput("exclusive", t.input, printRules(rules), t.expected, false);
+            if (stats.mismatches) {
+                failures++;
+                std::cerr << "FAIL (exclusive mismatches): " << t.input << "\n";
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     for (const OverlapTestCase & t : overlapTestCases) {
         count++;
         try {
@@ -810,6 +860,7 @@ int main(int argc, char * argv[]) {
     Extract e = Extract::All;
     bool eliminate = false;
     bool eliminateTrivial = false;
+    bool exclusive = false;
     bool countTrivial = false;
     bool overlaps = false;
     bool partition = false;
@@ -824,6 +875,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--backward") e = Extract::Backward;
         else if (arg == "--eliminate-nullable-captures") eliminate = true;
         else if (arg == "--eliminate-trivial-captures") eliminateTrivial = true;
+        else if (arg == "--mutually-exclusive") exclusive = true;
         else if (arg == "--count-trivial-captures") countTrivial = true;
         else if (arg == "--overlaps") overlaps = true;
         else if (arg == "--partition") partition = true;
@@ -832,7 +884,7 @@ int main(int argc, char * argv[]) {
     }
     if (files.empty()) {
         std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward]\n"
-                  << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] file ...\n"
+                  << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] [--mutually-exclusive] file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --overlaps file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --partition file ...\n"
                   << "       " << argv[0] << " [--xml] --count-trivial-captures file ...\n"
@@ -858,7 +910,7 @@ int main(int argc, char * argv[]) {
             } else if (count) {
                 countNullableCaptures(tRules, f, total);
             } else {
-                ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate);
+                ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate, exclusive);
             }
         } catch (const std::exception & e) {
             std::cerr << f << ": " << e.what() << "\n";

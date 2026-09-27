@@ -415,6 +415,34 @@ struct CharacterClassPartition {
 
 std::vector<CharacterClassPartition> partitionCharacterClasses(const std::vector<Rule *> & rules);
 
+//  Mutually exclusive partitioning.
+//
+//  Transform a rule set so that, within each group, all conversion rules are
+//  expressed in terms of the mutually exclusive character classes of the
+//  group (see partitionCharacterClasses):
+//    - each set in a conversion rule (a variable defining a set, or a set
+//      written inline) is replaced by the union of its classes, each denoted
+//      by its character, variable or inline set; strings within the set and
+//      the text boundary [$] are retained;
+//    - the classes with new variable names are defined at the start of the
+//      group;
+//    - each variable that is not a set but uses sets (e.g. $s = $v+ x ;) is
+//      replaced in the conversion rules of a group by a new variable (named
+//      after it) with the sets of its definition replaced;
+//    - within each group, the variable definitions of the group precede the
+//      new definitions, which precede the conversion rules (in their original
+//      order).
+//  Filter and transform rules, and the original variable definitions, are
+//  retained.
+struct MutuallyExclusiveStats {
+    unsigned groups = 0;
+    unsigned setsRewritten = 0;      // set occurrences replaced by unions of classes
+    unsigned classDefinitions = 0;   // new class variables defined
+    unsigned variableCopies = 0;     // new variables for variables that are not sets
+    unsigned mismatches = 0;         // replaced sets with different characters (an internal error)
+};
+std::vector<Rule *> MutuallyExclusivePartitioning(const std::vector<Rule *> & rules, MutuallyExclusiveStats * stats = nullptr);
+
 //  Overlap analysis of conversion rules.
 //
 //  Two rules overlap if both may match at the same position of some text:

@@ -551,20 +551,47 @@ UnicodeSet UnicodeSet::operator^(const UnicodeSet & other) const noexcept {
  * @brief equality
  ** ------------------------------------------------------------------------------------------------------------- */
 bool UnicodeSet::operator==(const UnicodeSet & other) const noexcept {
-    if (LLVM_LIKELY(mRunLength != other.mRunLength || mQuadLength != other.mQuadLength)) {
-        return false;
-    }
-    for (unsigned i = 0; i < mQuadLength; ++i) {
-        if (mQuads[i] != other.mQuads[i]) {
-            return false;
+    // The representation of a set is not necessarily canonical: adjacent runs
+    // may have the same type and Mixed quads may be empty or full.  Compare the
+    // quads represented, run by run.
+    const run_t * ra = mRuns;
+    const run_t * const raEnd = mRuns + mRunLength;
+    const run_t * rb = other.mRuns;
+    const run_t * const rbEnd = other.mRuns + other.mRunLength;
+    const bitquad_t * qa = mQuads;
+    const bitquad_t * qb = other.mQuads;
+    unsigned remainingA = 0;
+    unsigned remainingB = 0;
+    for (;;) {
+        while (remainingA == 0 && ra != raEnd) {
+            remainingA = lengthOf(*ra++);
         }
-    }
-    for (unsigned i = 0; i < mRunLength; ++i) {
-        if (mRuns[i] != other.mRuns[i]) {
-            return false;
+        while (remainingB == 0 && rb != rbEnd) {
+            remainingB = lengthOf(*rb++);
         }
+        if (remainingA == 0 || remainingB == 0) {
+            // Both sets represent all quads, so both end together.
+            return remainingA == remainingB;
+        }
+        const run_type_t ta = typeOf(*(ra - 1));
+        const run_type_t tb = typeOf(*(rb - 1));
+        const unsigned n = std::min(remainingA, remainingB);
+        if (ta != Mixed && tb != Mixed) {
+            if (ta != tb) {
+                return false;
+            }
+        } else {
+            for (unsigned i = 0; i < n; ++i) {
+                const bitquad_t a = (ta == Mixed) ? *qa++ : ((ta == Full) ? FULL_QUAD_MASK : 0);
+                const bitquad_t b = (tb == Mixed) ? *qb++ : ((tb == Full) ? FULL_QUAD_MASK : 0);
+                if (a != b) {
+                    return false;
+                }
+            }
+        }
+        remainingA -= n;
+        remainingB -= n;
     }
-    return true;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

@@ -517,6 +517,16 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  the rest of its repetitions, if the path ends within it), e.g. for
 //  E = ab and L = a+, aa a* → result ; a } [^ab] → result ;.
 //
+//  A later rule with sets with strings or the text boundary that is not
+//  otherwise completely resolved is split into rules for the alternatives
+//  of its sets (used only if these are all resolved), in ICU's order of
+//  preference (the longest strings, the characters, then the boundary),
+//  e.g. [{ch}{qu}ckq] → k ; into ch → k ; qu → k ; [ckq] → k ;, if no
+//  alternative is a prefix (suffix, preceding the position) of another or
+//  the set is the outermost item of its side (as ICU does not backtrack
+//  into sets).  The text boundary may be the outermost item of each side
+//  of L (e.g. [$] { or ^ at the start of its text to replace).
+//
 //  Not handled (the pairs remain in order): L with items that are not
 //  (repeated) single characters, E with items that are not sets or repeated sets,
 //  repetitions through several classes
@@ -526,6 +536,8 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  that are prefixes of one another or start with characters of the set.
 struct DisambiguationStats {
     size_t overlapsBefore = 0;       // overlapping pairs of rules
+    size_t rulesSplit = 0;           // later rules replaced by rules for the alternatives of their sets
+    size_t splitRules = 0;           // the rules for the alternatives
     size_t pairsResolved = 0;        // pairs (E, L) resolved
     size_t pairsUnresolved = 0;      // pairs (E, L) not handled
     size_t rulesReplaced = 0;        // rules L replaced

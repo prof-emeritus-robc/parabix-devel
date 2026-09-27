@@ -168,6 +168,7 @@ static bool processRules(const std::vector<std::string> & tRules, const std::str
             }
             if (disambiguate) {
                 std::cout << " (overlaps " << dstats.overlapsBefore << " -> " << dstats.overlapsAfter << ", "
+                          << dstats.rulesSplit << " rules split into " << dstats.splitRules << ", "
                           << dstats.pairsResolved << " pairs resolved, " << dstats.pairsUnresolved << " unresolved, "
                           << dstats.rulesReplaced << " rules replaced by " << dstats.rulesAdded << ")";
                 for (const auto & r : dstats.unresolvedReasons) {
@@ -717,6 +718,14 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"b { a → x ; d { a } e → y ;", "b { a → x ;\nd { a } e → y ;\n"},
     {"a } b → x ; a } b c → y ;", "a } b → x ;\n"},
     {"a } b c → x ; a } b → y ;", "a } bc → x ;\na } b [^c] → y ;\n"},
+    // Sets with strings or the text boundary in L are split into their alternatives.
+    {"ch → x ; [{ch}c] → y ;", "ch → x ;\nc } [^h] → y ;\n"},
+    {"c → x ; [{ch}{qu}ckq] → k ;", "c → x ;\nqu → k ;\nk → k ;\nq } [^u] → k ;\n"},
+    {"a { b → x ; [a$] { b → y ;", "a { b → x ;\n[$] { b → y ;\n"},
+    {"a } b → x ; a } [b$] → y ;", "a } b → x ;\na } [$] → y ;\n"},
+    // The text boundary as an item of L.
+    {"a } b → x ; ^ a → y ;", "a } b → x ;\n^ { a } [^b] → y ;\n"},
+    {"a } [b$] → x ; a } $ → y ;", "a } [b$] → x ;\n"},
     // Repetitions in L: each item is replaced by the classes it matches.
     {"ab → x ; a+ → y ;", "ab → x ;\naa a* → y ;\na } [^ab] → y ;\n"},
     {"ab → x ; a c? → y ;", "ab → x ;\nac → y ;\na } [^bc] → y ;\n"},

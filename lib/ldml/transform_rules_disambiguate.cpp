@@ -151,6 +151,7 @@ private:
         UCD::UnicodeSet chars;
         int lb;
         int ub;
+        bool boundary;      // the text boundary (^, $ or [$]), the outermost item of its side
     };
     // The progress of L on one side: its current item and the repetitions
     // of it matched (capped, so that repetitions return to the same state),
@@ -291,14 +292,18 @@ bool Disambiguator::parseL(RE * re, std::vector<LItem> & items, bool segments, s
             }
             RE * set = rep->getRE();
             items.push_back(LItem{set, mAnalysis.setOf(set, false), rep->getLB(),
-                                  rep->getUB() == Rep::UNBOUNDED_REP ? -1 : rep->getUB()});
+                                  rep->getUB() == Rep::UNBOUNDED_REP ? -1 : rep->getUB(), false});
+            continue;
+        }
+        if (isa<Start>(e) || isa<End>(e) || (isTextBoundary(e))) {
+            items.push_back(LItem{e, UCD::UnicodeSet(), 1, 1, true});
             continue;
         }
         if (!isCharItem(e)) {
             reason = itemReason(e);
             return false;
         }
-        items.push_back(LItem{e, mAnalysis.setOf(e, false), 1, 1});
+        items.push_back(LItem{e, mAnalysis.setOf(e, false), 1, 1, false});
     }
     return true;
 }
@@ -707,8 +712,29 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
     std::vector<std::pair<size_t, int>> candidates;
     bool canEnd = false;
     lCandidates(lItems, l, candidates, canEnd);
-    if (!canEnd) boundaryNext.clear();
+    // An item of L that is the text boundary.
+    int boundaryItem = -1;
+    int boundaryCount = 0;
+    for (auto i = candidates.begin(); i != candidates.end(); ) {
+        if (lItems[i->first].boundary) {
+            boundaryItem = static_cast<int>(i->first);
+            boundaryCount = i->second;
+            i = candidates.erase(i);
+        } else {
+            ++i;
+        }
+    }
+    const bool boundaryAllowed = canEnd || boundaryItem >= 0;
+    if (!boundaryAllowed) boundaryNext.clear();
     const LState done{0, 0, true};
+    if (atBoundary) {
+        // Beyond the end of the text, L must end (after a boundary item).
+        if (boundaryItem >= 0) {
+            l = lAdvance(lItems, boundaryItem, boundaryCount);
+            lCandidates(lItems, l, candidates, canEnd);
+        }
+        if (!canEnd) return true;   // L does not match here
+    }
     if (atBoundary) {
         // Beyond the end of the text, only the text boundary may match.
         if (boundaryNext.empty()) {
@@ -823,13 +849,18 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         std::vector<RE *> excluded = edgeSets;
         excluded.insert(excluded.end(), candidateSets.begin(), candidateSets.end());
         std::vector<Step> p = path;
-        p.push_back(Step{negated(excluded, boundaryNext.empty()), -1});
+        p.push_back(Step{negated(excluded, boundaryNext.empty() && boundaryItem < 0), -1});
         out.push_back(Found{p, pending, done});
-        // The text boundary.
-        if (!boundaryNext.empty()) {
-            std::vector<Step> b = path;
-            b.push_back(Step{makeTextBoundary(), -1});
-            if (!explore(rules, after, boundaryNext, done, b, pending, true, seen, out)) return false;
+    }
+    // The text boundary: matched by a boundary item of L, or beyond L.
+    if (boundaryAllowed && (!boundaryNext.empty() || boundaryItem >= 0)) {
+        const LState lNext = boundaryItem >= 0 ? lAdvance(lItems, boundaryItem, boundaryCount) : done;
+        std::vector<Step> b = path;
+        b.push_back(Step{makeTextBoundary(), boundaryItem});
+        if (boundaryNext.empty()) {
+            out.push_back(Found{b, pending, lNext});    // all the rules fail
+        } else if (!explore(rules, after, boundaryNext, lNext, b, pending, true, seen, out)) {
+            return false;
         }
     }
     for (size_t i = 0; i < parts.size(); i++) {
@@ -850,7 +881,19 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     mAfter.clear();
     mBefore.clear();
     std::string why;
-    if (!parseL(src->getText(), mAfter, true, why)) {
+    // ^ at the start of the text to replace (without a before context) is a
+    // condition preceding the position.
+    RE * text = src->getText();
+    std::vector<LItem> leading;
+    if (!src->hasBeforeContext()) {
+        if (const Seq * seq = dyn_cast<Seq>(text)) {
+            if (!seq->empty() && isa<Start>(seq->front())) {
+                leading.push_back(LItem{seq->front(), UCD::UnicodeSet(), 1, 1, true});
+                text = makeSeq(seq->begin() + 1, seq->end());
+            }
+        }
+    }
+    if (!parseL(text, mAfter, true, why)) {
         unresolved("L: text to replace has a " + why, earlier.size());
         return false;
     }
@@ -869,6 +912,18 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
             return false;
         }
         std::reverse(mBefore.begin(), mBefore.end());
+    }
+    mBefore.insert(mBefore.end(), leading.begin(), leading.end());
+    auto boundaryOutermost = [](const std::vector<LItem> & items) {
+        for (size_t i = 0; i + 1 < items.size(); i++) {
+            if (items[i].boundary) return false;
+        }
+        return true;
+    };
+    if (!boundaryOutermost(mAfter) || !boundaryOutermost(mBefore) ||
+            std::any_of(mAfter.begin(), mAfter.begin() + mKeyLength, [](const LItem & i) {return i.boundary;})) {
+        unresolved("L: text boundary within its items", earlier.size());
+        return false;
     }
     if (!possessiveIsExactL(mAfter) || !possessiveIsExactL(mBefore)) {
         unresolved("L: repeated or optional item overlaps following items (possessive)", earlier.size());
@@ -918,7 +973,7 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         for (size_t j = 0; j < mKeyLength; j++) keyItems.push_back(makeSeq(following[j].begin(), following[j].end()));
         std::map<const Capture *, Capture *> captures;
         size_t next = 0;
-        RE * key = rebuildKey(src->getText(), keyItems, next, captures);
+        RE * key = rebuildKey(text, keyItems, next, captures);
         std::vector<RE *> afterItems;
         for (size_t j = mKeyLength; j < mAfter.size(); j++) afterItems.insert(afterItems.end(), following[j].begin(), following[j].end());
         afterItems.insert(afterItems.end(), beyond.begin(), beyond.end());
@@ -945,6 +1000,170 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     return true;
 }
 
+//  Splitting the sets with strings or the text boundary of a rule into
+//  rules for their alternatives, in ICU's order of preference (the longest
+//  strings, the characters, then the text boundary), e.g.
+//  [{ch}{qu}ckq] → k ; into ch → k ; qu → k ; [ckq] → k ;.  As ICU does
+//  not backtrack into a set, a set is split only if no alternative is a
+//  prefix (or, preceding the position, a suffix) of another, or it is the
+//  outermost item of its side.
+class AlternativeSplitter {
+public:
+    // The rules replacing r, or empty if r is not split.
+    std::vector<Rule *> split(const ConversionRule * r);
+private:
+    struct Leaf {
+        RE * re;
+        std::vector<RE *> alternatives;     // empty if not split
+    };
+    bool splittable(RE * re) {
+        return CharSetAnalysis::isSet(re) && hasStringsOrBoundary(re) && !isa<Start>(re) && !isa<End>(re)
+            && !isTextBoundary(re);
+    }
+    bool collect(RE * re, bool segments, std::vector<Leaf> & leaves);
+    bool alternatives(Leaf & leaf, bool reversed, bool outermost);
+    RE * rebuild(RE * re, bool segments, const std::vector<RE *> & choice, size_t & next,
+                 std::map<const Capture *, Capture *> & captures);
+    CharSetAnalysis mAnalysis;
+};
+
+bool AlternativeSplitter::collect(RE * re, bool segments, std::vector<Leaf> & leaves) {
+    if (re == nullptr) return true;
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) {
+            if (!collect(e, segments, leaves)) return false;
+        }
+        return true;
+    }
+    if (segments && isa<Capture>(re)) return collect(cast<Capture>(re)->getCapturedRE(), segments, leaves);
+    if (isSequenceVariable(re)) return collect(cast<Name>(re)->getDefinition(), segments, leaves);
+    if (Rep * rep = dyn_cast<Rep>(re)) {
+        if (splittable(rep->getRE())) return false;     // a repeated choice cannot be split
+    }
+    leaves.push_back(Leaf{re, {}});
+    return true;
+}
+
+bool AlternativeSplitter::alternatives(Leaf & leaf, bool reversed, bool outermost) {
+    RE * re = leaf.re;
+    std::vector<std::vector<codepoint_t>> strings;
+    collectSetStrings(re, strings);
+    std::stable_sort(strings.begin(), strings.end(), [](const std::vector<codepoint_t> & a, const std::vector<codepoint_t> & b) {
+        return a.size() > b.size();
+    });
+    const UCD::UnicodeSet chars = mAnalysis.setOf(re, false);
+    if (!outermost) {
+        // No alternative may be a prefix (suffix) of another.
+        for (const auto & s : strings) {
+            const codepoint_t first = reversed ? s.back() : s.front();
+            if (chars.contains(first)) return false;
+            for (const auto & t : strings) {
+                if (&t == &s || t.size() >= s.size()) continue;
+                if (reversed ? std::equal(t.rbegin(), t.rend(), s.rbegin()) : std::equal(t.begin(), t.end(), s.begin())) return false;
+            }
+        }
+    }
+    for (const auto & s : strings) {
+        std::vector<RE *> cps;
+        for (const codepoint_t c : s) cps.push_back(makeCC(c));
+        leaf.alternatives.push_back(cps.size() == 1 ? cps[0] : makeSeq(cps.begin(), cps.end()));
+    }
+    if (!chars.empty()) leaf.alternatives.push_back(charPart(re, chars));
+    if (hasBoundary(re)) leaf.alternatives.push_back(makeTextBoundary());
+    return true;
+}
+
+RE * AlternativeSplitter::rebuild(RE * re, bool segments, const std::vector<RE *> & choice, size_t & next,
+                                  std::map<const Capture *, Capture *> & captures) {
+    if (re == nullptr) return nullptr;
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> elements;
+        bool changed = false;
+        for (RE * e : *seq) {
+            elements.push_back(rebuild(e, segments, choice, next, captures));
+            changed |= elements.back() != e;
+        }
+        return changed ? makeSeq(elements.begin(), elements.end()) : re;
+    }
+    if (segments && isa<Capture>(re)) {
+        Capture * c = cast<Capture>(re);
+        RE * captured = rebuild(c->getCapturedRE(), segments, choice, next, captures);
+        if (captured == c->getCapturedRE()) return re;
+        Capture * rebuilt = makeCapture(c->getName(), captured);
+        captures.emplace(c, rebuilt);
+        return rebuilt;
+    }
+    if (isSequenceVariable(re)) {
+        RE * def = cast<Name>(re)->getDefinition();
+        RE * rebuilt = rebuild(def, segments, choice, next, captures);
+        return rebuilt == def ? re : rebuilt;
+    }
+    RE * chosen = choice[next++];
+    return chosen ? chosen : re;
+}
+
+std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r) {
+    if (r->getDirection() != Direction::Forward) return {};
+    const RuleSide * src = r->getLeftSide();
+    // The leaves preceding the position (in text order; the first is
+    // outermost) and following it (the text to replace, then the after
+    // context; the last is outermost).
+    std::vector<Leaf> before, following;
+    if (!collect(src->getBeforeContext(), false, before)) return {};
+    if (!collect(src->getText(), true, following)) return {};
+    const size_t keyLeaves = following.size();
+    if (!collect(src->getAfterContext(), false, following)) return {};
+    bool any = false;
+    size_t combinations = 1;
+    for (size_t i = 0; i < before.size(); i++) {
+        if (!splittable(before[i].re)) continue;
+        if (!alternatives(before[i], true, i == 0)) return {};
+        any = true;
+        combinations *= before[i].alternatives.size();
+    }
+    for (size_t i = 0; i < following.size(); i++) {
+        if (!splittable(following[i].re)) continue;
+        if (!alternatives(following[i], false, i + 1 == following.size())) return {};
+        any = true;
+        combinations *= following[i].alternatives.size();
+    }
+    if (!any || combinations > 64) return {};
+    // The combinations of alternatives, in order of preference.
+    std::vector<Leaf *> leaves;
+    for (Leaf & l : following) leaves.push_back(&l);
+    for (Leaf & l : before) leaves.push_back(&l);
+    std::vector<size_t> index(leaves.size(), 0);
+    std::vector<Rule *> rules;
+    for (;;) {
+        std::vector<RE *> choice;
+        for (size_t i = 0; i < leaves.size(); i++) {
+            choice.push_back(leaves[i]->alternatives.empty() ? nullptr : leaves[i]->alternatives[index[i]]);
+        }
+        const std::vector<RE *> followingChoice(choice.begin(), choice.begin() + following.size());
+        const std::vector<RE *> beforeChoice(choice.begin() + following.size(), choice.end());
+        std::map<const Capture *, Capture *> captures;
+        size_t next = 0;
+        RE * text = rebuild(src->getText(), true, followingChoice, next, captures);
+        assert (next == keyLeaves);
+        RE * afterContext = rebuild(src->getAfterContext(), false, followingChoice, next, captures);
+        next = 0;
+        RE * beforeContext = rebuild(src->getBeforeContext(), false, beforeChoice, next, captures);
+        RuleSide * side = RuleSide::Create(beforeContext, text, false, nullptr, 0, afterContext);
+        RuleSide * result = captures.empty() ? r->getRightSide() : remapReferences(r->getRightSide(), captures);
+        rules.push_back(makeConversionRule(side, Direction::Forward, result));
+        // The next combination (the last leaf varying fastest).
+        size_t i = leaves.size();
+        while (i > 0) {
+            --i;
+            if (leaves[i]->alternatives.empty()) continue;
+            if (++index[i] < leaves[i]->alternatives.size()) break;
+            index[i] = 0;
+            if (i == 0) return rules;
+        }
+        if (std::all_of(index.begin(), index.end(), [](size_t x) {return x == 0;})) return rules;
+    }
+}
+
 } // end anonymous namespace
 
 std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, DisambiguationStats * stats) {
@@ -957,16 +1176,65 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
         earlierOf[o.later].push_back(cast<ConversionRule>(rules[o.earlier]));
     }
     Disambiguator d(s);
+    AlternativeSplitter splitter;
+    RuleOverlapAnalysis analysis;
     std::vector<Rule *> result;
     for (size_t i = 0; i < rules.size(); i++) {
         auto f = earlierOf.find(i);
-        std::vector<Rule *> pieces;
-        if (f != earlierOf.end() && d.disambiguate(cast<ConversionRule>(rules[i]), f->second, pieces)) {
-            // No pieces: L is masked by its earlier rules.
-            result.insert(result.end(), pieces.begin(), pieces.end());
+        if (f == earlierOf.end()) {
+            result.push_back(rules[i]);
             continue;
         }
-        result.push_back(rules[i]);
+        ConversionRule * L = cast<ConversionRule>(rules[i]);
+        const DisambiguationStats initial = s;
+        std::vector<Rule *> pieces;
+        bool replaced = d.disambiguate(L, f->second, pieces);
+        if (!replaced || s.pairsUnresolved != initial.pairsUnresolved) {
+            // Not completely resolved: try splitting the sets of L with
+            // strings or the text boundary into rules for their alternatives,
+            // each disambiguated from the earlier rules and the preceding
+            // alternatives that it overlaps; used only if all are resolved.
+            const std::vector<Rule *> alternatives = splitter.split(L);
+            if (!alternatives.empty()) {
+                const DisambiguationStats first = s;
+                s = initial;
+                std::vector<Rule *> altPieces;
+                bool ok = true;
+                for (size_t k = 0; k < alternatives.size() && ok; k++) {
+                    ConversionRule * A = cast<ConversionRule>(alternatives[k]);
+                    std::vector<ConversionRule *> earlier;
+                    for (ConversionRule * e : f->second) {
+                        if (analysis.mayOverlap(e, A)) earlier.push_back(e);
+                    }
+                    for (size_t j = 0; j < k; j++) {
+                        ConversionRule * B = cast<ConversionRule>(alternatives[j]);
+                        if (analysis.mayOverlap(B, A)) earlier.push_back(B);
+                    }
+                    if (earlier.empty()) {
+                        altPieces.push_back(A);
+                        continue;
+                    }
+                    const size_t unresolved = s.pairsUnresolved;
+                    std::vector<Rule *> p;
+                    ok = d.disambiguate(A, earlier, p) && s.pairsUnresolved == unresolved;
+                    altPieces.insert(altPieces.end(), p.begin(), p.end());
+                }
+                if (ok) {
+                    pieces = altPieces;
+                    replaced = true;
+                    s.rulesSplit++;
+                    s.splitRules += alternatives.size();
+                } else {
+                    s = first;
+                }
+            }
+        }
+        if (replaced) {
+            // No pieces: L is masked by its earlier rules.
+            result.insert(result.end(), pieces.begin(), pieces.end());
+        } else {
+            result.push_back(L);
+        }
     }
     s.overlapsAfter = findRuleOverlaps(result).size();
     return result;

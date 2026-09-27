@@ -463,6 +463,9 @@ endif()
 # Kernel Tests
 add_subdirectory(tests)
 
+# Standalone unit tests
+add_subdirectory(QA/unit-tests)
+
 # Target definition for single library
 if(ARTIFACT_MODE STREQUAL "Single")
     target_link_libraries(${PARABIX_MONO_TARGET} ${REQ_LLVM_LIBRARIES} ${Boost_LIBRARIES} ${Z3_LIBRARIES} ${LIBBACKTRACE_LIBRARIES})

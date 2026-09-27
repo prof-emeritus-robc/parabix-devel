@@ -6,6 +6,7 @@
 #include <ldml/transform_rules_parser.h>
 #include <re/adt/adt.h>
 #include <algorithm>
+#include <set>
 #include <re/adt/re_utility.h>
 #include <ldml/transform_rules_printer.h>
 
@@ -1031,6 +1032,45 @@ void TransformRuleParser::validateInsertions() const {
     }
 }
 
+// The segments of a rule side within repetitions, and the segments referenced.
+static void collectSegments(const RE * re, bool withinRep, std::set<const Capture *> & repeated,
+                            std::set<const Capture *> & referenced) {
+    if (re == nullptr) return;
+    if (const Capture * c = dyn_cast<Capture>(re)) {
+        if (withinRep) repeated.insert(c);
+        collectSegments(c->getCapturedRE(), withinRep, repeated, referenced);
+    } else if (const Reference * ref = dyn_cast<Reference>(re)) {
+        referenced.insert(ref->getCapture());
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        collectSegments(rep->getRE(), withinRep || rep->getUB() != 1, repeated, referenced);
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) collectSegments(e, withinRep, repeated, referenced);
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) collectSegments(e, withinRep, repeated, referenced);
+    } else if (isFunctionCall(re)) {
+        collectSegments(cast<Name>(re)->getDefinition(), withinRep, repeated, referenced);
+    }
+}
+
+void TransformRuleParser::validateRepeatedSegments() const {
+    for (const Rule * rule : mRules) {
+        const ConversionRule * r = dyn_cast<ConversionRule>(rule);
+        if (r == nullptr) continue;
+        std::set<const Capture *> repeated;
+        std::set<const Capture *> referenced;
+        for (const RuleSide * side : {r->getLeftSide(), r->getRightSide()}) {
+            for (const RE * part : {side->getBeforeContext(), side->getCompletedResult(), side->getResultToRevisit(), side->getAfterContext()}) {
+                collectSegments(part, false, repeated, referenced);
+            }
+        }
+        for (const Capture * c : repeated) {
+            if (referenced.count(c)) {
+                throw TransformRuleParseError("Rule " + printRule(r) + " references a segment within a repetition, which captures only its last repetition");
+            }
+        }
+    }
+}
+
 Name * TransformRuleParser::lookupVariable(const std::string & name) const {
     auto f = mVariables.find(name);
     return f == mVariables.end() ? nullptr : f->second;
@@ -1043,6 +1083,7 @@ std::vector<Rule *> parseTransformRules(const std::vector<std::string> & tRules)
     }
     parser.validateRuleOrder();
     parser.validateInsertions();
+    parser.validateRepeatedSegments();
     return parser.getRules();
 }
 

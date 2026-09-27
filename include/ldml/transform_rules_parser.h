@@ -60,6 +60,9 @@ public:
     // applies) may be empty, without contexts, would match again at the
     // same position indefinitely: the rules are ill-formed.
     void validateInsertions() const;
+    // A segment within a repetition captures only its last repetition (or
+    // nothing): a rule referencing one is ill-formed.
+    void validateRepeatedSegments() const;
 
     // The variable of the given name, or nullptr if not defined.
     re::Name * lookupVariable(const std::string & name) const;

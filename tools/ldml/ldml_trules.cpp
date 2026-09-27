@@ -279,6 +279,9 @@ static const TestCase testCases[] = {
     {"$e = ; $e → x ;", nullptr},
     {"x ← (a?) ;", nullptr},
     {"(a*) ↔ b ;", nullptr},
+    {"a ([bc])+ → $1 ;", nullptr},           // a segment within a repetition referenced
+    {"x $1 ← ([bc])* y ;", nullptr},
+    {"a ([bc])+ → x ;", "a ([bc])+ → x ;\n"},
     {"[a^] → b ;", nullptr},                // unescaped ^ in set
     {"[a-\\x{62 63}] → b ;", nullptr},      // range end is not a single codepoint
 };
@@ -539,7 +542,7 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"$v = [ab] ; x ($v*) → &Any-Hex($1) | y ;",
      "$v = [ab] ;\nx ($v+) → &Any-Hex($1) | y ;\nx → &Any-Hex() | y ;\n"},
     // Deleting a capture deletes the captures within it.
-    {"((a)*) b → $2 $1 ;", "((a)+) b → $2 $1 ;\nb → ;\n"},
+    {"((a)?) b → $2 $1 ;", "((a)) b → $2 $1 ;\nb → ;\n"},
     // Captures in contexts.
     {"(x*) { y → z $1 ;", "(x+) { y → z $1 ;\ny → z ;\n"},
     // Variables defined as optional items.
@@ -550,7 +553,7 @@ static const EliminationTestCase eliminationTestCases[] = {
      "$m = m ;\n$d = d ;\n(x) $m $d y → $m $d $1 ;\n(x) $m y → $m $1 ;\n(x) $d y → $d $1 ;\n(x) y → $1 ;\n"},
     {"$V = [aeiou] ; z ([jw]? $V?) → $1 ;",
      "$V = [aeiou] ;\nz ([jw] $V) → $1 ;\nz ([jw]) → $1 ;\nz ($V) → $1 ;\nz → ;\n"},
-    {"((a)* b*) c → $2 $1 ;", "((a)+ b+) c → $2 $1 ;\n((a)+) c → $2 $1 ;\n(b+) c → $1 ;\nc → ;\n"},
+    {"((a)? b*) c → $2 $1 ;", "((a) b+) c → $2 $1 ;\n((a)) c → $2 $1 ;\n(b+) c → $1 ;\nc → ;\n"},
     {"z { (a? b? c?) → $1 ;",
      "z { abc → abc ;\nz { ab → ab ;\nz { ac → ac ;\nz { a → a ;\n"
      "z { bc → bc ;\nz { b → b ;\nz { c → c ;\nz { → ;\n"},

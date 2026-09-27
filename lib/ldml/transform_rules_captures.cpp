@@ -99,11 +99,14 @@ void collectCaptures(RE * re, std::set<const Capture *> & captures) {
 //  references are replaced by that string.  References to deleted
 //  captures are replaced by the empty string.  All captures of the source
 //  side are renumbered in order and the references of the result side updated.
+//  With no target, the captures are just renumbered.
 class CaptureRewriter {
 public:
-    CaptureRewriter(Capture * target, RE * newContent, std::set<const Capture *> deleted)
+    CaptureRewriter(Capture * target = nullptr, RE * newContent = nullptr, std::set<const Capture *> deleted = {})
     : mTarget(target), mNewContent(newContent), mDeleted(std::move(deleted)) {
-        if (isEmptySeq(newContent)) {
+        if (target == nullptr) {
+            // renumbering only
+        } else if (isEmptySeq(newContent)) {
             mDeleted.insert(target);
         } else if (isFixedString(newContent)) {
             mReplacement = newContent;
@@ -226,6 +229,63 @@ void eliminate(ConversionRule * r, std::vector<Rule *> & result) {
     }
 }
 
+bool referencesCapture(const RE * re, const Capture * c) {
+    if (re == nullptr) return false;
+    if (const Reference * ref = dyn_cast<Reference>(re)) {
+        return ref->getCapture() == c;
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return isFunctionCall(n) && referencesCapture(n->getDefinition(), c);
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) {
+            if (referencesCapture(e, c)) return true;
+        }
+    }
+    return false;
+}
+
+//  The capture of a trivial capture rule, or nullptr: a forward rule whose
+//  text to replace is a capture and whose completed result begins with a
+//  reference to it.
+Capture * trivialCapture(const ConversionRule * r) {
+    if (r->getDirection() != Direction::Forward) return nullptr;
+    Capture * c = dyn_cast<Capture>(r->getLeftSide()->getText());
+    if (c == nullptr) return nullptr;
+    RE * completed = r->getRightSide()->getCompletedResult();
+    const RE * front = completed;
+    if (const Seq * seq = dyn_cast<Seq>(completed)) {
+        if (seq->empty()) return nullptr;
+        front = seq->front();
+    }
+    const Reference * ref = dyn_cast<Reference>(front);
+    return (ref && ref->getCapture() == c) ? c : nullptr;
+}
+
+//  before { (X) } after → $n rest | revisit ;   becomes
+//  before X { } after → rest | revisit ;
+//  The capture is retained in the before context if it is referenced
+//  elsewhere in the result.
+Rule * eliminateTrivialCapture(ConversionRule * r) {
+    const RuleSide * src = r->getLeftSide();
+    const RuleSide * res = r->getRightSide();
+    Capture * c = trivialCapture(r);
+    if (c == nullptr) return r;
+    RE * completed = res->getCompletedResult();
+    std::vector<RE *> items;
+    if (const Seq * seq = dyn_cast<Seq>(completed)) {
+        items.assign(seq->begin(), seq->end());
+    } else {
+        items.push_back(completed);
+    }
+    RE * rest = makeSeq(items.begin() + 1, items.end());
+    const bool referenced = referencesCapture(rest, c) || referencesCapture(res->getResultToRevisit(), c);
+    RE * moved = referenced ? static_cast<RE *>(c) : c->getCapturedRE();
+    RE * before = src->hasBeforeContext() ? makeSeq({src->getBeforeContext(), moved}) : moved;
+    RuleSide * source = RuleSide::Create(before, makeSeq(), false, nullptr, 0, src->getAfterContext());
+    RuleSide * result = RuleSide::Create(nullptr, rest, res->hasCursor(), res->getResultToRevisit(), res->getCursorOffset(), nullptr);
+    // Renumber the captures, as the moved capture may no longer be a capture.
+    return CaptureRewriter().rewrite(makeConversionRule(source, Direction::Forward, result));
+}
+
 } // end anonymous namespace
 
 std::vector<Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated) {
@@ -234,6 +294,65 @@ std::vector<Capture *> findNullableCaptures(const RuleSide * side, bool includeR
     findNullableCaptures(side->getText(), false, includeRepeated, found);
     findNullableCaptures(side->getAfterContext(), false, includeRepeated, found);
     return found;
+}
+
+std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats) {
+    std::vector<Rule *> result(rules);
+    RuleOverlapAnalysis analysis;
+    // The group of each rule: the transform rules separate groups.
+    std::vector<size_t> groupStart(rules.size());
+    std::vector<size_t> groupEnd(rules.size());
+    for (size_t i = 0, start = 0; i <= rules.size(); i++) {
+        if (i == rules.size() || isa<TransformRule>(rules[i])) {
+            for (size_t j = start; j < i; j++) {
+                groupStart[j] = start;
+                groupEnd[j] = i;
+            }
+            start = i + 1;
+        }
+    }
+    auto competitor = [&](size_t j) -> const ConversionRule * {
+        const ConversionRule * s = dyn_cast<ConversionRule>(result[j]);
+        return (s && appliesForward(s->getDirection())) ? s : nullptr;
+    };
+    for (size_t i = 0; i < rules.size(); i++) {
+        ConversionRule * r = dyn_cast<ConversionRule>(rules[i]);
+        if (r == nullptr || trivialCapture(r) == nullptr) continue;
+        if (stats) stats->candidates++;
+        TrivialCaptureStats::Blocked blocked{r, {}, {}};
+        for (size_t j = groupStart[i]; j < groupEnd[i]; j++) {
+            if (j == i) continue;
+            const ConversionRule * s = competitor(j);
+            if (s == nullptr) continue;
+            // A later rule that may match at the start of X.
+            if (j > i && analysis.mayOverlap(r, s)) blocked.laterRules.push_back(s);
+            // Any rule that may match at a position within X.
+            if (analysis.mayMatchWithin(s, r)) blocked.withinRules.push_back(s);
+        }
+        if (!blocked.laterRules.empty() || !blocked.withinRules.empty()) {
+            if (stats) {
+                stats->blockedByLaterRule += !blocked.laterRules.empty();
+                stats->blockedWithinCapture += blocked.laterRules.empty();
+                stats->blocked.push_back(std::move(blocked));
+            }
+            continue;
+        }
+        ConversionRule * transformed = cast<ConversionRule>(eliminateTrivialCapture(r));
+        result[i] = transformed;
+        if (stats) {
+            stats->transformed.push_back(transformed);
+            // An earlier rule that may match at the end of X, where the
+            // transformed rule now applies.
+            for (size_t j = groupStart[i]; j < i; j++) {
+                const ConversionRule * s = competitor(j);
+                if (s && analysis.mayOverlap(s, transformed)) {
+                    stats->endPositionConflicts++;
+                    break;
+                }
+            }
+        }
+    }
+    return result;
 }
 
 std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules) {

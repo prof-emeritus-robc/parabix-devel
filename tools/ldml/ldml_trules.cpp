@@ -6,14 +6,22 @@
 //  ldml_trules: parse LDML transform rules and print them in canonical form.
 //
 //  ldml_trules [--xml] [--quiet] [--forward | --backward]
-//              [--eliminate-nullable-captures] file ...
+//              [--eliminate-trivial-captures] [--eliminate-nullable-captures] file ...
 //      Parse the rules of each file (plain rule text, or with --xml, the
 //      <tRule> elements of an LDML transform file), print the canonical
 //      form of the rules and check that the canonical form reparses to
 //      the same canonical form.  With --forward or --backward, the rules
 //      extracted for that direction (as forward rules) are printed.
-//      With --eliminate-nullable-captures, nullable capture elimination
-//      is applied to the (forward) rules before printing.
+//      With --eliminate-trivial-captures and --eliminate-nullable-captures,
+//      trivial and then nullable capture elimination are applied to the
+//      (forward) rules before printing.
+//  ldml_trules [--xml] [--quiet] --overlaps file ...
+//      Report the pairs of rules of the same group that may match at the
+//      same position, in the forward and backward rules (listing the pairs
+//      unless --quiet).
+//  ldml_trules [--xml] --count-trivial-captures file ...
+//      Report the rules transformed and not transformed by trivial capture
+//      elimination in the forward and backward rules.
 //  ldml_trules [--xml] --count-nullable-captures file ...
 //      Report the nullable captures in the source sides of conversion rules.
 //  ldml_trules --self-test
@@ -22,6 +30,8 @@
 #include <ldml/transform_rules.h>
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
+#include <re/adt/adt.h>
+#include <map>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -88,6 +98,20 @@ static std::vector<std::string> extractTRules(const std::string & xml) {
     return rules;
 }
 
+// The printed rules reparse to themselves (exact), or at least reparse to a
+// canonical form that is stable (as when classes are kept as distinct
+// members of sets, which parsing merges).
+static bool reparses(const std::string & printed, bool exact, std::string & reprinted) {
+    try {
+        reprinted = printRules(parseTransformRules({printed}));
+        if (exact) return reprinted == printed;
+        return printRules(parseTransformRules({reprinted})) == reprinted;
+    } catch (const TransformRuleParseError & e) {
+        reprinted = std::string("reparse failed: ") + e.what() + "\n";
+        return false;
+    }
+}
+
 enum class Extract {All, Forward, Backward};
 
 static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extract e) {
@@ -99,14 +123,16 @@ static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extr
 }
 
 // Parse, print, and check that the printed form reparses to the same form.
-static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e, bool eliminate) {
+static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e,
+                         bool eliminateTrivial, bool eliminateNullable) {
     try {
         std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
-        if (eliminate) rules = NullableCaptureElimination(rules);
+        if (eliminateTrivial) rules = TrivialCaptureElimination(rules);
+        if (eliminateNullable) rules = NullableCaptureElimination(rules);
         const std::string printed = printRules(rules);
         if (!quiet) std::cout << printed;
-        const std::string reprinted = printRules(parseTransformRules({printed}));
-        if (reprinted != printed) {
+        std::string reprinted;
+        if (!reparses(printed, true, reprinted)) {
             std::cerr << label << ": round trip mismatch\n--- printed\n" << printed << "--- reprinted\n" << reprinted;
             return false;
         }
@@ -252,6 +278,67 @@ static void countNullableCaptures(const std::vector<std::string> & tRules, const
     total.backwardAdded += n.backwardAdded;
 }
 
+struct OverlapCounts {
+    size_t rules = 0;
+    size_t pairs = 0;
+    size_t overlaps = 0;
+};
+
+static void reportOverlaps(const std::vector<std::string> & tRules, const std::string & label, bool quiet, OverlapCounts & total) {
+    const std::vector<Rule *> parsed = parseTransformRules(tRules);
+    for (const Extract e : {Extract::Forward, Extract::Backward}) {
+        const std::vector<Rule *> rules = extract(parsed, e);
+        OverlapCounts n;
+        size_t groupRules = 0;
+        for (const Rule * r : rules) {
+            if (llvm::isa<TransformRule>(r)) {
+                n.pairs += groupRules * (groupRules - (groupRules > 0)) / 2;
+                groupRules = 0;
+            } else if (llvm::isa<ConversionRule>(r)) {
+                n.rules++;
+                groupRules++;
+            }
+        }
+        n.pairs += groupRules * (groupRules - (groupRules > 0)) / 2;
+        const std::vector<RuleOverlap> overlaps = findRuleOverlaps(rules);
+        n.overlaps = overlaps.size();
+        if (n.rules == 0) continue;
+        std::cout << label << (e == Extract::Forward ? " forward: " : " backward: ") << n.rules << " rules, "
+                  << n.pairs << " pairs, " << n.overlaps << " overlapping\n";
+        if (!quiet) {
+            for (const RuleOverlap & o : overlaps) {
+                std::cout << "    " << printRule(rules[o.earlier]) << "   |   " << printRule(rules[o.later]) << "\n";
+            }
+        }
+        total.rules += n.rules;
+        total.pairs += n.pairs;
+        total.overlaps += n.overlaps;
+    }
+}
+
+static void countTrivialCaptures(const std::vector<std::string> & tRules, const std::string & label, TrivialCaptureStats & total) {
+    const std::vector<Rule *> rules = parseTransformRules(tRules);
+    for (const Extract e : {Extract::Forward, Extract::Backward}) {
+        TrivialCaptureStats stats;
+        TrivialCaptureElimination(extract(rules, e), &stats);
+        if (stats.candidates == 0) continue;
+        std::cout << label << (e == Extract::Forward ? " forward: " : " backward: ") << stats.candidates << " candidates, "
+                  << stats.transformed.size() << " transformed (" << stats.endPositionConflicts << " with end position conflicts), "
+                  << stats.blockedByLaterRule << " blocked by later rules, " << stats.blockedWithinCapture << " blocked within captures\n";
+        for (const Rule * r : stats.transformed) std::cout << "    transformed: " << printRule(r) << "\n";
+        for (const auto & b : stats.blocked) {
+            std::cout << "    blocked:     " << printRule(b.rule) << "\n";
+            for (const Rule * r : b.laterRules) std::cout << "        later rule may match at start: " << printRule(r) << "\n";
+            for (const Rule * r : b.withinRules) std::cout << "        rule may match within capture: " << printRule(r) << "\n";
+        }
+        total.candidates += stats.candidates;
+        total.blockedByLaterRule += stats.blockedByLaterRule;
+        total.blockedWithinCapture += stats.blockedWithinCapture;
+        total.endPositionConflicts += stats.endPositionConflicts;
+        total.transformed.insert(total.transformed.end(), stats.transformed.begin(), stats.transformed.end());
+    }
+}
+
 struct EliminationTestCase {
     const char * input;
     const char * expected;
@@ -295,6 +382,79 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"(a*) ↔ b ;", "(a*) ↔ b ;\n"},
 };
 
+static const EliminationTestCase trivialTestCases[] = {
+    {"a { (b) } c → $1 x ;", "ab { } c → x ;\n"},
+    {"(b) → $1 x | y ;", "b { → x | y ;\n"},
+    {"(b) → $1 ;", "b { → ;\n"},
+    {"(b+) → $1 x @| ;", "b+ { → x @| ;\n"},
+    // The capture is retained if referenced elsewhere in the result.
+    {"(b) → $1 x $1 ;", "(b) { → x $1 ;\n"},
+    {"(b) → $1 x | &Any-Hex($1) ;", "(b) { → x | &Any-Hex($1) ;\n"},
+    // Other captures are renumbered.
+    {"(a) { (b) } (c) → $2 $3 $1 ;", "(a) b { } (c) → $2 $1 ;\n"},
+    {"{ ((a)(b)) } → $1 $3 $2 ;", "(a) (b) { → $2 $1 ;\n"},
+    {"{ ((a)(b)) } → $1 $1 $3 ;", "((a) (b)) { → $1 $3 ;\n"},
+    {"{ ((a)(b)) } → $1 $3 ;", "(a) (b) { → $2 ;\n"},
+    // Not transformed when a later rule of the group may match at the start
+    // of X, or any other rule within X.  Properties are resolved; rules whose
+    // text to replace may be empty may match anywhere.
+    {"a { (b) } → $1 x ; b → y ;", "a { (b) → $1 x ;\nb → y ;\n"},
+    {"b → y ; (b) → $1 x ;", "b → y ;\nb { → x ;\n"},
+    {"(bc) → $1 x ; c → y ;", "(bc) → $1 x ;\nc → y ;\n"},
+    {"c → y ; (bc) → $1 x ;", "c → y ;\n(bc) → $1 x ;\n"},
+    {"(bc) → $1 x ; d → y ;", "bc { → x ;\nd → y ;\n"},
+    {"(b) → $1 x ; :: Null ; b → y ;", "b { → x ;\n:: Null ;\nb → y ;\n"},
+    {"(b) → $1 x ; [:L:] → y ;", "(b) → $1 x ;\n[:l:] → y ;\n"},
+    {"(b) → $1 x ; [:Nd:] → y ;", "b { → x ;\n[:nd:] → y ;\n"},
+    {"(b) → $1 x ; { } c → y ;", "b { → x ;\n} c → y ;\n"},
+    {"(b) → $1 x ; { } b → y ;", "(b) → $1 x ;\n} b → y ;\n"},
+    // Contexts are considered.
+    {"x { (b) } → $1 z ; y { b → w ;", "xb { → z ;\ny { b → w ;\n"},
+    {"[xy] { (b) } → $1 z ; y { b → w ;", "[xy] { (b) → $1 z ;\ny { b → w ;\n"},
+    {"(b) } [$] → $1 z ; b } \\. → w ;", "b { } [$] → z ;\nb } \\. → w ;\n"},
+    {"(bc) → $1 z ; x { c → w ;", "bc { → z ;\nx { c → w ;\n"},
+    {"(bc) → $1 z ; b { c → w ;", "(bc) → $1 z ;\nb { c → w ;\n"},
+    {"(b) → $1 x ; b ← y ;", "b { → x ;\nb ← y ;\n"},
+    // Unchanged: reference not first, text not only the capture, not a forward rule.
+    {"(b) → x $1 ;", "(b) → x $1 ;\n"},
+    {"(b) c → $1 ;", "(b) c → $1 ;\n"},
+    {"(b) → &Any-Hex($1) ;", "(b) → &Any-Hex($1) ;\n"},
+    {"(b) ↔ $1 x ;", "(b) ↔ $1 x ;\n"},
+    {"$1 x ← (b) ;", "$1 x ← (b) ;\n"},
+};
+
+struct OverlapTestCase {
+    const char * rules;     // two rules
+    bool overlap;
+};
+
+static const OverlapTestCase overlapTestCases[] = {
+    {"a → x ; a → y ;", true},
+    {"a → x ; b → y ;", false},
+    {"ab → x ; a → y ;", true},
+    {"abc → x ; ad → y ;", false},
+    {"a } b → x ; a } c → y ;", false},
+    {"a } [bc] → x ; a } c → y ;", true},
+    {"a } [$] → x ; a } \\. → y ;", false},
+    {"a } $ → x ; ab → y ;", false},
+    {"a } $ → x ; a* → y ;", true},
+    {"x { a → 1 ; y { a → 2 ;", false},
+    {"[xy] { a → 1 ; y { a → 2 ;", true},
+    {"^ { a → 1 ; b { a → 2 ;", false},
+    {"b* { a → 1 ; ^ { a → 2 ;", true},
+    {"[^b] { a → 1 ; b { a → 2 ;", false},
+    {"[^b] { a → 1 ; ^ { a → 2 ;", true},
+    {"^ a → 1 ; b { a → 2 ;", false},
+    {"^ a → 1 ; [^b] { a → 2 ;", true},
+    {"a } [^b] → 1 ; a } $ → 2 ;", true},
+    {"a } [^b] → 1 ; ab → 2 ;", false},
+    {"(a*) b → 1 ; b → 2 ;", true},
+    {"[:Lu:] → 1 ; [:Ll:] → 2 ;", false},
+    {"[:Greek:] → 1 ; α → 2 ;", true},
+    {"{ } c → 1 ; b → 2 ;", false},
+    {"{ } c → 1 ; c → 2 ;", true},
+};
+
 struct DirectionTestCase {
     const char * input;
     const char * forward;
@@ -336,17 +496,11 @@ static const DirectionTestCase directionTestCases[] = {
      ":: [:l:] ;\n$v = [ab] ;\n$w = y ;\nz → $w ;\n:: Null ;\nx → $v ;\n"},
 };
 
-static bool checkOutput(const char * label, const char * input, const std::string & actual, const char * expected) {
+static bool checkOutput(const char * label, const char * input, const std::string & actual, const char * expected, bool exact = true) {
     bool ok = actual == expected;
     std::string reprinted;
     if (ok) {
-        // The extracted rules must reparse to themselves.
-        try {
-            reprinted = printRules(parseTransformRules({actual}));
-        } catch (const TransformRuleParseError & e) {
-            reprinted = std::string("reparse failed: ") + e.what() + "\n";
-        }
-        ok = reprinted == actual;
+        ok = reparses(actual, exact, reprinted);
     }
     if (!ok) {
         std::cerr << "FAIL (" << label << "): " << input << "\n  expected: " << expected
@@ -401,6 +555,52 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const OverlapTestCase & t : overlapTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.rules});
+            RuleOverlapAnalysis analysis;
+            const bool overlap = analysis.mayOverlap(llvm::cast<ConversionRule>(rules[0]), llvm::cast<ConversionRule>(rules[1]));
+            const bool reverse = analysis.mayOverlap(llvm::cast<ConversionRule>(rules[1]), llvm::cast<ConversionRule>(rules[0]));
+            if (overlap != t.overlap || reverse != t.overlap) {
+                failures++;
+                std::cerr << "FAIL (overlap): " << t.rules << "\n  expected: " << t.overlap << " actual: " << overlap << " " << reverse << "\n";
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
+        }
+    }
+    for (const EliminationTestCase & t : trivialTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = TrivialCaptureElimination(parseTransformRules({t.input}));
+            failures += !checkOutput("trivial", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
+    // Trivial capture elimination followed by nullable capture elimination.
+    {
+        count++;
+        const char * input = "w { ($v?) } y → z $1 ; x { ($v?) } y → $1 z ;";
+        const char * expected = "w { $v } y → z $v ;\nw { } y → z ;\nx $v? { } y → z ;\n";
+        try {
+            TransformRuleParser parser;
+            parser.parse("$v = v ;");
+            std::vector<Rule *> rules = parser.parse(input);
+            rules = NullableCaptureElimination(TrivialCaptureElimination(rules));
+            const std::string actual = printRules(rules);
+            if (actual != expected) {
+                failures++;
+                std::cerr << "FAIL (trivial+nullable): " << input << "\n  expected: " << expected << "  actual:   " << actual;
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << input << "\n  " << e.what() << "\n";
+        }
+    }
     for (const EliminationTestCase & t : eliminationTestCases) {
         count++;
         try {
@@ -420,6 +620,9 @@ int main(int argc, char * argv[]) {
     bool quiet = false;
     Extract e = Extract::All;
     bool eliminate = false;
+    bool eliminateTrivial = false;
+    bool countTrivial = false;
+    bool overlaps = false;
     bool count = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
@@ -430,30 +633,52 @@ int main(int argc, char * argv[]) {
         else if (arg == "--forward") e = Extract::Forward;
         else if (arg == "--backward") e = Extract::Backward;
         else if (arg == "--eliminate-nullable-captures") eliminate = true;
+        else if (arg == "--eliminate-trivial-captures") eliminateTrivial = true;
+        else if (arg == "--count-trivial-captures") countTrivial = true;
+        else if (arg == "--overlaps") overlaps = true;
         else if (arg == "--count-nullable-captures") count = true;
         else files.push_back(arg);
     }
     if (files.empty()) {
-        std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward] [--eliminate-nullable-captures] file ...\n"
+        std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward]\n"
+                  << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] file ...\n"
+                  << "       " << argv[0] << " [--xml] [--quiet] --overlaps file ...\n"
+                  << "       " << argv[0] << " [--xml] --count-trivial-captures file ...\n"
                   << "       " << argv[0] << " [--xml] --count-nullable-captures file ...\n"
                   << "       " << argv[0] << " --self-test\n";
         return 2;
     }
     bool ok = true;
     NullableCounts total;
+    TrivialCaptureStats trivialTotal;
+    OverlapCounts overlapTotal;
     for (const std::string & f : files) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            if (count) {
+            if (overlaps) {
+                reportOverlaps(tRules, f, quiet, overlapTotal);
+            } else if (countTrivial) {
+                countTrivialCaptures(tRules, f, trivialTotal);
+            } else if (count) {
                 countNullableCaptures(tRules, f, total);
             } else {
-                ok &= processRules(tRules, f, quiet, e, eliminate);
+                ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate);
             }
         } catch (const std::exception & e) {
             std::cerr << f << ": " << e.what() << "\n";
             ok = false;
         }
+    }
+    if (overlaps) {
+        std::cout << "Total: " << overlapTotal.rules << " rules, " << overlapTotal.pairs << " pairs, "
+                  << overlapTotal.overlaps << " overlapping\n";
+    }
+    if (countTrivial) {
+        std::cout << "Total: " << trivialTotal.candidates << " candidates, " << trivialTotal.transformed.size()
+                  << " transformed (" << trivialTotal.endPositionConflicts << " with end position conflicts), "
+                  << trivialTotal.blockedByLaterRule << " blocked by later rules, "
+                  << trivialTotal.blockedWithinCapture << " blocked within captures\n";
     }
     if (count) {
         std::cout << "Total: " << total.captures << " nullable captures in " << total.rules << " rules of "

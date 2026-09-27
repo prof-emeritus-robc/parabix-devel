@@ -40,6 +40,7 @@
 
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <llvm/Support/Casting.h>
@@ -348,6 +349,78 @@ std::vector<Rule *> ExtractForwardRules(const std::vector<Rule *> & rules);
 //  Variable definitions are placed after the filter rule, before all
 //  other rules.
 std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rules);
+
+//  Overlap analysis of conversion rules.
+//
+//  Two rules overlap if both may match at the same position of some text:
+//  the text before the position may end with a match of each before context,
+//  and the text after the position may begin with a match of each text to
+//  replace followed by its after context.   At a position where rules
+//  overlap, the earlier rule of a group takes precedence.   Rules match
+//  against the source side (the left side of forward rules).
+//
+//  Patterns are analyzed as regular expressions with Unicode properties
+//  resolved.  The analysis is conservative: as possessive quantification is
+//  not modelled, rules may be reported as overlapping when they do not, but
+//  rules reported as not overlapping never match at the same position.
+class RuleOverlapAnalysis {
+public:
+    RuleOverlapAnalysis();
+    ~RuleOverlapAnalysis();
+    // May the rules both match at the same position of some text?
+    bool mayOverlap(const ConversionRule * r1, const ConversionRule * r2);
+    // May rule s match at a position strictly within the text matched by
+    // the text to replace of rule r, when r matches?
+    bool mayMatchWithin(const ConversionRule * s, const ConversionRule * r);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> mImpl;
+};
+
+//  The pairs of forward conversion rules of the same group (the rules
+//  between transform rules) that may overlap, by index in the rule list.
+struct RuleOverlap {
+    size_t earlier;
+    size_t later;
+};
+std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
+
+//  Trivial capture elimination.
+//
+//  A forward conversion rule whose text to replace is a capture and whose
+//  completed result begins with a reference to that capture is transformed
+//  by moving the text to replace into the before context and dropping the
+//  reference from the completed result:
+//      before { (X) } after → $1 rest | revisit ;
+//  becomes
+//      before X { } after → rest | revisit ;
+//  The capture is retained in the before context if other references to it
+//  remain in the result; otherwise it is dropped and the remaining captures
+//  are renumbered.
+//
+//  The transformed rule matches at the end of X rather than its start, so
+//  other rules may then apply at the positions of X.   A rule is therefore
+//  transformed only if, within its group of conversion rules (the rules
+//  between transform rules), no later rule may overlap it (match at the
+//  start of X) and no other rule may match within X, as determined by
+//  RuleOverlapAnalysis.
+//
+//  Rules other than forward conversion rules are unchanged.  This is
+//  intended to be applied before NullableCaptureElimination.
+struct TrivialCaptureStats {
+    unsigned candidates = 0;             // rules of the trivial capture form
+    unsigned blockedByLaterRule = 0;     // not transformed: a later rule may overlap the rule
+    unsigned blockedWithinCapture = 0;   // not transformed (otherwise): a rule may match within X
+    unsigned endPositionConflicts = 0;   // transformed, but an earlier rule may match at the end of X
+    std::vector<const Rule *> transformed;
+    struct Blocked {
+        const Rule * rule;
+        std::vector<const Rule *> laterRules;      // later rules that may match at the start of X
+        std::vector<const Rule *> withinRules;     // rules that may match within X
+    };
+    std::vector<Blocked> blocked;
+};
+std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats = nullptr);
 
 //  Nullable capture elimination.
 //

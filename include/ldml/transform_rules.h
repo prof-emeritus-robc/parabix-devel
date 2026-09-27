@@ -489,9 +489,9 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //
 //  The case handled is that of L having a key of single character items
 //  l1 ... lm (characters or sets) and no contexts, and each earlier
-//  overlapping rule E being a sequence of single character items
-//  (characters or sets, optionally with ?; segments are disregarded) on one
-//  side of its position:
+//  overlapping rule E being a sequence of items on one side of its position,
+//  each a set (possibly with strings and the text boundary [$]), the anchor
+//  ^ or $, or a repeated set (x?, x*, x+); segments are disregarded:
 //      E:  k c1 c2 ... cn   or   k } c1 ... cn → ...    (after the position)
 //      E:  c1 ... cn { k → ...                          (before the position)
 //  The earlier rules are explored together: L is replaced by rules for the
@@ -501,15 +501,19 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  the text) or a set within the key, e.g., for E1 = k } s? t and E2 = k } u
 //  and L = [k x]:
 //      x → result ;   k } [^s t u] → result ;   k } s [^t] → result ;
-//  and, for E1 = ab and L = a, a } [^b] → result.  Earlier rules with items
-//  before the position contribute before contexts.  An L masked by its
-//  earlier rules is removed.
+//  and, for E1 = ab and L = a, a } [^b] → result, and for E = a } b* c and
+//  L = a, a } b* [^bc] → result.  The text boundary is a class of its own
+//  beyond the key (e.g. E = a } [b$] gives a } [^b$] → result).  Earlier
+//  rules with items before the position contribute before contexts.  An L
+//  masked by its earlier rules is removed.
 //
-//  Not handled (the pairs remain in order): L with contexts or with
-//  segments, optional or other items that are not single characters, E
-//  with items on both sides, E with items that are not single characters,
-//  and optional items whose sets intersect the sets that may match the same
-//  character when the item is skipped (where possessive matching differs).
+//  Not handled (the pairs remain in order): L with contexts or with items
+//  that are not single characters, E with items on both sides or with items
+//  that are not sets or repeated sets, repetitions through several classes
+//  (e.g. [{bc}]*), and cases where ICU's possessive matching differs from
+//  the regular expression interpretation: repeated or optional items whose
+//  sets intersect the sets of the following items, and sets with strings
+//  that are prefixes of one another or start with characters of the set.
 struct DisambiguationStats {
     size_t overlapsBefore = 0;       // overlapping pairs of rules
     size_t pairsResolved = 0;        // pairs (E, L) resolved

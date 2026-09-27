@@ -714,6 +714,22 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"a } [bc]? c → x ; a → y ;", "a } [bc]? c → x ;\na → y ;\n"},
     // Groups are independent.
     {"ab → x ; :: Null ; a → y ;", "ab → x ;\n:: Null ;\na → y ;\n"},
+    // The text boundary: [$] and $ in contexts.
+    {"a } [b$] → x ; a → y ;", "a } [b$] → x ;\na } [^b$] → y ;\n"},
+    {"a } $ → x ; a → y ;", "a } $ → x ;\na } [:any:] → y ;\n"},
+    {"[b$] { a → x ; a → y ;", "[b$] { a → x ;\n[^b$] { a → y ;\n"},
+    {"a } b [$] → x ; a → y ;", "a } b [$] → x ;\na } [^b] → y ;\na } b [:any:] → y ;\n"},
+    // Strings in sets.
+    {"a } [{bc}d] → x ; a → y ;", "a } [{bc}d] → x ;\na } [^bd] → y ;\na } b [^c] → y ;\n"},
+    // Repetitions.
+    {"a } b* c → x ; a → y ;", "a } b* c → x ;\na } b* [^bc] → y ;\n"},
+    {"a } b+ c → x ; a → y ;", "a } b+ c → x ;\na } [^b] → y ;\na } b b* [^bc] → y ;\n"},
+    {"ab*c → x ; a → y ;", "a b* c → x ;\na } b* [^bc] → y ;\n"},
+    {"c* d { a → x ; a → y ;", "c* d { a → x ;\n[^d] { a → y ;\n"},
+    // Not handled: repetitions through several classes, possessive differences.
+    {"a } [{bc}{de}]* f → x ; a → y ;", "a } [{bc}{de}]* f → x ;\na → y ;\n"},
+    {"a } b* b → x ; a → y ;", "a } b* b → x ;\na → y ;\n"},
+    {"a } [{b}{bc}] → x ; a → y ;", "a } [{bc}b] → x ;\na → y ;\n"},
 };
 
 struct DirectionTestCase {

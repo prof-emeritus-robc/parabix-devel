@@ -19,6 +19,10 @@
 //      Report the pairs of rules of the same group that may match at the
 //      same position, in the forward and backward rules (listing the pairs
 //      unless --quiet).
+//  ldml_trules [--xml] [--quiet] --partition file ...
+//      Partition the characters of the rules into mutually exclusive
+//      classes: print the classes and the variables partitioned into
+//      them (unless --quiet), and verify the partition.
 //  ldml_trules [--xml] --count-trivial-captures file ...
 //      Report the rules transformed and not transformed by trivial capture
 //      elimination in the forward and backward rules.
@@ -31,6 +35,7 @@
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
+#include <cstring>
 #include <map>
 #include <fstream>
 #include <iostream>
@@ -278,6 +283,140 @@ static void countNullableCaptures(const std::vector<std::string> & tRules, const
     total.backwardAdded += n.backwardAdded;
 }
 
+// A character class as an element of a set: the character or the variable.
+static std::string classElement(const CharacterClass & c) {
+    if (c.literal) return printPattern(c.chars);
+    if (c.inlineSet) return c.text;
+    return "$" + c.name;
+}
+
+// The partition as variable definitions: the classes, then the variables
+// that are divided into several classes, with the literal characters and the
+// inline sets in comments.
+static std::string printPartition(const CharacterClassPartition & p) {
+    std::string defs;
+    std::string literals;
+    for (const CharacterClass & c : p.classes) {
+        if (c.literal) {
+            literals += " " + printPattern(c.chars);
+        } else if (!c.inlineSet) {
+            const re::CC * cc = c.chars;
+            const bool single = cc->size() == 1 && re::lo_codepoint(cc->front()) == re::hi_codepoint(cc->front());
+            defs += "$" + c.name + " = " + (single ? printPattern(cc) : printUnicodeSet(cc)) + " ;\n";
+        }
+    }
+    for (const auto & v : p.variables) {
+        if (v.classes.size() == 1 && p.classes[v.classes[0]].name == v.name) continue;
+        defs += "$" + v.name + " = [";
+        for (size_t i = 0; i < v.classes.size(); i++) {
+            defs += (i ? " " : "") + classElement(p.classes[v.classes[i]]);
+        }
+        defs += "] ;\n";
+    }
+    for (const auto & s : p.inlineSets) {
+        if (s.classes.size() == 1 && p.classes[s.classes[0]].inlineSet) continue;   // remains as written
+        defs += "# " + s.text + " = [";
+        for (size_t i = 0; i < s.classes.size(); i++) {
+            defs += (i ? " " : "") + classElement(p.classes[s.classes[i]]);
+        }
+        defs += "]\n";
+    }
+    return (literals.empty() ? "" : "# literal characters:" + literals + "\n") + defs;
+}
+
+// Verify that the classes are disjoint, each variable is the union of its
+// classes and the literal classes are single characters.  Returns an error
+// message or the empty string.
+static std::string verifyPartition(const CharacterClassPartition & p) {
+    UCD::UnicodeSet all;
+    for (const CharacterClass & c : p.classes) {
+        if (c.chars->intersects(all)) return "classes intersect: " + classElement(c);
+        all = all + *c.chars;
+        if (c.literal && !(c.chars->size() == 1 && re::lo_codepoint(c.chars->front()) == re::hi_codepoint(c.chars->front()))) {
+            return "literal class of more than one character";
+        }
+        if (!c.literal && !c.inlineSet && c.name.empty()) return "unnamed class";
+    }
+    for (const auto & v : p.variables) {
+        UCD::UnicodeSet u;
+        for (size_t i : v.classes) u = u + *p.classes[i].chars;
+        if (!(u == *v.chars)) {
+            return "variable $" + v.name + " is not the union of its classes: missing "
+                + printUnicodeSet(re::makeCC(*v.chars - u)) + ", extra " + printUnicodeSet(re::makeCC(u - *v.chars));
+        }
+    }
+    for (const auto & s : p.inlineSets) {
+        UCD::UnicodeSet u;
+        for (size_t i : s.classes) u = u + *p.classes[i].chars;
+        if (!(u == *s.chars)) return "inline set " + s.text + " is not the union of its classes";
+    }
+    return "";
+}
+
+struct PartitionCounts {
+    size_t groups = 0;
+    size_t variables = 0;      // set variables (in each group)
+    size_t divided = 0;        // set variables divided into several classes
+    size_t inlineSets = 0;     // distinct inline sets
+    size_t inlineDivided = 0;  // inline sets divided into several classes
+    size_t classes = 0;
+    size_t literals = 0;
+    size_t generated = 0;      // classes with new variable names
+    size_t inlineClasses = 0;  // classes denoted by inline sets as written
+};
+
+// The partitions of all groups, each preceded by a comment giving its rules
+// (numbered from 1).
+static std::string printPartitions(const std::vector<CharacterClassPartition> & partitions) {
+    std::string s;
+    for (size_t g = 0; g < partitions.size(); g++) {
+        s += "# group " + std::to_string(g + 1) + ": rules " + std::to_string(partitions[g].firstRule + 1)
+            + "-" + std::to_string(partitions[g].lastRule + 1) + "\n" + printPartition(partitions[g]);
+    }
+    return s;
+}
+
+static std::string verifyPartitions(const std::vector<CharacterClassPartition> & partitions) {
+    for (size_t g = 0; g < partitions.size(); g++) {
+        const std::string error = verifyPartition(partitions[g]);
+        if (!error.empty()) return "group " + std::to_string(g + 1) + ": " + error;
+    }
+    return "";
+}
+
+static bool reportPartition(const std::vector<std::string> & tRules, const std::string & label, bool quiet, PartitionCounts & total) {
+    const std::vector<CharacterClassPartition> partitions = partitionCharacterClasses(parseTransformRules(tRules));
+    PartitionCounts n;
+    for (const CharacterClassPartition & p : partitions) {
+        n.variables += p.variables.size();
+        n.classes += p.classes.size();
+        for (const CharacterClass & c : p.classes) {
+            n.literals += c.literal;
+            n.inlineClasses += c.inlineSet;
+            n.generated += !c.literal && !c.existing && !c.inlineSet;
+        }
+        for (const auto & v : p.variables) n.divided += v.classes.size() > 1;
+        n.inlineSets += p.inlineSets.size();
+        for (const auto & s : p.inlineSets) n.inlineDivided += s.classes.size() > 1;
+    }
+    const std::string error = verifyPartitions(partitions);
+    std::cout << label << ": " << partitions.size() << " groups, " << n.variables << " set variables (" << n.divided << " divided), "
+              << n.inlineSets << " inline sets (" << n.inlineDivided << " divided), " << n.classes << " classes: "
+              << n.literals << " literal characters, " << (n.classes - n.literals - n.generated - n.inlineClasses) << " existing variables, "
+              << n.inlineClasses << " inline sets, " << n.generated << " new variables" << (error.empty() ? "" : "; ERROR: " + error) << "\n";
+    total.groups += partitions.size();
+    if (!quiet) std::cout << printPartitions(partitions);
+    total.variables += n.variables;
+    total.divided += n.divided;
+    total.inlineSets += n.inlineSets;
+    total.inlineDivided += n.inlineDivided;
+    total.classes += n.classes;
+    total.literals += n.literals;
+    total.inlineClasses += n.inlineClasses;
+    total.generated += n.generated;
+    return error.empty();
+}
+
 struct OverlapCounts {
     size_t rules = 0;
     size_t pairs = 0;
@@ -455,6 +594,39 @@ static const OverlapTestCase overlapTestCases[] = {
     {"{ } c → 1 ; c → 2 ;", true},
 };
 
+static const EliminationTestCase partitionTestCases[] = {
+    // Only the variables used by the rules are partitioned ($front is not used).
+    {"$vowel = [aeiou] ; $front = [ei] ; $m = m ; $vowel $m → x ; a → b ;",
+     "# group 1: rules 1-5\n# literal characters: a b x\n$vowel_1 = [eiou] ;\n$m = m ;\n$vowel = [a $vowel_1] ;\n"},
+    // Overlapping sets are divided into their common and distinct parts.
+    {"$A = [a-d] ; $B = [c-f] ; $A $B → x ;",
+     "# group 1: rules 1-3\n# literal characters: x\n$A_1 = [ab] ;\n$A_2 = [cd] ;\n$B_1 = [ef] ;\n$A = [$A_1 $A_2] ;\n$B = [$A_2 $B_1] ;\n"},
+    // Variables used only within the definitions of set variables are not partitioned.
+    {"$LO = [ace] ; $HI = [bdf] ; $W = f ; $C = [$LO $HI] ; $F = $C ; $C $W → y ;",
+     "# group 1: rules 1-6\n# literal characters: y\n$C_1 = [a-e] ;\n$W = f ;\n$C = [$C_1 $W] ;\n"},
+    // Characters of strings in sets are literal; properties are resolved.
+    {"$v = [{ch}a-c] ; $v → x ;", "# group 1: rules 1-2\n# literal characters: c h x\n$v_1 = [ab] ;\n$v = [$v_1 c] ;\n"},
+    {"$d = [:Nd:] ; $d → 1 ;", "# group 1: rules 1-2\n# literal characters: 1\n$d_1 = [02-9٠-٩۰-۹߀-߉"},
+    // Inline sets, including sets within variable definitions that are not
+    // sets; inline sets that are not divided remain as written.
+    {"$v = [a-e] ; $v [cx] → 1 ; $sp = [fg]* ; $sp → 2 ;",
+     "# group 1: rules 1-4\n# literal characters: 1 2\n$v_1 = [abde] ;\n$v_2 = c ;\n$set_1 = x ;\n$v = [$v_1 $v_2] ;\n"
+     "# [cx] = [$v_2 $set_1]\n"},
+    {"$v = [a-e] ; $v → 1 ; [cd] → 2 ;", "# group 1: rules 1-3\n# literal characters: 1 2\n$v_1 = [abe] ;\n$v = [$v_1 [cd]] ;\n"},
+    // Variables whose sets include strings, or variables defined as strings.
+    {"$d = [{ab}{cd}] ; $v = [x y $d] ; $v → 1 ;", "# group 1: rules 1-3\n# literal characters: 1 a b c d\n$v = [xy] ;\n"},
+    {"$a = [ab] ; $s = [{xy}{zw}] ; $m = [$a $s c] ; $m → 1 ;",
+     "# group 1: rules 1-4\n# literal characters: 1 w x y z\n$m = [a-c] ;\n"},
+    // Groups are partitioned separately; filter and transform rules are excluded.
+    {"[ab] → 1 ; :: [a-c] Upper ; [ab] → 2 ;",
+     "# group 1: rules 1-1\n# literal characters: 1\n# group 2: rules 3-3\n# literal characters: 2\n"},
+    // Variables defined in an earlier group and used in a later one, including
+    // through a variable that is not a set.
+    {"$v = [a-d] ; $w = [cd] ; $s = $v+ x ; :: NFD ; $s → 1 ; :: Null ; [b-e] → 2 ;",
+     "# group 1: rules 1-3\n# group 2: rules 5-5\n# literal characters: 1 x\n$v = [a-d] ;\n"
+     "# group 3: rules 7-7\n# literal characters: 2\n"},
+};
+
 struct DirectionTestCase {
     const char * input;
     const char * forward;
@@ -555,6 +727,23 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const EliminationTestCase & t : partitionTestCases) {
+        count++;
+        try {
+            const std::vector<CharacterClassPartition> p = partitionCharacterClasses(parseTransformRules({t.input}));
+            const std::string actual = printPartitions(p);
+            const std::string error = verifyPartitions(p);
+            // A prefix of the output is expected when the classes are large.
+            if (!error.empty() || actual.compare(0, std::strlen(t.expected), t.expected) != 0) {
+                failures++;
+                std::cerr << "FAIL (partition): " << t.input << "\n  expected: " << t.expected << "\n  actual:   " << actual
+                          << (error.empty() ? "" : "  error: " + error + "\n");
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     for (const OverlapTestCase & t : overlapTestCases) {
         count++;
         try {
@@ -623,6 +812,7 @@ int main(int argc, char * argv[]) {
     bool eliminateTrivial = false;
     bool countTrivial = false;
     bool overlaps = false;
+    bool partition = false;
     bool count = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
@@ -636,6 +826,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--eliminate-trivial-captures") eliminateTrivial = true;
         else if (arg == "--count-trivial-captures") countTrivial = true;
         else if (arg == "--overlaps") overlaps = true;
+        else if (arg == "--partition") partition = true;
         else if (arg == "--count-nullable-captures") count = true;
         else files.push_back(arg);
     }
@@ -643,6 +834,7 @@ int main(int argc, char * argv[]) {
         std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward]\n"
                   << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --overlaps file ...\n"
+                  << "       " << argv[0] << " [--xml] [--quiet] --partition file ...\n"
                   << "       " << argv[0] << " [--xml] --count-trivial-captures file ...\n"
                   << "       " << argv[0] << " [--xml] --count-nullable-captures file ...\n"
                   << "       " << argv[0] << " --self-test\n";
@@ -652,11 +844,14 @@ int main(int argc, char * argv[]) {
     NullableCounts total;
     TrivialCaptureStats trivialTotal;
     OverlapCounts overlapTotal;
+    PartitionCounts partitionTotal;
     for (const std::string & f : files) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            if (overlaps) {
+            if (partition) {
+                ok &= reportPartition(tRules, f, quiet, partitionTotal);
+            } else if (overlaps) {
                 reportOverlaps(tRules, f, quiet, overlapTotal);
             } else if (countTrivial) {
                 countTrivialCaptures(tRules, f, trivialTotal);
@@ -669,6 +864,13 @@ int main(int argc, char * argv[]) {
             std::cerr << f << ": " << e.what() << "\n";
             ok = false;
         }
+    }
+    if (partition) {
+        std::cout << "Total: " << partitionTotal.groups << " groups, " << partitionTotal.variables << " set variables (" << partitionTotal.divided << " divided), "
+                  << partitionTotal.inlineSets << " inline sets (" << partitionTotal.inlineDivided << " divided), "
+                  << partitionTotal.classes << " classes: " << partitionTotal.literals << " literal characters, "
+                  << (partitionTotal.classes - partitionTotal.literals - partitionTotal.generated - partitionTotal.inlineClasses) << " existing variables, "
+                  << partitionTotal.inlineClasses << " inline sets, " << partitionTotal.generated << " new variables\n";
     }
     if (overlaps) {
         std::cout << "Total: " << overlapTotal.rules << " rules, " << overlapTotal.pairs << " pairs, "

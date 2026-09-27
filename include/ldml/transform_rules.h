@@ -47,7 +47,7 @@
 #include <allocator/threadsafe_slaballocator.h>
 #include <re/adt/re_re.h>
 
-namespace re { class Name; class Capture; }
+namespace re { class Name; class Capture; class CC; }
 
 namespace ldml {
 
@@ -349,6 +349,71 @@ std::vector<Rule *> ExtractForwardRules(const std::vector<Rule *> & rules);
 //  Variable definitions are placed after the filter rule, before all
 //  other rules.
 std::vector<Rule *> ExtractReverseBackwardRules(const std::vector<Rule *> & rules);
+
+//  Character class partition.
+//
+//  For each group of rules (each maximal sequence of conversion rules and
+//  variable definitions, i.e., the rules between filter and transform
+//  rules), a partition of the characters of the group into mutually
+//  exclusive classes.   The variables of a group are those used by its
+//  conversion rules, including the variables used in the definitions of
+//  variables that are not sets (wherever defined).  The classes are such
+//  that:
+//    - every character occurring directly in a rule (in the text of
+//      conversion rules or variable definitions, including strings in sets)
+//      is a class by itself, denoted by the character or by an existing
+//      variable defined as that single character;
+//    - every variable used in the group defining a UnicodeSet is the union
+//      of classes;
+//    - every set written inline is the union of classes: the maximal set
+//      expressions in conversion rules and in the definitions of variables
+//      that are not sets (e.g., [:Separator:] in $space = [:Separator:]* ;).
+//  Filter rules and transform rules (and their filters) are not included.
+//  Strings within sets (e.g. {ch}) are not part of the character sets; their
+//  characters occur directly.   The partition is the coarsest such
+//  partition: two characters are in the same class exactly when they are
+//  contained in the same sets and neither occurs directly.   Thus each set
+//  is divided into the minimal number of subsets consistent with no subsets
+//  intersecting.
+//
+//  Each class that is not a directly occurring character is denoted by an
+//  existing variable defined as that single character or defining exactly
+//  that set (the first in definition order), or else by an inline set that
+//  is exactly that class (which thus remains as written), or else by a new
+//  variable named V_n after the first variable V containing it (or set_n if
+//  no variable contains it), distinct from all other variable names,
+//  including the new names of other groups.
+struct CharacterClass {
+    std::string name;       // the variable denoting the class (without '$'), or empty
+    bool literal;           // denoted by the character itself (name is empty)
+    bool existing;          // denoted by an existing variable
+    bool inlineSet;         // denoted by an inline set as written (name is empty)
+    std::string text;       // the inline set, if inlineSet
+    re::RE * inlineRE;      // the inline set, if inlineSet
+    re::CC * chars;
+};
+
+struct CharacterClassPartition {
+    size_t firstRule;                       // the rules of the group, by index
+    size_t lastRule;
+    std::vector<CharacterClass> classes;    // in order of their first codepoints
+    struct VariableSet {
+        std::string name;
+        re::CC * chars;                     // the codepoints of the variable
+        std::vector<size_t> classes;        // the classes whose union it is
+    };
+    std::vector<VariableSet> variables;     // in definition order
+    struct InlineSet {
+        std::string text;                   // the first occurrence, in rule syntax
+        re::RE * re;                        // the first occurrence
+        re::CC * chars;
+        std::vector<size_t> classes;        // the classes whose union it is
+        unsigned occurrences;               // the number of occurrences of the set
+    };
+    std::vector<InlineSet> inlineSets;      // distinct sets, in order of first occurrence
+};
+
+std::vector<CharacterClassPartition> partitionCharacterClasses(const std::vector<Rule *> & rules);
 
 //  Overlap analysis of conversion rules.
 //

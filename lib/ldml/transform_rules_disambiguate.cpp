@@ -211,7 +211,16 @@ std::string Disambiguator::itemReason(RE * e) {
     return "other";
 }
 
-// The key of L: single character items (no segments, repetitions, strings).
+// A variable that is not a set, whose definition is expanded into its items.
+static bool isSequenceVariable(const RE * re) {
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition());
+    }
+    return false;
+}
+
+// The key of L: single character items (no segments, repetitions, strings),
+// with variables that are not sets expanded.
 bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, std::string & reason) {
     std::vector<RE *> elements;
     if (Seq * seq = dyn_cast<Seq>(re)) {
@@ -220,13 +229,17 @@ bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, std::string & rea
         elements.push_back(re);
     }
     for (RE * e : elements) {
+        if (isSequenceVariable(e)) {
+            if (!parseKey(cast<Name>(e)->getDefinition(), key, reason)) return false;
+            continue;
+        }
         if (!isCharItem(e)) {
             reason = itemReason(e);
             return false;
         }
         key.push_back(e);
     }
-    return !key.empty();
+    return true;
 }
 
 // Collect the strings of a set (possibly through variables).
@@ -312,9 +325,23 @@ bool Disambiguator::parseElements(RE * re, std::vector<Element> & elements, bool
             if (!parseElements(c->getCapturedRE(), elements, reversed, reason)) return false;
             continue;
         }
+        if (isSequenceVariable(item)) {
+            // Variables that are not sets are expanded into their items.
+            if (!parseElements(cast<Name>(item)->getDefinition(), elements, reversed, reason)) return false;
+            continue;
+        }
         Element e;
         if (Rep * rep = dyn_cast<Rep>(item)) {
-            if (!setElement(rep->getRE(), reversed, e) || e.boundary) {
+            bool ok = setElement(rep->getRE(), reversed, e);
+            if (!ok && isSequenceVariable(rep->getRE())) {
+                // A repeated variable must expand to a single set.
+                std::vector<Element> expanded;
+                std::string why;
+                ok = parseElements(cast<Name>(rep->getRE())->getDefinition(), expanded, reversed, why)
+                    && expanded.size() == 1 && expanded[0].lb == 1 && expanded[0].ub == 1;
+                if (ok) e = expanded[0];
+            }
+            if (!ok || e.boundary) {
                 reason = itemReason(item);
                 return false;
             }
@@ -606,7 +633,11 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     mKey.clear();
     std::string why;
     if (!parseKey(src->getText(), mKey, why)) {
-        unresolved("L: text to replace has a " + (why.empty() ? std::string("nothing") : why), earlier.size());
+        unresolved("L: text to replace has a " + why, earlier.size());
+        return false;
+    }
+    if (mKey.empty()) {
+        unresolved("L: text to replace is empty", earlier.size());
         return false;
     }
     std::vector<Earlier> rules;

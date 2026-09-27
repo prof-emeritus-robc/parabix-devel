@@ -726,6 +726,12 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"a } b+ c → x ; a → y ;", "a } b+ c → x ;\na } [^b] → y ;\na } b b* [^bc] → y ;\n"},
     {"ab*c → x ; a → y ;", "a b* c → x ;\na } b* [^bc] → y ;\n"},
     {"c* d { a → x ; a → y ;", "c* d { a → x ;\n[^d] { a → y ;\n"},
+    // Variables that are not sets are expanded, in the key of L as well.
+    {"$h = h ; $u = u ; $e = ; $h $u → x ; $h $e → y ;",
+     "$h = h ;\n$u = u ;\n$e = ;\n$h $u → x ;\n$h } [^$u] → y ;\n"},
+    {"$s = hu ; $s → x ; h → y ;", "$s = hu ;\n$s → x ;\nh } [^u] → y ;\n"},
+    {"$c = cd ; $c { a → x ; a → y ;", "$c = cd ;\n$c { a → x ;\n[^d] { a → y ;\n[^c] d { a → y ;\n"},
+    {"$e = ; $e → x ; a → y ;", "$e = ;\n$e → x ;\na → y ;\n"},
     // Not handled: repetitions through several classes, possessive differences.
     {"a } [{bc}{de}]* f → x ; a → y ;", "a } [{bc}{de}]* f → x ;\na → y ;\n"},
     {"a } b* b → x ; a → y ;", "a } b* b → x ;\na → y ;\n"},

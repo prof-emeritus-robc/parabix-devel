@@ -715,6 +715,11 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"b { a → x ; d { a } e → y ;", "b { a → x ;\nd { a } e → y ;\n"},
     {"a } b → x ; a } b c → y ;", "a } b → x ;\n"},
     {"a } b c → x ; a } b → y ;", "a } bc → x ;\na } b [^c] → y ;\n"},
+    // Segments in the key of L are retained, with references to them.
+    {"ab → x ; (a) → $1 y ;", "ab → x ;\n(a) } [^b] → $1 y ;\n"},
+    {"ab → x ; ([ac]) → z $1 ;", "ab → x ;\n(c) → z $1 ;\n(a) } [^b] → z $1 ;\n"},
+    {"$v = xy ; xyz → z ; ($v) → w $1 ;", "$v = xy ;\nxyz → z ;\n(xy) } [^z] → w $1 ;\n"},
+    {"abc → x ; (a) (b) → &Any-Hex($2) $1 ;", "abc → x ;\n(a) (b) } [^c] → &Any-Hex($2) $1 ;\n"},
     // A later rule masked by its earlier rules is removed.
     {"a → x ; a } b → z ; a → y ;", "a → x ;\n"},
     {"a } [bc]? c → x ; a → y ;", "a } [bc]? c → x ;\na → y ;\n"},

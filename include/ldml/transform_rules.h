@@ -489,7 +489,8 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //
 //  The case handled is that of L having a key and contexts of single
 //  character items (characters or sets, with variables that are not sets
-//  expanded), and each earlier
+//  expanded; the key may have segments, which the replacement rules
+//  retain), and each earlier
 //  overlapping rule E being a sequence of items on one side of its position,
 //  each a set (possibly with strings and the text boundary [$]), the anchor
 //  ^ or $, or a repeated set (x?, x*, x+); segments are disregarded, and

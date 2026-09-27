@@ -147,7 +147,7 @@ private:
     bool isCharItem(RE * re) {
         return CharSetAnalysis::isSet(re) && !hasStringsOrBoundary(re) && !mAnalysis.setOf(re, false).empty();
     }
-    bool parseKey(RE * re, std::vector<RE *> & key, std::string & reason);
+    bool parseKey(RE * re, std::vector<RE *> & key, bool segments, std::string & reason);
     bool parseElements(RE * re, std::vector<Element> & elements, bool reversed, std::string & reason);
     bool setElement(RE * re, bool reversed, Element & e);
     bool parseEarlier(const ConversionRule * e, Earlier & p, std::string & reason);
@@ -221,9 +221,10 @@ static bool isSequenceVariable(const RE * re) {
     return false;
 }
 
-// The key of L: single character items (no segments, repetitions, strings),
-// with variables that are not sets expanded.
-bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, std::string & reason) {
+// The items of L: single character items (no repetitions or strings), with
+// variables that are not sets expanded and, if segments is set, the items
+// of segments included.
+bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, bool segments, std::string & reason) {
     std::vector<RE *> elements;
     if (Seq * seq = dyn_cast<Seq>(re)) {
         elements.assign(seq->begin(), seq->end());
@@ -232,7 +233,11 @@ bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, std::string & rea
     }
     for (RE * e : elements) {
         if (isSequenceVariable(e)) {
-            if (!parseKey(cast<Name>(e)->getDefinition(), key, reason)) return false;
+            if (!parseKey(cast<Name>(e)->getDefinition(), key, segments, reason)) return false;
+            continue;
+        }
+        if (segments && isa<Capture>(e)) {
+            if (!parseKey(cast<Capture>(e)->getCapturedRE(), key, segments, reason)) return false;
             continue;
         }
         if (!isCharItem(e)) {
@@ -242,6 +247,59 @@ bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, std::string & rea
         key.push_back(e);
     }
     return true;
+}
+
+//  The text to replace of L rebuilt with its items replaced by the given
+//  classes (in the order of parseKey): segments are rebuilt (recording the
+//  new captures) and variables that are not sets are expanded.
+static RE * rebuildKey(RE * re, const std::vector<RE *> & items, size_t & next,
+                       std::map<const Capture *, Capture *> & captures) {
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> elements;
+        for (RE * e : *seq) elements.push_back(rebuildKey(e, items, next, captures));
+        return makeSeq(elements.begin(), elements.end());
+    }
+    if (Capture * c = dyn_cast<Capture>(re)) {
+        Capture * rebuilt = makeCapture(c->getName(), rebuildKey(c->getCapturedRE(), items, next, captures));
+        captures.emplace(c, rebuilt);
+        return rebuilt;
+    }
+    if (isSequenceVariable(re)) {
+        return rebuildKey(cast<Name>(re)->getDefinition(), items, next, captures);
+    }
+    return items[next++];
+}
+
+//  A result with its references to the captures replaced by the rebuilt captures.
+static RE * remapReferences(RE * re, const std::map<const Capture *, Capture *> & captures) {
+    if (re == nullptr) return nullptr;
+    if (Reference * ref = dyn_cast<Reference>(re)) {
+        auto f = captures.find(ref->getCapture());
+        return f == captures.end() ? re : makeReference(ref->getName(), f->second, ref->getInstance());
+    }
+    if (Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n)) {
+            RE * arg = remapReferences(n->getDefinition(), captures);
+            return (arg != n->getDefinition()) ? makeFunctionCall(getFunctionID(n), arg) : re;
+        }
+        return re;
+    }
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> elements;
+        bool changed = false;
+        for (RE * e : *seq) {
+            elements.push_back(remapReferences(e, captures));
+            changed |= elements.back() != e;
+        }
+        return changed ? makeSeq(elements.begin(), elements.end()) : re;
+    }
+    return re;
+}
+
+static RuleSide * remapReferences(const RuleSide * s, const std::map<const Capture *, Capture *> & captures) {
+    return RuleSide::Create(remapReferences(s->getBeforeContext(), captures), remapReferences(s->getCompletedResult(), captures),
+                            s->hasCursor(), remapReferences(s->getResultToRevisit(), captures), s->getCursorOffset(),
+                            remapReferences(s->getAfterContext(), captures));
 }
 
 // Collect the strings of a set (possibly through variables).
@@ -632,7 +690,7 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     mAfter.clear();
     mBefore.clear();
     std::string why;
-    if (!parseKey(src->getText(), mAfter, why)) {
+    if (!parseKey(src->getText(), mAfter, true, why)) {
         unresolved("L: text to replace has a " + why, earlier.size());
         return false;
     }
@@ -641,12 +699,12 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         return false;
     }
     mKeyLength = mAfter.size();
-    if (src->hasAfterContext() && !parseKey(src->getAfterContext(), mAfter, why)) {
+    if (src->hasAfterContext() && !parseKey(src->getAfterContext(), mAfter, false, why)) {
         unresolved("L: after context has a " + why, earlier.size());
         return false;
     }
     if (src->hasBeforeContext()) {
-        if (!parseKey(src->getBeforeContext(), mBefore, why)) {
+        if (!parseKey(src->getBeforeContext(), mBefore, false, why)) {
             unresolved("L: before context has a " + why, earlier.size());
             return false;
         }
@@ -692,7 +750,11 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         // the items of L: the key, the after context and the before context.
         std::vector<RE *> following = side.second;
         for (size_t i = following.size(); i < mAfter.size(); i++) following.push_back(mAfter[i]);
-        std::vector<RE *> key(following.begin(), following.begin() + mKeyLength);
+        // The key keeps the structure of L's text to replace (its segments).
+        std::vector<RE *> keyItems(following.begin(), following.begin() + mKeyLength);
+        std::map<const Capture *, Capture *> captures;
+        size_t next = 0;
+        RE * key = rebuildKey(src->getText(), keyItems, next, captures);
         RE * afterContext = nullptr;
         if (following.size() > mKeyLength) {
             afterContext = makeSeq(following.begin() + mKeyLength, following.end());
@@ -704,8 +766,9 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
             std::reverse(before.begin(), before.end());
             beforeContext = makeSeq(before.begin(), before.end());
         }
-        RuleSide * rs = RuleSide::Create(beforeContext, makeSeq(key.begin(), key.end()), false, nullptr, 0, afterContext);
-        pieces.push_back(makeConversionRule(rs, Direction::Forward, L->getRightSide()));
+        RuleSide * rs = RuleSide::Create(beforeContext, key, false, nullptr, 0, afterContext);
+        RuleSide * result = captures.empty() ? L->getRightSide() : remapReferences(L->getRightSide(), captures);
+        pieces.push_back(makeConversionRule(rs, Direction::Forward, result));
     }
     // Verify that no piece overlaps a resolved rule.
     for (Rule * piece : pieces) {

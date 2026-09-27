@@ -144,12 +144,54 @@ private:
     };
     // A state of the exploration: an earlier rule and a state of its automaton.
     using State = std::pair<unsigned, unsigned>;
-    using Paths = std::vector<std::pair<std::vector<RE *>, std::set<unsigned>>>;
+    // An item of L: a single character set, repeated from lb to ub times
+    // (ub < 0: unbounded).
+    struct LItem {
+        RE * set;
+        UCD::UnicodeSet chars;
+        int lb;
+        int ub;
+    };
+    // The progress of L on one side: its current item and the repetitions
+    // of it matched (capped, so that repetitions return to the same state),
+    // or done (beyond L's items).
+    struct LState {
+        size_t i;
+        int c;
+        bool done;
+        bool operator==(const LState & o) const {return i == o.i && c == o.c && done == o.done;}
+    };
+    // A step of a path: a class of characters, matched by an item of L (or
+    // beyond L's items: -1).
+    struct Step {
+        RE * re;
+        int item;
+    };
+    // A path on which the earlier rules fail, the rules pending, and the
+    // final state of L.
+    struct Found {
+        std::vector<Step> path;
+        std::set<unsigned> pending;
+        LState l;
+    };
+    using Paths = std::vector<Found>;
 
     bool isCharItem(RE * re) {
         return CharSetAnalysis::isSet(re) && !hasStringsOrBoundary(re) && !mAnalysis.setOf(re, false).empty();
     }
-    bool parseKey(RE * re, std::vector<RE *> & key, bool segments, std::string & reason);
+    bool parseL(RE * re, std::vector<LItem> & items, bool segments, std::string & reason);
+    bool possessiveIsExactL(const std::vector<LItem> & items);
+    // The items of L that may match the next character (with their counts),
+    // and whether L may end before it.
+    void lCandidates(const std::vector<LItem> & items, const LState & s,
+                     std::vector<std::pair<size_t, int>> & candidates, bool & canEnd);
+    LState lAdvance(const std::vector<LItem> & items, size_t j, int c);
+    // A canonical state: fully repeated items are passed, and L beyond its
+    // items is done.
+    LState lNormalize(const std::vector<LItem> & items, LState s);
+    // The replacement of each item of L given a path and the final state of L.
+    std::vector<std::vector<RE *>> lReplacement(const std::vector<LItem> & items, const std::vector<Step> & path,
+                                                const LState & final, std::vector<RE *> & beyond);
     bool parseElements(RE * re, std::vector<Element> & elements, bool reversed, std::string & reason);
     bool setElement(RE * re, bool reversed, Element & e);
     bool parseEarlier(const ConversionRule * e, Earlier & p, std::string & reason);
@@ -176,21 +218,21 @@ private:
     void closure(const std::vector<Earlier> & rules, bool after, std::set<State> & states);
 
     // Explore the earlier rules following the position (after) or preceding
-    // it, from the k-th position outward.  For the following side, the first
-    // positions are those of the key of L; rules with items preceding the
-    // position that match their key become pending.  Each path on which all
-    // rules fail yields the items of the path (and, following the position,
-    // the rules pending).  Returns false if the paths cannot be expressed.
-    bool explore(const std::vector<Earlier> & rules, bool after, size_t k, std::set<State> states,
-                 std::vector<RE *> path, std::set<unsigned> pending, bool atBoundary,
-                 std::vector<std::set<State>> seen, Paths & out);
+    // it, outward, together with the items of L on that side.  Rules with
+    // items preceding the position whose following items match become
+    // pending.  Each path on which all rules fail yields the steps of the
+    // path (and, following the position, the rules pending).  Returns false
+    // if the paths cannot be expressed.
+    bool explore(const std::vector<Earlier> & rules, bool after, std::set<State> states, LState l,
+                 std::vector<Step> path, std::set<unsigned> pending, bool atBoundary,
+                 std::vector<std::pair<std::set<State>, LState>> seen, Paths & out);
 
     DisambiguationStats & mStats;
     CharSetAnalysis mAnalysis;
     RuleOverlapAnalysis mOverlaps;
-    std::vector<RE *> mAfter;       // the items of L following its position: its key, then its after context
+    std::vector<LItem> mAfter;      // the items of L following its position: its key, then its after context
     size_t mKeyLength = 0;          // the number of key items
-    std::vector<RE *> mBefore;      // the items of L's before context, outward
+    std::vector<LItem> mBefore;     // the items of L's before context, outward
     std::string mFailure;           // why the exploration failed
 };
 
@@ -223,10 +265,10 @@ static bool isSequenceVariable(const RE * re) {
     return false;
 }
 
-// The items of L: single character items (no repetitions or strings), with
-// variables that are not sets expanded and, if segments is set, the items
-// of segments included.
-bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, bool segments, std::string & reason) {
+// The items of L: single character items (no strings), possibly repeated,
+// with variables that are not sets expanded and, if segments is set, the
+// items of segments included.
+bool Disambiguator::parseL(RE * re, std::vector<LItem> & items, bool segments, std::string & reason) {
     std::vector<RE *> elements;
     if (Seq * seq = dyn_cast<Seq>(re)) {
         elements.assign(seq->begin(), seq->end());
@@ -235,24 +277,114 @@ bool Disambiguator::parseKey(RE * re, std::vector<RE *> & key, bool segments, st
     }
     for (RE * e : elements) {
         if (isSequenceVariable(e)) {
-            if (!parseKey(cast<Name>(e)->getDefinition(), key, segments, reason)) return false;
+            if (!parseL(cast<Name>(e)->getDefinition(), items, segments, reason)) return false;
             continue;
         }
         if (segments && isa<Capture>(e)) {
-            if (!parseKey(cast<Capture>(e)->getCapturedRE(), key, segments, reason)) return false;
+            if (!parseL(cast<Capture>(e)->getCapturedRE(), items, segments, reason)) return false;
+            continue;
+        }
+        if (Rep * rep = dyn_cast<Rep>(e)) {
+            if (!isCharItem(rep->getRE())) {
+                reason = itemReason(e);
+                return false;
+            }
+            RE * set = rep->getRE();
+            items.push_back(LItem{set, mAnalysis.setOf(set, false), rep->getLB(),
+                                  rep->getUB() == Rep::UNBOUNDED_REP ? -1 : rep->getUB()});
             continue;
         }
         if (!isCharItem(e)) {
             reason = itemReason(e);
             return false;
         }
-        key.push_back(e);
+        items.push_back(LItem{e, mAnalysis.setOf(e, false), 1, 1});
     }
     return true;
 }
 
+//  L's matching is deterministic (as ICU's possessive matching) if no
+//  repeated or optional item may match a character that the following
+//  items could match.
+bool Disambiguator::possessiveIsExactL(const std::vector<LItem> & items) {
+    for (size_t i = 0; i < items.size(); i++) {
+        if (items[i].lb == items[i].ub) continue;
+        for (size_t j = i + 1; j < items.size(); j++) {
+            if (items[i].chars.intersects(items[j].chars)) return false;
+            if (items[j].lb > 0) break;
+        }
+    }
+    return true;
+}
+
+void Disambiguator::lCandidates(const std::vector<LItem> & items, const LState & s,
+                                std::vector<std::pair<size_t, int>> & candidates, bool & canEnd) {
+    candidates.clear();
+    canEnd = s.done;
+    if (s.done) return;
+    size_t i = s.i;
+    int c = s.c;
+    for (;;) {
+        if (i == items.size()) {
+            canEnd = true;
+            return;
+        }
+        const LItem & item = items[i];
+        if (item.ub < 0 || c < item.ub) candidates.emplace_back(i, c);
+        if (c < item.lb) return;
+        i++;
+        c = 0;
+    }
+}
+
+Disambiguator::LState Disambiguator::lAdvance(const std::vector<LItem> & items, size_t j, int c) {
+    const LItem & item = items[j];
+    const int cap = item.ub < 0 ? item.lb : item.ub;
+    return lNormalize(items, LState{j, std::min(c + 1, cap), false});
+}
+
+Disambiguator::LState Disambiguator::lNormalize(const std::vector<LItem> & items, LState s) {
+    while (!s.done) {
+        if (s.i == items.size()) return LState{0, 0, true};
+        const LItem & item = items[s.i];
+        if (item.ub < 0 || s.c < item.ub) break;
+        s.i++;
+        s.c = 0;
+    }
+    return s;
+}
+
+std::vector<std::vector<RE *>> Disambiguator::lReplacement(const std::vector<LItem> & items, const std::vector<Step> & path,
+                                                           const LState & final, std::vector<RE *> & beyond) {
+    std::vector<std::vector<RE *>> replacement(items.size());
+    beyond.clear();
+    for (const Step & step : path) {
+        if (step.item < 0) {
+            beyond.push_back(step.re);
+        } else {
+            replacement[step.item].push_back(step.re);
+        }
+    }
+    if (!final.done) {
+        for (size_t j = final.i; j < items.size(); j++) {
+            const LItem & item = items[j];
+            // The rest of the current item, and the following items.
+            const int c = (j == final.i) ? final.c : 0;
+            const int lb = std::max(item.lb - c, 0);
+            const int ub = item.ub < 0 ? -1 : item.ub - c;
+            if (ub == 0) continue;
+            if (lb == 1 && ub == 1) {
+                replacement[j].push_back(item.set);
+            } else {
+                replacement[j].push_back(makeRep(item.set, lb, ub < 0 ? Rep::UNBOUNDED_REP : ub));
+            }
+        }
+    }
+    return replacement;
+}
+
 //  The text to replace of L rebuilt with its items replaced by the given
-//  classes (in the order of parseKey): segments are rebuilt (recording the
+//  replacements (in the order of parseL): segments are rebuilt (recording the
 //  new captures) and variables that are not sets are expanded.
 static RE * rebuildKey(RE * re, const std::vector<RE *> & items, size_t & next,
                        std::map<const Capture *, Capture *> & captures) {
@@ -531,16 +663,16 @@ void Disambiguator::closure(const std::vector<Earlier> & rules, bool after, std:
     }
 }
 
-bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, size_t k, std::set<State> states,
-                            std::vector<RE *> path, std::set<unsigned> pending, bool atBoundary,
-                            std::vector<std::set<State>> seen, Paths & out) {
+bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std::set<State> states, LState l,
+                            std::vector<Step> path, std::set<unsigned> pending, bool atBoundary,
+                            std::vector<std::pair<std::set<State>, LState>> seen, Paths & out) {
     if (path.size() > MaxPathLength || out.size() > MaxPaths) {
         mFailure = "exploration limit";
         return false;
     }
     closure(rules, after, states);
-    // Rules whose items are all matched either block the path or (for the
-    // key of a rule with items preceding the position) become pending.
+    // Rules whose items are all matched either block the path or (for a
+    // rule with items preceding the position) become pending.
     std::set<State> active;
     for (const State & s : states) {
         const Earlier & e = rules[s.first];
@@ -569,63 +701,92 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, size
             }
         }
     }
-    // Within the items of L, the characters are restricted to those of L.
-    const std::vector<RE *> & lItems = after ? mAfter : mBefore;
-    const bool inKey = k < lItems.size();
-    if (inKey) boundaryNext.clear();
+    // The items of L that may match the next character; L may end here
+    // (then any character or the text boundary may follow).
+    const std::vector<LItem> & lItems = after ? mAfter : mBefore;
+    std::vector<std::pair<size_t, int>> candidates;
+    bool canEnd = false;
+    lCandidates(lItems, l, candidates, canEnd);
+    if (!canEnd) boundaryNext.clear();
+    const LState done{0, 0, true};
     if (atBoundary) {
         // Beyond the end of the text, only the text boundary may match.
         if (boundaryNext.empty()) {
-            out.emplace_back(path, pending);
+            out.push_back(Found{path, pending, l});
             return true;
         }
         std::set<State> next = boundaryNext;
         closure(rules, after, next);
         if (next == states) {
-            out.emplace_back(path, pending);    // the boundary repeated: no progress
+            out.push_back(Found{path, pending, l});     // the boundary repeated: no progress
             return true;
         }
-        return explore(rules, after, k, next, path, pending, true, seen, out);
+        return explore(rules, after, next, l, path, pending, true, seen, out);
     }
     if (edgeSets.empty() && boundaryNext.empty()) {
-        out.emplace_back(path, pending);
+        out.push_back(Found{path, pending, l});
         return true;
     }
-    if (!inKey) {
-        if (std::find(seen.begin(), seen.end(), states) != seen.end()) {
-            mFailure = "E: repetition not expressible with single character items";
-            return false;
-        }
-        seen.push_back(states);
+    if (std::find(seen.begin(), seen.end(), std::make_pair(states, l)) != seen.end()) {
+        mFailure = "E: repetition not expressible with single character items";
+        return false;
     }
-    // The classes of characters: those in the same transition sets.
-    const UCD::UnicodeSet universe = inKey ? mAnalysis.setOf(lItems[k], false) : UCD::UnicodeSet(0, UCD::UNICODE_MAX);
+    seen.emplace_back(states, l);
+    // The characters possible at this position.
+    UCD::UnicodeSet universe;
+    std::vector<RE *> candidateSets;
+    for (const auto & cand : candidates) {
+        universe = universe + lItems[cand.first].chars;
+        candidateSets.push_back(lItems[cand.first].set);
+    }
+    if (canEnd) universe = UCD::UnicodeSet(0, UCD::UNICODE_MAX);
     UCD::UnicodeSet covered;
     for (const UCD::UnicodeSet & c : edgeChars) covered = covered + c;
-    std::vector<UCD::UnicodeSet> parts;
-    if (!(universe & covered).empty()) parts.push_back(universe & covered);
-    for (const UCD::UnicodeSet & c : edgeChars) {
-        std::vector<UCD::UnicodeSet> refined;
-        for (const UCD::UnicodeSet & part : parts) {
-            UCD::UnicodeSet in = part & c;
-            UCD::UnicodeSet notIn = part - c;
-            if (!in.empty()) refined.push_back(in);
-            if (!notIn.empty()) refined.push_back(notIn);
+    // The classes of characters: those in the same transition sets and the
+    // same item of L.
+    auto refine = [&](UCD::UnicodeSet within) {
+        std::vector<UCD::UnicodeSet> parts;
+        if (!within.empty()) parts.push_back(within);
+        std::vector<UCD::UnicodeSet> sets = edgeChars;
+        for (const auto & cand : candidates) sets.push_back(lItems[cand.first].chars);
+        for (const UCD::UnicodeSet & c : sets) {
+            std::vector<UCD::UnicodeSet> refined;
+            for (const UCD::UnicodeSet & part : parts) {
+                UCD::UnicodeSet in = part & c;
+                UCD::UnicodeSet notIn = part - c;
+                if (!in.empty()) refined.push_back(in);
+                if (!notIn.empty()) refined.push_back(notIn);
+            }
+            parts = std::move(refined);
         }
-        parts = std::move(refined);
-    }
-    std::sort(parts.begin(), parts.end(), [](const UCD::UnicodeSet & a, const UCD::UnicodeSet & b) {
-        return a.front().first < b.front().first;
-    });
-    // The representation and the next states of each class.
-    std::vector<RE *> reprs;
+        std::sort(parts.begin(), parts.end(), [](const UCD::UnicodeSet & a, const UCD::UnicodeSet & b) {
+            return a.front().first < b.front().first;
+        });
+        return parts;
+    };
+    // The item of L matching a class (or -1 beyond L's items), and L's next state.
+    auto lStep = [&](const UCD::UnicodeSet & part, int & item) {
+        for (const auto & cand : candidates) {
+            if (lItems[cand.first].chars.intersects(part)) {
+                item = static_cast<int>(cand.first);
+                return lAdvance(lItems, cand.first, cand.second);
+            }
+        }
+        item = -1;
+        return done;
+    };
+    const std::vector<UCD::UnicodeSet> parts = refine(universe & covered);
+    std::vector<Step> steps;
     std::vector<std::set<State>> nexts;
+    std::vector<LState> lNexts;
     for (const UCD::UnicodeSet & part : parts) {
+        int item = -1;
+        const LState lNext = lStep(part, item);
         RE * cls = nullptr;
         for (size_t i = 0; i < edgeSets.size() && cls == nullptr; i++) {
             if (edgeChars[i] == part) cls = edgeSets[i];
         }
-        if (cls == nullptr && inKey && part == universe) cls = lItems[k];
+        if (cls == nullptr && item >= 0 && lItems[item].chars == part) cls = lItems[item].set;
         if (cls == nullptr) cls = makeCC(part);
         std::set<State> next;
         for (const State & s : active) {
@@ -634,40 +795,48 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, size
             }
         }
         closure(rules, after, next);
-        reprs.push_back(cls);
+        steps.push_back(Step{cls, item});
         nexts.push_back(next);
+        lNexts.push_back(lNext);
     }
     // Classes returning to the same states repeat: cls*.
     std::vector<RE *> loop;
-    if (!inKey) {
-        for (size_t i = 0; i < parts.size(); i++) {
-            if (nexts[i] == states) loop.push_back(reprs[i]);
+    int loopItem = -1;
+    for (size_t i = 0; i < parts.size(); i++) {
+        if (nexts[i] == states && lNexts[i] == l) {
+            loop.push_back(steps[i].re);
+            loopItem = steps[i].item;
         }
-        if (!loop.empty()) path.push_back(makeRep(unionOf(loop), 0, Rep::UNBOUNDED_REP));
     }
-    // The characters of no transition: all the rules fail.
-    if (inKey) {
-        if (RE * rest = subtract(lItems[k], covered)) {
-            std::vector<RE *> p = path;
-            p.push_back(rest);
-            out.emplace_back(p, pending);
-        }
-    } else {
-        std::vector<RE *> p = path;
-        p.push_back(negated(edgeSets, boundaryNext.empty()));
-        out.emplace_back(p, pending);
+    if (!loop.empty()) path.push_back(Step{makeRep(unionOf(loop), 0, Rep::UNBOUNDED_REP), loopItem});
+    // The characters of no transition: all the rules fail.  Within the items
+    // of L, the classes of L's items; beyond them, a negated set.
+    for (const UCD::UnicodeSet & part : refine(universe - covered)) {
+        int item = -1;
+        const LState lNext = lStep(part, item);
+        if (item < 0) continue;
+        std::vector<Step> p = path;
+        p.push_back(Step{subtract(lItems[item].set, covered), item});
+        out.push_back(Found{p, pending, lNext});
+    }
+    if (canEnd) {
+        std::vector<RE *> excluded = edgeSets;
+        excluded.insert(excluded.end(), candidateSets.begin(), candidateSets.end());
+        std::vector<Step> p = path;
+        p.push_back(Step{negated(excluded, boundaryNext.empty()), -1});
+        out.push_back(Found{p, pending, done});
         // The text boundary.
         if (!boundaryNext.empty()) {
-            std::vector<RE *> b = path;
-            b.push_back(makeTextBoundary());
-            if (!explore(rules, after, k + 1, boundaryNext, b, pending, true, seen, out)) return false;
+            std::vector<Step> b = path;
+            b.push_back(Step{makeTextBoundary(), -1});
+            if (!explore(rules, after, boundaryNext, done, b, pending, true, seen, out)) return false;
         }
     }
     for (size_t i = 0; i < parts.size(); i++) {
-        if (!inKey && nexts[i] == states) continue;     // repeated
-        std::vector<RE *> p = path;
-        p.push_back(reprs[i]);
-        if (!explore(rules, after, k + 1, nexts[i], p, pending, false, seen, out)) return false;
+        if (nexts[i] == states && lNexts[i] == l) continue;     // repeated
+        std::vector<Step> p = path;
+        p.push_back(steps[i]);
+        if (!explore(rules, after, nexts[i], lNexts[i], p, pending, false, seen, out)) return false;
     }
     return true;
 }
@@ -681,7 +850,7 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     mAfter.clear();
     mBefore.clear();
     std::string why;
-    if (!parseKey(src->getText(), mAfter, true, why)) {
+    if (!parseL(src->getText(), mAfter, true, why)) {
         unresolved("L: text to replace has a " + why, earlier.size());
         return false;
     }
@@ -690,16 +859,20 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         return false;
     }
     mKeyLength = mAfter.size();
-    if (src->hasAfterContext() && !parseKey(src->getAfterContext(), mAfter, false, why)) {
+    if (src->hasAfterContext() && !parseL(src->getAfterContext(), mAfter, false, why)) {
         unresolved("L: after context has a " + why, earlier.size());
         return false;
     }
     if (src->hasBeforeContext()) {
-        if (!parseKey(src->getBeforeContext(), mBefore, false, why)) {
+        if (!parseL(src->getBeforeContext(), mBefore, false, why)) {
             unresolved("L: before context has a " + why, earlier.size());
             return false;
         }
         std::reverse(mBefore.begin(), mBefore.end());
+    }
+    if (!possessiveIsExactL(mAfter) || !possessiveIsExactL(mBefore)) {
+        unresolved("L: repeated or optional item overlaps following items (possessive)", earlier.size());
+        return false;
     }
     std::vector<Earlier> rules;
     for (const ConversionRule * e : earlier) {
@@ -716,20 +889,20 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     Paths paths;
     std::set<State> initial;
     for (unsigned j = 0; j < rules.size(); j++) initial.insert(State{j, rules[j].forward.start});
-    std::vector<std::pair<std::vector<RE *>, std::vector<RE *>>> sides;   // (before, following) paths
-    bool ok = explore(rules, true, 0, initial, {}, {}, false, {}, paths);
-    for (auto & path : paths) {
+    std::vector<std::pair<Found, Found>> sides;     // (preceding, following) paths
+    bool ok = explore(rules, true, initial, lNormalize(mAfter, LState{0, 0, false}), {}, {}, false, {}, paths);
+    for (Found & path : paths) {
         if (!ok) break;
         // The paths preceding the position on which the pending rules fail.
         Paths befores;
-        if (path.second.empty()) {
-            befores.emplace_back(std::vector<RE *>{}, std::set<unsigned>{});
+        if (path.pending.empty()) {
+            befores.push_back(Found{{}, {}, LState{0, 0, false}});
         } else {
             std::set<State> pendingStates;
-            for (unsigned j : path.second) pendingStates.insert(State{j, rules[j].backward.start});
-            ok = explore(rules, false, 0, pendingStates, {}, {}, false, {}, befores);
+            for (unsigned j : path.pending) pendingStates.insert(State{j, rules[j].backward.start});
+            ok = explore(rules, false, pendingStates, lNormalize(mBefore, LState{0, 0, false}), {}, {}, false, {}, befores);
         }
-        for (auto & before : befores) sides.emplace_back(before.first, path.first);
+        for (Found & before : befores) sides.emplace_back(before, path);
     }
     if (!ok) {
         unresolved(mFailure.compare(0, 3, "E: ") == 0 ? mFailure : "E: " + mFailure, rules.size());
@@ -737,26 +910,25 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     }
     pieces.clear();
     for (auto & side : sides) {
-        // The classes of the paths within the items of L, then the rest of
-        // the items of L: the key, the after context and the before context.
-        std::vector<RE *> following = side.second;
-        for (size_t i = following.size(); i < mAfter.size(); i++) following.push_back(mAfter[i]);
-        // The key keeps the structure of L's text to replace (its segments).
-        std::vector<RE *> keyItems(following.begin(), following.begin() + mKeyLength);
+        // The items of L replaced by the classes of the paths: the key (with
+        // L's segments), the after context and the before context.
+        std::vector<RE *> beyond;
+        const std::vector<std::vector<RE *>> following = lReplacement(mAfter, side.second.path, side.second.l, beyond);
+        std::vector<RE *> keyItems;
+        for (size_t j = 0; j < mKeyLength; j++) keyItems.push_back(makeSeq(following[j].begin(), following[j].end()));
         std::map<const Capture *, Capture *> captures;
         size_t next = 0;
         RE * key = rebuildKey(src->getText(), keyItems, next, captures);
-        RE * afterContext = nullptr;
-        if (following.size() > mKeyLength) {
-            afterContext = makeSeq(following.begin() + mKeyLength, following.end());
-        }
-        std::vector<RE *> before = side.first;
-        for (size_t i = before.size(); i < mBefore.size(); i++) before.push_back(mBefore[i]);
-        RE * beforeContext = nullptr;
-        if (!before.empty()) {
-            std::reverse(before.begin(), before.end());
-            beforeContext = makeSeq(before.begin(), before.end());
-        }
+        std::vector<RE *> afterItems;
+        for (size_t j = mKeyLength; j < mAfter.size(); j++) afterItems.insert(afterItems.end(), following[j].begin(), following[j].end());
+        afterItems.insert(afterItems.end(), beyond.begin(), beyond.end());
+        RE * afterContext = afterItems.empty() ? nullptr : makeSeq(afterItems.begin(), afterItems.end());
+        const std::vector<std::vector<RE *>> preceding = lReplacement(mBefore, side.first.path, side.first.l, beyond);
+        std::vector<RE *> beforeItems;
+        for (const std::vector<RE *> & r : preceding) beforeItems.insert(beforeItems.end(), r.begin(), r.end());
+        beforeItems.insert(beforeItems.end(), beyond.begin(), beyond.end());
+        std::reverse(beforeItems.begin(), beforeItems.end());
+        RE * beforeContext = beforeItems.empty() ? nullptr : makeSeq(beforeItems.begin(), beforeItems.end());
         RuleSide * rs = RuleSide::Create(beforeContext, key, false, nullptr, 0, afterContext);
         RuleSide * result = captures.empty() ? L->getRightSide() : remapReferences(L->getRightSide(), captures);
         pieces.push_back(makeConversionRule(rs, Direction::Forward, result));

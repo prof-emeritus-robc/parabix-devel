@@ -717,6 +717,12 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"b { a → x ; d { a } e → y ;", "b { a → x ;\nd { a } e → y ;\n"},
     {"a } b → x ; a } b c → y ;", "a } b → x ;\n"},
     {"a } b c → x ; a } b → y ;", "a } bc → x ;\na } b [^c] → y ;\n"},
+    // Repetitions in L: each item is replaced by the classes it matches.
+    {"ab → x ; a+ → y ;", "ab → x ;\naa a* → y ;\na } [^ab] → y ;\n"},
+    {"ab → x ; a c? → y ;", "ab → x ;\nac → y ;\na } [^bc] → y ;\n"},
+    {"b { a → x ; c* { a → y ;", "b { a → x ;\nc* c { a → y ;\n[^bc] { a → y ;\n"},
+    {"ab → x ; (a+) → $1 ;", "ab → x ;\n(aa a*) → $1 ;\n(a) } [^ab] → $1 ;\n"},
+    {"ab → x ; a+ a → y ;", "ab → x ;\na+ a → y ;\n"},
     // Segments in the key of L are retained, with references to them.
     {"ab → x ; (a) → $1 y ;", "ab → x ;\n(a) } [^b] → $1 y ;\n"},
     {"ab → x ; ([ac]) → z $1 ;", "ab → x ;\n(c) → z $1 ;\n(a) } [^b] → z $1 ;\n"},

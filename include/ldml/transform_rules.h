@@ -488,9 +488,9 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  without changing their meaning, as far as the overlaps are resolved.
 //
 //  The case handled is that of L having a key and contexts of single
-//  character items (characters or sets, with variables that are not sets
-//  expanded; the key may have segments, which the replacement rules
-//  retain), and each earlier
+//  character items (characters or sets, possibly repeated: x?, x*, x+,
+//  with variables that are not sets expanded; the key may have segments,
+//  which the replacement rules retain), and each earlier
 //  overlapping rule E being a sequence of items on one side of its position,
 //  each a set (possibly with strings and the text boundary [$]), the anchor
 //  ^ or $, or a repeated set (x?, x*, x+); segments are disregarded, and
@@ -513,8 +513,12 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  rules with items before the position contribute before contexts.  An L
 //  masked by its earlier rules is removed.
 //
+//  Each item of L is replaced by the classes it matches on each path (and
+//  the rest of its repetitions, if the path ends within it), e.g. for
+//  E = ab and L = a+, aa a* → result ; a } [^ab] → result ;.
+//
 //  Not handled (the pairs remain in order): L with items that are not
-//  single characters, E with items that are not sets or repeated sets,
+//  (repeated) single characters, E with items that are not sets or repeated sets,
 //  repetitions through several classes
 //  (e.g. [{bc}]*), and cases where ICU's possessive matching differs from
 //  the regular expression interpretation: repeated or optional items whose

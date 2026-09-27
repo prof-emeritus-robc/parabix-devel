@@ -131,9 +131,11 @@ public:
     bool disambiguate(ConversionRule * L, const std::vector<ConversionRule *> & earlier, std::vector<Rule *> & pieces);
 
 private:
-    // An earlier rule: automata for its items following the position
-    // (including its key), and, for a rule with items preceding the
-    // position, for its key and for its preceding items (outward).
+    // An earlier rule: an automaton for its items following the position
+    // (its key and after context) and, for a rule with a before context
+    // (after is false), for its items preceding the position (outward).
+    // A rule with a before context matching its following items becomes
+    // pending: it blocks L only if its preceding items match too.
     struct Earlier {
         const ConversionRule * rule;
         bool after;
@@ -470,32 +472,21 @@ bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::str
         reason = "E: text to replace is empty or optional";
         return false;
     }
-    const bool single = text.size() == 1 && text[0].lb == 1 && text[0].ub == 1;
-    if (!single || src->hasAfterContext()) {
-        if (src->hasBeforeContext()) {
-            reason = "E: items both before and after the position";
-            return false;
-        }
-        if (!parseElements(src->getAfterContext(), text, false, why)) {
-            reason = "E: after context has a " + why;
-            return false;
-        }
-        if (!possessiveIsExact(text, reason)) return false;
-        p.after = true;
-        p.forward = buildNFA(text);
-    } else if (src->hasBeforeContext()) {
+    if (!parseElements(src->getAfterContext(), text, false, why)) {
+        reason = "E: after context has a " + why;
+        return false;
+    }
+    if (!possessiveIsExact(text, reason)) return false;
+    p.forward = buildNFA(text);
+    p.after = !src->hasBeforeContext();
+    if (src->hasBeforeContext()) {
         std::vector<Element> before;
         if (!parseElements(src->getBeforeContext(), before, true, why)) {
             reason = "E: before context has a " + why;
             return false;
         }
         if (!possessiveIsExact(before, reason)) return false;
-        p.after = false;
-        p.forward = buildNFA(text);
         p.backward = buildNFA(before);
-    } else {
-        p.after = true;
-        p.forward = buildNFA(text);
     }
     return true;
 }

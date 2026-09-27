@@ -695,9 +695,11 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"a } b → x ; c } d → z ; [ac] → y ;", "a } b → x ;\nc } d → z ;\na } [^b] → y ;\nc } [^d] → y ;\n"},
     // Sets and variables.
     {"$v = [bc] ; a } $v → x ; [ae] → y ;", "$v = [bc] ;\na } $v → x ;\ne → y ;\na } [^$v] → y ;\n"},
-    // Not handled: contexts on both sides, a later rule with a context,
-    // shared keys, optional items overlapping following items.
-    {"c { a } b → x ; a → y ;", "c { a } b → x ;\na → y ;\n"},
+    // Earlier rules with items on both sides; not handled: optional items
+    // overlapping following items.
+    {"c { a } b → x ; a → y ;", "c { a } b → x ;\na } [^b] → y ;\n[^c] { a } b → y ;\n"},
+    {"c { a } b → x ; a } b → y ;", "c { a } b → x ;\n[^c] { a } b → y ;\n"},
+    {"c { a } b → x ; ab → z ; a → y ;", "c { a } b → x ;\n[^c] { ab → z ;\na } [^b] → y ;\n"},
     // Earlier rules with shared keys are explored together.
     {"a } b → x ; a } c → z ; a → y ;", "a } b → x ;\na } c → z ;\na } [^bc] → y ;\n"},
     {"ab → x ; ac → z ; a → y ;", "ab → x ;\nac → z ;\na } [^bc] → y ;\n"},

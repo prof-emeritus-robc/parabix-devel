@@ -150,8 +150,14 @@ public:
 
     UnicodeSet & operator=(const UnicodeSet & other) noexcept;
     UnicodeSet & operator=(const UnicodeSet && other) noexcept;
+    // Set equality.
     bool operator==(const UnicodeSet & other) const noexcept;
+    // Proper subset: a partial order, not suitable for sorting or ordered
+    // containers.  Use compare for a total order.
     bool operator<(const UnicodeSet & other) const noexcept;
+    // A total order on sets, consistent with set equality: negative, zero or
+    // positive as this set is ordered before, equal to or after the other.
+    int compare(const UnicodeSet & other) const noexcept;
 
     UnicodeSet() noexcept;
     UnicodeSet(const codepoint_t codepoint) noexcept;

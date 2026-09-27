@@ -215,7 +215,7 @@ static bool compare(const RE * const lh, const RE * const rh) {
         case Type::Assertion:
             return lessThan(cast<Assertion>(lh), cast<Assertion>(rh));
         case Type::CC:
-            return *cast<CC>(lh) < *cast<CC>(rh);
+            return cast<CC>(lh)->compare(*cast<CC>(rh)) < 0;
         case Type::Name:
             return lessThan(cast<Name>(lh), cast<Name>(rh));
         case Type::Capture:

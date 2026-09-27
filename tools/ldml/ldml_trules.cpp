@@ -786,7 +786,7 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"a } [{b}{bc}] → x ; a → y ;", "a } [{bc}b] → x ;\na } [^b] → y ;\n"},
     {"a } [{bc}b] c → x ; a → y ;", "a } [{bc}b] c → x ;\na } [^b] → y ;\na } b [^c] → y ;\na } bc [^c] → y ;\n"},
     {"[{ab}ac] d? → x ; c → y ;", "[{ab}ac] d? → x ;\n"},
-    {"yw } [{m̥}bm]* [$] → ɨu ; yw → əu ; y → ə ;", "yw } [{m̥}bm]* [$] → ɨu ;\nyw → əu ;\ny } [^w] → ə ;\n"},
+    {"yw } [{m̥}bm]* [$] → ɨu ; yw → əu ; y → ə ;", "yw } [{m̥}bm]* [$] → ɨu ;\nyw } [{m̥}bm]* [^bm$] → əu ;\ny } [^w] → ə ;\n"},
     {"b a { b → y ; ([a-c] a) { b → $1 ;", "ba { b → y ;\n([ac] a) { b → $1 ;\n"},
     {"a b { c → y ; (a+ [bd]) { c → $1 ;", "ab { c → y ;\n(a+ d) { c → $1 ;\n"},
     {"b } c → y ; ([a-c] (a)) { b → $1 $2 ;", "b } c → y ;\n([a-c] (a)) { b } [^c] → $1 $2 ;\n"},
@@ -802,6 +802,10 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"([^0-9]) 0 $ → $1 o ; ([a-z]) 0 ([^0-9]) → $1 o $2 ;", "([^0-9]) 0 $ → $1 o ;\n([a-z]) 0 ([^0-9$]) → $1 o $2 ;\n"},
     {"^ x+ → ; x+ $ → ;", "^ x+ → ;\n[:any:] { x x* } $ → ;\n"},
     {"a 0 → y ; ([a-z]) 0 ($) → $1 o $2 ;", "a0 → y ;\n([b-z]) 0 () } $ → $1 o $2 ;\n"},
+    {"$c = [{m̥}bmw] ; yw } $c* [$] → u ; yw → o ;", "$c = [{m̥}bmw] ;\nyw } $c* [$] → u ;\nyw } $c* [^bmw$] → o ;\n"},
+    {"$c = [{m̥}bmw] ; y } $c* [$] → i ; y → e ;", "$c = [{m̥}bmw] ;\ny } $c* [$] → i ;\ny } $c* [^bmw$] → e ;\n"},
+    {"$c = [{m̥}bmw] ; yw → əu ; y } $c* [$] → ɨ ;", "$c = [{m̥}bmw] ;\nyw → əu ;\ny } [{m̥}bm] $c* [$] → ɨ ;\ny } [$] → ɨ ;\n"},
+    {"$c = [{m̥}bm] ; a → y ; [$] $c* { a → x ;", "$c = [{m̥}bm] ;\na → y ;\n"},
     {"a } [{bc}{bcd}] e → x ; a → y ;", "a } [{bc}{bcd}] e → x ;\na } [^b] → y ;\na } b [^c] → y ;\na } bc [^de] → y ;\na } bcd [^e] → y ;\n"},
 };
 

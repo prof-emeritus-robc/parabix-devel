@@ -51,6 +51,33 @@ bool hasStringsOrBoundary(const RE * re) {
 
 // A single character item of a pattern: a set, possibly with strings and
 // the text boundary, repeated from lb to ub times (ub < 0: unbounded).
+static void collectSetStrings(RE * re, std::vector<std::vector<codepoint_t>> & strings);
+static bool hasBoundary(const RE * re);
+
+// Whether an item is the text boundary alone (^, $ or [$], possibly as a
+// variable).
+static bool isBoundaryItem(const RE * re) {
+    while (const Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n) || n->getDefinition() == nullptr) return false;
+        re = n->getDefinition();
+    }
+    if (isa<Start>(re) || isa<End>(re) || isTextBoundary(re)) return true;
+    // [$]: the boundary with no characters.
+    if (const Alt * alt = dyn_cast<Alt>(re)) {
+        bool boundary = false;
+        for (const RE * a : *alt) {
+            if (isa<Start>(a) || isa<End>(a)) {
+                boundary = true;
+            } else if (!isa<CC>(a) || !cast<CC>(a)->empty()) {
+                return false;
+            }
+        }
+        return boundary;
+    }
+    return false;
+}
+static RE * charPart(RE * re, const UCD::UnicodeSet & chars);
+
 struct Element {
     RE * set;                                   // the set as written
     RE * chars;                                 // its characters (or nullptr)
@@ -63,12 +90,13 @@ struct Element {
 
 // An automaton for the elements of a pattern, in the direction of matching.
 struct NFA {
-    enum class Kind {Epsilon, Chars, Boundary};
+    enum class Kind {Epsilon, Chars, Boundary, String};
     struct Edge {
         unsigned to;
         Kind kind;
         RE * set;
         UCD::UnicodeSet chars;
+        std::vector<codepoint_t> str;       // a String edge: a string of a set, taken as a whole
     };
     std::vector<std::vector<Edge>> out;
     unsigned start = 0;
@@ -78,7 +106,10 @@ struct NFA {
         return static_cast<unsigned>(out.size() - 1);
     }
     void addEdge(unsigned from, unsigned to, Kind k, RE * set = nullptr, UCD::UnicodeSet chars = UCD::UnicodeSet()) {
-        out[from].push_back(Edge{to, k, set, std::move(chars)});
+        out[from].push_back(Edge{to, k, set, std::move(chars), {}});
+    }
+    void addStringEdge(unsigned from, unsigned to, RE * set, const std::vector<codepoint_t> & str) {
+        out[from].push_back(Edge{to, Kind::String, set, UCD::UnicodeSet(), str});
     }
 };
 
@@ -403,6 +434,91 @@ NFA ICUAutomatonBuilder::build() {
 // kinds on the same characters into the same blocks.  (The conditions of
 // ICUAutomatonBuilder distinguish states that may nevertheless behave alike,
 // which would otherwise form cycles of several steps.)
+// Whether the strings of the sets of the elements may be taken as single
+// steps (for repeated sets with strings): each string begins with a
+// character of its set, and none is a prefix of another.  Then, as ICU
+// takes the longest string of a set, a text beginning with a string of the
+// set is matched by that string, and otherwise by a character.
+bool stringsAsSteps(const std::vector<Element> & elements) {
+    bool repeated = false;
+    for (const Element & e : elements) {
+        if (e.strings.empty()) continue;
+        repeated |= e.lb != e.ub;
+        for (const auto & x : e.strings) {
+            if (x.size() < 2 || !e.charSet.contains(x[0])) return false;
+            for (const auto & y : e.strings) {
+                if (&x != &y && x.size() <= y.size() && std::equal(x.begin(), x.end(), y.begin())) return false;
+            }
+        }
+    }
+    return repeated;
+}
+
+// An automaton under ICU's possessive matching, with the strings of sets as
+// String edges (see stringsAsSteps).  The states are (element, repetitions);
+// an element takes the characters (and strings) that the preceding elements
+// that may be passed over cannot take, and the pattern is matched once its
+// remaining elements may be empty.
+NFA buildStringStepNFA(const std::vector<Element> & elements) {
+    NFA n;
+    n.accept = n.addState();
+    std::map<std::pair<size_t, int>, unsigned> ids;
+    std::vector<std::pair<size_t, int>> work;
+    auto cap = [&](size_t j, int c) {
+        const Element & e = elements[j];
+        return e.ub < 0 ? std::min(c + 1, e.lb) : c + 1;
+    };
+    auto stateOf = [&](size_t i, int c) -> unsigned {
+        while (i < elements.size() && elements[i].ub >= 0 && c >= elements[i].ub) {
+            i++;
+            c = 0;
+        }
+        bool complete = i == elements.size() || c >= elements[i].lb;
+        for (size_t j = i + 1; j < elements.size() && complete; j++) complete = elements[j].lb == 0;
+        if (complete) return n.accept;
+        const auto key = std::make_pair(i, c);
+        auto f = ids.find(key);
+        if (f != ids.end()) return f->second;
+        const unsigned id = n.addState();
+        ids.emplace(key, id);
+        work.push_back(key);
+        return id;
+    };
+    n.start = stateOf(0, 0);
+    while (!work.empty()) {
+        const auto key = work.back();
+        work.pop_back();
+        const unsigned from = ids.at(key);
+        UCD::UnicodeSet taken;
+        bool boundaryTaken = false;
+        size_t j = key.first;
+        int c = key.second;
+        while (j < elements.size()) {
+            const Element & e = elements[j];
+            if (e.ub < 0 || c < e.ub) {
+                const unsigned to = stateOf(j, cap(j, c));
+                const UCD::UnicodeSet takeable = e.charSet - taken;
+                if (!takeable.empty()) {
+                    RE * set = !(takeable == e.charSet) ? makeCC(takeable) : hasBoundary(e.set) ? e.chars : e.set;
+                    n.addEdge(from, to, NFA::Kind::Chars, set, takeable);
+                }
+                for (const auto & str : e.strings) {
+                    if (takeable.contains(str[0])) n.addStringEdge(from, to, e.set, str);
+                }
+                if (e.boundary && !boundaryTaken && c + 1 >= e.lb) {
+                    n.addEdge(from, stateOf(j + 1, 0), NFA::Kind::Boundary);
+                }
+                taken = taken + e.charSet;
+                boundaryTaken |= e.boundary;
+            }
+            if (c < e.lb) break;
+            j++;
+            c = 0;
+        }
+    }
+    return n;
+}
+
 NFA reduce(const NFA & n) {
     const size_t N = n.out.size();
     struct Transition {
@@ -532,10 +648,6 @@ NFA emptyNFA() {
     return n;
 }
 
-static void collectSetStrings(RE * re, std::vector<std::vector<codepoint_t>> & strings);
-static bool hasBoundary(const RE * re);
-static RE * charPart(RE * re, const UCD::UnicodeSet & chars);
-
 class Disambiguator {
 public:
     Disambiguator(DisambiguationStats & stats) : mStats(stats) {}
@@ -579,6 +691,10 @@ private:
         // A repeated set that also matches the text boundary (as negated
         // sets do); valid only if a following item requires a character.
         bool setBoundary = false;
+        // The strings of a repeated set, each beginning with one of its
+        // characters and none a prefix of another (reversed preceding the
+        // position).
+        std::vector<std::vector<codepoint_t>> strings;
     };
     // The progress of L on one side: its current item and the repetitions
     // of it matched (capped, so that repetitions return to the same state),
@@ -652,7 +768,14 @@ private:
     // A negated set, which also matches beyond the ends of the text unless
     // excluding the boundary.
     RE * negated(const std::vector<RE *> & sets, bool boundary) {
-        RE * complement = makeDiff(makeAny(), unionOf(sets));
+        // (Of the characters of the sets: their strings begin with them.)
+        std::vector<RE *> chars;
+        for (RE * set : sets) {
+            std::vector<std::vector<codepoint_t>> strings;
+            collectSetStrings(set, strings);
+            chars.push_back(strings.empty() ? set : charPart(set, mAnalysis.setOf(set, false)));
+        }
+        RE * complement = makeDiff(makeAny(), unionOf(chars));
         return boundary ? makeAlt({complement, makeStart(), makeEnd()}) : complement;
     }
     RE * subtract(RE * x, const UCD::UnicodeSet & k);
@@ -670,6 +793,11 @@ private:
     bool explore(const std::vector<Earlier> & rules, bool after, std::set<State> states, LState l,
                  std::vector<Step> path, std::set<unsigned> pending, bool atBoundary,
                  std::vector<std::pair<std::set<State>, LState>> seen, Paths & out);
+    // The states of the rules and of L after a string (as a whole where a
+    // rule or L has it as a string of a set, otherwise character by
+    // character); false if L cannot match it.
+    bool stringStep(const std::vector<Earlier> & rules, bool after, const std::set<State> & active, LState l,
+                    const std::vector<codepoint_t> & str, std::set<State> & next, LState & lNext);
     // The (preceding, following) paths on which all the rules fail.
     bool exploreSides(const std::vector<Earlier> & rules, std::vector<std::pair<Found, Found>> & sides);
 
@@ -739,17 +867,25 @@ bool Disambiguator::parseL(RE * re, std::vector<LItem> & items, bool segments, s
             }
             std::vector<std::vector<codepoint_t>> strings;
             collectSetStrings(set, strings);
-            if (!CharSetAnalysis::isSet(set) || !strings.empty() || mAnalysis.setOf(set, false).empty()) {
+            const UCD::UnicodeSet chars = mAnalysis.setOf(set, false);
+            bool stringsOK = true;
+            for (const auto & x : strings) {
+                stringsOK &= x.size() > 1 && chars.contains(x[0]);
+                for (const auto & y : strings) {
+                    if (&x != &y && x.size() <= y.size() && std::equal(x.begin(), x.end(), y.begin())) stringsOK = false;
+                }
+            }
+            if (!CharSetAnalysis::isSet(set) || !stringsOK || chars.empty()) {
                 reason = itemReason(e);
                 return false;
             }
-            LItem item{set, mAnalysis.setOf(set, false), rep->getLB(),
-                       rep->getUB() == Rep::UNBOUNDED_REP ? -1 : rep->getUB(), false};
+            LItem item{set, chars, rep->getLB(), rep->getUB() == Rep::UNBOUNDED_REP ? -1 : rep->getUB(), false};
             item.setBoundary = hasBoundary(set);
+            item.strings = strings;
             items.push_back(item);
             continue;
         }
-        if (isa<Start>(e) || isa<End>(e) || (isTextBoundary(e))) {
+        if (isBoundaryItem(e)) {
             items.push_back(LItem{e, UCD::UnicodeSet(), 1, 1, true});
             continue;
         }
@@ -1078,15 +1214,25 @@ bool Disambiguator::automaton(const std::vector<Element> & elements, bool posses
         n = buildNFA(elements);
         return true;
     }
+    if (!possessive && stringsAsSteps(elements)) {
+        // For the exploration (verification uses the exact automaton).
+        n = buildStringStepNFA(elements);
+        isPossessive = true;
+        return true;
+    }
     n = reduce(ICUAutomatonBuilder(elements).build());
     isPossessive = true;
     return true;
 }
 
-bool Disambiguator::mayOverlapPossessive(const Earlier & e, const ConversionRule * r) {
+bool Disambiguator::mayOverlapPossessive(const Earlier & explored, const ConversionRule * r) {
+    // (The exact automata of the earlier rule, not those of the exploration.)
+    Earlier e;
     Earlier p;
     std::string reason;
-    if (!parseEarlier(r, p, reason, true)) return mOverlaps.mayOverlap(e.rule, r);
+    if (!parseEarlier(explored.rule, e, reason, true) || !parseEarlier(r, p, reason, true)) {
+        return mOverlaps.mayOverlap(explored.rule, r);
+    }
     const NFA empty = emptyNFA();
     return compatible(e.forward, p.forward) && compatible(e.after ? empty : e.backward, p.after ? empty : p.backward);
 }
@@ -1198,6 +1344,73 @@ void Disambiguator::closure(const std::vector<Earlier> & rules, bool after, std:
     }
 }
 
+bool Disambiguator::stringStep(const std::vector<Earlier> & rules, bool after, const std::set<State> & active, LState l,
+                               const std::vector<codepoint_t> & str, std::set<State> & next, LState & lNext) {
+    next.clear();
+    for (const State & s : active) {
+        const NFA & n = automaton(rules[s.first], after);
+        bool whole = false;
+        for (const NFA::Edge & e : n.out[s.second]) {
+            if (e.kind == NFA::Kind::String && e.str == str) {
+                next.insert(State{s.first, e.to});
+                whole = true;
+            }
+        }
+        if (whole) continue;
+        std::set<State> cur{s};
+        for (const codepoint_t cp : str) {
+            std::set<State> following;
+            for (const State & c : cur) {
+                if (c.second == n.accept) {
+                    following.insert(c);    // matched within the string
+                    continue;
+                }
+                for (const NFA::Edge & e : n.out[c.second]) {
+                    if (e.kind == NFA::Kind::Chars && e.chars.contains(cp)) following.insert(State{c.first, e.to});
+                }
+            }
+            closure(rules, after, following);
+            cur = std::move(following);
+        }
+        next.insert(cur.begin(), cur.end());
+    }
+    closure(rules, after, next);
+    // L: the first of its possible items that may take the first character
+    // takes the string as a whole if it is one of its strings.
+    const std::vector<LItem> & lItems = after ? mAfter : mBefore;
+    const LState done{0, 0, true};
+    std::vector<std::pair<size_t, int>> candidates;
+    bool canEnd = false;
+    lCandidates(lItems, l, candidates, canEnd);
+    for (const auto & cand : candidates) {
+        const LItem & item = lItems[cand.first];
+        if (item.boundary || !item.chars.contains(str[0])) continue;
+        if (std::find(item.strings.begin(), item.strings.end(), str) != item.strings.end()) {
+            lNext = lAdvance(lItems, cand.first, cand.second);
+            return true;
+        }
+        break;
+    }
+    for (const codepoint_t cp : str) {
+        if (l.done) break;
+        lCandidates(lItems, l, candidates, canEnd);
+        bool taken = false;
+        for (const auto & cand : candidates) {
+            if (!lItems[cand.first].boundary && lItems[cand.first].chars.contains(cp)) {
+                l = lAdvance(lItems, cand.first, cand.second);
+                taken = true;
+                break;
+            }
+        }
+        if (!taken) {
+            if (!canEnd) return false;
+            l = done;
+        }
+    }
+    lNext = l;
+    return true;
+}
+
 bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std::set<State> states, LState l,
                             std::vector<Step> path, std::set<unsigned> pending, bool atBoundary,
                             std::vector<std::pair<std::set<State>, LState>> seen, Paths & out) {
@@ -1224,9 +1437,12 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
     std::vector<RE *> edgeSets;
     std::vector<UCD::UnicodeSet> edgeChars;
     std::set<State> boundaryNext;
+    std::vector<std::vector<codepoint_t>> strings;     // the strings of sets that may follow (in matching order)
     for (const State & s : active) {
         for (const NFA::Edge & e : automaton(rules[s.first], after).out[s.second]) {
-            if (e.kind == NFA::Kind::Chars && !atBoundary) {
+            if (e.kind == NFA::Kind::String && !atBoundary) {
+                if (std::find(strings.begin(), strings.end(), e.str) == strings.end()) strings.push_back(e.str);
+            } else if (e.kind == NFA::Kind::Chars && !atBoundary) {
                 if (std::find(edgeSets.begin(), edgeSets.end(), e.set) == edgeSets.end()) {
                     edgeSets.push_back(e.set);
                     edgeChars.push_back(e.chars);
@@ -1355,6 +1571,44 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         nexts.push_back(next);
         lNexts.push_back(lNext);
     }
+    // A text beginning with a string of a set is matched by the string where
+    // a rule (or L) has the set: the string must lead to the same states as
+    // its first character, and joins its class (which, as a set with
+    // strings, then matches as ICU does, taking the string where present).
+    for (const auto & cand : candidates) {
+        for (const auto & str : lItems[cand.first].strings) {
+            if (std::find(strings.begin(), strings.end(), str) == strings.end()) strings.push_back(str);
+        }
+    }
+    auto stringRE = [after](const std::vector<codepoint_t> & str) {
+        std::vector<RE *> cps;
+        if (after) {
+            for (const codepoint_t cp : str) cps.push_back(makeCC(cp));
+        } else {
+            for (auto i = str.rbegin(); i != str.rend(); ++i) cps.push_back(makeCC(*i));
+        }
+        return makeSeq(cps.begin(), cps.end());
+    };
+    // Whether a class already includes a string (as a set with strings).
+    auto includes = [after](RE * cls, const std::vector<codepoint_t> & str) {
+        std::vector<std::vector<codepoint_t>> within;
+        collectSetStrings(cls, within);
+        std::vector<codepoint_t> text = str;
+        if (!after) std::reverse(text.begin(), text.end());
+        return std::find(within.begin(), within.end(), text) != within.end();
+    };
+    for (const auto & str : strings) {
+        size_t i = 0;
+        while (i < parts.size() && !parts[i].contains(str[0])) i++;
+        if (i == parts.size()) continue;    // L cannot match it, or all the rules fail (below)
+        std::set<State> next;
+        LState lNext;
+        if (!stringStep(rules, after, active, l, str, next, lNext) || !(next == nexts[i]) || !(lNext == lNexts[i])) {
+            mFailure = "E: set with strings whose strings and characters lead to different states";
+            return false;
+        }
+        if (!includes(steps[i].re, str)) steps[i].re = makeAlt({steps[i].re, stringRE(str)});
+    }
     // Classes returning to the same states repeat: cls*.
     std::vector<RE *> loop;
     int loopItem = -1;
@@ -1371,8 +1625,12 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         int item = -1;
         const LState lNext = lStep(part, item);
         if (item < 0) continue;
+        RE * cls = subtract(lItems[item].set, covered);
+        for (const auto & str : lItems[item].strings) {
+            if (part.contains(str[0]) && !includes(cls, str)) cls = makeAlt({cls, stringRE(str)});
+        }
         std::vector<Step> p = path;
-        p.push_back(Step{subtract(lItems[item].set, covered), item});
+        p.push_back(Step{cls, item});
         out.push_back(Found{p, pending, lNext});
     }
     const bool boundaryFails = boundaryNext.empty() && boundaryItem < 0;
@@ -1464,7 +1722,7 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     Capture * emptySegment = nullptr;
     if (!src->hasAfterContext()) {
         if (const Seq * seq = dyn_cast<Seq>(text)) {
-            auto isBoundary = [](const RE * e) {return isa<End>(e) || isTextBoundary(e);};
+            auto isBoundary = [](const RE * e) {return !isa<Start>(e) && isBoundaryItem(e);};
             if (seq->size() > 1 && isBoundary(seq->back())) {
                 trailing = seq->back();
                 text = makeSeq(seq->begin(), seq->end() - 1);
@@ -1494,6 +1752,9 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
             return false;
         }
         std::reverse(mBefore.begin(), mBefore.end());
+        for (LItem & item : mBefore) {
+            for (auto & str : item.strings) std::reverse(str.begin(), str.end());
+        }
     }
     mBefore.insert(mBefore.end(), leading.begin(), leading.end());
     auto boundaryOutermost = [](const std::vector<LItem> & items) {
@@ -1523,7 +1784,10 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     }
     // L is followed possessively in the exploration; the replacement rules
     // are then verified with possessive matching.
-    const bool possessiveL = !possessiveIsExactL(mAfter) || !possessiveIsExactL(mBefore);
+    auto hasStrings = [](const std::vector<LItem> & items) {
+        return std::any_of(items.begin(), items.end(), [](const LItem & i) {return !i.strings.empty();});
+    };
+    const bool possessiveL = !possessiveIsExactL(mAfter) || !possessiveIsExactL(mBefore) || hasStrings(mAfter) || hasStrings(mBefore);
     std::vector<Earlier> rules;
     for (const ConversionRule * e : earlier) {
         Earlier p;

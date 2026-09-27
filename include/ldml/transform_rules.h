@@ -527,16 +527,22 @@ std::vector<RuleOverlap> findRuleOverlaps(const std::vector<Rule *> & rules);
 //  e.g. [{ch}{qu}ckq] → k ; into ch → k ; qu → k ; [ckq] → k ;, if no
 //  alternative is a prefix (suffix, preceding the position) of another or
 //  the set is the outermost item of its side (as ICU does not backtrack
-//  into sets).  The text boundary may be the outermost item of each side
+//  into sets).
+//
+//  Repeated and optional items are matched possessively, as ICU does: an
+//  item takes each character it can, e.g. E = a } [bc]? c matches exactly
+//  a [bc] c, and E = a } b* b never matches.  The replacement rules are
+//  verified with possessive matching where it differs from the regular
+//  expression interpretation.  The text boundary may be the outermost item of each side
 //  of L (e.g. [$] { or ^ at the start of its text to replace).
 //
 //  Not handled (the pairs remain in order): L with items that are not
 //  (repeated) single characters, E with items that are not sets or repeated sets,
 //  repetitions through several classes
-//  (e.g. [{bc}]*), and cases where ICU's possessive matching differs from
-//  the regular expression interpretation: repeated or optional items whose
-//  sets intersect the sets of the following items, and sets with strings
-//  that are prefixes of one another or start with characters of the set.
+//  (e.g. [{bc}]*), and sets with strings where ICU's matching differs from
+//  the regular expression interpretation (strings that are prefixes of one
+//  another or start with characters of the set, or repeated or optional
+//  items overlapping the following items).
 struct DisambiguationStats {
     size_t overlapsBefore = 0;       // overlapping pairs of rules
     size_t rulesSplit = 0;           // later rules replaced by rules for the alternatives of their sets

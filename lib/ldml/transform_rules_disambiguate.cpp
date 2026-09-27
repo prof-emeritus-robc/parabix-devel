@@ -122,6 +122,125 @@ NFA buildNFA(const std::vector<Element> & elements) {
     return n;
 }
 
+//  An automaton for elements under ICU's possessive matching: a repeated or
+//  optional element takes each character (or the text boundary) it can,
+//  so that it may be passed over only on characters it cannot take.  The
+//  states are (element, repetitions matched); the elements must not have
+//  strings.
+NFA buildPossessiveNFA(const std::vector<Element> & elements) {
+    NFA n;
+    n.accept = n.addState();
+    std::map<std::pair<size_t, int>, unsigned> ids;
+    std::vector<std::pair<size_t, int>> work;
+    // A canonical state: fully repeated elements are passed.
+    auto normalize = [&](size_t i, int c) {
+        while (i < elements.size() && elements[i].ub >= 0 && c >= elements[i].ub) {
+            i++;
+            c = 0;
+        }
+        return std::make_pair(i, c);
+    };
+    auto stateOf = [&](std::pair<size_t, int> s) {
+        if (s.first == elements.size()) return n.accept;
+        auto f = ids.find(s);
+        if (f != ids.end()) return f->second;
+        const unsigned id = n.addState();
+        ids.emplace(s, id);
+        work.push_back(s);
+        return id;
+    };
+    auto cap = [&](size_t j, int c) {
+        const Element & e = elements[j];
+        return e.ub < 0 ? std::min(c + 1, e.lb) : c + 1;
+    };
+    n.start = stateOf(normalize(0, 0));
+    while (!work.empty()) {
+        const auto s = work.back();
+        work.pop_back();
+        const unsigned from = ids.at(s);
+        // The elements that may take the next character, in order of priority.
+        UCD::UnicodeSet taken;
+        bool boundaryTaken = false;
+        size_t j = s.first;
+        int c = s.second;
+        for (;;) {
+            if (j == elements.size()) {
+                n.addEdge(from, n.accept, NFA::Kind::Epsilon);
+                break;
+            }
+            const Element & e = elements[j];
+            if (e.ub < 0 || c < e.ub) {
+                const unsigned to = stateOf(normalize(j, cap(j, c)));
+                const UCD::UnicodeSet chars = e.charSet - taken;
+                if (!chars.empty()) {
+                    RE * set = (chars == e.charSet) ? e.chars : makeCC(chars);
+                    n.addEdge(from, to, NFA::Kind::Chars, set, chars);
+                }
+                if (e.boundary && !boundaryTaken) n.addEdge(from, to, NFA::Kind::Boundary);
+                taken = taken + e.charSet;
+                boundaryTaken |= e.boundary;
+            }
+            if (c < e.lb) break;
+            j++;
+            c = 0;
+        }
+    }
+    return n;
+}
+
+// Is there a text beginning with a match of each automaton?
+bool compatible(const NFA & a, const NFA & b) {
+    using S = std::tuple<unsigned, unsigned, bool>;     // (a state, b state, at the text boundary)
+    std::set<S> visited;
+    std::vector<S> pending{S{a.start, b.start, false}};
+    auto visit = [&](S s) {
+        if (visited.insert(s).second) pending.push_back(s);
+    };
+    while (!pending.empty()) {
+        const S s = pending.back();
+        pending.pop_back();
+        const unsigned qa = std::get<0>(s);
+        const unsigned qb = std::get<1>(s);
+        const bool ended = std::get<2>(s);
+        const bool acceptA = qa == a.accept;
+        const bool acceptB = qb == b.accept;
+        if (acceptA && acceptB) return true;
+        for (const NFA::Edge & e : a.out[qa]) {
+            if (e.kind == NFA::Kind::Epsilon) visit(S{e.to, qb, ended});
+            else if (e.kind == NFA::Kind::Boundary) visit(S{e.to, qb, true});
+        }
+        for (const NFA::Edge & e : b.out[qb]) {
+            if (e.kind == NFA::Kind::Epsilon) visit(S{qa, e.to, ended});
+            else if (e.kind == NFA::Kind::Boundary) visit(S{qa, e.to, true});
+        }
+        if (ended) continue;
+        if (acceptA) {
+            for (const NFA::Edge & e : b.out[qb]) {
+                if (e.kind == NFA::Kind::Chars && !e.chars.empty()) visit(S{qa, e.to, false});
+            }
+        } else if (acceptB) {
+            for (const NFA::Edge & e : a.out[qa]) {
+                if (e.kind == NFA::Kind::Chars && !e.chars.empty()) visit(S{e.to, qb, false});
+            }
+        } else {
+            for (const NFA::Edge & ea : a.out[qa]) {
+                if (ea.kind != NFA::Kind::Chars) continue;
+                for (const NFA::Edge & eb : b.out[qb]) {
+                    if (eb.kind == NFA::Kind::Chars && ea.chars.intersects(eb.chars)) visit(S{ea.to, eb.to, false});
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// The automaton matching only the empty string.
+NFA emptyNFA() {
+    NFA n;
+    n.start = n.accept = n.addState();
+    return n;
+}
+
 class Disambiguator {
 public:
     Disambiguator(DisambiguationStats & stats) : mStats(stats) {}
@@ -141,6 +260,7 @@ private:
         bool after;
         NFA forward;
         NFA backward;
+        bool possessive = false;    // an automaton for possessive matching was needed
     };
     // A state of the exploration: an earlier rule and a state of its automaton.
     using State = std::pair<unsigned, unsigned>;
@@ -195,7 +315,12 @@ private:
                                                 const LState & final, std::vector<RE *> & beyond);
     bool parseElements(RE * re, std::vector<Element> & elements, bool reversed, std::string & reason);
     bool setElement(RE * re, bool reversed, Element & e);
-    bool parseEarlier(const ConversionRule * e, Earlier & p, std::string & reason);
+    bool parseEarlier(const ConversionRule * e, Earlier & p, std::string & reason, bool possessive = false);
+    // The automaton for elements: for possessive matching (if it differs from
+    // the regular expression interpretation, or if possessive is set).
+    bool automaton(const std::vector<Element> & elements, bool possessive, NFA & n, bool & isPossessive, std::string & reason);
+    // May the rules match at the same position (with possessive matching)?
+    bool mayOverlapPossessive(const Earlier & e, const ConversionRule * r);
     std::string itemReason(RE * e);
     void unresolved(const std::string & reason, size_t n = 1) {
         mStats.pairsUnresolved += n;
@@ -596,7 +721,31 @@ bool Disambiguator::possessiveIsExact(const std::vector<Element> & elements, std
     return true;
 }
 
-bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::string & reason) {
+bool Disambiguator::automaton(const std::vector<Element> & elements, bool possessive, NFA & n, bool & isPossessive,
+                              std::string & reason) {
+    std::string why;
+    if (!possessive && possessiveIsExact(elements, why)) {
+        n = buildNFA(elements);
+        return true;
+    }
+    if (std::any_of(elements.begin(), elements.end(), [](const Element & e) {return !e.strings.empty();})) {
+        reason = why.empty() ? "E: set with strings under possessive matching" : why;
+        return false;
+    }
+    n = buildPossessiveNFA(elements);
+    isPossessive = true;
+    return true;
+}
+
+bool Disambiguator::mayOverlapPossessive(const Earlier & e, const ConversionRule * r) {
+    Earlier p;
+    std::string reason;
+    if (!parseEarlier(r, p, reason, true)) return mOverlaps.mayOverlap(e.rule, r);
+    const NFA empty = emptyNFA();
+    return compatible(e.forward, p.forward) && compatible(e.after ? empty : e.backward, p.after ? empty : p.backward);
+}
+
+bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::string & reason, bool possessive) {
     const RuleSide * src = e->getLeftSide();
     std::vector<Element> text;
     std::string why;
@@ -640,8 +789,7 @@ bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::str
         reason = "E: ^ following the position";
         return false;
     }
-    if (!possessiveIsExact(text, reason)) return false;
-    p.forward = buildNFA(text);
+    if (!automaton(text, possessive, p.forward, p.possessive, reason)) return false;
     p.after = !src->hasBeforeContext() && !leadingStart;
     if (!p.after) {
         std::vector<Element> before;
@@ -657,8 +805,7 @@ bool Disambiguator::parseEarlier(const ConversionRule * e, Earlier & p, std::str
             reason = "E: $ preceding the position";
             return false;
         }
-        if (!possessiveIsExact(before, reason)) return false;
-        p.backward = buildNFA(before);
+        if (!automaton(before, possessive, p.backward, p.possessive, reason)) return false;
     }
     return true;
 }
@@ -956,10 +1103,9 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
         unresolved("L: text boundary within its items", earlier.size());
         return false;
     }
-    if (!possessiveIsExactL(mAfter) || !possessiveIsExactL(mBefore)) {
-        unresolved("L: repeated or optional item overlaps following items (possessive)", earlier.size());
-        return false;
-    }
+    // L is followed possessively in the exploration; the replacement rules
+    // are then verified with possessive matching.
+    const bool possessiveL = !possessiveIsExactL(mAfter) || !possessiveIsExactL(mBefore);
     std::vector<Earlier> rules;
     for (const ConversionRule * e : earlier) {
         Earlier p;
@@ -1022,7 +1168,8 @@ bool Disambiguator::disambiguate(ConversionRule * L, const std::vector<Conversio
     // Verify that no piece overlaps a resolved rule.
     for (Rule * piece : pieces) {
         for (const Earlier & e : rules) {
-            if (mOverlaps.mayOverlap(e.rule, cast<ConversionRule>(piece))) {
+            const ConversionRule * r = cast<ConversionRule>(piece);
+            if (e.possessive || possessiveL ? mayOverlapPossessive(e, r) : mOverlaps.mayOverlap(e.rule, r)) {
                 mStats.verificationFailures++;
                 mStats.failedPairs.emplace_back(e.rule, piece);
             }

@@ -744,6 +744,8 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"b { a → x ; c* { a → y ;", "b { a → x ;\nc* c { a → y ;\n[^bc] { a → y ;\n"},
     {"ab → x ; (a+) → $1 ;", "ab → x ;\n(aa a*) → $1 ;\n(a) } [^ab] → $1 ;\n"},
     {"ab → x ; a+ a → y ;", "ab → x ;\na+ a → y ;\n"},
+    // A later rule matched possessively: [ab]? b matches only ab and bb.
+    {"bc → x ; [ab]? b → y ;", "bc → x ;\nab → y ;\nbb → y ;\n"},
     // Segments in the key of L are retained, with references to them.
     {"ab → x ; (a) → $1 y ;", "ab → x ;\n(a) } [^b] → $1 y ;\n"},
     {"ab → x ; ([ac]) → z $1 ;", "ab → x ;\n(c) → z $1 ;\n(a) } [^b] → z $1 ;\n"},
@@ -751,7 +753,7 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"abc → x ; (a) (b) → &Any-Hex($2) $1 ;", "abc → x ;\n(a) (b) } [^c] → &Any-Hex($2) $1 ;\n"},
     // A later rule masked by its earlier rules is removed.
     {"a → x ; a } b → z ; a → y ;", "a → x ;\n"},
-    {"a } [bc]? c → x ; a → y ;", "a } [bc]? c → x ;\na → y ;\n"},
+    {"a } [bc]? c → x ; a → y ;", "a } [bc]? c → x ;\na } [^bc] → y ;\na } [bc] [^c] → y ;\n"},
     // Groups are independent.
     {"ab → x ; :: Null ; a → y ;", "ab → x ;\n:: Null ;\na → y ;\n"},
     // The text boundary: [$] and $ in contexts.
@@ -774,7 +776,7 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"$e = ; $e → x ; a → y ;", "$e = ;\n$e → x ;\na → y ;\n"},
     // Not handled: repetitions through several classes, possessive differences.
     {"a } [{bc}{de}]* f → x ; a → y ;", "a } [{bc}{de}]* f → x ;\na → y ;\n"},
-    {"a } b* b → x ; a → y ;", "a } b* b → x ;\na → y ;\n"},
+    {"a } b* b → x ; a → y ;", "a } b* b → x ;\na } b* [^b] → y ;\n"},
     {"a } [{b}{bc}] → x ; a → y ;", "a } [{bc}b] → x ;\na → y ;\n"},
 };
 

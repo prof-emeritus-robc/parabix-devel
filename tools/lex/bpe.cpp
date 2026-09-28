@@ -1318,11 +1318,13 @@ protected:
                     // its children in it, instead of emitting flat at the outer scope.
                     // The root's gate is then doubly guarded (chunk prefix, then its own
                     // Astart), and a cold chunk skips the whole chain in one test.
-<<<<<<< Updated upstream
                     // (--embedded-if-bits does not apply: the root's own gate already
                     // plays the part of its inner if.)
                     if (childrenOf.count(r.idAB)) {
-                        emitChain(body, r, fireStart);
+                        if (ChainUngateRoots && gatePinsIdA && r.idA != r.idB)
+                            emitChainInto(body, r, fireStart);  // own if would re-test the gate
+                        else
+                            emitChain(body, r, fireStart);
                         continue;
                     }
                     if (embedBits == 0) {
@@ -1343,14 +1345,6 @@ protected:
                     auto inner = body.createScope();
                     emitBody(inner, r, embedCond, grpAhead, grpBoundary, &bPeek, bLowUsed);
                     body.createIf(embedCond, inner);
-=======
-                    if (!childrenOf.count(r.idAB))
-                        emitBody(body, r, fireStart, grpAhead, grpBoundary);
-                    else if (ChainUngateRoots && gatePinsIdA && r.idA != r.idB)
-                        emitChainInto(body, r, fireStart);   // own if would re-test the gate
-                    else
-                        emitChain(body, r, fireStart);
->>>>>>> Stashed changes
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }

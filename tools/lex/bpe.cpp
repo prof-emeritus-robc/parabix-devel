@@ -113,14 +113,17 @@ static cl::opt<unsigned> IfGroupSize(
     cl::init(1));
 
 // HIGH-BIT PREFIX: instead of chunking the idA-sorted rules by size or count, group rules
-// whose idA share the same top K bits (of the kernel's W_out-bit id). The group's gate
-// tests only those K high bits; inside the gate each rule's Astart ANDs in the test of the
-// remaining W_out-K low bits (shared by rules with the same idA). Only active with
-// --if-group-lower-limit >= 0; overrides --if-group-count/--if-group-size when > 0.
+// whose idA share the same K significant bits, counted down from the highest 1 bit of idA
+// (so idA of bit-length L is keyed by bits [L-K, L), and ids with L <= K by their whole
+// value). The group's gate tests those K bits together with the zero bits above them;
+// inside the gate each rule's Astart ANDs in the test of the remaining L-K low bits
+// (shared by rules with the same idA). Only active with --if-group-lower-limit >= 0;
+// overrides --if-group-count/--if-group-size when > 0.
 static cl::opt<unsigned> IfTestSignificantBits(
     "if-test-significant-bits",
-    cl::desc("Grouped kernels: group rules by the top K bits of idA; the if-gate tests those "
-             "K bits and each rule completes its idA test inside the gate. 0 = off (default)."),
+    cl::desc("Grouped kernels: group rules by the K bits of idA starting at its highest 1 bit; "
+             "the if-gate tests those K bits (and the zero bits above them) and each rule "
+             "completes its idA test inside the gate. 0 = off (default)."),
     cl::init(0));
 
 // Effective grouped-if chunk size for a kernel with n rules. Fixed --if-group-size wins
@@ -650,7 +653,7 @@ public:
 
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
                         + (grouped ? (IfTestSignificantBits > 0
-                                        ? "sb" + std::to_string(IfTestSignificantBits) + "_"
+                                        ? "sbh" + std::to_string(IfTestSignificantBits) + "_"
                                         : "g" + std::to_string(effGroupSize(group.rules.size())) + "_") : "")
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
@@ -1106,10 +1109,14 @@ protected:
             // (T6-safe). Reorder is safe (T4 independence). GROUP_SIZE=5 → N/5 groups.
             //
             // --if-test-significant-bits=K (high-bit prefix): groups are instead the runs of
-            // sorted rules whose idA share the same top K bits. The gate tests only those K
-            // bits; inside the gate each rule's Astart ANDs in the EQ of the remaining low
-            // bits, so the id test is split across the gate and the body rather than paid
-            // in full outside (range gate) and again inside (per-rule EQ).
+            // sorted rules whose idA share the same K significant bits, counted from the
+            // highest 1 bit of idA. For idA of bit-length L, loBits = max(0, L-K) and the
+            // group key is idA >> loBits (which also fixes L, since its top bit is 1). The
+            // gate tests bits [loBits, W_out) against that key (the K significant bits plus
+            // the zero bits above them); inside the gate each rule's Astart ANDs in the EQ
+            // of the low loBits bits, so the id test is split across the gate and the body
+            // rather than paid in full outside (range gate) and again inside (per-rule EQ).
+            // Sorted by idA → equal keys are contiguous (same L, same prefix).
             std::vector<const MergeRule*> sorted;
             sorted.reserve(mRuleGroup.rules.size());
             for (const auto & r : mRuleGroup.rules) sorted.push_back(&r);
@@ -1117,17 +1124,21 @@ protected:
                       [](const MergeRule* a, const MergeRule* b){ return a->idA < b->idA; });
 
             const unsigned hiBits = std::min<unsigned>(IfTestSignificantBits, W_out);
-            const unsigned loBits = W_out - hiBits;
-            const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
-            const BixNum loFrozen(frozenBits.begin(), frozenBits.begin() + loBits);
+            // Number of low bits of idA below its K significant bits.
+            auto loBitsOf = [&](unsigned idA) -> unsigned {
+                const unsigned L = (idA == 0) ? 0 : 32u - __builtin_clz(idA);
+                return (L > hiBits) ? L - hiBits : 0;
+            };
 
             // [s,e) ranges of `sorted` forming each gate.
             std::vector<std::pair<size_t, size_t>> groups;
             if (hiBits > 0) {
                 for (size_t s = 0; s < sorted.size(); ) {
+                    const unsigned loBits = loBitsOf(sorted[s]->idA);
                     const unsigned prefix = sorted[s]->idA >> loBits;
                     size_t e = s + 1;
-                    while (e < sorted.size() && (sorted[e]->idA >> loBits) == prefix) e++;
+                    while (e < sorted.size() && loBitsOf(sorted[e]->idA) == loBits
+                           && (sorted[e]->idA >> loBits) == prefix) e++;
                     groups.emplace_back(s, e);
                     s = e;
                 }
@@ -1139,10 +1150,15 @@ protected:
 
             for (const auto & [s, e] : groups) {
                 PabloAST * inRange;
+                // Per-group split point (high-bit prefix only): all rules in the group share it.
+                const unsigned loBits = (hiBits > 0) ? loBitsOf(sorted[s]->idA) : 0;
+                const BixNum loFrozen(frozenBits.begin(), frozenBits.begin() + loBits);
                 if (hiBits > 0) {
                     const unsigned prefix = sorted[s]->idA >> loBits;
+                    const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
                     cc::Parabix_CC_Compiler_Builder ccHi(hiFrozen);
-                    inRange = ccHi.compileCC("idHi_" + std::to_string(prefix), re::makeCC(prefix), pb);
+                    inRange = ccHi.compileCC("idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
+                                             re::makeCC(prefix), pb);
                 } else {
                     unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
                     cc::Parabix_CC_Compiler_Builder ccId(frozenBits);

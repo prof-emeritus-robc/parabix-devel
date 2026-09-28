@@ -126,6 +126,16 @@ static cl::opt<unsigned> IfTestSignificantBits(
              "completes its idA test inside the gate. 0 = off (default)."),
     cl::init(0));
 
+// EMBEDDED IF (with --if-test-significant-bits): inside a group's gate, each idA-idB rule
+// gets its own inner createIf whose condition tests the idA bits the gate left untested
+// plus enough of idB's LOW bits to make E bits in all. The rest of the rule (the high
+// bits of idB, boundary, veto, stamp) is emitted in that inner body. 0 = off (default).
+static cl::opt<unsigned> EmbeddedIfBits(
+    "embedded-if-bits",
+    cl::desc("With --if-test-significant-bits: nest each rule in an inner if testing the "
+             "remaining idA bits plus low idB bits, E bits in all. 0 = off (default)."),
+    cl::init(0));
+
 // Effective grouped-if chunk size for a kernel with n rules. Fixed --if-group-size wins
 // when set (!= 1); otherwise derive from --if-group-count (n/count). Used by BOTH the
 // cache-name tag and the Pablo body so they never disagree (stale-cache hazard).
@@ -654,6 +664,7 @@ public:
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
                         + (grouped ? (IfTestSignificantBits > 0
                                         ? "sbh" + std::to_string(IfTestSignificantBits) + "_"
+                                          + (EmbeddedIfBits > 0 ? "eb" + std::to_string(EmbeddedIfBits) + "_" : "")
                                         : "g" + std::to_string(effGroupSize(group.rules.size())) + "_") : "")
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
@@ -900,12 +911,22 @@ protected:
         // chunk-local cached peeks, deduped per lenA and built inside this gate body.
         auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart,
                             const std::map<unsigned, BixNum> * grpAhead = nullptr,
-                            const std::map<unsigned, PabloAST*> * grpBoundary = nullptr) {
+                            const std::map<unsigned, PabloAST*> * grpBoundary = nullptr,
+                            const BixNum * bPeek = nullptr, unsigned bLowDone = 0) {
             //indexed mode reads the next-live id, byte mode reads lenA ahead via LookAhead.
             // Peek source precedence: indexed nextId > group-cache > per-rule in-gate > hoisted.
             PabloAST * BstartAtA;
             const std::string bstartName = "Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB);
-            if (mUseNextId) {
+            if (bPeek) {
+                // --embedded-if-bits: the caller's inner-if condition already matched the
+                // low bLowDone bits of idB on bPeek; test only the remaining high bits.
+                if (bLowDone >= bPeek->size()) {
+                    BstartAtA = nullptr;
+                } else {
+                    cc::Parabix_CC_Compiler_Builder ccHiB(BixNum(bPeek->begin() + bLowDone, bPeek->end()));
+                    BstartAtA = ccHiB.compileCC(bstartName, re::makeCC(r.idB >> bLowDone), body);
+                }
+            } else if (mUseNextId) {
                 cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
                 BstartAtA = ccNext.compileCC(bstartName, re::makeCC(r.idB), body);
             } else if (grpAhead) {   // chunk-cached shared peek (built once per lenA in the gate)
@@ -921,7 +942,7 @@ protected:
                 cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
                 BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
             }
-            PabloAST * fire = body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
+            PabloAST * fire = !BstartAtA ? fireStart : body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
                 PabloAST * bAhead = grpBoundary ? grpBoundary->at(r.lenA)
                     : LookaheadInGate ? body.createLookahead(boundaryBit, (int64_t) r.lenA)
@@ -1226,6 +1247,23 @@ protected:
                     }
                     return body.createAnd(f->second, inPlayMask, "Astart_" + std::to_string(idA));
                 };
+                // --embedded-if-bits=E: the E-bit budget covers the loBits idA bits the
+                // gate left untested, then the lowest bLow = E - loBits bits of idB.
+                const unsigned embedBits = (hiBits > 0) ? EmbeddedIfBits.getValue() : 0;
+                const unsigned bLow = (embedBits > loBits) ? embedBits - loBits : 0;
+                // Peek at the id lenA ahead (B's start), using the same source emitBody
+                // would: indexed nextId > group-cache > per-rule in-gate > hoisted.
+                auto bPeekFor = [&](const MergeRule & r) -> BixNum {
+                    if (mUseNextId) return nextIdBN;
+                    if (grpAhead) return grpAhead->at(r.lenA);
+                    if (LookaheadInGate) {
+                        std::vector<PabloAST*> bits(W);
+                        for (unsigned i = 0; i < W; i++)
+                            bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
+                        return BixNum(bits.begin(), bits.end());
+                    }
+                    return aheadByLenA.at(r.lenA);
+                };
                 for (size_t k = s; k < e; k++) {
                     const MergeRule & r = *sorted[k];
                     PabloAST * fireStart = (hiBits > 0) ? prefixAstart(r.idA) : eqAstart(body, r.idA);
@@ -1235,10 +1273,30 @@ protected:
                     // its children in it, instead of emitting flat at the outer scope.
                     // The root's gate is then doubly guarded (chunk prefix, then its own
                     // Astart), and a cold chunk skips the whole chain in one test.
-                    if (childrenOf.count(r.idAB))
+                    // (--embedded-if-bits does not apply: the root's own gate already
+                    // plays the part of its inner if.)
+                    if (childrenOf.count(r.idAB)) {
                         emitChain(body, r, fireStart);
-                    else
+                        continue;
+                    }
+                    if (embedBits == 0) {
                         emitBody(body, r, fireStart, grpAhead, grpBoundary);
+                        continue;
+                    }
+                    const BixNum bPeek = bPeekFor(r);
+                    const unsigned bLowUsed = std::min<unsigned>(bLow, bPeek.size());
+                    PabloAST * embedCond = fireStart;
+                    if (bLowUsed > 0) {
+                        const unsigned lowB = r.idB & ((1u << bLowUsed) - 1u);
+                        cc::Parabix_CC_Compiler_Builder ccLoB(BixNum(bPeek.begin(), bPeek.begin() + bLowUsed));
+                        PabloAST * bLoMatch = ccLoB.compileCC(
+                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB), re::makeCC(lowB), body);
+                        embedCond = body.createAnd(fireStart, bLoMatch,
+                            "embed_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
+                    }
+                    auto inner = body.createScope();
+                    emitBody(inner, r, embedCond, grpAhead, grpBoundary, &bPeek, bLowUsed);
+                    body.createIf(embedCond, inner);
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }

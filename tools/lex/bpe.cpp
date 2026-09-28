@@ -272,6 +272,21 @@ static cl::opt<bool> ChainVeto(
              "competitor applies, instead of splitting the kernel."),
     cl::init(false));
 
+// --chain-partition emission shape. Output-identical: Pablo ORs pending carries into
+// every if test (CarryManager::generateEntrySummaryTest), so fusing same-condition ifs,
+// or dropping one whose body is a no-op when its condition is zero, changes nothing.
+static cl::opt<bool> ChainFuseSiblings(
+    "chain-fuse-siblings",
+    cl::desc("With --chain-partition, nest all chain-children of a rule under ONE createIf "
+             "on its fire instead of one createIf per child."),
+    cl::init(false));
+
+static cl::opt<bool> ChainUngateRoots(
+    "chain-ungate-roots",
+    cl::desc("With --chain-partition on grouped kernels, drop a chain root's own createIf "
+             "when the group gate already tests its full idA."),
+    cl::init(false));
+
 static cl::opt<bool> LookaheadInGate(
     "lookahead-in-gate",
     cl::desc("Build the B-detection LookAhead inside each rule's if-gate (per-rule, "
@@ -686,6 +701,8 @@ public:
                         + (BatchWriteback ? "bw1_" : "bw0_")
                         + (ChainPartition ? "cp1_" : "cp0_")
                         + (ChainVeto ? "cv1_" : "cv0_")
+                        + (ChainFuseSiblings ? "fs1_" : "fs0_")
+                        + (ChainUngateRoots ? "ur1_" : "ur0_")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -1116,18 +1133,28 @@ protected:
             return fire;
         };
 
-        // Recurse: build r's gate, then nest every one of r's chain-children INSIDE
-        // it (using r's `fire`, not a fresh Astart) before closing r's createIf.
-        std::function<void(PabloBuilder&, const MergeRule&, PabloAST*)> emitChain =
-            [&](PabloBuilder & bld, const MergeRule & r, PabloAST * fireStart) {
-                auto body = bld.createScope();
-                PabloAST * fire = emitChainBody(body, r, fireStart);
-                auto it = childrenOf.find(r.idAB);
-                if (it != childrenOf.end())
-                    for (const MergeRule * child : it->second)
-                        emitChain(body, *child, fire);   // physically nested inside `body`
-                bld.createIf(fireStart, body);
-            };
+        // emitChainInto: r's body straight into `scope` (no gate of its own), then r's
+        // chain-children nested on r's `fire`. emitChain: same, wrapped in createIf(fireStart).
+        std::function<void(PabloBuilder&, const MergeRule&, PabloAST*)> emitChainInto;
+        auto emitChain = [&](PabloBuilder & bld, const MergeRule & r, PabloAST * fireStart) {
+            auto body = bld.createScope();
+            emitChainInto(body, r, fireStart);
+            bld.createIf(fireStart, body);
+        };
+        emitChainInto = [&](PabloBuilder & scope, const MergeRule & r, PabloAST * fireStart) {
+            PabloAST * fire = emitChainBody(scope, r, fireStart);
+            auto it = childrenOf.find(r.idAB);
+            if (it == childrenOf.end()) return;
+            if (ChainFuseSiblings) {
+                auto kids = scope.createScope();
+                for (const MergeRule * child : it->second)
+                    emitChainInto(kids, *child, fire);
+                scope.createIf(fire, kids);
+            } else {
+                for (const MergeRule * child : it->second)
+                    emitChain(scope, *child, fire);   // one createIf per child
+            }
+        };
 
         if (!mGrouped) {
             for (const auto & r : mRuleGroup.rules) {
@@ -1211,6 +1238,9 @@ protected:
                 PabloAST * inRange;
                 // Per-group split point (high-bit prefix only): all rules in the group share it.
                 const unsigned loBits = (hiBits > 0) ? loBitsOf(sorted[s]->idA) : 0;
+                // Every rule in the group has the same idA and the gate tests all of it.
+                const bool gatePinsIdA = (hiBits > 0) ? (loBits == 0)
+                                                      : (sorted[s]->idA == sorted[e-1]->idA);
                 const BixNum loFrozen(frozenBits.begin(), frozenBits.begin() + loBits);
                 if (hiBits > 0) {
                     const unsigned prefix = sorted[s]->idA >> loBits;
@@ -1288,6 +1318,7 @@ protected:
                     // its children in it, instead of emitting flat at the outer scope.
                     // The root's gate is then doubly guarded (chunk prefix, then its own
                     // Astart), and a cold chunk skips the whole chain in one test.
+<<<<<<< Updated upstream
                     // (--embedded-if-bits does not apply: the root's own gate already
                     // plays the part of its inner if.)
                     if (childrenOf.count(r.idAB)) {
@@ -1312,6 +1343,14 @@ protected:
                     auto inner = body.createScope();
                     emitBody(inner, r, embedCond, grpAhead, grpBoundary, &bPeek, bLowUsed);
                     body.createIf(embedCond, inner);
+=======
+                    if (!childrenOf.count(r.idAB))
+                        emitBody(body, r, fireStart, grpAhead, grpBoundary);
+                    else if (ChainUngateRoots && gatePinsIdA && r.idA != r.idB)
+                        emitChainInto(body, r, fireStart);   // own if would re-test the gate
+                    else
+                        emitChain(body, r, fireStart);
+>>>>>>> Stashed changes
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }

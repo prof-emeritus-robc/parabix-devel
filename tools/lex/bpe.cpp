@@ -787,15 +787,34 @@ protected:
         //     grouped-if kernels.
         const bool groupNeedsLiveMask = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
                                                      [](const MergeRule & r) { return r.needsFlush; });
-        // groupNeedsLiveId (--chain-partition): some rule is nested inside its
-        // producer's gate (see emitChain below) — batching's deferred, end-of-kernel
-        // stamp write doesn't compose with that structure, so batching is off
-        // entirely for the whole group, same fallback groupNeedsLiveMask uses for
-        // the mask.
-        const bool groupNeedsLiveId = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
-                                                   [](const MergeRule & r) { return r.needsLiveId; });
-        const bool batch     = BatchWriteback && !mUseNextId && !groupNeedsLiveId;  // defer the id-stamp
-        const bool deferMask = batch && !groupNeedsLiveMask;       // also defer the mask consume
+        // --chain-partition rules (a chain root and every rule nested under it) keep
+        // the EAGER write-back: a parent stamps idAB and its child stamps idABC at the
+        // SAME position, so the child must overwrite the parent, and the batch
+        // accumulators only OR — they cannot express "the later one wins". Batching
+        // stays ON for every OTHER rule in the same kernel, which is safe because the
+        // two never collide:
+        //   - STAMP: a rule fires at its A start, identified by the FROZEN id there.
+        //     A chain position holds the root's idA, and all of a kernel's rules with
+        //     that idA share one lenA and so probe one slot, where at most one idB can
+        //     actually sit — so at most one of them fires. No batched rule ever fires
+        //     where a chain rule does, hence anyFire is 0 there and flushWriteback's
+        //     `idAcc & ~anyFire` preserves the eager chain stamp untouched.
+        //   - MASK: a chain rule consumes at its idB's start. The maxLeft constraint
+        //     forbids any same-kernel rule from having that idB as ITS idA (or, under
+        //     --chain-veto, makes it stand down at runtime), so no batched rule reads
+        //     the position a chain consume clears.
+        //
+        // childrenOf[idAB] = the rules in THIS group whose idA == idAB (i.e. every rule
+        // that should nest inside idAB's own gate — see emitChain below). Empty, so
+        // isChainRule is always false, whenever --chain-partition is off.
+        std::unordered_map<unsigned, std::vector<const MergeRule*>> childrenOf;
+        for (const auto & r : mRuleGroup.rules)
+            if (r.needsLiveId) childrenOf[r.idA].push_back(&r);
+        auto isChainRule = [&](const MergeRule & r) {
+            return r.needsLiveId || childrenOf.count(r.idAB) != 0;
+        };
+        const bool batch     = BatchWriteback && !mUseNextId;  // defer the id-stamp
+        const bool deferMask = batch && !groupNeedsLiveMask;   // also defer the mask consume
         std::vector<Var *> setBit;
         std::map<unsigned, Var *> fireByLen;
         Var * anyFire = nullptr;
@@ -806,7 +825,7 @@ protected:
             anyFire = pb.createVar("anyFire", zeroes);
             if (deferMask)
                 for (const auto & r : mRuleGroup.rules)
-                    if (fireByLen.find(r.lenA) == fireByLen.end())
+                    if (!isChainRule(r) && fireByLen.find(r.lenA) == fireByLen.end())
                         fireByLen.emplace(r.lenA,
                             pb.createVar("fireByLen_" + std::to_string(r.lenA), zeroes));
         }
@@ -1031,14 +1050,8 @@ protected:
         // ONLY, behind this one opt-in flag, specifically to test whether the IR-size
         // cost it warns about is bearable for real merge chains.
         //
-        // childrenOf[idAB] = the rules in THIS group whose idA == idAB (i.e. every
-        // rule that should nest inside idAB's own gate). Empty (all rules go through
-        // the untouched emitRule path below) whenever --chain-partition is off,
-        // since needsLiveId is never set in that case.
-        std::unordered_map<unsigned, std::vector<const MergeRule*>> childrenOf;
-        for (const auto & r : mRuleGroup.rules)
-            if (r.needsLiveId) childrenOf[r.idA].push_back(&r);
-
+        // childrenOf is built above the write-back accumulators — isChainRule needs it.
+        //
         // One rule's B-detect + stamp + consume, built fresh (not shared with
         // emitBody — deliberately isolated). Returns `fire` (Astart AND B-detect) so
         // a nested child can use it as ITS gate condition directly.
@@ -1117,9 +1130,19 @@ protected:
             // of the low loBits bits, so the id test is split across the gate and the body
             // rather than paid in full outside (range gate) and again inside (per-rule EQ).
             // Sorted by idA → equal keys are contiguous (same L, same prefix).
+            //
+            // --chain-partition: only the nested CHILDREN sit out the chunk loop —
+            // emitChain emits each of them physically inside its producer's gate, so
+            // they must not also appear as a chunk rule. Chain ROOTS stay in, and get
+            // their nest built inside the chunk gate (see emitChain call below), so a
+            // chain costs one gate shared with ~14 neighbours instead of a flat if of
+            // its own. Grouping is therefore decided per RULE, not per kernel: the old
+            // per-kernel exclusion sent all ~170 rules of any chain-bearing kernel back
+            // to one createIf each — 94.7% of all rules, measured.
             std::vector<const MergeRule*> sorted;
             sorted.reserve(mRuleGroup.rules.size());
-            for (const auto & r : mRuleGroup.rules) sorted.push_back(&r);
+            for (const auto & r : mRuleGroup.rules)
+                if (!r.needsLiveId) sorted.push_back(&r);
             std::sort(sorted.begin(), sorted.end(),
                       [](const MergeRule* a, const MergeRule* b){ return a->idA < b->idA; });
 
@@ -1208,7 +1231,14 @@ protected:
                     PabloAST * fireStart = (hiBits > 0) ? prefixAstart(r.idA) : eqAstart(body, r.idA);
                     if (r.idA == r.idB)
                         fireStart = selfMergeFireStarts(body, fireStart, r.lenA);
-                    emitBody(body, r, fireStart, grpAhead, grpBoundary);
+                    // Chain root: build its own createIf inside THIS chunk gate and nest
+                    // its children in it, instead of emitting flat at the outer scope.
+                    // The root's gate is then doubly guarded (chunk prefix, then its own
+                    // Astart), and a cold chunk skips the whole chain in one test.
+                    if (childrenOf.count(r.idAB))
+                        emitChain(body, r, fireStart);
+                    else
+                        emitBody(body, r, fireStart, grpAhead, grpBoundary);
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }
@@ -1350,13 +1380,11 @@ BPEPassResult buildBPEPassPipeline(
             P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
         }
         // Grouped-if for kernels at/after the lower limit (later kernels); -1 = off.
-        // Excludes any group with a --chain-partition rule: eqAstart's live-idAcc read
-        // (and its per-rule idAcc rebind) is only wired into the per-rule (!mGrouped)
-        // loop below, not the grouped-if chunk loop.
-        bool groupHasChain = std::any_of(g.rules.begin(), g.rules.end(),
-                                          [](const MergeRule & r) { return r.needsLiveId; });
-        bool grouped = (IfGroupLowerLimit >= 0) && ((long) i >= (long) IfGroupLowerLimit)
-                       && !groupHasChain;
+        // A --chain-partition rule no longer disqualifies the whole kernel: the
+        // grouped-if path now skips just the chain-involved rules and emits them
+        // its chain roots' nests inside its chunk gates (see isChainRule / emitChain in
+        // BPEMergeKernel::generatePabloMethod).
+        bool grouped = (IfGroupLowerLimit >= 0) && ((long) i >= (long) IfGroupLowerLimit);
         P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
                                            g, hashRuleSet(g.rules), g.maxLen, grouped);
         source     = sOut;

@@ -85,21 +85,25 @@ static cl::opt<bool> GeometricCompaction(
 // (shared Astart EQ) instead of one per rule. Single-level (no nested if → T6).
 // Applied only to kernels with index >= IfGroupLowerLimit — the early kernels
 // fire on almost every block (grouping there saves gates but never skips), so
-// grouping is aimed at the later kernels. -1 = off (per-rule everywhere).
+// grouping is aimed at the later kernels. -1 = off (per-rule everywhere), unless one of
+// --if-group-size/--if-group-count/--if-test-significant-bits is given, which implies 0
+// (see effIfGroupLowerLimit).
 static cl::opt<int> IfGroupLowerLimit(
     "if-group-lower-limit",
     cl::desc("Group merge rules by first id under one createIf, for kernels at/after "
-             "this index (-1 = off)."),
+             "this index (-1 = off; default -1, or 0 when --if-group-size, "
+             "--if-group-count or --if-test-significant-bits is given)."),
     cl::init(-1));
 
 
 // FIXED COUNT: give every kernel exactly K grouped-if gates. Gate SIZE then VARIES per
 // kernel = rules/K (a 900-rule kernel -> 900/K rules per gate, a 10-rule kernel -> 10/K).
-// Same gate structure everywhere, scales with kernel size. Only active with
-// --if-group-lower-limit >= 0. Default 1 = one gate covering all the kernel's rules.
+// Same gate structure everywhere, scales with kernel size. Applies to grouped kernels
+// (giving it turns grouping on; see effIfGroupLowerLimit). Default 1 = one gate covering
+// all the kernel's rules.
 static cl::opt<unsigned> IfGroupCount(
     "if-group-count",
-    cl::desc("Grouped-if gates per kernel (only with --if-group-lower-limit >= 0). "
+    cl::desc("Grouped-if gates per kernel (implies --if-group-lower-limit=0 if unset). "
              "Gate size = rules/count; count scales with kernel. Default 1."),
     cl::init(1));
 
@@ -117,8 +121,8 @@ static cl::opt<unsigned> IfGroupSize(
 // (so idA of bit-length L is keyed by bits [L-K, L), and ids with L <= K by their whole
 // value). The group's gate tests those K bits together with the zero bits above them;
 // inside the gate each rule's Astart ANDs in the test of the remaining L-K low bits
-// (shared by rules with the same idA). Only active with --if-group-lower-limit >= 0;
-// overrides --if-group-count/--if-group-size when > 0.
+// (shared by rules with the same idA). Giving it turns grouping on (see
+// effIfGroupLowerLimit); overrides --if-group-count/--if-group-size when > 0.
 static cl::opt<unsigned> IfTestSignificantBits(
     "if-test-significant-bits",
     cl::desc("Grouped kernels: group rules by the K bits of idA starting at its highest 1 bit; "
@@ -135,6 +139,17 @@ static cl::opt<unsigned> EmbeddedIfBits(
     cl::desc("With --if-test-significant-bits: nest each rule in an inner if testing the "
              "remaining idA bits plus low idB bits, E bits in all. 0 = off (default)."),
     cl::init(0));
+
+// Effective --if-group-lower-limit: when left at its default (-1 = off) but a grouping
+// option is given on the command line, grouping is evidently wanted, so apply it to every
+// kernel (0) rather than silently ignoring that option.
+static int effIfGroupLowerLimit() {
+    if (IfGroupLowerLimit.getNumOccurrences() == 0 && IfGroupLowerLimit < 0
+            && (IfGroupSize.getNumOccurrences() > 0 || IfGroupCount.getNumOccurrences() > 0
+                || IfTestSignificantBits.getNumOccurrences() > 0))
+        return 0;
+    return IfGroupLowerLimit;
+}
 
 // Effective grouped-if chunk size for a kernel with n rules. Fixed --if-group-size wins
 // when set (!= 1); otherwise derive from --if-group-count (n/count). Used by BOTH the
@@ -1442,7 +1457,8 @@ BPEPassResult buildBPEPassPipeline(
         // grouped-if path now skips just the chain-involved rules and emits them
         // its chain roots' nests inside its chunk gates (see isChainRule / emitChain in
         // BPEMergeKernel::generatePabloMethod).
-        bool grouped = (IfGroupLowerLimit >= 0) && ((long) i >= (long) IfGroupLowerLimit);
+        const int groupLowerLimit = effIfGroupLowerLimit();
+        bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
         P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
                                            g, hashRuleSet(g.rules), g.maxLen, grouped);
         source     = sOut;

@@ -18,6 +18,8 @@
 #include <boost/interprocess/mapped_region.hpp>
 #include <thread>
 #include <cstdlib>
+#include <map>
+#include <set>
 
 #if defined(PARABIX_ARM_TARGET)
 #include <llvm/TargetParser/AArch64TargetParser.h>
@@ -512,6 +514,36 @@ static inline void gentlyHideUnrelatedOptions(ArrayRef<const cl::OptionCategory 
     }
 }
 
+// Since LLVM 15, cl::opt no longer rejects a repeated single-value option: cl::Optional
+// and cl::Required only enforce a minimum, and the last occurrence silently wins. Restore
+// the error for every option declared to occur at most once (cl::Optional or cl::Required,
+// the cl::opt default), after parsing. cl::list and options explicitly declared
+// cl::ZeroOrMore/cl::OneOrMore may still repeat. Options named in TEST_FLAGS
+// (testFlagArgs) are exempt, since TEST_FLAGS exists to override a test's own flags.
+static void reportRepeatedOptions(const std::vector<std::string> & testFlagArgs) {
+    std::set<std::string> testFlagNames;
+    for (const auto & arg : testFlagArgs) {
+        StringRef name(arg);
+        if (!name.consume_front("-")) continue;
+        name.consume_front("-");
+        testFlagNames.insert(name.take_until([](char c) { return c == '='; }).str());
+    }
+    std::map<std::string, cl::Option *> repeated;   // sorted by name for stable output
+    for (auto & entry : cl::getRegisteredOptions()) {
+        cl::Option * const O = entry.second;
+        const auto flag = O->getNumOccurrencesFlag();
+        if ((flag == cl::Optional || flag == cl::Required) && O->getNumOccurrences() > 1
+                && testFlagNames.count(entry.first().str()) == 0) {
+            repeated.emplace(entry.first().str(), O);
+        }
+    }
+    if (LLVM_LIKELY(repeated.empty())) return;
+    for (auto & [name, O] : repeated) {
+        O->error("may only occur zero or one times!", name);
+    }
+    exit(1);
+}
+
 void ParseCommandLineOptions(int argc, const char * const *argv, std::initializer_list<const cl::OptionCategory *> hiding, StringRef overview) {
     AddParabixVersionPrinter();
 
@@ -525,8 +557,8 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     // variable, e.g. `TEST_FLAGS="--use-mcjit" make check` to run the whole test suite
     // under a different backend/setting without editing every test script or
     // CMakeLists.txt COMMAND. Whitespace-separated; appended after argv's own flags, so
-    // an explicit flag on the command line still takes precedence for any option where
-    // cl::opt keeps the first occurrence. A no-op when unset, which is the overwhelming
+    // for a single-value option the TEST_FLAGS value overrides the command line's (the
+    // last occurrence wins; see reportRepeatedOptions). A no-op when unset, which is the overwhelming
     // majority of invocations, including every normal (non-test) run of any of these
     // programs -- quoted values containing spaces are not supported, matching the same
     // naive whitespace-splitting convention as CFLAGS/CXXFLAGS-style environment variables
@@ -543,6 +575,7 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     }
 
     cl::ParseCommandLineOptions((int)expandedArgv.size(), expandedArgv.data(), overview);
+    reportRepeatedOptions(extraArgStorage);
     if(BlockSize == 0) {
         BlockSize = DefaultBlockSizeForFeatures(MapFeatureNames(GetFeatureNames()));
     }

@@ -531,10 +531,17 @@ static void reportRepeatedOptions(const std::vector<std::string> & testFlagArgs)
     std::map<std::string, cl::Option *> repeated;   // sorted by name for stable output
     for (auto & entry : cl::getRegisteredOptions()) {
         cl::Option * const O = entry.second;
+        // getRegisteredOptions() returns a DenseMap from LLVM 22 (key in .first), and a
+        // StringMap before that (key via first()).
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(22, 0, 0)
+        const std::string name = entry.first.str();
+        #else
+        const std::string name = entry.first().str();
+        #endif
         const auto flag = O->getNumOccurrencesFlag();
         if ((flag == cl::Optional || flag == cl::Required) && O->getNumOccurrences() > 1
-                && testFlagNames.count(entry.first().str()) == 0) {
-            repeated.emplace(entry.first().str(), O);
+                && testFlagNames.count(name) == 0) {
+            repeated.emplace(name, O);
         }
     }
     if (LLVM_LIKELY(repeated.empty())) return;

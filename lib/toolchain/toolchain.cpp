@@ -306,11 +306,12 @@ static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""
 
 // The custom allocator keeps persistent, long-lived exec/data slab pools rather than
 // allocating a small dedicated region per compiled object as LLVM's default in-process
-// memory manager does. That's a deliberate linking-speed optimization, but under LLVM 21
-// it can place exec and data content too far apart for Mach-O compact-unwind info's
-// 32-bit deltas, so it defaults to off there; LLVM < 21 is unaffected and defaults to on.
+// memory manager does. That's a deliberate linking-speed optimization, but from LLVM 20,
+// where JITLink began emitting Mach-O compact-unwind info, it can place exec and data
+// content too far apart for that info's 32-bit deltas, so it defaults to off there;
+// LLVM < 20 is unaffected and defaults to on.
 static cl::opt<bool, true> UseCustomJITMemoryManagerOption("use-custom-jit-memory-manager", cl::location(UseCustomJITMemoryManager),
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(20, 0, 0)
     cl::init(false),
     #else
     cl::init(true),

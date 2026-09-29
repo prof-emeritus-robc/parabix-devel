@@ -1269,7 +1269,7 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
                                   mDriver.mObjectCache.get());
 
     // Our custom CPUDriverJITMemoryManager's persistent exec/data slab pools are a
-    // linking-speed optimization, but under LLVM 21 they can trigger "__TEXT,__unwind_info,
+    // linking-speed optimization, but from LLVM 20 they can trigger "__TEXT,__unwind_info,
     // delta to end of functions ... exceeds 32 bits" JIT session errors from JITLink's
     // Mach-O/arm64 compact-unwind handling (confirmed specific to our allocator; LLVM's own
     // InProcessMemoryManager, which allocates a small dedicated region per object rather

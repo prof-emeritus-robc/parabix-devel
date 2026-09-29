@@ -26,6 +26,7 @@ bool isNullable(const RE * re) {
                 return true;
             }
         }
+        return false;
     } else if (const Rep* re_rep = dyn_cast<const Rep>(re)) {
         return (re_rep->getLB() == 0) || isNullable(re_rep->getRE());
     } else if (isa<Diff>(re)) {
@@ -36,8 +37,11 @@ bool isNullable(const RE * re) {
         return isNullable(e->getLH()) && isNullable(e->getRH());
     } else if (const Group * g = dyn_cast<const Group>(re)) {
         return isNullable(g->getRE());
+    } else if (isa<Any, Assertion, CC, Range, End, Name, PropertyExpression,
+                   Capture, Reference, Start, Permute, Interleavable>(re)) {
+        return false;
     }
-    return false;
+    UnexpectedRE("isNullable", re);
 }
 
 } // namespace re

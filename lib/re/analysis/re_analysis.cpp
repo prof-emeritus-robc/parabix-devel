@@ -138,8 +138,10 @@ std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexAlph
         return getLengthRange(c->getCapturedRE(), indexAlphabet);
     } else if (const Reference * r = dyn_cast<Reference>(re)) {
         return getLengthRange(r->getCapture(), indexAlphabet);
+    } else if (isa<Range, Group>(re)) {
+        return std::make_pair(0, INT_MAX);
     }
-    return std::make_pair(0, INT_MAX);
+    UnexpectedRE("getLengthRange", re);
 }
 
 struct LookaheadLengthInspector : public RE_Inspector {
@@ -280,8 +282,10 @@ int minMatchLength(const RE * re) {
         return minMatchLength(c->getCapturedRE());
     } else if (const Reference * r = dyn_cast<Reference>(re)) {
         return minMatchLength(r->getCapture());
+    } else if (isa<Start, End, Range, PropertyExpression, Group, Permute, Interleavable>(re)) {
+        return 0;
     }
-    return 0; // otherwise
+    UnexpectedRE("minMatchLength", re);
 }
 
 
@@ -402,6 +406,9 @@ void ByteTestComplexity::gatherTests(RE * re) {
         gatherTests(e->getRH());
     } else if (const Group * g = dyn_cast<Group>(re)) {
         gatherTests(g->getRE());
+    } else if (!isa<Any, Start, End, Range, PropertyExpression, Capture,
+                    Reference, Permute, Interleavable>(re)) {
+        UnexpectedRE("ByteTestComplexity::gatherTests", re);
     }
 }
 
@@ -431,8 +438,11 @@ bool hasEndAnchor(const RE * re) {
         return hasEndAnchor(e->getLH()) && hasEndAnchor(e->getRH());
     } else if (isa<End>(re)) {
         return true;
+    } else if (isa<Any, Assertion, CC, Name, PropertyExpression, Capture, Reference,
+                   Group, Start, Range, Permute, Interleavable>(re)) {
+        return false;
     }
-    return false; // otherwise
+    UnexpectedRE("hasEndAnchor", re);
 }
 
 class EndFreeValidator : public RE_Validator {
@@ -494,8 +504,10 @@ unsigned grepOffset(const RE * re) {
         return grepOffset(n->getDefinition());
     } else if (const Capture * c = dyn_cast<Capture>(re)) {
         return grepOffset(c->getCapturedRE());
+    } else if (isa<Range, Reference, Permute, Interleavable>(re)) {
+        return 0;
     }
-    return 0; // otherwise
+    UnexpectedRE("grepOffset", re);
 }
 
 }

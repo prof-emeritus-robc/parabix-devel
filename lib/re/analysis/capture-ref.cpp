@@ -72,6 +72,8 @@ void updateReferenceInfo(RE * re, CapturePostfixMap & cm, ReferenceInfo & info) 
         if (defn && isa<Reference>(defn)) {
             update1reference(cast<Reference>(defn), cm, info);
         }
+    } else if (!isa<Any, CC, Range, End, Name, Group, Start, Permute, Interleavable>(re)) {
+        UnexpectedRE("updateReferenceInfo", re);
     }
 }
 

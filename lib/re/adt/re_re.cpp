@@ -42,12 +42,44 @@ bool matchesEmptyString(const RE * re) {
         return matchesEmptyString(n->getDefinition());
     } else if (const Capture * c = dyn_cast<Capture>(re)) {
         return matchesEmptyString(c->getCapturedRE());
+    } else if (isa<Range, PropertyExpression, Reference, Permute, Interleavable>(re)) {
+        return false;
     }
-    return false; // otherwise
+    UnexpectedRE("matchesEmptyString", re);
 }
 
 [[noreturn]] void UnsupportedRE(const std::string & errmsg) {
     llvm::report_fatal_error(llvm::StringRef(errmsg));
+}
+
+const char * getClassTypeName(RE::ClassTypeId t) {
+    using T = RE::ClassTypeId;
+    // No default: -Wswitch flags any RE type missing here.
+    switch (t) {
+        case T::Alt: return "Alt";
+        case T::Any: return "Any";
+        case T::Assertion: return "Assertion";
+        case T::CC: return "CC";
+        case T::Range: return "Range";
+        case T::Diff: return "Diff";
+        case T::End: return "End";
+        case T::Intersect: return "Intersect";
+        case T::Name: return "Name";
+        case T::PropertyExpression: return "PropertyExpression";
+        case T::Capture: return "Capture";
+        case T::Reference: return "Reference";
+        case T::Group: return "Group";
+        case T::Rep: return "Rep";
+        case T::Seq: return "Seq";
+        case T::Start: return "Start";
+        case T::Permute: return "Permute";
+        case T::Interleavable: return "Interleavable";
+    }
+    llvm_unreachable("Unknown RE type");
+}
+
+[[noreturn]] void UnexpectedRE(const char * routine, const RE * re) {
+    UnsupportedRE(std::string(routine) + ": unexpected RE type " + getClassTypeName(re->getClassTypeId()));
 }
 
 }

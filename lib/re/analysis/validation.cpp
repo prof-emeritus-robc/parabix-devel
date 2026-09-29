@@ -44,9 +44,10 @@ case T::Type: return validate##Type(llvm::cast<Type>(re)); break
             VALIDATE(Permute);
             VALIDATE(Interleavable);
             VALIDATE(PropertyExpression);
-        default: llvm_unreachable("Unknown RE type");
+        // No default: -Wswitch flags any RE type missing here.
     }
 #undef VALIDATE
+    llvm_unreachable("Unknown RE type");
 }
 
 bool RE_Validator::validateName(const Name * nm) {

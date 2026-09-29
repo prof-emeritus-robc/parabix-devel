@@ -118,8 +118,11 @@ const CC * matchableCodepoints(const RE * re) {
         return makeCC(0, 0x10FFFF);
     } else if (const Name * n = dyn_cast<Name>(re)) {
         return matchableCodepoints(n->getDefinition());
+    } else if (isa<Start, End, Assertion, Range, PropertyExpression, Capture,
+                   Reference, Group, Permute, Interleavable>(re)) {
+        return makeCC();
     }
-    return makeCC(); // otherwise = Start, End, Assertion
+    UnexpectedRE("matchableCodepoints", re);
 }
 
 }

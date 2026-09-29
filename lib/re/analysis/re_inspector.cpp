@@ -42,7 +42,7 @@ void RE_Inspector::inspect(RE * const re) {
         INSPECT(Permute);
         INSPECT(Interleavable);
         INSPECT(PropertyExpression);
-        default: llvm_unreachable("Unknown RE type");
+        // No default: -Wswitch flags any RE type missing here.
     }
     #undef INSPECT
 }

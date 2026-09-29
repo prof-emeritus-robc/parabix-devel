@@ -238,10 +238,9 @@ static bool compare(const RE * const lh, const RE * const rh) {
             return lessThan(cast<Interleavable>(lh), cast<Interleavable>(rh));
         case Type::PropertyExpression:
             return lessThan(cast<PropertyExpression>(lh), cast<PropertyExpression>(rh));
-        default:
-            llvm_unreachable("RE object of unknown type given to Memoizer");
-            return false;
+        // No default: -Wswitch flags any RE type missing here.
     }
+    llvm_unreachable("RE object of unknown type given to Memoizer");
 }
 
 bool MemoizerComparator::operator()(const RE * const lh, const RE * const rh) const {

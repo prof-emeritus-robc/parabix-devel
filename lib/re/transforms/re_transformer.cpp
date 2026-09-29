@@ -59,7 +59,7 @@ case T::Type: to = transform##Type(llvm::cast<Type>(from)); break
         TRANSFORM(Permute);
         TRANSFORM(Interleavable);
         TRANSFORM(PropertyExpression);
-        default: llvm_unreachable("Unknown RE type");
+        // No default: -Wswitch flags any RE type missing here.
     }
     #undef TRANSFORM
     assert (to);

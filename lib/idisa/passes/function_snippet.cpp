@@ -799,28 +799,22 @@ inline void FunctionSnippetTokenReplacerPass::serializeToCache(Function &F, Mach
     for (const auto & LI : MRI.liveins()) {
         Register reg = LI.second; assert (reg.isVirtual());
 
-        for (;;) {
-            const MachineInstr * const def = MRI.getVRegDef(reg);
-            skipped.insert(def);
+//        for (;;) {
+//            const MachineInstr * const def = MRI.getVRegDef(reg);
+//            skipped.insert(def);
 
-            auto useItr = MRI.use_instr_begin(reg);
-            if (std::next(useItr) != MRI.use_instr_end()) {
-                break;
-            }
+//            auto useItr = MRI.use_instr_begin(reg);
+//            if (std::next(useItr) != MRI.use_instr_end()) {
+//                break;
+//            }
 
-            const MachineInstr & next = *useItr;
-            if (!next.isCopyLike() && !next.isMoveReg()) {
-               break;
-            }
+//            const MachineInstr & next = *useItr;
+//            if (!next.isCopyLike() && !next.isMoveReg()) {
+//               break;
+//            }
 
-            reg = next
-
-
-
-        }
-
-
-
+//            reg = next.getOperand(1).getReg();
+//        }
 
         const TargetRegisterClass * c = MRI.getRegClass(reg);
         auto v = newMRI.createVirtualRegister(c);

@@ -28,7 +28,6 @@ class Alphabet : public SlabAllocatedObject {
 public:
     USE_SLAB_ALLOCATED_OBJECT_MEMORY_OPERATORS
     const std::string & getName() const { return mAlphabetName;}
-    const std::string & getCode() const { return mCode;}
     virtual const unsigned getSize() const = 0;
     enum class ClassTypeId : unsigned {UnicodeMappableAlphabet, CodeUnitAlphabet, MultiplexedAlphabet};
     inline ClassTypeId getClassTypeId() const {
@@ -68,7 +67,6 @@ public:
     UCD::codepoint_t toUnicode(const unsigned n) const;
     
     //  The ordinal position of the character whose Unicode codepoint value is ucp.
-    unsigned fromUnicode(const UCD::codepoint_t ucp) const;
 
     const unsigned getCommon() const {return mUnicodeCommon;}
     const unsigned getSize() const override {return mUnicodeCommon + mAboveCommon.size();}
@@ -97,8 +95,6 @@ private:
 const extern UnicodeMappableAlphabet Unicode; // Unicode("Unicode", "U", UCD::UNICODE_MAX, {})
 
 const extern UnicodeMappableAlphabet ASCII;  // ASCII("ASCII", "A", 0x7F, {});
-
-const extern UnicodeMappableAlphabet ISO_Latin1; // ISO_Latin1("ISO_Latin1", "l1", 0xFF, {});
 
 const extern CodeUnitAlphabet Byte; // Byte("Byte", "x8", 8);
     

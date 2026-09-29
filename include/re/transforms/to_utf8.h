@@ -13,9 +13,6 @@ namespace re {class CC;}
 namespace re {
 
 class EncodingTransformer : public RE_Transformer {
-public:
-    const cc::Alphabet * getIndexingAlphabet() const {return mIndexingAlphabet;}
-    const cc::Alphabet * getEncodingAlphabet() const {return mEncodingAlphabet;}
 protected:
     EncodingTransformer(std::string transformationName,
                         const cc::Alphabet * indexingAlphabet,

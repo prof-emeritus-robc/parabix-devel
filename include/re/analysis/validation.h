@@ -18,9 +18,6 @@ bool validateNamesDefined(const RE * r);
 /* Check that all CCs within an RE have the given Alphabet */
 bool validateAlphabet(const cc::Alphabet * a, const RE * r);
 
-/* Check that the RE is free of zero-width assertions */
-bool validateAssertionFree(const RE * r);
-
 /* A generic visitor for validation tasks.   The generic routines
    traverse the AST attempting validation at each RE node, returning
    false immediately if the validation fails anywhere.   By default,

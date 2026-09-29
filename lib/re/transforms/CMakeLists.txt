@@ -7,11 +7,8 @@ parabix_add_module(
 NAME
     re.transforms
 SRC
-    assertion_transformations.cpp
-    exclude_CC.cpp
     name_intro.cpp
     name_lookaheads.cpp
-    re_contextual_simplification.cpp
     re_minimizer.cpp
     re_multiplex.cpp
     re_reverse.cpp
@@ -21,7 +18,6 @@ SRC
     re_transformer.cpp
     reference_transform.cpp
     remove_nullable.cpp
-    replaceCC.cpp
     resolve_diffs.cpp
     to_utf8.cpp
     expand_permutes.cpp

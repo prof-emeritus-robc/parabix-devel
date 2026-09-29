@@ -19,9 +19,4 @@ CC_Set collectCCs(RE * const re, const cc::Alphabet & a,
                   re::NameProcessingMode m = re::NameProcessingMode::None);
 
 
-using Alphabet_Set = std::set<const cc::Alphabet *>;
-
-void collectAlphabets(RE * const re, Alphabet_Set & s,
-                      re::NameProcessingMode m = re::NameProcessingMode::None);
-
 }

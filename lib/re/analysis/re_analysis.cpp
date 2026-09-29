@@ -19,52 +19,6 @@ using namespace llvm;
 
 namespace re {
 
-bool isUnicodeUnitLength(const RE * re) {
-    if (const Alt * alt = dyn_cast<Alt>(re)) {
-        for (const RE * re : *alt) {
-            if (!isUnicodeUnitLength(re)) {
-                return false;
-            }
-        }
-        return true;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        bool unitLengthSeen = false;
-        for (const RE * e : *seq) {
-            if (isa<Assertion>(e)) continue;
-            else if (unitLengthSeen) return false;
-            else if (isUnicodeUnitLength(e)) unitLengthSeen = true;
-            else return false;
-        }
-        return unitLengthSeen;
-    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
-        return (rep->getLB() == 1) && (rep->getUB() == 1) && isUnicodeUnitLength(rep->getRE());
-    } else if (isa<Assertion>(re)) {
-        return false;
-    } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return isUnicodeUnitLength(diff->getLH()) && isUnicodeUnitLength(diff->getRH());
-    } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
-        return isUnicodeUnitLength(e->getLH()) && isUnicodeUnitLength(e->getRH());
-    } else if (isa<Any>(re)) {
-        return true;
-    } else if (const CC * cc = dyn_cast<CC>(re)) {
-        return !(cc->empty());
-    } else if (const Name * n = dyn_cast<Name>(re)) {
-        RE * defn = n->getDefinition();
-        if (defn) return isUnicodeUnitLength(defn);
-        return false;
-    } else if (const Capture * c = dyn_cast<Capture>(re)) {
-        return isUnicodeUnitLength(c->getCapturedRE());
-    } else if (const Reference * r = dyn_cast<Reference>(re)) {
-        return isUnicodeUnitLength(r->getCapture());
-    } else if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(re)) {
-        if (pe->getKind() == PropertyExpression::Kind::Boundary) {
-            return false;
-        }
-        return true;
-    }
-    return false; // otherwise
-}
-
 std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexAlphabet) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         std::pair<int, int> range = std::make_pair(INT_MAX, 0);
@@ -293,33 +247,6 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r) {
     return std::make_pair(makeSeq(), r);
 }
 
-bool isFixedLength(const RE * re) {
-    if (isa<Alt>(re)) {
-        auto range = getLengthRange(re, &cc::Unicode);
-        return range.first == range.second;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        for (const RE * e : *seq) {
-            if (!isFixedLength(e)) return false;
-        }
-        return true;
-    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
-        return (rep->getLB() == rep->getUB()) && isFixedLength(rep->getRE());
-    } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return isFixedLength(diff->getLH());
-    } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
-        return isFixedLength(e->getLH()) || isFixedLength(e->getRH());
-    } else if (const Group * g = dyn_cast<Group>(re)) {
-        return isFixedLength(g->getRE());
-    } else if (const Name * n = dyn_cast<Name>(re)) {
-        return isFixedLength(n->getDefinition());
-    } else if (const Capture * c = dyn_cast<Capture>(re)) {
-        return isFixedLength(c->getCapturedRE());
-    } else if (const Reference * r = dyn_cast<Reference>(re)) {
-        return isFixedLength(r->getCapture());
-    }
-    return true; // otherwise = CC, Any, Start, End, Range, Assertion
-}
-
 
 int minMatchLength(const RE * re) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
@@ -357,40 +284,6 @@ int minMatchLength(const RE * re) {
     return 0; // otherwise
 }
 
-
-//Cases that not include bounded repetition, assertion, start and end type can suit for local language compile pipeline.
-bool isTypeForLocal(const RE * re) {
-    if (const Name * n = dyn_cast<Name>(re)) {
-        return isTypeForLocal(n->getDefinition());
-    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
-        for (const RE * re : *alt) {
-            if (!isTypeForLocal(re)) {
-                return false;
-            }
-        }
-        return true;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        if (seq->empty()) return false;
-        for (const RE * re : *seq) {
-            if (!isTypeForLocal(re)) {
-                return false;
-            }
-        }
-        return true;
-    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
-        if (rep->getLB() != 0 || rep->getUB() != Rep::UNBOUNDED_REP) {
-            return false;
-        }
-        return true;
-    } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return isTypeForLocal(diff->getLH()) && isTypeForLocal(diff->getRH());
-    } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
-        return isTypeForLocal(e->getLH()) && isTypeForLocal(e->getRH());
-    } else if (isa<Start>(re) || isa<End>(re) || isa<Assertion>(re) || isa<Any>(re)) {
-        return false;
-    }
-    return true; // otherwise
-}
 
 struct FixedUTF8Validator : public RE_Validator {
     FixedUTF8Validator() : RE_Validator("FixedUTF8Validator") {}
@@ -438,20 +331,6 @@ bool hasReference(const RE * r) {
     return !ReferenceFree().validateRE(r);
 }
 
-struct CodepointReferenceFree : public RE_Validator {
-    CodepointReferenceFree() : RE_Validator("CodepointReferenceFree") {}
-
-    bool validateReference(const Reference * ref) override {
-        UCD::property_t p = ref->getReferencedProperty();
-        UCD::PropertyObject * propObj = UCD::getPropertyObject(p);
-        return !isa<UCD::CodePointPropertyObject>(propObj);
-    }
-};
-
-bool hasCodepointReference(const RE * r) {
-    return !CodepointReferenceFree().validateRE(r);
-}
-
 struct PropertyReferenceFree : public RE_Validator {
     PropertyReferenceFree() : RE_Validator("PropertyReferenceFree") {}
 
@@ -463,40 +342,6 @@ struct PropertyReferenceFree : public RE_Validator {
 
 bool hasPropertyReference(const RE * r) {
     return !PropertyReferenceFree().validateRE(r);
-}
-
-bool hasAssertion(const RE * re) {
-    if (isa<CC>(re) || isa<Any>(re)) {
-        return false;
-    } else if (const Name * n = dyn_cast<Name>(re)) {
-        return hasAssertion(n->getDefinition());
-    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
-        for (const RE * re : *alt) {
-            if (hasAssertion(re)) return true;
-        }
-        return false;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        for (const RE * re : *seq) {
-            if (hasAssertion(re)) return true;
-        }
-        return false;
-    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
-        return hasAssertion(rep->getRE());
-    } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return hasAssertion(diff->getLH()) || hasAssertion(diff->getRH());
-    } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
-        return hasAssertion(e->getLH()) || hasAssertion(e->getRH());
-    } else if (isa<Start>(re) || isa<End>(re) || isa<Assertion>(re)) {
-        return true;
-    } else if (const Group * g = dyn_cast<Group>(re)) {
-        if ((g->getMode() == Group::Mode::GraphemeMode) && (g->getSense() == Group::Sense::On)) {
-            return true;
-        }
-        else {
-            return hasAssertion(g->getRE());
-        }
-    }
-    else llvm_unreachable("Unknown RE type");
 }
 
 struct ByteTestComplexity {
@@ -568,28 +413,6 @@ bool byteTestsWithinLimit(RE * re, unsigned limit) {
     return btc_object.testCount <= btc_object.testLimit;
 }
 
-bool hasStartAnchor(const RE * re) {
-    if (const Alt * alt = dyn_cast<Alt>(re)) {
-        for (const RE * re : *alt) {
-            if (!hasStartAnchor(re)) {
-                return false;
-            }
-        }
-        return true;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        return (!seq->empty()) && hasStartAnchor(seq->front());
-    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
-        return hasStartAnchor(rep->getRE());
-    } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return hasStartAnchor(diff->getLH());
-    } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
-        return hasStartAnchor(e->getLH()) && hasStartAnchor(e->getRH());
-    } else if (isa<Start>(re)) {
-        return true;
-    }
-    return false; // otherwise
-}
-
 bool hasEndAnchor(const RE * re) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         for (const RE * re : *alt) {
@@ -612,15 +435,6 @@ bool hasEndAnchor(const RE * re) {
     return false; // otherwise
 }
 
-class StartFreeValidator : public RE_Validator {
-public:
-    StartFreeValidator() : RE_Validator("StartFreeValidator", NameProcessingMode::ProcessDefinition) {}
-    bool validateStart(const Start * s) override {return false;}
-};
-
-bool anyStartAnchor(const RE * re) {
-    return !StartFreeValidator().validateRE(re);
-}
 class EndFreeValidator : public RE_Validator {
 public:
     EndFreeValidator() : RE_Validator("EndFreeValidator", NameProcessingMode::ProcessDefinition) {}
@@ -632,69 +446,6 @@ bool anyEndAnchor(const RE * re) {
 }
 
 
-
-//
-//  Back Reference Analysis
-//
-//  The definite-length back-reference implementation strategy requires that
-//  each capture that has a back-reference be fixed in length and that
-//  that each back-reference is a fixed length from its corresponding capture.
-//
-//   In analyzing a sequences of regular expression elements
-//   e_0, e_1, ..., e_i, ..., e_j, ..., e_n
-//   we say that e_j is within fixed-length range of e_i if
-//   for all k: i < k < j, e_k is fixed length.
-//
-
-bool DefiniteLengthBackReferencesOnly(const RE * re) {
-    if (const Alt * alt = dyn_cast<Alt>(re)) {
-        for (const RE * a : *alt) {
-            if (!DefiniteLengthBackReferencesOnly(a)) return false;
-        }
-        return true;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        // As we iterate through sequence elements, we keep track of captures
-        // that are encountered and are still reachable through a series of
-        // fixed length elements back from the current position.  As soon as
-        // a variable length element is encounterd, the list of available_captures
-        // is cleared.
-        //
-        SmallFlatSet<const Capture *, 8> available_captures;
-        for (const RE * e : *seq) {
-            if (const Reference * r = dyn_cast<Reference>(e)) {
-                auto capture = r->getCapture();
-                if (available_captures.count(cast<Capture>(capture)) == 0) {
-                    // Capture is not available.
-                    return false;
-                } else {
-                    continue;
-                }
-            } else if (const Capture * c = dyn_cast<Capture>(e)) {
-                available_captures.emplace(c);
-            }
-            if (!DefiniteLengthBackReferencesOnly(e)) return false;
-            if (!isFixedLength(e)) available_captures.clear();
-        }
-        return true;
-    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
-        return DefiniteLengthBackReferencesOnly(rep->getRE());
-    } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return DefiniteLengthBackReferencesOnly(diff->getLH()) && DefiniteLengthBackReferencesOnly(diff->getRH());
-    } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
-        return DefiniteLengthBackReferencesOnly(e->getLH()) && DefiniteLengthBackReferencesOnly(e->getRH());
-    } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
-        return DefiniteLengthBackReferencesOnly(a->getAsserted());
-    } else if (const Group * g = dyn_cast<Group>(re)) {
-        return DefiniteLengthBackReferencesOnly(g->getRE());
-    } else if (const Name * n = dyn_cast<Name>(re)) {
-        return DefiniteLengthBackReferencesOnly(n->getDefinition());
-    } else if (const Capture * c = dyn_cast<Capture>(re)) {
-        return DefiniteLengthBackReferencesOnly(c->getCapturedRE());
-    } else if (const Reference * r = dyn_cast<Reference>(re)) {
-        return DefiniteLengthBackReferencesOnly(r->getCapture());
-    }
-    return true; // otherwise = CC, Any, Start, End, Range
-}
 
 # define End_Lookahead 1
 unsigned grepOffset(const RE * re) {

@@ -40,22 +40,4 @@ bool isNullable(const RE * re) {
     return false;
 }
 
-struct ZeroWidthValidator : public RE_Validator {
-    ZeroWidthValidator() : RE_Validator() {}
-    bool validateName(const Name * n) override {
-        RE * defn = n->getDefinition();
-        return defn && validate(defn);
-    }
-    bool validateAssertion(const Assertion * a) override {return true;}
-    bool validateAny(const Any *) override {return false;}
-    bool validateCC(const CC *) override {return false;}
-    bool validateRange(const Range *) override {return false;}
-    bool validateDiff(const Diff * d) override {return validate(d->getLH());}
-    bool validateIntersect(const Intersect * x) override {return validate(x->getLH()) || validate(x->getRH());}
-};
-
-bool isZeroWidth(const RE * re) {
-    return ZeroWidthValidator().validateRE(re);
-}
-
 } // namespace re

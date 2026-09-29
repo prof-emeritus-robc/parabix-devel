@@ -16,10 +16,6 @@ Assertion::Kind Assertion::reverseKind(Assertion::Kind k) {
     return k == Assertion::Kind::LookAhead ? Assertion::Kind::LookBehind : Assertion::Kind::LookAhead;
 }
 
-Assertion::Sense Assertion::negateSense(Assertion::Sense s) {
-    return s == Assertion::Sense::Positive ? Assertion::Sense::Negative : Assertion::Sense::Positive;
-}
-
 RE * makeAssertion(RE * asserted, Assertion::Kind k, Assertion::Sense s) {
     if (isEmptySet(asserted)) {
         if (s == Assertion::Sense::Negative) return makeSeq();

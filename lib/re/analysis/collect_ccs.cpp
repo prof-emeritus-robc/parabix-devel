@@ -76,28 +76,6 @@ CC_Set collectCCs(RE * const re, const cc::Alphabet & a, re::NameProcessingMode 
     return ccs;
 }
 
-struct AlphabetCollector final : public RE_Inspector {
-
-    AlphabetCollector(Alphabet_Set & alphabets, re::NameProcessingMode m)
-    : RE_Inspector(m)
-    , mAlphabets(alphabets) {
-
-    }
-
-    void inspectCC(CC * cc) final {
-        mAlphabets.insert(cc->getAlphabet());
-    }
-
-private:
-    Alphabet_Set & mAlphabets;
-};
-
-void collectAlphabets(RE * const re, Alphabet_Set & alphabets,
-                      re::NameProcessingMode m) {
-    AlphabetCollector collector(alphabets, m);
-    collector.inspectRE(re);
-}
-
 
 
 

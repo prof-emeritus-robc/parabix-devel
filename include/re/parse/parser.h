@@ -189,8 +189,6 @@ protected:
 
     virtual RE * extend_item(RE * re);
 
-    RE * parseGraphemeBoundary(RE * re);
-
     virtual std::pair<int, int> parse_range_bound();
 
     unsigned parse_int();
@@ -222,8 +220,6 @@ protected:
     
     RE * makeAtomicGroup(RE * r);
     RE * makeBranchResetGroup(RE * r);
-
-    codepoint_t parse_codepoint();
 
     virtual codepoint_t parse_escaped_codepoint();
 

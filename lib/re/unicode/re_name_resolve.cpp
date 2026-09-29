@@ -44,21 +44,4 @@ RE * resolveEscapeNames(RE * re, NameStandard c) {
 }
     
 
-class AnchorResolution : public RE_Transformer {
-public:
-    AnchorResolution(RE * anchorRE) : RE_Transformer("Anchor Resolution"), mAnchorRE(anchorRE) {}
-    RE * transformStart(Start * s) override {
-        return makeAlt({s, makeLookBehindAssertion(mAnchorRE)});
-    }
-    RE * transformEnd(End * s) override{
-        return makeAlt({s, makeLookAheadAssertion(mAnchorRE)});
-    }
-private:
-    RE * mAnchorRE;
-};
-
-RE * resolveAnchors(RE * r, RE * breakRE, NameTransformationMode m) {
-    return AnchorResolution(breakRE).transformRE(r, m);
-}
-
 }

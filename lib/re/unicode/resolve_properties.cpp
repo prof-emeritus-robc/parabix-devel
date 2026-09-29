@@ -270,83 +270,6 @@ RE * inlineSimpleProperties(RE * r) {
     return SimplePropertyInliner().transformRE(r);
 }
 
-using PropertySet = std::set<UCD::property_t>;
-struct EnumBasisRequiredCollector : public RE_Inspector {
-    EnumBasisRequiredCollector(PropertySet & enums) : RE_Inspector(),
-    mEnumSet(enums) {}
-
-    void inspectPropertyExpression(PropertyExpression * pe) {
-        auto id = static_cast<UCD::property_t>(pe->getPropertyCode());
-        PropertyObject * propObj = getPropertyObject(id);
-        if (isa<EnumeratedPropertyObject>(propObj)) {
-            if (pe->getKind() == PropertyExpression::Kind::Boundary) {
-                mEnumSet.insert(id);
-            }
-            RE * defn = pe->getResolvedRE();
-            if (defn && isa<Reference>(defn)) {
-                mEnumSet.insert(id);
-            }
-        }
-    }
-    PropertySet & mEnumSet;
-};
-
-PropertySet propertiesRequiringBasisSet(RE * r) {
-    PropertySet ps;
-    EnumBasisRequiredCollector(ps).inspectRE(r);
-    return ps;
-}
-
-using PropertyAlphabetMap = std::map<UCD::property_t, cc::Alphabet *>;
-
-struct EnumeratedPropertyMultiplexer : public RE_Transformer {
-    EnumeratedPropertyMultiplexer(PropertyAlphabetMap & propertiesToMultiplex)
-        : RE_Transformer("EnumeratedPropertyMultiplexer"), mPropertiesToMultiplex(propertiesToMultiplex) {}
-    RE * transformPropertyExpression (PropertyExpression * exp) override {
-        auto id = static_cast<UCD::property_t>(exp->getPropertyCode());
-        auto f = mPropertiesToMultiplex.find(id);
-        if (f == mPropertiesToMultiplex.end()) return exp;
-        cc::Alphabet * enumAlphabet = f->second;
-        PropertyExpression::Operator op = exp->getOperator();
-        std::string val_str = exp->getValueString();
-        PropertyObject * propObj = getPropertyObject(id);
-        if (auto * obj = dyn_cast<EnumeratedPropertyObject>(propObj)) {
-            std::string propName = getPropertyFullName(id);
-            int val_code = obj->GetPropertyValueEnumCode(val_str);
-            if (val_code < 0) return exp;  // TODO: deal with recursive regexp
-            re::CC * enumCC = makeCC(enumAlphabet);
-            if (op == PropertyExpression::Operator::Eq) {
-                enumCC->insert(val_code);
-            } else if (op == PropertyExpression::Operator::NEq) {
-                for (int i = 0; i < obj->GetEnumCount(); i++) {
-                    if (i != val_code) enumCC->insert(i);
-                }
-            }
-            return enumCC;
-        }
-        return exp;
-    }
-private:
-    PropertyAlphabetMap mPropertiesToMultiplex;
-};
-
-RE * enumeratedPropertiesToCCs(PropertySet propertyCodes, RE * r) {
-    PropertyAlphabetMap propertyMap;
-    for (auto c : propertyCodes) {
-        PropertyObject * propObj = getPropertyObject(c);
-        if (auto * obj = dyn_cast<EnumeratedPropertyObject>(propObj)) {
-            std::string alphabetName = "UCD:" + getPropertyFullName(c);
-            auto enumCount = obj->GetEnumCount();
-            std::vector<CC *> enumCCs;
-            for (int i = 0; i < enumCount; i++) {
-                enumCCs.push_back(re::makeCC(obj->GetCodepointSet(i)));
-            }
-            propertyMap.emplace(c, cc::makeMultiplexedAlphabet(alphabetName, enumCCs));
-        }
-    }
-    return EnumeratedPropertyMultiplexer(propertyMap).transformRE(r);
-}
-
 PropertyExternalizer::PropertyExternalizer() :
     NameIntroduction("PropertyExternalizer") {}
 
@@ -368,19 +291,6 @@ RE * PropertyExternalizer::transformPropertyExpression (PropertyExpression * exp
 
 RE * externalizeProperties(RE * r) {
     return PropertyExternalizer().transformRE(r);
-}
-
-struct AnyExternalizer : public RE_Transformer {
-    AnyExternalizer() : RE_Transformer("AnyExternalizer") {}
-    RE * transformAny(re::Any * a) override {
-        Name * externName = makeName("u8index");
-        externName->setDefinition(a);
-        return externName;
-    }
-};
-
-RE * externalizeAnyNodes(RE * r) {
-    return AnyExternalizer().transformRE(r);
 }
 
 RE * linkAndResolve(RE * r, GrepLinesFunctionType grep) {

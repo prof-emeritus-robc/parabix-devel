@@ -14,7 +14,6 @@
 #include <re/alphabet/multiplex_CCs.h>
 #include <re/cc/cc_compiler.h>
 #include <re/analysis/re_analysis.h>
-#include <re/analysis/re_local.h>
 #include <re/analysis/cc_sequence_search.h>
 #include <re/transforms/name_lookaheads.h>
 #include <re/toolchain/toolchain.h>

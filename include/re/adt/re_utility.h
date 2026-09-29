@@ -15,6 +15,5 @@ RE * makeWordBoundary();
 RE * makeWordNonBoundary();
 RE * makeWordBegin();
 RE * makeWordEnd();
-RE * makeUnicodeBreak();
 
 }

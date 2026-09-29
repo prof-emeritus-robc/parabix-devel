@@ -21,7 +21,6 @@ public:
     Assertion::Sense getSense() const {return mSense;}
     
     static Assertion::Kind reverseKind(Assertion::Kind k);
-    static Assertion::Sense negateSense(Assertion::Sense s);
     static Assertion * Create(RE * asserted, Kind k, Sense s) {
         return new Assertion(asserted, k, s);
     }

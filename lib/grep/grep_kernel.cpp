@@ -24,7 +24,6 @@
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/to_utf8.h>
 #include <re/analysis/collect_ccs.h>
-#include <re/transforms/exclude_CC.h>
 #include <re/transforms/re_multiplex.h>
 #include <kernel/basis/s2p_kernel.h>
 #include <kernel/re/regexp_kernel.h>

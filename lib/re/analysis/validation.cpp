@@ -162,20 +162,4 @@ bool validateAlphabet(const cc::Alphabet * a, const RE * r) {
     return AlphabetValidator(a).validateRE(r);
 }
     
-class AssertionFreeValidator : public RE_Validator {
-public:
-    AssertionFreeValidator() : RE_Validator("AssertionFreeValidator") {}
-    
-    bool validateAssertion(const Assertion * a) override {return false;}
-    bool validateStart(const Start * s) override {return false;}
-    bool validateEnd(const End * e) override {return false;}
-    bool validatePropertyExpression(const PropertyExpression * pe) override {
-        return true;
-    }
-};
-
-bool validateAssertionFree(const RE * r) {
-    return AssertionFreeValidator().validateRE(r);
-}
-
 }

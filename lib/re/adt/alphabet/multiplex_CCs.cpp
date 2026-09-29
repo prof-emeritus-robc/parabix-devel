@@ -160,16 +160,6 @@ re::CC * MultiplexedAlphabet::transformCC(const re::CC * sourceCC) const {
     return CC_union;
 }
 
-re::CC * MultiplexedAlphabet::invertCC(const re::CC * transformedCC) const {
-    if (transformedCC->getAlphabet() != this) llvm::report_fatal_error("invertCC applied to non-transformed CC");
-    re::CC * CC_union = re::makeCC(mSourceAlphabet);
-    for (const UCD::interval_t i : *transformedCC) {
-        for (unsigned cp = re::lo_codepoint(i); cp <= re::hi_codepoint(i); cp++) {
-            CC_union = re::makeCC(mUnicodeSets[cp], CC_union);
-        }
-    }
-    return CC_union;
-}
     
 
     

@@ -85,21 +85,25 @@ static cl::opt<bool> GeometricCompaction(
 // (shared Astart EQ) instead of one per rule. Single-level (no nested if → T6).
 // Applied only to kernels with index >= IfGroupLowerLimit — the early kernels
 // fire on almost every block (grouping there saves gates but never skips), so
-// grouping is aimed at the later kernels. -1 = off (per-rule everywhere).
+// grouping is aimed at the later kernels. -1 = off (per-rule everywhere), unless one of
+// --if-group-size/--if-group-count/--if-test-significant-bits is given, which implies 0
+// (see effIfGroupLowerLimit).
 static cl::opt<int> IfGroupLowerLimit(
     "if-group-lower-limit",
     cl::desc("Group merge rules by first id under one createIf, for kernels at/after "
-             "this index (-1 = off)."),
+             "this index (-1 = off; default -1, or 0 when --if-group-size, "
+             "--if-group-count or --if-test-significant-bits is given)."),
     cl::init(-1));
 
 
 // FIXED COUNT: give every kernel exactly K grouped-if gates. Gate SIZE then VARIES per
 // kernel = rules/K (a 900-rule kernel -> 900/K rules per gate, a 10-rule kernel -> 10/K).
-// Same gate structure everywhere, scales with kernel size. Only active with
-// --if-group-lower-limit >= 0. Default 1 = one gate covering all the kernel's rules.
+// Same gate structure everywhere, scales with kernel size. Applies to grouped kernels
+// (giving it turns grouping on; see effIfGroupLowerLimit). Default 1 = one gate covering
+// all the kernel's rules.
 static cl::opt<unsigned> IfGroupCount(
     "if-group-count",
-    cl::desc("Grouped-if gates per kernel (only with --if-group-lower-limit >= 0). "
+    cl::desc("Grouped-if gates per kernel (implies --if-group-lower-limit=0 if unset). "
              "Gate size = rules/count; count scales with kernel. Default 1."),
     cl::init(1));
 
@@ -113,15 +117,39 @@ static cl::opt<unsigned> IfGroupSize(
     cl::init(1));
 
 // HIGH-BIT PREFIX: instead of chunking the idA-sorted rules by size or count, group rules
-// whose idA share the same top K bits (of the kernel's W_out-bit id). The group's gate
-// tests only those K high bits; inside the gate each rule's Astart ANDs in the test of the
-// remaining W_out-K low bits (shared by rules with the same idA). Only active with
-// --if-group-lower-limit >= 0; overrides --if-group-count/--if-group-size when > 0.
+// whose idA share the same K significant bits, counted down from the highest 1 bit of idA
+// (so idA of bit-length L is keyed by bits [L-K, L), and ids with L <= K by their whole
+// value). The group's gate tests those K bits together with the zero bits above them;
+// inside the gate each rule's Astart ANDs in the test of the remaining L-K low bits
+// (shared by rules with the same idA). Giving it turns grouping on (see
+// effIfGroupLowerLimit); overrides --if-group-count/--if-group-size when > 0.
 static cl::opt<unsigned> IfTestSignificantBits(
     "if-test-significant-bits",
-    cl::desc("Grouped kernels: group rules by the top K bits of idA; the if-gate tests those "
-             "K bits and each rule completes its idA test inside the gate. 0 = off (default)."),
+    cl::desc("Grouped kernels: group rules by the K bits of idA starting at its highest 1 bit; "
+             "the if-gate tests those K bits (and the zero bits above them) and each rule "
+             "completes its idA test inside the gate. 0 = off (default)."),
     cl::init(0));
+
+// EMBEDDED IF (with --if-test-significant-bits): inside a group's gate, each idA-idB rule
+// gets its own inner createIf whose condition tests the idA bits the gate left untested
+// plus enough of idB's LOW bits to make E bits in all. The rest of the rule (the high
+// bits of idB, boundary, veto, stamp) is emitted in that inner body. 0 = off (default).
+static cl::opt<unsigned> EmbeddedIfBits(
+    "embedded-if-bits",
+    cl::desc("With --if-test-significant-bits: nest each rule in an inner if testing the "
+             "remaining idA bits plus low idB bits, E bits in all. 0 = off (default)."),
+    cl::init(0));
+
+// Effective --if-group-lower-limit: when left at its default (-1 = off) but a grouping
+// option is given on the command line, grouping is evidently wanted, so apply it to every
+// kernel (0) rather than silently ignoring that option.
+static int effIfGroupLowerLimit() {
+    if (IfGroupLowerLimit.getNumOccurrences() == 0 && IfGroupLowerLimit < 0
+            && (IfGroupSize.getNumOccurrences() > 0 || IfGroupCount.getNumOccurrences() > 0
+                || IfTestSignificantBits.getNumOccurrences() > 0))
+        return 0;
+    return IfGroupLowerLimit;
+}
 
 // Effective grouped-if chunk size for a kernel with n rules. Fixed --if-group-size wins
 // when set (!= 1); otherwise derive from --if-group-count (n/count). Used by BOTH the
@@ -204,6 +232,59 @@ static cl::opt<bool> ChainPartition(
     cl::desc("With --level-partition, let a rule whose idA was stamped by an earlier "
              "same-level rule share that level (dependency chains collapse into one "
              "kernel) instead of taking the next level."),
+    cl::init(false));
+
+// Chain veto (--level-partition): relax the maxLeft/idB seam — "a lower-rank rule
+// already claims my idB as ITS idA" — and pay for it with a runtime test instead of a
+// kernel boundary.
+//
+// Rules A+B->AB (rank 1), C+D->CD (rank 2), AB+C->ABC (rank 3). maxLeft[C] == CD's
+// level forces ABC one level later, because on "ABCD" the lower-rank CD must consume C
+// first and ABC must NOT fire. Instead of the split, ABC checks CD itself: the id one
+// slot PAST the merged token (offset lenA+lenB, i.e. right after C) is read from the
+// FROZEN kernel input and compared against D.
+//     veto     = EQ(LookAhead(src, lenA+lenB), idD)   // ... OR idE, one per competitor
+//     fire_ABC = fire_AB AND hasC AND NOT veto
+// "ABCD" -> veto=1, ABC suppressed, CD fires in the same kernel. "ABCX" -> veto=0, ABC
+// fires. Both match HF.
+//
+// Competitor set is exact and small. Rules are scheduled in rank order, so every
+// lower-rank rule with idA == this rule's idB is already placed when this rule lands:
+//   - competitor at a STRICTLY EARLIER level already stamped its merged id over idB's
+//     slot, so this rule's own B-detect fails on its own — no veto term needed;
+//   - a LATER-level competitor cannot exist, rank order places it first;
+//   - a SAME-level competitor is exactly what this flag creates, and exactly what
+//     vetoIdB lists.
+//
+// Veto recursion is handled by REFUSING the relaxation, never by approximating it. A
+// competitor can itself be beaten (D+E at a lower rank kills C+D, so ABC SHOULD fire —
+// a depth-1 veto would wrongly suppress it). Such a competitor carries a non-empty
+// vetoIdB of its own, so if any candidate is itself vetoed, this rule falls back to the
+// strict level and takes the kernel split.
+//
+// Independent of --chain-partition: the veto reads ONLY the frozen kernel input, never
+// the producer's fire or a live idAcc, so it is emitted identically for a flat sibling
+// rule (emitBody) and a nested chain child (emitChainBody).
+static cl::opt<bool> ChainVeto(
+    "chain-veto",
+    cl::desc("With --level-partition, let a rule share its level with the lower-rank "
+             "rules claiming its idB, suppressing the merge at runtime when such a "
+             "competitor applies, instead of splitting the kernel."),
+    cl::init(false));
+
+// --chain-partition emission shape. Output-identical: Pablo ORs pending carries into
+// every if test (CarryManager::generateEntrySummaryTest), so fusing same-condition ifs,
+// or dropping one whose body is a no-op when its condition is zero, changes nothing.
+static cl::opt<bool> ChainFuseSiblings(
+    "chain-fuse-siblings",
+    cl::desc("With --chain-partition, nest all chain-children of a rule under ONE createIf "
+             "on its fire instead of one createIf per child."),
+    cl::init(false));
+
+static cl::opt<bool> ChainUngateRoots(
+    "chain-ungate-roots",
+    cl::desc("With --chain-partition on grouped kernels, drop a chain root's own createIf "
+             "when the group gate already tests its full idA."),
     cl::init(false));
 
 static cl::opt<bool> LookaheadInGate(
@@ -433,7 +514,13 @@ protected:
 uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
     uint64_t h = 0xCBF29CE484222325ull;
     auto mix = [&](uint64_t x){ h = (h ^ x) * 0x100000001B3ull; };
-    for (const auto & r : rules) { mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenA); mix(r.lenB); }
+    // vetoOff/vetoIdB shape the Pablo body (an extra peek + one EQ per competitor)
+    // without touching any field above, so they must be mixed in too — T7.
+    for (const auto & r : rules) {
+        mix(r.idA); mix(r.idB); mix(r.idAB); mix(r.lenA); mix(r.lenB);
+        mix(r.vetoOff);
+        for (unsigned v : r.vetoIdB) mix(v | 0x8000000000000000ull);
+    }
     return h;
 }
 
@@ -501,6 +588,14 @@ static std::vector<bool> applyCompactionSchedule(
             if (nCompact == 0 && d != r.lenA) firstBlockDisagree++;
             r.lenA = d;
             if (d > maxDist) maxDist = d;
+            // --chain-veto: the probe sits one slot past idB, so its slot-space distance
+            // is slotSpan(idA) + slotSpan(idB) — lenB alone is still a BYTE count here.
+            // It can exceed every lenA in the group, so it must widen maxDist too, or the
+            // LookAhead binding comes up short and the kernel refuses to compile (T5).
+            if (!r.vetoIdB.empty()) {
+                r.vetoOff = d + slotSpan(r.idB);
+                if (r.vetoOff > maxDist) maxDist = r.vetoOff;
+            }
         }
         // Update the maximum length in the current rule range.
         g.maxLen = maxDist;                   // LookAhead binding must cover every lenA
@@ -598,12 +693,16 @@ public:
 
     : PabloKernel(ts, std::string("BPEMerge_") + (nextIdIn ? "x1_" : "") + (boundaryIn ? "b1_" : "")
                         + (grouped ? (IfTestSignificantBits > 0
-                                        ? "sb" + std::to_string(IfTestSignificantBits) + "_"
+                                        ? "sbh" + std::to_string(IfTestSignificantBits) + "_"
+                                          + (EmbeddedIfBits > 0 ? "eb" + std::to_string(EmbeddedIfBits) + "_" : "")
                                         : "g" + std::to_string(effGroupSize(group.rules.size())) + "_") : "")
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
                         + (BatchWriteback ? "bw1_" : "bw0_")
                         + (ChainPartition ? "cp1_" : "cp0_")
+                        + (ChainVeto ? "cv1_" : "cv0_")
+                        + (ChainFuseSiblings ? "fs1_" : "fs0_")
+                        + (ChainUngateRoots ? "ur1_" : "ur0_")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -731,15 +830,34 @@ protected:
         //     grouped-if kernels.
         const bool groupNeedsLiveMask = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
                                                      [](const MergeRule & r) { return r.needsFlush; });
-        // groupNeedsLiveId (--chain-partition): some rule is nested inside its
-        // producer's gate (see emitChain below) — batching's deferred, end-of-kernel
-        // stamp write doesn't compose with that structure, so batching is off
-        // entirely for the whole group, same fallback groupNeedsLiveMask uses for
-        // the mask.
-        const bool groupNeedsLiveId = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
-                                                   [](const MergeRule & r) { return r.needsLiveId; });
-        const bool batch     = BatchWriteback && !mUseNextId && !groupNeedsLiveId;  // defer the id-stamp
-        const bool deferMask = batch && !groupNeedsLiveMask;       // also defer the mask consume
+        // --chain-partition rules (a chain root and every rule nested under it) keep
+        // the EAGER write-back: a parent stamps idAB and its child stamps idABC at the
+        // SAME position, so the child must overwrite the parent, and the batch
+        // accumulators only OR — they cannot express "the later one wins". Batching
+        // stays ON for every OTHER rule in the same kernel, which is safe because the
+        // two never collide:
+        //   - STAMP: a rule fires at its A start, identified by the FROZEN id there.
+        //     A chain position holds the root's idA, and all of a kernel's rules with
+        //     that idA share one lenA and so probe one slot, where at most one idB can
+        //     actually sit — so at most one of them fires. No batched rule ever fires
+        //     where a chain rule does, hence anyFire is 0 there and flushWriteback's
+        //     `idAcc & ~anyFire` preserves the eager chain stamp untouched.
+        //   - MASK: a chain rule consumes at its idB's start. The maxLeft constraint
+        //     forbids any same-kernel rule from having that idB as ITS idA (or, under
+        //     --chain-veto, makes it stand down at runtime), so no batched rule reads
+        //     the position a chain consume clears.
+        //
+        // childrenOf[idAB] = the rules in THIS group whose idA == idAB (i.e. every rule
+        // that should nest inside idAB's own gate — see emitChain below). Empty, so
+        // isChainRule is always false, whenever --chain-partition is off.
+        std::unordered_map<unsigned, std::vector<const MergeRule*>> childrenOf;
+        for (const auto & r : mRuleGroup.rules)
+            if (r.needsLiveId) childrenOf[r.idA].push_back(&r);
+        auto isChainRule = [&](const MergeRule & r) {
+            return r.needsLiveId || childrenOf.count(r.idAB) != 0;
+        };
+        const bool batch     = BatchWriteback && !mUseNextId;  // defer the id-stamp
+        const bool deferMask = batch && !groupNeedsLiveMask;   // also defer the mask consume
         std::vector<Var *> setBit;
         std::map<unsigned, Var *> fireByLen;
         Var * anyFire = nullptr;
@@ -750,7 +868,7 @@ protected:
             anyFire = pb.createVar("anyFire", zeroes);
             if (deferMask)
                 for (const auto & r : mRuleGroup.rules)
-                    if (fireByLen.find(r.lenA) == fireByLen.end())
+                    if (!isChainRule(r) && fireByLen.find(r.lenA) == fireByLen.end())
                         fireByLen.emplace(r.lenA,
                             pb.createVar("fireByLen_" + std::to_string(r.lenA), zeroes));
         }
@@ -778,6 +896,45 @@ protected:
             return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask, "Astart_" + std::to_string(id));
         };
 
+        // --chain-veto: suppress this rule where a lower-rank competitor claims its idB.
+        // Reads the id one slot PAST idB (r.vetoOff) from the frozen kernel input; if it
+        // is that competitor's right part, the competitor applies here, wins on rank, and
+        // this merge must not fire. One peek serves every competitor (all probe the same
+        // slot), one EQ each. Returns `fire` untouched when the rule carries no veto, so
+        // both emission paths call it unconditionally. Reads nothing but the kernel
+        // input, which is why it needs neither nesting nor --chain-partition.
+        auto applyVeto = [&](auto & body, const MergeRule & r, PabloAST * fire) -> PabloAST * {
+            if (r.vetoIdB.empty()) return fire;
+            if (mUseNextId)   // --indexed-shift: no byte-distance LookAhead exists here
+                llvm::report_fatal_error("--chain-veto is incompatible with --indexed-shift");
+            std::vector<PabloAST*> vbits(W);
+            for (unsigned i = 0; i < W; i++)
+                vbits[i] = body.createLookahead(srcBits[i], (int64_t) r.vetoOff);
+            cc::Parabix_CC_Compiler_Builder ccVeto(BixNum(vbits.begin(), vbits.end()));
+            PabloAST * veto = nullptr;
+            for (unsigned vid : r.vetoIdB) {
+                PabloAST * hit = ccVeto.compileCC("veto_" + std::to_string(r.idB) + "_" + std::to_string(vid),
+                                                  re::makeCC(vid), body);
+                veto = veto ? body.createOr(veto, hit) : hit;
+            }
+            // The competitor only wins if it could actually FIRE, and it is subject to
+            // the same pretoken-boundary rule this kernel applies to every merge: a
+            // merge whose right part begins a new pretoken is blocked. The competitor's
+            // right part sits at vetoOff, so a boundary there means the competitor can
+            // never run and must not suppress anything.
+            //
+            // GPT-2's regex splits contractions, which makes this reachable rather than
+            // theoretical: in "al-Mu'minin", "'m" is its own pretoken and "inin" the
+            // next, so the lower-rank competitor m+in straddles the boundary and is
+            // blocked — HF merges '+m. Without this gate the veto killed that merge
+            // (first mismatch at token 2687270 of the 49MB val.txt run).
+            if (mHasBoundary) {
+                PabloAST * bAtVeto = body.createLookahead(boundaryBit, (int64_t) r.vetoOff);
+                veto = body.createAnd(veto, body.createNot(bAtVeto), "vetoLive_" + std::to_string(r.idAB));
+            }
+            return body.createAnd(fire, body.createNot(veto), "vetoed_" + std::to_string(r.idAB));
+        };
+
         // One rule's fire → B-detect + stamp all idAB bits + consume B, all inside `body`
         // (the gated scope, so it's block-skippable). fireStart is supplied by the caller
         // (per-rule Astart) and MUST already be AND-ed with the live mask — eqAstart
@@ -786,12 +943,22 @@ protected:
         // chunk-local cached peeks, deduped per lenA and built inside this gate body.
         auto emitBody = [&](auto & body, const MergeRule & r, PabloAST * fireStart,
                             const std::map<unsigned, BixNum> * grpAhead = nullptr,
-                            const std::map<unsigned, PabloAST*> * grpBoundary = nullptr) {
+                            const std::map<unsigned, PabloAST*> * grpBoundary = nullptr,
+                            const BixNum * bPeek = nullptr, unsigned bLowDone = 0) {
             //indexed mode reads the next-live id, byte mode reads lenA ahead via LookAhead.
             // Peek source precedence: indexed nextId > group-cache > per-rule in-gate > hoisted.
             PabloAST * BstartAtA;
             const std::string bstartName = "Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB);
-            if (mUseNextId) {
+            if (bPeek) {
+                // --embedded-if-bits: the caller's inner-if condition already matched the
+                // low bLowDone bits of idB on bPeek; test only the remaining high bits.
+                if (bLowDone >= bPeek->size()) {
+                    BstartAtA = nullptr;
+                } else {
+                    cc::Parabix_CC_Compiler_Builder ccHiB(BixNum(bPeek->begin() + bLowDone, bPeek->end()));
+                    BstartAtA = ccHiB.compileCC(bstartName, re::makeCC(r.idB >> bLowDone), body);
+                }
+            } else if (mUseNextId) {
                 cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
                 BstartAtA = ccNext.compileCC(bstartName, re::makeCC(r.idB), body);
             } else if (grpAhead) {   // chunk-cached shared peek (built once per lenA in the gate)
@@ -807,13 +974,14 @@ protected:
                 cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
                 BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
             }
-            PabloAST * fire = body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
+            PabloAST * fire = !BstartAtA ? fireStart : body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
                 PabloAST * bAhead = grpBoundary ? grpBoundary->at(r.lenA)
                     : LookaheadInGate ? body.createLookahead(boundaryBit, (int64_t) r.lenA)
                     : boundaryAheadByLen.at(r.lenA);
                 fire = body.createAnd(fire, body.createNot(bAhead));
             }
+            fire = applyVeto(body, r, fire);
 
             // Batched: no stamp in the gate — just OR the fire into the shared
             // accumulators; the id-stamp write is applied once per kernel below (see
@@ -935,14 +1103,8 @@ protected:
         // ONLY, behind this one opt-in flag, specifically to test whether the IR-size
         // cost it warns about is bearable for real merge chains.
         //
-        // childrenOf[idAB] = the rules in THIS group whose idA == idAB (i.e. every
-        // rule that should nest inside idAB's own gate). Empty (all rules go through
-        // the untouched emitRule path below) whenever --chain-partition is off,
-        // since needsLiveId is never set in that case.
-        std::unordered_map<unsigned, std::vector<const MergeRule*>> childrenOf;
-        for (const auto & r : mRuleGroup.rules)
-            if (r.needsLiveId) childrenOf[r.idA].push_back(&r);
-
+        // childrenOf is built above the write-back accumulators — isChainRule needs it.
+        //
         // One rule's B-detect + stamp + consume, built fresh (not shared with
         // emitBody — deliberately isolated). Returns `fire` (Astart AND B-detect) so
         // a nested child can use it as ITS gate condition directly.
@@ -958,6 +1120,7 @@ protected:
                 PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
                 fire = body.createAnd(fire, body.createNot(bAhead));
             }
+            fire = applyVeto(body, r, fire);   // same helper the flat path uses
             PabloAST * notStamp = body.createNot(fire);
             for (unsigned i = 0; i < W_out; i++) {
                 if ((r.idAB >> i) & 1u)
@@ -970,18 +1133,28 @@ protected:
             return fire;
         };
 
-        // Recurse: build r's gate, then nest every one of r's chain-children INSIDE
-        // it (using r's `fire`, not a fresh Astart) before closing r's createIf.
-        std::function<void(PabloBuilder&, const MergeRule&, PabloAST*)> emitChain =
-            [&](PabloBuilder & bld, const MergeRule & r, PabloAST * fireStart) {
-                auto body = bld.createScope();
-                PabloAST * fire = emitChainBody(body, r, fireStart);
-                auto it = childrenOf.find(r.idAB);
-                if (it != childrenOf.end())
-                    for (const MergeRule * child : it->second)
-                        emitChain(body, *child, fire);   // physically nested inside `body`
-                bld.createIf(fireStart, body);
-            };
+        // emitChainInto: r's body straight into `scope` (no gate of its own), then r's
+        // chain-children nested on r's `fire`. emitChain: same, wrapped in createIf(fireStart).
+        std::function<void(PabloBuilder&, const MergeRule&, PabloAST*)> emitChainInto;
+        auto emitChain = [&](PabloBuilder & bld, const MergeRule & r, PabloAST * fireStart) {
+            auto body = bld.createScope();
+            emitChainInto(body, r, fireStart);
+            bld.createIf(fireStart, body);
+        };
+        emitChainInto = [&](PabloBuilder & scope, const MergeRule & r, PabloAST * fireStart) {
+            PabloAST * fire = emitChainBody(scope, r, fireStart);
+            auto it = childrenOf.find(r.idAB);
+            if (it == childrenOf.end()) return;
+            if (ChainFuseSiblings) {
+                auto kids = scope.createScope();
+                for (const MergeRule * child : it->second)
+                    emitChainInto(kids, *child, fire);
+                scope.createIf(fire, kids);
+            } else {
+                for (const MergeRule * child : it->second)
+                    emitChain(scope, *child, fire);   // one createIf per child
+            }
+        };
 
         if (!mGrouped) {
             for (const auto & r : mRuleGroup.rules) {
@@ -1012,28 +1185,46 @@ protected:
             // (T6-safe). Reorder is safe (T4 independence). GROUP_SIZE=5 → N/5 groups.
             //
             // --if-test-significant-bits=K (high-bit prefix): groups are instead the runs of
-            // sorted rules whose idA share the same top K bits. The gate tests only those K
-            // bits; inside the gate each rule's Astart ANDs in the EQ of the remaining low
-            // bits, so the id test is split across the gate and the body rather than paid
-            // in full outside (range gate) and again inside (per-rule EQ).
+            // sorted rules whose idA share the same K significant bits, counted from the
+            // highest 1 bit of idA. For idA of bit-length L, loBits = max(0, L-K) and the
+            // group key is idA >> loBits (which also fixes L, since its top bit is 1). The
+            // gate tests bits [loBits, W_out) against that key (the K significant bits plus
+            // the zero bits above them); inside the gate each rule's Astart ANDs in the EQ
+            // of the low loBits bits, so the id test is split across the gate and the body
+            // rather than paid in full outside (range gate) and again inside (per-rule EQ).
+            // Sorted by idA → equal keys are contiguous (same L, same prefix).
+            //
+            // --chain-partition: only the nested CHILDREN sit out the chunk loop —
+            // emitChain emits each of them physically inside its producer's gate, so
+            // they must not also appear as a chunk rule. Chain ROOTS stay in, and get
+            // their nest built inside the chunk gate (see emitChain call below), so a
+            // chain costs one gate shared with ~14 neighbours instead of a flat if of
+            // its own. Grouping is therefore decided per RULE, not per kernel: the old
+            // per-kernel exclusion sent all ~170 rules of any chain-bearing kernel back
+            // to one createIf each — 94.7% of all rules, measured.
             std::vector<const MergeRule*> sorted;
             sorted.reserve(mRuleGroup.rules.size());
-            for (const auto & r : mRuleGroup.rules) sorted.push_back(&r);
+            for (const auto & r : mRuleGroup.rules)
+                if (!r.needsLiveId) sorted.push_back(&r);
             std::sort(sorted.begin(), sorted.end(),
                       [](const MergeRule* a, const MergeRule* b){ return a->idA < b->idA; });
 
             const unsigned hiBits = std::min<unsigned>(IfTestSignificantBits, W_out);
-            const unsigned loBits = W_out - hiBits;
-            const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
-            const BixNum loFrozen(frozenBits.begin(), frozenBits.begin() + loBits);
+            // Number of low bits of idA below its K significant bits.
+            auto loBitsOf = [&](unsigned idA) -> unsigned {
+                const unsigned L = (idA == 0) ? 0 : 32u - __builtin_clz(idA);
+                return (L > hiBits) ? L - hiBits : 0;
+            };
 
             // [s,e) ranges of `sorted` forming each gate.
             std::vector<std::pair<size_t, size_t>> groups;
             if (hiBits > 0) {
                 for (size_t s = 0; s < sorted.size(); ) {
+                    const unsigned loBits = loBitsOf(sorted[s]->idA);
                     const unsigned prefix = sorted[s]->idA >> loBits;
                     size_t e = s + 1;
-                    while (e < sorted.size() && (sorted[e]->idA >> loBits) == prefix) e++;
+                    while (e < sorted.size() && loBitsOf(sorted[e]->idA) == loBits
+                           && (sorted[e]->idA >> loBits) == prefix) e++;
                     groups.emplace_back(s, e);
                     s = e;
                 }
@@ -1045,10 +1236,18 @@ protected:
 
             for (const auto & [s, e] : groups) {
                 PabloAST * inRange;
+                // Per-group split point (high-bit prefix only): all rules in the group share it.
+                const unsigned loBits = (hiBits > 0) ? loBitsOf(sorted[s]->idA) : 0;
+                // Every rule in the group has the same idA and the gate tests all of it.
+                const bool gatePinsIdA = (hiBits > 0) ? (loBits == 0)
+                                                      : (sorted[s]->idA == sorted[e-1]->idA);
+                const BixNum loFrozen(frozenBits.begin(), frozenBits.begin() + loBits);
                 if (hiBits > 0) {
                     const unsigned prefix = sorted[s]->idA >> loBits;
+                    const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
                     cc::Parabix_CC_Compiler_Builder ccHi(hiFrozen);
-                    inRange = ccHi.compileCC("idHi_" + std::to_string(prefix), re::makeCC(prefix), pb);
+                    inRange = ccHi.compileCC("idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
+                                             re::makeCC(prefix), pb);
                 } else {
                     unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
                     cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
@@ -1093,12 +1292,59 @@ protected:
                     }
                     return body.createAnd(f->second, inPlayMask, "Astart_" + std::to_string(idA));
                 };
+                // --embedded-if-bits=E: the E-bit budget covers the loBits idA bits the
+                // gate left untested, then the lowest bLow = E - loBits bits of idB.
+                const unsigned embedBits = (hiBits > 0) ? EmbeddedIfBits.getValue() : 0;
+                const unsigned bLow = (embedBits > loBits) ? embedBits - loBits : 0;
+                // Peek at the id lenA ahead (B's start), using the same source emitBody
+                // would: indexed nextId > group-cache > per-rule in-gate > hoisted.
+                auto bPeekFor = [&](const MergeRule & r) -> BixNum {
+                    if (mUseNextId) return nextIdBN;
+                    if (grpAhead) return grpAhead->at(r.lenA);
+                    if (LookaheadInGate) {
+                        std::vector<PabloAST*> bits(W);
+                        for (unsigned i = 0; i < W; i++)
+                            bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
+                        return BixNum(bits.begin(), bits.end());
+                    }
+                    return aheadByLenA.at(r.lenA);
+                };
                 for (size_t k = s; k < e; k++) {
                     const MergeRule & r = *sorted[k];
                     PabloAST * fireStart = (hiBits > 0) ? prefixAstart(r.idA) : eqAstart(body, r.idA);
                     if (r.idA == r.idB)
                         fireStart = selfMergeFireStarts(body, fireStart, r.lenA);
-                    emitBody(body, r, fireStart, grpAhead, grpBoundary);
+                    // Chain root: build its own createIf inside THIS chunk gate and nest
+                    // its children in it, instead of emitting flat at the outer scope.
+                    // The root's gate is then doubly guarded (chunk prefix, then its own
+                    // Astart), and a cold chunk skips the whole chain in one test.
+                    // (--embedded-if-bits does not apply: the root's own gate already
+                    // plays the part of its inner if.)
+                    if (childrenOf.count(r.idAB)) {
+                        if (ChainUngateRoots && gatePinsIdA && r.idA != r.idB)
+                            emitChainInto(body, r, fireStart);  // own if would re-test the gate
+                        else
+                            emitChain(body, r, fireStart);
+                        continue;
+                    }
+                    if (embedBits == 0) {
+                        emitBody(body, r, fireStart, grpAhead, grpBoundary);
+                        continue;
+                    }
+                    const BixNum bPeek = bPeekFor(r);
+                    const unsigned bLowUsed = std::min<unsigned>(bLow, bPeek.size());
+                    PabloAST * embedCond = fireStart;
+                    if (bLowUsed > 0) {
+                        const unsigned lowB = r.idB & ((1u << bLowUsed) - 1u);
+                        cc::Parabix_CC_Compiler_Builder ccLoB(BixNum(bPeek.begin(), bPeek.begin() + bLowUsed));
+                        PabloAST * bLoMatch = ccLoB.compileCC(
+                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB), re::makeCC(lowB), body);
+                        embedCond = body.createAnd(fireStart, bLoMatch,
+                            "embed_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
+                    }
+                    auto inner = body.createScope();
+                    emitBody(inner, r, embedCond, grpAhead, grpBoundary, &bPeek, bLowUsed);
+                    body.createIf(embedCond, inner);
                 }
                 pb.createIf(pb.createAnd(inRange, meInFrozen), body);
             }
@@ -1240,13 +1486,12 @@ BPEPassResult buildBPEPassPipeline(
             P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
         }
         // Grouped-if for kernels at/after the lower limit (later kernels); -1 = off.
-        // Excludes any group with a --chain-partition rule: eqAstart's live-idAcc read
-        // (and its per-rule idAcc rebind) is only wired into the per-rule (!mGrouped)
-        // loop below, not the grouped-if chunk loop.
-        bool groupHasChain = std::any_of(g.rules.begin(), g.rules.end(),
-                                          [](const MergeRule & r) { return r.needsLiveId; });
-        bool grouped = (IfGroupLowerLimit >= 0) && ((long) i >= (long) IfGroupLowerLimit)
-                       && !groupHasChain;
+        // A --chain-partition rule no longer disqualifies the whole kernel: the
+        // grouped-if path now skips just the chain-involved rules and emits them
+        // its chain roots' nests inside its chunk gates (see isChainRule / emitChain in
+        // BPEMergeKernel::generatePabloMethod).
+        const int groupLowerLimit = effIfGroupLowerLimit();
+        bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
         P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
                                            g, hashRuleSet(g.rules), g.maxLen, grouped);
         source     = sOut;
@@ -1465,6 +1710,10 @@ static unsigned rawByteLen(const std::string & s) {
 // NOTE `hi` is a WIDTH BOUND ONLY — under levels it is ~50k from the first kernel on, so
 // it is NOT an "everything below is already stamped" watermark; applyCompactionSchedule
 // asks kernelOf[] instead. `lo` is the level's lowest idAB — informational (debug dump).
+// --chain-veto bookkeeping, reported on the [BPE] stderr dump.
+static unsigned gChainVetoRelaxed = 0;   // rules carrying a runtime veto
+static unsigned gChainVetoTerms   = 0;   // total competitor EQs those rules emit
+
 static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules) {
     std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps i
     // token -> highest level using it as idA  
@@ -1507,9 +1756,39 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         // consumed an X-run position... so frozen==live"). 
         if (AsymmetricSeam && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
         else after(maxRight, r.idA);
-        after(maxLeft,   r.idB);      // seam: an earlier rule claimed this token as its A
-                                      // — unfixable in-kernel (forward LookAhead reads
-                                      // frozen input only, T5); always enforced.
+        // seam: an earlier rule claimed this token as its A. Without --chain-veto this is
+        // a hard split — the forward LookAhead reads frozen input only (T5), so a
+        // same-kernel competitor's consume of idB is invisible. With it, the rule tests
+        // the competitor itself and stands down at runtime (see ChainVeto).
+        std::vector<unsigned> veto;
+        bool relaxed = false;
+        if (ChainVeto && r.idA != r.idB) {
+            unsigned lvlStrict = lvl, lvlRelaxed = lvl;      // lvl = level ignoring maxLeft
+            auto ml = maxLeft.find(r.idB);
+            if (ml != maxLeft.end()) {
+                if (ml->second + 1u > lvlStrict)  lvlStrict  = ml->second + 1u;
+                if (ml->second      > lvlRelaxed) lvlRelaxed = ml->second;
+            }
+            if (lvlRelaxed < lvlStrict && lvlRelaxed >= 1 && lvlRelaxed <= levels.size()) {
+                bool competitorItselfVetoed = false;
+                for (const auto & c : levels[lvlRelaxed - 1]) {
+                    if (c.idA != r.idB) continue;            // not a competitor
+                    if (c.idA == c.idB || !c.vetoIdB.empty()) {
+                        competitorItselfVetoed = true;       // beatable → depth-1 veto
+                        break;                               // would be wrong; take split
+                    }
+                    veto.push_back(c.idB);
+                }
+                if (!competitorItselfVetoed && !veto.empty()) {
+                    lvl = lvlRelaxed;          // share the competitor's kernel
+                    relaxed = true;
+                    gChainVetoRelaxed++;
+                    gChainVetoTerms += veto.size();
+                }
+            }
+        }
+        if (!relaxed) { veto.clear(); after(maxLeft, r.idB); }
+
         // Base ids (< 256) are absent from prodLevel — the seed supplies them, so they
         // impose no constraint and such a rule can sit in level 1.
         // If the number of levels we currently have is LESS than the level needed for this rule, create more level slots.
@@ -1523,6 +1802,10 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         {
             auto it = prodLevel.find(r.idA);
             rc.needsLiveId = (it != prodLevel.end() && it->second == lvl);
+        }
+        if (relaxed) {
+            rc.vetoIdB = std::move(veto);
+            rc.vetoOff = rc.lenA + rc.lenB;   // byte space; rewritten under compaction
         }
         levels[lvl - 1].push_back(rc);
         prodLevel[r.idAB] = lvl;
@@ -1573,7 +1856,15 @@ static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
         std::unordered_set<unsigned> consumedAsB;   // idB values used by earlier rules in this group
         unsigned before = totalFlags;
         for (auto & r : g.rules) {
-            if (consumedAsB.count(r.idA)) { r.needsFlush = true; totalFlags++; }
+            // Two reasons a rule's gate must read the LIVE mask rather than the kernel's
+            // frozen entry mask:
+            //  1. --asymmetric-seam: an earlier rule in this group consumed this rule's
+            //     idA as ITS idB, so idA is already gone and the gate has to see that.
+            //  2. --chain-veto: this rule now shares its kernel with the lower-rank rules
+            //     claiming its idB — that sharing is exactly what the veto buys. Those
+            //     competitors fire first and clear starts around this rule's B, so the
+            //     same staleness applies and the frozen entry mask would hide it.
+            if (consumedAsB.count(r.idA) || !r.vetoIdB.empty()) { r.needsFlush = true; totalFlags++; }
             consumedAsB.insert(r.idB);
         }
         totalRules += g.rules.size();
@@ -1627,6 +1918,10 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             std::cerr << "[BPE] chain-partition: " << n << "/" << total
                        << " rules flagged needsLiveId\n";
         }
+        if (ChainVeto)
+            std::cerr << "[BPE] chain-veto: " << gChainVetoRelaxed
+                      << " rules kept their level via a runtime veto ("
+                      << gChainVetoTerms << " competitor EQs)\n";
         return groups;
     }
 

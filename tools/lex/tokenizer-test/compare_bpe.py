@@ -40,7 +40,7 @@ TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
-DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/val.txt")
+DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/val_4MB.txt")
 OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "compare_bpe_output.txt")
 

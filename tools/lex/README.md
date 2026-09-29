@@ -478,7 +478,7 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 | `--level-partition` | off | (via rule set + `o{bits}`) | Partition merge rules by **ASAP level scheduling** (minimum kernel count) instead of contiguous clean id ranges. Full GPT-2: **1123 → 283 kernels**. Same two correctness conditions, only the packing changes — see [Alternative partition](#alternative-partition--asap-level-scheduling---level-partition). Verified byte-identical output. |
 | `--compact-base=N` | `0` (off) | `L{maxLen}` | Base kernel index at which `FilterByMask` compaction first shrinks the inter-kernel streams. `0` = no compaction. Larger streams stay full-width; compaction trades a per-point compact/expand cost for cheaper downstream kernels. |
 | `--geometric-compaction` | off | (via `L`) | Space the compaction points geometrically instead of arithmetically (denser early, sparser later). Only meaningful with `--compact-base > 0`. |
-| `--if-group-lower-limit=N` | `-1` (off) | `g{size}_` | **Master switch for grouped-if.** For kernels at/after index `N`, replace the one-`createIf`-per-rule structure with range-gated group gates (rules sorted by `idA`, chopped into chunks, one `createIf` per chunk on the id range it spans). A block with no live id in a chunk's range skips that whole chunk. `-1` = per-rule ifs everywhere. |
+| `--if-group-lower-limit=N` | `-1` (off) | `g{size}_` | **Master switch for grouped-if.** For kernels at/after index `N`, replace the one-`createIf`-per-rule structure with range-gated group gates (rules sorted by `idA`, chopped into chunks, one `createIf` per chunk on the id range it spans). A block with no live id in a chunk's range skips that whole chunk. `-1` = per-rule ifs everywhere. Left at its default, it becomes `0` whenever `--if-group-size`, `--if-group-count` or `--if-test-significant-bits` is given. |
 | `--if-group-count=K` | `1` | `g{rules/K}_` | Grouped kernels get **K gates each**; gate size = `rules/K` (scales with kernel). Only active with `--if-group-lower-limit >= 0`. |
 | `--if-group-size=S` | `1` | `g{S}_` | **Fixed** `S` rules per gate regardless of kernel size (gate count = `rules/S`). **Overrides `--if-group-count` when `!= 1`.** `1` = defer to `--if-group-count`. |
 | `--lookahead-in-gate` | off | `la1_` | Build the B-detection `LookAhead` **inside each rule's** `createIf` (skippable on cold blocks) instead of one shared shift hoisted outside all gates. Skippable but **duplicated per rule** (loses the per-lenA dedup). Works with or without grouping. |
@@ -588,8 +588,9 @@ python3 bench_bpe.py --sweep \
 Notes:
 - Distinct cache tags mean the two runs do **not** collide — no wipe needed
   between them. Wipe (`rm -rf ~/.parabix/objcache/`) only after a **rebuild**.
-- `--lookahead-in-group` / `--if-group-*` are no-ops without
-  `--if-group-lower-limit >= 0` — always include it when testing grouping.
+- `--lookahead-in-group` is a no-op on ungrouped kernels. Giving `--if-group-size`,
+  `--if-group-count` or `--if-test-significant-bits` without `--if-group-lower-limit`
+  groups every kernel (limit 0); an explicit `--if-group-lower-limit=-1` keeps grouping off.
 - Cross-run absolute MB/s is noisy; trust only **back-to-back** A/B deltas.
 - Confirm a flag engaged by inspecting the IR on a debug build:
   `build_debug/bin/tokenizer --ShowOptimizedPablo --ToShow="BPEMerge*" --merges=tools/lex/merges.txt <flags> build19/test.txt`.

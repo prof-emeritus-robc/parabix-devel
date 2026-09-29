@@ -8,6 +8,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/adt.h>
 #include <re/adt/re_name.h>
+#include <re/adt/re_utility.h>
 #include <re/alphabet/multiplex_CCs.h>
 #include <re/analysis/re_inspector.h>
 #include <re/parse/parser.h>
@@ -78,7 +79,7 @@ RE * PropertyResolver::resolveBoundary (std::string val, bool is_negated) {
             b->SetBoundaryExpression(resolved);
         }
         if (is_negated) {
-            resolved = makeDiff(makeAny(), resolved);
+            resolved = makeZerowidthComplement(resolved);
         }
     } else if (isa<EnumeratedPropertyObject>(mPropObj) && (val == "")) {
         // Boundary between codepoints with any two different values for an
@@ -86,7 +87,7 @@ RE * PropertyResolver::resolveBoundary (std::string val, bool is_negated) {
         // TODO:  Pass in the operator, so that negated boundaries are generated in simplified form.
         resolved = EnumeratedPropertyBoundary(cast<EnumeratedPropertyObject>(mPropObj));
         if (is_negated) {
-            resolved = makeDiff(makeAny(), resolved);
+            resolved = makeZerowidthComplement(resolved);
         }
     } else {
         std::string propName = getPropertyFullName(static_cast<property_t>(mPropCode));
@@ -283,10 +284,20 @@ RE * PropertyExternalizer::transformPropertyExpression (PropertyExpression * exp
     std::string theName = id + op_str + val_str;
     if (exp->getKind() == PropertyExpression::Kind::Codepoint) {
         return createName(theName, exp);
-    } else {
-        theName = "\\b{" + theName + "}";
-        return createName(theName, exp);
     }
+    if (op == PropertyExpression::Operator::NEq) {
+        // Externalize the positive boundary; its zero-width complement is
+        // then taken at the point of use.  Boundary streams are always
+        // computed for the positive boundary.
+        PropertyExpression * positive =
+            makePropertyExpression(PropertyExpression::Kind::Boundary, id, PropertyExpression::Operator::Eq, val_str);
+        positive->setPropertyCode(exp->getPropertyCode());
+        if (Diff * negated = dyn_cast_or_null<Diff>(exp->getResolvedRE())) {
+            positive->setResolvedRE(negated->getRH());
+        }
+        return makeZerowidthComplement(transformPropertyExpression(positive));
+    }
+    return createName("\\b{" + theName + "}", exp);
 }
 
 RE * externalizeProperties(RE * r) {

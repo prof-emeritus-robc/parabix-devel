@@ -707,6 +707,11 @@ void UnicodePropertyLogic(PipelineBuilder & P, re::PropertyExpression * pe,
     if (pe->getKind() == re::PropertyExpression::Kind::Codepoint) {
         P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(pe, BasisBits, PropertyStream);
     } else { //PropertyExpression::Kind::Boundary
+        if (pe->getOperator() == re::PropertyExpression::Operator::NEq) {
+            // Boundary kernels compute positive boundaries only.
+            llvm::report_fatal_error("negated boundary " + llvm::StringRef(propName) +
+                                     " must be compiled as a zero-width complement");
+        }
         if (BasisBits->getNumElements() < 21) {
             if (IndexStream == nullptr) {
                 llvm::report_fatal_error("index stream required for boundary properties without full Unicode basis");

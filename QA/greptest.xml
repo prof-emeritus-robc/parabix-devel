@@ -1293,6 +1293,19 @@ bababab
 <grepcase regexp="(?:aaaa){3}" datafile="rep_overlap" greplines="5"/>
 <grepcase regexp="(?:bb){4}" datafile="rep_overlap" greplines=""/>
 
+<!-- An alternation of ASCII sequences after a nullable alternation is not a
+     single UTF-8 encoded character and must not be end-aligned. -->
+<datafile id="alt_alignment">
+aacaabc
+abaacacacbaaccaca
+bbaaaccc
+acbcbacc
+xyz
+</datafile>
+<grepcase regexp="b(?:.a|a*)(?:[bc]c|b)" datafile="alt_alignment" greplines="3 4 5"/>
+<grepcase regexp=".b(?:.[ab]|a*)(?:[bc]c|b)" datafile="alt_alignment" greplines="3 4 5"/>
+<grepcase regexp="b(?:.[ab]|a*)(?:cc|b)" datafile="alt_alignment" greplines="3 4 5"/>
+
 <!-- Captures inside lookahead assertions (named subexpressions). -->
 <datafile id="capture_lookahead">
 abab

@@ -524,7 +524,42 @@ size_t EmitMatch::getFileStartPos(size_t fileNo) {
 void EmitMatch::setBatchLineNumber(size_t fileNo, size_t batchLine) {
     //llvm::errs() << "setBatchLineNumber(" << fileNo << ", " << batchLine << ")  file = " << mFileNames[fileNo] << "\n";
     mFileStartLineNumbers[fileNo+1] = batchLine;
-    if (!mTerminated) *mResultStr << "\n";
+    terminateRecord();
+}
+
+// Whether the matched record [line_start, line_end] includes its own terminator.
+bool EmitMatch::isTerminated(const char * line_start, const char * line_end) const {
+    const unsigned last_byte = static_cast<unsigned char>(*line_end);
+    switch (mRecordBreak) {
+        case GrepRecordBreakKind::Null:
+            return last_byte == 0;
+        case GrepRecordBreakKind::LF:
+            return last_byte == 0x0A;
+        case GrepRecordBreakKind::Unicode:
+            break;
+    }
+    if ((last_byte >= 0x0A) && (last_byte <= 0x0D)) {
+        return true;
+    }
+    const auto bytes = line_end - line_start + 1;
+    if (last_byte == 0x85) {  //  Possible NEL terminator.
+        return (bytes >= 2) && (static_cast<unsigned char>(line_end[-1]) == 0xC2);
+    }
+    // Possible LS or PS terminators.
+    return (bytes >= 3) && (static_cast<unsigned char>(line_end[-2]) == 0xE2)
+                        && (static_cast<unsigned char>(line_end[-1]) == 0x80)
+                        && ((last_byte == 0xA8) || (last_byte == 0xA9));
+}
+
+// Emit the record terminator after a final record that lacked one.
+void EmitMatch::terminateRecord() {
+    if (!mTerminated) {
+        if (mRecordBreak == GrepRecordBreakKind::Null) {
+            mResultStr->put('\0');
+        } else {
+            *mResultStr << "\n";
+        }
+    }
     mTerminated = true;
 }
 
@@ -555,23 +590,11 @@ void EmitMatch::accumulate_match (const size_t lineNum, char * line_start, char 
     mResultStr->write(line_start, bytes);
     mLineCount++;
     mLineNum = lineNum;
-    unsigned last_byte = *line_end;
-    mTerminated = (last_byte >= 0x0A) && (last_byte <= 0x0D);
-    if (LLVM_UNLIKELY(!mTerminated)) {
-        if (last_byte == 0x85) {  //  Possible NEL terminator.
-            mTerminated = (bytes >= 2) && (static_cast<unsigned>(line_end[-1]) == 0xC2);
-        }
-        else {
-            // Possible LS or PS terminators.
-            mTerminated = (bytes >= 3) && (static_cast<unsigned>(line_end[-2]) == 0xE2)
-                                       && (static_cast<unsigned>(line_end[-1]) == 0x80)
-                                       && ((last_byte == 0xA8) || (last_byte == 0xA9));
-        }
-    }
+    mTerminated = isTerminated(line_start, line_end);
 }
 
 void EmitMatch::finalize_match(char * buffer_end) {
-    if (!mTerminated) *mResultStr << "\n";
+    terminateRecord();
 }
 
 void GrepEngine::applyColorization(PipelineBuilder & P,
@@ -881,9 +904,16 @@ void MatchOnlyEngine::showResult(uint64_t grepResult, const std::string & fileNa
 
 constexpr size_t batch_alignment = 64;
 
+// A NUL byte marks a binary file, except with NUL record breaks (-z), where it is
+// the record terminator.
+bool EmitMatchesEngine::detectsBinaryByNull() const {
+    return ((mBinaryFilesMode == argv::WithoutMatch) || (mBinaryFilesMode == argv::Binary))
+        && (mGrepRecordBreak != GrepRecordBreakKind::Null);
+}
+
 uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) {
     auto f = mBatchMethod;
-    EmitMatch accum(mShowFileNames, mShowLineNumbers, ((mBeforeContext > 0) || (mAfterContext > 0)), mInitialTab);
+    EmitMatch accum(mShowFileNames, mShowLineNumbers, ((mBeforeContext > 0) || (mAfterContext > 0)), mInitialTab, mGrepRecordBreak);
     accum.setStringStream(&strm);
     AlignedAllocator<char, batch_alignment> alloc;
     if (fileNames.size() == 1) {
@@ -904,7 +934,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         if (bytes_read <= 0) return 0;
         accum.mBatchBuffer = buf.getBuf();
         bool skip_binary_file = false;
-        if ((mBinaryFilesMode == argv::WithoutMatch) || (mBinaryFilesMode == argv::Binary)) {
+        if (detectsBinaryByNull()) {
             auto null_byte_ptr = memchr(accum.mBatchBuffer, char (0), bytes_read);
             if (null_byte_ptr != nullptr) { // Binary file;
                 skip_binary_file = true;
@@ -949,7 +979,7 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         ssize_t bytes_read = read(fd, current_base, fileSize[i]);
         close(fd);
         if (bytes_read <= 0) continue; // No data or error reading the file; skip.
-        if ((mBinaryFilesMode == argv::WithoutMatch) || (mBinaryFilesMode == argv::Binary)) {
+        if (detectsBinaryByNull()) {
             auto null_byte_ptr = memchr(current_base, char (0), bytes_read);
             if (null_byte_ptr != nullptr) { // Binary file;
                 // Silently skip in the WithoutMatch mode
@@ -963,8 +993,10 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         accum.mFileStartPositions.push_back(current_start_position);
         current_base += bytes_read;
         current_start_position += bytes_read;
-        if (*(current_base - 1) != '\n') {
-            *current_base = '\n';
+        // Terminate each file's final record so that records never span files.
+        const char terminator = (mGrepRecordBreak == GrepRecordBreakKind::Null) ? '\0' : '\n';
+        if (*(current_base - 1) != terminator) {
+            *current_base = terminator;
             current_base++;
             current_start_position++;
         }

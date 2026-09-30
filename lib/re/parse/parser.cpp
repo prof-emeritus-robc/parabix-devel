@@ -331,13 +331,6 @@ RE * RE_Parser::parse_escaped() {
     if (isSetEscapeChar(*mCursor)) {
         return parseEscapedSet();
     }
-    else if (atany("xo0")) {
-        codepoint_t cp = parse_escaped_codepoint();
-        if ((cp <= 0xFF)) {
-            return makeByte(cp);
-        }
-        else return createCC(cp);
-    }
     else if (atany("123456789")) {
         return parse_back_reference();
     }
@@ -699,13 +692,6 @@ RE * RE_Parser::parse_permute_class() {
 
 RE * RE_Parser::parse_escaped_char_item() {
     if (accept('N')) return parseNamePatternExpression();
-    else if (atany("xo0")) {
-        codepoint_t cp = parse_escaped_codepoint();
-        if ((cp <= 0xFF)) {
-            return makeByte(cp);
-        }
-        else return createCC(cp);
-    }
     else return createCC(parse_escaped_codepoint());
 }
 

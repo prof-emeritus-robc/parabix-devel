@@ -1258,9 +1258,13 @@ aé
 1é
 é1
 </datafile>
-<grepcase regexp="1\b{gc}\x{E9}" datafile="boundary_hex_cc" greplines="3" knownbug="Alphabet Byte has no CC compiler"/>
-<grepcase regexp="\x{E9}\b{gc}1" datafile="boundary_hex_cc" greplines="4" knownbug="Alphabet Byte has no CC compiler"/>
-<grepcase regexp="a\B{gc}\x{E9}" datafile="boundary_hex_cc" greplines="2" knownbug="Alphabet Byte has no CC compiler"/>
+<grepcase regexp="1\b{gc}\x{E9}" datafile="boundary_hex_cc" greplines="3"/>
+<grepcase regexp="\x{E9}\b{gc}1" datafile="boundary_hex_cc" greplines="4"/>
+<grepcase regexp="a\B{gc}\x{E9}" datafile="boundary_hex_cc" greplines="2"/>
+<!-- \x, \o and \0 escapes denote codepoints, as \u does, not raw bytes. -->
+<grepcase regexp="\x{E9}" datafile="boundary_hex_cc" greplines="2 3 4"/>
+<grepcase regexp="[\xE0-\xEF]1" datafile="boundary_hex_cc" greplines="4"/>
+<grepcase regexp="\o{351}1" datafile="boundary_hex_cc" greplines="4"/>
 
 <!-- Bounded repetitions of sequences containing bounded repetitions, where
      CC_Sequence_Search wrongly reports a characteristic subexpression. -->

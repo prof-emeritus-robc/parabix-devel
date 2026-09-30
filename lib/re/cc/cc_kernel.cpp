@@ -10,6 +10,7 @@
 #include <re/adt/re_cc.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
+#include <pablo/pablo.h>
 
 using namespace cc;
 using namespace kernel;

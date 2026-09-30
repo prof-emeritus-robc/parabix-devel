@@ -5,12 +5,6 @@
 #pragma once
 
 #include <pablo/pablo.h>
-#include <re/alphabet/alphabet.h>
-#include <re/alphabet/multiplex_CCs.h>
-#include <re/analysis/capture-ref.h>
-#include <re/analysis/re_analysis.h>
-#include <re/analysis/re_name_gather.h>
-#include <re/transforms/to_utf8.h>
 #include <kernel/pipeline/program_builder.h>
 
 namespace IDISA { class IDISA_Builder; }

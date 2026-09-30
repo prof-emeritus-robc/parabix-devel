@@ -16,6 +16,7 @@
 #include <kernel/core/kernel.h>
 #include <map>
 #include <memory>
+#include <re/printer/re_printer.h>
 
 using namespace llvm;
 

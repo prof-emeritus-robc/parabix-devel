@@ -17,6 +17,7 @@
 #include <grep/grep_engine.h>
 #include <grep/grep_kernel.h>
 #include <kernel/streamutils/pdep_kernel.h>
+#include <toolchain/toolchain.h>
 
 //
 // Certain characters within JSON strings must be escaped, including

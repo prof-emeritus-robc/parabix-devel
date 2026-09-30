@@ -51,6 +51,7 @@
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/utf/utf_compiler.h>
 #include <re/toolchain/toolchain.h>
+#include <kernel/core/streamsetptr.h>
 
 using namespace kernel;
 using namespace llvm;

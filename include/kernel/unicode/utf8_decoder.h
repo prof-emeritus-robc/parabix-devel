@@ -4,10 +4,10 @@
  */
 #pragma once
 
-#include <pablo/pablo.h>
 #include <string>                // for string
-#include <kernel/core/kernel_builder.h>
 #include <pablo/toolchain/pablo_toolchain.h>
+#include <pablo/pablo.h>
+#include <kernel/core/kernel_builder.h>
 
 namespace kernel {
 

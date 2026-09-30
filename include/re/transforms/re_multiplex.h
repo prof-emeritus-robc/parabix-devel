@@ -2,8 +2,8 @@
 
 #include <set>
 #include <memory>
-#include <re/adt/adt.h>
 #include <re/transforms/re_transformer.h>
+#include <re/adt/adt.h>
 
 namespace cc { class MultiplexedAlphabet; }
 

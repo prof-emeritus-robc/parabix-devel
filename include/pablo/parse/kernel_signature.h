@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 #include <vector>
-#include <pablo/parse/pablo_type.h>
+namespace pablo { namespace parse { class PabloType; } }
 
 namespace pablo {
 namespace parse {

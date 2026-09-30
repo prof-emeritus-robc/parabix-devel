@@ -21,6 +21,8 @@
 #endif
 #include <boost/intrusive/detail/math.hpp>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <toolchain/toolchain.h>
+#include <kernel/illustrator/illustrator.h>
 
 using namespace llvm;
 using namespace boost;

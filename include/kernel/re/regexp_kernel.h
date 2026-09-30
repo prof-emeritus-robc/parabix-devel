@@ -4,15 +4,14 @@
  */
 #pragma once
 
-#include <re/adt/adt.h>
-#include <re/alphabet/alphabet.h>
 #include <kernel/core/streamset.h>
-#include <kernel/core/kernel_builder.h>
-#include <kernel/pipeline/pipeline_builder.h>
-#include <kernel/pipeline/program_builder.h>
-#include <pablo/pablo.h>
-#include <re/transforms/name_intro.h>
 #include <map>
+#include <re/transforms/name_intro.h>
+#include <re/adt/adt.h>
+#include <pablo/pablo.h>
+namespace kernel { class StreamSet; }
+namespace cc { class Alphabet; }
+namespace kernel { class PipelineBuilder; }
 
 using Alphabets = std::vector<std::pair<const cc::Alphabet *, kernel::StreamSet *>>;
 

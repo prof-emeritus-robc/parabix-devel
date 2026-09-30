@@ -13,8 +13,7 @@
 #include <llvm/ADT/StringMap.h>
 #include <pablo/parse/error.h>
 #include <pablo/parse/lexer.h>
-#include <pablo/parse/symbol_table.h>
-#include <pablo/parse/token.h>
+namespace pablo { namespace parse { class SymbolTable; } }
 
 namespace pablo {
 

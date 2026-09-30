@@ -14,6 +14,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <boost/intrusive/detail/math.hpp>
 #include <sstream>
+#include <toolchain/toolchain.h>
 
 #if 0
 #define DEBUG_PRINT(title,value) b.CallPrintInt(title, value)

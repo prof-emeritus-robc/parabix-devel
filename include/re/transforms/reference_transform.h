@@ -8,6 +8,7 @@
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/name_intro.h>
 #include <re/alphabet/alphabet.h>
+namespace cc { class Alphabet; }
 
 namespace re {
 

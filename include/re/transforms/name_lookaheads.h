@@ -4,10 +4,13 @@
  */
 
 #pragma once
-#include <re/adt/adt.h>
-#include <re/alphabet/alphabet.h>
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/name_intro.h>
+#include <re/alphabet/alphabet.h>
+namespace re { class Assertion; }
+namespace re { class Name; }
+namespace re { class RE; }
+namespace cc { class Alphabet; }
 
 namespace re {
 

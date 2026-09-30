@@ -38,6 +38,7 @@
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/utf/utf_compiler.h>
+#include <toolchain/toolchain.h>
 
 using namespace re;
 using namespace pablo;

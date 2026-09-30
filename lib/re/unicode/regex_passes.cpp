@@ -23,6 +23,7 @@
 #include <re/unicode/resolve_properties.h>
 #include <re/toolchain/toolchain.h>
 #include <toolchain/toolchain.h>
+#include <re/printer/re_printer.h>
 
 using namespace llvm;
 using namespace re;

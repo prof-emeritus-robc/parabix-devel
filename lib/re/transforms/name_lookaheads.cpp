@@ -8,6 +8,8 @@
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <re/analysis/re_analysis.h>
+#include <re/adt/adt.h>
+#include <re/printer/re_printer.h>
 
 using namespace llvm;
 

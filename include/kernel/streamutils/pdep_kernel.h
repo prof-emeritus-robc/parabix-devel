@@ -7,9 +7,10 @@
 #include <kernel/core/kernel.h>
 #include <llvm/IR/Value.h>
 #include <string>
-#include <kernel/pipeline/driver/driver.h>
-#include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/scan/base.h>
+namespace kernel { class PipelineBuilder; }
+namespace kernel { class Scalar; }
+namespace kernel { class StreamSet; }
 
 namespace kernel {
 

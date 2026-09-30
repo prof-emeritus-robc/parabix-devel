@@ -6,8 +6,8 @@
 #pragma once
 
 #include <string>
-#include <re/adt/adt_forward_decl.h>
 #include <re/analysis/re_inspector.h>
+#include <re/adt/adt_forward_decl.h>
 
 namespace cc { class Alphabet;}
 

@@ -18,6 +18,7 @@
 #include <random>
 #include <type_traits>
 #include <llvm/IR/Instructions.h>
+#include <toolchain/toolchain.h>
 
 using namespace kernel;
 using namespace llvm;

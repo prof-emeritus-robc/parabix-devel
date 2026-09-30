@@ -5,11 +5,11 @@
 
 #pragma once
 
-#include <kernel/core/block_kernel_compiler.h>
 #include <pablo/compiler/carry_manager.h>
 #include <unordered_map>
 #include <vector>
 #include <memory>
+#include <kernel/core/block_kernel_compiler.h>
 namespace IDISA { class IDISA_Builder; }
 namespace llvm { class BasicBlock; }
 namespace llvm { class Function; }

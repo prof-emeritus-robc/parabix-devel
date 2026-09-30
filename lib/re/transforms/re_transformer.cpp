@@ -10,6 +10,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/adt.h>
 #include <re/toolchain/toolchain.h>
+#include <re/printer/re_printer.h>
 
 using namespace llvm;
 

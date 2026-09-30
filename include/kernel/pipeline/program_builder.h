@@ -3,8 +3,8 @@
 
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/pipeline/driver/driver.h>
-#include <kernel/core/streamsetptr.h>
 #include <type_traits>
+namespace kernel { class StreamSetPtr; }
 
 namespace kernel {
 

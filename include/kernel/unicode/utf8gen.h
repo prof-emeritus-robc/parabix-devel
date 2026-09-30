@@ -4,10 +4,11 @@
  */
 
 #pragma once
-
 #include <pablo/pablo.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/driver/driver.h>
+namespace kernel { class KernelBuilder; }
+
 
 
 //

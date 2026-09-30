@@ -6,8 +6,8 @@
 #pragma once
 
 #include <set>
-#include <re/adt/adt_forward_decl.h>
 #include <re/adt/memoization.h>
+#include <re/adt/adt_forward_decl.h>
 
 namespace re {
 

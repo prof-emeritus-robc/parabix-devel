@@ -14,7 +14,6 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/Support/Compiler.h>
-#include <kernel/illustrator/illustrator.h>
 #include <codegen/FunctionTypeBuilder.h>
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>

@@ -6,10 +6,10 @@
 #pragma once
 
 #include <initializer_list>
-#include <kernel/scan/base.h>
-#include <kernel/streamutils/stream_select.h>
 #include <kernel/pipeline/driver/driver.h>
 #include <kernel/pipeline/pipeline_builder.h>
+#include <kernel/scan/base.h>
+#include <kernel/streamutils/stream_select.h>
 
 namespace kernel {
 

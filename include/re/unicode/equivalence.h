@@ -6,7 +6,6 @@
 #pragma once
 
 #include <string>
-#include <ucd/core/unicode_set.h>
 #include <ucd/data/Equivalence.h>
 
 namespace re { class RE; class CC; class Seq; class Group;}

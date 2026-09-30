@@ -9,7 +9,7 @@
  */
 
 #include "PropertyAliases.h"
-#include <ucd/data/PropertyObjects.h>
+namespace UCD { class PropertyObject; }
 
 namespace UCD {
 PropertyObject * get_IDENTITY_PropertyObject();

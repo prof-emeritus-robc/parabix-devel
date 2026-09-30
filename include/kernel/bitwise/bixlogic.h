@@ -3,9 +3,9 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 #pragma once
+namespace kernel { class PipelineBuilder; }
+namespace kernel { class StreamSet; }
 
-#include <kernel/core/kernel.h>
-#include <kernel/pipeline/pipeline_builder.h>
 
 namespace kernel {
 

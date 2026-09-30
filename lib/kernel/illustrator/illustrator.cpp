@@ -25,6 +25,7 @@
 #elif defined(__linux__) || defined(__APPLE__)
 #include <sys/ioctl.h>
 #include <stdio.h>
+#include <toolchain/toolchain.h>
 #endif
 
 using namespace boost;

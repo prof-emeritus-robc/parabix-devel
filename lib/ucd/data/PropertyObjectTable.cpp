@@ -10,6 +10,7 @@
 
 #include <array>
 #include <ucd/data/PropertyObjectTable.h>
+#include <ucd/data/PropertyObjects.h>
 
 namespace UCD {
 

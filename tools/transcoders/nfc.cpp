@@ -41,6 +41,7 @@
 #include <re/toolchain/toolchain.h>
 #include <re/unicode/resolve_properties.h>
 #include <kernel/unicode/UCD_property_kernel.h>
+#include <kernel/core/streamsetptr.h>
 
 using namespace kernel;
 using namespace llvm;

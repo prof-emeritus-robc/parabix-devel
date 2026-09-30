@@ -6,8 +6,8 @@
 #pragma once
 
 #include <ucd/utf/utf_encoder.h>
-#include <re/adt/adt.h>
 #include <re/transforms/re_transformer.h>
+#include <re/adt/adt.h>
 
 namespace re {class CC;}
 namespace re {

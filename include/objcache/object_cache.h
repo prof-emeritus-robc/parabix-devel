@@ -12,10 +12,10 @@
 #include <boost/container/flat_set.hpp>
 #include <boost/container/flat_map.hpp>
 #include <util/not_null.h>
-#include <kernel/core/kernel.h>
 #include <kernel/pipeline/driver/driver.h>
 #include <mutex>
 #include <string>
+namespace kernel { class Kernel; }
 
 namespace llvm { 
     class Module;  class MemoryBuffer;  class LLVMContext;

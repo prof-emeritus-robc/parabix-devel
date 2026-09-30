@@ -17,6 +17,7 @@
 #include <re/analysis/cc_sequence_search.h>
 #include <re/transforms/name_lookaheads.h>
 #include <re/toolchain/toolchain.h>
+#include <re/printer/re_printer.h>
 
 namespace pablo { class PabloAST; }
 namespace pablo { class Var; }

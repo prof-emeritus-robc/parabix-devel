@@ -7,6 +7,7 @@
 
 #include <re/adt/re_start.h>
 #include <re/adt/re_end.h>
+#include <re/adt/adt.h>
 
 using namespace llvm;
 

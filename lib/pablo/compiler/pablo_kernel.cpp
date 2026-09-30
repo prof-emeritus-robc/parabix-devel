@@ -44,6 +44,7 @@
 #endif
 
 #include <codegen/LLVMTypeSystemInterface.h>
+#include <kernel/illustrator/illustrator.h>
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }

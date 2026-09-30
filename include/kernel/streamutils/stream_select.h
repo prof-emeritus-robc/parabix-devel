@@ -9,8 +9,9 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
-#include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/core/kernel.h>
+namespace kernel { class PipelineBuilder; }
+namespace kernel { class StreamSet; }
 
 namespace kernel {
 

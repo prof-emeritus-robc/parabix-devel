@@ -8,6 +8,8 @@
 #include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <boost/intrusive/detail/math.hpp>
+#include <toolchain/toolchain.h>
+#include <kernel/pipeline/pipeline_builder.h>
 
 using boost::intrusive::detail::ceil_log2;
 using namespace kernel;

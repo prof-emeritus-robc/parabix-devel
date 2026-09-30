@@ -2,9 +2,9 @@
 
 #include <pablo/ast/codegenstate.h>
 #include <pablo/ast/expression_map.hpp>
-#include <pablo/ast/pe_var.h>
 #include <util/not_null.h>
 #include <sstream>
+#include <pablo/ast/pe_var.h>
 
 namespace pablo {
 

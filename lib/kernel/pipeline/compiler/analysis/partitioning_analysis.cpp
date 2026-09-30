@@ -217,6 +217,12 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
 
     std::vector<unsigned> forcedPartitionRoot;
 
+    // Rate ids introduced by outputs with an Add attribute.  A kernel's rate set is the
+    // union of its inputs', so a kernel reading both a stream extended by an Add and a
+    // stream that is not would otherwise share a partition with the consumers of the
+    // extended stream alone, even though its own inputs end at different positions.
+    BitSet addRateIds(n + numOfPhases);
+
     for (unsigned i = 0; i < m; ++i) {
 
         const auto u = sequence[i];
@@ -310,6 +316,30 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
                 }
             }
 
+            // Fixed-rate inputs must agree on which Add-extended streams they derive from;
+            // otherwise the kernel may be unable to process the final strides its partition
+            // root does (e.g., an input of N items alongside one of N+1 items that fills an
+            // exact stride), and it must determine its own number of strides.
+            BEGIN_SCOPED_REGION
+            BitSet addIds;
+            bool first = true;
+            for (const auto e : make_iterator_range(in_edges(i, G))) {
+                const Binding & bind = Relationships[G[e]].Binding;
+                if (bind.hasAttribute(AttrId::ZeroExtended)) {
+                    continue;
+                }
+                BitSet ids = G[source(e, G)];
+                ids &= addRateIds;
+                if (first) {
+                    addIds = std::move(ids);
+                    first = false;
+                } else if (ids != addIds) {
+                    hasInputRateChange = true;
+                    goto found_rate_change;
+                }
+            }
+            END_SCOPED_REGION
+
             if (hasInputRateChange) {
 found_rate_change:
                 assert (nextRateId < n);
@@ -376,12 +406,16 @@ found_rate_change:
                 BitSet & O = G[target(e, G)];
                 O |= V;
 
+                const bool isExtended = rate.isFixed() &&
+                    (b.hasAttribute(AttrId::Add) || b.hasAttribute(AttrId::AddCarry));
+
                 if (rate.isFixed() && !demarcateOutputs) {
 
                     // Check the attributes to see whether any impose a partition change
                     for (const Attribute & attr : b.getAttributes()) {
                         switch (attr.getKind()) {
                             case AttrId::Add:
+                            case AttrId::AddCarry:
                             // TODO: if we computed the transitive add/subtracts prior to partitioning,
                             // we could more safely associate them with the dataflow
                             case AttrId::Delayed:
@@ -397,6 +431,9 @@ found_rate_change:
                 } else {
 add_output_rate:    assert (nextRateId < n);
                     assert (!V.test(nextRateId));
+                    if (isExtended) {
+                        addRateIds.set(nextRateId);
+                    }
                     O.set(nextRateId++);
                 }
 
@@ -973,6 +1010,21 @@ start_of_transfer_loop:
                             if (pos < transferPos) {
                                 transferPos = pos;
                             }
+                        }
+                    }
+
+                    // A kernel may not be moved into a partition whose streams are extended by a
+                    // different set of Add attributes; its inputs would end at different positions
+                    // than those of the partition root.
+                    if (transferPos != -1U) {
+                        const auto & target = partGraph[ordering[transferPos]].AllKernels;
+                        assert (!target.empty());
+                        BitSet a = G[potentiallyTransferedKernel];
+                        a &= addRateIds;
+                        BitSet b = G[target.front()];
+                        b &= addRateIds;
+                        if (a != b) {
+                            transferPos = -1U;
                         }
                     }
 

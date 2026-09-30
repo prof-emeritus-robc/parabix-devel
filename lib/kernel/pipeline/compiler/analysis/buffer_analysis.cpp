@@ -146,6 +146,19 @@ void PipelineAnalysis::generateInitialBufferGraph(KernelBuilder & b) {
                     case AttrId::Add:
                         maxAdd = std::max<unsigned>(maxAdd, attr.amount());
                         break;
+                    case AttrId::AddCarry:
+                        if (LLVM_UNLIKELY(port.Type != PortType::Output || !rate.isFixed() ||
+                                          binding.getNumElements() != 1 || binding.getFieldWidth() != 1)) {
+                            SmallVector<char, 0> tmp;
+                            raw_svector_ostream out(tmp);
+                            out << "AddCarry attribute may only be applied to a Fixed rate output "
+                                   "of a single bitstream: "
+                                << kernelObj->getName() << "." << binding.getName();
+                            report_fatal_error(out.str());
+                        }
+                        bp.Flags |= BufferPortType::IsAddCarry;
+                        maxAdd = std::max<unsigned>(maxAdd, 1);
+                        break;
                     case AttrId::Delayed:
                         bp.Delay = std::max<unsigned>(bp.Delay, attr.amount());
                         break;

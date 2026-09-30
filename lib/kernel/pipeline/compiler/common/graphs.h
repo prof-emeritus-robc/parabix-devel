@@ -421,6 +421,7 @@ enum BufferPortType : unsigned {
     IsShared = 32,
     IsManaged = 64,
     CanModifySegmentLength = 128,
+    IsAddCarry = 256,
     Illustrated = 512,
     InputMayBeTruncated = 1024,
     InputMayBeImplicitlyZeroExtended = 2048,
@@ -466,6 +467,10 @@ struct BufferPort {
 
     bool isRelative() const {
         return (Flags & BufferPortType::IsRelative) != 0;
+    }
+
+    bool isAddCarry() const {
+        return (Flags & BufferPortType::IsAddCarry) != 0;
     }
 
     bool isShared() const {

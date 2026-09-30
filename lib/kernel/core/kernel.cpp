@@ -155,6 +155,7 @@ bool Kernel::requiresExplicitPartialFinalStride() const {
                     if (LLVM_LIKELY(attr.amount() > 0)) {
                         return true;
                     }
+                case AttrId::AddCarry:
                 case AttrId::Deferred:
                     return true;
                 default: break;

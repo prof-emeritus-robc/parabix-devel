@@ -1,48 +1,106 @@
+#include <re/analysis/cc_sequence_search.h>
 #include <re/adt/adt.h>
 #include <re/printer/re_printer.h>
 #include <llvm/Support/raw_ostream.h>
+#include <climits>
 
 using namespace llvm;
 namespace re {
 
 typedef uint64_t stateVector_t;
 
+//  Bit i of a state vector marks that the first i CCs of the sequence may have
+//  been matched ending at the current position (bit 0 is always set).  States
+//  are over-approximated, so the count of positions at which the full sequence
+//  is matched is an upper bound on the occurrences in any matched string.
+
 class ccSequenceSearchObject {
 public:
-    ccSequenceSearchObject(std::vector<CC *> & CC_seq) : 
+    ccSequenceSearchObject(std::vector<CC *> & CC_seq) :
         mCCseq(CC_seq),
         mInitState(1),
-        mFinalState(mInitState<<CC_seq.size()),
-        mAnyState(mFinalState-1) {
-                if (CC_seq.size() >= 64) llvm::report_fatal_error("CC_seq too long!");
-        }
+        mFinalState(CC_seq.size() < 63 ? (stateVector_t{1} << CC_seq.size()) : 0),
+        mCount(0),
+        mFailed(false) {}
 
+    int search(RE * re);
+
+private:
     stateVector_t search_from_state(RE * re, stateVector_t v);
-    bool search(RE * re);
+    stateVector_t repeat(RE * repeated, stateVector_t v, int64_t times, bool optional);
+    stateVector_t advance(stateVector_t matched, stateVector_t v);
+    void addCount(int64_t k);
+    void fail() {mFailed = true;}
 
     std::vector<CC *> mCCseq;
-    stateVector_t mInitState;
-    stateVector_t mFinalState;
-    stateVector_t mAnyState;
+    const stateVector_t mInitState;
+    const stateVector_t mFinalState;
+    int64_t mCount;
+    bool mFailed;
 };
 
+void ccSequenceSearchObject::addCount(int64_t k) {
+    mCount += k;
+    if (mCount > INT_MAX) fail();
+}
+
+//  Consume one character matching the sequence positions in matched.
+stateVector_t ccSequenceSearchObject::advance(stateVector_t matched, stateVector_t v) {
+    const stateVector_t next = ((matched & v) << 1) | mInitState;
+    if (next & mFinalState) {
+        addCount(1);
+    }
+    return next & ~mFinalState;
+}
+
+//  Apply repeated the given number of times (times < 0: unboundedly often),
+//  optionally, i.e., each iteration may also be skipped.
+stateVector_t ccSequenceSearchObject::repeat(RE * repeated, stateVector_t v, int64_t times, bool optional) {
+    for (int64_t done = 0; (times < 0) || (done < times); ) {
+        const int64_t before = mCount;
+        stateVector_t next = search_from_state(repeated, v);
+        if (optional) next |= v;
+        if (mFailed) return v;
+        ++done;
+        if (next == v) {
+            // Further iterations start from the same state and add the same count.
+            const int64_t perIteration = mCount - before;
+            if (perIteration > 0) {
+                if ((times < 0) || (times - done > INT_MAX)) {
+                    fail();  // unbounded number of occurrences
+                } else {
+                    addCount(perIteration * (times - done));
+                }
+            }
+            return v;
+        }
+        v = next;
+    }
+    return v;
+}
+
 stateVector_t ccSequenceSearchObject::search_from_state(RE * re, stateVector_t v) {
+    if (mFailed) return v;
     if (const Name * n = dyn_cast<Name>(re)) {
-        return search_from_state(n->getDefinition(), v);
+        RE * defn = n->getDefinition();
+        if (defn == nullptr) {
+            fail();
+            return v;
+        }
+        return search_from_state(defn, v);
     } else if (Capture * c = dyn_cast<Capture>(re)) {
         return search_from_state(c->getCapturedRE(), v);
-    } else if (LLVM_UNLIKELY(isa<Reference>(re))) {
-        llvm::errs() << "back references not supported in CC_sequence_search.\n";
-        return 0;
+    } else if (isa<Reference>(re)) {
+        fail();  // the referenced text is unknown
+        return v;
     } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        stateVector_t rslt = v;
         for (RE * s : *seq) {
-            rslt = search_from_state(s, rslt);
-            if (rslt & mFinalState) return rslt; // match found
+            v = search_from_state(s, v);
         }
-        return rslt;
+        return v;
     } else if (const Alt * alt = dyn_cast<Alt>(re)) {
-        stateVector_t rslt = mInitState;
+        // Occurrences in the alternatives are summed: an upper bound for any one of them.
+        stateVector_t rslt = 0;
         for (RE * a : *alt) {
             rslt |= search_from_state(a, v);
         }
@@ -50,66 +108,58 @@ stateVector_t ccSequenceSearchObject::search_from_state(RE * re, stateVector_t v
     } else if (const Rep * rep = dyn_cast<Rep>(re)) {
         const auto lb = rep->getLB();
         const auto ub = rep->getUB();
-        const auto rpt = rep->getRE();
-        stateVector_t rslt = v;
-        for (auto i = 0; i < lb; i++) {
-            stateVector_t next = search_from_state(rpt, rslt);
-            if (next == rslt) return next;  // Further repetitions won't change state.
-            rslt = next;
-            if (rslt & mFinalState) return rslt;  // match found
+        v = repeat(rep->getRE(), v, lb, false);
+        if (ub == Rep::UNBOUNDED_REP) {
+            return repeat(rep->getRE(), v, -1, true);
         }
-        for (auto i = lb; i != ub; i++) {
-            stateVector_t next = search_from_state(rpt, rslt) | rslt;
-            if (next == rslt) return next; // Further repetitions won't change state.
-            rslt |= next;
-            if (rslt & mFinalState) return rslt;  // match found
-        }
-    } else if (const Assertion * a = dyn_cast<const Assertion>(re)) {
-        if (a->getKind() == Assertion::Kind::LookBehind) {
-            stateVector_t next = search_from_state(a->getAsserted(), mAnyState);
-            if (a->getSense() == Assertion::Sense::Negative) {
-                next = ~next;
-            }
-            return (v & next) | mInitState;
-        } else {
-            llvm::errs() << "assertion not supported in CC_sequence_search.\n";
-            return 0;
-        }
+        return repeat(rep->getRE(), v, ub - lb, true);
+    } else if (isa<Assertion>(re)) {
+        // Zero-width; ignoring the assertion only over-approximates the states.
+        return v;
     } else if (const PropertyExpression * pe = dyn_cast<const PropertyExpression>(re)) {
+        if (pe->getKind() == PropertyExpression::Kind::Boundary) {
+            return v;  // zero-width
+        }
         RE * resolved = pe->getResolvedRE();
         if (LLVM_LIKELY(resolved != nullptr)) {
             return search_from_state(resolved, v);
         }
-        llvm::errs() << "unresolved property expression in CC_sequence_search.\n";
-        return 0;
+        fail();
+        return v;
     } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return (search_from_state(diff->getLH(), v) &~ search_from_state(diff->getRH(), v)) | mInitState;
+        // A difference matches a subset of its left operand.
+        return search_from_state(diff->getLH(), v);
     } else if (const Intersect * ix = dyn_cast<Intersect>(re)) {
-        return search_from_state(ix->getLH(), v) & search_from_state(ix->getRH(), v);
+        // An intersection matches a subset of either operand.
+        return search_from_state(ix->getLH(), v);
     } else if (isa<Start>(re)) {
         return mInitState;
     } else if (isa<End>(re)) {
-        return v & mFinalState;
+        return v;
     } else if (isa<Any>(re)) {
-        return (v << 1) | mInitState;
+        return advance(mFinalState - 1, v);
     } else if (const CC * cc = dyn_cast<CC>(re)) {
         stateVector_t CC_matches = 0;
         for (unsigned i = 0; i < mCCseq.size(); i++) {
-            CC_matches |= (cc->intersects(*mCCseq[i])) << i;
+            CC_matches |= static_cast<stateVector_t>(cc->intersects(*mCCseq[i])) << i;
         }
-        return ((CC_matches & v) << 1) | mInitState;
+        return advance(CC_matches, v);
     } else if (!isa<Range, Group, Permute, Interleavable>(re)) {
         UnexpectedRE("CC_Sequence_Search", re);
     }
-    llvm::errs() << "CC sequence search failed to process " << Printer_RE::PrintRE(re) << "\n";
-    return 0;
+    fail();
+    return v;
 }
 
-bool ccSequenceSearchObject::search(RE * re) {
-    return (search_from_state(re, mInitState) & mFinalState) > 0;
+int ccSequenceSearchObject::search(RE * re) {
+    if (mCCseq.empty() || (mFinalState == 0)) {
+        return -1;  // empty or too long for the state vector
+    }
+    search_from_state(re, mInitState);
+    return mFailed ? -1 : static_cast<int>(mCount);
 }
 
-bool CC_Sequence_Search(std::vector<CC *> & CC_seq, RE * re) {
+int CC_Sequence_Search(std::vector<CC *> & CC_seq, RE * re) {
     return ccSequenceSearchObject(CC_seq).search(re);
 }
 }

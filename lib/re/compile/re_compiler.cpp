@@ -524,15 +524,16 @@ bool CharacteristicSubexpressionAnalysis(RE * repeated, RE * &E1, RE * &C, RE * 
                 } else break;
             }
             // If we found a nonempty CC_seq, determine if it is a characteristic
-            // expression.
+            // expression: CC_seq must occur exactly once per repetition, even
+            // across the boundary between consecutive repetitions.  So in two
+            // consecutive repetitions, it must occur exactly twice.
             if (j > i) {
-                E1 = makeSeq(s->begin(), s->begin()+i);
-                E2 = makeSeq(s->begin()+j, s->end());
-                // Form E2 E1, where the original seq s is E1 CC_seq E2
-                RE * E2_E1 = makeSeq({E2, E1});
-                if (!CC_Sequence_Search(CC_seq, E2_E1)) {
+                RE * R2 = makeSeq({repeated, repeated});
+                if (CC_Sequence_Search(CC_seq, R2) == 2) {
                     // C is a characteristic subexpression
+                    E1 = makeSeq(s->begin(), s->begin()+i);
                     C = makeSeq(s->begin()+i, s->begin()+j);
+                    E2 = makeSeq(s->begin()+j, s->end());
                     return true;
                 }
             }

@@ -1274,9 +1274,24 @@ bbaaabaaabbaaabaaabbaaabaaa
 bbaabaabbaabaa
 bbaabaabbaabaabbaabaabbaabaa
 </datafile>
-<grepcase regexp="(?:b{2}aaba{2}){3}" datafile="cc_seq_rep" greplines="2 5" knownbug="CC_Sequence_Search unsafe on bounded Rep"/>
-<grepcase regexp="(?:b{2}aaaba{3}){3}" datafile="cc_seq_rep" greplines="3" knownbug="CC_Sequence_Search unsafe on bounded Rep"/>
-<grepcase regexp="(?:b{2}aaba{2}){4}" datafile="cc_seq_rep" greplines="5" knownbug="CC_Sequence_Search unsafe on bounded Rep"/>
+<grepcase regexp="(?:b{2}aaba{2}){3}" datafile="cc_seq_rep" greplines="2 5"/>
+<grepcase regexp="(?:b{2}aaaba{3}){3}" datafile="cc_seq_rep" greplines="3"/>
+<grepcase regexp="(?:b{2}aaba{2}){4}" datafile="cc_seq_rep" greplines="5"/>
+
+<!-- A repeated CC sequence that can overlap itself across repetitions is not
+     a characteristic subexpression. -->
+<datafile id="rep_overlap">
+bbbbbb
+bbbbb
+abbbbbba
+aaaaaaaaaaaa
+aaaaaaaaaaa
+babababab
+bababab
+</datafile>
+<grepcase regexp="(?:bb){3}" datafile="rep_overlap" greplines="2 4"/>
+<grepcase regexp="(?:aaaa){3}" datafile="rep_overlap" greplines="5"/>
+<grepcase regexp="(?:bb){4}" datafile="rep_overlap" greplines=""/>
 
 <!-- Captures inside lookahead assertions (named subexpressions). -->
 <datafile id="capture_lookahead">

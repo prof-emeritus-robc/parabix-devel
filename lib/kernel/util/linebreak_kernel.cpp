@@ -318,7 +318,7 @@ void NullDelimiterKernel::generatePabloMethod() {
     if (getInputStreamSet("Source").size() == 1) {
         ccc = std::make_unique<cc::Direct_CC_Compiler>(pb.createExtract(getInput(0), pb.getInteger(0)));
     } else {
-        ccc = std::make_unique<cc::Parabix_CC_Compiler_Builder>(getInputStreamSet("basis"));
+        ccc = std::make_unique<cc::Parabix_CC_Compiler_Builder>(getInputStreamSet("Source"));
     }
     PabloAST * NUL = ccc->compileCC("NUL", makeByte(0x0), pb);
     if (mEOFmode == UnterminatedLineAtEOF::Add1) {

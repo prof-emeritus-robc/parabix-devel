@@ -141,7 +141,9 @@ struct PropertyLinker : public RE_Transformer {
         std::string canon = UCD::canonicalize_value_name(id);
         // In the case of a property expression without a value,
         // we may have a general category, script or some other special cases.
-        if (exp->getValueString() == "") {
+        // These shortcuts apply only to \p{...}: a boundary \b{...} names a
+        // property (e.g., \b{sc} is a Script boundary, not a boundary of gc=Sc).
+        if ((exp->getValueString() == "") && (exp->getKind() != PropertyExpression::Kind::Boundary)) {
             const auto & gcObj = cast<EnumeratedPropertyObject>(getPropertyObject(gc));
             int valcode = gcObj->GetPropertyValueEnumCode(canon);
             if (valcode >= 0) {
@@ -310,7 +312,7 @@ RE * externalizeProperties(RE * r) {
 
 RE * linkAndResolve(RE * r, GrepLinesFunctionType grep) {
     RE * linked = linkProperties(r);
-    linked = promotePropertyReferences(r);
+    linked = promotePropertyReferences(linked);
     RE * std = standardizeProperties(linked);
     return resolveProperties(std, grep);
 }

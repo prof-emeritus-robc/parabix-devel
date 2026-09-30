@@ -122,6 +122,32 @@ RE * removeNullableSuffix(RE * r) {
     return NullableSuffixRemover().transformRE(r);
 }
 
+class LookaheadSuffixRemover final : public RE_Transformer {
+public:
+    LookaheadSuffixRemover() : RE_Transformer("LookaheadSuffixRemoval") {}
+protected:
+    RE * transformAssertion(Assertion * a) override;
+};
+
+RE * LookaheadSuffixRemover::transformAssertion(Assertion * a) {
+    RE * const asserted0 = a->getAsserted();
+    RE * asserted = transform(asserted0);
+    if (a->getKind() == Assertion::Kind::LookAhead) {
+        if (isNullable(asserted)) {
+            // A lookahead of a nullable RE always holds; a negative one never does.
+            if (a->getSense() == Assertion::Sense::Positive) return makeSeq();
+            return makeAlt();
+        }
+        asserted = removeNullableSuffix(asserted);
+    }
+    if (asserted == asserted0) return a;
+    return makeAssertion(asserted, a->getKind(), a->getSense());
+}
+
+RE * removeNullableLookaheadSuffixes(RE * r) {
+    return LookaheadSuffixRemover().transformRE(r);
+}
+
 class ZeroBoundElimination final : public RE_Transformer {
 public:
     ZeroBoundElimination() : RE_Transformer("ZeroBoundElimination") {}

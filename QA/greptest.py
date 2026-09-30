@@ -16,6 +16,10 @@
 # <grepcase regexp="[A-Z]" datafile="simple1" greplines="1"/>
 #
 # </greptest>
+#
+# A grepcase for an open bug may carry a knownbug="<description>" attribute.
+# Its failures are reported as known failures rather than counted as test
+# failures; if it passes, it is reported so that the attribute can be removed.
 
 
 import sys, subprocess, os, optparse, re, stat
@@ -121,15 +125,19 @@ def escape_quotes(e):  return e.replace(u"'", u"'\\''")
 
 test_count = 0
 failure_count = 0
+known_failure_count = 0
+known_bug_pass_count = 0
 
 
 colorizationRE = re.compile("\\x1B\\x5B01;31m\\x1B\\x5BK|\\x1B\\x5Bm")
 def filter_colorization(grep_output):
     return colorizationRE.sub("", grep_output)
 
-def execute_grep_test(flags, regexp, datafile, expected_result):
+def execute_grep_test(flags, regexp, datafile, expected_result, knownbug=None):
     global test_count
     global failure_count
+    global known_failure_count
+    global known_bug_pass_count
     test_count +=1
     flag_string = ""
     for f in flags:
@@ -139,25 +147,40 @@ def execute_grep_test(flags, regexp, datafile, expected_result):
     grep_cmd = u"%s %s '%s' %s" % (grep_program_under_test, flag_string, escape_quotes(regexp), os.path.join(options.datafile_dir, datafile))
     if options.verbose:
         print("Doing: " + grep_cmd, file=sys.stderr)
+    # For a known bug, an error message also marks the test as failing (with -L,
+    # for example, a failed compile would otherwise produce the expected empty
+    # output), and it is kept out of the test log.
+    errors = subprocess.PIPE if knownbug else None
+    error_output = b''
     try:
-        raw_output = subprocess.check_output(grep_cmd.encode('utf-8'), cwd=options.exec_dir, shell=True)
-        grep_out = raw_output.decode()
-    except subprocess.CalledProcessError as e:
-        grep_out = e.output.decode()
+        completed = subprocess.run(grep_cmd.encode('utf-8'), cwd=options.exec_dir, shell=True,
+                                   stdout=subprocess.PIPE, stderr=errors)
+        if knownbug: error_output = completed.stderr
+        grep_out = completed.stdout.decode()
     except UnicodeDecodeError:
+        if knownbug:
+            known_failure_count += 1
+            return
         msg = u"Test failure: {%s} expecting {%s} got malformed UTF-8" % (grep_cmd, expected_result)
         print(msg.encode('utf-8'), file=sys.stderr)
         failure_count += 1
         return
     if len(grep_out) > 0 and grep_out[-1] == '\n': grep_out = grep_out[:-1]
     filtered_out = filter_colorization(grep_out)
-    if filtered_out != expected_result:
+    if knownbug and (filtered_out != expected_result or error_output):
+        known_failure_count += 1
+        if options.verbose:
+            print(u"Known bug (%s): {%s} expecting {%s} got {%s}" % (knownbug, grep_cmd, expected_result, grep_out), file=sys.stderr)
+    elif filtered_out != expected_result:
         msg = u"Test failure: {%s} expecting {%s} got {%s}" % (grep_cmd, expected_result, grep_out)
         print(msg, file=sys.stderr)
         #print(expected_result.encode('utf-8').hex(sep=' '))
         #print(grep_out.encode('utf-8').hex(sep=' '))
         failure_count += 1
     else:
+        if knownbug:
+            known_bug_pass_count += 1
+            print(u"Known bug now passes (%s): {%s}; remove its knownbug attribute" % (knownbug, grep_cmd), file=sys.stderr)
         if options.verbose:
             msg = u"Test success: regexp {%s} on datafile {%s} expecting {%s} got {%s}" % (regexp, datafile, expected_result, grep_out)
             print(msg, file=sys.stderr)
@@ -221,6 +244,7 @@ def start_element_do_test(name, attrs):
         if not 'regexp' in attrs or not 'datafile' in attrs:
             print("Bad grepcase: missing regexp and/or datafile attributes.", file=sys.stderr)
             return
+        knownbug = attrs.get('knownbug')
         grep_case_flags = {}
         if 'flags' in attrs:
             grep_case_flags = parse_flag_string(attrs['flags'])
@@ -230,7 +254,7 @@ def start_element_do_test(name, attrs):
             if "-m" in grep_case_flags:
                 if int(grep_case_flags["-m"]) < int(attrs['grepcount']):
                     expected_result = grep_case_flags["-m"]
-            execute_grep_test(grep_case_flags, attrs['regexp'], attrs['datafile'], expected_result)
+            execute_grep_test(grep_case_flags, attrs['regexp'], attrs['datafile'], expected_result, knownbug)
         else:
             if not 'greplines' in attrs:
                 raise Exception('Expecting grepcount or greplines in grepcase')
@@ -241,13 +265,13 @@ def start_element_do_test(name, attrs):
                 lines = [int(f) for f in lineFields]
             if len(grep_case_flags) > 0:
                 expected_result = expected_grep_results(attrs['datafile'], lines, grep_case_flags)
-                execute_grep_test(grep_case_flags, attrs['regexp'], attrs['datafile'], expected_result)
+                execute_grep_test(grep_case_flags, attrs['regexp'], attrs['datafile'], expected_result, knownbug)
             else:
                 for i in range(options.tests_per_grepcase):
                     flags = {}
                     add_random_flags(flags, fileLength)
                     expected_result = expected_grep_results(attrs['datafile'], lines, flags)
-                    execute_grep_test(flags, attrs['regexp'], attrs['datafile'], expected_result)
+                    execute_grep_test(flags, attrs['regexp'], attrs['datafile'], expected_result, knownbug)
 
 def run_tests(greptest_xml):
     global test_count
@@ -255,7 +279,10 @@ def run_tests(greptest_xml):
     p = xml.parsers.expat.ParserCreate()
     p.StartElementHandler = start_element_do_test
     p.Parse(greptest_xml, 1)
-    print("%i tests executed, %i failures\n"  % (test_count, failure_count), file=sys.stderr)
+    msg = "%i tests executed, %i failures" % (test_count, failure_count)
+    if known_failure_count > 0 or known_bug_pass_count > 0:
+        msg += ", %i known-bug failures, %i known-bug passes" % (known_failure_count, known_bug_pass_count)
+    print(msg + "\n", file=sys.stderr)
     if failure_count > 0: exit(1)
 
 if __name__ == '__main__':

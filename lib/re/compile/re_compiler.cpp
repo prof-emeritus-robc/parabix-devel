@@ -203,12 +203,23 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
     auto ext = f->second;
     unsigned amt = NamedLookAheadAmount(name, *mMain.mCodeUnitAlphabet);
     if (amt > 0) {
-        // Named lookahead expression.
+        // Named lookahead expression.  The external stream marks where the
+        // positive lookahead holds; negate it here for a negative lookahead, so
+        // that the lookahead also holds where it would extend past the end of
+        // the data (read as zeroes).
+        const Assertion * const a = cast<Assertion>(name->getDefinition());
+        auto lookahead = [&](unsigned k) -> PabloAST * {
+            PabloAST * la = mPB.createLookahead(ext.stream(), k);
+            if (a->getSense() == Assertion::Sense::Negative) {
+                la = mPB.createNot(la);
+            }
+            return la;
+        };
         if (marker.position() == Position::AtEnd) {
-            return Marker(mPB.createAnd(marker.stream(), mPB.createLookahead(ext.stream(), amt)));
+            return Marker(mPB.createAnd(marker.stream(), lookahead(amt)));
         } else {
             PabloAST * nextPos = NextCharacter(marker, mPB);
-            return Marker(mPB.createAnd(nextPos, mPB.createLookahead(ext.stream(), amt - 1)), Position::AtNextChar);
+            return Marker(mPB.createAnd(nextPos, lookahead(amt - 1)), Position::AtNextChar);
         }
     }
     auto externalLength = ext.minLength();
@@ -303,21 +314,59 @@ Marker RE_Block_Compiler::compileSeqTail(Seq::const_iterator current, const Seq:
 //  treatment is needed (including single-byte characters, for which the first
 //  and final code units coincide).
 //
-static bool isUTF8CodeUnitRE(const RE * re, const cc::Alphabet * codeUnitAlphabet) {
+//  Track the UTF-8 decoding state through re: pending is the number of
+//  continuation bytes still expected, and chars counts completed characters.
+//  Every string matched by re must drive the state identically; otherwise
+//  (or for anything other than UTF-8 code unit CCs) return false.
+static bool trackUTF8Characters(const RE * re, unsigned & pending, unsigned & chars) {
     if (const CC * cc = dyn_cast<CC>(re)) {
-        return cc->getAlphabet() == codeUnitAlphabet;
+        if ((cc->getAlphabet() != &cc::UTF8) || cc->empty()) return false;
+        const auto lo = lo_codepoint(cc->front());
+        const auto hi = hi_codepoint(cc->back());
+        if (pending > 0) {
+            if ((lo < 0x80) || (hi > 0xBF)) return false;
+            if (--pending == 0) ++chars;
+        } else if (hi <= 0x7F) {
+            ++chars;
+        } else if ((lo >= 0xC0) && (hi <= 0xDF)) {
+            pending = 1;
+        } else if ((lo >= 0xE0) && (hi <= 0xEF)) {
+            pending = 2;
+        } else if ((lo >= 0xF0) && (hi <= 0xF7)) {
+            pending = 3;
+        } else {
+            return false;
+        }
+        return true;
     } else if (const Seq * seq = dyn_cast<Seq>(re)) {
         for (const RE * e : *seq) {
-            if (!isUTF8CodeUnitRE(e, codeUnitAlphabet)) return false;
+            if (!trackUTF8Characters(e, pending, chars)) return false;
         }
-        return !seq->empty();
+        return true;
     } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        if (alt->empty()) return false;
+        bool first = true;
+        unsigned altPending = 0, altChars = 0;
         for (const RE * e : *alt) {
-            if (!isUTF8CodeUnitRE(e, codeUnitAlphabet)) return false;
+            unsigned p = pending, c = chars;
+            if (!trackUTF8Characters(e, p, c)) return false;
+            if (first) {
+                altPending = p; altChars = c; first = false;
+            } else if ((p != altPending) || (c != altChars)) {
+                return false;
+            }
         }
-        return !alt->empty();
+        pending = altPending;
+        chars = altChars;
+        return true;
     }
     return false;
+}
+
+//  Does every string matched by re encode exactly one character in UTF-8?
+static bool isUTF8EncodedCharacter(const RE * re) {
+    unsigned pending = 0, chars = 0;
+    return trackUTF8Characters(re, pending, chars) && (pending == 0) && (chars == 1);
 }
 
 unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, const Seq::const_iterator end, Marker marker) {
@@ -344,7 +393,8 @@ unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, c
     }
     // A UTF-8 encoded character class (an Alt of code unit sequences, as
     // produced by toUTF8) is one character; only multibyte ones need care.
-    if (isa<Alt>(first) && isUTF8CodeUnitRE(first, &cc::UTF8)) {
+    // An Alt of longer code unit sequences (e.g., (?:[bc]c|b)) is not.
+    if (isa<Alt>(first) && isUTF8EncodedCharacter(first)) {
         const auto range = getLengthRange(first, &cc::UTF8);
         return (range.second > 1) ? 1 : 0;
     }
@@ -524,15 +574,16 @@ bool CharacteristicSubexpressionAnalysis(RE * repeated, RE * &E1, RE * &C, RE * 
                 } else break;
             }
             // If we found a nonempty CC_seq, determine if it is a characteristic
-            // expression.
+            // expression: CC_seq must occur exactly once per repetition, even
+            // across the boundary between consecutive repetitions.  So in two
+            // consecutive repetitions, it must occur exactly twice.
             if (j > i) {
-                E1 = makeSeq(s->begin(), s->begin()+i);
-                E2 = makeSeq(s->begin()+j, s->end());
-                // Form E2 E1, where the original seq s is E1 CC_seq E2
-                RE * E2_E1 = makeSeq({E2, E1});
-                if (!CC_Sequence_Search(CC_seq, E2_E1)) {
+                RE * R2 = makeSeq({repeated, repeated});
+                if (CC_Sequence_Search(CC_seq, R2) == 2) {
                     // C is a characteristic subexpression
+                    E1 = makeSeq(s->begin(), s->begin()+i);
                     C = makeSeq(s->begin()+i, s->begin()+j);
+                    E2 = makeSeq(s->begin()+j, s->end());
                     return true;
                 }
             }

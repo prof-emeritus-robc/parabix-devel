@@ -349,7 +349,13 @@ inline size_t parseInt(const StringRef & str, const StringRef & label) {
  * @brief loadCacheSettings
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void ParabixObjectCache::loadCacheSettings() noexcept {
-    getDefaultCachePath(mCachePath);
+    if (codegen::ObjectCacheDir) {
+        mCachePath.assign(codegen::ObjectCacheDir);
+        // the cache cleanup daemon is handed this path; resolve it now
+        sys::fs::make_absolute(mCachePath);
+    } else {
+        getDefaultCachePath(mCachePath);
+    }
     #if 0
 
     const auto configPath = getConfigPath();

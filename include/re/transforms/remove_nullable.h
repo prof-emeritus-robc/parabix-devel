@@ -14,6 +14,11 @@ RE * removeNullablePrefix(RE * re);
 
 RE * removeNullableSuffix(RE * re);
 
+//  Remove the nullable suffix of every lookahead assertion:  (?=R S) holds
+//  exactly where (?=R) does if S matches the empty string (likewise for (?!...)).
+//  A lookahead of a nullable RE always holds (a negative one never does).
+RE * removeNullableLookaheadSuffixes(RE * re);
+
 RE * zeroBoundElimination(RE * re,
                           NameTransformationMode m = NameTransformationMode::None);
 

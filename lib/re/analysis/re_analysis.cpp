@@ -20,6 +20,10 @@ using namespace llvm;
 namespace re {
 
 std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexAlphabet) {
+    // Each position of a multiplexed alphabet is one unit of its source alphabet.
+    if (const auto * mpx = dyn_cast_or_null<cc::MultiplexedAlphabet>(indexAlphabet)) {
+        indexAlphabet = mpx->getSourceAlphabet();
+    }
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         std::pair<int, int> range = std::make_pair(INT_MAX, 0);
         for (const RE * a : *alt) {
@@ -211,6 +215,7 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r) {
             // No parse possible.
             return std::make_pair(makeSeq(), r);
         }
+        // A start symbol (^) is always an unambiguous prefix.
         if (isa<Start>(seq->front())) {
             return std::make_pair(seq->front(),
                                   makeSeq(seq->begin()+1, seq->end()));
@@ -219,23 +224,19 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r) {
         // CC sequence can be matched other than at the beginning
         // of the RE, i.e., by any suffix.
         RE * suffix1 = makeSeq(seq->begin()+1, seq->end());
-        // A start symbol (^) is always an unambiguous prefix.
-        if (isa<Start>(seq->front())) {
-            return std::make_pair(seq->front(), suffix1);
-        }
-        unsigned i = 0;
-        std::vector<RE *> prefixElems;
+        // Extend the prefix one CC at a time until it cannot occur
+        // anywhere within the suffix (leaving a nonempty suffix).
         std::vector<CC *> prefixCCs;
-        while (i < seq->size() - 1) {
+        for (unsigned i = 0; i < seq->size() - 1; ++i) {
             RE * item = (*seq)[i];
-            CC * cc1 = resolveToCC(item);
-            if (cc1 != nullptr) {
+            if (CC * cc1 = resolveToCC(item)) {
                 prefixCCs.push_back(cc1);
-                if (!CC_Sequence_Search(prefixCCs, suffix1)) {
+                if (CC_Sequence_Search(prefixCCs, suffix1) == 0) {
                     // Unambiguous prefix found!
                     return std::make_pair(makeSeq(seq->begin(), seq->begin()+i+1),
                                           makeSeq(seq->begin()+i+1, seq->end()));
                 }
+                continue;
             }
             //  We don't have an expression resolving to a CC.
             //  But if we have a zerowidth item, we can simply
@@ -528,6 +529,14 @@ unsigned grepOffset(const RE * re) {
     } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
         if (a->getKind() == Assertion::Kind::LookBehind) {
             return grepOffset(a->getAsserted());
+        }
+        // A single character lookahead is compiled in place, leaving the
+        // marker on the following position (which, for a negative lookahead,
+        // may be past the end of the data).  Longer lookaheads are named
+        // externals (LookAheadNamer, using the same measure) and zero-width
+        // ones leave the marker where it was.
+        if (getLengthRange(a->getAsserted(), &cc::Unicode).second == 1) {
+            return 1;
         }
         return 0;
     } else if (const Diff * diff = dyn_cast<Diff>(re)) {

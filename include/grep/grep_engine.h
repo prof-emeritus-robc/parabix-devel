@@ -183,11 +183,13 @@ protected:
 class EmitMatch : public MatchAccumulator {
     friend class EmitMatchesEngine;
 public:
-    EmitMatch(bool showFileNames, bool showLineNumbers, bool showContext, bool initialTab)
+    EmitMatch(bool showFileNames, bool showLineNumbers, bool showContext, bool initialTab,
+              GrepRecordBreakKind recordBreak = GrepRecordBreakKind::LF)
         : mShowFileNames(showFileNames),
         mShowLineNumbers(showLineNumbers),
         mContextGroups(showContext),
         mInitialTab(initialTab),
+        mRecordBreak(recordBreak),
         mCurrentFile(0),
         mLineCount(0),
         mLineNum(0),
@@ -201,10 +203,13 @@ public:
     size_t getFileStartPos(size_t fileNo) override;
     void setBatchLineNumber(size_t fileNo, size_t batchLine) override;
 protected:
+    bool isTerminated(const char * line_start, const char * line_end) const;
+    void terminateRecord();
     bool mShowFileNames;
     bool mShowLineNumbers;
     bool mContextGroups;
     bool mInitialTab;
+    GrepRecordBreakKind mRecordBreak;
     unsigned mCurrentFile;
     size_t mLineCount;
     size_t mLineNum;
@@ -228,6 +233,7 @@ public:
     void grepCodeGen() override;
 private:
     uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) override;
+    bool detectsBinaryByNull() const;
 };
 
 class CountOnlyEngine final : public GrepEngine {

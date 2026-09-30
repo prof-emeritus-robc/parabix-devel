@@ -30,9 +30,3 @@ DEPS
     toolchain
     ${Boost_LIBRARIES})
 endif()
-
-if(ARTIFACT_MODE STREQUAL "Single")
-    add_dependencies(${PARABIX_MONO_TARGET} recompile-object-cache)
-else()
-    add_dependencies(idisa recompile-object-cache)
-endif()

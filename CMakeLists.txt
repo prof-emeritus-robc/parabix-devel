@@ -238,6 +238,13 @@ set(CMAKE_REQUIRED_FLAGS)
 # Define parabix version
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_VERSION='\"${Parabix_REVISION}\"'")
 
+# The object cache keys cached kernels by the linker build IDs of the running
+# executable and libraries (see lib/objcache/build_identity.cpp); make sure ELF
+# binaries always carry an NT_GNU_BUILD_ID note.  Mach-O binaries get LC_UUID by default.
+if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+    add_link_options(-Wl,--build-id)
+endif()
+
 # Use gold linker on Linux:gcc
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")

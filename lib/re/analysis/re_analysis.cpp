@@ -530,6 +530,14 @@ unsigned grepOffset(const RE * re) {
         if (a->getKind() == Assertion::Kind::LookBehind) {
             return grepOffset(a->getAsserted());
         }
+        // A single character lookahead is compiled in place, leaving the
+        // marker on the following position (which, for a negative lookahead,
+        // may be past the end of the data).  Longer lookaheads are named
+        // externals (LookAheadNamer, using the same measure) and zero-width
+        // ones leave the marker where it was.
+        if (getLengthRange(a->getAsserted(), &cc::Unicode).second == 1) {
+            return 1;
+        }
         return 0;
     } else if (const Diff * diff = dyn_cast<Diff>(re)) {
         return grepOffset(diff->getLH());

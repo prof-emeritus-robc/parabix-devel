@@ -1306,4 +1306,14 @@ xyz
 <grepcase regexp=".b(?:.[ab]|a*)(?:[bc]c|b)" datafile="alt_alignment" greplines="3 4 5"/>
 <grepcase regexp="b(?:.[ab]|a*)(?:cc|b)" datafile="alt_alignment" greplines="3 4 5"/>
 
+<!-- Single character negative lookaheads hold at the end of an unterminated
+     final line. -->
+<datafile id="lookahead_eof">
+xab
+xac
+xa</datafile>
+<grepcase regexp="xa(?!b)" datafile="lookahead_eof" greplines="3 4"/>
+<grepcase regexp="a(?![bc])" datafile="lookahead_eof" greplines="4"/>
+<grepcase regexp="a(?!b)$" datafile="lookahead_eof" greplines="4"/>
+
 </greptest>

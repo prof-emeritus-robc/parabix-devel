@@ -625,3 +625,20 @@ add_custom_target (json_perf
 add_custom_target (csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
   COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")
+
+# Custom test targets run the tools directly, so each must depend on the tools
+# it runs; otherwise e.g. `make greptest` tests whatever icgrep binary is already
+# in the build directory, stale or absent.
+foreach(TEST_AND_TOOL
+        greptest:icgrep proptest:icgrep abc_test:icgrep
+        u8u16_test:u8u16 u32u8_test:u32u8 editd_test:editd base64_test:base64
+        gb18030_test:gb18030 nfd_test:nfd nfc_test:nfc
+        xml_test:xml json_test:json json_perf:json csv2json_test:csv2json)
+    string(REPLACE ":" ";" PAIR ${TEST_AND_TOOL})
+    list(GET PAIR 0 TEST_TARGET)
+    list(GET PAIR 1 TOOL_TARGET)
+    if (TARGET ${TOOL_TARGET})
+        add_dependencies(${TEST_TARGET} ${TOOL_TARGET})
+    endif()
+endforeach()
+

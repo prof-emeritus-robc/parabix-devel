@@ -12,9 +12,6 @@ DEPS
     re.adt
     pablo.compiler
     grep
-    kernel.bitwise
-    kernel.io
     kernel.pipeline
     kernel.re
-    kernel.unicode
 )

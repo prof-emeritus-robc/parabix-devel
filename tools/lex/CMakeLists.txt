@@ -19,6 +19,7 @@ SRC
     ICU_Boundaries.cpp
     bpe.cpp
 DEPS
+    kernel.re
     pablo.compiler
     kernel.basis
     kernel.io
@@ -28,9 +29,7 @@ DEPS
     kernel.streamutils
     kernel.scan
     kernel.bitwise
-    kernel.util
     toolchain
-    grep
     re.cc
     re.parse
 )

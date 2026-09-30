@@ -10,7 +10,6 @@ SRC
     regexp_kernel.cpp
 DEPS
     kernel.pipeline
-    kernel.basis
     kernel.bitwise
     kernel.streamutils
     kernel.unicode

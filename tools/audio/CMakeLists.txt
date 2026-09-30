@@ -11,7 +11,6 @@ SRC
 DEPS
     kernel.io
     kernel.pipeline
-    kernel.util
     toolchain
     audio
 )
@@ -24,7 +23,6 @@ SRC
 DEPS
     kernel.io
     kernel.pipeline
-    kernel.util
     toolchain
     audio
 )
@@ -37,7 +35,6 @@ SRC
 DEPS
     kernel.io
     kernel.pipeline
-    kernel.util
     toolchain
     audio
 )

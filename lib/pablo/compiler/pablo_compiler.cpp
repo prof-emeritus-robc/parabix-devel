@@ -726,7 +726,7 @@ void PabloCompiler::compileStatement(KernelBuilder & b, const Statement * const 
             FixedVectorType * bTy = b.getBitBlockType();
 
             FixedArray<Type *, 2> retTy;
-            retTy[0] = bTy;
+            retTy[0] = pending->getType();  // the updated accumulator
             retTy[1] = bTy;
             StructType * const resultType = StructType::get(b.getContext(), retTy);
 
@@ -756,7 +756,7 @@ void PabloCompiler::compileStatement(KernelBuilder & b, const Statement * const 
                 Value * const finalNthMask = b.simd_sllv(fieldWidth, splatMask, shift);
 
                 Value * const value = b.simd_pdep(fieldWidth, finalNthMask, to_count);
-                Value * const pendingOut = b.CreateURem(b.mvmd_extract(fieldWidth, sumCountPend, hiBlock), vn);
+                Value * const pendingOut = b.CreateZExtOrTrunc(b.CreateURem(b.mvmd_extract(fieldWidth, sumCountPend, hiBlock), vn), pending->getType());
 
                 Value * retArg = UndefValue::get(resultType);
                 retArg = b.CreateInsertValue(retArg, pendingOut, 0);

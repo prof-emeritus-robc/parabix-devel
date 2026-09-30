@@ -302,7 +302,7 @@ static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::loca
                                                    cl::desc("Trace object cache retrieval."), cl::cat(JIT_InfoOptions));
 
 static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""),
-                                                 cl::desc("Path to the object cache diretory"), cl::cat(CodeGenOptions));
+                                                 cl::desc("Path to the object cache directory"), cl::cat(CodeGenOptions));
 
 // The custom allocator keeps persistent, long-lived exec/data slab pools rather than
 // allocating a small dedicated region per compiled object as LLVM's default in-process

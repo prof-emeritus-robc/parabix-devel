@@ -28,7 +28,9 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
             }
             std::string prefixName = Printer_RE::PrintRE(prefix);
             Name * pfx = makeName(prefixName, prefix);
-            RE * xfrmd = makeSeq({pfx, suffix});
+            // Keep the assertion (and its sense): the name stands for a
+            // zero-width lookahead whose asserted RE begins with the named prefix.
+            RE * xfrmd = makeAssertion(makeSeq({pfx, suffix}), a->getKind(), a->getSense());
             return createName(Printer_RE::PrintRE(xfrmd), xfrmd);
         } else if (a_range.first > mMaxLookahead) {
             // Fixed length RE 

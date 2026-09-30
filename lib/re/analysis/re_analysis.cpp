@@ -215,6 +215,7 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r) {
             // No parse possible.
             return std::make_pair(makeSeq(), r);
         }
+        // A start symbol (^) is always an unambiguous prefix.
         if (isa<Start>(seq->front())) {
             return std::make_pair(seq->front(),
                                   makeSeq(seq->begin()+1, seq->end()));
@@ -223,23 +224,19 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r) {
         // CC sequence can be matched other than at the beginning
         // of the RE, i.e., by any suffix.
         RE * suffix1 = makeSeq(seq->begin()+1, seq->end());
-        // A start symbol (^) is always an unambiguous prefix.
-        if (isa<Start>(seq->front())) {
-            return std::make_pair(seq->front(), suffix1);
-        }
-        unsigned i = 0;
-        std::vector<RE *> prefixElems;
+        // Extend the prefix one CC at a time until it cannot occur
+        // anywhere within the suffix (leaving a nonempty suffix).
         std::vector<CC *> prefixCCs;
-        while (i < seq->size() - 1) {
+        for (unsigned i = 0; i < seq->size() - 1; ++i) {
             RE * item = (*seq)[i];
-            CC * cc1 = resolveToCC(item);
-            if (cc1 != nullptr) {
+            if (CC * cc1 = resolveToCC(item)) {
                 prefixCCs.push_back(cc1);
                 if (CC_Sequence_Search(prefixCCs, suffix1) == 0) {
                     // Unambiguous prefix found!
                     return std::make_pair(makeSeq(seq->begin(), seq->begin()+i+1),
                                           makeSeq(seq->begin()+i+1, seq->end()));
                 }
+                continue;
             }
             //  We don't have an expression resolving to a CC.
             //  But if we have a zerowidth item, we can simply

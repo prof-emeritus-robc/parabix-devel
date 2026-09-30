@@ -496,16 +496,20 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         RE * asserted = a->getAsserted();
         StreamSet * assertedStrm = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, asserted, assertedStrm);
-        if (a->getSense() == Assertion::Sense::Negative) {
+        // A negative lookahead holds wherever the positive one does not; the
+        // positive stream must be fully formed (for variable length lookaheads,
+        // aligned to the prefix) before inverting.
+        auto negateIfRequired = [&](StreamSet * positive) {
+            if (a->getSense() == Assertion::Sense::Positive) return positive;
             StreamSet * negatedStrm = mPB.CreateStreamSet(1);
-            Invert(mPB, assertedStrm, negatedStrm);
-            assertedStrm = negatedStrm;
-        }
+            Invert(mPB, positive, negatedStrm);
+            return negatedStrm;
+        };
         auto r = getLengthRange(asserted, mCtxt.mLengthAlphabet);
         if (r.first == r.second) {
             // Fixed length lookaheads can be stored directly.
             unsigned lgth = static_cast<unsigned>(r.second);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, lgth, r, assertedStrm});
+            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, lgth, r, negateIfRequired(assertedStrm)});
         } else {
             // Apply the logic of matching a lookahead with a unique prefix.  
             // Match positions for the lookahead (assertedStrm) are shifted back to the 
@@ -525,7 +529,7 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
             mPB.CreateKernelCall<IndexedShiftBack>(maskStrm, assertedStrm, assertedBack);
             StreamSet * extStrm = mPB.CreateStreamSet(1);
             AndCombine(mPB, prefStrm, assertedBack, extStrm);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, amt, r, extStrm});
+            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, amt, r, negateIfRequired(extStrm)});
         }
     }
 }
@@ -631,9 +635,6 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
         }
     }
 
-    re::LookAheadNamer LA;
-    xfrmedRE = LA.transformRE(xfrmedRE);
-
     re::VariableLengthCCNamer CCnamer;
     xfrmedRE = CCnamer.transformRE(xfrmedRE);
     for (auto m : CCnamer.mNameMap) {
@@ -651,6 +652,10 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
     if (mCtxt.mCodeUnitAlphabet == &cc::UTF8) {
         xfrmedRE = toUTF8(xfrmedRE);
     }
+
+    re::LookAheadNamer LA;
+    xfrmedRE = LA.transformRE(xfrmedRE);
+
     return xfrmedRE;
 }
 

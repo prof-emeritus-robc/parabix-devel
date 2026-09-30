@@ -54,6 +54,7 @@ RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive, GrepLi
 RE * regular_expression_passes(RE * re) {
     //Optimization passes to simplify the AST.
     RE * r = re;
+    r = removeNullableLookaheadSuffixes(r);
     r = convertToStarNormalForm(r);
     if (codegen::OptLevel > CodeGenOptLevel::Less) {
         r = minimizeRE(r);

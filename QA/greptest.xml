@@ -1207,4 +1207,75 @@ a你a坏
 <grepcase regexp="(ре)\1" datafile="unicode_multichar_backref" greplines="9"/>
 <grepcase regexp="(😀)\1" datafile="unicode_multichar_backref" greplines="11"/>
 <grepcase regexp="(a你)\1" datafile="unicode_multichar_backref" greplines="13"/>
+
+<!-- Script boundaries \b{script}: a boundary wherever the Script value changes,
+     and at the start and end of a line. -->
+<datafile id="script_boundary">
+a b
+ab
+αb
+a1
+xy
+</datafile>
+<grepcase regexp="a\b{script} " datafile="script_boundary" greplines="2"/>
+<grepcase regexp="α\b{script}b" datafile="script_boundary" greplines="4"/>
+<grepcase regexp="α\B{script}b" datafile="script_boundary" greplines=""/>
+
+<!-- Boundaries inside a property value pattern. -->
+<datafile id="value_pattern_boundary">
+a
+æ
+b
+x
+</datafile>
+<grepcase regexp="\p{name=/^LATIN SMALL LETTER A\b{g}$/}" datafile="value_pattern_boundary" greplines="2" knownbug="boundary in value pattern crashes"/>
+<grepcase regexp="\p{name=/\bLETTER A$/}" datafile="value_pattern_boundary" greplines="2" knownbug="boundary in value pattern crashes"/>
+<grepcase regexp="\p{name=/SMALL LETTER\b{w} A$/}" datafile="value_pattern_boundary" greplines="2" knownbug="boundary in value pattern crashes"/>
+
+<!-- Properties inside a property value pattern. -->
+<datafile id="value_pattern_property">
+a
+一
+ 
+æ
+</datafile>
+<grepcase regexp="\p{name=/^[[:upper:]]+$/}" datafile="value_pattern_property" greplines="4" knownbug="properties in value pattern unresolved"/>
+<grepcase regexp="\p{name=/^\p{Lu}+$/}" datafile="value_pattern_property" greplines="4" knownbug="properties in value pattern unresolved"/>
+<grepcase regexp="\p{name=/^[\p{Lu} ]+ A$/}" datafile="value_pattern_property" greplines="2" knownbug="properties in value pattern unresolved"/>
+
+<!-- A hex-escaped codepoint adjacent to an enumerated property boundary. -->
+<datafile id="boundary_hex_cc">
+aé
+1é
+é1
+</datafile>
+<grepcase regexp="1\b{gc}\x{E9}" datafile="boundary_hex_cc" greplines="3" knownbug="Alphabet Byte has no CC compiler"/>
+<grepcase regexp="\x{E9}\b{gc}1" datafile="boundary_hex_cc" greplines="4" knownbug="Alphabet Byte has no CC compiler"/>
+<grepcase regexp="a\B{gc}\x{E9}" datafile="boundary_hex_cc" greplines="2" knownbug="Alphabet Byte has no CC compiler"/>
+
+<!-- Bounded repetitions of sequences containing bounded repetitions, where
+     CC_Sequence_Search wrongly reports a characteristic subexpression. -->
+<datafile id="cc_seq_rep">
+bbaabaabbaabaabbaabaa
+bbaaabaaabbaaabaaabbaaabaaa
+bbaabaabbaabaa
+bbaabaabbaabaabbaabaabbaabaa
+</datafile>
+<grepcase regexp="(?:b{2}aaba{2}){3}" datafile="cc_seq_rep" greplines="2 5" knownbug="CC_Sequence_Search unsafe on bounded Rep"/>
+<grepcase regexp="(?:b{2}aaaba{3}){3}" datafile="cc_seq_rep" greplines="3" knownbug="CC_Sequence_Search unsafe on bounded Rep"/>
+<grepcase regexp="(?:b{2}aaba{2}){4}" datafile="cc_seq_rep" greplines="5" knownbug="CC_Sequence_Search unsafe on bounded Rep"/>
+
+<!-- Captures inside lookahead assertions (named subexpressions). -->
+<datafile id="capture_lookahead">
+abab
+abac
+xyzxyz
+xyzxya
+aXa
+aXb
+</datafile>
+<grepcase regexp="(?=(a)X)\1" datafile="capture_lookahead" greplines="6 7" knownbug="updateReferenceInfo ignores Name definitions"/>
+<grepcase regexp="(?=(x)y)\1yz" datafile="capture_lookahead" greplines="4 5" knownbug="updateReferenceInfo ignores Name definitions"/>
+<grepcase regexp="(?=(ab)a)\1" datafile="capture_lookahead" greplines="2 3" knownbug="updateReferenceInfo ignores Name definitions"/>
+
 </greptest>

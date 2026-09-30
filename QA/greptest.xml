@@ -1232,9 +1232,14 @@ a
 b
 x
 </datafile>
-<grepcase regexp="\p{name=/^LATIN SMALL LETTER A\b{g}$/}" datafile="value_pattern_boundary" greplines="2" knownbug="boundary in value pattern crashes"/>
-<grepcase regexp="\p{name=/\bLETTER A$/}" datafile="value_pattern_boundary" greplines="2" knownbug="boundary in value pattern crashes"/>
-<grepcase regexp="\p{name=/SMALL LETTER\b{w} A$/}" datafile="value_pattern_boundary" greplines="2" knownbug="boundary in value pattern crashes"/>
+<grepcase regexp="\p{name=/^LATIN SMALL LETTER A\b{g}$/}" datafile="value_pattern_boundary" greplines="2"/>
+<grepcase regexp="\p{name=/\bLETTER A$/}" datafile="value_pattern_boundary" greplines="2"/>
+<grepcase regexp="\p{name=/SMALL LETTER\b{w} A$/}" datafile="value_pattern_boundary" greplines="2"/>
+
+<!-- \p{any} is linked to Any, not left as an unlinked property. -->
+<grepcase regexp="\p{any}" datafile="value_pattern_boundary" greplines="2 3 4 5"/>
+<grepcase regexp="\P{any}" datafile="value_pattern_boundary" greplines=""/>
+<grepcase regexp="\p{name=/^\p{any}+$/}" datafile="value_pattern_boundary" greplines="2 3 4 5"/>
 
 <!-- Properties inside a property value pattern. -->
 <datafile id="value_pattern_property">
@@ -1243,9 +1248,9 @@ a
  
 æ
 </datafile>
-<grepcase regexp="\p{name=/^[[:upper:]]+$/}" datafile="value_pattern_property" greplines="4" knownbug="properties in value pattern unresolved"/>
-<grepcase regexp="\p{name=/^\p{Lu}+$/}" datafile="value_pattern_property" greplines="4" knownbug="properties in value pattern unresolved"/>
-<grepcase regexp="\p{name=/^[\p{Lu} ]+ A$/}" datafile="value_pattern_property" greplines="2" knownbug="properties in value pattern unresolved"/>
+<grepcase regexp="\p{name=/^[[:upper:]]+$/}" datafile="value_pattern_property" greplines="4"/>
+<grepcase regexp="\p{name=/^\p{Lu}+$/}" datafile="value_pattern_property" greplines="4"/>
+<grepcase regexp="\p{name=/^[\p{Lu} ]+ A$/}" datafile="value_pattern_property" greplines="2"/>
 
 <!-- A hex-escaped codepoint adjacent to an enumerated property boundary. -->
 <datafile id="boundary_hex_cc">

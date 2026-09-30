@@ -312,7 +312,7 @@ RE * externalizeProperties(RE * r) {
 
 RE * linkAndResolve(RE * r, GrepLinesFunctionType grep) {
     RE * linked = linkProperties(r);
-    linked = promotePropertyReferences(r);
+    linked = promotePropertyReferences(linked);
     RE * std = standardizeProperties(linked);
     return resolveProperties(std, grep);
 }

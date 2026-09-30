@@ -1161,7 +1161,9 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
         breakCC = re::makeCC(0x0A, &cc::UTF8);
     }
 
-    matchingRE = resolveCaseInsensitiveMode(matchingRE, mCaseInsensitive);
+    // Link and resolve properties and boundaries as for the main engine; a search
+    // of property value names may itself contain property value patterns.
+    matchingRE = resolveModesAndExternalSymbols(matchingRE, mCaseInsensitive, lineNumGrep);
     matchingRE = regular_expression_passes(matchingRE);
     matchingRE = toUTF8(matchingRE);
 
@@ -1274,7 +1276,7 @@ void InternalMultiSearchEngine::grepCodeGen(const re::PatternVector & patterns) 
     for (unsigned i = 0; i < n; i++) {
         StreamSet * const MatchResults = E.CreateStreamSet();
 
-        auto r = resolveCaseInsensitiveMode(patterns[i].second, mCaseInsensitive);
+        auto r = resolveModesAndExternalSymbols(patterns[i].second, mCaseInsensitive, lineNumGrep);
         r = regular_expression_passes(r);
         r = toUTF8(r);
 

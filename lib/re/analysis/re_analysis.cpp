@@ -20,6 +20,10 @@ using namespace llvm;
 namespace re {
 
 std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexAlphabet) {
+    // Each position of a multiplexed alphabet is one unit of its source alphabet.
+    if (const auto * mpx = dyn_cast_or_null<cc::MultiplexedAlphabet>(indexAlphabet)) {
+        indexAlphabet = mpx->getSourceAlphabet();
+    }
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         std::pair<int, int> range = std::make_pair(INT_MAX, 0);
         for (const RE * a : *alt) {

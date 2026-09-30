@@ -117,9 +117,62 @@ const CC * matchableCodepoints(const RE * re) {
     } else if (isa<Any>(re)) {
         return makeCC(0, 0x10FFFF);
     } else if (const Name * n = dyn_cast<Name>(re)) {
-        return matchableCodepoints(n->getDefinition());
+        const RE * const defn = n->getDefinition();
+        return defn ? matchableCodepoints(defn) : makeCC();
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        return matchableCodepoints(c->getCapturedRE());
+    } else if (const Group * g = dyn_cast<Group>(re)) {
+        // Modes are not applied here (case folding is not available at this
+        // level), so e.g. (?i:a) yields only 'a': an under-approximation.
+        return matchableCodepoints(g->getRE());
+    } else if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(re)) {
+        // A boundary is zero-width; an unresolved property is unknown.
+        const RE * const resolved = pe->getResolvedRE();
+        if ((pe->getKind() == PropertyExpression::Kind::Codepoint) && resolved) {
+            return matchableCodepoints(resolved);
+        }
+        return makeCC();
+    } else if (const Range * rg = dyn_cast<Range>(re)) {
+        const CC * const lo = matchableCodepoints(rg->getLo());
+        const CC * const hi = matchableCodepoints(rg->getHi());
+        if (lo->empty() || hi->empty()) {
+            return makeCC();
+        }
+        const auto lo_cp = lo_codepoint(lo->front());
+        const auto hi_cp = hi_codepoint(hi->back());
+        if (lo_cp > hi_cp) {
+            return makeCC();
+        }
+        return makeCC(lo_cp, hi_cp, lo->getAlphabet());
+    } else if (isa<Permute, Interleavable>(re)) {
+        // A single character is matched by one term while all others match
+        // the empty string.
+        auto termsMatchable = [](const auto & terms) -> const CC * {
+            const RE * nonEmptyTerm = nullptr;
+            for (const RE * term : terms) {
+                if (!matchesEmptyString(term)) {
+                    if (nonEmptyTerm) {
+                        return makeCC();  // at least two characters are required
+                    }
+                    nonEmptyTerm = term;
+                }
+            }
+            if (nonEmptyTerm) {
+                return matchableCodepoints(nonEmptyTerm);
+            }
+            CC * matchable = makeCC();
+            for (const RE * term : terms) {
+                matchable = makeCC(matchable, matchableCodepoints(term));
+            }
+            return matchable;
+        };
+        return isa<Permute>(re) ? termsMatchable(*cast<Permute>(re)) : termsMatchable(*cast<Interleavable>(re));
+    } else if (isa<Start, End, Assertion, Reference>(re)) {
+        // Zero-width, or a back-reference, which repeats a capture and so
+        // cannot match a single character on its own.
+        return makeCC();
     }
-    return makeCC(); // otherwise = Start, End, Assertion
+    UnexpectedRE("matchableCodepoints", re);
 }
 
 }

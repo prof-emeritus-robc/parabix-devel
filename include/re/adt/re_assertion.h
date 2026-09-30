@@ -4,10 +4,9 @@
  */
 
 #pragma once
-
+#include <re/adt/re_re.h>
 #include <re/adt/adt.h>
-#include <re/adt/re_empty_set.h>
-#include <re/analysis/nullable.h>
+
 
 namespace re {
 
@@ -21,7 +20,6 @@ public:
     Assertion::Sense getSense() const {return mSense;}
     
     static Assertion::Kind reverseKind(Assertion::Kind k);
-    static Assertion::Sense negateSense(Assertion::Sense s);
     static Assertion * Create(RE * asserted, Kind k, Sense s) {
         return new Assertion(asserted, k, s);
     }

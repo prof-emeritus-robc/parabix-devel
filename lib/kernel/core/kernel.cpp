@@ -21,6 +21,8 @@
 #endif
 #include <boost/intrusive/detail/math.hpp>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <toolchain/toolchain.h>
+#include <kernel/illustrator/illustrator.h>
 
 using namespace llvm;
 using namespace boost;
@@ -153,6 +155,7 @@ bool Kernel::requiresExplicitPartialFinalStride() const {
                     if (LLVM_LIKELY(attr.amount() > 0)) {
                         return true;
                     }
+                case AttrId::AddCarry:
                 case AttrId::Deferred:
                     return true;
                 default: break;

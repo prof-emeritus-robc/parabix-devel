@@ -17,6 +17,8 @@
 #include <pablo/parse/pablo_type.h>
 #include <pablo/ast/ps_assign.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <pablo/parse/symbol_table.h>
+#include <pablo/parse/pablo_source_kernel.h>
 
 
 #define TOKEN_CHECK(TOKEN, EXPECTED_TYPE, HINT) {\

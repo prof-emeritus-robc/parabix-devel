@@ -1,6 +1,7 @@
 #include <objcache/object_cache.h>
 
 #include <objcache/object_cache_util.hpp>
+#include <objcache/build_identity.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/driver/driver.h>
@@ -38,37 +39,19 @@ bool ParabixObjectCache::mStartedCacheCleanupDaemon = false;
 // file exists.
 //
 
-#define MONTH_1 \
-    ((__DATE__ [0] == 'O' || __DATE__ [0] == 'N' || __DATE__ [0] == 'D') ? '1' : '0')
-#define MONTH_2 \
-    (__DATE__ [2] == 'n' ? (__DATE__ [1] == 'a' ? '1' : '6') \
-    : __DATE__ [2] == 'b' ? '2' \
-    : __DATE__ [2] == 'r' ? (__DATE__ [0] == 'M' ? '3' : '4') \
-    : __DATE__ [2] == 'y' ? '5' \
-    : __DATE__ [2] == 'l' ? '7' \
-    : __DATE__ [2] == 'g' ? '8' \
-    : __DATE__ [2] == 'p' ? '9' \
-    : __DATE__ [2] == 't' ? '0' \
-    : __DATE__ [2] == 'v' ? '1' : '2')
-#define DAY_1 (__DATE__[4] == ' ' ? '0' : __DATE__[4])
-#define DAY_2 (__DATE__[5])
-#define YEAR_1 (__DATE__[9])
-#define YEAR_2 (__DATE__[10])
-#define HOUR_1 (__TIME__[0])
-#define HOUR_2 (__TIME__[1])
-#define MINUTE_1 (__TIME__[3])
-#define MINUTE_2 (__TIME__[4])
-#define SECOND_1 (__TIME__[6])
-#define SECOND_2 (__TIME__[7])
-
-
-
-
-const static auto CACHE_PREFIX = PARABIX_VERSION +
-                          std::string{'@',
-                          MONTH_1, MONTH_2, DAY_1, DAY_2, YEAR_1, YEAR_2,
-                          HOUR_1, HOUR_2, MINUTE_1, MINUTE_2, SECOND_1, SECOND_2,
-                          '_'};
+// Cached kernels are keyed by the identity of the running code (the build IDs of
+// the executable and the Parabix libraries), so that rebuilding any of them
+// invalidates the cache automatically.
+static const std::string & cachePrefix() {
+    static const std::string prefix = [] {
+        std::string p = "parabix-" + parabix::getBuildIdentity() + "_";
+        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            errs() << "Object cache prefix: " << p << "\n";
+        }
+        return p;
+    }();
+    return prefix;
+}
 
 const static auto SIGNATURE = "signature";
 
@@ -110,7 +93,7 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
     }
 
     Path fileName(mCachePath);
-    sys::path::append(fileName, CACHE_PREFIX);
+    sys::path::append(fileName, cachePrefix());
     const auto moduleId = kernel->makeCacheName(builder);
     fileName.append(moduleId);
     fileName.append(KERNEL_FILE_EXTENSION);
@@ -216,7 +199,7 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
     mCachedObject[moduleId] = Obj;
 
     Path objectName(mCachePath);
-    sys::path::append(objectName, CACHE_PREFIX);
+    sys::path::append(objectName, cachePrefix());
     objectName.append(moduleId);
     objectName.append(OBJECT_FILE_EXTENSION);
 

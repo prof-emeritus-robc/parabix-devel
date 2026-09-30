@@ -7,6 +7,7 @@
 
 #include <llvm/Support/raw_ostream.h>
 #include <kernel/core/kernel_builder.h>
+#include <toolchain/toolchain.h>
 
 using namespace llvm;
 

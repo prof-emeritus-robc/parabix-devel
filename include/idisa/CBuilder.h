@@ -4,7 +4,6 @@
  */
 #pragma once
 
-#include <toolchain/toolchain.h>
 #include <codegen/FunctionTypeBuilder.h>
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <llvm/IR/IRBuilder.h>

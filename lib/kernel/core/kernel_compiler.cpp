@@ -19,6 +19,7 @@
 
 
 #include <kernel/pipeline/driver/driver.h>
+#include <toolchain/toolchain.h>
 
 using namespace llvm;
 using namespace boost;

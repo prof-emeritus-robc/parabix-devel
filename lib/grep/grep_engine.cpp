@@ -60,10 +60,7 @@
 #include <re/cc/cc_kernel.h>
 #include <re/alphabet/multiplex_CCs.h>
 #include <re/transforms/re_transformer.h>
-#include <re/transforms/re_contextual_simplification.h>
-#include <re/transforms/exclude_CC.h>
 #include <re/transforms/remove_nullable.h>
-#include <re/transforms/replaceCC.h>
 #include <re/transforms/re_multiplex.h>
 #include <re/transforms/expand_permutes.h>
 #include <re/transforms/name_intro.h>

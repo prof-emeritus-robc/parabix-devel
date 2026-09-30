@@ -1,7 +1,6 @@
 #include <grep/nested_grep_engine.h>
 #include <re/unicode/regex_passes.h>
 #include <re/unicode/casing.h>
-#include <re/transforms/exclude_CC.h>
 #include <re/transforms/to_utf8.h>
 #include <re/unicode/re_name_resolve.h>
 #include <kernel/io/source_kernel.h>
@@ -122,14 +121,8 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
         E.setStride(E.getTypeSystem().getBitBlockWidth());
 
-        std::string tmp;
-        raw_string_ostream name(tmp);
-        name << "gitignore";
-
         const auto n = patterns.size();
         assert (n > 0);
-        SmallVector<Kernel *, 32> pipeline;
-        pipeline.reserve(n + 1);
 
         Kernel * const outerKernel = mNested.back();
         StreamSet * resultSoFar = breaks;
@@ -139,7 +132,6 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             chained->setInputStreamSetAt(0, basisBits);
             chained->setInputStreamSetAt(1, U8index);
             chained->setInputStreamSetAt(2, breaks);
-            pipeline.push_back(chained);
             assert (chained->getNumOfStreamOutputs() > 0);
             resultSoFar = chained->getOutputStreamSet(0); assert (resultSoFar);
         }
@@ -163,40 +155,22 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
             auto r = resolveCaseInsensitiveMode(patterns[i].second, mCaseInsensitive);
             r = regular_expression_passes(r);
-            //r = re::exclude_CC(r, breakCC);
-            //r = resolveAnchors(r, breakCC);
             r = toUTF8(r);
             // check if we need to combine the current result with the new set of matches
             const bool exclude = (patterns[i].first == re::PatternKind::Exclude);
             if (i || outerKernel || exclude) {
                 ctxt.setCombiningStream(resultSoFar, exclude ? RE_CombiningType::Exclude : RE_CombiningType::Include);
             }
-            Kernel * K = E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, MatchResults);
-            pipeline.push_back(K);
+            E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, MatchResults);
             resultSoFar = MatchResults;
 
         }
         assert (resultSoFar == E.getOutputStreamSet(0));
 
-        mGrepDriver.generateUncachedKernels();
-
-        for (Kernel * K : pipeline) {
-            char flags = '0';
-            if (K->getSharedStateType()) {
-                flags += 1;
-            }
-            if (LLVM_UNLIKELY(K->getThreadLocalStateType())) {
-                flags += 2;
-            }
-            if (LLVM_UNLIKELY(K->allocatesInternalStreamSets())) {
-                flags += 4;
-            }
-            name << flags;
-        }
-        name.flush();
-
-        E.setUniqueName(name.str());
-
+        // The default signature identifies each family-called kernel by its family
+        // name (its stride, attributes and bindings), so structurally different
+        // nested pipelines never share an object cache entry, while pipelines that
+        // differ only in their regular expressions do.
         kernel = E.makeKernel();
     }
 

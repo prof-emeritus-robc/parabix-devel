@@ -26,6 +26,7 @@ bool isNullable(const RE * re) {
                 return true;
             }
         }
+        return false;
     } else if (const Rep* re_rep = dyn_cast<const Rep>(re)) {
         return (re_rep->getLB() == 0) || isNullable(re_rep->getRE());
     } else if (isa<Diff>(re)) {
@@ -36,26 +37,33 @@ bool isNullable(const RE * re) {
         return isNullable(e->getLH()) && isNullable(e->getRH());
     } else if (const Group * g = dyn_cast<const Group>(re)) {
         return isNullable(g->getRE());
+    } else if (const Name * n = dyn_cast<const Name>(re)) {
+        const RE * const defn = n->getDefinition();
+        return defn && isNullable(defn);
+    } else if (const Capture * c = dyn_cast<const Capture>(re)) {
+        return isNullable(c->getCapturedRE());
+    } else if (const Permute * p = dyn_cast<const Permute>(re)) {
+        for (const RE * term : *p) {
+            if (!isNullable(term)) {
+                return false;
+            }
+        }
+        return true;
+    } else if (const Interleavable * s = dyn_cast<const Interleavable>(re)) {
+        for (const RE * term : *s) {
+            if (!isNullable(term)) {
+                return false;
+            }
+        }
+        return true;
+    } else if (isa<Any, CC, Range, PropertyExpression>(re)) {
+        return false;
+    } else if (isa<Assertion, Start, End, Reference>(re)) {
+        // Zero-width or back-referenced: these match the empty string only in
+        // some contexts, so they are not unconditionally nullable.
+        return false;
     }
-    return false;
-}
-
-struct ZeroWidthValidator : public RE_Validator {
-    ZeroWidthValidator() : RE_Validator() {}
-    bool validateName(const Name * n) override {
-        RE * defn = n->getDefinition();
-        return defn && validate(defn);
-    }
-    bool validateAssertion(const Assertion * a) override {return true;}
-    bool validateAny(const Any *) override {return false;}
-    bool validateCC(const CC *) override {return false;}
-    bool validateRange(const Range *) override {return false;}
-    bool validateDiff(const Diff * d) override {return validate(d->getLH());}
-    bool validateIntersect(const Intersect * x) override {return validate(x->getLH()) || validate(x->getRH());}
-};
-
-bool isZeroWidth(const RE * re) {
-    return ZeroWidthValidator().validateRE(re);
+    UnexpectedRE("isNullable", re);
 }
 
 } // namespace re

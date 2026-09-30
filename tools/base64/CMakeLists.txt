@@ -12,6 +12,4 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.util
-    re.adt
-    re.cc
 )

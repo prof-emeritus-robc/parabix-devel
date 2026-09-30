@@ -6,8 +6,8 @@
 namespace kernel {
 
 
-struct StreamSetPtr {
-
+class StreamSetPtr {
+public:
     // TODO: if we're returning a bitstream, we cannot actually return a single bit value.
     // should this instead return a bitblock pointer type?
 

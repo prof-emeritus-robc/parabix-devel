@@ -16,6 +16,7 @@
 #include <kernel/core/kernel.h>
 #include <map>
 #include <memory>
+#include <re/printer/re_printer.h>
 
 using namespace llvm;
 
@@ -145,6 +146,7 @@ CC * variableCodepoints(RE * re) {
             }
         }
         if (accumCC) return accumCC;
+        return makeCC();
     } else if (Rep * rep = dyn_cast<Rep>(re)) {
         if (rep->getLB() == rep->getUB()) {
             return variableCodepoints(rep->getRE());
@@ -166,9 +168,12 @@ CC * variableCodepoints(RE * re) {
         return variableCodepoints(c->getCapturedRE());
     } else if (Reference * r = dyn_cast<Reference>(re)) {
         return variableCodepoints(r->getCapture());
+    } else if (isa<Any, Assertion, CC, Range, End, PropertyExpression, Start,
+                   Permute, Interleavable>(re)) {
+        // Other expressions are all singleCCs, not variable.
+        return makeCC();
     }
-    // Other expressions are all singleCCs, not variable.
-    return makeCC();
+    UnexpectedRE("variableCodepoints", re);
 }
 
 unsigned fixedCodepointCount(RE * re, CC * variableCC) {
@@ -218,8 +223,10 @@ unsigned fixedCodepointCount(RE * re, CC * variableCC) {
         return fixedCodepointCount(c->getCapturedRE(), variableCC);
     } else if (Reference * r = dyn_cast<Reference>(re)) {
         return fixedCodepointCount(r->getCapture(), variableCC);
+    } else if (isa<Any, Assertion, Range, End, Start, Permute, Interleavable>(re)) {
+        return 0;
     }
-    return 0;
+    UnexpectedRE("fixedCodepointCount", re);
 }
 
 std::string Repeated_CC_Seq_Namer::genSym() {

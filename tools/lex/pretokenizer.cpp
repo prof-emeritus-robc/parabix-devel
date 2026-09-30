@@ -28,6 +28,7 @@
 #include <map>
 #include <vector>
 #include <string>
+#include <toolchain/toolchain.h>
 
 using namespace llvm;
 using namespace codegen;

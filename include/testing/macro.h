@@ -8,8 +8,6 @@
 #include <tuple>
 #include <testing/test_case.hpp>
 #include <testing/runtime.h>
-#include <testing/stream_gen.hpp>
-#include <toolchain/toolchain.h>
 
 #define TEST_CASE(NAME, ...)                                                                                    \
 template<typename... Ps>                                                                                        \

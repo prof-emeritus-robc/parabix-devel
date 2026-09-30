@@ -6,10 +6,10 @@
 
 #include <map>
 #include <vector>
-#include <kernel/pipeline/pipeline_builder.h>
-#include <ucd/core/unicode_set.h>
 #include <ucd/data/PropertyAliases.h>
 #include <ucd/utf/transchar.h>
+namespace kernel { class StreamSet; }
+namespace kernel { class PipelineBuilder; }
 
 //
 //  Given a Unicode character stream represented by a

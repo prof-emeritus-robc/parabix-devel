@@ -11,7 +11,6 @@
 #include <re/adt/re_cc.h>
 #include <re/adt/re_seq.h>
 #include <re/adt/re_rep.h>
-#include <re/printer/re_printer.h>
 
 namespace re {
 

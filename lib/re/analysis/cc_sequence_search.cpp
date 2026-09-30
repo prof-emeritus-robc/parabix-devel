@@ -98,6 +98,8 @@ stateVector_t ccSequenceSearchObject::search_from_state(RE * re, stateVector_t v
             CC_matches |= (cc->intersects(*mCCseq[i])) << i;
         }
         return ((CC_matches & v) << 1) | mInitState;
+    } else if (!isa<Range, Group, Permute, Interleavable>(re)) {
+        UnexpectedRE("CC_Sequence_Search", re);
     }
     llvm::errs() << "CC sequence search failed to process " << Printer_RE::PrintRE(re) << "\n";
     return 0;

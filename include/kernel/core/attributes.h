@@ -196,6 +196,14 @@ struct Attribute {
 
         // NOTE: currently supports only the removal of "added" items.
 
+        AddCarry,
+
+        // Applies only to a single-stream, Fixed rate output bitstream.  The final item count
+        // is extended by one position exactly when the kernel writes a 1 bit at the position
+        // one past the end of its principal input (the EOFbit position); i.e., the produced
+        // item count is the available item count of that input plus the value of that bit.
+        // Buffers are sized as for Add1; the pipeline reads the bit after the final invocation.
+
         Linear,
 
         // Either an input buffer is required to be linearly accessible or a managed output
@@ -434,6 +442,10 @@ private:
 
 inline Attribute Add1() {
     return Attribute(Attribute::KindId::Add, 1);
+}
+
+inline Attribute AddCarry() {
+    return Attribute(Attribute::KindId::AddCarry, 1);
 }
 
 inline Attribute Truncate(const unsigned k = 1) {

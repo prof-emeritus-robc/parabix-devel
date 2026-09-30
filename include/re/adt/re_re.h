@@ -69,5 +69,11 @@ bool matchesEmptyString(const RE * re);
 
 [[noreturn]] void UnsupportedRE(const std::string & errmsg);
 
+// The name of an RE class, e.g., "Seq".
+const char * getClassTypeName(RE::ClassTypeId t);
+
+// Report a fatal error for an RE whose type the named routine does not handle.
+[[noreturn]] void UnexpectedRE(const char * routine, const RE * re);
+
 }
 

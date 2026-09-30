@@ -9,8 +9,7 @@
 #include <string>                       // for ExternalNameMap key
 #include <vector>                       // for vector<>::iterator
 #include <boost/container/flat_map.hpp>
-#include <re/adt/adt.h>              // for Seq
-#include <re/alphabet/alphabet.h>
+#include <re/adt/adt.h>
 
 namespace cc { class CC_Compiler; class Alphabet;}
 namespace pablo { class PabloAST; }

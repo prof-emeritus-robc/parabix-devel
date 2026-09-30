@@ -25,18 +25,12 @@ public:
         return mSourceAlphabet;
     }
     
-    const std::vector<std::vector<unsigned>> & getExclusiveSetIDs() const {
-        return mExclusiveSetIDs;
-    }
-    
     const CC_Set & getMultiplexedCCs() const {
         return mMultiplexedCCs;
     }
     
     re::CC * transformCC(const re::CC * sourceCC) const;
     
-    re::CC * invertCC(const re::CC * transformedCC) const;
-
     friend MultiplexedAlphabet * makeMultiplexedAlphabet(const std::string alphabetName, const CC_Set CCs);
 protected:
     MultiplexedAlphabet(const std::string alphabetName, const CC_Set CCs);

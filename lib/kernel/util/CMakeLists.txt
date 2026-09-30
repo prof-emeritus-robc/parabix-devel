@@ -19,6 +19,4 @@ DEPS
     pablo.bixnum
     re.cc
     kernel.pipeline
-    kernel.basis
-    kernel.streamutils
 )

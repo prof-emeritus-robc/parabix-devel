@@ -306,6 +306,7 @@ public:
     void writeKernelCall(KernelBuilder & b);
     void buildKernelCallArgumentList(KernelBuilder & b, ArgVec & args);
     void updateProcessedAndProducedItemCounts(KernelBuilder & b, Value * rejectedTermSignal);
+    Value * resolveAddCarryItemCount(KernelBuilder & b, const StreamSetPort outputPort, Value * const produced);
     void writeInternalProcessedAndProducedItemCounts(KernelBuilder & b, const bool atTermination);
     void readAndUpdateInternalProcessedAndProducedItemCounts(KernelBuilder & b);
     Value * addVirtualBaseAddressArg(KernelBuilder & b, const StreamSetBuffer * buffer, ArgVec & args);

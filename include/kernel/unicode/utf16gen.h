@@ -4,9 +4,10 @@
  */
 
 #pragma once
-
 #include <pablo/pablo.h>
 #include <kernel/core/kernel_builder.h>
+namespace kernel { class KernelBuilder; }
+
 
 //
 // UTF-16 encoding requires one or two code units per Unicode character.

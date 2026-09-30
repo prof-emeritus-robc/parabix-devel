@@ -4,9 +4,9 @@
  */
 #pragma once
 
-#include <kernel/core/kernel_builder.h>
-#include <kernel/pipeline/pipeline_builder.h>
-#include <pablo/pablo.h>
+#include <pablo/compiler/pablo_kernel.h>
+namespace kernel { class PipelineBuilder; }
+namespace kernel { class StreamSet; }
 
 using namespace kernel;
 //

@@ -13,13 +13,13 @@
 #include <set>
 #include <thread>
 #include <boost/filesystem.hpp>
-#include <re/analysis/capture-ref.h>
-#include <re/alphabet/multiplex_CCs.h>
 #include <re/parse/GLOB_parser.h>
 #include <kernel/core/callback.h>
 #include <kernel/util/linebreak_kernel.h>
 #include <kernel/re/regexp_kernel.h>
+#include <re/analysis/capture-ref.h>
 #include <grep/grep_kernel.h>
+#include <re/transforms/to_utf8.h>
 
 namespace re { class CC; class Name; class RE; }
 namespace llvm { namespace cl { class OptionCategory; } }

@@ -5,7 +5,6 @@
 #include <string>
 #include <iostream>
 #include <stdexcept>
-#include <toolchain/toolchain.h>
 
 namespace papi {
 

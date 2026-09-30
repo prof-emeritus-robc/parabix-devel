@@ -14,6 +14,8 @@
 #include <boost/graph/adjacency_list.hpp>
 #include "../pipeline/compiler/analysis/lexographic_ordering.hpp" // TODO: <- move this to a util folder we use this in the final version
 #include <mutex>
+#include <shared_mutex>
+#include <cstdlib>
 #include <stack>
 
 #if defined(_WIN32)
@@ -23,6 +25,7 @@
 #elif defined(__linux__) || defined(__APPLE__)
 #include <sys/ioctl.h>
 #include <stdio.h>
+#include <toolchain/toolchain.h>
 #endif
 
 using namespace boost;
@@ -78,6 +81,53 @@ using StreamDataKey = const void *;
 
 struct StreamDataStateObject;
 
+// Captures are made by generated kernel code on whichever pipeline thread runs
+// the kernel.  Those threads have no ThreadSafeSlabAllocator, so all capture
+// storage comes from this illustrator-owned, mutex-guarded arena instead.  It is
+// released when the illustrator is destroyed.
+class CaptureArena {
+public:
+    void * allocate(size_t size, size_t align) {
+        if (align < alignof(std::max_align_t)) {
+            align = alignof(std::max_align_t);
+        }
+        assert (is_pow2(align));
+        std::lock_guard<std::mutex> L(Lock);
+        uintptr_t addr = (reinterpret_cast<uintptr_t>(Bump) + align - 1) & ~(uintptr_t)(align - 1);
+        if ((Bump == nullptr) || (addr + size > reinterpret_cast<uintptr_t>(End))) {
+            const size_t slabSize = std::max<size_t>(SLAB_SIZE, size + align);
+            uint8_t * const slab = static_cast<uint8_t *>(std::malloc(slabSize));
+            if (LLVM_UNLIKELY(slab == nullptr)) {
+                report_fatal_error("Illustrator: out of memory");
+            }
+            Slabs.push_back(slab);
+            Bump = slab;
+            End = slab + slabSize;
+            addr = (reinterpret_cast<uintptr_t>(Bump) + align - 1) & ~(uintptr_t)(align - 1);
+        }
+        Bump = reinterpret_cast<uint8_t *>(addr + size);
+        return reinterpret_cast<void *>(addr);
+    }
+
+    template <typename T, typename... Args>
+    T * create(Args &&... args) {
+        return new (allocate(sizeof(T), alignof(T))) T(std::forward<Args>(args)...);
+    }
+
+    ~CaptureArena() {
+        for (uint8_t * slab : Slabs) {
+            std::free(slab);
+        }
+    }
+
+private:
+    static constexpr size_t SLAB_SIZE = 1024UL * 1024UL;
+    std::mutex Lock;
+    std::vector<uint8_t *> Slabs;
+    uint8_t * Bump = nullptr;
+    uint8_t * End = nullptr;
+};
+
 struct StreamDataCapture;
 
 struct StreamDataElement {
@@ -120,7 +170,7 @@ struct StreamDataCapture : public SlabAllocatedObject {
     const StreamDataStateObject * StateObject;
     #endif
 
-    inline void append(StreamDataStateObject * stateObjectEntry,
+    inline void append(CaptureArena & arena, StreamDataStateObject * stateObjectEntry,
                        const size_t strideNum, const uint8_t * streamData, const size_t from, const size_t to, const size_t blockWidth);
 
     StreamDataCapture(const char * streamName, size_t rows, size_t cols, size_t iw, uint8_t ordering,
@@ -141,6 +191,9 @@ struct StreamDataStateObject : public SlabAllocatedObject {
     size_t SequenceLength = 0;
     LoopVector LoopIteration;
     bool InKernel = false;
+    // Successive segments of a kernel may run on different pipeline threads;
+    // serialize the updates to this kernel's capture state.
+    std::mutex Lock;
 
     inline void enterKernel() {
         assert (!InKernel);
@@ -194,7 +247,7 @@ inline void registerStreamDataCapture(const char * kernelName, const char * stre
                                       const IllustratorTypeId illustratorType, const char replacement0, const char replacement1,
                                       const size_t * loopIdArray) {
 
- //   std::lock_guard<std::mutex> L(AllocatorLock);
+    std::unique_lock<std::shared_mutex> L(RegistryLock);
     StreamDataCapture * newCapture = nullptr;
     #ifndef NDEBUG
     StreamDataStateObject * so = nullptr;
@@ -202,7 +255,7 @@ inline void registerStreamDataCapture(const char * kernelName, const char * stre
     auto r = RegisteredStateObjects.find(stateObject);
     if (r == RegisteredStateObjects.end()) {
         StreamDataStateObject * newStateObjectEntry =
-            new StreamDataStateObject(kernelName, streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
+            Arena.create<StreamDataStateObject>(kernelName, streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
         #ifndef NDEBUG
         so = newStateObjectEntry;
         #endif
@@ -229,7 +282,7 @@ inline void registerStreamDataCapture(const char * kernelName, const char * stre
             }
             current = next;
         }
-        newCapture = new StreamDataCapture(streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
+        newCapture = Arena.create<StreamDataCapture>(streamName, rows, cols, itemWidth, memoryOrdering, illustratorType, replacement0, replacement1, loopIdArray);
         current->Next = newCapture;
     }
     assert (newCapture);
@@ -248,6 +301,7 @@ inline void doStreamDataCapture(const char * streamName, const void * stateObjec
                                 const size_t blockWidth) {
 
     StreamDataStateObject * const stateObjectEntry = getStateObject(stateObject);
+    std::lock_guard<std::mutex> L(stateObjectEntry->Lock);
     StreamDataCapture * current = &stateObjectEntry->First;
     for (;;) {
         assert (current);
@@ -258,48 +312,59 @@ inline void doStreamDataCapture(const char * streamName, const void * stateObjec
         current = current->Next;
     }
 
-    current->append(stateObjectEntry, strideNum, streamData, from, to, blockWidth);
+    current->append(Arena, stateObjectEntry, strideNum, streamData, from, to, blockWidth);
 };
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief enterKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void enterKernel(const void * stateObject) {
-    getStateObject(stateObject)->enterKernel();
+    StreamDataStateObject * const so = getStateObject(stateObject);
+    std::lock_guard<std::mutex> L(so->Lock);
+    so->enterKernel();
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief enterLoop
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void enterLoop(const void * stateObject) {
-    getStateObject(stateObject)->enterLoop();
+    StreamDataStateObject * const so = getStateObject(stateObject);
+    std::lock_guard<std::mutex> L(so->Lock);
+    so->enterLoop();
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief iterateLoop
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void iterateLoop(const void * stateObject) {
-    getStateObject(stateObject)->iterateLoop();
+    StreamDataStateObject * const so = getStateObject(stateObject);
+    std::lock_guard<std::mutex> L(so->Lock);
+    so->iterateLoop();
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief exitLoop
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void exitLoop(const void * stateObject) {
-    getStateObject(stateObject)->exitLoop();
+    StreamDataStateObject * const so = getStateObject(stateObject);
+    std::lock_guard<std::mutex> L(so->Lock);
+    so->exitLoop();
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief enterKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void exitKernel(const void * stateObject) {
-    getStateObject(stateObject)->exitKernel();
+    StreamDataStateObject * const so = getStateObject(stateObject);
+    std::lock_guard<std::mutex> L(so->Lock);
+    so->exitKernel();
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getStateObject
  ** ------------------------------------------------------------------------------------------------------------- */
 inline StreamDataStateObject * getStateObject(const void * address) const {
+    std::shared_lock<std::shared_mutex> L(RegistryLock);
     auto r = RegisteredStateObjects.find(address);
     assert (r != RegisteredStateObjects.end());
     return r->second;
@@ -1028,18 +1093,21 @@ updated_trie:
 
 private:
 
+// Declared first so that it is destroyed last.
+CaptureArena Arena;
+mutable std::shared_mutex RegistryLock;
 flat_map<StreamDataKey, StreamDataStateObject *> RegisteredStateObjects;
 std::vector<StreamDataEntry> InstallOrderCaptures;
 
 };
 
-inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
+inline void StreamDataCapture::append(CaptureArena & arena, StreamDataStateObject * stateObjectEntry,
                    const size_t strideNum, const uint8_t * streamData, const size_t from, const size_t to, const size_t blockWidth) {
     assert (to >= from);
 
     StreamDataChunk * C = Current;
     if (LLVM_UNLIKELY(CurrentIndex == ELEMENTS_PER_ALLOCATION)) {
-        StreamDataChunk * N = new StreamDataChunk;
+        StreamDataChunk * N = arena.create<StreamDataChunk>();
         assert (N);
         C->Next = N;
         Current = N;
@@ -1070,7 +1138,7 @@ inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
         const auto ItemBytes = (ItemWidth / CHAR_BIT);
         const size_t length  = (to - from) * ItemBytes;
         assert ((length % ItemBytes) == 0);
-        E.Data = (uint8_t*)ThreadSafeSlabAllocator::allocate(length, ItemBytes);
+        E.Data = (uint8_t*)arena.allocate(length, ItemBytes);
         assert (E.Data);
         std::memcpy(E.Data, start, length);
     } else {
@@ -1085,7 +1153,7 @@ inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
             const auto end = (modFrom & (blockWidth - 1)) + (to - modFrom);
             const auto length = udiv(end + blockWidth - 1, blockWidth) * blockSize;
             assert (length > 0);
-            E.Data = (uint8_t*)ThreadSafeSlabAllocator::allocate(length, blockWidth / CHAR_BIT);
+            E.Data = (uint8_t*)arena.allocate(length, blockWidth / CHAR_BIT);
             assert (E.Data);
             std::memcpy(E.Data, start, length);
         }
@@ -1096,7 +1164,7 @@ inline void StreamDataCapture::append(StreamDataStateObject * stateObjectEntry,
     if (stateObjectEntry->InKernel) {
         const auto & L = stateObjectEntry->LoopIteration;
         const auto n = L.size();
-        size_t * const V = ThreadSafeSlabAllocator::allocate_array_of<size_t>(n + 1);
+        size_t * const V = static_cast<size_t *>(arena.allocate((n + 1) * sizeof(size_t), alignof(size_t)));
         assert (V);
         for (size_t i = 0; i < n; ++i) {
             V[i] = L[i]; assert (L[i]);

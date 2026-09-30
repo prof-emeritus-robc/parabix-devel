@@ -8,11 +8,13 @@
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/adt.h>
 #include <re/adt/re_name.h>
+#include <re/adt/re_utility.h>
 #include <re/alphabet/multiplex_CCs.h>
 #include <re/analysis/re_inspector.h>
 #include <re/parse/parser.h>
 #include <re/compile/re_compiler.h>
 #include <re/unicode/boundaries.h>
+#include <re/unicode/casing.h>
 #include <ucd/data/PropertyAliases.h>
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/data/PropertyObjectTable.h>
@@ -49,6 +51,9 @@ RE * PropertyResolver::resolveCC (std::string value, bool is_negated) {
         if (mGrep == nullptr)
             llvm::report_fatal_error("Recursive property expression found, but no grep function supplied");
         re::RE * propValueRe = re::RE_Parser::parse(value.substr(1), re::DEFAULT_MODE, re::PCRE, false);
+        // Apply (?i) groups now, so that value sets computed directly from the
+        // pattern (e.g., matchableCodepoints) include the case variants.
+        propValueRe = resolveCaseInsensitiveMode(propValueRe, false);
         resolved = mPropObj->GetCodepointSetMatchingPattern(propValueRe, mGrep);
     }
     else if ((value.length() > 0) && (value[0] == '@')) {
@@ -78,7 +83,7 @@ RE * PropertyResolver::resolveBoundary (std::string val, bool is_negated) {
             b->SetBoundaryExpression(resolved);
         }
         if (is_negated) {
-            resolved = makeDiff(makeAny(), resolved);
+            resolved = makeZerowidthComplement(resolved);
         }
     } else if (isa<EnumeratedPropertyObject>(mPropObj) && (val == "")) {
         // Boundary between codepoints with any two different values for an
@@ -86,7 +91,7 @@ RE * PropertyResolver::resolveBoundary (std::string val, bool is_negated) {
         // TODO:  Pass in the operator, so that negated boundaries are generated in simplified form.
         resolved = EnumeratedPropertyBoundary(cast<EnumeratedPropertyObject>(mPropObj));
         if (is_negated) {
-            resolved = makeDiff(makeAny(), resolved);
+            resolved = makeZerowidthComplement(resolved);
         }
     } else {
         std::string propName = getPropertyFullName(static_cast<property_t>(mPropCode));
@@ -270,83 +275,6 @@ RE * inlineSimpleProperties(RE * r) {
     return SimplePropertyInliner().transformRE(r);
 }
 
-using PropertySet = std::set<UCD::property_t>;
-struct EnumBasisRequiredCollector : public RE_Inspector {
-    EnumBasisRequiredCollector(PropertySet & enums) : RE_Inspector(),
-    mEnumSet(enums) {}
-
-    void inspectPropertyExpression(PropertyExpression * pe) {
-        auto id = static_cast<UCD::property_t>(pe->getPropertyCode());
-        PropertyObject * propObj = getPropertyObject(id);
-        if (isa<EnumeratedPropertyObject>(propObj)) {
-            if (pe->getKind() == PropertyExpression::Kind::Boundary) {
-                mEnumSet.insert(id);
-            }
-            RE * defn = pe->getResolvedRE();
-            if (defn && isa<Reference>(defn)) {
-                mEnumSet.insert(id);
-            }
-        }
-    }
-    PropertySet & mEnumSet;
-};
-
-PropertySet propertiesRequiringBasisSet(RE * r) {
-    PropertySet ps;
-    EnumBasisRequiredCollector(ps).inspectRE(r);
-    return ps;
-}
-
-using PropertyAlphabetMap = std::map<UCD::property_t, cc::Alphabet *>;
-
-struct EnumeratedPropertyMultiplexer : public RE_Transformer {
-    EnumeratedPropertyMultiplexer(PropertyAlphabetMap & propertiesToMultiplex)
-        : RE_Transformer("EnumeratedPropertyMultiplexer"), mPropertiesToMultiplex(propertiesToMultiplex) {}
-    RE * transformPropertyExpression (PropertyExpression * exp) override {
-        auto id = static_cast<UCD::property_t>(exp->getPropertyCode());
-        auto f = mPropertiesToMultiplex.find(id);
-        if (f == mPropertiesToMultiplex.end()) return exp;
-        cc::Alphabet * enumAlphabet = f->second;
-        PropertyExpression::Operator op = exp->getOperator();
-        std::string val_str = exp->getValueString();
-        PropertyObject * propObj = getPropertyObject(id);
-        if (auto * obj = dyn_cast<EnumeratedPropertyObject>(propObj)) {
-            std::string propName = getPropertyFullName(id);
-            int val_code = obj->GetPropertyValueEnumCode(val_str);
-            if (val_code < 0) return exp;  // TODO: deal with recursive regexp
-            re::CC * enumCC = makeCC(enumAlphabet);
-            if (op == PropertyExpression::Operator::Eq) {
-                enumCC->insert(val_code);
-            } else if (op == PropertyExpression::Operator::NEq) {
-                for (int i = 0; i < obj->GetEnumCount(); i++) {
-                    if (i != val_code) enumCC->insert(i);
-                }
-            }
-            return enumCC;
-        }
-        return exp;
-    }
-private:
-    PropertyAlphabetMap mPropertiesToMultiplex;
-};
-
-RE * enumeratedPropertiesToCCs(PropertySet propertyCodes, RE * r) {
-    PropertyAlphabetMap propertyMap;
-    for (auto c : propertyCodes) {
-        PropertyObject * propObj = getPropertyObject(c);
-        if (auto * obj = dyn_cast<EnumeratedPropertyObject>(propObj)) {
-            std::string alphabetName = "UCD:" + getPropertyFullName(c);
-            auto enumCount = obj->GetEnumCount();
-            std::vector<CC *> enumCCs;
-            for (int i = 0; i < enumCount; i++) {
-                enumCCs.push_back(re::makeCC(obj->GetCodepointSet(i)));
-            }
-            propertyMap.emplace(c, cc::makeMultiplexedAlphabet(alphabetName, enumCCs));
-        }
-    }
-    return EnumeratedPropertyMultiplexer(propertyMap).transformRE(r);
-}
-
 PropertyExternalizer::PropertyExternalizer() :
     NameIntroduction("PropertyExternalizer") {}
 
@@ -360,27 +288,24 @@ RE * PropertyExternalizer::transformPropertyExpression (PropertyExpression * exp
     std::string theName = id + op_str + val_str;
     if (exp->getKind() == PropertyExpression::Kind::Codepoint) {
         return createName(theName, exp);
-    } else {
-        theName = "\\b{" + theName + "}";
-        return createName(theName, exp);
     }
+    if (op == PropertyExpression::Operator::NEq) {
+        // Externalize the positive boundary; its zero-width complement is
+        // then taken at the point of use.  Boundary streams are always
+        // computed for the positive boundary.
+        PropertyExpression * positive =
+            makePropertyExpression(PropertyExpression::Kind::Boundary, id, PropertyExpression::Operator::Eq, val_str);
+        positive->setPropertyCode(exp->getPropertyCode());
+        if (Diff * negated = dyn_cast_or_null<Diff>(exp->getResolvedRE())) {
+            positive->setResolvedRE(negated->getRH());
+        }
+        return makeZerowidthComplement(transformPropertyExpression(positive));
+    }
+    return createName("\\b{" + theName + "}", exp);
 }
 
 RE * externalizeProperties(RE * r) {
     return PropertyExternalizer().transformRE(r);
-}
-
-struct AnyExternalizer : public RE_Transformer {
-    AnyExternalizer() : RE_Transformer("AnyExternalizer") {}
-    RE * transformAny(re::Any * a) override {
-        Name * externName = makeName("u8index");
-        externName->setDefinition(a);
-        return externName;
-    }
-};
-
-RE * externalizeAnyNodes(RE * r) {
-    return AnyExternalizer().transformRE(r);
 }
 
 RE * linkAndResolve(RE * r, GrepLinesFunctionType grep) {

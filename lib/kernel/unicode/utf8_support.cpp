@@ -115,10 +115,19 @@ UTF8_index::UTF8_index(LLVMTypeSystemInterface & ts, StreamSet * Source, StreamS
         s << "_LB";
     }
     return s.str();}(),
-{}, {Binding{"u8index", u8index}}) {
-    mInputStreamSets.push_back(Binding{"source", Source});
+{}, {}) {
     if (u8_LB) {
+        // A line-break stream produced with UnterminatedLineAtEOF::Add1 has one
+        // extra position (AddCarry) exactly when the final line is unterminated.
+        // u8final copies that bit, so u8index is extended exactly when u8_LB is
+        // (as in UnicodeLinesKernelBuilder); otherwise filtering the line breaks
+        // by this index drops it and the final line is never matched.
+        mInputStreamSets.push_back(Binding{"source", Source, FixedRate(), ZeroExtended()});
         mInputStreamSets.push_back(Binding{"u8_LB", u8_LB, FixedRate(), Principal()});
+        mOutputStreamSets.push_back(Binding{"u8index", u8index, FixedRate(), AddCarry()});
+    } else {
+        mInputStreamSets.push_back(Binding{"source", Source});
+        mOutputStreamSets.push_back(Binding{"u8index", u8index});
     }
 }
 

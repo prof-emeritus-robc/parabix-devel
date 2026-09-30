@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#include <pablo/pablo.h>
 #include <kernel/core/relationship.h>
+#include <pablo/pablo.h>
 #include <kernel/core/kernel.h>
 
 using namespace kernel;

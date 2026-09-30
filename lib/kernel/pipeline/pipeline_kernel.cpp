@@ -6,6 +6,7 @@
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <kernel/core/streamset.h>
 #include <llvm/Analysis/ConstantFolding.h>
+#include <kernel/illustrator/illustrator.h>
 #ifdef ENABLE_PAPI
 #include <papi.h>
 #include <boost/tokenizer.hpp>

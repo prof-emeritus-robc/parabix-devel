@@ -10,6 +10,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/adt.h>
 #include <re/toolchain/toolchain.h>
+#include <re/printer/re_printer.h>
 
 using namespace llvm;
 
@@ -59,7 +60,7 @@ case T::Type: to = transform##Type(llvm::cast<Type>(from)); break
         TRANSFORM(Permute);
         TRANSFORM(Interleavable);
         TRANSFORM(PropertyExpression);
-        default: llvm_unreachable("Unknown RE type");
+        // No default: -Wswitch flags any RE type missing here.
     }
     #undef TRANSFORM
     assert (to);

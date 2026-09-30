@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#include <pablo/pablo.h>
 #include <boost/intrusive/detail/math.hpp>
+#include <pablo/pablo.h>
 using boost::intrusive::detail::ceil_log2;
 
 namespace kernel {

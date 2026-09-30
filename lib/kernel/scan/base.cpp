@@ -7,6 +7,7 @@
 
 #include <kernel/core/kernel_builder.h>
 #include <llvm/IR/Module.h>
+#include <toolchain/toolchain.h>
 
 #define IS_POW_2(i) ((i > 0) && ((i & (i - 1)) == 0))
 

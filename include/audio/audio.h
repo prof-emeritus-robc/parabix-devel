@@ -3,11 +3,10 @@
 #include <fstream>
 #include <string>
 #include <memory>
+#include <util/aligned_allocator.h>
 #include <kernel/pipeline/pipeline_builder.h>
-#include <kernel/core/relationship.h>
 #include <kernel/io/source_kernel.h>
 #include <pablo/pablo.h>
-#include <util/aligned_allocator.h>
 
 using namespace kernel;
 using namespace llvm;

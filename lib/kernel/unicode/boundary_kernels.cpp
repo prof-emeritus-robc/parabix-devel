@@ -21,7 +21,10 @@ using namespace kernel;
 using namespace pablo;
 
 BoundaryKernel::BoundaryKernel(LLVMTypeSystemInterface & ts, StreamSet * PropertyBasis, StreamSet * IndexStream, StreamSet * BoundaryStream, bool invert)
-: PabloKernel(ts, "boundary_" + std::to_string(PropertyBasis->getNumElements()) + (invert ? "x1_negated" : "x1"),
+: PabloKernel(ts, "boundary_" + std::to_string(PropertyBasis->getNumElements()) + (invert ? "x1_negated" : "x1")
+              // The generated code differs with and without an index stream, so the
+              // name (which is also the object cache key) must distinguish them.
+              + (IndexStream ? "_indexed" : ""),
               {Binding{"basis", PropertyBasis}},
               {Binding{"boundary", BoundaryStream, FixedRate(), Add1()}}),
   mHasIndex(IndexStream != nullptr), mInvert(invert) {

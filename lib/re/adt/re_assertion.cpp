@@ -7,6 +7,7 @@
 
 #include <re/adt/re_start.h>
 #include <re/adt/re_end.h>
+#include <re/adt/adt.h>
 
 using namespace llvm;
 
@@ -14,10 +15,6 @@ namespace re {
 
 Assertion::Kind Assertion::reverseKind(Assertion::Kind k) {
     return k == Assertion::Kind::LookAhead ? Assertion::Kind::LookBehind : Assertion::Kind::LookAhead;
-}
-
-Assertion::Sense Assertion::negateSense(Assertion::Sense s) {
-    return s == Assertion::Sense::Positive ? Assertion::Sense::Negative : Assertion::Sense::Positive;
 }
 
 RE * makeAssertion(RE * asserted, Assertion::Kind k, Assertion::Sense s) {

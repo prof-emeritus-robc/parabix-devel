@@ -1,10 +1,8 @@
 #pragma once
 
-#include <ucd/core/UCD_Config.h>
-#include <ucd/core/unicode_set.h>
-#include <ucd/utf/utf_encoder.h>
 #include <vector>
 #include <pablo/toolchain/pablo_toolchain.h>
+#include <ucd/core/unicode_set.h>
 
 namespace re {
     class CC;

@@ -2,6 +2,7 @@
 
 #include <kernel/core/kernel_builder.h>
 #include <boost/intrusive/detail/math.hpp>
+#include <toolchain/toolchain.h>
 
 // This option is mostly for testing lookbehind of an input streamset but
 // creates a cross-thread memory dependency that is otherwise unnecessary.

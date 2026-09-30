@@ -44,7 +44,6 @@ public:
     virtual ~Name() {}
 protected:
     friend Name * makeName(const std::string & name, RE * cc);
-    friend Name * makeZeroWidth(const std::string & name, RE * zerowidth);
     friend Name * makeName(CC * const cc);
     friend Name * makeName(const std::string &, RE *);
     friend Name * makeName(const std::string &, const std::string &, RE *);
@@ -141,10 +140,6 @@ inline Name * makeName(const std::string & property, const std::string & value, 
 inline Name * makeName(CC * const cc) {
     const std::string name = cc->canonicalName();
     return new Name(nullptr, 0, name.c_str(), name.length(), cc);
-}
-
-inline Name * makeZeroWidth(const std::string & name, RE * zerowidth = NULL) {
-    return new Name(nullptr, 0, name.c_str(), name.length(), zerowidth);
 }
 
 template <typename To, typename FromTy> bool defined(FromTy * e) {

@@ -360,6 +360,7 @@ void PipelineCompiler::clearInternalStateForCurrentKernel() {
     mFirstOutputStrideLength.reset(numOfOutputs);
     mLinearOutputItemsPhi.reset(numOfOutputs);
     mReturnedOutputVirtualBaseAddressPtr.reset(numOfOutputs);
+    mOutputVirtualBaseAddress.reset(numOfOutputs);
     mReturnedProducedItemCountPtr.reset(numOfOutputs);
     mProducedItemCountPtr.reset(numOfOutputs);
     mProducedItemCount.reset(numOfOutputs);

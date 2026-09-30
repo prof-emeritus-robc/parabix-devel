@@ -38,6 +38,7 @@
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/utf/utf_compiler.h>
+#include <toolchain/toolchain.h>
 
 using namespace re;
 using namespace pablo;
@@ -441,10 +442,8 @@ void RE_PipelineBuilder::compileProperty(PropertyExpression * pe) {
     if (pe->getKind() == re::PropertyExpression::Kind::Codepoint) {
         addExternal(propName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, pStrm});
     } else { //PropertyExpression::Kind::Boundary
-        UCD::property_t prop = static_cast<UCD::property_t>(pe->getPropertyCode());
-        if (prop == UCD::g) propName = "\\b{g}";
-        else if (prop == UCD::w) propName = "\\b{w}";
-        addExternal(propName, ExternalStream{ExternalStreamKind::ZeroWidth, 1, {0, 0}, pStrm});
+        // The name given by UCD::PropertyExternalizer, e.g. \b{g} or \b{gc}.
+        addExternal("\\b{" + propName + "}", ExternalStream{ExternalStreamKind::ZeroWidth, 1, {0, 0}, pStrm});
     }
 }
 
@@ -707,6 +706,11 @@ void UnicodePropertyLogic(PipelineBuilder & P, re::PropertyExpression * pe,
     if (pe->getKind() == re::PropertyExpression::Kind::Codepoint) {
         P.CreateKernelFamilyCall<UnicodePropertyKernelBuilder>(pe, BasisBits, PropertyStream);
     } else { //PropertyExpression::Kind::Boundary
+        if (pe->getOperator() == re::PropertyExpression::Operator::NEq) {
+            // Boundary kernels compute positive boundaries only.
+            llvm::report_fatal_error("negated boundary " + llvm::StringRef(propName) +
+                                     " must be compiled as a zero-width complement");
+        }
         if (BasisBits->getNumElements() < 21) {
             if (IndexStream == nullptr) {
                 llvm::report_fatal_error("index stream required for boundary properties without full Unicode basis");

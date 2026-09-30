@@ -48,7 +48,7 @@ std::string NullModeAnnotation(NullCharMode nullMode) {
 
 Bindings makeOutputBreakBindings(UnterminatedLineAtEOF eofMode, StreamSet * lb) {
     if (eofMode == UnterminatedLineAtEOF::Add1) {
-        return {Binding{"LB", lb, FixedRate(), Add1()}};
+        return {Binding{"LB", lb, FixedRate(), AddCarry()}};
     }
     return {Binding{"LB", lb}};
 }
@@ -164,7 +164,7 @@ UnicodeLinesKernelBuilder::UnicodeLinesKernelBuilder(LLVMTypeSystemInterface & t
 mEOFmode(eofMode),
 mNullMode(nullMode) {
     if (eofMode == UnterminatedLineAtEOF::Add1) {
-        getOutputStreamSetBindings().emplace_back("u8index", u8index, FixedRate(), Add1());
+        getOutputStreamSetBindings().emplace_back("u8index", u8index, FixedRate(), AddCarry());
     } else {
         getOutputStreamSetBindings().emplace_back("u8index", u8index);
     }
@@ -275,12 +275,14 @@ void UnicodeLinesKernelBuilder::generatePabloMethod() {
 
     Var * const u8index = getOutputStreamVar("u8index");
     PabloAST * u8final = pb.createNot(nonFinal);
-    pb.createAssign(pb.createExtract(u8index, pb.getInteger(0)), u8final);
     PabloAST * notLB = pb.createNot(LineBreak);
     if (mEOFmode == UnterminatedLineAtEOF::Add1) {
         PabloAST * unterminatedLineAtEOF = pb.createAtEOF(pb.createAdvance(notLB, 1), "unterminatedLineAtEOF");
         pb.createAssign(LineBreak, pb.createOr(LineBreak, unterminatedLineAtEOF));
+        // LB and u8index are both AddCarry outputs: u8index must be extended exactly when LB is.
+        u8final = pb.createOr(pb.createInFile(u8final), unterminatedLineAtEOF);
     }
+    pb.createAssign(pb.createExtract(u8index, pb.getInteger(0)), u8final);
     pb.createAssign(pb.createExtract(getOutputStreamVar("LB"), pb.getInteger(0)), LineBreak);
 }
 

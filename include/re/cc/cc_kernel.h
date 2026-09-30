@@ -3,8 +3,8 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 #pragma once
+#include <pablo/compiler/pablo_kernel.h>
 
-#include <pablo/pablo.h>
 // #include <kernel/util/callback.h>
 
 namespace IDISA { class IDISA_Builder; }

@@ -1220,6 +1220,10 @@ xy
 <grepcase regexp="a\b{script} " datafile="script_boundary" greplines="2"/>
 <grepcase regexp="α\b{script}b" datafile="script_boundary" greplines="4"/>
 <grepcase regexp="α\B{script}b" datafile="script_boundary" greplines=""/>
+<!-- \b{sc} names the Script property, not the gc=Sc shortcut of \p{sc}. -->
+<grepcase regexp="a\b{sc} " datafile="script_boundary" greplines="2"/>
+<grepcase regexp="α\b{sc}b" datafile="script_boundary" greplines="4"/>
+<grepcase regexp="α\B{sc}b" datafile="script_boundary" greplines=""/>
 
 <!-- Boundaries inside a property value pattern. -->
 <datafile id="value_pattern_boundary">

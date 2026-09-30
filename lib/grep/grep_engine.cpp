@@ -287,7 +287,10 @@ void GrepEngine::initRE(re::RE * re) {
         bool useIndexedUTF8 = !UnicodeBasisMode
                                     && !hasReference(mRE) 
                                     && !(mGrepRecordBreak == GrepRecordBreakKind::Unicode)
-                                    && !hasGraphemeClusterBoundary(mRE)
+                                    // Boundary streams are character aligned; under UTF-8 indexing a
+                                    // code unit sequence after a zero-width external is misaligned,
+                                    // e.g. a\b{gc}\x{3A9} failed to match.
+                                    && !hasBoundaryExpression(mRE)
                                     && (maxLookaheadLength(re, &cc::Unicode) <= 1)
                                     && !mColoring;
         if (useIndexedUTF8) {

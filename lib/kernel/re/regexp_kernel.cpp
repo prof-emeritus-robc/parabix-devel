@@ -441,10 +441,8 @@ void RE_PipelineBuilder::compileProperty(PropertyExpression * pe) {
     if (pe->getKind() == re::PropertyExpression::Kind::Codepoint) {
         addExternal(propName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, pStrm});
     } else { //PropertyExpression::Kind::Boundary
-        UCD::property_t prop = static_cast<UCD::property_t>(pe->getPropertyCode());
-        if (prop == UCD::g) propName = "\\b{g}";
-        else if (prop == UCD::w) propName = "\\b{w}";
-        addExternal(propName, ExternalStream{ExternalStreamKind::ZeroWidth, 1, {0, 0}, pStrm});
+        // The name given by UCD::PropertyExternalizer, e.g. \b{g} or \b{gc}.
+        addExternal("\\b{" + propName + "}", ExternalStream{ExternalStreamKind::ZeroWidth, 1, {0, 0}, pStrm});
     }
 }
 

@@ -9,7 +9,8 @@ class Name;
 
 class EnumeratedPropertyObject;
 
-bool hasGraphemeClusterBoundary(const RE * re);
+// Does the RE contain a boundary expression (e.g., \b{g}, \b{w}, \b{gc})?
+bool hasBoundaryExpression(const RE * re);
 
 RE * resolveGraphemeMode(RE * re, bool inGraphemeMode);
 

@@ -31,22 +31,25 @@ using namespace llvm;
 
 namespace re {
 
-struct GraphemeBoundaryAbsentValidator final : public RE_Validator {
-    
-    GraphemeBoundaryAbsentValidator()
+struct BoundaryAbsentValidator final : public RE_Validator {
+
+    BoundaryAbsentValidator()
     : RE_Validator() {}
-    
+
     bool validatePropertyExpression(const PropertyExpression * e) override {
-        return e->getPropertyCode() != UCD::g;
+        return e->getKind() != PropertyExpression::Kind::Boundary;
     }
 
     bool validateName(const Name * n) override {
-        return n->getFullName() != "\\b{g}";
+        // Externalized boundaries are named \b{...}.
+        if (llvm::StringRef(n->getFullName()).starts_with("\\b{")) return false;
+        const RE * const defn = n->getDefinition();
+        return (defn == nullptr) || validate(defn);
     }
 };
 
-bool hasGraphemeClusterBoundary(const RE * re) {
-    GraphemeBoundaryAbsentValidator v;
+bool hasBoundaryExpression(const RE * re) {
+    BoundaryAbsentValidator v;
     return !(v.validateRE(re));
 }
 

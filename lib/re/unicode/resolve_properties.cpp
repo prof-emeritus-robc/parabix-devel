@@ -14,6 +14,7 @@
 #include <re/parse/parser.h>
 #include <re/compile/re_compiler.h>
 #include <re/unicode/boundaries.h>
+#include <re/unicode/casing.h>
 #include <ucd/data/PropertyAliases.h>
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/data/PropertyObjectTable.h>
@@ -50,6 +51,9 @@ RE * PropertyResolver::resolveCC (std::string value, bool is_negated) {
         if (mGrep == nullptr)
             llvm::report_fatal_error("Recursive property expression found, but no grep function supplied");
         re::RE * propValueRe = re::RE_Parser::parse(value.substr(1), re::DEFAULT_MODE, re::PCRE, false);
+        // Apply (?i) groups now, so that value sets computed directly from the
+        // pattern (e.g., matchableCodepoints) include the case variants.
+        propValueRe = resolveCaseInsensitiveMode(propValueRe, false);
         resolved = mPropObj->GetCodepointSetMatchingPattern(propValueRe, mGrep);
     }
     else if ((value.length() > 0) && (value[0] == '@')) {

@@ -27,9 +27,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/pablo_kernel.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
 #include <fileselect/file_select.h>

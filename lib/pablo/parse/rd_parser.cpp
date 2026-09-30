@@ -8,14 +8,14 @@
 #include <unordered_set>
 #include <kernel/core/streamset.h>
 #include <llvm/Support/Casting.h>
-#include <pablo/builder.hpp>
-#include <pablo/branch.h>
-#include <pablo/pablo_intrinsic.h>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/ast/builder.hpp>
+#include <pablo/ast/branch.h>
+#include <pablo/ast/pablo_intrinsic.h>
+#include <pablo/ast/pe_ones.h>
+#include <pablo/ast/pe_zeroes.h>
 #include <pablo/parse/error_text.h>
 #include <pablo/parse/pablo_type.h>
-#include <pablo/ps_assign.h>
+#include <pablo/ast/ps_assign.h>
 #include <llvm/Support/ErrorHandling.h>
 
 

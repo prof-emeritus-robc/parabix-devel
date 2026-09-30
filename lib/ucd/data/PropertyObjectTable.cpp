@@ -13,7 +13,7 @@
 
 namespace UCD {
 
-  const std::array<PropertyObject *, 160> property_object_table = {{
+  const std::array<PropertyObject *, 167> property_object_table = {{
     get_IDENTITY_PropertyObject(),
     new UnsupportedPropertyObject(cjkAccountingNumeric, PropertyObject::ClassTypeId::NumericProperty),
     new UnsupportedPropertyObject(cjkOtherNumeric, PropertyObject::ClassTypeId::NumericProperty),
@@ -58,6 +58,13 @@ namespace UCD {
     new UnsupportedPropertyObject(kEH_HG, PropertyObject::ClassTypeId::StringProperty),
     new UnsupportedPropertyObject(kEH_IFAO, PropertyObject::ClassTypeId::StringProperty),
     new UnsupportedPropertyObject(kEH_JSesh, PropertyObject::ClassTypeId::StringProperty),
+    new UnsupportedPropertyObject(kJURC_Src, PropertyObject::ClassTypeId::StringProperty),
+    new UnsupportedPropertyObject(kNSHU_DubenSrc, PropertyObject::ClassTypeId::StringProperty),
+    new UnsupportedPropertyObject(kSEAL_CCZSrc, PropertyObject::ClassTypeId::StringProperty),
+    new UnsupportedPropertyObject(kSEAL_DYCSrc, PropertyObject::ClassTypeId::StringProperty),
+    new UnsupportedPropertyObject(kSEAL_QJZSrc, PropertyObject::ClassTypeId::StringProperty),
+    new UnsupportedPropertyObject(kSEAL_THXSrc, PropertyObject::ClassTypeId::StringProperty),
+    new UnsupportedPropertyObject(kTGT_MergedSrc, PropertyObject::ClassTypeId::StringProperty),
     get_NA_PropertyObject(),
     get_NA1_PropertyObject(),
     get_NAME_ALIAS_PropertyObject(),

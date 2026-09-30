@@ -1119,6 +1119,16 @@ static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingS
             args[1] = pendingCapacity2;
             b.CreateCall(fMunmap, args);
         }
+        // The first entry was already released on entry to this function. Unless a surviving
+        // linked-list entry is later copied over it, it must be marked empty here; otherwise the
+        // next call sees its stale consumed count and releases the same address a second time,
+        // by which point it may have been reused by a newly mapped buffer (e.g., a circular
+        // buffer's mirror).
+        b.CreateAlignedStore(nilVoidPtr, pendingAddr1Field, voidPtrTyAlign);
+        if (LLVM_LIKELY(!useFree)) {
+            b.CreateAlignedStore(sz_ZERO, pendingCapacity1Field, intPtrTyAlign);
+        }
+        b.CreateAlignedStore(sz_ALL_ONES, pendingConsumed1Field, intPtrTyAlign);
         Value * const pendingLink = b.CreateAlignedLoad(voidPtrTy, additionalLinkField, voidPtrTyAlign);
         Value * const noPendingLink = b.CreateICmpEQ(pendingLink, nilVoidPtr);
         b.CreateLikelyCondBr(noPendingLink, clearSecond, checkLinkedList);

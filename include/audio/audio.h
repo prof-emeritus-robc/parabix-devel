@@ -6,7 +6,7 @@
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/core/relationship.h>
 #include <kernel/io/source_kernel.h>
-#include <pablo/builder.hpp>
+#include <pablo/pablo.h>
 #include <util/aligned_allocator.h>
 
 using namespace kernel;
@@ -104,8 +104,6 @@ namespace audio
         void generatePabloMethod() override;
 
     private:
-        unsigned int bitsPerSample;
-        unsigned int numInputStreams;
         unsigned int factor;
     };
 

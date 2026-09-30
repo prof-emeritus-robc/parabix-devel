@@ -10,7 +10,7 @@ SRC
     audio.cpp
     stream_manipulation.cpp
 DEPS
-    pablo
+    pablo.compiler
     kernel.io
     kernel.pipeline
     kernel.streamutils

@@ -3,8 +3,7 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 #include <kernel/bitwise/bixnum_kernel.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 
 using namespace kernel;

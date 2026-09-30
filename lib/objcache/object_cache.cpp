@@ -16,7 +16,9 @@
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/ADT/STLFunctionalExtras.h>
 #include <system_error>
+#include <csignal>
 
 using namespace llvm;
 using namespace boost;
@@ -96,6 +98,17 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
     // Have we already seen this signature before? if so, we can safely assume that the ExecutionEngine
     // will have a compiled module for this kernel when we execute the pipeline.
 
+    std::lock_guard<std::mutex> L(mCacheMutex);
+
+    if (LLVM_UNLIKELY(codegen::ObjectCacheForceUpdate)) {
+        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            errs() << "Forcing recompilation (--update-object-cache, or --optimization-level"
+                      "/--backend-optimization-level set): " << kernel->makeCacheName(builder)
+                   << KERNEL_FILE_EXTENSION << "\n";
+        }
+        return LoadResult{nullptr, nullptr};
+    }
+
     Path fileName(mCachePath);
     sys::path::append(fileName, CACHE_PREFIX);
     const auto moduleId = kernel->makeCacheName(builder);
@@ -147,11 +160,55 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief writeCacheFileAtomically
+ *
+ * Writes to a uniquely-named temporary file in the same directory as finalPath, then renames it into
+ * place. saveCachedObjectFile can run concurrently in unrelated processes that share this cache
+ * directory (e.g. parallel test targets), and rename() on the same filesystem is atomic: a concurrent
+ * loadCachedObjectFile() in another process only ever sees the old (or absent) file or the fully-written
+ * new one, never a partially-written one. Writing straight to finalPath let a reader observe a torn
+ * object file mid-write (e.g. "section header table goes past the end of the file", or missing symbols).
+ ** ------------------------------------------------------------------------------------------------------------- */
+static void writeCacheFileAtomically(const ParabixObjectCache::Path & finalPath, llvm::function_ref<void(raw_fd_ostream &)> write) {
+    SmallString<256> tempPath;
+    int tempFD;
+    std::error_code EC = sys::fs::createUniqueFile(Twine(finalPath) + ".tmp-%%%%%%", tempFD, tempPath);
+    if (LLVM_UNLIKELY(EC)) {
+        SmallVector<char, 512> tmp;
+        llvm::raw_svector_ostream msg(tmp);
+        msg << "Could not create a temporary file for \""
+            << finalPath.str()
+            << "\" in object cache directory.\n\n"
+            "Reason: " << EC.message() << "\n\n"
+            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
+        report_fatal_error(Twine(msg.str()));
+    }
+    {
+        raw_fd_ostream out(tempFD, true);
+        write(out);
+    }
+    EC = sys::fs::rename(tempPath, finalPath);
+    if (LLVM_UNLIKELY(EC)) {
+        sys::fs::remove(tempPath);
+        SmallVector<char, 512> tmp;
+        llvm::raw_svector_ostream msg(tmp);
+        msg << "Could not finalize \""
+            << finalPath.str()
+            << "\" in object cache directory.\n\n"
+            "Reason: " << EC.message() << "\n\n"
+            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
+        report_fatal_error(Twine(msg.str()));
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief saveCachedObjectFile
  *
  * A new module has been compiled. If it is cacheable and no conflicting module exists, write it out.
  ** ------------------------------------------------------------------------------------------------------------- */
 void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBufferRef Obj) noexcept {
+
+    std::lock_guard<std::mutex> L(mCacheMutex);
 
     auto moduleId = M.getModuleIdentifier();
 
@@ -160,35 +217,11 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
     objectName.append(moduleId);
     objectName.append(OBJECT_FILE_EXTENSION);
 
-    // Write the object code
-    std::error_code EC;
-    raw_fd_ostream objFile(objectName, EC, sys::fs::OF_None);
-    if (LLVM_UNLIKELY(EC)) {
-        SmallVector<char, 512> tmp;
-        llvm::raw_svector_ostream msg(tmp);
-        msg << "Could not write to \""
-            << objectName.str()
-            << "\" in object cache directory.\n\n"
-            "Reason: " << EC.message() << "\n\n"
-            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
-        report_fatal_error(Twine(msg.str()));
-    }
-    objFile.write(Obj.getBufferStart(), Obj.getBufferSize());
-    objFile.close();
+    writeCacheFileAtomically(objectName, [&](raw_fd_ostream & out) {
+        out.write(Obj.getBufferStart(), Obj.getBufferSize());
+    });
 
     sys::path::replace_extension(objectName, KERNEL_FILE_EXTENSION);
-    raw_fd_ostream kernelFile(objectName.str(), EC, sys::fs::OF_None);
-
-    if (LLVM_UNLIKELY(EC)) {
-        SmallVector<char, 512> tmp;
-        llvm::raw_svector_ostream msg(tmp);
-        msg << "Could not write to \""
-            << objectName.str()
-            << "\" in object cache directory.\n\n"
-            "Reason: " << EC.message() << "\n\n"
-            "Rerun " << codegen::ProgramName << " with --enable-object-cache=0";
-        report_fatal_error(Twine(msg.str()));
-    }
 
     // Clone the function prototypes and metadata to minimize the size of the stored .kernel file.
     std::unique_ptr<Module> H(new Module(moduleId, M.getContext()));
@@ -207,8 +240,9 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
         }
     }
 
-    WriteBitcodeToFile(*H, kernelFile);
-    kernelFile.close();
+    writeCacheFileAtomically(objectName, [&](raw_fd_ostream & out) {
+        WriteBitcodeToFile(*H, out);
+    });
 
     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
         errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
@@ -216,10 +250,36 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief cachejanitordAppearsAlive
+ *
+ * A cheap, best-effort check for whether a cachejanitord is already running, to avoid
+ * needlessly forking+exec'ing+daemonizing a redundant one. This is NOT airtight: two
+ * processes launched close enough together can still both pass it before either's
+ * daemon has actually relocked the pid file (see requiresCacheCleanUp's own fcntl-based
+ * check, which is race-prone the same way -- the daemon's own internal lock is the only
+ * thing that actually guarantees at most one janitor ever runs its cleanup loop). But
+ * since ParabixObjectCache's constructor runs once per process, and this repo's test
+ * suite launches many short-lived tool invocations in quick succession, this closes the
+ * overwhelmingly common case: a prior janitor from an earlier invocation is still alive,
+ * so nothing needs to be spawned at all.
+ ** ------------------------------------------------------------------------------------------------------------- */
+inline bool ParabixObjectCache::cachejanitordAppearsAlive() noexcept {
+    std::ifstream in((fs::path{mCachePath.c_str()} / DAEMON_FILE).string());
+    if (!in) return false;
+    pid_t pid = 0;
+    in >> pid;
+    if (pid <= 0) return false;
+    return kill(pid, 0) == 0;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief requiresCacheCleanUp
  ** ------------------------------------------------------------------------------------------------------------- */
 inline bool ParabixObjectCache::requiresCacheCleanUp() noexcept {
     if (LLVM_UNLIKELY(mStartedCacheCleanupDaemon)) {
+        return false;
+    }
+    if (cachejanitordAppearsAlive()) {
         return false;
     }
     // if we cannot lock the pid file then an earlier process

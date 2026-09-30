@@ -623,17 +623,13 @@ void PipelineCompiler::writeInsufficientIOExit(KernelBuilder & b) {
     assert (mCurrentNumOfStridesAtLoopEntryPhi);
     currentNumOfStrides = b.CreateMulRational(mCurrentNumOfStridesAtLoopEntryPhi, mPartitionStrideRateScalingFactor);
 
-    bool hasBranchToLoopExit = false;
-
     if (mKernelJumpToNextUsefulPartition) {
         assert (mIsPartitionRoot);
         // TODO: check whether we need to release/acquire the pre/post locks here too
         b.CreateLikelyCondBr(mExecutedAtLeastOnceAtLoopEntryPhi, mKernelLoopExit, mKernelJumpToNextUsefulPartition);
-        hasBranchToLoopExit = true;
     } else {
         // if this is not a partition root, it is not responsible for determining
         // whether the partition is out of input
-        hasBranchToLoopExit = true;
         if (LLVM_UNLIKELY(mAllowDataParallelExecution)) {
             releaseSynchronizationLock(b, mKernelId, SYNC_LOCK_PRE_INVOCATION, mSegNo);
             acquireSynchronizationLockWithTimingInstrumentation(b, mKernelId, SYNC_LOCK_POST_INVOCATION, mSegNo);

@@ -20,11 +20,8 @@
 #include <kernel/streamutils/swizzle.h>
 #include <kernel/streamutils/zeroextend.h>
 #include <kernel/streamutils/stream_select.h>
-#include <pablo/builder.hpp>
-#include <pablo/boolean.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
-#include <pablo/pe_zeroes.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <toolchain/toolchain.h>
 #include <llvm/Support/CommandLine.h>
@@ -279,7 +276,7 @@ u8u16FunctionType generatePipeline(CPUDriver & driver, cc::ByteNumbering byteNum
     StreamSet * selectors = P.CreateStreamSet();
     P.CreateKernelCall<U8U16Kernel>(BasisBits, u8bits, selectors);
     StreamSet * u16bytes = P.CreateStreamSet(1, 16);
-    const auto fieldWidth = P.getBitBlockWidth() / 16;
+    const auto fieldWidth = P.getTypeSystem().getBitBlockWidth() / 16;
     P.CreateKernelCall<FieldCompressKernel>(Select(selectors, {0}),
                                              SelectOperationList{Select(u8bits, streamutils::Range(0, 16))},
                                              u16bits,
@@ -293,7 +290,7 @@ u8u16FunctionType generatePipeline(CPUDriver & driver, cc::ByteNumbering byteNum
 }
 
 // ------------------------------------------------------
-
+#if 0
 void makeNonAsciiBranch(LLVMTypeSystemInterface & driver,
                         PipelineBuilder & P,
                         StreamSet * const ByteStream, StreamSet * const u16bytes, cc::ByteNumbering byteNumbering) {
@@ -351,6 +348,7 @@ u8u16FunctionType generatePipeline2(CPUDriver & driver, cc::ByteNumbering byteNu
 
     return reinterpret_cast<u8u16FunctionType>(P.compile());
 }
+#endif
 
 size_t file_size(const int fd) {
     struct stat st;
@@ -374,9 +372,12 @@ int main(int argc, char *argv[]) {
     }
     CPUDriver driver("u8u16");
     u8u16FunctionType u8u16Function = nullptr;
+#if 0
     if (BranchingMode) {
         u8u16Function = generatePipeline2(driver, byteNumbering);
-    } else {
+    } else
+#endif
+    {
         u8u16Function = generatePipeline(driver, byteNumbering);
     }
     const int fd = open(inputFile.c_str(), O_RDONLY);

@@ -6,9 +6,11 @@
 #include <kernel/core/kernel.h>
 #include <kernel/core/kernel_compiler.h>
 #include <kernel/pipeline/driver/driver.h>
+#include <functional>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Module.h>
 #include <boost/container/flat_set.hpp>
+#include <boost/container/flat_map.hpp>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Format.h>
 #include <llvm/Analysis/ConstantFolding.h>
@@ -23,6 +25,7 @@
 using namespace llvm;
 using namespace boost;
 using boost::container::flat_set;
+using boost::container::flat_map;
 using IDISA::FixedVectorType;
 
 
@@ -303,7 +306,7 @@ void Kernel::loadCachedKernel(const Module * m) {
  * @brief linkExternalMethods
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::linkExternalMethods(KernelBuilder & b) {
-    Module * const m = b.getModule(); assert (m);
+    [[maybe_unused]] Module * const m = b.getModule(); assert (m);
     if (mFlags & Kernel::KernelFlags::HasInternallyManagedStreamSet) {
         StreamSetBuffer::linkFunctions(b);
     }
@@ -355,6 +358,94 @@ void Kernel::linkExternalMethods(KernelBuilder & b) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief recordScalarFieldIndices
+ ** ------------------------------------------------------------------------------------------------------------- *
+ * Recomputes and records each scalar's flat field index using only group membership and
+ * declaration order -- the same deterministic bookkeeping constructStateTypes uses when
+ * laying out mSharedStateType/mThreadLocalStateType (padding/alignment only affect BYTE
+ * offsets within a field, never WHICH struct element a given scalar lands at) -- without
+ * touching the LLVM struct types themselves or their metadata.
+ *
+ * loadCachedKernel() restores mSharedStateType/mThreadLocalStateType directly from a
+ * cached object file's metadata and never calls constructStateTypes() at all, so this
+ * kernel object's own InternalScalar/Binding entries would otherwise be left with their
+ * field indices unset. Call this immediately after loadCachedKernel().
+ */
+void Kernel::recordScalarFieldIndices() {
+
+    auto addToGroupCountMap = [](flat_map<unsigned, unsigned> & groups, const unsigned groupNum) {
+        auto f = groups.find(groupNum);
+        if (f == groups.end()) {
+            groups.emplace(groupNum, 1U);
+        } else {
+            f->second++;
+        }
+    };
+
+    auto computePartialSumOfGroupCounts = [](flat_map<unsigned, unsigned> & groups, const unsigned initialCount) -> unsigned {
+        if (groups.empty()) return 0U;
+        auto itr = groups.begin();
+        const auto end = groups.end();
+        auto partSum = itr->second + initialCount;
+        itr->second = initialCount;
+        while (++itr != end) {
+            const auto groupCount = itr->second;
+            itr->second = partSum;
+            partSum += groupCount;
+        }
+        return partSum;
+    };
+
+    flat_map<unsigned, unsigned> sharedGroups;
+    flat_map<unsigned, unsigned> threadLocalGroups;
+
+    for (const auto & scalar : mInternalScalars) {
+        switch (scalar.getScalarType()) {
+            case ScalarType::Internal:
+                addToGroupCountMap(sharedGroups, scalar.getGroup());
+                break;
+            case ScalarType::ThreadLocal:
+                addToGroupCountMap(threadLocalGroups, scalar.getGroup());
+                break;
+            default: break;
+        }
+    }
+
+    const auto totalSharedGroupCount = computePartialSumOfGroupCounts(sharedGroups, (unsigned)mInputScalars.size());
+    computePartialSumOfGroupCounts(threadLocalGroups, 0U);
+
+    mInputScalarFieldIndex.resize(mInputScalars.size());
+    for (unsigned i = 0; i < mInputScalars.size(); ++i) {
+        mInputScalarFieldIndex[i] = i * 2 + 1;
+    }
+
+    for (auto & scalar : mInternalScalars) {
+        switch (scalar.getScalarType()) {
+            case ScalarType::Internal: {
+                auto f = sharedGroups.find(scalar.getGroup());
+                assert (f != sharedGroups.end());
+                const auto index = f->second++;
+                scalar.setFieldIndex(index * 2 + 1);
+                break;
+            }
+            case ScalarType::ThreadLocal: {
+                auto f = threadLocalGroups.find(scalar.getGroup());
+                assert (f != threadLocalGroups.end());
+                const auto index = f->second++;
+                scalar.setFieldIndex(index * 2 + 1);
+                break;
+            }
+            default: break;
+        }
+    }
+
+    mOutputScalarFieldIndex.resize(mOutputScalars.size());
+    for (unsigned i = 0; i < mOutputScalars.size(); ++i) {
+        mOutputScalarFieldIndex[i] = (totalSharedGroupCount + i) * 2 + 1;
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief constructStateTypes
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::constructStateTypes(KernelBuilder & b) {
@@ -363,7 +454,13 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
     SmallVector<char, 256> tmpMeta;
     auto strMeta = concat(getName(), STATE_TYPE_METADATA_SUFFIX, tmpMeta);
     NamedMDNode * const structTypeMetadata = m->getOrInsertNamedMetadata(strMeta);
-    assert (structTypeMetadata->getNumOperands() == 0);
+    assert (structTypeMetadata->getNumOperands() <= 1);
+    // This function is re-entrant per kernel name within a module by design (see the
+    // comment below) -- a distinct Kernel object sharing an already-declared name still
+    // needs its own field indices recorded, even though the LLVM type itself is reused.
+    // But the metadata node this function writes at the end is a once-per-name-per-module
+    // fact, read back elsewhere assuming exactly one operand; only write it the first time.
+    const bool stateTypeMetadataAlreadyWritten = structTypeMetadata->getNumOperands() != 0;
 
     StructType * sharedStateType = nullptr;
     StructType * threadLocalStateType = nullptr;
@@ -381,13 +478,16 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
     threadLocalStateType = StructType::getTypeByName(C, strThreadLocal);
     assert (threadLocalStateType == nullptr || &threadLocalStateType->getContext() == &b.getContext());
 
-    auto isOpaqueType = [&](StructType * const st) -> bool {
-        return st ? st->isOpaque() : false;
-    };
-
-    if (LLVM_LIKELY((sharedStateType == nullptr && threadLocalStateType == nullptr)
-                    || isOpaqueType(sharedStateType)
-                    || isOpaqueType(threadLocalStateType))) {
+    // Always walk the scalar lists and (re)assign field indices below, even when both
+    // struct types already exist (found by name -- e.g. after loadCachedKernel() restored
+    // them from the object cache's metadata, or a signature-based kernel dedup copied a
+    // type pointer from another Kernel instance): THIS kernel object's own
+    // InternalScalar/Binding entries still need indices recorded on them, regardless of
+    // whether the LLVM type itself needs (re)building. makeStructType below skips
+    // mutating an already-complete (non-opaque) type -- it only recomputes and records
+    // indices for it, which must reproduce the identical deterministic layout since it's
+    // driven by the same scalar lists that originally built that type.
+    {
 
         flat_set<unsigned> sharedGroups;
         flat_set<unsigned> threadLocalGroups;
@@ -409,24 +509,41 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
 
         using VecOfTypes = std::vector<TypesVec>;
 
+        // Parallel to VecOfTypes: RecordIndexFn[i][j] writes the flat struct field index
+        // makeStructType computes for TypesVec[i][j] back onto the scalar it came from
+        // (InternalScalar::setFieldIndex, or mInputScalarFieldIndex/mOutputScalarFieldIndex).
+        // This is the single point where "what index did construction assign" is recorded;
+        // every reader (KernelCompiler's scalar-field-pointer lookup) must read it back
+        // rather than independently re-deriving a struct position, so construction and
+        // access can never silently diverge.
+        using RecordIndexFn = std::function<void(unsigned)>;
+        using RefsVec = std::vector<RecordIndexFn>;
+        using VecOfRefs = std::vector<RefsVec>;
+
         VecOfTypes shared(sharedGroups.size() + 2);
         VecOfTypes threadLocal(threadLocalGroups.size());
+        VecOfRefs sharedRefs(sharedGroups.size() + 2);
+        VecOfRefs threadLocalRefs(threadLocalGroups.size());
 
-
-        auto addScalar = [&](VecOfTypes & S, const unsigned group, Type * const type) {
+        auto addScalar = [&](VecOfTypes & S, VecOfRefs & R, const unsigned group, Type * const type, RecordIndexFn record) {
             assert (group < S.size());
             S[group].push_back(CBuilder::convertTypeToLLVMContext(C, type));
+            R[group].push_back(std::move(record));
         };
 
         size_t sharedGroupCount = 0;
         size_t threadLocalGroupCount = 0;
 
+        mInputScalarFieldIndex.resize(mInputScalars.size());
+        unsigned inputScalarIndex = 0;
         for (const auto & scalar : mInputScalars) {
-            addScalar(shared, 0, scalar.getType());
-             ++sharedGroupCount;
+            addScalar(shared, sharedRefs, 0, scalar.getType(),
+                      [this, inputScalarIndex](unsigned k) { mInputScalarFieldIndex[inputScalarIndex] = k; });
+            ++sharedGroupCount;
+            ++inputScalarIndex;
         }
 
-        for (const auto & scalar : mInternalScalars) {
+        for (auto & scalar : mInternalScalars) {
             assert (scalar.getValueType());
 
             auto getGroupIndex = [&](const flat_set<unsigned> & groups) {
@@ -437,11 +554,13 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
 
             switch (scalar.getScalarType()) {
                 case ScalarType::Internal:
-                    addScalar(shared, getGroupIndex(sharedGroups) + 1, scalar.getValueType());
+                    addScalar(shared, sharedRefs, getGroupIndex(sharedGroups) + 1, scalar.getValueType(),
+                              [&scalar](unsigned k) { scalar.setFieldIndex(k); });
                      ++sharedGroupCount;
                     break;
                 case ScalarType::ThreadLocal:
-                    addScalar(threadLocal, getGroupIndex(threadLocalGroups), scalar.getValueType());
+                    addScalar(threadLocal, threadLocalRefs, getGroupIndex(threadLocalGroups), scalar.getValueType(),
+                              [&scalar](unsigned k) { scalar.setFieldIndex(k); });
                     ++threadLocalGroupCount;
                     break;
                 default: break;
@@ -449,9 +568,13 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
         }
 
         assert (shared[sharedGroups.size() + 1].empty());
+        mOutputScalarFieldIndex.resize(mOutputScalars.size());
+        unsigned outputScalarIndex = 0;
         for (const auto & scalar : mOutputScalars) {
-            addScalar(shared, sharedGroups.size() + 1, scalar.getType());
+            addScalar(shared, sharedRefs, sharedGroups.size() + 1, scalar.getType(),
+                      [this, outputScalarIndex](unsigned k) { mOutputScalarFieldIndex[outputScalarIndex] = k; });
             ++sharedGroupCount;
+            ++outputScalarIndex;
         }
 
         IntegerType * const int8Ty = b.getInt8Ty();
@@ -460,7 +583,7 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
 
         auto & dl = m->getDataLayout();
 
-        auto makeStructType = [&](StructType * st, VecOfTypes & structTypeVec, const size_t count,
+        auto makeStructType = [&](StructType * st, VecOfTypes & structTypeVec, VecOfRefs & refsVec, const size_t count,
                                   StringRef name, const bool addGroupCacheLinePadding) -> StructType * {
 
             if (count == 0) return nullptr;
@@ -475,6 +598,7 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
 
             for (unsigned i = 0; i < n; ++i) {
                 const auto & L = structTypeVec[i];
+                const auto & R = refsVec[i];
                 const auto m = L.size();
                 auto padToCacheLine = addGroupCacheLinePadding;
                 for (size_t j = 0; j != m; ++j) {
@@ -497,7 +621,11 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
                     assert (k < fields.size());
                     fields[k++] = paddingTy;
                     assert (k < fields.size());
+                    const auto fieldIndex = k;
                     fields[k++] = type;
+                    if (R[j]) {
+                        R[j](static_cast<unsigned>(fieldIndex));
+                    }
                     ghostPadding = allocSize - storeSize;
                     byteOffset += allocSize + paddingBytes;
                 }
@@ -508,7 +636,14 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
 
             if (LLVM_UNLIKELY(byteOffset == 0)) return nullptr;
 
-            if (st == nullptr) {
+            if (st != nullptr && !st->isOpaque()) {
+                // Type body already exists (loaded from the object cache, or found by
+                // name from another kernel instance); the loop above has already invoked
+                // every recording callback with the freshly recomputed indices. Just
+                // verify that recomputation actually matches the existing layout.
+                assert (&st->getContext() == &b.getContext());
+                assert (st->getStructNumElements() == k);
+            } else if (st == nullptr) {
                 st = StructType::create(C, fields, name, true);
             } else {
                 assert (&st->getContext() == &b.getContext());
@@ -532,15 +667,14 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
         };
 
         // NOTE: StructType::create always creates a new type even if an identical one exists.
+        // makeStructType is always called (even when a type already exists and is complete)
+        // so that field indices get recorded on THIS kernel's own scalars either way; see
+        // the comment above.
         const auto allowStructPadding = !codegen::DebugOptionIsSet(codegen::DisableCacheAlignedKernelStructs);
-        if (sharedStateType == nullptr || sharedStateType->isOpaque()) {
-            sharedStateType = makeStructType(sharedStateType, shared, sharedGroupCount, strShared, allowStructPadding);
-            assert (nullIfEmpty(sharedStateType) == sharedStateType);
-        }
-        if (threadLocalStateType == nullptr || threadLocalStateType->isOpaque()) {
-            threadLocalStateType = makeStructType(threadLocalStateType, threadLocal, threadLocalGroupCount, strThreadLocal, false);
-            assert (nullIfEmpty(threadLocalStateType) == threadLocalStateType);
-        }
+        sharedStateType = makeStructType(sharedStateType, shared, sharedRefs, sharedGroupCount, strShared, allowStructPadding);
+        assert (nullIfEmpty(sharedStateType) == sharedStateType);
+        threadLocalStateType = makeStructType(threadLocalStateType, threadLocal, threadLocalRefs, threadLocalGroupCount, strThreadLocal, false);
+        assert (nullIfEmpty(threadLocalStateType) == threadLocalStateType);
         if (LLVM_UNLIKELY(InfoOptionIsSet(codegen::PrintKernelSizes))) {
             errs() << "KERNEL: " << mKernelName
                    << " SHARED STATE: " << CBuilder::getTypeSize(dl, sharedStateType) << " bytes"
@@ -548,17 +682,19 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
         }
     }
 
-    auto makeTypeMetadata = [&](StructType * st, StringRef name) -> Metadata * {
-        if (st == nullptr) {
-            st = StructType::create(b.getContext(), name);
-        }
-        return ConstantAsMetadata::get(Constant::getNullValue(st));
-    };
+    if (!stateTypeMetadataAlreadyWritten) {
+        auto makeTypeMetadata = [&](StructType * st, StringRef name) -> Metadata * {
+            if (st == nullptr) {
+                st = StructType::create(b.getContext(), name);
+            }
+            return ConstantAsMetadata::get(Constant::getNullValue(st));
+        };
 
-    FixedArray<Metadata *, 2> stateTypes;
-    stateTypes[0] = makeTypeMetadata(sharedStateType, strShared);
-    stateTypes[1] = makeTypeMetadata(threadLocalStateType, strThreadLocal);
-    structTypeMetadata->addOperand(MDNode::get(m->getContext(), stateTypes));
+        FixedArray<Metadata *, 2> stateTypes;
+        stateTypes[0] = makeTypeMetadata(sharedStateType, strShared);
+        stateTypes[1] = makeTypeMetadata(threadLocalStateType, strThreadLocal);
+        structTypeMetadata->addOperand(MDNode::get(m->getContext(), stateTypes));
+    }
     assert (structTypeMetadata->getNumOperands() == 1);
 
     mSharedStateType = sharedStateType;
@@ -1737,6 +1873,16 @@ static inline unsigned collectOutputFlags(const Bindings & streamSets) {
     return flags;
 }
 
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief addBaseInternalScalars
+ ** ------------------------------------------------------------------------------------------------------------- */
+void Kernel::addBaseInternalScalars(LLVMTypeSystemInterface & ts) {
+    for (const Binding & output : mOutputStreamSets) {
+        addInternalScalar(ts.getVoidPtrTy(), output.getName() + BUFFER_HANDLE_SUFFIX);
+    }
+    addInternalScalar(ts.getSizeTy(), TERMINATION_SIGNAL);
+}
+
 // CONSTRUCTOR
 Kernel::Kernel(LLVMTypeSystemInterface & ts,
                const TypeId typeId,
@@ -1755,7 +1901,7 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
 , mOutputScalars(std::move(scalar_outputs))
 , mInternalScalars( std::move(internal_scalars))
 , mKernelName(annotateKernelNameWithDebugFlags(typeId, mFlags, std::move(kernelName))) {
-
+    addBaseInternalScalars(ts);
 }
 
 const llvm::MDString * Kernel::readSignatureFromModule(const llvm::Module * const M) {
@@ -1797,7 +1943,7 @@ Kernel::Kernel(LLVMTypeSystemInterface & ts,
 , mOutputScalars(std::move(scalar_outputs))
 , mInternalScalars()
 , mKernelName() {
-
+    addBaseInternalScalars(ts);
 }
 
 Kernel::~Kernel() { }

@@ -12,7 +12,7 @@ SRC
     cc_kernel.cpp
     GB_18030_data.cpp
 DEPS
-    pablo
+    pablo.compiler
     re.adt
     unicode.core
 )

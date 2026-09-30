@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  tokenizertest.xml - Simple test for tokenizer pretokenizer functionality
+
+  Test format:
+  <tokenizertest>
+    <inputdata id="test_name">
+      raw text input to tokenize
+    </inputdata>
+
+    <tokenizercase inputdata="test_name"
+             pretokenizer="uax29|whitespace|whitespacesplit|digits|punctuation|simplewordboundaries|bytelevel|chardelimiter|bert|sequence_whitespace_punctuation"
+                   expectedcount="N"/>
+  </tokenizertest>
+
+  Input: "Hello, world! abc123def, test-case 42. مرحبا بالعالم، یہ ایک ٹیسٹ ہے۔ 你好世界，这是一个测试。 안녕하세요 세계, 이것은 테스트입니다。"
+    - Mixed scripts: Latin, Arabic/Urdu, CJK (Chinese), Korean (Hangul)
+    - ASCII punctuation: , ! . -     Arabic punctuation: ، ۔     Fullwidth: ， 。
+    - Digits mixed with letters: abc123def
+    - Contraction with apostrophe: shouldn't (in test_input2 only)
+    - Hyphen within word: test-case (UAX29 splits; apostrophe in contractions does not)
+    - Three ASCII commas as delimiters (chardelimiter gives 4 segments)
+
+-->
+
+<tokenizertest>
+
+  <!-- Shared input for all tests — matches build19/test.txt -->
+  <inputdata id="test_input">
+Hello, world! abc123def, test-case . مرحبا بالعالم، یہ ایک ٹیسٹ ہے۔ 你好世界，这是一个测试。 안녕하세요 세계, 이것은 테스트입니다。
+  </inputdata>
+
+  <!-- ========== PRETOKENIZER TESTS ========== -->
+
+  <!-- UAX29: Unicode word boundaries, isolated behavior (default) -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="uax29"
+                 expectedcount="51"/>
+
+  <!-- simplewordboundaries: like UAX29 but CJK chars grouped and contractions split. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="simplewordboundaries"
+                 expectedcount="42"/>
+
+  <!-- Whitespace: \w++ | [^\w\s]++ pattern, forced removed behavior. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="whitespace"
+                 expectedcount="28"/>
+
+  <!-- WhitespaceSplit: non-space runs, forced removed behavior.-->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="whitespacesplit"
+                 expectedcount="16"/>
+
+  <!-- Punctuation: each punct char or non-punct run, isolated behavior. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="punctuation"
+                 expectedcount="23"/>
+
+  <!-- Digits: each decimal digit is its own token; non-digit runs (including spaces) grouped. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="digits"
+                 expectedcount="5"/>
+
+  <!-- ByteLevel: GPT-2 byte-level pattern; space before word encoded as Ġ prefix. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="bytelevel"
+                 expectedcount="30"/>
+
+  <!-- CharDelimiter: split on ',' (ASCII comma only), forced removed behavior. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="chardelimiter"
+                 expectedcount="4"/>
+
+  <!-- BERT: \w++ | [^\w\s]++ pattern; whitespace removed before tokenizing. -->
+  <!-- <tokenizercase inputdata="test_input"
+                 pretokenizer="bert"
+                 expectedcount="14"/> -->
+
+  <!-- SeqWhitespacePunctuation: \w++ | [^\w\s]++ pattern, forced removed behavior. -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="sequence_whitespace_punctuation"
+                 expectedcount="28"/>
+
+  <!-- ========== BEHAVIOR TESTS (all use uax29 pretokenizer on test_input) ========== -->
+
+  <!-- Behavior: removed - delete whitespace tokens (15 spaces removed from isolated) -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="uax29"
+                 behavior="removed"
+                 expectedcount="36"/>
+
+  <!-- Behavior: isolated - spaces appear as their own tokens (default UAX29 behavior)-->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="uax29"
+                 behavior="isolated"
+                 expectedcount="51"/>
+
+  <!-- Behavior: mergedwithprevious - trailing space merged into preceding token-->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="uax29"
+                 behavior="mergedwithprevious"
+                 expectedcount="36"/>
+
+  <!-- Behavior: mergedwithnext - leading space merged into following token -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="uax29"
+                 behavior="mergedwithnext"
+                 expectedcount="36"/>
+
+  <!-- Behavior: contiguous - punct attached to left neighbor, spaces isolated (11 merges) -->
+  <tokenizercase inputdata="test_input"
+                 pretokenizer="uax29"
+                 behavior="contiguous"
+                 expectedcount="41"/>
+
+</tokenizertest>

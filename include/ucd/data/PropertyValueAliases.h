@@ -32,22 +32,24 @@ namespace UCD {
             Unassigned, V1_1, V2_0, V2_1, V3_0, V3_1, V3_2, V4_0, V4_1,
             V5_0, V5_1, V5_2, V6_0, V6_1, V6_2, V6_3, V7_0, V8_0, V9_0,
             V10_0, V11_0, V12_0, V12_1, V13_0, V14_0, V15_0, V15_1, V16_0,
-            V17_0};
+            V17_0, V18_0};
         const static std::vector<std::string> enum_names = {
             "Unassigned", "V1_1", "V2_0", "V2_1", "V3_0", "V3_1", "V3_2",
             "V4_0", "V4_1", "V5_0", "V5_1", "V5_2", "V6_0", "V6_1", "V6_2",
             "V6_3", "V7_0", "V8_0", "V9_0", "V10_0", "V11_0", "V12_0",
-            "V12_1", "V13_0", "V14_0", "V15_0", "V15_1", "V16_0", "V17_0"};
+            "V12_1", "V13_0", "V14_0", "V15_0", "V15_1", "V16_0", "V17_0",
+            "V18_0"};
         const static std::vector<std::string> value_names = {
             "Unassigned", "V1_1", "V2_0", "V2_1", "V3_0", "V3_1", "V3_2",
             "V4_0", "V4_1", "V5_0", "V5_1", "V5_2", "V6_0", "V6_1", "V6_2",
             "V6_3", "V7_0", "V8_0", "V9_0", "V10_0", "V11_0", "V12_0",
-            "V12_1", "V13_0", "V14_0", "V15_0", "V15_1", "V16_0", "V17_0"};
+            "V12_1", "V13_0", "V14_0", "V15_0", "V15_1", "V16_0", "V17_0",
+            "V18_0"};
         const static std::vector<std::string> aliases = {{
             "NA", "1.1", "2.0", "2.1", "3.0", "3.1", "3.2", "4.0", "4.1",
             "5.0", "5.1", "5.2", "6.0", "6.1", "6.2", "6.3", "7.0", "8.0",
             "9.0", "10.0", "11.0", "12.0", "12.1", "13.0", "14.0", "15.0",
-            "15.1", "16.0", "17.0"}};
+            "15.1", "16.0", "17.0", "18.0"}};
     }
 
     namespace BLK_ns {
@@ -104,22 +106,24 @@ namespace UCD {
             Warang_Citi, Dives_Akuru, Nandinagari, Zanabazar_Square,
             Soyombo, UCAS_Ext_A, Pau_Cin_Hau, Devanagari_Ext_A, Sharada_Sup,
             Sunuwar, Bhaiksuki, Marchen, Masaram_Gondi, Gunjala_Gondi,
-            Tolong_Siki, Makasar, Kawi, Lisu_Sup, Tamil_Sup, Cuneiform,
-            Cuneiform_Numbers, Early_Dynastic_Cuneiform, Cypro_Minoan,
-            Egyptian_Hieroglyphs, Egyptian_Hieroglyph_Format_Controls,
-            Egyptian_Hieroglyphs_Ext_A, Anatolian_Hieroglyphs, Gurung_Khema,
-            Bamum_Sup, Mro, Tangsa, Bassa_Vah, Pahawh_Hmong, Kirat_Rai,
-            Medefaidrin, Beria_Erfe, Miao, Ideographic_Symbols, Tangut,
-            Tangut_Components, Khitan_Small_Script, Tangut_Sup,
-            Tangut_Components_Sup, Kana_Ext_B, Kana_Sup, Kana_Ext_A,
+            Tolong_Siki, Bengali_Sup, Makasar, Kawi, Lisu_Sup, Tamil_Sup,
+            Cuneiform, Cuneiform_Numbers, Early_Dynastic_Cuneiform,
+            Archaic_Cuneiform_Numerals, Cypro_Minoan, Egyptian_Hieroglyphs,
+            Egyptian_Hieroglyph_Format_Controls, Egyptian_Hieroglyphs_Ext_A,
+            Anatolian_Hieroglyphs, Gurung_Khema, Bamum_Sup, Mro, Tangsa,
+            Bassa_Vah, Pahawh_Hmong, Kirat_Rai, Medefaidrin, Beria_Erfe,
+            Miao, Ideographic_Symbols, Tangut, Tangut_Components,
+            Khitan_Small_Script, Tangut_Sup, Tangut_Components_Sup, Jurchen,
+            Jurchen_Radicals, Kana_Ext_B, Kana_Sup, Kana_Ext_A,
             Small_Kana_Ext, Nushu, Duployan, Shorthand_Format_Controls,
             Symbols_For_Legacy_Computing_Sup, Misc_Symbols_Sup,
             Znamenny_Music, Byzantine_Music, Music, Ancient_Greek_Music,
-            Kaktovik_Numerals, Mayan_Numerals, Tai_Xuan_Jing, Counting_Rod,
-            Math_Alphanum, Sutton_SignWriting, Latin_Ext_G, Glagolitic_Sup,
-            Cyrillic_Ext_D, Nyiakeng_Puachue_Hmong, Toto, Wancho,
-            Nag_Mundari, Ol_Onal, Tai_Yo, Ethiopic_Ext_B, Mende_Kikakui,
-            Adlam, Indic_Siyaq_Numbers, Ottoman_Siyaq_Numbers, Arabic_Math,
+            Music_Sup, Kaktovik_Numerals, Mayan_Numerals, Tai_Xuan_Jing,
+            Counting_Rod, Math_Alphanum, Sutton_SignWriting,
+            Misc_Arrows_Ext, Latin_Ext_G, Glagolitic_Sup, Cyrillic_Ext_D,
+            Nyiakeng_Puachue_Hmong, Toto, Wancho, Nag_Mundari, Ol_Onal,
+            Tai_Yo, Ethiopic_Ext_B, Mende_Kikakui, Adlam,
+            Indic_Siyaq_Numbers, Ottoman_Siyaq_Numbers, Arabic_Math,
             Mahjong, Domino, Playing_Cards, Enclosed_Alphanum_Sup,
             Enclosed_Ideographic_Sup, Misc_Pictographs, Emoticons,
             Ornamental_Dingbats, Transport_And_Map, Alchemical,
@@ -127,7 +131,7 @@ namespace UCD {
             Chess_Symbols, Symbols_And_Pictographs_Ext_A,
             Symbols_For_Legacy_Computing, CJK_Ext_B, CJK_Ext_C, CJK_Ext_D,
             CJK_Ext_E, CJK_Ext_F, CJK_Ext_I, CJK_Compat_Ideographs_Sup,
-            CJK_Ext_G, CJK_Ext_H, CJK_Ext_J, Tags, VS_Sup, Sup_PUA_A,
+            CJK_Ext_G, CJK_Ext_H, CJK_Ext_J, Seal, Tags, VS_Sup, Sup_PUA_A,
             Sup_PUA_B};
         const static std::vector<std::string> enum_names = {
             "NB", "ASCII", "Latin_1_Sup", "Latin_Ext_A", "Latin_Ext_B",
@@ -192,21 +196,23 @@ namespace UCD {
             "Zanabazar_Square", "Soyombo", "UCAS_Ext_A", "Pau_Cin_Hau",
             "Devanagari_Ext_A", "Sharada_Sup", "Sunuwar", "Bhaiksuki",
             "Marchen", "Masaram_Gondi", "Gunjala_Gondi", "Tolong_Siki",
-            "Makasar", "Kawi", "Lisu_Sup", "Tamil_Sup", "Cuneiform",
-            "Cuneiform_Numbers", "Early_Dynastic_Cuneiform", "Cypro_Minoan",
+            "Bengali_Sup", "Makasar", "Kawi", "Lisu_Sup", "Tamil_Sup",
+            "Cuneiform", "Cuneiform_Numbers", "Early_Dynastic_Cuneiform",
+            "Archaic_Cuneiform_Numerals", "Cypro_Minoan",
             "Egyptian_Hieroglyphs", "Egyptian_Hieroglyph_Format_Controls",
             "Egyptian_Hieroglyphs_Ext_A", "Anatolian_Hieroglyphs",
             "Gurung_Khema", "Bamum_Sup", "Mro", "Tangsa", "Bassa_Vah",
             "Pahawh_Hmong", "Kirat_Rai", "Medefaidrin", "Beria_Erfe",
             "Miao", "Ideographic_Symbols", "Tangut", "Tangut_Components",
             "Khitan_Small_Script", "Tangut_Sup", "Tangut_Components_Sup",
-            "Kana_Ext_B", "Kana_Sup", "Kana_Ext_A", "Small_Kana_Ext",
-            "Nushu", "Duployan", "Shorthand_Format_Controls",
-            "Symbols_For_Legacy_Computing_Sup", "Misc_Symbols_Sup",
-            "Znamenny_Music", "Byzantine_Music", "Music",
-            "Ancient_Greek_Music", "Kaktovik_Numerals", "Mayan_Numerals",
-            "Tai_Xuan_Jing", "Counting_Rod", "Math_Alphanum",
-            "Sutton_SignWriting", "Latin_Ext_G", "Glagolitic_Sup",
+            "Jurchen", "Jurchen_Radicals", "Kana_Ext_B", "Kana_Sup",
+            "Kana_Ext_A", "Small_Kana_Ext", "Nushu", "Duployan",
+            "Shorthand_Format_Controls", "Symbols_For_Legacy_Computing_Sup",
+            "Misc_Symbols_Sup", "Znamenny_Music", "Byzantine_Music",
+            "Music", "Ancient_Greek_Music", "Music_Sup",
+            "Kaktovik_Numerals", "Mayan_Numerals", "Tai_Xuan_Jing",
+            "Counting_Rod", "Math_Alphanum", "Sutton_SignWriting",
+            "Misc_Arrows_Ext", "Latin_Ext_G", "Glagolitic_Sup",
             "Cyrillic_Ext_D", "Nyiakeng_Puachue_Hmong", "Toto", "Wancho",
             "Nag_Mundari", "Ol_Onal", "Tai_Yo", "Ethiopic_Ext_B",
             "Mende_Kikakui", "Adlam", "Indic_Siyaq_Numbers",
@@ -219,7 +225,7 @@ namespace UCD {
             "Symbols_And_Pictographs_Ext_A", "Symbols_For_Legacy_Computing",
             "CJK_Ext_B", "CJK_Ext_C", "CJK_Ext_D", "CJK_Ext_E", "CJK_Ext_F",
             "CJK_Ext_I", "CJK_Compat_Ideographs_Sup", "CJK_Ext_G",
-            "CJK_Ext_H", "CJK_Ext_J", "Tags", "VS_Sup", "Sup_PUA_A",
+            "CJK_Ext_H", "CJK_Ext_J", "Seal", "Tags", "VS_Sup", "Sup_PUA_A",
             "Sup_PUA_B"};
         const static std::vector<std::string> value_names = {
             "No_Block", "Basic_Latin", "Latin_1_Supplement",
@@ -305,27 +311,28 @@ namespace UCD {
             "Unified_Canadian_Aboriginal_Syllabics_Extended_A",
             "Pau_Cin_Hau", "Devanagari_Extended_A", "Sharada_Supplement",
             "Sunuwar", "Bhaiksuki", "Marchen", "Masaram_Gondi",
-            "Gunjala_Gondi", "Tolong_Siki", "Makasar", "Kawi",
-            "Lisu_Supplement", "Tamil_Supplement", "Cuneiform",
+            "Gunjala_Gondi", "Tolong_Siki", "Bengali_Supplement", "Makasar",
+            "Kawi", "Lisu_Supplement", "Tamil_Supplement", "Cuneiform",
             "Cuneiform_Numbers_And_Punctuation", "Early_Dynastic_Cuneiform",
-            "Cypro_Minoan", "Egyptian_Hieroglyphs",
-            "Egyptian_Hieroglyph_Format_Controls",
+            "Archaic_Cuneiform_Numerals", "Cypro_Minoan",
+            "Egyptian_Hieroglyphs", "Egyptian_Hieroglyph_Format_Controls",
             "Egyptian_Hieroglyphs_Extended_A", "Anatolian_Hieroglyphs",
             "Gurung_Khema", "Bamum_Supplement", "Mro", "Tangsa",
             "Bassa_Vah", "Pahawh_Hmong", "Kirat_Rai", "Medefaidrin",
             "Beria_Erfe", "Miao", "Ideographic_Symbols_And_Punctuation",
             "Tangut", "Tangut_Components", "Khitan_Small_Script",
-            "Tangut_Supplement", "Tangut_Components_Supplement",
-            "Kana_Extended_B", "Kana_Supplement", "Kana_Extended_A",
-            "Small_Kana_Extension", "Nushu", "Duployan",
+            "Tangut_Supplement", "Tangut_Components_Supplement", "Jurchen",
+            "Jurchen_Radicals", "Kana_Extended_B", "Kana_Supplement",
+            "Kana_Extended_A", "Small_Kana_Extension", "Nushu", "Duployan",
             "Shorthand_Format_Controls",
             "Symbols_For_Legacy_Computing_Supplement",
             "Miscellaneous_Symbols_Supplement", "Znamenny_Musical_Notation",
             "Byzantine_Musical_Symbols", "Musical_Symbols",
-            "Ancient_Greek_Musical_Notation", "Kaktovik_Numerals",
-            "Mayan_Numerals", "Tai_Xuan_Jing_Symbols",
+            "Ancient_Greek_Musical_Notation", "Musical_Symbols_Supplement",
+            "Kaktovik_Numerals", "Mayan_Numerals", "Tai_Xuan_Jing_Symbols",
             "Counting_Rod_Numerals", "Mathematical_Alphanumeric_Symbols",
-            "Sutton_SignWriting", "Latin_Extended_G",
+            "Sutton_SignWriting",
+            "Miscellaneous_Symbols_And_Arrows_Extended", "Latin_Extended_G",
             "Glagolitic_Supplement", "Cyrillic_Extended_D",
             "Nyiakeng_Puachue_Hmong", "Toto", "Wancho", "Nag_Mundari",
             "Ol_Onal", "Tai_Yo", "Ethiopic_Extended_B", "Mende_Kikakui",
@@ -349,7 +356,7 @@ namespace UCD {
             "CJK_Compatibility_Ideographs_Supplement",
             "CJK_Unified_Ideographs_Extension_G",
             "CJK_Unified_Ideographs_Extension_H",
-            "CJK_Unified_Ideographs_Extension_J", "Tags",
+            "CJK_Unified_Ideographs_Extension_J", "Seal", "Tags",
             "Variation_Selectors_Supplement",
             "Supplementary_Private_Use_Area_A",
             "Supplementary_Private_Use_Area_B"};
@@ -378,7 +385,7 @@ namespace UCD {
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-            "", "", "", "", "", ""}};
+            "", "", "", "", "", "", "", "", "", "", "", "", ""}};
     }
 
     namespace SC_ns {
@@ -400,7 +407,7 @@ namespace UCD {
             Soyo, Zanb, Dogr, Gong, Maka, Medf, Rohg, Sogd, Sogo, Elym,
             Nand, Hmnp, Wcho, Chrs, Diak, Kits, Yezi, Cpmn, Ougr, Tnsa,
             Toto, Vith, Kawi, Nagm, Gara, Gukh, Krai, Onao, Sunu, Todr,
-            Tutg, Sidt, Tayo, Tols, Berf, Hrkt};
+            Tutg, Sidt, Tayo, Tols, Berf, Jurc, Pcun, Seal, Hrkt};
         const static std::vector<std::string> enum_names = {
             "Zzzz", "Zyyy", "Latn", "Grek", "Cyrl", "Armn", "Hebr", "Arab",
             "Syrc", "Thaa", "Deva", "Beng", "Guru", "Gujr", "Orya", "Taml",
@@ -423,7 +430,8 @@ namespace UCD {
             "Maka", "Medf", "Rohg", "Sogd", "Sogo", "Elym", "Nand", "Hmnp",
             "Wcho", "Chrs", "Diak", "Kits", "Yezi", "Cpmn", "Ougr", "Tnsa",
             "Toto", "Vith", "Kawi", "Nagm", "Gara", "Gukh", "Krai", "Onao",
-            "Sunu", "Todr", "Tutg", "Sidt", "Tayo", "Tols", "Berf", "Hrkt"};
+            "Sunu", "Todr", "Tutg", "Sidt", "Tayo", "Tols", "Berf", "Jurc",
+            "Pcun", "Seal", "Hrkt"};
         const static std::vector<std::string> value_names = {
             "Unknown", "Common", "Latin", "Greek", "Cyrillic", "Armenian",
             "Hebrew", "Arabic", "Syriac", "Thaana", "Devanagari", "Bengali",
@@ -462,7 +470,8 @@ namespace UCD {
             "Old_Uyghur", "Tangsa", "Toto", "Vithkuqi", "Kawi",
             "Nag_Mundari", "Garay", "Gurung_Khema", "Kirat_Rai", "Ol_Onal",
             "Sunuwar", "Todhri", "Tulu_Tigalari", "Sidetic", "Tai_Yo",
-            "Tolong_Siki", "Beria_Erfe", "Katakana_Or_Hiragana"};
+            "Tolong_Siki", "Beria_Erfe", "Jurchen", "Proto_Cuneiform",
+            "Seal", "Katakana_Or_Hiragana"};
         const static std::vector<std::string> aliases = {{
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
@@ -475,7 +484,7 @@ namespace UCD {
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-            "", ""}};
+            "", "", "", "", ""}};
     }
 
     namespace BC_ns {
@@ -738,7 +747,9 @@ namespace UCD {
             Malayalam_Nya, Malayalam_Tta, Malayalam_Nna, Malayalam_Nnna,
             Malayalam_Bha, Malayalam_Ra, Malayalam_Lla, Malayalam_Llla,
             Malayalam_Ssa, Hanifi_Rohingya_Pa, Hanifi_Rohingya_Kinna_Ya,
-            Thin_Yeh, Vertical_Tail, Kashmiri_Yeh, Thin_Noon};
+            Thin_Yeh, Vertical_Tail, Kashmiri_Yeh, Thin_Noon, Crown_Beh,
+            Crown_Hah, Crown_Seen, Crown_Sad, Crown_Tah, Crown_Ain,
+            Crown_Feh, Crown_Kaf, Crown_Meem, Crown_Heh};
         const static std::vector<std::string> enum_names = {
             "No_Joining_Group", "Ain", "Alaph", "Alef", "Beh", "Beth",
             "Dal", "Dalath_Rish", "E", "Feh", "Final_Semkath", "Gaf",
@@ -764,7 +775,10 @@ namespace UCD {
             "Malayalam_Nnna", "Malayalam_Bha", "Malayalam_Ra",
             "Malayalam_Lla", "Malayalam_Llla", "Malayalam_Ssa",
             "Hanifi_Rohingya_Pa", "Hanifi_Rohingya_Kinna_Ya", "Thin_Yeh",
-            "Vertical_Tail", "Kashmiri_Yeh", "Thin_Noon"};
+            "Vertical_Tail", "Kashmiri_Yeh", "Thin_Noon", "Crown_Beh",
+            "Crown_Hah", "Crown_Seen", "Crown_Sad", "Crown_Tah",
+            "Crown_Ain", "Crown_Feh", "Crown_Kaf", "Crown_Meem",
+            "Crown_Heh"};
         const static std::vector<std::string> value_names = {
             "No_Joining_Group", "Ain", "Alaph", "Alef", "Beh", "Beth",
             "Dal", "Dalath_Rish", "E", "Feh", "Final_Semkath", "Gaf",
@@ -790,7 +804,10 @@ namespace UCD {
             "Malayalam_Nnna", "Malayalam_Bha", "Malayalam_Ra",
             "Malayalam_Lla", "Malayalam_Llla", "Malayalam_Ssa",
             "Hanifi_Rohingya_Pa", "Hanifi_Rohingya_Kinna_Ya", "Thin_Yeh",
-            "Vertical_Tail", "Kashmiri_Yeh", "Thin_Noon"};
+            "Vertical_Tail", "Kashmiri_Yeh", "Thin_Noon", "Crown_Beh",
+            "Crown_Hah", "Crown_Seen", "Crown_Sad", "Crown_Tah",
+            "Crown_Ain", "Crown_Feh", "Crown_Kaf", "Crown_Meem",
+            "Crown_Heh"};
         const static std::vector<std::string> aliases = {{
             "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "Hamza_On_Heh_Goal", "", "", "", "", "", "", "", "", "", "", "",
@@ -798,7 +815,8 @@ namespace UCD {
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
             "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
-            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", ""}};
+            "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+            "", "", "", "", "", "", "", "", "", ""}};
     }
 
     namespace JT_ns {
@@ -816,13 +834,13 @@ namespace UCD {
     namespace LB_ns {
         enum value_t {
             XX, CM, BA, LF, BK, CR, SP, EX, QU, AL, PR, PO, OP, CP, IS, HY,
-            SY, NU, CL, NL, GL, AI, BB, HH, HL, SA, JL, JV, JT, NS, AK, VI,
+            SY, NU, CL, NL, GL, AI, HH, BB, HL, SA, JL, JV, JT, NS, AK, VI,
             AS, ID, VF, ZW, ZWJ, B2, IN, WJ, EB, CJ, H2, H3, SG, CB, AP, RI,
             EM};
         const static std::vector<std::string> enum_names = {
             "XX", "CM", "BA", "LF", "BK", "CR", "SP", "EX", "QU", "AL",
             "PR", "PO", "OP", "CP", "IS", "HY", "SY", "NU", "CL", "NL",
-            "GL", "AI", "BB", "HH", "HL", "SA", "JL", "JV", "JT", "NS",
+            "GL", "AI", "HH", "BB", "HL", "SA", "JL", "JV", "JT", "NS",
             "AK", "VI", "AS", "ID", "VF", "ZW", "ZWJ", "B2", "IN", "WJ",
             "EB", "CJ", "H2", "H3", "SG", "CB", "AP", "RI", "EM"};
         const static std::vector<std::string> value_names = {
@@ -831,9 +849,9 @@ namespace UCD {
             "Quotation", "Alphabetic", "Prefix_Numeric", "Postfix_Numeric",
             "Open_Punctuation", "Close_Parenthesis", "Infix_Numeric",
             "Hyphen", "Break_Symbols", "Numeric", "Close_Punctuation",
-            "Next_Line", "Glue", "Ambiguous", "Break_Before",
-            "Unambiguous_Hyphen", "Hebrew_Letter", "Complex_Context", "JL",
-            "JV", "JT", "Nonstarter", "Aksara", "Virama", "Aksara_Start",
+            "Next_Line", "Glue", "Ambiguous", "Unambiguous_Hyphen",
+            "Break_Before", "Hebrew_Letter", "Complex_Context", "JL", "JV",
+            "JT", "Nonstarter", "Aksara", "Virama", "Aksara_Start",
             "Ideographic", "Virama_Final", "ZWSpace", "ZWJ", "Break_Both",
             "Inseparable", "Word_Joiner", "E_Base",
             "Conditional_Japanese_Starter", "H2", "H3", "Surrogate",

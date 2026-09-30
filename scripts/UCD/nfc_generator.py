@@ -251,7 +251,7 @@ def range_usets_from_cps(cp_list):
             rg_sets[code] = uset_union(rg_sets[code], singleton_uset(cp))
     return rg_sets
 
-singleton_header = r"""//
+singleton_header_template = string.Template(r"""//
 SingletonCanonicalization::SingletonCanonicalization
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmBasis)
 : PabloKernel(ts, "SingletonCanonicalization" + Basis->shapeString(),
@@ -263,44 +263,93 @@ void SingletonCanonicalization::generatePabloMethod() {
     BixNumCompiler bnc(pb);
     PabloAST * All0 = pb.createZeroes();
     std::vector<PabloAST *> Basis = getInputStreamSet("Basis");
-    Var * DeleteVar = pb.createVar("DeleteVar", All0);
-    std::vector<Var *> XfrmVar(Basis.size());
+${delete_var_decl}    std::vector<Var *> XfrmVar(Basis.size());
     for (unsigned i = 0; i < Basis.size(); i++) {
         XfrmVar[i] = pb.createVar("XfrmBasis" + std::to_string(i), All0);
     }
-"""
+""")
+
+def singleton_header(needs_delete_var):
+    decl = '    Var * DeleteVar = pb.createVar("DeleteVar", All0);\n' if needs_delete_var else ""
+    return singleton_header_template.substitute(delete_var_decl = decl)
 
 nested_pfx_template = r"""
     auto ${builder} = pb.createScope();
     PabloAST * ${pfx_test_var} = ${logic};
     pb.createIf(${pfx_test_var}, ${builder});
     std::vector<PabloAST *> xfrm_${code_str}(8, All0);
-    PabloAST * del_${code_str} = All0;
-"""
+${del_var_decl}"""
 
-def gen_nested_pfx_code(pfx_code):
+def gen_nested_pfx_code(pfx_code, declare_del_var = True):
     code_str = pfx_code_string(pfx_code)
     pfx_test_var = "pfx_%s_test" % code_str
     test = prefix_test_logic(pfx_code)
     scope = "b_%s" % code_str
     t = string.Template(nested_pfx_template)
+    del_var_decl = "    PabloAST * del_%s = All0;\n" % code_str if declare_del_var else ""
     return t.substitute(builder = scope,
                         code_str = code_str,
                         pfx_test_var = pfx_test_var,
-                        logic = test)
+                        logic = test,
+                        del_var_decl = del_var_decl)
 
-singleton_final_code = r"""
+# Emits the code that ORs each installed per-deletion-amount uset (del_vars, keyed by
+# ldiff -- see u8_deletion_sets) into this subrange's del_${code_str}, then combines
+# del_${code_str} into the enclosing routine's DeleteVar. Only called when this
+# subrange's own del_usets was non-empty (so del_${code_str} was actually declared --
+# see gen_nested_pfx_code) and the enclosing routine's overall mapping needs a DeleteVar
+# at all (see needs_delete_var below).
+#
+# Each del_vars[ldiff] uset is matched (like bit_xfrm_sets) at the STARTING byte position
+# of the affected codepoint, whose own encoded length is cp_len (fixed for every
+# codepoint in this prefix's subrange -- see pfx_code_lgth). Per u8_byte_xfrms/
+# CharacterTranslationLogic's zero-padding convention, the replacement's bytes occupy
+# positions [0, cp_len-ldiff-1] of that span and the codepoint's own trailing
+# [cp_len-ldiff, cp_len-1] bytes are exactly the ones that must be dropped -- NOT the
+# whole span (this isn't removing a second, separately-encoded codepoint the way
+# short_composable's DeleteVar does) and NOT just the starting byte. So each del_vars
+# entry needs to mark every one of those trailing offsets individually, each via its own
+# createAdvance from the starting-position match.
+def combine_del_vars_code(scope, code_str, cp_len, del_vars):
+    s = ""
+    for del_amt in sorted(del_vars.keys()):
+        for offset in range(cp_len - del_amt, cp_len):
+            term = del_vars[del_amt] if offset == 0 else "%s.createAdvance(%s, %i)" % (scope, del_vars[del_amt], offset)
+            s += "    del_%s = %s.createOr(del_%s, %s);\n" % (code_str, scope, code_str, term)
+    s += "    %s.createAssign(DeleteVar, %s.createOr(DeleteVar, del_%s));\n" % (scope, scope, code_str)
+    return s
+
+# The maximum number of UTF-8 code units by which any codepoint's encoding in
+# char2string_map is longer than its mapped replacement's encoding -- i.e. the deepest
+# any single mapping in this routine ever needs to delete. 0 means the routine's Basis
+# is never longer than its Xfrm output for any codepoint it handles, so it never needs a
+# DeleteVar/deletion mask at all (see needs_delete_var).
+def max_deletion_amount(char2string_map):
+    del_usets = u8_deletion_sets(char2string_map)
+    if len(del_usets) == 0:
+        return 0
+    return max(del_usets.keys())
+
+singleton_final_template = string.Template(r"""
     Var * XfrmOutputVar = getOutputStreamVar("XfrmBasis");
-    PabloAST * select = pb.createNot(DeleteVar);
-    for (unsigned i = 0; i < 8; i++) {
+${select_decl}    for (unsigned i = 0; i < 8; i++) {
         Var * xfrm_out = pb.createExtract(XfrmOutputVar, pb.getInteger(i));
         //  pb.createAssign(xfrm_out, XfrmVar[i]);
-        pb.createAssign(xfrm_out, pb.createAnd(select, pb.createXor(Basis[i], XfrmVar[i])));
+        pb.createAssign(xfrm_out, ${xfrm_expr});
     }
 }
-"""
+""")
 
-excluded_composite_header = r"""//
+def singleton_final_code(needs_delete_var):
+    if needs_delete_var:
+        select_decl = "    PabloAST * select = pb.createNot(DeleteVar);\n"
+        xfrm_expr = "pb.createAnd(select, pb.createXor(Basis[i], XfrmVar[i]))"
+    else:
+        select_decl = ""
+        xfrm_expr = "pb.createXor(Basis[i], XfrmVar[i])"
+    return singleton_final_template.substitute(select_decl = select_decl, xfrm_expr = xfrm_expr)
+
+excluded_composite_header_template = string.Template(r"""//
 ExcludedCompositeStage::ExcludedCompositeStage
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmBasis)
 : PabloKernel(ts, "ExcludedCompositeStage" + Basis->shapeString(),
@@ -312,23 +361,34 @@ void ExcludedCompositeStage::generatePabloMethod() {
     BixNumCompiler bnc(pb);
     PabloAST * All0 = pb.createZeroes();
     std::vector<PabloAST *> Basis = getInputStreamSet("Basis");
-    Var * DeleteVar = pb.createVar("DeleteVar", All0);
-    std::vector<Var *> XfrmVar(Basis.size());
+${delete_var_decl}    std::vector<Var *> XfrmVar(Basis.size());
     for (unsigned i = 0; i < Basis.size(); i++) {
         XfrmVar[i] = pb.createVar("XfrmBasis" + std::to_string(i), All0);
     }
-"""
+""")
 
-excluded_composite_final_code = r"""
+def excluded_composite_header(needs_delete_var):
+    decl = '    Var * DeleteVar = pb.createVar("DeleteVar", All0);\n' if needs_delete_var else ""
+    return excluded_composite_header_template.substitute(delete_var_decl = decl)
+
+excluded_composite_final_template = string.Template(r"""
     Var * XfrmOutputVar = getOutputStreamVar("XfrmBasis");
-    PabloAST * select = pb.createNot(DeleteVar);
-    for (unsigned i = 0; i < 8; i++) {
+${select_decl}    for (unsigned i = 0; i < 8; i++) {
         Var * xfrm_out = pb.createExtract(XfrmOutputVar, pb.getInteger(i));
         //  pb.createAssign(xfrm_out, XfrmVar[i]);
-        pb.createAssign(xfrm_out, pb.createAnd(select, pb.createXor(Basis[i], XfrmVar[i])));
+        pb.createAssign(xfrm_out, ${xfrm_expr});
     }
 }
-"""
+""")
+
+def excluded_composite_final_code(needs_delete_var):
+    if needs_delete_var:
+        select_decl = "    PabloAST * select = pb.createNot(DeleteVar);\n"
+        xfrm_expr = "pb.createAnd(select, pb.createXor(Basis[i], XfrmVar[i]))"
+    else:
+        select_decl = ""
+        xfrm_expr = "pb.createXor(Basis[i], XfrmVar[i])"
+    return excluded_composite_final_template.substitute(select_decl = select_decl, xfrm_expr = xfrm_expr)
 
 
 pass_template = r"""//
@@ -896,14 +956,12 @@ void NFC_CandidateClass::generatePabloMethod() {
 }
 """
 
-nfc_generated_cpp_template = r"""#include <kernel/unicode/normalization.h>
+nfc_generated_cpp_template = r"""#include <kernel/unicode/normalization/normalization.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/algo/normalization.h>
 #include <ucd/utf/utf_compiler.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/streamutils/stream_shift.h>
 #include <toolchain/toolchain.h>
@@ -1498,48 +1556,59 @@ class NFC_generator:
                 print("  pfx_code %s: %s" % (pfx_code_string(pfx_code), ", ".join(codes)))
 
     def generate_singleton_stage(self):
-        s = singleton_header
+        full_xlate_map = {cp1 : chr(self.singleton_map[cp1]) for cp1 in self.singleton_map.keys()}
+        needs_delete_var = max_deletion_amount(full_xlate_map) > 0
+        s = singleton_header(needs_delete_var)
         rg_set_map = range_usets_from_cps(self.singleton_map.keys())
         for pfx_code in rg_set_map.keys():
             code_str = pfx_code_string(pfx_code)
             scope = "b_%s" % code_str
-            s += gen_nested_pfx_code(pfx_code)
-            s += self.builder.open_scope(code_str, scope)
             pfx_xlate_map = {}
             singleton_list = uset_to_member_list(rg_set_map[pfx_code])
             for cp1 in singleton_list:
                 pfx_xlate_map[cp1] = chr(self.singleton_map[cp1])
-            bit_xfrm_sets = u8_bit_transform_sets(pfx_xlate_map)
             del_usets = u8_deletion_sets(pfx_xlate_map)
+            subrange_needs_del = needs_delete_var and len(del_usets) > 0
+            s += gen_nested_pfx_code(pfx_code, declare_del_var = subrange_needs_del)
+            s += self.builder.open_scope(code_str, scope)
+            bit_xfrm_sets = u8_bit_transform_sets(pfx_xlate_map)
             bit_xfrm_data = install_bit_xfrm_usets(self.builder, bit_xfrm_sets)
-            del_vars = install_del_usets(self.builder, del_usets)
+            if subrange_needs_del:
+                del_vars = install_del_usets(self.builder, del_usets)
             s += self.builder.generate_scope_compilations()
             s += generateUpdateBitXfrms(scope, bit_xfrm_data, "XfrmVar", "nullptr")
-            #s += generateDel
+            if subrange_needs_del:
+                s += combine_del_vars_code(scope, code_str, pfx_code_lgth(pfx_code), del_vars)
             s += self.builder.close_scope()
-        s += singleton_final_code
+        s += singleton_final_code(needs_delete_var)
         return s
 
     def generate_excluded_composite_stage(self):
-        s = excluded_composite_header
+        full_xlate_map = {cp : self.excluded_composite_map[cp] for cp in self.excluded_composite_map.keys()}
+        needs_delete_var = max_deletion_amount(full_xlate_map) > 0
+        s = excluded_composite_header(needs_delete_var)
         rg_set_map = range_usets_from_cps(self.excluded_composite_map.keys())
         for pfx_code in rg_set_map.keys():
             code_str = pfx_code_string(pfx_code)
             scope = "b_%s" % code_str
-            s += gen_nested_pfx_code(pfx_code)
-            s += self.builder.open_scope(code_str, scope)
             pfx_xlate_map = {}
             composite_list = uset_to_member_list(rg_set_map[pfx_code])
             for cp in composite_list:
                 pfx_xlate_map[cp] = self.excluded_composite_map[cp]
-            bit_xfrm_sets = u8_bit_transform_sets(pfx_xlate_map)
             del_usets = u8_deletion_sets(pfx_xlate_map)
+            subrange_needs_del = needs_delete_var and len(del_usets) > 0
+            s += gen_nested_pfx_code(pfx_code, declare_del_var = subrange_needs_del)
+            s += self.builder.open_scope(code_str, scope)
+            bit_xfrm_sets = u8_bit_transform_sets(pfx_xlate_map)
             bit_xfrm_data = install_bit_xfrm_usets(self.builder, bit_xfrm_sets)
-            del_vars = install_del_usets(self.builder, del_usets)
+            if subrange_needs_del:
+                del_vars = install_del_usets(self.builder, del_usets)
             s += self.builder.generate_scope_compilations()
             s += generateUpdateBitXfrms(scope, bit_xfrm_data, "XfrmVar", "nullptr")
+            if subrange_needs_del:
+                s += combine_del_vars_code(scope, code_str, pfx_code_lgth(pfx_code), del_vars)
             s += self.builder.close_scope()
-        s += excluded_composite_final_code
+        s += excluded_composite_final_code(needs_delete_var)
         return s
 
     def generate_nfc_stage(self, pass_no):

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <pablo/pablo_kernel.h>
+#include <pablo/pablo.h>
 
 namespace kernel {
     

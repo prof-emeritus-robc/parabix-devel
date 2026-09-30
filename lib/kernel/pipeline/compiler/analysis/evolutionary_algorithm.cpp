@@ -42,8 +42,34 @@ struct WorkQueue {
     }
 
     inline void push(T && item) {
-       std::lock_guard<TASLock> lock(_lock);
+        std::lock_guard<TASLock> lock(_lock);
         _queue.push(std::move(item));
+        ++_pending;
+    }
+
+    // Call once the item popped by a successful pop() has been fully processed.
+    // _pending is incremented inside push() (before the item is ever visible to a
+    // popper) and decremented here (after processing completes), both under the
+    // same lock as pop() itself -- so hasPendingWork() returning false is a real
+    // happens-before guarantee that every push has been fully processed, unlike
+    // a separately-incremented "active worker count" that isn't updated in the
+    // same atomic step as the pop that makes it active (that gap let the main
+    // thread conclude "no worker is active" while a worker had already removed
+    // an item from the queue but not yet finished/been counted as processing
+    // it -- confirmed via ThreadSanitizer as a genuine race on nextGeneration
+    // between a worker still inside processCandidate and the main thread moving
+    // on to mutate it directly).
+    inline void markDone() {
+        std::lock_guard<TASLock> lock(_lock);
+        assert (_pending > 0);
+        --_pending;
+    }
+
+    // True if any pushed item has not yet been popped, or has been popped but
+    // not yet markDone()'d.
+    inline bool hasPendingWork() const {
+        std::lock_guard<TASLock> lock(_lock);
+        return !_queue.empty() || _pending > 0;
     }
 
     inline size_t size() {
@@ -53,7 +79,8 @@ struct WorkQueue {
 
 private:
     mutable std::queue<T> _queue;
-    TASLock _lock;
+    mutable TASLock _lock;
+    size_t _pending = 0;
 };
 
 using CandidateQueue = WorkQueue<Candidate>;
@@ -86,7 +113,10 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
 
     CandidateQueue workQueue;
 
-    bool finishedProcessing = false;
+    // Written once by the calling thread and polled by every worker thread's exit
+    // check below; must be atomic (ThreadSanitizer confirmed a genuine data race
+    // here when this was a plain bool).
+    std::atomic<bool> finishedProcessing{false};
 
     TASLock candidateMapLock;
     TASLock nextGenLock;
@@ -105,22 +135,33 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
         nextGenLock.unlock();
     };
 
-    std::atomic<size_t> activeThreads{0};
+    // Pre-seed each worker thread's RNG on this (the calling) thread, before any
+    // worker thread is spawned. Previously each worker thread called the shared
+    // `rng` itself (via `pipeline_random_engine threadRng(rng());`) right after
+    // starting, racing with this thread's own -- extensive, main-loop-long -- use
+    // of that same `rng` below (e.g. zeroToOneReal(rng), bitString.randomize(rng),
+    // std::shuffle(..., rng)). ThreadSanitizer confirmed this as a genuine,
+    // unsynchronized data race on rng's internal state. Seeding up front here
+    // means `rng` itself is only ever touched by this thread, and each worker
+    // thread gets its own independent, already-seeded generator.
+    std::vector<pipeline_random_engine::result_type> threadSeeds;
+    threadSeeds.reserve(threadCount > 0 ? threadCount - 1 : 0);
+    for (unsigned i = 1; i < threadCount; ++i) {
+        threadSeeds.push_back(rng());
+    }
 
     for (unsigned i = 1; i < threadCount; ++i) {
-        threads.emplace_back([&]() {
-            pipeline_random_engine threadRng(rng());
+        threads.emplace_back([&, i]() {
+            pipeline_random_engine threadRng(threadSeeds[i - 1]);
             auto worker = makeWorker(threadRng);
             for (;;) {
                 Candidate C;
                 if (workQueue.pop(C)) {
                     assert (C.size() == candidateLength);
-                    activeThreads.fetch_add(1, std::memory_order_seq_cst);
                     processCandidate(worker, std::move(C), threadRng);
-                    activeThreads.fetch_add(-1, std::memory_order_seq_cst);
+                    workQueue.markDone();
                 } else { // sleep 1/10 ms then check if we're finished.
                     std::this_thread::sleep_for(nanoseconds(100));
-                    assert (activeThreads.load(std::memory_order_relaxed) < threadCount);
                     if (finishedProcessing) {
                         break;
                     }
@@ -160,13 +201,8 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
         if (workQueue.pop(C)) {
             assert (C.size() == candidateLength);
             processCandidate(mainWorker, std::move(C), rng);
-        } else {
-            assert (workQueue.empty());
-            for (;;) {
-                const auto c = activeThreads.load(std::memory_order_relaxed);
-                assert (c < threadCount);
-                if (c == 0) break;
-            }
+            workQueue.markDone();
+        } else if (!workQueue.hasPendingWork()) {
             break;
         }
     }
@@ -184,6 +220,20 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
 
 
     if (LLVM_UNLIKELY(candidateLength < 2)) {
+        goto enumerated_entire_search_space;
+    }
+
+    // The crossover/selection logic below assumes at least two candidates to
+    // operate on (it asserts populationSize > 1), but nothing upstream actually
+    // guarantees that many were produced -- the population-initialization phase
+    // above only asserts nextGeneration.size() > 0. Under heavy CPU contention
+    // (e.g. many kernels' thread-local buffer layouts being optimized
+    // concurrently), that phase's wall-clock init budget can be starved enough
+    // to leave exactly one candidate, which previously tripped the assert in a
+    // debug build and was undefined behaviour in a release build. getResult()
+    // already handles a population of exactly one correctly, so just skip the
+    // generational loop in that case too.
+    if (LLVM_UNLIKELY(population.size() <= 1)) {
         goto enumerated_entire_search_space;
     }
 
@@ -212,7 +262,7 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
     const auto maxTimeVal = maxTime.count();
     const auto limit = start + maxTime;
 
-    for (unsigned g = 0; ; ++g) {
+    for (;;) {
 
         const auto now = system_clock::now();
         if (now >= limit) break;
@@ -328,13 +378,8 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
             if (workQueue.pop(C)) {
                 assert (C.size() == candidateLength);
                 processCandidate(mainWorker, std::move(C), rng);
-            } else {
-                assert (workQueue.empty());
-                for (;;) {
-                    const auto c = activeThreads.load(std::memory_order_relaxed);
-                    assert (c < threadCount);
-                    if (c == 0) break;
-                }
+                workQueue.markDone();
+            } else if (!workQueue.hasPendingWork()) {
                 break;
             }
         }
@@ -449,7 +494,20 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
                 // ELITISM: always keep the fittest candidate for the next generation
                 chosen.insert(fittestIndividual);
                 std::uniform_real_distribution<double> selector(0, sumX);
-                while (chosen.size() < maxCandidates) {
+                // A wide enough fitness spread makes some candidates' exp()-weighted
+                // contributions to sumX numerically insignificant (more than double
+                // precision's ~1e16x dynamic range smaller than the running total),
+                // silently lost by sumX += y above -- their weights[] slot then differs
+                // from its neighbour by nothing a random draw can land between, making
+                // that index effectively unreachable here. Confirmed in practice as a
+                // reproducible hang (csv2json_test under make check): unbounded retries
+                // waiting for a random draw that may never come. Bound the attempts and
+                // deterministically fill any remaining slots, so termination doesn't
+                // depend on how skewed the fitness distribution happens to be.
+                unsigned selectionAttempts = 0;
+                const unsigned maxSelectionAttempts = 100 * maxCandidates;
+                while (chosen.size() < maxCandidates && selectionAttempts < maxSelectionAttempts) {
+                    ++selectionAttempts;
                     const auto d = selector(rng);
                     assert (d < sumX);
                     const auto f = std::upper_bound(weights.begin(), weights_end, d);
@@ -457,6 +515,9 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
                     const unsigned j = std::distance(weights.begin(), f);
                     assert (j < newPopulationSize);
                     chosen.insert(j);
+                }
+                for (unsigned i = 0; i < newPopulationSize && chosen.size() < maxCandidates; ++i) {
+                    chosen.insert(i);
                 }
                 for (unsigned i : chosen) {
                     assert (i < newPopulationSize);

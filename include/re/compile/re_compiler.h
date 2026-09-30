@@ -5,16 +5,16 @@
 
 #pragma once
 
+#include <map>                          // for ExternalNameMap
+#include <string>                       // for ExternalNameMap key
 #include <vector>                       // for vector<>::iterator
 #include <boost/container/flat_map.hpp>
-#include <pablo/builder.hpp>
 #include <re/adt/adt.h>              // for Seq
 #include <re/alphabet/alphabet.h>
 
 namespace cc { class CC_Compiler; class Alphabet;}
 namespace pablo { class PabloAST; }
 namespace pablo { class PabloBlock; }
-namespace pablo { class Var; }
 
 namespace re {
 

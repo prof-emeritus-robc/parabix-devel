@@ -3,11 +3,8 @@
 #include <array>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/pablo_kernel.h>
-#include <pablo/pe_var.h>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_ones.h>
-#include <pablo/printer_pablos.h>
+#include <pablo/pablo.h>
+#include <pablo/compiler/printer_pablos.h>
 #include <pablo/bixnum/bixnum.h>
 #include <re/alphabet/alphabet.h>
 #include <re/cc/cc_compiler_target.h>

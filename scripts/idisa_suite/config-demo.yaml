@@ -118,6 +118,11 @@ modes:
   block-size: 256
   extra-args: [--BlockSize=256, "--cpu-features=-avx512f"]
 
+- name: avx-512
+  exerciser-path: build/bin/idisa_exerciser
+  block-size: 512
+  extra-args: [--BlockSize=512]
+
 - name: i64
   exerciser-path: build/bin/idisa_exerciser
   block-size: 64

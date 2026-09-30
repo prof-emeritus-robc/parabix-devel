@@ -175,7 +175,7 @@ class DummyCheckKernel : public Kernel {
                  {Binding{OperationConfig::failureCountIdent, failureCount}}, {}) {}
 
   protected:
-    void generateKernelMethod(KernelBuilder &b) override {}
+    void generateKernelMethod(KernelBuilder &b, llvm::TargetMachine *) override {}
 
     void generateFinalizeMethod(KernelBuilder &b) override {
         b.setScalarField(OperationConfig::failureCountIdent, b.getSize(0));
@@ -600,9 +600,9 @@ class GenericOpConfig : public BaseOpConfig {
 using UnaryOpConfig = NaryOpConfig<1>;
 using BinaryOpConfig = NaryOpConfig<2>;
 using TernaryOpConfig = NaryOpConfig<3>;
-using ImmedUnOpConfig = ImmediateOpConfig<UnaryOpConfig, 0, 256>;
-using ImmedBinOpConfig = ImmediateOpConfig<BinaryOpConfig, 0, 256>;
-using ImmedTernOpConfig = ImmediateOpConfig<TernaryOpConfig, 0, 256>;
+using ImmedUnOpConfig = ImmediateOpConfig<UnaryOpConfig, 0, 512>;
+using ImmedBinOpConfig = ImmediateOpConfig<BinaryOpConfig, 0, 512>;
+using ImmedTernOpConfig = ImmediateOpConfig<TernaryOpConfig, 0, 512>;
 
 //////////////////////////////////////////////////////////////////////////////////
 // And now, the actual index of operations...
@@ -1213,28 +1213,16 @@ OperationIndexEntry allOperations[] = {
                      auto expectedF = wrapHorizontalStore<BinaryOpConfig>([=](KernelBuilder &b, const BinaryOpConfig &c,
                                                                               const BinaryOpConfig::Params &p,
                                                                               Value *expectedBlock, unsigned i) {
-// JL -- I found 2 versions of the hsimd_packss test, the first is the one that would have been active...?
-#if 1
-                         Value *maxVal = ConstantInt::get(b.getContext(), APInt::getLowBitsSet(p.fw, p.fw / 2 - 1));
-                         Value *newOpr0 = b.CreateSelect(b.CreateICmpSGT(p.opr[0], maxVal), maxVal, p.opr[0]);
-                         Value *newOpr1 = b.CreateSelect(b.CreateICmpSGT(p.opr[1], maxVal), maxVal, p.opr[1]);
-                         Value *minVal = ConstantInt::get(b.getContext(), APInt::getHighBitsSet(p.fw, p.fw / 2 + 1));
-                         newOpr0 = b.CreateSelect(b.CreateICmpSLT(newOpr0, minVal), minVal, p.opr[0]);
-                         newOpr1 = b.CreateSelect(b.CreateICmpSLT(newOpr1, minVal), minVal, newOpr1);
+                         Value * hiSat = ConstantInt::get(b.getContext(), APInt::getLowBitsSet(p.fw, p.fw / 2 - 1));
+                         Value *newOpr0 = b.CreateSelect(b.CreateICmpSLE(p.opr[0], hiSat), p.opr[0], hiSat);
+                         Value *newOpr1 = b.CreateSelect(b.CreateICmpSLE(p.opr[1], hiSat), p.opr[1], hiSat);
+                         Value * loSat = b.CreateNot(hiSat);
+                         newOpr0 = b.CreateSelect(b.CreateICmpSGE(newOpr0, loSat), newOpr0, loSat);
+                         newOpr1 = b.CreateSelect(b.CreateICmpSGE(newOpr1, loSat), newOpr1, loSat);
                          newOpr0 = b.CreateTrunc(newOpr0, b.getIntNTy(p.fw / 2));
                          newOpr1 = b.CreateTrunc(newOpr1, b.getIntNTy(p.fw / 2));
-                         expectedBlock = SafeInsertElement(b, p.fw / 2, expectedBlock, newOpr0, i);
-                         expectedBlock = b.bitCast(SafeInsertElement(b, p.fw / 2, expectedBlock, newOpr1, p.fn + i));
-#else
-                         Value *testVal = ConstantInt::get(p.fTy, (1 << (p.fw / 2 - 1)) - 1);
-                         Value *newOpr0 = b.CreateSelect(b.CreateICmpSGT(p.opr[0], testVal), testVal, p.opr[0]);
-                         Value *newOpr1 = b.CreateSelect(b.CreateICmpSGT(p.opr[1], testVal), testVal, p.opr[1]);
-                         testVal = b.CreateNot(testVal);
-                         newOpr0 = b.CreateSelect(b.CreateICmpSLT(newOpr0, testVal), testVal, newOpr0);
-                         newOpr1 = b.CreateSelect(b.CreateICmpSLT(newOpr1, testVal), testVal, newOpr1);
-                         expectedBlock = SafeInsertElement(b, p.fw / 2, expectedBlock, newOpr0, i);
-                         expectedBlock = b.bitCast(SafeInsertElement(b, p.fw / 2, expectedBlock, newOpr1, p.fn + i));
-#endif
+                         expectedBlock = b.mvmd_insert(p.fw / 2, expectedBlock, newOpr0, i);
+                         expectedBlock = b.bitCast(b.mvmd_insert(p.fw / 2, expectedBlock, newOpr1, p.fn + i));
                          return expectedBlock;
                      });
                      return expectedF(b, c, newP);

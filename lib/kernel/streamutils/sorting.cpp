@@ -5,9 +5,7 @@
 
 #include <kernel/streamutils/sorting.h>
 #include <kernel/streamutils/run_index.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_var.h>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <boost/intrusive/detail/math.hpp>
 

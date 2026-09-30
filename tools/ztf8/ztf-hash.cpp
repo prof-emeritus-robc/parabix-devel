@@ -13,7 +13,6 @@
 #include <llvm/IR/Module.h>                        // for Module
 #include <llvm/Support/CommandLine.h>              // for ParseCommandLineOp...
 #include <llvm/Support/Debug.h>                    // for dbgs
-#include <pablo/pablo_kernel.h>                    // for PabloKernel
 #include <pablo/parse/pablo_source_kernel.h>
 #include <pablo/parse/pablo_parser.h>
 #include <pablo/parse/simple_lexer.h>
@@ -26,7 +25,7 @@
 #include <re/unicode/resolve_properties.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/core/kernel_builder.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
@@ -36,8 +35,6 @@
 #include <kernel/util/bixhash.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>
 #include <fcntl.h>
 #include <iostream>
 #include <iomanip>

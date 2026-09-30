@@ -12,19 +12,8 @@
 #include <kernel/pipeline/pipeline_builder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/codegenstate.h>
+#include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_ones.h>          // for Ones
-#include <pablo/pe_var.h>           // for Var
-#include <pablo/pe_zeroes.h>        // for Zeroes
-#include <pablo/pe_infile.h>
-#include <pablo/pe_advance.h>
-#include <pablo/boolean.h>
-#include <pablo/pe_count.h>
-#include <pablo/pe_matchstar.h>
-#include <pablo/pe_pack.h>
-#include <pablo/pe_debugprint.h>
 #include <re/printer/re_printer.h>
 #include <re/adt/re_cc.h>
 #include <re/adt/re_name.h>

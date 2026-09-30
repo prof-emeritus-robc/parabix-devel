@@ -21,6 +21,7 @@ enable_testing()
 ###   Build Options   ###
 
 option(USE_ADDRESS_SANITIZER "Enables use of address sanitizer in debug mode if available" OFF)
+option(ENABLE_ICU "Enable ICU support if available" ON)
 option(ENABLE_PAPI "Enable PAPI support if available" OFF)
 option(REPORT_PAPI_TESTS "Report PAPI testing results" OFF)
 option(LLVM_PATH "LLVM root directory")
@@ -78,7 +79,7 @@ set(PARABIX_TARGETS_TO_BUILD X86)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_X86_TARGET")
 endif()
 
-llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} orcjit jitlink native IRReader Linker IRPrinter Passes)
+llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} orcjit jitlink mcjit native IRReader Linker IRPrinter Passes)
 
 include_directories(${LLVM_INCLUDE_DIRS})
 link_directories(${LLVM_LIBRARY_DIRS})
@@ -108,6 +109,23 @@ string(REGEX REPLACE "[0-9]+[.]([0-9]+).*" "\\1" Z3_VERSION_MINOR "${Z3_VERSION_
 string(REGEX REPLACE "[0-9]+[.][0-9]+[.]([0-9]+).*" "\\1" Z3_VERSION_PATCH "${Z3_VERSION_STRING}")
 math(EXPR Z3_VERSION_INTEGER "${Z3_VERSION_MAJOR} * 10000 + ${Z3_VERSION_MINOR} * 100 + ${Z3_VERSION_PATCH}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DZ3_VERSION_INTEGER=${Z3_VERSION_INTEGER}")
+
+###   Import Dependency: ICU   ###
+
+if (ENABLE_ICU)
+    if(APPLE)
+        execute_process(
+            COMMAND brew --prefix icu4c
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            OUTPUT_VARIABLE BREW_ICU_ROOT
+            ERROR_QUIET
+        )
+        if(BREW_ICU_ROOT)
+            set(ICU_ROOT "${BREW_ICU_ROOT}")
+            message(STATUS "Found ICU: ${ICU_ROOT}")
+        endif()
+    endif()
+endif()
 
 ###   Import Dependency: PAPI   ###
 
@@ -385,7 +403,9 @@ if (ROOT_FOUND)
 add_subdirectory(lib/kernel/pipeline/compiler/statistics/cern-root)
 endif()
 add_subdirectory(lib/objcache)
-add_subdirectory(lib/pablo)
+add_subdirectory(runtime/cachejanitord)
+add_subdirectory(lib/pablo/toolchain)
+add_subdirectory(lib/pablo/compiler)
 add_subdirectory(lib/pablo/bixnum)
 add_subdirectory(lib/pablo/parse)
 add_subdirectory(lib/re/adt)
@@ -415,6 +435,7 @@ add_subdirectory(lib/kernel/re)
 add_subdirectory(lib/kernel/scan)
 add_subdirectory(lib/kernel/streamutils)
 add_subdirectory(lib/kernel/unicode)
+add_subdirectory(lib/kernel/unicode/normalization)
 add_subdirectory(lib/kernel/util)
 add_subdirectory(lib/kernel/illustrator)
 
@@ -469,27 +490,27 @@ endif()
 add_test(
   NAME abc_test
   WORKING_DIRECTORY ${QA_DIR}
-  COMMAND ./run_abc ${BIN_DIR}/icgrep)
+  COMMAND python3 abc_test.py ${BIN_DIR}/icgrep)
 
 add_test(
   NAME u8u16_test
   WORKING_DIRECTORY ${QA_DIR}/u8u16
-  COMMAND ./run_all "${BIN_DIR}/u8u16 -thread-num=2")
+  COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")
 
 add_test(
   NAME u32u8_test
   WORKING_DIRECTORY ${QA_DIR}/
-  COMMAND ./test_u32u8 "${BIN_DIR}/u32u8")
+  COMMAND python3 u32u8_test.py "${BIN_DIR}/u32u8")
 
 add_test(
   NAME nfd_test
   WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND ./test_nfd "${BIN_DIR}/nfd")
+  COMMAND python3 nfd_test.py "${BIN_DIR}/nfd")
 
 add_test(
   NAME nfc_test
   WORKING_DIRECTORY ${QA_DIR}/nfc
-  COMMAND ./test_nfc "${BIN_DIR}/nfc")
+  COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")
 
 add_test(
     NAME editd_test
@@ -504,17 +525,17 @@ add_test(
 add_test(
   NAME gb18030_test
   WORKING_DIRECTORY ${QA_DIR}/gb18030
-  COMMAND ./run_all "${BIN_DIR}/gb18030")
+  COMMAND python3 gb18030_test.py "${BIN_DIR}/gb18030")
 
 add_test(
   NAME json_test
   WORKING_DIRECTORY ${QA_DIR}/json
-  COMMAND ./run_all "${BIN_DIR}/json")
+  COMMAND python3 json_test.py "${BIN_DIR}/json")
 
 add_test(
   NAME csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
-  COMMAND ./run_csv2json "${BIN_DIR}/csv2json")
+  COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")
 
 
 SET_PROPERTY(TEST proptest PROPERTY TIMEOUT 1500)
@@ -532,11 +553,11 @@ add_custom_target (proptest
 
 add_custom_target (u8u16_test
     WORKING_DIRECTORY ${QA_DIR}/u8u16
-    COMMAND ./run_all "${BIN_DIR}/u8u16 -thread-num=2")
+    COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")
 
 add_custom_target (u32u8_test
     WORKING_DIRECTORY ${QA_DIR}
-    COMMAND ./test_u32u8 "${BIN_DIR}/u32u8 -EnableAsserts -VerifyIR")
+    COMMAND python3 u32u8_test.py "--flags=-EnableAsserts -VerifyIR" "${BIN_DIR}/u32u8")
 
 add_custom_target (editd_test
     WORKING_DIRECTORY ${QA_DIR}/editd
@@ -548,15 +569,15 @@ add_custom_target (base64_test
 
 add_custom_target(gb18030_test
   WORKING_DIRECTORY ${QA_DIR}/gb18030
-  COMMAND ./run_all "${BIN_DIR}/gb18030")
+  COMMAND python3 gb18030_test.py "${BIN_DIR}/gb18030")
 
 add_custom_target(nfd_test
   WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND ./test_nfd "${BIN_DIR}/nfd")
+  COMMAND python3 nfd_test.py "${BIN_DIR}/nfd")
 
 add_custom_target(nfc_test
   WORKING_DIRECTORY ${QA_DIR}/nfc
-  COMMAND ./test_nfc "${BIN_DIR}/nfc")
+  COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")
 
 add_custom_target (abc_gen
     WORKING_DIRECTORY ${QA_DIR}
@@ -564,11 +585,17 @@ add_custom_target (abc_gen
 
 add_custom_target (abc_test
     WORKING_DIRECTORY ${QA_DIR}
-    COMMAND ./run_abc "${BIN_DIR}/icgrep")
+    COMMAND python3 abc_test.py "${BIN_DIR}/icgrep")
 
 add_custom_target (check
-    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS icgrep u8u16 u32u8 base64 editd gb18030 idisa_test json csv2json kernel-test-suite)
+    # Build everything before testing, rather than a hand-maintained DEPENDS
+    # list of the binaries individual `add_test` entries happen to invoke --
+    # that list has drifted out of sync before (nfd/nfc were missing, so
+    # nfd_test/nfc_test silently ran against whatever nfd/nfc binary was
+    # already sitting in the build directory, stale or absent) and is a
+    # standing risk for every future test/tool addition.
+    COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR}
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure)
 
 add_custom_target (perf_icgrep
     COMMAND python3 perf.py icgrep
@@ -589,12 +616,12 @@ add_custom_target (xml_test
 
 add_custom_target (json_test
     WORKING_DIRECTORY ${QA_DIR}/json
-    COMMAND ./run_all "${BIN_DIR}/json")
+    COMMAND python3 json_test.py "${BIN_DIR}/json")
 
 add_custom_target (json_perf
     WORKING_DIRECTORY ${QA_DIR}/json_perf
-    COMMAND ./run_all "${BIN_DIR}/json")
+    COMMAND python3 json_perf_test.py "${BIN_DIR}/json")
 
 add_custom_target (csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
-  COMMAND ./run_csv2json "${BIN_DIR}/csv2json")
+  COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")

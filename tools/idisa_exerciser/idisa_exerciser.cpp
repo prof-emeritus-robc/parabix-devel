@@ -18,8 +18,6 @@ using namespace kernel;
 Entropy ent;
 XorShift256pp rng(ent.nextWord());
 
-const char *const ProgramName = "idisa_exerciser";
-
 cl::opt<string> OperationName(cl::Positional, cl::desc("<IDISA op>"), cl::Required);
 cl::opt<unsigned> OperationFieldWidth(cl::Positional, cl::desc("<field width>"), cl::Required);
 cl::list<string> OperationArgs(cl::ConsumeAfter, cl::desc("[operation args..]"));

@@ -10,7 +10,7 @@
 
 #include <utility>
 namespace UCD {
-	const auto UnicodeVersion = "17.0.0";
+	const auto UnicodeVersion = "18.0.0";
 	using codepoint_t = unsigned;
 	enum : codepoint_t { UNICODE_MAX = 0x10FFFF };
 	using interval_t = std::pair<codepoint_t, codepoint_t>;

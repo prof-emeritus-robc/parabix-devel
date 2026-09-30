@@ -8,10 +8,7 @@
 #include <re/adt/re_cc.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
-#include <pablo/pabloAST.h>
-#include <pablo/pe_ones.h>
-#include <pablo/pablo_kernel.h>
-#include <pablo/builder.hpp>
+#include <pablo/pablo.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 

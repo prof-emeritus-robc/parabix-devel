@@ -45,7 +45,6 @@ void PipelineCompiler::addBufferHandlesToPipelineKernel(KernelBuilder & b, const
         }
 
         if (LLVM_UNLIKELY(mTraceDynamicBuffers && bn.canTrackBufferExpansionData())) {
-            const auto numOfConsumers = std::max(out_degree(streamSet, mConsumerGraph), 1UL);
 
             // segment num  0
             // new capacity 1
@@ -53,7 +52,6 @@ void PipelineCompiler::addBufferHandlesToPipelineKernel(KernelBuilder & b, const
             // consumer processed item count [3,n)
 
             IntegerType * const sizeTy = IntegerType::getIntNTy(C, sizeof(size_t) * 8);
-            Type * const traceStructTy = ArrayType::get(sizeTy, numOfConsumers + 3);
             FixedArray<Type *, 2> traceStruct;
             traceStruct[0] = PointerType::getUnqual(b.getContext()); // pointer to trace log
             traceStruct[1] = sizeTy; // length of trace log

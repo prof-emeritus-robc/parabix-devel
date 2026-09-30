@@ -17,6 +17,9 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <thread>
+#include <cstdlib>
+#include <map>
+#include <set>
 
 #if defined(PARABIX_ARM_TARGET)
 #include <llvm/TargetParser/AArch64TargetParser.h>
@@ -286,11 +289,45 @@ PipelineCompilationModeOption("pipeline-optimization-level", cl::location(Pipeli
 static cl::opt<bool, true> EnableObjectCacheOption("enable-object-cache", cl::location(EnableObjectCache), cl::init(true),
                                                    cl::desc("Enable object caching"), cl::cat(CodeGenOptions));
 
+bool UpdateObjectCache = false;
+static cl::opt<bool, true> UpdateObjectCacheOption("update-object-cache", cl::location(UpdateObjectCache), cl::init(false),
+                                                   cl::desc("Force existing object cache entries to be recompiled and replaced, "
+                                                            "rather than reused. Implied if --optimization-level or "
+                                                            "--backend-optimization-level is explicitly set."), cl::cat(CodeGenOptions));
+
+static cl::opt<bool, true> EnableModuleInlinerOption("enable-kernel-module-inliner", cl::location(EnableModuleInliner), cl::init(false),
+                                                   cl::desc("Run a whole-module inliner pass over each kernel's IR before object generation."), cl::cat(CodeGenOptions));
+
 static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::location(TraceObjectCache), cl::init(false),
                                                    cl::desc("Trace object cache retrieval."), cl::cat(JIT_InfoOptions));
 
 static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""),
                                                  cl::desc("Path to the object cache diretory"), cl::cat(CodeGenOptions));
+
+// The custom allocator keeps persistent, long-lived exec/data slab pools rather than
+// allocating a small dedicated region per compiled object as LLVM's default in-process
+// memory manager does. That's a deliberate linking-speed optimization, but under LLVM 21
+// it can place exec and data content too far apart for Mach-O compact-unwind info's
+// 32-bit deltas, so it defaults to off there; LLVM < 21 is unaffected and defaults to on.
+static cl::opt<bool, true> UseCustomJITMemoryManagerOption("use-custom-jit-memory-manager", cl::location(UseCustomJITMemoryManager),
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    cl::init(false),
+    #else
+    cl::init(true),
+    #endif
+    cl::desc("Use the custom slab-based JIT memory manager instead of LLVM's default in-process memory manager."),
+    cl::cat(CodeGenOptions));
+
+unsigned CompileThreads;
+static cl::opt<unsigned, true>
+CompileThreadsOption("compile-threads", cl::location(CompileThreads), cl::init(4),
+                     cl::desc("Number of threads used for JIT compilation."),
+                     cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
+
+bool UseMCJIT = false;
+static cl::opt<bool, true> UseMCJITOption("use-mcjit", cl::location(UseMCJIT), cl::init(false),
+    cl::desc("Use classic single-threaded MCJIT instead of the default multi-threaded ORC JIT backend."),
+    cl::cat(CodeGenOptions));
 
 bool EnableDynamicMultithreading;
 static cl::opt<bool, true> EnableDynamicMultithreadingOption("dynamic-multithreading", cl::location(EnableDynamicMultithreading), cl::init(false),
@@ -383,8 +420,11 @@ unsigned SegmentThreads;
 unsigned ScanBlocks;
 
 bool EnableObjectCache = true;
+bool EnableModuleInliner = false;
 bool EnablePipelineObjectCache = true;
 bool TraceObjectCache;
+bool UseCustomJITMemoryManager = true;
+bool ObjectCacheForceUpdate = false;
 
 unsigned CacheDaysLimit;
 
@@ -474,6 +514,43 @@ static inline void gentlyHideUnrelatedOptions(ArrayRef<const cl::OptionCategory 
     }
 }
 
+// Since LLVM 15, cl::opt no longer rejects a repeated single-value option: cl::Optional
+// and cl::Required only enforce a minimum, and the last occurrence silently wins. Restore
+// the error for every option declared to occur at most once (cl::Optional or cl::Required,
+// the cl::opt default), after parsing. cl::list and options explicitly declared
+// cl::ZeroOrMore/cl::OneOrMore may still repeat. Options named in TEST_FLAGS
+// (testFlagArgs) are exempt, since TEST_FLAGS exists to override a test's own flags.
+static void reportRepeatedOptions(const std::vector<std::string> & testFlagArgs) {
+    std::set<std::string> testFlagNames;
+    for (const auto & arg : testFlagArgs) {
+        StringRef name(arg);
+        if (!name.consume_front("-")) continue;
+        name.consume_front("-");
+        testFlagNames.insert(name.take_until([](char c) { return c == '='; }).str());
+    }
+    std::map<std::string, cl::Option *> repeated;   // sorted by name for stable output
+    for (auto & entry : cl::getRegisteredOptions()) {
+        cl::Option * const O = entry.second;
+        // getRegisteredOptions() returns a DenseMap from LLVM 22 (key in .first), and a
+        // StringMap before that (key via first()).
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(22, 0, 0)
+        const std::string name = entry.first.str();
+        #else
+        const std::string name = entry.first().str();
+        #endif
+        const auto flag = O->getNumOccurrencesFlag();
+        if ((flag == cl::Optional || flag == cl::Required) && O->getNumOccurrences() > 1
+                && testFlagNames.count(name) == 0) {
+            repeated.emplace(name, O);
+        }
+    }
+    if (LLVM_LIKELY(repeated.empty())) return;
+    for (auto & [name, O] : repeated) {
+        O->error("may only occur zero or one times!", name);
+    }
+    exit(1);
+}
+
 void ParseCommandLineOptions(int argc, const char * const *argv, std::initializer_list<const cl::OptionCategory *> hiding, StringRef overview) {
     AddParabixVersionPrinter();
 
@@ -481,7 +558,31 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     if (hiding.size() != 0) {
         gentlyHideUnrelatedOptions(ArrayRef<const cl::OptionCategory *>(hiding));
     }
-    cl::ParseCommandLineOptions(argc, argv, overview);
+
+    // Every Parabix tool and test binary funnels its argv through here, so this is a
+    // single choke point to uniformly inject extra flags via the TEST_FLAGS environment
+    // variable, e.g. `TEST_FLAGS="--use-mcjit" make check` to run the whole test suite
+    // under a different backend/setting without editing every test script or
+    // CMakeLists.txt COMMAND. Whitespace-separated; appended after argv's own flags, so
+    // for a single-value option the TEST_FLAGS value overrides the command line's (the
+    // last occurrence wins; see reportRepeatedOptions). A no-op when unset, which is the overwhelming
+    // majority of invocations, including every normal (non-test) run of any of these
+    // programs -- quoted values containing spaces are not supported, matching the same
+    // naive whitespace-splitting convention as CFLAGS/CXXFLAGS-style environment variables
+    // elsewhere in the C/C++ build ecosystem.
+    std::vector<std::string> extraArgStorage;
+    std::vector<const char *> expandedArgv(argv, argv + argc);
+    if (const char * const testFlags = std::getenv("TEST_FLAGS")) {
+        boost::split(extraArgStorage, std::string(testFlags), boost::is_any_of(" \t"), boost::token_compress_on);
+        for (const auto & arg : extraArgStorage) {
+            if (!arg.empty()) {
+                expandedArgv.push_back(arg.c_str());
+            }
+        }
+    }
+
+    cl::ParseCommandLineOptions((int)expandedArgv.size(), expandedArgv.data(), overview);
+    reportRepeatedOptions(extraArgStorage);
     if(BlockSize == 0) {
         BlockSize = DefaultBlockSizeForFeatures(MapFeatureNames(GetFeatureNames()));
     }
@@ -493,8 +594,29 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     } else if (disablePipelineObjectCacheDueToCommandLineOptions()) {
         EnablePipelineObjectCache = false;
     }
+    // A cache entry compiled under one --optimization-level/--backend-optimization-level
+    // setting is not distinguished from one compiled under another (they share the same
+    // cache key), so silently reusing it would serve code built at the wrong opt level.
+    // Rather than growing the cache with a separate entry per opt level, explicitly
+    // setting either flag (or passing --update-object-cache directly) forces existing
+    // entries to be recompiled and replaced in place.
+    ObjectCacheForceUpdate = UpdateObjectCache
+        || (OptimizationLevel.getNumOccurrences() > 0)
+        || (BackEndOptOption.getNumOccurrences() > 0);
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
     target_Options.MCOptions.AsmVerbose = true;
+
+    if (UseMCJIT) {
+        // --compile-threads and --use-custom-jit-memory-manager only affect the default
+        // ORC JIT backend's worker-thread pool and its custom JITLink memory manager;
+        // MCJIT compiles single-threaded and has no equivalent knobs, so both are ignored.
+        if (CompileThreadsOption.getNumOccurrences() > 0) {
+            errs() << "warning: --compile-threads is ignored under --use-mcjit (MCJIT compiles single-threaded)\n";
+        }
+        if (UseCustomJITMemoryManagerOption.getNumOccurrences() > 0) {
+            errs() << "warning: --use-custom-jit-memory-manager is ignored under --use-mcjit\n";
+        }
+    }
 
 }
 

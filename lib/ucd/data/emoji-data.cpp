@@ -49,11 +49,11 @@ namespace UCD {
         [1f5b1, 1f5b2], [1f5bc, 1f5bc], [1f5c2, 1f5c4], [1f5d1, 1f5d3],
         [1f5dc, 1f5de], [1f5e1, 1f5e1], [1f5e3, 1f5e3], [1f5e8, 1f5e8],
         [1f5ef, 1f5ef], [1f5f3, 1f5f3], [1f5fa, 1f64f], [1f680, 1f6c5],
-        [1f6cb, 1f6d2], [1f6d5, 1f6d8], [1f6dc, 1f6e5], [1f6e9, 1f6e9],
+        [1f6cb, 1f6d2], [1f6d5, 1f6d9], [1f6dc, 1f6e5], [1f6e9, 1f6e9],
         [1f6eb, 1f6ec], [1f6f0, 1f6f0], [1f6f3, 1f6fc], [1f7e0, 1f7eb],
         [1f7f0, 1f7f0], [1f90c, 1f93a], [1f93c, 1f945], [1f947, 1f9ff],
-        [1fa70, 1fa7c], [1fa80, 1fa8a], [1fa8e, 1fac6], [1fac8, 1fac8],
-        [1facd, 1fadc], [1fadf, 1faea], [1faef, 1faf8] */
+        [1fa70, 1fa7c], [1fa80, 1fac6], [1fac8, 1fac8], [1facc, 1fadd],
+        [1fadf, 1faeb], [1faef, 1fafa] */
 
         const static UnicodeSet::run_t __emoji_set_runs[] = {
         {Empty, 1}, {Mixed, 1}, {Empty, 3}, {Mixed, 1}, {Empty, 251},
@@ -67,7 +67,7 @@ namespace UCD {
         {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Full, 7}, {Mixed, 1}, {Full, 1},
         {Mixed, 7}, {Full, 2}, {Mixed, 1}, {Empty, 1}, {Full, 2},
         {Mixed, 2}, {Empty, 7}, {Mixed, 1}, {Empty, 8}, {Mixed, 3},
-        {Full, 5}, {Empty, 3}, {Mixed, 2}, {Full, 1}, {Mixed, 2},
+        {Full, 5}, {Empty, 3}, {Mixed, 1}, {Full, 2}, {Mixed, 2},
         {Empty, 30760}};
         const static UnicodeSet::bitquad_t __emoji_set_quads[] = {
         0x03ff0408, 0x00004200, 0x10000000, 0x00000200, 0x02000004,
@@ -80,10 +80,10 @@ namespace UCD {
         0x00008000, 0xc0030000, 0x07fe4000, 0xffffffc0, 0x04000006,
         0x07fc8000, 0x00030000, 0xfffffff3, 0xcecfffff, 0xffb9ffff,
         0xbfffffff, 0x3fffffff, 0xffff7e00, 0x07f980ff, 0x00613c80,
-        0x10060130, 0x700e001c, 0xfc08810a, 0x0000ffff, 0xf1e7f83f,
+        0x10060130, 0x700e001c, 0xfc08810a, 0x0000ffff, 0xf3e7f83f,
         0x1ff91a3f, 0x00010fff, 0xfffff000, 0xf7ffffff, 0xffffffbf,
-        0x1fff0000, 0xffffc7ff, 0x9fffe17f, 0x01ff87ff};
-        const static UnicodeSet emoji_set{__emoji_set_runs, 62, __emoji_set_quads, 64};
+        0x1fff0000, 0xbffff17f, 0x07ff8fff};
+        const static UnicodeSet emoji_set{__emoji_set_runs, 62, __emoji_set_quads, 63};
         static BinaryPropertyObject property_object{emoji, std::move(emoji_set)};
     }
 PropertyObject * get_EMOJI_PropertyObject() {  return & EMOJI_ns::property_object; }
@@ -126,7 +126,7 @@ PropertyObject * get_EMOJIMODIFIER_PropertyObject() {  return & EMOJIMODIFIER_ns
         [1f6c0, 1f6c0], [1f6cc, 1f6cc], [1f90c, 1f90c], [1f90f, 1f90f],
         [1f918, 1f91f], [1f926, 1f926], [1f930, 1f939], [1f93c, 1f93e],
         [1f977, 1f977], [1f9b5, 1f9b6], [1f9b8, 1f9b9], [1f9bb, 1f9bb],
-        [1f9cd, 1f9cf], [1f9d1, 1f9dd], [1fac3, 1fac5], [1faf0, 1faf8] */
+        [1f9cd, 1f9cf], [1f9d1, 1f9dd], [1fac3, 1fac5], [1faf0, 1fafa] */
 
         const static UnicodeSet::run_t __emojimodifierbase_set_runs[] = {
         {Empty, 304}, {Mixed, 1}, {Empty, 6}, {Mixed, 2}, {Empty, 3683},
@@ -139,7 +139,7 @@ PropertyObject * get_EMOJIMODIFIER_PropertyObject() {  return & EMOJIMODIFIER_ns
         0x0001ffcc, 0x11ffffc0, 0x000280ee, 0x00000400, 0x04300000,
         0x00610000, 0x0000f8e0, 0x00700008, 0x00001001, 0xff009000,
         0x73ff0040, 0x00800000, 0x0b600000, 0x3ffee000, 0x00000038,
-        0x01ff0000};
+        0x07ff0000};
         const static UnicodeSet emojimodifierbase_set{__emojimodifierbase_set_runs, 25, __emojimodifierbase_set_quads, 21};
         static BinaryPropertyObject property_object{emojimodifierbase, std::move(emojimodifierbase_set)};
     }
@@ -162,11 +162,10 @@ PropertyObject * get_EMOJIMODIFIERBASE_PropertyObject() {  return & EMOJIMODIFIE
         [1f3f8, 1f43e], [1f440, 1f440], [1f442, 1f4fc], [1f4ff, 1f53d],
         [1f54b, 1f54e], [1f550, 1f567], [1f57a, 1f57a], [1f595, 1f596],
         [1f5a4, 1f5a4], [1f5fb, 1f64f], [1f680, 1f6c5], [1f6cc, 1f6cc],
-        [1f6d0, 1f6d2], [1f6d5, 1f6d8], [1f6dc, 1f6df], [1f6eb, 1f6ec],
+        [1f6d0, 1f6d2], [1f6d5, 1f6d9], [1f6dc, 1f6df], [1f6eb, 1f6ec],
         [1f6f4, 1f6fc], [1f7e0, 1f7eb], [1f7f0, 1f7f0], [1f90c, 1f93a],
-        [1f93c, 1f945], [1f947, 1f9ff], [1fa70, 1fa7c], [1fa80, 1fa8a],
-        [1fa8e, 1fac6], [1fac8, 1fac8], [1facd, 1fadc], [1fadf, 1faea],
-        [1faef, 1faf8] */
+        [1f93c, 1f945], [1f947, 1f9ff], [1fa70, 1fa7c], [1fa80, 1fac6],
+        [1fac8, 1fac8], [1facc, 1fadd], [1fadf, 1faeb], [1faef, 1fafa] */
 
         const static UnicodeSet::run_t __emojipresentation_set_runs[] = {
         {Empty, 280}, {Mixed, 1}, {Empty, 6}, {Mixed, 1}, {Empty, 15},
@@ -178,7 +177,7 @@ PropertyObject * get_EMOJIMODIFIERBASE_PropertyObject() {  return & EMOJIMODIFIE
         {Full, 4}, {Mixed, 1}, {Full, 1}, {Mixed, 5}, {Empty, 1},
         {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Empty, 1}, {Full, 2},
         {Mixed, 2}, {Empty, 7}, {Mixed, 1}, {Empty, 8}, {Mixed, 3},
-        {Full, 5}, {Empty, 3}, {Mixed, 2}, {Full, 1}, {Mixed, 2},
+        {Full, 5}, {Empty, 3}, {Mixed, 1}, {Full, 2}, {Mixed, 2},
         {Empty, 30760}};
         const static UnicodeSet::bitquad_t __emojipresentation_set_quads[] = {
         0x0c000000, 0x00091e00, 0x60000000, 0x00300000, 0x000fff00,
@@ -188,10 +187,10 @@ PropertyObject * get_EMOJIMODIFIERBASE_PropertyObject() {  return & EMOJIMODIFIE
         0xffffffc0, 0x04000002, 0x077c8000, 0x00030000, 0xffbfe001,
         0xdfffffff, 0x000fffff, 0x000f87ff, 0xff11ffff, 0x7fffffff,
         0xfffffffd, 0x9fffffff, 0x3fffffff, 0xffff7800, 0x040000ff,
-        0x00600000, 0x00000010, 0xf8000000, 0x0000ffff, 0xf1e7103f,
+        0x00600000, 0x00000010, 0xf8000000, 0x0000ffff, 0xf3e7103f,
         0x1ff01800, 0x00010fff, 0xfffff000, 0xf7ffffff, 0xffffffbf,
-        0x1fff0000, 0xffffc7ff, 0x9fffe17f, 0x01ff87ff};
-        const static UnicodeSet emojipresentation_set{__emojipresentation_set_runs, 52, __emojipresentation_set_quads, 49};
+        0x1fff0000, 0xbffff17f, 0x07ff8fff};
+        const static UnicodeSet emojipresentation_set{__emojipresentation_set_runs, 52, __emojipresentation_set_quads, 48};
         static BinaryPropertyObject property_object{emojipresentation, std::move(emojipresentation_set)};
     }
 PropertyObject * get_EMOJIPRESENTATION_PropertyObject() {  return & EMOJIPRESENTATION_ns::property_object; }
@@ -221,7 +220,7 @@ PropertyObject * get_EMOJIPRESENTATION_PropertyObject() {  return & EMOJIPRESENT
         [303d, 303d], [3297, 3297], [3299, 3299], [1f004, 1f004],
         [1f02c, 1f02f], [1f094, 1f09f], [1f0af, 1f0b0], [1f0c0, 1f0c0],
         [1f0cf, 1f0d0], [1f0f6, 1f0ff], [1f170, 1f171], [1f17e, 1f17f],
-        [1f18e, 1f18e], [1f191, 1f19a], [1f1ae, 1f1e5], [1f201, 1f20f],
+        [1f18e, 1f18e], [1f191, 1f19a], [1f1af, 1f1e5], [1f201, 1f20f],
         [1f21a, 1f21a], [1f22f, 1f22f], [1f232, 1f23a], [1f23c, 1f23f],
         [1f249, 1f25f], [1f266, 1f321], [1f324, 1f393], [1f396, 1f397],
         [1f399, 1f39b], [1f39e, 1f3f0], [1f3f3, 1f3f5], [1f3f7, 1f3fa],
@@ -232,7 +231,7 @@ PropertyObject * get_EMOJIPRESENTATION_PropertyObject() {  return & EMOJIPRESENT
         [1f5dc, 1f5de], [1f5e1, 1f5e1], [1f5e3, 1f5e3], [1f5e8, 1f5e8],
         [1f5ef, 1f5ef], [1f5f3, 1f5f3], [1f5fa, 1f64f], [1f680, 1f6c5],
         [1f6cb, 1f6d2], [1f6d5, 1f6e5], [1f6e9, 1f6e9], [1f6eb, 1f6f0],
-        [1f6f3, 1f6ff], [1f7da, 1f7ff], [1f80c, 1f80f], [1f848, 1f84f],
+        [1f6f3, 1f6ff], [1f7dc, 1f7f0], [1f80c, 1f80f], [1f848, 1f84f],
         [1f85a, 1f85f], [1f888, 1f88f], [1f8ae, 1f8af], [1f8bc, 1f8bf],
         [1f8c2, 1f8cf], [1f8d9, 1f8ff], [1f90c, 1f93a], [1f93c, 1f945],
         [1f947, 1f9ff], [1fa58, 1fa5f], [1fa6e, 1faff], [1fc00, 1fffd] */
@@ -247,11 +246,10 @@ PropertyObject * get_EMOJIPRESENTATION_PropertyObject() {  return & EMOJIPRESENT
         {Empty, 3}, {Mixed, 3}, {Full, 1}, {Mixed, 5}, {Full, 5},
         {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Full, 7},
         {Mixed, 1}, {Full, 1}, {Mixed, 7}, {Full, 2}, {Mixed, 1},
-        {Empty, 1}, {Full, 2}, {Mixed, 2}, {Empty, 6}, {Mixed, 1},
-        {Full, 1}, {Mixed, 1}, {Empty, 1}, {Mixed, 1}, {Empty, 1},
-        {Mixed, 3}, {Full, 1}, {Mixed, 3}, {Full, 5}, {Empty, 2},
-        {Mixed, 2}, {Full, 4}, {Empty, 8}, {Full, 31}, {Mixed, 1},
-        {Empty, 30720}};
+        {Empty, 1}, {Full, 2}, {Mixed, 2}, {Empty, 6}, {Mixed, 3},
+        {Empty, 1}, {Mixed, 1}, {Empty, 1}, {Mixed, 3}, {Full, 1},
+        {Mixed, 3}, {Full, 5}, {Empty, 2}, {Mixed, 2}, {Full, 4},
+        {Empty, 8}, {Full, 31}, {Mixed, 1}, {Empty, 30720}};
         const static UnicodeSet::bitquad_t __extendedpictographic_set_quads[] = {
         0x00004200, 0x10000000, 0x00000200, 0x02000004, 0x03f00000,
         0x00000600, 0x0c000000, 0x00000100, 0x00008000, 0x070ffe00,
@@ -261,14 +259,14 @@ PropertyObject * get_EMOJIPRESENTATION_PropertyObject() {  return & EMOJIPRESENT
         0x00000018, 0x00e00000, 0x80010002, 0x00300000, 0x180000e0,
         0x00210000, 0x20010000, 0x02800000, 0x00000010, 0x0000f000,
         0xfff00000, 0x00018000, 0x00018001, 0xffc00000, 0xc0030000,
-        0x07fe4000, 0xffffc000, 0x0000003f, 0x0400fffe, 0xf7fc8000,
+        0x07fe4000, 0xffff8000, 0x0000003f, 0x0400fffe, 0xf7fc8000,
         0xfffffe00, 0xffffffc0, 0xfffffff3, 0xcecfffff, 0x07b9ffff,
         0xbfffffff, 0x3fffffff, 0xffff7e00, 0x07f980ff, 0x00613c80,
         0x10060130, 0x700e001c, 0xfc08810a, 0x0000ffff, 0xffe7f83f,
-        0xfff9fa3f, 0xfc000000, 0x0000f000, 0xfc00ff00, 0x0000ff00,
-        0xf000c000, 0xfe00fffc, 0xfffff000, 0xf7ffffff, 0xffffffbf,
-        0xff000000, 0xffffc000, 0x3fffffff};
-        const static UnicodeSet extendedpictographic_set{__extendedpictographic_set_runs, 67, __extendedpictographic_set_quads, 73};
+        0xfff9fa3f, 0xf0000000, 0x0001ffff, 0x0000f000, 0xfc00ff00,
+        0x0000ff00, 0xf000c000, 0xfe00fffc, 0xfffff000, 0xf7ffffff,
+        0xffffffbf, 0xff000000, 0xffffc000, 0x3fffffff};
+        const static UnicodeSet extendedpictographic_set{__extendedpictographic_set_runs, 65, __extendedpictographic_set_quads, 74};
         static BinaryPropertyObject property_object{extendedpictographic, std::move(extendedpictographic_set)};
     }
 PropertyObject * get_EXTENDEDPICTOGRAPHIC_PropertyObject() {  return & EXTENDEDPICTOGRAPHIC_ns::property_object; }

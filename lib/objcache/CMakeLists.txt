@@ -14,8 +14,3 @@ DEPS
     kernel.core
     toolchain
 )
-
-add_executable(cachejanitord
-    object_cache_daemon.cpp)
-
-target_link_libraries(cachejanitord ${Boost_LIBRARIES})

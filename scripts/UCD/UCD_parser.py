@@ -10,9 +10,17 @@
 import UCD_config
 from UCD_property_objects import *
 
-version_regexp = re.compile(".*Version\s+([0-9.]*)\s+of the Unicode Standard.*")
+# The Unicode Consortium's ReadMe.txt wording -- and where it wraps -- has
+# changed across releases, e.g. "for Version 16.0.0 of the Unicode Standard."
+# all on one line (UCD 16/17) vs. "for version 18.0.0 of the\nUnicode
+# Character Database." wrapping mid-phrase right after the version (UCD 18).
+# Matching only up through the version number, not the trailing "of the
+# Unicode ..." text that may have wrapped onto the next line, is robust to
+# both.
+version_regexp = re.compile(r".*for\s+[Vv]ersion\s+([0-9.]+)")
 
 def setVersionfromReadMe_txt():
+    UCD_config.version = None
     f = open(UCD_config.UCD_src_dir + "/" + 'ReadMe.txt')
     lines = f.readlines()
     for t in lines:
@@ -20,6 +28,8 @@ def setVersionfromReadMe_txt():
         if m:
             UCD_config.version = m.group(1)
             print("Version %s" % m.group(1))
+            return
+    print("Warning: could not detect UCD version from %s/ReadMe.txt" % UCD_config.UCD_src_dir)
 
 trivial_name_char_re = re.compile('[-_\s]')
 def canonicalize(property_string):

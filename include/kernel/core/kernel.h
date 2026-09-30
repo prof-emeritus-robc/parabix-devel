@@ -185,6 +185,17 @@ public:
             return mAccumulationRule;
         }
 
+        // The flat field index of this scalar within its owning kernel's constructed
+        // state struct (mSharedStateType or mThreadLocalStateType, per getScalarType()).
+        // Set exactly once, by Kernel::constructStateTypes, as it lays out that struct;
+        // every other consumer (e.g. KernelCompiler's scalar-field-pointer lookup) must
+        // read this value rather than independently recompute a struct position, so
+        // construction and access can never silently diverge.
+        unsigned getFieldIndex() const {
+            assert (mFieldIndex != NO_FIELD_INDEX && "field index read before state type construction");
+            return mFieldIndex;
+        }
+
         explicit InternalScalar(llvm::Type * const valueType,
                                 const llvm::StringRef name, const unsigned group = 0,
                                 const ThreadLocalScalarAccumulationRule rule = ThreadLocalScalarAccumulationRule::DoNothing)
@@ -206,12 +217,19 @@ public:
             mValueType = type;
         }
 
+        static constexpr unsigned NO_FIELD_INDEX = ~0U;
+
+        void setFieldIndex(const unsigned index) {
+            mFieldIndex = index;
+        }
+
     private:
         const ScalarType                        mScalarType;
         llvm::Type *                            mValueType;
         const std::string                       mName;
         const unsigned                          mGroup;
         const ThreadLocalScalarAccumulationRule mAccumulationRule;
+        unsigned                                mFieldIndex = NO_FIELD_INDEX;
     };
 
     using InternalScalars = std::vector<InternalScalar>;
@@ -362,6 +380,14 @@ public:
         return mInputScalars.size();
     }
 
+    // The flat field index of input scalar i within mSharedStateType, recorded once by
+    // constructStateTypes as it lays out the struct. See InternalScalar::getFieldIndex
+    // for why this must be read rather than independently recomputed.
+    unsigned getInputScalarFieldIndex(const unsigned i) const {
+        assert (i < mInputScalarFieldIndex.size());
+        return mInputScalarFieldIndex[i];
+    }
+
     virtual void setInputScalarAt(const unsigned i, Scalar * value);
 
     const Bindings & getOutputScalarBindings() const {
@@ -379,6 +405,12 @@ public:
 
     LLVM_READNONE unsigned getNumOfScalarOutputs() const {
         return mOutputScalars.size();
+    }
+
+    // See getInputScalarFieldIndex.
+    unsigned getOutputScalarFieldIndex(const unsigned i) const {
+        assert (i < mOutputScalarFieldIndex.size());
+        return mOutputScalarFieldIndex[i];
     }
 
     Scalar * getOutputScalarAt(const unsigned i) const {
@@ -418,6 +450,28 @@ public:
         mThreadLocalStateType = stateTy;
     }
 
+    // For a Target that's about to fully reuse another, already-declared kernel's state
+    // type (e.g. across LLVMContexts, via setSharedStateType/setThreadLocalStateType) but
+    // still needs its own mInternalScalars list (and input/output scalar field indices)
+    // populated to match: copies other's already-computed scalar list (including each
+    // entry's recorded field index) wholesale, rather than independently recomputing it
+    // via addInternalProperties(). A matching cache-name/signature already guarantees
+    // Target and other were built identically (same kernel class, same construction
+    // arguments), so recomputing would just reproduce the same result -- and for some
+    // kernel classes (e.g. a PabloKernel's carry-structure analysis) recomputing it is
+    // expensive enough to be a real cost, paid for nothing, every time a kernel with a
+    // large enough body is deduplicated this way. mInputScalars/mOutputScalars (the
+    // Bindings, fixed at construction time from the kernel's own declared I/O) are
+    // asserted to already match, since those aren't copied here -- only the field
+    // indices that locate them within the now-shared state type are.
+    void copyInternalScalarsFrom(const Kernel & other) {
+        assert (mInputScalars.size() == other.mInputScalars.size()
+             && mOutputScalars.size() == other.mOutputScalars.size());
+        mInternalScalars = InternalScalars(other.mInternalScalars.begin(), other.mInternalScalars.end());
+        mInputScalarFieldIndex = other.mInputScalarFieldIndex;
+        mOutputScalarFieldIndex = other.mOutputScalarFieldIndex;
+    }
+
     llvm::StructType * getThreadLocalStateType(llvm::LLVMContext & C) const;
 
     std::string makeCacheName(KernelBuilder & b);
@@ -431,6 +485,8 @@ public:
     void generateKernel(KernelBuilder & b, llvm::TargetMachine * TM, llvm::GlobalValue::LinkageTypes linkageType);
 
     void loadCachedKernel(const llvm::Module * m);
+
+    void recordScalarFieldIndices();
 
     struct LocalBufferFlagSet {
         enum LocalBufferFlagType : uint32_t {
@@ -634,13 +690,42 @@ protected:
 
     static std::string annotateKernelNameWithDebugFlags(const TypeId id, const unsigned flags, std::string && name);
 
+    // Names of the two internal scalars every kernel unconditionally reserves at
+    // construction time (see addBaseInternalScalars below): a per-output owned-buffer
+    // handle and a termination-signal flag. Shared between kernel.cpp (which adds them)
+    // and kernel_compiler.cpp (which looks them up), so both sides can never drift out of
+    // sync on the name. Scoped as class members, not namespace-scope constants, so they
+    // can't collide with an unrelated identifier of the same name declared unscoped
+    // elsewhere in namespace kernel (as happened with an enumerator also named
+    // TERMINATION_SIGNAL in multithreading_model_logic.cpp).
+    static constexpr auto BUFFER_HANDLE_SUFFIX = "_buffer";
+    static constexpr auto TERMINATION_SIGNAL = "__termination_signal";
+
+    // Unconditionally reserves the buffer-handle (per output) and termination-signal
+    // internal scalars at construction time, rather than at pipeline-compile time (the
+    // old KernelCompiler::addBaseInternalProperties). This makes a kernel's scalar
+    // composition fixed the moment it's constructed, before any pipeline-specific
+    // buffer-layout analysis (which mutates output Binding attributes, e.g. promoting a
+    // buffer to Shared/Managed) can change what used to be a conditional field count --
+    // two structurally-identical kernel instances used in different, independently-
+    // analyzed pipelines now always agree on scalar composition, which the driver's
+    // kernel-declaration dedup (orc_jit_backend.cpp's materializeDecl) requires.
+    //
+    // The buffer handle field is only a pointer here, not the buffer's actual handle
+    // struct: that struct's LLVM type depends on which concrete StreamSetBuffer subclass
+    // the pipeline later picks (ExternalBuffer vs. ManagedDynamicBuffer, etc; see
+    // KernelCompiler::constructStreamSetBuffers), which isn't known until then. The real
+    // struct is heap-allocated once, lazily, the first time the kernel runs; see
+    // KernelCompiler::allocateOwnedBufferHandleStorage.
+    void addBaseInternalScalars(LLVMTypeSystemInterface & ts);
+
     struct FunctionLink {
-        const llvm::StringRef       UnmanagedName;
+        const std::string           UnmanagedName;
         llvm::FunctionType * const  FuncType;
         void * const                FuncPointer;
 
         FunctionLink(llvm::StringRef unmanagedName, llvm::FunctionType * funcType, void * funcPtr)
-        : UnmanagedName(unmanagedName)
+        : UnmanagedName(unmanagedName.str())
         , FuncType(funcType)
         , FuncPointer(funcPtr) {
 
@@ -661,6 +746,11 @@ protected:
     Bindings                            mInputScalars;
     Bindings                            mOutputScalars;
     InternalScalars                     mInternalScalars;
+    // Parallel to mInputScalars/mOutputScalars (Binding carries no kernel-state-layout
+    // bookkeeping of its own, unlike InternalScalar); recorded once by
+    // constructStateTypes. See InternalScalar::getFieldIndex.
+    std::vector<unsigned>               mInputScalarFieldIndex;
+    std::vector<unsigned>               mOutputScalarFieldIndex;
     std::string                         mKernelName;
     llvm::StructType *                  mSharedStateType = nullptr;
     llvm::StructType *                  mThreadLocalStateType = nullptr;

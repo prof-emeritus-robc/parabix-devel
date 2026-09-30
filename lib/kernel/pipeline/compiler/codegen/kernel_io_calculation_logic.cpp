@@ -1529,9 +1529,8 @@ Value * PipelineCompiler::getNumOfWritableStrides(KernelBuilder & b,
 
     const auto outputPort = port.Port;
     assert (outputPort.Type == PortType::Output);
-    const auto bufferVertex = getOutputBufferVertex(outputPort);
-    const BufferNode & bn = mBufferGraph[bufferVertex];
-    assert (bn.isOwned());
+    [[maybe_unused]] const auto bufferVertex = getOutputBufferVertex(outputPort);
+    assert (mBufferGraph[bufferVertex].isOwned());
     const Binding & output = port.Binding;
     Value * numOfStrides = nullptr;
     if (LLVM_UNLIKELY(output.getRate().isPartialSum())) {

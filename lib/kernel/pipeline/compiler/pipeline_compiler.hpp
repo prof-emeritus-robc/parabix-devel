@@ -108,6 +108,13 @@ const static std::string REPEATING_STREAMSET_HANDLE_PREFIX = "@RSS.";
 const static std::string REPEATING_STREAMSET_LENGTH_PREFIX = "@RSSL.";
 const static std::string REPEATING_STREAMSET_MALLOCED_DATA_PREFIX = "@RSSD.";
 
+// Named per owning kernel (see generateMetaDataForRepeatingStreamSets /
+// PipelineKernel::writeInternallyGeneratedStreamSetScaleVector): a nested pipeline
+// kernel's own repeating-streamset length metadata can end up in the same module as
+// its parent's, and an unqualified name would let one kernel's lookup silently find
+// and misread another's.
+const static std::string RSL_METADATA_PREFIX = "rsl.";
+
 const static std::string STATISTICS_CYCLE_COUNT_SUFFIX = ".SCy";
 const static std::string STATISTICS_CYCLE_COUNT_TOTAL = "!SCT";
 

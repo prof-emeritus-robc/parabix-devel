@@ -42,7 +42,7 @@ SRC
     ztf-runs.cpp
 DEPS
     grep
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline
@@ -60,7 +60,7 @@ SRC
     ztf-hash.cpp
 DEPS
     grep
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline

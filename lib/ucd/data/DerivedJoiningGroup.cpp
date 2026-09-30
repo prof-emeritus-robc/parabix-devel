@@ -15,7 +15,7 @@
 
 namespace UCD {
   namespace JG_ns {
-    const unsigned independent_prop_values = 106;
+    const unsigned independent_prop_values = 116;
 
     /* Code Point Ranges for No_Joining_Group
     [0000, 061f], [0621, 0621], [0640, 0640], [064b, 066d], [0670, 0670],
@@ -25,16 +25,16 @@ namespace UCD {
     [10ac6, 10ac6], [10ac8, 10ac8], [10acb, 10acc], [10ae2, 10ae3],
     [10ae5, 10aea], [10af0, 10d01], [10d03, 10d08], [10d0a, 10d18],
     [10d1a, 10d1b], [10d1d, 10d1d], [10d1f, 10d1f], [10d21, 10d22],
-    [10d24, 10ec1], [10ec5, 10ec5], [10ec8, 10ffff] */
+    [10d24, 10ec1], [10ec5, 10ec5], [10ec8, 10ed8], [10eef, 10ffff] */
     const static UnicodeSet::run_t __no_joining_group_Set_runs[] = {
     {Full, 49}, {Mixed, 3}, {Empty, 2}, {Mixed, 5}, {Empty, 1}, {Full, 7},
     {Mixed, 4}, {Full, 2063}, {Mixed, 2}, {Full, 16}, {Mixed, 2},
-    {Full, 12}, {Mixed, 1}, {Full, 32649}};
+    {Full, 12}, {Mixed, 2}, {Full, 32648}};
     const static UnicodeSet::bitquad_t __no_joining_group_Set_quads[] = {
     0x00000002, 0xfffff801, 0x00113fff, 0xffd00000, 0x63ff3fff, 0x0002ffff,
     0xffff0000, 0x00001fff, 0x0000f800, 0xffff01b8, 0x00002000, 0xfffffe00,
-    0x00001940, 0xffff07ec, 0xadfffdfb, 0xfffffff6, 0xffffff23};
-    const static UnicodeSet no_joining_group_Set{__no_joining_group_Set_runs, 14, __no_joining_group_Set_quads, 17};
+    0x00001940, 0xffff07ec, 0xadfffdfb, 0xfffffff6, 0x01ffff23, 0xffff8000};
+    const static UnicodeSet no_joining_group_Set{__no_joining_group_Set_runs, 14, __no_joining_group_Set_quads, 18};
 
     /* Code Point Ranges for Ain
     [0639, 063a], [06a0, 06a0], [06fc, 06fc], [075d, 075f], [08b3, 08b3],
@@ -650,6 +650,56 @@ namespace UCD {
     const static UnicodeSet::run_t __thin_noon_Set_runs[] = {{Empty, 2166}, {Mixed, 1}, {Empty, 32649}};
     const static UnicodeSet::bitquad_t __thin_noon_Set_quads[] = {0x00000040};
     const static UnicodeSet thin_noon_Set{__thin_noon_Set_runs, 3, __thin_noon_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Beh    [10ed9, 10edc], [10eec, 10eec], [10eee, 10eee] */
+    const static UnicodeSet::run_t __crown_beh_Set_runs[] = {{Empty, 2166}, {Mixed, 2}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_beh_Set_quads[] = {0x1e000000, 0x00005000};
+    const static UnicodeSet crown_beh_Set{__crown_beh_Set_runs, 3, __crown_beh_Set_quads, 2};
+
+    /* Code Point Ranges for Crown_Hah    [10edd, 10edf] */
+    const static UnicodeSet::run_t __crown_hah_Set_runs[] = {{Empty, 2166}, {Mixed, 1}, {Empty, 32649}};
+    const static UnicodeSet::bitquad_t __crown_hah_Set_quads[] = {0xe0000000};
+    const static UnicodeSet crown_hah_Set{__crown_hah_Set_runs, 3, __crown_hah_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Seen    [10ee0, 10ee1] */
+    const static UnicodeSet::run_t __crown_seen_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_seen_Set_quads[] = {0x00000003};
+    const static UnicodeSet crown_seen_Set{__crown_seen_Set_runs, 3, __crown_seen_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Sad    [10ee2, 10ee3] */
+    const static UnicodeSet::run_t __crown_sad_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_sad_Set_quads[] = {0x0000000c};
+    const static UnicodeSet crown_sad_Set{__crown_sad_Set_runs, 3, __crown_sad_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Tah    [10ee4, 10ee5] */
+    const static UnicodeSet::run_t __crown_tah_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_tah_Set_quads[] = {0x00000030};
+    const static UnicodeSet crown_tah_Set{__crown_tah_Set_runs, 3, __crown_tah_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Ain    [10ee6, 10ee7] */
+    const static UnicodeSet::run_t __crown_ain_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_ain_Set_quads[] = {0x000000c0};
+    const static UnicodeSet crown_ain_Set{__crown_ain_Set_runs, 3, __crown_ain_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Feh    [10ee8, 10ee9] */
+    const static UnicodeSet::run_t __crown_feh_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_feh_Set_quads[] = {0x00000300};
+    const static UnicodeSet crown_feh_Set{__crown_feh_Set_runs, 3, __crown_feh_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Kaf    [10eea, 10eea] */
+    const static UnicodeSet::run_t __crown_kaf_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_kaf_Set_quads[] = {0x00000400};
+    const static UnicodeSet crown_kaf_Set{__crown_kaf_Set_runs, 3, __crown_kaf_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Meem    [10eeb, 10eeb] */
+    const static UnicodeSet::run_t __crown_meem_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_meem_Set_quads[] = {0x00000800};
+    const static UnicodeSet crown_meem_Set{__crown_meem_Set_runs, 3, __crown_meem_Set_quads, 1};
+
+    /* Code Point Ranges for Crown_Heh    [10eed, 10eed] */
+    const static UnicodeSet::run_t __crown_heh_Set_runs[] = {{Empty, 2167}, {Mixed, 1}, {Empty, 32648}};
+    const static UnicodeSet::bitquad_t __crown_heh_Set_quads[] = {0x00002000};
+    const static UnicodeSet crown_heh_Set{__crown_heh_Set_runs, 3, __crown_heh_Set_quads, 1};
     static EnumeratedPropertyObject property_object
         {jg,
         JG_ns::independent_prop_values,
@@ -685,7 +735,9 @@ namespace UCD {
         &malayalam_bha_Set, &malayalam_ra_Set, &malayalam_lla_Set,
         &malayalam_llla_Set, &malayalam_ssa_Set, &hanifi_rohingya_pa_Set,
         &hanifi_rohingya_kinna_ya_Set, &thin_yeh_Set, &vertical_tail_Set,
-        &kashmiri_yeh_Set, &thin_noon_Set
+        &kashmiri_yeh_Set, &thin_noon_Set, &crown_beh_Set, &crown_hah_Set,
+        &crown_seen_Set, &crown_sad_Set, &crown_tah_Set, &crown_ain_Set,
+        &crown_feh_Set, &crown_kaf_Set, &crown_meem_Set, &crown_heh_Set
         }};
     }
 PropertyObject * get_JG_PropertyObject() {  return & JG_ns::property_object; }

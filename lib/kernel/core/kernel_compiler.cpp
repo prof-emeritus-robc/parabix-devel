@@ -1,6 +1,7 @@
 #include <kernel/core/kernel_compiler.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/driver/driver.h>
+#include <functional>
 #include <llvm/IR/CallingConv.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Constants.h>
@@ -33,9 +34,6 @@ using RateId = ProcessingRate::KindId;
 using StreamSetPort = Kernel::StreamSetPort;
 using PortType = Kernel::PortType;
 
-constexpr static auto BUFFER_HANDLE_SUFFIX = "_buffer";
-constexpr static auto TERMINATION_SIGNAL = "__termination_signal";
-
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
 
@@ -62,7 +60,6 @@ void KernelCompiler::constructStateTypes(KernelBuilder & b) {
         assert ("output buffer not set by constructStreamSetBuffers" && buffer.get());
     }
     #endif
-    addBaseInternalProperties(b);
     mTarget->addInternalProperties(b);
     mTarget->constructStateTypes(b);
     b.setCompiler(oc);
@@ -96,31 +93,6 @@ void KernelCompiler::generateKernel(KernelBuilder & b, TargetMachine * TM, Globa
     mTarget->addAdditionalFunctions(b);
     b.setCompiler(oc);
 
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief addBaseInternalProperties
-  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::addBaseInternalProperties(KernelBuilder & b) {
-     // If an output is a managed buffer, store its handle.
-    auto & C = b.getContext();
-    const auto n = mOutputStreamSets.size();
-    for (unsigned i = 0; i < n; ++i) {
-        const Binding & output = mOutputStreamSets[i];
-        Type * const handleTy = CBuilder::convertTypeToLLVMContext(C, mStreamSetOutputBuffers[i]->getHandleType(b));
-        const auto isLocal = Kernel::isLocalBuffer(output);
-        if (LLVM_UNLIKELY(isLocal.any())) {
-            mTarget->addInternalScalar(handleTy, output.getName() + BUFFER_HANDLE_SUFFIX);
-        } else {
-            mTarget->addNonPersistentScalar(handleTy, output.getName() + BUFFER_HANDLE_SUFFIX);
-        }
-    }
-    IntegerType * const sizeTy = b.getSizeTy();
-    if (mTarget->hasAttribute(AttrId::InternallySynchronized) || mTarget->canSetTerminateSignal()) {
-        mTarget->addInternalScalar(sizeTy, TERMINATION_SIGNAL);
-    } else {
-        mTarget->addNonPersistentScalar(sizeTy, TERMINATION_SIGNAL);
-    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -252,10 +224,10 @@ inline void KernelCompiler::callGenerateInitializeMethod(KernelBuilder & b, Glob
     // TODO: we could permit shared managed buffers here if we passed in the buffer
     // into the init method. However, since there are no uses of this in any written
     // program, we currently prohibit it.
-    initializeOwnedBufferHandles(b, InitializeOptions::DoNotIncludeThreadLocalScalars);
+    initializeOwnedBufferHandles(b, InitializeOptions::DoNotIncludeThreadLocalScalars, nullptr, true);
     // any kernel can set termination on initialization
     Type * termSignalTy;
-    std::tie(mTerminationSignalPtr, termSignalTy) = getScalarFieldPtr(b, TERMINATION_SIGNAL);
+    std::tie(mTerminationSignalPtr, termSignalTy) = getScalarFieldPtr(b, Kernel::TERMINATION_SIGNAL);
     b.CreateStore(b.getSize(KernelBuilder::TerminationCode::None), mTerminationSignalPtr);
     mTarget->generateInitializeMethod(b);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableMProtect) && sharedStateTy)) {
@@ -674,9 +646,12 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
             buffer->setHandle(handle);
         } else if (LLVM_UNLIKELY(isMainPipeline || isLocal.any())) {
             // If an output is a managed buffer, the address is stored within the state instead
-            // of being passed in through the function call.
+            // of being passed in through the function call. The field holds a pointer to the
+            // handle storage allocated once by initializeOwnedBufferHandles, not the handle
+            // itself, so it must be loaded rather than used directly.
             mUpdatableOutputBaseVirtualAddressPtr[i] = nextArg();
-            Value * handle = getScalarFieldPtr(b, output.getName() + BUFFER_HANDLE_SUFFIX).first;
+            Value * const fieldPtr = getScalarFieldPtr(b, output.getName() + Kernel::BUFFER_HANDLE_SUFFIX).first;
+            Value * const handle = b.CreateLoad(b.getVoidPtrTy(), fieldPtr);
             buffer->setHandle(handle);
         } else {
             assert (isa<ExternalBuffer>(buffer));
@@ -776,7 +751,7 @@ void KernelCompiler::setDoSegmentProperties(KernelBuilder & b, const ArrayRef<Va
     // initialize the termination signal if this kernel can set it
     mTerminationSignalPtr = nullptr;
     if (internallySynchronized || canTerminate) {
-        mTerminationSignalPtr = getScalarFieldPtr(b, TERMINATION_SIGNAL).first;
+        mTerminationSignalPtr = getScalarFieldPtr(b, Kernel::TERMINATION_SIGNAL).first;
         if (LLVM_UNLIKELY(enableAsserts)) {
             Value * const unterminated =
                 b.CreateICmpEQ(b.CreateLoad(sizeTy, mTerminationSignalPtr), b.getSize(KernelBuilder::TerminationCode::None));
@@ -1086,6 +1061,21 @@ std::vector<Value *> KernelCompiler::getFinalOutputScalars(KernelBuilder & b) {
     return outputs;
 }
 
+// Independently recomputes each scalar's flat state-struct field index and checks it
+// against the index Kernel::constructStateTypes recorded at construction (see
+// InternalScalar::getFieldIndex), aborting via report_fatal_error on any mismatch. This
+// duplicates the group-index bookkeeping that construction itself already does, purely
+// as a cross-check against the two ever silently diverging again -- not needed for
+// correctness once that guarantee is trusted, so it defaults to on only in debug builds.
+// Define PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK=1/0 explicitly to override either way.
+#ifndef PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
+#ifndef NDEBUG
+#define PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK 1
+#else
+#define PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK 0
+#endif
+#endif
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addToGroupCountMap
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -1190,8 +1180,10 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         #endif
     };
 
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
     flat_map<size_t, size_t> sharedGroups;
     flat_map<size_t, size_t> threadLocalGroups;
+#endif
 
     bool hasThreadLocalAccum = false;
 
@@ -1199,11 +1191,15 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         assert (scalar.getValueType());
         switch (scalar.getScalarType()) {
             case ScalarType::Internal:
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
                 addToGroupCountMap(sharedGroups, scalar.getGroup());
+#endif
                 break;
             case ScalarType::ThreadLocal:
                 if (options == InitializeOptions::DoNotIncludeThreadLocalScalars) continue;
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
                 addToGroupCountMap(threadLocalGroups, scalar.getGroup());
+#endif
                 if (options != InitializeOptions::IncludeAndAutomaticallyAccumulateThreadLocalScalars) continue;
                 if (scalar.getAccumulationRule() != Kernel::ThreadLocalScalarAccumulationRule::DoNothing) {
                     assert (mCommonThreadLocalHandle && "no main thread local given?");
@@ -1214,8 +1210,12 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         }
     }
 
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
     const auto totalSharedGroupCount = computePartialSumOfGroupCounts(sharedGroups, mInputScalars.size());
     computePartialSumOfGroupCounts(threadLocalGroups, 0U);
+#else
+    const size_t totalSharedGroupCount = 0;
+#endif
 
     BasicBlock * combineToMainThreadLocal = nullptr;
 
@@ -1234,16 +1234,28 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         return b.CreateInBoundsGEP(i8Ty, handle, idx);
     };
 
-    IntegerType * const intPtrTy = DL.getIntPtrType(b.getContext());
 
 
-
-
-    auto enumerate = [&](const Bindings & bindings, const size_t initialIndex) {
+    auto enumerate = [&](const Bindings & bindings, const size_t initialIndex,
+                         const std::function<unsigned(unsigned)> & getRecordedIndex) {
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
         auto index = initialIndex;
-        for (const auto & binding : bindings) {
+#endif
+        for (unsigned bindingIndex = 0; bindingIndex < bindings.size(); ++bindingIndex) {
+            const auto & binding = bindings[bindingIndex];
             assert (sharedTy);
-            const auto k = index * 2 + 1;
+            const auto k = getRecordedIndex(bindingIndex);
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
+            const auto oldK = index * 2 + 1;
+            if (LLVM_UNLIKELY(oldK != k)) {
+                SmallVector<char, 256> tmp;
+                raw_svector_ostream out(tmp);
+                out << "Kernel " << getName() << " scalar '" << binding.getName()
+                    << "': constructStateTypes recorded field index " << k
+                    << " but independent recomputation gave " << oldK;
+                report_fatal_error(Twine(out.str()));
+            }
+#endif
             assert (k < sharedTy->getStructNumElements());
             Type * const actualType = sharedTy->getStructElementType(k);
             assert (&actualType->getContext() == &sharedTy->getContext());
@@ -1281,13 +1293,15 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
             #ifndef NDEBUG
             mScalarPositionMap.insert(std::make_pair(binding.getName(), std::make_pair(ScalarType::Internal, k)));
             #endif
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
             ++index;
+#endif
         }
     };
 
     BasicBlock * combineExit = combineToMainThreadLocal;
 
-    enumerate(mInputScalars, 0U);
+    enumerate(mInputScalars, 0U, [&](unsigned i) { return mTarget->getInputScalarFieldIndex(i); });
 
     for (const auto & binding : mInternalScalars) {
         Value * scalar = nullptr;
@@ -1297,10 +1311,21 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
             case ScalarType::Internal:
                 assert (mSharedHandle);
                 BEGIN_SCOPED_REGION
+                const auto k = binding.getFieldIndex();
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
                 auto f = sharedGroups.find(binding.getGroup());
                 assert (f != sharedGroups.end());
                 const auto index = f->second++;
-                const auto k = index * 2 + 1;
+                const auto oldK = index * 2 + 1;
+                if (LLVM_UNLIKELY(oldK != k)) {
+                    SmallVector<char, 256> tmp;
+                    raw_svector_ostream out(tmp);
+                    out << "Kernel " << getName() << " internal scalar '" << binding.getName()
+                        << "': constructStateTypes recorded field index " << k
+                        << " but independent recomputation gave " << oldK;
+                    report_fatal_error(Twine(out.str()));
+                }
+#endif
                 assert (k < sharedTy->getStructNumElements());
                 scalarType = sharedTy->getStructElementType(k);
                 assert (scalarType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType()));
@@ -1342,10 +1367,21 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
                 assert (mThreadLocalHandle);
                 BEGIN_SCOPED_REGION
 
+                const auto k = binding.getFieldIndex();
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
                 auto f = threadLocalGroups.find(binding.getGroup());
                 assert (f != threadLocalGroups.end());
                 const auto index = f->second++;
-                const auto k = index * 2 + 1;
+                const auto oldK = index * 2 + 1;
+                if (LLVM_UNLIKELY(oldK != k)) {
+                    SmallVector<char, 256> tmp;
+                    raw_svector_ostream out(tmp);
+                    out << "Kernel " << getName() << " thread-local scalar '" << binding.getName()
+                        << "': constructStateTypes recorded field index " << k
+                        << " but independent recomputation gave " << oldK;
+                    report_fatal_error(Twine(out.str()));
+                }
+#endif
                 assert (k < threadLocalTy->getStructNumElements());
                 scalarType = threadLocalTy->getStructElementType(k);
                 assert (scalarType == CBuilder::convertTypeToLLVMContext(b.getContext(), binding.getValueType()));
@@ -1505,7 +1541,7 @@ void KernelCompiler::initializeScalarMap(KernelBuilder & b, const InitializeOpti
         addToScalarFieldMap(binding.getName(), scalar, binding.getValueType(), scalarType);
     }
 
-    enumerate(mOutputScalars, totalSharedGroupCount);
+    enumerate(mOutputScalars, totalSharedGroupCount, [&](unsigned i) { return mTarget->getOutputScalarFieldIndex(i); });
 
     // finally add any aliases
     for (const auto & alias : mScalarAliasMap) {
@@ -1553,17 +1589,47 @@ void KernelCompiler::initializeIOBindingMap() {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief allocateOwnedBufferHandleStorage
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * KernelCompiler::allocateOwnedBufferHandleStorage(KernelBuilder & b, Value * const fieldPtr, Type * const handleTy) {
+    Value * const priorHandle = b.CreateLoad(b.getVoidPtrTy(), fieldPtr);
+    BasicBlock * const freePrior = b.CreateBasicBlock("freePriorBufferHandle");
+    BasicBlock * const afterFree = b.CreateBasicBlock("afterFreePriorBufferHandle");
+    b.CreateUnlikelyCondBr(b.CreateIsNotNull(priorHandle), freePrior, afterFree);
+    b.SetInsertPoint(freePrior);
+    b.CreateFree(priorHandle);
+    b.CreateBr(afterFree);
+    b.SetInsertPoint(afterFree);
+    Value * const handleSize = b.getTypeSize(handleTy);
+    Value * const newHandle = b.CreateAlignedMalloc(handleSize, sizeof(void *));
+    b.CreateMemZero(newHandle, handleSize, sizeof(void *));
+    b.CreateStore(newHandle, fieldPtr);
+    return newHandle;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief initializeOwnedBufferHandles
  ** ------------------------------------------------------------------------------------------------------------- */
-void KernelCompiler::initializeOwnedBufferHandles(KernelBuilder & b, const InitializeOptions /* options */, Value * const expectedNumOfStrides) {
+void KernelCompiler::initializeOwnedBufferHandles(KernelBuilder & b, const InitializeOptions /* options */,
+                                                   Value * const expectedNumOfStrides, const bool allocateHandleStorage) {
+    // Matches the isMainPipeline condition callGenerateDoSegmentMethod uses to decide
+    // whether to read this same field: the top-level (non-internally-synchronized)
+    // Pipeline kernel routes even its non-local outputs through persistent handle
+    // storage (so the driver can query their virtual base address after the call
+    // returns), not just outputs isLocalBuffer() considers owned/managed.
+    const auto isMainPipeline = (mTarget->getTypeId() == Kernel::TypeId::Pipeline)
+                              && !mTarget->hasAttribute(AttrId::InternallySynchronized);
     const auto numOfOutputs = getNumOfStreamOutputs();
     for (unsigned i = 0; i < numOfOutputs; i++) {
         const Binding & output = mOutputStreamSets[i];
         const auto isLocal = Kernel::isLocalBuffer(output);
-        if (LLVM_UNLIKELY(isLocal.any())) {
-            auto handle = getScalarFieldPtr(b, output.getName() + BUFFER_HANDLE_SUFFIX);
+        if (LLVM_UNLIKELY(isLocal.any() || isMainPipeline)) {
+            auto handle = getScalarFieldPtr(b, output.getName() + Kernel::BUFFER_HANDLE_SUFFIX);
             const auto & buffer = mStreamSetOutputBuffers[i]; assert (buffer.get());
-            buffer->setHandle(handle.first);
+            Value * const handlePtr = allocateHandleStorage
+                ? allocateOwnedBufferHandleStorage(b, handle.first, buffer->getHandleType(b))
+                : b.CreateLoad(b.getVoidPtrTy(), handle.first);
+            buffer->setHandle(handlePtr);
 //            assert (isLocal.isManaged() == Kernel::isManagedBuffer(output));
 //            assert (buffer->isDynamic() || !isLocal.isManaged());
             if (LLVM_UNLIKELY(isLocal.isManaged() && expectedNumOfStrides)) {

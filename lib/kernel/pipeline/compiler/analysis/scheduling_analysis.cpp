@@ -843,7 +843,7 @@ is_bipartite_graph:
 
         assert (stack.size() > 0);
 
-        unsigned visited = 0;
+        [[maybe_unused]] unsigned visited = 0;
 
         size_t maxWeight = 0;
         for (;;) {

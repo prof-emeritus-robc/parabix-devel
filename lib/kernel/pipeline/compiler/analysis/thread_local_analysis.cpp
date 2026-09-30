@@ -980,7 +980,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             }
         }
 
-        const auto r = check();
+        [[maybe_unused]] const auto r = check();
         assert (r == Z3_L_TRUE);
 
         const auto model = Z3_solver_get_model(ctx, solver);

@@ -344,8 +344,6 @@ protected:
 
     virtual void constructStreamSetBuffers(KernelBuilder & b);
 
-    virtual void addBaseInternalProperties(KernelBuilder & b);
-
     ScalarRef getScalarFieldPtr(KernelBuilder & b, llvm::Value * handle,  const ScalarType type, const llvm::StringRef name) const;
 
 private:
@@ -354,7 +352,25 @@ private:
 
     void initializeIOBindingMap();
 
-    void initializeOwnedBufferHandles(KernelBuilder & b, const InitializeOptions options, llvm::Value * expectedNumOfStrides = nullptr);
+    // allocateHandleStorage is true only for the call from callGenerateInitializeMethod --
+    // the first of several separately-generated functions (Initialize, then possibly
+    // AllocateSharedInternalStreamSets, AllocateThreadLocalInternalStreamSets, Finalize)
+    // that all run, in that order, within one kernel instance's lifetime and each need
+    // buffer->setHandle() reconnected to the persistent handle storage. Only the first one
+    // should (re)allocate that storage; the rest must just load the pointer already
+    // written there, or they would stomp on state written by an earlier one in the
+    // sequence. See allocateOwnedBufferHandleStorage.
+    void initializeOwnedBufferHandles(KernelBuilder & b, const InitializeOptions options,
+                                       llvm::Value * expectedNumOfStrides = nullptr,
+                                       bool allocateHandleStorage = false);
+
+    // Frees any handle storage left over from a prior run of this kernel instance (mirrors
+    // MemorySourceKernel's "free at start of next Initialize, not at Finalize" convention,
+    // since a Returned/kept buffer must remain valid to the caller after the pipeline call
+    // returns), then heap-allocates and zero-initializes a fresh block sized for handleTy,
+    // stores its address into the persistent (now pointer-typed) *_buffer scalar field at
+    // fieldPtr, and returns it.
+    llvm::Value * allocateOwnedBufferHandleStorage(KernelBuilder & b, llvm::Value * fieldPtr, llvm::Type * handleTy);
 
 protected:
 

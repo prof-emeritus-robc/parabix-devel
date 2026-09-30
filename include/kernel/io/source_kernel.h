@@ -67,6 +67,16 @@ protected:
     const unsigned mCodeUnitWidth;
 };
 
+// Accepts a caller-supplied (fileSource, fileItems) buffer of arbitrary alignment
+// and with no guaranteed overflow past fileItems -- like every block-based Parabix
+// kernel, this may read a full block past the logical end of the final (partial)
+// stride, which an arbitrary caller buffer has no obligation to provide. Rather
+// than impose an alignment/overflow contract on every caller, this kernel copies
+// the caller's data into its own safely-padded, aligned buffer during
+// initialization. That copy is intentionally NOT freed on finalize -- a "kept"
+// (exposed) output streamset may still point a caller at it after the pipeline
+// call returns -- but is freed at the start of the next initialization, if any,
+// so repeated calls to the same compiled pipeline don't leak.
 class MemorySourceKernel final : public SegmentOrientedKernel {
 public:
     MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fileSource, Scalar * fileItems, StreamSet * const outputStream);
@@ -74,6 +84,9 @@ protected:
     void generateInitializeMethod(KernelBuilder & b) override;
     void generateDoSegmentMethod(KernelBuilder & b) override;
     llvm::Value * generateExpectedOutputSizeMethod(KernelBuilder &) override;
+private:
+    const unsigned mCodeUnitWidth;
+    const unsigned mNumElements;
 };
 
 }

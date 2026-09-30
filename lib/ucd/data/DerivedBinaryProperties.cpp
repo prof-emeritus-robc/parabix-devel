@@ -40,11 +40,12 @@ namespace UCD {
         [2ae2, 2ae6], [2aec, 2aee], [2af3, 2af3], [2af7, 2afb],
         [2afd, 2afd], [2bfe, 2bfe], [2e02, 2e05], [2e09, 2e0a],
         [2e0c, 2e0d], [2e1c, 2e1d], [2e20, 2e29], [2e55, 2e5c],
-        [3008, 3011], [3014, 301b], [fe59, fe5e], [fe64, fe65],
-        [ff08, ff09], [ff1c, ff1c], [ff1e, ff1e], [ff3b, ff3b],
-        [ff3d, ff3d], [ff5b, ff5b], [ff5d, ff5d], [ff5f, ff60],
-        [ff62, ff63], [1d6db, 1d6db], [1d715, 1d715], [1d74f, 1d74f],
-        [1d789, 1d789], [1d7c3, 1d7c3] */
+        [2e62, 2e63], [3008, 3011], [3014, 301b], [fe59, fe5e],
+        [fe64, fe65], [ff08, ff09], [ff1c, ff1c], [ff1e, ff1e],
+        [ff3b, ff3b], [ff3d, ff3d], [ff5b, ff5b], [ff5d, ff5d],
+        [ff5f, ff60], [ff62, ff63], [1cedd, 1cedf], [1d6db, 1d6db],
+        [1d715, 1d715], [1d74f, 1d74f], [1d789, 1d789], [1d7c3, 1d7c3],
+        [1db03, 1db09], [1db10, 1db10], [1db17, 1db18], [1db1b, 1db1b] */
 
         const static UnicodeSet::run_t __Bidi_M_set_runs[] = {
         {Empty, 1}, {Mixed, 3}, {Empty, 1}, {Mixed, 1}, {Empty, 115},
@@ -52,10 +53,11 @@ namespace UCD {
         {Empty, 5}, {Mixed, 1}, {Empty, 5}, {Mixed, 10}, {Empty, 33},
         {Mixed, 1}, {Empty, 2}, {Mixed, 2}, {Empty, 12}, {Mixed, 8},
         {Full, 1}, {Mixed, 3}, {Empty, 7}, {Mixed, 1}, {Empty, 16},
-        {Mixed, 3}, {Empty, 13}, {Mixed, 1}, {Empty, 1649}, {Mixed, 2},
-        {Empty, 4}, {Mixed, 4}, {Empty, 1722}, {Mixed, 1}, {Empty, 1},
+        {Mixed, 4}, {Empty, 12}, {Mixed, 1}, {Empty, 1649}, {Mixed, 2},
+        {Empty, 4}, {Mixed, 4}, {Empty, 1658}, {Mixed, 1}, {Empty, 63},
         {Mixed, 1}, {Empty, 1}, {Mixed, 1}, {Empty, 1}, {Mixed, 1},
-        {Empty, 1}, {Mixed, 1}, {Empty, 31041}};
+        {Empty, 1}, {Mixed, 1}, {Empty, 1}, {Mixed, 1}, {Empty, 25},
+        {Mixed, 1}, {Empty, 31015}};
         const static UnicodeSet::bitquad_t __Bidi_M_set_quads[] = {
         0x50000300, 0x28000000, 0x28000000, 0x08000800, 0x3c000000,
         0x18000000, 0x06000000, 0x00000060, 0x60000000, 0x00006000,
@@ -64,11 +66,11 @@ namespace UCD {
         0x00000603, 0x003fff00, 0x70783b79, 0x0000fffc, 0xf9fffff8,
         0x0100fffd, 0x1f37c23f, 0x33f0033a, 0xdffffc00, 0x70307a53,
         0x01800000, 0xfe19bc30, 0xffffbfcf, 0x507fffff, 0x2f88707c,
-        0x40000000, 0x3000363c, 0x000003ff, 0x1fe00000, 0x0ff3ff00,
-        0x7e000000, 0x00000030, 0x50000300, 0x28000000, 0xa8000000,
-        0x0000000d, 0x08000000, 0x00200000, 0x00008000, 0x00000200,
-        0x00000008};
-        const static UnicodeSet Bidi_M_set{__Bidi_M_set_runs, 43, __Bidi_M_set_quads, 51};
+        0x40000000, 0x3000363c, 0x000003ff, 0x1fe00000, 0x0000000c,
+        0x0ff3ff00, 0x7e000000, 0x00000030, 0x50000300, 0x28000000,
+        0xa8000000, 0x0000000d, 0xe0000000, 0x08000000, 0x00200000,
+        0x00008000, 0x00000200, 0x00000008, 0x098103f8};
+        const static UnicodeSet Bidi_M_set{__Bidi_M_set_runs, 47, __Bidi_M_set_quads, 54};
         static BinaryPropertyObject property_object{Bidi_M, std::move(Bidi_M_set)};
     }
 PropertyObject * get_BIDI_M_PropertyObject() {  return & BIDI_M_ns::property_object; }

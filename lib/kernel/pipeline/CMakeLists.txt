@@ -14,6 +14,8 @@ NAME
 SRC
     driver/driver.cpp
     driver/cpudriver.cpp
+    driver/mcjit_backend.cpp
+    driver/orc_jit_backend.cpp
     # driver/NVPTXDriver.cpp
     compiler/analysis/add_analysis.cpp
     compiler/analysis/buffer_analysis.cpp

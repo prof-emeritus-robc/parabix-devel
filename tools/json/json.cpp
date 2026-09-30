@@ -19,21 +19,19 @@
 #include <llvm/IR/Module.h>                        // for Module
 #include <llvm/Support/CommandLine.h>              // for ParseCommandLineOp...
 #include <llvm/Support/Debug.h>                    // for dbgs
-#include <pablo/pablo_kernel.h>                    // for PabloKernel
 #include <pablo/parse/pablo_source_kernel.h>
 #include <pablo/parse/pablo_parser.h>
 #include <pablo/parse/simple_lexer.h>
 #include <pablo/parse/rd_parser.h>
 #include <pablo/bixnum/bixnum.h>
 #include <kernel/core/kernel_builder.h>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <toolchain/toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/core/streamset.h>
 #include <kernel/streamutils/streams_merge.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/builder.hpp>
 #include <fcntl.h>
 #include <iostream>
 #include <iomanip>
@@ -204,7 +202,7 @@ jsonFunctionType json_parsing_gen(
         StreamSet * const Errs = su::Collapse(P, Errors);
         auto simpleErrFn = SCAN_CALLBACK(postproc_parensError);
 
-        Scalar * const errCount = P.CreateScalar(P.getInt64Ty());
+        Scalar * const errCount = P.CreateScalar(P.getTypeSystem().getInt64Ty());
         P.CreateKernelCall<PopcountKernel>(Errs, errCount);
         P.CreateCall(simpleErrFn.name, *simpleErrFn.func, { errCount });
 

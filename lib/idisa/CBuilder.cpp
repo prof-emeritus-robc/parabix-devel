@@ -1076,7 +1076,9 @@ __unwind_callback (struct _Unwind_Context *context, void *data) {
 
 #endif // ENABLE_LIBBACKTRACE
 
-constexpr StringRef __BACKTRACE_STRUCT_NAME{"__bkstruct"};
+// Only referenced under !NDEBUG (below) and, separately, under ENABLE_LIBBACKTRACE
+// (generateBacktraceMethod); a release build without libbacktrace uses neither.
+[[maybe_unused]] constexpr StringRef __BACKTRACE_STRUCT_NAME{"__bkstruct"};
 
 void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::initializer_list<Value *> params) {
 
@@ -1140,8 +1142,17 @@ void CBuilder::__CreateAssert(Value * const assertion, const Twine format, std::
 
         Value * const vaList = CreatePointerCast(CreateAlignedAlloca(vaListTy, mCacheLineAlignment), int8PtrTy);
         FunctionType * vaFuncTy = FunctionType::get(voidTy, { int8PtrTy }, false);
-        Function * const vaStart = Intrinsic::getDeclaration(m, Intrinsic::vastart);
-        Function * const vaEnd = Intrinsic::getDeclaration(m, Intrinsic::vaend);
+        // Intrinsic::getOrInsertDeclaration mangles the overloaded pointer type into the
+        // symbol name (e.g. "llvm.va_start.p0"). That's what LLVM 19+'s backend expects,
+        // but under LLVM 17/18 the ISel intrinsic-matching table still expects the plain,
+        // unmangled name, so the mangled declaration is left unresolved at JIT link time.
+        #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(19, 0, 0)
+        Function * vaStart = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vastart, {int8PtrTy});
+        Function * vaEnd = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::vaend, {int8PtrTy});
+        #else
+        Function * const vaStart = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_start", m);
+        Function * const vaEnd = Function::Create(vaFuncTy, Function::ExternalLinkage, "llvm.va_end", m);
+        #endif
         CreateCondBr(assertion, success, failure);
 
         SetInsertPoint(failure);
@@ -2479,6 +2490,23 @@ Constant * CBuilder::convertConstantToLLVMContext(LLVMContext & C, Constant * co
             if (isa<ConstantVector>(constant)) {
                 return ConstantVector::get(ops);
             }
+        }
+        // ConstantArray::get()/ConstantVector::get() transparently return a more compact
+        // ConstantDataArray/ConstantDataVector instead of an actual ConstantAggregate
+        // subclass when every element is a simple integer or float constant (e.g. an
+        // array of size_t constants), so that case must be handled separately here.
+        if (isa<ConstantDataSequential>(constant)) {
+            const ConstantDataSequential * const cv = cast<ConstantDataSequential>(constant);
+            const auto numElements = cv->getNumElements();
+            SmallVector<Constant *, 16> ops(numElements);
+            for (unsigned i = 0; i < numElements; ++i) {
+                ops[i] = convertConstant(cv->getElementAsConstant(i));
+            }
+            if (isa<ConstantDataArray>(constant)) {
+                return ConstantArray::get(cast<ArrayType>(newType), ops);
+            }
+            assert (isa<ConstantDataVector>(constant));
+            return ConstantVector::get(ops);
         }
         if (isa<UndefValue>(constant)) {
             return UndefValue::get(newType);

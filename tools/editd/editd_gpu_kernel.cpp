@@ -104,8 +104,8 @@ editdGPUKernel::editdGPUKernel(LLVMTypeSystemInterface & ts, unsigned dist, unsi
 BlockOrientedKernel(ts, "editd_gpu",
 {Binding{ts.getStreamSetTy(4), "CCStream"}},
 {Binding{ts.getStreamSetTy(dist + 1), "ResultStream"}},
-{Binding{PointerType::get(ts.getInt8Ty(), 1), "pattStream"},
-Binding{PointerType::get(ArrayType::get(ts.getBitBlockType(), pattLen * (dist + 1) * 4 * groupSize), 0), "strideCarry"}},
+{Binding{PointerType::get(ts.getContext(), 1), "pattStream"},
+Binding{PointerType::getUnqual(ts.getContext()), "strideCarry"}},
 {},
 {InternalScalar{ScalarType::NonPersistent, ts.getBitBlockType(), "EOFmask"}})
 , mEditDistance(dist)

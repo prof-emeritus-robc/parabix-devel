@@ -234,7 +234,7 @@ void PipelineAnalysis::identifyTerminationChecks() {
     }
 
     // determine which phase terminals need to be checked to determine whether the pipeline has finished.
-    const auto d = in_degree(requiredChecks + numOfPhases, G);
+    [[maybe_unused]] const auto d = in_degree(requiredChecks + numOfPhases, G);
     assert (0 < d && d <= numOfPhases);
     for (const auto e : make_iterator_range(in_edges(requiredChecks + numOfPhases, G))) {
         const auto s = source(e, G);

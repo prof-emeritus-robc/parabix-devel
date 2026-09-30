@@ -4,9 +4,7 @@
  */
 
 #include "pattern_compiler.h"
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
-#include <pablo/pe_ones.h>
+#include <pablo/pablo.h>
 
 using namespace pablo;
 

@@ -9,7 +9,7 @@ NAME
 SRC
     hexlines.cpp
 DEPS
-    pablo
+    pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline
@@ -26,22 +26,8 @@ SRC
     hashdemo.cpp
 DEPS
     grep
-    pablo
+    pablo.compiler
     kernel.basis
-    kernel.io
-    kernel.pipeline
-    kernel.streamutils
-    kernel.util
-    toolchain
-)
-
-
-parabix_add_executable(
-NAME
-    packdemo
-SRC
-    packdemo.cpp
-DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils

@@ -4,10 +4,8 @@
  */
 
 #include <kernel/util/nesting.h>
-#include <pablo/builder.hpp>
+#include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
-#include <pablo/pe_zeroes.h>
-#include <pablo/branch.h>
 #include <vector>
 #include <llvm/Support/CommandLine.h>
 

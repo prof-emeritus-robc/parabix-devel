@@ -12,8 +12,7 @@
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Value.h>
 #include <llvm/Support/raw_ostream.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <re/cc/cc_compiler.h>                     // for CC_Compiler
 
 using namespace pablo;

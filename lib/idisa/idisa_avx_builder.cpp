@@ -276,7 +276,7 @@ Value * IDISA_AVX2_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
         return CreateShuffleVector(packed, UndefValue::get(fwVectorType(64)), shuffleMask);
     }
     // Otherwise use default logic.
-    return IDISA_Builder::hsimd_packus(fw, a, b);
+    return IDISA_Builder::hsimd_packss(fw, a, b);
 }
 
 std::pair<Value *, Value *> IDISA_AVX2_Builder::bitblock_add_with_carry(Value * e1, Value * e2, Value * carryin) {
@@ -535,20 +535,19 @@ Value * IDISA_AVX2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_v
     }
     if (getVectorBitWidth(a) == AVX_width && (fw == 8)) {
         // x86_avx2_pshuf_b shuffles within 128 bit lanes, zeroing if the high bit is set.
-        constexpr unsigned fieldCount = 256 / 8;
-        
+        constexpr unsigned fieldCount = AVX_width / 8;
+        Value * mask = getSplat(fieldCount, getInt8(fieldCount - 1));
+        Value * base_index = simd_and(index_vector, mask);
+        Value * over = nullptr;
         if (mode == ShuffleMode::TruncateIndex) {
-            // Clear high bits
-            index_vector = simd_and(index_vector, getSplat(fieldCount, getInt8(fieldCount - 1)));
+            over = allZeroes();
         } else if (mode == ShuffleMode::ZeroOnIndexOver) {
-            Value * over = simd_ugt(fw, index_vector, getSplat(fieldCount, getInt8(fieldCount - 1)));
-            index_vector = simd_or(index_vector, over);
+            over = simd_ugt(fw, index_vector, mask);
+        } else { // ZeroOnHighBit
+            over = simd_uge(fw, index_vector, getSplat(fieldCount, getInt8(1<<7)));
         }
-        
-        IntegerType * const int8Ty = getInt8Ty();
-        
-        Constant * SIXTEEN = getSplat(fieldCount, ConstantInt::get(int8Ty, 16));
-        
+
+        Value * const a64 = fwCast(64, a);
         auto createShuffleVec = [&](int a, int b, int c, int d) {
             FixedArray<Constant *, 4> idx;
             idx[0] = getInt32(a);
@@ -557,26 +556,18 @@ Value * IDISA_AVX2_Builder::mvmd_shuffle(unsigned fw, Value * a, Value * index_v
             idx[3] = getInt32(d);
             return ConstantVector::get(idx);
         };
-        
-        FixedVectorType * vec64Ty = FixedVectorType::get(getInt64Ty(), 256 / 64);
+        Value * lane_switched = fwCast(8, CreateShuffleVector(a64, a64, createShuffleVec(2, 3, 0, 1)));
+
         Function * shufFunc = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::x86_avx2_pshuf_b);
-        Value * const a64 = CreateBitCast(a, vec64Ty);
-        FixedVectorType * vecTy = FixedVectorType::get(int8Ty, 256 / 8);
-        index_vector = CreateBitCast(index_vector, vecTy);
-        
-        FixedArray<Value *, 2> args;
-        Value * a0 = CreateShuffleVector(a64, UndefValue::get(vec64Ty), createShuffleVec(0, 1, 0, 1));
-        args[0] = CreateBitCast(a0, vecTy);
-        args[1] = CreateOr(index_vector, CreateSExt(CreateICmpUGE(index_vector, SIXTEEN), vecTy));
-        Value * a1 = CreateCall(shufFunc->getFunctionType(), shufFunc, args);
-        assert (a1->getType() == vecTy);
-        Value * b0 = CreateShuffleVector(a64, UndefValue::get(vec64Ty), createShuffleVec(2, 3, 2, 3));
-        assert (b0->getType() == vec64Ty);
-        args[0] = CreateBitCast(b0, vecTy);
-        args[1] = CreateSub(index_vector, SIXTEEN); // sets sign bit automatically if selected in a0
-        Value * b1 = CreateCall(shufFunc->getFunctionType(), shufFunc, args);
-        assert (b1->getType() == vecTy);
-        return CreateOr(a1, b1);
+        index_vector = fwCast(8, simd_or(base_index, over));
+        Value * shuffled_from_lane = CreateCall(shufFunc->getFunctionType(), shufFunc, {fwCast(8,a), index_vector});
+        Value * shuffled_from_other_lane = CreateCall(shufFunc->getFunctionType(), shufFunc, {lane_switched, index_vector});
+
+        Constant * hi_lane = Constant::getIntegerValue(getIntNTy(AVX_width), APInt::getHighBitsSet(AVX_width, AVX_width/2));
+        Value * select_hi_lane = simd_uge(8, base_index, getSplat(fieldCount, getInt8(fieldCount/2)));
+        Value * select_other_lane = simd_xor(select_hi_lane, hi_lane);
+        Value * rslt = simd_if(8, select_other_lane, shuffled_from_other_lane, shuffled_from_lane);
+        return rslt;
     }
     return IDISA_Builder::mvmd_shuffle(fw, a, index_vector, mode);
 }
@@ -815,7 +806,7 @@ Value * IDISA_AVX512F_Builder::hsimd_packss(unsigned fw, Value * a, Value * b) {
         return CreateShuffleVector(fwCast(64, packed), UndefValue::get(fwVectorType(64)), shuffleMask);
     }
     // Otherwise use default logic.
-    return IDISA_Builder::hsimd_packus(fw, a, b);
+    return IDISA_Builder::hsimd_packss(fw, a, b);
 }
 
 Value * IDISA_AVX512F_Builder::mvmd_srl(unsigned fw, Value * a, Value * shift, const bool safe) {

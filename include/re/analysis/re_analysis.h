@@ -30,6 +30,8 @@ bool hasReference(const RE * r);
 
 bool hasCodepointReference(const RE * r);
 
+bool hasPropertyReference(const RE * r);
+
 bool isTypeForLocal(const RE * re);
     
 bool hasAssertion(const RE * re);

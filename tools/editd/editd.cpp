@@ -20,8 +20,8 @@
 #include <kernel/core/streamset.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/streamutils/streams_merge.h>
-#include <pablo/pablo_compiler.h>
-#include <pablo/pablo_kernel.h>
+#include <pablo/compiler/pablo_compiler.h>
+#include <pablo/pablo.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
 #include <re/cc/cc_kernel.h>
@@ -299,6 +299,16 @@ void wrapped_report_pos(size_t match_pos, int dist) {
 typedef void (*editdFunctionType)(const StreamSetPtr & chStream);
 
 void editdPipeline(ProgramBuilder & P, const std::vector<std::string> & patterns, StreamSet * const ChStream) {
+    // The pipeline's auto-computed signature deliberately excludes family-called sub-kernel
+    // content (it assumes such kernels are bound at runtime, so the parent's compiled code
+    // can be shared regardless of which family kernel is bound). That assumption doesn't hold
+    // here: PatternKernel is constructed *inline* by this very call, with these specific
+    // patterns baked directly into its compiled pablo logic, so two calls with different
+    // patterns produce genuinely different compiled code. Without a unique signature, separate
+    // editdPipeline() compiles for different pattern groups collide on the same dedup key and
+    // JIT symbol name, so a later group's compiled pipeline is silently discarded in favour of
+    // an earlier group's -- see nested_grep_engine.cpp's setUniqueName() for the same pattern.
+    P.setUniqueName("editd_" + Kernel::getStringHash(createName(patterns)));
     StreamSet * const MatchResults = P.CreateStreamSet(editDistance + 1);
     P.CreateKernelFamilyCall<PatternKernel>(patterns, ChStream, MatchResults);
     Kernel * const scan = P.CreateKernelCall<editdScanKernel>(MatchResults);

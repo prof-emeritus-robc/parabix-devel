@@ -1,4 +1,4 @@
-import csv, sys, subprocess, filecmp;
+import csv, sys, subprocess, filecmp, os, shlex;
 
 def perf_stat_counts(filename, perf_counters):
     src = open(filename)
@@ -23,7 +23,12 @@ def run_with_perf_stat(program_under_test, args, perf_counters):
 class PerformanceTester:
     def __init__(self, program_under_test, fixed_flags = []):
         self.PUT = program_under_test
-        self.fixed_flags = fixed_flags
+        # TEST_FLAGS lets a whole sweep be re-run under a different backend/setting
+        # (e.g. TEST_FLAGS="--use-mcjit" python3 NFD_perf.py) without editing the script;
+        # applied to every invocation of the program under test, both the baseline
+        # (expected-output) run and every performance-combination run, so functional
+        # comparisons between them stay apples-to-apples.
+        self.fixed_flags = fixed_flags + shlex.split(os.environ.get('TEST_FLAGS', ''))
         self.functional_keys =[]
         self.performance_parms =[]
         self.positional_parameter_list = []

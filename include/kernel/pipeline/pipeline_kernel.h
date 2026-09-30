@@ -129,6 +129,14 @@ public:
 
     llvm::Function * addOrDeclareMainFunction(KernelBuilder & b, const MainMethodGenerationType method) const final;
 
+private:
+    // KernelBuilder::setCompiler is protected, with friendship granted to PipelineKernel
+    // specifically so this wrapper can bracket it around addOrDeclareMainFunction (see
+    // its definition for why that's needed); a struct local to that function can't use
+    // the friendship directly since it isn't itself a PipelineKernel member.
+    void setBuilderCompiler(KernelBuilder & b, KernelCompiler * const compiler) const;
+public:
+
     PipelinePhaseBoundary * InsertPhaseBoundary() {
         auto boundary = std::make_unique<PipelinePhaseBoundary>();
         auto ptr = boundary.get();

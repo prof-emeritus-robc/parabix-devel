@@ -232,8 +232,11 @@ def run_idisa_exerciser(exerciser_path,
         cmd.append(f"--output={str(output_path)}")
     if ir_path is not None:
         cmd.append(f"--ShowIR={str(ir_path)}")
+        cmd.append(f"--ToShow=test_{operation}_{field_width}")
     if unopt_ir_path is not None:
         cmd.append(f"--ShowUnoptimizedIR={str(unopt_ir_path)}")
+        if ir_path is None:
+            cmd.append(f"--ToShow=test_{operation}_{field_width}")
     if asm_path is not None:
         cmd.append(f"--ShowASM={str(asm_path)}")
     cmd += [str(arg) for arg in extra_args]

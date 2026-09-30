@@ -13,8 +13,7 @@
 #include <re/unicode/resolve_properties.h>
 #include <ucd/utf/utf_compiler.h>
 #include <kernel/core/kernel_builder.h>
-#include <pablo/builder.hpp>
-#include <pablo/pe_zeroes.h>
+#include <pablo/pablo.h>
 #include <llvm/Support/ErrorHandling.h>
 
 using namespace kernel;

@@ -197,16 +197,16 @@ const static UnicodeSet::run_t __kangXi_11_runs[] = {
     {Empty, 421}, {Mixed, 1}, {Empty, 229}, {Mixed, 1}, {Empty, 213},
     {Mixed, 1}, {Empty, 129}, {Mixed, 1}, {Empty, 999}, {Mixed, 1},
     {Empty, 7}, {Mixed, 1}, {Empty, 2106}, {Mixed, 1}, {Empty, 9},
-    {Mixed, 1}, {Empty, 13}, {Mixed, 1}, {Full, 1}, {Empty, 1300},
-    {Mixed, 1}, {Empty, 140}, {Mixed, 1}, {Empty, 183}, {Mixed, 2},
-    {Empty, 221}, {Mixed, 1}, {Empty, 95}, {Mixed, 1}, {Empty, 69},
-    {Mixed, 1}, {Empty, 152}, {Mixed, 1}, {Empty, 131}, {Mixed, 1},
-    {Empty, 28380}};
+    {Mixed, 1}, {Empty, 13}, {Mixed, 2}, {Empty, 1300}, {Mixed, 1},
+    {Empty, 140}, {Mixed, 1}, {Empty, 183}, {Mixed, 2}, {Empty, 221},
+    {Mixed, 1}, {Empty, 95}, {Mixed, 1}, {Empty, 69}, {Mixed, 1},
+    {Empty, 152}, {Mixed, 1}, {Empty, 131}, {Mixed, 1}, {Empty, 28380}};
     const static UnicodeSet::bitquad_t __kangXi_11_quads[] = {
     0x001f0000, 0x000007e0, 0x20000000, 0x00100000, 0x01000000, 0x00040000,
-    0x00040000, 0x00000040, 0xf8000000, 0x00000080, 0x00000600, 0xf8000000,
-    0x0000000f, 0x00000008, 0x00100000, 0x1fc00000, 0x00060000, 0x3c001000};
-    const static UnicodeSet kangXi_11{__kangXi_11_runs, 36, __kangXi_11_quads, 18};
+    0x00040000, 0x00000040, 0xf8000000, 0xfffbffff, 0x00000080, 0x00000600,
+    0xf8000000, 0x0000000f, 0x00000008, 0x00100000, 0x1fc00000, 0x00060000,
+    0x3c001000};
+    const static UnicodeSet kangXi_11{__kangXi_11_runs, 35, __kangXi_11_quads, 19};
 const static UnicodeSet::run_t __kangXi_110_runs[] = {
     {Empty, 516}, {Mixed, 1}, {Empty, 441}, {Mixed, 2}, {Empty, 3163},
     {Mixed, 1}, {Empty, 276}, {Mixed, 1}, {Empty, 361}, {Mixed, 1},
@@ -385,7 +385,7 @@ const static UnicodeSet::run_t __kangXi_12_runs[] = {
     const static UnicodeSet::bitquad_t __kangXi_12_quads[] = {
     0x03e00000, 0xfffff800, 0x00000003, 0x80000000, 0x00000040, 0x02000000,
     0x00020000, 0x00200000, 0x10000000, 0xfeffff7f, 0x0ffbffff, 0x00400000,
-    0x08000000, 0x00003f00, 0x007ff800, 0x00000084, 0x7ffffff0, 0x000e0000,
+    0x08000000, 0x00003f00, 0x007ff800, 0x00000084, 0x7dfdeff0, 0x000e0000,
     0x08000000, 0xe0000000, 0x0000003f, 0x01f80000, 0xc0000000, 0x0000000f,
     0x00200000};
     const static UnicodeSet kangXi_12{__kangXi_12_runs, 43, __kangXi_12_quads, 25};
@@ -464,7 +464,7 @@ const static UnicodeSet::run_t __kangXi_123_runs[] = {
     const static UnicodeSet::bitquad_t __kangXi_123_quads[] = {
     0x3fffff80, 0x08000000, 0x00000001, 0xfffffc00, 0x1fffffff, 0x00008000,
     0x00000400, 0x00400000, 0x40000000, 0x00000200, 0xfffff800, 0xffffffdf,
-    0x0003ffff, 0xffffc000, 0x00000003, 0x00000100, 0xfffff000, 0x00000007,
+    0x0003ffff, 0xfeffc000, 0x00000003, 0x00000100, 0xfffff000, 0x00000007,
     0x00fffffc, 0x01000000, 0x1f800000, 0x007ffe00, 0x00002000, 0x0001fff0};
     const static UnicodeSet kangXi_123{__kangXi_123_runs, 41, __kangXi_123_quads, 24};
 const static UnicodeSet::run_t __kangXi_124_runs[] = {
@@ -562,8 +562,8 @@ const static UnicodeSet::run_t __kangXi_130_runs[] = {
     {Mixed, 1}, {Empty, 3}, {Mixed, 1}, {Empty, 266}, {Mixed, 2}, {Full, 2},
     {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Full, 8}, {Mixed, 1}, {Full, 3},
     {Mixed, 1}, {Empty, 581}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
-    {Empty, 42}, {Mixed, 1}, {Empty, 4}, {Mixed, 1}, {Empty, 69},
-    {Mixed, 1}, {Empty, 48}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
+    {Empty, 42}, {Mixed, 1}, {Empty, 4}, {Mixed, 1}, {Empty, 68},
+    {Mixed, 2}, {Empty, 48}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
     {Empty, 224}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 74},
     {Mixed, 1}, {Empty, 6}, {Mixed, 1}, {Empty, 89}, {Mixed, 1}, {Empty, 5},
     {Mixed, 1}, {Empty, 142}, {Mixed, 1}, {Full, 3}, {Mixed, 1},
@@ -575,11 +575,11 @@ const static UnicodeSet::run_t __kangXi_130_runs[] = {
     0x00020000, 0x00000022, 0xfffffe00, 0xffffffef, 0x00000007, 0x00000040,
     0x00080000, 0x10000000, 0x00018100, 0x00000008, 0x00008000, 0xfffffe00,
     0xff7fffff, 0xfdffffff, 0xfff7ffff, 0xff3fffff, 0x1fffffff, 0xffc00000,
-    0x00000017, 0x40400000, 0x00000400, 0x00000001, 0xffff8000, 0x00000003,
-    0xffffff80, 0x00000fff, 0x00000800, 0x00300000, 0x00c00000, 0x000001be,
-    0xc0000000, 0x00003fff, 0x0000007f, 0x00000001, 0x00800000, 0xffffffe0,
-    0x0000000f, 0x08000000};
-    const static UnicodeSet kangXi_130{__kangXi_130_runs, 84, __kangXi_130_quads, 44};
+    0x00000017, 0x40400000, 0x00000400, 0x08000000, 0x00000001, 0xffff8000,
+    0x00000003, 0xffffff80, 0x00000fff, 0x00000800, 0x00300000, 0x00c00000,
+    0x000001be, 0xc0000000, 0x00003fff, 0x0000007f, 0x00000001, 0x00800000,
+    0xffffffe0, 0x0000000f, 0x08000000};
+    const static UnicodeSet kangXi_130{__kangXi_130_runs, 84, __kangXi_130_quads, 45};
 const static UnicodeSet::run_t __kangXi_131_runs[] = {
     {Empty, 546}, {Mixed, 1}, {Empty, 120}, {Mixed, 1}, {Empty, 371},
     {Mixed, 1}, {Empty, 959}, {Mixed, 1}, {Empty, 2934}, {Mixed, 2},
@@ -595,11 +595,11 @@ const static UnicodeSet::run_t __kangXi_132_runs[] = {
     {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 580}, {Mixed, 1},
     {Empty, 168}, {Mixed, 1}, {Empty, 226}, {Mixed, 1}, {Empty, 81},
     {Mixed, 1}, {Empty, 242}, {Mixed, 1}, {Empty, 153}, {Mixed, 1},
-    {Empty, 124}, {Mixed, 1}, {Empty, 28297}};
+    {Empty, 48}, {Mixed, 1}, {Empty, 75}, {Mixed, 1}, {Empty, 28297}};
     const static UnicodeSet::bitquad_t __kangXi_132_quads[] = {
     0x0007fc00, 0x10000000, 0xfe000000, 0x0007ffff, 0x00003c00, 0x0001f000,
-    0xfff00000, 0x00400000, 0x00f00000, 0x00000100, 0x000000c0};
-    const static UnicodeSet kangXi_132{__kangXi_132_runs, 23, __kangXi_132_quads, 11};
+    0xfff00000, 0x00400000, 0x00f00000, 0x00000100, 0x00000200, 0x000000c0};
+    const static UnicodeSet kangXi_132{__kangXi_132_runs, 25, __kangXi_132_quads, 12};
 const static UnicodeSet::run_t __kangXi_133_runs[] = {
     {Empty, 546}, {Mixed, 1}, {Empty, 492}, {Mixed, 1}, {Empty, 3897},
     {Mixed, 2}, {Empty, 579}, {Mixed, 1}, {Empty, 168}, {Mixed, 1},
@@ -700,10 +700,10 @@ const static UnicodeSet::run_t __kangXi_140_runs[] = {
     {Empty, 74}, {Mixed, 1}, {Empty, 49}, {Mixed, 1}, {Empty, 2},
     {Mixed, 1}, {Empty, 18}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 4},
     {Mixed, 1}, {Empty, 144}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 3},
-    {Mixed, 1}, {Empty, 29}, {Mixed, 1}, {Empty, 23}, {Mixed, 1},
-    {Empty, 4}, {Mixed, 1}, {Empty, 25}, {Mixed, 1}, {Empty, 31},
-    {Mixed, 1}, {Full, 4}, {Mixed, 1}, {Empty, 24}, {Mixed, 1},
-    {Empty, 28266}};
+    {Mixed, 1}, {Empty, 29}, {Mixed, 1}, {Empty, 8}, {Mixed, 1},
+    {Empty, 14}, {Mixed, 1}, {Empty, 4}, {Mixed, 1}, {Empty, 25},
+    {Mixed, 1}, {Empty, 31}, {Mixed, 1}, {Full, 4}, {Mixed, 1}, {Empty, 24},
+    {Mixed, 1}, {Empty, 28266}};
     const static UnicodeSet::bitquad_t __kangXi_140_quads[] = {
     0xfffe0000, 0x000000ff, 0x00080000, 0x80000000, 0xff000000, 0x00001fff,
     0x00004000, 0x80800200, 0x000c0401, 0x00000040, 0x81010000, 0x40200008,
@@ -712,9 +712,9 @@ const static UnicodeSet::run_t __kangXi_140_runs[] = {
     0xffffff7f, 0x07ffffbf, 0xffffffe0, 0x1fffffff, 0x007ff000, 0x0000007f,
     0x80000000, 0x80000000, 0x007fffff, 0xf8000000, 0x03ffffff, 0xfffb8000,
     0x0007f7ff, 0x00000001, 0x40000000, 0x00800000, 0xf0000000, 0x00ffffff,
-    0x00008000, 0xfffff800, 0x00003fff, 0x00400000, 0x00000200, 0x02000000,
-    0x00000010, 0x00000400, 0xffff8000, 0x00000001, 0x00004000};
-    const static UnicodeSet kangXi_140{__kangXi_140_runs, 84, __kangXi_140_quads, 53};
+    0x00008000, 0xfffff800, 0x00003fff, 0x00400000, 0x00000200, 0x00000004,
+    0x02000000, 0x00000010, 0x00000400, 0xffff8000, 0x00000001, 0x00004000};
+    const static UnicodeSet kangXi_140{__kangXi_140_runs, 86, __kangXi_140_quads, 54};
 const static UnicodeSet::run_t __kangXi_141_runs[] = {
     {Empty, 556}, {Mixed, 1}, {Empty, 206}, {Mixed, 1}, {Empty, 310},
     {Mixed, 2}, {Empty, 130}, {Mixed, 1}, {Empty, 786}, {Mixed, 1},
@@ -900,15 +900,15 @@ const static UnicodeSet::run_t __kangXi_151_runs[] = {
     {Mixed, 1}, {Empty, 712}, {Mixed, 1}, {Empty, 2273}, {Mixed, 1},
     {Empty, 819}, {Mixed, 2}, {Full, 1}, {Mixed, 1}, {Empty, 442},
     {Mixed, 1}, {Empty, 172}, {Mixed, 1}, {Empty, 232}, {Mixed, 1},
-    {Empty, 59}, {Mixed, 1}, {Empty, 253}, {Mixed, 2}, {Empty, 150},
-    {Mixed, 2}, {Empty, 126}, {Mixed, 1}, {Empty, 18}, {Mixed, 1},
-    {Empty, 28264}};
+    {Empty, 59}, {Mixed, 1}, {Empty, 160}, {Mixed, 1}, {Empty, 92},
+    {Mixed, 2}, {Empty, 150}, {Mixed, 2}, {Empty, 126}, {Mixed, 1},
+    {Empty, 18}, {Mixed, 1}, {Empty, 28264}};
     const static UnicodeSet::bitquad_t __kangXi_151_quads[] = {
     0xfff80000, 0x0000001f, 0x001fffc0, 0x00040000, 0x00000001, 0x00000040,
     0xfc000000, 0xffffff7f, 0x0000003f, 0x00000018, 0x07c00000, 0x03fc0000,
-    0x00000800, 0xff800000, 0x0000000f, 0xe0000000, 0x00000001, 0x00000078,
-    0x00100000};
-    const static UnicodeSet kangXi_151{__kangXi_151_runs, 31, __kangXi_151_quads, 19};
+    0x00000800, 0x80000000, 0xff800000, 0x0000000f, 0xe0000000, 0x00000001,
+    0x00000078, 0x00100000};
+    const static UnicodeSet kangXi_151{__kangXi_151_runs, 33, __kangXi_151_quads, 20};
 const static UnicodeSet::run_t __kangXi_152_runs[] = {
     {Empty, 570}, {Mixed, 1}, {Empty, 551}, {Mixed, 2}, {Empty, 3965},
     {Mixed, 1}, {Full, 3}, {Empty, 439}, {Mixed, 1}, {Empty, 172},
@@ -951,13 +951,13 @@ const static UnicodeSet::run_t __kangXi_154s_runs[] = {
     {Empty, 572}, {Mixed, 1}, {Empty, 555}, {Mixed, 1}, {Full, 2},
     {Mixed, 1}, {Empty, 3974}, {Mixed, 1}, {Empty, 426}, {Mixed, 1},
     {Empty, 173}, {Mixed, 2}, {Empty, 289}, {Mixed, 1}, {Empty, 255},
-    {Mixed, 2}, {Empty, 149}, {Mixed, 2}, {Empty, 126}, {Mixed, 1},
-    {Empty, 28282}};
+    {Mixed, 2}, {Empty, 51}, {Mixed, 1}, {Empty, 97}, {Mixed, 2},
+    {Empty, 126}, {Mixed, 1}, {Empty, 28282}};
     const static UnicodeSet::bitquad_t __kangXi_154s_quads[] = {
     0x0001f000, 0xe0000000, 0x0000000f, 0x00fe0000, 0x00001fc0, 0xfff80000,
-    0x00000001, 0x0001f000, 0xc0000000, 0x00007fff, 0xfc000000, 0x0000007f,
-    0x00001800};
-    const static UnicodeSet kangXi_154s{__kangXi_154s_runs, 21, __kangXi_154s_quads, 13};
+    0x00000001, 0x0001f000, 0xc0000000, 0x00007fff, 0x00000020, 0xfc000000,
+    0x0000007f, 0x00001800};
+    const static UnicodeSet kangXi_154s{__kangXi_154s_runs, 23, __kangXi_154s_quads, 14};
 const static UnicodeSet::run_t __kangXi_155_runs[] = {
     {Empty, 572}, {Mixed, 1}, {Empty, 558}, {Mixed, 1}, {Empty, 3974},
     {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 424}, {Mixed, 1},
@@ -1506,21 +1506,21 @@ const static UnicodeSet::run_t __kangXi_186_runs[] = {
     0x00000007};
     const static UnicodeSet kangXi_186{__kangXi_186_runs, 29, __kangXi_186_quads, 19};
 const static UnicodeSet::run_t __kangXi_187_runs[] = {
-    {Empty, 603}, {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Empty, 619},
-    {Mixed, 1}, {Empty, 2}, {Mixed, 1}, {Full, 5}, {Mixed, 1}, {Empty, 41},
-    {Mixed, 1}, {Empty, 714}, {Mixed, 1}, {Empty, 3}, {Mixed, 1},
-    {Empty, 3318}, {Mixed, 1}, {Full, 11}, {Mixed, 1}, {Empty, 224},
-    {Mixed, 1}, {Empty, 15}, {Mixed, 1}, {Empty, 166}, {Mixed, 1},
-    {Empty, 235}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 28},
-    {Mixed, 1}, {Empty, 93}, {Mixed, 1}, {Empty, 183}, {Mixed, 2},
-    {Empty, 141}, {Mixed, 2}, {Empty, 119}, {Mixed, 1}, {Empty, 7},
-    {Mixed, 1}, {Empty, 5}, {Mixed, 1}, {Empty, 28257}};
+    {Empty, 603}, {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Empty, 622},
+    {Mixed, 1}, {Full, 5}, {Mixed, 1}, {Empty, 41}, {Mixed, 1},
+    {Empty, 714}, {Mixed, 1}, {Empty, 3}, {Mixed, 1}, {Empty, 3318},
+    {Mixed, 1}, {Full, 11}, {Mixed, 1}, {Empty, 224}, {Mixed, 1},
+    {Empty, 15}, {Mixed, 1}, {Empty, 166}, {Mixed, 1}, {Empty, 235},
+    {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 28}, {Mixed, 1}, {Empty, 93},
+    {Mixed, 1}, {Empty, 183}, {Mixed, 2}, {Empty, 141}, {Mixed, 2},
+    {Empty, 119}, {Mixed, 1}, {Empty, 7}, {Mixed, 1}, {Empty, 5},
+    {Mixed, 1}, {Empty, 28257}};
     const static UnicodeSet::bitquad_t __kangXi_187_quads[] = {
-    0xfff00000, 0x00000007, 0x80000000, 0xfffff000, 0x00000fff, 0x00006000,
-    0x04000000, 0x00000080, 0xffffff80, 0x0000003f, 0x07ffffe0, 0x00000200,
-    0x0007ff00, 0xfffc0000, 0x00000001, 0x00000002, 0x000000c0, 0xfffe0000,
-    0x0fffffff, 0xfff80000, 0x0000000f, 0x02000000, 0x001ffff8, 0x00800000};
-    const static UnicodeSet kangXi_187{__kangXi_187_runs, 45, __kangXi_187_quads, 24};
+    0xfff00000, 0x00000007, 0xfffff000, 0x00000fff, 0x00006000, 0x04000000,
+    0x00000080, 0xffffff80, 0x0000003f, 0x07ffffe0, 0x00000200, 0x0007ff00,
+    0xfffc0000, 0x00000001, 0x00000002, 0x000000c0, 0xfffe0000, 0x0fffffff,
+    0xfff80000, 0x0000000f, 0x02000000, 0x001ffff8, 0x00800000};
+    const static UnicodeSet kangXi_187{__kangXi_187_runs, 43, __kangXi_187_quads, 23};
 const static UnicodeSet::run_t __kangXi_187s_runs[] = {
     {Empty, 606}, {Mixed, 1}, {Empty, 628}, {Mixed, 1}, {Full, 1},
     {Mixed, 1}, {Empty, 4089}, {Mixed, 2}, {Empty, 223}, {Mixed, 2},
@@ -1653,21 +1653,21 @@ const static UnicodeSet::run_t __kangXi_196_runs[] = {
     {Empty, 613}, {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Empty, 406},
     {Mixed, 1}, {Empty, 231}, {Mixed, 1}, {Full, 8}, {Mixed, 1},
     {Empty, 13}, {Mixed, 1}, {Empty, 714}, {Mixed, 1}, {Empty, 7},
-    {Mixed, 1}, {Empty, 2986}, {Mixed, 1}, {Empty, 48}, {Mixed, 1},
-    {Empty, 254}, {Mixed, 1}, {Empty, 79}, {Mixed, 1}, {Full, 17},
-    {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 162}, {Mixed, 2}, {Empty, 9},
-    {Mixed, 1}, {Empty, 172}, {Mixed, 3}, {Empty, 233}, {Mixed, 1},
-    {Full, 1}, {Mixed, 1}, {Empty, 116}, {Mixed, 1}, {Empty, 191},
-    {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 135}, {Mixed, 2},
-    {Empty, 12}, {Mixed, 1}, {Empty, 116}, {Mixed, 1}, {Full, 2},
-    {Empty, 28256}};
+    {Mixed, 1}, {Empty, 2880}, {Mixed, 1}, {Empty, 105}, {Mixed, 1},
+    {Empty, 48}, {Mixed, 1}, {Empty, 254}, {Mixed, 1}, {Empty, 79},
+    {Mixed, 1}, {Full, 17}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 162},
+    {Mixed, 2}, {Empty, 9}, {Mixed, 1}, {Empty, 172}, {Mixed, 3},
+    {Empty, 233}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 116},
+    {Mixed, 1}, {Empty, 191}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
+    {Empty, 135}, {Mixed, 2}, {Empty, 12}, {Mixed, 1}, {Empty, 116},
+    {Mixed, 1}, {Full, 2}, {Empty, 28256}};
     const static UnicodeSet::bitquad_t __kangXi_196_quads[] = {
     0xffffffe0, 0x0007ffff, 0x00200000, 0xffffffe0, 0x7fffffff, 0x00000004,
-    0x04000001, 0x00002000, 0x00000200, 0x00000001, 0x00100000, 0xffff8000,
-    0xbfffffff, 0x00000001, 0xffffc000, 0x03ffffff, 0x00380000, 0xf0000000,
-    0xffdfffff, 0x07ffffff, 0xffffffe0, 0x00000001, 0x000ff000, 0xe0000000,
-    0x0000007f, 0xfc000000, 0x000007ff, 0x00000001, 0xffffffc0};
-    const static UnicodeSet kangXi_196{__kangXi_196_runs, 52, __kangXi_196_quads, 29};
+    0x04000001, 0x00002000, 0x00080000, 0x00000200, 0x00000001, 0x00100000,
+    0xffff8000, 0xbfffffff, 0x00000001, 0xffffc000, 0x03ffffff, 0x00380000,
+    0xf0000000, 0xffdfffff, 0x07ffffff, 0xffffffe0, 0x00000001, 0x000ff000,
+    0xe0000000, 0x0000007f, 0xfc000000, 0x000007ff, 0x00000001, 0xffffffc0};
+    const static UnicodeSet kangXi_196{__kangXi_196_runs, 54, __kangXi_196_quads, 30};
 const static UnicodeSet::run_t __kangXi_196s_runs[] = {
     {Empty, 616}, {Mixed, 1}, {Empty, 436}, {Mixed, 1}, {Empty, 210},
     {Mixed, 1}, {Full, 2}, {Mixed, 1}, {Empty, 11}, {Mixed, 1},
@@ -1897,17 +1897,18 @@ const static UnicodeSet::run_t __kangXi_210s_runs[] = {
     const static UnicodeSet kangXi_210s{__kangXi_210s_runs, 7, __kangXi_210s_quads, 3};
 const static UnicodeSet::run_t __kangXi_211_runs[] = {
     {Empty, 620}, {Mixed, 2}, {Empty, 652}, {Mixed, 2}, {Empty, 2848},
-    {Mixed, 1}, {Empty, 431}, {Mixed, 1}, {Empty, 865}, {Mixed, 3},
-    {Full, 3}, {Mixed, 1}, {Empty, 132}, {Mixed, 1}, {Empty, 6}, {Mixed, 1},
-    {Empty, 178}, {Mixed, 1}, {Empty, 233}, {Mixed, 2}, {Empty, 113},
-    {Mixed, 1}, {Empty, 199}, {Mixed, 2}, {Empty, 131}, {Mixed, 1},
-    {Empty, 133}, {Mixed, 1}, {Empty, 28252}};
+    {Mixed, 1}, {Empty, 431}, {Mixed, 1}, {Empty, 503}, {Mixed, 1},
+    {Empty, 361}, {Mixed, 3}, {Full, 3}, {Mixed, 1}, {Empty, 132},
+    {Mixed, 1}, {Empty, 6}, {Mixed, 1}, {Empty, 178}, {Mixed, 1},
+    {Empty, 233}, {Mixed, 2}, {Empty, 113}, {Mixed, 1}, {Empty, 199},
+    {Mixed, 2}, {Empty, 131}, {Mixed, 1}, {Empty, 133}, {Mixed, 1},
+    {Empty, 28252}};
     const static UnicodeSet::bitquad_t __kangXi_211_quads[] = {
     0xfff00000, 0x00000fff, 0xfffc0000, 0x7ffffffb, 0x10000000, 0x00000c00,
-    0xfff00000, 0xfffdffff, 0xfbfffffb, 0x00007fff, 0x000000e0, 0x0a000000,
-    0x03e00000, 0xa0000000, 0x01ffa657, 0x20000000, 0xfc000000, 0x000001ff,
-    0x0000007c, 0x00003e00};
-    const static UnicodeSet kangXi_211{__kangXi_211_runs, 29, __kangXi_211_quads, 20};
+    0x80000000, 0xfff00000, 0xfffdffff, 0xfbfffffb, 0x00007fff, 0x000000e0,
+    0x0a000000, 0x03e00000, 0xa0000000, 0x01ffa657, 0x20000000, 0xfc000000,
+    0x000001ff, 0x0000007c, 0x00003e00};
+    const static UnicodeSet kangXi_211{__kangXi_211_runs, 31, __kangXi_211_quads, 21};
 const static UnicodeSet::run_t __kangXi_211s_runs[] = {
     {Empty, 1275}, {Mixed, 2}, {Empty, 4151}, {Mixed, 1}, {Empty, 132},
     {Mixed, 1}, {Empty, 6}, {Mixed, 1}, {Empty, 178}, {Mixed, 2},
@@ -1968,34 +1969,36 @@ const static UnicodeSet::run_t __kangXi_22_runs[] = {
     {Empty, 28377}};
     const static UnicodeSet::bitquad_t __kangXi_22_quads[] = {
     0x007f8000, 0xfc000000, 0x00ffffff, 0x00000100, 0xfffbf000, 0xfffffff7,
-    0x00001fff, 0x0007f000, 0x3ffff800, 0x7ff00000, 0x000003f0, 0x000003c0,
+    0x00001fff, 0x0007b000, 0x3ffff800, 0x7ff00000, 0x000003f0, 0x000003c0,
     0x0c000000};
     const static UnicodeSet kangXi_22{__kangXi_22_runs, 21, __kangXi_22_quads, 13};
 const static UnicodeSet::run_t __kangXi_23_runs[] = {
     {Empty, 425}, {Mixed, 1}, {Empty, 239}, {Mixed, 2}, {Empty, 1332},
-    {Mixed, 1}, {Empty, 2169}, {Mixed, 3}, {Empty, 1598}, {Mixed, 1},
-    {Empty, 384}, {Mixed, 1}, {Empty, 150}, {Mixed, 1}, {Empty, 28509}};
+    {Mixed, 1}, {Empty, 2169}, {Mixed, 3}, {Empty, 1267}, {Mixed, 1},
+    {Empty, 330}, {Mixed, 1}, {Empty, 384}, {Mixed, 1}, {Empty, 150},
+    {Mixed, 1}, {Empty, 28509}};
     const static UnicodeSet::bitquad_t __kangXi_23_quads[] = {
     0x01800000, 0xff000000, 0x00000001, 0x00000800, 0x00040000, 0x00000008,
-    0x07ffe000, 0x80000000, 0x00001c00, 0x00003c00};
-    const static UnicodeSet kangXi_23{__kangXi_23_runs, 15, __kangXi_23_quads, 10};
+    0x07ffe000, 0x00004000, 0x80000000, 0x00001c00, 0x00003c00};
+    const static UnicodeSet kangXi_23{__kangXi_23_runs, 17, __kangXi_23_quads, 11};
 const static UnicodeSet::run_t __kangXi_24_runs[] = {
     {Empty, 425}, {Mixed, 1}, {Empty, 240}, {Mixed, 1}, {Empty, 195},
     {Mixed, 1}, {Empty, 88}, {Mixed, 1}, {Empty, 6}, {Mixed, 1},
     {Empty, 318}, {Mixed, 1}, {Empty, 723}, {Mixed, 1}, {Empty, 2107},
     {Mixed, 1}, {Empty, 61}, {Mixed, 1}, {Full, 2}, {Mixed, 1},
     {Empty, 380}, {Mixed, 1}, {Empty, 883}, {Mixed, 1}, {Empty, 122},
-    {Mixed, 1}, {Empty, 19}, {Mixed, 2}, {Empty, 187}, {Mixed, 1},
-    {Empty, 212}, {Mixed, 1}, {Empty, 96}, {Mixed, 1}, {Empty, 73},
-    {Mixed, 2}, {Empty, 149}, {Mixed, 1}, {Empty, 131}, {Mixed, 2},
-    {Empty, 50}, {Mixed, 1}, {Empty, 9}, {Mixed, 1}, {Empty, 28315}};
+    {Mixed, 1}, {Empty, 19}, {Mixed, 2}, {Empty, 178}, {Mixed, 1},
+    {Empty, 8}, {Mixed, 1}, {Empty, 212}, {Mixed, 1}, {Empty, 96},
+    {Mixed, 1}, {Empty, 73}, {Mixed, 2}, {Empty, 149}, {Mixed, 1},
+    {Empty, 131}, {Mixed, 2}, {Empty, 50}, {Mixed, 1}, {Empty, 9},
+    {Mixed, 1}, {Empty, 28315}};
     const static UnicodeSet::bitquad_t __kangXi_24_quads[] = {
     0x1e000000, 0x0ffffffe, 0x00200000, 0x00100000, 0x00800000, 0x04000000,
     0x00200000, 0x00020000, 0xf8000000, 0x0003ffff, 0x00000020, 0x1ff80000,
-    0x001c0000, 0xc0000000, 0x00003fff, 0x00007fff, 0x00018000, 0x00007000,
-    0xffffe000, 0x00000007, 0x003fc000, 0xf0000000, 0x00000fff, 0x00000400,
-    0x00000040};
-    const static UnicodeSet kangXi_24{__kangXi_24_runs, 45, __kangXi_24_quads, 25};
+    0x001c0000, 0xc0000000, 0x00003fff, 0x02021000, 0x00007fff, 0x00018000,
+    0x00007000, 0xffffe000, 0x00000007, 0x003fc000, 0xf0000000, 0x00000fff,
+    0x00000400, 0x00000040};
+    const static UnicodeSet kangXi_24{__kangXi_24_runs, 47, __kangXi_24_quads, 26};
 const static UnicodeSet::run_t __kangXi_25_runs[] = {
     {Empty, 425}, {Mixed, 1}, {Empty, 240}, {Mixed, 2}, {Empty, 3428},
     {Mixed, 1}, {Empty, 77}, {Mixed, 3}, {Empty, 9}, {Mixed, 1},
@@ -2067,7 +2070,7 @@ const static UnicodeSet::run_t __kangXi_29_runs[] = {
     0x02000000, 0x00008000, 0x00000004, 0x00010000, 0x40000000, 0x00004000,
     0x00080000, 0xfc000000, 0xfffffdff, 0xf7bfffff, 0x01ffffff, 0x40000000,
     0x0003fff8, 0x10000000, 0xfffc0000, 0x00007fff, 0x00ffffe0, 0x00080000,
-    0x01c00000, 0xffff0000, 0x0000007f, 0x7ffe0000, 0x00001fe0};
+    0x01c00000, 0xffff0000, 0x0000007f, 0x7ffe0000, 0x00201fe0};
     const static UnicodeSet kangXi_29{__kangXi_29_runs, 45, __kangXi_29_quads, 29};
 const static UnicodeSet::run_t __kangXi_3_runs[] = {
     {Empty, 625}, {Mixed, 2}, {Empty, 1367}, {Mixed, 1}, {Empty, 2104},
@@ -2091,15 +2094,15 @@ const static UnicodeSet::run_t __kangXi_30_runs[] = {
     {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Full, 19}, {Mixed, 1}, {Full, 10},
     {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Full, 2}, {Empty, 195}, {Mixed, 1},
     {Empty, 652}, {Mixed, 1}, {Empty, 80}, {Mixed, 1}, {Empty, 263},
-    {Mixed, 1}, {Empty, 10}, {Mixed, 1}, {Full, 3}, {Mixed, 1},
-    {Empty, 115}, {Mixed, 2}, {Empty, 11}, {Mixed, 1}, {Empty, 11},
-    {Mixed, 1}, {Full, 7}, {Mixed, 1}, {Empty, 154}, {Mixed, 1},
-    {Empty, 23}, {Mixed, 1}, {Full, 12}, {Mixed, 1}, {Empty, 197},
-    {Mixed, 1}, {Empty, 96}, {Mixed, 2}, {Empty, 75}, {Mixed, 1}, {Full, 3},
-    {Mixed, 1}, {Empty, 144}, {Mixed, 1}, {Full, 7}, {Mixed, 1},
-    {Empty, 113}, {Mixed, 1}, {Empty, 7}, {Mixed, 1}, {Empty, 2},
-    {Mixed, 1}, {Full, 7}, {Mixed, 1}, {Empty, 22}, {Mixed, 1}, {Empty, 45},
-    {Mixed, 1}, {Empty, 40}, {Mixed, 1}, {Empty, 28257}};
+    {Mixed, 1}, {Empty, 10}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 68},
+    {Mixed, 1}, {Empty, 46}, {Mixed, 2}, {Empty, 11}, {Mixed, 1},
+    {Empty, 11}, {Mixed, 1}, {Full, 7}, {Mixed, 1}, {Empty, 154},
+    {Mixed, 1}, {Empty, 23}, {Mixed, 1}, {Full, 12}, {Mixed, 1},
+    {Empty, 197}, {Mixed, 1}, {Empty, 96}, {Mixed, 2}, {Empty, 75},
+    {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 144}, {Mixed, 1}, {Full, 7},
+    {Mixed, 1}, {Empty, 113}, {Mixed, 1}, {Empty, 7}, {Mixed, 1},
+    {Empty, 2}, {Mixed, 1}, {Full, 7}, {Mixed, 1}, {Empty, 22}, {Mixed, 1},
+    {Empty, 45}, {Mixed, 1}, {Empty, 40}, {Mixed, 1}, {Empty, 28257}};
     const static UnicodeSet::bitquad_t __kangXi_30_quads[] = {
     0xfffffff8, 0x1fffffff, 0x01800000, 0x20000000, 0x80000000, 0xfffffff8,
     0x007fffff, 0x08000000, 0x20000000, 0x00000008, 0x00000002, 0x20000000,
@@ -2107,11 +2110,12 @@ const static UnicodeSet::run_t __kangXi_30_runs[] = {
     0x0f002000, 0x02800000, 0x00800000, 0x00000400, 0x00000004, 0x00080000,
     0x00000080, 0x10000000, 0xfe000000, 0xfffff7ff, 0xffffffbf, 0xffffff7f,
     0xfffffdff, 0xff9fffff, 0x00010000, 0x00000020, 0x00080000, 0x00800000,
-    0xfffc0000, 0x000000ff, 0x01000000, 0x7f000000, 0x06000000, 0xffff8000,
-    0x00000003, 0x00000008, 0xff000000, 0x03ffffff, 0x00f00000, 0xfe000000,
-    0x0000d7ff, 0xffffff80, 0x00001fff, 0x80000000, 0x00ffffff, 0x00200000,
-    0x00008000, 0xffffe000, 0x3fffffff, 0x20000000, 0x00040000, 0x00008000};
-    const static UnicodeSet kangXi_30{__kangXi_30_runs, 110, __kangXi_30_quads, 60};
+    0xfffc0000, 0x000000ff, 0x01000000, 0x01000000, 0x7f000000, 0x06000000,
+    0xffff8000, 0x00000003, 0x00000008, 0xff000000, 0x03ffffff, 0x00f00000,
+    0xfe000000, 0x0000d7ff, 0xffffff80, 0x00001fff, 0x80000000, 0x00ffffff,
+    0x00200000, 0x00008000, 0xffffe000, 0x3fffffff, 0x20000000, 0x00040000,
+    0x00008000};
+    const static UnicodeSet kangXi_30{__kangXi_30_runs, 112, __kangXi_30_quads, 61};
 const static UnicodeSet::run_t __kangXi_31_runs[] = {
     {Empty, 432}, {Mixed, 2}, {Empty, 260}, {Mixed, 1}, {Full, 1},
     {Mixed, 1}, {Empty, 580}, {Mixed, 1}, {Empty, 719}, {Mixed, 1},
@@ -2137,36 +2141,37 @@ const static UnicodeSet::run_t __kangXi_32_runs[] = {
     {Mixed, 1}, {Full, 1}, {Mixed, 4}, {Empty, 250}, {Mixed, 1},
     {Empty, 422}, {Mixed, 1}, {Empty, 148}, {Mixed, 1}, {Empty, 357},
     {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 112}, {Mixed, 2},
-    {Empty, 30}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 188},
-    {Mixed, 1}, {Full, 4}, {Mixed, 1}, {Empty, 191}, {Mixed, 2},
-    {Empty, 96}, {Mixed, 1}, {Empty, 79}, {Mixed, 1}, {Full, 3}, {Mixed, 1},
-    {Empty, 149}, {Mixed, 1}, {Full, 4}, {Empty, 108}, {Mixed, 1},
-    {Empty, 19}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 7}, {Mixed, 1},
-    {Empty, 4}, {Mixed, 1}, {Empty, 5}, {Mixed, 1}, {Empty, 45}, {Mixed, 1},
-    {Empty, 28297}};
+    {Empty, 30}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
+    {Empty, 188}, {Mixed, 1}, {Full, 4}, {Mixed, 1}, {Empty, 191},
+    {Mixed, 2}, {Empty, 96}, {Mixed, 1}, {Empty, 79}, {Mixed, 1}, {Full, 3},
+    {Mixed, 1}, {Empty, 149}, {Mixed, 1}, {Full, 4}, {Empty, 108},
+    {Mixed, 1}, {Empty, 10}, {Mixed, 1}, {Empty, 8}, {Mixed, 1}, {Full, 3},
+    {Mixed, 1}, {Empty, 7}, {Mixed, 1}, {Empty, 4}, {Mixed, 1}, {Empty, 5},
+    {Mixed, 1}, {Empty, 45}, {Mixed, 1}, {Empty, 28297}};
     const static UnicodeSet::bitquad_t __kangXi_32_quads[] = {
     0xffffffc0, 0x00000007, 0x80000000, 0x000007fd, 0x01000000, 0x40000000,
     0x00002000, 0x00100000, 0x10480000, 0x00002000, 0x40000000, 0x00000404,
     0x00001000, 0x00018000, 0x06000000, 0x30000000, 0x08000000, 0xf0000000,
     0xff7fffff, 0xefffffff, 0xfbffffff, 0xfffffffd, 0xf7ffffff, 0xff7fffff,
     0x07ffffff, 0x00000080, 0x00000100, 0x00000080, 0xfffe0000, 0x0003ffff,
-    0x80000000, 0x00000003, 0xffc00000, 0x00000001, 0xfc000000, 0x0003ffff,
-    0xfe000000, 0x0000ffff, 0x03fc0000, 0xffe00000, 0x000000ff, 0xffffffc0,
-    0x00400000, 0xffff0000, 0x00000fff, 0x00000004, 0x00000100, 0x01000000,
-    0x00000010};
-    const static UnicodeSet kangXi_32{__kangXi_32_runs, 80, __kangXi_32_quads, 49};
+    0x80000000, 0x00000003, 0xffc00000, 0xfffffdff, 0x00000001, 0xfc000000,
+    0x0003ffff, 0xfe000000, 0x0000ffff, 0x03fc0000, 0xffe00000, 0x000000ff,
+    0xffffffc0, 0x00400000, 0x01000000, 0xffff0000, 0x00000fff, 0x00000004,
+    0x00000100, 0x01000000, 0x00000010};
+    const static UnicodeSet kangXi_32{__kangXi_32_runs, 84, __kangXi_32_quads, 51};
 const static UnicodeSet::run_t __kangXi_33_runs[] = {
     {Empty, 436}, {Mixed, 1}, {Empty, 263}, {Mixed, 1}, {Empty, 10},
     {Mixed, 2}, {Empty, 3521}, {Mixed, 1}, {Empty, 29}, {Mixed, 3},
-    {Empty, 1182}, {Mixed, 1}, {Empty, 148}, {Mixed, 1}, {Empty, 193},
-    {Mixed, 1}, {Empty, 192}, {Mixed, 1}, {Empty, 96}, {Mixed, 1},
-    {Empty, 83}, {Mixed, 1}, {Empty, 154}, {Mixed, 1}, {Empty, 131},
-    {Mixed, 1}, {Empty, 28362}};
+    {Empty, 1182}, {Mixed, 1}, {Empty, 146}, {Mixed, 1}, {Empty, 1},
+    {Mixed, 1}, {Empty, 193}, {Mixed, 1}, {Empty, 192}, {Mixed, 1},
+    {Empty, 96}, {Mixed, 1}, {Empty, 83}, {Mixed, 1}, {Empty, 154},
+    {Mixed, 1}, {Empty, 118}, {Mixed, 1}, {Empty, 12}, {Mixed, 1},
+    {Empty, 28362}};
     const static UnicodeSet::bitquad_t __kangXi_33_quads[] = {
     0x00000018, 0x00000004, 0xfffff800, 0x00000003, 0x00200000, 0xf8000000,
-    0xff7dffff, 0x0003bfbf, 0x001c0000, 0x000003fe, 0x1ffc0000, 0x00070000,
-    0x0c020000, 0x00003f00, 0x00000007, 0x00003000};
-    const static UnicodeSet kangXi_33{__kangXi_33_runs, 27, __kangXi_33_quads, 16};
+    0xff7dffff, 0x0003bfbf, 0x001c0000, 0x00000200, 0x000003fe, 0x1ffc0000,
+    0x00070000, 0x0c020000, 0x00003f00, 0x00000007, 0x00800000, 0x00003000};
+    const static UnicodeSet kangXi_33{__kangXi_33_runs, 31, __kangXi_33_quads, 18};
 const static UnicodeSet::run_t __kangXi_34_runs[] = {
     {Empty, 436}, {Mixed, 1}, {Empty, 218}, {Mixed, 1}, {Empty, 56},
     {Mixed, 1}, {Empty, 3433}, {Mixed, 1}, {Empty, 119}, {Mixed, 1},
@@ -2371,21 +2376,21 @@ const static UnicodeSet::run_t __kangXi_46_runs[] = {
     {Empty, 327}, {Mixed, 1}, {Empty, 571}, {Mixed, 1}, {Full, 1},
     {Mixed, 1}, {Empty, 101}, {Mixed, 1}, {Empty, 1}, {Mixed, 1},
     {Empty, 47}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 135},
-    {Mixed, 1}, {Empty, 54}, {Full, 3}, {Mixed, 1}, {Empty, 179},
-    {Mixed, 1}, {Empty, 95}, {Mixed, 2}, {Empty, 10}, {Mixed, 1},
-    {Empty, 73}, {Mixed, 1}, {Empty, 2}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
-    {Empty, 151}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 103},
-    {Mixed, 1}, {Empty, 25}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 45},
-    {Mixed, 1}, {Empty, 28309}};
+    {Mixed, 1}, {Empty, 24}, {Mixed, 1}, {Empty, 29}, {Full, 3}, {Mixed, 1},
+    {Empty, 179}, {Mixed, 1}, {Empty, 95}, {Mixed, 2}, {Empty, 10},
+    {Mixed, 1}, {Empty, 73}, {Mixed, 1}, {Empty, 2}, {Mixed, 1}, {Full, 1},
+    {Mixed, 1}, {Empty, 151}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
+    {Empty, 103}, {Mixed, 1}, {Empty, 25}, {Mixed, 1}, {Full, 1},
+    {Mixed, 1}, {Empty, 45}, {Mixed, 1}, {Empty, 28309}};
     const static UnicodeSet::bitquad_t __kangXi_46_quads[] = {
     0xff7ffff0, 0x000001ff, 0x00000004, 0x00000400, 0x08000000, 0xfffe0000,
     0x07ffffff, 0x00000002, 0x00000800, 0x00200000, 0x00020000, 0xffffe000,
     0xffffffef, 0xff7fffff, 0x0000003f, 0x00002000, 0x00000010, 0xfffffffc,
     0x00000001, 0x04000000, 0x00380000, 0xfffe0000, 0x0000007f, 0x00000800,
-    0x03ffffff, 0x0007fff0, 0xfe000000, 0x00000001, 0x00100000, 0x00004000,
-    0xfffffe00, 0x00000007, 0xffffffe0, 0x003fffff, 0x00000004, 0xfffffff8,
-    0x07ffffff, 0x00010000};
-    const static UnicodeSet kangXi_46{__kangXi_46_runs, 74, __kangXi_46_quads, 38};
+    0x20000000, 0x03ffffff, 0x0007fff0, 0xfe000000, 0x00000001, 0x00100000,
+    0x00004000, 0xfffffe00, 0x00000007, 0xffffffe0, 0x003fffff, 0x00000004,
+    0xfffffff8, 0x07ffffff, 0x00010000};
+    const static UnicodeSet kangXi_46{__kangXi_46_runs, 76, __kangXi_46_quads, 39};
 const static UnicodeSet::run_t __kangXi_47_runs[] = {
     {Empty, 449}, {Mixed, 1}, {Empty, 300}, {Mixed, 2}, {Empty, 3394},
     {Mixed, 1}, {Empty, 204}, {Mixed, 2}, {Empty, 1106}, {Mixed, 1},
@@ -2689,13 +2694,13 @@ const static UnicodeSet::run_t __kangXi_67_runs[] = {
     {Mixed, 1}, {Empty, 3207}, {Mixed, 2}, {Empty, 809}, {Mixed, 1},
     {Empty, 177}, {Mixed, 1}, {Empty, 159}, {Mixed, 1}, {Empty, 200},
     {Mixed, 1}, {Empty, 155}, {Mixed, 1}, {Empty, 197}, {Mixed, 1},
-    {Empty, 152}, {Mixed, 1}, {Empty, 131}, {Mixed, 1}, {Empty, 18},
-    {Mixed, 1}, {Empty, 28325}};
+    {Empty, 152}, {Mixed, 1}, {Empty, 101}, {Mixed, 1}, {Empty, 29},
+    {Mixed, 1}, {Empty, 18}, {Mixed, 1}, {Empty, 28325}};
     const static UnicodeSet::bitquad_t __kangXi_67_quads[] = {
     0x00038000, 0x007fff80, 0x00010000, 0xfffff7fe, 0x00000fff, 0x00010000,
     0x000007ff, 0x0007e000, 0x0ff00000, 0x00c00000, 0x1c000000, 0x000000fc,
-    0x1ff80000, 0x00080000};
-    const static UnicodeSet kangXi_67{__kangXi_67_runs, 27, __kangXi_67_quads, 14};
+    0x00000080, 0x1ff80000, 0x00080000};
+    const static UnicodeSet kangXi_67{__kangXi_67_runs, 29, __kangXi_67_quads, 15};
 const static UnicodeSet::run_t __kangXi_68_runs[] = {
     {Empty, 469}, {Mixed, 1}, {Empty, 342}, {Mixed, 2}, {Empty, 1183},
     {Mixed, 1}, {Empty, 2485}, {Mixed, 2}, {Empty, 471}, {Mixed, 1},
@@ -2761,23 +2766,23 @@ const static UnicodeSet::run_t __kangXi_72_runs[] = {
     {Mixed, 1}, {Empty, 9}, {Mixed, 1}, {Empty, 380}, {Mixed, 1}, {Full, 2},
     {Mixed, 1}, {Full, 6}, {Mixed, 2}, {Full, 2}, {Mixed, 3}, {Empty, 316},
     {Mixed, 1}, {Empty, 649}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
-    {Empty, 89}, {Mixed, 1}, {Empty, 68}, {Mixed, 2}, {Empty, 114},
-    {Mixed, 1}, {Empty, 84}, {Mixed, 1}, {Full, 5}, {Mixed, 1},
-    {Empty, 147}, {Mixed, 2}, {Empty, 94}, {Mixed, 1}, {Empty, 1},
-    {Mixed, 1}, {Empty, 100}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
-    {Empty, 149}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 130},
-    {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 85}, {Mixed, 1},
-    {Empty, 28255}};
+    {Empty, 89}, {Mixed, 1}, {Empty, 3}, {Mixed, 1}, {Empty, 64},
+    {Mixed, 2}, {Empty, 114}, {Mixed, 1}, {Empty, 84}, {Mixed, 1},
+    {Full, 5}, {Mixed, 1}, {Empty, 147}, {Mixed, 2}, {Empty, 94},
+    {Mixed, 1}, {Empty, 1}, {Mixed, 1}, {Empty, 100}, {Mixed, 1}, {Full, 1},
+    {Mixed, 1}, {Empty, 149}, {Mixed, 1}, {Full, 1}, {Mixed, 1},
+    {Empty, 130}, {Mixed, 1}, {Full, 1}, {Mixed, 1}, {Empty, 85},
+    {Mixed, 1}, {Empty, 28255}};
     const static UnicodeSet::bitquad_t __kangXi_72_quads[] = {
     0xffff0000, 0x0000ffff, 0x00000001, 0x00800000, 0xffffffe0, 0x2000ffff,
     0x00000040, 0x00000080, 0x00000800, 0x00000020, 0x00000001, 0x00040040,
     0x00000008, 0x00020000, 0x40000000, 0x08000000, 0xf8000000, 0xfffffdff,
     0xfffffffd, 0xfffbffff, 0xfffeffff, 0xbbffffff, 0x00000001, 0x00000004,
-    0xffffffc0, 0x001fffff, 0x0000001c, 0xffffffc0, 0x7fffffff, 0x00000200,
-    0xfffff800, 0x00ffffff, 0xfc000000, 0x000003ff, 0x00800000, 0x0023e000,
-    0xfffe0000, 0x7fffffff, 0xfe000000, 0x001fffff, 0xffff8000, 0x0001ffff,
-    0x80000000};
-    const static UnicodeSet kangXi_72{__kangXi_72_runs, 73, __kangXi_72_quads, 43};
+    0xffffffc0, 0x001fffff, 0x0000001c, 0x40000000, 0xffffffc0, 0x7fffffff,
+    0x00000200, 0xfffff800, 0x00ffffff, 0xfc000000, 0x000003ff, 0x00800000,
+    0x0023e000, 0xfffe0000, 0x7fffffff, 0xfe000000, 0x001fffff, 0xffff8000,
+    0x0001ffff, 0x80000000};
+    const static UnicodeSet kangXi_72{__kangXi_72_runs, 75, __kangXi_72_quads, 44};
 const static UnicodeSet::run_t __kangXi_73_runs[] = {
     {Empty, 473}, {Mixed, 1}, {Empty, 22}, {Mixed, 1}, {Empty, 165},
     {Mixed, 1}, {Empty, 160}, {Mixed, 2}, {Empty, 1167}, {Mixed, 1},
@@ -2807,7 +2812,7 @@ const static UnicodeSet::run_t __kangXi_74_runs[] = {
     0xfdf80000, 0x00000001, 0x3c000000, 0xfffdff00, 0x000000df, 0x00000010,
     0x00000200, 0x000c0000, 0xe0000000, 0xfffe7eff, 0x0007ffff, 0x00800000,
     0x02000000, 0x00080000, 0x00400000, 0xfe000000, 0x0001ffff, 0x00000008,
-    0x000000e0, 0xffff0000, 0x07ffffff, 0xfffffff0, 0x00ffffff, 0x00000400,
+    0x000000e0, 0xf7ff0000, 0x07ffffff, 0xfffffff0, 0x00ffffff, 0x00000400,
     0x07000000, 0x00000601, 0x0000fff0, 0x3f000000, 0xff800000, 0x00003fff};
     const static UnicodeSet kangXi_74{__kangXi_74_runs, 47, __kangXi_74_quads, 30};
 const static UnicodeSet::run_t __kangXi_75_runs[] = {
@@ -2815,27 +2820,27 @@ const static UnicodeSet::run_t __kangXi_75_runs[] = {
     {Empty, 344}, {Mixed, 1}, {Full, 31}, {Empty, 24}, {Mixed, 1},
     {Empty, 169}, {Mixed, 1}, {Empty, 226}, {Mixed, 1}, {Empty, 713},
     {Mixed, 4}, {Empty, 1}, {Mixed, 4}, {Empty, 1}, {Mixed, 1}, {Empty, 1},
-    {Mixed, 1}, {Empty, 1}, {Mixed, 1}, {Empty, 2502}, {Mixed, 1},
-    {Full, 5}, {Mixed, 1}, {Full, 21}, {Mixed, 1}, {Full, 2}, {Mixed, 1},
-    {Full, 6}, {Mixed, 1}, {Empty, 260}, {Mixed, 1}, {Empty, 666},
-    {Mixed, 1}, {Full, 5}, {Mixed, 1}, {Empty, 82}, {Mixed, 1}, {Empty, 9},
-    {Mixed, 1}, {Empty, 61}, {Mixed, 1}, {Full, 5}, {Mixed, 1},
-    {Empty, 106}, {Mixed, 1}, {Empty, 92}, {Mixed, 1}, {Full, 7},
-    {Mixed, 1}, {Empty, 138}, {Mixed, 1}, {Empty, 96}, {Mixed, 2},
-    {Empty, 102}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 146},
-    {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 129}, {Mixed, 1}, {Full, 3},
-    {Mixed, 1}, {Empty, 10}, {Mixed, 1}, {Empty, 49}, {Mixed, 1},
-    {Empty, 28275}};
+    {Mixed, 1}, {Empty, 1}, {Mixed, 1}, {Empty, 2128}, {Mixed, 1},
+    {Empty, 373}, {Mixed, 1}, {Full, 5}, {Mixed, 1}, {Full, 21}, {Mixed, 1},
+    {Full, 2}, {Mixed, 1}, {Full, 6}, {Mixed, 1}, {Empty, 260}, {Mixed, 1},
+    {Empty, 666}, {Mixed, 1}, {Full, 5}, {Mixed, 1}, {Empty, 82},
+    {Mixed, 1}, {Empty, 9}, {Mixed, 1}, {Empty, 61}, {Mixed, 1}, {Full, 5},
+    {Mixed, 1}, {Empty, 106}, {Mixed, 1}, {Empty, 92}, {Mixed, 1},
+    {Full, 7}, {Mixed, 1}, {Empty, 138}, {Mixed, 1}, {Empty, 96},
+    {Mixed, 2}, {Empty, 102}, {Mixed, 1}, {Full, 3}, {Mixed, 1},
+    {Empty, 146}, {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 129},
+    {Mixed, 1}, {Full, 3}, {Mixed, 1}, {Empty, 10}, {Mixed, 1}, {Empty, 49},
+    {Mixed, 1}, {Empty, 28275}};
     const static UnicodeSet::bitquad_t __kangXi_75_quads[] = {
     0xfffffffe, 0xfffffffd, 0x1fffffff, 0xffffff00, 0x00000001, 0x00000008,
     0x20000010, 0x20100000, 0x00020000, 0x10001000, 0x04000000, 0x80000000,
     0x04000300, 0x00100006, 0x00180000, 0x00000010, 0x00100000, 0x00060000,
-    0xfff80000, 0xffffff7f, 0xfffffffb, 0xffff7fff, 0xfff7ffff, 0x00100000,
-    0xfffe0000, 0x000001ff, 0x0007ff00, 0x06000000, 0xf8000000, 0x1fffffff,
-    0x00020000, 0xff000000, 0x0000000f, 0x3ffff000, 0xf8000000, 0x00007fff,
-    0xffff0000, 0x000003ff, 0xc0000000, 0x007fffff, 0xffffc000, 0x000007ff,
-    0x00000004, 0x00000040};
-    const static UnicodeSet kangXi_75{__kangXi_75_runs, 76, __kangXi_75_quads, 44};
+    0x00040000, 0xfff80000, 0xffffff7f, 0xfffffffb, 0xffff7fff, 0xfff7ffff,
+    0x00100000, 0xfffe0000, 0x000001ff, 0x0007ff00, 0x06000000, 0xf8000000,
+    0x1fffffff, 0x00020000, 0xff000000, 0x0000000f, 0x3ffff000, 0xf8000000,
+    0x00007fff, 0xffff0000, 0x000003ff, 0xc0000000, 0x007fffff, 0xffffc000,
+    0x000007ff, 0x00000004, 0x00000040};
+    const static UnicodeSet kangXi_75{__kangXi_75_runs, 78, __kangXi_75_quads, 45};
 const static UnicodeSet::run_t __kangXi_76_runs[] = {
     {Empty, 480}, {Mixed, 3}, {Empty, 138}, {Mixed, 1}, {Empty, 235},
     {Full, 2}, {Mixed, 1}, {Empty, 3688}, {Full, 3}, {Mixed, 1}, {Full, 2},
@@ -2935,15 +2940,15 @@ const static UnicodeSet::run_t __kangXi_82_runs[] = {
     {Mixed, 1}, {Empty, 3317}, {Mixed, 1}, {Empty, 385}, {Mixed, 1},
     {Full, 9}, {Mixed, 1}, {Empty, 903}, {Mixed, 2}, {Empty, 161},
     {Mixed, 2}, {Empty, 207}, {Mixed, 2}, {Empty, 134}, {Mixed, 1},
-    {Empty, 205}, {Mixed, 2}, {Empty, 148}, {Mixed, 2}, {Empty, 132},
-    {Mixed, 1}, {Empty, 47}, {Mixed, 1}, {Empty, 8}, {Mixed, 1},
-    {Empty, 28278}};
+    {Empty, 205}, {Mixed, 2}, {Empty, 148}, {Mixed, 2}, {Empty, 93},
+    {Mixed, 1}, {Empty, 38}, {Mixed, 1}, {Empty, 47}, {Mixed, 1},
+    {Empty, 8}, {Mixed, 1}, {Empty, 28278}};
     const static UnicodeSet::bitquad_t __kangXi_82_quads[] = {
     0xfffff000, 0x0007ffff, 0xf8000000, 0x00007fff, 0x00000100, 0xf8000000,
     0x0000001f, 0xffc00000, 0x00000007, 0xf0000000, 0x000001ff, 0xfffc0000,
     0x0000ffff, 0x00000006, 0xffffe000, 0x007fffff, 0xc0000000, 0x000000ff,
-    0x000ffff0, 0x00100000, 0x00001000};
-    const static UnicodeSet kangXi_82{__kangXi_82_runs, 31, __kangXi_82_quads, 21};
+    0x00000020, 0x000ffff0, 0x00100000, 0x00001000};
+    const static UnicodeSet kangXi_82{__kangXi_82_runs, 33, __kangXi_82_quads, 22};
 const static UnicodeSet::run_t __kangXi_83_runs[] = {
     {Empty, 485}, {Mixed, 1}, {Empty, 378}, {Mixed, 1}, {Empty, 3713},
     {Mixed, 1}, {Empty, 985}, {Mixed, 1}, {Empty, 81}, {Mixed, 1},

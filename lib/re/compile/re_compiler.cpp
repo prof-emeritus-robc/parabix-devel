@@ -203,12 +203,23 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
     auto ext = f->second;
     unsigned amt = NamedLookAheadAmount(name, *mMain.mCodeUnitAlphabet);
     if (amt > 0) {
-        // Named lookahead expression.
+        // Named lookahead expression.  The external stream marks where the
+        // positive lookahead holds; negate it here for a negative lookahead, so
+        // that the lookahead also holds where it would extend past the end of
+        // the data (read as zeroes).
+        const Assertion * const a = cast<Assertion>(name->getDefinition());
+        auto lookahead = [&](unsigned k) -> PabloAST * {
+            PabloAST * la = mPB.createLookahead(ext.stream(), k);
+            if (a->getSense() == Assertion::Sense::Negative) {
+                la = mPB.createNot(la);
+            }
+            return la;
+        };
         if (marker.position() == Position::AtEnd) {
-            return Marker(mPB.createAnd(marker.stream(), mPB.createLookahead(ext.stream(), amt)));
+            return Marker(mPB.createAnd(marker.stream(), lookahead(amt)));
         } else {
             PabloAST * nextPos = NextCharacter(marker, mPB);
-            return Marker(mPB.createAnd(nextPos, mPB.createLookahead(ext.stream(), amt - 1)), Position::AtNextChar);
+            return Marker(mPB.createAnd(nextPos, lookahead(amt - 1)), Position::AtNextChar);
         }
     }
     auto externalLength = ext.minLength();

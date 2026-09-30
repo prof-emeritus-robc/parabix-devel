@@ -125,6 +125,7 @@ std::string RE_Kernel::makeSignature(RE_CompilerContext & ctxt, RE * re) {
             } else if (ext.kind == ExternalStreamKind::StartIndexed) {
                 sigstrm << "+S";
                 sigstrm << ext.offset;
+                if (ext.negated) sigstrm << "n";
             } else {
                 sigstrm << "+E";
                 sigstrm << ext.lgthRange.first << "-" << ext.lgthRange.second;
@@ -496,20 +497,16 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         RE * asserted = a->getAsserted();
         StreamSet * assertedStrm = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, asserted, assertedStrm);
-        // A negative lookahead holds wherever the positive one does not; the
-        // positive stream must be fully formed (for variable length lookaheads,
-        // aligned to the prefix) before inverting.
-        auto negateIfRequired = [&](StreamSet * positive) {
-            if (a->getSense() == Assertion::Sense::Positive) return positive;
-            StreamSet * negatedStrm = mPB.CreateStreamSet(1);
-            Invert(mPB, positive, negatedStrm);
-            return negatedStrm;
-        };
+        // The external stream marks where the positive lookahead holds, for
+        // either sense; negative lookaheads are negated where the stream is
+        // read, so that they also hold for positions whose lookahead extends
+        // past the end of the data.  The sense is part of the RE_Kernel signature.
+        const bool negated = (a->getSense() == Assertion::Sense::Negative);
         auto r = getLengthRange(asserted, mCtxt.mLengthAlphabet);
         if (r.first == r.second) {
             // Fixed length lookaheads can be stored directly.
             unsigned lgth = static_cast<unsigned>(r.second);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, lgth, r, negateIfRequired(assertedStrm)});
+            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, lgth, r, assertedStrm, negated});
         } else {
             // Apply the logic of matching a lookahead with a unique prefix.  
             // Match positions for the lookahead (assertedStrm) are shifted back to the 
@@ -529,7 +526,7 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
             mPB.CreateKernelCall<IndexedShiftBack>(maskStrm, assertedStrm, assertedBack);
             StreamSet * extStrm = mPB.CreateStreamSet(1);
             AndCombine(mPB, prefStrm, assertedBack, extStrm);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, amt, r, negateIfRequired(extStrm)});
+            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, amt, r, extStrm, negated});
         }
     }
 }

@@ -22,6 +22,9 @@ struct ExternalStream {
     unsigned offset;
     std::pair<int, int> lgthRange;
     kernel::StreamSet * extStream;
+    // For a StartIndexed (lookahead) external: the stream marks where the
+    // positive lookahead holds, and the consuming kernel negates it.
+    bool negated = false;
 };
 
 enum class RE_CombiningType {None, Exclude, Include};

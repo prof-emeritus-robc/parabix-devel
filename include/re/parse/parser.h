@@ -181,6 +181,8 @@ protected:
     
     RE * parse_mode_group(bool & closing_paren_parsed);
 
+    RE * parse_lookahead_body();
+
     RE * parse_capture_body();
     
     Reference * parse_back_reference();

@@ -1306,17 +1306,4 @@ xyz
 <grepcase regexp=".b(?:.[ab]|a*)(?:[bc]c|b)" datafile="alt_alignment" greplines="3 4 5"/>
 <grepcase regexp="b(?:.[ab]|a*)(?:cc|b)" datafile="alt_alignment" greplines="3 4 5"/>
 
-<!-- Captures inside lookahead assertions (named subexpressions). -->
-<datafile id="capture_lookahead">
-abab
-abac
-xyzxyz
-xyzxya
-aXa
-aXb
-</datafile>
-<grepcase regexp="(?=(a)X)\1" datafile="capture_lookahead" greplines="6 7" knownbug="updateReferenceInfo ignores Name definitions"/>
-<grepcase regexp="(?=(x)y)\1yz" datafile="capture_lookahead" greplines="4 5" knownbug="updateReferenceInfo ignores Name definitions"/>
-<grepcase regexp="(?=(ab)a)\1" datafile="capture_lookahead" greplines="2 3" knownbug="updateReferenceInfo ignores Name definitions"/>
-
 </greptest>

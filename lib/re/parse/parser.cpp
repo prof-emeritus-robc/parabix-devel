@@ -204,9 +204,9 @@ RE * RE_Parser::parse_group() {
         } else if (accept(':')) { // Non-capturing paren
             group_expr = parse_alt();
         } else if (accept('=')) { // positive look ahead
-            group_expr = makeLookAheadAssertion(parse_alt());
+            group_expr = makeLookAheadAssertion(parse_lookahead_body());
         } else if (accept('!')) { // negative look ahead
-            group_expr = makeNegativeLookAheadAssertion(parse_alt());
+            group_expr = makeNegativeLookAheadAssertion(parse_lookahead_body());
         } else if (accept("<=")) { // positive look behind
             group_expr = makeLookBehindAssertion(parse_alt());
         } else if (accept("<!")) { // negative look behind
@@ -233,6 +233,15 @@ RE * RE_Parser::parse_group() {
     return group_expr;
 }
     
+RE * RE_Parser::parse_lookahead_body() {
+    const auto capturesBefore = mCaptureGroupCount;
+    RE * asserted = parse_alt();
+    if (mCaptureGroupCount != capturesBefore) {
+        ParseFailure("Capture groups inside lookahead assertions are not supported.");
+    }
+    return asserted;
+}
+
 RE * RE_Parser::parse_capture_body() {
     RE * captured = parse_alt();
     mCaptureGroupCount++;

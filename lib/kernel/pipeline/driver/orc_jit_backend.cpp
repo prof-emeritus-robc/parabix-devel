@@ -36,6 +36,7 @@
 #include <llvm/Support/SmallVectorMemoryBuffer.h>
 #include <idisa/passes/function_snippet.h>
 #include <queue>
+#include <optional>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
 #else
@@ -961,6 +962,8 @@ record_decl:
         SmallVector<char, 0> IROutput;
         SmallVector<char, 0> OptIROutput;
 
+        const auto snippetMode = getFunctionSnippetMode();
+
         BEGIN_SCOPED_REGION
         NamedRegionTimer T(Target->getSignature(), Target->getName(),
                            "Kernel", "Kernel Generation",
@@ -972,6 +975,10 @@ record_decl:
         Kernel::SelectedOptimizationPasses passes;
         Target->addOptimizationPasses(builder, passes);
         BaseDriver::runAllOptimizationPasses(builder, passes, TM, IROutput, OptIROutput);
+
+        if (snippetMode == FunctionSnippetMode::LateIR) {
+            inlineFunctionSnippets(*M);
+        }
 
         END_SCOPED_REGION
 
@@ -988,7 +995,12 @@ record_decl:
 
         const auto atLeastOpt1 = codegen::BackEndOptLevel != CodeGenOptLevel::None;
 
-        FunctionSnippetPassManagerProxy FPM(*M, PM, atLeastOpt1);
+        // Only MIR mode needs the snippet splicing pass in the codegen pipeline.
+        std::optional<FunctionSnippetPassManagerProxy> SnippetPM;
+        if (snippetMode == FunctionSnippetMode::MIR) {
+            SnippetPM.emplace(*M, PM, atLeastOpt1);
+        }
+        PassManagerBase & FPM = SnippetPM ? static_cast<PassManagerBase &>(*SnippetPM) : PM;
 
         SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> objBuffer;
@@ -1024,7 +1036,11 @@ record_decl:
             // had already emitted -- "symbol '...' is already defined". Reproducible
             // with idisa_exerciser --ShowASM=<path>.
             legacy::PassManager asmPM;
-            FunctionSnippetPassManagerProxy asmFPM(*M, asmPM, atLeastOpt1);
+            std::optional<FunctionSnippetPassManagerProxy> asmSnippetPM;
+            if (snippetMode == FunctionSnippetMode::MIR) {
+                asmSnippetPM.emplace(*M, asmPM, atLeastOpt1);
+            }
+            PassManagerBase & asmFPM = asmSnippetPM ? static_cast<PassManagerBase &>(*asmSnippetPM) : asmPM;
             if (LLVM_UNLIKELY(TM->addPassesToEmitFile(asmFPM, out, nullptr, ASMFile))) {
                 report_fatal_error(Twine{"Failed to generate ASM for ", M->getModuleIdentifier()});
             }

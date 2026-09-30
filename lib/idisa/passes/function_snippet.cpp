@@ -27,6 +27,9 @@
 #include <llvm/CodeGen/LiveVariables.h>
 #include <llvm/CodeGen/LiveIntervals.h>
 #include <llvm/CodeGen/MachineValueType.h>
+#include <llvm/Support/CommandLine.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+#include <toolchain/toolchain.h>
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
@@ -36,6 +39,17 @@ constexpr auto MAXIMUM_SYMBOL_LENGTH = 4096;
 using namespace llvm;
 
 constexpr static StringRef SNIPPET_PREFIX{"_snippet."};
+
+static cl::opt<FunctionSnippetMode> FunctionSnippetModeOption("function-snippets",
+    cl::desc("How pablo function snippets are compiled."),
+    cl::values(clEnumValN(FunctionSnippetMode::Direct, "direct", "emit snippet code in place (no snippet functions)"),
+               clEnumValN(FunctionSnippetMode::LateIR, "late-ir", "keep snippets opaque during IR optimization; inline them before codegen"),
+               clEnumValN(FunctionSnippetMode::MIR, "mir", "splice snippets after instruction selection (experimental)")),
+    cl::init(FunctionSnippetMode::LateIR), cl::cat(codegen::CodeGenOptions));
+
+FunctionSnippetMode getFunctionSnippetMode() {
+    return FunctionSnippetModeOption;
+}
 
 class FunctionSnippetTokenReplacerPass : public MachineFunctionPass {
 public:
@@ -1061,6 +1075,11 @@ void FunctionSnippetTokenReplacerPass::getAnalysisUsage(AnalysisUsage & AU) cons
 Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef name, ArrayRef<Value *> params,
                             std::function<Value *(ArrayRef<Value *>)> functionGenerator) {
 
+    const auto mode = getFunctionSnippetMode();
+    if (mode == FunctionSnippetMode::Direct) {
+        return functionGenerator(params);
+    }
+
     Module * const m = b.getModule();
 
     SmallVector<char, 128> tmp;
@@ -1112,6 +1131,13 @@ Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef na
 //        OperandBundleDef op(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL.str(), V);
 
         snippetFunction->setMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL, md);
+
+        if (mode == FunctionSnippetMode::LateIR) {
+            // Opaque to IR optimization: noinline prevents inlining, and the non-call use
+            // in llvm.compiler.used stops IPO passes from changing the signature.
+            snippetFunction->addFnAttr(Attribute::NoInline);
+            appendToCompilerUsed(*m, {snippetFunction});
+        }
 
         BasicBlock * const entry = BasicBlock::Create(b.getContext(), "entry", snippetFunction);
         b.SetInsertPoint(entry);
@@ -1165,13 +1191,17 @@ Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef na
 //    M[0] = ValueAsMetadata::get(snippetFunction);
 //    MDNode * node = MDNode::get(C, M);
 //    MetadataAsValue * mark = MetadataAsValue::get(C, node);
-    std::array<Value *, 1> V;
-    V[0] = ConstantInt::get(b.getInt64Ty(), (uintptr_t)snippetFunction);
-    OperandBundleDef op("cfguardtarget", V);
-    SmallVector<OperandBundleDef, 1> bundle;
-    bundle.emplace_back(std::move(op));
-
-    CallInst * const retStruct = b.CreateCall(funcTy, snippetFunction, params, bundle);
+    CallInst * retStruct = nullptr;
+    if (mode == FunctionSnippetMode::LateIR) {
+        retStruct = b.CreateCall(funcTy, snippetFunction, params);
+    } else {
+        std::array<Value *, 1> V;
+        V[0] = ConstantInt::get(b.getInt64Ty(), (uintptr_t)snippetFunction);
+        OperandBundleDef op("cfguardtarget", V);
+        SmallVector<OperandBundleDef, 1> bundle;
+        bundle.emplace_back(std::move(op));
+        retStruct = b.CreateCall(funcTy, snippetFunction, params, bundle);
+    }
     retStruct->setCallingConv(CallingConv::Fast);
 
 //    const auto isAgg = retTy->isAggregateType();
@@ -1236,4 +1266,42 @@ void FunctionSnippetPassManagerProxy::add(Pass * P) {
         }
         AlreadyInsertedFunctionSnippetPass = true;
 //    }
+}
+
+void inlineFunctionSnippets(Module & M) {
+    SmallVector<Function *, 16> snippets;
+    for (Function & F : M) {
+        if (F.hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
+            snippets.push_back(&F);
+        }
+    }
+    if (snippets.empty()) {
+        return;
+    }
+    SmallPtrSet<Constant *, 16> snippetSet(snippets.begin(), snippets.end());
+    removeFromUsedLists(M, [&](Constant * C) { return snippetSet.count(C) != 0; });
+    SmallVector<CallBase *, 64> calls;
+    for (Function * F : snippets) {
+        F->removeFnAttr(Attribute::NoInline);
+        calls.clear();
+        for (User * U : F->users()) {
+            if (auto * CB = dyn_cast<CallBase>(U)) {
+                if (CB->getCalledFunction() == F) {
+                    calls.push_back(CB);
+                }
+            }
+        }
+        for (CallBase * CB : calls) {
+            InlineFunctionInfo IFI;
+            const InlineResult r = InlineFunction(*CB, IFI);
+            if (LLVM_UNLIKELY(!r.isSuccess())) {
+                report_fatal_error(Twine("Failed to inline function snippet ") + F->getName() + ": " + r.getFailureReason());
+            }
+        }
+        // Replaced llvm.compiler.used initializers linger as dead constant users.
+        F->removeDeadConstantUsers();
+        if (F->use_empty()) {
+            F->eraseFromParent();
+        }
+    }
 }

@@ -6,6 +6,19 @@
 #include <functional>
 
 
+// How function snippets are compiled (--function-snippets):
+//   Direct: no snippet functions; the generated code is emitted in place.
+//   LateIR: snippets are noinline functions during IR optimization and are
+//           inlined by inlineFunctionSnippets just before code generation.
+//   MIR:    snippets are spliced after instruction selection by the
+//           FunctionSnippetTokenReplacerPass (see FunctionSnippetPassManagerProxy).
+enum class FunctionSnippetMode { Direct, LateIR, MIR };
+
+FunctionSnippetMode getFunctionSnippetMode();
+
+// LateIR mode: inline all snippet functions in M and delete them.
+void inlineFunctionSnippets(llvm::Module & M);
+
 llvm::Value * CallFunctionByToken(IDISA::IDISA_Builder & b,
                                   llvm::Type * retTy, llvm::StringRef name, llvm::ArrayRef<llvm::Value *> params,
                                   std::function<llvm::Value *(llvm::ArrayRef<llvm::Value *>)> functionGenerator);

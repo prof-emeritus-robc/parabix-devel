@@ -138,8 +138,13 @@ std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexAlph
         return getLengthRange(c->getCapturedRE(), indexAlphabet);
     } else if (const Reference * r = dyn_cast<Reference>(re)) {
         return getLengthRange(r->getCapture(), indexAlphabet);
-    } else if (isa<Range, Group>(re)) {
-        return std::make_pair(0, INT_MAX);
+    } else if (const Group * g = dyn_cast<Group>(re)) {
+        return getLengthRange(g->getRE(), indexAlphabet);
+    } else if (const Range * rg = dyn_cast<Range>(re)) {
+        // A single character between the two endpoints.
+        const auto lo = getLengthRange(rg->getLo(), indexAlphabet);
+        const auto hi = getLengthRange(rg->getHi(), indexAlphabet);
+        return std::make_pair(std::min(lo.first, hi.first), std::max(lo.second, hi.second));
     }
     UnexpectedRE("getLengthRange", re);
 }
@@ -277,12 +282,32 @@ int minMatchLength(const RE * re) {
     } else if (isa<CC>(re)) {
         return 1;
     } else if (const Name * n = dyn_cast<Name>(re)) {
-        return minMatchLength(n->getDefinition());
+        // An undefined (external) name has an unknown length.
+        const RE * const defn = n->getDefinition();
+        return defn ? minMatchLength(defn) : 0;
     } else if (const Capture * c = dyn_cast<Capture>(re)) {
         return minMatchLength(c->getCapturedRE());
     } else if (const Reference * r = dyn_cast<Reference>(re)) {
         return minMatchLength(r->getCapture());
-    } else if (isa<Start, End, Range, PropertyExpression, Group, Permute, Interleavable>(re)) {
+    } else if (const Group * g = dyn_cast<Group>(re)) {
+        return minMatchLength(g->getRE());
+    } else if (isa<Range>(re)) {
+        return 1;
+    } else if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(re)) {
+        return (pe->getKind() == PropertyExpression::Kind::Codepoint) ? 1 : 0;
+    } else if (const Permute * p = dyn_cast<Permute>(re)) {
+        int minLength = 0;
+        for (RE * term : *p) {
+            minLength += minMatchLength(term);
+        }
+        return minLength;
+    } else if (const Interleavable * s = dyn_cast<Interleavable>(re)) {
+        int minLength = 0;
+        for (RE * term : *s) {
+            minLength += minMatchLength(term);
+        }
+        return minLength;
+    } else if (isa<Start, End>(re)) {
         return 0;
     }
     UnexpectedRE("minMatchLength", re);
@@ -385,7 +410,9 @@ void ByteTestComplexity::gatherTests(RE * re) {
             if (testCount > testLimit) return;
         }
     } else if (const Name * n = dyn_cast<Name>(re)) {
-        gatherTests(n->getDefinition());
+        if (RE * const defn = n->getDefinition()) {
+            gatherTests(defn);
+        }
     } else if (const Alt * alt = dyn_cast<Alt>(re)) {
         for (RE * item : *alt) {
             gatherTests(item);
@@ -406,8 +433,26 @@ void ByteTestComplexity::gatherTests(RE * re) {
         gatherTests(e->getRH());
     } else if (const Group * g = dyn_cast<Group>(re)) {
         gatherTests(g->getRE());
-    } else if (!isa<Any, Start, End, Range, PropertyExpression, Capture,
-                    Reference, Permute, Interleavable>(re)) {
+    } else if (const Range * rg = dyn_cast<Range>(re)) {
+        gatherTests(rg->getLo());
+        gatherTests(rg->getHi());
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        gatherTests(c->getCapturedRE());
+    } else if (const Reference * r = dyn_cast<Reference>(re)) {
+        gatherTests(r->getCapture());
+    } else if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(re)) {
+        if (RE * resolved = pe->getResolvedRE()) {
+            gatherTests(resolved);
+        }
+    } else if (const Permute * p = dyn_cast<Permute>(re)) {
+        for (RE * term : *p) {
+            gatherTests(term);
+        }
+    } else if (const Interleavable * s = dyn_cast<Interleavable>(re)) {
+        for (RE * term : *s) {
+            gatherTests(term);
+        }
+    } else if (!isa<Any, Start, End>(re)) {
         UnexpectedRE("ByteTestComplexity::gatherTests", re);
     }
 }

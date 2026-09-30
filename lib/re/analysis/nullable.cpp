@@ -37,8 +37,30 @@ bool isNullable(const RE * re) {
         return isNullable(e->getLH()) && isNullable(e->getRH());
     } else if (const Group * g = dyn_cast<const Group>(re)) {
         return isNullable(g->getRE());
-    } else if (isa<Any, Assertion, CC, Range, End, Name, PropertyExpression,
-                   Capture, Reference, Start, Permute, Interleavable>(re)) {
+    } else if (const Name * n = dyn_cast<const Name>(re)) {
+        const RE * const defn = n->getDefinition();
+        return defn && isNullable(defn);
+    } else if (const Capture * c = dyn_cast<const Capture>(re)) {
+        return isNullable(c->getCapturedRE());
+    } else if (const Permute * p = dyn_cast<const Permute>(re)) {
+        for (const RE * term : *p) {
+            if (!isNullable(term)) {
+                return false;
+            }
+        }
+        return true;
+    } else if (const Interleavable * s = dyn_cast<const Interleavable>(re)) {
+        for (const RE * term : *s) {
+            if (!isNullable(term)) {
+                return false;
+            }
+        }
+        return true;
+    } else if (isa<Any, CC, Range, PropertyExpression>(re)) {
+        return false;
+    } else if (isa<Assertion, Start, End, Reference>(re)) {
+        // Zero-width or back-referenced: these match the empty string only in
+        // some contexts, so they are not unconditionally nullable.
         return false;
     }
     UnexpectedRE("isNullable", re);

@@ -435,7 +435,12 @@ Kernel * PipelineBuilder::makeKernel() {
 
             sig << typeCode[(unsigned)r->getClassTypeId()];
 
-            if (LLVM_UNLIKELY(isa<RepeatingStreamSet>(r))) {
+            if (LLVM_UNLIKELY(isa<ScalarConstant>(r))) {
+                // the value is compiled into the pipeline
+                sig << '(';
+                cast<ScalarConstant>(r)->value(mDriver.getContext())->print(sig);
+                sig << ')';
+            } else if (LLVM_UNLIKELY(isa<RepeatingStreamSet>(r))) {
                 const RepeatingStreamSet * rs = cast<RepeatingStreamSet>(r);
                 if (rs->isUnaligned()) {
                     sig << 'U';

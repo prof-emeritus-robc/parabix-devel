@@ -121,14 +121,8 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
         E.setStride(E.getTypeSystem().getBitBlockWidth());
 
-        std::string tmp;
-        raw_string_ostream name(tmp);
-        name << "gitignore";
-
         const auto n = patterns.size();
         assert (n > 0);
-        SmallVector<Kernel *, 32> pipeline;
-        pipeline.reserve(n + 1);
 
         Kernel * const outerKernel = mNested.back();
         StreamSet * resultSoFar = breaks;
@@ -138,7 +132,6 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             chained->setInputStreamSetAt(0, basisBits);
             chained->setInputStreamSetAt(1, U8index);
             chained->setInputStreamSetAt(2, breaks);
-            pipeline.push_back(chained);
             assert (chained->getNumOfStreamOutputs() > 0);
             resultSoFar = chained->getOutputStreamSet(0); assert (resultSoFar);
         }
@@ -168,32 +161,16 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             if (i || outerKernel || exclude) {
                 ctxt.setCombiningStream(resultSoFar, exclude ? RE_CombiningType::Exclude : RE_CombiningType::Include);
             }
-            Kernel * K = E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, MatchResults);
-            pipeline.push_back(K);
+            E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, MatchResults);
             resultSoFar = MatchResults;
 
         }
         assert (resultSoFar == E.getOutputStreamSet(0));
 
-        mGrepDriver.generateUncachedKernels();
-
-        for (Kernel * K : pipeline) {
-            char flags = '0';
-            if (K->getSharedStateType()) {
-                flags += 1;
-            }
-            if (LLVM_UNLIKELY(K->getThreadLocalStateType())) {
-                flags += 2;
-            }
-            if (LLVM_UNLIKELY(K->allocatesInternalStreamSets())) {
-                flags += 4;
-            }
-            name << flags;
-        }
-        name.flush();
-
-        E.setUniqueName(name.str());
-
+        // The default signature identifies each family-called kernel by its family
+        // name (its stride, attributes and bindings), so structurally different
+        // nested pipelines never share an object cache entry, while pipelines that
+        // differ only in their regular expressions do.
         kernel = E.makeKernel();
     }
 

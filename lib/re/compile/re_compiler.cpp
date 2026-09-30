@@ -48,6 +48,8 @@ private:
     Marker compileCC(CC * cc, Marker marker);
     Marker compileSeq(Seq * seq, Marker marker);
     Marker compileSeqTail(Seq::const_iterator current, const Seq::const_iterator end, int matchLenSoFar, Marker marker);
+    unsigned codeUnitCharacterSpan(Seq::const_iterator current, const Seq::const_iterator end, Marker marker);
+    Marker compileCodeUnitCharacter(Seq::const_iterator current, unsigned span, Marker marker);
     Marker compileAlt(Alt * alt, Marker base);
     Marker compileAssertion(Assertion * a, Marker marker);
     Marker compileRep(int LB, int UB, RE * repeated, Marker marker);
@@ -251,8 +253,13 @@ Marker RE_Block_Compiler::compileSeq(Seq * const seq, Marker marker) {
 
     // if-hierarchies are not inserted within unbounded repetitions
     if (mMain.mStarDepth > 0) {
-        for (RE * re : *seq) {
-            marker = process(re, marker);
+        for (auto current = seq->cbegin(); current != seq->cend(); ) {
+            if (const unsigned span = codeUnitCharacterSpan(current, seq->cend(), marker)) {
+                marker = compileCodeUnitCharacter(current, span, marker);
+                current += span;
+            } else {
+                marker = process(*current++, marker);
+            }
         }
         return marker;
     } else {
@@ -264,6 +271,14 @@ Marker RE_Block_Compiler::compileSeqTail(Seq::const_iterator current, const Seq:
     if (current == end) {
         return marker;
     } else if (matchLenSoFar < IfInsertionGap) {
+        if (const unsigned span = codeUnitCharacterSpan(current, end, marker)) {
+            marker = compileCodeUnitCharacter(current, span, marker);
+            int lgth = 0;
+            for (unsigned i = 0; i < span; ++i) {
+                lgth += minMatchLength(*current++);
+            }
+            return compileSeqTail(current, end, matchLenSoFar + lgth, marker);
+        }
         RE * r = *current;
         marker = process(r, marker);
         return compileSeqTail(++current, end, matchLenSoFar + minMatchLength(r), marker);
@@ -276,6 +291,74 @@ Marker RE_Block_Compiler::compileSeqTail(Seq::const_iterator current, const Seq:
         mPB.createIf(marker.stream(), nested);
         return Marker(m, m1.position());
     }
+}
+
+//
+//  A marker positioned AtNextChar lies on the final code unit of the next
+//  character (e.g., following a zero-width external).  If the RE continues with
+//  the individual UTF-8 code units of that character, they must be matched so
+//  as to end at the marker, rather than starting from it.  Return the number of
+//  sequence elements that encode that multibyte character, or 0 if no special
+//  treatment is needed (including single-byte characters, for which the first
+//  and final code units coincide).
+//
+static bool isUTF8CodeUnitRE(const RE * re, const cc::Alphabet * codeUnitAlphabet) {
+    if (const CC * cc = dyn_cast<CC>(re)) {
+        return cc->getAlphabet() == codeUnitAlphabet;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) {
+            if (!isUTF8CodeUnitRE(e, codeUnitAlphabet)) return false;
+        }
+        return !seq->empty();
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) {
+            if (!isUTF8CodeUnitRE(e, codeUnitAlphabet)) return false;
+        }
+        return !alt->empty();
+    }
+    return false;
+}
+
+unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, const Seq::const_iterator end, Marker marker) {
+    if ((marker.position() != Marker::Position::AtNextChar) || (mMain.mIndexingAlphabet == nullptr) ||
+            (mMain.mCodeUnitAlphabet != &cc::UTF8) || (current == end)) {
+        return 0;
+    }
+    const RE * const first = *current;
+    if (const CC * cc = dyn_cast<CC>(first)) {
+        if ((cc->getAlphabet() != &cc::UTF8) || cc->empty()) return 0;
+        const auto lo = lo_codepoint(cc->front());
+        const auto hi = hi_codepoint(cc->back());
+        unsigned lgth = 0;
+        if ((lo >= 0xC0) && (hi <= 0xDF)) lgth = 2;
+        else if ((lo >= 0xE0) && (hi <= 0xEF)) lgth = 3;
+        else if ((lo >= 0xF0) && (hi <= 0xF7)) lgth = 4;
+        else return 0;  // ASCII, continuation or mixed code units
+        unsigned available = 1;
+        for (auto i = std::next(current); (available < lgth) && (i != end); ++i, ++available) {
+            const CC * const cont = dyn_cast<CC>(*i);
+            if (!cont || (cont->getAlphabet() != &cc::UTF8)) return 0;
+        }
+        return (available == lgth) ? lgth : 0;
+    }
+    // A UTF-8 encoded character class (an Alt of code unit sequences, as
+    // produced by toUTF8) is one character; only multibyte ones need care.
+    if (isa<Alt>(first) && isUTF8CodeUnitRE(first, &cc::UTF8)) {
+        const auto range = getLengthRange(first, &cc::UTF8);
+        return (range.second > 1) ? 1 : 0;
+    }
+    return 0;
+}
+
+Marker RE_Block_Compiler::compileCodeUnitCharacter(Seq::const_iterator current, unsigned span, Marker marker) {
+    // Match the character's code units wherever they occur, then keep the
+    // occurrences whose final code unit is at the marker.
+    Marker charEnd(mPB.createOnes(), Marker::Position::AtNextChar);
+    for (unsigned i = 0; i < span; ++i) {
+        charEnd = process(*current++, charEnd);
+    }
+    assert (charEnd.position() == Marker::Position::AtEnd);
+    return Marker(mPB.createAnd(marker.stream(), charEnd.stream(), "aligned"), Marker::Position::AtEnd);
 }
 
 Marker RE_Block_Compiler::compileAlt(Alt * const alt, const Marker base) {

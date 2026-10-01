@@ -51,10 +51,10 @@ RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive, GrepLi
     return r;
 }
 
-RE * regular_expression_passes(RE * re) {
+RE * regular_expression_passes(RE * re, const cc::Alphabet * lengthAlpha) {
     //Optimization passes to simplify the AST.
     RE * r = re;
-    r = standardizeAssertions(r);
+    r = standardizeAssertions(r, lengthAlpha);
     r = convertToStarNormalForm(r);
     if (codegen::OptLevel > CodeGenOptLevel::Less) {
         r = minimizeRE(r);

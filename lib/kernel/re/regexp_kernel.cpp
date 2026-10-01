@@ -622,7 +622,7 @@ RE * RE_PipelineBuilder::spanFactoring(RE * re) {
 RE * RE_PipelineBuilder::prepareRE(RE * re) {
     const cc::Alphabet * lengthAlphabet = mCtxt.mLengthAlphabet;
     RE * xfrmedRE = expandPermutes(re);
-    xfrmedRE = regular_expression_passes(xfrmedRE);
+    xfrmedRE = regular_expression_passes(xfrmedRE, lengthAlphabet);
 
     UCD::PropertyExternalizer PE;
     xfrmedRE = PE.transformRE(xfrmedRE);

@@ -28,7 +28,7 @@
  *                       inPlayMask &= NOT(Advance(merge, lenA)). B is read from the
  *                       INPUT via LookAhead (forward reads are input-only; sourceIn
  *                       declares LookAhead(maxLen)). `source` threads kernel→kernel
- *                       (width grows to ceil_log2(hi+1) bits per range), so a
+ *                       (width grows to ceil_log2(hi) bits per range), so a
  *                       higher-rank merge sees ids stamped by lower-rank ones (the
  *                       Ġthe→Ġthey cascade).
  *
@@ -189,6 +189,50 @@ static cl::opt<bool> LevelPartition(
     "level-partition",
     cl::desc("Partition merge rules by ASAP level scheduling (minimum kernel count) "
              "instead of contiguous clean id ranges."),
+    cl::init(false));
+
+// Bit-tier partition: confine every kernel to merged ids of ONE bit length. Tier b holds
+// the rules with idAB in [2^(b-1), 2^b) — tier 9 = ids 256..511, tier 10 = 512..1023, …
+// Each tier is partitioned on its own (clean ranges, or --level-partition levels) and
+// the tiers run in order, so the first kernel of tier N+1 reads an N-bit id stream and
+// writes N+1 bits, and every later kernel of that tier reads and writes N+1 bits. Both
+// correctness constraints carry across a tier boundary for free: every rule of a lower
+// tier has lower rank and runs in a strictly earlier kernel, which is exactly what the
+// dependency and seam constraints ask of an earlier rule. Only the packing changes.
+static cl::opt<bool> PartitionByMergeIdBits(
+    "partition-by-merge-id-bits",
+    cl::desc("Confine each merge kernel to merged ids of a single bit length, so each "
+             "kernel grows the id stream by at most one bit."),
+    cl::init(false));
+
+// Cap the rules per merge kernel: a partition group with more than this many rules is
+// split into ceil(n/cap) consecutive kernels of near-equal size, in rank order. Pablo's
+// compile time is superlinear in kernel size, and --level-partition with
+// --partition-by-merge-id-bits puts most of a bit tier into its first level (8023 rules
+// in the 16-bit tier's first kernel). Splitting is exact: the rules of one group have
+// no dependencies or seams among each other that a later kernel could break —
+//   - dependency / seam: a lower-rank rule moves to an EARLIER kernel, which is what
+//     both constraints ask of it anyway;
+//   - --chain-partition: needsLiveId is recomputed per chunk; a child whose producer
+//     landed in an earlier chunk reads the producer's stamp from its frozen input;
+//   - --chain-veto: a competitor in an earlier chunk has already stamped its merged id
+//     over this rule's idB slot, so B-detect fails exactly where the veto would fire;
+//   - --asymmetric-seam: an earlier chunk's consume reaches this kernel through meIn.
+// 0 = no cap.
+static cl::opt<unsigned> MaxMergesPerKernel(
+    "max-merges-per-kernel",
+    cl::desc("Split any merge kernel with more than this many rules into consecutive "
+             "kernels of near-equal size (0 = no cap). Default 500."),
+    cl::init(500));
+
+// Compact once per bit tier: a FilterByMask after the LAST kernel producing N+1-bit ids,
+// so the first kernel producing N+2-bit ids reads a compacted stream. Combines with
+// --compact-base (a kernel compacts if either schedule asks). Intended for use with
+// --partition-by-merge-id-bits; without it, compacts wherever the id width grows.
+static cl::opt<bool> CompactByMergeIdBits(
+    "compact-by-merge-id-bits",
+    cl::desc("Apply FilterByMask compaction after the last kernel of each id bit width "
+             "(before the first kernel producing wider ids)."),
     cl::init(false));
 
 // Asymmetric seam (--level-partition only): drop the maxRight/idA seam constraint,
@@ -555,6 +599,28 @@ protected:
     }
 };
 
+// BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
+// bits. The emitter (P2S16Kernel) reads exactly 16 streams, but the final id stream
+// is only ceil_log2(hi) wide — fewer than 16 under --merges-limit — and reading a
+// narrower stream set as 16 elements misaligns every block.
+class BPEWidenKernel : public PabloKernel {
+public:
+    BPEWidenKernel(LLVMTypeSystemInterface & ts, StreamSet * idIn, StreamSet * idOut)
+    : PabloKernel(ts, "BPE_Widen" + std::to_string(idIn->getNumElements())
+                        + "to" + std::to_string(idOut->getNumElements()),
+                  {Binding{"idIn", idIn}},
+                  {Binding{"idOut", idOut}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> in = getInputStreamSet("idIn");
+        Var * out = getOutputStreamVar("idOut");
+        for (unsigned i = 0; i < out->getType()->getArrayNumElements(); i++)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)),
+                            i < in.size() ? in[i] : pb.createZeroes());
+    }
+};
+
 // Hash a rule group's (idA,idB,idAB,lenA,lenB) list → unique cache name per kernel,
 // since the Pablo body is data-dependent (same shape, different rules). lenA MUST be
 // in the hash: it is the LookAhead/Advance distance, and applyCompactionSchedule
@@ -589,7 +655,21 @@ static std::vector<bool> applyCompactionSchedule(
     //  Compact after every K kernels. The first block is always byte space (F=256),
     //  so the first K kernels see the original lenA = byte distance. 
     std::vector<bool> compactAfter(ruleRanges.size(), false);
-    if (nextCompaction == 0) return compactAfter;
+    if (nextCompaction == 0 && !CompactByMergeIdBits) return compactAfter;
+
+    // --compact-by-merge-id-bits: compact after kernel i when the next non-empty kernel
+    // writes a wider id stream (the last kernel of its bit tier). Never after the last.
+    std::vector<bool> widthGrowsAfter(ruleRanges.size(), false);
+    if (CompactByMergeIdBits) {
+        size_t prev = ruleRanges.size();
+        for (size_t i = 0; i < ruleRanges.size(); i++) {
+            if (ruleRanges[i].rules.empty()) continue;
+            if (prev < ruleRanges.size()
+                    && ceil_log2(ruleRanges[i].hi) > ceil_log2(ruleRanges[prev].hi))
+                widthGrowsAfter[prev] = true;
+            prev = i;
+        }
+    }
 
     // parts[idAB] = (idA, idB) for every merged token. Base ids (< 256) are absent —
     // they are atomic and terminate the recursion. lookup table
@@ -652,17 +732,19 @@ static std::vector<bool> applyCompactionSchedule(
         // Decide whether to compact after this range. If we do, every token stamped by
         // kernel <= i is now one slot wide, so the memo (built against the previous
         // compaction point) is stale and must be dropped.
-        if (++sinceCompact < nextCompaction) continue;
+        const bool byCount = nextCompaction > 0 && ++sinceCompact >= nextCompaction;
+        if (!byCount && !widthGrowsAfter[i]) continue;
         compactAfter[i] = true;
         lastCompactKernel = (long) i;
         memo.clear();
         sinceCompact = 0;
-        if (GeometricCompaction) {
+        if (byCount && GeometricCompaction) {
             nextCompaction *=2;
         }
         nCompact++;
     }
-    std::cerr << "[BPE] compaction: BPE_COMPACT_EVERY=" << K << " -> "
+    std::cerr << "[BPE] compaction: BPE_COMPACT_EVERY=" << K
+              << (CompactByMergeIdBits ? " + by merge id bits" : "") << " -> "
               << nCompact << " FilterByMask points\n";
     if (firstBlockDisagree)
         std::cerr << "[BPE] WARNING: " << firstBlockDisagree
@@ -758,7 +840,7 @@ public:
                         + (SkipInstCombine ? "ic1_" : "")
                         + (KeyCluster ? "kc1_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
-                        + "o" + std::to_string(ceil_log2(group.hi + 1))
+                        + "o" + std::to_string(ceil_log2(group.hi))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
                   mergeInputs(sourceIn, meIn, boundaryIn, nextIdIn, maxLen),
                   {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
@@ -787,7 +869,7 @@ protected:
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
         const unsigned W = srcBits.size();
-        const unsigned W_out = ceil_log2(mRuleGroup.hi + 1);
+        const unsigned W_out = ceil_log2(mRuleGroup.hi);
         PabloAST * zeroes = pb.createZeroes();
 
         // idAcc — the id stream we mutate; starts as a copy of the input ids.
@@ -1511,7 +1593,8 @@ BPEPassResult buildBPEPassPipeline(
     // debug: dump the merge-range groups to stderr. BPE_GROUPS=1 for the
     // per-group [lo,hi) xN maxLen=M lines too (verbose, 1 line/kernel).
     std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels ("
-              << (LevelPartition ? "ASAP level schedule" : "contiguous clean ranges") << ")\n";
+              << (LevelPartition ? "ASAP level schedule" : "contiguous clean ranges")
+              << (PartitionByMergeIdBits ? ", per merge id bit width" : "") << ")\n";
     if (std::getenv("BPE_GROUPS")) {
         for (const auto & g : ruleRanges)
             std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.rules.size()
@@ -1568,7 +1651,7 @@ BPEPassResult buildBPEPassPipeline(
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
         if (g.rules.empty()) continue;
-        unsigned output_bits = ceil_log2(g.hi+1);
+        unsigned output_bits = ceil_log2(g.hi);
         StreamSet * sOut  = P.CreateStreamSet(output_bits, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
         // 1. Make the copied/shifted stream
@@ -1610,6 +1693,12 @@ BPEPassResult buildBPEPassPipeline(
         inPlayMask = onesC;
     }
 
+    // The emitter packs exactly 16 id bits (P2S16Kernel); widen a narrower final stream.
+    if (source->getNumElements() < 16) {
+        StreamSet * source16 = P.CreateStreamSet(16, 1);
+        P.CreateKernelCall<BPEWidenKernel>(source, source16);
+        source = source16;
+    }
     // inPlayMask marks surviving (outermost) token STARTS; vocabID = source (start-anchored,
     // id stamped at each token's start). Emission scans inPlayMask and reads source there.
     return {inPlayMask, source};
@@ -2106,6 +2195,66 @@ static void keyCluster(std::vector<std::vector<MergeRule>> & levels) {
     levels.swap(out);
 }
 
+// splitOversizedGroups — apply --max-merges-per-kernel (see MaxMergesPerKernel). Each
+// chunk keeps the group's `hi` (a valid width bound, and it keeps `hi` monotone).
+static std::vector<MergeRuleGroup> splitOversizedGroups(std::vector<MergeRuleGroup> groups) {
+    const size_t cap = MaxMergesPerKernel;
+    if (cap == 0) return groups;
+    std::vector<MergeRuleGroup> out;
+    unsigned nSplit = 0;
+    for (auto & g : groups) {
+        const size_t n = g.rules.size();
+        if (n <= cap) { out.push_back(std::move(g)); continue; }
+        const size_t k = (n + cap - 1) / cap;
+        nSplit++;
+        for (size_t c = 0; c < k; c++) {
+            MergeRuleGroup sub;
+            sub.hi = g.hi;
+            sub.rules.assign(g.rules.begin() + n * c / k, g.rules.begin() + n * (c + 1) / k);
+            sub.lo = sub.rules.front().idAB;
+            std::unordered_set<unsigned> stamped;   // idABs stamped in this chunk
+            for (auto & r : sub.rules) {
+                if (r.needsLiveId) r.needsLiveId = stamped.count(r.idA) != 0;
+                stamped.insert(r.idAB);
+                sub.maxLen = std::max(sub.maxLen, std::max(r.lenA + r.lenB, r.vetoOff));
+            }
+            out.push_back(std::move(sub));
+        }
+    }
+    if (nSplit)
+        std::cerr << "[BPE] max-merges-per-kernel=" << cap << ": split " << nSplit
+                  << " kernels -> " << out.size() << " kernels total\n";
+    return out;
+}
+
+// cleanRangePartition — the default contiguous clean-range walk: lo = first rule's
+// idAB (its parts always precede it, so it always fits); extend while the rule is
+// dependency-independent (idA<lo && idB<lo) AND token-adjacency-overlap-free vs every
+// rule already in the group. The first rule violating either starts the next range.
+static std::vector<MergeRuleGroup> cleanRangePartition(const std::vector<MergeRule> & rules) {
+    std::vector<MergeRuleGroup> ranges;
+    size_t i = 0, n = rules.size();
+    while (i < n) {
+        MergeRuleGroup g;
+        g.lo = rules[i].idAB;                        // new range starts here
+        while (i < n && rules[i].idA < g.lo && rules[i].idB < g.lo) {
+            const MergeRule & cur = rules[i];
+            bool overlap = false;                    // token-adjacency: right == left
+            for (const MergeRule & p : g.rules)
+                if (cur.idB == p.idA || p.idB == cur.idA) { overlap = true; break; }
+            if (overlap) break;
+            unsigned mergedLen = cur.lenA + cur.lenB;
+            if (mergedLen > g.maxLen) g.maxLen = mergedLen;
+            g.rules.push_back(cur);
+            ++i;
+        }
+        g.hi = (i < n) ? rules[i].idAB               // next range's lo
+                       : rules[n - 1].idAB + 1;      // last range: past top id
+        ranges.push_back(std::move(g));
+    }
+    return ranges;
+}
+
 // Mark rules whose gate needs a POST-write live mask: an earlier (lower-rank) rule
 // in the SAME group already consumed this rule's idA as its own idB. Under the
 // default symmetric seam test (clean-range and --level-partition without
@@ -2167,14 +2316,32 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
               [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
 
     // 3. Partition. --level-partition takes the ASAP level schedule (minimum kernel
-    //    count, same constraints); the default is the clean_range walk: lo = first
-    //    rule's idAB (its parts always precede it, so it always fits); extend while the
-    //    rule is dependency-independent (idA<lo && idB<lo) AND token-adjacency-overlap-
-    //    free vs every rule already in the group. The first rule violating either
-    //    starts the next range.
+    //    count, same constraints); the default is the clean_range walk (see
+    //    cleanRangePartition). --partition-by-merge-id-bits partitions each idAB bit
+    //    tier separately and concatenates the tiers in order (see PartitionByMergeIdBits).
+    auto partition = [](const std::vector<MergeRule> & rs) {
+        return LevelPartition ? levelPartition(rs) : cleanRangePartition(rs);
+    };
+    std::vector<MergeRuleGroup> groups;
+    if (PartitionByMergeIdBits) {
+        // rules are rank-sorted, so each bit tier is a contiguous run of them
+        size_t i = 0, n = rules.size();
+        while (i < n) {
+            const unsigned bits = ceil_log2(rules[i].idAB + 1);   // bit length of idAB
+            size_t j = i;
+            while (j < n && ceil_log2(rules[j].idAB + 1) == bits) ++j;
+            auto tier = partition(std::vector<MergeRule>(rules.begin() + i, rules.begin() + j));
+            std::cerr << "[BPE] merge id bits " << bits << ": " << (j - i) << " rules in "
+                      << tier.size() << " kernels\n";
+            for (auto & g : tier) groups.push_back(std::move(g));
+            i = j;
+        }
+    } else {
+        groups = partition(rules);
+    }
+    groups = splitOversizedGroups(std::move(groups));
+    tagFlushPoints(groups);
     if (LevelPartition) {
-        auto groups = levelPartition(rules);
-        tagFlushPoints(groups);
         if (std::getenv("BPE_CHAIN_STATS")) {
             unsigned n = 0, total = 0;
             for (auto & g : groups) {
@@ -2188,29 +2355,6 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             std::cerr << "[BPE] chain-veto: " << gChainVetoRelaxed
                       << " rules kept their level via a runtime veto ("
                       << gChainVetoTerms << " competitor EQs)\n";
-        return groups;
     }
-
-    std::vector<MergeRuleGroup> ranges;
-    size_t i = 0, n = rules.size();
-    while (i < n) {
-        MergeRuleGroup g;
-        g.lo = rules[i].idAB;                        // new range starts here
-        while (i < n && rules[i].idA < g.lo && rules[i].idB < g.lo) {
-            const MergeRule & cur = rules[i];
-            bool overlap = false;                    // token-adjacency: right == left
-            for (const MergeRule & p : g.rules)
-                if (cur.idB == p.idA || p.idB == cur.idA) { overlap = true; break; }
-            if (overlap) break;
-            unsigned mergedLen = cur.lenA + cur.lenB;
-            if (mergedLen > g.maxLen) g.maxLen = mergedLen;
-            g.rules.push_back(cur);
-            ++i;
-        }
-        g.hi = (i < n) ? rules[i].idAB               // next range's lo
-                       : rules[n - 1].idAB + 1;      // last range: past top id
-        ranges.push_back(std::move(g));
-    }
-    tagFlushPoints(ranges);
-    return ranges;
+    return groups;
 }

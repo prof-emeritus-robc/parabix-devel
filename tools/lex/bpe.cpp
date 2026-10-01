@@ -345,6 +345,44 @@ static cl::opt<bool> BatchWriteback(
              "instead of one Advance + a full stamp per rule."),
     cl::init(false));
 
+// Apply the end-of-file mask ONCE per merge kernel instead of once per id compare.
+// cc::Parabix_CC_Compiler::compileCC wraps every result in InFile (cc_compiler.cpp:144),
+// one extra load+not+and per compare per block — 35,104 of them in the entry scopes alone
+// at the best config, ~16% of the always-run ops. With this flag the compares are built
+// as the same balanced AND tree (so Pablo CSE shares them exactly as before) but without
+// the InFile, and InFile is applied once to the kernel's live-start mask instead. Every
+// gate and every fire is ANDed with that mask, so nothing changes inside the file; past
+// EOF the threaded mask now reads 0 instead of 1. Cache tag io1_ (only when on).
+static cl::opt<bool> InFileOnce(
+    "infile-once",
+    cl::desc("Apply the end-of-file mask once per merge kernel (on the live-start mask) "
+             "instead of once per id compare."),
+    cl::init(false));
+
+// Grouped kernels with --if-test-significant-bits: fold the live-start mask into each
+// gate's id-compare AND tree instead of ANDing it onto the finished compare. The gate
+// condition was And(idHi_compare, meInFrozen) — one private AND per gate, ~35k across the
+// pipeline, all in the always-run entry scope. With the mask as one more leaf of the tree
+// it lands on a partial product that gates with the same bit length share (Pablo CSE), so
+// that AND is paid a handful of times per kernel instead of once per gate. Same value:
+// AND is associative and commutative. Cache tag gm1_.
+static cl::opt<bool> GateMaskFold(
+    "gate-mask-fold",
+    cl::desc("Grouped kernels: fold the live-start mask into each gate's shared id-compare "
+             "tree instead of one AND per gate."),
+    cl::init(false));
+
+// Compile time: leave InstCombine out of the LLVM IR passes for the BPE merge kernels
+// only (via the NoInstCombinePass marker in addOptimizationPasses; every other kernel and
+// every other tool keeps it). Profiling a cold 283-kernel compile put InstCombine at ~29%
+// of compile CPU, while Pablo has already simplified the and/or/not trees it works on.
+// Measured: cold compile 44 s -> 34 s, runtime unchanged (<=1%), compare_bpe MATCH.
+// Cache tag ic1_ (the IR passes are not part of the cache key otherwise).
+static cl::opt<bool> SkipInstCombine(
+    "skip-instcombine",
+    cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
+    cl::init(false));
+
 
 
 using namespace pablo;
@@ -703,6 +741,9 @@ public:
                         + (ChainVeto ? "cv1_" : "cv0_")
                         + (ChainFuseSiblings ? "fs1_" : "fs0_")
                         + (ChainUngateRoots ? "ur1_" : "ur0_")
+                        + (InFileOnce ? "io1_" : "")   // off = body identical to before → keep old names
+                        + (GateMaskFold ? "gm1_" : "")
+                        + (SkipInstCombine ? "ic1_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -711,6 +752,11 @@ public:
       mRuleGroup(group), mHasBoundary(boundaryIn != nullptr), mUseNextId(nextIdIn != nullptr),
       mGrouped(grouped) {}
 protected:
+    // --skip-instcombine: ask the driver to drop InstCombine for this kernel only.
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override {
+        PabloKernel::addOptimizationPasses(b, passes);
+        if (SkipInstCombine) passes.push_back(OptimizationPass::NoInstCombinePass);
+    }
     static std::vector<kernel::Binding> mergeInputs(
             StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
             StreamSet * nextIdIn, unsigned maxLen) {
@@ -745,7 +791,12 @@ protected:
         // Threaded kernel→kernel (meIn/meOut), seeded all-ones. Each fired merge clears
         // B's start (interior seam); A's start survives as AB's start. Final mask marks
         // the surviving (outermost) token STARTS — the stream emission scans.
-        Var * inPlayMask = pb.createVar("inPlayMask", getInputStreamSet("meIn")[0]);
+        // --infile-once: the end-of-file mask is applied here, once, instead of inside every
+        // id compare (see eqId below).
+        PabloAST * const meInMasked = InFileOnce
+            ? pb.createInFile(getInputStreamSet("meIn")[0], "meInFile")
+            : getInputStreamSet("meIn")[0];
+        Var * inPlayMask = pb.createVar("inPlayMask", meInMasked);
 
         // 3. Read the copy inside the body
         // nextIdBN — indexed mode: the NEXT LIVE token's id at each position (precomputed
@@ -796,7 +847,41 @@ protected:
         std::vector<PabloAST*> frozenBits(W_out);       // entry idAcc value, immutable
         for (unsigned i = 0; i < W_out; i++) frozenBits[i] = (i < W) ? srcBits[i] : zeroes;
         BixNum      srcFrozen(frozenBits.begin(), frozenBits.end());
-        PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
+        PabloAST *  meInFrozen = meInMasked;
+
+        // eqId(bits, v) = (bits == v): the same balanced AND tree the binary
+        // cc::Parabix_CC_Compiler builds for a single value (bit_pattern_expr: one term per
+        // bit, NOT for a 0 bit, pairwise AND reduction), so Pablo CSE shares the partial
+        // products across compares in a scope exactly as compileCC's trees did. compileCC
+        // then wraps the result in InFile; without --infile-once so does eqId (identical
+        // body), with it the InFile is dropped — every gate and fire is ANDed with
+        // meInFrozen/inPlayMask, which already carry it (meInMasked above).
+        // `extra` (optional) is ANDed in as one more leaf, placed FIRST so it pairs with the
+        // lowest tested bit: that product is shared by every compare over the same bits
+        // (placed last, an even bit count would carry it to the root — one private AND).
+        auto eqId = [&](auto & bld, const BixNum & bits, unsigned v,
+                        const std::string & name = std::string(),
+                        PabloAST * extra = nullptr) -> PabloAST * {
+            std::vector<PabloAST*> terms;
+            terms.reserve(bits.size() + 1);
+            if (extra) terms.push_back(extra);
+            for (unsigned i = 0; i < bits.size(); i++)
+                terms.push_back(((v >> i) & 1u) ? bits[i] : bld.createNot(bits[i]));
+            if (terms.empty()) terms.push_back(bld.createOnes());
+            while (terms.size() > 1) {
+                std::vector<PabloAST*> next;
+                next.reserve(terms.size() / 2 + 1);
+                for (size_t i = 0; i + 1 < terms.size(); i += 2)
+                    next.push_back(bld.createAnd(terms[i], terms[i + 1]));
+                if (terms.size() % 2 == 1) next.push_back(terms.back());
+                terms.swap(next);
+            }
+            if (!InFileOnce)
+                return bld.createInFile(terms[0], name.empty() ? std::string("expr") : name);
+            if (!name.empty() && isa<And>(terms[0]))   // label only an And we built, never an input bit
+                cast<Statement>(terms[0])->setName(bld.makeName(name));
+            return terms[0];
+        };
 
         // ── Batched write-back accumulators (--batch-writeback) ──────────────────
         // Each rule's gate only ORs its fire in here; the id-stamp write is applied
@@ -892,8 +977,7 @@ protected:
         // --level-partition symmetric seam) this is a no-op — conflict-freedom already
         // guarantees no rule's fire touches a position another same-kernel rule reads 
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
-            cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);
-            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask, "Astart_" + std::to_string(id));
+            return bld.createAnd(eqId(bld, srcFrozen, id), inPlayMask, "Astart_" + std::to_string(id));
         };
 
         // --chain-veto: suppress this rule where a lower-rank competitor claims its idB.
@@ -910,11 +994,11 @@ protected:
             std::vector<PabloAST*> vbits(W);
             for (unsigned i = 0; i < W; i++)
                 vbits[i] = body.createLookahead(srcBits[i], (int64_t) r.vetoOff);
-            cc::Parabix_CC_Compiler_Builder ccVeto(BixNum(vbits.begin(), vbits.end()));
+            const BixNum vetoBits(vbits.begin(), vbits.end());
             PabloAST * veto = nullptr;
             for (unsigned vid : r.vetoIdB) {
-                PabloAST * hit = ccVeto.compileCC("veto_" + std::to_string(r.idB) + "_" + std::to_string(vid),
-                                                  re::makeCC(vid), body);
+                PabloAST * hit = eqId(body, vetoBits, vid,
+                                      "veto_" + std::to_string(r.idB) + "_" + std::to_string(vid));
                 veto = veto ? body.createOr(veto, hit) : hit;
             }
             // The competitor only wins if it could actually FIRE, and it is subject to
@@ -955,24 +1039,20 @@ protected:
                 if (bLowDone >= bPeek->size()) {
                     BstartAtA = nullptr;
                 } else {
-                    cc::Parabix_CC_Compiler_Builder ccHiB(BixNum(bPeek->begin() + bLowDone, bPeek->end()));
-                    BstartAtA = ccHiB.compileCC(bstartName, re::makeCC(r.idB >> bLowDone), body);
+                    BstartAtA = eqId(body, BixNum(bPeek->begin() + bLowDone, bPeek->end()),
+                                     r.idB >> bLowDone, bstartName);
                 }
             } else if (mUseNextId) {
-                cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
-                BstartAtA = ccNext.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, nextIdBN, r.idB, bstartName);
             } else if (grpAhead) {   // chunk-cached shared peek (built once per lenA in the gate)
-                cc::Parabix_CC_Compiler_Builder ccAhead(grpAhead->at(r.lenA));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, grpAhead->at(r.lenA), r.idB, bstartName);
             } else if (LookaheadInGate) {
                 std::vector<PabloAST*> bits(W);
                 for (unsigned i = 0; i < W; i++)
                     bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
-                cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, BixNum(bits.begin(), bits.end()), r.idB, bstartName);
             } else {
-                cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, aheadByLenA.at(r.lenA), r.idB, bstartName);
             }
             PabloAST * fire = !BstartAtA ? fireStart : body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
@@ -1113,8 +1193,8 @@ protected:
             std::vector<PabloAST*> bits(W);
             for (unsigned i = 0; i < W; i++)
                 bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
-            cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-            PabloAST * BstartAtA = ccAhead.compileCC("Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB), re::makeCC(r.idB), body);
+            PabloAST * BstartAtA = eqId(body, BixNum(bits.begin(), bits.end()), r.idB,
+                                        "Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
             PabloAST * fire = body.createAnd(fireStart, BstartAtA, "chainfire_" + std::to_string(r.idA) + "_"  + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {
                 PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
@@ -1245,9 +1325,11 @@ protected:
                 if (hiBits > 0) {
                     const unsigned prefix = sorted[s]->idA >> loBits;
                     const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
-                    cc::Parabix_CC_Compiler_Builder ccHi(hiFrozen);
-                    inRange = ccHi.compileCC("idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
-                                             re::makeCC(prefix), pb);
+                    // --gate-mask-fold: the mask rides inside the shared tree, so inRange
+                    // IS the gate condition (prefixAstart still ANDs the live inPlayMask).
+                    inRange = eqId(pb, hiFrozen, prefix,
+                                   "idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
+                                   GateMaskFold ? meInFrozen : nullptr);
                 } else {
                     unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
                     cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
@@ -1285,8 +1367,7 @@ protected:
                         PabloAST * m = inRange;
                         if (loBits > 0) {
                             const unsigned lo = idA & ((1u << loBits) - 1u);
-                            cc::Parabix_CC_Compiler_Builder ccLo(loFrozen);
-                            m = body.createAnd(m, ccLo.compileCC(re::makeCC(lo), body), "idMatch_" + std::to_string(idA));
+                            m = body.createAnd(m, eqId(body, loFrozen, lo), "idMatch_" + std::to_string(idA));
                         }
                         f = idMatchInGroup.emplace(idA, m).first;
                     }
@@ -1336,9 +1417,8 @@ protected:
                     PabloAST * embedCond = fireStart;
                     if (bLowUsed > 0) {
                         const unsigned lowB = r.idB & ((1u << bLowUsed) - 1u);
-                        cc::Parabix_CC_Compiler_Builder ccLoB(BixNum(bPeek.begin(), bPeek.begin() + bLowUsed));
-                        PabloAST * bLoMatch = ccLoB.compileCC(
-                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB), re::makeCC(lowB), body);
+                        PabloAST * bLoMatch = eqId(body, BixNum(bPeek.begin(), bPeek.begin() + bLowUsed), lowB,
+                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB));
                         embedCond = body.createAnd(fireStart, bLoMatch,
                             "embed_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
                     }
@@ -1346,7 +1426,8 @@ protected:
                     emitBody(inner, r, embedCond, grpAhead, grpBoundary, &bPeek, bLowUsed);
                     body.createIf(embedCond, inner);
                 }
-                pb.createIf(pb.createAnd(inRange, meInFrozen), body);
+                const bool maskInRange = GateMaskFold && hiBits > 0;
+                pb.createIf(maskInRange ? inRange : pb.createAnd(inRange, meInFrozen), body);
             }
         }
 

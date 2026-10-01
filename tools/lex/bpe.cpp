@@ -383,6 +383,18 @@ static cl::opt<bool> SkipInstCombine(
     cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
     cl::init(false));
 
+static cl::opt<bool> KeyCluster(
+    "key-cluster",
+    cl::desc("With --level-partition and --if-test-significant-bits: move rules (only later, only "
+             "inside their compaction segment) so rules sharing a gate key share a kernel."),
+    cl::init(false));
+
+static cl::opt<unsigned> KeyClusterCap(
+    "key-cluster-cap",
+    cl::desc("With --key-cluster: never move a rule into a kernel already holding this many "
+             "rules (0 = no cap, the default)."),
+    cl::init(0));
+
 
 
 using namespace pablo;
@@ -744,6 +756,7 @@ public:
                         + (InFileOnce ? "io1_" : "")   // off = body identical to before → keep old names
                         + (GateMaskFold ? "gm1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
+                        + (KeyCluster ? "kc1_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -1795,6 +1808,8 @@ static unsigned rawByteLen(const std::string & s) {
 static unsigned gChainVetoRelaxed = 0;   // rules carrying a runtime veto
 static unsigned gChainVetoTerms   = 0;   // total competitor EQs those rules emit
 
+static void keyCluster(std::vector<std::vector<MergeRule>> & levels);
+
 static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules) {
     std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps i
     // token -> highest level using it as idA  
@@ -1899,7 +1914,8 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         keepMax(maxLeft,  r.idA, lvl);
         keepMax(maxRight, r.idB, lvl);
     }
-    // map the level-partitioned rules into MergeRuleGroups, 
+    if (KeyCluster) keyCluster(levels);
+    // map the level-partitioned rules into MergeRuleGroups,
     // each level will be a MergeRuleGroup, and compute the lo/hi/maxLen for each group.
     std::vector<MergeRuleGroup> ranges;
     unsigned runningMax = 255;                          // base alphabet occupies 0..255, the largest token ID we've seen so far is 255
@@ -1919,6 +1935,175 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         ranges.push_back(std::move(g));
     }
     return ranges;
+}
+
+// --key-cluster: re-level the ASAP schedule so rules sharing a gate key (idA's
+// --if-test-significant-bits=K key, as in the grouped path) land in ONE kernel and
+// share one gate test, instead of each kernel of a segment testing the same key.
+// A rule only moves LATER, and only inside its ASAP compaction segment (so every
+// stream length is unchanged). Every rank-order dependency and seam constraint of
+// levelPartition's strict pass is re-checked against the NEW levels while placing,
+// so the result is as valid as ASAP. Port of analysis/bpe_model/partition/
+// chain_sched.py key_cluster ('KC: chain, keep today nests'): model -38%
+// block-weighted gate tests, same 283 kernels, 0 fire mismatches vs HF.
+static void keyCluster(std::vector<std::vector<MergeRule>> & levels) {
+    const int lowerLimit = effIfGroupLowerLimit();
+    if (AsymmetricSeam || ChainVeto || IfTestSignificantBits == 0 || lowerLimit < 0) {
+        std::cerr << "[BPE] --key-cluster ignored: needs grouping with --if-test-significant-bits, "
+                     "and no --asymmetric-seam / --chain-veto\n";
+        return;
+    }
+    const bool chain = ChainPartition;
+    const unsigned K = IfTestSignificantBits;
+    const unsigned NL = levels.size();
+    // Rules in rank order (= idAB order) with their ASAP level E0 (1-based).
+    std::vector<MergeRule> rules;
+    std::vector<unsigned> E0;
+    for (unsigned l = 0; l < NL; l++)
+        for (const auto & r : levels[l]) { rules.push_back(r); E0.push_back(l + 1); }
+    const size_t R = rules.size();
+    {
+        std::vector<size_t> ord(R);
+        for (size_t i = 0; i < R; i++) ord[i] = i;
+        std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return rules[a].idAB < rules[b].idAB; });
+        std::vector<MergeRule> rs; std::vector<unsigned> es;
+        for (size_t i : ord) { rs.push_back(rules[i]); es.push_back(E0[i]); }
+        rules.swap(rs); E0.swap(es);
+    }
+    // segEnd[l] = last level of l's compaction segment (same points applyCompactionSchedule picks).
+    std::vector<unsigned> segEnd(NL + 1, NL);
+    if (CompactionBase > 0) {
+        std::vector<unsigned> ends;
+        unsigned next = CompactionBase, since = 0;
+        for (unsigned i = 0; i < NL; i++) {
+            if (++since < next) continue;
+            ends.push_back(i + 1); since = 0;
+            if (GeometricCompaction) next *= 2;
+        }
+        for (unsigned l = 1; l <= NL; l++) {
+            auto it = std::lower_bound(ends.begin(), ends.end(), l);
+            segEnd[l] = (it != ends.end()) ? *it : NL;
+        }
+    }
+    using Map = std::unordered_map<unsigned, unsigned>;
+    auto get = [](const Map & m, unsigned k) -> unsigned { auto it = m.find(k); return it == m.end() ? 0 : it->second; };
+    auto keepMax = [](Map & m, unsigned k, unsigned v) { unsigned & s = m[k]; if (v > s) s = v; };
+    auto keepMin = [](Map & m, unsigned k, unsigned v) { auto it = m.find(k); if (it == m.end() || v < it->second) m[k] = v; };
+    auto bound = [](const Map & m, unsigned k, unsigned off, unsigned & u) {
+        auto it = m.find(k); if (it != m.end()) u = std::min(u, it->second - off);
+    };
+    // ALAP (reverse rank order): the latest level each rule can take with every later rule
+    // at or below ITS latest level, capped at the end of the rule's ASAP segment.
+    std::vector<unsigned> L(R);
+    {
+        Map minLns, minLs, minR;   // token -> min level of a later rule using it as A (non-self / self), as B
+        for (size_t p = R; p-- > 0; ) {
+            const MergeRule & r = rules[p];
+            unsigned u = segEnd[E0[p]];
+            bound(minLns, r.idAB, chain ? 0 : 1, u);   // a later rule built on idAB (nestable under chain)
+            bound(minLs,  r.idAB, 1, u);
+            bound(minR,   r.idAB, 1, u);
+            bound(minLns, r.idB, 1, u);                // seam: a later rule's A is our B
+            bound(minLs,  r.idB, 1, u);
+            bound(minR,   r.idA, 1, u);                // seam: a later rule's B is our A
+            L[p] = std::max(u, E0[p]);                 // ASAP is feasible, so u >= E0 (defensive)
+            keepMin(r.idA == r.idB ? minLs : minLns, r.idA, L[p]);
+            keepMin(minR, r.idB, L[p]);
+        }
+    }
+    auto keyOf = [&](unsigned idA) -> uint64_t {
+        const unsigned b = idA ? 32u - __builtin_clz(idA) : 0;
+        const unsigned lo = (b > K) ? b - K : 0;
+        return (uint64_t(lo) << 32) | (idA >> lo);
+    };
+    // Rules left in place: the flat kernels (below the grouping limit) and today's nests.
+    std::vector<char> skip(R);
+    for (size_t q = 0; q < R; q++) skip[q] = (E0[q] <= (unsigned) lowerLimit) || rules[q].needsLiveId;
+    // Per key: fewest levels that stab every rule's window [lo, L] (greedy by right end),
+    // each point pulled down to the latest left end it covers.
+    std::unordered_map<uint64_t, std::vector<size_t>> byKey;
+    for (size_t q = 0; q < R; q++) if (!skip[q]) byKey[keyOf(rules[q].idA)].push_back(q);
+    auto stab = [&](const std::vector<unsigned> & lo) {
+        std::vector<unsigned> tgt = lo;
+        for (auto & kv : byKey) {
+            std::vector<size_t> idx = kv.second;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return L[a] < L[b]; });
+            while (!idx.empty()) {
+                const unsigned point = L[idx[0]];
+                unsigned p2 = 0;
+                std::vector<size_t> rest;
+                for (size_t v : idx) if (lo[v] <= point) p2 = std::max(p2, lo[v]); else rest.push_back(v);
+                for (size_t v : idx) if (lo[v] <= point) tgt[v] = p2;
+                idx.swap(rest);
+            }
+        }
+        return tgt;
+    };
+    // Rank-order placement: earliest legal level ep from the rules ALREADY placed, then
+    // the target clipped into [ep, L]. nested[q] = idA's producer sits at the same level.
+    std::vector<unsigned> lv(R), cnt(NL + 2);
+    std::vector<char> nested(R);
+    auto realize = [&](const std::vector<unsigned> & tgt) {
+        Map prod, maxL, maxR;
+        std::fill(cnt.begin(), cnt.end(), 0);
+        for (size_t q = 0; q < R; q++) {
+            const MergeRule & r = rules[q];
+            const bool nestable = chain && r.idA != r.idB;
+            const unsigned ep = std::max({1u, get(prod, r.idA) + (nestable ? 0u : 1u), get(prod, r.idB) + 1u,
+                                          get(maxR, r.idA) + 1u, get(maxL, r.idB) + 1u});
+            unsigned l;
+            if (rules[q].needsLiveId && get(prod, r.idA) == ep) l = ep;   // keep today's nest
+            else l = std::max(ep, std::min(tgt[q], L[q]));
+            if (KeyClusterCap > 0 && l > ep && cnt[l] >= KeyClusterCap) l = ep;
+            if (l >= cnt.size()) cnt.resize(l + 1);
+            lv[q] = l; cnt[l]++;
+            nested[q] = nestable && get(prod, r.idA) == l;
+            prod[r.idAB] = l;
+            keepMax(maxL, r.idA, l);
+            keepMax(maxR, r.idB, l);
+        }
+    };
+    // Static gate count: distinct (level, key) over grouped, non-nested rules.
+    auto gates = [&](const std::vector<unsigned> & lvls, const std::vector<char> & nst) {
+        std::unordered_set<uint64_t> s;
+        for (size_t q = 0; q < R; q++)
+            if (lvls[q] > (unsigned) lowerLimit && !nst[q]) s.insert((uint64_t(lvls[q]) << 40) ^ keyOf(rules[q].idA));
+        return s.size();
+    };
+    std::vector<char> nested0(R);
+    for (size_t q = 0; q < R; q++) nested0[q] = rules[q].needsLiveId;
+    const size_t gates0 = gates(E0, nested0);
+    size_t bestGates = gates0;
+    std::vector<unsigned> best = E0;
+    std::vector<char> bestNested = nested0;
+    std::vector<unsigned> lo = E0;
+    for (int it = 0; it < 3; it++) {
+        realize(stab(lo));
+        const size_t g = gates(lv, nested);
+        if (g < bestGates) { bestGates = g; best = lv; bestNested = nested; }
+        // next round's windows: the lower bound from every predecessor except the
+        // chain parent (it can follow the rule), under the schedule just built
+        Map prod, maxL, maxR;
+        for (size_t q = 0; q < R; q++) {
+            const MergeRule & r = rules[q];
+            unsigned x = std::max({1u, get(prod, r.idB) + 1u, get(maxR, r.idA) + 1u, get(maxL, r.idB) + 1u});
+            if (!chain || r.idA == r.idB || r.idA < 256) x = std::max(x, get(prod, r.idA) + 1u);
+            lo[q] = std::max(x, E0[q]);
+            prod[r.idAB] = lv[q]; keepMax(maxL, r.idA, lv[q]); keepMax(maxR, r.idB, lv[q]);
+        }
+    }
+    size_t maxBefore = 0, maxAfter = 0;
+    for (auto & v : levels) maxBefore = std::max(maxBefore, v.size());
+    std::vector<std::vector<MergeRule>> out(*std::max_element(best.begin(), best.end()));
+    for (size_t q = 0; q < R; q++) {
+        MergeRule rc = rules[q];
+        rc.needsLiveId = bestNested[q];
+        out[best[q] - 1].push_back(rc);        // q runs in rank order → each level stays rank-sorted
+    }
+    for (auto & v : out) maxAfter = std::max(maxAfter, v.size());
+    std::cerr << "[BPE] --key-cluster: static gates " << gates0 << " -> " << bestGates
+              << ", max rules/kernel " << maxBefore << " -> " << maxAfter << "\n";
+    levels.swap(out);
 }
 
 // Mark rules whose gate needs a POST-write live mask: an earlier (lower-rank) rule

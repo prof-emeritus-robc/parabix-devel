@@ -954,6 +954,10 @@ start_of_transfer_loop:
                         goto start_of_transfer_loop;
                     }
 
+                    // The earliest position of a partition whose root consumes this kernel's
+                    // output; the kernel must remain scheduled before any such partition.
+                    unsigned rootConsumerPos = -1U;
+
                     for (auto e : make_iterator_range(out_edges(currentPartId, partGraph))) {
                         auto & bi = partGraph[e];
                         if (bi.Producer == potentiallyTransferedKernel) {
@@ -968,6 +972,7 @@ start_of_transfer_loop:
                             const auto selectedRoot = roots[0];
 
                             if (c == selectedRoot) {
+                                rootConsumerPos = std::min<unsigned>(rootConsumerPos, ordinal[consumerPartId]);
                                 const auto & H = partitionPostDominators[consumerPartId];
                                 assert (H.test(consumerPartId) == 1);
                                 assert (H.test(currentPartId) == 0);
@@ -1011,6 +1016,16 @@ start_of_transfer_loop:
                                 transferPos = pos;
                             }
                         }
+                    }
+
+                    // Pruning the destinations dominated by a root consumer may leave only
+                    // destinations on a parallel path that is scheduled after that consumer's
+                    // partition (e.g., two lookaheads sharing a character class kernel); moving
+                    // the kernel there would create a cycle.  The pruned edges are gone, so the
+                    // kernel is no longer a candidate for transfer.
+                    if ((transferPos != -1U) && (transferPos >= rootConsumerPos)) {
+                        itr = Transfer.erase(itr);
+                        goto start_of_transfer_loop;
                     }
 
                     // A kernel may not be moved into a partition whose streams are extended by a

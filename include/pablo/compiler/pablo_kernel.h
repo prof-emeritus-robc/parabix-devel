@@ -141,7 +141,8 @@ public:
 
     bool requiresExplicitPartialFinalStride() const override;
 
-    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
+    // Not final: a Pablo kernel may extend it (call this, then add its own selections).
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override;
 
 protected:
 

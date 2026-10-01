@@ -538,7 +538,11 @@ public:
         MemCpyOptPass,
         AggressiveInstCombinePass,
         NewGVNPass,
-        PHICanonicalizerPass
+        PHICanonicalizerPass,
+        // Not a pass: a kernel that adds this marker in addOptimizationPasses drops
+        // InstCombine from the base pass list the driver runs on every kernel. For
+        // kernels whose IR is already simplified upstream (e.g. Pablo-generated).
+        NoInstCombinePass
     };
 
     using SelectedOptimizationPasses = llvm::SmallVector<OptimizationPass, 6>;

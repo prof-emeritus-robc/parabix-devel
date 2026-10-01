@@ -14,7 +14,7 @@
 #include <re/transforms/re_simplifier.h>
 #include <re/transforms/re_star_normal.h>
 #include <re/transforms/resolve_diffs.h>
-#include <re/transforms/remove_nullable.h>
+#include <re/transforms/assertion_transformations.h>
 #include <re/unicode/boundaries.h>
 #include <re/unicode/casing.h>
 #include <re/unicode/decomposition.h>
@@ -54,7 +54,7 @@ RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive, GrepLi
 RE * regular_expression_passes(RE * re) {
     //Optimization passes to simplify the AST.
     RE * r = re;
-    r = removeNullableLookaheadSuffixes(r);
+    r = standardizeAssertions(r);
     r = convertToStarNormalForm(r);
     if (codegen::OptLevel > CodeGenOptLevel::Less) {
         r = minimizeRE(r);

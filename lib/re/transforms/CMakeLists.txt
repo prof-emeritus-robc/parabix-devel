@@ -22,6 +22,7 @@ SRC
     to_utf8.cpp
     expand_permutes.cpp
     variable_alt_promotion.cpp
+    assertion_transformations.cpp
 DEPS
     re.analysis
     re.printer

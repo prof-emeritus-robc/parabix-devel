@@ -33,3 +33,9 @@ UCD-scripts/generated*
 
 # Don't track test outputs
 TestOutput*
+
+# Claude working files
+CLAUDE.md
+
+# binary files
+*.bin

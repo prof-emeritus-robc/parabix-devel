@@ -60,6 +60,7 @@
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
 #include <re/adt/re_cc.h>
+#include <ucd/core/unicode_set.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/stream_shift.h>   // IndexedShiftBack (BPE_INDEXED_SHIFT)
@@ -439,6 +440,18 @@ static cl::opt<bool> SkipInstCombine(
     "skip-instcombine",
     cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
     cl::init(false));
+
+// Bit-transformation kernels (BPEXfrmKernel): a merge kernel whose input id stream has
+// fewer than this many bits computes every output bit as input XOR a "change" stream,
+// where each change stream is one character class compiled over the (A id, B id) pair.
+// 0 = off. At most 11: the pair vector has 2N bits, and a character class holds at most
+// 21 (codepoints stop at 0x10FFFF).
+static cl::opt<unsigned> MaxBitXfrmLimit(
+    "max-bit-xfrm-limit",
+    cl::desc("Build merge kernels whose input id stream has fewer than N bits as bit "
+             "transformations: one compiled character class per output bit and lookahead "
+             "distance (0 = off, the default; at most 11)."),
+    cl::init(0));
 
 static cl::opt<bool> KeyCluster(
     "key-cluster",
@@ -1634,6 +1647,166 @@ private:
     bool mUseNextId;
     bool mGrouped;
 };
+// ─── BPEXfrmKernel (--max-bit-xfrm-limit) ───────────────────────────────────
+// A merge kernel built as a set of bit transformations instead of per-rule gates. Same
+// bindings and semantics as BPEMergeKernel; it handles groups whose rules read only the
+// frozen kernel input (no --chain-partition nest, --asymmetric-seam live mask or
+// --chain-veto; see bitXfrmEligible).
+//
+// For an input id stream of N bits, rules are bucketed by L = lenA, the lookahead
+// distance at which their B part starts. For each L the kernel forms one 2N-bit vector
+//     V_L = [ id bits 0..N-1 at p ,  id bits 0..N-1 at p+L ]
+// so a rule's (idA, idB) pair is the value idA | idB << N. For every output bit j, the
+// rules of that bucket whose idAB bit j differs from idA bit j (for j >= N: whose idAB
+// bit j is set, the input bit being 0) form a set of such values; cc::Parabix_CC_Compiler
+// compiles it over V_L, and
+//     change_j = OR over L of ( CC_{L,j}(V_L) AND live AND NOT boundary(p+L) )
+//     out_j    = in_j XOR change_j.
+// The union of a bucket's values, under the same mask, is its fire stream, and the B
+// starts are consumed as in BPEMergeKernel: live &= NOT Advance(fire_L, L).
+//
+// Exactness: within one kernel at most one rule fires at a position (the frozen id there
+// selects idA, and rules sharing idA share L and so read one B slot), and same-kernel
+// rules never touch each other's positions (dependency + seam constraints), so XOR-ing
+// all change streams from the frozen input equals applying the rules one by one.
+//
+// Self-merges X+X need per-run pairing (selfMergeFireStarts), which a character class
+// cannot express; they keep a per-rule stamp here. The seam constraints keep every other
+// rule off their positions, so the stamp and the change streams never meet.
+class BPEXfrmKernel : public PabloKernel {
+public:
+    BPEXfrmKernel(LLVMTypeSystemInterface & ts,
+                  StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
+                  StreamSet * sourceOut, StreamSet * meOut,
+                  MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
+    : PabloKernel(ts, std::string("BPEXfrm_") + (boundaryIn ? "b1_" : "")
+                        + (SkipInstCombine ? "ic1_" : "")
+                        + "w" + std::to_string(sourceIn->getNumElements())
+                        + "o" + std::to_string(ceil_log2(group.hi))
+                        + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
+                  xfrmInputs(sourceIn, meIn, boundaryIn, maxLen),
+                  {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
+      mRuleGroup(std::move(group)), mHasBoundary(boundaryIn != nullptr) {}
+protected:
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override {
+        PabloKernel::addOptimizationPasses(b, passes);
+        if (SkipInstCombine) passes.push_back(OptimizationPass::NoInstCombinePass);
+    }
+    static std::vector<kernel::Binding> xfrmInputs(StreamSet * sourceIn, StreamSet * meIn,
+                                                   StreamSet * boundaryIn, unsigned maxLen) {
+        std::vector<kernel::Binding> in {
+            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
+            Binding{"meIn", meIn} };
+        if (boundaryIn)
+            in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
+        return in;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
+        const unsigned N = srcBits.size();
+        const unsigned W_out = ceil_log2(mRuleGroup.hi);
+        PabloAST * const live = getInputStreamSet("meIn")[0];
+        PabloAST * const boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
+
+        // Per lookahead distance L: the CC rules and the self-merges.
+        std::map<unsigned, std::vector<const MergeRule *>> byLen;
+        std::vector<const MergeRule *> selfMerges;
+        for (const auto & r : mRuleGroup.rules)
+            (r.idA == r.idB ? selfMerges : byLen[r.lenA]).push_back(&r);
+
+        std::map<unsigned, std::vector<PabloAST *>> aheadBits;   // id bits L slots ahead
+        auto ahead = [&](unsigned L) -> const std::vector<PabloAST *> & {
+            auto & v = aheadBits[L];
+            if (v.empty())
+                for (unsigned i = 0; i < N; i++) v.push_back(pb.createLookahead(srcBits[i], (int64_t) L));
+            return v;
+        };
+        // gate(L) = live AND NOT (a pretoken boundary at B's start)
+        auto gate = [&](unsigned L) -> PabloAST * {
+            if (!mHasBoundary) return live;
+            return pb.createAnd(live, pb.createNot(pb.createLookahead(boundaryBit, (int64_t) L)),
+                                "gate_L" + std::to_string(L));
+        };
+
+        std::vector<PabloAST *> change(W_out, nullptr);
+        PabloAST * consumed = nullptr;   // B starts to clear from the live mask
+        auto orInto = [&](PabloAST *& acc, PabloAST * v) { acc = acc ? pb.createOr(acc, v) : v; };
+
+        for (const auto & [L, rules] : byLen) {
+            std::vector<PabloAST *> pairBits(srcBits.begin(), srcBits.end());
+            const auto & bBits = ahead(L);
+            pairBits.insert(pairBits.end(), bBits.begin(), bBits.end());
+            cc::Parabix_CC_Compiler ccc(pairBits);
+            PabloAST * const g = gate(L);
+
+            UCD::UnicodeSet fireSet;
+            std::vector<UCD::UnicodeSet> changeSet(W_out);
+            for (const MergeRule * r : rules) {
+                const re::codepoint_t v = r->idA | (r->idB << N);
+                fireSet.insert(v);
+                for (unsigned j = 0; j < W_out; j++) {
+                    const unsigned inBit = (j < N) ? ((r->idA >> j) & 1u) : 0u;
+                    if (((r->idAB >> j) & 1u) != inBit) changeSet[j].insert(v);
+                }
+            }
+            const std::string tag = "_L" + std::to_string(L);
+            PabloAST * fire = pb.createAnd(ccc.compileCC("fire" + tag, re::makeCC(std::move(fireSet)), pb), g);
+            orInto(consumed, pb.createAdvance(fire, (int64_t) L));
+            for (unsigned j = 0; j < W_out; j++) {
+                if (changeSet[j].empty()) continue;
+                PabloAST * cj = ccc.compileCC("chg" + std::to_string(j) + tag,
+                                              re::makeCC(std::move(changeSet[j])), pb);
+                orInto(change[j], pb.createAnd(cj, g));
+            }
+        }
+
+        // out_j = in_j XOR change_j
+        std::vector<PabloAST *> outBits(W_out);
+        for (unsigned j = 0; j < W_out; j++) {
+            PabloAST * in = (j < N) ? srcBits[j] : pb.createZeroes();
+            outBits[j] = change[j] ? pb.createXor(in, change[j], "xfrm_" + std::to_string(j)) : in;
+        }
+
+        // Self-merges: per-run pairing, then an explicit stamp of idAB.
+        for (const MergeRule * r : selfMerges) {
+            std::vector<PabloAST *> terms;
+            auto eqTerms = [&](const std::vector<PabloAST *> & bits, unsigned id) {
+                PabloAST * e = nullptr;
+                for (unsigned i = 0; i < N; i++) {
+                    PabloAST * t = ((id >> i) & 1u) ? bits[i] : pb.createNot(bits[i]);
+                    e = e ? pb.createAnd(e, t) : t;
+                }
+                return e;
+            };
+            PabloAST * isX = pb.createInFile(pb.createAnd(eqTerms(srcBits, r->idA), live));
+            PabloAST * fire = selfMergeFireStarts(pb, isX, r->lenA);
+            fire = pb.createAnd(fire, eqTerms(ahead(r->lenA), r->idB));
+            fire = pb.createAnd(fire, gate(r->lenA), "selffire_" + std::to_string(r->idAB));
+            orInto(consumed, pb.createAdvance(fire, (int64_t) r->lenA));
+            for (unsigned j = 0; j < W_out; j++)
+                outBits[j] = ((r->idAB >> j) & 1u) ? pb.createOr(outBits[j], fire)
+                                                   : pb.createAnd(outBits[j], pb.createNot(fire));
+        }
+
+        Var * sOut = getOutputStreamVar("sourceOut");
+        for (unsigned j = 0; j < W_out; j++)
+            pb.createAssign(pb.createExtract(sOut, pb.getInteger(j)), outBits[j]);
+        PabloAST * meOut = consumed ? pb.createAnd(live, pb.createNot(consumed), "liveOut") : live;
+        pb.createAssign(pb.createExtract(getOutputStreamVar("meOut"), pb.getInteger(0)), meOut);
+    }
+private:
+    MergeRuleGroup mRuleGroup;
+    bool mHasBoundary;
+};
+
+// A group can be built by BPEXfrmKernel iff every rule reads only the frozen kernel input.
+static bool bitXfrmEligible(const MergeRuleGroup & g) {
+    for (const auto & r : g.rules)
+        if (r.needsLiveId || r.needsFlush || !r.vetoIdB.empty()) return false;
+    return true;
+}
+
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
 //   1. buildMergeRuleRanges() partitions merges into clean id-ranges (dependency-independent
@@ -1652,6 +1825,13 @@ BPEPassResult buildBPEPassPipeline(
         kernel::StreamSet * boundary) {
 
     compactionMode();   // validate the compaction settings first: conflicts halt here
+    if (MaxBitXfrmLimit > 11) {
+        std::cerr << "tokenizer: --max-bit-xfrm-limit=" << MaxBitXfrmLimit << " is too large: a "
+                  << (MaxBitXfrmLimit - 1) << "-bit input makes a " << 2 * (MaxBitXfrmLimit - 1)
+                  << "-bit (A id, B id) vector, but character classes hold at most 21 bits; "
+                     "use at most 11\n";
+        std::exit(1);
+    }
     auto ruleRanges = bpe.buildMergeRuleRanges();
 
     // Inject FilterByMask compactions per --compaction and rewrite the rules' merge
@@ -1740,6 +1920,7 @@ BPEPassResult buildBPEPassPipeline(
     // kernel→kernel; `inPlayMask` (seeded active = all ones) threads too, each kernel
     // clearing the token starts it consumes, so the final mask marks surviving starts.
     StreamSet * inPlayMask = active;
+    unsigned nXfrm = 0, nXfrmIneligible = 0;   // --max-bit-xfrm-limit kernel counts
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
         if (g.rules.empty()) continue;
@@ -1761,8 +1942,15 @@ BPEPassResult buildBPEPassPipeline(
         // BPEMergeKernel::generatePabloMethod).
         const int groupLowerLimit = effIfGroupLowerLimit();
         bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
-        P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
-                                           g, hashRuleSet(g.rules), g.maxLen, grouped);
+        if (source->getNumElements() < MaxBitXfrmLimit && !nextId && bitXfrmEligible(g)) {
+            P.CreateKernelCall<BPEXfrmKernel>(source, inPlayMask, boundary, sOut, meOut,
+                                              g, hashRuleSet(g.rules), g.maxLen);
+            nXfrm++;
+        } else {
+            if (source->getNumElements() < MaxBitXfrmLimit) nXfrmIneligible++;
+            P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
+                                               g, hashRuleSet(g.rules), g.maxLen, grouped);
+        }
         source     = sOut;
         inPlayMask = meOut;
 
@@ -1785,6 +1973,12 @@ BPEPassResult buildBPEPassPipeline(
         inPlayMask = onesC;
     }
 
+    if (MaxBitXfrmLimit > 0)
+        std::cerr << "[BPE] max-bit-xfrm-limit=" << MaxBitXfrmLimit << ": " << nXfrm
+                  << " bit-transformation kernels" << (nXfrmIneligible
+                      ? ", " + std::to_string(nXfrmIneligible) + " narrow kernels kept per-rule "
+                        "(chain/asymmetric-seam/veto rules or --indexed-shift)" : std::string())
+                  << "\n";
     // The emitter packs exactly 16 id bits (P2S16Kernel); widen a narrower final stream.
     if (source->getNumElements() < 16) {
         StreamSet * source16 = P.CreateStreamSet(16, 1);

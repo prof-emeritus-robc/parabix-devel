@@ -480,6 +480,7 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 | `--max-merges-per-kernel=N` | `500` | (via rule set) | Split any partition group with more than `N` rules into consecutive kernels of about `n/ceil(n/N)` rules. With `--if-test-significant-bits` (and no `--asymmetric-seam`/`--chain-veto`) chunks are filled **by gate key**, keeping each `--chain-partition` tree whole, so rules sharing a gate stay in one kernel; otherwise in rank order. Exact either way: a group's rules have no dependencies or seams among them. Also the default `--key-cluster` move cap. `0` = no cap. No effect on full GPT-2 with plain clean ranges (max 196) or plain `--level-partition` (max 373). |
 | `--key-cluster` | off | `kc1_` | With `--level-partition` and `--if-test-significant-bits`: move rules later, within their compaction segment, so rules sharing a gate key share a kernel. Under `--partition-by-merge-id-bits` it runs per tier using global kernel indices (`--if-group-lower-limit`) and the real compaction points (linear/geometric counted across tiers; under `--compaction=by-output-bits` each tier is one segment). |
 | `--key-cluster-cap=N` | `--max-merges-per-kernel` | — | Override key-cluster's move cap: never move a rule into a kernel already holding `N` rules (`0` = none). Rules at their ASAP level are not capped; `--max-merges-per-kernel` splits those. |
+| `--max-bit-xfrm-limit=N` | `0` (off) | `BPEXfrm_` kernel name | Build every merge kernel whose input id stream has **fewer than N bits** as a bit transformation (`BPEXfrmKernel`, see [Bit-transformation kernels](#bit-transformation-kernels---max-bit-xfrm-limit)) instead of per-rule gates. At most `11` (larger values halt). Kernels with `--chain-partition`, `--asymmetric-seam` or `--chain-veto` rules, or under `--indexed-shift`, keep the per-rule body. |
 | `--compaction=MODE` | (see text) | (via `L`) | Compaction schedule. `linear`: a `FilterByMask` after every `--compact-base` kernels. `geometric`: after `--compact-base` kernels, then doubling the interval. `by-output-bits`: between two kernels whose output id widths differ (after each bit tier under `--partition-by-merge-id-bits`); `--compact-base=N` is then the **minimum kernel number**, so a width change after fewer than N kernels is skipped and compaction waits for the next one. Not given: `linear` if `--compact-base > 0` (`geometric` with `--geometric-compaction`), else none. Conflicting settings (e.g. `--geometric-compaction` with another mode, or `linear`/`geometric` without `--compact-base`) halt with a message. |
 | `--compact-base=N` | `0` (off) | `L{maxLen}` | `linear`/`geometric`: kernels per compaction interval (`0` = no compaction). `by-output-bits`: minimum kernel number for a compaction. `BPE_COMPACT_EVERY` overrides it. Compaction trades a per-point filter cost for cheaper downstream kernels. |
 | `--geometric-compaction` | off | (via `L`) | Same as `--compaction=geometric`; needs `--compact-base > 0`. |
@@ -535,6 +536,29 @@ moves the peek-ahead work inside those gates so cold chunks skip it too, while
 `--lookahead-in-gate` moves the peek inside but per-rule (no sharing). The three
 peek placements are mutually exclusive — precedence in the kernel body is
 indexed-nextId > in-group > in-gate > hoisted (default).
+
+### Bit-transformation kernels (`--max-bit-xfrm-limit`)
+
+For a kernel with an N-bit input id stream, `BPEXfrmKernel` buckets the rules by
+`L = lenA` (the lookahead distance to B's start) and forms one 2N-bit vector per
+bucket: the N id bits at `p` followed by the N id bits at `p+L`, so a rule's
+`(idA, idB)` pair is the value `idA | idB << N`. For each output bit `j`, the
+values of the rules whose `idAB` bit `j` differs from `idA` bit `j` (for `j >= N`:
+whose `idAB` bit `j` is set) form a set, compiled by `cc::Parabix_CC_Compiler`
+over that vector. Then
+
+```
+change_j = OR over L of ( CC_{L,j} AND live AND NOT boundary(p+L) )
+out_j    = in_j XOR change_j
+```
+
+and the union of each bucket's values gives its fire stream, which consumes B's
+start (`live &= ~Advance(fire_L, L)`). This is exact because at most one rule
+fires per position (the frozen id selects `idA`, and rules sharing `idA` share `L`)
+and same-kernel rules never touch each other's positions. Self-merges `X+X` keep a
+per-rule stamp (per-run pairing is not a set membership test). `re::CC` holds
+codepoints up to `0x10FFFF`, so the 2N-bit vector limits the method to N ≤ 10:
+the 8-, 9- and 10-bit input kernels.
 
 ### Correctness testing
 
@@ -599,6 +623,59 @@ Notes:
 - Cross-run absolute MB/s is noisy; trust only **back-to-back** A/B deltas.
 - Confirm a flag engaged by inspecting the IR on a debug build:
   `build_debug/bin/tokenizer --ShowOptimizedPablo --ToShow="BPEMerge*" --merges=tools/lex/merges.txt <flags> build19/test.txt`.
+
+### Results: id-bit tiers, compaction and bit-transformation kernels (2026-10-01)
+
+Full GPT-2 merges, `--pretokenizer=bytelevel`, one macOS machine. Every
+configuration below produced output byte-identical to `--level-partition`, both on a
+300 KB mixed text/source file and on the first 1 MB of `QA/TestCorpora/Twain.txt`.
+Not yet compared against HuggingFace.
+
+Abbreviations: **LT** = `--level-partition --partition-by-merge-id-bits`;
+**KC** = `--if-test-significant-bits=3 --key-cluster`; **bits** =
+`--compaction=by-output-bits`; **xN** = `--max-bit-xfrm-limit=N`. Default
+`--max-merges-per-kernel=500` throughout.
+
+**Throughput**: `--bench-loop=5`, 1 MB Twain, median ms per tokenization from two
+processes. Treat differences under about 5% as noise.
+
+| Config | Kernels | Median ms |
+|---|---|---|
+| `--level-partition` | 283 | 3146 / 3204 |
+| LT, no compaction | 342 | 4213 / 4224 |
+| LT + bits | 342 | 1749 / 1769 |
+| LT + bits + x9 / x10 / x11 | 342 | 1727–1786 / 1720–1728 / 1675–1685 |
+| `--level-partition --compaction=geometric --compact-base=2` (7 points, like LT + bits) | 283 | 1370 / 1406 |
+| `--level-partition` + KC | 297 | 1325 / 1344 |
+| LT + KC, no compaction | 331 | 1371 / 1380 |
+| LT + KC + bits | 331 | 656 / 718 |
+| LT + KC + bits + x9 / x10 / x11 | 331 | 676–677 / 636–651 / 646–649 |
+
+**Bit-transformation kernels, per kernel**: `-EnableCycleCounter` cycles for the
+32 kernels with 8–10-bit inputs, compared position by position:
+
+| Input → output bits | Kernels | LT + bits: per-rule → x11 | LT + KC + bits: per-rule → x11 |
+|---|---|---|---|
+| 8 → 9 | 1 | 0.24× | 0.55× |
+| 9 → 9 | 14 | 0.25× | 0.40× |
+| 9 → 10 | 1 | 0.23× | 0.51× |
+| 10 → 10 | 15 | 0.25× | 0.46× |
+| 10 → 11 | 1 | 0.12× | 0.42× |
+| all 32 | 32 | 0.19× | 0.44× |
+
+Compile time with the object cache off: LT + bits 93.0 s → 94.9 s with x11;
+LT + KC + bits 37.9 s → 37.6 s.
+
+Findings:
+- Compaction gives the large gains. Tiering alone slows LT by 33% and leaves KC
+  unchanged; tiering plus `by-output-bits` compaction makes KC about 2× faster.
+- For LT, tier-boundary compaction is not the best placement: untiered
+  `--level-partition` with geometric compaction at base 2 (also 7 points) beats
+  LT + bits. KC with geometric compaction has not been measured.
+- Bit-transformation kernels are 2–5× cheaper than per-rule kernels, but the
+  8–10-bit kernels are only 3–4% of merge-kernel cycles, so end-to-end time improves
+  by just 2–4%. Most time is in the 11–16-bit kernels, past the 21-bit `re::CC`
+  limit.
 
 ## Testing
 

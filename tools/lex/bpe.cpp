@@ -345,6 +345,56 @@ static cl::opt<bool> BatchWriteback(
              "instead of one Advance + a full stamp per rule."),
     cl::init(false));
 
+// Apply the end-of-file mask ONCE per merge kernel instead of once per id compare.
+// cc::Parabix_CC_Compiler::compileCC wraps every result in InFile (cc_compiler.cpp:144),
+// one extra load+not+and per compare per block — 35,104 of them in the entry scopes alone
+// at the best config, ~16% of the always-run ops. With this flag the compares are built
+// as the same balanced AND tree (so Pablo CSE shares them exactly as before) but without
+// the InFile, and InFile is applied once to the kernel's live-start mask instead. Every
+// gate and every fire is ANDed with that mask, so nothing changes inside the file; past
+// EOF the threaded mask now reads 0 instead of 1. Cache tag io1_ (only when on).
+static cl::opt<bool> InFileOnce(
+    "infile-once",
+    cl::desc("Apply the end-of-file mask once per merge kernel (on the live-start mask) "
+             "instead of once per id compare."),
+    cl::init(false));
+
+// Grouped kernels with --if-test-significant-bits: fold the live-start mask into each
+// gate's id-compare AND tree instead of ANDing it onto the finished compare. The gate
+// condition was And(idHi_compare, meInFrozen) — one private AND per gate, ~35k across the
+// pipeline, all in the always-run entry scope. With the mask as one more leaf of the tree
+// it lands on a partial product that gates with the same bit length share (Pablo CSE), so
+// that AND is paid a handful of times per kernel instead of once per gate. Same value:
+// AND is associative and commutative. Cache tag gm1_.
+static cl::opt<bool> GateMaskFold(
+    "gate-mask-fold",
+    cl::desc("Grouped kernels: fold the live-start mask into each gate's shared id-compare "
+             "tree instead of one AND per gate."),
+    cl::init(false));
+
+// Compile time: leave InstCombine out of the LLVM IR passes for the BPE merge kernels
+// only (via the NoInstCombinePass marker in addOptimizationPasses; every other kernel and
+// every other tool keeps it). Profiling a cold 283-kernel compile put InstCombine at ~29%
+// of compile CPU, while Pablo has already simplified the and/or/not trees it works on.
+// Measured: cold compile 44 s -> 34 s, runtime unchanged (<=1%), compare_bpe MATCH.
+// Cache tag ic1_ (the IR passes are not part of the cache key otherwise).
+static cl::opt<bool> SkipInstCombine(
+    "skip-instcombine",
+    cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
+    cl::init(false));
+
+static cl::opt<bool> KeyCluster(
+    "key-cluster",
+    cl::desc("With --level-partition and --if-test-significant-bits: move rules (only later, only "
+             "inside their compaction segment) so rules sharing a gate key share a kernel."),
+    cl::init(false));
+
+static cl::opt<unsigned> KeyClusterCap(
+    "key-cluster-cap",
+    cl::desc("With --key-cluster: never move a rule into a kernel already holding this many "
+             "rules (0 = no cap, the default)."),
+    cl::init(0));
+
 
 
 using namespace pablo;
@@ -703,6 +753,10 @@ public:
                         + (ChainVeto ? "cv1_" : "cv0_")
                         + (ChainFuseSiblings ? "fs1_" : "fs0_")
                         + (ChainUngateRoots ? "ur1_" : "ur0_")
+                        + (InFileOnce ? "io1_" : "")   // off = body identical to before → keep old names
+                        + (GateMaskFold ? "gm1_" : "")
+                        + (SkipInstCombine ? "ic1_" : "")
+                        + (KeyCluster ? "kc1_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi + 1))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -711,6 +765,11 @@ public:
       mRuleGroup(group), mHasBoundary(boundaryIn != nullptr), mUseNextId(nextIdIn != nullptr),
       mGrouped(grouped) {}
 protected:
+    // --skip-instcombine: ask the driver to drop InstCombine for this kernel only.
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override {
+        PabloKernel::addOptimizationPasses(b, passes);
+        if (SkipInstCombine) passes.push_back(OptimizationPass::NoInstCombinePass);
+    }
     static std::vector<kernel::Binding> mergeInputs(
             StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
             StreamSet * nextIdIn, unsigned maxLen) {
@@ -745,7 +804,12 @@ protected:
         // Threaded kernel→kernel (meIn/meOut), seeded all-ones. Each fired merge clears
         // B's start (interior seam); A's start survives as AB's start. Final mask marks
         // the surviving (outermost) token STARTS — the stream emission scans.
-        Var * inPlayMask = pb.createVar("inPlayMask", getInputStreamSet("meIn")[0]);
+        // --infile-once: the end-of-file mask is applied here, once, instead of inside every
+        // id compare (see eqId below).
+        PabloAST * const meInMasked = InFileOnce
+            ? pb.createInFile(getInputStreamSet("meIn")[0], "meInFile")
+            : getInputStreamSet("meIn")[0];
+        Var * inPlayMask = pb.createVar("inPlayMask", meInMasked);
 
         // 3. Read the copy inside the body
         // nextIdBN — indexed mode: the NEXT LIVE token's id at each position (precomputed
@@ -796,7 +860,41 @@ protected:
         std::vector<PabloAST*> frozenBits(W_out);       // entry idAcc value, immutable
         for (unsigned i = 0; i < W_out; i++) frozenBits[i] = (i < W) ? srcBits[i] : zeroes;
         BixNum      srcFrozen(frozenBits.begin(), frozenBits.end());
-        PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
+        PabloAST *  meInFrozen = meInMasked;
+
+        // eqId(bits, v) = (bits == v): the same balanced AND tree the binary
+        // cc::Parabix_CC_Compiler builds for a single value (bit_pattern_expr: one term per
+        // bit, NOT for a 0 bit, pairwise AND reduction), so Pablo CSE shares the partial
+        // products across compares in a scope exactly as compileCC's trees did. compileCC
+        // then wraps the result in InFile; without --infile-once so does eqId (identical
+        // body), with it the InFile is dropped — every gate and fire is ANDed with
+        // meInFrozen/inPlayMask, which already carry it (meInMasked above).
+        // `extra` (optional) is ANDed in as one more leaf, placed FIRST so it pairs with the
+        // lowest tested bit: that product is shared by every compare over the same bits
+        // (placed last, an even bit count would carry it to the root — one private AND).
+        auto eqId = [&](auto & bld, const BixNum & bits, unsigned v,
+                        const std::string & name = std::string(),
+                        PabloAST * extra = nullptr) -> PabloAST * {
+            std::vector<PabloAST*> terms;
+            terms.reserve(bits.size() + 1);
+            if (extra) terms.push_back(extra);
+            for (unsigned i = 0; i < bits.size(); i++)
+                terms.push_back(((v >> i) & 1u) ? bits[i] : bld.createNot(bits[i]));
+            if (terms.empty()) terms.push_back(bld.createOnes());
+            while (terms.size() > 1) {
+                std::vector<PabloAST*> next;
+                next.reserve(terms.size() / 2 + 1);
+                for (size_t i = 0; i + 1 < terms.size(); i += 2)
+                    next.push_back(bld.createAnd(terms[i], terms[i + 1]));
+                if (terms.size() % 2 == 1) next.push_back(terms.back());
+                terms.swap(next);
+            }
+            if (!InFileOnce)
+                return bld.createInFile(terms[0], name.empty() ? std::string("expr") : name);
+            if (!name.empty() && isa<And>(terms[0]))   // label only an And we built, never an input bit
+                cast<Statement>(terms[0])->setName(bld.makeName(name));
+            return terms[0];
+        };
 
         // ── Batched write-back accumulators (--batch-writeback) ──────────────────
         // Each rule's gate only ORs its fire in here; the id-stamp write is applied
@@ -892,8 +990,7 @@ protected:
         // --level-partition symmetric seam) this is a no-op — conflict-freedom already
         // guarantees no rule's fire touches a position another same-kernel rule reads 
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
-            cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);
-            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask, "Astart_" + std::to_string(id));
+            return bld.createAnd(eqId(bld, srcFrozen, id), inPlayMask, "Astart_" + std::to_string(id));
         };
 
         // --chain-veto: suppress this rule where a lower-rank competitor claims its idB.
@@ -910,11 +1007,11 @@ protected:
             std::vector<PabloAST*> vbits(W);
             for (unsigned i = 0; i < W; i++)
                 vbits[i] = body.createLookahead(srcBits[i], (int64_t) r.vetoOff);
-            cc::Parabix_CC_Compiler_Builder ccVeto(BixNum(vbits.begin(), vbits.end()));
+            const BixNum vetoBits(vbits.begin(), vbits.end());
             PabloAST * veto = nullptr;
             for (unsigned vid : r.vetoIdB) {
-                PabloAST * hit = ccVeto.compileCC("veto_" + std::to_string(r.idB) + "_" + std::to_string(vid),
-                                                  re::makeCC(vid), body);
+                PabloAST * hit = eqId(body, vetoBits, vid,
+                                      "veto_" + std::to_string(r.idB) + "_" + std::to_string(vid));
                 veto = veto ? body.createOr(veto, hit) : hit;
             }
             // The competitor only wins if it could actually FIRE, and it is subject to
@@ -955,24 +1052,20 @@ protected:
                 if (bLowDone >= bPeek->size()) {
                     BstartAtA = nullptr;
                 } else {
-                    cc::Parabix_CC_Compiler_Builder ccHiB(BixNum(bPeek->begin() + bLowDone, bPeek->end()));
-                    BstartAtA = ccHiB.compileCC(bstartName, re::makeCC(r.idB >> bLowDone), body);
+                    BstartAtA = eqId(body, BixNum(bPeek->begin() + bLowDone, bPeek->end()),
+                                     r.idB >> bLowDone, bstartName);
                 }
             } else if (mUseNextId) {
-                cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
-                BstartAtA = ccNext.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, nextIdBN, r.idB, bstartName);
             } else if (grpAhead) {   // chunk-cached shared peek (built once per lenA in the gate)
-                cc::Parabix_CC_Compiler_Builder ccAhead(grpAhead->at(r.lenA));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, grpAhead->at(r.lenA), r.idB, bstartName);
             } else if (LookaheadInGate) {
                 std::vector<PabloAST*> bits(W);
                 for (unsigned i = 0; i < W; i++)
                     bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
-                cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, BixNum(bits.begin(), bits.end()), r.idB, bstartName);
             } else {
-                cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, aheadByLenA.at(r.lenA), r.idB, bstartName);
             }
             PabloAST * fire = !BstartAtA ? fireStart : body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
@@ -1113,8 +1206,8 @@ protected:
             std::vector<PabloAST*> bits(W);
             for (unsigned i = 0; i < W; i++)
                 bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
-            cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-            PabloAST * BstartAtA = ccAhead.compileCC("Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB), re::makeCC(r.idB), body);
+            PabloAST * BstartAtA = eqId(body, BixNum(bits.begin(), bits.end()), r.idB,
+                                        "Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
             PabloAST * fire = body.createAnd(fireStart, BstartAtA, "chainfire_" + std::to_string(r.idA) + "_"  + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {
                 PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
@@ -1245,9 +1338,11 @@ protected:
                 if (hiBits > 0) {
                     const unsigned prefix = sorted[s]->idA >> loBits;
                     const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
-                    cc::Parabix_CC_Compiler_Builder ccHi(hiFrozen);
-                    inRange = ccHi.compileCC("idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
-                                             re::makeCC(prefix), pb);
+                    // --gate-mask-fold: the mask rides inside the shared tree, so inRange
+                    // IS the gate condition (prefixAstart still ANDs the live inPlayMask).
+                    inRange = eqId(pb, hiFrozen, prefix,
+                                   "idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
+                                   GateMaskFold ? meInFrozen : nullptr);
                 } else {
                     unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
                     cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
@@ -1285,8 +1380,7 @@ protected:
                         PabloAST * m = inRange;
                         if (loBits > 0) {
                             const unsigned lo = idA & ((1u << loBits) - 1u);
-                            cc::Parabix_CC_Compiler_Builder ccLo(loFrozen);
-                            m = body.createAnd(m, ccLo.compileCC(re::makeCC(lo), body), "idMatch_" + std::to_string(idA));
+                            m = body.createAnd(m, eqId(body, loFrozen, lo), "idMatch_" + std::to_string(idA));
                         }
                         f = idMatchInGroup.emplace(idA, m).first;
                     }
@@ -1336,9 +1430,8 @@ protected:
                     PabloAST * embedCond = fireStart;
                     if (bLowUsed > 0) {
                         const unsigned lowB = r.idB & ((1u << bLowUsed) - 1u);
-                        cc::Parabix_CC_Compiler_Builder ccLoB(BixNum(bPeek.begin(), bPeek.begin() + bLowUsed));
-                        PabloAST * bLoMatch = ccLoB.compileCC(
-                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB), re::makeCC(lowB), body);
+                        PabloAST * bLoMatch = eqId(body, BixNum(bPeek.begin(), bPeek.begin() + bLowUsed), lowB,
+                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB));
                         embedCond = body.createAnd(fireStart, bLoMatch,
                             "embed_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
                     }
@@ -1346,7 +1439,8 @@ protected:
                     emitBody(inner, r, embedCond, grpAhead, grpBoundary, &bPeek, bLowUsed);
                     body.createIf(embedCond, inner);
                 }
-                pb.createIf(pb.createAnd(inRange, meInFrozen), body);
+                const bool maskInRange = GateMaskFold && hiBits > 0;
+                pb.createIf(maskInRange ? inRange : pb.createAnd(inRange, meInFrozen), body);
             }
         }
 
@@ -1714,6 +1808,8 @@ static unsigned rawByteLen(const std::string & s) {
 static unsigned gChainVetoRelaxed = 0;   // rules carrying a runtime veto
 static unsigned gChainVetoTerms   = 0;   // total competitor EQs those rules emit
 
+static void keyCluster(std::vector<std::vector<MergeRule>> & levels);
+
 static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules) {
     std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps i
     // token -> highest level using it as idA  
@@ -1818,7 +1914,8 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         keepMax(maxLeft,  r.idA, lvl);
         keepMax(maxRight, r.idB, lvl);
     }
-    // map the level-partitioned rules into MergeRuleGroups, 
+    if (KeyCluster) keyCluster(levels);
+    // map the level-partitioned rules into MergeRuleGroups,
     // each level will be a MergeRuleGroup, and compute the lo/hi/maxLen for each group.
     std::vector<MergeRuleGroup> ranges;
     unsigned runningMax = 255;                          // base alphabet occupies 0..255, the largest token ID we've seen so far is 255
@@ -1838,6 +1935,175 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         ranges.push_back(std::move(g));
     }
     return ranges;
+}
+
+// --key-cluster: re-level the ASAP schedule so rules sharing a gate key (idA's
+// --if-test-significant-bits=K key, as in the grouped path) land in ONE kernel and
+// share one gate test, instead of each kernel of a segment testing the same key.
+// A rule only moves LATER, and only inside its ASAP compaction segment (so every
+// stream length is unchanged). Every rank-order dependency and seam constraint of
+// levelPartition's strict pass is re-checked against the NEW levels while placing,
+// so the result is as valid as ASAP. Port of analysis/bpe_model/partition/
+// chain_sched.py key_cluster ('KC: chain, keep today nests'): model -38%
+// block-weighted gate tests, same 283 kernels, 0 fire mismatches vs HF.
+static void keyCluster(std::vector<std::vector<MergeRule>> & levels) {
+    const int lowerLimit = effIfGroupLowerLimit();
+    if (AsymmetricSeam || ChainVeto || IfTestSignificantBits == 0 || lowerLimit < 0) {
+        std::cerr << "[BPE] --key-cluster ignored: needs grouping with --if-test-significant-bits, "
+                     "and no --asymmetric-seam / --chain-veto\n";
+        return;
+    }
+    const bool chain = ChainPartition;
+    const unsigned K = IfTestSignificantBits;
+    const unsigned NL = levels.size();
+    // Rules in rank order (= idAB order) with their ASAP level E0 (1-based).
+    std::vector<MergeRule> rules;
+    std::vector<unsigned> E0;
+    for (unsigned l = 0; l < NL; l++)
+        for (const auto & r : levels[l]) { rules.push_back(r); E0.push_back(l + 1); }
+    const size_t R = rules.size();
+    {
+        std::vector<size_t> ord(R);
+        for (size_t i = 0; i < R; i++) ord[i] = i;
+        std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return rules[a].idAB < rules[b].idAB; });
+        std::vector<MergeRule> rs; std::vector<unsigned> es;
+        for (size_t i : ord) { rs.push_back(rules[i]); es.push_back(E0[i]); }
+        rules.swap(rs); E0.swap(es);
+    }
+    // segEnd[l] = last level of l's compaction segment (same points applyCompactionSchedule picks).
+    std::vector<unsigned> segEnd(NL + 1, NL);
+    if (CompactionBase > 0) {
+        std::vector<unsigned> ends;
+        unsigned next = CompactionBase, since = 0;
+        for (unsigned i = 0; i < NL; i++) {
+            if (++since < next) continue;
+            ends.push_back(i + 1); since = 0;
+            if (GeometricCompaction) next *= 2;
+        }
+        for (unsigned l = 1; l <= NL; l++) {
+            auto it = std::lower_bound(ends.begin(), ends.end(), l);
+            segEnd[l] = (it != ends.end()) ? *it : NL;
+        }
+    }
+    using Map = std::unordered_map<unsigned, unsigned>;
+    auto get = [](const Map & m, unsigned k) -> unsigned { auto it = m.find(k); return it == m.end() ? 0 : it->second; };
+    auto keepMax = [](Map & m, unsigned k, unsigned v) { unsigned & s = m[k]; if (v > s) s = v; };
+    auto keepMin = [](Map & m, unsigned k, unsigned v) { auto it = m.find(k); if (it == m.end() || v < it->second) m[k] = v; };
+    auto bound = [](const Map & m, unsigned k, unsigned off, unsigned & u) {
+        auto it = m.find(k); if (it != m.end()) u = std::min(u, it->second - off);
+    };
+    // ALAP (reverse rank order): the latest level each rule can take with every later rule
+    // at or below ITS latest level, capped at the end of the rule's ASAP segment.
+    std::vector<unsigned> L(R);
+    {
+        Map minLns, minLs, minR;   // token -> min level of a later rule using it as A (non-self / self), as B
+        for (size_t p = R; p-- > 0; ) {
+            const MergeRule & r = rules[p];
+            unsigned u = segEnd[E0[p]];
+            bound(minLns, r.idAB, chain ? 0 : 1, u);   // a later rule built on idAB (nestable under chain)
+            bound(minLs,  r.idAB, 1, u);
+            bound(minR,   r.idAB, 1, u);
+            bound(minLns, r.idB, 1, u);                // seam: a later rule's A is our B
+            bound(minLs,  r.idB, 1, u);
+            bound(minR,   r.idA, 1, u);                // seam: a later rule's B is our A
+            L[p] = std::max(u, E0[p]);                 // ASAP is feasible, so u >= E0 (defensive)
+            keepMin(r.idA == r.idB ? minLs : minLns, r.idA, L[p]);
+            keepMin(minR, r.idB, L[p]);
+        }
+    }
+    auto keyOf = [&](unsigned idA) -> uint64_t {
+        const unsigned b = idA ? 32u - __builtin_clz(idA) : 0;
+        const unsigned lo = (b > K) ? b - K : 0;
+        return (uint64_t(lo) << 32) | (idA >> lo);
+    };
+    // Rules left in place: the flat kernels (below the grouping limit) and today's nests.
+    std::vector<char> skip(R);
+    for (size_t q = 0; q < R; q++) skip[q] = (E0[q] <= (unsigned) lowerLimit) || rules[q].needsLiveId;
+    // Per key: fewest levels that stab every rule's window [lo, L] (greedy by right end),
+    // each point pulled down to the latest left end it covers.
+    std::unordered_map<uint64_t, std::vector<size_t>> byKey;
+    for (size_t q = 0; q < R; q++) if (!skip[q]) byKey[keyOf(rules[q].idA)].push_back(q);
+    auto stab = [&](const std::vector<unsigned> & lo) {
+        std::vector<unsigned> tgt = lo;
+        for (auto & kv : byKey) {
+            std::vector<size_t> idx = kv.second;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return L[a] < L[b]; });
+            while (!idx.empty()) {
+                const unsigned point = L[idx[0]];
+                unsigned p2 = 0;
+                std::vector<size_t> rest;
+                for (size_t v : idx) if (lo[v] <= point) p2 = std::max(p2, lo[v]); else rest.push_back(v);
+                for (size_t v : idx) if (lo[v] <= point) tgt[v] = p2;
+                idx.swap(rest);
+            }
+        }
+        return tgt;
+    };
+    // Rank-order placement: earliest legal level ep from the rules ALREADY placed, then
+    // the target clipped into [ep, L]. nested[q] = idA's producer sits at the same level.
+    std::vector<unsigned> lv(R), cnt(NL + 2);
+    std::vector<char> nested(R);
+    auto realize = [&](const std::vector<unsigned> & tgt) {
+        Map prod, maxL, maxR;
+        std::fill(cnt.begin(), cnt.end(), 0);
+        for (size_t q = 0; q < R; q++) {
+            const MergeRule & r = rules[q];
+            const bool nestable = chain && r.idA != r.idB;
+            const unsigned ep = std::max({1u, get(prod, r.idA) + (nestable ? 0u : 1u), get(prod, r.idB) + 1u,
+                                          get(maxR, r.idA) + 1u, get(maxL, r.idB) + 1u});
+            unsigned l;
+            if (rules[q].needsLiveId && get(prod, r.idA) == ep) l = ep;   // keep today's nest
+            else l = std::max(ep, std::min(tgt[q], L[q]));
+            if (KeyClusterCap > 0 && l > ep && cnt[l] >= KeyClusterCap) l = ep;
+            if (l >= cnt.size()) cnt.resize(l + 1);
+            lv[q] = l; cnt[l]++;
+            nested[q] = nestable && get(prod, r.idA) == l;
+            prod[r.idAB] = l;
+            keepMax(maxL, r.idA, l);
+            keepMax(maxR, r.idB, l);
+        }
+    };
+    // Static gate count: distinct (level, key) over grouped, non-nested rules.
+    auto gates = [&](const std::vector<unsigned> & lvls, const std::vector<char> & nst) {
+        std::unordered_set<uint64_t> s;
+        for (size_t q = 0; q < R; q++)
+            if (lvls[q] > (unsigned) lowerLimit && !nst[q]) s.insert((uint64_t(lvls[q]) << 40) ^ keyOf(rules[q].idA));
+        return s.size();
+    };
+    std::vector<char> nested0(R);
+    for (size_t q = 0; q < R; q++) nested0[q] = rules[q].needsLiveId;
+    const size_t gates0 = gates(E0, nested0);
+    size_t bestGates = gates0;
+    std::vector<unsigned> best = E0;
+    std::vector<char> bestNested = nested0;
+    std::vector<unsigned> lo = E0;
+    for (int it = 0; it < 3; it++) {
+        realize(stab(lo));
+        const size_t g = gates(lv, nested);
+        if (g < bestGates) { bestGates = g; best = lv; bestNested = nested; }
+        // next round's windows: the lower bound from every predecessor except the
+        // chain parent (it can follow the rule), under the schedule just built
+        Map prod, maxL, maxR;
+        for (size_t q = 0; q < R; q++) {
+            const MergeRule & r = rules[q];
+            unsigned x = std::max({1u, get(prod, r.idB) + 1u, get(maxR, r.idA) + 1u, get(maxL, r.idB) + 1u});
+            if (!chain || r.idA == r.idB || r.idA < 256) x = std::max(x, get(prod, r.idA) + 1u);
+            lo[q] = std::max(x, E0[q]);
+            prod[r.idAB] = lv[q]; keepMax(maxL, r.idA, lv[q]); keepMax(maxR, r.idB, lv[q]);
+        }
+    }
+    size_t maxBefore = 0, maxAfter = 0;
+    for (auto & v : levels) maxBefore = std::max(maxBefore, v.size());
+    std::vector<std::vector<MergeRule>> out(*std::max_element(best.begin(), best.end()));
+    for (size_t q = 0; q < R; q++) {
+        MergeRule rc = rules[q];
+        rc.needsLiveId = bestNested[q];
+        out[best[q] - 1].push_back(rc);        // q runs in rank order → each level stays rank-sorted
+    }
+    for (auto & v : out) maxAfter = std::max(maxAfter, v.size());
+    std::cerr << "[BPE] --key-cluster: static gates " << gates0 << " -> " << bestGates
+              << ", max rules/kernel " << maxBefore << " -> " << maxAfter << "\n";
+    levels.swap(out);
 }
 
 // Mark rules whose gate needs a POST-write live mask: an earlier (lower-rank) rule

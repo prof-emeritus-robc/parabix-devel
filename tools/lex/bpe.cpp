@@ -442,15 +442,15 @@ static cl::opt<bool> SkipInstCombine(
     cl::init(false));
 
 // Bit-transformation kernels (BPEXfrmKernel): a merge kernel whose input id stream has
-// fewer than this many bits computes every output bit as input XOR a "change" stream,
-// where each change stream is one character class compiled over the (A id, B id) pair.
-// 0 = off. At most 11: the pair vector has 2N bits, and a character class holds at most
-// 21 (codepoints stop at 0x10FFFF).
+// at most this many bits computes every output bit as input XOR a "change" stream, where
+// each change stream is a character class compiled over an (A id, B id) pair. Ids wider
+// than kXfrmLowBits are split: an if-block per (high A bits, high B bits) pair, with the
+// character classes over the low bits inside (see BPEXfrmKernel). 0 = off.
 static cl::opt<unsigned> MaxBitXfrmLimit(
     "max-bit-xfrm-limit",
-    cl::desc("Build merge kernels whose input id stream has fewer than N bits as bit "
-             "transformations: one compiled character class per output bit and lookahead "
-             "distance (0 = off, the default; at most 11)."),
+    cl::desc("Build merge kernels whose input id stream has at most N bits as bit "
+             "transformations (0 = off, the default). Ids over 10 bits are gated by "
+             "if-blocks on their high bits."),
     cl::init(0));
 
 static cl::opt<bool> KeyCluster(
@@ -1673,6 +1673,16 @@ private:
 // Self-merges X+X need per-run pairing (selfMergeFireStarts), which a character class
 // cannot express; they keep a per-rule stamp here. The seam constraints keep every other
 // rule off their positions, so the stamp and the change streams never meet.
+//
+// Ids wider than kXfrmLowBits (re::CC codepoints stop at 0x10FFFF = 21 bits, so the pair
+// vector can hold two 10-bit ids): with H = N - 10 high bits, a bucket's rules are
+// further split by (idA >> 10, idB >> 10). Each such pair gets one createIf whose
+// condition tests those H high bits at p and at p+L (AND the bucket's live/boundary
+// gate); inside, the change and fire sets are compiled over the 20-bit vector of the low
+// 10 bits of both ids, and ANDed with that condition. Every rule belongs to exactly one
+// block, so the result equals the ungated form.
+static constexpr unsigned kXfrmLowBits = 10;
+
 class BPEXfrmKernel : public PabloKernel {
 public:
     BPEXfrmKernel(LLVMTypeSystemInterface & ts,
@@ -1681,6 +1691,8 @@ public:
                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
     : PabloKernel(ts, std::string("BPEXfrm_") + (boundaryIn ? "b1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
+                        + (sourceIn->getNumElements() > kXfrmLowBits
+                               ? "lo" + std::to_string(kXfrmLowBits) + "_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -1733,33 +1745,87 @@ protected:
         PabloAST * consumed = nullptr;   // B starts to clear from the live mask
         auto orInto = [&](PabloAST *& acc, PabloAST * v) { acc = acc ? pb.createOr(acc, v) : v; };
 
-        for (const auto & [L, rules] : byLen) {
-            std::vector<PabloAST *> pairBits(srcBits.begin(), srcBits.end());
-            const auto & bBits = ahead(L);
-            pairBits.insert(pairBits.end(), bBits.begin(), bBits.end());
-            cc::Parabix_CC_Compiler ccc(pairBits);
-            PabloAST * const g = gate(L);
+        // Ids of N bits: the low Nlo bits go into the character classes, the high H bits
+        // (if any) into the if-block conditions.
+        const unsigned H = (N > kXfrmLowBits) ? N - kXfrmLowBits : 0;
+        const unsigned Nlo = N - H;
+        const unsigned loMask = (1u << Nlo) - 1u;
 
+        // Compile one block's sets in `bld` over the low-bit pair vector, masked by `mask`,
+        // handing each result to addFire / addChange.
+        auto buildSets = [&](auto & bld, const std::vector<const MergeRule *> & rs,
+                             const std::vector<PabloAST *> & bBits, PabloAST * mask,
+                             const std::string & tag, auto && addFire, auto && addChange) {
+            std::vector<PabloAST *> pairBits(srcBits.begin(), srcBits.begin() + Nlo);
+            pairBits.insert(pairBits.end(), bBits.begin(), bBits.begin() + Nlo);
+            cc::Parabix_CC_Compiler ccc(pairBits);
             UCD::UnicodeSet fireSet;
             std::vector<UCD::UnicodeSet> changeSet(W_out);
-            for (const MergeRule * r : rules) {
-                const re::codepoint_t v = r->idA | (r->idB << N);
+            for (const MergeRule * r : rs) {
+                const re::codepoint_t v = (r->idA & loMask) | ((r->idB & loMask) << Nlo);
                 fireSet.insert(v);
                 for (unsigned j = 0; j < W_out; j++) {
                     const unsigned inBit = (j < N) ? ((r->idA >> j) & 1u) : 0u;
                     if (((r->idAB >> j) & 1u) != inBit) changeSet[j].insert(v);
                 }
             }
-            const std::string tag = "_L" + std::to_string(L);
-            PabloAST * fire = pb.createAnd(ccc.compileCC("fire" + tag, re::makeCC(std::move(fireSet)), pb), g);
-            orInto(consumed, pb.createAdvance(fire, (int64_t) L));
+            addFire(bld.createAnd(ccc.compileCC("fire" + tag, re::makeCC(std::move(fireSet)), bld), mask));
             for (unsigned j = 0; j < W_out; j++) {
                 if (changeSet[j].empty()) continue;
                 PabloAST * cj = ccc.compileCC("chg" + std::to_string(j) + tag,
-                                              re::makeCC(std::move(changeSet[j])), pb);
-                orInto(change[j], pb.createAnd(cj, g));
+                                              re::makeCC(std::move(changeSet[j])), bld);
+                addChange(j, bld.createAnd(cj, mask));
             }
+        };
+
+        // H > 0: accumulators the if-blocks OR into (Pablo joins them at each block's end).
+        std::vector<Var *> changeVar(W_out, nullptr);
+        auto changeAcc = [&](unsigned j) -> Var * {
+            if (!changeVar[j]) changeVar[j] = pb.createVar("change_" + std::to_string(j), pb.createZeroes());
+            return changeVar[j];
+        };
+        // (high bits [Nlo, N) of `bits`) == v, as one AND tree
+        auto eqHigh = [&](const std::vector<PabloAST *> & bits, unsigned v) -> PabloAST * {
+            PabloAST * e = nullptr;
+            for (unsigned i = Nlo; i < N; i++) {
+                PabloAST * t = ((v >> (i - Nlo)) & 1u) ? bits[i] : pb.createNot(bits[i]);
+                e = e ? pb.createAnd(e, t) : t;
+            }
+            return e;
+        };
+
+        for (const auto & [L, rules] : byLen) {
+            const auto & bBits = ahead(L);
+            PabloAST * const g = gate(L);
+            const std::string tag = "_L" + std::to_string(L);
+            if (H == 0) {
+                PabloAST * fire = nullptr;
+                buildSets(pb, rules, bBits, g, tag,
+                          [&](PabloAST * f) { fire = f; },
+                          [&](unsigned j, PabloAST * c) { orInto(change[j], c); });
+                orInto(consumed, pb.createAdvance(fire, (int64_t) L));
+                continue;
+            }
+            std::map<std::pair<unsigned, unsigned>, std::vector<const MergeRule *>> blocks;
+            for (const MergeRule * r : rules) blocks[{r->idA >> Nlo, r->idB >> Nlo}].push_back(r);
+            Var * fireL = pb.createVar("fire" + tag, pb.createZeroes());
+            for (const auto & [hi, rs] : blocks) {
+                const std::string btag = tag + "_a" + std::to_string(hi.first) + "_b" + std::to_string(hi.second);
+                PabloAST * cond = pb.createAnd(pb.createAnd(eqHigh(srcBits, hi.first), eqHigh(bBits, hi.second)),
+                                               g, "hi" + btag);
+                auto body = pb.createScope();
+                buildSets(body, rs, bBits, cond, btag,
+                          [&](PabloAST * f) { body.createAssign(fireL, body.createOr(fireL, f)); },
+                          [&](unsigned j, PabloAST * c) {
+                              Var * acc = changeAcc(j);
+                              body.createAssign(acc, body.createOr(acc, c));
+                          });
+                pb.createIf(cond, body);
+            }
+            orInto(consumed, pb.createAdvance(fireL, (int64_t) L));
         }
+        for (unsigned j = 0; j < W_out; j++)
+            if (changeVar[j]) orInto(change[j], changeVar[j]);
 
         // out_j = in_j XOR change_j
         std::vector<PabloAST *> outBits(W_out);
@@ -1825,13 +1891,6 @@ BPEPassResult buildBPEPassPipeline(
         kernel::StreamSet * boundary) {
 
     compactionMode();   // validate the compaction settings first: conflicts halt here
-    if (MaxBitXfrmLimit > 11) {
-        std::cerr << "tokenizer: --max-bit-xfrm-limit=" << MaxBitXfrmLimit << " is too large: a "
-                  << (MaxBitXfrmLimit - 1) << "-bit input makes a " << 2 * (MaxBitXfrmLimit - 1)
-                  << "-bit (A id, B id) vector, but character classes hold at most 21 bits; "
-                     "use at most 11\n";
-        std::exit(1);
-    }
     auto ruleRanges = bpe.buildMergeRuleRanges();
 
     // Inject FilterByMask compactions per --compaction and rewrite the rules' merge
@@ -1942,12 +2001,12 @@ BPEPassResult buildBPEPassPipeline(
         // BPEMergeKernel::generatePabloMethod).
         const int groupLowerLimit = effIfGroupLowerLimit();
         bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
-        if (source->getNumElements() < MaxBitXfrmLimit && !nextId && bitXfrmEligible(g)) {
+        if (source->getNumElements() <= MaxBitXfrmLimit && !nextId && bitXfrmEligible(g)) {
             P.CreateKernelCall<BPEXfrmKernel>(source, inPlayMask, boundary, sOut, meOut,
                                               g, hashRuleSet(g.rules), g.maxLen);
             nXfrm++;
         } else {
-            if (source->getNumElements() < MaxBitXfrmLimit) nXfrmIneligible++;
+            if (source->getNumElements() <= MaxBitXfrmLimit) nXfrmIneligible++;
             P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
                                                g, hashRuleSet(g.rules), g.maxLen, grouped);
         }

@@ -480,7 +480,7 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 | `--max-merges-per-kernel=N` | `500` | (via rule set) | Split any partition group with more than `N` rules into consecutive kernels of about `n/ceil(n/N)` rules. With `--if-test-significant-bits` (and no `--asymmetric-seam`/`--chain-veto`) chunks are filled **by gate key**, keeping each `--chain-partition` tree whole, so rules sharing a gate stay in one kernel; otherwise in rank order. Exact either way: a group's rules have no dependencies or seams among them. Also the default `--key-cluster` move cap. `0` = no cap. No effect on full GPT-2 with plain clean ranges (max 196) or plain `--level-partition` (max 373). |
 | `--key-cluster` | off | `kc1_` | With `--level-partition` and `--if-test-significant-bits`: move rules later, within their compaction segment, so rules sharing a gate key share a kernel. Under `--partition-by-merge-id-bits` it runs per tier using global kernel indices (`--if-group-lower-limit`) and the real compaction points (linear/geometric counted across tiers; under `--compaction=by-output-bits` each tier is one segment). |
 | `--key-cluster-cap=N` | `--max-merges-per-kernel` | — | Override key-cluster's move cap: never move a rule into a kernel already holding `N` rules (`0` = none). Rules at their ASAP level are not capped; `--max-merges-per-kernel` splits those. |
-| `--max-bit-xfrm-limit=N` | `0` (off) | `BPEXfrm_` kernel name | Build every merge kernel whose input id stream has **fewer than N bits** as a bit transformation (`BPEXfrmKernel`, see [Bit-transformation kernels](#bit-transformation-kernels---max-bit-xfrm-limit)) instead of per-rule gates. At most `11` (larger values halt). Kernels with `--chain-partition`, `--asymmetric-seam` or `--chain-veto` rules, or under `--indexed-shift`, keep the per-rule body. |
+| `--max-bit-xfrm-limit=N` | `0` (off) | `BPEXfrm_` kernel name (`lo10_` when gated) | Build every merge kernel whose input id stream has **at most N bits** as a bit transformation (`BPEXfrmKernel`, see [Bit-transformation kernels](#bit-transformation-kernels---max-bit-xfrm-limit)) instead of per-rule gates. Ids over 10 bits are split: an if-block per (high bits of idA, high bits of idB) pair, with the bit transformation over the low 10 bits inside. Kernels with `--chain-partition`, `--asymmetric-seam` or `--chain-veto` rules, or under `--indexed-shift`, keep the per-rule body. |
 | `--compaction=MODE` | (see text) | (via `L`) | Compaction schedule. `linear`: a `FilterByMask` after every `--compact-base` kernels. `geometric`: after `--compact-base` kernels, then doubling the interval. `by-output-bits`: between two kernels whose output id widths differ (after each bit tier under `--partition-by-merge-id-bits`); `--compact-base=N` is then the **minimum kernel number**, so a width change after fewer than N kernels is skipped and compaction waits for the next one. Not given: `linear` if `--compact-base > 0` (`geometric` with `--geometric-compaction`), else none. Conflicting settings (e.g. `--geometric-compaction` with another mode, or `linear`/`geometric` without `--compact-base`) halt with a message. |
 | `--compact-base=N` | `0` (off) | `L{maxLen}` | `linear`/`geometric`: kernels per compaction interval (`0` = no compaction). `by-output-bits`: minimum kernel number for a compaction. `BPE_COMPACT_EVERY` overrides it. Compaction trades a per-point filter cost for cheaper downstream kernels. |
 | `--geometric-compaction` | off | (via `L`) | Same as `--compaction=geometric`; needs `--compact-base > 0`. |
@@ -557,8 +557,15 @@ start (`live &= ~Advance(fire_L, L)`). This is exact because at most one rule
 fires per position (the frozen id selects `idA`, and rules sharing `idA` share `L`)
 and same-kernel rules never touch each other's positions. Self-merges `X+X` keep a
 per-rule stamp (per-run pairing is not a set membership test). `re::CC` holds
-codepoints up to `0x10FFFF`, so the 2N-bit vector limits the method to N ≤ 10:
-the 8-, 9- and 10-bit input kernels.
+codepoints up to `0x10FFFF`, so a pair vector can hold two ids of at most 10 bits.
+
+Wider ids (N > 10, H = N − 10) are gated: a bucket's rules are split by
+`(idA >> 10, idB >> 10)`, and each such pair gets one `createIf` whose condition
+tests the H high bits at `p` and at `p+L`, ANDed with the bucket's live/boundary
+gate. Inside the block, the change and fire sets are compiled over the 20-bit
+vector of the low 10 bits of both ids and ANDed with the condition. Every rule
+belongs to exactly one block, so the result equals the ungated form, and a block
+whose high bits do not occur in a stretch of input is skipped.
 
 ### Correctness testing
 
@@ -633,7 +640,9 @@ Not yet compared against HuggingFace.
 
 Abbreviations: **LT** = `--level-partition --partition-by-merge-id-bits`;
 **KC** = `--if-test-significant-bits=3 --key-cluster`; **bits** =
-`--compaction=by-output-bits`; **xN** = `--max-bit-xfrm-limit=N`. Default
+`--compaction=by-output-bits`; **xN** = `--max-bit-xfrm-limit=N` as defined at the
+time, when it selected inputs of **fewer than** N bits (x11 here = today's
+`--max-bit-xfrm-limit=10`). Default
 `--max-merges-per-kernel=500` throughout.
 
 **Throughput**: `--bench-loop=5`, 1 MB Twain, median ms per tokenization from two
@@ -676,6 +685,32 @@ Findings:
   8–10-bit kernels are only 3–4% of merge-kernel cycles, so end-to-end time improves
   by just 2–4%. Most time is in the 11–16-bit kernels, past the 21-bit `re::CC`
   limit.
+
+**Gated bit transformation for all widths** (2026-10-02). `--max-bit-xfrm-limit=N`
+now means "at most N input bits", and ids over 10 bits are gated by if-blocks on
+their high bits. Same setup as above; xN below uses the new meaning. All
+configurations match `--level-partition` on both inputs.
+
+| Config | Bit-xfrm kernels | Median ms (1 MB Twain) | Compile, cache off |
+|---|---|---|---|
+| LT + bits + x10 | 32 of 342 | 1618 / 1628 | — |
+| LT + bits + x13 | 108 of 342 | 1491 / 1494 | — |
+| LT + bits + x16 | 342 of 342 | **344 / 379** | 15.7 s (93.0 s without) |
+| LT + KC + bits + x10 | 32 of 331 | 655 / 670 | — |
+| LT + KC + bits + x13 | 106 of 331 | 605 / 623 | — |
+| LT + KC + bits + x16 | 331 of 331 | **293 / 301** | 13.6 s (37.9 s without) |
+
+Merge-kernel cycles with x16, relative to the per-rule body of the same partition
+(`-EnableCycleCounter`, 1 MB Twain), by input id width:
+
+| Input bits | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| LT + bits | 0.22× | 0.21× | 0.14× | 0.19× | 0.18× | 0.17× | 0.15× | 0.14× | 0.14× | **0.15×** |
+| LT + KC + bits | 0.55× | 0.41× | 0.43× | 0.44× | 0.41× | 0.36× | 0.34× | 0.32× | 0.28× | **0.32×** |
+
+The gated form is cheapest relative to per-rule kernels at the widest ids, where most
+of the time was. Untiered partitions with x16 (e.g. with geometric compaction) have
+not been benchmarked yet.
 
 ## Testing
 

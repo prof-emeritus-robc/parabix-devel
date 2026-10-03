@@ -261,7 +261,9 @@ void JSON_Value_Matching(PipelineBuilder & P, JSON_ValueKind val_bitset, StreamS
         }
         i++;
     }
-    re::RE * matchRE = toUTF8(re::RE_Parser::parse("^(?:" + matchRegex + ")$"));
+    re::RE * matchRE = re::RE_Parser::parse("^(?:" + matchRegex + ")$");
+    matchRE = resolveModesAndExternalSymbols(matchRE);
+    matchRE = toUTF8(regular_expression_passes(matchRE));
     RE_PipelineBuilder RE_PB(P, ctxt);
     StreamSet * const val_matches = P.CreateStreamSet(1);
     RE_PB.matchSearchPipeline(matchRE, val_matches);
@@ -273,7 +275,9 @@ void JSON_Value_Quoted(PipelineBuilder & P, StreamSet * BasisBits, StreamSet * f
     RE_CompilerContext ctxt;
     ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
     ctxt.setMatchRegions(fieldStarts, fieldFollows);
-    re::RE * quotedRE = toUTF8(re::RE_Parser::parse("^\".*\"$"));
+    re::RE * quotedRE = re::RE_Parser::parse("^\".*\"$");
+    quotedRE = resolveModesAndExternalSymbols(quotedRE);
+    quotedRE = toUTF8(regular_expression_passes(quotedRE));
     RE_PipelineBuilder RE_PB(P, ctxt);
     StreamSet * const quotedValues = P.CreateStreamSet(1);
     RE_PB.matchSearchPipeline(quotedRE, quotedValues);

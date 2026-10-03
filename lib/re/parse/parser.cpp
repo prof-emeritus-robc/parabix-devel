@@ -675,7 +675,7 @@ RE * RE_Parser::range_extend(RE * char_expr1) {
     } else {
         char_expr2 = CC::Create(parse_literal_codepoint());
     }
-    return makeRange(char_expr1, char_expr2);
+    return Range::Create(char_expr1, char_expr2);
 }
 
 RE * RE_Parser::parse_equivalence_class() {

@@ -12,7 +12,6 @@ SRC
     re_diff.cpp
     re_empty_set.cpp
     re_intersect.cpp
-    re_range.cpp
     re_re.cpp
     re_rep.cpp
     memoization.cpp

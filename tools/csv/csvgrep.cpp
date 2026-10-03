@@ -39,6 +39,7 @@
 #include <toolchain/toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <re/analysis/re_analysis.h>
+#include <re/unicode/regex_passes.h>
 using namespace kernel;
 using namespace llvm;
 using namespace pablo;
@@ -120,6 +121,9 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     UTF_Encoder u8_encoder(8);
 
     re::RE * searchRE = csvRE(re::RE_Parser::parse(Regex));
+    searchRE = resolveModesAndExternalSymbols(searchRE, false, grep::lineNumGrep);
+    searchRE = regular_expression_passes(searchRE);
+
     StreamSet * u8index = nullptr;
 
     unsigned DQ_u8bytes = u8_encoder.encoded_length(csv::QuoteChar);

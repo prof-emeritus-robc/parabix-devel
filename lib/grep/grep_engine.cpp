@@ -267,9 +267,10 @@ bool GrepEngine::matchesToEOLrequired () {
 }
 
 void GrepEngine::initRE(re::RE * re) {
-    // Ensure that all modes and Unicode properties are resolved
-    // before proceeding with RE analysis.
+    // Ensure that all modes and Unicode properties are resolved, and
+    // the RE is fully simplified before proceeding with RE analysis.
     mRE = resolveModesAndExternalSymbols(re, mCaseInsensitive, grep::lineNumGrep);
+    mRE = regular_expression_passes(mRE);
 
     // Determine the unit of length for the RE.  If the RE involves
     // fixed length UTF-8 sequences only, then UTF-8 can be used

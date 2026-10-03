@@ -14,6 +14,7 @@
 #include <re/transforms/re_simplifier.h>
 #include <re/transforms/re_star_normal.h>
 #include <re/transforms/resolve_diffs.h>
+#include <re/transforms/resolve_ranges.h>
 #include <re/transforms/assertion_transformations.h>
 #include <re/unicode/boundaries.h>
 #include <re/unicode/casing.h>
@@ -41,6 +42,7 @@ RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive, GrepLi
     r = UCD::inlineSimpleProperties(r);
     //r = resolveBoundaryProperties(r);
     validateNamesDefined(r);
+    r = resolveRanges(r);
     if (UnicodeLevel2IsSet() && validateAlphabet(&cc::Unicode, r)) {
         r = UCD::toNFD(r);
         r = UCD::addClusterMatches(r);

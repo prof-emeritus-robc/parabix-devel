@@ -28,7 +28,7 @@
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/core/callback.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <kernel/unicode/boundary_kernels.h>
@@ -158,11 +158,10 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mNextFileToPrint(0),
     grepMatchFound(false),
     mGrepRecordBreak(GrepRecordBreakKind::LF),
-    mIndexAlphabet(&cc::UTF8),
+    mSource(nullptr),
+    mMatchStarts(nullptr),
     mLineBreakStream(nullptr),
     mU8index(nullptr),
-    mU21(nullptr),
-    mU21_LB(nullptr),
     mEngineThread(std::this_thread::get_id()) {
 
     }
@@ -269,36 +268,25 @@ bool GrepEngine::matchesToEOLrequired () {
 void GrepEngine::initRE(re::RE * re) {
     // Ensure that all modes and Unicode properties are resolved, and
     // the RE is fully simplified before proceeding with RE analysis.
-    mRE = resolveModesAndExternalSymbols(re, mCaseInsensitive, grep::lineNumGrep);
-    mRE = regular_expression_passes(mRE);
+    mRE = prepareInputRE(re, mCaseInsensitive, grep::lineNumGrep);
 
-    // Determine the unit of length for the RE.  If the RE involves
-    // fixed length UTF-8 sequences only, then UTF-8 can be used
-    // for most efficient processing.   Otherwise we must use full
-    // Unicode length calculations.
-    bool useFixedUTF8 = !UnicodeIndexing && validateFixedUTF8(mRE) && !hasPropertyReference(mRE);
-    useFixedUTF8 = useFixedUTF8 && !(mGrepRecordBreak == GrepRecordBreakKind::Unicode);
-    if (useFixedUTF8) {
-        mLengthAlphabet = &cc::UTF8;
-        mIndexAlphabet = &cc::UTF8;
-    } else {
-        mLengthAlphabet = &cc::Unicode;
-        // Determine whether UTF8-indexed or Unicode-indexed streams will
-        // be used for regular expression processing.
-        bool useIndexedUTF8 = !UnicodeBasisMode
-                                    && !hasReference(mRE) 
-                                    && !(mGrepRecordBreak == GrepRecordBreakKind::Unicode)
-                                    && !hasGraphemeClusterBoundary(mRE)
-                                    && (maxLookaheadLength(re, &cc::Unicode) <= 1)
-                                    && !mColoring;
-        if (useIndexedUTF8) {
-            mIndexAlphabet = &cc::UTF8;
-        } else {
-            mIndexAlphabet = &cc::Unicode;
-        }
-    }
+    // Mode determination (byte / UTF8-indexed / full Unicode) is the regex
+    // engine's job; grep_engine just supplies the reasons specific to it.
+    // Unicode record-break mode always forces full Unicode indexing, just as
+    // before. Coloring doesn't force full indexing outright (a fixed-UTF8 RE
+    // still gets plain byte mode); it only rules out the cheaper UTF8-indexed
+    // optimization once we're past that -- the same role UnicodeBasisMode
+    // plays -- so it's folded in there rather than given its own concept in
+    // the engine's API.
+    RE_ModeOptions opts;
+    opts.forceUnicodeIndexing = (mGrepRecordBreak == GrepRecordBreakKind::Unicode);
+    opts.unicodeIndexingOverride = UnicodeIndexing;
+    opts.unicodeBasisOverride = UnicodeBasisMode || mColoring;
+    opts.byteCClimit = ByteCClimit;
+    mMode = determineREMode(mRE, opts);
+
     // Don't attempt colorization with a zero-width RE.
-    if (getLengthRange(mRE, mLengthAlphabet).second == 0) {
+    if (getLengthRange(mRE, mMode.lengthAlphabet).second == 0) {
         mColoring = false;
     }
 }
@@ -307,14 +295,6 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
     StreamSet * Source = ByteStream;
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         P.captureByteData("Source", ByteStream);
-    }
-    if ((mLengthAlphabet == &cc::Unicode) || hasReference(mRE) || !byteTestsWithinLimit(mRE, ByteCClimit)) {
-        StreamSet * BasisBits = P.CreateStreamSet(ENCODING_BITS, 1);
-        Selected_S2P(P, ByteStream, BasisBits);
-        Source = BasisBits;
-        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBixNum("basis", BasisBits);
-        }
     }
 
     mLineBreakStream = nullptr;
@@ -330,8 +310,20 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
     }
     mLineBreakStream = P.CreateStreamSet(1, 1);
     if (mGrepRecordBreak == GrepRecordBreakKind::Unicode) {
+        // Unicode line-break detection needs bit-parallel basis streams; the
+        // regex engine doesn't get a say here since this is purely about
+        // finding line breaks, not about how the RE itself will be compiled.
+        StreamSet * BasisBits = P.CreateStreamSet(ENCODING_BITS, 1);
+        Selected_S2P(P, ByteStream, BasisBits);
+        Source = BasisBits;
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBixNum("basis", BasisBits);
+        }
         mU8index = P.CreateStreamSet(1, 1);
         UnicodeLinesLogic(P, Source, mLineBreakStream, mU8index, UnterminatedLineAtEOF::Add1, mNullMode, callbackObject);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            P.captureBitstream("mU8index", mU8index);
+        }
     }
     else {
         if (mGrepRecordBreak == GrepRecordBreakKind::LF) {
@@ -342,63 +334,14 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
         } else { // if (mGrepRecordBreak == GrepRecordBreakKind::Null) {
             P.CreateKernelCall<NullDelimiterKernel>(Source, mLineBreakStream, UnterminatedLineAtEOF::Add1);
         }
-        if (mLengthAlphabet == &cc::Unicode) {
-            mU8index = P.CreateStreamSet(1, 1);
-            P.CreateKernelCall<UTF8_index>(Source, mU8index, mLineBreakStream);
-        }
-    }
-    if (mU8index) {
-        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBitstream("mU8index", mU8index);
-        }
     }
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         P.captureBitstream("mLineBreakStream", mLineBreakStream);
     }
-    if (mIndexAlphabet == &cc::UTF8) {
-        mCtxt.setCodeUnitContext(mIndexAlphabet, Source);
-        StreamSet * lineStarts = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<LineStartsKernel>(mLineBreakStream, lineStarts);
-        mCtxt.setMatchRegions(lineStarts, mLineBreakStream);
-        if (mLengthAlphabet == &cc::Unicode) {
-            mCtxt.setIndexingContext(&cc::Unicode, mU8index);
-        }
-    }
 
-    if (mIndexAlphabet == &cc::Unicode) {
-        bool useMultiplexedUnicode = false;//!UnicodeBasisMode && !hasCodepointReference(mRE);
-
-        if (useMultiplexedUnicode) {
-            const auto UnicodeSets = re::collectCCs(mRE, *mIndexAlphabet);
-            if (!UnicodeSets.empty()) {
-                auto mpx = makeMultiplexedAlphabet("mpx", UnicodeSets);
-                mRE = transformCCs(mpx, mRE, re::NameTransformationMode::None);
-                auto mpx_basis = mpx->getMultiplexedCCs();
-                StreamSet * const u8CharClasses = P.CreateStreamSet(mpx_basis.size());
-                P.CreateKernelFamilyCall<CharClassesKernel>(mpx_basis, Source, u8CharClasses);
-                StreamSet * const unicodeCCs = P.CreateStreamSet(mpx_basis.size());
-                FilterByMask(P, mU8index, u8CharClasses, unicodeCCs);
-                mCtxt.setCodeUnitContext(mpx, unicodeCCs);
-            }
-        } else {
-            StreamSet * u21_u8indexed = P.CreateStreamSet(21);
-            P.CreateKernelCall<UTF8_Decoder>(Source, u21_u8indexed);
-            StreamSet * mU21 = P.CreateStreamSet(21);
-            FilterByMask(P, mU8index, u21_u8indexed, mU21);
-            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-                P.captureBixNum("u21basis", mU21);
-            }
-            mCtxt.setCodeUnitContext(mIndexAlphabet, mU21);
-        }
-        mU21_LB = P.CreateStreamSet(1);
-        FilterByMask(P, mU8index, mLineBreakStream, mU21_LB);
-        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-            P.captureBitstream("mU21_LB", mU21_LB);
-        }
-        StreamSet * lineStarts = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<LineStartsKernel>(mU21_LB, lineStarts);
-        mCtxt.setMatchRegions(lineStarts, mU21_LB);
-    }
+    mSource = Source;
+    mMatchStarts = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<LineStartsKernel>(mLineBreakStream, mMatchStarts);
 }
 
 StreamSet * GrepEngine::initialMatches(RE_PipelineBuilder & RE_PB, StreamSet * InputStream) {
@@ -465,9 +408,19 @@ StreamSet * GrepEngine::applyMatchLimit(kernel::PipelineBuilder & P, StreamSet *
 
 StreamSet * GrepEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * InputStream) {
     grepPrologue(P, InputStream);
-    StreamSet * lbs = (mIndexAlphabet == &cc::Unicode) ? mU21_LB : mLineBreakStream;
-    RE_PipelineBuilder RE_PB(P, mCtxt);
+    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, mSource, mMatchStarts, mLineBreakStream});
+    RE_ModeOptions modeOpts;
+    modeOpts.byteCClimit = ByteCClimit;
+    RE_PB.setModeOptions(modeOpts);
+    RE_PB.setMode(mMode);
+    if (mU8index) {
+        RE_PB.setU8IndexHint(mU8index);
+    } else {
+        RE_PB.setLineBreakStream(mLineBreakStream);
+    }
     StreamSet * Matches = initialMatches(RE_PB, InputStream);
+    mU8index = RE_PB.getU8Index();
+    StreamSet * lbs = RE_PB.getMatchFollows();
     StreamSet * matches = matchedLines(P, Matches, lbs);
     return applyMatchLimit(P, matches);
 }
@@ -702,7 +655,16 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
 
 void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * ByteStream) {
     grepPrologue(P, ByteStream);
-    RE_PipelineBuilder RE_PB(P, mCtxt);
+    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, mSource, mMatchStarts, mLineBreakStream});
+    RE_ModeOptions modeOpts;
+    modeOpts.byteCClimit = ByteCClimit;
+    RE_PB.setModeOptions(modeOpts);
+    RE_PB.setMode(mMode);
+    if (mU8index) {
+        RE_PB.setU8IndexHint(mU8index);
+    } else {
+        RE_PB.setLineBreakStream(mLineBreakStream);
+    }
 
     StreamSet * Matches = P.CreateStreamSet(1);
     StreamSet * MatchSpans = nullptr;
@@ -719,8 +681,10 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
             P.captureBitstream("Matches", Matches);
         }
     }
+    mU8index = RE_PB.getU8Index();
+    const bool usesUnicodeIndexing = RE_PB.usesUnicodeIndexing();
 
-    StreamSet * lbs = (mIndexAlphabet == &cc::Unicode) ? mU21_LB : mLineBreakStream;
+    StreamSet * lbs = RE_PB.getMatchFollows();
     StreamSet * MatchedLineEnds = matchedLines(P, Matches, lbs);
 
     bool hasContext = (mAfterContext != 0) || (mBeforeContext != 0);
@@ -744,7 +708,7 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
         SpreadByMask(P, mLineBreakStream, ContextByLine, SelectedLines);
         MatchedLineEnds = SelectedLines;
         MatchesByLine = ContextByLine;
-    } else if (mIndexAlphabet == &cc::Unicode) {
+    } else if (usesUnicodeIndexing) {
         StreamSet * u8index1 = mU8index;
         if (grepOffset(mRE) > 0) {
             u8index1 = P.CreateStreamSet(1, 1);
@@ -760,7 +724,7 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
 
     MatchedLineEnds = applyMatchLimit(P, MatchedLineEnds);
 
-    if (mColoring && (mIndexAlphabet == &cc::Unicode)) {
+    if (mColoring && usesUnicodeIndexing) {
         StreamSet * spreadSpans = P.CreateStreamSet(1, 1);
         SpreadByMask(P, mU8index, MatchSpans, spreadSpans);
         StreamSet * ResultSpans = P.CreateStreamSet(1, 1);
@@ -1164,9 +1128,7 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
 
     // Link and resolve properties and boundaries as for the main engine; a search
     // of property value names may itself contain property value patterns.
-    matchingRE = resolveModesAndExternalSymbols(matchingRE, mCaseInsensitive, lineNumGrep);
-    matchingRE = regular_expression_passes(matchingRE);
-    matchingRE = toUTF8(matchingRE);
+    matchingRE = prepareInputRE(matchingRE, mCaseInsensitive, lineNumGrep);
 
     auto E = CreatePipeline(mGrepDriver,
                             Input<const char*>{"buffer"}, Input<size_t>{"length"},
@@ -1277,9 +1239,7 @@ void InternalMultiSearchEngine::grepCodeGen(const re::PatternVector & patterns) 
     for (unsigned i = 0; i < n; i++) {
         StreamSet * const MatchResults = E.CreateStreamSet();
 
-        auto r = resolveModesAndExternalSymbols(patterns[i].second, mCaseInsensitive, lineNumGrep);
-        r = regular_expression_passes(r);
-        r = toUTF8(r);
+        auto r = prepareInputRE(patterns[i].second, mCaseInsensitive, lineNumGrep);
 
         RE_PB.matchSearchPipeline(r, MatchResults);
         const auto isExclude = patterns[i].first == re::PatternKind::Exclude;

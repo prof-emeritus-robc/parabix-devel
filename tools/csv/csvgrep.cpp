@@ -31,7 +31,7 @@
 #include <kernel/basis/s2p_kernel.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/unicode/utf8_support.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <re/cc/cc_kernel.h>
@@ -121,16 +121,20 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     UTF_Encoder u8_encoder(8);
 
     re::RE * searchRE = csvRE(re::RE_Parser::parse(Regex));
-    searchRE = resolveModesAndExternalSymbols(searchRE, false, grep::lineNumGrep);
-    searchRE = regular_expression_passes(searchRE);
+    searchRE = prepareInputRE(searchRE, false, grep::lineNumGrep);
 
     StreamSet * u8index = nullptr;
 
     unsigned DQ_u8bytes = u8_encoder.encoded_length(csv::QuoteChar);
     unsigned Delim_u8bytes = u8_encoder.encoded_length(csv::FieldDelimiter);
 
-    RE_CompilerContext ctxt;
-    if (!validateFixedUTF8(searchRE) || (DQ_u8bytes > 1) || (Delim_u8bytes > 1) || U21) {
+    // CSV-specific reasons to require the full 21-bit Unicode basis: a
+    // multi-byte delimiter/quote character structurally needs codepoint
+    // granularity for the CSV parser itself, and -u21 is an explicit user
+    // override. Whether the RE itself needs more than plain byte mode is now
+    // the regex engine's own call (determineREMode), not csvgrep's.
+    const cc::Alphabet * sourceEncoding = &cc::UTF8;
+    if ((DQ_u8bytes > 1) || (Delim_u8bytes > 1) || U21) {
         u8index = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
         SHOW_STREAM(u8index);
@@ -147,11 +151,7 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
         SHOW_BIXNUM(U21codepoints);
 
         BasisBits = U21codepoints;
-
-        ctxt.setCodeUnitContext(&cc::Unicode, BasisBits);
-    } else {
-        searchRE = toUTF8(searchRE);
-        ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
+        sourceEncoding = &cc::Unicode;
     }
 
     csv::CSV_Parser parser(P, csv::QuoteChar, csv::FieldDelimiter);
@@ -170,10 +170,9 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     StreamSet * regionStarts = P.CreateStreamSet(1);
     StreamSet * regionFollows = P.CreateStreamSet(1);
     P.CreateKernelCall<RegexRegions>(csvCCs, fieldStarts, fieldFollows, Selected, regionStarts, regionFollows);
-    ctxt.setMatchRegions(regionStarts, regionFollows);
 
     StreamSet * Matches = P.CreateStreamSet(1);
-    RE_PipelineBuilder RE_PB(P, ctxt);
+    RE_PipelineBuilder RE_PB(P, RE_context{sourceEncoding, BasisBits, regionStarts, regionFollows});
     RE_PB.matchSearchPipeline(searchRE, Matches);
 
     StreamSet * MatchedLineEnds = P.CreateStreamSet(1, 1);

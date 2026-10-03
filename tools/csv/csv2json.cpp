@@ -30,7 +30,7 @@
 #include <kernel/bitwise/bixnum_kernel.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/io/stdout_kernel.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/scan/scanmatchgen.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>

@@ -1,8 +1,9 @@
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/core/streamset.h>
 #include <kernel/pipeline/pipeline_builder.h>
+#include <kernel/basis/s2p_kernel.h>
 #include <kernel/bitwise/bixlogic.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
@@ -11,6 +12,9 @@
 #include <kernel/unicode/boundary_kernels.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/UCD_property_kernel.h>
+#include <kernel/unicode/utf8_support.h>
+#include <kernel/unicode/utf8_decoder.h>
+#include <kernel/util/linebreak_kernel.h>
 #include <pablo/pablo.h>
 #include <re/adt/adt.h>
 #include <re/alphabet/alphabet.h>
@@ -423,6 +427,172 @@ LongestSpan::LongestSpan (LLVMTypeSystemInterface & ts, unsigned pfxOffset, unsi
 }
 
 
+RE * prepareInputRE(RE * re, bool caseInsensitive, GrepLinesFunctionType grepCallback) {
+    re = resolveModesAndExternalSymbols(re, caseInsensitive, grepCallback);
+    re = regular_expression_passes(re);
+    return re;
+}
+
+RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
+    RE_Mode mode;
+    // Determine the unit of length for the RE.  If the RE involves
+    // fixed length UTF-8 sequences only, then UTF-8 can be used
+    // for most efficient processing.   Otherwise we must use full
+    // Unicode length calculations.
+    bool useFixedUTF8 = !opts.unicodeIndexingOverride && validateFixedUTF8(re) && !hasPropertyReference(re);
+    useFixedUTF8 = useFixedUTF8 && !opts.forceUnicodeIndexing;
+    if (useFixedUTF8) {
+        mode.lengthAlphabet = &cc::UTF8;
+        mode.indexAlphabet = &cc::UTF8;
+    } else {
+        mode.lengthAlphabet = &cc::Unicode;
+        // Determine whether UTF8-indexed or Unicode-indexed streams will
+        // be used for regular expression processing.
+        bool useIndexedUTF8 = !opts.unicodeBasisOverride
+                                    && !hasReference(re)
+                                    && !opts.forceUnicodeIndexing
+                                    && !hasGraphemeClusterBoundary(re)
+                                    && (maxLookaheadLength(re, &cc::Unicode) <= 1);
+        if (useIndexedUTF8) {
+            mode.indexAlphabet = &cc::UTF8;
+        } else {
+            mode.indexAlphabet = &cc::Unicode;
+        }
+    }
+    return mode;
+}
+
+RE_PipelineBuilder::RE_PipelineBuilder(PipelineBuilder & P, RE_context context)
+: mPB(P), mCtxt(), mCaseInsensitive(false), mMatchSpans(false),
+  mHaveSourceContext(true), mSourceContext(context), mPrepared(false), mHaveMode(false),
+  mLineBreakHint(nullptr), mU8IndexHint(nullptr),
+  mUsesUnicodeIndexing(false), mU8Index(nullptr),
+  mFinalMatchStarts(context.matchStarts), mFinalMatchFollows(context.matchFollows) {
+}
+
+void RE_PipelineBuilder::ensurePrepared(RE *& re) {
+    if (mPrepared) return;
+    mPrepared = true;
+    if (!mHaveSourceContext) {
+        // Low-level construction: the caller already populated mCtxt by hand.
+        return;
+    }
+
+    StreamSet * source = mSourceContext.source;
+    StreamSet * matchStarts = mSourceContext.matchStarts;
+    StreamSet * matchFollows = mSourceContext.matchFollows;
+
+    if (mSourceContext.encoding == &cc::Unicode) {
+        // Already fully Unicode-encoded by the caller (e.g. csvgrep); use as-is.
+        mCtxt.setCodeUnitContext(&cc::Unicode, source);
+        if (matchStarts) {
+            mCtxt.setMatchRegions(matchStarts, matchFollows);
+        }
+        mUsesUnicodeIndexing = true;
+        mFinalMatchStarts = matchStarts;
+        mFinalMatchFollows = matchFollows;
+        return;
+    }
+
+    RE_Mode mode = mHaveMode ? mMode : determineREMode(re, mModeOptions);
+
+    if (mode.indexAlphabet == &cc::UTF8) {
+        if ((source->getNumElements() == 1) &&
+            ((mode.lengthAlphabet == &cc::Unicode) || hasReference(re) || !byteTestsWithinLimit(re, mModeOptions.byteCClimit))) {
+            StreamSet * basis = mPB.CreateStreamSet(8, 1);
+            Selected_S2P(mPB, source, basis);
+            source = basis;
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                mPB.captureBixNum("basis", basis);
+            }
+        }
+        mCtxt.setCodeUnitContext(&cc::UTF8, source);
+        if (matchStarts) {
+            mCtxt.setMatchRegions(matchStarts, matchFollows);
+        }
+        if (mode.lengthAlphabet == &cc::Unicode) {
+            if (mU8IndexHint) {
+                mU8Index = mU8IndexHint;
+            } else {
+                mU8Index = mPB.CreateStreamSet(1, 1);
+                mPB.CreateKernelCall<UTF8_index>(source, mU8Index, mLineBreakHint);
+            }
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                mPB.captureBitstream("mU8index", mU8Index);
+            }
+            mCtxt.setIndexingContext(&cc::Unicode, mU8Index);
+        }
+        mFinalMatchStarts = matchStarts;
+        mFinalMatchFollows = matchFollows;
+        return;
+    }
+
+    // Full Unicode indexing required.
+    if (source->getNumElements() == 1) {
+        StreamSet * basis = mPB.CreateStreamSet(8, 1);
+        Selected_S2P(mPB, source, basis);
+        source = basis;
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBixNum("basis", basis);
+        }
+    }
+    if (mU8IndexHint) {
+        mU8Index = mU8IndexHint;
+    } else {
+        mU8Index = mPB.CreateStreamSet(1, 1);
+        mPB.CreateKernelCall<UTF8_index>(source, mU8Index, mLineBreakHint);
+    }
+    if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+        mPB.captureBitstream("mU8index", mU8Index);
+    }
+
+    // Kept disabled (and dead) for now -- to be re-enabled in a future step.
+    bool useMultiplexedUnicode = false; //!mModeOptions.unicodeBasisOverride && !hasCodepointReference(re);
+    if (useMultiplexedUnicode) {
+        const auto UnicodeSets = re::collectCCs(re, *mode.indexAlphabet);
+        if (!UnicodeSets.empty()) {
+            auto mpx = cc::makeMultiplexedAlphabet("mpx", UnicodeSets);
+            re = transformCCs(mpx, re, re::NameTransformationMode::None);
+            auto mpx_basis = mpx->getMultiplexedCCs();
+            StreamSet * const u8CharClasses = mPB.CreateStreamSet(mpx_basis.size());
+            mPB.CreateKernelFamilyCall<CharClassesKernel>(mpx_basis, source, u8CharClasses);
+            StreamSet * const unicodeCCs = mPB.CreateStreamSet(mpx_basis.size());
+            FilterByMask(mPB, mU8Index, u8CharClasses, unicodeCCs);
+            mCtxt.setCodeUnitContext(mpx, unicodeCCs);
+        }
+    } else {
+        StreamSet * u21_u8indexed = mPB.CreateStreamSet(21);
+        mPB.CreateKernelCall<UTF8_Decoder>(source, u21_u8indexed);
+        StreamSet * u21 = mPB.CreateStreamSet(21);
+        FilterByMask(mPB, mU8Index, u21_u8indexed, u21);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBixNum("u21basis", u21);
+        }
+        mCtxt.setCodeUnitContext(&cc::Unicode, u21);
+    }
+    mUsesUnicodeIndexing = true;
+
+    if (matchStarts) {
+        // Recalculate the match regions in the new (Unicode-codeunit) index
+        // space. Rather than independently filtering the byte-space starts
+        // (which were already InFile-masked at byte granularity, and so can
+        // disagree with an InFile mask applied at the coarser U21
+        // granularity near EOF), filter follows and rederive starts from it
+        // -- the same construction grep_engine itself uses to get starts
+        // from a line-break (follows) stream in the first place.
+        StreamSet * newFollows = mPB.CreateStreamSet(1);
+        FilterByMask(mPB, mU8Index, matchFollows, newFollows);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBitstream("mU21_LB", newFollows);
+        }
+        StreamSet * newStarts = mPB.CreateStreamSet(1, 1);
+        mPB.CreateKernelCall<LineStartsKernel>(newFollows, newStarts);
+        mCtxt.setMatchRegions(newStarts, newFollows);
+        mFinalMatchStarts = newStarts;
+        mFinalMatchFollows = newFollows;
+    }
+}
+
 void RE_PipelineBuilder::addExternal(std::string extName, ExternalStream s) {
     //llvm::errs() << "addExternal(" << extName << ", ";
     //if (s.kind == ExternalStreamKind::StartIndexed) llvm::errs() << "StartIndexed";
@@ -532,6 +702,7 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
 }
 
 void RE_PipelineBuilder::matchSearchPipeline(RE * re, StreamSet * results) {
+    ensurePrepared(re);
     mRE = prepareRE(re);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
@@ -539,6 +710,7 @@ void RE_PipelineBuilder::matchSearchPipeline(RE * re, StreamSet * results) {
 }
 
 void RE_PipelineBuilder::matchSpanPipeline(RE * re, StreamSet * matches, StreamSet * spans) {
+    ensurePrepared(re);
     mRE = prepareRE(re);
     mRE = processReferences(mRE);
     mRE = spanFactoring(mRE);

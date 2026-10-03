@@ -26,7 +26,7 @@
 #include <re/analysis/collect_ccs.h>
 #include <re/transforms/re_multiplex.h>
 #include <kernel/basis/s2p_kernel.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/stream_select.h>

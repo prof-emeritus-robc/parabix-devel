@@ -153,8 +153,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
                 MatchResults = E.CreateStreamSet();
             }
 
-            auto r = resolveModesAndExternalSymbols(patterns[i].second, mCaseInsensitive);
-            r = regular_expression_passes(r);
+            auto r = prepareInputRE(patterns[i].second, mCaseInsensitive);
             r = toUTF8(r);
             // check if we need to combine the current result with the new set of matches
             const bool exclude = (patterns[i].first == re::PatternKind::Exclude);

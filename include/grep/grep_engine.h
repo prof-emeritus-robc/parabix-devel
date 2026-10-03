@@ -16,7 +16,7 @@
 #include <re/parse/GLOB_parser.h>
 #include <kernel/core/callback.h>
 #include <kernel/util/linebreak_kernel.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <re/analysis/capture-ref.h>
 #include <grep/grep_kernel.h>
 #include <re/transforms/to_utf8.h>
@@ -146,7 +146,6 @@ protected:
     int mMaxCount;
     bool mGrepStdIn;
     NullCharMode mNullMode;
-    RE_CompilerContext mCtxt;
     BaseDriver & mGrepDriver;
     GrepFunctionType mMainMethod;
     size_t mBatchSize;
@@ -164,12 +163,11 @@ protected:
     re:: RE * mRE;
     re::ReferenceInfo mRefInfo;
     std::string mFileSuffix;
-    const cc::Alphabet * mIndexAlphabet;
-    const cc::Alphabet * mLengthAlphabet;
+    RE_Mode mMode;
+    kernel::StreamSet * mSource;
+    kernel::StreamSet * mMatchStarts;
     kernel::StreamSet * mLineBreakStream;
     kernel::StreamSet * mU8index;
-    kernel::StreamSet * mU21;
-    kernel::StreamSet * mU21_LB;
     std::vector<std::string> mSpanNames;
     re::UTF8_Transformer mUTF8_Transformer;
     std::thread::id mEngineThread;

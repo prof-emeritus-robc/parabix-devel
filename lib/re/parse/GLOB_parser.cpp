@@ -29,7 +29,7 @@ RE * FileGLOB_Parser::parse_alt() {
 RE * FileGLOB_Parser::parse_seq() {
     mPathComponentStartContext = true;
     std::vector<RE *> seq;
-    if (!mCursor.more()) return makeSeq();
+    if (!mCursor.more()) return Seq::Create();
     for (;;) {
         RE * re = parse_next_item();
         if (re == nullptr) {
@@ -37,7 +37,7 @@ RE * FileGLOB_Parser::parse_seq() {
         }
         seq.push_back(re);
     }
-    return makeSeq(seq.begin(), seq.end());
+    return Seq::Create(seq.begin(), seq.end());
 }
 
 const codepoint_t NUL = 0;
@@ -65,16 +65,16 @@ const codepoint_t FILE_PATH_SEPARATOR = '/';
 //         filename or path component (immediately after a '/').
 
 static RE * makeAnyFileCC() {
-    return makeComplement(makeCC(makeCC(NUL), makeCC(FILE_PATH_SEPARATOR)));
+    return makeComplement(CC::Create(CC::Create(NUL), CC::Create(FILE_PATH_SEPARATOR)));
 }
 
 //  Allowing PATH separator for /**/ in GLOB_kind == GIT mode.
 static RE * makeAnyPathCC() {
-    return makeComplement(makeCC(NUL));
+    return makeComplement(CC::Create(NUL));
 }
 
 static RE * makeAnyButDot() {
-    return makeComplement(makeCC(makeCC(makeCC(NUL), makeCC(FILE_PATH_SEPARATOR)), makeCC('.')));
+    return makeComplement(CC::Create(CC::Create(CC::Create(NUL), CC::Create(FILE_PATH_SEPARATOR)), CC::Create('.')));
 }
 
 RE * FileGLOB_Parser::parse_next_item() {
@@ -90,7 +90,7 @@ RE * FileGLOB_Parser::parse_next_item() {
         // process according to GIT special GLOB rules if required.
         if ((mGLOB_kind == GLOB_kind::GIT) && mPathComponentStartContext && accept('*')) {
             if (mCursor.noMore() || at(PATTERN_PATH_SEPARATOR))
-                return makeRep(makeAnyPathCC(), 0, Rep::UNBOUNDED_REP);
+                return Rep::Create(makeAnyPathCC(), 0, Rep::UNBOUNDED_REP);
         }
         // Otherwise fall through and ignore redundant * characters (normal GLOB rule).
         // Then check for a ? character.
@@ -98,26 +98,26 @@ RE * FileGLOB_Parser::parse_next_item() {
         if (at('?')) {
             // Accept the ? and build the ?* regexp in place of *?
             RE * first = parse_next_item();  // Checks/sets mPathComponentStartContext as required.
-            return makeSeq({first, makeRep(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP)});
+            return Seq::Create({first, Rep::Create(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP)});
         } else if (mPathComponentStartContext) {
             mPathComponentStartContext = false;   // After this * metacharacter.
-            return makeRep(makeSeq({makeAnyButDot(), makeRep(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP)}), 0, 1);
+            return Rep::Create(Seq::Create({makeAnyButDot(), Rep::Create(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP)}), 0, 1);
         } else {
-            return makeRep(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP);
+            return Rep::Create(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP);
         }
     } else if (accept('\\')) {
         mPathComponentStartContext = at('/');
-        return makeCC(parse_literal_codepoint());
+        return CC::Create(parse_literal_codepoint());
     } else if (accept('[')) {
         RE * cc = parse_bracket_expr();
         mPathComponentStartContext = false; // After the bracket expression, which cannot match /
         return cc;
     } else if (accept(PATTERN_PATH_SEPARATOR)) {
         mPathComponentStartContext = true;
-        return makeCC(FILE_PATH_SEPARATOR);
+        return CC::Create(FILE_PATH_SEPARATOR);
     } else {
         mPathComponentStartContext = false;
-        return makeCC(parse_literal_codepoint());
+        return CC::Create(parse_literal_codepoint());
     }
 }
 
@@ -135,19 +135,19 @@ RE * FileGLOB_Parser::parse_bracket_expr () {
             // found, the items and the bracket expr are interpreted as ordinary characters.
             // See section 2.13.3
             std::vector<RE *> seqItems;
-            seqItems.push_back(makeCC('['));
-            if (negated) seqItems.push_back(makeCC('!'));
+            seqItems.push_back(CC::Create('['));
+            if (negated) seqItems.push_back(CC::Create('!'));
             for (auto a : items) {
                 if (Range * rg = llvm::dyn_cast<Range>(a)) {
                     seqItems.push_back(rg->getLo());
-                    seqItems.push_back(makeCC('-'));
+                    seqItems.push_back(CC::Create('-'));
                     seqItems.push_back(rg->getHi());
                 } else {
                     seqItems.push_back(a);
                 }
             }
-            seqItems.push_back(makeCC(FILE_PATH_SEPARATOR));
-            return makeSeq(seqItems.begin(), seqItems.end());
+            seqItems.push_back(CC::Create(FILE_PATH_SEPARATOR));
+            return Seq::Create(seqItems.begin(), seqItems.end());
         }
         if (accept('[')) {
             if (accept('=')) items.push_back(parse_equivalence_class());
@@ -155,21 +155,21 @@ RE * FileGLOB_Parser::parse_bracket_expr () {
             else if (accept(':')) items.push_back(parse_Posix_class());
             else items.push_back(parse_bracket_expr());
         } else {
-            items.push_back(range_extend(makeCC(parse_literal_codepoint())));
+            items.push_back(range_extend(CC::Create(parse_literal_codepoint())));
         }
     } while (mCursor.more() && !at(']'));
     require(']');
     if (negated) {
         if (mPathComponentStartContext) {
             // In mPathComponentStartContext, a dot cannot be matched by a negated bracket expression
-            items.push_back(makeCC('.'));
+            items.push_back(CC::Create('.'));
         }
-        return makeComplement(makeAlt(items.begin(), items.end()));
+        return makeComplement(Alt::Create(items.begin(), items.end()));
     }
     else {
-        RE * t = makeAlt(items.begin(), items.end());
+        RE * t = Alt::Create(items.begin(), items.end());
         if (mPathComponentStartContext) {
-            t = makeDiff(t, makeCC('.'));
+            t = Diff::Create(t, CC::Create('.'));
         }
         return t;
     }
@@ -185,7 +185,7 @@ RE * FileGLOB_Parser::range_extend(RE * char_expr1) {
         if (accept('.')) char_expr2 = parse_collation_element();
         else ParseFailure("Error in range expression");
     } else {
-        char_expr2 = makeCC(parse_literal_codepoint());
+        char_expr2 = CC::Create(parse_literal_codepoint());
     }
     return makeRange(char_expr1, char_expr2);
 }
@@ -246,18 +246,18 @@ PatternVector parseGitIgnoreFile(fs::path dirpath, std::string ignoreFileName) {
             RE * lineRE = RE_Parser::parse(line, DEFAULT_MODE, RE_Syntax::GitGLOB);
             if (is_local_pattern) {
                 // The full path must be matched.
-                lineRE = makeSeq({makeStart(), lineRE});
+                lineRE = Seq::Create({Start::Create(), lineRE});
             }
             else {
                 // Ensure that the pattern matches a full path component.
-                lineRE = makeSeq({makeAlt({makeStart(), makeCC('/')}), lineRE});
+                lineRE = Seq::Create({Alt::Create({Start::Create(), CC::Create('/')}), lineRE});
             }
             if (is_directory_only_pattern) {
                 // The full path must be matched including the trailing slash.
-                lineRE = makeSeq({lineRE, makeEnd()});
+                lineRE = Seq::Create({lineRE, End::Create()});
             } else {
                 // Match both files and directories
-                lineRE = makeSeq({lineRE, makeRep(makeCC('/'), 0, 1), makeEnd()});
+                lineRE = Seq::Create({lineRE, Rep::Create(CC::Create('/'), 0, 1), End::Create()});
             }
             ignoreREs.push_back(std::make_pair(is_include_override ? PatternKind::Include : PatternKind::Exclude, lineRE));
         }

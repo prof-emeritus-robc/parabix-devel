@@ -30,7 +30,7 @@ namespace re{
             re = extend_item(re);
             seq.push_back(re);
         }
-        return makeSeq(seq.begin(), seq.end());
+        return Seq::Create(seq.begin(), seq.end());
     }
 
     RE * RE_Parser_PROSITE::parse_next_item() {
@@ -44,11 +44,11 @@ namespace re{
                     ParseFailure("Illegal Input");
                 case '<': { // the N-terminal of the sequence ('<')
                     mCursor++;
-                    return makeStart();
+                    return Start::Create();
                 }
                 case '>': { // the C-terminal of the sequence ('>')
                     mCursor++;
-                    return makeEnd();
+                    return End::Create();
                 }
                 case '[': { // Ambiguities are indicated by listing between '[ ]' the acceptable amino acids for a given position.
                     mCursor++;
@@ -57,11 +57,11 @@ namespace re{
                 case '{': { // Ambiguities are also indicated by listing between '{ }' the amino acids that are not accepted at a given position.
                     mCursor++;
                     RE * re_temp = parse_prosite_not();
-                    return makeDiff(makeAny(), re_temp);
+                    return Diff::Create(Any::Create(), re_temp);
                 }
                 case 'x': // the 'any' metacharacter
                     mCursor++;
-                    return makeAny();
+                    return Any::Create();
                 case '.': // ends the pattern
                     break;
                 default:
@@ -77,7 +77,7 @@ namespace re{
         while (*mCursor != ']') {
             RE * re = nullptr;
             if (*mCursor == '>') {
-                re = makeEnd();
+                re = End::Create();
                 mCursor++;
             } else {
                 re = createCC(parse_utf8_codepoint());
@@ -85,7 +85,7 @@ namespace re{
             alt.push_back(re);
         }
         mCursor++;
-        return makeAlt(alt.begin(), alt.end());
+        return Alt::Create(alt.begin(), alt.end());
     }
 
     RE * RE_Parser_PROSITE::parse_prosite_not() {
@@ -95,7 +95,7 @@ namespace re{
             alt.push_back(re);
         }
         mCursor++;
-        return makeAlt(alt.begin(), alt.end());
+        return Alt::Create(alt.begin(), alt.end());
     }
     
     RE * RE_Parser_PROSITE::extend_item(RE * re) {
@@ -107,7 +107,7 @@ namespace re{
                     ParseFailure("Lower bound cannot exceed upper bound in bounded repetition");
                 }
                 ++mCursor;
-                re = makeRep(re, lb, ub);
+                re = Rep::Create(re, lb, ub);
             }
 
          }

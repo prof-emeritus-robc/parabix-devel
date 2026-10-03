@@ -38,6 +38,15 @@ public:
         return back().second;
     }
 
+    static CC * Create(const codepoint_t cp, const cc::Alphabet * a = &cc::Unicode) {
+        return new CC(cp, a);
+    }
+    static CC * Create(UCD::UnicodeSet set, const cc::Alphabet * a = &cc::Unicode) {
+        return new CC(set, a);
+    }
+    static CC * Create(const CC * cc1, const CC * cc2) {
+        return makeCC(cc1, cc2);
+    }
     virtual ~CC() {}
 
     const CC* sourceCC;

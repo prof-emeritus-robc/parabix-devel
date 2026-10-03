@@ -24,12 +24,12 @@ RE * BRE_Parser::parse_alt() {
         alt.push_back(parse_seq());
     }
     while (accept("\\|"));
-    return makeAlt(alt.begin(), alt.end());
+    return Alt::Create(alt.begin(), alt.end());
 }
 
 RE * BRE_Parser::parse_seq() {
     std::vector<RE *> seq;
-    if (!mCursor.more() || at("\\|") || at("\\)")) return makeSeq();
+    if (!mCursor.more() || at("\\|") || at("\\)")) return Seq::Create();
     for (;;) {
         RE * re = parse_next_item();
         if (re == nullptr) {
@@ -38,16 +38,16 @@ RE * BRE_Parser::parse_seq() {
         re = extend_item(re);
         seq.push_back(re);
     }
-    return makeSeq(seq.begin(), seq.end());
+    return Seq::Create(seq.begin(), seq.end());
 }
 
 
 RE * BRE_Parser::parse_next_item() {
     if (mCursor.noMore() || at('*') || at("\\?") || at("\\{") || at("\\|")) return nullptr;
     else if ((mGroupsOpen > 0) && at("\\)")) return nullptr;
-    else if (accept('^')) return makeStart();
-    else if (accept('$')) return makeEnd();
-    else if (accept('.')) return makeAny();
+    else if (accept('^')) return Start::Create();
+    else if (accept('$')) return End::Create();
+    else if (accept('.')) return Any::Create();
     else if (accept("\\(")) return parse_group();
     else if (accept('[')) return parse_bracket_expr();
     else if (accept('\\')) return parse_escaped();
@@ -74,7 +74,7 @@ RE * BRE_Parser::extend_item(RE * re) {
         // No quantifier found.
         return re;
     }
-    re = makeRep(re, lb, ub);
+    re = Rep::Create(re, lb, ub);
     // The quantified expression may be extended with a further quantifier, e,g., [a-z]\{6,7\}\{2,3\}
     return extend_item(re);
 }

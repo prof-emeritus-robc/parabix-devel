@@ -17,7 +17,7 @@ RE * FixedStringParser::parse_alt() {
         alt.push_back(parse_seq());
     }
     while (accept('\n'));
-    return makeAlt(alt.begin(), alt.end());
+    return Alt::Create(alt.begin(), alt.end());
 }
 
 RE * FixedStringParser::parse_seq() {
@@ -25,7 +25,7 @@ RE * FixedStringParser::parse_seq() {
     while (mCursor.more() && (!at('\n'))) {
         seq.push_back(createCC(parse_literal_codepoint()));
     }
-    return makeSeq(seq.begin(), seq.end());
+    return Seq::Create(seq.begin(), seq.end());
 }
 
 }

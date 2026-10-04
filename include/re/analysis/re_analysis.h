@@ -25,21 +25,25 @@ unsigned maxLookaheadLength(const RE * re, const cc::Alphabet * lengthAlphabet);
 // character classes (Any, Alt, Diff, Intersect), or nullptr.
 CC * resolveCharClass(RE * r);
 
-// A segment of a lookahead chain: either X{lb,} for a character class X
-// (star), or a fixed-length RE of at least one character.
+// A segment of a lookahead chain: X{lb,} for a character class X (star),
+// a fixed-length RE of at least one character, or the end of the text (End,
+// directly after a star).
 struct LookaheadSegment {
     bool star;
+    bool end;
     CC * cc;        // star: the class X
-    RE * re;        // star: the repeated RE as written; fixed: the segment
+    RE * re;        // star: the repeated RE as written; fixed: the segment; end: End
     int lb;         // star: the minimum number of repetitions
     int length;     // fixed: the length (in the length alphabet)
 };
 
-// Parse a lookahead body as a chain of segments, e.g. B*C D{2,}E, with at
-// least one star segment and ending with a fixed segment (which ends with a
-// character).  Each star class X must be disjoint from the characters that
-// can begin the rest of the body, so that a run of X is always maximal: the
-// rest must then match at the first position after it not in X.
+// Parse a lookahead body as a chain of segments, e.g. B*C D{2,}E or B*C D*$,
+// with at least one star segment and ending with a fixed segment (which ends
+// with a character, or with End) or with the end of the text.  Each star class
+// X must be disjoint from the characters that can begin the rest of the body,
+// so that a run of X is always maximal: the rest must then match at the first
+// position after it not in X.  The end of the text is the end of a match
+// region (the RE compiler's region follow), where runs end in any case.
 bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments);
 
 // Can the lookahead body be split by ParseUniquePrefix?  The unique prefix

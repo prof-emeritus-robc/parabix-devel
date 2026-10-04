@@ -181,11 +181,13 @@ private:
 // chain is processed from the right, maintaining a stream H that marks the
 // first character after each position where the rest of the chain holds.
 //
-// A fixed segment F of length k (StarChainFixedStep) gives the starts of F
-// matches followed immediately by a position of H.
+// The end of the text gives the region follows (the positions following the
+// ends of the match regions), as End is compiled.  A fixed segment F of length
+// k (StarChainFixedStep) gives the starts of F matches followed immediately by
+// a position of H.
 //
 // A star segment B{lb,} uses the other two kernels.  With B' the B positions
-// other than record breaks, StarLookaheadIndex marks the positions not in B'
+// other than region follows, StarLookaheadIndex marks the positions not in B'
 // together with the first position of each run of B'.  Shifting each position
 // of H back to the preceding index position (IndexedShiftBack) reaches the
 // start of the run of B' before it, if there is one.  StarLookaheadSpans then

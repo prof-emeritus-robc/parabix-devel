@@ -712,28 +712,39 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
         fixed.clear();
         const auto range = getLengthRange(F, lengthAlpha);
         if ((range.first != range.second) || (range.first < 1) || (grepOffset(F) != 0)) return false;
-        segments.push_back(LookaheadSegment{false, nullptr, F, 0, range.first});
+        segments.push_back(LookaheadSegment{false, false, nullptr, F, 0, range.first});
         return true;
     };
     bool hasStar = false;
-    for (RE * e : elems) {
+    for (unsigned i = 0; i < elems.size(); ++i) {
+        RE * const e = elems[i];
         if (const Rep * rep = dyn_cast<Rep>(e)) {
             if (rep->getUB() == Rep::UNBOUNDED_REP) {
                 CC * const X = resolveCharClass(rep->getRE());
                 if ((X == nullptr) || !closeFixed()) return false;
-                segments.push_back(LookaheadSegment{true, X, rep->getRE(), rep->getLB(), 0});
+                segments.push_back(LookaheadSegment{true, false, X, rep->getRE(), rep->getLB(), 0});
                 hasStar = true;
                 continue;
             }
+        }
+        // The end of the text directly after a star (with no fixed segment
+        // to include it) is a segment of its own, which must be the last.
+        if (isa<End>(e) && fixed.empty() && !segments.empty() && segments.back().star) {
+            if (i != elems.size() - 1) return false;
+            segments.push_back(LookaheadSegment{false, true, nullptr, e, 0, 0});
+            continue;
         }
         fixed.push_back(e);
     }
     if (!closeFixed() || !hasStar || segments.back().star) return false;
     // From the right, each star class must be disjoint from the characters
-    // that can begin the rest of the body.
+    // that can begin the rest of the body.  (Runs end before the end of the
+    // text anyway, so the end segment allows any star class.)
     CC * restFirst = nullptr;
     for (auto i = segments.rbegin(); i != segments.rend(); ++i) {
-        if (i->star) {
+        if (i->end) {
+            restFirst = makeCC();
+        } else if (i->star) {
             if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
             if (!intersectCC(i->cc, restFirst)->empty()) return false;
             if (i->lb == 0) {

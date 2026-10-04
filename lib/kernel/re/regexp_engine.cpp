@@ -785,6 +785,15 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         {
             StreamSet * H = nullptr;  // all positions, for the empty rest of the chain
             for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
+                if (seg->end) {
+                    // The end of the text holds at a position followed by the end of
+                    // a match region (as End is compiled): H is the region follows.
+                    if (mCtxt.mMatchFollows == nullptr) {
+                        llvm::report_fatal_error("A lookahead ending with the end of the text requires match regions");
+                    }
+                    H = mCtxt.mMatchFollows;
+                    continue;
+                }
                 if (!seg->star) {
                     StreamSet * const Fends = mPB.CreateStreamSet(1);
                     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, seg->re, Fends);

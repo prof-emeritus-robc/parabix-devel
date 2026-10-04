@@ -151,6 +151,7 @@ extern std::string PapiCounterOptions;
 #endif
 extern std::string ShowASMOption;
 extern const char * ObjectCacheDir;
+extern std::string ObjectCacheSalt;  // set from command line: --object-cache-salt
 extern unsigned CacheDaysLimit;  // set from command line
 extern int FreeCallBisectLimit;  // set from command line
 extern llvm::CodeGenOptLevel OptLevel;  // set from command line

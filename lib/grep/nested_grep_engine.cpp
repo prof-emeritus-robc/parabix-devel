@@ -53,7 +53,6 @@ protected:
 
 NestedInternalSearchEngine::NestedInternalSearchEngine(BaseDriver & driver)
 : mGrepRecordBreak(GrepRecordBreakKind::LF)
-, mCaseInsensitive(false)
 , mGrepDriver(driver)
 , mNested(1, nullptr) {
 
@@ -153,7 +152,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
                 MatchResults = E.CreateStreamSet();
             }
 
-            auto r = prepareInputRE(patterns[i].second, mCaseInsensitive);
+            auto r = prepareInputRE(patterns[i].second, grep::lineNumGrep);
             r = toUTF8(r);
             // check if we need to combine the current result with the new set of matches
             const bool exclude = (patterns[i].first == re::PatternKind::Exclude);

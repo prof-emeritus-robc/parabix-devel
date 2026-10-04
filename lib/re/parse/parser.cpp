@@ -22,6 +22,7 @@
 #include <re/adt/adt.h>
 #include <re/adt/re_utility.h>
 #include <re/printer/re_printer.h>
+#include <re/toolchain/toolchain.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/data/RadicalSets.h>
 
@@ -79,7 +80,12 @@ RE * RE_Parser::makeBranchResetGroup(RE * r) {
 }
 
 RE * RE_Parser::parse_RE() {
-    return parse_alt();
+    RE * top_level_result = parse_alt();
+    if (re::IgnoreCaseFlag) {
+        top_level_result =
+            Group::Create(Group::Mode::CaseInsensitiveMode, top_level_result, Group::Sense::On);
+    }
+    return top_level_result;
 }
 
 RE * RE_Parser::parse_alt() {

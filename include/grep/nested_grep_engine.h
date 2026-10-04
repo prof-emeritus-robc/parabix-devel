@@ -12,8 +12,6 @@ public:
 
     void setRecordBreak(GrepRecordBreakKind b) {mGrepRecordBreak = b;}
 
-    void setCaseInsensitive()  {mCaseInsensitive = true;}
-
     void push(const re::PatternVector & REs);
 
     void pop();
@@ -22,7 +20,6 @@ public:
 
 private:
     GrepRecordBreakKind mGrepRecordBreak;
-    bool mCaseInsensitive;
     BaseDriver & mGrepDriver;
 
     std::vector<GrepFunctionType>   mMainMethod;

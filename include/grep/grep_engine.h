@@ -97,7 +97,6 @@ public:
     void setMaxCount(int m) {mMaxCount = m;}
     void setGrepStdIn(bool b = true) {mGrepStdIn = b;}
     void setInvertMatches(bool b = true) {mInvertMatches = b;}
-    void setCaseInsensitive(bool b = true)  {mCaseInsensitive = b;}
 
     void suppressFileMessages(bool b = true) {mSuppressFileMessages = b;}
     void setBinaryFilesOption(argv::BinaryFilesMode mode) {mBinaryFilesMode = mode;}
@@ -141,7 +140,6 @@ protected:
     unsigned mBeforeContext;
     unsigned mAfterContext;
     bool mInitialTab;
-    bool mCaseInsensitive;
     bool mInvertMatches;
     int mMaxCount;
     bool mGrepStdIn;
@@ -266,7 +264,6 @@ public:
     ~InternalSearchEngine();
 
     void setRecordBreak(GrepRecordBreakKind b) {mGrepRecordBreak = b;}
-    void setCaseInsensitive()  {mCaseInsensitive = true;}
 
     void grepCodeGen(re::RE * matchingRE);
 
@@ -274,7 +271,6 @@ public:
 
 private:
     GrepRecordBreakKind mGrepRecordBreak;
-    bool mCaseInsensitive;
     BaseDriver & mGrepDriver;
     GrepFunctionType mMainMethod;
 };
@@ -290,7 +286,6 @@ public:
     ~InternalMultiSearchEngine() {};
 
     void setRecordBreak(GrepRecordBreakKind b) {mGrepRecordBreak = b;}
-    void setCaseInsensitive() {mCaseInsensitive = true;}
 
     void grepCodeGen(const re::PatternVector & patterns);
 
@@ -298,7 +293,6 @@ public:
 
 private:
     GrepRecordBreakKind mGrepRecordBreak;
-    bool mCaseInsensitive;
     BaseDriver & mGrepDriver;
     GrepFunctionType mMainMethod;
 };

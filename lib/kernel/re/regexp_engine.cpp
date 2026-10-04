@@ -427,8 +427,8 @@ LongestSpan::LongestSpan (LLVMTypeSystemInterface & ts, unsigned pfxOffset, unsi
 }
 
 
-RE * prepareInputRE(RE * re, bool caseInsensitive, GrepLinesFunctionType grepCallback) {
-    re = resolveModesAndExternalSymbols(re, caseInsensitive, grepCallback);
+RE * prepareInputRE(RE * re, GrepLinesFunctionType grepCallback) {
+    re = resolveModesAndExternalSymbols(re, grepCallback);
     re = regular_expression_passes(re);
     return re;
 }
@@ -463,7 +463,7 @@ RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
 }
 
 RE_PipelineBuilder::RE_PipelineBuilder(PipelineBuilder & P, RE_context context)
-: mPB(P), mCtxt(), mCaseInsensitive(false), mMatchSpans(false),
+: mPB(P), mCtxt(), mMatchSpans(false),
   mHaveSourceContext(true), mSourceContext(context), mPrepared(false), mHaveMode(false),
   mLineBreakHint(nullptr), mU8IndexHint(nullptr),
   mUsesUnicodeIndexing(false), mU8Index(nullptr),

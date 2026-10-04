@@ -54,7 +54,7 @@ static cl::opt<bool> FieldMatch("field-match", cl::desc("require that entire fie
 static cl::alias FieldMatchA("x", cl::desc("Alias for --field-match"), cl::aliasopt(FieldMatch), cl::cat(csv::CSV_Options), cl::NotHidden);
 
 re::RE * csvRE(re::RE * re) {
-    re::RE * xfrmedRE = resolveModesAndExternalSymbols(re, false, grep::lineNumGrep);
+    re::RE * xfrmedRE = resolveModesAndExternalSymbols(re, grep::lineNumGrep);
     xfrmedRE = csv::DoubleQuoteEscape(csv::QuoteChar).transformRE(xfrmedRE);
     if (FieldMatch) {
         xfrmedRE = re::makeSeq({re::makeStart(), xfrmedRE, re::makeEnd()});
@@ -121,7 +121,7 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     UTF_Encoder u8_encoder(8);
 
     re::RE * searchRE = csvRE(re::RE_Parser::parse(Regex));
-    searchRE = prepareInputRE(searchRE, false, grep::lineNumGrep);
+    searchRE = prepareInputRE(searchRE, grep::lineNumGrep);
 
     StreamSet * u8index = nullptr;
 

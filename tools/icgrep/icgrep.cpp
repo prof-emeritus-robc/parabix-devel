@@ -63,9 +63,6 @@ re::RE * readRE() {
         argv::RegexpVector.push_back(inputFiles[0]);
         inputFiles.erase(inputFiles.begin());
     }
-    if (argv::IgnoreCaseFlag) {
-        globalFlags |= re::CASE_INSENSITIVE_MODE_FLAG;
-    }
 
     std::vector<re::RE *> REs;
     for (unsigned i = 0; i < argv::RegexpVector.size(); i++) {
@@ -128,7 +125,6 @@ int main(int argc, char *argv[]) {
             break;
         default: llvm_unreachable("Invalid grep mode!");
     }
-    if (argv::IgnoreCaseFlag) grep->setCaseInsensitive();
     if (argv::InvertMatchFlag) grep->setInvertMatches();
     if (argv::UnicodeLinesFlag) {
         grep->setRecordBreak(grep::GrepRecordBreakKind::Unicode);

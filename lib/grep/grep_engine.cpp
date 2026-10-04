@@ -145,7 +145,6 @@ GrepEngine::GrepEngine(BaseDriver &driver) :
     mBeforeContext(0),
     mAfterContext(0),
     mInitialTab(false),
-    mCaseInsensitive(false),
     mInvertMatches(false),
     mMaxCount(0),
     mGrepStdIn(false),
@@ -268,7 +267,7 @@ bool GrepEngine::matchesToEOLrequired () {
 void GrepEngine::initRE(re::RE * re) {
     // Ensure that all modes and Unicode properties are resolved, and
     // the RE is fully simplified before proceeding with RE analysis.
-    mRE = prepareInputRE(re, mCaseInsensitive, grep::lineNumGrep);
+    mRE = prepareInputRE(re, grep::lineNumGrep);
 
     // Mode determination (byte / UTF8-indexed / full Unicode) is the regex
     // engine's job; grep_engine just supplies the reasons specific to it.
@@ -1112,7 +1111,6 @@ void GrepEngine::DoGrepThreadMethod() {
 
 InternalSearchEngine::InternalSearchEngine(BaseDriver &driver) :
 mGrepRecordBreak(GrepRecordBreakKind::LF),
-mCaseInsensitive(false),
 mGrepDriver(driver),
 mMainMethod(nullptr) {
 }
@@ -1128,7 +1126,7 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
 
     // Link and resolve properties and boundaries as for the main engine; a search
     // of property value names may itself contain property value patterns.
-    matchingRE = prepareInputRE(matchingRE, mCaseInsensitive, lineNumGrep);
+    matchingRE = prepareInputRE(matchingRE, lineNumGrep);
 
     auto E = CreatePipeline(mGrepDriver,
                             Input<const char*>{"buffer"}, Input<size_t>{"length"},
@@ -1189,7 +1187,6 @@ void InternalSearchEngine::doGrep(const char * search_buffer, size_t bufferLengt
 
 InternalMultiSearchEngine::InternalMultiSearchEngine(BaseDriver &driver) :
 mGrepRecordBreak(GrepRecordBreakKind::LF),
-mCaseInsensitive(false),
 mGrepDriver(driver),
 mMainMethod(nullptr) {
 }
@@ -1239,7 +1236,7 @@ void InternalMultiSearchEngine::grepCodeGen(const re::PatternVector & patterns) 
     for (unsigned i = 0; i < n; i++) {
         StreamSet * const MatchResults = E.CreateStreamSet();
 
-        auto r = prepareInputRE(patterns[i].second, mCaseInsensitive, lineNumGrep);
+        auto r = prepareInputRE(patterns[i].second, lineNumGrep);
 
         RE_PB.matchSearchPipeline(r, MatchResults);
         const auto isExclude = patterns[i].first == re::PatternKind::Exclude;

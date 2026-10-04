@@ -80,8 +80,7 @@ RE_Mode determineREMode(re::RE * re, const RE_ModeOptions & opts);
 // recursive regular expressions (a property value that is itself resolved by
 // running a line-oriented grep over text); pass nullptr where that isn't
 // needed.
-re::RE * prepareInputRE(re::RE * re, bool caseInsensitive = false,
-                         re::GrepLinesFunctionType grepCallback = nullptr);
+re::RE * prepareInputRE(re::RE * re, re::GrepLinesFunctionType grepCallback = nullptr);
 
 class RE_CompilerContext {
     friend class RE_Kernel;
@@ -179,7 +178,7 @@ private:
 class RE_PipelineBuilder {
 public:
     RE_PipelineBuilder(kernel::PipelineBuilder & P, RE_CompilerContext & ctxt) :
-        mPB(P), mCtxt(ctxt), mCaseInsensitive(false), mMatchSpans(false),
+        mPB(P), mCtxt(ctxt), mMatchSpans(false),
         mHaveSourceContext(false), mPrepared(false), mHaveMode(false),
         mLineBreakHint(nullptr), mU8IndexHint(nullptr),
         mUsesUnicodeIndexing(false), mU8Index(nullptr),
@@ -188,8 +187,6 @@ public:
     // Auto-determining entry point: the engine decides (and builds) whatever
     // representation it needs to compile a given RE against this source.
     RE_PipelineBuilder(kernel::PipelineBuilder & P, RE_context context);
-
-    void setCaseInsensitive(bool caseless) {mCaseInsensitive = caseless;}
 
     // Only meaningful for the RE_context constructor.
     void setModeOptions(const RE_ModeOptions & opts) {mModeOptions = opts;}
@@ -230,7 +227,6 @@ protected:
 private:
     kernel::PipelineBuilder & mPB;
     RE_CompilerContext mCtxt;
-    bool mCaseInsensitive;
     bool mMatchSpans;
     re::RE * mRE;
     re::UniquePrefixNamer mUPnamer;

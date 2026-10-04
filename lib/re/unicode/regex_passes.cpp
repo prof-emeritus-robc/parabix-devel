@@ -31,7 +31,7 @@ using namespace re;
 
 namespace re {
 
-RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive, GrepLinesFunctionType grep) {
+RE * resolveModesAndExternalSymbols(RE * r, GrepLinesFunctionType grep) {
     if (PrintOptionIsSet(ShowAllREs) || PrintOptionIsSet(ShowREs)) {
         errs() << "Parser:\n" << Printer_RE::PrintRE(r) << '\n';
     }
@@ -40,7 +40,6 @@ RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive, GrepLi
     r = UCD::linkAndResolve(r, grep);
     r = removeUnneededCaptures(r);
     r = UCD::inlineSimpleProperties(r);
-    //r = resolveBoundaryProperties(r);
     validateNamesDefined(r);
     r = resolveRanges(r);
     if (UnicodeLevel2IsSet() && validateAlphabet(&cc::Unicode, r)) {
@@ -48,8 +47,7 @@ RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive, GrepLi
         r = UCD::addClusterMatches(r);
         r = UCD::addEquivalentCodepoints(r);
     }
-    r = resolveCaseInsensitiveMode(r, globallyCaseInsensitive);
-    //r = expandBoundaryAssertions(r);
+    r = resolveCaseInsensitiveMode(r);
     return r;
 }
 

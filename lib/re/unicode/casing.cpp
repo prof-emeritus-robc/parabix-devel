@@ -18,8 +18,8 @@ public:
     RE * transformName(Name * name) override;
     RE * transformGroup(Group * g) override;
 
-    ResolveCaseInsensitiveMode(const bool globallyCaseInsensitive) :
-       RE_Transformer("CaseInsensitize"), inCaseInsensitiveMode(globallyCaseInsensitive) { }
+    ResolveCaseInsensitiveMode() :
+       RE_Transformer("CaseInsensitize"), inCaseInsensitiveMode(false) { }
 
 private:
     bool inCaseInsensitiveMode;
@@ -59,8 +59,8 @@ RE * ResolveCaseInsensitiveMode::transformGroup(Group * g) {
 }
 
 
-RE * resolveCaseInsensitiveMode(RE * re, const bool globallyCaseInsensitive) {
-    ResolveCaseInsensitiveMode R(globallyCaseInsensitive);
+RE * resolveCaseInsensitiveMode(RE * re) {
+    ResolveCaseInsensitiveMode R;
     return R.transformRE(re);
 }
 

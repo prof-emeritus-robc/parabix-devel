@@ -14,6 +14,8 @@ namespace re {
 
 extern llvm::cl::OptionCategory RE_Options;
 
+extern bool IgnoreCaseFlag; // -i
+
 enum RE_PrintFlags {
     ShowREs, ShowAllREs
 };

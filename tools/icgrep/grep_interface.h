@@ -27,8 +27,8 @@ void InitializeCommandLineInterface(int argc, char *argv[]);
 // The syntax specified with =E, -F, -G, or -PROSITE. 
 extern re::RE_Syntax RegexpSyntax;
     
-// Regular expression interpretation corresponding to -i, -v, -w, -x flags.
-extern bool IgnoreCaseFlag; // -i
+// Regular expression interpretation corresponding to  -v, -w, -x flags.
+//extern bool IgnoreCaseFlag; // -i moved to lib/re/toolchain.cpp
 extern bool InvertMatchFlag; // -v
 extern bool LineRegexpFlag; // -x
 extern bool WordRegexpFlag; // -w

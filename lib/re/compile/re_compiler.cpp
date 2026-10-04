@@ -313,62 +313,6 @@ Marker RE_Block_Compiler::compileSeqTail(Seq::const_iterator current, const Seq:
 //  sequence elements that encode that multibyte character, or 0 if no special
 //  treatment is needed (including single-byte characters, for which the first
 //  and final code units coincide).
-//
-//  Track the UTF-8 decoding state through re: pending is the number of
-//  continuation bytes still expected, and chars counts completed characters.
-//  Every string matched by re must drive the state identically; otherwise
-//  (or for anything other than UTF-8 code unit CCs) return false.
-static bool trackUTF8Characters(const RE * re, unsigned & pending, unsigned & chars) {
-    if (const CC * cc = dyn_cast<CC>(re)) {
-        if ((cc->getAlphabet() != &cc::UTF8) || cc->empty()) return false;
-        const auto lo = lo_codepoint(cc->front());
-        const auto hi = hi_codepoint(cc->back());
-        if (pending > 0) {
-            if ((lo < 0x80) || (hi > 0xBF)) return false;
-            if (--pending == 0) ++chars;
-        } else if (hi <= 0x7F) {
-            ++chars;
-        } else if ((lo >= 0xC0) && (hi <= 0xDF)) {
-            pending = 1;
-        } else if ((lo >= 0xE0) && (hi <= 0xEF)) {
-            pending = 2;
-        } else if ((lo >= 0xF0) && (hi <= 0xF7)) {
-            pending = 3;
-        } else {
-            return false;
-        }
-        return true;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        for (const RE * e : *seq) {
-            if (!trackUTF8Characters(e, pending, chars)) return false;
-        }
-        return true;
-    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
-        if (alt->empty()) return false;
-        bool first = true;
-        unsigned altPending = 0, altChars = 0;
-        for (const RE * e : *alt) {
-            unsigned p = pending, c = chars;
-            if (!trackUTF8Characters(e, p, c)) return false;
-            if (first) {
-                altPending = p; altChars = c; first = false;
-            } else if ((p != altPending) || (c != altChars)) {
-                return false;
-            }
-        }
-        pending = altPending;
-        chars = altChars;
-        return true;
-    }
-    return false;
-}
-
-//  Does every string matched by re encode exactly one character in UTF-8?
-static bool isUTF8EncodedCharacter(const RE * re) {
-    unsigned pending = 0, chars = 0;
-    return trackUTF8Characters(re, pending, chars) && (pending == 0) && (chars == 1);
-}
-
 unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, const Seq::const_iterator end, Marker marker) {
     if ((marker.position() != Marker::Position::AtNextChar) || (mMain.mIndexingAlphabet == nullptr) ||
             (mMain.mCodeUnitAlphabet != &cc::UTF8) || (current == end)) {
@@ -450,6 +394,10 @@ Marker RE_Block_Compiler::compileAssertion(Assertion * const a, Marker marker) {
     }
     // Lookahead assertions.
     auto lengths = lengthRange(asserted);
+    if (mMain.mIndexingAlphabet && isUTF8EncodedCharacter(asserted)) {
+        // One character in UTF-8 code units (left in place by LookAheadNamer).
+        lengths = std::make_pair(1, 1);
+    }
     // Zero-width assertions
     if (lengths.second == 0) {
         Marker lookahead = compile(asserted);

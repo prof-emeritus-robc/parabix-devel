@@ -20,6 +20,11 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
     RE * x = transform(x0);
     if ((a->getKind() == Assertion::Kind::LookAhead) && !isa<Name>(x)) {
         auto a_range = getLengthRange(x0, &mAlphabet);
+        if ((&mAlphabet == &cc::Unicode) && isUTF8EncodedCharacter(x0)) {
+            // One character, encoded in UTF-8 code units: compiled in place
+            // with Unicode indexing, as grepOffset expects.
+            a_range = std::make_pair(1, 1);
+        }
         if (a_range.first != a_range.second) {
             RE * prefix, * suffix;
             std::tie(prefix, suffix) = ParseUniquePrefix(x);

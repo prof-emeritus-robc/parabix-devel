@@ -8,6 +8,10 @@ namespace re {
 
 std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexingAlphabet);
 
+// Does every string matched by re (an RE of UTF-8 code unit CCs) encode
+// exactly one character?  getLengthRange counts such an RE in code units.
+bool isUTF8EncodedCharacter(const RE * re);
+
 // Attempt to parse a regular expression into a prefix-suffix pair
 // such that any match to the prefix cannot be matched at any
 // other position within the RE.   If no such parse is found,

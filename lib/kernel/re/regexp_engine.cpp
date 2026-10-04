@@ -822,7 +822,8 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
         xfrmedRE = toUTF8(xfrmedRE);
     }
 
-    re::LookAheadNamer LA;
+    // Lookahead lengths are measured in the mode's length alphabet.
+    re::LookAheadNamer LA(*lengthAlphabet);
     xfrmedRE = LA.transformRE(xfrmedRE);
 
     return xfrmedRE;

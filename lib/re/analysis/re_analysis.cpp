@@ -802,6 +802,30 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
                 continue;
             }
         }
+        // Final one-character lookaheads (?=Y) or (?!Y), which must all hold.
+        if (isa<Assertion>(e)) {
+            if ((fixed.empty() && segments.empty()) || !closeFixed()) return false;
+            CC * holds = nullptr;
+            bool negated = true;
+            std::vector<Assertion *> assertions;
+            for (unsigned j = i; j < elems.size(); ++j) {
+                Assertion * const la = dyn_cast<Assertion>(elems[j]);
+                if ((la == nullptr) || (la->getKind() != Assertion::Kind::LookAhead)) return false;
+                CC * const Y = resolveCharClass(la->getAsserted());
+                if (Y == nullptr) return false;
+                const bool neg = la->getSense() == Assertion::Sense::Negative;
+                CC * const h = neg ? subtractCC(makeCC(0, 0x10FFFF, Y->getAlphabet()), Y) : Y;
+                if (holds && (holds->getAlphabet() != h->getAlphabet())) return false;
+                holds = holds ? intersectCC(holds, h) : h;
+                negated &= neg;
+                assertions.push_back(la);
+            }
+            LookaheadSegment seg{false, true, holds, e, 0, 0};
+            seg.negated = negated;
+            seg.assertions = std::move(assertions);
+            segments.push_back(std::move(seg));
+            break;
+        }
         // The end of the text directly after a star (with no fixed segment
         // to include it) is a segment of its own, which must be the last.
         if (isa<End>(e) && fixed.empty() && !segments.empty() && segments.back().star) {
@@ -818,7 +842,7 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
     CC * restFirst = nullptr;
     for (auto i = segments.rbegin(); i != segments.rend(); ++i) {
         if (i->end) {
-            restFirst = makeCC();
+            restFirst = i->cc ? i->cc : makeCC();
         } else if (i->star) {
             if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
             // (A string class requires no disjointness: the rest may hold at

@@ -587,6 +587,43 @@ void StringClassStarSpans::generatePabloMethod() {
     writeOutputStreamSet("result", std::vector<PabloAST *>{result});
 }
 
+static std::string chainAssertionEndName(const std::vector<bool> & negated, bool follows) {
+    std::string name = "ChainAssertionEnd_";
+    for (bool n : negated) name += n ? 'n' : 'p';
+    return name + (follows ? "_f" : "");
+}
+
+ChainAssertionEnd::ChainAssertionEnd(LLVMTypeSystemInterface & ts, std::vector<StreamSet *> classes,
+                                     std::vector<bool> negated, StreamSet * follows, StreamSet * H)
+: PabloKernel(ts, chainAssertionEndName(negated, follows != nullptr),
+              [&] {
+                  Bindings inputs;
+                  for (unsigned i = 0; i < classes.size(); ++i) {
+                      inputs.emplace_back("Y" + std::to_string(i), classes[i]);
+                  }
+                  if (follows) inputs.emplace_back("follows", follows);
+                  return inputs;
+              }(),
+              {Binding{"H", H}}),
+  mNegated(std::move(negated)), mHasFollows(follows != nullptr) {
+}
+
+void ChainAssertionEnd::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * H = pb.createOnes();
+    bool allNegated = true;
+    for (unsigned i = 0; i < mNegated.size(); ++i) {
+        PabloAST * Y = getInputStreamSet("Y" + std::to_string(i))[0];
+        H = pb.createAnd(H, mNegated[i] ? pb.createNot(Y) : Y);
+        allNegated &= mNegated[i];
+    }
+    if (mHasFollows) {
+        PabloAST * const follows = getInputStreamSet("follows")[0];
+        H = allNegated ? pb.createOr(H, follows) : pb.createAnd(H, pb.createNot(follows));
+    }
+    writeOutputStreamSet("H", std::vector<PabloAST *>{H});
+}
+
 StarChainFixedStep::StarChainFixedStep(LLVMTypeSystemInterface & ts, unsigned length, StreamSet * Fends,
                                        StreamSet * H, StreamSet * result)
 : PabloKernel(ts, "StarChainFixed" + std::to_string(length) + (H ? "_h" : ""),
@@ -919,6 +956,20 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         {
             StreamSet * H = nullptr;  // all positions, for the empty rest of the chain
             for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
+                if (seg->end && !seg->assertions.empty()) {
+                    // Final one-character lookaheads (see ChainAssertionEnd).
+                    std::vector<StreamSet *> classes;
+                    std::vector<bool> negated;
+                    for (Assertion * la : seg->assertions) {
+                        StreamSet * const Y = mPB.CreateStreamSet(1);
+                        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, la->getAsserted(), Y);
+                        classes.push_back(Y);
+                        negated.push_back(la->getSense() == Assertion::Sense::Negative);
+                    }
+                    H = mPB.CreateStreamSet(1);
+                    mPB.CreateKernelCall<ChainAssertionEnd>(classes, negated, mCtxt.mMatchFollows, H);
+                    continue;
+                }
                 if (seg->end) {
                     // The end of the text holds at a position followed by the end of
                     // a match region (as End is compiled): H is the region follows.

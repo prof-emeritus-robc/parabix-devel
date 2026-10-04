@@ -2,7 +2,7 @@
 
 #include <utility>
 #include <vector>
-namespace re { class RE; class Name; class CC; class Capture; class Reference;}
+namespace re { class RE; class Name; class CC; class Capture; class Reference; class Assertion;}
 namespace cc { class Alphabet;}
 
 namespace re {
@@ -52,6 +52,12 @@ struct LookaheadSegment {
     // (cc is then the class of all their characters).
     std::vector<std::vector<CC *>> strings = {};
     CC * first = nullptr;
+    // An end segment may also be final one-character lookaheads (?=Y) or
+    // (?!Y): cc is then the class of the characters at which they all hold,
+    // and negated is true if all are negative, so that they also hold at the
+    // end of the text.
+    bool negated = false;
+    std::vector<Assertion *> assertions = {};   // the final lookaheads
 };
 
 // Parse a lookahead body as a chain of segments, e.g. B*C D{2,}E or B*C D*$,
@@ -61,6 +67,9 @@ struct LookaheadSegment {
 // so that a run of X is always maximal: the rest must then match at the first
 // position after it not in X.  The end of the text is the end of a match
 // region (the RE compiler's region follow), where runs end in any case.
+// The body may also end with one-character lookaheads (?=Y) or (?!Y), for
+// character classes Y, holding where all of them hold: at the characters of
+// Y or not of Y, and at the end of the text if all are negative.
 // A star segment may also be (s1|s2|...){lb,} (lb <= 1) for a class of strings
 // (sequences of character classes) satisfying isRepeatableStringClass, with
 // no condition on the rest of the body.

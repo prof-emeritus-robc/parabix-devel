@@ -19,6 +19,7 @@ SRC
     transform_rules_printer.cpp
 DEPS
     re.adt
+    re.analysis
     re.unicode
     unicode.core
     slaballocator

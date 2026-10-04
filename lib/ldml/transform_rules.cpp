@@ -6,6 +6,7 @@
 #include <ldml/transform_rules.h>
 #include <re/adt/adt.h>
 #include <re/adt/re_utility.h>
+#include <re/analysis/re_analysis.h>
 #include <algorithm>
 #include <map>
 #include <cctype>
@@ -150,6 +151,72 @@ RE * makeTextBoundary() {
 RE * makeBoundarySet(bool beforeContext) {
     RE * const boundary = beforeContext ? static_cast<RE *>(makeStart()) : static_cast<RE *>(makeEnd());
     return Alt::Create({makeCC(), boundary});
+}
+
+// The context with the text boundary dropped from the sets (alternations)
+// that include it: beyond is true if the rest of the context beyond re (after
+// it, or before it in a before context) must match a character, so that the
+// boundary cannot be matched; last is true if nothing of the context lies
+// beyond re.  A negated set [^X] that is the last item (outermost, at the end
+// of an after context or the beginning of a before context) becomes the
+// negative assertion (?!X) or (?<!X), which holds at the boundary.
+static RE * dropBoundary(RE * re, bool after, bool beyond, bool last) {
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> items(seq->begin(), seq->end());
+        bool changed = false;
+        const int n = static_cast<int>(items.size());
+        bool b = beyond;
+        for (int k = 0; k < n; ++k) {
+            const int i = after ? (n - 1 - k) : k;
+            RE * const x = dropBoundary(items[i], after, b, last && (k == 0));
+            changed |= (x != items[i]);
+            b = b || (minMatchLength(items[i]) > 0);
+            items[i] = x;
+        }
+        return changed ? makeSeq(items.begin(), items.end()) : re;
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> alts;
+        bool boundary = false;
+        bool changed = false;
+        for (RE * a : *alt) {
+            if (after ? isa<End>(a) : isa<Start>(a)) {
+                boundary = true;
+                continue;
+            }
+            RE * const x = dropBoundary(a, after, beyond, last);
+            changed |= (x != a);
+            alts.push_back(x);
+        }
+        if (boundary && last && (alts.size() == 1)) {
+            if (Diff * d = dyn_cast<Diff>(alts[0])) {
+                if (isa<Any>(d->getLH())) {
+                    return makeAssertion(d->getRH(), after ? Assertion::Kind::LookAhead : Assertion::Kind::LookBehind,
+                                         Assertion::Sense::Negative);
+                }
+            }
+        }
+        if (boundary && !beyond) {
+            alts.push_back(after ? static_cast<RE *>(makeEnd()) : static_cast<RE *>(makeStart()));
+        } else {
+            changed |= boundary;
+        }
+        if (!changed) return re;
+        return (alts.size() == 1) ? alts[0] : makeAlt(alts.begin(), alts.end());
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        // Each repetition is followed by another or by the rest of the context.
+        RE * const x = dropBoundary(rep->getRE(), after, beyond, false);
+        return (x == rep->getRE()) ? re : makeRep(x, rep->getLB(), rep->getUB());
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n) || (n->getDefinition() == nullptr)) return re;
+        RE * const x = dropBoundary(n->getDefinition(), after, beyond, last);
+        return (x == n->getDefinition()) ? re : x;
+    }
+    // (Captures are kept, for the references to them.)
+    return re;
+}
+
+RE * engineContext(RE * context, bool afterContext) {
+    return dropBoundary(context, afterContext, false, true);
 }
 
 bool isTextBoundary(const RE * re) {

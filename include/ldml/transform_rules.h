@@ -336,6 +336,17 @@ re::RE * resolveTextBoundary(re::RE * re, BoundaryResolution resolution,
 bool mayIncludeTextBoundary(const re::RE * set);
 // The variable of which a variable is a resolved copy (or the variable itself).
 const re::Name * originalVariable(const re::Name * n);
+// A context for matching with the regular expression engine, as a lookbehind
+// (before context) or lookahead (after context): the text boundary is dropped
+// from the sets that include it (as negated sets do) wherever a character
+// must be matched beyond the set (before it in a before context, after it in
+// an after context), since the start or end of the text cannot then be
+// matched there.  A negated set [^X] that is the last item of the context
+// (the first of a before context) becomes the negative assertion (?!X), or
+// (?<!X) in a before context, which also holds at the start or end of the
+// text.  Variables (other than function calls) whose definitions change are
+// replaced by their changed definitions.
+re::RE * engineContext(re::RE * context, bool afterContext);
 
 // The set of "." in rules, matching any character other than line and
 // paragraph separators: [^[:Zp:][:Zl:]\r\n$]

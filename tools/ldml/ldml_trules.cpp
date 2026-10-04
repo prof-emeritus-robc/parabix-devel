@@ -986,7 +986,7 @@ static void classifyAfterContexts(const std::vector<std::string> & tRules, const
             ConversionRule * const cr = llvm::dyn_cast<ConversionRule>(r);
             if ((cr == nullptr) || !cr->getSourceSide(Direction::Forward)->hasAfterContext()) continue;
             re::RE * const after = cr->getSourceSide(Direction::Forward)->getAfterContext();
-            re::RE * inlined = InlineVariables().transformRE(after);
+            re::RE * inlined = InlineVariables().transformRE(engineContext(after, true));
             re::RE * la = re::makeAssertion(inlined, re::Assertion::Kind::LookAhead, re::Assertion::Sense::Positive);
             la = re::resolveModesAndExternalSymbols(la);
             la = re::regular_expression_passes(la);
@@ -1016,6 +1016,34 @@ static void classifyAfterContexts(const std::vector<std::string> & tRules, const
             counts.examples[cls].emplace(printPattern(after), label);
         }
     }
+}
+
+// The contexts of the first rule, for the regular expression engine
+// (engineContext), as printed by Printer_RE ("" for no context).
+struct EngineContextTestCase {
+    const char * input;
+    const char * before;
+    const char * after;
+};
+
+static const EngineContextTestCase engineContextTestCases[] = {
+    // A negated set as the outermost item: a negative assertion.
+    {"[^ab] { x } [^cd] → y ;",
+     "NegativeLookBehindAssertion(CC \"Unicode_61_62\" )", "NegativeLookAheadAssertion(CC \"Unicode_63_64\" )"},
+    // A negated set followed (or preceded) by a character: no boundary (and
+    // the outermost item of the before context is a negative assertion).
+    {"[^ab] c { x } c [^de]* e → y ;",
+     "(Seq[NegativeLookBehindAssertion(CC \"Unicode_61_62\" ),CC \"Unicode_63\" ])",
+     "(Seq[CC \"Unicode_63\" ,Rep(Diff (Any(Unicode) , CC \"Unicode_64_65\" ),0,Unbounded),CC \"Unicode_65\" ])"},
+    // A negated set followed only by an optional item: the boundary is kept.
+    {"x } [^cd] e? → y ;", "",
+     "(Seq[(Alt[Diff (Any(Unicode) , CC \"Unicode_63_64\" ),End]),Rep(CC \"Unicode_65\" ,0,1)])"},
+    // The boundary set [$] (End or Start) is kept.
+    {"[$] { x } [$] → y ;", "(Alt[Start,CC \"Unicode\" ])", "(Alt[End,CC \"Unicode\" ])"},
+};
+
+static std::string printEngineContext(re::RE * context, bool after) {
+    return context ? Printer_RE::PrintRE(engineContext(context, after)) : "";
 }
 
 static int runSelfTest() {
@@ -1162,6 +1190,23 @@ static int runSelfTest() {
         try {
             const std::vector<Rule *> rules = NullableCaptureElimination(parseTransformRules({t.input}));
             failures += !checkOutput("elimination", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
+    for (const EngineContextTestCase & t : engineContextTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.input});
+            const RuleSide * const side = llvm::cast<ConversionRule>(rules[0])->getSourceSide(Direction::Forward);
+            const std::string before = printEngineContext(side->getBeforeContext(), false);
+            const std::string after = printEngineContext(side->getAfterContext(), true);
+            if ((before != t.before) || (after != t.after)) {
+                failures++;
+                std::cerr << "FAIL (engine context): " << t.input << "\n  expected: " << t.before << " | " << t.after
+                          << "\n  actual:   " << before << " | " << after << "\n";
+            }
         } catch (const TransformRuleParseError & e) {
             failures++;
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";

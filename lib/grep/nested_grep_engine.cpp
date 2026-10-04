@@ -3,7 +3,6 @@
 #include <kernel/bitwise/bixlogic.h>
 #include <re/unicode/regex_passes.h>
 #include <re/unicode/casing.h>
-#include <re/transforms/to_utf8.h>
 #include <re/unicode/re_name_resolve.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/basis/s2p_kernel.h>
@@ -160,9 +159,14 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             }
 
             auto r = prepareInputRE(patterns[i].second, grep::lineNumGrep);
-            r = toUTF8(r);
+            // The streams above fix the UTF-8 indexed mode; a pattern requiring
+            // full Unicode indexing cannot be compiled in it.
+            if (LLVM_UNLIKELY(determineREMode(r, RE_ModeOptions{}).indexAlphabet != &cc::UTF8)) {
+                llvm::report_fatal_error(llvm::StringRef("Unsupported file selection pattern: ") +
+                                         Printer_RE::PrintRE(patterns[i].second));
+            }
             StreamSet * const REmatches = E.CreateStreamSet();
-            E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, REmatches);
+            RE_PB.matchSearchPipeline(r, REmatches);
             // A match marks the end of the matched text, which for an RE ending
             // in $ is the final code unit of the record.  Results are combined
             // (and reported) at record breaks, so move each match there first.
@@ -186,10 +190,10 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
         }
         assert (resultSoFar == E.getOutputStreamSet(0));
 
-        // The default signature identifies each family-called kernel by its family
-        // name (its stride, attributes and bindings), so structurally different
-        // nested pipelines never share an object cache entry, while pipelines that
-        // differ only in their regular expressions do.
+        // The default signature identifies each kernel of the nested pipeline
+        // (family calls by family name, others, including the RE kernels, by
+        // signature), so nested pipelines that differ never share an object
+        // cache entry.
         kernel = E.makeKernel();
     }
 

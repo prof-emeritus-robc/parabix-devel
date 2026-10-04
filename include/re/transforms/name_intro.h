@@ -81,6 +81,12 @@ private:
     const cc::Alphabet * mAlphabet;
 };
 
+// The name of the fixed-length unique prefix of an RE split by
+// ParseUniquePrefix (as Seq[prefix name, suffix]), in its own namespace so
+// that such a split may be recognized.
+Name * makeUniquePrefixName(RE * prefix);
+bool isUniquePrefixName(const Name * n);
+
 RE * canonicalizeExternals(RE * r, const std::vector<std::string> & external_names);
 
 }

@@ -11,6 +11,7 @@
 #include <re/unicode/regex_passes.h>
 #include <pablo/pablo.h>
 namespace kernel { class StreamSet; }
+namespace re { struct LookaheadSegment; }
 namespace cc { class Alphabet; }
 namespace kernel { class PipelineBuilder; }
 
@@ -357,12 +358,17 @@ protected:
     // position s + offset - 1 (as for a StartIndexed external).  A fixed
     // length RE gives its match ends, with the length as offset; an RE
     // Seq[P, S] for a named unique prefix P gives the ends of the matches of
-    // P that begin matches of the RE, with the length of P as offset.
+    // P that begin matches of the RE, with the length of P as offset; a
+    // lookahead chain (see parseLookaheadChain, with Unicode code units)
+    // gives the starts themselves, with offset 1.
     struct MatchStarts {
         kernel::StreamSet * stream;
         unsigned offset;
     };
     MatchStarts matchStartPipeline(re::RE * re);
+
+    // The starts of the matches of a lookahead chain (offset 1).
+    kernel::StreamSet * chainMatchStarts(const std::vector<re::LookaheadSegment> & segments);
 
     // For the matches of an RE Seq[P, S] with a named unique prefix P (see
     // matchStartPipeline), marked at their ends: the ends shifted back to the

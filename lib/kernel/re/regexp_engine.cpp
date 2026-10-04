@@ -940,107 +940,15 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
     //  are compiled first.
     prepareExternals(defn);
     //
-    // A lookahead chain (e.g. B*C D{2,}E), compiled with one position per
-    // character (see StarChainFixedStep, StarLookaheadIndex and
-    // StarLookaheadSpans).  Processing the segments from the right, the
-    // stream H marks the first character after each position where the
-    // rest of the chain holds; for the whole chain, this is the external
-    // stream, read with a lookahead of 1 (NamedLookAheadAmount).
-    if (isLookaheadChainName(n)) {
-        Assertion * const a = cast<Assertion>(defn);
-        std::vector<LookaheadSegment> segments;
-        if (!parseLookaheadChain(a->getAsserted(), mCtxt.mLengthAlphabet, segments)) {
-            llvm::report_fatal_error("Expecting a lookahead chain");
-        }
-        {
-            StreamSet * H = nullptr;  // all positions, for the empty rest of the chain
-            for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
-                if (seg->end && !seg->assertions.empty()) {
-                    // Final one-character lookaheads (see ChainAssertionEnd).
-                    std::vector<StreamSet *> classes;
-                    std::vector<bool> negated;
-                    for (Assertion * la : seg->assertions) {
-                        StreamSet * const Y = mPB.CreateStreamSet(1);
-                        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, la->getAsserted(), Y);
-                        classes.push_back(Y);
-                        negated.push_back(la->getSense() == Assertion::Sense::Negative);
-                    }
-                    H = mPB.CreateStreamSet(1);
-                    mPB.CreateKernelCall<ChainAssertionEnd>(classes, negated, mCtxt.mMatchFollows, H);
-                    continue;
-                }
-                if (seg->end) {
-                    // The end of the text holds at a position followed by the end of
-                    // a match region (as End is compiled): H is the region follows.
-                    if (mCtxt.mMatchFollows == nullptr) {
-                        llvm::report_fatal_error("A lookahead ending with the end of the text requires match regions");
-                    }
-                    H = mCtxt.mMatchFollows;
-                    continue;
-                }
-                if (!seg->star) {
-                    StreamSet * const Fends = mPB.CreateStreamSet(1);
-                    mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, seg->re, Fends);
-                    StreamSet * const result = mPB.CreateStreamSet(1);
-                    mPB.CreateKernelCall<StarChainFixedStep>(seg->length, Fends, H, result);
-                    H = result;
-                    continue;
-                }
-                if (!seg->strings.empty()) {
-                    // A string class (see StringClassStarIndex).
-                    StreamSet * const fillStartsEnds = mPB.CreateStreamSet(3);
-                    mPB.CreateKernelCall<StringClassKernel>(seg->strings, mCtxt.mCodeUnitStream, fillStartsEnds);
-                    StreamSet * const index = mPB.CreateStreamSet(1);
-                    StreamSet * const good = mPB.CreateStreamSet(1);
-                    mPB.CreateKernelCall<StringClassStarIndex>(fillStartsEnds, H, mCtxt.mMatchFollows, index, good);
-                    StreamSet * const goodNext = mPB.CreateStreamSet(1);
-                    mPB.CreateKernelCall<IndexedShiftBack>(index, good, goodNext);
-                    StreamSet * const result = mPB.CreateStreamSet(1);
-                    mPB.CreateKernelCall<StringClassStarSpans>(seg->lb, fillStartsEnds, H, index, goodNext, result);
-                    if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-                        mPB.captureBixNum("scFSE", fillStartsEnds);
-                        mPB.captureBitstream("scH", H);
-                        mPB.captureBitstream("scIndex", index);
-                        mPB.captureBitstream("scGood", good);
-                        mPB.captureBitstream("scGoodNext", goodNext);
-                        mPB.captureBitstream("scResult", result);
-                    }
-                    H = result;
-                    continue;
-                }
-                // The class may already be an external (e.g. from
-                // VariableLengthCCNamer), whose kernel must then be the one used.
-                StreamSet * Bstrm = nullptr;
-                if (Name * const Bname = dyn_cast<Name>(seg->re)) {
-                    auto f = mCtxt.mExternals.find(Bname->getFullName());
-                    if (f != mCtxt.mExternals.end()) {
-                        Bstrm = f->second.extStream;
-                    }
-                }
-                if (Bstrm == nullptr) {
-                    Bstrm = mPB.CreateStreamSet(1);
-                    mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{seg->cc}, mCtxt.mCodeUnitStream, Bstrm);
-                }
-                StreamSet * const index = mPB.CreateStreamSet(1);
-                mPB.CreateKernelCall<StarLookaheadIndex>(Bstrm, mCtxt.mMatchFollows, index);
-                StreamSet * const runStarts = mPB.CreateStreamSet(1);
-                mPB.CreateKernelCall<IndexedShiftBack>(index, H, runStarts);
-                StreamSet * const spans = mPB.CreateStreamSet(1);
-                mPB.CreateKernelCall<StarLookaheadSpans>(seg->lb, Bstrm, mCtxt.mMatchFollows, runStarts, H, spans);
-                H = spans;
-            }
-            const bool negated = (a->getSense() == Assertion::Sense::Negative);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, 1, {0, 0}, H, negated});
-            return;
-        }
-    }
-    //
     // The defining expression can now be compiled.  In most cases,
     // a single RE_Kernel can be used.   However, for lookahead
-    // assertions, special treatment is required.
-    unsigned amt = NamedLookAheadAmount(n, *mCtxt.mLengthAlphabet);
+    // assertions (other than zero-width ones), the starts of the matches
+    // of the asserted expression are needed (see matchStartPipeline).
+    Assertion * const la = dyn_cast<Assertion>(defn);
+    const bool lookahead = la && (la->getKind() == Assertion::Kind::LookAhead) &&
+                           (getLengthRange(la->getAsserted(), mCtxt.mLengthAlphabet).second > 0);
     unsigned offset = grepOffset(defn);
-    if (amt == 0) {
+    if (!lookahead) {
         // Not a lookahead; compile using a single kernel call.
         StreamSet * extStrm = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, defn, extStrm);
@@ -1067,19 +975,28 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
 }
 
 RE_PipelineBuilder::MatchStarts RE_PipelineBuilder::matchStartPipeline(RE * re) {
+    const auto r = getLengthRange(re, mCtxt.mLengthAlphabet);
+    Name * prefName = nullptr;
+    if (Seq * const seq = dyn_cast<Seq>(re)) {
+        Name * const front = seq->empty() ? nullptr : dyn_cast<Name>(seq->front());
+        if (front && isUniquePrefixName(front)) prefName = front;
+    }
+    if ((r.first != r.second) && (prefName == nullptr)) {
+        // A lookahead chain, compiled with one position per character.
+        std::vector<LookaheadSegment> segments;
+        if ((mCtxt.mCodeUnitAlphabet != &cc::Unicode) || !parseLookaheadChain(re, mCtxt.mLengthAlphabet, segments)) {
+            llvm::report_fatal_error(llvm::StringRef("Unsupported lookahead assertion: ") + Printer_RE::PrintRE(re));
+        }
+        return MatchStarts{chainMatchStarts(segments), 1};
+    }
     StreamSet * const ends = mPB.CreateStreamSet(1);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, ends);
-    const auto r = getLengthRange(re, mCtxt.mLengthAlphabet);
     if (r.first == r.second) {
         // Fixed length: the ends are the starts, offset by the length.
         return MatchStarts{ends, static_cast<unsigned>(r.second)};
     }
     // A unique prefix: the ends are shifted back to the matches of the prefix
     // that begin them.
-    if (!isa<Seq>(re) || !isa<Name>(cast<Seq>(re)->front())) {
-        llvm::report_fatal_error("Expecting named unique prefix lookahead");
-    }
-    Name * const prefName = cast<Name>(cast<Seq>(re)->front());
     auto f = mCtxt.mExternals.find(prefName->getFullName());
     assert(f != mCtxt.mExternals.end());
     StreamSet * const prefStrm = f->second.extStream;
@@ -1091,6 +1008,93 @@ RE_PipelineBuilder::MatchStarts RE_PipelineBuilder::matchStartPipeline(RE * re) 
         llvm::report_fatal_error("Expecting a fixed length unique prefix");
     }
     return MatchStarts{starts, static_cast<unsigned>(pfxRange.first)};
+}
+
+//
+// The starts of the matches of a lookahead chain (e.g. B*C D{2,}E), with one
+// position per character (see StarChainFixedStep, StarLookaheadIndex and
+// StarLookaheadSpans).  Processing the segments from the right, the stream H
+// marks the first character after each position where the rest of the chain
+// holds; for the whole chain, these are the starts of its matches.
+//
+StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegment> & segments) {
+    StreamSet * H = nullptr;  // all positions, for the empty rest of the chain
+    for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
+        if (seg->end && !seg->assertions.empty()) {
+            // Final one-character lookaheads (see ChainAssertionEnd).
+            std::vector<StreamSet *> classes;
+            std::vector<bool> negated;
+            for (Assertion * la : seg->assertions) {
+                StreamSet * const Y = mPB.CreateStreamSet(1);
+                mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, la->getAsserted(), Y);
+                classes.push_back(Y);
+                negated.push_back(la->getSense() == Assertion::Sense::Negative);
+            }
+            H = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<ChainAssertionEnd>(classes, negated, mCtxt.mMatchFollows, H);
+            continue;
+        }
+        if (seg->end) {
+            // The end of the text holds at a position followed by the end of
+            // a match region (as End is compiled): H is the region follows.
+            if (mCtxt.mMatchFollows == nullptr) {
+                llvm::report_fatal_error("A lookahead ending with the end of the text requires match regions");
+            }
+            H = mCtxt.mMatchFollows;
+            continue;
+        }
+        if (!seg->star) {
+            StreamSet * const Fends = mPB.CreateStreamSet(1);
+            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, seg->re, Fends);
+            StreamSet * const result = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<StarChainFixedStep>(seg->length, Fends, H, result);
+            H = result;
+            continue;
+        }
+        if (!seg->strings.empty()) {
+            // A string class (see StringClassStarIndex).
+            StreamSet * const fillStartsEnds = mPB.CreateStreamSet(3);
+            mPB.CreateKernelCall<StringClassKernel>(seg->strings, mCtxt.mCodeUnitStream, fillStartsEnds);
+            StreamSet * const index = mPB.CreateStreamSet(1);
+            StreamSet * const good = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<StringClassStarIndex>(fillStartsEnds, H, mCtxt.mMatchFollows, index, good);
+            StreamSet * const goodNext = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<IndexedShiftBack>(index, good, goodNext);
+            StreamSet * const result = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<StringClassStarSpans>(seg->lb, fillStartsEnds, H, index, goodNext, result);
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                mPB.captureBixNum("scFSE", fillStartsEnds);
+                mPB.captureBitstream("scH", H);
+                mPB.captureBitstream("scIndex", index);
+                mPB.captureBitstream("scGood", good);
+                mPB.captureBitstream("scGoodNext", goodNext);
+                mPB.captureBitstream("scResult", result);
+            }
+            H = result;
+            continue;
+        }
+        // The class may already be an external (e.g. from
+        // VariableLengthCCNamer), whose kernel must then be the one used.
+        StreamSet * Bstrm = nullptr;
+        if (Name * const Bname = dyn_cast<Name>(seg->re)) {
+            auto f = mCtxt.mExternals.find(Bname->getFullName());
+            if (f != mCtxt.mExternals.end()) {
+                Bstrm = f->second.extStream;
+            }
+        }
+        if (Bstrm == nullptr) {
+            Bstrm = mPB.CreateStreamSet(1);
+            mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{seg->cc}, mCtxt.mCodeUnitStream, Bstrm);
+        }
+        StreamSet * const index = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<StarLookaheadIndex>(Bstrm, mCtxt.mMatchFollows, index);
+        StreamSet * const runStarts = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<IndexedShiftBack>(index, H, runStarts);
+        StreamSet * const spans = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<StarLookaheadSpans>(seg->lb, Bstrm, mCtxt.mMatchFollows, runStarts, H, spans);
+        H = spans;
+    }
+    return H;
 }
 
 StreamSet * RE_PipelineBuilder::uniquePrefixEndsBack(StreamSet * prefix, StreamSet * ends) {

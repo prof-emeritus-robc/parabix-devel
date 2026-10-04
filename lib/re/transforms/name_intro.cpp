@@ -96,6 +96,16 @@ RE * FixedSpanNamer::transform(RE * r) {
     return makeAlt(mNewAlts.begin(), mNewAlts.end());
 }
 
+static const std::string UniquePrefixNamespace = "uniquePrefix";
+
+Name * makeUniquePrefixName(RE * prefix) {
+    return makeName(UniquePrefixNamespace, Printer_RE::PrintRE(prefix), prefix);
+}
+
+bool isUniquePrefixName(const Name * n) {
+    return n->hasNamespace() && n->getNamespace() == UniquePrefixNamespace;
+}
+
 UniquePrefixNamer::UniquePrefixNamer() : NameIntroduction("UniquePrefixNamer") {}
 
 RE * UniquePrefixNamer::transform(RE * r) {
@@ -109,8 +119,7 @@ RE * UniquePrefixNamer::transform(RE * r) {
                 alts.push_back(e);
             } else {
                 fixedPrefixFound = true;
-                std::string prefixName = Printer_RE::PrintRE(prefix);
-                Name * pfx = makeName(prefixName, prefix);
+                Name * pfx = makeUniquePrefixName(prefix);
                 std::string altName = Printer_RE::PrintRE(e);
                 Name * n = createName(altName, makeSeq({pfx, suffix}));
                 alts.push_back(n);
@@ -126,8 +135,7 @@ RE * UniquePrefixNamer::transform(RE * r) {
     if (isEmptySeq(prefix) || isEmptySeq(suffix)) {
         return r;
     }
-    std::string prefixName = Printer_RE::PrintRE(prefix);
-    Name * pfx = makeName(prefixName, prefix);
+    Name * pfx = makeUniquePrefixName(prefix);
     std::string rName = Printer_RE::PrintRE(r);
     return createName(rName, makeSeq({pfx, suffix}));
 }

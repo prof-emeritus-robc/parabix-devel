@@ -39,8 +39,7 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
             if (isEmptySeq(prefix) || isEmptySeq(suffix)) {
                 llvm::report_fatal_error("Unsupported lookahead assertion");
             }
-            std::string prefixName = Printer_RE::PrintRE(prefix);
-            Name * pfx = makeName(prefixName, prefix);
+            Name * pfx = makeUniquePrefixName(prefix);
             // Keep the assertion (and its sense): the name stands for a
             // zero-width lookahead whose asserted RE begins with the named prefix.
             RE * xfrmd = makeAssertion(makeSeq({pfx, suffix}), a->getKind(), a->getSense());
@@ -57,40 +56,6 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
     }
     if (x == x0) return a;
     return makeAssertion(x, a->getKind(), a->getSense());
-}
-
-bool isLookaheadChainName(const Name * n) {
-    return n->getFullName().compare(0, LookaheadChainPrefix.size(), LookaheadChainPrefix) == 0;
-}
-
- unsigned NamedLookAheadAmount(const Name * n, const cc::Alphabet & alpha) {
-    RE * defn = n->getDefinition();
-    if (defn == nullptr) {
-        llvm::report_fatal_error("Undefined name");
-    }
-    if (isLookaheadChainName(n)) {
-        // The external marks the first character after the lookahead point.
-        return 1;
-    }
-    if (const Assertion * a = dyn_cast<Assertion>(defn)) {
-        if (a->getKind() == Assertion::Kind::LookAhead) {
-            const RE * asserted = a->getAsserted();
-            auto a_range = getLengthRange(asserted, &alpha);
-            if (a_range.first == a_range.second) {
-                // fixed length RE
-                return a_range.second;
-            }
-            if (const Seq * seq = dyn_cast<Seq>(asserted)) {
-                // Expecting a unique prefix as the first element
-                auto a_range = getLengthRange(seq->front(), &alpha);
-                if (a_range.first == a_range.second) {
-                    return a_range.second;
-                }
-            }
-            llvm::report_fatal_error("Unsupported lookahead assertion");
-        }
-    }
-    return 0;  // Not a lookahead
 }
 
 }

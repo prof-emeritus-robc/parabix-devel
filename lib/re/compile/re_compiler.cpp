@@ -201,7 +201,8 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
         }
     }
     auto ext = f->second;
-    unsigned amt = NamedLookAheadAmount(name, *mMain.mCodeUnitAlphabet);
+    // A named lookahead: the external marks its starts, offset as given.
+    const unsigned amt = ext.fromFirst() ? ext.offset() : 0;
     if (amt > 0) {
         // Named lookahead expression.  The external stream marks where the
         // positive lookahead holds; negate it here for a negative lookahead, so

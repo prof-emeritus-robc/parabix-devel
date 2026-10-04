@@ -59,6 +59,11 @@ RE * RE_Parser::parse(const std::string & regular_expression, ModeFlagSet initia
     }
     parser->fByteMode = ByteMode;
     parser->fModeFlagSet = initialFlags;
+    if (re::IgnoreCaseFlag) {
+        // parse_RE wraps the result in a case-insensitive group; the mode flag
+        // must agree so that (?-i) and (?-i:...) register as changes.
+        parser->fModeFlagSet |= CASE_INSENSITIVE_MODE_FLAG;
+    }
     parser->mGroupsOpen = 0;
     parser->fNested = false;
     parser->mCaptureGroupCount = 0;

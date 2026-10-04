@@ -228,6 +228,9 @@ protected:
     // eventual pipeline configuration
     PipelineKernel * const  mTarget;
     bool                    mExternallySynchronized = false;
+    // Set for a top-level program (ProgramBuilder), whose compiled "main"
+    // constructs the specific kernels of its family calls.
+    bool                    mIsProgram = false;
 };
 
 /** ------------------------------------------------------------------------------------------------------------- *

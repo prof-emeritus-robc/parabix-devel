@@ -34,7 +34,6 @@ extern unsigned ByteCClimit;
 enum class GrepRecordBreakKind {Null, LF, Unicode};
 
 class InternalSearchEngine;
-class InternalMultiSearchEngine;
 
 enum GrepSignal : unsigned {BinaryFile};
 
@@ -74,7 +73,6 @@ class EmitMatch;
 class GrepEngine {
     enum class FileStatus {Pending, GrepComplete, PrintComplete};
     friend class InternalSearchEngine;
-    friend class InternalMultiSearchEngine;
     typedef uint64_t (*GrepFunctionType)(uint32_t useMMap, uint32_t fileDescriptor, GrepCallBackObject &, size_t maxCount);
     typedef uint64_t (*GrepBatchFunctionType)(const char * buffer, size_t length, EmitMatch &, size_t maxCount);
 public:
@@ -275,27 +273,24 @@ private:
     GrepFunctionType mMainMethod;
 };
 
-enum class PatternKind {Include, Exclude};
-class InternalMultiSearchEngine {
-    typedef void (*GrepFunctionType)(const char * buffer, const size_t length, MatchAccumulator *);
-public:
-    InternalMultiSearchEngine(BaseDriver & driver);
 
-    InternalMultiSearchEngine(const std::unique_ptr<grep::GrepEngine> & engine);
-
-    ~InternalMultiSearchEngine() {};
-
-    void setRecordBreak(GrepRecordBreakKind b) {mGrepRecordBreak = b;}
-
-    void grepCodeGen(const re::PatternVector & patterns);
-
-    void doGrep(const char * search_buffer, size_t bufferLength, MatchAccumulator & accum);
-
-private:
-    GrepRecordBreakKind mGrepRecordBreak;
-    BaseDriver & mGrepDriver;
-    GrepFunctionType mMainMethod;
-};
+/**
+ * The records of a buffer that contain a match to an RE, marked at their
+ * record breaks, for the internal search engines.  The RE is prepared as for
+ * the main engine, and compiled by the regular expression engine in the mode
+ * that it chooses; results of full Unicode indexing are spread back to code
+ * unit positions.
+ *
+ * @param basis the UTF-8 basis bits of the buffer.
+ * @param u8index the final UTF-8 code units of the characters.
+ * @param breaks the record breaks.
+ * @param matchStarts the starts of the records (LineStartsKernel of breaks).
+ * @param records the output: a bit at each break of a matching record.
+ */
+void matchingRecords(kernel::PipelineBuilder & P, re::RE * re,
+                     kernel::StreamSet * basis, kernel::StreamSet * u8index,
+                     kernel::StreamSet * breaks, kernel::StreamSet * matchStarts,
+                     kernel::StreamSet * records);
 
 /**
  * Returns which lines of a given buffer matches with a given regex pattern.

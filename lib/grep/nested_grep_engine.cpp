@@ -141,13 +141,8 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             resultSoFar = chained->getOutputStreamSet(0); assert (resultSoFar);
         }
 
-        RE_CompilerContext ctxt;
-        ctxt.setCodeUnitContext(&cc::UTF8, basisBits);
-        ctxt.setIndexingContext(&cc::Unicode, U8index);
         StreamSet * matchStarts = E.CreateStreamSet(1, 1);
         E.CreateKernelCall<LineStartsKernel>(breaks, matchStarts);
-        ctxt.setMatchRegions(matchStarts, breaks);
-        RE_PipelineBuilder RE_PB(E, ctxt);
 
         for (unsigned i = 0; i != n; ++i) {
             StreamSet * MatchResults = nullptr;
@@ -157,24 +152,11 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             } else {
                 MatchResults = E.CreateStreamSet();
             }
-
-            auto r = prepareInputRE(patterns[i].second, grep::lineNumGrep);
-            // The streams above fix the UTF-8 indexed mode; a pattern requiring
-            // full Unicode indexing cannot be compiled in it.
-            if (LLVM_UNLIKELY(determineREMode(r, RE_ModeOptions{}).indexAlphabet != &cc::UTF8)) {
-                llvm::report_fatal_error(llvm::StringRef("Unsupported file selection pattern: ") +
-                                         Printer_RE::PrintRE(patterns[i].second));
-            }
-            StreamSet * const REmatches = E.CreateStreamSet();
-            RE_PB.matchSearchPipeline(r, REmatches);
-            // A match marks the end of the matched text, which for an RE ending
-            // in $ is the final code unit of the record.  Results are combined
-            // (and reported) at record breaks, so move each match there first.
             // check if we need to combine the current result with the new set of matches
             const bool exclude = (patterns[i].first == re::PatternKind::Exclude);
             if (i || outerKernel || exclude) {
                 StreamSet * const matchedRecords = E.CreateStreamSet();
-                E.CreateKernelCall<MatchedLinesKernel>(REmatches, breaks, matchedRecords);
+                matchingRecords(E, patterns[i].second, basisBits, U8index, breaks, matchStarts, matchedRecords);
                 if (exclude) {
                     StreamSet * const unmatchedRecords = E.CreateStreamSet();
                     E.CreateKernelCall<InvertMatchesKernel>(matchedRecords, breaks, unmatchedRecords);
@@ -183,7 +165,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
                     OrCombine(E, resultSoFar, matchedRecords, MatchResults);
                 }
             } else {
-                E.CreateKernelCall<MatchedLinesKernel>(REmatches, breaks, MatchResults);
+                matchingRecords(E, patterns[i].second, basisBits, U8index, breaks, matchStarts, MatchResults);
             }
             resultSoFar = MatchResults;
 

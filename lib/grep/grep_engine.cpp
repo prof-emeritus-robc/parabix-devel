@@ -1109,6 +1109,31 @@ void GrepEngine::DoGrepThreadMethod() {
     }
 }
 
+void matchingRecords(PipelineBuilder & P, re::RE * re, StreamSet * basis, StreamSet * u8index,
+                     StreamSet * breaks, StreamSet * matchStarts, StreamSet * records) {
+    // Link and resolve properties and boundaries as for the main engine; a search
+    // of property value names may itself contain property value patterns.
+    re = prepareInputRE(re, lineNumGrep);
+    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, basis, matchStarts, breaks});
+    RE_PB.setU8IndexHint(u8index);
+    StreamSet * const matches = P.CreateStreamSet();
+    RE_PB.matchSearchPipeline(re, matches);
+    // A match marks the end of the matched text; move each to its record break
+    // (in the index space of the mode).
+    if (!RE_PB.usesUnicodeIndexing()) {
+        P.CreateKernelCall<MatchedLinesKernel>(matches, breaks, records);
+        return;
+    }
+    StreamSet * const matchedRecords = P.CreateStreamSet();
+    P.CreateKernelCall<MatchedLinesKernel>(matches, RE_PB.getMatchFollows(), matchedRecords);
+    StreamSet * index = u8index;
+    if (grepOffset(re) > 0) {
+        index = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<AddSentinel>(u8index, index);
+    }
+    SpreadByMask(P, index, matchedRecords, records);
+}
+
 InternalSearchEngine::InternalSearchEngine(BaseDriver &driver) :
 mGrepRecordBreak(GrepRecordBreakKind::LF),
 mGrepDriver(driver),
@@ -1123,10 +1148,6 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
     } else {// if (mGrepRecordBreak == GrepRecordBreakKind::LF)
         breakCC = re::makeCC(0x0A, &cc::UTF8);
     }
-
-    // Link and resolve properties and boundaries as for the main engine; a search
-    // of property value names may itself contain property value patterns.
-    matchingRE = prepareInputRE(matchingRE, lineNumGrep);
 
     auto E = CreatePipeline(mGrepDriver,
                             Input<const char*>{"buffer"}, Input<size_t>{"length"},
@@ -1148,16 +1169,8 @@ void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
     StreamSet * u8index = E.CreateStreamSet();
     E.CreateKernelCall<UTF8_index>(BasisBits, u8index);
 
-    StreamSet * MatchResults = E.CreateStreamSet();
-    RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
-    ctxt.setIndexingContext(&cc::Unicode, u8index);
-    ctxt.setMatchRegions(matchStarts, RecordBreakStream);
-
-    RE_PipelineBuilder RE_PB(E, ctxt);
-    RE_PB.matchSearchPipeline(matchingRE, MatchResults);
     StreamSet * MatchingRecords = E.CreateStreamSet();
-    E.CreateKernelCall<MatchedLinesKernel>(MatchResults, RecordBreakStream, MatchingRecords);
+    matchingRecords(E, matchingRE, BasisBits, u8index, RecordBreakStream, matchStarts, MatchingRecords);
 
     if (MatchCoordinateBlocks > 0) {
         StreamSet * MatchCoords = E.CreateStreamSet(3, sizeof(size_t) * 8);
@@ -1181,86 +1194,6 @@ InternalSearchEngine::~InternalSearchEngine() { }
 
 
 void InternalSearchEngine::doGrep(const char * search_buffer, size_t bufferLength, MatchAccumulator & accum) {
-    assert ((((uintptr_t)search_buffer) % (512 / 8)) == 0);
-    mMainMethod(search_buffer, bufferLength, &accum);
-}
-
-InternalMultiSearchEngine::InternalMultiSearchEngine(BaseDriver &driver) :
-mGrepRecordBreak(GrepRecordBreakKind::LF),
-mGrepDriver(driver),
-mMainMethod(nullptr) {
-}
-
-InternalMultiSearchEngine::InternalMultiSearchEngine(const std::unique_ptr<grep::GrepEngine> & engine) :
-    InternalMultiSearchEngine(engine->mGrepDriver) {}
-
-void InternalMultiSearchEngine::grepCodeGen(const re::PatternVector & patterns) {
-
-    re::CC * breakCC = nullptr;
-    if (mGrepRecordBreak == GrepRecordBreakKind::Null) {
-        breakCC = re::makeCC(0x0, &cc::UTF8);
-    } else {// if (mGrepRecordBreak == GrepRecordBreakKind::LF)
-        breakCC = re::makeCC(0x0A, &cc::UTF8);
-    }
-
-    auto E = CreatePipeline(mGrepDriver,
-                            Input<const char*>{"buffer"}, Input<size_t>{"length"},
-                            Input<MatchAccumulator *>{"accumulator"});
-
-    Scalar * const buffer = E.getInputScalar(0);
-    Scalar * const length = E.getInputScalar(1);
-    Scalar * const callbackObject = E.getInputScalar(2);
-    StreamSet * ByteStream = E.CreateStreamSet(1, 8);
-    E.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
-
-    StreamSet * RecordBreakStream = E.CreateStreamSet();
-    StreamSet * BasisBits = E.CreateStreamSet(8);
-    E.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
-    E.CreateKernelCall<CharacterClassKernelBuilder>(std::vector<re::CC *>{breakCC}, BasisBits, RecordBreakStream);
-    StreamSet * matchStarts = E.CreateStreamSet(1, 1);
-    E.CreateKernelCall<LineStartsKernel>(RecordBreakStream, matchStarts);
-
-    StreamSet * u8index = E.CreateStreamSet();
-    E.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-
-    StreamSet * resultsSoFar = RecordBreakStream;
-
-    const auto n = patterns.size();
-
-    RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
-    ctxt.setIndexingContext(&cc::Unicode, u8index);
-    ctxt.setMatchRegions(matchStarts, RecordBreakStream);
-    RE_PipelineBuilder RE_PB(E, ctxt);
-
-    for (unsigned i = 0; i < n; i++) {
-        StreamSet * const MatchResults = E.CreateStreamSet();
-
-        auto r = prepareInputRE(patterns[i].second, lineNumGrep);
-
-        RE_PB.matchSearchPipeline(r, MatchResults);
-        const auto isExclude = patterns[i].first == re::PatternKind::Exclude;
-        ctxt.setCombiningStream(resultsSoFar, isExclude ? RE_CombiningType::Exclude : RE_CombiningType::Include);
-        RE_PB.matchSearchPipeline(r, MatchResults);
-        resultsSoFar = MatchResults;
-    }
-
-    if (MatchCoordinateBlocks > 0) {
-        StreamSet * MatchCoords = E.CreateStreamSet(3, sizeof(size_t) * 8);
-        E.CreateKernelCall<MatchCoordinatesKernel>(resultsSoFar, RecordBreakStream, MatchCoords, MatchCoordinateBlocks);
-        Kernel * const matchK = E.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-        E.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
-        E.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
-    } else {
-        Kernel * const scanMatchK = E.CreateKernelCall<ScanMatchKernel>(resultsSoFar, RecordBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-        E.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
-        E.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
-    }
-
-    mMainMethod = E.compile();
-}
-
-void InternalMultiSearchEngine::doGrep(const char * search_buffer, size_t bufferLength, MatchAccumulator & accum) {
     assert ((((uintptr_t)search_buffer) % (512 / 8)) == 0);
     mMainMethod(search_buffer, bufferLength, &accum);
 }

@@ -20,6 +20,16 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r);
 
 unsigned maxLookaheadLength(const RE * re, const cc::Alphabet * lengthAlphabet);
 
+// Parse a lookahead body of the form B{lb,} C, where B is a character class,
+// C has a fixed length of at least one (in lengthAlpha) and ends with a
+// character, and the first item of C is a character class disjoint from B.
+// Such a lookahead holds at a position iff C matches at the first position
+// after it not in B, with at least lb characters of B between.
+bool parseStarLookahead(RE * body, const cc::Alphabet * lengthAlpha, CC *& B, int & lb, RE *& C);
+
+// Does the RE contain a lookahead accepted by parseStarLookahead?
+bool hasStarLookahead(const RE * r);
+
 int minMatchLength(const RE * re);
 
 /* Validate that the given RE can be compiled in UTF-8 mode

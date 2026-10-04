@@ -175,6 +175,38 @@ private:
     unsigned mEndOffset;
 };
 
+//
+// Kernels for a lookahead (?=B{lb,}C) (see re::parseStarLookahead), with
+// one stream position per character.  With B' the B positions other than
+// record breaks, StarLookaheadIndex marks the positions not in B' together
+// with the first position of each run of B'.  Shifting the start of each C
+// match back to the preceding index position (IndexedShiftBack) reaches the
+// start of the run of B' before it, if there is one.  StarLookaheadSpans then
+// marks, from each such run start (and each C start), the positions through
+// the C start, keeping those followed by at least lb characters of B': these
+// are the first characters after the positions where the lookahead holds.
+//
+class StarLookaheadIndex : public pablo::PabloKernel {
+public:
+    StarLookaheadIndex(LLVMTypeSystemInterface & ts, kernel::StreamSet * B, kernel::StreamSet * breaks,
+                       kernel::StreamSet * index);
+protected:
+    void generatePabloMethod() override;
+private:
+    const bool mHasBreaks;
+};
+
+class StarLookaheadSpans : public pablo::PabloKernel {
+public:
+    StarLookaheadSpans(LLVMTypeSystemInterface & ts, unsigned lb, kernel::StreamSet * B, kernel::StreamSet * breaks,
+                       kernel::StreamSet * runStarts, kernel::StreamSet * Cstarts, kernel::StreamSet * spans);
+protected:
+    void generatePabloMethod() override;
+private:
+    const unsigned mLB;
+    const bool mHasBreaks;
+};
+
 class RE_PipelineBuilder {
 public:
     RE_PipelineBuilder(kernel::PipelineBuilder & P, RE_CompilerContext & ctxt) :

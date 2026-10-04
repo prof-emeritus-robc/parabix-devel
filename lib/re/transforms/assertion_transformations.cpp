@@ -43,6 +43,13 @@ public:
         if (aKind == Assertion::Kind::LookAhead) {
             // Try to transform into alternations of fixed length assertions.
             asserted = removeNullableSuffix(asserted);
+            // A body B{lb,} C is compiled directly (see parseStarLookahead);
+            // zero bound elimination would split it into forms that are not.
+            CC * B; int lb; RE * C;
+            if (parseStarLookahead(asserted, mLengthAlphabet, B, lb, C)) {
+                if (asserted == asserted0) return a;
+                return makeAssertion(asserted, aKind, aSense);
+            }
             asserted = zeroBoundElimination(asserted);
             asserted = variableAltPromotion(asserted, mLengthAlphabet);
             // Now if the asserted RE is an alternation, we can transform

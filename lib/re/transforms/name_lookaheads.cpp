@@ -25,7 +25,12 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
             // with Unicode indexing, as grepOffset expects.
             a_range = std::make_pair(1, 1);
         }
-        if (a_range.first != a_range.second) {
+        CC * B; int lb; RE * C;
+        if ((a_range.first != a_range.second) && parseStarLookahead(x, &mAlphabet, B, lb, C)) {
+            // A B{lb,}C lookahead, compiled directly as an external.
+            RE * a1 = (x == x0) ? a : makeAssertion(x, a->getKind(), a->getSense());
+            return createName(Printer_RE::PrintRE(a1), a1);
+        } else if (a_range.first != a_range.second) {
             RE * prefix, * suffix;
             std::tie(prefix, suffix) = ParseUniquePrefix(x);
             if (isEmptySeq(prefix) || isEmptySeq(suffix)) {
@@ -63,6 +68,11 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
             if (a_range.first == a_range.second) {
                 // fixed length RE
                 return a_range.second;
+            }
+            CC * B; int lb; RE * C;
+            if (parseStarLookahead(const_cast<RE *>(asserted), &alpha, B, lb, C)) {
+                // The external marks the first character after the lookahead point.
+                return 1;
             }
             if (const Seq * seq = dyn_cast<Seq>(asserted)) {
                 // Expecting a unique prefix as the first element

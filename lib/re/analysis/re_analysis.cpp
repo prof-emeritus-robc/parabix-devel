@@ -631,4 +631,66 @@ unsigned grepOffset(const RE * re) {
     UnexpectedRE("grepOffset", re);
 }
 
+//  The character class matched by r, which is a CC or a combination of
+//  character classes (Any, Alt, Diff, Intersect), or nullptr.
+static CC * resolveCharClass(RE * r) {
+    if (CC * cc = resolveToCC(r)) return cc;
+    if (const Any * a = dyn_cast<Any>(r)) {
+        return makeCC(0, UCD::UNICODE_MAX, a->getAlphabet());
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        CC * u = nullptr;
+        for (RE * e : *alt) {
+            CC * cc = resolveCharClass(e);
+            if ((cc == nullptr) || (u && (u->getAlphabet() != cc->getAlphabet()))) return nullptr;
+            u = u ? makeCC(u, cc) : cc;
+        }
+        return u;
+    } else if (const Diff * d = dyn_cast<Diff>(r)) {
+        CC * lh = resolveCharClass(d->getLH());
+        CC * rh = resolveCharClass(d->getRH());
+        if (lh && rh && (lh->getAlphabet() == rh->getAlphabet())) return subtractCC(lh, rh);
+    } else if (const Intersect * x = dyn_cast<Intersect>(r)) {
+        CC * lh = resolveCharClass(x->getLH());
+        CC * rh = resolveCharClass(x->getRH());
+        if (lh && rh && (lh->getAlphabet() == rh->getAlphabet())) return intersectCC(lh, rh);
+    }
+    return nullptr;
+}
+
+bool parseStarLookahead(RE * body, const cc::Alphabet * lengthAlpha, CC *& B, int & lb, RE *& C) {
+    const Seq * const seq = dyn_cast<Seq>(body);
+    if ((seq == nullptr) || (seq->size() < 2)) return false;
+    const Rep * const rep = dyn_cast<Rep>(seq->front());
+    if ((rep == nullptr) || (rep->getUB() != Rep::UNBOUNDED_REP)) return false;
+    CC * const repeated = resolveCharClass(rep->getRE());
+    CC * const first = resolveCharClass((*seq)[1]);
+    if ((repeated == nullptr) || (first == nullptr)) return false;
+    if (repeated->getAlphabet() != first->getAlphabet()) return false;
+    if (!intersectCC(repeated, first)->empty()) return false;
+    RE * const rest = makeSeq(seq->begin() + 1, seq->end());
+    const auto range = getLengthRange(rest, lengthAlpha);
+    if ((range.first != range.second) || (range.first < 1)) return false;
+    if (grepOffset(rest) != 0) return false;
+    B = repeated;
+    lb = rep->getLB();
+    C = rest;
+    return true;
+}
+
+struct StarLookaheadFree : public RE_Validator {
+    StarLookaheadFree() : RE_Validator("StarLookaheadFree") {}
+
+    bool validateAssertion(const Assertion * a) override {
+        if (a->getKind() == Assertion::Kind::LookAhead) {
+            CC * B; int lb; RE * C;
+            if (parseStarLookahead(a->getAsserted(), &cc::Unicode, B, lb, C)) return false;
+        }
+        return validate(a->getAsserted());
+    }
+};
+
+bool hasStarLookahead(const RE * r) {
+    return !StarLookaheadFree().validateRE(r);
+}
+
 }

@@ -423,7 +423,72 @@ LongestSpan::LongestSpan (LLVMTypeSystemInterface & ts, unsigned pfxOffset, unsi
  Binding{"matchEnd", matchEnd}},
 // output
 {Binding{"spans", spans}}), mPfxOffset(pfxOffset),  mEndOffset(endOffset) {
-    
+
+}
+
+static Bindings starLookaheadInputs(StreamSet * B, StreamSet * breaks, unsigned lookahead) {
+    Bindings inputs;
+    inputs.emplace_back("B", B, FixedRate(1), LookAhead(lookahead));
+    if (breaks) {
+        inputs.emplace_back("breaks", breaks, FixedRate(1), LookAhead(lookahead));
+    }
+    return inputs;
+}
+
+StarLookaheadIndex::StarLookaheadIndex(LLVMTypeSystemInterface & ts, StreamSet * B, StreamSet * breaks, StreamSet * index)
+: PabloKernel(ts, std::string("StarLookaheadIndex") + (breaks ? "_br" : ""),
+              starLookaheadInputs(B, breaks, 0), {Binding{"index", index}}),
+  mHasBreaks(breaks != nullptr) {
+}
+
+void StarLookaheadIndex::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * Bp = getInputStreamSet("B")[0];
+    if (mHasBreaks) {
+        Bp = pb.createAnd(Bp, pb.createNot(getInputStreamSet("breaks")[0]));
+    }
+    PabloAST * runStarts = pb.createAnd(Bp, pb.createNot(pb.createAdvance(Bp, 1)));
+    PabloAST * index = pb.createOr(pb.createNot(Bp), runStarts);
+    writeOutputStreamSet("index", std::vector<PabloAST *>{index});
+}
+
+StarLookaheadSpans::StarLookaheadSpans(LLVMTypeSystemInterface & ts, unsigned lb, StreamSet * B, StreamSet * breaks,
+                                       StreamSet * runStarts, StreamSet * Cstarts, StreamSet * spans)
+: PabloKernel(ts, "StarLookaheadSpans" + std::to_string(lb) + (breaks ? "_br" : ""),
+              [&] {
+                  Bindings inputs = starLookaheadInputs(B, breaks, lb);
+                  inputs.emplace_back("runStarts", runStarts);
+                  inputs.emplace_back("Cstarts", Cstarts);
+                  return inputs;
+              }(),
+              {Binding{"spans", spans}}),
+  mLB(lb), mHasBreaks(breaks != nullptr) {
+}
+
+void StarLookaheadSpans::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * const B = getInputStreamSet("B")[0];
+    PabloAST * const breaks = mHasBreaks ? getInputStreamSet("breaks")[0] : nullptr;
+    // B' at the position i characters ahead.
+    auto Bp = [&](unsigned i) -> PabloAST * {
+        PabloAST * b = (i == 0) ? B : pb.createLookahead(B, i);
+        if (breaks) {
+            PabloAST * br = (i == 0) ? breaks : pb.createLookahead(breaks, i);
+            b = pb.createAnd(b, pb.createNot(br));
+        }
+        return b;
+    };
+    PabloAST * const B0 = Bp(0);
+    PabloAST * const Cstarts = getInputStreamSet("Cstarts")[0];
+    // Keep only shifted C starts that reached the start of a run of B'.
+    PabloAST * runStarts = pb.createAnd(getInputStreamSet("runStarts")[0],
+                                        pb.createAnd(B0, pb.createNot(pb.createAdvance(B0, 1))));
+    // From each run start through the following C start, and each C start itself.
+    PabloAST * spans = pb.createOr(pb.createMatchStar(runStarts, B0), Cstarts);
+    for (unsigned i = 0; i < mLB; ++i) {
+        spans = pb.createAnd(spans, Bp(i));
+    }
+    writeOutputStreamSet("spans", std::vector<PabloAST *>{spans});
 }
 
 
@@ -445,6 +510,12 @@ RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     // characters, but is conditioned by lookarounds, could then succeed
     // within a multibyte character.
     if (useFixedUTF8 && (getLengthRange(re, &cc::UTF8).first == 0) && hasAssertion(re)) {
+        useFixedUTF8 = false;
+    }
+    // A B{lb,}C lookahead (parseStarLookahead) is compiled with one position
+    // per character, which full Unicode indexing provides (its unbounded
+    // length already rules out the UTF8-indexed mode).
+    if (hasStarLookahead(re)) {
         useFixedUTF8 = false;
     }
     if (useFixedUTF8) {
@@ -650,6 +721,48 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
     //  Need to compile this defn.   Make sure all referenced externals
     //  are compiled first.
     prepareExternals(defn);
+    //
+    // A lookahead (?=B{lb,}C), compiled with one position per character
+    // (see StarLookaheadIndex/StarLookaheadSpans).  The external stream marks
+    // the first character after each position where the positive lookahead
+    // holds, so it is read with a lookahead of 1 (NamedLookAheadAmount).
+    if (Assertion * a = dyn_cast<Assertion>(defn)) {
+        CC * B; int lb; RE * C;
+        if ((a->getKind() == Assertion::Kind::LookAhead) &&
+                parseStarLookahead(a->getAsserted(), mCtxt.mLengthAlphabet, B, lb, C)) {
+            // B may already be an external (e.g. from VariableLengthCCNamer),
+            // whose kernel must then be the one used.
+            StreamSet * Bstrm = nullptr;
+            RE * const repeated = cast<Rep>(cast<Seq>(a->getAsserted())->front())->getRE();
+            if (Name * const Bname = dyn_cast<Name>(repeated)) {
+                auto f = mCtxt.mExternals.find(Bname->getFullName());
+                if (f != mCtxt.mExternals.end()) {
+                    Bstrm = f->second.extStream;
+                }
+            }
+            if (Bstrm == nullptr) {
+                Bstrm = mPB.CreateStreamSet(1);
+                mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{B}, mCtxt.mCodeUnitStream, Bstrm);
+            }
+            StreamSet * const Cends = mPB.CreateStreamSet(1);
+            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, C, Cends);
+            const auto lgth = getLengthRange(C, mCtxt.mLengthAlphabet).first;
+            StreamSet * Cstarts = Cends;
+            if (lgth > 1) {
+                Cstarts = mPB.CreateStreamSet(1);
+                mPB.CreateKernelCall<ShiftBack>(Cends, Cstarts, lgth - 1);
+            }
+            StreamSet * const index = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<StarLookaheadIndex>(Bstrm, mCtxt.mMatchFollows, index);
+            StreamSet * const runStarts = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<IndexedShiftBack>(index, Cstarts, runStarts);
+            StreamSet * const extStrm = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<StarLookaheadSpans>(lb, Bstrm, mCtxt.mMatchFollows, runStarts, Cstarts, extStrm);
+            const bool negated = (a->getSense() == Assertion::Sense::Negative);
+            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, 1, {0, 0}, extStrm, negated});
+            return;
+        }
+    }
     //
     // The defining expression can now be compiled.  In most cases,
     // a single RE_Kernel can be used.   However, for lookahead

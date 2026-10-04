@@ -20,6 +20,7 @@
 #include <re/alphabet/alphabet.h>
 #include <re/alphabet/multiplex_CCs.h>
 #include <re/analysis/re_analysis.h>
+#include <re/analysis/validation.h>
 #include <re/analysis/collect_ccs.h>
 #include <re/analysis/re_name_gather.h>
 #include <re/analysis/capture-ref.h>
@@ -525,6 +526,23 @@ RE * prepareInputRE(RE * re, GrepLinesFunctionType grepCallback) {
     return re;
 }
 
+// In byte mode, a variable-length lookahead is compiled by the unique prefix
+// method on UTF-8 code units, which can fail where it succeeds on characters
+// (e.g. the prefix [éÉ] is an alternation of code unit sequences).
+struct ByteModeLookaheads : public RE_Validator {
+    ByteModeLookaheads() : RE_Validator("ByteModeLookaheads") {}
+
+    bool validateAssertion(const Assertion * a) override {
+        if (a->getKind() == Assertion::Kind::LookAhead) {
+            const auto range = getLengthRange(a->getAsserted(), &cc::Unicode);
+            if ((range.first != range.second) && !hasUniquePrefix(toUTF8(a->getAsserted()))) {
+                return false;
+            }
+        }
+        return validate(a->getAsserted());
+    }
+};
+
 RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     RE_Mode mode;
     // Determine the unit of length for the RE.  If the RE involves
@@ -543,6 +561,9 @@ RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     // per character, which full Unicode indexing provides (its unbounded
     // length already rules out the UTF8-indexed mode).
     if (hasLookaheadChain(re)) {
+        useFixedUTF8 = false;
+    }
+    if (useFixedUTF8 && !ByteModeLookaheads().validateRE(re)) {
         useFixedUTF8 = false;
     }
     if (useFixedUTF8) {

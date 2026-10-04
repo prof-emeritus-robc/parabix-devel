@@ -8,6 +8,7 @@
 #include <llvm/Support/Casting.h>
 #include <re/adt/adt.h>
 #include <re/analysis/nullable.h>
+#include <re/analysis/re_analysis.h>
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/remove_nullable.h>
 #include <re/transforms/variable_alt_promotion.h>
@@ -52,7 +53,8 @@ public:
             if (Alt * alt = dyn_cast<Alt>(asserted)) {
                 std::vector<RE *> alt_lookaheads;
                 for (auto e : *alt) {
-                    alt_lookaheads.push_back(makeAssertion(e, aKind, aSense));
+                    RE * distributed = distributeNestedLookahead(e, aSense);
+                    alt_lookaheads.push_back(distributed ? distributed : makeAssertion(e, aKind, aSense));
                 }
                 if (aSense == Assertion::Sense::Positive) {
                     return makeAlt(alt_lookaheads.begin(), alt_lookaheads.end());
@@ -60,11 +62,59 @@ public:
                     return makeSeq(alt_lookaheads.begin(), alt_lookaheads.end());
                 }
             }
+            if (RE * distributed = distributeNestedLookahead(asserted, aSense)) {
+                return distributed;
+            }
         }
         if (asserted == asserted0) return a;
         return makeAssertion(asserted, aKind, aSense);
     }
 private:
+    //
+    // A lookahead whose body contains a lookahead is not directly compilable.
+    // If the body is P A S, where A is the first lookahead (on X) and P has a
+    // fixed length (so that P matches at most one string at any position):
+    //   (?=P A S)  ==>  A' (?=P S)
+    //   (?!P A S)  ==>  ¬A' | (?!P S)
+    // where A' is a lookahead of P X with the sense of A, and ¬A' has the
+    // opposite sense.  The result is standardized in turn.  Returns nullptr
+    // if the rule does not apply.
+    //
+    RE * distributeNestedLookahead(RE * body, Assertion::Sense sense) {
+        std::vector<RE *> elems;
+        if (Seq * s = dyn_cast<Seq>(body)) {
+            elems.assign(s->begin(), s->end());
+        } else {
+            elems.push_back(body);
+        }
+        for (unsigned i = 0; i < elems.size(); i++) {
+            Assertion * inner = dyn_cast<Assertion>(elems[i]);
+            if ((inner == nullptr) || (inner->getKind() != Assertion::Kind::LookAhead)) continue;
+            std::vector<RE *> P(elems.begin(), elems.begin() + i);
+            auto pRange = getLengthRange(makeSeq(P.begin(), P.end()), mLengthAlphabet);
+            if (pRange.first != pRange.second) return nullptr;
+            std::vector<RE *> PX(P);
+            PX.push_back(inner->getAsserted());
+            std::vector<RE *> PS(P);
+            PS.insert(PS.end(), elems.begin() + i + 1, elems.end());
+            RE * PX_seq = makeSeq(PX.begin(), PX.end());
+            RE * PS_seq = makeSeq(PS.begin(), PS.end());
+            const auto innerSense = inner->getSense();
+            RE * result;
+            if (sense == Assertion::Sense::Positive) {
+                result = makeSeq({makeAssertion(PX_seq, Assertion::Kind::LookAhead, innerSense),
+                                  makeAssertion(PS_seq, Assertion::Kind::LookAhead, Assertion::Sense::Positive)});
+            } else {
+                const auto flipped = (innerSense == Assertion::Sense::Positive) ? Assertion::Sense::Negative
+                                                                                 : Assertion::Sense::Positive;
+                result = makeAlt({makeAssertion(PX_seq, Assertion::Kind::LookAhead, flipped),
+                                  makeAssertion(PS_seq, Assertion::Kind::LookAhead, Assertion::Sense::Negative)});
+            }
+            return transform(result);
+        }
+        return nullptr;
+    }
+
     const cc::Alphabet * mLengthAlphabet;
 };
 

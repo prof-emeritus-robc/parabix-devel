@@ -1,4 +1,6 @@
 #include <grep/nested_grep_engine.h>
+#include <grep/grep_kernel.h>
+#include <kernel/bitwise/bixlogic.h>
 #include <re/unicode/regex_passes.h>
 #include <re/unicode/casing.h>
 #include <re/transforms/to_utf8.h>
@@ -154,12 +156,26 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
             auto r = prepareInputRE(patterns[i].second, grep::lineNumGrep);
             r = toUTF8(r);
+            StreamSet * const REmatches = E.CreateStreamSet();
+            E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, REmatches);
+            // A match marks the end of the matched text, which for an RE ending
+            // in $ is the final code unit of the record.  Results are combined
+            // (and reported) at record breaks, so move each match there first.
             // check if we need to combine the current result with the new set of matches
             const bool exclude = (patterns[i].first == re::PatternKind::Exclude);
             if (i || outerKernel || exclude) {
-                ctxt.setCombiningStream(resultSoFar, exclude ? RE_CombiningType::Exclude : RE_CombiningType::Include);
+                StreamSet * const matchedRecords = E.CreateStreamSet();
+                E.CreateKernelCall<MatchedLinesKernel>(REmatches, breaks, matchedRecords);
+                if (exclude) {
+                    StreamSet * const unmatchedRecords = E.CreateStreamSet();
+                    E.CreateKernelCall<InvertMatchesKernel>(matchedRecords, breaks, unmatchedRecords);
+                    AndCombine(E, resultSoFar, unmatchedRecords, MatchResults);
+                } else {
+                    OrCombine(E, resultSoFar, matchedRecords, MatchResults);
+                }
+            } else {
+                E.CreateKernelCall<MatchedLinesKernel>(REmatches, breaks, MatchResults);
             }
-            E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, MatchResults);
             resultSoFar = MatchResults;
 
         }

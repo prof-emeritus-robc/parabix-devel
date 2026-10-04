@@ -1,6 +1,7 @@
 #pragma once
 
 #include <utility>
+#include <vector>
 namespace re { class RE; class Name; class CC; class Capture; class Reference;}
 namespace cc { class Alphabet;}
 
@@ -20,15 +21,30 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r);
 
 unsigned maxLookaheadLength(const RE * re, const cc::Alphabet * lengthAlphabet);
 
-// Parse a lookahead body of the form B{lb,} C, where B is a character class,
-// C has a fixed length of at least one (in lengthAlpha) and ends with a
-// character, and the first item of C is a character class disjoint from B.
-// Such a lookahead holds at a position iff C matches at the first position
-// after it not in B, with at least lb characters of B between.
-bool parseStarLookahead(RE * body, const cc::Alphabet * lengthAlpha, CC *& B, int & lb, RE *& C);
+// A segment of a lookahead chain: either X{lb,} for a character class X
+// (star), or a fixed-length RE of at least one character.
+struct LookaheadSegment {
+    bool star;
+    CC * cc;        // star: the class X
+    RE * re;        // star: the repeated RE as written; fixed: the segment
+    int lb;         // star: the minimum number of repetitions
+    int length;     // fixed: the length (in the length alphabet)
+};
 
-// Does the RE contain a lookahead accepted by parseStarLookahead?
-bool hasStarLookahead(const RE * r);
+// Parse a lookahead body as a chain of segments, e.g. B*C D{2,}E, with at
+// least one star segment and ending with a fixed segment (which ends with a
+// character).  Each star class X must be disjoint from the characters that
+// can begin the rest of the body, so that a run of X is always maximal: the
+// rest must then match at the first position after it not in X.
+bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments);
+
+// Can the lookahead body be split by ParseUniquePrefix?  The unique prefix
+// method is used for such a body, in preference to a lookahead chain.
+bool hasUniquePrefix(RE * body);
+
+// Does the RE contain a lookahead that is compiled as a lookahead chain
+// (accepted by parseLookaheadChain, with no unique prefix)?
+bool hasLookaheadChain(const RE * r);
 
 int minMatchLength(const RE * re);
 

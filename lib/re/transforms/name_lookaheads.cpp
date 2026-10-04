@@ -10,6 +10,7 @@
 #include <re/analysis/re_analysis.h>
 #include <re/adt/adt.h>
 #include <re/printer/re_printer.h>
+#include <kernel/core/kernel.h>
 
 using namespace llvm;
 
@@ -25,11 +26,13 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
             // with Unicode indexing, as grepOffset expects.
             a_range = std::make_pair(1, 1);
         }
-        CC * B; int lb; RE * C;
-        if ((a_range.first != a_range.second) && parseStarLookahead(x, &mAlphabet, B, lb, C)) {
-            // A B{lb,}C lookahead, compiled directly as an external.
+        std::vector<LookaheadSegment> segments;
+        if ((a_range.first != a_range.second) && !hasUniquePrefix(x) &&
+                (&mAlphabet == &cc::Unicode) && parseLookaheadChain(x, &mAlphabet, segments)) {
+            // A lookahead chain (e.g. B*C D*E), compiled directly as an external
+            // (with one position per character).  The name identifies it as such.
             RE * a1 = (x == x0) ? a : makeAssertion(x, a->getKind(), a->getSense());
-            return createName(Printer_RE::PrintRE(a1), a1);
+            return createName(LookaheadChainPrefix + kernel::Kernel::getStringHash(Printer_RE::PrintRE(a1)), a1);
         } else if (a_range.first != a_range.second) {
             RE * prefix, * suffix;
             std::tie(prefix, suffix) = ParseUniquePrefix(x);
@@ -56,10 +59,18 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
     return makeAssertion(x, a->getKind(), a->getSense());
 }
 
+bool isLookaheadChainName(const Name * n) {
+    return n->getFullName().compare(0, LookaheadChainPrefix.size(), LookaheadChainPrefix) == 0;
+}
+
  unsigned NamedLookAheadAmount(const Name * n, const cc::Alphabet & alpha) {
     RE * defn = n->getDefinition();
     if (defn == nullptr) {
         llvm::report_fatal_error("Undefined name");
+    }
+    if (isLookaheadChainName(n)) {
+        // The external marks the first character after the lookahead point.
+        return 1;
     }
     if (const Assertion * a = dyn_cast<Assertion>(defn)) {
         if (a->getKind() == Assertion::Kind::LookAhead) {
@@ -68,11 +79,6 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
             if (a_range.first == a_range.second) {
                 // fixed length RE
                 return a_range.second;
-            }
-            CC * B; int lb; RE * C;
-            if (parseStarLookahead(const_cast<RE *>(asserted), &alpha, B, lb, C)) {
-                // The external marks the first character after the lookahead point.
-                return 1;
             }
             if (const Seq * seq = dyn_cast<Seq>(asserted)) {
                 // Expecting a unique prefix as the first element

@@ -452,6 +452,33 @@ void StarLookaheadIndex::generatePabloMethod() {
     writeOutputStreamSet("index", std::vector<PabloAST *>{index});
 }
 
+StarChainFixedStep::StarChainFixedStep(LLVMTypeSystemInterface & ts, unsigned length, StreamSet * Fends,
+                                       StreamSet * H, StreamSet * result)
+: PabloKernel(ts, "StarChainFixed" + std::to_string(length) + (H ? "_h" : ""),
+              [&] {
+                  Bindings inputs;
+                  inputs.emplace_back("Fends", Fends, FixedRate(1), LookAhead(length - 1));
+                  if (H) {
+                      inputs.emplace_back("H", H, FixedRate(1), LookAhead(length));
+                  }
+                  return inputs;
+              }(),
+              {Binding{"result", result}}),
+  mLength(length), mHasH(H != nullptr) {
+}
+
+void StarChainFixedStep::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * const Fends = getInputStreamSet("Fends")[0];
+    // The starts of F matches, ...
+    PabloAST * result = (mLength > 1) ? pb.createLookahead(Fends, mLength - 1) : Fends;
+    // ... followed immediately by a position of H.
+    if (mHasH) {
+        result = pb.createAnd(result, pb.createLookahead(getInputStreamSet("H")[0], mLength));
+    }
+    writeOutputStreamSet("result", std::vector<PabloAST *>{result});
+}
+
 StarLookaheadSpans::StarLookaheadSpans(LLVMTypeSystemInterface & ts, unsigned lb, StreamSet * B, StreamSet * breaks,
                                        StreamSet * runStarts, StreamSet * Cstarts, StreamSet * spans)
 : PabloKernel(ts, "StarLookaheadSpans" + std::to_string(lb) + (breaks ? "_br" : ""),
@@ -512,10 +539,10 @@ RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     if (useFixedUTF8 && (getLengthRange(re, &cc::UTF8).first == 0) && hasAssertion(re)) {
         useFixedUTF8 = false;
     }
-    // A B{lb,}C lookahead (parseStarLookahead) is compiled with one position
+    // A lookahead chain (parseLookaheadChain) is compiled with one position
     // per character, which full Unicode indexing provides (its unbounded
     // length already rules out the UTF8-indexed mode).
-    if (hasStarLookahead(re)) {
+    if (hasLookaheadChain(re)) {
         useFixedUTF8 = false;
     }
     if (useFixedUTF8) {
@@ -722,44 +749,52 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
     //  are compiled first.
     prepareExternals(defn);
     //
-    // A lookahead (?=B{lb,}C), compiled with one position per character
-    // (see StarLookaheadIndex/StarLookaheadSpans).  The external stream marks
-    // the first character after each position where the positive lookahead
-    // holds, so it is read with a lookahead of 1 (NamedLookAheadAmount).
-    if (Assertion * a = dyn_cast<Assertion>(defn)) {
-        CC * B; int lb; RE * C;
-        if ((a->getKind() == Assertion::Kind::LookAhead) &&
-                parseStarLookahead(a->getAsserted(), mCtxt.mLengthAlphabet, B, lb, C)) {
-            // B may already be an external (e.g. from VariableLengthCCNamer),
-            // whose kernel must then be the one used.
-            StreamSet * Bstrm = nullptr;
-            RE * const repeated = cast<Rep>(cast<Seq>(a->getAsserted())->front())->getRE();
-            if (Name * const Bname = dyn_cast<Name>(repeated)) {
-                auto f = mCtxt.mExternals.find(Bname->getFullName());
-                if (f != mCtxt.mExternals.end()) {
-                    Bstrm = f->second.extStream;
+    // A lookahead chain (e.g. B*C D{2,}E), compiled with one position per
+    // character (see StarChainFixedStep, StarLookaheadIndex and
+    // StarLookaheadSpans).  Processing the segments from the right, the
+    // stream H marks the first character after each position where the
+    // rest of the chain holds; for the whole chain, this is the external
+    // stream, read with a lookahead of 1 (NamedLookAheadAmount).
+    if (isLookaheadChainName(n)) {
+        Assertion * const a = cast<Assertion>(defn);
+        std::vector<LookaheadSegment> segments;
+        if (!parseLookaheadChain(a->getAsserted(), mCtxt.mLengthAlphabet, segments)) {
+            llvm::report_fatal_error("Expecting a lookahead chain");
+        }
+        {
+            StreamSet * H = nullptr;  // all positions, for the empty rest of the chain
+            for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
+                if (!seg->star) {
+                    StreamSet * const Fends = mPB.CreateStreamSet(1);
+                    mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, seg->re, Fends);
+                    StreamSet * const result = mPB.CreateStreamSet(1);
+                    mPB.CreateKernelCall<StarChainFixedStep>(seg->length, Fends, H, result);
+                    H = result;
+                    continue;
                 }
+                // The class may already be an external (e.g. from
+                // VariableLengthCCNamer), whose kernel must then be the one used.
+                StreamSet * Bstrm = nullptr;
+                if (Name * const Bname = dyn_cast<Name>(seg->re)) {
+                    auto f = mCtxt.mExternals.find(Bname->getFullName());
+                    if (f != mCtxt.mExternals.end()) {
+                        Bstrm = f->second.extStream;
+                    }
+                }
+                if (Bstrm == nullptr) {
+                    Bstrm = mPB.CreateStreamSet(1);
+                    mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{seg->cc}, mCtxt.mCodeUnitStream, Bstrm);
+                }
+                StreamSet * const index = mPB.CreateStreamSet(1);
+                mPB.CreateKernelCall<StarLookaheadIndex>(Bstrm, mCtxt.mMatchFollows, index);
+                StreamSet * const runStarts = mPB.CreateStreamSet(1);
+                mPB.CreateKernelCall<IndexedShiftBack>(index, H, runStarts);
+                StreamSet * const spans = mPB.CreateStreamSet(1);
+                mPB.CreateKernelCall<StarLookaheadSpans>(seg->lb, Bstrm, mCtxt.mMatchFollows, runStarts, H, spans);
+                H = spans;
             }
-            if (Bstrm == nullptr) {
-                Bstrm = mPB.CreateStreamSet(1);
-                mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{B}, mCtxt.mCodeUnitStream, Bstrm);
-            }
-            StreamSet * const Cends = mPB.CreateStreamSet(1);
-            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, C, Cends);
-            const auto lgth = getLengthRange(C, mCtxt.mLengthAlphabet).first;
-            StreamSet * Cstarts = Cends;
-            if (lgth > 1) {
-                Cstarts = mPB.CreateStreamSet(1);
-                mPB.CreateKernelCall<ShiftBack>(Cends, Cstarts, lgth - 1);
-            }
-            StreamSet * const index = mPB.CreateStreamSet(1);
-            mPB.CreateKernelCall<StarLookaheadIndex>(Bstrm, mCtxt.mMatchFollows, index);
-            StreamSet * const runStarts = mPB.CreateStreamSet(1);
-            mPB.CreateKernelCall<IndexedShiftBack>(index, Cstarts, runStarts);
-            StreamSet * const extStrm = mPB.CreateStreamSet(1);
-            mPB.CreateKernelCall<StarLookaheadSpans>(lb, Bstrm, mCtxt.mMatchFollows, runStarts, Cstarts, extStrm);
             const bool negated = (a->getSense() == Assertion::Sense::Negative);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, 1, {0, 0}, extStrm, negated});
+            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, 1, {0, 0}, H, negated});
             return;
         }
     }

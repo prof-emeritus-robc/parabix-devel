@@ -31,5 +31,10 @@ private:
     with that name as created by the LookAneadHamer, or returns
     0 if the Name is not defined as a Lookahead assertion. */
 unsigned NamedLookAheadAmount(const Name * n, const cc::Alphabet & alpha = cc::Unicode);
+
+/*  Lookaheads compiled as lookahead chains (see parseLookaheadChain) are
+    named by the LookAheadNamer with this prefix. */
+const std::string LookaheadChainPrefix = "LAchain_";
+bool isLookaheadChainName(const Name * n);
 }
 

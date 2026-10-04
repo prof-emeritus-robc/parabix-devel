@@ -43,10 +43,11 @@ public:
         if (aKind == Assertion::Kind::LookAhead) {
             // Try to transform into alternations of fixed length assertions.
             asserted = removeNullableSuffix(asserted);
-            // A body B{lb,} C is compiled directly (see parseStarLookahead);
-            // zero bound elimination would split it into forms that are not.
-            CC * B; int lb; RE * C;
-            if (parseStarLookahead(asserted, mLengthAlphabet, B, lb, C)) {
+            // A chain such as B*C D*E is compiled directly (see
+            // parseLookaheadChain); zero bound elimination would split it
+            // into forms that are not.
+            std::vector<LookaheadSegment> segments;
+            if (!hasUniquePrefix(asserted) && parseLookaheadChain(asserted, mLengthAlphabet, segments)) {
                 if (asserted == asserted0) return a;
                 return makeAssertion(asserted, aKind, aSense);
             }

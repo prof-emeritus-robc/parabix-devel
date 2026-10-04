@@ -657,40 +657,123 @@ static CC * resolveCharClass(RE * r) {
     return nullptr;
 }
 
-bool parseStarLookahead(RE * body, const cc::Alphabet * lengthAlpha, CC *& B, int & lb, RE *& C) {
-    const Seq * const seq = dyn_cast<Seq>(body);
-    if ((seq == nullptr) || (seq->size() < 2)) return false;
-    const Rep * const rep = dyn_cast<Rep>(seq->front());
-    if ((rep == nullptr) || (rep->getUB() != Rep::UNBOUNDED_REP)) return false;
-    CC * const repeated = resolveCharClass(rep->getRE());
-    CC * const first = resolveCharClass((*seq)[1]);
-    if ((repeated == nullptr) || (first == nullptr)) return false;
-    if (repeated->getAlphabet() != first->getAlphabet()) return false;
-    if (!intersectCC(repeated, first)->empty()) return false;
-    RE * const rest = makeSeq(seq->begin() + 1, seq->end());
-    const auto range = getLengthRange(rest, lengthAlpha);
-    if ((range.first != range.second) || (range.first < 1)) return false;
-    if (grepOffset(rest) != 0) return false;
-    B = repeated;
-    lb = rep->getLB();
-    C = rest;
+//  The class of characters that can begin a match of r (which matches at
+//  least one character), or nullptr if it cannot be determined.
+static CC * firstCharClass(RE * r) {
+    if (CC * cc = resolveCharClass(r)) return cc;
+    if (const Seq * seq = dyn_cast<Seq>(r)) {
+        if (seq->empty() || (getLengthRange(seq->front(), &cc::Unicode).first == 0)) return nullptr;
+        return firstCharClass(seq->front());
+    } else if (const Rep * rep = dyn_cast<Rep>(r)) {
+        if (rep->getLB() == 0) return nullptr;
+        return firstCharClass(rep->getRE());
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        CC * u = nullptr;
+        for (RE * e : *alt) {
+            CC * cc = firstCharClass(e);
+            if ((cc == nullptr) || (u && (u->getAlphabet() != cc->getAlphabet()))) return nullptr;
+            u = u ? makeCC(u, cc) : cc;
+        }
+        return u;
+    } else if (const Name * n = dyn_cast<Name>(r)) {
+        if (n->getDefinition()) return firstCharClass(n->getDefinition());
+    } else if (const Capture * c = dyn_cast<Capture>(r)) {
+        return firstCharClass(c->getCapturedRE());
+    } else if (const Group * g = dyn_cast<Group>(r)) {
+        return firstCharClass(g->getRE());
+    }
+    return nullptr;
+}
+
+//  The elements of r as a sequence, seeing through nested sequences and
+//  single alternatives (which unsimplified REs may contain).
+static void flattenSeq(RE * r, std::vector<RE *> & elems) {
+    if (const Alt * alt = dyn_cast<Alt>(r)) {
+        if (alt->size() == 1) {
+            flattenSeq(alt->front(), elems);
+            return;
+        }
+    } else if (const Seq * seq = dyn_cast<Seq>(r)) {
+        for (RE * e : *seq) {
+            flattenSeq(e, elems);
+        }
+        return;
+    }
+    elems.push_back(r);
+}
+
+bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments) {
+    segments.clear();
+    std::vector<RE *> elems;
+    flattenSeq(body, elems);
+    // Group the elements into star segments and maximal fixed segments.
+    std::vector<RE *> fixed;
+    auto closeFixed = [&]() -> bool {
+        if (fixed.empty()) return true;
+        RE * const F = makeSeq(fixed.begin(), fixed.end());
+        fixed.clear();
+        const auto range = getLengthRange(F, lengthAlpha);
+        if ((range.first != range.second) || (range.first < 1) || (grepOffset(F) != 0)) return false;
+        segments.push_back(LookaheadSegment{false, nullptr, F, 0, range.first});
+        return true;
+    };
+    bool hasStar = false;
+    for (RE * e : elems) {
+        if (const Rep * rep = dyn_cast<Rep>(e)) {
+            if (rep->getUB() == Rep::UNBOUNDED_REP) {
+                CC * const X = resolveCharClass(rep->getRE());
+                if ((X == nullptr) || !closeFixed()) return false;
+                segments.push_back(LookaheadSegment{true, X, rep->getRE(), rep->getLB(), 0});
+                hasStar = true;
+                continue;
+            }
+        }
+        fixed.push_back(e);
+    }
+    if (!closeFixed() || !hasStar || segments.back().star) return false;
+    // From the right, each star class must be disjoint from the characters
+    // that can begin the rest of the body.
+    CC * restFirst = nullptr;
+    for (auto i = segments.rbegin(); i != segments.rend(); ++i) {
+        if (i->star) {
+            if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
+            if (!intersectCC(i->cc, restFirst)->empty()) return false;
+            if (i->lb == 0) {
+                restFirst = makeCC(i->cc, restFirst);
+            } else {
+                restFirst = i->cc;
+            }
+        } else {
+            restFirst = firstCharClass(i->re);
+            if (restFirst == nullptr) return false;
+        }
+    }
     return true;
 }
 
-struct StarLookaheadFree : public RE_Validator {
-    StarLookaheadFree() : RE_Validator("StarLookaheadFree") {}
+bool hasUniquePrefix(RE * body) {
+    std::vector<RE *> elems;
+    flattenSeq(body, elems);
+    RE * prefix, * suffix;
+    std::tie(prefix, suffix) = ParseUniquePrefix(makeSeq(elems.begin(), elems.end()));
+    return !isEmptySeq(prefix) && !isEmptySeq(suffix);
+}
+
+struct LookaheadChainFree : public RE_Validator {
+    LookaheadChainFree() : RE_Validator("LookaheadChainFree") {}
 
     bool validateAssertion(const Assertion * a) override {
         if (a->getKind() == Assertion::Kind::LookAhead) {
-            CC * B; int lb; RE * C;
-            if (parseStarLookahead(a->getAsserted(), &cc::Unicode, B, lb, C)) return false;
+            std::vector<LookaheadSegment> segments;
+            if (!hasUniquePrefix(a->getAsserted()) &&
+                    parseLookaheadChain(a->getAsserted(), &cc::Unicode, segments)) return false;
         }
         return validate(a->getAsserted());
     }
 };
 
-bool hasStarLookahead(const RE * r) {
-    return !StarLookaheadFree().validateRE(r);
+bool hasLookaheadChain(const RE * r) {
+    return !LookaheadChainFree().validateRE(r);
 }
 
 }

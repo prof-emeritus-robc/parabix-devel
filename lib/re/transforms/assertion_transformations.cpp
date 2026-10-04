@@ -77,8 +77,12 @@ private:
     //   (?=P A S)  ==>  A' (?=P S)
     //   (?!P A S)  ==>  ¬A' | (?!P S)
     // where A' is a lookahead of P X with the sense of A, and ¬A' has the
-    // opposite sense.  The result is standardized in turn.  Returns nullptr
-    // if the rule does not apply.
+    // opposite sense.  A lookbehind A is handled in the same way when P is
+    // empty, with A' = A.  If instead an alternation containing assertions is
+    // found first, the body is expanded over its alternatives,
+    //   P (E1|E2) S  ==>  P E1 S | P E2 S,
+    // so that the lookahead is split by alternative.  The result is
+    // standardized in turn.  Returns nullptr if no rule applies.
     //
     RE * distributeNestedLookahead(RE * body, Assertion::Sense sense) {
         std::vector<RE *> elems;
@@ -88,8 +92,21 @@ private:
             elems.push_back(body);
         }
         for (unsigned i = 0; i < elems.size(); i++) {
+            if (Alt * alt = dyn_cast<Alt>(elems[i])) {
+                if (!hasTopLevelAssertion(alt)) continue;
+                std::vector<RE *> alts;
+                for (RE * e : *alt) {
+                    std::vector<RE *> PES(elems.begin(), elems.begin() + i);
+                    PES.push_back(e);
+                    PES.insert(PES.end(), elems.begin() + i + 1, elems.end());
+                    alts.push_back(makeSeq(PES.begin(), PES.end()));
+                }
+                return transform(makeAssertion(makeAlt(alts.begin(), alts.end()), Assertion::Kind::LookAhead, sense));
+            }
             Assertion * inner = dyn_cast<Assertion>(elems[i]);
-            if ((inner == nullptr) || (inner->getKind() != Assertion::Kind::LookAhead)) continue;
+            if (inner == nullptr) continue;
+            const auto innerKind = inner->getKind();
+            if ((innerKind == Assertion::Kind::LookBehind) && (i > 0)) continue;
             std::vector<RE *> P(elems.begin(), elems.begin() + i);
             auto pRange = getLengthRange(makeSeq(P.begin(), P.end()), mLengthAlphabet);
             if (pRange.first != pRange.second) return nullptr;
@@ -102,17 +119,30 @@ private:
             const auto innerSense = inner->getSense();
             RE * result;
             if (sense == Assertion::Sense::Positive) {
-                result = makeSeq({makeAssertion(PX_seq, Assertion::Kind::LookAhead, innerSense),
+                result = makeSeq({makeAssertion(PX_seq, innerKind, innerSense),
                                   makeAssertion(PS_seq, Assertion::Kind::LookAhead, Assertion::Sense::Positive)});
             } else {
                 const auto flipped = (innerSense == Assertion::Sense::Positive) ? Assertion::Sense::Negative
                                                                                  : Assertion::Sense::Positive;
-                result = makeAlt({makeAssertion(PX_seq, Assertion::Kind::LookAhead, flipped),
+                result = makeAlt({makeAssertion(PX_seq, innerKind, flipped),
                                   makeAssertion(PS_seq, Assertion::Kind::LookAhead, Assertion::Sense::Negative)});
             }
             return transform(result);
         }
         return nullptr;
+    }
+
+    // Is some alternative an assertion, or a sequence with an assertion element?
+    static bool hasTopLevelAssertion(Alt * alt) {
+        for (RE * e : *alt) {
+            if (isa<Assertion>(e)) return true;
+            if (Seq * s = dyn_cast<Seq>(e)) {
+                for (RE * f : *s) {
+                    if (isa<Assertion>(f)) return true;
+                }
+            }
+        }
+        return false;
     }
 
     const cc::Alphabet * mLengthAlphabet;

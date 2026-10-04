@@ -441,6 +441,12 @@ RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     // Unicode length calculations.
     bool useFixedUTF8 = !opts.unicodeIndexingOverride && validateFixedUTF8(re) && !hasPropertyReference(re);
     useFixedUTF8 = useFixedUTF8 && !opts.forceUnicodeIndexing;
+    // Byte mode tries every code unit position.  A match that consumes no
+    // characters, but is conditioned by lookarounds, could then succeed
+    // within a multibyte character.
+    if (useFixedUTF8 && (getLengthRange(re, &cc::UTF8).first == 0) && hasAssertion(re)) {
+        useFixedUTF8 = false;
+    }
     if (useFixedUTF8) {
         mode.lengthAlphabet = &cc::UTF8;
         mode.indexAlphabet = &cc::UTF8;

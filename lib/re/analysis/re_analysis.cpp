@@ -361,6 +361,18 @@ bool hasReference(const RE * r) {
     return !ReferenceFree().validateRE(r);
 }
 
+struct AssertionFree : public RE_Validator {
+    AssertionFree() : RE_Validator("AssertionFree") {}
+
+    bool validateAssertion(const Assertion * a) override {
+        return false;
+    }
+};
+
+bool hasAssertion(const RE * r) {
+    return !AssertionFree().validateRE(r);
+}
+
 struct PropertyReferenceFree : public RE_Validator {
     PropertyReferenceFree() : RE_Validator("PropertyReferenceFree") {}
 

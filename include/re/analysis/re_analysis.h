@@ -28,6 +28,9 @@ bool validateFixedUTF8(const RE * r);
 
 bool hasReference(const RE * r);
 
+// Does the RE contain a lookahead or lookbehind assertion?
+bool hasAssertion(const RE * r);
+
 bool hasPropertyReference(const RE * r);
 
     

@@ -43,6 +43,7 @@ public:
         if (aKind == Assertion::Kind::LookAhead) {
             // Try to transform into alternations of fixed length assertions.
             asserted = removeNullableSuffix(asserted);
+            asserted = separateFinalStar(asserted);
             // A chain such as B*C D*E is compiled directly (see
             // parseLookaheadChain); zero bound elimination would split it
             // into forms that are not.
@@ -78,6 +79,54 @@ public:
         return makeAssertion(asserted, aKind, aSense);
     }
 private:
+    //
+    // A lookahead body ending X{lb,} F, where F is a character class that
+    // overlaps the character class X, is equivalent to one ending
+    // X{lb} (X-F)* F: after the first lb characters, the first character
+    // of F or not in X decides the match.  The run of X-F is then maximal,
+    // as a lookahead chain requires, e.g. (?=.*c) becomes (?=[^c]*c).
+    // (This needs F to be the last item: (?=a*ab) is not (?=ab).)
+    //
+    static RE * separateFinalStar(RE * body) {
+        std::vector<RE *> elems;
+        flatten(body, elems);
+        const auto n = elems.size();
+        if (n < 2) return body;
+        Rep * const rep = dyn_cast<Rep>(elems[n - 2]);
+        if ((rep == nullptr) || (rep->getUB() != Rep::UNBOUNDED_REP)) return body;
+        CC * const X = resolveCharClass(rep->getRE());
+        CC * const F = resolveCharClass(elems[n - 1]);
+        if ((X == nullptr) || (F == nullptr) || (X->getAlphabet() != F->getAlphabet())) return body;
+        if (intersectCC(X, F)->empty()) return body;
+        std::vector<RE *> result(elems.begin(), elems.end() - 2);
+        if (rep->getLB() > 0) {
+            result.push_back(makeRep(rep->getRE(), rep->getLB(), rep->getLB()));
+        }
+        CC * const remaining = subtractCC(X, F);
+        if (!remaining->empty()) {
+            result.push_back(makeRep(remaining, 0, Rep::UNBOUNDED_REP));
+        }
+        result.push_back(elems[n - 1]);
+        return makeSeq(result.begin(), result.end());
+    }
+
+    // The elements of r as a sequence, seeing through nested sequences and
+    // single alternatives.
+    static void flatten(RE * r, std::vector<RE *> & elems) {
+        if (Alt * alt = dyn_cast<Alt>(r)) {
+            if (alt->size() == 1) {
+                flatten(alt->front(), elems);
+                return;
+            }
+        } else if (Seq * seq = dyn_cast<Seq>(r)) {
+            for (RE * e : *seq) {
+                flatten(e, elems);
+            }
+            return;
+        }
+        elems.push_back(r);
+    }
+
     //
     // A lookahead whose body contains a lookahead is not directly compilable.
     // If the body is P A S, where A is the first lookahead (on X) and P has a

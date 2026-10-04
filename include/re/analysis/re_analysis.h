@@ -21,6 +21,10 @@ std::pair<RE *, RE *> ParseUniquePrefix(RE * r);
 
 unsigned maxLookaheadLength(const RE * re, const cc::Alphabet * lengthAlphabet);
 
+// The character class matched by r, which is a CC or a combination of
+// character classes (Any, Alt, Diff, Intersect), or nullptr.
+CC * resolveCharClass(RE * r);
+
 // A segment of a lookahead chain: either X{lb,} for a character class X
 // (star), or a fixed-length RE of at least one character.
 struct LookaheadSegment {

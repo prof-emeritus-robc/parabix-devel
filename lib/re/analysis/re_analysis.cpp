@@ -631,9 +631,7 @@ unsigned grepOffset(const RE * re) {
     UnexpectedRE("grepOffset", re);
 }
 
-//  The character class matched by r, which is a CC or a combination of
-//  character classes (Any, Alt, Diff, Intersect), or nullptr.
-static CC * resolveCharClass(RE * r) {
+CC * resolveCharClass(RE * r) {
     if (CC * cc = resolveToCC(r)) return cc;
     if (const Any * a = dyn_cast<Any>(r)) {
         return makeCC(0, UCD::UNICODE_MAX, a->getAlphabet());

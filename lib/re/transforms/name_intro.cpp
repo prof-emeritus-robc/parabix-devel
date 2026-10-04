@@ -270,6 +270,36 @@ RE * Repeated_CC_Seq_Namer::transform(RE * r) {
     return r;
 }
 
+StringClassRepNamer::StringClassRepNamer(const cc::Alphabet * codeUnitAlphabet) :
+    NameIntroduction("StringClassRepNamer"), mAlphabet(codeUnitAlphabet) {}
+
+RE * StringClassRepNamer::transformAssertion(Assertion * a) {
+    return a;
+}
+
+RE * StringClassRepNamer::transformRep(Rep * rep) {
+    RE * const repeated = rep->getRE();
+    const int lb = rep->getLB();
+    if ((rep->getUB() != Rep::UNBOUNDED_REP) || (resolveCharClass(repeated) != nullptr)) {
+        return RE_Transformer::transformRep(rep);
+    }
+    std::vector<std::vector<CC *>> strings;
+    if (!parseStringClass(repeated, strings) || !isRepeatableStringClass(strings)) {
+        return RE_Transformer::transformRep(rep);
+    }
+    for (const auto & str : strings) {
+        for (CC * cc : str) {
+            if (cc->getAlphabet() != mAlphabet) return RE_Transformer::transformRep(rep);
+        }
+    }
+    const std::string name = "StrRep_" + kernel::Kernel::getStringHash(Printer_RE::PrintRE(repeated));
+    Name * n = createName(name, repeated);
+    mStrings.emplace(n->getFullName(), std::move(strings));
+    RE * const star = makeRep(n, 0, Rep::UNBOUNDED_REP);
+    if (lb == 0) return star;
+    return makeSeq({makeRep(repeated, lb, lb), star});
+}
+
 class Canonical_External_Names : public RE_Transformer {
 public:
     Canonical_External_Names(const std::vector<std::string> & external_names);

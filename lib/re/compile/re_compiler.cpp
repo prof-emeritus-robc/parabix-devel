@@ -765,6 +765,27 @@ Marker RE_Block_Compiler::expandUpperBound(RE * const repeated, const int ub, Ma
 Marker RE_Block_Compiler::processUnboundedRep(RE * const repeated, Marker marker) {
     // always use PostPosition markers for unbounded repetition.
     PabloAST * base = NextCharacter(marker, mPB);
+    if (Name * n = dyn_cast<Name>(repeated)) {
+        auto f = mMain.mStringClassMap.find(n->getFullName());
+        if (f != mMain.mStringClassMap.end()) {
+            // A run of occurrences of the string class from base, ending just
+            // after the end of an occurrence (or base itself, for no occurrences).
+            // With an indexing alphabet, base lies on the final code unit of the
+            // next character: the run is seeded there (within the fill of an
+            // occurrence starting at that character), and its results realigned.
+            const auto & sc = f->second;
+            PabloAST * starts = sc.starts;
+            if (mMain.mIndexingAlphabet) {
+                starts = ScanToIndex(starts, mMain.mIndexStream, mPB);
+            }
+            PabloAST * run = mPB.createMatchStar(mPB.createAnd(base, starts), sc.fill);
+            PabloAST * after = mPB.createAnd(run, mPB.createAdvance(sc.ends, 1));
+            if (mMain.mIndexingAlphabet) {
+                after = ScanToIndex(after, mMain.mIndexStream, mPB);
+            }
+            return Marker(mPB.createOr(base, after, "strclass_star"), Position::AtNextChar);
+        }
+    }
     if (LLVM_LIKELY(!AlgorithmOptionIsSet(DisableMatchStar))) {
         auto lengths = getLengthRange(repeated, mMain.mCodeUnitAlphabet);
         //llvm::errs() << "getLengthRange(repeated, mMain.mCodeUnitAlphabet) = " << lengths.first << ", " << lengths.second << "\n";
@@ -904,6 +925,10 @@ void RE_Compiler::setIndexing(const cc::Alphabet * indexingAlphabet, PabloAST * 
     mIndexStream = indexStream;
 }
     
+void RE_Compiler::addStringClassRep(std::string name, PabloAST * fill, PabloAST * starts, PabloAST * ends) {
+    mStringClassMap.emplace(name, StringClassStreams{fill, starts, ends});
+}
+
 void RE_Compiler::addPrecompiled(std::string precompiledName, ExternalStream precompiled) {
     mExternalNameMap.emplace(precompiledName, precompiled);
 }

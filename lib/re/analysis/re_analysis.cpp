@@ -700,6 +700,64 @@ static void flattenSeq(RE * r, std::vector<RE *> & elems) {
     elems.push_back(r);
 }
 
+bool parseStringClass(RE * r, std::vector<std::vector<CC *>> & strings) {
+    std::vector<RE *> alternatives;
+    std::vector<RE *> pending{r};
+    while (!pending.empty()) {
+        RE * a = pending.back();
+        pending.pop_back();
+        if (const Name * n = dyn_cast<Name>(a)) {
+            if (n->getDefinition() == nullptr) return false;
+            pending.push_back(n->getDefinition());
+        } else if (const Alt * alt = dyn_cast<Alt>(a)) {
+            for (RE * e : *alt) pending.push_back(e);
+        } else {
+            alternatives.push_back(a);
+        }
+    }
+    bool multi = false;
+    for (RE * a : alternatives) {
+        std::vector<RE *> items;
+        flattenSeq(a, items);
+        std::vector<CC *> str;
+        for (RE * item : items) {
+            CC * const cc = resolveCharClass(item);
+            if ((cc == nullptr) || cc->empty()) return false;
+            str.push_back(cc);
+        }
+        if (str.empty()) return false;
+        multi |= (str.size() > 1);
+        strings.push_back(std::move(str));
+    }
+    return multi;
+}
+
+// Can the strings s (at offset i) and t (at offset 0) match the same text
+// over the k positions starting at offset i of s and 0 of t?
+static bool overlaps(const std::vector<CC *> & s, size_t i, const std::vector<CC *> & t, size_t k) {
+    for (size_t j = 0; j < k; ++j) {
+        if (!s[i + j]->intersects(*t[j])) return false;
+    }
+    return true;
+}
+
+bool isRepeatableStringClass(const std::vector<std::vector<CC *>> & strings) {
+    for (const auto & s : strings) {
+        for (const auto & t : strings) {
+            // (A) No proper suffix of s matches a proper prefix of t.
+            const size_t m = std::min(s.size(), t.size());
+            for (size_t k = 1; k < m; ++k) {
+                if (overlaps(s, s.size() - k, t, k)) return false;
+            }
+            // (B) No occurrence of t lies strictly within s.
+            for (size_t i = 1; i + t.size() < s.size(); ++i) {
+                if (overlaps(s, i, t, t.size())) return false;
+            }
+        }
+    }
+    return true;
+}
+
 bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments) {
     segments.clear();
     std::vector<RE *> elems;

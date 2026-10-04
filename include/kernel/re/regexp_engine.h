@@ -16,7 +16,10 @@ namespace kernel { class PipelineBuilder; }
 
 using Alphabets = std::vector<std::pair<const cc::Alphabet *, kernel::StreamSet *>>;
 
-enum ExternalStreamKind {ZeroWidth, FixedLength, StartIndexed, EndIndexed};
+// A StringClassRep external is the repeated string class of an unbounded
+// repetition (see re::StringClassRepNamer); its stream set holds the Fill,
+// Starts and Ends streams of the string class (see StringClassKernel).
+enum ExternalStreamKind {ZeroWidth, FixedLength, StartIndexed, EndIndexed, StringClassRep};
 
 struct ExternalStream {
     ExternalStreamKind kind;
@@ -215,6 +218,30 @@ protected:
 private:
     const unsigned mLength;
     const bool mHasH;
+};
+
+//
+// A string class: an alternation of strings, each a sequence of character
+// classes over the alphabet of the basis (e.g. 21-bit Unicode, or 8-bit UTF-8
+// code units after toUTF8).  With L the length of the longest string, the
+// basis is read with a lookahead of L - 1: each character of a string is
+// tested on the basis looked ahead by its offset, giving the start positions
+// of the occurrences of the string.  Fill marks every position within an
+// occurrence (each start, shifted forward up to the length of its string
+// less one); Starts marks the start positions and Ends the final positions.
+// The output stream set holds Fill, Starts and Ends, in that order.
+//
+class StringClassKernel : public pablo::PabloKernel {
+public:
+    StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
+                      kernel::StreamSet * basis, kernel::StreamSet * fillStartsEnds);
+    bool hasSignature() const override { return true; }
+    llvm::StringRef getSignature() const override { return mSignature; }
+protected:
+    void generatePabloMethod() override;
+private:
+    const std::vector<std::vector<re::CC *>> mStrings;
+    const std::string mSignature;
 };
 
 class StarLookaheadSpans : public pablo::PabloKernel {

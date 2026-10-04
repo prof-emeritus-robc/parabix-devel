@@ -25,6 +25,18 @@ unsigned maxLookaheadLength(const RE * re, const cc::Alphabet * lengthAlphabet);
 // character classes (Any, Alt, Diff, Intersect), or nullptr.
 CC * resolveCharClass(RE * r);
 
+// Parse r as an alternation of strings, each a sequence of items resolving to
+// character classes, with at least one string of two or more characters.
+bool parseStringClass(RE * r, std::vector<std::vector<CC *>> & strings);
+
+// Can (s1|s2|...)* be matched as a run of the string class: from each
+// starting position of a string, by MatchStar over the positions within
+// occurrences of the strings (the fill), stopping just after the end of an
+// occurrence?  This requires that (A) no proper suffix of any string matches
+// a proper prefix of any string (itself included), and (B) no string matches
+// strictly within another (other than as a prefix or suffix).
+bool isRepeatableStringClass(const std::vector<std::vector<CC *>> & strings);
+
 // A segment of a lookahead chain: X{lb,} for a character class X (star),
 // a fixed-length RE of at least one character, or the end of the text (End,
 // directly after a star).

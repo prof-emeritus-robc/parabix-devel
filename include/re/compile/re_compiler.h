@@ -124,6 +124,22 @@ class RE_Compiler {
 
     void addPrecompiled(std::string externalName, ExternalStream s);
 
+    //
+    // The streams of a string class (an alternation of strings) named as the
+    // repeated RE of a star repetition N* (see re::StringClassRepNamer):
+    // Fill marks the positions within occurrences of the strings, Starts the
+    // first positions of occurrences and Ends their last positions.  N* is
+    // then matched from marker positions M (at the next character) as
+    // M | (MatchStar(M & Starts, Fill) & Advance(Ends, 1)).
+    //
+    struct StringClassStreams {
+        pablo::PabloAST * fill;
+        pablo::PabloAST * starts;
+        pablo::PabloAST * ends;
+    };
+
+    void addStringClassRep(std::string name, pablo::PabloAST * fill, pablo::PabloAST * starts, pablo::PabloAST * ends);
+
     RE_Compiler(pablo::PabloBlock * scope,
                 pablo::PabloAST * regionStartStream,
                 pablo::PabloAST * regionFollowStream,
@@ -170,6 +186,7 @@ private:
     pablo::PabloAST *                               mWhileTest;
     int                                             mStarDepth;
     ExternalNameMap                                 mExternalNameMap;
+    std::map<std::string, StringClassStreams>       mStringClassMap;
 };
 
 }

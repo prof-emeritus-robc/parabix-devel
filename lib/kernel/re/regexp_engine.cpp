@@ -127,6 +127,8 @@ std::string RE_Kernel::makeSignature(RE_CompilerContext & ctxt, RE * re) {
                 sigstrm << "+F";
                 sigstrm << ext.lgthRange.second;
                 if (ext.offset == 1) sigstrm << "o";
+            } else if (ext.kind == ExternalStreamKind::StringClassRep) {
+                sigstrm << "+C";
             } else if (ext.kind == ExternalStreamKind::StartIndexed) {
                 sigstrm << "+S";
                 sigstrm << ext.offset;
@@ -234,6 +236,11 @@ void RE_Kernel::generatePabloMethod() {
         auto name = e.first;
         if (localExternals.count(name) == 1) {
             auto ext = e.second;
+            if (ext.kind == ExternalStreamKind::StringClassRep) {
+                std::vector<PabloAST *> fse = getInputStreamSet(name);
+                re_compiler.addStringClassRep(name, fse[0], fse[1], fse[2]);
+                continue;
+            }
             PabloAST * extStrm = pb.createExtract(getInputStreamVar(name), pb.getInteger(0));
             unsigned offset = ext.offset;
             bool fromFirst = false;
@@ -451,6 +458,74 @@ void StarLookaheadIndex::generatePabloMethod() {
     PabloAST * runStarts = pb.createAnd(Bp, pb.createNot(pb.createAdvance(Bp, 1)));
     PabloAST * index = pb.createOr(pb.createNot(Bp), runStarts);
     writeOutputStreamSet("index", std::vector<PabloAST *>{index});
+}
+
+static unsigned maxStringLength(const std::vector<std::vector<re::CC *>> & strings) {
+    size_t L = 1;
+    for (const auto & str : strings) L = std::max(L, str.size());
+    return static_cast<unsigned>(L);
+}
+
+static std::string stringClassSignature(const std::vector<std::vector<re::CC *>> & strings, StreamSet * basis) {
+    std::string sig;
+    raw_string_ostream out(sig);
+    out << basis->getNumElements();
+    for (const auto & str : strings) {
+        out << "|";
+        for (re::CC * cc : str) out << cc->canonicalName() << ";";
+    }
+    out.flush();
+    return sig;
+}
+
+StringClassKernel::StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
+                                     StreamSet * basis, StreamSet * fillStartsEnds)
+: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis)),
+              {Binding{"basis", basis, FixedRate(1), LookAhead(maxStringLength(strings) - 1)}},
+              {Binding{"fillStartsEnds", fillStartsEnds}}),
+  mStrings(std::move(strings)),
+  mSignature(stringClassSignature(mStrings, basis)) {
+}
+
+void StringClassKernel::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const std::vector<PabloAST *> basis = getInputStreamSet("basis");
+    const unsigned L = maxStringLength(mStrings);
+    // The basis looked ahead by each offset, and a character class compiler for each.
+    std::vector<std::unique_ptr<cc::Parabix_CC_Compiler>> compilers;
+    for (unsigned v = 0; v < L; ++v) {
+        std::vector<PabloAST *> ahead;
+        for (PabloAST * b : basis) ahead.push_back(v == 0 ? b : pb.createLookahead(b, v));
+        compilers.emplace_back(std::make_unique<cc::Parabix_CC_Compiler>(ahead));
+    }
+    // The start positions of the strings, by length.
+    std::map<unsigned, PabloAST *> startsByLength;
+    PabloAST * allStarts = pb.createZeroes();
+    for (const auto & str : mStrings) {
+        PabloAST * start = pb.createInFile(pb.createOnes());
+        for (unsigned k = 0; k < str.size(); ++k) {
+            start = pb.createAnd(start, compilers[k]->compileCC(str[k], pb));
+        }
+        const unsigned M = static_cast<unsigned>(str.size());
+        auto f = startsByLength.find(M);
+        startsByLength[M] = (f == startsByLength.end()) ? start : pb.createOr(f->second, start);
+        allStarts = pb.createOr(allStarts, start);
+    }
+    // Fill the M positions of each occurrence of a string of length M; the
+    // last of them is the end of the occurrence.
+    PabloAST * fill = pb.createZeroes();
+    PabloAST * ends = pb.createZeroes();
+    for (const auto & m : startsByLength) {
+        PabloAST * shifted = m.second;
+        PabloAST * filled = shifted;
+        for (unsigned i = 1; i < m.first; ++i) {
+            shifted = pb.createAdvance(shifted, 1);
+            filled = pb.createOr(filled, shifted);
+        }
+        fill = pb.createOr(fill, filled);
+        ends = pb.createOr(ends, shifted);
+    }
+    writeOutputStreamSet("fillStartsEnds", std::vector<PabloAST *>{fill, allStarts, ends});
 }
 
 StarChainFixedStep::StarChainFixedStep(LLVMTypeSystemInterface & ts, unsigned length, StreamSet * Fends,
@@ -988,13 +1063,18 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
         }
     }
 
-    re::VariableLengthCCNamer CCnamer;
-    xfrmedRE = CCnamer.transformRE(xfrmedRE);
-    for (auto m : CCnamer.mNameMap) {
-        std::vector<re::CC *> ccs = {cast<re::CC>(m.second)};
-        StreamSet * ccStrm = mPB.CreateStreamSet(1);
-        mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, mCtxt.mCodeUnitStream, ccStrm);
-        addExternal(m.first, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ccStrm});
+    // CCs of characters of more than one UTF-8 length are computed as externals
+    // when the code units are UTF-8.  (With Unicode code units, every CC is one
+    // code unit.)
+    if (mCtxt.mCodeUnitAlphabet == &cc::UTF8) {
+        re::VariableLengthCCNamer CCnamer;
+        xfrmedRE = CCnamer.transformRE(xfrmedRE);
+        for (auto m : CCnamer.mNameMap) {
+            std::vector<re::CC *> ccs = {cast<re::CC>(m.second)};
+            StreamSet * ccStrm = mPB.CreateStreamSet(1);
+            mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, mCtxt.mCodeUnitStream, ccStrm);
+            addExternal(m.first, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ccStrm});
+        }
     }
 
     if (mMatchSpans) {
@@ -1004,6 +1084,23 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
 
     if (mCtxt.mCodeUnitAlphabet == &cc::UTF8) {
         xfrmedRE = toUTF8(xfrmedRE);
+    }
+
+    // Unbounded repetitions of suitable string classes are matched using
+    // the Fill, Starts and Ends of the string class.
+    {
+        re::StringClassRepNamer SCnamer(mCtxt.mCodeUnitAlphabet);
+        xfrmedRE = SCnamer.transformRE(xfrmedRE);
+        StreamSet * basis = mCtxt.mCodeUnitStream;
+        for (auto & m : SCnamer.mStrings) {
+            if (basis->getNumElements() == 1) {
+                basis = mPB.CreateStreamSet(8, 1);
+                Selected_S2P(mPB, mCtxt.mCodeUnitStream, basis);
+            }
+            StreamSet * fillStartsEnds = mPB.CreateStreamSet(3);
+            mPB.CreateKernelCall<StringClassKernel>(m.second, basis, fillStartsEnds);
+            addExternal(m.first, ExternalStream{ExternalStreamKind::StringClassRep, 0, {0, 0}, fillStartsEnds});
+        }
     }
 
     // Lookahead lengths are measured in the mode's length alphabet.

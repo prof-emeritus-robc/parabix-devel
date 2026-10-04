@@ -309,7 +309,7 @@ private:
 class RE_PipelineBuilder {
 public:
     RE_PipelineBuilder(kernel::PipelineBuilder & P, RE_CompilerContext & ctxt) :
-        mPB(P), mCtxt(ctxt), mMatchSpans(false),
+        mPB(P), mCtxt(ctxt),
         mHaveSourceContext(false), mPrepared(false), mHaveMode(false),
         mLineBreakHint(nullptr), mU8IndexHint(nullptr),
         mUsesUnicodeIndexing(false), mU8Index(nullptr),
@@ -352,13 +352,30 @@ protected:
 
     void getSpan(re::RE * re, kernel::StreamSet * spans);
 
+    // The starts of the matches of a prepared RE (with its externals
+    // compiled): stream marks, for each start position s of a match, the
+    // position s + offset - 1 (as for a StartIndexed external).  A fixed
+    // length RE gives its match ends, with the length as offset; an RE
+    // Seq[P, S] for a named unique prefix P gives the ends of the matches of
+    // P that begin matches of the RE, with the length of P as offset.
+    struct MatchStarts {
+        kernel::StreamSet * stream;
+        unsigned offset;
+    };
+    MatchStarts matchStartPipeline(re::RE * re);
+
+    // For the matches of an RE Seq[P, S] with a named unique prefix P (see
+    // matchStartPipeline), marked at their ends: the ends shifted back to the
+    // preceding position of P or of an end.  Marked at a match of P, it
+    // identifies those that begin matches of the RE.
+    kernel::StreamSet * uniquePrefixEndsBack(kernel::StreamSet * prefix, kernel::StreamSet * ends);
+
     // Mode determination + source preparation, run once before compiling.
     void ensurePrepared(re::RE *& re);
 
 private:
     kernel::PipelineBuilder & mPB;
     RE_CompilerContext mCtxt;
-    bool mMatchSpans;
     re::RE * mRE;
     re::UniquePrefixNamer mUPnamer;
 

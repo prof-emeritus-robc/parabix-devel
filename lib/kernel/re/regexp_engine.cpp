@@ -33,7 +33,6 @@
 #include <re/transforms/name_lookaheads.h>
 #include <re/transforms/reference_transform.h>
 #include <re/transforms/remove_nullable.h>
-#include <re/transforms/variable_alt_promotion.h>
 #include <re/unicode/boundaries.h>
 #include <re/unicode/resolve_properties.h>
 #include <re/cc/cc_compiler.h>         // for CC_Compiler
@@ -759,7 +758,7 @@ RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
 }
 
 RE_PipelineBuilder::RE_PipelineBuilder(PipelineBuilder & P, RE_context context)
-: mPB(P), mCtxt(), mMatchSpans(false),
+: mPB(P), mCtxt(),
   mHaveSourceContext(true), mSourceContext(context), mPrepared(false), mHaveMode(false),
   mLineBreakHint(nullptr), mU8IndexHint(nullptr),
   mUsesUnicodeIndexing(false), mU8Index(nullptr),
@@ -1054,42 +1053,54 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
             addExternal(name, ExternalStream{ExternalStreamKind::EndIndexed, offset, r, extStrm});
         }
     } else {
-        Assertion * a = llvm::cast<Assertion>(defn);
-        RE * asserted = a->getAsserted();
-        StreamSet * assertedStrm = mPB.CreateStreamSet(1);
-        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, asserted, assertedStrm);
         // The external stream marks where the positive lookahead holds, for
         // either sense; negative lookaheads are negated where the stream is
         // read, so that they also hold for positions whose lookahead extends
         // past the end of the data.  The sense is part of the RE_Kernel signature.
+        Assertion * a = llvm::cast<Assertion>(defn);
+        RE * asserted = a->getAsserted();
         const bool negated = (a->getSense() == Assertion::Sense::Negative);
         auto r = getLengthRange(asserted, mCtxt.mLengthAlphabet);
-        if (r.first == r.second) {
-            // Fixed length lookaheads can be stored directly.
-            unsigned lgth = static_cast<unsigned>(r.second);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, lgth, r, assertedStrm, negated});
-        } else {
-            // Apply the logic of matching a lookahead with a unique prefix.  
-            // Match positions for the lookahead (assertedStrm) are shifted back to the 
-            // prior prefix position.   This is implemented by making a mask stream
-            // consisting of full matches to the lookahead (assertedStrm) and matches
-            // to the unique prefix.  An indexed shift back of asserted matches
-            // moves the match to the position of its unique fixed length prefix.
-            if (!isa<Seq>(asserted) || !isa<Name>(cast<Seq>(asserted)->front())) {
-                llvm::report_fatal_error("Expecting named unique prefix lookahead");
-            }
-            Name * prefName = cast<Name>(cast<Seq>(asserted)->front());
-            auto f = mCtxt.mExternals.find(prefName->getFullName());
-            StreamSet * prefStrm = f->second.extStream;
-            StreamSet * maskStrm = mPB.CreateStreamSet(1);
-            OrCombine(mPB, prefStrm, assertedStrm, maskStrm);
-            StreamSet * assertedBack = mPB.CreateStreamSet(1);
-            mPB.CreateKernelCall<IndexedShiftBack>(maskStrm, assertedStrm, assertedBack);
-            StreamSet * extStrm = mPB.CreateStreamSet(1);
-            AndCombine(mPB, prefStrm, assertedBack, extStrm);
-            addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, amt, r, extStrm, negated});
-        }
+        const MatchStarts starts = matchStartPipeline(asserted);
+        addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, starts.offset, r, starts.stream, negated});
     }
+}
+
+RE_PipelineBuilder::MatchStarts RE_PipelineBuilder::matchStartPipeline(RE * re) {
+    StreamSet * const ends = mPB.CreateStreamSet(1);
+    mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, ends);
+    const auto r = getLengthRange(re, mCtxt.mLengthAlphabet);
+    if (r.first == r.second) {
+        // Fixed length: the ends are the starts, offset by the length.
+        return MatchStarts{ends, static_cast<unsigned>(r.second)};
+    }
+    // A unique prefix: the ends are shifted back to the matches of the prefix
+    // that begin them.
+    if (!isa<Seq>(re) || !isa<Name>(cast<Seq>(re)->front())) {
+        llvm::report_fatal_error("Expecting named unique prefix lookahead");
+    }
+    Name * const prefName = cast<Name>(cast<Seq>(re)->front());
+    auto f = mCtxt.mExternals.find(prefName->getFullName());
+    assert(f != mCtxt.mExternals.end());
+    StreamSet * const prefStrm = f->second.extStream;
+    StreamSet * const endsBack = uniquePrefixEndsBack(prefStrm, ends);
+    StreamSet * const starts = mPB.CreateStreamSet(1);
+    AndCombine(mPB, prefStrm, endsBack, starts);
+    const auto pfxRange = getLengthRange(prefName, mCtxt.mLengthAlphabet);
+    if (pfxRange.first != pfxRange.second) {
+        llvm::report_fatal_error("Expecting a fixed length unique prefix");
+    }
+    return MatchStarts{starts, static_cast<unsigned>(pfxRange.first)};
+}
+
+StreamSet * RE_PipelineBuilder::uniquePrefixEndsBack(StreamSet * prefix, StreamSet * ends) {
+    // An indexed shift back over the positions of the prefix and the ends moves
+    // each end to the position of the preceding prefix (or end).
+    StreamSet * const mask = mPB.CreateStreamSet(1);
+    OrCombine(mPB, prefix, ends, mask);
+    StreamSet * const endsBack = mPB.CreateStreamSet(1);
+    mPB.CreateKernelCall<IndexedShiftBack>(mask, ends, endsBack);
+    return endsBack;
 }
 
 void RE_PipelineBuilder::matchSearchPipeline(RE * re, StreamSet * results) {
@@ -1143,10 +1154,7 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
             auto pfxStrm = fp->second.extStream;
             auto pfxLgth = fp->second.lgthRange.first;
             auto pfxOffset = fp->second.offset;
-            StreamSet * maskStrm = mPB.CreateStreamSet(1);
-            OrCombine(mPB, pfxStrm, matchEnd, maskStrm);
-            StreamSet * endBack = mPB.CreateStreamSet(1);
-            mPB.CreateKernelCall<IndexedShiftBack>(maskStrm, matchEnd, endBack);
+            StreamSet * endBack = uniquePrefixEndsBack(pfxStrm, matchEnd);
             if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
                 mPB.captureBitstream("pfxStrm", pfxStrm);
                 mPB.captureBitstream("endBack", endBack);
@@ -1207,11 +1215,6 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
             mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, mCtxt.mCodeUnitStream, ccStrm);
             addExternal(m.first, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ccStrm});
         }
-    }
-
-    if (mMatchSpans) {
-        xfrmedRE = zeroBoundElimination(xfrmedRE);
-        xfrmedRE = variableAltPromotion(xfrmedRE, lengthAlphabet);
     }
 
     if (mCtxt.mCodeUnitAlphabet == &cc::UTF8) {

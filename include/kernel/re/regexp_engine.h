@@ -244,6 +244,40 @@ private:
     const std::string mSignature;
 };
 
+//
+// A star segment (s1|s2|...){lb,} (lb <= 1) of a lookahead chain, for a
+// string class satisfying re::isRepeatableStringClass.  From a start of an
+// occurrence p, the repetitions reach exactly the positions just after the
+// end of an occurrence that lie after p within its run of Fill (or just
+// after that run).  The rest of the chain must hold at one of them: these are
+// the good positions G = H & Advance(Ends, 1).  StringClassStarIndex marks
+// G together with the positions not in Fill (or at region follows) and the
+// first position of each run of Fill, as the index I.  Shifting G back along I (IndexedShiftBack) marks each index
+// position whose next index position is good; StringClassStarSpans spreads
+// that mark forward over the positions before the next index position, and
+// keeps the starts of occurrences (and, with lb = 0, the positions of H).
+//
+class StringClassStarIndex : public pablo::PabloKernel {
+public:
+    StringClassStarIndex(LLVMTypeSystemInterface & ts, kernel::StreamSet * fillStartsEnds, kernel::StreamSet * H,
+                         kernel::StreamSet * breaks, kernel::StreamSet * index, kernel::StreamSet * good);
+protected:
+    void generatePabloMethod() override;
+private:
+    const bool mHasBreaks;
+};
+
+class StringClassStarSpans : public pablo::PabloKernel {
+public:
+    StringClassStarSpans(LLVMTypeSystemInterface & ts, unsigned lb, kernel::StreamSet * fillStartsEnds,
+                         kernel::StreamSet * H, kernel::StreamSet * index, kernel::StreamSet * goodNext,
+                         kernel::StreamSet * result);
+protected:
+    void generatePabloMethod() override;
+private:
+    const unsigned mLB;
+};
+
 class StarLookaheadSpans : public pablo::PabloKernel {
 public:
     StarLookaheadSpans(LLVMTypeSystemInterface & ts, unsigned lb, kernel::StreamSet * B, kernel::StreamSet * breaks,

@@ -528,6 +528,65 @@ void StringClassKernel::generatePabloMethod() {
     writeOutputStreamSet("fillStartsEnds", std::vector<PabloAST *>{fill, allStarts, ends});
 }
 
+StringClassStarIndex::StringClassStarIndex(LLVMTypeSystemInterface & ts, StreamSet * fillStartsEnds, StreamSet * H,
+                                           StreamSet * breaks, StreamSet * index, StreamSet * good)
+: PabloKernel(ts, std::string("StringClassStarIndex") + (breaks ? "_br" : ""),
+              [&] {
+                  Bindings inputs;
+                  inputs.emplace_back("fillStartsEnds", fillStartsEnds);
+                  inputs.emplace_back("H", H);
+                  if (breaks) inputs.emplace_back("breaks", breaks);
+                  return inputs;
+              }(),
+              {Binding{"index", index}, Binding{"good", good}}),
+  mHasBreaks(breaks != nullptr) {
+}
+
+void StringClassStarIndex::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const std::vector<PabloAST *> fse = getInputStreamSet("fillStartsEnds");
+    PabloAST * const H = getInputStreamSet("H")[0];
+    PabloAST * good = pb.createAnd(H, pb.createAdvance(fse[2], 1));
+    PabloAST * fill = fse[0];
+    if (mHasBreaks) {
+        fill = pb.createAnd(fill, pb.createNot(getInputStreamSet("breaks")[0]));
+    }
+    // The first position of each run of fill is an index position (so that a
+    // run at the beginning of the text has one).
+    PabloAST * runStarts = pb.createAnd(fill, pb.createNot(pb.createAdvance(fill, 1)));
+    PabloAST * index = pb.createOr(pb.createOr(good, pb.createNot(fill)), runStarts);
+    writeOutputStreamSet("index", std::vector<PabloAST *>{index});
+    writeOutputStreamSet("good", std::vector<PabloAST *>{good});
+}
+
+StringClassStarSpans::StringClassStarSpans(LLVMTypeSystemInterface & ts, unsigned lb, StreamSet * fillStartsEnds,
+                                           StreamSet * H, StreamSet * index, StreamSet * goodNext, StreamSet * result)
+: PabloKernel(ts, "StringClassStarSpans" + std::to_string(lb),
+              {Binding{"fillStartsEnds", fillStartsEnds}, Binding{"H", H},
+               Binding{"index", index}, Binding{"goodNext", goodNext}},
+              {Binding{"result", result}}),
+  mLB(lb) {
+}
+
+void StringClassStarSpans::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const std::vector<PabloAST *> fse = getInputStreamSet("fillStartsEnds");
+    PabloAST * const H = getInputStreamSet("H")[0];
+    PabloAST * const index = getInputStreamSet("index")[0];
+    PabloAST * const goodNext = getInputStreamSet("goodNext")[0];
+    // Each position whose next index position (strictly after it) is good:
+    // an index position marked by goodNext, and the positions after it up
+    // to the next index position.
+    PabloAST * const notIndex = pb.createNot(index);
+    PabloAST * following = pb.createMatchStar(pb.createAdvance(goodNext, 1), notIndex);
+    PabloAST * spans = pb.createOr(goodNext, pb.createAnd(following, notIndex));
+    PabloAST * result = pb.createAnd(spans, fse[1]);
+    if (mLB == 0) {
+        result = pb.createOr(result, H);
+    }
+    writeOutputStreamSet("result", std::vector<PabloAST *>{result});
+}
+
 StarChainFixedStep::StarChainFixedStep(LLVMTypeSystemInterface & ts, unsigned length, StreamSet * Fends,
                                        StreamSet * H, StreamSet * result)
 : PabloKernel(ts, "StarChainFixed" + std::to_string(length) + (H ? "_h" : ""),
@@ -874,6 +933,28 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
                     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, seg->re, Fends);
                     StreamSet * const result = mPB.CreateStreamSet(1);
                     mPB.CreateKernelCall<StarChainFixedStep>(seg->length, Fends, H, result);
+                    H = result;
+                    continue;
+                }
+                if (!seg->strings.empty()) {
+                    // A string class (see StringClassStarIndex).
+                    StreamSet * const fillStartsEnds = mPB.CreateStreamSet(3);
+                    mPB.CreateKernelCall<StringClassKernel>(seg->strings, mCtxt.mCodeUnitStream, fillStartsEnds);
+                    StreamSet * const index = mPB.CreateStreamSet(1);
+                    StreamSet * const good = mPB.CreateStreamSet(1);
+                    mPB.CreateKernelCall<StringClassStarIndex>(fillStartsEnds, H, mCtxt.mMatchFollows, index, good);
+                    StreamSet * const goodNext = mPB.CreateStreamSet(1);
+                    mPB.CreateKernelCall<IndexedShiftBack>(index, good, goodNext);
+                    StreamSet * const result = mPB.CreateStreamSet(1);
+                    mPB.CreateKernelCall<StringClassStarSpans>(seg->lb, fillStartsEnds, H, index, goodNext, result);
+                    if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                        mPB.captureBixNum("scFSE", fillStartsEnds);
+                        mPB.captureBitstream("scH", H);
+                        mPB.captureBitstream("scIndex", index);
+                        mPB.captureBitstream("scGood", good);
+                        mPB.captureBitstream("scGoodNext", goodNext);
+                        mPB.captureBitstream("scResult", result);
+                    }
                     H = result;
                     continue;
                 }

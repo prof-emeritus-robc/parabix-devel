@@ -43,6 +43,9 @@ public:
         if (aKind == Assertion::Kind::LookAhead) {
             // Try to transform into alternations of fixed length assertions.
             asserted = removeNullableSuffix(asserted);
+            if (RE * split = splitFinalAlternation(asserted, aSense)) {
+                return split;
+            }
             asserted = separateFinalStar(asserted);
             // A chain such as B*C D*E is compiled directly (see
             // parseLookaheadChain); zero bound elimination would split it
@@ -79,6 +82,41 @@ public:
         return makeAssertion(asserted, aKind, aSense);
     }
 private:
+    //
+    // A lookahead body with an unbounded repetition, ending with an alternation
+    // that is not a character class (e.g. a set with the text boundary, [x$] in
+    // an after context, i.e. x|End), is split over the alternatives of the
+    // alternation before zero bound elimination, so that each may be compiled
+    // as a lookahead chain:
+    //   (?=P (A|B))  ==>  (?=P A) | (?=P B)
+    //   (?!P (A|B))  ==>  (?!P A) (?!P B)
+    // Returns nullptr if the body is not of this form.
+    //
+    RE * splitFinalAlternation(RE * body, Assertion::Sense sense) {
+        std::vector<RE *> elems;
+        flatten(body, elems);
+        if (elems.size() < 2) return nullptr;
+        Alt * const last = dyn_cast<Alt>(elems.back());
+        if ((last == nullptr) || (last->size() < 2) || resolveCharClass(last)) return nullptr;
+        bool star = false;
+        for (size_t i = 0; i + 1 < elems.size(); ++i) {
+            if (const Rep * rep = dyn_cast<Rep>(elems[i])) {
+                star |= (rep->getUB() == Rep::UNBOUNDED_REP);
+            }
+        }
+        if (!star) return nullptr;
+        std::vector<RE *> pieces;
+        for (RE * e : *last) {
+            std::vector<RE *> piece(elems.begin(), elems.end() - 1);
+            piece.push_back(e);
+            pieces.push_back(transform(makeAssertion(makeSeq(piece.begin(), piece.end()), Assertion::Kind::LookAhead, sense)));
+        }
+        if (sense == Assertion::Sense::Positive) {
+            return makeAlt(pieces.begin(), pieces.end());
+        }
+        return makeSeq(pieces.begin(), pieces.end());
+    }
+
     //
     // A lookahead body ending X{lb,} F, where F is a character class that
     // overlaps the character class X, is equivalent to one ending

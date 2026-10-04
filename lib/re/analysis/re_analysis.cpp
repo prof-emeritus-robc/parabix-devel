@@ -779,6 +779,23 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
         if (const Rep * rep = dyn_cast<Rep>(e)) {
             if (rep->getUB() == Rep::UNBOUNDED_REP) {
                 CC * const X = resolveCharClass(rep->getRE());
+                std::vector<std::vector<CC *>> strings;
+                if (X == nullptr && rep->getLB() <= 1 && parseStringClass(rep->getRE(), strings)) {
+                    // A string class (see isRepeatableStringClass).
+                    if (!isRepeatableStringClass(strings) || !closeFixed()) return false;
+                    CC * first = makeCC();
+                    CC * later = makeCC();
+                    for (const auto & str : strings) {
+                        first = makeCC(first, str[0]);
+                        for (size_t k = 1; k < str.size(); ++k) later = makeCC(later, str[k]);
+                    }
+                    LookaheadSegment seg{true, false, makeCC(first, later), rep->getRE(), rep->getLB(), 0};
+                    seg.strings = std::move(strings);
+                    seg.first = first;
+                    segments.push_back(std::move(seg));
+                    hasStar = true;
+                    continue;
+                }
                 if ((X == nullptr) || !closeFixed()) return false;
                 segments.push_back(LookaheadSegment{true, false, X, rep->getRE(), rep->getLB(), 0});
                 hasStar = true;
@@ -795,8 +812,8 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
         fixed.push_back(e);
     }
     if (!closeFixed() || !hasStar || segments.back().star) return false;
-    // From the right, each star class must be disjoint from the characters
-    // that can begin the rest of the body.  (Runs end before the end of the
+    // From the right, each star class (other than a string class) must be
+    // disjoint from the characters that can begin the rest of the body.  (Runs end before the end of the
     // text anyway, so the end segment allows any star class.)
     CC * restFirst = nullptr;
     for (auto i = segments.rbegin(); i != segments.rend(); ++i) {
@@ -804,11 +821,13 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
             restFirst = makeCC();
         } else if (i->star) {
             if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
-            if (!intersectCC(i->cc, restFirst)->empty()) return false;
+            // (A string class requires no disjointness: the rest may hold at
+            // any end of an occurrence.)
+            if (i->strings.empty() && !intersectCC(i->cc, restFirst)->empty()) return false;
             if (i->lb == 0) {
-                restFirst = makeCC(i->cc, restFirst);
+                restFirst = makeCC(i->first ? i->first : i->cc, restFirst);
             } else {
-                restFirst = i->cc;
+                restFirst = i->first ? i->first : i->cc;
             }
         } else {
             restFirst = firstCharClass(i->re);

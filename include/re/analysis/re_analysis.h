@@ -47,6 +47,11 @@ struct LookaheadSegment {
     RE * re;        // star: the repeated RE as written; fixed: the segment; end: End
     int lb;         // star: the minimum number of repetitions
     int length;     // fixed: the length (in the length alphabet)
+    // A star of a string class (an alternation of strings, lb <= 1): the strings,
+    // as sequences of character classes, and the class of their first characters
+    // (cc is then the class of all their characters).
+    std::vector<std::vector<CC *>> strings = {};
+    CC * first = nullptr;
 };
 
 // Parse a lookahead body as a chain of segments, e.g. B*C D{2,}E or B*C D*$,
@@ -56,6 +61,9 @@ struct LookaheadSegment {
 // so that a run of X is always maximal: the rest must then match at the first
 // position after it not in X.  The end of the text is the end of a match
 // region (the RE compiler's region follow), where runs end in any case.
+// A star segment may also be (s1|s2|...){lb,} (lb <= 1) for a class of strings
+// (sequences of character classes) satisfying isRepeatableStringClass, with
+// no condition on the rest of the body.
 bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments);
 
 // Can the lookahead body be split by ParseUniquePrefix?  The unique prefix

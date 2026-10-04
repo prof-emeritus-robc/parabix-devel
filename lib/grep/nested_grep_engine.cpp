@@ -103,8 +103,13 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
     if (LLVM_UNLIKELY(patterns.empty())) {
 
         if (LLVM_LIKELY(mNested.size() > 1)) {
+            // Reuse the enclosing level's kernel, bound to this pipeline's streams.
             kernel = mNested.back(); assert (kernel);
-            mNested.push_back(kernel);
+            assert (kernel->getNumOfStreamInputs() == 3);
+            kernel->setInputStreamSetAt(0, basisBits);
+            kernel->setInputStreamSetAt(1, U8index);
+            kernel->setInputStreamSetAt(2, breaks);
+            kernel->setOutputStreamSetAt(0, matches);
         } else {
             kernel = new CopyBreaksToMatches(P.getTypeSystem(),
                                              basisBits, U8index, breaks,

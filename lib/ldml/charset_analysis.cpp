@@ -27,7 +27,7 @@ bool CharSetAnalysis::isSet(const RE * re) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         // Unions, possibly with strings and the text boundary.
         for (const RE * a : *alt) {
-            if (isa<Start>(a) || isa<End>(a)) continue;
+            if (isBoundary(a)) continue;
             if (const Seq * seq = dyn_cast<Seq>(a)) {
                 for (const RE * e : *seq) {
                     if (!isa<CC>(e)) return false;
@@ -69,7 +69,7 @@ UCD::UnicodeSet CharSetAnalysis::setOf(const RE * re, bool stringChars) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         UCD::UnicodeSet s;
         for (const RE * a : *alt) {
-            if (isa<Start>(a) || isa<End>(a)) continue;
+            if (isBoundary(a)) continue;
             if (const Seq * seq = dyn_cast<Seq>(a)) {
                 if (stringChars) {
                     for (const RE * e : *seq) s = s + setOf(e, stringChars);

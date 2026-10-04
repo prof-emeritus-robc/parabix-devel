@@ -111,8 +111,10 @@ private:
 void VariableUseCollector::collect(const RE * re) {
     if (re == nullptr) return;
     if (const Name * n = dyn_cast<Name>(re)) {
-        if (mVariables.count(n) != 0) {
-            if (!mUsed.insert(n).second) return;  // already collected
+        // A use of a resolved copy of a variable is a use of the variable.
+        const Name * const variable = originalVariable(n);
+        if (mVariables.count(variable) != 0) {
+            if (!mUsed.insert(variable).second && variable == n) return;  // already collected
         }
         // A variable definition, or the argument of a function call.
         collect(n->getDefinition());

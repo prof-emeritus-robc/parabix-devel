@@ -7,6 +7,7 @@
 #include <re/adt/adt.h>
 #include <re/adt/re_utility.h>
 #include <algorithm>
+#include <map>
 #include <cctype>
 
 using namespace llvm;
@@ -139,28 +140,137 @@ RuleSide * makeRuleSide(RE * before, RE * completed, RE * revisit, int cursorOff
     return RuleSide::Create(before, completed, true, revisit, cursorOffset, after);
 }
 
+static const std::string TextBoundaryNamespace = "$";
+
 RE * makeTextBoundary() {
-    return makeAlt({makeStart(), makeEnd()});
+    static Name * const marker = makeName(TextBoundaryNamespace, "$", nullptr);
+    return marker;
+}
+
+RE * makeBoundarySet(bool beforeContext) {
+    RE * const boundary = beforeContext ? static_cast<RE *>(makeStart()) : static_cast<RE *>(makeEnd());
+    return Alt::Create({makeCC(), boundary});
 }
 
 bool isTextBoundary(const RE * re) {
-    if (const Alt * alt = dyn_cast<Alt>(re)) {
-        return alt->size() == 2 && includesTextBoundary(re);
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return n->hasNamespace() && n->getNamespace() == TextBoundaryNamespace;
     }
     return false;
+}
+
+bool isBoundary(const RE * re) {
+    return isa<Start>(re) || isa<End>(re) || isTextBoundary(re);
 }
 
 bool includesTextBoundary(const RE * set) {
     if (const Alt * alt = dyn_cast<Alt>(set)) {
-        bool start = false;
-        bool end = false;
         for (const RE * a : *alt) {
-            start |= isa<Start>(a);
-            end |= isa<End>(a);
+            if (isBoundary(a)) return true;
         }
-        return start && end;
     }
     return false;
+}
+
+namespace {
+
+// Does the RE include the text boundary marker (possibly through variables)?
+bool includesMarker(const RE * re) {
+    if (re == nullptr) return false;
+    if (isTextBoundary(re)) return true;
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return !isFunctionCall(n) && includesMarker(n->getDefinition());
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (includesMarker(e)) return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (includesMarker(e)) return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        return includesMarker(rep->getRE());
+    } else if (const Diff * d = dyn_cast<Diff>(re)) {
+        return includesMarker(d->getLH()) || includesMarker(d->getRH());
+    } else if (const Intersect * x = dyn_cast<Intersect>(re)) {
+        return includesMarker(x->getLH()) || includesMarker(x->getRH());
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        return includesMarker(c->getCapturedRE());
+    }
+    return false;
+}
+
+// The resolved copies of variables, for each resolution, and their originals.
+std::map<std::pair<const Name *, BoundaryResolution>, Name *> & resolvedCopies() {
+    static std::map<std::pair<const Name *, BoundaryResolution>, Name *> copies;
+    return copies;
+}
+
+std::map<const Name *, const Name *> & copyOriginals() {
+    static std::map<const Name *, const Name *> originals;
+    return originals;
+}
+
+RE * resolve(RE * re, const BoundaryResolution before, std::map<Capture *, Capture *> * captures) {
+    if (re == nullptr || !includesMarker(re)) return re;
+    if (isTextBoundary(re)) {
+        switch (before) {
+            case BoundaryResolution::Start: return makeStart();
+            case BoundaryResolution::End: return makeEnd();
+            default: return makeAlt();
+        }
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        // A variable whose definition includes the marker.
+        auto & copies = resolvedCopies();
+        auto f = copies.find(std::make_pair(n, before));
+        if (f != copies.end()) return f->second;
+        Name * copy = makeName(n->getName(), resolve(n->getDefinition(), before, nullptr));
+        copies.emplace(std::make_pair(n, before), copy);
+        copyOriginals().emplace(copy, originalVariable(n));
+        return copy;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> elems;
+        for (RE * e : *seq) elems.push_back(resolve(e, before, captures));
+        return makeSeq(elems.begin(), elems.end());
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> elems;
+        for (RE * e : *alt) elems.push_back(resolve(e, before, captures));
+        return makeAlt(elems.begin(), elems.end());
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        return makeRep(resolve(rep->getRE(), before, captures), rep->getLB(), rep->getUB());
+    } else if (Diff * d = dyn_cast<Diff>(re)) {
+        return makeDiff(resolve(d->getLH(), before, captures), resolve(d->getRH(), before, captures));
+    } else if (Intersect * x = dyn_cast<Intersect>(re)) {
+        return makeIntersect(resolve(x->getLH(), before, captures), resolve(x->getRH(), before, captures));
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        Capture * const rebuilt = makeCapture(c->getName(), resolve(c->getCapturedRE(), before, captures));
+        if (captures) captures->emplace(c, rebuilt);
+        return rebuilt;
+    }
+    return re;
+}
+
+}
+
+RE * resolveTextBoundary(RE * re, BoundaryResolution resolution, std::map<Capture *, Capture *> * captures) {
+    return resolve(re, resolution, captures);
+}
+
+bool mayIncludeTextBoundary(const RE * re) {
+    if (const Name * n = dyn_cast<Name>(re)) {
+        if (isTextBoundary(n)) return true;
+        if (isFunctionCall(n)) return false;
+        const Name * const original = originalVariable(n);
+        return includesMarker(original->getDefinition()) || (n->getDefinition() && mayIncludeTextBoundary(n->getDefinition()));
+    }
+    if (isBoundary(re)) return true;
+    if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * a : *alt) {
+            if (mayIncludeTextBoundary(a)) return true;
+        }
+    }
+    return false;
+}
+
+const Name * originalVariable(const Name * n) {
+    auto f = copyOriginals().find(n);
+    return f == copyOriginals().end() ? n : f->second;
 }
 
 static CC * dotExclusions() {

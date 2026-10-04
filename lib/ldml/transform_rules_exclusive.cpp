@@ -19,19 +19,22 @@ namespace ldml {
 
 namespace {
 
-// Does a set include the text boundary [$] (possibly through variables)?
-bool hasTextBoundary(const RE * re) {
-    if (const Name * n = dyn_cast<Name>(re)) {
-        return !isFunctionCall(n) && n->getDefinition() && hasTextBoundary(n->getDefinition());
+// The text boundary that a set includes (possibly through variables): Start,
+// End or the marker, or nullptr if none.
+RE * textBoundaryOf(RE * re) {
+    if (Name * n = dyn_cast<Name>(re)) {
+        if (isTextBoundary(n)) return n;
+        return (!isFunctionCall(n) && n->getDefinition()) ? textBoundaryOf(n->getDefinition()) : nullptr;
     }
-    if (const Alt * alt = dyn_cast<Alt>(re)) {
-        if (includesTextBoundary(re)) return true;
-        for (const RE * a : *alt) {
-            if (hasTextBoundary(a)) return true;
+    if (isa<Start>(re) || isa<End>(re)) return re;
+    if (Alt * alt = dyn_cast<Alt>(re)) {
+        for (RE * a : *alt) {
+            if (RE * b = textBoundaryOf(a)) return b;
         }
     }
-    return false;
+    return nullptr;
 }
+
 
 // The strings of a set (possibly through variables).
 void collectStrings(RE * re, std::vector<RE *> & strings) {
@@ -57,7 +60,7 @@ RE * withoutStringsAndBoundary(RE * re) {
     if (Alt * alt = dyn_cast<Alt>(re)) {
         std::vector<RE *> members;
         for (RE * a : *alt) {
-            if (!isa<Seq>(a) && !isa<Start>(a) && !isa<End>(a)) members.push_back(a);
+            if (!isa<Seq>(a) && !isBoundary(a)) members.push_back(a);
         }
         if (members.size() == alt->size()) return re;
         if (members.size() == 1) return members[0];
@@ -137,14 +140,17 @@ private:
         // set that is not divided, or the variable) remains as written.
         if (classes.size() == 1) {
             const CharacterClass & c = mPartition.classes[classes[0]];
-            if (c.inlineSet || elements[0] == set) {
+            // (A resolved copy of the variable is the variable.)
+            const Name * const setVariable = dyn_cast<Name>(set);
+            if (c.inlineSet || elements[0] == set ||
+                    (setVariable && elements[0] == originalVariable(setVariable))) {
                 return set;
             }
         }
         mStats.setsRewritten++;
         std::vector<RE *> strings;
         collectStrings(set, strings);
-        const bool boundary = hasTextBoundary(set);
+        RE * const boundary = textBoundaryOf(set);
         if (elements.size() == 1 && strings.empty() && !boundary) {
             return elements[0];
         }
@@ -159,8 +165,7 @@ private:
             if (isa<CC>(e)) members.push_back(e);
         }
         if (boundary) {
-            members.push_back(makeStart());
-            members.push_back(makeEnd());
+            members.push_back(boundary);
         }
         return Alt::Create(members.begin(), members.end());
     }

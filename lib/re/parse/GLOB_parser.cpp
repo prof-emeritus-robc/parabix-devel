@@ -62,7 +62,8 @@ const codepoint_t FILE_PATH_SEPARATOR = '/';
 //     (a) a NUL character.
 //     (b) a slash ('/')
 //     (c) a period ('.') when it appears as the first character of a
-//         filename or path component (immediately after a '/').
+//         filename or path component (immediately after a '/'), for the
+//         Posix GLOB kind only.
 
 static RE * makeAnyFileCC() {
     return makeComplement(CC::Create(CC::Create(NUL), CC::Create(FILE_PATH_SEPARATOR)));
@@ -80,11 +81,9 @@ static RE * makeAnyButDot() {
 RE * FileGLOB_Parser::parse_next_item() {
     if (mCursor.noMore()) return nullptr;
     if (accept('?')) {
-        if (mPathComponentStartContext) {
-            mPathComponentStartContext = false;  // After this ? metacharacter.
-            return makeAnyButDot();
-        }
-        else return makeAnyFileCC();
+        const bool componentStart = mPathComponentStartContext;
+        mPathComponentStartContext = false;  // After this ? metacharacter.
+        return (componentStart && periodRule()) ? makeAnyButDot() : makeAnyFileCC();
     } else if (accept('*')) {
         // Check for pattern beginning **/, containing /**/, or ending /**, and
         // process according to GIT special GLOB rules if required.
@@ -99,10 +98,11 @@ RE * FileGLOB_Parser::parse_next_item() {
             // Accept the ? and build the ?* regexp in place of *?
             RE * first = parse_next_item();  // Checks/sets mPathComponentStartContext as required.
             return Seq::Create({first, Rep::Create(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP)});
-        } else if (mPathComponentStartContext) {
+        } else if (mPathComponentStartContext && periodRule()) {
             mPathComponentStartContext = false;   // After this * metacharacter.
             return Rep::Create(Seq::Create({makeAnyButDot(), Rep::Create(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP)}), 0, 1);
         } else {
+            mPathComponentStartContext = false;
             return Rep::Create(makeAnyFileCC(), 0, Rep::UNBOUNDED_REP);
         }
     } else if (accept('\\')) {
@@ -160,7 +160,7 @@ RE * FileGLOB_Parser::parse_bracket_expr () {
     } while (mCursor.more() && !at(']'));
     require(']');
     if (negated) {
-        if (mPathComponentStartContext) {
+        if (mPathComponentStartContext && periodRule()) {
             // In mPathComponentStartContext, a dot cannot be matched by a negated bracket expression
             items.push_back(CC::Create('.'));
         }
@@ -168,7 +168,7 @@ RE * FileGLOB_Parser::parse_bracket_expr () {
     }
     else {
         RE * t = Alt::Create(items.begin(), items.end());
-        if (mPathComponentStartContext) {
+        if (mPathComponentStartContext && periodRule()) {
             t = Diff::Create(t, CC::Create('.'));
         }
         return t;
@@ -215,7 +215,7 @@ PatternVector parseGitIgnoreFile(fs::path dirpath, std::string ignoreFileName) {
             while ((line[line_end] == ' ') && (line_end > 0)) {
                 line_end--;
             }
-            if (line_end == 0) continue;  // skip blank lines.
+            if (line[line_end] == ' ') continue;  // skip blank lines (only spaces).
             if (line[line_end] == '\\') {
                 // Escape character found, but is it an escaped escape (\\)?
                 // Determine whether we have an odd or even number of escapes.

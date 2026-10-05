@@ -5,6 +5,7 @@
 
 #include <fileselect/file_select.h>
 
+#include <algorithm>
 #include <fstream>
 #include <string>
 #include <boost/filesystem.hpp>
@@ -87,57 +88,94 @@ static cl::opt<unsigned> GitREcoalescing("git-RE-coalescing", cl::desc("gitignor
 
 
 
-// Command line arguments to specify file and directory includes/excludes
-// use GLOB syntax, matching any full pathname suffix after a "/", or
-// the full filename of any recursively selected file or directory.
-re::RE * anchorToFullFileName(re::RE * glob) {
-    return re::makeSeq({re::makeAlt({re::makeStart(), re::makeCC('/')}), glob, re::makeEnd()});
+//
+// Include and exclude options (--include, --exclude, --exclude-from,
+// --include-dir, --exclude-dir) follow GNU grep: GLOB patterns, applied in
+// the order given on the command line, so that the last option matching a
+// name wins.  A name matching no option is selected unless the first such
+// option (for files, or for directories) is an include.  For the files and
+// directories named on the command line, a pattern matches any suffix of the
+// name that begins after a "/" (or the whole name); for those found while
+// recursing, it matches the base name.  (BSD grep instead matches the full
+// path, and selects no unmatched files once an --include is given.)
+//
+struct SelectionOption {
+    unsigned position;      // on the command line
+    re::PatternKind kind;
+    std::string glob;
+};
+
+// The options for files or for directories, in command line order.
+static std::vector<SelectionOption> selectionOptions(bool directories) {
+    std::vector<SelectionOption> options;
+    auto add = [&](const cl::list<std::string> & list, re::PatternKind kind) {
+        for (unsigned i = 0; i < list.size(); i++) {
+            options.push_back(SelectionOption{list.getPosition(i), kind, list[i]});
+        }
+    };
+    if (directories) {
+        add(IncludeDirectories, re::PatternKind::Include);
+        add(ExcludeDirectories, re::PatternKind::Exclude);
+    } else {
+        add(IncludeFiles, re::PatternKind::Include);
+        add(ExcludeFiles, re::PatternKind::Exclude);
+        if (ExcludeFromFlag.getNumOccurrences()) {
+            std::ifstream globFile(ExcludeFromFlag.c_str());
+            std::string r;
+            if (globFile.is_open()) {
+                while (std::getline(globFile, r)) {
+                    options.push_back(SelectionOption{ExcludeFromFlag.getPosition(), re::PatternKind::Exclude, r});
+                }
+                globFile.close();
+            }
+        }
+    }
+    std::stable_sort(options.begin(), options.end(),
+                     [](const SelectionOption & a, const SelectionOption & b) {return a.position < b.position;});
+    return options;
+}
+
+// The pattern of a GLOB for files or directories (whose candidate names end
+// with "/"): matching a name suffix after a "/" for command line names, or
+// the base name for names found while recursing (never, for a GLOB with "/").
+static re::RE * selectionPattern(const std::string & glob, bool directory, bool commandLine) {
+    if (!commandLine && (glob.find('/') != std::string::npos)) return nullptr;
+    re::RE * globRE = re::RE_Parser::parse(directory ? glob + "/" : glob, re::DEFAULT_MODE, re::RE_Syntax::GrepGLOB);
+    return re::makeSeq({re::makeAlt({re::makeStart(), re::makeCC('/')}), globRE, re::makeEnd()});
 }
 
 bool UseStdIn;
 
-re::PatternVector getIncludeExcludePatterns() {
+re::PatternVector getIncludeExcludePatterns(bool commandLine) {
     using Pattern = re::PatternKind;
     re::PatternVector signedPatterns;
-    if (IncludeDirectories.empty() && IncludeFiles.empty()) {
-        // No explicit inclusion, start by including everything.
+    const std::vector<SelectionOption> fileOptions = selectionOptions(false);
+    const std::vector<SelectionOption> dirOptions = selectionOptions(true);
+    // The names selected initially: files (not ending in "/") unless the
+    // first file option is an include, and directories (ending in "/")
+    // unless the first directory option is an include.
+    const bool allFiles = fileOptions.empty() || (fileOptions.front().kind == Pattern::Exclude);
+    const bool allDirs = dirOptions.empty() || (dirOptions.front().kind == Pattern::Exclude);
+    if (allFiles && allDirs) {
         signedPatterns.push_back(std::make_pair(Pattern::Include, re::makeEnd()));
-    } else if (IncludeDirectories.empty()) {
-        // Include any directory, using the pattern "/$"
+    } else if (allDirs) {
         signedPatterns.push_back(std::make_pair(Pattern::Include, re::makeSeq({re::makeCC('/'), re::makeEnd()})));
-    } else if (IncludeFiles.empty()) {
-        // Include any file, using the pattern "[^/]$"
+    } else if (allFiles) {
         signedPatterns.push_back(std::make_pair(Pattern::Include,
                                                 re::makeSeq({re::makeComplement(re::makeCC('/')), re::makeEnd()})));
     }
-    for (auto & d : IncludeDirectories) {
-        std::string path = d + "/";  // Force directory matching only by appending a "/".
-        re::RE * includeDirRE = re::RE_Parser::parse(path, re::DEFAULT_MODE, re::RE_Syntax::FileGLOB);
-        signedPatterns.push_back(std::make_pair(Pattern::Include, anchorToFullFileName(includeDirRE)));
-    }
-    for (auto & path : IncludeFiles) {
-        re::RE * includeRE = re::RE_Parser::parse(path, re::DEFAULT_MODE, re::RE_Syntax::FileGLOB);
-        signedPatterns.push_back(std::make_pair(Pattern::Include, anchorToFullFileName(includeRE)));
-    }
-    for (auto & d : ExcludeDirectories) {
-        std::string path = d + "/"; // Force directory matching only by appending a "/".
-        re::RE * includeDirRE = re::RE_Parser::parse(path, re::DEFAULT_MODE, re::RE_Syntax::FileGLOB);
-        signedPatterns.push_back(std::make_pair(Pattern::Exclude, anchorToFullFileName(includeDirRE)));
-    }
-    for (auto & path : ExcludeFiles) {
-        re::RE * excludeRE = re::RE_Parser::parse(path, re::DEFAULT_MODE, re::RE_Syntax::FileGLOB);
-        signedPatterns.push_back(std::make_pair(Pattern::Exclude, anchorToFullFileName(excludeRE)));
-    }
-    if (ExcludeFromFlag.getNumOccurrences()) {
-        std::ifstream globFile(ExcludeFromFlag.c_str());
-        std::string r;
-        if (globFile.is_open()) {
-            while (std::getline(globFile, r)) {
-                re::RE * glob = re::RE_Parser::parse(r, re::DEFAULT_MODE, re::RE_Syntax::FileGLOB);
-                signedPatterns.push_back(std::make_pair(Pattern::Exclude, anchorToFullFileName(glob)));
+    // The options, each applied in turn (file and directory patterns match
+    // different names).
+    for (const auto & opts : {std::make_pair(&fileOptions, false), std::make_pair(&dirOptions, true)}) {
+        for (const SelectionOption & o : *opts.first) {
+            if (re::RE * pattern = selectionPattern(o.glob, opts.second, commandLine)) {
+                signedPatterns.push_back(std::make_pair(o.kind, pattern));
             }
-            globFile.close();
         }
+    }
+    if (signedPatterns.empty()) {
+        // Nothing is selected.
+        signedPatterns.push_back(std::make_pair(Pattern::Exclude, re::makeEnd()));
     }
     return signedPatterns;
 }
@@ -381,7 +419,9 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
 
     grep::NestedInternalSearchEngine pathSelectEngine(driver);
     pathSelectEngine.setRecordBreak(grep::GrepRecordBreakKind::Null);
-    pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(), GitREcoalescing));
+    // The command line names are selected first, then the names found while
+    // recursing, with their own patterns (see getIncludeExcludePatterns).
+    pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(true), GitREcoalescing));
 
     const auto commandLineFileCandidates = fileCandidates.getCandidateCount();
     if (commandLineFileCandidates > 0) {
@@ -404,6 +444,8 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
         // Each of these candidates is a full path return from command line argument processing.
         directoryAccum.setFullPathEntries(commandLineDirCandidates);
         pathSelectEngine.doGrep(dirCandidates.data(), dirCandidates.size(), directoryAccum);
+        pathSelectEngine.pop();
+        pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), GitREcoalescing));
         // Select files from subdirectories using the recursive process.
         for (const auto & dirpath : selectedDirectories) {
             recursiveFileSelect(driver, dirpath, pathSelectEngine, collectedPaths);

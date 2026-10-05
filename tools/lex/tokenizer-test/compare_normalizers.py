@@ -61,16 +61,24 @@ MODES = {
                                         handle_chinese_chars=True,
                                         strip_accents=False,
                                         lowercase=False),
+    # Built as a literal chain (Sequence), not a single BertNormalizer(strip_accents=True,...)
+    # call: HF's own BertNormalizer.strip_accents uses BERT's original Mn-only accent
+    # rule internally, which differs from the standalone StripAccents() class (Mn+Mc+Me,
+    # see "stripaccents" above) -- confirmed by comparing the two directly in pure HF code,
+    # no Parabix involved. Parabix's --normalize=X,Y,Z is a literal chain (cl::CommaSeparated),
+    # so the chain is the correct HF counterpart here, not the single composite object.
+    # NFD is required before StripAccents(): it only removes marks already split out as
+    # their own codepoint (e.g. 'e'+'́'), not a precomposed char like 'e' -- matching
+    # Parabix's own stripaccents step, which always NFD-decomposes internally first
+    # (normalize.cpp: applyStripAccents(P, applyNFD(P, ...))).
     "bertcleantext,stripaccents,lowercase":
-        BertNormalizer(clean_text=True,
-                       handle_chinese_chars=False,
-                       strip_accents=True,
-                       lowercase=True),
+        Sequence([BertNormalizer(clean_text=True, handle_chinese_chars=False,
+                                  strip_accents=False, lowercase=False),
+                   NFD(), StripAccents(), Lowercase()]),
     "bertcleantext,bertchinesechars,stripaccents,lowercase":
-        BertNormalizer(clean_text=True,
-                       handle_chinese_chars=True,
-                       strip_accents=True,
-                       lowercase=True),
+        Sequence([BertNormalizer(clean_text=True, handle_chinese_chars=True,
+                                  strip_accents=False, lowercase=False),
+                   NFD(), StripAccents(), Lowercase()]),
     "bytelevel,lowercase":              Sequence([ByteLevel(), Lowercase()]),
     "lowercase,strip":                  Sequence([Lowercase(), Strip()]),
     "bytelevel,strip":                  Sequence([ByteLevel(), Strip()]),

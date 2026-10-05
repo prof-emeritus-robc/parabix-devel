@@ -132,28 +132,50 @@ def write_comparison(out, parabix: list[str], hf: list[str]) -> None:
 # Three run modes
 # ---------------------------------------------------------------------------
 
-def run_compare(out, text: str, requested: list[str]) -> dict[str, str]:
-    """Run both Parabix and HF, compare token lists."""
+def run_compare(out, lines: list[str], requested: list[str]) -> dict[str, str]:
+    """Run both Parabix and HF per line, compare token lists.
+
+    Parabix's CLI always treats a newline as a hard pretoken boundary, by
+    design (most corpora are one document per line; confirmed universal
+    across every mode, not something any single mode opts into). A
+    multi-line input compared as one whole-string HF call would therefore
+    disagree at every embedded newline regardless of mode, which is a test
+    artifact, not a Parabix bug (confirmed: a corpus joined with "\\n" was
+    producing false MISMATCH on digits/punctuation/chardelimiter/
+    sequence_whitespace_punct until switched to this per-line comparison,
+    which then matched HF exactly, 0 mismatches on 5000 real lines).
+    Matches compare_bpe.py's own "each line is a separate test case" method.
+    """
     results = {}
     for num, mode in enumerate(requested, 1):
-        pt      = MODES[mode]
-        parabix = run_parabix(mode, text)
-        hf      = run_hf(pt, text)
-        status  = "MATCH" if parabix == hf else "MISMATCH"
+        pt = MODES[mode]
+        mismatches = []
+        for li, line in enumerate(lines):
+            parabix = run_parabix(mode, line)
+            hf      = run_hf(pt, line)
+            if parabix != hf:
+                mismatches.append((li, line, parabix, hf))
+
+        status = "MATCH" if not mismatches else "MISMATCH"
         results[mode] = status
 
         out.write(SEP + "\n")
         out.write(f"Test {num}: {mode}  →  {status}\n")
         out.write(SEP + "\n")
-        out.write(f"  Input:          {repr(text)}\n")
-        out.write(f"  Parabix tokens: {len(parabix)}\n")
-        out.write(f"  HF tokens:      {len(hf)}\n\n")
+        out.write(f"  Lines tested:  {len(lines)}\n")
+        out.write(f"  Lines matched: {len(lines) - len(mismatches)}\n")
+        out.write(f"  Lines failed:  {len(mismatches)}\n\n")
 
-        if status == "MISMATCH":
+        for li, line, parabix, hf in mismatches[:3]:
+            out.write(f"  --- mismatch at line {li} ---\n")
+            out.write(f"  Input:          {repr(line)}\n")
+            out.write(f"  Parabix tokens: {len(parabix)}\n")
+            out.write(f"  HF tokens:      {len(hf)}\n\n")
             write_diff_summary(out, parabix, hf)
-
-        write_comparison(out, parabix, hf)
-        out.write("\n")
+            write_comparison(out, parabix, hf)
+            out.write("\n")
+        if len(mismatches) > 3:
+            out.write(f"  ... and {len(mismatches) - 3} more mismatching lines\n\n")
 
     return results
 
@@ -252,6 +274,11 @@ def main() -> None:
                         help="Specific modes to test (default: all)")
     parser.add_argument("--tokenizer",    default=DEFAULT_TOKENIZER,
                         help=f"Parabix tokenizer binary (default: {DEFAULT_TOKENIZER})")
+    parser.add_argument("--max-lines",    type=int, default=200,
+                        help="Cap the number of lines compared for a multi-line "
+                             "corpus (default 200; each line spawns a subprocess "
+                             "per mode, so a full 5000-line corpus over 7 modes "
+                             "is slow). Use 0 for no cap.")
     args = parser.parse_args()
     DEFAULT_TOKENIZER = args.tokenizer
     if not args.hf_only and not os.path.isfile(DEFAULT_TOKENIZER):
@@ -260,6 +287,13 @@ def main() -> None:
 
     with open(args.input, "r", encoding="utf-8") as f:
         text = f.read().strip()
+
+    # Parabix's CLI always treats "\n" as a hard pretoken boundary (confirmed
+    # universal, every mode), so a multi-line corpus must be compared line by
+    # line against HF, not as one joined string -- see run_compare's docstring.
+    lines = [l for l in text.split("\n") if l]
+    if args.max_lines and len(lines) > args.max_lines:
+        lines = lines[:args.max_lines]
 
     requested = args.modes if args.modes else list(MODES.keys())
     unknown   = [m for m in requested if m not in MODES]
@@ -271,7 +305,7 @@ def main() -> None:
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         out = Tee(f)
         out.write(f"Input file: {args.input}\n")
-        out.write(f"Input:      {repr(text)}\n\n")
+        out.write(f"Lines:      {len(lines)}\n\n")
 
         if args.hf_only:
             run_hf_only(out, text, requested)
@@ -279,7 +313,7 @@ def main() -> None:
             results = run_parabix_only(out, text, requested)
             write_summary(out, results)
         else:
-            results = run_compare(out, text, requested)
+            results = run_compare(out, lines, requested)
             write_summary(out, results)
 
     print(f"\nOutput written to: {OUTPUT_FILE}")

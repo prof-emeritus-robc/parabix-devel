@@ -248,11 +248,24 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
             }
             return la;
         };
+        // The offset counts code units from the start of the lookahead.
         if (marker.position() == Position::AtEnd) {
             return Marker(mPB.createAnd(marker.stream(), lookahead(amt)));
-        } else {
+        } else if (mMain.mIndexingAlphabet == nullptr) {
             PabloAST * nextPos = NextCharacter(marker, mPB);
             return Marker(mPB.createAnd(nextPos, lookahead(amt - 1)), Position::AtNextChar);
+        } else if (marker.position() == Position::AtNextCodeUnit) {
+            // At the first code unit of the next character.
+            return Marker(mPB.createAnd(marker.stream(), lookahead(amt - 1)), Position::AtNextCodeUnit);
+        } else {
+            // At the final code unit of the next character: the lookahead is
+            // evaluated at the first code units of characters (those after an
+            // index position, or at the start), and moved to their final ones.
+            PabloAST * const idx = mMain.mIndexStream;
+            PabloAST * const charStarts = mPB.createNot(mPB.createAdvance(mPB.createNot(idx), 1), "charStarts");
+            PabloAST * const atStarts = mPB.createAnd(charStarts, lookahead(amt - 1));
+            PabloAST * const atFinals = ScanToIndex(atStarts, idx, mPB);
+            return Marker(mPB.createAnd(marker.stream(), atFinals), Position::AtNextChar);
         }
     }
     auto externalLength = ext.minLength();

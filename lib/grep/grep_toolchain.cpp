@@ -53,6 +53,10 @@ bool UseNestedColourizationPipeline;
 static cl::opt<bool, true> OptUsePipelinedColourization("UseNestedColourizationPipeline", cl::location(UseNestedColourizationPipeline),
                                          cl::desc("Use a nested pipeline for colourization."), cl::init(true));
 
+bool ColourizeByTemplate;
+static cl::opt<bool, true> ColourizeByTemplateOption("ColourizeByTemplate", cl::location(ColourizeByTemplate),
+                                                     cl::desc("Insert colour escapes by merging a repeating template (as csv2json)."), cl::init(false));
+
 bool UsePhaseForColourization;
 static cl::opt<bool, true> UsePhaseForColourizationOption("UsePhaseForColourization", cl::location(UsePhaseForColourization),
                                                           cl::desc("Use independent phase for colourization"), cl::init(true));

@@ -571,6 +571,32 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
             E.captureBixNum("SpanMarks", SpanMarks);
         }
 
+        StreamSet * ColorizedBasis = E.CreateStreamSet(8);
+        if (ColourizeByTemplate) {
+            // As in csv2json: the escapes are inserted at the span starts and ends,
+            // which strictly alternate (spans are maximal, nonempty and within
+            // lines), so the inserted bytes are the bytes of the start and end
+            // escapes in turn, taken in order from a repeating template.
+            StreamSet * const InsertPoints = E.CreateStreamSet(1);
+            E.CreateKernelCall<StreamSelect>(InsertPoints, Merge(SpanMarks, {0, 1}));
+            std::vector<uint64_t> amts;
+            std::vector<uint64_t> templateBytes;
+            for (auto & s : colorEscapes) {
+                amts.push_back(s.size());
+                for (unsigned char ch : s) templateBytes.push_back(ch);
+            }
+            StreamSet * const Amounts = E.CreateRepeatingBixNum(insertLengthBits, amts, false);
+            StreamSet * const InsertBixNum = E.CreateStreamSet(insertLengthBits, 1);
+            SpreadByMask(E, InsertPoints, Amounts, InsertBixNum);
+            StreamSet * const SpreadMask = E.CreateStreamSet(1, 1);
+            InsertionSpreadMask(E, InsertBixNum, SpreadMask, kernel::InsertPosition::Before);
+            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+                E.captureBitstream("SpreadMask", SpreadMask);
+            }
+            StreamSet * const Template = E.CreateRepeatingBixNum(8, templateBytes, false);
+            MergeByMask(E, SpreadMask, Basis, Template, ColorizedBasis);
+        } else {
+
         StreamSet * const InsertBixNum = E.CreateStreamSet(insertLengthBits, 1);
         E.CreateKernelCall<ZeroInsertBixNum>(insertAmts, SpanMarks, InsertBixNum);
         StreamSet * const SpreadMask = E.CreateStreamSet(1, 1);
@@ -598,8 +624,8 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
             E.captureBixNum("ExpandedMarks", ExpandedMarks);
         }
 
-        StreamSet * ColorizedBasis = E.CreateStreamSet(8);
         E.CreateKernelCall<StringReplaceKernel>(colorEscapes, ExpandedBasis, SpreadMask, ExpandedMarks, InsertIndex, ColorizedBasis, -1);
+        }
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             E.captureBixNum("ColorizedBasis", ColorizedBasis);
         }

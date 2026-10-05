@@ -31,8 +31,11 @@ from tokenizers.normalizers import NFD, NFC, NFKD, NFKC, StripAccents, Strip, Se
 # Paths
 # ---------------------------------------------------------------------------
 
-DEFAULT_INPUT     = "/Users/munizahashim/parabix-devel/build19/test.txt"
-DEFAULT_TOKENIZER = "/Users/munizahashim/parabix-devel/build19/bin/tokenizer"
+# Defaults only: the repo root is three levels above this script
+# (tools/lex/tokenizer-test/); --input/--tokenizer override.
+REPO_ROOT         = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
+DEFAULT_INPUT     = os.path.join(REPO_ROOT, "build19/test.txt")
+DEFAULT_TOKENIZER = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 OUTPUT_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "compare_normalizers_output.txt")
 
@@ -208,6 +211,7 @@ def write_summary(out, results: dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global DEFAULT_TOKENIZER
     all_modes = list(MODES.keys())
 
     parser = argparse.ArgumentParser(description="Normalizer comparison: Parabix vs HuggingFace.")
@@ -220,7 +224,13 @@ def main() -> None:
     parser.add_argument("modes",          nargs="*",
                         help=f"Specific modes to test (default: all). "
                              f"Available: {all_modes}")
+    parser.add_argument("--tokenizer",    default=DEFAULT_TOKENIZER,
+                        help=f"Parabix tokenizer binary (default: {DEFAULT_TOKENIZER})")
     args = parser.parse_args()
+    DEFAULT_TOKENIZER = args.tokenizer
+    if not args.hf_only and not os.path.isfile(DEFAULT_TOKENIZER):
+        print(f"Error: tokenizer binary not found: {DEFAULT_TOKENIZER}")
+        sys.exit(1)
 
     with open(args.input, "r", encoding="utf-8") as f:
         text = f.read()

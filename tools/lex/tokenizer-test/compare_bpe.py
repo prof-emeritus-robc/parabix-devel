@@ -35,7 +35,9 @@ from tokenizers import Tokenizer
 # Paths
 # ---------------------------------------------------------------------------
 
-REPO_ROOT      = "/Users/munizahashim/parabix-devel"
+# Defaults only: the repo root is three levels above this script
+# (tools/lex/tokenizer-test/); --tokenizer/--merges/--vocab/--tokenizer-json override.
+REPO_ROOT      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
@@ -46,7 +48,7 @@ OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 DEFAULT_RUNS = 5
 
-# Extra flags forwarded verbatim to build19/bin/tokenizer on every invocation
+# Extra flags forwarded verbatim to the tokenizer binary on every invocation
 # (both the correctness run and the --bench-loop timing run). Set by --tok-flag.
 EXTRA_ARGS: list[str] = []
 
@@ -375,6 +377,7 @@ def write_summary(out, results: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global SHOW_INPUT, EXTRA_ARGS, TOKENIZER, MERGES, VOCAB, TOKENIZER_JSON
     parser = argparse.ArgumentParser(description="BPE tokenizer comparison test suite.")
     parser.add_argument("--input",        default=DEFAULT_INPUT,
                         help=f"Input file (entire file is one test case, default: {DEFAULT_INPUT})")
@@ -392,10 +395,22 @@ def main() -> None:
     parser.add_argument("--no-timing",    action="store_true",
                         help="Skip the timing section")
     parser.add_argument("--tok-flag",     action="append", default=[], metavar="FLAG",
-                        help="Extra flag passed straight to build19/bin/tokenizer "
+                        help="Extra flag passed straight to the tokenizer binary "
                              "(repeatable), e.g. --tok-flag=--level-partition")
+    parser.add_argument("--tokenizer",      default=TOKENIZER,
+                        help=f"Parabix tokenizer binary (default: {TOKENIZER})")
+    parser.add_argument("--merges",         default=MERGES,
+                        help=f"merges.txt (default: {MERGES})")
+    parser.add_argument("--vocab",          default=VOCAB,
+                        help=f"vocab.json (default: {VOCAB})")
+    parser.add_argument("--tokenizer-json", default=TOKENIZER_JSON,
+                        help=f"HuggingFace tokenizer.json (default: {TOKENIZER_JSON})")
     args = parser.parse_args()
-    global SHOW_INPUT, EXTRA_ARGS
+    TOKENIZER, MERGES = args.tokenizer, args.merges
+    VOCAB, TOKENIZER_JSON = args.vocab, args.tokenizer_json
+    if not args.hf_only and not os.path.isfile(TOKENIZER):
+        print(f"Error: tokenizer binary not found: {TOKENIZER}")
+        sys.exit(1)
     SHOW_INPUT = args.show_input
     EXTRA_ARGS = list(args.tok_flag)
     if EXTRA_ARGS:

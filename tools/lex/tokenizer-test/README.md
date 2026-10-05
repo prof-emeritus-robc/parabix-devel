@@ -25,8 +25,9 @@ Scripts 1–3 print `MATCH` / `MISMATCH` per case; all five tee their output to
 ## Requirements
 
 - **Python 3.10+**
-- **A built tokenizer binary** at `<repo>/build19/bin/tokenizer`
-  (`make -C build19 -j8 tokenizer`).
+- **A built tokenizer binary**, by default `<repo>/build19/bin/tokenizer`
+  (`make -C build19 -j8 tokenizer`). `compare_bpe.py` and `bench_bpe.py` take
+  another one via `--tokenizer PATH`.
 - **HuggingFace `tokenizers`** (PyPI, no account or token needed).
 - **`datasets`** (PyPI) — only for `bench_bpe.py --openwebtext`, which streams a
   fresh corpus sample from the Hub instead of downloading the 40 GB dataset.
@@ -42,20 +43,29 @@ pip install datasets            # optional: only for --openwebtext
 python -c "import tokenizers; print(tokenizers.__version__)"
 ```
 
-### Paths are hard-coded
+### Paths
 
-Every script defines its paths as constants near the top:
+Every script finds the repo from its own location (three levels up from
+`tools/lex/tokenizer-test/`), so it runs from any directory and any checkout.
+Every path can be overridden on the command line:
 
-```python
-REPO_ROOT      = "/Users/munizahashim/parabix-devel"
-TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
-MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
-VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
-TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
+| Option | Default | `compare_bpe` | `bench_bpe` | `bench_configs` | `compare_normalizers`, `compare_pretokenizers` |
+|---|---|---|---|---|---|
+| `--input PATH` | see each script below | ✓ | ✓ | ✓ | ✓ |
+| `--tokenizer PATH` | `<repo>/build19/bin/tokenizer` | ✓ | ✓ | ✓ | ✓ |
+| `--merges PATH` | `<repo>/tools/lex/tokenizer_files/merges.txt` | ✓ | ✓ | ✓ | — |
+| `--tokenizer-json PATH` | `<repo>/tools/lex/tokenizer_files/tokenizer.json` | ✓ | ✓ | — | — |
+| `--vocab PATH` | `<repo>/tools/lex/tokenizer_files/vocab.json` | ✓ | — | — | — |
+
+Each script stops with an error when the tokenizer binary is missing (except
+with `--hf-only`).
+
+```bash
+python compare_bpe.py --no-timing --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
+python bench_bpe.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer \
+    --parabix-args="--pretokenizer=bytelevel --level-partition"
+python compare_pretokenizers.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
 ```
-
-If your checkout lives elsewhere, or you build into a directory other than
-`build19`, edit `REPO_ROOT` / `TOKENIZER` in each script you use.
 
 ---
 

@@ -51,7 +51,9 @@ from tokenizers import Tokenizer
 # Paths
 # ---------------------------------------------------------------------------
 
-REPO_ROOT      = "/Users/munizahashim/parabix-devel"
+# Defaults only: the repo root is three levels above this script
+# (tools/lex/tokenizer-test/); --tokenizer/--merges/--tokenizer-json override.
+REPO_ROOT      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
@@ -396,6 +398,7 @@ def ensure_openwebtext(cap_bytes: int, max_docs: int, path: str):
 # ---------------------------------------------------------------------------
 
 def main():
+    global TOKENIZER, MERGES, TOKENIZER_JSON
     ap = argparse.ArgumentParser(description="Parabix vs HuggingFace BPE throughput benchmark.")
     ap.add_argument("--input", help="Single corpus file (overrides the default sweep)")
     ap.add_argument("--big", action="store_true", help="Append the ~13 MB corpus to the sweep")
@@ -431,7 +434,17 @@ def main():
     ap.add_argument("--parabix-args", default="",
                     help="Extra flags forwarded verbatim to the tokenizer binary, "
                          "e.g. --parabix-args=\"--geometric-compaction --compact-base=15\"")
+    ap.add_argument("--tokenizer", default=TOKENIZER,
+                    help=f"Parabix tokenizer binary (default: {TOKENIZER})")
+    ap.add_argument("--merges", default=MERGES,
+                    help=f"merges.txt (default: {MERGES})")
+    ap.add_argument("--tokenizer-json", default=TOKENIZER_JSON,
+                    help=f"HuggingFace tokenizer.json (default: {TOKENIZER_JSON})")
     args = ap.parse_args()
+    TOKENIZER, MERGES, TOKENIZER_JSON = args.tokenizer, args.merges, args.tokenizer_json
+    if not args.hf_only and not os.path.isfile(TOKENIZER):
+        print(f"Error: tokenizer binary not found: {TOKENIZER}")
+        sys.exit(1)
     parabix_extra = shlex.split(args.parabix_args)
 
     owt_path = None

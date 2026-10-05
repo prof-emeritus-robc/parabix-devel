@@ -48,8 +48,8 @@ make tokenizer
 ```
 
 All compiled tools land under `build19/bin/`; the tokenizer binary is
-`build19/bin/tokenizer`. The test scripts in `tokenizer-test/` hard-code
-`build19`, so prefer that directory name.
+`build19/bin/tokenizer`. The test scripts in `tokenizer-test/` default to that
+binary; pass `--tokenizer=PATH` to use another build directory.
 
 ## Tokenizer
 

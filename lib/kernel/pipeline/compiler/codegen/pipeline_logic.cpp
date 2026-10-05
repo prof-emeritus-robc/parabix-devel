@@ -322,6 +322,8 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 
     initializeScalarValues(b);
 
+    initializeStaticRepeatingStreamSets(b);
+
     initializeKernelAssertions(b);
 
     Constant * const unterminated = getTerminationSignal(b, TerminationSignal::None);

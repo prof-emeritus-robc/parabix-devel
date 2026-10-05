@@ -61,9 +61,11 @@ public:
 
     using pattern_t = std::vector<uint64_t>;
 
+    // Only dynamic repeating streamsets are internally generated (their data
+    // is provided at initialization); static ones are compiled in.
     #define RETURN_REPSTREAMSET(...) \
         RepeatingStreamSet * const ss = mDriver.CreateRepeatingStreamSet(__VA_ARGS__); \
-        mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
+        if (ss->isDynamic()) mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
         return ss
 
     RepeatingStreamSet * CreateRepeatingStreamSet(unsigned FieldWidth, pattern_t string, const bool isDynamic = true) {
@@ -85,7 +87,7 @@ public:
 
     #define RETURN_REPSTREAMSET(...) \
         RepeatingStreamSet * const ss = mDriver.CreateUnalignedRepeatingStreamSet(__VA_ARGS__); \
-        mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
+        if (ss->isDynamic()) mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
         return ss
 
     RepeatingStreamSet * CreateUnalignedRepeatingStreamSet(unsigned FieldWidth, pattern_t string, const bool isDynamic = true) {

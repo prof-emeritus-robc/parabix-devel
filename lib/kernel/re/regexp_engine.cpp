@@ -2,6 +2,12 @@
 #include <kernel/core/kernel.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/core/streamset.h>
+#include <kernel/io/source_kernel.h>
+#include <kernel/pipeline/driver/cpudriver.h>
+#include <kernel/pipeline/program_builder.h>
+#include <kernel/scan/scanmatchgen.h>
+#include <kernel/streamutils/sentinel.h>
+#include <re/cc/cc_kernel.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/basis/s2p_kernel.h>
 #include <kernel/bitwise/bixlogic.h>
@@ -767,6 +773,26 @@ void CharClassFillStartsEnds::generatePabloMethod() {
     writeOutputStreamSet("fillStartsEnds", std::vector<PabloAST *>{X, X, X});
 }
 
+void MatchedLinesKernel::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    auto matchResults = getInputStreamSet("matchResults");
+    PabloAST * lineBreaks = pb.createExtract(getInputStreamVar("lineBreaks"), pb.getInteger(0));
+    PabloAST * notLB = pb.createNot(lineBreaks);
+    PabloAST * match_follow = pb.createMatchStar(matchResults.back(), notLB);
+    Var * const matchedLines = getOutputStreamVar("matchedLines");
+    pb.createAssign(pb.createExtract(matchedLines, pb.getInteger(0)), pb.createAnd(match_follow, lineBreaks, "matchedLines"));
+}
+
+MatchedLinesKernel::MatchedLinesKernel (LLVMTypeSystemInterface & ts, StreamSet * Matches, StreamSet * LineBreakStream, StreamSet * MatchedLines)
+: PabloKernel(ts, "MatchedLines" + std::to_string(Matches->getNumElements()),
+// inputs
+{Binding{"matchResults", Matches}
+,Binding{"lineBreaks", LineBreakStream, FixedRate(), Principal()}},
+// output
+{Binding{"matchedLines", MatchedLines}}) {
+
+}
+
 StarChainFixedStep::StarChainFixedStep(LLVMTypeSystemInterface & ts, unsigned length, StreamSet * Fends,
                                        StreamSet * H, StreamSet * result)
 : PabloKernel(ts, "StarChainFixed" + std::to_string(length) + (H ? "_h" : ""),
@@ -834,11 +860,7 @@ void StarLookaheadSpans::generatePabloMethod() {
 }
 
 
-RE * prepareInputRE(RE * re, GrepLinesFunctionType grepCallback) {
-    re = resolveModesAndExternalSymbols(re, grepCallback);
-    re = regular_expression_passes(re);
-    return re;
-}
+
 
 // In byte mode, a variable-length lookahead is compiled by the unique prefix
 // method on UTF-8 code units, which can fail where it succeeds on characters
@@ -857,7 +879,7 @@ struct ByteModeLookaheads : public RE_Validator {
     }
 };
 
-RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
+static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     RE_Mode mode;
     // Determine the unit of length for the RE.  If the RE involves
     // fixed length UTF-8 sequences only, then UTF-8 can be used
@@ -899,6 +921,90 @@ RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
         }
     }
     return mode;
+}
+
+PreparedRE prepareRE(RE * re, const RE_ModeOptions & opts) {
+    PreparedRE prepared;
+    // Property values given by regular expressions are resolved by a search
+    // of the lines of property value names.
+    re = resolveModesAndExternalSymbols(re, matchingLineNumbers);
+    prepared.re = regular_expression_passes(re);
+    prepared.mode = determineREMode(prepared.re, opts);
+    prepared.options = opts;
+    return prepared;
+}
+
+std::pair<int, int> PreparedRE::lengthRange() const {
+    return getLengthRange(re, mode.lengthAlphabet);
+}
+
+bool PreparedRE::endAnchored() const {
+    return hasEndAnchor(re);
+}
+
+unsigned PreparedRE::grepOffset() const {
+    return re::grepOffset(re);
+}
+
+void matchingRecords(PipelineBuilder & P, RE * re, StreamSet * basis, StreamSet * u8index,
+                     StreamSet * breaks, StreamSet * matchStarts, StreamSet * records) {
+    const PreparedRE prepared = prepareRE(re);
+    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, basis, matchStarts, breaks});
+    RE_PB.setU8IndexHint(u8index);
+    StreamSet * const matches = P.CreateStreamSet();
+    RE_PB.matchSearchPipeline(prepared, matches);
+    // A match marks the end of the matched text; move each to its record break
+    // (in the index space of the mode).
+    if (!RE_PB.usesUnicodeIndexing()) {
+        P.CreateKernelCall<MatchedLinesKernel>(matches, breaks, records);
+        return;
+    }
+    StreamSet * const matchedRecords = P.CreateStreamSet();
+    P.CreateKernelCall<MatchedLinesKernel>(matches, RE_PB.getMatchFollows(), matchedRecords);
+    StreamSet * index = u8index;
+    if (prepared.grepOffset() > 0) {
+        index = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<AddSentinel>(u8index, index);
+    }
+    SpreadByMask(P, index, matchedRecords, records);
+}
+
+namespace {
+// The line numbers reported by ScanMatchKernel.
+struct LineNumberCollector {
+    std::vector<uint64_t> lines;
+};
+void collect_line_number(LineNumberCollector * c, const size_t lineNum, char * /*start*/, char * /*end*/) {
+    c->lines.push_back(lineNum);
+}
+void collect_finalize(LineNumberCollector * /*c*/, char * /*end*/) {
+}
+}
+
+std::vector<uint64_t> matchingLineNumbers(RE * pattern, const char * buffer, size_t bufSize) {
+    assert ((((uintptr_t)buffer) % (512 / 8)) == 0);
+    CPUDriver driver("matchingLineNumbers");
+    auto E = CreatePipeline(driver, Input<const char *>{"buffer"}, Input<size_t>{"length"},
+                            Input<LineNumberCollector *>{"collector"});
+    StreamSet * const ByteStream = E.CreateStreamSet(1, 8);
+    E.CreateKernelCall<MemorySourceKernel>(E.getInputScalar(0), E.getInputScalar(1), ByteStream);
+    StreamSet * const BasisBits = E.CreateStreamSet(8);
+    E.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
+    StreamSet * const breaks = E.CreateStreamSet();
+    E.CreateKernelCall<CharacterClassKernelBuilder>(std::vector<re::CC *>{re::makeCC(0x0A, &cc::UTF8)}, BasisBits, breaks);
+    StreamSet * const matchStarts = E.CreateStreamSet(1, 1);
+    E.CreateKernelCall<LineStartsKernel>(breaks, matchStarts);
+    StreamSet * const u8index = E.CreateStreamSet();
+    E.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+    StreamSet * const records = E.CreateStreamSet();
+    matchingRecords(E, pattern, BasisBits, u8index, breaks, matchStarts, records);
+    Kernel * const scanK = E.CreateKernelCall<ScanMatchKernel>(records, breaks, ByteStream, E.getInputScalar(2));
+    E.LinkFunction(scanK, "accumulate_match_wrapper", collect_line_number);
+    E.LinkFunction(scanK, "finalize_match_wrapper", collect_finalize);
+    auto f = E.compile();
+    LineNumberCollector collector;
+    f(buffer, bufSize, &collector);
+    return std::move(collector.lines);
 }
 
 RE_PipelineBuilder::RE_PipelineBuilder(PipelineBuilder & P, RE_context context)
@@ -1257,16 +1363,48 @@ StreamSet * RE_PipelineBuilder::uniquePrefixEndsBack(StreamSet * prefix, StreamS
 }
 
 void RE_PipelineBuilder::matchSearchPipeline(RE * re, StreamSet * results) {
-    ensurePrepared(re);
-    mRE = prepareRE(re);
+    if (mHaveSourceContext) {
+        matchSearchPipeline(::prepareRE(re, mModeOptions), results);
+        return;
+    }
+    // A hand-built RE_CompilerContext: the RE is compiled as given.
+    mRE = applyModePasses(re);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, results);
 }
 
-void RE_PipelineBuilder::matchSpanPipeline(RE * re, StreamSet * matches, StreamSet * spans) {
+void RE_PipelineBuilder::matchSearchPipeline(const PreparedRE & prepared, StreamSet * results) {
+    usePrepared(prepared);
+    RE * re = prepared.re;
     ensurePrepared(re);
-    mRE = prepareRE(re);
+    mRE = applyModePasses(re);
+    mRE = processReferences(mRE);
+    prepareExternals(mRE);
+    mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, results);
+}
+
+void RE_PipelineBuilder::usePrepared(const PreparedRE & prepared) {
+    if (mHaveSourceContext) {
+        mModeOptions = prepared.options;
+        mMode = prepared.mode;
+        mHaveMode = true;
+    }
+}
+
+void RE_PipelineBuilder::matchSpanPipeline(RE * re, StreamSet * matches, StreamSet * spans) {
+    if (mHaveSourceContext) {
+        matchSpanPipeline(::prepareRE(re, mModeOptions), matches, spans);
+        return;
+    }
+    matchSpanPipeline(PreparedRE{re, RE_Mode{nullptr, nullptr}, mModeOptions}, matches, spans);
+}
+
+void RE_PipelineBuilder::matchSpanPipeline(const PreparedRE & prepared, StreamSet * matches, StreamSet * spans) {
+    usePrepared(prepared);
+    RE * re = prepared.re;
+    ensurePrepared(re);
+    mRE = applyModePasses(re);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, matches);
@@ -1571,7 +1709,7 @@ RE * RE_PipelineBuilder::spanFactoring(RE * re) {
     return xfrmedRE;
 }
 
-RE * RE_PipelineBuilder::prepareRE(RE * re) {
+RE * RE_PipelineBuilder::applyModePasses(RE * re) {
     const cc::Alphabet * lengthAlphabet = mCtxt.mLengthAlphabet;
     RE * xfrmedRE = expandPermutes(re);
     xfrmedRE = regular_expression_passes(xfrmedRE, lengthAlphabet);

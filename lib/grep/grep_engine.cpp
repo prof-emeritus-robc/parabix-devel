@@ -257,7 +257,7 @@ bool GrepEngine::matchesToEOLrequired () {
     // may be on the CR of a CRLF.
     if (mGrepRecordBreak == GrepRecordBreakKind::Unicode) return true;
     // If all REs are anchored to EOL already, then we can avoid moving them.
-    if (hasEndAnchor(mRE) && (grepOffset(mRE) > 0)) return false;
+    if (mPreparedRE.endAnchored() && (mPreparedRE.grepOffset() > 0)) return false;
     //
     // Not all REs are anchored.   We can avoid moving matches, if we are
     // in MatchOnly mode (or CountOnly with MaxCount = 1) and no invert match inversion.
@@ -265,12 +265,10 @@ bool GrepEngine::matchesToEOLrequired () {
 }
 
 void GrepEngine::initRE(re::RE * re) {
-    // Ensure that all modes and Unicode properties are resolved, and
-    // the RE is fully simplified before proceeding with RE analysis.
-    mRE = prepareInputRE(re, grep::lineNumGrep);
-
-    // Mode determination (byte / UTF8-indexed / full Unicode) is the regex
-    // engine's job; grep_engine just supplies the reasons specific to it.
+    // The regular expression engine prepares the RE (resolving modes and
+    // Unicode properties, and simplifying it) and determines its mode
+    // (byte / UTF8-indexed / full Unicode); grep_engine just supplies the
+    // reasons specific to it, and uses the prepared RE for its own analysis.
     // Unicode record-break mode always forces full Unicode indexing, just as
     // before. Coloring doesn't force full indexing outright (a fixed-UTF8 RE
     // still gets plain byte mode); it only rules out the cheaper UTF8-indexed
@@ -282,10 +280,12 @@ void GrepEngine::initRE(re::RE * re) {
     opts.unicodeIndexingOverride = UnicodeIndexing;
     opts.unicodeBasisOverride = UnicodeBasisMode || mColoring;
     opts.byteCClimit = ByteCClimit;
-    mMode = determineREMode(mRE, opts);
+    mPreparedRE = prepareRE(re, opts);
+    mRE = mPreparedRE.re;
+    mMode = mPreparedRE.mode;
 
     // Don't attempt colorization with a zero-width RE.
-    if (getLengthRange(mRE, mMode.lengthAlphabet).second == 0) {
+    if (mPreparedRE.lengthRange().second == 0) {
         mColoring = false;
     }
 }
@@ -346,7 +346,7 @@ void GrepEngine::grepPrologue(kernel::PipelineBuilder & P, StreamSet * ByteStrea
 StreamSet * GrepEngine::initialMatches(RE_PipelineBuilder & RE_PB, StreamSet * InputStream) {
     kernel::PipelineBuilder & P = RE_PB.getPipelineBuilder();
     StreamSet * Matches = P.CreateStreamSet();
-    RE_PB.matchSearchPipeline(mRE, Matches);
+    RE_PB.matchSearchPipeline(mPreparedRE, Matches);
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         P.captureBitstream("initial matches", Matches);
     }
@@ -408,10 +408,6 @@ StreamSet * GrepEngine::applyMatchLimit(kernel::PipelineBuilder & P, StreamSet *
 StreamSet * GrepEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * InputStream) {
     grepPrologue(P, InputStream);
     RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, mSource, mMatchStarts, mLineBreakStream});
-    RE_ModeOptions modeOpts;
-    modeOpts.byteCClimit = ByteCClimit;
-    RE_PB.setModeOptions(modeOpts);
-    RE_PB.setMode(mMode);
     if (mU8index) {
         RE_PB.setU8IndexHint(mU8index);
     } else {
@@ -655,10 +651,6 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
 void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * ByteStream) {
     grepPrologue(P, ByteStream);
     RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, mSource, mMatchStarts, mLineBreakStream});
-    RE_ModeOptions modeOpts;
-    modeOpts.byteCClimit = ByteCClimit;
-    RE_PB.setModeOptions(modeOpts);
-    RE_PB.setMode(mMode);
     if (mU8index) {
         RE_PB.setU8IndexHint(mU8index);
     } else {
@@ -669,13 +661,13 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
     StreamSet * MatchSpans = nullptr;
     if (mColoring) {
         MatchSpans = P.CreateStreamSet(1);
-        RE_PB.matchSpanPipeline(mRE, Matches, MatchSpans);
+        RE_PB.matchSpanPipeline(mPreparedRE, Matches, MatchSpans);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             P.captureBitstream("MatchSpans", MatchSpans);
             P.captureBitstream("Matches", Matches);
         }
     } else {
-        RE_PB.matchSearchPipeline(mRE, Matches);
+        RE_PB.matchSearchPipeline(mPreparedRE, Matches);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             P.captureBitstream("Matches", Matches);
         }
@@ -709,7 +701,7 @@ void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * By
         MatchesByLine = ContextByLine;
     } else if (usesUnicodeIndexing) {
         StreamSet * u8index1 = mU8index;
-        if (grepOffset(mRE) > 0) {
+        if (mPreparedRE.grepOffset() > 0) {
             u8index1 = P.CreateStreamSet(1, 1);
             P.CreateKernelCall<AddSentinel>(mU8index, u8index1);
         }
@@ -1109,141 +1101,5 @@ void GrepEngine::DoGrepThreadMethod() {
     }
 }
 
-void matchingRecords(PipelineBuilder & P, re::RE * re, StreamSet * basis, StreamSet * u8index,
-                     StreamSet * breaks, StreamSet * matchStarts, StreamSet * records) {
-    // Link and resolve properties and boundaries as for the main engine; a search
-    // of property value names may itself contain property value patterns.
-    re = prepareInputRE(re, lineNumGrep);
-    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, basis, matchStarts, breaks});
-    RE_PB.setU8IndexHint(u8index);
-    StreamSet * const matches = P.CreateStreamSet();
-    RE_PB.matchSearchPipeline(re, matches);
-    // A match marks the end of the matched text; move each to its record break
-    // (in the index space of the mode).
-    if (!RE_PB.usesUnicodeIndexing()) {
-        P.CreateKernelCall<MatchedLinesKernel>(matches, breaks, records);
-        return;
-    }
-    StreamSet * const matchedRecords = P.CreateStreamSet();
-    P.CreateKernelCall<MatchedLinesKernel>(matches, RE_PB.getMatchFollows(), matchedRecords);
-    StreamSet * index = u8index;
-    if (grepOffset(re) > 0) {
-        index = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<AddSentinel>(u8index, index);
-    }
-    SpreadByMask(P, index, matchedRecords, records);
-}
-
-InternalSearchEngine::InternalSearchEngine(BaseDriver &driver) :
-mGrepRecordBreak(GrepRecordBreakKind::LF),
-mGrepDriver(driver),
-mMainMethod(nullptr) {
-}
-
-void InternalSearchEngine::grepCodeGen(re::RE * matchingRE) {
-
-    re::CC * breakCC = nullptr;
-    if (mGrepRecordBreak == GrepRecordBreakKind::Null) {
-        breakCC = re::makeCC(0x0, &cc::UTF8);
-    } else {// if (mGrepRecordBreak == GrepRecordBreakKind::LF)
-        breakCC = re::makeCC(0x0A, &cc::UTF8);
-    }
-
-    auto E = CreatePipeline(mGrepDriver,
-                            Input<const char*>{"buffer"}, Input<size_t>{"length"},
-                            Input<MatchAccumulator *>{"accumulator"});
-
-    Scalar * const buffer = E.getInputScalar(0);
-    Scalar * const length = E.getInputScalar(1);
-    Scalar * const callbackObject = E.getInputScalar(2);
-    StreamSet * ByteStream = E.CreateStreamSet(1, 8);
-    E.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
-
-    StreamSet * RecordBreakStream = E.CreateStreamSet();
-    StreamSet * BasisBits = E.CreateStreamSet(8);
-    E.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
-    E.CreateKernelCall<CharacterClassKernelBuilder>(std::vector<re::CC *>{breakCC}, BasisBits, RecordBreakStream);
-    StreamSet * matchStarts = E.CreateStreamSet(1, 1);
-    E.CreateKernelCall<LineStartsKernel>(RecordBreakStream, matchStarts);
-
-    StreamSet * u8index = E.CreateStreamSet();
-    E.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-
-    StreamSet * MatchingRecords = E.CreateStreamSet();
-    matchingRecords(E, matchingRE, BasisBits, u8index, RecordBreakStream, matchStarts, MatchingRecords);
-
-    if (MatchCoordinateBlocks > 0) {
-        StreamSet * MatchCoords = E.CreateStreamSet(3, sizeof(size_t) * 8);
-        E.CreateKernelCall<MatchCoordinatesKernel>(MatchingRecords, RecordBreakStream, MatchCoords, MatchCoordinateBlocks);
-        Kernel * const matchK = E.CreateKernelCall<MatchReporter>(ByteStream, MatchCoords, callbackObject);
-        E.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
-        E.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
-    } else {
-        Kernel * const scanMatchK = E.CreateKernelCall<ScanMatchKernel>(MatchingRecords, RecordBreakStream, ByteStream, callbackObject, ScanMatchBlocks);
-        E.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
-        E.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
-    }
-
-    mMainMethod = E.compile();
-}
-
-InternalSearchEngine::InternalSearchEngine(const std::unique_ptr<grep::GrepEngine> & engine)
-    : InternalSearchEngine(engine->mGrepDriver) {}
-
-InternalSearchEngine::~InternalSearchEngine() { }
-
-
-void InternalSearchEngine::doGrep(const char * search_buffer, size_t bufferLength, MatchAccumulator & accum) {
-    assert ((((uintptr_t)search_buffer) % (512 / 8)) == 0);
-    mMainMethod(search_buffer, bufferLength, &accum);
-}
-
-class LineNumberAccumulator : public grep::MatchAccumulator {
-public:
-    LineNumberAccumulator() {}
-    void accumulate_match(const size_t lineNum, char * line_start, char * line_end) override;
-    std::vector<uint64_t> && getAccumulatedLines() { return std::move(mLineNums); }
-private:
-    std::vector<uint64_t> mLineNums;
-};
-
-void LineNumberAccumulator::accumulate_match(const size_t lineNum, char * /* line_start */, char * /* line_end */) {
-    mLineNums.push_back(lineNum);
-}
-
-std::vector<uint64_t> lineNumGrep(re::RE * pattern, const char * buffer, size_t bufSize) {
-    LineNumberAccumulator accum;
-    CPUDriver driver("driver");
-    grep::InternalSearchEngine engine(driver);
-    engine.setRecordBreak(grep::GrepRecordBreakKind::LF);
-    engine.grepCodeGen(pattern);
-    assert ((((uintptr_t)buffer) % (512 / 8)) == 0);
-    engine.doGrep(buffer, bufSize, accum);
-    return accum.getAccumulatedLines();
-}
-
-class MatchOnlyAccumulator : public grep::MatchAccumulator {
-public:
-    MatchOnlyAccumulator() : mFoundMatch(false) {}
-    void accumulate_match(const size_t lineNum, char * line_start, char * line_end) override;
-    bool foundAnyMatches() { return mFoundMatch; }
-private:
-    bool mFoundMatch;
-};
-
-void MatchOnlyAccumulator::accumulate_match(const size_t lineNum, char * /* line_start */, char * /* line_end */) {
-    mFoundMatch = true;
-}
-
-bool matchOnlyGrep(re::RE * pattern, const char * buffer, size_t bufSize) {
-    MatchOnlyAccumulator accum;
-    CPUDriver driver("driver");
-    grep::InternalSearchEngine engine(driver);
-    engine.setRecordBreak(grep::GrepRecordBreakKind::Null);
-    engine.grepCodeGen(pattern);
-    assert ((((uintptr_t)buffer) % (512 / 8)) == 0);
-    engine.doGrep(buffer, bufSize, accum);
-    return accum.foundAnyMatches();
-}
 
 }

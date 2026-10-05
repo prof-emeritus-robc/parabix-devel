@@ -259,7 +259,6 @@ void JSON_Value_Matching(PipelineBuilder & P, JSON_ValueKind val_bitset, StreamS
         i++;
     }
     re::RE * matchRE = re::RE_Parser::parse("^(?:" + matchRegex + ")$");
-    matchRE = prepareInputRE(matchRE);
     RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, BasisBits, fieldStarts, fieldFollows});
     StreamSet * const val_matches = P.CreateStreamSet(1);
     RE_PB.matchSearchPipeline(matchRE, val_matches);
@@ -269,7 +268,6 @@ void JSON_Value_Matching(PipelineBuilder & P, JSON_ValueKind val_bitset, StreamS
 
 void JSON_Value_Quoted(PipelineBuilder & P, StreamSet * BasisBits, StreamSet * fieldStarts, StreamSet * fieldFollows, StreamSet * quoted) {
     re::RE * quotedRE = re::RE_Parser::parse("^\".*\"$");
-    quotedRE = prepareInputRE(quotedRE);
     RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, BasisBits, fieldStarts, fieldFollows});
     StreamSet * const quotedValues = P.CreateStreamSet(1);
     RE_PB.matchSearchPipeline(quotedRE, quotedValues);

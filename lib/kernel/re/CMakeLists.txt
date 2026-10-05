@@ -11,6 +11,8 @@ SRC
 DEPS
     kernel.pipeline
     kernel.basis
+    kernel.io
+    kernel.scan
     kernel.bitwise
     kernel.streamutils
     kernel.unicode

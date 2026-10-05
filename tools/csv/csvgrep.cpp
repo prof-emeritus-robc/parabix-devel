@@ -54,7 +54,7 @@ static cl::opt<bool> FieldMatch("field-match", cl::desc("require that entire fie
 static cl::alias FieldMatchA("x", cl::desc("Alias for --field-match"), cl::aliasopt(FieldMatch), cl::cat(csv::CSV_Options), cl::NotHidden);
 
 re::RE * csvRE(re::RE * re) {
-    re::RE * xfrmedRE = resolveModesAndExternalSymbols(re, grep::lineNumGrep);
+    re::RE * xfrmedRE = resolveModesAndExternalSymbols(re, matchingLineNumbers);
     xfrmedRE = csv::DoubleQuoteEscape(csv::QuoteChar).transformRE(xfrmedRE);
     if (FieldMatch) {
         xfrmedRE = re::makeSeq({re::makeStart(), xfrmedRE, re::makeEnd()});
@@ -121,7 +121,6 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     UTF_Encoder u8_encoder(8);
 
     re::RE * searchRE = csvRE(re::RE_Parser::parse(Regex));
-    searchRE = prepareInputRE(searchRE, grep::lineNumGrep);
 
     StreamSet * u8index = nullptr;
 
@@ -131,8 +130,8 @@ CSVFunctionType generatePipeline(CPUDriver & driver, const std::vector<unsigned>
     // CSV-specific reasons to require the full 21-bit Unicode basis: a
     // multi-byte delimiter/quote character structurally needs codepoint
     // granularity for the CSV parser itself, and -u21 is an explicit user
-    // override. Whether the RE itself needs more than plain byte mode is now
-    // the regex engine's own call (determineREMode), not csvgrep's.
+    // override. Whether the RE itself needs more than plain byte mode is
+    // the regex engine's own call, not csvgrep's.
     const cc::Alphabet * sourceEncoding = &cc::UTF8;
     if ((DQ_u8bytes > 1) || (Delim_u8bytes > 1) || U21) {
         u8index = P.CreateStreamSet(1, 1);

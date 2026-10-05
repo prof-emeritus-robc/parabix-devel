@@ -74,17 +74,35 @@ struct RE_Mode {
     const cc::Alphabet * indexAlphabet;   // &cc::UTF8 or &cc::Unicode
 };
 
-// Pure analysis, no StreamSets touched.
-RE_Mode determineREMode(re::RE * re, const RE_ModeOptions & opts);
+//
+// The first step of the regular expression engine: the RE as parsed is
+// prepared (modes and external symbols resolved -- escapes, properties,
+// including property values given by regular expressions, case folding,
+// grapheme mode -- and the RE passes), and the mode for compiling it is
+// determined (see RE_Mode), given the client's options.  Clients that need
+// to know about the prepared RE before building a pipeline (for example, its
+// length range) prepare it with prepareRE and pass the result to the
+// pipeline methods; otherwise the pipeline methods prepare it themselves.
+//
+struct PreparedRE {
+    re::RE * re = nullptr;
+    RE_Mode mode{nullptr, nullptr};
+    RE_ModeOptions options;
+    // The range of match lengths, in the mode's length alphabet.
+    std::pair<int, int> lengthRange() const;
+    // Must every match end at the end anchor $?
+    bool endAnchored() const;
+    // The offset of the match positions after the last matched character
+    // (see re::grepOffset).
+    unsigned grepOffset() const;
+};
 
-// Common RE input preparation (mode resolution + name/property resolution,
-// case folding, and general simplification), shared by every client of the
-// regex engine -- whether it goes on to use the auto-determining RE_context
-// path or builds an RE_CompilerContext by hand. grepCallback supports
-// recursive regular expressions (a property value that is itself resolved by
-// running a line-oriented grep over text); pass nullptr where that isn't
-// needed.
-re::RE * prepareInputRE(re::RE * re, re::GrepLinesFunctionType grepCallback = nullptr);
+PreparedRE prepareRE(re::RE * re, const RE_ModeOptions & opts = RE_ModeOptions{});
+
+// The numbers (from 0) of the lines of a buffer that contain a match to an
+// RE (as parsed).  This resolves property values given by regular
+// expressions, as a search over the lines of the property value names.
+std::vector<uint64_t> matchingLineNumbers(re::RE * pattern, const char * buffer, size_t bufSize);
 
 class RE_CompilerContext {
     friend class RE_Kernel;
@@ -377,6 +395,37 @@ private:
     const bool mHasBreaks;
 };
 
+//
+// The region follows (e.g. line breaks) of the regions that contain a match,
+// given the matches (each marked at or after the end of the match, within
+// its region).
+//
+namespace kernel {
+class MatchedLinesKernel : public pablo::PabloKernel {
+public:
+    MatchedLinesKernel(LLVMTypeSystemInterface & ts, StreamSet * OriginalMatches, StreamSet * LineBreakStream, StreamSet * Matches);
+protected:
+    void generatePabloMethod() override;
+};
+}
+
+//
+// The records of a buffer that contain a match to an RE (as parsed), marked
+// at their record breaks, for searches of records (e.g. lines) internal to
+// clients.  The RE is compiled by the regular expression engine in the mode
+// that it chooses; results of full Unicode indexing are spread back to code
+// unit positions.
+//   basis: the UTF-8 basis bits of the buffer.
+//   u8index: the final UTF-8 code units of the characters.
+//   breaks: the record breaks.
+//   matchStarts: the starts of the records (LineStartsKernel of breaks).
+//   records: the output, a bit at each break of a matching record.
+//
+void matchingRecords(kernel::PipelineBuilder & P, re::RE * re,
+                     kernel::StreamSet * basis, kernel::StreamSet * u8index,
+                     kernel::StreamSet * breaks, kernel::StreamSet * matchStarts,
+                     kernel::StreamSet * records);
+
 class RE_PipelineBuilder {
 public:
     RE_PipelineBuilder(kernel::PipelineBuilder & P, RE_CompilerContext & ctxt) :
@@ -391,8 +440,8 @@ public:
     RE_PipelineBuilder(kernel::PipelineBuilder & P, RE_context context);
 
     // Only meaningful for the RE_context constructor.
+    // The options used when the pipeline methods prepare the RE themselves.
     void setModeOptions(const RE_ModeOptions & opts) {mModeOptions = opts;}
-    void setMode(const RE_Mode & mode) {mMode = mode; mHaveMode = true;}
     void setLineBreakStream(kernel::StreamSet * lb) {mLineBreakHint = lb;}
     void setU8IndexHint(kernel::StreamSet * idx) {mU8IndexHint = idx;}
 
@@ -401,15 +450,22 @@ public:
     kernel::StreamSet * getMatchStarts() const {return mFinalMatchStarts;}
     kernel::StreamSet * getMatchFollows() const {return mFinalMatchFollows;}
 
+    // With the RE_context constructor, an RE as parsed is first prepared
+    // (prepareRE); with a hand-built RE_CompilerContext, the RE is compiled
+    // as given.
     void matchSearchPipeline(re::RE * re, kernel::StreamSet * results);
     void matchSpanPipeline(re::RE * re, kernel::StreamSet * matches, kernel::StreamSet * spans);
+    void matchSearchPipeline(const PreparedRE & re, kernel::StreamSet * results);
+    void matchSpanPipeline(const PreparedRE & re, kernel::StreamSet * matches, kernel::StreamSet * spans);
     kernel::PipelineBuilder & getPipelineBuilder() {return mPB;}
 
 protected:
     // Internal methods.
     void addExternal(std::string extName, ExternalStream s);
 
-    re::RE * prepareRE(re::RE * re);
+    // The mode-specific steps for a prepared RE (expandPermutes, the RE passes
+    // for the mode's length alphabet, externals, toUTF8, LookAheadNamer...).
+    re::RE * applyModePasses(re::RE * re);
 
     re::RE * spanFactoring(re::RE * re);
 
@@ -480,6 +536,9 @@ protected:
     // preceding position of P or of an end.  Marked at a match of P, it
     // identifies those that begin matches of the RE.
     kernel::StreamSet * uniquePrefixEndsBack(kernel::StreamSet * prefix, kernel::StreamSet * ends);
+
+    // Use the mode and options of a prepared RE.
+    void usePrepared(const PreparedRE & prepared);
 
     // Mode determination + source preparation, run once before compiling.
     void ensurePrepared(re::RE *& re);

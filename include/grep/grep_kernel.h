@@ -6,6 +6,7 @@
 
 #include <pablo/pablo.h>
 #include <kernel/pipeline/program_builder.h>
+#include <kernel/re/regexp_engine.h>   // MatchedLinesKernel
 
 namespace IDISA { class IDISA_Builder; }
 namespace cc { class Alphabet; }
@@ -13,13 +14,6 @@ namespace re { class CC; class RE; }
 namespace grep { class GrepEngine; }
 
 namespace kernel {
-
-class MatchedLinesKernel : public pablo::PabloKernel {
-public:
-    MatchedLinesKernel(LLVMTypeSystemInterface & ts, StreamSet * OriginalMatches, StreamSet * LineBreakStream, StreamSet * Matches);
-protected:
-    void generatePabloMethod() override;
-};
 
 class InvertMatchesKernel : public BlockOrientedKernel {
 public:

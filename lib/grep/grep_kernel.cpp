@@ -63,26 +63,6 @@ unsigned round_up_to_blocksize(int lgth) {
 }
 
 
-void MatchedLinesKernel::generatePabloMethod() {
-    PabloBuilder pb(getEntryScope());
-    auto matchResults = getInputStreamSet("matchResults");
-    PabloAST * lineBreaks = pb.createExtract(getInputStreamVar("lineBreaks"), pb.getInteger(0));
-    PabloAST * notLB = pb.createNot(lineBreaks);
-    PabloAST * match_follow = pb.createMatchStar(matchResults.back(), notLB);
-    Var * const matchedLines = getOutputStreamVar("matchedLines");
-    pb.createAssign(pb.createExtract(matchedLines, pb.getInteger(0)), pb.createAnd(match_follow, lineBreaks, "matchedLines"));
-}
-
-MatchedLinesKernel::MatchedLinesKernel (LLVMTypeSystemInterface & ts, StreamSet * Matches, StreamSet * LineBreakStream, StreamSet * MatchedLines)
-: PabloKernel(ts, "MatchedLines" + std::to_string(Matches->getNumElements()),
-// inputs
-{Binding{"matchResults", Matches}
-,Binding{"lineBreaks", LineBreakStream, FixedRate(), Principal()}},
-// output
-{Binding{"matchedLines", MatchedLines}}) {
-
-}
-
 void InvertMatchesKernel::generateDoBlockMethod(KernelBuilder & b) {
     Value * input = b.loadInputStreamBlock("matchedLines", b.getInt32(0));
     Value * lbs = b.loadInputStreamBlock("lineBreaks", b.getInt32(0));

@@ -18,6 +18,7 @@
 #include <re/transforms/name_lookaheads.h>
 #include <re/toolchain/toolchain.h>
 #include <re/printer/re_printer.h>
+#include <set>
 
 namespace pablo { class PabloAST; }
 namespace pablo { class Var; }
@@ -528,7 +529,29 @@ Marker RE_Block_Compiler::compileIntersect(Intersect * const x, Marker marker) {
     UnsupportedRE("Unsupported Intersect operands: " + Printer_RE::PrintRE(x));
 }
 
+// The alphabets of the CCs of an RE (including those of names defined as CCs).
+static void collectAlphabets(RE * re, std::set<const cc::Alphabet *> & alphabets) {
+    if (CC * cc = dyn_cast<CC>(re)) {
+        alphabets.insert(cc->getAlphabet());
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        if (n->getDefinition()) collectAlphabets(n->getDefinition(), alphabets);
+    } else if (Seq * s = dyn_cast<Seq>(re)) {
+        for (RE * e : *s) collectAlphabets(e, alphabets);
+    } else if (Alt * a = dyn_cast<Alt>(re)) {
+        for (RE * e : *a) collectAlphabets(e, alphabets);
+    } else if (Rep * r = dyn_cast<Rep>(re)) {
+        collectAlphabets(r->getRE(), alphabets);
+    }
+}
+
 bool CharacteristicSubexpressionAnalysis(RE * repeated, RE * &E1, RE * &C, RE * &E2) {
+    // The search for occurrences of C compares CCs, which is meaningful only
+    // within one alphabet (e.g. not between a Unicode CC, the definition of a
+    // name for a CC of characters of several UTF-8 lengths, and UTF-8 code
+    // unit CCs).
+    std::set<const cc::Alphabet *> alphabets;
+    collectAlphabets(repeated, alphabets);
+    if (alphabets.size() > 1) return false;
     if (isa<CC>(repeated)) {
         E1 = makeSeq();
         E2 = makeSeq();

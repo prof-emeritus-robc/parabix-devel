@@ -62,7 +62,10 @@ RE * RE_Parser::parse(const std::string & regular_expression, ModeFlagSet initia
     }
     parser->fByteMode = ByteMode;
     parser->fModeFlagSet = initialFlags;
-    if (re::IgnoreCaseFlag) {
+    // (-i applies to search patterns, not to the file name patterns of
+    // --include/--exclude and .gitignore files.)
+    parser->fIgnoreCase = re::IgnoreCaseFlag && (syntax != RE_Syntax::GrepGLOB) && (syntax != RE_Syntax::GitGLOB);
+    if (parser->fIgnoreCase) {
         // parse_RE wraps the result in a case-insensitive group; the mode flag
         // must agree so that (?-i) and (?-i:...) register as changes.
         parser->fModeFlagSet |= CASE_INSENSITIVE_MODE_FLAG;
@@ -89,7 +92,7 @@ RE * RE_Parser::makeBranchResetGroup(RE * r) {
 
 RE * RE_Parser::parse_RE() {
     RE * top_level_result = parse_alt();
-    if (re::IgnoreCaseFlag) {
+    if (fIgnoreCase) {
         top_level_result =
             Group::Create(Group::Mode::CaseInsensitiveMode, top_level_result, Group::Sense::On);
     }

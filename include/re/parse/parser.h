@@ -245,6 +245,7 @@ protected:
     bool                        fByteMode;
     ModeFlagSet                 fModeFlagSet;
     bool                        fNested;
+    bool                        fIgnoreCase = false;    // -i applies (set by parse)
     unsigned                    mGroupsOpen;
     Cursor                      mCursor;
     unsigned                    mCaptureGroupCount;

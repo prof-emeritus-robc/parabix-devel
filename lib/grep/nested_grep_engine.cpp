@@ -55,12 +55,13 @@ protected:
 NestedInternalSearchEngine::NestedInternalSearchEngine(BaseDriver & driver)
 : mGrepRecordBreak(GrepRecordBreakKind::LF)
 , mGrepDriver(driver)
-, mNested(1, nullptr) {
+, mNested(1, nullptr)
+, mIsFilter(1, false) {
 
 
 }
 
-void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
+void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool filter) {
     // If we have no patterns and this is the "root" pattern,
     // we'll still need an empty gitignore kernel even if it
     // just returns the record break stream for input.
@@ -96,14 +97,27 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
     assert (mNested.size() > 0 && mNested[0] == nullptr);
     assert (mNested.size() == 1 || mNested[1] != nullptr);
+    assert (mIsFilter.size() == mNested.size());
 
     Kernel * kernel = nullptr;
 
+    // The level whose selection this level modifies: the nearest enclosing
+    // level that is not a filter (none, for a filter level).
+    Kernel * enclosing = nullptr;
+    if (!filter) {
+        for (size_t k = mNested.size() - 1; k > 0; --k) {
+            if (!mIsFilter[k]) {
+                enclosing = mNested[k];
+                break;
+            }
+        }
+    }
+
     if (LLVM_UNLIKELY(patterns.empty())) {
 
-        if (LLVM_LIKELY(mNested.size() > 1)) {
+        if (LLVM_LIKELY(enclosing != nullptr)) {
             // Reuse the enclosing level's kernel, bound to this pipeline's streams.
-            kernel = mNested.back(); assert (kernel);
+            kernel = enclosing;
             assert (kernel->getNumOfStreamInputs() == 3);
             kernel->setInputStreamSetAt(0, basisBits);
             kernel->setInputStreamSetAt(1, U8index);
@@ -129,7 +143,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
         const auto n = patterns.size();
         assert (n > 0);
 
-        Kernel * const outerKernel = mNested.back();
+        Kernel * const outerKernel = enclosing;
         StreamSet * resultSoFar = breaks;
         if (outerKernel) {
             Kernel * const chained = E.AddKernelFamilyCall(outerKernel);
@@ -153,8 +167,9 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
                 MatchResults = E.CreateStreamSet();
             }
             // check if we need to combine the current result with the new set of matches
+            // (a filter level starts from no records, others from all records)
             const bool exclude = (patterns[i].first == re::PatternKind::Exclude);
-            if (i || outerKernel || exclude) {
+            if (i || outerKernel || exclude || !filter) {
                 StreamSet * const matchedRecords = E.CreateStreamSet();
                 matchingRecords(E, patterns[i].second, basisBits, U8index, breaks, matchStarts, matchedRecords);
                 if (exclude) {
@@ -181,19 +196,37 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
     P.AddKernelFamilyCall(kernel);
 
+    // Restrict the selection to the records selected by the filter levels.
+    StreamSet * selected = matches;
+    for (size_t k = 1; k < mNested.size(); ++k) {
+        if (!mIsFilter[k]) continue;
+        Kernel * const f = mNested[k];
+        assert (f->getNumOfStreamInputs() == 3);
+        StreamSet * const filtered = P.CreateStreamSet();
+        f->setInputStreamSetAt(0, basisBits);
+        f->setInputStreamSetAt(1, U8index);
+        f->setInputStreamSetAt(2, breaks);
+        f->setOutputStreamSetAt(0, filtered);
+        P.AddKernelFamilyCall(f);
+        StreamSet * const combined = P.CreateStreamSet();
+        AndCombine(P, selected, filtered, combined);
+        selected = combined;
+    }
+
     if (MatchCoordinateBlocks > 0) {
         StreamSet * const MatchCoords = P.CreateStreamSet(3, sizeof(size_t) * 8);
-        P.CreateKernelCall<MatchCoordinatesKernel>(matches, breaks, MatchCoords, MatchCoordinateBlocks);
+        P.CreateKernelCall<MatchCoordinatesKernel>(selected, breaks, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = P.CreateKernelCall<MatchReporter>(byteStream, MatchCoords, accumulator);
         P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
         P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
-        Kernel * const scanMatchK = P.CreateKernelCall<ScanMatchKernel>(matches, breaks, byteStream, accumulator, ScanMatchBlocks);
+        Kernel * const scanMatchK = P.CreateKernelCall<ScanMatchKernel>(selected, breaks, byteStream, accumulator, ScanMatchBlocks);
         P.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
         P.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mNested.push_back(kernel);
+    mIsFilter.push_back(filter);
 
     mMainMethod.push_back(P.compile());
     assert (mMainMethod.size() + 1 == mNested.size());
@@ -204,6 +237,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 void NestedInternalSearchEngine::pop() {
     assert (mNested.size() > 1);
     mNested.pop_back();
+    mIsFilter.pop_back();
     assert (mMainMethod.size() > 0);
     mMainMethod.pop_back();
     assert (mMainMethod.size() + 1 == mNested.size());

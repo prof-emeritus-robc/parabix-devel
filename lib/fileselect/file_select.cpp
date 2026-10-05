@@ -421,7 +421,9 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
     pathSelectEngine.setRecordBreak(grep::GrepRecordBreakKind::Null);
     // The command line names are selected first, then the names found while
     // recursing, with their own patterns (see getIncludeExcludePatterns).
-    pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(true), GitREcoalescing));
+    // These levels are filters: .gitignore patterns (pushed for each
+    // directory with such a file) cannot override them.
+    pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(true), GitREcoalescing), true);
 
     const auto commandLineFileCandidates = fileCandidates.getCandidateCount();
     if (commandLineFileCandidates > 0) {
@@ -445,7 +447,7 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
         directoryAccum.setFullPathEntries(commandLineDirCandidates);
         pathSelectEngine.doGrep(dirCandidates.data(), dirCandidates.size(), directoryAccum);
         pathSelectEngine.pop();
-        pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), GitREcoalescing));
+        pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), GitREcoalescing), true);
         // Select files from subdirectories using the recursive process.
         for (const auto & dirpath : selectedDirectories) {
             recursiveFileSelect(driver, dirpath, pathSelectEngine, collectedPaths);

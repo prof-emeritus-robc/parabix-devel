@@ -43,6 +43,11 @@ private:
 
     Marker compile(RE * re);
     Marker compile(RE * re, Marker initialMarkers);
+    // The matches of an RE starting at every position (in the given position
+    // convention), compiled in the entry scope (see compileEverywhere).
+    Marker compileEverywhere(RE * re, RE_Compiler::Marker::Position p);
+    // The same, for a sequence of items, each processed in turn.
+    Marker compileEverywhere(const std::vector<RE *> & items, RE_Compiler::Marker::Position p);
 
     Marker compileName(Name * name, Marker marker);
     Marker compileAny(Marker marker);
@@ -83,7 +88,33 @@ private:
 using Position = RE_Compiler::Marker::Position;
 
 inline Marker RE_Block_Compiler::compile(RE * const re) {
-    return process(re, Marker(mPB.createOnes(), Position::AtNextCodeUnit));
+    return compileEverywhere(re, Position::AtNextCodeUnit);
+}
+
+//
+//  Matches that start everywhere do not depend on the current marker, so they
+//  are compiled in the entry scope.  Within an If scope on the marker, the
+//  carries of their computation (e.g. Advances over the code units of a
+//  character crossing a block boundary) would be lost in blocks where the
+//  marker is empty.  (Their compilation is outside any enclosing star.)
+//
+Marker RE_Block_Compiler::compileEverywhere(RE * const re, Position p) {
+    return compileEverywhere(std::vector<RE *>{re}, p);
+}
+
+Marker RE_Block_Compiler::compileEverywhere(const std::vector<RE *> & items, Position p) {
+    PabloBuilder entry(mMain.mEntryScope);
+    RE_Block_Compiler entryCompiler(mMain, entry);
+    const int starDepth = mMain.mStarDepth;
+    PabloAST * const whileTest = mMain.mWhileTest;
+    mMain.mStarDepth = 0;
+    Marker m(entry.createOnes(), p);
+    for (RE * re : items) {
+        m = entryCompiler.process(re, m);
+    }
+    mMain.mStarDepth = starDepth;
+    mMain.mWhileTest = whileTest;
+    return m;
 }
 
 inline Marker RE_Block_Compiler::compile(RE * const re, Marker initialMarkers) {
@@ -190,7 +221,7 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
             // at the final byte of the code unit sequence.  We compile the
             // definition and align the marker based on the final position of
             // the compiled code unit sequence sequence.
-            auto nameMarker = compile(defn, Marker(mPB.createOnes(), Position::AtNextChar));
+            auto nameMarker = compileEverywhere(defn, Position::AtNextChar);
             PabloAST * nextPos = marker.stream();
             if (marker.position() == Position::AtEnd) {
                 nextPos = mPB.createIndexedAdvance(nextPos, mMain.mIndexStream, 1);
@@ -347,12 +378,12 @@ unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, c
 }
 
 Marker RE_Block_Compiler::compileCodeUnitCharacter(Seq::const_iterator current, unsigned span, Marker marker) {
-    // Match the character's code units wherever they occur, then keep the
-    // occurrences whose final code unit is at the marker.
-    Marker charEnd(mPB.createOnes(), Marker::Position::AtNextChar);
-    for (unsigned i = 0; i < span; ++i) {
-        charEnd = process(*current++, charEnd);
-    }
+    // Match the character's code units wherever they occur (see
+    // compileEverywhere), then keep the occurrences whose final code unit is
+    // at the marker.
+    // (The units are processed one by one: as a sequence, they would be
+    // recognized as this character again.)
+    Marker charEnd = compileEverywhere(std::vector<RE *>(current, current + span), Marker::Position::AtNextChar);
     assert (charEnd.position() == Marker::Position::AtEnd);
     return Marker(mPB.createAnd(marker.stream(), charEnd.stream(), "aligned"), Marker::Position::AtEnd);
 }

@@ -394,8 +394,11 @@ void FixedMatchSpansKernel::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
     PabloAST * marks = pb.createExtract(getInputStreamVar("MatchMarks"), pb.getInteger(0));
     Var * matchSpansVar = getOutputStreamVar("MatchSpans");
+    // (Named for the illustrator: "fms<length>_...".)
+    const std::string tag = "fms" + std::to_string(mMatchLength) + "_";
+    marks = pb.createAnd(marks, pb.createOnes(), tag + "marks");
     // starts of all the matches
-    PabloAST * starts = pb.createLookahead(marks, mMatchLength + mOffset - 1);
+    PabloAST * starts = pb.createLookahead(marks, mMatchLength + mOffset - 1, tag + "starts");
     // now find all consecutive positions within mMatchLength of any start.
     unsigned consecutiveCount = 1;
     PabloAST * consecutive = starts;
@@ -403,12 +406,12 @@ void FixedMatchSpansKernel::generatePabloMethod() {
         consecutiveCount += i;
         consecutive = pb.createOr(consecutive,
                                   pb.createAdvance(consecutive, i),
-                                  "consecutive" + std::to_string(consecutiveCount));
+                                  tag + "consecutive" + std::to_string(consecutiveCount));
     }
     if (consecutiveCount < mMatchLength) {
         consecutive = pb.createOr(consecutive,
                                   pb.createAdvance(consecutive, mMatchLength - consecutiveCount),
-                                  "consecutive" + std::to_string(mMatchLength));
+                                  tag + "consecutive" + std::to_string(mMatchLength));
     }
     pb.createAssign(pb.createExtract(matchSpansVar, 0), consecutive);
 }

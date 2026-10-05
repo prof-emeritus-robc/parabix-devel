@@ -234,15 +234,34 @@ private:
 //
 class StringClassKernel : public pablo::PabloKernel {
 public:
+    // With the region follows (the position after each match region),
+    // occurrences that include a region follow are excluded.
     StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
-                      kernel::StreamSet * basis, kernel::StreamSet * fillStartsEnds);
+                      kernel::StreamSet * basis, kernel::StreamSet * fillStartsEnds,
+                      kernel::StreamSet * follows = nullptr);
     bool hasSignature() const override { return true; }
     llvm::StringRef getSignature() const override { return mSignature; }
 protected:
     void generatePabloMethod() override;
 private:
     const std::vector<std::vector<re::CC *>> mStrings;
+    const bool mHasFollows;
     const std::string mSignature;
+};
+
+//
+// The fill, starts and ends (see StringClassKernel) of the string class of
+// the one-character strings of a class X, given its stream: X itself,
+// excluding the region follows.
+//
+class CharClassFillStartsEnds : public pablo::PabloKernel {
+public:
+    CharClassFillStartsEnds(LLVMTypeSystemInterface & ts, kernel::StreamSet * X, kernel::StreamSet * follows,
+                            kernel::StreamSet * fillStartsEnds);
+protected:
+    void generatePabloMethod() override;
+private:
+    const bool mHasFollows;
 };
 
 //
@@ -293,6 +312,57 @@ protected:
     void generatePabloMethod() override;
 private:
     const std::vector<bool> mNegated;
+    const bool mHasFollows;
+};
+
+//
+// The coverage of the matches of a lookahead chain (as parsed for match
+// spans, see RE_PipelineBuilder::chainSpans): every position within some
+// match.  From the starts of the matches, the segments are followed forward,
+// each from its entries (the positions where it begins on the way to a
+// complete match) to the entries of the next segment, which are where the
+// rest of the chain holds (the stream H of the next segment):
+//   - a fixed segment of length k covers each entry and the k - 1 positions
+//     after it, and the next entries are k positions after;
+//   - a star of a class covers the run of the class from each entry, and
+//     the next entry is the end of the run (the rest holds only there);
+//   - a star of a string class covers the positions reached from entries
+//     that are starts of occurrences, up to the last end of an occurrence
+//     followed by a position of H in the run of fill (see
+//     StringClassStarSpans), and the next entries are the reached positions
+//     after ends of occurrences where H holds (and the entries themselves
+//     where H holds, with no lower bound);
+//   - the end of the text and final lookaheads are zero-width.
+// Final stars (of a class, or a string class with no lower bound) follow:
+// each covers its runs from the entries, and every position it reaches is
+// an entry of the next.  Runs exclude the region follows.
+//
+class ChainCoverage : public pablo::PabloKernel {
+public:
+    // Segment kinds: 'f' fixed (length), 's' class star, 'c' string-class
+    // star (lower bound), 'z' zero-width.
+    struct Step {
+        char kind;
+        unsigned n;     // fixed: the length; star: the lower bound
+        kernel::StreamSet * Hnext;
+        kernel::StreamSet * cls;
+        kernel::StreamSet * fse;
+        kernel::StreamSet * index;
+        kernel::StreamSet * goodNext;
+    };
+    // A final star: 's' of a class (its stream), 'c' of a string class
+    // (fill, starts and ends).
+    struct Final {
+        char kind;
+        kernel::StreamSet * strm;
+    };
+    ChainCoverage(LLVMTypeSystemInterface & ts, kernel::StreamSet * starts, std::vector<Step> steps,
+                  std::vector<Final> finals, kernel::StreamSet * follows, kernel::StreamSet * coverage);
+protected:
+    void generatePabloMethod() override;
+private:
+    const std::vector<Step> mSteps;
+    const std::vector<Final> mFinals;
     const bool mHasFollows;
 };
 
@@ -367,8 +437,43 @@ protected:
     };
     MatchStarts matchStartPipeline(re::RE * re);
 
-    // The starts of the matches of a lookahead chain (offset 1).
-    kernel::StreamSet * chainMatchStarts(const std::vector<re::LookaheadSegment> & segments);
+    // The streams used for a segment of a lookahead chain by chainMatchStarts,
+    // as needed for the coverage of its matches (see ChainCoverage).
+    struct ChainStepStreams {
+        kernel::StreamSet * Hnext = nullptr;    // where the rest of the chain holds
+        kernel::StreamSet * cls = nullptr;      // class star: the class
+        kernel::StreamSet * fse = nullptr;      // string-class star: fill, starts, ends
+        kernel::StreamSet * index = nullptr;    // string-class star: see StringClassStarIndex
+        kernel::StreamSet * goodNext = nullptr;
+    };
+
+    // The starts of the matches of a lookahead chain (offset 1), recording
+    // the streams of each segment if steps is given.  Hend marks where the
+    // rest after the chain holds (nullptr for all positions).
+    kernel::StreamSet * chainMatchStarts(const std::vector<re::LookaheadSegment> & segments,
+                                         std::vector<ChainStepStreams> * steps = nullptr,
+                                         kernel::StreamSet * Hend = nullptr);
+
+    // The spans of the matches of an RE that is a chain (with no star
+    // segment required), possibly followed by final stars, each of a class
+    // or of a string class (with a lower bound of 1 only for the first; the
+    // chain may then be empty).  Returns false if the RE is not of this
+    // form, or positions are not code units.
+    bool chainSpans(re::RE * re, kernel::StreamSet * spans);
+
+    // The spans of the matches of an RE with a unique prefix (see
+    // ParseUniquePrefix), from each match of the prefix that begins a match
+    // to the longest end before the next (LongestSpan).  Returns false if
+    // the RE has no unique prefix.
+    bool uniquePrefixSpans(re::RE * re, kernel::StreamSet * spans);
+
+    // The basis bits of the code units (transposed from a byte stream if
+    // needed), for CC kernels.
+    kernel::StreamSet * codeUnitBasis();
+
+    // The stream of a character class, given as the RE re (which may be the
+    // name of an external, whose stream is then used).
+    kernel::StreamSet * classStream(re::RE * re, re::CC * cc);
 
     // For the matches of an RE Seq[P, S] with a named unique prefix P (see
     // matchStartPipeline), marked at their ends: the ends shifted back to the
@@ -383,7 +488,6 @@ private:
     kernel::PipelineBuilder & mPB;
     RE_CompilerContext mCtxt;
     re::RE * mRE;
-    re::UniquePrefixNamer mUPnamer;
 
     bool mHaveSourceContext;
     RE_context mSourceContext;
@@ -397,6 +501,7 @@ private:
     kernel::StreamSet * mU8Index;
     kernel::StreamSet * mFinalMatchStarts;
     kernel::StreamSet * mFinalMatchFollows;
+    kernel::StreamSet * mCodeUnitBasis = nullptr;
 };
 
 //

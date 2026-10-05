@@ -72,8 +72,13 @@ struct LookaheadSegment {
 // Y or not of Y, and at the end of the text if all are negative.
 // A star segment may also be (s1|s2|...){lb,} (lb <= 1) for a class of strings
 // (sequences of character classes) satisfying isRepeatableStringClass, with
-// no condition on the rest of the body.
-bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments);
+// no condition on the rest of the body; a star of a class that is not
+// disjoint from the rest is such a star, of the one-character strings of
+// the class (preceded by a fixed segment, for a lower bound above 1).
+// With requireStar false, a chain need not have a star segment (for the
+// coverage of match spans).
+bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments,
+                         bool requireStar = true);
 
 // Can the lookahead body be split by ParseUniquePrefix?  The unique prefix
 // method is used for such a body, in preference to a lookahead chain.

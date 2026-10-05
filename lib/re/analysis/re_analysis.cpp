@@ -758,7 +758,8 @@ bool isRepeatableStringClass(const std::vector<std::vector<CC *>> & strings) {
     return true;
 }
 
-bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments) {
+bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments,
+                         bool requireStar) {
     segments.clear();
     std::vector<RE *> elems;
     flattenSeq(body, elems);
@@ -835,19 +836,26 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
         }
         fixed.push_back(e);
     }
-    if (!closeFixed() || !hasStar || segments.back().star) return false;
-    // From the right, each star class (other than a string class) must be
-    // disjoint from the characters that can begin the rest of the body.  (Runs end before the end of the
-    // text anyway, so the end segment allows any star class.)
+    if (!closeFixed() || (requireStar && !hasStar) || segments.back().star) return false;
+    // From the right, each star class is disjoint from the characters that
+    // can begin the rest of the body, so that its runs are maximal.  (Runs end
+    // before the end of the text anyway, so the end segment allows any star
+    // class.)  A star of a class X that is not disjoint is a star of the
+    // string class of the one-character strings of X, which requires no
+    // disjointness (the rest may hold at any end of an occurrence): X{lb,} is
+    // then X{lb-1} X+ for lb > 1.
     CC * restFirst = nullptr;
+    std::vector<size_t> extended;   // the converted stars with lb > 1
     for (auto i = segments.rbegin(); i != segments.rend(); ++i) {
         if (i->end) {
             restFirst = i->cc ? i->cc : makeCC();
         } else if (i->star) {
             if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
-            // (A string class requires no disjointness: the rest may hold at
-            // any end of an occurrence.)
-            if (i->strings.empty() && !intersectCC(i->cc, restFirst)->empty()) return false;
+            if (i->strings.empty() && !intersectCC(i->cc, restFirst)->empty()) {
+                i->strings = {{i->cc}};
+                i->first = i->cc;
+                if (i->lb > 1) extended.push_back(segments.rend() - i - 1);
+            }
             if (i->lb == 0) {
                 restFirst = makeCC(i->first ? i->first : i->cc, restFirst);
             } else {
@@ -857,6 +865,17 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
             restFirst = firstCharClass(i->re);
             if (restFirst == nullptr) return false;
         }
+    }
+    // Insert the fixed X{lb-1} before each converted X{lb,} (from the right,
+    // so that the recorded positions remain valid).
+    for (size_t k : extended) {
+        LookaheadSegment & seg = segments[k];
+        RE * const fixedRE = makeRep(seg.re, seg.lb - 1, seg.lb - 1);
+        const auto range = getLengthRange(fixedRE, lengthAlpha);
+        if (range.first != range.second) return false;
+        LookaheadSegment fixedSeg{false, false, nullptr, fixedRE, 0, range.first};
+        seg.lb = 1;
+        segments.insert(segments.begin() + k, fixedSeg);
     }
     return true;
 }

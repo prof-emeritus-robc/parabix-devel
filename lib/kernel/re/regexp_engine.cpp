@@ -7,6 +7,7 @@
 #include <kernel/bitwise/bixlogic.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
+#include <kernel/streamutils/stream_select.h>
 #include <kernel/streamutils/stream_shift.h>
 #include <kernel/streamutils/streams_merge.h>
 #include <kernel/unicode/boundary_kernels.h>
@@ -33,6 +34,7 @@
 #include <re/transforms/name_lookaheads.h>
 #include <re/transforms/reference_transform.h>
 #include <re/transforms/remove_nullable.h>
+#include <re/transforms/variable_alt_promotion.h>
 #include <re/unicode/boundaries.h>
 #include <re/unicode/resolve_properties.h>
 #include <re/cc/cc_compiler.h>         // for CC_Compiler
@@ -478,12 +480,19 @@ static std::string stringClassSignature(const std::vector<std::vector<re::CC *>>
 }
 
 StringClassKernel::StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
-                                     StreamSet * basis, StreamSet * fillStartsEnds)
-: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis)),
-              {Binding{"basis", basis, FixedRate(1), LookAhead(maxStringLength(strings) - 1)}},
+                                     StreamSet * basis, StreamSet * fillStartsEnds, StreamSet * follows)
+: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis) + (follows ? "_f" : "")),
+              [&] {
+                  const unsigned la = maxStringLength(strings) - 1;
+                  Bindings inputs;
+                  inputs.emplace_back("basis", basis, FixedRate(1), LookAhead(la));
+                  if (follows) inputs.emplace_back("follows", follows, FixedRate(1), LookAhead(la));
+                  return inputs;
+              }(),
               {Binding{"fillStartsEnds", fillStartsEnds}}),
   mStrings(std::move(strings)),
-  mSignature(stringClassSignature(mStrings, basis)) {
+  mHasFollows(follows != nullptr),
+  mSignature(stringClassSignature(mStrings, basis) + (follows ? "_f" : "")) {
 }
 
 void StringClassKernel::generatePabloMethod() {
@@ -497,6 +506,17 @@ void StringClassKernel::generatePabloMethod() {
         for (PabloAST * b : basis) ahead.push_back(v == 0 ? b : pb.createLookahead(b, v));
         compilers.emplace_back(std::make_unique<cc::Parabix_CC_Compiler>(ahead));
     }
+    // The positions with no region follow within the next v + 1 positions.
+    std::vector<PabloAST *> followFree;
+    if (mHasFollows) {
+        PabloAST * const follows = getInputStreamSet("follows")[0];
+        PabloAST * any = follows;
+        followFree.push_back(pb.createNot(any));
+        for (unsigned v = 1; v < L; ++v) {
+            any = pb.createOr(any, pb.createLookahead(follows, v));
+            followFree.push_back(pb.createNot(any));
+        }
+    }
     // The start positions of the strings, by length.
     std::map<unsigned, PabloAST *> startsByLength;
     PabloAST * allStarts = pb.createZeroes();
@@ -504,6 +524,9 @@ void StringClassKernel::generatePabloMethod() {
         PabloAST * start = pb.createInFile(pb.createOnes());
         for (unsigned k = 0; k < str.size(); ++k) {
             start = pb.createAnd(start, compilers[k]->compileCC(str[k], pb));
+        }
+        if (mHasFollows) {
+            start = pb.createAnd(start, followFree[str.size() - 1]);
         }
         const unsigned M = static_cast<unsigned>(str.size());
         auto f = startsByLength.find(M);
@@ -621,6 +644,127 @@ void ChainAssertionEnd::generatePabloMethod() {
         H = allNegated ? pb.createOr(H, follows) : pb.createAnd(H, pb.createNot(follows));
     }
     writeOutputStreamSet("H", std::vector<PabloAST *>{H});
+}
+
+static std::string chainCoverageName(const std::vector<ChainCoverage::Step> & steps,
+                                     const std::vector<ChainCoverage::Final> & finals, bool follows) {
+    std::string name = "ChainCoverage_";
+    for (const auto & st : steps) {
+        name += st.kind + std::to_string(st.n) + (st.Hnext ? "h" : "") + "_";
+    }
+    if (!finals.empty()) {
+        name += "final";
+        for (const auto & f : finals) name += f.kind;
+    }
+    return name + (follows ? "_f" : "");
+}
+
+ChainCoverage::ChainCoverage(LLVMTypeSystemInterface & ts, StreamSet * starts, std::vector<Step> steps,
+                             std::vector<Final> finals, StreamSet * follows, StreamSet * coverage)
+: PabloKernel(ts, chainCoverageName(steps, finals, follows != nullptr),
+              [&] {
+                  Bindings inputs;
+                  inputs.emplace_back("starts", starts);
+                  for (unsigned i = 0; i < steps.size(); ++i) {
+                      const std::string k = std::to_string(i);
+                      const Step & st = steps[i];
+                      if (st.Hnext) inputs.emplace_back("H" + k, st.Hnext);
+                      if (st.kind == 's') inputs.emplace_back("cls" + k, st.cls);
+                      if (st.kind == 'c') {
+                          inputs.emplace_back("fse" + k, st.fse);
+                          inputs.emplace_back("index" + k, st.index);
+                          inputs.emplace_back("goodNext" + k, st.goodNext);
+                      }
+                  }
+                  for (unsigned i = 0; i < finals.size(); ++i) {
+                      inputs.emplace_back("final" + std::to_string(i), finals[i].strm);
+                  }
+                  if (follows) inputs.emplace_back("follows", follows);
+                  return inputs;
+              }(),
+              {Binding{"coverage", coverage}}),
+  mSteps(std::move(steps)), mFinals(std::move(finals)), mHasFollows(follows != nullptr) {
+}
+
+void ChainCoverage::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * const notFollow = mHasFollows ? pb.createNot(getInputStreamSet("follows")[0]) : pb.createOnes();
+    PabloAST * E = getInputStreamSet("starts")[0];    // the entries of the current segment
+    PabloAST * cover = pb.createZeroes();
+    for (unsigned i = 0; i < mSteps.size(); ++i) {
+        const std::string k = std::to_string(i);
+        const Step & st = mSteps[i];
+        PabloAST * const H = st.Hnext ? getInputStreamSet("H" + k)[0] : nullptr;
+        if (st.kind == 'f') {
+            PabloAST * shifted = E;
+            for (unsigned j = 0; j < st.n; ++j) {
+                cover = pb.createOr(cover, shifted);
+                shifted = pb.createAdvance(shifted, 1);
+            }
+            E = H ? pb.createAnd(shifted, H) : shifted;
+        } else if (st.kind == 's') {
+            PabloAST * const B = pb.createAnd(getInputStreamSet("cls" + k)[0], notFollow);
+            PabloAST * const reach = pb.createMatchStar(E, B);
+            cover = pb.createOr(cover, pb.createAnd(reach, B));
+            E = pb.createAnd(reach, pb.createNot(B));
+            if (H) E = pb.createAnd(E, H);
+        } else if (st.kind == 'c') {
+            const std::vector<PabloAST *> fse = getInputStreamSet("fse" + k);
+            PabloAST * const fill = pb.createAnd(fse[0], notFollow);
+            PabloAST * const reach = pb.createMatchStar(pb.createAnd(E, fse[1]), fill);
+            // The positions with an end of an occurrence followed by H after
+            // them in the run (see StringClassStarSpans).
+            PabloAST * const notIndex = pb.createNot(getInputStreamSet("index" + k)[0]);
+            PabloAST * const goodNext = getInputStreamSet("goodNext" + k)[0];
+            PabloAST * const following = pb.createMatchStar(pb.createAdvance(goodNext, 1), notIndex);
+            PabloAST * const beforeGood = pb.createOr(goodNext, pb.createAnd(following, notIndex));
+            cover = pb.createOr(cover, pb.createAnd(pb.createAnd(reach, fill), beforeGood));
+            PabloAST * next = pb.createAnd(reach, pb.createAdvance(fse[2], 1));
+            if (st.n == 0) next = pb.createOr(next, E);
+            E = H ? pb.createAnd(next, H) : next;
+        }
+        // 'z': zero-width, the entries are unchanged.
+    }
+    // The final stars: each covers its runs from the entries, and every
+    // position it reaches is an entry of the next.
+    for (unsigned i = 0; i < mFinals.size(); ++i) {
+        const std::string name = "final" + std::to_string(i);
+        if (mFinals[i].kind == 's') {
+            PabloAST * const B = pb.createAnd(getInputStreamSet(name)[0], notFollow);
+            PabloAST * const reach = pb.createMatchStar(E, B);
+            cover = pb.createOr(cover, pb.createAnd(reach, B));
+            E = reach;
+        } else {
+            const std::vector<PabloAST *> fse = getInputStreamSet(name);
+            PabloAST * const fill = pb.createAnd(fse[0], notFollow);
+            PabloAST * const reach = pb.createMatchStar(pb.createAnd(E, fse[1]), fill);
+            cover = pb.createOr(cover, pb.createAnd(reach, fill));
+            E = pb.createOr(E, pb.createAnd(reach, pb.createAdvance(fse[2], 1)));
+        }
+    }
+    writeOutputStreamSet("coverage", std::vector<PabloAST *>{cover});
+}
+
+CharClassFillStartsEnds::CharClassFillStartsEnds(LLVMTypeSystemInterface & ts, StreamSet * X, StreamSet * follows,
+                                                 StreamSet * fillStartsEnds)
+: PabloKernel(ts, std::string("CharClassFillStartsEnds") + (follows ? "_f" : ""),
+              [&] {
+                  Bindings inputs;
+                  inputs.emplace_back("X", X);
+                  if (follows) inputs.emplace_back("follows", follows);
+                  return inputs;
+              }(),
+              {Binding{"fillStartsEnds", fillStartsEnds}}),
+  mHasFollows(follows != nullptr) {
+}
+
+void CharClassFillStartsEnds::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * X = getInputStreamSet("X")[0];
+    if (mHasFollows) {
+        X = pb.createAnd(X, pb.createNot(getInputStreamSet("follows")[0]));
+    }
+    writeOutputStreamSet("fillStartsEnds", std::vector<PabloAST *>{X, X, X});
 }
 
 StarChainFixedStep::StarChainFixedStep(LLVMTypeSystemInterface & ts, unsigned length, StreamSet * Fends,
@@ -1017,9 +1161,13 @@ RE_PipelineBuilder::MatchStarts RE_PipelineBuilder::matchStartPipeline(RE * re) 
 // marks the first character after each position where the rest of the chain
 // holds; for the whole chain, these are the starts of its matches.
 //
-StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegment> & segments) {
-    StreamSet * H = nullptr;  // all positions, for the empty rest of the chain
+StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegment> & segments,
+                                                  std::vector<ChainStepStreams> * steps, StreamSet * Hend) {
+    if (steps) steps->assign(segments.size(), ChainStepStreams{});
+    StreamSet * H = Hend;  // where the rest after the chain holds (nullptr: all positions)
     for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
+        ChainStepStreams * const step = steps ? &(*steps)[segments.rend() - seg - 1] : nullptr;
+        if (step) step->Hnext = H;
         if (seg->end && !seg->assertions.empty()) {
             // Final one-character lookaheads (see ChainAssertionEnd).
             std::vector<StreamSet *> classes;
@@ -1054,7 +1202,14 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
         if (!seg->strings.empty()) {
             // A string class (see StringClassStarIndex).
             StreamSet * const fillStartsEnds = mPB.CreateStreamSet(3);
-            mPB.CreateKernelCall<StringClassKernel>(seg->strings, mCtxt.mCodeUnitStream, fillStartsEnds);
+            if ((seg->strings.size() == 1) && (seg->strings[0].size() == 1)) {
+                // A class X (of one-character strings): fill, starts and ends
+                // are all X, which may already be an external.
+                StreamSet * const X = classStream(seg->re, seg->cc);
+                mPB.CreateKernelCall<CharClassFillStartsEnds>(X, mCtxt.mMatchFollows, fillStartsEnds);
+            } else {
+                mPB.CreateKernelCall<StringClassKernel>(seg->strings, codeUnitBasis(), fillStartsEnds, mCtxt.mMatchFollows);
+            }
             StreamSet * const index = mPB.CreateStreamSet(1);
             StreamSet * const good = mPB.CreateStreamSet(1);
             mPB.CreateKernelCall<StringClassStarIndex>(fillStartsEnds, H, mCtxt.mMatchFollows, index, good);
@@ -1062,6 +1217,11 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
             mPB.CreateKernelCall<IndexedShiftBack>(index, good, goodNext);
             StreamSet * const result = mPB.CreateStreamSet(1);
             mPB.CreateKernelCall<StringClassStarSpans>(seg->lb, fillStartsEnds, H, index, goodNext, result);
+            if (step) {
+                step->fse = fillStartsEnds;
+                step->index = index;
+                step->goodNext = goodNext;
+            }
             if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
                 mPB.captureBixNum("scFSE", fillStartsEnds);
                 mPB.captureBitstream("scH", H);
@@ -1073,19 +1233,8 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
             H = result;
             continue;
         }
-        // The class may already be an external (e.g. from
-        // VariableLengthCCNamer), whose kernel must then be the one used.
-        StreamSet * Bstrm = nullptr;
-        if (Name * const Bname = dyn_cast<Name>(seg->re)) {
-            auto f = mCtxt.mExternals.find(Bname->getFullName());
-            if (f != mCtxt.mExternals.end()) {
-                Bstrm = f->second.extStream;
-            }
-        }
-        if (Bstrm == nullptr) {
-            Bstrm = mPB.CreateStreamSet(1);
-            mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{seg->cc}, mCtxt.mCodeUnitStream, Bstrm);
-        }
+        StreamSet * const Bstrm = classStream(seg->re, seg->cc);
+        if (step) step->cls = Bstrm;
         StreamSet * const index = mPB.CreateStreamSet(1);
         mPB.CreateKernelCall<StarLookaheadIndex>(Bstrm, mCtxt.mMatchFollows, index);
         StreamSet * const runStarts = mPB.CreateStreamSet(1);
@@ -1119,11 +1268,13 @@ void RE_PipelineBuilder::matchSpanPipeline(RE * re, StreamSet * matches, StreamS
     ensurePrepared(re);
     mRE = prepareRE(re);
     mRE = processReferences(mRE);
-    mRE = spanFactoring(mRE);
     prepareExternals(mRE);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, matches);
-    auto subsetRE = emptyMatchElimination(mRE);
-    getSpan(subsetRE, spans);
+    // The spans are the union of the extents of the nonempty matches,
+    // computed for the alternatives of a factored form of the RE.
+    RE * const spanRE = spanFactoring(mRE);
+    prepareExternals(spanRE);
+    getSpan(spanRE, spans);
 }
 
 void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
@@ -1148,30 +1299,16 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
         auto minlgth = f->second.lgthRange.first;
         auto endOffset = f->second.offset;
         //llvm::errs() << "endOffset: " << endOffset << "\n";
-        auto f2 = mUPnamer.mNameMap.find(name);
-        if (f2 != mUPnamer.mNameMap.end()) {
-            auto namedRE = f2->second;
-            re::Name * prefixName = cast<re::Name>(cast<re::Seq>(namedRE)->front());
-            std::string prefixStr = prefixName->getFullName();
-            auto fp = mCtxt.mExternals.find(prefixStr);
-            assert(fp != mCtxt.mExternals.end());
-            auto pfxStrm = fp->second.extStream;
-            auto pfxLgth = fp->second.lgthRange.first;
-            auto pfxOffset = fp->second.offset;
-            StreamSet * endBack = uniquePrefixEndsBack(pfxStrm, matchEnd);
-            if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
-                mPB.captureBitstream("pfxStrm", pfxStrm);
-                mPB.captureBitstream("endBack", endBack);
-            }
-            mPB.CreateKernelCall<LongestSpan>(pfxLgth + pfxOffset - 1, endOffset, pfxStrm, endBack, matchEnd, spans);
-        } else {
-            mPB.CreateKernelCall<FixedMatchSpansKernel>(minlgth, endOffset, matchEnd, spans);
-        }
+        mPB.CreateKernelCall<FixedMatchSpansKernel>(minlgth, endOffset, matchEnd, spans);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             auto spanName = name + "Span";
             mPB.captureBitstream(spanName, spans);
         }
-    } else {
+    } else if (chainSpans(re, spans)) {
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBitstream("chainSpans", spans);
+        }
+    } else if (!uniquePrefixSpans(re, spans)) {
         StreamSet * matchEnd = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, matchEnd);
         auto minlgth = getLengthRange(re, mCtxt.mLengthAlphabet).first;
@@ -1184,11 +1321,251 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
     }
 }
 
+StreamSet * RE_PipelineBuilder::codeUnitBasis() {
+    if (mCodeUnitBasis == nullptr) {
+        mCodeUnitBasis = mCtxt.mCodeUnitStream;
+        if (mCodeUnitBasis->getNumElements() == 1) {
+            mCodeUnitBasis = mPB.CreateStreamSet(8, 1);
+            Selected_S2P(mPB, mCtxt.mCodeUnitStream, mCodeUnitBasis);
+        }
+    }
+    return mCodeUnitBasis;
+}
+
+StreamSet * RE_PipelineBuilder::classStream(RE * re, CC * cc) {
+    // The class may already be an external (e.g. a property), whose kernel
+    // must then be the one used.
+    if (Name * const n = dyn_cast<Name>(re)) {
+        auto f = mCtxt.mExternals.find(n->getFullName());
+        if (f != mCtxt.mExternals.end()) return f->second.extStream;
+    }
+    StreamSet * const strm = mPB.CreateStreamSet(1);
+    mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{cc}, codeUnitBasis(), strm);
+    return strm;
+}
+
+bool RE_PipelineBuilder::uniquePrefixSpans(RE * re, StreamSet * spans) {
+    RE * prefix, * suffix;
+    std::tie(prefix, suffix) = ParseUniquePrefix(re);
+    if (isEmptySeq(prefix) || isEmptySeq(suffix)) return false;
+    Name * const pfxName = makeUniquePrefixName(prefix);
+    compileExternal(pfxName);
+    auto fp = mCtxt.mExternals.find(pfxName->getFullName());
+    assert(fp != mCtxt.mExternals.end());
+    StreamSet * const pfxStrm = fp->second.extStream;
+    const auto pfxLgth = fp->second.lgthRange.first;
+    const auto pfxOffset = fp->second.offset;
+    RE * const split = makeSeq({pfxName, suffix});
+    StreamSet * const matchEnd = mPB.CreateStreamSet(1);
+    mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, split, matchEnd);
+    StreamSet * const endBack = uniquePrefixEndsBack(pfxStrm, matchEnd);
+    if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+        mPB.captureBitstream("pfxStrm", pfxStrm);
+        mPB.captureBitstream("endBack", endBack);
+    }
+    mPB.CreateKernelCall<LongestSpan>(pfxLgth + pfxOffset - 1, grepOffset(split), pfxStrm, endBack, matchEnd, spans);
+    return true;
+}
+
+bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
+    // Chains are compiled with one position per code unit.
+    if (mCtxt.mIndexStream != nullptr) return false;
+    std::vector<RE *> elems;
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        elems.assign(seq->begin(), seq->end());
+    } else {
+        elems.push_back(re);
+    }
+    if (elems.empty()) return false;
+    // Final stars, each of a class or of a string class: a final X{lb,} of a
+    // class with lb > 0 is X{lb} followed by X*, where X{lb} ends the chain;
+    // a string class with lb = 1 must be the first final star, and the
+    // chain then ends where an occurrence begins.  (Kernels are created only
+    // once the form is known.)
+    struct Final {
+        char kind;
+        RE * re;
+        CC * cc;
+        std::vector<std::vector<CC *>> strings;
+    };
+    std::vector<Final> finals;   // from the right
+    bool occurrenceRequired = false;
+    while (!elems.empty()) {
+        Rep * const rep = dyn_cast<Rep>(elems.back());
+        if ((rep == nullptr) || (rep->getUB() != Rep::UNBOUNDED_REP)) break;
+        RE * const X = rep->getRE();
+        const int lb = rep->getLB();
+        Final f{0, X, nullptr, {}};
+        if ((f.cc = resolveCharClass(X))) {
+            f.kind = 's';
+            elems.pop_back();
+            finals.push_back(f);
+            if (lb > 0) {
+                elems.push_back(makeRep(X, lb, lb));
+                break;
+            }
+        } else if ((lb <= 1) && parseStringClass(X, f.strings) && isRepeatableStringClass(f.strings)) {
+            f.kind = 'c';
+            elems.pop_back();
+            finals.push_back(f);
+            // With lb = 1, an occurrence must begin where the chain ends.
+            if (lb == 1) {
+                occurrenceRequired = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    std::vector<LookaheadSegment> segments;
+    if (elems.empty()) {
+        if (!occurrenceRequired) return false;
+    } else {
+        // When an occurrence of the first final string class is required,
+        // the chain is parsed as followed by a lookahead to the first
+        // characters of the strings (so that a star at its end is checked
+        // against them), which is then replaced by the starts of the
+        // occurrences (Hend, below).
+        if (occurrenceRequired) {
+            CC * first = nullptr;
+            for (const auto & str : finals.back().strings) first = first ? makeCC(first, str[0]) : str[0];
+            elems.push_back(makeLookAheadAssertion(first));
+        }
+        if (!parseLookaheadChain(makeSeq(elems.begin(), elems.end()), mCtxt.mLengthAlphabet, segments, false)) {
+            return false;
+        }
+        if (occurrenceRequired) segments.pop_back();
+        if (segments.empty()) return false;
+    }
+    std::vector<ChainCoverage::Final> finalSteps;
+    for (auto f = finals.rbegin(); f != finals.rend(); ++f) {
+        StreamSet * strm = nullptr;
+        if (f->kind == 's') {
+            strm = classStream(f->re, f->cc);
+        } else {
+            strm = mPB.CreateStreamSet(3);
+            mPB.CreateKernelCall<StringClassKernel>(f->strings, codeUnitBasis(), strm, mCtxt.mMatchFollows);
+        }
+        finalSteps.push_back(ChainCoverage::Final{f->kind, strm});
+    }
+    // The starts of the occurrences of the first final star, if one is required.
+    StreamSet * Hend = nullptr;
+    if (occurrenceRequired) {
+        Hend = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<StreamSelect>(Hend, Select(finalSteps.front().strm, {1}));
+    }
+    std::vector<ChainStepStreams> rec;
+    StreamSet * const starts = segments.empty() ? Hend : chainMatchStarts(segments, &rec, Hend);
+    std::vector<ChainCoverage::Step> steps;
+    for (unsigned i = 0; i < segments.size(); ++i) {
+        const LookaheadSegment & seg = segments[i];
+        ChainCoverage::Step step{'z', 0, rec[i].Hnext, rec[i].cls, rec[i].fse, rec[i].index, rec[i].goodNext};
+        if (seg.end) {
+            step.kind = 'z';
+        } else if (!seg.star) {
+            step.kind = 'f';
+            step.n = static_cast<unsigned>(seg.length);
+        } else {
+            step.kind = seg.strings.empty() ? 's' : 'c';
+            step.n = static_cast<unsigned>(seg.lb);
+        }
+        steps.push_back(step);
+    }
+    mPB.CreateKernelCall<ChainCoverage>(starts, steps, finalSteps, mCtxt.mMatchFollows, spans);
+    return true;
+}
+
+namespace {
+// Expand each bounded repetition X{m,n} with a small range (m < n) into the
+// alternation of X{m}, ..., X{n}, where X{k} is written out as k copies of
+// X if X has a variable length (so that its alternations may be promoted).
+// For such an X, X{m,} (1 < m <= 4) is written out as m - 1 copies of X
+// followed by X+.
+class BoundedRepExpander final : public RE_Transformer {
+public:
+    BoundedRepExpander(const cc::Alphabet * lengthAlphabet) : RE_Transformer("BoundedRepExpander"),
+        mAlphabet(lengthAlphabet) {}
+protected:
+    RE * transformRep(Rep * rep) override {
+        RE * const x = transform(rep->getRE());
+        const int lb = rep->getLB();
+        const int ub = rep->getUB();
+        const auto range = getLengthRange(x, mAlphabet);
+        if ((ub == Rep::UNBOUNDED_REP) && (lb >= 2) && (lb <= 4) && (range.first != range.second)) {
+            // X{lb,} is lb - 1 copies of X followed by X+.
+            std::vector<RE *> seq(lb - 1, x);
+            seq.push_back(makeRep(x, 1, Rep::UNBOUNDED_REP));
+            return makeSeq(seq.begin(), seq.end());
+        }
+        if ((ub == Rep::UNBOUNDED_REP) || (ub > 4) || ((lb != ub) && (ub - lb > 3))) {
+            return (x == rep->getRE()) ? rep : makeRep(x, lb, ub);
+        }
+        auto copies = [&](int k) -> RE * {
+            if (range.first == range.second) return makeRep(x, k, k);
+            std::vector<RE *> seq(k, x);
+            return makeSeq(seq.begin(), seq.end());
+        };
+        if (lb == ub) {
+            return copies(lb);
+        }
+        std::vector<RE *> alts;
+        for (int k = lb; k <= ub; ++k) alts.push_back(copies(k));
+        return makeAlt(alts.begin(), alts.end());
+    }
+    RE * transformAssertion(Assertion * a) override {
+        return a;
+    }
+private:
+    const cc::Alphabet * mAlphabet;
+};
+}
+
+namespace {
+// Replace the names of the given externals by their definitions.
+class ExternalDefinitionSubstitution final : public RE_Transformer {
+public:
+    ExternalDefinitionSubstitution(const ExternalNameMap & externals, ExternalStreamKind kind)
+    : RE_Transformer("ExternalDefinitionSubstitution"), mExternals(externals), mKind(kind) {}
+protected:
+    RE * transformName(Name * n) override {
+        auto f = mExternals.find(n->getFullName());
+        if ((f != mExternals.end()) && (f->second.kind == mKind) && n->getDefinition()) {
+            return transform(n->getDefinition());
+        }
+        return n;
+    }
+private:
+    const ExternalNameMap & mExternals;
+    const ExternalStreamKind mKind;
+};
+}
+
 RE * RE_PipelineBuilder::spanFactoring(RE * re) {
+    // The repetitions of string classes (named by StringClassRepNamer for the
+    // matches) are factored as written: their spans are computed by chainSpans.
+    re = ExternalDefinitionSubstitution(mCtxt.mExternals, ExternalStreamKind::StringClassRep).transformRE(re);
+    // The empty matches are eliminated, and variable-length alternations
+    // (including small bounded repetitions) are promoted to the top level,
+    // so that the alternatives are fixed-length, have a unique prefix or
+    // are chains (see chainSpans), within a limit on their number.
+    // (Promotion distributes the alternations directly within sequences; it
+    // is repeated for those it exposes.)
+    RE * const nonempty = emptyMatchElimination(re);
+    const size_t limit = 32;
+    auto alternatives = [](RE * r) -> size_t {
+        if (const Alt * alt = dyn_cast<Alt>(r)) return alt->size();
+        return 1;
+    };
+    RE * promoted = BoundedRepExpander(mCtxt.mLengthAlphabet).transformRE(nonempty);
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        RE * const next = variableAltPromotion(promoted, mCtxt.mLengthAlphabet);
+        if ((next == promoted) || (alternatives(next) > limit)) break;
+        promoted = next;
+    }
+    promoted = emptyMatchElimination(promoted);
+    if (alternatives(promoted) > limit) promoted = nonempty;
     re::FixedSpanNamer FLnamer(mCtxt.mCodeUnitAlphabet);
-    RE * xfrmedRE = FLnamer.transformRE(re);
-    xfrmedRE = mUPnamer.transformRE(xfrmedRE);
-    xfrmedRE = zeroBoundElimination(xfrmedRE);
+    RE * xfrmedRE = FLnamer.transformRE(promoted);
     //re::Repeated_CC_Seq_Namer RCCSnamer;
     //xfrmedRE = mRCCSnamer.transformRE(xfrmedRE);
     return xfrmedRE;
@@ -1230,14 +1607,9 @@ RE * RE_PipelineBuilder::prepareRE(RE * re) {
     {
         re::StringClassRepNamer SCnamer(mCtxt.mCodeUnitAlphabet);
         xfrmedRE = SCnamer.transformRE(xfrmedRE);
-        StreamSet * basis = mCtxt.mCodeUnitStream;
         for (auto & m : SCnamer.mStrings) {
-            if (basis->getNumElements() == 1) {
-                basis = mPB.CreateStreamSet(8, 1);
-                Selected_S2P(mPB, mCtxt.mCodeUnitStream, basis);
-            }
             StreamSet * fillStartsEnds = mPB.CreateStreamSet(3);
-            mPB.CreateKernelCall<StringClassKernel>(m.second, basis, fillStartsEnds);
+            mPB.CreateKernelCall<StringClassKernel>(m.second, codeUnitBasis(), fillStartsEnds);
             addExternal(m.first, ExternalStream{ExternalStreamKind::StringClassRep, 0, {0, 0}, fillStartsEnds});
         }
     }

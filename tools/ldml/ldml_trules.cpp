@@ -39,6 +39,13 @@
 //      counts and the distinct after contexts of each class.  With the
 //      SHOW_BODIES environment variable set, the prepared lookahead bodies of
 //      unsupported after contexts are printed to stderr.
+//  ldml_trules [--xml] [--quiet] --classify-rules file ...
+//      Classify the conversion rules (forward and backward, as extracted
+//      forward rules) by the length of the text to replace (0, 1, 2,
+//      fixed > 2, variable), the number of captures, the order of the
+//      references to the captures in the result, and the revisiting status
+//      of the result (cursor).  Report the counts for each, and the combined
+//      classes with an example of each (listing each rule unless --quiet).
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 
@@ -50,11 +57,14 @@
 #include <re/transforms/re_transformer.h>
 #include <re/unicode/regex_passes.h>
 #include <re/printer/re_printer.h>
+#include <algorithm>
+#include <climits>
 #include <cstring>
 #include <map>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <tuple>
 
 using namespace ldml;
 
@@ -1018,6 +1028,220 @@ static void classifyAfterContexts(const std::vector<std::string> & tRules, const
     }
 }
 
+//
+// Classification of conversion rules (forward and backward, as extracted
+// forward rules) by the length of the text to replace, the number of
+// captures, the order of the references to the captures in the result, and
+// the revisiting status of the result (its cursor).
+//
+
+// Variables inlined, with the text boundary marker as the empty string (it
+// matches no character).
+class InlineVariablesAndBoundary final : public re::RE_Transformer {
+public:
+    InlineVariablesAndBoundary() : RE_Transformer("InlineVariablesAndBoundary") {}
+protected:
+    re::RE * transformName(re::Name * n) override {
+        if (isTextBoundary(n)) return re::makeSeq();
+        if (isFunctionCall(n) || (n->getDefinition() == nullptr)) return n;
+        return transform(n->getDefinition());
+    }
+    // Empty sets match nothing: [$] is Alt{CC{}, End}, of length 0.
+    re::RE * transformAlt(re::Alt * alt) override {
+        std::vector<re::RE *> elems;
+        for (re::RE * e : *alt) {
+            re::RE * const e1 = transform(e);
+            const re::CC * const cc = llvm::dyn_cast<re::CC>(e1);
+            if ((cc == nullptr) || !cc->empty()) elems.push_back(e1);
+        }
+        return re::makeAlt(elems.begin(), elems.end());
+    }
+};
+
+static std::string classifyTextLength(re::RE * text) {
+    const auto range = re::getLengthRange(InlineVariablesAndBoundary().transformRE(text), &cc::Unicode);
+    if (range.first == range.second) {
+        if (range.first <= 2) return std::to_string(range.first) + (range.first == 0 ? " (insertion)" : "");
+        return "fixed >2";
+    }
+    return range.second == INT_MAX ? "variable (unbounded)" : "variable (bounded)";
+}
+
+static void collectCaptures(re::RE * r, std::vector<re::Capture *> & found) {
+    using namespace re;
+    if (r == nullptr) return;
+    if (Capture * c = llvm::dyn_cast<Capture>(r)) {
+        found.push_back(c);
+        collectCaptures(c->getCapturedRE(), found);
+    } else if (Seq * s = llvm::dyn_cast<Seq>(r)) {
+        for (RE * e : *s) collectCaptures(e, found);
+    } else if (Alt * alt = llvm::dyn_cast<Alt>(r)) {
+        for (RE * e : *alt) collectCaptures(e, found);
+    } else if (Rep * rep = llvm::dyn_cast<Rep>(r)) {
+        collectCaptures(rep->getRE(), found);
+    } else if (Group * g = llvm::dyn_cast<Group>(r)) {
+        collectCaptures(g->getRE(), found);
+    } else if (Assertion * a = llvm::dyn_cast<Assertion>(r)) {
+        collectCaptures(a->getAsserted(), found);
+    }
+}
+
+// The references of a result in order, noting those within function calls.
+static void collectReferences(re::RE * r, std::vector<re::Reference *> & found, bool & inFunction, bool withinCall = false) {
+    using namespace re;
+    if (Reference * ref = llvm::dyn_cast<Reference>(r)) {
+        found.push_back(ref);
+        inFunction |= withinCall;
+    } else if (Seq * s = llvm::dyn_cast<Seq>(r)) {
+        for (RE * e : *s) collectReferences(e, found, inFunction, withinCall);
+    } else if (Alt * alt = llvm::dyn_cast<Alt>(r)) {
+        for (RE * e : *alt) collectReferences(e, found, inFunction, withinCall);
+    } else if (Name * n = llvm::dyn_cast<Name>(r)) {
+        if (isFunctionCall(n) && n->getDefinition()) collectReferences(n->getDefinition(), found, inFunction, true);
+    }
+}
+
+static std::string classifyCaptureCount(size_t n) {
+    return n >= 3 ? "3+" : std::to_string(n);
+}
+
+static std::string classifyCaptureOrder(const std::vector<re::Capture *> & captures, re::RE * result) {
+    if (captures.empty()) return "no captures";
+    std::vector<re::Reference *> refs;
+    bool inFunction = false;
+    collectReferences(result, refs, inFunction);
+    if (refs.empty()) return "unreferenced";
+    std::vector<unsigned> order;
+    for (re::Reference * r : refs) order.push_back(std::stoul(r->getName()));
+    bool increasing = true;
+    for (size_t i = 1; i < order.size(); i++) increasing &= order[i - 1] < order[i];
+    std::vector<unsigned> distinct(order);
+    std::sort(distinct.begin(), distinct.end());
+    const bool repeated = std::adjacent_find(distinct.begin(), distinct.end()) != distinct.end();
+    distinct.erase(std::unique(distinct.begin(), distinct.end()), distinct.end());
+    std::string c = repeated ? "repeated" : (increasing ? "in order" : "reordered");
+    if (distinct.size() < captures.size()) c += ", partial";
+    if (inFunction) c += ", in function call";
+    return c;
+}
+
+static std::string classifyRevisit(const RuleSide * result) {
+    const bool revisit = !llvm::cast<re::Seq>(result->getResultToRevisit())->empty();
+    const bool completed = !llvm::cast<re::Seq>(result->getCompletedResult())->empty();
+    const int offset = result->getCursorOffset();
+    if (!result->hasCursor() || (offset == 0 && !revisit)) return "none";
+    if (offset < 0) return "back up before result (|@)";
+    if (offset > 0) return "skip past result (@|)";
+    return completed ? "revisit part of result" : "revisit entire result";
+}
+
+struct RuleClassCounts {
+    // dimension -> direction -> class -> count
+    std::map<std::string, std::map<std::string, std::map<std::string, unsigned>>> byDimension;
+    // signature -> (count, example rule, file)
+    std::map<std::string, std::tuple<unsigned, std::string, std::string>> signatures;
+    unsigned rules = 0;
+};
+
+// The classes of a forward conversion rule: text to replace, captures,
+// capture order and revisiting.
+struct RuleClass {
+    std::string length;
+    std::string captures;
+    std::string order;
+    std::string revisit;
+    std::string signature() const {return length + " | " + captures + " | " + order + " | " + revisit;}
+};
+
+static RuleClass classifyRule(const ConversionRule * cr) {
+    const RuleSide * const source = cr->getSourceSide(Direction::Forward);
+    const RuleSide * const result = cr->getResultSide(Direction::Forward);
+    std::vector<re::Capture *> captures;
+    collectCaptures(source->getBeforeContext(), captures);
+    collectCaptures(source->getAfterContext(), captures);
+    const size_t contextCaptures = captures.size();
+    collectCaptures(source->getText(), captures);
+    RuleClass c;
+    c.length = classifyTextLength(source->getText());
+    c.captures = classifyCaptureCount(captures.size());
+    if (contextCaptures) c.captures += " (" + std::to_string(contextCaptures) + " in contexts)";
+    c.order = classifyCaptureOrder(captures, result->getText());
+    c.revisit = classifyRevisit(result);
+    return c;
+}
+
+static void classifyRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, RuleClassCounts & counts) {
+    const std::vector<Rule *> parsed = parseTransformRules(tRules);
+    for (const Extract e : {Extract::Forward, Extract::Backward}) {
+        const std::string dir = (e == Extract::Forward) ? "forward" : "backward";
+        for (const Rule * r : extract(parsed, e)) {
+            const ConversionRule * const cr = llvm::dyn_cast<ConversionRule>(r);
+            if (cr == nullptr) continue;
+            const RuleClass c = classifyRule(cr);
+            counts.rules++;
+            counts.byDimension["text to replace"][dir][c.length]++;
+            counts.byDimension["captures"][dir][c.captures]++;
+            counts.byDimension["capture order"][dir][c.order]++;
+            counts.byDimension["revisiting"][dir][c.revisit]++;
+            const std::string sig = c.signature();
+            auto & s = counts.signatures[sig];
+            if (std::get<0>(s)++ == 0) {
+                std::get<1>(s) = printRule(r);
+                std::get<2>(s) = label;
+            }
+            if (!quiet) std::cout << label << " " << dir << "\t" << sig << "\t" << printRule(r) << "\n";
+        }
+    }
+}
+
+static const EliminationTestCase ruleClassTestCases[] = {
+    {"a → x ;", "1 | 0 | no captures | none"},
+    {"ab → x ;", "2 | 0 | no captures | none"},
+    {"$v = abc ; $v → x ;", "fixed >2 | 0 | no captures | none"},
+    {"[{ch}c] → x ;", "variable (bounded) | 0 | no captures | none"},
+    {"a+ → x ;", "variable (unbounded) | 0 | no captures | none"},
+    {"a { } b → x ;", "0 (insertion) | 0 | no captures | none"},
+    {"a } [$] → x ;", "1 | 0 | no captures | none"},
+    {"a [$] → x ;", "1 | 0 | no captures | none"},
+    {"(a) (b) → $1 $2 ;", "2 | 2 | in order | none"},
+    {"(a) (b) → $2 $1 ;", "2 | 2 | reordered | none"},
+    {"(a) (b) → $1 $1 ;", "2 | 2 | repeated, partial | none"},
+    {"(a) (b) (c) → $3 ;", "fixed >2 | 3+ | in order, partial | none"},
+    {"(a) → &Any-Hex($1) ;", "1 | 1 | in order, in function call | none"},
+    {"(a) { b → x ;", "1 | 1 (1 in contexts) | unreferenced | none"},
+    {"a → x | y ;", "1 | 0 | no captures | revisit part of result"},
+    {"a → | y ;", "1 | 0 | no captures | revisit entire result"},
+    {"a → y | ;", "1 | 0 | no captures | none"},
+    {"a → |@ y ;", "1 | 0 | no captures | back up before result (|@)"},
+    {"a → y @| ;", "1 | 0 | no captures | skip past result (@|)"},
+};
+
+static void reportRuleClasses(const RuleClassCounts & counts) {
+    std::cout << "Total: " << counts.rules << " conversion rules (forward and backward)\n";
+    for (const char * dim : {"text to replace", "captures", "capture order", "revisiting"}) {
+        const auto it = counts.byDimension.find(dim);
+        if (it == counts.byDimension.end()) continue;
+        std::map<std::string, std::pair<unsigned, unsigned>> rows;
+        for (const auto & d : it->second) {
+            for (const auto & c : d.second) {
+                (d.first == "forward" ? rows[c.first].first : rows[c.first].second) += c.second;
+            }
+        }
+        std::cout << "\n== " << dim << "\tforward\tbackward\ttotal\n";
+        for (const auto & row : rows) {
+            std::cout << "  " << row.first << "\t" << row.second.first << "\t" << row.second.second
+                      << "\t" << (row.second.first + row.second.second) << "\n";
+        }
+    }
+    std::vector<std::pair<std::string, std::tuple<unsigned, std::string, std::string>>> sigs(counts.signatures.begin(), counts.signatures.end());
+    std::stable_sort(sigs.begin(), sigs.end(), [](const auto & a, const auto & b) { return std::get<0>(a.second) > std::get<0>(b.second); });
+    std::cout << "\n== combined classes (text to replace | captures | capture order | revisiting): count, example\n";
+    for (const auto & s : sigs) {
+        std::cout << "  " << std::get<0>(s.second) << "\t" << s.first << "\n      e.g. " << std::get<1>(s.second)
+                  << "\t" << std::get<2>(s.second) << "\n";
+    }
+}
+
 // The contexts of the first rule, for the regular expression engine
 // (engineContext), as printed by Printer_RE ("" for no context).
 struct EngineContextTestCase {
@@ -1195,6 +1419,20 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const EliminationTestCase & t : ruleClassTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.input});
+            const std::string actual = classifyRule(llvm::cast<ConversionRule>(rules.back())).signature();
+            if (actual != t.expected) {
+                failures++;
+                std::cerr << "FAIL (rule class): " << t.input << "\n  expected: " << t.expected << "\n  actual:   " << actual << "\n";
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     for (const EngineContextTestCase & t : engineContextTestCases) {
         count++;
         try {
@@ -1229,6 +1467,7 @@ int main(int argc, char * argv[]) {
     bool partition = false;
     bool count = false;
     bool classifyAfter = false;
+    bool classifyRuleKinds = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -1246,6 +1485,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--partition") partition = true;
         else if (arg == "--count-nullable-captures") count = true;
         else if (arg == "--classify-after-contexts") classifyAfter = true;
+        else if (arg == "--classify-rules") classifyRuleKinds = true;
         else files.push_back(arg);
     }
     if (files.empty()) {
@@ -1257,6 +1497,7 @@ int main(int argc, char * argv[]) {
                   << "       " << argv[0] << " [--xml] --count-trivial-captures file ...\n"
                   << "       " << argv[0] << " [--xml] --count-nullable-captures file ...\n"
                   << "       " << argv[0] << " [--xml] --classify-after-contexts file ...\n"
+                  << "       " << argv[0] << " [--xml] [--quiet] --classify-rules file ...\n"
                   << "       " << argv[0] << " --self-test\n";
         return 2;
     }
@@ -1266,11 +1507,14 @@ int main(int argc, char * argv[]) {
     OverlapCounts overlapTotal;
     PartitionCounts partitionTotal;
     AfterContextCounts afterCounts;
+    RuleClassCounts ruleClassCounts;
     for (const std::string & f : files) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            if (classifyAfter) {
+            if (classifyRuleKinds) {
+                classifyRules(tRules, f, quiet, ruleClassCounts);
+            } else if (classifyAfter) {
                 classifyAfterContexts(tRules, f, afterCounts);
             } else if (partition) {
                 ok &= reportPartition(tRules, f, quiet, partitionTotal);
@@ -1299,6 +1543,9 @@ int main(int argc, char * argv[]) {
                 std::cout << "  " << x.first << "\t" << x.second << "\n";
             }
         }
+    }
+    if (classifyRuleKinds) {
+        reportRuleClasses(ruleClassCounts);
     }
     if (partition) {
         std::cout << "Total: " << partitionTotal.groups << " groups, " << partitionTotal.variables << " set variables (" << partitionTotal.divided << " divided), "

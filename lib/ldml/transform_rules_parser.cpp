@@ -220,11 +220,17 @@ bool isSetOperand(const RE * re) {
 
 class RuleTextParser {
 public:
-    RuleTextParser(const std::u32string & text, std::map<std::string, Name *> & variables)
-    : mText(text), mPos(0), mVariables(variables) {}
+    RuleTextParser(const std::u32string & text, std::map<std::string, Name *> & variables,
+                   std::set<std::string> * failedVariables = nullptr)
+    : mText(text), mPos(0), mVariables(variables), mFailedVariables(failedVariables) {}
 
     // Parse the next rule, or return nullptr at the end of the text.
     Rule * parseRule();
+
+    // Recovery after an error in the rule starting at the given position:
+    // continue after the ';' ending it.
+    void skipRule(const size_t ruleStart);
+    size_t position() const {return mPos;}
 
     // Parse a complete text consisting of a single UnicodeSet.
     RE * parseCompleteSet();
@@ -320,6 +326,7 @@ private:
     const std::u32string & mText;
     size_t mPos;
     std::map<std::string, Name *> & mVariables;
+    std::set<std::string> * const mFailedVariables;
 
     // State for the conversion rule side being parsed.
     std::vector<Capture *> mCaptures;
@@ -341,7 +348,12 @@ Rule * RuleTextParser::parseRule() {
         const std::string name = parseVariableName();
         skipWhiteSpace();
         if (accept('=')) {
-            rule = parseVariableDefinition(name);
+            try {
+                rule = parseVariableDefinition(name);
+            } catch (const TransformRuleParseError &) {
+                if (mFailedVariables && mVariables.count(name) == 0) mFailedVariables->insert(name);
+                throw;
+            }
         } else {
             mPos = start;
             rule = parseConversionRule();
@@ -352,6 +364,50 @@ Rule * RuleTextParser::parseRule() {
     skipWhiteSpace();
     if (more()) require(';', "';' at end of rule");
     return rule;
+}
+
+// The end of a rule is the first ';' that is not quoted, escaped, within a
+// set or within a comment.  If there is none (as for an unterminated quote
+// or set), the first unescaped ';' after the error position is taken.
+void RuleTextParser::skipRule(const size_t ruleStart) {
+    const size_t errorPos = mPos;
+    unsigned setDepth = 0;
+    char32_t quote = 0;
+    for (size_t i = ruleStart; i < mText.size(); i++) {
+        const char32_t c = mText[i];
+        if (c == '\\') {
+            i++;
+        } else if (quote) {
+            if (c == quote) quote = 0;
+        } else if (c == '\'' || c == '"') {
+            quote = c;
+        } else if (c == '[') {
+            setDepth++;
+        } else if (c == ']') {
+            if (setDepth) setDepth--;
+        } else if (setDepth == 0) {
+            if (c == ';') {
+                mPos = i + 1;
+                return;
+            }
+            if (c == '#') {
+                while (i + 1 < mText.size()) {
+                    const char32_t n = mText[i + 1];
+                    if (n == '\n' || n == '\r' || n == 0x2028 || n == 0x2029) break;
+                    i++;
+                }
+            }
+        }
+    }
+    for (size_t i = std::max(errorPos, ruleStart); i < mText.size(); i++) {
+        if (mText[i] == '\\') {
+            i++;
+        } else if (mText[i] == ';') {
+            mPos = i + 1;
+            return;
+        }
+    }
+    mPos = mText.size();
 }
 
 std::pair<RE *, TransformID> RuleTextParser::parseTransformPart() {
@@ -711,6 +767,9 @@ RE * RuleTextParser::parseVariableReference() {
     const std::string name = parseVariableName();
     auto f = mVariables.find(name);
     if (f == mVariables.end()) {
+        if (mFailedVariables && mFailedVariables->count(name)) {
+            ParseFailure("Variable $" + name + " is undefined, as its definition has an error");
+        }
         ParseFailure("Undefined variable $" + name);
     }
     return f->second;
@@ -992,14 +1051,36 @@ RE * RuleTextParser::parseCompleteSet() {
 
 } // end anonymous namespace
 
+static std::string joinMessages(const std::vector<TransformRuleParseError> & errors) {
+    std::string msg;
+    for (const TransformRuleParseError & e : errors) {
+        if (!msg.empty()) msg += "\n";
+        msg += e.what();
+    }
+    return msg;
+}
+
+TransformRuleParseErrors::TransformRuleParseErrors(std::vector<TransformRuleParseError> errors)
+: TransformRuleParseError(joinMessages(errors)), mErrors(std::move(errors)) {}
+
 std::vector<Rule *> TransformRuleParser::parse(const std::string & rules) {
     const std::u32string text = decodeUTF8(rules);
-    RuleTextParser parser(text, mVariables);
+    RuleTextParser parser(text, mVariables, &mFailedVariables);
     std::vector<Rule *> parsed;
-    while (Rule * r = parser.parseRule()) {
-        parsed.push_back(r);
+    std::vector<TransformRuleParseError> errors;
+    for (;;) {
+        const size_t start = parser.position();
+        try {
+            Rule * const r = parser.parseRule();
+            if (r == nullptr) break;
+            parsed.push_back(r);
+        } catch (const TransformRuleParseError & e) {
+            errors.push_back(e);
+            parser.skipRule(start);
+        }
     }
     mRules.insert(mRules.end(), parsed.begin(), parsed.end());
+    if (!errors.empty()) throw TransformRuleParseErrors(std::move(errors));
     return parsed;
 }
 
@@ -1009,18 +1090,30 @@ RE * TransformRuleParser::parseUnicodeSet(const std::string & set) {
     return parser.parseCompleteSet();
 }
 
-void TransformRuleParser::validateRuleOrder() const {
+void TransformRuleParser::validate() const {
+    std::vector<TransformRuleParseError> errors;
+    for (auto check : {&TransformRuleParser::validateRuleOrder, &TransformRuleParser::validateInsertions,
+                       &TransformRuleParser::validateRepeatedSegments}) {
+        const auto e = (this->*check)();
+        errors.insert(errors.end(), e.begin(), e.end());
+    }
+    if (!errors.empty()) throw TransformRuleParseErrors(std::move(errors));
+}
+
+std::vector<TransformRuleParseError> TransformRuleParser::validateRuleOrder() const {
+    std::vector<TransformRuleParseError> errors;
     const size_t n = mRules.size();
     for (size_t i = 0; i < n; i++) {
         if (const FilterRule * f = dyn_cast<FilterRule>(mRules[i])) {
             if (f->isInverse() && i != n - 1) {
-                throw TransformRuleParseError("Inverse filter rule " + printRule(f) + " is not the last rule");
+                errors.emplace_back("Inverse filter rule " + printRule(f) + " is not the last rule");
             }
             if (!f->isInverse() && i != 0) {
-                throw TransformRuleParseError("Filter rule " + printRule(f) + " is not the first rule");
+                errors.emplace_back("Filter rule " + printRule(f) + " is not the first rule");
             }
         }
     }
+    return errors;
 }
 
 // Whether an item of a rule may match the empty text (anchors constrain
@@ -1041,18 +1134,24 @@ static bool matchesEmpty(RE * re) {
     return false;
 }
 
-void TransformRuleParser::validateInsertions() const {
-    auto check = [](const ConversionRule * r, const RuleSide * side) {
-        if (side->hasBeforeContext() || side->hasAfterContext() || !matchesEmpty(side->getText())) return;
-        throw TransformRuleParseError("Rule " + printRule(r) + " matches the empty text without contexts, indefinitely");
+std::vector<TransformRuleParseError> TransformRuleParser::validateInsertions() const {
+    std::vector<TransformRuleParseError> errors;
+    auto check = [&errors](const ConversionRule * r, const RuleSide * side) {
+        if (side->hasBeforeContext() || side->hasAfterContext() || !matchesEmpty(side->getText())) return false;
+        errors.emplace_back("Rule " + printRule(r) + " matches the empty text without contexts, indefinitely");
+        return true;
     };
     for (const Rule * rule : mRules) {
         if (const ConversionRule * r = dyn_cast<ConversionRule>(rule)) {
             const unsigned d = static_cast<unsigned>(r->getDirection());
-            if (d & static_cast<unsigned>(Direction::Forward)) check(r, r->getLeftSide());
+            // A rule is reported once, even if ill-formed in both directions.
+            if (d & static_cast<unsigned>(Direction::Forward)) {
+                if (check(r, r->getLeftSide())) continue;
+            }
             if (d & static_cast<unsigned>(Direction::Backward)) check(r, r->getRightSide());
         }
     }
+    return errors;
 }
 
 // The segments of a rule side within repetitions, and the segments referenced.
@@ -1075,7 +1174,8 @@ static void collectSegments(const RE * re, bool withinRep, std::set<const Captur
     }
 }
 
-void TransformRuleParser::validateRepeatedSegments() const {
+std::vector<TransformRuleParseError> TransformRuleParser::validateRepeatedSegments() const {
+    std::vector<TransformRuleParseError> errors;
     for (const Rule * rule : mRules) {
         const ConversionRule * r = dyn_cast<ConversionRule>(rule);
         if (r == nullptr) continue;
@@ -1088,10 +1188,12 @@ void TransformRuleParser::validateRepeatedSegments() const {
         }
         for (const Capture * c : repeated) {
             if (referenced.count(c)) {
-                throw TransformRuleParseError("Rule " + printRule(r) + " references a segment within a repetition, which captures only its last repetition");
+                errors.emplace_back("Rule " + printRule(r) + " references a segment within a repetition, which captures only its last repetition");
+                break;
             }
         }
     }
+    return errors;
 }
 
 Name * TransformRuleParser::lookupVariable(const std::string & name) const {
@@ -1101,12 +1203,20 @@ Name * TransformRuleParser::lookupVariable(const std::string & name) const {
 
 std::vector<Rule *> parseTransformRules(const std::vector<std::string> & tRules) {
     TransformRuleParser parser;
+    std::vector<TransformRuleParseError> errors;
     for (const std::string & r : tRules) {
-        parser.parse(r);
+        try {
+            parser.parse(r);
+        } catch (const TransformRuleParseErrors & e) {
+            errors.insert(errors.end(), e.getErrors().begin(), e.getErrors().end());
+        }
     }
-    parser.validateRuleOrder();
-    parser.validateInsertions();
-    parser.validateRepeatedSegments();
+    try {
+        parser.validate();
+    } catch (const TransformRuleParseErrors & e) {
+        errors.insert(errors.end(), e.getErrors().begin(), e.getErrors().end());
+    }
+    if (!errors.empty()) throw TransformRuleParseErrors(std::move(errors));
     return parser.getRules();
 }
 

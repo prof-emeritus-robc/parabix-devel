@@ -142,6 +142,13 @@ static bool reparses(const std::string & printed, bool exact, std::string & repr
     }
 }
 
+// Each error of the file on its own line, prefixed by the file name.
+static void reportErrors(const std::string & label, const TransformRuleParseErrors & e) {
+    for (const TransformRuleParseError & err : e.getErrors()) {
+        std::cerr << label << ": " << err.what() << "\n";
+    }
+}
+
 enum class Extract {All, Forward, Backward};
 
 static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extract e) {
@@ -203,6 +210,9 @@ static bool processRules(const std::vector<std::string> & tRules, const std::str
             std::cout << "\n";
         }
         return true;
+    } catch (const TransformRuleParseErrors & e) {
+        reportErrors(label, e);
+        return false;
     } catch (const std::exception & e) {
         std::cerr << label << ": " << e.what() << "\n";
         return false;
@@ -1270,6 +1280,44 @@ static std::string printEngineContext(re::RE * context, bool after) {
     return context ? Printer_RE::PrintRE(engineContext(context, after)) : "";
 }
 
+// All the errors of a rule text are reported, one per line, after recovery
+// at the end of each rule.
+struct MultipleErrorTestCase {
+    const char * input;
+    const char * expected;
+};
+
+static const MultipleErrorTestCase multipleErrorTestCases[] = {
+    {"a b ; c → d ; e f ;",
+     "Expected a conversion operator (→, ←, ↔) but found ';' (line 1, column 5)\n"
+     "Expected a conversion operator (→, ←, ↔) but found ';' (line 1, column 19)"},
+    // Recovery skips quoted, escaped and bracketed ';' and comments.
+    {"a ';' b ; [;] c → d ; x\\; y ; # ; \n e $ f → g ;",
+     "Expected a conversion operator (→, ←, ↔) but found ';' (line 1, column 9)\n"
+     "Expected a conversion operator (→, ←, ↔) but found ';' (line 1, column 29)\n"
+     "The '$' anchor must be at the end of the pattern (line 2, column 6)"},
+    // An unterminated set: recovery at the next ';' after the error (here,
+    // the variable $v used within the set while being defined).
+    {"$v = [a-z ; $v → x ; y → $w ;",
+     "Undefined variable $v (line 1, column 15)\n"
+     "Undefined variable $w (line 1, column 28)"},
+    // Uses of a variable whose definition has an error.
+    {"$v = a ] ; $v → x ; y → $w ;",
+     "Unquoted syntax character ']' (line 1, column 8)\n"
+     "Variable $v is undefined, as its definition has an error (line 1, column 14)\n"
+     "Undefined variable $w (line 1, column 27)"},
+    // Validation errors are all reported, by check.
+    {"a → b ; :: [a] ; x* → y ; (a)+ → $1 ; z* ↔ w* ;",
+     "Filter rule :: [a] ; is not the first rule\n"
+     "Rule x* → y ; matches the empty text without contexts, indefinitely\n"
+     "Rule z* ↔ w* ; matches the empty text without contexts, indefinitely\n"
+     "Rule (a)+ → $1 ; references a segment within a repetition, which captures only its last repetition"},
+    // Syntax errors, then validation errors of the rules without syntax errors.
+    {"a b ; x* → y ;",
+     "Expected a conversion operator (→, ←, ↔) but found ';' (line 1, column 5)\n"
+     "Rule x* → y ; matches the empty text without contexts, indefinitely"},
+};
+
 static int runSelfTest() {
     unsigned failures = 0;
     unsigned count = 0;
@@ -1433,6 +1481,19 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const MultipleErrorTestCase & t : multipleErrorTestCases) {
+        count++;
+        std::string actual = "(no error)";
+        try {
+            parseTransformRules({t.input});
+        } catch (const TransformRuleParseError & e) {
+            actual = e.what();
+        }
+        if (actual != t.expected) {
+            failures++;
+            std::cerr << "FAIL (multiple errors): " << t.input << "\n  expected: " << t.expected << "\n  actual:   " << actual << "\n";
+        }
+    }
     for (const EngineContextTestCase & t : engineContextTestCases) {
         count++;
         try {
@@ -1527,6 +1588,9 @@ int main(int argc, char * argv[]) {
             } else {
                 ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate, exclusive, disambiguate);
             }
+        } catch (const TransformRuleParseErrors & e) {
+            reportErrors(f, e);
+            ok = false;
         } catch (const std::exception & e) {
             std::cerr << f << ": " << e.what() << "\n";
             ok = false;

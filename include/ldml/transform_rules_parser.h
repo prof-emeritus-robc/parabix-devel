@@ -13,6 +13,7 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,13 +38,27 @@ private:
     size_t mColumn;
 };
 
+// All the errors of a rule text (or of the rules of a transform), thrown
+// once parsing and validation are complete.  The message lists the errors,
+// one per line.
+class TransformRuleParseErrors : public TransformRuleParseError {
+public:
+    explicit TransformRuleParseErrors(std::vector<TransformRuleParseError> errors);
+    const std::vector<TransformRuleParseError> & getErrors() const {return mErrors;}
+private:
+    std::vector<TransformRuleParseError> mErrors;
+};
+
 class TransformRuleParser {
 public:
     TransformRuleParser() = default;
 
     // Parse UTF-8 text consisting of zero or more rules, each terminated
     // by ";" (the final ";" may be omitted).  The new rules are appended
-    // to the rule list and returned.   Throws TransformRuleParseError.
+    // to the rule list and returned.   After an error in a rule, parsing
+    // resumes after the ";" ending it, so that all the errors of the text
+    // are found; if there are any, TransformRuleParseErrors is thrown at
+    // the end (the rules without errors are still in the rule list).
     std::vector<Rule *> parse(const std::string & rules);
 
     // Parse a single UnicodeSet, e.g. "[[:Latin:]-[a-z]]" or "\p{Lu}".
@@ -52,27 +67,34 @@ public:
     // All rules parsed so far.
     const std::vector<Rule *> & getRules() const {return mRules;}
 
-    // Check the rule list constraints: a filter rule may only be the first
-    // rule and an inverse filter rule may only be the last rule.
-    // Throws TransformRuleParseError.
-    void validateRuleOrder() const;
+    // Check the constraints on the rule list as a whole (see below),
+    // throwing TransformRuleParseErrors with all the violations.
+    void validate() const;
+    // Each check returns its violations:
+    // A filter rule may only be the first rule and an inverse filter rule
+    // may only be the last rule.
+    std::vector<TransformRuleParseError> validateRuleOrder() const;
     // A conversion rule whose text to match (in a direction in which it
     // applies) may be empty, without contexts, would match again at the
     // same position indefinitely: the rules are ill-formed.
-    void validateInsertions() const;
+    std::vector<TransformRuleParseError> validateInsertions() const;
     // A segment within a repetition captures only its last repetition (or
     // nothing): a rule referencing one is ill-formed.
-    void validateRepeatedSegments() const;
+    std::vector<TransformRuleParseError> validateRepeatedSegments() const;
 
     // The variable of the given name, or nullptr if not defined.
     re::Name * lookupVariable(const std::string & name) const;
 
 private:
     std::map<std::string, re::Name *> mVariables;
+    // Variables whose definitions have errors (their uses are reported as such).
+    std::set<std::string> mFailedVariables;
     std::vector<Rule *> mRules;
 };
 
-// Parse the contents of all the <tRule> elements of a transform.
+// Parse the contents of all the <tRule> elements of a transform.  All the
+// syntax errors of all the elements and the violations of the rule list
+// constraints are reported together, as TransformRuleParseErrors.
 std::vector<Rule *> parseTransformRules(const std::vector<std::string> & tRules);
 
 }

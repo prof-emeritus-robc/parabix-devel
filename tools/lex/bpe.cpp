@@ -50,6 +50,8 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <array>
+#include <iomanip>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
@@ -709,6 +711,154 @@ protected:
                             i < in.size() ? in[i] : pb.createZeroes());
     }
 };
+
+// --bit-frequency-statistics: over the surviving token starts (`live`), count all tokens
+// (`total`) and, for each N in [kBitFreqLo, kBitFreqHi], the tokens whose id has at least
+// N bits, i.e. id >= 2^(N-1) (`atLeastN`).
+static cl::opt<bool> BitFrequencyStatistics(
+    "bit-frequency-statistics",
+    cl::desc("BPE mode: report how many output tokens have ids of at least N bits, for "
+             "N = 10..16."),
+    cl::init(false));
+
+static constexpr unsigned kBitFreqLo = 10, kBitFreqHi = 16;
+
+class BPEBitFrequencyKernel : public PabloKernel {
+public:
+    BPEBitFrequencyKernel(LLVMTypeSystemInterface & ts, StreamSet * id, StreamSet * live)
+    : PabloKernel(ts, "BPE_BitFreq" + std::to_string(id->getNumElements()),
+                  {Binding{"id", id}, Binding{"live", live}},
+                  {},
+                  {},
+                  outputScalars(ts)) {}
+protected:
+    static std::vector<Binding> outputScalars(LLVMTypeSystemInterface & ts) {
+        std::vector<Binding> out {Binding{ts.getSizeTy(), "total"}};
+        for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++)
+            out.push_back(Binding{ts.getSizeTy(), "atLeast" + std::to_string(n)});
+        return out;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> id = getInputStreamSet("id");
+        PabloAST * live = pb.createInFile(getInputStreamSet("live")[0]);
+        pb.createAssign(getOutputScalarVar("total"), pb.createCount(live));
+        // bits[N-1 .. W) has a 1, accumulated from the top bit down
+        PabloAST * any = pb.createZeroes();
+        for (unsigned n = kBitFreqHi; n >= kBitFreqLo; n--) {
+            if (n - 1 < id.size()) any = pb.createOr(any, id[n - 1]);
+            pb.createAssign(getOutputScalarVar("atLeast" + std::to_string(n)),
+                            pb.createCount(pb.createAnd(any, live)));
+        }
+    }
+};
+
+static void bpe_report_bit_frequency(uint64_t total, uint64_t n10, uint64_t n11, uint64_t n12,
+                                     uint64_t n13, uint64_t n14, uint64_t n15, uint64_t n16) {
+    const uint64_t counts[] = {n10, n11, n12, n13, n14, n15, n16};
+    std::cerr << "[BPE] bit frequency statistics: " << total << " tokens\n";
+    for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++) {
+        const uint64_t c = counts[n - kBitFreqLo];
+        std::cerr << "[BPE]   ids of >= " << n << " bits (id >= " << (1u << (n - 1)) << "): "
+                  << c << " (" << (total ? 100.0 * c / total : 0.0) << "%)\n";
+    }
+}
+
+// --merge-frequency-statistics: after each merge kernel, count the merges it made
+// (`merges`, the B starts it consumed) and, for each N in [kBitFreqLo, kBitFreqHi], the
+// merges whose A and B ids both have at least N bits (`bothN`). B is a consumed start of
+// the kernel's input live mask, A the live start before it, so A's size flag reaches B
+// by an IndexedAdvance over that mask.
+static cl::opt<bool> MergeFrequencyStatistics(
+    "merge-frequency-statistics",
+    cl::desc("BPE mode: report, per merge id bit tier, how many merges have both part ids "
+             "of at least N bits, for N = 10..16."),
+    cl::init(false));
+
+static bool hasStreamInput(const Kernel * k, llvm::StringRef name);   // defined below
+
+class BPEMergeFrequencyKernel : public PabloKernel {
+public:
+    BPEMergeFrequencyKernel(LLVMTypeSystemInterface & ts, StreamSet * id, StreamSet * liveIn,
+                            StreamSet * liveOut)
+    : PabloKernel(ts, "BPE_MergeFreq" + std::to_string(id->getNumElements()) + (liveIn ? "" : "_fa1"),
+                  inputs(id, liveIn, liveOut),
+                  {},
+                  {},
+                  outputScalars(ts)) {}
+protected:
+    // liveIn is null right after a FilterByMask compaction: every position is live then.
+    static std::vector<Binding> inputs(StreamSet * id, StreamSet * liveIn, StreamSet * liveOut) {
+        std::vector<Binding> in {Binding{"id", id}, Binding{"liveOut", liveOut}};
+        if (liveIn) in.push_back(Binding{"liveIn", liveIn});
+        return in;
+    }
+    static std::vector<Binding> outputScalars(LLVMTypeSystemInterface & ts) {
+        std::vector<Binding> out {Binding{ts.getSizeTy(), "merges"}};
+        for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++)
+            out.push_back(Binding{ts.getSizeTy(), "both" + std::to_string(n)});
+        return out;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> id = getInputStreamSet("id");
+        PabloAST * liveIn = hasStreamInput(this, "liveIn")
+            ? getInputStreamSet("liveIn")[0]
+            : pb.createInFile(pb.createNot(pb.createZeroes()));
+        PabloAST * consumed = pb.createInFile(pb.createAnd(liveIn, pb.createNot(getInputStreamSet("liveOut")[0])),
+                                              "consumedB");
+        pb.createAssign(getOutputScalarVar("merges"), pb.createCount(consumed));
+        PabloAST * any = pb.createZeroes();   // id has a 1 in bits [N-1, W)
+        for (unsigned n = kBitFreqHi; n >= kBitFreqLo; n--) {
+            if (n - 1 < id.size()) any = pb.createOr(any, id[n - 1]);
+            PabloAST * big = pb.createAnd(any, liveIn);
+            PabloAST * prevBig = pb.createIndexedAdvance(big, liveIn, 1);
+            pb.createAssign(getOutputScalarVar("both" + std::to_string(n)),
+                            pb.createCount(pb.createAnd(consumed, pb.createAnd(big, prevBig))));
+        }
+    }
+};
+
+// merge statistics per output id width (tier): [0] merges, [1 + N - kBitFreqLo] bothN
+static std::map<uint64_t, std::array<uint64_t, 2 + kBitFreqHi - kBitFreqLo>> gMergeFreq;
+
+// One instance per tier: the tier is a template argument, not a call argument, because a
+// pipeline constant scalar passed to a CreateCall crashes getFinalOutputScalars.
+template <unsigned tier>
+static void bpe_record_merge_frequency(uint64_t merges, uint64_t b10, uint64_t b11, uint64_t b12,
+                                       uint64_t b13, uint64_t b14, uint64_t b15, uint64_t b16) {
+    const uint64_t v[] = {merges, b10, b11, b12, b13, b14, b15, b16};
+    auto & row = gMergeFreq[tier];
+    for (unsigned i = 0; i < row.size(); i++) row[i] += v[i];
+}
+
+using MergeFrequencyRecorder = decltype(bpe_record_merge_frequency<16>);
+
+template <unsigned... tiers>
+static MergeFrequencyRecorder * mergeFrequencyRecorder(unsigned tier, std::integer_sequence<unsigned, tiers...>) {
+    MergeFrequencyRecorder * fns[] = {bpe_record_merge_frequency<tiers>...};
+    return tier < sizeof...(tiers) ? fns[tier] : nullptr;
+}
+
+void reportBPEStatistics() {
+    if (gMergeFreq.empty()) return;
+    std::array<uint64_t, 2 + kBitFreqHi - kBitFreqLo> all{};
+    std::cerr << "[BPE] merge frequency statistics: merges whose A and B ids both have >= N bits\n"
+              << "[BPE]   tier      merges";
+    for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++) std::cerr << std::setw(11) << ("both>=" + std::to_string(n));
+    std::cerr << "\n";
+    auto printRow = [](const std::string & label, const auto & row) {
+        std::cerr << "[BPE]   " << std::setw(4) << label << std::setw(12) << row[0];
+        for (unsigned i = 1; i < row.size(); i++) std::cerr << std::setw(11) << row[i];
+        std::cerr << "\n";
+    };
+    for (const auto & [tier, row] : gMergeFreq) {
+        printRow(std::to_string(tier), row);
+        for (unsigned i = 0; i < row.size(); i++) all[i] += row[i];
+    }
+    printRow("all", all);
+    gMergeFreq.clear();
+}
 
 // Hash a rule group's (idA,idB,idAB,lenA,lenB) list → unique cache name per kernel,
 // since the Pablo body is data-dependent (same shape, different rules). lenA MUST be
@@ -2087,7 +2237,7 @@ BPEPassResult buildBPEPassPipeline(
             for (unsigned i = 0; i < g.rules.size() && i < cap; i++) {
                 const auto & r = g.rules[i];
                 std::cerr << "    idA=" << r.idA << " idB=" << r.idB
-                          << " lenB=" << r.lenB << " -> idAB=" << r.idAB
+                          << " lenA=" << r.lenA << " lenB=" << r.lenB << " -> idAB=" << r.idAB
                           << "  (" << bpe.decodeToken(r.idA) << "+" << bpe.decodeToken(r.idB)
                           << "->" << bpe.decodeToken(r.idAB) << ")\n";
             }
@@ -2162,6 +2312,17 @@ BPEPassResult buildBPEPassPipeline(
             P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
                                                g, hashRuleSet(g.rules), g.maxLen, grouped);
         }
+        if (MergeFrequencyStatistics) {
+            Kernel * k = P.CreateKernelCall<BPEMergeFrequencyKernel>(source, inPlayMask, meOut);
+            MergeFrequencyRecorder * rec =
+                mergeFrequencyRecorder(output_bits, std::make_integer_sequence<unsigned, 17>());
+            if (!rec) throw std::runtime_error("--merge-frequency-statistics: id width over 16 bits");
+            // one call name per kernel: the pipeline merges calls that share a name
+            P.CreateCall("bpe_record_merge_frequency_" + std::to_string(i), *rec,
+                         {k->getOutputScalarAt(0), k->getOutputScalarAt(1), k->getOutputScalarAt(2),
+                          k->getOutputScalarAt(3), k->getOutputScalarAt(4), k->getOutputScalarAt(5),
+                          k->getOutputScalarAt(6), k->getOutputScalarAt(7)});
+        }
         source     = sOut;
         inPlayMask = meOut;
 
@@ -2197,6 +2358,13 @@ BPEPassResult buildBPEPassPipeline(
         StreamSet * source16 = P.CreateStreamSet(16, 1);
         P.CreateKernelCall<BPEWidenKernel>(source, source16);
         source = source16;
+    }
+    if (BitFrequencyStatistics) {
+        Kernel * k = P.CreateKernelCall<BPEBitFrequencyKernel>(source, inPlayMask);
+        P.CreateCall("bpe_report_bit_frequency", bpe_report_bit_frequency,
+                     {k->getOutputScalarAt(0), k->getOutputScalarAt(1), k->getOutputScalarAt(2),
+                      k->getOutputScalarAt(3), k->getOutputScalarAt(4), k->getOutputScalarAt(5),
+                      k->getOutputScalarAt(6), k->getOutputScalarAt(7)});
     }
     // inPlayMask marks surviving (outermost) token STARTS; vocabID = source (start-anchored,
     // id stamped at each token's start). Emission scans inPlayMask and reads source there.

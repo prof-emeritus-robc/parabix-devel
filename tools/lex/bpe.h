@@ -129,6 +129,10 @@ BPEPassResult buildBPEPassPipeline(
     const BPETokenizer      & bpe,
     kernel::StreamSet       * boundary = nullptr);
 
+// Print the statistics gathered by the last pipeline run (--merge-frequency-statistics)
+// to stderr, then reset them. A no-op when nothing was gathered.
+void reportBPEStatistics();
+
 // Line-delimited pretokenizer used when --vocab is given without
 // --pretokenizer (compare_bpe.py step-2 input format).
 // Returns the basis byte stream with '\n' bytes removed via FilterByMask.

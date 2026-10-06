@@ -26,7 +26,7 @@
 #include <re/analysis/collect_ccs.h>
 #include <re/transforms/re_multiplex.h>
 #include <kernel/basis/s2p_kernel.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/stream_select.h>
@@ -62,26 +62,6 @@ unsigned round_up_to_blocksize(int lgth) {
     return lookahead_blocks * codegen::BlockSize;
 }
 
-
-void MatchedLinesKernel::generatePabloMethod() {
-    PabloBuilder pb(getEntryScope());
-    auto matchResults = getInputStreamSet("matchResults");
-    PabloAST * lineBreaks = pb.createExtract(getInputStreamVar("lineBreaks"), pb.getInteger(0));
-    PabloAST * notLB = pb.createNot(lineBreaks);
-    PabloAST * match_follow = pb.createMatchStar(matchResults.back(), notLB);
-    Var * const matchedLines = getOutputStreamVar("matchedLines");
-    pb.createAssign(pb.createExtract(matchedLines, pb.getInteger(0)), pb.createAnd(match_follow, lineBreaks, "matchedLines"));
-}
-
-MatchedLinesKernel::MatchedLinesKernel (LLVMTypeSystemInterface & ts, StreamSet * Matches, StreamSet * LineBreakStream, StreamSet * MatchedLines)
-: PabloKernel(ts, "MatchedLines" + std::to_string(Matches->getNumElements()),
-// inputs
-{Binding{"matchResults", Matches}
-,Binding{"lineBreaks", LineBreakStream, FixedRate(), Principal()}},
-// output
-{Binding{"matchedLines", MatchedLines}}) {
-
-}
 
 void InvertMatchesKernel::generateDoBlockMethod(KernelBuilder & b) {
     Value * input = b.loadInputStreamBlock("matchedLines", b.getInt32(0));

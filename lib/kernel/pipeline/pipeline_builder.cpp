@@ -559,7 +559,13 @@ Kernel * PipelineBuilder::makeKernel() {
 
     signature = PipelineKernel::annotateSignatureWithPipelineFlags(std::move(signature));
 
-    if (LLVM_UNLIKELY(mTarget->hasInternallyGeneratedStreamSets())) {
+    // Likewise, a family call is listed in the signature only by its family name,
+    // but a top-level program's "main" constructs the specific family kernels (e.g.
+    // the RE kernels of a nested grep pipeline).  Two programs differing only in
+    // those kernels would otherwise share a "_main", and the second would run the
+    // first one's kernels.
+    const bool programWithFamilyCalls = mIsProgram && (mTarget->getNumOfNestedKernelFamilyCalls() > 0);
+    if (LLVM_UNLIKELY(mTarget->hasInternallyGeneratedStreamSets() || programWithFamilyCalls)) {
         // A dynamic RepeatingStreamSet's actual pattern data is deliberately left out of
         // the signature above (it's substituted in later, when addOrDeclareMainFunction
         // bakes it into the compiled "main" as an LLVM Constant -- see

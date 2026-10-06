@@ -639,7 +639,10 @@ struct RelationshipGraphBuilder {
                 if (LLVM_LIKELY(diff != 0)) {
                     return diff < 0;
                 } else {
-                    return (Scalars < other.Scalars) || (Streams < other.Streams);
+                    if (Scalars != other.Scalars) {
+                        return Scalars < other.Scalars;
+                    }
+                    return Streams < other.Streams;
                 }
             }
         };

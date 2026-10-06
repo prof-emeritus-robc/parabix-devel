@@ -6,6 +6,7 @@
 #pragma once
 #include <vector>
 #include <cstdint>
+#include <re/alphabet/alphabet.h>
 
 namespace re {
 
@@ -13,8 +14,8 @@ class RE;
 
 typedef std::vector<uint64_t> (*GrepLinesFunctionType)(re::RE *, const char * buf, size_t bufSize);
 
-RE * resolveModesAndExternalSymbols(RE * r, bool globallyCaseInsensitive = false, GrepLinesFunctionType grep = nullptr);
+RE * resolveModesAndExternalSymbols(RE * r, GrepLinesFunctionType grep = nullptr);
 
-RE * regular_expression_passes(RE * r);
+RE * regular_expression_passes(RE * r, const cc::Alphabet * lengthAlpha = &cc::Unicode);
 
 }

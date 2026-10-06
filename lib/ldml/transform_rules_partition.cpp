@@ -181,7 +181,7 @@ CharacterClassPartition partitionGroup(const std::vector<Rule *> & rules, const 
     }
     std::vector<const Name *> variables(used.begin(), used.end());
     auto position = [&](const Name * n) {
-        auto f = definitionIndex.find(n);
+        auto f = definitionIndex.find(originalVariable(n));
         return f == definitionIndex.end() ? rules.size() : f->second;
     };
     std::sort(variables.begin(), variables.end(), [&](const Name * a, const Name * b) {return position(a) < position(b);});

@@ -18,7 +18,7 @@
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/re_multiplex.h>
 #include <kernel/core/kernel_builder.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/boundary_kernels.h>

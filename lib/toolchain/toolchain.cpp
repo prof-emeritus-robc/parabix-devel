@@ -304,6 +304,13 @@ static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::loca
 static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""),
                                                  cl::desc("Path to the object cache directory"), cl::cat(CodeGenOptions));
 
+std::string ObjectCacheSalt;
+static cl::opt<std::string, true> ObjectCacheSaltOption("object-cache-salt", cl::location(ObjectCacheSalt), cl::init(""),
+                                                        cl::desc("Extra string added to the key of every object cache entry, so that "
+                                                                 "experimental builds or settings get their own entries rather than "
+                                                                 "reusing (or overwriting) the normal ones. Letters, digits, '.', '_' "
+                                                                 "and '-' only."), cl::cat(CodeGenOptions));
+
 // The custom allocator keeps persistent, long-lived exec/data slab pools rather than
 // allocating a small dedicated region per compiled object as LLVM's default in-process
 // memory manager does. That's a deliberate linking-speed optimization, but from LLVM 20,
@@ -605,6 +612,12 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
         || (OptimizationLevel.getNumOccurrences() > 0)
         || (BackEndOptOption.getNumOccurrences() > 0);
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
+    // The salt becomes part of each cache file name.
+    for (const char c : ObjectCacheSalt) {
+        if (!(isalnum(static_cast<unsigned char>(c)) || (c == '.') || (c == '_') || (c == '-'))) {
+            report_fatal_error(Twine("--object-cache-salt may contain only letters, digits, '.', '_' and '-': ") + ObjectCacheSalt);
+        }
+    }
     target_Options.MCOptions.AsmVerbose = true;
 
     if (UseMCJIT) {

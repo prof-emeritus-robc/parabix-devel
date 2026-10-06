@@ -303,12 +303,50 @@ inline ConversionRule * makeConversionRule(RuleSide * left, Direction d, RuleSid
 
 // Helpers for the transform-specific uses of RE objects.
 
-// The text boundary, i.e., "$" within a UnicodeSet.  In a before context it
-// matches the start of the text, in an after context the end of the text.
+// The text boundary, i.e., "$" within a UnicodeSet (including the boundary
+// implied by a negated set [^...]).  In a before context it matches the start
+// of the text, and is represented by re::Start; in an after context it
+// matches the end of the text, and is represented by re::End.  Within a
+// variable definition, whose context is not known, it is represented by the
+// text boundary marker made by makeTextBoundary(); each use of such a variable
+// in a context is a resolved copy of the variable (see resolveTextBoundary).
 re::RE * makeTextBoundary();
+// The set [$] of a before context (the text boundary as Start) or an after
+// context (as End), printed as [$].
+re::RE * makeBoundarySet(bool beforeContext);
+// Is the RE the (unresolved) text boundary marker?
 bool isTextBoundary(const re::RE * re);
-// Does a set (as returned by the parser) include the text boundary?
+// Is the RE a text boundary: Start, End or the marker?
+bool isBoundary(const re::RE * re);
+// Does a set include the text boundary (Start, End or the marker as a member)?
 bool includesTextBoundary(const re::RE * set);
+// The pattern with the text boundary marker resolved as Start (for a before
+// context, or the first item of a text), End (for an after context, or the
+// last item of a text) or None (no match, for any other item of a text),
+// including within the variables it uses: a variable whose definition
+// includes the marker is replaced by a resolved copy, with the same name.
+enum class BoundaryResolution {Start, End, None};
+// A segment containing the marker is rebuilt; if captures is given, each
+// rebuilt segment is recorded there (for the references to it).
+re::RE * resolveTextBoundary(re::RE * re, BoundaryResolution resolution,
+                             std::map<re::Capture *, re::Capture *> * captures = nullptr);
+// Does a set include the text boundary in some context: Start, End or the
+// marker, possibly through a variable whose definition includes the marker
+// (although a resolved copy of it may not)?
+bool mayIncludeTextBoundary(const re::RE * set);
+// The variable of which a variable is a resolved copy (or the variable itself).
+const re::Name * originalVariable(const re::Name * n);
+// A context for matching with the regular expression engine, as a lookbehind
+// (before context) or lookahead (after context): the text boundary is dropped
+// from the sets that include it (as negated sets do) wherever a character
+// must be matched beyond the set (before it in a before context, after it in
+// an after context), since the start or end of the text cannot then be
+// matched there.  A negated set [^X] that is the last item of the context
+// (the first of a before context) becomes the negative assertion (?!X), or
+// (?<!X) in a before context, which also holds at the start or end of the
+// text.  Variables (other than function calls) whose definitions change are
+// replaced by their changed definitions.
+re::RE * engineContext(re::RE * context, bool afterContext);
 
 // The set of "." in rules, matching any character other than line and
 // paragraph separators: [^[:Zp:][:Zl:]\r\n$]

@@ -10,4 +10,7 @@ SRC
     ldml_trules.cpp
 DEPS
     ldml.transforms
+    re.analysis
+    re.transforms
+    re.unicode
 )

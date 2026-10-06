@@ -31,6 +31,14 @@
 //      elimination in the forward and backward rules.
 //  ldml_trules [--xml] --count-nullable-captures file ...
 //      Report the nullable captures in the source sides of conversion rules.
+//  ldml_trules [--xml] --classify-after-contexts file ...
+//      Classify the after contexts of the conversion rules (forward and
+//      backward, after DisambiguateOrder) by their support in the regular
+//      expression engine as lookaheads: supported (+), unsupported with a
+//      known limitation (b) or unsupported otherwise (c).  Report the rule
+//      counts and the distinct after contexts of each class.  With the
+//      SHOW_BODIES environment variable set, the prepared lookahead bodies of
+//      unsupported after contexts are printed to stderr.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 
@@ -38,6 +46,10 @@
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
+#include <re/analysis/re_analysis.h>
+#include <re/transforms/re_transformer.h>
+#include <re/unicode/regex_passes.h>
+#include <re/printer/re_printer.h>
 #include <cstring>
 #include <map>
 #include <fstream>
@@ -863,6 +875,177 @@ static bool checkOutput(const char * label, const char * input, const std::strin
     return ok;
 }
 
+//
+// Classification of the after contexts of conversion rules by their support
+// in the regular expression engine, as lookaheads (?=after) prepared as for
+// icgrep (property resolution and the RE passes, including the lookahead
+// standardizations) and then compiled as the LookAheadNamer would.
+//
+
+// Replace variables by their definitions (function calls are kept).
+class InlineVariables final : public re::RE_Transformer {
+public:
+    InlineVariables() : RE_Transformer("InlineVariables") {}
+protected:
+    re::RE * transformName(re::Name * n) override {
+        if (isFunctionCall(n) || (n->getDefinition() == nullptr)) return n;
+        return transform(n->getDefinition());
+    }
+};
+
+static void collectLookaheads(re::RE * r, std::vector<re::Assertion *> & found) {
+    using namespace re;
+    if (Assertion * a = llvm::dyn_cast<Assertion>(r)) {
+        if (a->getKind() == Assertion::Kind::LookAhead) found.push_back(a);
+    } else if (Seq * s = llvm::dyn_cast<Seq>(r)) {
+        for (RE * e : *s) collectLookaheads(e, found);
+    } else if (Alt * alt = llvm::dyn_cast<Alt>(r)) {
+        for (RE * e : *alt) collectLookaheads(e, found);
+    } else if (Rep * rep = llvm::dyn_cast<Rep>(r)) {
+        collectLookaheads(rep->getRE(), found);
+    } else if (Capture * c = llvm::dyn_cast<Capture>(r)) {
+        collectLookaheads(c->getCapturedRE(), found);
+    } else if (Group * g = llvm::dyn_cast<Group>(r)) {
+        collectLookaheads(g->getRE(), found);
+    }
+}
+
+static bool containsKind(re::RE * r, bool (*pred)(re::RE *)) {
+    using namespace re;
+    if (pred(r)) return true;
+    if (Seq * s = llvm::dyn_cast<Seq>(r)) {
+        for (RE * e : *s) if (containsKind(e, pred)) return true;
+    } else if (Alt * alt = llvm::dyn_cast<Alt>(r)) {
+        for (RE * e : *alt) if (containsKind(e, pred)) return true;
+    } else if (Rep * rep = llvm::dyn_cast<Rep>(r)) {
+        return containsKind(rep->getRE(), pred);
+    } else if (Capture * c = llvm::dyn_cast<Capture>(r)) {
+        return containsKind(c->getCapturedRE(), pred);
+    } else if (Assertion * a = llvm::dyn_cast<Assertion>(r)) {
+        return containsKind(a->getAsserted(), pred);
+    } else if (Group * g = llvm::dyn_cast<Group>(r)) {
+        return containsKind(g->getRE(), pred);
+    }
+    return false;
+}
+
+static void flattenBody(re::RE * r, std::vector<re::RE *> & elems) {
+    using namespace re;
+    if (Alt * alt = llvm::dyn_cast<Alt>(r)) {
+        if (alt->size() == 1) { flattenBody(alt->front(), elems); return; }
+    } else if (Seq * s = llvm::dyn_cast<Seq>(r)) {
+        for (RE * e : *s) flattenBody(e, elems);
+        return;
+    }
+    elems.push_back(r);
+}
+
+// The class of a lookahead body: "+..." supported, "b..." unsupported with a
+// known limitation, "c..." unsupported, other.
+static std::string classifyLookaheadBody(re::RE * body) {
+    using namespace re;
+    const auto range = getLengthRange(body, &cc::Unicode);
+    if (range.second == 0) return "+zero-width";
+    if (range.first == range.second) return range.first == 1 ? "+one character" : "+fixed length";
+    if (hasUniquePrefix(body)) return "+unique prefix";
+    std::vector<LookaheadSegment> segments;
+    if (parseLookaheadChain(body, &cc::Unicode, segments)) return "+lookahead chain";
+    if (containsKind(body, [](RE * e) { return llvm::isa<Reference>(e); })) return "creference";
+    if (containsKind(body, [](RE * e) { return llvm::isa<Assertion>(e); })) return "cnested lookaround";
+    if (containsKind(body, [](RE * e) { return llvm::isa<Start>(e); })) return "ctext start";
+    if (containsKind(body, [](RE * e) { return llvm::isa<Capture>(e); })) return "bcapture";
+    std::vector<RE *> elems;
+    flattenBody(body, elems);
+    bool nonClassStar = false, variableItem = false;
+    for (RE * e : elems) {
+        const auto r = getLengthRange(e, &cc::Unicode);
+        if (const Rep * rep = llvm::dyn_cast<Rep>(e)) {
+            if (rep->getUB() == Rep::UNBOUNDED_REP) {
+                if (resolveCharClass(rep->getRE()) == nullptr) nonClassStar = true;
+                continue;
+            }
+        }
+        if (r.first != r.second) variableItem = true;
+    }
+    if (nonClassStar) return "bstar of a non-class";
+    if (llvm::isa<End>(elems.back())) return "crun of a class to the end of the text";
+    if (variableItem) return "bvariable-length item (bounded repetition or alternation)";
+    if (llvm::isa<Rep>(elems.back())) return "cending with a star";
+    return "boverlapping star class";
+}
+
+struct AfterContextCounts {
+    std::map<std::string, unsigned> rules;                  // by class
+    std::map<std::string, std::map<std::string, std::string>> examples;   // class -> after context -> file
+};
+
+static void classifyAfterContexts(const std::vector<std::string> & tRules, const std::string & label, AfterContextCounts & counts) {
+    for (const Extract e : {Extract::Forward, Extract::Backward}) {
+        std::vector<Rule *> rules = DisambiguateOrder(extract(parseTransformRules(tRules), e));
+        for (Rule * r : rules) {
+            ConversionRule * const cr = llvm::dyn_cast<ConversionRule>(r);
+            if ((cr == nullptr) || !cr->getSourceSide(Direction::Forward)->hasAfterContext()) continue;
+            re::RE * const after = cr->getSourceSide(Direction::Forward)->getAfterContext();
+            re::RE * inlined = InlineVariables().transformRE(engineContext(after, true));
+            re::RE * la = re::makeAssertion(inlined, re::Assertion::Kind::LookAhead, re::Assertion::Sense::Positive);
+            la = re::resolveModesAndExternalSymbols(la);
+            la = re::regular_expression_passes(la);
+            std::vector<re::Assertion *> lookaheads;
+            collectLookaheads(la, lookaheads);
+            // The class of the context is the least supported class of its lookaheads.
+            auto rank = [](const std::string & c) -> int {
+                static const std::vector<std::string> supported{"+always or never holds", "+zero-width",
+                    "+one character", "+fixed length", "+unique prefix", "+lookahead chain"};
+                for (unsigned i = 0; i < supported.size(); ++i) if (c == supported[i]) return i;
+                return (c[0] == 'b') ? 10 : 20;
+            };
+            std::string cls = "+always or never holds";
+            std::string body;
+            for (re::Assertion * a : lookaheads) {
+                const std::string c = classifyLookaheadBody(a->getAsserted());
+                if (rank(c) > rank(cls)) {
+                    cls = c;
+                    body = Printer_RE::PrintRE(a->getAsserted());
+                }
+            }
+            if ((cls[0] != '+') && getenv("SHOW_BODIES")) {
+                std::cerr << cls << "\t" << label << "\t" << printPattern(after) << "\n    " << body << "\n";
+            }
+            const std::string dir = (e == Extract::Forward) ? "forward" : "backward";
+            counts.rules[dir + " " + cls]++;
+            counts.examples[cls].emplace(printPattern(after), label);
+        }
+    }
+}
+
+// The contexts of the first rule, for the regular expression engine
+// (engineContext), as printed by Printer_RE ("" for no context).
+struct EngineContextTestCase {
+    const char * input;
+    const char * before;
+    const char * after;
+};
+
+static const EngineContextTestCase engineContextTestCases[] = {
+    // A negated set as the outermost item: a negative assertion.
+    {"[^ab] { x } [^cd] → y ;",
+     "NegativeLookBehindAssertion(CC \"Unicode_61_62\" )", "NegativeLookAheadAssertion(CC \"Unicode_63_64\" )"},
+    // A negated set followed (or preceded) by a character: no boundary (and
+    // the outermost item of the before context is a negative assertion).
+    {"[^ab] c { x } c [^de]* e → y ;",
+     "(Seq[NegativeLookBehindAssertion(CC \"Unicode_61_62\" ),CC \"Unicode_63\" ])",
+     "(Seq[CC \"Unicode_63\" ,Rep(Diff (Any(Unicode) , CC \"Unicode_64_65\" ),0,Unbounded),CC \"Unicode_65\" ])"},
+    // A negated set followed only by an optional item: the boundary is kept.
+    {"x } [^cd] e? → y ;", "",
+     "(Seq[(Alt[Diff (Any(Unicode) , CC \"Unicode_63_64\" ),End]),Rep(CC \"Unicode_65\" ,0,1)])"},
+    // The boundary set [$] (End or Start) is kept.
+    {"[$] { x } [$] → y ;", "(Alt[Start,CC \"Unicode\" ])", "(Alt[End,CC \"Unicode\" ])"},
+};
+
+static std::string printEngineContext(re::RE * context, bool after) {
+    return context ? Printer_RE::PrintRE(engineContext(context, after)) : "";
+}
+
 static int runSelfTest() {
     unsigned failures = 0;
     unsigned count = 0;
@@ -1012,6 +1195,23 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
         }
     }
+    for (const EngineContextTestCase & t : engineContextTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.input});
+            const RuleSide * const side = llvm::cast<ConversionRule>(rules[0])->getSourceSide(Direction::Forward);
+            const std::string before = printEngineContext(side->getBeforeContext(), false);
+            const std::string after = printEngineContext(side->getAfterContext(), true);
+            if ((before != t.before) || (after != t.after)) {
+                failures++;
+                std::cerr << "FAIL (engine context): " << t.input << "\n  expected: " << t.before << " | " << t.after
+                          << "\n  actual:   " << before << " | " << after << "\n";
+            }
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     std::cout << (count - failures) << "/" << count << " tests passed\n";
     return failures == 0 ? 0 : 1;
 }
@@ -1028,6 +1228,7 @@ int main(int argc, char * argv[]) {
     bool overlaps = false;
     bool partition = false;
     bool count = false;
+    bool classifyAfter = false;
     std::vector<std::string> files;
     for (int i = 1; i < argc; i++) {
         const std::string arg = argv[i];
@@ -1044,6 +1245,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--overlaps") overlaps = true;
         else if (arg == "--partition") partition = true;
         else if (arg == "--count-nullable-captures") count = true;
+        else if (arg == "--classify-after-contexts") classifyAfter = true;
         else files.push_back(arg);
     }
     if (files.empty()) {
@@ -1054,6 +1256,7 @@ int main(int argc, char * argv[]) {
                   << "       " << argv[0] << " [--xml] [--quiet] --partition file ...\n"
                   << "       " << argv[0] << " [--xml] --count-trivial-captures file ...\n"
                   << "       " << argv[0] << " [--xml] --count-nullable-captures file ...\n"
+                  << "       " << argv[0] << " [--xml] --classify-after-contexts file ...\n"
                   << "       " << argv[0] << " --self-test\n";
         return 2;
     }
@@ -1062,11 +1265,14 @@ int main(int argc, char * argv[]) {
     TrivialCaptureStats trivialTotal;
     OverlapCounts overlapTotal;
     PartitionCounts partitionTotal;
+    AfterContextCounts afterCounts;
     for (const std::string & f : files) {
         try {
             const std::string text = readFile(f);
             const std::vector<std::string> tRules = xml ? extractTRules(text) : std::vector<std::string>{text};
-            if (partition) {
+            if (classifyAfter) {
+                classifyAfterContexts(tRules, f, afterCounts);
+            } else if (partition) {
                 ok &= reportPartition(tRules, f, quiet, partitionTotal);
             } else if (overlaps) {
                 reportOverlaps(tRules, f, quiet, overlapTotal);
@@ -1080,6 +1286,18 @@ int main(int argc, char * argv[]) {
         } catch (const std::exception & e) {
             std::cerr << f << ": " << e.what() << "\n";
             ok = false;
+        }
+    }
+    if (classifyAfter) {
+        // Classes: + supported, b unsupported (known limitation), c unsupported (other).
+        for (const auto & c : afterCounts.rules) {
+            std::cout << c.second << "\t" << c.first << "\n";
+        }
+        for (const auto & c : afterCounts.examples) {
+            std::cout << "\n== " << c.first << " (" << c.second.size() << " distinct after contexts)\n";
+            for (const auto & x : c.second) {
+                std::cout << "  " << x.first << "\t" << x.second << "\n";
+            }
         }
     }
     if (partition) {

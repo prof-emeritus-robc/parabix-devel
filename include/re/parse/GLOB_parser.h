@@ -14,7 +14,13 @@
 //  IEEE-1003.1 XCU section  2.13 Pattern Matching Notation
 
 namespace re {
-    enum class GLOB_kind {Posix, GIT};
+    // Posix: shell filename expansion, in which ? and * (and negated bracket
+    // expressions) do not match a period beginning a path component.
+    // Grep: grep's --include/--exclude patterns (fnmatch without FNM_PERIOD),
+    // in which a leading period is an ordinary character.
+    // GIT: .gitignore patterns, also with ordinary leading periods, and with
+    // the ** forms.
+    enum class GLOB_kind {Posix, Grep, GIT};
     class FileGLOB_Parser : public RE_Parser  {
     public:
         FileGLOB_Parser(const std::string & glob, GLOB_kind k = GLOB_kind::Posix) : RE_Parser(glob),
@@ -26,6 +32,8 @@ namespace re {
         RE * parse_alt() override;
         RE * parse_seq() override;
         RE * parse_next_item() override;
+        // Does a period beginning a path component require a literal match?
+        bool periodRule() const {return mGLOB_kind == GLOB_kind::Posix;}
         RE * parse_bracket_expr();
         RE * range_extend(RE * e1);
     private:

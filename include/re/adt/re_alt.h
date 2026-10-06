@@ -23,6 +23,12 @@ public:
         return false;
     }
     template<typename iterator> static Alt * Create(const iterator begin, const iterator end) {return new Alt(begin, end);}
+    static Alt * Create(std::initializer_list<RE *> list) {
+        return new Alt(list.begin(), list.end());
+    }
+    static Alt * Create() {
+        return new Alt();
+    }
 protected:
     friend Alt * makeAlt();
     template<typename iterator> friend RE * makeAlt(iterator, iterator);

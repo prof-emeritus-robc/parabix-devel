@@ -14,7 +14,7 @@ namespace re { class Name; class Capture; class Reference;}
 
 namespace re {
 
-enum RE_Syntax {FixedStrings, BRE, ERE, FileGLOB, GitGLOB, PCRE, PROSITE};
+enum RE_Syntax {FixedStrings, BRE, ERE, FileGLOB, GrepGLOB, GitGLOB, PCRE, PROSITE};
 
 enum ModeFlagType : unsigned {
     DEFAULT_MODE = 0,
@@ -245,6 +245,7 @@ protected:
     bool                        fByteMode;
     ModeFlagSet                 fModeFlagSet;
     bool                        fNested;
+    bool                        fIgnoreCase = false;    // -i applies (set by parse)
     unsigned                    mGroupsOpen;
     Cursor                      mCursor;
     unsigned                    mCaptureGroupCount;

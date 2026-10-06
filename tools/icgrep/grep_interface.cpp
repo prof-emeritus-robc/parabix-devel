@@ -40,10 +40,6 @@ static cl::opt<re::RE_Syntax, true> RegexpSyntaxOption(cl::desc("Regular express
         clEnumValN(re::RE_Syntax::PROSITE, "PROSITE", "PROSITE protein patterns syntax")),
             cl::cat(re::RE_Options), cl::location(RegexpSyntax), cl::init(re::RE_Syntax::PCRE));
 
-bool IgnoreCaseFlag;
-static cl::opt<bool, true> IgnoreCaseOption("i", cl::location(IgnoreCaseFlag), cl::desc("Ignore case distinctions in the pattern and the file."), cl::cat(re::RE_Options), cl::Grouping);
-static cl::alias IgnoreCaseAlias("ignore-case", cl::desc("Alias for -i"), cl::aliasopt(IgnoreCaseOption));
-
 bool InvertMatchFlag;
 static cl::opt<bool, true> InvertMatchOption("v", cl::location(InvertMatchFlag), cl::desc("Invert match results: select non-matching lines."), cl::cat(re::RE_Options), cl::Grouping);
 static cl::alias InvertMatchAlias("invert-match", cl::desc("Alias for -v"), cl::aliasopt(InvertMatchOption));

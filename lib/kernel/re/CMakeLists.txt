@@ -7,12 +7,16 @@ parabix_add_module(
 NAME
     kernel.re
 SRC
-    regexp_kernel.cpp
+    regexp_engine.cpp
 DEPS
     kernel.pipeline
+    kernel.basis
+    kernel.io
+    kernel.scan
     kernel.bitwise
     kernel.streamutils
     kernel.unicode
+    kernel.util
     re.compile
     re.unicode
     re.transforms

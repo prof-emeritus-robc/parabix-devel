@@ -13,7 +13,7 @@
 namespace cc {class Alphabet;}
 
 namespace re {
-class RE; class Name; class Alt; class Seq;
+class RE; class Name; class Alt; class Seq; class Rep; class Assertion; class CC;
 
 class NameIntroduction : public RE_Transformer {
 public:
@@ -64,6 +64,28 @@ private:
     unsigned mGenSym;
     std::string genSym();
 };
+
+// Name the repeated string class of each unbounded repetition (s1|s2|...){lb,}
+// (outside of assertions) whose strings are over the given code unit alphabet
+// and satisfy isRepeatableStringClass:  the repetition becomes
+// (s1|s2|...){lb} N*, for a name N whose definition is the string class.
+// mStrings maps each name to the strings.
+class StringClassRepNamer final : public NameIntroduction {
+public:
+    StringClassRepNamer(const cc::Alphabet * codeUnitAlphabet);
+    std::map<std::string, std::vector<std::vector<CC *>>> mStrings;
+protected:
+    RE * transformRep (Rep * rep) override;
+    RE * transformAssertion (Assertion * a) override;
+private:
+    const cc::Alphabet * mAlphabet;
+};
+
+// The name of the fixed-length unique prefix of an RE split by
+// ParseUniquePrefix (as Seq[prefix name, suffix]), in its own namespace so
+// that such a split may be recognized.
+Name * makeUniquePrefixName(RE * prefix);
+bool isUniquePrefixName(const Name * n);
 
 RE * canonicalizeExternals(RE * r, const std::vector<std::string> & external_names);
 

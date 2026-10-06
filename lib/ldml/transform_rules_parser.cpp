@@ -167,7 +167,7 @@ struct SetValue {
 };
 
 RE * toSetRE(const SetValue & v) {
-    if (v.boundary) return makeAlt({v.chars, makeStart(), makeEnd()});
+    if (v.boundary) return makeAlt({v.chars, makeTextBoundary()});
     return v.chars;
 }
 
@@ -180,7 +180,7 @@ SetValue fromSetRE(RE * set) {
     if (!includesTextBoundary(def)) return SetValue{set, false};
     std::vector<RE *> members;
     for (RE * a : *cast<Alt>(def)) {
-        if (!isa<Start>(a) && !isa<End>(a)) members.push_back(a);
+        if (!isBoundary(a)) members.push_back(a);
     }
     RE * chars = members.empty() ? makeCC() : makeAlt(members.begin(), members.end());
     return SetValue{chars, true};
@@ -211,7 +211,7 @@ bool isSetOperand(const RE * re) {
     }
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         for (const RE * a : *alt) {
-            if (!isSetOperand(a) && !isa<Start>(a) && !isa<End>(a) && !isa<Seq>(a)) return false;
+            if (!isSetOperand(a) && !isBoundary(a) && !isa<Seq>(a)) return false;
         }
         return true;
     }
@@ -546,13 +546,36 @@ RuleSide * RuleTextParser::parseSide() {
     auto seq = [](std::vector<RE *> & items, size_t b, size_t e) -> RE * {
         return makeSeq(items.begin() + b, items.begin() + e);
     };
+    // The text boundary is the start of the text in the before context, and
+    // the end of the text in the after context.  Segments rebuilt by the
+    // resolution replace the originals for the references of the other side.
+    std::map<Capture *, Capture *> rebuilt;
     auto context = [&](Part p) -> RE * {
         if (!present[p] || parts[p].empty()) return nullptr;
-        return seq(parts[p], 0, parts[p].size());
+        return resolveTextBoundary(seq(parts[p], 0, parts[p].size()),
+                                   p == Before ? BoundaryResolution::Start : BoundaryResolution::End, &rebuilt);
     };
+    // Within the text, the boundary may be matched only by its first item (at
+    // the start of the text) or its last item (at the end of the text).
+    size_t firstItem = 0;
+    while (firstItem < text.size() && text[firstItem] == nullptr) firstItem++;
+    size_t lastItem = text.size();
+    while (lastItem > firstItem && text[lastItem - 1] == nullptr) lastItem--;
+    for (size_t i = firstItem; i < lastItem; i++) {
+        if (text[i] == nullptr) continue;
+        const BoundaryResolution r = (i + 1 == lastItem) ? BoundaryResolution::End
+                                   : (i == firstItem) ? BoundaryResolution::Start : BoundaryResolution::None;
+        text[i] = resolveTextBoundary(text[i], r, &rebuilt);
+    }
     RE * completed = seq(text, 0, completedEnd);
     RE * revisit = seq(text, revisitStart, text.size());
-    return RuleSide::Create(context(Before), completed, cursor, revisit, cursorOffset, context(After));
+    RE * const before = context(Before);
+    RE * const after = context(After);
+    for (Capture * & c : mCaptures) {
+        auto f = rebuilt.find(c);
+        if (f != rebuilt.end()) c = f->second;
+    }
+    return RuleSide::Create(before, completed, cursor, revisit, cursorOffset, after);
 }
 
 //  Parse a sequence of items (literals, quoted strings, sets, variables,

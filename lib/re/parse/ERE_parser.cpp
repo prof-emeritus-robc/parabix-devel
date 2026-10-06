@@ -18,9 +18,9 @@ namespace re {
 RE * ERE_Parser::parse_next_item() {
     if (mCursor.noMore() || atany("*?+{|")) return nullptr;
     else if ((mGroupsOpen > 0) && at(')')) return nullptr;
-    else if (accept('^')) return makeStart();
-    else if (accept('$')) return makeEnd();
-    else if (accept('.')) return makeAny();
+    else if (accept('^')) return Start::Create();
+    else if (accept('$')) return End::Create();
+    else if (accept('.')) return Any::Create();
     else if (accept('(')) return parse_group();
     else if (accept('[')) return parse_bracket_expr();
     else if (accept('\\')) return parse_escaped();
@@ -39,8 +39,8 @@ RE * ERE_Parser::parse_group() {
 RE * ERE_Parser::parse_escaped() {
     if (accept('b')) return makeWordBoundary();
     if (accept('B')) return makeWordNonBoundary();
-    if (accept('s')) return makePropertyExpression("whitespace");
-    if (accept('S')) return makeComplement(makePropertyExpression("whitespace"));
+    if (accept('s')) return PropertyExpression::Create(PropertyExpression::Kind::Codepoint, "whitespace");
+    if (accept('S')) return makeComplement(PropertyExpression::Create(PropertyExpression::Kind::Codepoint, "whitespace"));
     if (accept('<')) return makeWordBegin();
     if (accept('>')) return makeWordEnd();
     if (isdigit(*mCursor)) return parse_back_reference();
@@ -64,10 +64,10 @@ RE * ERE_Parser::parse_bracket_expr () {
             else if (accept(':')) items.push_back(parse_Posix_class());
             else items.push_back(parse_bracket_expr());
         } else {
-            items.push_back(range_extend(makeCC(parse_literal_codepoint())));
+            items.push_back(range_extend(CC::Create(parse_literal_codepoint())));
         }
     } while (mCursor.more() && !at(']'));
-    RE * t = makeAlt(items.begin(), items.end());
+    RE * t = Alt::Create(items.begin(), items.end());
     require(']');
     if (negated) return makeComplement(t);
     else return t;

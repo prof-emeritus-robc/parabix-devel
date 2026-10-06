@@ -41,10 +41,14 @@ bool ParabixObjectCache::mStartedCacheCleanupDaemon = false;
 
 // Cached kernels are keyed by the identity of the running code (the build IDs of
 // the executable and the Parabix libraries), so that rebuilding any of them
-// invalidates the cache automatically.
+// invalidates the cache automatically.  An --object-cache-salt adds a further
+// component, giving experiments their own entries.
 static const std::string & cachePrefix() {
     static const std::string prefix = [] {
         std::string p = "parabix-" + parabix::getBuildIdentity() + "_";
+        if (!codegen::ObjectCacheSalt.empty()) {
+            p += "salt-" + codegen::ObjectCacheSalt + "_";
+        }
         if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
             errs() << "Object cache prefix: " << p << "\n";
         }

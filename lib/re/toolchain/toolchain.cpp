@@ -15,6 +15,10 @@ namespace re {
 cl::OptionCategory RE_Options("A. Regular Expression Interpretation", 
     "These options control regular expression parsing and interpretation");
 
+bool IgnoreCaseFlag;
+static cl::opt<bool, true> IgnoreCaseOption("i", cl::location(IgnoreCaseFlag), cl::desc("Ignore case distinctions in the pattern and the file."), cl::cat(re::RE_Options), cl::Grouping);
+static cl::alias IgnoreCaseAlias("ignore-case", cl::desc("Alias for -i"), cl::aliasopt(IgnoreCaseOption), cl::cat(re::RE_Options));
+
 static cl::bits<RE_PrintFlags>
     PrintOptions(cl::values(clEnumVal(ShowREs, "Show parsed regular expressions and transformations that change them"),
                             clEnumVal(ShowAllREs, "Print all regular expression passes")), cl::cat(codegen::JIT_InfoOptions));

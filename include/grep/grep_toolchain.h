@@ -15,5 +15,6 @@ extern bool ShowExternals;
 extern bool UseByteFilterByMask;
 extern bool UseNestedColourizationPipeline;
 extern bool UsePhaseForColourization;
+extern bool ColourizeByTemplate;
 }
 

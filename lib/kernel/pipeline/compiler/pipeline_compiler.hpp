@@ -409,6 +409,7 @@ public:
     using InternallyGeneratedStreamSetMap = flat_map<Value *, std::pair<Value *, Value>>;
 
     void generateGlobalDataForRepeatingStreamSet(KernelBuilder & b, const unsigned streamSet);
+    void initializeStaticRepeatingStreamSets(KernelBuilder & b);
     void addRepeatingStreamSetBufferProperties(KernelBuilder & b);
     void deallocateRepeatingBuffers(KernelBuilder & b);
     void generateMetaDataForRepeatingStreamSets(KernelBuilder & b);

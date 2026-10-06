@@ -15,6 +15,7 @@ DEPS
     re.parse
     kernel.pipeline
     kernel.basis
+    kernel.bitwise
     kernel.io
     kernel.re
     kernel.scan

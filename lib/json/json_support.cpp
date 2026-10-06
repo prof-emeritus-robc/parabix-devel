@@ -9,7 +9,7 @@
 #include <re/adt/re_re.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <re/adt/adt.h>
 #include <re/adt/re_re.h>
 #include <re/parse/parser.h>
@@ -247,9 +247,6 @@ void EscapeStringTranslation(PipelineBuilder & P, StreamSet * BasisBits, StreamS
 const std::vector<std::string> JSON_Kind_REs = {"null", "true", "false", "-?(?:0|[1-9][0-9]*)(?:[.][0-9]+)?(?:[Ee][-+][0-9]+)?", "\".*\""};
 
 void JSON_Value_Matching(PipelineBuilder & P, JSON_ValueKind val_bitset, StreamSet * BasisBits, StreamSet * fieldStarts, StreamSet * fieldFollows, StreamSet * matches) {
-    RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
-    ctxt.setMatchRegions(fieldStarts, fieldFollows);
     std::string matchRegex = "";
     unsigned i = 0;
     for (JSON_ValueKind k = NullLiteral; k <= QuotedString; k = static_cast<JSON_ValueKind>(k << 1)) {
@@ -261,8 +258,8 @@ void JSON_Value_Matching(PipelineBuilder & P, JSON_ValueKind val_bitset, StreamS
         }
         i++;
     }
-    re::RE * matchRE = toUTF8(re::RE_Parser::parse("^(?:" + matchRegex + ")$"));
-    RE_PipelineBuilder RE_PB(P, ctxt);
+    re::RE * matchRE = re::RE_Parser::parse("^(?:" + matchRegex + ")$");
+    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, BasisBits, fieldStarts, fieldFollows});
     StreamSet * const val_matches = P.CreateStreamSet(1);
     RE_PB.matchSearchPipeline(matchRE, val_matches);
     P.CreateKernelCall<MatchedLinesKernel>(val_matches, fieldFollows, matches);
@@ -270,11 +267,8 @@ void JSON_Value_Matching(PipelineBuilder & P, JSON_ValueKind val_bitset, StreamS
 }
 
 void JSON_Value_Quoted(PipelineBuilder & P, StreamSet * BasisBits, StreamSet * fieldStarts, StreamSet * fieldFollows, StreamSet * quoted) {
-    RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::UTF8, BasisBits);
-    ctxt.setMatchRegions(fieldStarts, fieldFollows);
-    re::RE * quotedRE = toUTF8(re::RE_Parser::parse("^\".*\"$"));
-    RE_PipelineBuilder RE_PB(P, ctxt);
+    re::RE * quotedRE = re::RE_Parser::parse("^\".*\"$");
+    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, BasisBits, fieldStarts, fieldFollows});
     StreamSet * const quotedValues = P.CreateStreamSet(1);
     RE_PB.matchSearchPipeline(quotedRE, quotedValues);
     P.CreateKernelCall<MatchedLinesKernel>(quotedValues, fieldFollows, quoted);

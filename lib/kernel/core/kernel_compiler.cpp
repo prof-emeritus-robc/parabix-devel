@@ -2116,7 +2116,10 @@ void KernelCompiler::registerIllustrator(KernelBuilder & b,
         ids[n] = b.getSize(0);
         ArrayType * arTy = ArrayType::get(sizeTy, n + 1);
         Constant * ar = ConstantArray::get(arTy, ids);
-        GlobalVariable * const gv = new GlobalVariable(*b.getModule(), arTy, true, GlobalValue::ExternalLinkage, ar);
+        // (Private: an unnamed external global would be emitted with the same
+        // generated name by every illustrated kernel, and the objects of the
+        // later kernels would then fail to link.)
+        GlobalVariable * const gv = new GlobalVariable(*b.getModule(), arTy, true, GlobalValue::PrivateLinkage, ar);
         loopIdConstant = gv;
     }
     args[11] = loopIdConstant;

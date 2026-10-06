@@ -24,7 +24,7 @@
 #include <pablo/pablo.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <grep/grep_kernel.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <toolchain/toolchain.h>
 #include <fileselect/file_select.h>
 #include <fcntl.h>

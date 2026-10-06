@@ -96,6 +96,16 @@ RE * FixedSpanNamer::transform(RE * r) {
     return makeAlt(mNewAlts.begin(), mNewAlts.end());
 }
 
+static const std::string UniquePrefixNamespace = "uniquePrefix";
+
+Name * makeUniquePrefixName(RE * prefix) {
+    return makeName(UniquePrefixNamespace, Printer_RE::PrintRE(prefix), prefix);
+}
+
+bool isUniquePrefixName(const Name * n) {
+    return n->hasNamespace() && n->getNamespace() == UniquePrefixNamespace;
+}
+
 UniquePrefixNamer::UniquePrefixNamer() : NameIntroduction("UniquePrefixNamer") {}
 
 RE * UniquePrefixNamer::transform(RE * r) {
@@ -109,8 +119,7 @@ RE * UniquePrefixNamer::transform(RE * r) {
                 alts.push_back(e);
             } else {
                 fixedPrefixFound = true;
-                std::string prefixName = Printer_RE::PrintRE(prefix);
-                Name * pfx = makeName(prefixName, prefix);
+                Name * pfx = makeUniquePrefixName(prefix);
                 std::string altName = Printer_RE::PrintRE(e);
                 Name * n = createName(altName, makeSeq({pfx, suffix}));
                 alts.push_back(n);
@@ -126,8 +135,7 @@ RE * UniquePrefixNamer::transform(RE * r) {
     if (isEmptySeq(prefix) || isEmptySeq(suffix)) {
         return r;
     }
-    std::string prefixName = Printer_RE::PrintRE(prefix);
-    Name * pfx = makeName(prefixName, prefix);
+    Name * pfx = makeUniquePrefixName(prefix);
     std::string rName = Printer_RE::PrintRE(r);
     return createName(rName, makeSeq({pfx, suffix}));
 }
@@ -268,6 +276,36 @@ RE * Repeated_CC_Seq_Namer::transform(RE * r) {
         return makeAlt(newAlts.begin(), newAlts.end());
     }
     return r;
+}
+
+StringClassRepNamer::StringClassRepNamer(const cc::Alphabet * codeUnitAlphabet) :
+    NameIntroduction("StringClassRepNamer"), mAlphabet(codeUnitAlphabet) {}
+
+RE * StringClassRepNamer::transformAssertion(Assertion * a) {
+    return a;
+}
+
+RE * StringClassRepNamer::transformRep(Rep * rep) {
+    RE * const repeated = rep->getRE();
+    const int lb = rep->getLB();
+    if ((rep->getUB() != Rep::UNBOUNDED_REP) || (resolveCharClass(repeated) != nullptr)) {
+        return RE_Transformer::transformRep(rep);
+    }
+    std::vector<std::vector<CC *>> strings;
+    if (!parseStringClass(repeated, strings) || !isRepeatableStringClass(strings)) {
+        return RE_Transformer::transformRep(rep);
+    }
+    for (const auto & str : strings) {
+        for (CC * cc : str) {
+            if (cc->getAlphabet() != mAlphabet) return RE_Transformer::transformRep(rep);
+        }
+    }
+    const std::string name = "StrRep_" + kernel::Kernel::getStringHash(Printer_RE::PrintRE(repeated));
+    Name * n = createName(name, repeated);
+    mStrings.emplace(n->getFullName(), std::move(strings));
+    RE * const star = makeRep(n, 0, Rep::UNBOUNDED_REP);
+    if (lb == 0) return star;
+    return makeSeq({makeRep(repeated, lb, lb), star});
 }
 
 class Canonical_External_Names : public RE_Transformer {

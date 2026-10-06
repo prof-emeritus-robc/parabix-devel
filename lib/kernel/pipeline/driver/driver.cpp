@@ -167,6 +167,17 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         }
     }
 
+    // A preserved kernel may be added again (e.g. reused as a family call in a
+    // later pipeline).  Transfer its ownership rather than taking a second one,
+    // which would delete it twice once preserved kernels are released.
+    for (auto i = mPreservedKernel.rbegin(); i != mPreservedKernel.rend(); ++i) {
+        if (i->get() == kernel) {
+            i->release();
+            mPreservedKernel.erase(std::next(i).base());
+            break;
+        }
+    }
+
     mUncachedKernel.emplace_back(kernel);
 
 }

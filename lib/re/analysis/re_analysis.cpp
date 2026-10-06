@@ -361,6 +361,18 @@ bool hasReference(const RE * r) {
     return !ReferenceFree().validateRE(r);
 }
 
+struct AssertionFree : public RE_Validator {
+    AssertionFree() : RE_Validator("AssertionFree") {}
+
+    bool validateAssertion(const Assertion * a) override {
+        return false;
+    }
+};
+
+bool hasAssertion(const RE * r) {
+    return !AssertionFree().validateRE(r);
+}
+
 struct PropertyReferenceFree : public RE_Validator {
     PropertyReferenceFree() : RE_Validator("PropertyReferenceFree") {}
 
@@ -503,6 +515,61 @@ bool anyEndAnchor(const RE * re) {
 
 
 
+//  Track the UTF-8 decoding state through re: pending is the number of
+//  continuation bytes still expected, and chars counts completed characters.
+//  Every string matched by re must drive the state identically; otherwise
+//  (or for anything other than UTF-8 code unit CCs) return false.
+static bool trackUTF8Characters(const RE * re, unsigned & pending, unsigned & chars) {
+    if (const CC * cc = dyn_cast<CC>(re)) {
+        if ((cc->getAlphabet() != &cc::UTF8) || cc->empty()) return false;
+        const auto lo = lo_codepoint(cc->front());
+        const auto hi = hi_codepoint(cc->back());
+        if (pending > 0) {
+            if ((lo < 0x80) || (hi > 0xBF)) return false;
+            if (--pending == 0) ++chars;
+        } else if (hi <= 0x7F) {
+            ++chars;
+        } else if ((lo >= 0xC0) && (hi <= 0xDF)) {
+            pending = 1;
+        } else if ((lo >= 0xE0) && (hi <= 0xEF)) {
+            pending = 2;
+        } else if ((lo >= 0xF0) && (hi <= 0xF7)) {
+            pending = 3;
+        } else {
+            return false;
+        }
+        return true;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) {
+            if (!trackUTF8Characters(e, pending, chars)) return false;
+        }
+        return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        if (alt->empty()) return false;
+        bool first = true;
+        unsigned altPending = 0, altChars = 0;
+        for (const RE * e : *alt) {
+            unsigned p = pending, c = chars;
+            if (!trackUTF8Characters(e, p, c)) return false;
+            if (first) {
+                altPending = p; altChars = c; first = false;
+            } else if ((p != altPending) || (c != altChars)) {
+                return false;
+            }
+        }
+        pending = altPending;
+        chars = altChars;
+        return true;
+    }
+    return false;
+}
+
+//  Does every string matched by re encode exactly one character in UTF-8?
+bool isUTF8EncodedCharacter(const RE * re) {
+    unsigned pending = 0, chars = 0;
+    return trackUTF8Characters(re, pending, chars) && (pending == 0) && (chars == 1);
+}
+
 # define End_Lookahead 1
 unsigned grepOffset(const RE * re) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
@@ -562,6 +629,280 @@ unsigned grepOffset(const RE * re) {
         return 0;
     }
     UnexpectedRE("grepOffset", re);
+}
+
+CC * resolveCharClass(RE * r) {
+    if (CC * cc = resolveToCC(r)) return cc;
+    if (const Any * a = dyn_cast<Any>(r)) {
+        return makeCC(0, UCD::UNICODE_MAX, a->getAlphabet());
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        CC * u = nullptr;
+        for (RE * e : *alt) {
+            CC * cc = resolveCharClass(e);
+            if ((cc == nullptr) || (u && (u->getAlphabet() != cc->getAlphabet()))) return nullptr;
+            u = u ? makeCC(u, cc) : cc;
+        }
+        return u;
+    } else if (const Diff * d = dyn_cast<Diff>(r)) {
+        CC * lh = resolveCharClass(d->getLH());
+        CC * rh = resolveCharClass(d->getRH());
+        if (lh && rh && (lh->getAlphabet() == rh->getAlphabet())) return subtractCC(lh, rh);
+    } else if (const Intersect * x = dyn_cast<Intersect>(r)) {
+        CC * lh = resolveCharClass(x->getLH());
+        CC * rh = resolveCharClass(x->getRH());
+        if (lh && rh && (lh->getAlphabet() == rh->getAlphabet())) return intersectCC(lh, rh);
+    }
+    return nullptr;
+}
+
+//  The class of characters that can begin a match of r (which matches at
+//  least one character), or nullptr if it cannot be determined.
+static CC * firstCharClass(RE * r) {
+    if (CC * cc = resolveCharClass(r)) return cc;
+    if (const Seq * seq = dyn_cast<Seq>(r)) {
+        if (seq->empty() || (getLengthRange(seq->front(), &cc::Unicode).first == 0)) return nullptr;
+        return firstCharClass(seq->front());
+    } else if (const Rep * rep = dyn_cast<Rep>(r)) {
+        if (rep->getLB() == 0) return nullptr;
+        return firstCharClass(rep->getRE());
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        CC * u = nullptr;
+        for (RE * e : *alt) {
+            CC * cc = firstCharClass(e);
+            if ((cc == nullptr) || (u && (u->getAlphabet() != cc->getAlphabet()))) return nullptr;
+            u = u ? makeCC(u, cc) : cc;
+        }
+        return u;
+    } else if (const Name * n = dyn_cast<Name>(r)) {
+        if (n->getDefinition()) return firstCharClass(n->getDefinition());
+    } else if (const Capture * c = dyn_cast<Capture>(r)) {
+        return firstCharClass(c->getCapturedRE());
+    } else if (const Group * g = dyn_cast<Group>(r)) {
+        return firstCharClass(g->getRE());
+    }
+    return nullptr;
+}
+
+//  The elements of r as a sequence, seeing through nested sequences and
+//  single alternatives (which unsimplified REs may contain).
+static void flattenSeq(RE * r, std::vector<RE *> & elems) {
+    if (const Alt * alt = dyn_cast<Alt>(r)) {
+        if (alt->size() == 1) {
+            flattenSeq(alt->front(), elems);
+            return;
+        }
+    } else if (const Seq * seq = dyn_cast<Seq>(r)) {
+        for (RE * e : *seq) {
+            flattenSeq(e, elems);
+        }
+        return;
+    }
+    elems.push_back(r);
+}
+
+bool parseStringClass(RE * r, std::vector<std::vector<CC *>> & strings) {
+    std::vector<RE *> alternatives;
+    std::vector<RE *> pending{r};
+    while (!pending.empty()) {
+        RE * a = pending.back();
+        pending.pop_back();
+        if (const Name * n = dyn_cast<Name>(a)) {
+            if (n->getDefinition() == nullptr) return false;
+            pending.push_back(n->getDefinition());
+        } else if (const Alt * alt = dyn_cast<Alt>(a)) {
+            for (RE * e : *alt) pending.push_back(e);
+        } else {
+            alternatives.push_back(a);
+        }
+    }
+    bool multi = false;
+    for (RE * a : alternatives) {
+        std::vector<RE *> items;
+        flattenSeq(a, items);
+        std::vector<CC *> str;
+        for (RE * item : items) {
+            CC * const cc = resolveCharClass(item);
+            if ((cc == nullptr) || cc->empty()) return false;
+            str.push_back(cc);
+        }
+        if (str.empty()) return false;
+        multi |= (str.size() > 1);
+        strings.push_back(std::move(str));
+    }
+    return multi;
+}
+
+// Can the strings s (at offset i) and t (at offset 0) match the same text
+// over the k positions starting at offset i of s and 0 of t?
+static bool overlaps(const std::vector<CC *> & s, size_t i, const std::vector<CC *> & t, size_t k) {
+    for (size_t j = 0; j < k; ++j) {
+        if (!s[i + j]->intersects(*t[j])) return false;
+    }
+    return true;
+}
+
+bool isRepeatableStringClass(const std::vector<std::vector<CC *>> & strings) {
+    for (const auto & s : strings) {
+        for (const auto & t : strings) {
+            // (A) No proper suffix of s matches a proper prefix of t.
+            const size_t m = std::min(s.size(), t.size());
+            for (size_t k = 1; k < m; ++k) {
+                if (overlaps(s, s.size() - k, t, k)) return false;
+            }
+            // (B) No occurrence of t lies strictly within s.
+            for (size_t i = 1; i + t.size() < s.size(); ++i) {
+                if (overlaps(s, i, t, t.size())) return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments,
+                         bool requireStar) {
+    segments.clear();
+    std::vector<RE *> elems;
+    flattenSeq(body, elems);
+    // Group the elements into star segments and maximal fixed segments.
+    std::vector<RE *> fixed;
+    auto closeFixed = [&]() -> bool {
+        if (fixed.empty()) return true;
+        RE * const F = makeSeq(fixed.begin(), fixed.end());
+        fixed.clear();
+        const auto range = getLengthRange(F, lengthAlpha);
+        if ((range.first != range.second) || (range.first < 1) || (grepOffset(F) != 0)) return false;
+        segments.push_back(LookaheadSegment{false, false, nullptr, F, 0, range.first});
+        return true;
+    };
+    bool hasStar = false;
+    for (unsigned i = 0; i < elems.size(); ++i) {
+        RE * const e = elems[i];
+        if (const Rep * rep = dyn_cast<Rep>(e)) {
+            if (rep->getUB() == Rep::UNBOUNDED_REP) {
+                CC * const X = resolveCharClass(rep->getRE());
+                std::vector<std::vector<CC *>> strings;
+                if (X == nullptr && rep->getLB() <= 1 && parseStringClass(rep->getRE(), strings)) {
+                    // A string class (see isRepeatableStringClass).
+                    if (!isRepeatableStringClass(strings) || !closeFixed()) return false;
+                    CC * first = makeCC();
+                    CC * later = makeCC();
+                    for (const auto & str : strings) {
+                        first = makeCC(first, str[0]);
+                        for (size_t k = 1; k < str.size(); ++k) later = makeCC(later, str[k]);
+                    }
+                    LookaheadSegment seg{true, false, makeCC(first, later), rep->getRE(), rep->getLB(), 0};
+                    seg.strings = std::move(strings);
+                    seg.first = first;
+                    segments.push_back(std::move(seg));
+                    hasStar = true;
+                    continue;
+                }
+                if ((X == nullptr) || !closeFixed()) return false;
+                segments.push_back(LookaheadSegment{true, false, X, rep->getRE(), rep->getLB(), 0});
+                hasStar = true;
+                continue;
+            }
+        }
+        // Final one-character lookaheads (?=Y) or (?!Y), which must all hold.
+        if (isa<Assertion>(e)) {
+            if ((fixed.empty() && segments.empty()) || !closeFixed()) return false;
+            CC * holds = nullptr;
+            bool negated = true;
+            std::vector<Assertion *> assertions;
+            for (unsigned j = i; j < elems.size(); ++j) {
+                Assertion * const la = dyn_cast<Assertion>(elems[j]);
+                if ((la == nullptr) || (la->getKind() != Assertion::Kind::LookAhead)) return false;
+                CC * const Y = resolveCharClass(la->getAsserted());
+                if (Y == nullptr) return false;
+                const bool neg = la->getSense() == Assertion::Sense::Negative;
+                CC * const h = neg ? subtractCC(makeCC(0, 0x10FFFF, Y->getAlphabet()), Y) : Y;
+                if (holds && (holds->getAlphabet() != h->getAlphabet())) return false;
+                holds = holds ? intersectCC(holds, h) : h;
+                negated &= neg;
+                assertions.push_back(la);
+            }
+            LookaheadSegment seg{false, true, holds, e, 0, 0};
+            seg.negated = negated;
+            seg.assertions = std::move(assertions);
+            segments.push_back(std::move(seg));
+            break;
+        }
+        // The end of the text directly after a star (with no fixed segment
+        // to include it) is a segment of its own, which must be the last.
+        if (isa<End>(e) && fixed.empty() && !segments.empty() && segments.back().star) {
+            if (i != elems.size() - 1) return false;
+            segments.push_back(LookaheadSegment{false, true, nullptr, e, 0, 0});
+            continue;
+        }
+        fixed.push_back(e);
+    }
+    if (!closeFixed() || (requireStar && !hasStar) || segments.back().star) return false;
+    // From the right, each star class is disjoint from the characters that
+    // can begin the rest of the body, so that its runs are maximal.  (Runs end
+    // before the end of the text anyway, so the end segment allows any star
+    // class.)  A star of a class X that is not disjoint is a star of the
+    // string class of the one-character strings of X, which requires no
+    // disjointness (the rest may hold at any end of an occurrence): X{lb,} is
+    // then X{lb-1} X+ for lb > 1.
+    CC * restFirst = nullptr;
+    std::vector<size_t> extended;   // the converted stars with lb > 1
+    for (auto i = segments.rbegin(); i != segments.rend(); ++i) {
+        if (i->end) {
+            restFirst = i->cc ? i->cc : makeCC();
+        } else if (i->star) {
+            if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
+            if (i->strings.empty() && !intersectCC(i->cc, restFirst)->empty()) {
+                i->strings = {{i->cc}};
+                i->first = i->cc;
+                if (i->lb > 1) extended.push_back(segments.rend() - i - 1);
+            }
+            if (i->lb == 0) {
+                restFirst = makeCC(i->first ? i->first : i->cc, restFirst);
+            } else {
+                restFirst = i->first ? i->first : i->cc;
+            }
+        } else {
+            restFirst = firstCharClass(i->re);
+            if (restFirst == nullptr) return false;
+        }
+    }
+    // Insert the fixed X{lb-1} before each converted X{lb,} (from the right,
+    // so that the recorded positions remain valid).
+    for (size_t k : extended) {
+        LookaheadSegment & seg = segments[k];
+        RE * const fixedRE = makeRep(seg.re, seg.lb - 1, seg.lb - 1);
+        const auto range = getLengthRange(fixedRE, lengthAlpha);
+        if (range.first != range.second) return false;
+        LookaheadSegment fixedSeg{false, false, nullptr, fixedRE, 0, range.first};
+        seg.lb = 1;
+        segments.insert(segments.begin() + k, fixedSeg);
+    }
+    return true;
+}
+
+bool hasUniquePrefix(RE * body) {
+    std::vector<RE *> elems;
+    flattenSeq(body, elems);
+    RE * prefix, * suffix;
+    std::tie(prefix, suffix) = ParseUniquePrefix(makeSeq(elems.begin(), elems.end()));
+    return !isEmptySeq(prefix) && !isEmptySeq(suffix);
+}
+
+struct LookaheadChainFree : public RE_Validator {
+    LookaheadChainFree() : RE_Validator("LookaheadChainFree") {}
+
+    bool validateAssertion(const Assertion * a) override {
+        if (a->getKind() == Assertion::Kind::LookAhead) {
+            std::vector<LookaheadSegment> segments;
+            if (!hasUniquePrefix(a->getAsserted()) &&
+                    parseLookaheadChain(a->getAsserted(), &cc::Unicode, segments)) return false;
+        }
+        return validate(a->getAsserted());
+    }
+};
+
+bool hasLookaheadChain(const RE * r) {
+    return !LookaheadChainFree().validateRE(r);
 }
 
 }

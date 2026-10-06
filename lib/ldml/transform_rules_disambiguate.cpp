@@ -43,7 +43,7 @@ bool hasStringsOrBoundary(const RE * re) {
     }
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         for (const RE * a : *alt) {
-            if (isa<Seq>(a) || isa<Start>(a) || isa<End>(a) || hasStringsOrBoundary(a)) return true;
+            if (isa<Seq>(a) || isBoundary(a) || hasStringsOrBoundary(a)) return true;
         }
     }
     return false;
@@ -58,15 +58,16 @@ static bool hasBoundary(const RE * re);
 // variable).
 static bool isBoundaryItem(const RE * re) {
     while (const Name * n = dyn_cast<Name>(re)) {
+        if (isTextBoundary(n)) return true;
         if (isFunctionCall(n) || n->getDefinition() == nullptr) return false;
         re = n->getDefinition();
     }
-    if (isa<Start>(re) || isa<End>(re) || isTextBoundary(re)) return true;
+    if (isBoundary(re)) return true;
     // [$]: the boundary with no characters.
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         bool boundary = false;
         for (const RE * a : *alt) {
-            if (isa<Start>(a) || isa<End>(a)) {
+            if (isBoundary(a)) {
                 boundary = true;
             } else if (!isa<CC>(a) || !cast<CC>(a)->empty()) {
                 return false;
@@ -765,9 +766,9 @@ private:
         if (distinct.empty()) return makeCC();
         return distinct.size() == 1 ? distinct[0] : makeAlt(distinct.begin(), distinct.end());
     }
-    // A negated set, which also matches beyond the ends of the text unless
-    // excluding the boundary.
-    RE * negated(const std::vector<RE *> & sets, bool boundary) {
+    // A negated set, which also matches the text boundary (Start or End for a
+    // before or after context) unless boundary is nullptr.
+    RE * negated(const std::vector<RE *> & sets, RE * boundary) {
         // (Of the characters of the sets: their strings begin with them.)
         std::vector<RE *> chars;
         for (RE * set : sets) {
@@ -776,7 +777,7 @@ private:
             chars.push_back(strings.empty() ? set : charPart(set, mAnalysis.setOf(set, false)));
         }
         RE * complement = makeDiff(makeAny(), unionOf(chars));
-        return boundary ? makeAlt({complement, makeStart(), makeEnd()}) : complement;
+        return boundary ? makeAlt({complement, boundary}) : complement;
     }
     RE * subtract(RE * x, const UCD::UnicodeSet & k);
     const NFA & automaton(const Earlier & e, bool after) const {
@@ -1072,7 +1073,7 @@ static bool hasBoundary(const RE * re) {
     }
     if (const Alt * alt = dyn_cast<Alt>(re)) {
         for (const RE * a : *alt) {
-            if (isa<Start>(a) || isa<End>(a) || hasBoundary(a)) return true;
+            if (isBoundary(a) || hasBoundary(a)) return true;
         }
     }
     return false;
@@ -1080,13 +1081,15 @@ static bool hasBoundary(const RE * re) {
 
 // The characters of a set without its strings and text boundary.
 static RE * charPart(RE * re, const UCD::UnicodeSet & chars) {
-    if (!hasStringsOrBoundary(re)) return re;
+    // (A variable that includes the boundary in some context is replaced by
+    // its characters, as a use elsewhere may resolve the boundary differently.)
+    if (!hasStringsOrBoundary(re) && !mayIncludeTextBoundary(re)) return re;
     if (Alt * alt = dyn_cast<Alt>(re)) {
         std::vector<RE *> members;
         for (RE * a : *alt) {
-            if (!isa<Seq>(a) && !isa<Start>(a) && !isa<End>(a) && !hasStringsOrBoundary(a)) {
+            if (!isa<Seq>(a) && !isBoundary(a) && !hasStringsOrBoundary(a)) {
                 members.push_back(a);
-            } else if (!isa<Seq>(a) && !isa<Start>(a) && !isa<End>(a)) {
+            } else if (!isa<Seq>(a) && !isBoundary(a)) {
                 return makeCC(chars);
             }
         }
@@ -1641,14 +1644,15 @@ bool Disambiguator::explore(const std::vector<Earlier> & rules, bool after, std:
         std::vector<RE *> excluded = edgeSets;
         excluded.insert(excluded.end(), candidateSets.begin(), candidateSets.end());
         std::vector<Step> p = path;
-        p.push_back(Step{negated(excluded, boundaryFails), -1});
+        RE * const boundary = after ? static_cast<RE *>(makeEnd()) : static_cast<RE *>(makeStart());
+        p.push_back(Step{negated(excluded, boundaryFails ? boundary : nullptr), -1});
         out.push_back(Found{p, pending, done});
     }
     // The text boundary: matched by a boundary item of L, or beyond L.
     if (boundaryAllowed && (!boundaryNext.empty() || boundaryItem >= 0)) {
         const LState lNext = boundaryItem >= 0 ? lAdvance(lItems, boundaryItem, boundaryCount) : done;
         std::vector<Step> b = path;
-        b.push_back(Step{makeTextBoundary(), boundaryItem});
+        b.push_back(Step{makeBoundarySet(!after), boundaryItem});
         if (boundaryNext.empty()) {
             out.push_back(Found{b, pending, lNext});    // all the rules fail
         } else if (!explore(rules, after, boundaryNext, lNext, b, pending, true, seen, out)) {
@@ -1911,8 +1915,7 @@ private:
         std::vector<std::vector<std::vector<codepoint_t>>> longer;
     };
     bool splittable(RE * re) {
-        return CharSetAnalysis::isSet(re) && hasStringsOrBoundary(re) && !isa<Start>(re) && !isa<End>(re)
-            && !isTextBoundary(re);
+        return CharSetAnalysis::isSet(re) && hasStringsOrBoundary(re) && !isBoundary(re);
     }
     bool collect(RE * re, bool segments, std::vector<Leaf> & leaves);
     bool alternatives(Leaf & leaf, bool reversed, bool outermost);
@@ -1975,7 +1978,7 @@ bool AlternativeSplitter::alternatives(Leaf & leaf, bool reversed, bool outermos
         leaf.longer.push_back(longer);
     }
     if (hasBoundary(re)) {
-        leaf.alternatives.push_back(makeTextBoundary());
+        leaf.alternatives.push_back(makeBoundarySet(reversed));
         leaf.longer.emplace_back();
     }
     return true;
@@ -1997,7 +2000,7 @@ RE * AlternativeSplitter::rebuild(RE * re, bool segments, const std::vector<RE *
         Capture * c = cast<Capture>(re);
         RE * captured = rebuild(c->getCapturedRE(), segments, choice, next, captures);
         if (captured == c->getCapturedRE()) return re;
-        if (isa<Start>(captured) || isa<End>(captured) || isTextBoundary(captured)) {
+        if (isBoundary(captured)) {
             // A segment of the text boundary alone is empty (keeping the
             // numbering of the segments).
             Capture * rebuilt = makeCapture(c->getName(), makeSeq());

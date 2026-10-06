@@ -54,7 +54,7 @@ std::string BitMovementMode_string(BitMovementMode m) {
 }
 
 std::string PabloIllustrateKernelRegEx = "";
-static cl::opt<std::string, true> PabloIllustrateKernelOption("pablo-illustrate-kernel", cl::location(PabloIllustrateBitstreamRegEx), cl::ValueOptional,
+static cl::opt<std::string, true> PabloIllustrateKernelOption("pablo-illustrate-kernel", cl::location(PabloIllustrateKernelRegEx), cl::ValueOptional,
     cl::desc("RegEx describing Pablo kernel names to illustrate"), cl::value_desc("regex"), cl::cat(codegen::InstrumentationOptions));
 
 

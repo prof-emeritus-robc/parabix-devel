@@ -18,6 +18,7 @@
 #include <re/transforms/name_lookaheads.h>
 #include <re/toolchain/toolchain.h>
 #include <re/printer/re_printer.h>
+#include <set>
 
 namespace pablo { class PabloAST; }
 namespace pablo { class Var; }
@@ -43,6 +44,11 @@ private:
 
     Marker compile(RE * re);
     Marker compile(RE * re, Marker initialMarkers);
+    // The matches of an RE starting at every position (in the given position
+    // convention), compiled in the entry scope (see compileEverywhere).
+    Marker compileEverywhere(RE * re, RE_Compiler::Marker::Position p);
+    // The same, for a sequence of items, each processed in turn.
+    Marker compileEverywhere(const std::vector<RE *> & items, RE_Compiler::Marker::Position p);
 
     Marker compileName(Name * name, Marker marker);
     Marker compileAny(Marker marker);
@@ -83,7 +89,33 @@ private:
 using Position = RE_Compiler::Marker::Position;
 
 inline Marker RE_Block_Compiler::compile(RE * const re) {
-    return process(re, Marker(mPB.createOnes(), Position::AtNextCodeUnit));
+    return compileEverywhere(re, Position::AtNextCodeUnit);
+}
+
+//
+//  Matches that start everywhere do not depend on the current marker, so they
+//  are compiled in the entry scope.  Within an If scope on the marker, the
+//  carries of their computation (e.g. Advances over the code units of a
+//  character crossing a block boundary) would be lost in blocks where the
+//  marker is empty.  (Their compilation is outside any enclosing star.)
+//
+Marker RE_Block_Compiler::compileEverywhere(RE * const re, Position p) {
+    return compileEverywhere(std::vector<RE *>{re}, p);
+}
+
+Marker RE_Block_Compiler::compileEverywhere(const std::vector<RE *> & items, Position p) {
+    PabloBuilder entry(mMain.mEntryScope);
+    RE_Block_Compiler entryCompiler(mMain, entry);
+    const int starDepth = mMain.mStarDepth;
+    PabloAST * const whileTest = mMain.mWhileTest;
+    mMain.mStarDepth = 0;
+    Marker m(entry.createOnes(), p);
+    for (RE * re : items) {
+        m = entryCompiler.process(re, m);
+    }
+    mMain.mStarDepth = starDepth;
+    mMain.mWhileTest = whileTest;
+    return m;
 }
 
 inline Marker RE_Block_Compiler::compile(RE * const re, Marker initialMarkers) {
@@ -190,7 +222,7 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
             // at the final byte of the code unit sequence.  We compile the
             // definition and align the marker based on the final position of
             // the compiled code unit sequence sequence.
-            auto nameMarker = compile(defn, Marker(mPB.createOnes(), Position::AtNextChar));
+            auto nameMarker = compileEverywhere(defn, Position::AtNextChar);
             PabloAST * nextPos = marker.stream();
             if (marker.position() == Position::AtEnd) {
                 nextPos = mPB.createIndexedAdvance(nextPos, mMain.mIndexStream, 1);
@@ -201,7 +233,8 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
         }
     }
     auto ext = f->second;
-    unsigned amt = NamedLookAheadAmount(name, *mMain.mCodeUnitAlphabet);
+    // A named lookahead: the external marks its starts, offset as given.
+    const unsigned amt = ext.fromFirst() ? ext.offset() : 0;
     if (amt > 0) {
         // Named lookahead expression.  The external stream marks where the
         // positive lookahead holds; negate it here for a negative lookahead, so
@@ -215,11 +248,24 @@ Marker RE_Block_Compiler::compileName(Name * const name, Marker marker) {
             }
             return la;
         };
+        // The offset counts code units from the start of the lookahead.
         if (marker.position() == Position::AtEnd) {
             return Marker(mPB.createAnd(marker.stream(), lookahead(amt)));
-        } else {
+        } else if (mMain.mIndexingAlphabet == nullptr) {
             PabloAST * nextPos = NextCharacter(marker, mPB);
             return Marker(mPB.createAnd(nextPos, lookahead(amt - 1)), Position::AtNextChar);
+        } else if (marker.position() == Position::AtNextCodeUnit) {
+            // At the first code unit of the next character.
+            return Marker(mPB.createAnd(marker.stream(), lookahead(amt - 1)), Position::AtNextCodeUnit);
+        } else {
+            // At the final code unit of the next character: the lookahead is
+            // evaluated at the first code units of characters (those after an
+            // index position, or at the start), and moved to their final ones.
+            PabloAST * const idx = mMain.mIndexStream;
+            PabloAST * const charStarts = mPB.createNot(mPB.createAdvance(mPB.createNot(idx), 1), "charStarts");
+            PabloAST * const atStarts = mPB.createAnd(charStarts, lookahead(amt - 1));
+            PabloAST * const atFinals = ScanToIndex(atStarts, idx, mPB);
+            return Marker(mPB.createAnd(marker.stream(), atFinals), Position::AtNextChar);
         }
     }
     auto externalLength = ext.minLength();
@@ -313,62 +359,6 @@ Marker RE_Block_Compiler::compileSeqTail(Seq::const_iterator current, const Seq:
 //  sequence elements that encode that multibyte character, or 0 if no special
 //  treatment is needed (including single-byte characters, for which the first
 //  and final code units coincide).
-//
-//  Track the UTF-8 decoding state through re: pending is the number of
-//  continuation bytes still expected, and chars counts completed characters.
-//  Every string matched by re must drive the state identically; otherwise
-//  (or for anything other than UTF-8 code unit CCs) return false.
-static bool trackUTF8Characters(const RE * re, unsigned & pending, unsigned & chars) {
-    if (const CC * cc = dyn_cast<CC>(re)) {
-        if ((cc->getAlphabet() != &cc::UTF8) || cc->empty()) return false;
-        const auto lo = lo_codepoint(cc->front());
-        const auto hi = hi_codepoint(cc->back());
-        if (pending > 0) {
-            if ((lo < 0x80) || (hi > 0xBF)) return false;
-            if (--pending == 0) ++chars;
-        } else if (hi <= 0x7F) {
-            ++chars;
-        } else if ((lo >= 0xC0) && (hi <= 0xDF)) {
-            pending = 1;
-        } else if ((lo >= 0xE0) && (hi <= 0xEF)) {
-            pending = 2;
-        } else if ((lo >= 0xF0) && (hi <= 0xF7)) {
-            pending = 3;
-        } else {
-            return false;
-        }
-        return true;
-    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        for (const RE * e : *seq) {
-            if (!trackUTF8Characters(e, pending, chars)) return false;
-        }
-        return true;
-    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
-        if (alt->empty()) return false;
-        bool first = true;
-        unsigned altPending = 0, altChars = 0;
-        for (const RE * e : *alt) {
-            unsigned p = pending, c = chars;
-            if (!trackUTF8Characters(e, p, c)) return false;
-            if (first) {
-                altPending = p; altChars = c; first = false;
-            } else if ((p != altPending) || (c != altChars)) {
-                return false;
-            }
-        }
-        pending = altPending;
-        chars = altChars;
-        return true;
-    }
-    return false;
-}
-
-//  Does every string matched by re encode exactly one character in UTF-8?
-static bool isUTF8EncodedCharacter(const RE * re) {
-    unsigned pending = 0, chars = 0;
-    return trackUTF8Characters(re, pending, chars) && (pending == 0) && (chars == 1);
-}
-
 unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, const Seq::const_iterator end, Marker marker) {
     if ((marker.position() != Marker::Position::AtNextChar) || (mMain.mIndexingAlphabet == nullptr) ||
             (mMain.mCodeUnitAlphabet != &cc::UTF8) || (current == end)) {
@@ -402,12 +392,12 @@ unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, c
 }
 
 Marker RE_Block_Compiler::compileCodeUnitCharacter(Seq::const_iterator current, unsigned span, Marker marker) {
-    // Match the character's code units wherever they occur, then keep the
-    // occurrences whose final code unit is at the marker.
-    Marker charEnd(mPB.createOnes(), Marker::Position::AtNextChar);
-    for (unsigned i = 0; i < span; ++i) {
-        charEnd = process(*current++, charEnd);
-    }
+    // Match the character's code units wherever they occur (see
+    // compileEverywhere), then keep the occurrences whose final code unit is
+    // at the marker.
+    // (The units are processed one by one: as a sequence, they would be
+    // recognized as this character again.)
+    Marker charEnd = compileEverywhere(std::vector<RE *>(current, current + span), Marker::Position::AtNextChar);
     assert (charEnd.position() == Marker::Position::AtEnd);
     return Marker(mPB.createAnd(marker.stream(), charEnd.stream(), "aligned"), Marker::Position::AtEnd);
 }
@@ -450,6 +440,10 @@ Marker RE_Block_Compiler::compileAssertion(Assertion * const a, Marker marker) {
     }
     // Lookahead assertions.
     auto lengths = lengthRange(asserted);
+    if (mMain.mIndexingAlphabet && isUTF8EncodedCharacter(asserted)) {
+        // One character in UTF-8 code units (left in place by LookAheadNamer).
+        lengths = std::make_pair(1, 1);
+    }
     // Zero-width assertions
     if (lengths.second == 0) {
         Marker lookahead = compile(asserted);
@@ -548,7 +542,29 @@ Marker RE_Block_Compiler::compileIntersect(Intersect * const x, Marker marker) {
     UnsupportedRE("Unsupported Intersect operands: " + Printer_RE::PrintRE(x));
 }
 
+// The alphabets of the CCs of an RE (including those of names defined as CCs).
+static void collectAlphabets(RE * re, std::set<const cc::Alphabet *> & alphabets) {
+    if (CC * cc = dyn_cast<CC>(re)) {
+        alphabets.insert(cc->getAlphabet());
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        if (n->getDefinition()) collectAlphabets(n->getDefinition(), alphabets);
+    } else if (Seq * s = dyn_cast<Seq>(re)) {
+        for (RE * e : *s) collectAlphabets(e, alphabets);
+    } else if (Alt * a = dyn_cast<Alt>(re)) {
+        for (RE * e : *a) collectAlphabets(e, alphabets);
+    } else if (Rep * r = dyn_cast<Rep>(re)) {
+        collectAlphabets(r->getRE(), alphabets);
+    }
+}
+
 bool CharacteristicSubexpressionAnalysis(RE * repeated, RE * &E1, RE * &C, RE * &E2) {
+    // The search for occurrences of C compares CCs, which is meaningful only
+    // within one alphabet (e.g. not between a Unicode CC, the definition of a
+    // name for a CC of characters of several UTF-8 lengths, and UTF-8 code
+    // unit CCs).
+    std::set<const cc::Alphabet *> alphabets;
+    collectAlphabets(repeated, alphabets);
+    if (alphabets.size() > 1) return false;
     if (isa<CC>(repeated)) {
         E1 = makeSeq();
         E2 = makeSeq();
@@ -817,6 +833,27 @@ Marker RE_Block_Compiler::expandUpperBound(RE * const repeated, const int ub, Ma
 Marker RE_Block_Compiler::processUnboundedRep(RE * const repeated, Marker marker) {
     // always use PostPosition markers for unbounded repetition.
     PabloAST * base = NextCharacter(marker, mPB);
+    if (Name * n = dyn_cast<Name>(repeated)) {
+        auto f = mMain.mStringClassMap.find(n->getFullName());
+        if (f != mMain.mStringClassMap.end()) {
+            // A run of occurrences of the string class from base, ending just
+            // after the end of an occurrence (or base itself, for no occurrences).
+            // With an indexing alphabet, base lies on the final code unit of the
+            // next character: the run is seeded there (within the fill of an
+            // occurrence starting at that character), and its results realigned.
+            const auto & sc = f->second;
+            PabloAST * starts = sc.starts;
+            if (mMain.mIndexingAlphabet) {
+                starts = ScanToIndex(starts, mMain.mIndexStream, mPB);
+            }
+            PabloAST * run = mPB.createMatchStar(mPB.createAnd(base, starts), sc.fill);
+            PabloAST * after = mPB.createAnd(run, mPB.createAdvance(sc.ends, 1));
+            if (mMain.mIndexingAlphabet) {
+                after = ScanToIndex(after, mMain.mIndexStream, mPB);
+            }
+            return Marker(mPB.createOr(base, after, "strclass_star"), Position::AtNextChar);
+        }
+    }
     if (LLVM_LIKELY(!AlgorithmOptionIsSet(DisableMatchStar))) {
         auto lengths = getLengthRange(repeated, mMain.mCodeUnitAlphabet);
         //llvm::errs() << "getLengthRange(repeated, mMain.mCodeUnitAlphabet) = " << lengths.first << ", " << lengths.second << "\n";
@@ -956,6 +993,10 @@ void RE_Compiler::setIndexing(const cc::Alphabet * indexingAlphabet, PabloAST * 
     mIndexStream = indexStream;
 }
     
+void RE_Compiler::addStringClassRep(std::string name, PabloAST * fill, PabloAST * starts, PabloAST * ends) {
+    mStringClassMap.emplace(name, StringClassStreams{fill, starts, ends});
+}
+
 void RE_Compiler::addPrecompiled(std::string precompiledName, ExternalStream precompiled) {
     mExternalNameMap.emplace(precompiledName, precompiled);
 }

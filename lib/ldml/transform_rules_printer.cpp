@@ -136,7 +136,7 @@ std::string printSetBody(const RE * re) {
         bool boundary = false;
         bool afterVariable = false;
         for (const RE * a : *alt) {
-            if (isa<Start>(a) || isa<End>(a)) {
+            if (isBoundary(a)) {
                 boundary = true;
             } else {
                 const std::string member = printSetBody(a);
@@ -185,7 +185,7 @@ std::string printSet(const RE * re) {
     } else if (const Intersect * x = dyn_cast<Intersect>(re)) {
         return "[" + printSet(x->getLH()) + "&" + printSet(x->getRH()) + "]";
     } else if (const Alt * alt = dyn_cast<Alt>(re)) {
-        if (includesTextBoundary(re) && alt->size() == 3) {
+        if (includesTextBoundary(re) && alt->size() == 2) {
             for (const RE * a : *alt) {
                 if (const Diff * d = dyn_cast<Diff>(a)) {
                     if (isa<Any>(d->getLH())) {
@@ -205,19 +205,28 @@ bool isLiteralItem(const RE * re) {
 
 std::string printItem(const RE * re);
 
-std::string printSequence(const RE * re) {
+// The text boundary is printed as the anchor ^ (Start) at the beginning of a
+// side and $ (End) at its end, where the anchors may appear, and otherwise
+// as [$] (resolved by the context).
+std::string printSequence(const RE * re, bool startAnchor = false, bool endAnchor = false) {
     if (re == nullptr) return "";
+    auto item = [&](const RE * e, bool first, bool last) -> std::string {
+        if (first && startAnchor && isa<Start>(e)) return "^";
+        if (last && endAnchor && isa<End>(e)) return "$";
+        return printItem(e);
+    };
     if (const Seq * seq = dyn_cast<Seq>(re)) {
         std::string s;
         const RE * prev = nullptr;
-        for (const RE * e : *seq) {
+        for (size_t i = 0; i < seq->size(); i++) {
+            const RE * e = (*seq)[i];
             if (prev && !(isLiteralItem(prev) && isLiteralItem(e))) s += " ";
-            s += printItem(e);
+            s += item(e, i == 0, i + 1 == seq->size());
             prev = e;
         }
         return s;
     }
-    return printItem(re);
+    return item(re, true, true);
 }
 
 std::string printQuoted(const RE * re) {
@@ -235,11 +244,7 @@ std::string printItem(const RE * re) {
         std::string s;
         appendLiteral(s, theCodepoint(re));
         return s;
-    } else if (isa<Start>(re)) {
-        return "^";
-    } else if (isa<End>(re)) {
-        return "$";
-    } else if (isTextBoundary(re)) {
+    } else if (isBoundary(re)) {
         return "[$]";
     } else if (isDotSet(re)) {
         return ".";
@@ -300,11 +305,14 @@ std::string printUnicodeSet(const RE * re) {
 
 std::string printRuleSide(const RuleSide * side) {
     std::string s;
+    // The anchors may begin the first part of the side and end its last part.
+    const bool after = side->hasAfterContext();
+    const bool revisitLast = !after && side->hasCursor();
     if (side->hasBeforeContext()) {
-        appendPart(s, printSequence(side->getBeforeContext()));
+        appendPart(s, printSequence(side->getBeforeContext(), true, false));
         appendPart(s, "{");
     }
-    appendPart(s, printSequence(side->getCompletedResult()));
+    appendPart(s, printSequence(side->getCompletedResult(), !side->hasBeforeContext(), !after && !revisitLast));
     if (side->hasCursor()) {
         const int offset = side->getCursorOffset();
         std::string cursor;
@@ -313,10 +321,10 @@ std::string printRuleSide(const RuleSide * side) {
         if (offset < 0) cursor.append(-offset, '@');
         appendPart(s, cursor);
     }
-    appendPart(s, printSequence(side->getResultToRevisit()));
+    appendPart(s, printSequence(side->getResultToRevisit(), false, revisitLast));
     if (side->hasAfterContext()) {
         appendPart(s, "}");
-        appendPart(s, printSequence(side->getAfterContext()));
+        appendPart(s, printSequence(side->getAfterContext(), false, true));
     }
     return s;
 }

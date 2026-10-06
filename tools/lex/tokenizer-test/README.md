@@ -16,6 +16,7 @@ with the repo venv active.
 | 3 | `compare_bpe.py`           | correctness + timing | Full BPE encoding → token IDs, plus a fair head-to-head timing section |
 | 4 | `bench_bpe.py`             | performance | Throughput (MB/s), size sweep, fixed-floor vs marginal-rate fit, SVG charts |
 | 5 | `bench_configs.py`         | performance (Parabix only) | N flag configurations timed against each other — interleaved rounds, per-config floor/marginal fit, output-identity check |
+| 6 | `selfmerge_test.py`        | correctness (no HF) | Self-merges (X+X→XX): runs of repeated tokens of length 1–12, checked against a built-in reference BPE for several flag configurations |
 
 Scripts 1–3 print `MATCH` / `MISMATCH` per case; all five tee their output to
 `<script>_output.txt` in this directory (those result files are not committed).
@@ -395,6 +396,28 @@ measure the floor and will shrink as the input grows.
 
 Sweeping the compaction interval is the same command with several
 `--compact-base=N` configs.
+
+---
+
+## 6. `selfmerge_test.py`
+
+Correctness of self-merges, which the merge kernels resolve with run-parity logic: a
+run of equal tokens must pair left to right, each token used once (`XXXXX` → `XX XX X`).
+The script generates its own input (runs of length 1–12 of single bytes, multi-byte
+characters and multi-character units, in several contexts, plus mixed alternations)
+and compares the tokenizer's ids with a self-contained reference BPE built from
+`merges.txt` (priority queue, lowest rank then leftmost first, as in HuggingFace), so
+it needs neither HuggingFace nor `vocab.json`.
+
+```bash
+python selfmerge_test.py --tokenizer ../../../build22/bin/tokenizer
+python selfmerge_test.py --config 'mine=--level-partition --compact-base=2' --keep /tmp/sm
+```
+
+Each `--config NAME=FLAGS` is one tokenizer run (the default is a built-in set of merge
+strategies); `--keep DIR` saves the input, the reference ids and each output. Prints
+`MATCH` / `MISMATCH` per configuration and exits 1 on any mismatch. The first run of a
+new configuration pays its JIT compile.
 
 ---
 

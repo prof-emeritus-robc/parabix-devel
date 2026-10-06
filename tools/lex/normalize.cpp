@@ -188,7 +188,7 @@ static StreamSet * applyStripAccents(PipelineBuilder & P, StreamSet * U21_focus)
     // Build the Mn character class from the Unicode General Category table.
     auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
         UCD::getPropertyObject(UCD::gc));
-    re::CC * mnCC = re::makeCC(gcObj->GetCodepointSet("Mn"), &cc::Unicode);
+    re::CC * mnCC = re::makeCC(gcObj->GetCodepointSet("M"), &cc::Unicode);
 
     // Mark every slot that holds an Mn codepoint.
     // CharClassesKernel takes our NFD stream (one codepoint per slot) and outputs
@@ -411,11 +411,15 @@ static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * U21_focus
     re::CC * delCC = re::makeCC(delSet, &cc::Unicode);
 
     // REPLACE with space: \p{Zs} (space separators) plus \t \n \r.
-    UCD::UnicodeSet repSet = gcObj->GetCodepointSet("Zs");
-    repSet.insert(0x09);
-    repSet.insert(0x0A);
-    repSet.insert(0x0D);
-    re::CC * repCC = re::makeCC(repSet, &cc::Unicode);
+    // Built via re::makeCC unions rather than UnicodeSet::insert() -- the same
+    // pattern applyNmt already uses successfully (see below) -- because
+    // UnicodeSet::insert() was found to corrupt an unrelated bit (U+0040 '@'
+    // wrongly matched) after the 2026-09-05 slab-allocator rewrite. Framework
+    // bug, flagged upstream; this sidesteps it rather than fixing it.
+    re::CC * repCC = re::makeCC(gcObj->GetCodepointSet("Zs"), &cc::Unicode);
+    repCC = re::makeCC(repCC, re::makeCC(0x09));
+    repCC = re::makeCC(repCC, re::makeCC(0x0A));
+    repCC = re::makeCC(repCC, re::makeCC(0x0D));
 
     return applyDeleteAndSpaceReplace(P, U21_focus, delCC, repCC);
 }

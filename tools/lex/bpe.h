@@ -60,6 +60,9 @@ struct MergeRule {
 struct MergeRuleGroup {
     unsigned lo = 0, hi = 0;
     unsigned maxLen = 0;
+    // --full-subtiering-limit: build the group as a bit transformation with one
+    // if-block per idA subtier of its merge id bit tier.
+    bool subtiered = false;
     std::vector<MergeRule> rules;
 };
 
@@ -128,6 +131,10 @@ BPEPassResult buildBPEPassPipeline(
     kernel::StreamSet       * basis,
     const BPETokenizer      & bpe,
     kernel::StreamSet       * boundary = nullptr);
+
+// Print the statistics gathered by the last pipeline run (--merge-frequency-statistics)
+// to stderr, then reset them. A no-op when nothing was gathered.
+void reportBPEStatistics();
 
 // Line-delimited pretokenizer used when --vocab is given without
 // --pretokenizer (compare_bpe.py step-2 input format).

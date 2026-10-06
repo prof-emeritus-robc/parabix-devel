@@ -67,7 +67,9 @@ import tempfile
 # Paths
 # ---------------------------------------------------------------------------
 
-REPO_ROOT   = "/Users/munizahashim/parabix-devel"
+# Defaults only: the repo root is three levels above this script
+# (tools/lex/tokenizer-test/); --input/--tokenizer/--merges override.
+REPO_ROOT   = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 TOKENIZER   = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 MERGES      = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TFILES      = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files")
@@ -334,6 +336,7 @@ def parse_config(spec: str) -> tuple[str, list]:
 
 
 def main() -> None:
+    global TOKENIZER, MERGES
     ap = argparse.ArgumentParser(
         description="Benchmark Parabix BPE configurations against each other (no HuggingFace).")
     ap.add_argument("--config", action="append", default=[], metavar="NAME=FLAGS",
@@ -357,7 +360,12 @@ def main() -> None:
                          "cheaper and NOT the pipeline compare_bpe.py validates — so the "
                          "numbers would describe a config nobody checks for correctness. "
                          "Pass --common-flags='' to time that raw path deliberately.")
+    ap.add_argument("--tokenizer", default=TOKENIZER,
+                    help=f"Parabix tokenizer binary (default: {TOKENIZER})")
+    ap.add_argument("--merges", default=MERGES,
+                    help=f"merges.txt (default: {MERGES})")
     args = ap.parse_args()
+    TOKENIZER, MERGES = args.tokenizer, args.merges
 
     if not os.path.isfile(TOKENIZER):
         sys.exit(f"No tokenizer binary at {TOKENIZER} — run: make -C build19 -j8 tokenizer")

@@ -662,6 +662,7 @@ int main(int argc, char *argv[]) {
         std::cerr << "[BPE] run (execute pipeline): "
                   << std::chrono::duration<double, std::milli>(__tRun1 - __tRun0).count()
                   << " ms\n";
+        reportBPEStatistics();
         if (mapping != MAP_FAILED) munmap(mapping, nbytes);
         close(fd);
         return 0;

@@ -680,34 +680,6 @@ protected:
     }
 };
 
-// ─── BPEOnesKernel ──────────────────────────────────────────────────────────
-// Emit an all-ones 1-bit stream at the rate of `anchor` (consumed for its RATE
-// only, never read). Used right after a FilterByMask compaction: every position
-// that survived the filter was, by construction, a LIVE token start, so the fresh
-// inPlayMask at the new (shorter) rate is all ones.
-//
-// createInFile, not a bare Not(Zeroes): the compacted stream's item count is a
-// popcount and rarely lands on a block boundary, so a bare all-ones bleeds into the
-// final block's PADDING. Those padded ones survive to matchEnd and the scan emits
-// them as junk tokens past end-of-input (observed: exactly 128 rows of `id=0`).
-// InFile(x) compiles to x AND NOT EOFmask, so the padding reads 0. Same primitive as
-// the EOF trailing-whitespace fix in InFileNonSpaceKernel (pretokenizer.cpp).
-class BPEOnesKernel : public PabloKernel {
-public:
-    BPEOnesKernel(LLVMTypeSystemInterface & ts, StreamSet * anchor, StreamSet * ones)
-    // Name says InFile: the body is data-independent so the cache key is the name
-    // alone, and the pre-InFile version would otherwise be served from objcache.
-    : PabloKernel(ts, "BPE_OnesInFile",
-                  {Binding{"anchor", anchor}},
-                  {Binding{"ones",   ones}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        pb.createAssign(pb.createExtract(getOutputStreamVar("ones"), pb.getInteger(0)),
-                        pb.createInFile(pb.createNot(pb.createZeroes())));
-    }
-};
-
 // BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
 // bits. The emitter (P2S16Kernel) reads exactly 16 streams, but the final id stream
 // is only ceil_log2(hi) wide — fewer than 16 under --merges-limit — and reading a
@@ -896,6 +868,20 @@ static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigne
     return pb.createOr(pb.createAnd(A1_runs, A1), pb.createAnd(A2_runs, A2));
 }
 
+// Shared by every kernel below that takes an optional "meIn" (inPlayMask) input:
+// omitted (nullptr) right after a FilterByMask compaction, where it's provably
+// all-ones (every surviving position just passed that filter on the real mask).
+static void bindOptional(std::vector<kernel::Binding> & in, const char * name, StreamSet * s) {
+    if (s) in.push_back(Binding{name, s});
+}
+// true iff this kernel instance actually has a stream bound under `name` -- lets a
+// kernel body ask "was meIn given?" without each kernel needing its own stored flag.
+static bool hasStreamInput(const Kernel * k, llvm::StringRef name) {
+    for (auto & b : k->getInputStreamSetBindings())
+        if (b.getName() == name) return true;
+    return false;
+}
+
 // BPEMergeKernel — one id-range, REAL BPE merge on the id stream (START-anchored).
 // `source` carries a token id at each token's START byte (a base byte is a 1-byte
 // token → start == end; seeded = base id per raw byte). For each rule (A,B → AB),
@@ -946,6 +932,9 @@ public:
                         + (GateMaskFold ? "gm1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
                         + (KeyCluster ? "kc1_" : "")
+                        + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
+                                                 // FilterByMask, its inPlayMask is built
+                                                 // locally instead of bound as an input
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -963,8 +952,8 @@ protected:
             StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
             StreamSet * nextIdIn, unsigned maxLen) {
         std::vector<kernel::Binding> in {
-            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
-            Binding{"meIn", meIn} };
+            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)} };
+        bindOptional(in, "meIn", meIn);
         if (boundaryIn)
             in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
         if (nextIdIn)   // Deferred producer (IndexedShiftBack), 2. Kernel receives both as input bindings
@@ -995,9 +984,18 @@ protected:
         // the surviving (outermost) token STARTS — the stream emission scans.
         // --infile-once: the end-of-file mask is applied here, once, instead of inside every
         // id compare (see eqId below).
-        PabloAST * const meInMasked = InFileOnce
-            ? pb.createInFile(getInputStreamSet("meIn")[0], "meInFile")
-            : getInputStreamSet("meIn")[0];
+        //
+        // No meIn stream given (right after a FilterByMask). Every position here just
+        // passed that filter, so it's already known to be live — build "all ones"
+        // directly instead of reading it. This also lets every rule's AND(eqId,
+        // inPlayMask) below collapse to just eqId for free.
+        // Must use InFile (not a bare all-ones): the filtered stream's length rarely
+        // lands on a block boundary, so a bare all-ones would leak into the leftover
+        // padding and show up as junk tokens past the real end of input.
+        PabloAST * const meInMasked = !hasStreamInput(this, "meIn")
+            ? pb.createInFile(pb.createNot(pb.createZeroes()), "meInFile")
+            : (InFileOnce ? pb.createInFile(getInputStreamSet("meIn")[0], "meInFile")
+                          : getInputStreamSet("meIn")[0]);
         Var * inPlayMask = pb.createVar("inPlayMask", meInMasked);
 
         // 3. Read the copy inside the body
@@ -1693,6 +1691,8 @@ public:
                         + (SkipInstCombine ? "ic1_" : "")
                         + (sourceIn->getNumElements() > kXfrmLowBits
                                ? "lo" + std::to_string(kXfrmLowBits) + "_" : "")
+                        + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
+                                                 // FilterByMask, inPlayMask built locally
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -1707,8 +1707,8 @@ protected:
     static std::vector<kernel::Binding> xfrmInputs(StreamSet * sourceIn, StreamSet * meIn,
                                                    StreamSet * boundaryIn, unsigned maxLen) {
         std::vector<kernel::Binding> in {
-            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
-            Binding{"meIn", meIn} };
+            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)} };
+        bindOptional(in, "meIn", meIn);
         if (boundaryIn)
             in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
         return in;
@@ -1718,7 +1718,12 @@ protected:
         std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
         const unsigned N = srcBits.size();
         const unsigned W_out = ceil_log2(mRuleGroup.hi);
-        PabloAST * const live = getInputStreamSet("meIn")[0];
+        // No meIn stream given (right after a FilterByMask): every position here just
+        // passed that filter, so it's already known to be live -- build "all ones"
+        // directly (InFile, so leftover block padding doesn't read as live).
+        PabloAST * const live = hasStreamInput(this, "meIn")
+            ? getInputStreamSet("meIn")[0]
+            : pb.createInFile(pb.createNot(pb.createZeroes()), "meInFile");
         PabloAST * const boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
 
         // Per lookahead distance L: the CC rules and the self-merges.
@@ -1991,6 +1996,13 @@ BPEPassResult buildBPEPassPipeline(
         // Only the first indexedShiftN kernels convert (isolation); rest stay byte-space.
         StreamSet * nextId = nullptr;
         if (useIndexedShift && i < indexedShiftN) {
+            // CAUTION: inPlayMask may be nullptr here (first kernel after a
+            // FilterByMask). Unlike BPEMergeKernel/BPEXfrmKernel below, IndexedShiftBack
+            // is a shared framework kernel (include/kernel/streamutils/stream_shift.h)
+            // and does NOT know how to build inPlayMask locally when it's missing --
+            // not reachable with the current --compaction schedule + --indexed-shift
+            // combination, but would need a framework-side change (opt-in, default off)
+            // to support, not just a bpe.cpp one.
             nextId = P.CreateStreamSet(source->getNumElements(), 1);
             P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
         }
@@ -2002,6 +2014,9 @@ BPEPassResult buildBPEPassPipeline(
         const int groupLowerLimit = effIfGroupLowerLimit();
         bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
         if (source->getNumElements() <= MaxBitXfrmLimit && !nextId && bitXfrmEligible(g)) {
+            // inPlayMask may be nullptr here (first kernel after a FilterByMask) --
+            // BPEXfrmKernel builds it locally in that case (see hasStreamInput in its
+            // generatePabloMethod), same as BPEMergeKernel.
             P.CreateKernelCall<BPEXfrmKernel>(source, inPlayMask, boundary, sOut, meOut,
                                               g, hashRuleSet(g.rules), g.maxLen);
             nXfrm++;
@@ -2026,10 +2041,12 @@ BPEPassResult buildBPEPassPipeline(
             FilterByMask(P, inPlayMask, boundary, boundaryC);
             boundary = boundaryC;
         }
-        StreamSet * onesC = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<BPEOnesKernel>(sourceC, onesC);
         source     = sourceC;
-        inPlayMask = onesC;
+        // nullptr, not BPEOnesKernel: whichever kernel consumes this next builds the
+        // constant locally (see hasStreamInput in each kernel's generatePabloMethod)
+        // instead of reading it from a materialized stream -- one fewer kernel, and
+        // LLVM folds away every rule's now-trivial AND(eqId, inPlayMask) for free.
+        inPlayMask = nullptr;
     }
 
     if (MaxBitXfrmLimit > 0)

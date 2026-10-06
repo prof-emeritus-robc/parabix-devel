@@ -39,6 +39,10 @@ DEFAULT_CONFIGS = [
     ("level+geometric", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback"),
     ("bits+xfrm10", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "
                     "--partition-by-merge-id-bits --max-bit-xfrm-limit=10"),
+    ("level+geometric+smb", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback "
+                            "--self-merge-block"),
+    ("bits+xfrm10+smb", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "
+                        "--partition-by-merge-id-bits --max-bit-xfrm-limit=10 --self-merge-block"),
 ]
 
 UNITS = ['-', '=', '.', ' ', '*', '#', '/', '_', '0', '1', '9', 'a', 'l', 'k', 't', 's',

@@ -453,6 +453,14 @@ static cl::opt<unsigned> MaxBitXfrmLimit(
              "if-blocks on their high bits."),
     cl::init(0));
 
+// --self-merge-block: resolve a kernel's self-merges (X+X -> XX) together in one gated
+// block instead of per rule (see emitSelfMergeBlock).
+static cl::opt<bool> SelfMergeBlock(
+    "self-merge-block",
+    cl::desc("BPE merge kernels: resolve all self-merges of a kernel in one block gated "
+             "by an any-self-merge test, stamping by bit transformation."),
+    cl::init(false));
+
 static cl::opt<bool> KeyCluster(
     "key-cluster",
     cl::desc("With --level-partition and --if-test-significant-bits: move rules (only later, only "
@@ -882,6 +890,91 @@ static bool hasStreamInput(const Kernel * k, llvm::StringRef name) {
     return false;
 }
 
+// Self-merges handled by emitSelfMergeBlock (--self-merge-block): every self-merge of the
+// group, except a --chain-partition chain root (whose dependents nest in its own gate).
+static std::vector<const MergeRule *> blockSelfMerges(const MergeRuleGroup & g) {
+    std::vector<const MergeRule *> out;
+    if (!SelfMergeBlock) return out;
+    std::unordered_set<unsigned> chainParents;   // idA of every needsLiveId rule
+    for (const auto & r : g.rules)
+        if (r.needsLiveId) chainParents.insert(r.idA);
+    for (const auto & r : g.rules)
+        if (r.idA == r.idB && !chainParents.count(r.idAB)) out.push_back(&r);
+    return out;
+}
+
+// emitSelfMergeBlock (--self-merge-block) — all of a kernel's self-merges X+X -> XX at once.
+//   eq_L  = NOT OR_i (id_i XOR id_i L slots ahead): the token at p equals the next one,
+//           when the token at p spans L slots. One per distinct span L of the rules' X.
+//   E_L   = InFile(mask(L) AND eq_L AND CC(S_L)(id)), S_L = the X's of span L. The
+//           membership test is required, not just a filter: for a token whose span is
+//           not L, the id L slots ahead is a stale interior id and may match.
+// A run of k equal tokens X at stride L gives k-1 consecutive E_L positions, and runs of
+// different tokens never join (the E positions of XXYY are 2L apart), so the per-run
+// pairing selfMergeFireStarts(E_L, L) fires at the 1st, 3rd, ... X of every run that has
+// a partner. The OR of all E_L gates one if-block holding that pairing and the stamp,
+// a bit transformation: change_j = CC_j(id) AND fire, where CC_j holds the X whose XX
+// differs from X in bit j (X selects its rule, so one class serves every L).
+// mask(L) = live start mask AND NOT (pretoken boundary at p+L); ahead(L) = the W id bits
+// L slots ahead. Returns change Vars (W_out) and fire Vars per L, zero outside the block;
+// the caller applies out_j = id_j XOR change_j and consumes Advance(fire_L, L).
+struct SelfMergeBlockResult {
+    std::vector<Var *> change;
+    std::map<unsigned, Var *> fireByL;
+};
+static SelfMergeBlockResult emitSelfMergeBlock(
+        PabloBuilder & pb, const std::vector<PabloAST *> & idBits, unsigned W_out,
+        const std::vector<const MergeRule *> & rules,
+        const std::function<std::vector<PabloAST *>(unsigned)> & ahead,
+        const std::function<PabloAST *(unsigned)> & mask) {
+    SelfMergeBlockResult res;
+    if (rules.empty()) return res;
+    const unsigned W = idBits.size();
+    cc::Parabix_CC_Compiler ccc(idBits);
+    std::map<unsigned, UCD::UnicodeSet> xByL;
+    std::vector<UCD::UnicodeSet> changeSet(W_out);
+    for (const MergeRule * r : rules) {
+        xByL[r->lenA].insert(r->idA);
+        for (unsigned j = 0; j < W_out; j++) {
+            const unsigned inBit = (j < W) ? ((r->idA >> j) & 1u) : 0u;
+            if (((r->idAB >> j) & 1u) != inBit) changeSet[j].insert(r->idA);
+        }
+    }
+    std::map<unsigned, PabloAST *> E;
+    PabloAST * anySelf = nullptr;
+    for (auto & [L, xs] : xByL) {
+        const std::vector<PabloAST *> nxt = ahead(L);
+        PabloAST * diff = nullptr;
+        for (unsigned i = 0; i < W; i++) {
+            PabloAST * d = pb.createXor(idBits[i], nxt[i]);
+            diff = diff ? pb.createOr(diff, d) : d;
+        }
+        PabloAST * isX = ccc.compileCC("selfX_L" + std::to_string(L), re::makeCC(std::move(xs)), pb);
+        PabloAST * e = pb.createAnd(pb.createAnd(mask(L), isX), pb.createNot(diff));
+        E[L] = pb.createInFile(e, "selfEq_L" + std::to_string(L));
+        anySelf = anySelf ? pb.createOr(anySelf, E[L]) : E[L];
+    }
+    for (unsigned j = 0; j < W_out; j++)
+        res.change.push_back(changeSet[j].empty() ? nullptr
+                             : pb.createVar("selfChange_" + std::to_string(j), pb.createZeroes()));
+    for (const auto & [L, e] : E)
+        res.fireByL[L] = pb.createVar("selfFire_L" + std::to_string(L), pb.createZeroes());
+    auto body = pb.createScope();
+    PabloAST * fireAll = nullptr;
+    for (const auto & [L, e] : E) {
+        PabloAST * f = selfMergeFireStarts(body, e, L);
+        body.createAssign(res.fireByL[L], f);
+        fireAll = fireAll ? body.createOr(fireAll, f) : f;
+    }
+    for (unsigned j = 0; j < W_out; j++) {
+        if (!res.change[j]) continue;
+        PabloAST * cj = ccc.compileCC("selfChg_" + std::to_string(j), re::makeCC(std::move(changeSet[j])), body);
+        body.createAssign(res.change[j], body.createAnd(cj, fireAll));
+    }
+    pb.createIf(anySelf, body);
+    return res;
+}
+
 // BPEMergeKernel — one id-range, REAL BPE merge on the id stream (START-anchored).
 // `source` carries a token id at each token's START byte (a base byte is a 1-byte
 // token → start == end; seeded = base id per raw byte). For each rule (A,B → AB),
@@ -935,6 +1028,7 @@ public:
                         + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
                                                  // FilterByMask, its inPlayMask is built
                                                  // locally instead of bound as an input
+                        + (!nextIdIn && !blockSelfMerges(group).empty() ? "smb_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
                         + "o" + std::to_string(ceil_log2(group.hi))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
@@ -1141,6 +1235,11 @@ protected:
         auto isChainRule = [&](const MergeRule & r) {
             return r.needsLiveId || childrenOf.count(r.idAB) != 0;
         };
+        // --self-merge-block: these self-merges are resolved together after the other rules
+        // (emitSelfMergeBlock) and skipped by every per-rule path below.
+        const std::vector<const MergeRule *> blockSelf =
+            mUseNextId ? std::vector<const MergeRule *>() : blockSelfMerges(mRuleGroup);
+        const std::unordered_set<const MergeRule *> inSelfBlock(blockSelf.begin(), blockSelf.end());
         const bool batch     = BatchWriteback && !mUseNextId;  // defer the id-stamp
         const bool deferMask = batch && !groupNeedsLiveMask;   // also defer the mask consume
         std::vector<Var *> setBit;
@@ -1153,7 +1252,7 @@ protected:
             anyFire = pb.createVar("anyFire", zeroes);
             if (deferMask)
                 for (const auto & r : mRuleGroup.rules)
-                    if (!isChainRule(r) && fireByLen.find(r.lenA) == fireByLen.end())
+                    if (!isChainRule(r) && !inSelfBlock.count(&r) && fireByLen.find(r.lenA) == fireByLen.end())
                         fireByLen.emplace(r.lenA,
                             pb.createVar("fireByLen_" + std::to_string(r.lenA), zeroes));
         }
@@ -1439,6 +1538,7 @@ protected:
         if (!mGrouped) {
             for (const auto & r : mRuleGroup.rules) {
                 if (r.needsLiveId) continue;      // emitted as a nested child above, not a root
+                if (inSelfBlock.count(&r)) continue;
                 if (!childrenOf.count(r.idAB)) {
                     emitRule(r);                   // no chain involved — untouched path
                     continue;
@@ -1485,7 +1585,7 @@ protected:
             std::vector<const MergeRule*> sorted;
             sorted.reserve(mRuleGroup.rules.size());
             for (const auto & r : mRuleGroup.rules)
-                if (!r.needsLiveId) sorted.push_back(&r);
+                if (!r.needsLiveId && !inSelfBlock.count(&r)) sorted.push_back(&r);
             std::sort(sorted.begin(), sorted.end(),
                       [](const MergeRule* a, const MergeRule* b){ return a->idA < b->idA; });
 
@@ -1634,6 +1734,30 @@ protected:
         // ── Apply whatever's left in the batch accumulators ─────────────────────
         if (batch) flushWriteback();
 
+        // ── --self-merge-block ───────────────────────────────────────────────────
+        // Read from the frozen input like every other rule; its fire and consume
+        // positions are disjoint from theirs (seam constraints), so XOR-ing its change
+        // into the accumulated ids after them equals applying it in rank order.
+        if (!blockSelf.empty()) {
+            auto ahead = [&](unsigned L) -> std::vector<PabloAST *> {
+                auto f = aheadByLenA.find(L);
+                if (f != aheadByLenA.end()) return std::vector<PabloAST *>(f->second.begin(), f->second.end());
+                std::vector<PabloAST *> bits(W);
+                for (unsigned i = 0; i < W; i++) bits[i] = pb.createLookahead(srcBits[i], (int64_t) L);
+                return bits;
+            };
+            auto mask = [&](unsigned L) -> PabloAST * {
+                if (!mHasBoundary) return meInFrozen;
+                return pb.createAnd(meInFrozen, pb.createNot(pb.createLookahead(boundaryBit, (int64_t) L)));
+            };
+            auto res = emitSelfMergeBlock(pb, srcBits, W_out, blockSelf, ahead, mask);
+            for (unsigned i = 0; i < W_out; i++)
+                if (res.change[i]) pb.createAssign(idAcc[i], pb.createXor(idAcc[i], res.change[i]));
+            for (const auto & [L, fire] : res.fireByL)
+                pb.createAssign(inPlayMask,
+                    pb.createAnd(inPlayMask, pb.createNot(pb.createAdvance(fire, (int64_t) L))));
+        }
+
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
             pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idAcc[i]);  // 16-bit token ID stream
@@ -1689,6 +1813,7 @@ public:
                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
     : PabloKernel(ts, std::string("BPEXfrm_") + (boundaryIn ? "b1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
+                        + (!blockSelfMerges(group).empty() ? "smb_" : "")
                         + (sourceIn->getNumElements() > kXfrmLowBits
                                ? "lo" + std::to_string(kXfrmLowBits) + "_" : "")
                         + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
@@ -1831,6 +1956,18 @@ protected:
         }
         for (unsigned j = 0; j < W_out; j++)
             if (changeVar[j]) orInto(change[j], changeVar[j]);
+
+        // --self-merge-block: the self-merges join the bit transformation as one gated block.
+        const std::vector<const MergeRule *> blockSelf = blockSelfMerges(mRuleGroup);
+        if (!blockSelf.empty()) {
+            auto res = emitSelfMergeBlock(pb, srcBits, W_out, blockSelf,
+                                          [&](unsigned L) { return ahead(L); }, gate);
+            for (unsigned j = 0; j < W_out; j++)
+                if (res.change[j]) orInto(change[j], res.change[j]);
+            for (const auto & [L, fire] : res.fireByL)
+                orInto(consumed, pb.createAdvance(fire, (int64_t) L));
+            selfMerges.clear();
+        }
 
         // out_j = in_j XOR change_j
         std::vector<PabloAST *> outBits(W_out);

@@ -60,6 +60,9 @@ struct MergeRule {
 struct MergeRuleGroup {
     unsigned lo = 0, hi = 0;
     unsigned maxLen = 0;
+    // --full-subtiering-limit: build the group as a bit transformation with one
+    // if-block per idA subtier of its merge id bit tier.
+    bool subtiered = false;
     std::vector<MergeRule> rules;
 };
 

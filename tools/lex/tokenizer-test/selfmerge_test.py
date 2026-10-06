@@ -39,6 +39,10 @@ DEFAULT_CONFIGS = [
     ("level+geometric", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback"),
     ("bits+xfrm10", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "
                     "--partition-by-merge-id-bits --max-bit-xfrm-limit=10"),
+    ("bits+subtier13", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "
+                       "--partition-by-merge-id-bits --max-bit-xfrm-limit=10 --full-subtiering-limit=13"),
+    ("bits+subtier14", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback "
+                       "--partition-by-merge-id-bits --max-bit-xfrm-limit=10 --full-subtiering-limit=14"),
     ("level+geometric+smb", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback "
                             "--self-merge-block"),
     ("bits+xfrm10+smb", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "

@@ -39,6 +39,7 @@ using Scalars = PipelineKernel::Scalars;
  * @brief initializeKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 Kernel * PipelineBuilder::initializeKernel(Kernel * const kernel, const unsigned flags) {
+    kernel->addAutomaticAttributes();
     mDriver.addKernel(kernel);
     mTarget->mKernels.emplace_back(kernel, flags);
     return kernel;

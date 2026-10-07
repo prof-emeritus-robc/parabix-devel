@@ -87,6 +87,22 @@ enum NonCarryCollapsingMode {
 
 #define LONG_ADVANCE_BREAKPOINT 64
 
+bool isDynamicallyAllocatedType(const Type * const ty);
+
+static bool containsDynamicallyAllocatedTypeRecursively(const Type * const ty) {
+    if (isDynamicallyAllocatedType(ty)) {
+        return true;
+    }
+    if (isa<StructType>(ty) || isa<ArrayType>(ty)) {
+        for (unsigned i = 0; i < ty->getNumContainedTypes(); ++i) {
+            if (containsDynamicallyAllocatedTypeRecursively(ty->getContainedType(i))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief initializeCarryData
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -118,6 +134,15 @@ void CarryManager::initializeCarryData(kernel::KernelBuilder & b, PabloKernel * 
 
     mCarryFrameType = analyse(b, entryScope);
 
+
+    if (LLVM_UNLIKELY(kernel->hasAttribute(kernel::Attribute::KindId::ProvisionalLookAheadStride))) {
+        // The provisional stride saves and restores the kernel state by copying it; carry data
+        // allocated on the heap would be modified in place and could not be restored.
+        if (LLVM_UNLIKELY(containsDynamicallyAllocatedTypeRecursively(mCarryFrameType))) {
+            report_fatal_error(StringRef(kernel->getName() + ": ProvisionalLookAheadStride cannot be used "
+                                         "with variable-length While loop carry data"));
+        }
+    }
 
     if (LLVM_UNLIKELY(mCarryFrameType->isEmptyTy())) {
         mCarryFrameType = nullptr;

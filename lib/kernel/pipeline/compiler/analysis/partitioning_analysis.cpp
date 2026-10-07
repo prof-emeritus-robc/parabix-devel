@@ -223,6 +223,13 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
     // extended stream alone, even though its own inputs end at different positions.
     BitSet addRateIds(n + numOfPhases);
 
+    // A kernel with the ProvisionalLookAheadStride attribute may share the partition of the
+    // provisional kernels that produce all of its inputs, rather than starting a new one,
+    // provided that the cumulative lookahead along the chain stays below its stride.
+    // provisionalChainLA[i] records, for a streamset node i produced by such a chain, the
+    // cumulative lookahead up to and including its producer; -1 otherwise.
+    std::vector<int> provisionalChainLA(m, -1);
+
     for (unsigned i = 0; i < m; ++i) {
 
         const auto u = sequence[i];
@@ -235,6 +242,11 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
             bool hasInputRateChange = false;
             bool hasLookAheads = false;
             auto demarcateOutputs = (node.Kernel == mPipelineKernel);
+            const bool isProvisional = (node.Kernel != mPipelineKernel) &&
+                node.Kernel->hasAttribute(AttrId::ProvisionalLookAheadStride);
+            // cumulative lookahead of this kernel within a provisional chain; -1 if not part of one
+            int kernelChainLA = -1;
+            int joinedChainLA = -1;
 
             const auto initialRateId = nextRateId;
 
@@ -340,11 +352,41 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
             }
             END_SCOPED_REGION
 
+            // Determine whether this provisional kernel can continue the provisional chain of its
+            // producers: every input must come from the chain, through producers with the same rate set.
+            if (isProvisional && !hasInputRateChange) {
+                int c = 0;
+                const BitSet * producerRates = nullptr;
+                for (const auto e : make_iterator_range(in_edges(i, G))) {
+                    const auto streamSet = source(e, G);
+                    const int chain = provisionalChainLA[streamSet];
+                    if (chain < 0) {
+                        c = -1;
+                        break;
+                    }
+                    const BitSet & R = G[streamSet];
+                    if (producerRates && *producerRates != R) {
+                        c = -1;
+                        break;
+                    }
+                    producerRates = &R;
+                    const Binding & bind = Relationships[G[e]].Binding;
+                    const int la = bind.hasLookahead() ? static_cast<int>(bind.getLookahead()) : 0;
+                    c = std::max(c, chain + la);
+                }
+                if (c >= 0 && static_cast<size_t>(c) < node.Kernel->getStride()) {
+                    joinedChainLA = c;
+                }
+            }
+
             if (hasInputRateChange) {
 found_rate_change:
                 assert (nextRateId < n);
                 V.set(nextRateId++);
                 forcedPartitionRoot.push_back(i);
+            } else if (joinedChainLA >= 0) {
+                // continues the provisional chain within the partition of its producers
+                kernelChainLA = joinedChainLA;
             } else if (hasLookAheads) {
 
                 assert (LookAheadIds.empty());
@@ -394,6 +436,20 @@ found_rate_change:
                 LookAheadIds.clear();
             }
 
+            if (isProvisional && kernelChainLA < 0) {
+                // this kernel starts a new partition; its chain begins with its own lookahead
+                int la = 0;
+                for (const auto e : make_iterator_range(in_edges(i, G))) {
+                    const Binding & bind = Relationships[G[e]].Binding;
+                    if (bind.hasLookahead()) {
+                        la = std::max(la, static_cast<int>(bind.getLookahead()));
+                    }
+                }
+                if (static_cast<size_t>(la) < node.Kernel->getStride()) {
+                    kernelChainLA = la;
+                }
+            }
+
             assert (V.any());
 
             // Now iterate through the outputs
@@ -408,6 +464,8 @@ found_rate_change:
 
                 const bool isExtended = rate.isFixed() &&
                     (b.hasAttribute(AttrId::Add) || b.hasAttribute(AttrId::AddCarry));
+
+                provisionalChainLA[target(e, G)] = kernelChainLA;
 
                 if (rate.isFixed() && !demarcateOutputs) {
 
@@ -431,6 +489,8 @@ found_rate_change:
                 } else {
 add_output_rate:    assert (nextRateId < n);
                     assert (!V.test(nextRateId));
+                    // consumers of this output are in another partition
+                    provisionalChainLA[target(e, G)] = -1;
                     if (isExtended) {
                         addRateIds.set(nextRateId);
                     }
@@ -439,7 +499,9 @@ add_output_rate:    assert (nextRateId < n);
 
             }
 
-            if (initialRateId == nextRateId && !hasLookAheads) {
+            // Provisional kernels must not be transferred between partitions; moving one would
+            // break the chain that supplies data beyond the full strides to its consumers.
+            if (initialRateId == nextRateId && !hasLookAheads && !isProvisional) {
                 assert (!hasInputRateChange);
                 assert (!demarcateOutputs);
                 potentiallyMergable.push_back(i);
@@ -1802,6 +1864,85 @@ void PipelineAnalysis::determinePartitionJumpIndices() {
     PartitionJumpTargetId[(PartitionCount - 1)] = (PartitionCount - 1);
 
 #endif
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief identifyProvisionalStrideKernels
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineAnalysis::identifyProvisionalStrideKernels() {
+
+    ProvisionalStrideKernel.resize(LastKernel + 1);
+    ProvisionalChainLookAhead.assign(LastKernel + 1, 0);
+    PartitionProvisionalLookAhead.assign(PartitionCount, 0);
+
+    for (auto kernel = FirstKernel; kernel <= LastKernel; ++kernel) {
+        const Kernel * const kernelObj = getKernel(kernel);
+        const auto partitionId = KernelPartitionId[kernel];
+        const auto isRoot = (FirstKernelInPartition[partitionId] == kernel);
+        bool active = false;
+        unsigned chain = 0;
+        if (kernelObj->hasAttribute(AttrId::ProvisionalLookAheadStride)) {
+            active = true;
+            for (const auto e : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                const BufferPort & port = mBufferGraph[e];
+                const auto la = static_cast<unsigned>(std::max(port.LookAhead, 0));
+                if (isRoot) {
+                    chain = std::max(chain, la);
+                } else {
+                    const auto producer = parent(source(e, mBufferGraph), mBufferGraph);
+                    if (KernelPartitionId[producer] != partitionId || !ProvisionalStrideKernel.test(producer)) {
+                        active = false;
+                        break;
+                    }
+                    chain = std::max(chain, ProvisionalChainLookAhead[producer] + la);
+                }
+            }
+            if (active && chain >= kernelObj->getStride()) {
+                active = false;
+            }
+        }
+        if (active) {
+            ProvisionalStrideKernel.set(kernel);
+            ProvisionalChainLookAhead[kernel] = chain;
+        } else if (!isRoot) {
+            // A kernel that looks ahead into data produced within its own partition depends on
+            // the provisional strides of its producers.
+            for (const auto e : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                const BufferPort & port = mBufferGraph[e];
+                if (port.LookAhead > 0) {
+                    const auto producer = parent(source(e, mBufferGraph), mBufferGraph);
+                    if (LLVM_UNLIKELY(KernelPartitionId[producer] == partitionId)) {
+                        SmallVector<char, 256> tmp;
+                        raw_svector_ostream msg(tmp);
+                        msg << kernelObj->getName() << " looks ahead into data produced within its partition "
+                               "by " << getKernel(producer)->getName() << " but is not a provisional stride kernel";
+                        report_fatal_error(msg.str());
+                    }
+                }
+            }
+        }
+    }
+
+    for (auto kernel = FirstKernel; kernel <= LastKernel; ++kernel) {
+        if (ProvisionalStrideKernel.test(kernel)) {
+            const auto partitionId = KernelPartitionId[kernel];
+            auto & L = PartitionProvisionalLookAhead[partitionId];
+            L = std::max(L, ProvisionalChainLookAhead[kernel]);
+            // A provisional stride writes one stride past the full strides, and its lookahead
+            // reads the whole of the stride after that.
+            const int overflow = 2 * static_cast<int>(getKernel(kernel)->getStride());
+            for (const auto e : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                BufferPort & port = mBufferGraph[e];
+                port.RequiredOverflowSpace = std::max(port.RequiredOverflowSpace, overflow);
+                BufferPort & producerPort = mBufferGraph[in_edge(source(e, mBufferGraph), mBufferGraph)];
+                producerPort.RequiredOverflowSpace = std::max(producerPort.RequiredOverflowSpace, overflow);
+            }
+            for (const auto e : make_iterator_range(out_edges(kernel, mBufferGraph))) {
+                BufferPort & port = mBufferGraph[e];
+                port.RequiredOverflowSpace = std::max(port.RequiredOverflowSpace, overflow);
+            }
+        }
+    }
 }
 
 } // end of namespace kernel

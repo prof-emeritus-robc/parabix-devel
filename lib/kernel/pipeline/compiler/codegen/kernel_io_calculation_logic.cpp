@@ -175,7 +175,11 @@ no_static_max:
         if (LLVM_LIKELY(!port.canModifySegmentLength())) {
             const auto streamSet = target(e, mBufferGraph);
             Value * const produced = mCurrentProducedItemCountPhi[port.Port];
-            Value * const required = mLinearOutputItemsPhi[port.Port];
+            Value * required = mLinearOutputItemsPhi[port.Port];
+            if (LLVM_UNLIKELY(isProvisionalStrideKernel())) {
+                // the provisional stride writes one stride past the full strides
+                required = b.CreateAdd(required, b.getSize(mKernel->getStride()));
+            }
             ensureSufficientOutputSpace(b, port, streamSet, produced, required, getWritableOutputItems(b, port), true);
         }
     }
@@ -419,6 +423,12 @@ Value * PipelineCompiler::calculateTransferableItemCounts(KernelBuilder & b,
     if (mFixedRateFactorPhi) {
         const Rational stride(mKernel->getStride());
         fixedRateFactor  = b.CreateMulRational(nonFinalNumOfLinearStrides, stride * mFixedRateLCM);
+        if (LLVM_UNLIKELY(isProvisionalStrideKernel())) {
+            // The kernel processes the full strides and then a provisional stride over any
+            // further data; the processed and produced item counts still reflect only the
+            // full strides.  (A final invocation takes the final stride path instead.)
+            fixedRateFactor = calculateProvisionalFixedRateFactor(b, nonFinalNumOfLinearStrides);
+        }
     } else {
         fixedRateFactor = sz_ZERO;
     }
@@ -1392,6 +1402,100 @@ Value * PipelineCompiler::getAccessibleInputItems(KernelBuilder & b, const Buffe
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getProvisionalAvailableItemPtr
+ *
+ * The number of valid items of a streamset produced by a provisional stride kernel, including those beyond its
+ * full strides that its provisional stride produced.  Only provisional stride kernels in the same partition
+ * read it; every other consumer sees the produced item count of the full strides.
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * PipelineCompiler::getProvisionalAvailableItemPtr(KernelBuilder & b, const unsigned streamSet) {
+    assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
+    AllocaInst *& ptr = mProvisionalAvailableItemPtr[streamSet - FirstStreamSet];
+    if (ptr == nullptr || ptr->getFunction() != b.GetInsertBlock()->getParent()) {
+        ptr = b.CreateAllocaAtEntryPoint(b.getSizeTy(), nullptr, "provisionalAvail" + std::to_string(streamSet));
+    }
+    return ptr;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief calculateProvisionalFixedRateFactor
+ *
+ * All stream I/O of a provisional stride kernel is FixedRate(1), so its accessible items are the same for each
+ * input: the full strides plus at most one further stride.  The partition root reads its inputs directly; every
+ * other provisional stride kernel in the partition reads the items produced by the provisional strides of its
+ * producers.
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * PipelineCompiler::calculateProvisionalFixedRateFactor(KernelBuilder & b, Value * const numOfLinearStrides) {
+    assert (isProvisionalStrideKernel());
+    const auto stride = mKernel->getStride();
+    Value * const fullItems = b.CreateMul(numOfLinearStrides, b.getSize(stride));
+    Value * accessible = b.CreateAdd(fullItems, b.getSize(stride));
+    for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
+        const BufferPort & port = mBufferGraph[e];
+        Value * a = nullptr;
+        if (mIsPartitionRoot) {
+            a = getAccessibleInputItems(b, port);
+        } else {
+            const auto streamSet = source(e, mBufferGraph);
+            Value * const produced = mLocallyAvailableItems[streamSet]; assert (produced);
+            Value * const provisional = b.CreateAlignedLoad(b.getSizeTy(), getProvisionalAvailableItemPtr(b, streamSet), SizeTyABIAlignment);
+            Value * const avail = b.CreateUMax(produced, provisional);
+            a = b.CreateUnsignedSaturatingSub(avail, mCurrentProcessedItemCountPhi[port.Port]);
+        }
+        accessible = b.CreateUMin(accessible, a);
+    }
+    accessible = b.CreateUMax(accessible, fullItems);
+    #ifdef PRINT_DEBUG_MESSAGES
+    debugPrint(b, makeKernelName(mKernelId) + "_provisionalAccessible = %" PRIu64, accessible);
+    #endif
+    return b.CreateMulRational(accessible, mFixedRateLCM);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief resetProvisionalAvailableItemCounts
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::resetProvisionalAvailableItemCounts(KernelBuilder & b) {
+    if (LLVM_LIKELY(!isProvisionalStrideKernel())) {
+        return;
+    }
+    for (const auto e : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
+        const auto streamSet = target(e, mBufferGraph);
+        b.CreateAlignedStore(b.getSize(0), getProvisionalAvailableItemPtr(b, streamSet), SizeTyABIAlignment);
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief recordProvisionalAvailableItemCounts
+ *
+ * Called after the kernel call.  The output of the provisional stride is valid up to the accessible input
+ * items less the lookahead.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::recordProvisionalAvailableItemCounts(KernelBuilder & b) {
+    if (LLVM_LIKELY(!isProvisionalStrideKernel())) {
+        return;
+    }
+    assert (mCurrentFixedRateFactor);
+    assert (mFixedRateLCM == Rational{1});
+    unsigned maxLookAhead = 0;
+    for (const auto e : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
+        maxLookAhead = std::max<unsigned>(maxLookAhead, std::max(mBufferGraph[e].LookAhead, 0));
+    }
+    Value * const valid = b.CreateUnsignedSaturatingSub(mCurrentFixedRateFactor, b.getSize(maxLookAhead));
+    Constant * const unterminated = getTerminationSignal(b, TerminationSignal::None);
+    Value * const isFinal = b.CreateICmpNE(mIsFinalInvocation, unterminated);
+    for (const auto e : make_iterator_range(out_edges(mKernelId, mBufferGraph))) {
+        const BufferPort & port = mBufferGraph[e];
+        const auto streamSet = target(e, mBufferGraph);
+        Value * const produced = mCurrentProducedItemCountPhi[port.Port];
+        Value * const avail = b.CreateSelect(isFinal, b.getSize(0), b.CreateAdd(produced, valid));
+        #ifdef PRINT_DEBUG_MESSAGES
+        debugPrint(b, makeBufferName(mKernelId, port.Port) + "_provisionalAvail = %" PRIu64, avail);
+        #endif
+        b.CreateAlignedStore(avail, getProvisionalAvailableItemPtr(b, streamSet), SizeTyABIAlignment);
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief ensureSufficientOutputSpace
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::ensureSufficientOutputSpace(KernelBuilder & b, const BufferPort & port, const unsigned streamSet,
@@ -1536,8 +1640,12 @@ Value * PipelineCompiler::getNumOfWritableStrides(KernelBuilder & b,
     if (LLVM_UNLIKELY(output.getRate().isPartialSum())) {
         numOfStrides = getMaximumNumOfPartialSumStrides(b, port, numOfLinearStrides);
     } else {
-        Value * const writable = getWritableOutputItems(b, port);
+        Value * writable = getWritableOutputItems(b, port);
         Value * const strideLength = getOutputStrideLength(b, port, "getWritable");
+        if (LLVM_UNLIKELY(isProvisionalStrideKernel())) {
+            // reserve space for the provisional stride
+            writable = b.CreateUnsignedSaturatingSub(writable, strideLength);
+        }
         numOfStrides = b.CreateUDiv(writable, strideLength);
     }
     #ifdef PRINT_DEBUG_MESSAGES

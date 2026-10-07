@@ -37,6 +37,13 @@ parabix_add_kernel_test(test_bytefilterandspread kernel.io kernel.streamutils)
 parabix_add_kernel_test(test_emptyprogram kernel.io)
 parabix_add_kernel_test(test_truncatedstreamset kernel.io)
 
+# ProvisionalLookAheadStride: compare provisional and normal processing of a lookahead chain
+parabix_add_executable(NAME provisional_lookahead SRC provisional_lookahead.cpp
+                       DEPS pablo.compiler kernel.basis kernel.io kernel.pipeline toolchain)
+add_test(NAME provisional_lookahead_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/provisional_lookahead_test.py ${TEST_BIN_DIR}/provisional_lookahead)
+
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

@@ -126,6 +126,9 @@ public:
 
     bool isCachable() const override;
 
+    // Adds ProvisionalLookAheadStride when the kernel has lookahead inputs and meets its requirements.
+    void addAutomaticAttributes() override;
+
     String * makeName(const llvm::StringRef prefix) const;
 
     Integer * getInteger(const int64_t value, unsigned intWidth = 64) const;

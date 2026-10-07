@@ -122,21 +122,37 @@ void PipelineCompiler::computeFullyProducedItemCounts(KernelBuilder & b, Value *
  * @brief addLookahead
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::addLookahead(KernelBuilder & b, const BufferPort & inputPort, Value * const itemCount) const {
-    if (LLVM_LIKELY(inputPort.LookAhead == 0)) {
+    const auto L = getEffectiveLookahead(inputPort);
+    if (LLVM_LIKELY(L == 0)) {
         return itemCount;
     }
-    Constant * const lookAhead = b.getSize(inputPort.LookAhead);
+    Constant * const lookAhead = b.getSize(L);
     return b.CreateAdd(itemCount, lookAhead);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getEffectiveLookahead
+ *
+ * The full strides of a provisional partition are limited by the total lookahead along its provisional chains,
+ * which the partition root applies to each of its inputs.
+ ** ------------------------------------------------------------------------------------------------------------- */
+unsigned PipelineCompiler::getEffectiveLookahead(const BufferPort & inputPort) const {
+    const auto L = static_cast<unsigned>(std::max(inputPort.LookAhead, 0));
+    if (LLVM_UNLIKELY(isProvisionalPartitionRoot())) {
+        return std::max(L, PartitionProvisionalLookAhead[mCurrentPartitionId]);
+    }
+    return L;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief subtractLookahead
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::subtractLookahead(KernelBuilder & b, const BufferPort & inputPort, Value * const itemCount) {
-    if (LLVM_LIKELY(inputPort.LookAhead == 0)) {
+    const auto L = getEffectiveLookahead(inputPort);
+    if (LLVM_LIKELY(L == 0)) {
         return itemCount;
     }
-    Constant * const lookAhead = b.getSize(inputPort.LookAhead);
+    Constant * const lookAhead = b.getSize(L);
     Value * const closed = isClosed(b, inputPort.Port);
     Value * const reducedItemCount = b.CreateUnsignedSaturatingSub(itemCount, lookAhead);
     return b.CreateSelect(closed, itemCount, reducedItemCount);

@@ -323,6 +323,27 @@ struct Attribute {
         // Note that that this does not guarantee that the pipeline compiler will mark
         // this kernel as statefree if it is unsafe to do so.
 
+        ProvisionalLookAheadStride,
+
+        // A block-oriented kernel with lookahead inputs may be called with N full strides
+        // plus additional input data that is less than one stride.  The kernel processes
+        // the N full strides normally (using the additional data as lookahead for the
+        // last of them), and then processes one further "provisional" stride as if it
+        // were a full stride.  The kernel state after the N full strides is preserved;
+        // any state changes made by the provisional stride are discarded, so that the
+        // provisional stride is reprocessed as a normal stride on the next call.
+
+        // The processed and produced item counts of the kernel reflect only the N full
+        // strides.  Output beyond them is valid up to the accessible input items less the
+        // lookahead amount; it is rewritten with the same values by the next call.  Only
+        // provisional stride kernels in the same partition read this extra output, which
+        // allows a chain of such kernels to share a partition while their total lookahead
+        // is less than a stride.  The partition root then limits its full strides by that
+        // total lookahead, and the final segment is processed normally.
+
+        // Requirements: every stream input and output is FixedRate(1), no output is InOut,
+        // the stride is the block width, and all mutable kernel state is held in kernel scalars.
+
         /** COUNT **/
 
         __Count
@@ -575,6 +596,10 @@ inline Attribute ExecuteStridesIndividually() {
 
 inline Attribute Statefree() {
     return Attribute(Attribute::KindId::Statefree, 0);
+}
+
+inline Attribute ProvisionalLookAheadStride() {
+    return Attribute(Attribute::KindId::ProvisionalLookAheadStride, 0);
 }
 
 inline Attribute InternallyGenerated() {

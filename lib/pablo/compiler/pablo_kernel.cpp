@@ -237,6 +237,19 @@ void PabloKernel::addInternalProperties(KernelBuilder & b) {
     mStreamTy = nullptr;
 }
 
+void PabloKernel::addAutomaticAttributes() {
+    if (!EnableProvisionalLookAheadStride || (mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
+        return;
+    }
+    bool hasLookAhead = false;
+    for (const Binding & input : mInputStreamSets) {
+        hasLookAhead |= input.hasLookahead();
+    }
+    if (hasLookAhead && meetsProvisionalLookAheadStrideRequirements()) {
+        setProvisionalLookAheadStride();
+    }
+}
+
 bool PabloKernel::isCachable() const {
     return (mFlags & Kernel::KernelFlags::RequiresIllustratorObject) == 0;
 }

@@ -45,6 +45,73 @@ void BlockOrientedKernel::generateFinalBlockMethod(KernelBuilder & b, llvm::Valu
     COMPILER->generateDefaultFinalBlockMethod(b);
 }
 
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief setProvisionalLookAheadStride
+ ** ------------------------------------------------------------------------------------------------------------- */
+void BlockOrientedKernel::setProvisionalLookAheadStride() {
+    if (!hasAttribute(Attribute::KindId::ProvisionalLookAheadStride)) {
+        addAttribute(ProvisionalLookAheadStride());
+        mKernelName += "+PLS";
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief meetsProvisionalLookAheadStrideRequirements
+ ** ------------------------------------------------------------------------------------------------------------- */
+bool BlockOrientedKernel::meetsProvisionalLookAheadStrideRequirements(std::string * reason) const {
+    auto fail = [&](const std::string & r) {
+        if (reason) {
+            *reason = r;
+        }
+        return false;
+    };
+    if (mInputStreamSets.empty()) {
+        return fail("at least one stream input");
+    }
+    auto checkBinding = [&](const Binding & binding) -> bool {
+        const ProcessingRate & rate = binding.getRate();
+        if (!rate.isFixed() || rate.getRate() != ProcessingRate::Rational{1}) {
+            return fail("every stream input and output to be FixedRate(1); " + binding.getName() + " is not");
+        }
+        for (const Attribute & attr : binding.getAttributes()) {
+            switch (attr.getKind()) {
+                case Attribute::KindId::Add:
+                case Attribute::KindId::Truncate:
+                case Attribute::KindId::AddCarry:
+                case Attribute::KindId::Delayed:
+                case Attribute::KindId::Deferred:
+                case Attribute::KindId::BlockSize:
+                case Attribute::KindId::ManagedBuffer:
+                case Attribute::KindId::SharedManagedBuffer:
+                case Attribute::KindId::ReturnedBuffer:
+                    return fail("stream bindings without rate-changing or managed-buffer attributes; " + binding.getName() + " has one");
+                case Attribute::KindId::InOut:
+                    // the provisional stride would overwrite input data that the next call reprocesses
+                    return fail("outputs that do not share a buffer with an input; " + binding.getName() + " is InOut");
+                default: break;
+            }
+        }
+        return true;
+    };
+    for (const Binding & input : mInputStreamSets) {
+        if (!checkBinding(input)) return false;
+    }
+    for (const Binding & output : mOutputStreamSets) {
+        if (!checkBinding(output)) return false;
+    }
+    for (const Attribute & attr : getAttributes()) {
+        switch (attr.getKind()) {
+            case Attribute::KindId::CanTerminateEarly:
+            case Attribute::KindId::MustExplicitlyTerminate:
+            case Attribute::KindId::MayFatallyTerminate:
+            case Attribute::KindId::InternallySynchronized:
+                return fail("a kernel that does not terminate early and is not internally synchronized");
+            default: break;
+        }
+    }
+    return true;
+}
+
 // CONSTRUCTOR
 BlockOrientedKernel::BlockOrientedKernel(LLVMTypeSystemInterface & ts,
     std::string && kernelName,

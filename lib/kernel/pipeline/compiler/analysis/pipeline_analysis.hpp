@@ -63,6 +63,8 @@ public:
 
         P.annotateBufferGraphWithAddAttributes();
 
+        P.identifyProvisionalStrideKernels();
+
         // Finish annotating the buffer graph
         P.identifyOwnedBuffers();
 
@@ -243,6 +245,10 @@ private:
 
     void annotateBufferGraphWithAddAttributes();
 
+    // ProvisionalLookAheadStride analysis
+
+    void identifyProvisionalStrideKernels();
+
     // Input truncation analysis functions
 
     void makeInputTruncationGraph();
@@ -307,6 +313,15 @@ public:
     std::vector<unsigned>           MaximumNumOfStrides;
     std::vector<unsigned>           StrideRepetitionVector;
     std::vector<unsigned>           TerminalPhaseSet;
+
+    // A kernel is provisional-active if it has the ProvisionalLookAheadStride attribute and is
+    // either its partition root or receives all of its inputs from provisional-active kernels
+    // in its partition.  ProvisionalChainLookAhead is the cumulative lookahead from the
+    // partition root up to and including the kernel; PartitionProvisionalLookAhead is the
+    // maximum of these over each partition (0 if the partition root is not provisional-active).
+    BitVector                       ProvisionalStrideKernel;
+    std::vector<unsigned>           ProvisionalChainLookAhead;
+    std::vector<unsigned>           PartitionProvisionalLookAhead;
 
     BufferGraph                     mBufferGraph;
     InOutGraph                      InOutStreamSetReplacement;

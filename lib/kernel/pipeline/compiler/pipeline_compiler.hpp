@@ -343,6 +343,18 @@ public:
     Value * getNumOfAccessibleStrides(KernelBuilder & b, const BufferPort & inputPort, Value * const numOfLinearStrides);
     Value * getWritableOutputItems(KernelBuilder & b, const BufferPort & outputPort, const bool force = false);
     Value * getNumOfWritableStrides(KernelBuilder & b, const BufferPort & port, Value * const numOfLinearStrides);
+    bool isProvisionalStrideKernel() const {
+        return ProvisionalStrideKernel.test(mKernelId);
+    }
+    bool isProvisionalPartitionRoot() const {
+        return mIsPartitionRoot && ProvisionalStrideKernel.test(mKernelId);
+    }
+    Value * getProvisionalAvailableItemPtr(KernelBuilder & b, const unsigned streamSet);
+    Value * calculateProvisionalFixedRateFactor(KernelBuilder & b, Value * const numOfLinearStrides);
+    void recordProvisionalAvailableItemCounts(KernelBuilder & b);
+    void resetProvisionalAvailableItemCounts(KernelBuilder & b);
+
+    unsigned getEffectiveLookahead(const BufferPort & inputPort) const;
     Value * addLookahead(KernelBuilder & b, const BufferPort & inputPort, Value * const itemCount) const;
     Value * subtractLookahead(KernelBuilder & b, const BufferPort & inputPort, Value * const itemCount);
 
@@ -688,6 +700,9 @@ protected:
     const RelationshipGraph                     mScalarGraph;
     const BufferGraph                           mBufferGraph;
     const std::vector<unsigned>                 PartitionJumpTargetId;
+    const BitVector                             ProvisionalStrideKernel;
+    const std::vector<unsigned>                 ProvisionalChainLookAhead;
+    const std::vector<unsigned>                 PartitionProvisionalLookAhead;
     const ConsumerGraph                         mConsumerGraph;
     const PartialSumStepFactorGraph             mPartialSumStepFactorGraph;
     const TerminationChecks                     mTerminationCheck;
@@ -738,6 +753,7 @@ protected:
     FixedVector<PHINode *>                      mInitiallyAvailableItemsPhi;
     FixedVector<Value *>                        mKernelIsClosed;
     FixedVector<Value *>                        mLocallyAvailableItems;
+    std::vector<AllocaInst *>                   mProvisionalAvailableItemPtr;
 
     FixedVector<Value *>                        mScalarValue;
     FixedVector<Value *>                        mThreadLocalStartOffset;
@@ -1003,6 +1019,9 @@ inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel,
 , mScalarGraph(std::move(P.mScalarGraph))
 , mBufferGraph(std::move(P.mBufferGraph))
 , PartitionJumpTargetId(std::move(P.PartitionJumpTargetId))
+, ProvisionalStrideKernel(std::move(P.ProvisionalStrideKernel))
+, ProvisionalChainLookAhead(std::move(P.ProvisionalChainLookAhead))
+, PartitionProvisionalLookAhead(std::move(P.PartitionProvisionalLookAhead))
 , mConsumerGraph(std::move(P.mConsumerGraph))
 , mPartialSumStepFactorGraph(std::move(P.mPartialSumStepFactorGraph))
 , mTerminationCheck(std::move(P.mTerminationCheck))
@@ -1021,6 +1040,7 @@ inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel,
 , mInitiallyAvailableItemsPhi(FirstStreamSet, LastStreamSet)
 , mKernelIsClosed(FirstKernel, LastKernel)
 , mLocallyAvailableItems(FirstStreamSet, LastStreamSet)
+, mProvisionalAvailableItemPtr(LastStreamSet - FirstStreamSet + 1, nullptr)
 
 , mScalarValue(FirstKernel, LastScalar)
 , mThreadLocalStartOffset(FirstStreamSet, LastStreamSet + PartitionCount + 1)

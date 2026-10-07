@@ -53,6 +53,11 @@ std::string BitMovementMode_string(BitMovementMode m) {
     else return "LookAhead";
 }
 
+bool EnableProvisionalLookAheadStride = true;
+static cl::opt<bool, true> EnableProvisionalLookAheadStrideOption("ProvisionalLookAheadStride", cl::location(EnableProvisionalLookAheadStride),
+    cl::desc("Give eligible Pablo kernels with lookahead inputs the ProvisionalLookAheadStride attribute (default true)"),
+    cl::cat(codegen::CodeGenOptions), cl::init(true));
+
 std::string PabloIllustrateKernelRegEx = "";
 static cl::opt<std::string, true> PabloIllustrateKernelOption("pablo-illustrate-kernel", cl::location(PabloIllustrateKernelRegEx), cl::ValueOptional,
     cl::desc("RegEx describing Pablo kernel names to illustrate"), cl::value_desc("regex"), cl::cat(codegen::InstrumentationOptions));

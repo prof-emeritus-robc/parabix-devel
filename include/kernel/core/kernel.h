@@ -290,6 +290,12 @@ public:
 
     virtual bool isCachable() const { return true; }
 
+    // Called by the PipelineBuilder when the kernel is added to a pipeline, after construction
+    // is complete but before the kernel is registered with the driver.  A kernel type may add
+    // attributes it can determine automatically; any that change the generated code must also
+    // be recorded in the kernel name.
+    virtual void addAutomaticAttributes() { }
+
     virtual bool hasSignature() const { return false; }
 
     virtual KernelCompilationPriority getCompilationPriority() const { return KernelCompilationPriority::Normal; }
@@ -841,6 +847,10 @@ public:
 
     std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) override;
 
+    // Whether the stream I/O and attributes of this kernel permit the ProvisionalLookAheadStride
+    // attribute; if not, reason (when given) describes the first requirement that is not met.
+    bool meetsProvisionalLookAheadStrideRequirements(std::string * reason = nullptr) const;
+
 protected:
 
     // Each BlockOrientedKernel must provide its own logic for generating
@@ -857,6 +867,10 @@ protected:
     void RepeatDoBlockLogic(KernelBuilder & b);
 
     virtual void generateFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingItems);
+
+    // Adds the ProvisionalLookAheadStride attribute and records it in the kernel name,
+    // since it changes the generated code.  Call from the subclass constructor.
+    void setProvisionalLookAheadStride();
 
     BlockOrientedKernel(LLVMTypeSystemInterface & ts,
                         std::string && kernelName,

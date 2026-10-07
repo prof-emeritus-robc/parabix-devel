@@ -42,6 +42,9 @@ extern llvm::sys::fs::OpenFlags PabloOutputFileFlag;
 extern llvm::sys::fs::OpenFlags PabloOptimizedOutputFileFlag;
 
 extern std::string PabloIllustrateKernelRegEx;
+
+// Give every eligible Pablo kernel with lookahead inputs the ProvisionalLookAheadStride attribute.
+extern bool EnableProvisionalLookAheadStride;
 extern std::string PabloIllustrateBitstreamRegEx;
 
 bool CompileOptionIsSet(const PabloCompilationFlags flag);

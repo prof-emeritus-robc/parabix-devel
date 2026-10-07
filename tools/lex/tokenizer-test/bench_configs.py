@@ -31,14 +31,14 @@ Why a dedicated script instead of running bench_bpe.py --parabix-only twice
 
 Usage
 -----
-    # default: baseline vs --level-partition on val_2MB
+    # default: baseline vs --partition=level on val_2MB
     python bench_configs.py
 
     # explicit configs, NAME=FLAGS (first one is the baseline for speedups)
     python bench_configs.py \
         --config 'baseline=' \
-        --config 'level=--level-partition' \
-        --config 'level+compact=--level-partition --compact-base=40'
+        --config 'level=--partition=level' \
+        --config 'level+compact=--partition=level --compact-base=40'
 
     # floor / marginal-rate split, plus an output-identity check
     python bench_configs.py --sizes 0.25,1,4,8 --verify
@@ -79,7 +79,7 @@ OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Default comparison when the user names no configs: the current default
 # partition against the level schedule.
-DEFAULT_CONFIGS = [("baseline", ""), ("level-partition", "--level-partition")]
+DEFAULT_CONFIGS = [("baseline", ""), ("level", "--partition=level")]
 
 DEFAULT_ITERS  = 5
 DEFAULT_ROUNDS = 3
@@ -341,7 +341,7 @@ def main() -> None:
         description="Benchmark Parabix BPE configurations against each other (no HuggingFace).")
     ap.add_argument("--config", action="append", default=[], metavar="NAME=FLAGS",
                     help="Config to time, repeatable. The FIRST is the baseline for "
-                         "speedup columns. Example: --config 'level=--level-partition'")
+                         "speedup columns. Example: --config 'level=--partition=level'")
     ap.add_argument("--input", default=DEFAULT_INPUT,
                     help=f"Corpus (default {DEFAULT_INPUT})")
     ap.add_argument("--sizes", metavar="MB[,MB...]",

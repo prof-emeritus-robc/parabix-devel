@@ -477,7 +477,7 @@ def main() -> None:
                         help="Skip the timing section")
     parser.add_argument("--tok-flag",     action="append", default=[], metavar="FLAG",
                         help="Extra flag passed straight to the tokenizer binary "
-                             "(repeatable), e.g. --tok-flag=--level-partition")
+                             "(repeatable), e.g. --tok-flag=--partition=level")
     parser.add_argument("--tokenizer",      default=TOKENIZER,
                         help=f"Parabix tokenizer binary (default: {TOKENIZER})")
     parser.add_argument("--merges",         default=MERGES,

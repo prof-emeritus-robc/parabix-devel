@@ -444,29 +444,16 @@ static cl::opt<bool> SkipInstCombine(
     cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
     cl::init(false));
 
-// Bit-transformation kernels (BPEXfrmKernel): a merge kernel whose input id stream has
-// at most this many bits computes every output bit as input XOR a "change" stream, where
-// each change stream is a character class compiled over an (A id, B id) pair. Ids wider
-// than kXfrmLowBits are split: an if-block per (high A bits, high B bits) pair, with the
-// character classes over the low bits inside (see BPEXfrmKernel). 0 = off.
-static cl::opt<unsigned> MaxBitXfrmLimit(
-    "max-bit-xfrm-limit",
-    cl::desc("Build merge kernels whose input id stream has at most N bits as bit "
-             "transformations (0 = off, the default). Ids over 10 bits are gated by "
-             "if-blocks on their high bits."),
-    cl::init(0));
-
-// Full subtiering (--partition-by-merge-id-bits): every kernel of a merge id bit tier N
-// with kXfrmLowBits < N <= this limit is built as a bit transformation whose character
-// classes take 20 bits: the low 20-N bits of idA and all N bits of idB. The remaining
-// high 2N-20 bits of the N-bit idA name the rule's subtier (4 subtiers in the 11-bit
-// tier, 16 in the 12-bit tier, 64 in the 13-bit tier); a kernel may hold rules of several
-// subtiers and guards each with one if-test on idA's subtier bits. 0 = off.
-static cl::opt<unsigned> FullSubtieringLimit(
-    "full-subtiering-limit",
-    cl::desc("With --partition-by-merge-id-bits: build merge id bit tiers 11..N as bit "
-             "transformations with one if-block per subtier (the high 2N-20 bits of idA) "
-             "(0 = off)."),
+// --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
+// bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
+// input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
+// --partition-by-merge-id-bits these are the kernels of merge id bit tiers 9..N. Ids of
+// up to kXfrmLowBits bits fit the 20-bit class whole; wider ids are split into subtiers
+// (see BPEXfrmKernel). 0 = off.
+static cl::opt<unsigned> BitXfrmLimit(
+    "bit-xfrm-limit",
+    cl::desc("Build merge kernels whose output ids have at most N bits as bit "
+             "transformations, ids over 10 bits by subtiers (0 = off, the default)."),
     cl::init(0));
 
 // --subtier-grouping-by-min-ID=N: in the subtiered kernels of merge id bit tiers >= N, key
@@ -480,7 +467,7 @@ static cl::opt<unsigned> FullSubtieringLimit(
 // gates it is no faster (default backend level) or slightly slower (aggressive).
 static cl::opt<unsigned> SubtierGroupingByMinID(
     "subtier-grouping-by-min-ID",
-    cl::desc("Key the subtiers of --full-subtiering-limit kernels of merge id bit tiers >= N "
+    cl::desc("Key the subtiers of bit-transformation kernels of merge id bit tiers >= N "
              "by the high bits of the smaller part id (0 = off, the default)."),
     cl::init(0));
 
@@ -496,7 +483,7 @@ static bool subtierGroupingApplies(unsigned tierBits) {
 // none, which measured fastest (tiers 12-14 10-25% cheaper than with every subtier gated).
 static cl::opt<unsigned> SubtierGatingBits(
     "subtier-gating-bits",
-    cl::desc("Gate a subtier of --full-subtiering-limit kernels with an if only when its keyed "
+    cl::desc("Gate a subtier of bit-transformation kernels with an if only when its keyed "
              "part id has at least K bits (0 = gate every subtier; default 17 = no gates)."),
     cl::init(17));
 
@@ -1964,14 +1951,15 @@ private:
     bool mUseNextId;
     bool mGrouped;
 };
-// ─── BPEXfrmKernel (--max-bit-xfrm-limit) ───────────────────────────────────
+// ─── BPEXfrmKernel (--bit-xfrm-limit) ───────────────────────────────────────
 // A merge kernel built as a set of bit transformations instead of per-rule gates. Same
 // bindings and semantics as BPEMergeKernel; it handles groups whose rules read only the
 // frozen kernel input (no --chain-partition nest, --asymmetric-seam live mask or
 // --chain-veto; see bitXfrmEligible).
 //
-// For an input id stream of N bits, rules are bucketed by L = lenA, the lookahead
-// distance at which their B part starts. For each L the kernel forms one 2N-bit vector
+// For an input id stream of N <= kXfrmLowBits bits, rules are bucketed by L = lenA, the
+// lookahead distance at which their B part starts. For each L the kernel forms one 2N-bit
+// vector
 //     V_L = [ id bits 0..N-1 at p ,  id bits 0..N-1 at p+L ]
 // so a rule's (idA, idB) pair is the value idA | idB << N. For every output bit j, the
 // rules of that bucket whose idAB bit j differs from idA bit j (for j >= N: whose idAB
@@ -1982,22 +1970,22 @@ private:
 // The union of a bucket's values, under the same mask, is its fire stream, and the B
 // starts are consumed as in BPEMergeKernel: live &= NOT Advance(fire_L, L).
 //
+// Subtiers (N > kXfrmLowBits): re::CC codepoints stop at 0x10FFFF, so a pair value can
+// hold 20 bits. The classes take the low 20-N bits of idA and all N bits of idB; the
+// remaining high 2N-20 bits of idA name the rule's subtier, and each subtier present in
+// the kernel is one block: its classes ANDed with (idA's subtier bits at p == the key),
+// all L sharing the block. --subtier-gating-bits puts a block in an if when its key
+// shows a large idA; --subtier-grouping-by-min-ID keys rules with idA > idB on idB.
+//
 // Exactness: within one kernel at most one rule fires at a position (the frozen id there
 // selects idA, and rules sharing idA share L and so read one B slot), and same-kernel
 // rules never touch each other's positions (dependency + seam constraints), so XOR-ing
 // all change streams from the frozen input equals applying the rules one by one.
 //
 // Self-merges X+X need per-run pairing (selfMergeFireStarts), which a character class
-// cannot express; they keep a per-rule stamp here. The seam constraints keep every other
-// rule off their positions, so the stamp and the change streams never meet.
-//
-// Ids wider than kXfrmLowBits (re::CC codepoints stop at 0x10FFFF = 21 bits, so the pair
-// vector can hold two 10-bit ids): with H = N - 10 high bits, a bucket's rules are
-// further split by (idA >> 10, idB >> 10). Each such pair gets one createIf whose
-// condition tests those H high bits at p and at p+L (AND the bucket's live/boundary
-// gate); inside, the change and fire sets are compiled over the 20-bit vector of the low
-// 10 bits of both ids, and ANDed with that condition. Every rule belongs to exactly one
-// block, so the result equals the ungated form.
+// cannot express; they keep a per-rule stamp here, or join --self-merge-block. The seam
+// constraints keep every other rule off their positions, so the stamp and the change
+// streams never meet.
 static constexpr unsigned kXfrmLowBits = 10;
 
 class BPEXfrmKernel : public PabloKernel {
@@ -2008,14 +1996,12 @@ public:
                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
     : PabloKernel(ts, std::string("BPEXfrm_") + (boundaryIn ? "b1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
-                        + (group.subtiered ? "st_" : "")
-                        + (group.subtiered && sourceIn->getNumElements() > kXfrmLowBits
-                               && subtierGroupingApplies(ceil_log2(group.hi)) ? "gm_" : "")
-                        + (group.subtiered && SubtierGatingBits > 0
-                               ? "sg" + std::to_string(SubtierGatingBits) + "_" : "")
-                        + (!blockSelfMerges(group).empty() ? "smb_" : "")
                         + (sourceIn->getNumElements() > kXfrmLowBits
-                               ? "lo" + std::to_string(kXfrmLowBits) + "_" : "")
+                               ? std::string("st_")
+                                 + (subtierGroupingApplies(ceil_log2(group.hi)) ? "gm_" : "")
+                                 + (SubtierGatingBits > 0 ? "sg" + std::to_string(SubtierGatingBits) + "_" : "")
+                               : std::string())
+                        + (!blockSelfMerges(group).empty() ? "smb_" : "")
                         + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
                                                  // FilterByMask, inPlayMask built locally
                         + "w" + std::to_string(sourceIn->getNumElements())
@@ -2075,20 +2061,15 @@ protected:
         PabloAST * consumed = nullptr;   // B starts to clear from the live mask
         auto orInto = [&](PabloAST *& acc, PabloAST * v) { acc = acc ? pb.createOr(acc, v) : v; };
 
-        // Ids of N bits: the low NloA bits of idA and NloB bits of idB go into the
-        // character classes, the remaining high bits (if any) into the if-block
-        // conditions. Default: kXfrmLowBits of each. Subtiered: all N bits of idB and
-        // 2*kXfrmLowBits - N of idA, whose high bits (the subtier) each get an if-block.
-        unsigned NloA = std::min(N, kXfrmLowBits), NloB = NloA;
-        if (mRuleGroup.subtiered && N > kXfrmLowBits) {
-            NloB = N;
-            NloA = 2 * kXfrmLowBits - N;
-        }
-        const bool H = (NloA < N) || (NloB < N);
+        // Ids of N bits: the classes take the low NloA bits of idA and all N bits of idB.
+        // Subtiers (H): N > kXfrmLowBits, NloA = 2*kXfrmLowBits - N, and the high N-NloA
+        // bits of idA (the subtier key) select a block.
+        const bool H = N > kXfrmLowBits;
+        const unsigned NloA = H ? 2 * kXfrmLowBits - N : N, NloB = N;
         const unsigned loMaskA = (1u << NloA) - 1u, loMaskB = (1u << NloB) - 1u;
         // --subtier-grouping-by-min-ID: rules with idA > idB (group B) swap the roles: idB
         // gives the NloA keyed bits, idA all NloB bits.
-        const bool byMin = mRuleGroup.subtiered && N > kXfrmLowBits && subtierGroupingApplies(W_out);
+        const bool byMin = H && subtierGroupingApplies(W_out);
 
         // Compile one block's sets in `bld` over the low-bit pair vector, masked by `mask`,
         // handing each result to addFire / addChange. keyB: the block is keyed on idB
@@ -2121,7 +2102,7 @@ protected:
             }
         };
 
-        // H > 0: accumulators the if-blocks OR into (Pablo joins them at each block's end).
+        // H: accumulators the subtier blocks OR into (Pablo joins them at each if's end).
         std::vector<Var *> changeVar(W_out, nullptr);
         auto changeAcc = [&](unsigned j) -> Var * {
             if (!changeVar[j]) changeVar[j] = pb.createVar("change_" + std::to_string(j), pb.createZeroes());
@@ -2146,32 +2127,29 @@ protected:
                 orInto(consumed, pb.createAdvance(fire, (int64_t) L));
             }
         } else {
-            // One block per (high idA bits, high idB bits). idB's high bits are read L slots
-            // ahead, so while they are tested a block also has a single L; without them
-            // (subtiered) one block serves every L. Group B blocks (--subtier-grouping-by-
-            // min-ID) are keyed on idB's high bits, so they too have a single L.
-            // Key: (group: 0 = keyed on idA, 1 = on idB; L or 0; keyed high bits; high idB bits).
-            const bool testB = NloB < N;
-            std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>,
+            // One block per subtier, all L sharing it. Group B blocks (--subtier-grouping-
+            // by-min-ID) are keyed on idB's high bits, read L slots ahead, so each has one L.
+            // Key: (group: 0 = keyed on idA, 1 = on idB; L, or 0 for group 0; keyed high bits).
+            std::map<std::tuple<unsigned, unsigned, unsigned>,
                      std::map<unsigned, std::vector<const MergeRule *>>> blocks;
             for (const auto & [L, rules] : byLen)
                 for (const MergeRule * r : rules) {
                     if (byMin && r->idA > r->idB)
-                        blocks[{1u, L, r->idB >> NloA, 0u}][L].push_back(r);
+                        blocks[{1u, L, r->idB >> NloA}][L].push_back(r);
                     else
-                        blocks[{0u, testB ? L : 0u, r->idA >> NloA, r->idB >> NloB}][L].push_back(r);
+                        blocks[{0u, 0u, r->idA >> NloA}][L].push_back(r);
                 }
             std::map<unsigned, Var *> fireL;
             for (const auto & [L, rules] : byLen)
                 fireL[L] = pb.createVar("fire_L" + std::to_string(L), pb.createZeroes());
             // Emit one block's sets into `bld`: the if body, or the top scope when ungated.
             auto emitSets = [&](auto & bld, const std::map<unsigned, std::vector<const MergeRule *>> & rulesByL,
-                                PabloAST * cond, bool perL, bool keyB, const std::string & btag) {
+                                PabloAST * cond, bool keyB, const std::string & btag) {
                 for (const auto & [L, rs] : rulesByL) {
                     // the condition already carries `live`; add L's boundary gate if any
-                    PabloAST * mask = (perL || !mHasBoundary) ? cond : bld.createAnd(cond, gate(L));
+                    PabloAST * mask = (keyB || !mHasBoundary) ? cond : bld.createAnd(cond, gate(L));
                     Var * fire = fireL[L];
-                    buildSets(bld, rs, ahead(L), mask, keyB, btag + (perL ? "" : "_L" + std::to_string(L)),
+                    buildSets(bld, rs, ahead(L), mask, keyB, btag + (keyB ? "" : "_L" + std::to_string(L)),
                               [&](PabloAST * f) { bld.createAssign(fire, bld.createOr(fire, f)); },
                               [&](unsigned j, PabloAST * c) {
                                   Var * acc = changeAcc(j);
@@ -2180,26 +2158,20 @@ protected:
                 }
             };
             for (const auto & [key, rulesByL] : blocks) {
-                const auto & [grp, keyL, hiK, hiB] = key;
+                const auto & [grp, keyL, hiK] = key;
                 const bool keyB = grp == 1;
-                const bool perL = testB || keyB;
-                const std::string btag = (perL ? "_L" + std::to_string(keyL) : std::string())
-                                       + (keyB ? "_kb" : "_a") + std::to_string(hiK) + "_b" + std::to_string(hiB);
+                const std::string btag = (keyB ? "_L" + std::to_string(keyL) + "_kb" : "_a") + std::to_string(hiK);
                 PabloAST * hiEq = eqHigh(keyB ? ahead(keyL) : srcBits, NloA, hiK);
-                if (testB) {
-                    PabloAST * e = eqHigh(ahead(keyL), NloB, hiB);
-                    hiEq = hiEq ? pb.createAnd(hiEq, e) : e;
-                }
-                PabloAST * cond = pb.createAnd(hiEq, perL ? gate(keyL) : live, "hi" + btag);
+                PabloAST * cond = pb.createAnd(hiEq, keyB ? gate(keyL) : live, "hi" + btag);
                 // --subtier-gating-bits: gate only a subtier whose keyed part has >= K bits.
                 const unsigned keyedBits = hiK ? (32u - __builtin_clz(hiK)) + NloA : 0u;
-                const bool gated = testB || SubtierGatingBits == 0 || keyedBits >= SubtierGatingBits;
+                const bool gated = SubtierGatingBits == 0 || keyedBits >= SubtierGatingBits;
                 if (!gated) {
-                    emitSets(pb, rulesByL, cond, perL, keyB, btag);
+                    emitSets(pb, rulesByL, cond, keyB, btag);
                     continue;
                 }
                 auto body = pb.createScope();
-                emitSets(body, rulesByL, cond, perL, keyB, btag);
+                emitSets(body, rulesByL, cond, keyB, btag);
                 pb.createIf(cond, body);
             }
             for (const auto & [L, fire] : fireL)
@@ -2372,7 +2344,7 @@ BPEPassResult buildBPEPassPipeline(
     // kernel→kernel; `inPlayMask` (seeded active = all ones) threads too, each kernel
     // clearing the token starts it consumes, so the final mask marks surviving starts.
     StreamSet * inPlayMask = active;
-    unsigned nXfrm = 0, nXfrmIneligible = 0;   // --max-bit-xfrm-limit kernel counts
+    unsigned nXfrm = 0, nXfrmIneligible = 0;   // --bit-xfrm-limit kernel counts
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
         if (g.rules.empty()) continue;
@@ -2401,7 +2373,7 @@ BPEPassResult buildBPEPassPipeline(
         // BPEMergeKernel::generatePabloMethod).
         const int groupLowerLimit = effIfGroupLowerLimit();
         bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
-        const bool xfrmWidth = source->getNumElements() <= MaxBitXfrmLimit || g.subtiered;
+        const bool xfrmWidth = output_bits <= BitXfrmLimit;
         if (xfrmWidth && !nextId && bitXfrmEligible(g)) {
             // inPlayMask may be nullptr here (first kernel after a FilterByMask) --
             // BPEXfrmKernel builds it locally in that case (see hasStreamInput in its
@@ -2449,11 +2421,10 @@ BPEPassResult buildBPEPassPipeline(
         inPlayMask = nullptr;
     }
 
-    if (MaxBitXfrmLimit > 0 || FullSubtieringLimit > 0)
-        std::cerr << "[BPE] max-bit-xfrm-limit=" << MaxBitXfrmLimit
-                  << " full-subtiering-limit=" << FullSubtieringLimit << ": " << nXfrm
+    if (BitXfrmLimit > 0)
+        std::cerr << "[BPE] bit-xfrm-limit=" << BitXfrmLimit << ": " << nXfrm
                   << " bit-transformation kernels" << (nXfrmIneligible
-                      ? ", " + std::to_string(nXfrmIneligible) + " narrow kernels kept per-rule "
+                      ? ", " + std::to_string(nXfrmIneligible) + " kernels kept per-rule "
                         "(chain/asymmetric-seam/veto rules or --indexed-shift)" : std::string())
                   << "\n";
     // The emitter packs exactly 16 id bits (P2S16Kernel); widen a narrower final stream.
@@ -3031,7 +3002,6 @@ static std::vector<MergeRuleGroup> splitOversizedGroups(std::vector<MergeRuleGro
         for (auto & c : chunks) {
             MergeRuleGroup sub;
             sub.hi = g.hi;
-            sub.subtiered = g.subtiered;
             sub.rules = std::move(c);
             sub.lo = sub.rules.front().idAB;
             std::unordered_set<unsigned> stamped;   // idABs stamped in this chunk
@@ -3141,15 +3111,10 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     //    Oversized groups are split right after each partition (--max-merges-per-kernel),
     //    so a tier's context counts the kernels that will really precede it.
     unsigned nSplit = 0;
-    auto partition = [&](const std::vector<MergeRule> & rs, const PartitionContext & ctx,
-                         unsigned bits) {
-        auto groups = LevelPartition ? levelPartition(rs, ctx) : cleanRangePartition(rs);
-        if (bits > kXfrmLowBits && bits <= FullSubtieringLimit)
-            for (auto & g : groups) g.subtiered = true;
-        return splitOversizedGroups(std::move(groups), nSplit);
+    auto partition = [&](const std::vector<MergeRule> & rs, const PartitionContext & ctx) {
+        return splitOversizedGroups(LevelPartition ? levelPartition(rs, ctx) : cleanRangePartition(rs),
+                                    nSplit);
     };
-    if (FullSubtieringLimit && !PartitionByMergeIdBits)
-        std::cerr << "[BPE] WARNING: --full-subtiering-limit needs --partition-by-merge-id-bits; ignored\n";
     std::vector<MergeRuleGroup> groups;
     if (PartitionByMergeIdBits) {
         // rules are rank-sorted, so each bit tier is a contiguous run of them
@@ -3159,7 +3124,7 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             const unsigned bits = ceil_log2(rules[i].idAB + 1);   // bit length of idAB
             size_t j = i;
             while (j < n && ceil_log2(rules[j].idAB + 1) == bits) ++j;
-            auto tier = partition(std::vector<MergeRule>(rules.begin() + i, rules.begin() + j), ctx, bits);
+            auto tier = partition(std::vector<MergeRule>(rules.begin() + i, rules.begin() + j), ctx);
             std::cerr << "[BPE] merge id bits " << bits << ": " << (j - i) << " rules in "
                       << tier.size() << " kernels\n";
             // advance the context past this tier: the count steps once per kernel, as in
@@ -3170,7 +3135,7 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             i = j;
         }
     } else {
-        groups = partition(rules, PartitionContext(), 0);
+        groups = partition(rules, PartitionContext());
     }
     if (nSplit)
         std::cerr << "[BPE] max-merges-per-kernel=" << MaxMergesPerKernel << ": split " << nSplit

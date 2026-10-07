@@ -78,7 +78,7 @@ using namespace llvm;
 //   linear         — after every N kernels (N = --compact-base).
 //   geometric      — after N kernels, then 2N more, 4N more, ... (N = --compact-base).
 //   by-output-bits — between two kernels whose output id widths differ, i.e. after the
-//                    last kernel of each width (with --partition-by-merge-id-bits: after
+//                    last kernel of each width (with --partition=bit-tier: after
 //                    each bit tier). --compact-base=N is the minimum kernel number: a width
 //                    change after fewer than N kernels is skipped, deferring compaction to
 //                    the next width change.
@@ -249,7 +249,16 @@ static unsigned effGroupSize(size_t n) {
 //               producer side always needs a real kernel boundary -- B-detection is a
 //               forward LookAhead on the frozen input (T5) and can never see a
 //               same-kernel producer.
-enum class PartitionMode { Clean, Level, Asymmetric, Chain };
+// BitTier: confine every kernel to merged ids of ONE bit length. Tier b holds the rules
+// with idAB in [2^(b-1), 2^b) — tier 9 = ids 256..511, tier 10 = 512..1023, … Each tier is
+// partitioned on its own via ASAP level scheduling (same as Level) and the tiers run in
+// order, so the first kernel of tier N+1 reads an N-bit id stream and writes N+1 bits, and
+// every later kernel of that tier reads and writes N+1 bits. Both correctness constraints
+// carry across a tier boundary for free: every rule of a lower tier has lower rank and
+// runs in a strictly earlier kernel, which is exactly what the dependency and seam
+// constraints ask of an earlier rule. Only the packing changes. Mutually exclusive with
+// Level/Asymmetric/Chain (one PartitionMode at a time).
+enum class PartitionMode { Clean, Level, Asymmetric, Chain, BitTier };
 static cl::opt<PartitionMode> Partition(
     "partition",
     cl::desc("Merge-rule partitioning strategy:"),
@@ -262,32 +271,22 @@ static cl::opt<PartitionMode> Partition(
             "Level scheduling, relaxed maxRight seam (76 kernels; less battle-tested)."),
         clEnumValN(PartitionMode::Chain, "chain",
             "Level scheduling, same-level dependency chains + veto (fewer kernels; "
-            "slower in testing so far).")),
+            "slower in testing so far)."),
+        clEnumValN(PartitionMode::BitTier, "bit-tier",
+            "ASAP level scheduling confined to one merged-id bit length per kernel, "
+            "tiers run in order, so each kernel grows the id stream by at most one bit.")),
     cl::init(PartitionMode::Clean));
 static bool isLevelPartition()  { return Partition != PartitionMode::Clean; }
 static bool isAsymmetricSeam()  { return Partition == PartitionMode::Asymmetric; }
 static bool isChainPartition()  { return Partition == PartitionMode::Chain; }
 static bool isChainVeto()       { return Partition == PartitionMode::Chain; }
-
-// Bit-tier partition: confine every kernel to merged ids of ONE bit length. Tier b holds
-// the rules with idAB in [2^(b-1), 2^b) — tier 9 = ids 256..511, tier 10 = 512..1023, …
-// Each tier is partitioned on its own (clean ranges, or --partition=level levels) and
-// the tiers run in order, so the first kernel of tier N+1 reads an N-bit id stream and
-// writes N+1 bits, and every later kernel of that tier reads and writes N+1 bits. Both
-// correctness constraints carry across a tier boundary for free: every rule of a lower
-// tier has lower rank and runs in a strictly earlier kernel, which is exactly what the
-// dependency and seam constraints ask of an earlier rule. Only the packing changes.
-static cl::opt<bool> PartitionByMergeIdBits(
-    "partition-by-merge-id-bits",
-    cl::desc("Confine each merge kernel to merged ids of a single bit length, so each "
-             "kernel grows the id stream by at most one bit."),
-    cl::init(false));
+static bool isBitTierPartition() { return Partition == PartitionMode::BitTier; }
 
 // Cap the rules per merge kernel: a partition group with more than this many rules is
 // split into ceil(n/cap) consecutive kernels of near-equal size, in rank order. Pablo's
-// compile time is superlinear in kernel size, and --partition=level with
-// --partition-by-merge-id-bits puts most of a bit tier into its first level (8023 rules
-// in the 16-bit tier's first kernel). Splitting is exact: the rules of one group have
+// compile time is superlinear in kernel size, and --partition=bit-tier puts most of a
+// bit tier into its first level (8023 rules in the 16-bit tier's first kernel). Splitting
+// is exact: the rules of one group have
 // no dependencies or seams among each other that a later kernel could break —
 //   - dependency / seam: a lower-rank rule moves to an EARLIER kernel, which is what
 //     both constraints ask of it anyway;
@@ -417,7 +416,7 @@ static cl::opt<bool> SkipInstCombine(
 // --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
 // bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
 // input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
-// --partition-by-merge-id-bits these are the kernels of merge id bit tiers 9..N. Ids of
+// --partition=bit-tier these are the kernels of merge id bit tiers 9..N. Ids of
 // up to kXfrmLowBits bits fit the 20-bit class whole; wider ids are split into subtiers
 // (see BPEXfrmKernel). 0 = off.
 static cl::opt<unsigned> BitXfrmLimit(
@@ -542,7 +541,7 @@ struct CompactionCounter {
 };
 
 // Where one levelPartition call sits in the whole pipeline: the global index of its first
-// kernel and the compaction count on entry. --partition-by-merge-id-bits partitions each
+// kernel and the compaction count on entry. --partition=bit-tier partitions each
 // bit tier separately, so key-cluster needs these to see global kernel indices
 // (--if-group-lower-limit) and the real compaction points. The defaults describe a
 // partition of the whole rule list.
@@ -2260,7 +2259,7 @@ BPEPassResult buildBPEPassPipeline(
     // per-group [lo,hi) xN maxLen=M lines too (verbose, 1 line/kernel).
     std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels ("
               << (isLevelPartition() ? "ASAP level schedule" : "contiguous clean ranges")
-              << (PartitionByMergeIdBits ? ", per merge id bit width" : "") << ")\n";
+              << (isBitTierPartition() ? ", per merge id bit width" : "") << ")\n";
     if (std::getenv("BPE_GROUPS")) {
         for (const auto & g : ruleRanges)
             std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.rules.size()
@@ -3074,12 +3073,12 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     std::sort(rules.begin(), rules.end(),
               [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
 
-    // 3. Partition. --partition=level/asymmetric/chain take the ASAP level schedule
-    //    (minimum kernel count, same constraints); --partition=clean (default) is the
-    //    clean_range walk (see cleanRangePartition). --partition-by-merge-id-bits
-    //    partitions each idAB bit tier separately and concatenates the tiers in order
-    //    (see PartitionByMergeIdBits). Oversized groups are split right after each
-    //    partition (--max-merges-per-kernel), so a tier's context counts the kernels
+    // 3. Partition. --partition=level/asymmetric/chain/bit-tier take the ASAP level
+    //    schedule (minimum kernel count, same constraints); --partition=clean (default) is
+    //    the clean_range walk (see cleanRangePartition). --partition=bit-tier partitions
+    //    each idAB bit tier separately (via the ASAP level schedule) and concatenates the
+    //    tiers in order (see isBitTierPartition). Oversized groups are split right after
+    //    each partition (--max-merges-per-kernel), so a tier's context counts the kernels
     //    that will really precede it.
     unsigned nSplit = 0;
     auto partition = [&](const std::vector<MergeRule> & rs, const PartitionContext & ctx) {
@@ -3087,7 +3086,7 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
                                     nSplit);
     };
     std::vector<MergeRuleGroup> groups;
-    if (PartitionByMergeIdBits) {
+    if (isBitTierPartition()) {
         // rules are rank-sorted, so each bit tier is a contiguous run of them
         PartitionContext ctx;
         size_t i = 0, n = rules.size();

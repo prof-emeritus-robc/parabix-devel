@@ -2,8 +2,10 @@
 """
 BPE tokenizer test suite.
 
-Compares Parabix BPE output against HuggingFace's tokenizer.
-Each non-empty line in the input file is treated as a separate test case.
+Compares Parabix BPE output against HuggingFace's tokenizer and, as a third
+independent reference, OpenAI's tiktoken (same GPT-2 vocab/merges -- confirmed
+byte-identical to HF on this project's vocab.json/merges.txt). Each non-empty
+line in the input file is treated as a separate test case.
 
 Parabix uses a two-step pipeline:
   Step 1: tokenizer --pretokenizer bytelevel <input>              → pre-tokens
@@ -11,13 +13,18 @@ Parabix uses a two-step pipeline:
 
 HuggingFace runs the same GPT-2 BPE model via the tokenizers library,
 loaded from the local tokenizer.json so both sides use identical vocab/merges.
+tiktoken runs its own Rust implementation of the same GPT-2 encoding (its
+"gpt2" built-in encoding), not loaded from this project's files at all --
+a genuinely independent implementation, not just a second config of the same one.
 
 Usage:
     python compare_bpe.py                              # default input file
     python compare_bpe.py --input path/to/cases.txt   # custom input file
     python compare_bpe.py --verbose                    # full token-by-token table always
-    python compare_bpe.py --parabix-only               # skip HF, show Parabix output only
-    python compare_bpe.py --hf-only                    # skip Parabix, show HF output only
+    python compare_bpe.py --parabix-only               # skip HF + tiktoken
+    python compare_bpe.py --hf-only                    # skip Parabix + tiktoken
+    python compare_bpe.py --tiktoken-only               # skip Parabix + HF
+    python compare_bpe.py --no-tiktoken                 # Parabix vs HF only (original behavior)
     python compare_bpe.py --runs 10                    # timed runs per side (default 5)
     python compare_bpe.py --no-timing                  # skip the timing section
 """
@@ -30,6 +37,7 @@ import re
 import argparse
 import time
 from tokenizers import Tokenizer
+import tiktoken
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -132,6 +140,14 @@ def run_hf_bpe(tokenizer_obj, text: str) -> tuple[list[int], list[str]]:
     return output.ids, output.tokens
 
 
+def run_tiktoken_bpe(enc, text: str) -> tuple[list[int], list[str]]:
+    """Run tiktoken's built-in "gpt2" encoding -- its own Rust implementation,
+    not loaded from this project's vocab.json/merges.txt at all."""
+    ids = enc.encode(text)
+    toks = [enc.decode_single_token_bytes(i).decode("utf-8", errors="replace") for i in ids]
+    return ids, toks
+
+
 # ---------------------------------------------------------------------------
 # Timing — FAIR: pure tokenization, one-time setup excluded on BOTH sides.
 #
@@ -201,8 +217,27 @@ def bench_hf(tokenizer_obj, text: str, runs: int) -> dict:
             "median_ms": median, "mean_ms": mean, "mbps": mbps}
 
 
-def measure_timing(tokenizer_obj, text: str, runs: int) -> dict:
-    """Fair tokenize-vs-tokenize timing (setup excluded both sides)."""
+def bench_tiktoken(enc, text: str, runs: int) -> dict:
+    """Fair tiktoken tokenize time: warm best-of-N in-process encode() (encoding
+    already loaded by tiktoken.get_encoding() before timing)."""
+    enc.encode(text)                                  # one discarded warm-up
+    times_ms = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        enc.encode(text)
+        times_ms.append((time.perf_counter() - t0) * 1e3)
+    times_ms.sort()
+    nbytes = len(text.encode("utf-8"))
+    minv   = times_ms[0]
+    median = times_ms[len(times_ms) // 2]
+    mean   = sum(times_ms) / len(times_ms)
+    mbps   = (nbytes / (minv / 1e3)) / 1e6 if minv > 0 else 0.0
+    return {"bytes": nbytes, "iters": runs, "min_ms": minv,
+            "median_ms": median, "mean_ms": mean, "mbps": mbps}
+
+
+def measure_timing(tokenizer_obj, tiktoken_enc, text: str, runs: int) -> dict:
+    """Fair tokenize-vs-tokenize timing (setup excluded on every side)."""
     result = {}
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
@@ -216,6 +251,8 @@ def measure_timing(tokenizer_obj, text: str, runs: int) -> dict:
 
     if tokenizer_obj is not None:
         result["hf"] = bench_hf(tokenizer_obj, text, runs)
+    if tiktoken_enc is not None:
+        result["tiktoken"] = bench_tiktoken(tiktoken_enc, text, runs)
 
     return result
 
@@ -224,38 +261,54 @@ def measure_timing(tokenizer_obj, text: str, runs: int) -> dict:
 # Output helpers
 # ---------------------------------------------------------------------------
 
-def write_token_table(out, parabix_ids, parabix_strs, hf_ids, hf_strs) -> None:
-    w = 22
-    out.write(f"    {'#':<5} {'Parabix ID':<12} {'Parabix token':<{w}} "
-              f"{'HF ID':<12} {'HF token':<{w}} Match\n")
-    out.write(f"    {'-'*5} {'-'*12} {'-'*w} {'-'*12} {'-'*w} -----\n")
-    max_len = max(len(parabix_ids), len(hf_ids))
+def write_token_table(out, engines: list[tuple[str, list[int], list[str]]]) -> None:
+    """engines: list of (label, ids, strs), e.g. [("Parabix", ids, strs), ("HF", ...), ...].
+    Match column is YES iff every engine's id agrees at that position."""
+    w = 20
+    header = "    {:<5} ".format("#")
+    rule   = "    {:<5} ".format("-" * 5)
+    for label, _, _ in engines:
+        header += f"{label + ' ID':<10} {label + ' token':<{w}} "
+        rule   += f"{'-'*10} {'-'*w} "
+    out.write(header + "Match\n")
+    out.write(rule + "-----\n")
+    max_len = max((len(ids) for _, ids, _ in engines), default=0)
     for i in range(max_len):
-        pid  = str(parabix_ids[i])   if i < len(parabix_ids)  else "<miss>"
-        pstr = repr(parabix_strs[i]) if i < len(parabix_strs) else "<miss>"
-        hid  = str(hf_ids[i])        if i < len(hf_ids)        else "<miss>"
-        hstr = repr(hf_strs[i])      if i < len(hf_strs)       else "<miss>"
-        mark = "YES" if pid == hid else "NO "
-        out.write(f"    {i+1:<5} {pid:<12} {pstr:<{w}} {hid:<12} {hstr:<{w}} {mark}\n")
+        row_ids = []
+        row = f"    {i+1:<5} "
+        for _, ids, strs in engines:
+            tid  = ids[i]  if i < len(ids)  else None
+            tstr = strs[i] if i < len(strs) else "<miss>"
+            row_ids.append(tid)
+            row += f"{str(tid) if tid is not None else '<miss>':<10} {repr(tstr):<{w}} "
+        mark = "YES" if len(set(row_ids)) == 1 else "NO "
+        out.write(row + mark + "\n")
 
 
-def write_diff_detail(out, parabix_ids, hf_ids) -> None:
-    if len(parabix_ids) != len(hf_ids):
-        out.write(f"  → Length mismatch: Parabix={len(parabix_ids)}, HF={len(hf_ids)}\n")
-    first = next(
-        (i for i in range(min(len(parabix_ids), len(hf_ids)))
-         if parabix_ids[i] != hf_ids[i]),
-        None
-    )
-    if first is not None:
-        out.write(f"  → First mismatch at position {first + 1}: "
-                  f"Parabix={parabix_ids[first]}, HF={hf_ids[first]}\n")
+def write_diff_detail(out, engines: list[tuple[str, list[int]]]) -> None:
+    """engines: list of (label, ids). Reports length + first mismatch of every
+    engine against the first (the one under test -- Parabix)."""
+    ref_label, ref_ids = engines[0]
+    for label, ids in engines[1:]:
+        if len(ids) != len(ref_ids):
+            out.write(f"  → Length mismatch: {ref_label}={len(ref_ids)}, {label}={len(ids)}\n")
+        first = next(
+            (i for i in range(min(len(ref_ids), len(ids))) if ref_ids[i] != ids[i]),
+            None
+        )
+        if first is not None:
+            out.write(f"  → First mismatch vs {label} at position {first + 1}: "
+                      f"{ref_label}={ref_ids[first]}, {label}={ids[first]}\n")
+
+
+ENGINE_ORDER = ["parabix", "hf", "tiktoken"]
+ENGINE_LABEL = {"parabix": "Parabix", "hf": "HF", "tiktoken": "tiktoken"}
 
 
 def write_timing(out, timing: dict, text: str, runs: int, ntokens: int) -> None:
     nbytes = len(text.encode("utf-8"))
     out.write(SEP + "\n")
-    out.write(f"TIMING  (FAIR — pure tokenize, one-time setup excluded both sides; N={runs})\n")
+    out.write(f"TIMING  (FAIR — pure tokenize, one-time setup excluded every side; N={runs})\n")
     out.write(SEP + "\n")
     out.write(f"  Input size:  {nbytes} bytes, {ntokens} tokens\n\n")
 
@@ -264,24 +317,26 @@ def write_timing(out, timing: dict, text: str, runs: int, ntokens: int) -> None:
                   f"median {s['median_ms']:9.4f} ms   mean {s['mean_ms']:9.4f} ms   "
                   f"{s['mbps']:8.3f} MB/s\n")
 
-    p = timing.get("parabix")
-    h = timing.get("hf")
-    if p:
-        row("Parabix", p)
-    else:
+    present = [(name, timing[name]) for name in ENGINE_ORDER if timing.get(name)]
+    if "parabix" not in timing or not timing.get("parabix"):
         out.write("  Parabix    <no BENCH_RESULT — rebuild tokenizer with --bench-loop support>\n")
-    if h:
-        row("HF", h)
+    for name, s in present:
+        row(ENGINE_LABEL[name], s)
 
-    if p and h and p["min_ms"] > 0 and h["min_ms"] > 0:
-        ratio = p["min_ms"] / h["min_ms"]
-        faster, slower = ("HF", "Parabix") if ratio >= 1 else ("Parabix", "HF")
-        out.write(f"\n  Speedup (min): {faster} is {max(ratio, 1 / ratio):.1f}x "
-                  f"faster than {slower}  (pure tokenize)\n")
+    # Ranked ratio summary: fastest first, each one's slowdown vs the fastest.
+    ranked = sorted(present, key=lambda ns: ns[1]["min_ms"])
+    if len(ranked) >= 2:
+        fastest_name, fastest = ranked[0]
+        out.write(f"\n  Speedup (min), fastest first:\n")
+        out.write(f"    {ENGINE_LABEL[fastest_name]:<9} baseline\n")
+        for name, s in ranked[1:]:
+            ratio = s["min_ms"] / fastest["min_ms"] if fastest["min_ms"] > 0 else float("inf")
+            out.write(f"    {ENGINE_LABEL[name]:<9} {ratio:.1f}x slower than {ENGINE_LABEL[fastest_name]}\n")
 
     out.write("\n  Fair: Parabix via --bench-loop (N iters in ONE process — no per-iter\n"
-              "        spawn / merges-load / compile, output suppressed); HF via preloaded\n"
-              "        in-process encode() loop (from_file excluded). Setup excluded both.\n"
+              "        spawn / merges-load / compile, output suppressed); HF and tiktoken via\n"
+              "        preloaded in-process encode() loops (model/encoding load excluded).\n"
+              "        Setup excluded on every side.\n"
               "  Caveats: Parabix 'run' still includes the input file read; use MB-scale\n"
               "        input (tokenizer_files/webtext_100.txt) for a meaningful MB/s.\n")
     out.write(SEP + "\n\n")
@@ -291,39 +346,45 @@ def write_timing(out, timing: dict, text: str, runs: int, ntokens: int) -> None:
 # Run modes
 # ---------------------------------------------------------------------------
 
-def run_compare(out, tokenizer_obj, cases: list[tuple[int, str]], verbose: bool,
-                runs: int = 0) -> dict:
+def run_compare(out, tokenizer_obj, tiktoken_enc, cases: list[tuple[int, str]],
+                verbose: bool, runs: int = 0) -> dict:
     results = {}
     for num, (lineno, text) in enumerate(cases, 1):
-        parabix_ids, parabix_strs = run_parabix_bpe(text)
-        hf_ids, hf_strs           = run_hf_bpe(tokenizer_obj, text)
+        engines = [("Parabix", *run_parabix_bpe(text))]
+        if tokenizer_obj is not None:
+            engines.append(("HF", *run_hf_bpe(tokenizer_obj, text)))
+        if tiktoken_enc is not None:
+            engines.append(("tiktoken", *run_tiktoken_bpe(tiktoken_enc, text)))
 
-        match  = (parabix_ids == hf_ids)
-        status = "MATCH" if match else "MISMATCH"
-        label  = f"line {lineno}"
+        all_ids = [ids for _, ids, _ in engines]
+        match   = all(ids == all_ids[0] for ids in all_ids[1:])
+        status  = "MATCH" if match else "MISMATCH"
+        label   = f"line {lineno}"
         results[label] = status
 
         out.write(SEP + "\n")
         out.write(f"Test {num} (line {lineno})  →  {status}\n")
         out.write(SEP + "\n")
         out.write(input_line(text, "         "))
-        out.write(f"  Parabix tokens: {len(parabix_ids)}\n")
-        out.write(f"  HF tokens:      {len(hf_ids)}\n\n")
+        for label_e, ids, _ in engines:
+            out.write(f"  {label_e + ' tokens:':<16}{len(ids)}\n")
+        out.write("\n")
 
         if not match:
-            write_diff_detail(out, parabix_ids, hf_ids)
+            write_diff_detail(out, [(label_e, ids) for label_e, ids, _ in engines])
             out.write("\n")
 
         if verbose or not match:
-            write_token_table(out, parabix_ids, parabix_strs, hf_ids, hf_strs)
+            write_token_table(out, engines)
         else:
+            parabix_ids = engines[0][1]
             out.write(f"  IDs: {parabix_ids[:12]}{'...' if len(parabix_ids) > 12 else ''}\n")
 
         out.write("\n")
 
         if runs > 0:
-            timing = measure_timing(tokenizer_obj, text, runs)
-            write_timing(out, timing, text, runs, len(hf_ids))
+            timing = measure_timing(tokenizer_obj, tiktoken_enc, text, runs)
+            write_timing(out, timing, text, runs, len(engines[0][1]))
 
     return results
 
@@ -333,6 +394,19 @@ def run_hf_only(out, tokenizer_obj, cases: list[tuple[int, str]]) -> None:
         ids, tokens = run_hf_bpe(tokenizer_obj, text)
         out.write(SEP + "\n")
         out.write(f"Test {num} (line {lineno}) — HuggingFace\n")
+        out.write(SEP + "\n")
+        out.write(input_line(text))
+        out.write(f"  Tokens ({len(ids)}):\n")
+        for i, (tid, tok) in enumerate(zip(ids, tokens), 1):
+            out.write(f"    {i:3}. {tid:<7} {repr(tok)}\n")
+        out.write("\n")
+
+
+def run_tiktoken_only(out, tiktoken_enc, cases: list[tuple[int, str]]) -> None:
+    for num, (lineno, text) in enumerate(cases, 1):
+        ids, tokens = run_tiktoken_bpe(tiktoken_enc, text)
+        out.write(SEP + "\n")
+        out.write(f"Test {num} (line {lineno}) — tiktoken\n")
         out.write(SEP + "\n")
         out.write(input_line(text))
         out.write(f"  Tokens ({len(ids)}):\n")
@@ -385,6 +459,13 @@ def main() -> None:
                         help="Run HuggingFace tokenizer only")
     parser.add_argument("--parabix-only", action="store_true",
                         help="Run Parabix tokenizer only")
+    parser.add_argument("--tiktoken-only", action="store_true",
+                        help="Run tiktoken only")
+    parser.add_argument("--no-tiktoken",  action="store_true",
+                        help="Compare mode: Parabix vs HF only, skip tiktoken (original 2-way behavior)")
+    parser.add_argument("--tiktoken-encoding", default="gpt2",
+                        help="tiktoken encoding name (default: gpt2, same vocab as this "
+                             "project's vocab.json/merges.txt)")
     parser.add_argument("--show-input",   action="store_true",
                         help="Print each case's full input text (off by default: "
                              "only a char/byte count is shown)")
@@ -408,7 +489,11 @@ def main() -> None:
     args = parser.parse_args()
     TOKENIZER, MERGES = args.tokenizer, args.merges
     VOCAB, TOKENIZER_JSON = args.vocab, args.tokenizer_json
-    if not args.hf_only and not os.path.isfile(TOKENIZER):
+    only_flags = [args.hf_only, args.parabix_only, args.tiktoken_only]
+    if sum(only_flags) > 1:
+        print("Error: --hf-only / --parabix-only / --tiktoken-only are mutually exclusive.")
+        sys.exit(1)
+    if not args.hf_only and not args.tiktoken_only and not os.path.isfile(TOKENIZER):
         print(f"Error: tokenizer binary not found: {TOKENIZER}")
         sys.exit(1)
     SHOW_INPUT = args.show_input
@@ -432,26 +517,35 @@ def main() -> None:
     cases = [(1, full_text)]
 
     tokenizer_obj = None
-    if not args.parabix_only:
+    if not args.parabix_only and not args.tiktoken_only:
         if not os.path.isfile(TOKENIZER_JSON):
             print(f"Error: tokenizer.json not found at {TOKENIZER_JSON}")
             sys.exit(1)
         tokenizer_obj = Tokenizer.from_file(TOKENIZER_JSON)
 
+    tiktoken_enc = None
+    if args.tiktoken_only or not (args.parabix_only or args.hf_only or args.no_tiktoken):
+        tiktoken_enc = tiktoken.get_encoding(args.tiktoken_encoding)
+
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         out = Tee(f)
-        out.write(f"Parabix BPE vs HuggingFace BPE comparison\n")
+        out.write(f"Parabix vs HuggingFace vs tiktoken BPE comparison\n")
         out.write(f"Input:  {args.input}\n")
         out.write(f"Vocab:  {VOCAB}\n")
-        out.write(f"Merges: {MERGES}\n\n")
+        out.write(f"Merges: {MERGES}\n")
+        if tiktoken_enc is not None:
+            out.write(f"tiktoken encoding: {args.tiktoken_encoding}\n")
+        out.write("\n")
 
         if args.hf_only:
             run_hf_only(out, tokenizer_obj, cases)
         elif args.parabix_only:
             run_parabix_only(out, cases)
+        elif args.tiktoken_only:
+            run_tiktoken_only(out, tiktoken_enc, cases)
         else:
             runs = 0 if args.no_timing else args.runs
-            results = run_compare(out, tokenizer_obj, cases, args.verbose, runs)
+            results = run_compare(out, tokenizer_obj, tiktoken_enc, cases, args.verbose, runs)
             write_summary(out, results)
 
     print(f"\nOutput written to: {OUTPUT_FILE}")

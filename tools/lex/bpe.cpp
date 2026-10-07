@@ -190,37 +190,88 @@ static unsigned effGroupSize(size_t n) {
 // hoisting one shared shift per distinct lenA outside all gates. Inside = skippable on cold
 // blocks but DUPLICATED per rule (loses the per-lenA dedup); outside (default) = shared but
 // runs every block. 
-// --level-partition: schedule merge rules into the MINIMUM number of kernels instead
-// of cutting the rank-sorted rule list into contiguous id ranges.
+// --partition=mode: how merge rules are packed into kernels. Same shape as
+// --compaction=mode. clean is the default and most battle-tested; the others trade
+// more risk for fewer kernels.
 //
-// The clean-range walk (buildMergeRuleRanges, step 3) closes a group at the FIRST rule
-// that violates either constraint, so a group is necessarily a consecutive interval of
-// rank. Measured over full GPT-2: 1098 of its 1123 groups close on a seam conflict, and
-// at each break ~179 of the next 200 rules would still have fit in the group being
-// closed — ~90% of the available packing is discarded purely to keep groups contiguous.
-// Group size therefore saturates near 44 (a new rule must clash with NONE of the ~44
-// already present) and 50000/44.5 = 1123.
+//   clean       Cut the rank-sorted rule list into contiguous id ranges, closing a
+//               group at the FIRST rule that violates a dependency/seam constraint.
+//               Measured over full GPT-2: 1098 of its 1123 groups close on a seam
+//               conflict, and at each break ~179 of the next 200 rules would still
+//               have fit — ~90% of the available packing discarded purely to keep
+//               groups contiguous. Group size saturates near 44, 50000/44.5 = 1123.
 //
-// Level scheduling drops contiguity only. Each rule takes its EARLIEST legal kernel:
-//     level(r) = 1 + max( level(producer of idA), level(producer of idB),
-//                         level of any lower-rank rule seaming with r )
-// A violator no longer ends the group — it defers ITSELF while the rest keep filling the
-// current level. Kernel count becomes the constraint DAG's longest path (a provable
-// minimum, nothing can go earlier than its own dependencies) rather than a function of
-// how often violations occur: 1123 -> 283, mean group size 44.5 -> 176.7.
+//   level       Drop contiguity only: each rule takes its EARLIEST legal kernel,
+//                 level(r) = 1 + max( level(producer of idA), level(producer of idB),
+//                                     level of any lower-rank rule seaming with r )
+//               A violator defers ITSELF instead of ending the group. Kernel count
+//               becomes the constraint DAG's longest path (a provable minimum):
+//               1123 -> 283, mean group size 44.5 -> 176.7. BOTH correctness
+//               constraints (T4 + the clean-range conflict test) still hold exactly;
+//               only the packing changes. Levels are NOT rank intervals — level 1
+//               legitimately holds rank 0 alongside rank 47815.
 //
-// BOTH correctness constraints are preserved exactly (T4 + the clean-range conflict
-// test); only the packing changes. Levels are NOT rank intervals — level 1 legitimately
-// holds rank 0 alongside rank 47815.
-static cl::opt<bool> LevelPartition(
-    "level-partition",
-    cl::desc("Partition merge rules by ASAP level scheduling (minimum kernel count) "
-             "instead of contiguous clean id ranges."),
-    cl::init(false));
+//   asymmetric  level, plus drop the maxRight/idA seam (keep maxLeft/idB). Two rules
+//               sharing token t where an earlier rule used t as its B part and a
+//               later rule uses t as its A part (e.g. rank11 "Ġ+o" vs rank17 "o+r" on
+//               "Ġor") no longer need separate levels: rank11's fire clears t's
+//               live-start bit in inPlayMask, and the later rule's gate reads that
+//               mask LIVE. The other direction (maxLeft/idB) stays a hard separation —
+//               B-detect is a forward LookAhead on the FROZEN kernel input (T5), so it
+//               can never see a same-kernel restamp. Cuts 283 -> 76 kernels (measured
+//               via merge_analysis.py's scheduling model; first C++ implementation —
+//               less battle-tested than level).
+//
+//   chain       level, plus two more relaxations, always together:
+//               - chain-partition: a rule whose idA was STAMPED by an earlier
+//                 same-level rule shares that level instead of taking the next one —
+//                 a dependency chain A+B->AB, AB+C->ABC... collapses into ONE kernel.
+//                 Same mechanism as asymmetric, one level up: a same-kernel rule's ID
+//                 read goes live (idAcc) instead of frozen, via createIf's normal
+//                 Var-reassignment-as-Sel join (no nested createIf, T6 -- chain rules
+//                 stay SIBLING ifs in rank order).
+//               - chain-veto: relaxes the OTHER seam (maxLeft/idB) that asymmetric
+//                 leaves intact, by paying for it with a runtime test instead of a
+//                 kernel boundary. Rules A+B->AB (rank1), C+D->CD (rank2), AB+C->ABC
+//                 (rank3): maxLeft[C] normally forces ABC one level later, because on
+//                 "ABCD" the lower-rank CD must consume C first. Instead, ABC checks
+//                 CD itself -- the id one slot past the merged token is read from the
+//                 FROZEN kernel input and compared against D:
+//                   veto     = EQ(LookAhead(src, lenA+lenB), idD)  // + one per competitor
+//                   fire_ABC = fire_AB AND hasC AND NOT veto
+//               "ABCD" -> veto=1, ABC suppressed, CD fires same kernel; "ABCX" ->
+//               veto=0, ABC fires. Both match HF. The competitor set is exact and
+//               small (rank order guarantees every same-or-earlier-level competitor is
+//               already placed); a competitor that could itself be beaten by a
+//               lower-rank rule carries its own non-empty vetoIdB, and THAT makes this
+//               rule fall back to the strict level instead of approximating.
+//               In both idA (chain-partition) and idB (chain-veto), the RIGHT-hand
+//               producer side always needs a real kernel boundary -- B-detection is a
+//               forward LookAhead on the frozen input (T5) and can never see a
+//               same-kernel producer.
+enum class PartitionMode { Clean, Level, Asymmetric, Chain };
+static cl::opt<PartitionMode> Partition(
+    "partition",
+    cl::desc("Merge-rule partitioning strategy:"),
+    cl::values(
+        clEnumValN(PartitionMode::Clean, "clean",
+            "Contiguous clean id ranges (default, most battle-tested)."),
+        clEnumValN(PartitionMode::Level, "level",
+            "ASAP level scheduling: minimum kernel count (283 vs 1123)."),
+        clEnumValN(PartitionMode::Asymmetric, "asymmetric",
+            "Level scheduling, relaxed maxRight seam (76 kernels; less battle-tested)."),
+        clEnumValN(PartitionMode::Chain, "chain",
+            "Level scheduling, same-level dependency chains + veto (fewer kernels; "
+            "slower in testing so far).")),
+    cl::init(PartitionMode::Clean));
+static bool isLevelPartition()  { return Partition != PartitionMode::Clean; }
+static bool isAsymmetricSeam()  { return Partition == PartitionMode::Asymmetric; }
+static bool isChainPartition()  { return Partition == PartitionMode::Chain; }
+static bool isChainVeto()       { return Partition == PartitionMode::Chain; }
 
 // Bit-tier partition: confine every kernel to merged ids of ONE bit length. Tier b holds
 // the rules with idAB in [2^(b-1), 2^b) — tier 9 = ids 256..511, tier 10 = 512..1023, …
-// Each tier is partitioned on its own (clean ranges, or --level-partition levels) and
+// Each tier is partitioned on its own (clean ranges, or --partition=level levels) and
 // the tiers run in order, so the first kernel of tier N+1 reads an N-bit id stream and
 // writes N+1 bits, and every later kernel of that tier reads and writes N+1 bits. Both
 // correctness constraints carry across a tier boundary for free: every rule of a lower
@@ -234,17 +285,17 @@ static cl::opt<bool> PartitionByMergeIdBits(
 
 // Cap the rules per merge kernel: a partition group with more than this many rules is
 // split into ceil(n/cap) consecutive kernels of near-equal size, in rank order. Pablo's
-// compile time is superlinear in kernel size, and --level-partition with
+// compile time is superlinear in kernel size, and --partition=level with
 // --partition-by-merge-id-bits puts most of a bit tier into its first level (8023 rules
 // in the 16-bit tier's first kernel). Splitting is exact: the rules of one group have
 // no dependencies or seams among each other that a later kernel could break —
 //   - dependency / seam: a lower-rank rule moves to an EARLIER kernel, which is what
 //     both constraints ask of it anyway;
-//   - --chain-partition: needsLiveId is recomputed per chunk; a child whose producer
+//   - --partition=chain: needsLiveId is recomputed per chunk; a child whose producer
 //     landed in an earlier chunk reads the producer's stamp from its frozen input;
-//   - --chain-veto: a competitor in an earlier chunk has already stamped its merged id
+//   - --partition=chain: a competitor in an earlier chunk has already stamped its merged id
 //     over this rule's idB slot, so B-detect fails exactly where the veto would fire;
-//   - --asymmetric-seam: an earlier chunk's consume reaches this kernel through meIn.
+//   - --partition=asymmetric: an earlier chunk's consume reaches this kernel through meIn.
 // 0 = no cap.
 static cl::opt<unsigned> MaxMergesPerKernel(
     "max-merges-per-kernel",
@@ -252,99 +303,18 @@ static cl::opt<unsigned> MaxMergesPerKernel(
              "kernels of near-equal size (0 = no cap). Default 500."),
     cl::init(500));
 
-// Asymmetric seam (--level-partition only): drop the maxRight/idA seam constraint,
-// keep maxLeft/idB. Two rules sharing token t where an earlier (lower-rank) rule used
-// t as ITS right/B part and a later rule uses t as ITS left/A part (e.g. rank11 "Ġ+o"
-// vs rank17 "o+r" on "Ġor") no longer need separate levels: rank11's fire clears t's
-// live-start bit in inPlayMask, and eqAstart's gate now reads that mask LIVE (see
-// below), so rank17 correctly sees t already consumed even inside the same kernel.
-// The other direction (maxLeft/idB — e.g. rank40 "o+m" vs rank49 "r+o" on "from")
-// stays a hard separation: rank49's B-detect is a forward LookAhead on the FROZEN
-// kernel input (Pablo: LookAhead legal only on a declared input binding, T5), so it
-// can never observe rank40's same-kernel restamp of o's position. Needs a real kernel
-// boundary. Cuts 283 -> 76 kernels (measured via merge_analysis.py's scheduling model;
-// this flag is the first C++ implementation — verify byte-identical vs HF before
-// trusting it for anything beyond experimentation).
-static cl::opt<bool> AsymmetricSeam(
-    "asymmetric-seam",
-    cl::desc("With --level-partition, drop the maxRight seam constraint (keep maxLeft) "
-             "for a tighter (but less battle-tested) level schedule."),
-    cl::init(false));
-
-// Chain partition (--level-partition only): let a rule whose idA was STAMPED by an
-// earlier (lower-rank) rule in the SAME level share that level instead of taking the
-// next one — a dependency chain A+B->AB, AB+C->ABC, ABC+D->ABCD... collapses into ONE
-// kernel instead of one per link. Same mechanism as --asymmetric-seam, one level up:
-// there, a same-kernel rule's MASK read goes live (inPlayMask) so it sees an earlier
-// rule's consume; here, a same-kernel rule's ID read goes live (idAcc) so it sees an
-// earlier rule's STAMP. Both rely on the same Pablo property — createIf auto-joins a
-// Var's reassignment as a Sel when the gated scope closes, so a LATER sibling
-// createIf reading that Var outward-of-scope already observes it. No nested createIf
-// (T6) — chain rules stay SIBLING ifs in rank order, just reading a live Var instead
-// of a frozen one.
-//
-// The other producer (idB, the RIGHT part) stays a hard separation, same as maxLeft
-// under --asymmetric-seam: B-detection is a forward LookAhead on the FROZEN kernel
-// input (T5), so a same-kernel producer of idB can never be seen — that side always
-// needs a real kernel boundary.
-//
-static cl::opt<bool> ChainPartition(
-    "chain-partition",
-    cl::desc("With --level-partition, let a rule whose idA was stamped by an earlier "
-             "same-level rule share that level (dependency chains collapse into one "
-             "kernel) instead of taking the next level."),
-    cl::init(false));
-
-// Chain veto (--level-partition): relax the maxLeft/idB seam — "a lower-rank rule
-// already claims my idB as ITS idA" — and pay for it with a runtime test instead of a
-// kernel boundary.
-//
-// Rules A+B->AB (rank 1), C+D->CD (rank 2), AB+C->ABC (rank 3). maxLeft[C] == CD's
-// level forces ABC one level later, because on "ABCD" the lower-rank CD must consume C
-// first and ABC must NOT fire. Instead of the split, ABC checks CD itself: the id one
-// slot PAST the merged token (offset lenA+lenB, i.e. right after C) is read from the
-// FROZEN kernel input and compared against D.
-//     veto     = EQ(LookAhead(src, lenA+lenB), idD)   // ... OR idE, one per competitor
-//     fire_ABC = fire_AB AND hasC AND NOT veto
-// "ABCD" -> veto=1, ABC suppressed, CD fires in the same kernel. "ABCX" -> veto=0, ABC
-// fires. Both match HF.
-//
-// Competitor set is exact and small. Rules are scheduled in rank order, so every
-// lower-rank rule with idA == this rule's idB is already placed when this rule lands:
-//   - competitor at a STRICTLY EARLIER level already stamped its merged id over idB's
-//     slot, so this rule's own B-detect fails on its own — no veto term needed;
-//   - a LATER-level competitor cannot exist, rank order places it first;
-//   - a SAME-level competitor is exactly what this flag creates, and exactly what
-//     vetoIdB lists.
-//
-// Veto recursion is handled by REFUSING the relaxation, never by approximating it. A
-// competitor can itself be beaten (D+E at a lower rank kills C+D, so ABC SHOULD fire —
-// a depth-1 veto would wrongly suppress it). Such a competitor carries a non-empty
-// vetoIdB of its own, so if any candidate is itself vetoed, this rule falls back to the
-// strict level and takes the kernel split.
-//
-// Independent of --chain-partition: the veto reads ONLY the frozen kernel input, never
-// the producer's fire or a live idAcc, so it is emitted identically for a flat sibling
-// rule (emitBody) and a nested chain child (emitChainBody).
-static cl::opt<bool> ChainVeto(
-    "chain-veto",
-    cl::desc("With --level-partition, let a rule share its level with the lower-rank "
-             "rules claiming its idB, suppressing the merge at runtime when such a "
-             "competitor applies, instead of splitting the kernel."),
-    cl::init(false));
-
-// --chain-partition emission shape. Output-identical: Pablo ORs pending carries into
+// --partition=chain emission shape. Output-identical: Pablo ORs pending carries into
 // every if test (CarryManager::generateEntrySummaryTest), so fusing same-condition ifs,
 // or dropping one whose body is a no-op when its condition is zero, changes nothing.
 static cl::opt<bool> ChainFuseSiblings(
     "chain-fuse-siblings",
-    cl::desc("With --chain-partition, nest all chain-children of a rule under ONE createIf "
+    cl::desc("With --partition=chain, nest all chain-children of a rule under ONE createIf "
              "on its fire instead of one createIf per child."),
     cl::init(false));
 
 static cl::opt<bool> ChainUngateRoots(
     "chain-ungate-roots",
-    cl::desc("With --chain-partition on grouped kernels, drop a chain root's own createIf "
+    cl::desc("With --partition=chain on grouped kernels, drop a chain root's own createIf "
              "when the group gate already tests its full idA."),
     cl::init(false));
 
@@ -381,7 +351,7 @@ static cl::opt<unsigned> IndexedShift(
 // entry-scope accumulators (anyFire, setBit[i], fireByLen[lenA]); the kernel then
 // applies ONE Advance per DISTINCT lenA and ONE Sel per id bit at the end.
 //
-// Carry ops per kernel: one per RULE (~177 under --level-partition) → one per
+// Carry ops per kernel: one per RULE (~177 under --partition=level) → one per
 // distinct lenA (≤ maxLen; 8 under --compact-base=2 --geometric-compaction).
 // Gate body drops from ~20 ops + 1 carry + W_out+1 mutated Vars to
 // popcount(idAB)+2 Ors, 0 carries — so createIf also drops its carry save/restore.
@@ -444,29 +414,16 @@ static cl::opt<bool> SkipInstCombine(
     cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
     cl::init(false));
 
-// Bit-transformation kernels (BPEXfrmKernel): a merge kernel whose input id stream has
-// at most this many bits computes every output bit as input XOR a "change" stream, where
-// each change stream is a character class compiled over an (A id, B id) pair. Ids wider
-// than kXfrmLowBits are split: an if-block per (high A bits, high B bits) pair, with the
-// character classes over the low bits inside (see BPEXfrmKernel). 0 = off.
-static cl::opt<unsigned> MaxBitXfrmLimit(
-    "max-bit-xfrm-limit",
-    cl::desc("Build merge kernels whose input id stream has at most N bits as bit "
-             "transformations (0 = off, the default). Ids over 10 bits are gated by "
-             "if-blocks on their high bits."),
-    cl::init(0));
-
-// Full subtiering (--partition-by-merge-id-bits): every kernel of a merge id bit tier N
-// with kXfrmLowBits < N <= this limit is built as a bit transformation whose character
-// classes take 20 bits: the low 20-N bits of idA and all N bits of idB. The remaining
-// high 2N-20 bits of the N-bit idA name the rule's subtier (4 subtiers in the 11-bit
-// tier, 16 in the 12-bit tier, 64 in the 13-bit tier); a kernel may hold rules of several
-// subtiers and guards each with one if-test on idA's subtier bits. 0 = off.
-static cl::opt<unsigned> FullSubtieringLimit(
-    "full-subtiering-limit",
-    cl::desc("With --partition-by-merge-id-bits: build merge id bit tiers 11..N as bit "
-             "transformations with one if-block per subtier (the high 2N-20 bits of idA) "
-             "(0 = off)."),
+// --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
+// bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
+// input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
+// --partition-by-merge-id-bits these are the kernels of merge id bit tiers 9..N. Ids of
+// up to kXfrmLowBits bits fit the 20-bit class whole; wider ids are split into subtiers
+// (see BPEXfrmKernel). 0 = off.
+static cl::opt<unsigned> BitXfrmLimit(
+    "bit-xfrm-limit",
+    cl::desc("Build merge kernels whose output ids have at most N bits as bit "
+             "transformations, ids over 10 bits by subtiers (0 = off, the default)."),
     cl::init(0));
 
 // --subtier-grouping-by-min-ID=N: in the subtiered kernels of merge id bit tiers >= N, key
@@ -480,7 +437,7 @@ static cl::opt<unsigned> FullSubtieringLimit(
 // gates it is no faster (default backend level) or slightly slower (aggressive).
 static cl::opt<unsigned> SubtierGroupingByMinID(
     "subtier-grouping-by-min-ID",
-    cl::desc("Key the subtiers of --full-subtiering-limit kernels of merge id bit tiers >= N "
+    cl::desc("Key the subtiers of bit-transformation kernels of merge id bit tiers >= N "
              "by the high bits of the smaller part id (0 = off, the default)."),
     cl::init(0));
 
@@ -496,7 +453,7 @@ static bool subtierGroupingApplies(unsigned tierBits) {
 // none, which measured fastest (tiers 12-14 10-25% cheaper than with every subtier gated).
 static cl::opt<unsigned> SubtierGatingBits(
     "subtier-gating-bits",
-    cl::desc("Gate a subtier of --full-subtiering-limit kernels with an if only when its keyed "
+    cl::desc("Gate a subtier of bit-transformation kernels with an if only when its keyed "
              "part id has at least K bits (0 = gate every subtier; default 17 = no gates)."),
     cl::init(17));
 
@@ -510,7 +467,7 @@ static cl::opt<bool> SelfMergeBlock(
 
 static cl::opt<bool> KeyCluster(
     "key-cluster",
-    cl::desc("With --level-partition and --if-test-significant-bits: move rules (only later, only "
+    cl::desc("With --partition=level/asymmetric/chain and --if-test-significant-bits: move rules (only later, only "
              "inside their compaction segment) so rules sharing a gate key share a kernel."),
     cl::init(false));
 
@@ -973,7 +930,7 @@ static std::vector<bool> applyCompactionSchedule(std::vector<MergeRuleGroup> & r
     // sits on top of several, so its span is the sum of its parts'. Kernels run in order
     // and a compaction happens after a specific kernel, so kernelOf IS the build time.
     // Testing `id < hi` instead is equivalent only when groups tile the id axis in rank
-    // order, which --level-partition does not.
+    // order, which --partition=level does not.
     std::function<unsigned(unsigned)> slotSpan = [&](unsigned id) -> unsigned {
         if (id < 256) return 1;               // base byte — the seed supplies it
         auto k = kernelOf.find(id);
@@ -1003,7 +960,7 @@ static std::vector<bool> applyCompactionSchedule(std::vector<MergeRuleGroup> & r
             if (nCompact == 0 && d != r.lenA) firstBlockDisagree++;
             r.lenA = d;
             if (d > maxDist) maxDist = d;
-            // --chain-veto: the probe sits one slot past idB, so its slot-space distance
+            // --partition=chain: the probe sits one slot past idB, so its slot-space distance
             // is slotSpan(idA) + slotSpan(idB) — lenB alone is still a BYTE count here.
             // It can exceed every lenA in the group, so it must widen maxDist too, or the
             // LookAhead binding comes up short and the kernel refuses to compile (T5).
@@ -1212,8 +1169,8 @@ public:
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
                         + (BatchWriteback ? "bw1_" : "bw0_")
-                        + (ChainPartition ? "cp1_" : "cp0_")
-                        + (ChainVeto ? "cv1_" : "cv0_")
+                        + (isChainPartition() ? "cp1_" : "cp0_")
+                        + (isChainVeto() ? "cv1_" : "cv0_")
                         + (ChainFuseSiblings ? "fs1_" : "fs0_")
                         + (ChainUngateRoots ? "ur1_" : "ur0_")
                         + (InFileOnce ? "io1_" : "")   // off = body identical to before → keep old names
@@ -1377,7 +1334,7 @@ protected:
         // once at the end of the kernel. setBit[i] = positions where id bit i must
         // become 1, anyFire = positions where SOME rule fired (drives the bit clear).
         //
-        // --asymmetric-seam can put two rules in the SAME kernel where the second
+        // --partition=asymmetric can put two rules in the SAME kernel where the second
         // one's idA is the first one's idB (MergeRule::needsFlush, set by
         // tagFlushPoints) — the second rule's eqAstart MUST see the first rule's
         // consume, or it wrongly fires on a position that's already been taken.
@@ -1404,7 +1361,7 @@ protected:
         //     grouped-if kernels.
         const bool groupNeedsLiveMask = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
                                                      [](const MergeRule & r) { return r.needsFlush; });
-        // --chain-partition rules (a chain root and every rule nested under it) keep
+        // --partition=chain rules (a chain root and every rule nested under it) keep
         // the EAGER write-back: a parent stamps idAB and its child stamps idABC at the
         // SAME position, so the child must overwrite the parent, and the batch
         // accumulators only OR — they cannot express "the later one wins". Batching
@@ -1418,12 +1375,12 @@ protected:
         //     `idAcc & ~anyFire` preserves the eager chain stamp untouched.
         //   - MASK: a chain rule consumes at its idB's start. The maxLeft constraint
         //     forbids any same-kernel rule from having that idB as ITS idA (or, under
-        //     --chain-veto, makes it stand down at runtime), so no batched rule reads
+        //     --partition=chain, makes it stand down at runtime), so no batched rule reads
         //     the position a chain consume clears.
         //
         // childrenOf[idAB] = the rules in THIS group whose idA == idAB (i.e. every rule
         // that should nest inside idAB's own gate — see emitChain below). Empty, so
-        // isChainRule is always false, whenever --chain-partition is off.
+        // isChainRule is always false, whenever --partition=chain is off.
         std::unordered_map<unsigned, std::vector<const MergeRule*>> childrenOf;
         for (const auto & r : mRuleGroup.rules)
             if (r.needsLiveId) childrenOf[r.idA].push_back(&r);
@@ -1468,23 +1425,23 @@ protected:
         // by the time a later rule in this same kernel calls eqAstart again (back at
         // the outer scope), inPlayMask already reflects every earlier rule's consume in
         // THIS kernel. Under the shipped partition schemes (clean-range default,
-        // --level-partition symmetric seam) this is a no-op — conflict-freedom already
+        // --partition=level symmetric seam) this is a no-op — conflict-freedom already
         // guarantees no rule's fire touches a position another same-kernel rule reads 
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
             return bld.createAnd(eqId(bld, srcFrozen, id), inPlayMask, "Astart_" + std::to_string(id));
         };
 
-        // --chain-veto: suppress this rule where a lower-rank competitor claims its idB.
+        // --partition=chain: suppress this rule where a lower-rank competitor claims its idB.
         // Reads the id one slot PAST idB (r.vetoOff) from the frozen kernel input; if it
         // is that competitor's right part, the competitor applies here, wins on rank, and
         // this merge must not fire. One peek serves every competitor (all probe the same
         // slot), one EQ each. Returns `fire` untouched when the rule carries no veto, so
         // both emission paths call it unconditionally. Reads nothing but the kernel
-        // input, which is why it needs neither nesting nor --chain-partition.
+        // input, which is why it needs neither nesting nor --partition=chain.
         auto applyVeto = [&](auto & body, const MergeRule & r, PabloAST * fire) -> PabloAST * {
             if (r.vetoIdB.empty()) return fire;
             if (mUseNextId)   // --indexed-shift: no byte-distance LookAhead exists here
-                llvm::report_fatal_error("--chain-veto is incompatible with --indexed-shift");
+                llvm::report_fatal_error("--partition=chain is incompatible with --indexed-shift");
             std::vector<PabloAST*> vbits(W);
             for (unsigned i = 0; i < W; i++)
                 vbits[i] = body.createLookahead(srcBits[i], (int64_t) r.vetoOff);
@@ -1651,9 +1608,9 @@ protected:
             inPlayMask = freshMask;
         };
 
-        // ── --chain-partition: REAL nested createIf ─────────────────────────────
+        // ── --partition=chain: REAL nested createIf ─────────────────────────────
         // A rule flagged needsLiveId (its idA was stamped by an earlier SAME-level
-        // rule — see levelPartition's ChainPartition branch) is emitted physically
+        // rule — see levelPartition's chain-partition branch) is emitted physically
         // INSIDE that producer's gate, instead of as a sibling createIf reading a
         // live Var. Isolated from emitBody/emitRule (used by every other path,
         // including plain-sibling non-chain rules in the SAME kernel) so no other
@@ -1769,7 +1726,7 @@ protected:
             // rather than paid in full outside (range gate) and again inside (per-rule EQ).
             // Sorted by idA → equal keys are contiguous (same L, same prefix).
             //
-            // --chain-partition: only the nested CHILDREN sit out the chunk loop —
+            // --partition=chain: only the nested CHILDREN sit out the chunk loop —
             // emitChain emits each of them physically inside its producer's gate, so
             // they must not also appear as a chunk rule. Chain ROOTS stay in, and get
             // their nest built inside the chunk gate (see emitChain call below), so a
@@ -1964,14 +1921,15 @@ private:
     bool mUseNextId;
     bool mGrouped;
 };
-// ─── BPEXfrmKernel (--max-bit-xfrm-limit) ───────────────────────────────────
+// ─── BPEXfrmKernel (--bit-xfrm-limit) ───────────────────────────────────────
 // A merge kernel built as a set of bit transformations instead of per-rule gates. Same
 // bindings and semantics as BPEMergeKernel; it handles groups whose rules read only the
-// frozen kernel input (no --chain-partition nest, --asymmetric-seam live mask or
-// --chain-veto; see bitXfrmEligible).
+// frozen kernel input (no --partition=chain nest, --partition=asymmetric live mask or
+// --partition=chain; see bitXfrmEligible).
 //
-// For an input id stream of N bits, rules are bucketed by L = lenA, the lookahead
-// distance at which their B part starts. For each L the kernel forms one 2N-bit vector
+// For an input id stream of N <= kXfrmLowBits bits, rules are bucketed by L = lenA, the
+// lookahead distance at which their B part starts. For each L the kernel forms one 2N-bit
+// vector
 //     V_L = [ id bits 0..N-1 at p ,  id bits 0..N-1 at p+L ]
 // so a rule's (idA, idB) pair is the value idA | idB << N. For every output bit j, the
 // rules of that bucket whose idAB bit j differs from idA bit j (for j >= N: whose idAB
@@ -1982,22 +1940,22 @@ private:
 // The union of a bucket's values, under the same mask, is its fire stream, and the B
 // starts are consumed as in BPEMergeKernel: live &= NOT Advance(fire_L, L).
 //
+// Subtiers (N > kXfrmLowBits): re::CC codepoints stop at 0x10FFFF, so a pair value can
+// hold 20 bits. The classes take the low 20-N bits of idA and all N bits of idB; the
+// remaining high 2N-20 bits of idA name the rule's subtier, and each subtier present in
+// the kernel is one block: its classes ANDed with (idA's subtier bits at p == the key),
+// all L sharing the block. --subtier-gating-bits puts a block in an if when its key
+// shows a large idA; --subtier-grouping-by-min-ID keys rules with idA > idB on idB.
+//
 // Exactness: within one kernel at most one rule fires at a position (the frozen id there
 // selects idA, and rules sharing idA share L and so read one B slot), and same-kernel
 // rules never touch each other's positions (dependency + seam constraints), so XOR-ing
 // all change streams from the frozen input equals applying the rules one by one.
 //
 // Self-merges X+X need per-run pairing (selfMergeFireStarts), which a character class
-// cannot express; they keep a per-rule stamp here. The seam constraints keep every other
-// rule off their positions, so the stamp and the change streams never meet.
-//
-// Ids wider than kXfrmLowBits (re::CC codepoints stop at 0x10FFFF = 21 bits, so the pair
-// vector can hold two 10-bit ids): with H = N - 10 high bits, a bucket's rules are
-// further split by (idA >> 10, idB >> 10). Each such pair gets one createIf whose
-// condition tests those H high bits at p and at p+L (AND the bucket's live/boundary
-// gate); inside, the change and fire sets are compiled over the 20-bit vector of the low
-// 10 bits of both ids, and ANDed with that condition. Every rule belongs to exactly one
-// block, so the result equals the ungated form.
+// cannot express; they keep a per-rule stamp here, or join --self-merge-block. The seam
+// constraints keep every other rule off their positions, so the stamp and the change
+// streams never meet.
 static constexpr unsigned kXfrmLowBits = 10;
 
 class BPEXfrmKernel : public PabloKernel {
@@ -2008,14 +1966,12 @@ public:
                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
     : PabloKernel(ts, std::string("BPEXfrm_") + (boundaryIn ? "b1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
-                        + (group.subtiered ? "st_" : "")
-                        + (group.subtiered && sourceIn->getNumElements() > kXfrmLowBits
-                               && subtierGroupingApplies(ceil_log2(group.hi)) ? "gm_" : "")
-                        + (group.subtiered && SubtierGatingBits > 0
-                               ? "sg" + std::to_string(SubtierGatingBits) + "_" : "")
-                        + (!blockSelfMerges(group).empty() ? "smb_" : "")
                         + (sourceIn->getNumElements() > kXfrmLowBits
-                               ? "lo" + std::to_string(kXfrmLowBits) + "_" : "")
+                               ? std::string("st_")
+                                 + (subtierGroupingApplies(ceil_log2(group.hi)) ? "gm_" : "")
+                                 + (SubtierGatingBits > 0 ? "sg" + std::to_string(SubtierGatingBits) + "_" : "")
+                               : std::string())
+                        + (!blockSelfMerges(group).empty() ? "smb_" : "")
                         + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
                                                  // FilterByMask, inPlayMask built locally
                         + "w" + std::to_string(sourceIn->getNumElements())
@@ -2075,20 +2031,15 @@ protected:
         PabloAST * consumed = nullptr;   // B starts to clear from the live mask
         auto orInto = [&](PabloAST *& acc, PabloAST * v) { acc = acc ? pb.createOr(acc, v) : v; };
 
-        // Ids of N bits: the low NloA bits of idA and NloB bits of idB go into the
-        // character classes, the remaining high bits (if any) into the if-block
-        // conditions. Default: kXfrmLowBits of each. Subtiered: all N bits of idB and
-        // 2*kXfrmLowBits - N of idA, whose high bits (the subtier) each get an if-block.
-        unsigned NloA = std::min(N, kXfrmLowBits), NloB = NloA;
-        if (mRuleGroup.subtiered && N > kXfrmLowBits) {
-            NloB = N;
-            NloA = 2 * kXfrmLowBits - N;
-        }
-        const bool H = (NloA < N) || (NloB < N);
+        // Ids of N bits: the classes take the low NloA bits of idA and all N bits of idB.
+        // Subtiers (H): N > kXfrmLowBits, NloA = 2*kXfrmLowBits - N, and the high N-NloA
+        // bits of idA (the subtier key) select a block.
+        const bool H = N > kXfrmLowBits;
+        const unsigned NloA = H ? 2 * kXfrmLowBits - N : N, NloB = N;
         const unsigned loMaskA = (1u << NloA) - 1u, loMaskB = (1u << NloB) - 1u;
         // --subtier-grouping-by-min-ID: rules with idA > idB (group B) swap the roles: idB
         // gives the NloA keyed bits, idA all NloB bits.
-        const bool byMin = mRuleGroup.subtiered && N > kXfrmLowBits && subtierGroupingApplies(W_out);
+        const bool byMin = H && subtierGroupingApplies(W_out);
 
         // Compile one block's sets in `bld` over the low-bit pair vector, masked by `mask`,
         // handing each result to addFire / addChange. keyB: the block is keyed on idB
@@ -2121,7 +2072,7 @@ protected:
             }
         };
 
-        // H > 0: accumulators the if-blocks OR into (Pablo joins them at each block's end).
+        // H: accumulators the subtier blocks OR into (Pablo joins them at each if's end).
         std::vector<Var *> changeVar(W_out, nullptr);
         auto changeAcc = [&](unsigned j) -> Var * {
             if (!changeVar[j]) changeVar[j] = pb.createVar("change_" + std::to_string(j), pb.createZeroes());
@@ -2146,32 +2097,29 @@ protected:
                 orInto(consumed, pb.createAdvance(fire, (int64_t) L));
             }
         } else {
-            // One block per (high idA bits, high idB bits). idB's high bits are read L slots
-            // ahead, so while they are tested a block also has a single L; without them
-            // (subtiered) one block serves every L. Group B blocks (--subtier-grouping-by-
-            // min-ID) are keyed on idB's high bits, so they too have a single L.
-            // Key: (group: 0 = keyed on idA, 1 = on idB; L or 0; keyed high bits; high idB bits).
-            const bool testB = NloB < N;
-            std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>,
+            // One block per subtier, all L sharing it. Group B blocks (--subtier-grouping-
+            // by-min-ID) are keyed on idB's high bits, read L slots ahead, so each has one L.
+            // Key: (group: 0 = keyed on idA, 1 = on idB; L, or 0 for group 0; keyed high bits).
+            std::map<std::tuple<unsigned, unsigned, unsigned>,
                      std::map<unsigned, std::vector<const MergeRule *>>> blocks;
             for (const auto & [L, rules] : byLen)
                 for (const MergeRule * r : rules) {
                     if (byMin && r->idA > r->idB)
-                        blocks[{1u, L, r->idB >> NloA, 0u}][L].push_back(r);
+                        blocks[{1u, L, r->idB >> NloA}][L].push_back(r);
                     else
-                        blocks[{0u, testB ? L : 0u, r->idA >> NloA, r->idB >> NloB}][L].push_back(r);
+                        blocks[{0u, 0u, r->idA >> NloA}][L].push_back(r);
                 }
             std::map<unsigned, Var *> fireL;
             for (const auto & [L, rules] : byLen)
                 fireL[L] = pb.createVar("fire_L" + std::to_string(L), pb.createZeroes());
             // Emit one block's sets into `bld`: the if body, or the top scope when ungated.
             auto emitSets = [&](auto & bld, const std::map<unsigned, std::vector<const MergeRule *>> & rulesByL,
-                                PabloAST * cond, bool perL, bool keyB, const std::string & btag) {
+                                PabloAST * cond, bool keyB, const std::string & btag) {
                 for (const auto & [L, rs] : rulesByL) {
                     // the condition already carries `live`; add L's boundary gate if any
-                    PabloAST * mask = (perL || !mHasBoundary) ? cond : bld.createAnd(cond, gate(L));
+                    PabloAST * mask = (keyB || !mHasBoundary) ? cond : bld.createAnd(cond, gate(L));
                     Var * fire = fireL[L];
-                    buildSets(bld, rs, ahead(L), mask, keyB, btag + (perL ? "" : "_L" + std::to_string(L)),
+                    buildSets(bld, rs, ahead(L), mask, keyB, btag + (keyB ? "" : "_L" + std::to_string(L)),
                               [&](PabloAST * f) { bld.createAssign(fire, bld.createOr(fire, f)); },
                               [&](unsigned j, PabloAST * c) {
                                   Var * acc = changeAcc(j);
@@ -2180,26 +2128,20 @@ protected:
                 }
             };
             for (const auto & [key, rulesByL] : blocks) {
-                const auto & [grp, keyL, hiK, hiB] = key;
+                const auto & [grp, keyL, hiK] = key;
                 const bool keyB = grp == 1;
-                const bool perL = testB || keyB;
-                const std::string btag = (perL ? "_L" + std::to_string(keyL) : std::string())
-                                       + (keyB ? "_kb" : "_a") + std::to_string(hiK) + "_b" + std::to_string(hiB);
+                const std::string btag = (keyB ? "_L" + std::to_string(keyL) + "_kb" : "_a") + std::to_string(hiK);
                 PabloAST * hiEq = eqHigh(keyB ? ahead(keyL) : srcBits, NloA, hiK);
-                if (testB) {
-                    PabloAST * e = eqHigh(ahead(keyL), NloB, hiB);
-                    hiEq = hiEq ? pb.createAnd(hiEq, e) : e;
-                }
-                PabloAST * cond = pb.createAnd(hiEq, perL ? gate(keyL) : live, "hi" + btag);
+                PabloAST * cond = pb.createAnd(hiEq, keyB ? gate(keyL) : live, "hi" + btag);
                 // --subtier-gating-bits: gate only a subtier whose keyed part has >= K bits.
                 const unsigned keyedBits = hiK ? (32u - __builtin_clz(hiK)) + NloA : 0u;
-                const bool gated = testB || SubtierGatingBits == 0 || keyedBits >= SubtierGatingBits;
+                const bool gated = SubtierGatingBits == 0 || keyedBits >= SubtierGatingBits;
                 if (!gated) {
-                    emitSets(pb, rulesByL, cond, perL, keyB, btag);
+                    emitSets(pb, rulesByL, cond, keyB, btag);
                     continue;
                 }
                 auto body = pb.createScope();
-                emitSets(body, rulesByL, cond, perL, keyB, btag);
+                emitSets(body, rulesByL, cond, keyB, btag);
                 pb.createIf(cond, body);
             }
             for (const auto & [L, fire] : fireL)
@@ -2317,7 +2259,7 @@ BPEPassResult buildBPEPassPipeline(
     // debug: dump the merge-range groups to stderr. BPE_GROUPS=1 for the
     // per-group [lo,hi) xN maxLen=M lines too (verbose, 1 line/kernel).
     std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels ("
-              << (LevelPartition ? "ASAP level schedule" : "contiguous clean ranges")
+              << (isLevelPartition() ? "ASAP level schedule" : "contiguous clean ranges")
               << (PartitionByMergeIdBits ? ", per merge id bit width" : "") << ")\n";
     if (std::getenv("BPE_GROUPS")) {
         for (const auto & g : ruleRanges)
@@ -2372,7 +2314,7 @@ BPEPassResult buildBPEPassPipeline(
     // kernel→kernel; `inPlayMask` (seeded active = all ones) threads too, each kernel
     // clearing the token starts it consumes, so the final mask marks surviving starts.
     StreamSet * inPlayMask = active;
-    unsigned nXfrm = 0, nXfrmIneligible = 0;   // --max-bit-xfrm-limit kernel counts
+    unsigned nXfrm = 0, nXfrmIneligible = 0;   // --bit-xfrm-limit kernel counts
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
         if (g.rules.empty()) continue;
@@ -2395,13 +2337,13 @@ BPEPassResult buildBPEPassPipeline(
             P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
         }
         // Grouped-if for kernels at/after the lower limit (later kernels); -1 = off.
-        // A --chain-partition rule no longer disqualifies the whole kernel: the
+        // A --partition=chain rule no longer disqualifies the whole kernel: the
         // grouped-if path now skips just the chain-involved rules and emits them
         // its chain roots' nests inside its chunk gates (see isChainRule / emitChain in
         // BPEMergeKernel::generatePabloMethod).
         const int groupLowerLimit = effIfGroupLowerLimit();
         bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
-        const bool xfrmWidth = source->getNumElements() <= MaxBitXfrmLimit || g.subtiered;
+        const bool xfrmWidth = output_bits <= BitXfrmLimit;
         if (xfrmWidth && !nextId && bitXfrmEligible(g)) {
             // inPlayMask may be nullptr here (first kernel after a FilterByMask) --
             // BPEXfrmKernel builds it locally in that case (see hasStreamInput in its
@@ -2449,11 +2391,10 @@ BPEPassResult buildBPEPassPipeline(
         inPlayMask = nullptr;
     }
 
-    if (MaxBitXfrmLimit > 0 || FullSubtieringLimit > 0)
-        std::cerr << "[BPE] max-bit-xfrm-limit=" << MaxBitXfrmLimit
-                  << " full-subtiering-limit=" << FullSubtieringLimit << ": " << nXfrm
+    if (BitXfrmLimit > 0)
+        std::cerr << "[BPE] bit-xfrm-limit=" << BitXfrmLimit << ": " << nXfrm
                   << " bit-transformation kernels" << (nXfrmIneligible
-                      ? ", " + std::to_string(nXfrmIneligible) + " narrow kernels kept per-rule "
+                      ? ", " + std::to_string(nXfrmIneligible) + " kernels kept per-rule "
                         "(chain/asymmetric-seam/veto rules or --indexed-shift)" : std::string())
                   << "\n";
     // The emitter packs exactly 16 id bits (P2S16Kernel); widen a narrower final stream.
@@ -2645,7 +2586,7 @@ static unsigned rawByteLen(const std::string & s) {
 // the token-grid conflict test (interior sub-token byte overlaps are NOT counted —
 // interior bytes are not live token starts). Mirrors merge_analysis.py
 // clean_range_analysis (id-based merges_overlap). Rules stay idAB-ASC = rank-ASC.
-// levelPartition — ASAP level schedule of the rank-sorted rules (see --level-partition).
+// levelPartition — ASAP level schedule of the rank-sorted rules (see --partition=level).
 // Same two constraints as the clean-range walk, minus the contiguity requirement:
 //   dependency — a rule's parts must be stamped by a STRICTLY earlier kernel (T4), so
 //                level(r) > level(producer(idA)) and > level(producer(idB));
@@ -2663,7 +2604,7 @@ static unsigned rawByteLen(const std::string & s) {
 // NOTE `hi` is a WIDTH BOUND ONLY — under levels it is ~50k from the first kernel on, so
 // it is NOT an "everything below is already stamped" watermark; applyCompactionSchedule
 // asks kernelOf[] instead. `lo` is the level's lowest idAB — informational (debug dump).
-// --chain-veto bookkeeping, reported on the [BPE] stderr dump.
+// --partition=chain bookkeeping, reported on the [BPE] stderr dump.
 static unsigned gChainVetoRelaxed = 0;   // rules carrying a runtime veto
 static unsigned gChainVetoTerms   = 0;   // total competitor EQs those rules emit
 
@@ -2689,7 +2630,7 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
             if (it != m.end() && it->second + 1u > lvl) lvl = it->second + 1u;
         };
         // sameOrAfter: like `after`, but level ITSELF is acceptable (not level+1). Used
-        // only for the --asymmetric-seam maxRight relaxation: the live-mask read makes
+        // only for the --partition=asymmetric maxRight relaxation: the live-mask read makes
         // same-kernel coexistence correct (rank order inside the kernel still runs the
         // consumer before the dependent), but the rule must never land STRICTLY EARLIER
         // than the token's consumer.
@@ -2698,27 +2639,27 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
             if (it != m.end() && it->second > lvl) lvl = it->second;
         };
         // dependency: idA must be stamped by a lower-OR-SAME kernel under
-        // --chain-partition (excluding self-merges, see ChainPartition's comment);
+        // --partition=chain (excluding self-merges, see the enum's comment);
         // otherwise (default) strictly a lower kernel, same as idB below.
-        if (ChainPartition && r.idA != r.idB) sameOrAfter(prodLevel, r.idA);
+        if (isChainPartition() && r.idA != r.idB) sameOrAfter(prodLevel, r.idA);
         else after(prodLevel, r.idA);
         after(prodLevel, r.idB);      // dependency: idB stamped by a lower kernel
-        // seam: an earlier rule consumed this token as its B. Under --asymmetric-seam,
-        // softened to same-level-or-after — the runtime gate now reads inPlayMask LIVE
-        // (see eqAstart), so a same-kernel earlier consume is visible without a level
-        // split, but the rule still can't jump to an EARLIER level than its consumer.
-        // EXCEPT self-merges (idA==idB): selfMergeFireStarts' run-parity math assumes a
-        // STATIC isX (see its call site comment — "no same-kernel rule can have
-        // consumed an X-run position... so frozen==live"). 
-        if (AsymmetricSeam && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
+        // seam: an earlier rule consumed this token as its B. Under --partition=asymmetric
+        // (or chain), softened to same-level-or-after — the runtime gate now reads
+        // inPlayMask LIVE (see eqAstart), so a same-kernel earlier consume is visible
+        // without a level split, but the rule still can't jump to an EARLIER level than
+        // its consumer. EXCEPT self-merges (idA==idB): selfMergeFireStarts' run-parity
+        // math assumes a STATIC isX (see its call site comment — "no same-kernel rule
+        // can have consumed an X-run position... so frozen==live").
+        if (isAsymmetricSeam() && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
         else after(maxRight, r.idA);
-        // seam: an earlier rule claimed this token as its A. Without --chain-veto this is
-        // a hard split — the forward LookAhead reads frozen input only (T5), so a
+        // seam: an earlier rule claimed this token as its A. Without --partition=chain
+        // this is a hard split — the forward LookAhead reads frozen input only (T5), so a
         // same-kernel competitor's consume of idB is invisible. With it, the rule tests
-        // the competitor itself and stands down at runtime (see ChainVeto).
+        // the competitor itself and stands down at runtime (see the enum's comment).
         std::vector<unsigned> veto;
         bool relaxed = false;
-        if (ChainVeto && r.idA != r.idB) {
+        if (isChainVeto() && r.idA != r.idB) {
             unsigned lvlStrict = lvl, lvlRelaxed = lvl;      // lvl = level ignoring maxLeft
             auto ml = maxLeft.find(r.idB);
             if (ml != maxLeft.end()) {
@@ -2753,7 +2694,7 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         // needsLiveId: true exactly when idA's producer landed at THIS SAME level —
         // only possible via the sameOrAfter(prodLevel, r.idA) branch above (the plain
         // after() branch always forces a STRICTLY later level), so this is a no-op
-        // (always false) whenever --chain-partition is off.
+        // (always false) whenever --partition=chain is off.
         MergeRule rc = r;
         {
             auto it = prodLevel.find(r.idA);
@@ -2808,12 +2749,12 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
 // block-weighted gate tests, same 283 kernels, 0 fire mismatches vs HF.
 static void keyCluster(std::vector<std::vector<MergeRule>> & levels, const PartitionContext & ctx) {
     const int lowerLimit = effIfGroupLowerLimit();
-    if (AsymmetricSeam || ChainVeto || IfTestSignificantBits == 0 || lowerLimit < 0) {
+    if (isAsymmetricSeam() || isChainVeto() || IfTestSignificantBits == 0 || lowerLimit < 0) {
         std::cerr << "[BPE] --key-cluster ignored: needs grouping with --if-test-significant-bits, "
-                     "and no --asymmetric-seam / --chain-veto\n";
+                     "and --partition=level (not asymmetric or chain)\n";
         return;
     }
-    const bool chain = ChainPartition;
+    const bool chain = isChainPartition();
     const unsigned NL = levels.size();
     // Level l (1-based) is global kernel ctx.kernelOffset + l - 1, which is grouped iff that
     // index >= lowerLimit, i.e. iff l > localLimit.
@@ -2966,19 +2907,19 @@ static void keyCluster(std::vector<std::vector<MergeRule>> & levels, const Parti
 // chunk keeps the group's `hi` (a valid width bound, and it keeps `hi` monotone), and its
 // rules stay in rank order. nSplit counts the groups split.
 //
-// Key-aware split (with --if-test-significant-bits, unless --asymmetric-seam or
-// --chain-veto): chunks are filled by gate key, so rules sharing a gate stay in one kernel
+// Key-aware split (with --if-test-significant-bits, unless --partition=asymmetric or
+// --partition=chain): chunks are filled by gate key, so rules sharing a gate stay in one kernel
 // (what --key-cluster gathered is not scattered again). Any assignment of a group's rules
 // to consecutive kernels is valid when no two of them are rank-order dependent — no
-// dependency or seam lies inside a group — except a --chain-partition nest, whose child
+// dependency or seam lies inside a group — except a --partition=chain nest, whose child
 // reads its producer's stamp in the same kernel; a chain tree is therefore kept whole.
-// --asymmetric-seam and --chain-veto relate same-group rules by rank, so with either of
+// --partition=asymmetric and --partition=chain relate same-group rules by rank, so with either of
 // those the split stays in rank order.
 static std::vector<MergeRuleGroup> splitOversizedGroups(std::vector<MergeRuleGroup> groups,
                                                         unsigned & nSplit) {
     const size_t cap = MaxMergesPerKernel;
     if (cap == 0) return groups;
-    const bool byKey = IfTestSignificantBits > 0 && !AsymmetricSeam && !ChainVeto;
+    const bool byKey = IfTestSignificantBits > 0 && !isAsymmetricSeam() && !isChainVeto();
     std::vector<MergeRuleGroup> out;
     for (auto & g : groups) {
         const size_t n = g.rules.size();
@@ -3031,7 +2972,6 @@ static std::vector<MergeRuleGroup> splitOversizedGroups(std::vector<MergeRuleGro
         for (auto & c : chunks) {
             MergeRuleGroup sub;
             sub.hi = g.hi;
-            sub.subtiered = g.subtiered;
             sub.rules = std::move(c);
             sub.lo = sub.rules.front().idAB;
             std::unordered_set<unsigned> stamped;   // idABs stamped in this chunk
@@ -3076,10 +3016,10 @@ static std::vector<MergeRuleGroup> cleanRangePartition(const std::vector<MergeRu
 
 // Mark rules whose gate needs a POST-write live mask: an earlier (lower-rank) rule
 // in the SAME group already consumed this rule's idA as its own idB. Under the
-// default symmetric seam test (clean-range and --level-partition without
-// --asymmetric-seam) this can never occur — the seam test forbids both overlap
-// directions within one group — so this pass is a no-op there. Under
-// --asymmetric-seam it is exactly the ONE relaxed direction (see AsymmetricSeam's
+// default symmetric seam test (--partition=clean or level) this can never occur —
+// the seam test forbids both overlap directions within one group — so this pass is
+// a no-op there. Under --partition=asymmetric (or chain) it is exactly the ONE
+// relaxed direction (see isAsymmetricSeam()'s
 // `sameOrAfter(maxRight, r.idA)` in levelPartition). --batch-writeback defers the
 // inPlayMask clear to the end of the kernel; a flagged rule must force a flush of
 // the pending write-back first, or its eqAstart sees the kernel's frozen entry
@@ -3092,9 +3032,9 @@ static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
         for (auto & r : g.rules) {
             // Two reasons a rule's gate must read the LIVE mask rather than the kernel's
             // frozen entry mask:
-            //  1. --asymmetric-seam: an earlier rule in this group consumed this rule's
+            //  1. --partition=asymmetric: an earlier rule in this group consumed this rule's
             //     idA as ITS idB, so idA is already gone and the gate has to see that.
-            //  2. --chain-veto: this rule now shares its kernel with the lower-rank rules
+            //  2. --partition=chain: this rule now shares its kernel with the lower-rank rules
             //     claiming its idB — that sharing is exactly what the veto buys. Those
             //     competitors fire first and clear starts around this rule's B, so the
             //     same staleness applies and the frozen entry mask would hide it.
@@ -3134,22 +3074,18 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     std::sort(rules.begin(), rules.end(),
               [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
 
-    // 3. Partition. --level-partition takes the ASAP level schedule (minimum kernel
-    //    count, same constraints); the default is the clean_range walk (see
-    //    cleanRangePartition). --partition-by-merge-id-bits partitions each idAB bit
-    //    tier separately and concatenates the tiers in order (see PartitionByMergeIdBits).
-    //    Oversized groups are split right after each partition (--max-merges-per-kernel),
-    //    so a tier's context counts the kernels that will really precede it.
+    // 3. Partition. --partition=level/asymmetric/chain take the ASAP level schedule
+    //    (minimum kernel count, same constraints); --partition=clean (default) is the
+    //    clean_range walk (see cleanRangePartition). --partition-by-merge-id-bits
+    //    partitions each idAB bit tier separately and concatenates the tiers in order
+    //    (see PartitionByMergeIdBits). Oversized groups are split right after each
+    //    partition (--max-merges-per-kernel), so a tier's context counts the kernels
+    //    that will really precede it.
     unsigned nSplit = 0;
-    auto partition = [&](const std::vector<MergeRule> & rs, const PartitionContext & ctx,
-                         unsigned bits) {
-        auto groups = LevelPartition ? levelPartition(rs, ctx) : cleanRangePartition(rs);
-        if (bits > kXfrmLowBits && bits <= FullSubtieringLimit)
-            for (auto & g : groups) g.subtiered = true;
-        return splitOversizedGroups(std::move(groups), nSplit);
+    auto partition = [&](const std::vector<MergeRule> & rs, const PartitionContext & ctx) {
+        return splitOversizedGroups(isLevelPartition() ? levelPartition(rs, ctx) : cleanRangePartition(rs),
+                                    nSplit);
     };
-    if (FullSubtieringLimit && !PartitionByMergeIdBits)
-        std::cerr << "[BPE] WARNING: --full-subtiering-limit needs --partition-by-merge-id-bits; ignored\n";
     std::vector<MergeRuleGroup> groups;
     if (PartitionByMergeIdBits) {
         // rules are rank-sorted, so each bit tier is a contiguous run of them
@@ -3159,7 +3095,7 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             const unsigned bits = ceil_log2(rules[i].idAB + 1);   // bit length of idAB
             size_t j = i;
             while (j < n && ceil_log2(rules[j].idAB + 1) == bits) ++j;
-            auto tier = partition(std::vector<MergeRule>(rules.begin() + i, rules.begin() + j), ctx, bits);
+            auto tier = partition(std::vector<MergeRule>(rules.begin() + i, rules.begin() + j), ctx);
             std::cerr << "[BPE] merge id bits " << bits << ": " << (j - i) << " rules in "
                       << tier.size() << " kernels\n";
             // advance the context past this tier: the count steps once per kernel, as in
@@ -3170,15 +3106,15 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             i = j;
         }
     } else {
-        groups = partition(rules, PartitionContext(), 0);
+        groups = partition(rules, PartitionContext());
     }
     if (nSplit)
         std::cerr << "[BPE] max-merges-per-kernel=" << MaxMergesPerKernel << ": split " << nSplit
                   << " kernels -> " << groups.size() << " kernels total"
-                  << (IfTestSignificantBits > 0 && !AsymmetricSeam && !ChainVeto ? " (by gate key)" : "")
+                  << (IfTestSignificantBits > 0 && !isAsymmetricSeam() && !isChainVeto() ? " (by gate key)" : "")
                   << "\n";
     tagFlushPoints(groups);
-    if (LevelPartition) {
+    if (isLevelPartition()) {
         if (std::getenv("BPE_CHAIN_STATS")) {
             unsigned n = 0, total = 0;
             for (auto & g : groups) {
@@ -3188,7 +3124,7 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             std::cerr << "[BPE] chain-partition: " << n << "/" << total
                        << " rules flagged needsLiveId\n";
         }
-        if (ChainVeto)
+        if (isChainVeto())
             std::cerr << "[BPE] chain-veto: " << gChainVetoRelaxed
                       << " rules kept their level via a runtime veto ("
                       << gChainVetoTerms << " competitor EQs)\n";

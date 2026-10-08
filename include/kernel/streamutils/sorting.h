@@ -5,6 +5,7 @@
 #pragma once
 
 #include <pablo/compiler/pablo_kernel.h>
+#include <kernel/core/kernel.h>
 namespace kernel { class PipelineBuilder; }
 namespace kernel { class StreamSet; }
 
@@ -60,3 +61,28 @@ using StreamSets = std::vector<StreamSet *>;
 //   chunk of a longer run has missing items at the end of its instance; comparisons with
 //   missing items are omitted, which is correct because all comparisons are ascending.
 StreamSets OddEvenMergeSortRuns(PipelineBuilder & P, unsigned instance_size, StreamSet * Runs, StreamSets & ToSort);
+
+//
+//   SeqRunSort sorts runs of any length.  Each run of 1 bits in Runs is stably sorted
+//   by the K-bit key in Keys, permuting the M-bit items of Data into Sorted.
+//   Misordered marks the last position of each run that is out of order (as
+//   computed by the Misorder_Check kernel; see SeqSortRuns); other runs are copied
+//   to the output as is.  The output is deferred: items are produced up to the
+//   end of the last complete run, and the Keys and Data inputs are deferred to
+//   the same position, so that an incomplete run stays available until its end
+//   is seen.  K + M must be at most 64.
+//
+class SeqRunSort final : public MultiBlockKernel {
+public:
+    SeqRunSort(LLVMTypeSystemInterface & ts, StreamSet * Runs, StreamSet * Misordered,
+            StreamSet * Keys, StreamSet * Data, StreamSet * Sorted);
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) override;
+private:
+    const unsigned mKeyBits;
+    const unsigned mDataBits;
+};
+
+//   Sort each run of 1 bits in Runs, of any length, stably by Keys, permuting Data
+//   into Sorted (Misorder_Check followed by SeqRunSort).
+void SeqSortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted);

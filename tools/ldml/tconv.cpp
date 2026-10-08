@@ -558,6 +558,46 @@ static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysi
             continue;
         }
         llvm::outs() << "  conversion group: " << step.subgroups.size() << " subgroups\n";
+        //  ICU matches before contexts against the converted text.  A before context
+        //  may match differently in the unconverted text, as the regular expression
+        //  engine sees it, if a conversion of the group:
+        //    - replaces a character by one, where exactly one of them is in a set of
+        //      the context;
+        //    - replaces a character by a longer string, where the character or one of
+        //      the string is in a set of the context;
+        //    - deletes a character, unless the context is A S* with the character
+        //      in S but not in A (a deleted character within a match is then in S*,
+        //      as after the deletion closure of DisambiguateOrder).
+        std::vector<std::pair<UCD::codepoint_t, std::u32string>> conversions;
+        for (const ldml::CharMapSubgroup & s : step.subgroups) {
+            for (const auto & m : s.charMap) {
+                if (m.second.size() != 1 || m.second[0] != m.first) conversions.emplace_back(m.first, m.second);
+            }
+        }
+        for (const ldml::CharMapSubgroup & s : step.subgroups) {
+            if (s.before == nullptr) continue;
+            const std::vector<ldml::PatternItem> items = ldml::patternItems(s.before);
+            const bool closedForm = items.size() == 2 && !items[0].repeated && items[1].repeated;
+            bool changes = false;
+            for (const auto & c : conversions) {
+                if (c.second.empty()) {
+                    changes = !(closedForm && items[1].chars.contains(c.first) && !items[0].chars.contains(c.first));
+                } else {
+                    for (const ldml::PatternItem & item : items) {
+                        bool replacementInItem = false;
+                        for (char32_t r : c.second) replacementInItem |= item.chars.contains(r);
+                        changes = c.second.size() == 1 ? item.chars.contains(c.first) != replacementInItem
+                                                       : item.chars.contains(c.first) || replacementInItem;
+                        if (changes) break;
+                    }
+                }
+                if (changes) break;
+            }
+            if (changes) {
+                llvm::outs() << "    warning: the before context of [" << s.contextKey
+                             << "] may match differently in the converted text\n";
+            }
+        }
         for (const ldml::CharMapSubgroup & s : step.subgroups) {
             llvm::outs() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.charMap.size() << " characters";
             unsigned shown = 0;

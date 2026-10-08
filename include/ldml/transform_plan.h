@@ -79,4 +79,17 @@ TransformPlan planTransform(const std::vector<Rule *> & rules);
 re::RE * expandedContext(re::RE * context, const std::map<UCD::codepoint_t, unsigned> & insertions,
                          UCD::codepoint_t filler);
 
+// The characters that the set items of a pattern (e.g. a context) may match,
+// including those of the variables it uses.
+UCD::UnicodeSet patternCharacters(re::RE * pattern);
+
+// The set items of a pattern (including the items of the variables it uses),
+// in order: the characters of each, and whether it is repeated (within x*,
+// x+, x{m,n} or x?).
+struct PatternItem {
+    UCD::UnicodeSet chars;
+    bool repeated;
+};
+std::vector<PatternItem> patternItems(re::RE * pattern);
+
 }

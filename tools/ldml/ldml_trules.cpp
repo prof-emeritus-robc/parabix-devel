@@ -150,7 +150,9 @@ static bool processRules(const std::vector<std::string> & tRules, const std::str
                 std::cout << " (overlaps " << dstats.overlapsBefore << " -> " << dstats.overlapsAfter << ", "
                           << dstats.rulesSplit << " rules split into " << dstats.splitRules << ", "
                           << dstats.pairsResolved << " pairs resolved, " << dstats.pairsUnresolved << " unresolved, "
-                          << dstats.rulesReplaced << " rules replaced by " << dstats.rulesAdded << ")";
+                          << dstats.rulesReplaced << " rules replaced by " << dstats.rulesAdded;
+                if (dstats.deletionClosures) std::cout << ", " << dstats.deletionClosures << " deletion closures";
+                std::cout << ")";
                 for (const auto & r : dstats.unresolvedReasons) {
                     std::cout << "\n    unresolved: " << r.second << " " << r.first;
                 }
@@ -787,6 +789,18 @@ static const EliminationTestCase disambiguationTestCases[] = {
     {"$c = [{m̥}bmw] ; yw → əu ; y } $c* [$] → ɨ ;", "$c = [{m̥}bmw] ;\nyw → əu ;\ny } [{m̥}bm] $c* [$] → ɨ ;\ny } [$] → ɨ ;\n"},
     {"$c = [{m̥}bm] ; a → y ; [$] $c* { a → x ;", "$c = [{m̥}bm] ;\na → y ;\n"},
     {"a } [{bc}{bcd}] e → x ; a → y ;", "a } [{bc}{bcd}] e → x ;\na } [^b] → y ;\na } b [^c] → y ;\na } bc [^de] → y ;\na } bcd [^e] → y ;\n"},
+    // Deletion closure: the characters deleted by a rule are added to the
+    // repeated set preceding it in its before context (el-Upper).
+    {"x [cd]* { [ab] → ;", "x [a-d]* { [ab] → ;\n"},
+    {"y [cd]* { [ab] → ; [ef] → g ;", "y [a-d]* { [ab] → ;\n[ef] → g ;\n"},
+    // The item before the repeated set may overlap the set, but not the deleted characters.
+    {"[xc] [cd]* { [ab] → ;", "[cx] [a-d]* { [ab] → ;\n"},
+    {"x [^ab]* { [ab] → ;", "x [[^ab$]ab$]* { [ab] → ;\n"},
+    // Not applied: another rule produces a deleted character, an after context,
+    // an item before the repeated set that includes a deleted character.
+    {"x [cd]* { [ab] → ; e → a ;", "x [cd]* { [ab] → ;\ne → a ;\n"},
+    {"x [cd]* { [ab] } y → ;", "x [cd]* { [ab] } y → ;\n"},
+    {"[xa] [cd]* { [ab] → ;", "[ax] [cd]* { [ab] → ;\n"},
 };
 
 struct DirectionTestCase {

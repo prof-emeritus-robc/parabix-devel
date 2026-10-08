@@ -179,4 +179,36 @@ re::RE * expandedContext(re::RE * context, const std::map<UCD::codepoint_t, unsi
     return expandContext(context, insertions, filler, sets);
 }
 
+static void collectItems(re::RE * re, bool repeated, std::vector<PatternItem> & items, CharSetAnalysis & sets) {
+    if (isa<re::CC>(re) || isa<re::PropertyExpression>(re) || isa<re::Any>(re) || isa<re::Diff>(re) || isa<re::Intersect>(re)
+            || ((isa<re::Alt>(re) || isa<re::Name>(re)) && CharSetAnalysis::isSet(re))) {
+        items.push_back(PatternItem{sets.setOf(re, true), repeated});
+    } else if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        for (re::RE * e : *seq) collectItems(e, repeated, items, sets);
+    } else if (re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        for (re::RE * a : *alt) collectItems(a, repeated, items, sets);
+    } else if (re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        collectItems(rep->getRE(), true, items, sets);
+    } else if (re::Assertion * a = dyn_cast<re::Assertion>(re)) {
+        collectItems(a->getAsserted(), repeated, items, sets);
+    } else if (re::Capture * c = dyn_cast<re::Capture>(re)) {
+        collectItems(c->getCapturedRE(), repeated, items, sets);
+    } else if (re::Name * name = dyn_cast<re::Name>(re)) {
+        if (!isFunctionCall(name) && name->getDefinition()) collectItems(name->getDefinition(), repeated, items, sets);
+    }
+}
+
+std::vector<PatternItem> patternItems(re::RE * pattern) {
+    CharSetAnalysis sets;
+    std::vector<PatternItem> items;
+    collectItems(pattern, false, items, sets);
+    return items;
+}
+
+UCD::UnicodeSet patternCharacters(re::RE * pattern) {
+    UCD::UnicodeSet chars;
+    for (const PatternItem & item : patternItems(pattern)) chars = chars + item.chars;
+    return chars;
+}
+
 }

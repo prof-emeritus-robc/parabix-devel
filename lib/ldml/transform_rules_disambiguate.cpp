@@ -2120,6 +2120,94 @@ std::vector<Rule *> AlternativeSplitter::split(const ConversionRule * r, std::ve
 
 } // end anonymous namespace
 
+//  The characters of a pattern (the members of its sets and its literal
+//  characters).  Returns false if the pattern may produce other characters
+//  (references to captures, function calls).
+static bool patternChars(const re::RE * re, UCD::UnicodeSet & chars, CharSetAnalysis & sets) {
+    if (re == nullptr) return true;
+    if (isa<re::CC>(re) || isa<re::PropertyExpression>(re) || isa<re::Any>(re) || isa<re::Diff>(re) || isa<re::Intersect>(re)) {
+        chars = chars + sets.setOf(re, true);
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        for (const re::RE * e : *seq) if (!patternChars(e, chars, sets)) return false;
+    } else if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        for (const re::RE * a : *alt) if (!patternChars(a, chars, sets)) return false;
+    } else if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        return patternChars(rep->getRE(), chars, sets);
+    } else if (const re::Capture * c = dyn_cast<re::Capture>(re)) {
+        return patternChars(c->getCapturedRE(), chars, sets);
+    } else if (const re::Name * name = dyn_cast<re::Name>(re)) {
+        if (isFunctionCall(name) || name->getDefinition() == nullptr) return false;
+        return patternChars(name->getDefinition(), chars, sets);
+    } else if (isa<re::Reference>(re)) {
+        return false;
+    }
+    return true;
+}
+
+//  A set of single characters (no strings; and no text boundary, unless allowed)?
+static bool isCharacterSet(const re::RE * re, CharSetAnalysis & sets, bool allowBoundary = false) {
+    return re && CharSetAnalysis::isSet(re) && (allowBoundary || !mayIncludeTextBoundary(re))
+        && sets.setOf(re, false) == sets.setOf(re, true);
+}
+
+static bool isEmptyResult(const RuleSide * result) {
+    const re::Seq * seq = dyn_cast_or_null<re::Seq>(result->getText());
+    return seq && seq->empty() && (!result->hasCursor() || result->getCursorOffset() == 0);
+}
+
+//  The deletion closure of the before contexts of the rules (see transform_rules.h).
+static std::vector<Rule *> closeDeletionContexts(const std::vector<Rule *> & rules, DisambiguationStats & stats) {
+    std::vector<Rule *> result = rules;
+    CharSetAnalysis sets;
+    for (size_t first = 0; first < result.size(); ) {
+        size_t last = first;     // the group of conversion rules [first, last)
+        while (last < result.size() && !isa<TransformRule>(result[last]) && !isa<FilterRule>(result[last])) last++;
+        for (size_t i = first; i < last; i++) {
+            ConversionRule * const L = dyn_cast<ConversionRule>(result[i]);
+            if (L == nullptr || L->getDirection() != Direction::Forward) continue;
+            const RuleSide * const source = L->getSourceSide(Direction::Forward);
+            if (!isEmptyResult(L->getResultSide(Direction::Forward)) || source->hasAfterContext()
+                    || !isCharacterSet(source->getText(), sets)) continue;
+            const re::Seq * const before = dyn_cast_or_null<re::Seq>(source->getBeforeContext());
+            if (before == nullptr || before->size() < 2) continue;
+            const re::Rep * const star = dyn_cast<re::Rep>(before->back());
+            const re::RE * const anchor = (*before)[before->size() - 2];
+            //  The sets of A and S may include the text boundary (e.g., as negated sets):
+            //  S, preceded by A, never matches it; A may match it only at the start of
+            //  the text, where the closure holds as well.
+            if (star == nullptr || star->getUB() != re::Rep::UNBOUNDED_REP
+                    || !isCharacterSet(star->getRE(), sets, true) || !isCharacterSet(anchor, sets, true)) continue;
+            const UCD::UnicodeSet D = sets.setOf(source->getText(), false);
+            const UCD::UnicodeSet S = sets.setOf(star->getRE(), false);
+            //  A must be disjoint from D: possessive matching of [S D]* (backward from the
+            //  position) then stops where that of S* does, or, at a D character that was
+            //  not deleted, fails as S* followed by A does.
+            if ((D - S).empty() || !(sets.setOf(anchor, false) & D).empty()) continue;
+            //  No other rule of the group converts or may produce D characters.
+            bool independent = true;
+            for (size_t j = first; j < last && independent; j++) {
+                const ConversionRule * const R = dyn_cast<ConversionRule>(result[j]);
+                if (R == nullptr || R == L) continue;
+                UCD::UnicodeSet text, produced;
+                independent = R->getDirection() == Direction::Forward
+                    && patternChars(R->getSourceSide(Direction::Forward)->getText(), text, sets)
+                    && patternChars(R->getResultSide(Direction::Forward)->getText(), produced, sets)
+                    && (text & D).empty() && (produced & D).empty();
+            }
+            if (!independent) continue;
+            std::vector<re::RE *> items(before->begin(), before->end());
+            items.back() = re::makeRep(re::makeAlt({star->getRE(), source->getText()}), star->getLB(), star->getUB());
+            RuleSide * const closed = RuleSide::Create(re::makeSeq(items.begin(), items.end()), source->getCompletedResult(),
+                                                       source->hasCursor(), source->getResultToRevisit(),
+                                                       source->getCursorOffset(), nullptr);
+            result[i] = ConversionRule::Create(closed, Direction::Forward, L->getResultSide(Direction::Forward));
+            stats.deletionClosures++;
+        }
+        first = last + 1;
+    }
+    return result;
+}
+
 std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, DisambiguationStats * stats) {
     DisambiguationStats localStats;
     DisambiguationStats & s = stats ? *stats : localStats;
@@ -2217,6 +2305,7 @@ std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, Disambi
         }
     }
     s.overlapsAfter = remaining.size();
+    result = closeDeletionContexts(result, s);
     return result;
 }
 

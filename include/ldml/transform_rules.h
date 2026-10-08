@@ -591,9 +591,27 @@ struct DisambiguationStats {
     size_t rulesAdded = 0;           // replacement rules
     size_t overlapsAfter = 0;        // overlapping pairs remaining (of the original rules, under ICU matching)
     size_t verificationFailures = 0; // replacement rules still overlapping a resolved E (an internal error)
+    size_t deletionClosures = 0;     // before contexts extended by deleted characters (see below)
     std::vector<std::pair<const Rule *, const Rule *>> failedPairs;  // (E, replacement rule) failing verification
     std::map<std::string, size_t> unresolvedReasons;   // the unresolved pairs by reason
 };
+//
+//  Deletion closure.  Before contexts are matched against the converted text.
+//  A rule L deleting the characters of a set D, preceded by an item A and a
+//  repeated set S* (the last items of its before context, with no after
+//  context), sees the converted text, from which the D characters following
+//  A S* have already been deleted (by L itself).  Its context is extended to
+//  A [S D]*, which matches the same converted texts, but also matches the
+//  unconverted text, as the regular expression engine sees it: e.g.,
+//      [:Greek:] [^[:ccc=0:][:ccc=230:]]* { [\u0300\u0301] → ;
+//  becomes
+//      [:Greek:] [[^[:ccc=0:][:ccc=230:]][\u0300\u0301]]* { [\u0300\u0301] → ;
+//  The rewrite applies when no other rule of the group converts D characters
+//  or may produce them (so that each D character following A S* in the text
+//  is deleted by L), and A is disjoint from D (so that possessive matching of
+//  [S D]* takes the character matching A only where that of S* does).  A and S may be
+//  negated sets (including the text boundary): S, preceded by A, never matches
+//  the boundary, and A may match it only at the start of the text.
 std::vector<Rule *> DisambiguateOrder(const std::vector<Rule *> & rules, DisambiguationStats * stats = nullptr);
 
 //  Trivial capture elimination.

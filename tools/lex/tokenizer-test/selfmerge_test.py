@@ -19,7 +19,7 @@ Each --config NAME=FLAGS runs the tokenizer with those flags (after --merges); t
 default set covers the main merge-kernel strategies. Exit status 1 on any mismatch.
 
     python selfmerge_test.py --tokenizer ../../../build22/bin/tokenizer
-    python selfmerge_test.py --config 'mine=--level-partition --some-new-flag'
+    python selfmerge_test.py --config 'mine=--partition=level --some-new-flag'
 """
 
 import argparse
@@ -35,18 +35,18 @@ MERGES    = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 
 DEFAULT_CONFIGS = [
     ("plain", ""),
-    ("level", "--level-partition"),
-    ("level+geometric", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback"),
-    ("bits+xfrm10", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "
-                    "--partition-by-merge-id-bits --max-bit-xfrm-limit=10"),
-    ("bits+subtier13", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "
-                       "--partition-by-merge-id-bits --max-bit-xfrm-limit=10 --full-subtiering-limit=13"),
-    ("bits+subtier14", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback "
-                       "--partition-by-merge-id-bits --max-bit-xfrm-limit=10 --full-subtiering-limit=14"),
-    ("level+geometric+smb", "--level-partition --compact-base=2 --geometric-compaction --batch-writeback "
+    ("level", "--partition=level"),
+    ("level+geometric", "--partition=level --compact-base=2 --geometric-compaction --batch-writeback"),
+    ("bits+xfrm10", "--compact-base=2 --compaction=by-output-bits --batch-writeback "
+                    "--partition=bit-tier --bit-xfrm-limit=10"),
+    ("bits+subtier13", "--compact-base=2 --compaction=by-output-bits --batch-writeback "
+                       "--partition=bit-tier --bit-xfrm-limit=13"),
+    ("bits+subtier14", "--compact-base=2 --geometric-compaction --batch-writeback "
+                       "--partition=bit-tier --bit-xfrm-limit=14"),
+    ("level+geometric+smb", "--partition=level --compact-base=2 --geometric-compaction --batch-writeback "
                             "--self-merge-block"),
-    ("bits+xfrm10+smb", "--level-partition --compact-base=2 --compaction=by-output-bits --batch-writeback "
-                        "--partition-by-merge-id-bits --max-bit-xfrm-limit=10 --self-merge-block"),
+    ("bits+xfrm10+smb", "--compact-base=2 --compaction=by-output-bits --batch-writeback "
+                        "--partition=bit-tier --bit-xfrm-limit=10 --self-merge-block"),
 ]
 
 UNITS = ['-', '=', '.', ' ', '*', '#', '/', '_', '0', '1', '9', 'a', 'l', 'k', 't', 's',

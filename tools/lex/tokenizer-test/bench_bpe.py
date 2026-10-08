@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-BPE throughput benchmark: Parabix vs HuggingFace `tokenizers`.
+BPE throughput benchmark: Parabix vs HuggingFace `tokenizers` vs tiktoken.
 
 This is the PERFORMANCE counterpart to compare_bpe.py (which checks
-correctness).  It mirrors HuggingFace's own criterion methodology
-(tokenizers/benches/*.rs): a fixed corpus, N warm iterations, and the
-primary metric is **throughput in MB/s** — comparable across inputs and
-machines — not raw milliseconds.
+correctness, including tiktoken as a third independent reference). It mirrors
+HuggingFace's own criterion methodology (tokenizers/benches/*.rs): a fixed
+corpus, N warm iterations, and the primary metric is **throughput in MB/s** —
+comparable across inputs and machines — not raw milliseconds.
+
+tiktoken is OpenAI's own Rust BPE implementation (its built-in "gpt2"
+encoding) — a genuinely separate codebase from both Parabix and HF, not just
+another config of HF's tokenizer, and worth benchmarking against because it is
+the fastest widely-used BPE implementation available.
 
 Fairness
 --------
@@ -33,6 +38,8 @@ Usage
     python bench_bpe.py --openwebtext --owt-bytes 50000000  # bigger sample
     python bench_bpe.py --parabix-only
     python bench_bpe.py --hf-only
+    python bench_bpe.py --tiktoken-only
+    python bench_bpe.py --no-tiktoken         # Parabix vs HF only (original 2-way)
     python bench_bpe.py --svg bench.svg       # also emit a MB/s bar chart
 """
 
@@ -46,6 +53,7 @@ import sys
 import tempfile
 import time
 from tokenizers import Tokenizer
+import tiktoken
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -210,8 +218,38 @@ def run_hf(tok, text: str, iters: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# tiktoken side — in-process encode loop, same shape as run_hf
+# ---------------------------------------------------------------------------
+
+def run_tiktoken(enc, text: str, iters: int) -> dict:
+    """Time tiktoken's encode() on the whole-file string, same methodology as run_hf."""
+    nbytes = len(text.encode("utf-8"))
+    enc.encode(text)                       # warm-up (discarded)
+    times = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        enc.encode(text)
+        times.append((time.perf_counter() - t0) * 1e3)   # ms
+    times.sort()
+    minv   = times[0]
+    median = statistics.median(times)
+    mean   = statistics.fmean(times)
+    mbps   = (nbytes / (minv / 1e3)) / 1e6 if minv > 0 else 0.0
+    return {
+        "bytes":     nbytes,
+        "iters":     iters,
+        "min_ms":    minv,
+        "median_ms": median,
+        "mean_ms":   mean,
+        "mbps":      mbps,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
+ENGINE_ORDER = ["Parabix", "HF", "tiktoken"]
 
 def _fmt_bytes(n: int) -> str:
     if n >= 1 << 20:
@@ -221,10 +259,12 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def write_row(out, name, p, h):
-    """One corpus file: parabix (p) and hf (h) result dicts (either may be None)."""
-    nbytes = (p or h)["bytes"]
-    niters = (p or h)["iters"]
+def write_row(out, name, results: dict):
+    """One corpus file: results maps engine label -> result dict (or None/absent)."""
+    present = {k: v for k, v in results.items() if v}
+    any_r = next(iter(present.values()))
+    nbytes = any_r["bytes"]
+    niters = any_r["iters"]
     out.write(f"\n{name}   ({_fmt_bytes(nbytes)}, {nbytes} bytes, {niters} iters)\n")
     out.write(f"  {'engine':<10} {'min ms':>12} {'median ms':>12} "
               f"{'mean ms':>12} {'MB/s (peak)':>14}\n")
@@ -237,33 +277,50 @@ def write_row(out, name, p, h):
         out.write(f"  {label:<10} {r['min_ms']:>12.3f} {r['median_ms']:>12.3f} "
                   f"{r['mean_ms']:>12.3f} {r['mbps']:>14.2f}\n")
 
-    line("Parabix", p)
-    line("HF", h)
+    for label in ENGINE_ORDER:
+        if label in results:
+            line(label, results[label])
 
-    if p and h and p["mbps"] > 0 and h["mbps"] > 0:
-        ratio = p["mbps"] / h["mbps"]
-        faster, x = ("Parabix", ratio) if ratio >= 1 else ("HF", 1 / ratio)
-        out.write(f"  → {faster} {x:.2f}x faster (throughput)\n")
+    # Ranked throughput summary: fastest first (highest MB/s), each one's
+    # slowdown vs the fastest.
+    ranked = sorted(present.items(), key=lambda kv: -kv[1]["mbps"])
+    if len(ranked) >= 2 and ranked[0][1]["mbps"] > 0:
+        fastest_label, fastest = ranked[0]
+        for label, r in ranked[1:]:
+            ratio = fastest["mbps"] / r["mbps"] if r["mbps"] > 0 else float("inf")
+            out.write(f"  → {fastest_label} {ratio:.2f}x faster than {label} (throughput)\n")
+
+
+SVG_ENGINE_STYLE = [("Parabix", "#58a6ff", "PBX"), ("HF", "#f0883e", "HF"),
+                    ("tiktoken", "#3fb950", "TIK")]
 
 
 def write_svg(path, rows):
-    """Grouped MB/s bar chart: Parabix vs HF per corpus file."""
-    rows = [(n, p, h) for (n, p, h) in rows if p and h]
+    """Grouped MB/s bar chart: one bar per present engine, per corpus file."""
+    rows = [(n, res) for (n, res) in rows if any(res.values())]
     if not rows:
         return
-    ROW_H, PAD, LABEL_W, BAR_MAX = 46, 20, 200, 420
+    present_engines = [(lab, col, short) for lab, col, short in SVG_ENGINE_STYLE
+                       if any(res.get(lab) for _, res in rows)]
+    if not present_engines:
+        return
+    ROW_H, PAD, LABEL_W, BAR_MAX = 16 * len(present_engines) + 14, 20, 200, 420
     W = PAD * 2 + LABEL_W + BAR_MAX + 90
     H = PAD * 2 + 40 + len(rows) * ROW_H
-    peak = max(max(p["mbps"], h["mbps"]) for _, p, h in rows) or 1.0
+    peak = max(r["mbps"] for _, res in rows for r in res.values() if r) or 1.0
+    engines_txt = " vs ".join(lab for lab, _, _ in present_engines)
     L = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
          f'font-family="ui-monospace,Menlo,monospace" font-size="12">',
          f'<rect width="{W}" height="{H}" fill="#0d1117" rx="8"/>',
          f'<text x="{W//2}" y="26" fill="#e6edf3" font-size="15" font-weight="bold" '
-         f'text-anchor="middle">BPE throughput — Parabix vs HuggingFace (MB/s, peak)</text>']
-    for i, (name, p, h) in enumerate(rows):
+         f'text-anchor="middle">BPE throughput — {engines_txt} (MB/s, peak)</text>']
+    for i, (name, res) in enumerate(rows):
         y = PAD + 40 + i * ROW_H
         L.append(f'<text x="{PAD}" y="{y+14}" fill="#8b949e">{os.path.basename(name)}</text>')
-        for j, (r, col, lab) in enumerate([(p, "#58a6ff", "PBX"), (h, "#f0883e", "HF")]):
+        for j, (label, col, lab) in enumerate(present_engines):
+            r = res.get(label)
+            if not r:
+                continue
             bw = int(r["mbps"] / peak * BAR_MAX)
             by = y + j * 16
             L.append(f'<rect x="{PAD+LABEL_W}" y="{by}" width="{max(bw,1)}" height="14" '
@@ -313,9 +370,8 @@ def write_marginal(out, rows):
     Peak MB/s (single-file) is contaminated by the fixed per-call pipeline
     dispatch floor. The slope isolates the real steady-state per-byte rate —
     what the SIMD data-parallelism actually delivers once the floor amortizes."""
-    pts = [(r_bytes, p, h) for (_, p, h) in rows
-           for r_bytes in [(p or h)["bytes"]]]
-    if len({b for b, _, _ in pts}) < 2:
+    pts = [(next(iter(res.values()))["bytes"], res) for (_, res) in rows if any(res.values())]
+    if len({b for b, _ in pts}) < 2:
         return   # need ≥2 distinct sizes to fit a line
 
     out.write("\n" + SEP + "\n")
@@ -323,10 +379,10 @@ def write_marginal(out, rows):
     out.write("per-call pipeline-dispatch cost, excluded from the per-byte rate)\n")
     out.write(SEP + "\n")
 
-    def fit_line(label, sel):
+    def fit_line(label):
         xs, ys = [], []
-        for b, p, h in pts:
-            r = sel(p, h)
+        for b, res in pts:
+            r = res.get(label)
             if r:
                 xs.append(b); ys.append(r["min_ms"])
         if len(xs) < 2:
@@ -337,8 +393,8 @@ def write_marginal(out, rows):
         out.write(f"  {label:<9} floor {a:8.2f} ms   marginal {mtxt:<16} "
                   f"(R²={r2:.3f}, n={len(xs)})\n")
 
-    fit_line("Parabix", lambda p, h: p)
-    fit_line("HF",      lambda p, h: h)
+    for label in ENGINE_ORDER:
+        fit_line(label)
     out.write("\n  Peak MB/s (per file above) includes the floor; marginal MB/s is\n")
     out.write("  the floor-free steady-state rate. On large inputs peak → marginal.\n")
     out.write(SEP + "\n")
@@ -399,13 +455,19 @@ def ensure_openwebtext(cap_bytes: int, max_docs: int, path: str):
 
 def main():
     global TOKENIZER, MERGES, TOKENIZER_JSON
-    ap = argparse.ArgumentParser(description="Parabix vs HuggingFace BPE throughput benchmark.")
+    ap = argparse.ArgumentParser(description="Parabix vs HuggingFace vs tiktoken BPE throughput benchmark.")
     ap.add_argument("--input", help="Single corpus file (overrides the default sweep)")
     ap.add_argument("--big", action="store_true", help="Append the ~13 MB corpus to the sweep")
     ap.add_argument("--iters", type=int, default=DEFAULT_ITERS,
                     help=f"Timed iterations per side (default {DEFAULT_ITERS})")
     ap.add_argument("--parabix-only", action="store_true")
     ap.add_argument("--hf-only", action="store_true")
+    ap.add_argument("--tiktoken-only", action="store_true")
+    ap.add_argument("--no-tiktoken", action="store_true",
+                    help="Parabix vs HF only, skip tiktoken (original 2-way behavior)")
+    ap.add_argument("--tiktoken-encoding", default="gpt2",
+                    help="tiktoken encoding name (default: gpt2, same vocab as this "
+                         "project's vocab.json/merges.txt)")
     ap.add_argument("--svg", metavar="PATH", help="Also write a MB/s bar chart SVG")
     ap.add_argument("--sweep", action="store_true",
                     help="Input-size sweep: cut prefixes of increasing size from a "
@@ -442,7 +504,11 @@ def main():
                     help=f"HuggingFace tokenizer.json (default: {TOKENIZER_JSON})")
     args = ap.parse_args()
     TOKENIZER, MERGES, TOKENIZER_JSON = args.tokenizer, args.merges, args.tokenizer_json
-    if not args.hf_only and not os.path.isfile(TOKENIZER):
+    only_flags = [args.parabix_only, args.hf_only, args.tiktoken_only]
+    if sum(only_flags) > 1:
+        print("Error: --parabix-only / --hf-only / --tiktoken-only are mutually exclusive.")
+        sys.exit(1)
+    if not (args.hf_only or args.tiktoken_only) and not os.path.isfile(TOKENIZER):
         print(f"Error: tokenizer binary not found: {TOKENIZER}")
         sys.exit(1)
     parabix_extra = shlex.split(args.parabix_args)
@@ -507,20 +573,30 @@ def main():
         print("No corpus files found.")
         sys.exit(1)
 
+    want_parabix  = not (args.hf_only or args.tiktoken_only)
+    want_hf       = not (args.parabix_only or args.tiktoken_only)
+    want_tiktoken = args.tiktoken_only or not (args.parabix_only or args.hf_only or args.no_tiktoken)
+
     tok = None
-    if not args.parabix_only:
+    if want_hf:
         if not os.path.isfile(TOKENIZER_JSON):
             print(f"Error: tokenizer.json not found at {TOKENIZER_JSON}")
             sys.exit(1)
         tok = Tokenizer.from_file(TOKENIZER_JSON)
 
+    tiktoken_enc = None
+    if want_tiktoken:
+        tiktoken_enc = tiktoken.get_encoding(args.tiktoken_encoding)
+
     rows = []
     with open(OUTPUT_FILE, "w", encoding="utf-8") as fh:
         out = Tee(fh)
         out.write(SEP + "\n")
-        out.write("Parabix vs HuggingFace — BPE throughput benchmark\n")
+        out.write("Parabix vs HuggingFace vs tiktoken — BPE throughput benchmark\n")
         out.write(f"Binary: {TOKENIZER}\n")
         out.write(f"Merges: {MERGES}\n")
+        if tiktoken_enc is not None:
+            out.write(f"tiktoken encoding: {args.tiktoken_encoding}\n")
         out.write(f"Iters:  {args.iters} (per side, warm; +1 discarded warm-up)")
         if not args.no_adaptive_iters:
             out.write(f", scaled down above {ITER_SCALE_THRESHOLD >> 20} MB "
@@ -530,14 +606,16 @@ def main():
         for path in files:
             it = iters_for(os.path.getsize(path), args.iters,
                            adaptive=not args.no_adaptive_iters)
-            p = None if args.hf_only else run_parabix(path, it, parabix_extra)
-            h = None
-            if not args.parabix_only:
+            p = run_parabix(path, it, parabix_extra) if want_parabix else None
+            text = None
+            if want_hf or want_tiktoken:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     text = f.read()
-                h = run_hf(tok, text, it)
-            write_row(out, os.path.basename(path), p, h)
-            rows.append((path, p, h))
+            h = run_hf(tok, text, it) if want_hf else None
+            t = run_tiktoken(tiktoken_enc, text, it) if want_tiktoken else None
+            results = {"Parabix": p, "HF": h, "tiktoken": t}
+            write_row(out, os.path.basename(path), results)
+            rows.append((path, results))
 
         write_marginal(out, rows)
 
@@ -545,8 +623,9 @@ def main():
         out.write("Note: Parabix numbers come from --bench-loop (pipeline built once,\n")
         out.write("      excludes process spawn + merges load + JIT + file I/O — input\n")
         out.write("      is mmap'd once and reused, matching HF's in-memory encode).\n")
-        out.write("      Peak MB/s is best-iteration; marginal MB/s removes the fixed\n")
-        out.write("      per-call floor (see --sweep).\n")
+        out.write("      HF and tiktoken via preloaded in-process encode() loops (model/\n")
+        out.write("      encoding load excluded). Peak MB/s is best-iteration; marginal\n")
+        out.write("      MB/s removes the fixed per-call floor (see --sweep).\n")
         out.write(SEP + "\n")
 
     if args.svg:

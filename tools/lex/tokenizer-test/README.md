@@ -64,7 +64,7 @@ with `--hf-only`).
 ```bash
 python compare_bpe.py --no-timing --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
 python bench_bpe.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer \
-    --parabix-args="--pretokenizer=bytelevel --level-partition"
+    --parabix-args="--pretokenizer=bytelevel --partition=level"
 python compare_pretokenizers.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
 ```
 
@@ -336,14 +336,14 @@ Three things it does that repeating `bench_bpe.py` cannot:
   faster-but-wrong config is not a win.
 
 ```bash
-# default pair: no flags vs --level-partition, on val_2MB
+# default pair: no flags vs --partition=level, on val_2MB
 python bench_configs.py
 
 # explicit configs — NAME=FLAGS, first one is the speedup baseline
 python bench_configs.py \
     --config 'baseline=' \
-    --config 'level=--level-partition' \
-    --config 'level+compact=--level-partition --compact-base=40'
+    --config 'level=--partition=level' \
+    --config 'level+compact=--partition=level --compact-base=40'
 
 # floor / marginal split + output-identity check
 python bench_configs.py --input ../tokenizer_files/val_4MB.txt \
@@ -382,12 +382,12 @@ python3 bench_configs.py \
     --input ../tokenizer_files/val_8MB.txt \
     --sizes 0.25,1,2,4,7.5 \
     --config 'baseline=' \
-    --config 'level=--level-partition' \
-    --config 'level+compact=--level-partition --geometric-compaction --compact-base=15' \
+    --config 'level=--partition=level' \
+    --config 'level+compact=--partition=level --geometric-compaction --compact-base=15' \
     --verify
 ```
 
-Read the floor/marginal table, not the per-size MB/s. `--level-partition` cuts
+Read the floor/marginal table, not the per-size MB/s. `--partition=level` cuts
 kernel count, so it moves the **floor** roughly in proportion; compaction shrinks
 the stream every kernel scans, so it moves the **marginal MB/s**. A flag that
 moves neither is doing nothing. `floor @ largest` says how much of the biggest
@@ -411,7 +411,7 @@ it needs neither HuggingFace nor `vocab.json`.
 
 ```bash
 python selfmerge_test.py --tokenizer ../../../build22/bin/tokenizer
-python selfmerge_test.py --config 'mine=--level-partition --compact-base=2' --keep /tmp/sm
+python selfmerge_test.py --config 'mine=--partition=level --compact-base=2' --keep /tmp/sm
 ```
 
 Each `--config NAME=FLAGS` is one tokenizer run (the default is a built-in set of merge
@@ -432,7 +432,7 @@ The binary's CLI is documented once, in the parent
 - **[BPE optimization parameters](../README.md#bpe-optimization-parameters)** —
   `--compact-base`, `--geometric-compaction`, `--if-group-lower-limit`,
   `--if-group-count`, `--if-group-size`, `--lookahead-in-gate`,
-  `--lookahead-in-group`, `--level-partition`, `--indexed-shift`, each with its
+  `--lookahead-in-group`, `--partition=level`, `--indexed-shift`, each with its
   objcache-name tag. All default OFF. Sweep them against HF via
   `bench_bpe.py --parabix-args`, or against each other via
   [`bench_configs.py --config`](#5-bench_configspy); the parent's

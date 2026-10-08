@@ -180,30 +180,39 @@ void NFC_U8_logic(PipelineBuilder & P, StreamSet * ExpansionMask, StreamSet * U8
     StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
     FilterByMask(P, FinalSelectionMask, TranslatedBasis, TransformedBasis);
 
-    UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(getPropertyObject(UCD::ccc));
-    StreamSet * const CCC_Basis = P.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
-    P.CreateKernelCall<UnicodePropertyBasis>(enumObj, TransformedBasis, CCC_Basis);
-    SHOW_BIXNUM(CCC_Basis);
+    // Canonical ordering is a sort of runs of nonzero ccc characters.  Sort
+    // in the 21-bit representation, one position per character, so that the
+    // sort never separates the bytes of a UTF-8 sequence.
+    StreamSet * const U21_u8indexed = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(TransformedBasis, U21_u8indexed);
+    SHOW_BIXNUM(U21_u8indexed);
 
     StreamSet * const u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(TransformedBasis, u8index);
     SHOW_STREAM(u8index);
 
-    StreamSet * const CCC_Spans = P.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
-    P.CreateKernelCall<U8Spans>(CCC_Basis, u8index, CCC_Spans);
-    SHOW_BIXNUM(CCC_Spans);
+    StreamSet * const U21_Basis = P.CreateStreamSet(21, 1);
+    FilterByMask(P, u8index, U21_u8indexed, U21_Basis);
+    SHOW_BIXNUM(U21_Basis);
+
+    UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(getPropertyObject(UCD::ccc));
+    StreamSet * const CCC_Basis = P.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
+    P.CreateKernelCall<UnicodePropertyBasis>(enumObj, U21_Basis, CCC_Basis);
+    SHOW_BIXNUM(CCC_Basis);
 
     StreamSet * const CCC_NonZero = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Spans, 0, CCC_NonZero);
+    P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
     SHOW_STREAM(CCC_NonZero);
 
-    StreamSets ToSort = {CCC_Spans, TransformedBasis};
+    StreamSet * const Sorted_U21 = P.CreateStreamSet(21, 1);
+    SortRuns(P, CCC_NonZero, CCC_Basis, U21_Basis, Sorted_U21);
+    SHOW_BIXNUM(Sorted_U21);
 
-    StreamSets SortResults = BitonicSortRuns(P, 32, CCC_NonZero, ToSort);
-    SHOW_BIXNUM(SortResults[0]);
-    SHOW_BIXNUM(SortResults[1]);
+    StreamSet * const SortedBasis = P.CreateStreamSet(8, 1);
+    U21_to_UTF8(P, Sorted_U21, SortedBasis);
+    SHOW_BIXNUM(SortedBasis);
 
-    P.CreateKernelCall<P2SKernel>(SortResults[1], TransformedBytes);
+    P.CreateKernelCall<P2SKernel>(SortedBasis, TransformedBytes);
     SHOW_BYTES(TransformedBytes);
 }
 
@@ -350,9 +359,12 @@ void final_stage_logic(PipelineBuilder & P, StreamSet * ByteStream, StreamSet * 
 
     StreamSet * const FinalWorkPlacementMask = P.CreateStreamSet(1, 1);
     FilterByMask(P, FinalWorkSelectionMask, ExpandedWorkMask, FinalWorkPlacementMask);
+    SHOW_STREAM(FinalWorkPlacementMask);
+    SHOW_BYTES(NonModifiedBytes);
 
     StreamSet * OutputBytes = P.CreateStreamSet(1, 8);
     MergeByMask(P, FinalWorkPlacementMask, TransformedBytes, NonModifiedBytes, OutputBytes);
+    SHOW_BYTES(OutputBytes);
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
 }
 

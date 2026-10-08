@@ -14,3 +14,24 @@ DEPS
     re.transforms
     re.unicode
 )
+
+parabix_add_executable(
+NAME
+    tconv
+SRC
+    tconv.cpp
+DEPS
+    ldml.transforms
+    pablo.compiler
+    pablo.bixnum
+    kernel.basis
+    kernel.bitwise
+    kernel.io
+    kernel.pipeline
+    kernel.streamutils
+    kernel.unicode
+    kernel.unicode.normalization
+    re.cc
+    re.unicode
+    toolchain
+)

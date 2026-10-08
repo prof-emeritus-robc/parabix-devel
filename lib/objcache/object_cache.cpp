@@ -77,6 +77,58 @@ inline bool isNonMatchingSignature(const MDString * const received, const String
     return expected.compare(received->getString()) != 0;
 }
 
+// Each .kernel file records the --optimization-level and --backend-optimization-level
+// its object was compiled at, as a single node holding the two levels as integers.
+// The levels are not part of the cache key: one entry per kernel is kept, and it is
+// replaced only when a run asks for a higher level than the entry was compiled at.
+const static auto OPT_LEVELS = "parabix.opt-levels";
+
+using OptLevels = std::pair<unsigned, unsigned>;
+
+static OptLevels requestedOptLevels() {
+    return OptLevels{static_cast<unsigned>(codegen::OptLevel), static_cast<unsigned>(codegen::BackEndOptLevel)};
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief readOptLevels
+ *
+ * Entries written before the levels were recorded have no node. They are read as none/none,
+ * so any run that requests a higher level recompiles and replaces them.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static OptLevels readOptLevels(const Module * const M) {
+    OptLevels levels{static_cast<unsigned>(CodeGenOptLevel::None), static_cast<unsigned>(CodeGenOptLevel::None)};
+    const NamedMDNode * const md = M->getNamedMetadata(OPT_LEVELS);
+    if (md && md->getNumOperands() == 1 && md->getOperand(0)->getNumOperands() == 2) {
+        const MDNode * const node = md->getOperand(0);
+        const auto front = mdconst::dyn_extract<ConstantInt>(node->getOperand(0));
+        const auto back = mdconst::dyn_extract<ConstantInt>(node->getOperand(1));
+        if (front && back) {
+            levels = OptLevels{static_cast<unsigned>(front->getZExtValue()), static_cast<unsigned>(back->getZExtValue())};
+        }
+    }
+    return levels;
+}
+
+static void writeOptLevels(Module * const M, const OptLevels levels) {
+    LLVMContext & C = M->getContext();
+    IntegerType * const int32Ty = Type::getInt32Ty(C);
+    Metadata * const ops[2] = {ConstantAsMetadata::get(ConstantInt::get(int32Ty, levels.first)),
+                               ConstantAsMetadata::get(ConstantInt::get(int32Ty, levels.second))};
+    NamedMDNode * const md = M->getOrInsertNamedMetadata(OPT_LEVELS);
+    md->clearOperands();
+    md->addOperand(MDNode::get(C, ops));
+}
+
+static const char * optLevelName(const unsigned level) {
+    switch (static_cast<CodeGenOptLevel>(level)) {
+        case CodeGenOptLevel::None: return "none";
+        case CodeGenOptLevel::Less: return "less";
+        case CodeGenOptLevel::Default: return "standard";
+        case CodeGenOptLevel::Aggressive: return "aggressive";
+    }
+    return "unknown";
+}
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedObjectFile
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -87,10 +139,9 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
 
     std::lock_guard<std::mutex> L(mCacheMutex);
 
-    if (LLVM_UNLIKELY(codegen::ObjectCacheForceUpdate)) {
+    if (LLVM_UNLIKELY(codegen::UpdateObjectCache)) {
         if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-            errs() << "Forcing recompilation (--update-object-cache, or --optimization-level"
-                      "/--backend-optimization-level set): " << kernel->makeCacheName(builder)
+            errs() << "Forcing recompilation (--update-object-cache): " << kernel->makeCacheName(builder)
                    << KERNEL_FILE_EXTENSION << "\n";
         }
         return LoadResult{nullptr, nullptr};
@@ -120,6 +171,19 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
                     return LoadResult{nullptr, nullptr};
                 }
             }
+            // An entry compiled at the requested levels or higher (in both the front end
+            // and the back end) is used as is. Otherwise the kernel is recompiled at the
+            // requested levels and saveCachedObjectFile replaces the entry.
+            const auto cachedLevels = readOptLevels(H.get());
+            const auto requested = requestedOptLevels();
+            if (LLVM_UNLIKELY(cachedLevels.first < requested.first || cachedLevels.second < requested.second)) {
+                if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+                    errs() << "Recompiling at a higher optimization level: " << moduleId << KERNEL_FILE_EXTENSION
+                           << " (cached " << optLevelName(cachedLevels.first) << "/" << optLevelName(cachedLevels.second)
+                           << ", requested " << optLevelName(requested.first) << "/" << optLevelName(requested.second) << ")\n";
+                }
+                return LoadResult{nullptr, nullptr};
+            }
             sys::path::replace_extension(fileName, OBJECT_FILE_EXTENSION);
             auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), false, false, false);
             if (LLVM_LIKELY(objectBuffer)) {
@@ -134,7 +198,8 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
                 fs::last_write_time(fileName.c_str(), access_time);
 
                 if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-                    errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
+                    errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION
+                           << " (" << optLevelName(cachedLevels.first) << "/" << optLevelName(cachedLevels.second) << ")\n";
                 }
 
                 return std::make_pair(std::move(obj), std::move(H));
@@ -229,13 +294,16 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
             md->addOperand(og.getOperand(i));
         }
     }
+    writeOptLevels(H.get(), requestedOptLevels());
 
     writeCacheFileAtomically(objectName, [&](raw_fd_ostream & out) {
         WriteBitcodeToFile(*H, out);
     });
 
     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-        errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
+        const auto levels = requestedOptLevels();
+        errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION
+               << " (" << optLevelName(levels.first) << "/" << optLevelName(levels.second) << ")\n";
     }
 }
 

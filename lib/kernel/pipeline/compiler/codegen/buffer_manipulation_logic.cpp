@@ -609,8 +609,11 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
             BasicBlock * const maskLoop = b.CreateBasicBlock(prefix + "_zeroUnwrittenLoop", mKernelLoopExit);
             BasicBlock * const maskExit = b.CreateBasicBlock(prefix + "_zeroUnwrittenExit", mKernelLoopExit);
 
+            // When the block is partially written, the pack at packIndex is masked (and cleared entirely
+            // if the produced item count is pack-aligned) and the remaining packs of the block are cleared.
+            Value * const isPartialBlock = b.CreateICmpNE(blockOffset, sz_ZERO);
             BasicBlock * const entry = b.GetInsertBlock();
-            b.CreateCondBr(b.CreateICmpNE(maskOffset, sz_ZERO), maskLoop, maskExit);
+            b.CreateCondBr(isPartialBlock, maskLoop, maskExit);
 
             b.SetInsertPoint(maskLoop);
             PHINode * const streamIndexPhi = b.CreatePHI(b.getSizeTy(), 2, "streamIndex");
@@ -630,29 +633,29 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
             Value * const maskedValue = b.CreateAnd(value, mask);
             b.CreateBlockAlignedStore(maskedValue, inputPtr);
 
+            if (itemWidth > 1) {
+                // Since packs are laid out sequentially in memory, it will hopefully be cheaper to zero them out here
+                // because they may be within the same cache line.
+                Value * const nextPackIndex = b.CreateAdd(packIndex, ONE);
+                Value * const start = buffer->getStreamPackPtr(b, baseAddress, streamIndexPhi, blockIndex, nextPackIndex);
+                Value * const startInt = b.CreatePtrToInt(start, intPtrTy);
+                Value * const end = buffer->getStreamPackPtr(b, baseAddress, streamIndexPhi, blockIndex, ITEM_WIDTH);
+                Value * const endInt = b.CreatePtrToInt(end, intPtrTy);
+                Value * const remainingPackBytes = b.CreateSub(endInt, startInt);
+                #ifdef PRINT_DEBUG_MESSAGES
+                #ifndef PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY
+                debugPrint(b, prefix + "_zeroUnwritten_clearRange = [0x%" PRIx64 ",0x%" PRIx64 ")", startInt, endInt);
+                #endif
+                debugPrint(b, prefix + "_zeroUnwritten_remainingBufferBytes = %" PRIu64, remainingPackBytes);
+                #endif
+                b.CreateMemZero(start, remainingPackBytes, blockWidth / 8);
+            }
+
             const auto isUnary = isa<ConstantInt>(numOfStreams) && cast<ConstantInt>(numOfStreams)->isOne();
 
             if (isUnary) {
                 b.CreateBr(maskExit);
             } else {
-
-                if (itemWidth > 1) {
-                    // Since packs are laid out sequentially in memory, it will hopefully be cheaper to zero them out here
-                    // because they may be within the same cache line.
-                    Value * const nextPackIndex = b.CreateAdd(packIndex, ONE);
-                    Value * const start = buffer->getStreamPackPtr(b, baseAddress, streamIndexPhi, blockIndex, nextPackIndex);
-                    Value * const startInt = b.CreatePtrToInt(start, intPtrTy);
-                    Value * const end = buffer->getStreamPackPtr(b, baseAddress, streamIndexPhi, blockIndex, ITEM_WIDTH);
-                    Value * const endInt = b.CreatePtrToInt(end, intPtrTy);
-                    Value * const remainingPackBytes = b.CreateSub(endInt, startInt);
-                    #ifdef PRINT_DEBUG_MESSAGES
-                    #ifndef PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY
-                    debugPrint(b, prefix + "_zeroUnwritten_clearRange = [0x%" PRIx64 ",0x%" PRIx64 ")", startInt, endInt);
-                    #endif
-                    debugPrint(b, prefix + "_zeroUnwritten_remainingBufferBytes = %" PRIu64, remainingPackBytes);
-                    #endif
-                    b.CreateMemZero(start, remainingPackBytes, blockWidth / 8);
-                }
 
                 Value * const nextStreamIndex = b.CreateAdd(streamIndexPhi, ONE);
                 streamIndexPhi->addIncoming(nextStreamIndex, b.GetInsertBlock());
@@ -691,7 +694,6 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
     //            }  else {
                     // If the produced item count is block-aligned, the block at blockIndex is entirely
                     // unwritten and was not masked above, so it must be cleared as well.
-                    Value * const isPartialBlock = b.CreateICmpNE(blockOffset, sz_ZERO);
                     Value * const nextBlockIndex = b.CreateAdd(blockIndex, b.CreateZExt(isPartialBlock, b.getSizeTy()));
                     Value * const nextOffset = buffer->modByCapacity(b, nextBlockIndex);
                     Value * const startPtr = buffer->StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, nextOffset);

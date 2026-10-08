@@ -44,6 +44,13 @@ add_test(NAME provisional_lookahead_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/provisional_lookahead_test.py ${TEST_BIN_DIR}/provisional_lookahead)
 
+# Clearing of a wide stream's output past its final produced item, checked with a reference
+parabix_add_executable(NAME unwritten_wide_output SRC unwritten_wide_output.cpp
+                       DEPS kernel.io kernel.pipeline toolchain)
+add_test(NAME unwritten_wide_output_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/unwritten_wide_output_test.py ${TEST_BIN_DIR}/unwritten_wide_output)
+
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

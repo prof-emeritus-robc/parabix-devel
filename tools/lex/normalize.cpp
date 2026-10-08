@@ -592,7 +592,7 @@ static StreamSet * applyNFC(PipelineBuilder & P, StreamSet * U21_focus) {
     // UnicodePropertyBasis gives us the CCC as a multi-bit stream.
     // U8Spans extends CCC values from the last byte to the full span
     // of each UTF-8 character.
-    // BitonicSortRuns sorts runs of non-zero CCC positions.
+    // OddEvenMergeSortRuns sorts runs of non-zero CCC positions.
     UCD::EnumeratedPropertyObject * enumObj =
         llvm::cast<UCD::EnumeratedPropertyObject>(
             UCD::getPropertyObject(UCD::ccc));
@@ -611,7 +611,7 @@ static StreamSet * applyNFC(PipelineBuilder & P, StreamSet * U21_focus) {
     P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Spans, 0, CCC_NonZero);
 
     StreamSets ToSort = {CCC_Spans, ComposedBasis};
-    StreamSets SortResult = BitonicSortRuns(P, 32, CCC_NonZero, ToSort);
+    StreamSets SortResult = OddEvenMergeSortRuns(P, 32, CCC_NonZero, ToSort);
     // SortResult[1] is the CCC-sorted BasisBits (8×1) — same format
     // as ComposedBasis.
 

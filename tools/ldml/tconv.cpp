@@ -271,29 +271,26 @@ static void NFC_U8_logic(PipelineBuilder & P, StreamSet * ExpansionMask, StreamS
     StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
     FilterByMask(P, FinalSelectionMask, TranslatedBasis, TransformedBasis);
 
+    // Canonical ordering is a sort of runs of nonzero ccc characters.  Sort
+    // in the 21-bit representation, one position per character, so that the
+    // sort never separates the bytes of a UTF-8 sequence.
+    StreamSet * const U21_Basis = U21_Of(P, TransformedBasis);
+
     UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
     StreamSet * const CCC_Basis = P.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
-    P.CreateKernelCall<UnicodePropertyBasis>(enumObj, TransformedBasis, CCC_Basis);
+    P.CreateKernelCall<UnicodePropertyBasis>(enumObj, U21_Basis, CCC_Basis);
     SHOW_BIXNUM(CCC_Basis);
 
-    StreamSet * const u8index = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UTF8_index>(TransformedBasis, u8index);
-    SHOW_STREAM(u8index);
-
-    StreamSet * const CCC_Spans = P.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
-    P.CreateKernelCall<U8Spans>(CCC_Basis, u8index, CCC_Spans);
-    SHOW_BIXNUM(CCC_Spans);
-
     StreamSet * const CCC_NonZero = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Spans, 0, CCC_NonZero);
+    P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
     SHOW_STREAM(CCC_NonZero);
 
-    StreamSets ToSort = {CCC_Spans, TransformedBasis};
-    StreamSets SortResults = BitonicSortRuns(P, 32, CCC_NonZero, ToSort);
+    StreamSets ToSort = {CCC_Basis, U21_Basis};
+    StreamSets SortResults = OddEvenMergeSortRuns(P, 64, CCC_NonZero, ToSort);
     SHOW_BIXNUM(SortResults[0]);
     SHOW_BIXNUM(SortResults[1]);
 
-    P.CreateKernelCall<P2SKernel>(SortResults[1], TransformedBytes);
+    P.CreateKernelCall<P2SKernel>(UTF8_Of(P, SortResults[1]), TransformedBytes);
     SHOW_BYTES(TransformedBytes);
 }
 

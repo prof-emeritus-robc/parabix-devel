@@ -587,7 +587,7 @@ StreamSet * NFD_PipelineBuilder::NFD_U21_Pipeline(StreamSet * U21_Basis) {
 
     StreamSets ToSort = {CCC_Basis, NFD_Basis};
 
-    StreamSets SortResults = BitonicSortRuns(mPB, 8, CCC_NonZero, ToSort);
+    StreamSets SortResults = OddEvenMergeSortRuns(mPB, 8, CCC_NonZero, ToSort);
     SHOW_BIXNUM(SortResults[0]);
     SHOW_BIXNUM(SortResults[1]);
 
@@ -636,7 +636,7 @@ StreamSet * NFD_PipelineBuilder::NFKD_U21_Pipeline(StreamSet * U21_Basis) {
 
     StreamSets ToSort = {CCC_Basis, NFD_Basis};
 
-    StreamSets SortResults = BitonicSortRuns(mPB, 8, CCC_NonZero, ToSort);
+    StreamSets SortResults = OddEvenMergeSortRuns(mPB, 8, CCC_NonZero, ToSort);
     SHOW_BIXNUM(SortResults[0]);
     SHOW_BIXNUM(SortResults[1]);
 

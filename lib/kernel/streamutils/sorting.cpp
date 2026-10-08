@@ -111,56 +111,20 @@ void AdjustRunsAndIndexes::generatePabloMethod() {
     writeOutputStreamSet("AdjustedIndex", AdjustedIndex);
 }
 
-BitonicCompareStep::BitonicCompareStep(LLVMTypeSystemInterface & ts, unsigned distance, unsigned region_size,
-                                       StreamSet * Runs, StreamSet * SeqIndex, StreamSet * Basis, StreamSet * SwapMarks)
-: PabloKernel(ts, "BitonicCompareStep<" + std::to_string(region_size) + "," + std::to_string(distance) + ">" +
-              SeqIndex->shapeString() + "_" + Basis->shapeString(),
-// inputs
-{Binding{"Runs", Runs}, Binding{"SeqIndex", SeqIndex}, Binding{"Basis", Basis}},
-// output
-{Binding{"SwapMarks", SwapMarks}}), mCompareDistance(distance), mRegionSize(region_size) {
-}
-
-void BitonicCompareStep::generatePabloMethod() {
-    PabloBuilder pb(getEntryScope());
-    PabloAST * Runs = getInputStreamSet("Runs")[0];
-    BixNum SeqIndex = getInputStreamSet("SeqIndex");
-    BixNum Basis = getInputStreamSet("Basis");
-    auto advance_amt = pb.getInteger(mCompareDistance);
-    Var * SwapVar = pb.createVar("SwapVar", pb.createZeroes());
-    // Bitonic swapping:
-    // At step N (N = 0, 1, ...):
-    // Comparison distance is mCompareDistance = 1 << N.
-    // Input is divided into groups of size 1 << (N + 2) (group size 4, for N = 0).
-    // Each input group is split into 2 subgroups of size (1 << (N + 1)) (size 2 for N = 0)
-    BixNumCompiler bnc(pb);
-    BixNum Forward_Basis(Basis.size());
-    for (unsigned i = 0; i < Basis.size(); i++) {
-        Forward_Basis[i] = pb.createAdvance(Basis[i], advance_amt, "Fwd_basis" + std::to_string(i));
-    }
-    // Identify the separate regions.
-    unsigned bit_identifying_hi_region = ceil_log2(mRegionSize);
-    PabloAST * descending_regions = pb.createZeroes();
-    if (SeqIndex.size() > bit_identifying_hi_region) {
-        descending_regions = SeqIndex[bit_identifying_hi_region];
-    }
-    unsigned bit_identifying_subgroup_hi_elements = ceil_log2(mCompareDistance);
-    PabloAST * hi_elements_in_comparisons = SeqIndex[bit_identifying_subgroup_hi_elements];
-    PabloAST * gt_forward = bnc.UGT(Forward_Basis, Basis, "gt_forward");
-    PabloAST * compare = pb.createXor(gt_forward, descending_regions, "compare");
-    // Negation of > is <=, exclude the = case.
-    compare = pb.createAnd(compare, bnc.NEQ(Forward_Basis, Basis), "compare3");
-    PabloAST * swap_mark = pb.createAnd(compare, hi_elements_in_comparisons);
-    PabloAST * consecutiveRuns = Runs;
-    for (unsigned i = 1; i < mCompareDistance; i*=2) {
-        consecutiveRuns = pb.createAnd(consecutiveRuns, pb.createAdvance(consecutiveRuns, i));
-    }
-    swap_mark = pb.createAnd(swap_mark, consecutiveRuns);
-    pb.createAssign(SwapVar, swap_mark);
-    pb.createAssign(pb.createExtract(getOutputStreamVar("SwapMarks"), pb.getInteger(0)), SwapVar);
-}
-
-
+//
+//  The bitonic network sorts the blocks of each level alternately ascending and
+//  descending.  A run shorter than its power-of-2 block occupies the top indexes
+//  of the block, and the last chunk of a run longer than the instance size
+//  occupies the bottom indexes of its instance; either way, comparisons with the
+//  missing items are omitted, which is correct only for ascending comparisons
+//  (missing items at the front act as minimal keys, at the back as maximal keys).
+//  Any merge only needs the two blocks of a pair to be sorted in opposite
+//  directions, so the direction of a block at level k is taken as bit k of the
+//  index XOR bit k of a boundary b: the index of the first item of a short run,
+//  or the number of items in the last chunk of a long run (0 elsewhere).  Then
+//  every block containing both items and missing items contains index b and is
+//  sorted ascending.
+//
 SwapBack_N::SwapBack_N(LLVMTypeSystemInterface & ts, unsigned n, StreamSet * SwapMarks, StreamSet * Source, StreamSet * Swapped)
 : PabloKernel(ts, "SwapBack" + std::to_string(n) + "_" + Source->shapeString(),
 // inputs
@@ -261,7 +225,58 @@ void RunTails::generatePabloMethod() {
     pb.createAssign(pb.createExtract(getOutputStreamVar("Tails"), pb.getInteger(0)), tailVar);
 }
 
-StreamSets  BitonicSortRuns(PipelineBuilder & P, unsigned instance_size, StreamSet * Runs, StreamSets & ToSort) {
+OddEvenCompareStep::OddEvenCompareStep(LLVMTypeSystemInterface & ts, unsigned distance, unsigned block_size,
+                                       StreamSet * Runs, StreamSet * SeqIndex, StreamSet * Basis, StreamSet * SwapMarks)
+: PabloKernel(ts, "OddEvenCompareStep<" + std::to_string(block_size) + "," + std::to_string(distance) + ">" +
+              SeqIndex->shapeString() + "_" + Basis->shapeString(),
+// inputs
+{Binding{"Runs", Runs}, Binding{"SeqIndex", SeqIndex}, Binding{"Basis", Basis}},
+// output
+{Binding{"SwapMarks", SwapMarks}}), mCompareDistance(distance), mBlockSize(block_size) {
+}
+
+void OddEvenCompareStep::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * Runs = getInputStreamSet("Runs")[0];
+    BixNum SeqIndex = getInputStreamSet("SeqIndex");
+    BixNum Basis = getInputStreamSet("Basis");
+    BixNumCompiler bnc(pb);
+    // Swap marks are placed at the higher item y of each compared pair (x, y),
+    // x = y - k, where k is the compare distance.
+    BixNum Forward_Basis(Basis.size());
+    for (unsigned i = 0; i < Basis.size(); i++) {
+        Forward_Basis[i] = pb.createAdvance(Basis[i], mCompareDistance, "Fwd_basis" + std::to_string(i));
+    }
+    // In merging blocks of size p into blocks of size 2p, Batcher's network compares
+    // x and x + k when k = p and bit log2(k) of x is 0, or when k < p, bit log2(k)
+    // of x is 1 and x + k is in the same 2p block as x.  In terms of y = x + k:
+    // for k = p, bit log2(k) of y is 1; for k < p, bit log2(k) of y is 0 and the bits
+    // log2(k) + 1 through log2(p) of y are not all 0.
+    const unsigned k_bit = ceil_log2(mCompareDistance);
+    PabloAST * compared = nullptr;
+    if (mCompareDistance == mBlockSize) {
+        compared = SeqIndex[k_bit];
+    } else {
+        PabloAST * higher = pb.createZeroes();
+        for (unsigned b = k_bit + 1; b <= ceil_log2(mBlockSize); b++) {
+            higher = pb.createOr(higher, SeqIndex[b]);
+        }
+        compared = pb.createAnd(pb.createNot(SeqIndex[k_bit]), higher);
+    }
+    // Both items, and everything between them, must be in the same run.
+    PabloAST * inRun = Runs;
+    for (unsigned covered = 1; covered <= mCompareDistance; ) {
+        const unsigned shift = std::min(covered, mCompareDistance + 1 - covered);
+        inRun = pb.createAnd(inRun, pb.createAdvance(inRun, shift));
+        covered += shift;
+    }
+    PabloAST * swap_mark = pb.createAnd3(bnc.UGT(Forward_Basis, Basis, "gt_forward"), compared, inRun);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("SwapMarks"), pb.getInteger(0)), swap_mark);
+}
+
+//  Number the positions of each run, find the runs that need sorting, and append the
+//  (adjusted) position index to the sort key, which makes the sort stable.
+static StreamSet * PrepareRunsForSorting(PipelineBuilder & P, unsigned instance_size, StreamSet * Runs, StreamSets & ToSort, StreamSet *& AdjustedIndex) {
     unsigned steps = ceil_log2(instance_size);
     StreamSet * SeqIndex = P.CreateStreamSet(steps);
     P.CreateKernelCall<RunIndex>(Runs, SeqIndex);
@@ -270,62 +285,35 @@ StreamSets  BitonicSortRuns(PipelineBuilder & P, unsigned instance_size, StreamS
     P.CreateKernelCall<Misorder_Check>(Runs, ToSort[0], Misordered);
     SHOW_STREAM(Misordered);
     StreamSet * FilteredRuns = P.CreateStreamSet(1);
-    StreamSet * AdjustedIndex = P.CreateStreamSet(SeqIndex->getNumElements());
+    AdjustedIndex = P.CreateStreamSet(SeqIndex->getNumElements());
     P.CreateKernelCall<AdjustRunsAndIndexes>(Runs, Misordered, SeqIndex, FilteredRuns, AdjustedIndex);
     SHOW_STREAM(FilteredRuns);
     SHOW_BIXNUM(AdjustedIndex);
     StreamSet * SortOrder = P.CreateStreamSet(SeqIndex->getNumElements() + ToSort[0]->getNumElements());
     P.CreateKernelCall<AppendStreamSets>(ToSort[0], AdjustedIndex, SortOrder);
     ToSort[0] = SortOrder;
-    return BitonicSort(P, instance_size, FilteredRuns, AdjustedIndex, ToSort);
+    return FilteredRuns;
 }
 
-StreamSets BitonicSort(PipelineBuilder & P, unsigned instance_size, StreamSet * Runs, StreamSet * SeqIndex, StreamSets & ToSort) {
-    unsigned region_size = instance_size/2;
-    unsigned compare_distance = region_size/2;
-
-    StreamSets PartiallySorted;
-    if (compare_distance > 1) {
-        PartiallySorted = BitonicSort(P, region_size, Runs, SeqIndex, ToSort);
-    } else {
-        PartiallySorted = ToSort;
+StreamSets OddEvenMergeSortRuns(PipelineBuilder & P, unsigned instance_size, StreamSet * Runs, StreamSets & ToSort) {
+    StreamSet * SeqIndex = nullptr;
+    StreamSet * FilteredRuns = PrepareRunsForSorting(P, instance_size, Runs, ToSort, SeqIndex);
+    // A run shorter than its instance occupies the top indexes of a power-of-2 block,
+    // so missing items act as minimal keys at the front, which every (ascending)
+    // comparison leaves in place.  Comparisons with them are simply omitted.
+    StreamSets Sorted = ToSort;
+    for (unsigned p = 1; p < instance_size; p *= 2) {
+        for (unsigned k = p; k >= 1; k /= 2) {
+            StreamSet * SwapMarks = P.CreateStreamSet(1, 1);
+            P.CreateKernelCall<OddEvenCompareStep>(k, p, FilteredRuns, SeqIndex, Sorted[0], SwapMarks);
+            SHOW_STREAM(SwapMarks);
+            for (unsigned i = 0; i < Sorted.size(); i++) {
+                StreamSet * Swapped = P.CreateStreamSet(Sorted[i]->getNumElements(), 1);
+                P.CreateKernelCall<SwapBack_N>(k, SwapMarks, Sorted[i], Swapped);
+                SHOW_BIXNUM(Swapped);
+                Sorted[i] = Swapped;
+            }
+        }
     }
-
-    //StreamSet * Debug = P.CreateStreamSet(1, 1);
-    StreamSet * SwapMarks = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<BitonicCompareStep>(compare_distance, region_size, Runs, SeqIndex, PartiallySorted[0], SwapMarks);
-    //SHOW_STREAM(Debug);
-    SHOW_STREAM(SwapMarks);
-
-    StreamSets Sorted(ToSort.size());
-    for (unsigned i = 0; i < ToSort.size(); i++) {
-        Sorted[i] = P.CreateStreamSet(ToSort[i]->getNumElements(), 1);
-        P.CreateKernelCall<SwapBack_N>(compare_distance, SwapMarks, PartiallySorted[i], Sorted[i]);
-        SHOW_BIXNUM(Sorted[i]);
-    }
-
-    if (instance_size <=2 ) {
-        return Sorted;
-    } else {
-        return BitonicMerge(P, instance_size, instance_size, Runs, SeqIndex, Sorted);
-    }
-}
-
-StreamSets BitonicMerge(PipelineBuilder & P, unsigned region_size, unsigned instance_size, StreamSet * Runs, StreamSet * RunIndex, StreamSets & ToMerge) {
-    
-    StreamSet * MergeSwapMarks = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<BitonicCompareStep>(region_size/2, instance_size, Runs, RunIndex, ToMerge[0], MergeSwapMarks);
-    SHOW_STREAM(MergeSwapMarks);
-
-    StreamSets Merged(ToMerge.size());
-    for (unsigned i = 0; i < ToMerge.size(); i++) {
-        Merged[i] = P.CreateStreamSet(ToMerge[i]->getNumElements(), 1);
-        P.CreateKernelCall<SwapBack_N>(region_size/2, MergeSwapMarks, ToMerge[i], Merged[i]);
-        SHOW_BIXNUM(Merged[i]);
-    }
-    if (region_size <= 2) {
-        return Merged;
-    } else {
-        return BitonicMerge(P, region_size/2, instance_size, Runs, RunIndex, Merged);
-    }
+    return Sorted;
 }

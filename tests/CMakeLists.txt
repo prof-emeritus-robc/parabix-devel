@@ -37,7 +37,7 @@ parabix_add_kernel_test(test_bytefilterandspread kernel.io kernel.streamutils)
 parabix_add_kernel_test(test_emptyprogram kernel.io)
 parabix_add_kernel_test(test_truncatedstreamset kernel.io)
 
-# ProvisionalLookAheadStride: compare provisional and normal processing of a lookahead chain
+# ProvisionalLookAheadStride: compare provisional and normal processing of a lookahead chain with a reference
 parabix_add_executable(NAME provisional_lookahead SRC provisional_lookahead.cpp
                        DEPS pablo.compiler kernel.basis kernel.io kernel.pipeline toolchain)
 add_test(NAME provisional_lookahead_test

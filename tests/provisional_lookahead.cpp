@@ -37,14 +37,18 @@ static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), 
 static cl::list<unsigned> LookAheads("la", cl::desc("Lookahead amount of each kernel in the chain"),
                                      cl::CommaSeparated, cl::cat(testOptions));
 
+static cl::opt<bool> Invert("invert", cl::desc("Complement the output of each chain kernel, so that it is nonzero past the end of input"),
+                            cl::init(false), cl::cat(testOptions));
+
 class LookAheadMixKernel final : public PabloKernel {
 public:
     LookAheadMixKernel(LLVMTypeSystemInterface & ts, StreamSet * const input, StreamSet * const output,
-                       const unsigned lookAhead, const unsigned index)
-    : PabloKernel(ts, "LookAheadMix" + std::to_string(lookAhead) + "_" + std::to_string(index),
+                       const unsigned lookAhead, const unsigned index, const bool invert)
+    : PabloKernel(ts, "LookAheadMix" + std::to_string(lookAhead) + "_" + std::to_string(index) + (invert ? "_inv" : ""),
                   {Binding{"input", input, FixedRate(1), LookAhead(lookAhead)}},
                   {Binding{"output", output}})
-    , mLookAhead(lookAhead) { }
+    , mLookAhead(lookAhead)
+    , mInvert(invert) { }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -56,11 +60,15 @@ protected:
             PabloAST * adv = pb.createAdvance(in[(i + 2) % n], 3);
             PabloAST * star = pb.createMatchStar(in[i], in[(i + 3) % n]);
             PabloAST * out = pb.createXor(pb.createXor(la, adv), star);
+            if (mInvert) {
+                out = pb.createNot(out);
+            }
             pb.createAssign(pb.createExtract(output, pb.getInteger(i)), out);
         }
     }
 private:
     const unsigned mLookAhead;
+    const bool mInvert;
 };
 
 typedef void (*TestFunctionType)(uint32_t fd);
@@ -75,7 +83,7 @@ static TestFunctionType generatePipeline(CPUDriver & driver) {
     unsigned index = 0;
     for (const auto la : LookAheads) {
         StreamSet * const next = P.CreateStreamSet(8, 1);
-        P.CreateKernelCall<LookAheadMixKernel>(basis, next, la, index++);
+        P.CreateKernelCall<LookAheadMixKernel>(basis, next, la, index++, Invert);
         basis = next;
     }
     StreamSet * const result = P.CreateStreamSet(1, 8);

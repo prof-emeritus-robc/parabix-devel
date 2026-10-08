@@ -590,7 +590,8 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
             Value * const blockIndex = b.CreateLShr(produced, LOG_2_BLOCK_WIDTH);
             Constant * const ITEM_WIDTH = b.getSize(itemWidth);
             Value * packIndex = nullptr;
-            Value * maskOffset = b.CreateAnd(produced, BLOCK_MASK);
+            Value * const blockOffset = b.CreateAnd(produced, BLOCK_MASK);
+            Value * maskOffset = blockOffset;
             if (itemWidth > 1) {
                 Value * const position = b.CreateMul(maskOffset, ITEM_WIDTH);
                 packIndex = b.CreateLShr(position, LOG_2_BLOCK_WIDTH);
@@ -688,7 +689,10 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
     //                startPtr = buffer->StreamSetBuffer::getStreamPackPtr(b, baseAddress, sz_ZERO, nextOffset, nextPackIndex);
     //                endPtr = buffer->StreamSetBuffer::getStreamPackPtr(b, baseAddress, sz_ZERO, getEndOffset(nextOffset), ITEM_WIDTH);
     //            }  else {
-                    Value * const nextBlockIndex = b.CreateAdd(blockIndex, ONE);
+                    // If the produced item count is block-aligned, the block at blockIndex is entirely
+                    // unwritten and was not masked above, so it must be cleared as well.
+                    Value * const isPartialBlock = b.CreateICmpNE(blockOffset, sz_ZERO);
+                    Value * const nextBlockIndex = b.CreateAdd(blockIndex, b.CreateZExt(isPartialBlock, b.getSizeTy()));
                     Value * const nextOffset = buffer->modByCapacity(b, nextBlockIndex);
                     Value * const startPtr = buffer->StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, nextOffset);
                     Value * const endPtr = buffer->StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, getEndOffset(nextOffset));

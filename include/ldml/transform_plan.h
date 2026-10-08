@@ -68,4 +68,15 @@ struct TransformPlan {
 // ExtractForwardRules or ExtractReverseBackwardRules).
 TransformPlan planTransform(const std::vector<Rule *> & rules);
 
+// A context (as given for the regular expression engine, see engineContext)
+// rewritten for matching text in which each character c of the map has been
+// followed by insertions[c] positions holding the filler codepoint, to make
+// space for its replacement: each set item matches its characters, each
+// followed by its fillers, and never matches the filler itself.  The filler
+// should be a codepoint that cannot occur in the text (e.g., a surrogate), so
+// that the inserted positions are distinguished from the characters of the
+// text (including U+0000).
+re::RE * expandedContext(re::RE * context, const std::map<UCD::codepoint_t, unsigned> & insertions,
+                         UCD::codepoint_t filler);
+
 }

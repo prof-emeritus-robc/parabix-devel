@@ -47,6 +47,7 @@
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/sorting.h>
+#include <kernel/streamutils/stream_shift.h>
 #include <kernel/unicode/char_replacement.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/normalization/normalization.h>
@@ -514,25 +515,12 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
             a.problems.push_back(std::to_string(dstats.overlapsAfter) + " pairs of rules remain order dependent");
         }
         for (const ldml::TransformStep & step : a.plan.steps) {
-            if (step.kind == ldml::TransformStep::Kind::Transform && a.plan.filter) {
-                a.problems.push_back("transform rule :: " + step.transform.getText() + " within a filtered transform (not yet supported)");
-            }
-            for (const ldml::CharMapSubgroup & sg : step.subgroups) {
-                for (const auto & m : sg.charMap) {
-                    if (m.second.size() != 1) {
-                        char buf[24];
-                        snprintf(buf, sizeof(buf), "U+%04X", static_cast<unsigned>(m.first));
-                        a.problems.push_back(std::string("replacement of ") + buf + " by " + printCodepoints(m.second)
-                                             + " is not a single character (not yet supported)");
-                        break;
-                    }
-                }
-            }
-        }
-        for (const ldml::TransformStep & step : a.plan.steps) {
             if (step.kind != ldml::TransformStep::Kind::Transform) continue;
             const std::string id = step.transform.getText();
             const ldml::TransformEntry * used = mRegistry.lookup(id);
+            if (a.plan.filter) {
+                a.problems.push_back("transform rule :: " + id + " within a filtered transform (not yet supported)");
+            }
             if (used == nullptr) {
                 a.problems.push_back("unknown transform " + id);
             } else if (step.filter) {
@@ -585,8 +573,8 @@ static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysi
 }
 
 //  Pipelines for transforms defined by rules.  For now, the whole text is
-//  transformed in the 21-bit representation of Unicode, and each implementable
-//  conversion rule replaces a single character by a single character.
+//  transformed in the 21-bit representation of Unicode; each implementable
+//  conversion rule replaces a single character by a fixed string.
 //
 //  For each conversion group, each subgroup (the rules with the same contexts)
 //  computes the bits to change at each position: for each of the 21 bits, the
@@ -595,6 +583,30 @@ static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysi
 //  characters of the subgroup, and after-lookahead).  As the rules are
 //  disambiguated, no two subgroups change the same position: their changes are
 //  combined by OR, and applied to the input of the group by XOR.
+
+//  The codepoint marking the positions inserted for replacements, in the stream
+//  used for matching contexts: a surrogate, which cannot occur in decoded UTF-8,
+//  so that the inserted positions are distinguished from U+0000 in the text.
+static constexpr UCD::codepoint_t InsertionFiller = 0xD800;
+
+//  Filled: the 21-bit basis with the filler codepoint at the positions not in
+//  the spread mask (the inserted positions, which hold 0 in the basis).
+class FillInsertedPositions : public pablo::PabloKernel {
+public:
+    FillInsertedPositions(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Basis, StreamSet * Filled)
+    : PabloKernel(ts, "FillInsertedPositions" + std::to_string(InsertionFiller),
+                  {Binding{"SpreadMask", SpreadMask}, Binding{"Basis", Basis}}, {Binding{"Filled", Filled}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
+        std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        for (unsigned b = 0; b < basis.size(); b++) {
+            if ((InsertionFiller >> b) & 1) basis[b] = pb.createOr(basis[b], inserted);
+        }
+        writeOutputStreamSet("Filled", basis);
+    }
+};
 
 class RulePipelineBuilder {
 public:
@@ -605,19 +617,42 @@ public:
 private:
     StreamSet * builtIn(const std::string & name, StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21, const UCD::UnicodeSet * filter);
-    StreamSet * matchPositions(const ldml::CharMapSubgroup & subgroup, const UCD::UnicodeSet & chars, StreamSet * U21);
+    using Insertions = std::map<UCD::codepoint_t, unsigned>;
+    StreamSet * matchPositions(const ldml::CharMapSubgroup & subgroup, const UCD::UnicodeSet & chars,
+                               unsigned nulls, const Insertions & insertions, StreamSet * U21);
+    StreamSet * classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21);
+    StreamSet * combine(StreamSet * a, StreamSet * b, bool isOr);
     PipelineBuilder & mP;
     const ldml::TransformRegistry & mRegistry;
     TransformAnalyzer & mAnalyzer;
     NFD_PipelineBuilder mNFD;
 };
 
+//  The Final_Sigma condition of Unicode full lowercasing (as in el-Lower): Σ
+//  becomes ς when preceded by a cased letter (with case-ignorable characters
+//  between) and not followed by one.
+static const ldml::TransformPlan & finalSigmaPlan() {
+    static const ldml::TransformPlan plan = [] {
+        std::vector<ldml::Rule *> rules = ldml::ExtractForwardRules(ldml::parseTransformRules({
+            "Σ } [:caseignorable:]* [:cased:] → σ ;"
+            "[:cased:] [:caseignorable:]* { Σ → ς ;"}));
+        return ldml::planTransform(ldml::DisambiguateOrder(rules));
+    }();
+    return plan;
+}
+
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
     if (name == "Any-Null") return U21;
     if (name == "Any-NFD") return mNFD.NFD_U21_Pipeline(U21);
     if (name == "Any-NFKD") return mNFD.NFKD_U21_Pipeline(U21);
-    if (name == "Any-Lower") return U21_StringOverridePipeline(P, UCD::lc, U21);
+    if (name == "Any-Lower") {
+        //  Full lowercasing: the Final_Sigma context of Σ, then the lc mapping.
+        for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
+            U21 = conversionGroup(step, U21, nullptr);
+        }
+        return U21_StringOverridePipeline(P, UCD::lc, U21);
+    }
     if (name == "Any-Upper") return U21_StringOverridePipeline(P, UCD::uc, U21);
     if (name == "Any-Title") return U21_StringOverridePipeline(P, UCD::tc, U21);
     if (name == "Any-NFKC") U21 = mNFD.NFKD_U21_Pipeline(U21);
@@ -629,11 +664,19 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
 
-StreamSet * RulePipelineBuilder::matchPositions(const ldml::CharMapSubgroup & subgroup, const UCD::UnicodeSet & chars, StreamSet * U21) {
+StreamSet * RulePipelineBuilder::matchPositions(const ldml::CharMapSubgroup & subgroup, const UCD::UnicodeSet & chars,
+                                                unsigned nulls, const Insertions & insertions, StreamSet * U21) {
     std::vector<re::RE *> items;
-    if (subgroup.engineBefore) items.push_back(re::makeLookBehindAssertion(subgroup.engineBefore));
+    if (subgroup.engineBefore) {
+        items.push_back(re::makeLookBehindAssertion(ldml::expandedContext(subgroup.engineBefore, insertions, InsertionFiller)));
+    }
     items.push_back(re::makeCC(chars, &cc::Unicode));
-    if (subgroup.engineAfter) items.push_back(re::makeLookAheadAssertion(subgroup.engineAfter));
+    //  The lookahead begins after the positions inserted after the character.
+    if (subgroup.engineAfter) {
+        std::vector<re::RE *> ahead(nulls, re::makeCC(InsertionFiller, &cc::Unicode));
+        ahead.push_back(ldml::expandedContext(subgroup.engineAfter, insertions, InsertionFiller));
+        items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
+    }
     re::RE * const pattern = re::makeSeq(items.begin(), items.end());
     StreamSet * const matches = mP.CreateStreamSet(1);
     RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
@@ -641,45 +684,180 @@ StreamSet * RulePipelineBuilder::matchPositions(const ldml::CharMapSubgroup & su
     return matches;
 }
 
+//  The stream (or stream set) of the CCs for a vector of sets, at each position of U21.
+StreamSet * RulePipelineBuilder::classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21) {
+    std::vector<re::CC *> ccs;
+    for (const UCD::UnicodeSet & s : sets) ccs.push_back(re::makeCC(s, &cc::Unicode));
+    StreamSet * const result = mP.CreateStreamSet(ccs.size());
+    mP.CreateKernelCall<CharClassesKernel>(ccs, U21, result);
+    return result;
+}
+
+StreamSet * RulePipelineBuilder::combine(StreamSet * a, StreamSet * b, bool isOr) {
+    if (a == nullptr) return b;
+    StreamSet * const result = mP.CreateStreamSet(a->getNumElements());
+    if (isOr) OrCombine(mP, a, b, result); else AndCombine(mP, a, b, result);
+    return result;
+}
+
+//  A conversion group: characters to be replaced by strings of n > 1 characters
+//  are first expanded, by inserting positions (holding 0) after them for the
+//  longest replacement.  Contexts are matched on a copy of the expanded stream
+//  with the filler codepoint at the inserted positions, with each character
+//  followed by its fillers.  Each subgroup computes the changes at the position of each
+//  character it replaces (the XOR of the character and the first character of its
+//  replacement) and at the positions of the inserted null codepoints (the further
+//  characters of the replacement), restricted to the matches of its contexts.  If
+//  a replacement may be shorter than the space made for it (or empty), the unused
+//  positions are then deleted.
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21, const UCD::UnicodeSet * filter) {
     PipelineBuilder & P = mP;
-    StreamSet * changes = nullptr;
+    //  The replacements of each subgroup, restricted by the filter; and the number of
+    //  positions inserted after each character.
+    std::vector<std::map<UCD::codepoint_t, std::u32string>> maps;
+    Insertions insertions;
+    std::map<UCD::codepoint_t, std::set<size_t>> lengths;
+    bool needDeletion = false;
     for (const ldml::CharMapSubgroup & subgroup : step.subgroups) {
-        unicode::TranslationMap map;
-        UCD::UnicodeSet chars;
+        maps.emplace_back();
         for (const auto & m : subgroup.charMap) {
-            if (filter && !filter->contains(m.first)) continue;
-            chars.insert(m.first);
-            if (m.second[0] != m.first) map.emplace(m.first, m.second[0]);
-        }
-        if (map.empty()) continue;
-        unicode::BitTranslationSets bitSets = unicode::ComputeBitTranslationSets(map);
-        std::vector<re::CC *> bitCCs;
-        for (unsigned i = 0; i < 21; i++) {
-            bitCCs.push_back(re::makeCC(i < bitSets.size() ? bitSets[i] : UCD::UnicodeSet(), &cc::Unicode));
-        }
-        StreamSet * bits = P.CreateStreamSet(21);
-        P.CreateKernelCall<CharClassesKernel>(bitCCs, U21, bits);
-        SHOW_BIXNUM(bits);
-        if (subgroup.engineBefore || subgroup.engineAfter) {
-            StreamSet * const matches = matchPositions(subgroup, chars, U21);
-            SHOW_STREAM(matches);
-            StreamSet * const selected = P.CreateStreamSet(21);
-            ZeroByMask(P, matches, bits, selected);
-            bits = selected;
-        }
-        if (changes) {
-            StreamSet * const combined = P.CreateStreamSet(21);
-            OrCombine(P, changes, bits, combined);
-            changes = combined;
-        } else {
-            changes = bits;
+            if (m.first == 0 || (filter && !filter->contains(m.first))) continue;
+            maps.back().emplace(m.first, m.second);
+            const unsigned extra = m.second.empty() ? 0 : m.second.size() - 1;
+            insertions[m.first] = std::max(insertions[m.first], extra);
+            lengths[m.first].insert(m.second.size());
+            if (m.second.empty()) needDeletion = true;
         }
     }
-    if (changes == nullptr) return U21;
-    StreamSet * const result = P.CreateStreamSet(21);
-    XorCombine(P, U21, changes, result);
-    SHOW_BIXNUM(result);
+    for (size_t g = 0; g < step.subgroups.size(); g++) {
+        const bool hasContexts = step.subgroups[g].engineBefore || step.subgroups[g].engineAfter;
+        for (const auto & m : maps[g]) {
+            const unsigned extra = insertions[m.first];
+            //  The space may be unused: the rule may not apply, or apply with a shorter result.
+            if (extra > 0 && (hasContexts || lengths[m.first].size() > 1)) needDeletion = true;
+        }
+    }
+    for (auto i = insertions.begin(); i != insertions.end(); ) {
+        if (i->second == 0) i = insertions.erase(i); else ++i;
+    }
+
+    StreamSet * SpreadMask = nullptr;
+    if (!insertions.empty()) {
+        std::vector<UCD::UnicodeSet> bixnum;
+        for (const auto & ins : insertions) {
+            for (unsigned bit = 0; (ins.second >> bit) != 0; bit++) {
+                if (bixnum.size() <= bit) bixnum.resize(bit + 1);
+                if ((ins.second >> bit) & 1) bixnum[bit].insert(ins.first);
+            }
+        }
+        StreamSet * const InsertBixNum = classes(bixnum, U21);
+        SHOW_BIXNUM(InsertBixNum);
+        SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
+        SHOW_STREAM(SpreadMask);
+        StreamSet * const Expanded = P.CreateStreamSet(21, 1);
+        SpreadByMask(P, SpreadMask, U21, Expanded);
+        SHOW_BIXNUM(Expanded);
+        U21 = Expanded;
+    }
+    //  Contexts are matched with the filler at the inserted positions.
+    StreamSet * MatchBasis = U21;
+    if (SpreadMask) {
+        MatchBasis = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<FillInsertedPositions>(SpreadMask, U21, MatchBasis);
+        SHOW_BIXNUM(MatchBasis);
+    }
+
+    StreamSet * changes = nullptr;
+    StreamSet * used = nullptr;        // inserted positions holding replacement characters
+    StreamSet * deleted = nullptr;     // characters replaced by the empty string
+    for (size_t g = 0; g < step.subgroups.size(); g++) {
+        const ldml::CharMapSubgroup & subgroup = step.subgroups[g];
+        const auto & map = maps[g];
+        if (map.empty()) continue;
+        //  The positions where the rules of the subgroup apply.
+        StreamSet * matches = nullptr;
+        if (subgroup.engineBefore || subgroup.engineAfter) {
+            std::map<unsigned, UCD::UnicodeSet> byNulls;
+            for (const auto & m : map) {
+                const auto f = insertions.find(m.first);
+                byNulls[f == insertions.end() ? 0 : f->second].insert(m.first);
+            }
+            for (const auto & k : byNulls) {
+                matches = combine(matches, matchPositions(subgroup, k.second, k.first, insertions, MatchBasis), true);
+            }
+            SHOW_STREAM(matches);
+        }
+        size_t maxLength = 0;
+        for (const auto & m : map) maxLength = std::max(maxLength, m.second.size());
+        for (size_t i = 0; i < maxLength; i++) {
+            //  Position i of the replacements: at the character itself, the bits that change;
+            //  at the inserted positions, the bits of the replacement character.
+            unicode::TranslationMap tmap;
+            for (const auto & m : map) {
+                if (m.second.size() > i) tmap.emplace(m.first, static_cast<UCD::codepoint_t>(m.second[i]));
+            }
+            unicode::BitTranslationSets bitSets = unicode::ComputeBitTranslationSets(tmap, i == 0 ? unicode::XorBit : unicode::LiteralBit);
+            if (bitSets.empty()) continue;
+            bitSets.resize(21);
+            StreamSet * bits = classes(bitSets, U21);
+            if (matches) {
+                StreamSet * const selected = P.CreateStreamSet(21);
+                ZeroByMask(P, matches, bits, selected);
+                bits = selected;
+            }
+            if (i > 0) {
+                StreamSet * const shifted = P.CreateStreamSet(21);
+                P.CreateKernelCall<ShiftForward>(bits, shifted, i);
+                bits = shifted;
+            }
+            SHOW_BIXNUM(bits);
+            changes = combine(changes, bits, true);
+        }
+        if (needDeletion) {
+            UCD::UnicodeSet empty;
+            std::vector<UCD::UnicodeSet> longer(maxLength > 1 ? maxLength - 1 : 0);
+            for (const auto & m : map) {
+                if (m.second.empty()) empty.insert(m.first);
+                for (size_t i = 1; i < m.second.size(); i++) longer[i - 1].insert(m.first);
+            }
+            if (!empty.empty()) {
+                StreamSet * d = classes({empty}, U21);
+                if (matches) d = combine(matches, d, false);
+                deleted = combine(deleted, d, true);
+            }
+            for (size_t i = 1; i < maxLength; i++) {
+                StreamSet * u = classes({longer[i - 1]}, U21);
+                if (matches) u = combine(matches, u, false);
+                StreamSet * const shifted = P.CreateStreamSet(1);
+                P.CreateKernelCall<ShiftForward>(u, shifted, i);
+                used = combine(used, shifted, true);
+            }
+        }
+    }
+    StreamSet * result = U21;
+    if (changes) {
+        result = P.CreateStreamSet(21);
+        XorCombine(P, U21, changes, result);
+        SHOW_BIXNUM(result);
+    }
+    if (needDeletion) {
+        //  Keep the original characters, including U+0000 (other than those replaced
+        //  by the empty string), and the inserted positions holding replacement
+        //  characters: unused inserted positions are deleted.
+        StreamSet * keep = SpreadMask ? combine(used, SpreadMask, true) : nullptr;
+        if (deleted) {
+            StreamSet * const notDeleted = P.CreateStreamSet(1);
+            Invert(P, deleted, notDeleted);
+            keep = keep ? combine(keep, notDeleted, false) : notDeleted;
+        }
+        if (keep) {
+            SHOW_STREAM(keep);
+            StreamSet * const filtered = P.CreateStreamSet(21);
+            FilterByMask(P, keep, result, filtered);
+            result = filtered;
+        }
+    }
     return result;
 }
 
@@ -770,8 +948,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     CPUDriver driver("tconv");
-    TransformFunctionType fn = impl != implementedTransforms.end() ? generatePipeline(driver, impl->second)
-                                                                  : generateRulePipeline(driver, registry, analyzer, entry);
+    //  Lowercasing needs the Final_Sigma context, provided by the rule pipeline.
+    const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower;
+    TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
+                                      : generateRulePipeline(driver, registry, analyzer, entry);
     fn(fd);
     close(fd);
     return 0;

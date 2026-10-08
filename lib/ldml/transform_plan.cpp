@@ -129,4 +129,54 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     return plan;
 }
 
+static re::RE * expandContext(re::RE * re, const std::map<UCD::codepoint_t, unsigned> & insertions,
+                              UCD::codepoint_t filler, CharSetAnalysis & sets) {
+    if (isa<re::CC>(re) || isa<re::PropertyExpression>(re) || isa<re::Any>(re) || isa<re::Diff>(re) || isa<re::Intersect>(re)) {
+        UCD::UnicodeSet chars = sets.setOf(re, false);
+        chars = chars - UCD::UnicodeSet(filler);
+        //  The characters by the number of null codepoints following them.
+        std::map<unsigned, UCD::UnicodeSet> byInsertion;
+        for (const auto & range : chars) {
+            for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
+                const auto f = insertions.find(cp);
+                if (f != insertions.end() && f->second > 0) byInsertion[f->second].insert(cp);
+            }
+        }
+        std::vector<re::RE *> alts;
+        UCD::UnicodeSet plain = chars;
+        for (const auto & k : byInsertion) {
+            plain = plain - k.second;
+            std::vector<re::RE *> seq{re::makeCC(k.second, &cc::Unicode)};
+            for (unsigned i = 0; i < k.first; i++) seq.push_back(re::makeCC(filler, &cc::Unicode));
+            alts.push_back(re::makeSeq(seq.begin(), seq.end()));
+        }
+        alts.insert(alts.begin(), re::makeCC(plain, &cc::Unicode));
+        return alts.size() == 1 ? alts[0] : re::makeAlt(alts.begin(), alts.end());
+    } else if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        std::vector<re::RE *> items;
+        for (re::RE * e : *seq) items.push_back(expandContext(e, insertions, filler, sets));
+        return re::makeSeq(items.begin(), items.end());
+    } else if (re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        std::vector<re::RE *> items;
+        for (re::RE * a : *alt) items.push_back(expandContext(a, insertions, filler, sets));
+        return re::makeAlt(items.begin(), items.end());
+    } else if (re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        return re::makeRep(expandContext(rep->getRE(), insertions, filler, sets), rep->getLB(), rep->getUB());
+    } else if (re::Assertion * a = dyn_cast<re::Assertion>(re)) {
+        return re::makeAssertion(expandContext(a->getAsserted(), insertions, filler, sets), a->getKind(), a->getSense());
+    } else if (re::Capture * c = dyn_cast<re::Capture>(re)) {
+        return expandContext(c->getCapturedRE(), insertions, filler, sets);
+    } else if (re::Name * name = dyn_cast<re::Name>(re)) {
+        if (isFunctionCall(name) || name->getDefinition() == nullptr) return re;
+        return expandContext(name->getDefinition(), insertions, filler, sets);
+    }
+    return re;
+}
+
+re::RE * expandedContext(re::RE * context, const std::map<UCD::codepoint_t, unsigned> & insertions,
+                         UCD::codepoint_t filler) {
+    CharSetAnalysis sets;
+    return expandContext(context, insertions, filler, sets);
+}
+
 }

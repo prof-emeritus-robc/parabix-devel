@@ -693,11 +693,16 @@ void PipelineCompiler::clearUnwrittenOutputData(KernelBuilder & b) {
     //                endPtr = buffer->StreamSetBuffer::getStreamPackPtr(b, baseAddress, sz_ZERO, getEndOffset(nextOffset), ITEM_WIDTH);
     //            }  else {
                     // If the produced item count is block-aligned, the block at blockIndex is entirely
-                    // unwritten and was not masked above, so it must be cleared as well.
+                    // unwritten and was not masked above, so it must be cleared as well.  Rounding its
+                    // offset up to the alignment would give an empty range when the produced count is
+                    // also a multiple of the alignment, yet a consumer's final stride may still read
+                    // the whole aligned unit starting there; so round up from the block after it.
+                    Value * const isAlignedBlock = b.CreateZExt(b.CreateNot(isPartialBlock), b.getSizeTy());
                     Value * const nextBlockIndex = b.CreateAdd(blockIndex, b.CreateZExt(isPartialBlock, b.getSizeTy()));
                     Value * const nextOffset = buffer->modByCapacity(b, nextBlockIndex);
                     Value * const startPtr = buffer->StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, nextOffset);
-                    Value * const endPtr = buffer->StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, getEndOffset(nextOffset));
+                    Value * const endOffset = getEndOffset(b.CreateAdd(nextOffset, isAlignedBlock));
+                    Value * const endPtr = buffer->StreamSetBuffer::getStreamBlockPtr(b, baseAddress, sz_ZERO, endOffset);
     //            }
 
                 Value * const startPtrInt = b.CreatePtrToInt(startPtr, intPtrTy);

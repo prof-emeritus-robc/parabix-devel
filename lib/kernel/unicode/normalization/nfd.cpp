@@ -585,13 +585,11 @@ StreamSet * NFD_PipelineBuilder::NFD_U21_Pipeline(StreamSet * U21_Basis) {
     mPB.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
     SHOW_STREAM(CCC_NonZero);
 
-    StreamSets ToSort = {CCC_Basis, NFD_Basis};
+    StreamSet * const Sorted_Basis = mPB.CreateStreamSet(NFD_Basis->getNumElements(), 1);
+    SortRuns(mPB, CCC_NonZero, CCC_Basis, NFD_Basis, Sorted_Basis);
+    SHOW_BIXNUM(Sorted_Basis);
 
-    StreamSets SortResults = OddEvenMergeSortRuns(mPB, 64, CCC_NonZero, ToSort);
-    SHOW_BIXNUM(SortResults[0]);
-    SHOW_BIXNUM(SortResults[1]);
-
-    return SortResults[1];
+    return Sorted_Basis;
 }
 
 StreamSet * NFD_PipelineBuilder::NFKD_U21_Pipeline(StreamSet * U21_Basis) {
@@ -634,13 +632,11 @@ StreamSet * NFD_PipelineBuilder::NFKD_U21_Pipeline(StreamSet * U21_Basis) {
     mPB.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
     SHOW_STREAM(CCC_NonZero);
 
-    StreamSets ToSort = {CCC_Basis, NFD_Basis};
+    StreamSet * const Sorted_Basis = mPB.CreateStreamSet(NFD_Basis->getNumElements(), 1);
+    SortRuns(mPB, CCC_NonZero, CCC_Basis, NFD_Basis, Sorted_Basis);
+    SHOW_BIXNUM(Sorted_Basis);
 
-    StreamSets SortResults = OddEvenMergeSortRuns(mPB, 64, CCC_NonZero, ToSort);
-    SHOW_BIXNUM(SortResults[0]);
-    SHOW_BIXNUM(SortResults[1]);
-
-    return SortResults[1];
+    return Sorted_Basis;
 }
 
 void NFD_PipelineBuilder::DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * NFD_WorkItems) {

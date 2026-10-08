@@ -52,7 +52,7 @@ out.append('''/*
  *  SPDX-License-Identifier: OSL-3.0
  */
 
-//  Tests of OddEvenMergeSortRuns and SeqSortRuns (Misorder_Check and SeqRunSort).
+//  Tests of OddEvenMergeSortRuns, SeqSortRuns (Misorder_Check and SeqRunSort) and\n//  SortRuns (with 0, 1, 3 and 6 parallel sort steps).
 //
 //  The short data set has runs of every length from 1 to 70 and runs of lengths
 //  96, 100, 127, 128, 129, 150, 191 and 200; the long data set has runs of lengths
@@ -99,6 +99,15 @@ for name, prefix in (("runsort", ""), ("runsort_long", "long_")):
     AssertEQ(P, Sorted, Input<3>(T));
 }
 ''' % (name, prefix, prefix, prefix, prefix))
+for steps in (0, 1, 3, 6):
+    for name, prefix in (("sortruns%d" % steps, ""), ("sortruns%d_long" % steps, "long_")):
+        out.append('''TEST_CASE(%s, %sruns, %skeys, %spayload, %ssorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, %d);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+''' % (name, prefix, prefix, prefix, prefix, steps))
 cases = ["oddeven_8", "oddeven_32", "oddeven_64", "runsort", "runsort_long"]
+cases += ["sortruns%d%s" % (steps, suffix) for steps in (0, 1, 3, 6) for suffix in ("", "_long")]
 out.append("RUN_TESTS(\n%s\n)\n" % ",\n".join("    CASE(%s)" % c for c in cases))
 open(sys.argv[1], "w").write("\n".join(out))

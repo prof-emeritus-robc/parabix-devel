@@ -285,12 +285,11 @@ static void NFC_U8_logic(PipelineBuilder & P, StreamSet * ExpansionMask, StreamS
     P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
     SHOW_STREAM(CCC_NonZero);
 
-    StreamSets ToSort = {CCC_Basis, U21_Basis};
-    StreamSets SortResults = OddEvenMergeSortRuns(P, 64, CCC_NonZero, ToSort);
-    SHOW_BIXNUM(SortResults[0]);
-    SHOW_BIXNUM(SortResults[1]);
+    StreamSet * const Sorted_U21 = P.CreateStreamSet(21, 1);
+    SortRuns(P, CCC_NonZero, CCC_Basis, U21_Basis, Sorted_U21);
+    SHOW_BIXNUM(Sorted_U21);
 
-    P.CreateKernelCall<P2SKernel>(UTF8_Of(P, SortResults[1]), TransformedBytes);
+    P.CreateKernelCall<P2SKernel>(UTF8_Of(P, Sorted_U21), TransformedBytes);
     SHOW_BYTES(TransformedBytes);
 }
 

@@ -11,6 +11,8 @@
 #include <toolchain/toolchain.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/core/kernel_builder.h>
+#include <kernel/streamutils/stream_select.h>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <functional>
 
@@ -18,6 +20,11 @@ using boost::intrusive::detail::ceil_log2;
 using namespace kernel;
 using namespace pablo;
 using namespace llvm;
+
+static cl::opt<unsigned> ParallelSortSteps("parallel-sort-steps",
+    cl::desc("Sort runs of up to 2^N items with a parallel odd-even merge network, "
+             "before the sequential sort of longer runs (N from 0 to 6)"),
+    cl::init(6));
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -569,4 +576,35 @@ void SeqSortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, Stream
     P.CreateKernelCall<Misorder_Check>(Runs, Keys, Misordered);
     SHOW_STREAM(Misordered);
     P.CreateKernelCall<SeqRunSort>(Runs, Misordered, Keys, Data, Sorted);
+}
+
+//  The largest instance size for which RunIndex and AdjustRunsAndIndexes number runs.
+static constexpr unsigned MaxParallelSortSteps = 6;
+
+void SortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted,
+              unsigned parallelSteps) {
+    if (LLVM_UNLIKELY(parallelSteps > MaxParallelSortSteps)) {
+        report_fatal_error("SortRuns: at most " + Twine(MaxParallelSortSteps) + " parallel sort steps are supported");
+    }
+    if (parallelSteps == 0) {
+        SeqSortRuns(P, Runs, Keys, Data, Sorted);
+        return;
+    }
+    StreamSets ToSort = {Keys, Data};
+    StreamSets Partial = OddEvenMergeSortRuns(P, 1U << parallelSteps, Runs, ToSort);
+    //  Partial[0] is the sort order: the run index in its low parallelSteps streams,
+    //  followed by the keys.
+    const unsigned keyBits = Keys->getNumElements();
+    std::vector<uint32_t> keyStreams(keyBits);
+    for (unsigned k = 0; k < keyBits; k++) {
+        keyStreams[k] = parallelSteps + k;
+    }
+    StreamSet * const PartialKeys = P.CreateStreamSet(keyBits);
+    P.CreateKernelCall<StreamSelect>(PartialKeys, Select(Partial[0], keyStreams));
+    SHOW_BIXNUM(PartialKeys);
+    SeqSortRuns(P, Runs, PartialKeys, Partial[1], Sorted);
+}
+
+void SortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted) {
+    SortRuns(P, Runs, Keys, Data, Sorted, ParallelSortSteps);
 }

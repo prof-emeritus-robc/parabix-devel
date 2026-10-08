@@ -3,7 +3,8 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
-//  Tests of OddEvenMergeSortRuns and SeqSortRuns (Misorder_Check and SeqRunSort).
+//  Tests of OddEvenMergeSortRuns, SeqSortRuns (Misorder_Check and SeqRunSort) and
+//  SortRuns (with 0, 1, 3 and 6 parallel sort steps).
 //
 //  The short data set has runs of every length from 1 to 70 and runs of lengths
 //  96, 100, 127, 128, 129, 150, 191 and 200; the long data set has runs of lengths
@@ -1027,10 +1028,66 @@ TEST_CASE(runsort_long, long_runs, long_keys, long_payload, long_sorted) {
     AssertEQ(P, Sorted, Input<3>(T));
 }
 
+TEST_CASE(sortruns0, runs, keys, payload, sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 0);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
+TEST_CASE(sortruns0_long, long_runs, long_keys, long_payload, long_sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 0);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
+TEST_CASE(sortruns1, runs, keys, payload, sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 1);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
+TEST_CASE(sortruns1_long, long_runs, long_keys, long_payload, long_sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 1);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
+TEST_CASE(sortruns3, runs, keys, payload, sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 3);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
+TEST_CASE(sortruns3_long, long_runs, long_keys, long_payload, long_sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 3);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
+TEST_CASE(sortruns6, runs, keys, payload, sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 6);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
+TEST_CASE(sortruns6_long, long_runs, long_keys, long_payload, long_sorted) {
+    StreamSet * Sorted = P.CreateStreamSet(8);
+    SortRuns(P, Input<0>(T), Input<1>(T), Input<2>(T), Sorted, 6);
+    AssertEQ(P, Sorted, Input<3>(T));
+}
+
 RUN_TESTS(
     CASE(oddeven_8),
     CASE(oddeven_32),
     CASE(oddeven_64),
     CASE(runsort),
-    CASE(runsort_long)
+    CASE(runsort_long),
+    CASE(sortruns0),
+    CASE(sortruns0_long),
+    CASE(sortruns1),
+    CASE(sortruns1_long),
+    CASE(sortruns3),
+    CASE(sortruns3_long),
+    CASE(sortruns6),
+    CASE(sortruns6_long)
 )

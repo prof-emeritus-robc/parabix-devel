@@ -86,3 +86,14 @@ private:
 //   Sort each run of 1 bits in Runs, of any length, stably by Keys, permuting Data
 //   into Sorted (Misorder_Check followed by SeqRunSort).
 void SeqSortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted);
+
+//   Sort each run of 1 bits in Runs, of any length, stably by Keys, permuting Data
+//   into Sorted: runs of up to 2^parallelSteps items are sorted by the odd-even merge
+//   network of OddEvenMergeSortRuns, and longer runs are then completed by SeqSortRuns
+//   (runs already sorted pass through it unchanged).  With parallelSteps = 0, all runs
+//   are sorted by SeqSortRuns.  parallelSteps is at most 6.
+void SortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted,
+              unsigned parallelSteps);
+
+//   SortRuns with parallelSteps given by the --parallel-sort-steps option (default 6).
+void SortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted);

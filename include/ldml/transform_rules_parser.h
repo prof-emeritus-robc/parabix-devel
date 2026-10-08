@@ -97,4 +97,15 @@ private:
 // constraints are reported together, as TransformRuleParseErrors.
 std::vector<Rule *> parseTransformRules(const std::vector<std::string> & tRules);
 
+// The text content of an XML element: CDATA sections are copied, comments are
+// removed and the predefined entities (&lt; &gt; &amp; &quot; &apos;) are decoded.
+// Throws std::runtime_error for an unterminated CDATA section or comment, or
+// another entity.
+std::string decodeXMLText(const std::string & s);
+
+// The decoded contents of the <tRule> elements of an LDML transform file, in
+// order (empty <tRule/> elements are skipped).  Throws std::runtime_error for
+// an unterminated element.
+std::vector<std::string> extractTRules(const std::string & xml);
+
 }

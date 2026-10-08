@@ -33,5 +33,6 @@ DEPS
     kernel.unicode.normalization
     re.cc
     re.unicode
+    kernel.re
     toolchain
 )

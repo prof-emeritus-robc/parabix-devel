@@ -48,12 +48,24 @@
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/sorting.h>
 #include <kernel/unicode/char_replacement.h>
+#include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/normalization/normalization.h>
 #include <kernel/unicode/utf8gen.h>
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <ldml/transform_registry.h>
+#include <kernel/re/regexp_engine.h>
+#include <re/adt/adt.h>
+#include <re/cc/cc_kernel.h>
+#include <ucd/utf/transchar.h>
+#include <ldml/transform_plan.h>
+#include <ldml/transform_rules_parser.h>
+#include <ldml/transform_rules_printer.h>
+#include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
 #include <re/adt/re_name.h>
 #include <re/unicode/resolve_properties.h>
 #include <toolchain/toolchain.h>
@@ -72,6 +84,8 @@ static cl::opt<std::string> TransformsDir("transforms-dir", cl::desc("Directory 
                                           cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> ListTransforms("list-transforms", cl::desc("List the known transform names and exit"),
                                     cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
+                              cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report problems found in the transform files"),
                                   cl::init(false), cl::cat(TconvOptions));
 
@@ -422,6 +436,286 @@ static void listTransforms(const ldml::TransformRegistry & registry) {
     }
 }
 
+//  Analysis of the transforms defined by rules: the rules of the transform in
+//  the direction of the registry entry (as forward rules) are rewritten by
+//  trivial and nullable capture elimination and order disambiguation, and
+//  planned (see ldml/transform_plan.h).  A transform is implementable if its
+//  conversion rules are implementable and every transform its transform rules
+//  invoke is implementable (without filters, for now).
+
+struct TransformAnalysis {
+    bool implementable = false;
+    ldml::TransformPlan plan;
+    std::vector<std::string> problems;
+};
+
+class TransformAnalyzer {
+public:
+    explicit TransformAnalyzer(const ldml::TransformRegistry & registry) : mRegistry(registry) {}
+    const TransformAnalysis & analyze(const ldml::TransformEntry * entry);
+private:
+    const ldml::TransformRegistry & mRegistry;
+    std::map<std::string, TransformAnalysis> mResults;
+    std::set<std::string> mInProgress;
+};
+
+static std::string readFile(const std::string & path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read " + path);
+    std::stringstream buf;
+    buf << in.rdbuf();
+    return buf.str();
+}
+
+static bool isImplementedBuiltIn(const std::string & canonicalName) {
+    if (canonicalName == "Any-Null") return true;
+    return std::any_of(implementedTransforms.begin(), implementedTransforms.end(),
+                       [&](const std::pair<std::string, Transform> & p) {return p.first == canonicalName;});
+}
+
+static std::string printCodepoints(const std::u32string & s) {
+    std::string out;
+    for (char32_t c : s) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%sU+%04X", out.empty() ? "" : " ", static_cast<unsigned>(c));
+        out += buf;
+    }
+    return out.empty() ? "(empty)" : out;
+}
+
+const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry * entry) {
+    const std::string & name = entry->canonicalName;
+    auto f = mResults.find(name);
+    if (f != mResults.end()) return f->second;
+    TransformAnalysis a;
+    if (mInProgress.count(name)) {
+        a.problems.push_back("recursive reference to " + name);
+        return mResults.emplace(name + " (recursive)", std::move(a)).first->second;
+    }
+    if (entry->isBuiltIn()) {
+        a.implementable = isImplementedBuiltIn(name);
+        if (!a.implementable) a.problems.push_back("built-in transform " + name + " is not implemented");
+        return mResults.emplace(name, std::move(a)).first->second;
+    }
+    mInProgress.insert(name);
+    try {
+        const std::vector<ldml::Rule *> parsed = ldml::parseTransformRules(ldml::extractTRules(readFile(entry->file)));
+        std::vector<ldml::Rule *> rules = entry->direction == ldml::TransformDirection::Forward
+                                          ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+        rules = ldml::TrivialCaptureElimination(rules);
+        rules = ldml::NullableCaptureElimination(rules);
+        ldml::DisambiguationStats dstats;
+        rules = ldml::DisambiguateOrder(rules, &dstats);
+        a.plan = ldml::planTransform(rules);
+        a.problems = a.plan.problems;
+        //  The bit changes of the subgroups of a group are combined, assuming that
+        //  no two rules of a group may apply at the same position.
+        if (dstats.overlapsAfter > 0) {
+            a.problems.push_back(std::to_string(dstats.overlapsAfter) + " pairs of rules remain order dependent");
+        }
+        for (const ldml::TransformStep & step : a.plan.steps) {
+            if (step.kind == ldml::TransformStep::Kind::Transform && a.plan.filter) {
+                a.problems.push_back("transform rule :: " + step.transform.getText() + " within a filtered transform (not yet supported)");
+            }
+            for (const ldml::CharMapSubgroup & sg : step.subgroups) {
+                for (const auto & m : sg.charMap) {
+                    if (m.second.size() != 1) {
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "U+%04X", static_cast<unsigned>(m.first));
+                        a.problems.push_back(std::string("replacement of ") + buf + " by " + printCodepoints(m.second)
+                                             + " is not a single character (not yet supported)");
+                        break;
+                    }
+                }
+            }
+        }
+        for (const ldml::TransformStep & step : a.plan.steps) {
+            if (step.kind != ldml::TransformStep::Kind::Transform) continue;
+            const std::string id = step.transform.getText();
+            const ldml::TransformEntry * used = mRegistry.lookup(id);
+            if (used == nullptr) {
+                a.problems.push_back("unknown transform " + id);
+            } else if (step.filter) {
+                a.problems.push_back("filtered transform :: " + ldml::printUnicodeSet(step.filter) + " " + id);
+            } else if (!analyze(used).implementable) {
+                a.problems.push_back("unimplemented transform " + used->canonicalName);
+            }
+        }
+    } catch (const std::exception & e) {
+        a.problems.push_back(std::string("rules not loaded: ") + e.what());
+    }
+    mInProgress.erase(name);
+    a.implementable = a.problems.empty();
+    return mResults.emplace(name, std::move(a)).first->second;
+}
+
+static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysis & a) {
+    llvm::outs() << entry->canonicalName << (entry->isBuiltIn() ? " (built-in)" : " (" + entry->file + ")")
+                 << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
+    for (const std::string & p : a.problems) {
+        std::string shown = p;
+        if (p.size() > 160) {
+            size_t cut = 150;
+            while (cut > 0 && (static_cast<unsigned char>(p[cut]) & 0xC0) == 0x80) cut--;   // a UTF-8 boundary
+            const size_t reason = p.rfind("  (");
+            shown = p.substr(0, cut) + " ... " + (reason == std::string::npos ? "" : p.substr(reason));
+        }
+        llvm::outs() << "  problem: " << shown << "\n";
+    }
+    if (a.plan.filter) llvm::outs() << "  filter " << ldml::printUnicodeSet(a.plan.filter) << "\n";
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
+                         << step.transform.getText() << "\n";
+            continue;
+        }
+        llvm::outs() << "  conversion group: " << step.subgroups.size() << " subgroups\n";
+        for (const ldml::CharMapSubgroup & s : step.subgroups) {
+            llvm::outs() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.charMap.size() << " characters";
+            unsigned shown = 0;
+            for (const auto & m : s.charMap) {
+                if (shown++ == 3) {llvm::outs() << " ..."; break;}
+                char buf[16];
+                snprintf(buf, sizeof(buf), "U+%04X", static_cast<unsigned>(m.first));
+                llvm::outs() << (shown == 1 ? ": " : ", ") << buf << " -> " << printCodepoints(m.second);
+            }
+            llvm::outs() << "\n";
+        }
+    }
+}
+
+//  Pipelines for transforms defined by rules.  For now, the whole text is
+//  transformed in the 21-bit representation of Unicode, and each implementable
+//  conversion rule replaces a single character by a single character.
+//
+//  For each conversion group, each subgroup (the rules with the same contexts)
+//  computes the bits to change at each position: for each of the 21 bits, the
+//  characters whose replacement differs from them in that bit, restricted to the
+//  positions where the contexts hold (a match of before-lookbehind, the
+//  characters of the subgroup, and after-lookahead).  As the rules are
+//  disambiguated, no two subgroups change the same position: their changes are
+//  combined by OR, and applied to the input of the group by XOR.
+
+class RulePipelineBuilder {
+public:
+    RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
+    : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P) {}
+    // Apply the transform of a registry entry to U21 (an implementable transform).
+    StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21, const UCD::UnicodeSet * filter);
+private:
+    StreamSet * builtIn(const std::string & name, StreamSet * U21);
+    StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21, const UCD::UnicodeSet * filter);
+    StreamSet * matchPositions(const ldml::CharMapSubgroup & subgroup, const UCD::UnicodeSet & chars, StreamSet * U21);
+    PipelineBuilder & mP;
+    const ldml::TransformRegistry & mRegistry;
+    TransformAnalyzer & mAnalyzer;
+    NFD_PipelineBuilder mNFD;
+};
+
+StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    if (name == "Any-Null") return U21;
+    if (name == "Any-NFD") return mNFD.NFD_U21_Pipeline(U21);
+    if (name == "Any-NFKD") return mNFD.NFKD_U21_Pipeline(U21);
+    if (name == "Any-Lower") return U21_StringOverridePipeline(P, UCD::lc, U21);
+    if (name == "Any-Upper") return U21_StringOverridePipeline(P, UCD::uc, U21);
+    if (name == "Any-Title") return U21_StringOverridePipeline(P, UCD::tc, U21);
+    if (name == "Any-NFKC") U21 = mNFD.NFKD_U21_Pipeline(U21);
+    if (name == "Any-NFC" || name == "Any-NFKC") {
+        StreamSet * const basis = UTF8_Of(P, U21);
+        StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
+        return U21_Of(P, BasisOf(P, composed));
+    }
+    llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
+}
+
+StreamSet * RulePipelineBuilder::matchPositions(const ldml::CharMapSubgroup & subgroup, const UCD::UnicodeSet & chars, StreamSet * U21) {
+    std::vector<re::RE *> items;
+    if (subgroup.engineBefore) items.push_back(re::makeLookBehindAssertion(subgroup.engineBefore));
+    items.push_back(re::makeCC(chars, &cc::Unicode));
+    if (subgroup.engineAfter) items.push_back(re::makeLookAheadAssertion(subgroup.engineAfter));
+    re::RE * const pattern = re::makeSeq(items.begin(), items.end());
+    StreamSet * const matches = mP.CreateStreamSet(1);
+    RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
+    engine.matchSearchPipeline(pattern, matches);
+    return matches;
+}
+
+StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21, const UCD::UnicodeSet * filter) {
+    PipelineBuilder & P = mP;
+    StreamSet * changes = nullptr;
+    for (const ldml::CharMapSubgroup & subgroup : step.subgroups) {
+        unicode::TranslationMap map;
+        UCD::UnicodeSet chars;
+        for (const auto & m : subgroup.charMap) {
+            if (filter && !filter->contains(m.first)) continue;
+            chars.insert(m.first);
+            if (m.second[0] != m.first) map.emplace(m.first, m.second[0]);
+        }
+        if (map.empty()) continue;
+        unicode::BitTranslationSets bitSets = unicode::ComputeBitTranslationSets(map);
+        std::vector<re::CC *> bitCCs;
+        for (unsigned i = 0; i < 21; i++) {
+            bitCCs.push_back(re::makeCC(i < bitSets.size() ? bitSets[i] : UCD::UnicodeSet(), &cc::Unicode));
+        }
+        StreamSet * bits = P.CreateStreamSet(21);
+        P.CreateKernelCall<CharClassesKernel>(bitCCs, U21, bits);
+        SHOW_BIXNUM(bits);
+        if (subgroup.engineBefore || subgroup.engineAfter) {
+            StreamSet * const matches = matchPositions(subgroup, chars, U21);
+            SHOW_STREAM(matches);
+            StreamSet * const selected = P.CreateStreamSet(21);
+            ZeroByMask(P, matches, bits, selected);
+            bits = selected;
+        }
+        if (changes) {
+            StreamSet * const combined = P.CreateStreamSet(21);
+            OrCombine(P, changes, bits, combined);
+            changes = combined;
+        } else {
+            changes = bits;
+        }
+    }
+    if (changes == nullptr) return U21;
+    StreamSet * const result = P.CreateStreamSet(21);
+    XorCombine(P, U21, changes, result);
+    SHOW_BIXNUM(result);
+    return result;
+}
+
+StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * U21, const UCD::UnicodeSet * filter) {
+    if (entry->isBuiltIn()) return builtIn(entry->canonicalName, U21);
+    const TransformAnalysis & a = mAnalyzer.analyze(entry);
+    assert (a.implementable);
+    UCD::UnicodeSet combined;
+    if (a.plan.filter) {
+        combined = filter ? (*filter & a.plan.filterSet) : a.plan.filterSet;
+        filter = &combined;
+    }
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            U21 = transform(mRegistry.lookup(step.transform.getText()), U21, filter);
+        } else {
+            U21 = conversionGroup(step, U21, filter);
+        }
+    }
+    return U21;
+}
+
+static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml::TransformRegistry & registry,
+                                                  TransformAnalyzer & analyzer, const ldml::TransformEntry * entry) {
+    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
+    RulePipelineBuilder builder(P, registry, analyzer);
+    StreamSet * const Result = builder.transform(entry, U21, nullptr);
+    StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
+    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    return P.compile();
+}
+
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
@@ -438,7 +732,7 @@ int main(int argc, char *argv[]) {
         listTransforms(registry);
         return 0;
     }
-    if (TransformName.empty() || InputFile.empty()) {
+    if (TransformName.empty() || (InputFile.empty() && !ShowPlan)) {
         llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> <input file>\n"
                      << "       " << argv[0] << " [options] --list-transforms\n";
         return 1;
@@ -449,12 +743,24 @@ int main(int argc, char *argv[]) {
         llvm::errs() << "Error: unknown transform " << TransformName << "\n";
         return 1;
     }
+    if (ShowPlan) {
+        TransformAnalyzer analyzer(registry);
+        const TransformAnalysis & a = analyzer.analyze(entry);
+        printPlan(entry, a);
+        return a.implementable ? 0 : 2;
+    }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),
                              [&](const std::pair<std::string, Transform> & p) {return p.first == entry->canonicalName;});
-    if (impl == implementedTransforms.end()) {
+    TransformAnalyzer analyzer(registry);
+    if (impl == implementedTransforms.end() && !analyzer.analyze(entry).implementable) {
         llvm::errs() << "Transform " << TransformName << " (canonical name " << entry->canonicalName
                      << (entry->isBuiltIn() ? ", built-in" : ", defined in " + entry->file)
-                     << ") is known but not yet implemented.\n";
+                     << ") is known but not yet implemented";
+        const TransformAnalysis & a = analyzer.analyze(entry);
+        if (!a.problems.empty()) {
+            llvm::errs() << ": " << a.problems.size() << " problems (see --plan), e.g.\n  " << a.problems.front();
+        }
+        llvm::errs() << "\n";
         return 2;
     }
 
@@ -464,7 +770,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     CPUDriver driver("tconv");
-    TransformFunctionType fn = generatePipeline(driver, impl->second);
+    TransformFunctionType fn = impl != implementedTransforms.end() ? generatePipeline(driver, impl->second)
+                                                                  : generateRulePipeline(driver, registry, analyzer, entry);
     fn(fd);
     close(fd);
     return 0;

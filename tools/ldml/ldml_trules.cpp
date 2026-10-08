@@ -76,58 +76,6 @@ static std::string readFile(const std::string & path) {
     return buf.str();
 }
 
-static std::string decodeXMLText(const std::string & s) {
-    std::string result;
-    size_t i = 0;
-    while (i < s.size()) {
-        if (s.compare(i, 9, "<![CDATA[") == 0) {
-            const size_t end = s.find("]]>", i + 9);
-            if (end == std::string::npos) throw std::runtime_error("Unterminated CDATA section");
-            result += s.substr(i + 9, end - i - 9);
-            i = end + 3;
-        } else if (s.compare(i, 4, "<!--") == 0) {
-            const size_t end = s.find("-->", i + 4);
-            if (end == std::string::npos) throw std::runtime_error("Unterminated XML comment");
-            i = end + 3;
-        } else if (s[i] == '&') {
-            const size_t semi = s.find(';', i);
-            if (semi == std::string::npos) throw std::runtime_error("Malformed XML entity");
-            const std::string entity = s.substr(i + 1, semi - i - 1);
-            if (entity == "lt") result += "<";
-            else if (entity == "gt") result += ">";
-            else if (entity == "amp") result += "&";
-            else if (entity == "quot") result += "\"";
-            else if (entity == "apos") result += "'";
-            else throw std::runtime_error("Unsupported XML entity &" + entity + ";");
-            i = semi + 1;
-        } else {
-            result.push_back(s[i++]);
-        }
-    }
-    return result;
-}
-
-// The contents of the <tRule> elements of an LDML file.
-static std::vector<std::string> extractTRules(const std::string & xml) {
-    std::vector<std::string> rules;
-    size_t pos = 0;
-    for (;;) {
-        const size_t open = xml.find("<tRule", pos);
-        if (open == std::string::npos) break;
-        const size_t start = xml.find('>', open);
-        if (start == std::string::npos) break;
-        if (xml[start - 1] == '/') {    // <tRule/>
-            pos = start + 1;
-            continue;
-        }
-        const size_t end = xml.find("</tRule>", start);
-        if (end == std::string::npos) throw std::runtime_error("Unterminated <tRule> element");
-        rules.push_back(decodeXMLText(xml.substr(start + 1, end - start - 1)));
-        pos = end + 8;
-    }
-    return rules;
-}
-
 // The printed rules reparse to themselves (exact), or at least reparse to a
 // canonical form that is stable (as when classes are kept as distinct
 // members of sets, which parsing merges).

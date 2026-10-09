@@ -131,7 +131,7 @@ private:
         const auto n = elems.size();
         if (n < 2) return body;
         Rep * const rep = dyn_cast<Rep>(elems[n - 2]);
-        if ((rep == nullptr) || (rep->getUB() != Rep::UNBOUNDED_REP)) return body;
+        if ((rep == nullptr) || (rep->getUB() != Rep::UNBOUNDED_REP) || (rep->getKind() == Rep::Kind::Possessive)) return body;
         CC * const X = resolveCharClass(rep->getRE());
         CC * const F = resolveCharClass(elems[n - 1]);
         if ((X == nullptr) || (F == nullptr) || (X->getAlphabet() != F->getAlphabet())) return body;

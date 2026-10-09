@@ -140,7 +140,7 @@ RE * RE_Transformer::transformRep(Rep * r) {
     if (x == x0) {
         return r;
     } else {
-        return makeRep(x, r->getLB(), r->getUB());
+        return makeRep(x, r->getLB(), r->getUB(), r->getKind());
     }
 }
 

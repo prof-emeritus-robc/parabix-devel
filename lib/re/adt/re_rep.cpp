@@ -36,7 +36,10 @@ RE * makeRep(RE * re, int lb, const int ub, Rep::Kind k) {
         // Repeated match of empty string: just match once.
         return re;
     }
-    if (Rep * rep = dyn_cast<Rep>(re)) {
+    //  Nested repetitions are combined only if both are standard: e.g., (a*+)? is
+    //  not a* (a possessive repetition takes all the repetitions it can).
+    Rep * const nested = (k == Rep::Kind::Standard) ? dyn_cast<Rep>(re) : nullptr;
+    if (Rep * rep = (nested && nested->getKind() == Rep::Kind::Standard) ? nested : nullptr) {
         int l = rep->getLB();
         int u = rep->getUB();
         if (lb == ub) {
@@ -87,7 +90,7 @@ RE * makeRep(RE * re, int lb, const int ub, Rep::Kind k) {
             return re;
         }
     }
-    return Rep::Create(re, lb, ub);
+    return Rep::Create(re, lb, ub, k);
 }
 
 }

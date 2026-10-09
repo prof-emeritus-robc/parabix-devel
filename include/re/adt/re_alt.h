@@ -93,7 +93,10 @@ RE * makeAlt(const iterator begin, const iterator end) {
                 }
             }
         } else if (const Rep * rep = llvm::dyn_cast<Rep>(*i)) {
-            if (rep->getLB() == 0) {
+            //  A possessive repetition matches the empty string only if no repetition
+            //  is possible, so it is not equivalent to an empty alternative together
+            //  with the repetition with a lower bound of 1.
+            if (rep->getLB() == 0 && rep->getKind() == Rep::Kind::Standard) {
                 if (nullableRE == nullptr) {
                     nullableRE = makeSeq();
                 }

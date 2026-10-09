@@ -127,7 +127,8 @@ public:
     ZeroBoundElimination() : RE_Transformer("ZeroBoundElimination") {}
 protected:
     RE * transformRep(Rep * r) override {
-        if (r->getLB() > 0) return r;
+        //  A possessive repetition matches the empty string only if no repetition is possible.
+        if (r->getLB() > 0 || r->getKind() == Rep::Kind::Possessive) return r;
         return makeAlt({makeSeq(), makeRep(r->getRE(), 1, r->getUB())});
     }
     RE * transformAssertion(Assertion * a) override {

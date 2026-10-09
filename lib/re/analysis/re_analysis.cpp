@@ -655,9 +655,7 @@ CC * resolveCharClass(RE * r) {
     return nullptr;
 }
 
-//  The class of characters that can begin a match of r (which matches at
-//  least one character), or nullptr if it cannot be determined.
-static CC * firstCharClass(RE * r) {
+CC * firstCharClass(RE * r) {
     if (CC * cc = resolveCharClass(r)) return cc;
     if (const Seq * seq = dyn_cast<Seq>(r)) {
         if (seq->empty() || (getLengthRange(seq->front(), &cc::Unicode).first == 0)) return nullptr;

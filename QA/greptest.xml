@@ -1316,4 +1316,35 @@ xa</datafile>
 <grepcase regexp="a(?![bc])" datafile="lookahead_eof" greplines="4"/>
 <grepcase regexp="a(?!b)$" datafile="lookahead_eof" greplines="4"/>
 
+<!-- Possessive quantifiers, including within lookaheads (resolved without
+     assertions where the repeated class and what follows allow). -->
+<datafile id="possessive">
+abbc
+abbbd
+ac
+xa1
+xab12
+abcz
+aaab
+AbBc
+</datafile>
+<grepcase regexp="a(?=b*+c)" datafile="possessive" greplines="2 4 7"/>
+<grepcase regexp="a(?=b*+c)" datafile="possessive" flags="-i" greplines="2 4 7 9"/>
+<grepcase regexp="a(?=[bc]*+c)" datafile="possessive" grepcount="0"/>
+<grepcase regexp="a(?=[bc]*+c)" datafile="possessive" flags="-i" grepcount="0"/>
+<grepcase regexp="x(?=[a-z]*+\d)" datafile="possessive" greplines="5 6"/>
+<grepcase regexp="x(?=[a-z]*+\d)" datafile="possessive" flags="-i" greplines="5 6"/>
+<grepcase regexp="a(?=b++d)" datafile="possessive" greplines="3"/>
+<grepcase regexp="a(?=b++d)" datafile="possessive" flags="-i" greplines="3"/>
+<grepcase regexp="a(?=[a-z]*+$)" datafile="possessive" greplines="2 3 4 7 8"/>
+<grepcase regexp="a(?=[a-z]*+$)" datafile="possessive" flags="-i" greplines="2 3 4 7 8 9"/>
+<grepcase regexp="a(?=b*+[cd])" datafile="possessive" greplines="2 3 4 7"/>
+<grepcase regexp="a(?=b*+[cd])" datafile="possessive" flags="-i" greplines="2 3 4 7 9"/>
+<grepcase regexp="a(?=[a-c]*+[c-z])" datafile="possessive" greplines="3 7"/>
+<grepcase regexp="a(?=[a-c]*+[c-z])" datafile="possessive" flags="-i" greplines="3 7"/>
+<grepcase regexp="a*+ab" datafile="possessive" grepcount="0"/>
+<grepcase regexp="a*+ab" datafile="possessive" flags="-i" grepcount="0"/>
+<grepcase regexp="[ab]*+c" datafile="possessive" greplines="2 4 7 9"/>
+<grepcase regexp="[ab]*+c" datafile="possessive" flags="-i" greplines="2 4 7 9"/>
+
 </greptest>

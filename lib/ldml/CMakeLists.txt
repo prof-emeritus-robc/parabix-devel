@@ -22,6 +22,7 @@ SRC
 DEPS
     re.adt
     re.analysis
+    re.transforms
     re.unicode
     unicode.core
     slaballocator

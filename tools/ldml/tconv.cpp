@@ -708,13 +708,15 @@ StreamSet * RulePipelineBuilder::matchPositions(const ldml::CharMapSubgroup & su
                                                 unsigned nulls, const Insertions & insertions, StreamSet * U21) {
     std::vector<re::RE *> items;
     if (subgroup.engineBefore) {
-        items.push_back(re::makeLookBehindAssertion(ldml::expandedContext(subgroup.engineBefore, insertions, InsertionFiller)));
+        //  ICU matches contexts possessively (see ldml::possessiveContext).
+        items.push_back(re::makeLookBehindAssertion(
+            ldml::possessiveContext(ldml::expandedContext(subgroup.engineBefore, insertions, InsertionFiller), false)));
     }
     items.push_back(re::makeCC(chars, &cc::Unicode));
     //  The lookahead begins after the positions inserted after the character.
     if (subgroup.engineAfter) {
         std::vector<re::RE *> ahead(nulls, re::makeCC(InsertionFiller, &cc::Unicode));
-        ahead.push_back(ldml::expandedContext(subgroup.engineAfter, insertions, InsertionFiller));
+        ahead.push_back(ldml::possessiveContext(ldml::expandedContext(subgroup.engineAfter, insertions, InsertionFiller), true));
         items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
     }
     re::RE * const pattern = re::makeSeq(items.begin(), items.end());

@@ -7,6 +7,7 @@
 #include <re/adt/adt.h>
 #include <re/adt/re_utility.h>
 #include <re/analysis/re_analysis.h>
+#include <re/transforms/re_transformer.h>
 #include <algorithm>
 #include <map>
 #include <cctype>
@@ -217,6 +218,40 @@ static RE * dropBoundary(RE * re, bool after, bool beyond, bool last) {
 
 RE * engineContext(RE * context, bool afterContext) {
     return dropBoundary(context, afterContext, false, true);
+}
+
+namespace {
+
+class ForwardPossessive final : public RE_Transformer {
+public:
+    ForwardPossessive() : RE_Transformer("ForwardPossessive") {}
+    RE * transformRep(Rep * rep) override {
+        return Rep::Create(transform(rep->getRE()), rep->getLB(), rep->getUB(), Rep::Kind::Possessive);
+    }
+};
+
+class BackwardPossessive final : public RE_Transformer {
+public:
+    BackwardPossessive() : RE_Transformer("BackwardPossessive") {}
+    RE * transformRep(Rep * rep) override {
+        RE * const e = transform(rep->getRE());
+        const int lb = rep->getLB();
+        const int ub = rep->getUB();
+        if (ub == Rep::UNBOUNDED_REP) {
+            return makeSeq({makeNegativeLookBehindAssertion(e), makeRep(e, lb, ub)});
+        } else if (lb == ub) {
+            return makeRep(e, ub, ub);
+        }
+        return makeAlt({makeSeq({makeNegativeLookBehindAssertion(e), makeRep(e, lb, ub - 1)}),
+                        makeRep(e, ub, ub)});
+    }
+};
+
+}
+
+RE * possessiveContext(RE * context, bool afterContext) {
+    if (afterContext) return ForwardPossessive().transformRE(context);
+    return BackwardPossessive().transformRE(context);
 }
 
 bool isTextBoundary(const RE * re) {

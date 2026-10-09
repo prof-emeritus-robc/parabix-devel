@@ -25,6 +25,10 @@ unsigned maxLookaheadLength(const RE * re, const cc::Alphabet * lengthAlphabet);
 // character classes (Any, Alt, Diff, Intersect), or nullptr.
 CC * resolveCharClass(RE * r);
 
+// The class of characters that can begin a match of r (which matches at
+// least one character), or nullptr if it cannot be determined.
+CC * firstCharClass(RE * r);
+
 // Parse r as an alternation of strings, each a sequence of items resolving to
 // character classes, with at least one string of two or more characters.
 bool parseStringClass(RE * r, std::vector<std::vector<CC *>> & strings);

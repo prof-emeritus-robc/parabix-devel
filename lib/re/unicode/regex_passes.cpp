@@ -41,7 +41,6 @@ RE * resolveModesAndExternalSymbols(RE * r, GrepLinesFunctionType grep) {
     r = UCD::linkAndResolve(r, grep);
     r = removeUnneededCaptures(r);
     r = UCD::inlineSimpleProperties(r);
-    r = resolvePossessiveQuantifiers(r);
     validateNamesDefined(r);
     r = resolveRanges(r);
     if (UnicodeLevel2IsSet() && validateAlphabet(&cc::Unicode, r)) {
@@ -50,6 +49,10 @@ RE * resolveModesAndExternalSymbols(RE * r, GrepLinesFunctionType grep) {
         r = UCD::addEquivalentCodepoints(r);
     }
     r = resolveCaseInsensitiveMode(r);
+    //  Possessive repetitions are resolved once the character classes are final
+    //  (ranges and case-insensitive classes resolved), so that classes following
+    //  them can be compared with those repeated.
+    r = resolvePossessiveQuantifiers(r);
     return r;
 }
 

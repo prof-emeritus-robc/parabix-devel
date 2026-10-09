@@ -56,12 +56,13 @@ struct LookaheadSegment {
     // (cc is then the class of all their characters).
     std::vector<std::vector<CC *>> strings = {};
     CC * first = nullptr;
-    // An end segment may also be final one-character lookaheads (?=Y) or
-    // (?!Y): cc is then the class of the characters at which they all hold,
-    // and negated is true if all are negative, so that they also hold at the
-    // end of the text.
+    // An assertion segment is a run of one-character lookaheads (?=Y) or
+    // (?!Y), within the chain or at its end (it is then an end segment): cc is
+    // the class of the characters at which they all hold, and negated is true
+    // if all are negative, so that they also hold at the end of the text.
+    bool assertion = false;
     bool negated = false;
-    std::vector<Assertion *> assertions = {};   // the final lookaheads
+    std::vector<Assertion *> assertions = {};   // the lookaheads
 };
 
 // Parse a lookahead body as a chain of segments, e.g. B*C D{2,}E or B*C D*$,
@@ -71,9 +72,12 @@ struct LookaheadSegment {
 // so that a run of X is always maximal: the rest must then match at the first
 // position after it not in X.  The end of the text is the end of a match
 // region (the RE compiler's region follow), where runs end in any case.
-// The body may also end with one-character lookaheads (?=Y) or (?!Y), for
-// character classes Y, holding where all of them hold: at the characters of
-// Y or not of Y, and at the end of the text if all are negative.
+// One-character lookaheads (?=Y) or (?!Y), for character classes Y, may
+// follow any segment, within the body or at its end: they hold where all of
+// them hold, at the characters of Y or not of Y, and at the end of the text
+// if all are negative.  (A possessive repetition S{lb,}+ followed by B is
+// resolved as S{lb,} (?!S) B, a chain whenever the rest begins with
+// characters of B outside S.)
 // A star segment may also be (s1|s2|...){lb,} (lb <= 1) for a class of strings
 // (sequences of character classes) satisfying isRepeatableStringClass, with
 // no condition on the rest of the body; a star of a class that is not

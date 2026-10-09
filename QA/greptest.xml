@@ -1347,4 +1347,35 @@ AbBc
 <grepcase regexp="[ab]*+c" datafile="possessive" greplines="2 4 7 9"/>
 <grepcase regexp="[ab]*+c" datafile="possessive" flags="-i" greplines="2 4 7 9"/>
 
+<!-- One-character lookaheads within lookahead chains, e.g. from possessive
+     repetitions resolved with negative lookaheads. -->
+<datafile id="lookahead_chain_assertions">
+abbc
+abbbd
+ac
+xa1
+xab12
+abcz
+aaab
+AbBc
+x12
+ab3c
+abz9
+abd
+</datafile>
+<grepcase regexp="x(?=[a-z]*+\p{Nd})" datafile="lookahead_chain_assertions" greplines="5 6 10"/>
+<grepcase regexp="x(?=[a-z]*+\p{Nd})" datafile="lookahead_chain_assertions" flags="-i" greplines="5 6 10"/>
+<grepcase regexp="a(?=b*(?!b)c)" datafile="lookahead_chain_assertions" greplines="2 4 7"/>
+<grepcase regexp="a(?=b*(?!b)c)" datafile="lookahead_chain_assertions" flags="-i" greplines="2 4 7 9"/>
+<grepcase regexp="a(?=b*(?![cd])[c-z])" datafile="lookahead_chain_assertions" greplines="12"/>
+<grepcase regexp="a(?=b*(?![cd])[c-z])" datafile="lookahead_chain_assertions" flags="-i" greplines="12"/>
+<grepcase regexp="a(?=b*(?=[cz])[a-z])" datafile="lookahead_chain_assertions" greplines="2 4 7 12"/>
+<grepcase regexp="a(?=b*(?=[cz])[a-z])" datafile="lookahead_chain_assertions" flags="-i" greplines="2 4 7 9 12"/>
+<grepcase regexp="a(?=b*(?!c)[a-z]\d)" datafile="lookahead_chain_assertions" greplines="6 11 12"/>
+<grepcase regexp="a(?=b*(?!c)[a-z]\d)" datafile="lookahead_chain_assertions" flags="-i" greplines="6 11 12"/>
+<grepcase regexp="a(?=[a-z]*(?!z)\d)" datafile="lookahead_chain_assertions" greplines="5 6 11 12"/>
+<grepcase regexp="a(?=[a-z]*(?!z)\d)" datafile="lookahead_chain_assertions" flags="-i" greplines="5 6 11 12"/>
+<grepcase regexp="a(?=b*(?!c)$)" datafile="lookahead_chain_assertions" greplines="8"/>
+<grepcase regexp="a(?=b*(?!c)$)" datafile="lookahead_chain_assertions" flags="-i" greplines="8"/>
+
 </greptest>

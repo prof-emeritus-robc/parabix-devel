@@ -20,6 +20,13 @@ namespace re {
 //    is S{lb,ub};
 //  - followed by a character class B, S{lb,}+ B is S{lb,} (B - S), and
 //    S{lb,ub}+ B is S{lb,ub-1} (B - S) | S{ub} B.
+//  The repetitions of a class of strings X (sequences of character classes) are
+//  likewise resolved without assertions at the end of a lookahead body, before
+//  $, and before items whose first characters are not among the characters of
+//  the strings (at any position, not only the first): X{lb,ub}+ is then
+//  X{lb,ub}.  (Wherever the following items can begin, no string of X begins,
+//  so (?!X) holds; and no occurrence of a string of X can extend over that
+//  position, as ICU's matching of the longest string of a set might.)
 //  The end of a top-level RE or of a lookbehind body is not treated as such:
 //  there, a possessive repetition determines the match end or must reach the
 //  position of the lookbehind.
@@ -46,6 +53,50 @@ static RE * withAssertion(RE * e, const int lb, const int ub) {
     return makeAlt({makeSeq({makeRep(e, lb, ub - 1), notE}), makeRep(e, ub, ub)});
 }
 
+//  The characters that can begin the items rest (the items following a
+//  repetition in a sequence), or nullptr if they cannot be determined: an item
+//  that may be empty (a repetition with no lower bound) adds the first
+//  characters of its body, and those of the items after it; assertions are
+//  passed over (which can only add characters); $ ends the items.  Items that
+//  may all be empty, up to the end of the sequence, are followed by whatever
+//  follows it, which is not known here.  (The items may include sequences, such
+//  as resolved repetitions with their following items, which are seen through.)
+static void flattenItems(const std::vector<RE *> & items, std::vector<RE *> & flat) {
+    for (RE * item : items) {
+        if (Seq * const seq = dyn_cast<Seq>(item)) {
+            flattenItems(std::vector<RE *>(seq->begin(), seq->end()), flat);
+        } else {
+            flat.push_back(item);
+        }
+    }
+}
+
+static CC * firstCharClassOfItems(const std::vector<RE *> & items) {
+    std::vector<RE *> rest;
+    flattenItems(items, rest);
+    CC * first = nullptr;
+    auto add = [&](CC * cc) -> bool {
+        if (cc == nullptr || (first && first->getAlphabet() != cc->getAlphabet())) return false;
+        first = first ? makeCC(first, cc) : cc;
+        return true;
+    };
+    for (RE * item : rest) {
+        if (isa<End>(item)) {
+            return first ? first : makeCC();
+        } else if (isa<Assertion>(item)) {
+            continue;
+        } else if (Rep * const rep = dyn_cast<Rep>(item)) {
+            if (rep->getLB() == 0) {
+                if (!add(firstCharClass(rep->getRE()))) return nullptr;
+                continue;
+            }
+        }
+        if (!add(firstCharClass(item))) return nullptr;
+        return first;
+    }
+    return nullptr;
+}
+
 //  The possessive repetition rep (with its body transformed), followed by the
 //  items rest (transformed), within the same sequence; returns the items of the
 //  sequence that replace rep and rest.
@@ -64,7 +115,7 @@ RE * ResolvePossessive::resolve(Rep * rep, const std::vector<RE *> & rest, bool 
             return makeSeq({makeRep(e, lb, ub), makeSeq(rest.begin(), rest.end())});
         } else {
             RE * const following = makeSeq(rest.begin(), rest.end());
-            CC * const first = firstCharClass(following);
+            CC * const first = firstCharClassOfItems(rest);
             if (first && first->getAlphabet() == S->getAlphabet()) {
                 if (intersectCC(first, S)->empty()) {
                     return makeSeq({makeRep(e, lb, ub), following});
@@ -81,6 +132,28 @@ RE * ResolvePossessive::resolve(Rep * rep, const std::vector<RE *> & rest, bool 
             }
         }
     }
+    std::vector<std::vector<CC *>> strings;
+    if (!S && parseStringClass(e, strings)) {
+        CC * chars = nullptr;
+        for (const auto & str : strings) {
+            for (CC * cc : str) {
+                if (chars && chars->getAlphabet() != cc->getAlphabet()) goto general;
+                chars = chars ? makeCC(chars, cc) : cc;
+            }
+        }
+        if (rest.empty()) {
+            if (atLookaheadEnd) return makeRep(e, lb, ub);
+        } else if (isa<End>(rest.front())) {
+            return makeSeq({makeRep(e, lb, ub), makeSeq(rest.begin(), rest.end())});
+        } else {
+            RE * const following = makeSeq(rest.begin(), rest.end());
+            CC * const first = firstCharClassOfItems(rest);
+            if (first && (first->getAlphabet() == chars->getAlphabet()) && intersectCC(first, chars)->empty()) {
+                return makeSeq({makeRep(e, lb, ub), following});
+            }
+        }
+    }
+general:
     return makeSeq({withAssertion(e, lb, ub), makeSeq(rest.begin(), rest.end())});
 }
 

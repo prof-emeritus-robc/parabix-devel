@@ -1090,6 +1090,23 @@ start_of_transfer_loop:
                         goto start_of_transfer_loop;
                     }
 
+                    // A kernel may not be moved into a partition in which a consumer reads its
+                    // output with a lookahead: only a provisional stride kernel may look ahead into
+                    // data produced within its own partition, and only along a chain of provisional
+                    // stride kernels from the partition root (see identifyProvisionalStrideKernels).
+                    if (transferPos != -1U) {
+                        const auto & members = partGraph[ordering[transferPos]].AllKernels;
+                        for (const auto e : make_iterator_range(out_edges(potentiallyTransferedKernel, G))) {
+                            for (const auto f : make_iterator_range(out_edges(target(e, G), G))) {
+                                const Binding & bind = Relationships[G[f]].Binding;
+                                if (bind.hasLookahead() && bind.getLookahead() > 0 &&
+                                        std::find(members.begin(), members.end(), target(f, G)) != members.end()) {
+                                    transferPos = -1U;
+                                }
+                            }
+                        }
+                    }
+
                     // A kernel may not be moved into a partition whose streams are extended by a
                     // different set of Add attributes; its inputs would end at different positions
                     // than those of the partition root.

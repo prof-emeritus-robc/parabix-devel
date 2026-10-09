@@ -311,20 +311,7 @@ RE * RE_Parser::extend_item(RE * re) {
         re = Rep::Create(re, lb, ub);
     } else if (ENABLE_EXTENDED_QUANTIFIERS && accept('+')) {
         // Possessive qualifier
-        if (ub == Rep::UNBOUNDED_REP) {
-            re = Seq::Create({Rep::Create(re, lb, ub),
-                              Assertion::Create(re,
-                                                Assertion::Kind::LookAhead,
-                                                Assertion::Sense::Negative)});
-        } else if (lb == ub) {
-            re = Rep::Create(re, ub, ub);
-        } else /* if (lb < ub) */{
-            re = Alt::Create({Seq::Create({Rep::Create(re, lb, ub-1), 
-                                           Assertion::Create(re,
-                                                             Assertion::Kind::LookAhead,
-                                                             Assertion::Sense::Negative)}),
-                              Rep::Create(re, ub, ub)});
-        }
+        re = Rep::Create(re, lb, ub, Rep::Kind::Possessive);
     } else {
         re = Rep::Create(re, lb, ub);
     }

@@ -104,6 +104,9 @@ static bool lessThan(const Rep * const lh, const Rep * const rh) {
     if (lh->getUB() != rh->getUB()) {
         return lh->getUB() < rh->getUB();
     }
+    if (lh->getKind() != rh->getKind()) {
+        return lh->getKind() < rh->getKind();
+    }
     return compare(lh->getRE(), rh->getRE());
 }
 

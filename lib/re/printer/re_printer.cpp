@@ -126,6 +126,9 @@ void REStringBuilder::buildString(const RE * re) {
         } else {
             out << re_rep->getUB();
         }
+        if (re_rep->getKind() == Rep::Kind::Possessive) {
+            out << "Possessive";
+        }
         out << ')';
     } else if (const Seq* re_seq = dyn_cast<const Seq>(re)) {
         out << "(Seq[";

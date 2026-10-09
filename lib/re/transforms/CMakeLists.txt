@@ -19,6 +19,7 @@ SRC
     reference_transform.cpp
     remove_nullable.cpp
     resolve_diffs.cpp
+    resolve_possessive.cpp
     resolve_ranges.cpp
     to_utf8.cpp
     expand_permutes.cpp

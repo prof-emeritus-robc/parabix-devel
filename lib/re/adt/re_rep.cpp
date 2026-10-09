@@ -21,7 +21,7 @@ inline int ubCombine(const int h1, const int h2) {
     }
 }
     
-RE * makeRep(RE * re, int lb, const int ub) {
+RE * makeRep(RE * re, int lb, const int ub, Rep::Kind k) {
     if (LLVM_UNLIKELY(lb == Rep::UNBOUNDED_REP)) {
         report_fatal_error("repetition lower bound must be finite!");
     }

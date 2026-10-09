@@ -1456,7 +1456,7 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             mPB.captureBitstream("chainSpans", spans);
         }
-    } else if (!uniquePrefixSpans(re, spans)) {
+    } else if (!uniquePrefixSpans(re, spans) && !lengthClassSpans(re, spans)) {
         StreamSet * matchEnd = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, matchEnd);
         auto minlgth = getLengthRange(re, mCtxt.mLengthAlphabet).first;
@@ -1610,6 +1610,91 @@ bool isLookbehind(RE * r) {
     Assertion * const a = definedAssertion(r);
     return a && (a->getKind() == Assertion::Kind::LookBehind);
 }
+}
+
+namespace {
+// The matches of a bounded RE by their length: classes[k] matches exactly
+// the strings of length k that the RE matches (with the same contexts).
+// Alternations are divided among the classes, the classes of the items of a
+// sequence are combined, and X? is the alternation of X and the empty
+// string; other repetitions must have a fixed length.  (Zero-width
+// assertions, such as the alternative (?!X) of a possessive X?+, have length
+// 0.)  Returns false if the RE is not of this form, or would have more than
+// limit classes at any step.
+using LengthClasses = std::map<int, RE *>;
+
+bool lengthClasses(RE * re, const cc::Alphabet * alphabet, unsigned limit, LengthClasses & classes) {
+    classes.clear();
+    const auto range = getLengthRange(re, alphabet);
+    if (range.first == range.second) {
+        if (range.first == INT_MAX) return false;
+        classes.emplace(range.first, re);
+        return true;
+    }
+    if (range.second == INT_MAX) return false;
+    auto add = [](LengthClasses & C, int k, RE * r) {
+        auto f = C.find(k);
+        if (f == C.end()) {
+            C.emplace(k, r);
+        } else {
+            f->second = makeAlt({f->second, r});
+        }
+    };
+    if (Alt * const alt = dyn_cast<Alt>(re)) {
+        for (RE * e : *alt) {
+            LengthClasses E;
+            if (!lengthClasses(e, alphabet, limit, E)) return false;
+            for (const auto & c : E) add(classes, c.first, c.second);
+        }
+    } else if (Seq * const seq = dyn_cast<Seq>(re)) {
+        classes.emplace(0, makeSeq());
+        for (RE * e : *seq) {
+            LengthClasses E;
+            if (!lengthClasses(e, alphabet, limit, E)) return false;
+            LengthClasses next;
+            for (const auto & a : classes) {
+                for (const auto & b : E) add(next, a.first + b.first, makeSeq({a.second, b.second}));
+            }
+            if (next.size() > limit) return false;
+            classes = std::move(next);
+        }
+    } else if (Rep * const rep = dyn_cast<Rep>(re)) {
+        if ((rep->getLB() != 0) || (rep->getUB() != 1)) return false;
+        if (!lengthClasses(rep->getRE(), alphabet, limit, classes)) return false;
+        add(classes, 0, makeSeq());
+    } else if (Name * const n = dyn_cast<Name>(re)) {
+        if (n->getDefinition() == nullptr) return false;
+        return lengthClasses(n->getDefinition(), alphabet, limit, classes);
+    } else {
+        return false;
+    }
+    return classes.size() <= limit;
+}
+}
+
+bool RE_PipelineBuilder::lengthClassSpans(RE * re, StreamSet * spans) {
+    // Spans are counted in code units.
+    if (mCtxt.mIndexStream != nullptr) return false;
+    LengthClasses classes;
+    if (!lengthClasses(re, mCtxt.mLengthAlphabet, 16, classes)) return false;
+    // Empty matches have no spans.
+    classes.erase(0);
+    if (classes.empty()) return false;
+    std::vector<StreamSet *> allSpans;
+    for (const auto & c : classes) {
+        StreamSet * const matchEnd = mPB.CreateStreamSet(1);
+        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, c.second, matchEnd);
+        StreamSet * const span = (classes.size() == 1) ? spans : mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<FixedMatchSpansKernel>(c.first, grepOffset(c.second), matchEnd, span);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBitstream("lengthClass" + std::to_string(c.first), span);
+        }
+        allSpans.push_back(span);
+    }
+    if (allSpans.size() > 1) {
+        mPB.CreateKernelCall<StreamsMerge>(allSpans, spans);
+    }
+    return true;
 }
 
 bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {

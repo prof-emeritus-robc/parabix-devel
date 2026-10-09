@@ -528,6 +528,12 @@ protected:
     // the RE has no unique prefix.
     bool uniquePrefixSpans(re::RE * re, kernel::StreamSet * spans);
 
+    // The spans of the matches of a bounded RE, as the union of the spans of
+    // its matches of each length (see lengthClasses), each a fixed-length RE.
+    // Returns false if the RE has no such classes, or positions are not code
+    // units.
+    bool lengthClassSpans(re::RE * re, kernel::StreamSet * spans);
+
     // The basis bits of the code units (transposed from a byte stream if
     // needed), for CC kernels.
     kernel::StreamSet * codeUnitBasis();

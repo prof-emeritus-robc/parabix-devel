@@ -41,11 +41,11 @@ inline RE * RE_Star_Normal::star_rule(RE * re) {
 RE * RE_Star_Normal::transformRep(Rep * rep) {
     RE * e0 = rep->getRE();
     RE * e = transform(e0);
-    if (rep->getLB() == 0 && rep->getUB() == Rep::UNBOUNDED_REP) {
+    if (rep->getLB() == 0 && rep->getUB() == Rep::UNBOUNDED_REP && rep->getKind() == Rep::Kind::Standard) {
         e = star_rule(e);
     }
     if (e == e0) return rep;
-    return makeRep(e, rep->getLB(), rep->getUB());
+    return makeRep(e, rep->getLB(), rep->getUB(), rep->getKind());
 }
 
 RE * convertToStarNormalForm(RE * re) {

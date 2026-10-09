@@ -370,7 +370,11 @@ def write_marginal(out, rows):
     Peak MB/s (single-file) is contaminated by the fixed per-call pipeline
     dispatch floor. The slope isolates the real steady-state per-byte rate —
     what the SIMD data-parallelism actually delivers once the floor amortizes."""
-    pts = [(next(iter(res.values()))["bytes"], res) for (_, res) in rows if any(res.values())]
+    pts = []
+    for _, res in rows:
+        ok = next((r for r in res.values() if r), None)
+        if ok:
+            pts.append((ok["bytes"], res))
     if len({b for b, _ in pts}) < 2:
         return   # need ≥2 distinct sizes to fit a line
 

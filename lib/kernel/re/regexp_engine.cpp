@@ -618,25 +618,26 @@ void StringClassStarSpans::generatePabloMethod() {
     writeOutputStreamSet("result", std::vector<PabloAST *>{result});
 }
 
-static std::string chainAssertionEndName(const std::vector<bool> & negated, bool follows) {
+static std::string chainAssertionEndName(const std::vector<bool> & negated, bool follows, bool rest) {
     std::string name = "ChainAssertionEnd_";
     for (bool n : negated) name += n ? 'n' : 'p';
-    return name + (follows ? "_f" : "");
+    return name + (follows ? "_f" : "") + (rest ? "_h" : "");
 }
 
 ChainAssertionEnd::ChainAssertionEnd(LLVMTypeSystemInterface & ts, std::vector<StreamSet *> classes,
-                                     std::vector<bool> negated, StreamSet * follows, StreamSet * H)
-: PabloKernel(ts, chainAssertionEndName(negated, follows != nullptr),
+                                     std::vector<bool> negated, StreamSet * follows, StreamSet * Hrest, StreamSet * H)
+: PabloKernel(ts, chainAssertionEndName(negated, follows != nullptr, Hrest != nullptr),
               [&] {
                   Bindings inputs;
                   for (unsigned i = 0; i < classes.size(); ++i) {
                       inputs.emplace_back("Y" + std::to_string(i), classes[i]);
                   }
                   if (follows) inputs.emplace_back("follows", follows);
+                  if (Hrest) inputs.emplace_back("Hrest", Hrest);
                   return inputs;
               }(),
               {Binding{"H", H}}),
-  mNegated(std::move(negated)), mHasFollows(follows != nullptr) {
+  mNegated(std::move(negated)), mHasFollows(follows != nullptr), mHasRest(Hrest != nullptr) {
 }
 
 void ChainAssertionEnd::generatePabloMethod() {
@@ -651,6 +652,10 @@ void ChainAssertionEnd::generatePabloMethod() {
     if (mHasFollows) {
         PabloAST * const follows = getInputStreamSet("follows")[0];
         H = allNegated ? pb.createOr(H, follows) : pb.createAnd(H, pb.createNot(follows));
+    }
+    if (mHasRest) {
+        //  Within the chain: the rest must also hold at the position.
+        H = pb.createAnd(H, getInputStreamSet("Hrest")[0]);
     }
     writeOutputStreamSet("H", std::vector<PabloAST *>{H});
 }
@@ -1277,8 +1282,9 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
     for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
         ChainStepStreams * const step = steps ? &(*steps)[segments.rend() - seg - 1] : nullptr;
         if (step) step->Hnext = H;
-        if (seg->end && !seg->assertions.empty()) {
-            // Final one-character lookaheads (see ChainAssertionEnd).
+        if (seg->assertion) {
+            // One-character lookaheads (see ChainAssertionEnd), within the
+            // chain (where the rest must also hold) or at its end.
             std::vector<StreamSet *> classes;
             std::vector<bool> negated;
             for (Assertion * la : seg->assertions) {
@@ -1287,8 +1293,9 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
                 classes.push_back(Y);
                 negated.push_back(la->getSense() == Assertion::Sense::Negative);
             }
+            StreamSet * const Hrest = H;
             H = mPB.CreateStreamSet(1);
-            mPB.CreateKernelCall<ChainAssertionEnd>(classes, negated, mCtxt.mMatchFollows, H);
+            mPB.CreateKernelCall<ChainAssertionEnd>(classes, negated, mCtxt.mMatchFollows, Hrest, H);
             continue;
         }
         if (seg->end) {
@@ -1601,7 +1608,7 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     for (unsigned i = 0; i < segments.size(); ++i) {
         const LookaheadSegment & seg = segments[i];
         ChainCoverage::Step step{'z', 0, rec[i].Hnext, rec[i].cls, rec[i].fse, rec[i].index, rec[i].goodNext};
-        if (seg.end) {
+        if (seg.end || seg.assertion) {
             step.kind = 'z';
         } else if (!seg.star) {
             step.kind = 'f';

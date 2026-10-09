@@ -317,20 +317,25 @@ private:
 };
 
 //
-// The final one-character lookaheads (?=Y) or (?!Y) of a lookahead chain:
-// given the streams of the classes Y (one per lookahead, negated as given),
-// H marks the positions at which all of them hold.  At a region follow (the
-// end of the text), only negative lookaheads hold.
+// One-character lookaheads (?=Y) or (?!Y) of a lookahead chain, at its end
+// or within it: given the streams of the classes Y (one per lookahead,
+// negated as given), H marks the positions at which all of them hold (and,
+// within the chain, the rest of the chain holds: Hrest).  At a region follow
+// (the end of the text), only negative lookaheads hold.
 //
 class ChainAssertionEnd : public pablo::PabloKernel {
 public:
+    // Hrest: for lookaheads within the chain, where the rest of the chain holds
+    // (nullptr at the end of the chain).
     ChainAssertionEnd(LLVMTypeSystemInterface & ts, std::vector<kernel::StreamSet *> classes,
-                      std::vector<bool> negated, kernel::StreamSet * follows, kernel::StreamSet * H);
+                      std::vector<bool> negated, kernel::StreamSet * follows, kernel::StreamSet * Hrest,
+                      kernel::StreamSet * H);
 protected:
     void generatePabloMethod() override;
 private:
     const std::vector<bool> mNegated;
     const bool mHasFollows;
+    const bool mHasRest;
 };
 
 //

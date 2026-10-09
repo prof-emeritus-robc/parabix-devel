@@ -801,15 +801,17 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
                 continue;
             }
         }
-        // Final one-character lookaheads (?=Y) or (?!Y), which must all hold.
+        // One-character lookaheads (?=Y) or (?!Y), which must all hold: a
+        // zero-width assertion segment, within the chain or at its end.
         if (isa<Assertion>(e)) {
             if ((fixed.empty() && segments.empty()) || !closeFixed()) return false;
             CC * holds = nullptr;
             bool negated = true;
             std::vector<Assertion *> assertions;
-            for (unsigned j = i; j < elems.size(); ++j) {
-                Assertion * const la = dyn_cast<Assertion>(elems[j]);
-                if ((la == nullptr) || (la->getKind() != Assertion::Kind::LookAhead)) return false;
+            unsigned j = i;
+            for (; j < elems.size() && isa<Assertion>(elems[j]); ++j) {
+                Assertion * const la = cast<Assertion>(elems[j]);
+                if (la->getKind() != Assertion::Kind::LookAhead) return false;
                 CC * const Y = resolveCharClass(la->getAsserted());
                 if (Y == nullptr) return false;
                 const bool neg = la->getSense() == Assertion::Sense::Negative;
@@ -819,15 +821,20 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
                 negated &= neg;
                 assertions.push_back(la);
             }
-            LookaheadSegment seg{false, true, holds, e, 0, 0};
+            const bool final = (j == elems.size());
+            LookaheadSegment seg{false, final, holds, e, 0, 0};
+            seg.assertion = true;
             seg.negated = negated;
             seg.assertions = std::move(assertions);
             segments.push_back(std::move(seg));
-            break;
+            if (final) break;
+            i = j - 1;
+            continue;
         }
-        // The end of the text directly after a star (with no fixed segment
-        // to include it) is a segment of its own, which must be the last.
-        if (isa<End>(e) && fixed.empty() && !segments.empty() && segments.back().star) {
+        // The end of the text directly after a star or an assertion segment
+        // (with no fixed segment to include it) is a segment of its own, which
+        // must be the last.
+        if (isa<End>(e) && fixed.empty() && !segments.empty() && (segments.back().star || segments.back().assertion)) {
             if (i != elems.size() - 1) return false;
             segments.push_back(LookaheadSegment{false, true, nullptr, e, 0, 0});
             continue;
@@ -847,6 +854,10 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
     for (auto i = segments.rbegin(); i != segments.rend(); ++i) {
         if (i->end) {
             restFirst = i->cc ? i->cc : makeCC();
+        } else if (i->assertion) {
+            // The rest begins with a character at which the assertions hold.
+            if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
+            restFirst = intersectCC(restFirst, i->cc);
         } else if (i->star) {
             if (i->cc->getAlphabet() != restFirst->getAlphabet()) return false;
             if (i->strings.empty() && !intersectCC(i->cc, restFirst)->empty()) {

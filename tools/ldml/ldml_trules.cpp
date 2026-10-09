@@ -46,6 +46,9 @@
 //      references to the captures in the result, and the revisiting status
 //      of the result (cursor).  Report the counts for each, and the combined
 //      classes with an example of each (listing each rule unless --quiet).
+//      Also report the simple insertion rules (a captured text, replaced by
+//      fixed text, the reference to the capture and fixed text), by the kind
+//      of insertion and the length of the captured text.
 //  ldml_trules --self-test
 //      Run the built-in test cases.
 
@@ -1107,6 +1110,63 @@ static std::string classifyRevisit(const RuleSide * result) {
     return completed ? "revisit part of result" : "revisit entire result";
 }
 
+// Fixed text: characters, or variables defined as fixed text.
+static bool isFixedText(re::RE * r) {
+    using namespace re;
+    if (CC * cc = llvm::dyn_cast<CC>(r)) return cc->count() == 1;
+    if (Seq * seq = llvm::dyn_cast<Seq>(r)) {
+        for (RE * e : *seq) if (!isFixedText(e)) return false;
+        return true;
+    }
+    if (Alt * alt = llvm::dyn_cast<Alt>(r)) return alt->size() == 1 && isFixedText(alt->front());
+    if (Name * n = llvm::dyn_cast<Name>(r)) {
+        return !isFunctionCall(n) && n->getDefinition() && isFixedText(n->getDefinition());
+    }
+    return false;
+}
+
+static void flattenItems(re::RE * r, std::vector<re::RE *> & items) {
+    if (re::Seq * seq = llvm::dyn_cast<re::Seq>(r)) {
+        for (re::RE * e : *seq) flattenItems(e, items);
+    } else {
+        items.push_back(r);
+    }
+}
+
+// A simple insertion rule: the text to replace is a capture, and the result
+// (without text to revisit) is fixed text, the reference to the capture, and
+// fixed text, e.g. ($v) → $1 x ;  inserts x after the text.  Returns the kind
+// of insertion (before, after, before and after, or none: a copy), or an
+// empty string if the rule is not a simple insertion rule.
+static std::string classifyInsertion(const ConversionRule * cr, re::RE ** captured = nullptr) {
+    using namespace re;
+    const RuleSide * const source = cr->getSourceSide(Direction::Forward);
+    const RuleSide * const result = cr->getResultSide(Direction::Forward);
+    std::vector<RE *> text;
+    flattenItems(source->getText(), text);
+    Capture * const capture = (text.size() == 1) ? llvm::dyn_cast<Capture>(text[0]) : nullptr;
+    if (capture == nullptr || classifyRevisit(result) != "none") return "";
+    std::vector<RE *> items;
+    flattenItems(result->getText(), items);
+    size_t refIndex = items.size();
+    for (size_t i = 0; i < items.size(); i++) {
+        if (Reference * ref = llvm::dyn_cast<Reference>(items[i])) {
+            if (refIndex != items.size() || ref->getName() != capture->getName()) return "";
+            refIndex = i;
+        } else if (!isFixedText(items[i])) {
+            return "";
+        }
+    }
+    if (refIndex == items.size()) return "";
+    if (captured) *captured = capture->getCapturedRE();
+    const bool before = refIndex > 0;
+    const bool after = refIndex + 1 < items.size();
+    if (before && after) return "insert before and after";
+    if (before) return "insert before";
+    if (after) return "insert after";
+    return "copy (no insertion)";
+}
+
 struct RuleClassCounts {
     // dimension -> direction -> class -> count
     std::map<std::string, std::map<std::string, std::map<std::string, unsigned>>> byDimension;
@@ -1155,13 +1215,22 @@ static void classifyRules(const std::vector<std::string> & tRules, const std::st
             counts.byDimension["captures"][dir][c.captures]++;
             counts.byDimension["capture order"][dir][c.order]++;
             counts.byDimension["revisiting"][dir][c.revisit]++;
+            re::RE * captured = nullptr;
+            const std::string insertion = classifyInsertion(cr, &captured);
+            counts.byDimension["simple insertion"][dir][insertion.empty() ? "not a simple insertion rule" : insertion]++;
+            if (!insertion.empty()) {
+                counts.byDimension["simple insertion: captured text"][dir][classifyTextLength(captured)]++;
+            }
             const std::string sig = c.signature();
             auto & s = counts.signatures[sig];
             if (std::get<0>(s)++ == 0) {
                 std::get<1>(s) = printRule(r);
                 std::get<2>(s) = label;
             }
-            if (!quiet) std::cout << label << " " << dir << "\t" << sig << "\t" << printRule(r) << "\n";
+            if (!quiet) {
+                std::cout << label << " " << dir << "\t" << sig << (insertion.empty() ? "" : " | simple insertion: " + insertion)
+                          << "\t" << printRule(r) << "\n";
+            }
         }
     }
 }
@@ -1188,9 +1257,25 @@ static const EliminationTestCase ruleClassTestCases[] = {
     {"a → y @| ;", "1 | 0 | no captures | skip past result (@|)"},
 };
 
+static const EliminationTestCase insertionClassTestCases[] = {
+    {"(a) → $1 x ;", "insert after"},
+    {"(a) → x $1 ;", "insert before"},
+    {"(a) → x $1 yz ;", "insert before and after"},
+    {"$v = [aeiou] ; ($v) → $1 ;", "copy (no insertion)"},
+    {"$s = xy ; ([ab]+) → $s $1 ;", "insert before"},
+    {"b { (a) } c → $1 x ;", "insert after"},
+    {"(a) b → $1 x ;", ""},
+    {"(a) → $1 $1 ;", ""},
+    {"(a) (b) → $1 x $2 ;", ""},
+    {"(a) → &Any-Hex($1) ;", ""},
+    {"(a) → x | $1 ;", ""},
+    {"a → x ;", ""},
+};
+
 static void reportRuleClasses(const RuleClassCounts & counts) {
     std::cout << "Total: " << counts.rules << " conversion rules (forward and backward)\n";
-    for (const char * dim : {"text to replace", "captures", "capture order", "revisiting"}) {
+    for (const char * dim : {"text to replace", "captures", "capture order", "revisiting",
+                             "simple insertion", "simple insertion: captured text"}) {
         const auto it = counts.byDimension.find(dim);
         if (it == counts.byDimension.end()) continue;
         std::map<std::string, std::pair<unsigned, unsigned>> rows;
@@ -1424,6 +1509,20 @@ static int runSelfTest() {
         try {
             const std::vector<Rule *> rules = NullableCaptureElimination(parseTransformRules({t.input}));
             failures += !checkOutput("elimination", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
+    for (const EliminationTestCase & t : insertionClassTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.input});
+            const std::string actual = classifyInsertion(llvm::cast<ConversionRule>(rules.back()));
+            if (actual != t.expected) {
+                failures++;
+                std::cerr << "FAIL (insertion class): " << t.input << "\n  expected: " << t.expected << "\n  actual:   " << actual << "\n";
+            }
         } catch (const TransformRuleParseError & e) {
             failures++;
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";

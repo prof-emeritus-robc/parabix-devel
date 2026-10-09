@@ -53,6 +53,23 @@ static bool fixedString(const re::RE * re, std::u32string & out) {
     return false;
 }
 
+//  The items of a text to replace, through sequences, variables defined as
+//  strings and captures: e.g., a $v [bc] with $v = xy is a, x, y, [bc].
+static void textItems(re::RE * re, std::vector<re::RE *> & items) {
+    if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        for (re::RE * e : *seq) textItems(e, items);
+    } else if (re::Capture * c = dyn_cast<re::Capture>(re)) {
+        textItems(c->getCapturedRE(), items);
+    } else if (re::Alt * alt = dyn_cast<re::Alt>(re); alt && alt->size() == 1) {
+        textItems(alt->front(), items);
+    } else if (re::Name * name = dyn_cast<re::Name>(re);
+               name && !isFunctionCall(name) && name->getDefinition() && !CharSetAnalysis::isSet(name->getDefinition())) {
+        textItems(name->getDefinition(), items);
+    } else {
+        items.push_back(re);
+    }
+}
+
 static bool isEmptyText(const re::RE * re) {
     const re::Seq * seq = dyn_cast_or_null<re::Seq>(re);
     return re == nullptr || (seq && seq->empty());
@@ -78,11 +95,17 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             const RuleSide * source = c->getSourceSide(Direction::Forward);
             const RuleSide * result = c->getResultSide(Direction::Forward);
             re::RE * const text = source->getText();
+            std::vector<re::RE *> items;
+            textItems(text, items);
             std::string problem;
             std::u32string replacement;
-            if (!CharSetAnalysis::isSet(text) || hasStrings(text)) {
-                problem = "the text to replace is not a single character";
-            } else if (mayIncludeTextBoundary(text)) {
+            bool singleChars = !items.empty();
+            for (re::RE * item : items) singleChars &= CharSetAnalysis::isSet(item) && !hasStrings(item);
+            bool boundary = false;
+            for (re::RE * item : items) boundary |= mayIncludeTextBoundary(item);
+            if (!singleChars) {
+                problem = "the text to replace is not a fixed-length sequence of characters";
+            } else if (boundary) {
                 problem = "the text to replace includes the text boundary";
             } else if (result->hasCursor() && (!isEmptyText(result->getResultToRevisit()) || result->getCursorOffset() != 0)) {
                 problem = "the result has text to revisit";
@@ -101,6 +124,19 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             }
             re::RE * const before = source->getBeforeContext();
             re::RE * const after = source->getAfterContext();
+            group->rules.push_back(c);
+            if (items.size() > 1) {
+                StringRule s;
+                for (re::RE * item : items) s.text.push_back(sets.setOf(item, false));
+                s.replacement = replacement;
+                s.before = before;
+                s.after = after;
+                s.engineBefore = before ? engineContext(before, false) : nullptr;
+                s.engineAfter = after ? engineContext(after, true) : nullptr;
+                s.rule = c;
+                group->stringRules.push_back(std::move(s));
+                continue;
+            }
             const std::string key = (before ? printPattern(before) : "") + " { } " + (after ? printPattern(after) : "");
             CharMapSubgroup * subgroup = nullptr;
             for (CharMapSubgroup & s : group->subgroups) {
@@ -122,6 +158,34 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             for (const auto & range : sets.setOf(text, false)) {
                 for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
                     subgroup->charMap.emplace(cp, replacement);   // the earliest rule takes precedence
+                }
+            }
+        }
+    }
+    //  As the rules of a group are applied at all positions at once, no rule may
+    //  match within the text of a string rule (where ICU, having replaced the
+    //  text, does not apply rules).
+    //  A quick check first: a rule may match within the text only if its first
+    //  characters may occur at a position of the text other than the first.  The
+    //  first rule found that may match within a text is reported.
+    for (const TransformStep & step : plan.steps) {
+        if (step.stringRules.empty()) continue;
+        std::vector<UCD::UnicodeSet> firstChars;
+        for (const ConversionRule * r : step.rules) {
+            std::vector<re::RE *> items;
+            textItems(r->getSourceSide(Direction::Forward)->getText(), items);
+            firstChars.push_back(items.empty() ? UCD::UnicodeSet() : sets.setOf(items.front(), false));
+        }
+        RuleOverlapAnalysis analysis;
+        for (const StringRule & s : step.stringRules) {
+            UCD::UnicodeSet within;
+            for (size_t k = 1; k < s.text.size(); k++) within = within + s.text[k];
+            for (size_t i = 0; i < step.rules.size(); i++) {
+                const ConversionRule * const r = step.rules[i];
+                if ((firstChars[i] & within).empty()) continue;
+                if (analysis.mayMatchWithin(r, s.rule)) {
+                    plan.problems.push_back(printRule(r) + "  (may match within the text of " + printRule(s.rule) + ")");
+                    break;
                 }
             }
         }

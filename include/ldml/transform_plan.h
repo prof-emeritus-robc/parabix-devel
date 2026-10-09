@@ -10,15 +10,18 @@
 //  sequence of conversion rules (with any variable definitions among them)
 //  is a conversion group.
 //
-//  A conversion rule is implementable if its text to replace is a single
-//  character of a set (without strings or the text boundary), possibly with
-//  before and after contexts, and its result is a fixed string (characters,
-//  or variables defined as strings, without references, function calls or
-//  text to revisit).  The rules of a group are implementable together as a
-//  sequence of subgroups: the rules with the same contexts (as printed) form
-//  a subgroup, in the order of their first rules, each a map from characters
-//  to their replacement strings (the earliest rule for a character takes
-//  precedence).
+//  A conversion rule is implementable if its text to replace has a fixed
+//  length, each of its characters being of a set (without strings or the text
+//  boundary), possibly with before and after contexts, and its result is a
+//  fixed string (characters, or variables defined as strings, without
+//  references, function calls or text to revisit).  The rules of a group
+//  replacing single characters are implementable together as a sequence of
+//  subgroups: the rules with the same contexts (as printed) form a subgroup,
+//  in the order of their first rules, each a map from characters to their
+//  replacement strings (the earliest rule for a character takes precedence).
+//  Each rule replacing a text of two or more characters is a string rule of
+//  its own; no rule of the group may match within its text (other than at its
+//  start), as the rules are applied to all positions at once.
 
 #pragma once
 
@@ -43,11 +46,25 @@ struct CharMapSubgroup {
     unsigned rules = 0;         // the number of rules
 };
 
+// A conversion rule replacing a fixed-length text of two or more characters.
+struct StringRule {
+    std::vector<UCD::UnicodeSet> text;  // the characters at each position of the text
+    std::u32string replacement;
+    // The contexts, as for CharMapSubgroup.
+    re::RE * before = nullptr;
+    re::RE * after = nullptr;
+    re::RE * engineBefore = nullptr;
+    re::RE * engineAfter = nullptr;
+    const ConversionRule * rule = nullptr;
+};
+
 struct TransformStep {
     enum class Kind {Conversion, Transform};
     Kind kind;
-    // A conversion group: its subgroups.
+    // A conversion group: its subgroups, string rules, and implementable rules.
     std::vector<CharMapSubgroup> subgroups;
+    std::vector<StringRule> stringRules;
+    std::vector<const ConversionRule *> rules;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

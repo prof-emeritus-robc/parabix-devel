@@ -582,7 +582,14 @@ unsigned grepOffset(const RE * re) {
         if (seq->empty()) return 1;
         for (auto i = seq->rbegin(); i != seq->rend(); ++i) {
             unsigned o = grepOffset(*i);
-            if (!isa<Assertion>(*i) && !isa<End>(*i)) return o;
+            // An assertion may be named (e.g. a lookahead externalized by
+            // LookAheadNamer): it is zero-width all the same.
+            const RE * e = *i;
+            while (const Name * n = dyn_cast<Name>(e)) {
+                if (n->getDefinition() == nullptr) break;
+                e = n->getDefinition();
+            }
+            if (!isa<Assertion>(e) && !isa<End>(e)) return o;
             if (o == 1) return o;
         }
         return 1;

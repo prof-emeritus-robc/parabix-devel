@@ -1515,6 +1515,61 @@ bool RE_PipelineBuilder::uniquePrefixSpans(RE * re, StreamSet * spans) {
     return true;
 }
 
+namespace {
+// The strings matched by r (an alternation of sequences of items resolving
+// to character classes), or false if r is not of that form.
+bool classStrings(RE * r, std::vector<std::vector<CC *>> & strings) {
+    if (CC * const cc = resolveCharClass(r)) {
+        strings.push_back({cc});
+        return !cc->empty();
+    }
+    return parseStringClass(r, strings);
+}
+
+// Is every string matched by Y also matched by X (character classes, or
+// string classes; see classStrings)?
+bool coversStrings(RE * X, RE * Y) {
+    std::vector<std::vector<CC *>> xs, ys;
+    if (!classStrings(X, xs) || !classStrings(Y, ys)) return false;
+    for (const auto & y : ys) {
+        bool covered = false;
+        for (const auto & x : xs) {
+            if (x.size() != y.size()) continue;
+            covered = true;
+            for (size_t i = 0; covered && (i < y.size()); ++i) covered = y[i]->subset(*x[i]);
+            if (covered) break;
+        }
+        if (!covered) return false;
+    }
+    return true;
+}
+
+// An assertion, possibly as the definition of a name (an externalized
+// assertion), or nullptr.
+Assertion * definedAssertion(RE * r) {
+    while (Name * const n = dyn_cast<Name>(r)) {
+        if (n->getDefinition() == nullptr) return nullptr;
+        r = n->getDefinition();
+    }
+    return dyn_cast<Assertion>(r);
+}
+
+// A negative lookahead assertion (see definedAssertion), or nullptr.
+Assertion * negativeLookahead(RE * r) {
+    Assertion * const a = definedAssertion(r);
+    if ((a == nullptr) || (a->getKind() != Assertion::Kind::LookAhead) || (a->getSense() != Assertion::Sense::Negative)) {
+        return nullptr;
+    }
+    return a;
+}
+
+// Is r a lookbehind assertion (see definedAssertion)?
+bool isLookbehind(RE * r) {
+    Assertion * const a = definedAssertion(r);
+    return a && (a->getKind() == Assertion::Kind::LookBehind);
+}
+}
+
 bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     // Chains are compiled with one position per code unit.
     if (mCtxt.mIndexStream != nullptr) return false;
@@ -1524,7 +1579,31 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     } else {
         elems.push_back(re);
     }
+    // Lookbehinds at the start hold at the starts of the matches: they are
+    // compiled on their own and restrict the starts of the rest.
+    const auto lookbehindEnd = std::find_if_not(elems.begin(), elems.end(), isLookbehind);
+    const std::vector<RE *> lookbehinds(elems.begin(), lookbehindEnd);
+    elems.erase(elems.begin(), lookbehindEnd);
     if (elems.empty()) return false;
+    // Negative lookaheads (?!Y) at the end (possibly externalized), following
+    // a final star X{lb,} where every string of Y is a string of X (as in the
+    // possessive form X{lb,} (?!X)), do not change the spans: the furthest
+    // end of a match from each start cannot be followed by Y, as X{lb,} would
+    // extend over it.  They are dropped.
+    size_t n = elems.size();
+    while ((n > 1) && negativeLookahead(elems[n - 1])) {
+        n--;
+    }
+    if (n < elems.size()) {
+        Rep * const rep = dyn_cast<Rep>(elems[n - 1]);
+        if (rep && (rep->getUB() == Rep::UNBOUNDED_REP)) {
+            bool covered = true;
+            for (size_t i = n; covered && (i < elems.size()); ++i) {
+                covered = coversStrings(rep->getRE(), negativeLookahead(elems[i])->getAsserted());
+            }
+            if (covered) elems.resize(n);
+        }
+    }
     // Final stars, each of a class or of a string class: a final X{lb,} of a
     // class with lb > 0 is X{lb} followed by X*, where X{lb} ends the chain;
     // a string class with lb = 1 must be the first final star, and the
@@ -1603,7 +1682,18 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
         mPB.CreateKernelCall<StreamSelect>(Hend, Select(finalSteps.front().strm, {1}));
     }
     std::vector<ChainStepStreams> rec;
-    StreamSet * const starts = segments.empty() ? Hend : chainMatchStarts(segments, &rec, Hend);
+    StreamSet * starts = segments.empty() ? Hend : chainMatchStarts(segments, &rec, Hend);
+    if (!lookbehinds.empty()) {
+        StreamSet * const holds = mPB.CreateStreamSet(1);
+        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(lookbehinds.begin(), lookbehinds.end()), holds);
+        StreamSet * const restricted = mPB.CreateStreamSet(1);
+        AndCombine(mPB, starts, holds, restricted);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBitstream("chainStarts", starts);
+            mPB.captureBitstream("lookbehindHolds", holds);
+        }
+        starts = restricted;
+    }
     std::vector<ChainCoverage::Step> steps;
     for (unsigned i = 0; i < segments.size(); ++i) {
         const LookaheadSegment & seg = segments[i];

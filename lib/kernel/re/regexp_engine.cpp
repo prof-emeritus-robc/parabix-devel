@@ -624,6 +624,43 @@ static std::string chainAssertionEndName(const std::vector<bool> & negated, bool
     return name + (follows ? "_f" : "") + (rest ? "_h" : "");
 }
 
+EndOfTextMark::EndOfTextMark(LLVMTypeSystemInterface & ts, StreamSet * source, StreamSet * mark)
+: PabloKernel(ts, "EndOfTextMark" + std::to_string(source->getNumElements()) + "x" + std::to_string(source->getFieldWidth()),
+              {Binding{"source", source}},
+              {Binding{"mark", mark, FixedRate(), Add1()}}) {
+}
+
+void EndOfTextMark::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * const advOnes = pb.createAdvance(pb.createOnes(), 1);
+    writeOutputStreamSet("mark", std::vector<PabloAST *>{pb.createAtEOF(advOnes)});
+}
+
+ExtendByOne::ExtendByOne(LLVMTypeSystemInterface & ts, StreamSet * source, StreamSet * extended)
+: PabloKernel(ts, "ExtendByOne" + std::to_string(source->getNumElements()) + "x1",
+              {Binding{"source", source}},
+              {Binding{"extended", extended, FixedRate(), Add1()}}) {
+}
+
+void ExtendByOne::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * const inText = pb.createNot(pb.createAtEOF(pb.createOnes()));
+    std::vector<PabloAST *> extended;
+    for (PabloAST * strm : getInputStreamSet("source")) extended.push_back(pb.createAnd(strm, inText));
+    writeOutputStreamSet("extended", extended);
+}
+
+StartOfTextMark::StartOfTextMark(LLVMTypeSystemInterface & ts, StreamSet * source, StreamSet * mark)
+: PabloKernel(ts, "StartOfTextMark" + std::to_string(source->getNumElements()) + "x" + std::to_string(source->getFieldWidth()),
+              {Binding{"source", source}},
+              {Binding{"mark", mark}}) {
+}
+
+void StartOfTextMark::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    writeOutputStreamSet("mark", std::vector<PabloAST *>{pb.createNot(pb.createAdvance(pb.createOnes(), 1))});
+}
+
 ChainAssertionEnd::ChainAssertionEnd(LLVMTypeSystemInterface & ts, std::vector<StreamSet *> classes,
                                      std::vector<bool> negated, StreamSet * follows, StreamSet * Hrest, StreamSet * H)
 : PabloKernel(ts, chainAssertionEndName(negated, follows != nullptr, Hrest != nullptr),
@@ -1023,6 +1060,32 @@ RE_PipelineBuilder::RE_PipelineBuilder(PipelineBuilder & P, RE_context context)
   mFinalMatchStarts(context.matchStarts), mFinalMatchFollows(context.matchFollows) {
 }
 
+// Does the RE match End anywhere (including within assertions and the
+// definitions of names)?
+static bool hasEndAnchorAnywhere(const RE * re) {
+    if (isa<End>(re)) return true;
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (hasEndAnchorAnywhere(e)) return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (hasEndAnchorAnywhere(e)) return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        return hasEndAnchorAnywhere(rep->getRE());
+    } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
+        return hasEndAnchorAnywhere(a->getAsserted());
+    } else if (const Diff * d = dyn_cast<Diff>(re)) {
+        return hasEndAnchorAnywhere(d->getLH()) || hasEndAnchorAnywhere(d->getRH());
+    } else if (const re::Intersect * x = dyn_cast<re::Intersect>(re)) {
+        return hasEndAnchorAnywhere(x->getLH()) || hasEndAnchorAnywhere(x->getRH());
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        return hasEndAnchorAnywhere(c->getCapturedRE());
+    } else if (const Group * g = dyn_cast<Group>(re)) {
+        return hasEndAnchorAnywhere(g->getRE());
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() && hasEndAnchorAnywhere(n->getDefinition());
+    }
+    return false;
+}
+
 void RE_PipelineBuilder::ensurePrepared(RE *& re) {
     if (mPrepared) return;
     mPrepared = true;
@@ -1034,6 +1097,25 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
     StreamSet * source = mSourceContext.source;
     StreamSet * matchStarts = mSourceContext.matchStarts;
     StreamSet * matchFollows = mSourceContext.matchFollows;
+
+    // Without match regions, Start and End match at the start and the end of
+    // the text: if the RE has End, the text (of bit streams) is made one match
+    // region, from its first position to the position after its last code
+    // unit, which the text is extended by (as an unterminated last line is
+    // in grep).  The results then have that position too.
+    if ((matchStarts == nullptr) && (source->getFieldWidth() == 1) && hasEndAnchorAnywhere(re)) {
+        StreamSet * const extended = mPB.CreateStreamSet(source->getNumElements(), 1);
+        mPB.CreateKernelCall<ExtendByOne>(source, extended);
+        matchFollows = mPB.CreateStreamSet(1, 1);
+        mPB.CreateKernelCall<EndOfTextMark>(source, matchFollows);
+        matchStarts = mPB.CreateStreamSet(1, 1);
+        mPB.CreateKernelCall<StartOfTextMark>(extended, matchStarts);
+        source = extended;
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBitstream("textStart", matchStarts);
+            mPB.captureBitstream("textFollow", matchFollows);
+        }
+    }
 
     if (mSourceContext.encoding == &cc::Unicode) {
         // Already fully Unicode-encoded by the caller (e.g. csvgrep); use as-is.
@@ -1301,6 +1383,8 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
         if (seg->end) {
             // The end of the text holds at a position followed by the end of
             // a match region (as End is compiled): H is the region follows.
+            // (Without match regions, the text is made one region, see
+            // ensurePrepared.)
             if (mCtxt.mMatchFollows == nullptr) {
                 llvm::report_fatal_error("A lookahead ending with the end of the text requires match regions");
             }

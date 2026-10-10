@@ -444,6 +444,15 @@ Marker RE_Block_Compiler::compileAssertion(Assertion * const a, Marker marker) {
         // One character in UTF-8 code units (left in place by LookAheadNamer).
         lengths = std::make_pair(1, 1);
     }
+    // A lookahead to the end of the text (or region) holds where End does,
+    // compiled from the marker itself, which it leaves in place (as
+    // grepOffset expects: End is compiled with a lookahead).
+    if (isa<End>(asserted) &&
+            ((marker.position() == Position::AtEnd) || (marker.position() == Position::AtNextChar))) {
+        Marker atEnd = compileEnd(marker);
+        if (a->getSense() == Assertion::Sense::Positive) return atEnd;
+        return Marker(mPB.createAnd(marker.stream(), mPB.createNot(atEnd.stream()), "notEnd"), marker.position());
+    }
     // Zero-width assertions
     if (lengths.second == 0) {
         Marker lookahead = compile(asserted);

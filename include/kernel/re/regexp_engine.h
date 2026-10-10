@@ -323,6 +323,34 @@ private:
 // within the chain, the rest of the chain holds: Hrest).  At a region follow
 // (the end of the text), only negative lookaheads hold.
 //
+//
+// For a text without match regions (see RE_PipelineBuilder::ensurePrepared):
+// ExtendByOne extends the bit streams of a text by one (zero) position, after
+// its last code unit; EndOfTextMark marks that position (an output of one
+// more item than the source), the follow of the text as one match region;
+// StartOfTextMark marks the first position of the (extended) text.
+//
+class ExtendByOne : public pablo::PabloKernel {
+public:
+    ExtendByOne(LLVMTypeSystemInterface & ts, kernel::StreamSet * source, kernel::StreamSet * extended);
+protected:
+    void generatePabloMethod() override;
+};
+
+class EndOfTextMark : public pablo::PabloKernel {
+public:
+    EndOfTextMark(LLVMTypeSystemInterface & ts, kernel::StreamSet * source, kernel::StreamSet * mark);
+protected:
+    void generatePabloMethod() override;
+};
+
+class StartOfTextMark : public pablo::PabloKernel {
+public:
+    StartOfTextMark(LLVMTypeSystemInterface & ts, kernel::StreamSet * source, kernel::StreamSet * mark);
+protected:
+    void generatePabloMethod() override;
+};
+
 class ChainAssertionEnd : public pablo::PabloKernel {
 public:
     // Hrest: for lookaheads within the chain, where the rest of the chain holds

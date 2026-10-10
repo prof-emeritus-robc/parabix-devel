@@ -1286,7 +1286,11 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     for (const ldml::CharMapSubgroup & subgroup : step.subgroups) {
         maps.emplace_back();
         for (const ldml::CharMapping & m : subgroup.mappings) {
-            const UCD::UnicodeSet chars = restricted(m.chars);
+            //  A character replaced by itself does not change (and a subgroup in
+            //  which no character changes needs no matches, whose kernels would
+            //  have no use).
+            UCD::UnicodeSet chars = restricted(m.chars);
+            if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
             if (chars.empty()) continue;
             maps.back().push_back(ldml::CharMapping{chars, m.replacement});
             if (m.replacement.size() > 1) addInsertions(insertions, chars, m.replacement.size() - 1);

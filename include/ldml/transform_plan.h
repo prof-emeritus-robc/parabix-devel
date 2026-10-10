@@ -24,9 +24,9 @@
 //  match within the text of a string rule (other than at its start) must be
 //  kept from applying there: a single-character rule is, by the coverage of
 //  the matches of the string rules (see TransformStep::coverStringRules); a
-//  string rule of two characters within its own text is, by the selection of
-//  its matches (see StringRule::selfOverlapping); other string rules are not
-//  supported.
+//  string rule is, if the string rules of the group can be applied in a single
+//  pass (see StringRuleOverlaps, TransformStep::stringOrder and
+//  StringRule::selfOverlapping); other string rules are not supported.
 
 #pragma once
 
@@ -91,6 +91,14 @@ struct TransformStep {
     // not apply it: the rule then applies only at the positions not covered by
     // the matches of the string rules (other than their starts).
     bool coverStringRules = false;
+    // If string rules may match within the texts of others, and they can be
+    // applied in a single pass (see StringRuleOverlaps::singlePass): the string
+    // rules in the order to apply them (indices in stringRules), and for each,
+    // the rules within whose texts it may match (which precede it): a match of
+    // the rule applies only if it does not begin within an applied match of
+    // these.  Empty otherwise.
+    std::vector<size_t> stringOrder;
+    std::vector<std::vector<size_t>> stringPredecessors;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;
@@ -158,6 +166,10 @@ struct StringRuleOverlaps {
     // Can the string rules be applied sequentially in a single pass?
     bool singlePass() const {return twoWay == 0 && (acyclic || (acyclicApartFromSelf && selfSelectable));}
     unsigned singlePassStages() const {return acyclic ? stages : stagesApartFromSelf;}
+    // If the graph without the self-overlaps is acyclic: a topological order of
+    // the rules, and for each rule the rules preceding it (one-way pairs).
+    std::vector<size_t> order;
+    std::vector<std::vector<size_t>> predecessors;
 };
 StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step);
 

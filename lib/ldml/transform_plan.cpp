@@ -181,13 +181,16 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     //  match within the text of a string rule (where ICU, having replaced the
     //  text, does not apply rules).  A single-character rule matching there is
     //  kept from applying by the coverage of the string rules (see
-    //  TransformStep::coverStringRules), and a rule of two characters matching
-    //  within its own text by the selection of its matches (see StringRule::
-    //  selfOverlapping); another string rule matching there (whose match may
-    //  then overlap the text) is not supported.
+    //  TransformStep::coverStringRules).  String rules matching within the texts
+    //  of string rules are supported if the string rules of the group can be
+    //  applied in a single pass (see StringRuleOverlaps): in a topological order,
+    //  each applying where it does not begin within an applied match of a rule
+    //  preceding it (TransformStep::stringOrder), and a rule of two characters
+    //  matching within its own text by the selection of its matches (see
+    //  StringRule::selfOverlapping).  Otherwise, for each string rule within
+    //  whose text a string rule may match, the first such rule is reported.
     //  A quick check first: a rule may match within the text only if its first
-    //  characters may occur at a position of the text other than the first.  The
-    //  first string rule found that may match within a text is reported.
+    //  characters may occur at a position of the text other than the first.
     for (TransformStep & step : plan.steps) {
         if (step.stringRules.empty()) continue;
         std::vector<UCD::UnicodeSet> firstChars;
@@ -199,25 +202,39 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             single.push_back(items.size() == 1);
         }
         RuleOverlapAnalysis analysis;
-        for (StringRule & s : step.stringRules) {
+        for (const StringRule & s : step.stringRules) {
+            if (step.coverStringRules) break;
             UCD::UnicodeSet within;
             for (size_t k = 1; k < s.text.size(); k++) within = within + s.text[k];
             for (size_t i = 0; i < step.rules.size(); i++) {
-                const ConversionRule * const r = step.rules[i];
-                if ((firstChars[i] & within).empty()) continue;
-                if (single[i] && step.coverStringRules) continue;
-                if (analysis.mayMatchWithin(r, s.rule)) {
-                    if (single[i]) {
-                        step.coverStringRules = true;
-                        continue;
-                    }
-                    if (r == s.rule && s.text.size() == 2) {
-                        s.selfOverlapping = true;
-                        continue;
-                    }
-                    plan.problems.push_back(printRule(r) + "  (may match within the text of " + printRule(s.rule) + ")");
+                if (!single[i] || (firstChars[i] & within).empty()) continue;
+                if (analysis.mayMatchWithin(step.rules[i], s.rule)) {
+                    step.coverStringRules = true;
                     break;
                 }
+            }
+        }
+        //  String rules within the texts of string rules.
+        const StringRuleOverlaps overlaps = analyzeStringRuleOverlaps(step);
+        if (overlaps.pairs.empty()) continue;
+        if (overlaps.singlePass()) {
+            step.stringOrder = overlaps.order;
+            step.stringPredecessors = overlaps.predecessors;
+            for (const StringRuleOverlaps::Pair & p : overlaps.pairs) {
+                if (p.kind == StringRuleOverlaps::Kind::Self) step.stringRules[p.outer].selfOverlapping = true;
+            }
+            continue;
+        }
+        //  The first rule found that may match within the text of each.
+        std::vector<bool> reported(step.stringRules.size(), false);
+        for (const StringRuleOverlaps::Pair & p : overlaps.pairs) {
+            const size_t outers[2] = {p.outer, p.inner};
+            for (unsigned k = 0; k < (p.kind == StringRuleOverlaps::Kind::TwoWay ? 2u : 1u); k++) {
+                const size_t outer = outers[k], inner = outers[1 - k];
+                if (reported[outer]) continue;
+                reported[outer] = true;
+                plan.problems.push_back(printRule(step.stringRules[inner].rule) + "  (may match within the text of "
+                                        + printRule(step.stringRules[outer].rule) + ")");
             }
         }
     }
@@ -281,6 +298,7 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
     //  A depth-first search of the graph (with or without the self-overlaps):
     //  a cycle (an edge to a rule on the path), or the number of rules in the
     //  longest chain (0 without edges).
+    std::vector<size_t> postorder;
     auto search = [&](bool withSelf, std::vector<size_t> & cycle) -> std::pair<bool, unsigned> {
         enum : unsigned char {Unvisited, OnPath, Done};
         std::vector<unsigned char> state(n, Unvisited);
@@ -315,6 +333,7 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
                         chain[v] = std::max(chain[v], chain[w] + 1);
                     }
                     if (edges) stages = std::max(stages, chain[v]);
+                    if (!withSelf) postorder.push_back(v);
                     state[v] = Done;
                     path.pop_back();
                     stack.pop_back();
@@ -326,6 +345,16 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
     std::tie(result.acyclic, result.stages) = search(true, result.cycle);
     std::vector<size_t> ignored;
     std::tie(result.acyclicApartFromSelf, result.stagesApartFromSelf) = search(false, ignored);
+    if (result.acyclicApartFromSelf) {
+        //  Each rule follows the rules it is reached from.
+        result.order.assign(postorder.rbegin(), postorder.rend());
+        result.predecessors.resize(n);
+        for (size_t a = 0; a < n; a++) {
+            for (size_t b : precedes[a]) {
+                if (b != a) result.predecessors[b].push_back(a);
+            }
+        }
+    }
     return result;
 }
 

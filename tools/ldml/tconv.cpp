@@ -1486,11 +1486,29 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     StreamSet * spans = nullptr;
     StreamSet * starts = nullptr;
 
-    for (size_t r = 0; r < step.stringRules.size(); r++) {
+    //  The string rules, in the order to apply them: where string rules may match
+    //  within the texts of others, a match of a rule applies only if it does not
+    //  begin within an applied match of a rule preceding it (see
+    //  ldml::TransformStep::stringOrder).  For these, the positions within the
+    //  applied matches after their first.
+    std::vector<size_t> order = step.stringOrder;
+    if (order.empty()) {
+        for (size_t r = 0; r < step.stringRules.size(); r++) order.push_back(r);
+    }
+    std::vector<bool> preceding(step.stringRules.size(), false);
+    for (const std::vector<size_t> & predecessors : step.stringPredecessors) {
+        for (size_t a : predecessors) preceding[a] = true;
+    }
+    std::vector<StreamSet *> within(step.stringRules.size(), nullptr);
+
+    for (size_t r : order) {
         const ldml::StringRule & rule = step.stringRules[r];
         const std::vector<UCD::UnicodeSet> & text = texts[r];
         if (text.empty()) continue;
         const size_t n = text.size(), m = rule.replacement.size();
+        const std::vector<size_t> * const predecessors = step.stringPredecessors.empty() ? nullptr : &step.stringPredecessors[r];
+        //  Whether only some of the matches apply.
+        const bool selected = (predecessors && !predecessors->empty()) || rule.selfOverlapping;
         //  The positions of the last characters of the matches (and their spans).
         StreamSet * matches = nullptr;
         StreamSet * ruleSpans = nullptr;
@@ -1499,7 +1517,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             t.back() = k.second;
             StreamSet * kSpans = nullptr;
             matches = combine(matches, matchPositions(rule.engineBefore, rule.engineAfter, t, k.first, insertions, U21,
-                                                      step.coverStringRules && !rule.selfOverlapping ? &kSpans : nullptr), true);
+                                                      step.coverStringRules && !selected ? &kSpans : nullptr), true);
             if (kSpans) ruleSpans = combine(ruleSpans, kSpans, true);
         }
         StreamSet * const allMatches = matches;
@@ -1516,26 +1534,55 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 matches = combine(matches, within, false);
             }
         }
+        //  The matches that do not begin within an applied match of a preceding
+        //  rule (marked at their last characters, n - 1 positions after their
+        //  first: as only the last character of a text may be followed by
+        //  inserted positions, the characters of a text are consecutive).
+        if (predecessors) {
+            StreamSet * covered = nullptr;
+            for (size_t a : *predecessors) {
+                if (within[a]) covered = combine(covered, within[a], true);
+            }
+            if (covered) {
+                StreamSet * const atEnd = P.CreateStreamSet(1);
+                P.CreateKernelCall<ShiftForward>(covered, atEnd, static_cast<unsigned>(n - 1));
+                matches = combine(matches, inverted(atEnd), false);
+            }
+        }
         //  The matches of a rule matching within its own text that apply.
         if (rule.selfOverlapping) {
-            StreamSet * const selected = P.CreateStreamSet(1);
-            P.CreateKernelCall<AlternateMatches>(matches, selected);
-            matches = selected;
+            StreamSet * const alternate = P.CreateStreamSet(1);
+            P.CreateKernelCall<AlternateMatches>(matches, alternate);
+            matches = alternate;
         }
         SHOW_STREAM(matches);
-        if (step.coverStringRules && rule.selfOverlapping) {
+        //  The positions within the applied matches after their first (for the
+        //  rules following this one, and the coverage of the string rules).
+        StreamSet * inside = nullptr;
+        if (preceding[r] || (selected && step.coverStringRules)) {
+            for (size_t j = 0; j + 1 < n; j++) {
+                StreamSet * back = matches;
+                if (j > 0) {
+                    back = P.CreateStreamSet(1);
+                    P.CreateKernelCall<ShiftBack>(matches, back, static_cast<unsigned>(j));
+                }
+                inside = combine(inside, back, true);
+            }
+            SHOW_STREAM(inside);
+            within[r] = inside;
+        }
+        if (step.coverStringRules && selected) {
             //  The spans of the matches that apply (the engine's spans, the
-            //  union of those of all the matches, would include the overlapping
-            //  ones): their two positions.
+            //  union of those of all the matches, would include the others).
             StreamSet * const first = P.CreateStreamSet(1);
-            P.CreateKernelCall<ShiftBack>(matches, first, 1);
-            spans = combine(spans, combine(matches, first, true), true);
+            P.CreateKernelCall<ShiftBack>(matches, first, static_cast<unsigned>(n - 1));
+            spans = combine(spans, combine(inside, first, true), true);
             starts = combine(starts, first, true);
         } else if (step.coverStringRules) {
             //  Within a filter, the spans of the matches that do not apply (those
-            //  extending beyond the mask) do not count: as the matches of the
-            //  string rules do not overlap (one matching within another is not
-            //  supported), these are the n positions up to their ends.
+            //  extending beyond the mask) do not count: as the matches of this
+            //  rule do not overlap one another (it does not match within its own
+            //  text), these are the n positions up to their ends.
             if (mask) {
                 StreamSet * const rejected = combine(allMatches, inverted(matches), false);
                 StreamSet * rejectedSpans = rejected;

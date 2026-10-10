@@ -17,7 +17,7 @@
 //  references, function calls or text to revisit).  The rules of a group
 //  replacing single characters are implementable together as a sequence of
 //  subgroups: the rules with the same contexts (as printed) form a subgroup,
-//  in the order of their first rules, each a map from characters to their
+//  in the order of their first rules, each mapping sets of characters to their
 //  replacement strings (the earliest rule for a character takes precedence).
 //  Each rule replacing a text of two or more characters is a string rule of
 //  its own; no rule of the group may match within its text (other than at its
@@ -33,6 +33,12 @@
 
 namespace ldml {
 
+// The characters of a subgroup replaced by a string.
+struct CharMapping {
+    UCD::UnicodeSet chars;
+    std::u32string replacement;
+};
+
 struct CharMapSubgroup {
     // The contexts of the rules (nullptr if none), and the same contexts
     // as lookbehind and lookahead bodies for the regular expression engine
@@ -42,8 +48,12 @@ struct CharMapSubgroup {
     re::RE * engineBefore = nullptr;
     re::RE * engineAfter = nullptr;
     std::string contextKey;     // the printed contexts, identifying the subgroup
-    std::map<UCD::codepoint_t, std::u32string> charMap;
+    // The characters of the rules, by their replacements: disjoint sets, one
+    // per replacement string.
+    std::vector<CharMapping> mappings;
     unsigned rules = 0;         // the number of rules
+    // All the characters of the mappings.
+    UCD::UnicodeSet characters() const;
 };
 
 // A conversion rule replacing a fixed-length text of two or more characters.
@@ -86,14 +96,15 @@ struct TransformPlan {
 TransformPlan planTransform(const std::vector<Rule *> & rules);
 
 // A context (as given for the regular expression engine, see engineContext)
-// rewritten for matching text in which each character c of the map has been
-// followed by insertions[c] positions holding the filler codepoint, to make
+// rewritten for matching text in which each character of insertions[k] (the
+// sets are disjoint) has been followed by k positions holding the filler
+// codepoint, to make
 // space for its replacement: each set item matches its characters, each
 // followed by its fillers, and never matches the filler itself.  The filler
 // should be a codepoint that cannot occur in the text (e.g., a surrogate), so
 // that the inserted positions are distinguished from the characters of the
 // text (including U+0000).
-re::RE * expandedContext(re::RE * context, const std::map<UCD::codepoint_t, unsigned> & insertions,
+re::RE * expandedContext(re::RE * context, const std::map<unsigned, UCD::UnicodeSet> & insertions,
                          UCD::codepoint_t filler);
 
 // The characters that the set items of a pattern (e.g. a context) may match,

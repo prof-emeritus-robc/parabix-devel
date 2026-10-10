@@ -75,6 +75,12 @@ static bool isEmptyText(const re::RE * re) {
     return re == nullptr || (seq && seq->empty());
 }
 
+UCD::UnicodeSet CharMapSubgroup::characters() const {
+    UCD::UnicodeSet all;
+    for (const CharMapping & m : mappings) all = all + m.chars;
+    return all;
+}
+
 TransformPlan planTransform(const std::vector<Rule *> & rules) {
     TransformPlan plan;
     CharSetAnalysis sets;
@@ -155,10 +161,17 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
                 subgroup->contextKey = key;
             }
             subgroup->rules++;
-            for (const auto & range : sets.setOf(text, false)) {
-                for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
-                    subgroup->charMap.emplace(cp, replacement);   // the earliest rule takes precedence
-                }
+            //  The earliest rule for a character takes precedence.
+            const UCD::UnicodeSet chars = sets.setOf(text, false) - subgroup->characters();
+            if (chars.empty()) continue;
+            CharMapping * same = nullptr;
+            for (CharMapping & m : subgroup->mappings) {
+                if (m.replacement == replacement) same = &m;
+            }
+            if (same) {
+                same->chars = same->chars + chars;
+            } else {
+                subgroup->mappings.push_back(CharMapping{chars, replacement});
             }
         }
     }
@@ -193,24 +206,20 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     return plan;
 }
 
-static re::RE * expandContext(re::RE * re, const std::map<UCD::codepoint_t, unsigned> & insertions,
+static re::RE * expandContext(re::RE * re, const std::map<unsigned, UCD::UnicodeSet> & insertions,
                               UCD::codepoint_t filler, CharSetAnalysis & sets) {
     if (isa<re::CC>(re) || isa<re::PropertyExpression>(re) || isa<re::Any>(re) || isa<re::Diff>(re) || isa<re::Intersect>(re)) {
         UCD::UnicodeSet chars = sets.setOf(re, false);
         chars = chars - UCD::UnicodeSet(filler);
-        //  The characters by the number of null codepoints following them.
-        std::map<unsigned, UCD::UnicodeSet> byInsertion;
-        for (const auto & range : chars) {
-            for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
-                const auto f = insertions.find(cp);
-                if (f != insertions.end() && f->second > 0) byInsertion[f->second].insert(cp);
-            }
-        }
+        //  The characters by the number of filler codepoints following them.
         std::vector<re::RE *> alts;
         UCD::UnicodeSet plain = chars;
-        for (const auto & k : byInsertion) {
-            plain = plain - k.second;
-            std::vector<re::RE *> seq{re::makeCC(k.second, &cc::Unicode)};
+        for (const auto & k : insertions) {
+            if (k.first == 0) continue;
+            const UCD::UnicodeSet followed = chars & k.second;
+            if (followed.empty()) continue;
+            plain = plain - followed;
+            std::vector<re::RE *> seq{re::makeCC(followed, &cc::Unicode)};
             for (unsigned i = 0; i < k.first; i++) seq.push_back(re::makeCC(filler, &cc::Unicode));
             alts.push_back(re::makeSeq(seq.begin(), seq.end()));
         }
@@ -237,7 +246,7 @@ static re::RE * expandContext(re::RE * re, const std::map<UCD::codepoint_t, unsi
     return re;
 }
 
-re::RE * expandedContext(re::RE * context, const std::map<UCD::codepoint_t, unsigned> & insertions,
+re::RE * expandedContext(re::RE * context, const std::map<unsigned, UCD::UnicodeSet> & insertions,
                          UCD::codepoint_t filler) {
     CharSetAnalysis sets;
     return expandContext(context, insertions, filler, sets);

@@ -599,7 +599,13 @@ RuleSide * RuleTextParser::parseSide() {
             ParseFailure("Misplaced '@'");
         }
     }
+    // A sequence with an item that never matches (such as a set of the text
+    // boundary alone, within the text) is kept as written, rather than
+    // simplified to that item, so that its segments remain for the references.
     auto seq = [](std::vector<RE *> & items, size_t b, size_t e) -> RE * {
+        for (size_t i = b; i < e; i++) {
+            if (isEmptySet(items[i]) && (e - b > 1)) return Seq::Create(items.begin() + b, items.begin() + e);
+        }
         return makeSeq(items.begin() + b, items.begin() + e);
     };
     // The text boundary is the start of the text in the before context, and
@@ -611,17 +617,20 @@ RuleSide * RuleTextParser::parseSide() {
         return resolveTextBoundary(seq(parts[p], 0, parts[p].size()),
                                    p == Before ? BoundaryResolution::Start : BoundaryResolution::End, &rebuilt);
     };
-    // Within the text, the boundary may be matched only by its first item (at
-    // the start of the text) or its last item (at the end of the text).
+    // Within the text, a set matches the text boundary only as the last of two
+    // or more items, at the end of the text (as in ICU: a [^a] → y replaces a
+    // final a, but [^a] a → y does not apply at the start of the text, and
+    // [^a] → y does not insert y at the end, as ICU never applies a rule to an
+    // empty match).  The anchors ^ and $ are Start and End, not set members,
+    // and are unaffected.
     size_t firstItem = 0;
     while (firstItem < text.size() && text[firstItem] == nullptr) firstItem++;
     size_t lastItem = text.size();
     while (lastItem > firstItem && text[lastItem - 1] == nullptr) lastItem--;
     for (size_t i = firstItem; i < lastItem; i++) {
         if (text[i] == nullptr) continue;
-        const BoundaryResolution r = (i + 1 == lastItem) ? BoundaryResolution::End
-                                   : (i == firstItem) ? BoundaryResolution::Start : BoundaryResolution::None;
-        text[i] = resolveTextBoundary(text[i], r, &rebuilt);
+        const bool atEnd = (i + 1 == lastItem) && (i > firstItem);
+        text[i] = resolveTextBoundary(text[i], atEnd ? BoundaryResolution::End : BoundaryResolution::None, &rebuilt);
     }
     RE * completed = seq(text, 0, completedEnd);
     RE * revisit = seq(text, revisitStart, text.size());

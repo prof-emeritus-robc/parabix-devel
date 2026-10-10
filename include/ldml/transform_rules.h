@@ -321,8 +321,8 @@ bool isBoundary(const re::RE * re);
 // Does a set include the text boundary (Start, End or the marker as a member)?
 bool includesTextBoundary(const re::RE * set);
 // The pattern with the text boundary marker resolved as Start (for a before
-// context, or the first item of a text), End (for an after context, or the
-// last item of a text) or None (no match, for any other item of a text),
+// context), End (for an after context, or the last of two or more items of a
+// text) or None (no match, for the other items of a text),
 // including within the variables it uses: a variable whose definition
 // includes the marker is replaced by a resolved copy, with the same name.
 enum class BoundaryResolution {Start, End, None};

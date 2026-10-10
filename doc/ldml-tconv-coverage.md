@@ -14,6 +14,43 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 [Reproducing](#reproducing)). The per-transform table is in
 [ldml-tconv-coverage-table.md](ldml-tconv-coverage-table.md).
 
+## Update: W2a (single-character rules within string rules) implemented
+
+Commit `9119ae0d` implements W2a (§4.1):
+
+- **What changes.** A single-character rule that may match within the text of
+  a string rule no longer makes a transform unimplementable.
+- **How.** tconv computes the match spans of the string rules with the regular
+  expression engine (`RE_PipelineBuilder::matchSpanPipeline`), from the first
+  to the last character of each match, without the contexts. Single-character
+  rules then apply only outside those spans or at a match's first position.
+- **Filters.** Within a filter, matches that extend beyond the filter are
+  discounted.
+- **Still reported.** A string rule that may match within another's text (W2b)
+  is still a problem.
+
+Commit `50e26cce` fixes a pipeline compilation failure that the newly
+runnable transforms exposed: subgroups whose rules replace characters by
+themselves were matched without their matches being used.
+
+With the same CLDR data:
+
+- **Coverage:** 145 of 425 CLDR-defined transforms are implementable (60
+  after W1; 122 of the 393 public ones). None of the earlier 60 was lost.
+  - The 85 new ones include all script-to-script transforms among
+    Devanagari, Bengali, Gujarati, Gurmukhi, Kannada, Malayalam, Oriya, Tamil
+    and Telugu, and their Urdu conversions.
+  - Also new: Arab-Latn, Armn-Latn and Latn-Armn, Latn-Syrc,
+    Halfwidth-Fullwidth, Spacedhan-Han and eo-eo_FONIPA.
+- **Tests:** 93 CLDR test files run, 136,236 cases. 84 files pass entirely.
+  The 9 that fail are the two known cases (1,036 cases):
+  - the 8 conversions to Gurmukhi, from InterIndic-Gurmukhi's before context
+    on converted text;
+  - ka-ka_Latn/BGN, whose test data disagrees with its rules.
+- **What remains of W2.** 230 transforms still need W2 (W2b, string rules
+  within string rules, or W2c, expanded non-final characters). It is the only
+  blocker of 69.
+
 ## Update: W1 (filters) implemented
 
 Commit `9dea741` implements filters (§4.2). A filter is computed once, as a
@@ -45,8 +82,7 @@ With the same CLDR data:
     filter. This does not arise when a filter contains the characters of
     its rules, as CLDR's do.
 
-The per-transform table now reflects this state. The rest of this report
-describes the state before W1.
+The rest of this report describes the state before W1.
 
 ## 1. Summary
 

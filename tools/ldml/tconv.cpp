@@ -780,6 +780,32 @@ protected:
     }
 };
 
+//  The matches that apply of a string rule of two characters that may match
+//  within its own text (see ldml::StringRule::selfOverlapping), marked at their
+//  last characters: matches ending at consecutive positions overlap, and of each
+//  run of them, the first and every other one after it apply (those at the
+//  positions of the same parity as the first), as ICU, scanning from the left,
+//  applies the leftmost of overlapping matches and continues after it.
+class AlternateMatches : public pablo::PabloKernel {
+public:
+    AlternateMatches(LLVMTypeSystemInterface & ts, StreamSet * Matches, StreamSet * Selected)
+    : PabloKernel(ts, "AlternateMatches", {Binding{"Matches", Matches}}, {Binding{"Selected", Selected}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const matches = getInputStreamSet("Matches")[0];
+        PabloAST * const odd = pb.createRepeat(1, pb.getInteger(0xAA, 8));
+        PabloAST * const first = pb.createAnd(matches, pb.createAdvance(pb.createNot(matches), 1));
+        PabloAST * const firstOdd = pb.createAnd(first, odd);
+        PabloAST * const firstEven = pb.createXor(first, firstOdd);
+        PabloAST * const oddSelected = pb.createAnd(pb.createMatchStar(firstOdd, matches), odd);
+        PabloAST * const evenSelected = pb.createAnd(pb.createMatchStar(firstEven, matches), pb.createNot(odd));
+        //  MatchStar also marks the position after each run, which is not a match.
+        PabloAST * const selected = pb.createAnd(pb.createOr(oddSelected, evenSelected), matches);
+        writeOutputStreamSet("Selected", std::vector<PabloAST *>{selected});
+    }
+};
+
 //  The codepoint standing for the characters outside the filter of a filtered
 //  normalization (see RulePipelineBuilder::maskedNormalization): a starter
 //  (ccc 0) without a decomposition, which does not compose with any character.
@@ -1472,7 +1498,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             t.back() = k.second;
             StreamSet * kSpans = nullptr;
             matches = combine(matches, matchPositions(rule.engineBefore, rule.engineAfter, t, k.first, insertions, U21,
-                                                      step.coverStringRules ? &kSpans : nullptr), true);
+                                                      step.coverStringRules && !rule.selfOverlapping ? &kSpans : nullptr), true);
             if (kSpans) ruleSpans = combine(ruleSpans, kSpans, true);
         }
         StreamSet * const allMatches = matches;
@@ -1489,8 +1515,22 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 matches = combine(matches, within, false);
             }
         }
+        //  The matches of a rule matching within its own text that apply.
+        if (rule.selfOverlapping) {
+            StreamSet * const selected = P.CreateStreamSet(1);
+            P.CreateKernelCall<AlternateMatches>(matches, selected);
+            matches = selected;
+        }
         SHOW_STREAM(matches);
-        if (step.coverStringRules) {
+        if (step.coverStringRules && rule.selfOverlapping) {
+            //  The spans of the matches that apply (the engine's spans, the
+            //  union of those of all the matches, would include the overlapping
+            //  ones): their two positions.
+            StreamSet * const first = P.CreateStreamSet(1);
+            P.CreateKernelCall<ShiftBack>(matches, first, 1);
+            spans = combine(spans, combine(matches, first, true), true);
+            starts = combine(starts, first, true);
+        } else if (step.coverStringRules) {
             //  Within a filter, the spans of the matches that do not apply (those
             //  extending beyond the mask) do not count: as the matches of the
             //  string rules do not overlap (one matching within another is not

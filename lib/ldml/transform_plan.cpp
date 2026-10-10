@@ -181,8 +181,10 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     //  match within the text of a string rule (where ICU, having replaced the
     //  text, does not apply rules).  A single-character rule matching there is
     //  kept from applying by the coverage of the string rules (see
-    //  TransformStep::coverStringRules); a string rule matching there (whose
-    //  match may then overlap the text) is not supported.
+    //  TransformStep::coverStringRules), and a rule of two characters matching
+    //  within its own text by the selection of its matches (see StringRule::
+    //  selfOverlapping); another string rule matching there (whose match may
+    //  then overlap the text) is not supported.
     //  A quick check first: a rule may match within the text only if its first
     //  characters may occur at a position of the text other than the first.  The
     //  first string rule found that may match within a text is reported.
@@ -197,7 +199,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             single.push_back(items.size() == 1);
         }
         RuleOverlapAnalysis analysis;
-        for (const StringRule & s : step.stringRules) {
+        for (StringRule & s : step.stringRules) {
             UCD::UnicodeSet within;
             for (size_t k = 1; k < s.text.size(); k++) within = within + s.text[k];
             for (size_t i = 0; i < step.rules.size(); i++) {
@@ -207,6 +209,10 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
                 if (analysis.mayMatchWithin(r, s.rule)) {
                     if (single[i]) {
                         step.coverStringRules = true;
+                        continue;
+                    }
+                    if (r == s.rule && s.text.size() == 2) {
+                        s.selfOverlapping = true;
                         continue;
                     }
                     plan.problems.push_back(printRule(r) + "  (may match within the text of " + printRule(s.rule) + ")");

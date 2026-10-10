@@ -24,7 +24,9 @@
 //  match within the text of a string rule (other than at its start) must be
 //  kept from applying there: a single-character rule is, by the coverage of
 //  the matches of the string rules (see TransformStep::coverStringRules); a
-//  string rule is not supported.
+//  string rule of two characters within its own text is, by the selection of
+//  its matches (see StringRule::selfOverlapping); other string rules are not
+//  supported.
 
 #pragma once
 
@@ -69,6 +71,12 @@ struct StringRule {
     re::RE * engineBefore = nullptr;
     re::RE * engineAfter = nullptr;
     const ConversionRule * rule = nullptr;
+    // Whether the rule, of a text of two characters, may match within its own
+    // text (e.g. rr → r): its matches then overlap where they end at
+    // consecutive positions, and of each run of such matches, the first and
+    // every other one after it apply (as ICU, scanning from the left, applies
+    // the leftmost of overlapping matches).
+    bool selfOverlapping = false;
 };
 
 struct TransformStep {

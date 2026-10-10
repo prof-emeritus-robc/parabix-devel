@@ -23,6 +23,10 @@
 //      Any-Lower, Any-Upper, Any-Title
 //                          full case mapping by the string override
 //                          properties lc, uc and tc, as in xch -prop=...
+//      Transforms defined by rules (see TransformAnalyzer), with global
+//      filters (:: [set] ;) and filtered transform rules (:: [set] ID ;):
+//      the filter is computed once, as a mask of the positions of the text
+//      where the transform may change characters (see RulePipelineBuilder).
 //  Any other known name is reported with its canonical name as not yet
 //  implemented.
 
@@ -442,7 +446,7 @@ static void listTransforms(const ldml::TransformRegistry & registry) {
 //  trivial and nullable capture elimination and order disambiguation, and
 //  planned (see ldml/transform_plan.h).  A transform is implementable if its
 //  conversion rules are implementable and every transform its transform rules
-//  invoke is implementable (without filters, for now).
+//  invoke is implementable (with or without filters).
 
 struct TransformAnalysis {
     bool implementable = false;
@@ -539,13 +543,8 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
             if (step.kind != ldml::TransformStep::Kind::Transform) continue;
             const std::string id = step.transform.getText();
             const ldml::TransformEntry * used = mRegistry.lookup(id);
-            if (a.plan.filter) {
-                a.problems.push_back("transform rule :: " + id + " within a filtered transform (not yet supported)");
-            }
             if (used == nullptr) {
                 a.problems.push_back("unknown transform " + id);
-            } else if (step.filter) {
-                a.problems.push_back("filtered transform :: " + ldml::printUnicodeSet(step.filter) + " " + id);
             } else if (!analyze(used).implementable) {
                 a.problems.push_back("unimplemented transform " + used->canonicalName);
             }
@@ -706,6 +705,52 @@ protected:
     }
 };
 
+//  The mask of the positions after insertions (see ExpandFilter): Spread is the
+//  mask spread by the spread mask, and each inserted position (not in the spread
+//  mask) inherits the mask of the character it follows.
+class InheritMask : public pablo::PabloKernel {
+public:
+    InheritMask(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Spread, StreamSet * Inherited)
+    : PabloKernel(ts, "InheritMask",
+                  {Binding{"SpreadMask", SpreadMask}, Binding{"Spread", Spread}}, {Binding{"Inherited", Inherited}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
+        PabloAST * const spread = getInputStreamSet("Spread")[0];
+        //  The runs of inserted positions after the characters of the mask.
+        PabloAST * const follow = pb.createAnd(pb.createAdvance(spread, 1), inserted);
+        PabloAST * const runs = pb.createAnd(pb.createMatchStar(follow, inserted), inserted);
+        writeOutputStreamSet("Inherited", std::vector<PabloAST *>{pb.createOr(spread, runs)});
+    }
+};
+
+//  The codepoint standing for the characters outside the filter of a filtered
+//  normalization (see RulePipelineBuilder::maskedNormalization): a starter
+//  (ccc 0) without a decomposition, which does not compose with any character.
+//  It is a noncharacter (rather than a surrogate, which NFC's UTF-8 processing
+//  does not accept), which may occur in the text.
+static constexpr UCD::codepoint_t BarrierMark = 0xFDD0;
+
+//  The 21-bit basis with the barrier codepoint at the positions not in Mask.
+class ReplaceUnmasked : public pablo::PabloKernel {
+public:
+    ReplaceUnmasked(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * Mask, StreamSet * Replaced)
+    : PabloKernel(ts, "ReplaceUnmasked" + std::to_string(BarrierMark),
+                  {Binding{"Basis", Basis}, Binding{"Mask", Mask}}, {Binding{"Replaced", Replaced}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const mask = getInputStreamSet("Mask")[0];
+        PabloAST * const unmasked = pb.createInFile(pb.createNot(mask));
+        std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        for (unsigned b = 0; b < basis.size(); b++) {
+            basis[b] = ((BarrierMark >> b) & 1) ? pb.createOr(basis[b], unmasked) : pb.createAnd(basis[b], mask);
+        }
+        writeOutputStreamSet("Replaced", basis);
+    }
+};
+
 //  The characters followed by inserted positions: disjoint sets, by the
 //  number of positions inserted after each.
 using Insertions = std::map<unsigned, UCD::UnicodeSet>;
@@ -819,10 +864,29 @@ public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
     : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P) {}
     // Apply the transform of a registry entry to U21 (an implementable transform).
-    StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21, const UCD::UnicodeSet * filter);
+    StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
 private:
+    //  Filters.  As in ICU, a filter selects the characters of the text that a
+    //  transform may change, once, when the transform is applied: the steps of
+    //  the transform then apply only at the positions of these characters (and of
+    //  the characters they are replaced by), while contexts match the whole text.
+    //  The positions are given by masks, one for each filter in effect (the
+    //  innermost last, each within the ones before it), which are kept in step
+    //  with the text as positions are inserted and deleted.
+    //  Two differences from ICU remain: ICU 74 ignores the global filter of a
+    //  transform consisting of a single set of conversion rules (applied here),
+    //  and a context added by DisambiguateOrder for a string rule (e.g., the
+    //  [^d] of b } [^d] → Z for bd → Y ; b → Z ;) still sees a character
+    //  outside the filter that keeps the string rule from applying.
+    void pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21);
+    void popFilter() {mMasks.pop_back();}
+    StreamSet * activeMask() const {return mMasks.empty() ? nullptr : mMasks.back();}
+    void spreadMasks(StreamSet * SpreadMask);
+    void filterMasks(StreamSet * keep);
     StreamSet * builtIn(const std::string & name, StreamSet * U21);
-    StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21, const UCD::UnicodeSet * filter);
+    StreamSet * normalization(const std::string & name, StreamSet * U21);
+    StreamSet * maskedNormalization(const std::string & name, StreamSet * U21);
+    StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
@@ -834,6 +898,7 @@ private:
     const ldml::TransformRegistry & mRegistry;
     TransformAnalyzer & mAnalyzer;
     NFD_PipelineBuilder mNFD;
+    std::vector<StreamSet *> mMasks;
 };
 
 //  The Final_Sigma condition of Unicode full lowercasing (as in el-Lower): Σ
@@ -849,27 +914,111 @@ static const ldml::TransformPlan & finalSigmaPlan() {
     return plan;
 }
 
+void RulePipelineBuilder::pushFilter(const UCD::UnicodeSet & filter, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    StreamSet * mask = classes({filter}, U21);
+    if (StreamSet * const outer = activeMask()) mask = combine(mask, outer, false);
+    SHOW_STREAM(mask);
+    mMasks.push_back(mask);
+}
+
+//  The masks after positions are inserted (where the spread mask is 0): each
+//  inserted position has the mask of the character it follows.
+void RulePipelineBuilder::spreadMasks(StreamSet * SpreadMask) {
+    for (StreamSet *& mask : mMasks) {
+        StreamSet * const spread = mP.CreateStreamSet(1);
+        SpreadByMask(mP, SpreadMask, mask, spread);
+        StreamSet * const inherited = mP.CreateStreamSet(1);
+        mP.CreateKernelCall<InheritMask>(SpreadMask, spread, inherited);
+        mask = inherited;
+    }
+}
+
+//  The masks after the positions not in keep are deleted.
+void RulePipelineBuilder::filterMasks(StreamSet * keep) {
+    for (StreamSet *& mask : mMasks) {
+        StreamSet * const filtered = mP.CreateStreamSet(1);
+        FilterByMask(mP, keep, mask, filtered);
+        mask = filtered;
+    }
+}
+
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
     if (name == "Any-Null") return U21;
+    if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
+        return activeMask() ? maskedNormalization(name, U21) : normalization(name, U21);
+    }
+    if (name == "Any-Lower" || name == "Any-Upper") {
+        //  Full lowercasing: the Final_Sigma context of Σ, then the lc mapping.
+        if (name == "Any-Lower") {
+            for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
+                U21 = conversionGroup(step, U21);
+            }
+        }
+        const UCD::property_t prop = name == "Any-Lower" ? UCD::lc : UCD::uc;
+        if (StreamSet * const mask = activeMask()) return maskedStringOverrides({{prop, mask}}, U21);
+        return U21_StringOverridePipeline(P, prop, U21);
+    }
+    if (name == "Any-Title") return titlecase(U21);
+    llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
+}
+
+StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamSet * U21) {
+    PipelineBuilder & P = mP;
     if (name == "Any-NFD") return mNFD.NFD_U21_Pipeline(U21);
     if (name == "Any-NFKD") return mNFD.NFKD_U21_Pipeline(U21);
-    if (name == "Any-Lower") {
-        //  Full lowercasing: the Final_Sigma context of Σ, then the lc mapping.
-        for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
-            U21 = conversionGroup(step, U21, nullptr);
-        }
-        return U21_StringOverridePipeline(P, UCD::lc, U21);
-    }
-    if (name == "Any-Upper") return U21_StringOverridePipeline(P, UCD::uc, U21);
-    if (name == "Any-Title") return titlecase(U21);
     if (name == "Any-NFKC") U21 = mNFD.NFKD_U21_Pipeline(U21);
-    if (name == "Any-NFC" || name == "Any-NFKC") {
-        StreamSet * const basis = UTF8_Of(P, U21);
-        StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
-        return U21_Of(P, BasisOf(P, composed));
+    StreamSet * const basis = UTF8_Of(P, U21);
+    StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
+    return U21_Of(P, BasisOf(P, composed));
+}
+
+//  A normalization within a filter.  As in ICU, each run of the characters of
+//  the filter is normalized by itself: the characters outside it are replaced by
+//  the barrier codepoint, which is neither reordered nor composed, so that no
+//  character moves or composes across them; after the normalization, which keeps
+//  the barriers in order, they are replaced by the characters again.  The
+//  barrier codepoint itself is normalized to itself and is a barrier anyway: it
+//  is treated as a character outside the filter (its masks are restored with
+//  it).  The characters of the normalized runs are all within the filter.
+StreamSet * RulePipelineBuilder::maskedNormalization(const std::string & name, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    StreamSet * const barrierChars = classes({UCD::UnicodeSet(BarrierMark)}, U21);
+    StreamSet * const notBarrierChars = P.CreateStreamSet(1);
+    Invert(P, barrierChars, notBarrierChars);
+    StreamSet * const mask = combine(activeMask(), notBarrierChars, false);
+    StreamSet * const Work = P.CreateStreamSet(21);
+    P.CreateKernelCall<ReplaceUnmasked>(U21, mask, Work);
+    SHOW_BIXNUM(Work);
+    StreamSet * const Normalized = normalization(name, Work);
+    StreamSet * const barriers = classes({UCD::UnicodeSet(BarrierMark)}, Normalized);
+    StreamSet * const others = P.CreateStreamSet(1);
+    Invert(P, barriers, others);
+    StreamSet * const unmasked = P.CreateStreamSet(1);
+    Invert(P, mask, unmasked);
+    //  The characters replaced by barriers, at the positions of the barriers.
+    StreamSet * const outside = P.CreateStreamSet(21);
+    FilterByMask(P, unmasked, U21, outside);
+    StreamSet * const restored = P.CreateStreamSet(21);
+    SpreadByMask(P, barriers, outside, restored);
+    StreamSet * const kept = P.CreateStreamSet(21);
+    ZeroByMask(P, others, Normalized, kept);
+    StreamSet * const result = P.CreateStreamSet(21);
+    OrCombine(P, kept, restored, result);
+    SHOW_BIXNUM(result);
+    //  The masks hold at the normalized characters, and keep their values at
+    //  the barriers.
+    for (StreamSet *& m : mMasks) {
+        StreamSet * const outer = P.CreateStreamSet(1);
+        FilterByMask(P, unmasked, m, outer);
+        StreamSet * const spread = P.CreateStreamSet(1);
+        SpreadByMask(P, barriers, outer, spread);
+        StreamSet * const combined = P.CreateStreamSet(1);
+        OrCombine(P, spread, others, combined);
+        m = combined;
     }
-    llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
+    return result;
 }
 
 //  Unicode titlecasing (see TitlecasePositions), with the word boundaries of
@@ -879,7 +1028,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
 StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
     PipelineBuilder & P = mP;
     for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
-        U21 = conversionGroup(step, U21, nullptr);
+        U21 = conversionGroup(step, U21);
     }
     StreamSet * const boundaries = wordBoundaries(U21);
     UCD::BinaryPropertyObject * const casedObj = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(UCD::Cased));
@@ -890,6 +1039,10 @@ StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
     SHOW_STREAM(boundaries);
     SHOW_STREAM(title);
     SHOW_STREAM(lower);
+    //  Within a filter, the words are those of the whole text.
+    if (StreamSet * const mask = activeMask()) {
+        return maskedStringOverrides({{UCD::tc, combine(title, mask, false)}, {UCD::lc, combine(lower, mask, false)}}, U21);
+    }
     return maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21);
 }
 
@@ -954,6 +1107,7 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
         StreamSet * const Expanded = P.CreateStreamSet(21, 1);
         SpreadByMask(P, SpreadMask, U21, Expanded);
         U21 = Expanded;
+        spreadMasks(SpreadMask);
         for (Override & v : all) {
             StreamSet * const spread = P.CreateStreamSet(1);
             SpreadByMask(P, SpreadMask, v.mask, spread);
@@ -1078,15 +1232,22 @@ static bool anyBits(const std::vector<UCD::UnicodeSet> & sets) {
 //      beyond the replacement (if m < n) to the deletion mark, and the inserted
 //      positions after the text to the further characters (if m > n).
 //  The positions holding the deletion mark are then deleted.
-StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21, const UCD::UnicodeSet * filter) {
+//
+//  Within a filter, the rules apply only at the positions of the active mask: the
+//  changes elsewhere are discarded, and a string rule applies only where all the
+//  characters of its text are within the mask.  Positions are inserted after the
+//  characters regardless of the mask (so that contexts, which match the whole
+//  text, are matched as without a filter); those inserted after characters
+//  outside the mask keep the deletion mark, and are deleted.
+StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    //  The characters of a set that the group may change: those in the filter,
-    //  other than the deletion mark.
+    //  The characters of a set that the group may change: those other than the
+    //  deletion mark.
     auto restricted = [&](const UCD::UnicodeSet & chars) {
-        return (filter ? (chars & *filter) : chars) - UCD::UnicodeSet(DeletionMark);
+        return chars - UCD::UnicodeSet(DeletionMark);
     };
     //  The mappings of each subgroup, and the texts of the string rules,
-    //  restricted by the filter.
+    //  restricted to the characters that may change.
     std::vector<std::vector<ldml::CharMapping>> maps;
     Insertions insertions;
     bool needDeletion = false;
@@ -1137,7 +1298,9 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         P.CreateKernelCall<FillInsertedPositions>(SpreadMask, Expanded, Marked);
         SHOW_BIXNUM(Marked);
         U21 = Marked;
+        spreadMasks(SpreadMask);
     }
+    StreamSet * const mask = activeMask();
 
     StreamSet * changes = nullptr;
     auto shiftAndAdd = [&](StreamSet * bits, int shift) {
@@ -1225,6 +1388,19 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             t.back() = k.second;
             matches = combine(matches, matchPositions(rule.engineBefore, rule.engineAfter, t, k.first, insertions, U21), true);
         }
+        //  Within a filter, the n characters of the text (at the last position
+        //  and the n - 1 before it, as only the last may be followed by inserted
+        //  positions) must all be within the mask.
+        if (mask) {
+            for (size_t j = 0; j < n; j++) {
+                StreamSet * within = mask;
+                if (j > 0) {
+                    within = P.CreateStreamSet(1);
+                    P.CreateKernelCall<ShiftForward>(mask, within, static_cast<unsigned>(j));
+                }
+                matches = combine(matches, within, false);
+            }
+        }
         SHOW_STREAM(matches);
         //  The characters of the text, at n - 1 - j positions before the last,
         //  change to the characters of the replacement (or the deletion mark).
@@ -1244,6 +1420,11 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     }
 
     StreamSet * result = U21;
+    if (changes && mask) {
+        StreamSet * const masked = P.CreateStreamSet(21);
+        ZeroByMask(P, mask, changes, masked);
+        changes = masked;
+    }
     if (changes) {
         result = P.CreateStreamSet(21);
         XorCombine(P, U21, changes, result);
@@ -1257,26 +1438,26 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * const filtered = P.CreateStreamSet(21);
         FilterByMask(P, keep, result, filtered);
         result = filtered;
+        filterMasks(keep);
     }
     return result;
 }
 
-StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * U21, const UCD::UnicodeSet * filter) {
+StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, StreamSet * U21) {
     if (entry->isBuiltIn()) return builtIn(entry->canonicalName, U21);
     const TransformAnalysis & a = mAnalyzer.analyze(entry);
     assert (a.implementable);
-    UCD::UnicodeSet combined;
-    if (a.plan.filter) {
-        combined = filter ? (*filter & a.plan.filterSet) : a.plan.filterSet;
-        filter = &combined;
-    }
+    if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
-            U21 = transform(mRegistry.lookup(step.transform.getText()), U21, filter);
+            if (step.filter) pushFilter(step.filterSet, U21);
+            U21 = transform(mRegistry.lookup(step.transform.getText()), U21);
+            if (step.filter) popFilter();
         } else {
-            U21 = conversionGroup(step, U21, filter);
+            U21 = conversionGroup(step, U21);
         }
     }
+    if (a.plan.filter) popFilter();
     return U21;
 }
 
@@ -1288,7 +1469,7 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
     P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     RulePipelineBuilder builder(P, registry, analyzer);
-    StreamSet * const Result = builder.transform(entry, U21, nullptr);
+    StreamSet * const Result = builder.transform(entry, U21);
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();

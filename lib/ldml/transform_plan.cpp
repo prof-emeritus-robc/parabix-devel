@@ -220,18 +220,31 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
 StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
     StringRuleOverlaps result;
     const size_t n = step.stringRules.size();
-    //  within[a][b]: rule b may match within the text of rule a.  A quick check
-    //  first: only if the first characters of b may occur at a position of the
-    //  text of a other than the first.
+    //  within[a][b]: rule b may match within the text of rule a.  Quick checks
+    //  first, of the texts without the contexts (which only restrict matches):
+    //  the first characters of b must occur at a position of the text of a other
+    //  than the first, and, for some position k of the text of a other than the
+    //  first, each character of the text of b up to the end of the text of a
+    //  must be one that may occur at its position in the text of a.
     std::vector<std::vector<bool>> within(n, std::vector<bool>(n, false));
     RuleOverlapAnalysis analysis;
+    auto textsOverlap = [](const std::vector<UCD::UnicodeSet> & outer, const std::vector<UCD::UnicodeSet> & inner) {
+        for (size_t k = 1; k < outer.size(); k++) {
+            bool overlap = true;
+            for (size_t i = 0; overlap && i < inner.size() && k + i < outer.size(); i++) {
+                overlap = outer[k + i].intersects(inner[i]);
+            }
+            if (overlap) return true;
+        }
+        return false;
+    };
     for (size_t a = 0; a < n; a++) {
         const StringRule & outer = step.stringRules[a];
         UCD::UnicodeSet inside;
         for (size_t k = 1; k < outer.text.size(); k++) inside = inside + outer.text[k];
         for (size_t b = 0; b < n; b++) {
             const StringRule & inner = step.stringRules[b];
-            if ((inner.text.front() & inside).empty()) continue;
+            if (!inner.text.front().intersects(inside) || !textsOverlap(outer.text, inner.text)) continue;
             within[a][b] = analysis.mayMatchWithin(inner.rule, outer.rule);
         }
     }

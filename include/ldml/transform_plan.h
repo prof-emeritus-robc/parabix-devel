@@ -152,8 +152,12 @@ struct StringRuleOverlaps {
     // matches of each self-overlapping rule are selected among themselves.
     bool acyclicApartFromSelf = true;
     unsigned stagesApartFromSelf = 0;
+    // Whether the matches of each self-overlapping rule can be selected among
+    // themselves: its text has two characters (see StringRule::selfOverlapping).
+    bool selfSelectable = true;
     // Can the string rules be applied sequentially in a single pass?
-    bool singlePass() const {return twoWay == 0 && acyclic;}
+    bool singlePass() const {return twoWay == 0 && (acyclic || (acyclicApartFromSelf && selfSelectable));}
+    unsigned singlePassStages() const {return acyclic ? stages : stagesApartFromSelf;}
 };
 StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step);
 

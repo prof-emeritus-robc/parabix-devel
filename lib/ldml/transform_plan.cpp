@@ -261,6 +261,7 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
         if (within[a][a]) {
             result.pairs.push_back({a, a, StringRuleOverlaps::Kind::Self});
             result.self++;
+            if (step.stringRules[a].text.size() != 2) result.selfSelectable = false;
             precedes[a].push_back(a);
         }
         for (size_t b = 0; b < n; b++) {

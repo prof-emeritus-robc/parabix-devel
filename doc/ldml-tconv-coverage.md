@@ -14,6 +14,76 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 [Reproducing](#reproducing)). The per-transform table is in
 [ldml-tconv-coverage-table.md](ldml-tconv-coverage-table.md).
 
+## Update: W2b classification (string rules within string rules)
+
+Commits `b5501bda`, `17fe8701` and `eac773f4` classify the overlaps of the
+string rules of each conversion group (`ldml::analyzeStringRuleOverlaps`).
+`tconv --plan` reports them, and `tconv_coverage.py` classes W2b problems by
+them.
+
+**Pairs.** String rule B *overlaps* A if B may match strictly within the text
+of a match of A (`RuleOverlapAnalysis::mayMatchWithin`, with contexts).
+Where both match, ICU applies A, the rule whose match begins first, and not
+B. A pair is:
+
+- **one-way** if B may match within A but not A within B. A then always
+  takes precedence (A → B).
+- **two-way** if each may match within the other. Which applies depends on
+  which match begins first, e.g. `海里 → 海裡` and `里海 → 裡海` (Hans-Hant),
+  or `ai → ай` and `ia → я` (zh_Latn_PINYIN-ru).
+- **self-overlapping** if a rule may match within its own text, e.g.
+  `rr → r` on `rrr`. Of its overlapping matches, the leftmost takes
+  precedence.
+
+**Groups.** If all the overlaps of a group are one-way and the precedence
+graph A → B is acyclic, the string rules can be applied sequentially in a
+single pass, in a topological order. Each rule applies where it does not
+begin within an applied match of a rule preceding it. The number of stages
+is the longest chain. A self-overlap is a cycle of one rule: its overlapping
+matches must be selected among themselves, from the left (for a doubled
+character, by the parity of the run).
+
+**Results**, with the same CLDR data:
+
+| groups | verdict | transforms | one-way pairs | two-way pairs | self-overlaps |
+|---:|---|---:|---:|---:|---:|
+| 48 | one-way, acyclic: single pass | 44 | 4,199 | – | – |
+| 33 | one-way with self-overlaps, otherwise acyclic | 31 | 613 | – | 173 |
+| 1 | one-way, cyclic (3 rules) | 1 | 95 | – | – |
+| 19 | two-way | 19 | 766,614 | 6,308 | 328 |
+
+- **Stages of the single-pass groups:** 2 stages in 32 groups, 3 in 8, 4 in
+  6, 5 in 1 (ru-ja), 8 in 1 (ru-zh).
+- **Self-overlap groups:** every one would be single-pass apart from its
+  self-overlaps, in 1–6 stages. Their self-overlaps are mostly doubled
+  characters, such as `rr → r` and `bb → bː` (ch-ch_FONIPA), `ΓΓ → NG`
+  (el-el_Latn/BGN) and `||` (Latin-ThaiLogical).
+- **The one cyclic group (fa-fa_FONIPA):** `ِی → ej`, `یه → je`,
+  `هِ } [^ّ] → he`.
+- **Two-way groups:**
+  - dictionaries: Hans-Hant/Hant-Hans, am_Ethi-am_Ethi/Geminate (7,718
+    string rules, 741,470 overlapping pairs);
+  - number and punctuation sequences: am_Brai-am_Ethi, Sarb-gz_Ethi,
+    d0_Morse-am_Ethi, Any-Publishing;
+  - vowel sequences in either order: ro-ro_FONIPA,
+    rm_SURSILV-rm_FONIPA_SURSILV, zh_Latn_PINYIN-ru.
+
+**What each would unlock.** Supporting W2b in stages, with the other work
+items unsolved:
+
+| supported | implementable |
+|---|---:|
+| (now) | 145 |
+| single-pass groups (W2b1) | 149 |
+| + self-overlaps (leftmost selection within a rule) | 159 |
+| + W2c (expanded non-final characters) | 204 |
+| + cyclic and two-way groups (all of W2) | 214 |
+
+Most transforms with W2b problems also need other work. W2b1 alone is the
+only blocker of 4 transforms (Latn-Cans, Latn-Geor, Latn-Ethi/Williamson,
+ru_Latn-ru/BGN), but it is needed by 81. W2c is the only blocker of 25,
+including all the Indic-to-Latin transforms.
+
 ## Update: W2a (single-character rules within string rules) implemented
 
 Commit `9119ae0d` implements W2a (§4.1):

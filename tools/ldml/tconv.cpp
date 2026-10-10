@@ -69,6 +69,7 @@
 #include <sstream>
 #include <re/adt/re_name.h>
 #include <re/unicode/resolve_properties.h>
+#include <re/unicode/boundaries.h>
 #include <toolchain/toolchain.h>
 #include <ucd/data/PropertyAliases.h>
 #include <ucd/data/PropertyObjects.h>
@@ -416,8 +417,7 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
             OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::uc, BasisBits));
             break;
         case Transform::Title:
-            OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::tc, BasisBits));
-            break;
+            llvm::report_fatal_error("tconv: Any-Title is implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -781,6 +781,39 @@ private:
     const bool mHasBasis;
 };
 
+//  The positions of Unicode titlecasing (toTitlecase, Unicode 3.13, R3): for
+//  each word boundary, the first cased character F at or after it is mapped to
+//  its titlecase, and the characters after F up to the next word boundary to
+//  their lowercase.  WordBoundaries marks the position after each boundary
+//  (the first character of each word, and the end of the text).
+class TitlecasePositions : public pablo::PabloKernel {
+public:
+    TitlecasePositions(LLVMTypeSystemInterface & ts, StreamSet * WordBoundaries, StreamSet * Cased,
+                       StreamSet * Title, StreamSet * Lower)
+    : PabloKernel(ts, "TitlecasePositions",
+                  {Binding{"WordBoundaries", WordBoundaries}, Binding{"Cased", Cased}},
+                  {Binding{"Title", Title}, Binding{"Lower", Lower}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const boundaries = getInputStreamSet("WordBoundaries")[0];
+        PabloAST * const cased = getInputStreamSet("Cased")[0];
+        //  The first cased character at or after each boundary: at a boundary, or
+        //  at the end of a run of other characters from a boundary.  (Scanning
+        //  only from the boundaries at other characters, within runs, so that
+        //  the scans do not carry into the boundaries at cased characters.)
+        PabloAST * const notCased = pb.createNot(cased);
+        PabloAST * const scanned = pb.createScanThru(pb.createAnd(boundaries, notCased), notCased);
+        PabloAST * const title = pb.createAnd(pb.createOr(scanned, boundaries), cased, "title");
+        //  The characters after it, up to the first boundary after it.
+        PabloAST * const next = pb.createAdvance(title, 1);
+        PabloAST * const end = pb.createScanTo(next, boundaries);
+        PabloAST * const lower = pb.createInFile(pb.createIntrinsicCall(pablo::Intrinsic::SpanUpTo, {next, end}), "lower");
+        writeOutputStreamSet("Title", std::vector<PabloAST *>{title});
+        writeOutputStreamSet("Lower", std::vector<PabloAST *>{lower});
+    }
+};
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -790,6 +823,9 @@ public:
 private:
     StreamSet * builtIn(const std::string & name, StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21, const UCD::UnicodeSet * filter);
+    StreamSet * titlecase(StreamSet * U21);
+    StreamSet * wordBoundaries(StreamSet * U21);
+    StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
                                unsigned marks, const Insertions & insertions, StreamSet * U21);
     StreamSet * classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21);
@@ -826,7 +862,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
         return U21_StringOverridePipeline(P, UCD::lc, U21);
     }
     if (name == "Any-Upper") return U21_StringOverridePipeline(P, UCD::uc, U21);
-    if (name == "Any-Title") return U21_StringOverridePipeline(P, UCD::tc, U21);
+    if (name == "Any-Title") return titlecase(U21);
     if (name == "Any-NFKC") U21 = mNFD.NFKD_U21_Pipeline(U21);
     if (name == "Any-NFC" || name == "Any-NFKC") {
         StreamSet * const basis = UTF8_Of(P, U21);
@@ -834,6 +870,116 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
         return U21_Of(P, BasisOf(P, composed));
     }
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
+}
+
+//  Unicode titlecasing (see TitlecasePositions), with the word boundaries of
+//  Parabix (re::generateWordBoundaryRule).  Lowercasing includes the Final_Sigma
+//  condition (as in Any-Lower), which changes only Σ, to σ or ς, both cased and
+//  with the titlecase Σ.
+StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    for (const ldml::TransformStep & step : finalSigmaPlan().steps) {
+        U21 = conversionGroup(step, U21, nullptr);
+    }
+    StreamSet * const boundaries = wordBoundaries(U21);
+    UCD::BinaryPropertyObject * const casedObj = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(UCD::Cased));
+    StreamSet * const cased = classes({casedObj->GetCodepointSet("Y")}, U21);
+    StreamSet * const title = P.CreateStreamSet(1);
+    StreamSet * const lower = P.CreateStreamSet(1);
+    P.CreateKernelCall<TitlecasePositions>(boundaries, cased, title, lower);
+    SHOW_STREAM(boundaries);
+    SHOW_STREAM(title);
+    SHOW_STREAM(lower);
+    return maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21);
+}
+
+//  The word boundaries of a text (in Unicode indexing, one position per
+//  character), marked at the position after each.
+StreamSet * RulePipelineBuilder::wordBoundaries(StreamSet * U21) {
+    const PreparedRE prepared = prepareRE(re::generateWordBoundaryRule());
+    StreamSet * const boundaries = mP.CreateStreamSet(1);
+    RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
+    engine.matchSearchPipeline(prepared, boundaries);
+    return boundaries;
+}
+
+//  String override properties (e.g. full case mappings) applied to the
+//  characters at the positions of their masks (which are disjoint), as by
+//  U21_StringOverridePipeline: positions are inserted after the characters
+//  mapped to longer strings, and the bits of each position of the replacements
+//  are changed (the first) or set (the further ones).
+StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides,
+                                                       StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    struct Override {
+        std::vector<UCD::UnicodeSet> insertion;             // the bixnum of the number of positions to insert
+        std::vector<std::vector<UCD::UnicodeSet>> xfrms;    // the bit sets of each position of the replacements
+        StreamSet * mask;
+    };
+    std::vector<Override> all;
+    unsigned insertionBits = 0;
+    size_t maxLength = 0;
+    for (const auto & o : overrides) {
+        Override v;
+        v.mask = o.second;
+        UCD::PropertyObject * const propObj = UCD::getPropertyObject(o.first);
+        if (auto * p = llvm::dyn_cast<UCD::CodePointPropertyObject>(propObj)) {
+            v.xfrms.push_back(p->GetBitTransformSets());
+        } else if (auto * p = llvm::dyn_cast<UCD::StringOverridePropertyObject>(propObj)) {
+            for (unsigned i = 0; i < p->MaxUnicodeInsertLength(); i++) v.xfrms.push_back(p->GetBitTransformSets(i));
+            v.insertion = p->GetUnicodeInsertLengthBixNumSets();
+        } else {
+            llvm::report_fatal_error("tconv: not a codepoint or string override property");
+        }
+        insertionBits = std::max<unsigned>(insertionBits, v.insertion.size());
+        maxLength = std::max(maxLength, v.xfrms.size());
+        all.push_back(std::move(v));
+    }
+    //  Each set of streams restricted to the positions of a mask.
+    auto masked = [&](StreamSet * mask, StreamSet * streams) {
+        StreamSet * const result = P.CreateStreamSet(streams->getNumElements());
+        ZeroByMask(P, mask, streams, result);
+        return result;
+    };
+    if (insertionBits > 0) {
+        StreamSet * InsertBixNum = nullptr;
+        for (const Override & v : all) {
+            std::vector<UCD::UnicodeSet> sets = v.insertion;
+            sets.resize(insertionBits);
+            InsertBixNum = combine(InsertBixNum, masked(v.mask, classes(sets, U21)), true);
+        }
+        SHOW_BIXNUM(InsertBixNum);
+        StreamSet * const SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
+        StreamSet * const Expanded = P.CreateStreamSet(21, 1);
+        SpreadByMask(P, SpreadMask, U21, Expanded);
+        U21 = Expanded;
+        for (Override & v : all) {
+            StreamSet * const spread = P.CreateStreamSet(1);
+            SpreadByMask(P, SpreadMask, v.mask, spread);
+            v.mask = spread;
+        }
+    }
+    StreamSet * result = U21;
+    for (size_t i = 0; i < maxLength; i++) {
+        StreamSet * bits = nullptr;
+        for (const Override & v : all) {
+            if (i >= v.xfrms.size()) continue;
+            std::vector<UCD::UnicodeSet> sets = v.xfrms[i];
+            sets.resize(21);
+            bits = combine(bits, masked(v.mask, classes(sets, U21)), true);
+        }
+        StreamSet * const next = P.CreateStreamSet(21, 1);
+        if (i == 0) {
+            XorCombine(P, result, bits, next);
+        } else {
+            StreamSet * const shifted = P.CreateStreamSet(21);
+            P.CreateKernelCall<ShiftForward>(bits, shifted, static_cast<unsigned>(i));
+            OrCombine(P, result, shifted, next);
+        }
+        result = next;
+    }
+    return result;
 }
 
 //  The positions of the last characters of the matches of a text (a sequence of
@@ -1202,8 +1348,10 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     CPUDriver driver("tconv");
-    //  Lowercasing needs the Final_Sigma context, provided by the rule pipeline.
-    const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower;
+    //  Lowercasing needs the Final_Sigma context, and titlecasing word
+    //  boundaries, provided by the rule pipeline.
+    const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower
+                        && impl->second != Transform::Title;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
     fn(fd);

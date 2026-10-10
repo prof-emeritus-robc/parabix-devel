@@ -14,6 +14,40 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 [Reproducing](#reproducing)). The per-transform table is in
 [ldml-tconv-coverage-table.md](ldml-tconv-coverage-table.md).
 
+## Update: W1 (filters) implemented
+
+Commit `9dea741` implements filters (§4.2). A filter is computed once, as a
+mask of positions on U21, and every step of the filtered transform changes
+characters only there, while contexts see the whole text. Normalization
+handles each run of filtered characters separately, using a barrier
+codepoint.
+
+With the same CLDR data:
+
+- **Coverage:** 60 of 425 CLDR-defined transforms are implementable (was
+  34). The 26 transforms blocked only by W1 now work, and none of the 34 was
+  lost. W2 is now the only blocker of 154 transforms.
+- **Tests:** 20 CLDR test files now run, 34,744 cases. 16 files pass
+  entirely. The 4 that fail are not caused by filters:
+  - **Deva-Guru, Gujr-Guru, Mlym-Guru (333 cases):**
+    InterIndic-Gurmukhi's rule `$consonant { \uE002 → ੰ` has a before
+    context that only the *converted* text can satisfy. ICU matches before
+    contexts against converted text, tconv does not (§4.1, the warning
+    printed by `--plan`).
+  - **ka-ka_Latn/BGN (215 cases):** the test file expects `ʼ` (U+02BC)
+    where the current rules, and ICU 74, give `’` (U+2019). tconv agrees
+    with ICU on all 682 cases.
+- **Remaining differences from ICU:**
+  - ICU 74 ignores the global filter of a transform made of a single
+    rule set, with no `::` steps; tconv applies it, as UTS #35 specifies.
+  - A context added by `DisambiguateOrder` for a string rule whose text
+    extends outside the filter still sees the character outside the
+    filter. This does not arise when a filter contains the characters of
+    its rules, as CLDR's do.
+
+The per-transform table now reflects this state. The rest of this report
+describes the state before W1.
+
 ## 1. Summary
 
 | | names | implementable today |

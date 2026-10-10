@@ -182,8 +182,9 @@ def classify(args, entries):
                     g['stages'] = int(re.search(r'in (\d+) stages', verdict).group(1))
                 elif g['two_way']:
                     g['verdict'] = 'two-way'
-                elif g['self']:
+                elif verdict.startswith('not single pass: self-overlaps'):
                     g['verdict'] = 'self'
+                    g['stages'] = int(re.search(r'in (\d+) stages', verdict).group(1))
                 else:
                     g['verdict'] = 'cycle'
                     g['cycle'] = int(re.search(r'cycle of (\d+)', verdict).group(1))
@@ -304,11 +305,12 @@ def summary(entries):
         md.append('| %s | %d | %d | %d | %d | %d |' % (v, len(gs), len({n for n, g in groups if g['verdict'] == v}),
                                                       sum(g['one_way'] for g in gs), sum(g['two_way'] for g in gs),
                                                       sum(g['self'] for g in gs)))
-    stages = collections.Counter(g['stages'] for _, g in groups if g['verdict'] == 'single-pass')
-    md.append('\nStages of the single-pass groups: %s\n' % ', '.join('%d stages: %d groups' % kv for kv in sorted(stages.items())))
+    for v, label in (('single-pass', 'the single-pass groups'), ('self', 'the self-overlap groups, apart from their self-overlaps')):
+        stages = collections.Counter(g['stages'] for _, g in groups if g['verdict'] == v)
+        md.append('\nStages of %s: %s\n' % (label, ', '.join('%d stages: %d groups' % kv for kv in sorted(stages.items()))))
     cycles = collections.Counter(g['cycle'] for _, g in groups if g['verdict'] == 'cycle')
     if cycles:
-        md.append('Cycles of the cyclic groups (one-way, without self-overlaps): %s\n' %
+        md.append('Cycles of the cyclic groups (one-way, not only self-overlaps): %s\n' %
                   ', '.join('%d rules: %d groups' % kv for kv in sorted(cycles.items())))
     md.append('## Transforms\n')
     md.append('Status: **ok** implementable; otherwise the work items needed (own problems and those of the '

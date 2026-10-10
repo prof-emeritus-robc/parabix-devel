@@ -139,6 +139,11 @@ struct StringRuleOverlaps {
     bool acyclic = true;
     unsigned stages = 0;
     std::vector<size_t> cycle;
+    // The same, for the graph without the self-overlaps: if acyclic, the rules
+    // can be applied in a single pass as above, provided that the overlapping
+    // matches of each self-overlapping rule are selected among themselves.
+    bool acyclicApartFromSelf = true;
+    unsigned stagesApartFromSelf = 0;
     // Can the string rules be applied sequentially in a single pass?
     bool singlePass() const {return twoWay == 0 && acyclic;}
 };

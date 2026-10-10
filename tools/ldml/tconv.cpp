@@ -605,6 +605,9 @@ static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysi
                 llvm::outs() << "single pass in " << overlaps.stages << " stages\n";
             } else if (overlaps.twoWay > 0) {
                 llvm::outs() << "not single pass: two-way overlaps\n";
+            } else if (overlaps.acyclicApartFromSelf) {
+                llvm::outs() << "not single pass: self-overlaps (otherwise single pass in "
+                             << std::max(overlaps.stagesApartFromSelf, 1u) << " stages)\n";
             } else {
                 llvm::outs() << "not single pass: cycle of " << overlaps.cycle.size() << " rules\n";
             }

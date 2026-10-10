@@ -5,6 +5,7 @@
 
 #include <ldml/transform_plan.h>
 #include <algorithm>
+#include <tuple>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
 #include "charset_analysis.h"
@@ -270,44 +271,54 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
             }
         }
     }
-    //  A depth-first search of the graph: a cycle (an edge to a rule on the
-    //  path), or the number of rules in the longest chain from each rule.
-    enum : unsigned char {Unvisited, OnPath, Done};
-    std::vector<unsigned char> state(n, Unvisited);
-    std::vector<unsigned> chain(n, 1);
-    std::vector<size_t> path;
-    std::vector<std::pair<size_t, size_t>> stack;     // (rule, next edge)
-    for (size_t root = 0; root < n && result.acyclic; root++) {
-        if (state[root] != Unvisited || precedes[root].empty()) continue;
-        stack.emplace_back(root, 0);
-        state[root] = OnPath;
-        path.push_back(root);
-        while (!stack.empty() && result.acyclic) {
-            auto & top = stack.back();
-            const size_t v = top.first;
-            if (top.second < precedes[v].size()) {
-                const size_t w = precedes[v][top.second++];
-                if (state[w] == OnPath) {
-                    result.acyclic = false;
-                    result.cycle.assign(std::find(path.begin(), path.end(), w), path.end());
-                } else if (state[w] == Unvisited) {
-                    state[w] = OnPath;
-                    path.push_back(w);
-                    stack.emplace_back(w, 0);
+    //  A depth-first search of the graph (with or without the self-overlaps):
+    //  a cycle (an edge to a rule on the path), or the number of rules in the
+    //  longest chain (0 without edges).
+    auto search = [&](bool withSelf, std::vector<size_t> & cycle) -> std::pair<bool, unsigned> {
+        enum : unsigned char {Unvisited, OnPath, Done};
+        std::vector<unsigned char> state(n, Unvisited);
+        std::vector<unsigned> chain(n, 1);
+        std::vector<size_t> path;
+        std::vector<std::pair<size_t, size_t>> stack;     // (rule, next edge)
+        unsigned stages = 0;
+        for (size_t root = 0; root < n; root++) {
+            if (state[root] != Unvisited) continue;
+            stack.emplace_back(root, 0);
+            state[root] = OnPath;
+            path.push_back(root);
+            while (!stack.empty()) {
+                auto & top = stack.back();
+                const size_t v = top.first;
+                if (top.second < precedes[v].size()) {
+                    const size_t w = precedes[v][top.second++];
+                    if (w == v && !withSelf) continue;
+                    if (state[w] == OnPath) {
+                        cycle.assign(std::find(path.begin(), path.end(), w), path.end());
+                        return {false, 0};
+                    } else if (state[w] == Unvisited) {
+                        state[w] = OnPath;
+                        path.push_back(w);
+                        stack.emplace_back(w, 0);
+                    }
+                } else {
+                    bool edges = false;
+                    for (size_t w : precedes[v]) {
+                        if (w == v) continue;
+                        edges = true;
+                        chain[v] = std::max(chain[v], chain[w] + 1);
+                    }
+                    if (edges) stages = std::max(stages, chain[v]);
+                    state[v] = Done;
+                    path.pop_back();
+                    stack.pop_back();
                 }
-            } else {
-                for (size_t w : precedes[v]) chain[v] = std::max(chain[v], chain[w] + 1);
-                state[v] = Done;
-                path.pop_back();
-                stack.pop_back();
             }
         }
-    }
-    if (result.acyclic) {
-        for (size_t a = 0; a < n; a++) {
-            if (!precedes[a].empty()) result.stages = std::max(result.stages, chain[a]);
-        }
-    }
+        return {true, stages};
+    };
+    std::tie(result.acyclic, result.stages) = search(true, result.cycle);
+    std::vector<size_t> ignored;
+    std::tie(result.acyclicApartFromSelf, result.stagesApartFromSelf) = search(false, ignored);
     return result;
 }
 

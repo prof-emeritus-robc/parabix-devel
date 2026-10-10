@@ -1060,10 +1060,14 @@ RE_PipelineBuilder::RE_PipelineBuilder(PipelineBuilder & P, RE_context context)
   mFinalMatchStarts(context.matchStarts), mFinalMatchFollows(context.matchFollows) {
 }
 
-// Does the RE match End anywhere (including within assertions and the
-// definitions of names)?
+// Does the RE refer to the end of the text anywhere (including within
+// assertions and the definitions of names): End, or a negative lookahead,
+// which holds at the end of the text?
 static bool hasEndAnchorAnywhere(const RE * re) {
     if (isa<End>(re)) return true;
+    if (const Assertion * a = dyn_cast<Assertion>(re)) {
+        if ((a->getKind() == Assertion::Kind::LookAhead) && (a->getSense() == Assertion::Sense::Negative)) return true;
+    }
     if (const Seq * seq = dyn_cast<Seq>(re)) {
         for (const RE * e : *seq) if (hasEndAnchorAnywhere(e)) return true;
     } else if (const Alt * alt = dyn_cast<Alt>(re)) {
@@ -1099,10 +1103,11 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
     StreamSet * matchFollows = mSourceContext.matchFollows;
 
     // Without match regions, Start and End match at the start and the end of
-    // the text: if the RE has End, the text (of bit streams) is made one match
-    // region, from its first position to the position after its last code
-    // unit, which the text is extended by (as an unterminated last line is
-    // in grep).  The results then have that position too.
+    // the text: if the RE refers to the end of the text (End, or a negative
+    // lookahead, which holds there), the text (of bit streams) is made one
+    // match region, from its first position to the position after its last
+    // code unit, which the text is extended by (as an unterminated last line
+    // is in grep).  The results then have that position too.
     if ((matchStarts == nullptr) && (source->getFieldWidth() == 1) && hasEndAnchorAnywhere(re)) {
         StreamSet * const extended = mPB.CreateStreamSet(source->getNumElements(), 1);
         mPB.CreateKernelCall<ExtendByOne>(source, extended);

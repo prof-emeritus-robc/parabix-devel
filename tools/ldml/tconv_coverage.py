@@ -34,9 +34,16 @@ import subprocess
 
 #  Work items: the problem classes of tconv --plan, grouped by the kind of
 #  work needed in tconv / the Parabix framework (see doc/ldml-tconv-coverage.md).
+#  A string rule that may match within the text of another (W2b) is classed by
+#  the overlaps of the string rules of its conversion group (see
+#  ldml::StringRuleOverlaps): all one-way, with an acyclic precedence graph
+#  (applicable sequentially in a single pass), or not (self-overlaps, longer
+#  cycles, two-way overlaps).
 WORK_ITEMS = collections.OrderedDict([
     ('W1 filters', ['F-transform-in-filtered', 'F-filtered-transform-rule']),
-    ('W2 parallel conflicts', ['S-match-within-string-rule', 'S-expanded-nonfinal']),
+    ('W2b1 one-way string overlaps', ['S-W2b-single-pass']),
+    ('W2b2 cyclic/two-way string overlaps', ['S-W2b-self', 'S-W2b-cycle', 'S-W2b-two-way', 'S-match-within-string-rule']),
+    ('W2c expanded non-final', ['S-expanded-nonfinal']),
     ('W3 variable-length text', ['T-repetition', 'T-setstrings', 'T-variable', 'T-boundary']),
     ('W4 insertion', ['T-insertion']),
     ('W5 captures/functions', ['R-backref', 'R-funcall', 'R-other']),
@@ -163,6 +170,29 @@ def classify(args, entries):
         own, uses = collections.Counter(), set()
         if e['rc'] not in (0, 2):
             own['X-analysis-failed'] += 1
+        #  The string rule overlaps of each conversion group.
+        groups = []
+        for line in lines:
+            m = re.match(r'    string rule overlaps: (\d+) pairs \((\d+) one-way, (\d+) two-way, (\d+) self\); (.*)$', line)
+            if m:
+                verdict = m.group(5)
+                g = dict(pairs=int(m.group(1)), one_way=int(m.group(2)), two_way=int(m.group(3)), self=int(m.group(4)))
+                if verdict.startswith('single pass'):
+                    g['verdict'] = 'single-pass'
+                    g['stages'] = int(re.search(r'in (\d+) stages', verdict).group(1))
+                elif g['two_way']:
+                    g['verdict'] = 'two-way'
+                elif g['self']:
+                    g['verdict'] = 'self'
+                else:
+                    g['verdict'] = 'cycle'
+                    g['cycle'] = int(re.search(r'cycle of (\d+)', verdict).group(1))
+                groups.append(g)
+        e['overlap_groups'] = groups
+        w2b = {'two-way': 'S-W2b-two-way', 'self': 'S-W2b-self', 'cycle': 'S-W2b-cycle', 'single-pass': 'S-W2b-single-pass'}
+        verdicts = {g['verdict'] for g in groups}
+        w2b_class = next((w2b[v] for v in ('two-way', 'self', 'cycle', 'single-pass') if v in verdicts),
+                         'S-match-within-string-rule')
         for line in lines:
             if line.startswith('  transform '):
                 used = resolve(line.split()[-1])
@@ -173,7 +203,8 @@ def classify(args, entries):
             elif line.startswith('  problem: '):
                 p = line[len('  problem: '):]
                 if not p.startswith(('unimplemented transform', 'unknown transform')):
-                    own[classify_problem(p)] += 1
+                    c = classify_problem(p)
+                    own[w2b_class if c == 'S-match-within-string-rule' else c] += 1
         e['own'] = dict(own)
         e['uses'] = sorted(uses)
         e['warnings'] = sum(1 for line in lines if line.startswith('    warning:'))
@@ -262,6 +293,23 @@ def summary(entries):
                                                 sum(1 for e in pop if c in e['classes']),
                                                 sum(e['own'].get(c, 0) for e in pop)))
     md.append('')
+    md.append('## String rule overlaps (W2b)\n')
+    md.append('The conversion groups (of all CLDR-defined transforms, each group counted once per transform) '
+              'whose string rules overlap, by verdict (see ldml::StringRuleOverlaps).\n')
+    groups = [(e['name'], g) for e in pop for g in e.get('overlap_groups', [])]
+    md.append('| verdict | groups | transforms | one-way pairs | two-way pairs | self-overlaps |')
+    md.append('|---|---:|---:|---:|---:|---:|')
+    for v in ('single-pass', 'cycle', 'self', 'two-way'):
+        gs = [g for _, g in groups if g['verdict'] == v]
+        md.append('| %s | %d | %d | %d | %d | %d |' % (v, len(gs), len({n for n, g in groups if g['verdict'] == v}),
+                                                      sum(g['one_way'] for g in gs), sum(g['two_way'] for g in gs),
+                                                      sum(g['self'] for g in gs)))
+    stages = collections.Counter(g['stages'] for _, g in groups if g['verdict'] == 'single-pass')
+    md.append('\nStages of the single-pass groups: %s\n' % ', '.join('%d stages: %d groups' % kv for kv in sorted(stages.items())))
+    cycles = collections.Counter(g['cycle'] for _, g in groups if g['verdict'] == 'cycle')
+    if cycles:
+        md.append('Cycles of the cyclic groups (one-way, without self-overlaps): %s\n' %
+                  ', '.join('%d rules: %d groups' % kv for kv in sorted(cycles.items())))
     md.append('## Transforms\n')
     md.append('Status: **ok** implementable; otherwise the work items needed (own problems and those of the '
               'transforms used).  Tests: CLDR test files (failed/total cases for implementable transforms).\n')

@@ -103,6 +103,47 @@ struct TransformPlan {
 // ExtractForwardRules or ExtractReverseBackwardRules).
 TransformPlan planTransform(const std::vector<Rule *> & rules);
 
+//  The overlaps of the string rules of a conversion group.
+//
+//  A string rule B overlaps a string rule A if B may match at a position
+//  strictly within the text of a match of A (RuleOverlapAnalysis::
+//  mayMatchWithin).  Where both match, ICU, scanning from the left, applies A,
+//  the rule whose match begins first (if its first position is reached), and
+//  not B.  For a pair of string rules, the overlap is
+//    - one-way if B may match within A but not A within B: where both match
+//      (overlapping), A always takes precedence (A → B);
+//    - two-way if each may match within the other: which takes precedence
+//      depends on which match begins first;
+//    - a self-overlap if a rule may match within its own text (A → A): of its
+//      overlapping matches, the leftmost takes precedence.
+//  If the overlaps of a group are all one-way and the precedence graph
+//  (A → B) is acyclic, the string rules can be applied sequentially, in a
+//  single pass, in a topological order: the matches of each rule that apply
+//  are those not beginning within an applied match of a rule preceding it.
+//  The number of stages is the number of rules in the longest chain of the
+//  graph.  A self-overlap is a cycle (of length 1): the overlapping matches of
+//  a rule must be selected among themselves, from the left.
+struct StringRuleOverlaps {
+    enum class Kind {OneWay, TwoWay, Self};
+    struct Pair {
+        size_t outer;   // the rule within whose text the other may match (A)
+        size_t inner;   // (B; for a two-way pair, outer < inner)
+        Kind kind;
+    };
+    std::vector<Pair> pairs;    // indices in TransformStep::stringRules
+    unsigned oneWay = 0, twoWay = 0, self = 0;
+    // The precedence graph of the one-way pairs and self-overlaps: whether it
+    // is acyclic, and if so its number of stages (0 without overlaps), and if
+    // not a cycle (a sequence of rules, each preceding the next and the last
+    // the first).
+    bool acyclic = true;
+    unsigned stages = 0;
+    std::vector<size_t> cycle;
+    // Can the string rules be applied sequentially in a single pass?
+    bool singlePass() const {return twoWay == 0 && acyclic;}
+};
+StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step);
+
 // A context (as given for the regular expression engine, see engineContext)
 // rewritten for matching text in which each character of insertions[k] (the
 // sets are disjoint) has been followed by k positions holding the filler

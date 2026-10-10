@@ -596,6 +596,34 @@ static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysi
         }
         llvm::outs() << "  conversion group: " << step.subgroups.size() << " subgroups, "
                      << step.stringRules.size() << " string rules\n";
+        //  The overlaps of the string rules (see ldml::StringRuleOverlaps).
+        const ldml::StringRuleOverlaps overlaps = ldml::analyzeStringRuleOverlaps(step);
+        if (!overlaps.pairs.empty()) {
+            llvm::outs() << "    string rule overlaps: " << overlaps.pairs.size() << " pairs (" << overlaps.oneWay << " one-way, "
+                         << overlaps.twoWay << " two-way, " << overlaps.self << " self); ";
+            if (overlaps.singlePass()) {
+                llvm::outs() << "single pass in " << overlaps.stages << " stages\n";
+            } else if (overlaps.twoWay > 0) {
+                llvm::outs() << "not single pass: two-way overlaps\n";
+            } else {
+                llvm::outs() << "not single pass: cycle of " << overlaps.cycle.size() << " rules\n";
+            }
+            for (size_t i = 0; i < overlaps.cycle.size(); i++) {
+                llvm::outs() << "      cycle: " << ldml::printRule(step.stringRules[overlaps.cycle[i]].rule) << "\n";
+            }
+            for (const ldml::StringRuleOverlaps::Pair & pair : overlaps.pairs) {
+                const std::string outer = ldml::printRule(step.stringRules[pair.outer].rule);
+                const std::string inner = ldml::printRule(step.stringRules[pair.inner].rule);
+                switch (pair.kind) {
+                    case ldml::StringRuleOverlaps::Kind::OneWay:
+                        llvm::outs() << "      overlap one-way: " << outer << "  →  " << inner << "\n"; break;
+                    case ldml::StringRuleOverlaps::Kind::TwoWay:
+                        llvm::outs() << "      overlap two-way: " << outer << "  ↔  " << inner << "\n"; break;
+                    case ldml::StringRuleOverlaps::Kind::Self:
+                        llvm::outs() << "      overlap self: " << outer << "\n"; break;
+                }
+            }
+        }
         //  ICU matches before contexts against the converted text.  A before context
         //  may match differently in the unconverted text, as the regular expression
         //  engine sees it, if a conversion of the group:

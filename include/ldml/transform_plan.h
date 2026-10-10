@@ -20,8 +20,11 @@
 //  in the order of their first rules, each mapping sets of characters to their
 //  replacement strings (the earliest rule for a character takes precedence).
 //  Each rule replacing a text of two or more characters is a string rule of
-//  its own; no rule of the group may match within its text (other than at its
-//  start), as the rules are applied to all positions at once.
+//  its own.  As the rules are applied to all positions at once, a rule that may
+//  match within the text of a string rule (other than at its start) must be
+//  kept from applying there: a single-character rule is, by the coverage of
+//  the matches of the string rules (see TransformStep::coverStringRules); a
+//  string rule is not supported.
 
 #pragma once
 
@@ -75,6 +78,11 @@ struct TransformStep {
     std::vector<CharMapSubgroup> subgroups;
     std::vector<StringRule> stringRules;
     std::vector<const ConversionRule *> rules;
+    // Whether a single-character rule may match within the text of a string
+    // rule (other than at its start), where ICU, having replaced the text, does
+    // not apply it: the rule then applies only at the positions not covered by
+    // the matches of the string rules (other than their starts).
+    bool coverStringRules = false;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

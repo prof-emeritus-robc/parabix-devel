@@ -725,6 +725,30 @@ protected:
     }
 };
 
+//  The positions where the single-character rules of a conversion group may
+//  apply, given the matches of its string rules (see TransformStep::
+//  coverStringRules): not those covered by the matches, from the position after
+//  the first character of a match (Spans, without Starts) to its last, nor the
+//  inserted positions (Inserted) after these.
+class UncoveredPositions : public pablo::PabloKernel {
+public:
+    UncoveredPositions(LLVMTypeSystemInterface & ts, StreamSet * Spans, StreamSet * Starts, StreamSet * Inserted,
+                       StreamSet * Uncovered)
+    : PabloKernel(ts, "UncoveredPositions",
+                  {Binding{"Spans", Spans}, Binding{"Starts", Starts}, Binding{"Inserted", Inserted}},
+                  {Binding{"Uncovered", Uncovered}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const inserted = getInputStreamSet("Inserted")[0];
+        PabloAST * const covered = pb.createAnd(getInputStreamSet("Spans")[0], pb.createNot(getInputStreamSet("Starts")[0]));
+        PabloAST * const follow = pb.createAnd(pb.createAdvance(covered, 1), inserted);
+        PabloAST * const runs = pb.createAnd(pb.createMatchStar(follow, inserted), inserted);
+        PabloAST * const uncovered = pb.createInFile(pb.createNot(pb.createOr(covered, runs)));
+        writeOutputStreamSet("Uncovered", std::vector<PabloAST *>{uncovered});
+    }
+};
+
 //  The codepoint standing for the characters outside the filter of a filtered
 //  normalization (see RulePipelineBuilder::maskedNormalization): a starter
 //  (ccc 0) without a decomposition, which does not compose with any character.
@@ -891,7 +915,7 @@ private:
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
-                               unsigned marks, const Insertions & insertions, StreamSet * U21);
+                               unsigned marks, const Insertions & insertions, StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21);
     StreamSet * combine(StreamSet * a, StreamSet * b, bool isOr);
     PipelineBuilder & mP;
@@ -1138,8 +1162,11 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
 
 //  The positions of the last characters of the matches of a text (a sequence of
 //  sets) with contexts, followed by the given number of inserted positions.
+//  With spans, also the positions of the characters of the texts of the
+//  matches, from the first to the last (the match spans of the regular
+//  expression engine, without the contexts).
 StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
-                                                unsigned marks, const Insertions & insertions, StreamSet * U21) {
+                                                unsigned marks, const Insertions & insertions, StreamSet * U21, StreamSet ** spans) {
     std::vector<re::RE *> items;
     //  ICU matches contexts possessively (see ldml::possessiveContext).
     if (engineBefore) {
@@ -1159,7 +1186,12 @@ StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * 
     const PreparedRE prepared = prepareRE(pattern);
     StreamSet * matches = mP.CreateStreamSet(1);
     RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
-    engine.matchSearchPipeline(prepared, matches);
+    if (spans) {
+        *spans = mP.CreateStreamSet(1);
+        engine.matchSpanPipeline(prepared, matches, *spans);
+    } else {
+        engine.matchSearchPipeline(prepared, matches);
+    }
     if (const unsigned offset = prepared.grepOffset()) {
         StreamSet * const shifted = mP.CreateStreamSet(1);
         mP.CreateKernelCall<ShiftBack>(matches, shifted, offset);
@@ -1375,19 +1407,40 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             addChanges(i == 0 ? xorSets(targets) : markXorSets(targets), matches, static_cast<int>(i));
         }
     }
+    //  The changes of the single-character rules, kept apart from those of the
+    //  string rules if they apply only where no string rule matches.
+    StreamSet * charChanges = nullptr;
+    if (step.coverStringRules) {
+        charChanges = changes;
+        changes = nullptr;
+    }
+    auto inverted = [&](StreamSet * s) {
+        StreamSet * const result = P.CreateStreamSet(1);
+        Invert(P, s, result);
+        return result;
+    };
+    //  The match spans of the string rules (see TransformStep::coverStringRules),
+    //  and the first positions of the matches.
+    StreamSet * spans = nullptr;
+    StreamSet * starts = nullptr;
 
     for (size_t r = 0; r < step.stringRules.size(); r++) {
         const ldml::StringRule & rule = step.stringRules[r];
         const std::vector<UCD::UnicodeSet> & text = texts[r];
         if (text.empty()) continue;
         const size_t n = text.size(), m = rule.replacement.size();
-        //  The positions of the last characters of the matches.
+        //  The positions of the last characters of the matches (and their spans).
         StreamSet * matches = nullptr;
+        StreamSet * ruleSpans = nullptr;
         for (const auto & k : byInsertions(text.back(), insertions)) {
             std::vector<UCD::UnicodeSet> t = text;
             t.back() = k.second;
-            matches = combine(matches, matchPositions(rule.engineBefore, rule.engineAfter, t, k.first, insertions, U21), true);
+            StreamSet * kSpans = nullptr;
+            matches = combine(matches, matchPositions(rule.engineBefore, rule.engineAfter, t, k.first, insertions, U21,
+                                                      step.coverStringRules ? &kSpans : nullptr), true);
+            if (kSpans) ruleSpans = combine(ruleSpans, kSpans, true);
         }
+        StreamSet * const allMatches = matches;
         //  Within a filter, the n characters of the text (at the last position
         //  and the n - 1 before it, as only the last may be followed by inserted
         //  positions) must all be within the mask.
@@ -1402,6 +1455,26 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
         }
         SHOW_STREAM(matches);
+        if (step.coverStringRules) {
+            //  Within a filter, the spans of the matches that do not apply (those
+            //  extending beyond the mask) do not count: as the matches of the
+            //  string rules do not overlap (one matching within another is not
+            //  supported), these are the n positions up to their ends.
+            if (mask) {
+                StreamSet * const rejected = combine(allMatches, inverted(matches), false);
+                StreamSet * rejectedSpans = rejected;
+                for (size_t j = 1; j < n; j++) {
+                    StreamSet * const back = P.CreateStreamSet(1);
+                    P.CreateKernelCall<ShiftBack>(rejected, back, static_cast<unsigned>(j));
+                    rejectedSpans = combine(rejectedSpans, back, true);
+                }
+                ruleSpans = combine(ruleSpans, inverted(rejectedSpans), false);
+            }
+            spans = combine(spans, ruleSpans, true);
+            StreamSet * const first = P.CreateStreamSet(1);
+            P.CreateKernelCall<ShiftBack>(matches, first, static_cast<unsigned>(n - 1));
+            starts = combine(starts, first, true);
+        }
         //  The characters of the text, at n - 1 - j positions before the last,
         //  change to the characters of the replacement (or the deletion mark).
         for (size_t j = 0; j < n; j++) {
@@ -1418,6 +1491,21 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             addTargetChanges(matches, static_cast<UCD::codepoint_t>(rule.replacement[j]), false, static_cast<int>(j - n + 1));
         }
     }
+
+    //  The single-character rules apply only where not covered by the matches of
+    //  the string rules (other than at their first positions), as in ICU, which
+    //  does not apply rules within the text it has replaced.
+    if (charChanges && spans) {
+        SHOW_STREAM(spans);
+        SHOW_STREAM(starts);
+        StreamSet * const uncovered = P.CreateStreamSet(1);
+        P.CreateKernelCall<UncoveredPositions>(spans, starts, classes({UCD::UnicodeSet(DeletionMark)}, U21), uncovered);
+        SHOW_STREAM(uncovered);
+        StreamSet * const applied = P.CreateStreamSet(21);
+        ZeroByMask(P, uncovered, charChanges, applied);
+        charChanges = applied;
+    }
+    if (charChanges) changes = changes ? combine(changes, charChanges, true) : charChanges;
 
     StreamSet * result = U21;
     if (changes && mask) {

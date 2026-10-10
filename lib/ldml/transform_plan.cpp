@@ -175,19 +175,24 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             }
         }
     }
-    //  As the rules of a group are applied at all positions at once, no rule may
+    //  As the rules of a group are applied at all positions at once, a rule may
     //  match within the text of a string rule (where ICU, having replaced the
-    //  text, does not apply rules).
+    //  text, does not apply rules).  A single-character rule matching there is
+    //  kept from applying by the coverage of the string rules (see
+    //  TransformStep::coverStringRules); a string rule matching there (whose
+    //  match may then overlap the text) is not supported.
     //  A quick check first: a rule may match within the text only if its first
     //  characters may occur at a position of the text other than the first.  The
-    //  first rule found that may match within a text is reported.
-    for (const TransformStep & step : plan.steps) {
+    //  first string rule found that may match within a text is reported.
+    for (TransformStep & step : plan.steps) {
         if (step.stringRules.empty()) continue;
         std::vector<UCD::UnicodeSet> firstChars;
+        std::vector<bool> single;
         for (const ConversionRule * r : step.rules) {
             std::vector<re::RE *> items;
             textItems(r->getSourceSide(Direction::Forward)->getText(), items);
             firstChars.push_back(items.empty() ? UCD::UnicodeSet() : sets.setOf(items.front(), false));
+            single.push_back(items.size() == 1);
         }
         RuleOverlapAnalysis analysis;
         for (const StringRule & s : step.stringRules) {
@@ -196,7 +201,12 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             for (size_t i = 0; i < step.rules.size(); i++) {
                 const ConversionRule * const r = step.rules[i];
                 if ((firstChars[i] & within).empty()) continue;
+                if (single[i] && step.coverStringRules) continue;
                 if (analysis.mayMatchWithin(r, s.rule)) {
+                    if (single[i]) {
+                        step.coverStringRules = true;
+                        continue;
+                    }
                     plan.problems.push_back(printRule(r) + "  (may match within the text of " + printRule(s.rule) + ")");
                     break;
                 }

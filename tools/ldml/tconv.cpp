@@ -7,6 +7,11 @@
 //
 //  tconv [options] <transform name> <input file>
 //      Write the transformed file to standard output.
+//  tconv [options] --rules-file=<rules file> <input file>
+//      Parse and compile the LDML transform rules (plain tRule text, as
+//      ldml_trules reads without --xml) of <rules file>, as the forward
+//      rules of an ad hoc transform, and apply it in place of a named
+//      transform.
 //  tconv [options] --list-transforms
 //      List the known transforms: canonical name, aliases, defining file.
 //
@@ -91,6 +96,9 @@ static cl::opt<std::string> TransformName(cl::Positional, cl::desc("<transform n
 static cl::opt<std::string> InputFile(cl::Positional, cl::desc("<input file>"), cl::cat(TconvOptions));
 static cl::opt<std::string> TransformsDir("transforms-dir", cl::desc("Directory of CLDR transform files (default ~/cldr/common/transforms)"),
                                           cl::init(""), cl::cat(TconvOptions));
+static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML transform rules (plain tRule text) to parse and compile, applied "
+                                                              "in place of a named transform"),
+                                      cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> ListTransforms("list-transforms", cl::desc("List the known transform names and exit"),
                                     cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
@@ -463,7 +471,15 @@ class TransformAnalyzer {
 public:
     explicit TransformAnalyzer(const ldml::TransformRegistry & registry) : mRegistry(registry) {}
     const TransformAnalysis & analyze(const ldml::TransformEntry * entry);
+    //  Analyze rules not tied to a registry entry (e.g. from --rules-file), as
+    //  the forward rules of an ad hoc transform.
+    TransformAnalysis analyzeRulesFile(const std::vector<ldml::Rule *> & parsed);
 private:
+    //  The common analysis of a set of parsed rules (trivial and nullable
+    //  capture elimination, order disambiguation, planning, and checking the
+    //  transforms the plan's steps invoke), given the rules to extract as
+    //  forward rules.
+    TransformAnalysis analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction);
     const ldml::TransformRegistry & mRegistry;
     std::map<std::string, TransformAnalysis> mResults;
     std::set<std::string> mInProgress;
@@ -510,7 +526,19 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
     mInProgress.insert(name);
     try {
         const std::vector<ldml::Rule *> parsed = ldml::parseTransformRules(ldml::extractTRules(readFile(entry->file)));
-        std::vector<ldml::Rule *> rules = entry->direction == ldml::TransformDirection::Forward
+        a = analyzeRules(parsed, entry->direction);
+    } catch (const std::exception & e) {
+        a.problems.push_back(std::string("rules not loaded: ") + e.what());
+        a.implementable = false;
+    }
+    mInProgress.erase(name);
+    return mResults.emplace(name, std::move(a)).first->second;
+}
+
+TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
+    TransformAnalysis a;
+    try {
+        std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
         rules = ldml::TrivialCaptureElimination(rules);
         rules = ldml::NullableCaptureElimination(rules);
@@ -536,9 +564,12 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
     } catch (const std::exception & e) {
         a.problems.push_back(std::string("rules not loaded: ") + e.what());
     }
-    mInProgress.erase(name);
     a.implementable = a.problems.empty();
-    return mResults.emplace(name, std::move(a)).first->second;
+    return a;
+}
+
+TransformAnalysis TransformAnalyzer::analyzeRulesFile(const std::vector<ldml::Rule *> & parsed) {
+    return analyzeRules(parsed, ldml::TransformDirection::Forward);
 }
 
 //  A set of codepoints, as its first few ranges (U+0041, U+0061-U+007A, ...).
@@ -558,9 +589,8 @@ static std::string printRanges(const UCD::UnicodeSet & set) {
     return set.count() == 1 ? result : "[" + result + "]";
 }
 
-static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysis & a) {
-    llvm::outs() << entry->canonicalName << (entry->isBuiltIn() ? " (built-in)" : " (" + entry->file + ")")
-                 << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
+static void printPlan(const std::string & label, const TransformAnalysis & a) {
+    llvm::outs() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
     for (const std::string & p : a.problems) {
         std::string shown = p;
         if (p.size() > 160) {
@@ -1029,6 +1059,9 @@ public:
     : mP(P), mRegistry(registry), mAnalyzer(analyzer), mNFD(P) {}
     // Apply the transform of a registry entry to U21 (an implementable transform).
     StreamSet * transform(const ldml::TransformEntry * entry, StreamSet * U21);
+    // Apply an already-analyzed plan (e.g. of an ad hoc --rules-file transform,
+    // not tied to a registry entry) to U21.
+    StreamSet * applyAnalysis(const TransformAnalysis & a, StreamSet * U21);
 private:
     //  Filters.  As in ICU, a filter selects the characters of the text that a
     //  transform may change, once, when the transform is applied: the steps of
@@ -1779,6 +1812,10 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
     if (entry->isBuiltIn()) return builtIn(entry->canonicalName, U21);
     const TransformAnalysis & a = mAnalyzer.analyze(entry);
     assert (a.implementable);
+    return applyAnalysis(a, U21);
+}
+
+StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, StreamSet * U21) {
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
@@ -1807,6 +1844,22 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
     return P.compile();
 }
 
+//  A pipeline for a transform compiled from an ad hoc rules file (--rules-file),
+//  given its already-computed analysis (see TransformAnalyzer::analyzeRulesFile).
+static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver, const ldml::TransformRegistry & registry,
+                                                               TransformAnalyzer & analyzer, const TransformAnalysis & a) {
+    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
+    RulePipelineBuilder builder(P, registry, analyzer);
+    StreamSet * const Result = builder.applyAnalysis(a, U21);
+    StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
+    P.CreateKernelCall<StdOutKernel>(OutputBytes);
+    return P.compile();
+}
+
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
@@ -1823,8 +1876,61 @@ int main(int argc, char *argv[]) {
         listTransforms(registry);
         return 0;
     }
+
+    if (!RulesFile.empty()) {
+        //  Only one positional argument is expected (the input file); if it was
+        //  parsed as TransformName (the first positional), it is the input file.
+        std::string inputFile = InputFile;
+        if (!TransformName.empty()) {
+            if (!InputFile.empty()) {
+                llvm::errs() << "Error: --rules-file takes only an input file, not a transform name.\n";
+                return 1;
+            }
+            inputFile = TransformName;
+        }
+        if (inputFile.empty() && !ShowPlan) {
+            llvm::errs() << "Usage: " << argv[0] << " [options] --rules-file=<rules file> <input file>\n";
+            return 1;
+        }
+        std::vector<ldml::Rule *> parsed;
+        try {
+            parsed = ldml::parseTransformRules({readFile(RulesFile)});
+        } catch (const ldml::TransformRuleParseErrors & e) {
+            for (const ldml::TransformRuleParseError & err : e.getErrors()) llvm::errs() << RulesFile << ": " << err.what() << "\n";
+            return 1;
+        } catch (const std::exception & e) {
+            llvm::errs() << "Error: " << e.what() << "\n";
+            return 1;
+        }
+        TransformAnalyzer analyzer(registry);
+        const TransformAnalysis a = analyzer.analyzeRulesFile(parsed);
+        if (ShowPlan) {
+            printPlan("rules file " + RulesFile, a);
+            return a.implementable ? 0 : 2;
+        }
+        if (!a.implementable) {
+            llvm::errs() << "Rules file " << RulesFile << " is not implementable";
+            if (!a.problems.empty()) {
+                llvm::errs() << ": " << a.problems.size() << " problems (see --plan), e.g.\n  " << a.problems.front();
+            }
+            llvm::errs() << "\n";
+            return 2;
+        }
+        const int fd = open(inputFile.c_str(), O_RDONLY);
+        if (LLVM_UNLIKELY(fd == -1)) {
+            llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
+            return 1;
+        }
+        CPUDriver driver("tconv");
+        TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
+        fn(fd);
+        close(fd);
+        return 0;
+    }
+
     if (TransformName.empty() || (InputFile.empty() && !ShowPlan)) {
         llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> <input file>\n"
+                     << "       " << argv[0] << " [options] --rules-file=<rules file> <input file>\n"
                      << "       " << argv[0] << " [options] --list-transforms\n";
         return 1;
     }
@@ -1837,7 +1943,7 @@ int main(int argc, char *argv[]) {
     if (ShowPlan) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);
-        printPlan(entry, a);
+        printPlan(entry->canonicalName + (entry->isBuiltIn() ? " (built-in)" : " (" + entry->file + ")"), a);
         return a.implementable ? 0 : 2;
     }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),

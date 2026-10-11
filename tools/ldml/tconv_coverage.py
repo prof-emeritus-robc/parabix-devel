@@ -251,8 +251,12 @@ def run_tests(args, entries):
         src = os.path.join(tests, f)
         with open(src, 'w', encoding='utf-8') as t:
             t.write(''.join(p[0] + '\n' for p in pairs))
-        r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, name, src],
-                           capture_output=True, timeout=args.timeout)
+        try:
+            r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, name, src],
+                               capture_output=True, timeout=args.timeout)
+        except subprocess.TimeoutExpired:
+            e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(pairs), timeout=True)
+            continue
         out = r.stdout.decode('utf-8', 'replace').split('\n')
         failed = sum(1 for i, p in enumerate(pairs) if i >= len(out) or out[i] != p[1])
         e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=failed)

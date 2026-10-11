@@ -781,30 +781,94 @@ protected:
     }
 };
 
-//  The matches that apply of a string rule of two characters that may match
-//  within its own text (see ldml::StringRule::selfOverlapping), marked at their
-//  last characters: matches ending at consecutive positions overlap, and of each
-//  run of them, the first and every other one after it apply (those at the
-//  positions of the same parity as the first), as ICU, scanning from the left,
-//  applies the leftmost of overlapping matches and continues after it.
-class AlternateMatches : public pablo::PabloKernel {
+//  The matches that apply of the string rules of a conversion group in which
+//  string rules may match within the texts of others (see ldml::TransformStep::
+//  stringOrder), given the matches of each rule, in the order to apply them,
+//  marked at their first positions (Firsts): a match of a rule applies only if
+//  it does not begin within an applied match of a rule preceding it (at the
+//  1 to n - 1 positions after the first of a match of n characters).  Of the
+//  matches of a rule of two characters that may match within its own text,
+//  which overlap where they begin at consecutive positions, the first of each
+//  run and every other one after it apply (those at the positions of the same
+//  parity as the first), as ICU, scanning from the left, applies the leftmost of
+//  overlapping matches and continues after it.  Optionally, also the positions
+//  within the applied matches after their first (Inside), and their first
+//  positions (First), of all the rules.
+class SelectStringMatches : public pablo::PabloKernel {
 public:
-    AlternateMatches(LLVMTypeSystemInterface & ts, StreamSet * Matches, StreamSet * Selected)
-    : PabloKernel(ts, "AlternateMatches", {Binding{"Matches", Matches}}, {Binding{"Selected", Selected}}) {}
+    struct Rule {
+        unsigned length;
+        std::vector<size_t> predecessors;   // indices of preceding rules
+        bool selfOverlapping;
+    };
+    SelectStringMatches(LLVMTypeSystemInterface & ts, const std::vector<Rule> & rules,
+                        const std::vector<StreamSet *> & Firsts, const std::vector<StreamSet *> & Applied,
+                        StreamSet * Inside, StreamSet * First)
+    : PabloKernel(ts, "SelectStringMatches" + signature(rules) + (Inside ? "_spans" : ""),
+                  [&] {
+                      Bindings inputs;
+                      for (size_t i = 0; i < Firsts.size(); i++) inputs.emplace_back("Firsts" + std::to_string(i), Firsts[i]);
+                      return inputs;
+                  }(),
+                  [&] {
+                      Bindings outputs;
+                      for (size_t i = 0; i < Applied.size(); i++) outputs.emplace_back("Applied" + std::to_string(i), Applied[i]);
+                      if (Inside) {
+                          outputs.emplace_back("Inside", Inside);
+                          outputs.emplace_back("First", First);
+                      }
+                      return outputs;
+                  }()),
+      mRules(rules), mSpans(Inside != nullptr) {}
 protected:
+    //  The rules, as a hash of their lengths, predecessors and self-overlaps (the
+    //  description itself may be too long for a kernel name).
+    static std::string signature(const std::vector<Rule> & rules) {
+        std::string sig;
+        for (const Rule & r : rules) {
+            sig += "_" + std::to_string(r.length) + (r.selfOverlapping ? "s" : "");
+            for (size_t p : r.predecessors) sig += "." + std::to_string(p);
+        }
+        char hex[17];
+        snprintf(hex, sizeof(hex), "%016llx", static_cast<unsigned long long>(std::hash<std::string>{}(sig)));
+        return "_" + std::to_string(rules.size()) + "_" + hex;
+    }
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        PabloAST * const matches = getInputStreamSet("Matches")[0];
         PabloAST * const odd = pb.createRepeat(1, pb.getInteger(0xAA, 8));
-        PabloAST * const first = pb.createAnd(matches, pb.createAdvance(pb.createNot(matches), 1));
-        PabloAST * const firstOdd = pb.createAnd(first, odd);
-        PabloAST * const firstEven = pb.createXor(first, firstOdd);
-        PabloAST * const oddSelected = pb.createAnd(pb.createMatchStar(firstOdd, matches), odd);
-        PabloAST * const evenSelected = pb.createAnd(pb.createMatchStar(firstEven, matches), pb.createNot(odd));
-        //  MatchStar also marks the position after each run, which is not a match.
-        PabloAST * const selected = pb.createAnd(pb.createOr(oddSelected, evenSelected), matches);
-        writeOutputStreamSet("Selected", std::vector<PabloAST *>{selected});
+        std::vector<PabloAST *> applied;
+        PabloAST * inside = pb.createZeroes();
+        PabloAST * first = pb.createZeroes();
+        //  The positions within the applied matches of a rule after their first.
+        std::vector<PabloAST *> within;
+        for (size_t i = 0; i < mRules.size(); i++) {
+            const Rule & rule = mRules[i];
+            PabloAST * matches = getInputStreamSet("Firsts" + std::to_string(i))[0];
+            for (size_t p : rule.predecessors) matches = pb.createAnd(matches, pb.createNot(within[p]));
+            if (rule.selfOverlapping) {
+                PabloAST * const runFirst = pb.createAnd(matches, pb.createNot(pb.createAdvance(matches, 1)));
+                PabloAST * const firstOdd = pb.createAnd(runFirst, odd);
+                PabloAST * const firstEven = pb.createXor(runFirst, firstOdd);
+                PabloAST * const oddSelected = pb.createAnd(pb.createMatchStar(firstOdd, matches), odd);
+                PabloAST * const evenSelected = pb.createAnd(pb.createMatchStar(firstEven, matches), pb.createNot(odd));
+                //  MatchStar also marks the position after each run, which is not a match.
+                matches = pb.createAnd(pb.createOr(oddSelected, evenSelected), matches);
+            }
+            PabloAST * w = pb.createZeroes();
+            for (unsigned j = 1; j < rule.length; j++) w = pb.createOr(w, pb.createAdvance(matches, j));
+            within.push_back(w);
+            inside = pb.createOr(inside, w);
+            first = pb.createOr(first, matches);
+            writeOutputStreamSet("Applied" + std::to_string(i), std::vector<PabloAST *>{matches});
+        }
+        if (mSpans) {
+            writeOutputStreamSet("Inside", std::vector<PabloAST *>{inside});
+            writeOutputStreamSet("First", std::vector<PabloAST *>{first});
+        }
     }
+private:
+    const std::vector<Rule> mRules;
+    const bool mSpans;
 };
 
 //  The codepoint standing for the characters outside the filter of a filtered
@@ -1486,46 +1550,31 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     StreamSet * spans = nullptr;
     StreamSet * starts = nullptr;
 
-    //  The string rules, in the order to apply them: where string rules may match
-    //  within the texts of others, a match of a rule applies only if it does not
-    //  begin within an applied match of a rule preceding it (see
-    //  ldml::TransformStep::stringOrder).  For these, the positions within the
-    //  applied matches after their first.
-    std::vector<size_t> order = step.stringOrder;
-    if (order.empty()) {
-        for (size_t r = 0; r < step.stringRules.size(); r++) order.push_back(r);
-    }
-    std::vector<bool> preceding(step.stringRules.size(), false);
-    for (const std::vector<size_t> & predecessors : step.stringPredecessors) {
-        for (size_t a : predecessors) preceding[a] = true;
-    }
-    std::vector<StreamSet *> within(step.stringRules.size(), nullptr);
-
-    for (size_t r : order) {
+    //  The string rules.  Where string rules may match within the texts of others
+    //  (see ldml::TransformStep::stringOrder), the matches that apply are selected
+    //  among those of all the string rules of the group, at once, by
+    //  SelectStringMatches; otherwise all the matches of each rule apply.
+    //
+    //  The positions of the last characters of the matches of a rule (all of
+    //  them, and those within the mask), and with spans, their spans.
+    auto ruleMatches = [&](size_t r, StreamSet ** ruleSpans) -> std::pair<StreamSet *, StreamSet *> {
         const ldml::StringRule & rule = step.stringRules[r];
         const std::vector<UCD::UnicodeSet> & text = texts[r];
-        if (text.empty()) continue;
-        const size_t n = text.size(), m = rule.replacement.size();
-        const std::vector<size_t> * const predecessors = step.stringPredecessors.empty() ? nullptr : &step.stringPredecessors[r];
-        //  Whether only some of the matches apply.
-        const bool selected = (predecessors && !predecessors->empty()) || rule.selfOverlapping;
-        //  The positions of the last characters of the matches (and their spans).
         StreamSet * matches = nullptr;
-        StreamSet * ruleSpans = nullptr;
         for (const auto & k : byInsertions(text.back(), insertions)) {
             std::vector<UCD::UnicodeSet> t = text;
             t.back() = k.second;
             StreamSet * kSpans = nullptr;
             matches = combine(matches, matchPositions(rule.engineBefore, rule.engineAfter, t, k.first, insertions, U21,
-                                                      step.coverStringRules && !selected ? &kSpans : nullptr), true);
-            if (kSpans) ruleSpans = combine(ruleSpans, kSpans, true);
+                                                      ruleSpans ? &kSpans : nullptr), true);
+            if (kSpans) *ruleSpans = combine(*ruleSpans, kSpans, true);
         }
         StreamSet * const allMatches = matches;
         //  Within a filter, the n characters of the text (at the last position
         //  and the n - 1 before it, as only the last may be followed by inserted
         //  positions) must all be within the mask.
         if (mask) {
-            for (size_t j = 0; j < n; j++) {
+            for (size_t j = 0; j < text.size(); j++) {
                 StreamSet * within = mask;
                 if (j > 0) {
                     within = P.CreateStreamSet(1);
@@ -1534,70 +1583,14 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 matches = combine(matches, within, false);
             }
         }
-        //  The matches that do not begin within an applied match of a preceding
-        //  rule (marked at their last characters, n - 1 positions after their
-        //  first: as only the last character of a text may be followed by
-        //  inserted positions, the characters of a text are consecutive).
-        if (predecessors) {
-            StreamSet * covered = nullptr;
-            for (size_t a : *predecessors) {
-                if (within[a]) covered = combine(covered, within[a], true);
-            }
-            if (covered) {
-                StreamSet * const atEnd = P.CreateStreamSet(1);
-                P.CreateKernelCall<ShiftForward>(covered, atEnd, static_cast<unsigned>(n - 1));
-                matches = combine(matches, inverted(atEnd), false);
-            }
-        }
-        //  The matches of a rule matching within its own text that apply.
-        if (rule.selfOverlapping) {
-            StreamSet * const alternate = P.CreateStreamSet(1);
-            P.CreateKernelCall<AlternateMatches>(matches, alternate);
-            matches = alternate;
-        }
         SHOW_STREAM(matches);
-        //  The positions within the applied matches after their first (for the
-        //  rules following this one, and the coverage of the string rules).
-        StreamSet * inside = nullptr;
-        if (preceding[r] || (selected && step.coverStringRules)) {
-            for (size_t j = 0; j + 1 < n; j++) {
-                StreamSet * back = matches;
-                if (j > 0) {
-                    back = P.CreateStreamSet(1);
-                    P.CreateKernelCall<ShiftBack>(matches, back, static_cast<unsigned>(j));
-                }
-                inside = combine(inside, back, true);
-            }
-            SHOW_STREAM(inside);
-            within[r] = inside;
-        }
-        if (step.coverStringRules && selected) {
-            //  The spans of the matches that apply (the engine's spans, the
-            //  union of those of all the matches, would include the others).
-            StreamSet * const first = P.CreateStreamSet(1);
-            P.CreateKernelCall<ShiftBack>(matches, first, static_cast<unsigned>(n - 1));
-            spans = combine(spans, combine(inside, first, true), true);
-            starts = combine(starts, first, true);
-        } else if (step.coverStringRules) {
-            //  Within a filter, the spans of the matches that do not apply (those
-            //  extending beyond the mask) do not count: as the matches of this
-            //  rule do not overlap one another (it does not match within its own
-            //  text), these are the n positions up to their ends.
-            if (mask) {
-                StreamSet * const rejected = combine(allMatches, inverted(matches), false);
-                StreamSet * rejectedSpans = rejected;
-                for (size_t j = 1; j < n; j++) {
-                    StreamSet * const back = P.CreateStreamSet(1);
-                    P.CreateKernelCall<ShiftBack>(rejected, back, static_cast<unsigned>(j));
-                    rejectedSpans = combine(rejectedSpans, back, true);
-                }
-                ruleSpans = combine(ruleSpans, inverted(rejectedSpans), false);
-            }
-            spans = combine(spans, ruleSpans, true);
-            StreamSet * const first = P.CreateStreamSet(1);
-            P.CreateKernelCall<ShiftBack>(matches, first, static_cast<unsigned>(n - 1));
-            starts = combine(starts, first, true);
-        }
+        return {allMatches, matches};
+    };
+    //  The changes of a rule at the matches that apply (marked at their last
+    //  characters).
+    auto ruleChanges = [&](size_t r, StreamSet * matches) {
+        const ldml::StringRule & rule = step.stringRules[r];
+        const size_t n = texts[r].size(), m = rule.replacement.size();
         //  The characters of the text, at n - 1 - j positions before the last,
         //  change to the characters of the replacement (or the deletion mark).
         for (size_t j = 0; j < n; j++) {
@@ -1612,6 +1605,81 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         //  The further characters of the replacement, at the inserted positions.
         for (size_t j = n; j < m; j++) {
             addTargetChanges(matches, static_cast<UCD::codepoint_t>(rule.replacement[j]), false, static_cast<int>(j - n + 1));
+        }
+    };
+
+    if (!step.stringOrder.empty()) {
+        //  The matches of the rules, in the order to apply them, at their first
+        //  positions (n - 1 before their last: as only the last character of a
+        //  text may be followed by inserted positions, the characters of a text
+        //  are consecutive).
+        std::vector<size_t> rules;
+        std::vector<size_t> index(step.stringRules.size(), SIZE_MAX);
+        for (size_t r : step.stringOrder) {
+            if (texts[r].empty()) continue;
+            index[r] = rules.size();
+            rules.push_back(r);
+        }
+        std::vector<StreamSet *> firsts, applied;
+        std::vector<SelectStringMatches::Rule> select;
+        for (size_t r : rules) {
+            const size_t n = texts[r].size();
+            StreamSet * const first = P.CreateStreamSet(1);
+            P.CreateKernelCall<ShiftBack>(ruleMatches(r, nullptr).second, first, static_cast<unsigned>(n - 1));
+            firsts.push_back(first);
+            applied.push_back(P.CreateStreamSet(1));
+            SelectStringMatches::Rule sr;
+            sr.length = static_cast<unsigned>(n);
+            sr.selfOverlapping = step.stringRules[r].selfOverlapping;
+            for (size_t a : step.stringPredecessors[r]) {
+                if (index[a] != SIZE_MAX) sr.predecessors.push_back(index[a]);
+            }
+            select.push_back(std::move(sr));
+        }
+        StreamSet * const inside = step.coverStringRules ? P.CreateStreamSet(1) : nullptr;
+        StreamSet * const first = step.coverStringRules ? P.CreateStreamSet(1) : nullptr;
+        P.CreateKernelCall<SelectStringMatches>(select, firsts, applied, inside, first);
+        for (size_t i = 0; i < rules.size(); i++) {
+            const size_t n = texts[rules[i]].size();
+            StreamSet * const ends = P.CreateStreamSet(1);
+            P.CreateKernelCall<ShiftForward>(applied[i], ends, static_cast<unsigned>(n - 1));
+            SHOW_STREAM(ends);
+            ruleChanges(rules[i], ends);
+        }
+        //  The spans of the matches that apply (the engine's spans, the union of
+        //  those of all the matches, would include the others).
+        if (step.coverStringRules) {
+            spans = combine(inside, first, true);
+            starts = first;
+        }
+    } else {
+        for (size_t r = 0; r < step.stringRules.size(); r++) {
+            if (texts[r].empty()) continue;
+            const size_t n = texts[r].size();
+            StreamSet * ruleSpans = nullptr;
+            StreamSet * allMatches, * matches;
+            std::tie(allMatches, matches) = ruleMatches(r, step.coverStringRules ? &ruleSpans : nullptr);
+            if (step.coverStringRules) {
+                //  Within a filter, the spans of the matches that do not apply
+                //  (those extending beyond the mask) do not count: as the matches
+                //  of the string rules do not overlap, these are the n positions up
+                //  to their ends.
+                if (mask) {
+                    StreamSet * const rejected = combine(allMatches, inverted(matches), false);
+                    StreamSet * rejectedSpans = rejected;
+                    for (size_t j = 1; j < n; j++) {
+                        StreamSet * const back = P.CreateStreamSet(1);
+                        P.CreateKernelCall<ShiftBack>(rejected, back, static_cast<unsigned>(j));
+                        rejectedSpans = combine(rejectedSpans, back, true);
+                    }
+                    ruleSpans = combine(ruleSpans, inverted(rejectedSpans), false);
+                }
+                spans = combine(spans, ruleSpans, true);
+                StreamSet * const first = P.CreateStreamSet(1);
+                P.CreateKernelCall<ShiftBack>(matches, first, static_cast<unsigned>(n - 1));
+                starts = combine(starts, first, true);
+            }
+            ruleChanges(r, matches);
         }
     }
 

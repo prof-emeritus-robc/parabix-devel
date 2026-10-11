@@ -7,9 +7,12 @@
 #include <kernel/core/kernel_builder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_ostream.h>
+#include <pablo/bixnum/bixnum.h>
+#include <sstream>
 
 using namespace kernel;
 using namespace llvm;
+using namespace pablo;
 
 HexToBinary::HexToBinary(LLVMTypeSystemInterface & ts, StreamSet * hexStream, StreamSet * binStream)
 : BlockOrientedKernel(ts, "HexToBinary",
@@ -80,4 +83,80 @@ void BinaryToHex::generateFinalBlockMethod(KernelBuilder & b, Value * const rema
     Value * remainingHexDigits = b.CreateUDiv(b.CreateAdd(remainingBits, b.getSize(3)), b.getSize(4));
     Value * toZero = b.CreateSub(b.getSize(b.getBitBlockWidth()), remainingHexDigits);
     b.CreateMemZero(b.getRawOutputPointer("hexdata", b.CreateAdd(priorProduced, remainingHexDigits)), toZero);
+}
+
+static std::string bixSplitUniqueName(StreamSet * bixData, StreamSet * bixPairData) {
+    unsigned inBits = bixData->getNumElements();
+    unsigned outBits = bixPairData->getNumElements();
+    assert((outBits < inBits) && (inBits <= 2 * outBits));
+    std::stringstream ss;
+    ss << "bixSplit_" << inBits << "_x1->" << outBits << "x1";
+    return ss.str();
+}
+
+BixSplit::BixSplit(LLVMTypeSystemInterface & ts, StreamSet * bixData, StreamSet * bixPairData)
+: BlockOrientedKernel(ts, bixSplitUniqueName(bixData, bixPairData),
+                   {Binding{"bixData", bixData, FixedRate()}},
+                   {Binding{"bixPairData", bixPairData, FixedRate(2)}},
+{}, {}, {}), mInputBits(bixData->getNumElements()), mOutputBits(bixPairData->getNumElements()) {}
+
+void BixSplit::generateDoBlockMethod(KernelBuilder & b) {
+    Constant * const ZERO = b.getSize(0);
+    for (unsigned out_bit = 0; out_bit < mOutputBits; out_bit++) {
+        //  Output bit out_bit of the first (high) hex digit of each byte comes from
+        //  bit out_bit + 4 of the byte, the second (low) digit from bit out_bit.
+        Value * input[2];
+        for (unsigned i = 0; i < 2; i++) {
+            unsigned input_bit = out_bit + mOutputBits * (1 - i);
+            if (input_bit >= mInputBits) {
+                input[i] = b.allZeroes();
+            } else {
+                input[i] = b.loadInputStreamBlock("bixData", b.getInt32(input_bit), ZERO);
+            }
+        }
+
+        Value * pack[2];
+        pack[0] = b.esimd_mergel(1, input[0], input[1]);
+        pack[1] = b.esimd_mergeh(1, input[0], input[1]);
+        for (unsigned i = 0; i < 2; i++) {
+            //  The output rate is 2, so each pack is a full block of output; pack i
+            //  goes to block offset i (a pack index would address the next stream).
+            b.storeOutputStreamBlock("bixPairData", b.getInt32(out_bit), b.getSize(i), pack[i]);
+        }
+    }
+}
+
+Bix4toHex::Bix4toHex(LLVMTypeSystemInterface & ts,
+                     StreamSet * bix4Data, StreamSet * hexBasis, bool LowerHex)
+        : PabloKernel(ts, LowerHex ? "Bix4toHex_lc" : "Bix4toHex",
+                      {Binding{"bix4Data", bix4Data}},
+                      {Binding{"hexBasis", hexBasis}}), mLowerHex(LowerHex) {}
+
+void Bix4toHex::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    //  bnc is an object that can perform arithmetic on sets of parallel bit streams
+    BixNumCompiler bnc(pb);
+    // Get the input stream sets.
+    std::vector<PabloAST *> bix4Data = getInputStreamSet("bix4Data");
+
+    //  Given these 4 bit streams, a position is in the hex A-F range when its binary code is >= 10.
+    PabloAST * hexA_F = bnc.UGE(bix4Data, 10, "hexA_F");
+    //  If a number is in the hexA_F range, the low 4 bits are determined by subtracting 9.
+    bix4Data = bnc.Select(hexA_F, bnc.SubModular(bix4Data, 9), bix4Data);
+    //
+    // Now we will extend to 8 bits and insert the appropriate bits of the
+    // ASCII representation.
+    std::vector<PabloAST *> hexBasis = bnc.ZeroExtend(bix4Data, 8);
+    // Now compute the high 4 bits of the hexBasis.
+    // High 4 bits are 0x40 for hex A-F, 0x60 for hex a-f, 0x30 for hex 0-9,
+    hexBasis[7] = pb.createZeroes();  // the high bit (bit 7) is always zero for ASCII
+    hexBasis[6] = hexA_F;
+    if (mLowerHex) {
+        hexBasis[5] = pb.createOnes();
+    } else {
+        hexBasis[5] = pb.createNot(hexA_F);
+    }
+    hexBasis[4] = pb.createNot(hexA_F);
+    //
+    writeOutputStreamSet("hexBasis", hexBasis);
 }

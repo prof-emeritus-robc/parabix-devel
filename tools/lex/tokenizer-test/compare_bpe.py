@@ -27,6 +27,7 @@ Usage:
     python compare_bpe.py --no-tiktoken                 # Parabix vs HF only (original behavior)
     python compare_bpe.py --runs 10                    # timed runs per side (default 5)
     python compare_bpe.py --no-timing                  # skip the timing section
+    python compare_bpe.py --parabix-args="--level-partition --compact-base=2"
 """
 
 import sys
@@ -35,6 +36,7 @@ import tempfile
 import os
 import re
 import argparse
+import shlex
 import time
 from tokenizers import Tokenizer
 import tiktoken
@@ -475,9 +477,9 @@ def main() -> None:
                         help=f"Timed runs per side in compare mode (default: {DEFAULT_RUNS})")
     parser.add_argument("--no-timing",    action="store_true",
                         help="Skip the timing section")
-    parser.add_argument("--tok-flag",     action="append", default=[], metavar="FLAG",
-                        help="Extra flag passed straight to the tokenizer binary "
-                             "(repeatable), e.g. --tok-flag=--partition=level")
+    parser.add_argument("--parabix-args", default="",
+                        help="Extra flags passed straight to the tokenizer binary, "
+                             "e.g. --parabix-args=\"--level-partition --compact-base=2\"")
     parser.add_argument("--tokenizer",      default=TOKENIZER,
                         help=f"Parabix tokenizer binary (default: {TOKENIZER})")
     parser.add_argument("--merges",         default=MERGES,
@@ -497,7 +499,7 @@ def main() -> None:
         print(f"Error: tokenizer binary not found: {TOKENIZER}")
         sys.exit(1)
     SHOW_INPUT = args.show_input
-    EXTRA_ARGS = list(args.tok_flag)
+    EXTRA_ARGS = shlex.split(args.parabix_args)
     if EXTRA_ARGS:
         print(f"Extra tokenizer flags: {' '.join(EXTRA_ARGS)}")
 

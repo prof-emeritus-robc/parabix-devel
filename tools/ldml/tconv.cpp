@@ -518,27 +518,6 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
         if (dstats.overlapsAfter > 0) {
             a.problems.push_back(std::to_string(dstats.overlapsAfter) + " pairs of rules remain order dependent");
         }
-        //  The characters of the texts of string rules, other than the last, must
-        //  not be expanded for longer replacements (so that the characters of each
-        //  text are consecutive).
-        for (const ldml::TransformStep & step : a.plan.steps) {
-            UCD::UnicodeSet expanded;
-            for (const ldml::CharMapSubgroup & sg : step.subgroups) {
-                for (const ldml::CharMapping & m : sg.mappings) if (m.replacement.size() > 1) expanded = expanded + m.chars;
-            }
-            for (const ldml::StringRule & sr : step.stringRules) {
-                if (sr.replacement.size() > sr.text.size()) expanded = expanded + sr.text.back();
-            }
-            for (const ldml::StringRule & sr : step.stringRules) {
-                for (size_t j = 0; j + 1 < sr.text.size(); j++) {
-                    if (!(sr.text[j] & expanded).empty()) {
-                        a.problems.push_back(ldml::printRule(sr.rule) + "  (a character of the text other than the last "
-                                             "is expanded for a longer replacement; not yet supported)");
-                        break;
-                    }
-                }
-            }
-        }
         for (const ldml::TransformStep & step : a.plan.steps) {
             if (step.kind != ldml::TransformStep::Kind::Transform) continue;
             const std::string id = step.transform.getText();
@@ -763,27 +742,57 @@ protected:
 };
 
 //  The positions where the single-character rules of a conversion group may
-//  apply, given the matches of its string rules (see TransformStep::
+//  apply, given the matches of its string rules that apply (see TransformStep::
 //  coverStringRules): not those covered by the matches, from the position after
-//  the first character of a match (Spans, without Starts) to its last, nor the
-//  inserted positions (Inserted) after these.
+//  the first character of a match (Spans, without Starts) to its last.
 class UncoveredPositions : public pablo::PabloKernel {
 public:
-    UncoveredPositions(LLVMTypeSystemInterface & ts, StreamSet * Spans, StreamSet * Starts, StreamSet * Inserted,
-                       StreamSet * Uncovered)
+    UncoveredPositions(LLVMTypeSystemInterface & ts, StreamSet * Spans, StreamSet * Starts, StreamSet * Uncovered)
     : PabloKernel(ts, "UncoveredPositions",
-                  {Binding{"Spans", Spans}, Binding{"Starts", Starts}, Binding{"Inserted", Inserted}},
+                  {Binding{"Spans", Spans}, Binding{"Starts", Starts}},
                   {Binding{"Uncovered", Uncovered}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        PabloAST * const inserted = getInputStreamSet("Inserted")[0];
         PabloAST * const covered = pb.createAnd(getInputStreamSet("Spans")[0], pb.createNot(getInputStreamSet("Starts")[0]));
-        PabloAST * const follow = pb.createAnd(pb.createAdvance(covered, 1), inserted);
-        PabloAST * const runs = pb.createAnd(pb.createMatchStar(follow, inserted), inserted);
-        PabloAST * const uncovered = pb.createInFile(pb.createNot(pb.createOr(covered, runs)));
-        writeOutputStreamSet("Uncovered", std::vector<PabloAST *>{uncovered});
+        writeOutputStreamSet("Uncovered", std::vector<PabloAST *>{pb.createInFile(pb.createNot(covered))});
     }
+};
+
+//  The bixnum of the numbers of positions to insert after the characters, given
+//  the positions of the characters after which each number of positions is to be
+//  inserted (disjoint).
+class InsertionCounts : public pablo::PabloKernel {
+public:
+    InsertionCounts(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & counts,
+                    const std::vector<StreamSet *> & Positions, StreamSet * BixNum)
+    : PabloKernel(ts, "InsertionCounts" + [&] {
+                      std::string sig;
+                      for (unsigned k : counts) sig += "_" + std::to_string(k);
+                      return sig;
+                  }(),
+                  [&] {
+                      Bindings inputs;
+                      for (size_t i = 0; i < Positions.size(); i++) inputs.emplace_back("Positions" + std::to_string(i), Positions[i]);
+                      return inputs;
+                  }(),
+                  {Binding{"BixNum", BixNum}}),
+      mCounts(counts), mBits(BixNum->getNumElements()) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> bits(mBits, pb.createZeroes());
+        for (size_t i = 0; i < mCounts.size(); i++) {
+            PabloAST * const positions = getInputStreamSet("Positions" + std::to_string(i))[0];
+            for (unsigned b = 0; b < mBits; b++) {
+                if ((mCounts[i] >> b) & 1) bits[b] = pb.createOr(bits[b], positions);
+            }
+        }
+        writeOutputStreamSet("BixNum", bits);
+    }
+private:
+    const std::vector<unsigned> mCounts;
+    const unsigned mBits;
 };
 
 //  The matches that apply of the string rules of a conversion group in which
@@ -906,37 +915,6 @@ protected:
 //  number of positions inserted after each.
 using Insertions = std::map<unsigned, UCD::UnicodeSet>;
 
-//  Insert k positions after the characters of a set (each character keeps the
-//  largest number of positions required for it).
-static void addInsertions(Insertions & insertions, UCD::UnicodeSet chars, unsigned k) {
-    for (const auto & e : insertions) {
-        if (e.first >= k) chars = chars - e.second;
-    }
-    if (chars.empty()) return;
-    for (auto & e : insertions) {
-        if (e.first < k) e.second = e.second - chars;
-    }
-    insertions[k] = insertions[k] + chars;
-    for (auto e = insertions.begin(); e != insertions.end(); ) {
-        e = e->second.empty() ? insertions.erase(e) : std::next(e);
-    }
-}
-
-//  The characters of a set by the number of positions inserted after them
-//  (0 for the others).
-static std::map<unsigned, UCD::UnicodeSet> byInsertions(const UCD::UnicodeSet & chars, const Insertions & insertions) {
-    std::map<unsigned, UCD::UnicodeSet> result;
-    UCD::UnicodeSet rest = chars;
-    for (const auto & e : insertions) {
-        const UCD::UnicodeSet followed = chars & e.second;
-        if (followed.empty()) continue;
-        result[e.first] = followed;
-        rest = rest - followed;
-    }
-    if (!rest.empty()) result[0] = rest;
-    return result;
-}
-
 //  The mappings of at most this many characters change by the per-bit sets of
 //  their targets (see xorSets); larger ones by TargetBits.
 static constexpr unsigned SmallMappingLimit = 64;
@@ -1042,7 +1020,7 @@ private:
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
-                               unsigned marks, const Insertions & insertions, StreamSet * U21, StreamSet ** spans = nullptr);
+                               StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21);
     StreamSet * combine(StreamSet * a, StreamSet * b, bool isOr);
     PipelineBuilder & mP;
@@ -1288,24 +1266,24 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
 }
 
 //  The positions of the last characters of the matches of a text (a sequence of
-//  sets) with contexts, followed by the given number of inserted positions.
-//  With spans, also the positions of the characters of the texts of the
-//  matches, from the first to the last (the match spans of the regular
-//  expression engine, without the contexts).
+//  sets) with contexts.  With spans, also the positions of the characters of the
+//  texts of the matches, from the first to the last (the match spans of the
+//  regular expression engine, without the contexts).
 StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
-                                                unsigned marks, const Insertions & insertions, StreamSet * U21, StreamSet ** spans) {
+                                                StreamSet * U21, StreamSet ** spans) {
     std::vector<re::RE *> items;
-    //  ICU matches contexts possessively (see ldml::possessiveContext).
+    //  ICU matches contexts possessively (see ldml::possessiveContext).  (The
+    //  contexts are resolved to sets of characters by ldml::expandedContext,
+    //  without inserted positions.)
+    const Insertions none;
     if (engineBefore) {
         items.push_back(re::makeLookBehindAssertion(
-            ldml::possessiveContext(ldml::expandedContext(engineBefore, insertions, DeletionMark), false)));
+            ldml::possessiveContext(ldml::expandedContext(engineBefore, none, DeletionMark), false)));
     }
     for (const UCD::UnicodeSet & chars : text) items.push_back(re::makeCC(chars, &cc::Unicode));
-    //  The lookahead begins after the positions inserted after the last character.
     if (engineAfter) {
-        std::vector<re::RE *> ahead(marks, re::makeCC(DeletionMark, &cc::Unicode));
-        ahead.push_back(ldml::possessiveContext(ldml::expandedContext(engineAfter, insertions, DeletionMark), true));
-        items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
+        items.push_back(re::makeLookAheadAssertion(
+            ldml::possessiveContext(ldml::expandedContext(engineAfter, none, DeletionMark), true)));
     }
     re::RE * const pattern = re::makeSeq(items.begin(), items.end());
     //  The engine marks a match at an offset after its last character (e.g. 1
@@ -1336,8 +1314,10 @@ StreamSet * RulePipelineBuilder::classes(const std::vector<UCD::UnicodeSet> & se
     return result;
 }
 
+//  (nullptr stands for no streams: OR or AND of the other.)
 StreamSet * RulePipelineBuilder::combine(StreamSet * a, StreamSet * b, bool isOr) {
     if (a == nullptr) return b;
+    if (b == nullptr) return a;
     StreamSet * const result = mP.CreateStreamSet(a->getNumElements());
     if (isOr) OrCombine(mP, a, b, result); else AndCombine(mP, a, b, result);
     return result;
@@ -1376,28 +1356,35 @@ static bool anyBits(const std::vector<UCD::UnicodeSet> & sets) {
     return false;
 }
 
-//  A conversion group.  Characters to be replaced by longer strings are first
-//  expanded: positions holding the deletion mark are inserted after each, for its
-//  longest replacement (after the last character of a text, for the replacements
-//  of texts longer than the text).  Contexts are matched with each character
-//  followed by its inserted positions.  The rules then compute the bits to change,
-//  at all positions at once (as no two rules apply at the same position, they are
-//  combined by OR, and applied by XOR):
-//    - a single-character rule changes the character to the first character of its
-//      replacement (or to the deletion mark, for an empty replacement), and the
-//      inserted positions after it to the further characters;
-//    - a string rule, of a text of n characters replaced by m characters, changes
-//      the characters of the text to those of the replacement, the characters
-//      beyond the replacement (if m < n) to the deletion mark, and the inserted
-//      positions after the text to the further characters (if m > n).
-//  The positions holding the deletion mark are then deleted.
+//  A conversion group, in three phases.
 //
-//  Within a filter, the rules apply only at the positions of the active mask: the
-//  changes elsewhere are discarded, and a string rule applies only where all the
-//  characters of its text are within the mask.  Positions are inserted after the
-//  characters regardless of the mask (so that contexts, which match the whole
-//  text, are matched as without a filter); those inserted after characters
-//  outside the mask keep the deletion mark, and are deleted.
+//  1. The rules are matched on the text as it is (with their contexts): the
+//     subgroups of single-character rules, and the string rules, of whose
+//     matches those that apply are selected where string rules may match within
+//     the texts of others (see SelectStringMatches).  The single-character rules
+//     apply only where not covered by the applied matches of the string rules
+//     (see ldml::TransformStep::coverStringRules) and, within a filter, at the
+//     positions of the mask.
+//  2. The changes are computed at the positions of the characters, for each
+//     position i of the replacements: the bits to change at the character (for
+//     i = 0, to change it to the first character of its replacement, or to the
+//     deletion mark), or at the i-th position to be inserted after it (for i > 0,
+//     to change the deletion mark there to the i-th character of the
+//     replacement).  A string rule, of a text of n characters replaced by m,
+//     changes the characters of the text to those of the replacement (the
+//     characters beyond m to the deletion mark), and the further characters of
+//     the replacement (if m > n) are written at the positions to be inserted after
+//     its last character.
+//  3. Positions holding the deletion mark are inserted after the characters where
+//     applied rules have longer replacements, as many as needed after each; the
+//     changes are spread with the text (those of position i > 0 then moved i
+//     positions forward), and applied by XOR (as no two rules apply at the same
+//     position, the changes of all the rules are combined by OR).  The positions
+//     holding the deletion mark are then deleted.
+//
+//  As positions are inserted only where rules apply, after the rules have been
+//  matched, the matches are those of the text itself, and the characters of the
+//  text of a string rule are consecutive.
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     //  The characters of a set that the group may change: those other than the
@@ -1408,7 +1395,6 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     //  The mappings of each subgroup, and the texts of the string rules,
     //  restricted to the characters that may change.
     std::vector<std::vector<ldml::CharMapping>> maps;
-    Insertions insertions;
     bool needDeletion = false;
     for (const ldml::CharMapSubgroup & subgroup : step.subgroups) {
         maps.emplace_back();
@@ -1420,7 +1406,6 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
             if (chars.empty()) continue;
             maps.back().push_back(ldml::CharMapping{chars, m.replacement});
-            if (m.replacement.size() > 1) addInsertions(insertions, chars, m.replacement.size() - 1);
             if (m.replacement.empty()) needDeletion = true;
         }
     }
@@ -1435,149 +1420,25 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
             texts.back().push_back(r);
         }
-        if (texts.back().empty()) continue;
-        const size_t n = rule.text.size(), m = rule.replacement.size();
-        if (m < n) needDeletion = true;
-        if (m > n) addInsertions(insertions, texts.back().back(), m - n);
-    }
-    if (!insertions.empty()) needDeletion = true;
-
-    if (!insertions.empty()) {
-        std::vector<UCD::UnicodeSet> bixnum;
-        for (const auto & ins : insertions) {
-            for (unsigned bit = 0; (ins.first >> bit) != 0; bit++) {
-                if (bixnum.size() <= bit) bixnum.resize(bit + 1);
-                if ((ins.first >> bit) & 1) bixnum[bit] = bixnum[bit] + ins.second;
-            }
-        }
-        StreamSet * const InsertBixNum = classes(bixnum, U21);
-        SHOW_BIXNUM(InsertBixNum);
-        StreamSet * const SpreadMask = P.CreateStreamSet(1);
-        InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
-        SHOW_STREAM(SpreadMask);
-        StreamSet * const Expanded = P.CreateStreamSet(21, 1);
-        SpreadByMask(P, SpreadMask, U21, Expanded);
-        StreamSet * const Marked = P.CreateStreamSet(21, 1);
-        P.CreateKernelCall<FillInsertedPositions>(SpreadMask, Expanded, Marked);
-        SHOW_BIXNUM(Marked);
-        U21 = Marked;
-        spreadMasks(SpreadMask);
+        if (!texts.back().empty() && rule.replacement.size() < rule.text.size()) needDeletion = true;
     }
     StreamSet * const mask = activeMask();
-
-    StreamSet * changes = nullptr;
-    auto shiftAndAdd = [&](StreamSet * bits, int shift) {
-        if (shift != 0) {
-            StreamSet * const shifted = P.CreateStreamSet(21);
-            if (shift > 0) {
-                P.CreateKernelCall<ShiftForward>(bits, shifted, shift);
-            } else {
-                P.CreateKernelCall<ShiftBack>(bits, shifted, -shift);
-            }
-            bits = shifted;
-        }
-        SHOW_BIXNUM(bits);
-        changes = combine(changes, bits, true);
-    };
-    //  The changes of per-bit sets of characters, at the positions of matches.
-    auto addChanges = [&](const std::vector<UCD::UnicodeSet> & sets, StreamSet * matches, int shift) {
-        if (!anyBits(sets)) return;
-        StreamSet * bits = classes(sets, U21);
-        if (matches) {
-            StreamSet * const selected = P.CreateStreamSet(21);
-            ZeroByMask(P, matches, bits, selected);
-            bits = selected;
-        }
-        shiftAndAdd(bits, shift);
-    };
-    //  The changes at the positions of At to a target: of the character there,
-    //  or of the deletion mark at an inserted position.
-    auto addTargetChanges = [&](StreamSet * At, UCD::codepoint_t target, bool ofCharacter, int shift) {
-        if (!ofCharacter && target == DeletionMark) return;
-        StreamSet * const bits = P.CreateStreamSet(21);
-        P.CreateKernelCall<TargetBits>(At, ofCharacter ? U21 : nullptr, target, bits);
-        shiftAndAdd(bits, shift);
-    };
-
-    for (size_t g = 0; g < step.subgroups.size(); g++) {
-        const ldml::CharMapSubgroup & subgroup = step.subgroups[g];
-        const std::vector<ldml::CharMapping> & map = maps[g];
-        if (map.empty()) continue;
-        //  The positions where the rules of the subgroup apply (with contexts).
-        StreamSet * matches = nullptr;
-        if (subgroup.engineBefore || subgroup.engineAfter) {
-            UCD::UnicodeSet all;
-            for (const ldml::CharMapping & m : map) all = all + m.chars;
-            for (const auto & k : byInsertions(all, insertions)) {
-                matches = combine(matches, matchPositions(subgroup.engineBefore, subgroup.engineAfter, {k.second},
-                                                          k.first, insertions, U21), true);
-            }
-            SHOW_STREAM(matches);
-        }
-        //  Small sets of characters change by the per-bit sets of their targets;
-        //  large ones by their targets, at their positions.
-        size_t maxLength = 1;
-        for (const ldml::CharMapping & m : map) maxLength = std::max(maxLength, m.replacement.size());
-        for (size_t i = 0; i < maxLength; i++) {
-            std::map<UCD::codepoint_t, UCD::codepoint_t> targets;
-            for (const ldml::CharMapping & m : map) {
-                if (i > 0 && m.replacement.size() <= i) continue;
-                const UCD::codepoint_t target = m.replacement.empty() ? DeletionMark : static_cast<UCD::codepoint_t>(m.replacement[i]);
-                if (m.chars.count() <= SmallMappingLimit) {
-                    for (const auto & range : m.chars) {
-                        for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) targets.emplace(cp, target);
-                    }
-                } else {
-                    StreamSet * at = classes({m.chars}, U21);
-                    if (matches) at = combine(at, matches, false);
-                    addTargetChanges(at, target, i == 0, static_cast<int>(i));
-                }
-            }
-            //  Position i of the replacements: at the character, the bits that
-            //  change it; at the inserted positions, those that change the mark.
-            addChanges(i == 0 ? xorSets(targets) : markXorSets(targets), matches, static_cast<int>(i));
-        }
-    }
-    //  The changes of the single-character rules, kept apart from those of the
-    //  string rules if they apply only where no string rule matches.
-    StreamSet * charChanges = nullptr;
-    if (step.coverStringRules) {
-        charChanges = changes;
-        changes = nullptr;
-    }
     auto inverted = [&](StreamSet * s) {
         StreamSet * const result = P.CreateStreamSet(1);
         Invert(P, s, result);
         return result;
     };
-    //  The match spans of the string rules (see TransformStep::coverStringRules),
-    //  and the first positions of the matches.
-    StreamSet * spans = nullptr;
-    StreamSet * starts = nullptr;
 
-    //  The string rules.  Where string rules may match within the texts of others
-    //  (see ldml::TransformStep::stringOrder), the matches that apply are selected
-    //  among those of all the string rules of the group, at once, by
-    //  SelectStringMatches; otherwise all the matches of each rule apply.
-    //
-    //  The positions of the last characters of the matches of a rule (all of
-    //  them, and those within the mask), and with spans, their spans.
+    //  Phase 1.  The positions of the last characters of the matches of a string
+    //  rule (all of them, and those within the mask), and with spans, their
+    //  spans.
     auto ruleMatches = [&](size_t r, StreamSet ** ruleSpans) -> std::pair<StreamSet *, StreamSet *> {
         const ldml::StringRule & rule = step.stringRules[r];
         const std::vector<UCD::UnicodeSet> & text = texts[r];
-        StreamSet * matches = nullptr;
-        for (const auto & k : byInsertions(text.back(), insertions)) {
-            std::vector<UCD::UnicodeSet> t = text;
-            t.back() = k.second;
-            StreamSet * kSpans = nullptr;
-            matches = combine(matches, matchPositions(rule.engineBefore, rule.engineAfter, t, k.first, insertions, U21,
-                                                      ruleSpans ? &kSpans : nullptr), true);
-            if (kSpans) *ruleSpans = combine(*ruleSpans, kSpans, true);
-        }
-        StreamSet * const allMatches = matches;
-        //  Within a filter, the n characters of the text (at the last position
-        //  and the n - 1 before it, as only the last may be followed by inserted
-        //  positions) must all be within the mask.
+        StreamSet * const allMatches = matchPositions(rule.engineBefore, rule.engineAfter, text, U21, ruleSpans);
+        StreamSet * matches = allMatches;
+        //  Within a filter, the n characters of the text (at the last position and
+        //  the n - 1 before it) must all be within the mask.
         if (mask) {
             for (size_t j = 0; j < text.size(); j++) {
                 StreamSet * within = mask;
@@ -1591,33 +1452,16 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         SHOW_STREAM(matches);
         return {allMatches, matches};
     };
-    //  The changes of a rule at the matches that apply (marked at their last
-    //  characters).
-    auto ruleChanges = [&](size_t r, StreamSet * matches) {
-        const ldml::StringRule & rule = step.stringRules[r];
-        const size_t n = texts[r].size(), m = rule.replacement.size();
-        //  The characters of the text, at n - 1 - j positions before the last,
-        //  change to the characters of the replacement (or the deletion mark).
-        for (size_t j = 0; j < n; j++) {
-            const UCD::codepoint_t target = j < m ? static_cast<UCD::codepoint_t>(rule.replacement[j]) : DeletionMark;
-            StreamSet * at = matches;
-            if (j + 1 < n) {
-                at = P.CreateStreamSet(1);
-                P.CreateKernelCall<ShiftBack>(matches, at, static_cast<unsigned>(n - 1 - j));
-            }
-            addTargetChanges(at, target, true, 0);
-        }
-        //  The further characters of the replacement, at the inserted positions.
-        for (size_t j = n; j < m; j++) {
-            addTargetChanges(matches, static_cast<UCD::codepoint_t>(rule.replacement[j]), false, static_cast<int>(j - n + 1));
-        }
-    };
-
+    //  The applied matches of each string rule, at their last characters; and the
+    //  spans and first positions of the applied matches (for the coverage of the
+    //  string rules).
+    std::vector<StreamSet *> ruleEnds(step.stringRules.size(), nullptr);
+    StreamSet * spans = nullptr;
+    StreamSet * starts = nullptr;
     if (!step.stringOrder.empty()) {
         //  The matches of the rules, in the order to apply them, at their first
-        //  positions (n - 1 before their last: as only the last character of a
-        //  text may be followed by inserted positions, the characters of a text
-        //  are consecutive).
+        //  positions (n - 1 before their last), from which those that apply are
+        //  selected (see ldml::TransformStep::stringOrder).
         std::vector<size_t> rules;
         std::vector<size_t> index(step.stringRules.size(), SIZE_MAX);
         for (size_t r : step.stringOrder) {
@@ -1649,7 +1493,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             StreamSet * const ends = P.CreateStreamSet(1);
             P.CreateKernelCall<ShiftForward>(applied[i], ends, static_cast<unsigned>(n - 1));
             SHOW_STREAM(ends);
-            ruleChanges(rules[i], ends);
+            ruleEnds[rules[i]] = ends;
         }
         //  The spans of the matches that apply (the engine's spans, the union of
         //  those of all the matches, would include the others).
@@ -1684,35 +1528,176 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 P.CreateKernelCall<ShiftBack>(matches, first, static_cast<unsigned>(n - 1));
                 starts = combine(starts, first, true);
             }
-            ruleChanges(r, matches);
+            ruleEnds[r] = matches;
         }
     }
-
-    //  The single-character rules apply only where not covered by the matches of
-    //  the string rules (other than at their first positions), as in ICU, which
-    //  does not apply rules within the text it has replaced.
-    if (charChanges && spans) {
+    //  The positions where the single-character rules may apply: not within the
+    //  applied matches of string rules (other than at their first positions), as
+    //  in ICU, which does not apply rules within the text it has replaced, and
+    //  within the mask.
+    StreamSet * allowed = mask;
+    if (spans && std::any_of(maps.begin(), maps.end(), [](const std::vector<ldml::CharMapping> & m) {return !m.empty();})) {
         SHOW_STREAM(spans);
         SHOW_STREAM(starts);
         StreamSet * const uncovered = P.CreateStreamSet(1);
-        P.CreateKernelCall<UncoveredPositions>(spans, starts, classes({UCD::UnicodeSet(DeletionMark)}, U21), uncovered);
+        P.CreateKernelCall<UncoveredPositions>(spans, starts, uncovered);
         SHOW_STREAM(uncovered);
-        StreamSet * const applied = P.CreateStreamSet(21);
-        ZeroByMask(P, uncovered, charChanges, applied);
-        charChanges = applied;
+        allowed = combine(allowed, uncovered, false);
     }
-    if (charChanges) changes = changes ? combine(changes, charChanges, true) : charChanges;
 
+    //  Phase 2.  The changes at the positions of the characters, for each
+    //  position of the replacements, and the positions after which positions are
+    //  to be inserted, by their number.
+    std::vector<StreamSet *> changesAt;
+    auto addChanges = [&](size_t i, StreamSet * bits) {
+        if (changesAt.size() <= i) changesAt.resize(i + 1, nullptr);
+        SHOW_BIXNUM(bits);
+        changesAt[i] = combine(changesAt[i], bits, true);
+    };
+    std::map<unsigned, StreamSet *> inserting;
+    auto addInsertion = [&](unsigned k, StreamSet * at) {
+        StreamSet *& positions = inserting[k];
+        positions = combine(positions, at, true);
+    };
+    //  The changes at the positions of At to a target: of the character there,
+    //  or (for i > 0) of the deletion mark at a position to be inserted.
+    auto addTargetChanges = [&](size_t i, StreamSet * At, UCD::codepoint_t target) {
+        if (i > 0 && target == DeletionMark) return;
+        StreamSet * const bits = P.CreateStreamSet(21);
+        P.CreateKernelCall<TargetBits>(At, i == 0 ? U21 : nullptr, target, bits);
+        addChanges(i, bits);
+    };
+
+    for (size_t g = 0; g < step.subgroups.size(); g++) {
+        const ldml::CharMapSubgroup & subgroup = step.subgroups[g];
+        const std::vector<ldml::CharMapping> & map = maps[g];
+        if (map.empty()) continue;
+        //  The positions where the rules of the subgroup apply (with contexts), if
+        //  not all those of its characters.
+        StreamSet * at = allowed;
+        if (subgroup.engineBefore || subgroup.engineAfter) {
+            UCD::UnicodeSet all;
+            for (const ldml::CharMapping & m : map) all = all + m.chars;
+            StreamSet * const matches = matchPositions(subgroup.engineBefore, subgroup.engineAfter, {all}, U21);
+            SHOW_STREAM(matches);
+            at = combine(matches, at, false);
+        }
+        //  Small sets of characters change by the per-bit sets of their targets;
+        //  large ones by their targets, at their positions.
+        size_t maxLength = 1;
+        std::map<size_t, UCD::UnicodeSet> byLength;     // the characters by the length of their replacements
+        for (const ldml::CharMapping & m : map) {
+            maxLength = std::max(maxLength, m.replacement.size());
+            if (m.replacement.size() > 1) byLength[m.replacement.size()] = byLength[m.replacement.size()] + m.chars;
+        }
+        for (size_t i = 0; i < maxLength; i++) {
+            std::map<UCD::codepoint_t, UCD::codepoint_t> targets;
+            for (const ldml::CharMapping & m : map) {
+                if (i > 0 && m.replacement.size() <= i) continue;
+                const UCD::codepoint_t target = m.replacement.empty() ? DeletionMark : static_cast<UCD::codepoint_t>(m.replacement[i]);
+                if (m.chars.count() <= SmallMappingLimit) {
+                    for (const auto & range : m.chars) {
+                        for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) targets.emplace(cp, target);
+                    }
+                } else {
+                    StreamSet * charsAt = classes({m.chars}, U21);
+                    if (at) charsAt = combine(charsAt, at, false);
+                    addTargetChanges(i, charsAt, target);
+                }
+            }
+            //  Position i of the replacements: at the character, the bits that
+            //  change it; at the positions to be inserted, those that change the
+            //  deletion mark.
+            const std::vector<UCD::UnicodeSet> sets = i == 0 ? xorSets(targets) : markXorSets(targets);
+            if (anyBits(sets)) {
+                StreamSet * bits = classes(sets, U21);
+                if (at) {
+                    StreamSet * const selected = P.CreateStreamSet(21);
+                    ZeroByMask(P, at, bits, selected);
+                    bits = selected;
+                }
+                addChanges(i, bits);
+            }
+        }
+        //  The characters replaced by longer strings, after which positions are
+        //  to be inserted.
+        for (const auto & l : byLength) {
+            StreamSet * positions = classes({l.second}, U21);
+            if (at) positions = combine(positions, at, false);
+            addInsertion(static_cast<unsigned>(l.first - 1), positions);
+        }
+    }
+    for (size_t r = 0; r < step.stringRules.size(); r++) {
+        StreamSet * const ends = ruleEnds[r];
+        if (ends == nullptr) continue;
+        const ldml::StringRule & rule = step.stringRules[r];
+        const size_t n = texts[r].size(), m = rule.replacement.size();
+        //  The characters of the text, at n - 1 - j positions before the last,
+        //  change to the characters of the replacement (or the deletion mark).
+        for (size_t j = 0; j < n; j++) {
+            const UCD::codepoint_t target = j < m ? static_cast<UCD::codepoint_t>(rule.replacement[j]) : DeletionMark;
+            StreamSet * charAt = ends;
+            if (j + 1 < n) {
+                charAt = P.CreateStreamSet(1);
+                P.CreateKernelCall<ShiftBack>(ends, charAt, static_cast<unsigned>(n - 1 - j));
+            }
+            addTargetChanges(0, charAt, target);
+        }
+        //  The further characters of the replacement, at the positions to be
+        //  inserted after the last character of the text.
+        for (size_t j = n; j < m; j++) {
+            addTargetChanges(j - n + 1, ends, static_cast<UCD::codepoint_t>(rule.replacement[j]));
+        }
+        if (m > n) addInsertion(static_cast<unsigned>(m - n), ends);
+    }
+
+    //  Phase 3.  The positions inserted, and the changes applied.
     StreamSet * result = U21;
-    if (changes && mask) {
-        StreamSet * const masked = P.CreateStreamSet(21);
-        ZeroByMask(P, mask, changes, masked);
-        changes = masked;
+    StreamSet * changes = changesAt.empty() ? nullptr : changesAt[0];
+    if (!inserting.empty()) {
+        std::vector<unsigned> counts;
+        std::vector<StreamSet *> positions;
+        unsigned maxCount = 0;
+        for (const auto & k : inserting) {
+            counts.push_back(k.first);
+            positions.push_back(k.second);
+            maxCount = std::max(maxCount, k.first);
+        }
+        unsigned bits = 0;
+        while ((maxCount >> bits) != 0) bits++;
+        StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
+        P.CreateKernelCall<InsertionCounts>(counts, positions, InsertBixNum);
+        SHOW_BIXNUM(InsertBixNum);
+        StreamSet * const SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
+        SHOW_STREAM(SpreadMask);
+        StreamSet * const Expanded = P.CreateStreamSet(21, 1);
+        SpreadByMask(P, SpreadMask, U21, Expanded);
+        StreamSet * const Marked = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<FillInsertedPositions>(SpreadMask, Expanded, Marked);
+        SHOW_BIXNUM(Marked);
+        result = Marked;
+        spreadMasks(SpreadMask);
+        //  The changes of each position i of the replacements, spread with the
+        //  text, and moved to the i-th position inserted after their characters.
+        changes = nullptr;
+        for (size_t i = 0; i < changesAt.size(); i++) {
+            if (changesAt[i] == nullptr) continue;
+            StreamSet * spread = P.CreateStreamSet(21);
+            SpreadByMask(P, SpreadMask, changesAt[i], spread);
+            if (i > 0) {
+                StreamSet * const shifted = P.CreateStreamSet(21);
+                P.CreateKernelCall<ShiftForward>(spread, shifted, static_cast<unsigned>(i));
+                spread = shifted;
+            }
+            changes = combine(changes, spread, true);
+        }
     }
     if (changes) {
-        result = P.CreateStreamSet(21);
-        XorCombine(P, U21, changes, result);
-        SHOW_BIXNUM(result);
+        StreamSet * const changed = P.CreateStreamSet(21);
+        XorCombine(P, result, changes, changed);
+        SHOW_BIXNUM(changed);
+        result = changed;
     }
     if (needDeletion) {
         StreamSet * const marks = classes({UCD::UnicodeSet(DeletionMark)}, result);

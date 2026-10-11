@@ -1103,8 +1103,9 @@ static std::string classifyCaptureOrder(const std::vector<re::Capture *> & captu
 }
 
 static std::string classifyRevisit(const RuleSide * result) {
-    const bool revisit = !llvm::cast<re::Seq>(result->getResultToRevisit())->empty();
-    const bool completed = !llvm::cast<re::Seq>(result->getCompletedResult())->empty();
+    // A part of one item is that item, not a Seq.
+    const bool revisit = !re::isEmptySeq(result->getResultToRevisit());
+    const bool completed = !re::isEmptySeq(result->getCompletedResult());
     const int offset = result->getCursorOffset();
     if (!result->hasCursor() || (offset == 0 && !revisit)) return "none";
     if (offset < 0) return "back up before result (|@)";

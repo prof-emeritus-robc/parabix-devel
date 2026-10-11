@@ -103,8 +103,13 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
 
         // Now conditionally perform the final block processing depending on the doFinal parameter.
         if (mStrideLoopTarget) {
+            // The destinations are the targets of the stride loop: stridesExit, and the
+            // blocks added by the final block method and the provisional stride.  The
+            // final block is not one of them (it is reached by the branch on mIsFinal);
+            // listed as a destination, its address never taken, it would be removed by
+            // the optimizer without its branch weight, leaving the !prof metadata with
+            // more weights than destinations (a broken module).
             mStrideLoopBranch = b.CreateIndirectBr(mStrideLoopTarget, 3);
-            mStrideLoopBranch->addDestination(doFinalBlock);
             mStrideLoopBranch->addDestination(stridesExit);
         } else {
             b.CreateUnlikelyCondBr(mIsFinal, doFinalBlock, stridesExit);

@@ -31,6 +31,7 @@ DEPS
     kernel.streamutils
     kernel.unicode
     kernel.unicode.normalization
+    kernel.util
     re.cc
     re.unicode
     kernel.re

@@ -23,6 +23,8 @@
 //      Any-Lower, Any-Upper, Any-Title
 //                          full case mapping by the string override
 //                          properties lc, uc and tc, as in xch -prop=...
+//      Any-Hex/Unicode     each character as U+ and its codepoint in
+//                          (uppercase) hexadecimal, of at least 4 digits
 //      Transforms defined by rules (see TransformAnalyzer), with global
 //      filters (:: [set] ;) and filtered transform rules (:: [set] ID ;):
 //      the filter is computed once, as a mask of the positions of the text
@@ -59,6 +61,7 @@
 #include <kernel/unicode/utf8_decoder.h>
 #include <kernel/unicode/utf8_support.h>
 #include <kernel/unicode/UCD_property_kernel.h>
+#include <kernel/util/hex_convert.h>
 #include <ldml/transform_registry.h>
 #include <kernel/re/regexp_engine.h>
 #include <re/adt/adt.h>
@@ -99,12 +102,13 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title};
+enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexUnicode};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
     {"Any-NFC", Transform::NFC}, {"Any-NFKC", Transform::NFKC},
     {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title},
+    {"Any-Hex/Unicode", Transform::HexUnicode},
 };
 
 //  Basis bits of a byte stream.
@@ -421,7 +425,8 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
             OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::uc, BasisBits));
             break;
         case Transform::Title:
-            llvm::report_fatal_error("tconv: Any-Title is implemented by the rule pipeline");
+        case Transform::HexUnicode:
+            llvm::report_fatal_error("tconv: Any-Title and Any-Hex/Unicode are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -988,6 +993,36 @@ protected:
     }
 };
 
+//  Any-Hex/Unicode within a mask: given the text with every character converted
+//  (Hex, by UnicodeHexPipeline), the starts of the conversions (the U of each, in
+//  Starts), and at each start the character converted (Chars) and whether it is
+//  within the mask (Converted), the characters not within the mask are restored:
+//  each is written at the start of its conversion (Restored), and the rest of the
+//  conversion is to be deleted (not in Keep).
+class RestoreUnconverted : public pablo::PabloKernel {
+public:
+    RestoreUnconverted(LLVMTypeSystemInterface & ts, StreamSet * Starts, StreamSet * Converted, StreamSet * Chars,
+                       StreamSet * Hex, StreamSet * Restored, StreamSet * Keep)
+    : PabloKernel(ts, "RestoreUnconverted",
+                  {Binding{"Starts", Starts}, Binding{"Converted", Converted}, Binding{"Chars", Chars}, Binding{"Hex", Hex}},
+                  {Binding{"Restored", Restored}, Binding{"Keep", Keep}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const starts = getInputStreamSet("Starts")[0];
+        PabloAST * const restored = pb.createAnd(starts, pb.createNot(getInputStreamSet("Converted")[0]));
+        const std::vector<PabloAST *> chars = getInputStreamSet("Chars");
+        const std::vector<PabloAST *> hex = getInputStreamSet("Hex");
+        //  The rest of the conversions of the restored characters: up to the next start.
+        PabloAST * const within = pb.createInFile(pb.createNot(starts));
+        PabloAST * const rest = pb.createAnd(pb.createMatchStar(pb.createAdvance(restored, 1), within), within);
+        std::vector<PabloAST *> out(hex.size());
+        for (unsigned b = 0; b < hex.size(); b++) out[b] = pb.createSel(restored, chars[b], hex[b]);
+        writeOutputStreamSet("Restored", out);
+        writeOutputStreamSet("Keep", std::vector<PabloAST *>{pb.createInFile(pb.createNot(rest))});
+    }
+};
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -1017,6 +1052,7 @@ private:
     StreamSet * maskedNormalization(const std::string & name, StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * titlecase(StreamSet * U21);
+    StreamSet * hexUnicode(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
@@ -1090,6 +1126,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
         return U21_StringOverridePipeline(P, prop, U21);
     }
     if (name == "Any-Title") return titlecase(U21);
+    if (name == "Any-Hex/Unicode") return hexUnicode(U21);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
 
@@ -1173,6 +1210,32 @@ StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
         return maskedStringOverrides({{UCD::tc, combine(title, mask, false)}, {UCD::lc, combine(lower, mask, false)}}, U21);
     }
     return maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21);
+}
+
+//  Any-Hex/Unicode: each character as U+ and its codepoint in uppercase
+//  hexadecimal, of at least 4 digits (by UnicodeHexPipeline).  Within a mask, all
+//  the characters are converted, and those not within it restored (see
+//  RestoreUnconverted).
+StreamSet * RulePipelineBuilder::hexUnicode(StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    StreamSet * const Hex = P.CreateStreamSet(21, 1);
+    UnicodeHexPipeline(P, U21, Hex);
+    SHOW_BIXNUM(Hex);
+    if (!activeMask()) return Hex;
+    //  Each conversion begins with U, which none of its digits are.
+    StreamSet * const Starts = classes({UCD::UnicodeSet('U')}, Hex);
+    SHOW_STREAM(Starts);
+    StreamSet * const Chars = P.CreateStreamSet(21, 1);
+    SpreadByMask(P, Starts, U21, Chars);
+    spreadMasks(Starts);
+    StreamSet * const Restored = P.CreateStreamSet(21, 1);
+    StreamSet * const Keep = P.CreateStreamSet(1);
+    P.CreateKernelCall<RestoreUnconverted>(Starts, activeMask(), Chars, Hex, Restored, Keep);
+    SHOW_STREAM(Keep);
+    StreamSet * const Result = P.CreateStreamSet(21, 1);
+    FilterByMask(P, Keep, Restored, Result);
+    filterMasks(Keep);
+    return Result;
 }
 
 //  The word boundaries of a text (in Unicode indexing, one position per
@@ -1801,7 +1864,7 @@ int main(int argc, char *argv[]) {
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
     //  boundaries, provided by the rule pipeline.
     const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower
-                        && impl->second != Transform::Title;
+                        && impl->second != Transform::Title && impl->second != Transform::HexUnicode;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
     fn(fd);

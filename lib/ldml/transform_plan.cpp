@@ -4,6 +4,9 @@
  */
 
 #include <ldml/transform_plan.h>
+#include <algorithm>
+#include <cstdint>
+#include <tuple>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
 #include "charset_analysis.h"
@@ -175,35 +178,245 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             }
         }
     }
-    //  As the rules of a group are applied at all positions at once, no rule may
+    //  As the rules of a group are applied at all positions at once, a rule may
     //  match within the text of a string rule (where ICU, having replaced the
-    //  text, does not apply rules).
+    //  text, does not apply rules).  A single-character rule matching there is
+    //  kept from applying by the coverage of the string rules (see
+    //  TransformStep::coverStringRules).  String rules matching within the texts
+    //  of string rules are supported if the string rules of the group can be
+    //  applied in a single pass (see StringRuleOverlaps): in a topological order,
+    //  each applying where it does not begin within an applied match of a rule
+    //  preceding it (TransformStep::stringOrder), and a rule of two characters
+    //  matching within its own text by the selection of its matches (see
+    //  StringRule::selfOverlapping).  Otherwise, for each string rule within
+    //  whose text a string rule may match, the first such rule is reported.
     //  A quick check first: a rule may match within the text only if its first
-    //  characters may occur at a position of the text other than the first.  The
-    //  first rule found that may match within a text is reported.
-    for (const TransformStep & step : plan.steps) {
+    //  characters may occur at a position of the text other than the first.
+    for (TransformStep & step : plan.steps) {
         if (step.stringRules.empty()) continue;
         std::vector<UCD::UnicodeSet> firstChars;
+        std::vector<bool> single;
         for (const ConversionRule * r : step.rules) {
             std::vector<re::RE *> items;
             textItems(r->getSourceSide(Direction::Forward)->getText(), items);
             firstChars.push_back(items.empty() ? UCD::UnicodeSet() : sets.setOf(items.front(), false));
+            single.push_back(items.size() == 1);
         }
         RuleOverlapAnalysis analysis;
         for (const StringRule & s : step.stringRules) {
+            if (step.coverStringRules) break;
             UCD::UnicodeSet within;
             for (size_t k = 1; k < s.text.size(); k++) within = within + s.text[k];
             for (size_t i = 0; i < step.rules.size(); i++) {
-                const ConversionRule * const r = step.rules[i];
-                if ((firstChars[i] & within).empty()) continue;
-                if (analysis.mayMatchWithin(r, s.rule)) {
-                    plan.problems.push_back(printRule(r) + "  (may match within the text of " + printRule(s.rule) + ")");
+                if (!single[i] || (firstChars[i] & within).empty()) continue;
+                if (analysis.mayMatchWithin(step.rules[i], s.rule)) {
+                    step.coverStringRules = true;
                     break;
                 }
             }
         }
+        //  String rules within the texts of string rules.
+        const StringRuleOverlaps overlaps = analyzeStringRuleOverlaps(step);
+        if (overlaps.pairs.empty()) continue;
+        if (overlaps.singlePass()) {
+            step.stringOrder = overlaps.order;
+            step.stringPredecessors = overlaps.predecessors;
+            for (const StringRuleOverlaps::Pair & p : overlaps.pairs) {
+                if (p.kind == StringRuleOverlaps::Kind::Self) step.stringRules[p.outer].selfOverlapping = true;
+            }
+            continue;
+        }
+        //  The first rule found that may match within the text of each.
+        std::vector<bool> reported(step.stringRules.size(), false);
+        for (const StringRuleOverlaps::Pair & p : overlaps.pairs) {
+            const size_t outers[2] = {p.outer, p.inner};
+            for (unsigned k = 0; k < (p.kind == StringRuleOverlaps::Kind::TwoWay ? 2u : 1u); k++) {
+                const size_t outer = outers[k], inner = outers[1 - k];
+                if (reported[outer]) continue;
+                reported[outer] = true;
+                plan.problems.push_back(printRule(step.stringRules[inner].rule) + "  (may match within the text of "
+                                        + printRule(step.stringRules[outer].rule) + ")");
+            }
+        }
     }
     return plan;
+}
+
+StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
+    StringRuleOverlaps result;
+    const size_t n = step.stringRules.size();
+    //  within[a][b]: rule b may match within the text of rule a.  Quick checks
+    //  first, of the texts without the contexts (which only restrict matches):
+    //  the first characters of b must occur at a position of the text of a other
+    //  than the first, and, for some position k of the text of a other than the
+    //  first, each character of the text of b up to the end of the text of a
+    //  must be one that may occur at its position in the text of a.
+    std::vector<std::vector<bool>> within(n, std::vector<bool>(n, false));
+    RuleOverlapAnalysis analysis;
+    auto textsOverlap = [](const std::vector<UCD::UnicodeSet> & outer, const std::vector<UCD::UnicodeSet> & inner) {
+        for (size_t k = 1; k < outer.size(); k++) {
+            bool overlap = true;
+            for (size_t i = 0; overlap && i < inner.size() && k + i < outer.size(); i++) {
+                overlap = outer[k + i].intersects(inner[i]);
+            }
+            if (overlap) return true;
+        }
+        return false;
+    };
+    for (size_t a = 0; a < n; a++) {
+        const StringRule & outer = step.stringRules[a];
+        UCD::UnicodeSet inside;
+        for (size_t k = 1; k < outer.text.size(); k++) inside = inside + outer.text[k];
+        for (size_t b = 0; b < n; b++) {
+            const StringRule & inner = step.stringRules[b];
+            if (!inner.text.front().intersects(inside) || !textsOverlap(outer.text, inner.text)) continue;
+            within[a][b] = analysis.mayMatchWithin(inner.rule, outer.rule);
+        }
+    }
+    //  The pairs, and the precedence graph of the one-way pairs and self-overlaps.
+    std::vector<std::vector<size_t>> precedes(n);
+    for (size_t a = 0; a < n; a++) {
+        if (within[a][a]) {
+            result.pairs.push_back({a, a, StringRuleOverlaps::Kind::Self});
+            result.self++;
+            if (step.stringRules[a].text.size() != 2) result.selfSelectable = false;
+            precedes[a].push_back(a);
+        }
+        for (size_t b = 0; b < n; b++) {
+            if (b == a || !within[a][b]) continue;
+            if (within[b][a]) {
+                if (a < b) {
+                    result.pairs.push_back({a, b, StringRuleOverlaps::Kind::TwoWay});
+                    result.twoWay++;
+                }
+            } else {
+                result.pairs.push_back({a, b, StringRuleOverlaps::Kind::OneWay});
+                result.oneWay++;
+                precedes[a].push_back(b);
+            }
+        }
+    }
+    //  A depth-first search of the graph (with or without the self-overlaps):
+    //  a cycle (an edge to a rule on the path), or the number of rules in the
+    //  longest chain (0 without edges).
+    std::vector<size_t> postorder;
+    auto search = [&](bool withSelf, std::vector<size_t> & cycle) -> std::pair<bool, unsigned> {
+        enum : unsigned char {Unvisited, OnPath, Done};
+        std::vector<unsigned char> state(n, Unvisited);
+        std::vector<unsigned> chain(n, 1);
+        std::vector<size_t> path;
+        std::vector<std::pair<size_t, size_t>> stack;     // (rule, next edge)
+        unsigned stages = 0;
+        for (size_t root = 0; root < n; root++) {
+            if (state[root] != Unvisited) continue;
+            stack.emplace_back(root, 0);
+            state[root] = OnPath;
+            path.push_back(root);
+            while (!stack.empty()) {
+                auto & top = stack.back();
+                const size_t v = top.first;
+                if (top.second < precedes[v].size()) {
+                    const size_t w = precedes[v][top.second++];
+                    if (w == v && !withSelf) continue;
+                    if (state[w] == OnPath) {
+                        cycle.assign(std::find(path.begin(), path.end(), w), path.end());
+                        return {false, 0};
+                    } else if (state[w] == Unvisited) {
+                        state[w] = OnPath;
+                        path.push_back(w);
+                        stack.emplace_back(w, 0);
+                    }
+                } else {
+                    bool edges = false;
+                    for (size_t w : precedes[v]) {
+                        if (w == v) continue;
+                        edges = true;
+                        chain[v] = std::max(chain[v], chain[w] + 1);
+                    }
+                    if (edges) stages = std::max(stages, chain[v]);
+                    if (!withSelf) postorder.push_back(v);
+                    state[v] = Done;
+                    path.pop_back();
+                    stack.pop_back();
+                }
+            }
+        }
+        return {true, stages};
+    };
+    std::tie(result.acyclic, result.stages) = search(true, result.cycle);
+    std::vector<size_t> ignored;
+    std::tie(result.acyclicApartFromSelf, result.stagesApartFromSelf) = search(false, ignored);
+    //  The strongly connected components of the graph of all the overlaps
+    //  (Tarjan's algorithm, iteratively).
+    {
+        std::vector<std::vector<size_t>> edges(n);
+        for (size_t a = 0; a < n; a++) {
+            for (size_t b = 0; b < n; b++) {
+                if (within[a][b]) edges[a].push_back(b);
+            }
+        }
+        const size_t none = SIZE_MAX;
+        std::vector<size_t> index(n, none), low(n, 0);
+        std::vector<bool> onStack(n, false);
+        std::vector<size_t> stack;
+        std::vector<std::pair<size_t, size_t>> work;
+        size_t next = 0;
+        for (size_t root = 0; root < n; root++) {
+            if (index[root] != none) continue;
+            work.emplace_back(root, 0);
+            while (!work.empty()) {
+                const size_t v = work.back().first;
+                size_t & e = work.back().second;
+                if (e == 0 && index[v] == none) {
+                    index[v] = low[v] = next++;
+                    stack.push_back(v);
+                    onStack[v] = true;
+                }
+                if (e < edges[v].size()) {
+                    const size_t w = edges[v][e++];
+                    if (index[w] == none) {
+                        work.emplace_back(w, 0);
+                    } else if (onStack[w]) {
+                        low[v] = std::min(low[v], index[w]);
+                    }
+                    continue;
+                }
+                if (low[v] == index[v]) {
+                    std::vector<size_t> component;
+                    size_t w;
+                    do {
+                        w = stack.back();
+                        stack.pop_back();
+                        onStack[w] = false;
+                        component.push_back(w);
+                    } while (w != v);
+                    if (component.size() > 1 || within[v][v]) {
+                        result.cyclicComponents++;
+                        result.largestComponent = std::max(result.largestComponent, component.size());
+                        bool pairs = true;
+                        for (size_t r : component) pairs &= step.stringRules[r].text.size() == 2;
+                        if (pairs) result.pairComponents++; else result.pairSelectable = false;
+                    }
+                }
+                work.pop_back();
+                if (!work.empty()) {
+                    const size_t u = work.back().first;
+                    low[u] = std::min(low[u], low[v]);
+                }
+            }
+        }
+    }
+    if (result.acyclicApartFromSelf) {
+        //  Each rule follows the rules it is reached from.
+        result.order.assign(postorder.rbegin(), postorder.rend());
+        result.predecessors.resize(n);
+        for (size_t a = 0; a < n; a++) {
+            for (size_t b : precedes[a]) {
+                if (b != a) result.predecessors[b].push_back(a);
+            }
+        }
+    }
+    return result;
 }
 
 static re::RE * expandContext(re::RE * re, const std::map<unsigned, UCD::UnicodeSet> & insertions,

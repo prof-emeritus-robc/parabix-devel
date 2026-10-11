@@ -17,15 +17,20 @@ void PipelineCompiler::makePartitionEntryPoints(KernelBuilder & b) {
     const auto oneAfterLastPartition = PartitionPhaseBoundaries[mCurrentPipelinePhase];
     assert (firstPartition < oneAfterLastPartition);
     assert (oneAfterLastPartition < PartitionCount);
-    const auto count = oneAfterLastPartition - firstPartition + 1;
 
     for (unsigned i = firstPartition; i < oneAfterLastPartition; ++i) {
         mPartitionEntryPoint[i] = b.CreateBasicBlock("Partition" + std::to_string(i));
     }
+    // The PHI nodes of the partition entry points reserve space for a few incoming
+    // values only: LLVM grows their operand lists as incoming values are added.  (A
+    // PHI node per partition, or per stream set and partition, each reserving space
+    // for an incoming value from every partition, take memory quadratic or cubic in
+    // the number of partitions: for a pipeline of 1453 partitions, several GB.)
+    constexpr unsigned ReservedIncomingValues = 4;
     mPartitionEntryPoint[oneAfterLastPartition] = b.CreateBasicBlock("PipelineEnd");
     for (unsigned i = firstPartition + 1; i <= oneAfterLastPartition; ++i) {
         mPartitionPipelineProgressPhi[i] =
-            PHINode::Create(boolTy, count, std::to_string(i) + ".pipelineProgress", mPartitionEntryPoint[i]);
+            PHINode::Create(boolTy, ReservedIncomingValues, std::to_string(i) + ".pipelineProgress", mPartitionEntryPoint[i]);
     }
 
     if (LLVM_UNLIKELY(EnableCycleCounter)) {
@@ -34,7 +39,7 @@ void PipelineCompiler::makePartitionEntryPoints(KernelBuilder & b) {
         #endif
         for (unsigned i = firstPartition + 1; i < oneAfterLastPartition; ++i) {
             mPartitionStartTimePhi[i] =
-                PHINode::Create(sizeTy, count, std::to_string(i) + ".startTimeCycleCounter", mPartitionEntryPoint[i]);
+                PHINode::Create(sizeTy, ReservedIncomingValues, std::to_string(i) + ".startTimeCycleCounter", mPartitionEntryPoint[i]);
         }
     }
 
@@ -90,7 +95,7 @@ void PipelineCompiler::makePartitionEntryPoints(KernelBuilder & b) {
             const auto prodPartId = KernelPartitionId[producer];
             for (auto partitionId = prodPartId + 1; partitionId <= readsPartId; ++partitionId) {
                 auto entryPoint = mPartitionEntryPoint[partitionId]; assert (entryPoint);
-                PHINode * const phi = PHINode::Create(sizeTy, PartitionCount, prodPrefix + std::to_string(partitionId), entryPoint);
+                PHINode * const phi = PHINode::Create(sizeTy, ReservedIncomingValues, prodPrefix + std::to_string(partitionId), entryPoint);
                 mPartitionProducedItemCountPhi[partitionId][k] = phi;
             }
 

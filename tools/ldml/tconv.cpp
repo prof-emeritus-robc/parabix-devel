@@ -76,6 +76,7 @@
 #include <ldml/transform_rules_parser.h>
 #include <ldml/transform_rules_printer.h>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <sstream>
@@ -1023,36 +1024,6 @@ protected:
     }
 };
 
-//  Any-Hex/Unicode within a mask: given the text with every character converted
-//  (Hex, by UnicodeHexPipeline), the starts of the conversions (the U of each, in
-//  Starts), and at each start the character converted (Chars) and whether it is
-//  within the mask (Converted), the characters not within the mask are restored:
-//  each is written at the start of its conversion (Restored), and the rest of the
-//  conversion is to be deleted (not in Keep).
-class RestoreUnconverted : public pablo::PabloKernel {
-public:
-    RestoreUnconverted(LLVMTypeSystemInterface & ts, StreamSet * Starts, StreamSet * Converted, StreamSet * Chars,
-                       StreamSet * Hex, StreamSet * Restored, StreamSet * Keep)
-    : PabloKernel(ts, "RestoreUnconverted",
-                  {Binding{"Starts", Starts}, Binding{"Converted", Converted}, Binding{"Chars", Chars}, Binding{"Hex", Hex}},
-                  {Binding{"Restored", Restored}, Binding{"Keep", Keep}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * const starts = getInputStreamSet("Starts")[0];
-        PabloAST * const restored = pb.createAnd(starts, pb.createNot(getInputStreamSet("Converted")[0]));
-        const std::vector<PabloAST *> chars = getInputStreamSet("Chars");
-        const std::vector<PabloAST *> hex = getInputStreamSet("Hex");
-        //  The rest of the conversions of the restored characters: up to the next start.
-        PabloAST * const within = pb.createInFile(pb.createNot(starts));
-        PabloAST * const rest = pb.createAnd(pb.createMatchStar(pb.createAdvance(restored, 1), within), within);
-        std::vector<PabloAST *> out(hex.size());
-        for (unsigned b = 0; b < hex.size(); b++) out[b] = pb.createSel(restored, chars[b], hex[b]);
-        writeOutputStreamSet("Restored", out);
-        writeOutputStreamSet("Keep", std::vector<PabloAST *>{pb.createInFile(pb.createNot(rest))});
-    }
-};
-
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -1080,6 +1051,19 @@ private:
     StreamSet * activeMask() const {return mMasks.empty() ? nullptr : mMasks.back();}
     void spreadMasks(StreamSet * SpreadMask);
     void filterMasks(StreamSet * keep);
+    //  A context-free, single-character mapping of U21 (no contexts, and no
+    //  characters deleted): without an active mask, simply map(U21).  With a
+    //  mask, map is applied only to the masked characters, in a stream
+    //  shortened by FilterByMask (as the focused pipelines of nfc/nfd), so
+    //  that its kernels run only over the masked part of the text, however
+    //  sparse the mask; the mapped result is interleaved back with the
+    //  unmasked characters.  lengths gives, for each length other than one
+    //  that map's replacements may produce, the masked characters it applies
+    //  to (e.g. the digit-length ranges of Any-Hex/Unicode, or a conversion
+    //  group's characters by the length of their replacement); every other
+    //  masked character is assumed to map to exactly one character.
+    StreamSet * localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
+                                      const std::function<StreamSet * (StreamSet *)> & map);
     StreamSet * builtIn(const std::string & name, StreamSet * U21);
     StreamSet * normalization(const std::string & name, StreamSet * U21);
     StreamSet * maskedNormalization(const std::string & name, StreamSet * U21);
@@ -1139,6 +1123,57 @@ void RulePipelineBuilder::filterMasks(StreamSet * keep) {
         FilterByMask(mP, keep, mask, filtered);
         mask = filtered;
     }
+}
+
+StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const std::vector<std::pair<unsigned, UCD::UnicodeSet>> & lengths,
+                                                       const std::function<StreamSet * (StreamSet *)> & map) {
+    StreamSet * const mask = activeMask();
+    if (!mask) return map(U21);
+    PipelineBuilder & P = mP;
+    //  The masked characters, shortened by FilterByMask, and the untouched
+    //  rest of the text (also shortened, to merge back with the mapped
+    //  result below).
+    StreamSet * const notMask = P.CreateStreamSet(1);
+    Invert(P, mask, notMask);
+    StreamSet * const Selected = P.CreateStreamSet(21);
+    FilterByMask(P, mask, U21, Selected);
+    StreamSet * const NonSelected = P.CreateStreamSet(21);
+    FilterByMask(P, notMask, U21, NonSelected);
+    //  map, applied only to the masked characters: its kernels cost only
+    //  that of the (possibly much shorter) masked part of the text.
+    StreamSet * const Mapped = map(Selected);
+    //  The placement of the mapped characters among the untouched ones: as
+    //  many positions as each masked character's replacement has (lengths),
+    //  or one otherwise, inserted after its position (as for a conversion
+    //  group's longer replacements) -- expanding the masks in effect so that
+    //  the (now expanded) active mask spans each full replacement, which is
+    //  exactly the placement needed.
+    std::vector<unsigned> counts;
+    std::vector<StreamSet *> positions;
+    for (const auto & l : lengths) {
+        if (l.first == 1) continue;
+        counts.push_back(l.first - 1);
+        positions.push_back(combine(classes({l.second}, U21), mask, false));
+    }
+    StreamSet * placement = mask;
+    if (!counts.empty()) {
+        unsigned maxCount = 0;
+        for (unsigned c : counts) maxCount = std::max(maxCount, c);
+        unsigned bits = 0;
+        while ((maxCount >> bits) != 0) bits++;
+        StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
+        P.CreateKernelCall<InsertionCounts>(counts, positions, InsertBixNum);
+        SHOW_BIXNUM(InsertBixNum);
+        StreamSet * const SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
+        spreadMasks(SpreadMask);
+        placement = activeMask();
+    }
+    SHOW_STREAM(placement);
+    StreamSet * const Merged = P.CreateStreamSet(21);
+    MergeByMask(P, placement, Mapped, NonSelected, Merged);
+    SHOW_BIXNUM(Merged);
+    return Merged;
 }
 
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
@@ -1246,29 +1281,22 @@ StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
 }
 
 //  Any-Hex/Unicode: each character as U+ and its codepoint in uppercase
-//  hexadecimal, of at least 4 digits (by UnicodeHexPipeline).  Within a mask, all
-//  the characters are converted, and those not within it restored (see
-//  RestoreUnconverted).
+//  hexadecimal, of 4, 5 or 6 digits by its magnitude (UnicodeHexPipeline) --
+//  a context-free, single-character mapping, so within a mask only the
+//  masked characters need be converted (localCharacterMapping).
 StreamSet * RulePipelineBuilder::hexUnicode(StreamSet * U21) {
-    PipelineBuilder & P = mP;
-    StreamSet * const Hex = P.CreateStreamSet(21, 1);
-    UnicodeHexPipeline(P, U21, Hex);
-    SHOW_BIXNUM(Hex);
-    if (!activeMask()) return Hex;
-    //  Each conversion begins with U, which none of its digits are.
-    StreamSet * const Starts = classes({UCD::UnicodeSet('U')}, Hex);
-    SHOW_STREAM(Starts);
-    StreamSet * const Chars = P.CreateStreamSet(21, 1);
-    SpreadByMask(P, Starts, U21, Chars);
-    spreadMasks(Starts);
-    StreamSet * const Restored = P.CreateStreamSet(21, 1);
-    StreamSet * const Keep = P.CreateStreamSet(1);
-    P.CreateKernelCall<RestoreUnconverted>(Starts, activeMask(), Chars, Hex, Restored, Keep);
-    SHOW_STREAM(Keep);
-    StreamSet * const Result = P.CreateStreamSet(21, 1);
-    FilterByMask(P, Keep, Restored, Result);
-    filterMasks(Keep);
-    return Result;
+    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
+        {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // U+ and 4 digits
+        {7, UCD::UnicodeSet(0x10000, 0xFFFFF)},     // U+ and 5 digits
+        {8, UCD::UnicodeSet(0x100000, 0x10FFFF)},   // U+ and 6 digits
+    };
+    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
+        PipelineBuilder & P = mP;
+        StreamSet * const Hex = P.CreateStreamSet(21, 1);
+        UnicodeHexPipeline(P, Selected, Hex);
+        SHOW_BIXNUM(Hex);
+        return Hex;
+    });
 }
 
 //  The word boundaries of a text (in Unicode indexing, one position per
@@ -1452,6 +1480,25 @@ static bool anyBits(const std::vector<UCD::UnicodeSet> & sets) {
     return false;
 }
 
+//  Whether a conversion group is a context-free, single-character mapping:
+//  no string rules (whose multi-character matches could spuriously span the
+//  seam between unrelated masked spans once concatenated by
+//  localCharacterMapping), no subgroup with a context (which could need to
+//  see a character outside the mask), and no character deleted (a
+//  replacement length of zero, which localCharacterMapping's masked fast
+//  path does not support).  Only for such a group is shortening the text to
+//  the masked characters both correct and complete.
+static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
+    if (!step.stringRules.empty()) return false;
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        if (s.engineBefore || s.engineAfter) return false;
+        for (const ldml::CharMapping & m : s.mappings) {
+            if (m.replacement.empty()) return false;
+        }
+    }
+    return true;
+}
+
 //  A conversion group, in three phases.
 //
 //  1. The rules are matched on the text as it is (with their contexts): the
@@ -1482,6 +1529,25 @@ static bool anyBits(const std::vector<UCD::UnicodeSet> & sets) {
 //  matched, the matches are those of the text itself, and the characters of the
 //  text of a string rule are consecutive.
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    //  Within a mask, a context-free, single-character mapping is applied
+    //  only to the masked characters (localCharacterMapping): map runs this
+    //  same function again, but on the (unmasked) shortened text, where the
+    //  group's rules apply to every character directly, as without a filter.
+    if (activeMask() && isLocalCharacterMapping(step)) {
+        std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths;
+        for (const ldml::CharMapSubgroup & s : step.subgroups) {
+            for (const ldml::CharMapping & m : s.mappings) {
+                if (m.replacement.size() != 1) lengths.push_back({static_cast<unsigned>(m.replacement.size()), m.chars});
+            }
+        }
+        return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
+            std::vector<StreamSet *> outerMasks = std::move(mMasks);
+            mMasks.clear();
+            StreamSet * const Mapped = conversionGroup(step, Selected);
+            mMasks = std::move(outerMasks);
+            return Mapped;
+        });
+    }
     PipelineBuilder & P = mP;
     //  The characters of a set that the group may change: those other than the
     //  deletion mark.

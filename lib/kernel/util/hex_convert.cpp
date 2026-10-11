@@ -5,6 +5,8 @@
 
 #include <kernel/util/hex_convert.h>
 #include <kernel/core/kernel_builder.h>
+#include <kernel/pipeline/program_builder.h>
+#include <kernel/streamutils/deletion.h>
 #include <llvm/IR/Module.h>
 #include <llvm/Support/raw_ostream.h>
 #include <pablo/bixnum/bixnum.h>
@@ -126,6 +128,29 @@ void BixSplit::generateDoBlockMethod(KernelBuilder & b) {
     }
 }
 
+static BixNum Bix4toASCII_Hex(pablo::PabloBuilder & pb, BixNum & bix4Data, bool LowerHex = false) {
+    BixNumCompiler bnc(pb);
+    //  Given a 4-bit bixnum, a position is in the hex A-F range when its binary code is >= 10.
+    PabloAST * hexA_F = bnc.UGE(bix4Data, 10, "hexA_F");
+    //  If a number is in the hexA_F range, the low 4 bits are determined by subtracting 9.
+    BixNum lo = bnc.Select(hexA_F, bnc.SubModular(bix4Data, 9), bix4Data);
+    //
+    // Now we will extend to 8 bits and insert the appropriate bits of the
+    // ASCII representation.
+    BixNum hexBasis = bnc.ZeroExtend(lo, 8);
+    // Now compute the high 4 bits of the hexBasis.
+    // High 4 bits are 0x40 for hex A-F, 0x60 for hex a-f, 0x30 for hex 0-9,
+    hexBasis[7] = pb.createZeroes();  // the high bit (bit 7) is always zero for ASCII
+    hexBasis[6] = hexA_F;
+    if (LowerHex) {
+        hexBasis[5] = pb.createOnes();
+    } else {
+        hexBasis[5] = pb.createNot(hexA_F);
+    }
+    hexBasis[4] = pb.createNot(hexA_F);
+    return hexBasis;
+}
+
 Bix4toHex::Bix4toHex(LLVMTypeSystemInterface & ts,
                      StreamSet * bix4Data, StreamSet * hexBasis, bool LowerHex)
         : PabloKernel(ts, LowerHex ? "Bix4toHex_lc" : "Bix4toHex",
@@ -134,29 +159,99 @@ Bix4toHex::Bix4toHex(LLVMTypeSystemInterface & ts,
 
 void Bix4toHex::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
-    //  bnc is an object that can perform arithmetic on sets of parallel bit streams
+    std::vector<PabloAST *> bix4Data = getInputStreamSet("bix4Data");
+    std::vector<PabloAST *> hexBasis = Bix4toASCII_Hex(pb, bix4Data, mLowerHex);
+    writeOutputStreamSet("hexBasis", hexBasis);
+}
+
+class UnicodeEscapedHex final : public pablo::PabloKernel {
+public:
+    UnicodeEscapedHex(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * hexBasis, StreamSet * filterMask);
+protected:
+    void generatePabloMethod() override;
+};
+
+UnicodeEscapedHex::UnicodeEscapedHex(LLVMTypeSystemInterface & ts,
+                                     StreamSet * bix4Data,
+                                     StreamSet * hexBasis, StreamSet * filterMask)
+        : PabloKernel(ts, "UnicodeEscapedHex",
+                      {Binding{"bix4Data", bix4Data}},
+                      {Binding{"hexBasis", hexBasis}, Binding{"filterMask", filterMask}}) {}
+
+void UnicodeEscapedHex::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
     BixNumCompiler bnc(pb);
     // Get the input stream sets.
     std::vector<PabloAST *> bix4Data = getInputStreamSet("bix4Data");
-
-    //  Given these 4 bit streams, a position is in the hex A-F range when its binary code is >= 10.
-    PabloAST * hexA_F = bnc.UGE(bix4Data, 10, "hexA_F");
-    //  If a number is in the hexA_F range, the low 4 bits are determined by subtracting 9.
-    bix4Data = bnc.Select(hexA_F, bnc.SubModular(bix4Data, 9), bix4Data);
     //
-    // Now we will extend to 8 bits and insert the appropriate bits of the
-    // ASCII representation.
-    std::vector<PabloAST *> hexBasis = bnc.ZeroExtend(bix4Data, 8);
-    // Now compute the high 4 bits of the hexBasis.
-    // High 4 bits are 0x40 for hex A-F, 0x60 for hex a-f, 0x30 for hex 0-9,
-    hexBasis[7] = pb.createZeroes();  // the high bit (bit 7) is always zero for ASCII
-    hexBasis[6] = hexA_F;
-    if (mLowerHex) {
-        hexBasis[5] = pb.createOnes();
-    } else {
-        hexBasis[5] = pb.createNot(hexA_F);
-    }
-    hexBasis[4] = pb.createNot(hexA_F);
+    // First convert the 4-bit bixnum values to an 8-bit hex-ASCII basis.
+    BixNum hexBasis = Bix4toASCII_Hex(pb, bix4Data);
+
+    //  Mark the start of every 8th value
+    PabloAST * Umark = pb.createRepeat(1, pb.getInteger(0x01, 8));
+    // Encode ASCII U = 0x55, given hexBasis value is digit 0 (0x30);
+    hexBasis[6] = pb.createOr(hexBasis[6], Umark);
+    hexBasis[5] = pb.createXor(hexBasis[5], Umark);  // flip bit 5
+    hexBasis[2] = pb.createOr(hexBasis[2], Umark);
+    hexBasis[0] = pb.createOr(hexBasis[0], Umark);
+    //
+    // Now deal with the "+" mark following U (+ = 0x2b)
+    PabloAST * Uplus = pb.createAdvance(Umark, 1);
+    hexBasis[4] = pb.createXor(hexBasis[4], Uplus);  // flip bit 4
+    hexBasis[3] = pb.createOr(hexBasis[3], Uplus);
+    hexBasis[1] = pb.createOr(hexBasis[1], Uplus);
+    hexBasis[0] = pb.createOr(hexBasis[0], Uplus);
+    //
+    // Now determine whether we need to delete excess leading zeroes.
+    PabloAST * leadingDigit = pb.createAdvance(Uplus, 1);
+    PabloAST * sourceZeroes = bnc.EQ(bix4Data, 0);
+    PabloAST * deleteLeading = pb.createAnd(leadingDigit, sourceZeroes);
+    PabloAST * deleteSecond = pb.createAnd(pb.createAdvance(deleteLeading, 1), sourceZeroes);
+    PabloAST * filterMask = pb.createInFile(pb.createNot(pb.createOr(deleteLeading, deleteSecond)));
     //
     writeOutputStreamSet("hexBasis", hexBasis);
+    writeOutputStreamSet("filterMask", std::vector<PabloAST *>{filterMask});
+}
+
+class ZeroExtendASCII_to_U21 final : public pablo::PabloKernel {
+public:
+    ZeroExtendASCII_to_U21(LLVMTypeSystemInterface & ts, StreamSet * AsciiData, StreamSet * U21);
+protected:
+    void generatePabloMethod() override;
+};
+
+ZeroExtendASCII_to_U21::ZeroExtendASCII_to_U21(LLVMTypeSystemInterface & ts,
+                                     StreamSet * AsciiData,
+                                     StreamSet * U21)
+        : PabloKernel(ts, "ZeroExtendASCII_to_U21",
+                      {Binding{"AsciiData", AsciiData}},
+                      {Binding{"U21", U21}}) {}
+
+void ZeroExtendASCII_to_U21::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    BixNumCompiler bnc(pb);
+    std::vector<PabloAST *> ASCIIData = getInputStreamSet("AsciiData");
+    std::vector<PabloAST *> U21data = bnc.ZeroExtend(ASCIIData, 21);
+    writeOutputStreamSet("U21", U21data);
+}
+
+void kernel::UnicodeHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
+
+    StreamSet * Bix2x16 = P.CreateStreamSet(16);
+    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+
+    StreamSet * Bix4x8 = P.CreateStreamSet(8);
+    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    StreamSet * Bix8x4 = P.CreateStreamSet(4);
+    P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
+
+    StreamSet * Hex8 = P.CreateStreamSet(8);
+    StreamSet * filterMask = P.CreateStreamSet(1);
+    P.CreateKernelCall<UnicodeEscapedHex>(Bix8x4, Hex8, filterMask);
+
+    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    FilterByMask(P, filterMask, Hex8, EncodedU8);
+
+    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
 }

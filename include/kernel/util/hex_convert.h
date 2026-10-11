@@ -6,6 +6,7 @@
 
 #include <kernel/core/kernel.h>
 #include <pablo/pablo.h>
+namespace kernel { class PipelineBuilder; }
 
 namespace kernel {
 //
@@ -64,5 +65,6 @@ private:
     bool mLowerHex;
 };
 
+void UnicodeHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
 
 }

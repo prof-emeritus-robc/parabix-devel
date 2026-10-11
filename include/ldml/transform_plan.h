@@ -170,6 +170,19 @@ struct StringRuleOverlaps {
     // the rules, and for each rule the rules preceding it (one-way pairs).
     std::vector<size_t> order;
     std::vector<std::vector<size_t>> predecessors;
+    // The strongly connected components of the graph of all the overlaps (one-
+    // way, two-way and self) that are cycles: of two or more rules, or of one
+    // self-overlapping rule.  Matches of two characters overlap only where they
+    // begin at consecutive positions, whichever their rules: of a component of
+    // rules of two characters, the matches that apply are those at the first
+    // and every other position of each run of consecutive first positions of
+    // the matches of its rules (as for the self-overlaps of one rule), and the
+    // components, as single rules, form an acyclic graph.  pairSelectable: all
+    // cyclic components consist of rules of two characters.
+    unsigned cyclicComponents = 0;
+    unsigned pairComponents = 0;    // cyclic components of rules of two characters
+    size_t largestComponent = 0;    // rules in the largest cyclic component
+    bool pairSelectable = true;
 };
 StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step);
 

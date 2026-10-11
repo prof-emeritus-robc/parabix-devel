@@ -604,13 +604,18 @@ static void printPlan(const ldml::TransformEntry * entry, const TransformAnalysi
             if (overlaps.singlePass()) {
                 llvm::outs() << "single pass in " << std::max(overlaps.singlePassStages(), 1u) << " stages"
                              << (overlaps.self ? " (with two-character self-overlaps)" : "") << "\n";
-            } else if (overlaps.twoWay > 0) {
-                llvm::outs() << "not single pass: two-way overlaps\n";
-            } else if (overlaps.acyclicApartFromSelf) {
-                llvm::outs() << "not single pass: self-overlaps (otherwise single pass in "
-                             << std::max(overlaps.stagesApartFromSelf, 1u) << " stages)\n";
             } else {
-                llvm::outs() << "not single pass: cycle of " << overlaps.cycle.size() << " rules\n";
+                if (overlaps.twoWay > 0) {
+                    llvm::outs() << "not single pass: two-way overlaps";
+                } else if (overlaps.acyclicApartFromSelf) {
+                    llvm::outs() << "not single pass: self-overlaps (otherwise single pass in "
+                                 << std::max(overlaps.stagesApartFromSelf, 1u) << " stages)";
+                } else {
+                    llvm::outs() << "not single pass: cycle of " << overlaps.cycle.size() << " rules";
+                }
+                llvm::outs() << "; " << overlaps.cyclicComponents << " cyclic components (" << overlaps.pairComponents
+                             << " of 2-character rules, largest " << overlaps.largestComponent << " rules)"
+                             << (overlaps.pairSelectable ? ": pair selectable" : "") << "\n";
             }
             for (size_t i = 0; i < overlaps.cycle.size(); i++) {
                 llvm::outs() << "      cycle: " << ldml::printRule(step.stringRules[overlaps.cycle[i]].rule) << "\n";

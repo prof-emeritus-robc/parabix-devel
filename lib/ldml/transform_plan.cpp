@@ -5,6 +5,7 @@
 
 #include <ldml/transform_plan.h>
 #include <algorithm>
+#include <cstdint>
 #include <tuple>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
@@ -345,6 +346,66 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
     std::tie(result.acyclic, result.stages) = search(true, result.cycle);
     std::vector<size_t> ignored;
     std::tie(result.acyclicApartFromSelf, result.stagesApartFromSelf) = search(false, ignored);
+    //  The strongly connected components of the graph of all the overlaps
+    //  (Tarjan's algorithm, iteratively).
+    {
+        std::vector<std::vector<size_t>> edges(n);
+        for (size_t a = 0; a < n; a++) {
+            for (size_t b = 0; b < n; b++) {
+                if (within[a][b]) edges[a].push_back(b);
+            }
+        }
+        const size_t none = SIZE_MAX;
+        std::vector<size_t> index(n, none), low(n, 0);
+        std::vector<bool> onStack(n, false);
+        std::vector<size_t> stack;
+        std::vector<std::pair<size_t, size_t>> work;
+        size_t next = 0;
+        for (size_t root = 0; root < n; root++) {
+            if (index[root] != none) continue;
+            work.emplace_back(root, 0);
+            while (!work.empty()) {
+                const size_t v = work.back().first;
+                size_t & e = work.back().second;
+                if (e == 0 && index[v] == none) {
+                    index[v] = low[v] = next++;
+                    stack.push_back(v);
+                    onStack[v] = true;
+                }
+                if (e < edges[v].size()) {
+                    const size_t w = edges[v][e++];
+                    if (index[w] == none) {
+                        work.emplace_back(w, 0);
+                    } else if (onStack[w]) {
+                        low[v] = std::min(low[v], index[w]);
+                    }
+                    continue;
+                }
+                if (low[v] == index[v]) {
+                    std::vector<size_t> component;
+                    size_t w;
+                    do {
+                        w = stack.back();
+                        stack.pop_back();
+                        onStack[w] = false;
+                        component.push_back(w);
+                    } while (w != v);
+                    if (component.size() > 1 || within[v][v]) {
+                        result.cyclicComponents++;
+                        result.largestComponent = std::max(result.largestComponent, component.size());
+                        bool pairs = true;
+                        for (size_t r : component) pairs &= step.stringRules[r].text.size() == 2;
+                        if (pairs) result.pairComponents++; else result.pairSelectable = false;
+                    }
+                }
+                work.pop_back();
+                if (!work.empty()) {
+                    const size_t u = work.back().first;
+                    low[u] = std::min(low[u], low[v]);
+                }
+            }
+        }
+    }
     if (result.acyclicApartFromSelf) {
         //  Each rule follows the rules it is reached from.
         result.order.assign(postorder.rbegin(), postorder.rend());

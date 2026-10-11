@@ -14,6 +14,60 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 [Reproducing](#reproducing)). The per-transform table is in
 [ldml-tconv-coverage-table.md](ldml-tconv-coverage-table.md).
 
+## Update: W2b1 (single-pass string rule groups) implemented
+
+Commits `d11b949e`, `92ca8af9`, `335b2b2a` and `1ed0394e` implement the
+single-pass groups of string rules. A group qualifies when its overlaps are
+one-way with an acyclic precedence graph, apart from self-overlaps of
+two-character rules.
+
+**Planning.** The plan records, for each such group:
+
+- an order in which to apply the string rules (a topological order of the
+  precedence graph);
+- for each rule, the rules within whose texts it may match
+  (`TransformStep::stringOrder` and `stringPredecessors`);
+- the two-character self-overlapping rules (`StringRule::selfOverlapping`).
+
+**Pipeline.** tconv selects the matches that apply in one Pablo kernel,
+`SelectStringMatches`, from the matches of all the string rules of the
+group, marked at their first positions:
+
+- A match of a rule applies only if it does not begin within an applied
+  match of a rule preceding it, computed by `Advance` within the kernel.
+- The matches of a self-overlapping two-character rule are selected by
+  parity: the positions of each run of the same parity as its first. This
+  is the `MatchStar` logic of the `odd_positions` / `firstMatchInRun`
+  formulation, with the result restricted to the matches.
+
+Selecting in one kernel matters. Chaining shift and combine kernels from
+rule to rule produced pipelines whose partitioning analysis did not finish:
+el-el_Latn/BGN has 73 string rules in 4 stages.
+
+With the same CLDR data:
+
+- **Coverage:** 151 of 425 CLDR-defined transforms are implementable (145
+  before; 128 of the 393 public ones). The six new ones are exactly the
+  transforms W2b1 alone blocked: Latn-Cans, Latn-Geor, Latn-Ethi/Williamson,
+  ch-ch_FONIPA, el-el_Latn/BGN and ru_Latn-ru/BGN. None was lost.
+- **Tests:** 96 CLDR test files run, 137,033 cases. 85 files pass entirely.
+  - ch-ch_FONIPA passes 19/19.
+  - el-el_Latn/BGN fails 2/700. Both follow the current rule
+    `ν{δ}ρ → d`, where the test data (and ICU 74) expect `dh`.
+  - ru_Latn-ru/BGN fails 7/78.
+- **Before contexts on converted text.** The ru_Latn-ru/BGN failures, like
+  those of the conversions to Gurmukhi, come from before contexts that only
+  the converted text can satisfy. For example, `$consonant { y } → ы` has
+  `$consonant` defined as Cyrillic consonants. ICU matches before contexts
+  against the converted text, tconv against the input (§4.1). `--plan` warns
+  of such contexts: 7 of the 151 implementable transforms have warnings,
+  and they account for every remaining test failure other than test data
+  that disagrees with its rules.
+  - The 7 are am-am_Latn/BGN, Arab-Latn, el-el_Latn/BGN, Spacedhan-Han,
+    Kana-Hira, InterIndic-Gurmukhi and ru_Latn-ru/BGN.
+  - Treating these contexts properly (or reporting them as problems) is the
+    next correctness item.
+
 ## Update: W2b classification (string rules within string rules)
 
 Commits `b5501bda`, `17fe8701` and `eac773f4` classify the overlaps of the

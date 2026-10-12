@@ -30,6 +30,9 @@
 //                          properties lc, uc and tc, as in xch -prop=...
 //      Any-Hex/Unicode     each character as U+ and its codepoint in
 //                          (uppercase) hexadecimal, of at least 4 digits
+//      Any-Hex/Java        each character first decoded to UTF-16 and then
+//                          each code unit as \u and 4 hex digits
+//      Any-Hex             == Any-Hex/Java
 //      Transforms defined by rules (see TransformAnalyzer), with global
 //      filters (:: [set] ;) and filtered transform rules (:: [set] ID ;):
 //      the filter is computed once, as a mask of the positions of the text
@@ -111,13 +114,13 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexUnicode};
+enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
     {"Any-NFC", Transform::NFC}, {"Any-NFKC", Transform::NFKC},
     {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title},
-    {"Any-Hex/Unicode", Transform::HexUnicode},
+    {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},{"Any-Hex/Unicode", Transform::HexUnicode},
 };
 
 //  Basis bits of a byte stream.
@@ -434,8 +437,9 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
             OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::uc, BasisBits));
             break;
         case Transform::Title:
+        case Transform::HexJava:
         case Transform::HexUnicode:
-            llvm::report_fatal_error("tconv: Any-Title and Any-Hex/Unicode are implemented by the rule pipeline");
+            llvm::report_fatal_error("tconv: Any-Title and Any-Hex (/Java, /Unicode) are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -1069,6 +1073,7 @@ private:
     StreamSet * maskedNormalization(const std::string & name, StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * titlecase(StreamSet * U21);
+    StreamSet * hexJava(StreamSet * U21);
     StreamSet * hexUnicode(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
@@ -1194,6 +1199,8 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
         return U21_StringOverridePipeline(P, prop, U21);
     }
     if (name == "Any-Title") return titlecase(U21);
+    if (name == "Any-Hex") return hexJava(U21);
+    if (name == "Any-Hex/Java") return hexJava(U21);
     if (name == "Any-Hex/Unicode") return hexUnicode(U21);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
@@ -1278,6 +1285,24 @@ StreamSet * RulePipelineBuilder::titlecase(StreamSet * U21) {
         return maskedStringOverrides({{UCD::tc, combine(title, mask, false)}, {UCD::lc, combine(lower, mask, false)}}, U21);
     }
     return maskedStringOverrides({{UCD::tc, title}, {UCD::lc, lower}}, U21);
+}
+
+//  Any-Hex/Java: each character encoded as UTF-16 code units, then
+//  each unit expressed as \u followed by 4 hexadecimal digits (JavaHexPipeline) --
+//  a context-free, single-character mapping, so within a mask only the
+//  masked characters need be converted (localCharacterMapping).
+StreamSet * RulePipelineBuilder::hexJava(StreamSet * U21) {
+    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
+        {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
+        {12, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // a surrogate pair: 2 \uXXXX
+    };
+    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
+        PipelineBuilder & P = mP;
+        StreamSet * const Hex = P.CreateStreamSet(21, 1);
+        JavaHexPipeline(P, Selected, Hex);
+        SHOW_BIXNUM(Hex);
+        return Hex;
+    });
 }
 
 //  Any-Hex/Unicode: each character as U+ and its codepoint in uppercase
@@ -2036,7 +2061,8 @@ int main(int argc, char *argv[]) {
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
     //  boundaries, provided by the rule pipeline.
     const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower
-                        && impl->second != Transform::Title && impl->second != Transform::HexUnicode;
+                        && impl->second != Transform::Title && impl->second != Transform::HexJava
+                        && impl->second != Transform::HexUnicode;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
     fn(fd);

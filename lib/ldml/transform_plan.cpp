@@ -165,7 +165,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             }
             subgroup->rules++;
             //  The earliest rule for a character takes precedence.
-            const UCD::UnicodeSet chars = sets.setOf(text, false) - subgroup->characters();
+            const UCD::UnicodeSet chars = sets.setOf(items.front(), false) - subgroup->characters();
             if (chars.empty()) continue;
             CharMapping * same = nullptr;
             for (CharMapping & m : subgroup->mappings) {

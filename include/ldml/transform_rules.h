@@ -696,6 +696,60 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
 //  a → x ; does.
 std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules);
 
+//  Composition of revisits.
+//
+//  A forward conversion rule whose result has text to revisit,
+//      before { X } after → A | B ;
+//  places B back before the cursor: the rules of its group then apply to
+//  B and the text following it, as to any text, with A (and the converted
+//  text before X) as the text before the cursor.  Each such rule is replaced
+//  by rules without a cursor that give the same results, found by applying
+//  the rules of the group to B symbolically: the rules are tried in order at
+//  the cursor, a rule matching where the characters of B are members of the
+//  sets of its text and its contexts may match the known text around the
+//  cursor.  A rule may match beyond B: its remaining items, Z, are appended
+//  to the text of the composed rule.   Each complete sequence of rule
+//  applications, ending when no text is left to revisit, gives a rule
+//      before' { X Z } after' → A A2 ... ;
+//  where before' combines the before context with the parts of the contexts
+//  of the applied rules lying before X, and after' the after context with
+//  those lying beyond X Z.   Where no rule applies, a character of B is
+//  passed through.  The composed rules are ordered depth first, by the order
+//  of the rules applied, ending with the rule passing all characters through,
+//  so that the earliest applicable composed rule gives the result of the
+//  original rules; a rule that applies whatever the unknown text is ends the
+//  rules tried.  References in A and B to captures of single characters
+//  are enumerated (with at most 64 characters each), as are characters of Z
+//  referenced by the results of applied rules.  A text anchor (^ or $ in the
+//  text of a rule) is matched as a context [$].
+//
+//  As in ICU, in a result with references to captures the cursor is placed
+//  after the last reference preceding it, or at the start of the result (so
+//  that X → A | $1 ; revisits A $1).
+//
+//  A rule whose text to revisit is the text matched by the end of its text,
+//      before { P S } after → A | S ;
+//  is instead rewritten as before { P } S after → A ; which leaves the same
+//  text and cursor (and applies to runs, as kk → x | k ; on kkkk).  The rules
+//  are composed with the rewritten rules.
+//
+//  A rule is left unchanged (reported in the stats) if the cursor is placed
+//  beyond the result, a rule whose text is not a fixed-length sequence of
+//  characters may apply to the text to revisit, results are not fixed
+//  strings, contexts that cannot be combined (other than sequences of sets
+//  with no repetitions) apply together, or the revisits do not end within
+//  8 rule applications (as with ll → | l ;).
+//
+//  The rules of other kinds are unchanged; apply ExtractForwardRules or
+//  ExtractReverseBackwardRules first.
+struct RevisitStats {
+    unsigned candidates = 0;        // rules with text to revisit
+    unsigned composed = 0;          // replaced by composed rules
+    unsigned composedRules = 0;     // the composed rules replacing them
+    std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
+};
+std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats = nullptr);
+
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.
 std::vector<re::Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated = false);

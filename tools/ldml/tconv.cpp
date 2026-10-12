@@ -557,11 +557,23 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
     try {
         std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+        ldml::RevisitStats rstats;
+        rules = ldml::ComposeRevisits(rules, &rstats);
         rules = ldml::TrivialCaptureElimination(rules);
         rules = ldml::NullableCaptureElimination(rules);
         ldml::DisambiguationStats dstats;
         rules = ldml::DisambiguateOrder(rules, &dstats);
         a.plan = ldml::planTransform(rules);
+        //  The reasons the rules with text to revisit were not composed: these
+        //  rules remain, in order, as the rules with that problem.
+        size_t notComposed = 0;
+        for (std::string & problem : a.plan.problems) {
+            const std::string revisit = "(the result has text to revisit)";
+            if (problem.size() >= revisit.size() && problem.compare(problem.size() - revisit.size(), revisit.size(), revisit) == 0
+                    && notComposed < rstats.notComposed.size()) {
+                problem += " (not composed: " + rstats.notComposed[notComposed++].second + ")";
+            }
+        }
         a.problems = a.plan.problems;
         //  The bit changes of the subgroups of a group are combined, assuming that
         //  no two rules of a group may apply at the same position.
@@ -767,9 +779,10 @@ public:
     InsertionCounts(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & counts,
                     const std::vector<StreamSet *> & Positions, StreamSet * BixNum)
     : PabloKernel(ts, "InsertionCounts" + [&] {
-                      std::string sig;
+                      std::string sig = "_b" + std::to_string(BixNum->getNumElements());
                       for (unsigned k : counts) sig += "_" + std::to_string(k);
-                      return sig;
+                      //  A long signature is hashed (the kernel name is a file name in the object cache).
+                      return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
                   }(),
                   [&] {
                       Bindings inputs;
@@ -1969,7 +1982,16 @@ void FusedRules::generatePabloMethod() {
     //  that apply (selected as in SelectStringMatches) and the positions where the
     //  subgroups apply (not covered by them, and within the mask).
     PabloAST * const odd = pb.createRepeat(1, pb.getInteger(0xAA, 8));
+    //  In a correction kernel: the positions within the matches applied in the
+    //  previous round, after their first positions.  A before context
+    //  matched against the converted text may let a string rule match within an
+    //  applied match, where ICU applies no rule; such matches are dropped,
+    //  round by round (as the matches covering them may themselves be dropped).
+    PabloAST * appliedWithin = nullptr;
     auto settle = [&]() {
+        if (appliedWithin) {
+            for (size_t r = 0; r < mConfig.strings.size(); r++) firstOf[r] = pb.createAnd(firstOf[r], pb.createNot(appliedWithin));
+        }
         if (!mConfig.selection.empty()) {
             std::vector<PabloAST *> within;
             for (size_t i = 0; i < mConfig.selection.size(); i++) {
@@ -2002,6 +2024,13 @@ void FusedRules::generatePabloMethod() {
             PabloAST * uncovered = pb.createInFile(pb.createNot(pb.createAnd(inside, pb.createNot(first))));
             if (mask) uncovered = pb.createAnd(uncovered, mask);
             for (size_t g = 0; g < atOf.size(); g++) atOf[g] = pb.createAnd(atOf[g], uncovered);
+        }
+        if (correction) {
+            PabloAST * inside = zeroes;
+            for (size_t r = 0; r < mConfig.strings.size(); r++) {
+                for (unsigned j = 1; j < mConfig.strings[r].text.size(); j++) inside = pb.createOr(inside, pb.createAdvance(firstOf[r], j));
+            }
+            appliedWithin = inside;
         }
     };
     if (correction) {

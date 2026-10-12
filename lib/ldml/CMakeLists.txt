@@ -17,6 +17,7 @@ SRC
     transform_rules_partition.cpp
     transform_rules_parser.cpp
     transform_rules_printer.cpp
+    transform_rules_revisit.cpp
     transform_registry.cpp
     transform_plan.cpp
 DEPS

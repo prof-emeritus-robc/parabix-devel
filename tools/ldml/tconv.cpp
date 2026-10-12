@@ -75,6 +75,8 @@
 #include <kernel/re/regexp_engine.h>
 #include <re/adt/adt.h>
 #include <re/cc/cc_kernel.h>
+#include <re/cc/cc_compiler.h>
+#include <re/cc/cc_compiler_target.h>
 #include <ucd/utf/transchar.h>
 #include <ldml/transform_plan.h>
 #include <ldml/transform_rules_parser.h>
@@ -106,6 +108,10 @@ static cl::opt<std::string> RulesFile("rules-file", cl::desc("File of LDML trans
                                       cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> ListTransforms("list-transforms", cl::desc("List the known transform names and exit"),
                                     cl::init(false), cl::cat(TconvOptions));
+static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
+    cl::desc("Rounds of matching before contexts against the converted text, which the conversions of a group may change "
+             "(exact for chains of up to this many such rules; 0 matches them against the text itself)"),
+    cl::init(8), cl::cat(TconvOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
                               cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report problems found in the transform files"),
@@ -597,6 +603,8 @@ static std::string printRanges(const UCD::UnicodeSet & set) {
     return set.count() == 1 ? result : "[" + result + "]";
 }
 
+static void printBeforeContextNotes(const ldml::TransformStep & step);
+
 static void printPlan(const std::string & label, const TransformAnalysis & a) {
     llvm::outs() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
     for (const std::string & p : a.problems) {
@@ -655,61 +663,7 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
                 }
             }
         }
-        //  ICU matches before contexts against the converted text.  A before context
-        //  may match differently in the unconverted text, as the regular expression
-        //  engine sees it, if a conversion of the group:
-        //    - replaces a character by one, where exactly one of them is in a set of
-        //      the context;
-        //    - replaces a character by a longer string, where the character or one of
-        //      the string is in a set of the context;
-        //    - deletes a character, unless the context is A S* with the character
-        //      in S but not in A (a deleted character within a match is then in S*,
-        //      as after the deletion closure of DisambiguateOrder).
-        //  (The characters that a mapping does not change are excluded.)
-        std::vector<ldml::CharMapping> conversions;
-        for (const ldml::CharMapSubgroup & s : step.subgroups) {
-            for (const ldml::CharMapping & m : s.mappings) {
-                UCD::UnicodeSet chars = m.chars;
-                if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
-                if (!chars.empty()) conversions.push_back(ldml::CharMapping{chars, m.replacement});
-            }
-        }
-        //  String rules convert and delete the characters of their texts, and produce
-        //  those of their replacements.
-        UCD::UnicodeSet stringRuleChars;
-        for (const ldml::StringRule & sr : step.stringRules) {
-            for (const UCD::UnicodeSet & t : sr.text) stringRuleChars = stringRuleChars + t;
-            for (char32_t c : sr.replacement) stringRuleChars.insert(c);
-        }
-        for (const ldml::CharMapSubgroup & s : step.subgroups) {
-            if (s.before == nullptr) continue;
-            const std::vector<ldml::PatternItem> items = ldml::patternItems(s.before);
-            const bool closedForm = items.size() == 2 && !items[0].repeated && items[1].repeated;
-            bool changes = false;
-            for (const ldml::CharMapping & c : conversions) {
-                if (c.replacement.empty()) {
-                    changes = !(closedForm && c.chars.subset(items[1].chars - items[0].chars));
-                } else {
-                    for (const ldml::PatternItem & item : items) {
-                        bool replacementInItem = false;
-                        for (char32_t r : c.replacement) replacementInItem |= item.chars.contains(r);
-                        if (c.replacement.size() == 1) {
-                            //  Some character is in the item and its replacement not, or vice versa.
-                            changes = replacementInItem ? !c.chars.subset(item.chars) : c.chars.intersects(item.chars);
-                        } else {
-                            changes = c.chars.intersects(item.chars) || replacementInItem;
-                        }
-                        if (changes) break;
-                    }
-                }
-                if (changes) break;
-            }
-            for (const ldml::PatternItem & item : items) changes |= !(item.chars & stringRuleChars).empty();
-            if (changes) {
-                llvm::outs() << "    warning: the before context of [" << s.contextKey
-                             << "] may match differently in the converted text\n";
-            }
-        }
+        printBeforeContextNotes(step);
         for (const ldml::StringRule & sr : step.stringRules) {
             llvm::outs() << "    string rule: " << ldml::printRule(sr.rule) << "\n";
         }
@@ -1237,6 +1191,156 @@ static bool fusedContexts(re::RE * context, bool before, FusedContexts & alterna
     return ContextExpansion(before).expand(context, alternatives);
 }
 
+//  The conversions of a group: the characters each may change (at a position of
+//  a single-character rule, or of the text of a string rule) and the converted
+//  text there (empty if deleted).
+struct ConversionOutcome {
+    UCD::UnicodeSet chars;
+    std::u32string out;
+};
+
+static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformStep & step) {
+    std::vector<ConversionOutcome> outcomes;
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        for (const ldml::CharMapping & m : s.mappings) {
+            UCD::UnicodeSet chars = m.chars;
+            if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
+            if (!chars.empty()) outcomes.push_back(ConversionOutcome{chars, m.replacement});
+        }
+    }
+    for (const ldml::StringRule & sr : step.stringRules) {
+        const size_t n = sr.text.size(), m = sr.replacement.size();
+        for (size_t j = 0; j < n; j++) {
+            std::u32string out;
+            if (j + 1 < n) {
+                if (j < m) out = sr.replacement.substr(j, 1);
+            } else if (j < m) {
+                out = sr.replacement.substr(j);
+            }
+            outcomes.push_back(ConversionOutcome{sr.text[j], out});
+        }
+    }
+    return outcomes;
+}
+
+//  Whether the conversions of a group may make a before context (as fused
+//  alternatives) match differently in the converted text, against which ICU
+//  matches it, than in the text itself: a conversion changes whether a
+//  character is in the set of an item (the last character of its converted
+//  text, for the item adjacent to the rule), deletes a character (the context
+//  then sees the characters before it), or (for the items further from the
+//  rule) changes the length of the text.
+static bool convertedContextMatters(const FusedContexts & before, const std::vector<ConversionOutcome> & outcomes) {
+    for (const FusedContext & alt : before) {
+        const size_t B = alt.size();
+        for (size_t k = 0; k < B; k++) {
+            const size_t d = B - k;     // 1: adjacent to the rule
+            const UCD::UnicodeSet & S = alt[k].chars;
+            for (const ConversionOutcome & o : outcomes) {
+                if (o.out.empty()) return true;
+                if (d > 1 && o.out.size() != 1) return true;
+                const bool in = S.contains(o.out.back());
+                if (in ? !o.chars.subset(S) : o.chars.intersects(S)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+//  The notes of tconv --plan on the before contexts of a conversion group that
+//  its conversions may make match differently in the converted text, against
+//  which ICU matches them: those matched against the converted text (see
+//  FusedRules), and warnings for the others.
+static void printBeforeContextNotes(const ldml::TransformStep & step) {
+    const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
+    bool changingMappings = false;
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        for (const ldml::CharMapping & m : s.mappings) {
+            UCD::UnicodeSet chars = m.chars - UCD::UnicodeSet(DeletionMark);
+            if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
+            changingMappings |= !chars.empty();
+        }
+    }
+    const bool needCoverage = step.coverStringRules && changingMappings;
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        FusedContexts before, after;
+        if (s.engineBefore && fusedContexts(s.engineBefore, true, before) && fusedContexts(s.engineAfter, false, after)
+                && convertedContextMatters(before, outcomes)) {
+            llvm::outs() << "    before context matched against the converted text: [" << s.contextKey << "]\n";
+        }
+    }
+    for (const ldml::StringRule & sr : step.stringRules) {
+        FusedContexts before, after;
+        if (sr.engineBefore && fusedContexts(sr.engineBefore, true, before) && fusedContexts(sr.engineAfter, false, after)
+                && convertedContextMatters(before, outcomes)) {
+            if (step.stringOrder.empty() && !needCoverage) {
+                llvm::outs() << "    before context matched against the converted text: " << ldml::printRule(sr.rule) << "\n";
+            } else {
+                llvm::outs() << "    warning: the before context of " << ldml::printRule(sr.rule)
+                             << " may match differently in the converted text\n";
+            }
+        }
+    }
+    //  The contexts that are not fused (with unbounded repetitions) are matched
+    //  against the text itself.
+        //  ICU matches before contexts against the converted text.  A before context
+    //  may match differently in the unconverted text, as the regular expression
+    //  engine sees it, if a conversion of the group:
+    //    - replaces a character by one, where exactly one of them is in a set of
+    //      the context;
+    //    - replaces a character by a longer string, where the character or one of
+    //      the string is in a set of the context;
+    //    - deletes a character, unless the context is A S* with the character
+    //      in S but not in A (a deleted character within a match is then in S*,
+    //      as after the deletion closure of DisambiguateOrder).
+    //  (The characters that a mapping does not change are excluded.)
+    std::vector<ldml::CharMapping> conversions;
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        for (const ldml::CharMapping & m : s.mappings) {
+            UCD::UnicodeSet chars = m.chars;
+            if (m.replacement.size() == 1) chars = chars - UCD::UnicodeSet(m.replacement[0]);
+            if (!chars.empty()) conversions.push_back(ldml::CharMapping{chars, m.replacement});
+        }
+    }
+    //  String rules convert and delete the characters of their texts, and produce
+    //  those of their replacements.
+    UCD::UnicodeSet stringRuleChars;
+    for (const ldml::StringRule & sr : step.stringRules) {
+        for (const UCD::UnicodeSet & t : sr.text) stringRuleChars = stringRuleChars + t;
+        for (char32_t c : sr.replacement) stringRuleChars.insert(c);
+    }
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        FusedContexts fusedBefore, fusedAfter;
+        if (s.before == nullptr || (fusedContexts(s.engineBefore, true, fusedBefore) && fusedContexts(s.engineAfter, false, fusedAfter))) continue;
+        const std::vector<ldml::PatternItem> items = ldml::patternItems(s.before);
+        const bool closedForm = items.size() == 2 && !items[0].repeated && items[1].repeated;
+        bool changes = false;
+        for (const ldml::CharMapping & c : conversions) {
+            if (c.replacement.empty()) {
+                changes = !(closedForm && c.chars.subset(items[1].chars - items[0].chars));
+            } else {
+                for (const ldml::PatternItem & item : items) {
+                    bool replacementInItem = false;
+                    for (char32_t r : c.replacement) replacementInItem |= item.chars.contains(r);
+                    if (c.replacement.size() == 1) {
+                        //  Some character is in the item and its replacement not, or vice versa.
+                        changes = replacementInItem ? !c.chars.subset(item.chars) : c.chars.intersects(item.chars);
+                    } else {
+                        changes = c.chars.intersects(item.chars) || replacementInItem;
+                    }
+                    if (changes) break;
+                }
+            }
+            if (changes) break;
+        }
+        for (const ldml::PatternItem & item : items) changes |= !(item.chars & stringRuleChars).empty();
+        if (changes) {
+            llvm::outs() << "    warning: the before context of [" << s.contextKey
+                         << "] may match differently in the converted text\n";
+        }
+    }
+}
+
 //  A match stream given as input to a fused kernel: a stream of a stream set.
 struct FusedMatchSource {
     StreamSet * streamSet = nullptr;
@@ -1273,6 +1377,14 @@ struct FusedRulesConfig {
     //  Also the spans and first positions of the matches of the string rules
     //  (Spans and Starts), for the coverage of the single-character rules.
     bool coverage = false;
+    //  A correction kernel (rounds > 0): its rules have before contexts that the
+    //  conversions of the group may make match differently in the converted
+    //  text, against which ICU matches them.  Given the results of the other
+    //  rules of the group (in the state), it matches their before contexts
+    //  against the converted text, in this many rounds (see FusedRules).
+    //  replacementChars: the characters of all the replacements of the group.
+    unsigned rounds = 0;
+    UCD::UnicodeSet replacementChars;
 };
 
 //  The results of the rules of a conversion group, accumulated by its fused
@@ -1534,6 +1646,10 @@ private:
                                  const FusedState & in) {
         std::string s = "FusedRulesCC" + std::to_string(DeletionMark) + "_" + std::to_string(SmallMappingLimit);
         s += c.matchOnly ? "M" : "C";
+        if (c.rounds) {
+            s += "R" + std::to_string(c.rounds);
+            appendSet(s, c.replacementChars);
+        }
         if (c.coverage) s += "V";
         if (Mask) s += "K" + std::to_string(l.maskLookahead);
         if (Allowed) s += "A";
@@ -1651,7 +1767,10 @@ void FusedRules::generatePabloMethod() {
     PabloAST * const mask = mHasMask ? getInputStreamSet("Mask")[0] : nullptr;
     PabloAST * const allowed = mHasAllowed ? getInputStreamSet("Allowed")[0] : mask;
 
-    //  The matches of the string rules, at their first positions.
+    //  The matches of the string rules, at their first positions, and the
+    //  positions where the rules of the subgroups apply.  In a correction kernel,
+    //  without their before contexts (matched against the converted text below).
+    const bool correction = mConfig.rounds > 0;
     std::vector<PabloAST *> starts;
     for (const FusedStringRule & r : mConfig.strings) {
         if (r.match >= 0) {
@@ -1659,7 +1778,7 @@ void FusedRules::generatePabloMethod() {
             continue;
         }
         const unsigned n = r.text.size();
-        PabloAST * m = contexts(r.before, r.after, n);
+        PabloAST * m = contexts(correction ? FusedContexts{FusedContext()} : r.before, r.after, n);
         for (unsigned j = 0; j < n; j++) {
             m = pb.createAnd(m, classAt(j, r.text[j]));
             if (mask) m = pb.createAnd(m, j ? pb.createLookahead(mask, j) : mask);
@@ -1673,84 +1792,217 @@ void FusedRules::generatePabloMethod() {
         }
         return;
     }
-
-    //  The changes at each position i of the replacements, the insertions, and
-    //  the coverage, from the state given.
-    std::vector<std::vector<PabloAST *>> changes(mLayout.changePositions, std::vector<PabloAST *>(21, zeroes));
-    for (unsigned i = 0; i < mChangesIn.size(); i++) {
-        if (mChangesIn[i]) changes[i] = getInputStreamSet("ChangesIn" + std::to_string(i));
-    }
-    std::map<unsigned, PabloAST *> insert;
-    for (unsigned k : mLayout.insertCounts) {
-        insert[k] = mInsertIn.count(k) ? getInputStreamSet("InsertIn" + std::to_string(k))[0] : zeroes;
-    }
-    PabloAST * spans = mCoverageIn ? getInputStreamSet("SpansIn")[0] : zeroes;
-    PabloAST * firsts = mCoverageIn ? getInputStreamSet("StartsIn")[0] : zeroes;
-    //  At the positions of At: changing the character there to the target (the
-    //  character known if Known), or the deletion mark at an inserted position.
-    auto changeChar = [&](PabloAST * at, UCD::codepoint_t target, const UCD::UnicodeSet * known) {
-        if (known && known->count() == 1) {
-            const UCD::codepoint_t diff = known->front().first ^ target;
-            for (unsigned b = 0; b < 21; b++) {
-                if ((diff >> b) & 1) changes[0][b] = pb.createOr(changes[0][b], at);
-            }
-        } else {
-            for (unsigned b = 0; b < 21; b++) {
-                PabloAST * const bit = ((target >> b) & 1) ? pb.createNot(basis[b]) : basis[b];
-                changes[0][b] = pb.createOr(changes[0][b], pb.createAnd(at, bit));
-            }
-        }
-    };
-    auto changeMark = [&](unsigned i, PabloAST * at, UCD::codepoint_t target) {
-        const UCD::codepoint_t diff = DeletionMark ^ target;
-        for (unsigned b = 0; b < 21; b++) {
-            if ((diff >> b) & 1) changes[i][b] = pb.createOr(changes[i][b], at);
-        }
-    };
-
-    for (size_t r = 0; r < mConfig.strings.size(); r++) {
-        const FusedStringRule & rule = mConfig.strings[r];
-        const unsigned n = rule.text.size(), m = rule.replacement.size();
-        PabloAST * const first = starts[r];
-        //  The characters of the text change to those of the replacement (or the
-        //  deletion mark), and the further characters of the replacement are
-        //  written at the positions inserted after the last.
-        PabloAST * last = first;
-        for (unsigned j = 0; j < n; j++) {
-            PabloAST * const at = j ? pb.createAdvance(first, j) : first;
-            if (mConfig.coverage) spans = pb.createOr(spans, at);
-            changeChar(at, j < m ? static_cast<UCD::codepoint_t>(rule.replacement[j]) : DeletionMark, &rule.text[j]);
-            last = at;
-        }
-        for (unsigned j = n; j < m; j++) changeMark(j - n + 1, last, static_cast<UCD::codepoint_t>(rule.replacement[j]));
-        if (m > n) insert[m - n] = pb.createOr(insert[m - n], last);
-        if (mConfig.coverage) firsts = pb.createOr(firsts, first);
-    }
-
+    std::vector<PabloAST *> ats;
     for (const FusedSubgroup & g : mConfig.subgroups) {
         const FusedSubgroupPlan plan(g);
-        PabloAST * at = g.match >= 0 ? source(g.match) : pb.createAnd(classAt(0, plan.all), contexts(g.before, g.after, 1));
+        PabloAST * at = g.match >= 0 ? source(g.match)
+                        : pb.createAnd(classAt(0, plan.all), contexts(correction ? FusedContexts{FusedContext()} : g.before, g.after, 1));
         if (allowed) at = pb.createAnd(at, allowed);
-        for (size_t i = 0; i < plan.bitSets.size(); i++) {
+        ats.push_back(at);
+    }
+
+    //  The results of the rules: the changes at each position i of the
+    //  replacements, the insertions, and the coverage, added to the state given.
+    struct Results {
+        std::vector<std::vector<PabloAST *>> changes;
+        std::map<unsigned, PabloAST *> insert;
+        PabloAST * spans;
+        PabloAST * firsts;
+    };
+    auto stateIn = [&]() {
+        Results res;
+        res.changes.assign(mLayout.changePositions, std::vector<PabloAST *>(21, zeroes));
+        for (unsigned i = 0; i < mChangesIn.size(); i++) {
+            if (mChangesIn[i]) res.changes[i] = getInputStreamSet("ChangesIn" + std::to_string(i));
+        }
+        for (unsigned k : mLayout.insertCounts) {
+            res.insert[k] = mInsertIn.count(k) ? getInputStreamSet("InsertIn" + std::to_string(k))[0] : zeroes;
+        }
+        res.spans = mCoverageIn ? getInputStreamSet("SpansIn")[0] : zeroes;
+        res.firsts = mCoverageIn ? getInputStreamSet("StartsIn")[0] : zeroes;
+        return res;
+    };
+    //  The results of the rules applied at the positions given (the first
+    //  positions of the matches of the string rules, and the positions of the
+    //  subgroups), added to res.
+    auto addResults = [&](Results & res, const std::vector<PabloAST *> & firstOf, const std::vector<PabloAST *> & atOf) {
+        //  At the positions of At: changing the character there to the target
+        //  (the character known if Known), or the deletion mark at an inserted
+        //  position.
+        auto changeChar = [&](PabloAST * at, UCD::codepoint_t target, const UCD::UnicodeSet * known) {
+            if (known && known->count() == 1) {
+                const UCD::codepoint_t diff = known->front().first ^ target;
+                for (unsigned b = 0; b < 21; b++) {
+                    if ((diff >> b) & 1) res.changes[0][b] = pb.createOr(res.changes[0][b], at);
+                }
+            } else {
+                for (unsigned b = 0; b < 21; b++) {
+                    PabloAST * const bit = ((target >> b) & 1) ? pb.createNot(basis[b]) : basis[b];
+                    res.changes[0][b] = pb.createOr(res.changes[0][b], pb.createAnd(at, bit));
+                }
+            }
+        };
+        auto changeMark = [&](unsigned i, PabloAST * at, UCD::codepoint_t target) {
+            const UCD::codepoint_t diff = DeletionMark ^ target;
             for (unsigned b = 0; b < 21; b++) {
-                const UCD::UnicodeSet & set = plan.bitSets[i][b];
-                if (!set.empty()) changes[i][b] = pb.createOr(changes[i][b], pb.createAnd(at, classAt(0, set)));
+                if ((diff >> b) & 1) res.changes[i][b] = pb.createOr(res.changes[i][b], at);
+            }
+        };
+        for (size_t r = 0; r < mConfig.strings.size(); r++) {
+            const FusedStringRule & rule = mConfig.strings[r];
+            const unsigned n = rule.text.size(), m = rule.replacement.size();
+            PabloAST * const first = firstOf[r];
+            //  The characters of the text change to those of the replacement (or
+            //  the deletion mark), and the further characters of the replacement
+            //  are written at the positions inserted after the last.
+            PabloAST * last = first;
+            for (unsigned j = 0; j < n; j++) {
+                PabloAST * const at = j ? pb.createAdvance(first, j) : first;
+                if (mConfig.coverage) res.spans = pb.createOr(res.spans, at);
+                changeChar(at, j < m ? static_cast<UCD::codepoint_t>(rule.replacement[j]) : DeletionMark, &rule.text[j]);
+                last = at;
+            }
+            for (unsigned j = n; j < m; j++) changeMark(j - n + 1, last, static_cast<UCD::codepoint_t>(rule.replacement[j]));
+            if (m > n) res.insert[m - n] = pb.createOr(res.insert[m - n], last);
+            if (mConfig.coverage) res.firsts = pb.createOr(res.firsts, first);
+        }
+        for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
+            const FusedSubgroupPlan plan(mConfig.subgroups[g]);
+            PabloAST * const at = atOf[g];
+            for (size_t i = 0; i < plan.bitSets.size(); i++) {
+                for (unsigned b = 0; b < 21; b++) {
+                    const UCD::UnicodeSet & set = plan.bitSets[i][b];
+                    if (!set.empty()) res.changes[i][b] = pb.createOr(res.changes[i][b], pb.createAnd(at, classAt(0, set)));
+                }
+            }
+            for (const FusedSubgroupPlan::Large & l : plan.large) {
+                PabloAST * const charsAt = pb.createAnd(at, classAt(0, l.chars));
+                if (l.position == 0) changeChar(charsAt, l.target, nullptr); else changeMark(l.position, charsAt, l.target);
+            }
+            for (const auto & k : plan.byInsertion) {
+                res.insert[k.first] = pb.createOr(res.insert[k.first], pb.createAnd(at, classAt(0, k.second)));
             }
         }
-        for (const FusedSubgroupPlan::Large & l : plan.large) {
-            PabloAST * const charsAt = pb.createAnd(at, classAt(0, l.chars));
-            if (l.position == 0) changeChar(charsAt, l.target, nullptr); else changeMark(l.position, charsAt, l.target);
+    };
+
+    std::vector<PabloAST *> firstOf = starts, atOf = ats;
+    if (correction) {
+        //  Round 0: the before contexts matched against the text itself.
+        for (size_t r = 0; r < mConfig.strings.size(); r++) {
+            firstOf[r] = pb.createAnd(starts[r], contexts(mConfig.strings[r].before, FusedContexts{FusedContext()}, 0));
         }
-        for (const auto & k : plan.byInsertion) {
-            insert[k.first] = pb.createOr(insert[k.first], pb.createAnd(at, classAt(0, k.second)));
+        for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
+            atOf[g] = pb.createAnd(ats[g], contexts(mConfig.subgroups[g].before, FusedContexts{FusedContext()}, 0));
+        }
+        PabloAST * const firstPosition = beforeStart(1);
+        const UCD::UnicodeSet replaced = mConfig.replacementChars - UCD::UnicodeSet(DeletionMark);
+        //  Each further round: the converted text from the results so far, and the
+        //  before contexts matched against it.  (A rule whose before context sees
+        //  the result of another such rule is right after as many rounds as such
+        //  rules precede it in a chain.)
+        for (unsigned round = 1; round <= mConfig.rounds; round++) {
+            Results res = stateIn();
+            addResults(res, firstOf, atOf);
+            //  The converted text at each position: its length (0 if deleted, or
+            //  1 + the positions inserted after it) and its characters (slot 0, the
+            //  character itself, and the slots inserted after it).
+            unsigned maxInsert = 0;
+            PabloAST * anyInsert = zeroes;
+            for (const auto & k : res.insert) {
+                maxInsert = std::max(maxInsert, k.first);
+                anyInsert = pb.createOr(anyInsert, k.second);
+            }
+            std::vector<std::vector<PabloAST *>> slot(maxInsert + 1, std::vector<PabloAST *>(21));
+            PabloAST * changed0 = zeroes;
+            for (unsigned b = 0; b < 21; b++) {
+                slot[0][b] = pb.createXor(basis[b], res.changes[0][b]);
+                changed0 = pb.createOr(changed0, res.changes[0][b]);
+            }
+            for (unsigned i = 1; i <= maxInsert; i++) {
+                for (unsigned b = 0; b < 21; b++) {
+                    PabloAST * const c = i < res.changes.size() ? res.changes[i][b] : zeroes;
+                    slot[i][b] = ((DeletionMark >> b) & 1) ? pb.createNot(c) : c;
+                }
+            }
+            std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> slotCompiler(maxInsert + 1);
+            for (unsigned i = 0; i <= maxInsert; i++) slotCompiler[i] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(slot[i]);
+            auto slotClass = [&](unsigned i, const UCD::UnicodeSet & set) -> PabloAST * {
+                if (set.empty()) return zeroes;
+                return pb.createInFile(slotCompiler[i]->compileCC(re::makeCC(set, &cc::Unicode), pb));
+            };
+            PabloAST * const deleted = pb.createAnd(pb.createNot(anyInsert),
+                                                    pb.createAnd(changed0, slotClass(0, UCD::UnicodeSet(DeletionMark))));
+            PabloAST * const kept = pb.createInFile(pb.createNot(deleted));
+            std::vector<PabloAST *> length(maxInsert + 2, zeroes);     // length[l]: the converted text has l characters
+            length[1] = pb.createAnd(kept, pb.createNot(anyInsert));
+            for (const auto & k : res.insert) length[k.first + 1] = pb.createOr(length[k.first + 1], k.second);
+            PabloAST * const noneKeptBefore = pb.createInFile(pb.createNot(pb.createMatchStar(pb.createAdvance(kept, 1), ones)));
+            //  Whether the j-th last character of the converted text up to each
+            //  position (j = 1, its last) is in a set (or, before the start of the
+            //  text, whether the item holds there), for j = 1 .. depth.
+            std::map<std::pair<std::string, bool>, std::vector<PabloAST *>> memo;
+            auto lastIn = [&](const FusedItem & item, unsigned depth) -> PabloAST * {
+                std::vector<PabloAST *> & V = memo[{setKey(item.chars), item.boundary}];
+                const UCD::UnicodeSet inReplaced = item.chars & replaced;
+                auto slotIn = [&](unsigned i) -> PabloAST * {
+                    if (i == 0) {
+                        return pb.createOr(pb.createAnd(pb.createNot(changed0), classAt(0, item.chars)),
+                                           pb.createAnd(changed0, slotClass(0, inReplaced)));
+                    }
+                    return slotClass(i, inReplaced);
+                };
+                auto previous = [&](PabloAST * v) {
+                    PabloAST * p = pb.createAdvance(v, 1);
+                    return item.boundary ? pb.createOr(p, firstPosition) : p;
+                };
+                while (V.size() < depth) {
+                    const unsigned j = V.size() + 1;
+                    PabloAST * x = zeroes;
+                    for (unsigned l = 1; l < length.size(); l++) {
+                        if (length[l] == zeroes) continue;
+                        PabloAST * const v = l >= j ? slotIn(l - j) : previous(V[j - l - 1]);
+                        x = pb.createOr(x, pb.createAnd(length[l], v));
+                    }
+                    //  A deleted position: as the position before it.
+                    PabloAST * carried = pb.createMatchStar(pb.createAnd(pb.createAdvance(x, 1), deleted), deleted);
+                    if (item.boundary) carried = pb.createOr(carried, noneKeptBefore);
+                    V.push_back(pb.createOr(x, pb.createAnd(deleted, carried)));
+                }
+                return V[depth - 1];
+            };
+            //  The positions at which a before context matches the converted text
+            //  before them.
+            auto convertedBefore = [&](const FusedContexts & before) {
+                PabloAST * match = zeroes;
+                for (const FusedContext & alt : before) {
+                    PabloAST * m = ones;
+                    const unsigned B = alt.size();
+                    for (unsigned k = 0; k < B; k++) {
+                        const unsigned d = B - k;
+                        PabloAST * item = pb.createAdvance(lastIn(alt[k], d), 1);
+                        if (alt[k].boundary) item = pb.createOr(item, firstPosition);
+                        m = pb.createAnd(m, item);
+                    }
+                    match = pb.createOr(match, m);
+                }
+                return match;
+            };
+            for (size_t r = 0; r < mConfig.strings.size(); r++) {
+                firstOf[r] = pb.createAnd(starts[r], convertedBefore(mConfig.strings[r].before));
+            }
+            for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
+                atOf[g] = pb.createAnd(ats[g], convertedBefore(mConfig.subgroups[g].before));
+            }
         }
     }
 
-    for (unsigned i = 0; i < mLayout.changePositions; i++) writeOutputStreamSet("Changes" + std::to_string(i), changes[i]);
-    for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{insert[k]});
+    Results res = stateIn();
+    addResults(res, firstOf, atOf);
+    for (unsigned i = 0; i < mLayout.changePositions; i++) writeOutputStreamSet("Changes" + std::to_string(i), res.changes[i]);
+    for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
     if (mConfig.coverage) {
-        writeOutputStreamSet("Spans", std::vector<PabloAST *>{spans});
-        writeOutputStreamSet("Starts", std::vector<PabloAST *>{firsts});
+        writeOutputStreamSet("Spans", std::vector<PabloAST *>{res.spans});
+        writeOutputStreamSet("Starts", std::vector<PabloAST *>{res.firsts});
     }
 }
 
@@ -2382,6 +2634,19 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         fusedMatch[r] = !texts[r].empty() && fusedContexts(rule.engineBefore, true, befores[r])
                    && fusedContexts(rule.engineAfter, false, afters[r]);
     }
+    //  The rules whose before contexts the conversions of the group may make match
+    //  differently in the converted text: matched against it by a correction
+    //  kernel (FusedRules with rounds), after the other rules.  (Not yet string
+    //  rules that must be selected, or whose coverage other rules need.)
+    const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
+    const bool needCoverage = step.coverStringRules &&
+        std::any_of(maps.begin(), maps.end(), [](const std::vector<ldml::CharMapping> & m) {return !m.empty();});
+    const bool correct = ConvertedContextRounds > 0;
+    std::vector<bool> correctedString(numStringRules, false);
+    for (size_t r = 0; r < numStringRules; r++) {
+        correctedString[r] = correct && fusedMatch[r] && step.stringOrder.empty() && !needCoverage
+                             && convertedContextMatters(befores[r], outcomes);
+    }
     auto engineFirsts = [&](size_t r) {
         const ldml::StringRule & rule = step.stringRules[r];
         const size_t n = texts[r].size();
@@ -2440,9 +2705,6 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowedAt, state, out, nullptr);
         state = out;
     };
-    //  Spans are needed for the coverage of the single-character rules.
-    const bool needCoverage = step.coverStringRules &&
-        std::any_of(maps.begin(), maps.end(), [](const std::vector<ldml::CharMapping> & m) {return !m.empty();});
     std::vector<size_t> applying;               // the string rules, by their matches
     std::vector<FusedMatchSource> applied;      // and the source of their matches that apply
     if (!step.stringOrder.empty()) {
@@ -2501,7 +2763,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         }
     } else {
         for (size_t r = 0; r < numStringRules; r++) {
-            if (texts[r].empty()) continue;
+            if (texts[r].empty() || correctedString[r]) continue;
             applying.push_back(r);
             applied.push_back(fusedMatch[r] ? FusedMatchSource{} : FusedMatchSource{engineFirsts(r), 0});
         }
@@ -2543,7 +2805,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         SHOW_STREAM(uncovered);
         allowed = combine(allowed, uncovered, false);
     }
-    //  ... and of the subgroups of single-character rules, in chunks.
+    //  ... of the subgroups of single-character rules, in chunks, ...
+    FusedRulesConfig correction;
     {
         FusedRulesConfig config;
         size_t mappings = 0;
@@ -2566,11 +2829,27 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 fg.match = static_cast<int>(config.sources.size());
                 config.sources.push_back(FusedMatchSource{matchPositions(subgroup.engineBefore, subgroup.engineAfter, {all}, U21), 0});
             }
+            if (fg.match < 0 && correct && convertedContextMatters(fg.before, outcomes)) {
+                correction.subgroups.push_back(std::move(fg));
+                continue;
+            }
             mappings += fg.mappings.size();
             config.subgroups.push_back(std::move(fg));
             if (config.subgroups.size() >= FusedMaxSubgroups || mappings >= FusedMaxRules) flush();
         }
         flush();
+    }
+    //  ... and, last, of the rules whose before contexts are matched against the
+    //  converted text (given the results of all the others).
+    for (size_t r = 0; r < numStringRules; r++) {
+        if (correctedString[r]) correction.strings.push_back(fusedRule(r));
+    }
+    if (!correction.strings.empty() || !correction.subgroups.empty()) {
+        correction.rounds = ConvertedContextRounds;
+        for (const ConversionOutcome & o : outcomes) {
+            for (char32_t c : o.out) correction.replacementChars.insert(c);
+        }
+        applyFused(std::move(correction), allowed);
     }
     std::vector<StreamSet *> changesAt = state.changes;
     std::map<unsigned, StreamSet *> inserting = state.insertions;

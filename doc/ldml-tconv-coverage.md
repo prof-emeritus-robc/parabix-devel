@@ -1,6 +1,7 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` at commit `481afafb5` (branch LDML), against CLDR
+*Status of `tools/ldml/tconv` on branch LDML, after `6b6b08cb6` with before contexts
+matched against the converted text (§3.1), against CLDR
 `common/transforms` and `common/testData/transforms` at commit `7cdeb9e`
 (2026-10-09). October 12, 2026.*
 
@@ -21,18 +22,18 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 
 | | names | implementable |
 |---|---:|---:|
-| Built-in transforms (UTS #35 / ICU) | 29 | 10 |
+| Built-in transforms (UTS #35 / ICU) | 29 | 11 |
 | Transforms defined by CLDR files (381 files) | 425 | 195 (46%) |
 | …of which public (not `visibility="internal"`) | 393 | 171 (44%) |
 
 - **Tests.** Of the 284 CLDR test files, 130 belong to implementable transforms.
-  Of their 166,382 cases, 14,511 fail. 102 of the 130 files pass entirely.
-- **Most failures have one cause.** About 14,000 of the failing cases come from
-  *before contexts that only the converted text satisfies* (§3.1). ICU matches
-  before contexts against the text it has already converted; tconv matches them
-  against the input. This affects the nine Indic→Latin transforms, which fail
-  about 95% of their cases, and the eight conversions to Gurmukhi. It is the most
-  important correctness item.
+  Of their 166,382 cases, 378 fail. 124 of the 130 files pass entirely.
+- **The remaining failures are not tconv errors.** On all 378 failing cases,
+  tconv's output is identical to ICU 78.3's: the test data disagrees with the
+  current rules (§3).
+- **Before contexts are matched against the converted text** (§3.1), as ICU does.
+  That fixed 14,133 failing cases, including the nine Indic→Latin transforms
+  (about 95% of their cases failed) and the eight conversions to Gurmukhi.
 - **Pipeline scale.** Conversion groups are now compiled into a few fused kernels
   instead of about 13 kernels per rule (§4.3).
   - InterIndic-Latin's pipeline went from 1,676 kernels to 63.
@@ -63,7 +64,7 @@ surface only after others are fixed.
 
 ## 2. What works
 
-### 2.1 Built-in transforms (10 of 29)
+### 2.1 Built-in transforms (11 of 29)
 
 | implemented | how |
 |---|---|
@@ -74,6 +75,7 @@ surface only after others are fixed.
 | Any-Null | identity |
 | Any-Hex/Unicode | `UnicodeHexPipeline`: `U+` and 4–6 hex digits |
 | Any-Hex/Java, Any-Hex | `JavaHexPipeline`: UTF-16 code units, each `\u` and 4 hex digits |
+| Any-Hex/C | `\u` and 4 hex digits, or `\U` and 8 for characters beyond U+FFFF (`6b6b08cb6`) |
 
 `Any-Hex/Unicode`, `Any-Hex/Java` and `Any-Hex` are byte-identical to ICU 78.3 on:
 
@@ -87,7 +89,7 @@ path of `localCharacterMapping`).
 
 Not implemented:
 
-- `Any-Hex/C`, `/Perl`, `/XML`, `/XML10`;
+- `Any-Hex/Perl`, `/XML`, `/XML10`;
 - all `Hex-Any/*`;
 - `Any-CaseFold`, `Any-Remove`, `Any-FCD`, `Any-FCC`, `Any-Name`, `Name-Any` and
   `Any-BreakInternal`.
@@ -119,7 +121,7 @@ The per-transform status is in the table.
 its transform by alias, and those of implementable transforms are run:
 
 - 130 files, 166,382 cases;
-- 102 files pass entirely.
+- 124 files pass entirely.
 
 The failures are in §3.
 
@@ -142,30 +144,37 @@ The output was identical on all 1,965 runs, other than ja_Hrkt-ja_Latn/BGN, wher
 the previous tconv crashed. On 16 transforms the output was also identical with
 segment sizes 1 to 3, 1 to 3 threads, and `-EnableAsserts -VerifyIR`.
 
+**Regression of the converted-text contexts.** On the same 1,975 runs:
+
+- with `--converted-context-rounds=0` (the correction off), the output is
+  identical to the tconv before fusion, other than ja_Hrkt-ja_Latn/BGN;
+- with the correction, 117 outputs change, in 25 transforms, and every one of
+  them is identical to ICU 78.3.
+
+On 8 corrected transforms, the output is also identical with segment sizes 1 to
+3, 1 to 3 threads, and `-EnableAsserts -VerifyIR`.
+
 ## 3. Correctness: known failures
 
-| test file(s) | failing cases | cause |
+On every remaining failing case, tconv's output is identical to ICU 78.3's: the
+CLDR test data disagrees with the current rules.
+
+| test file | failing cases | example |
 |---|---:|---|
-| 9 Indic→Latin (Deva-, Beng-, Gujr-, Guru-, Knda-, Mlym-, Orya-, Taml-, Telu-Latn) | 13,181 of 13,836 | before contexts on converted text (§3.1) |
-| 8 conversions to Gurmukhi (`*-Guru`) | 821 of 12,121 | before contexts on converted text (InterIndic-Gurmukhi) |
-| ka-ka_Latn/BGN | 215 of 682 | the test data expects `ʼ` (U+02BC) where the rules, and ICU 74, give `’` (U+2019) |
-| ky-ky_FONIPA | 150 of 1,090 | before contexts (17 warnings) |
-| pl-pl_FONIPA | 78 of 418 | **not yet investigated** (no warnings) |
-| fa-fa_Latn/BGN | 24 of 2,522 | before contexts (4 warnings) |
-| sk-sk_FONIPA | 11 of 91 | before contexts (2 warnings) |
-| Ethi-Latn/SERA | 9 of 612 | before contexts (4 warnings) |
-| ru-ja | 8 of 1,382 | **not yet investigated** |
-| ru_Latn-ru/BGN | 7 of 78 | before contexts (14 warnings), e.g. `$consonant { y } → ы` |
-| hy-hy_FONIPA | 4 of 701 | before contexts (4 warnings) |
-| el-el_Latn/BGN | 2 of 700 | the rule `ν{δ}ρ → d`, where the test data (and ICU 74) expect `dh` |
-| ia-ia_FONIPA | 1 of 330 | before contexts (1 warning) |
+| ka-ka_Latn/BGN | 215 of 682 | the test data expects `ʼ` (U+02BC) where the rules give `’` (U+2019) |
+| pl-pl_FONIPA | 78 of 418 | |
+| ky-ky_FONIPA | 65 of 1,090 | `Кемин`: the test data expects `ɡemin`, the rules give `kemin` |
+| sk-sk_FONIPA | 11 of 91 | |
+| ru-ja | 8 of 1,382 | |
+| ia-ia_FONIPA | 1 of 330 | |
 
 ### 3.1 Before contexts on converted text
 
 ICU scans left to right and matches a before context against the text to the
 left of the cursor, which it has already converted. tconv applies a conversion
-group to all positions at once and matches before contexts against the input.
-The two differ wherever the conversion changes whether a context matches.
+group to all positions at once, so it originally matched before contexts against
+the input. The two differ wherever the conversion changes whether a context
+matches.
 
 InterIndic-Latin is an example:
 
@@ -177,33 +186,60 @@ $forceIndependentMatra { $aa → ̔ā ;
 - The context means "the preceding character is not a letter or combining mark".
 - In ICU, the preceding consonant has already become a Latin letter such as `n`,
   so the rule does not apply.
-- In tconv, the preceding character is still a private-use InterIndic consonant,
-  which is not `[:L:]`, so the rule applies. `अनिया` gives `an̔iy̔ā` where
-  `aniyā` is expected.
+- Matched against the input, the preceding character is still a private-use
+  InterIndic consonant, which is not `[:L:]`, so the rule applied. `अनिया` gave
+  `an̔iy̔ā` where `aniyā` is expected.
 
-**Detection.** `tconv --plan` warns of such contexts ("the before context of …
-may match differently in the converted text"). Two gaps remain:
+ICU also:
 
-- The warning belongs to the transform whose rules have the context. Deva-Latn,
-  which invokes InterIndic-Latin, shows no warnings, and `tconv_coverage.py`
-  does not carry warnings over to the transforms that invoke a transform.
-- 26 implementable transforms have such warnings in their own rules.
+- looks through deleted characters (`x → ; [^a] { b → B` turns `axb` into `ab`);
+- matches against the last characters of longer replacements;
+- sees the results of earlier rules of the same kind, so chains propagate
+  (`a { b → a ; a { c → C` turns `abbbc` into `aaaaC`).
 
-**Proposed fix.** Rewrite each such before-context class into the set of
-*input* characters whose converted output ends in that class.
+**Which rules are affected.** A rule's before context is matched against the
+converted text if some conversion of its group:
 
-- Each rule of a group gives a fixed output for each character, so the set can be
-  computed when the transform is compiled.
-- Contexts for which it cannot be computed exactly should be reported as
-  problems.
-- There are precedents: the deletion closure of `DisambiguateOrder`
-  (`3a0562a83`), which rewrites `A S*` as `A [S D]*`, and `ldml::expandedContext`
-  (`142fba426`).
-- The fused kernels match tier-A and tier-B contexts from character classes,
-  so a rewritten context is just a different class there.
+- changes whether a character is in the set of a context item;
+- deletes a character;
+- or, for items beyond the one adjacent to the rule, changes the length of the
+  text.
 
-Fixing InterIndic-Latin and InterIndic-Gurmukhi alone would clear about 14,000 of
-the 14,511 failing cases.
+This is `convertedContextMatters` in `tools/ldml/tconv.cpp`. `tconv --plan` lists
+these contexts ("before context matched against the converted text").
+
+**How.** These rules are applied by a correction kernel (`FusedRules` with
+rounds), after all the other rules of the group, given their results:
+
+1. Round 0 matches the before contexts against the input.
+2. Each further round rebuilds the converted text at each position from all the
+   results so far: its length (0 if deleted, or 1 plus the positions inserted
+   after it) and its characters.
+3. From that, it computes whether the j-th last converted character before each
+   position is in a set. This uses `Advance`, looks through deleted positions
+   (`MatchStar`), and handles the start of the text. Only the set's intersection
+   with the group's replacement characters is compiled on computed bits.
+4. It then matches the before contexts again.
+
+A rule is right after as many rounds as rules of this kind precede it in a chain.
+`--converted-context-rounds` sets the number of rounds (default 8; 0 turns the
+correction off). Pablo `While` loops cannot be used for this fixpoint, because an
+`Advance` inside a loop takes the previous block's carry only in the first
+iteration.
+
+**Cost.** It is small:
+
+- 2 kernels per group (the correction kernel and its classes);
+- cold starts within noise (Deva-Latn 3.1–3.4 s at 1 to 8 rounds, 3.6 s at 16);
+- no measurable run-time cost.
+
+**Not yet covered.** 31 contexts in 7 implementable transforms keep the warning
+("may match differently in the converted text"):
+
+- before contexts with unbounded repetitions, which are not fused (e.g. ky-ky_FONIPA's
+  `[^$consonant_sound y] $consonant_sound* $consonant_sound {`);
+- string rules in groups whose string rules must be selected or whose coverage
+  other rules need: el-el_Latn/BGN has 18. Its CLDR test file passes.
 
 ### 3.2 Robustness
 
@@ -462,10 +498,11 @@ The per-transform table lists the problem classes of every transform.
 ## 6. Recommended order
 
 1. **Correctness first.**
-   - Rewrite before contexts over converted text (§3.1).
+   - Extend the converted-text contexts (§3.1) to string rules that are selected
+     or covered.
    - In `tconv_coverage.py`, record exit status, carry warnings over to invoking
      transforms, and report "implementable but failing its tests" separately.
-   - Investigate pl-pl_FONIPA and ru-ja.
+   - Report the test data that disagrees with the rules (§3) to CLDR.
 2. **W3, finite expansion plus run collapse.** About 30 transforms, mostly through
    und_FONIPA-fa and InterIndic-Arabic.
 3. **W6 composition for Latin-InterIndic.** Up to 43 transforms, with Latin→Kana
@@ -502,6 +539,8 @@ tconv on every implementable transform.
 | `0e51d5a69` | fused rule kernels (tier A) |
 | `ed416e768` | tier-B contexts in the fused kernels |
 | `481afafb5` | SortRuns default of 2 parallel steps |
+| `6b6b08cb6` | Any-Hex/C |
+| (next) | before contexts matched against the converted text: failing CLDR test cases 14,511 → 378 |
 
 ## Reproducing
 

@@ -71,4 +71,6 @@ void JavaHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U
 
 void CHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
 
+void XMLHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+
 }

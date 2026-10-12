@@ -255,3 +255,90 @@ void kernel::UnicodeHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamS
 
     P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
 }
+
+class BixDecodeSurrogates final : public pablo::PabloKernel {
+public:
+    BixDecodeSurrogates(LLVMTypeSystemInterface & ts, StreamSet * bix2x16Data, StreamSet * UTF16_pairs, StreamSet * UTF16_valid);
+protected:
+    void generatePabloMethod() override;
+};
+
+BixDecodeSurrogates::BixDecodeSurrogates(LLVMTypeSystemInterface & ts,
+                                     StreamSet * bix2x16Data,
+                                     StreamSet * UTF16_pairs, StreamSet * UTF16_valid)
+        : PabloKernel(ts, "BixDecodeSurrogates",
+                      {Binding{"bix2x16Data", bix2x16Data}},
+                      {Binding{"UTF16_pairs", UTF16_pairs}, Binding{"UTF16_valid", UTF16_valid}}) {}
+
+void BixDecodeSurrogates::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    BixNumCompiler bnc(pb);
+    // Get the input stream sets.
+    std::vector<PabloAST *> bix2x16Data = getInputStreamSet("bix2x16Data");
+    PabloAST * firstUnits = pb.createRepeat(1, pb.getInteger(0x55, 8));
+    PabloAST * surrogate1 = pb.createAnd(firstUnits, bnc.EQ(bix2x16Data, 0));
+    std::vector<Var *> U16_bit(16);
+    for (unsigned i = 0; i < 16; i++) {
+        U16_bit[i] = pb.createVar("U16_" + std::to_string(i), bix2x16Data[i]);
+    }
+    auto nested = pb.createScope();
+    // nested scope calculations
+    BixNumCompiler bnc1(nested);
+    PabloAST * surrogate2 = nested.createAdvance(surrogate1, 1);
+    PabloAST * anySurrogate = nested.createOr(surrogate1, surrogate2);
+    const unsigned movedSurrogateBits = 6;
+    // UTF-16 representation: subtract 1 from the first surrogate and
+    // extract 4 bits, then bring in 6 bits from the second surrogate.
+    BixNum top4 = bnc.SubModular(bnc1.Truncate(bix2x16Data, 4), 1);
+    for (unsigned i = 0; i < 4; i++) {
+        PabloAST * bit_to_move = nested.createAnd(surrogate1, bix2x16Data[i]);
+        unsigned dest = i + movedSurrogateBits;
+        nested.createAssign(U16_bit[dest], nested.createOr(bix2x16Data[dest], bit_to_move));
+    }
+    //  Move bits from the second of the pair to the first.
+    for (unsigned i = 0; i < movedSurrogateBits; i++) {
+        unsigned base = 16 - movedSurrogateBits;
+        PabloAST * bitAhead = nested.createLookahead(bix2x16Data[base + i], 1);
+        nested.createAssign(U16_bit[i], nested.createOr(bix2x16Data[i], nested.createAnd(surrogate1, bitAhead)));
+    }
+    // Set the upper bits of surrogate units  0xD8xx/DCxx
+    nested.createAssign(U16_bit[15], nested.createOr(bix2x16Data[15], anySurrogate));
+    nested.createAssign(U16_bit[14], nested.createOr(bix2x16Data[14], anySurrogate));
+    nested.createAssign(U16_bit[13], nested.createAnd(bix2x16Data[13], nested.createNot(anySurrogate)));
+    nested.createAssign(U16_bit[12], nested.createOr(bix2x16Data[12], anySurrogate));
+    nested.createAssign(U16_bit[11], nested.createOr(bix2x16Data[11], anySurrogate));
+    nested.createAssign(U16_bit[10], nested.createOr(bix2x16Data[10], anySurrogate));
+    pb.createIf(surrogate1, nested);
+    writeOutputStreamSet("UTF16_pairs", U16_bit);
+    PabloAST * valid = pb.createOr(surrogate1, pb.createInFile(pb.createNot(firstUnits)));
+    writeOutputStreamSet("UTF16_valid", std::vector<PabloAST *>{valid});
+}
+
+void kernel::JavaHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
+
+    StreamSet * Bix2x16 = P.CreateStreamSet(16);
+    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+
+    StreamSet * UTF16_pairs = P.CreateStreamSet(16);
+    StreamSet * UTF16_valid = P.CreateStreamSet(1);
+    P.CreateKernelCall<BixDecodeSurrogates>(Bix2x16, UTF16_pairs, UTF16_valid);
+
+    StreamSet * UTF16_basis = P.CreateStreamSet(16);
+    FilterByMask(P, UTF16_valid, UTF16_pairs, UTF16_basis);
+
+    StreamSet * Bix4x8 = P.CreateStreamSet(8);
+    P.CreateKernelCall<BixSplit>(UTF16_basis, Bix4x8);
+
+    StreamSet * Bix8x4 = P.CreateStreamSet(4);
+    P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
+
+    StreamSet * Hex8 = P.CreateStreamSet(8);
+    StreamSet * filterMask = P.CreateStreamSet(1);
+    P.CreateKernelCall<UnicodeEscapedHex>(Bix8x4, Hex8, filterMask);
+
+    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    FilterByMask(P, filterMask, Hex8, EncodedU8);
+
+    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+}
+

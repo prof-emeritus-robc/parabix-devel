@@ -1033,14 +1033,16 @@ protected:
 //  kernels per rule.
 //
 //  The rules whose contexts are fixed sequences of sets (tier A: no repetition
-//  other than a fixed count, no alternatives of sequences) are matched in the
-//  fused kernel, without the regular expression engine: a match is the AND of
-//  the character classes of its text and contexts at fixed offsets from the
+//  other than a fixed count, no alternatives of sequences), or expand into a few
+//  of them (tier B: optional items and alternatives of sequences of different
+//  lengths, see ContextExpansion), are matched in the fused kernel, without the
+//  regular expression engine: a match is the AND of the character classes of
+//  its text and of one alternative of each context at fixed offsets from the
 //  first character of the text, before it by Advance, at and after it by the
-//  classes of the basis looked ahead.  An item of a context may also hold beyond
-//  the text, before its start or past its end (the text boundary, which negated
-//  sets include).  The other rules are matched by the engine, and their matches
-//  given to the fused kernels as input streams.
+//  classes looked ahead.  An item of a context may also hold beyond the text,
+//  before its start or past its end (the text boundary, which negated sets
+//  include).  The other rules (unbounded repetitions in contexts) are matched by
+//  the engine, and their matches given to the fused kernels as input streams.
 
 struct FusedItem {
     UCD::UnicodeSet chars;
@@ -1071,67 +1073,165 @@ static UCD::UnicodeSet setOfRE(re::RE * re) {
     return chars;
 }
 
-//  Appends the items of a context (as given for the regular expression engine,
-//  see ldml::engineContext), in text order, if it is a fixed sequence of sets.
-static bool appendFixedItems(re::RE * re, FusedContext & items) {
-    using namespace re;
-    if (re == nullptr) return true;
-    if (isSetRE(re)) {
-        items.push_back(FusedItem{setOfRE(re), false});
-        return true;
-    }
-    if (isa<Start>(re) || isa<End>(re)) {
-        items.push_back(FusedItem{UCD::UnicodeSet(), true});
-        return true;
-    }
-    if (Seq * seq = dyn_cast<Seq>(re)) {
-        for (RE * e : *seq) {
-            if (!appendFixedItems(e, items)) return false;
+//  The alternatives of a context: each a fixed sequence of items, which the
+//  context matches where one of them does.  A context without optional items
+//  (tier A) has one alternative; with bounded repetitions or alternations of
+//  sequences of different lengths (tier B), a few.
+using FusedContexts = std::vector<FusedContext>;
+
+//  At most this many alternatives of a context are matched in a fused kernel
+//  (more, and the context is matched by the regular expression engine).
+static constexpr size_t FusedMaxAlternatives = 32;
+
+namespace {
+
+//  The expansion of a context (as given for the regular expression engine, see
+//  ldml::engineContext) into alternatives, matching it outward from the text
+//  (forward for an after context, backward for a before context) as ICU does,
+//  with possessive repetitions (see ldml::possessiveContext): an optional item
+//  is taken where it matches, and skipped only where it does not (or beyond the
+//  text).  An alternative is built as the constraints at the positions outward
+//  from the text (position 0 adjacent to it); the constraints at a position
+//  combine by intersection.
+class ContextExpansion {
+public:
+    explicit ContextExpansion(bool before) : mBefore(before) {}
+    bool expand(re::RE * context, FusedContexts & alternatives) {
+        alternatives.clear();
+        mFailed = false;
+        std::vector<FusedContext> out;
+        std::vector<re::RE *> elements;
+        if (context) elements.push_back(context);
+        extend(elements, 0, FusedContext(), 0, out);
+        if (mFailed || out.size() > FusedMaxAlternatives) return false;
+        for (FusedContext & alt : out) {
+            //  (A before context in text order: farthest first.)
+            if (mBefore) std::reverse(alt.begin(), alt.end());
+            alternatives.push_back(std::move(alt));
         }
         return true;
     }
-    if (Alt * alt = dyn_cast<Alt>(re)) {
-        FusedItem item;
-        for (RE * a : *alt) {
-            if (isa<Start>(a) || isa<End>(a)) {
-                item.boundary = true;
-            } else if (isSetRE(a)) {
-                item.chars = item.chars + setOfRE(a);
-            } else {
-                return false;
+private:
+    //  The items of a fixed sequence (no optional parts) outward from the text,
+    //  if the element is one.
+    bool fixedItems(re::RE * re, FusedContext & items) {
+        ContextExpansion inner(mBefore);
+        FusedContexts alts;
+        if (!inner.expand(re, alts) || alts.size() != 1) return false;
+        items = alts.front();
+        if (mBefore) std::reverse(items.begin(), items.end());     // outward order
+        return true;
+    }
+    static bool constrain(FusedContext & alt, size_t pos, const FusedItem & item) {
+        if (alt.size() <= pos) alt.resize(pos + 1, FusedItem{UCD::UnicodeSet(0, 0x10FFFF), true});
+        alt[pos].chars = alt[pos].chars & item.chars;
+        alt[pos].boundary = alt[pos].boundary && item.boundary;
+        return !alt[pos].chars.empty() || alt[pos].boundary;
+    }
+    //  Extend the alternative alt (positions before pos assigned) by the
+    //  elements from index i (in outward order).
+    void extend(const std::vector<re::RE *> & elements, size_t i, FusedContext alt, size_t pos, std::vector<FusedContext> & out) {
+        using namespace re;
+        if (mFailed) return;
+        if (out.size() > FusedMaxAlternatives) {
+            mFailed = true;
+            return;
+        }
+        if (i == elements.size()) {
+            //  Positions beyond pos may hold the constraints of skipped items.
+            out.push_back(std::move(alt));
+            return;
+        }
+        RE * const e = elements[i];
+        auto rest = [&](std::vector<RE *> replacement) {
+            std::vector<RE *> next(replacement);
+            next.insert(next.end(), elements.begin() + i + 1, elements.end());
+            return next;
+        };
+        auto item = [&](FusedItem it) {
+            if (constrain(alt, pos, it)) extend(elements, i + 1, alt, pos + 1, out);
+        };
+        if (isSetRE(e)) {
+            item(FusedItem{setOfRE(e), false});
+        } else if (isa<Start>(e) || isa<End>(e)) {
+            item(FusedItem{UCD::UnicodeSet(), true});
+        } else if (Seq * seq = dyn_cast<Seq>(e)) {
+            std::vector<RE *> items(seq->begin(), seq->end());
+            if (mBefore) std::reverse(items.begin(), items.end());
+            extend(rest(items), 0, alt, pos, out);
+        } else if (Alt * a = dyn_cast<Alt>(e)) {
+            //  A set (with the boundary) is one item; otherwise each alternative.
+            bool sets = true;
+            FusedItem it;
+            for (RE * x : *a) {
+                if (isa<Start>(x) || isa<End>(x)) it.boundary = true;
+                else if (isSetRE(x)) it.chars = it.chars + setOfRE(x);
+                else sets = false;
             }
+            if (sets) {
+                item(it);
+            } else {
+                for (RE * x : *a) extend(rest({x}), 0, alt, pos, out);
+            }
+        } else if (Assertion * as = dyn_cast<Assertion>(e)) {
+            //  (?!X) or (?<!X): a character not in X, or the text boundary.
+            if (as->getSense() == Assertion::Sense::Negative && isSetRE(as->getAsserted())
+                    && (as->getKind() == Assertion::Kind::LookAhead || as->getKind() == Assertion::Kind::LookBehind)) {
+                item(FusedItem{UCD::UnicodeSet(0, 0x10FFFF) - setOfRE(as->getAsserted()), true});
+            } else {
+                mFailed = true;
+            }
+        } else if (Name * n = dyn_cast<Name>(e)) {
+            if (ldml::isFunctionCall(n) || n->getDefinition() == nullptr) mFailed = true;
+            else extend(rest({n->getDefinition()}), 0, alt, pos, out);
+        } else if (Capture * c = dyn_cast<Capture>(e)) {
+            extend(rest({c->getCapturedRE()}), 0, alt, pos, out);
+        } else if (Rep * r = dyn_cast<Rep>(e)) {
+            if (r->getUB() == Rep::UNBOUNDED_REP) {
+                mFailed = true;
+                return;
+            }
+            const int lb = r->getLB(), ub = r->getUB();
+            if (lb > 0 || ub > 1) {
+                //  x{lb,ub}: lb copies of x, then ub - lb optional copies.
+                std::vector<RE *> copies(lb, r->getRE());
+                for (int k = lb; k < ub; k++) copies.push_back(makeRep(r->getRE(), 0, 1));
+                extend(rest(copies), 0, alt, pos, out);
+                return;
+            }
+            if (ub == 0) {
+                extend(elements, i + 1, alt, pos, out);
+                return;
+            }
+            //  x?, x a fixed sequence of k items: taken where x matches; skipped
+            //  where x does not, at one of its k positions.
+            FusedContext body;
+            if (!fixedItems(r->getRE(), body)) {
+                mFailed = true;
+                return;
+            }
+            FusedContext taken = alt;
+            bool ok = true;
+            for (size_t k = 0; k < body.size() && ok; k++) ok = constrain(taken, pos + k, body[k]);
+            if (ok) extend(elements, i + 1, taken, pos + body.size(), out);
+            for (size_t k = 0; k < body.size(); k++) {
+                FusedContext skipped = alt;
+                FusedItem notItem{UCD::UnicodeSet(0, 0x10FFFF) - body[k].chars, !body[k].boundary};
+                if (constrain(skipped, pos + k, notItem)) extend(elements, i + 1, skipped, pos, out);
+            }
+        } else {
+            mFailed = true;
         }
-        items.push_back(item);
-        return true;
     }
-    if (Assertion * a = dyn_cast<Assertion>(re)) {
-        //  (?!X) or (?<!X): a character not in X, or the text boundary.
-        if (a->getSense() == Assertion::Sense::Negative && isSetRE(a->getAsserted())
-                && (a->getKind() == Assertion::Kind::LookAhead || a->getKind() == Assertion::Kind::LookBehind)) {
-            items.push_back(FusedItem{UCD::UnicodeSet(0, 0x10FFFF) - setOfRE(a->getAsserted()), true});
-            return true;
-        }
-        return false;
-    }
-    if (Name * n = dyn_cast<Name>(re)) {
-        if (ldml::isFunctionCall(n) || n->getDefinition() == nullptr) return false;
-        return appendFixedItems(n->getDefinition(), items);
-    }
-    if (Capture * c = dyn_cast<Capture>(re)) return appendFixedItems(c->getCapturedRE(), items);
-    if (Rep * rep = dyn_cast<Rep>(re)) {
-        if (rep->getUB() == Rep::UNBOUNDED_REP || rep->getLB() != rep->getUB()) return false;
-        for (int i = 0; i < rep->getLB(); i++) {
-            if (!appendFixedItems(rep->getRE(), items)) return false;
-        }
-        return true;
-    }
-    return false;
+    const bool mBefore;
+    bool mFailed = false;
+};
+
 }
 
-//  The items of a context, if it is a fixed sequence of sets (tier A).
-static bool fixedContext(re::RE * context, FusedContext & items) {
-    items.clear();
-    return appendFixedItems(context, items);
+//  The alternatives of a context, if they can be matched in a fused kernel.
+static bool fusedContexts(re::RE * context, bool before, FusedContexts & alternatives) {
+    return ContextExpansion(before).expand(context, alternatives);
 }
 
 //  A match stream given as input to a fused kernel: a stream of a stream set.
@@ -1147,7 +1247,7 @@ struct FusedMatchSource {
 struct FusedStringRule {
     std::vector<UCD::UnicodeSet> text;
     std::u32string replacement;
-    FusedContext before, after;
+    FusedContexts before{FusedContext()}, after{FusedContext()};
     int match = -1;
 };
 
@@ -1155,7 +1255,7 @@ struct FusedStringRule {
 //  contexts, or (match >= 0) given by an input stream of the positions where
 //  its rules match.  Its rules apply there within Allowed (or the mask).
 struct FusedSubgroup {
-    FusedContext before, after;
+    FusedContexts before{FusedContext()}, after{FusedContext()};
     std::vector<ldml::CharMapping> mappings;
     int match = -1;
 };
@@ -1196,7 +1296,7 @@ struct FusedLayout {
         for (const FusedStringRule & r : c.strings) {
             const unsigned n = r.text.size(), m = r.replacement.size();
             if (r.match < 0) {
-                lookahead = std::max<unsigned>(lookahead, n - 1 + r.after.size());
+                for (const FusedContext & a : r.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
                 maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
             }
             if (!c.matchOnly) {
@@ -1205,7 +1305,9 @@ struct FusedLayout {
             }
         }
         for (const FusedSubgroup & g : c.subgroups) {
-            if (g.match < 0) lookahead = std::max<unsigned>(lookahead, g.after.size());
+            if (g.match < 0) {
+                for (const FusedContext & a : g.after) lookahead = std::max<unsigned>(lookahead, a.size());
+            }
             for (const ldml::CharMapping & m : g.mappings) {
                 changePositions = std::max<unsigned>(changePositions, std::max<size_t>(m.replacement.size(), 1));
                 if (m.replacement.size() > 1) insertCounts.insert(m.replacement.size() - 1);
@@ -1295,8 +1397,10 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
     auto add = [&](const UCD::UnicodeSet & set) {
         if (!set.empty() && keys.insert(setKey(set)).second) sets.push_back(set);
     };
-    auto addContext = [&](const FusedContext & items) {
-        for (const FusedItem & item : items) add(item.chars);
+    auto addContext = [&](const FusedContexts & alternatives) {
+        for (const FusedContext & items : alternatives) {
+            for (const FusedItem & item : items) add(item.chars);
+        }
     };
     for (const FusedStringRule & r : c.strings) {
         if (r.match >= 0) continue;
@@ -1411,11 +1515,14 @@ private:
         for (const auto & r : set) s += std::to_string(r.first) + "-" + std::to_string(r.second) + ",";
         s += "]";
     }
-    static void appendContext(std::string & s, const FusedContext & items) {
+    static void appendContext(std::string & s, const FusedContexts & alternatives) {
         s += "(";
-        for (const FusedItem & item : items) {
-            appendSet(s, item.chars);
-            if (item.boundary) s += "$";
+        for (const FusedContext & items : alternatives) {
+            s += "|";
+            for (const FusedItem & item : items) {
+                appendSet(s, item.chars);
+                if (item.boundary) s += "$";
+            }
         }
         s += ")";
     }
@@ -1504,24 +1611,34 @@ void FusedRules::generatePabloMethod() {
     auto beforeStart = [&](unsigned offset) {
         return pb.createInFile(pb.createNot(pb.createAdvance(ones, offset)));
     };
-    //  The positions at which the before context matches the B items before
-    //  them, and the after context the items from an offset after them.
-    auto contexts = [&](const FusedContext & before, const FusedContext & after, unsigned afterOffset) {
-        PabloAST * m = ones;
-        const unsigned B = before.size();
-        for (unsigned k = 0; k < B; k++) {
-            const unsigned d = B - k;
-            PabloAST * item = pb.createAdvance(classAt(0, before[k].chars), d);
-            if (before[k].boundary) item = pb.createOr(item, beforeStart(d));
-            m = pb.createAnd(m, item);
+    //  The positions at which a before context matches the B items of one of
+    //  its alternatives before them, and an after context those of one of its
+    //  alternatives from an offset after them.
+    auto contexts = [&](const FusedContexts & before, const FusedContexts & after, unsigned afterOffset) {
+        PabloAST * beforeMatch = zeroes;
+        for (const FusedContext & alt : before) {
+            PabloAST * m = ones;
+            const unsigned B = alt.size();
+            for (unsigned k = 0; k < B; k++) {
+                const unsigned d = B - k;
+                PabloAST * item = pb.createAdvance(classAt(0, alt[k].chars), d);
+                if (alt[k].boundary) item = pb.createOr(item, beforeStart(d));
+                m = pb.createAnd(m, item);
+            }
+            beforeMatch = pb.createOr(beforeMatch, m);
         }
-        for (unsigned k = 0; k < after.size(); k++) {
-            const unsigned o = afterOffset + k;
-            PabloAST * item = classAt(o, after[k].chars);
-            if (after[k].boundary) item = pb.createOr(item, pastEnd(o));
-            m = pb.createAnd(m, item);
+        PabloAST * afterMatch = zeroes;
+        for (const FusedContext & alt : after) {
+            PabloAST * m = ones;
+            for (unsigned k = 0; k < alt.size(); k++) {
+                const unsigned o = afterOffset + k;
+                PabloAST * item = classAt(o, alt[k].chars);
+                if (alt[k].boundary) item = pb.createOr(item, pastEnd(o));
+                m = pb.createAnd(m, item);
+            }
+            afterMatch = pb.createOr(afterMatch, m);
         }
-        return m;
+        return pb.createAnd(beforeMatch, afterMatch);
     };
     auto source = [&](int match) -> PabloAST * {
         const FusedMatchSource & src = mConfig.sources[match];
@@ -2229,17 +2346,18 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     StreamSet * const mask = activeMask();
 
     //  Phase 1.  The matches of the string rules, at their first positions: of a
-    //  rule of tier A (see FusedRules), computed by the fused kernels; of another,
+    //  rule of tier A or B (see FusedRules), computed by the fused kernels; of another,
     //  by the regular expression engine (at its last character, shifted back).
     //  Within a filter, the n characters of a match must all be within the mask.
     const size_t numStringRules = step.stringRules.size();
-    std::vector<bool> tierA(numStringRules, false);
-    std::vector<FusedContext> befores(numStringRules), afters(numStringRules);
+    std::vector<bool> fusedMatch(numStringRules, false);
+    std::vector<FusedContexts> befores(numStringRules), afters(numStringRules);
     std::vector<std::pair<size_t, size_t>> lengths(numStringRules);
     for (size_t r = 0; r < numStringRules; r++) {
         const ldml::StringRule & rule = step.stringRules[r];
         lengths[r] = {texts[r].size(), rule.replacement.size()};
-        tierA[r] = !texts[r].empty() && fixedContext(rule.engineBefore, befores[r]) && fixedContext(rule.engineAfter, afters[r]);
+        fusedMatch[r] = !texts[r].empty() && fusedContexts(rule.engineBefore, true, befores[r])
+                   && fusedContexts(rule.engineAfter, false, afters[r]);
     }
     auto engineFirsts = [&](size_t r) {
         const ldml::StringRule & rule = step.stringRules[r];
@@ -2318,7 +2436,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         std::vector<SelectStringMatches::Source> firsts(rules.size());
         std::vector<size_t> fusedRules;
         for (size_t i = 0; i < rules.size(); i++) {
-            if (tierA[rules[i]]) {
+            if (fusedMatch[rules[i]]) {
                 fusedRules.push_back(rules[i]);
             } else {
                 firsts[i] = SelectStringMatches::Source{engineFirsts(rules[i]), 0};
@@ -2362,7 +2480,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         for (size_t r = 0; r < numStringRules; r++) {
             if (texts[r].empty()) continue;
             applying.push_back(r);
-            applied.push_back(tierA[r] ? FusedMatchSource{} : FusedMatchSource{engineFirsts(r), 0});
+            applied.push_back(fusedMatch[r] ? FusedMatchSource{} : FusedMatchSource{engineFirsts(r), 0});
         }
     }
 
@@ -2417,9 +2535,9 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             if (maps[g].empty()) continue;
             FusedSubgroup fg;
             fg.mappings = maps[g];
-            if (!fixedContext(subgroup.engineBefore, fg.before) || !fixedContext(subgroup.engineAfter, fg.after)) {
-                fg.before.clear();
-                fg.after.clear();
+            if (!fusedContexts(subgroup.engineBefore, true, fg.before) || !fusedContexts(subgroup.engineAfter, false, fg.after)) {
+                fg.before = {FusedContext()};
+                fg.after = {FusedContext()};
                 UCD::UnicodeSet all;
                 for (const ldml::CharMapping & m : maps[g]) all = all + m.chars;
                 fg.match = static_cast<int>(config.sources.size());

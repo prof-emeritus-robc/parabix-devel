@@ -50,12 +50,12 @@ MODES = {
     "whitespacesplit":           WhitespaceSplit(),
     "whitespace":                Whitespace(),
     "bytelevel":                 ByteLevel(add_prefix_space=False),
-    # "bert":                      BertPreTokenizer(),
+    "bert":                      BertPreTokenizer(),
     "punctuation":               Punctuation(),
     "digits":                    Digits(individual_digits=True),
     "chardelimiter":             CharDelimiterSplit(","),
     "sequence_whitespace_punct": Sequence([WhitespaceSplit(), Punctuation()]),
-    # "simplewordboundaries":      Split(pattern=Regex(r"\w+"), behavior="isolated"),
+    "simplewordboundaries":      Split(pattern=Regex(r"\w+"), behavior="isolated"),
     # uax29: no HF equivalent — appears in parabix-only / behavior tests only
 }
 
@@ -63,6 +63,21 @@ MODES = {
 PARABIX_FLAG = {
     "sequence_whitespace_punct": "sequence_whitespace_punctuation",
 }
+
+# Parabix --behavior= value -> HuggingFace Split(behavior=...) value. Both sides
+# expose the same 5-way enum (confirmed via tokenizers.pre_tokenizers.Split),
+# so this is a real differential check, not a Parabix-only concept.
+BEHAVIOR_MAP = {
+    "removed":            "removed",
+    "isolated":           "isolated",
+    "mergedwithprevious": "merged_with_previous",
+    "mergedwithnext":     "merged_with_next",
+    "contiguous":         "contiguous",
+}
+# Pattern shared by both sides: the same \w+ rule "simplewordboundaries" uses,
+# confirmed correct against HF (see MODES["simplewordboundaries"] above) --
+# so a mismatch here isolates a behavior-kernel bug, not a pattern bug.
+BEHAVIOR_PATTERN = Regex(r"\w+")
 
 # ---------------------------------------------------------------------------
 # Tee: write to terminal and file simultaneously
@@ -180,6 +195,46 @@ def run_compare(out, lines: list[str], requested: list[str]) -> dict[str, str]:
     return results
 
 
+def run_behavior_compare(out, lines: list[str]) -> dict[str, str]:
+    r"""Differential check of all 5 --behavior= values against HF's
+    Split(Regex(r"\w+"), behavior=X) -- same pattern as simplewordboundaries,
+    already confirmed correct, so a mismatch here isolates a behavior-kernel
+    bug rather than a boundary-detection bug. Per-line, same reason as
+    run_compare (newline is a hard Parabix pretoken boundary)."""
+    results = {}
+    for num, (pbx_behavior, hf_behavior) in enumerate(BEHAVIOR_MAP.items(), 1):
+        hf_split = Split(pattern=BEHAVIOR_PATTERN, behavior=hf_behavior)
+        mismatches = []
+        for li, line in enumerate(lines):
+            parabix = run_parabix("simplewordboundaries", line, behavior=pbx_behavior)
+            hf      = run_hf(hf_split, line)
+            if parabix != hf:
+                mismatches.append((li, line, parabix, hf))
+
+        status = "MATCH" if not mismatches else "MISMATCH"
+        results[pbx_behavior] = status
+
+        out.write(SEP + "\n")
+        out.write(f"Behavior Test {num}: {pbx_behavior}  (HF: {hf_behavior})  →  {status}\n")
+        out.write(SEP + "\n")
+        out.write(f"  Lines tested:  {len(lines)}\n")
+        out.write(f"  Lines matched: {len(lines) - len(mismatches)}\n")
+        out.write(f"  Lines failed:  {len(mismatches)}\n\n")
+
+        for li, line, parabix, hf in mismatches[:3]:
+            out.write(f"  --- mismatch at line {li} ---\n")
+            out.write(f"  Input:          {repr(line)}\n")
+            out.write(f"  Parabix tokens: {len(parabix)}\n")
+            out.write(f"  HF tokens:      {len(hf)}\n\n")
+            write_diff_summary(out, parabix, hf)
+            write_comparison(out, parabix, hf)
+            out.write("\n")
+        if len(mismatches) > 3:
+            out.write(f"  ... and {len(mismatches) - 3} more mismatching lines\n\n")
+
+    return results
+
+
 def run_hf_only(out, text: str, requested: list[str]) -> None:
     """Run HuggingFace pre-tokenizers only."""
     for num, mode in enumerate(requested, 1):
@@ -219,12 +274,18 @@ def run_parabix_only(out, text: str, requested: list[str]) -> dict[str, str]:
         root  = tree.getroot()
         cases = [tc for tc in root.findall("tokenizercase") if tc.get("behavior")]
 
+        # Each case's own <inputdata id="..."> text, not the --input file --
+        # these counts were calibrated against this fixture's short multi-script
+        # string, not whatever corpus happens to be loaded for the other tests.
+        inputs = {el.get("id"): el.text.strip() for el in root.findall("inputdata")}
+
         passed = failed = 0
         for num, tc in enumerate(cases, 1):
             mode     = tc.get("pretokenizer")
             behavior = tc.get("behavior")
             expected = int(tc.get("expectedcount"))
-            tokens   = run_parabix(mode, text, behavior)
+            case_text = inputs.get(tc.get("inputdata"), text)
+            tokens   = run_parabix(mode, case_text, behavior)
             actual   = len(tokens)
             status   = "PASS" if actual == expected else "FAIL"
             results[f"{mode}+{behavior}"] = status
@@ -270,6 +331,10 @@ def main() -> None:
                         help="Run HuggingFace pre-tokenizers only")
     parser.add_argument("--parabix-only", action="store_true",
                         help="Run Parabix pre-tokenizers only (includes behavior tests)")
+    parser.add_argument("--behaviors",    action="store_true",
+                        help="Differential check of all 5 --behavior= values against "
+                             "HF's Split(Regex(r'\\w+'), behavior=X), instead of the "
+                             "per-mode comparison")
     parser.add_argument("modes",          nargs="*",
                         help="Specific modes to test (default: all)")
     parser.add_argument("--tokenizer",    default=DEFAULT_TOKENIZER,
@@ -311,6 +376,9 @@ def main() -> None:
             run_hf_only(out, text, requested)
         elif args.parabix_only:
             results = run_parabix_only(out, text, requested)
+            write_summary(out, results)
+        elif args.behaviors:
+            results = run_behavior_compare(out, lines)
             write_summary(out, results)
         else:
             results = run_compare(out, lines, requested)

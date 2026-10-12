@@ -67,6 +67,14 @@ void SpreadByMask(PipelineBuilder & P,
                   StreamExpandOptimization opt,
                   unsigned expansionFieldWidth,
                   ProcessingRateProbabilityDistribution itemsPerOutputUnit) {
+    if (LLVM_UNLIKELY(isa<RepeatingStreamSet>(mask))) {
+        if (LLVM_UNLIKELY(zeroExtend)) {
+            report_fatal_error("SpreadByMask: a repeating mask cannot be used with zeroExtend");
+        }
+        StreamSet * const truncated = P.CreateStreamSet(1);
+        P.CreateKernelCall<TruncateRepeatingMask>(mask, toSpread, truncated);
+        mask = truncated;
+    }
     if (toSpread->getFieldWidth() < 8) {
         unsigned streamCount = outputs->getNumElements();
         StreamSet * const expanded = P.CreateStreamSet(streamCount);
@@ -90,6 +98,128 @@ void SpreadByMask(PipelineBuilder & P,
             P.CreateKernelCall<ByteSpreadByMaskKernel>(toSpread, mask, outputs, offset);
         }
     }
+}
+
+TruncateRepeatingMask::TruncateRepeatingMask(LLVMTypeSystemInterface & ts,
+                                             StreamSet * mask, StreamSet * source, StreamSet * truncated)
+: MultiBlockKernel(ts, "TruncateRepeatingMask",
+{Bind("mask", mask, Principal()), Bind("source", source, PopcountOf("mask"))},
+{Bind("truncated", truncated, BoundedRate(0, 1))},
+{}, {}, {}) {
+    setStride(ts.getBitBlockWidth());
+}
+
+void TruncateRepeatingMask::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) {
+    const unsigned bw = b.getBitBlockWidth();
+    Type * const sizeTy = b.getSizeTy();
+    Type * const i64Ty = b.getInt64Ty();
+    Constant * const ZERO = b.getSize(0);
+    Constant * const ONE = b.getSize(1);
+    Constant * const BLOCK_WIDTH = b.getSize(bw);
+    Constant * const WORDS_PER_BLOCK = b.getSize(bw / 64);
+    Value * const produced = b.getProducedItemCount("truncated");
+    BasicBlock * const entry = b.GetInsertBlock();
+
+    //  Copy the mask.
+    BasicBlock * const copyLoop = b.CreateBasicBlock("copyLoop");
+    BasicBlock * const copyDone = b.CreateBasicBlock("copyDone");
+    b.CreateCondBr(b.CreateICmpEQ(numOfStrides, ZERO), copyDone, copyLoop);
+    b.SetInsertPoint(copyLoop);
+    PHINode * const blockNo = b.CreatePHI(sizeTy, 2);
+    blockNo->addIncoming(ZERO, entry);
+    b.storeOutputStreamBlock("truncated", b.getInt32(0), blockNo, b.loadInputStreamBlock("mask", b.getInt32(0), blockNo));
+    Value * const nextBlock = b.CreateAdd(blockNo, ONE);
+    blockNo->addIncoming(nextBlock, copyLoop);
+    b.CreateCondBr(b.CreateICmpULT(nextBlock, numOfStrides), copyLoop, copyDone);
+
+    b.SetInsertPoint(copyDone);
+    Value * const copied = b.CreateMul(numOfStrides, BLOCK_WIDTH);
+    BasicBlock * const notFinal = b.CreateBasicBlock("notFinal");
+    BasicBlock * const finalCall = b.CreateBasicBlock("final");
+    BasicBlock * const segmentDone = b.CreateBasicBlock("done");
+    b.CreateCondBr(b.isFinal(), finalCall, notFinal);
+
+    b.SetInsertPoint(notFinal);
+    b.setProducedItemCount("truncated", b.CreateAdd(produced, copied));
+    b.CreateBr(segmentDone);
+
+    //  Final: find the 1 bit of the mask that selects the last source item,
+    //  scanning the copied mask 64 bits at a time.
+    b.SetInsertPoint(finalCall);
+    Value * const remaining = b.CreateSub(b.getAvailableItemCount("source"), b.getProcessedItemCount("source"));
+    Value * const totalWords = b.CreateMul(numOfStrides, WORDS_PER_BLOCK);
+    Value * const words = b.CreatePointerCast(b.getOutputStreamBlockPtr("truncated", b.getInt32(0), ZERO), PointerType::getUnqual(b.getContext()));
+    BasicBlock * const scanLoop = b.CreateBasicBlock("scanLoop");
+    BasicBlock * const scanNext = b.CreateBasicBlock("scanNext");
+    BasicBlock * const found = b.CreateBasicBlock("found");
+    BasicBlock * const clearLoop = b.CreateBasicBlock("clearLoop");
+    BasicBlock * const clearDone = b.CreateBasicBlock("clearDone");
+    BasicBlock * const setCut = b.CreateBasicBlock("setCut");
+    BasicBlock * const zeroLoop = b.CreateBasicBlock("zeroLoop");
+    BasicBlock * const zeroDone = b.CreateBasicBlock("zeroDone");
+    b.CreateCondBr(b.CreateOr(b.CreateICmpEQ(remaining, ZERO), b.CreateICmpEQ(totalWords, ZERO)), setCut, scanLoop);
+
+    b.SetInsertPoint(scanLoop);
+    PHINode * const wordIdx = b.CreatePHI(sizeTy, 2);
+    PHINode * const toFind = b.CreatePHI(sizeTy, 2);
+    wordIdx->addIncoming(ZERO, finalCall);
+    toFind->addIncoming(remaining, finalCall);
+    Value * const word = b.CreateLoad(i64Ty, b.CreateGEP(i64Ty, words, wordIdx));
+    Value * const count = b.CreateZExtOrTrunc(b.CreatePopcount(word), sizeTy);
+    b.CreateCondBr(b.CreateICmpUGE(count, toFind), found, scanNext);
+
+    b.SetInsertPoint(scanNext);
+    Value * const nextWord = b.CreateAdd(wordIdx, ONE);
+    wordIdx->addIncoming(nextWord, scanNext);
+    toFind->addIncoming(b.CreateSub(toFind, count), scanNext);
+    //  If the mask has too few 1 bits, keep all of it.
+    b.CreateCondBr(b.CreateICmpULT(nextWord, totalWords), scanLoop, setCut);
+
+    //  Clear the lowest toFind - 1 bits of the word; the cut follows the lowest remaining one.
+    b.SetInsertPoint(found);
+    Value * const initialToClear = b.CreateSub(toFind, ONE);
+    b.CreateBr(clearLoop);
+    b.SetInsertPoint(clearLoop);
+    PHINode * const bits = b.CreatePHI(i64Ty, 2);
+    PHINode * const toClear = b.CreatePHI(sizeTy, 2);
+    bits->addIncoming(word, found);
+    toClear->addIncoming(initialToClear, found);
+    BasicBlock * const clearOne = b.CreateBasicBlock("clearOne");
+    b.CreateCondBr(b.CreateICmpEQ(toClear, ZERO), clearDone, clearOne);
+    b.SetInsertPoint(clearOne);
+    bits->addIncoming(b.CreateAnd(bits, b.CreateSub(bits, b.getInt64(1))), clearOne);
+    toClear->addIncoming(b.CreateSub(toClear, ONE), clearOne);
+    b.CreateBr(clearLoop);
+    b.SetInsertPoint(clearDone);
+    Value * const bitPos = b.CreateZExtOrTrunc(b.CreateCountForwardZeroes(bits, "", true), sizeTy);
+    Value * const foundCut = b.CreateAdd(b.CreateMul(wordIdx, b.getSize(64)), b.CreateAdd(bitPos, ONE));
+    b.CreateBr(setCut);
+
+    //  Zero the mask bits after the cut, so that kernels reading whole blocks see no more 1 bits.
+    b.SetInsertPoint(setCut);
+    PHINode * const cut = b.CreatePHI(sizeTy, 4);
+    cut->addIncoming(ZERO, finalCall);
+    cut->addIncoming(copied, scanNext);
+    cut->addIncoming(foundCut, clearDone);
+    Value * const cutWord = b.CreateUDiv(cut, b.getSize(64));
+    Value * const keepBits = b.CreateZExtOrTrunc(b.CreateURem(cut, b.getSize(64)), i64Ty);
+    b.CreateCondBr(b.CreateICmpULT(cutWord, totalWords), zeroLoop, zeroDone);
+    b.SetInsertPoint(zeroLoop);
+    PHINode * const zeroIdx = b.CreatePHI(sizeTy, 2);
+    zeroIdx->addIncoming(cutWord, setCut);
+    Value * const zeroPtr = b.CreateGEP(i64Ty, words, zeroIdx);
+    //  In the word of the cut, keep the bits below it; zero the later words entirely.
+    Value * const lowMask = b.CreateSub(b.CreateShl(b.getInt64(1), keepBits), b.getInt64(1));
+    Value * const keep = b.CreateSelect(b.CreateICmpEQ(zeroIdx, cutWord), lowMask, b.getInt64(0));
+    b.CreateStore(b.CreateAnd(b.CreateLoad(i64Ty, zeroPtr), keep), zeroPtr);
+    Value * const nextZero = b.CreateAdd(zeroIdx, ONE);
+    zeroIdx->addIncoming(nextZero, zeroLoop);
+    b.CreateCondBr(b.CreateICmpULT(nextZero, totalWords), zeroLoop, zeroDone);
+    b.SetInsertPoint(zeroDone);
+    b.setProducedItemCount("truncated", b.CreateAdd(produced, cut));
+    b.CreateBr(segmentDone);
+
+    b.SetInsertPoint(segmentDone);
 }
 
 //  TODO:  Consider adding toFill parameter to SpreadByMask so that filter expansion

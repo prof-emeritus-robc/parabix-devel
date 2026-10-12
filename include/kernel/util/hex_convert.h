@@ -73,4 +73,6 @@ void CHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_
 
 void XMLHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
 
+void PerlHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+
 }

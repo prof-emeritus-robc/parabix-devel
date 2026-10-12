@@ -648,3 +648,125 @@ void kernel::XMLHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet *
 
     P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
 }
+
+class PerlEscapedHex final : public pablo::PabloKernel {
+public:
+    PerlEscapedHex(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * spreadMask,
+                                              StreamSet * hexBasis, StreamSet * filterMask);
+protected:
+    void generatePabloMethod() override;
+};
+
+PerlEscapedHex::PerlEscapedHex(LLVMTypeSystemInterface & ts,
+                                     StreamSet * bix4Data, StreamSet * spreadMask,
+                                     StreamSet * hexBasis, StreamSet * filterMask)
+        : PabloKernel(ts, "PerlEscapedHex",
+                      {Binding{"bix4Data", bix4Data, FixedRate(), LookAhead(1)},
+                       Binding{"spreadMask", spreadMask, FixedRate(), LookAhead(2)}},
+                      {Binding{"hexBasis", hexBasis}, Binding{"filterMask", filterMask}}) {}
+
+void PerlEscapedHex::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    BixNumCompiler bnc(pb);
+    // Get the input stream sets.
+    std::vector<PabloAST *> bix4Data = getInputStreamSet("bix4Data");
+    //
+    // Data bits must move ahead 1 position to make way for the
+    // final semicolon.
+    std::vector<PabloAST *> bixDataAhead1(4);
+    for (unsigned i = 0; i < 4; i++) {
+        bixDataAhead1[i] = pb.createLookahead(bix4Data[i], 1);
+    }
+    // Now convert the 4-bit bixnum values to an 8-bit hex-ASCII basis.
+    BixNum hexBasis = Bix4toASCII_Hex(pb, bixDataAhead1);
+
+    PabloAST * spreadMask = getInputStreamSet("spreadMask")[0];
+    // The spreadmask for a group of 10 is .1.1111111
+    PabloAST * startOf8 = pb.createEveryNth(spreadMask, pb.getInteger(8), "startOf8");
+    PabloAST * startOf10 = pb.createInFile(pb.createNot(pb.createOr(spreadMask, pb.createLookahead(spreadMask, 2)), "startOf10"));
+    startOf8 = pb.createAnd(startOf8, pb.createNot(pb.createAdvance(startOf10, 1)), "startOf8_2");
+
+    // Mark positions for prefixing encoded values with "\x{"
+    PabloAST * escapePos = pb.createOr(startOf10, startOf8);
+    PabloAST * pos2 = pb.createAdvance(escapePos, 1);
+    PabloAST * pos3 = pb.createAdvance(pos2, 1);
+    // Mark the position of the final digit, as well as the
+    // position to receive the trailing semicolon.
+    PabloAST * lastDigitPos = pb.createOr(pb.createAdvance(startOf10, 8),
+                                         pb.createAdvance(startOf8, 6));
+    PabloAST * closingPos = pb.createAdvance(lastDigitPos, 1);
+
+    // At each escapePos position, we need a \ (0x5c)
+    // Note: hexBasis value is digit 0 (0x30).
+    hexBasis[6] = pb.createOr(hexBasis[6], escapePos);
+    hexBasis[5] = pb.createXor(hexBasis[5], escapePos);  // flip bit 5
+    hexBasis[3] = pb.createOr(hexBasis[3], escapePos);
+    hexBasis[2] = pb.createOr(hexBasis[2], escapePos);
+
+    // At pos2, encode ASCII x = 0x78, given hexBasis value is 0x30.
+    hexBasis[6] = pb.createOr(hexBasis[6], pos2);
+    hexBasis[3] = pb.createOr(hexBasis[3], pos2);
+
+    // At pos3, encode ASCII { = 0x7b, given hexBasis value is 0x30.
+    hexBasis[6] = pb.createOr(hexBasis[6], pos3);
+    hexBasis[3] = pb.createOr(hexBasis[3], pos3);
+    hexBasis[1] = pb.createOr(hexBasis[1], pos3);
+    hexBasis[0] = pb.createOr(hexBasis[0], pos3);
+
+    // At closingPos, encode ASCII } = 0x7d, aware that any
+    // hex value may be at this location.
+    hexBasis[6] = pb.createOr(hexBasis[6], closingPos);
+    hexBasis[5] = pb.createOr(hexBasis[5], closingPos);
+    hexBasis[4] = pb.createOr(hexBasis[4], closingPos);
+    hexBasis[3] = pb.createOr(hexBasis[3], closingPos);
+    hexBasis[2] = pb.createOr(hexBasis[2], closingPos);
+    hexBasis[1] = pb.createAnd(hexBasis[1], pb.createNot(closingPos));
+    hexBasis[0] = pb.createOr(hexBasis[0], closingPos);
+
+    //
+    // Now create a filter mask to delete all leading zeroes (except for
+    // the least significant position - &#x0; encodes codepoint 0.
+    PabloAST * isZero = bnc.EQ(bixDataAhead1, 0);
+    PabloAST * mayDelete = pb.createAnd(isZero, pb.createNot(lastDigitPos));
+    PabloAST * firstZero = pb.createAnd(isZero, pb.createAdvance(pos3, 1));
+    PabloAST * toDelete = pb.createAnd(pb.createMatchStar(firstZero, mayDelete), mayDelete);
+    PabloAST * filterMask = pb.createInFile(pb.createNot(toDelete));
+    //
+    writeOutputStreamSet("hexBasis", hexBasis);
+    writeOutputStreamSet("filterMask", std::vector<PabloAST *>{filterMask});
+}
+
+void kernel::PerlHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
+
+    StreamSet * Bix2x16 = P.CreateStreamSet(16);
+    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+
+    StreamSet * Bix4x8 = P.CreateStreamSet(8);
+    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    StreamSet * Bix8x4 = P.CreateStreamSet(4);
+    P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
+
+    // When a codepoint above 0xFFFFF exists, we need 10 total
+    // positions for the hex encoding.  Nine positions are needed
+    // for codepoints in the range 0x10000-0xFFFFF.  However,
+    // it is safe and simpler to expand to length 10 for both.
+    StreamSet * insertMarks = P.CreateStreamSet(1);
+    P.CreateKernelCall<CHexInsertMarks>(Bix8x4, insertMarks);
+
+    StreamSet * spreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, insertMarks, spreadMask, kernel::InsertPosition::Before);
+
+    StreamSet * expandedBix4 = P.CreateStreamSet(4);
+    SpreadByMask(P, spreadMask, Bix8x4, expandedBix4);
+
+    StreamSet * Hex8 = P.CreateStreamSet(8);
+    StreamSet * filterMask = P.CreateStreamSet(1);
+
+    P.CreateKernelCall<PerlEscapedHex>(expandedBix4, spreadMask, Hex8, filterMask);
+
+    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    FilterByMask(P, filterMask, Hex8, EncodedU8);
+
+    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+}

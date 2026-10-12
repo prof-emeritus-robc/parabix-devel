@@ -121,7 +121,7 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode, HexC, HexXML};
+enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode, HexC, HexXML, HexPerl};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
@@ -129,7 +129,7 @@ static const std::vector<std::pair<std::string, Transform>> implementedTransform
     {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title},
     {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},
     {"Any-Hex/Unicode", Transform::HexUnicode}, {"Any-Hex/C", Transform::HexC},
-    {"Any-Hex/XML", Transform::HexXML},
+    {"Any-Hex/XML", Transform::HexXML},  {"Any-Hex/Perl", Transform::HexPerl},
 };
 
 //  Basis bits of a byte stream.
@@ -450,7 +450,8 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
         case Transform::HexUnicode:
         case Transform::HexC:
         case Transform::HexXML:
-            llvm::report_fatal_error("tconv: Any-Title and Any-Hex (/Java, /Unicode, /C, /XML) are implemented by the rule pipeline");
+        case Transform::HexPerl:
+            llvm::report_fatal_error("tconv: Any-Title and Any-Hex (/Java, /Unicode, /C, /XML, /Perl) are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -2300,6 +2301,7 @@ private:
     StreamSet * hexUnicode(StreamSet * U21);
     StreamSet * hexC(StreamSet * U21);
     StreamSet * hexXML(StreamSet * U21);
+    StreamSet * hexPerl(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
@@ -2429,6 +2431,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Hex/Unicode") return hexUnicode(U21);
     if (name == "Any-Hex/C") return hexC(U21);
     if (name == "Any-Hex/XML") return hexXML(U21);
+    if (name == "Any-Hex/Perl") return hexPerl(U21);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
 
@@ -2586,6 +2589,28 @@ StreamSet * RulePipelineBuilder::hexXML(StreamSet * U21) {
         PipelineBuilder & P = mP;
         StreamSet * const Hex = P.CreateStreamSet(21, 1);
         XMLHexPipeline(P, Selected, Hex);
+        SHOW_BIXNUM(Hex);
+        return Hex;
+    });
+}
+
+//  Any-Hex/Perl: each basic mulitplane character encoded as &#x<hexdigit>+;
+//  where leading zeroes are deleted from <hexdigit>s, except for the last --
+//  a context-free, single-character mapping, so within a mask only the
+//  masked characters need be converted (localCharacterMapping).
+StreamSet * RulePipelineBuilder::hexPerl(StreamSet * U21) {
+    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
+        {5, UCD::UnicodeSet(0x0, 0xF)},            // \x{ and 1 digit and }
+        {6, UCD::UnicodeSet(0x10, 0xFF)},          // \x{ and 2 digits and }
+        {7, UCD::UnicodeSet(0x100, 0xFFF)},        // \x{ and 3 digits and }
+        {8, UCD::UnicodeSet(0x1000, 0xFFFF)},      // \x{ and 4 digits and }
+        {8, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // \x{ and 5 digits and }
+        {10, UCD::UnicodeSet(0x100000, 0x10FFFF)}, // \x{ and 6 digits and }
+    };
+    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
+        PipelineBuilder & P = mP;
+        StreamSet * const Hex = P.CreateStreamSet(21, 1);
+        PerlHexPipeline(P, Selected, Hex);
         SHOW_BIXNUM(Hex);
         return Hex;
     });
@@ -3411,7 +3436,8 @@ int main(int argc, char *argv[]) {
     const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower
                         && impl->second != Transform::Title && impl->second != Transform::HexJava
                         && impl->second != Transform::HexUnicode
-                        && impl->second != Transform::HexC && impl->second != Transform::HexXML;
+                        && impl->second != Transform::HexC && impl->second != Transform::HexXML
+                        && impl->second != Transform::HexPerl;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
     fn(fd);

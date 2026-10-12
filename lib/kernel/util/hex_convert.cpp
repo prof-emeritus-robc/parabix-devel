@@ -397,3 +397,133 @@ void kernel::JavaHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet 
 
     P.CreateKernelCall<ZeroExtendASCII_to_U21>(Hex8, U21_out);
 }
+
+class CHexInsertMarks final : public pablo::PabloKernel {
+public:
+    CHexInsertMarks(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * insertMarks);
+protected:
+    void generatePabloMethod() override;
+};
+
+CHexInsertMarks::CHexInsertMarks(LLVMTypeSystemInterface & ts,
+                                     StreamSet * bix4Data,
+                                     StreamSet * insertMarks)
+        : PabloKernel(ts, "CHexInsertMarks",
+                      {Binding{"bix4Data", bix4Data, FixedRate(), LookAhead(3)}},
+                      {Binding{"insertMarks", insertMarks}}) {}
+
+void CHexInsertMarks::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    BixNumCompiler bnc(pb);
+    // Get the input stream sets.
+    std::vector<PabloAST *> bix4Data = getInputStreamSet("bix4Data");
+    //
+    // Identify the start of each 8 x 4bit group.
+    PabloAST * startMarks = pb.createRepeat(1, pb.getInteger(0x01, 8));
+    //
+    // We have 8 positions of 4-bit data, which must be expanded to
+    // 10 positions when the codedpoint is 0x10000 or greater.
+    // This will occur whenever the 3rd or 4th 4-bit bixnum is
+    // non-zero.  Calculate at the startMarks position.
+    std::vector<PabloAST *> bixDataAhead2(4);
+    std::vector<PabloAST *> bixDataAhead3(4);
+    for (unsigned i = 0; i < 4; i++) {
+        bixDataAhead2[i] = pb.createLookahead(bix4Data[i], 2);
+        bixDataAhead3[i] = pb.createLookahead(bix4Data[i], 3);
+    }
+    PabloAST * above0x10000 =
+        pb.createAnd(startMarks, pb.createOr(bnc.NEQ(bixDataAhead2, 0),
+                                             bnc.NEQ(bixDataAhead3, 0)));
+    PabloAST * insertMarks = pb.createOr(above0x10000, pb.createAdvance(above0x10000, 1));
+    writeOutputStreamSet("insertMarks", std::vector<PabloAST *>{insertMarks});
+}
+
+class CEscapedHex final : public pablo::PabloKernel {
+public:
+    CEscapedHex(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * spreadMask,
+                                              StreamSet * hexBasis, StreamSet * filterMask);
+protected:
+    void generatePabloMethod() override;
+};
+
+CEscapedHex::CEscapedHex(LLVMTypeSystemInterface & ts,
+                                     StreamSet * bix4Data, StreamSet * spreadMask,
+                                     StreamSet * hexBasis, StreamSet * filterMask)
+        : PabloKernel(ts, "CEscapedHex",
+                      {Binding{"bix4Data", bix4Data}, Binding{"spreadMask", spreadMask, FixedRate(), LookAhead(2)}},
+                      {Binding{"hexBasis", hexBasis}, Binding{"filterMask", filterMask}}) {}
+
+void CEscapedHex::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    BixNumCompiler bnc(pb);
+    // Get the input stream sets.
+    std::vector<PabloAST *> bix4Data = getInputStreamSet("bix4Data");
+    //
+    // First convert the 4-bit bixnum values to an 8-bit hex-ASCII basis.
+    BixNum hexBasis = Bix4toASCII_Hex(pb, bix4Data);
+
+    PabloAST * spreadMask = getInputStreamSet("spreadMask")[0];
+    // The spreadmask for a group of 10 is .1.1111111
+    PabloAST * startOf8 = pb.createEveryNth(spreadMask, pb.getInteger(8), "startOf8");
+    PabloAST * startOf10 = pb.createInFile(pb.createNot(pb.createOr(spreadMask, pb.createLookahead(spreadMask, 2)), "startOf10"));
+    startOf8 = pb.createAnd(startOf8, pb.createNot(pb.createAdvance(startOf10, 1)), "startOf8_2");
+    PabloAST * escapePos = pb.createOr(startOf10, startOf8);
+
+    // At each escapePos position, we need an \ (0x5c)
+    // Note: hexBasis value is digit 0 (0x30);
+    hexBasis[6] = pb.createOr(hexBasis[6], escapePos);
+    hexBasis[5] = pb.createXor(hexBasis[5], escapePos);  // flip bit 5
+    hexBasis[3] = pb.createOr(hexBasis[3], escapePos);
+    hexBasis[2] = pb.createOr(hexBasis[2], escapePos);
+
+    PabloAST * big_U = pb.createAdvance(startOf10, 1);
+    PabloAST * small_u = pb.createAdvance(startOf8, 1);
+    PabloAST * uU = pb.createOr(big_U, small_u);
+
+    // Encode ASCII U/u = 0x55/0x75, given hexBasis value is digit 0 (0x30);
+    hexBasis[6] = pb.createOr(hexBasis[6], uU);
+    hexBasis[5] = pb.createXor(hexBasis[5], big_U);  // flip bit 5 for 0x55
+    hexBasis[2] = pb.createOr(hexBasis[2], uU);
+    hexBasis[0] = pb.createOr(hexBasis[0], uU);
+    //
+    // Now create a filter mask to delete 2 positions after \u
+    PabloAST * delMarks = pb.createOr(pb.createAdvance(small_u, 1), pb.createAdvance(small_u, 2));
+    PabloAST * filterMask = pb.createInFile(pb.createNot(delMarks));
+    //
+    writeOutputStreamSet("hexBasis", hexBasis);
+    writeOutputStreamSet("filterMask", std::vector<PabloAST *>{filterMask});
+}
+
+void kernel::CHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
+
+    StreamSet * Bix2x16 = P.CreateStreamSet(16);
+    P.CreateKernelCall<BixSplit>(U21_in, Bix2x16);
+
+    StreamSet * Bix4x8 = P.CreateStreamSet(8);
+    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    StreamSet * Bix8x4 = P.CreateStreamSet(4);
+    P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
+
+    // When a supplementary plane character exists, we need 10 total
+    // positions for the hex encoding.  Account for this by marking
+    // the first two positions for insertion.
+    StreamSet * insertMarks = P.CreateStreamSet(1);
+    P.CreateKernelCall<CHexInsertMarks>(Bix8x4, insertMarks);
+
+    StreamSet * spreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, insertMarks, spreadMask, kernel::InsertPosition::Before);
+
+    StreamSet * expandedBix4 = P.CreateStreamSet(4);
+    SpreadByMask(P, spreadMask, Bix8x4, expandedBix4);
+
+    StreamSet * Hex8 = P.CreateStreamSet(8);
+    StreamSet * filterMask = P.CreateStreamSet(1);
+    //
+    P.CreateKernelCall<CEscapedHex>(expandedBix4, spreadMask, Hex8, filterMask);
+
+    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    FilterByMask(P, filterMask, Hex8, EncodedU8);
+
+    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+}

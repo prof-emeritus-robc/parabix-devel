@@ -69,4 +69,6 @@ void UnicodeHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet 
 
 void JavaHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
 
+void CHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+
 }

@@ -33,6 +33,7 @@
 //      Any-Hex/Java        each character first decoded to UTF-16 and then
 //                          each code unit as \u and 4 hex digits
 //      Any-Hex             == Any-Hex/Java
+//      Any-Hex/C           \uXXXX for codepoints < 0x10000, otherwise \UXXXXXXXX
 //      Transforms defined by rules (see TransformAnalyzer), with global
 //      filters (:: [set] ;) and filtered transform rules (:: [set] ID ;):
 //      the filter is computed once, as a mask of the positions of the text
@@ -114,13 +115,14 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode};
+enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode, HexC};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
     {"Any-NFC", Transform::NFC}, {"Any-NFKC", Transform::NFKC},
     {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title},
-    {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},{"Any-Hex/Unicode", Transform::HexUnicode},
+    {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},
+    {"Any-Hex/Unicode", Transform::HexUnicode}, {"Any-Hex/C", Transform::HexC},
 };
 
 //  Basis bits of a byte stream.
@@ -439,7 +441,8 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
         case Transform::Title:
         case Transform::HexJava:
         case Transform::HexUnicode:
-            llvm::report_fatal_error("tconv: Any-Title and Any-Hex (/Java, /Unicode) are implemented by the rule pipeline");
+        case Transform::HexC:
+            llvm::report_fatal_error("tconv: Any-Title and Any-Hex (/Java, /Unicode, /C) are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -1836,6 +1839,7 @@ private:
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * hexJava(StreamSet * U21);
     StreamSet * hexUnicode(StreamSet * U21);
+    StreamSet * hexC(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
@@ -1963,6 +1967,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Hex") return hexJava(U21);
     if (name == "Any-Hex/Java") return hexJava(U21);
     if (name == "Any-Hex/Unicode") return hexUnicode(U21);
+    if (name == "Any-Hex/C") return hexC(U21);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
 
@@ -2080,6 +2085,24 @@ StreamSet * RulePipelineBuilder::hexUnicode(StreamSet * U21) {
         PipelineBuilder & P = mP;
         StreamSet * const Hex = P.CreateStreamSet(21, 1);
         UnicodeHexPipeline(P, Selected, Hex);
+        SHOW_BIXNUM(Hex);
+        return Hex;
+    });
+}
+
+//  Any-Hex/C: each basic mulitplane character encoded as \uxxxx,
+//  each supplementary plane character as \Uxxxxxxxx (UnicodeHexPipeline) --
+//  a context-free, single-character mapping, so within a mask only the
+//  masked characters need be converted (localCharacterMapping).
+StreamSet * RulePipelineBuilder::hexC(StreamSet * U21) {
+    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
+        {6, UCD::UnicodeSet(0x0000, 0xFFFF)},       // \u and 4 digits
+        {10, UCD::UnicodeSet(0x10000, 0x10FFFF)},   // \U and 8 digits
+    };
+    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
+        PipelineBuilder & P = mP;
+        StreamSet * const Hex = P.CreateStreamSet(21, 1);
+        CHexPipeline(P, Selected, Hex);
         SHOW_BIXNUM(Hex);
         return Hex;
     });
@@ -2776,7 +2799,7 @@ int main(int argc, char *argv[]) {
     //  boundaries, provided by the rule pipeline.
     const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower
                         && impl->second != Transform::Title && impl->second != Transform::HexJava
-                        && impl->second != Transform::HexUnicode;
+                        && impl->second != Transform::HexUnicode && impl->second != Transform::HexC;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
     fn(fd);

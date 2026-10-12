@@ -27,10 +27,10 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | …of which public (not `visibility="internal"`) | 393 | 171 (44%) |
 
 - **Tests.** Of the 284 CLDR test files, 130 belong to implementable transforms.
-  Of their 166,382 cases, 378 fail. 124 of the 130 files pass entirely.
-- **The remaining failures are not tconv errors.** On all 378 failing cases,
-  tconv's output is identical to ICU 78.3's: the test data disagrees with the
-  current rules (§3).
+  Their 166,382 cases fail only in ka-ka_Latn/BGN (215), where the test data
+  disagrees with the rules (§3). The coverage script still reports 378 failures,
+  because it runs all the cases of a file as one text; run separately, as the
+  test data intends, the other 163 pass.
 - **Before contexts are matched against the converted text** (§3.1), as ICU does.
   That fixed 14,133 failing cases, including the nine Indic→Latin transforms
   (about 95% of their cases failed) and the eight conversions to Gurmukhi.
@@ -156,17 +156,15 @@ On 8 corrected transforms, the output is also identical with segment sizes 1 to
 
 ## 3. Correctness: known failures
 
-On every remaining failing case, tconv's output is identical to ICU 78.3's: the
-CLDR test data disagrees with the current rules.
+The only failing test file is ka-ka_Latn/BGN (215 of 682 cases): the test data
+expects `ʼ` (U+02BC) where the rules, and ICU 78.3, give `’` (U+2019).
 
-| test file | failing cases | example |
-|---|---:|---|
-| ka-ka_Latn/BGN | 215 of 682 | the test data expects `ʼ` (U+02BC) where the rules give `’` (U+2019) |
-| pl-pl_FONIPA | 78 of 418 | |
-| ky-ky_FONIPA | 65 of 1,090 | `Кемин`: the test data expects `ɡemin`, the rules give `kemin` |
-| sk-sk_FONIPA | 11 of 91 | |
-| ru-ja | 8 of 1,382 | |
-| ia-ia_FONIPA | 1 of 330 | |
+`tconv_coverage.py` runs all the cases of a test file as one text, one case per
+line, but each line of the test data is a separate text. Rules that depend on the
+end or start of the text (`[$]`) then see the line breaks instead. This accounts
+for all the other failures it reports: ky-ky_FONIPA (65), pl-pl_FONIPA (78),
+sk-sk_FONIPA (11), ru-ja (8) and ia-ia_FONIPA (1). Run once per case, tconv
+passes all 3,311 of them, as ICU does when applied to each line.
 
 ### 3.1 Before contexts on converted text
 
@@ -233,13 +231,33 @@ iteration.
 - cold starts within noise (Deva-Latn 3.1–3.4 s at 1 to 8 rounds, 3.6 s at 16);
 - no measurable run-time cost.
 
-**Not yet covered.** 31 contexts in 7 implementable transforms keep the warning
-("may match differently in the converted text"):
+**Whole groups.** Where such string rules must be selected (their matches
+overlap), or other rules need their coverage, the correction kernel takes all
+the rules of the group: in each round it also selects the string-rule matches
+that apply (as `SelectStringMatches`) and computes where the single-character
+rules may apply. (Groups of more than 256 string rules or subgroups keep their
+before contexts matched against the text.) For example, pl-pl_FONIPA's
+`$voiceless { rz → ʂ` sees `W` converted to the voiceless `f` (`Wrz` gives `fʂ`).
 
-- before contexts with unbounded repetitions, which are not fused (e.g. ky-ky_FONIPA's
-  `[^$consonant_sound y] $consonant_sound* $consonant_sound {`);
-- string rules in groups whose string rules must be selected or whose coverage
-  other rules need: el-el_Latn/BGN has 18. Its CLDR test file passes.
+**Repetitions.** A before context may also hold a possessive repetition of a
+set (`[^$cs y] $cs* $cs {` in ky-ky_FONIPA, `[:letter:] [:mark:]* {` in
+Spacedhan-Han), with fixed items between it and the rule and at most one item
+beyond it. Going back from its depth, the run of converted characters in the set
+is skipped (within a position's converted text, and across positions whose
+converted text is all in the set, or deleted, by `MatchStar`), and the first
+other character must be in the item beyond it.
+
+All the before contexts of the implementable transforms that their conversions
+may change are now matched against the converted text: no transform has the
+warning of `tconv --plan`. Matching only some of them against the converted text
+is not safe: rules whose contexts `DisambiguateOrder` made complementary must be
+matched against the same text, or neither may apply (ky-ky_FONIPA left `к`
+unconverted in words like `бисидк` until its repetitions were matched too).
+
+**Tested against ICU** (rules applied by `createFromRules`): 27 rule sets with
+deletions, chains, expansions, fallback rules, selected and covered string rules,
+and repetitions, each on 5,000 random strings, are identical to ICU. Without the
+correction, between 108 and 1,853 of each 5,000 differ.
 
 ### 3.2 Robustness
 
@@ -267,6 +285,12 @@ iteration.
 - **Normalization.** On synthetic runs of many combining marks, ICU's `uconv`
   output was not canonically ordered. tconv agrees with Python's `unicodedata`
   on those inputs.
+- **The order of the steps of a backward transform.** For Spacedhan-Han (the
+  backward direction of Han-Spacedhan), tconv reverses the steps, as UTS #35
+  specifies: the conversion rules, then `halfwidth-fullwidth`, then NFKD. ICU 78.3
+  applies the conversion rules last, after `halfwidth-fullwidth` has made the space
+  U+3000, so that its rules deleting spaces between letters and ideographs never
+  apply. On random mixed-script text, 392 of 20,000 lines differ for this reason.
 
 ## 4. Implementation
 
@@ -498,11 +522,14 @@ The per-transform table lists the problem classes of every transform.
 ## 6. Recommended order
 
 1. **Correctness first.**
-   - Extend the converted-text contexts (§3.1) to string rules that are selected
-     or covered.
+   - Run the CLDR test cases as separate texts: a tconv option treating each line
+     as a text (boundaries at line ends), used by `tconv_coverage.py`.
    - In `tconv_coverage.py`, record exit status, carry warnings over to invoking
      transforms, and report "implementable but failing its tests" separately.
-   - Report the test data that disagrees with the rules (§3) to CLDR.
+   - Report the ka-ka_Latn/BGN test data (§3) to CLDR, and the backward step
+     order of ICU (§3.3) to ICU.
+   - Replace the rounds of the converted-text correction by a Pablo `While`
+     fixpoint (issue #21), exact for chains of any length.
 2. **W3, finite expansion plus run collapse.** About 30 transforms, mostly through
    und_FONIPA-fa and InterIndic-Arabic.
 3. **W6 composition for Latin-InterIndic.** Up to 43 transforms, with Latin→Kana
@@ -540,7 +567,8 @@ tconv on every implementable transform.
 | `ed416e768` | tier-B contexts in the fused kernels |
 | `481afafb5` | SortRuns default of 2 parallel steps |
 | `6b6b08cb6` | Any-Hex/C |
-| (next) | before contexts matched against the converted text: failing CLDR test cases 14,511 → 378 |
+| `bdbf47ef5` | before contexts matched against the converted text: failing CLDR test cases 14,511 → 378 |
+| (next) | converted-text contexts for selected and covered string rules, and with repetitions: no transform keeps the warning |
 
 ## Reproducing
 

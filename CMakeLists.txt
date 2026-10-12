@@ -82,7 +82,6 @@ endif()
 llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} orcjit jitlink mcjit native IRReader Linker IRPrinter Passes)
 
 include_directories(${LLVM_INCLUDE_DIRS})
-link_directories(${LLVM_LIBRARY_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 math(EXPR LLVM_VERSION_INTEGER "${LLVM_VERSION_MAJOR} * 10000 + ${LLVM_VERSION_MINOR} * 100 + ${LLVM_VERSION_PATCH}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_VERSION_INTEGER=${LLVM_VERSION_INTEGER}")

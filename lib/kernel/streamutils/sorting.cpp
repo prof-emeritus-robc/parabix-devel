@@ -23,8 +23,8 @@ using namespace llvm;
 
 static cl::opt<unsigned> ParallelSortSteps("parallel-sort-steps",
     cl::desc("Sort runs of up to 2^N items with a parallel odd-even merge network, "
-             "before the sequential sort of longer runs (N from 0 to 6)"),
-    cl::init(6));
+             "before the sequential sort of longer runs (N from 0 to 6, default 2)"),
+    cl::init(2));
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)

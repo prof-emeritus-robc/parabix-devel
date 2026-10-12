@@ -2582,7 +2582,7 @@ StreamSet * RulePipelineBuilder::hexXML(StreamSet * U21) {
         {6, UCD::UnicodeSet(0x10, 0xFF)},          // &#x and 2 digits and ;
         {7, UCD::UnicodeSet(0x100, 0xFFF)},        // &#x and 3 digits and ;
         {8, UCD::UnicodeSet(0x1000, 0xFFFF)},      // &#x and 4 digits and ;
-        {8, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // &#x and 5 digits and ;
+        {9, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // &#x and 5 digits and ;
         {10, UCD::UnicodeSet(0x100000, 0x10FFFF)}, // &#x and 6 digits and ;
     };
     return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
@@ -2604,7 +2604,7 @@ StreamSet * RulePipelineBuilder::hexPerl(StreamSet * U21) {
         {6, UCD::UnicodeSet(0x10, 0xFF)},          // \x{ and 2 digits and }
         {7, UCD::UnicodeSet(0x100, 0xFFF)},        // \x{ and 3 digits and }
         {8, UCD::UnicodeSet(0x1000, 0xFFFF)},      // \x{ and 4 digits and }
-        {8, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // \x{ and 5 digits and }
+        {9, UCD::UnicodeSet(0x10000, 0xFFFFF)},    // \x{ and 5 digits and }
         {10, UCD::UnicodeSet(0x100000, 0x10FFFF)}, // \x{ and 6 digits and }
     };
     return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {

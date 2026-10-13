@@ -182,12 +182,13 @@ def classify(args, entries):
                     g['stages'] = int(re.search(r'in (\d+) stages', verdict).group(1))
                 elif g['two_way']:
                     g['verdict'] = 'two-way'
-                elif verdict.startswith('not single pass: self-overlaps'):
+                elif re.match(r'(not single pass|selected sequentially): self-overlaps', verdict):
                     g['verdict'] = 'self'
                     g['stages'] = int(re.search(r'in (\d+) stages', verdict).group(1))
                 else:
                     g['verdict'] = 'cycle'
-                    g['cycle'] = int(re.search(r'cycle of (\d+)', verdict).group(1))
+                    m = re.search(r'cycle of (\d+)', verdict)
+                    g['cycle'] = int(m.group(1)) if m else 0
                 groups.append(g)
         e['overlap_groups'] = groups
         w2b = {'two-way': 'S-W2b-two-way', 'self': 'S-W2b-self', 'cycle': 'S-W2b-cycle', 'single-pass': 'S-W2b-single-pass'}

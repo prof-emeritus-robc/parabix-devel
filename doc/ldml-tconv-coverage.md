@@ -1,7 +1,8 @@
 # tconv: status of the LDML / CLDR transforms
 
 *Status of `tools/ldml/tconv` on branch LDML, with rules with text to revisit
-composed at compile time (W6, §5), against CLDR
+composed at compile time (W6) and overlapping string matches selected
+sequentially (W2b2, §4.2), against CLDR
 `common/transforms` and `common/testData/transforms` at commit `7cdeb9e`
 (2026-10-09). October 12, 2026.*
 
@@ -23,14 +24,18 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 29 | 13 |
-| Transforms defined by CLDR files (381 files) | 425 | 205 (48%) |
-| …of which public (not `visibility="internal"`) | 393 | 181 (46%) |
+| Transforms defined by CLDR files (381 files) | 425 | 244 (57%) |
+| …of which public (not `visibility="internal"`) | 393 | 218 (55%) |
 
-- **Tests.** Of the 284 CLDR test files, 137 belong to implementable transforms.
-  Their 172,995 cases fail only in ka-ka_Latn/BGN (215), where the test data
-  disagrees with the rules (§3). The coverage script still reports 1,277
+- **Tests.** Of the 284 CLDR test files, 149 belong to implementable transforms.
+  Their 194,544 cases fail only in ka-ka_Latn/BGN (215), where the test data
+  disagrees with the rules (§3). The coverage script still reports 1,994
   failures, because it runs all the cases of a file as one text; run separately,
-  as the test data intends, the other 1,062 pass.
+  as the test data intends, the other 1,779 pass.
+- **Overlapping string matches are selected sequentially** (W2b2, §4.2), from
+  the left as ICU applies them, by a scalar kernel. 39 more transforms are
+  implementable, including every Latin→Indic transform, Latin→Hangul,
+  Hans-Hant and Hant-Hans.
 - **Revisits are composed** (W6, §5): rules with text after the cursor are
   replaced at compile time by rules without it. Ten more transforms are
   implementable; most of the others W6 blocked now need W2b2 or W3.
@@ -44,16 +49,15 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     cases.
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
-  - W2b2 two-way and self-overlapping string rules: 39 transforms;
-  - W3 variable-length texts: 36;
-  - W6 revisits not composed (unbounded runs, variable-length texts): 16.
+  - W3 variable-length texts: 78 transforms;
+  - W6 revisits not composed (unbounded runs, variable-length texts): 21;
+  - W5 back-references and function calls: 8.
 
   Each of these is concentrated in a few rule files (§5).
 
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          205  ███████████████████
-+ W2b2 two-way overlaps      244  ███████████████████████
+now                          244  ███████████████████████
 + W3 variable-length text    322  ██████████████████████████████
 + W6 revisit (rest)          359  ██████████████████████████████████
 + W4 insertion               381  ████████████████████████████████████
@@ -107,7 +111,7 @@ Two notes on the registry (`lib/ldml/transform_registry.cpp`):
 - It makes `Hex-Any` an alias of `Hex-Any/Java`. In ICU, the bare `Hex-Any`
   accepts every escape form.
 
-### 2.2 Transforms defined by rules (205 of 425)
+### 2.2 Transforms defined by rules (244 of 425)
 
 Implementable now:
 
@@ -120,7 +124,12 @@ Implementable now:
   Publishing;
 - many FONIPA transforms, and ja_Hrkt-ja_Latn/BGN;
 - with composed revisits: Hebr-Latn, Latn-Cyrl, ru-zh, es-am, es-es_FONIPA,
-  Ethi-Latn/ES3842, Sinh-Latn/UNGEGN, gz_Ethi-Sarb, am_Ethi-am_Brai.
+  Ethi-Latn/ES3842, Sinh-Latn/UNGEGN, gz_Ethi-Sarb, am_Ethi-am_Brai;
+- with sequential selection: Latin-InterIndic and all the Latin→Indic
+  transforms, Latin-ConjoiningJamo and Latn-Hang, Hans-Hant and Hant-Hans,
+  am_Ethi-am_Ethi/Geminate, the Ethiopic Latin→Ethi transforms, Sarb-gz_Ethi,
+  am_Brai-am_Ethi, d0_Morse-am_Ethi, Any-Publishing, and the Spanish and Czech
+  conversions to Chinese and Korean.
 
 The per-transform status is in the table.
 
@@ -129,8 +138,8 @@ The per-transform status is in the table.
 **CLDR test data.** Every test file in `common/testData/transforms` is mapped to
 its transform by alias, and those of implementable transforms are run:
 
-- 137 files, 172,995 cases;
-- 129 files pass entirely; run per text, all but ka-ka_Latn/BGN do.
+- 149 files, 194,544 cases;
+- 136 files pass entirely; run per text, all but ka-ka_Latn/BGN do.
 
 The failures are in §3.
 
@@ -141,6 +150,14 @@ word-boundary semantics of `Any-Title` (§3.3). That comparison has not been
 repeated for the 195. The work since then was checked against ICU 78.3 on
 specific inputs: the Hex transforms, ja_Hrkt-ja_Latn/BGN, and the tier-B context
 rules of §4.3.
+
+**Sequential selection (W2b2).** Against ICU's `createFromRules`, on about 280
+random rule sets of overlapping string rules (two to four characters, with and
+without contexts), each on 3,000 to 9,000 random characters, including segment
+sizes 1 and 2 and 3 threads: all identical. Of the new transforms without test
+data, Latn-Deva (300 lines), Latn-Beng (200) and Latn-Hang (104) match ICU 78.3
+run per line, and Hans-Hant and Hant-Hans match on 400 lines of random
+concatenations of the words of their rules (73 KB each, densely overlapping).
 
 **Regression of the fused kernels.** The fused implementation was compared with
 the previous tconv on every implementable transform (205 names). Each ran on:
@@ -171,8 +188,10 @@ expects `ʼ` (U+02BC) where the rules, and ICU 78.3, give `’` (U+2019).
 `tconv_coverage.py` runs all the cases of a test file as one text, one case per
 line, but each line of the test data is a separate text. Rules that depend on the
 end or start of the text (`[$]`) then see the line breaks instead. This accounts
-for all the other failures it reports: es-es_FONIPA (859), ky-ky_FONIPA (65),
-pl-pl_FONIPA (78), ru-zh (40), sk-sk_FONIPA (11), ru-ja (8) and ia-ia_FONIPA (1).
+for all the other failures it reports: es-es_FONIPA (859), es-zh (619),
+pl-pl_FONIPA (78), ky-ky_FONIPA (65), es_FONIPA-zh (54), ru-zh (40), cs-ko and
+cs_FONIPA-ko (21 each), sk-sk_FONIPA (11), ru-ja (8), zh_Latn_PINYIN-ru (2) and
+ia-ia_FONIPA (1).
 Run once per case, tconv passes all of them, as ICU does when applied to each
 line.
 
@@ -351,7 +370,18 @@ the filtered characters (`localCharacterMapping`).
    may match within the texts of others, the matches that apply are selected
    (`SelectStringMatches`):
    - one-way overlaps in a topological order (W2b1);
-   - self-overlapping two-character rules by parity.
+   - self-overlapping two-character rules by parity;
+   - otherwise (two-way overlaps, cycles, longer self-overlaps: W2b2),
+     sequentially from the left. The matches of the rules are combined by the
+     lengths of their texts (in the fused kernels), and `LeftmostMatches`, a
+     scalar kernel, scans them 64 bits at a time: the leftmost match applies,
+     the matches beginning within it are skipped (by counting trailing zeroes),
+     and the positions it still covers are carried to the next word. The fused
+     kernels then apply the rules where selected. As no two string rules of a
+     group match at the same position (`DisambiguateOrder`), this is exactly
+     the order in which ICU applies them. In a group whose before contexts are
+     matched against the converted text (§3.1), each round of that matching is
+     a kernel of its own, and the matches of each round are selected this way.
 
    Single-character rules apply only outside the applied matches of string rules
    (W2a), and within the filter mask.
@@ -469,11 +499,10 @@ those of invoked transforms).
 
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W2b2 two-way and self-overlapping string rules | 125 | 39 | L |
-| W3 variable-length texts | 143 | 36 | M (finite) / L (unbounded) |
-| W6 text to revisit, not composed | 44 | 16 | L (with W3) |
+| W3 variable-length texts | 143 | 78 | M (finite) / L (unbounded) |
+| W6 text to revisit, not composed | 44 | 21 | L (with W3) |
 | W5 back-references and function calls | 43 | 8 | M–L |
-| W4 insertion rules | 45 | 5 | M |
+| W4 insertion rules | 45 | 6 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W8 built-ins (Any-BreakInternal) | 1 | 0 | L |
 | W9 analysis scale (Han, Japanese) | 1 | 0 | L |
@@ -484,7 +513,9 @@ Done since the first assessment:
 - W2a single-character rules within string rules (`9119ae0d`);
 - W2b1 one-way string rule overlaps (`1ed0394e`);
 - W2c expanded non-final characters (`029371343`);
-- W6 revisits, where composition is finite (this report).
+- W6 revisits, where composition is finite (`eea89e00d`);
+- W2b2 two-way, cyclic and self-overlapping string rules, by sequential
+  selection.
 
 W7 no longer blocks anything because the proposed CLDR fixes are applied in the
 local `~/cldr` checkout (see W7 below).
@@ -528,14 +559,11 @@ Sinh-Latn/UNGEGN, gz_Ethi-Sarb), as is am_Ethi-am_Brai (whose `InsertionCounts`
 kernel name was too long for the object cache, now hashed). The rest are now
 blocked by other items:
 
-- **W2b2.** Composed rules are string rules, and some overlap. Latin-InterIndic's
-  62 revisit rules all compose (into about 2,000 string rules), but the result
-  has two two-way overlaps (`$consonants { lh → $lh` and `hlh → …`, from
-  `h → $ha | $virama`) and two self-overlapping three-character rules, so it is
-  not selectable in one pass. Latin-ConjoiningJamo composes completely and is
-  left with `eo`/`oe` (both from `($latinMedial) → $IEUNG | $1`), a two-way
-  overlap of two-character rules that the analysis already marks "pair
-  selectable" but tconv does not yet implement.
+- **W2b2.** Composed rules are string rules, and some overlap: Latin-InterIndic's
+  62 revisit rules compose into about 2,000 string rules with two two-way
+  overlaps (`$consonants { lh → $lh` and `hlh → …`, from `h → $ha | $virama`)
+  and two self-overlapping three-character rules; Latin-ConjoiningJamo is left
+  with `eo`/`oe`. Both are now implementable by sequential selection.
 - **Not composed** (`tconv --plan` gives the reason):
   - unbounded runs, where a rule revisits text that it matches again further
     on: Khmr-Latn/UNGEGN's `ô្គ → k | ô`, it-am's `($consonant) ' → | $1`, the
@@ -564,19 +592,14 @@ The unbounded cases that remain are mostly runs collapsed or deleted:
 A deletion mask (`MatchStar`) and `FilterByMask` handle these without the full
 span model.
 
-**W2b2** covers two-way and self-overlapping string rules:
-
-- dictionaries: Hans-Hant and Hant-Hans (with W9), am_Ethi-am_Ethi/Geminate;
-- number and punctuation sequences: am_Brai-am_Ethi, Sarb-gz_Ethi,
-  d0_Morse-am_Ethi, Any-Publishing;
-- vowel sequences in either order: ro-ro_FONIPA, zh_Latn_PINYIN-ru.
-
-It needs the leftmost selection among overlapping matches: a fixpoint in a Pablo
-`While` loop, or a dictionary matcher for the Han transforms. Composed revisits
-added cases: Latin-InterIndic (behind every Latin→Indic transform) and
-Latin-ConjoiningJamo (W6 above). The "pair selectable" components (two-way
-overlaps among two-character rules only, as in Latin-ConjoiningJamo) could be
-selected by run parity, like the self-overlapping two-character rules already are.
+**Converted-text contexts in large groups.** A group of more than 256 string
+rules or subgroups keeps its before contexts matched against the input text,
+where the conversions may change them (§3.1): `tconv --plan` warns about these.
+Composition made some groups that large: 14 implementable transforms have the
+warning, among them Latin-InterIndic (31 rules, and so every Latin→Indic
+transform), Latn-Cyrl, Hans-Hant and Latn-Grek. They matched ICU on the inputs
+tried (§2.3), but are not known to be exact. Applying the correction to the rules
+with such contexts only, rather than to the whole group, would remove the limit.
 
 **W5.**
 
@@ -613,15 +636,14 @@ The per-transform table lists the problem classes of every transform.
      order of ICU (§3.3) to ICU.
    - Replace the rounds of the converted-text correction by a Pablo `While`
      fixpoint (issue #21), exact for chains of any length.
-2. **W2b2 for the composed revisits.** Pair-selectable components first
-   (Latin-ConjoiningJamo), then the few two-way and three-character
-   self-overlaps of Latin-InterIndic, which block every Latin→Indic transform.
-3. **W3, finite expansion plus run collapse.** About 36 transforms, mostly through
+2. **W3, finite expansion plus run collapse.** About 78 transforms, mostly through
    und_FONIPA-fa and InterIndic-Arabic; run collapse also covers the revisits
    not composed (W6).
+3. **Converted-text contexts in large groups** (§5): the correction for groups
+   of more than 256 rules, which affects Latin-InterIndic.
 4. **W5 Title and W7.** Small. They depend on decisions: Title semantics, and
    whether to adopt the proposed CLDR fixes.
-5. **W2b2 and W9.** Dictionary-style selection and matching.
+5. **W9.** Jpan-Latn.
 6. **Built-ins and pipeline size.**
    - Built-ins: the remaining `Any-Hex/*` variants, `Hex-Any/*`,
      `Any-CaseFold`, `Any-Remove`.
@@ -655,7 +677,9 @@ tconv on every implementable transform.
 | `bdbf47ef5` | before contexts matched against the converted text: failing CLDR test cases 14,511 → 378 |
 | `4c2e4609a` | converted-text contexts for selected and covered string rules, and with repetitions: no transform keeps the warning |
 | `0686a09d7`, `c2bd705f6` | Any-Hex/XML, Any-Hex/Perl |
-| (next) | W6 composition of revisits: 205; capture texts of single-character rules; string matches within applied matches in the correction kernel |
+| `ac5a5d095` | Any-Hex/XML and Any-Hex/Perl lengths for five hex digits |
+| `eea89e00d` | W6 composition of revisits: 205; capture texts of single-character rules; string matches within applied matches in the correction kernel |
+| (next) | W2b2 sequential selection of string matches (`LeftmostMatches`): 244 |
 
 ## Reproducing
 

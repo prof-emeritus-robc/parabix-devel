@@ -99,6 +99,13 @@ struct TransformStep {
     // these.  Empty otherwise.
     std::vector<size_t> stringOrder;
     std::vector<std::vector<size_t>> stringPredecessors;
+    // Otherwise (cyclic, two-way or longer self-overlaps), the matches are
+    // selected sequentially, from the left: a match applies if it does not
+    // begin within an applied match.  As no two string rules of a group match
+    // at the same position (see DisambiguateOrder), this is the order in which
+    // ICU applies them.  stringOrder then lists all the string rules, in
+    // order, with no predecessors.
+    bool sequentialSelection = false;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

@@ -651,12 +651,12 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
                              << (overlaps.self ? " (with two-character self-overlaps)" : "") << "\n";
             } else {
                 if (overlaps.twoWay > 0) {
-                    llvm::outs() << "not single pass: two-way overlaps";
+                    llvm::outs() << "selected sequentially: two-way overlaps";
                 } else if (overlaps.acyclicApartFromSelf) {
-                    llvm::outs() << "not single pass: self-overlaps (otherwise single pass in "
+                    llvm::outs() << "selected sequentially: self-overlaps (otherwise single pass in "
                                  << std::max(overlaps.stagesApartFromSelf, 1u) << " stages)";
                 } else {
-                    llvm::outs() << "not single pass: cycle of " << overlaps.cycle.size() << " rules";
+                    llvm::outs() << "selected sequentially: cycle of " << overlaps.cycle.size() << " rules";
                 }
                 llvm::outs() << "; " << overlaps.cyclicComponents << " cyclic components (" << overlaps.pairComponents
                              << " of 2-character rules, largest " << overlaps.largestComponent << " rules)"
@@ -927,6 +927,190 @@ private:
     const std::vector<Rule> mRules;
     const bool mSpans;
     const std::vector<std::pair<unsigned, unsigned>> mFirsts;   // the stream set and stream of each rule
+};
+
+//  The first positions of the matches of the string rules of a group, by the
+//  lengths of their texts: a stream for each length, the union of the matches
+//  of the rules of that length (given as for SelectStringMatches).
+class MatchStartsByLength : public pablo::PabloKernel {
+public:
+    using Source = SelectStringMatches::Source;
+    MatchStartsByLength(LLVMTypeSystemInterface & ts, const std::vector<std::vector<Source>> & byLength, StreamSet * Starts)
+    : MatchStartsByLength(ts, byLength, sourceSets(byLength), Starts) {}
+protected:
+    static std::vector<StreamSet *> sourceSets(const std::vector<std::vector<Source>> & byLength) {
+        std::vector<StreamSet *> sets;
+        for (const auto & sources : byLength) {
+            for (const Source & f : sources) {
+                if (std::find(sets.begin(), sets.end(), f.streamSet) == sets.end()) sets.push_back(f.streamSet);
+            }
+        }
+        return sets;
+    }
+    MatchStartsByLength(LLVMTypeSystemInterface & ts, const std::vector<std::vector<Source>> & byLength,
+                        const std::vector<StreamSet *> & sets, StreamSet * Starts)
+    : PabloKernel(ts, "MatchStartsByLength_" + [&] {
+                      std::string sig;
+                      for (const auto & sources : byLength) {
+                          sig += "|";
+                          for (const Source & f : sources) {
+                              sig += std::to_string(std::find(sets.begin(), sets.end(), f.streamSet) - sets.begin()) + ":" + std::to_string(f.index) + ",";
+                          }
+                      }
+                      for (StreamSet * ss : sets) sig += "#" + std::to_string(ss->getNumElements());
+                      return getStringHash(sig);
+                  }(),
+                  [&] {
+                      Bindings inputs;
+                      for (size_t i = 0; i < sets.size(); i++) inputs.emplace_back("Firsts" + std::to_string(i), sets[i]);
+                      return inputs;
+                  }(),
+                  {Binding{"Starts", Starts}}),
+      mSources([&] {
+          std::vector<std::vector<std::pair<unsigned, unsigned>>> v;
+          for (const auto & sources : byLength) {
+              v.emplace_back();
+              for (const Source & f : sources) {
+                  v.back().emplace_back(std::find(sets.begin(), sets.end(), f.streamSet) - sets.begin(), f.index);
+              }
+          }
+          return v;
+      }()) {}
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> starts;
+        for (const auto & sources : mSources) {
+            PabloAST * s = pb.createZeroes();
+            for (const auto & f : sources) s = pb.createOr(s, getInputStreamSet("Firsts" + std::to_string(f.first))[f.second]);
+            starts.push_back(pb.createInFile(s));
+        }
+        writeOutputStreamSet("Starts", starts);
+    }
+private:
+    const std::vector<std::vector<std::pair<unsigned, unsigned>>> mSources;
+};
+
+//  The matches that apply, selected sequentially from the left as ICU applies
+//  them: given the first positions of the matches by the lengths of their texts
+//  (Starts, a stream for each of lengths), a match applies if it does not begin
+//  within an applied match (at the 1 to n - 1 positions after the first of a
+//  match of n characters).  At most one match is expected at a position; if
+//  there are several, the one of the earliest stream applies.  The 64-bit words
+//  of the matches are scanned in order, with the applied matches found by
+//  counting trailing zeroes; the positions still covered by the last applied
+//  match are carried to the next word (and stride).
+class LeftmostMatches final : public MultiBlockKernel {
+public:
+    LeftmostMatches(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & lengths, StreamSet * Starts, StreamSet * Selected)
+    : MultiBlockKernel(ts, "LeftmostMatches" + [&] {
+                           std::string sig;
+                           for (unsigned k : lengths) sig += "_" + std::to_string(k);
+                           return sig;
+                       }(),
+                       {Binding{"Starts", Starts}}, {Binding{"Selected", Selected}}, {}, {},
+                       {InternalScalar{ts.getInt64Ty(), "covered"}}),
+      mLengths(lengths) {
+        setStride(ts.getBitBlockWidth());
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        const unsigned bw = b.getBitBlockWidth();
+        Type * const sizeTy = b.getSizeTy();
+        Type * const i64Ty = b.getInt64Ty();
+        Constant * const ZERO = b.getSize(0);
+        Constant * const ONE = b.getSize(1);
+        Constant * const WORDS_PER_BLOCK = b.getSize(bw / 64);
+        Constant * const W0 = b.getInt64(0);
+        Constant * const W64 = b.getInt64(64);
+        BasicBlock * const entry = b.GetInsertBlock();
+        BasicBlock * const blockLoop = b.CreateBasicBlock("blockLoop");
+        BasicBlock * const wordLoop = b.CreateBasicBlock("wordLoop");
+        BasicBlock * const selectLoop = b.CreateBasicBlock("selectLoop");
+        BasicBlock * const selectOne = b.CreateBasicBlock("selectOne");
+        BasicBlock * const wordDone = b.CreateBasicBlock("wordDone");
+        BasicBlock * const blockDone = b.CreateBasicBlock("blockDone");
+        BasicBlock * const done = b.CreateBasicBlock("done");
+        Value * const covered0 = b.getScalarField("covered");
+        b.CreateCondBr(b.CreateICmpEQ(numOfStrides, ZERO), done, blockLoop);
+
+        b.SetInsertPoint(blockLoop);
+        PHINode * const blockNo = b.CreatePHI(sizeTy, 2);
+        blockNo->addIncoming(ZERO, entry);
+        PHINode * const blockCovered = b.CreatePHI(i64Ty, 2);
+        blockCovered->addIncoming(covered0, entry);
+        std::vector<Value *> inWords;
+        for (unsigned i = 0; i < mLengths.size(); i++) {
+            inWords.push_back(b.CreatePointerCast(b.getInputStreamBlockPtr("Starts", b.getInt32(i), blockNo), PointerType::getUnqual(b.getContext())));
+        }
+        Value * const outWords = b.CreatePointerCast(b.getOutputStreamBlockPtr("Selected", b.getInt32(0), blockNo), PointerType::getUnqual(b.getContext()));
+        b.CreateBr(wordLoop);
+
+        //  Each word: the positions covered from before are excluded.
+        b.SetInsertPoint(wordLoop);
+        PHINode * const wordNo = b.CreatePHI(sizeTy, 2);
+        wordNo->addIncoming(ZERO, blockLoop);
+        PHINode * const covered = b.CreatePHI(i64Ty, 2);
+        covered->addIncoming(blockCovered, blockLoop);
+        std::vector<Value *> words;
+        Value * any = W0;
+        for (Value * ptr : inWords) {
+            words.push_back(b.CreateLoad(i64Ty, b.CreateGEP(i64Ty, ptr, wordNo)));
+            any = b.CreateOr(any, words.back());
+        }
+        Value * const allCovered = b.CreateICmpUGE(covered, W64);
+        Value * const coverMask = b.CreateSelect(allCovered, b.getInt64(-1),
+                                                 b.CreateSub(b.CreateShl(b.getInt64(1), b.CreateSelect(allCovered, W0, covered)), b.getInt64(1)));
+        Value * const candidates = b.CreateAnd(any, b.CreateNot(coverMask));
+        Value * const carried = b.CreateSelect(allCovered, b.CreateSub(covered, W64), W0);
+        BasicBlock * const wordStart = b.GetInsertBlock();
+        b.CreateBr(selectLoop);
+
+        //  The leftmost candidate applies; the candidates within it are excluded.
+        b.SetInsertPoint(selectLoop);
+        PHINode * const remaining = b.CreatePHI(i64Ty, 2);
+        remaining->addIncoming(candidates, wordStart);
+        PHINode * const selected = b.CreatePHI(i64Ty, 2);
+        selected->addIncoming(W0, wordStart);
+        PHINode * const nextCovered = b.CreatePHI(i64Ty, 2);
+        nextCovered->addIncoming(carried, wordStart);
+        b.CreateCondBr(b.CreateICmpEQ(remaining, W0), wordDone, selectOne);
+
+        b.SetInsertPoint(selectOne);
+        Value * const pos = b.CreateCountForwardZeroes(remaining);
+        Value * length = b.getInt64(mLengths.back());
+        for (int i = static_cast<int>(mLengths.size()) - 2; i >= 0; i--) {
+            Value * const bit = b.CreateAnd(b.CreateLShr(words[i], pos), b.getInt64(1));
+            length = b.CreateSelect(b.CreateICmpNE(bit, W0), b.getInt64(mLengths[i]), length);
+        }
+        Value * const end = b.CreateAdd(pos, length);
+        Value * const beyond = b.CreateICmpUGE(end, W64);
+        Value * const keep = b.CreateSelect(beyond, W0, b.CreateShl(b.getInt64(-1), b.CreateSelect(beyond, W0, end)));
+        remaining->addIncoming(b.CreateAnd(remaining, keep), selectOne);
+        selected->addIncoming(b.CreateOr(selected, b.CreateShl(b.getInt64(1), pos)), selectOne);
+        nextCovered->addIncoming(b.CreateSelect(beyond, b.CreateSub(end, W64), nextCovered), selectOne);
+        b.CreateBr(selectLoop);
+
+        b.SetInsertPoint(wordDone);
+        b.CreateStore(selected, b.CreateGEP(i64Ty, outWords, wordNo));
+        Value * const nextWord = b.CreateAdd(wordNo, ONE);
+        wordNo->addIncoming(nextWord, wordDone);
+        covered->addIncoming(nextCovered, wordDone);
+        b.CreateCondBr(b.CreateICmpULT(nextWord, WORDS_PER_BLOCK), wordLoop, blockDone);
+
+        b.SetInsertPoint(blockDone);
+        Value * const nextBlock = b.CreateAdd(blockNo, ONE);
+        blockNo->addIncoming(nextBlock, blockDone);
+        blockCovered->addIncoming(nextCovered, blockDone);
+        b.CreateCondBr(b.CreateICmpULT(nextBlock, numOfStrides), blockLoop, done);
+
+        b.SetInsertPoint(done);
+        PHINode * const finalCovered = b.CreatePHI(i64Ty, 2);
+        finalCovered->addIncoming(covered0, entry);
+        finalCovered->addIncoming(nextCovered, blockDone);
+        b.setScalarField("covered", finalCovered);
+    }
+private:
+    const std::vector<unsigned> mLengths;
 };
 
 //  The codepoint standing for the characters outside the filter of a filtered
@@ -1338,11 +1522,13 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
             llvm::outs() << "    before context matched against the converted text: [" << s.contextKey << "]\n";
         }
     }
+    bool wholeGroup = false;
     for (const ldml::StringRule & sr : step.stringRules) {
         FusedContexts before, after;
         if (sr.engineBefore && fusedContexts(sr.engineBefore, true, before, true) && fusedContexts(sr.engineAfter, false, after)
                 && convertedContextMatters(before, outcomes)) {
             const bool wholeGroupFits = step.stringRules.size() <= FusedMaxWholeGroupRules && step.subgroups.size() <= FusedMaxWholeGroupRules;
+            wholeGroup |= (!step.stringOrder.empty() || needCoverage) && wholeGroupFits;
             if ((step.stringOrder.empty() && !needCoverage) || wholeGroupFits) {
                 llvm::outs() << "    before context matched against the converted text: " << ldml::printRule(sr.rule) << "\n";
             } else {
@@ -1350,6 +1536,10 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
                              << " may match differently in the converted text\n";
             }
         }
+    }
+    if (wholeGroup && step.sequentialSelection) {
+        llvm::outs() << "    string matches selected sequentially between the " << ConvertedContextRounds + 1
+                     << " rounds of matching before contexts against the converted text\n";
     }
     //  The contexts that are not fused (with unbounded repetitions) are matched
     //  against the text itself.
@@ -1446,6 +1636,12 @@ struct FusedRulesConfig {
     //  Only the matches of the string rules (in the kernel), at their first
     //  positions (Firsts, a stream per rule), for SelectStringMatches.
     bool matchOnly = false;
+    //  With matchOnly: the matches by the lengths of the texts instead, a stream
+    //  for each length given (the union of the rules with texts of that length).
+    std::vector<unsigned> startsByLength;
+    //  The matches of the string rules apply only where selected (the index of
+    //  the source of the selected positions; see LeftmostMatches), or -1.
+    int selected = -1;
     //  Also the spans and first positions of the matches of the string rules
     //  (Spans and Starts), for the coverage of the single-character rules.
     bool coverage = false;
@@ -1469,6 +1665,15 @@ struct FusedRulesConfig {
     };
     std::vector<Selection> selection;
     bool groupCoverage = false;
+    //  A round of a correction kernel for a whole group whose string matches are
+    //  selected sequentially (see TransformStep::sequentialSelection), as a kernel
+    //  of its own: the converted text of the previous round is given (as the
+    //  state in; none for the first round), and the before contexts are matched
+    //  against it once.  With matchOnly, the matches are given by length
+    //  (startsByLength), for their selection; otherwise, the results of the
+    //  round, of the rules applied where selected, are given (without the state
+    //  in).
+    bool staged = false;
 };
 
 //  The results of the rules of a conversion group, accumulated by its fused
@@ -1498,7 +1703,7 @@ struct FusedLayout {
                 for (const FusedContext & a : r.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
                 maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
             }
-            if (!c.matchOnly) {
+            if (!c.matchOnly || c.staged) {
                 changePositions = std::max<unsigned>(changePositions, m > n ? m - n + 1 : 1);
                 if (m > n) insertCounts.insert(m - n);
             }
@@ -1512,7 +1717,7 @@ struct FusedLayout {
                 if (m.replacement.size() > 1) insertCounts.insert(m.replacement.size() - 1);
             }
         }
-        if (!c.matchOnly) {
+        if (!c.matchOnly || c.staged) {
             changePositions = std::max<unsigned>(changePositions, in.changes.size());
             for (const auto & k : in.insertions) insertCounts.insert(k.first);
         }
@@ -1683,7 +1888,7 @@ private:
         }
         if (Allowed) b.emplace_back("Allowed", Allowed);
         for (size_t i = 0; i < l.sourceSets.size(); i++) b.emplace_back("Source" + std::to_string(i), l.sourceSets[i]);
-        if (!c.matchOnly) {
+        if (!c.matchOnly || c.staged) {
             for (size_t i = 0; i < in.changes.size(); i++) {
                 if (in.changes[i]) b.emplace_back("ChangesIn" + std::to_string(i), in.changes[i]);
             }
@@ -1730,10 +1935,12 @@ private:
                                  const FusedState & in) {
         std::string s = "FusedRulesCC" + std::to_string(DeletionMark) + "_" + std::to_string(SmallMappingLimit);
         s += c.matchOnly ? "M" : "C";
+        for (unsigned n : c.startsByLength) s += "n" + std::to_string(n);
         if (c.rounds) {
             s += "R" + std::to_string(c.rounds);
             appendSet(s, c.replacementChars);
             if (c.groupCoverage) s += "G";
+            if (c.staged) s += "T";
             for (const FusedRulesConfig::Selection & sel : c.selection) {
                 s += "/" + std::to_string(sel.length) + (sel.selfOverlapping ? "s" : "");
                 for (size_t p : sel.predecessors) s += "." + std::to_string(p);
@@ -1756,6 +1963,7 @@ private:
             return "@" + std::to_string(std::find(l.sourceSets.begin(), l.sourceSets.end(), src.streamSet) - l.sourceSets.begin())
                    + "." + std::to_string(src.index);
         };
+        if (c.selected >= 0) s += "Q" + source(c.selected);
         for (const FusedStringRule & r : c.strings) {
             s += "|s";
             for (const UCD::UnicodeSet & t : r.text) appendSet(s, t);
@@ -1876,8 +2084,21 @@ void FusedRules::generatePabloMethod() {
         }
         starts.push_back(m);
     }
-    if (mConfig.matchOnly) {
+    if (mConfig.selected >= 0) {
+        for (PabloAST *& m : starts) m = pb.createAnd(m, source(mConfig.selected));
+    }
+    if (mConfig.matchOnly && !mConfig.staged) {
         Var * const firsts = getOutputStreamVar("Firsts");
+        if (!mConfig.startsByLength.empty()) {
+            for (size_t k = 0; k < mConfig.startsByLength.size(); k++) {
+                PabloAST * u = zeroes;
+                for (size_t i = 0; i < starts.size(); i++) {
+                    if (mConfig.strings[i].text.size() == mConfig.startsByLength[k]) u = pb.createOr(u, starts[i]);
+                }
+                pb.createAssign(pb.createExtract(firsts, pb.getInteger(k)), pb.createInFile(u));
+            }
+            return;
+        }
         for (size_t i = 0; i < starts.size(); i++) {
             pb.createAssign(pb.createExtract(firsts, pb.getInteger(i)), pb.createInFile(starts[i]));
         }
@@ -2218,6 +2439,30 @@ void FusedRules::generatePabloMethod() {
         };
         Results none;
         none.changes.assign(mLayout.changePositions, std::vector<PabloAST *>(21, zeroes));
+        if (mConfig.staged) {
+            //  One round, against the converted text of the previous round.
+            matchConverted(stateIn());
+            settle();
+            if (mConfig.matchOnly) {
+                Var * const firsts = getOutputStreamVar("Firsts");
+                for (size_t k = 0; k < mConfig.startsByLength.size(); k++) {
+                    PabloAST * u = zeroes;
+                    for (size_t i = 0; i < firstOf.size(); i++) {
+                        if (mConfig.strings[i].text.size() == mConfig.startsByLength[k]) u = pb.createOr(u, firstOf[i]);
+                    }
+                    pb.createAssign(pb.createExtract(firsts, pb.getInteger(k)), pb.createInFile(u));
+                }
+                return;
+            }
+            Results res = none;
+            for (unsigned k : mLayout.insertCounts) res.insert[k] = zeroes;
+            res.spans = zeroes;
+            res.firsts = zeroes;
+            addResults(res, firstOf, atOf);
+            for (unsigned i = 0; i < mLayout.changePositions; i++) writeOutputStreamSet("Changes" + std::to_string(i), res.changes[i]);
+            for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
+            return;
+        }
         //  Round 0: the before contexts matched against the text itself.
         matchConverted(none);
         settle();
@@ -3076,11 +3321,99 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         for (const ConversionOutcome & o : outcomes) {
             for (char32_t c : o.out) config.replacementChars.insert(c);
         }
-        applyFused(std::move(config), nullptr);
+        if (step.sequentialSelection) {
+            //  The string matches are selected sequentially, between the rounds:
+            //  each round is a kernel matching the before contexts against the
+            //  converted text of the previous round, the selection of the matches
+            //  (LeftmostMatches), and a kernel applying the rules where selected.
+            std::vector<unsigned> byLengthOf;
+            for (const FusedStringRule & r : config.strings) {
+                const unsigned n = static_cast<unsigned>(r.text.size());
+                if (std::find(byLengthOf.begin(), byLengthOf.end(), n) == byLengthOf.end()) byLengthOf.push_back(n);
+            }
+            config.staged = true;
+            config.selection.clear();
+            StreamSet * const classes = fusedClasses(config);
+            FusedState previous;
+            for (unsigned round = 0; round <= ConvertedContextRounds; round++) {
+                FusedRulesConfig matching = config;
+                matching.matchOnly = true;
+                matching.subgroups.clear();
+                matching.startsByLength = byLengthOf;
+                StreamSet * const starts = P.CreateStreamSet(byLengthOf.size());
+                const FusedState none;
+                P.CreateKernelCall<FusedRules>(std::move(matching), U21, classes, inText, mask, nullptr, previous, none, starts);
+                StreamSet * const selected = P.CreateStreamSet(1);
+                P.CreateKernelCall<LeftmostMatches>(byLengthOf, starts, selected);
+                FusedRulesConfig applying = config;
+                applying.selected = static_cast<int>(applying.sources.size());
+                applying.sources.push_back(FusedMatchSource{selected, 0});
+                const FusedLayout layout(applying, previous);
+                FusedState out;
+                for (unsigned i = 0; i < layout.changePositions; i++) out.changes.push_back(P.CreateStreamSet(21));
+                for (unsigned k : layout.insertCounts) out.insertions[k] = P.CreateStreamSet(1);
+                P.CreateKernelCall<FusedRules>(std::move(applying), U21, classes, inText, mask, nullptr, previous, out, nullptr);
+                previous = out;
+            }
+            state = previous;
+        } else {
+            applyFused(std::move(config), nullptr);
+        }
     } else {
         std::vector<size_t> applying;               // the string rules, by their matches
         std::vector<FusedMatchSource> applied;      // and the source of their matches that apply
-        if (!step.stringOrder.empty()) {
+        StreamSet * selected = nullptr;             // the first positions of the matches that apply
+        if (step.sequentialSelection) {
+            //  The matches that apply are selected sequentially, from the left (see
+            //  LeftmostMatches), given the matches of the rules by the lengths of
+            //  their texts.  The rules are then applied where selected.
+            std::vector<unsigned> byLengthOf;
+            for (size_t r = 0; r < numStringRules; r++) {
+                const unsigned n = static_cast<unsigned>(texts[r].size());
+                if (n > 0 && std::find(byLengthOf.begin(), byLengthOf.end(), n) == byLengthOf.end()) byLengthOf.push_back(n);
+            }
+            auto lengthIndex = [&](size_t n) {
+                return std::find(byLengthOf.begin(), byLengthOf.end(), static_cast<unsigned>(n)) - byLengthOf.begin();
+            };
+            std::vector<std::vector<SelectStringMatches::Source>> byLength(byLengthOf.size());
+            std::vector<size_t> fusedRules;
+            for (size_t r = 0; r < numStringRules; r++) {
+                if (texts[r].empty()) continue;
+                applying.push_back(r);
+                if (fusedMatch[r]) {
+                    fusedRules.push_back(r);
+                    applied.push_back(FusedMatchSource{});
+                } else {
+                    StreamSet * const firsts = engineFirsts(r);
+                    byLength[lengthIndex(texts[r].size())].push_back(SelectStringMatches::Source{firsts, 0});
+                    applied.push_back(FusedMatchSource{firsts, 0});
+                }
+            }
+            for (const std::vector<size_t> & chunk : fusedStringChunks(lengths, fusedRules)) {
+                FusedRulesConfig config;
+                config.matchOnly = true;
+                for (size_t r : chunk) {
+                    config.strings.push_back(fusedRule(r));
+                    const unsigned n = static_cast<unsigned>(texts[r].size());
+                    if (std::find(config.startsByLength.begin(), config.startsByLength.end(), n) == config.startsByLength.end()) {
+                        config.startsByLength.push_back(n);
+                    }
+                }
+                const std::vector<unsigned> chunkLengths = config.startsByLength;
+                StreamSet * const matches = P.CreateStreamSet(chunkLengths.size());
+                const FusedState none;
+                StreamSet * const classes = fusedClasses(config);
+                P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, nullptr, none, none, matches);
+                for (size_t k = 0; k < chunkLengths.size(); k++) {
+                    byLength[lengthIndex(chunkLengths[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
+                }
+            }
+            StreamSet * const starts = P.CreateStreamSet(byLengthOf.size());
+            P.CreateKernelCall<MatchStartsByLength>(byLength, starts);
+            selected = P.CreateStreamSet(1);
+            P.CreateKernelCall<LeftmostMatches>(byLengthOf, starts, selected);
+            SHOW_STREAM(selected);
+        } else if (!step.stringOrder.empty()) {
             //  String rules may match within the texts of others: the matches of the
             //  rules, in the order to apply them, from which those that apply are
             //  selected (see ldml::TransformStep::stringOrder).
@@ -3153,7 +3486,11 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             for (size_t r : applying) applyingLengths.push_back(lengths[r]);
             for (const std::vector<size_t> & chunk : fusedStringChunks(applyingLengths, order)) {
                 FusedRulesConfig config;
-                config.coverage = needCoverage && step.stringOrder.empty();
+                config.coverage = needCoverage && (step.stringOrder.empty() || selected);
+                if (selected) {
+                    config.selected = static_cast<int>(config.sources.size());
+                    config.sources.push_back(FusedMatchSource{selected, 0});
+                }
                 for (size_t i : chunk) {
                     FusedStringRule fr = fusedRule(applying[i]);
                     if (applied[i].streamSet) {

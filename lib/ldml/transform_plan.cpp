@@ -188,8 +188,8 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     //  each applying where it does not begin within an applied match of a rule
     //  preceding it (TransformStep::stringOrder), and a rule of two characters
     //  matching within its own text by the selection of its matches (see
-    //  StringRule::selfOverlapping).  Otherwise, for each string rule within
-    //  whose text a string rule may match, the first such rule is reported.
+    //  StringRule::selfOverlapping).  Otherwise, the matches that apply are
+    //  selected sequentially (TransformStep::sequentialSelection).
     //  A quick check first: a rule may match within the text only if its first
     //  characters may occur at a position of the text other than the first.
     for (TransformStep & step : plan.steps) {
@@ -226,18 +226,11 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             }
             continue;
         }
-        //  The first rule found that may match within the text of each.
-        std::vector<bool> reported(step.stringRules.size(), false);
-        for (const StringRuleOverlaps::Pair & p : overlaps.pairs) {
-            const size_t outers[2] = {p.outer, p.inner};
-            for (unsigned k = 0; k < (p.kind == StringRuleOverlaps::Kind::TwoWay ? 2u : 1u); k++) {
-                const size_t outer = outers[k], inner = outers[1 - k];
-                if (reported[outer]) continue;
-                reported[outer] = true;
-                plan.problems.push_back(printRule(step.stringRules[inner].rule) + "  (may match within the text of "
-                                        + printRule(step.stringRules[outer].rule) + ")");
-            }
-        }
+        //  Otherwise, the matches are selected sequentially.
+        step.sequentialSelection = true;
+        step.stringOrder.clear();
+        for (size_t r = 0; r < step.stringRules.size(); r++) step.stringOrder.push_back(r);
+        step.stringPredecessors.assign(step.stringRules.size(), {});
     }
     return plan;
 }

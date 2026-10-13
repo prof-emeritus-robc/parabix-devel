@@ -1,8 +1,9 @@
 # tconv: status of the LDML / CLDR transforms
 
 *Status of `tools/ldml/tconv` on branch LDML, with rules with text to revisit
-composed at compile time (W6) and overlapping string matches selected
-sequentially (W2b2, §4.2), against CLDR
+composed at compile time (W6), overlapping string matches selected
+sequentially (W2b2, §4.2), and variable-length texts expanded, as runs, or as
+SingleCaptureDoubleReplacement rules (W3, §5), against CLDR
 `common/transforms` and `common/testData/transforms` at commit `7cdeb9e`
 (2026-10-09). October 12, 2026.*
 
@@ -24,14 +25,20 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 29 | 13 |
-| Transforms defined by CLDR files (381 files) | 425 | 244 (57%) |
-| …of which public (not `visibility="internal"`) | 393 | 218 (55%) |
+| Transforms defined by CLDR files (381 files) | 425 | 320 (75%) |
+| …of which public (not `visibility="internal"`) | 393 | 293 (75%) |
 
-- **Tests.** Of the 284 CLDR test files, 149 belong to implementable transforms.
-  Their 194,544 cases fail only in ka-ka_Latn/BGN (215), where the test data
-  disagrees with the rules (§3). The coverage script still reports 1,994
+- **Tests.** Of the 284 CLDR test files, 217 belong to implementable transforms.
+  Their 235,974 cases fail only in ka-ka_Latn/BGN (215), where the test data
+  disagrees with the rules (§3). The coverage script still reports 10,892
   failures, because it runs all the cases of a file as one text; run separately,
-  as the test data intends, the other 1,779 pass.
+  as the test data intends, the other 10,677 pass.
+- **Variable-length texts** (W3, §5): finite texts are expanded into fixed-length
+  alternatives, runs (`h h+ → h`) are deleted after their text, and
+  SingleCaptureDoubleReplacement rules (`A (B) C → D $1 E`) are matched by the
+  regular expression engine, with B kept in place. 76 more transforms are
+  implementable, including the `*-fa`, `*-ar` and `*-chr` families, the Indic→Arabic
+  transforms, Latin-ASCII, Latn-Hebr, tr-Lower and az-Lower.
 - **Overlapping string matches are selected sequentially** (W2b2, §4.2), from
   the left as ICU applies them, by a scalar kernel. 39 more transforms are
   implementable, including every Latin→Indic transform, Latin→Hangul,
@@ -49,17 +56,18 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     cases.
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
-  - W3 variable-length texts: 78 transforms;
-  - W6 revisits not composed (unbounded runs, variable-length texts): 21;
+  - W6 revisits not composed (unbounded runs, variable-length texts): 25
+    transforms;
+  - W4 insertion rules: 13;
   - W5 back-references and function calls: 8.
 
   Each of these is concentrated in a few rule files (§5).
 
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          244  ███████████████████████
-+ W3 variable-length text    322  ██████████████████████████████
-+ W6 revisit (rest)          359  ██████████████████████████████████
+now                          320  ██████████████████████████████
++ W6 revisit (rest)          345  ████████████████████████████████
++ W3 (rest)                  359  ██████████████████████████████████
 + W4 insertion               381  ████████████████████████████████████
 + W5 captures/functions      423  ████████████████████████████████████████
 + W8, W9                     425  ████████████████████████████████████████
@@ -111,7 +119,7 @@ Two notes on the registry (`lib/ldml/transform_registry.cpp`):
 - It makes `Hex-Any` an alias of `Hex-Any/Java`. In ICU, the bare `Hex-Any`
   accepts every escape form.
 
-### 2.2 Transforms defined by rules (244 of 425)
+### 2.2 Transforms defined by rules (320 of 425)
 
 Implementable now:
 
@@ -129,7 +137,11 @@ Implementable now:
   transforms, Latin-ConjoiningJamo and Latn-Hang, Hans-Hant and Hant-Hans,
   am_Ethi-am_Ethi/Geminate, the Ethiopic Latin→Ethi transforms, Sarb-gz_Ethi,
   am_Brai-am_Ethi, d0_Morse-am_Ethi, Any-Publishing, and the Spanish and Czech
-  conversions to Chinese and Korean.
+  conversions to Chinese and Korean;
+- with variable-length texts: und_FONIPA-fa, -ar and -chr and the transforms to
+  Persian, Arabic and Cherokee through them (about 50), InterIndic-Arabic and the
+  nine Indic→Arabic transforms, ro, rm, chr and es_419 FONIPA, Latin-ASCII,
+  de-ASCII, ug-Latin, hy-hy_Latn/BGN, Latn-Hebr, tr-Lower and az-Lower.
 
 The per-transform status is in the table.
 
@@ -138,8 +150,8 @@ The per-transform status is in the table.
 **CLDR test data.** Every test file in `common/testData/transforms` is mapped to
 its transform by alias, and those of implementable transforms are run:
 
-- 149 files, 194,544 cases;
-- 136 files pass entirely; run per text, all but ka-ka_Latn/BGN do.
+- 217 files, 235,974 cases;
+- 174 files pass entirely; run per text, all but ka-ka_Latn/BGN do.
 
 The failures are in §3.
 
@@ -158,6 +170,18 @@ sizes 1 and 2 and 3 threads: all identical. Of the new transforms without test
 data, Latn-Deva (300 lines), Latn-Beng (200) and Latn-Hang (104) match ICU 78.3
 run per line, and Hans-Hant and Hant-Hans match on 400 lines of random
 concatenations of the words of their rules (73 KB each, densely overlapping).
+
+**Variable-length texts (W3).** Against ICU's `createFromRules`, all identical:
+
+- about 350 random rule sets with optional items, sets with strings and runs,
+  mixed with other rules and contexts, each on 200 to 3,000 random characters
+  (including segment size 1 and 3 threads);
+- 204 random sets of SingleCaptureDoubleReplacement rules with a shared B, mixed
+  with single-character rules.
+
+tr-Lower, az-Lower and Latn-Hebr, which have no CLDR test data, match ICU 78.3 on
+300 random lines each of letters with combining marks, per line and as whole
+files.
 
 **Regression of the fused kernels.** The fused implementation was compared with
 the previous tconv on every implementable transform (205 names). Each ran on:
@@ -188,10 +212,11 @@ expects `ʼ` (U+02BC) where the rules, and ICU 78.3, give `’` (U+2019).
 `tconv_coverage.py` runs all the cases of a test file as one text, one case per
 line, but each line of the test data is a separate text. Rules that depend on the
 end or start of the text (`[$]`) then see the line breaks instead. This accounts
-for all the other failures it reports: es-es_FONIPA (859), es-zh (619),
-pl-pl_FONIPA (78), ky-ky_FONIPA (65), es_FONIPA-zh (54), ru-zh (40), cs-ko and
-cs_FONIPA-ko (21 each), sk-sk_FONIPA (11), ru-ja (8), zh_Latn_PINYIN-ru (2) and
-ia-ia_FONIPA (1).
+for all the other failures it reports, in 42 files. The largest are es-chr
+(3,514, every case), es_419-chr (985), es-es_FONIPA (859), es-fa (723), es-zh and
+es_419-zh (619 each), and the other `*-chr` transforms (all of their cases). The
+`*-chr` rules end by deleting every character that is not Cherokee, line breaks
+included, so in one text all the lines merge. ICU does the same on such a text.
 Run once per case, tconv passes all of them, as ICU does when applied to each
 line.
 
@@ -273,6 +298,17 @@ on `ccc`, where `DisambiguateOrder` gives the string rule the context `[^c]`,
 which the `Y` then satisfies). Each round drops the matches starting within the
 matches applied in the previous round.
 
+Two more cases were found by the W3 fuzzing and fixed:
+
+- A string rule whose before context ends with a repetition (`a m* { b c → X`)
+  never applied when the context was matched against the converted text, because
+  its after context was not computed (`fusedMatch` short-circuited).
+- In a group whose single-character rules have before contexts matched against
+  the converted text, such a rule could apply within an applied string match: the
+  converted text before the match is seen through its deleted characters
+  (`a a c b → ; b { b → Z` on `baacb`). The single-character rules of such groups
+  now always apply only outside the string matches.
+
 **Repetitions.** A before context may also hold a possessive repetition of a
 set (`[^$cs y] $cs* $cs {` in ky-ky_FONIPA, `[:letter:] [:mark:]* {` in
 Spacedhan-Han), with fixed items between it and the rule and at most one item
@@ -344,7 +380,7 @@ correction, between 108 and 1,853 of each 5,000 differ.
 
 tconv parses the rules (`lib/ldml`). It then restates them as forward rules,
 composes the rules with text to revisit (W6, §5), removes trivial and nullable
-captures, and disambiguates the order of rules
+captures, expands finite texts (W3), and disambiguates the order of rules
 (`DisambiguateOrder`). Finally `ldml::planTransform` plans the transform as a
 sequence of steps:
 
@@ -499,13 +535,13 @@ those of invoked transforms).
 
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 143 | 78 | M (finite) / L (unbounded) |
-| W6 text to revisit, not composed | 44 | 21 | L (with W3) |
+| W6 text to revisit, not composed | 44 | 25 | L (with W3) |
+| W4 insertion rules | 45 | 13 | M |
 | W5 back-references and function calls | 43 | 8 | M–L |
-| W4 insertion rules | 45 | 6 | M |
+| W3 variable-length texts | 55 | 2 | L (the rest) |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W8 built-ins (Any-BreakInternal) | 1 | 0 | L |
-| W9 analysis scale (Han, Japanese) | 1 | 0 | L |
+| W9 analysis scale (Japanese) | 1 | 0 | L |
 
 Done since the first assessment:
 
@@ -515,7 +551,8 @@ Done since the first assessment:
 - W2c expanded non-final characters (`029371343`);
 - W6 revisits, where composition is finite (`eea89e00d`);
 - W2b2 two-way, cyclic and self-overlapping string rules, by sequential
-  selection.
+  selection (`c230d569a`);
+- W3 finite texts, runs and SingleCaptureDoubleReplacement rules (this report).
 
 W7 no longer blocks anything because the proposed CLDR fixes are applied in the
 local `~/cldr` checkout (see W7 below).
@@ -574,23 +611,70 @@ blocked by other items:
 
   Both are W3 cases.
 
-**W3 variable-length texts.** Of the 32 transforms it alone blocks, two rule
-files cause almost all:
+**W3 variable-length texts.** Three mechanisms now cover most of it:
 
-- **und_FONIPA-fa** (26 transforms, the `*-fa` family). Its problems are almost
-  all finite: 14 rules use `?` (`[$] { [iɪ] ː? → ای`), and 23 use sets with
-  strings (`[{t͡ʃ}ʧ] → چ`).
-- **InterIndic-Arabic** (10 `*-Arab` transforms). Its single problem rule is
-  `($alif) $alif+ → $1` (issue #17).
+- **Finite expansion** (`ldml::ExpandFiniteTexts`,
+  `lib/ldml/transform_rules_expand.cpp`). A text with optional items, bounded
+  repetitions or sets with strings (`[{t͡ʃ}ʧ]`) is replaced by one rule for each
+  way it matches. ICU matches possessively and takes the longest string of a set,
+  without backtracking, so each alternative excludes the others:
+  - an absent `x?` requires that the next character is not in `x`;
+  - a shorter string requires that no longer one continues there.
 
-The unbounded cases that remain are mostly runs collapsed or deleted:
+  What may not follow the text becomes the first item of its after context
+  (`[^x]`, including the end of the text). A string that may not follow becomes
+  an alternation (`[^͡] | ͡ [^χ] | …`).
+- **Runs** (`StringRule::run`). A text ending with an unbounded repetition of a
+  set, such as `h h+ → h`, `[sθ]+ → s`, `وو و+ → وو`,
+  `[[:latin:]0-9] { [:mn:]+ → ;` or `(S T*)+`, matches its fixed items and then
+  the longest run of the set. The run is deleted (`MatchStar` within the mask)
+  and covered. Groups with runs are selected sequentially: `LeftmostMatches`
+  follows the run of the selected match by counting trailing ones, across words
+  and strides. Only runs without an after context are supported.
+- **SingleCaptureDoubleReplacement rules**, `before { A (B) C } after → D $1 E`
+  (`TransformStep::singleCaptureDoubleReplacements`). Here A and C have fixed
+  lengths, B is any pattern, and D and E are fixed strings. B stays in place, so
+  only A is replaced by D (at the start of each match) and C by E (at its end),
+  and the match is covered.
+  - The regular expression engine finds the spans and ends, with B possessive.
+  - A's first characters may not occur elsewhere in a match, so the starts are
+    the span positions holding them.
+  - Rules with the same B, contexts, C and E are matched together, by one engine
+    call. D is chosen from the character at the start. The information flows
+    forward only, so D cannot depend on C: Latn-Hebr's six rules take three
+    engine calls, one per C.
+  - These rules may not overlap the string rules of their group.
 
-- `($alif) $alif+ → $1`;
-- `وو و+ → وو`;
-- `[[:latin:]0-9] { [:mn:]+ →` (Latin-ASCII).
+  This covers Latn-Hebr, tr-Lower and az-Lower, and rules with fixed-length B.
 
-A deletion mask (`MatchStar`) and `FilterByMask` handle these without the full
-span model.
+Also: trivial capture elimination now accepts `(X) Y → $1 …` (as `X { Y → …`)
+where the rule cannot match within itself, other than as `(X) X+`. This
+reduces InterIndic-Arabic's `($alif) $alif+ → $1` to `$alif { $alif+ → ;`, a run
+rule (issue #17).
+
+W3 alone now blocks only two transforms:
+
+- Latn-Arab, whose rule `t ($notAbove+) ̈ → ة | $1` also has text to revisit;
+- cy-cy_FONIPA, whose runs are followed by an after context
+  (`$end $cons* { ($vowel [aeiouwy…]*) } [$] → ˈ $1`). The W3 rules that remain mostly also have other problems:
+
+- results that reorder or repeat captures (W5);
+- runs followed by an after context (Grek-Latn/UNGEGN, cy-cy_FONIPA, Zawgyi);
+- runs of sets with strings (`[{i̯}ij]+`);
+- text boundaries in the text (`\. ([$])`);
+- SingleCaptureDoubleReplacement rules that string rules of their group may
+  overlap (byn Xaleget, Zawgyi).
+
+**The MultipleCaptureMultipleReplacement pattern** generalizes the above:
+`T0 (B1) T1 … (Bk) Tk → R0 $1 R1 … $k Rk`, with fixed-length Ti, fixed texts Ri
+and the references in the order of the captures. `ldml_trules --classify-rules`
+counts it:
+
+- 458 rules (forward and backward);
+- 414 with one capture (SingleCaptureDoubleReplacement): 287 of these have text
+  to revisit, 83 have a fixed-length B and no cursor, and 45 a variable B and no
+  cursor;
+- 44 with two to four captures, mostly in my-Zawgyi.
 
 **Converted-text contexts in large groups.** A group of more than 256 string
 rules or subgroups keeps its before contexts matched against the input text,
@@ -636,9 +720,9 @@ The per-transform table lists the problem classes of every transform.
      order of ICU (§3.3) to ICU.
    - Replace the rounds of the converted-text correction by a Pablo `While`
      fixpoint (issue #21), exact for chains of any length.
-2. **W3, finite expansion plus run collapse.** About 78 transforms, mostly through
-   und_FONIPA-fa and InterIndic-Arabic; run collapse also covers the revisits
-   not composed (W6).
+2. **W6 and W4.** The revisits not composed (25 transforms, mostly unbounded
+   runs, which the run rules of W3 now make approachable) and the insertion
+   rules (13).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W5 Title and W7.** Small. They depend on decisions: Title semantics, and
@@ -679,7 +763,8 @@ tconv on every implementable transform.
 | `0686a09d7`, `c2bd705f6` | Any-Hex/XML, Any-Hex/Perl |
 | `ac5a5d095` | Any-Hex/XML and Any-Hex/Perl lengths for five hex digits |
 | `eea89e00d` | W6 composition of revisits: 205; capture texts of single-character rules; string matches within applied matches in the correction kernel |
-| (next) | W2b2 sequential selection of string matches (`LeftmostMatches`): 244 |
+| `c230d569a` | W2b2 sequential selection of string matches (`LeftmostMatches`): 244 |
+| `379de8796` | W3 finite expansion, runs, SingleCaptureDoubleReplacement rules; MultipleCaptureMultipleReplacement classification: 320 |
 
 ## Reproducing
 

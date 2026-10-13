@@ -4,6 +4,7 @@
  */
 
 #include <ldml/transform_rules.h>
+#include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
 #include <map>
 #include <set>
@@ -244,11 +245,13 @@ bool referencesCapture(const RE * re, const Capture * c) {
 }
 
 //  The capture of a trivial capture rule, or nullptr: a forward rule whose
-//  text to replace is a capture and whose completed result begins with a
-//  reference to it.
+//  text to replace is, or begins with, a capture and whose completed result
+//  begins with a reference to it.
 Capture * trivialCapture(const ConversionRule * r) {
     if (r->getDirection() != Direction::Forward) return nullptr;
-    Capture * c = dyn_cast<Capture>(r->getLeftSide()->getText());
+    RE * const text = r->getLeftSide()->getText();
+    Capture * c = dyn_cast<Capture>(text);
+    if (const Seq * seq = dyn_cast<Seq>(text); seq && seq->size() >= 2) c = dyn_cast<Capture>(seq->front());
     if (c == nullptr) return nullptr;
     RE * completed = r->getRightSide()->getCompletedResult();
     const RE * front = completed;
@@ -260,8 +263,8 @@ Capture * trivialCapture(const ConversionRule * r) {
     return (ref && ref->getCapture() == c) ? c : nullptr;
 }
 
-//  before { (X) } after → $n rest | revisit ;   becomes
-//  before X { } after → rest | revisit ;
+//  before { (X) Y } after → $n rest | revisit ;   becomes
+//  before X { Y } after → rest | revisit ;
 //  The capture is retained in the before context if it is referenced
 //  elsewhere in the result.
 Rule * eliminateTrivialCapture(ConversionRule * r) {
@@ -280,10 +283,24 @@ Rule * eliminateTrivialCapture(ConversionRule * r) {
     const bool referenced = referencesCapture(rest, c) || referencesCapture(res->getResultToRevisit(), c);
     RE * moved = referenced ? static_cast<RE *>(c) : c->getCapturedRE();
     RE * before = src->hasBeforeContext() ? makeSeq({src->getBeforeContext(), moved}) : moved;
-    RuleSide * source = RuleSide::Create(before, makeSeq(), false, nullptr, 0, src->getAfterContext());
+    RE * text = makeSeq();
+    if (const Seq * seq = dyn_cast<Seq>(src->getText())) text = makeSeq(seq->begin() + 1, seq->end());
+    RuleSide * source = RuleSide::Create(before, text, false, nullptr, 0, src->getAfterContext());
     RuleSide * result = RuleSide::Create(nullptr, rest, res->hasCursor(), res->getResultToRevisit(), res->getCursorOffset(), nullptr);
     // Renumber the captures, as the moved capture may no longer be a capture.
     return CaptureRewriter().rewrite(makeConversionRule(source, Direction::Forward, result));
+}
+
+//  Whether a trivial capture rule with a text (X) Y may also match within its
+//  own text without changing the result: its text is (X) X+ (the repetition
+//  possessive, so that the transformed rule X { X+ } takes the whole run).
+bool selfOverlapSafe(const ConversionRule * r) {
+    const Seq * seq = dyn_cast<Seq>(r->getLeftSide()->getText());
+    if (seq == nullptr || seq->size() != 2) return false;
+    const Capture * c = dyn_cast<Capture>(seq->front());
+    const Rep * rep = dyn_cast<Rep>(seq->back());
+    return c && rep && rep->getLB() >= 1 && rep->getUB() == Rep::UNBOUNDED_REP
+           && printPattern(rep->getRE()) == printPattern(c->getCapturedRE());
 }
 
 } // end anonymous namespace
@@ -328,6 +345,10 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
             if (j > i && analysis.mayOverlap(r, s)) blocked.laterRules.push_back(s);
             // Any rule that may match at a position within X.
             if (analysis.mayMatchWithin(s, r)) blocked.withinRules.push_back(s);
+        }
+        // With a text (X) Y, also the rule itself, within X or at Y.
+        if (isa<Seq>(r->getLeftSide()->getText()) && !selfOverlapSafe(r) && analysis.mayMatchWithin(r, r)) {
+            blocked.withinRules.push_back(r);
         }
         if (!blocked.laterRules.empty() || !blocked.withinRules.empty()) {
             if (stats) {

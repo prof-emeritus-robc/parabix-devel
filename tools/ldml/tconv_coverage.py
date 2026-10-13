@@ -44,7 +44,7 @@ WORK_ITEMS = collections.OrderedDict([
     ('W2b1 one-way string overlaps', ['S-W2b-single-pass']),
     ('W2b2 cyclic/two-way string overlaps', ['S-W2b-self', 'S-W2b-cycle', 'S-W2b-two-way', 'S-match-within-string-rule']),
     ('W2c expanded non-final', ['S-expanded-nonfinal']),
-    ('W3 variable-length text', ['T-repetition', 'T-setstrings', 'T-variable', 'T-boundary']),
+    ('W3 variable-length text', ['T-repetition', 'T-setstrings', 'T-variable', 'T-boundary', 'T-capture-overlap']),
     ('W4 insertion', ['T-insertion']),
     ('W5 captures/functions', ['R-backref', 'R-funcall', 'R-other']),
     ('W6 revisit', ['C-revisit']),
@@ -125,6 +125,10 @@ def classify_problem(p):
         return 'O-order-dependent'
     if '(may match within the text of' in p:
         return 'S-match-within-string-rule'
+    if 'ends with a repetition followed by an after context' in p:
+        return 'T-repetition'
+    if 'may overlap this SingleCaptureDoubleReplacement rule' in p or 'may overlap this capture rule' in p:
+        return 'T-capture-overlap'
     if 'is expanded for a longer replacement' in p:
         return 'S-expanded-nonfinal'
     if '(the result has text to revisit)' in p:

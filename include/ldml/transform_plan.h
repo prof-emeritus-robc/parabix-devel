@@ -61,7 +61,8 @@ struct CharMapSubgroup {
     UCD::UnicodeSet characters() const;
 };
 
-// A conversion rule replacing a fixed-length text of two or more characters.
+// A conversion rule replacing a fixed-length text of two or more characters
+// (or of one character, followed by a run).
 struct StringRule {
     std::vector<UCD::UnicodeSet> text;  // the characters at each position of the text
     std::u32string replacement;
@@ -77,6 +78,42 @@ struct StringRule {
     // every other one after it apply (as ICU, scanning from the left, applies
     // the leftmost of overlapping matches).
     bool selfOverlapping = false;
+    // A run: the text is followed by the longest run of characters of this set
+    // (possibly none), which is deleted (S+ → x ; has the text S and the run S).
+    // The rule then has no after context, and its group is selected
+    // sequentially (TransformStep::sequentialSelection).
+    UCD::UnicodeSet run;
+};
+
+// A SingleCaptureDoubleReplacement rule: a conversion rule
+//      before { A (B) C } after → D $1 E ;
+// where A and C are
+// fixed-length texts (A not empty), B is any pattern, and D and E are fixed
+// strings: A is replaced by D and C by E, and B is kept.
+struct SingleCaptureDoubleReplacement {
+    std::vector<UCD::UnicodeSet> a;     // the characters at each position of A
+    std::u32string d;
+    const ConversionRule * rule = nullptr;
+};
+
+// The SingleCaptureDoubleReplacement rules of a group with the same capture B,
+// contexts, C and E,
+// matched together, by the regular expression engine (A B C, with the union
+// of the sets of A at each position): the span of a match begins at a
+// position of A[0], whose characters may occur nowhere else in a match, and
+// the rule applying is the first whose A matches there.  (The engine gives
+// the spans and ends of the matches, from which D, known from the characters
+// of A, is written at the start, and E at the end; as the rules differ only
+// in A and D, no information about the end of a match is needed at its start.)
+struct SingleCaptureDoubleReplacementSet {
+    re::RE * middle = nullptr;                 // B
+    std::vector<UCD::UnicodeSet> c;
+    std::u32string e;
+    re::RE * before = nullptr;
+    re::RE * after = nullptr;
+    re::RE * engineBefore = nullptr;
+    re::RE * engineAfter = nullptr;
+    std::vector<SingleCaptureDoubleReplacement> rules;
 };
 
 struct TransformStep {
@@ -106,6 +143,9 @@ struct TransformStep {
     // ICU applies them.  stringOrder then lists all the string rules, in
     // order, with no predecessors.
     bool sequentialSelection = false;
+    // The SingleCaptureDoubleReplacement rules (see SingleCaptureDoubleReplacementSet), which may not overlap the string
+    // rules; the single-character rules apply outside their matches.
+    std::vector<SingleCaptureDoubleReplacementSet> singleCaptureDoubleReplacements;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

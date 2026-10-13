@@ -586,9 +586,15 @@ static const EliminationTestCase trivialTestCases[] = {
     {"(bc) → $1 z ; x { c → w ;", "bc { → z ;\nx { c → w ;\n"},
     {"(bc) → $1 z ; b { c → w ;", "(bc) → $1 z ;\nb { c → w ;\n"},
     {"(b) → $1 x ; b ← y ;", "b { → x ;\nb ← y ;\n"},
-    // Unchanged: reference not first, text not only the capture, not a forward rule.
+    // A text beginning with the capture: the rest stays the text.
+    {"(b) c → $1 ;", "b { c → ;\n"},
+    {"(b) c d → $1 x ; e → y ;", "b { cd → x ;\ne → y ;\n"},
+    // ... unless the rule itself may match within its text, other than as (X) X+.
+    {"(a) a → $1 ;", "(a) a → $1 ;\n"},
+    {"(a) a+ → $1 x ;", "a { a+ → x ;\n"},
+    {"(b) c → $1 ; c → y ;", "(b) c → $1 ;\nc → y ;\n"},
+    // Unchanged: reference not first, not a forward rule.
     {"(b) → x $1 ;", "(b) → x $1 ;\n"},
-    {"(b) c → $1 ;", "(b) c → $1 ;\n"},
     {"(b) → &Any-Hex($1) ;", "(b) → &Any-Hex($1) ;\n"},
     {"(b) ↔ $1 x ;", "(b) ↔ $1 x ;\n"},
     {"$1 x ← (b) ;", "$1 x ← (b) ;\n"},
@@ -1170,11 +1176,111 @@ static std::string classifyInsertion(const ConversionRule * cr, re::RE ** captur
     return "copy (no insertion)";
 }
 
+// The SingleCaptureDoubleReplacement pattern A (B) C → D $1 E: a text to
+// replace with one capture, between
+// fixed-length texts A and C (possibly empty), and a result of fixed text D,
+// the reference to the capture and fixed text E.  Returns an empty string if
+// the rule does not have this form, and otherwise its class: the length of B,
+// whether A and C are strings (or have sets), and whether the result has
+// text to revisit.
+static std::string classifySingleCaptureDoubleReplacement(const ConversionRule * cr) {
+    using namespace re;
+    const RuleSide * const source = cr->getSourceSide(Direction::Forward);
+    const RuleSide * const result = cr->getResultSide(Direction::Forward);
+    std::vector<RE *> text;
+    flattenItems(source->getText(), text);
+    size_t at = text.size();
+    for (size_t i = 0; i < text.size(); i++) {
+        if (llvm::isa<Capture>(text[i])) {
+            if (at != text.size()) return "";
+            at = i;
+        }
+    }
+    if (at == text.size()) return "";
+    Capture * const capture = llvm::cast<Capture>(text[at]);
+    std::vector<Capture *> captures;
+    collectCaptures(source->getText(), captures);
+    if (captures.size() != 1) return "";
+    bool literal = true;
+    for (size_t i = 0; i < text.size(); i++) {
+        if (i == at) continue;
+        const std::string length = classifyTextLength(text[i]);
+        if (length.compare(0, 8, "variable") == 0) return "";
+        literal &= isFixedText(text[i]);
+    }
+    std::vector<RE *> items;
+    flattenItems(result->getText(), items);
+    bool referenced = false;
+    for (RE * item : items) {
+        if (Reference * ref = llvm::dyn_cast<Reference>(item)) {
+            if (referenced || ref->getName() != capture->getName()) return "";
+            referenced = true;
+        } else if (!isFixedText(item)) {
+            return "";
+        }
+    }
+    if (!referenced) return "";
+    std::string b = classifyTextLength(capture->getCapturedRE());
+    if (b.compare(0, 8, "variable") != 0) b = "fixed";
+    return "B " + b + " | A, C " + (literal ? "strings" : "with sets") + " | " + classifyRevisit(result);
+}
+
+// The MultipleCaptureMultipleReplacement pattern, generalizing
+// SingleCaptureDoubleReplacement: a text to replace
+//      T0 (B1) T1 (B2) ... (Bk) Tk
+// with k >= 1 captures, of any patterns Bi, and fixed-length texts Ti
+// (possibly empty), and a result
+//      R0 $1 R1 $2 ... $k Rk
+// of fixed texts Ri and a reference to each capture, in the order of the
+// captures.  Returns an empty string if the rule does not have this form, and
+// otherwise its class: the number of captures, whether their patterns all have
+// fixed lengths, and whether the result has text to revisit.
+static std::string classifyMultipleCaptureMultipleReplacement(const ConversionRule * cr) {
+    using namespace re;
+    const RuleSide * const source = cr->getSourceSide(Direction::Forward);
+    const RuleSide * const result = cr->getResultSide(Direction::Forward);
+    std::vector<RE *> text;
+    flattenItems(source->getText(), text);
+    std::vector<Capture *> captures;
+    bool fixedCaptures = true;
+    for (RE * item : text) {
+        if (Capture * c = llvm::dyn_cast<Capture>(item)) {
+            std::vector<Capture *> nested;
+            collectCaptures(c->getCapturedRE(), nested);
+            if (!nested.empty()) return "";
+            captures.push_back(c);
+            fixedCaptures &= classifyTextLength(c->getCapturedRE()).compare(0, 8, "variable") != 0;
+        } else {
+            std::vector<Capture *> nested;
+            collectCaptures(item, nested);
+            if (!nested.empty()) return "";
+            if (classifyTextLength(item).compare(0, 8, "variable") == 0) return "";
+        }
+    }
+    if (captures.empty()) return "";
+    std::vector<RE *> items;
+    flattenItems(result->getText(), items);
+    size_t next = 0;
+    for (RE * item : items) {
+        if (Reference * ref = llvm::dyn_cast<Reference>(item)) {
+            if (next == captures.size() || ref->getName() != captures[next]->getName()) return "";
+            next++;
+        } else if (!isFixedText(item)) {
+            return "";
+        }
+    }
+    if (next != captures.size()) return "";
+    const std::string k = captures.size() == 1 ? "1 (SingleCaptureDoubleReplacement)" : std::to_string(captures.size());
+    return k + " | captures " + (fixedCaptures ? "fixed length" : "variable") + " | " + classifyRevisit(result);
+}
+
 struct RuleClassCounts {
     // dimension -> direction -> class -> count
     std::map<std::string, std::map<std::string, std::map<std::string, unsigned>>> byDimension;
     // signature -> (count, example rule, file)
     std::map<std::string, std::tuple<unsigned, std::string, std::string>> signatures;
+    std::map<std::string, unsigned> patternFiles;     // the rules of the pattern A (B) C → D $1 E, by file
+    std::map<std::string, unsigned> multipleFiles;    // the MultipleCaptureMultipleReplacement rules, by file
     unsigned rules = 0;
 };
 
@@ -1221,6 +1327,26 @@ static void classifyRules(const std::vector<std::string> & tRules, const std::st
             re::RE * captured = nullptr;
             const std::string insertion = classifyInsertion(cr, &captured);
             counts.byDimension["simple insertion"][dir][insertion.empty() ? "not a simple insertion rule" : insertion]++;
+            const std::string multiple = classifyMultipleCaptureMultipleReplacement(cr);
+            counts.byDimension["MultipleCaptureMultipleReplacement"][dir][multiple.empty() ? "other rules" : multiple]++;
+            if (!multiple.empty()) {
+                auto & e = counts.signatures["MultipleCaptureMultipleReplacement: " + multiple];
+                if (std::get<0>(e)++ == 0) {
+                    std::get<1>(e) = printRule(r);
+                    std::get<2>(e) = label;
+                }
+                counts.multipleFiles[label]++;
+            }
+            const std::string pattern = classifySingleCaptureDoubleReplacement(cr);
+            counts.byDimension["SingleCaptureDoubleReplacement A (B) C → D $1 E"][dir][pattern.empty() ? "other rules" : pattern]++;
+            if (!pattern.empty()) {
+                auto & e = counts.signatures["SingleCaptureDoubleReplacement A (B) C → D $1 E: " + pattern];
+                if (std::get<0>(e)++ == 0) {
+                    std::get<1>(e) = printRule(r);
+                    std::get<2>(e) = label;
+                }
+                counts.patternFiles[label]++;
+            }
             if (!insertion.empty()) {
                 counts.byDimension["simple insertion: captured text"][dir][classifyTextLength(captured)]++;
             }
@@ -1260,6 +1386,19 @@ static const EliminationTestCase ruleClassTestCases[] = {
     {"a → y @| ;", "1 | 0 | no captures | skip past result (@|)"},
 };
 
+static const EliminationTestCase multipleCaptureTestCases[] = {
+    {"a (b+) c → x $1 y ;", "1 (SingleCaptureDoubleReplacement) | captures variable | none"},
+    {"a (b) c (d) → x $1 $2 ;", "2 | captures fixed length | none"},
+    {"(b) [cd] (e+) f → $1 x $2 ;", "2 | captures variable | none"},
+    {"(b) (c) → $1 x $2 | y ;", "2 | captures fixed length | revisit part of result"},
+    {"(b) (c) → $2 $1 ;", ""},          // references out of order
+    {"(b) (c) → $1 ;", ""},             // not every capture referenced
+    {"(b) (c) → $1 $1 $2 ;", ""},       // a capture referenced twice
+    {"a+ (b) → $1 ;", ""},              // variable-length text outside the captures
+    {"(b) → &Any-Hex($1) ;", ""},       // a reference in a function call
+    {"a → x ;", ""},
+};
+
 static const EliminationTestCase insertionClassTestCases[] = {
     {"(a) → $1 x ;", "insert after"},
     {"(a) → x $1 ;", "insert before"},
@@ -1278,7 +1417,8 @@ static const EliminationTestCase insertionClassTestCases[] = {
 static void reportRuleClasses(const RuleClassCounts & counts) {
     std::cout << "Total: " << counts.rules << " conversion rules (forward and backward)\n";
     for (const char * dim : {"text to replace", "captures", "capture order", "revisiting",
-                             "simple insertion", "simple insertion: captured text"}) {
+                             "simple insertion", "simple insertion: captured text", "SingleCaptureDoubleReplacement A (B) C → D $1 E",
+                             "MultipleCaptureMultipleReplacement"}) {
         const auto it = counts.byDimension.find(dim);
         if (it == counts.byDimension.end()) continue;
         std::map<std::string, std::pair<unsigned, unsigned>> rows;
@@ -1300,6 +1440,10 @@ static void reportRuleClasses(const RuleClassCounts & counts) {
         std::cout << "  " << std::get<0>(s.second) << "\t" << s.first << "\n      e.g. " << std::get<1>(s.second)
                   << "\t" << std::get<2>(s.second) << "\n";
     }
+    std::cout << "\n== SingleCaptureDoubleReplacement A (B) C → D $1 E: rules by file\n";
+    for (const auto & f : counts.patternFiles) std::cout << "  " << f.second << "\t" << f.first << "\n";
+    std::cout << "\n== MultipleCaptureMultipleReplacement: rules by file\n";
+    for (const auto & f : counts.multipleFiles) std::cout << "  " << f.second << "\t" << f.first << "\n";
 }
 
 // The contexts of the first rule, for the regular expression engine
@@ -1512,6 +1656,20 @@ static int runSelfTest() {
         try {
             const std::vector<Rule *> rules = NullableCaptureElimination(parseTransformRules({t.input}));
             failures += !checkOutput("elimination", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
+    for (const EliminationTestCase & t : multipleCaptureTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.input});
+            const std::string actual = classifyMultipleCaptureMultipleReplacement(llvm::cast<ConversionRule>(rules.back()));
+            if (actual != t.expected) {
+                failures++;
+                std::cerr << "FAIL (multiple capture class): " << t.input << "\n  expected: " << t.expected << "\n  actual:   " << actual << "\n";
+            }
         } catch (const TransformRuleParseError & e) {
             failures++;
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";

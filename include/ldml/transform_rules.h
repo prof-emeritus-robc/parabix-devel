@@ -696,6 +696,37 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
 //  a → x ; does.
 std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules);
 
+//  Expansion of finite texts.
+//
+//  A forward conversion rule whose text to replace has finitely many lengths
+//  (optional items x?, bounded repetitions, and sets with strings such as
+//  [{t͡ʃ}ʧ]) is replaced by rules with fixed-length texts, one for each way
+//  the text matches.  ICU matches the text possessively: an optional item or
+//  repetition takes what it can, and a set with strings takes its longest
+//  string matching, without backtracking.  So each alternative excludes the
+//  others: where an optional item is absent, the next character is not in its
+//  set (x? y becomes x y, and y without the characters of x), and where a
+//  shorter string of a set is taken, the text does not continue with a longer
+//  one ([{ab}a] c becomes ab c, and a c without b).  What may not follow the
+//  end of the text becomes a first item of the after context ([^x], which
+//  includes the end of the text).  The alternatives are mutually exclusive, so
+//  their order does not matter; they are given with the optional items present
+//  and the longest strings first.
+//
+//  A rule is left unchanged (reported in the stats) if its text has unbounded
+//  repetitions, the text boundary, or alternatives that are not single
+//  characters or strings; if its result refers to captures; if a string of
+//  two or more characters may not follow the text; if its after context does
+//  not begin with a set where a character may not follow; or if it has more
+//  than 64 alternatives.  Captures not referred to are dropped.
+struct FiniteTextStats {
+    unsigned candidates = 0;        // rules whose texts are not fixed-length
+    unsigned expanded = 0;
+    unsigned rules = 0;             // the rules replacing them
+    std::vector<std::pair<const Rule *, std::string>> notExpanded;  // with the reason
+};
+std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats = nullptr);
+
 //  Composition of revisits.
 //
 //  A forward conversion rule whose result has text to revisit,

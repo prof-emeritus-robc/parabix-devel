@@ -93,4 +93,40 @@ protected:
     void generatePabloMethod() override;
 };
 
+//
+//  As HexDecode, for spans of decimal digits ([0-9], at most 8 significant
+//  ones): at the end of each span, its value, if at most 10FFFF, and otherwise
+//  a mark in overflow (the basis copied there).
+//
+class DecimalDecode final : public pablo::PabloKernel {
+public:
+    DecimalDecode(LLVMTypeSystemInterface & ts, StreamSet * sourceBasis, StreamSet * decSpans,
+                  StreamSet * decoded, StreamSet * overflow);
+protected:
+    void generatePabloMethod() override;
+};
+
+//
+//  The forms of escaped codepoints decoded by the Hex-Any transforms (ICU's
+//  variants): Java (\uXXXX), C (also \UXXXXXXXX), Perl (\x{X...}, 1 to 6
+//  digits), Unicode (U+XXXX, 4 to 6), XML (&#xX...;, 1 to 6) and XML10 (&#D...;,
+//  1 to 7 decimal digits).  Hex-Any itself decodes all of them.
+//
+enum HexEscapeForm : unsigned {
+    HexEscapeJava = 1, HexEscapeC = 2, HexEscapePerl = 4, HexEscapeUnicode = 8, HexEscapeXML = 16, HexEscapeXML10 = 32,
+    HexEscapeAll = 63
+};
+
+//
+//  Decode the escaped codepoints of the given forms in U21 (within mask, if
+//  not null: all the characters of an escape must be in it), as ICU 78:
+//  the hex digits may be in either case, the prefixes are case-sensitive, an
+//  escape of a value beyond 10FFFF is deleted, a high surrogate decoded right
+//  before a low surrogate makes one codepoint with it, and a lone surrogate
+//  becomes U+FFFD.  keeps receives the masks of the positions kept by each of
+//  the deletions made (in order), to keep other streams in step.
+//
+void HexAnyPipeline(kernel::PipelineBuilder & p, unsigned forms, StreamSet * U21, StreamSet * mask, StreamSet * U21_out,
+                    std::vector<StreamSet *> & keeps);
+
 }

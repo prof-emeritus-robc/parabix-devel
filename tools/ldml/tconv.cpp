@@ -131,7 +131,7 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode, HexC, HexXML, HexPerl};
+enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode, HexC, HexXML, HexPerl, HexDecode};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
@@ -140,7 +140,22 @@ static const std::vector<std::pair<std::string, Transform>> implementedTransform
     {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},
     {"Any-Hex/Unicode", Transform::HexUnicode}, {"Any-Hex/C", Transform::HexC},
     {"Any-Hex/XML", Transform::HexXML},  {"Any-Hex/Perl", Transform::HexPerl},
+    {"Hex-Any", Transform::HexDecode}, {"Hex-Any/Java", Transform::HexDecode}, {"Hex-Any/C", Transform::HexDecode},
+    {"Hex-Any/Perl", Transform::HexDecode}, {"Hex-Any/Unicode", Transform::HexDecode},
+    {"Hex-Any/XML", Transform::HexDecode}, {"Hex-Any/XML10", Transform::HexDecode},
 };
+
+//  The forms of escapes decoded by each Hex-Any transform (see kernel::HexEscapeForm).
+static unsigned hexDecodeForms(const std::string & name) {
+    if (name == "Hex-Any") return HexEscapeAll;
+    if (name == "Hex-Any/Java") return HexEscapeJava;
+    if (name == "Hex-Any/C") return HexEscapeC;
+    if (name == "Hex-Any/Perl") return HexEscapePerl;
+    if (name == "Hex-Any/Unicode") return HexEscapeUnicode;
+    if (name == "Hex-Any/XML") return HexEscapeXML;
+    if (name == "Hex-Any/XML10") return HexEscapeXML10;
+    return 0;
+}
 
 //  Basis bits of a byte stream.
 static StreamSet * BasisOf(PipelineBuilder & P, StreamSet * Bytes) {
@@ -461,7 +476,8 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
         case Transform::HexC:
         case Transform::HexXML:
         case Transform::HexPerl:
-            llvm::report_fatal_error("tconv: Any-Title and Any-Hex (/Java, /Unicode, /C, /XML, /Perl) are implemented by the rule pipeline");
+        case Transform::HexDecode:
+            llvm::report_fatal_error("tconv: Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /Perl) are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -3318,6 +3334,7 @@ private:
     StreamSet * hexC(StreamSet * U21);
     StreamSet * hexXML(StreamSet * U21);
     StreamSet * hexPerl(StreamSet * U21);
+    StreamSet * hexDecode(unsigned forms, StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
@@ -3456,7 +3473,20 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Hex/C") return hexC(U21);
     if (name == "Any-Hex/XML") return hexXML(U21);
     if (name == "Any-Hex/Perl") return hexPerl(U21);
+    if (const unsigned forms = hexDecodeForms(name)) return hexDecode(forms, U21);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
+}
+
+//  Hex-Any (and its variants): the escapes decoded (within the filter, if any),
+//  with the masks kept in step with the positions deleted.
+StreamSet * RulePipelineBuilder::hexDecode(unsigned forms, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    std::vector<StreamSet *> keeps;
+    StreamSet * const decoded = P.CreateStreamSet(21, 1);
+    HexAnyPipeline(P, forms, U21, activeMask(), decoded, keeps);
+    for (StreamSet * keep : keeps) filterMasks(keep);
+    SHOW_BIXNUM(decoded);
+    return decoded;
 }
 
 StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamSet * U21) {
@@ -5029,7 +5059,7 @@ int main(int argc, char *argv[]) {
                         && impl->second != Transform::Title && impl->second != Transform::HexJava
                         && impl->second != Transform::HexUnicode
                         && impl->second != Transform::HexC && impl->second != Transform::HexXML
-                        && impl->second != Transform::HexPerl;
+                        && impl->second != Transform::HexPerl && impl->second != Transform::HexDecode;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
     applyToInput(fn, fd);

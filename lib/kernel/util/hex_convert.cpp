@@ -837,3 +837,252 @@ void HexDecode::generatePabloMethod() {
         pb.createAssign(pb.createExtract(getOutput(0), i), outputVars[i]);
     }
 }
+
+DecimalDecode::DecimalDecode(LLVMTypeSystemInterface & ts, StreamSet * sourceBasis, StreamSet * decSpans,
+                             StreamSet * decoded, StreamSet * overflow)
+        : PabloKernel(ts, "DecimalDecode" + sourceBasis->shapeString(),
+                      {Binding{"sourceBasis", sourceBasis}, Binding{"decSpans", decSpans, FixedRate(), LookAhead(1)}},
+                      {Binding{"decoded", decoded}, Binding{"overflow", overflow}}) {
+    assert(sourceBasis->getNumElements() == 21);
+}
+
+void DecimalDecode::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    std::vector<PabloAST *> sourceBasis = getInputStreamSet("sourceBasis");
+    PabloAST * decSpans = getInputStreamSet("decSpans")[0];
+    BixNumCompiler bnc(pb);
+    //  27 bits hold the values of 8 decimal digits.
+    constexpr unsigned W = 27;
+    auto advance = [&](BixNum v, unsigned n) {
+        for (PabloAST *& b : v) b = pb.createAdvance(b, n);
+        return v;
+    };
+    PabloAST * spanEnd = pb.createAnd(decSpans, pb.createNot(pb.createLookahead(decSpans, 1)));
+    //  The value of the digits of the span up to each position, by doubling: of
+    //  the last 2, 4 and 8 digits, each part taken where the span covers the
+    //  positions it comes from (as for HexDecode).
+    BixNum digit = bnc.ZeroExtend(bnc.Truncate(sourceBasis, 4), W);
+    PabloAST * runOf2 = pb.createAnd(decSpans, pb.createAdvance(decSpans, 1));
+    BixNum value2 = bnc.AddModular(digit, bnc.MulModular(bnc.Select(runOf2, advance(digit, 1)), 10));
+    PabloAST * runOf3 = pb.createAnd(decSpans, pb.createAdvance(runOf2, 1));
+    BixNum value4 = bnc.AddModular(value2, bnc.MulModular(bnc.Select(runOf3, advance(value2, 2)), 100));
+    PabloAST * runOf5 = pb.createAnd(runOf2, pb.createAdvance(runOf3, 2));
+    BixNum value8 = bnc.AddModular(value4, bnc.MulModular(bnc.Select(runOf5, advance(value4, 4)), 10000));
+    PabloAST * overflow = pb.createAnd(spanEnd, bnc.UGT(value8, 0x10FFFF));
+    BixNum decoded = bnc.Select(pb.createAnd(spanEnd, pb.createNot(overflow)), bnc.Truncate(value8, 21), sourceBasis);
+    for (unsigned i = 0; i < 21; i++) {
+        pb.createAssign(pb.createExtract(getOutputStreamVar("decoded"), pb.getInteger(i)), decoded[i]);
+    }
+    pb.createAssign(pb.createExtract(getOutputStreamVar("overflow"), pb.getInteger(0)), overflow);
+}
+
+//  The escapes of the given forms (see HexEscapeForm): the spans of their hex
+//  and decimal digits, the positions to remove (the prefixes, the digits other
+//  than the last, the terminators, and the whole of an escape of a value beyond
+//  10FFFF, of which hex values are recognized here), and the last digits of
+//  the other escapes (Ends).  An escape is recognized at its first position,
+//  from the classes of the characters ahead (within the mask).
+class HexEscapes final : public pablo::PabloKernel {
+public:
+    HexEscapes(LLVMTypeSystemInterface & ts, unsigned forms, StreamSet * U21, StreamSet * mask,
+               StreamSet * hexSpans, StreamSet * decSpans, StreamSet * remove, StreamSet * ends)
+        : PabloKernel(ts, "HexEscapes" + std::to_string(forms) + (mask ? "m" : ""),
+                      [&] {
+                          Bindings b{Binding{"U21", U21, FixedRate(), LookAhead(Lookahead)}};
+                          if (mask) b.emplace_back("mask", mask, FixedRate(), LookAhead(Lookahead));
+                          return b;
+                      }(),
+                      {Binding{"hexSpans", hexSpans}, Binding{"decSpans", decSpans}, Binding{"remove", remove},
+                       Binding{"ends", ends}}),
+          mForms(forms), mHasMask(mask != nullptr) {}
+protected:
+    void generatePabloMethod() override;
+private:
+    static constexpr unsigned Lookahead = 10;      // the longest escape: 10 positions
+    const unsigned mForms;
+    const bool mHasMask;
+};
+
+void HexEscapes::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+    PabloAST * const mask = mHasMask ? getInputStreamSet("mask")[0] : nullptr;
+    //  The classes of the characters k positions ahead (within the mask).
+    std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> ahead(Lookahead + 1);
+    std::map<std::pair<unsigned, std::string>, PabloAST *> memo;
+    auto cls = [&](unsigned k, re::CC * cc) -> PabloAST * {
+        auto & m = memo[{k, cc->canonicalName()}];
+        if (m) return m;
+        if (!ahead[k]) {
+            std::vector<PabloAST *> bits(basis.size());
+            for (unsigned b = 0; b < basis.size(); b++) bits[b] = k ? pb.createLookahead(basis[b], k) : basis[b];
+            ahead[k] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
+        }
+        PabloAST * c = ahead[k]->compileCC(cc, pb);
+        if (mask) c = pb.createAnd(c, k ? pb.createLookahead(mask, k) : mask);
+        return m = c;
+    };
+    re::CC * const hex = re::makeCC(re::makeCC(re::makeCC('0', '9'), re::makeCC('A', 'F')), re::makeCC('a', 'f'));
+    re::CC * const dec = re::makeCC('0', '9');
+    re::CC * const hexNonzero = re::makeCC(re::makeCC(re::makeCC('1', '9'), re::makeCC('A', 'F')), re::makeCC('a', 'f'));
+    re::CC * const hexAtLeast2 = re::makeCC(re::makeCC(re::makeCC('2', '9'), re::makeCC('A', 'F')), re::makeCC('a', 'f'));
+    re::CC * const one = re::makeCC('1');
+    struct Form {
+        unsigned flag;
+        std::vector<re::CC *> prefix;
+        bool decimal;
+        unsigned minDigits, maxDigits;
+        re::CC * terminator;            // or nullptr
+    };
+    const std::vector<Form> forms = {
+        {HexEscapeJava | HexEscapeC, {re::makeCC('\\'), re::makeCC('u')}, false, 4, 4, nullptr},
+        {HexEscapeC, {re::makeCC('\\'), re::makeCC('U')}, false, 8, 8, nullptr},
+        {HexEscapePerl, {re::makeCC('\\'), re::makeCC('x'), re::makeCC('{')}, false, 1, 6, re::makeCC('}')},
+        {HexEscapeUnicode, {re::makeCC('U'), re::makeCC('+')}, false, 4, 6, nullptr},
+        {HexEscapeXML, {re::makeCC('&'), re::makeCC('#'), re::makeCC('x')}, false, 1, 6, re::makeCC(';')},
+        {HexEscapeXML10, {re::makeCC('&'), re::makeCC('#')}, true, 1, 7, re::makeCC(';')},
+    };
+    PabloAST * hexSpans = pb.createZeroes();
+    PabloAST * decSpans = pb.createZeroes();
+    PabloAST * remove = pb.createZeroes();
+    PabloAST * ends = pb.createZeroes();
+    for (const Form & f : forms) {
+        if ((f.flag & mForms) == 0) continue;
+        const unsigned a = f.prefix.size();
+        re::CC * const digit = f.decimal ? dec : hex;
+        PabloAST * prefix = pb.createOnes();
+        for (unsigned k = 0; k < a; k++) prefix = pb.createAnd(prefix, cls(k, f.prefix[k]));
+        for (unsigned n = f.minDigits; n <= f.maxDigits; n++) {
+            //  An escape of n digits starting here: the digits, then the
+            //  terminator, or (without one) a character other than a digit,
+            //  unless the escape has the most digits (taken as they come).
+            PabloAST * start = prefix;
+            for (unsigned k = 0; k < n; k++) start = pb.createAnd(start, cls(a + k, digit));
+            if (f.terminator) {
+                start = pb.createAnd(start, cls(a + n, f.terminator));
+            } else if (n < f.maxDigits) {
+                start = pb.createAnd(start, pb.createNot(cls(a + n, digit)));
+            }
+            //  A hex value beyond 10FFFF: of 6 digits, 2 or more, or 1 then not 0;
+            //  of 8, also not two leading zeros.
+            PabloAST * over = pb.createZeroes();
+            if (!f.decimal && n >= 6) {
+                const unsigned d = a + n - 6;
+                over = pb.createOr(cls(d, hexAtLeast2), pb.createAnd(cls(d, one), cls(d + 1, hexNonzero)));
+                for (unsigned k = a; k < d; k++) over = pb.createOr(over, cls(k, hexNonzero));
+                over = pb.createAnd(start, over);
+            }
+            for (unsigned k = 0; k < a; k++) remove = pb.createOr(remove, pb.createAdvance(start, k));
+            for (unsigned k = 0; k < n; k++) {
+                PabloAST * const at = pb.createAdvance(start, a + k);
+                if (f.decimal) decSpans = pb.createOr(decSpans, at); else hexSpans = pb.createOr(hexSpans, at);
+                if (k + 1 < n) remove = pb.createOr(remove, at);
+            }
+            remove = pb.createOr(remove, pb.createAdvance(over, a + n - 1));
+            if (f.terminator) remove = pb.createOr(remove, pb.createAdvance(start, a + n));
+            ends = pb.createOr(ends, pb.createAdvance(pb.createAnd(start, pb.createNot(over)), a + n - 1));
+        }
+    }
+    pb.createAssign(pb.createExtract(getOutputStreamVar("hexSpans"), pb.getInteger(0)), hexSpans);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("decSpans"), pb.getInteger(0)), decSpans);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("remove"), pb.getInteger(0)), remove);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("ends"), pb.getInteger(0)), ends);
+}
+
+//  The positions kept (not removed, nor marked in overflow), and the ends of the
+//  escapes decoded (not in overflow).
+class HexEscapesKept final : public pablo::PabloKernel {
+public:
+    HexEscapesKept(LLVMTypeSystemInterface & ts, StreamSet * remove, StreamSet * overflow, StreamSet * ends,
+                   StreamSet * keep, StreamSet * decodedEnds)
+        : PabloKernel(ts, "HexEscapesKept",
+                      {Binding{"remove", remove}, Binding{"overflow", overflow}, Binding{"ends", ends}},
+                      {Binding{"keep", keep}, Binding{"decodedEnds", decodedEnds}}) {}
+protected:
+    void generatePabloMethod() override {
+        pablo::PabloBuilder pb(getEntryScope());
+        PabloAST * const overflow = getInputStreamSet("overflow")[0];
+        PabloAST * const removed = pb.createOr(getInputStreamSet("remove")[0], overflow);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("keep"), pb.getInteger(0)), pb.createInFile(pb.createNot(removed)));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("decodedEnds"), pb.getInteger(0)),
+                        pb.createAnd(getInputStreamSet("ends")[0], pb.createNot(overflow)));
+    }
+};
+
+//  The surrogates decoded (at Ends): a high surrogate followed by a low one
+//  makes the codepoint of the pair (the low one is then not kept), and a lone
+//  surrogate becomes U+FFFD.
+class CombineSurrogates final : public pablo::PabloKernel {
+public:
+    CombineSurrogates(LLVMTypeSystemInterface & ts, StreamSet * U21, StreamSet * ends, StreamSet * combined, StreamSet * keep)
+        : PabloKernel(ts, "CombineSurrogates",
+                      {Binding{"U21", U21, FixedRate(), LookAhead(1)}, Binding{"ends", ends, FixedRate(), LookAhead(1)}},
+                      {Binding{"combined", combined}, Binding{"keep", keep}}) {}
+protected:
+    void generatePabloMethod() override {
+        pablo::PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+        const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+        PabloAST * const ends = getInputStreamSet("ends")[0];
+        std::vector<PabloAST *> next(basis.size());
+        for (unsigned b = 0; b < basis.size(); b++) next[b] = pb.createLookahead(basis[b], 1);
+        cc::Parabix_CC_Compiler_Builder here(basis);
+        cc::Parabix_CC_Compiler_Builder ahead(next);
+        PabloAST * const surrogate = pb.createAnd(ends, here.compileCC(re::makeCC(0xD800, 0xDFFF), pb));
+        PabloAST * const high = pb.createAnd(ends, here.compileCC(re::makeCC(0xD800, 0xDBFF), pb));
+        PabloAST * const lowNext = pb.createAnd(pb.createLookahead(ends, 1), ahead.compileCC(re::makeCC(0xDC00, 0xDFFF), pb));
+        PabloAST * const pair = pb.createAnd(high, lowNext);
+        PabloAST * const second = pb.createAdvance(pair, 1);
+        PabloAST * const lone = pb.createAnd(surrogate, pb.createNot(pb.createOr(pair, second)));
+        //  0x10000 + (high - D800) * 0x400 + (low - DC00).
+        BixNum pairValue(21);
+        for (unsigned b = 0; b < 10; b++) {
+            pairValue[b] = next[b];
+            pairValue[b + 10] = basis[b];
+        }
+        pairValue[20] = pb.createZeroes();
+        pairValue = bnc.AddModular(pairValue, 0x10000);
+        BixNum out = bnc.Select(pair, pairValue, bnc.Select(lone, bnc.ZeroExtend(bnc.Create(0xFFFD), 21), basis));
+        for (unsigned i = 0; i < 21; i++) {
+            pb.createAssign(pb.createExtract(getOutputStreamVar("combined"), pb.getInteger(i)), out[i]);
+        }
+        pb.createAssign(pb.createExtract(getOutputStreamVar("keep"), pb.getInteger(0)), pb.createInFile(pb.createNot(second)));
+    }
+};
+
+void kernel::HexAnyPipeline(PipelineBuilder & P, unsigned forms, StreamSet * U21, StreamSet * mask, StreamSet * U21_out,
+                            std::vector<StreamSet *> & keeps) {
+    StreamSet * const hexSpans = P.CreateStreamSet(1);
+    StreamSet * const decSpans = P.CreateStreamSet(1);
+    StreamSet * const remove = P.CreateStreamSet(1);
+    StreamSet * const ends = P.CreateStreamSet(1);
+    P.CreateKernelCall<HexEscapes>(forms, U21, mask, hexSpans, decSpans, remove, ends);
+    StreamSet * decoded = U21;
+    if (forms & ~HexEscapeXML10) {
+        StreamSet * const hexDecoded = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<HexDecode>(decoded, hexSpans, hexDecoded);
+        decoded = hexDecoded;
+    }
+    StreamSet * overflow = nullptr;
+    if (forms & HexEscapeXML10) {
+        StreamSet * const decDecoded = P.CreateStreamSet(21, 1);
+        overflow = P.CreateStreamSet(1);
+        P.CreateKernelCall<DecimalDecode>(decoded, decSpans, decDecoded, overflow);
+        decoded = decDecoded;
+    } else {
+        overflow = P.CreateRepeatingStreamSet(1, std::vector<uint64_t>{0});
+    }
+    StreamSet * const keep = P.CreateStreamSet(1);
+    StreamSet * const decodedEnds = P.CreateStreamSet(1);
+    P.CreateKernelCall<HexEscapesKept>(remove, overflow, ends, keep, decodedEnds);
+    StreamSet * const kept = P.CreateStreamSet(21, 1);
+    FilterByMask(P, keep, decoded, kept);
+    StreamSet * const keptEnds = P.CreateStreamSet(1);
+    FilterByMask(P, keep, decodedEnds, keptEnds);
+    keeps.push_back(keep);
+    StreamSet * const combined = P.CreateStreamSet(21, 1);
+    StreamSet * const keep2 = P.CreateStreamSet(1);
+    P.CreateKernelCall<CombineSurrogates>(kept, keptEnds, combined, keep2);
+    FilterByMask(P, keep2, combined, U21_out);
+    keeps.push_back(keep2);
+}

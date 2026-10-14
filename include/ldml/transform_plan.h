@@ -160,15 +160,29 @@ struct MultipleCaptureMultipleReplacementSet {
     bool singleCharacter = false;
     std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0
     std::vector<MultipleCaptureMultipleReplacement> rules;
+    //  A rule whose result refers to its two captures in reverse order,
+    //  T0 (B1) T1 (B2) T2 → R0 $2 R1 $1 R2, with B1 and B2 of fixed lengths, is
+    //  planned as T0 (B1) T1 (B2) T2 → R0 R1 $1 $2 R2, and the region R1 B1 B2 of
+    //  each match is then made B2 R1 B1 (see kernel::SwapBack): its last
+    //  swapLength = |B2| positions are moved before its first
+    //  swapDistance = |R1| + |B1|.  The region begins swapBefore = |R1| positions
+    //  before the first character of B1 (after the replacements).
+    bool reversed = false;
+    unsigned swapLength = 0;
+    unsigned swapDistance = 0;
+    unsigned swapBefore = 0;
+    //  The characters of the region (of B1, B2 and R1), which may be in either
+    //  order where a rule of the group sees the converted text: every set of
+    //  the before contexts of the group must contain all of them or none.
+    UCD::UnicodeSet swapChars;
 };
 
 // A conversion rule inserting a text where its contexts meet: A { } C → S, with
 // an empty text to replace (W4).  Its before context ends with a character (of a
 // set, possibly repeated, not the text boundary) and its after context begins
 // with one: the insertion is before a character, which ICU reaches, and after
-// one.  At each
-// position, the first rule matching applies; the text inserted may not let a
-// rule match there again (ICU would insert repeatedly).
+// one.  At each position, the first rule matching applies; the text inserted
+// may not let a rule match there again (ICU would insert repeatedly).
 //   - In a group of such rules alone, with before contexts of one character, the
 //     converted text that the before contexts see is the text itself (each
 //     insertion is before a character that stays in place).

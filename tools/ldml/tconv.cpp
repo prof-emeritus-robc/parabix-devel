@@ -722,7 +722,9 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
             llvm::outs() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
                          << " rules, matched together (" << set.rules.size() << ", starts by "
-                         << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)" : "the ends of matches") << "):\n";
+                         << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)" : "the ends of matches") << ")"
+                         << (set.reversed ? ", captures reversed (SwapBack " + std::to_string(set.swapLength) + ", " + std::to_string(set.swapDistance) + ")" : "")
+                         << ":\n";
             for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) llvm::outs() << "      " << ldml::printRule(r.rule) << "\n";
         }
         for (const ldml::InsertionRule & ins : step.insertions) {
@@ -4145,6 +4147,17 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     //  The results of the rules, accumulated by the fused kernels (each ORing its
     //  results into those of the kernels before it).
     FusedState state;
+    //  The regions of the matches of the rules with captures referred to in
+    //  reverse order (see ldml::MultipleCaptureMultipleReplacementSet::reversed):
+    //  the first characters of B1, kept in step with the text as positions are
+    //  inserted and deleted, from which the regions begin at an offset.
+    struct Swap {
+        StreamSet * marks;
+        int offset;
+        unsigned length;
+        unsigned distance;
+    };
+    std::vector<Swap> swaps;
     auto applyFused = [&](FusedRulesConfig && config, StreamSet * allowedAt) {
         const FusedLayout layout(config, state);
         FusedState out;
@@ -4451,7 +4464,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             //  Only the streams used are made (the pipeline compiler fails on kernels
             //  whose outputs are unused): the starts, if replacements are made from
             //  them, the spans are covered or selected, and the spans, for the starts.
-            bool needStarts = n0 > 0 || needCoverage || step.captureSelection;
+            bool needStarts = n0 > 0 || needCoverage || step.captureSelection || set.reversed;
             for (const ldml::BoundaryReplacement & br : set.replacements) needStarts |= !br.fromEnd;
             CaptureMatches m;
             m.ends = matchPattern(set.engineBefore, set.engineAfter, items, U21,
@@ -4506,7 +4519,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 StreamSet * const chosen = P.CreateStreamSet(3);
                 P.CreateKernelCall<SelectedSpans>(m.starts, runStreams[i], m.ends, selected, chosen);
                 //  (Only the streams used are selected.)
-                bool usesStarts = !set.rules.front().first.empty() || needCoverage, usesEnds = false;
+                bool usesStarts = !set.rules.front().first.empty() || needCoverage || set.reversed, usesEnds = false;
                 for (const ldml::BoundaryReplacement & br : set.replacements) {
                     usesStarts |= !br.fromEnd;
                     usesEnds |= br.fromEnd;
@@ -4530,6 +4543,19 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             if (spans) SHOW_STREAM(spans);
             SHOW_STREAM(ends);
             if (starts) SHOW_STREAM(starts);
+            //  Captures referred to in reverse order: the first character of B1,
+            //  which stays in place, marks the region of the match to reverse.
+            if (set.reversed) {
+                StreamSet * b1 = starts;
+                if (n0 > 0) {
+                    b1 = P.CreateStreamSet(1);
+                    P.CreateKernelCall<ShiftForward>(starts, b1, static_cast<unsigned>(n0));
+                }
+                //  With T0 empty, B1 is kept after the text R0 R1 inserted before it.
+                const int offset = (n0 == 0 ? static_cast<int>(set.rules.front().firstReplacement.size()) : 0)
+                                   - static_cast<int>(set.swapBefore);
+                swaps.push_back(Swap{b1, offset, set.swapLength, set.swapDistance});
+            }
             //  T0 by R0, the first rule whose T0 matches at the start applying.
             if (n0 > 0) {
                 FusedRulesConfig config;
@@ -4734,6 +4760,11 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         SHOW_BIXNUM(Marked);
         result = Marked;
         spreadMasks(SpreadMask);
+        for (Swap & sw : swaps) {
+            StreamSet * const spread = P.CreateStreamSet(1);
+            SpreadByMask(P, SpreadMask, sw.marks, spread);
+            sw.marks = spread;
+        }
         //  The changes of each position i of the replacements, spread with the
         //  text, and moved to the i-th position inserted after their characters.
         changes = nullptr;
@@ -4764,6 +4795,28 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         FilterByMask(P, keep, result, filtered);
         result = filtered;
         filterMasks(keep);
+        for (Swap & sw : swaps) {
+            StreamSet * const marks = P.CreateStreamSet(1);
+            FilterByMask(P, keep, sw.marks, marks);
+            sw.marks = marks;
+        }
+    }
+    //  The regions reversed (their last characters moved before the others).
+    for (const Swap & sw : swaps) {
+        StreamSet * marks = sw.marks;
+        if (sw.offset != 0) {
+            StreamSet * const shifted = P.CreateStreamSet(1);
+            if (sw.offset > 0) {
+                P.CreateKernelCall<ShiftForward>(marks, shifted, static_cast<unsigned>(sw.offset));
+            } else {
+                P.CreateKernelCall<ShiftBack>(marks, shifted, static_cast<unsigned>(-sw.offset));
+            }
+            marks = shifted;
+        }
+        SHOW_STREAM(marks);
+        StreamSet * const swapped = P.CreateStreamSet(21);
+        P.CreateKernelCall<SwapBack>(marks, result, swapped, sw.length, sw.distance);
+        result = swapped;
     }
     return result;
 }

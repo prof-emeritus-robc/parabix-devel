@@ -327,10 +327,13 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
     };
     flattenResult(result->getText());
     std::vector<std::u32string> results(1);
+    std::vector<size_t> order;              // the captures referred to, in order
     for (re::RE * item : out) {
         if (const re::Reference * r = dyn_cast<re::Reference>(item)) {
-            const size_t i = results.size() - 1;
-            if (i >= k || r->getName() != captures[i]->getName()) return false;
+            size_t i = 0;
+            while (i < k && r->getName() != captures[i]->getName()) i++;
+            if (i == k) return false;
+            order.push_back(i);
             results.emplace_back();
         } else {
             std::u32string str;
@@ -339,6 +342,18 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
         }
     }
     if (results.size() != k + 1) return false;
+    //  Two captures referred to in reverse order (see
+    //  MultipleCaptureMultipleReplacementSet::reversed): as R0 R1 $1 $2 R2.
+    bool reversed = false;
+    if (k == 2 && order == std::vector<size_t>{1, 0}) {
+        reversed = true;
+        set.swapBefore = static_cast<unsigned>(results[1].size());
+        results = {results[0] + results[1], std::u32string(), results[2]};
+    } else {
+        for (size_t i = 0; i < order.size(); i++) {
+            if (order[i] != i) return false;
+        }
+    }
     //  The lengths and characters of the captures.
     constexpr unsigned Unbounded = UINT_MAX;
     std::vector<unsigned> minLength(k + 1), maxLength(k + 1);
@@ -353,6 +368,17 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
         all = all + captureChars[i];
     }
     for (const auto & t : texts) for (const UCD::UnicodeSet & chars : t) all = all + chars;
+    if (reversed) {
+        if (minLength[1] != maxLength[1] || minLength[2] != maxLength[2] || minLength[1] == 0 || minLength[2] == 0) {
+            reason = "it refers to its captures in reverse order, but they do not have fixed lengths";
+            return false;
+        }
+        set.reversed = true;
+        set.swapLength = minLength[2];
+        set.swapDistance = set.swapBefore + minLength[1];
+        set.swapChars = captureChars[1] + captureChars[2];
+        for (char32_t ch : results[0].substr(results[0].size() - set.swapBefore)) set.swapChars.insert(ch);
+    }
     const std::vector<UCD::UnicodeSet> & first = texts.front();
     const std::vector<UCD::UnicodeSet> & last = texts.back();
     if (first.empty() && minLength[1] == 0) {
@@ -520,6 +546,9 @@ static std::string captureReplacementKey(const MultipleCaptureMultipleReplacemen
         for (const UCD::UnicodeSet & chars : br.text) appendSet(key, chars);
     }
     key += set.startsByFirst ? " first" : (set.singleCharacter ? " single" : " ends");
+    if (set.reversed) {
+        key += " swap" + std::to_string(set.swapLength) + "/" + std::to_string(set.swapDistance) + "/" + std::to_string(set.swapBefore);
+    }
     return key;
 }
 
@@ -590,6 +619,29 @@ static const re::RE * firstContextItem(const re::RE * context) {
             return context;
         }
     }
+}
+
+//  Whether every set of a context contains all of the characters given or none.
+static bool uniformContext(const re::RE * re, const UCD::UnicodeSet & chars, CharSetAnalysis & sets) {
+    if (re == nullptr) return true;
+    if (CharSetAnalysis::isSet(re)) {
+        const UCD::UnicodeSet s = sets.setOf(re, true);
+        return !s.intersects(chars) || chars.subset(s);
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        for (const re::RE * e : *seq) if (!uniformContext(e, chars, sets)) return false;
+        return true;
+    } else if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        for (const re::RE * e : *alt) if (!uniformContext(e, chars, sets)) return false;
+        return true;
+    } else if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        return uniformContext(rep->getRE(), chars, sets);
+    } else if (const re::Capture * c = dyn_cast<re::Capture>(re)) {
+        return uniformContext(c->getCapturedRE(), chars, sets);
+    } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
+        if (isTextBoundary(n)) return true;
+        return !isFunctionCall(n) && n->getDefinition() && uniformContext(n->getDefinition(), chars, sets);
+    }
+    return false;
 }
 
 namespace {
@@ -845,6 +897,30 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     //  The MultipleCaptureMultipleReplacement rules: they may not overlap the
     //  string rules of their group (neither matching within the other), and the
     //  single-character rules apply outside their matches.
+    //  The rules with captures referred to in reverse order: the rules of their
+    //  group whose before contexts may tell the order of the characters of the
+    //  region apart (as ICU matches them against the converted text) are not
+    //  supported.
+    for (TransformStep & step : plan.steps) {
+        UCD::UnicodeSet swapChars;
+        for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) swapChars = swapChars + set.swapChars;
+        if (swapChars.empty()) continue;
+        std::vector<const re::RE *> befores;
+        for (const CharMapSubgroup & g : step.subgroups) befores.push_back(g.before);
+        for (const StringRule & sr : step.stringRules) befores.push_back(sr.before);
+        for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) befores.push_back(set.before);
+        for (const InsertionRule & ins : step.insertions) befores.push_back(ins.engineBefore);
+        bool uniform = true;
+        for (const re::RE * b : befores) uniform &= uniformContext(b, swapChars, sets);
+        if (uniform) continue;
+        for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            if (!set.reversed) continue;
+            for (const MultipleCaptureMultipleReplacement & r : set.rules) {
+                plan.problems.push_back(printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but it refers to its "
+                                        "captures in reverse order, and a before context of its group may tell their order apart)");
+            }
+        }
+    }
     //  The insertion rules (see InsertionRule): not in a group with string rules,
     //  and the text inserted may not let an insertion rule match again at the
     //  position (its last character, then before the position, in the set of the

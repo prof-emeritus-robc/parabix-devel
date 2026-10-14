@@ -6,6 +6,8 @@
 #include <ldml/transform_rules.h>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
+#include "charset_analysis.h"
+#include <functional>
 #include <map>
 #include <set>
 
@@ -303,6 +305,53 @@ bool selfOverlapSafe(const ConversionRule * r) {
            && printPattern(rep->getRE()) == printPattern(c->getCapturedRE());
 }
 
+//  Whether the transformed rule X { Y } → rest of a trivial capture rule with a
+//  text (X) Y cannot apply again right after itself: its before context, matched
+//  against the converted text (in which X is followed by rest), cannot match
+//  there, as rest is not empty and its last character cannot be the last of X.
+//  (With an empty rest, X { Y } → would apply to each Y following X, where
+//  (X) Y → $1 applies only once.)
+bool notReapplied(const ConversionRule * r, const Capture * c) {
+    RE * completed = r->getRightSide()->getCompletedResult();
+    const Seq * seq = dyn_cast<Seq>(completed);
+    if (seq == nullptr || seq->size() < 2) return false;
+    std::function<bool (const RE *, char32_t &)> lastChar = [&](const RE * re, char32_t & last) {
+        if (const CC * cc = dyn_cast<CC>(re)) {
+            if (cc->count() != 1) return false;
+            last = static_cast<char32_t>(cc->min_codepoint());
+            return true;
+        } else if (const Seq * s = dyn_cast<Seq>(re)) {
+            return !s->empty() && lastChar(s->back(), last);
+        } else if (const Name * n = dyn_cast<Name>(re)) {
+            return !isFunctionCall(n) && n->getDefinition() && lastChar(n->getDefinition(), last);
+        }
+        return false;
+    };
+    char32_t last;
+    if (!lastChar(seq->back(), last)) return false;
+    //  The characters X may match (a superset of those it may end with).
+    std::function<bool (const RE *, UCD::UnicodeSet &)> chars = [&](const RE * re, UCD::UnicodeSet & set) {
+        CharSetAnalysis sets;
+        if (CharSetAnalysis::isSet(re)) {
+            set = set + sets.setOf(re, true);
+            return true;
+        } else if (const Seq * s = dyn_cast<Seq>(re)) {
+            for (const RE * e : *s) if (!chars(e, set)) return false;
+            return true;
+        } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+            for (const RE * e : *alt) if (!chars(e, set)) return false;
+            return true;
+        } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+            return chars(rep->getRE(), set);
+        } else if (const Name * n = dyn_cast<Name>(re)) {
+            return !isFunctionCall(n) && n->getDefinition() && chars(n->getDefinition(), set);
+        }
+        return false;
+    };
+    UCD::UnicodeSet x;
+    return chars(c->getCapturedRE(), x) && !x.contains(last);
+}
+
 } // end anonymous namespace
 
 std::vector<Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated) {
@@ -313,7 +362,8 @@ std::vector<Capture *> findNullableCaptures(const RuleSide * side, bool includeR
     return found;
 }
 
-std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats) {
+std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats, bool allowEmptyText,
+                                              bool allowFollowingText) {
     std::vector<Rule *> result(rules);
     RuleOverlapAnalysis analysis;
     // The group of each rule: the transform rules separate groups.
@@ -335,6 +385,8 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
     for (size_t i = 0; i < rules.size(); i++) {
         ConversionRule * r = dyn_cast<ConversionRule>(rules[i]);
         if (r == nullptr || trivialCapture(r) == nullptr) continue;
+        if (!allowEmptyText && isa<Capture>(r->getLeftSide()->getText())) continue;
+        if (!allowFollowingText && isa<Seq>(r->getLeftSide()->getText()) && !selfOverlapSafe(r)) continue;
         if (stats) stats->candidates++;
         TrivialCaptureStats::Blocked blocked{r, {}, {}};
         for (size_t j = groupStart[i]; j < groupEnd[i]; j++) {
@@ -347,7 +399,8 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
             if (analysis.mayMatchWithin(s, r)) blocked.withinRules.push_back(s);
         }
         // With a text (X) Y, also the rule itself, within X or at Y.
-        if (isa<Seq>(r->getLeftSide()->getText()) && !selfOverlapSafe(r) && analysis.mayMatchWithin(r, r)) {
+        if (isa<Seq>(r->getLeftSide()->getText()) && !selfOverlapSafe(r)
+                && (analysis.mayMatchWithin(r, r) || !notReapplied(r, trivialCapture(r)))) {
             blocked.withinRules.push_back(r);
         }
         if (!blocked.laterRules.empty() || !blocked.withinRules.empty()) {

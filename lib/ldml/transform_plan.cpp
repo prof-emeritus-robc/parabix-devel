@@ -5,6 +5,7 @@
 
 #include <ldml/transform_plan.h>
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <functional>
 #include <tuple>
@@ -114,6 +115,30 @@ static bool runItem(re::RE * re, std::vector<re::RE *> & first, UCD::UnicodeSet 
 
 static bool isEmptyText(const re::RE * re);
 
+//  Whether an after context, matched by the regular expression engine as a
+//  lookahead, has an unbounded repetition of something other than a set of
+//  single characters (such as a set with strings, [{m̥}m]*): the engine does
+//  not support such variable-length lookaheads (their bodies must have a unique
+//  prefix, or be chains of repeated sets).
+static bool unsupportedLookahead(const re::RE * re) {
+    if (re == nullptr) return false;
+    if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        if (rep->getUB() == re::Rep::UNBOUNDED_REP && !(CharSetAnalysis::isSet(rep->getRE()) && !hasStrings(rep->getRE()))) return true;
+        return unsupportedLookahead(rep->getRE());
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        for (const re::RE * e : *seq) if (unsupportedLookahead(e)) return true;
+    } else if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        for (const re::RE * e : *alt) if (unsupportedLookahead(e)) return true;
+    } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
+        if (!isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+            return unsupportedLookahead(n->getDefinition());
+        }
+    } else if (const re::Capture * c = dyn_cast<re::Capture>(re)) {
+        return unsupportedLookahead(c->getCapturedRE());
+    }
+    return false;
+}
+
 //  The characters a pattern may match (false if not known).
 static bool matchableChars(const re::RE * re, UCD::UnicodeSet & chars, CharSetAnalysis & sets) {
     if (CharSetAnalysis::isSet(re)) {
@@ -145,9 +170,98 @@ static bool containsCapture(const re::RE * re) {
     return false;
 }
 
-//  A SingleCaptureDoubleReplacement rule A (B) C → D $1 E (see SingleCaptureDoubleReplacementSet): the rule, and its
-//  set (without rules), or false.
-static bool singleCaptureDoubleReplacement(const ConversionRule * c, SingleCaptureDoubleReplacement & rule, SingleCaptureDoubleReplacementSet & set, CharSetAnalysis & sets) {
+//  The minimum and maximum lengths of a pattern (max UINT_MAX if unbounded;
+//  false if not known).
+static bool lengthRange(const re::RE * re, unsigned & min, unsigned & max) {
+    constexpr unsigned Unbounded = UINT_MAX;
+    auto add = [](unsigned a, unsigned b) {return (a == Unbounded || b == Unbounded) ? Unbounded : a + b;};
+    if (CharSetAnalysis::isSet(re)) {
+        if (!hasStrings(re)) {
+            min = max = 1;
+            return true;
+        }
+        //  A set with strings: from the shortest member to the longest.
+        std::function<bool (const re::RE *, unsigned &, unsigned &)> members = [&](const re::RE * e, unsigned & lo, unsigned & hi) {
+            if (const re::Alt * alt = dyn_cast<re::Alt>(e)) {
+                for (const re::RE * a : *alt) {
+                    if (isBoundary(a)) continue;
+                    if (!members(a, lo, hi)) return false;
+                }
+                return true;
+            } else if (const re::Name * n = dyn_cast<re::Name>(e)) {
+                return !isFunctionCall(n) && n->getDefinition() && members(n->getDefinition(), lo, hi);
+            } else if (const re::Seq * seq = dyn_cast<re::Seq>(e)) {
+                std::u32string str;
+                if (!fixedString(seq, str)) return false;
+                lo = std::min<unsigned>(lo, str.size());
+                hi = std::max<unsigned>(hi, str.size());
+                return true;
+            } else if (CharSetAnalysis::isSetExpression(e)) {
+                lo = std::min(lo, 1u);
+                hi = std::max(hi, 1u);
+                return true;
+            }
+            return false;
+        };
+        min = Unbounded;
+        max = 0;
+        return members(re, min, max) && max > 0;
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        min = max = 0;
+        for (const re::RE * e : *seq) {
+            unsigned a, b;
+            if (!lengthRange(e, a, b)) return false;
+            min += a;
+            max = add(max, b);
+        }
+        return true;
+    } else if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        min = Unbounded;
+        max = 0;
+        for (const re::RE * e : *alt) {
+            unsigned a, b;
+            if (!lengthRange(e, a, b)) return false;
+            min = std::min(min, a);
+            max = std::max(max, b);
+        }
+        return !alt->empty();
+    } else if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        unsigned a, b;
+        if (!lengthRange(rep->getRE(), a, b)) return false;
+        min = a * static_cast<unsigned>(rep->getLB());
+        max = (rep->getUB() == re::Rep::UNBOUNDED_REP || b == Unbounded) ? Unbounded : b * static_cast<unsigned>(rep->getUB());
+        return true;
+    } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && lengthRange(n->getDefinition(), min, max);
+    }
+    return false;
+}
+
+//  The first item of a context (after), as a set of characters, if it is one.
+static bool firstContextSet(re::RE * context, UCD::UnicodeSet & chars, CharSetAnalysis & sets) {
+    re::RE * first = context;
+    while (true) {
+        if (re::Seq * seq = dyn_cast<re::Seq>(first)) {
+            if (seq->empty()) return false;
+            first = seq->front();
+        } else if (re::Name * n = dyn_cast<re::Name>(first);
+                   n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+            first = n->getDefinition();
+        } else {
+            break;
+        }
+    }
+    if (!CharSetAnalysis::isSet(first) || hasStrings(first)) return false;
+    chars = sets.setOf(first, false);
+    return true;
+}
+
+//  A MultipleCaptureMultipleReplacement rule (see
+//  MultipleCaptureMultipleReplacementSet): the rule, and its set (without
+//  rules), or false (with the reason, if the rule has the form).
+static bool multipleCaptureMultipleReplacement(const ConversionRule * c, MultipleCaptureMultipleReplacement & rule,
+                                               MultipleCaptureMultipleReplacementSet & set, CharSetAnalysis & sets,
+                                               std::string & reason) {
     const RuleSide * source = c->getSourceSide(Direction::Forward);
     const RuleSide * result = c->getResultSide(Direction::Forward);
     if (result->hasCursor() && (!isEmptyText(result->getResultToRevisit()) || result->getCursorOffset() != 0)) return false;
@@ -164,27 +278,23 @@ static bool singleCaptureDoubleReplacement(const ConversionRule * c, SingleCaptu
         }
     };
     flatten(source->getText());
-    size_t at = items.size();
-    for (size_t i = 0; i < items.size(); i++) {
-        if (isa<re::Capture>(items[i])) {
-            if (at != items.size()) return false;
-            at = i;
+    //  The text: T0 (B1) T1 ... (Bk) Tk.
+    std::vector<std::vector<UCD::UnicodeSet>> texts(1);
+    std::vector<const re::Capture *> captures;
+    for (re::RE * item : items) {
+        if (const re::Capture * cap = dyn_cast<re::Capture>(item)) {
+            if (containsCapture(cap->getCapturedRE())) return false;
+            captures.push_back(cap);
+            texts.emplace_back();
+        } else if (plainSet(item)) {
+            texts.back().push_back(sets.setOf(item, false));
+        } else {
+            return false;
         }
     }
-    if (at == items.size() || at == 0) return false;
-    const re::Capture * capture = cast<re::Capture>(items[at]);
-    if (containsCapture(capture->getCapturedRE())) return false;
-    UCD::UnicodeSet inside;     // the characters that may occur in the match after A[0]
-    for (size_t i = 0; i < items.size(); i++) {
-        if (i == at) continue;
-        if (!plainSet(items[i])) return false;
-        const UCD::UnicodeSet chars = sets.setOf(items[i], false);
-        if (i < at) rule.a.push_back(chars); else set.c.push_back(chars);
-        if (i > 0) inside = inside + chars;
-    }
-    if (!matchableChars(capture->getCapturedRE(), inside, sets)) return false;
-    if (rule.a.front().intersects(inside)) return false;
-    //  The result: D $1 E.
+    const size_t k = captures.size();
+    if (k == 0) return false;
+    //  The result: R0 $1 R1 ... $k Rk.
     std::vector<re::RE *> out;
     std::function<void (re::RE *)> flattenResult = [&](re::RE * re) {
         if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
@@ -194,37 +304,190 @@ static bool singleCaptureDoubleReplacement(const ConversionRule * c, SingleCaptu
         }
     };
     flattenResult(result->getText());
-    size_t ref = out.size();
-    for (size_t i = 0; i < out.size(); i++) {
-        if (const re::Reference * r = dyn_cast<re::Reference>(out[i])) {
-            if (ref != out.size() || r->getName() != capture->getName()) return false;
-            ref = i;
+    std::vector<std::u32string> results(1);
+    for (re::RE * item : out) {
+        if (const re::Reference * r = dyn_cast<re::Reference>(item)) {
+            const size_t i = results.size() - 1;
+            if (i >= k || r->getName() != captures[i]->getName()) return false;
+            results.emplace_back();
         } else {
-            std::u32string s;
-            if (!fixedString(out[i], s)) return false;
-            (ref == out.size() ? rule.d : set.e) += s;
+            std::u32string str;
+            if (!fixedString(item, str)) return false;
+            results.back() += str;
         }
     }
-    if (ref == out.size()) return false;
-    set.middle = capture->getCapturedRE();
+    if (results.size() != k + 1) return false;
+    //  The lengths and characters of the captures.
+    constexpr unsigned Unbounded = UINT_MAX;
+    std::vector<unsigned> minLength(k + 1), maxLength(k + 1);
+    std::vector<UCD::UnicodeSet> captureChars(k + 1);
+    UCD::UnicodeSet all;                    // the characters that may occur in a match
+    for (size_t i = 1; i <= k; i++) {
+        if (!lengthRange(captures[i - 1]->getCapturedRE(), minLength[i], maxLength[i])
+                || !matchableChars(captures[i - 1]->getCapturedRE(), captureChars[i], sets)) {
+            reason = "a capture has a pattern whose length or characters are not known";
+            return false;
+        }
+        all = all + captureChars[i];
+    }
+    for (const auto & t : texts) for (const UCD::UnicodeSet & chars : t) all = all + chars;
+    const std::vector<UCD::UnicodeSet> & first = texts.front();
+    const std::vector<UCD::UnicodeSet> & last = texts.back();
+    if (first.empty() && minLength[1] == 0) {
+        reason = "the text may begin with an empty capture";
+        return false;
+    }
+    //  How the matches begin: at the characters of T0[0] (which may occur nowhere
+    //  else in a match), or after the end of the previous match (which may not
+    //  end within another).
+    UCD::UnicodeSet inside;
+    for (size_t i = 0; i < texts.size(); i++) {
+        for (size_t j = (i == 0 ? 1 : 0); j < texts[i].size(); j++) inside = inside + texts[i][j];
+    }
+    for (size_t i = 1; i <= k; i++) inside = inside + captureChars[i];
+    set.startsByFirst = !first.empty() && !first.front().intersects(inside);
+    unsigned totalMin = 0, totalMax = 0;
+    for (const auto & t : texts) {
+        totalMin += static_cast<unsigned>(t.size());
+        totalMax += static_cast<unsigned>(t.size());
+    }
+    for (size_t i = 1; i <= k; i++) {
+        totalMin += minLength[i];
+        totalMax = (maxLength[i] == Unbounded || totalMax == Unbounded) ? Unbounded : totalMax + maxLength[i];
+    }
+    set.singleCharacter = !set.startsByFirst && totalMin == 1 && totalMax == 1;
+    if (!set.startsByFirst && !set.singleCharacter) {
+        bool endsUnique = false;
+        if (!last.empty()) {
+            UCD::UnicodeSet before;
+            for (size_t i = 0; i < texts.size(); i++) {
+                for (size_t j = 0; j < texts[i].size(); j++) {
+                    if (i + 1 == texts.size() && j + 1 == texts[i].size()) continue;
+                    before = before + texts[i][j];
+                }
+            }
+            for (size_t i = 1; i <= k; i++) before = before + captureChars[i];
+            endsUnique = !last.back().intersects(before);
+        }
+        UCD::UnicodeSet next;
+        if (!endsUnique && source->getAfterContext() && firstContextSet(source->getAfterContext(), next, sets)) {
+            endsUnique = !next.intersects(all);
+        }
+        if (!endsUnique) {
+            reason = "the starts of its matches cannot be told apart (a match may end within another)";
+            return false;
+        }
+    }
+    //  The replacements at the boundaries.  A boundary i (at Ti) is at a fixed
+    //  offset from the start if the captures before it have fixed lengths, or
+    //  from the end if those after it do.
+    auto fixed = [&](size_t i) {return minLength[i] == maxLength[i];};
+    std::vector<BoundaryReplacement> replacements;
+    for (size_t i = 0; i <= k; i++) {
+        if (i == 0 && !first.empty()) continue;         // T0 and R0: given by the rule
+        const std::vector<UCD::UnicodeSet> & t = texts[i];
+        const std::u32string & r = results[i];
+        if (t.empty() && r.empty()) continue;
+        //  The position b of the first character of Ti (or after the boundary),
+        //  from the start, and the number of positions from it to the end of the match.
+        bool fromStart = true, fromEnd = true;
+        unsigned b = static_cast<unsigned>(first.size());
+        for (size_t j = 1; j <= i; j++) {
+            fromStart &= fixed(j);
+            b += minLength[j] + (j < i ? static_cast<unsigned>(texts[j].size()) : 0);
+        }
+        unsigned after = 0;                             // the length after Ti
+        for (size_t j = i + 1; j <= k; j++) {
+            fromEnd &= fixed(j);
+            after += minLength[j] + static_cast<unsigned>(texts[j].size());
+        }
+        BoundaryReplacement br;
+        br.replacement = r;
+        if (!t.empty()) {
+            br.kind = BoundaryReplacement::Kind::Replace;
+            br.text = t;
+            if (fromStart) {
+                br.offset = b;
+            } else if (fromEnd) {
+                br.fromEnd = true;
+                br.offset = static_cast<unsigned>(t.size()) - 1 + after;
+            } else {
+                reason = "a replaced text lies between captures of variable length";
+                return false;
+            }
+        } else {
+            //  An insertion: after the last character of Bi, or before the first
+            //  character of Bi+1.
+            br.kind = BoundaryReplacement::Kind::Keep;
+            if (i > 0 && minLength[i] >= 1 && ((fromStart && b >= 1) || fromEnd)) {
+                br.keepAt = 0;
+                br.capture = static_cast<unsigned>(i);
+                br.text = {captureChars[i]};
+                if (fromStart) br.offset = b - 1; else {br.fromEnd = true; br.offset = after;}
+            } else if (i < k && minLength[i + 1] >= 1 && (fromStart || (fromEnd && after >= 1))) {
+                br.keepAt = static_cast<unsigned>(r.size());
+                br.capture = static_cast<unsigned>(i + 1);
+                br.text = {captureChars[i + 1]};
+                if (fromStart) br.offset = b; else {br.fromEnd = true; br.offset = after - 1;}
+            } else {
+                reason = "an insertion is not next to a capture that is never empty, at a fixed offset";
+                return false;
+            }
+        }
+        //  Two insertions around the same character are combined.
+        bool merged = false;
+        for (BoundaryReplacement & o : replacements) {
+            if (o.fromEnd != br.fromEnd || o.offset != br.offset) continue;
+            if (o.kind == BoundaryReplacement::Kind::Keep && br.kind == BoundaryReplacement::Kind::Keep
+                    && o.capture == br.capture && o.keepAt == o.replacement.size() && br.keepAt == 0) {
+                o.text.front() = o.text.front() & br.text.front();
+                o.replacement += br.replacement;
+                merged = true;
+            } else {
+                reason = "two replacements at the same position";
+                return false;
+            }
+        }
+        if (!merged) replacements.push_back(std::move(br));
+    }
+    for (const re::Capture * cap : captures) set.captures.push_back(cap->getCapturedRE());
+    set.texts.assign(texts.begin() + 1, texts.end());
+    set.replacements = std::move(replacements);
     set.before = source->getBeforeContext();
     set.after = source->getAfterContext();
     set.engineBefore = set.before ? engineContext(set.before, false) : nullptr;
     set.engineAfter = set.after ? engineContext(set.after, true) : nullptr;
+    rule.first = first;
+    rule.firstReplacement = results.front();
     rule.rule = c;
     return true;
 }
 
-//  The key of a SingleCaptureDoubleReplacement set: the rules of a set have the same capture,
-//  contexts, C and E, and A of the same length.
-static std::string singleCaptureDoubleReplacementKey(const SingleCaptureDoubleReplacementSet & set, size_t aLength) {
-    std::string key = printPattern(set.middle) + " | " + (set.before ? printPattern(set.before) : "") + " | "
-                      + (set.after ? printPattern(set.after) : "") + " | " + std::to_string(aLength) + " |";
-    for (const UCD::UnicodeSet & chars : set.c) {
+//  The key of a MultipleCaptureMultipleReplacement set: the rules of a set
+//  differ only in T0 and R0 (with T0 not empty, of the same length).
+static std::string captureReplacementKey(const MultipleCaptureMultipleReplacementSet & set,
+                                         const MultipleCaptureMultipleReplacement & rule) {
+    auto appendSet = [](std::string & key, const UCD::UnicodeSet & chars) {
         for (const auto & range : chars) key += " " + std::to_string(range.first) + "-" + std::to_string(range.second);
         key += ";";
+    };
+    std::string key = (set.before ? printPattern(set.before) : "") + " | " + (set.after ? printPattern(set.after) : "")
+                      + " | " + std::to_string(rule.first.size()) + " |";
+    if (rule.first.empty()) {
+        for (char32_t ch : rule.firstReplacement) key += " " + std::to_string(static_cast<unsigned>(ch));
     }
-    for (char32_t ch : set.e) key += " " + std::to_string(static_cast<unsigned>(ch));
+    for (const re::RE * b : set.captures) key += " (" + printPattern(b) + ")";
+    for (const auto & t : set.texts) {
+        key += " T";
+        for (const UCD::UnicodeSet & chars : t) appendSet(key, chars);
+    }
+    for (const BoundaryReplacement & br : set.replacements) {
+        key += " R" + std::to_string(static_cast<int>(br.kind)) + (br.fromEnd ? "e" : "s") + std::to_string(br.offset)
+               + "k" + std::to_string(br.keepAt) + ":";
+        for (char32_t ch : br.replacement) key += " " + std::to_string(static_cast<unsigned>(ch));
+        for (const UCD::UnicodeSet & chars : br.text) appendSet(key, chars);
+    }
+    key += set.startsByFirst ? " first" : (set.singleCharacter ? " single" : " ends");
     return key;
 }
 
@@ -259,6 +522,11 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             const RuleSide * source = c->getSourceSide(Direction::Forward);
             const RuleSide * result = c->getResultSide(Direction::Forward);
             re::RE * const text = source->getText();
+            if (unsupportedLookahead(source->getAfterContext())) {
+                plan.problems.push_back(printRule(r) + "  (the after context repeats a set with strings or a sequence, "
+                                        "which the regular expression engine does not support in lookaheads)");
+                continue;
+            }
             std::vector<re::RE *> items;
             textItems(text, items);
             //  A run at the end of the text (see StringRule::run).
@@ -276,31 +544,35 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             for (re::RE * item : items) singleChars &= CharSetAnalysis::isSet(item) && !hasStrings(item);
             bool boundary = false;
             for (re::RE * item : items) boundary |= mayIncludeTextBoundary(item);
-            SingleCaptureDoubleReplacement capture;
-            SingleCaptureDoubleReplacementSet set;
+            MultipleCaptureMultipleReplacement capture;
+            MultipleCaptureMultipleReplacementSet set;
             std::u32string fixedResult;
-            //  A SingleCaptureDoubleReplacement rule (whose text has a fixed length or not, with a result
-            //  referring to the capture).
-            if ((!singleChars || !fixedString(result->getText(), fixedResult)) && singleCaptureDoubleReplacement(c, capture, set, sets)) {
-                {
-                    if (group == nullptr) {
-                        TransformStep step;
-                        step.kind = TransformStep::Kind::Conversion;
-                        plan.steps.push_back(std::move(step));
-                        group = &plan.steps.back();
-                    }
-                    const std::string key = singleCaptureDoubleReplacementKey(set, capture.a.size());
-                    SingleCaptureDoubleReplacementSet * found = nullptr;
-                    for (SingleCaptureDoubleReplacementSet & s : group->singleCaptureDoubleReplacements) {
-                        if (singleCaptureDoubleReplacementKey(s, s.rules.front().a.size()) == key) found = &s;
-                    }
-                    if (found == nullptr) {
-                        group->singleCaptureDoubleReplacements.push_back(set);
-                        found = &group->singleCaptureDoubleReplacements.back();
-                    }
-                    found->rules.push_back(std::move(capture));
-                    continue;
+            std::string captureReason;
+            //  A MultipleCaptureMultipleReplacement rule (whose text has a fixed length or
+            //  not, with a result referring to its captures in order).
+            if ((!singleChars || !fixedString(result->getText(), fixedResult))
+                    && multipleCaptureMultipleReplacement(c, capture, set, sets, captureReason)) {
+                if (group == nullptr) {
+                    TransformStep step;
+                    step.kind = TransformStep::Kind::Conversion;
+                    plan.steps.push_back(std::move(step));
+                    group = &plan.steps.back();
                 }
+                const std::string key = captureReplacementKey(set, capture);
+                MultipleCaptureMultipleReplacementSet * found = nullptr;
+                for (MultipleCaptureMultipleReplacementSet & s : group->captureReplacements) {
+                    if (captureReplacementKey(s, s.rules.front()) == key) found = &s;
+                }
+                if (found == nullptr) {
+                    group->captureReplacements.push_back(set);
+                    found = &group->captureReplacements.back();
+                }
+                found->rules.push_back(std::move(capture));
+                continue;
+            }
+            if (!captureReason.empty()) {
+                plan.problems.push_back(printRule(r) + "  (a MultipleCaptureMultipleReplacement rule, but " + captureReason + ")");
+                continue;
             }
             if (!singleChars) {
                 problem = "the text to replace is not a fixed-length sequence of characters";
@@ -385,18 +657,44 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     //  selected sequentially (TransformStep::sequentialSelection).
     //  A quick check first: a rule may match within the text only if its first
     //  characters may occur at a position of the text other than the first.
-    //  The SingleCaptureDoubleReplacement rules: they may not overlap the string rules of their group
-    //  (neither matching within the other), and the single-character rules
-    //  apply outside their matches.
+    //  The MultipleCaptureMultipleReplacement rules: they may not overlap the
+    //  string rules of their group (neither matching within the other), and the
+    //  single-character rules apply outside their matches.
     for (TransformStep & step : plan.steps) {
-        if (step.singleCaptureDoubleReplacements.empty()) continue;
+        if (step.captureReplacements.empty()) continue;
         step.coverStringRules = true;
         RuleOverlapAnalysis analysis;
-        for (const SingleCaptureDoubleReplacementSet & set : step.singleCaptureDoubleReplacements) {
-            for (const SingleCaptureDoubleReplacement & r : set.rules) {
+        //  The rules of different sets that may overlap are selected sequentially.
+        //  (Every position at which a match may begin must then be known: its sets
+        //  must find their starts by their first characters, or have matches of
+        //  one character.  A set whose starts are those of its spans misses the
+        //  matches beginning within another, which apply where that one does not.)
+        for (size_t a = 0; a < step.captureReplacements.size(); a++) {
+            for (size_t b = a + 1; b < step.captureReplacements.size(); b++) {
+                for (const MultipleCaptureMultipleReplacement & r1 : step.captureReplacements[a].rules) {
+                    for (const MultipleCaptureMultipleReplacement & r2 : step.captureReplacements[b].rules) {
+                        if (analysis.mayOverlap(r1.rule, r2.rule) || analysis.mayMatchWithin(r1.rule, r2.rule)
+                                || analysis.mayMatchWithin(r2.rule, r1.rule)) {
+                            step.captureSelection = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (step.captureSelection) {
+            for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+                if (set.startsByFirst || set.singleCharacter) continue;
+                for (const MultipleCaptureMultipleReplacement & r : set.rules) {
+                    plan.problems.push_back(printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but the matches of "
+                                            "other such rules may overlap its matches, not all of whose starts are known)");
+                }
+            }
+        }
+        for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            for (const MultipleCaptureMultipleReplacement & r : set.rules) {
                 for (const StringRule & sr : step.stringRules) {
                     if (analysis.mayMatchWithin(sr.rule, r.rule) || analysis.mayMatchWithin(r.rule, sr.rule)) {
-                        plan.problems.push_back(printRule(r.rule) + "  (a string rule may overlap this SingleCaptureDoubleReplacement rule: "
+                        plan.problems.push_back(printRule(r.rule) + "  (a string rule may overlap this MultipleCaptureMultipleReplacement rule: "
                                                 + printRule(sr.rule) + ")");
                         break;
                     }

@@ -192,8 +192,11 @@ static const TestCase testCases[] = {
     {"[:Lowercase:] { '-' → ;", "[:lowercase:] { \\- → ;\n"},
     {"[:Lowercase:] { '-' } [:Uppercase:] → ;", "[:lowercase:] { \\- } [:uppercase:] → ;\n"},
     {"[[:Lowercase:]$] {'-' → ;", "[[:lowercase:]$] { \\- → ;\n"},
-    {"[^[:Lowercase:]] {'-' → ;", "[^[:lowercase:]] { \\- → ;\n"},
-    {"[^[:Lowercase:]$] {'-' → ;", "[:^lowercase:] { \\- → ;\n"},
+    // A negated property includes the text boundary, as [^...] does (ICU's sets
+    // include U+FFFF for the boundary): [^[:X:]] is printed as [:^X:], and the
+    // complement excluding the boundary as [^[:X:]$].
+    {"[^[:Lowercase:]] {'-' → ;", "[:^lowercase:] { \\- → ;\n"},
+    {"[^[:Lowercase:]$] {'-' → ;", "[^[:lowercase:]$] { \\- → ;\n"},
     {"x → y | z ; z a → w ;", "x → y | z ;\nza → w ;\n"},
     {"[a-z]{x > |@ab ; ab > J; ca > M;", "[a-z] { x → |@ ab ;\nab → J ;\nca → M ;\n"},
     {"a → Ab@|;", "a → Ab @| ;\n"},
@@ -219,7 +222,8 @@ static const TestCase testCases[] = {
     {"[\\p{L}-[a-z]] → x ;", "[[:l:]-[a-z]] → x ;\n"},
     {"[[:L:]&[:Latin:]] → x ;", "[[:l:]&[:latin:]] → x ;\n"},
     {"[{ch}a-c] → x ;", "[{ch}a-c] → x ;\n"},
-    {"\\p{Script=Greek} → x ; [:^gc=Lu:] → y ;", "[:script=Greek:] → x ;\n[:^gc=Lu:] → y ;\n"},
+    // (Within a text, the text boundary of a negated set is dropped.)
+    {"\\p{Script=Greek} → x ; [:^gc=Lu:] → y ;", "[:script=Greek:] → x ;\n[^[:gc=Lu:]$] → y ;\n"},
     {"$v = [aeiou] ; [$v y] → V ;", "$v = [aeiou] ;\n[$v y] → V ;\n"},
     {"[a\\-z] → x ;", "[\\-az] → x ;\n"},
     {"$mac = M [aA] [cC] ;", "$mac = M [Aa] [Cc] ;\n"},
@@ -586,8 +590,11 @@ static const EliminationTestCase trivialTestCases[] = {
     {"(bc) → $1 z ; x { c → w ;", "bc { → z ;\nx { c → w ;\n"},
     {"(bc) → $1 z ; b { c → w ;", "(bc) → $1 z ;\nb { c → w ;\n"},
     {"(b) → $1 x ; b ← y ;", "b { → x ;\nb ← y ;\n"},
-    // A text beginning with the capture: the rest stays the text.
-    {"(b) c → $1 ;", "b { c → ;\n"},
+    // A text beginning with the capture: the rest stays the text, if the
+    // transformed rule cannot apply again right after itself (on bcc, (b) c → $1
+    // gives bc, where b { c → ; would give b).
+    {"(b) c → $1 ;", "(b) c → $1 ;\n"},
+    {"(b) c → $1 x ;", "b { c → x ;\n"},
     {"(b) c d → $1 x ; e → y ;", "b { cd → x ;\ne → y ;\n"},
     // ... unless the rule itself may match within its text, other than as (X) X+.
     {"(a) a → $1 ;", "(a) a → $1 ;\n"},

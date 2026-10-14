@@ -552,6 +552,8 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
     return mResults.emplace(name, std::move(a)).first->second;
 }
 
+static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
+
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
     try {
@@ -559,7 +561,10 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
         ldml::RevisitStats rstats;
         rules = ldml::ComposeRevisits(rules, &rstats);
-        rules = ldml::TrivialCaptureElimination(rules);
+        //  (Rules whose text is only a capture, or continues after it, are kept as
+        //  MultipleCaptureMultipleReplacement rules, rather than insertion rules or
+        //  rules with the capture as a before context, other than (X) X+.)
+        rules = ldml::TrivialCaptureElimination(rules, nullptr, false, false);
         rules = ldml::NullableCaptureElimination(rules);
         ldml::FiniteTextStats fstats;
         rules = ldml::ExpandFiniteTexts(rules, &fstats);
@@ -591,6 +596,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
                 }
             }
         }
+        for (const ldml::TransformStep & step : a.plan.steps) captureContextProblems(step, a.plan.problems);
         a.problems = a.plan.problems;
         //  The bit changes of the subgroups of a group are combined, assuming that
         //  no two rules of a group may apply at the same position.
@@ -699,9 +705,11 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         for (const ldml::StringRule & sr : step.stringRules) {
             llvm::outs() << "    string rule: " << ldml::printRule(sr.rule) << "\n";
         }
-        for (const ldml::SingleCaptureDoubleReplacementSet & set : step.singleCaptureDoubleReplacements) {
-            llvm::outs() << "    SingleCaptureDoubleReplacement rules, matched together (" << set.rules.size() << "):\n";
-            for (const ldml::SingleCaptureDoubleReplacement & r : set.rules) llvm::outs() << "      " << ldml::printRule(r.rule) << "\n";
+        for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            llvm::outs() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
+                         << " rules, matched together (" << set.rules.size() << ", starts by "
+                         << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)" : "the ends of matches") << "):\n";
+            for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) llvm::outs() << "      " << ldml::printRule(r.rule) << "\n";
         }
         for (const ldml::CharMapSubgroup & s : step.subgroups) {
             llvm::outs() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.characters().count() << " characters";
@@ -778,6 +786,97 @@ protected:
 //  apply, given the matches of its string rules that apply (see TransformStep::
 //  coverStringRules): not those covered by the matches, from the position after
 //  the first character of a match (Spans, without Starts) to its last.
+//  The first positions of the matches of a pattern, given their spans (the
+//  union of their positions) and their ends (their last positions), where no
+//  match may end within another: the positions of the spans after a position
+//  outside them, or after the end of a match.
+class MatchStartsFromEnds : public pablo::PabloKernel {
+public:
+    MatchStartsFromEnds(LLVMTypeSystemInterface & ts, StreamSet * Spans, StreamSet * Ends, StreamSet * Starts)
+    : PabloKernel(ts, "MatchStartsFromEnds", {Binding{"Spans", Spans}, Binding{"Ends", Ends}}, {Binding{"Starts", Starts}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const spans = getInputStreamSet("Spans")[0];
+        PabloAST * const ends = getInputStreamSet("Ends")[0];
+        PabloAST * const continuing = pb.createAdvance(pb.createAnd(spans, pb.createNot(ends)), 1);
+        writeOutputStreamSet("Starts", std::vector<PabloAST *>{pb.createAnd(spans, pb.createNot(continuing))});
+    }
+};
+
+//  The positions of the spans of matches after their first positions.
+class SpanContinuation : public pablo::PabloKernel {
+public:
+    SpanContinuation(LLVMTypeSystemInterface & ts, StreamSet * Spans, StreamSet * Starts, StreamSet * Run)
+    : PabloKernel(ts, "SpanContinuation", {Binding{"Spans", Spans}, Binding{"Starts", Starts}}, {Binding{"Run", Run}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        writeOutputStreamSet("Run", std::vector<PabloAST *>{pb.createAnd(getInputStreamSet("Spans")[0],
+                                                                         pb.createNot(getInputStreamSet("Starts")[0]))});
+    }
+};
+
+//  Of the matches of a set, given their starts, the rest of their spans (Run),
+//  their ends and the starts selected (of all sets): the selected starts of the
+//  set, the spans of its selected matches, and their ends.
+class SelectedSpans : public pablo::PabloKernel {
+public:
+    SelectedSpans(LLVMTypeSystemInterface & ts, StreamSet * Starts, StreamSet * Run, StreamSet * Ends, StreamSet * Selected,
+                  StreamSet * Chosen)
+    : PabloKernel(ts, "SelectedSpans", {Binding{"Starts", Starts}, Binding{"Run", Run}, Binding{"Ends", Ends},
+                                        Binding{"Selected", Selected}}, {Binding{"Chosen", Chosen}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const run = getInputStreamSet("Run")[0];
+        PabloAST * const starts = pb.createAnd(getInputStreamSet("Starts")[0], getInputStreamSet("Selected")[0]);
+        //  (The run begins after the first position.)
+        PabloAST * const rest = pb.createAnd(pb.createMatchStar(pb.createAdvance(starts, 1), run), run);
+        PabloAST * const spans = pb.createOr(starts, rest);
+        PabloAST * const ends = pb.createAnd(getInputStreamSet("Ends")[0], spans);
+        writeOutputStreamSet("Chosen", std::vector<PabloAST *>{starts, spans, ends});
+    }
+};
+
+//  Single streams collected into a stream set.
+class CollectStreams : public pablo::PabloKernel {
+public:
+    CollectStreams(LLVMTypeSystemInterface & ts, const std::vector<StreamSet *> & In, StreamSet * Out)
+    : PabloKernel(ts, "CollectStreams" + std::to_string(In.size()),
+                  [&] {
+                      Bindings b;
+                      for (size_t i = 0; i < In.size(); i++) b.emplace_back("In" + std::to_string(i), In[i]);
+                      return b;
+                  }(),
+                  {Binding{"Out", Out}}), mCount(In.size()) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> out;
+        for (size_t i = 0; i < mCount; i++) out.push_back(getInputStreamSet("In" + std::to_string(i))[0]);
+        writeOutputStreamSet("Out", out);
+    }
+private:
+    const size_t mCount;
+};
+
+//  Of two streams of positions: the positions of the first only, of the second
+//  only, and of both.
+class CoincidentPositions : public pablo::PabloKernel {
+public:
+    CoincidentPositions(LLVMTypeSystemInterface & ts, StreamSet * First, StreamSet * Second, StreamSet * Split)
+    : PabloKernel(ts, "CoincidentPositions", {Binding{"First", First}, Binding{"Second", Second}}, {Binding{"Split", Split}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const a = getInputStreamSet("First")[0];
+        PabloAST * const b = getInputStreamSet("Second")[0];
+        writeOutputStreamSet("Split", std::vector<PabloAST *>{pb.createAnd(a, pb.createNot(b)), pb.createAnd(b, pb.createNot(a)),
+                                                              pb.createAnd(a, b)});
+    }
+};
+
 //  Streams within a mask.
 class MaskStreams : public pablo::PabloKernel {
 public:
@@ -1542,6 +1641,16 @@ static bool fusedContexts(re::RE * context, bool before, FusedContexts & alterna
 struct ConversionOutcome {
     UCD::UnicodeSet chars;
     std::u32string out;
+    //  If keptAt >= 0: the character itself is kept, at index keptAt of the
+    //  result (out is the rest).
+    int keptAt = -1;
+    size_t length() const {return out.size() + (keptAt >= 0 ? 1 : 0);}
+    //  The characters of the result: those of out, and the characters kept.
+    UCD::UnicodeSet resultChars() const {
+        UCD::UnicodeSet r = keptAt >= 0 ? chars : UCD::UnicodeSet();
+        for (char32_t c : out) r.insert(c);
+        return r;
+    }
 };
 
 static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformStep & step) {
@@ -1566,7 +1675,8 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
         }
         if (!sr.run.empty()) outcomes.push_back(ConversionOutcome{sr.run, std::u32string()});
     }
-    //  The texts A and C of the SingleCaptureDoubleReplacement rules (as string rules: A by D, C by E).
+    //  The replacements of the MultipleCaptureMultipleReplacement rules (as string
+    //  rules: Ti by Ri, or an insertion around a kept character).
     auto textOutcomes = [&](const std::vector<UCD::UnicodeSet> & text, const std::u32string & replacement) {
         const size_t n = text.size(), m = replacement.size();
         for (size_t j = 0; j < n; j++) {
@@ -1579,9 +1689,15 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
             outcomes.push_back(ConversionOutcome{text[j], out});
         }
     };
-    for (const ldml::SingleCaptureDoubleReplacementSet & set : step.singleCaptureDoubleReplacements) {
-        for (const ldml::SingleCaptureDoubleReplacement & r : set.rules) textOutcomes(r.a, r.d);
-        textOutcomes(set.c, set.e);
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) textOutcomes(r.first, r.firstReplacement);
+        for (const ldml::BoundaryReplacement & br : set.replacements) {
+            if (br.kind == ldml::BoundaryReplacement::Kind::Replace) {
+                textOutcomes(br.text, br.replacement);
+            } else {
+                outcomes.push_back(ConversionOutcome{br.text.front(), br.replacement, static_cast<int>(br.keepAt)});
+            }
+        }
     }
     return outcomes;
 }
@@ -1600,8 +1716,10 @@ static bool convertedContextMatters(const FusedContexts & before, const std::vec
             const size_t d = B - k;     // 1: adjacent to the rule
             const UCD::UnicodeSet & S = alt[k].chars;
             for (const ConversionOutcome & o : outcomes) {
-                if (o.out.empty()) return true;
-                if (d > 1 && o.out.size() != 1) return true;
+                if (o.length() == 0) return true;
+                if (d > 1 && o.length() != 1) return true;
+                //  The last character kept: whether it is in the set does not change.
+                if (o.keptAt >= 0 && static_cast<size_t>(o.keptAt) == o.out.size()) continue;
                 const bool in = S.contains(o.out.back());
                 if (in ? !o.chars.subset(S) : o.chars.intersects(S)) return true;
             }
@@ -1630,6 +1748,24 @@ static bool hasConvertedSubgroup(const ldml::TransformStep & step, const std::ve
     return false;
 }
 
+
+//  The MultipleCaptureMultipleReplacement rules whose before contexts the
+//  conversions of their group may make match differently in the converted text
+//  (or of which this is not known): their contexts are matched against the
+//  text itself, by the regular expression engine.
+static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
+    if (step.captureReplacements.empty()) return;
+    const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        if (set.engineBefore == nullptr) continue;
+        FusedContexts before;
+        if (fusedContexts(set.engineBefore, true, before, true) && !convertedContextMatters(before, outcomes)) continue;
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            problems.push_back(ldml::printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but its before "
+                               "context may match differently in the converted text)");
+        }
+    }
+}
 
 static void printBeforeContextNotes(const ldml::TransformStep & step) {
     const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
@@ -1745,6 +1881,12 @@ struct FusedStringRule {
     int match = -1;
     bool converted = false;     // in a correction kernel: its before context is matched against the converted text
     UCD::UnicodeSet run;        // the set of the run following the text, deleted (see ldml::StringRule::run)
+    //  If keep >= 0 (text of one character): the character is kept, with the
+    //  replacement inserted around it, the character at index keep of the result
+    //  (see ldml::BoundaryReplacement).
+    int keep = -1;
+    //  The length of the result.
+    unsigned resultLength() const {return static_cast<unsigned>(replacement.size()) + (keep >= 0 ? 1 : 0);}
 };
 
 //  A subgroup of single-character rules: matched in the kernel, with its
@@ -1835,7 +1977,7 @@ struct FusedLayout {
     std::vector<StreamSet *> sourceSets;
     FusedLayout(const FusedRulesConfig & c, const FusedState & in) {
         for (const FusedStringRule & r : c.strings) {
-            const unsigned n = r.text.size(), m = r.replacement.size();
+            const unsigned n = r.text.size(), m = r.resultLength();
             if (r.match < 0) {
                 for (const FusedContext & a : r.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
                 maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
@@ -2112,6 +2254,7 @@ private:
                 s += "+";
                 appendSet(s, r.run);
             }
+            if (r.keep >= 0) s += "k" + std::to_string(r.keep);
             s += ">";
             for (char32_t ch : r.replacement) s += std::to_string(ch) + ",";
             if (r.match >= 0) {
@@ -2316,6 +2459,26 @@ void FusedRules::generatePabloMethod() {
             const FusedStringRule & rule = mConfig.strings[r];
             const unsigned n = rule.text.size(), m = rule.replacement.size();
             PabloAST * const first = firstOf[r];
+            if (rule.keep >= 0) {
+                //  The character kept at index keep of the result, and the
+                //  replacement around it: the character itself at the position
+                //  (if keep = 0) or in an inserted position, written from its bits.
+                const unsigned k = static_cast<unsigned>(rule.keep), total = m + 1;
+                for (unsigned j = 0; j < total; j++) {
+                    if (j == k) {
+                        if (j == 0) continue;
+                        for (unsigned b = 0; b < 21; b++) {
+                            PabloAST * const bit = ((DeletionMark >> b) & 1) ? pb.createNot(basis[b]) : basis[b];
+                            res.changes[j][b] = pb.createOr(res.changes[j][b], pb.createAnd(first, bit));
+                        }
+                        continue;
+                    }
+                    const UCD::codepoint_t target = static_cast<UCD::codepoint_t>(rule.replacement[j < k ? j : j - 1]);
+                    if (j == 0) changeChar(first, target, nullptr); else changeMark(j, first, target);
+                }
+                if (total > 1) res.insert[total - 1] = pb.createOr(res.insert[total - 1], first);
+                continue;
+            }
             //  The characters of the text change to those of the replacement (or
             //  the deletion mark), and the further characters of the replacement
             //  are written at the positions inserted after the last.
@@ -3228,7 +3391,7 @@ StreamSet * RulePipelineBuilder::combine(StreamSet * a, StreamSet * b, bool isOr
 //  path does not support).  Only for such a group is shortening the text to
 //  the masked characters both correct and complete.
 static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
-    if (!step.stringRules.empty()) return false;
+    if (!step.stringRules.empty() || !step.captureReplacements.empty()) return false;
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         if (s.engineBefore || s.engineAfter) return false;
         for (const ldml::CharMapping & m : s.mappings) {
@@ -3329,10 +3492,12 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         }
         if (!texts.back().empty() && (rule.replacement.size() < rule.text.size() || !rule.run.empty())) needDeletion = true;
     }
-    for (const ldml::SingleCaptureDoubleReplacementSet & set : step.singleCaptureDoubleReplacements) {
-        if (set.e.size() < set.c.size()) needDeletion = true;
-        for (const ldml::SingleCaptureDoubleReplacement & r : set.rules) {
-            if (r.d.size() < r.a.size()) needDeletion = true;
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        for (const ldml::BoundaryReplacement & br : set.replacements) {
+            if (br.kind == ldml::BoundaryReplacement::Kind::Replace && br.replacement.size() < br.text.size()) needDeletion = true;
+        }
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            if (r.firstReplacement.size() < r.first.size()) needDeletion = true;
         }
     }
     StreamSet * const mask = activeMask();
@@ -3483,8 +3648,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     if (correct && (!step.stringOrder.empty() || needCoverage)) {
         for (size_t r = 0; r < numStringRules; r++) wholeGroup |= convertible[r];
         if (numStringRules > FusedMaxWholeGroupRules || step.subgroups.size() > FusedMaxWholeGroupRules) wholeGroup = false;
-        //  (The coverage of the SingleCaptureDoubleReplacement rules is not known to the correction kernel.)
-        if (!step.singleCaptureDoubleReplacements.empty()) wholeGroup = false;
+        //  (The coverage of the MultipleCaptureMultipleReplacement rules is not known to the correction kernel.)
+        if (!step.captureReplacements.empty()) wholeGroup = false;
     }
     if (wholeGroup) {
         FusedRulesConfig config;
@@ -3549,7 +3714,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         }
         config.rounds = ConvertedContextRounds;
         for (const ConversionOutcome & o : outcomes) {
-            for (char32_t c : o.out) config.replacementChars.insert(c);
+            config.replacementChars = config.replacementChars + o.resultChars();
         }
         if (step.sequentialSelection) {
             //  The string matches are selected sequentially, between the rounds:
@@ -3735,64 +3900,186 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 applyFused(std::move(config), nullptr);
             }
         }
-        //  ... of the SingleCaptureDoubleReplacement rules: for each set, the spans of its matches, found
-        //  by the regular expression engine, and their ends.  A is replaced by D
-        //  at the first position of each span (a position of A[0]), and C by E at
-        //  its end, as string rules applied there; the spans are covered.
-        for (const ldml::SingleCaptureDoubleReplacementSet & set : step.singleCaptureDoubleReplacements) {
-            const size_t na = set.rules.front().a.size();
+        //  ... of the MultipleCaptureMultipleReplacement rules: for each set, the
+        //  spans of its matches, found by the regular expression engine, and their
+        //  ends.  The captures stay in place: each Ti is replaced by Ri (T0 by R0
+        //  at the start of each match, as string rules applied there), or Ri is
+        //  inserted around a kept character of a capture (without a second spread
+        //  with InsertionSpreadMask's InsertPosition::Before, which an insertion
+        //  before the start of a match would otherwise need).  The spans are covered.
+        struct CaptureMatches {
+            StreamSet * spans = nullptr;
+            StreamSet * ends = nullptr;
+            StreamSet * starts = nullptr;
+        };
+        std::vector<CaptureMatches> captureMatches;
+        for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            const size_t n0 = set.rules.front().first.size();
             std::vector<re::RE *> items;
-            for (size_t j = 0; j < na; j++) {
+            for (size_t j = 0; j < n0; j++) {
                 UCD::UnicodeSet chars;
-                for (const ldml::SingleCaptureDoubleReplacement & r : set.rules) chars = chars + r.a[j];
+                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) chars = chars + r.first[j];
                 items.push_back(re::makeCC(chars, &cc::Unicode));
             }
-            //  (B matched possessively, as ICU matches it, with its sets resolved.)
-            items.push_back(ldml::possessiveContext(ldml::expandedContext(set.middle, Insertions(), DeletionMark), true));
-            for (const UCD::UnicodeSet & chars : set.c) items.push_back(re::makeCC(chars, &cc::Unicode));
-            StreamSet * spans = nullptr;
-            StreamSet * const ends = matchPattern(set.engineBefore, set.engineAfter, items, U21, &spans);
-            UCD::UnicodeSet firstChars;
-            for (const ldml::SingleCaptureDoubleReplacement & r : set.rules) firstChars = firstChars + r.a.front();
-            StreamSet * starts = combine(spans, classes({firstChars}, U21), false);
-            if (mask) starts = combine(starts, mask, false);
-            SHOW_STREAM(spans);
-            SHOW_STREAM(starts);
-            //  A by D, the first rule whose A matches at the start applying.
-            {
+            for (size_t i = 0; i < set.captures.size(); i++) {
+                //  (A capture matched possessively, as ICU matches it, with its sets resolved.)
+                items.push_back(ldml::possessiveContext(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark), true));
+                for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
+            }
+            //  Only the streams used are made (the pipeline compiler fails on kernels
+            //  whose outputs are unused): the starts, if replacements are made from
+            //  them, the spans are covered or selected, and the spans, for the starts.
+            bool needStarts = n0 > 0 || needCoverage || step.captureSelection;
+            for (const ldml::BoundaryReplacement & br : set.replacements) needStarts |= !br.fromEnd;
+            CaptureMatches m;
+            m.ends = matchPattern(set.engineBefore, set.engineAfter, items, U21,
+                                  (needStarts && !set.singleCharacter) ? &m.spans : nullptr);
+            if (!needStarts) {
+                //  (Only the ends are used.)
+            } else if (set.singleCharacter) {
+                m.starts = m.ends;
+                m.spans = m.ends;
+            } else if (set.startsByFirst) {
+                UCD::UnicodeSet firstChars;
+                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) firstChars = firstChars + r.first.front();
+                //  (The ends, within the spans, are included so that they are used.)
+                m.starts = combine(combine(m.spans, m.ends, true), classes({firstChars}, U21), false);
+            } else {
+                //  The positions of the spans after a position outside them, or after
+                //  the end of a match (no match ends within another).
+                m.starts = P.CreateStreamSet(1);
+                P.CreateKernelCall<MatchStartsFromEnds>(m.spans, m.ends, m.starts);
+            }
+            if (m.starts && mask) m.starts = combine(m.starts, mask, false);
+            captureMatches.push_back(m);
+        }
+        //  Where the matches of different sets may overlap, those that apply are
+        //  selected from the left (see LeftmostMatches), the earlier set first at the
+        //  same position: a class for each set, of its starts, followed by a run of
+        //  the rest of its span.  The spans and ends are then those of the matches
+        //  selected.
+        if (step.captureSelection) {
+            std::vector<StreamSet *> startStreams, runStreams;
+            for (CaptureMatches & m : captureMatches) {
+                StreamSet * const run = P.CreateStreamSet(1);
+                P.CreateKernelCall<SpanContinuation>(m.spans, m.starts, run);
+                startStreams.push_back(m.starts);
+                runStreams.push_back(run);
+            }
+            StreamSet * const starts = P.CreateStreamSet(startStreams.size());
+            P.CreateKernelCall<CollectStreams>(startStreams, starts);
+            StreamSet * const runs = P.CreateStreamSet(runStreams.size());
+            P.CreateKernelCall<CollectStreams>(runStreams, runs);
+            std::vector<unsigned> lengths(captureMatches.size(), 1);
+            std::vector<int> runOf;
+            for (size_t i = 0; i < captureMatches.size(); i++) runOf.push_back(static_cast<int>(i));
+            StreamSet * const selected = P.CreateStreamSet(1);
+            P.CreateKernelCall<LeftmostMatches>(lengths, runOf, starts, runs, selected);
+            SHOW_STREAM(selected);
+            for (size_t i = 0; i < captureMatches.size(); i++) {
+                const ldml::MultipleCaptureMultipleReplacementSet & set = step.captureReplacements[i];
+                CaptureMatches & m = captureMatches[i];
+                StreamSet * const chosen = P.CreateStreamSet(3);
+                P.CreateKernelCall<SelectedSpans>(m.starts, runStreams[i], m.ends, selected, chosen);
+                //  (Only the streams used are selected.)
+                bool usesStarts = !set.rules.front().first.empty() || needCoverage, usesEnds = false;
+                for (const ldml::BoundaryReplacement & br : set.replacements) {
+                    usesStarts |= !br.fromEnd;
+                    usesEnds |= br.fromEnd;
+                }
+                auto select = [&](unsigned k) {
+                    StreamSet * const out = P.CreateStreamSet(1);
+                    P.CreateKernelCall<StreamSelect>(out, Select(chosen, {k}));
+                    return out;
+                };
+                m.starts = usesStarts ? select(0) : nullptr;
+                m.spans = needCoverage ? select(1) : nullptr;
+                m.ends = usesEnds ? select(2) : nullptr;
+            }
+        }
+        for (size_t setIndex = 0; setIndex < step.captureReplacements.size(); setIndex++) {
+            const ldml::MultipleCaptureMultipleReplacementSet & set = step.captureReplacements[setIndex];
+            const size_t n0 = set.rules.front().first.size();
+            StreamSet * const spans = captureMatches[setIndex].spans;
+            StreamSet * const ends = captureMatches[setIndex].ends;
+            StreamSet * const starts = captureMatches[setIndex].starts;
+            if (spans) SHOW_STREAM(spans);
+            SHOW_STREAM(ends);
+            if (starts) SHOW_STREAM(starts);
+            //  T0 by R0, the first rule whose T0 matches at the start applying.
+            if (n0 > 0) {
                 FusedRulesConfig config;
                 config.selected = 0;
                 config.sources.push_back(FusedMatchSource{starts, 0});
                 UCD::UnicodeSet earlier;
-                for (const ldml::SingleCaptureDoubleReplacement & r : set.rules) {
+                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
                     FusedStringRule fr;
-                    fr.text = r.a;
-                    if (na == 1) fr.text.front() = fr.text.front() - earlier;
-                    earlier = earlier + r.a.front();
+                    fr.text = r.first;
+                    if (n0 == 1) fr.text.front() = fr.text.front() - earlier;
+                    earlier = earlier + r.first.front();
                     if (fr.text.front().empty()) continue;
-                    fr.replacement = r.d;
+                    fr.replacement = r.firstReplacement;
                     config.strings.push_back(std::move(fr));
                 }
                 applyFused(std::move(config), nullptr);
             }
-            //  C by E, at the end of each span whose start applies.
-            if (!set.c.empty()) {
-                StreamSet * cStarts = ends;
-                if (set.c.size() > 1) {
-                    cStarts = P.CreateStreamSet(1);
-                    P.CreateKernelCall<ShiftBack>(ends, cStarts, static_cast<unsigned>(set.c.size() - 1));
+            //  The other replacements, each at its offset from the start or the end.
+            std::vector<StreamSet *> positions;
+            for (const ldml::BoundaryReplacement & br : set.replacements) {
+                StreamSet * at = br.fromEnd ? ends : starts;
+                if (br.offset > 0) {
+                    StreamSet * const shifted = P.CreateStreamSet(1);
+                    if (br.fromEnd) {
+                        P.CreateKernelCall<ShiftBack>(ends, shifted, br.offset);
+                    } else {
+                        P.CreateKernelCall<ShiftForward>(starts, shifted, br.offset);
+                    }
+                    at = shifted;
                 }
+                positions.push_back(at);
+            }
+            auto apply = [&](const std::vector<UCD::UnicodeSet> & text, const std::u32string & replacement, int keep,
+                             FusedMatchSource at) {
                 FusedRulesConfig config;
                 config.selected = 0;
-                config.sources.push_back(FusedMatchSource{cStarts, 0});
+                config.sources.push_back(at);
                 FusedStringRule fr;
-                fr.text = set.c;
-                fr.replacement = set.e;
+                fr.text = text;
+                fr.replacement = replacement;
+                fr.keep = keep;
                 config.strings.push_back(std::move(fr));
                 applyFused(std::move(config), nullptr);
+            };
+            std::vector<bool> done(set.replacements.size(), false);
+            //  An insertion before a capture and one after it coincide where it
+            //  has one character: there, both apply around the character.
+            for (size_t a = 0; a < set.replacements.size(); a++) {
+                const ldml::BoundaryReplacement & before = set.replacements[a];
+                if (before.kind != ldml::BoundaryReplacement::Kind::Keep || before.keepAt != before.replacement.size()) continue;
+                for (size_t b = 0; b < set.replacements.size(); b++) {
+                    const ldml::BoundaryReplacement & after = set.replacements[b];
+                    if (b == a || done[b] || after.kind != ldml::BoundaryReplacement::Kind::Keep || after.keepAt != 0
+                            || after.capture != before.capture) continue;
+                    StreamSet * const split = P.CreateStreamSet(3);
+                    P.CreateKernelCall<CoincidentPositions>(positions[a], positions[b], split);
+                    apply(before.text, before.replacement, static_cast<int>(before.keepAt), FusedMatchSource{split, 0});
+                    apply(after.text, after.replacement, 0, FusedMatchSource{split, 1});
+                    apply({before.text.front() & after.text.front()}, before.replacement + after.replacement,
+                          static_cast<int>(before.keepAt), FusedMatchSource{split, 2});
+                    done[a] = done[b] = true;
+                    break;
+                }
             }
-            state.spans = combine(state.spans, spans, true);
-            state.starts = combine(state.starts, starts, true);
+            for (size_t i = 0; i < set.replacements.size(); i++) {
+                if (done[i]) continue;
+                const ldml::BoundaryReplacement & br = set.replacements[i];
+                apply(br.text, br.replacement, br.kind == ldml::BoundaryReplacement::Kind::Keep ? static_cast<int>(br.keepAt) : -1,
+                      FusedMatchSource{positions[i], 0});
+            }
+            if (needCoverage) {
+                state.spans = combine(state.spans, spans, true);
+                state.starts = combine(state.starts, starts, true);
+            }
         }
         //  The positions where the single-character rules may apply: not within the
         //  applied matches of string rules (other than at their first positions), as
@@ -3861,7 +4148,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         if (!correction.strings.empty() || !correction.subgroups.empty()) {
             correction.rounds = ConvertedContextRounds;
             for (const ConversionOutcome & o : outcomes) {
-                for (char32_t c : o.out) correction.replacementChars.insert(c);
+                correction.replacementChars = correction.replacementChars + o.resultChars();
             }
             applyFused(std::move(correction), allowed);
         }

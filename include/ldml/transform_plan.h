@@ -85,35 +85,74 @@ struct StringRule {
     UCD::UnicodeSet run;
 };
 
-// A SingleCaptureDoubleReplacement rule: a conversion rule
-//      before { A (B) C } after → D $1 E ;
-// where A and C are
-// fixed-length texts (A not empty), B is any pattern, and D and E are fixed
-// strings: A is replaced by D and C by E, and B is kept.
-struct SingleCaptureDoubleReplacement {
-    std::vector<UCD::UnicodeSet> a;     // the characters at each position of A
-    std::u32string d;
+// A MultipleCaptureMultipleReplacement rule: a conversion rule
+//      before { T0 (B1) T1 (B2) ... (Bk) Tk } after → R0 $1 R1 $2 ... $k Rk ;
+// with k >= 1 captures of any patterns Bi, fixed-length texts Ti (possibly
+// empty), and fixed strings Ri; the references are in the order of the
+// captures.  (With k = 1, A (B) C → D $1 E, it is a
+// SingleCaptureDoubleReplacement rule.)  The captures stay in place: each Ti is
+// replaced by Ri, or, if Ti is empty, Ri is inserted at its place.
+//
+// The rules of a group that differ only in T0 and R0 (with T0 not empty, of
+// the same length) are matched together (see
+// MultipleCaptureMultipleReplacementSet); a rule gives its T0 and R0.
+struct MultipleCaptureMultipleReplacement {
+    std::vector<UCD::UnicodeSet> first;     // T0: the characters at each position
+    std::u32string firstReplacement;        // R0
     const ConversionRule * rule = nullptr;
 };
 
-// The SingleCaptureDoubleReplacement rules of a group with the same capture B,
-// contexts, C and E,
-// matched together, by the regular expression engine (A B C, with the union
-// of the sets of A at each position): the span of a match begins at a
-// position of A[0], whose characters may occur nowhere else in a match, and
-// the rule applying is the first whose A matches there.  (The engine gives
-// the spans and ends of the matches, from which D, known from the characters
-// of A, is written at the start, and E at the end; as the rules differ only
-// in A and D, no information about the end of a match is needed at its start.)
-struct SingleCaptureDoubleReplacementSet {
-    re::RE * middle = nullptr;                 // B
-    std::vector<UCD::UnicodeSet> c;
-    std::u32string e;
+// A replacement at a boundary of the matches of a set (at Ti, for i > 0, or
+// at an empty T0), at a fixed offset from the start or the end of each match:
+// the position start + offset, or end - offset (end: the last position of the
+// match).  Kinds:
+//   - Replace: the text at the position (Ti) is replaced by the replacement;
+//   - Keep: the character at the position (the first or last character of a
+//     capture; text: the characters it may be) is kept, and the replacement
+//     inserted around it: before it (keepAt = the length of the replacement),
+//     after it (keepAt = 0), or both (the replacements of an empty Ti and Ti+1
+//     around a capture of one character).
+struct BoundaryReplacement {
+    enum class Kind {Replace, Keep};
+    Kind kind = Kind::Replace;
+    bool fromEnd = false;
+    unsigned offset = 0;
+    std::vector<UCD::UnicodeSet> text;
+    std::u32string replacement;
+    unsigned keepAt = 0;
+    //  Keep: the capture (1 to k) whose character is kept.  An insertion before
+    //  its first character and one after its last coincide where it has one
+    //  character (not known in advance if its length varies).
+    unsigned capture = 0;
+};
+
+// The MultipleCaptureMultipleReplacement rules of a group with the same
+// captures, contexts, and texts and replacements other than T0 and R0, matched
+// together by the regular expression engine (T0 B1 T1 ... Bk Tk, with the union
+// of the sets of T0 at each position, and the captures possessive), which
+// gives the spans of the matches and their ends (last positions).  The first
+// positions of the matches are found:
+//   - if startsByFirst: as the positions of the spans holding characters of
+//     T0[0], which may occur nowhere else in a match (so that any match begins
+//     there); the rule applying is the first whose T0 matches there;
+//   - otherwise: as the positions of the spans following a position outside
+//     them, or the end of a match.  This requires that no match may end within
+//     another (endsUnique): Tk's last characters (or, if Tk is empty, the
+//     first characters of the after context) may occur nowhere else in a match.
+// As information flows forward only, from the start of a match to its end,
+// only T0 and R0 may differ between the rules of a set.
+struct MultipleCaptureMultipleReplacementSet {
+    std::vector<re::RE *> captures;                      // B1 ... Bk
+    std::vector<std::vector<UCD::UnicodeSet>> texts;     // T1 ... Tk
     re::RE * before = nullptr;
     re::RE * after = nullptr;
     re::RE * engineBefore = nullptr;
     re::RE * engineAfter = nullptr;
-    std::vector<SingleCaptureDoubleReplacement> rules;
+    bool startsByFirst = false;
+    //  If the matches have one character: their starts are their ends.
+    bool singleCharacter = false;
+    std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0
+    std::vector<MultipleCaptureMultipleReplacement> rules;
 };
 
 struct TransformStep {
@@ -143,9 +182,12 @@ struct TransformStep {
     // ICU applies them.  stringOrder then lists all the string rules, in
     // order, with no predecessors.
     bool sequentialSelection = false;
-    // The SingleCaptureDoubleReplacement rules (see SingleCaptureDoubleReplacementSet), which may not overlap the string
+    // The MultipleCaptureMultipleReplacement rules (see MultipleCaptureMultipleReplacementSet), which may not overlap the string
     // rules; the single-character rules apply outside their matches.
-    std::vector<SingleCaptureDoubleReplacementSet> singleCaptureDoubleReplacements;
+    std::vector<MultipleCaptureMultipleReplacementSet> captureReplacements;
+    // Whether the matches of different sets may overlap: they are then selected
+    // sequentially, from the left (the earlier set at the same position).
+    bool captureSelection = false;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

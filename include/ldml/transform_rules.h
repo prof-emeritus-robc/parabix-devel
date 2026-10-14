@@ -658,7 +658,14 @@ struct TrivialCaptureStats {
     };
     std::vector<Blocked> blocked;
 };
-std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats = nullptr);
+//  With allowEmptyText false, a rule whose text is only the capture (which would
+//  become an insertion rule) is not transformed.  With allowFollowingText
+//  false, a rule whose text continues after the capture is transformed only if
+//  its text is (X) X+: the before context X of the transformed rule is matched
+//  against the converted text, which differs from the text where the group's
+//  conversions delete or change characters after X.
+std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats = nullptr,
+                                              bool allowEmptyText = true, bool allowFollowingText = true);
 
 //  Nullable capture elimination.
 //

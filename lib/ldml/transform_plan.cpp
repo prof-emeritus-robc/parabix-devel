@@ -158,6 +158,24 @@ static bool matchableChars(const re::RE * re, UCD::UnicodeSet & chars, CharSetAn
     return false;
 }
 
+//  A pattern that begins with a set of characters (no strings): the set, and
+//  the characters that may follow it in a match (added to rest).
+static bool leadingSet(const re::RE * re, UCD::UnicodeSet & first, UCD::UnicodeSet & rest, CharSetAnalysis & sets) {
+    if (plainSet(re)) {
+        first = sets.setOf(re, false);
+        return true;
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        if (seq->empty() || !leadingSet(seq->front(), first, rest, sets)) return false;
+        for (auto i = std::next(seq->begin()); i != seq->end(); ++i) {
+            if (!matchableChars(*i, rest, sets)) return false;
+        }
+        return true;
+    } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && leadingSet(n->getDefinition(), first, rest, sets);
+    }
+    return false;
+}
+
 static bool containsCapture(const re::RE * re) {
     if (isa<re::Capture>(re) || isa<re::Reference>(re)) return true;
     if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
@@ -344,8 +362,18 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
     for (size_t i = 0; i < texts.size(); i++) {
         for (size_t j = (i == 0 ? 1 : 0); j < texts[i].size(); j++) inside = inside + texts[i][j];
     }
-    for (size_t i = 1; i <= k; i++) inside = inside + captureChars[i];
-    set.startsByFirst = !first.empty() && !first.front().intersects(inside);
+    for (size_t i = 2; i <= k; i++) inside = inside + captureChars[i];
+    if (!first.empty()) {
+        set.startChars = first.front();
+        set.startsByFirst = !set.startChars.intersects(inside + captureChars[1]);
+    } else {
+        //  With T0 empty, a match begins with B1: by the first characters of B1,
+        //  if it begins with a set (as with a fixed literal).
+        UCD::UnicodeSet rest;
+        if (leadingSet(captures[0]->getCapturedRE(), set.startChars, rest, sets)) {
+            set.startsByFirst = !set.startChars.intersects(inside + rest);
+        }
+    }
     unsigned totalMin = 0, totalMax = 0;
     for (const auto & t : texts) {
         totalMin += static_cast<unsigned>(t.size());
@@ -499,7 +527,7 @@ static bool isEmptyText(const re::RE * re) {
 UCD::UnicodeSet CharMapSubgroup::characters() const {
     UCD::UnicodeSet all;
     for (const CharMapping & m : mappings) all = all + m.chars;
-    return all;
+    return all + kept;
 }
 
 TransformPlan planTransform(const std::vector<Rule *> & rules) {
@@ -544,13 +572,25 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             for (re::RE * item : items) singleChars &= CharSetAnalysis::isSet(item) && !hasStrings(item);
             bool boundary = false;
             for (re::RE * item : items) boundary |= mayIncludeTextBoundary(item);
+            //  An identity rule, (S) → $1 with S a set of characters: a single-character
+            //  rule keeping its characters.
+            bool identity = false;
+            if (items.size() == 1 && run.empty() && !result->hasCursor()) {
+                auto single = [](const re::RE * re) {
+                    const re::Seq * seq = dyn_cast<re::Seq>(re);
+                    return (seq && seq->size() == 1) ? seq->front() : re;
+                };
+                const re::Capture * cap = dyn_cast<re::Capture>(single(text));
+                const re::Reference * ref = dyn_cast<re::Reference>(single(result->getText()));
+                identity = cap && ref && ref->getName() == cap->getName() && plainSet(cap->getCapturedRE());
+            }
             MultipleCaptureMultipleReplacement capture;
             MultipleCaptureMultipleReplacementSet set;
             std::u32string fixedResult;
             std::string captureReason;
             //  A MultipleCaptureMultipleReplacement rule (whose text has a fixed length or
             //  not, with a result referring to its captures in order).
-            if ((!singleChars || !fixedString(result->getText(), fixedResult))
+            if (!identity && (!singleChars || !fixedString(result->getText(), fixedResult))
                     && multipleCaptureMultipleReplacement(c, capture, set, sets, captureReason)) {
                 if (group == nullptr) {
                     TransformStep step;
@@ -582,7 +622,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
                 problem = "the text to replace ends with a repetition followed by an after context";
             } else if (result->hasCursor() && (!isEmptyText(result->getResultToRevisit()) || result->getCursorOffset() != 0)) {
                 problem = "the result has text to revisit";
-            } else if (!fixedString(result->getText(), replacement)) {
+            } else if (!identity && !fixedString(result->getText(), replacement)) {
                 problem = "the result is not a fixed string";
             }
             if (!problem.empty()) {
@@ -632,6 +672,10 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             //  The earliest rule for a character takes precedence.
             const UCD::UnicodeSet chars = sets.setOf(items.front(), false) - subgroup->characters();
             if (chars.empty()) continue;
+            if (identity) {
+                subgroup->kept = subgroup->kept + chars;
+                continue;
+            }
             CharMapping * same = nullptr;
             for (CharMapping & m : subgroup->mappings) {
                 if (m.replacement == replacement) same = &m;

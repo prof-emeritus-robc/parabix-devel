@@ -56,8 +56,11 @@ struct CharMapSubgroup {
     // The characters of the rules, by their replacements: disjoint sets, one
     // per replacement string.
     std::vector<CharMapping> mappings;
+    // The characters of identity rules ((S) → $1): replaced by themselves, they
+    // are not changed, but take precedence over later rules for them.
+    UCD::UnicodeSet kept;
     unsigned rules = 0;         // the number of rules
-    // All the characters of the mappings.
+    // All the characters of the mappings and kept.
     UCD::UnicodeSet characters() const;
 };
 
@@ -133,8 +136,9 @@ struct BoundaryReplacement {
 // gives the spans of the matches and their ends (last positions).  The first
 // positions of the matches are found:
 //   - if startsByFirst: as the positions of the spans holding characters of
-//     T0[0], which may occur nowhere else in a match (so that any match begins
-//     there); the rule applying is the first whose T0 matches there;
+//     T0[0] (or, if T0 is empty, of the set with which B1 begins), which may
+//     occur nowhere else in a match (so that any match begins there); the rule
+//     applying is the first whose T0 matches there;
 //   - otherwise: as the positions of the spans following a position outside
 //     them, or the end of a match.  This requires that no match may end within
 //     another (endsUnique): Tk's last characters (or, if Tk is empty, the
@@ -149,6 +153,9 @@ struct MultipleCaptureMultipleReplacementSet {
     re::RE * engineBefore = nullptr;
     re::RE * engineAfter = nullptr;
     bool startsByFirst = false;
+    //  If startsByFirst: the characters at which the matches begin (those of
+    //  T0[0] or, with T0 empty, of the set with which B1 begins).
+    UCD::UnicodeSet startChars;
     //  If the matches have one character: their starts are their ends.
     bool singleCharacter = false;
     std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0

@@ -3940,8 +3940,10 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 m.starts = m.ends;
                 m.spans = m.ends;
             } else if (set.startsByFirst) {
-                UCD::UnicodeSet firstChars;
-                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) firstChars = firstChars + r.first.front();
+                UCD::UnicodeSet firstChars = set.startChars;
+                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+                    if (n0 > 0) firstChars = firstChars + r.first.front();
+                }
                 //  (The ends, within the spans, are included so that they are used.)
                 m.starts = combine(combine(m.spans, m.ends, true), classes({firstChars}, U21), false);
             } else {

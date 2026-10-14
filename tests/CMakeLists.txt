@@ -37,6 +37,7 @@ parabix_add_kernel_test(test_bytefilterandspread kernel.io kernel.streamutils)
 parabix_add_kernel_test(test_emptyprogram kernel.io)
 parabix_add_kernel_test(test_truncatedstreamset kernel.io)
 parabix_add_kernel_test(test_sorting kernel.streamutils)
+parabix_add_kernel_test(test_hex_decode kernel.util)
 
 # ProvisionalLookAheadStride: compare provisional and normal processing of a lookahead chain with a reference
 parabix_add_executable(NAME provisional_lookahead SRC provisional_lookahead.cpp

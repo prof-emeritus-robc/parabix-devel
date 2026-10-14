@@ -75,4 +75,22 @@ void XMLHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U2
 
 void PerlHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
 
+//
+//  Given a 21-bit basis stream and a single stream marking spans of hex digits
+//  that represent codepoints, calculate and produce the encoded 21-bit codepoint
+//  value at the end of each such span stream.  Elsewhere, the basis is copied.
+//  The spans hold only hex digits ([0-9A-Fa-f]) and are separated by other
+//  positions (adjacent spans are taken as one).  Only the last 6 digits of a
+//  span are used, of which the first contributes its low bit (the 21 bits of
+//  the value): longer spans are accommodated if the digits before these are
+//  leading zeros, and a value is at most 10FFFF.
+
+class HexDecode final : public pablo::PabloKernel {
+public:
+    HexDecode(LLVMTypeSystemInterface & ts, StreamSet * sourceBasis, StreamSet * hexSpans,
+                                            StreamSet * decoded);
+protected:
+    void generatePabloMethod() override;
+};
+
 }

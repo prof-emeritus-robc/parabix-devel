@@ -12,6 +12,9 @@
 #include <llvm/Support/raw_ostream.h>
 #include <pablo/bixnum/bixnum.h>
 #include <toolchain/toolchain.h>
+#include <re/adt/re_re.h>
+#include <re/cc/cc_compiler_target.h>
+#include <re/cc/cc_compiler.h>
 #include <sstream>
 
 using namespace kernel;
@@ -769,4 +772,68 @@ void kernel::PerlHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet 
     FilterByMask(P, filterMask, Hex8, EncodedU8);
 
     P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+}
+
+HexDecode::HexDecode(LLVMTypeSystemInterface & ts,
+                                     StreamSet * sourceBasis, StreamSet * hexSpans,
+                                     StreamSet * decoded)
+        : PabloKernel(ts, "HexDecode" + sourceBasis->shapeString(),
+                      {Binding{"sourceBasis", sourceBasis}, Binding{"hexSpans", hexSpans, FixedRate(), LookAhead(1)}},
+                      {Binding{"decoded", decoded}}) {
+                      assert(sourceBasis->getNumElements() == 21);
+                      }
+
+void HexDecode::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    // Get the input stream sets.
+    std::vector<PabloAST *> sourceBasis = getInputStreamSet("sourceBasis");
+    PabloAST * hexSpans = getInputStreamSet("hexSpans")[0];
+    //
+    std::vector<Var *> outputVars(sourceBasis.size());
+    for (unsigned i = 0; i < sourceBasis.size(); i++) {
+        outputVars[i] = pb.createVar("outVar" + std::to_string(i), sourceBasis[i]);
+    }
+    cc::Parabix_CC_Compiler_Builder ccc(sourceBasis);
+
+    auto nested = pb.createScope();
+
+    BixNumCompiler bnc(nested);
+    // The value of a hex digit: its low 4 bits, plus 9 for the letters.
+    PabloAST * hex_letter = ccc.compileCC(re::makeCC(re::makeCC('A', 'F'), re::makeCC('a', 'f')), nested);
+    BixNum low4 = bnc.Truncate(sourceBasis, 4);
+    BixNum hexVal = bnc.Select(hex_letter, bnc.AddModular(low4, 9), low4);
+
+    // We accumulate the 21 basis bits at the last position of the hexspan
+    PabloAST * spanEnd = nested.createAnd(hexSpans, nested.createNot(nested.createLookahead(hexSpans, 1)));
+
+    // The value of the digits of the span up to each position, by doubling: of
+    // the last 2 (basis8), 4 (basis16) and 6 (basis21) digits, each part taken
+    // where the span covers the positions it comes from.
+    PabloAST * runOf2 = nested.createAnd(hexSpans, nested.createAdvance(hexSpans, 1));
+    BixNum basis8 = bnc.ZeroExtend(hexVal, 8);
+    for (unsigned i = 0; i < 4; i++) {
+        basis8[i+4] = nested.createAnd(runOf2, nested.createAdvance(hexVal[i], 1));
+    }
+
+    PabloAST * runOf3 = nested.createAnd(hexSpans, nested.createAdvance(runOf2, 1));
+    BixNum basis16 = bnc.ZeroExtend(basis8, 16);
+    for (unsigned i = 0; i < 8; i++) {
+        basis16[i+8] = nested.createAnd(runOf3, nested.createAdvance(basis8[i], 2));
+    }
+
+    PabloAST * runOf5 = nested.createAnd(runOf2, nested.createAdvance(runOf3, 2));
+    BixNum basis21 = bnc.ZeroExtend(basis16, 21);
+    for (unsigned i = 0; i < 5; i++) {
+        basis21[i+16] = nested.createAnd(runOf5, nested.createAdvance(basis8[i], 4));
+    }
+    basis21 = bnc.Select(spanEnd, basis21, sourceBasis);
+
+    for (unsigned i = 0; i < 21; i++) {
+        nested.createAssign(outputVars[i], basis21[i]);
+    }
+
+    pb.createIf(hexSpans, nested);
+    for (unsigned i = 0; i < sourceBasis.size(); i++) {
+        pb.createAssign(pb.createExtract(getOutput(0), i), outputVars[i]);
+    }
 }

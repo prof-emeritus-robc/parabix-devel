@@ -374,12 +374,14 @@ unsigned RE_Block_Compiler::codeUnitCharacterSpan(Seq::const_iterator current, c
         else if ((lo >= 0xE0) && (hi <= 0xEF)) lgth = 3;
         else if ((lo >= 0xF0) && (hi <= 0xF7)) lgth = 4;
         else return 0;  // ASCII, continuation or mixed code units
-        unsigned available = 1;
-        for (auto i = std::next(current); (available < lgth) && (i != end); ++i, ++available) {
-            const CC * const cont = dyn_cast<CC>(*i);
-            if (!cont || (cont->getAlphabet() != &cc::UTF8)) return 0;
+        // The continuation units may be single CCs or factored by toUTF8 into
+        // alternations (e.g., \xE1(?:\x88[\xB4-\xBF]|\x89[\x80-\x85])): take
+        // the shortest run of elements encoding exactly one character.
+        for (unsigned span = 2; span <= lgth; ++span) {
+            if (static_cast<size_t>(std::distance(current, end)) < span) return 0;
+            if (isUTF8EncodedCharacter(makeSeq(current, current + span))) return span;
         }
-        return (available == lgth) ? lgth : 0;
+        return 0;
     }
     // A UTF-8 encoded character class (an Alt of code unit sequences, as
     // produced by toUTF8) is one character; only multibyte ones need care.

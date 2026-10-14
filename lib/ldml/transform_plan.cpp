@@ -11,6 +11,7 @@
 #include <tuple>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
+#include <re/transforms/re_transformer.h>
 #include "charset_analysis.h"
 
 using namespace llvm;
@@ -123,7 +124,10 @@ static bool isEmptyText(const re::RE * re);
 static bool unsupportedLookahead(const re::RE * re) {
     if (re == nullptr) return false;
     if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
-        if (rep->getUB() == re::Rep::UNBOUNDED_REP && !(CharSetAnalysis::isSet(rep->getRE()) && !hasStrings(rep->getRE()))) return true;
+        //  (A repeated set may be captured, as in ([ab])*.)
+        const re::RE * body = rep->getRE();
+        while (const re::Capture * c = dyn_cast<re::Capture>(body)) body = c->getCapturedRE();
+        if (rep->getUB() == re::Rep::UNBOUNDED_REP && !(CharSetAnalysis::isSet(body) && !hasStrings(body))) return true;
         return unsupportedLookahead(rep->getRE());
     } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
         for (const re::RE * e : *seq) if (unsupportedLookahead(e)) return true;
@@ -530,6 +534,78 @@ UCD::UnicodeSet CharMapSubgroup::characters() const {
     return all + kept;
 }
 
+//  A context as a single item (through sequences of one item and variables
+//  not defined as sets), or nullptr.
+static const re::RE * singleContextItem(const re::RE * context) {
+    while (true) {
+        if (const re::Seq * seq = dyn_cast_or_null<re::Seq>(context)) {
+            if (seq->size() != 1) return nullptr;
+            context = seq->front();
+        } else if (const re::Name * n = dyn_cast_or_null<re::Name>(context);
+                   n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+            context = n->getDefinition();
+        } else {
+            return context;
+        }
+    }
+}
+
+//  The first item of a context (as for firstContextSet), or nullptr.
+static const re::RE * firstContextItem(const re::RE * context) {
+    while (true) {
+        if (const re::Seq * seq = dyn_cast_or_null<re::Seq>(context)) {
+            if (seq->empty()) return nullptr;
+            context = seq->front();
+        } else if (const re::Name * n = dyn_cast_or_null<re::Name>(context);
+                   n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+            context = n->getDefinition();
+        } else {
+            return context;
+        }
+    }
+}
+
+namespace {
+//  A context without its captures (to which a fixed result does not refer): the
+//  regular expression engine does not support captures in lookaheads.
+class StripCaptures final : public re::RE_Transformer {
+public:
+    StripCaptures() : re::RE_Transformer("StripCaptures") {}
+    re::RE * transformCapture(re::Capture * c) override {return transform(c->getCapturedRE());}
+};
+}
+
+//  An insertion rule (see InsertionRule), or false with the reason.
+static bool insertionRule(const ConversionRule * c, InsertionRule & ins, CharSetAnalysis & sets, std::string & reason) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (result->hasCursor() && (!isEmptyText(result->getResultToRevisit()) || result->getCursorOffset() != 0)) {
+        reason = "the result has text to revisit";
+        return false;
+    }
+    if (!fixedString(result->getText(), ins.replacement) || ins.replacement.empty()) {
+        reason = "the text inserted is not a fixed string";
+        return false;
+    }
+    const re::RE * const before = singleContextItem(source->getBeforeContext());
+    if (before == nullptr || !plainSet(before)) {
+        reason = "its before context is not one character of a set";
+        return false;
+    }
+    ins.before = sets.setOf(before, false);
+    re::RE * const after = source->getAfterContext();
+    const re::RE * const first = firstContextItem(after);
+    if (first == nullptr || !plainSet(first)) {
+        reason = "its after context does not begin with a character of a set";
+        return false;
+    }
+    ins.afterFirst = sets.setOf(first, false);
+    ins.after = after;
+    ins.engineAfter = engineContext(StripCaptures().transformRE(after), true);
+    ins.rule = c;
+    return true;
+}
+
 TransformPlan planTransform(const std::vector<Rule *> & rules) {
     TransformPlan plan;
     CharSetAnalysis sets;
@@ -588,6 +664,23 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             MultipleCaptureMultipleReplacementSet set;
             std::u32string fixedResult;
             std::string captureReason;
+            //  An insertion rule (A { } C → S).
+            if (items.empty() && run.empty()) {
+                InsertionRule ins;
+                std::string reason;
+                if (!insertionRule(c, ins, sets, reason)) {
+                    plan.problems.push_back(printRule(r) + "  (an insertion rule, but " + reason + ")");
+                    continue;
+                }
+                if (group == nullptr) {
+                    TransformStep step;
+                    step.kind = TransformStep::Kind::Conversion;
+                    plan.steps.push_back(std::move(step));
+                    group = &plan.steps.back();
+                }
+                group->insertions.push_back(std::move(ins));
+                continue;
+            }
             //  A MultipleCaptureMultipleReplacement rule (whose text has a fixed length or
             //  not, with a result referring to its captures in order).
             if (!identity && (!singleChars || !fixedString(result->getText(), fixedResult))
@@ -704,6 +797,27 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     //  The MultipleCaptureMultipleReplacement rules: they may not overlap the
     //  string rules of their group (neither matching within the other), and the
     //  single-character rules apply outside their matches.
+    //  The insertion rules: only in groups of such rules, and the text inserted
+    //  may not let an insertion rule match again at the position (its last
+    //  character, then before the position, in the set of the before context of
+    //  a rule whose after context may also match there).
+    for (TransformStep & step : plan.steps) {
+        if (step.insertions.empty()) continue;
+        const bool others = !step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty();
+        for (const InsertionRule & ins : step.insertions) {
+            if (others) {
+                plan.problems.push_back(printRule(ins.rule) + "  (an insertion rule, but in a group with other rules)");
+                continue;
+            }
+            for (const InsertionRule & other : step.insertions) {
+                if (other.before.contains(ins.replacement.back()) && other.afterFirst.intersects(ins.afterFirst)) {
+                    plan.problems.push_back(printRule(ins.rule) + "  (an insertion rule, but its text may let an insertion "
+                                            "rule match again: " + printRule(other.rule) + ")");
+                    break;
+                }
+            }
+        }
+    }
     for (TransformStep & step : plan.steps) {
         if (step.captureReplacements.empty()) continue;
         step.coverStringRules = true;

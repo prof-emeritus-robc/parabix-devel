@@ -43,6 +43,7 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <thread>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -114,6 +115,8 @@ static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
     cl::init(8), cl::cat(TconvOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
                               cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
+                           cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report problems found in the transform files"),
                                   cl::init(false), cl::cat(TconvOptions));
 
@@ -711,6 +714,9 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
                          << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)" : "the ends of matches") << "):\n";
             for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) llvm::outs() << "      " << ldml::printRule(r.rule) << "\n";
         }
+        for (const ldml::InsertionRule & ins : step.insertions) {
+            llvm::outs() << "    insertion rule: " << ldml::printRule(ins.rule) << "\n";
+        }
         for (const ldml::CharMapSubgroup & s : step.subgroups) {
             llvm::outs() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.characters().count() << " characters";
             unsigned shown = 0;
@@ -760,6 +766,50 @@ protected:
         }
         writeOutputStreamSet("Filled", basis);
     }
+};
+
+//  The texts inserted by insertion rules (see RulePipelineBuilder::insertionGroup):
+//  Shifted[j - 1] has a stream per rule, marking the j-th position inserted after
+//  each position where it applies, which gets the j-th character of its text
+//  (Basis has 0 at the inserted positions).
+class InsertedTexts : public pablo::PabloKernel {
+public:
+    InsertedTexts(LLVMTypeSystemInterface & ts, const std::vector<std::u32string> & texts,
+                  const std::vector<StreamSet *> & Shifted, StreamSet * Basis, StreamSet * Result)
+    : PabloKernel(ts, "InsertedTexts" + [&] {
+                      std::string sig;
+                      for (const std::u32string & t : texts) {
+                          sig += "_";
+                          for (char32_t ch : t) sig += std::to_string(static_cast<unsigned>(ch)) + ".";
+                      }
+                      //  A long signature is hashed (the kernel name is a file name in the object cache).
+                      return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
+                  }(),
+                  [&] {
+                      Bindings inputs{Binding{"Basis", Basis}};
+                      for (size_t j = 0; j < Shifted.size(); j++) inputs.emplace_back("Shifted" + std::to_string(j), Shifted[j]);
+                      return inputs;
+                  }(),
+                  {Binding{"Result", Result}}),
+      mTexts(texts), mShifts(Shifted.size()) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        for (unsigned j = 0; j < mShifts; j++) {
+            const std::vector<PabloAST *> marks = getInputStreamSet("Shifted" + std::to_string(j));
+            for (size_t i = 0; i < mTexts.size(); i++) {
+                if (j >= mTexts[i].size()) continue;
+                for (unsigned b = 0; b < basis.size(); b++) {
+                    if ((mTexts[i][j] >> b) & 1) basis[b] = pb.createOr(basis[b], marks[i]);
+                }
+            }
+        }
+        writeOutputStreamSet("Result", basis);
+    }
+private:
+    const std::vector<std::u32string> mTexts;
+    const unsigned mShifts;
 };
 
 //  The mask of the positions after insertions (see ExpandFilter): Spread is the
@@ -2903,6 +2953,7 @@ private:
     StreamSet * normalization(const std::string & name, StreamSet * U21);
     StreamSet * maskedNormalization(const std::string & name, StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * hexJava(StreamSet * U21);
     StreamSet * hexUnicode(StreamSet * U21);
@@ -2922,6 +2973,12 @@ private:
     TransformAnalyzer & mAnalyzer;
     NFD_PipelineBuilder mNFD;
     std::vector<StreamSet *> mMasks;
+    //  Whether the transform applied is a single conversion group with its own
+    //  filter (or one where it is invoked), whose insertions the filter does
+    //  not restrict (see insertionGroup), and whether the transform about to be
+    //  applied is invoked with a filter.
+    bool mInsertAnywhere = false;
+    bool mInvokedWithFilter = false;
 };
 
 //  The Final_Sigma condition of Unicode full lowercasing (as in el-Lower): Σ
@@ -3391,7 +3448,7 @@ StreamSet * RulePipelineBuilder::combine(StreamSet * a, StreamSet * b, bool isOr
 //  path does not support).  Only for such a group is shortening the text to
 //  the masked characters both correct and complete.
 static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
-    if (!step.stringRules.empty() || !step.captureReplacements.empty()) return false;
+    if (!step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) return false;
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         if (s.engineBefore || s.engineAfter) return false;
         for (const ldml::CharMapping & m : s.mappings) {
@@ -3436,7 +3493,80 @@ static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
 //  the subgroups, which also match the rules whose contexts are fixed sequences
 //  of sets; the matches of the other rules are given to them by the regular
 //  expression engine.
+//  A group of insertion rules (see ldml::InsertionRule).  Each rule applies at
+//  the positions of the characters after which it inserts its text (its before
+//  character, followed by its after context), where no earlier rule applies,
+//  and, within a filter, where the next character is in the mask (see below).
+//  The positions are inserted after them (InsertionSpreadMask), and the texts
+//  written there.
+StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    //  Within a filter, ICU applies a compound transform (of several groups) to
+    //  each run of the characters of the mask, inserting where the cursor stops
+    //  in the run: before a character of the mask (the contexts see the text
+    //  outside the run).  The text inserted is in the run.  A transform of this
+    //  group alone, with its own filter (or one given where it is invoked), checks
+    //  the filter only for the characters it replaces, of which an insertion has
+    //  none: it inserts anywhere (within the runs of an enclosing filter).
+    StreamSet * eligible = nullptr;     // (nullptr: everywhere)
+    const size_t restricting = mMasks.size() - (mInsertAnywhere && !mMasks.empty() ? 1 : 0);
+    if (restricting > 0) {
+        eligible = P.CreateStreamSet(1);
+        P.CreateKernelCall<ShiftBack>(mMasks[restricting - 1], eligible, 1);
+    }
+    std::vector<StreamSet *> positions;
+    std::vector<unsigned> counts;
+    std::vector<std::u32string> texts;
+    unsigned maxCount = 0;
+    for (const ldml::InsertionRule & ins : step.insertions) {
+        //  (The engine's matches may extend a position beyond the text: they are
+        //  combined with a stream of the text's length, the class of the character.)
+        StreamSet * at = combine(classes({ins.before}, U21), matchPositions(nullptr, ins.engineAfter, {ins.before}, U21), false);
+        at = combine(at, eligible, false);
+        SHOW_STREAM(at);
+        StreamSet * const notAt = P.CreateStreamSet(1);
+        Invert(P, at, notAt);
+        eligible = combine(eligible, notAt, false);
+        positions.push_back(at);
+        counts.push_back(static_cast<unsigned>(ins.replacement.size()));
+        texts.push_back(ins.replacement);
+        maxCount = std::max(maxCount, counts.back());
+    }
+    unsigned bits = 0;
+    while ((maxCount >> bits) != 0) bits++;
+    StreamSet * const InsertBixNum = P.CreateStreamSet(bits);
+    P.CreateKernelCall<InsertionCounts>(counts, positions, InsertBixNum);
+    SHOW_BIXNUM(InsertBixNum);
+    StreamSet * const SpreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, InsertBixNum, SpreadMask, kernel::InsertPosition::After);
+    SHOW_STREAM(SpreadMask);
+    StreamSet * const Expanded = P.CreateStreamSet(21, 1);
+    SpreadByMask(P, SpreadMask, U21, Expanded);
+    spreadMasks(SpreadMask);
+    if (!mMasks.empty()) {
+        StreamSet * const inserted = P.CreateStreamSet(1);
+        Invert(P, SpreadMask, inserted);
+        for (StreamSet *& mask : mMasks) mask = combine(mask, inserted, true);
+    }
+    //  The j-th position inserted after a position where rule i applies.
+    StreamSet * const At = P.CreateStreamSet(positions.size());
+    P.CreateKernelCall<CollectStreams>(positions, At);
+    StreamSet * const SpreadAt = P.CreateStreamSet(positions.size());
+    SpreadByMask(P, SpreadMask, At, SpreadAt);
+    std::vector<StreamSet *> shifted;
+    for (unsigned j = 1; j <= maxCount; j++) {
+        StreamSet * const s = P.CreateStreamSet(positions.size());
+        P.CreateKernelCall<ShiftForward>(SpreadAt, s, j);
+        shifted.push_back(s);
+    }
+    StreamSet * const Result = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<InsertedTexts>(texts, shifted, Expanded, Result);
+    SHOW_BIXNUM(Result);
+    return Result;
+}
+
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    if (!step.insertions.empty()) return insertionGroup(step, U21);
     //  Within a mask, a context-free, single-character mapping is applied
     //  only to the masked characters (localCharacterMapping): map runs this
     //  same function again, but on the (unmasked) shortened text, where the
@@ -4227,17 +4357,24 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
 }
 
 StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, StreamSet * U21) {
+    const bool invokedWithFilter = mInvokedWithFilter;
+    mInvokedWithFilter = false;
+    const bool insertAnywhere = mInsertAnywhere;
+    mInsertAnywhere = a.plan.steps.size() == 1 && (a.plan.filter || invokedWithFilter);
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             if (step.filter) pushFilter(step.filterSet, U21);
+            mInvokedWithFilter = step.filter != nullptr;
             U21 = transform(mRegistry.lookup(step.transform.getText()), U21);
+            mInvokedWithFilter = false;
             if (step.filter) popFilter();
         } else {
             U21 = conversionGroup(step, U21);
         }
     }
     if (a.plan.filter) popFilter();
+    mInsertAnywhere = insertAnywhere;
     return U21;
 }
 
@@ -4269,6 +4406,42 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
+}
+
+//  Applies a transform function to the input: the whole text, or with --lines,
+//  each line as a text of its own (given through a pipe), followed by its line
+//  break.
+static void applyToInput(TransformFunctionType fn, int fd) {
+    if (!Lines) {
+        fn(fd);
+        return;
+    }
+    std::string text;
+    char buffer[1 << 16];
+    for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
+    for (size_t pos = 0; pos < text.size(); ) {
+        const size_t nl = text.find('\n', pos);
+        const size_t end = nl == std::string::npos ? text.size() : nl;
+        int fds[2];
+        if (pipe(fds) != 0) {
+            llvm::errs() << "Error: cannot create a pipe.\n";
+            exit(1);
+        }
+        std::thread writer([&] {
+            for (size_t i = pos; i < end; ) {
+                const ssize_t n = write(fds[1], text.data() + i, end - i);
+                if (n <= 0) break;
+                i += static_cast<size_t>(n);
+            }
+            close(fds[1]);
+        });
+        fn(fds[0]);
+        writer.join();
+        close(fds[0]);
+        if (nl == std::string::npos) break;
+        if (write(STDOUT_FILENO, "\n", 1) != 1) exit(1);
+        pos = nl + 1;
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -4334,7 +4507,7 @@ int main(int argc, char *argv[]) {
         }
         CPUDriver driver("tconv");
         TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
-        fn(fd);
+        applyToInput(fn, fd);
         close(fd);
         return 0;
     }
@@ -4387,7 +4560,7 @@ int main(int argc, char *argv[]) {
                         && impl->second != Transform::HexPerl;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
-    fn(fd);
+    applyToInput(fn, fd);
     close(fd);
     return 0;
 }

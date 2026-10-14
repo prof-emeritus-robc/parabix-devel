@@ -162,6 +162,23 @@ struct MultipleCaptureMultipleReplacementSet {
     std::vector<MultipleCaptureMultipleReplacement> rules;
 };
 
+// A conversion rule inserting a text where its contexts meet: A { } C → S, with
+// an empty text to replace (W4).  For now, only in a group of such rules, with
+// a before context of one character (of a set, not the text boundary) and an
+// after context beginning with one: the converted text that the before context
+// sees is then the text itself (each insertion is before a character that
+// stays in place), and the insertion is before a character, which ICU reaches.
+// At each position, the first rule matching applies; the text inserted may not
+// let a rule match there again (ICU would insert repeatedly).
+struct InsertionRule {
+    UCD::UnicodeSet before;         // the character before the insertion
+    re::RE * after = nullptr;       // the after context
+    UCD::UnicodeSet afterFirst;     // the first character of the after context
+    re::RE * engineAfter = nullptr; // as a lookahead body (see engineContext), without captures
+    std::u32string replacement;     // S
+    const ConversionRule * rule = nullptr;
+};
+
 struct TransformStep {
     enum class Kind {Conversion, Transform};
     Kind kind;
@@ -192,6 +209,8 @@ struct TransformStep {
     // The MultipleCaptureMultipleReplacement rules (see MultipleCaptureMultipleReplacementSet), which may not overlap the string
     // rules; the single-character rules apply outside their matches.
     std::vector<MultipleCaptureMultipleReplacementSet> captureReplacements;
+    // The insertion rules (see InsertionRule), in order.
+    std::vector<InsertionRule> insertions;
     // Whether the matches of different sets may overlap: they are then selected
     // sequentially, from the left (the earlier set at the same position).
     bool captureSelection = false;

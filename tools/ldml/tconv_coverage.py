@@ -134,6 +134,8 @@ def classify_problem(p):
         return 'T-capture-overlap'
     if '(a MultipleCaptureMultipleReplacement rule, but' in p:
         return 'T-capture-pattern'
+    if '(an insertion rule, but' in p:
+        return 'T-insertion'
     if 'does not support in lookaheads' in p:
         return 'E-engine-lookahead'
     if 'is expanded for a longer replacement' in p:
@@ -270,8 +272,23 @@ def run_tests(args, entries):
             e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(pairs), timeout=True)
             continue
         out = r.stdout.decode('utf-8', 'replace').split('\n')
-        failed = sum(1 for i, p in enumerate(pairs) if i >= len(out) or out[i] != p[1])
-        e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=failed)
+        failing = [i for i, p in enumerate(pairs) if i >= len(out) or out[i] != p[1]]
+        # Each case is a text of its own: in the text of all the cases, one per
+        # line, a context may see the line break instead of the text boundary.
+        # The failing cases are run again, each as a text (tconv --lines, which
+        # runs the pipeline once per line, too slowly for all the cases).
+        if failing:
+            retry = src + '.failing'
+            with open(retry, 'w', encoding='utf-8') as t:
+                t.write(''.join(pairs[i][0] + '\n' for i in failing))
+            try:
+                r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, '--lines', name, retry],
+                                   capture_output=True, timeout=args.timeout)
+                out = r.stdout.decode('utf-8', 'replace').split('\n')
+                failing = [i for k, i in enumerate(failing) if k >= len(out) or out[k] != pairs[i][1]]
+            except subprocess.TimeoutExpired:
+                pass
+        e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(failing))
 
 
 def summary(entries):

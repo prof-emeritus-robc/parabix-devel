@@ -43,6 +43,45 @@ void ShiftBack::generatePabloMethod() {
     }
 }
 
+SwapBack::SwapBack(LLVMTypeSystemInterface & ts, StreamSet * marker,  StreamSet * inputs, StreamSet * outputs, unsigned swapback_length, unsigned distance)
+: PabloKernel(ts, "SwapBack" + std::to_string(outputs->getNumElements()) + "x1_" + std::to_string(swapback_length) + "_" + std::to_string(distance),
+              {Binding{"marker", marker}, Binding{"inputs", inputs, FixedRate(1), LookAhead(distance)}},
+              {Binding{"outputs", outputs}}), mSwapBackLength(swapback_length), mDistance(distance)
+{   assert(outputs->getNumElements() == inputs->getNumElements());
+}
+
+void SwapBack::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    PabloAST * marker = getInputStreamSet("marker")[0];
+    std::vector<PabloAST *> source = getInputStreamSet("inputs");
+    std::vector<Var *> outputVars(source.size());
+    for (unsigned i = 0; i < source.size(); i++) {
+        outputVars[i] = pb.createVar("outVar" + std::to_string(i), source[i]);
+    }
+    auto nested = pb.createScope();
+    //  The region [marker, marker + swapback_length + distance): its first
+    //  swapback_length positions (mask1) take the data from distance positions
+    //  ahead, and the rest (mask2) the data from swapback_length positions back.
+    //  (A region continuing from a marker in a previous block is processed, as
+    //  the If is also entered for the pending carries of its scope.)
+    PabloAST * swap_back_follow = nested.createAdvance(marker, mSwapBackLength);
+    PabloAST * mask1 = nested.createIntrinsicCall(pablo::Intrinsic::SpanUpTo, {marker, swap_back_follow});
+    PabloAST * region_follow = nested.createAdvance(marker, mSwapBackLength + mDistance);
+    PabloAST * mask2 = nested.createIntrinsicCall(pablo::Intrinsic::SpanUpTo, {swap_back_follow, region_follow});
+    PabloAST * unchanged_mask = nested.createInFile(nested.createNot(nested.createOr(mask1, mask2)));
+
+    for (unsigned i = 0; i < source.size(); i++) {
+        PabloAST * back = nested.createAnd(nested.createLookahead(source[i], mDistance), mask1);
+        PabloAST * fwd =  nested.createAnd(nested.createAdvance(source[i], mSwapBackLength), mask2);
+        PabloAST * unchanged = nested.createAnd(source[i], unchanged_mask);
+        nested.createAssign(outputVars[i], nested.createOr3(back, fwd, unchanged));
+    }
+    pb.createIf(marker, nested);
+    for (unsigned i = 0; i < source.size(); i++) {
+        pb.createAssign(pb.createExtract(getOutput(0), i), outputVars[i]);
+    }
+}
+
 IndexedAdvance::IndexedAdvance(LLVMTypeSystemInterface & ts, StreamSet * index, StreamSet * inputs, StreamSet * shifted, unsigned shiftAmount)
 : PabloKernel(ts, "IndexedAdvance" + std::to_string(shifted->getNumElements()) + "x1_by" + std::to_string(shiftAmount),
 {Binding{"index", index}, Binding{"inputs", inputs}}, {Binding{"shifted", shifted}}),

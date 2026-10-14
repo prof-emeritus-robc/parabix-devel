@@ -171,6 +171,18 @@ struct MultipleCaptureMultipleReplacementSet {
     unsigned swapLength = 0;
     unsigned swapDistance = 0;
     unsigned swapBefore = 0;
+    //  More generally, a rule referring to its captures in order but for one
+    //  capture j (0-based) referred to before captures i to j - 1,
+    //      ... Q_i $j Q_(i+1) $i ... $(j-1) Q_(j+1) $(j+1) ...,
+    //  with captures i and j never empty (of variable lengths, or more than two
+    //  captures), is planned in order, with Q_i Q_(i+1) before capture i, the
+    //  texts between $i and $(j-1) before their captures, and no text between
+    //  capture j - 1 and capture j; the region from swapBefore = |Q_(i+1)|
+    //  positions before capture i up to capture j of each match is then moved
+    //  after capture j (moveFirst = i, moveCapture = j).
+    bool moved = false;
+    unsigned moveFirst = 0;
+    unsigned moveCapture = 0;
     //  The characters of the region (of B1, B2 and R1), which may be in either
     //  order where a rule of the group sees the converted text: every set of
     //  the before contexts of the group must contain all of them or none.

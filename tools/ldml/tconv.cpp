@@ -64,6 +64,7 @@
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/sorting.h>
 #include <kernel/streamutils/stream_shift.h>
+#include <kernel/streamutils/run_index.h>
 #include <kernel/unicode/char_replacement.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/normalization/normalization.h>
@@ -860,6 +861,8 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
                          << " rules, matched together (" << set.rules.size() << ", starts by "
                          << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)" : "the ends of matches") << ")"
                          << (set.reversed ? ", captures reversed (SwapBack " + std::to_string(set.swapLength) + ", " + std::to_string(set.swapDistance) + ")" : "")
+                         << (set.moved ? ", captures " + std::to_string(set.moveFirst + 1) + " to " + std::to_string(set.moveCapture)
+                                         + " moved after capture " + std::to_string(set.moveCapture + 1) : "")
                          << ":\n";
             for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) llvm::outs() << "      " << ldml::printRule(r.rule) << "\n";
         }
@@ -2026,8 +2029,77 @@ static void insertionContextProblems(const ldml::TransformStep & step, std::vect
     }
 }
 
+//  The possessive walk over the text of a MultipleCaptureMultipleReplacement
+//  rule from the start of each match (see CaptureWalk): an item is a set of
+//  characters (one), an optional one (taken if there), a run of them (as many
+//  as there are), or alternative strings (the longest that matches).
+struct WalkItem {
+    enum class Kind {Set, Optional, Star, Strings};
+    Kind kind;
+    UCD::UnicodeSet set;
+    std::vector<std::vector<UCD::UnicodeSet>> strings;      // longest first
+};
+
+//  The items of a capture's pattern, as resolved by ldml::expandedContext, or false.
+static bool walkItems(const re::RE * re, std::vector<WalkItem> & items) {
+    if (const re::CC * cc = dyn_cast<re::CC>(re)) {
+        items.push_back(WalkItem{WalkItem::Kind::Set, *cc, {}});
+        return true;
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        for (const re::RE * e : *seq) if (!walkItems(e, items)) return false;
+        return true;
+    } else if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        const re::CC * cc = dyn_cast<re::CC>(rep->getRE());
+        if (cc == nullptr) return false;
+        for (int i = 0; i < rep->getLB(); i++) items.push_back(WalkItem{WalkItem::Kind::Set, *cc, {}});
+        if (rep->getUB() == re::Rep::UNBOUNDED_REP) {
+            items.push_back(WalkItem{WalkItem::Kind::Star, *cc, {}});
+        } else {
+            for (int i = rep->getLB(); i < rep->getUB(); i++) items.push_back(WalkItem{WalkItem::Kind::Optional, *cc, {}});
+        }
+        return true;
+    } else if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        WalkItem w{WalkItem::Kind::Strings, {}, {}};
+        for (const re::RE * a : *alt) {
+            std::vector<UCD::UnicodeSet> str;
+            if (const re::CC * cc = dyn_cast<re::CC>(a)) {
+                str.push_back(*cc);
+            } else if (const re::Seq * sq = dyn_cast<re::Seq>(a)) {
+                for (const re::RE * e : *sq) {
+                    const re::CC * cc = dyn_cast<re::CC>(e);
+                    if (cc == nullptr) return false;
+                    str.push_back(*cc);
+                }
+            } else {
+                return false;
+            }
+            w.strings.push_back(std::move(str));
+        }
+        std::stable_sort(w.strings.begin(), w.strings.end(), [](const auto & a, const auto & b) {return a.size() > b.size();});
+        items.push_back(std::move(w));
+        return true;
+    }
+    return false;
+}
+
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
     if (step.captureReplacements.empty()) return;
+    //  The captures of the rules whose regions are moved must be found by a
+    //  possessive walk (see CaptureWalk).
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        if (!set.moved) continue;
+        bool walkable = true;
+        for (re::RE * c : set.captures) {
+            std::vector<WalkItem> items;
+            walkable &= walkItems(ldml::expandedContext(c, Insertions(), DeletionMark), items);
+        }
+        if (walkable) continue;
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            problems.push_back(ldml::printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but it refers to its "
+                               "captures out of order, and a capture is not a sequence of sets, optional sets, runs of sets "
+                               "and sets with strings)");
+        }
+    }
     const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
         if (set.engineBefore == nullptr) continue;
@@ -3402,6 +3474,168 @@ static std::vector<std::vector<size_t>> fusedStringChunks(const std::vector<std:
     return chunks;
 }
 
+//  The walk over the text of the matches of a MultipleCaptureMultipleReplacement
+//  set whose region is moved (see ldml::MultipleCaptureMultipleReplacementSet::
+//  moved): from the start of each match (Starts), the positions of the first
+//  characters of captures i and j and the position after capture j (Marks,
+//  three streams).  The segments are the texts before the captures (of fixed
+//  lengths) and the captures.
+struct CaptureWalkConfig {
+    std::vector<unsigned> textLengths;              // T0 ... Tk
+    std::vector<std::vector<WalkItem>> captures;    // B1 ... Bk
+    unsigned first;                                 // i (0-based)
+    unsigned moved;                                 // j
+    unsigned lookahead() const {
+        unsigned l = 0;
+        for (const auto & c : captures) {
+            for (const WalkItem & w : c) {
+                for (const auto & str : w.strings) l = std::max<unsigned>(l, str.size() - 1);
+            }
+        }
+        return l;
+    }
+    std::string signature() const {
+        std::string s = "W" + std::to_string(first) + "." + std::to_string(moved);
+        auto set = [&](const UCD::UnicodeSet & u) {
+            s += "[";
+            for (const auto & r : u) s += std::to_string(r.first) + "-" + std::to_string(r.second) + ",";
+            s += "]";
+        };
+        for (size_t c = 0; c < captures.size(); c++) {
+            s += "|t" + std::to_string(textLengths[c]) + "|c";
+            for (const WalkItem & w : captures[c]) {
+                s += std::to_string(static_cast<int>(w.kind));
+                if (w.kind == WalkItem::Kind::Strings) {
+                    for (const auto & str : w.strings) {
+                        s += "(";
+                        for (const auto & u : str) set(u);
+                        s += ")";
+                    }
+                } else {
+                    set(w.set);
+                }
+            }
+        }
+        return s + "|t" + std::to_string(textLengths.back());
+    }
+};
+
+class CaptureWalk final : public pablo::PabloKernel {
+public:
+    CaptureWalk(LLVMTypeSystemInterface & ts, CaptureWalkConfig config, StreamSet * U21, StreamSet * Starts, StreamSet * Marks)
+    : PabloKernel(ts, "CaptureWalk_" + getStringHash(config.signature()),
+                  {Binding{"U21", U21, FixedRate(1), LookAhead(std::max(1u, config.lookahead()))}, Binding{"Starts", Starts}},
+                  {Binding{"Marks", Marks}}),
+      mConfig(std::move(config)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+        std::vector<std::unique_ptr<cc::Parabix_CC_Compiler_Builder>> ahead(mConfig.lookahead() + 1);
+        auto cls = [&](unsigned k, const UCD::UnicodeSet & set) -> PabloAST * {
+            if (!ahead[k]) {
+                std::vector<PabloAST *> bits(basis.size());
+                for (unsigned b = 0; b < basis.size(); b++) bits[b] = k ? pb.createLookahead(basis[b], k) : basis[b];
+                ahead[k] = std::make_unique<cc::Parabix_CC_Compiler_Builder>(bits);
+            }
+            return ahead[k]->compileCC(re::makeCC(set, &cc::Unicode), pb);
+        };
+        PabloAST * cursor = getInputStreamSet("Starts")[0];
+        PabloAST * startI = nullptr, * startJ = nullptr, * afterJ = nullptr;
+        for (size_t c = 0; c <= mConfig.captures.size(); c++) {
+            if (mConfig.textLengths[c]) cursor = pb.createAdvance(cursor, mConfig.textLengths[c]);
+            if (c == mConfig.captures.size()) break;
+            if (c == mConfig.first) startI = cursor;
+            if (c == mConfig.moved) startJ = cursor;
+            for (const WalkItem & w : mConfig.captures[c]) {
+                switch (w.kind) {
+                    case WalkItem::Kind::Set:
+                        cursor = pb.createAdvance(pb.createAnd(cursor, cls(0, w.set)), 1);
+                        break;
+                    case WalkItem::Kind::Optional: {
+                        PabloAST * const in = cls(0, w.set);
+                        cursor = pb.createOr(pb.createAdvance(pb.createAnd(cursor, in), 1), pb.createAnd(cursor, pb.createNot(in)));
+                        break;
+                    }
+                    case WalkItem::Kind::Star: {
+                        PabloAST * const in = cls(0, w.set);
+                        cursor = pb.createAnd(pb.createMatchStar(cursor, in), pb.createNot(in));
+                        break;
+                    }
+                    case WalkItem::Kind::Strings: {
+                        PabloAST * taken = pb.createZeroes();
+                        PabloAST * next = pb.createZeroes();
+                        for (const auto & str : w.strings) {
+                            PabloAST * m = pb.createAnd(cursor, pb.createNot(taken));
+                            for (unsigned k = 0; k < str.size(); k++) m = pb.createAnd(m, cls(k, str[k]));
+                            next = pb.createOr(next, pb.createAdvance(m, str.size()));
+                            taken = pb.createOr(taken, m);
+                        }
+                        cursor = next;
+                        break;
+                    }
+                }
+            }
+            if (c == mConfig.moved) afterJ = cursor;
+        }
+        Var * const marks = getOutputStreamVar("Marks");
+        pb.createAssign(pb.createExtract(marks, pb.getInteger(0)), startI);
+        pb.createAssign(pb.createExtract(marks, pb.getInteger(1)), startJ);
+        pb.createAssign(pb.createExtract(marks, pb.getInteger(2)), afterJ);
+    }
+private:
+    const CaptureWalkConfig mConfig;
+};
+
+//  The regions moved (see ldml::MultipleCaptureMultipleReplacementSet::moved),
+//  given the first position of each (XStart), and the first (JStart) and last
+//  (JEnd) positions of capture j after it: the region (X), capture j (J), and
+//  the number of positions of the region (up to 64) at the last position of
+//  capture j, given the run index of the region (Index).
+class MoveRegions final : public pablo::PabloKernel {
+public:
+    MoveRegions(LLVMTypeSystemInterface & ts, StreamSet * XStart, StreamSet * JStart, StreamSet * JEnd, StreamSet * X, StreamSet * J)
+    : PabloKernel(ts, "MoveRegions", {Binding{"XStart", XStart}, Binding{"JStart", JStart}, Binding{"JEnd", JEnd}},
+                  {Binding{"X", X}, Binding{"J", J}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const jStart = getInputStreamSet("JStart")[0];
+        PabloAST * const x = pb.createIntrinsicCall(pablo::Intrinsic::SpanUpTo, {getInputStreamSet("XStart")[0], jStart});
+        PabloAST * const j = pb.createIntrinsicCall(pablo::Intrinsic::InclusiveSpan, {jStart, getInputStreamSet("JEnd")[0]});
+        pb.createAssign(pb.createExtract(getOutputStreamVar("X"), pb.getInteger(0)), x);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("J"), pb.getInteger(0)), j);
+    }
+};
+
+class MoveCounts final : public pablo::PabloKernel {
+public:
+    MoveCounts(LLVMTypeSystemInterface & ts, StreamSet * X, StreamSet * Index, StreamSet * JStart, StreamSet * J,
+               StreamSet * JEnd, StreamSet * Counts)
+    : PabloKernel(ts, "MoveCounts" + std::to_string(Index->getNumElements()),
+                  {Binding{"X", X}, Binding{"Index", Index}, Binding{"JStart", JStart, FixedRate(1), LookAhead(1)},
+                   Binding{"J", J}, Binding{"JEnd", JEnd}},
+                  {Binding{"Counts", Counts}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+        PabloAST * const x = getInputStreamSet("X")[0];
+        PabloAST * const j = getInputStreamSet("J")[0];
+        PabloAST * const jEnd = getInputStreamSet("JEnd")[0];
+        PabloAST * const xLast = pb.createAnd(x, pb.createLookahead(getInputStreamSet("JStart")[0], 1));
+        const BixNum index = getInputStreamSet("Index");
+        //  The length of the region at its last position, carried through capture j.
+        BixNum length = bnc.AddModular(bnc.ZeroExtend(index, index.size() + 1), 1);
+        Var * const counts = getOutputStreamVar("Counts");
+        for (unsigned b = 0; b < length.size(); b++) {
+            PabloAST * const bit = pb.createAnd(length[b], xLast);
+            pb.createAssign(pb.createExtract(counts, pb.getInteger(b)),
+                            pb.createAnd(pb.createMatchStar(pb.createAdvance(bit, 1), j), jEnd));
+        }
+    }
+};
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -4308,6 +4542,17 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         unsigned distance;
     };
     std::vector<Swap> swaps;
+    //  The regions moved (see ldml::MultipleCaptureMultipleReplacementSet::moved):
+    //  the first characters of capture i (moved by offset to the start of the
+    //  region) and of capture j, and the last of capture j, kept in step with
+    //  the text likewise.
+    struct Move {
+        StreamSet * startI;
+        int offset;
+        StreamSet * startJ;
+        StreamSet * endJ;
+    };
+    std::vector<Move> moves;
     auto applyFused = [&](FusedRulesConfig && config, StreamSet * allowedAt) {
         const FusedLayout layout(config, state);
         FusedState out;
@@ -4614,7 +4859,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             //  Only the streams used are made (the pipeline compiler fails on kernels
             //  whose outputs are unused): the starts, if replacements are made from
             //  them, the spans are covered or selected, and the spans, for the starts.
-            bool needStarts = n0 > 0 || needCoverage || step.captureSelection || set.reversed;
+            bool needStarts = n0 > 0 || needCoverage || step.captureSelection || set.reversed || set.moved;
             for (const ldml::BoundaryReplacement & br : set.replacements) needStarts |= !br.fromEnd;
             CaptureMatches m;
             m.ends = matchPattern(set.engineBefore, set.engineAfter, items, U21,
@@ -4669,7 +4914,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 StreamSet * const chosen = P.CreateStreamSet(3);
                 P.CreateKernelCall<SelectedSpans>(m.starts, runStreams[i], m.ends, selected, chosen);
                 //  (Only the streams used are selected.)
-                bool usesStarts = !set.rules.front().first.empty() || needCoverage || set.reversed, usesEnds = false;
+                bool usesStarts = !set.rules.front().first.empty() || needCoverage || set.reversed || set.moved, usesEnds = false;
                 for (const ldml::BoundaryReplacement & br : set.replacements) {
                     usesStarts |= !br.fromEnd;
                     usesEnds |= br.fromEnd;
@@ -4705,6 +4950,35 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 const int offset = (n0 == 0 ? static_cast<int>(set.rules.front().firstReplacement.size()) : 0)
                                    - static_cast<int>(set.swapBefore);
                 swaps.push_back(Swap{b1, offset, set.swapLength, set.swapDistance});
+            }
+            if (set.moved) {
+                //  The captures found by their possessive walk from the starts.
+                CaptureWalkConfig walk;
+                walk.textLengths.push_back(static_cast<unsigned>(n0));
+                for (size_t c = 0; c < set.captures.size(); c++) {
+                    walk.captures.emplace_back();
+                    walkItems(ldml::expandedContext(set.captures[c], Insertions(), DeletionMark), walk.captures.back());
+                    walk.textLengths.push_back(static_cast<unsigned>(set.texts[c].size()));
+                }
+                walk.first = set.moveFirst;
+                walk.moved = set.moveCapture;
+                StreamSet * const marks = P.CreateStreamSet(3);
+                P.CreateKernelCall<CaptureWalk>(std::move(walk), U21, starts, marks);
+                auto select = [&](unsigned k) {
+                    StreamSet * const out = P.CreateStreamSet(1);
+                    P.CreateKernelCall<StreamSelect>(out, Select(marks, {k}));
+                    return out;
+                };
+                StreamSet * const endJ = P.CreateStreamSet(1);
+                P.CreateKernelCall<ShiftBack>(select(2), endJ, 1);
+                //  Capture i is kept after the text inserted before it (if any).
+                int keptAt = 0;
+                for (const ldml::BoundaryReplacement & br : set.replacements) {
+                    if (br.kind == ldml::BoundaryReplacement::Kind::Keep && br.capture == set.moveFirst + 1 && br.keepAt > 0) {
+                        keptAt = static_cast<int>(br.keepAt);
+                    }
+                }
+                moves.push_back(Move{select(0), keptAt - static_cast<int>(set.swapBefore), select(1), endJ});
             }
             //  T0 by R0, the first rule whose T0 matches at the start applying.
             if (n0 > 0) {
@@ -4915,6 +5189,13 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             SpreadByMask(P, SpreadMask, sw.marks, spread);
             sw.marks = spread;
         }
+        for (Move & mv : moves) {
+            for (StreamSet ** m : {&mv.startI, &mv.startJ, &mv.endJ}) {
+                StreamSet * const spread = P.CreateStreamSet(1);
+                SpreadByMask(P, SpreadMask, *m, spread);
+                *m = spread;
+            }
+        }
         //  The changes of each position i of the replacements, spread with the
         //  text, and moved to the i-th position inserted after their characters.
         changes = nullptr;
@@ -4950,6 +5231,13 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             FilterByMask(P, keep, sw.marks, marks);
             sw.marks = marks;
         }
+        for (Move & mv : moves) {
+            for (StreamSet ** m : {&mv.startI, &mv.startJ, &mv.endJ}) {
+                StreamSet * const filtered = P.CreateStreamSet(1);
+                FilterByMask(P, keep, *m, filtered);
+                *m = filtered;
+            }
+        }
     }
     //  The regions reversed (their last characters moved before the others).
     for (const Swap & sw : swaps) {
@@ -4967,6 +5255,56 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * const swapped = P.CreateStreamSet(21);
         P.CreateKernelCall<SwapBack>(marks, result, swapped, sw.length, sw.distance);
         result = swapped;
+    }
+    //  The regions moved after capture j: their characters taken out, in order
+    //  (FilterByMask), and put into as many positions inserted after capture j
+    //  (InsertionSpreadMask, MergeByMask).  The marks of the regions moved later,
+    //  and the masks, are kept in step.
+    for (size_t m = 0; m < moves.size(); m++) {
+        const Move & mv = moves[m];
+        StreamSet * xStart = mv.startI;
+        if (mv.offset != 0) {
+            xStart = P.CreateStreamSet(1);
+            if (mv.offset > 0) {
+                P.CreateKernelCall<ShiftForward>(mv.startI, xStart, static_cast<unsigned>(mv.offset));
+            } else {
+                P.CreateKernelCall<ShiftBack>(mv.startI, xStart, static_cast<unsigned>(-mv.offset));
+            }
+        }
+        StreamSet * const x = P.CreateStreamSet(1);
+        StreamSet * const j = P.CreateStreamSet(1);
+        P.CreateKernelCall<MoveRegions>(xStart, mv.startJ, mv.endJ, x, j);
+        SHOW_STREAM(x);
+        StreamSet * const index = P.CreateStreamSet(6);
+        P.CreateKernelCall<RunIndex>(x, index);
+        StreamSet * const counts = P.CreateStreamSet(7);
+        P.CreateKernelCall<MoveCounts>(x, index, mv.startJ, j, mv.endJ, counts);
+        StreamSet * const keepRest = P.CreateStreamSet(1);
+        Invert(P, x, keepRest);
+        StreamSet * const extracted = P.CreateStreamSet(21);
+        FilterByMask(P, x, result, extracted);
+        StreamSet * const rest = P.CreateStreamSet(21);
+        FilterByMask(P, keepRest, result, rest);
+        StreamSet * const restCounts = P.CreateStreamSet(7);
+        FilterByMask(P, keepRest, counts, restCounts);
+        StreamSet * const SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, restCounts, SpreadMask, kernel::InsertPosition::After);
+        StreamSet * const inserted = P.CreateStreamSet(1);
+        Invert(P, SpreadMask, inserted);
+        StreamSet * const merged = P.CreateStreamSet(21);
+        MergeByMask(P, inserted, extracted, rest, merged);
+        result = merged;
+        filterMasks(keepRest);
+        spreadMasks(SpreadMask);
+        for (size_t later = m + 1; later < moves.size(); later++) {
+            for (StreamSet ** mk : {&moves[later].startI, &moves[later].startJ, &moves[later].endJ}) {
+                StreamSet * const filtered = P.CreateStreamSet(1);
+                FilterByMask(P, keepRest, *mk, filtered);
+                StreamSet * const spread = P.CreateStreamSet(1);
+                SpreadByMask(P, SpreadMask, filtered, spread);
+                *mk = spread;
+            }
+        }
     }
     return result;
 }

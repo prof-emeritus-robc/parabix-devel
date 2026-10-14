@@ -162,6 +162,29 @@ static bool matchableChars(const re::RE * re, UCD::UnicodeSet & chars, CharSetAn
     return false;
 }
 
+//  A pattern that ends with a set of characters (no strings), one character or
+//  an unbounded run of them (at least one): the set, and the characters that
+//  may come before it in a match (added to before).
+static bool finalItem(const re::RE * re, UCD::UnicodeSet & last, UCD::UnicodeSet & before, CharSetAnalysis & sets) {
+    if (plainSet(re)) {
+        last = sets.setOf(re, false);
+        return true;
+    } else if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        if (!plainSet(rep->getRE()) || rep->getLB() < 1 || rep->getUB() != re::Rep::UNBOUNDED_REP) return false;
+        last = sets.setOf(rep->getRE(), false);
+        return true;
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        if (seq->empty() || !finalItem(seq->back(), last, before, sets)) return false;
+        for (auto i = seq->begin(); i + 1 != seq->end(); ++i) {
+            if (!matchableChars(*i, before, sets)) return false;
+        }
+        return true;
+    } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && finalItem(n->getDefinition(), last, before, sets);
+    }
+    return false;
+}
+
 //  A pattern that begins with a set of characters (no strings): the set, and
 //  the characters that may follow it in a match (added to rest).
 static bool leadingSet(const re::RE * re, UCD::UnicodeSet & first, UCD::UnicodeSet & rest, CharSetAnalysis & sets) {
@@ -342,16 +365,38 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
         }
     }
     if (results.size() != k + 1) return false;
-    //  Two captures referred to in reverse order (see
-    //  MultipleCaptureMultipleReplacementSet::reversed): as R0 R1 $1 $2 R2.
-    bool reversed = false;
-    if (k == 2 && order == std::vector<size_t>{1, 0}) {
-        reversed = true;
-        set.swapBefore = static_cast<unsigned>(results[1].size());
-        results = {results[0] + results[1], std::u32string(), results[2]};
-    } else {
-        for (size_t i = 0; i < order.size(); i++) {
-            if (order[i] != i) return false;
+    //  Captures referred to in order, but for one capture j referred to before
+    //  captures i to j - 1 (see MultipleCaptureMultipleReplacementSet::moved):
+    //  planned in order, the text Q_i before $j and Q_(i+1) between $j and $i
+    //  before capture i, the texts within the region before their captures, and
+    //  no text between capture j - 1 and j.  (0-based captures; Q_t is the text
+    //  before the t-th reference.)
+    bool moved = false;
+    size_t mi = 0, mj = 0;
+    {
+        size_t m = 0;
+        while (m < order.size() && order[m] == m) m++;
+        if (m < order.size()) {
+            const size_t j = order[m];
+            std::vector<size_t> expected;
+            for (size_t c = 0; c < m; c++) expected.push_back(c);
+            expected.push_back(j);
+            for (size_t c = m; c < order.size(); c++) if (c != j) expected.push_back(c);
+            if (j <= m || order != expected) return false;
+            moved = true;
+            mi = m;
+            mj = j;
+            std::vector<std::u32string> inOrder(k + 1);
+            for (size_t c = 0; c < mi; c++) inOrder[c] = results[c];
+            inOrder[mi] = results[mi] + results[mi + 1];
+            for (size_t c = mi + 1; c < mj; c++) inOrder[c] = results[c + 1];
+            inOrder[mj] = std::u32string();
+            for (size_t c = mj + 1; c <= k; c++) inOrder[c] = results[c];
+            set.swapBefore = static_cast<unsigned>(results[mi + 1].size());
+            for (size_t c = mi + 1; c <= mj; c++) {
+                for (char32_t ch : results[c]) set.swapChars.insert(ch);
+            }
+            results = inOrder;
         }
     }
     //  The lengths and characters of the captures.
@@ -368,16 +413,22 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
         all = all + captureChars[i];
     }
     for (const auto & t : texts) for (const UCD::UnicodeSet & chars : t) all = all + chars;
-    if (reversed) {
-        if (minLength[1] != maxLength[1] || minLength[2] != maxLength[2] || minLength[1] == 0 || minLength[2] == 0) {
-            reason = "it refers to its captures in reverse order, but they do not have fixed lengths";
+    if (moved) {
+        if (minLength[mi + 1] == 0 || minLength[mj + 1] == 0) {
+            reason = "it refers to its captures out of order, of which one moved may be empty";
             return false;
         }
-        set.reversed = true;
-        set.swapLength = minLength[2];
-        set.swapDistance = set.swapBefore + minLength[1];
-        set.swapChars = captureChars[1] + captureChars[2];
-        for (char32_t ch : results[0].substr(results[0].size() - set.swapBefore)) set.swapChars.insert(ch);
+        for (size_t c = mi + 1; c <= mj + 1; c++) set.swapChars = set.swapChars + captureChars[c];
+        if (k == 2 && minLength[1] == maxLength[1] && minLength[2] == maxLength[2]) {
+            //  Two captures of fixed lengths: by SwapBack.
+            set.reversed = true;
+            set.swapLength = minLength[2];
+            set.swapDistance = set.swapBefore + minLength[1];
+        } else {
+            set.moved = true;
+            set.moveFirst = static_cast<unsigned>(mi);
+            set.moveCapture = static_cast<unsigned>(mj);
+        }
     }
     const std::vector<UCD::UnicodeSet> & first = texts.front();
     const std::vector<UCD::UnicodeSet> & last = texts.back();
@@ -426,6 +477,17 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
             }
             for (size_t i = 1; i <= k; i++) before = before + captureChars[i];
             endsUnique = !last.back().intersects(before);
+        }
+        //  With Tk empty, the last capture ending with a set S, one character or a
+        //  run of them (possessive: a match ends with the run), S not occurring
+        //  before in a match.
+        if (!endsUnique && last.empty()) {
+            UCD::UnicodeSet finalSet, before;
+            if (finalItem(captures[k - 1]->getCapturedRE(), finalSet, before, sets)) {
+                for (const auto & t : texts) for (const UCD::UnicodeSet & chars : t) before = before + chars;
+                for (size_t i = 1; i < k; i++) before = before + captureChars[i];
+                endsUnique = !finalSet.intersects(before);
+            }
         }
         UCD::UnicodeSet next;
         if (!endsUnique && source->getAfterContext() && firstContextSet(source->getAfterContext(), next, sets)) {
@@ -548,6 +610,9 @@ static std::string captureReplacementKey(const MultipleCaptureMultipleReplacemen
     key += set.startsByFirst ? " first" : (set.singleCharacter ? " single" : " ends");
     if (set.reversed) {
         key += " swap" + std::to_string(set.swapLength) + "/" + std::to_string(set.swapDistance) + "/" + std::to_string(set.swapBefore);
+    }
+    if (set.moved) {
+        key += " move" + std::to_string(set.moveFirst) + "/" + std::to_string(set.moveCapture) + "/" + std::to_string(set.swapBefore);
     }
     return key;
 }
@@ -914,10 +979,10 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
         for (const re::RE * b : befores) uniform &= uniformContext(b, swapChars, sets);
         if (uniform) continue;
         for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-            if (!set.reversed) continue;
+            if (!set.reversed && !set.moved) continue;
             for (const MultipleCaptureMultipleReplacement & r : set.rules) {
                 plan.problems.push_back(printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but it refers to its "
-                                        "captures in reverse order, and a before context of its group may tell their order apart)");
+                                        "captures out of order, and a before context of its group may tell their order apart)");
             }
         }
     }

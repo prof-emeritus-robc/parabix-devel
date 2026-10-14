@@ -115,6 +115,13 @@ static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
     cl::init(8), cl::cat(TconvOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
                               cl::init(false), cl::cat(TconvOptions));
+//  The classes of the bits of multiplexed mapping numbers (see FusedSubgroupPlan)
+//  are computed by kernels of their own, as the cost of compiling a kernel of
+//  classes of scattered characters grows faster than their number (for Hani-Latn,
+//  11 bits: 140s with the other classes, 33s in 3 kernels, 38s in 11).
+static cl::opt<unsigned> MuxClassKernels("mux-class-kernels",
+    cl::desc("The number of kernels computing the classes of multiplexed mapping numbers (0: with the other classes)"),
+    cl::init(3), cl::cat(TconvOptions), cl::Hidden);
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
                            cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report problems found in the transform files"),
@@ -915,6 +922,36 @@ private:
     const size_t mCount;
 };
 
+//  The streams of several stream sets, in the order given (of the pairs of the
+//  index of a stream set and of a stream in it).
+class MergeStreamSets : public pablo::PabloKernel {
+public:
+    MergeStreamSets(LLVMTypeSystemInterface & ts, const std::vector<StreamSet *> & In,
+                    const std::vector<std::pair<unsigned, unsigned>> & order, StreamSet * Out)
+    : PabloKernel(ts, "MergeStreamSets" + [&] {
+                      std::string sig;
+                      for (StreamSet * ss : In) sig += "_" + std::to_string(ss->getNumElements());
+                      sig += "o";
+                      for (const auto & o : order) sig += std::to_string(o.first) + "." + std::to_string(o.second) + ",";
+                      return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
+                  }(),
+                  [&] {
+                      Bindings b;
+                      for (size_t i = 0; i < In.size(); i++) b.emplace_back("In" + std::to_string(i), In[i]);
+                      return b;
+                  }(),
+                  {Binding{"Out", Out}}), mOrder(order) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> out;
+        for (const auto & o : mOrder) out.push_back(getInputStreamSet("In" + std::to_string(o.first))[o.second]);
+        writeOutputStreamSet("Out", out);
+    }
+private:
+    const std::vector<std::pair<unsigned, unsigned>> mOrder;
+};
+
 //  Of two streams of positions: the positions of the first only, of the second
 //  only, and of both.
 class CoincidentPositions : public pablo::PabloKernel {
@@ -1392,6 +1429,9 @@ using Insertions = std::map<unsigned, UCD::UnicodeSet>;
 //  change by the per-bit sets of the characters whose bits change to their
 //  targets; larger ones by their targets, at their positions.
 static constexpr unsigned SmallMappingLimit = 64;
+//  Unless the mappings of a subgroup have more characters than this in all
+//  (with small mappings, see FusedSubgroupPlan): they are then multiplexed.
+static constexpr unsigned MultiplexedMappingsLimit = 2048;
 
 //  The positions of Unicode titlecasing (toTitlecase, Unicode 3.13, R3): for
 //  each word boundary, the first cased character F at or after it is mapped to
@@ -2160,6 +2200,20 @@ static std::string setKey(const UCD::UnicodeSet & set) {
 //  characters whose bits change (bitSets[i][b]), the large ones (more than
 //  SmallMappingLimit characters) by their targets at their positions; and the
 //  characters after which k positions are inserted (byInsertion[k]).
+//
+//  A subgroup whose mappings have more than MultiplexedMappingsLimit characters
+//  in all, some in small mappings, is multiplexed instead: the per-bit sets
+//  would each hold about half of the characters, scattered (as for the
+//  mappings of Han characters to their readings), at each position.  The
+//  mappings are numbered (in the order of their replacements, so that similar
+//  replacements have close numbers), and the number of the mapping of each
+//  character is given by its bits (mux[b], the characters of the mappings with
+//  bit b in their numbers), the only sets of characters; the changes are then
+//  sets of mapping numbers, compiled over these bits: at position 0, the
+//  numbers whose targets have bit c (indexBits[0][c], to compare with the
+//  character), at a position i > 0, those whose targets there differ from the
+//  deletion mark in bit c (indexBits[i][c]); and the numbers of the mappings
+//  after whose characters k positions are inserted (insertIndices[k]).
 struct FusedSubgroupPlan {
     UCD::UnicodeSet all;
     std::vector<std::vector<UCD::UnicodeSet>> bitSets;
@@ -2170,7 +2224,21 @@ struct FusedSubgroupPlan {
     };
     std::vector<Large> large;
     std::map<unsigned, UCD::UnicodeSet> byInsertion;
+    bool multiplexed = false;
+    std::vector<UCD::UnicodeSet> mux;
+    std::vector<std::vector<UCD::UnicodeSet>> indexBits;
+    std::map<unsigned, UCD::UnicodeSet> insertIndices;
     explicit FusedSubgroupPlan(const FusedSubgroup & g) {
+        size_t total = 0;
+        bool small = false;
+        for (const ldml::CharMapping & mp : g.mappings) {
+            total += mp.chars.count();
+            small |= mp.chars.count() <= SmallMappingLimit;
+        }
+        if (small && total > MultiplexedMappingsLimit) {
+            multiplexPlan(g);
+            return;
+        }
         size_t maxLength = 1;
         for (const ldml::CharMapping & mp : g.mappings) {
             all = all + mp.chars;
@@ -2198,6 +2266,38 @@ struct FusedSubgroupPlan {
                     }
                 }
             }
+        }
+    }
+    void multiplexPlan(const FusedSubgroup & g) {
+        multiplexed = true;
+        std::vector<const ldml::CharMapping *> order;
+        for (const ldml::CharMapping & mp : g.mappings) order.push_back(&mp);
+        std::stable_sort(order.begin(), order.end(), [](const ldml::CharMapping * a, const ldml::CharMapping * b) {
+            return a->replacement < b->replacement;
+        });
+        unsigned bits = 1;
+        while ((static_cast<size_t>(1) << bits) < order.size()) bits++;
+        if (bits == 8) bits = 9;    // (the CC compiler of 8 bits is for UTF-8 code units)
+        mux.assign(bits, UCD::UnicodeSet());
+        size_t maxLength = 1;
+        for (const ldml::CharMapping * mp : order) maxLength = std::max(maxLength, mp->replacement.size());
+        indexBits.assign(maxLength, std::vector<UCD::UnicodeSet>(21));
+        for (size_t n = 0; n < order.size(); n++) {
+            const ldml::CharMapping & mp = *order[n];
+            const UCD::codepoint_t index = static_cast<UCD::codepoint_t>(n);
+            all = all + mp.chars;
+            for (unsigned b = 0; b < bits; b++) {
+                if ((n >> b) & 1) mux[b] = mux[b] + mp.chars;
+            }
+            const size_t length = mp.replacement.size();
+            for (size_t i = 0; i < std::max<size_t>(length, 1); i++) {
+                const UCD::codepoint_t target = length == 0 ? DeletionMark : static_cast<UCD::codepoint_t>(mp.replacement[i]);
+                const UCD::codepoint_t bitsOf = i == 0 ? target : (DeletionMark ^ target);
+                for (unsigned c = 0; c < 21; c++) {
+                    if ((bitsOf >> c) & 1) indexBits[i][c].insert(index);
+                }
+            }
+            if (length > 1) insertIndices[static_cast<unsigned>(length - 1)].insert(index);
         }
     }
 };
@@ -2234,6 +2334,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
             addContext(g.before);
             addContext(g.after);
         }
+        for (const UCD::UnicodeSet & set : plan.mux) add(set);
         for (const auto & position : plan.bitSets) {
             for (const UCD::UnicodeSet & set : position) add(set);
         }
@@ -2347,7 +2448,8 @@ private:
     //  Everything that shapes the generated code (hashed for the kernel name).
     static std::string signature(const FusedRulesConfig & c, const FusedLayout & l, StreamSet * Mask, StreamSet * Allowed,
                                  const FusedState & in) {
-        std::string s = "FusedRulesCC" + std::to_string(DeletionMark) + "_" + std::to_string(SmallMappingLimit);
+        std::string s = "FusedRulesCC" + std::to_string(DeletionMark) + "_" + std::to_string(SmallMappingLimit) + "x"
+                        + std::to_string(MultiplexedMappingsLimit);
         s += c.matchOnly ? "M" : "C";
         for (const MatchClass & k : c.startsByLength) {
             s += "n" + std::to_string(k.length);
@@ -2654,6 +2756,28 @@ void FusedRules::generatePabloMethod() {
         for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
             const FusedSubgroupPlan plan(mConfig.subgroups[g]);
             PabloAST * const at = atOf[g];
+            if (plan.multiplexed) {
+                //  The number of the mapping of the character, and the sets of
+                //  numbers compiled over its bits.
+                std::vector<PabloAST *> index;
+                for (const UCD::UnicodeSet & set : plan.mux) index.push_back(classAt(0, set));
+                cc::Parabix_CC_Compiler_Builder indexCompiler(index);
+                auto indexSet = [&](const UCD::UnicodeSet & set) -> PabloAST * {
+                    if (set.empty()) return zeroes;
+                    return indexCompiler.compileCC(re::makeCC(set, &cc::Unicode), pb);
+                };
+                for (size_t i = 0; i < plan.indexBits.size(); i++) {
+                    for (unsigned c = 0; c < 21; c++) {
+                        PabloAST * bit = indexSet(plan.indexBits[i][c]);
+                        if (i == 0) bit = pb.createXor(bit, basis[c]);
+                        if (bit != zeroes) res.changes[i][c] = pb.createOr(res.changes[i][c], pb.createAnd(at, bit));
+                    }
+                }
+                for (const auto & k : plan.insertIndices) {
+                    res.insert[k.first] = pb.createOr(res.insert[k.first], pb.createAnd(at, indexSet(k.second)));
+                }
+                continue;
+            }
             for (size_t i = 0; i < plan.bitSets.size(); i++) {
                 for (unsigned b = 0; b < 21; b++) {
                     const UCD::UnicodeSet & set = plan.bitSets[i][b];
@@ -3943,10 +4067,41 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     auto fusedClasses = [&](const FusedRulesConfig & config) -> StreamSet * {
         const std::vector<UCD::UnicodeSet> sets = fusedClassSets(config);
         if (sets.empty()) return nullptr;
-        std::vector<re::CC *> ccs;
-        for (const UCD::UnicodeSet & set : sets) ccs.push_back(re::makeCC(set, &cc::Unicode));
-        StreamSet * const classes = P.CreateStreamSet(ccs.size());
-        P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+        //  The classes of the multiplexed mapping numbers in kernels of their own
+        //  (see MuxClassKernels), the others in one.
+        std::set<std::string> muxKeys;
+        if (MuxClassKernels > 0) {
+            for (const FusedSubgroup & g : config.subgroups) {
+                const FusedSubgroupPlan plan(g);
+                for (const UCD::UnicodeSet & set : plan.mux) muxKeys.insert(setKey(set));
+            }
+        }
+        std::vector<size_t> rest, mux;
+        for (size_t i = 0; i < sets.size(); i++) (muxKeys.count(setKey(sets[i])) ? mux : rest).push_back(i);
+        auto kernelOf = [&](const std::vector<size_t> & indices) {
+            std::vector<re::CC *> ccs;
+            for (size_t i : indices) ccs.push_back(re::makeCC(sets[i], &cc::Unicode));
+            StreamSet * const classes = P.CreateStreamSet(ccs.size());
+            P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+            return classes;
+        };
+        if (mux.empty()) return kernelOf(rest);
+        std::vector<std::vector<size_t>> parts;
+        if (!rest.empty()) parts.push_back(rest);
+        const size_t n = std::min<size_t>(MuxClassKernels, mux.size());
+        for (size_t k = 0; k < n; k++) {
+            std::vector<size_t> part;
+            for (size_t j = k * mux.size() / n; j < (k + 1) * mux.size() / n; j++) part.push_back(mux[j]);
+            parts.push_back(part);
+        }
+        std::vector<StreamSet *> in;
+        std::vector<std::pair<unsigned, unsigned>> where(sets.size());
+        for (size_t p = 0; p < parts.size(); p++) {
+            in.push_back(kernelOf(parts[p]));
+            for (size_t j = 0; j < parts[p].size(); j++) where[parts[p][j]] = {static_cast<unsigned>(p), static_cast<unsigned>(j)};
+        }
+        StreamSet * const classes = P.CreateStreamSet(sets.size());
+        P.CreateKernelCall<MergeStreamSets>(in, where, classes);
         return classes;
     };
     //  For the selection of the matches by class (LeftmostMatches): the lengths of

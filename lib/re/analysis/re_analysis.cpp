@@ -570,53 +570,61 @@ bool isUTF8EncodedCharacter(const RE * re) {
     return trackUTF8Characters(re, pending, chars) && (pending == 0) && (chars == 1);
 }
 
-# define End_Lookahead 1
-unsigned grepOffset(const RE * re) {
+//  The offset of the match marker after re (0: at the last code unit of the
+//  match; 1: at the next character), given the offset of the marker before
+//  it, following RE_Block_Compiler: a sequence folds the marker through its
+//  items, an alternation aligns its branches to the furthest (AlignMarkers),
+//  and zero-width assertions leave the marker where it is, other than a
+//  lookahead of one character, which is compiled in place and leaves the
+//  marker on the following position (for a negative lookahead, possibly past
+//  the end of the data).  Longer lookaheads are named externals (LookAheadNamer,
+//  using the same measure), which leave the marker in place.
+static unsigned offsetFrom(const RE * re, unsigned in, bool indexedUTF8) {
     if (const Alt * alt = dyn_cast<Alt>(re)) {
+        if (alt->empty()) return 0;     // (matching nothing: the marker is cleared)
         unsigned altOffset = 0;
-        for (const RE * re : *alt) {
-            altOffset = std::max(altOffset, grepOffset(re));
+        for (const RE * a : *alt) {
+            altOffset = std::max(altOffset, offsetFrom(a, in, indexedUTF8));
         }
         return altOffset;
     } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        if (seq->empty()) return 1;
-        for (auto i = seq->rbegin(); i != seq->rend(); ++i) {
-            unsigned o = grepOffset(*i);
-            // An assertion may be named (e.g. a lookahead externalized by
-            // LookAheadNamer): it is zero-width all the same.
-            const RE * e = *i;
-            while (const Name * n = dyn_cast<Name>(e)) {
-                if (n->getDefinition() == nullptr) break;
-                e = n->getDefinition();
-            }
-            if (!isa<Assertion>(e) && !isa<End>(e)) return o;
-            if (o == 1) return o;
+        unsigned offset = in;
+        for (const RE * e : *seq) {
+            offset = offsetFrom(e, offset, indexedUTF8);
         }
-        return 1;
+        return offset;
     } else if (const Rep * rep = dyn_cast<Rep>(re)) {
         if (rep->getUB() == Rep::UNBOUNDED_REP) return 1;
-        return grepOffset(rep->getRE());
+        if (rep->getUB() == 0) return in;
+        const unsigned body = offsetFrom(rep->getRE(), in, indexedUTF8);
+        return rep->getLB() == 0 ? std::max(in, body) : body;
     } else if (isa<Start>(re)) {
         return 1;
     } else if (isa<End>(re)) {
-        return 1 - End_Lookahead;
+        //  End is compiled with a lookahead, leaving the marker in place.
+        return in;
     } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
+        const RE * asserted = a->getAsserted();
         if (a->getKind() == Assertion::Kind::LookBehind) {
-            return grepOffset(a->getAsserted());
+            //  The lookbehind is compiled from everywhere (at the next code unit).
+            return std::max(in, offsetFrom(asserted, 1, indexedUTF8));
         }
-        // A single character lookahead is compiled in place, leaving the
-        // marker on the following position (which, for a negative lookahead,
-        // may be past the end of the data).  Longer lookaheads are named
-        // externals (LookAheadNamer, using the same measure) and zero-width
-        // ones leave the marker where it was.
-        if (getLengthRange(a->getAsserted(), &cc::Unicode).second == 1) {
-            return 1;
-        }
-        return 0;
+        if (isa<End>(asserted)) return in;
+        //  With UTF-8 indexing, a lookahead of one UTF-8 encoded character is
+        //  also compiled in place (and not named by LookAheadNamer).
+        if (indexedUTF8 && isUTF8EncodedCharacter(asserted)) return 1;
+        const auto range = getLengthRange(asserted, &cc::Unicode);
+        if (range.second == 0) return std::max(in, offsetFrom(asserted, 1, indexedUTF8));
+        if (range.second == 1) return 1;
+        return in;
     } else if (const Diff * diff = dyn_cast<Diff>(re)) {
-        return grepOffset(diff->getLH());
+        //  The difference of an empty sequence and a zero-width assertion (e.g. not
+        //  a grapheme boundary) is compiled at the next character.
+        if (isEmptySeq(diff->getLH())) return 1;
+        return offsetFrom(diff->getLH(), in, indexedUTF8);
     } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
-        return std::min(grepOffset(e->getLH()), grepOffset(e->getRH()));
+        if (isEmptySeq(e->getLH()) || isEmptySeq(e->getRH())) return 1;
+        return std::min(offsetFrom(e->getLH(), in, indexedUTF8), offsetFrom(e->getRH(), in, indexedUTF8));
     } else if (isa<Any>(re)) {
         return 0;
     } else if (isa<CC>(re)) {
@@ -627,15 +635,21 @@ unsigned grepOffset(const RE * re) {
         }
         return 0;
     } else if (const Group * g = dyn_cast<Group>(re)) {
-        return grepOffset(g->getRE());
+        return offsetFrom(g->getRE(), in, indexedUTF8);
     } else if (const Name * n = dyn_cast<Name>(re)) {
-        return grepOffset(n->getDefinition());
+        return n->getDefinition() ? offsetFrom(n->getDefinition(), in, indexedUTF8) : 0;
     } else if (const Capture * c = dyn_cast<Capture>(re)) {
-        return grepOffset(c->getCapturedRE());
+        return offsetFrom(c->getCapturedRE(), in, indexedUTF8);
     } else if (isa<Range, Reference, Permute, Interleavable>(re)) {
         return 0;
     }
     UnexpectedRE("grepOffset", re);
+}
+
+//  The offset of the final match marker: the compiler begins with the marker
+//  at the next character of every position.
+unsigned grepOffset(const RE * re, bool indexedUTF8) {
+    return offsetFrom(re, 1, indexedUTF8);
 }
 
 CC * resolveCharClass(RE * r) {

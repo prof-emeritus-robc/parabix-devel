@@ -93,7 +93,7 @@ void RE_CompilerContext::setCombiningStream(kernel::StreamSet * s, RE_CombiningT
 
 
 RE_Kernel::RE_Kernel(LLVMTypeSystemInterface & ts, RE_CompilerContext & ctxt, RE * re, StreamSet * results)
-: PabloKernel(ts, makeSignature(ctxt, re), makeInputBindings(ctxt, re), makeOutputBindings(re, results), {}, {}),
+: PabloKernel(ts, makeSignature(ctxt, re), makeInputBindings(ctxt, re), makeOutputBindings(ctxt, re, results), {}, {}),
 mContext(ctxt), mRE(re) {
     addAttribute(InfrequentlyUsed());
 }
@@ -209,8 +209,8 @@ Bindings RE_Kernel::makeInputBindings(RE_CompilerContext & ctxt, RE * re) {
     return externalBindings;
 }
 
-Bindings RE_Kernel::makeOutputBindings(RE * re, StreamSet * results) {
-    if (grepOffset(re) == 0) {
+Bindings RE_Kernel::makeOutputBindings(RE_CompilerContext & ctxt, RE * re, StreamSet * results) {
+    if (grepOffset(re, ctxt.mIndexStream != nullptr) == 0) {
         return {Binding{"matches", results}};
     }
     return {Binding{"matches", results, FixedRate(), Add1()}};    
@@ -988,7 +988,8 @@ bool PreparedRE::endAnchored() const {
 }
 
 unsigned PreparedRE::grepOffset() const {
-    return re::grepOffset(re);
+    // The UTF-8 indexed mode: Unicode length alphabet over UTF-8 code units.
+    return re::grepOffset(re, (mode.lengthAlphabet == &cc::Unicode) && (mode.indexAlphabet == &cc::UTF8));
 }
 
 void matchingRecords(PipelineBuilder & P, RE * re, StreamSet * basis, StreamSet * u8index,
@@ -1292,7 +1293,7 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
     Assertion * const la = dyn_cast<Assertion>(defn);
     const bool lookahead = la && (la->getKind() == Assertion::Kind::LookAhead) &&
                            (getLengthRange(la->getAsserted(), mCtxt.mLengthAlphabet).second > 0);
-    unsigned offset = grepOffset(defn);
+    unsigned offset = grepOffset(defn, mCtxt.mIndexStream != nullptr);
     if (!lookahead) {
         // Not a lookahead; compile using a single kernel call.
         StreamSet * extStrm = mPB.CreateStreamSet(1);
@@ -1549,7 +1550,7 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
         StreamSet * matchEnd = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, matchEnd);
         auto minlgth = getLengthRange(re, mCtxt.mLengthAlphabet).first;
-        auto offset = grepOffset(re);
+        auto offset = grepOffset(re, mCtxt.mIndexStream != nullptr);
         mPB.CreateKernelCall<FixedMatchSpansKernel>(minlgth, offset, matchEnd, spans);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             auto spanName = "minlen" + std::to_string(minlgth + offset);
@@ -1600,7 +1601,7 @@ bool RE_PipelineBuilder::uniquePrefixSpans(RE * re, StreamSet * spans) {
         mPB.captureBitstream("pfxStrm", pfxStrm);
         mPB.captureBitstream("endBack", endBack);
     }
-    mPB.CreateKernelCall<LongestSpan>(pfxLgth + pfxOffset - 1, grepOffset(split), pfxStrm, endBack, matchEnd, spans);
+    mPB.CreateKernelCall<LongestSpan>(pfxLgth + pfxOffset - 1, grepOffset(split, mCtxt.mIndexStream != nullptr), pfxStrm, endBack, matchEnd, spans);
     return true;
 }
 
@@ -1774,7 +1775,7 @@ bool RE_PipelineBuilder::lengthClassSpans(RE * re, StreamSet * spans) {
         StreamSet * const matchEnd = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, c.second, matchEnd);
         StreamSet * const span = (classes.size() == 1) ? spans : mPB.CreateStreamSet(1);
-        mPB.CreateKernelCall<FixedMatchSpansKernel>(c.first, grepOffset(c.second), matchEnd, span);
+        mPB.CreateKernelCall<FixedMatchSpansKernel>(c.first, grepOffset(c.second, mCtxt.mIndexStream != nullptr), matchEnd, span);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             mPB.captureBitstream("lengthClass" + std::to_string(c.first), span);
         }

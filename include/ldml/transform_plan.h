@@ -163,15 +163,24 @@ struct MultipleCaptureMultipleReplacementSet {
 };
 
 // A conversion rule inserting a text where its contexts meet: A { } C → S, with
-// an empty text to replace (W4).  For now, only in a group of such rules, with
-// a before context of one character (of a set, not the text boundary) and an
-// after context beginning with one: the converted text that the before context
-// sees is then the text itself (each insertion is before a character that
-// stays in place), and the insertion is before a character, which ICU reaches.
-// At each position, the first rule matching applies; the text inserted may not
-// let a rule match there again (ICU would insert repeatedly).
+// an empty text to replace (W4).  Its before context ends with a character (of a
+// set, not the text boundary) and its after context begins with one: the
+// insertion is before a character, which ICU reaches, and after one.  At each
+// position, the first rule matching applies; the text inserted may not let a
+// rule match there again (ICU would insert repeatedly).
+//   - In a group of such rules alone, with before contexts of one character, the
+//     converted text that the before contexts see is the text itself (each
+//     insertion is before a character that stays in place).
+//   - Otherwise (W4 step 2), the before contexts are matched against the
+//     converted text, and the rules of the group applying after an insertion see
+//     the text inserted.  No rule of the group before the insertion rule may then
+//     apply at the position (its text beginning with a character with which the
+//     after context may begin), and the group has no string rules (whose texts
+//     could cover the position).
 struct InsertionRule {
-    UCD::UnicodeSet before;         // the character before the insertion
+    UCD::UnicodeSet before;         // the last character of the before context
+    bool singleBefore = false;      // the before context is that character alone
+    re::RE * engineBefore = nullptr;// the before context, as a lookbehind body (see engineContext)
     re::RE * after = nullptr;       // the after context
     UCD::UnicodeSet afterFirst;     // the first character of the after context
     re::RE * engineAfter = nullptr; // as a lookahead body (see engineContext), without captures

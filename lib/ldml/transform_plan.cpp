@@ -550,6 +550,22 @@ static const re::RE * singleContextItem(const re::RE * context) {
     }
 }
 
+//  The last item of a context (through sequences and variables not defined as
+//  sets), or nullptr.
+static const re::RE * lastContextItem(const re::RE * context) {
+    while (true) {
+        if (const re::Seq * seq = dyn_cast_or_null<re::Seq>(context)) {
+            if (seq->empty()) return nullptr;
+            context = seq->back();
+        } else if (const re::Name * n = dyn_cast_or_null<re::Name>(context);
+                   n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+            context = n->getDefinition();
+        } else {
+            return context;
+        }
+    }
+}
+
 //  The first item of a context (as for firstContextSet), or nullptr.
 static const re::RE * firstContextItem(const re::RE * context) {
     while (true) {
@@ -587,12 +603,15 @@ static bool insertionRule(const ConversionRule * c, InsertionRule & ins, CharSet
         reason = "the text inserted is not a fixed string";
         return false;
     }
-    const re::RE * const before = singleContextItem(source->getBeforeContext());
-    if (before == nullptr || !plainSet(before)) {
-        reason = "its before context is not one character of a set";
+    re::RE * const before = source->getBeforeContext();
+    const re::RE * const last = lastContextItem(before);
+    if (last == nullptr || !plainSet(last)) {
+        reason = "its before context does not end with a character of a set";
         return false;
     }
-    ins.before = sets.setOf(before, false);
+    ins.before = sets.setOf(last, false);
+    ins.singleBefore = singleContextItem(before) == last;
+    ins.engineBefore = engineContext(before, false);
     re::RE * const after = source->getAfterContext();
     const re::RE * const first = firstContextItem(after);
     if (first == nullptr || !plainSet(first)) {
@@ -677,6 +696,25 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
                     step.kind = TransformStep::Kind::Conversion;
                     plan.steps.push_back(std::move(step));
                     group = &plan.steps.back();
+                }
+                //  No rule of the group before it may apply at the position (the
+                //  rules so far: its single-character rules, string rules, and the
+                //  first characters of its MultipleCaptureMultipleReplacement rules).
+                UCD::UnicodeSet earlier;
+                for (const CharMapSubgroup & g : group->subgroups) earlier = earlier + g.characters();
+                for (const StringRule & sr : group->stringRules) earlier = earlier + sr.text.front();
+                bool unknown = false;
+                for (const MultipleCaptureMultipleReplacementSet & set : group->captureReplacements) {
+                    for (const MultipleCaptureMultipleReplacement & m : set.rules) {
+                        if (!m.first.empty()) earlier = earlier + m.first.front();
+                        else if (set.startsByFirst) earlier = earlier + set.startChars;
+                        else unknown = true;
+                    }
+                }
+                if (unknown || earlier.intersects(ins.afterFirst)) {
+                    plan.problems.push_back(printRule(r) + "  (an insertion rule, but a rule before it in its group may "
+                                            "apply where it inserts)");
+                    continue;
                 }
                 group->insertions.push_back(std::move(ins));
                 continue;
@@ -797,16 +835,16 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
     //  The MultipleCaptureMultipleReplacement rules: they may not overlap the
     //  string rules of their group (neither matching within the other), and the
     //  single-character rules apply outside their matches.
-    //  The insertion rules: only in groups of such rules, and the text inserted
-    //  may not let an insertion rule match again at the position (its last
-    //  character, then before the position, in the set of the before context of
-    //  a rule whose after context may also match there).
+    //  The insertion rules (see InsertionRule): not in a group with string rules,
+    //  and the text inserted may not let an insertion rule match again at the
+    //  position (its last character, then before the position, in the set of the
+    //  before context of a rule whose after context may also match there).
     for (TransformStep & step : plan.steps) {
         if (step.insertions.empty()) continue;
-        const bool others = !step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty();
+        const bool strings = !step.stringRules.empty() || !step.captureReplacements.empty();
         for (const InsertionRule & ins : step.insertions) {
-            if (others) {
-                plan.problems.push_back(printRule(ins.rule) + "  (an insertion rule, but in a group with other rules)");
+            if (strings) {
+                plan.problems.push_back(printRule(ins.rule) + "  (an insertion rule, but in a group with string rules)");
                 continue;
             }
             for (const InsertionRule & other : step.insertions) {

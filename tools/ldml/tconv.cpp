@@ -556,6 +556,7 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
 }
 
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
+static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
@@ -599,7 +600,10 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
                 }
             }
         }
-        for (const ldml::TransformStep & step : a.plan.steps) captureContextProblems(step, a.plan.problems);
+        for (const ldml::TransformStep & step : a.plan.steps) {
+            captureContextProblems(step, a.plan.problems);
+            insertionContextProblems(step, a.plan.problems);
+        }
         a.problems = a.plan.problems;
         //  The bit changes of the subgroups of a group are combined, assuming that
         //  no two rules of a group may apply at the same position.
@@ -1803,6 +1807,46 @@ static bool hasConvertedSubgroup(const ldml::TransformStep & step, const std::ve
 //  conversions of their group may make match differently in the converted text
 //  (or of which this is not known): their contexts are matched against the
 //  text itself, by the regular expression engine.
+//  Whether a group has only insertion rules, with before contexts of one
+//  character (applied by insertionGroup; otherwise, the insertion rules are
+//  applied by the correction kernel of the group).
+static bool insertionsOnly(const ldml::TransformStep & step) {
+    if (step.insertions.empty() || !step.subgroups.empty()) return false;
+    for (const ldml::InsertionRule & ins : step.insertions) {
+        if (!ins.singleBefore) return false;
+    }
+    return true;
+}
+
+//  The insertion rules of a group applied by its correction kernel (see
+//  insertionsOnly): their before contexts must be fixed sequences of sets, and
+//  the before contexts of the single-character rules, which may see the texts
+//  inserted, must be matched against the converted text.
+static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
+    if (step.insertions.empty() || insertionsOnly(step)) return;
+    for (const ldml::InsertionRule & ins : step.insertions) {
+        FusedContexts before;
+        if (ConvertedContextRounds == 0) {
+            problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but before contexts are not matched "
+                               "against the converted text: --converted-context-rounds=0)");
+        } else if (!fusedContexts(ins.engineBefore, true, before)) {
+            problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but its before context is not a fixed "
+                               "sequence of sets)");
+        }
+    }
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        if (s.engineBefore == nullptr) continue;
+        FusedContexts before, after;
+        if (!fusedContexts(s.engineBefore, true, before, true) || !fusedContexts(s.engineAfter, false, after)) {
+            for (const ldml::InsertionRule & ins : step.insertions) {
+                problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but rules of its group, with contexts ["
+                                   + s.contextKey + "], cannot be matched against the converted text)");
+            }
+            return;
+        }
+    }
+}
+
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
     if (step.captureReplacements.empty()) return;
     const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
@@ -1949,6 +1993,21 @@ struct FusedSubgroup {
     bool converted = false;     // as for FusedStringRule
 };
 
+//  An insertion rule (see ldml::InsertionRule) in a correction kernel, at the
+//  positions of the characters after which it inserts: its before context (of
+//  fixed items) is matched against the converted text up to and including the
+//  character (without the text this rule inserts there), and its after context
+//  (if match < 0) against the text from the next position; or the positions
+//  where the after context matches are given (match).  It applies only where
+//  eligible (the source given; within a filter), and where no insertion rule
+//  before it applies.
+struct FusedInsertion {
+    FusedContexts before{FusedContext()}, after{FusedContext()};
+    int match = -1;
+    int eligible = -1;
+    std::u32string text;
+};
+
 //  A class of string rules for their sequential selection (see LeftmostMatches):
 //  those with texts of a length, and the same run (if any).
 struct MatchClass {
@@ -1994,6 +2053,9 @@ struct FusedRulesConfig {
     };
     std::vector<Selection> selection;
     bool groupCoverage = false;
+    //  In a correction kernel: the insertion rules of the group (see
+    //  FusedInsertion), in order.
+    std::vector<FusedInsertion> insertions;
     //  A round of a correction kernel for a whole group whose string matches are
     //  selected sequentially (see TransformStep::sequentialSelection), as a kernel
     //  of its own: the converted text of the previous round is given (as the
@@ -2049,6 +2111,23 @@ struct FusedLayout {
         if (!c.matchOnly || c.staged) {
             changePositions = std::max<unsigned>(changePositions, in.changes.size());
             for (const auto & k : in.insertions) insertCounts.insert(k.first);
+        }
+        //  An insertion of m characters after a position whose converted text has
+        //  k + 1 characters (k inserted after it) or none (deleted, the first
+        //  replacing the deletion mark).
+        if (!c.insertions.empty()) {
+            std::set<unsigned> base = insertCounts;
+            base.insert(0);
+            const unsigned maxBase = *base.rbegin();
+            for (const FusedInsertion & ins : c.insertions) {
+                if (ins.match < 0) {
+                    for (const FusedContext & a : ins.after) lookahead = std::max<unsigned>(lookahead, a.size());
+                }
+                const unsigned m = ins.text.size();
+                for (unsigned k : base) insertCounts.insert(k + m);
+                if (m > 1) insertCounts.insert(m - 1);
+                changePositions = std::max<unsigned>(changePositions, maxBase + m + 1);
+            }
         }
         for (const FusedMatchSource & s : c.sources) {
             if (std::find(sourceSets.begin(), sourceSets.end(), s.streamSet) == sourceSets.end()) sourceSets.push_back(s.streamSet);
@@ -2143,6 +2222,10 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         addContext(r.after);
     }
     if (c.matchOnly) return sets;
+    for (const FusedInsertion & ins : c.insertions) {
+        addContext(ins.before);
+        if (ins.match < 0) addContext(ins.after);
+    }
     for (const FusedSubgroup & g : c.subgroups) {
         const FusedSubgroupPlan plan(g);
         if (g.match < 0) {
@@ -2315,6 +2398,14 @@ private:
             }
             if (r.converted) s += "c";
         }
+        for (const FusedInsertion & ins : c.insertions) {
+            s += "|i";
+            appendContext(s, ins.before);
+            if (ins.match >= 0) s += source(ins.match); else appendContext(s, ins.after);
+            if (ins.eligible >= 0) s += "e" + source(ins.eligible);
+            s += ">";
+            for (char32_t ch : ins.text) s += std::to_string(ch) + ",";
+        }
         for (const FusedSubgroup & g : c.subgroups) {
             s += "|g";
             if (g.match >= 0) {
@@ -2451,6 +2542,16 @@ void FusedRules::generatePabloMethod() {
         ats.push_back(at);
     }
 
+    //  The insertion rules: where their after contexts match (from the next
+    //  position) and they are eligible, and where they apply (given by the rounds
+    //  below).
+    std::vector<PabloAST *> insAfter, insAt(mConfig.insertions.size(), zeroes);
+    for (const FusedInsertion & ins : mConfig.insertions) {
+        PabloAST * a = ins.match >= 0 ? source(ins.match) : contexts(FusedContexts{FusedContext()}, ins.after, 1);
+        if (ins.eligible >= 0) a = pb.createAnd(a, source(ins.eligible));
+        insAfter.push_back(pb.createAnd(a, inText));
+    }
+
     //  The results of the rules: the changes at each position i of the
     //  replacements, the insertions, and the coverage, added to the state given.
     struct Results {
@@ -2568,6 +2669,56 @@ void FusedRules::generatePabloMethod() {
         }
     };
 
+    //  The deletion mark in slot 0 of the converted text of the positions (the
+    //  character there, changed as given).
+    auto markAt = [&](const std::vector<PabloAST *> & changes0) {
+        PabloAST * m = inText;
+        for (unsigned b = 0; b < 21; b++) {
+            PabloAST * const bit = pb.createXor(basis[b], changes0[b]);
+            m = pb.createAnd(m, ((DeletionMark >> b) & 1) ? bit : pb.createNot(bit));
+        }
+        return m;
+    };
+    //  The texts of the insertion rules applying at the positions given, added
+    //  after the converted text of the positions in res: after its k + 1
+    //  characters (k inserted after the character), or, where the character is
+    //  deleted, from slot 0 (replacing the deletion mark).
+    auto addInsertions = [&](Results & res, const std::vector<PabloAST *> & at) {
+        if (mConfig.insertions.empty()) return;
+        PabloAST * anyInsert = zeroes;
+        for (const auto & k : res.insert) anyInsert = pb.createOr(anyInsert, k.second);
+        PabloAST * const deleted = pb.createAnd(pb.createNot(anyInsert), markAt(res.changes[0]));
+        const std::map<unsigned, PabloAST *> baseInsert = res.insert;
+        std::map<unsigned, PabloAST *> withCount = baseInsert;    // the positions with k inserted after them
+        withCount[0] = pb.createAnd(pb.createNot(anyInsert), pb.createNot(deleted));
+        auto insertAt = [&](unsigned k) -> PabloAST *& {
+            PabloAST *& v = res.insert[k];
+            if (v == nullptr) v = zeroes;
+            return v;
+        };
+        auto writeMark = [&](unsigned i, PabloAST * where, UCD::codepoint_t target) {
+            const UCD::codepoint_t diff = DeletionMark ^ target;
+            for (unsigned b = 0; b < 21; b++) {
+                if ((diff >> b) & 1) res.changes[i][b] = pb.createXor(res.changes[i][b], where);
+            }
+        };
+        for (size_t i = 0; i < mConfig.insertions.size(); i++) {
+            const std::u32string & text = mConfig.insertions[i].text;
+            const unsigned m = text.size();
+            PabloAST * const d = pb.createAnd(at[i], deleted);
+            for (unsigned j = 0; j < m; j++) writeMark(j, d, static_cast<UCD::codepoint_t>(text[j]));
+            if (m > 1) insertAt(m - 1) = pb.createOr(insertAt(m - 1), d);
+            for (const auto & k : withCount) {
+                //  (The counts beyond those of the rules are only those of insertions.)
+                if (k.first + m >= res.changes.size()) continue;
+                PabloAST * const a = pb.createAnd(at[i], k.second);
+                for (unsigned j = 0; j < m; j++) writeMark(k.first + 1 + j, a, static_cast<UCD::codepoint_t>(text[j]));
+                if (k.first > 0) insertAt(k.first) = pb.createAnd(insertAt(k.first), pb.createNot(a));
+                insertAt(k.first + m) = pb.createOr(insertAt(k.first + m), a);
+            }
+        }
+    };
+
     std::vector<PabloAST *> firstOf = starts, atOf = ats;
     //  In a correction kernel for a whole group, given the matches of the string
     //  rules and the positions where the rules of the subgroups match: the matches
@@ -2642,7 +2793,7 @@ void FusedRules::generatePabloMethod() {
         const UCD::UnicodeSet replaced = mConfig.replacementChars - UCD::UnicodeSet(DeletionMark);
         //  The before contexts of the rules matched against the converted text
         //  given by results (with no results, the text itself).
-        auto matchConverted = [&](const Results & res) {
+        auto matchConverted = [&](const Results & res, const Results & base) {
             //  The converted text at each position: its length (0 if deleted, or
             //  1 + the positions inserted after it) and its characters (slot 0, the
             //  character itself, and the slots inserted after it).
@@ -2819,12 +2970,53 @@ void FusedRules::generatePabloMethod() {
             for (size_t g = 0; g < mConfig.subgroups.size(); g++) {
                 atOf[g] = mConfig.subgroups[g].converted ? pb.createAnd(ats[g], convertedBefore(mConfig.subgroups[g].before)) : ats[g];
             }
+            //  The insertion rules: their before contexts matched against the converted
+            //  text up to and including each position, as in res but without the text
+            //  inserted at the position itself (as in base, where the rules other than
+            //  the insertions apply): its characters (those of base), then the
+            //  converted text before it (as in res).
+            if (!mConfig.insertions.empty()) {
+                PabloAST * baseAnyInsert = zeroes;
+                for (const auto & k : base.insert) baseAnyInsert = pb.createOr(baseAnyInsert, k.second);
+                const std::vector<PabloAST *> baseChanges0 = base.changes.empty() ? std::vector<PabloAST *>(21, zeroes) : base.changes[0];
+                PabloAST * const baseDeleted = pb.createAnd(pb.createNot(baseAnyInsert), markAt(baseChanges0));
+                std::map<unsigned, PabloAST *> baseLength;      // l: the position has l characters
+                baseLength[1] = pb.createAnd(inText, pb.createNot(pb.createOr(baseAnyInsert, baseDeleted)));
+                for (const auto & k : base.insert) baseLength[k.first + 1] = k.second;
+                auto ownExcluded = [&](const FusedItem & item, unsigned j) -> PabloAST * {
+                    lastIn(item, j);
+                    const std::vector<PabloAST *> & V = memo[{setKey(item.chars), item.boundary}];
+                    auto previous = [&](PabloAST * v) {
+                        PabloAST * p = pb.createAdvance(v, 1);
+                        return item.boundary ? pb.createOr(p, firstPosition) : p;
+                    };
+                    PabloAST * x = pb.createAnd(baseDeleted, previous(V[j - 1]));
+                    for (const auto & l : baseLength) {
+                        PabloAST * const v = l.first >= j ? memberOf(l.first - j, item.chars) : previous(V[j - l.first - 1]);
+                        x = pb.createOr(x, pb.createAnd(l.second, v));
+                    }
+                    return x;
+                };
+                PabloAST * applied = zeroes;
+                for (size_t i = 0; i < mConfig.insertions.size(); i++) {
+                    PabloAST * match = zeroes;
+                    for (const FusedContext & alt : mConfig.insertions[i].before) {
+                        PabloAST * m = ones;
+                        const unsigned B = alt.size();
+                        for (unsigned k = 0; k < B; k++) m = pb.createAnd(m, ownExcluded(alt[k], B - k));
+                        match = pb.createOr(match, m);
+                    }
+                    insAt[i] = pb.createAnd(pb.createAnd(insAfter[i], match), pb.createNot(applied));
+                    applied = pb.createOr(applied, insAt[i]);
+                }
+            }
         };
         Results none;
         none.changes.assign(mLayout.changePositions, std::vector<PabloAST *>(21, zeroes));
         if (mConfig.staged) {
             //  One round, against the converted text of the previous round.
-            matchConverted(stateIn());
+            const Results in = stateIn();
+            matchConverted(in, in);
             settle();
             if (mConfig.matchOnly) {
                 Var * const firsts = getOutputStreamVar("Firsts");
@@ -2847,22 +3039,25 @@ void FusedRules::generatePabloMethod() {
             return;
         }
         //  Round 0: the before contexts matched against the text itself.
-        matchConverted(none);
+        matchConverted(none, none);
         settle();
-        //  Each further round: the converted text from the results so far, and the
-        //  before contexts matched against it.  (A rule whose before context sees
-        //  the result of another such rule is right after as many rounds as such
-        //  rules precede it in a chain.)
+        //  Each further round: the converted text from the results so far (with the
+        //  texts inserted), and the before contexts matched against it.  (A rule
+        //  whose before context sees the result of another such rule is right after
+        //  as many rounds as such rules precede it in a chain.)
         for (unsigned round = 1; round <= mConfig.rounds; round++) {
-            Results res = stateIn();
-            addResults(res, firstOf, atOf);
-            matchConverted(res);
+            Results base = stateIn();
+            addResults(base, firstOf, atOf);
+            Results res = base;
+            addInsertions(res, insAt);
+            matchConverted(res, base);
             settle();
         }
     }
 
     Results res = stateIn();
     addResults(res, firstOf, atOf);
+    addInsertions(res, insAt);
     for (unsigned i = 0; i < mLayout.changePositions; i++) writeOutputStreamSet("Changes" + std::to_string(i), res.changes[i]);
     for (unsigned k : mLayout.insertCounts) writeOutputStreamSet("Insert" + std::to_string(k), std::vector<PabloAST *>{res.insert[k]});
     if (mConfig.coverage) {
@@ -2954,6 +3149,7 @@ private:
     StreamSet * maskedNormalization(const std::string & name, StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * hexJava(StreamSet * U21);
     StreamSet * hexUnicode(StreamSet * U21);
@@ -3493,6 +3689,16 @@ static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
 //  the subgroups, which also match the rules whose contexts are fixed sequences
 //  of sets; the matches of the other rules are given to them by the regular
 //  expression engine.
+//  The positions after which the insertion rules of a group may insert, within
+//  filters (see insertionGroup), or nullptr (everywhere).
+StreamSet * RulePipelineBuilder::insertionsEligible() {
+    const size_t restricting = mMasks.size() - (mInsertAnywhere && !mMasks.empty() ? 1 : 0);
+    if (restricting == 0) return nullptr;
+    StreamSet * const eligible = mP.CreateStreamSet(1);
+    mP.CreateKernelCall<ShiftBack>(mMasks[restricting - 1], eligible, 1);
+    return eligible;
+}
+
 //  A group of insertion rules (see ldml::InsertionRule).  Each rule applies at
 //  the positions of the characters after which it inserts its text (its before
 //  character, followed by its after context), where no earlier rule applies,
@@ -3508,12 +3714,7 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
     //  group alone, with its own filter (or one given where it is invoked), checks
     //  the filter only for the characters it replaces, of which an insertion has
     //  none: it inserts anywhere (within the runs of an enclosing filter).
-    StreamSet * eligible = nullptr;     // (nullptr: everywhere)
-    const size_t restricting = mMasks.size() - (mInsertAnywhere && !mMasks.empty() ? 1 : 0);
-    if (restricting > 0) {
-        eligible = P.CreateStreamSet(1);
-        P.CreateKernelCall<ShiftBack>(mMasks[restricting - 1], eligible, 1);
-    }
+    StreamSet * eligible = insertionsEligible();
     std::vector<StreamSet *> positions;
     std::vector<unsigned> counts;
     std::vector<std::u32string> texts;
@@ -3566,7 +3767,7 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
 }
 
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
-    if (!step.insertions.empty()) return insertionGroup(step, U21);
+    if (insertionsOnly(step)) return insertionGroup(step, U21);
     //  Within a mask, a context-free, single-character mapping is applied
     //  only to the masked characters (localCharacterMapping): map runs this
     //  same function again, but on the (unmasked) shortened text, where the
@@ -4243,9 +4444,12 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 FusedSubgroup fg;
                 fg.mappings = maps[g];
                 {
+                    //  (With insertion rules, a before context may also see the texts
+                    //  inserted.)
                     FusedContexts starBefore, after;
-                    if (correct && fusedContexts(subgroup.engineAfter, false, after) && fusedContexts(subgroup.engineBefore, true, starBefore, true)
-                            && convertedContextMatters(starBefore, outcomes)) {
+                    if (correct && subgroup.engineBefore && fusedContexts(subgroup.engineAfter, false, after)
+                            && fusedContexts(subgroup.engineBefore, true, starBefore, true)
+                            && (!step.insertions.empty() || convertedContextMatters(starBefore, outcomes))) {
                         fg.before = starBefore;
                         fg.after = after;
                         fg.converted = true;
@@ -4277,7 +4481,31 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 correction.strings.push_back(std::move(fr));
             }
         }
-        if (!correction.strings.empty() || !correction.subgroups.empty()) {
+        //  ... with the insertion rules (see FusedInsertion).
+        if (!step.insertions.empty()) {
+            StreamSet * const eligible = insertionsEligible();
+            int eligibleSource = -1;
+            if (eligible) {
+                eligibleSource = static_cast<int>(correction.sources.size());
+                correction.sources.push_back(FusedMatchSource{eligible, 0});
+            }
+            for (const ldml::InsertionRule & ins : step.insertions) {
+                FusedInsertion fi;
+                fusedContexts(ins.engineBefore, true, fi.before);
+                if (!fusedContexts(ins.engineAfter, false, fi.after)) {
+                    //  The positions before those where the after context matches.
+                    fi.after = {FusedContext()};
+                    fi.match = static_cast<int>(correction.sources.size());
+                    correction.sources.push_back(FusedMatchSource{matchPositions(nullptr, ins.engineAfter,
+                                                                                 {UCD::UnicodeSet(0, 0x10FFFF)}, U21), 0});
+                }
+                fi.eligible = eligibleSource;
+                fi.text = ins.replacement;
+                for (char32_t ch : ins.replacement) correction.replacementChars.insert(ch);
+                correction.insertions.push_back(std::move(fi));
+            }
+        }
+        if (!correction.strings.empty() || !correction.subgroups.empty() || !correction.insertions.empty()) {
             correction.rounds = ConvertedContextRounds;
             for (const ConversionOutcome & o : outcomes) {
                 correction.replacementChars = correction.replacementChars + o.resultChars();

@@ -550,20 +550,31 @@ static const re::RE * singleContextItem(const re::RE * context) {
     }
 }
 
-//  The last item of a context (through sequences and variables not defined as
-//  sets), or nullptr.
-static const re::RE * lastContextItem(const re::RE * context) {
-    while (true) {
-        if (const re::Seq * seq = dyn_cast_or_null<re::Seq>(context)) {
-            if (seq->empty()) return nullptr;
-            context = seq->back();
-        } else if (const re::Name * n = dyn_cast_or_null<re::Name>(context);
-                   n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
-            context = n->getDefinition();
-        } else {
-            return context;
-        }
+//  The characters with which a context may end (adding them to last): its last
+//  item, a set, or a repetition of a set (with the characters before it, if it
+//  may be empty).  False if not known.
+static bool lastContextChars(const re::RE * context, UCD::UnicodeSet & last, CharSetAnalysis & sets) {
+    if (const re::Name * n = dyn_cast_or_null<re::Name>(context);
+            n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+        return lastContextChars(n->getDefinition(), last, sets);
     }
+    if (const re::Seq * seq = dyn_cast_or_null<re::Seq>(context)) {
+        for (auto i = seq->rbegin(); i != seq->rend(); ++i) {
+            bool mayBeEmpty = false;
+            if (const re::Rep * rep = dyn_cast<re::Rep>(*i)) {
+                if (!plainSet(rep->getRE())) return false;
+                last = last + sets.setOf(rep->getRE(), false);
+                mayBeEmpty = rep->getLB() == 0;
+            } else if (!lastContextChars(*i, last, sets)) {
+                return false;
+            }
+            if (!mayBeEmpty) return true;
+        }
+        return false;       // (the context may be empty)
+    }
+    if (context == nullptr || !plainSet(context)) return false;
+    last = last + sets.setOf(context, false);
+    return true;
 }
 
 //  The first item of a context (as for firstContextSet), or nullptr.
@@ -604,13 +615,12 @@ static bool insertionRule(const ConversionRule * c, InsertionRule & ins, CharSet
         return false;
     }
     re::RE * const before = source->getBeforeContext();
-    const re::RE * const last = lastContextItem(before);
-    if (last == nullptr || !plainSet(last)) {
+    if (!lastContextChars(before, ins.before, sets)) {
         reason = "its before context does not end with a character of a set";
         return false;
     }
-    ins.before = sets.setOf(last, false);
-    ins.singleBefore = singleContextItem(before) == last;
+    const re::RE * const single = singleContextItem(before);
+    ins.singleBefore = single && plainSet(single);
     ins.engineBefore = engineContext(before, false);
     re::RE * const after = source->getAfterContext();
     const re::RE * const first = firstContextItem(after);

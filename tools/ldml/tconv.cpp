@@ -1819,7 +1819,8 @@ static bool insertionsOnly(const ldml::TransformStep & step) {
 }
 
 //  The insertion rules of a group applied by its correction kernel (see
-//  insertionsOnly): their before contexts must be fixed sequences of sets, and
+//  insertionsOnly): their before contexts must be sequences of sets (possibly
+//  repeated, see ContextExpansion), and
 //  the before contexts of the single-character rules, which may see the texts
 //  inserted, must be matched against the converted text.
 static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
@@ -1829,9 +1830,9 @@ static void insertionContextProblems(const ldml::TransformStep & step, std::vect
         if (ConvertedContextRounds == 0) {
             problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but before contexts are not matched "
                                "against the converted text: --converted-context-rounds=0)");
-        } else if (!fusedContexts(ins.engineBefore, true, before)) {
-            problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but its before context is not a fixed "
-                               "sequence of sets)");
+        } else if (!fusedContexts(ins.engineBefore, true, before, true)) {
+            problems.push_back(ldml::printRule(ins.rule) + "  (an insertion rule, but its before context is not a sequence "
+                               "of sets and repeated sets)");
         }
     }
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
@@ -2997,13 +2998,48 @@ void FusedRules::generatePabloMethod() {
                     }
                     return x;
                 };
+                //  As runIn(S, T, j), at the j-th last character of the converted text
+                //  up to and including each position, without its own insertion.
+                auto ownExcludedRun = [&](const UCD::UnicodeSet & S, const FusedItem & T, unsigned j) -> PabloAST * {
+                    runIn(S, T, j);
+                    const std::vector<PabloAST *> & U = runMemo[std::make_tuple(setKey(S), setKey(T.chars), T.boundary)];
+                    auto previous = [&](PabloAST * v) {
+                        PabloAST * p = pb.createAdvance(v, 1);
+                        return T.boundary ? pb.createOr(p, firstPosition) : p;
+                    };
+                    PabloAST * x = pb.createAnd(baseDeleted, previous(U[j - 1]));
+                    for (const auto & l : baseLength) {
+                        PabloAST * v;
+                        if (l.first >= j) {
+                            //  Going back over the characters of the position from its
+                            //  (l - j)-th: the first not in S is in T, or all are in S.
+                            PabloAST * found = zeroes;
+                            PabloAST * allS = ones;
+                            for (int i = static_cast<int>(l.first - j); i >= 0; i--) {
+                                PabloAST * const inS = memberOf(i, S);
+                                found = pb.createOr(found, pb.createAnd(allS, pb.createAnd(pb.createNot(inS), memberOf(i, T.chars))));
+                                allS = pb.createAnd(allS, inS);
+                            }
+                            v = pb.createOr(found, pb.createAnd(allS, previous(U[0])));
+                        } else {
+                            v = previous(U[j - l.first - 1]);
+                        }
+                        x = pb.createOr(x, pb.createAnd(l.second, v));
+                    }
+                    return x;
+                };
                 PabloAST * applied = zeroes;
                 for (size_t i = 0; i < mConfig.insertions.size(); i++) {
                     PabloAST * match = zeroes;
                     for (const FusedContext & alt : mConfig.insertions[i].before) {
+                        //  (As convertedBefore, at the position itself.)
                         PabloAST * m = ones;
                         const unsigned B = alt.size();
-                        for (unsigned k = 0; k < B; k++) m = pb.createAnd(m, ownExcluded(alt[k], B - k));
+                        for (unsigned k = 0; k < B; k++) {
+                            const unsigned d = B - k;
+                            if (k + 1 < B && alt[k + 1].star) continue;     // matched with the repetition
+                            m = pb.createAnd(m, alt[k].star ? ownExcludedRun(alt[k].chars, alt[k - 1], d) : ownExcluded(alt[k], d));
+                        }
                         match = pb.createOr(match, m);
                     }
                     insAt[i] = pb.createAnd(pb.createAnd(insAfter[i], match), pb.createNot(applied));
@@ -4491,7 +4527,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
             for (const ldml::InsertionRule & ins : step.insertions) {
                 FusedInsertion fi;
-                fusedContexts(ins.engineBefore, true, fi.before);
+                fusedContexts(ins.engineBefore, true, fi.before, true);
                 if (!fusedContexts(ins.engineAfter, false, fi.after)) {
                     //  The positions before those where the after context matches.
                     fi.after = {FusedContext()};

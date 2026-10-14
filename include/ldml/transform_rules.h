@@ -44,9 +44,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <functional>
 #include <llvm/Support/Casting.h>
 #include <allocator/threadsafe_slaballocator.h>
 #include <re/adt/re_re.h>
+#include <ucd/core/unicode_set.h>
 
 namespace re { class Name; class Capture; class CC; }
 
@@ -787,6 +789,34 @@ struct RevisitStats {
     std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
 };
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats = nullptr);
+
+//  Expansion of function calls on captures of single characters.
+//
+//  A forward conversion rule whose result calls a transform on a capture of
+//  its text, &T($k), where the capture is a set of single characters S (not
+//  within a repetition), is replaced by rules for the characters of S, grouped
+//  by the value of T on them: for each group, the rule with the capture
+//  restricted to the characters of the group and the call replaced by their
+//  value, and for the characters that T leaves unchanged, the rule with the
+//  call replaced by $k.  The groups being disjoint, the order of these rules
+//  does not matter.  Further calls in the result are expanded in turn.
+//
+//  evaluate(T, S, groups, unchanged, reason) gives the groups of the
+//  characters of S by the value of T on each (as a text of its own), and the
+//  characters left unchanged; or false, with the reason, if T cannot be
+//  evaluated on them.  A rule whose call cannot be expanded is left unchanged
+//  (reported in the stats).
+using FunctionEvaluator = std::function<bool (const TransformID & transform, const UCD::UnicodeSet & chars,
+                                              std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
+                                              UCD::UnicodeSet & unchanged, std::string & reason)>;
+struct FunctionCallStats {
+    unsigned candidates = 0;        // rules with function calls on captures
+    unsigned expanded = 0;
+    unsigned rules = 0;             // the rules replacing them
+    std::vector<std::pair<const Rule *, std::string>> notExpanded;  // with the reason
+};
+std::vector<Rule *> ExpandFunctionCalls(const std::vector<Rule *> & rules, const FunctionEvaluator & evaluate,
+                                        FunctionCallStats * stats = nullptr);
 
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.

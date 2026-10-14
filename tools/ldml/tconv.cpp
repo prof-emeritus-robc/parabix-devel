@@ -523,6 +523,11 @@ private:
     //  transforms the plan's steps invoke), given the rules to extract as
     //  forward rules.
     TransformAnalysis analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction);
+    //  The value of a transform called by a rule (&T($k)) on the characters of a
+    //  set (see ldml::ExpandFunctionCalls).
+    bool evaluateFunction(const ldml::TransformID & transform, const UCD::UnicodeSet & chars,
+                          std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
+                          UCD::UnicodeSet & unchanged, std::string & reason);
     const ldml::TransformRegistry & mRegistry;
     std::map<std::string, TransformAnalysis> mResults;
     std::set<std::string> mInProgress;
@@ -578,6 +583,104 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
     return mResults.emplace(name, std::move(a)).first->second;
 }
 
+//  The value of a transform, as planned, on a single character: through its
+//  conversion groups, each mapping the character by a single-character rule
+//  without contexts, or leaving it unchanged; false (with the reason) if a rule
+//  with contexts may apply to the character, or other rules or steps, or a step
+//  applies to the text of several characters a mapping made.
+static bool evaluatePlan(const ldml::TransformPlan & plan, const ldml::TransformRegistry & registry, UCD::codepoint_t cp,
+                         std::u32string & out, std::string & reason) {
+    std::u32string s(1, static_cast<char32_t>(cp));
+    if (plan.filter && !plan.filterSet.contains(cp)) {
+        out = s;
+        return true;
+    }
+    for (const ldml::TransformStep & step : plan.steps) {
+        if (s.empty()) break;
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            const ldml::TransformEntry * used = registry.lookup(step.transform.getText());
+            if (used && used->canonicalName == "Any-Null") continue;
+            reason = "it invokes " + step.transform.getText();
+            return false;
+        }
+        if (s.size() != 1) {
+            reason = "a conversion group applies to a text of several characters";
+            return false;
+        }
+        const UCD::codepoint_t c = s[0];
+        if (!step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
+            reason = "it has rules other than single-character rules";
+            return false;
+        }
+        const ldml::CharMapSubgroup * applying = nullptr;
+        for (const ldml::CharMapSubgroup & g : step.subgroups) {
+            if (!g.characters().contains(c)) continue;
+            if (g.before || g.after) {
+                reason = "a single-character rule with contexts may apply";
+                return false;
+            }
+            if (applying == nullptr) applying = &g;
+        }
+        if (applying == nullptr) continue;
+        for (const ldml::CharMapping & m : applying->mappings) {
+            if (m.chars.contains(c)) {
+                s = m.replacement;
+                break;
+            }
+        }
+    }
+    out = s;
+    return true;
+}
+
+bool TransformAnalyzer::evaluateFunction(const ldml::TransformID & transform, const UCD::UnicodeSet & chars,
+                                         std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
+                                         UCD::UnicodeSet & unchanged, std::string & reason) {
+    const ldml::TransformEntry * const entry = mRegistry.lookup(transform.getText());
+    if (entry == nullptr) {
+        reason = "unknown transform " + transform.getText();
+        return false;
+    }
+    const std::string & name = entry->canonicalName;
+    std::map<std::u32string, UCD::UnicodeSet> byValue;
+    auto add = [&](UCD::codepoint_t cp, const std::u32string & v) {
+        if (v.size() == 1 && v[0] == cp) unchanged.insert(cp); else byValue[v].insert(cp);
+    };
+    if (name == "Any-Lower" || name == "Any-Upper" || name == "Any-Title") {
+        //  The full case mappings (of a character alone: no Final_Sigma context).
+        const UCD::property_t prop = name == "Any-Lower" ? UCD::lc : name == "Any-Upper" ? UCD::uc : UCD::tc;
+        auto * const p = cast<UCD::StringOverridePropertyObject>(UCD::getPropertyObject(prop));
+        const UCD::UnicodeSet same = chars & p->GetReflexiveSet();
+        unchanged = unchanged + same;
+        for (const auto & range : chars - same) {
+            for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) add(cp, p->GetU32StringValue(cp));
+        }
+    } else {
+        if (chars.count() > 4096) {
+            reason = "the capture has too many characters to evaluate " + name + " on";
+            return false;
+        }
+        const TransformAnalysis & a = analyze(entry);
+        if (!a.implementable) {
+            reason = name + " is not implementable";
+            return false;
+        }
+        for (const auto & range : chars) {
+            for (UCD::codepoint_t cp = range.first; cp <= range.second; cp++) {
+                std::u32string v;
+                std::string why;
+                if (!evaluatePlan(a.plan, mRegistry, cp, v, why)) {
+                    reason = name + " is not evaluated on single characters: " + why;
+                    return false;
+                }
+                add(cp, v);
+            }
+        }
+    }
+    for (const auto & kv : byValue) groups.emplace_back(kv.second, kv.first);
+    return true;
+}
+
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 
@@ -586,6 +689,14 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
     try {
         std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+        //  (Before revisits are composed: a result calling a function may have
+        //  text to revisit.)
+        ldml::FunctionCallStats cstats;
+        rules = ldml::ExpandFunctionCalls(rules, [&](const ldml::TransformID & t, const UCD::UnicodeSet & chars,
+                                                     std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
+                                                     UCD::UnicodeSet & unchanged, std::string & reason) {
+            return evaluateFunction(t, chars, groups, unchanged, reason);
+        }, &cstats);
         ldml::RevisitStats rstats;
         rules = ldml::ComposeRevisits(rules, &rstats);
         //  (Rules whose text is only a capture, or continues after it, are kept as
@@ -606,6 +717,15 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
             return s.size() >= e.size() && s.compare(s.size() - e.size(), e.size(), e) == 0;
         };
         for (std::string & problem : a.plan.problems) {
+            if (endsWith(problem, "(the result is not a fixed string)")) {
+                //  The function call not expanded (the rule is unchanged).
+                for (const auto & n : cstats.notExpanded) {
+                    if (problem.compare(0, ldml::printRule(n.first).size(), ldml::printRule(n.first)) == 0) {
+                        problem += " (function call not expanded: " + n.second + ")";
+                        break;
+                    }
+                }
+            }
             if (endsWith(problem, "(the result has text to revisit)") && notComposed < rstats.notComposed.size()) {
                 problem += " (not composed: " + rstats.notComposed[notComposed++].second + ")";
             } else if (endsWith(problem, "(the text to replace is not a fixed-length sequence of characters)")) {

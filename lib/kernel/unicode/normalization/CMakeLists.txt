@@ -14,6 +14,7 @@ parabix_add_module(
 NAME
     kernel.unicode.normalization
 SRC
+    fcd.cpp
     nfd.cpp
     normalization-generated.cpp
     normalization.cpp

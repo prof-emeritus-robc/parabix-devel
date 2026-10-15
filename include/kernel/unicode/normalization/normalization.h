@@ -247,6 +247,19 @@ void UpdateBitXfrms(pablo::PabloBuilder & pb,
                     std::vector<pablo::PabloAST *> & sets,
                     std::vector<BitXfrmSpec> & xfrmSpecs);
 
+//
+//  FCD (as ICU's FCD normalizer and the Any-FCD transform): the text is left
+//  as it is where it passes the FCD test, and elsewhere decomposed (NFD) in
+//  regions.  A violation is a character v with leading canonical combining class
+//  lccc(v) != 0 below the trailing class tccc of the character before it (the
+//  classes of the first and last characters of their NFD).  Its region begins
+//  at the last character before it with lccc = 0, or after the last one with
+//  tccc <= 1 if later, and ends before the next character with lccc = 0.
+//  FCD_RegionMask marks the regions of a U21-indexed text; the regions,
+//  decomposed with NFD (with the other characters as barriers), give the FCD.
+//
+void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions);
+
 // NFD Support
 
 class NFD_BixData {

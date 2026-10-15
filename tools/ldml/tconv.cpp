@@ -94,6 +94,7 @@
 #include <toolchain/toolchain.h>
 #include <ucd/data/PropertyAliases.h>
 #include <ucd/data/PropertyObjects.h>
+#include <ucd/algo/normalization.h>
 #include <ucd/data/PropertyObjectTable.h>
 
 using namespace kernel;
@@ -132,11 +133,11 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, FCD, Lower, Upper, Title, CaseFold, HexJava, HexUnicode, HexC, HexXML, HexPerl, HexDecode};
+enum class Transform {NFD, NFKD, NFC, NFKC, FCD, FCC, Lower, Upper, Title, CaseFold, HexJava, HexUnicode, HexC, HexXML, HexPerl, HexDecode};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
-    {"Any-NFC", Transform::NFC}, {"Any-NFKC", Transform::NFKC}, {"Any-FCD", Transform::FCD},
+    {"Any-NFC", Transform::NFC}, {"Any-NFKC", Transform::NFKC}, {"Any-FCD", Transform::FCD}, {"Any-FCC", Transform::FCC},
     {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title}, {"Any-CaseFold", Transform::CaseFold},
     {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},
     {"Any-Hex/Unicode", Transform::HexUnicode}, {"Any-Hex/C", Transform::HexC},
@@ -475,6 +476,7 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
             OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::cf, BasisBits));
             break;
         case Transform::FCD:
+        case Transform::FCC:
         case Transform::Title:
         case Transform::HexJava:
         case Transform::HexUnicode:
@@ -482,7 +484,7 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
         case Transform::HexXML:
         case Transform::HexPerl:
         case Transform::HexDecode:
-            llvm::report_fatal_error("tconv: Any-FCD, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /Perl) are implemented by the rule pipeline");
+            llvm::report_fatal_error("tconv: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /Perl) are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -3683,6 +3685,8 @@ private:
     StreamSet * builtIn(const std::string & name, StreamSet * U21);
     StreamSet * normalization(const std::string & name, StreamSet * U21);
     StreamSet * maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection = nullptr);
+    StreamSet * barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * mask, bool updateMasks);
+    StreamSet * fcc(StreamSet * U21);
     StreamSet * fcd(StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
@@ -3811,7 +3815,7 @@ StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const st
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
     if (name == "Any-Null") return U21;
-    if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC") {
+    if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" || name == "Any-FCC") {
         return activeMask() ? maskedNormalization(name, U21) : normalization(name, U21);
     }
     if (name == "Any-FCD") return fcd(U21);
@@ -3853,6 +3857,7 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
     PipelineBuilder & P = mP;
     if (name == "Any-NFD") return mNFD.NFD_U21_Pipeline(U21);
     if (name == "Any-NFKD") return mNFD.NFKD_U21_Pipeline(U21);
+    if (name == "Any-FCC") return fcc(U21);
     if (name == "Any-NFKC") U21 = mNFD.NFKD_U21_Pipeline(U21);
     StreamSet * const basis = UTF8_Of(P, U21);
     StreamSet * const composed = NFC_Bytes(P, BytesOf(P, basis), basis);
@@ -3870,11 +3875,18 @@ StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamS
 //  With a selection, the characters normalized are those of the selection
 //  (within the active mask, if any) rather than of the active mask.
 StreamSet * RulePipelineBuilder::maskedNormalization(const std::string & name, StreamSet * U21, StreamSet * selection) {
+    StreamSet * const selected = selection ? combine(selection, activeMask(), false) : activeMask();
+    return barrierNormalization(name, U21, selected, true);
+}
+
+//  The normalization of the characters of mask, the others replaced by barriers
+//  (as is a barrier codepoint in the text), and restored after it; with
+//  updateMasks, the masks of the filters in effect are kept in step.
+StreamSet * RulePipelineBuilder::barrierNormalization(const std::string & name, StreamSet * U21, StreamSet * selected, bool updateMasks) {
     PipelineBuilder & P = mP;
     StreamSet * const barrierChars = classes({UCD::UnicodeSet(BarrierMark)}, U21);
     StreamSet * const notBarrierChars = P.CreateStreamSet(1);
     Invert(P, barrierChars, notBarrierChars);
-    StreamSet * const selected = selection ? combine(selection, activeMask(), false) : activeMask();
     StreamSet * const mask = combine(selected, notBarrierChars, false);
     StreamSet * const Work = P.CreateStreamSet(21);
     P.CreateKernelCall<ReplaceUnmasked>(U21, mask, Work);
@@ -3897,7 +3909,7 @@ StreamSet * RulePipelineBuilder::maskedNormalization(const std::string & name, S
     SHOW_BIXNUM(result);
     //  The masks hold at the normalized characters, and keep their values at
     //  the barriers.
-    for (StreamSet *& m : mMasks) {
+    if (updateMasks) for (StreamSet *& m : mMasks) {
         StreamSet * const outer = P.CreateStreamSet(1);
         FilterByMask(P, unmasked, m, outer);
         StreamSet * const spread = P.CreateStreamSet(1);
@@ -3925,6 +3937,64 @@ StreamSet * RulePipelineBuilder::fcd(StreamSet * U21) {
     FCD_RegionMask(P, text, Regions);
     SHOW_STREAM(Regions);
     return maskedNormalization("Any-NFD", U21, Regions);
+}
+
+//  The characters visible in a pass of Any-FCC: the starters (ccc = 0) and the
+//  characters immediately after them.
+class FCC_Window : public pablo::PabloKernel {
+public:
+    FCC_Window(LLVMTypeSystemInterface & ts, StreamSet * Starters, StreamSet * Visible)
+    : PabloKernel(ts, "FCC_Window", {Binding{"Starters", Starters}}, {Binding{"Visible", Visible}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const starters = getInputStreamSet("Starters")[0];
+        PabloAST * const visible = pb.createInFile(pb.createOr(starters, pb.createAdvance(starters, 1)));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("Visible"), pb.getInteger(0)), visible);
+    }
+};
+
+//  The number of passes of Any-FCC: the largest number of nonstarters in the
+//  NFD of a primary composite (3, as α 0313 0300 0345 of U+1F82).
+static unsigned FCC_Passes() {
+    auto * cccObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
+    const UCD::UnicodeSet starters = cccObj->GetCodepointSet(UCD::CCC_ns::NR);
+    const UCD::UnicodeSet excluded = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(UCD::Comp_Ex))->GetCodepointSet(UCD::Binary_ns::Y);
+    auto * dmObj = llvm::cast<UCD::StringPropertyObject>(UCD::getPropertyObject(UCD::dm));
+    UCD::NFD_Engine NFD_engine(UCD::DecompositionOptions::NFD);
+    unsigned passes = 1;
+    for (UCD::codepoint_t cp : dmObj->GetExplicitCps()) {
+        if (excluded.contains(cp)) continue;
+        std::u32string decomp;
+        NFD_engine.NFD_append1(decomp, cp);
+        if (decomp.size() < 2) continue;
+        unsigned marks = 0;
+        for (char32_t c : decomp) marks += starters.contains(c) ? 0 : 1;
+        passes = std::max(passes, marks);
+    }
+    return passes;
+}
+
+//  Any-FCC (ICU's FCC, composition of contiguous characters only): NFD, then
+//  NFC in passes, each on the starters and the characters immediately after them
+//  (the others replaced by barriers): NFC then composes only adjacent characters.
+//  Where a character composes with the starter before it, the next one becomes
+//  adjacent to the composite, and is tried in the next pass; where it does not,
+//  it stays next to the starter, and so does nothing after it compose.  As many
+//  passes as nonstarters in a primary composite.
+StreamSet * RulePipelineBuilder::fcc(StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    auto * cccObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
+    const UCD::UnicodeSet starterSet = cccObj->GetCodepointSet(UCD::CCC_ns::NR);
+    StreamSet * text = mNFD.NFD_U21_Pipeline(U21);
+    static const unsigned passes = FCC_Passes();
+    for (unsigned i = 0; i < passes; i++) {
+        StreamSet * const starters = classes({starterSet}, text);
+        StreamSet * const visible = P.CreateStreamSet(1);
+        P.CreateKernelCall<FCC_Window>(starters, visible);
+        text = barrierNormalization("Any-NFC", text, visible, false);
+    }
+    return text;
 }
 
 //  Unicode titlecasing (see TitlecasePositions), with the word boundaries of
@@ -5541,7 +5611,7 @@ int main(int argc, char *argv[]) {
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
     //  boundaries, provided by the rule pipeline.
     const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower
-                        && impl->second != Transform::FCD
+                        && impl->second != Transform::FCD && impl->second != Transform::FCC
                         && impl->second != Transform::Title && impl->second != Transform::HexJava
                         && impl->second != Transform::HexUnicode
                         && impl->second != Transform::HexC && impl->second != Transform::HexXML

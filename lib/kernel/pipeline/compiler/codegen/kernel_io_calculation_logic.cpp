@@ -2370,9 +2370,10 @@ void PipelineCompiler::splatMultiStepPartialSumValues(KernelBuilder & b) {
             b.CreateBlockAlignedStore(splat, ptr);
         }
 
-        ConstantInt * const sz_maxStepFactor = b.getSize(spanLength * stepsPerBlock);
-
-        Value * const final = b.CreateRoundUp(b.CreateAdd(produced, sz_stepsPerBlock), sz_maxStepFactor);
+        // The partial sums are now valid (the total) from start through the spanLength blocks
+        // after its own: at least spanLength * stepsPerBlock items past the produced count, as a
+        // consumer may read up to its maximum step factor past any item it has not processed.
+        Value * const final = b.CreateAdd(start, b.getSize((spanLength + 1) * stepsPerBlock));
 
         #if defined(PRINT_DEBUG_MESSAGES) && defined(WRITE_POPCOUNT_VALUES_TO_STDERR)
         debugPrint(b, "  < splatting %" PRIu64 " across %" PRIu64 " -> %" PRIu64 "\n", total, produced, final);

@@ -1,19 +1,23 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `89e922e4f`: with rules with text
+*Status of `tools/ldml/tconv` on branch LDML at `42df6910a`: with rules with text
 to revisit composed at compile time (W6), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
 MultipleCaptureMultipleReplacement rules (W3, §5), insertion rules (W4, §4.2),
 large mappings multiplexed (§4.3), captures referred to out of order (SwapBack,
 MoveRegions, §5), function calls on captures of single characters (W5, §5), and
-the built-ins Hex-Any (all variants) and Any-CaseFold (§2.1), against CLDR
-`common/transforms` and `common/testData/transforms` at commit `7cdeb9e`
-(2026-10-09). October 15, 2026.*
+the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD and Any-FCC (§2.1),
+against CLDR `common/transforms` and `common/testData/transforms` at commit
+`7cdeb9e` (2026-10-09). October 15, 2026.*
 
-*This run used the CLDR transforms without the local fixes of W7 (§5), so
-Latin-ug and ug-Latin, implementable with them, are counted as blocked by W7
-here, and Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather
-than the W3, W4 and W6 problems they have with the fixes.*
+*This run used the CLDR transforms without the local fixes of W7 (§5), from a
+copy (`~/transforms`, 380 files rather than 381), so Latin-ug and ug-Latin,
+implementable with them, are counted as blocked by W7 here, and
+Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather than the
+W3, W4 and W6 problems they have with the fixes. Any-FCD and Any-FCC were added
+to the results by an incremental update (`tconv_coverage.py --update`, see
+[Reproducing](#reproducing)); the generated tables and blocks of this report are
+marked `<!-- coverage:… -->`.*
 
 This report covers:
 
@@ -30,11 +34,13 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 
 ## 1. Summary
 
+<!-- coverage:summary -->
 | | names | implementable |
 |---|---:|---:|
-| Built-in transforms (UTS #35 / ICU) | 30 | 21 |
-| Transforms defined by CLDR files (381 files) | 425 | 344 (81%) |
+| Built-in transforms (UTS #35 / ICU) | 30 | 23 |
+| Transforms defined by CLDR files (380 files) | 425 | 344 (81%) |
 | …of which public (not `visibility="internal"`) | 393 | 313 (80%) |
+<!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 230 belong to implementable transforms.
   Their 240,668 cases fail only in two files, where the test data disagrees with
@@ -53,7 +59,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   ThaiLogical-Thai are implementable, and Thai-Latn is left blocked only by
   `Any-BreakInternal` (W8).
 - **Built-ins** (§2.1): Hex-Any and its variants (Java, C, Perl, Unicode, XML,
-  XML10), with the bare Hex-Any decoding all the forms, and Any-CaseFold.
+  XML10), with the bare Hex-Any decoding all the forms, Any-CaseFold, and the
+  normalizations Any-FCD and Any-FCC of ICU, identical to ICU 78.3's
+  Normalizer2 on `QA/Normalization` and on random text.
 - **Insertion rules** (W4, §4.2), such as `a { } [$E $EO $EU] → $sep`: in groups
   of their own, and in groups with single-character rules, whose before contexts
   then see the text inserted, as in ICU. With them, ConjoiningJamo-Latin,
@@ -100,16 +108,20 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 
   Each of these is concentrated in a few rule files (§5).
 
+<!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
 now                          344  ████████████████████████████████
-+ W3 (rest)                  375  ███████████████████████████████████
-+ W6 revisit (rest)          411  ██████████████████████████████████████
-+ W5 back-references         417  ███████████████████████████████████████
++ W3 variable-length text    375  ███████████████████████████████████
++ W6 revisit                 411  ███████████████████████████████████████
++ W5 captures/functions      417  ███████████████████████████████████████
 + W7 parser semantics        421  ████████████████████████████████████████
-+ W10, W4                    423  ████████████████████████████████████████
-+ W8, W9                     425  ████████████████████████████████████████
++ W10 engine lookaheads      422  ████████████████████████████████████████
++ W4 insertion               423  ████████████████████████████████████████
++ W8 built-ins               424  ████████████████████████████████████████
++ W9 analysis scale          425  ████████████████████████████████████████
 ```
+<!-- /coverage:chart -->
 
 These counts are lower bounds on the remaining work. `planTransform` reports one
 problem per rule and skips the rules it cannot implement, so some problems
@@ -117,12 +129,14 @@ surface only after others are fixed.
 
 ## 2. What works
 
-### 2.1 Built-in transforms (21 of 30)
+### 2.1 Built-in transforms (23 of 30)
 
 | implemented | how |
 |---|---|
 | Any-NFD, Any-NFKD | `NFD_PipelineBuilder` (as the `nfd`/`nfkd` tools) |
 | Any-NFC, Any-NFKC | the focused NFC pipeline of the `nfc` tool (NFKC = NFKD then NFC) |
+| Any-FCD | NFD of the regions that fail the FCD test, the rest left as it is (`FCD_RegionMask`, `e2554e7f1`) |
+| Any-FCC | NFD, then NFC in passes on the starters and the characters just after them (`42df6910a`) |
 | Any-Lower, Any-Upper | string override properties `lc`/`uc`, with the Final_Sigma context for Lower |
 | Any-CaseFold | string override property `cf` (`89e922e4f`) |
 | Any-Title | Unicode toTitlecase (word boundaries + `tc`/`lc`), issue #16 |
@@ -160,11 +174,54 @@ filters), also with segment sizes 1 and 2, 3 threads, and `-EnableAsserts
 Unicode and XML. ICU's skipping of the character after a decoded pair or a
 deleted escape is not reproduced (§3.3).
 
-Not implemented:
+**Any-FCD** (ICU's FCD normalizer). A violation is a character whose leading
+canonical combining class (lccc, the class of the first character of its NFD) is
+not 0 and is below the trailing class (tccc, of the last character of its NFD)
+of the character before it. Its region begins at the last character before it
+with lccc = 0, or after the last one with tccc ≤ 1 if that is later (as ICU's
+FCD normalizer backs up), and ends before the next character with lccc = 0; the
+regions are decomposed (NFD), and the rest of the text is left as it is, so that
+a Hangul syllable or À before a violation stays composed. `FCD_Violations`
+finds the violations and the possible region starts, `IndexedShiftBack` moves the
+first violation of each span back to its start, and `FCD_Regions` extends the
+starts over the following nonstarters; the regions are then decomposed by NFD
+with the other characters as barriers (U+FDD0), as for a filter. Within a
+filter, the regions are found with the characters outside it replaced by
+barriers, so that each run of filtered characters is taken by itself, as in
+ICU.
 
-- `Any-Hex/XML10`;
-- `Any-Remove`, `Any-FCD`, `Any-FCC`, `Any-Name`, `Name-Any` and
-  `Any-BreakInternal`.
+**Any-FCC** (ICU's FCC: NFD, then composition of contiguous characters only).
+It differs from NFC where NFC composes a mark with a starter across another
+mark of a lower class: `1E0A 031B` (Ḋ and the horn) is NFC, and FCC
+`0044 031B 0307`. tconv applies NFD, then NFC in passes, each on the starters
+and the characters just after them, the other characters replaced by barriers:
+NFC then composes only adjacent characters. A character that composes with the
+starter before it makes the next one adjacent to the composite, which the next
+pass tries; one that does not stays next to the starter, and nothing after it
+composes. The passes are as many as the nonstarters of a primary composite (3,
+as in U+1F82 = α 0313 0300 0345). The cost is that of an NFD and three NFCs.
+
+**Verification.** `QA/Normalization/FCD` and `QA/Normalization/FCC` are the FCD
+and FCC of `NF-source` by ICU 78.3's Normalizer2 (the API: `uconv -x Any-NFD`
+and `-x Any-FCD` misorder combining marks in 73 lines of it, as noted in §3.3);
+tconv's results are identical to them. Against ICU 78.3:
+
+- Any-FCD: 20,000 random strings (Hangul, singletons, ccc-1 marks, Tibetan and
+  Kannada vowel parts, misordered marks) identical, also with segment sizes 1 and
+  3, 3 threads, and `--EnableAsserts --VerifyIR`; with the filters `[^x]` and
+  `[^\u0316]`, 5,000 strings identical to ICU's `createFromRules`;
+- Any-FCC: the same 20,000 strings and 30,000 strings of composition chains
+  (Greek and Vietnamese multiple accents, ǭ, the Sinhala and Kannada two-part
+  vowels, Hangul jamo; 2,257 of them differ from NFC) identical, also with
+  segment sizes 1 and 3 and 3 threads; with the filter `[^\u0302]`, identical to
+  `createFromRules`. Of six runs with `--EnableAsserts --VerifyIR`, the first
+  aborted without a diagnostic and the other five were identical; the direct
+  pipeline of Any-NFC fails a memory bounds assertion in `NFC_CandidateClass`
+  on every such run (§3.2).
+
+<!-- coverage:builtins-missing -->
+Not implemented: `Any-Remove`, `Any-Name`, `Name-Any`, `Any-Hex/XML10`, `Any-Hex/Plain`, `Hex-Any/Plain` and `Any-BreakInternal`.
+<!-- /coverage:builtins-missing -->
 
 The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
 `Hex-Any/Plain`, which ICU 78.3 does not have. `Hex-Any` is no longer an alias
@@ -447,6 +504,10 @@ correction, between 108 and 1,853 of each 5,000 differ.
   Existing Pablo kernels such as `Misorder_Check` make the same assumption, and
   no test showed a difference at text endings. However, the pipeline's guarantee
   of this has not been confirmed.
+- **NFC memory bounds.** With `--EnableAsserts`, the direct pipeline of Any-NFC
+  (`NFC_Bytes`) fails a memory bounds assertion in `NFC_CandidateClass`, which
+  reads past the end of its `Basis` input, on every run; its output is correct
+  without the assertions. The NFC of the rule pipeline (as in Any-FCC) passes.
 
 ### 3.3 Intended differences from ICU
 
@@ -461,7 +522,12 @@ correction, between 108 and 1,853 of each 5,000 differ.
   single rule set, with no `::` steps. tconv applies it, as UTS #35 specifies.
 - **Normalization.** On synthetic runs of many combining marks, ICU's `uconv`
   output was not canonically ordered. tconv agrees with Python's `unicodedata`
-  on those inputs.
+  on those inputs, and so does ICU itself through its API: `Normalizer2`, and
+  the transliterators created by `Transliterator::createInstance`, give exactly
+  `QA/Normalization/NFD` and `NFC`, while `uconv -x Any-NFD` (and `-x Any-FCD`)
+  leaves the first mark of some runs in place (73 lines of `NF-source`, such as
+  `a 302E 059A 0316`, and `212B 0323`, given as `0041 030A 0323`). The difference
+  is in `uconv`, not in ICU's normalization: compare with ICU through its API.
 - **ICU's cursor in results.** ICU's `StringReplacer` starts each rule as
   "complex" and builds the result piece by piece, recording the cursor before
   adding the literal text accumulated since the last reference to a capture. So:
@@ -683,6 +749,7 @@ sort.
 Table 1: work items, by the number of transforms that need them (own problems and
 those of invoked transforms).
 
+<!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
 | W3 variable-length texts | 48 | 31 | M–L (the rest) |
@@ -693,6 +760,7 @@ those of invoked transforms).
 | W4 insertion rules (with string rules) | 1 | 0 | M |
 | W8 built-ins (Any-BreakInternal) | 1 | 1 | L |
 | W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 1 | 1 | L |
+<!-- /coverage:work-items -->
 
 (W7 counts the run without the local CLDR fixes; with them, it blocks nothing,
 Latin-ug and ug-Latin are implementable, and the two Greek UNGEGN transforms
@@ -715,7 +783,8 @@ Done since the first assessment:
 - two captures of fixed lengths in reverse order (`7e927d2d7`, SwapBack), and
   captures of variable lengths moved out of order (`a090553b4`, MoveRegions);
 - W5 function calls on captures of single characters (`687470e89`);
-- the built-ins Hex-Any (`41df85c9e`) and Any-CaseFold (`89e922e4f`).
+- the built-ins Hex-Any (`41df85c9e`), Any-CaseFold (`89e922e4f`), Any-FCD
+  (`e2554e7f1`) and Any-FCC (`42df6910a`).
 
 W7 blocks nothing where the proposed CLDR fixes are applied locally (see W7
 below); this run did not apply them.
@@ -951,8 +1020,9 @@ The per-transform table lists the problem classes of every transform.
    the coverage with them (`~/cldr`), as the earlier reports did.
 5. **W5 back-references and W9.** Kana-Latn and Hira-Latn, then Jpan-Latn.
 6. **Built-ins and pipeline size.**
-   - Built-ins: `Any-Hex/XML10`, `Any-Remove`, and `Any-BreakInternal` for
-     Thai-Latn.
+   - Built-ins: `Any-Hex/XML10`, `Any-Remove`, `Any-Name` and `Name-Any`, and
+     `Any-BreakInternal` for Thai-Latn.
+   - The memory bounds assertion of the direct NFC pipeline (§3.2).
    - Pipeline size: a single-kernel sort network, or sharing normalizations
      between steps.
 
@@ -999,6 +1069,9 @@ tconv on every implementable transform.
 | `687470e89` | W5 function calls on captures of single characters (az-, el-, lt-, tr-Title, Latn-Ethi/ALALOC, /SERA) |
 | `a090553b4` | captures of variable lengths referred to out of order (MoveRegions) |
 | `89e922e4f` | Any-CaseFold: 344 (without the local W7 fixes) |
+| `e2554e7f1` | Any-FCD (`FCD_RegionMask`); `QA/Normalization/FCD` |
+| `86f6ad53d` | `tconv_coverage.py --update`: incremental coverage updates |
+| `42df6910a` | Any-FCC (NFC in passes on adjacent characters); `QA/Normalization/FCC`: 23 of 30 built-ins |
 
 ## Reproducing
 
@@ -1023,3 +1096,26 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
 - When comparing tconv versions, give each run its own `-object-cache-salt`.
 - The run at `89e922e4f` used `--transforms-dir ~/transforms`, without the local
   W7 fixes; use a checkout with them to count Latin-ug and ug-Latin.
+- **Incremental updates.** After a change to tconv, update the results instead of
+  a full run: `--update` keeps the previous results in `--out` and plans (and
+  tests) only the selected transforms (`--only NAME …`, `--builtins`,
+  `--blocked`), then the transforms using one whose status changed. It refuses
+  other `--transforms-dir` or `--test-data` than the previous results'
+  (`coverage-meta.json` records them, and the tconv commit), and writes
+  `changes.md`, the differences from the previous results. Then
+  `--table-doc doc/ldml-tconv-coverage-table.md` regenerates the per-transform
+  table (with `--note` and `--cldr-note` for its header), and
+  `--report-doc doc/ldml-tconv-coverage.md` the blocks of this report between
+  `<!-- coverage:NAME -->` markers (summary, chart, builtins-missing,
+  work-items); the rest of the report is edited by hand, from `changes.md`. For
+  Any-FCD and Any-FCC:
+
+  ```
+  python3 tools/ldml/tconv_coverage.py --tconv build18/bin/tconv \
+      --transforms-dir ~/transforms --test-data ~/testData/transforms \
+      --out tools/ldml/tconv-coverage --update --only Any-FCD Any-FCC \
+      --table-doc doc/ldml-tconv-coverage-table.md --report-doc doc/ldml-tconv-coverage.md \
+      --note '…' --cldr-note 'without the local fixes of W7'
+  ```
+
+  `tools/ldml/tconv-coverage/` is ignored by git (`tools/ldml/.gitignore`).

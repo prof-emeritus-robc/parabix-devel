@@ -27,8 +27,8 @@
 #  Incremental runs: with --update, the previous results in the output directory
 #  are kept, and only the selected transforms (--only, --builtins, --blocked,
 #  and transforms tconv now knows that the results do not have) are planned and
-#  tested again, with the transforms that use them (directly or through others),
-#  whose status depends on theirs.  The classes, totals and tables are then
+#  tested again, with the transforms that use one whose status changed (and so
+#  on), whose status depends on theirs.  The classes, totals and tables are then
 #  computed again for all.  --update refuses directories other than those of the
 #  previous results (unless --force).
 #
@@ -101,9 +101,9 @@ def list_transforms(args):
 
 
 #  The transforms of entries to plan again (all, without previous results): the
-#  selected ones, the ones the previous results do not have (or whose plan is
-#  missing), and the transforms that use any of these, directly or through
-#  others (whose exit status of tconv --plan depends on theirs).
+#  selected ones, and the ones the previous results do not have (or whose plan is
+#  missing).  (The transforms that use them are planned again only where their
+#  status changes: see plan_with_users.)
 def select(args, entries, previous):
     if previous is None:
         return list(entries)
@@ -123,17 +123,30 @@ def select(args, entries, previous):
     plans = os.path.join(args.out, 'plans')
     chosen |= {name for name in entries
                if name not in previous or not os.path.exists(os.path.join(plans, file_name(name)))}
+    return [name for name in entries if name in chosen]
+
+
+#  Plan the transforms of names; with previous results, also the transforms that
+#  use (directly) one whose exit status of tconv --plan changed, whose own status
+#  depends on it, and so on.  Returns all the transforms planned.
+def plan_with_users(args, entries, names, previous):
+    run_plans(args, entries, names)
+    if previous is None:
+        return names
     users = collections.defaultdict(set)
     for name, e in previous.items():
         for u in e.get('uses', []):
             users[u].add(name)
-    work = list(chosen)
-    while work:
-        for u in users[work.pop()]:
-            if u in entries and u not in chosen:
-                chosen.add(u)
-                work.append(u)
-    return [name for name in entries if name in chosen]
+    planned, batch = list(names), names
+    while batch:
+        changed = [n for n in batch if n not in previous or entries[n]['rc'] != previous[n].get('rc')]
+        batch = [u for u in entries if u not in planned and any(u in users[n] for n in changed)]
+        if batch:
+            print('tconv_coverage.py: planning %d transforms using ones whose status changed' % len(batch),
+                  file=sys.stderr)
+            run_plans(args, entries, batch)
+            planned += batch
+    return planned
 
 
 def run_plans(args, entries, names):
@@ -417,7 +430,7 @@ def summary(entries):
     return '\n'.join(md) + '\n'
 
 
-def git_info(path):
+def git_info(path, ignore=()):
     def git(*a):
         r = subprocess.run(['git', '-C', path] + list(a), capture_output=True, text=True)
         return r.stdout.strip() if r.returncode == 0 else None
@@ -425,7 +438,8 @@ def git_info(path):
     if commit is None:
         return None
     return dict(commit=commit, branch=git('rev-parse', '--abbrev-ref', 'HEAD'),
-                dirty=bool(git('status', '--porcelain', '--untracked-files=no')))
+                dirty=bool(git('status', '--porcelain', '--untracked-files=no', '--', '.',
+                               *[':!' + p for p in ignore])))
 
 
 #  The tconv source (the repository of this script), and the CLDR data.
@@ -435,7 +449,12 @@ def source_info(args):
             return None
         d = os.path.realpath(os.path.expanduser(d))
         return dict(path=d, git=git_info(d))
-    return dict(tconv=git_info(os.path.dirname(os.path.realpath(__file__))),
+    #  The documents and this script do not change tconv.
+    here = os.path.dirname(os.path.realpath(__file__))
+    root = git_info(here) and subprocess.run(['git', '-C', here, 'rev-parse', '--show-toplevel'],
+                                             capture_output=True, text=True).stdout.strip()
+    ignore = ['doc', os.path.relpath(os.path.realpath(__file__), root)] if root else []
+    return dict(tconv=git_info(root or here, ignore),
                 transforms_dir=directory(args.transforms_dir), test_data=directory(args.test_data))
 
 
@@ -520,10 +539,14 @@ def changes(previous, entries, names, meta):
 
 
 #  The per-transform table document: coverage.md, headings one level down.
-def table_doc(entries, meta, note):
+def table_doc(entries, meta, note, cldr_note=None):
     src = meta['source']
     t = src['transforms_dir']
-    cldr = 'CLDR transforms in `%s`%s' % (t['path'], ' at ' + describe_commit(t['git']) if t and t['git'] else '') if t else 'CLDR transforms'
+    home = os.path.expanduser('~')
+    shown = '~' + t['path'][len(home):] if t and t['path'].startswith(home + os.sep) else t and t['path']
+    cldr = 'CLDR transforms in `%s`%s' % (shown, ' at ' + describe_commit(t['git']) if t and t['git'] else '') if t else 'CLDR transforms'
+    if cldr_note:
+        cldr += ', ' + cldr_note
     branch = src['tconv']['branch'] if src['tconv'] else None
     head = ('# tconv coverage: per-transform table\n\n'
             'Generated by `tools/ldml/tconv_coverage.py` (tconv%s at %s%s; %s). '
@@ -635,6 +658,7 @@ def main():
     ap.add_argument('--force', action='store_true', help='with --update: accept directories other than those of the previous results')
     ap.add_argument('--table-doc', metavar='PATH', help='write the per-transform table document')
     ap.add_argument('--note', help='for --table-doc: what the tconv version includes')
+    ap.add_argument('--cldr-note', help='for --table-doc: about the CLDR data (e.g. local fixes applied or not)')
     ap.add_argument('--report-doc', metavar='PATH', help='rewrite the generated blocks of the status report')
     args = ap.parse_args()
     if (args.only or args.builtins or args.blocked or args.force) and not args.update:
@@ -664,7 +688,7 @@ def main():
         for name in entries:
             if name not in names:
                 entries[name]['rc'] = previous[name]['rc']
-    run_plans(args, entries, names)
+    names = plan_with_users(args, entries, names, previous)
     classify(args, entries)
     today = datetime.date.today().isoformat()
     checked = dict(tconv=source['tconv'] and source['tconv']['commit'], date=today)
@@ -694,7 +718,7 @@ def main():
             f.write(changes(previous, entries, names, meta))
     if args.table_doc:
         with open(args.table_doc, 'w', encoding='utf-8') as f:
-            f.write(table_doc(entries, meta, args.note))
+            f.write(table_doc(entries, meta, args.note, args.cldr_note))
     if args.report_doc:
         found = update_report(args.report_doc, entries)
         print('tconv_coverage.py: %s: blocks rewritten: %s' % (args.report_doc, ', '.join(found) or 'none (no markers)'),

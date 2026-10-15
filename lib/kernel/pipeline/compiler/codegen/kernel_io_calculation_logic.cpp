@@ -180,6 +180,11 @@ no_static_max:
                 // the provisional stride writes one stride past the full strides
                 required = b.CreateAdd(required, b.getSize(mKernel->getStride()));
             }
+            if (LLVM_UNLIKELY(port.ProvisionalOverflow > 0)) {
+                // the space a consumer's provisional stride reads past the produced items
+                // (which getWritableOutputItems leaves free)
+                required = b.CreateAdd(required, b.getSize(port.ProvisionalOverflow));
+            }
             ensureSufficientOutputSpace(b, port, streamSet, produced, required, getWritableOutputItems(b, port), true);
         }
     }
@@ -1734,8 +1739,9 @@ Value * PipelineCompiler::getWritableOutputItems(KernelBuilder & b, const Buffer
             c = b.CreateRoundDownRational(c, b.getBitBlockWidth());
         }
         Constant * overflow = nullptr;
-        if (LLVM_UNLIKELY(port.EmptyOverflow > 0)) {
-            overflow = b.getSize(port.EmptyOverflow);
+        const auto reserved = std::max(port.EmptyOverflow, port.ProvisionalOverflow);
+        if (LLVM_UNLIKELY(reserved > 0)) {
+            overflow = b.getSize(reserved);
         }
         writable = buffer->getLinearlyWritableItems(b, produced, c, overflow);
     }

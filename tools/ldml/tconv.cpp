@@ -132,12 +132,12 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, HexJava, HexUnicode, HexC, HexXML, HexPerl, HexDecode};
+enum class Transform {NFD, NFKD, NFC, NFKC, Lower, Upper, Title, CaseFold, HexJava, HexUnicode, HexC, HexXML, HexPerl, HexDecode};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
     {"Any-NFC", Transform::NFC}, {"Any-NFKC", Transform::NFKC},
-    {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title},
+    {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title}, {"Any-CaseFold", Transform::CaseFold},
     {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},
     {"Any-Hex/Unicode", Transform::HexUnicode}, {"Any-Hex/C", Transform::HexC},
     {"Any-Hex/XML", Transform::HexXML},  {"Any-Hex/Perl", Transform::HexPerl},
@@ -470,6 +470,9 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
             break;
         case Transform::Upper:
             OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::uc, BasisBits));
+            break;
+        case Transform::CaseFold:
+            OutputBytes = BytesOf(P, CaseMapBasis(P, UCD::cf, BasisBits));
             break;
         case Transform::Title:
         case Transform::HexJava:
@@ -1640,7 +1643,7 @@ using FusedContext = std::vector<FusedItem>;
 
 static bool isSetRE(re::RE * re) {
     using namespace re;
-    if (isa<CC>(re) || isa<PropertyExpression>(re) || isa<Any>(re) || isa<re::Diff>(re) || isa<re::Intersect>(re)) return true;
+    if (isa<CC>(re) || isa<PropertyExpression>(re) || isa<re::Any>(re) || isa<re::Diff>(re) || isa<re::Intersect>(re)) return true;
     if (Name * n = dyn_cast<Name>(re)) {
         return !ldml::isFunctionCall(n) && n->getDefinition() && isSetRE(n->getDefinition());
     }

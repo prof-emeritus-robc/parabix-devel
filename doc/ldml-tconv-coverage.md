@@ -1,12 +1,19 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `02e77ee59`: with rules with text
+*Status of `tools/ldml/tconv` on branch LDML at `89e922e4f`: with rules with text
 to revisit composed at compile time (W6), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
 MultipleCaptureMultipleReplacement rules (W3, §5), insertion rules (W4, §4.2),
-and large mappings multiplexed (§4.3), against CLDR `common/transforms` and
-`common/testData/transforms` at commit `7cdeb9e` (2026-10-09). October 14,
-2026.*
+large mappings multiplexed (§4.3), captures referred to out of order (SwapBack,
+MoveRegions, §5), function calls on captures of single characters (W5, §5), and
+the built-ins Hex-Any (all variants) and Any-CaseFold (§2.1), against CLDR
+`common/transforms` and `common/testData/transforms` at commit `7cdeb9e`
+(2026-10-09). October 15, 2026.*
+
+*This run used the CLDR transforms without the local fixes of W7 (§5), so
+Latin-ug and ug-Latin, implementable with them, are counted as blocked by W7
+here, and Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather
+than the W3, W4 and W6 problems they have with the fixes.*
 
 This report covers:
 
@@ -25,16 +32,28 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 
 | | names | implementable |
 |---|---:|---:|
-| Built-in transforms (UTS #35 / ICU) | 29 | 13 |
-| Transforms defined by CLDR files (381 files) | 425 | 338 (80%) |
-| …of which public (not `visibility="internal"`) | 393 | 309 (79%) |
+| Built-in transforms (UTS #35 / ICU) | 30 | 21 |
+| Transforms defined by CLDR files (381 files) | 425 | 344 (81%) |
+| …of which public (not `visibility="internal"`) | 393 | 313 (80%) |
 
 - **Tests.** Of the 284 CLDR test files, 230 belong to implementable transforms.
   Their 240,668 cases fail only in two files, where the test data disagrees with
   the rules and with ICU (§3): ka-ka_Latn/BGN (215 cases) and my-my_FONIPA (2).
   The coverage script now runs each case as a text of its own (`tconv --lines`
   for the cases that fail in the text of all the cases), which removed 10,675
-  spurious failures.
+  spurious failures. None of the transforms made implementable since `02e77ee59`
+  has CLDR test data; they were checked against ICU 78.3 (§2.3).
+- **Function calls on captures** (W5, §5), `&Any-Lower($1)`: the rule is
+  replaced by rules for the characters of the capture, grouped by the value of
+  the call. az-, el-, lt- and tr-Title, Latn-Ethi/ALALOC and Latn-Ethi/SERA are
+  implementable.
+- **Captures referred to out of order** (§5): two captures of fixed lengths in
+  reverse order (`($a) ($b) → $2 $1`) by SwapBack, and captures of variable
+  lengths moved after a later one by MoveRegions. Thai-ThaiLogical and
+  ThaiLogical-Thai are implementable, and Thai-Latn is left blocked only by
+  `Any-BreakInternal` (W8).
+- **Built-ins** (§2.1): Hex-Any and its variants (Java, C, Perl, Unicode, XML,
+  XML10), with the bare Hex-Any decoding all the forms, and Any-CaseFold.
 - **Insertion rules** (W4, §4.2), such as `a { } [$E $EO $EU] → $sep`: in groups
   of their own, and in groups with single-character rules, whose before contexts
   then see the text inserted, as in ICU. With them, ConjoiningJamo-Latin,
@@ -71,21 +90,24 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     cases.
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
-  - W3 variable-length texts: 26 transforms (am_FONIPA-am and the 18 `*-am`
+  - W3 variable-length texts: 31 transforms (am_FONIPA-am and the 18 `*-am`
     transforms through it, am-am_FONIPA and the three `am-*` transforms through
-    it, Latn-Arab, blt-blt_FONIPA, byn Xaleget);
-  - W6 revisits not composed (unbounded runs, variable-length texts): 25;
-  - W5 back-references and function calls: 8.
+    it, Latn-Arab, blt-blt_FONIPA, byn Xaleget, my-Zawgyi, and the Pinyin and
+    Bopomofo transforms);
+  - W6 revisits not composed (unbounded runs, variable-length texts): 23;
+  - W7 parser semantics: 4 in this run (2 with the local CLDR fixes);
+  - W5 back-references: 2 (Kana-Latn, and Hira-Latn through it).
 
   Each of these is concentrated in a few rule files (§5).
 
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          338  ████████████████████████████████
-+ W3 (rest)                  364  ██████████████████████████████████
-+ W6 revisit (rest)          402  ██████████████████████████████████████
-+ W5 captures/functions      420  ███████████████████████████████████████
-+ W4, W10                    423  ████████████████████████████████████████
+now                          344  ████████████████████████████████
++ W3 (rest)                  375  ███████████████████████████████████
++ W6 revisit (rest)          411  ██████████████████████████████████████
++ W5 back-references         417  ███████████████████████████████████████
++ W7 parser semantics        421  ████████████████████████████████████████
++ W10, W4                    423  ████████████████████████████████████████
 + W8, W9                     425  ████████████████████████████████████████
 ```
 
@@ -95,13 +117,14 @@ surface only after others are fixed.
 
 ## 2. What works
 
-### 2.1 Built-in transforms (13 of 29)
+### 2.1 Built-in transforms (21 of 30)
 
 | implemented | how |
 |---|---|
 | Any-NFD, Any-NFKD | `NFD_PipelineBuilder` (as the `nfd`/`nfkd` tools) |
 | Any-NFC, Any-NFKC | the focused NFC pipeline of the `nfc` tool (NFKC = NFKD then NFC) |
 | Any-Lower, Any-Upper | string override properties `lc`/`uc`, with the Final_Sigma context for Lower |
+| Any-CaseFold | string override property `cf` (`89e922e4f`) |
 | Any-Title | Unicode toTitlecase (word boundaries + `tc`/`lc`), issue #16 |
 | Any-Null | identity |
 | Any-Hex/Unicode | `UnicodeHexPipeline`: `U+` and 4–6 hex digits |
@@ -109,6 +132,7 @@ surface only after others are fixed.
 | Any-Hex/C | `\u` and 4 hex digits, or `\U` and 8 for characters beyond U+FFFF (`6b6b08cb6`) |
 | Any-Hex/XML | `&#x`, 1–6 hex digits and `;` (`0686a09d7`) |
 | Any-Hex/Perl | `\x{`, 1–6 hex digits and `}` (`c2bd705f6`) |
+| Hex-Any/Java, /C, /Perl, /Unicode, /XML, /XML10, Hex-Any | `HexAnyPipeline` (`41df85c9e`): decodes the escapes of the variant; Hex-Any decodes all of them |
 
 `Any-Hex/Unicode`, `Any-Hex/Java` and `Any-Hex` are byte-identical to ICU 78.3 on:
 
@@ -122,20 +146,31 @@ path of `localCharacterMapping`). Any-Hex/XML and Any-Hex/Perl are identical to
 ICU 78.3 on 3,000 random characters and the edge values, unfiltered and within a
 filter (the masked path had 8 instead of 9 positions for five hex digits).
 
+**Hex-Any.** The escapes are those of ICU 78: `\uXXXX` (Java), also
+`\UXXXXXXXX` (C), `\x{X..}` with 1 to 6 digits (Perl), `U+XXXX` with 4 to 6
+(Unicode), `&#xX..;` with 1 to 6 (XML) and `&#D..;` with 1 to 7 decimal digits
+(XML10). `HexEscapes` recognizes them (within a filter, entirely in the mask),
+`HexDecode` and `DecimalDecode` compute their values, the rest of each escape
+(and escapes of values beyond U+10FFFF) is deleted, and `CombineSurrogates`
+makes a pair of surrogates decoded one after the other a single codepoint (a
+lone surrogate becomes U+FFFD). Identical to ICU 78.3 on random text with
+escapes of all the forms (8 × 2,000 lines for each variant, and within
+filters), also with segment sizes 1 and 2, 3 threads, and `-EnableAsserts
+-VerifyIR`; Any-Hex/X followed by Hex-Any/X is the identity for Java, C, Perl,
+Unicode and XML. ICU's skipping of the character after a decoded pair or a
+deleted escape is not reproduced (§3.3).
+
 Not implemented:
 
 - `Any-Hex/XML10`;
-- all `Hex-Any/*`;
-- `Any-CaseFold`, `Any-Remove`, `Any-FCD`, `Any-FCC`, `Any-Name`, `Name-Any` and
+- `Any-Remove`, `Any-FCD`, `Any-FCC`, `Any-Name`, `Name-Any` and
   `Any-BreakInternal`.
 
-Two notes on the registry (`lib/ldml/transform_registry.cpp`):
+The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
+`Hex-Any/Plain`, which ICU 78.3 does not have. `Hex-Any` is no longer an alias
+of `Hex-Any/Java`: as in ICU, it accepts every escape form.
 
-- It lists `Any-Hex/Plain` and `Hex-Any/Plain`, which ICU 78.3 does not have.
-- It makes `Hex-Any` an alias of `Hex-Any/Java`. In ICU, the bare `Hex-Any`
-  accepts every escape form.
-
-### 2.2 Transforms defined by rules (338 of 425)
+### 2.2 Transforms defined by rules (344 of 425)
 
 Implementable now:
 
@@ -157,12 +192,16 @@ Implementable now:
 - with variable-length texts: und_FONIPA-fa, -ar and -chr and the transforms to
   Persian, Arabic and Cherokee through them (about 50), InterIndic-Arabic and the
   nine Indic→Arabic transforms, ro, rm, chr and es_419 FONIPA, Latin-ASCII,
-  de-ASCII, ug-Latin, hy-hy_Latn/BGN, Latn-Hebr, tr-Lower and az-Lower;
+  de-ASCII, hy-hy_Latn/BGN, Latn-Hebr, tr-Lower and az-Lower (and ug-Latin and
+  Latin-ug, with the local fixes of W7);
 - with MultipleCaptureMultipleReplacement rules: si-si_FONIPA, si-si_Latn,
   ta-ta_FONIPA, si-ar, si-fa, si-chr; with identity rules, vec-vec_FONIPA;
 - with insertion rules: ConjoiningJamo-Latin, Hang-Latn, Jamo-Latn,
   my-my_FONIPA, my-ar, my-fa, my-chr, Han-Spacedhan, Hani-Latn, Hant-Latn and
-  Han-Latin/Names.
+  Han-Latin/Names;
+- with captures in reverse order: Thai-ThaiLogical and ThaiLogical-Thai;
+- with function calls on captures: az-, el-, lt- and tr-Title,
+  Latn-Ethi/ALALOC and Latn-Ethi/SERA.
 
 The per-transform status is in the table.
 
@@ -228,6 +267,22 @@ strings (with deletions and some contextual rules) is identical to ICU's
 characters, Hani-Latn differs from ICU 78.3 in 95 lines: in the 92 readings
 checked, tconv gives the reading of the CLDR rules (`緕` → `zī`, ICU `qi`), whose
 data is newer than ICU's; one is a fullwidth comma (§3.3).
+
+**Captures out of order.** Against ICU's `createFromRules`, all identical:
+
+- 156 random rule sets of two captures of fixed lengths in reverse order, with
+  other rules, contexts and filters (SwapBack);
+- 47 random rule sets with two or three captures of variable lengths moved, with
+  texts, replacements, contexts, other rules and filters (MoveRegions).
+
+Thai-ThaiLogical and ThaiLogical-Thai are identical to ICU 78.3 on 2,000 random
+lines. The `SwapBack` kernel has tests of its own in `test_bit_movement`
+(regions crossing 128-, 256- and 512-bit blocks, segment sizes 1 and 3).
+
+**Function calls (W5).** az-, el-, lt- and tr-Title, Latn-Ethi/ALALOC and
+Latn-Ethi/SERA are identical to ICU 78.3 on 3,000 random lines each, and random
+rule sets calling the case mappings on captures are identical to ICU's
+`createFromRules`.
 
 **Regression of the fused kernels.** The fused implementation was compared with
 the previous tconv on every implementable transform (205 names). Each ran on:
@@ -397,8 +452,11 @@ correction, between 108 and 1,853 of each 5,000 differ.
 
 - **Any-Title** implements Unicode toTitlecase with word boundaries (issue #16).
   ICU's titlecase transliterator instead uses its own cased/case-ignorable
-  context test. This should be confirmed, since the locale Title transforms
-  (az-, tr-, lt-, el-Title) will be judged against ICU.
+  context test. This should be confirmed. The locale Title transforms (az-, tr-,
+  lt-, el-Title) do not use Any-Title: their rules call Any-Lower on captures,
+  and they are identical to ICU 78.3 (§2.3).
+- **Hex-Any.** After a decoded surrogate pair or a deleted escape, ICU 78.3 skips
+  the next character, leaving it undecoded; tconv decodes it.
 - **Global filters.** ICU 74 ignores the global filter of a transform made of a
   single rule set, with no `::` steps. tconv applies it, as UTS #35 specifies.
 - **Normalization.** On synthetic runs of many combining marks, ICU's `uconv`
@@ -627,14 +685,18 @@ those of invoked transforms).
 
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 50 | 26 | M–L (the rest) |
-| W6 text to revisit, not composed | 44 | 25 | L (with W3) |
-| W5 back-references and function calls | 19 | 8 | M–L |
-| W4 insertion rules (with string rules) | 2 | 0 | M |
+| W3 variable-length texts | 48 | 31 | M–L (the rest) |
+| W6 text to revisit, not composed | 40 | 23 | L (with W3) |
+| W5 back-references | 6 | 2 | M |
+| W7 parser semantics (#5, #6) | 4 | 4 | S |
 | W10 engine lookaheads | 1 | 0 | M |
-| W7 parser semantics (#5, #6) | 0 | 0 | S |
-| W8 built-ins (Any-BreakInternal) | 1 | 0 | L |
+| W4 insertion rules (with string rules) | 1 | 0 | M |
+| W8 built-ins (Any-BreakInternal) | 1 | 1 | L |
 | W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 1 | 1 | L |
+
+(W7 counts the run without the local CLDR fixes; with them, it blocks nothing,
+Latin-ug and ug-Latin are implementable, and the two Greek UNGEGN transforms
+need W3, W4 and W6.)
 
 Done since the first assessment:
 
@@ -649,10 +711,14 @@ Done since the first assessment:
 - W3 MultipleCaptureMultipleReplacement rules (`1bc9ef253`), identity rules and
   starts by the first set of B1 (`08c303c30`);
 - W4 insertion rules (`3b6ee29fa`, `4f26e7d02`, `a3a64eda2`), and the scale of
-  Han-Latin (`02e77ee59`).
+  Han-Latin (`02e77ee59`);
+- two captures of fixed lengths in reverse order (`7e927d2d7`, SwapBack), and
+  captures of variable lengths moved out of order (`a090553b4`, MoveRegions);
+- W5 function calls on captures of single characters (`687470e89`);
+- the built-ins Hex-Any (`41df85c9e`) and Any-CaseFold (`89e922e4f`).
 
-W7 no longer blocks anything because the proposed CLDR fixes are applied in the
-local `~/cldr` checkout (see W7 below).
+W7 blocks nothing where the proposed CLDR fixes are applied locally (see W7
+below); this run did not apply them.
 
 **W6 revisit** (`x } [^x] → | ks`, `t } [^hṭ̱] → $ta | $virama`). The text after
 `|` is processed again by the same group. Most such rules are now replaced at
@@ -755,18 +821,43 @@ around a character of a capture. The starts of the matches are found by the
 first characters of T0, or of B1 where it begins with a set (`08c303c30`), or
 from the ends of the matches where no match may end within another.
 
-W3 alone now blocks 26 transforms:
+**Captures out of order.** A rule `T0 (B1) T1 (B2) T2 → R0 $2 R1 $1 R2`, with
+B1 and B2 of fixed lengths, is planned as the rule with the captures in order,
+`→ R0 R1 $1 $2 R2`, and the region `R1 B1 B2` of each match is then made
+`B2 R1 B1` by `SwapBack` (`7e927d2d7`). The first character of B1 marks the
+region, and the marks are kept in step with the text as positions are inserted
+and deleted. Where a before context of the group may tell the order of the
+characters of the regions apart (ICU matching it against the converted text),
+the rules are not implemented. More generally (`a090553b4`), where one capture
+j of variable length is referred to before captures i to j − 1, the rule is
+planned in order, the captures are found by a possessive walk from the starts of
+the matches (`CaptureWalk`), and the region from T(i+1) to capture j is moved
+after capture j: its length is carried to the end of capture j (`MoveRegions`,
+`MoveCounts`), and its characters are taken out (`FilterByMask`) and put into as
+many positions inserted there (`InsertionSpreadMask`, `MergeByMask`). The
+starts of the matches are also found from their ends where Tk is empty and the
+last capture ends with a set not occurring before it in a match. Such moves are
+planned in Latin-NumericPinyin, blt-blt_FONIPA, my-Zawgyi and Zawgyi-my, which
+have other problems.
+
+W3 alone now blocks 31 transforms:
 
 - am_FONIPA-am and the 18 `*-am` transforms through it: three
   MultipleCaptureMultipleReplacement rules whose matches may overlap other such
-  rules, or string rules;
+  rules, or string rules, or whose starts cannot be told apart;
 - am-am_FONIPA and the three `am-*` transforms through it: an insertion that is
   not next to a capture (`($IPA_CONSONANT) ([jw]? $IPA_VOWEL) ፝ → $1 ː $2 ː`);
 - Latn-Arab (`t ($notAbove+) ̈ → ة | $1`, with text to revisit);
-- blt-blt_FONIPA (before contexts that the conversions change) and byn Xaleget. The W3 rules that remain mostly also
-have other problems:
+- blt-blt_FONIPA and Latin-NumericPinyin (before contexts that the conversions
+  change), and Latn-Bopo through Latin-NumericPinyin;
+- NumericPinyin-Latin (`([Oo]) ([$vowel-[AEae]]+) 4 → $1 ̀ $2`, whose matches
+  other such rules may overlap), and Bopo-Latn through it;
+- my-Zawgyi and byn Xaleget (string rules that may overlap
+  MultipleCaptureMultipleReplacement rules).
 
-- results that reorder or repeat captures (W5);
+The W3 rules that remain mostly also have other problems:
+
+- back-references (W5);
 - runs followed by an after context (Grek-Latn/UNGEGN, cy-cy_FONIPA, Zawgyi);
 - runs of sets with strings (`[{i̯}ij]+`);
 - text boundaries in the text (`\. ([$])`);
@@ -793,17 +884,27 @@ Latn-Cyrl, Hans-Hant, und_FONIPA-ar, es-ar, es-fa, es_419-ar and es_419-fa. They
 tried (§2.3), but are not known to be exact. Applying the correction to the rules
 with such contexts only, rather than to the whole group, would remove the limit.
 
-**W5.**
+**W5.** Function calls on captures of single characters are implemented
+(`687470e89`): `ldml::ExpandFunctionCalls` replaces a rule whose result calls a
+transform on such a capture, `&T($k)`, by rules for the characters of the
+capture grouped by the value of T on them: the capture is restricted to the
+group (or replaced by its set, if no longer referred to), and the call by the
+value, or by `$k` for the characters T leaves unchanged. It runs before revisits
+are composed. tconv evaluates Any-Lower, Any-Upper and Any-Title by the full case
+mappings, and other transforms through their plans, on single characters. This
+made az-, el-, lt- and tr-Title and Latn-Ethi/ALALOC and /SERA implementable, and
+removed W5 from the Pinyin transforms and my-Zawgyi.
 
-- az-, tr-, lt- and el-Title are blocked only by `&Any-Lower($1)`, a masked
-  application of Lower. That is close to the existing masked machinery, but
-  depends on the Title-semantics decision (§3.3).
-- Thai-ThaiLogical and its inverse need back-references.
+W5 now needs only back-references, in 6 transforms: Kana-Latn
+(`t (y* $vowel) { ヽ $voice → d $1`, 18 rules) and Hira-Latn through it,
+Zawgyi-my, fa-fa_FONIPA, sk_FONIPA-ja and sk-ja. It alone blocks Kana-Latn and
+Hira-Latn.
 
 **W4 insertion rules** (§4.2) are implemented. They remain only in Grek-Latn and
 Grek-Latn/UNGEGN (`[Pp] { } [ΣςσϷϸϺϻ] → \'`), in groups with string rules, and
 with rules whose after contexts have repetitions, which the correction kernel
-does not match. Both transforms also need W3 and W6.
+does not match. Both transforms also need W3 and W6 (in this run, Grek-Latn/UNGEGN
+reports only its W7 parse problem).
 
 **W10 engine lookaheads.** cy-cy_FONIPA's after contexts `$cons* $end` repeat
 `$cons`, a set with strings (`{m̥}{d͡ʒ}`). ICU matches it possessively, taking
@@ -818,11 +919,14 @@ differs (`yw } $cons* [^bdm$]` on `ywm̥`). cy-cy_FONIPA also needs W3.
   which `5efe07bd2` rejects as a ruleset bug.
 - Latin-ug and ug-Latin have `[:separator:]*` matching the empty text.
 
-Both have proposed CLDR fixes, applied locally in `~/cldr`.
+Both have proposed CLDR fixes, applied locally in `~/cldr`. This run used
+transforms without them (`~/transforms`), so these four transforms are reported
+as blocked by W7.
 
-**W8 and W9.** Thai-Latin needs `Any-BreakInternal`, which uses a dictionary
-word break. Jpan-Latn needs Hira-Latn and Kana-Latn (W5) and the scale work of
-W9; the Han transforms now compile (§4.3).
+**W8 and W9.** Thai-Latn now needs only `Any-BreakInternal`, which uses a
+dictionary word break (its Thai-ThaiLogical step is implemented). Jpan-Latn
+needs Hira-Latn and Kana-Latn (W5) and the scale work of W9; the Han transforms
+now compile (§4.3).
 
 The per-transform table lists the problem classes of every transform.
 
@@ -836,16 +940,19 @@ The per-transform table lists the problem classes of every transform.
    - Replace the rounds of the converted-text correction by a Pablo `While`
      fixpoint (issue #21), exact for chains of any length.
 2. **W3 and W6.** The overlapping MultipleCaptureMultipleReplacement rules of
-   am_FONIPA-am (26 transforms), and the revisits not composed (25 transforms,
-   mostly unbounded runs, which the run rules of W3 now make approachable).
+   am_FONIPA-am (19 transforms) and NumericPinyin-Latin, before contexts that the
+   conversions change in MultipleCaptureMultipleReplacement rules
+   (blt-blt_FONIPA, Latin-NumericPinyin), and the revisits not composed (23
+   transforms, mostly unbounded runs, which the run rules of W3 now make
+   approachable).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
-4. **W5 Title and W7.** Small. They depend on decisions: Title semantics, and
-   whether to adopt the proposed CLDR fixes.
-5. **W9.** Jpan-Latn.
+4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. Run
+   the coverage with them (`~/cldr`), as the earlier reports did.
+5. **W5 back-references and W9.** Kana-Latn and Hira-Latn, then Jpan-Latn.
 6. **Built-ins and pipeline size.**
-   - Built-ins: the remaining `Any-Hex/*` variants, `Hex-Any/*`,
-     `Any-CaseFold`, `Any-Remove`.
+   - Built-ins: `Any-Hex/XML10`, `Any-Remove`, and `Any-BreakInternal` for
+     Thai-Latn.
    - Pipeline size: a single-kernel sort network, or sharing normalizations
      between steps.
 
@@ -887,6 +994,11 @@ tconv on every implementable transform.
 | `4f26e7d02` | W4 insertion rules with single-character rules: 334 |
 | `a3a64eda2` | repetitions in the before contexts of insertion rules: 338 |
 | `02e77ee59` | multiplexed mappings: Han-Latin compiles (46+ min → about a minute) |
+| `d424a1029`, `7e927d2d7` | SwapBack: two captures in reverse order (Thai-ThaiLogical, ThaiLogical-Thai) |
+| `730101c2e`, `41df85c9e` | HexDecode kernel; Hex-Any and its variants |
+| `687470e89` | W5 function calls on captures of single characters (az-, el-, lt-, tr-Title, Latn-Ethi/ALALOC, /SERA) |
+| `a090553b4` | captures of variable lengths referred to out of order (MoveRegions) |
+| `89e922e4f` | Any-CaseFold: 344 (without the local W7 fixes) |
 
 ## Reproducing
 
@@ -909,3 +1021,5 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
   have used `--jobs 4` on 64 GB; a full run takes about 35 minutes, mostly
   rerunning failing cases per line.)
 - When comparing tconv versions, give each run its own `-object-cache-salt`.
+- The run at `89e922e4f` used `--transforms-dir ~/transforms`, without the local
+  W7 fixes; use a checkout with them to count Latin-ug and ug-Latin.

@@ -1953,6 +1953,10 @@ void PipelineAnalysis::identifyProvisionalStrideKernels() {
                 port.RequiredOverflowSpace = std::max(port.RequiredOverflowSpace, overflow);
                 BufferPort & producerPort = mBufferGraph[in_edge(source(e, mBufferGraph), mBufferGraph)];
                 producerPort.RequiredOverflowSpace = std::max(producerPort.RequiredOverflowSpace, overflow);
+                // The producer must also leave this space free past what it produced: the provisional
+                // stride reads its inputs over a whole stride past the full strides, and the lookahead
+                // beyond it, which is past the end of the buffer if the data reaches it.
+                producerPort.ProvisionalOverflow = std::max(producerPort.ProvisionalOverflow, overflow);
             }
             for (const auto e : make_iterator_range(out_edges(kernel, mBufferGraph))) {
                 BufferPort & port = mBufferGraph[e];

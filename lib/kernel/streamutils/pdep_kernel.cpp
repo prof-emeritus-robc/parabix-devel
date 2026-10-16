@@ -256,7 +256,11 @@ void MergeByMask(PipelineBuilder & P,
     if ((a->getFieldWidth() != fw) || (b->getFieldWidth() != fw)) {
         llvm::report_fatal_error("MergeByMask called with incompatible field widths");
     }
-    if (SeparatedMergeByMask) {
+    //  StreamMergeKernel merges bit streams only: streams of wider fields (bytes) are merged
+    //  by ElemMergeKernel (a single stream) or by spreading each source (several streams, or
+    //  without ElemSpread).
+    const bool wideFields = fw >= 8;
+    if (SeparatedMergeByMask || (wideFields && !(ElemSpread && elems == 1))) {
         StreamSet * expandedA = P.CreateStreamSet(elems, fw);
         SpreadByMask(P, mask, a, expandedA);
         StreamSet * inverted = P.CreateStreamSet(1);
@@ -265,7 +269,7 @@ void MergeByMask(PipelineBuilder & P,
         SpreadByMask(P, inverted, b, expandedB);
 
         OrCombine(P, expandedA, expandedB, merged);
-    } else if (ElemSpread && (elems == 1) && (fw >= 8)) {
+    } else if (wideFields) {
         P.CreateKernelCall<ElemMergeKernel>(mask, a, b, merged);
     } else {
         unsigned streamOffset = 0;

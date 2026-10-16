@@ -26,8 +26,14 @@ enum PreTokenizerMode {
     sequence_whitespace_punctuation
 };
 
-// Split behavior modes for delimiter handling
+// Split behavior modes for delimiter handling.
+// NOTE: "removed" here is HF's real Split(pattern, behavior="removed") --
+// the MATCH is deleted entirely, keeping only the gaps. This is distinct
+// from "excludewhitespace", which several modes force internally and which
+// only ever drops literal whitespace characters (it used to be misnamed
+// "removed", sharing a name with HF's concept without sharing its meaning).
 enum SplitBehaviorMode {
+    excludewhitespace,
     removed,
     isolated,
     mergedwithprevious,
@@ -47,6 +53,9 @@ struct PreTokenizerResult {
     StreamSet * AlphanumericMask;
     StreamSet * PunctuationStream;
     SplitBehaviorMode effectiveBehavior;
+    StreamSet * WordClassMask;         // \w mask; set only for simpleWordBoundaries,
+                                        // nullptr otherwise. Used by the real "removed"
+                                        // behavior to delete matched \w+ characters.
 };
 
 // Stage 2a: compute token boundaries and apply split-behavior rules.

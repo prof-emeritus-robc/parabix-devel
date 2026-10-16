@@ -50,7 +50,8 @@ static std::string SplitCode(SplitBehaviorMode s) {
     if (s == contiguous)        return "c";
     if (s == mergedwithprevious) return "p";
     if (s == mergedwithnext)    return "n";
-    if (s == removed)           return "r";
+    if (s == excludewhitespace) return "r";
+    if (s == removed)           return "x";
     return "d";
 }
 
@@ -321,7 +322,7 @@ protected:
         PabloAST * result = nullptr;
         if (mBehavior == contiguous)        result = pb.createOr(SplitRun1, SplitRunFollow);
         else if (mBehavior == mergedwithprevious) result = SplitRunFollow;
-        else if (mBehavior == removed)      result = SplitRunFollow;
+        else if (mBehavior == excludewhitespace) result = SplitRunFollow;
         else if (mBehavior == mergedwithnext) result = SplitRun1;
         else /* isolated */                 result = pb.createOr(SplitMarks, SplitRunFollow);
         writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
@@ -609,16 +610,29 @@ protected:
 static void whiteSpaceLogic(PipelineBuilder & P,
                              StreamSet * U21Basis,
                              StreamSet * WSmask,
+                             StreamSet * NumberStream,
                              StreamSet * results)
 {
-    re::RE * rule1 = re::generateRE_TokenizerRule(re::WhitespaceBoundary);
-    RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::Unicode, U21Basis);
-    RE_PipelineBuilder RE_PB(P, ctxt);
+    // generateRE_TokenizerRule(WhitespaceBoundary) parses the same
+    // \w++|[^\w\s]++ string as BertPreTokenizer, which matchSearchPipeline
+    // mis-compiles (confirmed: drops punct->word transitions after a short
+    // possessive match). Build \w/\W transitions by hand instead, same
+    // technique used for simpleWordBoundaries.
+    auto letterPropWS = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Letter");
+    letterPropWS = cast<re::PropertyExpression>(UCD::linkAndResolve(letterPropWS));
+    StreamSet * WS_Letter = P.CreateStreamSet(1);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterPropWS, U21Basis, WS_Letter);
+    StreamSet * WS_Underscore = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<CharClassesKernel>(
+        std::vector<re::CC *>{re::makeCC((codepoint_t)0x5F)}, U21Basis, WS_Underscore);
+    StreamSet * WS_LetterOrNumber = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<OrKernel>(WS_Letter, NumberStream, WS_LetterOrNumber);
+    StreamSet * WS_WordClass = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<OrKernel>(WS_LetterOrNumber, WS_Underscore, WS_WordClass);
     StreamSet * wsb = P.CreateStreamSet(1);
-    RE_PB.matchSearchPipeline(rule1, wsb);
+    P.CreateKernelCall<BoundaryKernel>(WS_WordClass, nullptr, wsb);
     StreamSet * wsFollows = P.CreateStreamSet(1);
-    P.CreateKernelCall<SplitMarksToTokens>(removed, WSmask, wsFollows);
+    P.CreateKernelCall<SplitMarksToTokens>(excludewhitespace, WSmask, wsFollows);
     P.CreateKernelCall<OrKernel>(wsFollows, wsb, results);
     SHOW_STREAM(results);
 }
@@ -720,8 +734,8 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     SHOW_STREAM(NumberStream);
 
     // Whitespace mask: full \p{White_Space} (HF's \s -- 0x20, tab/newline, NBSP
-    // U+00A0, etc.), shared by every pretokenizer mode's "removed"/"isolated"/
-    // "merged*"/"contiguous" behavior logic below (may be replaced for bytelevel
+    // U+00A0, etc.), shared by every pretokenizer mode's "excludewhitespace"/
+    // "isolated"/"merged*"/"contiguous" behavior logic below (may be replaced for bytelevel
     // and chardelimiter, which need their own semantics). Previously this was
     // WhitespaceDetector, literal 0x20 ONLY -- correct for bytelevel's "optional
     // leading space" rule, but wrong for every other mode, which must discard
@@ -735,16 +749,37 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     SHOW_STREAM(WhitespaceMask);
 
     StreamSet * WordBoundaries = nullptr;
+    StreamSet * SW_WordClass = nullptr;  // set below iff preTokenizer == simpleWordBoundaries
 
     if (preTokenizer == simpleWordBoundaries) {
-        auto wb = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "word");
-        wb = cast<re::PropertyExpression>(UCD::linkAndResolve(wb));
+        // CLI help says "Boundaries between \w and \W characters" (a plain
+        // character-class transition), NOT full UAX#29 word segmentation --
+        // the previous UnicodePropertyLogic("word" boundary) call implemented
+        // the latter, which is a different algorithm (confirmed divergent
+        // from HF's Split(Regex(r"\w+"), isolated) on a stress sentence).
+        // \w = Letter + Number + underscore; BoundaryKernel marks every
+        // transition of that mask, same mechanism already used for
+        // chardelimiter below.
+        auto letterPropSW = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "Letter");
+        letterPropSW = cast<re::PropertyExpression>(UCD::linkAndResolve(letterPropSW));
+        StreamSet * SW_Letter = P.CreateStreamSet(1);
+        P.CreateKernelCall<UnicodePropertyKernelBuilder>(letterPropSW, U21codepoints, SW_Letter);
+
+        StreamSet * SW_Underscore = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(
+            std::vector<re::CC *>{re::makeCC((codepoint_t)0x5F)}, U21codepoints, SW_Underscore);
+
+        StreamSet * SW_LetterOrNumber = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<OrKernel>(SW_Letter, NumberStream, SW_LetterOrNumber);
+        SW_WordClass = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<OrKernel>(SW_LetterOrNumber, SW_Underscore, SW_WordClass);
+
         WordBoundaries = P.CreateStreamSet(1, 1);
-        UnicodePropertyLogic(P, wb, U21codepoints, WordBoundaries);
+        P.CreateKernelCall<BoundaryKernel>(SW_WordClass, nullptr, WordBoundaries);
     }
     else if (preTokenizer == whitespace) {
         WordBoundaries = P.CreateStreamSet(1, 1);
-        whiteSpaceLogic(P, U21codepoints, WhitespaceMask, WordBoundaries);
+        whiteSpaceLogic(P, U21codepoints, WhitespaceMask, NumberStream, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
     }
     else if (preTokenizer == bytelevel) {
@@ -821,7 +856,7 @@ PreTokenizerResult buildPreTokenizerBoundaries(
             std::vector<re::CC *>{neverCC}, GPT2Codepoints, BL_WhitespaceMask);
         WhitespaceMask = BL_WhitespaceMask;
     }
-    else if (preTokenizer == sequence_whitespace_punctuation) {
+    else if (preTokenizer == bert || preTokenizer == sequence_whitespace_punctuation) {
         // HF reference is Sequence([WhitespaceSplit(), Punctuation()]) --
         // WhitespaceSplit splits ONLY on literal whitespace runs (its own
         // "\S+(?!\S)|\s+(?!\s)" rule), unlike Whitespace()'s \w/[^\w\s]
@@ -902,24 +937,59 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     P.CreateKernelCall<UnicodeAlphanumericDetector>(U21codepoints, AlphanumericMask, LetterStream, NumberStream);
     SHOW_STREAM(AlphanumericMask);
 
-    // Compute effective behavior (some pretokenizers force "removed")
+    // Compute effective behavior (some pretokenizers force "excludewhitespace")
     SplitBehaviorMode effectiveBehavior = splitBehavior;
     if (preTokenizer == bert || preTokenizer == sequence_whitespace_punctuation ||
         preTokenizer == whitespacesplit || preTokenizer == whitespace ||
         preTokenizer == chardelimiter) {
-        effectiveBehavior = removed;
+        effectiveBehavior = excludewhitespace;
     }
 
     // Apply behavior kernel to compute insertion boundaries
     StreamSet * insertionBoundaries = U21_tokenBoundaries;
-    if (effectiveBehavior == removed) {
+    if (effectiveBehavior == excludewhitespace) {
         StreamSet * notWhitespaceMask = P.CreateStreamSet(1);
         P.CreateKernelCall<NotKernel>(WhitespaceMask, notWhitespaceMask);
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWhitespaceMask, insertionBoundaries);
-    } else if (effectiveBehavior == isolated && preTokenizer != digits && preTokenizer != punctuation) {
+    } else if (effectiveBehavior == removed && preTokenizer == simpleWordBoundaries) {
+        // HF's real Split(pattern, "removed"): the matched run (here, \w+)
+        // is deleted entirely, keeping only the gaps. The actual character
+        // deletion happens in stage 2b (applyTokenSeparatorInsertion) via
+        // FilterByMask on WordClassMask; here we only need to drop the
+        // boundary mark at each word-run start so stage 2b's LF-insertion
+        // doesn't insert a separator for a run that's about to vanish
+        // (leaving a stray empty token).
+        StreamSet * notWordClass = P.CreateStreamSet(1);
+        P.CreateKernelCall<NotKernel>(SW_WordClass, notWordClass);
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWordClass, insertionBoundaries);
+    } else if (effectiveBehavior == isolated && preTokenizer != digits && preTokenizer != punctuation
+               && preTokenizer != simpleWordBoundaries) {
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
+    } else if (effectiveBehavior == mergedwithprevious && preTokenizer == simpleWordBoundaries) {
+        // HF's Split(pattern, "merged_with_previous") merges each MATCH (here,
+        // a \w+ run) backward into the non-matching run before it, by dropping
+        // the match's own run-start mark -- keep only \W-run starts. The very
+        // first run, if it's a word, has nothing to merge into and would need
+        // to keep its mark, but RemoveFirstMarkKernel unconditionally clears
+        // position 0 afterwards anyway, so no extra case is needed (verified
+        // against HF on leading/trailing word and gap combinations).
+        StreamSet * notWordClass = P.CreateStreamSet(1);
+        P.CreateKernelCall<NotKernel>(SW_WordClass, notWordClass);
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWordClass, insertionBoundaries);
+    } else if (effectiveBehavior == mergedwithnext && preTokenizer == simpleWordBoundaries) {
+        // Mirror of the above: each match merges forward into the following
+        // gap, by dropping the GAP's run-start mark instead -- keep only
+        // \w-run starts.
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, SW_WordClass, insertionBoundaries);
+    } else if (effectiveBehavior == contiguous && preTokenizer == simpleWordBoundaries) {
+        // Confirmed identical to "isolated" for a \w+/\W+ alternation (no
+        // adjacent same-class runs are possible), so no transformation needed.
+        insertionBoundaries = U21_tokenBoundaries;
     } else if (effectiveBehavior == mergedwithprevious) {
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
@@ -943,7 +1013,8 @@ PreTokenizerResult buildPreTokenizerBoundaries(
         U21codepoints,
         AlphanumericMask,
         PunctuationStream,
-        effectiveBehavior
+        effectiveBehavior,
+        SW_WordClass
     };
 }
 
@@ -981,12 +1052,28 @@ StreamSet * applyTokenSeparatorInsertion(
     StreamSet * tokenMask = P.CreateStreamSet(1);
     P.CreateKernelCall<NotKernel>(spreadWhitespaceMask, tokenMask);
 
-    if (result.effectiveBehavior == removed) {
+    if (result.effectiveBehavior == excludewhitespace) {
         StreamSet * newBasis = P.CreateStreamSet(21);
         FilterByMask(P, tokenMask, tokenBasis, newBasis);
         tokenBasis = newBasis;
         StreamSet * newBoundaries = P.CreateStreamSet(1);
         FilterByMask(P, tokenMask, spreadTokenBoundaries, newBoundaries);
+        spreadTokenBoundaries = newBoundaries;
+    } else if (result.effectiveBehavior == removed && result.WordClassMask != nullptr) {
+        // HF's real "removed": delete the matched \w+ characters entirely,
+        // same FilterByMask mechanism as excludewhitespace above, keyed on
+        // word-class instead of whitespace. Guarded on WordClassMask being
+        // set (only simpleWordBoundaries populates it) so a stray
+        // --behavior=removed on another mode is a safe no-op, not a crash.
+        StreamSet * spreadWordClassMask = P.CreateStreamSet(1);
+        SpreadByMask(P, lineInsertMask, result.WordClassMask, spreadWordClassMask);
+        StreamSet * notWordClassMask = P.CreateStreamSet(1);
+        P.CreateKernelCall<NotKernel>(spreadWordClassMask, notWordClassMask);
+        StreamSet * newBasis = P.CreateStreamSet(21);
+        FilterByMask(P, notWordClassMask, tokenBasis, newBasis);
+        tokenBasis = newBasis;
+        StreamSet * newBoundaries = P.CreateStreamSet(1);
+        FilterByMask(P, notWordClassMask, spreadTokenBoundaries, newBoundaries);
         spreadTokenBoundaries = newBoundaries;
     }
 

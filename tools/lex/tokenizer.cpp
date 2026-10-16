@@ -269,7 +269,9 @@ static cl::opt<SplitBehaviorMode> SplitBehavior(
     cl::desc("Split delimiter behavior:"),
     cl::init(isolated),
     cl::values(
-        clEnumValN(removed,          "removed",          "Only keep word/punctuation boundaries, exclude whitespace"),
+        clEnumValN(excludewhitespace,"excludewhitespace","Only keep word/punctuation boundaries, exclude whitespace"),
+        clEnumValN(removed,          "removed",          "Delete the matched run entirely, keep only the gaps "
+                                                          "(HF Split(behavior=\"removed\")-equivalent; simplewordboundaries only)"),
         clEnumValN(isolated,         "isolated",         "Keep token boundaries AND add space boundaries"),
         clEnumValN(mergedwithprevious,"mergedwithprevious","Attach whitespace to previous word"),
         clEnumValN(mergedwithnext,   "mergedwithnext",   "Attach whitespace to next word"),

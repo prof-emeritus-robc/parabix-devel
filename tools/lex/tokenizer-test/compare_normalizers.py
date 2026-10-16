@@ -61,6 +61,10 @@ MODES = {
                                         handle_chinese_chars=True,
                                         strip_accents=False,
                                         lowercase=False),
+    "bertcleantext":     BertNormalizer(clean_text=True,
+                                        handle_chinese_chars=False,
+                                        strip_accents=False,
+                                        lowercase=False),
     # Built as a literal chain (Sequence), not a single BertNormalizer(strip_accents=True,...)
     # call: HF's own BertNormalizer.strip_accents uses BERT's original Mn-only accent
     # rule internally, which differs from the standalone StripAccents() class (Mn+Mc+Me,

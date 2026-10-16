@@ -413,6 +413,33 @@ static cl::opt<bool> SkipInstCombine(
     cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
     cl::init(false));
 
+// Merge kernel gate codegen. The skip path of a grouped gate (the code run on every block
+// the gate does not enter, ~95% of them) measured ~18 AArch64 instructions on a cached
+// best-config kernel: 6 ANDs, 6 for the test, 5 spill loads/stores. The two flags below
+// attack the test and the spills through PabloKernel hooks that are off by default.
+// Measured on val_4MB (bit-tier config, M3, 3 interleaved rounds, bench min, 2026-10-15):
+// --if-reduce-test -7.3%, --if-unlikely-weight=32 alone -5.9%, both -9.2%; compare_bpe MATCH.
+//
+// --if-reduce-test (PabloKernel::reduceIfTest): test each gate with a max-reduce over its
+// 32-bit lanes. AArch64: umaxv, fmov, cbz instead of cmeq, bic (a {1,2} constant kept
+// live in a register), addp, fmov, tst, b.eq. Meant for ARM; x86 bitblock_any is already
+// short. Cache tag rt1_.
+static cl::opt<bool> IfReduceTest(
+    "if-reduce-test",
+    cl::desc("BPE merge kernels: test each if condition with a max-reduce (shorter on AArch64)."),
+    cl::init(false));
+
+// --if-unlikely-weight=N (PabloKernel::ifBodyUnlikelyWeight): give every if of a grouped
+// merge kernel branch_weights 1:N. Gates are entered on ~5% of blocks, but without weights
+// LLVM treats each body as half the time hot, keeps body-only values in registers and
+// spills the skip path instead. Grouped kernels only: the flat early kernels gate on common
+// ids. 0 = off. Cache tag uwN_.
+static cl::opt<unsigned> IfUnlikelyWeight(
+    "if-unlikely-weight",
+    cl::desc("Grouped BPE merge kernels: mark if bodies unlikely with branch weights 1:N "
+             "(0 = off, the default)."),
+    cl::init(0));
+
 // --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
 // bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
 // input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
@@ -1176,6 +1203,8 @@ public:
                         + (GateMaskFold ? "gm1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
                         + (KeyCluster ? "kc1_" : "")
+                        + (IfReduceTest ? "rt1_" : "")
+                        + (grouped && IfUnlikelyWeight > 0 ? "uw" + std::to_string(IfUnlikelyWeight) + "_" : "")
                         + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
                                                  // FilterByMask, its inPlayMask is built
                                                  // locally instead of bound as an input
@@ -1193,6 +1222,9 @@ protected:
         PabloKernel::addOptimizationPasses(b, passes);
         if (SkipInstCombine) passes.push_back(OptimizationPass::NoInstCombinePass);
     }
+    // --if-unlikely-weight / --if-reduce-test (see their definitions)
+    unsigned ifBodyUnlikelyWeight() const override { return mGrouped ? (unsigned) IfUnlikelyWeight : 0u; }
+    bool reduceIfTest() const override { return IfReduceTest; }
     static std::vector<kernel::Binding> mergeInputs(
             StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
             StreamSet * nextIdIn, unsigned maxLen) {

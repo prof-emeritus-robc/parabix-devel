@@ -1,12 +1,13 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `42df6910a`: with rules with text
+*Status of `tools/ldml/tconv` on branch LDML at `96fa4766f`: with rules with text
 to revisit composed at compile time (W6), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
 MultipleCaptureMultipleReplacement rules (W3, §5), insertion rules (W4, §4.2),
 large mappings multiplexed (§4.3), captures referred to out of order (SwapBack,
 MoveRegions, §5), function calls on captures of single characters (W5, §5), and
-the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD and Any-FCC (§2.1),
+the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD, Any-FCC and
+Any-Hex/XML10 (§2.1),
 against CLDR `common/transforms` and `common/testData/transforms` at commit
 `7cdeb9e` (2026-10-09). October 15, 2026.*
 
@@ -14,7 +15,8 @@ against CLDR `common/transforms` and `common/testData/transforms` at commit
 copy (`~/transforms`, 380 files rather than 381), so Latin-ug and ug-Latin,
 implementable with them, are counted as blocked by W7 here, and
 Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather than the
-W3, W4 and W6 problems they have with the fixes. Any-FCD and Any-FCC were added
+W3, W4 and W6 problems they have with the fixes. Any-FCD, Any-FCC and
+Any-Hex/XML10 were added
 to the results by an incremental update (`tconv_coverage.py --update`, see
 [Reproducing](#reproducing)); the generated tables and blocks of this report are
 marked `<!-- coverage:… -->`.*
@@ -37,7 +39,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:summary -->
 | | names | implementable |
 |---|---:|---:|
-| Built-in transforms (UTS #35 / ICU) | 30 | 23 |
+| Built-in transforms (UTS #35 / ICU) | 30 | 24 |
 | Transforms defined by CLDR files (380 files) | 425 | 344 (81%) |
 | …of which public (not `visibility="internal"`) | 393 | 313 (80%) |
 <!-- /coverage:summary -->
@@ -59,9 +61,10 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   ThaiLogical-Thai are implementable, and Thai-Latn is left blocked only by
   `Any-BreakInternal` (W8).
 - **Built-ins** (§2.1): Hex-Any and its variants (Java, C, Perl, Unicode, XML,
-  XML10), with the bare Hex-Any decoding all the forms, Any-CaseFold, and the
+  XML10), with the bare Hex-Any decoding all the forms, Any-CaseFold, the
   normalizations Any-FCD and Any-FCC of ICU, identical to ICU 78.3's
-  Normalizer2 on `QA/Normalization` and on random text.
+  Normalizer2 on `QA/Normalization` and on random text, and Any-Hex/XML10
+  (decimal), exact on every codepoint.
 - **Insertion rules** (W4, §4.2), such as `a { } [$E $EO $EU] → $sep`: in groups
   of their own, and in groups with single-character rules, whose before contexts
   then see the text inserted, as in ICU. With them, ConjoiningJamo-Latin,
@@ -129,7 +132,7 @@ surface only after others are fixed.
 
 ## 2. What works
 
-### 2.1 Built-in transforms (23 of 30)
+### 2.1 Built-in transforms (24 of 30)
 
 | implemented | how |
 |---|---|
@@ -146,6 +149,7 @@ surface only after others are fixed.
 | Any-Hex/C | `\u` and 4 hex digits, or `\U` and 8 for characters beyond U+FFFF (`6b6b08cb6`) |
 | Any-Hex/XML | `&#x`, 1–6 hex digits and `;` (`0686a09d7`) |
 | Any-Hex/Perl | `\x{`, 1–6 hex digits and `}` (`c2bd705f6`) |
+| Any-Hex/XML10 | `&#`, 1–7 decimal digits and `;` (`XMLDecimalPipeline`, `96fa4766f`) |
 | Hex-Any/Java, /C, /Perl, /Unicode, /XML, /XML10, Hex-Any | `HexAnyPipeline` (`41df85c9e`): decodes the escapes of the variant; Hex-Any decodes all of them |
 
 `Any-Hex/Unicode`, `Any-Hex/Java` and `Any-Hex` are byte-identical to ICU 78.3 on:
@@ -159,6 +163,19 @@ Within a filter, they convert only the filtered characters (the masked fast
 path of `localCharacterMapping`). Any-Hex/XML and Any-Hex/Perl are identical to
 ICU 78.3 on 3,000 random characters and the edge values, unfiltered and within a
 filter (the masked path had 8 instead of 9 positions for five hex digits).
+
+**Any-Hex/XML10** follows `XMLHexPipeline` with decimal digits. `U21ToBCD`
+converts each codepoint to 7 decimal digits of 4 bits by BixNum division by 10
+(each quotient truncated to the width its value needs: 17, 14, 11, 7, 4 and 1
+bits); `BixSplit` splits them into 8 positions of 4 bits, as the 8 hex digits of
+a codepoint; every codepoint is spread to 10 positions (`&#`, 7 digits, `;`);
+and `XMLEscapedDecimal` writes the ASCII digits, `&#` and `;` and deletes the
+leading zeroes but the last. (A BixNum division of a dividend narrower than the
+divisor returned the divisor as the remainder, `c3e3fe5b1`.) On every codepoint
+but the surrogates (1,112,064) the output is exactly `&#N;`, also with segment
+sizes 1 and 3, 3 threads, and `-EnableAsserts -VerifyIR`; Hex-Any/XML10 restores
+the codepoints; it is identical to ICU 78.3 on 5,000 random lines of all planes,
+and with the filter `[\u0080-\U0010FFFF]` to `createFromRules`.
 
 **Hex-Any.** The escapes are those of ICU 78: `\uXXXX` (Java), also
 `\UXXXXXXXX` (C), `\x{X..}` with 1 to 6 digits (Perl), `U+XXXX` with 4 to 6
@@ -214,13 +231,12 @@ tconv's results are identical to them. Against ICU 78.3:
   (Greek and Vietnamese multiple accents, ǭ, the Sinhala and Kannada two-part
   vowels, Hangul jamo; 2,257 of them differ from NFC) identical, also with
   segment sizes 1 and 3 and 3 threads; with the filter `[^\u0302]`, identical to
-  `createFromRules`. Of six runs with `--EnableAsserts --VerifyIR`, the first
-  aborted without a diagnostic and the other five were identical; the direct
-  pipeline of Any-NFC fails a memory bounds assertion in `NFC_CandidateClass`
-  on every such run (§3.2).
+  `createFromRules`. With `--EnableAsserts --VerifyIR` the output is identical;
+  some runs that compile the pipeline afresh abort in the JIT ("Failed to
+  materialize symbols", §3.2), which runs from the object cache do not.
 
 <!-- coverage:builtins-missing -->
-Not implemented: `Any-Remove`, `Any-Name`, `Name-Any`, `Any-Hex/XML10`, `Any-Hex/Plain`, `Hex-Any/Plain` and `Any-BreakInternal`.
+Not implemented: `Any-Remove`, `Any-Name`, `Name-Any`, `Any-Hex/Plain`, `Hex-Any/Plain` and `Any-BreakInternal`.
 <!-- /coverage:builtins-missing -->
 
 The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
@@ -504,10 +520,16 @@ correction, between 108 and 1,853 of each 5,000 differ.
   Existing Pablo kernels such as `Misorder_Check` make the same assumption, and
   no test showed a difference at text endings. However, the pipeline's guarantee
   of this has not been confirmed.
-- **NFC memory bounds.** With `--EnableAsserts`, the direct pipeline of Any-NFC
-  (`NFC_Bytes`) fails a memory bounds assertion in `NFC_CandidateClass`, which
-  reads past the end of its `Basis` input, on every run; its output is correct
-  without the assertions. The NFC of the rule pipeline (as in Any-FCC) passes.
+- **NFC memory bounds** (fixed). With `--EnableAsserts`, the direct pipeline of
+  Any-NFC failed a memory bounds assertion in `NFC_CandidateClass`: the
+  provisional stride of a kernel with lookahead read a block past the end of
+  its input buffer when the producer, not itself a provisional stride kernel,
+  had filled it (`81816aedb`). A second assertion, in the `elemMerge` of the
+  output, came from the count of the partial sums of a terminated popcount
+  kernel (`61225fd63`). Both are fixed on master, merged here.
+- **JIT.** Some runs that compile a pipeline afresh (not from the object cache)
+  abort with "LLVM ERROR: Failed to materialize symbols" (seen with Any-FCC and
+  `--EnableAsserts`, about 1 run in 3); not investigated.
 
 ### 3.3 Intended differences from ICU
 
@@ -784,7 +806,7 @@ Done since the first assessment:
   captures of variable lengths moved out of order (`a090553b4`, MoveRegions);
 - W5 function calls on captures of single characters (`687470e89`);
 - the built-ins Hex-Any (`41df85c9e`), Any-CaseFold (`89e922e4f`), Any-FCD
-  (`e2554e7f1`) and Any-FCC (`42df6910a`).
+  (`e2554e7f1`), Any-FCC (`42df6910a`) and Any-Hex/XML10 (`96fa4766f`).
 
 W7 blocks nothing where the proposed CLDR fixes are applied locally (see W7
 below); this run did not apply them.
@@ -1020,9 +1042,9 @@ The per-transform table lists the problem classes of every transform.
    the coverage with them (`~/cldr`), as the earlier reports did.
 5. **W5 back-references and W9.** Kana-Latn and Hira-Latn, then Jpan-Latn.
 6. **Built-ins and pipeline size.**
-   - Built-ins: `Any-Hex/XML10`, `Any-Remove`, `Any-Name` and `Name-Any`, and
+   - Built-ins: `Any-Remove`, `Any-Name` and `Name-Any`, and
      `Any-BreakInternal` for Thai-Latn.
-   - The memory bounds assertion of the direct NFC pipeline (§3.2).
+   - The JIT failures of fresh compilations (§3.2).
    - Pipeline size: a single-kernel sort network, or sharing normalizations
      between steps.
 
@@ -1072,6 +1094,8 @@ tconv on every implementable transform.
 | `e2554e7f1` | Any-FCD (`FCD_RegionMask`); `QA/Normalization/FCD` |
 | `86f6ad53d` | `tconv_coverage.py --update`: incremental coverage updates |
 | `42df6910a` | Any-FCC (NFC in passes on adjacent characters); `QA/Normalization/FCC`: 23 of 30 built-ins |
+| `81816aedb`, `61225fd63` | (master) room for a consumer's provisional stride; the partial sums of a terminated popcount kernel: no assertion failures in NFC |
+| `c3e3fe5b1`, `96fa4766f` | BixNum division of narrow dividends; Any-Hex/XML10 (`XMLDecimalPipeline`): 24 of 30 built-ins |
 
 ## Reproducing
 

@@ -133,7 +133,7 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, FCD, FCC, Lower, Upper, Title, CaseFold, HexJava, HexUnicode, HexC, HexXML, HexPerl, HexDecode};
+enum class Transform {NFD, NFKD, NFC, NFKC, FCD, FCC, Lower, Upper, Title, CaseFold, HexJava, HexUnicode, HexC, HexXML, HexXML10, HexPerl, HexDecode};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
@@ -141,7 +141,7 @@ static const std::vector<std::pair<std::string, Transform>> implementedTransform
     {"Any-Lower", Transform::Lower}, {"Any-Upper", Transform::Upper}, {"Any-Title", Transform::Title}, {"Any-CaseFold", Transform::CaseFold},
     {"Any-Hex", Transform::HexJava},{"Any-Hex/Java", Transform::HexJava},
     {"Any-Hex/Unicode", Transform::HexUnicode}, {"Any-Hex/C", Transform::HexC},
-    {"Any-Hex/XML", Transform::HexXML},  {"Any-Hex/Perl", Transform::HexPerl},
+    {"Any-Hex/XML", Transform::HexXML}, {"Any-Hex/XML10", Transform::HexXML10},  {"Any-Hex/Perl", Transform::HexPerl},
     {"Hex-Any", Transform::HexDecode}, {"Hex-Any/Java", Transform::HexDecode}, {"Hex-Any/C", Transform::HexDecode},
     {"Hex-Any/Perl", Transform::HexDecode}, {"Hex-Any/Unicode", Transform::HexDecode},
     {"Hex-Any/XML", Transform::HexDecode}, {"Hex-Any/XML10", Transform::HexDecode},
@@ -482,9 +482,10 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
         case Transform::HexUnicode:
         case Transform::HexC:
         case Transform::HexXML:
+        case Transform::HexXML10:
         case Transform::HexPerl:
         case Transform::HexDecode:
-            llvm::report_fatal_error("tconv: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /Perl) are implemented by the rule pipeline");
+            llvm::report_fatal_error("tconv: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /XML10, /Perl) are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -3696,6 +3697,7 @@ private:
     StreamSet * hexUnicode(StreamSet * U21);
     StreamSet * hexC(StreamSet * U21);
     StreamSet * hexXML(StreamSet * U21);
+    StreamSet * hexXML10(StreamSet * U21);
     StreamSet * hexPerl(StreamSet * U21);
     StreamSet * hexDecode(unsigned forms, StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
@@ -3836,6 +3838,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Hex/Unicode") return hexUnicode(U21);
     if (name == "Any-Hex/C") return hexC(U21);
     if (name == "Any-Hex/XML") return hexXML(U21);
+    if (name == "Any-Hex/XML10") return hexXML10(U21);
     if (name == "Any-Hex/Perl") return hexPerl(U21);
     if (const unsigned forms = hexDecodeForms(name)) return hexDecode(forms, U21);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
@@ -4096,6 +4099,29 @@ StreamSet * RulePipelineBuilder::hexXML(StreamSet * U21) {
         XMLHexPipeline(P, Selected, Hex);
         SHOW_BIXNUM(Hex);
         return Hex;
+    });
+}
+
+//  Any-Hex/XML10: each character encoded as &#<digit>+; with the decimal value
+//  of its codepoint, without leading zeroes (XMLDecimalPipeline) -- a
+//  context-free, single-character mapping, so within a mask only the masked
+//  characters need be converted (localCharacterMapping).
+StreamSet * RulePipelineBuilder::hexXML10(StreamSet * U21) {
+    static const std::vector<std::pair<unsigned, UCD::UnicodeSet>> lengths = {
+        {4, UCD::UnicodeSet(0, 9)},                 // &# and 1 digit and ;
+        {5, UCD::UnicodeSet(10, 99)},               // &# and 2 digits and ;
+        {6, UCD::UnicodeSet(100, 999)},             // &# and 3 digits and ;
+        {7, UCD::UnicodeSet(1000, 9999)},           // &# and 4 digits and ;
+        {8, UCD::UnicodeSet(10000, 99999)},         // &# and 5 digits and ;
+        {9, UCD::UnicodeSet(100000, 999999)},       // &# and 6 digits and ;
+        {10, UCD::UnicodeSet(1000000, 0x10FFFF)},   // &# and 7 digits and ;
+    };
+    return localCharacterMapping(U21, lengths, [&](StreamSet * Selected) {
+        PipelineBuilder & P = mP;
+        StreamSet * const Dec = P.CreateStreamSet(21, 1);
+        XMLDecimalPipeline(P, Selected, Dec);
+        SHOW_BIXNUM(Dec);
+        return Dec;
     });
 }
 
@@ -5614,7 +5640,7 @@ int main(int argc, char *argv[]) {
                         && impl->second != Transform::FCD && impl->second != Transform::FCC
                         && impl->second != Transform::Title && impl->second != Transform::HexJava
                         && impl->second != Transform::HexUnicode
-                        && impl->second != Transform::HexC && impl->second != Transform::HexXML
+                        && impl->second != Transform::HexC && impl->second != Transform::HexXML && impl->second != Transform::HexXML10
                         && impl->second != Transform::HexPerl && impl->second != Transform::HexDecode;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);

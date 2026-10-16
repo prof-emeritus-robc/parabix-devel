@@ -75,6 +75,10 @@ void XMLHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U2
 
 void PerlHexPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
 
+//  Any-Hex/XML10: each codepoint as &#, its value in decimal (without leading
+//  zeroes) and ;
+void XMLDecimalPipeline(kernel::PipelineBuilder & p, StreamSet * U21, StreamSet * U21_out);
+
 //
 //  Given a 21-bit basis stream and a single stream marking spans of hex digits
 //  that represent codepoints, calculate and produce the encoded 21-bit codepoint

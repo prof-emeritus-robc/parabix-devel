@@ -652,6 +652,161 @@ void kernel::XMLHexPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet *
     P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
 }
 
+//
+//  Any-Hex/XML10: each codepoint as &#, its value in decimal and ;  (1 to 7
+//  digits, without leading zeroes).  The codepoint is converted to 7 decimal
+//  digits of 4 bits (BCD) by BixNum division, which the XML pipeline then
+//  splits, spreads and converts to ASCII as it does hexadecimal digits.
+//
+class U21ToBCD final : public pablo::PabloKernel {
+public:
+    U21ToBCD(LLVMTypeSystemInterface & ts, StreamSet * U21, StreamSet * BCD);
+protected:
+    void generatePabloMethod() override;
+};
+
+U21ToBCD::U21ToBCD(LLVMTypeSystemInterface & ts, StreamSet * U21, StreamSet * BCD)
+        : PabloKernel(ts, "U21ToBCD", {Binding{"U21", U21}}, {Binding{"BCD", BCD}}) {}
+
+void U21ToBCD::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    BixNumCompiler bnc(pb);
+    BixNum value = getInputStreamSet("U21");
+    // The widths of the successive quotients by 10 of a codepoint (at most
+    // 1114111): 111411 < 2^17, 11141 < 2^14, 1114 < 2^11, 111 < 2^7, 11 < 2^4.
+    // Division keeps the width of the dividend, so the quotients are
+    // truncated to these.  The last quotient, at most 1, is the 7th digit.
+    const unsigned quotientWidth[6] = {17, 14, 11, 7, 4, 1};
+    std::vector<PabloAST *> bcd(28, pb.createZeroes());
+    for (unsigned d = 0; d < 6; d++) {
+        BixNum quotient, remainder;
+        bnc.Div(value, 10, quotient, remainder);
+        assert (remainder.size() == 4);
+        for (unsigned i = 0; i < 4; i++) {
+            bcd[4 * d + i] = remainder[i];
+        }
+        value = bnc.Truncate(quotient, quotientWidth[d]);
+    }
+    bcd[24] = value[0];
+    writeOutputStreamSet("BCD", bcd);
+}
+
+//  Two positions are inserted before each group of 8 x 4-bit digits, before its
+//  first two digits (as for codepoints of 0x10000 or more in CHexInsertMarks),
+//  for the &# and ; around the (at most) 7 decimal digits.
+class DecimalInsertMarks final : public pablo::PabloKernel {
+public:
+    DecimalInsertMarks(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * insertMarks);
+protected:
+    void generatePabloMethod() override;
+};
+
+DecimalInsertMarks::DecimalInsertMarks(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * insertMarks)
+        : PabloKernel(ts, "DecimalInsertMarks", {Binding{"bix4Data", bix4Data}}, {Binding{"insertMarks", insertMarks}}) {}
+
+void DecimalInsertMarks::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    PabloAST * insertMarks = pb.createInFile(pb.createRepeat(1, pb.getInteger(0x03, 8)));
+    writeOutputStreamSet("insertMarks", std::vector<PabloAST *>{insertMarks});
+}
+
+class XMLEscapedDecimal final : public pablo::PabloKernel {
+public:
+    XMLEscapedDecimal(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * spreadMask,
+                      StreamSet * decBasis, StreamSet * filterMask);
+protected:
+    void generatePabloMethod() override;
+};
+
+XMLEscapedDecimal::XMLEscapedDecimal(LLVMTypeSystemInterface & ts,
+                                     StreamSet * bix4Data, StreamSet * spreadMask,
+                                     StreamSet * decBasis, StreamSet * filterMask)
+        : PabloKernel(ts, "XMLEscapedDecimal",
+                      {Binding{"bix4Data", bix4Data, FixedRate(), LookAhead(1)},
+                       Binding{"spreadMask", spreadMask, FixedRate(), LookAhead(2)}},
+                      {Binding{"decBasis", decBasis}, Binding{"filterMask", filterMask}}) {}
+
+void XMLEscapedDecimal::generatePabloMethod() {
+    pablo::PabloBuilder pb(getEntryScope());
+    BixNumCompiler bnc(pb);
+    std::vector<PabloAST *> bix4Data = getInputStreamSet("bix4Data");
+    //
+    // Data bits move ahead 1 position to make way for the final semicolon.
+    std::vector<PabloAST *> bixDataAhead1(4);
+    for (unsigned i = 0; i < 4; i++) {
+        bixDataAhead1[i] = pb.createLookahead(bix4Data[i], 1);
+    }
+    // The digits (0 to 9) as ASCII.
+    BixNum decBasis = Bix4toASCII_Hex(pb, bixDataAhead1);
+
+    PabloAST * spreadMask = getInputStreamSet("spreadMask")[0];
+    // The spreadmask of each group of 10 is .1.1111111; after the move ahead, the
+    // group is &, #, the 7 digits (the first, of the zero 8th digit, being
+    // replaced by #) and ;.
+    PabloAST * ampPos = pb.createInFile(pb.createNot(pb.createOr(spreadMask, pb.createLookahead(spreadMask, 2))), "startOf10");
+    PabloAST * hashPos = pb.createAdvance(ampPos, 1);
+    PabloAST * lastDigitPos = pb.createAdvance(ampPos, 8);
+    PabloAST * semiColonPos = pb.createAdvance(ampPos, 9);
+
+    // At ampPos, an & (0x26), given the digit value 0 (0x30).
+    decBasis[4] = pb.createXor(decBasis[4], ampPos);  // flip bit 4
+    decBasis[2] = pb.createOr(decBasis[2], ampPos);
+    decBasis[1] = pb.createOr(decBasis[1], ampPos);
+
+    // At hashPos, # (0x23), given the digit value 0 (0x30).
+    decBasis[4] = pb.createXor(decBasis[4], hashPos);  // flip bit 4
+    decBasis[1] = pb.createOr(decBasis[1], hashPos);
+    decBasis[0] = pb.createOr(decBasis[0], hashPos);
+
+    // At semiColonPos, ; (0x3b), given the digit value 0 (0x30).
+    decBasis[3] = pb.createOr(decBasis[3], semiColonPos);
+    decBasis[1] = pb.createOr(decBasis[1], semiColonPos);
+    decBasis[0] = pb.createOr(decBasis[0], semiColonPos);
+
+    // Delete the leading zeroes, except for the last digit (&#0; encodes codepoint 0).
+    PabloAST * isZero = bnc.EQ(bixDataAhead1, 0);
+    PabloAST * mayDelete = pb.createAnd(isZero, pb.createNot(lastDigitPos));
+    PabloAST * firstZero = pb.createAnd(isZero, pb.createAdvance(hashPos, 1));
+    PabloAST * toDelete = pb.createAnd(pb.createMatchStar(firstZero, mayDelete), mayDelete);
+    PabloAST * filterMask = pb.createInFile(pb.createNot(toDelete));
+    writeOutputStreamSet("decBasis", decBasis);
+    writeOutputStreamSet("filterMask", std::vector<PabloAST *>{filterMask});
+}
+
+void kernel::XMLDecimalPipeline(PipelineBuilder & P, StreamSet * U21_in, StreamSet * U21_out) {
+
+    StreamSet * BCD = P.CreateStreamSet(28);
+    P.CreateKernelCall<U21ToBCD>(U21_in, BCD);
+
+    StreamSet * Bix2x16 = P.CreateStreamSet(16);
+    P.CreateKernelCall<BixSplit>(BCD, Bix2x16);
+
+    StreamSet * Bix4x8 = P.CreateStreamSet(8);
+    P.CreateKernelCall<BixSplit>(Bix2x16, Bix4x8);
+
+    StreamSet * Bix8x4 = P.CreateStreamSet(4);
+    P.CreateKernelCall<BixSplit>(Bix4x8, Bix8x4);
+
+    // Every codepoint takes 10 positions: &# and ; around 7 digits.
+    StreamSet * insertMarks = P.CreateStreamSet(1);
+    P.CreateKernelCall<DecimalInsertMarks>(Bix8x4, insertMarks);
+
+    StreamSet * spreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, insertMarks, spreadMask, kernel::InsertPosition::Before);
+
+    StreamSet * expandedBix4 = P.CreateStreamSet(4);
+    SpreadByMask(P, spreadMask, Bix8x4, expandedBix4);
+
+    StreamSet * Dec8 = P.CreateStreamSet(8);
+    StreamSet * filterMask = P.CreateStreamSet(1);
+    P.CreateKernelCall<XMLEscapedDecimal>(expandedBix4, spreadMask, Dec8, filterMask);
+
+    StreamSet * EncodedU8 = P.CreateStreamSet(8);
+    FilterByMask(P, filterMask, Dec8, EncodedU8);
+
+    P.CreateKernelCall<ZeroExtendASCII_to_U21>(EncodedU8, U21_out);
+}
+
 class PerlEscapedHex final : public pablo::PabloKernel {
 public:
     PerlEscapedHex(LLVMTypeSystemInterface & ts, StreamSet * bix4Data, StreamSet * spreadMask,

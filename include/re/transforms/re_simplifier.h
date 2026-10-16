@@ -13,7 +13,5 @@ class RE;
 
 RE * simplifyRE(RE * re);
 
-RE * removeUnneededCaptures(RE * r);
-
 }
 

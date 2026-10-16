@@ -25,6 +25,7 @@ SRC
     expand_permutes.cpp
     variable_alt_promotion.cpp
     assertion_transformations.cpp
+    capture_removal.cpp
 DEPS
     re.analysis
     re.printer

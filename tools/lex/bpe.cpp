@@ -65,6 +65,9 @@
 #include <re/adt/re_cc.h>
 #include <ucd/core/unicode_set.h>
 #include <kernel/pipeline/program_builder.h>
+#include <kernel/core/kernel_builder.h>        // BPEStuckKernel (--retire-stuck)
+#include <kernel/basis/p2s_kernel.h>
+#include <llvm/IR/Module.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>    // SpreadByMask (--retire-words)
 #include <kernel/streamutils/stream_shift.h>   // IndexedShiftBack (BPE_INDEXED_SHIFT)
@@ -481,6 +484,25 @@ static cl::opt<bool> RetireFrozen(
     cl::desc("With --retire-words: also retire tokens no later rule can merge."),
     cl::init(false));
 
+// --retire-stuck=N (with --retire-words): from compaction point N on (1-based), retire every
+// segment that can never change again: no adjacent pair (a, b) in it is a rule of a later
+// kernel. BPE only ever merges an adjacent pair that is a rule, so such a segment is final.
+// Segments run between word starts, barriers and frozen tokens; frozen tokens retire as
+// under --retire-frozen. A pair test is too big for bit-parallel code, so it is scalar: at
+// each such point BPEStuckKernel hands the Fp blocks to bpe_retire_stuck (C++), which looks
+// the pairs up in a bloom filter of the remaining rules and the ids in a frozen-id bitmap. It
+// replaces BPEFrozenKernel and BPERetireKernel there. Model (firesim/retire_more.py, LF 1 MiB
+// sample): from point 5 on, 18.6% less cycle-weighted merge work than --retire-frozen, for a
+// scan of 0.2 tokens per input byte. Measured (M3, 3 interleaved rounds, bench_bpe):
+// --retire-stuck=5 val_4MB 117.4 -> 109.9 ms (-6.4%), webtext_cases 241 -> 221 ms (-8.3%);
+// earlier points cost more scanning than they save. 0 = off. Cache tag: the tables' hash
+// in BPE_Stuck16.
+static cl::opt<unsigned> RetireStuck(
+    "retire-stuck",
+    cl::desc("With --retire-words: from compaction point N on (1-based), also retire segments "
+             "in which no adjacent pair is a later rule (0 = off, the default)."),
+    cl::init(0));
+
 // --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
 // bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
 // input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
@@ -859,6 +881,136 @@ protected:
     }
 private:
     const bool mHasFrozen;
+};
+
+// --retire-stuck tables, one per stuck point, built with the pipeline; BPEStuckKernel bakes
+// its point's index into its call.
+//   frozen: one bit per id, set when no rule of a later kernel uses the id as a part
+//   pairs:  a one-hash bloom filter over idA << 16 | idB of every rule of a later kernel.
+//           A false positive only keeps a segment; the lookup is one load, no branch
+//           (an exact probing hash set made the kernel ~1 cycle/position slower).
+static constexpr unsigned kStuckBloomBits = 21;   // 256 KiB; <= 50k pairs -> <= 2.4% false hits
+struct StuckTables {
+    std::vector<uint64_t> frozen;
+    std::vector<uint64_t> pairs;
+};
+static std::vector<StuckTables> gStuckTables;
+
+static inline uint32_t stuckHash(uint32_t key) { return (key * 0x9E3779B1u) >> (32 - kStuckBloomBits); }
+
+static inline bool stuckPairLive(const StuckTables & t, uint32_t key) {
+    const uint32_t h = stuckHash(key);
+    return (t.pairs[h >> 6] >> (h & 63)) & 1;
+}
+
+// BPEStuckKernel's body, on numItems positions of Fp (whole blocks; the first n are input).
+//   ids: one 16-bit id per position (P2S16); live: token starts; seg: segment starts (word
+//   starts and barriers). kept: the live starts that stay; segOut: the segment starts of the
+//   kept frame (word starts, barriers, and the start after each frozen token).
+// Pass 1 walks the tokens: frozen bit F, segment start S (seg, or the previous token was
+// frozen), and L = the pair (previous token, this token) may be a later rule. Pass 2 is
+// bit-parallel over the words: a token stays if its segment has an L, i.e. an L lies
+// before it in the segment (forward MatchStar by long addition through non-barrier
+// positions) or at/after it (the same on bit-reversed words, word order reversed).
+//   state[0]: bit 0 = the forward fill runs past the call (the open segment has an L),
+//   bit 1 = the last token was frozen, bit 2 = a token was seen; state[1] = its id.
+// Past the end of a non-final call the backward fill starts with a carry, so the segment
+// still open there is kept (it may continue). Its later tokens still retire if it turns out
+// stuck: no merge can reach the kept head, as its pairs are not rules and the next kept
+// token starts a segment.
+extern "C" void bpe_retire_stuck(uint64_t slot, const uint16_t * ids, const uint64_t * live,
+                                 const uint64_t * seg, uint64_t * kept, uint64_t * segOut,
+                                 uint64_t numItems, uint64_t n, uint64_t final, uint64_t * state) {
+    const StuckTables & t = gStuckTables[slot];
+    const uint64_t numWords = numItems / 64;
+    thread_local std::vector<uint64_t> tmp;
+    tmp.resize(3 * numWords);
+    uint64_t * const frozenW = tmp.data(), * const barrierW = frozenW + numWords,
+             * const fwdW = barrierW + numWords;
+    bool prevFrozen = state[0] & 2, seen = state[0] & 4;
+    uint32_t prevId = (uint32_t) state[1];
+    for (uint64_t wi = 0; wi < numWords; wi++) {
+        uint64_t lv = wi * 64 < n ? live[wi] : 0, beyond = 0;
+        if (wi * 64 < n && n - wi * 64 < 64) {
+            beyond = ~0ull << (n - wi * 64);
+            lv &= ~beyond;
+        } else if (wi * 64 >= n) {
+            beyond = ~0ull;
+        }
+        uint64_t L = 0, F = 0, AF = 0;
+        for (uint64_t m = lv; m; m &= m - 1) {
+            const unsigned p = __builtin_ctzll(m);
+            const uint32_t id = ids[wi * 64 + p];
+            const uint64_t fz = (t.frozen[id >> 6] >> (id & 63)) & 1;
+            L |= uint64_t(stuckPairLive(t, (prevId << 16) | id)) << p;
+            AF |= uint64_t(prevFrozen | !seen) << p;
+            F |= fz << p;
+            prevId = id; prevFrozen = fz; seen = true;
+        }
+        const uint64_t S = ((wi * 64 < n ? seg[wi] : 0) & lv) | AF;
+        const uint64_t barrier = S | F | (final ? beyond : 0);
+        kept[wi] = L & ~barrier;
+        segOut[wi] = S & ~F;
+        frozenW[wi] = F | ~lv;          // not a kept candidate: frozen, or no token here
+        barrierW[wi] = barrier;
+    }
+    // forward: fwd = MatchStar(L, ~barrier), minus the barrier it stops on
+    uint64_t carry = state[0] & 1;
+    for (uint64_t wi = 0; wi < numWords; wi++) {
+        const uint64_t C = ~barrierW[wi], L = kept[wi];
+        uint64_t s1, s2;
+        const bool c1 = __builtin_add_overflow(L, C, &s1);
+        const bool c2 = __builtin_add_overflow(s1, carry, &s2);
+        carry = c1 | c2;
+        fwdW[wi] = ((s2 ^ C) | L) & C;
+    }
+    const uint64_t fwdOut = carry;
+    // backward: the same on reversed bits, keeping the segment start it stops on
+    carry = final ? 0 : 1;
+    for (uint64_t wi = numWords; wi-- > 0; ) {
+        const uint64_t C = __builtin_bitreverse64(~barrierW[wi]), L = __builtin_bitreverse64(kept[wi]);
+        uint64_t s1, s2;
+        const bool c1 = __builtin_add_overflow(L, C, &s1);
+        const bool c2 = __builtin_add_overflow(s1, carry, &s2);
+        carry = c1 | c2;
+        const uint64_t bwd = __builtin_bitreverse64((s2 ^ C) | L);
+        const uint64_t keep = (fwdW[wi] | bwd) & ~frozenW[wi];
+        kept[wi] = keep;
+        segOut[wi] &= keep;
+    }
+    state[0] = fwdOut | (prevFrozen ? 2 : 0) | (seen ? 4 : 0);
+    state[1] = prevId;
+}
+
+// --retire-stuck, in Fp: one call of bpe_retire_stuck per invocation; it writes keptPre and
+// the kept frame's segment starts (still in Fp) directly, so nothing visits Fc. ids16 is the
+// id stream packed by P2S16Kernel, one i16 per position.
+class BPEStuckKernel final : public MultiBlockKernel {
+public:
+    BPEStuckKernel(LLVMTypeSystemInterface & ts, StreamSet * ids, StreamSet * live, StreamSet * seg,
+                   StreamSet * kept, StreamSet * segOut, unsigned slot, uint64_t tableHash)
+    : MultiBlockKernel(ts, "BPE_Stuck16_s" + std::to_string(slot) + "_h" + std::to_string(tableHash),
+                       {Binding{"ids", ids}, Binding{"live", live}, Binding{"seg", seg}},
+                       {Binding{"kept", kept}, Binding{"segOut", segOut}},
+                       {}, {},
+                       {InternalScalar{ArrayType::get(ts.getInt64Ty(), 2), "state"}}),
+      mSlot(slot) {}
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_retire_stuck");
+        if (fn == nullptr) report_fatal_error("BPE_Stuck: bpe_retire_stuck is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("live"));
+        Value * const final = b.CreateZExt(b.isFinal(), b.getInt64Ty());
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInt64(mSlot), b.getInputStreamBlockPtr("ids", zero),
+                      b.getInputStreamBlockPtr("live", zero), b.getInputStreamBlockPtr("seg", zero),
+                      b.getOutputStreamBlockPtr("kept", zero), b.getOutputStreamBlockPtr("segOut", zero),
+                      numItems, n, final, b.getScalarFieldPtr("state").first});
+    }
+private:
+    const unsigned mSlot;
 };
 
 // Merge-back at one retirement point, in Fp: `later` = the tokens that survived the point,
@@ -2472,6 +2624,7 @@ BPEPassResult buildBPEPassPipeline(
 
     compactionMode();   // validate the compaction settings first: conflicts halt here
     auto ruleRanges = bpe.buildMergeRuleRanges();
+    gStuckTables.clear();
 
     // Inject FilterByMask compactions per --compaction and rewrite the rules' merge
     // distances into the compacted (slot) frame.
@@ -2583,7 +2736,7 @@ BPEPassResult buildBPEPassPipeline(
     // left or right part (absent = never a part). After kernel i, an id is frozen iff its
     // entry is absent or <= i + 1.
     std::unordered_map<unsigned, size_t> lastPartUse;
-    if (retire && RetireFrozen)
+    if (retire && (RetireFrozen || RetireStuck))
         for (size_t gi = 0; gi < ruleRanges.size(); gi++)
             for (const auto & r : ruleRanges[gi].rules)
                 for (unsigned id : {r.idA, r.idB}) {
@@ -2674,6 +2827,48 @@ BPEPassResult buildBPEPassPipeline(
             // surviving position stays a live token start, so the next kernel still builds
             // its all-ones mask locally.
             ++nRetiring;
+            auto frozenId = [&](unsigned id) {
+                const auto f = lastPartUse.find(id);
+                return f == lastPartUse.end() || f->second <= i + 1;
+            };
+            if (RetireStuck && compactionPoint >= RetireStuck) {
+                // --retire-stuck: the frozen-id bitmap and the pairs of every later rule.
+                StuckTables tab;
+                uint64_t hash = 1469598103934665603ull;
+                auto mix = [&](uint64_t v) { hash = (hash ^ v) * 1099511628211ull; };
+                tab.frozen.assign(65536 / 64, 0);
+                for (unsigned id = 0; id < 65536; id++)
+                    if (frozenId(id)) tab.frozen[id >> 6] |= 1ull << (id & 63);
+                for (uint64_t w : tab.frozen) mix(w);
+                tab.pairs.assign((size_t(1) << kStuckBloomBits) / 64, 0);
+                for (size_t gi = i + 1; gi < ruleRanges.size(); gi++)
+                    for (const auto & r : ruleRanges[gi].rules) {
+                        const uint32_t key = (r.idA << 16) | r.idB;
+                        const uint32_t h = stuckHash(key);
+                        tab.pairs[h >> 6] |= 1ull << (h & 63);
+                        mix(key);
+                    }
+                const unsigned slot = gStuckTables.size();
+                gStuckTables.push_back(std::move(tab));
+                StreamSet * keptPre = P.CreateStreamSet(1, 1);
+                StreamSet * segPre = P.CreateStreamSet(1, 1);
+                // P2S16Kernel's StreamSets form names the kernel by the input's shape; the
+                // single-set form names every width "p2s_16", like the emitter's 16-bit one.
+                StreamSet * ids16 = P.CreateStreamSet(1, 16);
+                StreamSets idSets{source};
+                P.CreateKernelCall<P2S16Kernel>(idSets, ids16);
+                Kernel * const sk = P.CreateKernelCall<BPEStuckKernel>(ids16, inPlayMask, boundary,
+                                                                      keptPre, segPre, slot, hash);
+                P.LinkFunction(sk, "bpe_retire_stuck", bpe_retire_stuck);
+                FilterByMask(P, keptPre, source, sourceC);
+                StreamSet * boundaryK = P.CreateStreamSet(1, 1);
+                FilterByMask(P, keptPre, segPre, boundaryK);
+                retirePoints.push_back({inPlayMask, keptPre, source});
+                boundary = boundaryK;
+                source = sourceC;
+                inPlayMask = nullptr;
+                continue;
+            }
             // --retire-frozen: the frozen ids below 2^output_bits, as intervals, and their
             // complement; the kernel tests whichever has fewer intervals.
             UCD::UnicodeSet frozenSet, liveSet;
@@ -2683,10 +2878,6 @@ BPEPassResult buildBPEPassPipeline(
                 const unsigned idLimit = 1u << output_bits;
                 unsigned runStart = 0;
                 bool runFrozen = true;
-                auto frozenId = [&](unsigned id) {
-                    const auto f = lastPartUse.find(id);
-                    return f == lastPartUse.end() || f->second <= i + 1;
-                };
                 for (unsigned id = 0; id <= idLimit; id++) {
                     const bool fz = (id < idLimit) && frozenId(id);
                     if (id < idLimit && id > 0 && fz == runFrozen) continue;
@@ -2773,7 +2964,10 @@ BPEPassResult buildBPEPassPipeline(
         source = ids;
         inPlayMask = starts;
         std::cerr << "[BPE] --retire-words: retiring at " << nRetiring << " of "
-                  << compactionPoint << " compaction points\n";
+                  << compactionPoint << " compaction points";
+        if (!gStuckTables.empty())
+            std::cerr << " (" << gStuckTables.size() << " with --retire-stuck)";
+        std::cerr << "\n";
     }
     if (BitFrequencyStatistics) {
         Kernel * k = P.CreateKernelCall<BPEBitFrequencyKernel>(source, inPlayMask);

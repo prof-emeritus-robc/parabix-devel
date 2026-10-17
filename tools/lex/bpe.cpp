@@ -469,6 +469,18 @@ static cl::list<unsigned> RetirePoints(
     cl::desc("With --retire-words: the compaction points (1-based) that retire words; "
              "default all."));
 
+// --retire-frozen (with --retire-words): also retire frozen tokens, whose id no rule of a
+// later kernel uses as its left or right part, so they can never merge again. GPT-2 has no
+// rule with NUL (id 188) at all, so every NUL of a tar stream is frozen from the start. The
+// token after a dropped frozen token gets a boundary bit (a barrier), so the merge kernels
+// never join its neighbours, and one-token segments between barriers retire too. Model,
+// bit-tier on the 1 MiB sample: 2.95x fewer merge positions (-68% cycle-weighted) vs 1.59x
+// (-38%) for single-token words alone. Cache tag: the frozen set's hash in BPE_Retire.
+static cl::opt<bool> RetireFrozen(
+    "retire-frozen",
+    cl::desc("With --retire-words: also retire tokens no later rule can merge."),
+    cl::init(false));
+
 // --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
 // bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
 // input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
@@ -773,44 +785,100 @@ protected:
 // set: the 16 id bits plus bit 16, the token-start mask the emitter scans.
 static constexpr unsigned kRetireStreams = 17;
 
-// At one FilterByMask point (every position a live token start): finished = the token
-// starts a word and so does the next one, i.e. it is a whole word. keep = the rest of the
-// file. Past the last token the lookahead reads 0, so the last word is never retired.
+// A retirement point works in two frames: the one before the point's FilterByMask (Fp:
+// live token starts marked by inPlayMask, consumed positions in between) and the compacted
+// one (Fc: every position a live token start). Only the 1-bit streams visit Fc. The ids
+// are filtered once, from Fp, by the combined mask, and the merge-back reads the retired
+// ids straight from Fp.
+
+// --retire-frozen, in Fp: frozen = live token starts whose id no later rule uses as a part,
+// so they can never merge again. segStarts = word starts plus the live start right after
+// each frozen token (the barrier), found forward through the consumed positions in between.
+// testSet / negate: the frozen ids, or (negate) their complement when it has fewer intervals.
+class BPEFrozenKernel : public PabloKernel {
+public:
+    BPEFrozenKernel(LLVMTypeSystemInterface & ts, StreamSet * idIn, StreamSet * liveIn,
+                    StreamSet * boundaryIn, const UCD::UnicodeSet & testSet, bool negate,
+                    uint64_t setHash, StreamSet * frozen, StreamSet * segStarts)
+    : PabloKernel(ts, "BPE_Frozen" + std::to_string(setHash) + (negate ? "n" : "")
+                        + "_w" + std::to_string(idIn->getNumElements()),
+                  {Binding{"idIn", idIn}, Binding{"liveIn", liveIn}, Binding{"boundaryIn", boundaryIn}},
+                  {Binding{"frozen", frozen}, Binding{"segStarts", segStarts}}),
+      mTestSet(testSet), mNegate(negate) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> idBits = getInputStreamSet("idIn");
+        PabloAST * const live = getInputStreamSet("liveIn")[0];
+        cc::Parabix_CC_Compiler ccc(idBits);
+        PabloAST * inSet = ccc.compileCC("retireSet", re::makeCC(UCD::UnicodeSet(mTestSet)), pb);
+        PabloAST * fz = pb.createInFile(pb.createAnd(live, mNegate ? pb.createNot(inSet) : inSet), "frozen");
+        PabloAST * afterFrozen = pb.createAnd(pb.createMatchStar(pb.createAdvance(fz, (int64_t) 1),
+                                                                 pb.createNot(live)), live);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("frozen"), pb.getInteger(0)), fz);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("segStarts"), pb.getInteger(0)),
+                        pb.createOr(getInputStreamSet("boundaryIn")[0], afterFrozen));
+    }
+private:
+    const UCD::UnicodeSet mTestSet;
+    const bool mNegate;
+};
+
+// In Fc: finished = the token starts a segment and so does the next one, i.e. it is a whole
+// segment. A segment is a word, cut further under --retire-frozen: a frozen token is
+// finished too, and the token after it starts a segment. (That barrier also goes into the
+// boundary stream of the kept frame, from BPEFrozenKernel's segStarts, so the merge kernels
+// never join the tokens on both sides of a dropped frozen token.) keep = the rest of the
+// file. Past the last token the lookahead reads 0, so the last segment is never retired
+// unless frozen.
 class BPERetireKernel : public PabloKernel {
 public:
-    BPERetireKernel(LLVMTypeSystemInterface & ts, StreamSet * boundaryIn,
-                    StreamSet * keep, StreamSet * finished)
-    : PabloKernel(ts, "BPE_Retire",
-                  {Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(1)}},
-                  {Binding{"keep", keep}, Binding{"finished", finished}}) {}
+    BPERetireKernel(LLVMTypeSystemInterface & ts, StreamSet * boundaryIn, StreamSet * frozenIn,
+                    StreamSet * keep)
+    : PabloKernel(ts, std::string("BPE_Retire") + (frozenIn ? "_f" : ""),
+                  frozenIn ? std::vector<Binding>{Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(1)},
+                                                  Binding{"frozenIn", frozenIn}}
+                           : std::vector<Binding>{Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(1)}},
+                  {Binding{"keep", keep}}),
+      mHasFrozen(frozenIn != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * const wordStart = getInputStreamSet("boundaryIn")[0];
-        PabloAST * fin = pb.createInFile(
-            pb.createAnd(wordStart, pb.createLookahead(wordStart, (int64_t) 1)), "finished");
+        PabloAST * segStart = wordStart;
+        PabloAST * frozen = nullptr;
+        if (mHasFrozen) {
+            frozen = getInputStreamSet("frozenIn")[0];
+            segStart = pb.createOr(wordStart, pb.createAdvance(frozen, (int64_t) 1), "segStart");
+        }
+        // next token starts a segment = it starts a word, or this token is frozen
+        PabloAST * fin = pb.createAnd(segStart, pb.createLookahead(wordStart, (int64_t) 1));
+        if (frozen) fin = pb.createOr(fin, frozen);
         PabloAST * keep = pb.createInFile(pb.createNot(fin), "keep");
-        pb.createAssign(pb.createExtract(getOutputStreamVar("finished"), pb.getInteger(0)), fin);
         pb.createAssign(pb.createExtract(getOutputStreamVar("keep"), pb.getInteger(0)), keep);
     }
+private:
+    const bool mHasFrozen;
 };
 
-// Merge-back at one retirement point, in that point's frame: `later` = the tokens that
-// survived it, spread back by keep (all 0 at the finished positions); `ids` = the frame's
-// ids. The retired tokens are the finished positions: OR in their id and start bit.
+// Merge-back at one retirement point, in Fp: `later` = the tokens that survived the point,
+// spread back to Fp by keptPre; `ids` = Fp's id stream. The retired tokens are the live
+// starts that were not kept (liveIn & ~keptPre): OR in their id and start bit.
 class BPERetireMergeKernel : public PabloKernel {
 public:
     BPERetireMergeKernel(LLVMTypeSystemInterface & ts, StreamSet * later, StreamSet * ids,
-                         StreamSet * finished, StreamSet * merged)
+                         StreamSet * liveIn, StreamSet * keptPre, StreamSet * merged)
     : PabloKernel(ts, "BPE_RetireMerge" + std::to_string(ids->getNumElements()),
-                  {Binding{"later", later}, Binding{"ids", ids}, Binding{"finished", finished}},
+                  {Binding{"later", later}, Binding{"ids", ids}, Binding{"liveIn", liveIn},
+                   Binding{"keptPre", keptPre}},
                   {Binding{"merged", merged}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST *> later = getInputStreamSet("later");
         std::vector<PabloAST *> ids = getInputStreamSet("ids");
-        PabloAST * const fin = getInputStreamSet("finished")[0];
+        PabloAST * const fin = pb.createAnd(getInputStreamSet("liveIn")[0],
+                                            pb.createNot(getInputStreamSet("keptPre")[0]), "retired");
         Var * out = getOutputStreamVar("merged");
         for (unsigned i = 0; i + 1 < kRetireStreams; i++)
             pb.createAssign(pb.createExtract(out, pb.getInteger(i)),
@@ -2495,17 +2563,33 @@ BPEPassResult buildBPEPassPipeline(
 
     // --retire-words: one entry per FilterByMask point from the first retiring one on, for
     // the merge-back below.
-    //   prevMask: the mask that FilterByMask used (frame before the point)
-    //   keep, finished: kept and retired positions in the compacted frame; ids: that
-    //             frame's ids. All null at a point that does not retire
-    //             (--retire-points): the merge-back only steps through it.
+    //   prevMask: the mask that FilterByMask used: live token starts in Fp, the frame
+    //             before the point
+    //   keptPre:  the live starts the point kept, in Fp; idsPre: Fp's id stream. Both null
+    //             at a point that does not retire (--retire-points): the merge-back only
+    //             steps through it.
+    // A retiring point sends only 1-bit streams to the compacted frame (Fc): word starts
+    // and frozen marks are filtered by prevMask, BPERetireKernel decides keep there, and
+    // keep and the segment starts are spread back to Fp. The ids are then filtered once,
+    // by keptPre, instead of by prevMask and again by keep.
     struct RetirePoint {
-        StreamSet * prevMask; StreamSet * keep; StreamSet * finished; StreamSet * ids;
+        StreamSet * prevMask; StreamSet * keptPre; StreamSet * idsPre;
     };
     std::vector<RetirePoint> retirePoints;
     const bool retire = RetireWords && boundary && compactionMode() != CompactionMode::None;
     if (RetireWords && !retire)
         std::cerr << "[BPE] --retire-words ignored: it needs --compaction and a pretokenizer\n";
+    // --retire-frozen: lastPartUse[id] = 1 + the last kernel with a rule that has id as its
+    // left or right part (absent = never a part). After kernel i, an id is frozen iff its
+    // entry is absent or <= i + 1.
+    std::unordered_map<unsigned, size_t> lastPartUse;
+    if (retire && RetireFrozen)
+        for (size_t gi = 0; gi < ruleRanges.size(); gi++)
+            for (const auto & r : ruleRanges[gi].rules)
+                for (unsigned id : {r.idA, r.idB}) {
+                    size_t & u = lastPartUse[id];
+                    u = std::max(u, gi + 1);
+                }
     unsigned compactionPoint = 0, nRetiring = 0;
     auto retiresAt = [&](unsigned point) {
         return RetirePoints.empty()
@@ -2573,29 +2657,71 @@ BPEPassResult buildBPEPassPipeline(
         // the wrong token. The fresh mask is all-ones because every position that
         // survived the filter was, by construction, a live token start.
         if (!compactAfter[i]) continue;
+        ++compactionPoint;
+        const bool retireHere = retire && retiresAt(compactionPoint);
         StreamSet * sourceC = P.CreateStreamSet(output_bits, 1);
-        FilterByMask(P, inPlayMask, source, sourceC);
-        if (boundary) {
+        if (!retireHere) {
+            FilterByMask(P, inPlayMask, source, sourceC);
+            if (boundary) {
+                StreamSet * boundaryC = P.CreateStreamSet(1, 1);
+                FilterByMask(P, inPlayMask, boundary, boundaryC);
+                boundary = boundaryC;
+            }
+            if (retire && !retirePoints.empty())
+                retirePoints.push_back({inPlayMask, nullptr, nullptr});
+        } else {
+            // Drop the finished words too (see the RetirePoint comment above). Every
+            // surviving position stays a live token start, so the next kernel still builds
+            // its all-ones mask locally.
+            ++nRetiring;
+            // --retire-frozen: the frozen ids below 2^output_bits, as intervals, and their
+            // complement; the kernel tests whichever has fewer intervals.
+            UCD::UnicodeSet frozenSet, liveSet;
+            uint64_t setHash = 1469598103934665603ull;
+            bool negate = false;
+            if (RetireFrozen) {
+                const unsigned idLimit = 1u << output_bits;
+                unsigned runStart = 0;
+                bool runFrozen = true;
+                auto frozenId = [&](unsigned id) {
+                    const auto f = lastPartUse.find(id);
+                    return f == lastPartUse.end() || f->second <= i + 1;
+                };
+                for (unsigned id = 0; id <= idLimit; id++) {
+                    const bool fz = (id < idLimit) && frozenId(id);
+                    if (id < idLimit && id > 0 && fz == runFrozen) continue;
+                    if (id > 0) {
+                        (runFrozen ? frozenSet : liveSet).insert_range(runStart, id - 1);
+                        setHash = (setHash ^ (((uint64_t) runStart << 1) | runFrozen)) * 1099511628211ull;
+                    }
+                    runStart = id;
+                    runFrozen = fz;
+                }
+                negate = liveSet.size() < frozenSet.size();
+            }
+            // 1-bit streams only to Fc: the word starts and (--retire-frozen) frozen marks.
             StreamSet * boundaryC = P.CreateStreamSet(1, 1);
             FilterByMask(P, inPlayMask, boundary, boundaryC);
-            boundary = boundaryC;
-        }
-        ++compactionPoint;
-        if (retire && !retiresAt(compactionPoint) && !retirePoints.empty())
-            retirePoints.push_back({inPlayMask, nullptr, nullptr, nullptr});
-        if (retire && retiresAt(compactionPoint)) {
-            // Drop the finished words too. Every surviving position stays a live token
-            // start, so the next kernel still builds its all-ones mask locally.
-            ++nRetiring;
+            StreamSet * frozenC = nullptr;
+            StreamSet * segPre = boundary;   // segment starts in Fp: word starts, plus barriers
+            if (RetireFrozen) {
+                StreamSet * frozenPre = P.CreateStreamSet(1, 1);
+                segPre = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<BPEFrozenKernel>(source, inPlayMask, boundary,
+                                                    negate ? liveSet : frozenSet, negate, setHash,
+                                                    frozenPre, segPre);
+                frozenC = P.CreateStreamSet(1, 1);
+                FilterByMask(P, inPlayMask, frozenPre, frozenC);
+            }
             StreamSet * keep = P.CreateStreamSet(1, 1);
-            StreamSet * finished = P.CreateStreamSet(1, 1);
-            P.CreateKernelCall<BPERetireKernel>(boundary, keep, finished);
-            StreamSet * sourceK = P.CreateStreamSet(output_bits, 1);
-            FilterByMask(P, keep, sourceC, sourceK);
+            P.CreateKernelCall<BPERetireKernel>(boundaryC, frozenC, keep);
+            // keep back to Fp, then one filter of the ids and segment starts.
+            StreamSet * keptPre = P.CreateStreamSet(1, 1);
+            SpreadByMask(P, inPlayMask, keep, keptPre);
+            FilterByMask(P, keptPre, source, sourceC);
             StreamSet * boundaryK = P.CreateStreamSet(1, 1);
-            FilterByMask(P, keep, boundary, boundaryK);
-            retirePoints.push_back({inPlayMask, keep, finished, sourceC});
-            sourceC  = sourceK;
+            FilterByMask(P, keptPre, segPre, boundaryK);
+            retirePoints.push_back({inPlayMask, keptPre, source});
             boundary = boundaryK;
         }
         source     = sourceC;
@@ -2618,11 +2744,11 @@ BPEPassResult buildBPEPassPipeline(
         P.CreateKernelCall<BPEWidenKernel>(source, source16);
         source = source16;
     }
-    // --retire-words merge-back, last point first: SpreadByMask(keep) puts the later
-    // survivors back at their positions in the point's frame and BPERetireMergeKernel ORs
-    // the retired tokens in at the finished ones; SpreadByMask(prevMask) then steps back to
-    // the frame before that point, with 0 (no token) at the positions it had dropped as
-    // consumed. The emitter scans the frame of the first retiring point.
+    // --retire-words merge-back, last point first, one 17-stream spread per point: at a
+    // retiring point SpreadByMask(keptPre) puts the later survivors back at their positions
+    // in Fp and BPERetireMergeKernel ORs in the retired tokens, whose ids Fp still holds; at
+    // any other point SpreadByMask(prevMask) steps back to Fp, with 0 (no token) at the
+    // positions it had dropped as consumed. The emitter scans Fp of the first retiring point.
     // Not MergeByMask(keep, later, retired): it counts keep both ways (PopcountOf and
     // PopcountOfNot), and on some inputs the pipeline's two-way popcount kernel then
     // over-counts the filtered frame: later kernels ran on up to 1.9x phantom positions
@@ -2631,18 +2757,15 @@ BPEPassResult buildBPEPassPipeline(
         StreamSet * cur = P.CreateStreamSet(kRetireStreams, 1);
         P.CreateKernelCall<BPERetirePackKernel>(source, inPlayMask, cur);
         for (size_t m = retirePoints.size(); m-- > 0; ) {
-            if (retirePoints[m].keep) {
-                StreamSet * later = P.CreateStreamSet(kRetireStreams, 1);
-                SpreadByMask(P, retirePoints[m].keep, cur, later);
+            const RetirePoint & rp = retirePoints[m];
+            StreamSet * spread = P.CreateStreamSet(kRetireStreams, 1);
+            SpreadByMask(P, rp.keptPre ? rp.keptPre : rp.prevMask, cur, spread);
+            cur = spread;
+            if (rp.keptPre) {
                 StreamSet * merged = P.CreateStreamSet(kRetireStreams, 1);
-                P.CreateKernelCall<BPERetireMergeKernel>(later, retirePoints[m].ids,
-                                                         retirePoints[m].finished, merged);
+                P.CreateKernelCall<BPERetireMergeKernel>(cur, rp.idsPre, rp.prevMask, rp.keptPre, merged);
                 cur = merged;
             }
-            if (m == 0) break;
-            StreamSet * spread = P.CreateStreamSet(kRetireStreams, 1);
-            SpreadByMask(P, retirePoints[m].prevMask, cur, spread);
-            cur = spread;
         }
         StreamSet * ids = P.CreateStreamSet(16, 1);
         StreamSet * starts = P.CreateStreamSet(1, 1);

@@ -165,9 +165,26 @@ static void emitToken(uint16_t id, const std::string & tokStr) {
 // id_ptr points into the 16-bit vocab-ID stream at the match-end byte
 // position. The reader passes a single source pointer indexed by the
 // match-end byte offset, so we just deref to recover the full ID.
+// --fast-emit: the plain-id output path (no --offsets, no --strings) writes the decimal
+// id straight into llvm::outs(), skipping the per-token getenv, the decodeToken string
+// that path never prints, and the stream integer formatting. Same bytes out.
+static bool gFastEmit = false;
+static const bool gEmitDbg = std::getenv("BPE_EMIT_DBG") != nullptr;
+
 extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
     if (gBenchQuiet) return;   // timing loop: skip output, measure tokenization only
     uint16_t id = *id_ptr;
+    if (gFastEmit && !gEmitDbg) {
+        char text[8];                       // up to 5 digits + '\n'
+        char * const end = text + sizeof(text);
+        char * p = end;
+        *--p = '\n';
+        unsigned v = id;
+        do { *--p = char('0' + v % 10); v /= 10; } while (v);
+        std::lock_guard<std::mutex> lock(gEmitMutex);
+        llvm::outs().write(p, end - p);
+        return;
+    }
     if (getenv("BPE_EMIT_DBG")) {
         const uint8_t * bp = reinterpret_cast<const uint8_t *>(id_ptr);
         std::fprintf(stderr, "[emit] id=%u  lo=%u hi=%u  ptr=%p\n",
@@ -330,6 +347,13 @@ static cl::opt<OffsetMode> OffsetsFlag(
         clEnumValN(OffChar, "char", "CHARACTER spans, matching HuggingFace Encoding.offsets "
                                     "(a token splitting a character reports that whole character)")),
     cl::init(OffNone),
+    cl::cat(wordBreakerFlags));
+
+static cl::opt<bool> FastEmit(
+    "fast-emit",
+    cl::desc("BPE mode: write plain token ids with a direct integer formatter (same output; "
+             "ignored with --offsets or --strings)."),
+    cl::init(false),
     cl::cat(wordBreakerFlags));
 
 static cl::opt<unsigned> BenchLoop(
@@ -559,6 +583,7 @@ int main(int argc, char *argv[]) {
         gBPE           = &bpe;
         gOutputStrings = OutputStrings;
         gOffsetMode    = OffsetsFlag;
+        gFastEmit      = FastEmit && !OutputStrings && OffsetsFlag == OffNone;
 
         // --offsets reports spans into the byte stream the BPE stage consumed, so
         // anything that ADDS or REMOVES bytes relative to the mmap'd file breaks the

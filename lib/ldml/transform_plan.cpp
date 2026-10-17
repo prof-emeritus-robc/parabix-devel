@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <set>
 #include <tuple>
 #include <ldml/transform_rules_printer.h>
@@ -1268,6 +1269,24 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
                 }
             }
         }
+        //  String rules that may overlap MultipleCaptureMultipleReplacement rules
+        //  (one matching within the other): their matches are selected together
+        //  (jointSelection).  A rule of each may not match at the same position (as
+        //  the matches selected there would apply to both).
+        for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            for (const MultipleCaptureMultipleReplacement & r : set.rules) {
+                for (const StringRule & sr : step.stringRules) {
+                    if (analysis.mayMatchWithin(sr.rule, r.rule) || analysis.mayMatchWithin(r.rule, sr.rule)) {
+                        step.jointSelection = true;
+                    }
+                    if (analysis.mayOverlap(sr.rule, r.rule)) {
+                        plan.problems.push_back(printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but a string "
+                                                "rule may match at the same position: " + printRule(sr.rule) + ")");
+                    }
+                }
+            }
+        }
+        if (step.jointSelection) step.captureSelection = true;
         if (step.captureSelection) {
             for (MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
                 if (set.startsByFirst || set.singleCharacter) continue;
@@ -1285,23 +1304,14 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
                 }
             }
         }
-        for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-            for (const MultipleCaptureMultipleReplacement & r : set.rules) {
-                for (const StringRule & sr : step.stringRules) {
-                    if (analysis.mayMatchWithin(sr.rule, r.rule) || analysis.mayMatchWithin(r.rule, sr.rule)) {
-                        plan.problems.push_back(printRule(r.rule) + "  (a string rule may overlap this MultipleCaptureMultipleReplacement rule: "
-                                                + printRule(sr.rule) + ")");
-                        break;
-                    }
-                }
-            }
-        }
     }
     for (TransformStep & step : plan.steps) {
         if (step.stringRules.empty()) continue;
         //  A group with runs: its matches have no fixed length, and are selected
-        //  sequentially; the single-character rules apply outside them.
-        bool runs = false;
+        //  sequentially; the single-character rules apply outside them.  So are
+        //  those of a group whose string rules may overlap its
+        //  MultipleCaptureMultipleReplacement rules (with theirs).
+        bool runs = step.jointSelection;
         for (const StringRule & s : step.stringRules) runs |= !s.run.empty();
         if (runs) {
             step.coverStringRules = true;

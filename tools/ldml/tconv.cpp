@@ -881,6 +881,9 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         for (const ldml::StringRule & sr : step.stringRules) {
             llvm::outs() << "    string rule: " << ldml::printRule(sr.rule) << "\n";
         }
+        if (step.jointSelection) {
+            llvm::outs() << "    string rules and MultipleCaptureMultipleReplacement rules selected together\n";
+        }
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
             llvm::outs() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
                          << " rules, matched together (" << set.rules.size() << ", starts by "
@@ -4998,6 +5001,83 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         P.CreateKernelCall<FusedRules>(std::move(config), U21, classes, inText, mask, allowedAt, state, out, nullptr);
         state = out;
     };
+    //  The matches of the MultipleCaptureMultipleReplacement rules (see below),
+    //  on the text as it is: before the selection of the string rules, if the
+    //  matches of both are selected together (jointSelection).
+    struct CaptureMatches {
+        StreamSet * spans = nullptr;
+        StreamSet * ends = nullptr;
+        StreamSet * starts = nullptr;
+        StreamSet * firstStarts = nullptr;  // (with exactStarts: the first start of each span)
+    };
+    std::vector<CaptureMatches> captureMatches;
+    bool capturesMatched = false;
+    //  With jointSelection: the matches selected (of the string rules and the
+    //  sets), and the runs of the sets.
+    StreamSet * jointSelected = nullptr;
+    std::vector<StreamSet *> jointRuns;
+    auto matchCaptures = [&]() {
+        capturesMatched = true;
+        for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            const size_t n0 = set.rules.front().first.size();
+            std::vector<re::RE *> items;
+            for (size_t j = 0; j < n0; j++) {
+                UCD::UnicodeSet chars;
+                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) chars = chars + r.first[j];
+                items.push_back(re::makeCC(chars, &cc::Unicode));
+            }
+            for (size_t i = 0; i < set.captures.size(); i++) {
+                //  (A capture matched possessively, as ICU matches it, with its sets resolved.)
+                items.push_back(ldml::possessiveContext(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark), true));
+                for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
+            }
+            //  Only the streams used are made (the pipeline compiler fails on kernels
+            //  whose outputs are unused): the starts, if replacements are made from
+            //  them, the spans are covered or selected, and the spans, for the starts.
+            bool needStarts = n0 > 0 || needCoverage || step.captureSelection || set.reversed || set.moved;
+            for (const ldml::BoundaryReplacement & br : set.replacements) needStarts |= !br.fromEnd;
+            CaptureMatches m;
+            m.ends = matchPattern(set.engineBefore, set.engineAfter, items, U21,
+                                  (needStarts && !set.singleCharacter) ? &m.spans : nullptr);
+            if (!needStarts) {
+                //  (Only the ends are used.)
+            } else if (set.singleCharacter) {
+                m.starts = m.ends;
+                m.spans = m.ends;
+            } else if (set.startsByFirst) {
+                UCD::UnicodeSet firstChars = set.startChars;
+                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+                    if (n0 > 0) firstChars = firstChars + r.first.front();
+                }
+                //  (The ends, within the spans, are included so that they are used.)
+                m.starts = combine(combine(m.spans, m.ends, true), classes({firstChars}, U21), false);
+            } else {
+                //  The positions of the spans after a position outside them, or after
+                //  the end of a match (no match ends within another).
+                m.starts = P.CreateStreamSet(1);
+                P.CreateKernelCall<MatchStartsFromEnds>(m.spans, m.ends, m.starts);
+                //  Where the matches of the sets are selected: every start, as matches
+                //  beginning within another of the set apply where that one does not
+                //  (the rest of the span, after the first starts, still covered).
+                if (set.exactStarts) {
+                    m.firstStarts = m.starts;
+                    std::vector<re::RE *> lookahead = items;
+                    if (set.greedyStarts) {
+                        //  (The captures matched greedily: the same matches, see greedyStarts.)
+                        lookahead.clear();
+                        for (size_t j = 0; j < n0; j++) lookahead.push_back(items[j]);
+                        for (size_t i = 0; i < set.captures.size(); i++) {
+                            lookahead.push_back(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark));
+                            for (const UCD::UnicodeSet & chars : set.texts[i]) lookahead.push_back(re::makeCC(chars, &cc::Unicode));
+                        }
+                    }
+                    m.starts = matchStarts(set.engineBefore, set.engineAfter, lookahead, U21);
+                }
+            }
+            if (m.starts && mask) m.starts = combine(m.starts, mask, false);
+            captureMatches.push_back(m);
+        }
+    };
     //  A group with string rules whose before contexts are matched against the
     //  converted text, and which must be selected (or whose coverage other rules
     //  need): all its rules in one correction kernel, as which matches apply, and
@@ -5164,12 +5244,46 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     byLength[lengthIndex(chunkLengths[k])].push_back(SelectStringMatches::Source{matches, static_cast<unsigned>(k)});
                 }
             }
-            StreamSet * const starts = P.CreateStreamSet(byLengthOf.size());
+            StreamSet * starts = P.CreateStreamSet(byLengthOf.size());
             P.CreateKernelCall<MatchStartsByLength>(byLength, starts);
             selected = P.CreateStreamSet(1);
-            const SelectionClasses selection = selectionClasses(byLengthOf);
+            SelectionClasses selection = selectionClasses(byLengthOf);
+            if (step.jointSelection) {
+                //  With the matches of the MultipleCaptureMultipleReplacement sets
+                //  (after the string rules, which take precedence at a position): a
+                //  class for each set, of its starts, followed by a run of the rest of
+                //  its span.
+                matchCaptures();
+                std::vector<StreamSet *> startSets{starts}, runSets;
+                std::vector<std::pair<unsigned, unsigned>> startOrder, runOrder;
+                for (unsigned k = 0; k < byLengthOf.size(); k++) startOrder.emplace_back(0, k);
+                const unsigned firstRun = selection.runs ? selection.runs->getNumElements() : 0;
+                if (selection.runs) {
+                    runSets.push_back(selection.runs);
+                    for (unsigned k = 0; k < firstRun; k++) runOrder.emplace_back(0, k);
+                }
+                for (size_t i = 0; i < captureMatches.size(); i++) {
+                    CaptureMatches & m = captureMatches[i];
+                    StreamSet * const run = P.CreateStreamSet(1);
+                    P.CreateKernelCall<SpanContinuation>(m.spans, m.firstStarts ? m.firstStarts : m.starts, run);
+                    jointRuns.push_back(run);
+                    startOrder.emplace_back(startSets.size(), 0);
+                    startSets.push_back(m.starts);
+                    runOrder.emplace_back(runSets.size(), 0);
+                    runSets.push_back(run);
+                    selection.lengths.push_back(1);
+                    selection.runOf.push_back(static_cast<int>(firstRun + i));
+                }
+                StreamSet * const allStarts = P.CreateStreamSet(startOrder.size());
+                P.CreateKernelCall<MergeStreamSets>(startSets, startOrder, allStarts);
+                StreamSet * const allRuns = P.CreateStreamSet(runOrder.size());
+                P.CreateKernelCall<MergeStreamSets>(runSets, runOrder, allRuns);
+                starts = allStarts;
+                selection.runs = allRuns;
+            }
             P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected);
             SHOW_STREAM(selected);
+            jointSelected = selected;
         } else if (!step.stringOrder.empty()) {
             //  String rules may match within the texts of others: the matches of the
             //  rules, in the order to apply them, from which those that apply are
@@ -5266,95 +5380,34 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         //  inserted around a kept character of a capture (without a second spread
         //  with InsertionSpreadMask's InsertPosition::Before, which an insertion
         //  before the start of a match would otherwise need).  The spans are covered.
-        struct CaptureMatches {
-            StreamSet * spans = nullptr;
-            StreamSet * ends = nullptr;
-            StreamSet * starts = nullptr;
-            StreamSet * firstStarts = nullptr;  // (with exactStarts: the first start of each span)
-        };
-        std::vector<CaptureMatches> captureMatches;
-        for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-            const size_t n0 = set.rules.front().first.size();
-            std::vector<re::RE *> items;
-            for (size_t j = 0; j < n0; j++) {
-                UCD::UnicodeSet chars;
-                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) chars = chars + r.first[j];
-                items.push_back(re::makeCC(chars, &cc::Unicode));
-            }
-            for (size_t i = 0; i < set.captures.size(); i++) {
-                //  (A capture matched possessively, as ICU matches it, with its sets resolved.)
-                items.push_back(ldml::possessiveContext(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark), true));
-                for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
-            }
-            //  Only the streams used are made (the pipeline compiler fails on kernels
-            //  whose outputs are unused): the starts, if replacements are made from
-            //  them, the spans are covered or selected, and the spans, for the starts.
-            bool needStarts = n0 > 0 || needCoverage || step.captureSelection || set.reversed || set.moved;
-            for (const ldml::BoundaryReplacement & br : set.replacements) needStarts |= !br.fromEnd;
-            CaptureMatches m;
-            m.ends = matchPattern(set.engineBefore, set.engineAfter, items, U21,
-                                  (needStarts && !set.singleCharacter) ? &m.spans : nullptr);
-            if (!needStarts) {
-                //  (Only the ends are used.)
-            } else if (set.singleCharacter) {
-                m.starts = m.ends;
-                m.spans = m.ends;
-            } else if (set.startsByFirst) {
-                UCD::UnicodeSet firstChars = set.startChars;
-                for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
-                    if (n0 > 0) firstChars = firstChars + r.first.front();
-                }
-                //  (The ends, within the spans, are included so that they are used.)
-                m.starts = combine(combine(m.spans, m.ends, true), classes({firstChars}, U21), false);
-            } else {
-                //  The positions of the spans after a position outside them, or after
-                //  the end of a match (no match ends within another).
-                m.starts = P.CreateStreamSet(1);
-                P.CreateKernelCall<MatchStartsFromEnds>(m.spans, m.ends, m.starts);
-                //  Where the matches of the sets are selected: every start, as matches
-                //  beginning within another of the set apply where that one does not
-                //  (the rest of the span, after the first starts, still covered).
-                if (set.exactStarts) {
-                    m.firstStarts = m.starts;
-                    std::vector<re::RE *> lookahead = items;
-                    if (set.greedyStarts) {
-                        //  (The captures matched greedily: the same matches, see greedyStarts.)
-                        lookahead.clear();
-                        for (size_t j = 0; j < n0; j++) lookahead.push_back(items[j]);
-                        for (size_t i = 0; i < set.captures.size(); i++) {
-                            lookahead.push_back(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark));
-                            for (const UCD::UnicodeSet & chars : set.texts[i]) lookahead.push_back(re::makeCC(chars, &cc::Unicode));
-                        }
-                    }
-                    m.starts = matchStarts(set.engineBefore, set.engineAfter, lookahead, U21);
-                }
-            }
-            if (m.starts && mask) m.starts = combine(m.starts, mask, false);
-            captureMatches.push_back(m);
-        }
+        if (!capturesMatched) matchCaptures();
         //  Where the matches of different sets may overlap, those that apply are
         //  selected from the left (see LeftmostMatches), the earlier set first at the
         //  same position: a class for each set, of its starts, followed by a run of
         //  the rest of its span.  The spans and ends are then those of the matches
         //  selected.
         if (step.captureSelection) {
-            std::vector<StreamSet *> startStreams, runStreams;
-            for (CaptureMatches & m : captureMatches) {
-                StreamSet * const run = P.CreateStreamSet(1);
-                P.CreateKernelCall<SpanContinuation>(m.spans, m.firstStarts ? m.firstStarts : m.starts, run);
-                startStreams.push_back(m.starts);
-                runStreams.push_back(run);
+            std::vector<StreamSet *> runStreams = jointRuns;
+            StreamSet * selected = jointSelected;
+            if (!step.jointSelection) {
+                std::vector<StreamSet *> startStreams;
+                for (CaptureMatches & m : captureMatches) {
+                    StreamSet * const run = P.CreateStreamSet(1);
+                    P.CreateKernelCall<SpanContinuation>(m.spans, m.firstStarts ? m.firstStarts : m.starts, run);
+                    startStreams.push_back(m.starts);
+                    runStreams.push_back(run);
+                }
+                StreamSet * const starts = P.CreateStreamSet(startStreams.size());
+                P.CreateKernelCall<CollectStreams>(startStreams, starts);
+                StreamSet * const runs = P.CreateStreamSet(runStreams.size());
+                P.CreateKernelCall<CollectStreams>(runStreams, runs);
+                std::vector<unsigned> lengths(captureMatches.size(), 1);
+                std::vector<int> runOf;
+                for (size_t i = 0; i < captureMatches.size(); i++) runOf.push_back(static_cast<int>(i));
+                selected = P.CreateStreamSet(1);
+                P.CreateKernelCall<LeftmostMatches>(lengths, runOf, starts, runs, selected);
+                SHOW_STREAM(selected);
             }
-            StreamSet * const starts = P.CreateStreamSet(startStreams.size());
-            P.CreateKernelCall<CollectStreams>(startStreams, starts);
-            StreamSet * const runs = P.CreateStreamSet(runStreams.size());
-            P.CreateKernelCall<CollectStreams>(runStreams, runs);
-            std::vector<unsigned> lengths(captureMatches.size(), 1);
-            std::vector<int> runOf;
-            for (size_t i = 0; i < captureMatches.size(); i++) runOf.push_back(static_cast<int>(i));
-            StreamSet * const selected = P.CreateStreamSet(1);
-            P.CreateKernelCall<LeftmostMatches>(lengths, runOf, starts, runs, selected);
-            SHOW_STREAM(selected);
             for (size_t i = 0; i < captureMatches.size(); i++) {
                 const ldml::MultipleCaptureMultipleReplacementSet & set = step.captureReplacements[i];
                 CaptureMatches & m = captureMatches[i];

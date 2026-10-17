@@ -296,6 +296,12 @@ struct TransformStep {
     // Whether the matches of different sets may overlap: they are then selected
     // sequentially, from the left (the earlier set at the same position).
     bool captureSelection = false;
+    // Whether string rules may overlap MultipleCaptureMultipleReplacement rules
+    // (one matching within the other): the matches of both are then selected
+    // together, sequentially from the left (sequentialSelection, with
+    // captureSelection for the starts of the sets); no rules of both may match
+    // at the same position.
+    bool jointSelection = false;
     // The deferred rules (see DeferredRule), in order; the distinct captures C
     // they copy; the characters with which their texts begin (the triggers),
     // and those at each further position (the tails: tails[k] at position

@@ -158,6 +158,17 @@ protected:
 
     virtual void generatePabloMethod() = 0;
 
+    // Optional If codegen for this kernel. Both default off, so a kernel that does not
+    // override them compiles exactly as before.
+    //  ifBodyUnlikelyWeight(): N > 0 gives every If branch_weights 1:N (body : skip), so
+    //    LLVM lays the bodies out of line and puts register spills in them, not on the
+    //    skip path.
+    //  reduceIfTest(): test an If condition with an unsigned max-reduce over its 32-bit
+    //    lanes instead of bitblock_any (on AArch64: umaxv, fmov, cbz instead of six
+    //    instructions and a constant vector).
+    virtual unsigned ifBodyUnlikelyWeight() const { return 0; }
+    virtual bool reduceIfTest() const { return false; }
+
     llvm::IntegerType * getSizeTy() const {
         assert (mSizeTy); return mSizeTy;
     }

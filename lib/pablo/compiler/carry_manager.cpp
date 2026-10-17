@@ -9,6 +9,7 @@
 #include <pablo/ast/codegenstate.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <pablo/ast/branch.h>
@@ -337,7 +338,13 @@ Value * CarryManager::generateEntrySummaryTest(kernel::KernelBuilder & b, Value 
         mNextSummaryTest = nullptr;
     }
     if (LLVM_LIKELY(condition->getType() == b.getBitBlockType())) {
-        condition = b.bitblock_any(condition);
+        if (LLVM_UNLIKELY(mKernel->reduceIfTest())) {
+            // nonzero iff some 32-bit lane is nonzero (see PabloKernel::reduceIfTest)
+            Value * const maxLane = b.CreateUnaryIntrinsic(llvm::Intrinsic::vector_reduce_umax, b.fwCast(32, condition));
+            condition = b.CreateICmpNE(maxLane, ConstantInt::getNullValue(maxLane->getType()));
+        } else {
+            condition = b.bitblock_any(condition);
+        }
     }
     assert ("summary test was not consumed" && (mNextSummaryTest == nullptr));
     return condition;

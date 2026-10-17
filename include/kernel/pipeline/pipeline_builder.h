@@ -217,6 +217,12 @@ public:
     }
 
 
+    // The number of kernel calls added to this pipeline so far (a nested
+    // pipeline or optimization branch counts as one).
+    size_t getNumOfKernelCalls() const {
+        return mTarget->getKernels().size();
+    }
+
     LLVMTypeSystemInterface & getTypeSystem() {
         return *mDriver.getMainBuilder();
     }

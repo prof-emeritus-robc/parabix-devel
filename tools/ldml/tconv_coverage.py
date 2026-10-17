@@ -17,6 +17,7 @@
 #
 #  Writes to the output directory (default ./tconv-coverage):
 #      plans/<name>.txt     the --plan output of each transform ('/' as '%')
+#      kernels/<name>.txt   the --kernel-counts output of each transform
 #      coverage.json        per transform: status, own problem classes,
 #                           transforms used, transitive work items
 #      coverage.md          summary tables and the per-transform table
@@ -28,14 +29,24 @@
 #  are kept, and only the selected transforms (--only, --builtins, --blocked,
 #  and transforms tconv now knows that the results do not have) are planned and
 #  tested again, with the transforms that use one whose status changed (and so
-#  on), whose status depends on theirs.  The classes, totals and tables are then
-#  computed again for all.  --update refuses directories other than those of the
+#  on), whose status depends on theirs.  The kernels of the transforms planned
+#  are counted again, with those of all the transforms that use them, directly
+#  or not (whose total kernels include theirs).  The classes, totals and tables
+#  are then computed again for all.  --update refuses directories other than those of the
 #  previous results (unless --force).
 #
 #  --table-doc PATH writes the per-transform table document (coverage.md with a
 #  header); --report-doc PATH rewrites the generated blocks of the status report,
 #  between <!-- coverage:NAME --> and <!-- /coverage:NAME --> (see REPORT_BLOCKS),
 #  leaving the rest of it as it is.
+#
+#  Kernel counts (tconv --kernel-counts, which builds the pipeline of a transform
+#  without compiling it): the conversion groups of each transform's own rules,
+#  their rules, and their kernels, and the kernels of the whole transform,
+#  including those of its filters and of the transforms it uses, transitively
+#  (not those decoding the input and encoding the result).  --no-kernel-counts
+#  keeps the previous counts (with --update) or leaves them out; --update also
+#  counts the transforms that the previous results have no counts for.
 #
 #  Transforms whose analysis exceeds the memory available (the Han transforms
 #  need 8-14 GB) are reported as "analysis failed"; use a small --jobs.
@@ -167,6 +178,63 @@ def run_plans(args, entries, names):
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
         for name, rc in ex.map(run, names):
             entries[name]['rc'] = rc
+
+
+#  The kernel counts of the transforms of names (see tconv --kernel-counts).
+def run_kernel_counts(args, entries, names):
+    kernels = os.path.join(args.out, 'kernels')
+    os.makedirs(kernels, exist_ok=True)
+
+    def run(name):
+        try:
+            r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, '--kernel-counts', name],
+                               capture_output=True, timeout=args.timeout)
+            text = (r.stdout + r.stderr).decode('utf-8', 'replace')
+        except subprocess.TimeoutExpired:
+            text = 'timeout\n'
+        with open(os.path.join(kernels, file_name(name)), 'w', encoding='utf-8') as f:
+            f.write(text)
+        return name, parse_kernel_counts(text)
+
+    with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
+        for name, counts in ex.map(run, names):
+            entries[name]['kernels'] = counts
+
+
+#  groups, rules, group_kernels, kernels (the last two None if the pipeline
+#  was not built), and the rules and kernels of each group; None if tconv
+#  reported no counts.
+def parse_kernel_counts(text):
+    counts = None
+    per_group = []
+    for line in text.splitlines():
+        m = re.match(r'group \d+: (\d+) rules, (\d+) kernels$', line)
+        if m:
+            per_group.append([int(m.group(1)), int(m.group(2))])
+        m = re.match(r'total: (\d+) groups, (\d+) rules(?:, (\d+) group kernels, (\d+) kernels)?$', line)
+        if m:
+            counts = dict(groups=int(m.group(1)), rules=int(m.group(2)),
+                          group_kernels=int(m.group(3)) if m.group(3) else None,
+                          kernels=int(m.group(4)) if m.group(4) else None)
+    if counts is not None:
+        counts['per_group'] = per_group
+    return counts
+
+
+#  The transforms whose kernels are counted again: those of names, and the
+#  transforms that use them, directly or not.
+def with_users(entries, names):
+    users = collections.defaultdict(set)
+    for name, e in entries.items():
+        for u in e.get('uses', []):
+            users[u].add(name)
+    result, todo = set(names), list(names)
+    while todo:
+        for u in users[todo.pop()]:
+            if u not in result:
+                result.add(u)
+                todo.append(u)
+    return [n for n in entries if n in result]
 
 
 #  The text to replace of a printed conversion rule (without contexts).
@@ -444,17 +512,24 @@ def summary(entries):
                   ', '.join('%d rules: %d groups' % kv for kv in sorted(cycles.items())))
     md.append('## Transforms\n')
     md.append('Status: **ok** implementable; otherwise the work items needed (own problems and those of the '
-              'transforms used).  Tests: CLDR test files (failed/total cases for implementable transforms).\n')
-    md.append('| Transform | file | status | own problem classes (rules) | uses | tests |')
-    md.append('|---|---|---|---|---|---|')
+              'transforms used).  Tests: CLDR test files (failed/total cases for implementable transforms).  '
+              'Groups, rules: the conversion groups of the transform\'s own rules (not of the transforms it uses), '
+              'and their rules (as planned: without the rules reported as problems).  Group kernels: the kernels '
+              'of these groups; kernels: of the whole transform, including its filters and the transforms it '
+              'uses, transitively (tconv --kernel-counts; implementable transforms only).\n')
+    md.append('| Transform | file | status | own problem classes (rules) | uses | tests | groups | rules | group kernels | kernels |')
+    md.append('|---|---|---|---|---|---|---:|---:|---:|---:|')
     for e in sorted(entries.values(), key=lambda e: (e['builtin'], e['name'].lower())):
         status = '**ok**' if e['implementable'] else ', '.join(w.split()[0] for w in e['work']) or '?'
         own = ', '.join('%s (%d)' % (c, n) for c, n in sorted(e['own'].items()))
         tests = ', '.join('%s %d/%d' % (f, r['failed'], r['total']) for f, r in e.get('test_results', {}).items()) \
             or ', '.join(e.get('tests', []))
-        md.append('| %s%s | %s | %s | %s | %s | %s |' % (
+        k = e.get('kernels') or {}
+        cell = lambda v: '' if v is None else str(v)
+        md.append('| %s%s | %s | %s | %s | %s | %s | %s | %s | %s | %s |' % (
             e['name'], ' (internal)' if e['internal'] else '', e['file'] or 'built-in', status, own,
-            ', '.join(e['uses']), tests))
+            ', '.join(e['uses']), tests, cell(k.get('groups')), cell(k.get('rules')),
+            cell(k.get('group_kernels')), cell(k.get('kernels'))))
     return '\n'.join(md) + '\n'
 
 
@@ -548,6 +623,9 @@ def changes(previous, entries, names, meta):
         if old.get('own', {}) != e['own']:
             fmt = lambda own: ', '.join('%s (%d)' % kv for kv in sorted(own.items())) or 'none'
             diffs.append('own problems %s → %s' % (fmt(old.get('own', {})), fmt(e['own'])))
+        ko, kn = (old.get('kernels') or {}).get('kernels'), (e.get('kernels') or {}).get('kernels')
+        if ko != kn and (ko is not None or kn is not None):
+            diffs.append('kernels %s → %s' % (ko if ko is not None else 'none', kn if kn is not None else 'none'))
         for f in sorted(set(old.get('test_results', {})) | set(e.get('test_results', {}))):
             a, b = old.get('test_results', {}).get(f), e.get('test_results', {}).get(f)
             fmt = lambda r: '%d/%d failed' % (r['failed'], r['total']) if r else 'not run'
@@ -684,6 +762,8 @@ def main():
     ap.add_argument('--builtins', action='store_true', help='with --update: all the built-in transforms')
     ap.add_argument('--blocked', action='store_true', help='with --update: all the transforms not implementable before')
     ap.add_argument('--force', action='store_true', help='with --update: accept directories other than those of the previous results')
+    ap.add_argument('--no-kernel-counts', action='store_true',
+                    help='do not count kernels (keep the previous counts with --update)')
     ap.add_argument('--table-doc', metavar='PATH', help='write the per-transform table document')
     ap.add_argument('--note', help='for --table-doc: what the tconv version includes')
     ap.add_argument('--cldr-note', help='for --table-doc: about the CLDR data (e.g. local fixes applied or not)')
@@ -725,6 +805,16 @@ def main():
             e['checked'] = checked
         elif 'checked' in previous[name]:
             e['checked'] = previous[name]['checked']
+    #  (With --update, also the transforms the previous results have no counts for.)
+    counted = [] if args.no_kernel_counts else list(entries) if previous is None else \
+        with_users(entries, list(names) + [n for n in entries if 'kernels' not in previous.get(n, {})])
+    if previous is not None:
+        for name, e in entries.items():
+            if name not in counted and name in previous and 'kernels' in previous[name]:
+                e['kernels'] = previous[name]['kernels']
+    if counted:
+        print('tconv_coverage.py: counting the kernels of %d transforms' % len(counted), file=sys.stderr)
+        run_kernel_counts(args, entries, counted)
     if args.test_data:
         run_tests(args, entries, names, previous)
     elif previous is not None:
@@ -733,7 +823,7 @@ def main():
                 if key in previous[name] and (key == 'tests' or (name not in names and e['implementable'])):
                     e[key] = previous[name][key]
     run = dict(date=today, tconv=source['tconv'], mode='update' if args.update else 'full',
-               planned=len(names), selected=names if args.update else 'all')
+               planned=len(names), selected=names if args.update else 'all', kernel_counts=len(counted))
     meta = dict(source=source, runs=(meta['runs'] if meta else []) + [run])
     with open(os.path.join(args.out, 'coverage.json'), 'w', encoding='utf-8') as f:
         json.dump(entries, f, indent=1, ensure_ascii=False)

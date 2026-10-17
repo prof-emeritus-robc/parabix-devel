@@ -134,6 +134,9 @@ static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input a
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
     cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> KernelCounts("kernel-counts", cl::desc("Report the conversion groups of the transform (with their rules and "
+                                  "kernels) and the kernels of its pipeline, built without compiling it, and exit"),
+                                  cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report problems found in the transform files"),
                                   cl::init(false), cl::cat(TconvOptions));
 
@@ -4269,6 +4272,13 @@ public:
     // Apply an already-analyzed plan (e.g. of an ad hoc --rules-file transform,
     // not tied to a registry entry) to U21.
     StreamSet * applyAnalysis(const TransformAnalysis & a, StreamSet * U21);
+    //  The rules and kernels of each conversion group of the outermost transform
+    //  applied (not of the transforms it invokes), in order (see --kernel-counts).
+    struct GroupCount {
+        size_t rules;
+        size_t kernels;
+    };
+    const std::vector<GroupCount> & groupCounts() const {return mGroupCounts;}
 private:
     //  Filters.  As in ICU, a filter selects the characters of the text that a
     //  transform may change, once, when the transform is applied: the steps of
@@ -4339,7 +4349,16 @@ private:
     //  applied is invoked with a filter.
     bool mInsertAnywhere = false;
     bool mInvokedWithFilter = false;
+    unsigned mDepth = 0;
+    std::vector<GroupCount> mGroupCounts;
 };
+
+//  The rules of a conversion group, of all kinds.
+static size_t groupRules(const ldml::TransformStep & step) {
+    size_t rules = step.rules.size() + step.insertions.size() + step.deferred.size();
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) rules += set.rules.size();
+    return rules;
+}
 
 //  The Final_Sigma condition of Unicode full lowercasing (as in el-Lower): Σ
 //  becomes ς when preceded by a cased letter (with case-ignorable characters
@@ -6345,6 +6364,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     mInvokedWithFilter = false;
     const bool insertAnywhere = mInsertAnywhere;
     mInsertAnywhere = a.plan.steps.size() == 1 && (a.plan.filter || invokedWithFilter);
+    const bool outermost = mDepth++ == 0;
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
@@ -6354,13 +6374,16 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             mInvokedWithFilter = false;
             if (step.filter) popFilter();
         } else {
+            const size_t kernels = mP.getNumOfKernelCalls();
             if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
                 U21 = conversionGroup(step, U21);
             }
             if (!step.deferred.empty()) U21 = deferredRules(step, U21);
+            if (outermost && groupRules(step) > 0) mGroupCounts.push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         }
     }
     if (a.plan.filter) popFilter();
+    mDepth--;
     mInsertAnywhere = insertAnywhere;
     return U21;
 }
@@ -6377,6 +6400,52 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
     StreamSet * const OutputBytes = BytesOf(P, UTF8_Of(P, Result));
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
+}
+
+//  tconv --kernel-counts: the conversion groups of a transform (of its own
+//  steps, not of the transforms it invokes) with their rules, and, if it is
+//  implementable, the kernels of each group and of the whole transform (all
+//  the kernels its rule pipeline adds between the decoding of the input to
+//  U21 and the encoding of the result, including those of its filters and of
+//  the transforms it invokes, transitively).  The pipeline is built but not
+//  compiled.  Output lines:
+//      group <i>: <rules> rules, <kernels> kernels
+//      total: <groups> groups, <rules> rules[, <group kernels> group kernels, <kernels> kernels]
+static int printKernelCounts(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
+    TransformAnalyzer analyzer(registry);
+    const TransformAnalysis & a = analyzer.analyze(entry);
+    size_t groups = 0, rules = 0;
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Conversion && groupRules(step) > 0) {
+            groups++;
+            rules += groupRules(step);
+        }
+    }
+    llvm::outs() << "kernel counts: " << entry->canonicalName << "\n";
+    if (!a.implementable) {
+        llvm::outs() << "total: " << groups << " groups, " << rules << " rules\n";
+        return 2;
+    }
+    llvm::outs().flush();   // (not to be written again by a process the driver forks)
+    CPUDriver driver("tconv");
+    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
+    const size_t base = P.getNumOfKernelCalls();
+    RulePipelineBuilder builder(P, registry, analyzer);
+    builder.transform(entry, U21);
+    const size_t total = P.getNumOfKernelCalls() - base;
+    size_t groupKernels = 0;
+    for (size_t i = 0; i < builder.groupCounts().size(); i++) {
+        const RulePipelineBuilder::GroupCount & g = builder.groupCounts()[i];
+        llvm::outs() << "group " << (i + 1) << ": " << g.rules << " rules, " << g.kernels << " kernels\n";
+        groupKernels += g.kernels;
+    }
+    llvm::outs() << "total: " << groups << " groups, " << rules << " rules, " << groupKernels << " group kernels, "
+                 << total << " kernels\n";
+    return 0;
 }
 
 //  A pipeline for a transform compiled from an ad hoc rules file (--rules-file),
@@ -6499,7 +6568,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (TransformName.empty() || (InputFile.empty() && !ShowPlan)) {
+    if (TransformName.empty() || (InputFile.empty() && !ShowPlan && !KernelCounts)) {
         llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> <input file>\n"
                      << "       " << argv[0] << " [options] --rules-file=<rules file> <input file>\n"
                      << "       " << argv[0] << " [options] --list-transforms\n";
@@ -6511,6 +6580,7 @@ int main(int argc, char *argv[]) {
         llvm::errs() << "Error: unknown transform " << TransformName << "\n";
         return 1;
     }
+    if (KernelCounts) return printKernelCounts(registry, entry);
     if (ShowPlan) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);

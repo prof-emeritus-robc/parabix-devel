@@ -1247,29 +1247,13 @@ start_of_transfer_loop:
 
     if (hasMultipleRootsInSinglePartition) {
 
-        size_t bestScore = 0;
-        InternalPartitionGraph bestSelection;
-
-        std::function<void(std::vector<unsigned> &)> enumerateAllOptions = [&](std::vector<unsigned> & vec) {
-            for (auto i = vec.size(); i < componentCount; ++i) {
-                auto & roots = P[i].PotentialRoots;
-                assert (roots.size() > 0);
-                if (roots.size() == 1) {
-                    vec.push_back(roots[0]);
-                } else {
-                    const auto l = vec.size();
-                    for (auto j = 0; j < roots.size(); ++j) {
-                        vec.push_back(roots[j]);
-                        enumerateAllOptions(vec);
-                        vec.resize(l);
-                    }
-                    return;
-                }
-            }
-            InternalPartitionGraph filteredClone(componentCount);
+        //  The partition graph with the given choice of root for each component,
+        //  and its score (the number of kernels transferred to adjacent partitions).
+        auto evaluate = [&](const std::vector<unsigned> & vec, InternalPartitionGraph & clone) -> size_t {
+            clone = InternalPartitionGraph(componentCount);
             for (unsigned i = 0; i < componentCount; ++i) {
                 const auto & Pi = P[i];
-                auto & Gi = filteredClone[i];
+                auto & Gi = clone[i];
                 Gi.PartitionId = Pi.PartitionId;
                 Gi.PhaseId = Pi.PhaseId;
                 Gi.AllKernels.assign(Pi.AllKernels.begin(), Pi.AllKernels.end());
@@ -1279,18 +1263,79 @@ start_of_transfer_loop:
             for (auto e : make_iterator_range(edges(P))) {
                 const auto & bi = P[e];
                 assert (bi.Producer != -1U && bi.Consumer != -1U);
-                add_edge(source(e, P), target(e, P), BindingInfo{bi.Producer, bi.Consumer}, filteredClone);
+                add_edge(source(e, P), target(e, P), BindingInfo{bi.Producer, bi.Consumer}, clone);
             }
-            const auto score = transferKernelsToAdjacentPartitions(filteredClone) + 1UL;
-            if (score > bestScore) {
-                bestScore = score;
-                bestSelection = filteredClone;
-            }
+            return transferKernelsToAdjacentPartitions(clone) + 1UL;
         };
 
-        std::vector<unsigned> selection;
-        selection.reserve(synchronousPartitionCount);
-        enumerateAllOptions(selection);
+        //  The number of combinations of roots (saturating).
+        constexpr size_t MaxEnumeratedSelections = 4096;
+        size_t combinations = 1;
+        for (unsigned i = 0; i < componentCount; ++i) {
+            const auto r = P[i].PotentialRoots.size();
+            combinations = (combinations > MaxEnumeratedSelections / r) ? MaxEnumeratedSelections + 1 : combinations * r;
+        }
+
+        size_t bestScore = 0;
+        InternalPartitionGraph bestSelection;
+
+        if (combinations <= MaxEnumeratedSelections) {
+
+            std::function<void(std::vector<unsigned> &)> enumerateAllOptions = [&](std::vector<unsigned> & vec) {
+                for (auto i = vec.size(); i < componentCount; ++i) {
+                    auto & roots = P[i].PotentialRoots;
+                    assert (roots.size() > 0);
+                    if (roots.size() == 1) {
+                        vec.push_back(roots[0]);
+                    } else {
+                        const auto l = vec.size();
+                        for (auto j = 0; j < roots.size(); ++j) {
+                            vec.push_back(roots[j]);
+                            enumerateAllOptions(vec);
+                            vec.resize(l);
+                        }
+                        return;
+                    }
+                }
+                InternalPartitionGraph filteredClone;
+                const auto score = evaluate(vec, filteredClone);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestSelection = filteredClone;
+                }
+            };
+
+            std::vector<unsigned> selection;
+            selection.reserve(synchronousPartitionCount);
+            enumerateAllOptions(selection);
+
+        } else {
+
+            //  Too many combinations to enumerate (the number grows exponentially with
+            //  the components having several potential roots): the root of each such
+            //  component is chosen in turn, the others fixed, by the best score.
+            std::vector<unsigned> selection(componentCount);
+            for (unsigned i = 0; i < componentCount; ++i) selection[i] = P[i].PotentialRoots[0];
+            InternalPartitionGraph clone;
+            bestScore = evaluate(selection, bestSelection);
+            for (unsigned i = 0; i < componentCount; ++i) {
+                const auto & roots = P[i].PotentialRoots;
+                if (roots.size() == 1) continue;
+                auto best = selection[i];
+                for (auto j = 1; j < roots.size(); ++j) {
+                    selection[i] = roots[j];
+                    const auto score = evaluate(selection, clone);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestSelection = clone;
+                        best = roots[j];
+                    }
+                }
+                selection[i] = best;
+            }
+
+        }
+
         assert (bestScore > 0);
         P = bestSelection;
     } else {

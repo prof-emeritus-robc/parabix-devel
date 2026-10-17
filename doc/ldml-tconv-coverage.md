@@ -1,16 +1,18 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `258f7c284`: with rules with text
+*Status of `tools/ldml/tconv` on branch LDML at `323305975`: with rules with text
 to revisit composed at compile time (W6), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
-MultipleCaptureMultipleReplacement rules (W3, §5), insertion rules (W4, §4.2),
+MultipleCaptureMultipleReplacement rules (W3, §5; with exact starts, selected
+together with string rules, and with captures of finitely many lengths
+expanded), insertion rules (W4, §4.2),
 large mappings multiplexed (§4.3), captures referred to out of order (SwapBack,
 MoveRegions, §5), function calls on captures of single characters (W5, §5),
 captures of before contexts copied (W5, §5), unreferenced captures removed
 (§5), and the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD, Any-FCC,
 Any-Hex/XML10 and Any-Remove (§2.1),
 against CLDR `common/transforms` and `common/testData/transforms` at commit
-`7cdeb9e` (2026-10-09). October 16, 2026.*
+`7cdeb9e` (2026-10-09). October 17, 2026.*
 
 *This run used the CLDR transforms without the local fixes of W7 (§5), from a
 copy (`~/transforms`, 380 files rather than 381), so Latin-ug and ug-Latin,
@@ -19,7 +21,9 @@ Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather than the
 W3, W4 and W6 problems they have with the fixes. Any-FCD, Any-FCC,
 Any-Hex/XML10 and Any-Remove, and the transforms that the capture changes affect
 (Kana-Latn, Hira-Latn, Jpan-Latn, Zawgyi-my, my-Zawgyi, my-my_FONIPA,
-si-si_FONIPA, fa-fa_FONIPA), were added
+si-si_FONIPA, fa-fa_FONIPA) and the W3 changes affect (NumericPinyin-Latin,
+am_FONIPA-am, am-am_FONIPA, byn Xaleget, cy-cy_FONIPA, and the transforms
+through them), were added
 to the results by an incremental update (`tconv_coverage.py --update`, see
 [Reproducing](#reproducing)); the generated tables and blocks of this report are
 marked `<!-- coverage:… -->`.*
@@ -43,17 +47,24 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 347 (82%) |
-| …of which public (not `visibility="internal"`) | 393 | 316 (80%) |
+| Transforms defined by CLDR files (380 files) | 425 | 372 (88%) |
+| …of which public (not `visibility="internal"`) | 393 | 341 (87%) |
 <!-- /coverage:summary -->
 
-- **Tests.** Of the 284 CLDR test files, 230 belong to implementable transforms.
-  Their 240,668 cases fail only in two files, where the test data disagrees with
+- **Tests.** Of the 284 CLDR test files, 253 belong to implementable transforms.
+  Their 246,751 cases fail only in two files, where the test data disagrees with
   the rules and with ICU (§3): ka-ka_Latn/BGN (215 cases) and my-my_FONIPA (2).
   The coverage script now runs each case as a text of its own (`tconv --lines`
   for the cases that fail in the text of all the cases), which removed 10,675
-  spurious failures. None of the transforms made implementable since `02e77ee59`
-  has CLDR test data; they were checked against ICU 78.3 (§2.3).
+  spurious failures. Of the transforms made implementable since `02e77ee59`, only
+  the `*-am` and `am-*` transforms have CLDR test data (23 files, 6,083 cases, all
+  passing); all were checked against ICU 78.3 (§2.3).
+- **More MultipleCaptureMultipleReplacement rules** (W3, §5): exact starts by
+  the regular expression engine where sets of such rules overlap, string rules
+  and such rules selected together, and captures of finitely many lengths
+  expanded into fixed-length variants. am_FONIPA-am and the 18 `*-am`
+  transforms through it, am-am_FONIPA and the three `am-*` transforms through
+  it, NumericPinyin-Latin and Bopo-Latn are implementable.
 - **Captures of before contexts copied** (W5, §5), `t (y* $vowel) { ヽ $voice → d $1`:
   the rules copying a capture at the end of their before context, and the
   other rules of their group with the same first characters, are applied after
@@ -110,10 +121,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     cases.
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
-  - W3 variable-length texts: 32 transforms (am_FONIPA-am and the 18 `*-am`
-    transforms through it, am-am_FONIPA and the three `am-*` transforms through
-    it, Latn-Arab, blt-blt_FONIPA, byn Xaleget, my-Zawgyi, Zawgyi-my, and the
-    Pinyin and Bopomofo transforms);
+  - W3 variable-length texts: 7 transforms (Latn-Arab, blt-blt_FONIPA,
+    Latin-NumericPinyin and Latn-Bopo through it, byn Xaleget, my-Zawgyi and
+    Zawgyi-my);
   - W6 revisits not composed (unbounded runs, variable-length texts): 23;
   - W7 parser semantics: 4 in this run (2 with the local CLDR fixes);
   - W5 back-references: none alone (fa-fa_FONIPA, sk-ja and sk_FONIPA-ja also
@@ -124,9 +134,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          347  █████████████████████████████████
-+ W3 variable-length text    379  ████████████████████████████████████
-+ W6 revisit                 415  ███████████████████████████████████████
+now                          372  ███████████████████████████████████
++ W6 revisit                 396  █████████████████████████████████████
++ W3 variable-length text    415  ███████████████████████████████████████
 + W7 parser semantics        419  ███████████████████████████████████████
 + W5 captures/functions      422  ████████████████████████████████████████
 + W10 engine lookaheads      423  ████████████████████████████████████████
@@ -271,7 +281,7 @@ The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
 `Hex-Any/Plain`, which ICU 78.3 does not have. `Hex-Any` is no longer an alias
 of `Hex-Any/Java`: as in ICU, it accepts every escape form.
 
-### 2.2 Transforms defined by rules (347 of 425)
+### 2.2 Transforms defined by rules (372 of 425)
 
 Implementable now:
 
@@ -303,7 +313,10 @@ Implementable now:
 - with captures in reverse order: Thai-ThaiLogical and ThaiLogical-Thai;
 - with function calls on captures: az-, el-, lt- and tr-Title,
   Latn-Ethi/ALALOC and Latn-Ethi/SERA;
-- with captures of before contexts copied: Kana-Latn, Hira-Latn and Jpan-Latn.
+- with captures of before contexts copied: Kana-Latn, Hira-Latn and Jpan-Latn;
+- with MultipleCaptureMultipleReplacement rules matched by exact starts, selected
+  with string rules, or expanded: am_FONIPA-am and the `*-am` transforms through
+  it, am-am_FONIPA, am-ar, am-chr, am-fa, NumericPinyin-Latin and Bopo-Latn.
 
 The per-transform status is in the table.
 
@@ -405,6 +418,27 @@ never refer to (`9043a6b5b`) changes the plans of four transforms and the
 status of none: my-my_FONIPA, si-si_FONIPA and the six implementable transforms
 through them give the same output as before on their CLDR test sources and on
 20,000 random lines each.
+
+**MultipleCaptureMultipleReplacement rules (W3, `1230cb8e4`, `03e837f5f`,
+`323305975`).** Against ICU 78.3's `createFromRules`:
+
+- NumericPinyin-Latin (`Latin-NumericPinyin.xml`, reverse): identical on 20,000
+  random lines of numeric pinyin (initials, finals with `ü` precomposed and
+  decomposed, tone digits, noise); 15,722 are changed by the rules.
+- am_FONIPA-am (`am-am_FONIPA.xml`, reverse, with `::null;` written
+  `::Null (Null);`, as ICU 78.3 cannot invert a bare Null): identical on 20,000
+  lines of IPA made by ICU from random Ethiopic text and on 10,000 random
+  strings of its characters. am-am_FONIPA (forward): identical on 20,000 random
+  Ethiopic lines.
+- The CLDR test files of am_FONIPA-am, am-am_FONIPA and the 21 transforms
+  through them (6,083 cases) all pass.
+- Rule sets with overlapping and nested matches (sets with strings sharing an
+  end), string rules overlapping such rules both ways, and insertions and
+  replacements between captures of finitely many lengths are identical to ICU
+  on 5,000 to 8,000 random lines each, of which 951 to 4,672 are changed.
+
+The fix to sets with strings in differences (below) changes no transform that
+was implementable before: instrumented, it applies in none of the 342.
 
 **Regression of the fused kernels.** The fused implementation was compared with
 the previous tconv on every implementable transform (205 names). Each ran on:
@@ -582,6 +616,15 @@ correction, between 108 and 1,853 of each 5,000 differ.
   relocation out of range of a `Page21` fixup in `SingletonCanonicalization`
   (seen once with `:: NFD ; :: [:Mn:] Remove ; :: NFC ;` and `--EnableAsserts`);
   not investigated.
+- **JIT failures of fresh compilations** are more frequent with the larger
+  pipelines: NumericPinyin-Latin's first compilation aborts in 2 of 3 runs with
+  the `Page21` relocation error; runs from the object cache do not.
+- **Jpan-Latn does not compile.** It is implementable as planned, but its
+  pipeline, with the deferred rules of Kana-Latn twice (also through
+  Hira-Latn), compiles only with `--deferred-rule-rounds` of 1 or 2: with 3 or
+  more, the bounds of its buffers grow too large ("failed to allocate virtual
+  address space", or a Z3 error at the default of 4). It counts as implementable
+  in the tables.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
   contexts reach back to each other (`カヽヽヽヽヽ`) leaves the last ones
@@ -835,8 +878,8 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 48 | 32 | M–L (the rest) |
-| W6 text to revisit, not composed | 40 | 23 | L (with W3) |
+| W3 variable-length texts | 22 | 7 | M–L (the rest) |
+| W6 text to revisit, not composed | 40 | 24 | L (with W3) |
 | W5 back-references | 3 | 0 | M |
 | W7 parser semantics (#5, #6) | 4 | 4 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -868,6 +911,9 @@ Done since the first assessment:
 - W5 function calls on captures of single characters (`687470e89`);
 - W5 captures of before contexts copied (`258f7c284`), and unreferenced
   captures removed (`9043a6b5b`);
+- W3 MultipleCaptureMultipleReplacement rules with exact starts (`1230cb8e4`),
+  selected with string rules (`03e837f5f`), and with captures of finitely many
+  lengths expanded (`323305975`);
 - the built-ins Hex-Any (`41df85c9e`), Any-CaseFold (`89e922e4f`), Any-FCD
   (`e2554e7f1`), Any-FCC (`42df6910a`), Any-Hex/XML10 (`96fa4766f`) and
   Any-Remove (`335e35694`).
@@ -974,7 +1020,41 @@ rule (issue #17).
 several captures, after contexts, and an empty T0, with the inserted texts kept
 around a character of a capture. The starts of the matches are found by the
 first characters of T0, or of B1 where it begins with a set (`08c303c30`), or
-from the ends of the matches where no match may end within another.
+from the ends of the matches where no match may end within another: where Tk
+may not occur ending within a match, overlapping itself or in the part before
+it (`1230cb8e4`; `($L) ːwaː` of am_FONIPA-am).
+
+- **Exact starts** (`1230cb8e4`). Where the matches of sets of such rules may
+  overlap, and are selected from the left (`LeftmostMatches`), a set whose
+  starts are not known by its first characters gets every start from the
+  regular expression engine: the pattern and its after context as a
+  lookahead, after its before context as a lookbehind. These include the
+  matches beginning within another of the set with the same end (through a set
+  with strings, `{t͡ʃ}` and `ʃ`), which apply where that one does not. The engine
+  does not support the possessive repetition of a set with strings in a
+  lookahead (W10); the greedy form gives the same matches where what follows
+  each repetition cannot begin with a character it repeats
+  (`([Oo]) ([$vowel-[AEae]]* …) $digit`).
+- **Selected with string rules** (`03e837f5f`). Where string rules may overlap
+  such rules (one matching within the other), the sets join the string rules'
+  classes in `LeftmostMatches`, each as its starts followed by a run of the rest
+  of its span, and both apply only where selected. A string rule and such a
+  rule that may match at the same position are still rejected.
+- **Captures of finitely many lengths expanded** (`323305975`). Where a
+  replaced or inserted text lies between captures of variable length, the
+  rule becomes a rule for each combination of the alternatives of the items of
+  its captures (an optional item present or absent, each string of a set with
+  strings, then its characters), in ICU's possessive order, where that is
+  equivalent: `($IPA_CONSONANT) ([jw]? $IPA_VOWEL) ፝ → $1 ː $2 ː` is 16 rules.
+- **Sets with strings.** `expandedContext` dropped the strings of differences
+  and intersections of sets (`[$vowel-[aeAE]]` lost `{ü}`), and the engine
+  resolves a possessive repetition as PCRE does, taking the first alternative:
+  the alternatives are now ordered longest first, as ICU matches the longest
+  string of a set.
+- The pipeline compiler enumerated every combination of the roots of its
+  partitions (exponential in their number): NumericPinyin-Latin's pipeline
+  spent over 10 minutes there. Beyond 4,096 combinations it now chooses each
+  root in turn (`d2411817d`).
 
 **Captures out of order.** A rule `T0 (B1) T1 (B2) T2 → R0 $2 R1 $1 R2`, with
 B1 and B2 of fixed lengths, is planned as the rule with the captures in order,
@@ -995,20 +1075,14 @@ last capture ends with a set not occurring before it in a match. Such moves are
 planned in Latin-NumericPinyin, blt-blt_FONIPA, my-Zawgyi and Zawgyi-my, which
 have other problems.
 
-W3 alone now blocks 31 transforms:
+W3 alone now blocks 7 transforms:
 
-- am_FONIPA-am and the 18 `*-am` transforms through it: three
-  MultipleCaptureMultipleReplacement rules whose matches may overlap other such
-  rules, or string rules, or whose starts cannot be told apart;
-- am-am_FONIPA and the three `am-*` transforms through it: an insertion that is
-  not next to a capture (`($IPA_CONSONANT) ([jw]? $IPA_VOWEL) ፝ → $1 ː $2 ː`);
 - Latn-Arab (`t ($notAbove+) ̈ → ة | $1`, with text to revisit);
 - blt-blt_FONIPA and Latin-NumericPinyin (before contexts that the conversions
   change), and Latn-Bopo through Latin-NumericPinyin;
-- NumericPinyin-Latin (`([Oo]) ([$vowel-[AEae]]+) 4 → $1 ̀ $2`, whose matches
-  other such rules may overlap), and Bopo-Latn through it;
-- my-Zawgyi and byn Xaleget (string rules that may overlap
-  MultipleCaptureMultipleReplacement rules).
+- byn Xaleget and my-Zawgyi (rules whose starts cannot be told apart);
+- Zawgyi-my (runs followed by after contexts, the text boundary in the text,
+  and starts that cannot be told apart).
 
 The W3 rules that remain mostly also have other problems:
 
@@ -1016,8 +1090,8 @@ The W3 rules that remain mostly also have other problems:
 - runs followed by an after context (Grek-Latn/UNGEGN, cy-cy_FONIPA, Zawgyi);
 - runs of sets with strings (`[{i̯}ij]+`);
 - text boundaries in the text (`\. ([$])`);
-- SingleCaptureDoubleReplacement rules that string rules of their group may
-  overlap (byn Xaleget, Zawgyi).
+- MultipleCaptureMultipleReplacement rules whose starts cannot be told apart
+  (byn Xaleget, my-Zawgyi, Zawgyi-my).
 
 **The MultipleCaptureMultipleReplacement pattern** generalizes the above:
 `T0 (B1) T1 … (Bk) Tk → R0 $1 R1 … $k Rk`, with fixed-length Ti, fixed texts Ri
@@ -1127,12 +1201,11 @@ The per-transform table lists the problem classes of every transform.
      order of ICU (§3.3) to ICU.
    - Replace the rounds of the converted-text correction by a Pablo `While`
      fixpoint (issue #21), exact for chains of any length.
-2. **W3 and W6.** The overlapping MultipleCaptureMultipleReplacement rules of
-   am_FONIPA-am (19 transforms) and NumericPinyin-Latin, before contexts that the
-   conversions change in MultipleCaptureMultipleReplacement rules
-   (blt-blt_FONIPA, Latin-NumericPinyin), and the revisits not composed (23
-   transforms, mostly unbounded runs, which the run rules of W3 now make
-   approachable).
+2. **W3 and W6.** Before contexts that the conversions change in
+   MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
+   Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits not
+   composed (24 transforms, mostly unbounded runs, which the run rules of W3 now
+   make approachable).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. Run
@@ -1199,6 +1272,9 @@ tconv on every implementable transform.
 | `33e9cb1e1`, `335e35694` | `PipelineBuilder::CreateEmptyStreamSet`; Any-Remove: 25 of 30 built-ins |
 | `56473be9a`, `9043a6b5b` | unreferenced captures removed; `--disable-capture-simplification` |
 | `258f7c284` | captures of before contexts copied (deferred rules): Kana-Latn, Hira-Latn, Jpan-Latn: 347 |
+| `d2411817d`, `1230cb8e4` | partition roots no longer all enumerated; exact starts of MultipleCaptureMultipleReplacement sets, sets with strings kept: NumericPinyin-Latin, Bopo-Latn |
+| `03e837f5f` | string rules and MultipleCaptureMultipleReplacement rules selected together: am_FONIPA-am and 18 `*-am` |
+| `323305975` | captures of finitely many lengths expanded: am-am_FONIPA, am-ar, am-chr, am-fa: 372 |
 
 ## Reproducing
 

@@ -705,6 +705,22 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
 //  a → x ; does.
 std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules);
 
+//  Unreferenced capture removal.
+//
+//  The captures of the source side of a forward conversion rule (in its
+//  before context, text or after context) that the result side never
+//  references, as $n or in the argument of a function call, are replaced by
+//  their contents (re::removeUnneededCaptures); the remaining captures are
+//  renumbered in order and their references updated.  For example,
+//      ($wspace)+ ([\u102b-\u1032]) → $2 ;
+//  becomes
+//      $wspace+ ([\u102b-\u1032]) → $1 ;
+//  Captures do not affect what a rule matches, so the rules are equivalent.
+//  Rules other than forward conversion rules are unchanged.  This is
+//  intended to be applied before TrivialCaptureElimination and
+//  NullableCaptureElimination, which then see only the captures that matter.
+std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules);
+
 //  Expansion of finite texts.
 //
 //  A forward conversion rule whose text to replace has finitely many lengths

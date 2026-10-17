@@ -6,6 +6,7 @@
 #include <ldml/transform_rules.h>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
+#include <re/transforms/capture_removal.h>
 #include "charset_analysis.h"
 #include <functional>
 #include <map>
@@ -425,6 +426,111 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
                 }
             }
         }
+    }
+    return result;
+}
+
+namespace {
+
+//  The references of a result side part, including those in the arguments of
+//  function calls.
+void collectReferences(RE * re, std::vector<RE *> & refs) {
+    if (re == nullptr) return;
+    if (isa<Reference>(re)) {
+        refs.push_back(re);
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n)) collectReferences(n->getDefinition(), refs);
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) collectReferences(e, refs);
+    }
+}
+
+//  Renumbers the captures of a source side in order (by name, as the
+//  captures enclosing removed ones are new objects) and updates the
+//  references of the result side.
+class CaptureRenamer {
+public:
+    RE * source(RE * re) {
+        if (re == nullptr) return nullptr;
+        if (Capture * c = dyn_cast<Capture>(re)) {
+            const std::string name = std::to_string(++mCount);
+            Capture * renamed = makeCapture(name, source(c->getCapturedRE()));
+            mByName.emplace(c->getName(), renamed);
+            return renamed;
+        } else if (Seq * seq = dyn_cast<Seq>(re)) {
+            std::vector<RE *> items;
+            for (RE * e : *seq) items.push_back(source(e));
+            return makeSeq(items.begin(), items.end());
+        } else if (Rep * rep = dyn_cast<Rep>(re)) {
+            return makeRep(source(rep->getRE()), rep->getLB(), rep->getUB());
+        }
+        return re;
+    }
+    RE * result(RE * re) {
+        if (re == nullptr) return nullptr;
+        if (Reference * ref = dyn_cast<Reference>(re)) {
+            auto f = mByName.find(ref->getName());
+            if (f == mByName.end()) return re;
+            return makeReference(f->second->getName(), f->second, ref->getInstance());
+        } else if (Name * n = dyn_cast<Name>(re)) {
+            if (isFunctionCall(n)) return makeFunctionCall(getFunctionID(n), result(n->getDefinition()));
+            return re;
+        } else if (Seq * seq = dyn_cast<Seq>(re)) {
+            std::vector<RE *> items;
+            for (RE * e : *seq) items.push_back(result(e));
+            return makeSeq(items.begin(), items.end());
+        }
+        return re;
+    }
+private:
+    unsigned mCount = 0;
+    std::map<std::string, Capture *> mByName;
+};
+
+}
+
+std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules) {
+    std::vector<Rule *> result;
+    for (Rule * r : rules) {
+        ConversionRule * const c = dyn_cast<ConversionRule>(r);
+        if (c == nullptr || c->getDirection() != Direction::Forward) {
+            result.push_back(r);
+            continue;
+        }
+        const RuleSide * const src = c->getLeftSide();
+        const RuleSide * const res = c->getRightSide();
+        std::vector<RE *> refs;
+        collectReferences(res->getBeforeContext(), refs);
+        collectReferences(res->getCompletedResult(), refs);
+        collectReferences(res->getResultToRevisit(), refs);
+        collectReferences(res->getAfterContext(), refs);
+        std::set<const Capture *> captures;
+        for (RE * part : {src->getBeforeContext(), src->getText(), src->getAfterContext()}) {
+            if (part) collectCaptures(part, captures);
+        }
+        std::set<std::string> referenced;
+        for (RE * ref : refs) referenced.insert(cast<Reference>(ref)->getName());
+        bool unreferenced = false;
+        for (const Capture * cap : captures) unreferenced |= referenced.count(cap->getName()) == 0;
+        if (!unreferenced) {
+            result.push_back(r);
+            continue;
+        }
+        RE * const referencing = makeSeq(refs.begin(), refs.end());
+        auto remove = [&](RE * part) {return part ? removeUnneededCaptures(part, referencing) : nullptr;};
+        CaptureRenamer renamer;
+        // Captures are numbered in order of their opening parentheses.
+        RE * const before = renamer.source(remove(src->getBeforeContext()));
+        RE * const text = renamer.source(remove(src->getText()));
+        RE * const after = renamer.source(remove(src->getAfterContext()));
+        RuleSide * const source = RuleSide::Create(before, text, false, nullptr, 0, after);
+        RuleSide * const replaced = RuleSide::Create(renamer.result(res->getBeforeContext()),
+                                                     renamer.result(res->getCompletedResult()),
+                                                     res->hasCursor(),
+                                                     renamer.result(res->getResultToRevisit()),
+                                                     res->getCursorOffset(),
+                                                     renamer.result(res->getAfterContext()));
+        result.push_back(makeConversionRule(source, Direction::Forward, replaced));
     }
     return result;
 }

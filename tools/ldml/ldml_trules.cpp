@@ -6,14 +6,14 @@
 //  ldml_trules: parse LDML transform rules and print them in canonical form.
 //
 //  ldml_trules [--xml] [--quiet] [--forward | --backward]
-//              [--eliminate-trivial-captures] [--eliminate-nullable-captures] file ...
+//              [--disable-capture-simplification] file ...
 //      Parse the rules of each file (plain rule text, or with --xml, the
 //      <tRule> elements of an LDML transform file), print the canonical
 //      form of the rules and check that the canonical form reparses to
 //      the same canonical form.  With --forward or --backward, the rules
 //      extracted for that direction (as forward rules) are printed.
-//      With --eliminate-trivial-captures and --eliminate-nullable-captures,
-//      trivial and then nullable capture elimination are applied to the
+//      Unless --disable-capture-simplification, unreferenced capture removal
+//      and trivial and nullable capture elimination are applied to the
 //      (forward) rules before printing.  With --mutually-exclusive, the
 //      rules are then expressed in terms of the mutually exclusive
 //      character classes of each group.  With --disambiguate-order, the
@@ -112,11 +112,14 @@ static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extr
 
 // Parse, print, and check that the printed form reparses to the same form.
 static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e,
-                         bool eliminateTrivial, bool eliminateNullable, bool exclusive, bool disambiguate) {
+                         bool simplifyCaptures, bool exclusive, bool disambiguate) {
     try {
         std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
-        if (eliminateTrivial) rules = TrivialCaptureElimination(rules);
-        if (eliminateNullable) rules = NullableCaptureElimination(rules);
+        if (simplifyCaptures) {
+            rules = RemoveUnreferencedCaptures(rules);
+            rules = TrivialCaptureElimination(rules);
+            rules = NullableCaptureElimination(rules);
+        }
         MutuallyExclusiveStats stats;
         if (exclusive) {
             rules = MutuallyExclusivePartitioning(rules, &stats);
@@ -555,6 +558,19 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"(a+) b → $1 ;", "(a+) b → $1 ;\n"},
     {"(a b?) c → $1 ;", "(a b?) c → $1 ;\n"},
     {"(a*) ← b ;", "(a*) ← b ;\n"},
+};
+
+static const EliminationTestCase unreferencedTestCases[] = {
+    {"(a) b → c ;", "ab → c ;\n"},
+    {"(a)+ (b) → $2 ;", "a+ (b) → $1 ;\n"},
+    {"(a+) (b) → $2 $1 ;", "(a+) (b) → $2 $1 ;\n"},
+    // In the contexts, nested, and referenced from a function call.
+    {"(x)? [a-z] { y → z ;", "x? [a-z] { y → z ;\n"},
+    {"a { b } (c (d)) → $2 ;", "a { b } c (d) → $1 ;\n"},
+    {"((a) b) (c) → &Any-Hex($3) $1 ;", "(ab) (c) → &Any-Hex($2) $1 ;\n"},
+    {"(a) (b) → | $2 ;", "a (b) → | $1 ;\n"},
+    // Rules other than forward conversion rules are unchanged.
+    {"(a) b ↔ c ;", "(a) b ↔ c ;\n"},
 };
 
 static const EliminationTestCase trivialTestCases[] = {
@@ -1628,6 +1644,16 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
         }
     }
+    for (const EliminationTestCase & t : unreferencedTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = RemoveUnreferencedCaptures(parseTransformRules({t.input}));
+            failures += !checkOutput("unreferenced", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     for (const EliminationTestCase & t : trivialTestCases) {
         count++;
         try {
@@ -1748,8 +1774,7 @@ int main(int argc, char * argv[]) {
     bool xml = false;
     bool quiet = false;
     Extract e = Extract::All;
-    bool eliminate = false;
-    bool eliminateTrivial = false;
+    bool simplifyCaptures = true;
     bool exclusive = false;
     bool disambiguate = false;
     bool countTrivial = false;
@@ -1766,8 +1791,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--forward") e = Extract::Forward;
         else if (arg == "--backward") e = Extract::Backward;
-        else if (arg == "--eliminate-nullable-captures") eliminate = true;
-        else if (arg == "--eliminate-trivial-captures") eliminateTrivial = true;
+        else if (arg == "--disable-capture-simplification") simplifyCaptures = false;
         else if (arg == "--mutually-exclusive") exclusive = true;
         else if (arg == "--disambiguate-order") disambiguate = true;
         else if (arg == "--count-trivial-captures") countTrivial = true;
@@ -1780,7 +1804,7 @@ int main(int argc, char * argv[]) {
     }
     if (files.empty()) {
         std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward]\n"
-                  << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] [--mutually-exclusive]\n"
+                  << "           [--disable-capture-simplification] [--mutually-exclusive]\n"
                   << "           [--disambiguate-order] file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --overlaps file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --partition file ...\n"
@@ -1815,7 +1839,7 @@ int main(int argc, char * argv[]) {
             } else if (count) {
                 countNullableCaptures(tRules, f, total);
             } else {
-                ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate, exclusive, disambiguate);
+                ok &= processRules(tRules, f, quiet, e, simplifyCaptures, exclusive, disambiguate);
             }
         } catch (const TransformRuleParseErrors & e) {
             reportErrors(f, e);

@@ -126,6 +126,9 @@ static cl::opt<unsigned> MuxClassKernels("mux-class-kernels",
     cl::init(3), cl::cat(TconvOptions), cl::Hidden);
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
                            cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
+    cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
+    cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report problems found in the transform files"),
                                   cl::init(false), cl::cat(TconvOptions));
 
@@ -713,11 +716,15 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         }, &cstats);
         ldml::RevisitStats rstats;
         rules = ldml::ComposeRevisits(rules, &rstats);
-        //  (Rules whose text is only a capture, or continues after it, are kept as
-        //  MultipleCaptureMultipleReplacement rules, rather than insertion rules or
-        //  rules with the capture as a before context, other than (X) X+.)
-        rules = ldml::TrivialCaptureElimination(rules, nullptr, false, false);
-        rules = ldml::NullableCaptureElimination(rules);
+        //  Capture simplification.  (Rules whose text is only a capture, or
+        //  continues after it, are kept as MultipleCaptureMultipleReplacement
+        //  rules, rather than insertion rules or rules with the capture as a
+        //  before context, other than (X) X+.)
+        if (!DisableCaptureSimplification) {
+            rules = ldml::RemoveUnreferencedCaptures(rules);
+            rules = ldml::TrivialCaptureElimination(rules, nullptr, false, false);
+            rules = ldml::NullableCaptureElimination(rules);
+        }
         ldml::FiniteTextStats fstats;
         rules = ldml::ExpandFiniteTexts(rules, &fstats);
         ldml::DisambiguationStats dstats;

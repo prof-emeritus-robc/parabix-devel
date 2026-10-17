@@ -896,10 +896,199 @@ static bool greedyMatchesPossessive(const MultipleCaptureMultipleReplacementSet 
     return true;
 }
 
-TransformPlan planTransform(const std::vector<Rule *> & rules) {
+static std::set<std::u32string> setStrings(const re::RE * re);
+
+//  The expansion of a MultipleCaptureMultipleReplacement rule whose captures
+//  have finitely many lengths into rules whose captures have fixed lengths (so
+//  that its replacements are at fixed offsets): each capture is a sequence of
+//  sets, sets with strings and optional items, and the rules are the
+//  combinations of the alternatives of each item (an optional item present or
+//  absent; a set with strings, each of its strings, then its characters), in
+//  the order in which ICU, matching possessively, prefers them (present first,
+//  longest first).  The rules are equivalent to the rule as long as a less
+//  preferred alternative cannot match where a preferred one matches but the
+//  rest of the rule does not: what follows an optional item may not begin with
+//  its characters, nor what follows a set with strings with the character
+//  extending one of its strings (or characters) into a longer one.
+static bool expandFiniteCaptures(ConversionRule * c, CharSetAnalysis & sets, std::vector<Rule *> & variants) {
+    constexpr size_t MaxVariants = 64;
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    //  The items of the text, with the captures as items.
+    std::vector<re::RE *> textItemList;
+    std::function<void (re::RE *)> flattenText = [&](re::RE * re) {
+        if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+            for (re::RE * e : *seq) flattenText(e);
+        } else {
+            textItemList.push_back(re);
+        }
+    };
+    flattenText(source->getText());
+    //  An item of a capture: its alternatives (each a sequence of sets), the
+    //  characters it may match, and whether it is variable (with its
+    //  constraint on what follows: the characters that may not begin it).
+    struct Item {
+        std::vector<std::vector<re::RE *>> alts;
+        UCD::UnicodeSet first;          // the characters with which it may begin
+        UCD::UnicodeSet forbiddenNext;  // the characters that may not follow it
+        bool optional = false;
+    };
+    std::vector<Item> items;            // all the items of the text, in order
+    std::vector<size_t> owner;          // the item of the text (index in textItemList) of each item
+    auto setItem = [&](re::RE * set, Item & item) -> bool {
+        if (!CharSetAnalysis::isSet(set)) return false;
+        const UCD::UnicodeSet chars = sets.setOf(set, false);
+        const std::set<std::u32string> strings = setStrings(set);
+        std::vector<std::u32string> ordered(strings.begin(), strings.end());
+        std::stable_sort(ordered.begin(), ordered.end(), [](const std::u32string & a, const std::u32string & b) {return a.size() > b.size();});
+        for (const std::u32string & str : ordered) {
+            std::vector<re::RE *> alt;
+            for (char32_t ch : str) alt.push_back(re::makeCC(static_cast<UCD::codepoint_t>(ch), &cc::Unicode));
+            item.alts.push_back(alt);
+            item.first.insert(str[0]);
+            for (size_t k = 1; k < str.size(); k++) {
+                const std::u32string prefix = str.substr(0, k);
+                if ((k == 1 && chars.contains(prefix[0])) || strings.count(prefix)) item.forbiddenNext.insert(str[k]);
+            }
+        }
+        if (!chars.empty()) item.alts.push_back({re::makeCC(chars, &cc::Unicode)});
+        item.first = item.first + chars;
+        return !item.alts.empty();
+    };
+    std::function<bool (re::RE *, size_t)> addItems = [&](re::RE * re, size_t t) -> bool {
+        if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+            for (re::RE * e : *seq) if (!addItems(e, t)) return false;
+            return true;
+        } else if (re::Name * n = dyn_cast<re::Name>(re);
+                   n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+            return addItems(n->getDefinition(), t);
+        } else if (re::Rep * rep = dyn_cast<re::Rep>(re)) {
+            if (rep->getLB() != 0 || rep->getUB() != 1) return false;
+            Item item;
+            if (!setItem(rep->getRE(), item)) return false;
+            item.optional = true;
+            item.forbiddenNext = item.forbiddenNext + item.first;
+            item.alts.push_back({});
+            items.push_back(std::move(item));
+            owner.push_back(t);
+            return true;
+        }
+        Item item;
+        if (!setItem(re, item)) return false;
+        items.push_back(std::move(item));
+        owner.push_back(t);
+        return true;
+    };
+    for (size_t t = 0; t < textItemList.size(); t++) {
+        re::RE * const re = textItemList[t];
+        if (re::Capture * cap = dyn_cast<re::Capture>(re)) {
+            if (containsCapture(cap->getCapturedRE()) || !addItems(cap->getCapturedRE(), t)) return false;
+        } else if (!addItems(re, t)) {
+            return false;
+        }
+    }
+    //  The equivalence: what follows each item may not begin with a character it forbids.
+    UCD::UnicodeSet afterFirst;
+    if (source->getAfterContext() && !firstContextSet(source->getAfterContext(), afterFirst, sets)) afterFirst = UCD::UnicodeSet(0, 0x10FFFF);
+    for (size_t i = 0; i < items.size(); i++) {
+        if (items[i].forbiddenNext.empty()) continue;
+        UCD::UnicodeSet next;
+        size_t j = i + 1;
+        for (; j < items.size(); j++) {
+            next = next + items[j].first;
+            if (!items[j].optional) break;
+        }
+        if (j == items.size()) next = next + afterFirst;
+        if (next.intersects(items[i].forbiddenNext)) return false;
+    }
+    //  The combinations, the first item varying slowest.
+    size_t count = 1;
+    for (const Item & item : items) {
+        count *= item.alts.size();
+        if (count > MaxVariants) return false;
+    }
+    if (count == 1) return false;
+    for (size_t v = 0; v < count; v++) {
+        std::vector<size_t> choice(items.size());
+        size_t rest = v;
+        for (size_t i = items.size(); i-- > 0; ) {
+            choice[i] = rest % items[i].alts.size();
+            rest /= items[i].alts.size();
+        }
+        //  The text: the items outside the captures in place, and each capture
+        //  rebuilt from the alternatives of its items.
+        std::map<std::string, re::Capture *> captures;
+        std::vector<re::RE *> ordered;
+        for (size_t t = 0, i = 0; t < textItemList.size(); t++) {
+            std::vector<re::RE *> parts;
+            for (; i < items.size() && owner[i] == t; i++) {
+                for (re::RE * e : items[i].alts[choice[i]]) parts.push_back(e);
+            }
+            if (re::Capture * cap = dyn_cast<re::Capture>(textItemList[t])) {
+                re::Capture * const rebuilt = re::makeCapture(cap->getName(), re::makeSeq(parts.begin(), parts.end()));
+                captures.emplace(cap->getName(), rebuilt);
+                ordered.push_back(rebuilt);
+            } else {
+                ordered.insert(ordered.end(), parts.begin(), parts.end());
+            }
+        }
+        std::function<re::RE * (re::RE *)> refs = [&](re::RE * re) -> re::RE * {
+            if (re == nullptr) return nullptr;
+            if (re::Reference * ref = dyn_cast<re::Reference>(re)) {
+                auto f = captures.find(ref->getName());
+                return f == captures.end() ? re : re::makeReference(ref->getName(), f->second, ref->getInstance());
+            } else if (re::Name * n = dyn_cast<re::Name>(re)) {
+                return isFunctionCall(n) ? makeFunctionCall(getFunctionID(n), refs(n->getDefinition())) : re;
+            } else if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+                std::vector<re::RE *> es;
+                for (re::RE * e : *seq) es.push_back(refs(e));
+                return re::makeSeq(es.begin(), es.end());
+            }
+            return re;
+        };
+        RuleSide * const src = RuleSide::Create(source->getBeforeContext(), re::makeSeq(ordered.begin(), ordered.end()), false,
+                                                nullptr, 0, source->getAfterContext());
+        RuleSide * const res = RuleSide::Create(refs(result->getBeforeContext()), refs(result->getCompletedResult()),
+                                                result->hasCursor(), refs(result->getResultToRevisit()),
+                                                result->getCursorOffset(), refs(result->getAfterContext()));
+        variants.push_back(makeConversionRule(src, Direction::Forward, res));
+    }
+    return true;
+}
+
+TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
     TransformPlan plan;
     CharSetAnalysis sets;
     TransformStep * group = nullptr;
+    //  The MultipleCaptureMultipleReplacement rules whose replacements are not at
+    //  fixed offsets, for captures of variable length, expanded where possible
+    //  into rules whose captures have fixed lengths (see expandFiniteCaptures).
+    std::vector<Rule *> rules;
+    for (Rule * r : rulesGiven) {
+        ConversionRule * const c = dyn_cast<ConversionRule>(r);
+        if (c && c->getDirection() == Direction::Forward && containsCapture(c->getSourceSide(Direction::Forward)->getText())) {
+            MultipleCaptureMultipleReplacement mr;
+            MultipleCaptureMultipleReplacementSet ms;
+            std::string reason;
+            if (!multipleCaptureMultipleReplacement(c, mr, ms, sets, reason)
+                    && (reason == "a replaced text lies between captures of variable length"
+                        || reason == "an insertion is not next to a capture that is never empty, at a fixed offset")) {
+                std::vector<Rule *> variants;
+                bool ok = expandFiniteCaptures(c, sets, variants);
+                for (Rule * v : variants) {
+                    MultipleCaptureMultipleReplacement vr;
+                    MultipleCaptureMultipleReplacementSet vs;
+                    std::string vreason;
+                    ok &= multipleCaptureMultipleReplacement(cast<ConversionRule>(v), vr, vs, sets, vreason);
+                }
+                if (ok) {
+                    rules.insert(rules.end(), variants.begin(), variants.end());
+                    continue;
+                }
+            }
+        }
+        rules.push_back(r);
+    }
     //  The triggers of the BeforeCaptureCopy rules of each group (between
     //  transform rules): the rules of the group whose texts begin with them are
     //  deferred.

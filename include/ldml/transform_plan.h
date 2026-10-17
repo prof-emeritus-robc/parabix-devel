@@ -259,6 +259,19 @@ struct DeferredRule {
     re::RE * engineBefore = nullptr;    // the before context, without the capture, as a lookbehind body
     re::RE * engineAfter = nullptr;     // the after context, as a lookahead body
     const ConversionRule * rule = nullptr;
+    // A copy rule whose replacement R and copy c reproduce its before context
+    // (the SelfReproducingContext pattern): P matches R (or, R empty, the end of
+    // any copy), and C, matched right to left before R c, matches c again.  At a
+    // run of its texts T, the rule applies at each, writing R c every time, as
+    // long as its text and after context match there and those of no deferred
+    // rule before it do.
+    bool selfReproducing = false;
+    // For a self-reproducing rule, the deferred rules before it that may apply at
+    // the texts of its runs (indexes in TransformStep::deferred): those whose
+    // before contexts, matched right to left, may match the block R c written
+    // before each text (the others cannot apply there, whatever their texts and
+    // after contexts).
+    std::vector<size_t> runInterferers;
 };
 
 struct TransformStep {

@@ -902,7 +902,8 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             llvm::outs() << "    deferred rules (" << step.deferred.size() << ", " << step.copyCaptures.size()
                          << " captures copied, triggers " << printRanges(step.deferredTriggers) << "):\n";
             for (const ldml::DeferredRule & d : step.deferred) {
-                llvm::outs() << "      " << (d.capture >= 0 ? "copy: " : "") << ldml::printRule(d.rule) << "\n";
+                llvm::outs() << "      " << (d.selfReproducing ? "self-reproducing copy: " : d.capture >= 0 ? "copy: " : "")
+                             << ldml::printRule(d.rule) << "\n";
             }
         }
         for (const ldml::CharMapSubgroup & s : step.subgroups) {
@@ -3912,6 +3913,353 @@ private:
     const DeferredConfig mConfig;
 };
 
+//  The runs of the texts of self-reproducing copy rules (see
+//  ldml::DeferredRule::selfReproducing), after a round of the deferred rules:
+//  given the text (Text: the codepoint bits, then other streams kept in step
+//  with it, such as masks), the blocks written in the round by the
+//  self-reproducing rules applied (Marks: [0] their first positions, [1] their
+//  positions, then the bits of the rule of each block at its first position,
+//  then for each rule the first positions of its texts where it would apply but
+//  for its before context), each text that follows a block or a text of the
+//  same rule replaced by a copy of the block, which a scalar scan keeps: the rule
+//  applies there, its before context being reproduced.  The words without
+//  marks are copied whole, shifted by the positions inserted so far.
+class DeferredRuns final : public MultiBlockKernel {
+public:
+    DeferredRuns(LLVMTypeSystemInterface & ts, std::vector<unsigned> textLengths, unsigned maxBlock,
+                 StreamSet * Text, StreamSet * Marks, StreamSet * Result)
+    : MultiBlockKernel(ts, "DeferredRuns" + std::to_string(Text->getNumElements()) + "_" + std::to_string(maxBlock) + [&] {
+                           std::string sig;
+                           for (unsigned l : textLengths) sig += "_" + std::to_string(l);
+                           return sig;
+                       }(),
+                       {Binding{"Text", Text}, Binding{"Marks", Marks}},
+                       {Binding{"Result", Result, BoundedRate(0, std::max(1u, maxBlock)), EmptyWriteOverflow()}},
+                       {}, {},
+                       [&] {
+                           InternalScalars v{InternalScalar{ts.getInt64Ty(), "capturing"}, InternalScalar{ts.getInt64Ty(), "blockLength"},
+                                             InternalScalar{ts.getInt64Ty(), "blockRule"}, InternalScalar{ts.getInt64Ty(), "expected"},
+                                             InternalScalar{ts.getInt64Ty(), "skip"}};
+                           for (unsigned i = 0; i < Text->getNumElements(); i++) {
+                               v.push_back(InternalScalar{ts.getInt64Ty(), "block" + std::to_string(i)});
+                           }
+                           return v;
+                       }()),
+      mTextLengths(std::move(textLengths)), mStreams(Text->getNumElements()),
+      mRuleBits(Marks->getNumElements() - 2 - static_cast<unsigned>(mTextLengths.size())) {
+        setStride(ts.getBitBlockWidth());
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Type * const i64Ty = b.getInt64Ty();
+        Type * const sizeTy = b.getSizeTy();
+        Constant * const W0 = b.getInt64(0);
+        Constant * const W1 = b.getInt64(1);
+        Constant * const W64 = b.getInt64(64);
+        Constant * const NONE = b.getInt64(-1);
+        const unsigned N = mStreams;
+        const unsigned K = mRuleBits;
+        auto toI64 = [&](Value * v) {return b.CreateZExtOrTrunc(v, i64Ty);};
+        auto toSize = [&](Value * v) {return b.CreateZExtOrTrunc(v, sizeTy);};
+        //  The positions below n (0 to 64).
+        auto lowMask = [&](Value * n) {
+            Value * const full = b.CreateICmpUGE(n, W64);
+            return b.CreateSelect(full, b.getInt64(-1), b.CreateSub(b.CreateShl(W1, b.CreateSelect(full, W0, n)), W1));
+        };
+        auto inWordPtr = [&](const char * name, unsigned i, Value * pos) {
+            return b.CreatePointerCast(b.getRawInputPointer(name, b.getInt32(i), toSize(pos)), PointerType::getUnqual(b.getContext()));
+        };
+        auto outWordPtr = [&](unsigned i, Value * pos) {
+            return b.CreatePointerCast(b.getRawOutputPointer("Result", b.getInt32(i), toSize(pos)), PointerType::getUnqual(b.getContext()));
+        };
+        //  Writes the n (1 to 64) low bits of bits at output position o of stream i.
+        auto emit = [&](unsigned i, Value * bits, Value * n, Value * o) {
+            Value * const off = b.CreateAnd(o, b.getInt64(63));
+            Value * const base = b.CreateSub(o, off);
+            Value * const v = b.CreateAnd(bits, lowMask(n));
+            Value * const p0 = outWordPtr(i, base);
+            Value * const w0 = b.CreateAnd(b.CreateLoad(i64Ty, p0), lowMask(off));
+            b.CreateStore(b.CreateOr(w0, b.CreateShl(v, off)), p0);
+            //  The bits beyond the word (none if off is 0).
+            Value * const spill = b.CreateLShr(v, b.CreateSub(W64, b.CreateSelect(b.CreateICmpEQ(off, W0), W1, off)));
+            Value * const hi = b.CreateSelect(b.CreateICmpEQ(off, W0), W0, spill);
+            Value * const p1 = outWordPtr(i, b.CreateAdd(base, W64));
+            b.CreateStore(hi, p1);
+        };
+
+        Value * const processed = toI64(b.getProcessedItemCount("Text"));
+        Value * const produced = toI64(b.getProducedItemCount("Result"));
+        Value * const accessible = toI64(b.getAccessibleItemCount("Text"));
+        Value * const items = b.CreateUMin(b.CreateMul(toI64(numOfStrides), b.getInt64(b.getBitBlockWidth())), accessible);
+        Value * const words = b.CreateUDiv(b.CreateAdd(items, b.getInt64(63)), W64);
+
+        //  The state: the output position, the block kept (capturing, its length,
+        //  rule and bits), the position at which a text continues the run (or
+        //  NONE), the positions of a text still to skip.
+        enum {O, CAP, LEN, RULE, EXP, SKIP, BLOCK};
+        std::vector<Value *> state0{produced, b.getScalarField("capturing"), b.getScalarField("blockLength"),
+                                    b.getScalarField("blockRule"),
+                                    b.CreateSub(b.getScalarField("expected"), W1),     // (stored + 1; 0: none)
+                                    b.getScalarField("skip")};
+        for (unsigned i = 0; i < N; i++) state0.push_back(b.getScalarField("block" + std::to_string(i)));
+        auto phis = [&](const std::vector<Value *> & from, BasicBlock * pred, unsigned n) {
+            std::vector<PHINode *> v;
+            for (Value * x : from) {
+                v.push_back(b.CreatePHI(i64Ty, n));
+                v.back()->addIncoming(x, pred);
+            }
+            return v;
+        };
+        auto addIncoming = [&](std::vector<PHINode *> & v, const std::vector<Value *> & from, BasicBlock * pred) {
+            for (size_t k = 0; k < v.size(); k++) v[k]->addIncoming(from[k], pred);
+        };
+        auto values = [](const std::vector<PHINode *> & v) {return std::vector<Value *>(v.begin(), v.end());};
+
+        BasicBlock * const entry = b.GetInsertBlock();
+        BasicBlock * const wordLoop = b.CreateBasicBlock("wordLoop");
+        BasicBlock * const wordBody = b.CreateBasicBlock("wordBody");
+        BasicBlock * const fastWord = b.CreateBasicBlock("fastWord");
+        BasicBlock * const bitLoop = b.CreateBasicBlock("bitLoop");
+        BasicBlock * const bitBody = b.CreateBasicBlock("bitBody");
+        BasicBlock * const notSkipping = b.CreateBasicBlock("notSkipping");
+        BasicBlock * const chained = b.CreateBasicBlock("chained");
+        BasicBlock * const passThrough = b.CreateBasicBlock("passThrough");
+        BasicBlock * const bitNext = b.CreateBasicBlock("bitNext");
+        BasicBlock * const wordNext = b.CreateBasicBlock("wordNext");
+        BasicBlock * const done = b.CreateBasicBlock("done");
+        b.CreateBr(wordLoop);
+
+        b.SetInsertPoint(wordLoop);
+        PHINode * const w = b.CreatePHI(i64Ty, 2);
+        w->addIncoming(W0, entry);
+        std::vector<PHINode *> ws = phis(state0, entry, 2);
+        b.CreateCondBr(b.CreateICmpULT(w, words), wordBody, done);
+
+        b.SetInsertPoint(wordBody);
+        Value * const P = b.CreateAdd(processed, b.CreateMul(w, W64));
+        Value * const n = b.CreateUMin(W64, b.CreateSub(items, b.CreateMul(w, W64)));
+        std::vector<Value *> text, marks;
+        for (unsigned i = 0; i < N; i++) text.push_back(b.CreateLoad(i64Ty, inWordPtr("Text", i, P)));
+        Value * anyMark = W0;
+        const unsigned S = static_cast<unsigned>(mTextLengths.size());
+        for (unsigned i = 0; i < 2 + K + S; i++) {
+            marks.push_back(b.CreateLoad(i64Ty, inWordPtr("Marks", i, P)));
+            if (i < 2 || i >= 2 + K) anyMark = b.CreateOr(anyMark, marks.back());
+        }
+        anyMark = b.CreateAnd(anyMark, lowMask(n));
+        Value * const fast = b.CreateAnd(b.CreateAnd(b.CreateICmpEQ(anyMark, W0), b.CreateICmpEQ(n, W64)),
+                                         b.CreateAnd(b.CreateICmpEQ(ws[CAP], W0), b.CreateICmpEQ(ws[SKIP], W0)));
+        b.CreateCondBr(fast, fastWord, bitLoop);
+
+        //  A word without marks: copied whole.
+        b.SetInsertPoint(fastWord);
+        for (unsigned i = 0; i < N; i++) emit(i, text[i], W64, ws[O]);
+        std::vector<Value *> fastState = values(ws);
+        fastState[O] = b.CreateAdd(ws[O], W64);
+        b.CreateBr(wordNext);
+
+        //  Otherwise, position by position.
+        b.SetInsertPoint(bitLoop);
+        PHINode * const j = b.CreatePHI(i64Ty, 2);
+        j->addIncoming(W0, wordBody);
+        std::vector<PHINode *> bs = phis(values(ws), wordBody, 2);
+        b.CreateCondBr(b.CreateICmpULT(j, n), bitBody, wordNext);
+
+        b.SetInsertPoint(bitBody);
+        auto bit = [&](Value * word) {return b.CreateAnd(b.CreateLShr(word, j), W1);};
+        Value * const p = b.CreateAdd(P, j);
+        std::vector<Value * > skipState = values(bs);
+        skipState[SKIP] = b.CreateSub(bs[SKIP], W1);
+        BasicBlock * const skipFrom = b.GetInsertBlock();
+        b.CreateCondBr(b.CreateICmpNE(bs[SKIP], W0), bitNext, notSkipping);
+
+        b.SetInsertPoint(notSkipping);
+        Value * const blockStart = b.CreateICmpNE(bit(marks[0]), W0);
+        Value * const inBlock = b.CreateICmpNE(bit(marks[1]), W0);
+        Value * blockRule = W0;
+        for (unsigned k = 0; k < K; k++) blockRule = b.CreateOr(blockRule, b.CreateShl(bit(marks[2 + k]), b.getInt64(k)));
+        //  The end of the block kept: the next text continues the run here.
+        Value * const capturing = b.CreateICmpNE(bs[CAP], W0);
+        Value * const ended = b.CreateAnd(capturing, b.CreateOr(b.CreateNot(inBlock), blockStart));
+        std::vector<Value *> st = values(bs);
+        st[CAP] = b.CreateSelect(ended, W0, st[CAP]);
+        st[EXP] = b.CreateSelect(ended, p, st[EXP]);
+        //  A new block.
+        st[CAP] = b.CreateSelect(blockStart, W1, st[CAP]);
+        st[LEN] = b.CreateSelect(blockStart, W0, st[LEN]);
+        st[RULE] = b.CreateSelect(blockStart, blockRule, st[RULE]);
+        st[EXP] = b.CreateSelect(blockStart, NONE, st[EXP]);
+        for (unsigned i = 0; i < N; i++) st[BLOCK + i] = b.CreateSelect(blockStart, W0, st[BLOCK + i]);
+        //  A text of the rule of the block kept, where the run continues.
+        Value * textOfRule = W0;
+        for (unsigned r = 0; r < S; r++) {
+            textOfRule = b.CreateSelect(b.CreateICmpEQ(st[RULE], b.getInt64(r)), bit(marks[2 + K + r]), textOfRule);
+        }
+        Value * const continues = b.CreateAnd(b.CreateAnd(b.CreateICmpNE(textOfRule, W0), b.CreateICmpEQ(st[CAP], W0)),
+                                              b.CreateICmpEQ(p, st[EXP]));
+        b.CreateCondBr(continues, chained, passThrough);
+
+        //  A text continuing the run: a copy of the block in its place.
+        b.SetInsertPoint(chained);
+        for (unsigned i = 0; i < N; i++) emit(i, st[BLOCK + i], st[LEN], st[O]);
+        Value * length = b.getInt64(mTextLengths.back());
+        for (int r = static_cast<int>(mTextLengths.size()) - 2; r >= 0; r--) {
+            length = b.CreateSelect(b.CreateICmpEQ(st[RULE], b.getInt64(r)), b.getInt64(mTextLengths[r]), length);
+        }
+        std::vector<Value *> chainState = st;
+        chainState[O] = b.CreateAdd(st[O], st[LEN]);
+        chainState[SKIP] = b.CreateSub(length, W1);
+        chainState[EXP] = b.CreateAdd(p, length);
+        b.CreateBr(bitNext);
+
+        //  Any other position: copied (and kept, within a block).
+        b.SetInsertPoint(passThrough);
+        std::vector<Value *> passState = st;
+        Value * const keep = b.CreateICmpNE(st[CAP], W0);
+        for (unsigned i = 0; i < N; i++) {
+            Value * const v = bit(text[i]);
+            emit(i, v, W1, st[O]);
+            passState[BLOCK + i] = b.CreateSelect(keep, b.CreateOr(st[BLOCK + i], b.CreateShl(v, st[LEN])), st[BLOCK + i]);
+        }
+        passState[LEN] = b.CreateSelect(keep, b.CreateAdd(st[LEN], W1), st[LEN]);
+        passState[O] = b.CreateAdd(st[O], W1);
+        b.CreateBr(bitNext);
+
+        b.SetInsertPoint(bitNext);
+        std::vector<PHINode *> nx = phis(skipState, skipFrom, 3);
+        addIncoming(nx, chainState, chained);
+        addIncoming(nx, passState, passThrough);
+        j->addIncoming(b.CreateAdd(j, W1), bitNext);
+        addIncoming(bs, values(nx), bitNext);
+        b.CreateBr(bitLoop);
+
+        b.SetInsertPoint(wordNext);
+        std::vector<PHINode *> wn = phis(fastState, fastWord, 2);
+        addIncoming(wn, values(bs), bitLoop);
+        w->addIncoming(b.CreateAdd(w, W1), wordNext);
+        addIncoming(ws, values(wn), wordNext);
+        b.CreateBr(wordLoop);
+
+        b.SetInsertPoint(done);
+        b.setScalarField("capturing", ws[CAP]);
+        b.setScalarField("blockLength", ws[LEN]);
+        b.setScalarField("blockRule", ws[RULE]);
+        b.setScalarField("expected", b.CreateAdd(ws[EXP], W1));
+        b.setScalarField("skip", ws[SKIP]);
+        for (unsigned i = 0; i < N; i++) b.setScalarField("block" + std::to_string(i), ws[BLOCK + i]);
+        b.setProducedItemCount("Result", toSize(ws[O]));
+    }
+private:
+    const std::vector<unsigned> mTextLengths;
+    const unsigned mStreams;
+    const unsigned mRuleBits;
+};
+
+//  The blocks written by the self-reproducing rules applied in a round (after
+//  the insertions): for each such rule r (srcIndex of the rule, or -1), the
+//  positions inserted after its triggers; their first positions, all their
+//  positions, and the bits of r at the first.
+class DeferredHeadBlocks final : public pablo::PabloKernel {
+public:
+    DeferredHeadBlocks(LLVMTypeSystemInterface & ts, std::vector<int> srcIndex, unsigned ruleBits,
+                       StreamSet * Info, StreamSet * Spread, StreamSet * Blocks)
+    : PabloKernel(ts, "DeferredHeadBlocks_" + [&] {
+                      std::string sig = std::to_string(ruleBits);
+                      for (int r : srcIndex) sig += "," + std::to_string(r);
+                      return getStringHash(sig);
+                  }(),
+                  {Binding{"Info", Info}, Binding{"Spread", Spread}}, {Binding{"Blocks", Blocks}}),
+      mSrcIndex(std::move(srcIndex)), mRuleBits(ruleBits) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> info = getInputStreamSet("Info");
+        PabloAST * const inserted = pb.createNot(getInputStreamSet("Spread")[0]);
+        PabloAST * starts = pb.createZeroes(), * in = pb.createZeroes();
+        std::vector<PabloAST *> rule(mRuleBits, pb.createZeroes());
+        for (size_t i = 0; i < mSrcIndex.size(); i++) {
+            if (mSrcIndex[i] < 0) continue;
+            PabloAST * const first = pb.createAnd(pb.createAdvance(info[i], 1), inserted);
+            starts = pb.createOr(starts, first);
+            in = pb.createOr(in, pb.createAnd(pb.createMatchStar(first, inserted), inserted));
+            for (unsigned k = 0; k < mRuleBits; k++) {
+                if ((mSrcIndex[i] >> k) & 1) rule[k] = pb.createOr(rule[k], first);
+            }
+        }
+        std::vector<PabloAST *> out{starts, in};
+        out.insert(out.end(), rule.begin(), rule.end());
+        writeOutputStreamSet("Blocks", out);
+    }
+private:
+    const std::vector<int> mSrcIndex;
+    const unsigned mRuleBits;
+};
+
+//  Where a self-reproducing rule would apply but for its before context (at the
+//  first positions of its texts): its text and after context match there
+//  (Matches, at the last positions of the texts, by the index of the match of
+//  each deferred rule), and those of no deferred rule before it, within the mask
+//  and not in the text written by the deferred rules: a stream for each
+//  self-reproducing rule.
+class DeferredCandidates final : public pablo::PabloKernel {
+public:
+    DeferredCandidates(LLVMTypeSystemInterface & ts, std::vector<int> srcIndex, std::vector<unsigned> matchOf,
+                       std::vector<unsigned> textLengths, std::vector<std::vector<size_t>> interferers, unsigned ruleBits,
+                       const std::vector<StreamSet *> & Matches, StreamSet * Written, StreamSet * Mask, StreamSet * Candidates)
+    : PabloKernel(ts, "DeferredCandidates_" + [&] {
+                      std::string sig = std::to_string(ruleBits) + (Mask ? "m" : "");
+                      for (size_t i = 0; i < srcIndex.size(); i++) {
+                          sig += "," + std::to_string(srcIndex[i]) + "/" + std::to_string(matchOf[i]) + "/" + std::to_string(textLengths[i]) + ":";
+                          for (size_t j : interferers[i]) sig += std::to_string(j) + ".";
+                      }
+                      return getStringHash(sig);
+                  }(),
+                  [&] {
+                      Bindings b;
+                      for (size_t k = 0; k < Matches.size(); k++) {
+                          unsigned lookahead = 1;
+                          for (size_t i = 0; i < matchOf.size(); i++) {
+                              if (matchOf[i] == k) lookahead = std::max(lookahead, textLengths[i] - 1);
+                          }
+                          b.emplace_back("M" + std::to_string(k), Matches[k], FixedRate(1), LookAhead(lookahead));
+                      }
+                      b.emplace_back("Written", Written);
+                      if (Mask) b.emplace_back("Mask", Mask);
+                      return b;
+                  }(),
+                  {Binding{"Candidates", Candidates}}),
+      mSrcIndex(std::move(srcIndex)), mMatchOf(std::move(matchOf)), mTextLengths(std::move(textLengths)),
+      mInterferers(std::move(interferers)), mRuleBits(ruleBits), mMasked(Mask != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * allowed = pb.createNot(getInputStreamSet("Written")[0]);
+        if (mMasked) allowed = pb.createAnd(allowed, getInputStreamSet("Mask")[0]);
+        std::vector<PabloAST *> out;
+        std::vector<PabloAST *> matches;
+        for (size_t i = 0; i < mSrcIndex.size(); i++) {
+            PabloAST * m = getInputStreamSet("M" + std::to_string(mMatchOf[i]))[0];
+            if (mTextLengths[i] > 1) m = pb.createLookahead(m, mTextLengths[i] - 1);
+            matches.push_back(pb.createAnd(m, allowed));
+        }
+        //  (A stream for each self-reproducing rule, in order.)
+        for (size_t i = 0; i < mSrcIndex.size(); i++) {
+            if (mSrcIndex[i] < 0) continue;
+            PabloAST * c = matches[i];
+            for (size_t j : mInterferers[i]) c = pb.createAnd(c, pb.createNot(matches[j]));
+            out.push_back(c);
+        }
+        writeOutputStreamSet("Candidates", out);
+    }
+private:
+    const std::vector<int> mSrcIndex;
+    const std::vector<unsigned> mMatchOf;
+    const std::vector<unsigned> mTextLengths;
+    const std::vector<std::vector<size_t>> mInterferers;
+    const unsigned mRuleBits;
+    const bool mMasked;
+};
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -5837,6 +6185,39 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
         config.starClass.push_back(c.star ? static_cast<int>(classSets.size()) : -1);
         if (c.star) classSets.push_back(c.starSet);
     }
+    //  The self-reproducing rules (their indexes, the bits of an index, the lengths
+    //  of their texts), the distinct texts and after contexts of the deferred
+    //  rules (the match of each), and the longest block written.
+    std::vector<int> srcIndex;
+    std::vector<unsigned> srcTextLengths;
+    for (const ldml::DeferredRule & d : step.deferred) {
+        srcIndex.push_back(d.selfReproducing ? static_cast<int>(srcTextLengths.size()) : -1);
+        if (d.selfReproducing) srcTextLengths.push_back(static_cast<unsigned>(d.text.size()));
+    }
+    const unsigned srcCount = static_cast<unsigned>(srcTextLengths.size());
+    unsigned srcBits = 1;
+    while ((srcCount >> srcBits) != 0) srcBits++;
+    auto matchKey = [](const ldml::DeferredRule & d) {
+        re::RE * const after = d.rule->getSourceSide(ldml::Direction::Forward)->getAfterContext();
+        std::string key = after ? ldml::printPattern(after) : "";
+        for (const UCD::UnicodeSet & chars : d.text) {
+            key += "|";
+            for (const auto & range : chars) key += std::to_string(range.first) + "-" + std::to_string(range.second) + ",";
+        }
+        return key;
+    };
+    std::vector<size_t> matchKeys;
+    std::vector<unsigned> matchOf;
+    for (size_t i = 0; i < step.deferred.size(); i++) {
+        size_t k = 0;
+        while (k < matchKeys.size() && matchKey(step.deferred[matchKeys[k]]) != matchKey(step.deferred[i])) k++;
+        if (k == matchKeys.size()) matchKeys.push_back(i);
+        matchOf.push_back(static_cast<unsigned>(k));
+    }
+    unsigned maxBlock = 0;
+    for (const ldml::DeferredRule & d : step.deferred) {
+        if (d.selfReproducing) maxBlock = std::max(maxBlock, static_cast<unsigned>(d.replacement.size()) + config.maxCopy());
+    }
     //  The positions written by the deferred rules in the rounds so far.
     StreamSet * written = nullptr;
     for (unsigned round = 0; round < DeferredRounds; round++) {
@@ -5904,6 +6285,57 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
         written = writtenNext;
         SHOW_BIXNUM(result);
         U21 = result;
+        //  The runs of the texts of the self-reproducing rules applied (see
+        //  DeferredRuns): the blocks they wrote, and where their texts may follow.
+        if (srcCount > 0) {
+            StreamSet * const spreadBlocks = P.CreateStreamSet(2 + srcBits);
+            P.CreateKernelCall<DeferredHeadBlocks>(srcIndex, srcBits, spreadInfo, SpreadMask, spreadBlocks);
+            StreamSet * const blocks = P.CreateStreamSet(2 + srcBits);
+            FilterByMask(P, keep, spreadBlocks, blocks);
+            std::vector<StreamSet *> textMatches;
+            for (const auto & key : matchKeys) {
+                const ldml::DeferredRule & d = step.deferred[key];
+                textMatches.push_back(matchPositions(nullptr, d.engineAfter, d.text, U21));
+            }
+            StreamSet * const candidates = P.CreateStreamSet(srcCount);
+            std::vector<std::vector<size_t>> interferers;
+            for (const ldml::DeferredRule & d : step.deferred) interferers.push_back(d.runInterferers);
+            P.CreateKernelCall<DeferredCandidates>(srcIndex, matchOf, config.textLengths, interferers, srcBits, textMatches,
+                                                   written, activeMask(), candidates);
+            SHOW_STREAM(candidates);
+            //  The text with the masks and the text written, kept in step.
+            std::vector<StreamSet *> textSets{U21};
+            std::vector<std::pair<unsigned, unsigned>> textOrder;
+            for (unsigned b = 0; b < 21; b++) textOrder.emplace_back(0, b);
+            for (StreamSet * m : mMasks) {
+                textOrder.emplace_back(textSets.size(), 0);
+                textSets.push_back(m);
+            }
+            textOrder.emplace_back(textSets.size(), 0);
+            textSets.push_back(written);
+            StreamSet * const textIn = P.CreateStreamSet(textOrder.size());
+            P.CreateKernelCall<MergeStreamSets>(textSets, textOrder, textIn);
+            std::vector<std::pair<unsigned, unsigned>> markOrder{{0, 0}, {0, 1}};
+            for (unsigned k = 0; k < srcBits; k++) markOrder.emplace_back(0, 2 + k);
+            for (unsigned r = 0; r < srcCount; r++) markOrder.emplace_back(1, r);
+            StreamSet * const marks = P.CreateStreamSet(markOrder.size());
+            P.CreateKernelCall<MergeStreamSets>(std::vector<StreamSet *>{blocks, candidates}, markOrder, marks);
+            StreamSet * const textOut = P.CreateStreamSet(textOrder.size());
+            P.CreateKernelCall<DeferredRuns>(srcTextLengths, maxBlock, textIn, marks, textOut);
+            auto select = [&](unsigned k) {
+                StreamSet * const out = P.CreateStreamSet(1);
+                P.CreateKernelCall<StreamSelect>(out, Select(textOut, {k}));
+                return out;
+            };
+            StreamSet * const runs = P.CreateStreamSet(21);
+            std::vector<uint32_t> bits;
+            for (unsigned b = 0; b < 21; b++) bits.push_back(b);
+            P.CreateKernelCall<StreamSelect>(runs, Select(textOut, bits));
+            for (size_t m = 0; m < mMasks.size(); m++) mMasks[m] = select(static_cast<unsigned>(21 + m));
+            written = select(static_cast<unsigned>(21 + mMasks.size()));
+            SHOW_BIXNUM(runs);
+            U21 = runs;
+        }
     }
     return U21;
 }

@@ -1056,6 +1056,93 @@ static bool expandFiniteCaptures(ConversionRule * c, CharSetAnalysis & sets, std
     return true;
 }
 
+//  Whether a BeforeCaptureCopy rule P (C) { T } → R $1 reproduces its before
+//  context (see DeferredRule::selfReproducing), given the items of P, R and the
+//  shape of C:
+//  1. P matches R: a sequence of sets, one for each character of R, holding it;
+//     or, with R empty, P, matched right to left, matches the end of any copy
+//     (its sets holding all the characters the copy may have at their
+//     positions, its repetitions of sets holding none of them, matching nothing);
+//  2. C, matched right to left before R c, takes no character before c: its
+//     first item is a set, or the character before c (the last of R, or with R
+//     empty, of the previous copy) is not in the set of its repetition.
+static bool selfReproducingContext(const std::vector<re::RE *> & p, const std::u32string & r, const CopyCapture & c,
+                                   CharSetAnalysis & sets) {
+    //  The characters a copy may have at its last positions, from the end (as far
+    //  as they are known: its suffix, or all its sets, without a repetition).
+    //  (Sets of P may include the text boundary: at a run of texts, a character
+    //  precedes.)
+    auto charSet = [&](const re::RE * re) {return CharSetAnalysis::isSet(re) && !hasStrings(re);};
+    std::vector<UCD::UnicodeSet> copyEnd(c.suffix.rbegin(), c.suffix.rend());
+    if (!c.star) copyEnd.insert(copyEnd.end(), c.prefix.rbegin(), c.prefix.rend());
+    if (copyEnd.empty() && c.star) copyEnd.push_back(c.starSet);
+    if (!r.empty()) {
+        if (p.size() != r.size()) return false;
+        for (size_t i = 0; i < r.size(); i++) {
+            if (!charSet(p[i]) || !sets.setOf(p[i], false).contains(r[i])) return false;
+        }
+    } else {
+        size_t k = 0;       // the position of the copy reached, from its end
+        for (size_t i = p.size(); i-- > 0; ) {
+            re::RE * item = p[i];
+            while (re::Name * n = dyn_cast<re::Name>(item)) {
+                if (isFunctionCall(n) || n->getDefinition() == nullptr || CharSetAnalysis::isSet(n->getDefinition())) break;
+                item = n->getDefinition();
+            }
+            if (k >= copyEnd.size() || (c.star && k >= c.suffix.size())) return false;
+            if (const re::Rep * rep = dyn_cast<re::Rep>(item); rep && rep->getLB() == 0 && charSet(rep->getRE())) {
+                if (sets.setOf(rep->getRE(), false).intersects(copyEnd[k])) return false;
+                continue;
+            }
+            if (!charSet(item) || !(copyEnd[k] - sets.setOf(item, false)).empty()) return false;
+            k++;
+        }
+    }
+    if (c.prefix.empty() && c.star) {
+        const UCD::UnicodeSet before = r.empty() ? copyEnd.front() : UCD::UnicodeSet(r.back());
+        if (before.intersects(c.starSet)) return false;
+    }
+    return true;
+}
+
+//  Whether a before context may match before a text continuing the run of a
+//  self-reproducing rule, as far as the block R c written before it tells: its
+//  items, matched right to left against the characters the block may have at
+//  each position (from its end: the copy, its fixed items as far as its
+//  repetition, then R, then the copy again), each holding one of them (a repetition of a set holding
+//  none matching nothing).  Beyond what is known of the block, it may match.
+static bool mayMatchBeforeRun(re::RE * before, const std::u32string & r, const CopyCapture & c, CharSetAnalysis & sets) {
+    if (before == nullptr) return true;
+    //  (Before the block, the copy c again: at the first text of the run, the
+    //  region that the rule copied, and at the next, the copy written before.)
+    std::vector<UCD::UnicodeSet> block(c.suffix.rbegin(), c.suffix.rend());
+    if (!c.star) {
+        block.insert(block.end(), c.prefix.rbegin(), c.prefix.rend());
+        for (size_t i = r.size(); i-- > 0; ) block.push_back(UCD::UnicodeSet(r[i]));
+        block.insert(block.end(), c.prefix.rbegin(), c.prefix.rend());
+    }
+    std::vector<re::RE *> items;
+    textItems(before, items);
+    size_t k = 0;
+    for (size_t i = items.size(); i-- > 0; ) {
+        if (k >= block.size()) return true;
+        re::RE * item = items[i];
+        while (re::Name * n = dyn_cast<re::Name>(item)) {
+            if (isFunctionCall(n) || n->getDefinition() == nullptr || CharSetAnalysis::isSet(n->getDefinition())) break;
+            item = n->getDefinition();
+        }
+        if (const re::Rep * rep = dyn_cast<re::Rep>(item); rep && rep->getLB() == 0
+                && CharSetAnalysis::isSet(rep->getRE()) && !hasStrings(rep->getRE())) {
+            if (sets.setOf(rep->getRE(), false).intersects(block[k])) return true;
+            continue;
+        }
+        if (!CharSetAnalysis::isSet(item) || hasStrings(item)) return true;
+        if (!sets.setOf(item, false).intersects(block[k])) return false;
+        k++;
+    }
+    return true;
+}
+
 TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
     TransformPlan plan;
     CharSetAnalysis sets;
@@ -1182,6 +1269,17 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
                     group = &plan.steps.back();
                 }
                 if (capture) {
+                    std::vector<re::RE *> pItems;
+                    std::function<void (re::RE *)> flatten = [&](re::RE * re) {
+                        if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+                            for (re::RE * e : *seq) flatten(e);
+                        } else {
+                            pItems.push_back(re);
+                        }
+                    };
+                    flatten(source->getBeforeContext());
+                    pItems.pop_back();      // (the capture)
+                    d.selfReproducing = selfReproducingContext(pItems, d.replacement, copyCapture, sets);
                     const std::string key = printPattern(capture->getCapturedRE());
                     size_t k = 0;
                     while (k < group->copyCaptures.size() && printPattern(group->copyCaptures[k].pattern) != key) k++;
@@ -1624,6 +1722,16 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
                 reason = "a deferred rule has an after context that the other rules of its group may change";
             } else if (deletes) {
                 reason = "a deferred rule has an after context, and the other rules of its group delete characters";
+            }
+        }
+        //  The deferred rules that may interfere with the runs of each
+        //  self-reproducing rule.
+        for (size_t i = 0; i < step.deferred.size(); i++) {
+            DeferredRule & d = step.deferred[i];
+            if (!d.selfReproducing) continue;
+            for (size_t j = 0; j < i; j++) {
+                re::RE * const before = step.deferred[j].rule->getSourceSide(Direction::Forward)->getBeforeContext();
+                if (mayMatchBeforeRun(before, d.replacement, step.copyCaptures[d.capture], sets)) d.runInterferers.push_back(j);
             }
         }
         if (reason.empty()) continue;

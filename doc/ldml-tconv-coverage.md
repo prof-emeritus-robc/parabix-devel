@@ -1,22 +1,22 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `96fa4766f`: with rules with text
+*Status of `tools/ldml/tconv` on branch LDML at `335e35694`: with rules with text
 to revisit composed at compile time (W6), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
 MultipleCaptureMultipleReplacement rules (W3, §5), insertion rules (W4, §4.2),
 large mappings multiplexed (§4.3), captures referred to out of order (SwapBack,
 MoveRegions, §5), function calls on captures of single characters (W5, §5), and
-the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD, Any-FCC and
-Any-Hex/XML10 (§2.1),
+the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD, Any-FCC,
+Any-Hex/XML10 and Any-Remove (§2.1),
 against CLDR `common/transforms` and `common/testData/transforms` at commit
-`7cdeb9e` (2026-10-09). October 15, 2026.*
+`7cdeb9e` (2026-10-09). October 16, 2026.*
 
 *This run used the CLDR transforms without the local fixes of W7 (§5), from a
 copy (`~/transforms`, 380 files rather than 381), so Latin-ug and ug-Latin,
 implementable with them, are counted as blocked by W7 here, and
 Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather than the
-W3, W4 and W6 problems they have with the fixes. Any-FCD, Any-FCC and
-Any-Hex/XML10 were added
+W3, W4 and W6 problems they have with the fixes. Any-FCD, Any-FCC,
+Any-Hex/XML10 and Any-Remove were added
 to the results by an incremental update (`tconv_coverage.py --update`, see
 [Reproducing](#reproducing)); the generated tables and blocks of this report are
 marked `<!-- coverage:… -->`.*
@@ -39,7 +39,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:summary -->
 | | names | implementable |
 |---|---:|---:|
-| Built-in transforms (UTS #35 / ICU) | 30 | 24 |
+| Built-in transforms (UTS #35 / ICU) | 30 | 25 |
 | Transforms defined by CLDR files (380 files) | 425 | 344 (81%) |
 | …of which public (not `visibility="internal"`) | 393 | 313 (80%) |
 <!-- /coverage:summary -->
@@ -63,8 +63,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 - **Built-ins** (§2.1): Hex-Any and its variants (Java, C, Perl, Unicode, XML,
   XML10), with the bare Hex-Any decoding all the forms, Any-CaseFold, the
   normalizations Any-FCD and Any-FCC of ICU, identical to ICU 78.3's
-  Normalizer2 on `QA/Normalization` and on random text, and Any-Hex/XML10
-  (decimal), exact on every codepoint.
+  Normalizer2 on `QA/Normalization` and on random text, Any-Hex/XML10
+  (decimal), exact on every codepoint, and Any-Remove.
 - **Insertion rules** (W4, §4.2), such as `a { } [$E $EO $EU] → $sep`: in groups
   of their own, and in groups with single-character rules, whose before contexts
   then see the text inserted, as in ICU. With them, ConjoiningJamo-Latin,
@@ -132,7 +132,7 @@ surface only after others are fixed.
 
 ## 2. What works
 
-### 2.1 Built-in transforms (24 of 30)
+### 2.1 Built-in transforms (25 of 30)
 
 | implemented | how |
 |---|---|
@@ -144,6 +144,7 @@ surface only after others are fixed.
 | Any-CaseFold | string override property `cf` (`89e922e4f`) |
 | Any-Title | Unicode toTitlecase (word boundaries + `tc`/`lc`), issue #16 |
 | Any-Null | identity |
+| Any-Remove | the characters within the filter deleted (`FilterByMask`); without a filter, an empty text (`CreateEmptyStreamSet`, `33e9cb1e1`, `335e35694`) |
 | Any-Hex/Unicode | `UnicodeHexPipeline`: `U+` and 4–6 hex digits |
 | Any-Hex/Java, Any-Hex | `JavaHexPipeline`: UTF-16 code units, each `\u` and 4 hex digits |
 | Any-Hex/C | `\u` and 4 hex digits, or `\U` and 8 for characters beyond U+FFFF (`6b6b08cb6`) |
@@ -176,6 +177,24 @@ but the surrogates (1,112,064) the output is exactly `&#N;`, also with segment
 sizes 1 and 3, 3 threads, and `-EnableAsserts -VerifyIR`; Hex-Any/XML10 restores
 the codepoints; it is identical to ICU 78.3 on 5,000 random lines of all planes,
 and with the filter `[\u0080-\U0010FFFF]` to `createFromRules`.
+
+**Any-Remove** deletes the characters of the filter in effect, keeping the
+masks of the enclosing filters in step with the text, as Hex-Any does for the
+escapes it shortens; with no filter, its result is an empty stream set
+(`PipelineBuilder::CreateEmptyStreamSet`, a kernel that terminates without
+producing items). No CLDR transform invokes it. It is identical to ICU 78.3
+(`uconv -x` with the rules) on 20,000 random lines (Latin, combining marks,
+Greek, CJK, emoji and all planes), a short accented text and an empty input,
+for `:: [:Mn:] Remove ;`, `:: NFD ; :: [:Mn:] Remove ; :: NFC ;` (also within
+the global filter `[:Greek:]`), the global filters `:: [a-z] ; :: Remove ;` and
+`:: [\u0000-\u024F] ; :: [:L:] Remove ;`, conversion rules before and after it
+(`a > ae ; :: [ae] Remove ; e > E ;`, `:: [a-m] ; :: [aeiou] Remove ; [a-z] > X ;`)
+and an unfiltered Remove before NFC and after conversion rules; Any-Remove on
+its own gives empty output. Also with segment sizes 1 and 3, 3 threads, and
+`--EnableAsserts --VerifyIR` (one run aborted in the JIT, §3.2). The one
+difference is U+1D25C, which is `Mn` in the Unicode data of Parabix and
+unassigned in ICU 78.3; the comparisons are on the lines without the characters
+ICU treats as unassigned.
 
 **Hex-Any.** The escapes are those of ICU 78: `\uXXXX` (Java), also
 `\UXXXXXXXX` (C), `\x{X..}` with 1 to 6 digits (Perl), `U+XXXX` with 4 to 6
@@ -236,7 +255,7 @@ tconv's results are identical to them. Against ICU 78.3:
   materialize symbols", §3.2), which runs from the object cache do not.
 
 <!-- coverage:builtins-missing -->
-Not implemented: `Any-Remove`, `Any-Name`, `Name-Any`, `Any-Hex/Plain`, `Hex-Any/Plain` and `Any-BreakInternal`.
+Not implemented: `Any-Name`, `Name-Any`, `Any-Hex/Plain`, `Hex-Any/Plain` and `Any-BreakInternal`.
 <!-- /coverage:builtins-missing -->
 
 The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
@@ -529,7 +548,10 @@ correction, between 108 and 1,853 of each 5,000 differ.
   kernel (`61225fd63`). Both are fixed on master, merged here.
 - **JIT.** Some runs that compile a pipeline afresh (not from the object cache)
   abort with "LLVM ERROR: Failed to materialize symbols" (seen with Any-FCC and
-  `--EnableAsserts`, about 1 run in 3); not investigated.
+  `--EnableAsserts`, about 1 run in 3), or with a JIT session error, a
+  relocation out of range of a `Page21` fixup in `SingletonCanonicalization`
+  (seen once with `:: NFD ; :: [:Mn:] Remove ; :: NFC ;` and `--EnableAsserts`);
+  not investigated.
 
 ### 3.3 Intended differences from ICU
 
@@ -806,7 +828,8 @@ Done since the first assessment:
   captures of variable lengths moved out of order (`a090553b4`, MoveRegions);
 - W5 function calls on captures of single characters (`687470e89`);
 - the built-ins Hex-Any (`41df85c9e`), Any-CaseFold (`89e922e4f`), Any-FCD
-  (`e2554e7f1`), Any-FCC (`42df6910a`) and Any-Hex/XML10 (`96fa4766f`).
+  (`e2554e7f1`), Any-FCC (`42df6910a`), Any-Hex/XML10 (`96fa4766f`) and
+  Any-Remove (`335e35694`).
 
 W7 blocks nothing where the proposed CLDR fixes are applied locally (see W7
 below); this run did not apply them.
@@ -1042,7 +1065,7 @@ The per-transform table lists the problem classes of every transform.
    the coverage with them (`~/cldr`), as the earlier reports did.
 5. **W5 back-references and W9.** Kana-Latn and Hira-Latn, then Jpan-Latn.
 6. **Built-ins and pipeline size.**
-   - Built-ins: `Any-Remove`, `Any-Name` and `Name-Any`, and
+   - Built-ins: `Any-Name` and `Name-Any`, and
      `Any-BreakInternal` for Thai-Latn.
    - The JIT failures of fresh compilations (§3.2).
    - Pipeline size: a single-kernel sort network, or sharing normalizations
@@ -1096,6 +1119,7 @@ tconv on every implementable transform.
 | `42df6910a` | Any-FCC (NFC in passes on adjacent characters); `QA/Normalization/FCC`: 23 of 30 built-ins |
 | `81816aedb`, `61225fd63` | (master) room for a consumer's provisional stride; the partial sums of a terminated popcount kernel: no assertion failures in NFC |
 | `c3e3fe5b1`, `96fa4766f` | BixNum division of narrow dividends; Any-Hex/XML10 (`XMLDecimalPipeline`): 24 of 30 built-ins |
+| `33e9cb1e1`, `335e35694` | `PipelineBuilder::CreateEmptyStreamSet`; Any-Remove: 25 of 30 built-ins |
 
 ## Reproducing
 

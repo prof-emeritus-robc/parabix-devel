@@ -51,6 +51,10 @@ public:
         return mDriver.CreateStreamSet(NumElements, FieldWidth);
     }
 
+    // A stream set of NumElements streams of the given FieldWidth having no
+    // items: produced by a kernel that terminates immediately.
+    StreamSet * CreateEmptyStreamSet(const unsigned NumElements = 1, const unsigned FieldWidth = 1);
+
     Scalar * CreateConstant(llvm::Constant * value) {
         return mDriver.CreateConstant(value);
     }

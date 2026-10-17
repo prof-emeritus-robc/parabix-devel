@@ -209,6 +209,8 @@ def classify_problem(p):
         return 'S-expanded-nonfinal'
     if '(the result has text to revisit)' in p:
         return 'C-revisit'
+    if '(a rule deferred after the BeforeCaptureCopy rules of its group, but' in p:
+        return 'R-backref'
     if '(the result is not a fixed string)' in p:
         rhs = p.split('→')[-1]
         if '&' in rhs:
@@ -235,11 +237,37 @@ def classify(args, entries):
     for name, e in entries.items():
         for n in [name] + e['aliases']:
             index.setdefault(n.lower(), name)
+    #  Names may mix the forms of the scripts of the names of a transform (as
+    #  ::Hira-Latin ; for Hira-Latn, also Hiragana-Latin), which tconv resolves:
+    #  the components of the names of each transform with the same form (source,
+    #  target, variant) are taken as equivalent.
+    equivalent = {}
+    def representative(c):
+        while equivalent.get(c, c) != c:
+            c = equivalent[c]
+        return c
+    def parts(n):
+        return re.split(r'([-/])', n.lower())
+    for name, e in entries.items():
+        names = [parts(n) for n in [name] + e['aliases']]
+        for other in names[1:]:
+            if len(other) != len(names[0]) or other[1::2] != names[0][1::2]:
+                continue
+            for a, b in zip(names[0][0::2], other[0::2]):
+                ra, rb = representative(a), representative(b)
+                if ra != rb:
+                    equivalent[rb] = ra
+    def normalized(n):
+        return ''.join(c if i % 2 else representative(c) for i, c in enumerate(parts(n)))
+    for name, e in entries.items():
+        for n in [name] + e['aliases']:
+            index.setdefault(normalized(n), name)
 
     def resolve(tid):
         k = re.sub(r'\(\s*\)$', '', tid.strip().lower())
-        if k in index:
-            return index[k]
+        for key in (k, normalized(k)):
+            if key in index:
+                return index[key]
         if '-' not in k.split('/')[0]:
             return index.get('any-' + k)
         return None

@@ -133,7 +133,7 @@ static cl::opt<bool> ShowWarnings("show-transform-warnings", cl::desc("Report pr
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
-enum class Transform {NFD, NFKD, NFC, NFKC, FCD, FCC, Lower, Upper, Title, CaseFold, HexJava, HexUnicode, HexC, HexXML, HexXML10, HexPerl, HexDecode};
+enum class Transform {NFD, NFKD, NFC, NFKC, FCD, FCC, Lower, Upper, Title, CaseFold, HexJava, HexUnicode, HexC, HexXML, HexXML10, HexPerl, HexDecode, Remove};
 
 static const std::vector<std::pair<std::string, Transform>> implementedTransforms = {
     {"Any-NFD", Transform::NFD}, {"Any-NFKD", Transform::NFKD},
@@ -145,6 +145,7 @@ static const std::vector<std::pair<std::string, Transform>> implementedTransform
     {"Hex-Any", Transform::HexDecode}, {"Hex-Any/Java", Transform::HexDecode}, {"Hex-Any/C", Transform::HexDecode},
     {"Hex-Any/Perl", Transform::HexDecode}, {"Hex-Any/Unicode", Transform::HexDecode},
     {"Hex-Any/XML", Transform::HexDecode}, {"Hex-Any/XML10", Transform::HexDecode},
+    {"Any-Remove", Transform::Remove},
 };
 
 //  The forms of escapes decoded by each Hex-Any transform (see kernel::HexEscapeForm).
@@ -485,7 +486,8 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
         case Transform::HexXML10:
         case Transform::HexPerl:
         case Transform::HexDecode:
-            llvm::report_fatal_error("tconv: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /XML10, /Perl) are implemented by the rule pipeline");
+        case Transform::Remove:
+            llvm::report_fatal_error("tconv: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /XML10, /Perl) and Any-Remove are implemented by the rule pipeline");
     }
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
@@ -608,6 +610,10 @@ static bool evaluatePlan(const ldml::TransformPlan & plan, const ldml::Transform
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             const ldml::TransformEntry * used = registry.lookup(step.transform.getText());
             if (used && used->canonicalName == "Any-Null") continue;
+            if (used && used->canonicalName == "Any-Remove" && s.size() == 1) {
+                if (!step.filter || step.filterSet.contains(s[0])) s.clear();
+                continue;
+            }
             reason = "it invokes " + step.transform.getText();
             return false;
         }
@@ -3700,6 +3706,7 @@ private:
     StreamSet * hexXML10(StreamSet * U21);
     StreamSet * hexPerl(StreamSet * U21);
     StreamSet * hexDecode(unsigned forms, StreamSet * U21);
+    StreamSet * remove(StreamSet * U21);
     StreamSet * wordBoundaries(StreamSet * U21);
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
@@ -3841,6 +3848,7 @@ StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U
     if (name == "Any-Hex/XML10") return hexXML10(U21);
     if (name == "Any-Hex/Perl") return hexPerl(U21);
     if (const unsigned forms = hexDecodeForms(name)) return hexDecode(forms, U21);
+    if (name == "Any-Remove") return remove(U21);
     llvm::report_fatal_error(llvm::StringRef("tconv: built-in transform " + name + " is not implemented"));
 }
 
@@ -3854,6 +3862,21 @@ StreamSet * RulePipelineBuilder::hexDecode(unsigned forms, StreamSet * U21) {
     for (StreamSet * keep : keeps) filterMasks(keep);
     SHOW_BIXNUM(decoded);
     return decoded;
+}
+
+//  Any-Remove: the characters within the filter deleted, with the masks kept in
+//  step; without a filter, every character (an empty text).
+StreamSet * RulePipelineBuilder::remove(StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    StreamSet * const mask = activeMask();
+    if (!mask) return P.CreateEmptyStreamSet(21, 1);
+    StreamSet * const keep = P.CreateStreamSet(1);
+    Invert(P, mask, keep);
+    StreamSet * const kept = P.CreateStreamSet(21, 1);
+    FilterByMask(P, keep, U21, kept);
+    filterMasks(keep);
+    SHOW_BIXNUM(kept);
+    return kept;
 }
 
 StreamSet * RulePipelineBuilder::normalization(const std::string & name, StreamSet * U21) {
@@ -5641,7 +5664,8 @@ int main(int argc, char *argv[]) {
                         && impl->second != Transform::Title && impl->second != Transform::HexJava
                         && impl->second != Transform::HexUnicode
                         && impl->second != Transform::HexC && impl->second != Transform::HexXML && impl->second != Transform::HexXML10
-                        && impl->second != Transform::HexPerl && impl->second != Transform::HexDecode;
+                        && impl->second != Transform::HexPerl && impl->second != Transform::HexDecode
+                        && impl->second != Transform::Remove;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
     applyToInput(fn, fd);

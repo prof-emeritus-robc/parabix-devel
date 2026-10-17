@@ -65,6 +65,7 @@
 #include <kernel/streamutils/sorting.h>
 #include <kernel/streamutils/stream_shift.h>
 #include <kernel/streamutils/run_index.h>
+#include <kernel/streamutils/stream_select.h>
 #include <kernel/unicode/char_replacement.h>
 #include <kernel/unicode/charclasses.h>
 #include <kernel/unicode/normalization/normalization.h>
@@ -115,6 +116,10 @@ static cl::opt<unsigned> ConvertedContextRounds("converted-context-rounds",
     cl::desc("Rounds of matching before contexts against the converted text, which the conversions of a group may change "
              "(exact for chains of up to this many such rules; 0 matches them against the text itself)"),
     cl::init(8), cl::cat(TconvOptions));
+static cl::opt<unsigned> DeferredRounds("deferred-rule-rounds",
+    cl::desc("Rounds of applying the rules deferred after the BeforeCaptureCopy rules of a group, to the converted text "
+             "(exact for chains of up to this many triggers whose before contexts reach back to each other; at most 6)"),
+    cl::init(4), cl::cat(TconvOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
                               cl::init(false), cl::cat(TconvOptions));
 //  The classes of the bits of multiplexed mapping numbers (see FusedSubgroupPlan)
@@ -625,7 +630,7 @@ static bool evaluatePlan(const ldml::TransformPlan & plan, const ldml::Transform
             return false;
         }
         const UCD::codepoint_t c = s[0];
-        if (!step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
+        if (!step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty() || !step.deferred.empty()) {
             reason = "it has rules other than single-character rules";
             return false;
         }
@@ -888,6 +893,13 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         }
         for (const ldml::InsertionRule & ins : step.insertions) {
             llvm::outs() << "    insertion rule: " << ldml::printRule(ins.rule) << "\n";
+        }
+        if (!step.deferred.empty()) {
+            llvm::outs() << "    deferred rules (" << step.deferred.size() << ", " << step.copyCaptures.size()
+                         << " captures copied, triggers " << printRanges(step.deferredTriggers) << "):\n";
+            for (const ldml::DeferredRule & d : step.deferred) {
+                llvm::outs() << "      " << (d.capture >= 0 ? "copy: " : "") << ldml::printRule(d.rule) << "\n";
+            }
         }
         for (const ldml::CharMapSubgroup & s : step.subgroups) {
             llvm::outs() << "    [" << s.contextKey << "] " << s.rules << " rules, " << s.characters().count() << " characters";
@@ -3656,6 +3668,245 @@ protected:
     }
 };
 
+//  The deferred rules of a group (see ldml::DeferredRule), applied in rounds to
+//  the converted text.  In each round:
+//    - DeferredPlan: at each trigger, the first deferred rule applying, where
+//      no before context may reach back to a trigger not yet replaced (its
+//      characters between them in deferredReach); the length of the capture it
+//      copies, matched as ICU does, right to left from the trigger, possessively
+//      (its sets, and the run of the set of its repetition, counted by RunIndex,
+//      up to DeferredMaxRun characters, at the end of the run: a rule copying a
+//      longer run does not apply); the number of positions to
+//      insert after the trigger (the replacement R, then the copy); the
+//      positions of the text of the rule (deleted); and, for each distance d up
+//      to the longest copy, the triggers whose copies reach back d positions;
+//    - DeferredRegion: the regions copied, by looking ahead from each position
+//      to the triggers;
+//    - the regions are copied into the positions inserted after R (FilterByMask,
+//      MergeByMask), and R written (DeferredSlots), and the texts deleted.
+constexpr unsigned DeferredBlockingDepth = 8;
+//  (As each round may insert positions, the bounds of the buffers of the
+//  pipeline grow with the largest number of positions inserted at one, to the
+//  power of the number of rounds: the runs are limited to 16 characters.)
+constexpr unsigned DeferredRunBits = 4;
+constexpr unsigned DeferredMaxRun = 1u << DeferredRunBits;
+
+struct DeferredConfig {
+    std::vector<unsigned> textLengths;          // |T| of each rule
+    std::vector<std::u32string> replacements;   // R of each rule
+    std::vector<int> captures;                  // the capture of each rule, or -1
+    std::vector<unsigned> prefix;               // the number of sets of each capture before its repetition
+    std::vector<unsigned> suffix;               // and after it
+    std::vector<int> starClass;                 // the class of its repetition (index in Classes), or -1
+    unsigned numTails = 0;
+    bool masked = false;
+    bool written = false;
+    unsigned maxCopy() const {
+        unsigned m = 0;
+        for (size_t k = 0; k < prefix.size(); k++) m = std::max(m, prefix[k] + suffix[k] + (starClass[k] >= 0 ? DeferredMaxRun : 0));
+        return m;
+    }
+    //  The number of bits of the number of positions inserted at a trigger.
+    unsigned countBits() const {
+        size_t r = 0;
+        for (const std::u32string & s : replacements) r = std::max(r, s.size());
+        const unsigned max = maxCopy() + static_cast<unsigned>(r);
+        unsigned bits = 1;
+        while ((max >> bits) != 0) bits++;
+        return bits;
+    }
+    std::string signature() const {
+        std::string sig = std::to_string(numTails) + "t" + (masked ? "m" : "") + (written ? "w" : "");
+        for (size_t k = 0; k < prefix.size(); k++) {
+            sig += "/" + std::to_string(prefix[k]) + "," + std::to_string(suffix[k]) + "," + std::to_string(starClass[k]);
+        }
+        for (size_t i = 0; i < textLengths.size(); i++) {
+            sig += "|" + std::to_string(textLengths[i]) + "," + std::to_string(captures[i]) + ",";
+            for (char32_t ch : replacements[i]) sig += std::to_string(static_cast<unsigned>(ch)) + ".";
+        }
+        return sig;
+    }
+};
+
+//  Classes: the triggers, the tails (numTails), the reach, the sets of the
+//  repetitions of the captures.  The triggers, and the characters of the texts
+//  after them.
+static PabloAST * deferredTexts(PabloBuilder & pb, PabloAST * triggers, const std::vector<PabloAST *> & classes, unsigned numTails) {
+    PabloAST * u = triggers;
+    for (unsigned j = 0; j < numTails; j++) u = pb.createOr(u, pb.createAnd(pb.createAdvance(triggers, j + 1), classes[1 + j]));
+    return u;
+}
+
+class DeferredPlan final : public pablo::PabloKernel {
+public:
+    DeferredPlan(LLVMTypeSystemInterface & ts, DeferredConfig config, const std::vector<StreamSet *> & Matches, StreamSet * Classes,
+                 const std::vector<StreamSet *> & Runs, StreamSet * Mask, StreamSet * Written, StreamSet * Count, StreamSet * Info,
+                 StreamSet * Reach)
+    : PabloKernel(ts, "DeferredPlan_" + getStringHash(config.signature()),
+                  [&] {
+                      Bindings b;
+                      for (size_t i = 0; i < Matches.size(); i++) {
+                          b.emplace_back("M" + std::to_string(i), Matches[i], FixedRate(1),
+                                         LookAhead(std::max(1u, config.textLengths[i] - 1)));
+                      }
+                      b.emplace_back("Classes", Classes);
+                      for (size_t k = 0; k < Runs.size(); k++) b.emplace_back("Runs" + std::to_string(k), Runs[k]);
+                      if (Mask) b.emplace_back("Mask", Mask);
+                      if (Written) b.emplace_back("Written", Written);
+                      return b;
+                  }(),
+                  {Binding{"Count", Count}, Binding{"Info", Info}, Binding{"Reach", Reach}}), mConfig(std::move(config)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+        const size_t n = mConfig.textLengths.size();
+        const unsigned Bits = mConfig.countBits();
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        //  (The text written by the deferred rules in earlier rounds is not
+        //  matched again.)
+        PabloAST * triggers = classes[0];
+        if (mConfig.written) triggers = pb.createAnd(triggers, pb.createNot(getInputStreamSet("Written")[0]));
+        PabloAST * const reach = classes[1 + mConfig.numTails];
+        //  The length of each capture copied, at the triggers, and where it is not
+        //  known (a run of more than 64 characters).
+        std::vector<BixNum> lengths;
+        std::vector<PabloAST *> unknown;
+        unsigned run = 0;
+        for (size_t k = 0; k < mConfig.prefix.size(); k++) {
+            const unsigned fixed = mConfig.prefix[k] + mConfig.suffix[k];
+            BixNum len = bnc.ZeroExtend(bnc.Create(fixed), Bits);
+            PabloAST * over = pb.createZeroes();
+            if (mConfig.starClass[k] >= 0) {
+                const std::vector<PabloAST *> runs = getInputStreamSet("Runs" + std::to_string(run++));
+                PabloAST * const inRun = classes[mConfig.starClass[k]];
+                BixNum idx(runs.begin(), runs.begin() + DeferredRunBits);
+                BixNum count = bnc.AddModular(bnc.ZeroExtend(idx, Bits), 1);
+                //  The run ends just before the suffix, which ends just before the trigger.
+                const unsigned distance = mConfig.suffix[k] + 1;
+                for (unsigned b = 0; b < Bits; b++) count[b] = pb.createAdvance(pb.createAnd(count[b], inRun), distance);
+                over = pb.createAdvance(pb.createAnd(runs[DeferredRunBits], inRun), distance);
+                len = bnc.AddModular(count, fixed);
+            }
+            lengths.push_back(len);
+            unknown.push_back(over);
+        }
+        //  The matches of the rules, at the triggers.
+        std::vector<PabloAST *> starts;
+        PabloAST * matched = pb.createZeroes();
+        for (size_t i = 0; i < n; i++) {
+            PabloAST * mk = getInputStreamSet("M" + std::to_string(i))[0];
+            if (mConfig.textLengths[i] > 1) mk = pb.createLookahead(mk, mConfig.textLengths[i] - 1);
+            starts.push_back(mk);
+            matched = pb.createOr(matched, mk);
+        }
+        //  The triggers whose before contexts may not reach back to a trigger not yet
+        //  replaced: the triggers that match a rule, or are not ready themselves
+        //  (and may match once ready), block those they may reach.  A trigger
+        //  that is ready and matches no rule stays as it is.  (Through chains of
+        //  up to DeferredBlockingDepth triggers, each blocked by the one before.)
+        auto blockedBy = [&](PabloAST * blocking) {
+            return pb.createMatchStar(pb.createAdvance(deferredTexts(pb, blocking, classes, mConfig.numTails), 1), reach);
+        };
+        PabloAST * blocking = pb.createAnd(triggers, matched);
+        PabloAST * blocked = blockedBy(blocking);
+        for (unsigned j = 0; j < DeferredBlockingDepth; j++) {
+            blocking = pb.createAnd(triggers, pb.createOr(matched, blocked));
+            blocked = blockedBy(blocking);
+        }
+        PabloAST * ready = pb.createAnd(triggers, pb.createNot(blocked));
+        if (mConfig.masked) ready = pb.createAnd(ready, getInputStreamSet("Mask")[0]);
+        //  The first rule matching at each ready trigger (none, if the length of its
+        //  capture is not known).
+        PabloAST * taken = pb.createZeroes();
+        std::vector<PabloAST *> applied;
+        for (size_t i = 0; i < n; i++) {
+            PabloAST * a = pb.createAnd(pb.createAnd(starts[i], ready), pb.createNot(taken));
+            if (mConfig.captures[i] >= 0) a = pb.createAnd(a, pb.createNot(unknown[mConfig.captures[i]]));
+            applied.push_back(a);
+            taken = pb.createOr(taken, starts[i]);
+        }
+        BixNum copied = bnc.ZeroExtend(bnc.Create(0), Bits);
+        BixNum rlen = bnc.ZeroExtend(bnc.Create(0), Bits);
+        PabloAST * copying = pb.createZeroes();
+        PabloAST * del = pb.createZeroes();
+        for (size_t i = 0; i < n; i++) {
+            if (mConfig.captures[i] >= 0) {
+                copied = bnc.Select(applied[i], lengths[mConfig.captures[i]], copied);
+                copying = pb.createOr(copying, applied[i]);
+            }
+            if (!mConfig.replacements[i].empty()) {
+                rlen = bnc.Select(applied[i], bnc.ZeroExtend(bnc.Create(mConfig.replacements[i].size()), Bits), rlen);
+            }
+            for (unsigned k = 0; k < mConfig.textLengths[i]; k++) del = pb.createOr(del, pb.createAdvance(applied[i], k));
+        }
+        const BixNum count = bnc.AddModular(copied, rlen);
+        writeOutputStreamSet("Count", std::vector<PabloAST *>(count.begin(), count.end()));
+        std::vector<PabloAST *> info(applied.begin(), applied.end());
+        info.push_back(del);
+        writeOutputStreamSet("Info", info);
+        std::vector<PabloAST *> reachOut;
+        for (unsigned d = 1; d <= mConfig.maxCopy(); d++) reachOut.push_back(pb.createAnd(copying, bnc.UGE(copied, d)));
+        writeOutputStreamSet("Reach", reachOut);
+    }
+private:
+    const DeferredConfig mConfig;
+};
+
+//  The regions copied: the positions d positions before a trigger whose copy
+//  reaches back d positions.
+class DeferredRegion final : public pablo::PabloKernel {
+public:
+    DeferredRegion(LLVMTypeSystemInterface & ts, StreamSet * Reach, StreamSet * Region)
+    : PabloKernel(ts, "DeferredRegion" + std::to_string(Reach->getNumElements()),
+                  {Binding{"Reach", Reach, FixedRate(1), LookAhead(Reach->getNumElements())}},
+                  {Binding{"Region", Region}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> reach = getInputStreamSet("Reach");
+        PabloAST * region = pb.createZeroes();
+        for (unsigned d = 1; d <= reach.size(); d++) region = pb.createOr(region, pb.createLookahead(reach[d - 1], d));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("Region"), pb.getInteger(0)), region);
+    }
+};
+
+//  After the insertions: the positions of the copies (Slots), the replacements R
+//  written at the positions inserted before them (Chars), and the positions to
+//  keep (not those of the texts of the rules applied).
+class DeferredSlots final : public pablo::PabloKernel {
+public:
+    DeferredSlots(LLVMTypeSystemInterface & ts, DeferredConfig config, StreamSet * Info, StreamSet * Spread,
+                  StreamSet * Slots, StreamSet * Chars, StreamSet * Keep)
+    : PabloKernel(ts, "DeferredSlots_" + getStringHash(config.signature()),
+                  {Binding{"Info", Info}, Binding{"Spread", Spread}},
+                  {Binding{"Slots", Slots}, Binding{"Chars", Chars}, Binding{"Keep", Keep}}), mConfig(std::move(config)) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const size_t n = mConfig.textLengths.size();
+        const std::vector<PabloAST *> info = getInputStreamSet("Info");
+        PabloAST * const inserted = pb.createNot(getInputStreamSet("Spread")[0]);
+        std::vector<PabloAST *> chars(21, pb.createZeroes());
+        PabloAST * rSlots = pb.createZeroes();
+        for (size_t i = 0; i < n; i++) {
+            const std::u32string & r = mConfig.replacements[i];
+            for (unsigned k = 0; k < r.size(); k++) {
+                PabloAST * const at = pb.createAdvance(info[i], k + 1);
+                rSlots = pb.createOr(rSlots, at);
+                for (unsigned b = 0; b < 21; b++) {
+                    if ((r[k] >> b) & 1) chars[b] = pb.createOr(chars[b], at);
+                }
+            }
+        }
+        pb.createAssign(pb.createExtract(getOutputStreamVar("Slots"), pb.getInteger(0)), pb.createAnd(inserted, pb.createNot(rSlots)));
+        writeOutputStreamSet("Chars", chars);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("Keep"), pb.getInteger(0)), pb.createNot(info[n]));
+    }
+private:
+    const DeferredConfig mConfig;
+};
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -3704,6 +3955,7 @@ private:
     StreamSet * fcd(StreamSet * U21);
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * hexJava(StreamSet * U21);
@@ -4343,7 +4595,7 @@ StreamSet * RulePipelineBuilder::combine(StreamSet * a, StreamSet * b, bool isOr
 //  path does not support).  Only for such a group is shortening the text to
 //  the masked characters both correct and complete.
 static bool isLocalCharacterMapping(const ldml::TransformStep & step) {
-    if (!step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) return false;
+    if (!step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty() || !step.deferred.empty()) return false;
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         if (s.engineBefore || s.engineAfter) return false;
         for (const ldml::CharMapping & m : s.mappings) {
@@ -5469,6 +5721,98 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
     return applyAnalysis(a, U21);
 }
 
+//  The deferred rules of a group (see ldml::DeferredRule and DeferredPlan).
+StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    //  (The bounds of the buffers grow exponentially with the rounds, see DeferredRunBits.)
+    if (DeferredRounds > 6) llvm::report_fatal_error("tconv: --deferred-rule-rounds is at most 6");
+    DeferredConfig config;
+    for (const ldml::DeferredRule & d : step.deferred) {
+        config.textLengths.push_back(static_cast<unsigned>(d.text.size()));
+        config.replacements.push_back(d.replacement);
+        config.captures.push_back(d.capture);
+    }
+    config.numTails = static_cast<unsigned>(step.deferredTails.size());
+    std::vector<UCD::UnicodeSet> classSets{step.deferredTriggers};
+    for (const UCD::UnicodeSet & t : step.deferredTails) classSets.push_back(t);
+    classSets.push_back(step.deferredReach);
+    for (const ldml::CopyCapture & c : step.copyCaptures) {
+        config.prefix.push_back(static_cast<unsigned>(c.prefix.size()));
+        config.suffix.push_back(static_cast<unsigned>(c.suffix.size()));
+        config.starClass.push_back(c.star ? static_cast<int>(classSets.size()) : -1);
+        if (c.star) classSets.push_back(c.starSet);
+    }
+    //  The positions written by the deferred rules in the rounds so far.
+    StreamSet * written = nullptr;
+    for (unsigned round = 0; round < DeferredRounds; round++) {
+        StreamSet * const mask = activeMask();
+        config.masked = mask != nullptr;
+        config.written = written != nullptr;
+        StreamSet * const classStreams = classes(classSets, U21);
+        std::vector<StreamSet *> matches;
+        for (const ldml::DeferredRule & d : step.deferred) {
+            matches.push_back(matchPositions(d.engineBefore, d.engineAfter, d.text, U21));
+        }
+        //  The runs of the sets of the repetitions (with the overflow of the index).
+        std::vector<StreamSet *> runs;
+        for (size_t k = 0; k < step.copyCaptures.size(); k++) {
+            if (config.starClass[k] < 0) continue;
+            StreamSet * const index = P.CreateStreamSet(DeferredRunBits);
+            StreamSet * const overflow = P.CreateStreamSet(1);
+            P.CreateKernelCall<RunIndex>(streamutils::Select(P, classStreams, config.starClass[k]), index, overflow);
+            StreamSet * const indexed = P.CreateStreamSet(DeferredRunBits + 1);
+            std::vector<std::pair<unsigned, unsigned>> order;
+            for (unsigned b = 0; b < DeferredRunBits; b++) order.emplace_back(0, b);
+            order.emplace_back(1, 0);
+            P.CreateKernelCall<MergeStreamSets>(std::vector<StreamSet *>{index, overflow}, order, indexed);
+            runs.push_back(indexed);
+        }
+        StreamSet * const count = P.CreateStreamSet(config.countBits());
+        StreamSet * const info = P.CreateStreamSet(step.deferred.size() + 1);
+        StreamSet * const reach = P.CreateStreamSet(std::max(1u, config.maxCopy()));
+        P.CreateKernelCall<DeferredPlan>(config, matches, classStreams, runs, mask, written, count, info, reach);
+        SHOW_BIXNUM(count);
+        StreamSet * const region = P.CreateStreamSet(1);
+        P.CreateKernelCall<DeferredRegion>(reach, region);
+        SHOW_STREAM(region);
+        StreamSet * const SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, count, SpreadMask, kernel::InsertPosition::After);
+        StreamSet * const spreadU = P.CreateStreamSet(21);
+        SpreadByMask(P, SpreadMask, U21, spreadU);
+        StreamSet * const spreadInfo = P.CreateStreamSet(info->getNumElements());
+        SpreadByMask(P, SpreadMask, info, spreadInfo);
+        StreamSet * const extracted = P.CreateStreamSet(21);
+        FilterByMask(P, region, U21, extracted);
+        StreamSet * const slots = P.CreateStreamSet(1);
+        StreamSet * const chars = P.CreateStreamSet(21);
+        StreamSet * const keep = P.CreateStreamSet(1);
+        P.CreateKernelCall<DeferredSlots>(config, spreadInfo, SpreadMask, slots, chars, keep);
+        StreamSet * const withR = combine(spreadU, chars, true);
+        StreamSet * const notSlots = P.CreateStreamSet(1);
+        Invert(P, slots, notSlots);
+        StreamSet * const others = P.CreateStreamSet(21);
+        FilterByMask(P, notSlots, withR, others);
+        StreamSet * const merged = P.CreateStreamSet(21);
+        MergeByMask(P, slots, extracted, others, merged);
+        StreamSet * const result = P.CreateStreamSet(21);
+        FilterByMask(P, keep, merged, result);
+        spreadMasks(SpreadMask);
+        filterMasks(keep);
+        StreamSet * const expanded = P.CreateStreamSet(1);
+        if (written) {
+            ExpandFilter(P, SpreadMask, written, expanded);
+        } else {
+            Invert(P, SpreadMask, expanded);
+        }
+        StreamSet * const writtenNext = P.CreateStreamSet(1);
+        FilterByMask(P, keep, expanded, writtenNext);
+        written = writtenNext;
+        SHOW_BIXNUM(result);
+        U21 = result;
+    }
+    return U21;
+}
+
 StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, StreamSet * U21) {
     const bool invokedWithFilter = mInvokedWithFilter;
     mInvokedWithFilter = false;
@@ -5483,7 +5827,10 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             mInvokedWithFilter = false;
             if (step.filter) popFilter();
         } else {
-            U21 = conversionGroup(step, U21);
+            if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
+                U21 = conversionGroup(step, U21);
+            }
+            if (!step.deferred.empty()) U21 = deferredRules(step, U21);
         }
     }
     if (a.plan.filter) popFilter();

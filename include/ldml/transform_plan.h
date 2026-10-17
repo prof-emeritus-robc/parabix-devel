@@ -215,6 +215,40 @@ struct InsertionRule {
     const ConversionRule * rule = nullptr;
 };
 
+// A rule copying a capture of its before context (a BeforeCaptureCopy rule),
+//      P (C) { T } A → R $1 ;
+// whose result is a fixed string R followed by the converted text that the
+// capture C of the end of its before context matches, and the other rules of
+// its group whose texts begin with the same characters (the triggers): these
+// rules are deferred (DeferredRule).  As ICU matches before contexts against
+// the text it has converted, C copies converted text, and a trigger may see the
+// result of a deferred rule before it (in ICU, P X { b → $1 ; turns X b b into
+// X X X).  The deferred rules are therefore applied after the other rules of
+// the group, which may not change the triggers (or the characters of their
+// texts after the first, at the start of a match), to the converted text, in
+// rounds: in each round, at the triggers whose before contexts may not reach
+// back to a trigger not yet replaced (see TransformStep::deferredReach), the
+// first deferred rule matching applies.  The captures are matched as ICU does,
+// right to left from the end of the before context, possessively: a capture
+// copied is a sequence of sets with at most one unbounded repetition of a set
+// (CopyCapture), whose length at a trigger is then known.
+struct CopyCapture {
+    re::RE * pattern = nullptr;
+    std::vector<UCD::UnicodeSet> prefix;    // the sets before the repetition (or all)
+    bool star = false;                      // an unbounded repetition of starSet
+    UCD::UnicodeSet starSet;
+    std::vector<UCD::UnicodeSet> suffix;    // the sets after it
+};
+
+struct DeferredRule {
+    std::vector<UCD::UnicodeSet> text;  // T: the characters at each position
+    std::u32string replacement;         // R (before the copy, if any)
+    int capture = -1;                   // the index of C in TransformStep::copyCaptures, or -1 (no copy)
+    re::RE * engineBefore = nullptr;    // the before context, without the capture, as a lookbehind body
+    re::RE * engineAfter = nullptr;     // the after context, as a lookahead body
+    const ConversionRule * rule = nullptr;
+};
+
 struct TransformStep {
     enum class Kind {Conversion, Transform};
     Kind kind;
@@ -250,6 +284,17 @@ struct TransformStep {
     // Whether the matches of different sets may overlap: they are then selected
     // sequentially, from the left (the earlier set at the same position).
     bool captureSelection = false;
+    // The deferred rules (see DeferredRule), in order; the distinct captures C
+    // they copy; the characters with which their texts begin (the triggers),
+    // and those at each further position (the tails: tails[k] at position
+    // k + 1); and the characters that the items of their before contexts may
+    // match, other than the first (outermost) item: a before context can reach
+    // back to a trigger only through these characters.
+    std::vector<DeferredRule> deferred;
+    std::vector<CopyCapture> copyCaptures;
+    UCD::UnicodeSet deferredTriggers;
+    std::vector<UCD::UnicodeSet> deferredTails;
+    UCD::UnicodeSet deferredReach;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

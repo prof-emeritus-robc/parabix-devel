@@ -752,16 +752,111 @@ static bool insertionRule(const ConversionRule * c, InsertionRule & ins, CharSet
     return true;
 }
 
+//  A BeforeCaptureCopy rule (see DeferredRule), P (C) { T } A → R $1 ; with a
+//  text of single characters: the characters of the text, R, the capture C, and
+//  the before context with C replaced by its pattern.
+static bool beforeCaptureCopy(const ConversionRule * c, CharSetAnalysis & sets, std::vector<UCD::UnicodeSet> & text,
+                              std::u32string & replacement, re::Capture *& capture, re::RE *& before) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->getBeforeContext() == nullptr) return false;
+    if (result->hasCursor() && (!isEmptyText(result->getResultToRevisit()) || result->getCursorOffset() != 0)) return false;
+    if (containsCapture(source->getText()) || (source->getAfterContext() && containsCapture(source->getAfterContext()))) return false;
+    //  The before context ends with the capture.
+    std::vector<re::RE *> items;
+    std::function<void (re::RE *)> flatten = [&](re::RE * re) {
+        if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+            for (re::RE * e : *seq) flatten(e);
+        } else {
+            items.push_back(re);
+        }
+    };
+    flatten(source->getBeforeContext());
+    if (items.empty() || !isa<re::Capture>(items.back())) return false;
+    capture = cast<re::Capture>(items.back());
+    if (containsCapture(capture->getCapturedRE())) return false;
+    for (size_t i = 0; i + 1 < items.size(); i++) if (containsCapture(items[i])) return false;
+    //  The result: R $1.
+    std::vector<re::RE *> out;
+    std::function<void (re::RE *)> flattenResult = [&](re::RE * re) {
+        if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+            for (re::RE * e : *seq) flattenResult(e);
+        } else {
+            out.push_back(re);
+        }
+    };
+    flattenResult(result->getText());
+    if (out.empty()) return false;
+    const re::Reference * ref = dyn_cast<re::Reference>(out.back());
+    if (ref == nullptr || ref->getName() != capture->getName()) return false;
+    replacement.clear();
+    for (size_t i = 0; i + 1 < out.size(); i++) if (!fixedString(out[i], replacement)) return false;
+    std::vector<re::RE *> textItemList;
+    textItems(source->getText(), textItemList);
+    if (textItemList.empty()) return false;
+    text.clear();
+    for (re::RE * item : textItemList) {
+        if (!plainSet(item)) return false;
+        text.push_back(sets.setOf(item, false));
+    }
+    items.back() = capture->getCapturedRE();
+    before = re::makeSeq(items.begin(), items.end());
+    return true;
+}
+
+//  The shape of a capture copied (see CopyCapture).
+static bool copyCaptureShape(re::RE * pattern, CopyCapture & shape, CharSetAnalysis & sets) {
+    shape.pattern = pattern;
+    std::vector<re::RE *> items;
+    textItems(pattern, items);
+    if (items.empty()) return false;
+    for (re::RE * item : items) {
+        while (re::Name * n = dyn_cast<re::Name>(item)) {
+            if (isFunctionCall(n) || n->getDefinition() == nullptr || CharSetAnalysis::isSet(n->getDefinition())) break;
+            item = n->getDefinition();
+        }
+        if (plainSet(item)) {
+            (shape.star ? shape.suffix : shape.prefix).push_back(sets.setOf(item, false));
+        } else if (re::Rep * rep = dyn_cast<re::Rep>(item);
+                   rep && !shape.star && rep->getUB() == re::Rep::UNBOUNDED_REP && rep->getLB() <= 1 && plainSet(rep->getRE())) {
+            shape.star = true;
+            shape.starSet = sets.setOf(rep->getRE(), false);
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 TransformPlan planTransform(const std::vector<Rule *> & rules) {
     TransformPlan plan;
     CharSetAnalysis sets;
     TransformStep * group = nullptr;
+    //  The triggers of the BeforeCaptureCopy rules of each group (between
+    //  transform rules): the rules of the group whose texts begin with them are
+    //  deferred.
+    std::vector<UCD::UnicodeSet> triggers(1);
+    for (Rule * r : rules) {
+        if (isa<TransformRule>(r)) {
+            triggers.emplace_back();
+        } else if (const ConversionRule * c = dyn_cast<ConversionRule>(r)) {
+            std::vector<UCD::UnicodeSet> text;
+            std::u32string replacement;
+            re::Capture * capture = nullptr;
+            re::RE * before = nullptr;
+            if (beforeCaptureCopy(c, sets, text, replacement, capture, before)) {
+                triggers.back() = triggers.back() + text.front();
+            }
+        }
+    }
+    size_t groupIndex = 0;
     for (Rule * r : rules) {
         if (FilterRule * f = dyn_cast<FilterRule>(r)) {
             plan.filter = f->getFilterSet();
             plan.filterSet = sets.setOf(f->getFilterSet(), false);
         } else if (TransformRule * t = dyn_cast<TransformRule>(r)) {
             group = nullptr;
+            groupIndex++;
             TransformStep step;
             step.kind = TransformStep::Kind::Transform;
             step.transform = t->getForwardID();
@@ -779,6 +874,84 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             }
             std::vector<re::RE *> items;
             textItems(text, items);
+            //  A deferred rule (see DeferredRule): its text begins with a trigger
+            //  of the BeforeCaptureCopy rules of its group.
+            if (const UCD::UnicodeSet & trig = triggers[groupIndex];
+                    !trig.empty() && !items.empty() && CharSetAnalysis::isSet(items.front())
+                    && sets.setOf(items.front(), false).intersects(trig)) {
+                DeferredRule d;
+                d.rule = c;
+                re::Capture * capture = nullptr;
+                re::RE * before = source->getBeforeContext();
+                std::string reason;
+                CopyCapture copyCapture;
+                if (beforeCaptureCopy(c, sets, d.text, d.replacement, capture, before)) {
+                    d.capture = 0;
+                    if (!copyCaptureShape(capture->getCapturedRE(), copyCapture, sets)) {
+                        reason = "the capture it copies is not a sequence of sets with at most one unbounded repetition of a set";
+                    }
+                } else {
+                    capture = nullptr;
+                    before = source->getBeforeContext();
+                    d.text.clear();
+                    d.replacement.clear();
+                    bool singleChars = true;
+                    for (re::RE * item : items) {
+                        singleChars &= plainSet(item);
+                        if (singleChars) d.text.push_back(sets.setOf(item, false));
+                    }
+                    if (!singleChars) {
+                        reason = "its text is not a fixed-length sequence of characters";
+                    } else if (result->hasCursor() && (!isEmptyText(result->getResultToRevisit()) || result->getCursorOffset() != 0)) {
+                        reason = "its result has text to revisit";
+                    } else if (!fixedString(result->getText(), d.replacement)) {
+                        reason = "its result is neither a fixed string nor one followed by a capture of its before context";
+                    } else if ((before && containsCapture(before)) || (source->getAfterContext() && containsCapture(source->getAfterContext()))) {
+                        reason = "its contexts have captures";
+                    }
+                }
+                if (reason.empty() && !(d.text.front() - trig).empty()) {
+                    reason = "its text may also begin with characters other than the triggers";
+                }
+                if (!reason.empty()) {
+                    plan.problems.push_back(printRule(r) + "  (a rule deferred after the BeforeCaptureCopy rules of its group, but "
+                                            + reason + ")");
+                    continue;
+                }
+                if (group == nullptr) {
+                    TransformStep step;
+                    step.kind = TransformStep::Kind::Conversion;
+                    plan.steps.push_back(std::move(step));
+                    group = &plan.steps.back();
+                }
+                if (capture) {
+                    const std::string key = printPattern(capture->getCapturedRE());
+                    size_t k = 0;
+                    while (k < group->copyCaptures.size() && printPattern(group->copyCaptures[k].pattern) != key) k++;
+                    if (k == group->copyCaptures.size()) group->copyCaptures.push_back(copyCapture);
+                    d.capture = static_cast<int>(k);
+                }
+                d.engineBefore = before ? engineContext(before, false) : nullptr;
+                d.engineAfter = source->getAfterContext() ? engineContext(source->getAfterContext(), true) : nullptr;
+                group->deferredTriggers = group->deferredTriggers + d.text.front();
+                for (size_t k = 1; k < d.text.size(); k++) {
+                    if (group->deferredTails.size() < k) group->deferredTails.resize(k);
+                    group->deferredTails[k - 1] = group->deferredTails[k - 1] + d.text[k];
+                }
+                //  The characters through which the before context may reach back:
+                //  those of its items other than the first.
+                if (before) {
+                    std::vector<re::RE *> contextItems;
+                    textItems(before, contextItems);
+                    for (size_t k = 1; k < contextItems.size(); k++) {
+                        UCD::UnicodeSet chars;
+                        if (!matchableChars(contextItems[k], chars, sets)) chars = UCD::UnicodeSet(0, 0x10FFFF);
+                        group->deferredReach = group->deferredReach + chars;
+                    }
+                }
+                group->deferred.push_back(std::move(d));
+                continue;
+            }
             //  A run at the end of the text (see StringRule::run).
             UCD::UnicodeSet run;
             if (!items.empty()) {
@@ -1099,6 +1272,91 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
         step.stringOrder.clear();
         for (size_t r = 0; r < step.stringRules.size(); r++) step.stringOrder.push_back(r);
         step.stringPredecessors.assign(step.stringRules.size(), {});
+    }
+    //  The deferred rules (see DeferredRule) are applied after the other rules of
+    //  their group, to the converted text.  The other rules may therefore not
+    //  match the triggers, nor begin with the characters that may follow one in
+    //  the text of a deferred rule; their before contexts may not see the
+    //  triggers or the characters with which the deferred rules replace them
+    //  (which ICU, but not the other rules, sees); and the after contexts of the
+    //  deferred rules, which see the converted text, must match it as they match
+    //  the text (ICU matching them against the text not yet converted): each is
+    //  a single set holding all or none of the characters the other rules
+    //  change and replace them with, and these rules delete no character.
+    for (TransformStep & step : plan.steps) {
+        if (step.deferred.empty()) continue;
+        std::string reason;
+        UCD::UnicodeSet textChars, firstChars, changed;
+        bool deletes = false;
+        std::vector<const re::RE *> befores;
+        auto addReplacement = [&](const std::u32string & r) {
+            for (char32_t ch : r) changed.insert(ch);
+            deletes |= r.empty();
+        };
+        for (const CharMapSubgroup & g : step.subgroups) {
+            textChars = textChars + g.characters();
+            firstChars = firstChars + g.characters();
+            for (const CharMapping & m : g.mappings) {
+                changed = changed + m.chars;
+                addReplacement(m.replacement);
+            }
+            if (g.before) befores.push_back(g.before);
+        }
+        for (const StringRule & sr : step.stringRules) {
+            for (const UCD::UnicodeSet & chars : sr.text) textChars = textChars + chars;
+            textChars = textChars + sr.run;
+            firstChars = firstChars + sr.text.front();
+            //  (Only the character just after the text of a deferred rule matters to
+            //  its after context: the first of the text of a rule.)
+            changed = changed + sr.text.front();
+            addReplacement(sr.replacement);
+            if (sr.before) befores.push_back(sr.before);
+        }
+        UCD::UnicodeSet tails;
+        for (const UCD::UnicodeSet & t : step.deferredTails) tails = tails + t;
+        UCD::UnicodeSet output;
+        for (const DeferredRule & d : step.deferred) for (char32_t ch : d.replacement) output.insert(ch);
+        for (const CopyCapture & c : step.copyCaptures) {
+            for (const UCD::UnicodeSet & chars : c.prefix) output = output + chars;
+            for (const UCD::UnicodeSet & chars : c.suffix) output = output + chars;
+            output = output + c.starSet;
+        }
+        if (!step.captureReplacements.empty() || !step.insertions.empty()) {
+            reason = "its group has MultipleCaptureMultipleReplacement or insertion rules";
+        } else if (textChars.intersects(step.deferredTriggers)) {
+            reason = "another rule of its group may match a trigger";
+        } else if (firstChars.intersects(tails)) {
+            reason = "another rule of its group may begin with a character of its text after the first";
+        }
+        for (const re::RE * b : befores) {
+            if (!reason.empty()) break;
+            UCD::UnicodeSet chars;
+            if (!matchableChars(b, chars, sets) || chars.intersects(step.deferredTriggers + tails + output)) {
+                reason = "the before context of another rule of its group may see the triggers or their replacements";
+            }
+        }
+        for (const DeferredRule & d : step.deferred) {
+            if (!reason.empty()) break;
+            re::RE * const after = d.rule->getSourceSide(Direction::Forward)->getAfterContext();
+            if (after == nullptr) continue;
+            std::vector<re::RE *> afterItems;
+            textItems(after, afterItems);
+            if (afterItems.size() != 1 || !CharSetAnalysis::isSet(afterItems.front()) || hasStrings(afterItems.front())) {
+                reason = "a deferred rule has an after context of more than a set of characters";
+                break;
+            }
+            const UCD::UnicodeSet a = sets.setOf(afterItems.front(), false);
+            if (a.intersects(changed) && !(changed - a).empty()) {
+                reason = "a deferred rule has an after context that the other rules of its group may change";
+            } else if (deletes) {
+                reason = "a deferred rule has an after context, and the other rules of its group delete characters";
+            }
+        }
+        if (reason.empty()) continue;
+        for (const DeferredRule & d : step.deferred) {
+            plan.problems.push_back(printRule(d.rule) + "  (a rule deferred after the BeforeCaptureCopy rules of its group, but "
+                                    + reason + ")");
+        }
     }
     return plan;
 }

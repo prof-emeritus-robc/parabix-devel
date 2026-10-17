@@ -884,7 +884,8 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
             llvm::outs() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
                          << " rules, matched together (" << set.rules.size() << ", starts by "
-                         << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)" : "the ends of matches") << ")"
+                         << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)"
+                             : set.exactStarts ? "the engine (all starts)" : "the ends of matches") << ")"
                          << (set.reversed ? ", captures reversed (SwapBack " + std::to_string(set.swapLength) + ", " + std::to_string(set.swapDistance) + ")" : "")
                          << (set.moved ? ", captures " + std::to_string(set.moveFirst + 1) + " to " + std::to_string(set.moveCapture)
                                          + " moved after capture " + std::to_string(set.moveCapture + 1) : "")
@@ -1410,7 +1411,8 @@ public:
                            for (size_t k = 0; k < lengths.size(); k++) {
                                sig += "_" + std::to_string(lengths[k]) + (runs[k] >= 0 ? "r" + std::to_string(runs[k]) : "");
                            }
-                           return sig;
+                           //  (A file name of the object cache.)
+                           return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
                        }(),
                        [&] {
                            Bindings inputs{Binding{"Starts", Starts}};
@@ -3970,6 +3972,7 @@ private:
     StreamSet * maskedStringOverrides(const std::vector<std::pair<UCD::property_t, StreamSet *>> & overrides, StreamSet * U21);
     StreamSet * matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                              StreamSet * U21, StreamSet ** spans = nullptr);
+    StreamSet * matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text, StreamSet * U21);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
                                StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21);
@@ -4565,6 +4568,27 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
         mP.CreateKernelCall<ShiftBack>(matches, shifted, offset);
         matches = shifted;
     }
+    return matches;
+}
+
+//  The positions at which a pattern (a sequence of items) matches with its
+//  contexts: the pattern and its after context as a lookahead (which the engine
+//  marks at the position it begins), after a lookbehind of the before context.
+StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
+                                             StreamSet * U21) {
+    const Insertions none;
+    std::vector<re::RE *> items;
+    if (engineBefore) {
+        items.push_back(re::makeLookBehindAssertion(
+            ldml::possessiveContext(ldml::expandedContext(engineBefore, none, DeletionMark), false)));
+    }
+    std::vector<re::RE *> ahead(text.begin(), text.end());
+    if (engineAfter) ahead.push_back(ldml::possessiveContext(ldml::expandedContext(engineAfter, none, DeletionMark), true));
+    items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
+    const PreparedRE prepared = prepareRE(re::makeSeq(items.begin(), items.end()));
+    StreamSet * const matches = mP.CreateStreamSet(1);
+    RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
+    engine.matchSearchPipeline(prepared, matches);
     return matches;
 }
 
@@ -5246,6 +5270,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             StreamSet * spans = nullptr;
             StreamSet * ends = nullptr;
             StreamSet * starts = nullptr;
+            StreamSet * firstStarts = nullptr;  // (with exactStarts: the first start of each span)
         };
         std::vector<CaptureMatches> captureMatches;
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
@@ -5286,6 +5311,23 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 //  the end of a match (no match ends within another).
                 m.starts = P.CreateStreamSet(1);
                 P.CreateKernelCall<MatchStartsFromEnds>(m.spans, m.ends, m.starts);
+                //  Where the matches of the sets are selected: every start, as matches
+                //  beginning within another of the set apply where that one does not
+                //  (the rest of the span, after the first starts, still covered).
+                if (set.exactStarts) {
+                    m.firstStarts = m.starts;
+                    std::vector<re::RE *> lookahead = items;
+                    if (set.greedyStarts) {
+                        //  (The captures matched greedily: the same matches, see greedyStarts.)
+                        lookahead.clear();
+                        for (size_t j = 0; j < n0; j++) lookahead.push_back(items[j]);
+                        for (size_t i = 0; i < set.captures.size(); i++) {
+                            lookahead.push_back(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark));
+                            for (const UCD::UnicodeSet & chars : set.texts[i]) lookahead.push_back(re::makeCC(chars, &cc::Unicode));
+                        }
+                    }
+                    m.starts = matchStarts(set.engineBefore, set.engineAfter, lookahead, U21);
+                }
             }
             if (m.starts && mask) m.starts = combine(m.starts, mask, false);
             captureMatches.push_back(m);
@@ -5299,7 +5341,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             std::vector<StreamSet *> startStreams, runStreams;
             for (CaptureMatches & m : captureMatches) {
                 StreamSet * const run = P.CreateStreamSet(1);
-                P.CreateKernelCall<SpanContinuation>(m.spans, m.starts, run);
+                P.CreateKernelCall<SpanContinuation>(m.spans, m.firstStarts ? m.firstStarts : m.starts, run);
                 startStreams.push_back(m.starts);
                 runStreams.push_back(run);
             }

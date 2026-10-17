@@ -158,6 +158,18 @@ struct MultipleCaptureMultipleReplacementSet {
     UCD::UnicodeSet startChars;
     //  If the matches have one character: their starts are their ends.
     bool singleCharacter = false;
+    //  Where the matches of different sets may overlap (captureSelection), and
+    //  the starts are not known by the first characters: every position at
+    //  which a match begins, found by the regular expression engine (the
+    //  pattern with its contexts, as a lookahead), including those beginning
+    //  within another match of the set (with the same end), which apply where
+    //  that one does not.
+    bool exactStarts = false;
+    //  With exactStarts, whether the captures are matched greedily in the
+    //  lookahead (the engine does not support possessive repetitions of sets
+    //  with strings there): the same matches, if what follows each repetition
+    //  cannot begin with a character it repeats.
+    bool greedyStarts = false;
     std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0
     std::vector<MultipleCaptureMultipleReplacement> rules;
     //  A rule whose result refers to its two captures in reverse order,

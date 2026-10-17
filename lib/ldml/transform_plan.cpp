@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdint>
 #include <functional>
+#include <set>
 #include <tuple>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
@@ -477,6 +478,24 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
             }
             for (size_t i = 1; i <= k; i++) before = before + captureChars[i];
             endsUnique = !last.back().intersects(before);
+            //  More precisely, Tk may not occur ending within a match: overlapping
+            //  itself (d positions before its end, d < |Tk|), or within the part of
+            //  the match before it.
+            if (!endsUnique) {
+                UCD::UnicodeSet earlier;
+                for (size_t i = 0; i + 1 < texts.size(); i++) for (const UCD::UnicodeSet & chars : texts[i]) earlier = earlier + chars;
+                for (size_t i = 1; i <= k; i++) earlier = earlier + captureChars[i];
+                const size_t m = last.size();
+                auto mayEndAt = [&](size_t d) {
+                    for (size_t i = 0; i < m; i++) {
+                        const UCD::UnicodeSet & actual = d + i < m ? last[m - 1 - d - i] : earlier;
+                        if (!last[m - 1 - i].intersects(actual)) return false;
+                    }
+                    return true;
+                };
+                endsUnique = true;
+                for (size_t d = 1; d <= m && endsUnique; d++) endsUnique = !mayEndAt(d);
+            }
         }
         //  With Tk empty, the last capture ending with a set S, one character or a
         //  run of them (possessive: a match ends with the run), S not occurring
@@ -824,6 +843,54 @@ static bool copyCaptureShape(re::RE * pattern, CopyCapture & shape, CharSetAnaly
         } else {
             return false;
         }
+    }
+    return true;
+}
+
+//  Whether the matches of a MultipleCaptureMultipleReplacement set are the same
+//  with its captures matched greedily rather than possessively: what follows
+//  each repetition (in the captures, the texts after them, or the after
+//  context) cannot begin with a character it repeats, so that a match never
+//  needs fewer repetitions.
+static bool greedyMatchesPossessive(const MultipleCaptureMultipleReplacementSet & set, CharSetAnalysis & sets) {
+    std::vector<re::RE *> items;
+    std::function<void (re::RE *)> flatten = [&](re::RE * re) {
+        if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+            for (re::RE * e : *seq) flatten(e);
+        } else if (re::Capture * c = dyn_cast<re::Capture>(re)) {
+            flatten(c->getCapturedRE());
+        } else if (re::Name * n = dyn_cast<re::Name>(re);
+                   n && !isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
+            flatten(n->getDefinition());
+        } else {
+            items.push_back(re);
+        }
+    };
+    for (size_t i = 0; i < set.captures.size(); i++) {
+        flatten(set.captures[i]);
+        for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
+    }
+    if (set.after) flatten(set.after);
+    for (size_t i = 0; i < items.size(); i++) {
+        const re::Rep * rep = dyn_cast<re::Rep>(items[i]);
+        if (rep == nullptr || rep->getLB() == rep->getUB()) continue;
+        UCD::UnicodeSet repeated;
+        if (!matchableChars(rep->getRE(), repeated, sets)) return false;
+        //  The characters with which what follows may begin (through optional items).
+        UCD::UnicodeSet next;
+        size_t j = i + 1;
+        for (; j < items.size(); j++) {
+            const re::RE * item = items[j];
+            const re::Rep * r = dyn_cast<re::Rep>(item);
+            UCD::UnicodeSet chars;
+            if (!matchableChars(r ? r->getRE() : item, chars, sets)) {
+                if (isa<re::End>(item) || isBoundary(item)) break;
+                return false;
+            }
+            next = next + chars;
+            if (!(r && r->getLB() == 0)) break;
+        }
+        if (next.intersects(repeated)) return false;
     }
     return true;
 }
@@ -1202,8 +1269,16 @@ TransformPlan planTransform(const std::vector<Rule *> & rules) {
             }
         }
         if (step.captureSelection) {
-            for (const MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            for (MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
                 if (set.startsByFirst || set.singleCharacter) continue;
+                //  The starts found by the engine, with the captures in a lookahead.
+                bool supported = true;
+                for (const re::RE * c : set.captures) supported &= !unsupportedLookahead(c);
+                if (supported || greedyMatchesPossessive(set, sets)) {
+                    set.exactStarts = true;
+                    set.greedyStarts = !supported;
+                    continue;
+                }
                 for (const MultipleCaptureMultipleReplacement & r : set.rules) {
                     plan.problems.push_back(printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but the matches of "
                                             "other such rules may overlap its matches, not all of whose starts are known)");
@@ -1538,8 +1613,48 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step) {
     return result;
 }
 
+//  The strings (of two or more characters) of a set, such as [aeiou{ü}] or
+//  [$vowel-[ae]], through alternations, differences, intersections and
+//  variables.
+static std::set<std::u32string> setStrings(const re::RE * re) {
+    std::set<std::u32string> strings;
+    if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        for (const re::RE * a : *alt) {
+            const std::set<std::u32string> s = setStrings(a);
+            strings.insert(s.begin(), s.end());
+        }
+    } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        std::u32string str;
+        if (seq->size() > 1 && fixedString(seq, str)) strings.insert(str);
+    } else if (const re::Diff * d = dyn_cast<re::Diff>(re)) {
+        strings = setStrings(d->getLH());
+        for (const std::u32string & str : setStrings(d->getRH())) strings.erase(str);
+    } else if (const re::Intersect * x = dyn_cast<re::Intersect>(re)) {
+        const std::set<std::u32string> r = setStrings(x->getRH());
+        for (const std::u32string & str : setStrings(x->getLH())) if (r.count(str)) strings.insert(str);
+    } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
+        if (!isFunctionCall(n) && n->getDefinition()) strings = setStrings(n->getDefinition());
+    }
+    return strings;
+}
+
 static re::RE * expandContext(re::RE * re, const std::map<unsigned, UCD::UnicodeSet> & insertions,
                               UCD::codepoint_t filler, CharSetAnalysis & sets) {
+    if (isa<re::Diff>(re) || isa<re::Intersect>(re)) {
+        //  (The strings of the set, as alternatives, as in an alternation.)
+        const std::set<std::u32string> strings = setStrings(re);
+        if (!strings.empty()) {
+            std::vector<re::RE *> alts;
+            for (const std::u32string & str : strings) {
+                std::vector<re::RE *> chars;
+                for (char32_t ch : str) chars.push_back(re::makeCC(static_cast<UCD::codepoint_t>(ch), &cc::Unicode));
+                alts.push_back(re::makeSeq(chars.begin(), chars.end()));
+            }
+            CharSetAnalysis charSets;
+            alts.push_back(expandContext(re::makeCC(sets.setOf(re, false), &cc::Unicode), insertions, filler, charSets));
+            return re::makeAlt(alts.begin(), alts.end());
+        }
+    }
     if (isa<re::CC>(re) || isa<re::PropertyExpression>(re) || isa<re::Any>(re) || isa<re::Diff>(re) || isa<re::Intersect>(re)) {
         UCD::UnicodeSet chars = sets.setOf(re, false);
         chars = chars - UCD::UnicodeSet(filler);

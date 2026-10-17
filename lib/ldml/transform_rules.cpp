@@ -222,11 +222,30 @@ RE * engineContext(RE * context, bool afterContext) {
 
 namespace {
 
+// The alternatives of a set with strings, longest first: ICU matches the
+// longest of the strings of a set (and its characters) at a position, while
+// the engine resolves a possessive repetition as PCRE does, each repetition
+// taking the first alternative that matches.
+RE * longestFirst(RE * re) {
+    RE * body = re;
+    while (Name * n = dyn_cast<Name>(body)) {
+        if (isFunctionCall(n) || n->getDefinition() == nullptr) return re;
+        body = n->getDefinition();
+    }
+    Alt * const alt = dyn_cast<Alt>(body);
+    if (alt == nullptr || alt->size() < 2) return re;
+    std::vector<RE *> alts(alt->begin(), alt->end());
+    auto maxLength = [](const RE * a) {return getLengthRange(a, &cc::Unicode).second;};
+    std::stable_sort(alts.begin(), alts.end(), [&](const RE * a, const RE * b) {return maxLength(a) > maxLength(b);});
+    if (std::equal(alts.begin(), alts.end(), alt->begin())) return re;
+    return makeAlt(alts.begin(), alts.end());
+}
+
 class ForwardPossessive final : public RE_Transformer {
 public:
     ForwardPossessive() : RE_Transformer("ForwardPossessive") {}
     RE * transformRep(Rep * rep) override {
-        return Rep::Create(transform(rep->getRE()), rep->getLB(), rep->getUB(), Rep::Kind::Possessive);
+        return Rep::Create(longestFirst(transform(rep->getRE())), rep->getLB(), rep->getUB(), Rep::Kind::Possessive);
     }
 };
 

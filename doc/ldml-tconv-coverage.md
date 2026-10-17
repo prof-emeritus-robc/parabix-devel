@@ -1,12 +1,13 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `335e35694`: with rules with text
+*Status of `tools/ldml/tconv` on branch LDML at `258f7c284`: with rules with text
 to revisit composed at compile time (W6), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
 MultipleCaptureMultipleReplacement rules (W3, §5), insertion rules (W4, §4.2),
 large mappings multiplexed (§4.3), captures referred to out of order (SwapBack,
-MoveRegions, §5), function calls on captures of single characters (W5, §5), and
-the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD, Any-FCC,
+MoveRegions, §5), function calls on captures of single characters (W5, §5),
+captures of before contexts copied (W5, §5), unreferenced captures removed
+(§5), and the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD, Any-FCC,
 Any-Hex/XML10 and Any-Remove (§2.1),
 against CLDR `common/transforms` and `common/testData/transforms` at commit
 `7cdeb9e` (2026-10-09). October 16, 2026.*
@@ -16,7 +17,9 @@ copy (`~/transforms`, 380 files rather than 381), so Latin-ug and ug-Latin,
 implementable with them, are counted as blocked by W7 here, and
 Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather than the
 W3, W4 and W6 problems they have with the fixes. Any-FCD, Any-FCC,
-Any-Hex/XML10 and Any-Remove were added
+Any-Hex/XML10 and Any-Remove, and the transforms that the capture changes affect
+(Kana-Latn, Hira-Latn, Jpan-Latn, Zawgyi-my, my-Zawgyi, my-my_FONIPA,
+si-si_FONIPA, fa-fa_FONIPA), were added
 to the results by an incremental update (`tconv_coverage.py --update`, see
 [Reproducing](#reproducing)); the generated tables and blocks of this report are
 marked `<!-- coverage:… -->`.*
@@ -40,8 +43,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 344 (81%) |
-| …of which public (not `visibility="internal"`) | 393 | 313 (80%) |
+| Transforms defined by CLDR files (380 files) | 425 | 347 (82%) |
+| …of which public (not `visibility="internal"`) | 393 | 316 (80%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 230 belong to implementable transforms.
@@ -51,6 +54,12 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   for the cases that fail in the text of all the cases), which removed 10,675
   spurious failures. None of the transforms made implementable since `02e77ee59`
   has CLDR test data; they were checked against ICU 78.3 (§2.3).
+- **Captures of before contexts copied** (W5, §5), `t (y* $vowel) { ヽ $voice → d $1`:
+  the rules copying a capture at the end of their before context, and the
+  other rules of their group with the same first characters, are applied after
+  the rest of the group to the converted text, in rounds. Kana-Latn, Hira-Latn
+  and Jpan-Latn are implementable; Kana-Latn is identical to ICU 78.3's
+  `createFromRules` on 20,000 random lines.
 - **Function calls on captures** (W5, §5), `&Any-Lower($1)`: the rule is
   replaced by rules for the characters of the capture, grouped by the value of
   the call. az-, el-, lt- and tr-Title, Latn-Ethi/ALALOC and Latn-Ethi/SERA are
@@ -101,28 +110,28 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     cases.
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
-  - W3 variable-length texts: 31 transforms (am_FONIPA-am and the 18 `*-am`
+  - W3 variable-length texts: 32 transforms (am_FONIPA-am and the 18 `*-am`
     transforms through it, am-am_FONIPA and the three `am-*` transforms through
-    it, Latn-Arab, blt-blt_FONIPA, byn Xaleget, my-Zawgyi, and the Pinyin and
-    Bopomofo transforms);
+    it, Latn-Arab, blt-blt_FONIPA, byn Xaleget, my-Zawgyi, Zawgyi-my, and the
+    Pinyin and Bopomofo transforms);
   - W6 revisits not composed (unbounded runs, variable-length texts): 23;
   - W7 parser semantics: 4 in this run (2 with the local CLDR fixes);
-  - W5 back-references: 2 (Kana-Latn, and Hira-Latn through it).
+  - W5 back-references: none alone (fa-fa_FONIPA, sk-ja and sk_FONIPA-ja also
+    need W6).
 
   Each of these is concentrated in a few rule files (§5).
 
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          344  ████████████████████████████████
-+ W3 variable-length text    375  ███████████████████████████████████
-+ W6 revisit                 411  ███████████████████████████████████████
-+ W5 captures/functions      417  ███████████████████████████████████████
-+ W7 parser semantics        421  ████████████████████████████████████████
-+ W10 engine lookaheads      422  ████████████████████████████████████████
-+ W4 insertion               423  ████████████████████████████████████████
-+ W8 built-ins               424  ████████████████████████████████████████
-+ W9 analysis scale          425  ████████████████████████████████████████
+now                          347  █████████████████████████████████
++ W3 variable-length text    379  ████████████████████████████████████
++ W6 revisit                 415  ███████████████████████████████████████
++ W7 parser semantics        419  ███████████████████████████████████████
++ W5 captures/functions      422  ████████████████████████████████████████
++ W10 engine lookaheads      423  ████████████████████████████████████████
++ W4 insertion               424  ████████████████████████████████████████
++ W8 built-ins               425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
 
@@ -262,7 +271,7 @@ The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
 `Hex-Any/Plain`, which ICU 78.3 does not have. `Hex-Any` is no longer an alias
 of `Hex-Any/Java`: as in ICU, it accepts every escape form.
 
-### 2.2 Transforms defined by rules (344 of 425)
+### 2.2 Transforms defined by rules (347 of 425)
 
 Implementable now:
 
@@ -293,7 +302,8 @@ Implementable now:
   Han-Latin/Names;
 - with captures in reverse order: Thai-ThaiLogical and ThaiLogical-Thai;
 - with function calls on captures: az-, el-, lt- and tr-Title,
-  Latn-Ethi/ALALOC and Latn-Ethi/SERA.
+  Latn-Ethi/ALALOC and Latn-Ethi/SERA;
+- with captures of before contexts copied: Kana-Latn, Hira-Latn and Jpan-Latn.
 
 The per-transform status is in the table.
 
@@ -375,6 +385,26 @@ lines. The `SwapBack` kernel has tests of its own in `test_bit_movement`
 Latn-Ethi/SERA are identical to ICU 78.3 on 3,000 random lines each, and random
 rule sets calling the case mappings on captures are identical to ICU's
 `createFromRules`.
+
+**Captures of before contexts copied (W5).** Kana-Latn has no CLDR test data,
+and ICU's own Katakana-Latin differs from the CLDR rules (it gives `ka` for
+`カヽ`). It was compared with ICU 78.3's `createFromRules` on the rules of
+`Latin-Katakana.xml` (reverse): identical on 20,000 random lines of Katakana,
+iteration marks (ヽ, ヾ), voicing marks, small kana, halfwidth forms and Latin,
+also with segment sizes 1 and 3, 3 threads and `--EnableAsserts --VerifyIR`, and
+on chains of up to four iteration marks (`カヽヽヽヽ`; six with
+`--deferred-rule-rounds=6`). Eight rule sets of copying rules (contexts with
+repetitions, triggers within the captured sets, replacements before the copy,
+texts of two characters, conversions in the same group) are identical to ICU's
+`createFromRules` on 5,000 random lines each. Hira-Latn was checked on a few
+lines only (through ICU it would use ICU's own Katakana-Latin), and Jpan-Latn
+was not run.
+
+**Unreferenced captures removed.** Removing the captures that the results
+never refer to (`9043a6b5b`) changes the plans of four transforms and the
+status of none: my-my_FONIPA, si-si_FONIPA and the six implementable transforms
+through them give the same output as before on their CLDR test sources and on
+20,000 random lines each.
 
 **Regression of the fused kernels.** The fused implementation was compared with
 the previous tconv on every implementable transform (205 names). Each ran on:
@@ -552,6 +582,15 @@ correction, between 108 and 1,853 of each 5,000 differ.
   relocation out of range of a `Page21` fixup in `SingletonCanonicalization`
   (seen once with `:: NFD ; :: [:Mn:] Remove ; :: NFC ;` and `--EnableAsserts`);
   not investigated.
+- **Rounds of the deferred rules.** The copying rules are applied in rounds
+  (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
+  contexts reach back to each other (`カヽヽヽヽヽ`) leaves the last ones
+  unchanged. Each round may insert positions, and the bounds of the pipeline's
+  buffers grow with the number inserted at a position to the power of the
+  rounds: above 6 rounds the pipeline fails to compile ("failed to allocate
+  virtual address space"), and tconv rejects them. For the same reason, a
+  capture copied counts runs of its repeated set of up to 16 characters; a rule
+  copying a longer run does not apply.
 
 ### 3.3 Intended differences from ICU
 
@@ -796,14 +835,14 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 48 | 31 | M–L (the rest) |
+| W3 variable-length texts | 48 | 32 | M–L (the rest) |
 | W6 text to revisit, not composed | 40 | 23 | L (with W3) |
-| W5 back-references | 6 | 2 | M |
+| W5 back-references | 3 | 0 | M |
 | W7 parser semantics (#5, #6) | 4 | 4 | S |
 | W10 engine lookaheads | 1 | 0 | M |
 | W4 insertion rules (with string rules) | 1 | 0 | M |
 | W8 built-ins (Any-BreakInternal) | 1 | 1 | L |
-| W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 1 | 1 | L |
+| W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 0 | 0 | L |
 <!-- /coverage:work-items -->
 
 (W7 counts the run without the local CLDR fixes; with them, it blocks nothing,
@@ -827,6 +866,8 @@ Done since the first assessment:
 - two captures of fixed lengths in reverse order (`7e927d2d7`, SwapBack), and
   captures of variable lengths moved out of order (`a090553b4`, MoveRegions);
 - W5 function calls on captures of single characters (`687470e89`);
+- W5 captures of before contexts copied (`258f7c284`), and unreferenced
+  captures removed (`9043a6b5b`);
 - the built-ins Hex-Any (`41df85c9e`), Any-CaseFold (`89e922e4f`), Any-FCD
   (`e2554e7f1`), Any-FCC (`42df6910a`), Any-Hex/XML10 (`96fa4766f`) and
   Any-Remove (`335e35694`).
@@ -1009,10 +1050,41 @@ mappings, and other transforms through their plans, on single characters. This
 made az-, el-, lt- and tr-Title and Latn-Ethi/ALALOC and /SERA implementable, and
 removed W5 from the Pinyin transforms and my-Zawgyi.
 
-W5 now needs only back-references, in 6 transforms: Kana-Latn
-(`t (y* $vowel) { ヽ $voice → d $1`, 18 rules) and Hira-Latn through it,
-Zawgyi-my, fa-fa_FONIPA, sk_FONIPA-ja and sk-ja. It alone blocks Kana-Latn and
-Hira-Latn.
+**Unreferenced captures** are removed before the other capture simplifications
+(`ldml::RemoveUnreferencedCaptures`, `9043a6b5b`, with `re::removeUnneededCaptures`):
+a capture that the result never refers to, such as the grouping in
+`($wspace)+ ([…]) → $2`, becomes its pattern, and the other captures are
+renumbered. Seven rules of the CLDR transforms have such captures, in
+my-my_FONIPA, my-t-my-d0-zawgyi, my-t-my-s0-zawgyi and si-si_FONIPA. The three
+capture simplifications (with trivial and nullable capture elimination) are on
+by default; `--disable-capture-simplification` turns them off (in tconv and
+`ldml_trules`, whose `--eliminate-trivial-captures` and
+`--eliminate-nullable-captures` it replaces). Zawgyi-my no longer needs W5.
+
+**Captures of before contexts copied** (`258f7c284`). A rule
+`P (C) { T } A → R $1` copies the text that C, at the end of its before
+context, matches: as ICU matches before contexts against the text it has
+converted, the copy is of converted text, and a rule may see the copy of
+another (with `(.) { b → $1`, ICU turns `xbb` into `xxx`). Kana-Latn repeats a
+syllable this way at the iteration mark ヽ, with 18 such rules and a rule
+deleting the mark otherwise. The planner defers these rules, with the other
+rules of their group whose texts begin with the same characters (the
+triggers), and applies them after the rest of the group, to the converted text,
+in rounds: at each trigger whose before context may not reach back to a trigger
+not yet replaced, the first deferred rule matching applies (matched by the
+regular expression engine), R and the copy replace T, and the text written is
+not matched again. The capture is counted right to left from the trigger,
+possessively, as ICU matches it: it must be a sequence of sets with at most one
+unbounded repetition of a set, whose run `RunIndex` counts. The other rules of
+the group may not match the triggers or the characters after them in the texts
+of the deferred rules, nor see them in their before contexts, and the after
+contexts of the deferred rules (seeing the converted text) must be sets that
+the other rules' changes cannot tell apart. Kana-Latn, Hira-Latn and Jpan-Latn
+are implementable.
+
+W5 now needs only back-references, in 3 transforms, none of which it alone
+blocks: fa-fa_FONIPA (`([$IPA_CONSONANT$VOWEL\|]) { ّ → $1`, a copy of a set
+with strings, also W3 and W6), sk_FONIPA-ja and sk-ja (also W6).
 
 **W4 insertion rules** (§4.2) are implemented. They remain only in Grek-Latn and
 Grek-Latn/UNGEGN (`[Pp] { } [ΣςσϷϸϺϻ] → \'`), in groups with string rules, and
@@ -1038,9 +1110,11 @@ transforms without them (`~/transforms`), so these four transforms are reported
 as blocked by W7.
 
 **W8 and W9.** Thai-Latn now needs only `Any-BreakInternal`, which uses a
-dictionary word break (its Thai-ThaiLogical step is implemented). Jpan-Latn
-needs Hira-Latn and Kana-Latn (W5) and the scale work of W9; the Han transforms
-now compile (§4.3).
+dictionary word break (its Thai-ThaiLogical step is implemented). Jpan-Latn,
+which needed Hira-Latn and Kana-Latn, is implementable, and W9 blocks nothing:
+the Han transforms compile (§4.3). (`tconv_coverage.py` counted Jpan-Latn's
+`::Hira-Latin ;` as an unknown transform; it now resolves names that mix the
+forms of the scripts of a transform's names, as tconv does.)
 
 The per-transform table lists the problem classes of every transform.
 
@@ -1063,7 +1137,10 @@ The per-transform table lists the problem classes of every transform.
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. Run
    the coverage with them (`~/cldr`), as the earlier reports did.
-5. **W5 back-references and W9.** Kana-Latn and Hira-Latn, then Jpan-Latn.
+5. **W5 back-references.** The copy of a set with strings (fa-fa_FONIPA), with
+   W6 in fa-fa_FONIPA, sk-ja and sk_FONIPA-ja; and the deferred rules exact for
+   chains of any length (a fixpoint rather than rounds, with buffer bounds that
+   do not compound).
 6. **Built-ins and pipeline size.**
    - Built-ins: `Any-Name` and `Name-Any`, and
      `Any-BreakInternal` for Thai-Latn.
@@ -1120,6 +1197,8 @@ tconv on every implementable transform.
 | `81816aedb`, `61225fd63` | (master) room for a consumer's provisional stride; the partial sums of a terminated popcount kernel: no assertion failures in NFC |
 | `c3e3fe5b1`, `96fa4766f` | BixNum division of narrow dividends; Any-Hex/XML10 (`XMLDecimalPipeline`): 24 of 30 built-ins |
 | `33e9cb1e1`, `335e35694` | `PipelineBuilder::CreateEmptyStreamSet`; Any-Remove: 25 of 30 built-ins |
+| `56473be9a`, `9043a6b5b` | unreferenced captures removed; `--disable-capture-simplification` |
+| `258f7c284` | captures of before contexts copied (deferred rules): Kana-Latn, Hira-Latn, Jpan-Latn: 347 |
 
 ## Reproducing
 

@@ -20,6 +20,10 @@ namespace kernel {
 class PipelineKernel;
 class KernelBuilder;
 
+// Opt-in hook, null by default: when set, circular (double-mapped) buffers are built by this
+// function instead of from a memfd (a temp file on macOS). The result must be freeable by munmap.
+extern uint8_t * (*CircularBufferAllocator)(size_t size, size_t hasUnderflow);
+
 class StreamSetBuffer {
 public:
 

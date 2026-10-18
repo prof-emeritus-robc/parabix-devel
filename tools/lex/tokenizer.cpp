@@ -171,9 +171,21 @@ static void emitToken(uint16_t id, const std::string & tokStr) {
 static bool gFastEmit = false;
 static const bool gEmitDbg = std::getenv("BPE_EMIT_DBG") != nullptr;
 
+static void bpe_emit_id(uint16_t id);
+
 extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
     if (gBenchQuiet) return;   // timing loop: skip output, measure tokenization only
-    uint16_t id = *id_ptr;
+    if (getenv("BPE_EMIT_DBG")) {
+        const uint8_t * bp = reinterpret_cast<const uint8_t *>(id_ptr);
+        std::fprintf(stderr, "[emit] id=%u  lo=%u hi=%u  ptr=%p\n",
+                     (unsigned)*id_ptr, (unsigned)bp[0], (unsigned)bp[1], (const void*)id_ptr);
+    }
+    bpe_emit_id(*id_ptr);
+}
+
+// One finished token: the body of bpe_emit_token, and the --bpe-tail sink.
+static void bpe_emit_id(uint16_t id) {
+    if (gBenchQuiet) return;   // timing loop: skip output, measure tokenization only
     if (gFastEmit && !gEmitDbg) {
         char text[8];                       // up to 5 digits + '\n'
         char * const end = text + sizeof(text);
@@ -184,11 +196,6 @@ extern "C" void bpe_emit_token(const uint16_t * id_ptr) {
         std::lock_guard<std::mutex> lock(gEmitMutex);
         llvm::outs().write(p, end - p);
         return;
-    }
-    if (getenv("BPE_EMIT_DBG")) {
-        const uint8_t * bp = reinterpret_cast<const uint8_t *>(id_ptr);
-        std::fprintf(stderr, "[emit] id=%u  lo=%u hi=%u  ptr=%p\n",
-                     (unsigned)id, (unsigned)bp[0], (unsigned)bp[1], (const void*)id_ptr);
     }
     const std::string tokStr = gBPE ? gBPE->decodeToken(static_cast<int>(id)) : std::string();
     emitToken(id, tokStr);
@@ -356,6 +363,13 @@ static cl::opt<bool> FastEmit(
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
+static cl::opt<bool> SkipIdentityNormalize(
+    "skip-identity-normalize",
+    cl::desc("BPE mode without --normalize: feed BPE the input bytes instead of the decoded "
+             "and re-encoded codepoints (the same bytes for valid UTF-8)."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
 static cl::opt<unsigned> BenchLoop(
     "bench-loop",
     cl::desc("BPE mode: tokenize the input N times inside one process (excludes OS "
@@ -403,6 +417,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
         const BPETokenizer & bpe) {
 
     auto __tBuild0 = std::chrono::steady_clock::now();
+    bpeSetFrameworkHooks();
     auto P = CreatePipeline(driver,
                             Input<const char*>{"buffer"}, Input<size_t>{"length"});
     Scalar * const buffer = P.getInputScalar("buffer");
@@ -427,8 +442,12 @@ static BPEPipelineFunctionType buildBPEPipeline(
     StreamSet * normalizedBasis = BasisBits;
     if (hasActiveNorm || PreTokenizer.getNumOccurrences() != 0) {
         U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
-        normalizedBasis = P.CreateStreamSet(8, 1);
-        U21_to_UTF8(P, U21codepoints, normalizedBasis);
+        // --skip-identity-normalize: with no normalizer the re-encoded bytes are the input
+        // bytes (for valid UTF-8), so keep BasisBits; only the pretokenizer needs U21.
+        if (hasActiveNorm || !SkipIdentityNormalize) {
+            normalizedBasis = P.CreateStreamSet(8, 1);
+            U21_to_UTF8(P, U21codepoints, normalizedBasis);
+        }
     }
 
     // Stage 2: pre-tokenization — produces the byte stream that feeds the
@@ -491,14 +510,40 @@ static BPEPipelineFunctionType buildBPEPipeline(
     //      additionalStreams channel — that channel indexes by scan-
     //      iteration counter, not match-end byte position, which silently
     //      zeroed the high byte.)
-    StreamSet * idBytes16 = P.CreateStreamSet(1, 16); 
-    P.CreateKernelCall<P2S16Kernel>(vocabID, idBytes16);
+    if (tr.segStarts) {
+        // --bpe-tail: the tail kernels finish BPE per segment and hand the ids over in
+        // order, a batch per pipeline call. --fast-emit formats a batch into one write.
+        bpeTailSetSink([](const uint16_t * ids, size_t n) {
+            if (gBenchQuiet) return;
+            if (gFastEmit && !gEmitDbg) {
+                thread_local std::string text;
+                text.clear();
+                char digits[8];
+                for (size_t i = 0; i < n; i++) {
+                    char * const end = digits + sizeof(digits);
+                    char * p = end;
+                    *--p = '\n';
+                    unsigned v = ids[i];
+                    do { *--p = char('0' + v % 10); v /= 10; } while (v);
+                    text.append(p, end - p);
+                }
+                std::lock_guard<std::mutex> lock(gEmitMutex);
+                llvm::outs().write(text.data(), text.size());
+                return;
+            }
+            for (size_t i = 0; i < n; i++) bpe_emit_id(ids[i]);
+        });
+        buildBPETailEmitter(P, vocabID, matchEnd, tr.segStarts);
+    } else {
+        StreamSet * idBytes16 = P.CreateStreamSet(1, 16); 
+        P.CreateKernelCall<P2S16Kernel>(vocabID, idBytes16);
 
-    StreamSet * scanIndices = P.CreateStreamSet(1, 64); 
-    P.CreateKernelCall<ScanIndexGenerator>(matchEnd, scanIndices);  //  picks positions to print
+        StreamSet * scanIndices = P.CreateStreamSet(1, 64); 
+        P.CreateKernelCall<ScanIndexGenerator>(matchEnd, scanIndices);  //  picks positions to print
 
-    scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),  
-                 idBytes16, scanIndices);   // emit token IDs at every matchEnd position 
+        scan::Reader(P, driver, SCAN_CALLBACK(bpe_emit_token),  
+                     idBytes16, scanIndices);   // emit token IDs at every matchEnd position 
+    }
 
     auto __tBuild1 = std::chrono::steady_clock::now();
     auto fn = reinterpret_cast<BPEPipelineFunctionType>(P.compile());

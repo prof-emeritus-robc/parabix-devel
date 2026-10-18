@@ -164,6 +164,16 @@ static StreamSet * encodeFromU21(PipelineBuilder & P, StreamSet * U21_focus) {
     return Output;
 }
 
+// The characters assigned in Unicode <= maxAge (UCD::AGE_ns::V8_0 etc.). HF's Rust crates
+// carry old Unicode tables (punctuation and Cf 8.0, combining marks 9.0), so matching HF
+// exactly means ignoring what was assigned since.
+static UCD::UnicodeSet assignedUpTo(int maxAge) {
+    auto * ageObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::age));
+    UCD::UnicodeSet s;
+    for (int v = UCD::AGE_ns::V1_1; v <= maxAge; v++) s = s + ageObj->GetCodepointSet(v);
+    return s;
+}
+
 // applyStripAccents — remove all accent/combining marks (Unicode category Mn).
 //
 // Now works entirely in U21 space (one slot = one codepoint), so we never
@@ -185,10 +195,15 @@ static StreamSet * applyStripAccents(PipelineBuilder & P, StreamSet * U21_focus)
     NFD_PipelineBuilder nfd(P);
     StreamSet * NFD_U21 = nfd.NFD_U21_Pipeline(U21_focus);
 
-    // Build the Mn character class from the Unicode General Category table.
+    // Build the mark class from the Unicode General Category table, as HF's
+    // is_combining_mark has it: Unicode 9.0, when U+1CF2/U+1CF3 (now Lo) were marks
+    // and U+111C9 (now Mn) was punctuation. Per-codepoint sweep against HF's
+    // Sequence([NFD(), StripAccents()]); without this, 414 newer marks were stripped.
     auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
         UCD::getPropertyObject(UCD::gc));
-    re::CC * mnCC = re::makeCC(gcObj->GetCodepointSet("M"), &cc::Unicode);
+    re::CC * mnCC = re::makeCC((gcObj->GetCodepointSet("M") & assignedUpTo(UCD::AGE_ns::V9_0))
+                               - UCD::UnicodeSet(0x111C9, 0x111C9) + UCD::UnicodeSet(0x1CF2, 0x1CF3),
+                               &cc::Unicode);
 
     // Mark every slot that holds an Mn codepoint.
     // CharClassesKernel takes our NFD stream (one codepoint per slot) and outputs
@@ -370,11 +385,13 @@ static StreamSet * applyDeleteAndSpaceReplace(PipelineBuilder & P,
 // applyNmt
 // Deletes a fixed set of control characters and replaces a fixed set of
 static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * U21_focus) {
-    // DELETE: U+0001-U+0008, U+000B, U+000E-U+001F, U+007F
+    // DELETE: U+0001-U+0008, U+000B, U+000E-U+001F, U+007F, U+008F, U+009F (HF's Nmt)
     re::CC * delCC = re::makeCC(0x01, 0x08);
     delCC = re::makeCC(delCC, re::makeCC(0x0B));
     delCC = re::makeCC(delCC, re::makeCC(0x0E, 0x1F));
     delCC = re::makeCC(delCC, re::makeCC(0x7F));
+    delCC = re::makeCC(delCC, re::makeCC(0x8F));
+    delCC = re::makeCC(delCC, re::makeCC(0x9F));
 
     // REPLACE: tab, LF, FF, CR + Unicode whitespace/special chars
     re::CC * repCC = re::makeCC(0x09, 0x0A);
@@ -389,37 +406,31 @@ static StreamSet * applyNmt(PipelineBuilder & P, StreamSet * U21_focus) {
     return applyDeleteAndSpaceReplace(P, U21_focus, delCC, repCC);
 }
 
-// applyBertCleanText — BERT BasicTokenizer's _clean_text.
-// Deletes \p{C} codepoints (control/format/surrogate/private/unassigned) plus
-// U+FFFD, EXCEPT \t \n \r which are kept-but-replaced.  Replaces \p{Zs} (space
-// separator) plus \t \n \r with U+0020. 
+// applyBertCleanText — BERT BasicTokenizer's _clean_text, as HF's BertNormalizer does it.
+// Deletes U+0000, U+FFFD and the "other" codepoints of HF's Unicode 8.0 table (Cc, Cf,
+// Cs, Co; not Cn, so unassigned codepoints and noncharacters stay, and neither do Cf
+// characters newer than 8.0), EXCEPT \t \n \r which are kept-but-replaced. Then
+// replaces every White_Space codepoint left (Zs, U+2028, U+2029, \t \n \r) with U+0020.
+// Per-codepoint sweep against HF: Zs alone left U+2028/U+2029 in place.
 static StreamSet * applyBertCleanText(PipelineBuilder & P, StreamSet * U21_focus) {
     auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
         UCD::getPropertyObject(UCD::gc));
 
-    // DELETE: all of \p{C} (five subcategories) minus \t \n \r, plus U+FFFD.
-    UCD::UnicodeSet delSet;
-    delSet.insert(gcObj->GetCodepointSet("Cc"));
-    delSet.insert(gcObj->GetCodepointSet("Cf"));
-    delSet.insert(gcObj->GetCodepointSet("Cs"));
-    delSet.insert(gcObj->GetCodepointSet("Co"));
-    delSet.insert(gcObj->GetCodepointSet("Cn"));
-    delSet = delSet - UCD::UnicodeSet(0x09)   // \t — kept but replaced
-                    - UCD::UnicodeSet(0x0A)   // \n — kept but replaced
-                    - UCD::UnicodeSet(0x0D);  // \r — kept but replaced
-    delSet.insert(0xFFFD);
+    // DELETE: Cc, Cf (as of 8.0), Cs, Co minus \t \n \r, plus U+0000 and U+FFFD.
+    // Built with UnicodeSet operators, not insert(): UnicodeSet::insert() was found to
+    // corrupt an unrelated bit (U+0040 '@' wrongly matched) after the 2026-09-05
+    // slab-allocator rewrite. Framework bug, flagged upstream.
+    UCD::UnicodeSet delSet = gcObj->GetCodepointSet("Cc")
+                           + (gcObj->GetCodepointSet("Cf") & assignedUpTo(UCD::AGE_ns::V8_0))
+                           + gcObj->GetCodepointSet("Cs") + gcObj->GetCodepointSet("Co");
+    delSet = delSet - UCD::UnicodeSet(0x09, 0x0A)   // \t \n — kept but replaced
+                    - UCD::UnicodeSet(0x0D, 0x0D)   // \r — kept but replaced
+                    + UCD::UnicodeSet(0xFFFD, 0xFFFD);
     re::CC * delCC = re::makeCC(delSet, &cc::Unicode);
 
-    // REPLACE with space: \p{Zs} (space separators) plus \t \n \r.
-    // Built via re::makeCC unions rather than UnicodeSet::insert() -- the same
-    // pattern applyNmt already uses successfully (see below) -- because
-    // UnicodeSet::insert() was found to corrupt an unrelated bit (U+0040 '@'
-    // wrongly matched) after the 2026-09-05 slab-allocator rewrite. Framework
-    // bug, flagged upstream; this sidesteps it rather than fixing it.
-    re::CC * repCC = re::makeCC(gcObj->GetCodepointSet("Zs"), &cc::Unicode);
-    repCC = re::makeCC(repCC, re::makeCC(0x09));
-    repCC = re::makeCC(repCC, re::makeCC(0x0A));
-    repCC = re::makeCC(repCC, re::makeCC(0x0D));
+    // REPLACE with space: White_Space (deletion wins for the Cc ones: \v \f U+0085).
+    auto * wsObj = llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(UCD::WSpace));
+    re::CC * repCC = re::makeCC(wsObj->GetCodepointSet("Y"), &cc::Unicode);
 
     return applyDeleteAndSpaceReplace(P, U21_focus, delCC, repCC);
 }
@@ -448,7 +459,9 @@ static StreamSet * applyBertChineseChars(PipelineBuilder & P, StreamSet * U21_fo
     cjkCC = re::makeCC(cjkCC, re::makeCC(0x20000, 0x2A6DF));  // Extension B
     cjkCC = re::makeCC(cjkCC, re::makeCC(0x2A700, 0x2B73F));  // Extension C
     cjkCC = re::makeCC(cjkCC, re::makeCC(0x2B740, 0x2B81F));  // Extension D
-    cjkCC = re::makeCC(cjkCC, re::makeCC(0x2B820, 0x2CEAF));  // Extension E
+    // Extension E from U+2B920, not U+2B820: HF's is_chinese_char carries that typo from
+    // the original BERT code, so U+2B820..U+2B91F are not spaced (per-codepoint sweep).
+    cjkCC = re::makeCC(cjkCC, re::makeCC(0x2B920, 0x2CEAF));  // Extension E
     cjkCC = re::makeCC(cjkCC, re::makeCC(0x2F800, 0x2FA1F));  // Compatibility Supplement
 
     StreamSet * CJK_Mask = P.CreateStreamSet(1, 1);

@@ -31,6 +31,7 @@ public:
                                 ShuffleMode m = ShuffleMode::TruncateIndex) override;
     llvm::Value * mvmd_compress(unsigned fw, llvm::Value * a, llvm::Value * select_mask) override;
     llvm::Value * mvmd_expand(unsigned fw, llvm::Value * a, llvm::Value * select_mask) override;
+    llvm::Value * bitblock_any(llvm::Value * a) override;
     
     ~IDISA_ARM_Builder() {}
     

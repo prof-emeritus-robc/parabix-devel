@@ -301,6 +301,27 @@ Value * IDISA_ARM_Builder::mvmd_expand(unsigned fw, Value * a, Value * select_ma
     return IDISA_Builder::mvmd_expand(fw, a, select_mask);
 }
 
+Value * IDISA_ARM_Builder::bitblock_any(Value * a) {
+    const unsigned width = a->getType()->isVectorTy() ? getVectorBitWidth(a) : 0;
+    if (width < ARM_width || width % ARM_width != 0) {
+        return IDISA_Builder::bitblock_any(a);
+    }
+    // OR the 128-bit pieces together, then umaxp folds the four 32-bit lanes into the
+    // low 64 bits: umaxp, fmov, cbz (the integer compare would need mov, fmov, orr, cbz).
+    Type * const v2i64Ty = FixedVectorType::get(getInt64Ty(), 2);
+    Value * const a64 = fwCast(64, a);
+    Value * v = CreateExtractVector(v2i64Ty, a64, getInt64(0));
+    for (unsigned i = 2; i < width / 64; i += 2) {
+        v = CreateOr(v, CreateExtractVector(v2i64Ty, a64, getInt64(i)));
+    }
+    Type * const v4i32Ty = FixedVectorType::get(getInt32Ty(), 4);
+    Function * const umaxp = Intrinsic::getOrInsertDeclaration(getModule(), Intrinsic::aarch64_neon_umaxp, v4i32Ty);
+    Value * const v32 = CreateBitCast(v, v4i32Ty);
+    Value * m = CreateCall(umaxp->getFunctionType(), umaxp, {v32, v32});
+    m = CreateExtractElement(CreateBitCast(m, v2i64Ty), getInt32(0));
+    return CreateICmpNE(m, getInt64(0), "bitblock_any");
+}
+
 Value * IDISA_ARM_Builder::hsimd_packl(unsigned fw, Value * a, Value * b) {
     if ((fw >= 16) && (fw <= 64) && (getVectorBitWidth(a) == ARM_width)) {
         int nElems = getVectorBitWidth(a) / fw;

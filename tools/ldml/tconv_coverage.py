@@ -211,7 +211,7 @@ def parse_kernel_counts(text):
         m = re.match(r'group \d+: (\d+) rules, (\d+) kernels$', line)
         if m:
             per_group.append([int(m.group(1)), int(m.group(2))])
-        m = re.match(r'total: (\d+) groups, (\d+) rules(?:, (\d+) group kernels, (\d+) kernels)?$', line)
+        m = re.match(r'total: (\d+) groups, (\d+) rules(?:, (\d+) group kernels, (\d+) kernels)?(?: \(direct pipeline\))?$', line)
         if m:
             counts = dict(groups=int(m.group(1)), rules=int(m.group(2)),
                           group_kernels=int(m.group(3)) if m.group(3) else None,

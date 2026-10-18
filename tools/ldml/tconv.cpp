@@ -451,14 +451,9 @@ static StreamSet * CaseMapBasis(PipelineBuilder & P, UCD::property_t prop, Strea
 
 typedef void (*TransformFunctionType)(uint32_t fd);
 
-static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
-    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
-    Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
-
-    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
-    SHOW_BYTES(ByteStream);
-
+//  The kernels of the direct pipeline of a transform, from the bytes of the
+//  input to those of the result.
+static StreamSet * directPipeline(PipelineBuilder & P, Transform t, StreamSet * const ByteStream) {
     StreamSet * const BasisBits = BasisOf(P, ByteStream);
 
     NFD_PipelineBuilder NFD_builder(P);
@@ -500,6 +495,18 @@ static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
         case Transform::Remove:
             llvm::report_fatal_error("tconv: Any-FCD, Any-FCC, Any-Title, Any-Hex and Hex-Any (/Java, /Unicode, /C, /XML, /XML10, /Perl) and Any-Remove are implemented by the rule pipeline");
     }
+    return OutputBytes;
+}
+
+static TransformFunctionType generatePipeline(CPUDriver & driver, Transform t) {
+    auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDescriptor"));
+    Scalar * const fileDescriptor = P.getInputScalar("inputFileDescriptor");
+
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
+    SHOW_BYTES(ByteStream);
+
+    StreamSet * const OutputBytes = directPipeline(P, t, ByteStream);
     P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
 }
@@ -6411,6 +6418,9 @@ static TransformFunctionType generateRulePipeline(CPUDriver & driver, const ldml
 //  compiled.  Output lines:
 //      group <i>: <rules> rules, <kernels> kernels
 //      total: <groups> groups, <rules> rules[, <group kernels> group kernels, <kernels> kernels]
+//  A built-in transform that only the direct pipeline implements (Any-CaseFold)
+//  is counted in its direct pipeline, including the kernels decoding the input
+//  and encoding the result.
 static int printKernelCounts(const ldml::TransformRegistry & registry, const ldml::TransformEntry * entry) {
     TransformAnalyzer analyzer(registry);
     const TransformAnalysis & a = analyzer.analyze(entry);
@@ -6435,6 +6445,13 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     const size_t base = P.getNumOfKernelCalls();
     RulePipelineBuilder builder(P, registry, analyzer);
+    if (entry->canonicalName == "Any-CaseFold") {
+        const size_t kernels = P.getNumOfKernelCalls();
+        directPipeline(P, Transform::CaseFold, ByteStream);
+        llvm::outs() << "total: 0 groups, 0 rules, 0 group kernels, " << (P.getNumOfKernelCalls() - kernels)
+                     << " kernels (direct pipeline)\n";
+        return 0;
+    }
     builder.transform(entry, U21);
     const size_t total = P.getNumOfKernelCalls() - base;
     size_t groupKernels = 0;

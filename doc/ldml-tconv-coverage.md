@@ -28,6 +28,20 @@ to the results by an incremental update (`tconv_coverage.py --update`, see
 [Reproducing](#reproducing)); the generated tables and blocks of this report are
 marked `<!-- coverage:… -->`.*
 
+*Update at `585ccdeba` (October 18, 2026): a full run of `tconv_coverage.py`
+at `07794b04b` (`d92fd824b` with `tconv --kernel-counts`), with the same CLDR
+data, without the local fixes of W7. It adds the kernel counts of each
+transform to the per-transform table (§4.4). Its generated blocks replace
+those of the run at `323305975`; the rest of the report still describes that
+run. The test results are the same (253 files, 246,751 cases, the same 217
+failures). 371 transforms are implementable rather than 372: on a 15 GB
+machine, the analysis of Jpan-Latn exceeds the memory available (killed at
+13.3 GB after 112 s, also when run alone), so it is counted as "analysis
+failed" (W9) and has no kernel counts. Hani-Latn and Hant-Latn, whose analysis
+needs several GB each, failed when run two at a time and were run again one
+at a time, with Any-CaseFold (whose kernels were counted in its direct
+pipeline).*
+
 This report covers:
 
 - which transforms tconv implements, and how correct they are against the CLDR
@@ -47,8 +61,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 372 (88%) |
-| …of which public (not `visibility="internal"`) | 393 | 341 (87%) |
+| Transforms defined by CLDR files (380 files) | 425 | 371 (87%) |
+| …of which public (not `visibility="internal"`) | 393 | 340 (87%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 253 belong to implementable transforms.
@@ -134,14 +148,15 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          372  ███████████████████████████████████
-+ W6 revisit                 396  █████████████████████████████████████
-+ W3 variable-length text    415  ███████████████████████████████████████
-+ W7 parser semantics        419  ███████████████████████████████████████
-+ W5 captures/functions      422  ████████████████████████████████████████
-+ W10 engine lookaheads      423  ████████████████████████████████████████
-+ W4 insertion               424  ████████████████████████████████████████
-+ W8 built-ins               425  ████████████████████████████████████████
+now                          371  ███████████████████████████████████
++ W6 revisit                 395  █████████████████████████████████████
++ W3 variable-length text    414  ███████████████████████████████████████
++ W7 parser semantics        418  ███████████████████████████████████████
++ W5 captures/functions      421  ████████████████████████████████████████
++ W10 engine lookaheads      422  ████████████████████████████████████████
++ W4 insertion               423  ████████████████████████████████████████
++ W8 built-ins               424  ████████████████████████████████████████
++ W9 analysis scale          425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
 
@@ -870,6 +885,28 @@ sort.
   kernel's inputs. Fusing it would need a non-Pablo kernel, or sharing
   normalizations between steps.
 
+**Kernels per transform.** The per-transform table gives, for each
+transform (from `tconv --kernel-counts`, which builds its pipeline without
+compiling it):
+
+- **groups, rules:** the conversion groups of its own rules (not of the
+  transforms it uses) and their rules of all kinds, as planned (without the
+  rules reported as problems);
+- **group kernels:** the kernels these groups add;
+- **kernels:** all the kernels of the transform, including those of its
+  filters and of the transforms it uses, transitively (but not the kernels
+  decoding the input to U21 and encoding the result). Any-CaseFold, which
+  only the direct pipeline implements, is counted there, decoding and
+  encoding included.
+
+In the run at `07794b04b`, the 371 implementable CLDR-defined transforms have
+a median of 227 kernels. The largest are am_FONIPA-am (2,605; its own groups have
+602 rules in 2,457 kernels) and the `*-am` transforms through it (up to 3,070,
+my-am).
+Other large groups are NumericPinyin-Latin (75 rules, 1,946 kernels) and
+Latin-ASCII (847 rules, 688 kernels). Over all the transforms, 319
+conversion groups have 69,373 rules.
+
 ## 5. What is not covered
 
 Table 1: work items, by the number of transforms that need them (own problems and
@@ -885,7 +922,7 @@ those of invoked transforms).
 | W10 engine lookaheads | 1 | 0 | M |
 | W4 insertion rules (with string rules) | 1 | 0 | M |
 | W8 built-ins (Any-BreakInternal) | 1 | 1 | L |
-| W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 0 | 0 | L |
+| W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 1 | 1 | L |
 <!-- /coverage:work-items -->
 
 (W7 counts the run without the local CLDR fixes; with them, it blocks nothing,
@@ -1275,6 +1312,7 @@ tconv on every implementable transform.
 | `d2411817d`, `1230cb8e4` | partition roots no longer all enumerated; exact starts of MultipleCaptureMultipleReplacement sets, sets with strings kept: NumericPinyin-Latin, Bopo-Latn |
 | `03e837f5f` | string rules and MultipleCaptureMultipleReplacement rules selected together: am_FONIPA-am and 18 `*-am` |
 | `323305975` | captures of finitely many lengths expanded: am-am_FONIPA, am-ar, am-chr, am-fa: 372 |
+| `07794b04b`, `585ccdeba` | `tconv --kernel-counts`; kernel columns in the per-transform table: 371 on 15 GB (Jpan-Latn's analysis exceeds the memory) |
 
 ## Reproducing
 
@@ -1297,6 +1335,11 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
   have used `--jobs 4` on 64 GB; a full run takes about 35 minutes, mostly
   rerunning failing cases per line.)
 - When comparing tconv versions, give each run its own `-object-cache-salt`.
+- **Kernel counts.** Each transform's `tconv --kernel-counts` output is kept in
+  `kernels/`, and gives the groups, rules, group kernels and kernels columns of
+  the per-transform table. With `--update`, the kernels of the transforms
+  planned again are counted again, with those of all the transforms using
+  them, directly or not; `--no-kernel-counts` keeps the previous counts.
 - The run at `89e922e4f` used `--transforms-dir ~/transforms`, without the local
   W7 fixes; use a checkout with them to count Latin-ug and ug-Latin.
 - **Incremental updates.** After a change to tconv, update the results instead of

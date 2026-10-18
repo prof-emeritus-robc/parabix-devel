@@ -180,6 +180,11 @@ no_static_max:
                 // the provisional stride writes one stride past the full strides
                 required = b.CreateAdd(required, b.getSize(mKernel->getStride()));
             }
+            if (LLVM_UNLIKELY(port.ProvisionalOverflow > 0)) {
+                // the space a consumer's provisional stride reads past the produced items
+                // (which getWritableOutputItems leaves free)
+                required = b.CreateAdd(required, b.getSize(port.ProvisionalOverflow));
+            }
             ensureSufficientOutputSpace(b, port, streamSet, produced, required, getWritableOutputItems(b, port), true);
         }
     }
@@ -1734,8 +1739,9 @@ Value * PipelineCompiler::getWritableOutputItems(KernelBuilder & b, const Buffer
             c = b.CreateRoundDownRational(c, b.getBitBlockWidth());
         }
         Constant * overflow = nullptr;
-        if (LLVM_UNLIKELY(port.EmptyOverflow > 0)) {
-            overflow = b.getSize(port.EmptyOverflow);
+        const auto reserved = std::max(port.EmptyOverflow, port.ProvisionalOverflow);
+        if (LLVM_UNLIKELY(reserved > 0)) {
+            overflow = b.getSize(reserved);
         }
         writable = buffer->getLinearlyWritableItems(b, produced, c, overflow);
     }
@@ -2364,9 +2370,10 @@ void PipelineCompiler::splatMultiStepPartialSumValues(KernelBuilder & b) {
             b.CreateBlockAlignedStore(splat, ptr);
         }
 
-        ConstantInt * const sz_maxStepFactor = b.getSize(spanLength * stepsPerBlock);
-
-        Value * const final = b.CreateRoundUp(b.CreateAdd(produced, sz_stepsPerBlock), sz_maxStepFactor);
+        // The partial sums are now valid (the total) from start through the spanLength blocks
+        // after its own: at least spanLength * stepsPerBlock items past the produced count, as a
+        // consumer may read up to its maximum step factor past any item it has not processed.
+        Value * const final = b.CreateAdd(start, b.getSize((spanLength + 1) * stepsPerBlock));
 
         #if defined(PRINT_DEBUG_MESSAGES) && defined(WRITE_POPCOUNT_VALUES_TO_STDERR)
         debugPrint(b, "  < splatting %" PRIu64 " across %" PRIu64 " -> %" PRIu64 "\n", total, produced, final);

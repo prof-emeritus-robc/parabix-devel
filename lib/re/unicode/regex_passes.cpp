@@ -16,6 +16,7 @@
 #include <re/transforms/resolve_diffs.h>
 #include <re/transforms/resolve_ranges.h>
 #include <re/transforms/resolve_possessive.h>
+#include <re/transforms/capture_removal.h>
 #include <re/transforms/assertion_transformations.h>
 #include <re/unicode/boundaries.h>
 #include <re/unicode/casing.h>

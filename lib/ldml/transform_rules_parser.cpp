@@ -9,6 +9,7 @@
 #include <set>
 #include <re/adt/re_utility.h>
 #include <ldml/transform_rules_printer.h>
+#include "charset_analysis.h"
 
 using namespace llvm;
 using namespace re;
@@ -203,6 +204,16 @@ RE * setIntersection(RE * a, RE * b) {
 RE * setComplement(RE * a) {
     return makeComplement(a);
 }
+
+//  A negated property ([:^X:], \P{X}): as in ICU, where the text boundary is
+//  represented within sets by U+FFFF, the complement includes the boundary
+//  unless the property includes U+FFFF (as [^...] does).
+RE * negatedProperty(RE * prop) {
+    static CharSetAnalysis sets;
+    const bool boundary = !sets.setOf(prop, false).contains(0xFFFF);
+    return toSetRE(SetValue{setComplement(prop), boundary});
+}
+
 
 // Is the RE a set usable as an operand of the set operators?
 bool isSetOperand(const RE * re) {
@@ -884,7 +895,7 @@ RE * RuleTextParser::parseSet() {
         const std::u32string name(1, cur());
         mPos++;
         RE * prop = makePropertyExpression(canonicalizePropertyName(name));
-        return negated ? setComplement(prop) : prop;
+        return negated ? negatedProperty(prop) : prop;
     }
     ParseFailure("Expected a UnicodeSet");
 }
@@ -921,7 +932,7 @@ RE * RuleTextParser::parsePropertySet(const char32_t closer, bool negated) {
         if (ident.empty() || value.empty()) ParseFailure("Malformed property expression");
         prop = makePropertyExpression(PropertyExpression::Kind::Codepoint, ident, op, toUTF8(value));
     }
-    return negated ? setComplement(prop) : prop;
+    return negated ? negatedProperty(prop) : prop;
 }
 
 //  After "[".  The body is a sequence of items (characters, ranges, strings

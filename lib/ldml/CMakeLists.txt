@@ -13,10 +13,13 @@ SRC
     transform_rules_direction.cpp
     transform_rules_disambiguate.cpp
     transform_rules_exclusive.cpp
+    transform_rules_expand.cpp
+    transform_rules_functions.cpp
     transform_rules_overlap.cpp
     transform_rules_partition.cpp
     transform_rules_parser.cpp
     transform_rules_printer.cpp
+    transform_rules_revisit.cpp
     transform_registry.cpp
     transform_plan.cpp
 DEPS

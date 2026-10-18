@@ -448,6 +448,10 @@ struct BufferPort {
     int LookAhead = 0;
     int LookBehind = 0;
     int EmptyOverflow = 0;
+    // On an output: space its producer leaves free past the produced items for a
+    // consumer with a provisional stride, which reads a stride (and its lookahead)
+    // beyond them (see identifyProvisionalStrideKernels).
+    int ProvisionalOverflow = 0;
 
     bool isPrincipal() const {
         return (Flags & BufferPortType::IsPrincipal) != 0;

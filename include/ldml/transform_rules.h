@@ -44,9 +44,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <functional>
 #include <llvm/Support/Casting.h>
 #include <allocator/threadsafe_slaballocator.h>
 #include <re/adt/re_re.h>
+#include <ucd/core/unicode_set.h>
 
 namespace re { class Name; class Capture; class CC; }
 
@@ -658,7 +660,14 @@ struct TrivialCaptureStats {
     };
     std::vector<Blocked> blocked;
 };
-std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats = nullptr);
+//  With allowEmptyText false, a rule whose text is only the capture (which would
+//  become an insertion rule) is not transformed.  With allowFollowingText
+//  false, a rule whose text continues after the capture is transformed only if
+//  its text is (X) X+: the before context X of the transformed rule is matched
+//  against the converted text, which differs from the text where the group's
+//  conversions delete or change characters after X.
+std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats = nullptr,
+                                              bool allowEmptyText = true, bool allowFollowingText = true);
 
 //  Nullable capture elimination.
 //
@@ -695,6 +704,135 @@ std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules,
 //  zero repetitions, e.g., (a*) a → x ; never matches, but its replacement
 //  a → x ; does.
 std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules);
+
+//  Unreferenced capture removal.
+//
+//  The captures of the source side of a forward conversion rule (in its
+//  before context, text or after context) that the result side never
+//  references, as $n or in the argument of a function call, are replaced by
+//  their contents (re::removeUnneededCaptures); the remaining captures are
+//  renumbered in order and their references updated.  For example,
+//      ($wspace)+ ([\u102b-\u1032]) → $2 ;
+//  becomes
+//      $wspace+ ([\u102b-\u1032]) → $1 ;
+//  Captures do not affect what a rule matches, so the rules are equivalent.
+//  Rules other than forward conversion rules are unchanged.  This is
+//  intended to be applied before TrivialCaptureElimination and
+//  NullableCaptureElimination, which then see only the captures that matter.
+std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules);
+
+//  Expansion of finite texts.
+//
+//  A forward conversion rule whose text to replace has finitely many lengths
+//  (optional items x?, bounded repetitions, and sets with strings such as
+//  [{t͡ʃ}ʧ]) is replaced by rules with fixed-length texts, one for each way
+//  the text matches.  ICU matches the text possessively: an optional item or
+//  repetition takes what it can, and a set with strings takes its longest
+//  string matching, without backtracking.  So each alternative excludes the
+//  others: where an optional item is absent, the next character is not in its
+//  set (x? y becomes x y, and y without the characters of x), and where a
+//  shorter string of a set is taken, the text does not continue with a longer
+//  one ([{ab}a] c becomes ab c, and a c without b).  What may not follow the
+//  end of the text becomes a first item of the after context ([^x], which
+//  includes the end of the text).  The alternatives are mutually exclusive, so
+//  their order does not matter; they are given with the optional items present
+//  and the longest strings first.
+//
+//  A rule is left unchanged (reported in the stats) if its text has unbounded
+//  repetitions, the text boundary, or alternatives that are not single
+//  characters or strings; if its result refers to captures; if a string of
+//  two or more characters may not follow the text; if its after context does
+//  not begin with a set where a character may not follow; or if it has more
+//  than 64 alternatives.  Captures not referred to are dropped.
+struct FiniteTextStats {
+    unsigned candidates = 0;        // rules whose texts are not fixed-length
+    unsigned expanded = 0;
+    unsigned rules = 0;             // the rules replacing them
+    std::vector<std::pair<const Rule *, std::string>> notExpanded;  // with the reason
+};
+std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats = nullptr);
+
+//  Composition of revisits.
+//
+//  A forward conversion rule whose result has text to revisit,
+//      before { X } after → A | B ;
+//  places B back before the cursor: the rules of its group then apply to
+//  B and the text following it, as to any text, with A (and the converted
+//  text before X) as the text before the cursor.  Each such rule is replaced
+//  by rules without a cursor that give the same results, found by applying
+//  the rules of the group to B symbolically: the rules are tried in order at
+//  the cursor, a rule matching where the characters of B are members of the
+//  sets of its text and its contexts may match the known text around the
+//  cursor.  A rule may match beyond B: its remaining items, Z, are appended
+//  to the text of the composed rule.   Each complete sequence of rule
+//  applications, ending when no text is left to revisit, gives a rule
+//      before' { X Z } after' → A A2 ... ;
+//  where before' combines the before context with the parts of the contexts
+//  of the applied rules lying before X, and after' the after context with
+//  those lying beyond X Z.   Where no rule applies, a character of B is
+//  passed through.  The composed rules are ordered depth first, by the order
+//  of the rules applied, ending with the rule passing all characters through,
+//  so that the earliest applicable composed rule gives the result of the
+//  original rules; a rule that applies whatever the unknown text is ends the
+//  rules tried.  References in A and B to captures of single characters
+//  are enumerated (with at most 64 characters each), as are characters of Z
+//  referenced by the results of applied rules.  A text anchor (^ or $ in the
+//  text of a rule) is matched as a context [$].
+//
+//  As in ICU, in a result with references to captures the cursor is placed
+//  after the last reference preceding it, or at the start of the result (so
+//  that X → A | $1 ; revisits A $1).
+//
+//  A rule whose text to revisit is the text matched by the end of its text,
+//      before { P S } after → A | S ;
+//  is instead rewritten as before { P } S after → A ; which leaves the same
+//  text and cursor (and applies to runs, as kk → x | k ; on kkkk).  The rules
+//  are composed with the rewritten rules.
+//
+//  A rule is left unchanged (reported in the stats) if the cursor is placed
+//  beyond the result, a rule whose text is not a fixed-length sequence of
+//  characters may apply to the text to revisit, results are not fixed
+//  strings, contexts that cannot be combined (other than sequences of sets
+//  with no repetitions) apply together, or the revisits do not end within
+//  8 rule applications (as with ll → | l ;).
+//
+//  The rules of other kinds are unchanged; apply ExtractForwardRules or
+//  ExtractReverseBackwardRules first.
+struct RevisitStats {
+    unsigned candidates = 0;        // rules with text to revisit
+    unsigned composed = 0;          // replaced by composed rules
+    unsigned composedRules = 0;     // the composed rules replacing them
+    std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
+};
+std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats = nullptr);
+
+//  Expansion of function calls on captures of single characters.
+//
+//  A forward conversion rule whose result calls a transform on a capture of
+//  its text, &T($k), where the capture is a set of single characters S (not
+//  within a repetition), is replaced by rules for the characters of S, grouped
+//  by the value of T on them: for each group, the rule with the capture
+//  restricted to the characters of the group and the call replaced by their
+//  value, and for the characters that T leaves unchanged, the rule with the
+//  call replaced by $k.  The groups being disjoint, the order of these rules
+//  does not matter.  Further calls in the result are expanded in turn.
+//
+//  evaluate(T, S, groups, unchanged, reason) gives the groups of the
+//  characters of S by the value of T on each (as a text of its own), and the
+//  characters left unchanged; or false, with the reason, if T cannot be
+//  evaluated on them.  A rule whose call cannot be expanded is left unchanged
+//  (reported in the stats).
+using FunctionEvaluator = std::function<bool (const TransformID & transform, const UCD::UnicodeSet & chars,
+                                              std::vector<std::pair<UCD::UnicodeSet, std::u32string>> & groups,
+                                              UCD::UnicodeSet & unchanged, std::string & reason)>;
+struct FunctionCallStats {
+    unsigned candidates = 0;        // rules with function calls on captures
+    unsigned expanded = 0;
+    unsigned rules = 0;             // the rules replacing them
+    std::vector<std::pair<const Rule *, std::string>> notExpanded;  // with the reason
+};
+std::vector<Rule *> ExpandFunctionCalls(const std::vector<Rule *> & rules, const FunctionEvaluator & evaluate,
+                                        FunctionCallStats * stats = nullptr);
 
 //  The nullable captures of a side of a conversion rule, in order.  Unless
 //  includeRepeated, captures within repetitions are excluded.

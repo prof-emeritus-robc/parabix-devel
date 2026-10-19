@@ -20,6 +20,8 @@
 # A grepcase for an open bug may carry a knownbug="<description>" attribute.
 # Its failures are reported as known failures rather than counted as test
 # failures; if it passes, it is reported so that the attribute can be removed.
+#
+# A grepcase with an extended="yes" attribute runs only with --extended-testing.
 
 
 import sys, subprocess, os, optparse, re, stat
@@ -244,6 +246,8 @@ def start_element_do_test(name, attrs):
         if not 'regexp' in attrs or not 'datafile' in attrs:
             print("Bad grepcase: missing regexp and/or datafile attributes.", file=sys.stderr)
             return
+        if attrs.get('extended') == 'yes' and not options.extended_testing:
+            return
         knownbug = attrs.get('knownbug')
         grep_case_flags = {}
         if 'flags' in attrs:
@@ -312,6 +316,9 @@ if __name__ == '__main__':
     option_parser.add_option('-U', '--UTF-16',
                           dest = 'utf16', action='store_true', default=False,
                           help = 'test UTF-16 processing')
+    option_parser.add_option('--extended-testing',
+                          dest = 'extended_testing', action='store_true', default=False,
+                          help = 'also run the grepcases marked extended="yes"')
     option_parser.add_option('--grep_flags',
                           dest = 'fixed_flag_spec', type='string', default='',
                           help = 'specify fixed grep flags')

@@ -1949,6 +1949,32 @@ void Kernel::addBaseInternalScalars(LLVMTypeSystemInterface & ts) {
     addInternalScalar(ts.getSizeTy(), TERMINATION_SIGNAL);
 }
 
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief completeBaseInternalScalars
+ ** ------------------------------------------------------------------------------------------------------------- */
+void Kernel::completeBaseInternalScalars(LLVMTypeSystemInterface & ts) {
+    const auto outputFlags = collectOutputFlags(mOutputStreamSets);
+    const auto addedFlags = outputFlags & ~mFlags;
+    if (LLVM_UNLIKELY(addedFlags != 0)) {
+        mFlags |= addedFlags;
+        // keep the name consistent with annotateKernelNameWithDebugFlags
+        if (((addedFlags & KernelFlags::HasInOutStreamSet) != 0) && codegen::DebugOptionIsSet(codegen::DisableInOutAttributes)) {
+            mKernelName += "_NoIOAttr";
+        }
+        if (((addedFlags & KernelFlags::HasInternallyManagedStreamSet) != 0) && codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers)) {
+            mKernelName += "_TDB";
+        }
+    }
+    for (const Binding & output : mOutputStreamSets) {
+        const auto name = output.getName() + BUFFER_HANDLE_SUFFIX;
+        const auto f = std::find_if(mInternalScalars.begin(), mInternalScalars.end(),
+                                    [&](const InternalScalar & scalar) { return scalar.getName() == name; });
+        if (f == mInternalScalars.end()) {
+            addInternalScalar(ts.getVoidPtrTy(), name);
+        }
+    }
+}
+
 // CONSTRUCTOR
 Kernel::Kernel(LLVMTypeSystemInterface & ts,
                const TypeId typeId,

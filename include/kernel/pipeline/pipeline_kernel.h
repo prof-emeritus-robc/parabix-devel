@@ -146,6 +146,15 @@ public:
         return ptr;
     }
 
+    // Label the kernels added from now on as belonging to the given stage of the
+    // pipeline.  Labels are used only for reporting (e.g., by -EnableCycleCounter).
+    void SetStageLabel(llvm::StringRef label) {
+        mStageLabels.emplace_back(label.str(), mKernels.size());
+    }
+
+    // The stage label of the given kernel, or an empty string if it has none.
+    llvm::StringRef getStageLabel(const Kernel * const kernel) const;
+
     template<typename... OtherBoundaryTypes>
     PipelinePhaseBoundary * InsertLayerBoundary(const StreamSet * const streamSet, const double restriction, OtherBoundaryTypes... other) {
         auto boundary = std::make_unique<PipelinePhaseBoundary>();
@@ -266,6 +275,8 @@ protected:
     LengthAssertions                    mLengthAssertions;
     IllustratorBindings                 mIllustratorBindings;
     PhaseBoundaries                     mPhaseBoundaries;
+    // (label, index of the first kernel it applies to)
+    std::vector<std::pair<std::string, size_t>> mStageLabels;
 };
 
 }

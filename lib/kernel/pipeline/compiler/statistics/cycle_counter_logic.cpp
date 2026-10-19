@@ -423,7 +423,12 @@ void PipelineCompiler::printOptionalCycleCounter(KernelBuilder & b) {
         kernelNames.reserve(PipelineOutput - FirstKernel + 1);
         for (auto i = FirstKernel; i <= LastKernel; ++i) {
             const Kernel * const kernel = getKernel(i);
-            kernelNames.push_back(b.GetString(kernel->getName()));
+            const auto label = static_cast<const PipelineKernel *>(mTarget)->getStageLabel(kernel);
+            if (label.empty()) {
+                kernelNames.push_back(b.GetString(kernel->getName()));
+            } else {
+                kernelNames.push_back(b.GetString("[" + label.str() + "] " + kernel->getName()));
+            }
         }
         kernelNames.push_back(b.GetString(mTarget->getName()));
 

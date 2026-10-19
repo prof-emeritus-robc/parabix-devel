@@ -310,6 +310,12 @@ Kernel * PipelineBuilder::makeKernel() {
             }
         }
 
+        // Stage labels change the cycle counter report, so a labelled pipeline must
+        // not share a cache entry with an unlabelled one.
+        for (const auto & L : mTarget->mStageLabels) {
+            sig << "\nS" << L.second << ':' << L.first;
+        }
+
         if (numOfNestedKernelFamilyCalls) {
             sig << '\n';
             mTarget->recursivelyListFamilyKernels(sig);

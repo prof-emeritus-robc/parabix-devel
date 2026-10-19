@@ -17,7 +17,6 @@
 #include <llvm/ADT/Twine.h>
 #include <util/aligned_allocator.h>
 #include <re/adt/adt.h>
-#include <re/analysis/re_analysis.h>
 
 using namespace llvm;
 

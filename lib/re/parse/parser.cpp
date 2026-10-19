@@ -21,7 +21,6 @@
 #include <re/parse/fixed_string_parser.h>
 #include <re/adt/adt.h>
 #include <re/adt/re_utility.h>
-#include <re/printer/re_printer.h>
 #include <re/toolchain/toolchain.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/data/RadicalSets.h>

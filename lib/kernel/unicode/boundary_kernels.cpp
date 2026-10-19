@@ -9,7 +9,6 @@
 #include <re/adt/adt.h>
 #include <re/cc/cc_compiler.h>         // for CC_Compiler
 #include <re/cc/cc_compiler_target.h>
-#include <re/compile/re_compiler.h>
 #include <re/analysis/re_name_gather.h>
 #include <re/transforms/to_utf8.h>
 #include <re/unicode/boundaries.h>

@@ -61,6 +61,7 @@
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/MathExtras.h>
 #include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <re/cc/cc_compiler.h>
@@ -1018,7 +1019,7 @@ extern "C" void bpe_retire_stuck(uint64_t slot, const uint16_t * ids, const uint
     // backward: the same on reversed bits, keeping the segment start it stops on
     carry = final ? 0 : 1;
     for (uint64_t wi = numWords; wi-- > 0; ) {
-        const uint64_t C = __builtin_bitreverse64(~barrierW[wi]), L = __builtin_bitreverse64(kept[wi]);
+        const uint64_t C = llvm::reverseBits<uint64_t>(~barrierW[wi]), L = llvm::reverseBits<uint64_t>(kept[wi]);
         uint64_t s1, s2;
         const bool c1 = __builtin_add_overflow(L, C, &s1);
         const bool c2 = __builtin_add_overflow(s1, carry, &s2);

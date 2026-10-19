@@ -271,7 +271,7 @@ void * MCJITBackend::finalizeObject(kernel::Kernel * const pk) {
         }
     };
 
-    // Both tiers compile at codegen::BackEndOptLevel (default None/-O0; override with
+    // Both tiers compile at codegen::BackEndOptLevel (default Default/-O2; override with
     // --backend-optimization-level). Normal kernels used to get a hardcoded Default here
     // while Infrequent ones got BackEndOptLevel -- see OrcJITBackend::materializeObject
     // for why that hardcoded Default was itself a bug source, now avoided by using one

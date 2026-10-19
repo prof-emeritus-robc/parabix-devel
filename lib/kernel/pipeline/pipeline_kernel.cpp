@@ -425,8 +425,8 @@ void PipelineKernel::addOptimizationPasses(KernelBuilder & b, SelectedOptimizati
     // whatever it held before (typically null) by then, so without this bracket
     // COMPILER resolves to null here -- a null-pointer dereference that only actually
     // touches memory (and so only actually crashes) once there are real optimization
-    // passes to add, i.e. under any non-default --optimization-level/
-    // --backend-optimization-level.
+    // passes to add, i.e. under an --optimization-level or
+    // --backend-optimization-level above none.
     struct CompilerScope {
         const PipelineKernel * const Self;
         KernelBuilder & B;

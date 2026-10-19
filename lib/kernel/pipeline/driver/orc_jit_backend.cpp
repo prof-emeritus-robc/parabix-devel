@@ -996,7 +996,7 @@ record_decl:
 
         END_SCOPED_REGION
 
-        // All kernel bodies compile at codegen::BackEndOptLevel (default None/-O0;
+        // All kernel bodies compile at codegen::BackEndOptLevel (default Default/-O2;
         // override with --backend-optimization-level). InfrequentlyUsed kernels used to
         // get this level unconditionally while other kernels got a hardcoded Default --
         // that hardcoded Default was itself the source of a long-standing, previously

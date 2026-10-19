@@ -1,7 +1,7 @@
 #include <objcache/object_cache.h>
 
 #include <objcache/object_cache_util.hpp>
-#include <objcache/build_identity.h>
+#include <srchash/source_hash.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/driver/driver.h>
@@ -39,13 +39,14 @@ bool ParabixObjectCache::mStartedCacheCleanupDaemon = false;
 // file exists.
 //
 
-// Cached kernels are keyed by the identity of the running code (the build IDs of
-// the executable and the Parabix libraries), so that rebuilding any of them
-// invalidates the cache automatically.  An --object-cache-salt adds a further
-// component, giving experiments their own entries.
+// Each cached kernel is keyed by its cache name, which ends with the kernel's
+// source tag (Kernel::getSourceTag): changing the source of a module that can
+// shape a kernel's code (or the build configuration) invalidates that kernel's
+// entry, and no other.  An --object-cache-salt adds a further component,
+// giving experiments their own entries.
 static const std::string & cachePrefix() {
     static const std::string prefix = [] {
-        std::string p = "parabix-" + parabix::getBuildIdentity() + "_";
+        std::string p = "parabix-";
         if (!codegen::ObjectCacheSalt.empty()) {
             p += "salt-" + codegen::ObjectCacheSalt + "_";
         }
@@ -58,6 +59,26 @@ static const std::string & cachePrefix() {
 }
 
 const static auto SIGNATURE = "signature";
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief traceSourceTag
+ *
+ * Reports where a kernel's source tag comes from: the image defining the kernel's class, plus, for
+ * kernels that call nested kernels, the tags of those kernels.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static void traceSourceTag(const kernel::Kernel * const kernel) {
+    using TypeId = kernel::Kernel::TypeId;
+    const void * const vtable = *reinterpret_cast<const void * const *>(kernel);
+    const bool hasSourceHash = !parabix::getImageSourceHash(vtable).empty();
+    errs() << "Source tag of " << kernel->getName() << ": " << kernel->getSourceTag()
+           << " (" << (hasSourceHash ? "source hash" : "no source hash, build ID") << " of "
+           << parabix::getImageName(vtable);
+    const auto id = kernel->getTypeId();
+    if (id == TypeId::Pipeline || id == TypeId::OptimizationBranch) {
+        errs() << ", with the tags of its nested kernels";
+    }
+    errs() << ")\n";
+}
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getSignature
@@ -152,6 +173,9 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
     const auto moduleId = kernel->makeCacheName(builder);
     fileName.append(moduleId);
     fileName.append(KERNEL_FILE_EXTENSION);
+    if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+        traceSourceTag(kernel);
+    }
     auto kernelBuffer = MemoryBuffer::getFile(fileName, false, false, false);
     if (kernelBuffer) {
         auto loadedFile = parseBitcodeFile((*kernelBuffer)->getMemBufferRef(), builder.getContext());
@@ -207,6 +231,8 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
         } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
             errs() << "Failed to load cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
         }
+    } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+        errs() << "No cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
     }
     return LoadResult{nullptr, nullptr};
 }

@@ -87,6 +87,15 @@ std::string getImageSourceHash(const void * address) {
     return joined;
 }
 
+std::string getImageName(const void * address) {
+    Dl_info info;
+    if (address == nullptr || dladdr(address, &info) == 0 || info.dli_fname == nullptr) {
+        return std::string{};
+    }
+    const char * const slash = std::strrchr(info.dli_fname, '/');
+    return slash ? slash + 1 : info.dli_fname;
+}
+
 #if defined(__APPLE__)
 
 std::string getImageBuildID(const void * address) {

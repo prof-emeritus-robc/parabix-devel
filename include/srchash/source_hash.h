@@ -27,6 +27,9 @@ bool registerSourceHash(const void * anchor, const char * target, const char * h
 // order.  Empty if no hash was registered for that image.
 std::string getImageSourceHash(const void * address);
 
+// The file name (without directories) of the image holding ADDRESS.
+std::string getImageName(const void * address);
+
 // The linker build ID (Mach-O LC_UUID, ELF NT_GNU_BUILD_ID) of the image
 // holding ADDRESS, in hex.  Empty if the image carries none.
 std::string getImageBuildID(const void * address);

@@ -212,11 +212,14 @@ std::unique_ptr<KernelCompiler> Kernel::instantiateKernelCompiler(KernelBuilder 
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief makeCacheName
+ *
+ * The source tag makes the name change whenever the source of a module that can shape this kernel's
+ * code changes, and only then.
  ** ------------------------------------------------------------------------------------------------------------- */
 std::string Kernel::makeCacheName(KernelBuilder & b) {
     std::string cacheName;
     raw_string_ostream out(cacheName);
-    out << getName() << '_' << b.getBuilderUniqueName();
+    out << getName() << '_' << b.getBuilderUniqueName() << '_' << getSourceTag();
 #if 0
     auto appendStreamSetType = [&](const char code, const Bindings & bindings) {
         for (const auto & binding : bindings) {

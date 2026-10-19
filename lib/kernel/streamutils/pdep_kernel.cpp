@@ -1229,7 +1229,10 @@ void UnitInsertionSpreadMaskKernel::generateDoBlockMethod(KernelBuilder & b) {
             // We may have filled the pack; write it out in case we move on.
             b.CreateStore(pending, spread_mask_pack_ptr);
             Value * Rshift = b.CreateURem(b.CreateSub(PACK_BITS, offset), PACK_BITS);
-            Value * pack_overflow = b.CreateLShr(spread_pack, Rshift);
+            // With offset 0, a filled pack has no overflow bits (Rshift is 0, not PACK_BITS).
+            Value * pack_overflow = b.CreateSelect(b.CreateIsNull(offset),
+                                                   Constant::getNullValue(packTy),
+                                                   b.CreateLShr(spread_pack, Rshift));
             offset = b.CreateAdd(offset, newbits);
             produced = b.CreateAdd(produced, newbits);
             Value * pack_filled = b.CreateICmpUGE(offset, PACK_BITS);

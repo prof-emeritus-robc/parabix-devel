@@ -30,6 +30,24 @@ TEST_CASE(insert_after1, insert_mask_i, insert_after_e) {
     AssertEQ(P, Result, Input<1>(T));
 }
 
+// 32 insertions fill the first 64-bit output pack exactly at offset 0; the
+// overflow into the next pack must then be empty.
+auto insert_full_pack_i = BinaryStream({"1111111111111111111111111111111101101111111111111111111111111111111111111111001"});
+auto insert_full_pack_after_e = BinaryStream({"1010101010101010101010101010101010101010101010101010101010101010110101101010101010101010101010101010101010101010101010101010101010101010101010101010101110"});
+auto insert_full_pack_before_e = BinaryStream({"0101010101010101010101010101010101010101010101010101010101010101101011010101010101010101010101010101010101010101010101010101010101010101010101010101011101"});
+
+TEST_CASE(insert_full_pack_after, insert_full_pack_i, insert_full_pack_after_e) {
+    auto Result = P.CreateStreamSet(1);
+    UnitInsertionSpreadMask(T, Input<0>(T), Result, InsertPosition::After);
+    AssertEQ(P, Result, Input<1>(T));
+}
+
+TEST_CASE(insert_full_pack_before, insert_full_pack_i, insert_full_pack_before_e) {
+    auto Result = P.CreateStreamSet(1);
+    UnitInsertionSpreadMask(T, Input<0>(T), Result, InsertPosition::Before);
+    AssertEQ(P, Result, Input<1>(T));
+}
+
 auto insert_counts = BinaryStreamSet({"001000101", "001000000", "100000000"});
 auto insert_mult_before_e = BinaryStream("000011000111101101");
 auto insert_mult_after_e = BinaryStream("100001100011110110");
@@ -229,6 +247,8 @@ TEST_CASE(swapback_at_end, swapback_at_end_m, swap_src_long, swapback_at_end_e) 
 RUN_TESTS(
           CASE(insert_before1),
           CASE(insert_after1),
+          CASE(insert_full_pack_after),
+          CASE(insert_full_pack_before),
           CASE(insert_mult_after),
           CASE(insert_mult_before),
           CASE(filter1),

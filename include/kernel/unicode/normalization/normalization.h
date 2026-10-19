@@ -295,6 +295,9 @@ public:
 
     void NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis);
 
+    // Fill gaps of at most this many unchanged bytes between work regions (0: none).
+    void setFillRunGaps(unsigned maxGap) { mFillRunGaps = maxGap; }
+
     void ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask);
 
     void NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
@@ -302,6 +305,7 @@ public:
     void NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
 
 private:
+    unsigned mFillRunGaps = 0;
     PipelineBuilder & mPB;
     NFD_BixData NFD_Data;
 };

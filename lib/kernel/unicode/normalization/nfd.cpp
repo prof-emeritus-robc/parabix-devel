@@ -15,6 +15,7 @@
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/run_replace.h>
 #include <kernel/streamutils/pdep_kernel.h>
 #include <kernel/streamutils/run_index.h>
 #include <kernel/streamutils/sentinel.h>
@@ -666,7 +667,13 @@ void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * Wor
     StreamSet * NFD_WorkItems = mPB.CreateStreamSet(1, 1);
     DetermineNFD_WorkItems(BasisBits, u8index, NFD_WorkItems);
 
-    mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask);
+    if (mFillRunGaps > 0) {
+        StreamSet * const WorkSpans = mPB.CreateStreamSet(1, 1);
+        mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSpans);
+        FillRunGaps(mPB, WorkSpans, mFillRunGaps, WorkSelectionMask);
+    } else {
+        mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask);
+    }
     SHOW_STREAM(WorkSelectionMask);
 
     mPB.SetStageLabel("filter");

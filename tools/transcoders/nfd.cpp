@@ -17,6 +17,7 @@
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
+#include <kernel/streamutils/run_replace.h>
 #include <kernel/streamutils/run_index.h>
 #include <kernel/streamutils/sentinel.h>
 #include <kernel/streamutils/sorting.h>
@@ -64,6 +65,10 @@ static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), 
 static cl::opt<bool> NoFocus("NoFocus", cl::desc("Process the entire file without filtering to narrow the focus of work"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<bool> ByteMerging("ByteMerging", cl::desc("Use byte stream merging of transformed and unmodified data"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<bool> ByteReplace("ByteReplace", cl::desc("Perform byte merging using the ByteReplaceByMask kernel"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> RunFiltering("RunFilter", cl::desc("Filter unmodified bytes by copying whole runs (implies -ByteMerging)"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> RunMerging("RunMerge", cl::desc("Merge transformed and unmodified bytes by copying whole runs (implies -ByteMerging)"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> RunReplacement("RunReplace", cl::desc("Same as -RunFilter -RunMerge"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<unsigned> FillRunGapsOpt("fill-run-gaps", cl::desc("Include gaps of at most N unmodified bytes between work regions in the work"), cl::init(0), cl::cat(NFD_Options));
 static cl::opt<int> SeparatedPipelineStages("SeparatedPipelineStages", cl::desc("Use multiple separated pipeline stages"), cl::init(0), cl::cat(NFD_Options));
 static cl::opt<bool> FilterViolations("FilterViolations", cl::desc("Only include reorderable sequences in work items if they are misordered or start with a decomposable character"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<bool> UseIndexedShiftBack("IndexedShiftBack", cl::desc("Use IndexedShiftBack in place of Filter/Spread combination"), cl::init(false), cl::cat(NFD_Options));
@@ -108,6 +113,7 @@ NFD_FilterFunctionType NFD_filter_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("WorkingBasis", 8, 1, ReturnedBuffer(1))
                             );
     NFD_PipelineBuilder NFD_builder(P);
+    NFD_builder.setFillRunGaps(FillRunGapsOpt);
     StreamSet * const BasisBits = P.getInputStreamSet("BasisBits");
     StreamSet * const WorkSelectionMask = P.getOutputStreamSet("WorkSelectionMask");
     StreamSet * const FinalWorkPlacementMask = P.getOutputStreamSet("FinalWorkPlacementMask");
@@ -130,6 +136,7 @@ NFD_TransformFunctionType NFD_transform_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1))
                             );
     NFD_PipelineBuilder NFD_builder(P);
+    NFD_builder.setFillRunGaps(FillRunGapsOpt);
     StreamSet * const WorkingBasis = P.getInputStreamSet("WorkingBasis");
     StreamSet * const TransformedBasis = P.getOutputStreamSet("TransformedBasis");
 
@@ -147,8 +154,21 @@ void OutputAssemblyStage(PipelineBuilder & P, StreamSet * WorkSelectionMask, Str
     StreamSet * const OutputBytes = P.CreateStreamSet(1, 8);
     if (ByteMerging) {
         StreamSet * const NonModified = P.CreateStreamSet(1, 8);
-        FilterByMask(P, NonModifiedMask, Source, NonModified);
+        if (RunFiltering) {
+            RunFilter(P, NonModifiedMask, Source, NonModified);
+        } else {
+            FilterByMask(P, NonModifiedMask, Source, NonModified);
+        }
         SHOW_BYTES(NonModified);
+
+        StreamSet * const TransformedBytes = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<P2SKernel>(TransformedBasis, TransformedBytes);
+
+        if (RunMerging) {
+            RunMerge(P, FinalWorkPlacementMask, TransformedBytes, NonModified, OutputBytes);
+            P.CreateKernelCall<StdOutKernel>(OutputBytes);
+            return;
+        }
 
         StreamSet * const NonModifiedPlacementMask = P.CreateStreamSet(1, 1);
         Invert(P, FinalWorkPlacementMask, NonModifiedPlacementMask);
@@ -156,9 +176,6 @@ void OutputAssemblyStage(PipelineBuilder & P, StreamSet * WorkSelectionMask, Str
 
         StreamSet * const NonModifiedPlaced = P.CreateStreamSet(1, 8);
         SpreadByMask(P, NonModifiedPlacementMask, NonModified, NonModifiedPlaced);
-
-        StreamSet * const TransformedBytes = P.CreateStreamSet(1, 8);
-        P.CreateKernelCall<P2SKernel>(TransformedBasis, TransformedBytes);
 
         if (ByteReplace) {
             P.CreateKernelCall<ByteReplaceByMask>(FinalWorkPlacementMask, NonModifiedPlaced, TransformedBytes, OutputBytes);
@@ -201,6 +218,7 @@ CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
                             Input<uint32_t>("inputFileDecriptor")
                             );
     NFD_PipelineBuilder NFD_builder(P);
+    NFD_builder.setFillRunGaps(FillRunGapsOpt);
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     StreamSet * const WorkSelectionMask = P.getOutputStreamSet("WorkSelectionMask");
@@ -244,6 +262,7 @@ typedef void (*XfrmFunctionType)(uint32_t fd);
 XfrmFunctionType generate_unitary_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"));
     NFD_PipelineBuilder NFD_builder(P);
+    NFD_builder.setFillRunGaps(FillRunGapsOpt);
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
@@ -278,7 +297,8 @@ int main(int argc, char *argv[]) {
         llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
         exit(-1);
     }
-    if (ByteReplace) ByteMerging = true;
+    if (RunReplacement) RunFiltering = RunMerging = true;
+    if (ByteReplace || RunFiltering || RunMerging) ByteMerging = true;
     if (UseIndexedShiftBack) FilterViolations = true;
     CPUDriver driver("NFD_function");
     if (SeparatedPipelineStages == 2) {

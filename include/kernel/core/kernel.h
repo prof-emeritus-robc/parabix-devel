@@ -746,6 +746,14 @@ protected:
     // KernelCompiler::allocateOwnedBufferHandleStorage.
     void addBaseInternalScalars(LLVMTypeSystemInterface & ts);
 
+public:
+    // Called by the PipelineBuilder once construction is complete. Kernels that add
+    // stream bindings in their constructor body (after the Kernel constructor has run
+    // addBaseInternalScalars) would otherwise lack the buffer handles and output flags
+    // of those bindings; this adds whatever is missing.
+    void completeBaseInternalScalars(LLVMTypeSystemInterface & ts);
+protected:
+
     struct FunctionLink {
         const std::string           UnmanagedName;
         llvm::FunctionType * const  FuncType;

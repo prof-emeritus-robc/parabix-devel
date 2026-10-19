@@ -254,6 +254,21 @@ void PipelineKernel::recursivelyListFamilyKernels(llvm::raw_ostream & familyName
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getSourceTag
+ *
+ * The pipeline's code depends on the state types, bindings and family interfaces of its kernels,
+ * so their source tags are folded into its own.
+ ** ------------------------------------------------------------------------------------------------------------- */
+std::string PipelineKernel::getSourceTag() const {
+    std::string tags = Kernel::getSourceTag();
+    for (const auto & k : mKernels) {
+        tags.push_back(',');
+        tags.append(k.Object->getSourceTag());
+    }
+    return getStringHash(tags).substr(0, 16);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief createRepeatingStreamSet
  ** ------------------------------------------------------------------------------------------------------------- */
 Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuilder & b, const RepeatingStreamSet * ss, const size_t maxStrideLength) const {

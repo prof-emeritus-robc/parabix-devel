@@ -291,7 +291,7 @@ endif()
 function(parabix_add_module)
     cmake_parse_arguments(
         ARG             # resultant argument prefix
-        "USES_Z3;USES_CERNROOT;REQUIRES_RTTI"       # boolean args
+        "USES_Z3;USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH" # boolean args
         "NAME"          # mono-valued arguments:
                         #   NAME: target name
         "SRC;DEPS"      # multi-valued arguments:
@@ -317,7 +317,9 @@ function(parabix_add_module)
             add_library(${ARG_NAME} SHARED ${ARG_SRC})
         endif()
         parabix_set_library_name(${ARG_NAME})
-        parabix_srchash_attach(${ARG_NAME})
+        if(NOT ARG_NO_SOURCE_HASH)
+            parabix_srchash_attach(${ARG_NAME})
+        endif()
         target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
         if (ARG_REQUIRES_RTTI)
             target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
@@ -432,6 +434,7 @@ add_subdirectory(lib/re/printer)
 add_subdirectory(lib/re/toolchain)
 add_subdirectory(lib/re/transforms)
 add_subdirectory(lib/re/unicode)
+add_subdirectory(lib/srchash)
 add_subdirectory(lib/testing)
 add_subdirectory(lib/toolchain)
 add_subdirectory(lib/ucd/algo)

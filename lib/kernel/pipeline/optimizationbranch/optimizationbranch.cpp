@@ -14,6 +14,20 @@ std::unique_ptr<KernelCompiler> OptimizationBranch::instantiateKernelCompiler(Ke
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getSourceTag
+ *
+ * The branch's code depends on the state types and bindings of both of its kernels.
+ ** ------------------------------------------------------------------------------------------------------------- */
+std::string OptimizationBranch::getSourceTag() const {
+    std::string tags = Kernel::getSourceTag();
+    tags.push_back(',');
+    tags.append(mNonZeroKernel->getSourceTag());
+    tags.push_back(',');
+    tags.append(mAllZeroKernel->getSourceTag());
+    return getStringHash(tags).substr(0, 16);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief addInternalKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
 void OptimizationBranch::addInternalProperties(KernelBuilder & b) {

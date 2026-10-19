@@ -24,4 +24,5 @@ DEPS
     idisa
     kernel.illustrator
     slaballocator
+    srchash
 )

@@ -16,8 +16,9 @@
 #       Called for every module, including in ARTIFACT_MODE=Single, where the
 #       module is not a target of its own.
 #   parabix_srchash_attach(<target>)
-#       Adds the generated <target>_srchash.cpp to <target>.  Must be called in
-#       the directory that defines <target>.
+#       Adds the generated <target>_srchash.cpp to <target>, which registers the
+#       hash with lib/srchash when the image holding <target> is loaded.  Must
+#       be called in the directory that defines <target>.
 #   parabix_srchash_finalize()
 #       Computes the dependency closures.  Called once, at the end of the
 #       top-level CMakeLists.txt, after every target has been defined.
@@ -87,6 +88,11 @@ function(parabix_srchash_attach TARGET)
         COMMENT "Computing source hash of ${TARGET}"
         VERBATIM)
     target_sources(${TARGET} PRIVATE ${GENERATED} ${STAMP})
+    if(NOT ARTIFACT_MODE STREQUAL "Single")
+        # The generated file registers the hash with lib/srchash.  In Single
+        # mode that is part of the single artifact.
+        target_link_libraries(${TARGET} PRIVATE srchash)
+    endif()
     set_property(GLOBAL APPEND PROPERTY PARABIX_SRCHASH_TARGETS ${TARGET})
 endfunction(parabix_srchash_attach)
 

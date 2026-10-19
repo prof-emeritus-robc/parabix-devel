@@ -11,6 +11,7 @@ SRC
     deletion.cpp
     pdep_kernel.cpp
     run_index.cpp
+    run_replace.cpp
     sentinel.cpp
     sorting.cpp
     stream_select.cpp

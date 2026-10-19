@@ -272,6 +272,7 @@ function(parabix_set_library_name NAME)
 endfunction(parabix_set_library_name)
 
 include(CMakeParseArguments)
+include(ParabixSourceHash)
 
 # Release & Debug flags
 
@@ -301,6 +302,10 @@ function(parabix_add_module)
     if(NOT ARG_NAME)
         message(FATAL_ERROR "parabix_add_module: A target name is required")
     endif()
+    # The public headers of lib/<path> are in include/<path>
+    file(RELATIVE_PATH MODULE_PATH ${PROJECT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR})
+    set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include/${MODULE_PATH})
+    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} INCLUDE_DIR ${INCLUDE_DIR})
     if(ARTIFACT_MODE STREQUAL "Single")
         foreach(SRC ${ARG_SRC})
             target_sources(${PARABIX_MONO_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${SRC})
@@ -312,6 +317,7 @@ function(parabix_add_module)
             add_library(${ARG_NAME} SHARED ${ARG_SRC})
         endif()
         parabix_set_library_name(${ARG_NAME})
+        parabix_srchash_attach(${ARG_NAME})
         target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
         if (ARG_REQUIRES_RTTI)
             target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
@@ -354,6 +360,8 @@ function(parabix_add_executable)
         message(FATAL_ERROR "parabix_add_executable: A target name is required")
     endif()
     add_executable(${ARG_NAME} ${ARG_SRC})
+    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} toolchain kernel.pipeline)
+    parabix_srchash_attach(${ARG_NAME})
     target_compile_options(${ARG_NAME} PRIVATE ${NO_RTTI})
     if(ARTIFACT_MODE STREQUAL "Single")
         target_link_libraries(${ARG_NAME} PUBLIC ${PARABIX_MONO_TARGET})
@@ -396,6 +404,7 @@ if(ARTIFACT_MODE STREQUAL "Single")
     else()
         add_library(${PARABIX_MONO_TARGET} SHARED "")
     endif()
+    parabix_srchash_attach(${PARABIX_MONO_TARGET})
 endif()
 
 # Framework Libraries
@@ -476,6 +485,9 @@ add_subdirectory(QA/unit-tests)
 if(ARTIFACT_MODE STREQUAL "Single")
     target_link_libraries(${PARABIX_MONO_TARGET} ${REQ_LLVM_LIBRARIES} ${Boost_LIBRARIES} ${Z3_LIBRARIES} ${LIBBACKTRACE_LIBRARIES})
 endif()
+
+# Source hashes need every target defined (see cmake/ParabixSourceHash.cmake)
+parabix_srchash_finalize()
 
 ###   Test Suite   ###
 

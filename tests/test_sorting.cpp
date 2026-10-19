@@ -6,6 +6,10 @@
 //  Tests of OddEvenMergeSortRuns, SeqSortRuns (Misorder_Check and SeqRunSort) and
 //  SortRuns (with 0, 1, 3 and 6 parallel sort steps).
 //
+//  By default, a subset of the cases runs (OddEvenMergeSortRuns with instance size 8,
+//  SeqSortRuns on both data sets and SortRuns with 0, 1 and 3 steps) in under half a
+//  second; --extended-testing also runs the remaining cases.
+//
 //  The short data set has runs of every length from 1 to 70 and runs of lengths
 //  96, 100, 127, 128, 129, 150, 191 and 200; the long data set has runs of lengths
 //  1, 2, 7, 64, 65, 129, 300, 1000, 3000 and 5000.  Runs are in random order,
@@ -1078,16 +1082,16 @@ TEST_CASE(sortruns6_long, long_runs, long_keys, long_payload, long_sorted) {
 
 RUN_TESTS(
     CASE(oddeven_8),
-    CASE(oddeven_32),
-    CASE(oddeven_64),
+    EXTENDED_CASE(oddeven_32),
+    EXTENDED_CASE(oddeven_64),
     CASE(runsort),
     CASE(runsort_long),
     CASE(sortruns0),
-    CASE(sortruns0_long),
+    EXTENDED_CASE(sortruns0_long),
     CASE(sortruns1),
-    CASE(sortruns1_long),
-    CASE(sortruns3),
+    EXTENDED_CASE(sortruns1_long),
+    EXTENDED_CASE(sortruns3),
     CASE(sortruns3_long),
-    CASE(sortruns6),
-    CASE(sortruns6_long)
+    EXTENDED_CASE(sortruns6),
+    EXTENDED_CASE(sortruns6_long)
 )

@@ -45,4 +45,7 @@ int main(int argc, char ** argv) {                                              
 }
 
 
-#define CASE(X) (std::tuple<std::string, TestCaseInvocationType>(std::string(#X), invoke_##X))
+#define CASE(X) (std::tuple<std::string, TestCaseInvocationType, bool>(std::string(#X), invoke_##X, false))
+
+// A test case that runs only with --extended-testing.
+#define EXTENDED_CASE(X) (std::tuple<std::string, TestCaseInvocationType, bool>(std::string(#X), invoke_##X, true))

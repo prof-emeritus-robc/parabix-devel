@@ -5,8 +5,11 @@
 #
 # Checks the output of unwritten_wide_output against a reference over random inputs whose lengths
 # fall around pack and block boundaries, for several block widths and numbers of byte streams.
+# By default, a small set of cases (one block width, a few lengths, stream counts and segment
+# sizes) completes in under a second; --extended-testing runs all the combinations of the block
+# widths, lengths, stream counts and segment sizes below.
 #
-# usage: unwritten_wide_output_test.py <path to unwritten_wide_output> [-v]
+# usage: unwritten_wide_output_test.py <path to unwritten_wide_output> [--extended-testing] [-v]
 
 import os
 import random
@@ -17,6 +20,18 @@ import tempfile
 BLOCK_WIDTHS = [128, 256, 512]
 STREAM_COUNTS = [1, 2, 3]
 SEGMENT_SIZES = [None, "1"]
+
+# The default cases: one block width, the empty input, a length ending within a block but not on
+# a pack boundary and one of several segments, one and several byte streams, and the default
+# segment size and segments of one stride.
+QUICK_BLOCK_WIDTHS = [256]
+QUICK_STREAM_COUNTS = [1, 3]
+QUICK_SEGMENT_SIZES = [None, "1"]
+
+
+def quick_lengths(block_width):
+    pack = block_width // 8
+    return [0, 3 * pack + 5, 10000]
 
 
 def lengths(block_width):
@@ -62,19 +77,24 @@ def main():
         return 2
     exe = sys.argv[1]
     verbose = "-v" in sys.argv[2:]
+    if "--extended-testing" in sys.argv[2:]:
+        block_widths, stream_counts, segment_sizes, lengths_for = BLOCK_WIDTHS, STREAM_COUNTS, SEGMENT_SIZES, lengths
+    else:
+        block_widths, stream_counts, segment_sizes, lengths_for = (QUICK_BLOCK_WIDTHS, QUICK_STREAM_COUNTS,
+                                                                   QUICK_SEGMENT_SIZES, quick_lengths)
     rng = random.Random(20261007)
     failures = 0
     cases = 0
     with tempfile.TemporaryDirectory() as tmp:
-        for block_width in BLOCK_WIDTHS:
-            for n in lengths(block_width):
+        for block_width in block_widths:
+            for n in lengths_for(block_width):
                 path = os.path.join(tmp, "in%d_%d.bin" % (block_width, n))
                 data = bytes(rng.getrandbits(8) for _ in range(n))
                 with open(path, "wb") as f:
                     f.write(data)
-                for streams in STREAM_COUNTS:
+                for streams in stream_counts:
                     expected = reference(data, block_width, streams)
-                    for seg in SEGMENT_SIZES:
+                    for seg in segment_sizes:
                         cases += 1
                         rc, out, err, cmd = run(exe, path, block_width, streams, seg)
                         if rc != 0 or out != expected:

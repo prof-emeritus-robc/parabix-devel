@@ -254,6 +254,26 @@ void PipelineKernel::recursivelyListFamilyKernels(llvm::raw_ostream & familyName
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getStageLabel
+ ** ------------------------------------------------------------------------------------------------------------- */
+StringRef PipelineKernel::getStageLabel(const Kernel * const kernel) const {
+    if (mStageLabels.empty()) {
+        return StringRef{};
+    }
+    for (size_t i = 0; i < mKernels.size(); ++i) {
+        if (mKernels[i].Object == kernel) {
+            StringRef label;
+            for (const auto & L : mStageLabels) {
+                if (L.second > i) break;
+                label = L.first;
+            }
+            return label;
+        }
+    }
+    return StringRef{};
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief getSourceTag
  *
  * The pipeline's code depends on the state types, bindings and family interfaces of its kernels,

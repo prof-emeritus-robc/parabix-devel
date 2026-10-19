@@ -126,6 +126,11 @@ public:
         return mTarget->InsertPhaseBoundary();
     }
 
+    // Label the kernels created from now on as belonging to the given stage, for reporting.
+    void SetStageLabel(llvm::StringRef label) {
+        mTarget->SetStageLabel(label);
+    }
+
     template<typename... OtherBoundaryTypes>
     PipelinePhaseBoundary * InsertPhaseBoundary(const StreamSet * const streamSet, const double restriction, OtherBoundaryTypes... other) {
         return mTarget->InsertPhaseBoundary(streamSet, restriction, other...);

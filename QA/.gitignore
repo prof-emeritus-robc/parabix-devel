@@ -9,5 +9,6 @@ gb18030/TestOutput
 json/TestOutput
 json_perf/TestOutput
 nfd/nfd_output
+nfd/nfd_output_separated
 nfd/ExpectedOutput/NF*.nfd
 

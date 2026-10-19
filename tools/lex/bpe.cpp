@@ -1024,7 +1024,7 @@ extern "C" void bpe_retire_stuck(uint64_t slot, const uint16_t * ids, const uint
         const bool c1 = __builtin_add_overflow(L, C, &s1);
         const bool c2 = __builtin_add_overflow(s1, carry, &s2);
         carry = c1 | c2;
-        const uint64_t bwd = __builtin_bitreverse64((s2 ^ C) | L);
+        const uint64_t bwd = llvm::reverseBits<uint64_t>((s2 ^ C) | L);
         const uint64_t keep = (fwdW[wi] | bwd) & ~frozenW[wi];
         kept[wi] = keep;
         segOut[wi] &= keep;

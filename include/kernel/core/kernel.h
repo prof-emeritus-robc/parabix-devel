@@ -448,6 +448,13 @@ public:
         mInternalScalars.emplace_back(ScalarType::ThreadLocal, type, name, group, rule);
     }
 
+    // True if this kernel has any output scalar, any thread-local state, or any persistent
+    // internal scalar other than the base buffer handles and termination signal (see
+    // addBaseInternalScalars), i.e., state that one invocation may leave for the next.
+    // Shared state fields not described by an internal scalar (as with kernels restored
+    // from the object cache) are also treated as mutable state.
+    bool hasPersistentMutableState() const;
+
     llvm::StructType * getSharedStateType() const {
         return mSharedStateType;
     }

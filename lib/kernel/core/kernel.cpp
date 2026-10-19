@@ -1910,6 +1910,36 @@ static inline unsigned collectOutputFlags(const Bindings & streamSets) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief hasPersistentMutableState
+ ** ------------------------------------------------------------------------------------------------------------- */
+bool Kernel::hasPersistentMutableState() const {
+    if (!mOutputScalars.empty() || mThreadLocalStateType) {
+        return true;
+    }
+    size_t sharedScalars = mInputScalars.size();
+    for (const InternalScalar & scalar : mInternalScalars) {
+        if (scalar.getScalarType() == ScalarType::NonPersistent) continue;
+        if (scalar.getScalarType() == ScalarType::ThreadLocal) return true;
+        ++sharedScalars;
+        const StringRef name(scalar.getName());
+        if (name == TERMINATION_SIGNAL) continue;
+        if (name.ends_with(BUFFER_HANDLE_SUFFIX) && scalar.getValueType()->isPointerTy()) continue;
+        return true;
+    }
+    // A kernel restored from the object cache may have a shared state type with fields
+    // (e.g., Pablo carries) that were never registered as internal scalars, since the
+    // analysis that adds them is skipped. The flattened layout is [pad, field, ..., pad].
+    if (mSharedStateType) {
+        const auto n = mSharedStateType->getStructNumElements();
+        assert ((n % 2) == 1);
+        if (((n - 1) / 2) > sharedScalars) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief addBaseInternalScalars
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::addBaseInternalScalars(LLVMTypeSystemInterface & ts) {

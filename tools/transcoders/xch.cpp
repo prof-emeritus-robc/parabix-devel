@@ -643,7 +643,11 @@ int main(int argc, char *argv[]) {
     unicode::BitTranslationSets insertion_bixnum;
     unicode::BitTranslationSets deletion_bixnum;
     if (XfrmProperty != "") {
-        UCD::property_t prop = UCD::getPropertyCode(XfrmProperty);
+        std::string canon = UCD::canonicalize_value_name(XfrmProperty);
+        UCD::property_t prop = UCD::getPropertyCode(canon);
+        if (prop == UCD::Undefined) {
+            llvm::report_fatal_error(llvm::StringRef("Unknown property: " + XfrmProperty));
+        }
         UCD::PropertyObject * propObj = UCD::getPropertyObject(prop);
         if (UCD::CodePointPropertyObject * p = dyn_cast<UCD::CodePointPropertyObject>(propObj)) {
             xfrms.resize(1);

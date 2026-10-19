@@ -74,6 +74,7 @@ static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers"), cl:
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
 void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, StreamSet * ByteStream, StreamSet * BasisBits) {
+    P.SetStageLabel("source");
 
     P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
 
@@ -137,6 +138,7 @@ NFD_TransformFunctionType NFD_transform_pipeline(CPUDriver & driver) {
 }
 
 void OutputAssemblyStage(PipelineBuilder & P, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask, StreamSet * Source, StreamSet * TransformedBasis) {
+    P.SetStageLabel("reintegrate");
 
     StreamSet * const NonModifiedMask = P.CreateStreamSet(1, 1);
     Invert(P, WorkSelectionMask, NonModifiedMask);
@@ -181,6 +183,7 @@ void OutputAssemblyStage(PipelineBuilder & P, StreamSet * WorkSelectionMask, Str
 }
 
 void SimpleOutputStage(PipelineBuilder & P, StreamSet * TransformedBasis) {
+    P.SetStageLabel("output");
     StreamSet * const OutputBytes = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<P2SKernel>(TransformedBasis, OutputBytes);
     P.CreateKernelCall<StdOutKernel>(OutputBytes);

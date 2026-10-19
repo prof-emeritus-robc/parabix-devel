@@ -657,6 +657,7 @@ void NFD_PipelineBuilder::DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet
 }
 
 void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis) {
+    mPB.SetStageLabel("focus");
 
     StreamSet * const u8index = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<UTF8_index>(BasisBits, u8index);
@@ -668,16 +669,19 @@ void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * Wor
     mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask);
     SHOW_STREAM(WorkSelectionMask);
 
+    mPB.SetStageLabel("filter");
     FilterByMask(mPB, WorkSelectionMask, BasisBits, WorkingBasis);
     SHOW_BIXNUM(WorkingBasis);
 }
 
 void NFD_PipelineBuilder::ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask) {
+    mPB.SetStageLabel("placement");
     ComputeWorkPlacement(mPB, NFD_Data.UTF8_Insertion_BixNumCCs(), NFD_Data.UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
     SHOW_STREAM(FinalWorkPlacementMask);
 }
 
 void NFD_PipelineBuilder::NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis) {
+    mPB.SetStageLabel("transform");
 
     StreamSet * const U21_u8indexed = mPB.CreateStreamSet(21, 1);
     mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed);
@@ -698,6 +702,7 @@ void NFD_PipelineBuilder::NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * 
 }
 
 void NFD_PipelineBuilder::NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis) {
+    mPB.SetStageLabel("transform");
 
     StreamSet * const U21_u8indexed = mPB.CreateStreamSet(21, 1);
     mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed);

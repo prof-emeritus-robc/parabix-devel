@@ -192,7 +192,8 @@ CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver,
                             Output<streamset_t>("WorkSelectionMask", 1, 1, ReturnedBuffer(1)),
                             Output<streamset_t>("FinalWorkPlacementMask", 1, 1, ReturnedBuffer(1)),
-                            Output<streamset_t>("ByteStream", 1, 8, ReturnedBuffer(1)),
+                            // the source data in the form generate_output_pipeline expects
+                            Output<streamset_t>("Source", ByteMerging ? 1 : 8, ByteMerging ? 8 : 1, ReturnedBuffer(1)),
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1)),
                             Input<uint32_t>("inputFileDecriptor")
                             );
@@ -201,10 +202,11 @@ CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
 
     StreamSet * const WorkSelectionMask = P.getOutputStreamSet("WorkSelectionMask");
     StreamSet * const FinalWorkPlacementMask = P.getOutputStreamSet("FinalWorkPlacementMask");
-    StreamSet * const ByteStream = P.getOutputStreamSet("ByteStream");
+    StreamSet * const Source = P.getOutputStreamSet("Source");
     StreamSet * const TransformedBasis = P.getOutputStreamSet("TransformedBasis");
 
-    StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
+    StreamSet * const ByteStream = ByteMerging ? Source : P.CreateStreamSet(1, 8);
+    StreamSet * const BasisBits = ByteMerging ? P.CreateStreamSet(8, 1) : Source;
     source_input_stage(P, fileDescriptor, ByteStream, BasisBits);
 
     StreamSet * WorkingBasis = P.CreateStreamSet(8, 1);
@@ -280,13 +282,13 @@ int main(int argc, char *argv[]) {
         CombinedWorkFunctionType working_stages = generate_combined_work_pipeline(driver);
         kernel::StreamSetPtr WorkSelectionMask;
         kernel::StreamSetPtr FinalWorkPlacementMask;
-        kernel::StreamSetPtr ByteStream;
+        kernel::StreamSetPtr Source;
         kernel::StreamSetPtr TransformedBasis;
-        working_stages(WorkSelectionMask, FinalWorkPlacementMask, ByteStream, TransformedBasis, fd);
+        working_stages(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis, fd);
         close(fd);
 
         OutputAssemblyFunctionType stage3 = generate_output_pipeline(driver);
-        stage3(WorkSelectionMask, FinalWorkPlacementMask, ByteStream, TransformedBasis);
+        stage3(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis);
     } else if (SeparatedPipelineStages == 4) {
         SourceInputFunctionType stage0 = source_input_pipeline(driver);
         kernel::StreamSetPtr ByteStream;

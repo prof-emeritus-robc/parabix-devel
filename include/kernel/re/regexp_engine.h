@@ -144,7 +144,7 @@ public:
 
     std::string makeSignature(RE_CompilerContext & ctxt, re::RE * r);
     kernel::Bindings makeInputBindings(RE_CompilerContext & ctxt, re::RE * r);
-    kernel::Bindings makeOutputBindings(re::RE * r, kernel::StreamSet * results);
+    kernel::Bindings makeOutputBindings(RE_CompilerContext & ctxt, re::RE * r, kernel::StreamSet * results);
 
 private:
     RE_CompilerContext mContext;

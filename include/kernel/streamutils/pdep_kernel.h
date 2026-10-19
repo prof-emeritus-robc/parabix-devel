@@ -40,6 +40,12 @@ enum class StreamExpandOptimization {None, NullCheck};
     SpreadByMask employs two kernels in sequence:  StreamExpandKernel followed by
     FieldDepositKernel.
 
+    The mask may be a repeating stream set (P.CreateRepeatingStreamSet), which has
+    no end of its own.  The output then ends immediately after the mask position
+    of the last input item (TruncateRepeatingMask), so that, for example, the
+    repeating mask 001111 spreads 4n items into 6n positions.  A repeating mask
+    cannot be combined with zeroExtend.
+
  */
 void SpreadByMask(PipelineBuilder & P,
                   StreamSet * mask, StreamSet * toSpread, StreamSet * outputs,
@@ -135,6 +141,15 @@ protected:
 };
 
 /* The following kernels are used by SpreadByMask internally. */
+
+//  Copy a repeating (unbounded) mask, ending it immediately after the 1 bit
+//  that selects the last item of source (consumed at the popcount rate of the mask).
+class TruncateRepeatingMask final : public MultiBlockKernel {
+public:
+    TruncateRepeatingMask(LLVMTypeSystemInterface & ts, StreamSet * mask, StreamSet * source, StreamSet * truncated);
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) override;
+};
 
 class StreamExpandKernel final : public MultiBlockKernel {
 public:

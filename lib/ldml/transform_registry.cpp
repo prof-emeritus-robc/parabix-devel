@@ -49,7 +49,8 @@ static std::string scriptNormalized(const std::string & name) {
 }
 
 //  Built-in transforms of UTS #35 Part 2, with ICU's names for the Hex
-//  variants.  Any-Hex and Hex-Any without a variant are the Java forms.
+//  variants.  Any-Hex without a variant is the Java form; Hex-Any without one
+//  decodes all the forms (as ICU's).
 struct BuiltIn {
     const char * name;
     std::vector<const char *> aliases;
@@ -63,7 +64,7 @@ static const std::vector<BuiltIn> builtInTransforms = {
     {"Any-Name", {}}, {"Name-Any", {}},
     {"Any-Hex/Java", {"Any-Hex"}}, {"Any-Hex/C", {}}, {"Any-Hex/Perl", {}},
     {"Any-Hex/Unicode", {}}, {"Any-Hex/XML", {}}, {"Any-Hex/XML10", {}}, {"Any-Hex/Plain", {}},
-    {"Hex-Any/Java", {"Hex-Any"}}, {"Hex-Any/C", {}}, {"Hex-Any/Perl", {}},
+    {"Hex-Any", {}}, {"Hex-Any/Java", {}}, {"Hex-Any/C", {}}, {"Hex-Any/Perl", {}},
     {"Hex-Any/Unicode", {}}, {"Hex-Any/XML", {}}, {"Hex-Any/XML10", {}}, {"Hex-Any/Plain", {}},
     {"Any-BreakInternal", {}},
 };

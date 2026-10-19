@@ -122,6 +122,9 @@ bool hasEndAnchor(const RE * r);
 bool anyEndAnchor(const RE * r);
     
     
-unsigned grepOffset(const RE * re);
+// The offset of the match marker produced by RE_Block_Compiler after the last
+// matched code unit (0 or 1).  indexedUTF8: the RE is compiled over UTF-8 code
+// units with a Unicode character index (the UTF-8 indexed mode).
+unsigned grepOffset(const RE * re, bool indexedUTF8 = false);
 }
 

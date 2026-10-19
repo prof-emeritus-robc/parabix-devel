@@ -61,6 +61,7 @@ struct MergeRuleGroup {
     unsigned lo = 0, hi = 0;
     unsigned maxLen = 0;
     std::vector<MergeRule> rules;
+    bool tailOnly = false;   // --bpe-tail: the unpartitioned rules past the cut; never a kernel
 };
 
 class BPETokenizer {
@@ -89,8 +90,9 @@ public:
     // by idAB-range, sorted by idAB ASC = rank ASC. This is the data the
     // merge-loop kernel consumes: per rule it detects idA's end, checks idB at
     // +lenB, and stamps idAB. Rules whose parts are unresolvable are skipped
-    // (with a count on stderr).
-    std::vector<MergeRuleGroup> buildMergeRuleRanges() const;
+    // (with a count on stderr). tailPoint (--bpe-tail with a pretokenizer, else 0): see
+    // the bit-tier loop in the definition.
+    std::vector<MergeRuleGroup> buildMergeRuleRanges(unsigned tailPoint = 0) const;
 
 private:
     // Generate the 256-entry GPT-2 byte-level base alphabet (bytes_to_unicode)
@@ -116,9 +118,22 @@ private:
 //   Returns (matchEnd=active, vocabID=source). Emission is Stage-B debug
 //   (emit-all); correct emission (consume swallowed ends) is Stage C.
 struct BPEPassResult {
-    kernel::StreamSet * matchEnd;   //  1×1
-    kernel::StreamSet * vocabID;    // 16×1 BixNum
+    kernel::StreamSet * matchEnd;            //  1×1
+    kernel::StreamSet * vocabID;             // 16×1 BixNum
+    kernel::StreamSet * segStarts = nullptr; // --bpe-tail: segment starts; emit via buildBPETailEmitter
 };
+
+// --bpe-tail emitter: finishes BPE per segment over the tokens at `starts` (ids = 16×1 BixNum,
+// segs = segment starts) in order, and hands the finished ids to the sink, in order, a batch
+// per pipeline call.
+// The opt-in framework hooks of the BPE flags (--vm-ring-buffers, --memsource-block-capacity).
+// Call before building the pipeline: the source kernel reads its hook when constructed.
+void bpeSetFrameworkHooks();
+
+using BPETailSink = void (*)(const uint16_t * ids, size_t n);
+void bpeTailSetSink(BPETailSink sink);
+void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
+                         kernel::StreamSet * starts, kernel::StreamSet * segs);
 
 // `boundary` (optional, may be null): a 1-bit per-byte mask marking pretoken
 // STARTS (GPT-2 regex boundaries). When present, merges are blocked from crossing

@@ -62,6 +62,36 @@ StreamSet * PipelineBuilder::CreateRepeatingBixNum(unsigned bixNumBits, pattern_
     return CreateRepeatingStreamSet(1, templatePattern, isDynamic);
 }
 
+namespace {
+
+// Produces no items: the kernel terminates in its first segment.
+class EmptyStreamSetKernel final : public SegmentOrientedKernel {
+public:
+    EmptyStreamSetKernel(LLVMTypeSystemInterface & ts, StreamSet * const Empty)
+    : SegmentOrientedKernel(ts, "EmptyStreamSet" + std::to_string(Empty->getNumElements()) + "x" + std::to_string(Empty->getFieldWidth()),
+    {},
+    {Binding{"Empty", Empty}},
+    {}, {}, {}) {
+        addAttribute(MustExplicitlyTerminate());
+    }
+protected:
+    void generateDoSegmentMethod(KernelBuilder & b) override {
+        b.setProducedItemCount("Empty", b.getSize(0));
+        b.setTerminationSignal();
+    }
+};
+
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief CreateEmptyStreamSet
+ ** ------------------------------------------------------------------------------------------------------------- */
+StreamSet * PipelineBuilder::CreateEmptyStreamSet(const unsigned NumElements, const unsigned FieldWidth) {
+    StreamSet * const Empty = CreateStreamSet(NumElements, FieldWidth);
+    CreateKernelCall<EmptyStreamSetKernel>(Empty);
+    return Empty;
+}
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief captureBitstream
  ** ------------------------------------------------------------------------------------------------------------- */

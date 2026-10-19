@@ -33,6 +33,7 @@
 #include <pablo/toolchain/pablo_toolchain.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/core/streamset.h>
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/Support/raw_os_ostream.h>
@@ -334,7 +335,10 @@ void PabloCompiler::compileIf(KernelBuilder & b, const If * const ifStatement) {
 
     Value * condition = compileExpression(b, ifStatement->getCondition());
     Value * const cond = mCarryManager->generateEntrySummaryTest(b, condition);
-    b.CreateCondBr(cond, ifBodyBlock, ifEndBlock);
+    BranchInst * const ifBranch = b.CreateCondBr(cond, ifBodyBlock, ifEndBlock);
+    if (const auto weight = mKernel->ifBodyUnlikelyWeight()) {
+        ifBranch->setMetadata(LLVMContext::MD_prof, MDBuilder(b.getContext()).createBranchWeights(1, weight));
+    }
 
     // Entry processing is complete, now handle the body of the if.
     b.SetInsertPoint(ifBodyBlock);

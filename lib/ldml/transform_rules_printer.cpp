@@ -175,10 +175,8 @@ std::string printSet(const RE * re) {
         return "$" + n->getName();
     } else if (const Diff * d = dyn_cast<Diff>(re)) {
         if (isa<Any>(d->getLH())) {
-            if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(d->getRH())) {
-                return printProperty(pe, true);
-            }
-            // The complement of a set excluding the text boundary.
+            // The complement of a set excluding the text boundary.  ([:^X:] includes
+            // the text boundary, as in ICU, unless X includes U+FFFF.)
             return "[^" + printSetBody(d->getRH()) + "$]";
         }
         return "[" + printSet(d->getLH()) + "-" + printSet(d->getRH()) + "]";
@@ -190,6 +188,9 @@ std::string printSet(const RE * re) {
                 if (const Diff * d = dyn_cast<Diff>(a)) {
                     if (isa<Any>(d->getLH())) {
                         // A negated set, which includes the text boundary.
+                        if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(d->getRH())) {
+                            return printProperty(pe, true);
+                        }
                         return "[^" + printSetBody(d->getRH()) + "]";
                     }
                 }

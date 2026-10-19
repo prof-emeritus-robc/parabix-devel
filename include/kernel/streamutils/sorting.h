@@ -95,5 +95,5 @@ void SeqSortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, Stream
 void SortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted,
               unsigned parallelSteps);
 
-//   SortRuns with parallelSteps given by the --parallel-sort-steps option (default 6).
+//   SortRuns with parallelSteps given by the --parallel-sort-steps option (default 2).
 void SortRuns(PipelineBuilder & P, StreamSet * Runs, StreamSet * Keys, StreamSet * Data, StreamSet * Sorted);

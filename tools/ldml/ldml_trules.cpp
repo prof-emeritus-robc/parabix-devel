@@ -6,14 +6,14 @@
 //  ldml_trules: parse LDML transform rules and print them in canonical form.
 //
 //  ldml_trules [--xml] [--quiet] [--forward | --backward]
-//              [--eliminate-trivial-captures] [--eliminate-nullable-captures] file ...
+//              [--disable-capture-simplification] file ...
 //      Parse the rules of each file (plain rule text, or with --xml, the
 //      <tRule> elements of an LDML transform file), print the canonical
 //      form of the rules and check that the canonical form reparses to
 //      the same canonical form.  With --forward or --backward, the rules
 //      extracted for that direction (as forward rules) are printed.
-//      With --eliminate-trivial-captures and --eliminate-nullable-captures,
-//      trivial and then nullable capture elimination are applied to the
+//      Unless --disable-capture-simplification, unreferenced capture removal
+//      and trivial and nullable capture elimination are applied to the
 //      (forward) rules before printing.  With --mutually-exclusive, the
 //      rules are then expressed in terms of the mutually exclusive
 //      character classes of each group.  With --disambiguate-order, the
@@ -112,11 +112,14 @@ static std::vector<Rule *> extract(const std::vector<Rule *> & rules, const Extr
 
 // Parse, print, and check that the printed form reparses to the same form.
 static bool processRules(const std::vector<std::string> & tRules, const std::string & label, bool quiet, const Extract e,
-                         bool eliminateTrivial, bool eliminateNullable, bool exclusive, bool disambiguate) {
+                         bool simplifyCaptures, bool exclusive, bool disambiguate) {
     try {
         std::vector<Rule *> rules = extract(parseTransformRules(tRules), e);
-        if (eliminateTrivial) rules = TrivialCaptureElimination(rules);
-        if (eliminateNullable) rules = NullableCaptureElimination(rules);
+        if (simplifyCaptures) {
+            rules = RemoveUnreferencedCaptures(rules);
+            rules = TrivialCaptureElimination(rules);
+            rules = NullableCaptureElimination(rules);
+        }
         MutuallyExclusiveStats stats;
         if (exclusive) {
             rules = MutuallyExclusivePartitioning(rules, &stats);
@@ -192,8 +195,11 @@ static const TestCase testCases[] = {
     {"[:Lowercase:] { '-' → ;", "[:lowercase:] { \\- → ;\n"},
     {"[:Lowercase:] { '-' } [:Uppercase:] → ;", "[:lowercase:] { \\- } [:uppercase:] → ;\n"},
     {"[[:Lowercase:]$] {'-' → ;", "[[:lowercase:]$] { \\- → ;\n"},
-    {"[^[:Lowercase:]] {'-' → ;", "[^[:lowercase:]] { \\- → ;\n"},
-    {"[^[:Lowercase:]$] {'-' → ;", "[:^lowercase:] { \\- → ;\n"},
+    // A negated property includes the text boundary, as [^...] does (ICU's sets
+    // include U+FFFF for the boundary): [^[:X:]] is printed as [:^X:], and the
+    // complement excluding the boundary as [^[:X:]$].
+    {"[^[:Lowercase:]] {'-' → ;", "[:^lowercase:] { \\- → ;\n"},
+    {"[^[:Lowercase:]$] {'-' → ;", "[^[:lowercase:]$] { \\- → ;\n"},
     {"x → y | z ; z a → w ;", "x → y | z ;\nza → w ;\n"},
     {"[a-z]{x > |@ab ; ab > J; ca > M;", "[a-z] { x → |@ ab ;\nab → J ;\nca → M ;\n"},
     {"a → Ab@|;", "a → Ab @| ;\n"},
@@ -219,7 +225,8 @@ static const TestCase testCases[] = {
     {"[\\p{L}-[a-z]] → x ;", "[[:l:]-[a-z]] → x ;\n"},
     {"[[:L:]&[:Latin:]] → x ;", "[[:l:]&[:latin:]] → x ;\n"},
     {"[{ch}a-c] → x ;", "[{ch}a-c] → x ;\n"},
-    {"\\p{Script=Greek} → x ; [:^gc=Lu:] → y ;", "[:script=Greek:] → x ;\n[:^gc=Lu:] → y ;\n"},
+    // (Within a text, the text boundary of a negated set is dropped.)
+    {"\\p{Script=Greek} → x ; [:^gc=Lu:] → y ;", "[:script=Greek:] → x ;\n[^[:gc=Lu:]$] → y ;\n"},
     {"$v = [aeiou] ; [$v y] → V ;", "$v = [aeiou] ;\n[$v y] → V ;\n"},
     {"[a\\-z] → x ;", "[\\-az] → x ;\n"},
     {"$mac = M [aA] [cC] ;", "$mac = M [Aa] [Cc] ;\n"},
@@ -553,6 +560,19 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"(a*) ← b ;", "(a*) ← b ;\n"},
 };
 
+static const EliminationTestCase unreferencedTestCases[] = {
+    {"(a) b → c ;", "ab → c ;\n"},
+    {"(a)+ (b) → $2 ;", "a+ (b) → $1 ;\n"},
+    {"(a+) (b) → $2 $1 ;", "(a+) (b) → $2 $1 ;\n"},
+    // In the contexts, nested, and referenced from a function call.
+    {"(x)? [a-z] { y → z ;", "x? [a-z] { y → z ;\n"},
+    {"a { b } (c (d)) → $2 ;", "a { b } c (d) → $1 ;\n"},
+    {"((a) b) (c) → &Any-Hex($3) $1 ;", "(ab) (c) → &Any-Hex($2) $1 ;\n"},
+    {"(a) (b) → | $2 ;", "a (b) → | $1 ;\n"},
+    // Rules other than forward conversion rules are unchanged.
+    {"(a) b ↔ c ;", "(a) b ↔ c ;\n"},
+};
+
 static const EliminationTestCase trivialTestCases[] = {
     {"a { (b) } c → $1 x ;", "ab { } c → x ;\n"},
     {"(b) → $1 x | y ;", "b { → x | y ;\n"},
@@ -586,9 +606,18 @@ static const EliminationTestCase trivialTestCases[] = {
     {"(bc) → $1 z ; x { c → w ;", "bc { → z ;\nx { c → w ;\n"},
     {"(bc) → $1 z ; b { c → w ;", "(bc) → $1 z ;\nb { c → w ;\n"},
     {"(b) → $1 x ; b ← y ;", "b { → x ;\nb ← y ;\n"},
-    // Unchanged: reference not first, text not only the capture, not a forward rule.
-    {"(b) → x $1 ;", "(b) → x $1 ;\n"},
+    // A text beginning with the capture: the rest stays the text, if the
+    // transformed rule cannot apply again right after itself (on bcc, (b) c → $1
+    // gives bc, where b { c → ; would give b).
     {"(b) c → $1 ;", "(b) c → $1 ;\n"},
+    {"(b) c → $1 x ;", "b { c → x ;\n"},
+    {"(b) c d → $1 x ; e → y ;", "b { cd → x ;\ne → y ;\n"},
+    // ... unless the rule itself may match within its text, other than as (X) X+.
+    {"(a) a → $1 ;", "(a) a → $1 ;\n"},
+    {"(a) a+ → $1 x ;", "a { a+ → x ;\n"},
+    {"(b) c → $1 ; c → y ;", "(b) c → $1 ;\nc → y ;\n"},
+    // Unchanged: reference not first, not a forward rule.
+    {"(b) → x $1 ;", "(b) → x $1 ;\n"},
     {"(b) → &Any-Hex($1) ;", "(b) → &Any-Hex($1) ;\n"},
     {"(b) ↔ $1 x ;", "(b) ↔ $1 x ;\n"},
     {"$1 x ← (b) ;", "$1 x ← (b) ;\n"},
@@ -1170,11 +1199,111 @@ static std::string classifyInsertion(const ConversionRule * cr, re::RE ** captur
     return "copy (no insertion)";
 }
 
+// The SingleCaptureDoubleReplacement pattern A (B) C → D $1 E: a text to
+// replace with one capture, between
+// fixed-length texts A and C (possibly empty), and a result of fixed text D,
+// the reference to the capture and fixed text E.  Returns an empty string if
+// the rule does not have this form, and otherwise its class: the length of B,
+// whether A and C are strings (or have sets), and whether the result has
+// text to revisit.
+static std::string classifySingleCaptureDoubleReplacement(const ConversionRule * cr) {
+    using namespace re;
+    const RuleSide * const source = cr->getSourceSide(Direction::Forward);
+    const RuleSide * const result = cr->getResultSide(Direction::Forward);
+    std::vector<RE *> text;
+    flattenItems(source->getText(), text);
+    size_t at = text.size();
+    for (size_t i = 0; i < text.size(); i++) {
+        if (llvm::isa<Capture>(text[i])) {
+            if (at != text.size()) return "";
+            at = i;
+        }
+    }
+    if (at == text.size()) return "";
+    Capture * const capture = llvm::cast<Capture>(text[at]);
+    std::vector<Capture *> captures;
+    collectCaptures(source->getText(), captures);
+    if (captures.size() != 1) return "";
+    bool literal = true;
+    for (size_t i = 0; i < text.size(); i++) {
+        if (i == at) continue;
+        const std::string length = classifyTextLength(text[i]);
+        if (length.compare(0, 8, "variable") == 0) return "";
+        literal &= isFixedText(text[i]);
+    }
+    std::vector<RE *> items;
+    flattenItems(result->getText(), items);
+    bool referenced = false;
+    for (RE * item : items) {
+        if (Reference * ref = llvm::dyn_cast<Reference>(item)) {
+            if (referenced || ref->getName() != capture->getName()) return "";
+            referenced = true;
+        } else if (!isFixedText(item)) {
+            return "";
+        }
+    }
+    if (!referenced) return "";
+    std::string b = classifyTextLength(capture->getCapturedRE());
+    if (b.compare(0, 8, "variable") != 0) b = "fixed";
+    return "B " + b + " | A, C " + (literal ? "strings" : "with sets") + " | " + classifyRevisit(result);
+}
+
+// The MultipleCaptureMultipleReplacement pattern, generalizing
+// SingleCaptureDoubleReplacement: a text to replace
+//      T0 (B1) T1 (B2) ... (Bk) Tk
+// with k >= 1 captures, of any patterns Bi, and fixed-length texts Ti
+// (possibly empty), and a result
+//      R0 $1 R1 $2 ... $k Rk
+// of fixed texts Ri and a reference to each capture, in the order of the
+// captures.  Returns an empty string if the rule does not have this form, and
+// otherwise its class: the number of captures, whether their patterns all have
+// fixed lengths, and whether the result has text to revisit.
+static std::string classifyMultipleCaptureMultipleReplacement(const ConversionRule * cr) {
+    using namespace re;
+    const RuleSide * const source = cr->getSourceSide(Direction::Forward);
+    const RuleSide * const result = cr->getResultSide(Direction::Forward);
+    std::vector<RE *> text;
+    flattenItems(source->getText(), text);
+    std::vector<Capture *> captures;
+    bool fixedCaptures = true;
+    for (RE * item : text) {
+        if (Capture * c = llvm::dyn_cast<Capture>(item)) {
+            std::vector<Capture *> nested;
+            collectCaptures(c->getCapturedRE(), nested);
+            if (!nested.empty()) return "";
+            captures.push_back(c);
+            fixedCaptures &= classifyTextLength(c->getCapturedRE()).compare(0, 8, "variable") != 0;
+        } else {
+            std::vector<Capture *> nested;
+            collectCaptures(item, nested);
+            if (!nested.empty()) return "";
+            if (classifyTextLength(item).compare(0, 8, "variable") == 0) return "";
+        }
+    }
+    if (captures.empty()) return "";
+    std::vector<RE *> items;
+    flattenItems(result->getText(), items);
+    size_t next = 0;
+    for (RE * item : items) {
+        if (Reference * ref = llvm::dyn_cast<Reference>(item)) {
+            if (next == captures.size() || ref->getName() != captures[next]->getName()) return "";
+            next++;
+        } else if (!isFixedText(item)) {
+            return "";
+        }
+    }
+    if (next != captures.size()) return "";
+    const std::string k = captures.size() == 1 ? "1 (SingleCaptureDoubleReplacement)" : std::to_string(captures.size());
+    return k + " | captures " + (fixedCaptures ? "fixed length" : "variable") + " | " + classifyRevisit(result);
+}
+
 struct RuleClassCounts {
     // dimension -> direction -> class -> count
     std::map<std::string, std::map<std::string, std::map<std::string, unsigned>>> byDimension;
     // signature -> (count, example rule, file)
     std::map<std::string, std::tuple<unsigned, std::string, std::string>> signatures;
+    std::map<std::string, unsigned> patternFiles;     // the rules of the pattern A (B) C → D $1 E, by file
+    std::map<std::string, unsigned> multipleFiles;    // the MultipleCaptureMultipleReplacement rules, by file
     unsigned rules = 0;
 };
 
@@ -1221,6 +1350,26 @@ static void classifyRules(const std::vector<std::string> & tRules, const std::st
             re::RE * captured = nullptr;
             const std::string insertion = classifyInsertion(cr, &captured);
             counts.byDimension["simple insertion"][dir][insertion.empty() ? "not a simple insertion rule" : insertion]++;
+            const std::string multiple = classifyMultipleCaptureMultipleReplacement(cr);
+            counts.byDimension["MultipleCaptureMultipleReplacement"][dir][multiple.empty() ? "other rules" : multiple]++;
+            if (!multiple.empty()) {
+                auto & e = counts.signatures["MultipleCaptureMultipleReplacement: " + multiple];
+                if (std::get<0>(e)++ == 0) {
+                    std::get<1>(e) = printRule(r);
+                    std::get<2>(e) = label;
+                }
+                counts.multipleFiles[label]++;
+            }
+            const std::string pattern = classifySingleCaptureDoubleReplacement(cr);
+            counts.byDimension["SingleCaptureDoubleReplacement A (B) C → D $1 E"][dir][pattern.empty() ? "other rules" : pattern]++;
+            if (!pattern.empty()) {
+                auto & e = counts.signatures["SingleCaptureDoubleReplacement A (B) C → D $1 E: " + pattern];
+                if (std::get<0>(e)++ == 0) {
+                    std::get<1>(e) = printRule(r);
+                    std::get<2>(e) = label;
+                }
+                counts.patternFiles[label]++;
+            }
             if (!insertion.empty()) {
                 counts.byDimension["simple insertion: captured text"][dir][classifyTextLength(captured)]++;
             }
@@ -1260,6 +1409,19 @@ static const EliminationTestCase ruleClassTestCases[] = {
     {"a → y @| ;", "1 | 0 | no captures | skip past result (@|)"},
 };
 
+static const EliminationTestCase multipleCaptureTestCases[] = {
+    {"a (b+) c → x $1 y ;", "1 (SingleCaptureDoubleReplacement) | captures variable | none"},
+    {"a (b) c (d) → x $1 $2 ;", "2 | captures fixed length | none"},
+    {"(b) [cd] (e+) f → $1 x $2 ;", "2 | captures variable | none"},
+    {"(b) (c) → $1 x $2 | y ;", "2 | captures fixed length | revisit part of result"},
+    {"(b) (c) → $2 $1 ;", ""},          // references out of order
+    {"(b) (c) → $1 ;", ""},             // not every capture referenced
+    {"(b) (c) → $1 $1 $2 ;", ""},       // a capture referenced twice
+    {"a+ (b) → $1 ;", ""},              // variable-length text outside the captures
+    {"(b) → &Any-Hex($1) ;", ""},       // a reference in a function call
+    {"a → x ;", ""},
+};
+
 static const EliminationTestCase insertionClassTestCases[] = {
     {"(a) → $1 x ;", "insert after"},
     {"(a) → x $1 ;", "insert before"},
@@ -1278,7 +1440,8 @@ static const EliminationTestCase insertionClassTestCases[] = {
 static void reportRuleClasses(const RuleClassCounts & counts) {
     std::cout << "Total: " << counts.rules << " conversion rules (forward and backward)\n";
     for (const char * dim : {"text to replace", "captures", "capture order", "revisiting",
-                             "simple insertion", "simple insertion: captured text"}) {
+                             "simple insertion", "simple insertion: captured text", "SingleCaptureDoubleReplacement A (B) C → D $1 E",
+                             "MultipleCaptureMultipleReplacement"}) {
         const auto it = counts.byDimension.find(dim);
         if (it == counts.byDimension.end()) continue;
         std::map<std::string, std::pair<unsigned, unsigned>> rows;
@@ -1300,6 +1463,10 @@ static void reportRuleClasses(const RuleClassCounts & counts) {
         std::cout << "  " << std::get<0>(s.second) << "\t" << s.first << "\n      e.g. " << std::get<1>(s.second)
                   << "\t" << std::get<2>(s.second) << "\n";
     }
+    std::cout << "\n== SingleCaptureDoubleReplacement A (B) C → D $1 E: rules by file\n";
+    for (const auto & f : counts.patternFiles) std::cout << "  " << f.second << "\t" << f.first << "\n";
+    std::cout << "\n== MultipleCaptureMultipleReplacement: rules by file\n";
+    for (const auto & f : counts.multipleFiles) std::cout << "  " << f.second << "\t" << f.first << "\n";
 }
 
 // The contexts of the first rule, for the regular expression engine
@@ -1477,6 +1644,16 @@ static int runSelfTest() {
             std::cerr << "FAIL: " << t.rules << "\n  " << e.what() << "\n";
         }
     }
+    for (const EliminationTestCase & t : unreferencedTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = RemoveUnreferencedCaptures(parseTransformRules({t.input}));
+            failures += !checkOutput("unreferenced", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
     for (const EliminationTestCase & t : trivialTestCases) {
         count++;
         try {
@@ -1512,6 +1689,20 @@ static int runSelfTest() {
         try {
             const std::vector<Rule *> rules = NullableCaptureElimination(parseTransformRules({t.input}));
             failures += !checkOutput("elimination", t.input, printRules(rules), t.expected);
+        } catch (const TransformRuleParseError & e) {
+            failures++;
+            std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
+        }
+    }
+    for (const EliminationTestCase & t : multipleCaptureTestCases) {
+        count++;
+        try {
+            const std::vector<Rule *> rules = parseTransformRules({t.input});
+            const std::string actual = classifyMultipleCaptureMultipleReplacement(llvm::cast<ConversionRule>(rules.back()));
+            if (actual != t.expected) {
+                failures++;
+                std::cerr << "FAIL (multiple capture class): " << t.input << "\n  expected: " << t.expected << "\n  actual:   " << actual << "\n";
+            }
         } catch (const TransformRuleParseError & e) {
             failures++;
             std::cerr << "FAIL: " << t.input << "\n  " << e.what() << "\n";
@@ -1583,8 +1774,7 @@ int main(int argc, char * argv[]) {
     bool xml = false;
     bool quiet = false;
     Extract e = Extract::All;
-    bool eliminate = false;
-    bool eliminateTrivial = false;
+    bool simplifyCaptures = true;
     bool exclusive = false;
     bool disambiguate = false;
     bool countTrivial = false;
@@ -1601,8 +1791,7 @@ int main(int argc, char * argv[]) {
         else if (arg == "--quiet") quiet = true;
         else if (arg == "--forward") e = Extract::Forward;
         else if (arg == "--backward") e = Extract::Backward;
-        else if (arg == "--eliminate-nullable-captures") eliminate = true;
-        else if (arg == "--eliminate-trivial-captures") eliminateTrivial = true;
+        else if (arg == "--disable-capture-simplification") simplifyCaptures = false;
         else if (arg == "--mutually-exclusive") exclusive = true;
         else if (arg == "--disambiguate-order") disambiguate = true;
         else if (arg == "--count-trivial-captures") countTrivial = true;
@@ -1615,7 +1804,7 @@ int main(int argc, char * argv[]) {
     }
     if (files.empty()) {
         std::cerr << "Usage: " << argv[0] << " [--xml] [--quiet] [--forward | --backward]\n"
-                  << "           [--eliminate-trivial-captures] [--eliminate-nullable-captures] [--mutually-exclusive]\n"
+                  << "           [--disable-capture-simplification] [--mutually-exclusive]\n"
                   << "           [--disambiguate-order] file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --overlaps file ...\n"
                   << "       " << argv[0] << " [--xml] [--quiet] --partition file ...\n"
@@ -1650,7 +1839,7 @@ int main(int argc, char * argv[]) {
             } else if (count) {
                 countNullableCaptures(tRules, f, total);
             } else {
-                ok &= processRules(tRules, f, quiet, e, eliminateTrivial, eliminate, exclusive, disambiguate);
+                ok &= processRules(tRules, f, quiet, e, simplifyCaptures, exclusive, disambiguate);
             }
         } catch (const TransformRuleParseErrors & e) {
             reportErrors(f, e);

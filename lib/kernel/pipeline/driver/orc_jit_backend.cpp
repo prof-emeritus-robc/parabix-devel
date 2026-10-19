@@ -856,7 +856,14 @@ private:
 
         Module * pendingObjectModule = nullptr;
 
-        if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
+        ParabixObjectCache::VerificationEntry verification;
+
+        if (LLVM_UNLIKELY(ObjectCache && Target->isCachable() && codegen::DebugOptionIsSet(codegen::VerifyCache)
+                          && Target->hasDeterministicCodeGeneration())) {
+            // Generate the kernel as if it were not cached; materializeObject links the cached
+            // object instead of compiling the module only if the IR matches the entry's.
+            verification = ObjectCache->loadCachedObjectFileForVerification(builder, Target);
+        } else if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
             std::unique_ptr<MemoryBuffer> cached;
             std::unique_ptr<Module> M;
             std::tie(cached, M) = ObjectCache->loadCachedObjectFile(builder, Target);
@@ -911,13 +918,14 @@ record_decl:
         // contexts, producing an invalid same-width "zext i8 to i8" that only a debug
         // build's IR verifier catches (a release build emits it unnoticed).
         if (pendingObjectModule) {
-            materializeObject(ctx, Target, pendingObjectModule);
+            materializeObject(ctx, Target, pendingObjectModule, std::move(verification));
         }
 
         return true;
     }
 
-    void materializeObject(CPUDriverContext & C, Kernel * Target, Module * TargetModule) {
+    void materializeObject(CPUDriverContext & C, Kernel * Target, Module * TargetModule,
+                           ParabixObjectCache::VerificationEntry && verification) {
 
         // We can't be sure that the context associated with the decl is the same
         // one that we acquired here. However since we cannot control the order of
@@ -967,6 +975,20 @@ record_decl:
 
 
         Target->generateKernel(builder, TM, GlobalValue::ExternalLinkage);
+
+        if (LLVM_UNLIKELY(verification.Object != nullptr)) {
+            // -VerifyCache: a mismatch is a fatal error; an entry without a hash is recompiled.
+            if (ObjectCache->verifyIRHash(Target, *M, verification)) {
+                delete M;
+                auto & linker = Engine->getObjLinkingLayer();
+                auto & JITLib = Engine->getMainJITDylib();
+                cantFail(linker.add(JITLib, std::move(verification.Object)));
+                return;
+            }
+        }
+        if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
+            ParabixObjectCache::recordIRHash(*M);
+        }
 
         Kernel::SelectedOptimizationPasses passes;
         Target->addOptimizationPasses(builder, passes);

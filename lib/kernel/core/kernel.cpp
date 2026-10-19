@@ -23,6 +23,9 @@
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <toolchain/toolchain.h>
 #include <kernel/illustrator/illustrator.h>
+#include <srchash/source_hash.h>
+#include <llvm/ADT/DenseMap.h>
+#include <mutex>
 
 using namespace llvm;
 using namespace boost;
@@ -209,11 +212,14 @@ std::unique_ptr<KernelCompiler> Kernel::instantiateKernelCompiler(KernelBuilder 
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief makeCacheName
+ *
+ * The source tag makes the name change whenever the source of a module that can shape this kernel's
+ * code changes, and only then.
  ** ------------------------------------------------------------------------------------------------------------- */
 std::string Kernel::makeCacheName(KernelBuilder & b) {
     std::string cacheName;
     raw_string_ostream out(cacheName);
-    out << getName() << '_' << b.getBuilderUniqueName();
+    out << getName() << '_' << b.getBuilderUniqueName() << '_' << getSourceTag();
 #if 0
     auto appendStreamSetType = [&](const char code, const Bindings & bindings) {
         for (const auto & binding : bindings) {
@@ -1802,6 +1808,33 @@ std::string Kernel::getFamilyName() const {
     recursivelyListFamilyKernels(out);
     out.flush();
     return tmp;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getSourceTag
+ ** ------------------------------------------------------------------------------------------------------------- */
+std::string Kernel::getSourceTag() const {
+    // The vtable of a kernel class is emitted in the image that defines the class (or, for
+    // a class without an out-of-line virtual function, in an image that links that one), so
+    // the image holding it has a source hash covering the kernel's module.  Tags are
+    // memoized per vtable.
+    const void * const vtable = *reinterpret_cast<const void * const *>(this);
+    static std::mutex lock;
+    static DenseMap<const void *, std::string> tags;
+    std::lock_guard<std::mutex> L(lock);
+    auto & tag = tags[vtable];
+    if (tag.empty()) {
+        std::string id = parabix::getImageSourceHash(vtable);
+        if (LLVM_UNLIKELY(id.empty())) {
+            // Built without a source hash: fall back to the linker's identity of the image.
+            id = "build-id:" + parabix::getImageBuildID(vtable);
+            if (LLVM_UNLIKELY(id.size() == 9)) {
+                id = "version:" PARABIX_VERSION;
+            }
+        }
+        tag = getStringHash(id).substr(0, 16);
+    }
+    return tag;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

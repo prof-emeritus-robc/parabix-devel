@@ -237,8 +237,8 @@ set(CMAKE_REQUIRED_FLAGS)
 # Define parabix version
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_VERSION='\"${Parabix_REVISION}\"'")
 
-# The object cache keys cached kernels by the linker build IDs of the running
-# executable and libraries (see lib/objcache/build_identity.cpp); make sure ELF
+# Kernels defined in an image without a registered source hash fall back to the
+# image's linker build ID (see lib/srchash/source_hash.cpp); make sure ELF
 # binaries always carry an NT_GNU_BUILD_ID note.  Mach-O binaries get LC_UUID by default.
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     add_link_options(-Wl,--build-id)
@@ -272,6 +272,7 @@ function(parabix_set_library_name NAME)
 endfunction(parabix_set_library_name)
 
 include(CMakeParseArguments)
+include(ParabixSourceHash)
 
 # Release & Debug flags
 
@@ -290,17 +291,26 @@ endif()
 function(parabix_add_module)
     cmake_parse_arguments(
         ARG             # resultant argument prefix
-        "USES_Z3;USES_CERNROOT;REQUIRES_RTTI"       # boolean args
+        "USES_Z3;USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH" # boolean args
         "NAME"          # mono-valued arguments:
                         #   NAME: target name
-        "SRC;DEPS"      # multi-valued arguments:
+        "SRC;DEPS;CODEGEN_DEPS" # multi-valued arguments:
                         #   SRC:  source file list
                         #   DEPS: target dependencies
+                        #   CODEGEN_DEPS: the DEPS whose code can run while this module's
+                        #       kernels are generated (see cmake/ParabixSourceHash.cmake)
         ${ARGN}         # arguments to parse
     )
     if(NOT ARG_NAME)
         message(FATAL_ERROR "parabix_add_module: A target name is required")
     endif()
+    # The public headers of lib/<path> are in include/<path>
+    file(RELATIVE_PATH MODULE_PATH ${PROJECT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR})
+    set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include/${MODULE_PATH})
+    if("CODEGEN_DEPS" IN_LIST ARGN)
+        set(SRCHASH_CODEGEN_ARGS CODEGEN_DEPS ${ARG_CODEGEN_DEPS})
+    endif()
+    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} ${SRCHASH_CODEGEN_ARGS} INCLUDE_DIR ${INCLUDE_DIR})
     if(ARTIFACT_MODE STREQUAL "Single")
         foreach(SRC ${ARG_SRC})
             target_sources(${PARABIX_MONO_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${SRC})
@@ -312,6 +322,9 @@ function(parabix_add_module)
             add_library(${ARG_NAME} SHARED ${ARG_SRC})
         endif()
         parabix_set_library_name(${ARG_NAME})
+        if(NOT ARG_NO_SOURCE_HASH)
+            parabix_srchash_attach(${ARG_NAME})
+        endif()
         target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
         if (ARG_REQUIRES_RTTI)
             target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
@@ -354,6 +367,8 @@ function(parabix_add_executable)
         message(FATAL_ERROR "parabix_add_executable: A target name is required")
     endif()
     add_executable(${ARG_NAME} ${ARG_SRC})
+    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} toolchain kernel.pipeline)
+    parabix_srchash_attach(${ARG_NAME})
     target_compile_options(${ARG_NAME} PRIVATE ${NO_RTTI})
     if(ARTIFACT_MODE STREQUAL "Single")
         target_link_libraries(${ARG_NAME} PUBLIC ${PARABIX_MONO_TARGET})
@@ -396,6 +411,7 @@ if(ARTIFACT_MODE STREQUAL "Single")
     else()
         add_library(${PARABIX_MONO_TARGET} SHARED "")
     endif()
+    parabix_srchash_attach(${PARABIX_MONO_TARGET})
 endif()
 
 # Framework Libraries
@@ -423,6 +439,7 @@ add_subdirectory(lib/re/printer)
 add_subdirectory(lib/re/toolchain)
 add_subdirectory(lib/re/transforms)
 add_subdirectory(lib/re/unicode)
+add_subdirectory(lib/srchash)
 add_subdirectory(lib/testing)
 add_subdirectory(lib/toolchain)
 add_subdirectory(lib/ucd/algo)
@@ -476,6 +493,9 @@ add_subdirectory(QA/unit-tests)
 if(ARTIFACT_MODE STREQUAL "Single")
     target_link_libraries(${PARABIX_MONO_TARGET} ${REQ_LLVM_LIBRARIES} ${Boost_LIBRARIES} ${Z3_LIBRARIES} ${LIBBACKTRACE_LIBRARIES})
 endif()
+
+# Source hashes need every target defined (see cmake/ParabixSourceHash.cmake)
+parabix_srchash_finalize()
 
 ###   Test Suite   ###
 
@@ -548,6 +568,11 @@ add_test(
   COMMAND python3 json_test.py "${BIN_DIR}/json")
 
 add_test(
+  NAME objcache_test
+  WORKING_DIRECTORY ${QA_DIR}/objcache
+  COMMAND python3 objcache_test.py "${BIN_DIR}")
+
+add_test(
   NAME csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
   COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")
@@ -585,6 +610,11 @@ add_custom_target (base64_test
 add_custom_target(gb18030_test
   WORKING_DIRECTORY ${QA_DIR}/gb18030
   COMMAND python3 gb18030_test.py "${BIN_DIR}/gb18030")
+
+# Also edits sources (restoring them) and rebuilds, checking which cached kernels are invalidated
+add_custom_target(objcache_test
+  WORKING_DIRECTORY ${QA_DIR}/objcache
+  COMMAND python3 objcache_test.py --build-dir "${PROJECT_BINARY_DIR}" "${BIN_DIR}")
 
 add_custom_target(nfd_test
   WORKING_DIRECTORY ${QA_DIR}/nfd

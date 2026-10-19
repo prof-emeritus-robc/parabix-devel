@@ -9,7 +9,6 @@
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/re_cc.h>
-#include <re/printer/re_printer.h>
 #include <re/alphabet/multiplex_CCs.h>
 #include <ucd/core/unicode_set.h>
 

@@ -1212,13 +1212,11 @@ void PipelineAnalysis::setStreamSetLockIds() {
 
 constexpr static unsigned MANAGED_BUFFER_INIT_POPULATION_SIZE = 15;
 
-constexpr static unsigned MANAGED_BUFFER_GA_MAX_INIT_TIME_SECONDS = 2;
-
 constexpr static unsigned MANAGED_BUFFER_POPULATION_SIZE = 30;
 
-constexpr static unsigned MANAGED_BUFFER_GA_MAX_TIME_SECONDS = 15;
-
 constexpr static unsigned MANAGED_BUFFER_GA_STALLS = 50;
+
+constexpr static unsigned MANAGED_BUFFER_GA_MAX_GENERATIONS = 10 * MANAGED_BUFFER_GA_STALLS;
 
 using ConflictGraph = adjacency_list<hash_setS, vecS, undirectedS>;
 
@@ -1336,9 +1334,8 @@ struct ManagedBufferOptimizer final : public PermutationBasedEvolutionaryAlgorit
                           , const ConflictGraph & I
                           , pipeline_random_engine & srcRng)
     : PermutationBasedEvolutionaryAlgorithm (numOfLocalStreamSets,
-                                             MANAGED_BUFFER_GA_MAX_INIT_TIME_SECONDS,
                                              MANAGED_BUFFER_INIT_POPULATION_SIZE,
-                                             MANAGED_BUFFER_GA_MAX_TIME_SECONDS,
+                                             MANAGED_BUFFER_GA_MAX_GENERATIONS,
                                              MANAGED_BUFFER_POPULATION_SIZE,
                                              MANAGED_BUFFER_GA_STALLS,
                                              std::max(codegen::SegmentThreads, codegen::TaskThreads),

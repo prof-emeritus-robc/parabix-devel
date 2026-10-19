@@ -7,9 +7,9 @@ parabix_add_module(
 NAME
     objcache
 SRC
-    build_identity.cpp
     object_cache.cpp
 DEPS
     kernel.core
+    srchash
     toolchain
 )

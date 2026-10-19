@@ -288,6 +288,17 @@ public:
 
     LLVM_READNONE std::string getFamilyName() const;
 
+    // A short hash of the source of every Parabix module whose code can shape the
+    // code generated for this kernel: the source hash of the image that defines the
+    // kernel's class (see srchash/source_hash.h), which covers that module and all
+    // the modules it depends on.  Kernels that compile calls to nested kernels fold
+    // in the tags of those kernels.
+    virtual std::string getSourceTag() const;
+
+    // Whether generating this kernel twice from the same source and options yields the same
+    // IR.  -VerifyCache compares cached kernels with freshly generated IR only when it does.
+    virtual bool hasDeterministicCodeGeneration() const { return true; }
+
     virtual bool isCachable() const { return true; }
 
     // Called by the PipelineBuilder when the kernel is added to a pipeline, after construction

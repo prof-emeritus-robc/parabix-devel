@@ -72,4 +72,23 @@ DEPS
     toolchain
     slaballocator
     kernel.illustrator
+# objcache never shapes generated code, but the pipeline compiler generates code
+# through kernel.core, which it otherwise reaches only by way of objcache.
+CODEGEN_DEPS
+    kernel.core
+    toolchain
+    slaballocator
+    kernel.illustrator
+)
+
+# The driver optimizes and compiles every kernel's module, so its source is part of every
+# kernel's cache key; the rest of kernel.pipeline (the pipeline builder and compiler) is
+# part only of the keys of pipeline kernels (see cmake/ParabixSourceHash.cmake).
+file(GLOB DRIVER_HEADERS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/include/kernel/pipeline/driver/*.h)
+parabix_srchash_add_codegen_inputs(kernel.pipeline/driver
+    driver/driver.cpp
+    driver/cpudriver.cpp
+    driver/mcjit_backend.cpp
+    driver/orc_jit_backend.cpp
+    ${DRIVER_HEADERS}
 )

@@ -12,7 +12,6 @@
 #include <re/alphabet/multiplex_CCs.h>
 #include <re/analysis/re_inspector.h>
 #include <re/parse/parser.h>
-#include <re/compile/re_compiler.h>
 #include <re/unicode/boundaries.h>
 #include <re/unicode/casing.h>
 #include <ucd/data/PropertyAliases.h>

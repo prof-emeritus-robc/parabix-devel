@@ -27,4 +27,9 @@ DEPS
     kernel.basis
     kernel.bitwise
     kernel.scan
+# The other kernel modules are linked only to build pipelines from their kernels;
+# InsertionSpreadMaskKernel derives from kernel.scan's TwoLevelScanKernel.
+CODEGEN_DEPS
+    pablo.bixnum
+    kernel.scan
 )

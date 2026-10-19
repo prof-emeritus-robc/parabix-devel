@@ -8,8 +8,6 @@
 #include <re/alphabet/multiplex_CCs.h>
 #include <re/analysis/cc_sequence_search.h>
 #include <re/analysis/validation.h>
-#include <re/transforms/remove_nullable.h>
-#include <re/transforms/to_utf8.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/utf/utf_encoder.h>
 #include <ucd/data/PropertyObjectTable.h>

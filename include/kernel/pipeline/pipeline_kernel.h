@@ -111,6 +111,8 @@ public:
         return mSignature;
     }
 
+    std::string getSourceTag() const final;
+
     const Kernels & getKernels() const {
         return mKernels;
     }

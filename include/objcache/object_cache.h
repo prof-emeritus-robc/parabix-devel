@@ -55,6 +55,30 @@ public:
 
     LoadResult loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept;
 
+    // -VerifyCache: on a cache hit the driver regenerates the kernel's IR anyway and
+    // compares a hash of it with the one recorded in the .kernel file when the entry
+    // was written.  The entry is read in a private LLVMContext, so that none of its
+    // types (in particular the kernel's state types, which declareStateTypes would
+    // otherwise find by name and reuse) leak into the regenerated IR.
+    struct VerificationEntry {
+        std::unique_ptr<llvm::MemoryBuffer> Object; // null if there is no usable entry
+        std::string IRHash;                         // empty if the entry records none
+        std::string WrittenBy;                      // PARABIX_VERSION of the writer
+        std::string FileName;
+    };
+
+    VerificationEntry loadCachedObjectFileForVerification(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept;
+
+    // Records the hash of the IR just generated for a kernel in M (before any
+    // optimization), so that saveCachedObjectFile stores it in the .kernel file.
+    static void recordIRHash(llvm::Module & M);
+
+    // Compares the hash of M, the IR just regenerated for KERNEL, with ENTRY's.
+    // Returns true if they match, false if ENTRY records no hash (the kernel must
+    // then be compiled anew); a mismatch is a fatal error explaining how to find
+    // the dependency missing from the kernel's cache key.
+    bool verifyIRHash(const kernel::Kernel * kernel, const llvm::Module & M, const VerificationEntry & entry);
+
     void saveCachedObjectFile(const llvm::Module & M, llvm::MemoryBufferRef Obj) noexcept;
 
 protected:
@@ -64,6 +88,7 @@ protected:
     void saveCacheSettings() noexcept;
 
 private:
+    LoadResult lookupCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel, llvm::LLVMContext & C) noexcept;
     void initiateCacheCleanUp() noexcept;
     bool requiresCacheCleanUp() noexcept;
     bool cachejanitordAppearsAlive() noexcept;

@@ -14,7 +14,6 @@
 #include <re/adt/re_cc.h>
 #include <ucd/core/unicode_set.h>
 #include <toolchain/toolchain.h>
-#include <re/printer/re_printer.h>
 #include <llvm/Support/CommandLine.h>
 #include <boost/intrusive/detail/math.hpp>
 

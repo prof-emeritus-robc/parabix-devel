@@ -121,18 +121,17 @@ private:
 
 protected:
 
+    // threadCount only sets how many threads evaluate candidates: the result does not depend on it.
     PermutationBasedEvolutionaryAlgorithm(CandidateLengthType candidateLength
-                                         , const unsigned maxInitTime
                                          , const unsigned maxInitCandidates
-                                         , const unsigned maxRunTime
+                                         , const unsigned maxGenerations
                                          , const unsigned maxCandidates
                                          , const unsigned maxStallRounds
                                          , const unsigned threadCount
                                          , pipeline_random_engine & rng)
     : candidateLength(candidateLength)
-    , MaxInitTime(maxInitTime)
     , MaxInitCandidates(maxInitCandidates)
-    , MaxRunTime(maxRunTime)
+    , maxGenerations(maxGenerations)
     , maxCandidates(maxCandidates)
     , averageStallThreshold(3)
     , maxStallThreshold(3)
@@ -147,9 +146,8 @@ protected:
 
 
     const CandidateLengthType candidateLength;
-    const unsigned MaxInitTime;
     const unsigned MaxInitCandidates;
-    const unsigned MaxRunTime;
+    const unsigned maxGenerations;
     const unsigned maxCandidates;
 
     const FitnessValueType averageStallThreshold;

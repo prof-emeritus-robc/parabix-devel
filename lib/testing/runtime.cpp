@@ -24,12 +24,22 @@ cl::OptionCategory * testFlags() {
 static cl::opt<bool, true> SuppressCLIOutputOption("suppress-output", cl::location(SuppressCLIOutput), cl::init(false),
     cl::desc("Don't display any text to stdout"), cl::cat(testingFlags));
 
+bool ExtendedTesting;
+
+static cl::opt<bool, true> ExtendedTestingOption("extended-testing", cl::location(ExtendedTesting), cl::init(false),
+    cl::desc("Also run the test cases marked as extended"), cl::cat(testingFlags));
+
 }
 
 int32_t RunTestSuite(InvocationList list) {
     bool allTestsPassed = true;
     int failCount = 0;
+    int runCount = 0;
     for (auto const & elem : list) {
+        if (std::get<2>(elem) && !cli::ExtendedTesting) {
+            continue;
+        }
+        runCount++;
         if (!cli::SuppressCLIOutput) {
             llvm::outs() << " test " << std::get<0>(elem) << "... ";
         }
@@ -55,7 +65,7 @@ int32_t RunTestSuite(InvocationList list) {
         } else {
             llvm::outs().changeColor(llvm::outs().RED) << " failed ";
             llvm::outs().resetColor();
-            llvm::outs() << failCount << "/" << list.size() << " tests\n";
+            llvm::outs() << failCount << "/" << runCount << " tests\n";
         }
     }
     return allTestsPassed ? 0 : 1;

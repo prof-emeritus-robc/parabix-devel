@@ -5,9 +5,11 @@
 #
 # Compares the output of provisional_lookahead with and without -ProvisionalLookAheadStride over
 # random inputs whose lengths fall around block and segment boundaries, and checks both against
-# a reference computed here.
+# a reference computed here.  By default, a small set of cases (one lookahead chain, a few
+# lengths and segment sizes) completes in under a second; --extended-testing runs all the
+# combinations of the lookahead chains, inversion, lengths and segment sizes below.
 #
-# usage: provisional_lookahead_test.py <path to provisional_lookahead> [-v]
+# usage: provisional_lookahead_test.py <path to provisional_lookahead> [--extended-testing] [-v]
 
 import os
 import random
@@ -20,6 +22,14 @@ SEGMENT_SIZES = [None, "1", "2", "3"]
 INVERT = [False, True]
 LENGTHS = sorted({0, 1, 2, 63, 64, 65, 127, 128, 129, 255, 256, 257, 383, 511, 512, 513,
                   761, 777, 1892, 10253, 33023, 100003})
+
+# The default cases: a chain with a short lookahead and one across blocks, the empty input, a
+# length just past a block boundary and one of several blocks and segments, and the default
+# segment size and segments of one stride.
+QUICK_LOOKAHEAD_CHAINS = ["2,200"]
+QUICK_SEGMENT_SIZES = [None, "1"]
+QUICK_INVERT = [False]
+QUICK_LENGTHS = [0, 257, 10253]
 
 
 def reference(data, chain, invert):
@@ -73,22 +83,26 @@ def main():
         return 2
     exe = sys.argv[1]
     verbose = "-v" in sys.argv[2:]
+    if "--extended-testing" in sys.argv[2:]:
+        chains, segment_sizes, inverts, lengths = LOOKAHEAD_CHAINS, SEGMENT_SIZES, INVERT, LENGTHS
+    else:
+        chains, segment_sizes, inverts, lengths = QUICK_LOOKAHEAD_CHAINS, QUICK_SEGMENT_SIZES, QUICK_INVERT, QUICK_LENGTHS
     rng = random.Random(20261007)
     failures = 0
     cases = 0
     with tempfile.TemporaryDirectory() as tmp:
         files = []
-        for n in LENGTHS:
+        for n in lengths:
             path = os.path.join(tmp, "in%d.bin" % n)
             data = bytes(rng.getrandbits(8) for _ in range(n))
             with open(path, "wb") as f:
                 f.write(data)
             files.append((path, data))
-        for chain in LOOKAHEAD_CHAINS:
-            for invert in INVERT:
+        for chain in chains:
+            for invert in inverts:
                 for path, data in files:
                     expected = reference(data, chain, invert)
-                    for seg in SEGMENT_SIZES:
+                    for seg in segment_sizes:
                         cases += 1
                         rc0, out0, err0, cmd0 = run(exe, path, chain, seg, invert, False)
                         rc1, out1, err1, cmd1 = run(exe, path, chain, seg, invert, True)

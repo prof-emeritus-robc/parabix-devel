@@ -563,6 +563,11 @@ add_test(
   COMMAND python3 json_test.py "${BIN_DIR}/json")
 
 add_test(
+  NAME objcache_test
+  WORKING_DIRECTORY ${QA_DIR}/objcache
+  COMMAND python3 objcache_test.py "${BIN_DIR}")
+
+add_test(
   NAME csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
   COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")
@@ -600,6 +605,11 @@ add_custom_target (base64_test
 add_custom_target(gb18030_test
   WORKING_DIRECTORY ${QA_DIR}/gb18030
   COMMAND python3 gb18030_test.py "${BIN_DIR}/gb18030")
+
+# Also edits sources (restoring them) and rebuilds, checking which cached kernels are invalidated
+add_custom_target(objcache_test
+  WORKING_DIRECTORY ${QA_DIR}/objcache
+  COMMAND python3 objcache_test.py --build-dir "${PROJECT_BINARY_DIR}" "${BIN_DIR}")
 
 add_custom_target(nfd_test
   WORKING_DIRECTORY ${QA_DIR}/nfd

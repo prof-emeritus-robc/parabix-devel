@@ -74,11 +74,17 @@ return fd;
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
 
+uint8_t * (*kernel::CircularBufferAllocator)(size_t, size_t) = nullptr;
+
 extern "C"
 uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
 
     assert (size > 0);
     assert ((size % CBuilder::PAGE_SIZE) == 0);
+
+    if (kernel::CircularBufferAllocator) {
+        return kernel::CircularBufferAllocator(size, hasUnderflow);
+    }
 
     const auto memfd = create_memfd();
     if (memfd == -1) {

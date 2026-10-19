@@ -77,6 +77,12 @@ protected:
 // (exposed) output streamset may still point a caller at it after the pipeline
 // call returns -- but is freed at the start of the next initialization, if any,
 // so repeated calls to the same compiled pipeline don't leak.
+// Opt-in hook, false by default: give MemorySourceKernel's buffer a capacity of fileItems
+// rounded up to a whole block (the copy is padded that far). With a capacity of exactly
+// fileItems, a final segment of 1..BlockWidth-1 items is addressed modulo the capacity and
+// read from block 0 instead. Read when a MemorySourceKernel is constructed; tags its name.
+extern bool MemorySourceBlockCapacity;
+
 class MemorySourceKernel final : public SegmentOrientedKernel {
 public:
     MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fileSource, Scalar * fileItems, StreamSet * const outputStream);
@@ -87,6 +93,7 @@ protected:
 private:
     const unsigned mCodeUnitWidth;
     const unsigned mNumElements;
+    const bool mBlockCapacity;
 };
 
 }

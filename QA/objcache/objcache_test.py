@@ -7,12 +7,16 @@
 # on (see cmake/ParabixSourceHash.cmake and Kernel::getSourceTag).  Each tool
 # runs with --trace-object-cache against a fresh cache directory.
 #
-# Quick checks (always run; base64 only, so that ctest stays under a second):
+# Quick checks (always run; base64 and a small hexlines input, so that ctest
+# stays fast):
 #   - a first run compiles and writes every kernel; a second run, with
 #     -VerifyCache, reads every kernel back from the cache and verifies that it
 #     matches the IR generated for it now;
 #   - every kernel's tag comes from a registered source hash, and the cache
-#     name of every kernel ends with that tag.
+#     name of every kernel ends with that tag;
+#   - a pipeline compiled around kernels read from the cache sees their full
+#     state (hexlines, three threads), so that stateful kernels are not run
+#     data parallel.
 #
 # Full checks (--full, or --build-dir): the quick checks for icgrep as well,
 # which takes many seconds to compile from an empty cache.
@@ -36,6 +40,7 @@
 
 import argparse
 import os
+import random
 import re
 import shlex
 import signal
@@ -196,6 +201,32 @@ def quick_checks(args, tools, failures):
             print('%s: %d kernels written, then read back and verified' % (tool.name, len(first)))
 
 
+def cached_kernel_state_check(args, failures, work_dir):
+    """A pipeline compiled around kernels read from the cache must see their full state.
+
+    hexlines populates an empty cache; hexlines -EnableCycleCounter then compiles a new
+    pipeline that reads those kernels back.  Kernels with carries (e.g., Hexify) must not
+    be treated as state free there, or multithreaded runs corrupt their carries."""
+    hexlines = os.path.join(args.bin_dir, 'hexlines')
+    if not os.path.exists(hexlines):
+        return
+    rng = random.Random(1)
+    data = b'\n'.join(bytes(rng.choice(b'abcdefXYZ0189 ') for _ in range(rng.randrange(120)))
+                       for _ in range(5000))
+    path = os.path.join(work_dir, 'hexlines_input.txt')
+    with open(path, 'wb') as f:
+        f.write(data)
+    expected = '\n'.join(' '.join('%02X' % c for c in line) for line in data.split(b'\n')).encode()
+    with tempfile.TemporaryDirectory(prefix='objcache-') as cache_dir:
+        cmd = [hexlines, '--object-cache-dir=' + cache_dir] + shlex.split(args.flags)
+        subprocess.run(cmd + [path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=600)
+        result = subprocess.run(cmd + ['-EnableCycleCounter', '--thread-num=3', path],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=600)
+        failures.check(result.returncode == 0 and result.stdout == expected,
+                       'hexlines: pipeline compiled around cached kernels produced wrong output')
+    print('hexlines: pipeline compiled around cached kernels checked')
+
+
 def image_modules(build_dir, image):
     """The Parabix modules the image named IMAGE depends on, from build/srchash/<target>.inputs."""
     target = image
@@ -282,6 +313,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='objcache-input-') as work_dir:
         tools = make_tools(args, work_dir)
         quick_checks(args, tools, failures)
+        cached_kernel_state_check(args, failures, work_dir)
         if args.build_dir:
             rebuild_checks(args, tools, failures)
     if failures.messages:

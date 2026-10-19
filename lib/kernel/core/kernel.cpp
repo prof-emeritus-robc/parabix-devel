@@ -64,6 +64,7 @@ const static auto PAPI_INITIALIZE_EVENTSET = "_PAPIInitializeEventSet";
 const static auto SHARED_SUFFIX = "_shared_state";
 const static auto THREAD_LOCAL_SUFFIX = "_thread_local";
 constexpr static auto STATE_TYPE_METADATA_SUFFIX = "_state_types";
+constexpr static auto INTERNAL_SCALARS_METADATA_SUFFIX = "_internal_scalars";
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
@@ -309,6 +310,34 @@ void Kernel::loadCachedKernel(const Module * m) {
     mThreadLocalStateType = nullIfEmpty(cast<StructType>(tlType));
     assert (mThreadLocalStateType == nullptr ||
             (!mThreadLocalStateType->isOpaque() && &mThreadLocalStateType->getContext() == &m->getContext()));
+
+    // Restore the internal scalar list recorded by constructStateTypes. Scalars added
+    // during code generation (which a cached kernel skips) would otherwise be missing.
+    auto scalarMetadata = m->getNamedMetadata(getName() + INTERNAL_SCALARS_METADATA_SUFFIX);
+    if (LLVM_LIKELY(scalarMetadata != nullptr)) {
+        InternalScalars restored;
+        restored.reserve(scalarMetadata->getNumOperands());
+        auto getInt = [](const MDNode * node, const unsigned i) {
+            return (unsigned)cast<ConstantInt>(cast<ConstantAsMetadata>(node->getOperand(i))->getValue())->getZExtValue();
+        };
+        for (const MDNode * node : scalarMetadata->operands()) {
+            assert (node->getNumOperands() == 5);
+            const auto name = cast<MDString>(node->getOperand(0))->getString();
+            const auto scalarType = static_cast<ScalarType>(getInt(node, 1));
+            const auto rule = static_cast<ThreadLocalScalarAccumulationRule>(getInt(node, 3));
+            Type * const type = cast<ConstantAsMetadata>(node->getOperand(4))->getType();
+            restored.emplace_back(scalarType, type, name, getInt(node, 2), rule);
+        }
+        // Keep any scalar that was not recorded (e.g., one without a first-class type).
+        for (const InternalScalar & scalar : mInternalScalars) {
+            const auto f = std::find_if(restored.begin(), restored.end(),
+                                        [&](const InternalScalar & r) { return r.getName() == scalar.getName(); });
+            if (LLVM_UNLIKELY(f == restored.end())) {
+                restored.push_back(scalar);
+            }
+        }
+        mInternalScalars = std::move(restored);
+    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -703,6 +732,24 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
         stateTypes[0] = makeTypeMetadata(sharedStateType, strShared);
         stateTypes[1] = makeTypeMetadata(threadLocalStateType, strThreadLocal);
         structTypeMetadata->addOperand(MDNode::get(m->getContext(), stateTypes));
+
+        // Record the internal scalars, including any added during code generation (e.g.,
+        // Pablo carries), so that loadCachedKernel can restore the complete list.
+        SmallVector<char, 256> tmpScalars;
+        auto strScalars = concat(getName(), INTERNAL_SCALARS_METADATA_SUFFIX, tmpScalars);
+        NamedMDNode * const scalarMetadata = m->getOrInsertNamedMetadata(strScalars);
+        IntegerType * const int32Ty = b.getInt32Ty();
+        for (const InternalScalar & scalar : mInternalScalars) {
+            Type * const type = CBuilder::convertTypeToLLVMContext(C, scalar.getValueType());
+            if (LLVM_UNLIKELY(!type->isFirstClassType())) continue;
+            FixedArray<Metadata *, 5> fields;
+            fields[0] = MDString::get(C, scalar.getName());
+            fields[1] = ConstantAsMetadata::get(ConstantInt::get(int32Ty, (unsigned)scalar.getScalarType()));
+            fields[2] = ConstantAsMetadata::get(ConstantInt::get(int32Ty, scalar.getGroup()));
+            fields[3] = ConstantAsMetadata::get(ConstantInt::get(int32Ty, (unsigned)scalar.getAccumulationRule()));
+            fields[4] = ConstantAsMetadata::get(Constant::getNullValue(type));
+            scalarMetadata->addOperand(MDNode::get(C, fields));
+        }
     }
     assert (structTypeMetadata->getNumOperands() == 1);
 
@@ -1926,9 +1973,8 @@ bool Kernel::hasPersistentMutableState() const {
         if (name.ends_with(BUFFER_HANDLE_SUFFIX) && scalar.getValueType()->isPointerTy()) continue;
         return true;
     }
-    // A kernel restored from the object cache may have a shared state type with fields
-    // (e.g., Pablo carries) that were never registered as internal scalars, since the
-    // analysis that adds them is skipped. The flattened layout is [pad, field, ..., pad].
+    // As a safeguard, treat any shared state field not described by an internal scalar
+    // as state. The flattened layout is [pad, field, ..., pad].
     if (mSharedStateType) {
         const auto n = mSharedStateType->getStructNumElements();
         assert ((n % 2) == 1);

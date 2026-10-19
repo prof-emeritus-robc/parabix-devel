@@ -249,9 +249,12 @@ bool PipelineCommonGraphFunctions::isKernelStateFree(KernelBuilder & b, const si
         const ProcessingRate & r = b.getRate();
         switch (r.getKind()) {
             case ProcessingRate::KindId::Fixed:
-//            case ProcessingRate::KindId::PartialSum:
-//            case ProcessingRate::KindId::Greedy:
                 break;
+            // The item count of a PartialSum input is known before invocation (see
+            // updateProcessedAndProducedItemCounts), so it does not serialize execution.
+            case ProcessingRate::KindId::PartialSum:
+                break;
+//            case ProcessingRate::KindId::Greedy:
             default:
                 return false;
         }

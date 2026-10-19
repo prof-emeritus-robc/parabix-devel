@@ -50,6 +50,9 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <atomic>
+#include <memory>
+#include <queue>
 #include <array>
 #include <iomanip>
 #include <tuple>
@@ -65,10 +68,19 @@
 #include <re/adt/re_cc.h>
 #include <ucd/core/unicode_set.h>
 #include <kernel/pipeline/program_builder.h>
+#include <kernel/core/kernel_builder.h>        // BPEStuckKernel (--retire-stuck)
+#include <kernel/basis/p2s_kernel.h>
+#include <llvm/IR/Module.h>
 #include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/pdep_kernel.h>    // SpreadByMask (--retire-words)
 #include <kernel/streamutils/stream_shift.h>   // IndexedShiftBack (BPE_INDEXED_SHIFT)
 #include <stdexcept>
 #include <boost/intrusive/detail/math.hpp>
+#include <kernel/core/streamset.h>               // CircularBufferAllocator (--vm-ring-buffers)
+#include <kernel/io/source_kernel.h>              // MemorySourceBlockCapacity (--memsource-block-capacity)
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 using boost::intrusive::detail::ceil_log2;
 
 using namespace llvm;
@@ -413,6 +425,131 @@ static cl::opt<bool> SkipInstCombine(
     cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
     cl::init(false));
 
+// Merge kernel gate codegen. The skip path of a grouped gate (the code run on every block
+// the gate does not enter, ~95% of them) measured ~18 AArch64 instructions on a cached
+// best-config kernel: 6 ANDs, 6 for the test, 5 spill loads/stores. The two flags below
+// attack the test and the spills through PabloKernel hooks that are off by default.
+// Measured on val_4MB (bit-tier config, M3, 3 interleaved rounds, bench min, 2026-10-15):
+// --if-reduce-test -7.3%, --if-unlikely-weight=32 alone -5.9%, both -9.2%; compare_bpe MATCH.
+//
+// --if-reduce-test (PabloKernel::reduceIfTest): test each gate with a max-reduce over its
+// 32-bit lanes. AArch64: umaxv, fmov, cbz instead of cmeq, bic (a {1,2} constant kept
+// live in a register), addp, fmov, tst, b.eq. Meant for ARM; x86 bitblock_any is already
+// short. Cache tag rt1_.
+static cl::opt<bool> IfReduceTest(
+    "if-reduce-test",
+    cl::desc("BPE merge kernels: test each if condition with a max-reduce (shorter on AArch64)."),
+    cl::init(false));
+
+// --if-unlikely-weight=N (PabloKernel::ifBodyUnlikelyWeight): give every if of a grouped
+// merge kernel branch_weights 1:N. Gates are entered on ~5% of blocks, but without weights
+// LLVM treats each body as half the time hot, keeps body-only values in registers and
+// spills the skip path instead. Grouped kernels only: the flat early kernels gate on common
+// ids. 0 = off. Cache tag uwN_.
+static cl::opt<unsigned> IfUnlikelyWeight(
+    "if-unlikely-weight",
+    cl::desc("Grouped BPE merge kernels: mark if bodies unlikely with branch weights 1:N "
+             "(0 = off, the default)."),
+    cl::init(0));
+
+// --retire-words: at every FilterByMask point, also drop the finished words from the
+// stream. In the compacted frame every position is a live token start, so a token that
+// starts a word and is followed by another word start is a whole word. BPE never merges
+// across words, so no later kernel can change it. Late kernels then scan about half the
+// positions (model, bit-tier config on the 1 MiB sample: 1.59x fewer positions, -39%
+// cycle-weighted merge work). The retired ids go back in order before emission:
+// SpreadByMask(keep) plus an OR of the retired ids at each point, then
+// SpreadByMask(inPlayMask) between points, so the emitter scans the frame of the first
+// retiring point. Dropping a word can make X tokens of two different words adjacent, so
+// self-merge runs also break at word starts under this flag. Needs --compaction and a
+// pretokenizer. Cache tag rw1_.
+// Measured (bit-tier + --if-reduce-test --if-unlikely-weight=32, M3, 2026-10-15): bench_bpe
+// val_4MB 201 -> 167 ms (-17%, 3 interleaved rounds), -20% at 1 thread; cold compile +3 s
+// (19 -> 22 s); compare_bpe MATCH on every tokenizer_files input up to val.txt (50 MB).
+static cl::opt<bool> RetireWords(
+    "retire-words",
+    cl::desc("BPE: drop finished single-token words from the stream at each compaction "
+             "point (needs --compaction and a pretokenizer)."),
+    cl::init(false));
+
+// --retire-points=i,j,...: with --retire-words, retire only at these FilterByMask points
+// (1 = the first). Empty = every point. A point saves (words it retires) x (kernels after
+// it); points that retire few words late cost more than they save.
+static cl::list<unsigned> RetirePoints(
+    "retire-points", cl::CommaSeparated,
+    cl::desc("With --retire-words: the compaction points (1-based) that retire words; "
+             "default all."));
+
+// --retire-frozen (with --retire-words): also retire frozen tokens, whose id no rule of a
+// later kernel uses as its left or right part, so they can never merge again. GPT-2 has no
+// rule with NUL (id 188) at all, so every NUL of a tar stream is frozen from the start. The
+// token after a dropped frozen token gets a boundary bit (a barrier), so the merge kernels
+// never join its neighbours, and one-token segments between barriers retire too. Model,
+// bit-tier on the 1 MiB sample: 2.95x fewer merge positions (-68% cycle-weighted) vs 1.59x
+// (-38%) for single-token words alone. Cache tag: the frozen set's hash in BPE_Retire.
+static cl::opt<bool> RetireFrozen(
+    "retire-frozen",
+    cl::desc("With --retire-words: also retire tokens no later rule can merge."),
+    cl::init(false));
+
+// --retire-stuck=N (with --retire-words): from compaction point N on (1-based), retire every
+// segment that can never change again: no adjacent pair (a, b) in it is a rule of a later
+// kernel. BPE only ever merges an adjacent pair that is a rule, so such a segment is final.
+// Segments run between word starts, barriers and frozen tokens; frozen tokens retire as
+// under --retire-frozen. A pair test is too big for bit-parallel code, so it is scalar: at
+// each such point BPEStuckKernel hands the Fp blocks to bpe_retire_stuck (C++), which looks
+// the pairs up in a bloom filter of the remaining rules and the ids in a frozen-id bitmap. It
+// replaces BPEFrozenKernel and BPERetireKernel there. Model (firesim/retire_more.py, LF 1 MiB
+// sample): from point 5 on, 18.6% less cycle-weighted merge work than --retire-frozen, for a
+// scan of 0.2 tokens per input byte. Measured (M3, 3 interleaved rounds, bench_bpe):
+// --retire-stuck=5 val_4MB 117.4 -> 109.9 ms (-6.4%), webtext_cases 241 -> 221 ms (-8.3%);
+// earlier points cost more scanning than they save. 0 = off. Cache tag: the tables' hash
+// in BPE_Stuck16.
+static cl::opt<unsigned> RetireStuck(
+    "retire-stuck",
+    cl::desc("With --retire-words: from compaction point N on (1-based), also retire segments "
+             "in which no adjacent pair is a later rule (0 = off, the default)."),
+    cl::init(0));
+
+// --bpe-tail=P (needs a pretokenizer and --compaction): stop the merge kernels at
+// compaction point P (1-based) and finish BPE in the emitter. From there each segment
+// (between word starts and retirement barriers) gets the standard algorithm: merge its
+// lowest-ranked adjacent pair among the rules of the kernels not built, until none is
+// left. The bit-parallel kernels apply the early, frequent merges to the dense stream;
+// the late tiers rarely fire on a short residue, which a scalar loop handles far more
+// cheaply than ~200 kernels that each scan every live position. Same output: the rules of
+// the kernels run can no longer apply (their parts are all built by then), so what is left
+// is plain rank-order BPE on the remaining rules. The emitter's scan runs in order on one
+// thread, so a segment can span pipeline calls. 0 = off. Cache tag: "_t" on the merge-back
+// kernels, which carry an 18th stream, the segment starts.
+static cl::opt<unsigned> BPETail(
+    "bpe-tail",
+    cl::desc("Stop the merge kernels at compaction point P (1-based) and finish BPE per "
+             "segment in the emitter (0 = off, the default)."),
+    cl::init(0));
+
+// --vm-ring-buffers (macOS): build the pipeline's circular buffers with mach vm_remap
+// (kernel::CircularBufferAllocator) instead of the framework's memfd mapping, which on macOS
+// is a temp file in /tmp: mkstemp + unlink + ftruncate per buffer on every pipeline run,
+// ~9% of a 1-thread run, all of it before the worker threads start. Runtime only (the
+// kernels' code is the same), so no cache tag. No effect elsewhere.
+static cl::opt<bool> VMRingBuffers(
+    "vm-ring-buffers",
+    cl::desc("macOS: build circular buffers with vm_remap instead of a temp file (default off)."),
+    cl::init(false));
+
+// --memsource-block-capacity: the in-memory source's buffer capacity is the input length
+// rounded up to a whole block (kernel::MemorySourceBlockCapacity). Without it, an input whose
+// last segment has 1..127 bytes (length % --segment-size in 1..127, at least 4 segments in)
+// gets its final partial block read from block 0: the last tokens are made from the
+// file's first bytes (found as bug 6: long.txt at --segment-size=4096; 70 * 16384 + 38 bytes
+// fails at the default size). Cache tag "+bc" on the source kernel.
+static cl::opt<bool> MemSourceBlockCapacity(
+    "memsource-block-capacity",
+    cl::desc("Round the in-memory source's buffer capacity up to a whole block (fixes wrong "
+             "last tokens when the last segment is under one block; default off)."),
+    cl::init(false));
+
 // --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
 // bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
 // input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
@@ -713,6 +850,744 @@ protected:
     }
 };
 
+// --retire-words kernels. The merge-back carries each frame's tokens as one 17-stream
+// set: the 16 id bits plus bit 16, the token-start mask the emitter scans. Under --bpe-tail
+// an 18th stream (bit 17) marks the segment starts for the emitter's BPE; every retired
+// token is final, so it is one by itself.
+static constexpr unsigned kRetireStreams = 17;
+static constexpr unsigned kTailStreams = 18;
+
+// A retirement point works in two frames: the one before the point's FilterByMask (Fp:
+// live token starts marked by inPlayMask, consumed positions in between) and the compacted
+// one (Fc: every position a live token start). Only the 1-bit streams visit Fc. The ids
+// are filtered once, from Fp, by the combined mask, and the merge-back reads the retired
+// ids straight from Fp.
+
+// --retire-frozen, in Fp: frozen = live token starts whose id no later rule uses as a part,
+// so they can never merge again. segStarts = word starts plus the live start right after
+// each frozen token (the barrier), found forward through the consumed positions in between.
+// testSet / negate: the frozen ids, or (negate) their complement when it has fewer intervals.
+class BPEFrozenKernel : public PabloKernel {
+public:
+    BPEFrozenKernel(LLVMTypeSystemInterface & ts, StreamSet * idIn, StreamSet * liveIn,
+                    StreamSet * boundaryIn, const UCD::UnicodeSet & testSet, bool negate,
+                    uint64_t setHash, StreamSet * frozen, StreamSet * segStarts)
+    : PabloKernel(ts, "BPE_Frozen" + std::to_string(setHash) + (negate ? "n" : "")
+                        + "_w" + std::to_string(idIn->getNumElements()),
+                  {Binding{"idIn", idIn}, Binding{"liveIn", liveIn}, Binding{"boundaryIn", boundaryIn}},
+                  {Binding{"frozen", frozen}, Binding{"segStarts", segStarts}}),
+      mTestSet(testSet), mNegate(negate) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> idBits = getInputStreamSet("idIn");
+        PabloAST * const live = getInputStreamSet("liveIn")[0];
+        cc::Parabix_CC_Compiler ccc(idBits);
+        PabloAST * inSet = ccc.compileCC("retireSet", re::makeCC(UCD::UnicodeSet(mTestSet)), pb);
+        PabloAST * fz = pb.createInFile(pb.createAnd(live, mNegate ? pb.createNot(inSet) : inSet), "frozen");
+        PabloAST * afterFrozen = pb.createAnd(pb.createMatchStar(pb.createAdvance(fz, (int64_t) 1),
+                                                                 pb.createNot(live)), live);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("frozen"), pb.getInteger(0)), fz);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("segStarts"), pb.getInteger(0)),
+                        pb.createOr(getInputStreamSet("boundaryIn")[0], afterFrozen));
+    }
+private:
+    const UCD::UnicodeSet mTestSet;
+    const bool mNegate;
+};
+
+// In Fc: finished = the token starts a segment and so does the next one, i.e. it is a whole
+// segment. A segment is a word, cut further under --retire-frozen: a frozen token is
+// finished too, and the token after it starts a segment. (That barrier also goes into the
+// boundary stream of the kept frame, from BPEFrozenKernel's segStarts, so the merge kernels
+// never join the tokens on both sides of a dropped frozen token.) keep = the rest of the
+// file. Past the last token the lookahead reads 0, so the last segment is never retired
+// unless frozen.
+class BPERetireKernel : public PabloKernel {
+public:
+    BPERetireKernel(LLVMTypeSystemInterface & ts, StreamSet * boundaryIn, StreamSet * frozenIn,
+                    StreamSet * keep)
+    : PabloKernel(ts, std::string("BPE_Retire") + (frozenIn ? "_f" : ""),
+                  frozenIn ? std::vector<Binding>{Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(1)},
+                                                  Binding{"frozenIn", frozenIn}}
+                           : std::vector<Binding>{Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(1)}},
+                  {Binding{"keep", keep}}),
+      mHasFrozen(frozenIn != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const wordStart = getInputStreamSet("boundaryIn")[0];
+        PabloAST * segStart = wordStart;
+        PabloAST * frozen = nullptr;
+        if (mHasFrozen) {
+            frozen = getInputStreamSet("frozenIn")[0];
+            segStart = pb.createOr(wordStart, pb.createAdvance(frozen, (int64_t) 1), "segStart");
+        }
+        // next token starts a segment = it starts a word, or this token is frozen
+        PabloAST * fin = pb.createAnd(segStart, pb.createLookahead(wordStart, (int64_t) 1));
+        if (frozen) fin = pb.createOr(fin, frozen);
+        PabloAST * keep = pb.createInFile(pb.createNot(fin), "keep");
+        pb.createAssign(pb.createExtract(getOutputStreamVar("keep"), pb.getInteger(0)), keep);
+    }
+private:
+    const bool mHasFrozen;
+};
+
+// --retire-stuck tables, one per stuck point, built with the pipeline; BPEStuckKernel bakes
+// its point's index into its call.
+//   frozen: one bit per id, set when no rule of a later kernel uses the id as a part
+//   pairs:  a one-hash bloom filter over idA << 16 | idB of every rule of a later kernel.
+//           A false positive only keeps a segment; the lookup is one load, no branch
+//           (an exact probing hash set made the kernel ~1 cycle/position slower).
+static constexpr unsigned kStuckBloomBits = 21;   // 256 KiB; <= 50k pairs -> <= 2.4% false hits
+struct StuckTables {
+    std::vector<uint64_t> frozen;
+    std::vector<uint64_t> pairs;
+};
+static std::vector<StuckTables> gStuckTables;
+
+static inline uint32_t stuckHash(uint32_t key) { return (key * 0x9E3779B1u) >> (32 - kStuckBloomBits); }
+
+static inline bool stuckPairLive(const StuckTables & t, uint32_t key) {
+    const uint32_t h = stuckHash(key);
+    return (t.pairs[h >> 6] >> (h & 63)) & 1;
+}
+
+// BPEStuckKernel's body, on numItems positions of Fp (whole blocks; the first n are input).
+//   ids: one 16-bit id per position (P2S16); live: token starts; seg: segment starts (word
+//   starts and barriers). kept: the live starts that stay; segOut: the segment starts of the
+//   kept frame (word starts, barriers, and the start after each frozen token).
+// Pass 1 walks the tokens: frozen bit F, segment start S (seg, or the previous token was
+// frozen), and L = the pair (previous token, this token) may be a later rule. Pass 2 is
+// bit-parallel over the words: a token stays if its segment has an L, i.e. an L lies
+// before it in the segment (forward MatchStar by long addition through non-barrier
+// positions) or at/after it (the same on bit-reversed words, word order reversed).
+//   state[0]: bit 0 = the forward fill runs past the call (the open segment has an L),
+//   bit 1 = the last token was frozen, bit 2 = a token was seen; state[1] = its id.
+// Past the end of a non-final call the backward fill starts with a carry, so the segment
+// still open there is kept (it may continue). Its later tokens still retire if it turns out
+// stuck: no merge can reach the kept head, as its pairs are not rules and the next kept
+// token starts a segment.
+extern "C" void bpe_retire_stuck(uint64_t slot, const uint16_t * ids, const uint64_t * live,
+                                 const uint64_t * seg, uint64_t * kept, uint64_t * segOut,
+                                 uint64_t numItems, uint64_t n, uint64_t final, uint64_t * state) {
+    const StuckTables & t = gStuckTables[slot];
+    const uint64_t numWords = numItems / 64;
+    thread_local std::vector<uint64_t> tmp;
+    tmp.resize(3 * numWords);
+    uint64_t * const frozenW = tmp.data(), * const barrierW = frozenW + numWords,
+             * const fwdW = barrierW + numWords;
+    bool prevFrozen = state[0] & 2, seen = state[0] & 4;
+    uint32_t prevId = (uint32_t) state[1];
+    for (uint64_t wi = 0; wi < numWords; wi++) {
+        uint64_t lv = wi * 64 < n ? live[wi] : 0, beyond = 0;
+        if (wi * 64 < n && n - wi * 64 < 64) {
+            beyond = ~0ull << (n - wi * 64);
+            lv &= ~beyond;
+        } else if (wi * 64 >= n) {
+            beyond = ~0ull;
+        }
+        uint64_t L = 0, F = 0, AF = 0;
+        for (uint64_t m = lv; m; m &= m - 1) {
+            const unsigned p = __builtin_ctzll(m);
+            const uint32_t id = ids[wi * 64 + p];
+            const uint64_t fz = (t.frozen[id >> 6] >> (id & 63)) & 1;
+            L |= uint64_t(stuckPairLive(t, (prevId << 16) | id)) << p;
+            AF |= uint64_t(prevFrozen | !seen) << p;
+            F |= fz << p;
+            prevId = id; prevFrozen = fz; seen = true;
+        }
+        const uint64_t S = ((wi * 64 < n ? seg[wi] : 0) & lv) | AF;
+        const uint64_t barrier = S | F | (final ? beyond : 0);
+        kept[wi] = L & ~barrier;
+        segOut[wi] = S & ~F;
+        frozenW[wi] = F | ~lv;          // not a kept candidate: frozen, or no token here
+        barrierW[wi] = barrier;
+    }
+    // forward: fwd = MatchStar(L, ~barrier), minus the barrier it stops on
+    uint64_t carry = state[0] & 1;
+    for (uint64_t wi = 0; wi < numWords; wi++) {
+        const uint64_t C = ~barrierW[wi], L = kept[wi];
+        uint64_t s1, s2;
+        const bool c1 = __builtin_add_overflow(L, C, &s1);
+        const bool c2 = __builtin_add_overflow(s1, carry, &s2);
+        carry = c1 | c2;
+        fwdW[wi] = ((s2 ^ C) | L) & C;
+    }
+    const uint64_t fwdOut = carry;
+    // backward: the same on reversed bits, keeping the segment start it stops on
+    carry = final ? 0 : 1;
+    for (uint64_t wi = numWords; wi-- > 0; ) {
+        const uint64_t C = __builtin_bitreverse64(~barrierW[wi]), L = __builtin_bitreverse64(kept[wi]);
+        uint64_t s1, s2;
+        const bool c1 = __builtin_add_overflow(L, C, &s1);
+        const bool c2 = __builtin_add_overflow(s1, carry, &s2);
+        carry = c1 | c2;
+        const uint64_t bwd = __builtin_bitreverse64((s2 ^ C) | L);
+        const uint64_t keep = (fwdW[wi] | bwd) & ~frozenW[wi];
+        kept[wi] = keep;
+        segOut[wi] &= keep;
+    }
+    state[0] = fwdOut | (prevFrozen ? 2 : 0) | (seen ? 4 : 0);
+    state[1] = prevId;
+}
+
+// --retire-stuck, in Fp: one call of bpe_retire_stuck per invocation; it writes keptPre and
+// the kept frame's segment starts (still in Fp) directly, so nothing visits Fc. ids16 is the
+// id stream packed by P2S16Kernel, one i16 per position.
+class BPEStuckKernel final : public MultiBlockKernel {
+public:
+    BPEStuckKernel(LLVMTypeSystemInterface & ts, StreamSet * ids, StreamSet * live, StreamSet * seg,
+                   StreamSet * kept, StreamSet * segOut, unsigned slot, uint64_t tableHash)
+    : MultiBlockKernel(ts, "BPE_Stuck16_s" + std::to_string(slot) + "_h" + std::to_string(tableHash),
+                       {Binding{"ids", ids}, Binding{"live", live}, Binding{"seg", seg}},
+                       {Binding{"kept", kept}, Binding{"segOut", segOut}},
+                       {}, {},
+                       {InternalScalar{ArrayType::get(ts.getInt64Ty(), 2), "state"}}),
+      mSlot(slot) {}
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_retire_stuck");
+        if (fn == nullptr) report_fatal_error("BPE_Stuck: bpe_retire_stuck is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("live"));
+        Value * const final = b.CreateZExt(b.isFinal(), b.getInt64Ty());
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInt64(mSlot), b.getInputStreamBlockPtr("ids", zero),
+                      b.getInputStreamBlockPtr("live", zero), b.getInputStreamBlockPtr("seg", zero),
+                      b.getOutputStreamBlockPtr("kept", zero), b.getOutputStreamBlockPtr("segOut", zero),
+                      numItems, n, final, b.getScalarFieldPtr("state").first});
+    }
+private:
+    const unsigned mSlot;
+};
+
+// --bpe-tail runtime. gTail: open addressing over every rule of a kernel the pipeline did not
+// build, one 64-bit slot each: (idA << 16 | idB) << 16 | idAB, all ones = empty (idAB = 256
+// + the merge's rank, so the lower id is the higher priority). Load <= 1/4, so a pair that
+// is no rule, the common case, mostly ends at its first slot. (A table grouped by idA with a
+// binary search was 40% slower: one left part such as U+0120 starts thousands of rules.)
+// left / right: one bit per id, set when the id is the left / right part of some rule in
+// the table; a pair failing either (most non-rules) never touches the 2 MB table.
+struct TailTable {
+    std::vector<uint64_t> slots;
+    uint32_t mask = 0, shift = 0;
+    unsigned idBits = 16;                // the width of the ids reaching the tail
+    uint64_t left[1024], right[1024];
+};
+static constexpr uint64_t kTailEmpty = ~0ull;
+static TailTable gTail;
+static BPETailSink gTailSink = nullptr;
+
+void bpeTailSetSink(BPETailSink sink) { gTailSink = sink; }
+
+static inline uint32_t tailSlot(uint32_t key) { return (key * 0x9E3779B1u) >> gTail.shift; }
+
+static inline uint16_t tailMerge(uint16_t a, uint16_t b) {
+    if (!((gTail.left[a >> 6] >> (a & 63)) & (gTail.right[b >> 6] >> (b & 63)) & 1)) return 0xFFFF;
+    const uint32_t key = (uint32_t(a) << 16) | b;
+    for (uint32_t h = tailSlot(key); ; h = (h + 1) & gTail.mask) {
+        const uint64_t e = gTail.slots[h];
+        if (e == kTailEmpty) return 0xFFFF;
+        if (uint32_t(e >> 16) == key) return uint16_t(e);
+    }
+}
+
+// Standard BPE on one segment, in place: merge the lowest-ranked adjacent pair (leftmost on
+// a tie, as HF and tiktoken do) until no pair is a rule. t[0..n) are the ids and pos[0..n)
+// their positions; both lose the merged-away tokens, and n is updated. Segments of up to 64
+// tokens (nearly all) shift in plain arrays. Longer ones (one word of 100k tokens, e.g. a
+// run of one letter) use HF's merge_all: a linked list and a min-heap of (id, position)
+// pairs, skipping a popped pair whose tokens changed since; O(n log n). A long segment in
+// which no pair is a rule (a run of NULs, say) returns before building any of that.
+static void tailMergeLong(uint16_t * t, uint32_t * pos, size_t & n) {
+    size_t first = 0;
+    while (first + 1 < n && tailMerge(t[first], t[first + 1]) == 0xFFFF) first++;
+    if (first + 1 >= n) return;
+    thread_local std::vector<uint32_t> prev, next;
+    thread_local std::vector<uint8_t> gone;
+    using Item = std::pair<uint32_t, uint32_t>;          // (idAB, left position)
+    thread_local std::vector<Item> heap;
+    prev.resize(n); next.resize(n);
+    gone.assign(n, 0);
+    heap.clear();
+    for (size_t i = 0; i < n; i++) { prev[i] = uint32_t(i - 1); next[i] = uint32_t(i + 1); }
+    auto push = [&](uint32_t i) {
+        if (i >= n || next[i] >= n) return;
+        const uint16_t m = tailMerge(t[i], t[next[i]]);
+        if (m != 0xFFFF) { heap.emplace_back(m, i); std::push_heap(heap.begin(), heap.end(), std::greater<Item>()); }
+    };
+    for (uint32_t i = uint32_t(first); i + 1 < n; i++) push(i);
+    while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), std::greater<Item>());
+        const auto [m, i] = heap.back();
+        heap.pop_back();
+        if (gone[i] || next[i] >= n || tailMerge(t[i], t[next[i]]) != m) continue;   // stale
+        const uint32_t j = next[i];
+        t[i] = uint16_t(m);
+        gone[j] = 1;
+        next[i] = next[j];
+        if (next[j] < n) prev[next[j]] = i;
+        if (prev[i] < n) push(prev[i]);
+        push(i);
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) if (!gone[i]) { t[w] = t[i]; pos[w] = pos[i]; w++; }
+    n = w;
+}
+
+static inline void tailMergeSegment(uint16_t * t, uint32_t * pos, size_t & n) {
+    if (n < 2) return;
+    if (n > 64) { tailMergeLong(t, pos, n); return; }
+    uint16_t r[64];
+    size_t m = n - 1;                    // pairs
+    for (size_t i = 0; i < m; i++) r[i] = tailMerge(t[i], t[i + 1]);
+    for (;;) {
+        size_t best = 0;
+        for (size_t i = 1; i < m; i++) if (r[i] < r[best]) best = i;
+        if (m == 0 || r[best] == 0xFFFF) break;
+        t[best] = r[best];
+        for (size_t i = best + 1; i + 1 < n; i++) { t[i] = t[i + 1]; pos[i] = pos[i + 1]; }
+        for (size_t i = best; i + 1 < m; i++) r[i] = r[i + 1];
+        n--; m--;
+        if (best > 0) r[best - 1] = tailMerge(t[best - 1], t[best]);
+        if (best < m) r[best] = tailMerge(t[best], t[best + 1]);
+    }
+}
+
+// A growable scratch array of segment tokens: ids and positions.
+struct TailSegBuf {
+    std::vector<uint16_t> t;
+    std::vector<uint32_t> pos;
+    size_t n = 0;
+    void push(uint16_t id, uint32_t p) {
+        if (n == t.size()) { t.resize(std::max<size_t>(256, 2 * n)); pos.resize(t.size()); }
+        t[n] = id; pos[n] = p; n++;
+    }
+};
+
+// Per-thread cache of finished segments: words repeat, so most segments are a lookup instead
+// of a run of merges (HF's BPE keeps a word cache too). Key (TailKey<B>, B = gTail.idBits):
+// k0 holds input ids 0 .. 64/B - 1, k1 the next 60/B ids and the count in its top 4 bits, so
+// with 9-bit ids (--bpe-tail=1) segments of up to 13 tokens fit. Value: which input tokens
+// start an output token (bit i = token i) and the output ids; a result of more than
+// kTailCacheOut tokens is not cached. Two ways of 32 bytes per 64-byte set; a miss moves
+// way 0 to way 1 and fills way 0.
+struct TailCacheEntry {
+    uint64_t k0, k1;                     // k0 == k1 == 0: empty (a key's count is never 0)
+    uint16_t keep;
+    uint16_t out[7];
+};
+static constexpr unsigned kTailCacheSetBits = 15;   // 2^15 sets x 64 bytes = 2 MB per thread
+static constexpr unsigned kTailCacheOut = 7;
+static std::atomic<uint64_t> gTailGeneration{0};   // bumped whenever gTail is rebuilt
+
+template <unsigned B> struct TailKey {
+    static constexpr unsigned per0 = 64 / B, per1 = 60 / B;
+    static constexpr unsigned max = per0 + per1;               // cached segments: 2 .. max tokens
+    static constexpr unsigned fast = max < 8 ? max : 8;        // gathered without a loop
+};
+
+// The resolve kernel's per-thread state, fetched once per call: on macOS every access to a
+// thread_local with a constructor is a _tlv_get_addr call.
+struct TailScratch {
+    std::vector<uint16_t> t;             // an uncached segment: ids ...
+    std::vector<uint32_t> pos;           // ... and positions
+    std::vector<TailCacheEntry> cache;
+    uint64_t generation = 0;
+};
+static TailScratch & tailScratch() {
+    thread_local TailScratch s;
+    const uint64_t g = gTailGeneration.load(std::memory_order_relaxed);
+    if (s.generation != g) {
+        s.cache.assign(size_t(2) << kTailCacheSetBits, TailCacheEntry{});
+        s.generation = g;
+    }
+    return s;
+}
+
+static inline void tailMark(uint64_t * emit, uint32_t p) { emit[p / 64] |= 1ull << (p % 64); }
+static inline uint64_t tailLowMask(size_t k) { return k >= 64 ? ~0ull : (1ull << k) - 1; }
+
+// A cached segment on its way through the resolve loop: its tokens (positions, ids), its key
+// and its cache set, whose line was prefetched when the descriptor was made.
+struct TailDesc {
+    uint64_t k0, k1;
+    TailCacheEntry * set;
+    uint32_t cnt;
+    uint32_t p[16];
+    uint16_t t[16];
+};
+
+// Look d up (or merge it and fill the cache) and write its output ids at their positions.
+static inline void tailFinishDesc(const TailDesc & d, uint32_t * res, uint64_t * emit) {
+    TailCacheEntry * const set = d.set;
+    const TailCacheEntry * e;
+    if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
+    else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) e = &set[1];
+    else {
+        uint16_t tt[16];
+        uint32_t idx[16];
+        size_t m = d.cnt;
+        for (size_t i = 0; i < m; i++) { tt[i] = d.t[i]; idx[i] = uint32_t(i); }
+        tailMergeSegment(tt, idx, m);
+        if (m > kTailCacheOut) {
+            for (size_t j = 0; j < m; j++) { res[d.p[idx[j]]] = tt[j]; tailMark(emit, d.p[idx[j]]); }
+            return;
+        }
+        set[1] = set[0];
+        TailCacheEntry & f = set[0];
+        f.k0 = d.k0; f.k1 = d.k1; f.keep = 0;
+        for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << idx[j]); f.out[j] = tt[j]; }
+        e = &f;
+    }
+    unsigned j = 0;
+    for (uint32_t keep = e->keep; keep; keep &= keep - 1) {
+        const uint32_t q = d.p[__builtin_ctz(keep)];
+        res[q] = e->out[j++];
+        tailMark(emit, q);
+    }
+}
+
+// The tail runs in two kernels. BPETailResolveKernel is data-parallel: each call finishes
+// every segment that lies wholly inside its own blocks and writes one word per token start:
+// the finished id, or the input id with kTailOpen for a token of a segment cut by the call's
+// edges (bit kTailSeg on the first token of such a segment); a bit in `emit` marks each of
+// these, and not the tokens merged into their left neighbour. BPETailKernel then walks the
+// marked words in order on one thread, emits, and finishes the cut segments, a couple per call.
+static constexpr uint32_t kTailOpen = 1u << 16, kTailSeg = 1u << 18;
+
+// The resolve loop walks the segment starts. A segment of one token is its own output; one
+// of 2 .. TailKey<B>::max tokens becomes a TailDesc, whose cache set is prefetched and which
+// is finished kTailAhead segments later, so the cache's memory latency overlaps the work on
+// the segments in between (a lookup right away stalls on it: 30% slower); a longer segment
+// is merged on the spot. A segment's tokens are the `starts` bits up to the next segment
+// start; up to `fast` of them are gathered from one 64-bit window without a loop.
+static constexpr unsigned kTailAhead = 4;
+
+template <unsigned B>
+static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
+                        uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+    using K = TailKey<B>;
+    TailScratch & S = tailScratch();
+    std::fill(emit, emit + numItems / 64, 0);
+    if (n > numItems) n = numItems;
+    const size_t nWords = (n + 63) / 64;
+    if (nWords == 0) return;
+    uint64_t mask0[K::max + 1], mask1[K::max + 1];   // the key bits of a segment of k tokens
+    for (unsigned k = 0; k <= K::max; k++) {
+        mask0[k] = tailLowMask(std::min(k, K::per0) * B);
+        mask1[k] = k <= K::per0 ? 0 : tailLowMask((k - K::per0) * B);
+    }
+    TailCacheEntry * const cache = S.cache.data();
+    auto bitsIn = [&](size_t w, size_t lo, size_t hi) {      // starts bits of word w in [lo, hi)
+        uint64_t x = starts[w];
+        if (w * 64 < lo) x &= ~tailLowMask(lo - w * 64);
+        if (w * 64 + 64 > hi) x &= tailLowMask(hi - w * 64);
+        return x;
+    };
+    auto segWord = [&](size_t w) { return segs[w] & (w * 64 + 64 > n ? tailLowMask(n - w * 64) : ~0ull); };
+    size_t sw = 0;
+    uint64_t sx = segWord(0);
+    while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+    const size_t first = sx ? sw * 64 + __builtin_ctzll(sx) : n;
+    for (size_t w = 0; w * 64 < first; w++)                     // cut by the left edge
+        for (uint64_t x = bitsIn(w, 0, first); x; x &= x - 1) {
+            const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
+            res[p] = ids[p] | kTailOpen;
+            tailMark(emit, p);
+        }
+    if (!sx) return;
+    sx &= sx - 1;
+    TailDesc ring[kTailAhead];
+    unsigned head = 0, count = 0;
+    auto drain = [&] {
+        for (; count; count--, head = (head + 1) % kTailAhead) tailFinishDesc(ring[head], res, emit);
+    };
+    for (size_t s = first;;) {
+        while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+        const bool last = sx == 0;
+        const size_t e = last ? n : sw * 64 + __builtin_ctzll(sx);
+        if (last && !final) {                                   // may go on in the next call
+            drain();
+            uint32_t seg = kTailSeg;
+            for (size_t w = s / 64; w * 64 < n; w++)
+                for (uint64_t x = bitsIn(w, s, n); x; x &= x - 1) {
+                    const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
+                    res[p] = ids[p] | kTailOpen | seg;
+                    seg = 0;
+                    tailMark(emit, p);
+                }
+            return;
+        }
+        const size_t len = e - s, w = s / 64;
+        const unsigned b = s % 64;
+        const uint64_t next = w + 1 < nWords ? starts[w + 1] : 0;
+        uint64_t m = ((starts[w] >> b) | ((next << 1) << (63 - b))) & tailLowMask(len);
+        const unsigned cnt = len <= 64 ? __builtin_popcountll(m) : K::max + 1;
+        if (cnt == 1) {
+            res[s] = ids[s];
+            tailMark(emit, uint32_t(s));
+        } else if (cnt <= K::max) {
+            if (count == kTailAhead) {
+                tailFinishDesc(ring[head], res, emit);
+                head = (head + 1) % kTailAhead;
+                count--;
+            }
+            TailDesc & d = ring[(head + count++) % kTailAhead];
+            if (LLVM_LIKELY(cnt <= K::fast)) {
+                for (unsigned i = 0; i < K::fast; i++) {              // past cnt: the start again
+                    const unsigned o = m ? __builtin_ctzll(m) : 0;
+                    d.p[i] = uint32_t(s + o);
+                    d.t[i] = ids[s + o];
+                    m &= m - 1;
+                }
+            } else {
+                for (unsigned i = 0; m; i++, m &= m - 1) {
+                    d.p[i] = uint32_t(s + __builtin_ctzll(m));
+                    d.t[i] = ids[d.p[i]];
+                }
+            }
+            uint64_t k0 = 0, k1 = 0;
+            for (unsigned i = 0; i < K::max; i++) {
+                const uint64_t id = i < cnt ? d.t[i] : 0;
+                if (i < K::per0) k0 |= id << (i * B);
+                else k1 |= id << ((i - K::per0) * B);
+            }
+            d.k0 = k0 & mask0[cnt];
+            d.k1 = (k1 & mask1[cnt]) | (uint64_t(cnt) << 60);
+            d.cnt = cnt;
+            const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+            d.set = cache + (h >> (64 - kTailCacheSetBits)) * 2;
+            __builtin_prefetch(d.set);
+        } else {                                                // longer: merge it here
+            if (S.t.size() < e - s) { S.t.resize(e - s); S.pos.resize(e - s); }
+            size_t k = 0;
+            for (size_t x = w; x * 64 < e; x++)
+                for (uint64_t y = bitsIn(x, s, e); y; y &= y - 1) {
+                    const uint32_t p = uint32_t(x * 64 + __builtin_ctzll(y));
+                    S.t[k] = ids[p]; S.pos[k] = p; k++;
+                }
+            tailMergeSegment(S.t.data(), S.pos.data(), k);
+            for (size_t i = 0; i < k; i++) { res[S.pos[i]] = S.t[i]; tailMark(emit, S.pos[i]); }
+        }
+        if (last) break;
+        sx &= sx - 1;
+        s = e;
+    }
+    drain();
+}
+
+// emit: one bit per token the emitter must visit (finished or cut), so it skips the
+// merged-away ones without reading them.
+extern "C" void bpe_tail_resolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
+                                 uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n,
+                                 uint64_t final) {
+    switch (gTail.idBits) {
+#define TAIL_CASE(B) case B: tailResolve<B>(ids, starts, segs, res, emit, numItems, n, final); return;
+        TAIL_CASE(8) TAIL_CASE(9) TAIL_CASE(10) TAIL_CASE(11) TAIL_CASE(12)
+        TAIL_CASE(13) TAIL_CASE(14) TAIL_CASE(15) TAIL_CASE(16)
+#undef TAIL_CASE
+        default: report_fatal_error("--bpe-tail: unsupported id width");
+    }
+}
+
+// BPETailKernel's body: the tokens in order. A cut segment's tokens collect in gTailOpen and
+// are finished when the next segment starts; everything else is emitted as it comes. The
+// finished ids of a call go to gTailOutBuf (uninitialized, grown as needed: a call never
+// emits more tokens than it has positions) and then to the sink in one batch.
+static TailSegBuf gTailOpen;
+static std::unique_ptr<uint16_t[]> gTailOutBuf;
+static size_t gTailOutCap = 0;
+
+static size_t tailFlushOpen(uint16_t * out, size_t k) {
+    tailMergeSegment(gTailOpen.t.data(), gTailOpen.pos.data(), gTailOpen.n);
+    for (size_t i = 0; i < gTailOpen.n; i++) out[k++] = gTailOpen.t[i];
+    gTailOpen.n = 0;
+    return k;
+}
+
+extern "C" void bpe_tail_block(const uint32_t * res, const uint64_t * starts,
+                               uint64_t numItems, uint64_t n, uint64_t final) {
+    const size_t room = std::min(n, numItems) + gTailOpen.n;
+    if (room > gTailOutCap) {
+        gTailOutCap = std::max<size_t>(room, 2 * gTailOutCap);
+        gTailOutBuf.reset(new uint16_t[gTailOutCap]);
+    }
+    uint16_t * const out = gTailOutBuf.get();
+    size_t k = 0;
+    for (uint64_t wi = 0; wi * 64 < n && wi * 64 < numItems; wi++) {
+        uint64_t st = starts[wi];
+        if (n - wi * 64 < 64) st &= (1ull << (n - wi * 64)) - 1;
+        for (; st; st &= st - 1) {
+            const uint32_t v = res[wi * 64 + __builtin_ctzll(st)];
+            if (LLVM_LIKELY((v & kTailOpen) == 0)) {
+                if (LLVM_UNLIKELY(gTailOpen.n != 0)) k = tailFlushOpen(out, k);
+                out[k++] = uint16_t(v);
+            } else {
+                if ((v & kTailSeg) && gTailOpen.n != 0) k = tailFlushOpen(out, k);
+                gTailOpen.push(uint16_t(v), 0);
+            }
+        }
+    }
+    if (final && gTailOpen.n != 0) k = tailFlushOpen(out, k);
+    if (gTailSink && k) gTailSink(out, k);
+}
+
+// --bpe-tail kernels, both thin wrappers around their C++ bodies above.
+class BPETailResolveKernel final : public MultiBlockKernel {
+public:
+    BPETailResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * ids16, StreamSet * starts,
+                         StreamSet * segs, StreamSet * res, StreamSet * emit)
+    : MultiBlockKernel(ts, "BPE_TailResolve",
+                       {Binding{"ids", ids16}, Binding{"starts", starts}, Binding{"segs", segs}},
+                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+        // No state between calls (the C++ body only uses thread_local scratch), so the
+        // pipeline may run its calls on several threads at once.
+        addAttribute(Statefree());
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_tail_resolve");
+        if (fn == nullptr) report_fatal_error("BPE_TailResolve: bpe_tail_resolve is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("ids", zero), b.getInputStreamBlockPtr("starts", zero),
+                      b.getInputStreamBlockPtr("segs", zero), b.getOutputStreamBlockPtr("res", zero),
+                      b.getOutputStreamBlockPtr("emit", zero), numItems, n,
+                      b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+    }
+};
+
+// Side-effecting, so the pipeline keeps it and runs it in order, one call at a time.
+class BPETailKernel final : public MultiBlockKernel {
+public:
+    BPETailKernel(LLVMTypeSystemInterface & ts, StreamSet * res, StreamSet * starts)
+    : MultiBlockKernel(ts, "BPE_Tail",
+                       {Binding{"res", res}, Binding{"starts", starts}},
+                       {}, {}, {}, {}) {
+        addAttribute(SideEffecting());
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_tail_block");
+        if (fn == nullptr) report_fatal_error("BPE_Tail: bpe_tail_block is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("res", zero), b.getInputStreamBlockPtr("starts", zero),
+                      numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+    }
+};
+
+void buildBPETailEmitter(PipelineBuilder & P, StreamSet * ids, StreamSet * starts, StreamSet * segs) {
+    StreamSet * ids16 = P.CreateStreamSet(1, 16);
+    P.CreateKernelCall<P2S16Kernel>(ids, ids16);
+    StreamSet * res = P.CreateStreamSet(1, 32);
+    StreamSet * emit = P.CreateStreamSet(1, 1);
+    Kernel * const r = P.CreateKernelCall<BPETailResolveKernel>(ids16, starts, segs, res, emit);
+    P.LinkFunction(r, "bpe_tail_resolve", bpe_tail_resolve);
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
+    P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
+}
+
+// Merge-back at one retirement point, in Fp: `later` = the tokens that survived the point,
+// spread back to Fp by keptPre; `ids` = Fp's id stream. The retired tokens are the live
+// starts that were not kept (liveIn & ~keptPre): OR in their id and start bit.
+class BPERetireMergeKernel : public PabloKernel {
+public:
+    BPERetireMergeKernel(LLVMTypeSystemInterface & ts, StreamSet * later, StreamSet * ids,
+                         StreamSet * liveIn, StreamSet * keptPre, StreamSet * merged)
+    : PabloKernel(ts, "BPE_RetireMerge" + std::to_string(ids->getNumElements())
+                        + (later->getNumElements() == kTailStreams ? "_t" : ""),
+                  {Binding{"later", later}, Binding{"ids", ids}, Binding{"liveIn", liveIn},
+                   Binding{"keptPre", keptPre}},
+                  {Binding{"merged", merged}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> later = getInputStreamSet("later");
+        std::vector<PabloAST *> ids = getInputStreamSet("ids");
+        PabloAST * const fin = pb.createAnd(getInputStreamSet("liveIn")[0],
+                                            pb.createNot(getInputStreamSet("keptPre")[0]), "retired");
+        Var * out = getOutputStreamVar("merged");
+        for (unsigned i = 0; i + 1 < kRetireStreams; i++)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)),
+                            i < ids.size() ? pb.createOr(later[i], pb.createAnd(ids[i], fin))
+                                           : later[i]);
+        for (unsigned i = kRetireStreams - 1; i < later.size(); i++)   // start (and segment)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)), pb.createOr(later[i], fin));
+    }
+};
+
+// The final 16-bit id stream and its token-start mask as one 17-stream set. No mask
+// (the last kernel was followed by a FilterByMask) means every position is a token start.
+// segIn (--bpe-tail): the segment starts, packed as stream 17.
+class BPERetirePackKernel : public PabloKernel {
+public:
+    BPERetirePackKernel(LLVMTypeSystemInterface & ts, StreamSet * idIn, StreamSet * maskIn,
+                        StreamSet * packed, StreamSet * segIn = nullptr)
+    : PabloKernel(ts, std::string("BPE_RetirePack") + (maskIn ? "_m1" : "_m0") + (segIn ? "_t" : ""),
+                  bindings(idIn, maskIn, segIn),
+                  {Binding{"packed", packed}}),
+      mHasMask(maskIn != nullptr), mHasSeg(segIn != nullptr) {}
+protected:
+    static std::vector<Binding> bindings(StreamSet * idIn, StreamSet * maskIn, StreamSet * segIn) {
+        std::vector<Binding> b{Binding{"idIn", idIn}};
+        if (maskIn) b.emplace_back("maskIn", maskIn);
+        if (segIn) b.emplace_back("segIn", segIn);
+        return b;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> id = getInputStreamSet("idIn");
+        Var * out = getOutputStreamVar("packed");
+        for (unsigned i = 0; i + 1 < kRetireStreams; i++)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)), id[i]);
+        PabloAST * mask = mHasMask ? getInputStreamSet("maskIn")[0]
+                                   : pb.createInFile(pb.createOnes());
+        pb.createAssign(pb.createExtract(out, pb.getInteger(kRetireStreams - 1)), mask);
+        if (mHasSeg)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(kRetireStreams)),
+                            pb.createAnd(getInputStreamSet("segIn")[0], mask));
+    }
+private:
+    const bool mHasMask, mHasSeg;
+};
+
+// Splits the merged-back 17-stream set into the emitter's 16 id bits and start mask, and
+// with --bpe-tail (18 streams) the segment starts into segOut.
+class BPERetireUnpackKernel : public PabloKernel {
+public:
+    BPERetireUnpackKernel(LLVMTypeSystemInterface & ts, StreamSet * packed, StreamSet * idOut,
+                          StreamSet * maskOut, StreamSet * segOut = nullptr)
+    : PabloKernel(ts, std::string("BPE_RetireUnpack") + (segOut ? "_t" : ""),
+                  {Binding{"packed", packed}},
+                  segOut ? std::vector<Binding>{Binding{"idOut", idOut}, Binding{"maskOut", maskOut},
+                                                Binding{"segOut", segOut}}
+                         : std::vector<Binding>{Binding{"idOut", idOut}, Binding{"maskOut", maskOut}}),
+      mHasSeg(segOut != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> in = getInputStreamSet("packed");
+        Var * id = getOutputStreamVar("idOut");
+        for (unsigned i = 0; i + 1 < kRetireStreams; i++)
+            pb.createAssign(pb.createExtract(id, pb.getInteger(i)), in[i]);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("maskOut"), pb.getInteger(0)),
+                        in[kRetireStreams - 1]);
+        if (mHasSeg)
+            pb.createAssign(pb.createExtract(getOutputStreamVar("segOut"), pb.getInteger(0)),
+                            in[kRetireStreams]);
+    }
+private:
+    const bool mHasSeg;
+};
+
 // --bit-frequency-statistics: over the surviving token starts (`live`), count all tokens
 // (`total`) and, for each N in [kBitFreqLo, kBitFreqHi], the tokens whose id has at least
 // N bits, i.e. id >= 2^(N-1) (`atLeastN`).
@@ -917,6 +1792,7 @@ static std::vector<bool> applyCompactionSchedule(std::vector<MergeRuleGroup> & r
     std::map<unsigned, size_t> kernelOf;
     for (size_t gi = 0; gi < ruleRanges.size(); gi++)
         for (const auto & r : ruleRanges[gi].rules) {
+            if (ruleRanges[gi].tailOnly) break;   // never a kernel: nothing to measure
             parts.emplace(r.idAB, std::make_pair(r.idA, r.idB));
             kernelOf.emplace(r.idAB, gi);
         }
@@ -951,7 +1827,7 @@ static std::vector<bool> applyCompactionSchedule(std::vector<MergeRuleGroup> & r
     unsigned nCompact = 0, firstBlockDisagree = 0, kernelNo = 0;
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
-        if (g.rules.empty()) continue;
+        if (g.rules.empty() || g.tailOnly) continue;
         ++kernelNo;
         unsigned maxDist = 0;
         for (auto & r : g.rules) {
@@ -1009,7 +1885,12 @@ static std::vector<bool> applyCompactionSchedule(std::vector<MergeRuleGroup> & r
 // EveryNth gives GLOBAL parity of the X starts; MatchStar spreads each run's
 // starting parity across the run so the odd/even choice RESETS per run (otherwise a
 // preceding odd-length run would flip the next run's pairing).
-static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigned L) {
+//
+// wordStart (--retire-words, else null): pretoken starts. A run then also breaks at a word
+// start: once whole words are dropped from the stream, the last X of one word can sit right
+// before the first X of another, and one joined run would shift the second word's pairing.
+static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigned L,
+                                      PabloAST * wordStart = nullptr) {
     // X-token body: the L bytes each X covers (start .. start+L-1). For L==1 this is
     // just isX; the body connects consecutive X tokens so MatchStar spans the gaps.
     PabloAST * body = isX;
@@ -1017,12 +1898,22 @@ static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigne
         body = pb.createOr(body, pb.createAdvance(isX, (int64_t) k));
     // A run starts at an X with no X-token ending immediately L bytes before it.
     PabloAST * runStart = pb.createAnd(isX, pb.createNot(pb.createAdvance(isX, (int64_t) L)));
+    if (wordStart) runStart = pb.createOr(runStart, pb.createAnd(isX, wordStart));
     PabloAST * A1 = pb.createEveryNth(isX, pb.getInteger(2));  // global 1st,3rd,5th…
     PabloAST * A2 = pb.createXor(isX, A1);                     // global 2nd,4th,6th…
     PabloAST * A1_start = pb.createAnd(runStart, A1);
     PabloAST * A2_start = pb.createAnd(runStart, A2);
-    PabloAST * A1_runs = pb.createMatchStar(A1_start, body);   // runs whose 1st X is global-odd
-    PabloAST * A2_runs = pb.createMatchStar(A2_start, body);   // runs whose 1st X is global-even
+    // Spread each run start over its run. With word starts, spread from the position after
+    // the start through `cont` (the body minus word starts), so it stops before the next
+    // word's first X instead of running into it.
+    auto spread = [&](PabloAST * start) -> PabloAST * {
+        if (!wordStart) return pb.createMatchStar(start, body);
+        PabloAST * cont = pb.createAnd(body, pb.createNot(wordStart));
+        PabloAST * reach = pb.createMatchStar(pb.createAdvance(start, (int64_t) 1), cont);
+        return pb.createOr(start, pb.createAnd(reach, cont));
+    };
+    PabloAST * A1_runs = spread(A1_start);   // runs whose 1st X is global-odd
+    PabloAST * A2_runs = spread(A2_start);   // runs whose 1st X is global-even
     // Per-run 1st,3rd,5th X = the fire (A-start) positions.
     return pb.createOr(pb.createAnd(A1_runs, A1), pb.createAnd(A2_runs, A2));
 }
@@ -1176,6 +2067,9 @@ public:
                         + (GateMaskFold ? "gm1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
                         + (KeyCluster ? "kc1_" : "")
+                        + (IfReduceTest ? "rt1_" : "")
+                        + (grouped && IfUnlikelyWeight > 0 ? "uw" + std::to_string(IfUnlikelyWeight) + "_" : "")
+                        + (RetireWords && boundaryIn ? "rw1_" : "")
                         + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
                                                  // FilterByMask, its inPlayMask is built
                                                  // locally instead of bound as an input
@@ -1193,6 +2087,9 @@ protected:
         PabloKernel::addOptimizationPasses(b, passes);
         if (SkipInstCombine) passes.push_back(OptimizationPass::NoInstCombinePass);
     }
+    // --if-unlikely-weight / --if-reduce-test (see their definitions)
+    unsigned ifBodyUnlikelyWeight() const override { return mGrouped ? (unsigned) IfUnlikelyWeight : 0u; }
+    bool reduceIfTest() const override { return IfReduceTest; }
     static std::vector<kernel::Binding> mergeInputs(
             StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
             StreamSet * nextIdIn, unsigned maxLen) {
@@ -1277,6 +2174,7 @@ protected:
         // LookAhead on the boundaryIn input (declares LookAhead(maxLen)). Null when no
         // boundary stream was supplied → no gating (mHasBoundary == false).
         PabloAST * boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
+        PabloAST * const runWordStart = RetireWords ? boundaryBit : nullptr;   // see selfMergeFireStarts
         std::map<unsigned, PabloAST*> boundaryAheadByLen;
         if (mHasBoundary && !LookaheadInGate && !grpCache) {   // in-gate/in-group build it below
             for (const auto & r : mRuleGroup.rules) {
@@ -1586,7 +2484,7 @@ protected:
             // subset of its input, so fireStart IS the gate value — no extra And.
             PabloAST * fireStart = eqAstart(pb, r.idA);
             if (r.idA == r.idB)
-                fireStart = selfMergeFireStarts(pb, fireStart, r.lenA);
+                fireStart = selfMergeFireStarts(pb, fireStart, r.lenA, runWordStart);
             auto body = pb.createScope();
             emitBody(body, r, fireStart);
             pb.createIf(fireStart, body);
@@ -1698,7 +2596,7 @@ protected:
                 // inside via emitChain instead of a flat sibling loop.
                 PabloAST * fireStart = eqAstart(pb, r.idA);
                 if (r.idA == r.idB)
-                    fireStart = selfMergeFireStarts(pb, fireStart, r.lenA);
+                    fireStart = selfMergeFireStarts(pb, fireStart, r.lenA, runWordStart);
                 emitChain(pb, r, fireStart);
                 // Same rebind emitRule does after every rule — a later sibling's
                 // eqAstart must not reuse the pre-chain inPlayMask pointer.
@@ -1845,7 +2743,7 @@ protected:
                     const MergeRule & r = *sorted[k];
                     PabloAST * fireStart = (hiBits > 0) ? prefixAstart(r.idA) : eqAstart(body, r.idA);
                     if (r.idA == r.idB)
-                        fireStart = selfMergeFireStarts(body, fireStart, r.lenA);
+                        fireStart = selfMergeFireStarts(body, fireStart, r.lenA, runWordStart);
                     // Chain root: build its own createIf inside THIS chunk gate and nest
                     // its children in it, instead of emitting flat at the outer scope.
                     // The root's gate is then doubly guarded (chunk prefix, then its own
@@ -1965,6 +2863,7 @@ public:
                   MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
     : PabloKernel(ts, std::string("BPEXfrm_") + (boundaryIn ? "b1_" : "")
                         + (SkipInstCombine ? "ic1_" : "")
+                        + (RetireWords && boundaryIn ? "rw1_" : "")
                         + (sourceIn->getNumElements() > kXfrmLowBits
                                ? std::string("st_")
                                  + (subtierGroupingApplies(ceil_log2(group.hi)) ? "gm_" : "")
@@ -2180,7 +3079,8 @@ protected:
                 return e;
             };
             PabloAST * isX = pb.createInFile(pb.createAnd(eqTerms(srcBits, r->idA), live));
-            PabloAST * fire = selfMergeFireStarts(pb, isX, r->lenA);
+            PabloAST * fire = selfMergeFireStarts(pb, isX, r->lenA,
+                                                  RetireWords ? boundaryBit : nullptr);
             fire = pb.createAnd(fire, eqTerms(ahead(r->lenA), r->idB));
             fire = pb.createAnd(fire, gate(r->lenA), "selffire_" + std::to_string(r->idAB));
             orInto(consumed, pb.createAdvance(fire, (int64_t) r->lenA));
@@ -2218,6 +3118,35 @@ static bool bitXfrmEligible(const MergeRuleGroup & g) {
 //   Returns (matchEnd, vocabID=source). NOTE: emission is Stage-B debug —
 //   matchEnd = active (all ones) prints the id at EVERY byte, so stale interior
 //   ids of swallowed parts still show. Correct emission (consume) is Stage C.
+#ifdef __APPLE__
+// --vm-ring-buffers: the same layout as make_circular_buffer (m = 2 + hasUnderflow copies of
+// one size-byte region, back to back), built by mapping slot 0's pages over the other slots.
+static uint8_t * bpeVMRingBuffer(const size_t size, const size_t hasUnderflow) {
+    const size_t m = 2 + hasUnderflow;
+    const mach_port_t task = mach_task_self();
+    vm_address_t base = 0;
+    if (vm_allocate(task, &base, m * size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+        report_fatal_error("--vm-ring-buffers: vm_allocate failed");
+    for (size_t i = 1; i < m; i++) {
+        vm_address_t target = base + i * size;
+        vm_prot_t cur, max;
+        if (vm_remap(task, &target, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, base,
+                     FALSE, &cur, &max, VM_INHERIT_DEFAULT) != KERN_SUCCESS || target != base + i * size)
+            report_fatal_error("--vm-ring-buffers: vm_remap failed");
+    }
+    return reinterpret_cast<uint8_t *>(base) + hasUnderflow * size;
+}
+#endif
+
+void bpeSetFrameworkHooks() {
+#ifdef __APPLE__
+    if (VMRingBuffers) kernel::CircularBufferAllocator = bpeVMRingBuffer;
+#else
+    if (VMRingBuffers) std::cerr << "[BPE] --vm-ring-buffers ignored: macOS only\n";
+#endif
+    if (MemSourceBlockCapacity) kernel::MemorySourceBlockCapacity = true;
+}
+
 BPEPassResult buildBPEPassPipeline(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
@@ -2225,7 +3154,8 @@ BPEPassResult buildBPEPassPipeline(
         kernel::StreamSet * boundary) {
 
     compactionMode();   // validate the compaction settings first: conflicts halt here
-    auto ruleRanges = bpe.buildMergeRuleRanges();
+    auto ruleRanges = bpe.buildMergeRuleRanges(boundary ? (unsigned) BPETail : 0u);
+    gStuckTables.clear();
 
     // Inject FilterByMask compactions per --compaction and rewrite the rules' merge
     // distances into the compacted (slot) frame.
@@ -2314,9 +3244,51 @@ BPEPassResult buildBPEPassPipeline(
     // clearing the token starts it consumes, so the final mask marks surviving starts.
     StreamSet * inPlayMask = active;
     unsigned nXfrm = 0, nXfrmIneligible = 0;   // --bit-xfrm-limit kernel counts
+
+    // --retire-words: one entry per FilterByMask point from the first retiring one on, for
+    // the merge-back below.
+    //   prevMask: the mask that FilterByMask used: live token starts in Fp, the frame
+    //             before the point
+    //   keptPre:  the live starts the point kept, in Fp; idsPre: Fp's id stream. Both null
+    //             at a point that does not retire (--retire-points): the merge-back only
+    //             steps through it.
+    // A retiring point sends only 1-bit streams to the compacted frame (Fc): word starts
+    // and frozen marks are filtered by prevMask, BPERetireKernel decides keep there, and
+    // keep and the segment starts are spread back to Fp. The ids are then filtered once,
+    // by keptPre, instead of by prevMask and again by keep.
+    struct RetirePoint {
+        StreamSet * prevMask; StreamSet * keptPre; StreamSet * idsPre;
+    };
+    std::vector<RetirePoint> retirePoints;
+    const bool retire = RetireWords && boundary && compactionMode() != CompactionMode::None;
+    if (RetireWords && !retire)
+        std::cerr << "[BPE] --retire-words ignored: it needs --compaction and a pretokenizer\n";
+    // --retire-frozen: lastPartUse[id] = 1 + the last kernel with a rule that has id as its
+    // left or right part (absent = never a part). After kernel i, an id is frozen iff its
+    // entry is absent or <= i + 1.
+    std::unordered_map<unsigned, size_t> lastPartUse;
+    if (retire && (RetireFrozen || RetireStuck))
+        for (size_t gi = 0; gi < ruleRanges.size(); gi++)
+            for (const auto & r : ruleRanges[gi].rules)
+                for (unsigned id : {r.idA, r.idB}) {
+                    size_t & u = lastPartUse[id];
+                    u = std::max(u, gi + 1);
+                }
+    unsigned compactionPoint = 0, nRetiring = 0;
+    bool tailCut = false;   // --bpe-tail stopped the kernels; `boundary` is the segment starts
+    StreamSet * tailSegs = nullptr;   // --bpe-tail: the segment starts, in the emitter's frame
+    gTailOpen.n = 0;
+    if (BPETail && !boundary)
+        std::cerr << "[BPE] --bpe-tail ignored: it needs a pretokenizer\n";
+    auto retiresAt = [&](unsigned point) {
+        return RetirePoints.empty()
+            || std::find(RetirePoints.begin(), RetirePoints.end(), point) != RetirePoints.end();
+    };
+
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
         if (g.rules.empty()) continue;
+        if (g.tailOnly) report_fatal_error("BPE: the --bpe-tail rules were reached as a kernel");
         unsigned output_bits = ceil_log2(g.hi);
         StreamSet * sOut  = P.CreateStreamSet(output_bits, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
@@ -2375,12 +3347,137 @@ BPEPassResult buildBPEPassPipeline(
         // the wrong token. The fresh mask is all-ones because every position that
         // survived the filter was, by construction, a live token start.
         if (!compactAfter[i]) continue;
+        ++compactionPoint;
+        if (BPETail && compactionPoint == BPETail && boundary) {
+            // --bpe-tail: no more kernels. The emitter finishes the rules of kernels i+1 on.
+            size_t numRules = 0;
+            for (size_t gi = i + 1; gi < ruleRanges.size(); gi++) numRules += ruleRanges[gi].rules.size();
+            const unsigned bits = std::max<unsigned>(4, ceil_log2(4 * numRules + 1));
+            gTail.slots.assign(size_t(1) << bits, kTailEmpty);
+            gTailGeneration++;
+            std::fill(std::begin(gTail.left), std::end(gTail.left), 0);
+            std::fill(std::begin(gTail.right), std::end(gTail.right), 0);
+            gTail.mask = (1u << bits) - 1;
+            gTail.shift = 32 - bits;
+            gTail.idBits = output_bits;   // the ids reaching the tail are below 2^output_bits
+            for (size_t gi = i + 1; gi < ruleRanges.size(); gi++)
+                for (const auto & r : ruleRanges[gi].rules) {
+                    const uint32_t key = (r.idA << 16) | r.idB;
+                    uint32_t h = tailSlot(key);
+                    while (gTail.slots[h] != kTailEmpty && uint32_t(gTail.slots[h] >> 16) != key)
+                        h = (h + 1) & gTail.mask;
+                    gTail.slots[h] = (uint64_t(key) << 16) | r.idAB;
+                    gTail.left[r.idA >> 6] |= 1ull << (r.idA & 63);
+                    gTail.right[r.idB >> 6] |= 1ull << (r.idB & 63);
+                }
+            tailCut = true;
+            std::cerr << "[BPE] --bpe-tail: " << (i + 1) << " of " << ruleRanges.size()
+                      << " merge kernels built; the emitter applies the other " << numRules << " rules\n";
+            break;
+        }
+        const bool retireHere = retire && retiresAt(compactionPoint);
         StreamSet * sourceC = P.CreateStreamSet(output_bits, 1);
-        FilterByMask(P, inPlayMask, source, sourceC);
-        if (boundary) {
+        if (!retireHere) {
+            FilterByMask(P, inPlayMask, source, sourceC);
+            if (boundary) {
+                StreamSet * boundaryC = P.CreateStreamSet(1, 1);
+                FilterByMask(P, inPlayMask, boundary, boundaryC);
+                boundary = boundaryC;
+            }
+            if (retire && !retirePoints.empty())
+                retirePoints.push_back({inPlayMask, nullptr, nullptr});
+        } else {
+            // Drop the finished words too (see the RetirePoint comment above). Every
+            // surviving position stays a live token start, so the next kernel still builds
+            // its all-ones mask locally.
+            ++nRetiring;
+            auto frozenId = [&](unsigned id) {
+                const auto f = lastPartUse.find(id);
+                return f == lastPartUse.end() || f->second <= i + 1;
+            };
+            if (RetireStuck && compactionPoint >= RetireStuck) {
+                // --retire-stuck: the frozen-id bitmap and the pairs of every later rule.
+                StuckTables tab;
+                uint64_t hash = 1469598103934665603ull;
+                auto mix = [&](uint64_t v) { hash = (hash ^ v) * 1099511628211ull; };
+                tab.frozen.assign(65536 / 64, 0);
+                for (unsigned id = 0; id < 65536; id++)
+                    if (frozenId(id)) tab.frozen[id >> 6] |= 1ull << (id & 63);
+                for (uint64_t w : tab.frozen) mix(w);
+                tab.pairs.assign((size_t(1) << kStuckBloomBits) / 64, 0);
+                for (size_t gi = i + 1; gi < ruleRanges.size(); gi++)
+                    for (const auto & r : ruleRanges[gi].rules) {
+                        const uint32_t key = (r.idA << 16) | r.idB;
+                        const uint32_t h = stuckHash(key);
+                        tab.pairs[h >> 6] |= 1ull << (h & 63);
+                        mix(key);
+                    }
+                const unsigned slot = gStuckTables.size();
+                gStuckTables.push_back(std::move(tab));
+                StreamSet * keptPre = P.CreateStreamSet(1, 1);
+                StreamSet * segPre = P.CreateStreamSet(1, 1);
+                // P2S16Kernel's StreamSets form names the kernel by the input's shape; the
+                // single-set form names every width "p2s_16", like the emitter's 16-bit one.
+                StreamSet * ids16 = P.CreateStreamSet(1, 16);
+                StreamSets idSets{source};
+                P.CreateKernelCall<P2S16Kernel>(idSets, ids16);
+                Kernel * const sk = P.CreateKernelCall<BPEStuckKernel>(ids16, inPlayMask, boundary,
+                                                                      keptPre, segPre, slot, hash);
+                P.LinkFunction(sk, "bpe_retire_stuck", bpe_retire_stuck);
+                FilterByMask(P, keptPre, source, sourceC);
+                StreamSet * boundaryK = P.CreateStreamSet(1, 1);
+                FilterByMask(P, keptPre, segPre, boundaryK);
+                retirePoints.push_back({inPlayMask, keptPre, source});
+                boundary = boundaryK;
+                source = sourceC;
+                inPlayMask = nullptr;
+                continue;
+            }
+            // --retire-frozen: the frozen ids below 2^output_bits, as intervals, and their
+            // complement; the kernel tests whichever has fewer intervals.
+            UCD::UnicodeSet frozenSet, liveSet;
+            uint64_t setHash = 1469598103934665603ull;
+            bool negate = false;
+            if (RetireFrozen) {
+                const unsigned idLimit = 1u << output_bits;
+                unsigned runStart = 0;
+                bool runFrozen = true;
+                for (unsigned id = 0; id <= idLimit; id++) {
+                    const bool fz = (id < idLimit) && frozenId(id);
+                    if (id < idLimit && id > 0 && fz == runFrozen) continue;
+                    if (id > 0) {
+                        (runFrozen ? frozenSet : liveSet).insert_range(runStart, id - 1);
+                        setHash = (setHash ^ (((uint64_t) runStart << 1) | runFrozen)) * 1099511628211ull;
+                    }
+                    runStart = id;
+                    runFrozen = fz;
+                }
+                negate = liveSet.size() < frozenSet.size();
+            }
+            // 1-bit streams only to Fc: the word starts and (--retire-frozen) frozen marks.
             StreamSet * boundaryC = P.CreateStreamSet(1, 1);
             FilterByMask(P, inPlayMask, boundary, boundaryC);
-            boundary = boundaryC;
+            StreamSet * frozenC = nullptr;
+            StreamSet * segPre = boundary;   // segment starts in Fp: word starts, plus barriers
+            if (RetireFrozen) {
+                StreamSet * frozenPre = P.CreateStreamSet(1, 1);
+                segPre = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<BPEFrozenKernel>(source, inPlayMask, boundary,
+                                                    negate ? liveSet : frozenSet, negate, setHash,
+                                                    frozenPre, segPre);
+                frozenC = P.CreateStreamSet(1, 1);
+                FilterByMask(P, inPlayMask, frozenPre, frozenC);
+            }
+            StreamSet * keep = P.CreateStreamSet(1, 1);
+            P.CreateKernelCall<BPERetireKernel>(boundaryC, frozenC, keep);
+            // keep back to Fp, then one filter of the ids and segment starts.
+            StreamSet * keptPre = P.CreateStreamSet(1, 1);
+            SpreadByMask(P, inPlayMask, keep, keptPre);
+            FilterByMask(P, keptPre, source, sourceC);
+            StreamSet * boundaryK = P.CreateStreamSet(1, 1);
+            FilterByMask(P, keptPre, segPre, boundaryK);
+            retirePoints.push_back({inPlayMask, keptPre, source});
+            boundary = boundaryK;
         }
         source     = sourceC;
         // nullptr, not BPEOnesKernel: whichever kernel consumes this next builds the
@@ -2402,6 +3499,46 @@ BPEPassResult buildBPEPassPipeline(
         P.CreateKernelCall<BPEWidenKernel>(source, source16);
         source = source16;
     }
+    // --retire-words merge-back, last point first, one 17-stream spread per point: at a
+    // retiring point SpreadByMask(keptPre) puts the later survivors back at their positions
+    // in Fp and BPERetireMergeKernel ORs in the retired tokens, whose ids Fp still holds; at
+    // any other point SpreadByMask(prevMask) steps back to Fp, with 0 (no token) at the
+    // positions it had dropped as consumed. The emitter scans Fp of the first retiring point.
+    // Not MergeByMask(keep, later, retired): it counts keep both ways (PopcountOf and
+    // PopcountOfNot), and on some inputs the pipeline's two-way popcount kernel then
+    // over-counts the filtered frame: later kernels ran on up to 1.9x phantom positions
+    // (right output, 1.7x slower; val_4MB LF with --retire-points=5, 2026-10-15).
+    // --bpe-tail: the same, with the segment starts as an 18th stream (see kTailStreams).
+    if (!retirePoints.empty() || tailCut) {
+        const unsigned numStreams = tailCut ? kTailStreams : kRetireStreams;
+        StreamSet * cur = P.CreateStreamSet(numStreams, 1);
+        P.CreateKernelCall<BPERetirePackKernel>(source, inPlayMask, cur, tailCut ? boundary : nullptr);
+        for (size_t m = retirePoints.size(); m-- > 0; ) {
+            const RetirePoint & rp = retirePoints[m];
+            StreamSet * spread = P.CreateStreamSet(numStreams, 1);
+            SpreadByMask(P, rp.keptPre ? rp.keptPre : rp.prevMask, cur, spread);
+            cur = spread;
+            if (rp.keptPre) {
+                StreamSet * merged = P.CreateStreamSet(numStreams, 1);
+                P.CreateKernelCall<BPERetireMergeKernel>(cur, rp.idsPre, rp.prevMask, rp.keptPre, merged);
+                cur = merged;
+            }
+        }
+        StreamSet * ids = P.CreateStreamSet(16, 1);
+        StreamSet * starts = P.CreateStreamSet(1, 1);
+        tailSegs = tailCut ? P.CreateStreamSet(1, 1) : nullptr;
+        P.CreateKernelCall<BPERetireUnpackKernel>(cur, ids, starts, tailSegs);
+        source = ids;
+        inPlayMask = starts;
+        if (!retirePoints.empty()) {
+            std::cerr << "[BPE] --retire-words: retiring at " << nRetiring << " of "
+                      << compactionPoint << " compaction points";
+            if (!gStuckTables.empty())
+                std::cerr << " (" << gStuckTables.size() << " with --retire-stuck)";
+            std::cerr << "\n";
+        }
+    }
+    if (tailCut) return {inPlayMask, source, tailSegs};
     if (BitFrequencyStatistics) {
         Kernel * k = P.CreateKernelCall<BPEBitFrequencyKernel>(source, inPlayMask);
         P.CreateCall("bpe_report_bit_frequency", bpe_report_bit_frequency,
@@ -3026,6 +4163,7 @@ static std::vector<MergeRuleGroup> cleanRangePartition(const std::vector<MergeRu
 static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
     unsigned totalFlags = 0, totalRules = 0, groupsWithFlags = 0;
     for (auto & g : groups) {
+        if (g.tailOnly) continue;
         std::unordered_set<unsigned> consumedAsB;   // idB values used by earlier rules in this group
         unsigned before = totalFlags;
         for (auto & r : g.rules) {
@@ -3049,7 +4187,7 @@ static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
                   << groups.size() << " groups\n";
 }
 
-std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
+std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges(unsigned tailPoint) const {
     // 1. Resolve every raw merge → MergeRule.
     std::vector<MergeRule> rules;
     unsigned skipped = 0;                            // parts not found in the vocab
@@ -3090,7 +4228,25 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
         // rules are rank-sorted, so each bit tier is a contiguous run of them
         PartitionContext ctx;
         size_t i = 0, n = rules.size();
+        // --bpe-tail under by-output-bits: the compaction points sit at the ends of tiers
+        // (applyCompactionSchedule), so the tail's cut is known as the tiers are partitioned.
+        // The tiers past it never become kernels: their rules go to the tail as one
+        // unpartitioned group, which saves partitioning ~50k rules (~75 ms per run) and
+        // leaves the kernels before the cut as they were.
+        const bool tailCutKnown = tailPoint > 0 && compactionMode() == CompactionMode::ByOutputBits;
+        unsigned points = 0, kernelsSoFar = 0;
         while (i < n) {
+            if (tailCutKnown && points == tailPoint) {
+                MergeRuleGroup g;
+                g.rules.assign(rules.begin() + i, rules.end());
+                g.lo = g.rules.front().idAB;
+                g.hi = g.rules.back().idAB + 1;
+                g.tailOnly = true;
+                std::cerr << "[BPE] --bpe-tail: " << g.rules.size() << " rules past the cut left "
+                          "unpartitioned\n";
+                groups.push_back(std::move(g));
+                break;
+            }
             const unsigned bits = ceil_log2(rules[i].idAB + 1);   // bit length of idAB
             size_t j = i;
             while (j < n && ceil_log2(rules[j].idAB + 1) == bits) ++j;
@@ -3101,7 +4257,13 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             // applyCompactionSchedule
             ctx.kernelOffset += tier.size();
             for (size_t t = 0; t < tier.size(); t++) ctx.counter.step();
-            for (auto & g : tier) groups.push_back(std::move(g));
+            for (auto & g : tier) {
+                if (!g.rules.empty()) kernelsSoFar++;
+                groups.push_back(std::move(g));
+            }
+            // by-output-bits places a point after a tier's last kernel when a wider tier
+            // follows and at least --compact-base kernels have run (applyCompactionSchedule)
+            if (j < n && kernelsSoFar >= effCompactEvery()) points++;
             i = j;
         }
     } else {

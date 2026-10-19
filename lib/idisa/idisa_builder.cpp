@@ -1303,8 +1303,9 @@ Value * IDISA_Builder::bitblock_any(Value * a) {
     if (aType->isIntegerTy()) {
         return CreateICmpNE(a, ConstantInt::getNullValue(aType));
     } else {
-        Value * r = simd_ne(mLaneWidth, a,  ConstantInt::getNullValue(mBitBlockType));
-        r = hsimd_signmask(mLaneWidth, r);
+        // Compare the whole block as one integer: LLVM lowers this to ptest/vptest
+        // (SSE4.1/AVX2), vptestmd+kortest (AVX-512) and pcmpeqd/movmskps on plain SSE2.
+        Value * r = CreateBitCast(a, getIntNTy(getVectorBitWidth(a)));
         return CreateICmpNE(r, ConstantInt::getNullValue(r->getType()), "bitblock_any");
     }
 }

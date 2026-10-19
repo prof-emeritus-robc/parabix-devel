@@ -573,6 +573,16 @@ add_test(
   COMMAND python3 objcache_test.py "${BIN_DIR}")
 
 add_test(
+  NAME xch_test
+  WORKING_DIRECTORY ${QA_DIR}/xch
+  COMMAND python3 xch_test.py "${BIN_DIR}/xch")
+
+add_test(
+  NAME hexlines_test
+  WORKING_DIRECTORY ${QA_DIR}/hexlines
+  COMMAND python3 hexlines_test.py "${BIN_DIR}/hexlines")
+
+add_test(
   NAME csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
   COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")

@@ -23,8 +23,13 @@ namespace parabix {
 
 namespace {
 
-// image base address -> (target name -> source hash)
-using Registry = std::map<const void *, std::map<std::string, std::string>>;
+struct Registration {
+    std::string hash;
+    std::string modules;
+};
+
+// image base address -> (target name -> registration)
+using Registry = std::map<const void *, std::map<std::string, Registration>>;
 
 // Registration runs in static initializers of every image, so the registry
 // is created on first use rather than depending on initialization order.
@@ -55,10 +60,10 @@ std::string toHex(const uint8_t * bytes, const size_t n) {
 
 } // anonymous namespace
 
-bool registerSourceHash(const void * anchor, const char * target, const char * hash) {
+bool registerSourceHash(const void * anchor, const char * target, const char * hash, const char * modules) {
     auto R = registry();
     std::lock_guard<std::mutex> L(R.second);
-    R.first[imageBase(anchor)][target] = hash;
+    R.first[imageBase(anchor)][target] = Registration{hash, modules};
     return true;
 }
 
@@ -73,18 +78,37 @@ std::string getImageSourceHash(const void * address) {
     if (f == R.first.end()) {
         return std::string{};
     }
-    const auto & hashes = f->second;
-    if (hashes.size() == 1) {
-        return hashes.begin()->second;
+    const auto & targets = f->second;
+    if (targets.size() == 1) {
+        return targets.begin()->second.hash;
     }
     std::string joined;
-    for (const auto & h : hashes) {
-        joined.append(h.first);
+    for (const auto & t : targets) {
+        joined.append(t.first);
         joined.push_back(':');
-        joined.append(h.second);
+        joined.append(t.second.hash);
         joined.push_back(',');
     }
     return joined;
+}
+
+std::string getImageModules(const void * address) {
+    const void * const base = imageBase(address);
+    if (base == nullptr) {
+        return std::string{};
+    }
+    auto R = registry();
+    std::lock_guard<std::mutex> L(R.second);
+    const auto f = R.first.find(base);
+    if (f == R.first.end()) {
+        return std::string{};
+    }
+    std::string modules;
+    for (const auto & t : f->second) {
+        if (!modules.empty()) modules.push_back(' ');
+        modules.append(t.second.modules);
+    }
+    return modules;
 }
 
 std::string getImageName(const void * address) {

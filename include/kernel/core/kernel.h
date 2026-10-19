@@ -295,6 +295,10 @@ public:
     // in the tags of those kernels.
     virtual std::string getSourceTag() const;
 
+    // Whether generating this kernel twice from the same source and options yields the same
+    // IR.  -VerifyCache compares cached kernels with freshly generated IR only when it does.
+    virtual bool hasDeterministicCodeGeneration() const { return true; }
+
     virtual bool isCachable() const { return true; }
 
     // Called by the PipelineBuilder when the kernel is added to a pipeline, after construction

@@ -113,6 +113,11 @@ public:
 
     std::string getSourceTag() const final;
 
+    // The pipeline analysis searches for buffer layouts and schedules with wall-clock
+    // limits and several threads, so the same pipeline may be laid out differently
+    // from run to run.
+    bool hasDeterministicCodeGeneration() const final { return false; }
+
     const Kernels & getKernels() const {
         return mKernels;
     }

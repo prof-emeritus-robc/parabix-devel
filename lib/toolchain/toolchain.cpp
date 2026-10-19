@@ -181,6 +181,9 @@ KernelFlags(cl::desc("Flags controlling kernel/pipeline compilation"),
                         clEnumVal(EnableMProtect, "Use mprotect to cause a write fault when erroneously "
                                                   "overwriting kernel state / stream space."),
                         clEnumVal(ForcePipelineRecompilation, "Disable object cache lookup for any PipelineKernel."),
+                        clEnumVal(VerifyCache, "On an object cache hit, regenerate the kernel's IR anyway and check that it matches "
+                                               "the IR the cached object was compiled from, reporting any dependency missing "
+                                               "from the kernel's cache key."),
                         clEnumVal(VerifyIR, "Run the IR verification pass.")),
             cl::cat(CodeGenOptions));
 
@@ -472,7 +475,10 @@ bool LLVM_READONLY AnyDebugOptionIsSet() {
     #ifdef FORCE_ASSERTIONS
     return true;
     #endif
-    return (KernelFlags.getBits() != 0) || 
+    // -VerifyCache only checks cached kernels against the code generated for them, so it
+    // must not change that code (as debug options do, e.g. by adding instrumentation).
+    const auto kernelFlags = KernelFlags.getBits() & ~(1u << VerifyCache);
+    return (kernelFlags != 0) ||
            (JIT_InfoFlags.getBits() != 0) || 
            (StatisticsOptions.getBits() != 0);
 }

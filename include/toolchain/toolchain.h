@@ -57,6 +57,7 @@ enum DebugFlags {
     DisableCacheAlignedKernelStructs,
     DisableInOutAttributes,
     ForcePipelineRecompilation,
+    VerifyCache,
     DebugFlagSentinel
 };
 

@@ -18,14 +18,19 @@ namespace parabix {
 // kernel then gives a hash that changes exactly when the source that kernel
 // can depend on changes.
 
-// Registers HASH as a source hash of TARGET, linked into the image holding
-// ANCHOR.  Called by the generated files; returns true.
-bool registerSourceHash(const void * anchor, const char * target, const char * hash);
+// Registers HASH as the source hash of TARGET, linked into the image holding
+// ANCHOR; MODULES lists (space-separated) the Parabix modules the hash covers.
+// Called by the generated files; returns true.
+bool registerSourceHash(const void * anchor, const char * target, const char * hash, const char * modules);
 
 // The source hash of the image holding ADDRESS.  When several targets were
 // linked into one image (static builds), their hashes are joined in target
 // order.  Empty if no hash was registered for that image.
 std::string getImageSourceHash(const void * address);
+
+// The Parabix modules (space-separated) covered by the source hash of the image
+// holding ADDRESS: those of every target linked into it.  Empty if none.
+std::string getImageModules(const void * address);
 
 // The file name (without directories) of the image holding ADDRESS.
 std::string getImageName(const void * address);

@@ -162,7 +162,14 @@ void MCJITBackend::generateUncachedKernels() {
 
         Module * M = nullptr;
 
-        if (mDriver.mObjectCache && Target->isCachable()) {
+        ParabixObjectCache::VerificationEntry verification;
+
+        if (LLVM_UNLIKELY(mDriver.mObjectCache && Target->isCachable() && codegen::DebugOptionIsSet(codegen::VerifyCache)
+                          && Target->hasDeterministicCodeGeneration())) {
+            // Generate the kernel as if it were not cached; the cached object is used
+            // instead of compiling the module only if the IR matches the entry's.
+            verification = mDriver.mObjectCache->loadCachedObjectFileForVerification(builder, Target);
+        } else if (mDriver.mObjectCache && Target->isCachable()) {
             std::unique_ptr<MemoryBuffer> cached;
             std::unique_ptr<Module> cachedModule;
             std::tie(cached, cachedModule) = mDriver.mObjectCache->loadCachedObjectFile(builder, Target);
@@ -190,6 +197,18 @@ void MCJITBackend::generateUncachedKernels() {
         Target->declareStateTypes(builder);
         Target->linkExternalMethods(builder);
         Target->generateKernel(builder, mTarget, GlobalValue::ExternalLinkage);
+
+        if (LLVM_UNLIKELY(verification.Object != nullptr)) {
+            // -VerifyCache: a mismatch is a fatal error; an entry without a hash is recompiled.
+            if (mDriver.mObjectCache->verifyIRHash(Target, *M, verification)) {
+                mObjectCacheAdapter->registerPrecompiled(M, std::move(verification.Object));
+                mCompiledModules.emplace_back(Target, M);
+                continue;
+            }
+        }
+        if (mDriver.mObjectCache && Target->isCachable()) {
+            ParabixObjectCache::recordIRHash(*M);
+        }
 
         Kernel::SelectedOptimizationPasses passes;
         Target->addOptimizationPasses(builder, passes);

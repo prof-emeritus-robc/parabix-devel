@@ -274,10 +274,10 @@ OptimizationLevel("optimization-level", cl::location(OptLevel), cl::init(CodeGen
                              clEnumValN(CodeGenOptLevel::Default, "standard", "standard optimizations"),
                              clEnumValN(CodeGenOptLevel::Aggressive, "aggressive", "aggressive optimizations")), cl::cat(CodeGenOptions));
 static cl::opt<CodeGenOptLevel, true>
-BackEndOptOption("backend-optimization-level", cl::location(BackEndOptLevel), cl::init(CodeGenOptLevel::None), cl::desc("Set the back-end optimization level:"),
-                  cl::values(clEnumValN(CodeGenOptLevel::None, "none", "no optimizations (default)"),
+BackEndOptOption("backend-optimization-level", cl::location(BackEndOptLevel), cl::init(CodeGenOptLevel::Default), cl::desc("Set the back-end optimization level:"),
+                  cl::values(clEnumValN(CodeGenOptLevel::None, "none", "no optimizations"),
                              clEnumValN(CodeGenOptLevel::Less, "less", "trivial optimizations"),
-                             clEnumValN(CodeGenOptLevel::Default, "standard", "standard optimizations"),
+                             clEnumValN(CodeGenOptLevel::Default, "standard", "standard optimizations (default)"),
                              clEnumValN(CodeGenOptLevel::Aggressive, "aggressive", "aggressive optimizations")), cl::cat(CodeGenOptions));
 
 PipelineCompilationModeOptions PipelineCompilationMode = PipelineCompilationModeOptions::DefaultFast;

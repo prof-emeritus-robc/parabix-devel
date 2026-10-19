@@ -294,9 +294,11 @@ function(parabix_add_module)
         "USES_Z3;USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH" # boolean args
         "NAME"          # mono-valued arguments:
                         #   NAME: target name
-        "SRC;DEPS"      # multi-valued arguments:
+        "SRC;DEPS;CODEGEN_DEPS" # multi-valued arguments:
                         #   SRC:  source file list
                         #   DEPS: target dependencies
+                        #   CODEGEN_DEPS: the DEPS whose code can run while this module's
+                        #       kernels are generated (see cmake/ParabixSourceHash.cmake)
         ${ARGN}         # arguments to parse
     )
     if(NOT ARG_NAME)
@@ -305,7 +307,10 @@ function(parabix_add_module)
     # The public headers of lib/<path> are in include/<path>
     file(RELATIVE_PATH MODULE_PATH ${PROJECT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR})
     set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include/${MODULE_PATH})
-    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} INCLUDE_DIR ${INCLUDE_DIR})
+    if("CODEGEN_DEPS" IN_LIST ARGN)
+        set(SRCHASH_CODEGEN_ARGS CODEGEN_DEPS ${ARG_CODEGEN_DEPS})
+    endif()
+    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} ${SRCHASH_CODEGEN_ARGS} INCLUDE_DIR ${INCLUDE_DIR})
     if(ARTIFACT_MODE STREQUAL "Single")
         foreach(SRC ${ARG_SRC})
             target_sources(${PARABIX_MONO_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${SRC})

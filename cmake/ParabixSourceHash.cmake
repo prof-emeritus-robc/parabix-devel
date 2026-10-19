@@ -5,16 +5,33 @@
 #
 # Every library module and executable gets a generated source file,
 # <target>_srchash.cpp, holding a SHA-256 over the sources and headers of that
-# target and of every Parabix module it depends on (transitively), plus a
-# configuration salt (LLVM, compiler, build type and flags).  The hash changes
-# exactly when the source of some module the target depends on changes, so it
-# can key cached kernels at module granularity.
+# target and of every Parabix module its code generation depends on
+# (transitively), plus the inputs that shape the code of every kernel (the
+# pipeline driver, which optimizes and compiles each kernel module) and a
+# configuration salt (LLVM, compiler, build type and flags).  The hash keys the
+# cached kernels defined in the target.
+#
+# Code generation dependencies.  A kernel's cached object must change when
+# code that runs while the kernel's IR is generated, or turned into an object,
+# changes; other code need not be in its key.  Each module therefore has
+# CODEGEN_DEPS, the modules whose code its kernels' generation can run.  By
+# default they are its DEPS (and whatever target_link_libraries adds) less the
+# modules in PARABIX_SRCHASH_NON_CODEGEN_MODULES.  A module lists CODEGEN_DEPS
+# explicitly when some of its DEPS are needed only to build pipelines: kernel
+# modules link other kernel modules to instantiate their kernels in helper
+# pipelines, and those kernels are compiled, and cached, under their own keys.
+# A dependency missing from CODEGEN_DEPS makes stale kernels look current;
+# -VerifyCache detects that.
 #
 # Usage:
-#   parabix_srchash_add_inputs(<name> SRC <files...> DEPS <deps...> [INCLUDE_DIR <dir>])
+#   parabix_srchash_add_inputs(<name> SRC <files...> DEPS <deps...>
+#                              [CODEGEN_DEPS <deps...>] [INCLUDE_DIR <dir>])
 #       Records the inputs and direct dependencies of a module or executable.
 #       Called for every module, including in ARTIFACT_MODE=Single, where the
 #       module is not a target of its own.
+#   parabix_srchash_add_codegen_inputs(<label> <files...>)
+#       Adds files that shape the code of every kernel to every hash; <label>
+#       names them in the module lists.
 #   parabix_srchash_attach(<target>)
 #       Adds the generated <target>_srchash.cpp to <target>, which registers the
 #       hash with lib/srchash when the image holding <target> is loaded.  Must
@@ -26,6 +43,12 @@
 set(PARABIX_SRCHASH_SCRIPT ${CMAKE_CURRENT_LIST_DIR}/ComputeSourceHash.cmake)
 set(PARABIX_SRCHASH_DIR ${CMAKE_BINARY_DIR}/srchash)
 set(PARABIX_SRCHASH_HEADER_GLOBS *.h *.hh *.hpp *.hxx *.inc *.def *.tcc)
+
+# Modules whose code never runs while a kernel's IR is generated or compiled:
+# kernel.pipeline holds the pipeline builder and compiler (the driver part of
+# it is added to every hash with parabix_srchash_add_codegen_inputs), objcache
+# stores compiled objects and srchash identifies them.
+set(PARABIX_SRCHASH_NON_CODEGEN_MODULES kernel.pipeline objcache srchash)
 
 # Lists the headers below DIR, leaving out subdirectories that hold a module of
 # their own (a CMakeLists.txt in the corresponding directory of SRC_DIR).
@@ -46,7 +69,7 @@ function(parabix_srchash_glob_headers OUT DIR SRC_DIR)
 endfunction(parabix_srchash_glob_headers)
 
 function(parabix_srchash_add_inputs NAME)
-    cmake_parse_arguments(ARG "" "INCLUDE_DIR" "SRC;DEPS" ${ARGN})
+    cmake_parse_arguments(ARG "" "INCLUDE_DIR" "SRC;DEPS;CODEGEN_DEPS" ${ARGN})
     set(INPUTS "")
     foreach(SRC ${ARG_SRC})
         get_filename_component(ABS ${SRC} ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
@@ -62,7 +85,42 @@ function(parabix_srchash_add_inputs NAME)
     set_property(GLOBAL APPEND PROPERTY PARABIX_SRCHASH_NAMES ${NAME})
     set_property(GLOBAL PROPERTY PARABIX_SRCHASH_INPUTS_${NAME} ${INPUTS})
     set_property(GLOBAL PROPERTY PARABIX_SRCHASH_DEPS_${NAME} ${ARG_DEPS})
+    # An explicit CODEGEN_DEPS, even an empty one, replaces the default.
+    if("CODEGEN_DEPS" IN_LIST ARGN)
+        set_property(GLOBAL PROPERTY PARABIX_SRCHASH_CODEGEN_DEPS_${NAME} ${ARG_CODEGEN_DEPS})
+        set_property(GLOBAL PROPERTY PARABIX_SRCHASH_EXPLICIT_${NAME} TRUE)
+    endif()
 endfunction(parabix_srchash_add_inputs)
+
+function(parabix_srchash_add_codegen_inputs LABEL)
+    foreach(FILE ${ARGN})
+        get_filename_component(ABS ${FILE} ABSOLUTE BASE_DIR ${CMAKE_CURRENT_SOURCE_DIR})
+        set_property(GLOBAL APPEND PROPERTY PARABIX_SRCHASH_CODEGEN_INPUTS ${ABS})
+    endforeach()
+    set_property(GLOBAL APPEND PROPERTY PARABIX_SRCHASH_CODEGEN_LABELS ${LABEL})
+endfunction(parabix_srchash_add_codegen_inputs)
+
+# The direct code generation dependencies of module or executable NAME.
+function(parabix_srchash_codegen_deps OUT NAME)
+    get_property(EXPLICIT GLOBAL PROPERTY PARABIX_SRCHASH_EXPLICIT_${NAME})
+    if(EXPLICIT)
+        get_property(DEPS GLOBAL PROPERTY PARABIX_SRCHASH_CODEGEN_DEPS_${NAME})
+    else()
+        # Those recorded with the inputs, plus whatever was linked later with
+        # target_link_libraries, less the modules that never shape kernel code.
+        get_property(DEPS GLOBAL PROPERTY PARABIX_SRCHASH_DEPS_${NAME})
+        if(TARGET ${NAME})
+            get_target_property(LINKED ${NAME} LINK_LIBRARIES)
+            if(LINKED)
+                list(APPEND DEPS ${LINKED})
+            endif()
+        endif()
+        if(DEPS)
+            list(REMOVE_ITEM DEPS ${PARABIX_SRCHASH_NON_CODEGEN_MODULES})
+        endif()
+    endif()
+    set(${OUT} ${DEPS} PARENT_SCOPE)
+endfunction(parabix_srchash_codegen_deps)
 
 function(parabix_srchash_attach TARGET)
     string(MAKE_C_IDENTIFIER ${TARGET} ID)
@@ -135,17 +193,14 @@ function(parabix_srchash_finalize)
 
     get_property(NAMES GLOBAL PROPERTY PARABIX_SRCHASH_NAMES)
     get_property(TARGETS GLOBAL PROPERTY PARABIX_SRCHASH_TARGETS)
+    get_property(CODEGEN_INPUTS GLOBAL PROPERTY PARABIX_SRCHASH_CODEGEN_INPUTS)
+    get_property(CODEGEN_LABELS GLOBAL PROPERTY PARABIX_SRCHASH_CODEGEN_LABELS)
     foreach(TGT ${TARGETS})
-        # Direct dependencies: those recorded with the inputs, plus whatever
-        # was linked later with target_link_libraries.
-        get_property(DEPS GLOBAL PROPERTY PARABIX_SRCHASH_DEPS_${TGT})
-        get_target_property(LINKED ${TGT} LINK_LIBRARIES)
-        if(LINKED)
-            list(APPEND DEPS ${LINKED})
-        endif()
         if(TGT STREQUAL PARABIX_MONO_TARGET)
             # The single artifact holds every module.
-            list(APPEND DEPS ${NAMES})
+            set(DEPS ${NAMES})
+        else()
+            parabix_srchash_codegen_deps(DEPS ${TGT})
         endif()
         # Depth-first closure over the Parabix modules only.
         set(CLOSURE ${TGT})
@@ -156,17 +211,11 @@ function(parabix_srchash_finalize)
             list(FIND CLOSURE "${DEP}" SEEN)
             if(IS_MODULE GREATER -1 AND SEEN EQUAL -1)
                 list(APPEND CLOSURE ${DEP})
-                get_property(MORE GLOBAL PROPERTY PARABIX_SRCHASH_DEPS_${DEP})
-                if(TARGET ${DEP})
-                    get_target_property(MORE_LINKED ${DEP} LINK_LIBRARIES)
-                    if(MORE_LINKED)
-                        list(APPEND MORE ${MORE_LINKED})
-                    endif()
-                endif()
+                parabix_srchash_codegen_deps(MORE ${DEP})
                 list(APPEND PENDING ${MORE})
             endif()
         endwhile()
-        set(INPUTS ${CONFIG_FILE})
+        set(INPUTS ${CONFIG_FILE} ${CODEGEN_INPUTS})
         foreach(MODULE ${CLOSURE})
             get_property(MODULE_INPUTS GLOBAL PROPERTY PARABIX_SRCHASH_INPUTS_${MODULE})
             list(APPEND INPUTS ${MODULE_INPUTS})
@@ -175,6 +224,7 @@ function(parabix_srchash_finalize)
         list(SORT INPUTS)
         set_property(TARGET ${TGT} PROPERTY PARABIX_SRCHASH_CLOSURE ${INPUTS})
         list(SORT CLOSURE)
+        list(APPEND CLOSURE ${CODEGEN_LABELS})
         string(MAKE_C_IDENTIFIER ${TGT} ID)
         string(REPLACE ";" "\n" INPUT_LINES "${INPUTS}")
         string(REPLACE ";" " " MODULE_NAMES "${CLOSURE}")

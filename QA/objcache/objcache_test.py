@@ -20,8 +20,11 @@
 #
 # Rebuild checks (--build-dir): for each scenario, append a comment to one
 # source file, rebuild the tools, and check that exactly the kernels whose
-# module depends on the edited module (and the pipelines holding them) are
-# recompiled, while all the others are read from the cache.  The file is then
+# code generation depends on the edited module (per the module lists in
+# <build>/srchash/*.inputs), and the pipelines holding them, are recompiled,
+# while all the others are read from the cache.  The scenarios cover a module
+# of the RE front end, the pipeline compiler (only pipelines depend on it), the
+# pipeline driver and kernel.core (every kernel depends on those).  The file is then
 # restored and rebuilt, and every kernel must be read from the cache, and
 # verified, again.  These checks edit the source tree (restoring it afterwards)
 # and rebuild much of the framework; `make objcache_test` runs them.
@@ -47,6 +50,10 @@ SOURCE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 # (module, file in that module) edited by each rebuild scenario.
 SCENARIOS = {
     're.printer': 'lib/re/printer/re_printer.cpp',
+    # the pipeline compiler: only pipeline kernels depend on it
+    'kernel.pipeline': 'lib/kernel/pipeline/compiler/codegen/pipeline_logic.cpp',
+    # the driver optimizes and compiles every kernel
+    'kernel.pipeline/driver': 'lib/kernel/pipeline/driver/driver.cpp',
     'kernel.core': 'lib/kernel/core/kernel.cpp',
 }
 

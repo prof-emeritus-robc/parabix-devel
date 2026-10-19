@@ -21,4 +21,10 @@ DEPS
     re.unicode
     re.transforms
     re.printer
+# The kernel modules are linked only to build pipelines from their kernels.
+CODEGEN_DEPS
+    re.compile
+    re.unicode
+    re.transforms
+    re.printer
 )

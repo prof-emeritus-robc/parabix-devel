@@ -12,35 +12,29 @@ constexpr static unsigned INITIAL_TOPOLOGICAL_POPULATION_SIZE = 10;
 
 constexpr static unsigned MAX_PARTITION_POPULATION_SIZE = 20;
 
-constexpr static unsigned PARITION_SCHEDULING_GA_INIT_TIME = 1;
-
 constexpr static unsigned MAX_INIT_PARTITION_POPULATION_SIZE = 10;
-
-constexpr static unsigned PARITION_SCHEDULING_GA_MAX_TIME = 2;
 
 constexpr static unsigned MAX_PROGRAM_POPULATION_SIZE = 20;
 
 constexpr static unsigned PARITION_SCHEDULING_GA_STALLS = 10;
 
-constexpr static unsigned JUMP_SCHEDULING_GA_MAX_INIT_TIME_SECONDS = 2;
+constexpr static unsigned PARITION_SCHEDULING_GA_MAX_GENERATIONS = 10 * PARITION_SCHEDULING_GA_STALLS;
 
 constexpr static unsigned MAX_INIT_JUMP_POPULATION_SIZE = 10;
-
-constexpr static unsigned JUMP_SCHEDULING_GA_MAX_TIME_SECONDS = 10;
 
 constexpr static unsigned MAX_JUMP_POPULATION_SIZE = 20;
 
 constexpr static unsigned JUMP_SCHEDULING_GA_STALLS = 25;
 
-using Vertex = unsigned;
+constexpr static unsigned JUMP_SCHEDULING_GA_MAX_GENERATIONS = 10 * JUMP_SCHEDULING_GA_STALLS;
 
-constexpr static unsigned PROGRAM_SCHEDULING_GA_MAX_INIT_TIME_SECONDS = 2; // 50;
+using Vertex = unsigned;
 
 constexpr static unsigned MAX_INIT_PROGRAM_POPULATION_SIZE = 20; // 50;
 
-constexpr static unsigned PROGRAM_SCHEDULING_GA_MAX_TIME_SECONDS = 5; // 50;
-
 constexpr static unsigned PROGRAM_SCHEDULING_GA_STALLS = 10;
+
+constexpr static unsigned PROGRAM_SCHEDULING_GA_MAX_GENERATIONS = 10 * PROGRAM_SCHEDULING_GA_STALLS;
 
 constexpr static unsigned BIPARTITE_GRAPH_UNPLACED = 0;
 
@@ -1061,9 +1055,8 @@ struct PartitionSchedulingAnalysis final : public PermutationBasedEvolutionaryAl
     PartitionSchedulingAnalysis(const SchedulingGraph & S, const PartitionDependencyGraph & D,
                                 const unsigned numOfKernels, pipeline_random_engine & rng)
     : PermutationBasedEvolutionaryAlgorithm(numOfKernels,
-                                            PARITION_SCHEDULING_GA_INIT_TIME,
                                             MAX_INIT_PARTITION_POPULATION_SIZE,
-                                            PARITION_SCHEDULING_GA_MAX_TIME,
+                                            PARITION_SCHEDULING_GA_MAX_GENERATIONS,
                                             MAX_PARTITION_POPULATION_SIZE,
                                             PARITION_SCHEDULING_GA_STALLS,
                                             std::max(codegen::SegmentThreads, codegen::TaskThreads),
@@ -1733,9 +1726,8 @@ struct ProgramSchedulingJumpAnalysis final : public PermutationBasedEvolutionary
                               const unsigned numOfUnlinkedPartitions,
                               pipeline_random_engine & srcRng)
     : PermutationBasedEvolutionaryAlgorithm(numOfUnlinkedPartitions,
-                                            JUMP_SCHEDULING_GA_MAX_INIT_TIME_SECONDS,
                                             MAX_INIT_JUMP_POPULATION_SIZE,
-                                            JUMP_SCHEDULING_GA_MAX_TIME_SECONDS,
+                                            JUMP_SCHEDULING_GA_MAX_GENERATIONS,
                                             MAX_JUMP_POPULATION_SIZE,
                                             JUMP_SCHEDULING_GA_STALLS,
                                             std::max(codegen::SegmentThreads, codegen::TaskThreads),
@@ -2024,9 +2016,8 @@ struct ProgramSchedulingAnalysis final : public PermutationBasedEvolutionaryAlgo
                               const unsigned numOfKernels,
                               pipeline_random_engine & srcRng)
     : PermutationBasedEvolutionaryAlgorithm(numOfKernels,
-                                            PROGRAM_SCHEDULING_GA_MAX_INIT_TIME_SECONDS,
                                             MAX_INIT_PROGRAM_POPULATION_SIZE,
-                                            PROGRAM_SCHEDULING_GA_MAX_TIME_SECONDS,
+                                            PROGRAM_SCHEDULING_GA_MAX_GENERATIONS,
                                             MAX_PROGRAM_POPULATION_SIZE,
                                             PROGRAM_SCHEDULING_GA_STALLS,
                                             std::max(codegen::SegmentThreads, codegen::TaskThreads),

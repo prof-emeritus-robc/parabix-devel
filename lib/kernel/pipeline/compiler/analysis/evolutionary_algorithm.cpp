@@ -1,89 +1,9 @@
 #include "evolutionary_algorithm.hpp"
-#include <boost/lockfree/queue.hpp>
-#include <atomic>
-#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
-#include <queue>
 
-using namespace std::chrono;
-
-using TimePoint = time_point<system_clock, seconds>;
 using Candidate = kernel::PermutationBasedEvolutionaryAlgorithm::Candidate;
-
-struct TASLock {
-    inline void lock() {
-        while(_lock.exchange(true, std::memory_order_acquire));
-    }
-    inline void unlock() {
-        _lock.store(false, std::memory_order_release);
-    }
-private:
-    std::atomic<bool> _lock = {false};
-};
-
-template <typename T>
-struct WorkQueue {
-
-    inline bool empty() const {
-        // NOTE: not thread safe; used only for debugging.
-        return _queue.empty();
-    }
-
-    WorkQueue() = default;
-
-    inline bool pop(T & c) {
-        std::lock_guard<TASLock> lock(_lock);
-        if (_queue.empty()) {
-            return false;
-        }
-        c.swap(_queue.front());
-        _queue.pop();
-        return true;
-    }
-
-    inline void push(T && item) {
-        std::lock_guard<TASLock> lock(_lock);
-        _queue.push(std::move(item));
-        ++_pending;
-    }
-
-    // Call once the item popped by a successful pop() has been fully processed.
-    // _pending is incremented inside push() (before the item is ever visible to a
-    // popper) and decremented here (after processing completes), both under the
-    // same lock as pop() itself -- so hasPendingWork() returning false is a real
-    // happens-before guarantee that every push has been fully processed, unlike
-    // a separately-incremented "active worker count" that isn't updated in the
-    // same atomic step as the pop that makes it active (that gap let the main
-    // thread conclude "no worker is active" while a worker had already removed
-    // an item from the queue but not yet finished/been counted as processing
-    // it -- confirmed via ThreadSanitizer as a genuine race on nextGeneration
-    // between a worker still inside processCandidate and the main thread moving
-    // on to mutate it directly).
-    inline void markDone() {
-        std::lock_guard<TASLock> lock(_lock);
-        assert (_pending > 0);
-        --_pending;
-    }
-
-    // True if any pushed item has not yet been popped, or has been popped but
-    // not yet markDone()'d.
-    inline bool hasPendingWork() const {
-        std::lock_guard<TASLock> lock(_lock);
-        return !_queue.empty() || _pending > 0;
-    }
-
-    inline size_t size() {
-        std::lock_guard<TASLock> lock(_lock);
-        return _queue.size();
-    }
-
-private:
-    mutable std::queue<T> _queue;
-    mutable TASLock _lock;
-    size_t _pending = 0;
-};
-
-using CandidateQueue = WorkQueue<Candidate>;
 
 template<typename T>
 T abs_subtract(const T a, const T b) {
@@ -94,10 +14,110 @@ T abs_subtract(const T a, const T b) {
     }
 }
 
+namespace {
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief ParallelFor
+ *
+ * Runs task(worker, i) for every i < n on a fixed set of threads (the caller being worker 0) and returns once all
+ * are done.  Which worker runs which item varies from run to run, so tasks must not depend on it.
+ ** ------------------------------------------------------------------------------------------------------------- */
+class ParallelFor {
+public:
+
+    using Task = llvm::function_ref<void(unsigned worker, size_t i)>;
+
+    explicit ParallelFor(const unsigned threadCount) {
+        for (unsigned w = 1; w < threadCount; ++w) {
+            threads.emplace_back([this, w]() { work(w); });
+        }
+    }
+
+    ~ParallelFor() {
+        {
+            std::lock_guard<std::mutex> L(lock);
+            stop = true;
+        }
+        start.notify_all();
+        for (auto & t : threads) {
+            t.join();
+        }
+    }
+
+    void run(const size_t n, Task task) {
+        if (n == 0) return;
+        {
+            std::lock_guard<std::mutex> L(lock);
+            current = &task;
+            count = n;
+            next = 0;
+            busy = threads.size();
+            ++round;
+        }
+        start.notify_all();
+        drain(0, task, n);
+        std::unique_lock<std::mutex> L(lock);
+        done.wait(L, [this]() { return busy == 0; });
+        current = nullptr;
+    }
+
+private:
+
+    void drain(const unsigned worker, Task task, const size_t n) {
+        for (;;) {
+            const auto i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n) break;
+            task(worker, i);
+        }
+    }
+
+    void work(const unsigned worker) {
+        unsigned seen = 0;
+        for (;;) {
+            Task * task;
+            size_t n;
+            {
+                std::unique_lock<std::mutex> L(lock);
+                start.wait(L, [&]() { return stop || round != seen; });
+                if (stop) return;
+                seen = round;
+                task = current;
+                n = count;
+            }
+            drain(worker, *task, n);
+            {
+                std::lock_guard<std::mutex> L(lock);
+                if (--busy == 0) {
+                    done.notify_one();
+                }
+            }
+        }
+    }
+
+    std::vector<std::thread> threads;
+    std::mutex lock;
+    std::condition_variable start;
+    std::condition_variable done;
+    Task * current = nullptr;
+    size_t count = 0;
+    std::atomic<size_t> next{0};
+    size_t busy = 0;
+    unsigned round = 0;
+    bool stop = false;
+};
+
+}
+
 namespace kernel {
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief runGA
+ *
+ * The search is deterministic: for a given problem and random seed it reaches the same result whatever the number
+ * of threads and however they are scheduled, so that the code generated from it is reproducible (which -VerifyCache
+ * relies on).  Candidates are made on this thread; each batch of them is repaired and evaluated in parallel, but
+ * every candidate with a generator seeded for it alone, and the results are gathered in the order the candidates
+ * were made.  The search ends when it stalls or after maxGenerations generations, never on a time limit.
  ** ------------------------------------------------------------------------------------------------------------- */
 const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgorithm::runGA() {
 
@@ -109,70 +129,55 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
     Population nextGeneration;
     nextGeneration.reserve(3 * maxCandidates);
 
-    std::vector<std::thread> threads;
+    // One worker, and one generator for it, per thread.  A worker may keep a reference to the generator it was
+    // made with, so each candidate's generator is that one, reseeded for the candidate.
+    const unsigned workerCount = std::max(threadCount, 1U);
+    std::vector<pipeline_random_engine> workerRng(workerCount);
+    std::vector<WorkerPtr> workers;
+    workers.reserve(workerCount);
+    for (unsigned w = 0; w < workerCount; ++w) {
+        workers.emplace_back(makeWorker(workerRng[w]));
+    }
+    ParallelFor parallel(workerCount);
 
-    CandidateQueue workQueue;
+    std::vector<Candidate> batch;
+    std::vector<pipeline_random_engine::result_type> seeds;
+    std::vector<typename Candidates::iterator> entries;
+    std::vector<size_t> fresh;
 
-    // Written once by the calling thread and polled by every worker thread's exit
-    // check below; must be atomic (ThreadSanitizer confirmed a genuine data race
-    // here when this was a plain bool).
-    std::atomic<bool> finishedProcessing{false};
-
-    TASLock candidateMapLock;
-    TASLock nextGenLock;
-
-    auto processCandidate = [&](WorkerPtr & worker, Candidate && C, pipeline_random_engine & rng) {
-        assert (C.size() == candidateLength);
-        worker->repair(C, rng);
-        candidateMapLock.lock();
-        const auto f = candidates.emplace(std::move(C), 0);
-        candidateMapLock.unlock();
-        if (LLVM_LIKELY(f.second)) {
-            f.first->second = worker->fitness(f.first->first, rng);
+    // Repairs and evaluates the candidates in the batch, appending them to the generation in batch order.
+    auto evaluate = [&](Population & generation) {
+        const auto n = batch.size();
+        seeds.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            seeds[i] = rng();
         }
-        nextGenLock.lock();
-        nextGeneration.emplace_back(f.first);
-        nextGenLock.unlock();
+        parallel.run(n, [&](const unsigned w, const size_t i) {
+            assert (batch[i].size() == candidateLength);
+            workerRng[w].seed(seeds[i]);
+            workers[w]->repair(batch[i], workerRng[w]);
+        });
+        entries.clear();
+        fresh.clear();
+        for (size_t i = 0; i < n; ++i) {
+            const auto f = candidates.emplace(std::move(batch[i]), 0);
+            entries.push_back(f.first);
+            if (LLVM_LIKELY(f.second)) {
+                fresh.push_back(i);
+            }
+        }
+        parallel.run(fresh.size(), [&](const unsigned w, const size_t k) {
+            const auto i = fresh[k];
+            workerRng[w].seed(seeds[i]);
+            entries[i]->second = workers[w]->fitness(entries[i]->first, workerRng[w]);
+        });
+        for (const auto & e : entries) {
+            generation.emplace_back(e);
+        }
+        batch.clear();
     };
 
-    // Pre-seed each worker thread's RNG on this (the calling) thread, before any
-    // worker thread is spawned. Previously each worker thread called the shared
-    // `rng` itself (via `pipeline_random_engine threadRng(rng());`) right after
-    // starting, racing with this thread's own -- extensive, main-loop-long -- use
-    // of that same `rng` below (e.g. zeroToOneReal(rng), bitString.randomize(rng),
-    // std::shuffle(..., rng)). ThreadSanitizer confirmed this as a genuine,
-    // unsynchronized data race on rng's internal state. Seeding up front here
-    // means `rng` itself is only ever touched by this thread, and each worker
-    // thread gets its own independent, already-seeded generator.
-    std::vector<pipeline_random_engine::result_type> threadSeeds;
-    threadSeeds.reserve(threadCount > 0 ? threadCount - 1 : 0);
-    for (unsigned i = 1; i < threadCount; ++i) {
-        threadSeeds.push_back(rng());
-    }
-
-    for (unsigned i = 1; i < threadCount; ++i) {
-        threads.emplace_back([&, i]() {
-            pipeline_random_engine threadRng(threadSeeds[i - 1]);
-            auto worker = makeWorker(threadRng);
-            for (;;) {
-                Candidate C;
-                if (workQueue.pop(C)) {
-                    assert (C.size() == candidateLength);
-                    processCandidate(worker, std::move(C), threadRng);
-                    workQueue.markDone();
-                } else { // sleep 1/10 ms then check if we're finished.
-                    std::this_thread::sleep_for(nanoseconds(100));
-                    if (finishedProcessing) {
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
     mainWorker = makeWorker(rng);
-
-    const auto start = system_clock::now();
 
     if (LLVM_UNLIKELY(initGA(nextGeneration))) {
         population.swap(nextGeneration);
@@ -181,43 +186,23 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
 
     BEGIN_SCOPED_REGION
 
-    const auto initLimit = start + seconds(MaxInitTime);
-
     assert (MaxInitCandidates <= maxCandidates);
 
     if (nextGeneration.size() < MaxInitCandidates) {
         auto n = MaxInitCandidates - nextGeneration.size();
-        while (--n && system_clock::now() < initLimit) {
-
+        while (--n) {
             Candidate C(candidateLength);
             mainWorker->newCandidate(C, rng);
-            workQueue.push(std::move(C));
-
+            batch.push_back(std::move(C));
         }
     }
+    evaluate(nextGeneration);
 
-    for (;;) {
-        Candidate C;
-        if (workQueue.pop(C)) {
-            assert (C.size() == candidateLength);
-            processCandidate(mainWorker, std::move(C), rng);
-            workQueue.markDone();
-        } else if (!workQueue.hasPendingWork()) {
-            break;
-        }
-    }
-
-    assert (workQueue.empty());
     assert (population.empty());
     assert (nextGeneration.size() > 0);
     assert (candidateLength > 0);
 
-    // acquire then release the lock to ensure that all of the threads are clear
-    nextGenLock.lock();
-    nextGenLock.unlock();
-
     population.swap(nextGeneration);
-
 
     if (LLVM_UNLIKELY(candidateLength < 2)) {
         goto enumerated_entire_search_space;
@@ -226,13 +211,9 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
     // The crossover/selection logic below assumes at least two candidates to
     // operate on (it asserts populationSize > 1), but nothing upstream actually
     // guarantees that many were produced -- the population-initialization phase
-    // above only asserts nextGeneration.size() > 0. Under heavy CPU contention
-    // (e.g. many kernels' thread-local buffer layouts being optimized
-    // concurrently), that phase's wall-clock init budget can be starved enough
-    // to leave exactly one candidate, which previously tripped the assert in a
-    // debug build and was undefined behaviour in a release build. getResult()
-    // already handles a population of exactly one correctly, so just skip the
-    // generational loop in that case too.
+    // above only asserts nextGeneration.size() > 0 (initGA may supply fewer, and
+    // duplicates collapse).  getResult() already handles a population of exactly
+    // one correctly, so just skip the generational loop in that case too.
     if (LLVM_UNLIKELY(population.size() <= 1)) {
         goto enumerated_entire_search_space;
     }
@@ -258,14 +239,7 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
     flat_set<unsigned> chosen;
     chosen.reserve(maxCandidates);
 
-    const auto maxTime = seconds(MaxRunTime);
-    const auto maxTimeVal = maxTime.count();
-    const auto limit = start + maxTime;
-
-    for (;;) {
-
-        const auto now = system_clock::now();
-        if (now >= limit) break;
+    for (unsigned generation = 0; generation < maxGenerations; ++generation) {
 
         nextGeneration.clear();
 
@@ -273,10 +247,9 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
         const auto populationSize = population.size();
         assert (populationSize > 1);
 
-        Rational T{(limit - now).count(), maxTimeVal};
+        // The mutation rate falls as the search stalls.
         const auto s = std::max(averageStallCount, bestStallCount);
-        Rational S{maxStallGenerations - s, maxStallGenerations};
-        const auto d = std::min(S, T);
+        const Rational d{maxStallGenerations - s, maxStallGenerations};
         const double currentMutationRate = ((double)d.numerator() / (double)d.denominator()) + 0.03;
         const double currentCrossoverRate = 1.0 - currentMutationRate;
 
@@ -343,7 +316,7 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
 
                         assert (count == 0);
 
-                        workQueue.push(std::move(C));
+                        batch.push_back(std::move(C));
 
                     };
 
@@ -368,27 +341,13 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
                 const auto b = std::uniform_int_distribution<unsigned>{a + 1, candidateLength - 1}(rng);
                 std::shuffle(C.begin() + a, C.begin() + b, rng);
 
-                workQueue.push(std::move(C));
+                batch.push_back(std::move(C));
 
             }
         }
 
-        for (;;) {
-            Candidate C;
-            if (workQueue.pop(C)) {
-                assert (C.size() == candidateLength);
-                processCandidate(mainWorker, std::move(C), rng);
-                workQueue.markDone();
-            } else if (!workQueue.hasPendingWork()) {
-                break;
-            }
-        }
+        evaluate(nextGeneration);
 
-        // acquire then release the lock to ensure that all of the threads are clear
-        nextGenLock.lock();
-        nextGenLock.unlock();
-
-        assert (workQueue.empty());
         while (LLVM_UNLIKELY(nextGeneration.size() < 2)) {
             nextGeneration.push_back(population.back());
             population.pop_back();
@@ -544,12 +503,6 @@ const PermutationBasedEvolutionaryAlgorithm & PermutationBasedEvolutionaryAlgori
     END_SCOPED_REGION
 
 enumerated_entire_search_space:
-
-    finishedProcessing = true;
-
-    for (auto & t : threads) {
-        t.join();
-    }
 
     std::sort(population.begin(), population.end(), FitnessComparator{});
 

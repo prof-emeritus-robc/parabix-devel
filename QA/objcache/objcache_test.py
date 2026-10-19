@@ -10,8 +10,7 @@
 # Quick checks (always run; base64 only, so that ctest stays under a second):
 #   - a first run compiles and writes every kernel; a second run, with
 #     -VerifyCache, reads every kernel back from the cache and verifies that it
-#     matches the IR generated for it now (pipelines, whose code generation is
-#     not deterministic, must instead be reported as not verified);
+#     matches the IR generated for it now;
 #   - every kernel's tag comes from a registered source hash, and the cache
 #     name of every kernel ends with that tag.
 #
@@ -165,9 +164,6 @@ def run_tool(args, tool, cache_dir, verify=False):
 
 
 def check_verified(failures, what, k):
-    """K was verified, or, if it is a pipeline, reported as not verifiable."""
-    if k.nested and k.unverifiable:
-        return True
     return failures.check(k.verified and not k.unverifiable, '%s: %s was not verified' % (what, describe(k)))
 
 

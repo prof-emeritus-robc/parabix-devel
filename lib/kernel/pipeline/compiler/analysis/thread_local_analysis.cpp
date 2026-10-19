@@ -24,13 +24,11 @@ namespace kernel {
 
 constexpr static unsigned BUFFER_SIZE_INIT_POPULATION_SIZE = 15;
 
-constexpr static unsigned BUFFER_SIZE_GA_MAX_INIT_TIME_SECONDS = 2;
-
 constexpr static unsigned BUFFER_SIZE_POPULATION_SIZE = 30;
 
-constexpr static unsigned BUFFER_SIZE_GA_MAX_TIME_SECONDS = 15;
-
 constexpr static unsigned BUFFER_SIZE_GA_STALLS = 50;
+
+constexpr static unsigned BUFFER_SIZE_GA_MAX_GENERATIONS = 10 * BUFFER_SIZE_GA_STALLS;
 
 using ConflictGraph = adjacency_list<hash_setS, vecS, undirectedS>;
 
@@ -220,9 +218,8 @@ struct BufferLayoutOptimizer final : public PermutationBasedEvolutionaryAlgorith
                          , const std::vector<unsigned> & partitionId
                          , pipeline_random_engine & srcRng)
     : PermutationBasedEvolutionaryAlgorithm (numOfLocalStreamSets,
-                                             BUFFER_SIZE_GA_MAX_INIT_TIME_SECONDS,
                                              BUFFER_SIZE_INIT_POPULATION_SIZE,
-                                             BUFFER_SIZE_GA_MAX_TIME_SECONDS,
+                                             BUFFER_SIZE_GA_MAX_GENERATIONS,
                                              BUFFER_SIZE_POPULATION_SIZE,
                                              BUFFER_SIZE_GA_STALLS,
                                              std::max(codegen::SegmentThreads, codegen::TaskThreads),

@@ -260,6 +260,27 @@ void UpdateBitXfrms(pablo::PabloBuilder & pb,
 //
 void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions);
 
+// NFC Support
+//
+//  NFC as a focused transform, with placement after the transform: the
+//  transform decides which positions of its working space remain.
+
+// The focus of NFC: the UTF-8 sequences that may change (composable sequences
+// and excluded composites).
+void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask);
+
+// NFC of the UTF-8 basis bits U8_Basis.  The transform works in a working space,
+// U8_Basis with room inserted for decompositions; ValidWorkMask marks the positions
+// of the working space that remain in TransformedBasis.  Given a WorkMask, room is
+// inserted only within the work regions (for transforming a whole text).
+void NFC_Transform(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * TransformedBasis,
+                   StreamSet * ValidWorkMask, StreamSet * WorkMask = nullptr);
+
+// The placement of the transformed work regions in the output, given the
+// ValidWorkMask from NFC_Transform of the work regions.
+void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
+                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask);
+
 // NFD Support
 
 class NFD_BixData {

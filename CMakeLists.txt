@@ -558,6 +558,11 @@ add_test(
   COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")
 
 add_test(
+  NAME nfc_multistage_test
+  WORKING_DIRECTORY ${QA_DIR}/nfc
+  COMMAND python3 nfc_test.py -o TestOutput_multistage --flags=-MultiStage "${BIN_DIR}/nfc")
+
+add_test(
     NAME editd_test
     WORKING_DIRECTORY ${QA_DIR}/editd
     COMMAND python3 run_all.py -e ${BIN_DIR})

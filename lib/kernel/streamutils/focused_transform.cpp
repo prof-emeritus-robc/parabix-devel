@@ -22,17 +22,17 @@ static cl::OptionCategory FocusOptionCategory("Focused Transform Options",
 
 static cl::opt<FocusFilterMode> FocusFilterOption("focus-filter", cl::init(FocusFilterMode::Run),
     cl::desc("Extraction of the work regions:"),
-    cl::values(clEnumValN(FocusFilterMode::Bit, "bit", "FilterByMask of the basis bit streams (default)"),
+    cl::values(clEnumValN(FocusFilterMode::Bit, "bit", "FilterByMask of the basis bit streams"),
                clEnumValN(FocusFilterMode::Byte, "byte", "FilterByMask of the source bytes"),
-               clEnumValN(FocusFilterMode::Run, "run", "RunFilter of the source bytes")),
+               clEnumValN(FocusFilterMode::Run, "run", "RunFilter of the source bytes (default)")),
     cl::cat(FocusOptionCategory));
 
 static cl::opt<ReintegrationMode> ReintegrationOption("reintegrate", cl::init(ReintegrationMode::Run),
     cl::desc("Merging of transformed and unmodified data:"),
-    cl::values(clEnumValN(ReintegrationMode::Bit, "bit", "MergeByMask of basis bit streams (default)"),
+    cl::values(clEnumValN(ReintegrationMode::Bit, "bit", "MergeByMask of basis bit streams"),
                clEnumValN(ReintegrationMode::ByteSpread, "byte-spread", "spread and OR of bytes"),
                clEnumValN(ReintegrationMode::ByteReplace, "byte-replace", "spread and ByteReplaceByMask of bytes"),
-               clEnumValN(ReintegrationMode::Run, "run", "RunMerge of bytes")),
+               clEnumValN(ReintegrationMode::Run, "run", "RunMerge of bytes (default)")),
     cl::cat(FocusOptionCategory));
 
 static cl::opt<UnmodifiedFilterMode> UnmodifiedFilterOption("unmodified-filter", cl::init(UnmodifiedFilterMode::Byte),
@@ -60,7 +60,8 @@ FocusOptions FocusOptions::fromCommandLine() {
 
 StreamSet * FocusedTransform::build(PipelineBuilder & P, StreamSet * sourceBytes, StreamSet * sourceBasis) const {
     if (!mOptions.Focus) {
-        StreamSet * const transformedBasis = transform(P, sourceBasis);
+        StreamSet * const transformedBasis = P.CreateStreamSet(8, 1);
+        transform(P, sourceBasis, transformedBasis, placesAfterTransform() ? P.CreateStreamSet(1, 1) : nullptr);
         P.SetStageLabel("output");
         StreamSet * const outputBytes = P.CreateStreamSet(1, 8);
         P.CreateKernelCall<P2SKernel>(transformedBasis, outputBytes);
@@ -68,8 +69,17 @@ StreamSet * FocusedTransform::build(PipelineBuilder & P, StreamSet * sourceBytes
     }
     StreamSet * const workMask = focus(P, sourceBasis);
     StreamSet * const focusedBasis = filter(P, sourceBytes, sourceBasis, workMask);
-    StreamSet * const placementMask = placement(P, sourceBasis, workMask);
-    StreamSet * const transformedBasis = transform(P, focusedBasis);
+    StreamSet * placementMask = nullptr;
+    StreamSet * transformedBasis = nullptr;
+    if (placesAfterTransform()) {
+        StreamSet * const validMask = P.CreateStreamSet(1, 1);
+        transformedBasis = P.CreateStreamSet(8, 1);
+        transform(P, focusedBasis, transformedBasis, validMask);
+        placementMask = validatedPlacement(P, sourceBasis, workMask, validMask);
+    } else {
+        placementMask = placement(P, sourceBasis, workMask);
+        transformedBasis = transform(P, focusedBasis);
+    }
     return reintegrate(P, workMask, placementMask, sourceBytes, sourceBasis, transformedBasis);
 }
 
@@ -118,19 +128,38 @@ StreamSet * FocusedTransform::placement(PipelineBuilder & P, StreamSet * sourceB
 }
 
 void FocusedTransform::placement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * placementMask) const {
+    assert (!placesAfterTransform());
     P.SetStageLabel("placement");
     mPlacement(P, sourceBasis, workMask, placementMask);
 }
 
+StreamSet * FocusedTransform::validatedPlacement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * validMask) const {
+    StreamSet * const placementMask = P.CreateStreamSet(1, 1);
+    validatedPlacement(P, sourceBasis, workMask, validMask, placementMask);
+    return placementMask;
+}
+
+void FocusedTransform::validatedPlacement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * validMask, StreamSet * placementMask) const {
+    assert (placesAfterTransform());
+    P.SetStageLabel("placement");
+    mValidatedPlacement(P, sourceBasis, workMask, validMask, placementMask);
+}
+
 StreamSet * FocusedTransform::transform(PipelineBuilder & P, StreamSet * focusedBasis) const {
+    assert (!placesAfterTransform());
     StreamSet * const transformedBasis = P.CreateStreamSet(8, 1);
     transform(P, focusedBasis, transformedBasis);
     return transformedBasis;
 }
 
-void FocusedTransform::transform(PipelineBuilder & P, StreamSet * focusedBasis, StreamSet * transformedBasis) const {
+void FocusedTransform::transform(PipelineBuilder & P, StreamSet * focusedBasis, StreamSet * transformedBasis, StreamSet * validMask) const {
+    assert ((validMask != nullptr) == placesAfterTransform());
     P.SetStageLabel("transform");
-    mTransform(P, focusedBasis, transformedBasis);
+    if (placesAfterTransform()) {
+        mValidatingTransform(P, focusedBasis, transformedBasis, validMask);
+    } else {
+        mTransform(P, focusedBasis, transformedBasis);
+    }
 }
 
 StreamSet * FocusedTransform::reintegrate(PipelineBuilder & P, StreamSet * workMask, StreamSet * placementMask,

@@ -79,6 +79,9 @@ def main():
     ap.add_argument('--threads', type=int, default=3)
     ap.add_argument('--repeats', type=int, default=2)
     ap.add_argument('--tools', default='nfd,nfc')
+    ap.add_argument('--config', action='append', default=None,
+                    help='a configuration (options separated by spaces, "" for the default) to run '
+                         'instead of the built-in list; may be repeated')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     N = args.threads
@@ -92,7 +95,8 @@ def main():
             path = os.path.join(args.inputs, name)
             mb = os.path.getsize(path) / 1e6
             reference = output_digest([exe, '--thread-num=1', path])
-            for config in CONFIGS[tool]:
+            configs = [c.split() for c in args.config] if args.config is not None else CONFIGS[tool]
+            for config in configs:
                 tag = '%s%s.%s' % (tool, ''.join(config), name)
                 base = [exe] + config
                 run(base + ['--thread-num=1', path])  # ensure the configuration is compiled

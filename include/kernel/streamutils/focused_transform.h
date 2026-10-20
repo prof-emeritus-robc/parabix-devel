@@ -58,9 +58,9 @@ enum class UnmodifiedFilterMode {
 
 struct FocusOptions {
     bool Focus = true;
-    FocusFilterMode FocusFilter = FocusFilterMode::Bit;
-    ReintegrationMode Reintegration = ReintegrationMode::Bit;
-    UnmodifiedFilterMode UnmodifiedFilter = UnmodifiedFilterMode::Byte;
+    FocusFilterMode FocusFilter = FocusFilterMode::Run;
+    ReintegrationMode Reintegration = ReintegrationMode::Run;
+    UnmodifiedFilterMode UnmodifiedFilter = UnmodifiedFilterMode::Run;
     unsigned FillRunGaps = 0;
 
     // Whether the filter or reintegration stages need the source bytes (rather

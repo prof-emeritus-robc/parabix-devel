@@ -27,6 +27,7 @@ from collections import OrderedDict
 class Row:
     def __init__(self, kid, label, name, items, ticks, sync, pipe, execute):
         self.kid, self.label, self.name = kid, label, name
+        self.labelled = label is not None  # labelled in the report (not assigned to a stage)
         self.items, self.ticks = items, ticks
         self.sync, self.pipe, self.execute = sync, pipe, execute
 

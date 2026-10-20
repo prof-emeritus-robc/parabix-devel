@@ -180,7 +180,10 @@ void MultiStrideKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
     initialize(b);
 
     BasicBlock * loopPredecessor = b.GetInsertBlock();
-    b.CreateBr(multiStrideLoop);
+    // The stride body is a do-while loop (as is the index computation within it), so
+    // it must not be entered when there are no blocks to process.
+    BasicBlock * const noStrides = b.CreateBasicBlock("noStrides");
+    b.CreateLikelyCondBr(b.CreateICmpNE(numOfBlocks, ZERO), multiStrideLoop, noStrides);
 
     b.SetInsertPoint(multiStrideLoop);
     assert (&sizeTy->getContext() == &b.getContext());
@@ -207,8 +210,19 @@ void MultiStrideKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const
         loopVarPhi[i]->addIncoming(updatedLoopValues[i], multiStrideFinal);
     }
     b.CreateCondBr(b.CreateICmpNE(finalBlocksDone, numOfBlocks), multiStrideLoop, multiStrideExit);
+
+    b.SetInsertPoint(noStrides);
+    b.CreateBr(multiStrideExit);
+
     b.SetInsertPoint(multiStrideExit);
-    finalize(b, updatedLoopValues);
+    std::vector<Value *> finalLoopValues(loopVariableCount);
+    for (unsigned i = 0; i < loopVariableCount; i++) {
+        PHINode * const phi = b.CreatePHI(mLoopVars[i].Ty, 2);
+        phi->addIncoming(updatedLoopValues[i], multiStrideFinal);
+        phi->addIncoming(mLoopVarInitialValues[i], noStrides);
+        finalLoopValues[i] = phi;
+    }
+    finalize(b, finalLoopValues);
 }
 
 unsigned maxScanBlocks(LLVMTypeSystemInterface & ts, unsigned scanWordWidth) {
@@ -242,6 +256,9 @@ void TwoLevelScanKernel::strideLogic(KernelBuilder & b,
 
     Value * baseProcessed = b.getProcessedItemCount(mScanStreamName);
     Value * priorProcessed = b.CreateAdd(b.CreateMul(priorBlocksDone, BLOCK_WIDTH), baseProcessed);
+    Value * const scanLimit = b.CreateSelect(b.isFinal(),
+                                             b.CreateAdd(baseProcessed, b.getAccessibleItemCount(mScanStreamName)),
+                                             ConstantInt::getAllOnesValue(sizeTy));
 
     BasicBlock * const metaMaskLoop = b.CreateBasicBlock("metaMaskLoop");
     BasicBlock * const scanWordLoop = b.CreateBasicBlock("scanWordLoop");
@@ -317,7 +334,24 @@ void TwoLevelScanKernel::strideLogic(KernelBuilder & b,
     // passing in the current values of user loop variables,
     // anticipating that the user updates the loop variables
     // as required.
-    generateProcessingLogic(b, itemPos, innerLoopVars);
+    // On the final invocation, bits of the last block past the available items of the
+    // scan stream are not items; skip them.
+    BasicBlock * const processItem = b.CreateBasicBlock("processItem");
+    BasicBlock * const itemChecked = b.CreateBasicBlock("itemChecked");
+    BasicBlock * const itemCheck = b.GetInsertBlock();
+    b.CreateLikelyCondBr(b.CreateICmpULT(itemPos, scanLimit), processItem, itemChecked);
+    b.SetInsertPoint(processItem);
+    std::vector<Value *> processedLoopVars(innerLoopVars);
+    generateProcessingLogic(b, itemPos, processedLoopVars);
+    BasicBlock * const processItemExit = b.GetInsertBlock();
+    b.CreateBr(itemChecked);
+    b.SetInsertPoint(itemChecked);
+    for (unsigned i = 0; i < loopVariableCount; i++) {
+        PHINode * const phi = b.CreatePHI(mLoopVars[i].Ty, 2);
+        phi->addIncoming(innerLoopVars[i], itemCheck);
+        phi->addIncoming(processedLoopVars[i], processItemExit);
+        innerLoopVars[i] = phi;
+    }
 
     BasicBlock * itemDone = b.GetInsertBlock();
     Value * const scanWordNext = b.CreateResetLowestBit(remainingWordPhi);

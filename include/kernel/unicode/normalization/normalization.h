@@ -9,6 +9,9 @@
 #include <ucd/utf/utf_encoder.h>
 #include <ucd/utf/transchar.h>
 #include <pablo/pablo.h>
+#include <ucd/algo/normalization.h>
+#include <kernel/streamutils/focused_transform.h>
+#include <memory>
 
 using StreamSet = kernel::StreamSet;
 using PipelineBuilder = kernel::PipelineBuilder;
@@ -283,9 +286,13 @@ void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * Wo
 
 // NFD Support
 
+// The data of the UTF-8 placement of NFD (or, with UCD::DecompositionOptions::NFKD,
+// of NFKD).
 class NFD_BixData {
 public:
-    NFD_BixData();
+    NFD_BixData(UCD::DecompositionOptions opt = UCD::DecompositionOptions::NFD);
+    // The characters that the decomposition changes.
+    re::CC * Decomposable_CC();
     std::vector<re::CC *> NFD_Insertion_BixNumCCs();
     std::vector<re::CC *> UTF8_Insertion_BixNumCCs();
     std::vector<re::CC *> UTF8_Deletion_BixNumCCs();
@@ -301,6 +308,7 @@ private:
     unicode::TranslationMap mNFD_CharMap[4];
     UCD::UnicodeSet mHangul_Precomposed_LV;
     UCD::UnicodeSet mHangul_Precomposed_LVT;
+    UCD::UnicodeSet mDecomposable;
 };
 
 class NFD_PipelineBuilder {
@@ -329,8 +337,24 @@ public:
 
     void NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
 
+    // The focus of NFKD: the characters with a decomposition (canonical or
+    // compatibility) or a nonzero combining class, and the character after each.
+    void DetermineNFKD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask);
+
+    void ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask);
+
 private:
+    NFD_BixData & NFKD_Data();
+
     unsigned mFillRunGaps = 0;
     PipelineBuilder & mPB;
     NFD_BixData NFD_Data;
+    std::unique_ptr<NFD_BixData> mNFKD_Data;
 };
+
+//  The normalization forms as focused transforms (see kernel/streamutils/focused_transform.h),
+//  built with the stages above.  The NFD and NFKD transforms use the given
+//  NFD_PipelineBuilder, which must outlive them.
+kernel::FocusedTransform NFD_FocusedTransform(NFD_PipelineBuilder & builder, const kernel::FocusOptions & options);
+kernel::FocusedTransform NFKD_FocusedTransform(NFD_PipelineBuilder & builder, const kernel::FocusOptions & options);
+kernel::FocusedTransform NFC_FocusedTransform(const kernel::FocusOptions & options);

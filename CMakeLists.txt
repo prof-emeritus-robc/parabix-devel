@@ -553,6 +553,16 @@ add_test(
   COMMAND python3 nfd_test.py -o nfd_output_separated4 --flags=-SeparatedPipelineStages=4 "${BIN_DIR}/nfd")
 
 add_test(
+  NAME nfkd_test
+  WORKING_DIRECTORY ${QA_DIR}/nfkd
+  COMMAND python3 nfkd_test.py "${BIN_DIR}/nfkd")
+
+add_test(
+  NAME nfkd_nofocus_test
+  WORKING_DIRECTORY ${QA_DIR}/nfkd
+  COMMAND python3 nfkd_test.py --flags=-NoFocus "${BIN_DIR}/nfkd")
+
+add_test(
   NAME nfc_test
   WORKING_DIRECTORY ${QA_DIR}/nfc
   COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")

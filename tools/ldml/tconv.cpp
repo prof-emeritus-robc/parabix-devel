@@ -22,8 +22,8 @@
 //  Any source ("NFD" is "Any-NFD").
 //
 //  Implemented so far:
-//      Any-NFD, Any-NFKD   NFD_PipelineBuilder, as in the nfd and nfkd tools
-//      Any-NFC             the focused NFC pipeline of the nfc tool
+//      Any-NFD, Any-NFKD   focused transforms, as in the nfd and nfkd tools
+//      Any-NFC             the focused transform of the nfc tool
 //      Any-NFKC            NFC applied to the output of NFKD
 //      Any-Lower, Any-Upper, Any-Title
 //                          full case mapping by the string override
@@ -209,229 +209,24 @@ static StreamSet * UTF8_Of(PipelineBuilder & P, StreamSet * U21) {
     return U8_Basis;
 }
 
-//  NFD, as in the default (focused) pipeline of the nfd tool: only the
-//  spans that may change are decomposed and merged back with the rest.
-static StreamSet * NFD_Basis(PipelineBuilder & P, NFD_PipelineBuilder & NFD_builder, StreamSet * BasisBits) {
-    StreamSet * const WorkSelectionMask = P.CreateStreamSet(1, 1);
-    StreamSet * const WorkingBasis = P.CreateStreamSet(8, 1);
-    NFD_builder.NFD_FilterStage(BasisBits, WorkSelectionMask, WorkingBasis);
-
-    StreamSet * const FinalWorkPlacementMask = P.CreateStreamSet(1, 1);
-    NFD_builder.ComputeWorkPlacementMask(BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
-
-    StreamSet * const TransformedBasis = P.CreateStreamSet(8, 1);
-    NFD_builder.NFD_U8_Pipeline(WorkingBasis, TransformedBasis);
-
-    StreamSet * const NonModifiedMask = P.CreateStreamSet(1, 1);
-    Invert(P, WorkSelectionMask, NonModifiedMask);
-    SHOW_STREAM(NonModifiedMask);
-
-    StreamSet * const NonModifiedBasis = P.CreateStreamSet(8);
-    FilterByMask(P, NonModifiedMask, BasisBits, NonModifiedBasis);
-    SHOW_BIXNUM(NonModifiedBasis);
-
-    StreamSet * const OutputBasis = P.CreateStreamSet(8);
-    MergeByMask(P, FinalWorkPlacementMask, TransformedBasis, NonModifiedBasis, OutputBasis);
-    SHOW_BIXNUM(OutputBasis);
-    return OutputBasis;
+//  The focused-transform options (-focus-filter, -reintegrate, ...) for the
+//  normalization forms.
+static FocusOptions NormalizationFocusOptions() {
+    return FocusOptions::fromCommandLine();
 }
 
-//  NFKD, as in the nfkd tool.
-static StreamSet * NFKD_Basis(PipelineBuilder & P, NFD_PipelineBuilder & NFD_builder, StreamSet * BasisBits) {
-    StreamSet * const U21 = U21_Of(P, BasisBits);
-    StreamSet * const NFKD_U21 = NFD_builder.NFKD_U21_Pipeline(U21);
-    return UTF8_Of(P, NFKD_U21);
+//  NFD and NFKD, focused, as in the nfd and nfkd tools.
+static StreamSet * NFD_Bytes(PipelineBuilder & P, NFD_PipelineBuilder & NFD_builder, StreamSet * ByteStream, StreamSet * BasisBits) {
+    return NFD_FocusedTransform(NFD_builder, NormalizationFocusOptions()).build(P, ByteStream, BasisBits);
 }
 
-//  NFC, as in the default (focused, single-stage) pipeline of the nfc tool.
-
-class NFC_Focus : public pablo::PabloKernel {
-public:
-    NFC_Focus(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * NFC_candidates, StreamSet * Focus);
-protected:
-    void generatePabloMethod() override;
-};
-
-NFC_Focus::NFC_Focus(LLVMTypeSystemInterface & ts,
-                     StreamSet * Basis, StreamSet * NFC_candidates,
-                     StreamSet * Focus)
-: PabloKernel(ts, "NFC_Focus",
-// inputs
-{Binding{"Basis", Basis},
- Binding{"NFC_candidates", NFC_candidates, FixedRate(), LookAhead(4)}},
-// output
-{Binding{"Focus", Focus}}) {
+static StreamSet * NFKD_Bytes(PipelineBuilder & P, NFD_PipelineBuilder & NFD_builder, StreamSet * ByteStream, StreamSet * BasisBits) {
+    return NFKD_FocusedTransform(NFD_builder, NormalizationFocusOptions()).build(P, ByteStream, BasisBits);
 }
 
-void NFC_Focus::generatePabloMethod() {
-    PabloBuilder pb(getEntryScope());
-    std::vector<PabloAST *> Basis = getInputStreamSet("Basis");
-    std::vector<PabloAST *> NFC_candidates = getInputStreamSet("NFC_candidates");
-    PabloAST * composable_seconds = NFC_candidates[0];
-    PabloAST * excluded_composites = NFC_candidates[1];
-    BixNumCompiler bnc(pb);
-    PabloAST * pfx4 = bnc.UGE(Basis, 0xF0);
-    PabloAST * pfx3or4 = bnc.UGE(Basis, 0xE0);
-    PabloAST * pfx = bnc.UGE(Basis, 0xC2);
-    PabloAST * pfx3 = pb.createXor(pfx3or4, pfx4);
-    PabloAST * pfx2 = pb.createXor(pfx, pfx3or4);
-    PabloAST * ASCII = bnc.ULE(Basis, 0x7F);
-    PabloAST * focus = pb.createOr(composable_seconds, pb.createAnd(ASCII, pb.createLookahead(composable_seconds, 1)));
-    focus = pb.createOr(focus, pb.createAnd(pfx2, pb.createLookahead(composable_seconds, 2)));
-    focus = pb.createOr(focus, pb.createAnd(pfx3, pb.createLookahead(composable_seconds, 3)));
-    focus = pb.createOr(focus, pb.createAnd(pfx4, pb.createLookahead(composable_seconds, 4)));
-    focus = pb.createOr(focus, excluded_composites);
-    pb.createAssign(pb.createExtract(getOutputStreamVar("Focus"), pb.getInteger(0)), focus);
-}
-
-static void DetermineNFC_WorkSpans(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask) {
-    StreamSet * NFC_Candidates = P.CreateStreamSet(2, 1);
-    P.CreateKernelCall<NFC_CandidateClass>(U8_Basis, NFC_Candidates);
-    SHOW_BIXNUM(NFC_Candidates);
-
-    StreamSet * NFC_WorkItems = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<NFC_Focus>(U8_Basis, NFC_Candidates, NFC_WorkItems);
-    SHOW_STREAM(NFC_WorkItems);
-
-    StreamSet * const u8index = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UTF8_index>(U8_Basis, u8index);
-    SHOW_STREAM(u8index);
-
-    P.CreateKernelCall<U8Spans>(NFC_WorkItems, u8index, WorkSelectionMask, BitMovementMode::Advance);
-    SHOW_STREAM(WorkSelectionMask);
-}
-
-static void NFC_U8_logic(PipelineBuilder & P, StreamSet * ExpansionMask, StreamSet * U8_Basis, StreamSet * FinalSelectionMask, StreamSet * TransformedBytes) {
-    // The SourceNull stream identifies null bytes in the original source
-    // stream, rather than ones generated by insertion or by zeroing out
-    // characters to be deleted.
-    StreamSet * const NullStream = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<bixnum::EQ_immediate>(U8_Basis, 0, NullStream);
-    StreamSet * const SourceNull = P.CreateStreamSet(1, 1);
-    AndCombine(P, NullStream, ExpansionMask, SourceNull);
-    SHOW_STREAM(SourceNull);
-
-    StreamSet * EC_Basis = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<ExcludedCompositeStage>(U8_Basis, EC_Basis);
-    SHOW_BIXNUM(EC_Basis);
-
-    re::PropertyExpression * CCC0_Prop = re::makePropertyExpression("CCC", "NR");
-    CCC0_Prop = cast<re::PropertyExpression>(UCD::linkAndResolve(CCC0_Prop));
-
-    StreamSet * const ccc_NR0 = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, EC_Basis, ccc_NR0, BitMovementMode::LookAhead);
-    SHOW_STREAM(ccc_NR0);
-
-    StreamSet * const ccc_NR = P.CreateStreamSet(1, 1);
-    AndCombine(P, ccc_NR0, ExpansionMask, ccc_NR);
-    SHOW_STREAM(ccc_NR);
-
-    StreamSet * CanonBasis = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<SingletonCanonicalization>(EC_Basis, CanonBasis);
-    SHOW_BIXNUM(CanonBasis);
-
-    StreamSet * ShortBasis = P.CreateStreamSet(8, 1);
-    ShortComposablePipeline(P, CanonBasis, ShortBasis);
-    SHOW_BIXNUM(ShortBasis);
-
-    StreamSet * FinalBasis = P.CreateStreamSet(8, 1);
-    LongComposablePipeline(P, ShortBasis, ccc_NR, FinalBasis);
-    SHOW_BIXNUM(FinalBasis);
-
-    StreamSet * L_V_T = P.CreateStreamSet(Hangul_Composables::HC_Kind::Count);
-    P.CreateKernelCall<Hangul_Composables>(FinalBasis, L_V_T, pablo::BitMovementMode::LookAhead);
-    SHOW_BIXNUM(L_V_T);
-
-    StreamSet * TranslatedBasis = P.CreateStreamSet(8, 1);
-    P.CreateKernelCall<Hangul_Composition>(FinalBasis, L_V_T, TranslatedBasis);
-    SHOW_BIXNUM(TranslatedBasis);
-
-    StreamSet * NonZeroResults = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<bixnum::NEQ_immediate>(TranslatedBasis, 0, NonZeroResults);
-
-    OrCombine(P, NonZeroResults, SourceNull, FinalSelectionMask);
-    SHOW_STREAM(FinalSelectionMask);
-
-    StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
-    FilterByMask(P, FinalSelectionMask, TranslatedBasis, TransformedBasis);
-
-    // Canonical ordering is a sort of runs of nonzero ccc characters.  Sort
-    // in the 21-bit representation, one position per character, so that the
-    // sort never separates the bytes of a UTF-8 sequence.
-    StreamSet * const U21_Basis = U21_Of(P, TransformedBasis);
-
-    UCD::EnumeratedPropertyObject * enumObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::ccc));
-    StreamSet * const CCC_Basis = P.CreateStreamSet(enumObj->GetEnumerationBasisSets().size(), 1);
-    P.CreateKernelCall<UnicodePropertyBasis>(enumObj, U21_Basis, CCC_Basis);
-    SHOW_BIXNUM(CCC_Basis);
-
-    StreamSet * const CCC_NonZero = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<bixnum::NEQ_immediate>(CCC_Basis, 0, CCC_NonZero);
-    SHOW_STREAM(CCC_NonZero);
-
-    StreamSet * const Sorted_U21 = P.CreateStreamSet(21, 1);
-    SortRuns(P, CCC_NonZero, CCC_Basis, U21_Basis, Sorted_U21);
-    SHOW_BIXNUM(Sorted_U21);
-
-    P.CreateKernelCall<P2SKernel>(UTF8_Of(P, Sorted_U21), TransformedBytes);
-    SHOW_BYTES(TransformedBytes);
-}
-
+//  NFC, focused, as in the nfc tool.
 static StreamSet * NFC_Bytes(PipelineBuilder & P, StreamSet * ByteStream, StreamSet * BasisBits) {
-    // Focus: select the spans that may change.
-    StreamSet * const WorkSelectionMask = P.CreateStreamSet(1, 1);
-    DetermineNFC_WorkSpans(P, BasisBits, WorkSelectionMask);
-
-    StreamSet * const SelectedWorkBasis = P.CreateStreamSet(8, 1);
-    FilterByMask(P, WorkSelectionMask, BasisBits, SelectedWorkBasis);
-
-    StreamSet * const NonModifiedMask = P.CreateStreamSet(1, 1);
-    Invert(P, WorkSelectionMask, NonModifiedMask);
-    SHOW_STREAM(NonModifiedMask);
-
-    StreamSet * const NonModifiedBytes = P.CreateStreamSet(1, 8);
-    FilterByMask(P, NonModifiedMask, ByteStream, NonModifiedBytes);
-
-    // Working space for the selected spans.
-    StreamSet * const WorkingInsertionBixNum = P.CreateStreamSet(4, 1);
-    P.CreateKernelCall<NFC_Initial_Insertion>(SelectedWorkBasis, WorkingInsertionBixNum);
-    SHOW_BIXNUM(WorkingInsertionBixNum);
-
-    StreamSet * const WorkingExpansionMask = P.CreateStreamSet(1, 1);
-    InsertionSpreadMask(P, WorkingInsertionBixNum, WorkingExpansionMask, kernel::InsertPosition::After);
-    SHOW_STREAM(WorkingExpansionMask);
-
-    StreamSet * const WorkingBasis = P.CreateStreamSet(8, 1);
-    SpreadByMask(P, WorkingExpansionMask, SelectedWorkBasis, WorkingBasis);
-
-    StreamSet * const ValidWorkMask = P.CreateStreamSet(1, 1);
-    StreamSet * const TransformedBytes = P.CreateStreamSet(1, 8);
-    NFC_U8_logic(P, WorkingExpansionMask, WorkingBasis, ValidWorkMask, TransformedBytes);
-    SHOW_STREAM(ValidWorkMask);
-
-    // Merge the composed spans with the unmodified bytes.
-    StreamSet * const FinalInsertionBixNum = P.CreateStreamSet(4, 1);
-    P.CreateKernelCall<NFC_Initial_Insertion>(BasisBits, FinalInsertionBixNum, WorkSelectionMask);
-    SHOW_BIXNUM(FinalInsertionBixNum);
-
-    StreamSet * const SourceExpansionMask = P.CreateStreamSet(1, 1);
-    InsertionSpreadMask(P, FinalInsertionBixNum, SourceExpansionMask, kernel::InsertPosition::After);
-    SHOW_STREAM(SourceExpansionMask);
-
-    StreamSet * const ExpandedWorkMask = P.CreateStreamSet(1, 1);
-    ExpandFilter(P, SourceExpansionMask, WorkSelectionMask, ExpandedWorkMask);
-    SHOW_STREAM(ExpandedWorkMask);
-
-    StreamSet * const FinalWorkSelectionMask = P.CreateStreamSet(1, 1);
-    ExpandFilter(P, ExpandedWorkMask, ValidWorkMask, FinalWorkSelectionMask);
-    SHOW_STREAM(FinalWorkSelectionMask);
-
-    StreamSet * const FinalWorkPlacementMask = P.CreateStreamSet(1, 1);
-    FilterByMask(P, FinalWorkSelectionMask, ExpandedWorkMask, FinalWorkPlacementMask);
-
-    StreamSet * const OutputBytes = P.CreateStreamSet(1, 8);
-    MergeByMask(P, FinalWorkPlacementMask, TransformedBytes, NonModifiedBytes, OutputBytes);
-    return OutputBytes;
+    return NFC_FocusedTransform(NormalizationFocusOptions()).build(P, ByteStream, BasisBits);
 }
 
 //  Full case mapping by a string override property (lc, uc or tc), as in
@@ -460,17 +255,17 @@ static StreamSet * directPipeline(PipelineBuilder & P, Transform t, StreamSet * 
     StreamSet * OutputBytes = nullptr;
     switch (t) {
         case Transform::NFD:
-            OutputBytes = BytesOf(P, NFD_Basis(P, NFD_builder, BasisBits));
+            OutputBytes = NFD_Bytes(P, NFD_builder, ByteStream, BasisBits);
             break;
         case Transform::NFKD:
-            OutputBytes = BytesOf(P, NFKD_Basis(P, NFD_builder, BasisBits));
+            OutputBytes = NFKD_Bytes(P, NFD_builder, ByteStream, BasisBits);
             break;
         case Transform::NFC:
             OutputBytes = NFC_Bytes(P, ByteStream, BasisBits);
             break;
         case Transform::NFKC: {
-            StreamSet * const NFKD_Basis_ = NFKD_Basis(P, NFD_builder, BasisBits);
-            OutputBytes = NFC_Bytes(P, BytesOf(P, NFKD_Basis_), NFKD_Basis_);
+            StreamSet * const NFKD_Bytes_ = NFKD_Bytes(P, NFD_builder, ByteStream, BasisBits);
+            OutputBytes = NFC_Bytes(P, NFKD_Bytes_, BasisOf(P, NFKD_Bytes_));
             break;
         }
         case Transform::Lower:
@@ -6518,7 +6313,7 @@ static void applyToInput(TransformFunctionType fn, int fd) {
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&TconvOptions, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
 
     ldml::TransformRegistry registry;
     const std::string dir = TransformsDir.empty() ? ldml::defaultTransformDirectory() : TransformsDir;

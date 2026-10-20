@@ -218,3 +218,16 @@ void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * Wo
     FilterByMask(P, FinalWorkSelectionMask, ExpandedWorkMask, WorkPlacementMask);
     SHOW_STREAM(WorkPlacementMask);
 }
+
+FocusedTransform NFC_FocusedTransform(const FocusOptions & options) {
+    return FocusedTransform(options,
+        [](PipelineBuilder & P, StreamSet * basis, StreamSet * workMask) {
+            DetermineNFC_WorkSelection(P, basis, workMask);
+        },
+        [](PipelineBuilder & P, StreamSet * basis, StreamSet * workMask, StreamSet * validMask, StreamSet * placementMask) {
+            NFC_WorkPlacement(P, basis, workMask, validMask, placementMask);
+        },
+        [](PipelineBuilder & P, StreamSet * basis, StreamSet * transformedBasis, StreamSet * validMask) {
+            NFC_Transform(P, basis, transformedBasis, validMask);
+        });
+}

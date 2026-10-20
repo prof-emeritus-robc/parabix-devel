@@ -33,6 +33,7 @@ import stage_report  # noqa: E402
 CONFIGS = {
     'nfd': [[], ['-ByteMerging'], ['-ByteReplace'], ['-NoFocus']],
     'nfc': [[], ['-ByteFiltering'], ['-NoFocus']],
+    'nfkd': [[], ['-NoFocus']],
 }
 
 

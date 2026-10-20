@@ -657,9 +657,7 @@ void NFD_PipelineBuilder::DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet
     SHOW_STREAM(NFD_WorkItems);
 }
 
-void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis) {
-    mPB.SetStageLabel("focus");
-
+void NFD_PipelineBuilder::DetermineNFD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask) {
     StreamSet * const u8index = mPB.CreateStreamSet(1, 1);
     mPB.CreateKernelCall<UTF8_index>(BasisBits, u8index);
     SHOW_STREAM(u8index);
@@ -667,14 +665,19 @@ void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * Wor
     StreamSet * NFD_WorkItems = mPB.CreateStreamSet(1, 1);
     DetermineNFD_WorkItems(BasisBits, u8index, NFD_WorkItems);
 
+    mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask);
+    SHOW_STREAM(WorkSelectionMask);
+}
+
+void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis) {
+    mPB.SetStageLabel("focus");
     if (mFillRunGaps > 0) {
         StreamSet * const WorkSpans = mPB.CreateStreamSet(1, 1);
-        mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSpans);
+        DetermineNFD_WorkSelection(BasisBits, WorkSpans);
         FillRunGaps(mPB, WorkSpans, mFillRunGaps, WorkSelectionMask);
     } else {
-        mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask);
+        DetermineNFD_WorkSelection(BasisBits, WorkSelectionMask);
     }
-    SHOW_STREAM(WorkSelectionMask);
 
     mPB.SetStageLabel("filter");
     FilterByMask(mPB, WorkSelectionMask, BasisBits, WorkingBasis);

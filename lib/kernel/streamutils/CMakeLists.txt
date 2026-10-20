@@ -9,6 +9,7 @@ NAME
 SRC
     collapse.cpp
     deletion.cpp
+    focused_transform.cpp
     pdep_kernel.cpp
     run_index.cpp
     run_replace.cpp

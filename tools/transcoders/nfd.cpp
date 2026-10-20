@@ -145,10 +145,11 @@ static bool ReintegratesBytes() {
     return NFD_FocusOptions().Reintegration != ReintegrationMode::Bit;
 }
 
-typedef void (*NFD_FilterFunctionType)(const StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, StreamSetPtr &);
+typedef void (*NFD_FilterFunctionType)(const StreamSetPtr &, const StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, StreamSetPtr &);
 
 NFD_FilterFunctionType NFD_filter_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver,
+                            Input<streamset_t>("ByteStream", 1, 8),
                             Input<streamset_t>("BasisBits", 8, 1),
                             Output<streamset_t>("WorkSelectionMask", 1, 1, ReturnedBuffer(1)),
                             Output<streamset_t>("FinalWorkPlacementMask", 1, 1, ReturnedBuffer(1)),
@@ -162,7 +163,7 @@ NFD_FilterFunctionType NFD_filter_pipeline(CPUDriver & driver) {
     StreamSet * const WorkingBasis = P.getOutputStreamSet("WorkingBasis");
 
     NFD.focus(P, BasisBits, WorkSelectionMask);
-    NFD.filter(P, nullptr, BasisBits, WorkSelectionMask, WorkingBasis);
+    NFD.filter(P, P.getInputStreamSet("ByteStream"), BasisBits, WorkSelectionMask, WorkingBasis);
     if (UseLayers) {
         P.InsertPhaseBoundary();
     }
@@ -262,9 +263,6 @@ int main(int argc, char *argv[]) {
         exit(-1);
     }
     if (UseIndexedShiftBack) FilterViolations = true;
-    if (SeparatedPipelineStages != 0 && NFD_FocusOptions().FocusFilter != FocusFilterMode::Bit) {
-        llvm::report_fatal_error("-SeparatedPipelineStages requires -focus-filter=bit");
-    }
     CPUDriver driver("NFD_function");
     if (SeparatedPipelineStages == 2) {
         CombinedWorkFunctionType working_stages = generate_combined_work_pipeline(driver);
@@ -288,7 +286,7 @@ int main(int argc, char *argv[]) {
         kernel::StreamSetPtr WorkSelectionMask;
         kernel::StreamSetPtr FinalWorkPlacementMask;
         kernel::StreamSetPtr WorkingBasis;
-        stage1(BasisBits, WorkSelectionMask, FinalWorkPlacementMask, WorkingBasis);
+        stage1(ByteStream, BasisBits, WorkSelectionMask, FinalWorkPlacementMask, WorkingBasis);
 
         NFD_TransformFunctionType stage2 = NFD_transform_pipeline(driver);
         kernel::StreamSetPtr TransformedBasis;

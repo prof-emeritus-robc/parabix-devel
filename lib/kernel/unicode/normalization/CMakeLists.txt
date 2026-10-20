@@ -15,6 +15,7 @@ NAME
     kernel.unicode.normalization
 SRC
     fcd.cpp
+    nfc.cpp
     nfd.cpp
     normalization-generated.cpp
     normalization.cpp

@@ -121,6 +121,27 @@ a timing check with `QA/focus_baseline.py` against the step before.
   scaling at 5.4x). The builder should make it a separable stage; the
   optimization belongs to a later phase.
 
+## Status of the steps
+
+- **Step 1 (builder and nfd):** done.  `FocusedTransform`
+  (`kernel/streamutils/focused_transform.h`) with the options `-focus-filter`,
+  `-reintegrate`, `-unmodified-filter` and `-fill-run-gaps`; since 4341eae27 the
+  defaults are `-focus-filter=run -reintegrate=run`.  nfd's separated pipeline
+  stages now pass the source bytes to the filter stage, so they work with every
+  filter and reintegration mode.
+- **Step 2 (nfc):** done.  `FocusedTransform` has a second form for placement after
+  the transform: the transform returns a valid mask (a single bit stream, passed
+  unchanged) from which the placement callback computes the placement mask.
+  NFC's focus kernel, transform (working-space expansion and composition) and
+  placement are in the library (`DetermineNFC_WorkSelection`, `NFC_Transform`,
+  `NFC_WorkPlacement` in `lib/kernel/unicode/normalization/nfc.cpp`); nfc.cpp keeps
+  `-NoFocus` (the whole text, with room for decompositions only within the work
+  regions), `-UseLayers`, `-ByteFiltering` (alias of `-focus-filter=byte`) and
+  `-MultiStage`, now three pipelines (source/focus/filter, transform,
+  placement/reintegration).  Output is byte-identical to the previous nfc for every
+  mode, at 1 and 3 threads, on de, ko, vi, their NFD forms and small inputs.  New
+  test: `nfc_multistage_test`.
+
 ## Status of the other phases
 
 - **Phase 0:** done (baseline, stage labels, `stage_report.py`, `focus_baseline.py`).

@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <cassert>
 #include <functional>
 
 namespace llvm { namespace cl { class OptionCategory; } }
@@ -22,6 +23,12 @@ class StreamSet;
       placement    marks where the transformed bytes go in the output (a placement
                    mask over the output);
       reintegrate  merges the transformed bytes with the unchanged source bytes.
+
+    Placement is computed either from the source, independently of the transform
+    (e.g., NFD, where the output length of each character is known from the source),
+    or after the transform, from a valid mask the transform returns (e.g., NFC,
+    where composition decides which positions of the transform's working space
+    remain).  The valid mask is passed from the transform to the placement as is.
 
     The focus, placement and transform logic are given by the application; the
     filter and reintegration have several interchangeable implementations, selected
@@ -82,11 +89,23 @@ public:
     using PlacementFunction = std::function<void (PipelineBuilder & P, StreamSet * basis, StreamSet * workMask, StreamSet * placementMask)>;
     // focused (or, without focus, whole) basis -> transformed basis
     using TransformFunction = std::function<void (PipelineBuilder & P, StreamSet * basis, StreamSet * transformedBasis)>;
+    // For placement after the transform:
+    // focused (or, without focus, whole) basis -> transformed basis, valid mask
+    using ValidatingTransformFunction = std::function<void (PipelineBuilder & P, StreamSet * basis, StreamSet * transformedBasis, StreamSet * validMask)>;
+    // basis, work mask, valid mask -> placement mask (over the output bytes)
+    using ValidatedPlacementFunction = std::function<void (PipelineBuilder & P, StreamSet * basis, StreamSet * workMask, StreamSet * validMask, StreamSet * placementMask)>;
 
+    // Placement from the source.
     FocusedTransform(const FocusOptions & options, FocusFunction focus, PlacementFunction placement, TransformFunction transform)
     : mOptions(options), mFocus(std::move(focus)), mPlacement(std::move(placement)), mTransform(std::move(transform)) {}
 
+    // Placement after the transform.
+    FocusedTransform(const FocusOptions & options, FocusFunction focus, ValidatedPlacementFunction placement, ValidatingTransformFunction transform)
+    : mOptions(options), mFocus(std::move(focus)), mValidatedPlacement(std::move(placement)), mValidatingTransform(std::move(transform)) {}
+
     const FocusOptions & getOptions() const { return mOptions; }
+
+    bool placesAfterTransform() const { return static_cast<bool>(mValidatingTransform); }
 
     // The whole transform: source bytes and basis -> output bytes.  Either source
     // stream may be null if the options do not need it.
@@ -97,6 +116,8 @@ public:
     StreamSet * filter(PipelineBuilder & P, StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * workMask) const;
     StreamSet * placement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask) const;
     StreamSet * transform(PipelineBuilder & P, StreamSet * focusedBasis) const;
+    // placement after the transform; validMask as returned by transform
+    StreamSet * validatedPlacement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * validMask) const;
     StreamSet * reintegrate(PipelineBuilder & P, StreamSet * workMask, StreamSet * placementMask,
                             StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * transformedBasis) const;
 
@@ -104,7 +125,10 @@ public:
     void focus(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask) const;
     void filter(PipelineBuilder & P, StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * focusedBasis) const;
     void placement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * placementMask) const;
-    void transform(PipelineBuilder & P, StreamSet * focusedBasis, StreamSet * transformedBasis) const;
+    void validatedPlacement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * validMask, StreamSet * placementMask) const;
+    // With placement after the transform, validMask (a single bit stream) receives
+    // the transform's valid mask; it must be given exactly then.
+    void transform(PipelineBuilder & P, StreamSet * focusedBasis, StreamSet * transformedBasis, StreamSet * validMask = nullptr) const;
     void reintegrate(PipelineBuilder & P, StreamSet * workMask, StreamSet * placementMask,
                      StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * transformedBasis,
                      StreamSet * outputBytes) const;
@@ -114,6 +138,8 @@ private:
     FocusFunction mFocus;
     PlacementFunction mPlacement;
     TransformFunction mTransform;
+    ValidatedPlacementFunction mValidatedPlacement;
+    ValidatingTransformFunction mValidatingTransform;
 };
 
 }

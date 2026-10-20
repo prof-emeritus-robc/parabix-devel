@@ -10,5 +10,6 @@ json/TestOutput
 json_perf/TestOutput
 nfd/nfd_output
 nfd/nfd_output_separated
+nfd/nfd_output_separated4
 nfd/ExpectedOutput/NF*.nfd
 

@@ -62,6 +62,23 @@ struct LongCase {
 };
 static const LongCase L;
 
+// Sparse cases: short runs of 1 bits far apart, the last close to the end of the
+// final partial block.
+struct SparseCase {
+    std::string mask, source, filtered;
+    SparseCase() {
+        const unsigned n = 1000;
+        for (unsigned i = 0; i < n; ++i) {
+            const char c = 'a' + (i % 26);
+            const bool marked = (i % 97 == 40) || (i % 97 == 41) || (i == n - 7) || (i == n - 6);
+            mask += marked ? '1' : '.';
+            source += c;
+            if (marked) filtered += c;
+        }
+    }
+};
+static const SparseCase SP;
+
 auto long_mask_i = BinaryStream(L.mask.c_str());
 auto long_marked_i = TextStream(L.marked.c_str());
 auto long_unmarked_i = TextStream(L.unmarked.c_str());
@@ -77,6 +94,16 @@ TEST_CASE(run_merge_long, long_mask_i, long_marked_i, long_unmarked_i, long_merg
     auto Result = P.CreateStreamSet(1, 8);
     RunMerge(P, Input<0>(T), Input<1>(T), Input<2>(T), Result);
     AssertEQ(P, Result, Input<3>(T));
+}
+
+auto sparse_mask_i = BinaryStream(SP.mask.c_str());
+auto sparse_source_i = TextStream(SP.source.c_str());
+auto sparse_filtered_e = TextStream(SP.filtered.c_str());
+
+TEST_CASE(run_filter_sparse, sparse_mask_i, sparse_source_i, sparse_filtered_e) {
+    auto Result = P.CreateStreamSet(1, 8);
+    RunFilter(P, Input<0>(T), Input<1>(T), Result);
+    AssertEQ(P, Result, Input<2>(T));
 }
 
 // Gap filling: gaps of at most 2 between 1 bits are filled; gaps at either end are not.
@@ -95,5 +122,6 @@ RUN_TESTS(
     CASE(run_replace_short),
     CASE(run_filter_long),
     CASE(run_merge_long),
+    CASE(run_filter_sparse),
     CASE(fill_run_gaps)
 )

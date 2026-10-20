@@ -64,14 +64,16 @@ const unsigned V_Index_bits = 5;
 const unsigned T_Index_bits = 5;
 
 
-NFD_BixData::NFD_BixData() {
-    UCD::NFD_Engine NFD_engine(UCD::DecompositionOptions::NFD);
-    UTF_Encoder u8_encoder;
+NFD_BixData::NFD_BixData(UCD::DecompositionOptions opt) {
+    UCD::NFD_Engine NFD_engine(opt);
     UCD::StringPropertyObject * decompMappingObj = cast<UCD::StringPropertyObject>(getPropertyObject(UCD::dm));
     auto cps = decompMappingObj->GetExplicitCps();
     for (auto cp : cps) {
         std::u32string decomp;
         NFD_engine.NFD_append1(decomp, cp);
+        if (decomp != std::u32string(1, cp)) {
+            mDecomposable.insert(cp);
+        }
         unsigned NFD_expand = decomp.length() - 1;
         if (NFD_expand > 0) {
             mNFD_expansion.emplace(cp, NFD_expand);
@@ -83,7 +85,9 @@ NFD_BixData::NFD_BixData() {
         } else if (UTF8_nfd_len > UTF8_cp_len) {
             mUTF8_expansion.emplace(cp, UTF8_nfd_len - UTF8_cp_len);
         }
-        for (unsigned i = 0; i < decomp.length(); i++) {
+        // (Canonical decompositions have at most 4 characters; the character
+        // maps are only for NFD.)
+        for (unsigned i = 0; i < std::min<size_t>(decomp.length(), 4); i++) {
             mNFD_CharMap[i].emplace(cp, decomp[i]);
         }
     }
@@ -92,6 +96,11 @@ NFD_BixData::NFD_BixData() {
     }
     UCD::UnicodeSet Hangul_Precomposed(Hangul::SBase, Hangul::MaxPrecomposed);
     mHangul_Precomposed_LVT = Hangul_Precomposed - mHangul_Precomposed_LV;
+    mDecomposable = mDecomposable + Hangul_Precomposed;
+}
+
+re::CC * NFD_BixData::Decomposable_CC() {
+    return re::makeCC(mDecomposable, &cc::Unicode);
 }
 
 std::vector<re::CC *> NFD_BixData::NFD_Insertion_BixNumCCs() {
@@ -114,11 +123,15 @@ std::vector<re::CC *> NFD_BixData::NFD_Insertion_BixNumCCs() {
 }
 
 std::vector<re::CC *> NFD_BixData::UTF8_Insertion_BixNumCCs() {
-    unicode::BitTranslationSets BixNumCCs;
-    BixNumCCs.push_back(UCD::UnicodeSet());
-    BixNumCCs.push_back(UCD::UnicodeSet());
-    BixNumCCs.push_back(UCD::UnicodeSet());
-    BixNumCCs.push_back(UCD::UnicodeSet());
+    // At least 4 bits (Hangul LVT syllables need 6 bytes); compatibility
+    // decompositions need more.
+    unsigned maxInsert = 0;
+    for (auto p : mUTF8_expansion) {
+        maxInsert = std::max(maxInsert, p.second);
+    }
+    unsigned bits = 4;
+    while ((maxInsert >> bits) != 0) bits++;
+    unicode::BitTranslationSets BixNumCCs(bits);
     for (auto p : mUTF8_expansion) {
         auto insert_amt = p.second;
         for (unsigned i = 0; i < BixNumCCs.size(); i++) {
@@ -134,10 +147,11 @@ std::vector<re::CC *> NFD_BixData::UTF8_Insertion_BixNumCCs() {
     // Each LVT combination requires 6 additional bytes on decompositon; set bits 1 and 2.
     BixNumCCs[1] = BixNumCCs[1] + mHangul_Precomposed_LVT;
     BixNumCCs[2] = BixNumCCs[2] + mHangul_Precomposed_LVT;
-    return {re::makeCC(BixNumCCs[0], &cc::Unicode),
-        re::makeCC(BixNumCCs[1], &cc::Unicode),
-        re::makeCC(BixNumCCs[2], &cc::Unicode),
-        re::makeCC(BixNumCCs[3], &cc::Unicode)};
+    std::vector<re::CC *> ccs;
+    for (const auto & set : BixNumCCs) {
+        ccs.push_back(re::makeCC(set, &cc::Unicode));
+    }
+    return ccs;
 }
 
 //
@@ -150,6 +164,9 @@ std::vector<re::CC *> NFD_BixData::UTF8_Deletion_BixNumCCs() {
     BixNumCCs.push_back(UCD::UnicodeSet());
     for (auto p : mUTF8_deletion) {
         auto delete_amt = p.second;
+        if (LLVM_UNLIKELY(delete_amt > 3)) {
+            llvm::report_fatal_error("NFD_BixData: a UTF-8 deletion of more than 3 bytes");
+        }
         for (unsigned i = 0; i < BixNumCCs.size(); i++) {
             unsigned bit = 1u << i;
             if ((delete_amt & bit) == bit) {
@@ -669,6 +686,44 @@ void NFD_PipelineBuilder::DetermineNFD_WorkSelection(StreamSet * BasisBits, Stre
     SHOW_STREAM(WorkSelectionMask);
 }
 
+NFD_BixData & NFD_PipelineBuilder::NFKD_Data() {
+    if (!mNFKD_Data) {
+        mNFKD_Data = std::make_unique<NFD_BixData>(UCD::DecompositionOptions::NFKD);
+    }
+    return *mNFKD_Data;
+}
+
+void NFD_PipelineBuilder::DetermineNFKD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask) {
+    StreamSet * const u8index = mPB.CreateStreamSet(1, 1);
+    mPB.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+    SHOW_STREAM(u8index);
+
+    // The characters that NFKD decomposes (at their last byte), in place of
+    // NFD's dt=Can.
+    StreamSet * const Decomposable = mPB.CreateStreamSet(1, 1);
+    mPB.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{NFKD_Data().Decomposable_CC()}, BasisBits, Decomposable);
+    SHOW_STREAM(Decomposable);
+
+    re::PropertyExpression * CCC0_Prop = re::makePropertyExpression("CCC", "NR");
+    CCC0_Prop = cast<re::PropertyExpression>(UCD::linkAndResolve(CCC0_Prop));
+    StreamSet * const CCC_0 = mPB.CreateStreamSet(1, 1);
+    mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, BasisBits, CCC_0);
+    SHOW_STREAM(CCC_0);
+
+    StreamSet * const NFKD_WorkItems = mPB.CreateStreamSet(1, 1);
+    mPB.CreateKernelCall<NFD_Focus>(u8index, Decomposable, CCC_0, NFKD_WorkItems);
+    SHOW_STREAM(NFKD_WorkItems);
+
+    mPB.CreateKernelCall<U8Spans>(NFKD_WorkItems, u8index, WorkSelectionMask);
+    SHOW_STREAM(WorkSelectionMask);
+}
+
+void NFD_PipelineBuilder::ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask) {
+    mPB.SetStageLabel("placement");
+    ComputeWorkPlacement(mPB, NFKD_Data().UTF8_Insertion_BixNumCCs(), NFKD_Data().UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
+    SHOW_STREAM(FinalWorkPlacementMask);
+}
+
 void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis) {
     mPB.SetStageLabel("focus");
     if (mFillRunGaps > 0) {
@@ -730,4 +785,30 @@ void NFD_PipelineBuilder::NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet *
 
     U21_to_UTF8(mPB, NFD_U21_Results, TransformedBasis);
     SHOW_BIXNUM(TransformedBasis);
+}
+
+FocusedTransform NFD_FocusedTransform(NFD_PipelineBuilder & builder, const FocusOptions & options) {
+    return FocusedTransform(options,
+        [&builder](PipelineBuilder &, StreamSet * basis, StreamSet * workMask) {
+            builder.DetermineNFD_WorkSelection(basis, workMask);
+        },
+        [&builder](PipelineBuilder &, StreamSet * basis, StreamSet * workMask, StreamSet * placementMask) {
+            builder.ComputeWorkPlacementMask(basis, workMask, placementMask);
+        },
+        [&builder](PipelineBuilder &, StreamSet * basis, StreamSet * transformedBasis) {
+            builder.NFD_U8_Pipeline(basis, transformedBasis);
+        });
+}
+
+FocusedTransform NFKD_FocusedTransform(NFD_PipelineBuilder & builder, const FocusOptions & options) {
+    return FocusedTransform(options,
+        [&builder](PipelineBuilder &, StreamSet * basis, StreamSet * workMask) {
+            builder.DetermineNFKD_WorkSelection(basis, workMask);
+        },
+        [&builder](PipelineBuilder &, StreamSet * basis, StreamSet * workMask, StreamSet * placementMask) {
+            builder.ComputeNFKD_WorkPlacementMask(basis, workMask, placementMask);
+        },
+        [&builder](PipelineBuilder &, StreamSet * basis, StreamSet * transformedBasis) {
+            builder.NFKD_U8_Pipeline(basis, transformedBasis);
+        });
 }

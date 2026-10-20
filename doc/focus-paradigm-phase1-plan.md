@@ -142,6 +142,23 @@ a timing check with `QA/focus_baseline.py` against the step before.
   mode, at 1 and 3 threads, on de, ko, vi, their NFD forms and small inputs.  New
   test: `nfc_multistage_test`.
 
+- **Step 3 (nfkd and tconv):** done.  nfkd has a focused mode, now its default
+  (`-NoFocus` keeps the previous whole-text pipeline).  Its work is the characters
+  that NFKD changes (canonical or compatibility decomposition, including Hangul
+  syllables) or with a nonzero combining class, and the character after each
+  (the NFD_Focus kernel with the decomposable set in place of dt=Can).  Its
+  placement uses NFD_BixData for NFKD, whose UTF-8 insertion BixNum now has as many
+  bits as needed (5 for NFKD: up to 30 bytes are inserted).  The library provides
+  `NFD_FocusedTransform`, `NFKD_FocusedTransform` and `NFC_FocusedTransform`, used by
+  nfd, nfkd, nfc and tconv.  tconv's Any-NFD, Any-NFKD, Any-NFC and Any-NFKC use them
+  with the focused-transform options; its copies of the NFC kernels are gone.  Its rule
+  pipeline still uses the U21 pipelines for NFD and NFKD within rules.
+  Output: focused nfkd = `-NoFocus` = Python's NFKD on the conformance files and
+  corpora, in all modes at 1 and 3 threads; tconv's forms match the tools (and Python
+  for NFKC).  New tests: `nfkd_test`, `nfkd_nofocus_test`.  Timing (3 threads):
+  focused nfkd is 52% faster than `-NoFocus` on de (0.111 s against 0.230 s), 17% on
+  vi, and 26% slower on ko (64% density, as for nfd).
+
 ## Status of the other phases
 
 - **Phase 0:** done (baseline, stage labels, `stage_report.py`, `focus_baseline.py`).

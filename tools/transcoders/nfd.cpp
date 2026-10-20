@@ -125,21 +125,6 @@ static FocusOptions NFD_FocusOptions() {
     return options;
 }
 
-//  NFD as a focused transform, built with the given NFD_PipelineBuilder (of the
-//  pipeline being built).
-static FocusedTransform NFD_FocusedTransform(NFD_PipelineBuilder & NFD_builder) {
-    return FocusedTransform(NFD_FocusOptions(),
-        [&NFD_builder](PipelineBuilder &, StreamSet * basis, StreamSet * workMask) {
-            NFD_builder.DetermineNFD_WorkSelection(basis, workMask);
-        },
-        [&NFD_builder](PipelineBuilder &, StreamSet * basis, StreamSet * workMask, StreamSet * placementMask) {
-            NFD_builder.ComputeWorkPlacementMask(basis, workMask, placementMask);
-        },
-        [&NFD_builder](PipelineBuilder &, StreamSet * basis, StreamSet * transformedBasis) {
-            NFD_builder.NFD_U8_Pipeline(basis, transformedBasis);
-        });
-}
-
 //  The form of the source the reintegration stage takes: bytes or basis bits.
 static bool ReintegratesBytes() {
     return NFD_FocusOptions().Reintegration != ReintegrationMode::Bit;
@@ -156,7 +141,7 @@ NFD_FilterFunctionType NFD_filter_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("WorkingBasis", 8, 1, ReturnedBuffer(1))
                             );
     NFD_PipelineBuilder NFD_builder(P);
-    const auto NFD = NFD_FocusedTransform(NFD_builder);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     StreamSet * const BasisBits = P.getInputStreamSet("BasisBits");
     StreamSet * const WorkSelectionMask = P.getOutputStreamSet("WorkSelectionMask");
     StreamSet * const FinalWorkPlacementMask = P.getOutputStreamSet("FinalWorkPlacementMask");
@@ -179,7 +164,7 @@ NFD_TransformFunctionType NFD_transform_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1))
                             );
     NFD_PipelineBuilder NFD_builder(P);
-    const auto NFD = NFD_FocusedTransform(NFD_builder);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     NFD.transform(P, P.getInputStreamSet("WorkingBasis"), P.getOutputStreamSet("TransformedBasis"));
     return P.compile();
 }
@@ -197,7 +182,7 @@ CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
                             Input<uint32_t>("inputFileDecriptor")
                             );
     NFD_PipelineBuilder NFD_builder(P);
-    const auto NFD = NFD_FocusedTransform(NFD_builder);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     StreamSet * const WorkSelectionMask = P.getOutputStreamSet("WorkSelectionMask");
@@ -227,7 +212,7 @@ OutputAssemblyFunctionType generate_output_pipeline(CPUDriver & driver) {
                             Input<streamset_t>("TransformedBasis", 8, 1)
                             );
     NFD_PipelineBuilder NFD_builder(P);
-    const auto NFD = NFD_FocusedTransform(NFD_builder);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     StreamSet * const Source = P.getInputStreamSet("Source");
     StreamSet * const OutputBytes = NFD.reintegrate(P, P.getInputStreamSet("WorkSelectionMask"),
                                                     P.getInputStreamSet("FinalWorkPlacementMask"),
@@ -242,7 +227,7 @@ typedef void (*XfrmFunctionType)(uint32_t fd);
 XfrmFunctionType generate_unitary_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"));
     NFD_PipelineBuilder NFD_builder(P);
-    const auto NFD = NFD_FocusedTransform(NFD_builder);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);

@@ -47,20 +47,6 @@ static FocusOptions NFC_FocusOptions() {
     return options;
 }
 
-//  NFC as a focused transform, with placement after the transform.
-static FocusedTransform NFC_FocusedTransform() {
-    return FocusedTransform(NFC_FocusOptions(),
-        [](PipelineBuilder & P, StreamSet * basis, StreamSet * workMask) {
-            DetermineNFC_WorkSelection(P, basis, workMask);
-        },
-        [](PipelineBuilder & P, StreamSet * basis, StreamSet * workMask, StreamSet * validMask, StreamSet * placementMask) {
-            NFC_WorkPlacement(P, basis, workMask, validMask, placementMask);
-        },
-        [](PipelineBuilder & P, StreamSet * basis, StreamSet * transformedBasis, StreamSet * validMask) {
-            NFC_Transform(P, basis, transformedBasis, validMask);
-        });
-}
-
 void source_logic(PipelineBuilder & P, StreamSet * ByteStream, StreamSet * BasisBits) {
     P.SetStageLabel("source");
     Scalar * const buffer = P.getInputScalar("buffer");
@@ -82,7 +68,7 @@ FocusStageFunctionType focus_stage_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("FocusedBasis", 8, 1, ReturnedBuffer(1)),
                             Input<const char*>{"buffer"}, Input<size_t>{"length"}
                             );
-    const auto NFC = NFC_FocusedTransform();
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
     StreamSet * const ByteStream = P.getOutputStreamSet("ByteStream");
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     source_logic(P, ByteStream, BasisBits);
@@ -100,7 +86,7 @@ TransformStageFunctionType transform_stage_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1)),
                             Output<streamset_t>("ValidWorkMask", 1, 1, ReturnedBuffer(1))
                             );
-    const auto NFC = NFC_FocusedTransform();
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
     NFC.transform(P, P.getInputStreamSet("FocusedBasis"), P.getOutputStreamSet("TransformedBasis"), P.getOutputStreamSet("ValidWorkMask"));
     return P.compile();
 }
@@ -114,7 +100,7 @@ FinalStageFunctionType final_stage_pipeline(CPUDriver & driver) {
                             Input<streamset_t>("ValidWorkMask", 1, 1),
                             Input<streamset_t>("TransformedBasis", 8, 1)
                             );
-    const auto NFC = NFC_FocusedTransform();
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
     StreamSet * const ByteStream = P.getInputStreamSet("ByteStream");
     StreamSet * const WorkSelectionMask = P.getInputStreamSet("WorkSelectionMask");
     P.SetStageLabel("placement");
@@ -131,7 +117,7 @@ typedef void (*XfrmFunctionType)(const char * buffer, const size_t length);
 
 XfrmFunctionType generate_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<const char*>{"buffer"}, Input<size_t>{"length"});
-    const auto NFC = NFC_FocusedTransform();
+    const auto NFC = NFC_FocusedTransform(NFC_FocusOptions());
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);

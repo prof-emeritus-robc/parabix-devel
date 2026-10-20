@@ -64,8 +64,10 @@ def best_time(cmd, repeats):
 
 def density(cc_path):
     rows, _ = stage_report.parse_cycle_counter(cc_path)
-    source = next((r for r in rows if r.label == 'source'), None)
-    transform = next((r for r in rows if r.label == 'transform'), None)
+    # the first kernels labelled as such (unlabelled kernels, such as the PopCount
+    # kernels of a filter, are assigned to the following stage)
+    source = next((r for r in rows if r.labelled and r.label == 'source'), None)
+    transform = next((r for r in rows if r.labelled and r.label == 'transform'), None)
     if not source or not transform or not source.items:
         return None
     return 100.0 * transform.items / source.items

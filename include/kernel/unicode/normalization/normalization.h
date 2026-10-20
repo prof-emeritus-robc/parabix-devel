@@ -293,6 +293,10 @@ public:
 
     void DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * workItems);
 
+    // The focus of NFD: the UTF-8 sequences that may change.
+    void DetermineNFD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask);
+
+    // DetermineNFD_WorkSelection, with gap filling, then FilterByMask of the basis bits.
     void NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis);
 
     // Fill gaps of at most this many unchanged bytes between work regions (0: none).

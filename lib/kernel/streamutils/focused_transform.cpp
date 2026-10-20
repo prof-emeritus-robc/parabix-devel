@@ -1,0 +1,186 @@
+/*
+ *  Part of the Parabix Project, under the Open Software License 3.0.
+ *  SPDX-License-Identifier: OSL-3.0
+ */
+
+#include <kernel/streamutils/focused_transform.h>
+#include <kernel/pipeline/pipeline_builder.h>
+#include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/pdep_kernel.h>
+#include <kernel/streamutils/run_replace.h>
+#include <kernel/basis/s2p_kernel.h>
+#include <kernel/basis/p2s_kernel.h>
+#include <kernel/bitwise/bixlogic.h>
+#include <llvm/Support/CommandLine.h>
+
+using namespace llvm;
+
+namespace kernel {
+
+static cl::OptionCategory FocusOptionCategory("Focused Transform Options",
+    "Implementations of the filter and reintegration stages of focused transforms.");
+
+static cl::opt<FocusFilterMode> FocusFilterOption("focus-filter", cl::init(FocusFilterMode::Bit),
+    cl::desc("Extraction of the work regions:"),
+    cl::values(clEnumValN(FocusFilterMode::Bit, "bit", "FilterByMask of the basis bit streams (default)"),
+               clEnumValN(FocusFilterMode::Byte, "byte", "FilterByMask of the source bytes"),
+               clEnumValN(FocusFilterMode::Run, "run", "RunFilter of the source bytes")),
+    cl::cat(FocusOptionCategory));
+
+static cl::opt<ReintegrationMode> ReintegrationOption("reintegrate", cl::init(ReintegrationMode::Bit),
+    cl::desc("Merging of transformed and unmodified data:"),
+    cl::values(clEnumValN(ReintegrationMode::Bit, "bit", "MergeByMask of basis bit streams (default)"),
+               clEnumValN(ReintegrationMode::ByteSpread, "byte-spread", "spread and OR of bytes"),
+               clEnumValN(ReintegrationMode::ByteReplace, "byte-replace", "spread and ByteReplaceByMask of bytes"),
+               clEnumValN(ReintegrationMode::Run, "run", "RunMerge of bytes")),
+    cl::cat(FocusOptionCategory));
+
+static cl::opt<UnmodifiedFilterMode> UnmodifiedFilterOption("unmodified-filter", cl::init(UnmodifiedFilterMode::Byte),
+    cl::desc("Extraction of unmodified bytes for byte reintegration:"),
+    cl::values(clEnumValN(UnmodifiedFilterMode::Byte, "byte", "FilterByMask (default)"),
+               clEnumValN(UnmodifiedFilterMode::Run, "run", "RunFilter")),
+    cl::cat(FocusOptionCategory));
+
+static cl::opt<unsigned> FillRunGapsOption("fill-run-gaps", cl::init(0),
+    cl::desc("Include gaps of at most N unmodified bytes between work regions in the work"),
+    cl::cat(FocusOptionCategory));
+
+cl::OptionCategory & FocusedTransformOptions() {
+    return FocusOptionCategory;
+}
+
+FocusOptions FocusOptions::fromCommandLine() {
+    FocusOptions options;
+    options.FocusFilter = FocusFilterOption;
+    options.Reintegration = ReintegrationOption;
+    options.UnmodifiedFilter = UnmodifiedFilterOption;
+    options.FillRunGaps = FillRunGapsOption;
+    return options;
+}
+
+StreamSet * FocusedTransform::build(PipelineBuilder & P, StreamSet * sourceBytes, StreamSet * sourceBasis) const {
+    if (!mOptions.Focus) {
+        StreamSet * const transformedBasis = transform(P, sourceBasis);
+        P.SetStageLabel("output");
+        StreamSet * const outputBytes = P.CreateStreamSet(1, 8);
+        P.CreateKernelCall<P2SKernel>(transformedBasis, outputBytes);
+        return outputBytes;
+    }
+    StreamSet * const workMask = focus(P, sourceBasis);
+    StreamSet * const focusedBasis = filter(P, sourceBytes, sourceBasis, workMask);
+    StreamSet * const placementMask = placement(P, sourceBasis, workMask);
+    StreamSet * const transformedBasis = transform(P, focusedBasis);
+    return reintegrate(P, workMask, placementMask, sourceBytes, sourceBasis, transformedBasis);
+}
+
+StreamSet * FocusedTransform::focus(PipelineBuilder & P, StreamSet * sourceBasis) const {
+    StreamSet * const workMask = P.CreateStreamSet(1, 1);
+    focus(P, sourceBasis, workMask);
+    return workMask;
+}
+
+void FocusedTransform::focus(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask) const {
+    P.SetStageLabel("focus");
+    if (mOptions.FillRunGaps > 0) {
+        StreamSet * const regions = P.CreateStreamSet(1, 1);
+        mFocus(P, sourceBasis, regions);
+        FillRunGaps(P, regions, mOptions.FillRunGaps, workMask);
+    } else {
+        mFocus(P, sourceBasis, workMask);
+    }
+}
+
+StreamSet * FocusedTransform::filter(PipelineBuilder & P, StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * workMask) const {
+    StreamSet * const focusedBasis = P.CreateStreamSet(8, 1);
+    filter(P, sourceBytes, sourceBasis, workMask, focusedBasis);
+    return focusedBasis;
+}
+
+void FocusedTransform::filter(PipelineBuilder & P, StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * focusedBasis) const {
+    P.SetStageLabel("filter");
+    if (mOptions.FocusFilter == FocusFilterMode::Bit) {
+        FilterByMask(P, workMask, sourceBasis, focusedBasis);
+    } else {
+        StreamSet * const focusedBytes = P.CreateStreamSet(1, 8);
+        if (mOptions.FocusFilter == FocusFilterMode::Run) {
+            RunFilter(P, workMask, sourceBytes, focusedBytes);
+        } else {
+            FilterByMask(P, workMask, sourceBytes, focusedBytes);
+        }
+        Selected_S2P(P, focusedBytes, focusedBasis);
+    }
+}
+
+StreamSet * FocusedTransform::placement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask) const {
+    StreamSet * const placementMask = P.CreateStreamSet(1, 1);
+    placement(P, sourceBasis, workMask, placementMask);
+    return placementMask;
+}
+
+void FocusedTransform::placement(PipelineBuilder & P, StreamSet * sourceBasis, StreamSet * workMask, StreamSet * placementMask) const {
+    P.SetStageLabel("placement");
+    mPlacement(P, sourceBasis, workMask, placementMask);
+}
+
+StreamSet * FocusedTransform::transform(PipelineBuilder & P, StreamSet * focusedBasis) const {
+    StreamSet * const transformedBasis = P.CreateStreamSet(8, 1);
+    transform(P, focusedBasis, transformedBasis);
+    return transformedBasis;
+}
+
+void FocusedTransform::transform(PipelineBuilder & P, StreamSet * focusedBasis, StreamSet * transformedBasis) const {
+    P.SetStageLabel("transform");
+    mTransform(P, focusedBasis, transformedBasis);
+}
+
+StreamSet * FocusedTransform::reintegrate(PipelineBuilder & P, StreamSet * workMask, StreamSet * placementMask,
+                                          StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * transformedBasis) const {
+    StreamSet * const outputBytes = P.CreateStreamSet(1, 8);
+    reintegrate(P, workMask, placementMask, sourceBytes, sourceBasis, transformedBasis, outputBytes);
+    return outputBytes;
+}
+
+void FocusedTransform::reintegrate(PipelineBuilder & P, StreamSet * workMask, StreamSet * placementMask,
+                                   StreamSet * sourceBytes, StreamSet * sourceBasis, StreamSet * transformedBasis,
+                                   StreamSet * outputBytes) const {
+    P.SetStageLabel("reintegrate");
+    StreamSet * const unmodifiedMask = P.CreateStreamSet(1, 1);
+    Invert(P, workMask, unmodifiedMask);
+
+    if (mOptions.Reintegration == ReintegrationMode::Bit) {
+        StreamSet * const unmodifiedBasis = P.CreateStreamSet(8);
+        FilterByMask(P, unmodifiedMask, sourceBasis, unmodifiedBasis);
+        StreamSet * const outputBasis = P.CreateStreamSet(8);
+        MergeByMask(P, placementMask, transformedBasis, unmodifiedBasis, outputBasis);
+        P.CreateKernelCall<P2SKernel>(outputBasis, outputBytes);
+        return;
+    }
+
+    StreamSet * const unmodified = P.CreateStreamSet(1, 8);
+    if (mOptions.UnmodifiedFilter == UnmodifiedFilterMode::Run) {
+        RunFilter(P, unmodifiedMask, sourceBytes, unmodified);
+    } else {
+        FilterByMask(P, unmodifiedMask, sourceBytes, unmodified);
+    }
+    StreamSet * const transformedBytes = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<P2SKernel>(transformedBasis, transformedBytes);
+
+    if (mOptions.Reintegration == ReintegrationMode::Run) {
+        RunMerge(P, placementMask, transformedBytes, unmodified, outputBytes);
+        return;
+    }
+
+    StreamSet * const unmodifiedPlacementMask = P.CreateStreamSet(1, 1);
+    Invert(P, placementMask, unmodifiedPlacementMask);
+    StreamSet * const unmodifiedPlaced = P.CreateStreamSet(1, 8);
+    SpreadByMask(P, unmodifiedPlacementMask, unmodified, unmodifiedPlaced);
+    if (mOptions.Reintegration == ReintegrationMode::ByteReplace) {
+        P.CreateKernelCall<ByteReplaceByMask>(placementMask, unmodifiedPlaced, transformedBytes, outputBytes);
+    } else {
+        StreamSet * const transformedPlaced = P.CreateStreamSet(1, 8);
+        SpreadByMask(P, placementMask, transformedBytes, transformedPlaced);
+        OrCombine(P, unmodifiedPlaced, transformedPlaced, outputBytes);
+    }
+}
+
+}

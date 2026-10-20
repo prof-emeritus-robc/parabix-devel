@@ -90,8 +90,8 @@ Times are in seconds. "Ceiling" is the projected maximum speedup at any thread c
 
 ## Suggested next steps
 
-1. Consider `-unmodified-filter=run` as the default, for both nfc and nfd. This is
-   the main scaling gain at low density.
+1. ~~Consider `-unmodified-filter=run` as the default, for both nfc and nfd.~~ Done:
+   it is the default since the commit after this report.
 2. Choose the filter mode adaptively by density, as was proposed for nfd's run merge.
    Byte or bit filtering wins at high density (ko.nfd), run filtering at low density.
 3. Make placement cheaper. For nfc, compute the insertion bixnum only within the

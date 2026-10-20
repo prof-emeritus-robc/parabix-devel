@@ -35,10 +35,10 @@ static cl::opt<ReintegrationMode> ReintegrationOption("reintegrate", cl::init(Re
                clEnumValN(ReintegrationMode::Run, "run", "RunMerge of bytes (default)")),
     cl::cat(FocusOptionCategory));
 
-static cl::opt<UnmodifiedFilterMode> UnmodifiedFilterOption("unmodified-filter", cl::init(UnmodifiedFilterMode::Byte),
+static cl::opt<UnmodifiedFilterMode> UnmodifiedFilterOption("unmodified-filter", cl::init(UnmodifiedFilterMode::Run),
     cl::desc("Extraction of unmodified bytes for byte reintegration:"),
-    cl::values(clEnumValN(UnmodifiedFilterMode::Byte, "byte", "FilterByMask (default)"),
-               clEnumValN(UnmodifiedFilterMode::Run, "run", "RunFilter")),
+    cl::values(clEnumValN(UnmodifiedFilterMode::Byte, "byte", "FilterByMask"),
+               clEnumValN(UnmodifiedFilterMode::Run, "run", "RunFilter (default)")),
     cl::cat(FocusOptionCategory));
 
 static cl::opt<unsigned> FillRunGapsOption("fill-run-gaps", cl::init(0),

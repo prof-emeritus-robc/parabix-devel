@@ -1090,6 +1090,23 @@ start_of_transfer_loop:
                         goto start_of_transfer_loop;
                     }
 
+                    // A kernel may not be moved into a partition unless the other partitions that
+                    // consume its output follow that partition.  In its own partition, the kernel
+                    // processes all of its available input, ahead of any consumer; in the target
+                    // partition, it is limited by that partition's root, and a consumer in an
+                    // independent partition could get ahead of it (e.g., two ExpandFilters sharing
+                    // an Invert of their spread mask, each in the partition of its stream expansion).
+                    // A thread-local buffer feeding such a consumer would then not be fully consumed.
+                    if (transferPos != -1U) {
+                        const auto & D = partitionPostDominators[ordering[transferPos]];
+                        for (const auto e : make_iterator_range(out_edges(currentPartId, partGraph))) {
+                            if (partGraph[e].Producer == potentiallyTransferedKernel && !D.test(target(e, partGraph))) {
+                                transferPos = -1U;
+                                break;
+                            }
+                        }
+                    }
+
                     // A kernel may not be moved into a partition in which a consumer reads its
                     // output with a lookahead: only a provisional stride kernel may look ahead into
                     // data produced within its own partition, and only along a chain of provisional

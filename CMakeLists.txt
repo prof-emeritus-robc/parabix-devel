@@ -548,6 +548,11 @@ add_test(
   COMMAND python3 nfd_test.py -o nfd_output_separated --flags=-SeparatedPipelineStages=2 "${BIN_DIR}/nfd")
 
 add_test(
+  NAME nfd_separated4_test
+  WORKING_DIRECTORY ${QA_DIR}/nfd
+  COMMAND python3 nfd_test.py -o nfd_output_separated4 --flags=-SeparatedPipelineStages=4 "${BIN_DIR}/nfd")
+
+add_test(
   NAME nfc_test
   WORKING_DIRECTORY ${QA_DIR}/nfc
   COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")

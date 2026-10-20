@@ -20,14 +20,14 @@ namespace kernel {
 static cl::OptionCategory FocusOptionCategory("Focused Transform Options",
     "Implementations of the filter and reintegration stages of focused transforms.");
 
-static cl::opt<FocusFilterMode> FocusFilterOption("focus-filter", cl::init(FocusFilterMode::Bit),
+static cl::opt<FocusFilterMode> FocusFilterOption("focus-filter", cl::init(FocusFilterMode::Run),
     cl::desc("Extraction of the work regions:"),
     cl::values(clEnumValN(FocusFilterMode::Bit, "bit", "FilterByMask of the basis bit streams (default)"),
                clEnumValN(FocusFilterMode::Byte, "byte", "FilterByMask of the source bytes"),
                clEnumValN(FocusFilterMode::Run, "run", "RunFilter of the source bytes")),
     cl::cat(FocusOptionCategory));
 
-static cl::opt<ReintegrationMode> ReintegrationOption("reintegrate", cl::init(ReintegrationMode::Bit),
+static cl::opt<ReintegrationMode> ReintegrationOption("reintegrate", cl::init(ReintegrationMode::Run),
     cl::desc("Merging of transformed and unmodified data:"),
     cl::values(clEnumValN(ReintegrationMode::Bit, "bit", "MergeByMask of basis bit streams (default)"),
                clEnumValN(ReintegrationMode::ByteSpread, "byte-spread", "spread and OR of bytes"),

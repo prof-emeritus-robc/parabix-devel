@@ -7,38 +7,41 @@ register-allocator crash"), section 3.
 The issue reports that `nfc -focus-layers=focus` exits with status 139 and no
 output. The crash is in `HoistSpillHelper::runHoistSpills`, called from
 `InlineSpiller::postOptimization` and `RAGreedy`, while the pipeline kernel is
-being compiled. The issue suspects an LLVM 18 bug. This note gives a
-reproduction and assesses the crash with LLVM 18.1.8 (`build18`) and LLVM
-22.1.8 (`build22`).
+being compiled. The issue suspects an LLVM 18 bug.
+
+**It is not an LLVM bug.** The Parabix pipeline compiler produces invalid IR:
+a value is used in blocks that its definition does not dominate. The register
+allocator crashes on the resulting machine code. This note gives a
+reproduction, shows the invalid IR, explains the cause, and describes the fix.
 
 ## Summary
 
-* **Reproduced with both LLVM 18.1.8 and LLVM 22.1.8.** The crash is the same
-  in both: a load from address `0x8` in `runHoistSpills` (in LLVM 22 the
-  function is inlined into `InlineSpiller::postOptimization`). The bug is not
-  fixed in LLVM 22, so upgrading LLVM is not a fix.
-* **The crash depends on the shape of the code, not on the input.** A 6-byte
-  input (`hello\n`) crashes just as the test text does, because the crash
-  happens while compiling, before any data is read. Small pipeline changes
-  decide whether a given tool crashes (see the table: nfc stopped crashing
-  with LLVM 18 at 7005984ab, while nfd and nfkd started).
-* **Only `-focus-layers=focus` crashes.** Phase boundaries after `filter`,
-  `placement` or `transform`, or after all four stages together, compile with
-  both LLVM versions.
-* **Reliable workarounds:** `-regalloc=basic` and
-  `--backend-optimization-level=none`. Both give correct output in every
-  failing case.
-* **`-split-spill-mode=size` is not a reliable workaround.** It did not avoid
-  any of the crashes reproduced here with either LLVM version. The one
-  exception is nfc at efe701fca with LLVM 22.
-* **`-disable-spill-hoist` cannot help.** In LLVM 18.1.8, `DisableHoisting` is
-  declared in `llvm/lib/CodeGen/InlineSpiller.cpp` but is never read. LLVM 22
-  removed the option, and `build22` binaries reject it.
-* `--backend-optimization-level=less` still crashes. The crash needs the
-  greedy register allocator with spill hoisting, which runs at every level
-  above `none`.
+* **The cause is invalid IR from the pipeline compiler.** `-VerifyIR` rejects
+  the IR before any optimization ("Instruction does not dominate all uses!"),
+  and `-verify-machineinstrs` rejects the machine code right after
+  instruction selection ("Virtual register defs don't dominate all uses").
+  The register allocator crash is only where the bad code does damage.
+* **Every pipeline with a phase boundary right after the focus stage has
+  invalid IR,** whether or not it crashes. nfc at the branch tip with LLVM 18
+  ran and gave correct output, but `-VerifyIR` rejects its IR too. Phase
+  boundaries after `filter`, `placement` or `transform` give valid IR.
+* **Whether it crashes depends on the LLVM version and the shape of the code,
+  not on the input.** A 6-byte input crashes too, because the crash happens
+  during compilation. Which tool crashes changed from one commit to the next,
+  and between LLVM 18.1.8 and 22.1.8.
+* **The workarounds only hide the problem.** `-regalloc=basic` and
+  `--backend-optimization-level=none` avoided every crash. Neither one makes
+  the IR valid. `-split-spill-mode=size` did not avoid any crash except one
+  (nfc at efe701fca with LLVM 22). `-disable-spill-hoist` has no effect: in
+  LLVM 18.1.8 the option is declared in `InlineSpiller.cpp` but never read,
+  and LLVM 22 removed it.
+* **Fixed** by reading the item counts and termination signals of
+  earlier-phase producers once per segment, at the entry of the phase (see
+  "Fix" below). With the fix, nfc, nfd and nfkd pass `-VerifyIR
+  -verify-machineinstrs` and give correct output with every `-focus-layers`
+  setting, on both LLVM versions.
 
-## Reproduction
+## Reproduction (before the fix)
 
 Environment: Apple M1 (arm64, `ARM_Neon` target), macOS 14.6.1, Apple clang
 16.0.0. Release builds against `/opt/llvm/libllvm18` (18.1.8) and
@@ -65,6 +68,8 @@ Environment: Apple M1 (arm64, `ARM_Neon` target), macOS 14.6.1, Apple clang
     mkdir -p /tmp/emptycache
     build18/bin/nfc --object-cache-dir=/tmp/emptycache -focus-layers=focus fm.txt; echo $?
     # 139, no output
+    build18/bin/nfc --object-cache-dir=/tmp/emptycache -focus-layers=focus -VerifyIR fm.txt
+    # Instruction does not dominate all uses!
 
 Use an empty object cache directory each time, or a new
 `--object-cache-salt`. The other kernels are cached normally. The pipeline
@@ -96,16 +101,14 @@ is again `0x8`.
 The crashing module is the main pipeline kernel. Compare the object cache
 from a crashing run with one from a `-regalloc=basic` run: every kernel object
 is the same except the pipeline kernel's (`parabix-P2c045e34…_ARM_Neon_*.o`,
-188 KB at efe701fca), which is missing after the crash. The pipeline kernel
-contains the compute-thread functions of all partitions.
+188 KB at efe701fca), which is missing after the crash.
 
-## Results
+### Results before the fix
 
-Input: `QA/focus/focus_modes_test.py` text (8480 bytes). The input does not
-affect whether a tool crashes. "139" means a crash (SIGSEGV); "ok" means the
-output matches `unicodedata.normalize`.
+Input: `QA/focus/focus_modes_test.py` text (8480 bytes). "139" means a crash
+(SIGSEGV); "ok" means the output matches `unicodedata.normalize`.
 
-### efe701fca
+At efe701fca:
 
 | tool | `-focus-layers=` | LLVM 18 | LLVM 22 |
 |------|------------------|---------|---------|
@@ -117,7 +120,7 @@ output matches `unicodedata.normalize`.
 | nfd  | placement / transform | ok | ok |
 | nfkd | each stage       | ok      | ok      |
 
-Workarounds for nfc `-focus-layers=focus`:
+Workarounds for nfc `-focus-layers=focus` at efe701fca:
 
 | option | LLVM 18 | LLVM 22 |
 |--------|---------|---------|
@@ -129,46 +132,126 @@ Workarounds for nfc `-focus-layers=focus`:
 | `-focus-filter=bit -reintegrate=bit` | ok | ok |
 | `-NoFocus` | ok | ok |
 
-### 47e059423 (tip of `focus-paradigm`)
+At 47e059423 (tip of `focus-paradigm`):
 
 | tool | `-focus-layers=` | LLVM 18 | LLVM 22 |
 |------|------------------|---------|---------|
-| nfc  | focus            | ok      | **139** |
+| nfc  | focus            | ok (but the IR is invalid) | **139** |
 | nfd  | focus            | **139** | **139** |
 | nfkd | focus            | **139** | **139** |
 | nfc, nfd, nfkd | filter / placement / transform | ok | ok |
 
-At the tip, `-regalloc=basic` and `--backend-optimization-level=none` avoid
-every crash, and `-split-spill-mode=size` avoids none of them.
-`-u8-bit-movement=advance` (the default before 47e059423) changes the code
-enough to avoid the crash in nfd and nfkd with LLVM 18, and in nfkd with
-LLVM 22. nfd with LLVM 22 still crashes.
+At the tip, `-regalloc=basic` and `--backend-optimization-level=none` avoided
+every crash, and `-split-spill-mode=size` avoided none of them.
 
-Commit 7005984ab made `ExpandFilter` a single kernel and added the
-LookAhead-mode UTF-8 kernels. Both change the pipeline function: nfc stopped
-crashing with LLVM 18, and nfd and nfkd started.
+## The invalid IR
 
-## Assessment
+At 47e059423, `-verify-machineinstrs` fails in each crashing case, right after
+instruction selection, in one `ComputeThread` function of the pipeline kernel:
 
-* This is a latent LLVM bug in spill hoisting (`InlineSpiller.cpp`,
-  `HoistSpillHelper`), present from 18.1.8 through 22.1.8. A null
-  `MachineDomTreeNode` or block pointer is dereferenced at offset 8. Parabix
-  triggers it with the large, branchy pipeline function that a phase boundary
-  right after the focus stage produces. That the crash moves between tools
-  from one commit to the next shows how sensitive it is to code shape.
-* The issue rejected `-split-spill-mode=size` as a global workaround on the
-  grounds that it affects every program. In addition, it does not work here.
-  A workaround would have to use `-regalloc=basic`, or `-O0`
-  code generation for the pipeline kernel only. Applying either just to
-  pipeline kernels that use phase boundaries would limit the cost to those
-  pipelines.
-* To report the bug upstream, a standalone `.ll`/`.bc` reproducer for `llc`
-  is needed. `-ShowIR` does not give one: it prints the optimized IR one
-  function at a time, without declarations or attribute groups, and only
-  after code generation, so a crashing run writes nothing. A small hook that
-  writes the module bitcode before `materializeObject` (or `-ShowIR` from a
-  `-regalloc=basic` run, made into a complete module) would allow
-  `llc -O2 -mtriple=arm64-apple-macosx` reproduction and then `llvm-reduce`.
-* Unrelated, found while testing: every tool aborts on an empty input file
-  with `LLVM ERROR: Unable to allocate aligned file buffer` (exit 134), with
-  or without phase boundaries.
+    # After Instruction Selection
+    # Machine code for function Pb98679bb…_ComputeThread8_93: IsSSA, TracksLiveness
+    *** Bad machine code: Virtual register defs don't dominate all uses. ***
+    - v. register: %222
+    LLVM ERROR: Found 1 machine code errors.
+
+`-VerifyIR` reports the same problem in the LLVM IR, before optimization (nfd
+with LLVM 18):
+
+    Instruction does not dominate all uses!
+      %"1O0.IN" = load i64, ptr %28, align 8
+      %2270 = sub i64 %"1O0.IN", %"18I2_alreadyProcessed"
+    Instruction does not dominate all uses!
+      %"1O0.IN" = load i64, ptr %28, align 8
+      %"18I2_finalProcessed" = phi i64 [ %"1O0.IN", %"18:post_LSN_acquired82" ]
+
+`1O0.IN` is the produced item count of output 0 of kernel 1, the source
+kernel, which runs in an earlier phase. Kernel 18 uses a load of that count
+that one of its predecessors made in a block that does not dominate kernel 18.
+
+## Cause
+
+`readAvailableItemCounts` (`buffer_management_logic.cpp`) caches each consumed
+stream set's available item count in `mLocallyAvailableItems`. The first
+kernel that reads the stream set fills the cache. For a stream set produced
+in an earlier phase, `readAvailableItemCount` loads the count from the
+producer's `.IN` scalar at the current insertion point: the first consumer's
+entry block. The cache is cleared only once per compute function, in
+`PipelineCompiler::start`.
+
+For a stream set produced in the *current* phase, the compiler handles a
+consumer in a later partition that can be reached without passing through the
+earlier ones. It adds a PHI node to every partition between producer and
+reader (`mPartitionProducedItemCountPhi`), and when it jumps over a partition
+it loads the count at the jump (`phiOutPartitionItemCounts`). Stream sets from
+an earlier phase get no such PHI nodes. A later consumer therefore reuses the
+first consumer's load even when control can reach the later consumer without
+passing through the first one.
+
+A phase boundary right after the focus stage puts the source kernel and the
+focus in phase 1, and the rest of the pipeline in phase 2. Many kernels in
+several partitions of phase 2 then read stream sets from phase 1, such as the
+byte stream. Boundaries after later stages leave fewer such consumers. With
+those boundaries in nfc, nfd and nfkd, no consumer reused a load that did not
+dominate it, and `-VerifyIR` accepted the IR.
+
+## Fix
+
+`readEarlierPhaseItemCounts` (`buffer_management_logic.cpp`) is called at the
+end of `branchToInitialPartition`, once per segment. In a multithreaded
+pipeline, the first kernel of the phase has acquired its segment lock by that
+point. The entry of the phase's
+first partition dominates every kernel of the phase. The function:
+
+1. finds every stream set consumed in the current phase whose producer is in
+   an earlier phase. A truncated stream set counts with the stream set it is
+   a truncation of. Constant stream sets and pipeline inputs are excluded;
+2. reads the termination signals of those producers, and then the produced
+   item counts, with an acquire fence between them. A producer that is seen
+   as closed therefore has a final count;
+3. stores both in `mEarlierPhaseTerminationSignal` and
+   `mEarlierPhaseAvailableItems`.
+
+`readAvailableItemCounts` then starts each consumer from the snapshot, never
+from a value computed by an earlier consumer. `hasKernelTerminated` uses the
+snapshot signal for earlier-phase producers. Every kernel in a segment
+therefore sees the same item count and closed state for a stream set from an
+earlier phase.
+
+A snapshot taken at the start of the segment can be older than a count a
+kernel saw in its previous segment. Another thread may have run the kernel's
+previous segment, and read a later count, after the snapshot was taken. A
+non-data-parallel consumer therefore takes the maximum of the snapshot and its
+processed item count, so it never sees fewer items available than it has
+already processed. Data-parallel and relative-rate ports are not clamped: for
+those, the processed count is not a lower bound on the produced count.
+
+Trade-offs: later partitions in a segment see the earlier phase's count as it
+was at the start of the segment, so they may process less per segment, and a
+producer's termination may be noticed one segment later. The snapshot values
+are live through the whole compute function. That is a handful of `i64`
+values per phase.
+
+## Results after the fix
+
+Branch `doc/issue-26-regalloc-repro` (47e059423 plus the fix). Each tool ran
+on the same input with an empty object cache, with `-VerifyIR
+-verify-machineinstrs`, and with no phase boundary, with each of `focus`,
+`filter`, `placement` and `transform`, and with all four together. This gives
+36 runs at the default thread count: all compiled without verifier errors and
+gave output equal to `unicodedata.normalize`, with both LLVM 18.1.8 and
+22.1.8.
+
+A full rebuild of `build18` and `build22` with the fix passed all 42 `ctest`
+tests in each build. These include `focus_modes_{nfd,nfc,nfkd}_test`, which
+run with `--thread-num=3 --segment-size=1024` and
+`-focus-layers=filter,transform`, and the `-SeparatedPipelineStages` and
+`-MultiStage` tests.
+
+## Other findings
+
+* Every tool aborts on an empty input file with
+  `LLVM ERROR: Unable to allocate aligned file buffer` (exit 134), with or
+  without phase boundaries.
+* The phase-boundary tests should run with `-VerifyIR`. That would have
+  reported this problem when `-focus-layers` was added.

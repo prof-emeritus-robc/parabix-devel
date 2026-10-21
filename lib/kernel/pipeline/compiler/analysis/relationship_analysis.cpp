@@ -1047,6 +1047,37 @@ struct RelationshipGraphBuilder {
     B.addTruncatedStreamSetContraints();
     B.addPopCountKernels(b, mKernels, vertex);
 
+    // A PopCount kernel added for a PopcountOf rate belongs to the (earliest) phase of
+    // its consumers.  Without a phase, it could share a partition of an earlier phase
+    // with the producer of its input, and the consumers would then read its partial
+    // sums across the phase boundary (e.g., a phase boundary between a work mask and
+    // the FilterByMask that uses it gave empty output).
+    if (LLVM_UNLIKELY(!boundaries.empty())) {
+        for (auto i = n; i < mKernels.size(); ++i) {
+            const auto k = vertex[i];
+            size_t phase = boundaries.size() + 1;
+            for (const auto e : make_iterator_range(out_edges(k, Relationships))) {
+                const auto output = target(e, Relationships);
+                if (Relationships[output].Type != RelationshipNode::IsBinding) continue;
+                for (const auto f : make_iterator_range(out_edges(output, Relationships))) {
+                    const auto streamSet = target(f, Relationships);
+                    for (const auto g : make_iterator_range(out_edges(streamSet, Relationships))) {
+                        const auto input = target(g, Relationships);
+                        for (const auto h : make_iterator_range(out_edges(input, Relationships))) {
+                            const auto p = KernelPhaseId.find(target(h, Relationships));
+                            if (p != KernelPhaseId.end()) {
+                                phase = std::min<size_t>(phase, p->second);
+                            }
+                        }
+                    }
+                }
+            }
+            if (phase <= boundaries.size()) {
+                KernelPhaseId.emplace(k, phase);
+            }
+        }
+    }
+
     B.addProducerScalars(PortType::Output, p_in, mPipelineKernel->getInputScalarBindings());
     B.addConsumerScalars(PortType::Input, p_out, mPipelineKernel->getOutputScalarBindings(), true);
     for (unsigned i = 0; i < n; ++i) {

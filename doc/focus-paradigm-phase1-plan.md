@@ -159,6 +159,29 @@ a timing check with `QA/focus_baseline.py` against the step before.
   focused nfkd is 52% faster than `-NoFocus` on de (0.111 s against 0.230 s), 17% on
   vi, and 26% slower on ko (64% density, as for nfd).
 
+- **Step 4 (shared options, labels, layers):** done.  The shared option category
+  (`FocusedTransformOptions()`) now also has `-NoFocus` and
+  `-focus-layers=focus,filter,placement,transform` (a phase boundary after each
+  given stage, placed by `FocusedTransform::build`); the tools' own options are
+  aliases (`-ByteFiltering`; nfc's `-UseLayers` is `-focus-layers=filter`; nfd's
+  `-UseLayers` keeps its meaning, a boundary in the filter pipeline of
+  `-SeparatedPipelineStages=4`).  Labels come from the builder.
+  `QA/focus_baseline.py` runs nfd, nfc and nfkd with the current modes.
+  The pipeline's PopCount kernels now take the phase of their consumers (a
+  boundary between a work mask and its FilterByMask gave empty output).
+  Phase boundaries still have problems in the pipeline framework (drafted as an
+  issue): a boundary after the filter or the focus loses the end of nfd's
+  transformed data on dense input with work near the end; the separated filter
+  pipeline with `-UseLayers` and a byte-reading filter reports a cycle (nfd rejects
+  that combination); and `nfc -focus-layers=focus` crashes LLVM 18's greedy
+  register allocator (`-split-spill-mode=size` avoids it).  Boundaries after the
+  placement or the transform are correct for all three tools.
+- **Step 5 (tests):** done.  `focus_modes_{nfd,nfc,nfkd}_test` run six modes each
+  (default, bit filter/merge, byte filter with byte replacement, byte spread with
+  gap filling, a boundary after the transform, `-NoFocus`) at 3 threads with
+  `--segment-size=1024` on a generated 8 KB text of sparse and dense work,
+  against Python's `unicodedata` (0.3–0.4 s each).
+
 ## Status of the other phases
 
 - **Phase 0:** done (baseline, stage labels, `stage_report.py`, `focus_baseline.py`).

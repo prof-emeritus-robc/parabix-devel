@@ -45,6 +45,18 @@ static cl::opt<unsigned> FillRunGapsOption("fill-run-gaps", cl::init(0),
     cl::desc("Include gaps of at most N unmodified bytes between work regions in the work"),
     cl::cat(FocusOptionCategory));
 
+static cl::opt<bool> NoFocusOption("NoFocus", cl::init(false),
+    cl::desc("Process the entire text without filtering to narrow the focus of work"),
+    cl::cat(FocusOptionCategory));
+
+static cl::list<FocusStage> FocusLayersOption("focus-layers", cl::CommaSeparated,
+    cl::desc("Place a pipeline phase boundary after each of the given stages:"),
+    cl::values(clEnumValN(FocusStage::Focus, "focus", "after the focus"),
+               clEnumValN(FocusStage::Filter, "filter", "after the filter"),
+               clEnumValN(FocusStage::Placement, "placement", "after the placement"),
+               clEnumValN(FocusStage::Transform, "transform", "after the transform")),
+    cl::cat(FocusOptionCategory));
+
 cl::OptionCategory & FocusedTransformOptions() {
     return FocusOptionCategory;
 }
@@ -55,6 +67,10 @@ FocusOptions FocusOptions::fromCommandLine() {
     options.Reintegration = ReintegrationOption;
     options.UnmodifiedFilter = UnmodifiedFilterOption;
     options.FillRunGaps = FillRunGapsOption;
+    options.Focus = !NoFocusOption;
+    for (const auto stage : FocusLayersOption) {
+        options.addLayerAfter(stage);
+    }
     return options;
 }
 
@@ -67,18 +83,29 @@ StreamSet * FocusedTransform::build(PipelineBuilder & P, StreamSet * sourceBytes
         P.CreateKernelCall<P2SKernel>(transformedBasis, outputBytes);
         return outputBytes;
     }
+    auto layer = [&](FocusStage stage) {
+        if (mOptions.layerAfter(stage)) {
+            P.InsertPhaseBoundary();
+        }
+    };
     StreamSet * const workMask = focus(P, sourceBasis);
+    layer(FocusStage::Focus);
     StreamSet * const focusedBasis = filter(P, sourceBytes, sourceBasis, workMask);
+    layer(FocusStage::Filter);
     StreamSet * placementMask = nullptr;
     StreamSet * transformedBasis = nullptr;
     if (placesAfterTransform()) {
         StreamSet * const validMask = P.CreateStreamSet(1, 1);
         transformedBasis = P.CreateStreamSet(8, 1);
         transform(P, focusedBasis, transformedBasis, validMask);
+        layer(FocusStage::Transform);
         placementMask = validatedPlacement(P, sourceBasis, workMask, validMask);
+        layer(FocusStage::Placement);
     } else {
         placementMask = placement(P, sourceBasis, workMask);
+        layer(FocusStage::Placement);
         transformedBasis = transform(P, focusedBasis);
+        layer(FocusStage::Transform);
     }
     return reintegrate(P, workMask, placementMask, sourceBytes, sourceBasis, transformedBasis);
 }

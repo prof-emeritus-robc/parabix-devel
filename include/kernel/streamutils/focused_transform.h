@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <functional>
+#include <vector>
 
 namespace llvm { namespace cl { class OptionCategory; } }
 
@@ -51,6 +52,15 @@ enum class ReintegrationMode {
     Run             // RunMerge of unmodified and transformed bytes
 };
 
+// The stages after which a phase boundary (PipelineBuilder::InsertPhaseBoundary)
+// may be placed, so that the stages that follow form a separate layer.
+enum class FocusStage {
+    Focus,
+    Filter,
+    Placement,
+    Transform
+};
+
 enum class UnmodifiedFilterMode {
     Byte,           // FilterByMask of the source bytes
     Run             // RunFilter of the source bytes
@@ -62,6 +72,17 @@ struct FocusOptions {
     ReintegrationMode Reintegration = ReintegrationMode::Run;
     UnmodifiedFilterMode UnmodifiedFilter = UnmodifiedFilterMode::Run;
     unsigned FillRunGaps = 0;
+    std::vector<FocusStage> Layers;     // phase boundaries after these stages
+
+    bool layerAfter(FocusStage stage) const {
+        for (const auto s : Layers) {
+            if (s == stage) return true;
+        }
+        return false;
+    }
+    void addLayerAfter(FocusStage stage) {
+        if (!layerAfter(stage)) Layers.push_back(stage);
+    }
 
     // Whether the filter or reintegration stages need the source bytes (rather
     // than, or as well as, the source basis bits).
@@ -72,8 +93,8 @@ struct FocusOptions {
         return !Focus || FocusFilter == FocusFilterMode::Bit || Reintegration == ReintegrationMode::Bit;
     }
 
-    // The options given by -focus-filter, -reintegrate, -unmodified-filter and
-    // -fill-run-gaps.
+    // The options given by -NoFocus, -focus-filter, -reintegrate, -unmodified-filter,
+    // -fill-run-gaps and -focus-layers.
     static FocusOptions fromCommandLine();
 };
 
@@ -108,7 +129,8 @@ public:
     bool placesAfterTransform() const { return static_cast<bool>(mValidatingTransform); }
 
     // The whole transform: source bytes and basis -> output bytes.  Either source
-    // stream may be null if the options do not need it.
+    // stream may be null if the options do not need it.  Phase boundaries are
+    // placed after the stages given by the options' Layers.
     StreamSet * build(PipelineBuilder & P, StreamSet * sourceBytes, StreamSet * sourceBasis) const;
 
     // The individual stages, for applications that place them in separate pipelines.

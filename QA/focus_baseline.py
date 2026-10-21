@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: OSL-3.0
 #
 # Baseline measurements of the focus/filter/transform/reintegrate structure of the
-# normalization tools (nfd, nfc) over a set of input files.
+# normalization tools (nfd, nfc, nfkd) over a set of input files.
 #
 # For each input file and tool configuration, it
 #   - checks that the output with N threads matches the tool's default
@@ -31,9 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import stage_report  # noqa: E402
 
 CONFIGS = {
-    'nfd': [[], ['-ByteMerging'], ['-ByteReplace'], ['-NoFocus']],
-    'nfc': [[], ['-ByteFiltering'], ['-NoFocus']],
-    'nfkd': [[], ['-NoFocus']],
+    'nfd': [[], ['-focus-filter=bit', '-reintegrate=bit'], ['-reintegrate=byte-replace'], ['-NoFocus']],
+    'nfc': [[], ['-focus-filter=byte', '-reintegrate=bit'], ['-NoFocus']],
+    'nfkd': [[], ['-focus-filter=bit', '-reintegrate=bit'], ['-NoFocus']],
 }
 
 
@@ -81,7 +81,7 @@ def main():
     ap.add_argument('--out', default='focus_baseline_out', help='directory for reports')
     ap.add_argument('--threads', type=int, default=3)
     ap.add_argument('--repeats', type=int, default=2)
-    ap.add_argument('--tools', default='nfd,nfc')
+    ap.add_argument('--tools', default='nfd,nfc,nfkd')
     ap.add_argument('--config', action='append', default=None,
                     help='a configuration (options separated by spaces, "" for the default) to run '
                          'instead of the built-in list; may be repeated')

@@ -24,7 +24,6 @@ using namespace llvm;
 //  See the LLVM CommandLine Library Manual https://llvm.org/docs/CommandLine.html
 static cl::OptionCategory NFKD_Options("Decomposition Options", "Decomposition Options.");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(NFKD_Options));
-static cl::opt<bool> NoFocus("NoFocus", cl::desc("Process the entire file without filtering to narrow the focus of work"), cl::init(false), cl::cat(NFKD_Options));
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 
 void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, StreamSet * ByteStream, StreamSet * BasisBits) {
@@ -39,9 +38,7 @@ typedef void (*XfrmFunctionType)(uint32_t fd);
 XfrmFunctionType generate_NFKD_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"));
     NFD_PipelineBuilder NFD_builder(P);
-    FocusOptions options = FocusOptions::fromCommandLine();
-    options.Focus = !NoFocus;
-    const auto NFKD = NFKD_FocusedTransform(NFD_builder, options);
+    const auto NFKD = NFKD_FocusedTransform(NFD_builder, FocusOptions::fromCommandLine());
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);

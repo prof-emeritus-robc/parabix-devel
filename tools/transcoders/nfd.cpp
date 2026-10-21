@@ -63,7 +63,6 @@ using namespace pablo;
 //  See the LLVM CommandLine Library Manual https://llvm.org/docs/CommandLine.html
 static cl::OptionCategory NFD_Options("Decompositon Options", "Decompositon Options.");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(NFD_Options));
-static cl::opt<bool> NoFocus("NoFocus", cl::desc("Process the entire file without filtering to narrow the focus of work"), cl::init(false), cl::cat(NFD_Options));
 //  Aliases for the Focused Transform Options (-reintegrate, -unmodified-filter).
 static cl::opt<bool> ByteMerging("ByteMerging", cl::desc("Same as -reintegrate=byte-spread"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<bool> ByteReplace("ByteReplace", cl::desc("Same as -reintegrate=byte-replace"), cl::init(false), cl::cat(NFD_Options));
@@ -73,7 +72,7 @@ static cl::opt<bool> RunReplacement("RunReplace", cl::desc("Same as -RunFilter -
 static cl::opt<int> SeparatedPipelineStages("SeparatedPipelineStages", cl::desc("Use multiple separated pipeline stages"), cl::init(0), cl::cat(NFD_Options));
 static cl::opt<bool> FilterViolations("FilterViolations", cl::desc("Only include reorderable sequences in work items if they are misordered or start with a decomposable character"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<bool> UseIndexedShiftBack("IndexedShiftBack", cl::desc("Use IndexedShiftBack in place of Filter/Spread combination"), cl::init(false), cl::cat(NFD_Options));
-static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> UseLayers("UseLayers", cl::desc("With -SeparatedPipelineStages=4, a phase boundary after the filter"), cl::init(false), cl::cat(NFD_Options));
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
@@ -108,7 +107,6 @@ SourceInputFunctionType source_input_pipeline(CPUDriver & driver) {
 //  options as aliases.
 static FocusOptions NFD_FocusOptions() {
     FocusOptions options = FocusOptions::fromCommandLine();
-    options.Focus = !NoFocus;
     if (RunReplacement) {
         RunFiltering = RunMerging = true;
     }
@@ -149,7 +147,7 @@ NFD_FilterFunctionType NFD_filter_pipeline(CPUDriver & driver) {
 
     NFD.focus(P, BasisBits, WorkSelectionMask);
     NFD.filter(P, P.getInputStreamSet("ByteStream"), BasisBits, WorkSelectionMask, WorkingBasis);
-    if (UseLayers) {
+    if (UseLayers || NFD.getOptions().layerAfter(FocusStage::Filter)) {
         P.InsertPhaseBoundary();
     }
     NFD.placement(P, BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
@@ -248,6 +246,12 @@ int main(int argc, char *argv[]) {
         exit(-1);
     }
     if (UseIndexedShiftBack) FilterViolations = true;
+    if (SeparatedPipelineStages == 4 && (UseLayers || NFD_FocusOptions().layerAfter(FocusStage::Filter)) &&
+            NFD_FocusOptions().FocusFilter != FocusFilterMode::Bit) {
+        // With a phase boundary, a filter stage that reads the ByteStream input of the
+        // filter pipeline makes the pipeline compiler report a cycle.
+        llvm::report_fatal_error("-SeparatedPipelineStages=4 with -UseLayers requires -focus-filter=bit");
+    }
     CPUDriver driver("NFD_function");
     if (SeparatedPipelineStages == 2) {
         CombinedWorkFunctionType working_stages = generate_combined_work_pipeline(driver);

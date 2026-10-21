@@ -562,6 +562,16 @@ add_test(
   WORKING_DIRECTORY ${QA_DIR}/nfkd
   COMMAND python3 nfkd_test.py --flags=-NoFocus "${BIN_DIR}/nfkd")
 
+foreach(FOCUS_TOOL_FORM nfd:NFD nfc:NFC nfkd:NFKD)
+    string(REPLACE ":" ";" PAIR ${FOCUS_TOOL_FORM})
+    list(GET PAIR 0 FOCUS_TOOL)
+    list(GET PAIR 1 FOCUS_FORM)
+    add_test(
+      NAME focus_modes_${FOCUS_TOOL}_test
+      WORKING_DIRECTORY ${QA_DIR}/focus
+      COMMAND python3 focus_modes_test.py "${BIN_DIR}/${FOCUS_TOOL}" ${FOCUS_FORM})
+endforeach()
+
 add_test(
   NAME nfc_test
   WORKING_DIRECTORY ${QA_DIR}/nfc

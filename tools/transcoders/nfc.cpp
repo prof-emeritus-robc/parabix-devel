@@ -28,11 +28,10 @@ using namespace llvm;
 static cl::OptionCategory NFC_Options("Composition Options", "Composition Options.");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(NFC_Options));
 static cl::opt<bool> PreferMMap("useMMap", cl::desc("Use mmap for file input, if possible"), cl::init(false), cl::cat(NFC_Options));
-static cl::opt<bool> NoFocus("NoFocus", cl::desc("Process the entire file without filtering to narrow the focus of work"), cl::init(false), cl::cat(NFC_Options));
 static cl::opt<bool> MultiStage("MultiStage", cl::desc("Use separate pipelines for the focus, transform and reintegration stages"), cl::init(false), cl::cat(NFC_Options));
 static cl::opt<bool> ByteFiltering("ByteFiltering", cl::desc("Use byte filtering for focused work (alias of -focus-filter=byte)"), cl::init(false), cl::cat(NFC_Options));
 
-static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers"), cl::init(false), cl::cat(NFC_Options));
+static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers (alias of -focus-layers=filter)"), cl::init(false), cl::cat(NFC_Options));
 
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 
@@ -40,7 +39,9 @@ static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers"), cl:
 //  options as aliases.
 static FocusOptions NFC_FocusOptions() {
     FocusOptions options = FocusOptions::fromCommandLine();
-    options.Focus = !NoFocus;
+    if (UseLayers) {
+        options.addLayerAfter(FocusStage::Filter);
+    }
     if (ByteFiltering) {
         options.FocusFilter = FocusFilterMode::Byte;
     }
@@ -124,7 +125,7 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
     source_logic(P, ByteStream, BasisBits);
 
     StreamSet * OutputBytes = nullptr;
-    if (NoFocus) {
+    if (!NFC.getOptions().Focus) {
         // The whole text is transformed, with room for decompositions inserted only
         // within the work regions.
         P.SetStageLabel("focus");
@@ -137,15 +138,6 @@ XfrmFunctionType generate_pipeline(CPUDriver & driver) {
         P.SetStageLabel("output");
         OutputBytes = P.CreateStreamSet(1, 8);
         P.CreateKernelCall<P2SKernel>(TransformedBasis, OutputBytes);
-    } else if (UseLayers) {
-        StreamSet * const WorkSelectionMask = NFC.focus(P, BasisBits);
-        StreamSet * const FocusedBasis = NFC.filter(P, ByteStream, BasisBits, WorkSelectionMask);
-        P.InsertPhaseBoundary();
-        StreamSet * const TransformedBasis = P.CreateStreamSet(8, 1);
-        StreamSet * const ValidWorkMask = P.CreateStreamSet(1, 1);
-        NFC.transform(P, FocusedBasis, TransformedBasis, ValidWorkMask);
-        StreamSet * const PlacementMask = NFC.validatedPlacement(P, BasisBits, WorkSelectionMask, ValidWorkMask);
-        OutputBytes = NFC.reintegrate(P, WorkSelectionMask, PlacementMask, ByteStream, BasisBits, TransformedBasis);
     } else {
         OutputBytes = NFC.build(P, ByteStream, BasisBits);
     }
@@ -157,7 +149,7 @@ int main(int argc, char *argv[]) {
     //  ParseCommandLineOptions uses the LLVM CommandLine processor, but we also add
     //  standard Parabix command line options such as -help, -ShowPablo and many others.
     codegen::ParseCommandLineOptions(argc, argv, {&NFC_Options, &FocusedTransformOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    if (MultiStage && NoFocus) {
+    if (MultiStage && !NFC_FocusOptions().Focus) {
         llvm::report_fatal_error("-MultiStage requires focus (not -NoFocus)");
     }
 

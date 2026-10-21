@@ -587,10 +587,11 @@ protected:
 static cl::OptionCategory NormalizationOptionCategory("Normalization Options",
     "Options of the normalization (NFD, NFKD) pipelines.");
 
-static cl::opt<BitMovementMode> U8BitMovementOption("u8-bit-movement", cl::init(BitMovementMode::Advance),
+static cl::opt<BitMovementMode> U8BitMovementOption("u8-bit-movement", cl::init(BitMovementMode::LookAhead),
     cl::desc("Placement of the per-character marks of the NFD and NFKD UTF-8 kernels:"),
-    cl::values(clEnumValN(BitMovementMode::Advance, "advance", "on the last byte of each UTF-8 sequence (Advance; default)"),
-               clEnumValN(BitMovementMode::LookAhead, "lookahead", "on the first byte of each UTF-8 sequence (LookAhead)")),
+    cl::values(clEnumValN(BitMovementMode::Advance, "advance", "on the last byte of each UTF-8 sequence (Advance)"),
+               clEnumValN(BitMovementMode::LookAhead, "lookahead", "on the first byte of each UTF-8 sequence (LookAhead; default: "
+                                                               "the character-class kernels are then state-free)")),
     cl::cat(NormalizationOptionCategory));
 
 cl::OptionCategory & NormalizationOptions() {

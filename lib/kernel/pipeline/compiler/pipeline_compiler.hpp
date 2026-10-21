@@ -265,6 +265,7 @@ public:
 
 // inter-kernel codegen functions
 
+    void readEarlierPhaseItemCounts(KernelBuilder & b);
     void readAvailableItemCounts(KernelBuilder & b);
     Value * readAvailableItemCount(KernelBuilder & b, const size_t streamSet);
     void readProcessedItemCounts(KernelBuilder & b);
@@ -753,6 +754,8 @@ protected:
     FixedVector<PHINode *>                      mInitiallyAvailableItemsPhi;
     FixedVector<Value *>                        mKernelIsClosed;
     FixedVector<Value *>                        mLocallyAvailableItems;
+    FixedVector<Value *>                        mEarlierPhaseAvailableItems;
+    FixedVector<Value *>                        mEarlierPhaseTerminationSignal;
     std::vector<AllocaInst *>                   mProvisionalAvailableItemPtr;
 
     FixedVector<Value *>                        mScalarValue;
@@ -1040,6 +1043,8 @@ inline PipelineCompiler::PipelineCompiler(PipelineKernel * const pipelineKernel,
 , mInitiallyAvailableItemsPhi(FirstStreamSet, LastStreamSet)
 , mKernelIsClosed(FirstKernel, LastKernel)
 , mLocallyAvailableItems(FirstStreamSet, LastStreamSet)
+, mEarlierPhaseAvailableItems(FirstStreamSet, LastStreamSet)
+, mEarlierPhaseTerminationSignal(FirstKernel, LastKernel)
 , mProvisionalAvailableItemPtr(LastStreamSet - FirstStreamSet + 1, nullptr)
 
 , mScalarValue(FirstKernel, LastScalar)

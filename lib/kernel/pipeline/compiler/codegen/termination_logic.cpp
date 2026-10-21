@@ -44,7 +44,11 @@ Value * PipelineCompiler::hasKernelTerminated(KernelBuilder & b, const size_t ke
         assert (mBufferGraph[kernel].ProducedPhaseId == mBufferGraph[idx].ProducedPhaseId);
         assert (mBufferGraph[idx].ProducedPhaseId <= mCurrentPipelinePhase);
         if (LLVM_UNLIKELY(mBufferGraph[idx].ProducedPhaseId != mCurrentPipelinePhase)) {
-            signal = readTerminationSignal(b, idx);
+            // read at phase entry, before the item counts (see readEarlierPhaseItemCounts)
+            signal = mEarlierPhaseTerminationSignal[idx];
+            if (signal == nullptr) {
+                signal = readTerminationSignal(b, idx);
+            }
         } else {
             signal = mKernelTerminationSignal[idx];
         }

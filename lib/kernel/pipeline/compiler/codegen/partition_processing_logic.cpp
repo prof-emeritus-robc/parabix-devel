@@ -195,7 +195,8 @@ void PipelineCompiler::branchToInitialPartition(KernelBuilder & b) {
             #endif
         }
     }
-
+    // The first partition entry dominates every kernel of this phase.
+    readEarlierPhaseItemCounts(b);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

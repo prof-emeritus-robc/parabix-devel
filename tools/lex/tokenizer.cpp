@@ -363,10 +363,33 @@ static cl::opt<bool> FastEmit(
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
+// --emit-id-table (with --fast-emit and --bpe-tail): format a batch of ids from a table of
+// their texts (8 bytes per id, 512 KB, built once) instead of dividing digit by digit and
+// appending each to a string. The tail's sink runs on one thread in order, so in a real run
+// its formatting is a serial floor under the whole pipeline. Same output.
+static cl::opt<bool> EmitIdTable(
+    "emit-id-table",
+    cl::desc("With --fast-emit and --bpe-tail: format token ids from a precomputed table "
+             "(same output)."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
 static cl::opt<bool> SkipIdentityNormalize(
     "skip-identity-normalize",
     cl::desc("BPE mode without --normalize: feed BPE the input bytes instead of the decoded "
              "and re-encoded codepoints (the same bytes for valid UTF-8)."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
+// With --pretokenizer=bytelevel, --skip-identity-normalize and no normalizer, the decoded
+// codepoints feed only the nine pretokenizer classes. Compute those classes where the
+// decoder leaves each codepoint (its last byte) and compress the 9 class bits to one slot
+// per codepoint, instead of compressing all 21 codepoint bits first (FilterByMask's two
+// kernels were 8.5% of a 1-thread run). Same boundaries (buildGPT2ByteBoundaries).
+static cl::opt<bool> PretokCompressClasses(
+    "pretok-compress-classes",
+    cl::desc("BPE mode, bytelevel pretokenizer, no normalizer, --skip-identity-normalize: "
+             "compress the pretokenizer's character classes instead of the codepoints."),
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
@@ -440,7 +463,11 @@ static BPEPipelineFunctionType buildBPEPipeline(
     for (auto m : normModes) if (m != NormNone) { hasActiveNorm = true; break; }
     StreamSet * U21codepoints = nullptr;
     StreamSet * normalizedBasis = BasisBits;
-    if (hasActiveNorm || PreTokenizer.getNumOccurrences() != 0) {
+    const bool compressClasses = PretokCompressClasses && !hasActiveNorm && SkipIdentityNormalize
+                              && PreTokenizer.getNumOccurrences() != 0 && PreTokenizer == bytelevel;
+    if (compressClasses) {
+        // the pretokenizer decodes what it needs itself (buildGPT2ByteBoundaries)
+    } else if (hasActiveNorm || PreTokenizer.getNumOccurrences() != 0) {
         U21codepoints = applyNormalizationU21(P, BasisBits, normModes);
         // --skip-identity-normalize: with no normalizer the re-encoded bytes are the input
         // bytes (for valid UTF-8), so keep BasisBits; only the pretokenizer needs U21.
@@ -466,6 +493,9 @@ static BPEPipelineFunctionType buildBPEPipeline(
         // '\n' is only a pretoken separator and is filtered out.
         bpeBasis = StripNewlines ? buildLinePretokens(P, normalizedBasis)
                                  : normalizedBasis;
+    } else if (compressClasses) {
+        bpeBasis    = normalizedBasis;
+        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits);
     } else if (PreTokenizer == bytelevel) {
         // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to
         // mark pretoken STARTS. Feed BPE the RAW bytes (BPERangeSeed does bytes_to_unicode
@@ -515,6 +545,31 @@ static BPEPipelineFunctionType buildBPEPipeline(
         // order, a batch per pipeline call. --fast-emit formats a batch into one write.
         bpeTailSetSink([](const uint16_t * ids, size_t n) {
             if (gBenchQuiet) return;
+            if (gFastEmit && !gEmitDbg && EmitIdTable) {
+                // --emit-id-table: each id's text ("123\n") from a table, 8 bytes copied and
+                // the cursor moved by its length; the buffer has 8 bytes of room per id.
+                static const auto table = [] {
+                    std::vector<uint64_t> t(65536);
+                    std::vector<uint8_t> len(65536);
+                    for (unsigned v = 0; v < 65536; v++) {
+                        char d[8] = {0};
+                        const int k = std::snprintf(d, sizeof(d), "%u\n", v);
+                        std::memcpy(&t[v], d, 8);
+                        len[v] = uint8_t(k);
+                    }
+                    return std::make_pair(std::move(t), std::move(len));
+                }();
+                thread_local std::vector<char> buf;
+                if (buf.size() < 8 * n) buf.resize(8 * n);
+                char * p = buf.data();
+                for (size_t i = 0; i < n; i++) {
+                    std::memcpy(p, &table.first[ids[i]], 8);
+                    p += table.second[ids[i]];
+                }
+                std::lock_guard<std::mutex> lock(gEmitMutex);
+                llvm::outs().write(buf.data(), p - buf.data());
+                return;
+            }
             if (gFastEmit && !gEmitDbg) {
                 thread_local std::string text;
                 text.clear();
@@ -533,7 +588,16 @@ static BPEPipelineFunctionType buildBPEPipeline(
             }
             for (size_t i = 0; i < n; i++) bpe_emit_id(ids[i]);
         });
-        buildBPETailEmitter(P, vocabID, matchEnd, tr.segStarts);
+        if (vocabID == nullptr) {   // --tail-from-bytes: the tail reads the BPE input bytes
+            StreamSet * bpeBytes = ByteStream;
+            if (bpeBasis != BasisBits) {
+                bpeBytes = P.CreateStreamSet(1, 8);
+                P.CreateKernelCall<P2SKernel>(bpeBasis, bpeBytes);
+            }
+            buildBPEByteTailEmitter(P, bpeBytes, tr.segStarts);
+        } else {
+            buildBPETailEmitter(P, vocabID, matchEnd, tr.segStarts);
+        }
     } else {
         StreamSet * idBytes16 = P.CreateStreamSet(1, 16); 
         P.CreateKernelCall<P2S16Kernel>(vocabID, idBytes16);

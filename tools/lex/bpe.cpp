@@ -534,6 +534,43 @@ static cl::opt<unsigned> BPETail(
 // is a temp file in /tmp: mkstemp + unlink + ftruncate per buffer on every pipeline run,
 // ~9% of a 1-thread run, all of it before the worker threads start. Runtime only (the
 // kernels' code is the same), so no cache tag. No effect elsewhere.
+// --tail-direct-input (with --bpe-tail, when no retirement point comes before the cut): hand
+// the tail the last kernel's id bits, live mask and segment starts as they are. Otherwise
+// they go through BPEWidenKernel (to 16 id bits), BPERetirePackKernel and
+// BPERetireUnpackKernel, which with no merge-back in between copy 18 streams twice for
+// nothing; P2S16Kernel zero-pads the missing id bits itself. Cache tag: the kernels differ
+// (BPE_TailSeg, and P2S16 named by its input's shape).
+static cl::opt<bool> TailDirectInput(
+    "tail-direct-input",
+    cl::desc("With --bpe-tail and no retirement point before the cut: feed the tail the "
+             "kernel streams directly, without the widen/pack/unpack copies (default off)."),
+    cl::init(false));
+
+// --tail-from-bytes (needs a pretokenizer): no merge kernels at all, and no partition (the
+// partition and compaction flags are inert). The --bpe-tail emitter runs rank-order BPE
+// with every rule on each pretoken, straight from the input bytes, and its per-thread word
+// cache is keyed by the pretoken's bytes (2..15 of them: two 8-byte loads, no id
+// gathering). Cheaper than the hybrid because a cache hit costs about the same at any cut
+// and nothing else runs: no BPERangeSeed, no bit-transformation kernels, no P2S16.
+// Single-thread harness (val_4MB): the whole BPE in 10.8 ms warm / 14.8 ms cold, vs ~30 ms
+// for the 15 kernels + the --bpe-tail=1 tail. Cache tag: BPE_TailResolveBytes.
+static cl::opt<bool> TailFromBytes(
+    "tail-from-bytes",
+    cl::desc("With a pretokenizer: build no merge kernels; the tail applies every rule per "
+             "pretoken from the raw bytes (default off)."),
+    cl::init(false));
+
+// --tail-cache-pool: keep the tail's per-thread scratch (its 2 MB segment cache) in a pool
+// that outlives the pipeline's worker threads. The pipeline starts new workers on every run,
+// so without it each worker allocates, zeroes and page-faults a fresh cache and starts with
+// it cold. With it a worker takes a cache a finished thread left, still valid (the
+// generation check drops it when the rule table changes). Runtime only, no cache tag.
+static cl::opt<bool> TailCachePool(
+    "tail-cache-pool",
+    cl::desc("With --bpe-tail: reuse the tail's per-thread segment caches across pipeline "
+             "runs and threads (default off)."),
+    cl::init(false));
+
 static cl::opt<bool> VMRingBuffers(
     "vm-ring-buffers",
     cl::desc("macOS: build circular buffers with vm_remap instead of a temp file (default off)."),
@@ -774,6 +811,17 @@ protected:
 //   33..126      −33      0..93         173          →255     255
 //   127..160     +94      221..254      174..255     −68      106..187
 // (e.g. space 32 → 220 = 'Ġ', 'y' 121 → 88, 't' 116 → 83.)
+// GPT-2's base id of a byte (bytes_to_unicode order, T1): piecewise byte + offset, a
+// bijection over 0..255.
+static unsigned bpeBaseId(unsigned by) {
+    if (by <= 32)  return by + 188;
+    if (by <= 126) return by - 33;
+    if (by <= 160) return by + 94;
+    if (by <= 172) return by - 67;
+    if (by == 173) return 255;
+    return by - 68;                        // 174..255
+}
+
 class BPERangeSeed : public PabloKernel {
 public:
     BPERangeSeed(LLVMTypeSystemInterface & ts, StreamSet * basis,
@@ -796,14 +844,7 @@ protected:
         // bijection over 0..255): 0..32→+188  33..126→-33  127..160→+94  161..172→-67
         // 173→255  174..255→-68.
         cc::Parabix_CC_Compiler_Builder ccc(basisBits);
-        auto idOf = [](unsigned by) -> unsigned {
-            if (by <= 32)  return by + 188;
-            if (by <= 126) return by - 33;
-            if (by <= 160) return by + 94;
-            if (by <= 172) return by - 67;
-            if (by == 173) return 255;
-            return by - 68;                        // 174..255
-        };
+        auto idOf = bpeBaseId;
         const unsigned IDBITS = 8;                 // base ids are 0..255
         std::vector<PabloAST*> idBits(IDBITS);
         for (unsigned k = 0; k < IDBITS; k++) {
@@ -1180,7 +1221,12 @@ struct TailCacheEntry {
     uint16_t keep;
     uint16_t out[7];
 };
-static constexpr unsigned kTailCacheSetBits = 15;   // 2^15 sets x 64 bytes = 2 MB per thread
+// --tail-cache-bits=N: 2^N sets x 64 bytes per thread (default 15: 2 MB).
+static cl::opt<unsigned> TailCacheBits(
+    "tail-cache-bits",
+    cl::desc("With --bpe-tail: the tail's per-thread segment cache has 2^N sets of 64 bytes "
+             "(default 15, 2 MB)."),
+    cl::init(15));
 static constexpr unsigned kTailCacheOut = 7;
 static std::atomic<uint64_t> gTailGeneration{0};   // bumped whenever gTail is rebuilt
 
@@ -1197,15 +1243,40 @@ struct TailScratch {
     std::vector<uint32_t> pos;           // ... and positions
     std::vector<TailCacheEntry> cache;
     uint64_t generation = 0;
+    unsigned setBits = 0;                // log2 of the cache's sets
+};
+// --tail-cache-pool: scratches not in use; a thread leases one and returns it as it exits.
+static std::mutex gTailPoolMutex;
+static std::vector<std::unique_ptr<TailScratch>> gTailPool;
+struct TailScratchLease {
+    TailScratch * s = nullptr;
+    ~TailScratchLease() {
+        if (s == nullptr) return;
+        std::lock_guard<std::mutex> lock(gTailPoolMutex);
+        gTailPool.emplace_back(s);
+    }
 };
 static TailScratch & tailScratch() {
-    thread_local TailScratch s;
-    const uint64_t g = gTailGeneration.load(std::memory_order_relaxed);
-    if (s.generation != g) {
-        s.cache.assign(size_t(2) << kTailCacheSetBits, TailCacheEntry{});
-        s.generation = g;
+    TailScratch * sp;
+    if (TailCachePool) {
+        thread_local TailScratchLease lease;
+        if (lease.s == nullptr) {
+            std::lock_guard<std::mutex> lock(gTailPoolMutex);
+            if (gTailPool.empty()) lease.s = new TailScratch;
+            else { lease.s = gTailPool.back().release(); gTailPool.pop_back(); }
+        }
+        sp = lease.s;
+    } else {
+        thread_local TailScratch s;
+        sp = &s;
     }
-    return s;
+    const uint64_t g = gTailGeneration.load(std::memory_order_relaxed);
+    if (sp->generation != g || sp->setBits != TailCacheBits) {
+        sp->setBits = std::min<unsigned>(std::max<unsigned>(TailCacheBits, 4), 24);
+        sp->cache.assign(size_t(2) << sp->setBits, TailCacheEntry{});
+        sp->generation = g;
+    }
+    return *sp;
 }
 
 static inline void tailMark(uint64_t * emit, uint32_t p) { emit[p / 64] |= 1ull << (p % 64); }
@@ -1282,6 +1353,7 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
         mask1[k] = k <= K::per0 ? 0 : tailLowMask((k - K::per0) * B);
     }
     TailCacheEntry * const cache = S.cache.data();
+    const unsigned setShift = 64 - S.setBits;
     auto bitsIn = [&](size_t w, size_t lo, size_t hi) {      // starts bits of word w in [lo, hi)
         uint64_t x = starts[w];
         if (w * 64 < lo) x &= ~tailLowMask(lo - w * 64);
@@ -1360,7 +1432,7 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
             d.k1 = (k1 & mask1[cnt]) | (uint64_t(cnt) << 60);
             d.cnt = cnt;
             const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
-            d.set = cache + (h >> (64 - kTailCacheSetBits)) * 2;
+            d.set = cache + (h >> setShift) * 2;
             __builtin_prefetch(d.set);
         } else {                                                // longer: merge it here
             if (S.t.size() < e - s) { S.t.resize(e - s); S.pos.resize(e - s); }
@@ -1392,6 +1464,135 @@ extern "C" void bpe_tail_resolve(const uint16_t * ids, const uint64_t * starts, 
 #undef TAIL_CASE
         default: report_fatal_error("--bpe-tail: unsupported id width");
     }
+}
+
+// --tail-from-bytes: the tokens are the input bytes, as their GPT-2 base ids (T1).
+static uint16_t gTailBase[256];
+static constexpr unsigned kTailByteKeyMax = 15;   // cached pretokens: 2 .. 15 bytes
+
+// A cached pretoken on its way through the byte resolve loop: its start (relative to the
+// call), length, key (k0 = bytes 0..7, k1 = bytes 8..14 and the length in the top byte)
+// and prefetched cache set.
+struct TailByteDesc {
+    uint64_t k0, k1;
+    TailCacheEntry * set;
+    uint32_t s, len;
+};
+
+static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes, uint32_t * res,
+                                   uint64_t * emit) {
+    TailCacheEntry * const set = d.set;
+    const TailCacheEntry * e;
+    if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
+    else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) e = &set[1];
+    else {
+        uint16_t tt[kTailByteKeyMax];
+        uint32_t idx[kTailByteKeyMax];
+        size_t m = d.len;
+        for (size_t i = 0; i < m; i++) { tt[i] = gTailBase[bytes[d.s + i]]; idx[i] = uint32_t(i); }
+        tailMergeSegment(tt, idx, m);
+        if (m > kTailCacheOut) {
+            for (size_t j = 0; j < m; j++) { res[d.s + idx[j]] = tt[j]; tailMark(emit, d.s + idx[j]); }
+            return;
+        }
+        set[1] = set[0];
+        TailCacheEntry & f = set[0];
+        f.k0 = d.k0; f.k1 = d.k1; f.keep = 0;
+        for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << idx[j]); f.out[j] = tt[j]; }
+        e = &f;
+    }
+    unsigned j = 0;
+    for (uint32_t keep = e->keep; keep; keep &= keep - 1) {
+        const uint32_t q = d.s + __builtin_ctz(keep);
+        res[q] = e->out[j++];
+        tailMark(emit, q);
+    }
+}
+
+// tailResolve for --tail-from-bytes: segments are the pretokens (segs = their starts), every
+// byte a token. Same protocol for res / emit and the segments cut by the call's edges. A
+// pretoken of one byte is its base id; 2 .. kTailByteKeyMax bytes go through the cache
+// (keyed by the bytes, prefetched kTailAhead pretokens ahead); longer ones merge on the spot.
+static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
+                             uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+    TailScratch & S = tailScratch();
+    std::fill(emit, emit + numItems / 64, 0);
+    if (n > numItems) n = numItems;
+    const size_t nWords = (n + 63) / 64;
+    if (nWords == 0) return;
+    TailCacheEntry * const cache = S.cache.data();
+    const unsigned setShift = 64 - S.setBits;
+    auto segWord = [&](size_t w) { return segs[w] & (w * 64 + 64 > n ? tailLowMask(n - w * 64) : ~0ull); };
+    auto openRange = [&](size_t lo, size_t hi, bool segStart) {   // the bytes of a cut segment
+        for (size_t p = lo; p < hi; p++) {
+            res[p] = gTailBase[bytes[p]] | kTailOpen | (segStart && p == lo ? kTailSeg : 0);
+            tailMark(emit, uint32_t(p));
+        }
+    };
+    size_t sw = 0;
+    uint64_t sx = segWord(0);
+    while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+    const size_t first = sx ? sw * 64 + __builtin_ctzll(sx) : n;
+    openRange(0, first, false);                                     // cut by the left edge
+    if (!sx) return;
+    sx &= sx - 1;
+    TailByteDesc ring[kTailAhead];
+    unsigned head = 0, count = 0;
+    auto drain = [&] {
+        for (; count; count--, head = (head + 1) % kTailAhead) tailFinishBytes(ring[head], bytes, res, emit);
+    };
+    for (size_t s = first;;) {
+        while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+        const bool last = sx == 0;
+        const size_t e = last ? n : sw * 64 + __builtin_ctzll(sx);
+        if (last && !final) {                                       // may go on in the next call
+            drain();
+            openRange(s, n, true);
+            return;
+        }
+        const size_t len = e - s;
+        if (len == 1) {
+            res[s] = gTailBase[bytes[s]];
+            tailMark(emit, uint32_t(s));
+        } else if (len <= kTailByteKeyMax) {
+            if (count == kTailAhead) {
+                tailFinishBytes(ring[head], bytes, res, emit);
+                head = (head + 1) % kTailAhead;
+                count--;
+            }
+            TailByteDesc & d = ring[(head + count++) % kTailAhead];
+            uint64_t a = 0, b = 0;
+            if (LLVM_LIKELY(s + 16 <= n)) {                         // stays inside the call
+                std::memcpy(&a, bytes + s, 8);
+                std::memcpy(&b, bytes + s + 8, 8);
+            } else {
+                for (size_t i = 0; i < len; i++)
+                    (i < 8 ? a : b) |= uint64_t(bytes[s + i]) << (8 * (i % 8));
+            }
+            d.k0 = len >= 8 ? a : a & tailLowMask(len * 8);
+            d.k1 = (len > 8 ? b & tailLowMask((len - 8) * 8) : 0) | (uint64_t(len) << 56);
+            d.s = uint32_t(s);
+            d.len = uint32_t(len);
+            const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+            d.set = cache + (h >> setShift) * 2;
+            __builtin_prefetch(d.set);
+        } else {                                                    // longer: merge it here
+            if (S.t.size() < len) { S.t.resize(len); S.pos.resize(len); }
+            for (size_t i = 0; i < len; i++) { S.t[i] = gTailBase[bytes[s + i]]; S.pos[i] = uint32_t(s + i); }
+            size_t k = len;
+            tailMergeSegment(S.t.data(), S.pos.data(), k);
+            for (size_t i = 0; i < k; i++) { res[S.pos[i]] = S.t[i]; tailMark(emit, S.pos[i]); }
+        }
+        if (last) break;
+        sx &= sx - 1;
+        s = e;
+    }
+    drain();
+}
+
+extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
+                                       uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+    tailResolveBytes(bytes, segs, res, emit, numItems, n, final);
 }
 
 // BPETailKernel's body: the tokens in order. A cut segment's tokens collect in gTailOpen and
@@ -1485,9 +1686,63 @@ protected:
     }
 };
 
+// --tail-from-bytes: BPETailResolveKernel on the input bytes and the pretoken starts.
+class BPETailByteResolveKernel final : public MultiBlockKernel {
+public:
+    BPETailByteResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * segs,
+                             StreamSet * res, StreamSet * emit)
+    : MultiBlockKernel(ts, "BPE_TailResolveBytes",
+                       {Binding{"bytes", bytes}, Binding{"segs", segs}},
+                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+        addAttribute(Statefree());   // see BPETailResolveKernel
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_tail_resolve_bytes");
+        if (fn == nullptr) report_fatal_error("BPE_TailResolveBytes: bpe_tail_resolve_bytes is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("segs"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("bytes", zero), b.getInputStreamBlockPtr("segs", zero),
+                      b.getOutputStreamBlockPtr("res", zero), b.getOutputStreamBlockPtr("emit", zero),
+                      numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+    }
+};
+
+void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * segs) {
+    StreamSet * res = P.CreateStreamSet(1, 32);
+    StreamSet * emit = P.CreateStreamSet(1, 1);
+    Kernel * const r = P.CreateKernelCall<BPETailByteResolveKernel>(bytes, segs, res, emit);
+    P.LinkFunction(r, "bpe_tail_resolve_bytes", bpe_tail_resolve_bytes);
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
+    P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
+}
+
+// --tail-direct-input: the tail's segment starts, the word starts that are live tokens (what
+// BPERetirePackKernel's 18th stream holds).
+class BPETailSegKernel final : public PabloKernel {
+public:
+    BPETailSegKernel(LLVMTypeSystemInterface & ts, StreamSet * boundary, StreamSet * live, StreamSet * segs)
+    : PabloKernel(ts, "BPE_TailSeg",
+                  {Binding{"boundary", boundary}, Binding{"live", live}},
+                  {Binding{"segs", segs}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        pb.createAssign(pb.createExtract(getOutputStreamVar("segs"), pb.getInteger(0)),
+                        pb.createAnd(getInputStreamSet("boundary")[0], getInputStreamSet("live")[0]));
+    }
+};
+
 void buildBPETailEmitter(PipelineBuilder & P, StreamSet * ids, StreamSet * starts, StreamSet * segs) {
     StreamSet * ids16 = P.CreateStreamSet(1, 16);
-    P.CreateKernelCall<P2S16Kernel>(ids, ids16);
+    if (ids->getNumElements() < 16) {   // --tail-direct-input: P2S16Kernel zero-pads
+        StreamSets idSets{ids};
+        P.CreateKernelCall<P2S16Kernel>(idSets, ids16);
+    } else {
+        P.CreateKernelCall<P2S16Kernel>(ids, ids16);
+    }
     StreamSet * res = P.CreateStreamSet(1, 32);
     StreamSet * emit = P.CreateStreamSet(1, 1);
     Kernel * const r = P.CreateKernelCall<BPETailResolveKernel>(ids16, starts, segs, res, emit);
@@ -3148,6 +3403,32 @@ void bpeSetFrameworkHooks() {
     if (MemSourceBlockCapacity) kernel::MemorySourceBlockCapacity = true;
 }
 
+// The --bpe-tail rule table (gTail) from the rules of groups `from` on; idBits: the width
+// of the ids reaching the tail. Returns the number of rules.
+static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, size_t from, unsigned idBits) {
+    size_t numRules = 0;
+    for (size_t gi = from; gi < ruleRanges.size(); gi++) numRules += ruleRanges[gi].rules.size();
+    const unsigned bits = std::max<unsigned>(4, ceil_log2(4 * numRules + 1));
+    gTail.slots.assign(size_t(1) << bits, kTailEmpty);
+    gTailGeneration++;
+    std::fill(std::begin(gTail.left), std::end(gTail.left), 0);
+    std::fill(std::begin(gTail.right), std::end(gTail.right), 0);
+    gTail.mask = (1u << bits) - 1;
+    gTail.shift = 32 - bits;
+    gTail.idBits = idBits;
+    for (size_t gi = from; gi < ruleRanges.size(); gi++)
+        for (const auto & r : ruleRanges[gi].rules) {
+            const uint32_t key = (r.idA << 16) | r.idB;
+            uint32_t h = tailSlot(key);
+            while (gTail.slots[h] != kTailEmpty && uint32_t(gTail.slots[h] >> 16) != key)
+                h = (h + 1) & gTail.mask;
+            gTail.slots[h] = (uint64_t(key) << 16) | r.idAB;
+            gTail.left[r.idA >> 6] |= 1ull << (r.idA & 63);
+            gTail.right[r.idB >> 6] |= 1ull << (r.idB & 63);
+        }
+    return numRules;
+}
+
 BPEPassResult buildBPEPassPipeline(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
@@ -3155,6 +3436,19 @@ BPEPassResult buildBPEPassPipeline(
         kernel::StreamSet * boundary) {
 
     compactionMode();   // validate the compaction settings first: conflicts halt here
+    // --tail-from-bytes: every rule goes to the tail, which reads the bytes itself
+    // (buildBPEByteTailEmitter); no merge kernel and no id stream.
+    if (TailFromBytes && boundary) {
+        const auto all = bpe.buildMergeRuleRanges(BPETokenizer::kTailAllRules);
+        const size_t numRules = buildTailTable(all, 0, 8);
+        for (unsigned by = 0; by < 256; by++) gTailBase[by] = uint16_t(bpeBaseId(by));
+        gTailOpen.n = 0;
+        std::cerr << "[BPE] --tail-from-bytes: no merge kernels; the tail applies all "
+                  << numRules << " rules per pretoken\n";
+        return {nullptr, nullptr, boundary};
+    }
+    if (TailFromBytes)
+        std::cerr << "[BPE] --tail-from-bytes ignored: it needs a pretokenizer\n";
     auto ruleRanges = bpe.buildMergeRuleRanges(boundary ? (unsigned) BPETail : 0u);
     gStuckTables.clear();
 
@@ -3351,26 +3645,8 @@ BPEPassResult buildBPEPassPipeline(
         ++compactionPoint;
         if (BPETail && compactionPoint == BPETail && boundary) {
             // --bpe-tail: no more kernels. The emitter finishes the rules of kernels i+1 on.
-            size_t numRules = 0;
-            for (size_t gi = i + 1; gi < ruleRanges.size(); gi++) numRules += ruleRanges[gi].rules.size();
-            const unsigned bits = std::max<unsigned>(4, ceil_log2(4 * numRules + 1));
-            gTail.slots.assign(size_t(1) << bits, kTailEmpty);
-            gTailGeneration++;
-            std::fill(std::begin(gTail.left), std::end(gTail.left), 0);
-            std::fill(std::begin(gTail.right), std::end(gTail.right), 0);
-            gTail.mask = (1u << bits) - 1;
-            gTail.shift = 32 - bits;
-            gTail.idBits = output_bits;   // the ids reaching the tail are below 2^output_bits
-            for (size_t gi = i + 1; gi < ruleRanges.size(); gi++)
-                for (const auto & r : ruleRanges[gi].rules) {
-                    const uint32_t key = (r.idA << 16) | r.idB;
-                    uint32_t h = tailSlot(key);
-                    while (gTail.slots[h] != kTailEmpty && uint32_t(gTail.slots[h] >> 16) != key)
-                        h = (h + 1) & gTail.mask;
-                    gTail.slots[h] = (uint64_t(key) << 16) | r.idAB;
-                    gTail.left[r.idA >> 6] |= 1ull << (r.idA & 63);
-                    gTail.right[r.idB >> 6] |= 1ull << (r.idB & 63);
-                }
+            // The ids reaching the tail are below 2^output_bits.
+            const size_t numRules = buildTailTable(ruleRanges, i + 1, output_bits);
             tailCut = true;
             std::cerr << "[BPE] --bpe-tail: " << (i + 1) << " of " << ruleRanges.size()
                       << " merge kernels built; the emitter applies the other " << numRules << " rules\n";
@@ -3494,6 +3770,12 @@ BPEPassResult buildBPEPassPipeline(
                       ? ", " + std::to_string(nXfrmIneligible) + " kernels kept per-rule "
                         "(chain/asymmetric-seam/veto rules or --indexed-shift)" : std::string())
                   << "\n";
+    // --tail-direct-input: no merge-back to do, so skip the widen/pack/unpack copies.
+    if (TailDirectInput && tailCut && retirePoints.empty() && inPlayMask != nullptr) {
+        StreamSet * segs = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<BPETailSegKernel>(boundary, inPlayMask, segs);
+        return {inPlayMask, source, segs};
+    }
     // The emitter packs exactly 16 id bits (P2S16Kernel); widen a narrower final stream.
     if (source->getNumElements() < 16) {
         StreamSet * source16 = P.CreateStreamSet(16, 1);
@@ -4211,6 +4493,15 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges(unsigned tailPoin
     // 2. Rank order (idAB ASC == 256 + rank).
     std::sort(rules.begin(), rules.end(),
               [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
+
+    // --tail-from-bytes: every rule goes to the tail, so nothing is partitioned.
+    if (tailPoint == kTailAllRules) {
+        MergeRuleGroup g;
+        g.rules = std::move(rules);
+        if (!g.rules.empty()) { g.lo = g.rules.front().idAB; g.hi = g.rules.back().idAB + 1; }
+        g.tailOnly = true;
+        return {std::move(g)};
+    }
 
     // 3. Partition. --partition=level/asymmetric/chain/bit-tier take the ASAP level
     //    schedule (minimum kernel count, same constraints); --partition=clean (default) is

@@ -69,6 +69,12 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     SplitBehaviorMode splitBehavior,
     const std::string & delimiterString);
 
+// --pretok-compress-classes: the byte-domain GPT-2 pretoken starts of buildPreTokenizerBoundaries
+// (bytelevel, no normalizer), straight from the UTF-8 BasisBits. The nine classes are computed
+// on the decoded codepoints in place and only they are compressed to one slot per codepoint,
+// instead of all 21 codepoint bits. Returns U21tokenBoundaries' byte-domain equivalent.
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits);
+
 // Stage 2b: spread codepoints, insert LF separators, filter whitespace.
 // Takes the PreTokenizerResult and returns the final U21 codepoint stream
 // ready for UTF-8 re-encoding.

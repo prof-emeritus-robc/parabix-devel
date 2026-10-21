@@ -91,8 +91,10 @@ public:
     // merge-loop kernel consumes: per rule it detects idA's end, checks idB at
     // +lenB, and stamps idAB. Rules whose parts are unresolvable are skipped
     // (with a count on stderr). tailPoint (--bpe-tail with a pretokenizer, else 0): see
-    // the bit-tier loop in the definition.
+    // the bit-tier loop in the definition; kTailAllRules (--tail-from-bytes): all rules in
+    // one unpartitioned group.
     std::vector<MergeRuleGroup> buildMergeRuleRanges(unsigned tailPoint = 0) const;
+    static constexpr unsigned kTailAllRules = ~0u;
 
 private:
     // Generate the 256-entry GPT-2 byte-level base alphabet (bytes_to_unicode)
@@ -134,6 +136,10 @@ using BPETailSink = void (*)(const uint16_t * ids, size_t n);
 void bpeTailSetSink(BPETailSink sink);
 void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
                          kernel::StreamSet * starts, kernel::StreamSet * segs);
+// --tail-from-bytes (buildBPEPassPipeline returned vocabID == nullptr): the same emitter, run
+// on the BPE input as a byte stream (1x8) and the pretoken starts.
+void buildBPEByteTailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * bytes,
+                             kernel::StreamSet * segs);
 
 // `boundary` (optional, may be null): a 1-bit per-byte mask marking pretoken
 // STARTS (GPT-2 regex boundaries). When present, merges are blocked from crossing

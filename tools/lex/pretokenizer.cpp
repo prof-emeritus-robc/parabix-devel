@@ -21,6 +21,8 @@
 #include <kernel/re/regexp_engine.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <kernel/unicode/charclasses.h>
+#include <kernel/unicode/utf8_decoder.h>
+#include <kernel/unicode/utf8_support.h>
 #include <kernel/unicode/boundary_kernels.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
@@ -528,19 +530,31 @@ public:
                    Binding{"cl",   cl,   FixedRate(), LookAhead(2)},
                    Binding{"cvr",  cvr,  FixedRate(), LookAhead(2)},
                    Binding{"ce",   ce,   FixedRate(), LookAhead(2)}},
-                  {Binding{"boundary", boundary}}) {}
+                  {Binding{"boundary", boundary}}), mCombined(false) {}
+    // --pretok-compress-classes: the same nine classes as one set, in kGPT2Classes order.
+    GPT2PretokenBoundaryKernel(LLVMTypeSystemInterface & ts, StreamSet * classes,
+                               StreamSet * nonspace, StreamSet * boundary)
+    : PabloKernel(ts, "GPT2PretokenBoundary_c9",
+                  {Binding{"classes", classes, FixedRate(), LookAhead(2)},
+                   Binding{"nonspace", nonspace, FixedRate(), LookAhead(1)}},
+                  {Binding{"boundary", boundary}}), mCombined(true) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        PabloAST * space    = getInputStreamSet("space")[0];      // full \p{White_Space}
-        PabloAST * spaceLit = getInputStreamSet("spaceLit")[0];   // literal 0x20 only
-        PabloAST * letter   = getInputStreamSet("letter")[0];
-        PabloAST * number   = getInputStreamSet("number")[0];
-        PabloAST * apos     = getInputStreamSet("apostrophe")[0];
-        PabloAST * sdmt     = getInputStreamSet("sdmt")[0];   // [sdmt]  (single-letter suffix)
-        PabloAST * cl       = getInputStreamSet("cl")[0];     // 'l'     (ll)
-        PabloAST * cvr      = getInputStreamSet("cvr")[0];    // [vr]    (ve / re first letter)
-        PabloAST * ce       = getInputStreamSet("ce")[0];     // 'e'     (ve / re second letter)
+        std::vector<PabloAST *> c;
+        if (mCombined) c = getInputStreamSet("classes");
+        auto in = [&](const char * name, unsigned i) {
+            return mCombined ? c[i] : getInputStreamSet(name)[0];
+        };
+        PabloAST * space    = in("space", 0);        // full \p{White_Space}
+        PabloAST * spaceLit = in("spaceLit", 1);     // literal 0x20 only
+        PabloAST * letter   = in("letter", 2);
+        PabloAST * number   = in("number", 3);
+        PabloAST * apos     = in("apostrophe", 4);
+        PabloAST * sdmt     = in("sdmt", 5);         // [sdmt]  (single-letter suffix)
+        PabloAST * cl       = in("cl", 6);           // 'l'     (ll)
+        PabloAST * cvr      = in("cvr", 7);          // [vr]    (ve / re first letter)
+        PabloAST * ce       = in("ce", 8);           // 'e'     (ve / re second letter)
 
         PabloAST * nonspace = pb.createNot(space);
         PabloAST * other    = pb.createAnd(nonspace, pb.createNot(pb.createOr(letter, number)));
@@ -615,6 +629,38 @@ protected:
         boundary = pb.createOr(pb.createAnd(boundary, pb.createNot(cSuppress)), cForce);
 
         writeOutputStreamSet("boundary", std::vector<PabloAST*>{boundary});
+    }
+private:
+    const bool mCombined;
+};
+
+// --pretok-compress-classes: InFileNonSpaceKernel on stream 0 (space) of the class set.
+class GPT2NonSpaceKernel : public PabloKernel {
+public:
+    GPT2NonSpaceKernel(LLVMTypeSystemInterface & ts, StreamSet * classes, StreamSet * nonspace)
+    : PabloKernel(ts, "GPT2NonSpace_c" + std::to_string(classes->getNumElements()),
+                  {Binding{"classes", classes}}, {Binding{"nonspace", nonspace}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        pb.createAssign(pb.createExtract(getOutputStreamVar("nonspace"), pb.getInteger(0)),
+                        pb.createInFile(pb.createNot(getInputStreamSet("classes")[0])));
+    }
+};
+
+// --pretok-compress-classes: ByteLevelGPT2Kernel's firstbyte output alone (the first byte
+// of each UTF-8 sequence), without its 21 codepoint streams.
+class GPT2FirstByteKernel : public PabloKernel {
+public:
+    GPT2FirstByteKernel(LLVMTypeSystemInterface & ts, StreamSet * BasisBits, StreamSet * FirstByteMask)
+    : PabloKernel(ts, "GPT2FirstByte",
+                  {Binding{"basis", BasisBits}}, {Binding{"firstbyte", FirstByteMask}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> b = getInputStreamSet("basis");
+        PabloAST * isCont = pb.createAnd(b[7], pb.createNot(b[6]));
+        writeOutputStreamSet("firstbyte", std::vector<PabloAST *>{pb.createNot(isCont)});
     }
 };
 
@@ -1048,7 +1094,48 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     };
 }
 
-//  Stage 2b: spread + insert LF + filter 
+// The bytelevel classes of buildPreTokenizerBoundaries (same sets: White_Space, Letter and
+// Number as UnicodePropertyKernelBuilder resolves them), at each UTF-8 sequence's last byte,
+// where UTF8_Decoder leaves the codepoint and UTF8_index marks it. Filtering them by
+// u8index gives exactly what the class kernels compute on the compressed codepoints.
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits) {
+    auto propCC = [](const char * name) {
+        auto * pe = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, name);
+        pe = cast<re::PropertyExpression>(UCD::linkAndResolve(pe));
+        return cast<re::CC>(pe->getResolvedRE());
+    };
+    std::vector<re::CC *> ccs{
+        propCC("White_Space"),                                            // 0 space
+        re::makeCC((codepoint_t)0x20),                                    // 1 spaceLit
+        propCC("Letter"),                                                 // 2 letter
+        propCC("Number"),                                                 // 3 number
+        re::makeCC((codepoint_t)0x27),                                    // 4 apostrophe
+        re::makeCC(re::makeCC((codepoint_t)0x64),                         // 5 [sdmt]
+                   re::makeCC(re::makeCC((codepoint_t)0x6D),
+                              re::makeCC((codepoint_t)0x73, (codepoint_t)0x74))),
+        re::makeCC((codepoint_t)0x6C),                                    // 6 l
+        re::makeCC(re::makeCC((codepoint_t)0x72), re::makeCC((codepoint_t)0x76)), // 7 [rv]
+        re::makeCC((codepoint_t)0x65)};                                   // 8 e
+    StreamSet * U21 = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
+    StreamSet * u8index = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+    StreamSet * classes = P.CreateStreamSet(ccs.size(), 1);
+    P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+    StreamSet * classesC = P.CreateStreamSet(ccs.size(), 1);
+    FilterByMask(P, u8index, classes, classesC);
+    StreamSet * nonspace = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<GPT2NonSpaceKernel>(classesC, nonspace);
+    StreamSet * boundary = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<GPT2PretokenBoundaryKernel>(classesC, nonspace, boundary);
+    StreamSet * firstByte = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<GPT2FirstByteKernel>(BasisBits, firstByte);
+    StreamSet * byteBoundary = P.CreateStreamSet(1, 1);
+    SpreadByMask(P, firstByte, boundary, byteBoundary);
+    return byteBoundary;
+}
+
+//  Stage 2b: spread + insert LF + filter
 
 StreamSet * applyTokenSeparatorInsertion(
     PipelineBuilder & P,

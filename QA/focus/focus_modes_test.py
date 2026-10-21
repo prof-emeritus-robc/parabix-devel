@@ -26,11 +26,7 @@ MODES = [
     ['-focus-filter=bit', '-reintegrate=bit'],
     ['-focus-filter=byte', '-reintegrate=byte-replace', '-unmodified-filter=byte'],
     ['-reintegrate=byte-spread', '-fill-run-gaps=3'],
-    # A phase boundary after the filter (or the focus) loses the end of the
-    # transformed data in nfd when there is work near the end of a dense input
-    # (pipeline phases; see doc/focus-paradigm-phase1-plan.md), so only the
-    # boundary after the transform is tested here.
-    ['-focus-layers=transform'],
+    ['-focus-layers=filter,transform'],
     ['-NoFocus'],
 ]
 

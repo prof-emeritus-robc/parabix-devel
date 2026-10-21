@@ -170,15 +170,16 @@ a timing check with `QA/focus_baseline.py` against the step before.
   The pipeline's PopCount kernels now take the phase of their consumers (a
   boundary between a work mask and its FilterByMask gave empty output).
   Phase boundaries still have problems in the pipeline framework (drafted as an
-  issue): a boundary after the filter or the focus loses the end of nfd's
-  transformed data on dense input with work near the end; the separated filter
+  issue): a boundary after the filter or the focus lost the end of nfd's
+  transformed data on dense input with work near the end (avoided since by the
+  single-kernel ExpandFilter, see `focus-paradigm-bit-movement.md`); the separated filter
   pipeline with `-UseLayers` and a byte-reading filter reports a cycle (nfd rejects
   that combination); and `nfc -focus-layers=focus` crashes LLVM 18's greedy
   register allocator (`-split-spill-mode=size` avoids it).  Boundaries after the
   placement or the transform are correct for all three tools.
 - **Step 5 (tests):** done.  `focus_modes_{nfd,nfc,nfkd}_test` run six modes each
   (default, bit filter/merge, byte filter with byte replacement, byte spread with
-  gap filling, a boundary after the transform, `-NoFocus`) at 3 threads with
+  gap filling, boundaries after the filter and the transform, `-NoFocus`) at 3 threads with
   `--segment-size=1024` on a generated 8 KB text of sparse and dense work,
   against Python's `unicodedata` (0.3–0.4 s each).
 

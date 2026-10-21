@@ -3,10 +3,10 @@
 The Pablo kernels of nfd and nfkd that compute a property per character can place
 the marker bit on one of two bytes of each multibyte UTF-8 sequence:
 
-- `pablo::BitMovementMode::Advance` (the previous behaviour, and the default): on
-  the **last** byte. The kernels move information forward from the earlier bytes
+- `pablo::BitMovementMode::Advance` (the previous behaviour): on the **last** byte. The kernels move information forward from the earlier bytes
   with `Advance`, which carries bits from one block to the next.
-- `pablo::BitMovementMode::LookAhead`: on the **first** byte. The kernels read the
+- `pablo::BitMovementMode::LookAhead` (the default since the commit after this
+  report): on the **first** byte. The kernels read the
   later bytes with `Lookahead`, which reads ahead in the input buffer and keeps no
   state.
 
@@ -125,7 +125,7 @@ that is not data-parallel (`<StateFree>`).
 
 ### Recommendation
 
-Make `-u8-bit-movement=lookahead` the default. It is as fast or faster on every
+Make `-u8-bit-movement=lookahead` the default (done). It is as fast or faster on every
 input, and it removes the largest serialized kernels of nfd and nfkd on dense
 input. The same change would likely help other tools that compute per-character
 properties with the Advance mode, such as nfc's candidate classes and the UCD

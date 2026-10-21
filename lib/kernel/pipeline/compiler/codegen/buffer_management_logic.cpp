@@ -519,13 +519,107 @@ void PipelineCompiler::constructStreamSetBuffers(KernelBuilder & /* b */) {
 void PipelineCompiler::readAvailableItemCounts(KernelBuilder & b) {
     mKernelIsClosed.reset(FirstKernel, LastKernel);
 
+    SmallVector<size_t, 4> earlierPhaseStreamSets;
     for (const auto input : make_iterator_range(in_edges(mKernelId, mBufferGraph))) {
         const auto streamSet = source(input, mBufferGraph);
-        if (mLocallyAvailableItems[streamSet] == nullptr) {
+        Value * const snapshot = mEarlierPhaseAvailableItems[streamSet];
+        if (snapshot) {
+            // Each consumer starts from the phase entry snapshot: a value computed by an earlier
+            // consumer need not dominate this kernel.
+            if (std::find(earlierPhaseStreamSets.begin(), earlierPhaseStreamSets.end(), streamSet) == earlierPhaseStreamSets.end()) {
+                earlierPhaseStreamSets.push_back(streamSet);
+                mLocallyAvailableItems[streamSet] = snapshot;
+            }
+            // Another thread may have run this kernel for the prior segment after the snapshot
+            // was taken and seen a larger count; never report fewer items than it processed.
+            const BufferPort & br = mBufferGraph[input];
+            if (!mAllowDataParallelExecution && !br.isRelative()) {
+                Value * const processed = mInitiallyProcessedItemCount[br.Port]; assert (processed);
+                mLocallyAvailableItems[streamSet] = b.CreateUMax(mLocallyAvailableItems[streamSet], processed);
+            }
+        } else if (mLocallyAvailableItems[streamSet] == nullptr) {
             mLocallyAvailableItems[streamSet] = readAvailableItemCount(b, streamSet);
         }
     }
 
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief readEarlierPhaseItemCounts
+ *
+ * Read the termination signals and produced item counts of the earlier-phase producers of the streamsets
+ * consumed in the current phase, once per segment, at the entry of the first partition of the phase. That
+ * block dominates every kernel of the phase. Reading them lazily at the first consumer placed the loads in
+ * a block that does not dominate a consumer in a partition reachable without passing through it.
+ *
+ * The signals are read before the counts so that a closed producer implies a final count.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::readEarlierPhaseItemCounts(KernelBuilder & b) {
+    mEarlierPhaseAvailableItems.reset(FirstStreamSet, LastStreamSet);
+    mEarlierPhaseTerminationSignal.reset(FirstKernel, LastKernel);
+
+    const auto firstPartition = PartitionPhaseBoundaries[mCurrentPipelinePhase - 1U];
+    const auto oneAfterLastPartition = PartitionPhaseBoundaries[mCurrentPipelinePhase];
+    const auto firstKernel = FirstKernelInPartition[firstPartition];
+    const auto oneAfterLastKernel = FirstKernelInPartition[oneAfterLastPartition];
+
+    // (consumed streamset, the streamset it is a truncation of or itself)
+    SmallVector<std::pair<size_t, size_t>, 32> streamSets;
+    for (auto kernel = firstKernel; kernel < oneAfterLastKernel; ++kernel) {
+        for (const auto input : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+            const auto streamSet = source(input, mBufferGraph);
+            auto src = streamSet;
+            while (LLVM_UNLIKELY(mBufferGraph[src].isTruncated())) {
+                src = getTruncatedStreamSetSourceId(src);
+            }
+            const BufferNode & bn = mBufferGraph[src];
+            if (bn.isConstant() || bn.ProducedPhaseId >= mCurrentPipelinePhase) {
+                continue;
+            }
+            if (source(in_edge(src, mBufferGraph), mBufferGraph) == PipelineInput) {
+                continue;
+            }
+            const std::pair<size_t, size_t> entry(streamSet, src);
+            if (std::find(streamSets.begin(), streamSets.end(), entry) == streamSets.end()) {
+                streamSets.push_back(entry);
+            }
+        }
+    }
+
+    bool readAnySignal = false;
+    for (const auto & entry : streamSets) {
+        const auto producer = source(in_edge(entry.second, mBufferGraph), mBufferGraph);
+        const auto idx = getTerminationSignalIndex(producer);
+        if (HasTerminationSignal.test(idx) && mEarlierPhaseTerminationSignal[idx] == nullptr) {
+            mEarlierPhaseTerminationSignal[idx] = readTerminationSignal(b, idx);
+            readAnySignal = true;
+        }
+    }
+    if (readAnySignal) {
+        // keep the count loads below from being satisfied before the signal loads
+        b.CreateFence(AtomicOrdering::Acquire);
+    }
+
+    for (const auto & entry : streamSets) {
+        const auto src = entry.second;
+        Value * produced = mEarlierPhaseAvailableItems[src];
+        if (produced == nullptr) {
+            const auto f = in_edge(src, mBufferGraph);
+            const BufferPort & br = mBufferGraph[f];
+            const auto prefix = makeBufferName(source(f, mBufferGraph), br.Port);
+            #ifdef PHASES_RUN_TO_COMPLETION
+            produced = b.getScalarField(prefix + ITEM_COUNT_SUFFIX);
+            #else
+            if (LLVM_UNLIKELY(br.isDeferred())) {
+                produced = b.getScalarField(prefix + DEFERRED_ITEM_COUNT_SUFFIX);
+            } else {
+                produced = b.getScalarField(prefix + ITEM_COUNT_SUFFIX);
+            }
+            #endif
+            mEarlierPhaseAvailableItems[src] = produced;
+        }
+        mEarlierPhaseAvailableItems[entry.first] = produced;
+    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

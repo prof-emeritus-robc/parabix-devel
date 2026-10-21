@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <vector>
+#include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/IR/Module.h>
@@ -527,34 +528,83 @@ void NFD_Narrow_Focus::generatePabloMethod() {
 //  (and hence reorderable), as well as any nonreorderable starter following
 //  either of these  (to ensure that such sequences
 //  are separated).  NFD_Focus relies on inputs u8index marking the last
-//  position of each UTF-8 byte sequence,  DT_Can marking the last position
-//  of each character having dt=Can, and CCC_0 marking the initial position
-//  of each character that is not reorderable.
+//  position of each UTF-8 byte sequence, and DT_Can and CCC_0 marking the
+//  characters having dt=Can and the characters that are not reorderable.
+//  In the Advance mode, DT_Can and CCC_0 (and the result) mark the last byte of
+//  each UTF-8 sequence; in the LookAhead mode, its first byte.
 //
 class NFD_Focus : public pablo::PabloKernel {
 public:
-    NFD_Focus(LLVMTypeSystemInterface & ts, StreamSet * u8index, StreamSet * DT_Can, StreamSet * CCC_0, StreamSet * mayChangeOnNFD);
+    NFD_Focus(LLVMTypeSystemInterface & ts, StreamSet * u8index, StreamSet * DT_Can, StreamSet * CCC_0, StreamSet * mayChangeOnNFD,
+              BitMovementMode m = BitMovementMode::Advance);
 protected:
     void generatePabloMethod() override;
+private:
+    const BitMovementMode mBitMovement;
 };
 
-NFD_Focus::NFD_Focus(LLVMTypeSystemInterface & ts, StreamSet * u8index, StreamSet * DT_Can, StreamSet * CCC_0, StreamSet * mayChangeOnNFD)
-: PabloKernel(ts, "NFD_Focus",
+NFD_Focus::NFD_Focus(LLVMTypeSystemInterface & ts, StreamSet * u8index, StreamSet * DT_Can, StreamSet * CCC_0, StreamSet * mayChangeOnNFD,
+                     BitMovementMode m)
+: PabloKernel(ts, m == BitMovementMode::Advance ? "NFD_Focus" : "NFD_Focus_LookAhead",
 // inputs
 {Binding{"u8index", u8index}, Binding{"DT_Can", DT_Can}, Binding{"CCC_0", CCC_0}},
 // output
-{Binding{"mayChangeOnNFD", mayChangeOnNFD}}) {
+{Binding{"mayChangeOnNFD", mayChangeOnNFD}}), mBitMovement(m) {
 }
 
 void NFD_Focus::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
     PabloAST * u8index = getInputStreamSet("u8index")[0];
     PabloAST * DT_Can = getInputStreamSet("DT_Can")[0];
-    PabloAST * CCC_0_final = getInputStreamSet("CCC_0")[0];
-    PabloAST * CCC_Nonzero_final = pb.createAnd(u8index, pb.createNot(CCC_0_final));
-    PabloAST * CanOrNZ_follow = pb.createAdvanceThenScanThru(pb.createOr(DT_Can, CCC_Nonzero_final), pb.createNot(u8index));
-    PabloAST * focus = pb.createOr3(CanOrNZ_follow, DT_Can, CCC_Nonzero_final);
+    PabloAST * CCC_0 = getInputStreamSet("CCC_0")[0];
+    // the marked byte of each character: the last (Advance) or the first (LookAhead)
+    PabloAST * marked = u8index;
+    if (mBitMovement == BitMovementMode::LookAhead) {
+        // the first byte follows the last byte of the previous character
+        marked = pb.createNot(pb.createAdvance(pb.createNot(u8index), 1), "u8initial");
+    }
+    PabloAST * CCC_Nonzero = pb.createAnd(marked, pb.createNot(CCC_0));
+    PabloAST * CanOrNZ_follow = pb.createAdvanceThenScanThru(pb.createOr(DT_Can, CCC_Nonzero), pb.createNot(marked));
+    PabloAST * focus = pb.createOr3(CanOrNZ_follow, DT_Can, CCC_Nonzero);
     pb.createAssign(pb.createExtract(getOutputStreamVar("mayChangeOnNFD"), pb.getInteger(0)), focus);
+}
+
+//  The first byte of each UTF-8 sequence: the bytes that are not continuation
+//  bytes (10xxxxxx).
+class UTF8_InitialMask : public pablo::PabloKernel {
+public:
+    UTF8_InitialMask(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * initial)
+    : PabloKernel(ts, "UTF8_InitialMask", {Binding{"basis", Basis}}, {Binding{"initial", initial}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * const continuation = pb.createAnd(basis[7], pb.createNot(basis[6]));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("initial"), pb.getInteger(0)), pb.createNot(continuation));
+    }
+};
+
+static cl::OptionCategory NormalizationOptionCategory("Normalization Options",
+    "Options of the normalization (NFD, NFKD) pipelines.");
+
+static cl::opt<BitMovementMode> U8BitMovementOption("u8-bit-movement", cl::init(BitMovementMode::Advance),
+    cl::desc("Placement of the per-character marks of the NFD and NFKD UTF-8 kernels:"),
+    cl::values(clEnumValN(BitMovementMode::Advance, "advance", "on the last byte of each UTF-8 sequence (Advance; default)"),
+               clEnumValN(BitMovementMode::LookAhead, "lookahead", "on the first byte of each UTF-8 sequence (LookAhead)")),
+    cl::cat(NormalizationOptionCategory));
+
+cl::OptionCategory & NormalizationOptions() {
+    return NormalizationOptionCategory;
+}
+
+NFD_PipelineBuilder::NFD_PipelineBuilder(PipelineBuilder & P)
+: mBitMovement(U8BitMovementOption), mPB(P) {}
+
+//  The UTF-8 sequences of characters marked as given by the mode: U8Spans in the
+//  LookAhead mode extends marks on last bytes back over their sequences, and in the
+//  Advance mode, marks on first bytes forward.
+static BitMovementMode SpanMode(BitMovementMode m) {
+    return m == BitMovementMode::Advance ? BitMovementMode::LookAhead : BitMovementMode::Advance;
 }
 
 
@@ -661,16 +711,16 @@ void NFD_PipelineBuilder::DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet
     re::PropertyExpression * dtCanProp = re::makePropertyExpression("dt", "Can");
     dtCanProp = cast<re::PropertyExpression>(UCD::linkAndResolve(dtCanProp));
     StreamSet * DT_Can = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(dtCanProp, U8_Basis, DT_Can);
+    mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(dtCanProp, U8_Basis, DT_Can, mBitMovement);
     SHOW_STREAM(DT_Can);
 
     re::PropertyExpression * CCC0_Prop = re::makePropertyExpression("CCC", "NR");
     CCC0_Prop = cast<re::PropertyExpression>(UCD::linkAndResolve(CCC0_Prop));
     StreamSet * const CCC_0 = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, U8_Basis, CCC_0);//, BitMovementMode::LookAhead);
+    mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, U8_Basis, CCC_0, mBitMovement);
     SHOW_STREAM(CCC_0);
 
-    mPB.CreateKernelCall<NFD_Focus>(u8index, DT_Can, CCC_0, NFD_WorkItems);
+    mPB.CreateKernelCall<NFD_Focus>(u8index, DT_Can, CCC_0, NFD_WorkItems, mBitMovement);
     SHOW_STREAM(NFD_WorkItems);
 }
 
@@ -682,7 +732,7 @@ void NFD_PipelineBuilder::DetermineNFD_WorkSelection(StreamSet * BasisBits, Stre
     StreamSet * NFD_WorkItems = mPB.CreateStreamSet(1, 1);
     DetermineNFD_WorkItems(BasisBits, u8index, NFD_WorkItems);
 
-    mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask);
+    mPB.CreateKernelCall<U8Spans>(NFD_WorkItems, u8index, WorkSelectionMask, SpanMode(mBitMovement));
     SHOW_STREAM(WorkSelectionMask);
 }
 
@@ -701,26 +751,26 @@ void NFD_PipelineBuilder::DetermineNFKD_WorkSelection(StreamSet * BasisBits, Str
     // The characters that NFKD decomposes (at their last byte), in place of
     // NFD's dt=Can.
     StreamSet * const Decomposable = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{NFKD_Data().Decomposable_CC()}, BasisBits, Decomposable);
+    mPB.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{NFKD_Data().Decomposable_CC()}, BasisBits, Decomposable, mBitMovement);
     SHOW_STREAM(Decomposable);
 
     re::PropertyExpression * CCC0_Prop = re::makePropertyExpression("CCC", "NR");
     CCC0_Prop = cast<re::PropertyExpression>(UCD::linkAndResolve(CCC0_Prop));
     StreamSet * const CCC_0 = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, BasisBits, CCC_0);
+    mPB.CreateKernelCall<UnicodePropertyKernelBuilder>(CCC0_Prop, BasisBits, CCC_0, mBitMovement);
     SHOW_STREAM(CCC_0);
 
     StreamSet * const NFKD_WorkItems = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<NFD_Focus>(u8index, Decomposable, CCC_0, NFKD_WorkItems);
+    mPB.CreateKernelCall<NFD_Focus>(u8index, Decomposable, CCC_0, NFKD_WorkItems, mBitMovement);
     SHOW_STREAM(NFKD_WorkItems);
 
-    mPB.CreateKernelCall<U8Spans>(NFKD_WorkItems, u8index, WorkSelectionMask);
+    mPB.CreateKernelCall<U8Spans>(NFKD_WorkItems, u8index, WorkSelectionMask, SpanMode(mBitMovement));
     SHOW_STREAM(WorkSelectionMask);
 }
 
 void NFD_PipelineBuilder::ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask) {
     mPB.SetStageLabel("placement");
-    ComputeWorkPlacement(mPB, NFKD_Data().UTF8_Insertion_BixNumCCs(), NFKD_Data().UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
+    ComputeWorkPlacement(mPB, NFKD_Data().UTF8_Insertion_BixNumCCs(), NFKD_Data().UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask, mBitMovement);
     SHOW_STREAM(FinalWorkPlacementMask);
 }
 
@@ -741,7 +791,7 @@ void NFD_PipelineBuilder::NFD_FilterStage(StreamSet * BasisBits, StreamSet * Wor
 
 void NFD_PipelineBuilder::ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask) {
     mPB.SetStageLabel("placement");
-    ComputeWorkPlacement(mPB, NFD_Data.UTF8_Insertion_BixNumCCs(), NFD_Data.UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
+    ComputeWorkPlacement(mPB, NFD_Data.UTF8_Insertion_BixNumCCs(), NFD_Data.UTF8_Deletion_BixNumCCs(), BasisBits, WorkSelectionMask, FinalWorkPlacementMask, mBitMovement);
     SHOW_STREAM(FinalWorkPlacementMask);
 }
 
@@ -749,11 +799,16 @@ void NFD_PipelineBuilder::NFD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * 
     mPB.SetStageLabel("transform");
 
     StreamSet * const U21_u8indexed = mPB.CreateStreamSet(21, 1);
-    mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed);
+    mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed, mBitMovement);
     SHOW_BIXNUM(U21_u8indexed);
 
+    // the positions of the decoded codepoints
     StreamSet * const WorkingU8index = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<UTF8_index>(WorkingBasis, WorkingU8index);
+    if (mBitMovement == BitMovementMode::Advance) {
+        mPB.CreateKernelCall<UTF8_index>(WorkingBasis, WorkingU8index);
+    } else {
+        mPB.CreateKernelCall<UTF8_InitialMask>(WorkingBasis, WorkingU8index);
+    }
     SHOW_STREAM(WorkingU8index);
 
     StreamSet * const U21_focus = mPB.CreateStreamSet(21, 1);
@@ -770,11 +825,16 @@ void NFD_PipelineBuilder::NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet *
     mPB.SetStageLabel("transform");
 
     StreamSet * const U21_u8indexed = mPB.CreateStreamSet(21, 1);
-    mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed);
+    mPB.CreateKernelCall<UTF8_Decoder>(WorkingBasis, U21_u8indexed, mBitMovement);
     SHOW_BIXNUM(U21_u8indexed);
 
+    // the positions of the decoded codepoints
     StreamSet * const WorkingU8index = mPB.CreateStreamSet(1, 1);
-    mPB.CreateKernelCall<UTF8_index>(WorkingBasis, WorkingU8index);
+    if (mBitMovement == BitMovementMode::Advance) {
+        mPB.CreateKernelCall<UTF8_index>(WorkingBasis, WorkingU8index);
+    } else {
+        mPB.CreateKernelCall<UTF8_InitialMask>(WorkingBasis, WorkingU8index);
+    }
     SHOW_STREAM(WorkingU8index);
 
     StreamSet * const U21_focus = mPB.CreateStreamSet(21, 1);

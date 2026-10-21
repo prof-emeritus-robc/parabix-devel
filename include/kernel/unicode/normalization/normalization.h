@@ -17,6 +17,7 @@ using StreamSet = kernel::StreamSet;
 using PipelineBuilder = kernel::PipelineBuilder;
 namespace re {class CC;}
 namespace pablo {class PabloBuilder; class PabloAST; class Var;}
+namespace llvm { namespace cl { class OptionCategory; } }
 
 // Hangul Composition Kernels for NFC (See Unicode section 3.12).
 //
@@ -226,11 +227,14 @@ void LongComposablePipeline(PipelineBuilder & P,
 //  (d) a mask to select only those portions of the basis that are
 //      relevant to the work to be performed.
 
+//  The insertion and deletion amounts are computed at the last byte of each UTF-8
+//  sequence (Advance) or at its first byte (LookAhead).
 void ComputeWorkPlacement(PipelineBuilder & P,
                           std::vector<re::CC *> insertionBixNumCCs,
                           std::vector<re::CC *> deletionBixNumCCs,
                           StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
-                          StreamSet * WorkPlacementMask);
+                          StreamSet * WorkPlacementMask,
+                          pablo::BitMovementMode m = pablo::BitMovementMode::Advance);
 
 struct BitXfrmSpec {
     unsigned BitXfrmIndex;
@@ -311,10 +315,17 @@ private:
     UCD::UnicodeSet mDecomposable;
 };
 
+// The category of the normalization command line options (-u8-bit-movement), for
+// codegen::ParseCommandLineOptions.
+llvm::cl::OptionCategory & NormalizationOptions();
+
 class NFD_PipelineBuilder {
 public:
-    NFD_PipelineBuilder(PipelineBuilder & P) :
-        mPB(P) {}
+    // The marks of the UTF-8 kernels are placed as given by -u8-bit-movement.
+    NFD_PipelineBuilder(PipelineBuilder & P);
+
+    // Mark the last byte (Advance) or the first byte (LookAhead) of each UTF-8 sequence.
+    void setBitMovement(pablo::BitMovementMode m) { mBitMovement = m; }
 
     StreamSet * NFD_U21_Pipeline(StreamSet * U21_Basis);
 
@@ -347,6 +358,7 @@ private:
     NFD_BixData & NFKD_Data();
 
     unsigned mFillRunGaps = 0;
+    pablo::BitMovementMode mBitMovement;
     PipelineBuilder & mPB;
     NFD_BixData NFD_Data;
     std::unique_ptr<NFD_BixData> mNFKD_Data;

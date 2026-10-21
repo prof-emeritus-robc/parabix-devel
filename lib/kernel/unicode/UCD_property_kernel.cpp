@@ -40,11 +40,18 @@ UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterfa
 UnicodePropertyKernelBuilder::UnicodePropertyKernelBuilder(LLVMTypeSystemInterface & ts, re::PropertyExpression * pe, StreamSet * Source, StreamSet * property, pablo::BitMovementMode mode, std::string && propValueName)
 : PabloKernel(ts,
 "UCD:" + getStringHash(propValueName) ,
-{Binding{"source", Source, FixedRate(1), LookAhead(3)}},
+{},
 {Binding{"property_stream", property}})
 , mPropNameValue(propValueName)
 , mPropertyExpr(pe)
 , mBitMovement(mode) {
+    // Only the LookAhead mode, which marks the first byte of each UTF-8 sequence,
+    // looks ahead (to the end of the sequence); the Advance mode marks the last byte.
+    if (mode == pablo::BitMovementMode::LookAhead) {
+        mInputStreamSets.push_back(Binding{"source", Source, FixedRate(1), LookAhead(3)});
+    } else {
+        mInputStreamSets.push_back(Binding{"source", Source});
+    }
 }
 
 llvm::StringRef UnicodePropertyKernelBuilder::getSignature() const {

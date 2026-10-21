@@ -224,13 +224,32 @@ void TruncateRepeatingMask::generateMultiBlockLogic(KernelBuilder & b, Value * c
 
 //  TODO:  Consider adding toFill parameter to SpreadByMask so that filter expansion
 //  can be implemented by a single SpreadByMask call.
+//  Sets the positions not marked by a spread mask (the inserted positions) in a
+//  spread filter.
+class FillInsertedPositions final : public PabloKernel {
+public:
+    FillInsertedPositions(LLVMTypeSystemInterface & ts, StreamSet * spreadMask, StreamSet * spread, StreamSet * filled)
+    : PabloKernel(ts, "FillInsertedPositions",
+                  {Binding{"spreadMask", spreadMask}, Binding{"spread", spread}},
+                  {Binding{"filled", filled}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const spreadMask = getInputStreamSet("spreadMask")[0];
+        PabloAST * const spread = getInputStreamSet("spread")[0];
+        pb.createAssign(pb.createExtract(getOutputStreamVar("filled"), pb.getInteger(0)),
+                        pb.createOr(spread, pb.createNot(spreadMask)));
+    }
+};
+
 void ExpandFilter(PipelineBuilder & P,
                   StreamSet * spreadMask, StreamSet * filter, StreamSet * expanded) {
     StreamSet * initialSpread = P.CreateStreamSet(1, 1);
     SpreadByMask(P, spreadMask, filter, initialSpread);
-    StreamSet * filler = P.CreateStreamSet(1, 1);
-    Invert(P, spreadMask, filler);
-    OrCombine(P, initialSpread, filler, expanded);
+    // One kernel rather than Invert and OrCombine: with two ExpandFilters of the
+    // same spread mask, the Invert is shared, and the consumers of a shared Invert
+    // could read past its output at the end (see doc/focus-paradigm-bit-movement.md).
+    P.CreateKernelCall<FillInsertedPositions>(spreadMask, initialSpread, expanded);
 }
 
 class ElemMergeKernel final  : public MultiBlockKernel {

@@ -325,22 +325,30 @@ SCResults SelfComposableLogic(PabloBuilder & pb, std::vector<PabloAST *> Basis,
 
 class CreateU8_FilterMask : public pablo::PabloKernel {
 public:
-    CreateU8_FilterMask(LLVMTypeSystemInterface & ts, StreamSet * DeletionBixNum, StreamSet * DelMask);
+    CreateU8_FilterMask(LLVMTypeSystemInterface & ts, StreamSet * DeletionBixNum, StreamSet * DelMask,
+                        pablo::BitMovementMode m = pablo::BitMovementMode::Advance);
 protected:
     void generatePabloMethod() override;
 private:
     unsigned mBixBits;
+    const pablo::BitMovementMode mBitMovement;
 };
 
 CreateU8_FilterMask::CreateU8_FilterMask (LLVMTypeSystemInterface & ts,
                                 StreamSet * DeletionBixNum,
-                                StreamSet * DelMask)
-: PabloKernel(ts, "u8_delmask@-1_" + DeletionBixNum->shapeString(),
+                                StreamSet * DelMask,
+                                pablo::BitMovementMode m)
+: PabloKernel(ts, (m == pablo::BitMovementMode::Advance ? "u8_delmask@-1_" : "u8_delmask@+1_") + DeletionBixNum->shapeString(),
 // inputs
-{Binding{"deletion_bixnum", DeletionBixNum, FixedRate(1), LookAhead(3)}},
+{},
 // output
 {Binding{"selection_mask", DelMask}}),
-    mBixBits(DeletionBixNum->getNumElements()) {
+    mBixBits(DeletionBixNum->getNumElements()), mBitMovement(m) {
+    if (m == pablo::BitMovementMode::Advance) {
+        mInputStreamSets.push_back(Binding{"deletion_bixnum", DeletionBixNum, FixedRate(1), LookAhead(3)});
+    } else {
+        mInputStreamSets.push_back(Binding{"deletion_bixnum", DeletionBixNum});
+    }
 }
 
 void CreateU8_FilterMask::generatePabloMethod() {
@@ -348,15 +356,20 @@ void CreateU8_FilterMask::generatePabloMethod() {
     Var * deletion_bixnum = getInputStreamVar("deletion_bixnum");
     Var * del_bixnum0 = pb.createExtract(deletion_bixnum, pb.getInteger(0));
     // Deletion and insertion bixnums are calculated at the final position of
-    // a UTF-8 sequence.   Deletion masks will preserve this position.
+    // a UTF-8 sequence (Advance), and the deleted positions are those before it;
+    // or at the first position (LookAhead), and the deleted positions follow it.
+    // Deletion masks preserve the position of the bixnum.
     //
-    PabloAST * del_mask = pb.createLookahead(del_bixnum0, 1);
+    auto shift = [&](PabloAST * bixnum, unsigned n) {
+        return mBitMovement == pablo::BitMovementMode::Advance ? pb.createLookahead(bixnum, n) : pb.createAdvance(bixnum, n);
+    };
+    PabloAST * del_mask = shift(del_bixnum0, 1);
     if (mBixBits == 2) {
         Var * del_bixnum1 = pb.createExtract(deletion_bixnum, pb.getInteger(1));
         // Mark two positions for deletion.
-        del_mask = pb.createOr3(del_mask, pb.createLookahead(del_bixnum1, 1), pb.createLookahead(del_bixnum1, 2));
+        del_mask = pb.createOr3(del_mask, shift(del_bixnum1, 1), shift(del_bixnum1, 2));
         // If both del_bixnum0 and del_bixnum1 are 1, then 3 positions must be deleted.
-        del_mask = pb.createOr(del_mask, pb.createAnd(pb.createLookahead(del_bixnum0, 3), pb.createLookahead(del_bixnum1, 3)));
+        del_mask = pb.createOr(del_mask, pb.createAnd(shift(del_bixnum0, 3), shift(del_bixnum1, 3)));
     }
     PabloAST * selected = pb.createInFile(pb.createNot(del_mask));
     Var * const selection_mask = getOutputStreamVar("selection_mask");
@@ -371,17 +384,21 @@ void ComputeWorkPlacement(PipelineBuilder & P,
                           std::vector<re::CC *> insertionBixNumCCs,
                           std::vector<re::CC *> deletionBixNumCCs,
                           StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
-                          StreamSet * WorkPlacementMask) {
+                          StreamSet * WorkPlacementMask,
+                          pablo::BitMovementMode m) {
     StreamSet * const U8_Insertion_BixNum = P.CreateStreamSet(insertionBixNumCCs.size());
-    P.CreateKernelCall<CharClassesKernel>(insertionBixNumCCs, U8_Basis, U8_Insertion_BixNum);
+    P.CreateKernelCall<CharClassesKernel>(insertionBixNumCCs, U8_Basis, U8_Insertion_BixNum, m);
     SHOW_BIXNUM(U8_Insertion_BixNum);
 
     StreamSet * const U8_Deletion_BixNum = P.CreateStreamSet(deletionBixNumCCs.size());
-    P.CreateKernelCall<CharClassesKernel>(deletionBixNumCCs, U8_Basis, U8_Deletion_BixNum);
+    P.CreateKernelCall<CharClassesKernel>(deletionBixNumCCs, U8_Basis, U8_Deletion_BixNum, m);
     SHOW_BIXNUM(U8_Deletion_BixNum);
 
+    // The insertions follow the marked position: within the UTF-8 sequence in the
+    // LookAhead mode.  As all positions of a work region are placed, only the
+    // number of positions of each region matters.
     StreamSet * const U8_FilterMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<CreateU8_FilterMask>(U8_Deletion_BixNum, U8_FilterMask);
+    P.CreateKernelCall<CreateU8_FilterMask>(U8_Deletion_BixNum, U8_FilterMask, m);
     SHOW_STREAM(U8_FilterMask);
 
     StreamSet * const U8_SpreadMask =  P.CreateStreamSet(1, 1);

@@ -23,6 +23,44 @@ unsigned PipelineCompiler::getTruncatedStreamSetSourceId(const unsigned streamSe
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getConsumerPhaseSlots
+ *
+ * For a stream set (a consumer graph root) whose consumers lie in more than one pipeline phase, the phases
+ * before the phase of its last consumer that contain consumers.  Each phase has its own transitory consumed
+ * item counts, so the last consumer in each of these phases writes the phase's consumed item count to a slot
+ * of its own, and the last consumer overall writes the usual consumed item count.
+ ** ------------------------------------------------------------------------------------------------------------- */
+SmallVector<unsigned, 2> PipelineCompiler::getConsumerPhaseSlots(const size_t id) const {
+    SmallVector<unsigned, 2> phases;
+    if (PartitionPhaseBoundaries.size() <= 2 || out_degree(id, mConsumerGraph) == 0) {
+        return phases;
+    }
+    unsigned lastPhase = 0;
+    size_t lastConsumer = 0;
+    for (const auto e : make_iterator_range(out_edges(id, mConsumerGraph))) {
+        const auto consumer = target(e, mConsumerGraph);
+        if (consumer == PipelineOutput) {
+            return phases;
+        }
+        if (consumer > lastConsumer) {
+            lastConsumer = consumer;
+            lastPhase = mBufferGraph[consumer].ProducedPhaseId;
+        }
+    }
+    for (const auto e : make_iterator_range(out_edges(id, mConsumerGraph))) {
+        const auto phase = mBufferGraph[target(e, mConsumerGraph)].ProducedPhaseId;
+        if (phase != lastPhase && std::find(phases.begin(), phases.end(), phase) == phases.end()) {
+            phases.push_back(phase);
+        }
+    }
+    return phases;
+}
+
+static std::string makeConsumerPhaseSlotName(const size_t id, const unsigned phase) {
+    return CONSUMED_ITEM_COUNT_PREFIX + std::to_string(id) + "_P" + std::to_string(phase);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief addConsumerKernelProperties
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::addConsumerKernelProperties(KernelBuilder & b, const unsigned kernelId) {
@@ -65,6 +103,10 @@ void PipelineCompiler::addConsumerKernelProperties(KernelBuilder & b, const unsi
 
         const auto name = CONSUMED_ITEM_COUNT_PREFIX + std::to_string(streamSet);
         mTarget->addInternalScalar(countTy, name, groupId);
+
+        for (const auto phase : getConsumerPhaseSlots(streamSet)) {
+            mTarget->addInternalScalar(sizeTy, makeConsumerPhaseSlotName(streamSet, phase), groupId);
+        }
 
     }
 }
@@ -140,6 +182,11 @@ Value * PipelineCompiler::readConsumedItemCount(KernelBuilder & b, const size_t 
             ptr = b.CreateInBoundsGEP(consumedRef.second, ptr, { ZERO, ZERO } );
         }
         itemCount = b.CreateAlignedLoad(b.getSizeTy(), ptr, SizeTyABIAlignment, true);
+        for (const auto phase : getConsumerPhaseSlots(id)) {
+            Value * const slot = b.getScalarFieldPtr(makeConsumerPhaseSlotName(id, phase)).first;
+            Value * const phaseCount = b.CreateAlignedLoad(b.getSizeTy(), slot, SizeTyABIAlignment, true);
+            itemCount = b.CreateUMin(itemCount, phaseCount);
+        }
     }
     #endif
     assert (itemCount);
@@ -227,7 +274,17 @@ void PipelineCompiler::writeConsumedItemCounts(KernelBuilder & b) {
             debugPrint(b, " * writing " + prefix + "_consumed = %" PRIu64, consumed);
             #endif
             assert (out_degree(mConsumerGraph[id], mConsumerGraph) > 0);
-            setConsumedItemCount(b, streamSet, consumed, 0);
+            const auto phase = mBufferGraph[mKernelId].ProducedPhaseId;
+            const auto slots = getConsumerPhaseSlots(mConsumerGraph[id]);
+            if (LLVM_UNLIKELY(std::find(slots.begin(), slots.end(), phase) != slots.end())) {
+                // as in setConsumedItemCount, a zero count means the consumers were skipped
+                Value * const ptr = b.getScalarFieldPtr(makeConsumerPhaseSlotName(mConsumerGraph[id], phase)).first;
+                Value * const prior = b.CreateAlignedLoad(b.getSizeTy(), ptr, SizeTyABIAlignment);
+                Value * const updated = b.CreateSelect(b.CreateIsNull(consumed), prior, consumed);
+                b.CreateAlignedStore(updated, ptr, SizeTyABIAlignment, true);
+            } else {
+                setConsumedItemCount(b, streamSet, consumed, 0);
+            }
         }
     }
     #endif
@@ -290,6 +347,49 @@ void PipelineCompiler::updateExternalConsumedItemCounts(KernelBuilder & b) {
             b.CreateAlignedStore(consumed, getProcessedInputItemsPtr(inputPort.Port.Number), SizeTyABIAlignment);
         }
     }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief initializeEarlierPhaseTransitoryConsumedItemCounts
+ *
+ * The producer of a stream set initializes its transitory consumed item count to its produced item count, and
+ * each consumer lowers it to its processed item count.  A stream set produced in an earlier phase has no
+ * producer in this phase's compute function, so set its transitory count to the produced item count read at
+ * phase entry (readEarlierPhaseItemCounts.)
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::initializeEarlierPhaseTransitoryConsumedItemCounts(KernelBuilder & b) {
+    #ifndef FORCE_PIPELINE_TO_PRESERVE_CONSUMED_DATA
+    for (auto streamSet = FirstStreamSet; streamSet <= LastStreamSet; ++streamSet) {
+        if (mConsumerGraph[streamSet] != streamSet || out_degree(streamSet, mConsumerGraph) == 0) {
+            continue;
+        }
+        if (mBufferGraph[streamSet].ProducedPhaseId >= mCurrentPipelinePhase) {
+            continue;
+        }
+        if (source(in_edge(streamSet, mBufferGraph), mBufferGraph) == PipelineInput) {
+            continue;
+        }
+        bool consumedInThisPhase = false;
+        for (const auto e : make_iterator_range(out_edges(streamSet, mConsumerGraph))) {
+            const auto consumer = target(e, mConsumerGraph);
+            if (consumer != PipelineOutput && mBufferGraph[consumer].ProducedPhaseId == mCurrentPipelinePhase) {
+                consumedInThisPhase = true;
+                break;
+            }
+        }
+        if (!consumedInThisPhase) {
+            continue;
+        }
+        Value * produced = mEarlierPhaseAvailableItems[streamSet];
+        if (produced == nullptr) {
+            const auto f = in_edge(streamSet, mBufferGraph);
+            const BufferPort & br = mBufferGraph[f];
+            const auto prefix = makeBufferName(source(f, mBufferGraph), br.Port);
+            produced = b.getScalarField(prefix + (br.isDeferred() ? DEFERRED_ITEM_COUNT_SUFFIX : ITEM_COUNT_SUFFIX));
+        }
+        b.setScalarField(TRANSITORY_CONSUMED_ITEM_COUNT_PREFIX + std::to_string(streamSet), produced);
+    }
+    #endif
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

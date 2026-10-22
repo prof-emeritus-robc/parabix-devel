@@ -161,6 +161,7 @@ const unsigned LaneWidth = 64;
 extern unsigned BlockSize;  // set from command line
 extern unsigned SegmentSize; // set from command line
 extern unsigned BufferSegments;
+extern unsigned PhaseSegmentLimit; // set from command line: --phase-segment-limit
 extern unsigned TaskThreads;
 extern unsigned SegmentThreads;
 extern unsigned ScanBlocks;

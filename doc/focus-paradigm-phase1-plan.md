@@ -190,9 +190,11 @@ a timing check with `QA/focus_baseline.py` against the step before.
   `RunMergeKernel` on TwoLevelScanKernel), `-fill-run-gaps`, and two
   TwoLevelScanKernel fixes are done and tested; measurements and the report wait
   for mains power. Phase 2 for nfc follows naturally from step 2 here.
-- **Phase 3** (cheaper focused input) and **Phases 4–5** (transform layers, task
-  and thread allocation, scaling to many cores): unchanged, and easier once the
-  stages are explicit.
+- **Phase 3** (cheaper focused input): unchanged.
+- **Phase 4** (layers): planned in `doc/focus-paradigm-phase4-plan.md`. Phase
+  boundaries are correct at every stage since issue #26 was fixed, but slower than
+  no boundary, so the plan starts with the pipeline's handling of phases.
+- **Phase 5** (task and thread allocation, scaling to many cores): unchanged.
 
 ## Risks
 

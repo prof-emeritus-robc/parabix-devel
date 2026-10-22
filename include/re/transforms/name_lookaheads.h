@@ -4,6 +4,9 @@
  */
 
 #pragma once
+#include <string>
+#include <utility>
+#include <vector>
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/name_intro.h>
 #include <re/alphabet/alphabet.h>
@@ -16,12 +19,14 @@ namespace re {
 
 /* Transform a regular expression r so that all lookahead
    assertions of length more than maxLookahead are transformed into
-   names to be externally defined. */
+   names to be externally defined.  Lookaheads that cannot be compiled are
+   left in place and recorded in mUnsupported, with the reasons. */
 class LookAheadNamer final : public NameIntroduction {
 public:
     LookAheadNamer(const cc::Alphabet & alpha = cc::Unicode, unsigned maxLookahead = 1) : 
          NameIntroduction("LookAheadNamer"), mAlphabet(alpha), mMaxLookahead(maxLookahead) {}
     RE * transformAssertion (Assertion * a) override;
+    std::vector<std::pair<Assertion *, std::string>> mUnsupported;
 private:
    const cc::Alphabet & mAlphabet;
    const unsigned mMaxLookahead;

@@ -30,6 +30,7 @@
 #include <re/analysis/validation.h>
 #include <re/analysis/collect_ccs.h>
 #include <re/analysis/re_name_gather.h>
+#include <re/analysis/re_inspector.h>
 #include <re/analysis/capture-ref.h>
 #include <re/printer/re_printer.h>
 #include <re/toolchain/toolchain.h>
@@ -972,8 +973,8 @@ PreparedRE prepareRE(RE * re, const RE_ModeOptions & opts) {
     PreparedRE prepared;
     // Property values given by regular expressions are resolved by a search
     // of the lines of property value names.
-    re = resolveModesAndExternalSymbols(re, matchingLineNumbers);
-    prepared.re = regular_expression_passes(re);
+    re = resolveModesAndExternalSymbols(re, matchingLineNumbers, opts.goal);
+    prepared.re = regular_expression_passes(re, &cc::Unicode, opts.goal);
     prepared.mode = determineREMode(prepared.re, opts);
     prepared.options = opts;
     return prepared;
@@ -1468,7 +1469,7 @@ void RE_PipelineBuilder::matchSearchPipeline(RE * re, StreamSet * results) {
         return;
     }
     // A hand-built RE_CompilerContext: the RE is compiled as given.
-    mRE = applyModePasses(re);
+    mRE = applyModePasses(re, RE_Goal::MatchEnds);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, results);
@@ -1478,7 +1479,7 @@ void RE_PipelineBuilder::matchSearchPipeline(const PreparedRE & prepared, Stream
     usePrepared(prepared);
     RE * re = prepared.re;
     ensurePrepared(re);
-    mRE = applyModePasses(re);
+    mRE = applyModePasses(re, RE_Goal::MatchEnds);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, results);
@@ -1504,7 +1505,7 @@ void RE_PipelineBuilder::matchSpanPipeline(const PreparedRE & prepared, StreamSe
     usePrepared(prepared);
     RE * re = prepared.re;
     ensurePrepared(re);
-    mRE = applyModePasses(re);
+    mRE = applyModePasses(re, RE_Goal::MatchSpans);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
     mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, matches);
@@ -2073,52 +2074,158 @@ RE * RE_PipelineBuilder::spanFactoring(RE * re) {
     return xfrmedRE;
 }
 
-RE * RE_PipelineBuilder::applyModePasses(RE * re) {
-    const cc::Alphabet * lengthAlphabet = mCtxt.mLengthAlphabet;
-    RE * xfrmedRE = expandPermutes(re);
-    xfrmedRE = regular_expression_passes(xfrmedRE, lengthAlphabet);
+namespace {
+// The RE transformations of the mode passes (see
+// RE_PipelineBuilder::applyModePasses) for the length and code unit alphabets
+// of a mode, apart from the kernels of the names that they introduce, which
+// the namers record.
+struct ModeTransformation {
+    ModeTransformation(const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet)
+    : mLengthAlphabet(lengthAlphabet), mCodeUnitAlphabet(codeUnitAlphabet),
+      SCnamer(codeUnitAlphabet), LA(*lengthAlphabet) {}
 
+    RE * transform(RE * re, RE_Goal goal);
+
+    // The preconditions of the transformed RE (see checkPreconditions).
+    std::vector<PreconditionFailure> failures(RE * transformed, RE_Goal goal);
+
+    const cc::Alphabet * const mLengthAlphabet;
+    const cc::Alphabet * const mCodeUnitAlphabet;
     UCD::PropertyExternalizer PE;
+    re::VariableLengthCCNamer CCnamer;
+    re::StringClassRepNamer SCnamer;
+    re::LookAheadNamer LA;
+};
+
+RE * ModeTransformation::transform(RE * re, RE_Goal goal) {
+    RE * xfrmedRE = expandPermutes(re);
+    xfrmedRE = regular_expression_passes(xfrmedRE, mLengthAlphabet, goal);
     xfrmedRE = PE.transformRE(xfrmedRE);
-    for (auto m : PE.mNameMap) {
+    // CCs of characters of more than one UTF-8 length are computed as externals
+    // when the code units are UTF-8.  (With Unicode code units, every CC is one
+    // code unit.)
+    if (mCodeUnitAlphabet == &cc::UTF8) {
+        xfrmedRE = CCnamer.transformRE(xfrmedRE);
+        xfrmedRE = toUTF8(xfrmedRE);
+    }
+    // Unbounded repetitions of suitable string classes are matched using
+    // the Fill, Starts and Ends of the string class.
+    xfrmedRE = SCnamer.transformRE(xfrmedRE);
+    // Lookahead lengths are measured in the mode's length alphabet.
+    xfrmedRE = LA.transformRE(xfrmedRE);
+    return xfrmedRE;
+}
+
+// The back references of an RE, including those within the definitions of
+// its names, other than the names of the references compiled as externals.
+struct ReferenceGatherer final : public RE_Inspector {
+    ReferenceGatherer(const std::map<std::string, RE *> & compiled)
+    : RE_Inspector(NameProcessingMode::ProcessDefinition), mCompiled(compiled) {}
+    void inspectName(Name * n) override {
+        if (mCompiled.count(n->getFullName()) == 0) RE_Inspector::inspectName(n);
+    }
+    void inspectReference(Reference * r) override {
+        mReferences.push_back(r);
+    }
+    const std::map<std::string, RE *> & mCompiled;
+    std::vector<Reference *> mReferences;
+};
+
+std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, RE_Goal goal) {
+    // The transformations here only check the RE (processReferences applies them).
+    QuietREPrinting quiet;
+    std::vector<PreconditionFailure> failures;
+    if ((goal == RE_Goal::MatchStarts) || (goal == RE_Goal::SearchReplace)) {
+        failures.push_back(PreconditionFailure{goal, transformed,
+                           std::string("the ") + goalName(goal) + " goal is not yet implemented"});
+    }
+    // Lookaheads named as externals (see RE_PipelineBuilder::compileExternal
+    // and matchStartPipeline).
+    for (const auto & u : LA.mUnsupported) {
+        failures.push_back(PreconditionFailure{goal, u.first, u.second});
+    }
+    if (mCodeUnitAlphabet != &cc::Unicode) {
+        for (const auto & m : LA.mNameMap) {
+            if (m.first.compare(0, LookaheadChainPrefix.size(), LookaheadChainPrefix) == 0) {
+                failures.push_back(PreconditionFailure{goal, m.second,
+                                   "a lookahead chain requires Unicode code units (full Unicode indexing)"});
+            }
+        }
+    }
+    // Back references (see RE_PipelineBuilder::processReferences): those to a
+    // capture of fixed length at a fixed distance are compiled as externals,
+    // for enumerated and codepoint properties; others are not supported.
+    re::ReferenceInfo refInfo = re::buildReferenceInfo(transformed);
+    re::FixedReferenceTransformer FRT(refInfo, *mLengthAlphabet);
+    RE * const fixedRefs = FRT.transformRE(transformed);
+    for (const auto & m : FRT.mNameMap) {
+        re::Reference * ref = cast<re::Reference>(m.second);
+        UCD::PropertyObject * propObj = UCD::getPropertyObject(ref->getReferencedProperty());
+        if (!isa<UCD::EnumeratedPropertyObject>(propObj) && !isa<UCD::CodePointPropertyObject>(propObj)) {
+            failures.push_back(PreconditionFailure{goal, ref,
+                               "a property reference must be to an enumerated or codepoint property"});
+        }
+    }
+    ReferenceGatherer refs(FRT.mNameMap);
+    refs.inspectRE(fixedRefs);
+    for (Reference * r : refs.mReferences) {
+        failures.push_back(PreconditionFailure{goal, r,
+                           "a back reference must be to a capture of fixed length at a fixed distance"});
+    }
+    return failures;
+}
+}
+
+std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding) {
+    // The alphabets of the RE as compiled (see RE_PipelineBuilder::ensurePrepared).
+    const cc::Alphabet * lengthAlphabet = &cc::Unicode;
+    const cc::Alphabet * codeUnitAlphabet = &cc::Unicode;
+    if ((sourceEncoding != &cc::Unicode) && (prepared.mode.indexAlphabet == &cc::UTF8)) {
+        lengthAlphabet = prepared.mode.lengthAlphabet;
+        codeUnitAlphabet = &cc::UTF8;
+    }
+    // The passes are run to check the RE, not to compile it.
+    QuietREPrinting quiet;
+    ModeTransformation M(lengthAlphabet, codeUnitAlphabet);
+    RE * const transformed = M.transform(prepared.re, prepared.options.goal);
+    return M.failures(transformed, prepared.options.goal);
+}
+
+std::string preconditionReport(const std::vector<PreconditionFailure> & failures) {
+    std::string report;
+    for (const PreconditionFailure & f : failures) {
+        report += std::string(goalName(f.goal)) + ": " + f.reason + ": " + Printer_RE::PrintRE(f.construct) + "\n";
+    }
+    return report;
+}
+
+RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {
+    ModeTransformation M(mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet);
+    RE * const xfrmedRE = M.transform(re, goal);
+    const std::vector<PreconditionFailure> failures = M.failures(xfrmedRE, goal);
+    if (!failures.empty()) {
+        llvm::report_fatal_error(llvm::StringRef("Regular expression engine preconditions not met:\n") +
+                                 preconditionReport(failures));
+    }
+
+    for (auto m : M.PE.mNameMap) {
         if (re::PropertyExpression * pe = dyn_cast<re::PropertyExpression>(m.second)) {
             compileProperty(pe);
         }
     }
 
-    // CCs of characters of more than one UTF-8 length are computed as externals
-    // when the code units are UTF-8.  (With Unicode code units, every CC is one
-    // code unit.)
-    if (mCtxt.mCodeUnitAlphabet == &cc::UTF8) {
-        re::VariableLengthCCNamer CCnamer;
-        xfrmedRE = CCnamer.transformRE(xfrmedRE);
-        for (auto m : CCnamer.mNameMap) {
-            std::vector<re::CC *> ccs = {cast<re::CC>(m.second)};
-            StreamSet * ccStrm = mPB.CreateStreamSet(1);
-            mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, mCtxt.mCodeUnitStream, ccStrm);
-            addExternal(m.first, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ccStrm});
-        }
+    for (auto m : M.CCnamer.mNameMap) {
+        std::vector<re::CC *> ccs = {cast<re::CC>(m.second)};
+        StreamSet * ccStrm = mPB.CreateStreamSet(1);
+        mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, mCtxt.mCodeUnitStream, ccStrm);
+        addExternal(m.first, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ccStrm});
     }
 
-    if (mCtxt.mCodeUnitAlphabet == &cc::UTF8) {
-        xfrmedRE = toUTF8(xfrmedRE);
+    for (auto & m : M.SCnamer.mStrings) {
+        StreamSet * fillStartsEnds = mPB.CreateStreamSet(3);
+        mPB.CreateKernelCall<StringClassKernel>(m.second, codeUnitBasis(), fillStartsEnds);
+        addExternal(m.first, ExternalStream{ExternalStreamKind::StringClassRep, 0, {0, 0}, fillStartsEnds});
     }
-
-    // Unbounded repetitions of suitable string classes are matched using
-    // the Fill, Starts and Ends of the string class.
-    {
-        re::StringClassRepNamer SCnamer(mCtxt.mCodeUnitAlphabet);
-        xfrmedRE = SCnamer.transformRE(xfrmedRE);
-        for (auto & m : SCnamer.mStrings) {
-            StreamSet * fillStartsEnds = mPB.CreateStreamSet(3);
-            mPB.CreateKernelCall<StringClassKernel>(m.second, codeUnitBasis(), fillStartsEnds);
-            addExternal(m.first, ExternalStream{ExternalStreamKind::StringClassRep, 0, {0, 0}, fillStartsEnds});
-        }
-    }
-
-    // Lookahead lengths are measured in the mode's length alphabet.
-    re::LookAheadNamer LA(*lengthAlphabet);
-    xfrmedRE = LA.transformRE(xfrmedRE);
 
     return xfrmedRE;
 }

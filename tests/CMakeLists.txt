@@ -55,6 +55,13 @@ add_test(NAME unwritten_wide_output_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/unwritten_wide_output_test.py ${TEST_BIN_DIR}/unwritten_wide_output)
 
+# The preconditions of the regular expression engine and the passes of its goals (no pipeline compiled)
+parabix_add_executable(NAME re_preconditions SRC re_preconditions.cpp
+                       DEPS kernel.re re.parse re.unicode toolchain)
+add_test(NAME re_preconditions_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ./re_preconditions)
+
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

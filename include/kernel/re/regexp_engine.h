@@ -6,6 +6,8 @@
 
 #include <kernel/core/streamset.h>
 #include <map>
+#include <string>
+#include <vector>
 #include <re/transforms/name_intro.h>
 #include <re/adt/adt.h>
 #include <re/unicode/regex_passes.h>
@@ -67,6 +69,8 @@ struct RE_ModeOptions {
     bool unicodeIndexingOverride = false; // debug: always use full Unicode indexing
     bool unicodeBasisOverride = false;    // debug: disable the UTF8-indexed optimization
     unsigned byteCClimit = 6;
+    // What the RE is prepared for (see re::RE_Goal), which selects its passes.
+    re::RE_Goal goal = re::RE_Goal::MatchEnds;
 };
 
 struct RE_Mode {
@@ -98,6 +102,36 @@ struct PreparedRE {
 };
 
 PreparedRE prepareRE(re::RE * re, const RE_ModeOptions & opts = RE_ModeOptions{});
+
+//
+// The preconditions of the engine for a prepared RE: whether its mode and goal
+// can be implemented with the engine's current capabilities.  Each failure
+// names the construct (a subexpression of the RE as transformed for its mode)
+// that cannot be implemented, and why.  Clients may check the preconditions
+// to choose another implementation or report an error of their own; the
+// pipeline methods check them for the RE they compile and report any failure
+// as a fatal error.
+//   sourceEncoding: the encoding of the source given to the engine (see
+//   RE_context): with &cc::Unicode, the RE is compiled over Unicode code units
+//   whatever its mode.
+//
+// The preconditions checked so far are those of the lookaheads (named as
+// externals: fixed length, a fixed-length unique prefix or a lookahead chain,
+// which requires Unicode code units) and of the back references (to captures
+// of fixed length at fixed distances, of enumerated or codepoint properties).
+// The MatchStarts and SearchReplace goals are not yet implemented.
+//
+struct PreconditionFailure {
+    re::RE_Goal goal;
+    re::RE * construct;
+    std::string reason;
+};
+
+std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
+                                                    const cc::Alphabet * sourceEncoding = &cc::UTF8);
+
+// A report of the failures, one per line.
+std::string preconditionReport(const std::vector<PreconditionFailure> & failures);
 
 // The numbers (from 0) of the lines of a buffer that contain a match to an
 // RE (as parsed).  This resolves property values given by regular
@@ -498,7 +532,9 @@ protected:
 
     // The mode-specific steps for a prepared RE (expandPermutes, the RE passes
     // for the mode's length alphabet, externals, toUTF8, LookAheadNamer...).
-    re::RE * applyModePasses(re::RE * re);
+    // The preconditions for the goal are checked (see checkPreconditions); a
+    // failure is fatal.
+    re::RE * applyModePasses(re::RE * re, re::RE_Goal goal);
 
     re::RE * spanFactoring(re::RE * re);
 

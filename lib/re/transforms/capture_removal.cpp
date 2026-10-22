@@ -61,4 +61,12 @@ RE * removeUnneededCaptures(RE * capturingRE, RE * referencingRE) {
     ReferenceCollector(refs).inspectRE(referencingRE);
     return UnneededCaptureRemoval(refs).transformRE(capturingRE);
 }
+
+RE * removeUnneededCaptures(RE * capturingRE, const std::vector<RE *> & referencingREs) {
+    ReferenceSet refs;
+    for (RE * r : referencingREs) {
+        ReferenceCollector(refs).inspectRE(r);
+    }
+    return UnneededCaptureRemoval(refs).transformRE(capturingRE);
+}
 }

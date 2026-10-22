@@ -25,6 +25,15 @@ enum RE_AlgorithmFlags {
 };
     
 bool LLVM_READONLY PrintOptionIsSet(RE_PrintFlags flag);
+
+// While an object of this class exists, PrintOptionIsSet is false on the
+// thread that made it: RE passes run to check an RE, not to compile it,
+// print nothing.
+class QuietREPrinting {
+public:
+    QuietREPrinting();
+    ~QuietREPrinting();
+};
 bool LLVM_READONLY AlgorithmOptionIsSet(RE_AlgorithmFlags flag);
 bool LLVM_READONLY UnicodeLevel2IsSet();
 

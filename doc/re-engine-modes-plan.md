@@ -211,8 +211,8 @@ struct PreconditionFailure {
 std::vector<PreconditionFailure> checkPreconditions(const PreparedRE &);
 ```
 
-The pipeline methods report the failures (printed with `Printer_RE`) as an
-error; clients such as tconv can call the check themselves to choose another
+The pipeline methods treat any failure (printed with `Printer_RE`) as fatal;
+clients such as tconv call `checkPreconditions` themselves to choose another
 implementation or report the rule. The `report_fatal_error` calls of
 `compileExternal` and `matchStartPipeline` become assertions, unreachable once
 the preconditions hold. Each later phase that adds a capability relaxes the
@@ -372,11 +372,12 @@ Public API, beside the two existing pipelines:
 void matchStartsPipeline(const PreparedRE & re, kernel::StreamSet * starts);
 ```
 
-Convention: a mark at the first position of each match, in the code unit space
-of the mode (the first byte of its first character in byte mode, its first
+Convention (decided): offset 0, a mark at the first code unit of each match, in
+the code unit space of the mode (the first byte of its first character in byte mode, its first
 character in Unicode mode; for an empty match, the position it is at). The
-internal `MatchStarts {stream, offset}` stays for externals; the public result
-is shifted to offset 0 (`ShiftBack` by `offset - 1`, or the shift folded into
+internal `MatchStarts {stream, offset}` (the `StartIndexed` convention) stays for
+externals and internal match spans, as an optimization; the public result is
+shifted to offset 0 (`ShiftBack` by `offset - 1`, or the shift folded into
 the last kernel). With no UTF-8 indexed mode, offsets are always in code units.
 
 Strategy order, per alternative of the factored RE (reusing `spanFactoring`'s
@@ -618,10 +619,35 @@ the buffering), and one more RE kernel.
 
 ## Open questions
 
-- Should the public starts convention be offset 0 at the first code unit, or
-  the existing `StartIndexed` convention (`s + offset - 1`) to avoid a shift?
-- Should precondition failures be returned to every client (a status from the
-  pipeline methods) or only through `checkPreconditions`, with the pipeline
-  methods treating a failure as fatal?
 - For region reversal: what maximum region length is acceptable for streaming,
   and should whole-text reversal be offered for memory-mapped inputs?
+
+Decided: the public starts convention is offset 0 at the first code unit (the
+`StartIndexed` convention remains internal); `checkPreconditions` is available
+to clients, and the pipeline methods treat precondition failures as fatal.
+
+## Milestone 1 status
+
+- `re::RE_Goal` (`include/re/unicode/regex_passes.h`), carried by
+  `RE_ModeOptions::goal` and used by `prepareRE` and the mode passes.
+- The front-end and simplification passes are a table of
+  `{name, goals, pass}` (`lib/re/unicode/regex_passes.cpp`); passes skipped
+  for a goal other than `MatchEnds` are named under `-ShowREs`/`-ShowAllREs`
+  (the output for `MatchEnds` is unchanged).
+- `SearchReplace` keeps the captures referenced by the search pattern or the
+  replacement (`removeUnneededCaptures(r, {r, replacement})`); star normal
+  form and minimization are not yet applied for it.
+- `checkPreconditions` / `preconditionReport` (`regexp_engine.h`): the mode
+  passes are one transformation (`ModeTransformation`) shared by the check and
+  `applyModePasses`, which reports failures as fatal before building any
+  kernel. `LookAheadNamer` records unsupported lookaheads (`mUnsupported`)
+  instead of aborting. Covered: lookaheads (no strategy, a unique prefix of
+  variable length, chains without Unicode code units) and back references;
+  `MatchStarts` and `SearchReplace` report "not yet implemented".
+- Still found while building the pipeline: errors of the RE compiler itself
+  (a variable-length external not in initial position) and of lookaheads
+  within the definitions of names, which `LookAheadNamer` does not visit, and
+  a lookahead ending with the end of the text without match regions (a
+  property of the context, not the RE).
+- Test: `re_preconditions_test` (`tests/re_preconditions.cpp`), no pipeline
+  compiled.

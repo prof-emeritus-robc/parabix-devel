@@ -6,7 +6,6 @@
 #include <re/transforms/name_lookaheads.h>
 
 #include <llvm/Support/Casting.h>
-#include <llvm/Support/ErrorHandling.h>
 #include <re/analysis/re_analysis.h>
 #include <re/adt/adt.h>
 #include <re/printer/re_printer.h>
@@ -37,7 +36,14 @@ RE * LookAheadNamer::transformAssertion (Assertion * a) {
             RE * prefix, * suffix;
             std::tie(prefix, suffix) = ParseUniquePrefix(x);
             if (isEmptySeq(prefix) || isEmptySeq(suffix)) {
-                llvm::report_fatal_error("Unsupported lookahead assertion");
+                mUnsupported.emplace_back(a, "a lookahead of variable length must have a unique prefix "
+                                             "or be a lookahead chain");
+                return (x == x0) ? a : makeAssertion(x, a->getKind(), a->getSense());
+            }
+            const auto pfxRange = getLengthRange(prefix, &mAlphabet);
+            if (pfxRange.first != pfxRange.second) {
+                mUnsupported.emplace_back(a, "the unique prefix of a lookahead must have a fixed length");
+                return (x == x0) ? a : makeAssertion(x, a->getKind(), a->getSense());
             }
             Name * pfx = makeUniquePrefixName(prefix);
             // Keep the assertion (and its sense): the name stands for a

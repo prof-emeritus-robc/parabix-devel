@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include <llvm/Support/Compiler.h>
 
 namespace re {
@@ -25,6 +27,11 @@ RE * removeUnneededCaptures(RE * r);
 // are unreferenced either in the referencingRE.
 //
 RE * removeUnneededCaptures(RE * capturingRE, RE * referencingRE);
+
+// Transform a capturingRE by removing any captures that are
+// unreferenced in all of the referencingREs (which may include
+// the capturingRE itself, for its back references).
+RE * removeUnneededCaptures(RE * capturingRE, const std::vector<RE *> & referencingREs);
 
 }
 

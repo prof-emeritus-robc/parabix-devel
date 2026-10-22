@@ -30,8 +30,18 @@ static cl::bits<RE_AlgorithmFlags>
 static cl::opt<bool> UnicodeLevel2("U2", cl::desc("Enable Unicode Level matching under canonical and compatible (?K) equivalence."), 
     cl::Hidden, cl::cat(RE_Options));
 
+static thread_local unsigned QuietPrintingDepth = 0;
+
+QuietREPrinting::QuietREPrinting() {
+    QuietPrintingDepth++;
+}
+
+QuietREPrinting::~QuietREPrinting() {
+    QuietPrintingDepth--;
+}
+
 bool LLVM_READONLY PrintOptionIsSet(RE_PrintFlags flag) {
-    return PrintOptions.isSet(flag);
+    return (QuietPrintingDepth == 0) && PrintOptions.isSet(flag);
 }
 
 bool LLVM_READONLY AlgorithmOptionIsSet(RE_AlgorithmFlags flag) {

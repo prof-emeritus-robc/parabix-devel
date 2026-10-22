@@ -162,6 +162,7 @@ extern unsigned BlockSize;  // set from command line
 extern unsigned SegmentSize; // set from command line
 extern unsigned BufferSegments;
 extern unsigned PhaseSegmentLimit; // set from command line: --phase-segment-limit
+extern unsigned PhaseClaimSegments; // set from command line: --phase-claim-segments
 extern unsigned TaskThreads;
 extern unsigned SegmentThreads;
 extern unsigned ScanBlocks;

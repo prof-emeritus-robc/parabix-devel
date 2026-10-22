@@ -376,6 +376,12 @@ static cl::opt<unsigned, true> PhaseSegmentLimitOption("phase-segment-limit", cl
                                                         "before moving to the next one, and the number of segments buffered between phases"),
                                                cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
 
+static cl::opt<unsigned, true> PhaseClaimSegmentsOption("phase-claim-segments", cl::location(PhaseClaimSegments), cl::init(4),
+                                               cl::desc("In a pipeline with phase boundaries, the number of segments the most recent earlier "
+                                                        "phase must have started since a later phase's last segment before a thread claims "
+                                                        "another segment of the later phase (at most --phase-segment-limit)"),
+                                               cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
+
 
 unsigned Z3_Timeout;
 static cl::opt<unsigned, true> Z3_TimeoutOption("Z3-timeout", cl::location(Z3_Timeout), cl::init(3000),
@@ -431,6 +437,7 @@ unsigned SegmentSize;
 
 unsigned BufferSegments;
 unsigned PhaseSegmentLimit;
+unsigned PhaseClaimSegments;
 unsigned TaskThreads;
 unsigned SegmentThreads;
 
@@ -616,6 +623,10 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     if (PhaseSegmentLimit == 0) {
         report_fatal_error("--phase-segment-limit must be positive");
     }
+    if (PhaseClaimSegments == 0) {
+        report_fatal_error("--phase-claim-segments must be positive");
+    }
+    PhaseClaimSegments = std::min(PhaseClaimSegments, PhaseSegmentLimit);
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
     // The salt becomes part of each cache file name.
     for (const char c : ObjectCacheSalt) {

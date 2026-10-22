@@ -112,6 +112,11 @@ bool PipelineCompiler::getClaimedEarlierPhaseStreamSets(const unsigned phase, Sm
  * claim (a compare-and-swap of their total item count, so that no two threads claim the same items) or all of
  * their producers have terminated.  The claimed item counts are kept in thread-local scalars, and the segment
  * sees no more than them (readEarlierPhaseItemCounts.)
+ *
+ * With --phase-claim-segments=K > 1, a claim also requires the most recent earlier phase that produces these
+ * stream sets to have started at least K segments since the last claim, so that each segment of this phase has
+ * enough data for all of its partitions; a partition with no data must wait for the previous segment to release
+ * it.
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * PipelineCompiler::claimPhaseSegment(KernelBuilder & b) {
     SmallVector<size_t, 16> streamSets;
@@ -141,11 +146,29 @@ Value * PipelineCompiler::claimPhaseSegment(KernelBuilder & b) {
     const auto phase = std::to_string(mCurrentPipelinePhase);
     Value * const claimedPtr = b.getScalarFieldPtr(PHASE_CLAIMED_ITEM_TOTAL + phase).first;
     Value * const claimed = b.CreateAlignedLoad(sizeTy, claimedPtr, SizeTyABIAlignment, true);
-    Value * const grown = b.CreateICmpUGT(total, claimed);
+    Value * grown = b.CreateICmpUGT(total, claimed);
+    Value * startedSegments = nullptr;
+    Value * claimedSegNoPtr = nullptr;
+    if (codegen::PhaseClaimSegments > 1) {
+        unsigned producerPhase = 1;
+        for (const auto src : streamSets) {
+            producerPhase = std::max<unsigned>(producerPhase, mBufferGraph[src].ProducedPhaseId);
+        }
+        Value * const segNoPtr = b.getScalarFieldPtr(PHASE_NEXT_LOGICAL_SEGMENT_NUMBER + std::to_string(producerPhase)).first;
+        startedSegments = b.CreateAlignedLoad(sizeTy, segNoPtr, SizeTyABIAlignment, true);
+        claimedSegNoPtr = b.getScalarFieldPtr(PHASE_CLAIMED_SEGMENT_NUMBER + phase).first;
+        Value * const claimedSegNo = b.CreateAlignedLoad(sizeTy, claimedSegNoPtr, SizeTyABIAlignment, true);
+        Value * const enough = b.CreateICmpUGE(b.CreateSub(startedSegments, claimedSegNo), b.getSize(codegen::PhaseClaimSegments));
+        grown = b.CreateAnd(grown, enough);
+    }
     Value * const swap = b.CreateAtomicCmpXchg(claimedPtr, claimed, b.CreateSelect(grown, total, claimed), MaybeAlign(SizeTyABIAlignment),
                                                AtomicOrdering::AcquireRelease, AtomicOrdering::Monotonic);
     Value * const swapped = b.CreateAnd(grown, b.CreateExtractValue(swap, {1}));
     Value * const claim = b.CreateOr(swapped, allTerminated);
+    if (claimedSegNoPtr) {
+        Value * const prior = b.CreateAlignedLoad(sizeTy, claimedSegNoPtr, SizeTyABIAlignment, true);
+        b.CreateAlignedStore(b.CreateSelect(swapped, startedSegments, prior), claimedSegNoPtr, SizeTyABIAlignment, true);
+    }
     for (unsigned i = 0; i < streamSets.size(); ++i) {
         const auto name = PHASE_CLAIMED_ITEM_COUNT_PREFIX + phase + "_" + std::to_string(streamSets[i]);
         Value * const ptr = b.getScalarFieldPtr(name).first;

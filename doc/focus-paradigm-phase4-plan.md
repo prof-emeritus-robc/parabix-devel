@@ -160,4 +160,47 @@ cache), at 1 and 3 threads, with the scaling ceiling.
   (Without a boundary: ko 0.65 / 0.27 s, 54 MB; de 0.15 / 0.09 s, 72 MB.) A
   smaller step helps a little at 3 threads with two boundaries or a boundary after
   the filter (up to 19%), and changes little otherwise. It does not remove the loss
-  against no boundary or the memory growth, which are steps 3 and 4.
+  against no boundary or the memory growth (fixed in step 3; the loss is step 4).
+- **Step 3 (bounded memory):** fixed.
+  - **Cause.** A stream set's consumed item count is gathered in a transitory
+    (stack) variable of the compute function. The producer sets it to its produced
+    count, each consumer lowers it to its processed count, and the last consumer
+    stores it in the persistent count that the producer reads when it needs buffer
+    space. Each phase has its own compute function. For a stream set produced in
+    one phase and last consumed in a later one, the later phase's transitory count
+    was never set by the producer; it stayed 0, and a stored 0 means "consumers
+    skipped, keep the prior count". So the producer always saw 0 consumed and its
+    buffer grew to hold the whole stream. Temporary prints in
+    `ManagedDynamicBuffer::reserveCapacity` showed it: with a boundary after nfd's
+    transform, `UTF8assembly` (the transformed basis) and `streamCompress64_1`
+    expanded repeatedly with a consumed count of 0, to 14.75 MB on a 5 MB input.
+    Consumer counts of earlier-phase consumers were lost the same way.
+  - **Fix** (`consumer_analysis.cpp`, `consumer_logic.cpp`):
+    `initializeEarlierPhaseTransitoryConsumedItemCounts` sets the transitory count
+    of each earlier-phase stream set that this phase consumes to the produced count
+    read at phase entry (`readEarlierPhaseItemCounts`). If a stream set has
+    consumers in more than one phase, the last consumer in each phase before the
+    phase of its last consumer writes that phase's count to a slot of its own
+    (`@CON<id>_P<phase>`), and `readConsumedItemCount` takes the minimum of the
+    count and the slots.
+  - **Results** (nfd on ko, 1 thread, peak RSS for 5 / 20 / 50 MB inputs):
+    boundary after the transform 78 / 80 / 82 MB (was 92 / 166 / 350); after the
+    filter, the focus, or the placement and the transform, 141–186 MB, constant
+    from 20 MB on. The rest is the 100-segment cross-phase buffers: 76–78 MB with
+    `--phase-segment-limit=16`. No buffer expands more than twice.
+  - **Correctness:** nfd, nfc and nfkd with no boundary, each boundary and all four,
+    at 1 and 3 threads, `--segment-size=1024`, `-VerifyIR`, on the focus-modes text
+    against Python (36 runs); nfd on de and ko, nfkd on ko, nfc on ko.nfd and
+    de.nfd with boundaries after the filter, the transform, and the placement and
+    the transform, at 3 threads, against the 1-thread output without a boundary;
+    `ctest -j3` 42/42.
+  - **Time** (battery, best of 2, 1 / 3 threads). At 1 thread a boundary now costs
+    0–6% instead of 6–14%. At 3 threads it is still slower (step 4):
+
+    | tool, input | none | filter | transform | placement,transform |
+    |---|---|---|---|---|
+    | nfd de | 0.15 / 0.09 | 0.15 / 0.14 | 0.15 / 0.11 | 0.15 / 0.11 |
+    | nfd ko | 0.65 / 0.27 | 0.69 / 0.66 | 0.66 / 0.32 | 0.69 / 0.58 |
+    | nfkd ko | 0.75 / 0.32 | 0.81 / 0.83 | 0.76 / 0.36 | 0.82 / 0.71 |
+    | nfc ko.nfd | 0.97 / 0.40 | 0.98 / 0.95 | 0.98 / 0.51 | 0.97 / 0.51 |
+    | nfc de.nfd | 0.16 / 0.10 | 0.16 / 0.15 | 0.17 / 0.14 | 0.16 / 0.14 |

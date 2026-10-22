@@ -392,6 +392,8 @@ public:
     void readExternalConsumerItemCounts(KernelBuilder & b);
     Value * readConsumedItemCount(KernelBuilder & b, const size_t streamSet);
     void setConsumedItemCount(KernelBuilder & b, const size_t streamSet, Value * consumed, const unsigned slot) const;
+    SmallVector<unsigned, 2> getConsumerPhaseSlots(const size_t id) const;
+    void initializeEarlierPhaseTransitoryConsumedItemCounts(KernelBuilder & b);
     void updateExternalConsumedItemCounts(KernelBuilder & b);
     void zeroAnySkippedTransitoryConsumedItemCountsUntil(KernelBuilder & b, const unsigned targetKernelId);
 

@@ -120,6 +120,7 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
             SmallVector<size_t, 16> claimed;
             if (getClaimedEarlierPhaseStreamSets(phase, claimed)) {
                 mTarget->addInternalScalar(sizeTy, PHASE_CLAIMED_ITEM_TOTAL + std::to_string(phase), getCacheLineGroupId(firstKernelInCurrentPhase));
+                mTarget->addInternalScalar(sizeTy, PHASE_CLAIMED_SEGMENT_NUMBER + std::to_string(phase), getCacheLineGroupId(firstKernelInCurrentPhase));
                 for (const auto streamSet : claimed) {
                     mTarget->addThreadLocalScalar(sizeTy, PHASE_CLAIMED_ITEM_COUNT_PREFIX + std::to_string(phase) + "_" + std::to_string(streamSet), 0);
                 }

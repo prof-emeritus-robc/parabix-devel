@@ -69,6 +69,7 @@ const static std::string NEXT_LOGICAL_SEGMENT_NUMBER = "@NLSN";
 
 const static std::string PHASE_NEXT_LOGICAL_SEGMENT_NUMBER = "@PLSN";
 const static std::string PHASE_CLAIMED_ITEM_TOTAL = "@PCIT";
+const static std::string PHASE_CLAIMED_SEGMENT_NUMBER = "@PCSN";
 const static std::string PHASE_CLAIMED_ITEM_COUNT_PREFIX = "@PCIC";
 const static std::string PHASE_ITERATION_SEGMENT_LIMIT_STEP = "@PILS";
 

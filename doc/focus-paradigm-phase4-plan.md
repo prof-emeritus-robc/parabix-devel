@@ -273,3 +273,63 @@ cache), at 1 and 3 threads, with the scaling ceiling.
     0–40% at 3 threads instead of up to 140%, but it is still never faster than
     none. The next candidates are remedies 2 and 3 of step 4, and measurements
     on mains power (step 5).
+- **Step 4, remedy 3 (claim after K earlier segments):** done; `--phase-claim-segments=4`
+  is the default.
+  - **Why:** after remedy 1, threads still waited in the partition-jump path (lldb on
+    a 600 MB run, as before). A claim could cover little new data, so some partitions
+    of the segment had nothing to do and waited for the previous segment to release
+    them.
+  - **Change:** `claimPhaseSegment` also requires the most recent earlier phase that
+    produces the claimed stream sets to have started at least K segments since the
+    phase's last claim (its `PHASE_NEXT_LOGICAL_SEGMENT_NUMBER` against a shared
+    `@PCSN<phase>`), unless all their producers have terminated. K is clamped to
+    `--phase-segment-limit`, so a later phase never waits for more segments than an
+    earlier phase runs in one visit, and an earlier phase never waits for a later one.
+    K is part of the pipeline signature with the phase segment limit.
+  - **K sweep** (3 threads, battery, best of 2; all outputs equal to the 1-thread
+    output without a boundary):
+
+    | tool, input, boundary | K=1 | K=2 | K=4 | K=8 |
+    |---|---|---|---|---|
+    | nfd ko, filter | 0.69 | 0.31 | 0.31 | 0.29 |
+    | nfd ko, transform | 0.31 | 0.28 | 0.28 | 0.28 |
+    | nfd ko, placement,transform | 0.37 | 0.32 | 0.31 | 0.32 |
+    | nfkd ko, filter | 0.49 | 0.38 | 0.37 | 0.37 |
+    | nfc ko.nfd, filter | 0.57 | 0.43 | 0.43 | 0.42 |
+    | nfc ko.nfd, transform | 0.51 | 0.41 | 0.41 | 0.40 |
+
+    K=1 (remedy 1 alone) varies from run to run: 0.41–0.70 s for nfd ko with a
+    boundary after the filter, over five runs. From K=2 on, times are steady.
+  - **With K=4** (battery, best of 3, seconds and peak RSS):
+
+    | tool, input | none, 1 / 3 threads | filter | transform | placement,transform |
+    |---|---|---|---|---|
+    | nfd ko | 0.66 / 0.27 | 0.70 / 0.31 | 0.67 / 0.28 | 0.72 / 0.32 |
+    | nfd de | 0.16 / 0.09 | 0.16 / 0.09 | 0.15 / 0.09 | 0.16 / 0.09 |
+    | nfd vi | 0.37 / 0.17 | 0.39 / 0.18 | 0.38 / 0.17 | 0.39 / 0.18 |
+    | nfkd ko | 0.76 / 0.32 | 0.82 / 0.40 | 0.77 / 0.32 | 0.83 / 0.38 |
+    | nfc ko.nfd | 0.97 / 0.40 | 0.99 / 0.42 | 0.98 / 0.41 | 0.98 / 0.41 |
+    | nfc de.nfd | 0.17 / 0.11 | 0.16 / 0.10 | 0.16 / 0.10 | 0.17 / 0.10 |
+
+    Peak RSS with a boundary after the transform is 74–269 MB (52–236 MB without a
+    boundary); with a boundary after the filter, or after the placement and the
+    transform, up to 384 MB, from the 100-segment cross-phase buffers.
+    A boundary after the transform now costs nothing measurable at 3 threads, and
+    0–3% at 1 thread. Other boundaries cost up to 25% at 3 threads (nfkd ko after
+    the filter) and 4–9% at 1 thread. No boundary is clearly faster than none yet; on
+    battery, differences under about 0.01 s are noise.
+  - **Correctness:** the 36-run matrix with `-VerifyIR` at the default; `ctest -j3`
+    42/42 (greptest covers icgrep's own phase boundaries, which now also use K=4;
+    icgrep's timing with phases has not been measured).
+- **Step 4, remedy 2 (release skipped partitions without waiting):** not done.
+  - The wait in the jump path is what keeps the segment locks in order: a segment
+    may set a kernel's lock to its own number plus one only after the previous
+    segment has set it to its number. Releasing without waiting needs a different
+    lock protocol, for example a per-kernel record of skipped segments that the
+    previous segment completes when it releases the lock.
+  - After remedy 3, the remaining loss is small, so this is left for Phase 5, where
+    more threads would make such waits more frequent.
+- **Next:** step 5 (measure the layer configurations on mains power with
+  `QA/focus_baseline.py --layers`, including vi, ja, de.nfd and ko.nfd, and the
+  scaling ceilings), then step 6 (report and defaults). The 100-segment cross-phase
+  buffers should be measured against `--phase-segment-limit=16` for memory.

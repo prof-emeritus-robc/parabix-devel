@@ -57,6 +57,105 @@ void PipelineCompiler::obtainCurrentSegmentNumber(KernelBuilder & b) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getClaimedEarlierPhaseStreamSets
+ *
+ * The stream sets produced in earlier phases and consumed in the given phase (after the first), whose items
+ * each segment of the phase claims (see claimPhaseSegment), or false if the phase's segments claim nothing:
+ * the pipeline has no phase boundaries or is nested, or a producer has no termination signal.
+ ** ------------------------------------------------------------------------------------------------------------- */
+bool PipelineCompiler::getClaimedEarlierPhaseStreamSets(const unsigned phase, SmallVector<size_t, 16> & streamSets) const {
+    streamSets.clear();
+    if (phase < 2 || PartitionPhaseBoundaries.size() <= 2 || mIsNestedPipeline) {
+        return false;
+    }
+    const auto firstPartition = PartitionPhaseBoundaries[phase - 1U];
+    const auto oneAfterLastPartition = PartitionPhaseBoundaries[phase];
+    const auto firstKernel = FirstKernelInPartition[firstPartition];
+    const auto oneAfterLastKernel = FirstKernelInPartition[oneAfterLastPartition];
+    // as in readEarlierPhaseItemCounts
+    for (auto kernel = firstKernel; kernel < oneAfterLastKernel; ++kernel) {
+        for (const auto input : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+            auto src = source(input, mBufferGraph);
+            while (LLVM_UNLIKELY(mBufferGraph[src].isTruncated())) {
+                src = getTruncatedStreamSetSourceId(src);
+            }
+            const BufferNode & bn = mBufferGraph[src];
+            if (bn.isConstant() || bn.ProducedPhaseId >= phase) {
+                continue;
+            }
+            const auto producer = source(in_edge(src, mBufferGraph), mBufferGraph);
+            if (producer == PipelineInput) {
+                continue;
+            }
+            if (!HasTerminationSignal.test(getTerminationSignalIndex(producer))) {
+                streamSets.clear();
+                return false;
+            }
+            if (std::find(streamSets.begin(), streamSets.end(), src) == streamSets.end()) {
+                streamSets.push_back(src);
+            }
+        }
+    }
+    return !streamSets.empty();
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief claimPhaseSegment
+ *
+ * Whether the thread should claim a segment of the current phase (after the first), and if so, claim the items
+ * of the earlier-phase stream sets that the segment may process.
+ *
+ * A partition root that reads stream sets from an earlier phase has no limit on its strides per segment, so a
+ * segment takes every item available when it enters the phase.  The next segment, entering a moment later,
+ * then finds nothing new, skips its partitions, and must wait for the previous segment to release their locks.
+ * Instead, a thread claims a segment only if the earlier-phase stream sets have grown since the phase's last
+ * claim (a compare-and-swap of their total item count, so that no two threads claim the same items) or all of
+ * their producers have terminated.  The claimed item counts are kept in thread-local scalars, and the segment
+ * sees no more than them (readEarlierPhaseItemCounts.)
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * PipelineCompiler::claimPhaseSegment(KernelBuilder & b) {
+    SmallVector<size_t, 16> streamSets;
+    const auto enabled = getClaimedEarlierPhaseStreamSets(mCurrentPipelinePhase, streamSets);
+    assert (enabled); (void)enabled;
+
+    IntegerType * const sizeTy = b.getSizeTy();
+    SmallVector<Value *, 16> produced(streamSets.size());
+    Value * allTerminated = b.getTrue();
+    for (unsigned i = 0; i < streamSets.size(); ++i) {
+        const auto producer = source(in_edge(streamSets[i], mBufferGraph), mBufferGraph);
+        Value * const signal = readTerminationSignal(b, getTerminationSignalIndex(producer));
+        allTerminated = b.CreateAnd(allTerminated, b.CreateIsNotNull(signal));
+    }
+    // read the counts after the signals, as in readEarlierPhaseItemCounts
+    b.CreateFence(AtomicOrdering::Acquire);
+    Value * total = b.getSize(0);
+    for (unsigned i = 0; i < streamSets.size(); ++i) {
+        const auto f = in_edge(streamSets[i], mBufferGraph);
+        const BufferPort & br = mBufferGraph[f];
+        const auto prefix = makeBufferName(source(f, mBufferGraph), br.Port);
+        const auto name = prefix + (br.isDeferred() ? DEFERRED_ITEM_COUNT_SUFFIX : ITEM_COUNT_SUFFIX);
+        produced[i] = b.CreateAlignedLoad(sizeTy, b.getScalarFieldPtr(name).first, SizeTyABIAlignment, true);
+        total = b.CreateAdd(total, produced[i]);
+    }
+
+    const auto phase = std::to_string(mCurrentPipelinePhase);
+    Value * const claimedPtr = b.getScalarFieldPtr(PHASE_CLAIMED_ITEM_TOTAL + phase).first;
+    Value * const claimed = b.CreateAlignedLoad(sizeTy, claimedPtr, SizeTyABIAlignment, true);
+    Value * const grown = b.CreateICmpUGT(total, claimed);
+    Value * const swap = b.CreateAtomicCmpXchg(claimedPtr, claimed, b.CreateSelect(grown, total, claimed), MaybeAlign(SizeTyABIAlignment),
+                                               AtomicOrdering::AcquireRelease, AtomicOrdering::Monotonic);
+    Value * const swapped = b.CreateAnd(grown, b.CreateExtractValue(swap, {1}));
+    Value * const claim = b.CreateOr(swapped, allTerminated);
+    for (unsigned i = 0; i < streamSets.size(); ++i) {
+        const auto name = PHASE_CLAIMED_ITEM_COUNT_PREFIX + phase + "_" + std::to_string(streamSets[i]);
+        Value * const ptr = b.getScalarFieldPtr(name).first;
+        Value * const prior = b.CreateAlignedLoad(sizeTy, ptr, SizeTyABIAlignment);
+        b.CreateAlignedStore(b.CreateSelect(claim, produced[i], prior), ptr, SizeTyABIAlignment);
+    }
+    return claim;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief incrementCurrentSegNo
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::obtainNextSegmentNumber(KernelBuilder & b) {

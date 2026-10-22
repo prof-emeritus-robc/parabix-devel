@@ -234,3 +234,42 @@ cache), at 1 and 3 threads, with the scaling ceiling.
     phase's counts once, at entry (the issue #26 fix). Segment n+1 starts right after
     segment n's first kernel, sees nearly the same counts, and finds that segment n
     has taken them.
+- **Step 4, remedy 1 (claimed ranges):** done.
+  - **Why an estimate of a segment's consumption does not work:** a partition root
+    whose inputs are not all constant has no static limit on its strides per segment
+    (`kernel_io_calculation_logic.cpp`), so a later-phase segment takes every item
+    the earlier phase has produced when it enters the phase. The reverted claim check
+    failed for this reason: a segment read the counts after its claim, and so also
+    took the items that justified the next thread's claim.
+  - **Change** (`synchronization_logic.cpp`, `buffer_management_logic.cpp`,
+    `multithreading_model_logic.cpp`, `pipeline_logic.cpp`):
+    - Before each segment of a later phase, at phase entry and before each further
+      segment of a visit, `claimPhaseSegment` reads the earlier-phase stream sets'
+      termination signals and produced counts. The thread claims a segment only if
+      their total exceeds the phase's last claimed total (a compare-and-swap of a
+      shared scalar, so that no two threads claim the same items) or all their
+      producers have terminated. Otherwise it goes on to the next phase.
+    - The claimed counts are kept in thread-local scalars, and
+      `readEarlierPhaseItemCounts` limits each count the segment sees to them.
+      Segments therefore get disjoint ranges of the earlier phase's data. A
+      producer whose count was limited is treated as not yet terminated.
+    - It applies to non-nested pipelines with phase boundaries whose earlier-phase
+      producers have termination signals.
+  - **Correctness:** the 36-run matrix with `-VerifyIR`; nfd on ko and de, nfkd on
+    ko and nfc on ko.nfd with no boundary and boundaries after the filter, the
+    transform, and the placement and transform, at 3 threads, against the 1-thread
+    output without a boundary; `ctest -j3` 42/42.
+  - **Time** (battery, best of 2, 3 threads; 1-thread times unchanged):
+
+    | tool, input | none | filter | transform | placement,transform |
+    |---|---|---|---|---|
+    | nfd ko | 0.27 | 0.40 (was 0.66) | 0.31 (0.32) | 0.37 (0.58) |
+    | nfd de | 0.09 | 0.13 (0.14) | **0.09** (0.11) | 0.11 (0.11) |
+    | nfkd ko | 0.35 | 0.52 (0.83) | 0.36 (0.36) | 0.45 (0.71) |
+    | nfc ko.nfd | 0.40 | 0.56 (0.95) | 0.50 (0.51) | 0.45 (0.51) |
+
+    nfd on ko with a boundary after the transform runs 104 phase-1 and 103 phase-2
+    segments at 3 threads (141 / 140 before), none empty. A boundary now costs
+    0–40% at 3 threads instead of up to 140%, but it is still never faster than
+    none. The next candidates are remedies 2 and 3 of step 4, and measurements
+    on mains power (step 5).

@@ -456,7 +456,11 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
             BasicBlock * const pipelineLoop = b.CreateBasicBlock("PipelineLoop");
             BasicBlock * pipelineStart = nullptr;
             BasicBlock * const pipelineEnd = b.CreateBasicBlock("PipelineEnd");
-            BasicBlock * const entryBlock = b.GetInsertBlock();
+            BasicBlock * entryBlock = b.GetInsertBlock();
+            BasicBlock * phaseSkipped = nullptr;
+            BasicBlock * loopExit = nullptr;
+            SmallVector<size_t, 16> claimedStreamSets;
+            const auto claimsSegments = getClaimedEarlierPhaseStreamSets(mCurrentPipelinePhase, claimedStreamSets);
 
             PHINode * madeProgressInLastSegment = nullptr;
             Value * mInitialPhaseSegNo = nullptr;
@@ -473,6 +477,14 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
                 }
             } else {
                 pipelineStart = b.CreateBasicBlock("PipelineStart", pipelineEnd);
+                if (claimsSegments) {
+                    BasicBlock * const claimSegment = b.CreateBasicBlock("PhaseClaimSegment", pipelineStart);
+                    Value * const claim = claimPhaseSegment(b);
+                    phaseSkipped = b.GetInsertBlock();
+                    b.CreateLikelyCondBr(claim, claimSegment, pipelineEnd);
+                    b.SetInsertPoint(claimSegment);
+                    entryBlock = claimSegment;
+                }
                 obtainCurrentSegmentNumber(b);
                 mInitialPhaseSegNo = mSegNo;
                 #ifndef PHASES_RUN_TO_COMPLETION
@@ -742,10 +754,34 @@ void PipelineCompiler::generateMultiThreadKernelMethod(KernelBuilder & b) {
                 }
                 #endif
                 // TODO: need to check if we could potentially make more progress, not whether we did
-                b.CreateLikelyCondBr(doNextSegment, pipelineLoop, pipelineEnd);
+                if (phaseSkipped) {
+                    BasicBlock * const claimNext = b.CreateBasicBlock("PhaseClaimNextSegment", pipelineEnd);
+                    b.CreateLikelyCondBr(doNextSegment, claimNext, pipelineEnd);
+                    loopExit = b.GetInsertBlock();
+                    b.SetInsertPoint(claimNext);
+                    Value * const claim = claimPhaseSegment(b);
+                    BasicBlock * const claimExit = b.GetInsertBlock();
+                    b.CreateLikelyCondBr(claim, pipelineLoop, pipelineEnd);
+                    b.SetInsertPoint(pipelineEnd);
+                    // a skipped phase has not terminated
+                    PHINode * const terminatedPhi = b.CreatePHI(terminated->getType(), 3, "phaseTerminated");
+                    terminatedPhi->addIncoming(terminated, loopExit);
+                    terminatedPhi->addIncoming(terminated, claimExit);
+                    terminatedPhi->addIncoming(Constant::getNullValue(terminated->getType()), phaseSkipped);
+                    terminated = terminatedPhi;
+                    PHINode * const segNoPhi = b.CreatePHI(sizeTy, 3, "phaseSegNo");
+                    segNoPhi->addIncoming(mSegNo, loopExit);
+                    segNoPhi->addIncoming(mSegNo, claimExit);
+                    segNoPhi->addIncoming(b.getSize(0), phaseSkipped);
+                    mSegNo = segNoPhi;
+                } else {
+                    b.CreateLikelyCondBr(doNextSegment, pipelineLoop, pipelineEnd);
+                }
             }
 
-            b.SetInsertPoint(pipelineEnd);
+            if (!phaseSkipped) {
+                b.SetInsertPoint(pipelineEnd);
+            }
             Value * done = b.CreateIsNotNull(terminated);
             if (allPhasesDone) {
                 assert (numOfPhases > 2);

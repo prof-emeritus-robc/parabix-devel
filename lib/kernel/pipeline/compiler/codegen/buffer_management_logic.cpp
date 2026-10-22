@@ -620,6 +620,33 @@ void PipelineCompiler::readEarlierPhaseItemCounts(KernelBuilder & b) {
         }
         mEarlierPhaseAvailableItems[entry.first] = produced;
     }
+
+    // A segment of a phase that claims earlier-phase items sees no more than it claimed (claimPhaseSegment.)
+    // If it sees fewer items than the producer has produced, it must not treat the producer as terminated.
+    SmallVector<size_t, 16> claimed;
+    if (getClaimedEarlierPhaseStreamSets(mCurrentPipelinePhase, claimed)) {
+        const auto phase = std::to_string(mCurrentPipelinePhase);
+        for (const auto src : claimed) {
+            Value * const produced = mEarlierPhaseAvailableItems[src];
+            if (produced == nullptr) {
+                continue;
+            }
+            Value * const limit = b.getScalarField(PHASE_CLAIMED_ITEM_COUNT_PREFIX + phase + "_" + std::to_string(src));
+            Value * const capped = b.CreateICmpULT(limit, produced);
+            Value * const available = b.CreateSelect(capped, limit, produced);
+            for (const auto & entry : streamSets) {
+                if (entry.second == src) {
+                    mEarlierPhaseAvailableItems[entry.first] = available;
+                }
+            }
+            const auto producer = source(in_edge(src, mBufferGraph), mBufferGraph);
+            const auto idx = getTerminationSignalIndex(producer);
+            Value * const signal = mEarlierPhaseTerminationSignal[idx];
+            if (signal) {
+                mEarlierPhaseTerminationSignal[idx] = b.CreateSelect(capped, Constant::getNullValue(signal->getType()), signal);
+            }
+        }
+    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

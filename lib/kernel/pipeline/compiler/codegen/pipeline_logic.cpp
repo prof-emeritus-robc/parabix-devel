@@ -117,6 +117,13 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
 
         if (numOfPhases != 2) {
             mTarget->addThreadLocalScalar(sizeTy, PHASE_ITERATION_SEGMENT_LIMIT_STEP + std::to_string(phase), getCacheLineGroupId(firstKernelInCurrentPhase));
+            SmallVector<size_t, 16> claimed;
+            if (getClaimedEarlierPhaseStreamSets(phase, claimed)) {
+                mTarget->addInternalScalar(sizeTy, PHASE_CLAIMED_ITEM_TOTAL + std::to_string(phase), getCacheLineGroupId(firstKernelInCurrentPhase));
+                for (const auto streamSet : claimed) {
+                    mTarget->addThreadLocalScalar(sizeTy, PHASE_CLAIMED_ITEM_COUNT_PREFIX + std::to_string(phase) + "_" + std::to_string(streamSet), 0);
+                }
+            }
         }
 
         for (auto i = firstKernelInCurrentPhase; i < oneAfterLastKernelInCurrentPhase; ++i) {

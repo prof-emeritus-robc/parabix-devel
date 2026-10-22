@@ -35,5 +35,9 @@ private:
 /*  Lookaheads compiled as lookahead chains (see parseLookaheadChain) are
     named by the LookAheadNamer with this prefix. */
 const std::string LookaheadChainPrefix = "LAchain_";
+
+/*  Lookaheads matched by reversal (see RE_PipelineBuilder::reversedStarts)
+    are named with this prefix, before the other passes. */
+const std::string ReversedLookaheadPrefix = "LArev_";
 }
 

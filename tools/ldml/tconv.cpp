@@ -2038,6 +2038,7 @@ static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearch
     }
     RE_ModeOptions opts;
     opts.forceUnicodeIndexing = true;
+    opts.reversal = false;      //  (see engineOptions)
     PreparedSearchReplace prepared = prepareSearchReplace(re::makeSeq(items.begin(), items.end()),
                                                           re::makeSeq(result.begin(), result.end()), opts);
     const std::vector<PreconditionFailure> failures = checkPreconditions(prepared, &cc::Unicode);
@@ -4791,6 +4792,15 @@ StreamSet * RulePipelineBuilder::maskedStringOverrides(const std::vector<std::pa
     return result;
 }
 
+//  The options of tconv's uses of the regular expression engine: without
+//  matching by reversal, whose regions are limited in length (a text, or a
+//  line with -lines, is one region of any length).
+static RE_ModeOptions engineOptions() {
+    RE_ModeOptions opts;
+    opts.reversal = false;
+    return opts;
+}
+
 //  The positions of the last characters of the matches of a text (a sequence of
 //  sets) with contexts.  With spans, also the positions of the characters of the
 //  texts of the matches, from the first to the last (the match spans of the
@@ -4823,7 +4833,7 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
     re::RE * const pattern = re::makeSeq(items.begin(), items.end());
     //  The engine marks a match at an offset after its last character (e.g. 1
     //  for a pattern ending with a zero-width lookahead): shift the marks back.
-    const PreparedRE prepared = prepareRE(pattern);
+    const PreparedRE prepared = prepareRE(pattern, engineOptions());
     StreamSet * matches = mP.CreateStreamSet(1);
     RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
     if (spans) {
@@ -4861,17 +4871,15 @@ StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * eng
     RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
     std::vector<re::RE *> pattern(items);
     pattern.insert(pattern.end(), ahead.begin(), ahead.end());
-    RE_ModeOptions opts;
+    RE_ModeOptions opts = engineOptions();
     opts.goal = re::RE_Goal::MatchStarts;
-    //  (Not by reversal: a text, or a line with -lines, is one region of any length.)
-    opts.startsByReversal = false;
     const PreparedRE prepared = prepareRE(re::makeSeq(pattern.begin(), pattern.end()), opts);
     if (checkPreconditions(prepared, &cc::Unicode).empty()) {
         engine.matchStartsPipeline(prepared, starts);
         return starts;
     }
     items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
-    engine.matchSearchPipeline(prepareRE(re::makeSeq(items.begin(), items.end())), starts);
+    engine.matchSearchPipeline(prepareRE(re::makeSeq(items.begin(), items.end()), engineOptions()), starts);
     return starts;
 }
 

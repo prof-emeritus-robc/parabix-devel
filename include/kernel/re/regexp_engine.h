@@ -73,12 +73,12 @@ struct RE_ModeOptions {
     unsigned byteCClimit = 6;
     // What the RE is prepared for (see re::RE_Goal), which selects its passes.
     re::RE_Goal goal = re::RE_Goal::MatchEnds;
-    // Whether the starts of matches (the MatchStarts goal) may be found by
-    // reversing the regions of the text when no forward strategy applies
-    // (see RE_PipelineBuilder::reversedStarts): a client whose regions may
-    // exceed the region limit (re::ReverseRegionLimit, a runtime error)
-    // turns it off.
-    bool startsByReversal = true;
+    // Whether the engine may match backward, by reversing the regions of the
+    // text, where no forward strategy applies: the starts of matches (the
+    // MatchStarts goal) and lookaheads (see RE_PipelineBuilder::
+    // reversedStarts).  A client whose regions may exceed the region limit
+    // (re::ReverseRegionLimit, a runtime error) turns it off.
+    bool reversal = true;
 };
 
 struct RE_Mode {

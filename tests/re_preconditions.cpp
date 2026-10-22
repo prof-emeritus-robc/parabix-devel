@@ -36,8 +36,10 @@ const PreconditionCase Cases[] = {
     {"x(?=ab*c)", RE_Goal::MatchEnds, &cc::UTF8, true},            // unique prefix
     {"x(?=b*c)", RE_Goal::MatchEnds, &cc::UTF8, true},             // chain (Unicode mode)
     {"x(?=b*c)", RE_Goal::MatchEnds, &cc::Unicode, true},
-    {"x(?=(?:a*b)*c)", RE_Goal::MatchEnds, &cc::UTF8, false},        // no strategy
-    {"x(?=(?:a*b)*c)", RE_Goal::MatchSpans, &cc::Unicode, false},
+    {"x(?=(?:a*b)*c)", RE_Goal::MatchEnds, &cc::UTF8, true},         // no forward strategy: by reversal
+    {"x(?=(?:a*b)*c)", RE_Goal::MatchSpans, &cc::Unicode, true},
+    {"x(?=(?:a*b)*c$)", RE_Goal::MatchEnds, &cc::UTF8, false},       // reversal: anchored
+    {"x(?=(?:a*b)*(?<!a)c)", RE_Goal::MatchEnds, &cc::UTF8, false},  // reversal: would extend the text
     {"(a)\\1", RE_Goal::MatchEnds, &cc::UTF8, true},               // fixed back reference
     {"(a+)\\1", RE_Goal::MatchEnds, &cc::UTF8, false},             // variable capture
     {"abc", RE_Goal::MatchSpans, &cc::UTF8, true},
@@ -53,7 +55,7 @@ const PreconditionCase Cases[] = {
     {"x(?=(?:a*b)*c)", RE_Goal::MatchStarts, &cc::UTF8, true},     // (a lookbehind of the reversed RE)
     {"(?:a*b)*c$", RE_Goal::MatchStarts, &cc::UTF8, false},        // reversal: anchored
     {"(?:a*b)*c?", RE_Goal::MatchStarts, &cc::UTF8, false},        // reversal: nullable
-    {"(?<=c(?:a*b)*)(?:a*b)*d", RE_Goal::MatchStarts, &cc::UTF8, false}, // reversal: a lookahead without a strategy
+    {"(?<=c(?:a*b)*)(?:a*b)*d", RE_Goal::MatchStarts, &cc::UTF8, true}, // reversal, within it a lookahead by reversal
     {"abc", RE_Goal::SearchReplace, &cc::UTF8, true},              // (the search pattern alone)
 };
 

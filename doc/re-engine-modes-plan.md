@@ -924,7 +924,7 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   `--disable-engine-search-replace`; 0.5 s with the object cache), and
   adjacent captures in `replace_test` and `capture_spans_test`.
 
-## Milestone 9 status (begun)
+## Milestone 9 status (in progress)
 
 - `kernel::RegionReversal` (`kernel/streamutils/region_reversal.h`): each
   region of a stream set reversed in place, the regions being the runs of
@@ -951,18 +951,37 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   not nullable, no `Start`/`End` anchors, and the preconditions of
   `reverse(R)` for the MatchEnds goal; otherwise the forward failures are
   reported, with the reason the reversal does not apply.
-- `RE_ModeOptions::startsByReversal` (default true): tconv turns it off for its
-  match starts (a text without `-lines` is one region of any length), so its
-  outputs are unchanged.
+- `RE_ModeOptions::reversal` (default true): whether the engine may match by
+  reversal (starts and lookaheads). tconv turns it off for all its uses of the
+  engine (`engineOptions`: a text without `-lines` is one region of any
+  length), so its outputs are unchanged.
+- General lookaheads by reversal, in every mode: a lookahead that no forward
+  strategy compiles (`forwardFailures` of the lookahead alone) and whose
+  asserted RE reversal can match is named `LArev_` + hash before the mode
+  passes (`ReversedLookaheadNamer`, the first step of `ModeTransformation::
+  transform`), and the external is the starts of the asserted RE by reversal
+  (`StartIndexed`, offset 1; negated where read for a negative lookahead).
+  Lookaheads within it, and lookbehinds that become lookaheads of the
+  reversed RE, are compiled by the backward pipeline (by reversal again where
+  needed: `(?<=c(?:a*b)*)(?:a*b)*d` gives its starts by nested reversal). An
+  asserted RE whose reversal refers to the end of the text (a negative
+  lookbehind within the lookahead) is not reversed, as the text of the
+  backward pass would be extended where the forward one is not; the failure
+  then also gives the reason reversal does not apply. Examples now compiled:
+  `foo(?![a-z]*bar)`, `x(?=(?:ab|c)+d)`, `x(?=(?:a*b)*c)`.
 - Tests: `region_reversal_test` (`tests/region_reversal.cpp`,
   `region_reversal_test.py`, new: regions of lines, of barrier characters,
   without line regions, across the strides and segments of the pipeline, and
   the limit error, compared with Python; 0.3 s with the object cache), a group
   of six REs by reversal in `match_starts_test` (compared with Python's `re`),
-  and reversal cases in `re_preconditions_test`.
-- Next: general lookahead externals by reversal for the Ends mode (with the
-  lookbehinds matched forward as externals of the backward pass), reversal of
-  only the streams the reversed RE needs (rather than the 21-bit basis),
+  and reversal cases in `re_preconditions_test`; `reversed_lookahead_test`
+  (`QA/reversed_lookahead_test.py`, new: seven lookaheads by reversal, the
+  lines icgrep selects compared with Python's `re` on random lines, and two
+  errors; 0.2 s with the object cache). greptest passes.
+- Next: lookbehinds matched forward as externals of the backward pass (rather
+  than recompiled backward), reversal of only the streams the reversed RE
+  needs (rather than the 21-bit basis), one reversal shared by the uses of a
+  pipeline,
   anchors with reversal (the region starts and follows of the real regions as
   externals), meeting in the middle for capture boundaries, and relaxing the
   lookahead and U3 preconditions accordingly.

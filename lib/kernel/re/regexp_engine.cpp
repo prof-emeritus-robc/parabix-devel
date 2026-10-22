@@ -1379,6 +1379,17 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
         compileProperty(pe);
         return;
     }
+    if (name.compare(0, ReversedLookaheadPrefix.size(), ReversedLookaheadPrefix) == 0) {
+        // A lookahead matched by reversal (see ReversedLookaheadNamer): the
+        // starts of the matches of its asserted RE, at their first characters.
+        Assertion * const a = cast<Assertion>(defn);
+        StreamSet * const starts = mPB.CreateStreamSet(1);
+        reversedStarts(a->getAsserted(), starts);
+        const auto r = getLengthRange(a->getAsserted(), mCtxt.mLengthAlphabet);
+        addExternal(name, ExternalStream{ExternalStreamKind::StartIndexed, 1, r, starts,
+                                         a->getSense() == Assertion::Sense::Negative});
+        return;
+    }
     //  Need to compile this defn.   Make sure all referenced externals
     //  are compiled first.
     prepareExternals(defn);
@@ -2499,11 +2510,17 @@ namespace {
 // position a character).  The RE must not match the empty string (an empty
 // match is between positions, which reversal does not map to a start), and
 // must not have anchors (whose matches the barriers of the reversal would
-// create, see kernel::RegionReversal).
-std::string reversalFailure(RE * re, const cc::Alphabet * codeUnitAlphabet) {
+// create, see kernel::RegionReversal).  Unless extensible (the text of the
+// reversal may be extended, see matchStartsPipeline), the reversed RE must
+// not refer to the end of the text.
+std::string reversalFailure(RE * re, const cc::Alphabet * codeUnitAlphabet, bool extensible = true) {
     if (codeUnitAlphabet != &cc::Unicode) return "it requires full Unicode indexing";
     if (getLengthRange(re, &cc::Unicode).first == 0) return "the RE can match the empty string";
     if (hasAnchorAnywhere(re)) return "the RE has anchors (^, $), which barriers would match";
+    if (!extensible && hasEndAnchorAnywhere(reverse(re))) {
+        return "the reversed RE has a negative lookahead (a negative lookbehind of the RE), for which the text "
+               "would be extended";
+    }
     RE_ModeOptions opts;
     opts.goal = RE_Goal::MatchEnds;
     opts.forceUnicodeIndexing = true;
@@ -2513,6 +2530,37 @@ std::string reversalFailure(RE * re, const cc::Alphabet * codeUnitAlphabet) {
     for (const PreconditionFailure & f : failures) reason += f.reason + "; ";
     reason.resize(reason.size() - 2);
     return reason;
+}
+
+// The lookaheads of an RE that no forward strategy compiles, and whose starts
+// reversal finds (see reversalFailure, without extending the text), named
+// ReversedLookaheadPrefix + a hash, with the lookahead as its definition: the
+// external is computed by RE_PipelineBuilder::reversedStarts (see
+// compileExternal).  Lookaheads within them are left to the reversed RE.
+struct ReversedLookaheadNamer final : public NameIntroduction {
+    ReversedLookaheadNamer(const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet)
+    : NameIntroduction("ReversedLookaheadNamer"), mLengthAlphabet(lengthAlphabet), mCodeUnitAlphabet(codeUnitAlphabet) {}
+    RE * transformAssertion(Assertion * a) override;
+    const cc::Alphabet * const mLengthAlphabet;
+    const cc::Alphabet * const mCodeUnitAlphabet;
+    // The lookaheads without a forward strategy that reversal does not
+    // match either, with the reasons.
+    std::vector<std::pair<Assertion *, std::string>> mNotReversed;
+};
+
+// The precondition failures of the forward compilation of an RE (no reversal).
+std::vector<PreconditionFailure> forwardFailures(RE * re, const cc::Alphabet * lengthAlphabet,
+                                                 const cc::Alphabet * codeUnitAlphabet);
+
+RE * ReversedLookaheadNamer::transformAssertion(Assertion * a) {
+    if ((a->getKind() == Assertion::Kind::LookAhead) && !forwardFailures(a, mLengthAlphabet, mCodeUnitAlphabet).empty()) {
+        const std::string reason = reversalFailure(a->getAsserted(), mCodeUnitAlphabet, false);
+        if (reason.empty()) {
+            return createName(ReversedLookaheadPrefix + kernel::Kernel::getStringHash(Printer_RE::PrintRE(a)), a);
+        }
+        mNotReversed.emplace_back(a, reason);
+    }
+    return RE_Transformer::transformAssertion(a);
 }
 
 // The RE transformations of the mode passes (see
@@ -2534,8 +2582,12 @@ struct ModeTransformation {
     // The RE before the transformations, and whether the starts of its
     // matches (the MatchStarts goal) are found by reversal (see failures).
     RE * mSource = nullptr;
+    // Whether lookaheads (and, if mAcceptStartsByReversal, the starts of the
+    // matches) may be matched by reversal (see RE_ModeOptions::reversal).
     bool mAllowReversal = true;
+    bool mAcceptStartsByReversal = true;
     bool mStartsByReversal = false;
+    std::vector<std::pair<Assertion *, std::string>> mLookaheadsNotReversed;
     UCD::PropertyExternalizer PE;
     re::VariableLengthCCNamer CCnamer;
     re::StringClassRepNamer SCnamer;
@@ -2548,6 +2600,13 @@ RE * ModeTransformation::transform(RE * re, RE_Goal goal) {
     // computed without them.
     mSource = re;
     if (goal == RE_Goal::SearchReplace) re = removeUnneededCaptures(re);
+    // Lookaheads without a forward strategy, matched by reversal, are named
+    // before the passes, which leave the names as they are.
+    if (mAllowReversal) {
+        ReversedLookaheadNamer RLA(mLengthAlphabet, mCodeUnitAlphabet);
+        re = RLA.transformRE(re);
+        mLookaheadsNotReversed = std::move(RLA.mNotReversed);
+    }
     RE * xfrmedRE = expandPermutes(re);
     xfrmedRE = regular_expression_passes(xfrmedRE, mLengthAlphabet, goal);
     xfrmedRE = PE.transformRE(xfrmedRE);
@@ -2594,6 +2653,9 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
     for (const auto & u : LA.mUnsupported) {
         forward.push_back(PreconditionFailure{goal, u.first, u.second});
     }
+    for (const auto & u : mLookaheadsNotReversed) {
+        forward.push_back(PreconditionFailure{goal, u.first, "and not by reversal: " + u.second});
+    }
     if (mCodeUnitAlphabet != &cc::Unicode) {
         for (const auto & m : LA.mNameMap) {
             if (m.first.compare(0, LookaheadChainPrefix.size(), LookaheadChainPrefix) == 0) {
@@ -2636,7 +2698,7 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
                               "chain (with full Unicode indexing)"});
         }
     }
-    if (!forward.empty() && (goal == RE_Goal::MatchStarts) && mAllowReversal) {
+    if (!forward.empty() && (goal == RE_Goal::MatchStarts) && mAllowReversal && mAcceptStartsByReversal) {
         const std::string reason = reversalFailure(mSource, mCodeUnitAlphabet);
         if (reason.empty()) {
             mStartsByReversal = true;
@@ -2664,11 +2726,20 @@ static std::vector<PreconditionFailure> modeFailures(const PreparedRE & prepared
     // The passes are run to check the RE, not to compile it.
     QuietREPrinting quiet;
     ModeTransformation M(lengthAlphabet, codeUnitAlphabet);
-    M.mAllowReversal = prepared.options.startsByReversal;
+    M.mAllowReversal = prepared.options.reversal;
     RE * const transformed = M.transform(prepared.re, prepared.options.goal);
     std::vector<PreconditionFailure> failures = M.failures(transformed, prepared.options.goal);
     byReversal = M.mStartsByReversal;
     return failures;
+}
+
+namespace {
+std::vector<PreconditionFailure> forwardFailures(RE * re, const cc::Alphabet * lengthAlphabet,
+                                                 const cc::Alphabet * codeUnitAlphabet) {
+    ModeTransformation M(lengthAlphabet, codeUnitAlphabet);
+    M.mAllowReversal = false;
+    return M.failures(M.transform(re, RE_Goal::MatchEnds), RE_Goal::MatchEnds);
+}
 }
 
 std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding) {
@@ -3318,7 +3389,8 @@ RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {
     ModeTransformation M(mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet);
     // (Compiled forward: the starts by reversal are chosen before, see
     // matchStartsPipeline.)
-    M.mAllowReversal = false;
+    M.mAllowReversal = mModeOptions.reversal;
+    M.mAcceptStartsByReversal = false;
     RE * const xfrmedRE = M.transform(re, goal);
     const std::vector<PreconditionFailure> failures = M.failures(xfrmedRE, goal);
     if (!failures.empty()) {

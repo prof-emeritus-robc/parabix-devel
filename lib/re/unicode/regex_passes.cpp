@@ -14,6 +14,7 @@
 #include <re/transforms/re_simplifier.h>
 #include <re/transforms/re_star_normal.h>
 #include <re/transforms/resolve_diffs.h>
+#include <re/transforms/remove_nullable.h>
 #include <re/transforms/resolve_ranges.h>
 #include <re/transforms/resolve_possessive.h>
 #include <re/transforms/capture_removal.h>
@@ -125,6 +126,11 @@ RE * regular_expression_passes(RE * re, const cc::Alphabet * lengthAlpha, RE_Goa
             }
             return simplifyRE(r);}},
         {"resolveDiffs", AllGoals, [](RE * r) {return resolveDiffs(r);}},
+        //  The starts of the matches are unchanged by matching a trailing lookahead
+        //  as part of its alternative, and by removing a nullable suffix (ab* → a).
+        {"foldTrailingLookaheads", goalBit(RE_Goal::MatchStarts), [lengthAlpha](RE * r) {
+            return foldTrailingLookaheads(r, lengthAlpha);}},
+        {"removeNullableSuffix", goalBit(RE_Goal::MatchStarts), [](RE * r) {return removeNullableSuffix(r);}},
     };
     return applyPasses(re, goal, passes);
 }

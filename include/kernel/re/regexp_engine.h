@@ -532,8 +532,9 @@ public:
     // The starts of the matches: a mark at the first code unit of each match
     // (for an empty match, at its position).  Each alternative of the RE has
     // the starts of its matches computed by the first strategy that applies:
-    // fixed length, a unique prefix (after lookbehinds) or a lookahead chain;
-    // a trailing lookahead of variable length is matched as part of it.  The RE must be prepared with the
+    // fixed length, a unique prefix (after lookbehinds), length classes (a
+    // bounded RE) or a lookahead chain; a trailing lookahead of variable length
+    // is matched as part of it, and a nullable suffix is removed.  The RE must be prepared with the
     // MatchStarts goal, which selects byte mode or full Unicode indexing (never
     // the UTF-8 indexed mode): in full Unicode indexing, the marks are at the
     // positions of characters (see usesUnicodeIndexing and getU8Index).
@@ -603,6 +604,9 @@ protected:
 
     // The starts of the matches of an alternative (see matchStartsPipeline).
     void alternativeStarts(const MatchStartsAlternative & a, kernel::StreamSet * out);
+
+    // The starts of the matches of an RE of fixed length (in code units).
+    void fixedLengthStarts(re::RE * re, int length, kernel::StreamSet * out);
 
     // The spans of the matches of an RE that is a chain (with no star
     // segment required), possibly followed by final stars, each of a class

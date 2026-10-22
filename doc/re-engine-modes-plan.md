@@ -594,7 +594,7 @@ the buffering), and one more RE kernel.
    (icgrep ctests and `-ShowREs` output unchanged).
 2. **MatchStarts public mode** with strategies 1, 3, 4 and 6 (chains, pulled
    forward), byte or full Unicode mode, its preconditions; tests.
-3. **Length-class starts** (strategy 5) and `removeNullableSuffix`.
+3. **Length-class starts** (strategy 5) and `removeNullableSuffix`. Done (see the status below).
 4. **tconv on MatchStarts**: replace `RulePipelineBuilder::matchStarts` (the
    `(?<=B)(?=T A)` trick) and the starts half of `matchPattern`; tconv
    translates its contexts and boundaries to standard REs; compare outputs
@@ -680,4 +680,24 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   22 REs over the lines of a multi-script text, compared with Python's `re`
   (`re.match(line, p)` at each position); 0.2 s with the object cache, about
   2–3 s on a first run that compiles the kernels.
+
+## Milestone 3 status
+
+- Strategy 5, length classes: a bounded alternative (after
+  `BoundedRepExpander` writes small bounded repetitions as alternations, as
+  for spans) is the alternation of its matches of each length
+  (`lengthClasses`, at most `LengthClassLimit` = 16 lengths), each shifted back
+  from its ends as a fixed-length RE (`fixedLengthStarts`). Tried after the
+  unique prefix and before the chain.
+- Strategy 2: `removeNullableSuffix` (ab* → a) and `foldTrailingLookaheads`
+  (moved to `lib/re/transforms/assertion_transformations.cpp`) are passes of
+  the table for the `MatchStarts` goal only, so `prepareRE` and the mode
+  choice see the reduced RE (`ab*` is then fixed length).
+- Mode: byte mode also for alternatives with length classes in UTF-8 code
+  units (predicted on `toUTF8` of the alternative), but never for an
+  alternative that can match the empty string: in byte mode, an empty match
+  would be found at every byte, within characters too.
+- Tests: a group of 8 more REs in `match_starts_test` (length classes in byte
+  mode, nullable suffixes, the empty RE `x*` in Unicode mode), and
+  `re_preconditions_test` cases (too many length classes).
 

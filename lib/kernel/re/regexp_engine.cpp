@@ -926,6 +926,16 @@ struct ByteModeLookaheads : public RE_Validator {
     }
 };
 
+namespace {
+// The matches of a bounded RE by their length (see below).
+using LengthClasses = std::map<int, RE *>;
+bool lengthClasses(RE * re, const cc::Alphabet * alphabet, unsigned limit, LengthClasses & classes);
+// The limit on the number of length classes of an RE.
+const unsigned LengthClassLimit = 16;
+// Small bounded repetitions written out as alternations (BoundedRepExpander).
+RE * expandBoundedReps(RE * re, const cc::Alphabet * lengthAlphabet);
+}
+
 static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     RE_Mode mode;
     // Determine the unit of length for the RE.  If the RE involves
@@ -950,9 +960,10 @@ static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
         useFixedUTF8 = false;
     }
     // The starts of the matches (and search and replace) are computed in code
-    // units: in byte mode only for alternatives of fixed length (shifted back
-    // from their ends), and otherwise with full Unicode indexing, never the
-    // UTF-8 indexed mode.
+    // units: in byte mode only for alternatives of fixed length or with length
+    // classes in UTF-8 code units (shifted back from their ends), which match
+    // at least one character (an empty match would be found at every byte),
+    // and otherwise with full Unicode indexing, never the UTF-8 indexed mode.
     const bool codeUnitGoal = (opts.goal == RE_Goal::MatchStarts) || (opts.goal == RE_Goal::SearchReplace);
     if (useFixedUTF8 && codeUnitGoal) {
         std::vector<RE *> alts;
@@ -961,9 +972,17 @@ static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
         } else {
             alts.push_back(re);
         }
+        // (Checking only: the passes print nothing.)
+        QuietREPrinting quiet;
         for (RE * a : alts) {
             const auto range = getLengthRange(a, &cc::UTF8);
-            if (range.first != range.second) useFixedUTF8 = false;
+            LengthClasses classes;
+            if (range.first == 0) {
+                useFixedUTF8 = false;
+            } else if ((range.first != range.second) &&
+                    !lengthClasses(expandBoundedReps(toUTF8(a), &cc::UTF8), &cc::UTF8, LengthClassLimit, classes)) {
+                useFixedUTF8 = false;
+            }
         }
     }
     if (useFixedUTF8) {
@@ -1730,8 +1749,6 @@ namespace {
 // assertions, such as the alternative (?!X) of a possessive X?+, have length
 // 0.)  Returns false if the RE is not of this form, or would have more than
 // limit classes at any step.
-using LengthClasses = std::map<int, RE *>;
-
 bool lengthClasses(RE * re, const cc::Alphabet * alphabet, unsigned limit, LengthClasses & classes) {
     classes.clear();
     const auto range = getLengthRange(re, alphabet);
@@ -1785,7 +1802,7 @@ bool RE_PipelineBuilder::lengthClassSpans(RE * re, StreamSet * spans) {
     // Spans are counted in code units.
     if (mCtxt.mIndexStream != nullptr) return false;
     LengthClasses classes;
-    if (!lengthClasses(re, mCtxt.mLengthAlphabet, 16, classes)) return false;
+    if (!lengthClasses(re, mCtxt.mLengthAlphabet, LengthClassLimit, classes)) return false;
     // Empty matches have no spans.
     classes.erase(0);
     if (classes.empty()) return false;
@@ -2045,10 +2062,12 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
 //                 followed by a suffix that is not nullable: the matches of the
 //                 prefix that begin matches, restricted to where the
 //                 lookbehinds hold;
+//   LengthClasses: a bounded RE, as the alternation of its matches of each
+//                 length (lengthClasses), each of fixed length;
 //   Chain:        a lookahead chain with final stars (parseChainForm), with
 //                 Unicode code units.
 //
-enum class StartsStrategy {FixedLength, UniquePrefix, Chain};
+enum class StartsStrategy {FixedLength, UniquePrefix, LengthClasses, Chain};
 
 struct MatchStartsAlternative {
     RE * re = nullptr;
@@ -2056,6 +2075,7 @@ struct MatchStartsAlternative {
     std::vector<RE *> lookbehinds;      // UniquePrefix
     RE * prefix = nullptr;              // UniquePrefix
     RE * suffix = nullptr;              // UniquePrefix
+    std::map<int, RE *> classes;        // LengthClasses: by length
     ChainForm chain;                    // Chain
 };
 
@@ -2085,6 +2105,10 @@ static bool startsStrategy(RE * re, const cc::Alphabet * lengthAlphabet, const c
             a.suffix = suffix;
             return true;
         }
+    }
+    if (lengthClasses(expandBoundedReps(re, lengthAlphabet), lengthAlphabet, LengthClassLimit, a.classes)) {
+        a.strategy = StartsStrategy::LengthClasses;
+        return true;
     }
     if ((codeUnitAlphabet == &cc::Unicode) && parseChainForm(re, lengthAlphabet, a.chain)) {
         a.strategy = StartsStrategy::Chain;
@@ -2184,20 +2208,33 @@ void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, Stream
     mPB.CreateKernelCall<StreamsMerge>(allStarts, starts);
 }
 
+void RE_PipelineBuilder::fixedLengthStarts(RE * re, int length, StreamSet * out) {
+    // A match of length L marked at its last code unit plus the offset g
+    // begins L - 1 + g positions before the mark.
+    const int shift = std::max(0, length - 1 + static_cast<int>(grepOffset(re)));
+    if (shift == 0) {
+        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, out);
+    } else {
+        StreamSet * const ends = mPB.CreateStreamSet(1);
+        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, re, ends);
+        mPB.CreateKernelCall<ShiftBack>(ends, out, shift);
+    }
+}
+
 void RE_PipelineBuilder::alternativeStarts(const MatchStartsAlternative & a, StreamSet * out) {
     // Code units are positions: the starts are marked in code units.
     assert(mCtxt.mIndexStream == nullptr);
     if (a.strategy == StartsStrategy::FixedLength) {
-        // A match of length L marked at its last code unit plus the offset g
-        // begins L - 1 + g positions before the mark.
-        const int length = getLengthRange(a.re, mCtxt.mLengthAlphabet).first;
-        const int shift = std::max(0, length - 1 + static_cast<int>(grepOffset(a.re)));
-        if (shift == 0) {
-            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, a.re, out);
-        } else {
-            StreamSet * const ends = mPB.CreateStreamSet(1);
-            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, a.re, ends);
-            mPB.CreateKernelCall<ShiftBack>(ends, out, shift);
+        fixedLengthStarts(a.re, getLengthRange(a.re, mCtxt.mLengthAlphabet).first, out);
+    } else if (a.strategy == StartsStrategy::LengthClasses) {
+        std::vector<StreamSet *> classStarts;
+        for (const auto & c : a.classes) {
+            StreamSet * const s = (a.classes.size() == 1) ? out : mPB.CreateStreamSet(1);
+            fixedLengthStarts(c.second, c.first, s);
+            classStarts.push_back(s);
+        }
+        if (classStarts.size() > 1) {
+            mPB.CreateKernelCall<StreamsMerge>(classStarts, out);
         }
     } else if (a.strategy == StartsStrategy::UniquePrefix) {
         // The ends of the matches, shifted back to the preceding match of the
@@ -2277,6 +2314,10 @@ protected:
 private:
     const cc::Alphabet * mAlphabet;
 };
+
+RE * expandBoundedReps(RE * re, const cc::Alphabet * lengthAlphabet) {
+    return BoundedRepExpander(lengthAlphabet).transformRE(re);
+}
 }
 
 namespace {
@@ -2353,42 +2394,9 @@ struct ModeTransformation {
     re::LookAheadNamer LA;
 };
 
-// For the starts of the matches, a positive lookahead (?=C) of variable length
-// at the end of an alternative R (?=C) is matched as part of it: the starts of
-// R (?=C) are those of RC.  (A lookahead of fixed length is compiled with R.)
-RE * foldTrailingLookaheads(RE * re, const cc::Alphabet * lengthAlphabet) {
-    if (Alt * const alt = dyn_cast<Alt>(re)) {
-        std::vector<RE *> folded;
-        bool changed = false;
-        for (RE * a : *alt) {
-            folded.push_back(foldTrailingLookaheads(a, lengthAlphabet));
-            changed |= (folded.back() != a);
-        }
-        return changed ? makeAlt(folded.begin(), folded.end()) : re;
-    }
-    std::vector<RE *> elems;
-    if (Seq * const seq = dyn_cast<Seq>(re)) {
-        elems.assign(seq->begin(), seq->end());
-    } else {
-        elems.push_back(re);
-    }
-    if (elems.empty()) return re;
-    Assertion * const a = dyn_cast<Assertion>(elems.back());
-    if ((a == nullptr) || (a->getKind() != Assertion::Kind::LookAhead) || (a->getSense() != Assertion::Sense::Positive)) {
-        return re;
-    }
-    const auto range = getLengthRange(a->getAsserted(), lengthAlphabet);
-    if (range.first == range.second) return re;
-    elems.back() = a->getAsserted();
-    return makeSeq(elems.begin(), elems.end());
-}
-
 RE * ModeTransformation::transform(RE * re, RE_Goal goal) {
     RE * xfrmedRE = expandPermutes(re);
     xfrmedRE = regular_expression_passes(xfrmedRE, mLengthAlphabet, goal);
-    if (goal == RE_Goal::MatchStarts) {
-        xfrmedRE = foldTrailingLookaheads(xfrmedRE, mLengthAlphabet);
-    }
     xfrmedRE = PE.transformRE(xfrmedRE);
     // CCs of characters of more than one UTF-8 length are computed as externals
     // when the code units are UTF-8.  (With Unicode code units, every CC is one
@@ -2470,8 +2478,9 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
         for (RE * u : unsupported) {
             failures.push_back(PreconditionFailure{goal, u,
                                "no strategy for the starts of the matches: not of fixed length, without a unique "
-                               "prefix of fixed length followed by a suffix that is not nullable, and not a "
-                               "lookahead chain (with full Unicode indexing)"});
+                               "prefix of fixed length followed by a suffix that is not nullable, not bounded with "
+                               "at most " + std::to_string(LengthClassLimit) + " lengths, and not a lookahead "
+                               "chain (with full Unicode indexing)"});
         }
     }
     return failures;

@@ -51,6 +51,16 @@ GROUPS = [
         ("é+", "é+"),
         ("a+b", "a+b"),
     ],
+    [   # length classes (bounded REs) and nullable suffixes
+        ("[ab]{1,3}c", "[ab]{1,3}c"),
+        ("a{2,4}", "a{2,4}"),
+        ("é?a", "é?a"),
+        ("(?:ab|b)c?", "(?:ab|b)c?"),
+        ("ab*", "ab*"),
+        ("x*", "x*"),
+        ("(?:ab)+c*", "(?:ab)+c*"),
+        ("b{2,}", "b{2,}"),
+    ],
 ]
 
 

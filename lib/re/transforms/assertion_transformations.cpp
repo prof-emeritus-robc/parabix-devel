@@ -6,6 +6,7 @@
 #include <re/transforms/assertion_transformations.h>
 
 #include <llvm/Support/Casting.h>
+#include <vector>
 #include <re/adt/adt.h>
 #include <re/analysis/nullable.h>
 #include <re/analysis/re_analysis.h>
@@ -245,6 +246,36 @@ private:
 
 RE * standardizeAssertions(RE * r, const cc::Alphabet * lengthAlpha) {
     return AssertionStandardizer(lengthAlpha).transformRE(r);
+}
+
+// For the starts of the matches, a positive lookahead (?=C) of variable length
+// at the end of an alternative R (?=C) is matched as part of it: the starts of
+// R (?=C) are those of RC.  (A lookahead of fixed length is compiled with R.)
+RE * foldTrailingLookaheads(RE * re, const cc::Alphabet * lengthAlphabet) {
+    if (Alt * const alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> folded;
+        bool changed = false;
+        for (RE * a : *alt) {
+            folded.push_back(foldTrailingLookaheads(a, lengthAlphabet));
+            changed |= (folded.back() != a);
+        }
+        return changed ? makeAlt(folded.begin(), folded.end()) : re;
+    }
+    std::vector<RE *> elems;
+    if (Seq * const seq = dyn_cast<Seq>(re)) {
+        elems.assign(seq->begin(), seq->end());
+    } else {
+        elems.push_back(re);
+    }
+    if (elems.empty()) return re;
+    Assertion * const a = dyn_cast<Assertion>(elems.back());
+    if ((a == nullptr) || (a->getKind() != Assertion::Kind::LookAhead) || (a->getSense() != Assertion::Sense::Positive)) {
+        return re;
+    }
+    const auto range = getLengthRange(a->getAsserted(), lengthAlphabet);
+    if (range.first == range.second) return re;
+    elems.back() = a->getAsserted();
+    return makeSeq(elems.begin(), elems.end());
 }
 
 } // namespace re

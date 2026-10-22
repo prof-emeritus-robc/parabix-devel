@@ -44,6 +44,9 @@ const PreconditionCase Cases[] = {
     {"(?<=a)q[a-z]*u", RE_Goal::MatchStarts, &cc::UTF8, true},     // unique prefix
     {"[a-z]+ing", RE_Goal::MatchStarts, &cc::UTF8, true},          // chain (Unicode mode)
     {"ab(?=c+d)", RE_Goal::MatchStarts, &cc::UTF8, true},          // trailing lookahead folded
+    {"[ab]{1,3}c", RE_Goal::MatchStarts, &cc::UTF8, true},         // length classes (byte mode)
+    {"(?:ab|b)c*", RE_Goal::MatchStarts, &cc::UTF8, true},         // nullable suffix removed
+    {"(?:ab|b){1,9}c", RE_Goal::MatchStarts, &cc::Unicode, false}, // too many length classes
     {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::UTF8, false},         // no strategy
     {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::Unicode, false},
     {"abc", RE_Goal::SearchReplace, &cc::UTF8, false},             // not yet implemented

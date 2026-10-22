@@ -604,7 +604,8 @@ the buffering), and one more RE kernel.
 6. **S&R, literal replacements**: U1, U2, no overlap; precondition analyses
    for them; a small `resub`-style tool (or an icgrep `--replace` option) to
    exercise it. Done, with overlapping matches that end together (see the status below).
-7. **S&R, captures**: U3 analysis, capture boundaries, `captureSpans`.
+7. **S&R, captures**: U3 analysis, capture boundaries, `captureSpans`. Done,
+   with captured text kept in place (see the status below).
 8. **tconv on S&R**: string rules and MultipleCaptureMultipleReplacement sets
    through the engine, with functions applied by tconv to `captureSpans`;
    tconv keeps rule ordering, filters, insertions, cursors and deferred rules.
@@ -801,3 +802,61 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   6 rejections, -n -H over two files; 0.7 s with the object cache), and search
   and replace cases in `re_preconditions_test`.
 
+## Milestone 7 status
+
+- U3 analysis, `re::planCaptureWalk` (`re/analysis/replacement_analysis.h`): each
+  referenced capture is on every path of the search pattern (not within a
+  repetition, an alternation or an assertion), and each of its boundaries (its
+  start and its follow, the position after it) is found by a `CaptureWalk`:
+  - forward from the start of the match, over items of fixed length, or of
+    variable length whose characters are all of a class X, when the characters
+    that can follow such an item within the match are not of X (or it is
+    followed by `(?!Y)` with Y including X, or by `End`): its match is then the
+    run of X (`ScanThru` over X within the match). This generalises the
+    maximal runs of the plan (`[a-z]*`, prepared as `[a-z]+|ε`, or `(?:ab|c)`
+    before `x`);
+  - or back from the follow of the match, when the items after the boundary
+    have a fixed length (`#([a-z0-9]*)([0-9]);`).
+- A reference is folded into a literal only for a capture on every path
+  (`(?:(a)|b)c` with `$1` was folded before; the group may be unset).
+- Replacement assembly (`searchReplacePipeline`): the text of the referenced
+  captures stays in place and the rest of each selected match is deleted; the
+  literal pieces are inserted before anchors: the piece before reference j
+  before the start of its capture, the last piece before the follow of the
+  match (before its start, without references). The pieces inserted at one
+  position belong to the match that ends there, then to the match that it is
+  in; one insertion pass inserts a block of all the slots (in that order)
+  before every anchor, of which only the slots anchored there are kept
+  (`ReplacementAnchors`, `FillSlots`, in place of milestone 6's
+  `FillReplacement` after each kept start). A capture whose prefix is not nullable
+  never starts at a match start, so its start at a match follow is its own
+  match's follow; a capture whose prefix is nullable has a suffix that is not
+  (U2), so its start is within its match.
+- Precondition: the references are in the order of their captures in the
+  search pattern, each capture referred to once and not within another.
+  Moving or copying captured text (`$2$1`, `$1$1`) is not yet supported (a
+  later capability; swaps could use region reversal, as tconv does).
+- Mode: a replacement with references that are not folded selects full
+  Unicode indexing (`prepareSearchReplace`), as the walks are over characters.
+- The search pattern is compiled without the captures that only the
+  replacement refers to (`ModeTransformation` for `SearchReplace`), so that
+  the starts strategies (chains, unique prefixes) see through them; the walks
+  use the prepared pattern with its captures.
+- Without match regions, the text is extended by one position when a piece
+  may be inserted before the follow of a match at the end of the text.
+- `RE_PipelineBuilder::captureSpansPipeline(sr, captures, spans)`: for each
+  capture named, its start, coverage and follow (a follow rather than an end,
+  for empty captures), over characters.
+- Fix (milestone 6): `LeftmostMatchSelection` took the position after the end
+  of a match as covered when it was itself an end, so that a one-character
+  match directly after another was not replaced (`@[a-z]*(?![a-z])` on `@ab@`).
+- Not supported, as before: `([a-z]+)@([a-z]+)(?![a-z])` (a match may end
+  within another, `a@b@c`), which needs the sequential selection.
+- Tests: `replace_test` (10 more replacements with references, compared with
+  `re.sub`, among them empty captures at a match follow, adjacent matches and
+  boundaries from the end; 5 more rejections; its icgrep runs now three at a
+  time, 0.6–0.8 s with the object cache), `capture_spans_test` (new:
+  `tests/capture_spans.cpp`, `capture_spans_test.py`, the spans of 9 captures
+  compared with `re.finditer`, with and without match regions; 0.5 s with the
+  object cache), walks and folding in `re_replacement_test`, search and
+  replace cases with captures in `re_preconditions_test`.

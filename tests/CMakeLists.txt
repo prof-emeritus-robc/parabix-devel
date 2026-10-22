@@ -64,7 +64,7 @@ add_test(NAME re_preconditions_test
 
 # Replacement patterns of search and replace and their analyses (no pipeline compiled)
 parabix_add_executable(NAME re_replacement SRC re_replacement.cpp
-                       DEPS re.parse re.analysis re.adt toolchain)
+                       DEPS re.parse re.analysis re.adt re.unicode toolchain)
 add_test(NAME re_replacement_test
     WORKING_DIRECTORY ${TEST_BIN_DIR}
     COMMAND ./re_replacement)
@@ -75,6 +75,13 @@ parabix_add_executable(NAME match_starts SRC match_starts.cpp
 add_test(NAME match_starts_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/match_starts_test.py ${TEST_BIN_DIR}/match_starts)
+
+# The boundaries of captures in a search and replace, checked with Python's re
+parabix_add_executable(NAME capture_spans SRC capture_spans.cpp
+                       DEPS kernel.re kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.util re.parse toolchain)
+add_test(NAME capture_spans_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/capture_spans_test.py ${TEST_BIN_DIR}/capture_spans)
 
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests

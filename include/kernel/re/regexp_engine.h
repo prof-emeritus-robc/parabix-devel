@@ -13,7 +13,7 @@
 #include <re/unicode/regex_passes.h>
 #include <pablo/pablo.h>
 namespace kernel { class StreamSet; }
-namespace re { struct LookaheadSegment; }
+namespace re { struct LookaheadSegment; struct CaptureWalk; }
 struct ChainForm;
 struct MatchStartsAlternative;
 namespace cc { class Alphabet; }
@@ -122,8 +122,8 @@ PreparedRE prepareRE(re::RE * re, const RE_ModeOptions & opts = RE_ModeOptions{}
 // which requires Unicode code units) and of the back references (to captures
 // of fixed length at fixed distances, of enumerated or codepoint properties).
 // For the MatchStarts goal, each alternative must have a strategy for the
-// starts of its matches (see matchStartsPipeline).  The SearchReplace goal is
-// not yet implemented.
+// starts of its matches (see matchStartsPipeline).  A search and replace has
+// further preconditions (see checkPreconditions for PreparedSearchReplace).
 //
 struct PreconditionFailure {
     re::RE_Goal goal;
@@ -157,7 +157,10 @@ PreparedSearchReplace prepareSearchReplace(re::RE * search, re::RE * replacement
 // and no match may end within another (re::matchEndsUnique), so that the
 // matches replaced are the same whatever the matching conventions; every
 // reference of the replacement must be to a capture of the search pattern,
-// and (so far) to a capture that matches one string only.
+// and a capture that does not match one string only (which is folded into
+// the literal text) must have unique boundaries found by a re::CaptureWalk,
+// the references being in the order of the captures in the search pattern,
+// each capture referred to once and not within another.
 std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace & sr,
                                                     const cc::Alphabet * sourceEncoding = &cc::UTF8);
 
@@ -567,8 +570,9 @@ public:
 
     // The text with the matches of the search pattern replaced: the first
     // start of each set of overlapping matches is replaced (as every matching
-    // convention selects matches from the left), with the replacement (so far,
-    // a literal string).  output: the UTF-8 code units of the result, as a
+    // convention selects matches from the left), with the replacement: its
+    // literal text, and the text of the captures it refers to, which stay in
+    // place (references in the order of the captures in the search pattern).  output: the UTF-8 code units of the result, as a
     // byte stream.  With match regions (see RE_context), also the region
     // follows of the result (follows) and those of the regions in which a
     // match was replaced (replaced), at their positions in the result; the
@@ -576,6 +580,20 @@ public:
     // checkPreconditions) must hold: a failure is fatal.
     void searchReplacePipeline(const PreparedSearchReplace & sr, kernel::StreamSet * output,
                                kernel::StreamSet * follows = nullptr, kernel::StreamSet * replaced = nullptr);
+
+    // The captures named (see re::capturesByName) in the matches replaced by
+    // searchReplacePipeline, for clients that transform captured text
+    // themselves: for each capture, three streams, marking its start (its
+    // first character, or the position of an empty capture), its coverage,
+    // and its follow (the position after its last character).  The positions
+    // are those of the characters of the text (full Unicode indexing, which
+    // prepareSearchReplace selects for a replacement with references to
+    // captures of more than one string); without match regions, the text is
+    // extended by one position, which a follow may mark.  The preconditions
+    // of the search and replace must hold, and the boundaries of each capture
+    // must be found by a re::CaptureWalk: a failure is fatal.
+    void captureSpansPipeline(const PreparedSearchReplace & sr, const std::vector<std::string> & captures,
+                              kernel::StreamSet * spans);
     kernel::PipelineBuilder & getPipelineBuilder() {return mPB;}
 
 protected:
@@ -684,6 +702,22 @@ protected:
     // Use the mode and options of a prepared RE.
     void usePrepared(const PreparedRE & prepared);
 
+    // The matches of a search and replace selected from the left (see
+    // searchReplacePipeline): the selected starts, the ends (last positions)
+    // of all matches, the positions of the selected matches (covered), and
+    // the positions not covered (keep, less the extension of the text).
+    struct SelectedMatches {
+        kernel::StreamSet * selected = nullptr;
+        kernel::StreamSet * ends = nullptr;
+        kernel::StreamSet * covered = nullptr;
+        kernel::StreamSet * keep = nullptr;
+    };
+    SelectedMatches selectMatches(const PreparedSearchReplace & sr, bool extendText);
+
+    // The starts and follows of the captures of a walk in the selected
+    // matches (two streams per capture), with Unicode code units.
+    kernel::StreamSet * captureBoundaries(const re::CaptureWalk & walk, const SelectedMatches & m);
+
     // Mode determination + source preparation, run once before compiling.
     void ensurePrepared(re::RE *& re);
 
@@ -708,6 +742,8 @@ private:
     // Was the text extended by one position, as one match region (see
     // ensurePrepared)?  Its region follow (the only one) is that position.
     bool mTextExtended = false;
+    // Extend the text without match regions in any case (see ensurePrepared).
+    bool mExtendText = false;
 };
 
 //

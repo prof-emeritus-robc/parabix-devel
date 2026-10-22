@@ -102,7 +102,15 @@ int main(int argc, char * argv[]) {
             {"ab|abc", "X", false},                  // longest or first
             {"x{2}", "X", false},                    // overlapping matches with different ends
             {"x*", "X", false},                      // empty matches
-            {"([a-z]+)@", "$1", false},              // a reference (not yet supported)
+            {"([a-z]+)@", "$1", true},               // a capture of a maximal run, from the start
+            {"([a-z]+)@([a-z]+)\\.", "$1-$2", true},
+            {"#([a-z0-9]*)([0-9]);", "$1.$2", true},  // boundaries from the end of the match
+            {"([a-z]+)@([a-z]+)\\.", "$2$1", false}, // captures out of order (moved)
+            {"([a-z]+)@", "$1$1", false},            // a capture copied
+            {"(([a-z])[a-z]*)@", "$1$2", false},     // a capture within another
+            {"(?:(a)|b)c", "$1", false},             // a capture on one path only (not folded)
+            {"([a-z])+@", "$1", false},              // a capture within a repetition
+            {"#([a-z0-9]*)([0-9]+);", "$1", false},  // the end of the capture is not found
         };
         for (const SearchReplaceCase & c : cases) {
             RE * const search = RE_Parser::parse(c.search);

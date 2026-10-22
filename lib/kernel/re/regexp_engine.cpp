@@ -41,6 +41,7 @@
 #include <re/unicode/regex_passes.h>
 #include <re/transforms/to_utf8.h>
 #include <re/transforms/re_multiplex.h>
+#include <re/transforms/capture_removal.h>
 #include <re/transforms/expand_permutes.h>
 #include <re/transforms/name_lookaheads.h>
 #include <re/transforms/reference_transform.h>
@@ -1029,6 +1030,15 @@ PreparedRE prepareRE(RE * re, const RE_ModeOptions & opts) {
 PreparedSearchReplace prepareSearchReplace(RE * search, RE * replacement, const RE_ModeOptions & opts) {
     RE_ModeOptions o = opts;
     o.goal = RE_Goal::SearchReplace;
+    // Captured text is kept with full Unicode indexing (the boundaries of
+    // captures are found by walks over characters, see re::CaptureWalk), for
+    // references that are not folded into literals.
+    std::vector<re::ReplacementItem> items;
+    if (replacement && foldReplacement(replacement, search, items)) {
+        for (const re::ReplacementItem & item : items) {
+            if (item.reference) o.forceUnicodeIndexing = true;
+        }
+    }
     PreparedSearchReplace sr;
     sr.search = prepareFor(search, o, replacement);
     sr.replacement = replacement;
@@ -1161,11 +1171,12 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
 
     // Without match regions, Start and End match at the start and the end of
     // the text: if the RE refers to the end of the text (End, or a negative
-    // lookahead, which holds there), the text (of bit streams) is made one
+    // lookahead, which holds there), or a pipeline needs the follow of the
+    // last match to be a position (mExtendText), the text (of bit streams) is made one
     // match region, from its first position to the position after its last
     // code unit, which the text is extended by (as an unterminated last line
     // is in grep).  The results then have that position too.
-    if ((matchStarts == nullptr) && (source->getFieldWidth() == 1) && hasEndAnchorAnywhere(re)) {
+    if ((matchStarts == nullptr) && (source->getFieldWidth() == 1) && (mExtendText || hasEndAnchorAnywhere(re))) {
         StreamSet * const extended = mPB.CreateStreamSet(source->getNumElements(), 1);
         mPB.CreateKernelCall<ExtendByOne>(source, extended);
         matchFollows = mPB.CreateStreamSet(1, 1);
@@ -2418,6 +2429,10 @@ struct ModeTransformation {
 };
 
 RE * ModeTransformation::transform(RE * re, RE_Goal goal) {
+    // The captures of a search and replace that only the replacement refers
+    // to are found from its matches (see re::CaptureWalk): the matches are
+    // computed without them.
+    if (goal == RE_Goal::SearchReplace) re = removeUnneededCaptures(re);
     RE * xfrmedRE = expandPermutes(re);
     xfrmedRE = regular_expression_passes(xfrmedRE, mLengthAlphabet, goal);
     xfrmedRE = PE.transformRE(xfrmedRE);
@@ -2539,20 +2554,19 @@ namespace {
 // another (re::matchEndsUnique): overlapping matches then end at the same
 // position, and a start is selected unless it is within the match of an
 // earlier start.  Selected: the selected starts; Covered: the positions of the
-// selected matches; Keep: the positions kept when the matches are replaced
-// (not covered, other than the starts if keepStarts), less those of Drop.
+// selected matches; Keep: the positions not covered, less those of Drop.
 class LeftmostMatchSelection final : public pablo::PabloKernel {
 public:
     LeftmostMatchSelection(LLVMTypeSystemInterface & ts, StreamSet * Starts, StreamSet * Ends, StreamSet * Drop,
-                           bool keepStarts, StreamSet * Selected, StreamSet * Covered, StreamSet * Keep)
-    : PabloKernel(ts, std::string("LeftmostMatchSelection") + (Drop ? "_drop" : "") + (keepStarts ? "_keep" : ""),
+                           StreamSet * Selected, StreamSet * Covered, StreamSet * Keep)
+    : PabloKernel(ts, std::string("LeftmostMatchSelection") + (Drop ? "_drop" : ""),
                   [&] {
                       Bindings inputs{Binding{"Starts", Starts}, Binding{"Ends", Ends}};
                       if (Drop) inputs.emplace_back("Drop", Drop);
                       return inputs;
                   }(),
                   {Binding{"Selected", Selected}, Binding{"Covered", Covered}, Binding{"Keep", Keep}}),
-      mHasDrop(Drop != nullptr), mKeepStarts(keepStarts) {}
+      mHasDrop(Drop != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -2560,16 +2574,15 @@ protected:
         PabloAST * const E = getInputStreamSet("Ends")[0];
         PabloAST * const notE = pb.createNot(E);
         // The positions from marks M through the next end: the next end of each
-        // mark is the end of its match.
+        // mark is the end of its match.  (MatchStar over the positions other
+        // than ends stops at the next end, which it includes.)
         auto through = [&](PabloAST * M) {
-            PabloAST * const run = pb.createMatchStar(pb.createAnd(M, notE), notE);
-            return pb.createOr(pb.createOr(pb.createAnd(M, E), run), pb.createAnd(pb.createAdvance(run, 1), E));
+            return pb.createOr(pb.createAnd(M, E), pb.createMatchStar(pb.createAnd(M, notE), notE));
         };
         PabloAST * const inside = through(pb.createAdvance(pb.createAnd(S, notE), 1));
         PabloAST * const selected = pb.createAnd(S, pb.createNot(inside), "selected");
         PabloAST * const covered = through(selected);
         PabloAST * keep = pb.createNot(covered);
-        if (mKeepStarts) keep = pb.createOr(keep, selected);
         if (mHasDrop) keep = pb.createAnd(keep, pb.createNot(getInputStreamSet("Drop")[0]));
         writeOutputStreamSet("Selected", std::vector<PabloAST *>{selected});
         writeOutputStreamSet("Covered", std::vector<PabloAST *>{covered});
@@ -2577,7 +2590,6 @@ protected:
     }
 private:
     const bool mHasDrop;
-    const bool mKeepStarts;
 };
 
 // The bixnum of a constant count at the marked positions (zero elsewhere).
@@ -2602,44 +2614,260 @@ private:
     const unsigned mBits;
 };
 
-// The code units of a literal replacement written at each anchor and the
-// positions after it: code unit k at Advance(Anchors, k).  The text is
-// otherwise unchanged.
-class FillReplacement final : public pablo::PabloKernel {
+std::string captureWalkSignature(const re::CaptureWalk & walk) {
+    std::string s;
+    for (const re::CaptureWalk::Step & step : walk.steps) {
+        if (step.run) {
+            s += "r[";
+            for (const auto & r : *step.run) s += std::to_string(r.first) + "-" + std::to_string(r.second) + ",";
+            s += "]";
+        } else {
+            s += "a" + std::to_string(step.length);
+        }
+    }
+    auto boundary = [&](const re::CaptureWalk::Boundary & b) {
+        s += (b.fromEnd ? "b" : "f") + std::to_string(b.at);
+    };
+    for (const re::CaptureWalk::CaptureBoundaries & c : walk.captures) {
+        s += "|";
+        boundary(c.start);
+        boundary(c.follow);
+    }
+    return s;
+}
+
+unsigned captureWalkLookahead(const re::CaptureWalk & walk) {
+    unsigned la = 1;
+    for (const re::CaptureWalk::CaptureBoundaries & c : walk.captures) {
+        if (c.start.fromEnd) la = std::max(la, c.start.at);
+        if (c.follow.fromEnd) la = std::max(la, c.follow.at);
+    }
+    return la;
+}
+
+// The boundaries of captures in the selected matches (see re::CaptureWalk),
+// over Unicode code units (Basis): for each capture, its start and its follow
+// (Marks, two streams per capture).  Starts: the selected starts; Ends: the
+// ends of the matches, of which those of the selected ones are Covered.
+class CaptureBoundaries final : public pablo::PabloKernel {
 public:
-    FillReplacement(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & units, StreamSet * Text,
-                    StreamSet * Anchors, StreamSet * Filled)
-    : PabloKernel(ts, "FillReplacement" + std::to_string(Text->getNumElements()) + "_" + [&] {
-                      std::string sig;
-                      for (unsigned u : units) sig += std::to_string(u) + ",";
-                      return getStringHash(sig);
-                  }(),
-                  {Binding{"Text", Text}, Binding{"Anchors", Anchors}}, {Binding{"Filled", Filled}}),
-      mUnits(units) {}
+    CaptureBoundaries(LLVMTypeSystemInterface & ts, const re::CaptureWalk & walk, StreamSet * Basis,
+                      StreamSet * Starts, StreamSet * Ends, StreamSet * Covered, StreamSet * Marks)
+    : PabloKernel(ts, "CaptureBoundaries_" + getStringHash(captureWalkSignature(walk)),
+                  {Binding{"Basis", Basis}, Binding{"Starts", Starts},
+                   Binding{"Ends", Ends, FixedRate(1), LookAhead(captureWalkLookahead(walk))},
+                   Binding{"Covered", Covered, FixedRate(1), LookAhead(captureWalkLookahead(walk))}},
+                  {Binding{"Marks", Marks}}),
+      mWalk(walk) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        std::vector<PabloAST *> text = getInputStreamSet("Text");
-        PabloAST * const anchors = getInputStreamSet("Anchors")[0];
-        std::vector<PabloAST *> at;
-        PabloAST * any = pb.createZeroes();
-        for (unsigned k = 0; k < mUnits.size(); k++) {
-            at.push_back((k == 0) ? anchors : pb.createAdvance(anchors, k));
-            any = pb.createOr(any, at.back());
-        }
-        std::vector<PabloAST *> filled;
-        for (unsigned b = 0; b < text.size(); b++) {
-            PabloAST * bit = pb.createAnd(text[b], pb.createNot(any));
-            for (unsigned k = 0; k < mUnits.size(); k++) {
-                if ((mUnits[k] >> b) & 1) bit = pb.createOr(bit, at[k]);
+        cc::Parabix_CC_Compiler_Builder ccc(getInputStreamSet("Basis"));
+        PabloAST * const ends = getInputStreamSet("Ends")[0];
+        PabloAST * const covered = getInputStreamSet("Covered")[0];
+        // The cursor after each step of the walk from the starts.
+        std::vector<PabloAST *> at{getInputStreamSet("Starts")[0]};
+        for (const re::CaptureWalk::Step & step : mWalk.steps) {
+            if (step.run) {
+                at.push_back(pb.createScanThru(at.back(), pb.createAnd(ccc.compileCC(step.run, pb), covered)));
+            } else {
+                at.push_back(pb.createAdvance(at.back(), step.length));
             }
-            filled.push_back(bit);
         }
-        writeOutputStreamSet("Filled", filled);
+        // Back from the follows of the selected matches (the positions after
+        // their ends).
+        auto boundary = [&](const re::CaptureWalk::Boundary & b) -> PabloAST * {
+            if (!b.fromEnd) return at[b.at];
+            if (b.at == 0) return pb.createAdvance(pb.createAnd(ends, covered), 1);
+            if (b.at == 1) return pb.createAnd(ends, covered);
+            return pb.createAnd(pb.createLookahead(ends, b.at - 1), pb.createLookahead(covered, b.at - 1));
+        };
+        std::vector<PabloAST *> marks;
+        for (const re::CaptureWalk::CaptureBoundaries & c : mWalk.captures) {
+            marks.push_back(boundary(c.start));
+            marks.push_back(boundary(c.follow));
+        }
+        writeOutputStreamSet("Marks", marks);
     }
 private:
-    const std::vector<unsigned> mUnits;
+    const re::CaptureWalk mWalk;
 };
+
+// The positions from the start S of a capture to the position before its follow F.
+PabloAST * captureCoverage(PabloBuilder & pb, PabloAST * S, PabloAST * F) {
+    PabloAST * const notF = pb.createNot(F);
+    return pb.createAnd(pb.createMatchStar(pb.createAnd(S, notF), notF), notF);
+}
+
+// The starts, coverage and follows of captures, given their starts and
+// follows (CaptureBoundaries).
+class CaptureSpans final : public pablo::PabloKernel {
+public:
+    CaptureSpans(LLVMTypeSystemInterface & ts, StreamSet * Marks, StreamSet * Spans)
+    : PabloKernel(ts, "CaptureSpans" + std::to_string(Marks->getNumElements()),
+                  {Binding{"Marks", Marks}}, {Binding{"Spans", Spans}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> marks = getInputStreamSet("Marks");
+        std::vector<PabloAST *> spans;
+        for (unsigned j = 0; j + 1 < marks.size(); j += 2) {
+            spans.push_back(marks[j]);
+            spans.push_back(captureCoverage(pb, marks[j], marks[j + 1]));
+            spans.push_back(marks[j + 1]);
+        }
+        writeOutputStreamSet("Spans", spans);
+    }
+};
+
+// A literal piece of a replacement, inserted before an anchor of a match: its
+// start, its follow (the position after its last code unit), or the start of
+// a capture, possibly only where that is (or is not) the follow of the match.
+struct ReplacementSlot {
+    enum class Anchor {Start, Follow, CaptureStart};
+    enum class When {Always, AtFollow, NotAtFollow};
+    Anchor anchor;
+    unsigned capture;
+    When when;
+    std::vector<unsigned> units;
+};
+
+// The positions kept when the matches are replaced (Kept: those of Keep and
+// the captures referenced, given by their starts and follows, Marks), and
+// the anchors of the slots of the replacement (Flags, one per slot, and Any).
+class ReplacementAnchors final : public pablo::PabloKernel {
+public:
+    ReplacementAnchors(LLVMTypeSystemInterface & ts, const std::vector<ReplacementSlot> & slots,
+                       StreamSet * Selected, StreamSet * Ends, StreamSet * Covered, StreamSet * Keep,
+                       StreamSet * Marks, StreamSet * Kept, StreamSet * Flags, StreamSet * Any)
+    : PabloKernel(ts, "ReplacementAnchors" + std::to_string(Marks ? Marks->getNumElements() : 0) + "_" + [&] {
+                      std::string sig;
+                      for (const ReplacementSlot & s : slots) {
+                          sig += std::to_string(static_cast<int>(s.anchor)) + std::to_string(s.capture) +
+                                 std::to_string(static_cast<int>(s.when)) + ",";
+                      }
+                      return sig;
+                  }(),
+                  [&] {
+                      Bindings inputs{Binding{"Selected", Selected}, Binding{"Ends", Ends},
+                                      Binding{"Covered", Covered}, Binding{"Keep", Keep}};
+                      if (Marks) inputs.emplace_back("Marks", Marks);
+                      return inputs;
+                  }(),
+                  [&] {
+                      Bindings outputs{Binding{"Kept", Kept}};
+                      if (Flags) {
+                          outputs.emplace_back("Flags", Flags);
+                          outputs.emplace_back("Any", Any);
+                      }
+                      return outputs;
+                  }()),
+      mSlots(slots), mHasMarks(Marks != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const selected = getInputStreamSet("Selected")[0];
+        PabloAST * const covered = getInputStreamSet("Covered")[0];
+        PabloAST * const follow = pb.createAdvance(pb.createAnd(getInputStreamSet("Ends")[0], covered), 1);
+        std::vector<PabloAST *> marks;
+        if (mHasMarks) marks = getInputStreamSet("Marks");
+        PabloAST * kept = getInputStreamSet("Keep")[0];
+        for (unsigned j = 0; j + 1 < marks.size(); j += 2) {
+            kept = pb.createOr(kept, captureCoverage(pb, marks[j], marks[j + 1]));
+        }
+        writeOutputStreamSet("Kept", std::vector<PabloAST *>{kept});
+        if (mSlots.empty()) return;
+        std::vector<PabloAST *> flags;
+        PabloAST * any = pb.createZeroes();
+        for (const ReplacementSlot & s : mSlots) {
+            PabloAST * f = (s.anchor == ReplacementSlot::Anchor::Start) ? selected
+                         : (s.anchor == ReplacementSlot::Anchor::Follow) ? follow : marks[2 * s.capture];
+            if (s.when == ReplacementSlot::When::AtFollow) {
+                f = pb.createAnd(f, follow);
+            } else if (s.when == ReplacementSlot::When::NotAtFollow) {
+                f = pb.createAnd(f, pb.createNot(follow));
+            }
+            flags.push_back(f);
+            any = pb.createOr(any, f);
+        }
+        writeOutputStreamSet("Flags", flags);
+        writeOutputStreamSet("Any", std::vector<PabloAST *>{any});
+    }
+private:
+    const std::vector<ReplacementSlot> mSlots;
+    const bool mHasMarks;
+};
+
+// The code units of the slots written into the positions inserted before
+// their anchors: before each position with a flag, a block of all the slots
+// (Size code units) was inserted, of which those flagged there are written
+// and kept (Kept), the others deleted.
+class FillSlots final : public pablo::PabloKernel {
+public:
+    FillSlots(LLVMTypeSystemInterface & ts, const std::vector<ReplacementSlot> & slots, unsigned size,
+              StreamSet * Text, StreamSet * Keep, StreamSet * Flags, StreamSet * Filled, StreamSet * Kept)
+    : PabloKernel(ts, "FillSlots" + std::to_string(Text->getNumElements()) + "_" + [&] {
+                      std::string sig;
+                      for (const ReplacementSlot & s : slots) {
+                          for (unsigned u : s.units) sig += std::to_string(u) + ",";
+                          sig += "|";
+                      }
+                      return getStringHash(sig);
+                  }(),
+                  {Binding{"Text", Text}, Binding{"Keep", Keep},
+                   Binding{"Flags", Flags, FixedRate(1), LookAhead(size)}},
+                  {Binding{"Filled", Filled}, Binding{"Kept", Kept}}),
+      mSlots(slots), mSize(size) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> text = getInputStreamSet("Text");
+        const std::vector<PabloAST *> flags = getInputStreamSet("Flags");
+        // Code unit k of a slot at offset off of the block is at the
+        // position mSize - off - k before the flag.
+        std::vector<std::pair<PabloAST *, unsigned>> written;
+        unsigned off = 0;
+        for (unsigned s = 0; s < mSlots.size(); s++) {
+            for (unsigned k = 0; k < mSlots[s].units.size(); k++) {
+                written.emplace_back(pb.createLookahead(flags[s], mSize - off - k), mSlots[s].units[k]);
+            }
+            off += mSlots[s].units.size();
+        }
+        std::vector<PabloAST *> filled(text);
+        PabloAST * kept = getInputStreamSet("Keep")[0];
+        for (const auto & w : written) {
+            kept = pb.createOr(kept, w.first);
+            for (unsigned b = 0; b < filled.size(); b++) {
+                if ((w.second >> b) & 1) filled[b] = pb.createOr(filled[b], w.first);
+            }
+        }
+        writeOutputStreamSet("Filled", filled);
+        writeOutputStreamSet("Kept", std::vector<PabloAST *>{kept});
+    }
+private:
+    const std::vector<ReplacementSlot> mSlots;
+    const unsigned mSize;
+};
+
+// The replacement as literal pieces around the references that are not
+// folded (n references, between n + 1 pieces), or false if it is not a
+// sequence of literal characters and references.
+bool replacementPieces(const PreparedSearchReplace & sr, std::vector<std::u32string> & pieces,
+                       std::vector<std::string> & references) {
+    std::vector<re::ReplacementItem> items;
+    if (!foldReplacement(sr.replacement, sr.search.re, items)) return false;
+    pieces.assign(1, std::u32string());
+    references.clear();
+    for (const re::ReplacementItem & item : items) {
+        if (item.reference) {
+            references.push_back(item.reference->getName());
+            pieces.emplace_back();
+        } else {
+            pieces.back() += item.literal;
+        }
+    }
+    return true;
+}
 
 // The preconditions of a search and replace other than those of the search
 // pattern as compiled (see ModeTransformation::failures).
@@ -2660,21 +2888,45 @@ std::vector<PreconditionFailure> searchReplaceFailures(const PreparedSearchRepla
                            "replaced may then depend on the matching conventions (greedy or lazy, longest or "
                            "first), or need a sequential selection of overlapping matches (not yet supported)"});
     }
-    for (Reference * r : unresolvedReferences(sr.replacement, search)) {
+    const std::vector<Reference *> unresolved = unresolvedReferences(sr.replacement, search);
+    for (Reference * r : unresolved) {
         failures.push_back(PreconditionFailure{goal, r, "a reference to a capture that the search pattern does not have"});
     }
-    std::vector<re::ReplacementItem> items;
-    if (!foldReplacement(sr.replacement, search, items)) {
+    std::vector<std::u32string> pieces;
+    std::vector<std::string> references;
+    if (!replacementPieces(sr, pieces, references)) {
         failures.push_back(PreconditionFailure{goal, sr.replacement,
                            "the replacement is not a sequence of literal characters and references"});
-    }
-    for (const re::ReplacementItem & item : items) {
-        if (item.reference) {
-            failures.push_back(PreconditionFailure{goal, item.reference,
-                               "references to captures (other than captures of one string) are not yet supported"});
+    } else if (!references.empty() && unresolved.empty()) {
+        re::CaptureWalk walk;
+        RE * construct = nullptr;
+        std::string reason;
+        if (!planCaptureWalk(search, references, walk, construct, reason)) {
+            failures.push_back(PreconditionFailure{goal, construct, reason});
+        } else {
+            for (size_t j = 0; j + 1 < walk.captures.size(); j++) {
+                if (walk.captures[j].close >= walk.captures[j + 1].open) {
+                    failures.push_back(PreconditionFailure{goal, sr.replacement,
+                                       "the references must be to captures in their order in the search pattern, "
+                                       "each referred to once and not within another: moving or copying captured "
+                                       "text is not yet supported"});
+                    break;
+                }
+            }
+        }
+        if ((sr.search.mode.lengthAlphabet != &cc::Unicode) || (sr.search.mode.indexAlphabet != &cc::Unicode)) {
+            failures.push_back(PreconditionFailure{goal, sr.replacement,
+                               "references to captures require full Unicode indexing (see prepareSearchReplace)"});
         }
     }
     return failures;
+}
+
+void reportFailures(const std::vector<PreconditionFailure> & failures) {
+    if (!failures.empty()) {
+        llvm::report_fatal_error(llvm::StringRef("Regular expression engine preconditions not met:\n") +
+                                 preconditionReport(failures));
+    }
 }
 
 }
@@ -2685,25 +2937,14 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace 
     return failures;
 }
 
-void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr, StreamSet * output,
-                                               StreamSet * follows, StreamSet * replaced) {
-    if (sr.search.options.goal != RE_Goal::SearchReplace) {
-        llvm::report_fatal_error("searchReplacePipeline: the search pattern must be prepared with prepareSearchReplace");
-    }
-    const std::vector<PreconditionFailure> failures = searchReplaceFailures(sr);
-    if (!failures.empty()) {
-        llvm::report_fatal_error(llvm::StringRef("Regular expression engine preconditions not met:\n") +
-                                 preconditionReport(failures));
-    }
+RE_PipelineBuilder::SelectedMatches RE_PipelineBuilder::selectMatches(const PreparedSearchReplace & sr, bool extendText) {
     usePrepared(sr.search);
+    mExtendText = extendText;
     RE * re = sr.search.re;
     ensurePrepared(re);
     mRE = applyModePasses(re, RE_Goal::SearchReplace);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
-    if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
-        llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
-    }
     // The starts of the matches, and their ends (last positions).
     StreamSet * const starts = mPB.CreateStreamSet(1);
     compileStarts(mRE, starts);
@@ -2714,69 +2955,175 @@ void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr,
         mPB.CreateKernelCall<ShiftBack>(ends, shifted, offset);
         ends = shifted;
     }
-    // The replacement: one literal string (references are folded or excluded
-    // by the preconditions), in code units.
-    std::vector<re::ReplacementItem> items;
-    foldReplacement(sr.replacement, sr.search.re, items);
-    const std::u32string literal = items.empty() ? std::u32string() : items.front().literal;
-    std::vector<unsigned> units;
-    const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
-    if (utf8) {
-        for (const char c : toUTF8String(literal)) units.push_back(static_cast<unsigned char>(c));
-    } else {
-        units.assign(literal.begin(), literal.end());
-    }
-    const unsigned length = units.size();
-    // The matches selected, and the positions kept: each match is deleted but
-    // for its start, which becomes the first code unit of the replacement.
-    StreamSet * const selected = mPB.CreateStreamSet(1);
-    StreamSet * const covered = mPB.CreateStreamSet(1);
-    StreamSet * const keep = mPB.CreateStreamSet(1);
+    SelectedMatches m;
+    m.ends = ends;
+    m.selected = mPB.CreateStreamSet(1);
+    m.covered = mPB.CreateStreamSet(1);
+    m.keep = mPB.CreateStreamSet(1);
     StreamSet * const drop = mTextExtended ? mCtxt.mMatchFollows : nullptr;
-    mPB.CreateKernelCall<LeftmostMatchSelection>(starts, ends, drop, length > 0, selected, covered, keep);
+    mPB.CreateKernelCall<LeftmostMatchSelection>(starts, ends, drop, m.selected, m.covered, m.keep);
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         mPB.captureBitstream("srStarts", starts);
         mPB.captureBitstream("srEnds", ends);
-        mPB.captureBitstream("srSelected", selected);
-        mPB.captureBitstream("srKeep", keep);
+        mPB.captureBitstream("srSelected", m.selected);
+        mPB.captureBitstream("srCovered", m.covered);
+        mPB.captureBitstream("srKeep", m.keep);
+    }
+    return m;
+}
+
+StreamSet * RE_PipelineBuilder::captureBoundaries(const re::CaptureWalk & walk, const SelectedMatches & m) {
+    if (mCtxt.mCodeUnitAlphabet != &cc::Unicode) {
+        llvm::report_fatal_error("the boundaries of captures require full Unicode indexing (see prepareSearchReplace)");
+    }
+    StreamSet * const marks = mPB.CreateStreamSet(2 * walk.captures.size());
+    mPB.CreateKernelCall<CaptureBoundaries>(walk, mCtxt.mCodeUnitStream, m.selected, m.ends, m.covered, marks);
+    return marks;
+}
+
+void RE_PipelineBuilder::captureSpansPipeline(const PreparedSearchReplace & sr, const std::vector<std::string> & captures,
+                                              StreamSet * spans) {
+    if (sr.search.options.goal != RE_Goal::SearchReplace) {
+        llvm::report_fatal_error("captureSpansPipeline: the search pattern must be prepared with prepareSearchReplace");
+    }
+    reportFailures(searchReplaceFailures(sr));
+    re::CaptureWalk walk;
+    RE * construct = nullptr;
+    std::string reason;
+    if (!planCaptureWalk(sr.search.re, captures, walk, construct, reason)) {
+        reportFailures({PreconditionFailure{RE_Goal::SearchReplace, construct, reason}});
+    }
+    const SelectedMatches m = selectMatches(sr, true);
+    StreamSet * const marks = captureBoundaries(walk, m);
+    mPB.CreateKernelCall<CaptureSpans>(marks, spans);
+}
+
+void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr, StreamSet * output,
+                                               StreamSet * follows, StreamSet * replaced) {
+    if (sr.search.options.goal != RE_Goal::SearchReplace) {
+        llvm::report_fatal_error("searchReplacePipeline: the search pattern must be prepared with prepareSearchReplace");
+    }
+    reportFailures(searchReplaceFailures(sr));
+    // The replacement: literal pieces around references to captures, in the
+    // order of the captures (see the preconditions).
+    std::vector<std::u32string> pieces;
+    std::vector<std::string> references;
+    replacementPieces(sr, pieces, references);
+    const unsigned n = references.size();
+    re::CaptureWalk walk;
+    if (n > 0) {
+        RE * construct = nullptr;
+        std::string reason;
+        planCaptureWalk(sr.search.re, references, walk, construct, reason);
+    }
+    // With references, a piece may be inserted before the follow of a
+    // match, which must be a position of the text: without match regions,
+    // the text is extended by one.
+    const SelectedMatches m = selectMatches(sr, n > 0);
+    if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
+        llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
+    }
+    StreamSet * const marks = (n > 0) ? captureBoundaries(walk, m) : nullptr;
+    // Each match is deleted but for the captures referenced, which stay in
+    // place, and each literal piece is inserted before an anchor: piece j
+    // before the start of the capture of reference j, and the last piece
+    // before the follow of the match (or before its start, without
+    // references).  The pieces inserted before one position are those of the
+    // match that it follows, then those of the match that it is in: they are
+    // given slots in that order, and a block of all the slots is inserted
+    // before each anchor, of which only the pieces anchored there are kept.
+    // The start of a capture whose prefix in the search pattern is not
+    // nullable is never the start of a match: if it is the follow of a match,
+    // it is that of its own match.  (A capture whose prefix is nullable has a
+    // suffix that is not, and its start is within its match.)
+    const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
+    auto codeUnits = [&](const std::u32string & s) {
+        std::vector<unsigned> units;
+        if (utf8) {
+            for (const char c : toUTF8String(s)) units.push_back(static_cast<unsigned char>(c));
+        } else {
+            units.assign(s.begin(), s.end());
+        }
+        return units;
+    };
+    using Anchor = ReplacementSlot::Anchor;
+    using When = ReplacementSlot::When;
+    std::vector<ReplacementSlot> followSlots, inMatchSlots;
+    for (unsigned j = 0; j <= n; j++) {
+        if (pieces[j].empty()) continue;
+        const std::vector<unsigned> units = codeUnits(pieces[j]);
+        if (j < n) {
+            if (walk.captures[j].prefixMinLength > 0) {
+                followSlots.push_back(ReplacementSlot{Anchor::CaptureStart, j, When::AtFollow, units});
+                inMatchSlots.push_back(ReplacementSlot{Anchor::CaptureStart, j, When::NotAtFollow, units});
+            } else {
+                inMatchSlots.push_back(ReplacementSlot{Anchor::CaptureStart, j, When::Always, units});
+            }
+        } else if (n == 0) {
+            inMatchSlots.push_back(ReplacementSlot{Anchor::Start, 0, When::Always, units});
+        } else {
+            followSlots.push_back(ReplacementSlot{Anchor::Follow, 0, When::Always, units});
+        }
+    }
+    std::vector<ReplacementSlot> slots(followSlots);
+    slots.insert(slots.end(), inMatchSlots.begin(), inMatchSlots.end());
+    unsigned size = 0;
+    for (const ReplacementSlot & s : slots) size += s.units.size();
+    StreamSet * keep = m.keep;
+    StreamSet * flags = nullptr;
+    StreamSet * any = nullptr;
+    if (marks || !slots.empty()) {
+        keep = mPB.CreateStreamSet(1);
+        if (!slots.empty()) {
+            flags = mPB.CreateStreamSet(slots.size());
+            any = mPB.CreateStreamSet(1);
+        }
+        mPB.CreateKernelCall<ReplacementAnchors>(slots, m.selected, m.ends, m.covered, m.keep, marks, keep, flags, any);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            if (marks) mPB.captureBixNum("srCaptureMarks", marks);
+            if (flags) mPB.captureBixNum("srSlotFlags", flags);
+        }
     }
     StreamSet * matchedFollows = nullptr;
     if (replaced) {
         matchedFollows = mPB.CreateStreamSet(1);
-        mPB.CreateKernelCall<MatchedLinesKernel>(selected, mCtxt.mMatchFollows, matchedFollows);
+        mPB.CreateKernelCall<MatchedLinesKernel>(m.selected, mCtxt.mMatchFollows, matchedFollows);
     }
-    auto filtered = [&](StreamSet * s) {
-        StreamSet * const f = mPB.CreateStreamSet(s->getNumElements());
-        FilterByMask(mPB, keep, s, f);
-        return f;
-    };
-    StreamSet * text = filtered(utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream);
-    StreamSet * anchors = (length > 0) ? filtered(selected) : nullptr;
-    StreamSet * resultFollows = follows ? filtered(mCtxt.mMatchFollows) : nullptr;
-    StreamSet * resultReplaced = replaced ? filtered(matchedFollows) : nullptr;
-    // The positions of the rest of the replacement, after each start.
-    if (length > 1) {
+    StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
+    StreamSet * resultFollows = follows ? mCtxt.mMatchFollows : nullptr;
+    StreamSet * resultReplaced = matchedFollows;
+    // The blocks of slots inserted and filled.
+    if (size > 0) {
         unsigned bits = 0;
-        while (((length - 1) >> bits) != 0) bits++;
+        while ((size >> bits) != 0) bits++;
         StreamSet * const counts = mPB.CreateStreamSet(bits);
-        mPB.CreateKernelCall<ConstantCount>(anchors, length - 1, counts);
+        mPB.CreateKernelCall<ConstantCount>(any, size, counts);
         StreamSet * const spreadMask = mPB.CreateStreamSet(1);
-        InsertionSpreadMask(mPB, counts, spreadMask, kernel::InsertPosition::After);
+        InsertionSpreadMask(mPB, counts, spreadMask, kernel::InsertPosition::Before);
         auto spread = [&](StreamSet * s) {
             StreamSet * const x = mPB.CreateStreamSet(s->getNumElements());
             SpreadByMask(mPB, spreadMask, s, x);
             return x;
         };
         text = spread(text);
-        anchors = spread(anchors);
+        keep = spread(keep);
+        flags = spread(flags);
         if (resultFollows) resultFollows = spread(resultFollows);
         if (resultReplaced) resultReplaced = spread(resultReplaced);
-    }
-    if (length > 0) {
         StreamSet * const filled = mPB.CreateStreamSet(text->getNumElements());
-        mPB.CreateKernelCall<FillReplacement>(units, text, anchors, filled);
+        StreamSet * const kept = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<FillSlots>(slots, size, text, keep, flags, filled, kept);
         text = filled;
+        keep = kept;
     }
+    auto filtered = [&](StreamSet * s) {
+        StreamSet * const f = mPB.CreateStreamSet(s->getNumElements());
+        FilterByMask(mPB, keep, s, f);
+        return f;
+    };
+    text = filtered(text);
+    if (resultFollows) resultFollows = filtered(resultFollows);
+    if (resultReplaced) resultReplaced = filtered(resultReplaced);
     // The result in UTF-8 code units, and its follows at their positions.
     StreamSet * u8basis = text;
     if (!utf8) {

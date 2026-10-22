@@ -5,6 +5,8 @@ Written after Phase 1 (the `FocusedTransform` builder and `-focus-layers`), Phas
 (`focus-paradigm-bit-movement.md`) and the fix for issue #26 part 3
 (`issue-26-regalloc-crash.md`, bbf6179a8).
 
+Interim results: `focus-paradigm-phase4.md`.
+
 ## Goal
 
 Run a stage of a focused transform, above all the transform itself, as a separate

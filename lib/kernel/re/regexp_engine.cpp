@@ -2283,12 +2283,8 @@ void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, Stream
     compileStarts(mRE, starts);
 }
 
-void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
-    if (mCtxt.mCodeUnitAlphabet != &cc::Unicode) {
-        llvm::report_fatal_error("the starts of matches by reversal require full Unicode indexing");
-    }
-    // The barriers of the regions reversed: the region follows, and the
-    // characters that no match of the RE (or assertion within it) can reach.
+StreamSet * RE_PipelineBuilder::reversalBarriers(RE * re) {
+    // The characters that no match of the RE (or assertion within it) can reach.
     UCD::UnicodeSet matchable;
     re::CC * barrierChars = re::makeCC(&cc::Unicode);
     if (matchableCodepoints(re, matchable)) {
@@ -2301,6 +2297,14 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
         OrCombine(mPB, barriers, mCtxt.mMatchFollows, all);
         barriers = all;
     }
+    return barriers;
+}
+
+void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
+    if (mCtxt.mCodeUnitAlphabet != &cc::Unicode) {
+        llvm::report_fatal_error("the starts of matches by reversal require full Unicode indexing");
+    }
+    StreamSet * const barriers = reversalBarriers(re);
     // The ends of the matches of the reversed RE in the reversed regions
     // (which are the regions), marked at their last characters, are the
     // starts of the matches in the regions reversed back.
@@ -2899,9 +2903,9 @@ private:
     const unsigned mBits;
 };
 
-std::string captureWalkSignature(const re::CaptureWalk & walk) {
+std::string walkStepsSignature(const std::vector<re::CaptureWalk::Step> & steps) {
     std::string s;
-    for (const re::CaptureWalk::Step & step : walk.steps) {
+    for (const re::CaptureWalk::Step & step : steps) {
         if (step.run) {
             s += "r[";
             for (const auto & r : *step.run) s += std::to_string(r.first) + "-" + std::to_string(r.second) + ",";
@@ -2910,8 +2914,13 @@ std::string captureWalkSignature(const re::CaptureWalk & walk) {
             s += "a" + std::to_string(step.length);
         }
     }
+    return s;
+}
+
+std::string captureWalkSignature(const re::CaptureWalk & walk) {
+    std::string s = walkStepsSignature(walk.steps);
     auto boundary = [&](const re::CaptureWalk::Boundary & b) {
-        s += (b.fromEnd ? "b" : "f") + std::to_string(b.at);
+        s += (b.fromEnd ? "b" : b.backward ? "w" : "f") + std::to_string(b.at);
     };
     for (const re::CaptureWalk::CaptureBoundaries & c : walk.captures) {
         s += "|";
@@ -2930,20 +2939,87 @@ unsigned captureWalkLookahead(const re::CaptureWalk & walk) {
     return la;
 }
 
+// The streams of the walk back from the ends of the selected matches (see
+// re::CaptureWalk::backSteps), to be reversed (see RE_PipelineBuilder::
+// captureBoundaries), over Unicode code units (Basis): the last characters
+// of the selected matches, the positions covered by them, and the class of
+// each run of the walk.
+class BackwardWalkStreams final : public pablo::PabloKernel {
+public:
+    BackwardWalkStreams(LLVMTypeSystemInterface & ts, const re::CaptureWalk & walk, StreamSet * Basis,
+                        StreamSet * Ends, StreamSet * Covered, StreamSet * Streams)
+    : PabloKernel(ts, "BackwardWalkStreams_" + getStringHash(walkStepsSignature(walk.backSteps)),
+                  {Binding{"Basis", Basis}, Binding{"Ends", Ends}, Binding{"Covered", Covered}},
+                  {Binding{"Streams", Streams}}),
+      mSteps(walk.backSteps) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        cc::Parabix_CC_Compiler_Builder ccc(getInputStreamSet("Basis"));
+        PabloAST * const covered = getInputStreamSet("Covered")[0];
+        std::vector<PabloAST *> streams{pb.createAnd(getInputStreamSet("Ends")[0], covered), covered};
+        for (const re::CaptureWalk::Step & step : mSteps) {
+            if (step.run) streams.push_back(ccc.compileCC(step.run, pb));
+        }
+        writeOutputStreamSet("Streams", streams);
+    }
+private:
+    const std::vector<re::CaptureWalk::Step> mSteps;
+};
+
+// The walk back from the ends of the selected matches, as a forward walk in
+// the reversed regions (Reversed: the streams of BackwardWalkStreams,
+// reversed), from their last characters: the cursor after each prefix of
+// the steps (Cursors, one stream more than the steps).  After k characters,
+// the cursor is at the reversed position of the character before the
+// boundary k characters back from the follow of the match.
+class BackwardWalk final : public pablo::PabloKernel {
+public:
+    BackwardWalk(LLVMTypeSystemInterface & ts, const re::CaptureWalk & walk, StreamSet * Reversed, StreamSet * Cursors)
+    : PabloKernel(ts, "BackwardWalk_" + getStringHash(walkStepsSignature(walk.backSteps)),
+                  {Binding{"Reversed", Reversed}}, {Binding{"Cursors", Cursors}}),
+      mSteps(walk.backSteps) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> reversed = getInputStreamSet("Reversed");
+        PabloAST * const covered = reversed[1];
+        std::vector<PabloAST *> at{reversed[0]};
+        unsigned run = 2;
+        for (const re::CaptureWalk::Step & step : mSteps) {
+            if (step.run) {
+                at.push_back(pb.createScanThru(at.back(), pb.createAnd(reversed[run++], covered)));
+            } else {
+                at.push_back(pb.createAdvance(at.back(), step.length));
+            }
+        }
+        writeOutputStreamSet("Cursors", at);
+    }
+private:
+    const std::vector<re::CaptureWalk::Step> mSteps;
+};
+
 // The boundaries of captures in the selected matches (see re::CaptureWalk),
 // over Unicode code units (Basis): for each capture, its start and its follow
 // (Marks, two streams per capture).  Starts: the selected starts; Ends: the
-// ends of the matches, of which those of the selected ones are Covered.
+// ends of the matches, of which those of the selected ones are Covered;
+// Backward: the cursors of the walk back (see BackwardWalk) reversed back, at
+// the characters before the boundaries, if the walk has backward boundaries.
 class CaptureBoundaries final : public pablo::PabloKernel {
 public:
     CaptureBoundaries(LLVMTypeSystemInterface & ts, const re::CaptureWalk & walk, StreamSet * Basis,
-                      StreamSet * Starts, StreamSet * Ends, StreamSet * Covered, StreamSet * Marks)
+                      StreamSet * Starts, StreamSet * Ends, StreamSet * Covered, StreamSet * Backward,
+                      StreamSet * Marks)
     : PabloKernel(ts, "CaptureBoundaries_" + getStringHash(captureWalkSignature(walk)),
-                  {Binding{"Basis", Basis}, Binding{"Starts", Starts},
-                   Binding{"Ends", Ends, FixedRate(1), LookAhead(captureWalkLookahead(walk))},
-                   Binding{"Covered", Covered, FixedRate(1), LookAhead(captureWalkLookahead(walk))}},
+                  [&] {
+                      Bindings inputs{Binding{"Basis", Basis}, Binding{"Starts", Starts},
+                                      Binding{"Ends", Ends, FixedRate(1), LookAhead(captureWalkLookahead(walk))},
+                                      Binding{"Covered", Covered, FixedRate(1), LookAhead(captureWalkLookahead(walk))}};
+                      if (Backward) inputs.emplace_back("Backward", Backward);
+                      return inputs;
+                  }(),
                   {Binding{"Marks", Marks}}),
-      mWalk(walk) {}
+      mWalk(walk), mHasBackward(Backward != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -2961,7 +3037,10 @@ protected:
         }
         // Back from the follows of the selected matches (the positions after
         // their ends).
+        std::vector<PabloAST *> backward;
+        if (mHasBackward) backward = getInputStreamSet("Backward");
         auto boundary = [&](const re::CaptureWalk::Boundary & b) -> PabloAST * {
+            if (b.backward) return pb.createAdvance(backward[b.at], 1);
             if (!b.fromEnd) return at[b.at];
             if (b.at == 0) return pb.createAdvance(pb.createAnd(ends, covered), 1);
             if (b.at == 1) return pb.createAnd(ends, covered);
@@ -2976,6 +3055,7 @@ protected:
     }
 private:
     const re::CaptureWalk mWalk;
+    const bool mHasBackward;
 };
 
 // The positions from the start S of a capture to the position before its
@@ -3195,7 +3275,7 @@ std::vector<PreconditionFailure> searchReplaceFailures(const PreparedSearchRepla
         re::CaptureWalk walk;
         RE * construct = nullptr;
         std::string reason;
-        if (!planCaptureWalk(search, references, walk, construct, reason)) {
+        if (!planCaptureWalk(search, references, walk, construct, reason, sr.search.options.reversal)) {
             failures.push_back(PreconditionFailure{goal, construct, reason});
         } else {
             for (size_t j = 0; j + 1 < walk.captures.size(); j++) {
@@ -3266,12 +3346,35 @@ RE_PipelineBuilder::SelectedMatches RE_PipelineBuilder::selectMatches(const Prep
     return m;
 }
 
-StreamSet * RE_PipelineBuilder::captureBoundaries(const re::CaptureWalk & walk, const SelectedMatches & m) {
+StreamSet * RE_PipelineBuilder::captureBoundaries(const re::CaptureWalk & walk, const SelectedMatches & m, RE * search) {
     if (mCtxt.mCodeUnitAlphabet != &cc::Unicode) {
         llvm::report_fatal_error("the boundaries of captures require full Unicode indexing (see prepareSearchReplace)");
     }
+    // The boundaries found by the walk back from the ends of the matches:
+    // a forward walk in the regions reversed in place (whose barriers no
+    // match crosses), from the last characters of the selected matches.
+    // The cursor at the reversed position of the character before each
+    // boundary (a character of the match, as the items before a backward
+    // boundary are not nullable) is reversed back to that character.
+    StreamSet * backward = nullptr;
+    if (walk.hasBackward()) {
+        unsigned runs = 0;
+        for (const re::CaptureWalk::Step & step : walk.backSteps) if (step.run) runs++;
+        StreamSet * const barriers = reversalBarriers(search);
+        StreamSet * const streams = mPB.CreateStreamSet(2 + runs);
+        mPB.CreateKernelCall<BackwardWalkStreams>(walk, mCtxt.mCodeUnitStream, m.ends, m.covered, streams);
+        StreamSet * const reversed = mPB.CreateStreamSet(2 + runs);
+        mPB.CreateKernelCall<RegionReversal>(barriers, streams, reversed, ReverseRegionLimit);
+        StreamSet * const cursors = mPB.CreateStreamSet(walk.backSteps.size() + 1);
+        mPB.CreateKernelCall<BackwardWalk>(walk, reversed, cursors);
+        backward = mPB.CreateStreamSet(walk.backSteps.size() + 1);
+        mPB.CreateKernelCall<RegionReversal>(barriers, cursors, backward, ReverseRegionLimit);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBixNum("srBackwardCursors", backward);
+        }
+    }
     StreamSet * const marks = mPB.CreateStreamSet(2 * walk.captures.size());
-    mPB.CreateKernelCall<CaptureBoundaries>(walk, mCtxt.mCodeUnitStream, m.selected, m.ends, m.covered, marks);
+    mPB.CreateKernelCall<CaptureBoundaries>(walk, mCtxt.mCodeUnitStream, m.selected, m.ends, m.covered, backward, marks);
     return marks;
 }
 
@@ -3284,11 +3387,11 @@ void RE_PipelineBuilder::captureSpansPipeline(const PreparedSearchReplace & sr, 
     re::CaptureWalk walk;
     RE * construct = nullptr;
     std::string reason;
-    if (!planCaptureWalk(sr.search.re, captures, walk, construct, reason)) {
+    if (!planCaptureWalk(sr.search.re, captures, walk, construct, reason, sr.search.options.reversal)) {
         reportFailures({PreconditionFailure{RE_Goal::SearchReplace, construct, reason}});
     }
     const SelectedMatches m = selectMatches(sr, true);
-    StreamSet * const marks = captureBoundaries(walk, m);
+    StreamSet * const marks = captureBoundaries(walk, m, sr.search.re);
     mPB.CreateKernelCall<CaptureSpans>(marks, spans);
 }
 
@@ -3308,7 +3411,7 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     if (n > 0) {
         RE * construct = nullptr;
         std::string reason;
-        planCaptureWalk(sr.search.re, references, walk, construct, reason);
+        planCaptureWalk(sr.search.re, references, walk, construct, reason, sr.search.options.reversal);
     }
     // With references, a piece may be inserted before the follow of a
     // match, which must be a position of the text: without match regions,
@@ -3317,7 +3420,7 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
         llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
     }
-    StreamSet * const marks = (n > 0) ? captureBoundaries(walk, m) : nullptr;
+    StreamSet * const marks = (n > 0) ? captureBoundaries(walk, m, sr.search.re) : nullptr;
     // Each match is deleted but for the captures referenced, which stay in
     // place, and each literal piece is inserted before an anchor: piece j
     // before the start of the capture of reference j, and the last piece

@@ -167,7 +167,9 @@ int main(int argc, char * argv[]) {
         struct WalkCase {
             const char * search;
             std::vector<std::string> captures;
-            const char * expected;      // the steps, then the boundaries; or nullptr: no walk
+            const char * expected;      // the steps (and the steps back, if backward), then the
+                                        // boundaries; or nullptr: no walk
+            bool backward = false;      // walks back from the end of the match allowed
         };
         const WalkCase cases[] = {
             {"([a-z]+)@([a-z]+)\\.", {"\\1", "\\2"}, "r,1,r,1 | F0 F1 | F2 F3"},
@@ -179,6 +181,14 @@ int main(int argc, char * argv[]) {
             {"[a-z]*[a-z0-9]*(x)[a-z]+;", {"\\1"}, nullptr},
             {"([a-z])+@", {"\\1"}, nullptr},
             {"(?:(a)|b)c", {"\\1"}, nullptr},
+            // Walks back from the end of the match (W: after the steps back).
+            {"([a-z0-9]*[a-z])\\d+;", {"\\1"}, nullptr},
+            {"([a-z0-9]*[a-z])\\d+;", {"\\1"}, " < 1,r,1 | F0 W2", true},
+            {"x[a-z0-9]*([a-z]\\d+);", {"\\1"}, "1 < 1,r,1 | W3 B1", true},
+            {"([a-z0-9]*[a-z])(\\d+)-([a-z]+);", {"\\1", "\\2", "\\3"},
+             " < 1,r,1,r,1 | F0 W4 | W4 W3 | W2 B1", true},
+            {"([a-z0-9]*[a-z])[a-z0-9]+;", {"\\1"}, nullptr, true},     // the run back is not maximal
+            {"[a-z0-9]*([a-z]\\d+);", {"\\1"}, nullptr, true},        // a nullable prefix
         };
         for (const WalkCase & c : cases) {
             // The search pattern as prepared for the replacement of the captures.
@@ -191,15 +201,24 @@ int main(int argc, char * argv[]) {
             CaptureWalk walk;
             RE * construct = nullptr;
             std::string reason;
-            const bool ok = planCaptureWalk(search, c.captures, walk, construct, reason);
+            const bool ok = planCaptureWalk(search, c.captures, walk, construct, reason, c.backward);
             std::string got;
             if (ok) {
-                for (size_t i = 0; i < walk.steps.size(); i++) {
-                    got += (i ? "," : "") + (walk.steps[i].run ? std::string("r") : std::to_string(walk.steps[i].length));
+                auto steps = [&](const std::vector<CaptureWalk::Step> & v) {
+                    for (size_t i = 0; i < v.size(); i++) {
+                        got += (i ? "," : "") + (v[i].run ? std::string("r") : std::to_string(v[i].length));
+                    }
+                };
+                auto boundary = [](const CaptureWalk::Boundary & b) {
+                    return (b.fromEnd ? "B" : b.backward ? "W" : "F") + std::to_string(b.at);
+                };
+                steps(walk.steps);
+                if (c.backward) {
+                    got += " < ";
+                    steps(walk.backSteps);
                 }
                 for (const CaptureWalk::CaptureBoundaries & b : walk.captures) {
-                    got += std::string(" | ") + (b.start.fromEnd ? "B" : "F") + std::to_string(b.start.at) + " " +
-                           (b.follow.fromEnd ? "B" : "F") + std::to_string(b.follow.at);
+                    got += " | " + boundary(b.start) + " " + boundary(b.follow);
                 }
             }
             if (c.expected == nullptr) {

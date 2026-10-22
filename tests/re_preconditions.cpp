@@ -98,6 +98,7 @@ int main(int argc, char * argv[]) {
             const char * search;
             const char * replacement;
             bool supported;
+            bool reversal = true;                   // see RE_ModeOptions::reversal
         };
         const SearchReplaceCase cases[] = {
             {"cat", "dog", true},
@@ -118,12 +119,16 @@ int main(int argc, char * argv[]) {
             {"(?:(a)|b)c", "$1", false},             // a capture on one path only (not folded)
             {"([a-z])+@", "$1", false},              // a capture within a repetition
             {"#([a-z0-9]*)([0-9]+);", "$1", false},  // the end of the capture is not found
+            {"([a-z0-9]*[a-z])\\d+;", "<$1>", true},    // the end of the capture by a walk back
+            {"([a-z0-9]*[a-z])\\d+;", "<$1>", false, false},  // (by reversal)
         };
         for (const SearchReplaceCase & c : cases) {
             RE * const search = RE_Parser::parse(c.search);
             std::string error;
             RE * const replacement = parseReplacement(c.replacement, search, error);
-            const auto failures = checkPreconditions(prepareSearchReplace(search, replacement));
+            RE_ModeOptions opts;
+            opts.reversal = c.reversal;
+            const auto failures = checkPreconditions(prepareSearchReplace(search, replacement, opts));
             if (failures.empty() != c.supported) {
                 errors++;
                 llvm::errs() << "FAIL s/" << c.search << "/" << c.replacement << "/: expected "

@@ -16,7 +16,7 @@ import re
 TEXT = (
     "foo@bar.com and x@y a@.b @c.\n"
     "café@crème.fr ψ@ω. @@\n"
-    "#ab12; #9; #x7; #1a2b3;\n"
+    "#ab12; #9; #x7; #1a2b3; a1-bc; zz9q12-ab;\n"
     "\n"
     "k=v; key=value; =; k2=;\n"
     "last@line."
@@ -29,6 +29,7 @@ GROUPS = [
     [("#([a-z0-9]*)([0-9]);", 1), ("#([a-z0-9]*)([0-9]);", 2)],           # from the end of the match
     [("([a-z0-9]*)=([a-z]*);", 1), ("([a-z0-9]*)=([a-z]*);", 2)],         # empty captures
     [("@([a-z]*)(?![a-z])", 1), ("([a-z])(?!x)", 1)],                    # an empty capture at a follow; adjacent captures
+    [("([a-z0-9]*[a-z])[0-9]+;", 1), ("([a-z0-9]*[a-z])([0-9]+)-([a-z]+);", 3)],   # by a walk back (reversal)
 ]
 
 

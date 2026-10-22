@@ -28,6 +28,7 @@ TEXT = (
     "\n"
     "a@ b@c @@x @ab@\n"
     "@. a@. @b. #ab12; #9; #x7;\n"
+    "ab12; x9z77; abc1;; 7a7; q1a22;b3; é5é12; a1-bc; zz9q12-ab; x7a3;\n"
     "last line without a line break cat"
 )
 
@@ -55,6 +56,11 @@ CASES = [
     ("#([a-z0-9]*)([0-9]);", "$1.${2}", "#([a-z0-9]*)([0-9]);", "\\1.\\2"),
     ("c(a)(t)", "$1$1", "c(a)(t)", "\\1\\1"),
     ("([a-z])(?![x])", "${1}q", "([a-z])(?![x])", "\\1q"),       # adjacent matches, each a capture
+    # Boundaries found by a walk back from the end of the match (by reversal).
+    ("([a-z0-9]*[a-z])\\d+;", "<$1>", "([a-z0-9]*[a-z])[0-9]+;", "<\\1>"),
+    ("x[a-z0-9]*([a-z]\\d+);", "[$1]", "x[a-z0-9]*([a-z][0-9]+);", "[\\1]"),
+    ("([a-z0-9]*[a-z])(\\d+)-([a-z]+);", "$1.$2.$3", "([a-z0-9]*[a-z])([0-9]+)-([a-z]+);", "\\1.\\2.\\3"),
+    ("([a-z0-9é]*é)\\d+;", "<$1>", "([a-z0-9é]*é)[0-9]+;", "<\\1>"),
 ]
 
 # (icgrep pattern, icgrep replacement, a part of the expected error)
@@ -68,6 +74,7 @@ REJECTED = [
     ("(?:(a)|b)c", "$1", "no unique binding"),
     ("([a-z])+@", "$1", "no unique binding"),
     ("#([a-z0-9]*)([0-9]+);", "$1", "is not found"),
+    ("([a-z0-9]*[a-z])[a-z0-9]+;", "$1", "is not found"),     # not maximal backward either
     ("cat", "a\\nb", "line break"),
 ]
 
@@ -111,7 +118,7 @@ def main():
                              capture_output=True)
         lines = run.stdout.decode("utf-8").split("\n")
         want = [path + ":1:the Q sat on the mat", path + ":3:QQ conQ 123 de45f",
-                path + ":10:last line without a line break Q"]
+                path + ":11:last line without a line break Q"]
         if lines[:3] != want or lines[3:6] != want:
             failures += 1
             print("FAIL -n -H: got %r" % lines)

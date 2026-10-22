@@ -71,7 +71,15 @@ std::string toUTF8String(const std::u32string & s);
 //     (?!Y) for Y including X): the walk goes through the run of X within the
 //     match;
 //   - or back from the follow of the match (the position after its last
-//     character), when the items after the boundary have a fixed length.
+//     character), when the items after the boundary have a fixed length;
+//   - or, if backward walks are allowed, by a walk back from the last
+//     character of the match, over the items after the boundary taken in
+//     reverse, each of fixed length or a run of a class X that is maximal
+//     backward (the characters that can precede it within the match are not
+//     of X, or it is preceded by (?<!Y) for Y including X), when the items
+//     before the boundary are not nullable.  The walk is a forward walk in
+//     the reversed regions of the text (see RE_PipelineBuilder::
+//     captureBoundaries): meeting the forward walk in the middle.
 //
 struct CaptureWalk {
     struct Step {
@@ -80,7 +88,9 @@ struct CaptureWalk {
     };
     struct Boundary {
         bool fromEnd = false;
-        unsigned at = 0;            // forward: after steps[0, at); fromEnd: the length back from the follow
+        bool backward = false;
+        unsigned at = 0;            // forward: after steps[0, at); fromEnd: the length back from the follow;
+                                    // backward: after backSteps[0, at), back from the last character
     };
     struct CaptureBoundaries {
         Boundary start;
@@ -90,13 +100,22 @@ struct CaptureWalk {
         int prefixMinLength = 0;    // the minimum length of the match before the capture
     };
     std::vector<Step> steps;
+    std::vector<Step> backSteps;                // from the end of the match, back
     std::vector<CaptureBoundaries> captures;    // as requested
+    bool hasBackward() const {
+        for (const CaptureBoundaries & c : captures) {
+            if (c.start.backward || c.follow.backward) return true;
+        }
+        return false;
+    }
 };
 
 // The walk for the captures named (by capture name, see capturesByName) in
 // the search pattern as prepared.  Returns false if a capture has no unique
-// boundaries found this way, with the construct and the reason.
+// boundaries found this way, with the construct and the reason.  Walks back
+// from the end of the match are planned only if backward (they need the
+// reversal of the regions of the text, see RE_ModeOptions::reversal).
 bool planCaptureWalk(RE * search, const std::vector<std::string> & captures, CaptureWalk & walk,
-                     RE *& construct, std::string & reason);
+                     RE *& construct, std::string & reason, bool backward = false);
 
 }

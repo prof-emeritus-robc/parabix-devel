@@ -985,6 +985,30 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   the ends of the reversed regions, at the end of the text), so
   `x(?=(?:a*b)*(?<!a)c)` remains unsupported; each lookbehind matched forward
   has its own reversal kernel.
+- Capture boundaries by a walk back from the end of the match, meeting the
+  forward walk in the middle (U3 relaxed): where the forward walk stops (at
+  an item that is neither of fixed length nor a maximal run) and the items
+  after a boundary are not of fixed length, the boundary is found by a walk
+  back from the last character of the match over the items after it, taken
+  in reverse, each of fixed length or a run of a class X that is maximal
+  backward (the characters that can precede it within the match are not of
+  X, `lastChars`, or it is preceded by `(?<!Y)` with Y including X, or by
+  `Start`), when the items before the boundary are not nullable
+  (`re::planCaptureWalk`, `CaptureWalk::backSteps`, `Boundary::backward`).
+  The walk is a forward walk in the reversed regions
+  (`RE_PipelineBuilder::captureBoundaries`): the last characters of the
+  selected matches, their coverage and the classes of the runs
+  (`BackwardWalkStreams`) are reversed with one `RegionReversal` (barriers:
+  the region follows and the characters the search pattern cannot match,
+  `reversalBarriers`), walked (`BackwardWalk`: `Advance` and `ScanThru`
+  within the coverage), reversed back to the character before each
+  boundary, and advanced by one in `CaptureBoundaries`. Only the streams the
+  walk needs are reversed, not the basis. Allowed with
+  `RE_ModeOptions::reversal` (so not in tconv). Examples now supported:
+  `([a-z0-9]*[a-z])\d+;` with `<$1>`, `x[a-z0-9]*([a-z]\d+);`,
+  `([a-z0-9]*[a-z])(\d+)-([a-z]+);` with `$1.$2.$3`. A run back that reaches
+  the start of the match is not taken as maximal (the coverage of an
+  adjacent previous match would continue it).
 - Tests: `region_reversal_test` (`tests/region_reversal.cpp`,
   `region_reversal_test.py`, new: regions of lines, of barrier characters,
   without line regions, across the strides and segments of the pipeline, and
@@ -996,11 +1020,16 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   errors; 0.2 s with the object cache), with lookbehinds of variable length
   matched forward in `match_starts_test` (compared with a reference that
   matches the lookbehind on the text before each position) and
-  `reversed_lookahead_test`. greptest passes.
+  `reversed_lookahead_test`; walks back in `replace_test` (four
+  replacements compared with `re.sub`, one more rejection),
+  `capture_spans_test` (a group with and without match regions),
+  `re_replacement_test` (the planned walks) and `re_preconditions_test`
+  (with and without reversal). greptest passes.
 - Next: reversal of only the streams the reversed RE needs (rather than the
   21-bit basis), with the lookbehinds matched forward, one reversal shared by
   the uses of a pipeline,
   anchors with reversal (the region starts and follows of the real regions as
-  externals), meeting in the middle for capture boundaries, and relaxing the
-  lookahead and U3 preconditions accordingly.
+  externals), and meeting in the middle beyond walks (backward matching of
+  the suffix of the RE from the ends, for boundaries after items that are
+  not runs of a class).
 

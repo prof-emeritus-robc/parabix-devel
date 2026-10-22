@@ -675,6 +675,10 @@ protected:
     // reversed in place (kernel::RegionReversal, with the region follows and
     // the characters the RE cannot match as barriers), reversed back.
     void reversedStarts(re::RE * re, kernel::StreamSet * starts);
+    // The barriers of the regions of a reversal for the matches of an RE:
+    // the region follows, and the characters that the RE (including its
+    // assertions) cannot match.
+    kernel::StreamSet * reversalBarriers(re::RE * re);
 
     // The starts of the matches of an alternative (see matchStartsPipeline).
     void alternativeStarts(const MatchStartsAlternative & a, kernel::StreamSet * out);
@@ -731,8 +735,9 @@ protected:
     SelectedMatches selectMatches(const PreparedSearchReplace & sr, bool extendText);
 
     // The starts and follows of the captures of a walk in the selected
-    // matches (two streams per capture), with Unicode code units.
-    kernel::StreamSet * captureBoundaries(const re::CaptureWalk & walk, const SelectedMatches & m);
+    // matches of the search pattern (two streams per capture), with Unicode
+    // code units.
+    kernel::StreamSet * captureBoundaries(const re::CaptureWalk & walk, const SelectedMatches & m, re::RE * search);
 
     // The text with the selected matches replaced (see searchReplacePipeline),
     // as the basis bits of the code units of the source (written to

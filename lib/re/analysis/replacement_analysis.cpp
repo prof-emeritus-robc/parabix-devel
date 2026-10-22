@@ -156,6 +156,42 @@ bool firstChars(RE * r, UCD::UnicodeSet & chars, bool & nullable) {
     return false;
 }
 
+// The characters that can end a nonempty match of r, and whether r can match
+// the empty string.  False if unknown.
+bool lastChars(RE * r, UCD::UnicodeSet & chars, bool & nullable) {
+    if (Seq * const seq = dyn_cast<Seq>(r)) {
+        nullable = true;
+        for (auto i = seq->rbegin(); nullable && (i != seq->rend()); ++i) {
+            if (!lastChars(*i, chars, nullable)) return false;
+        }
+        return true;
+    } else if (Alt * const alt = dyn_cast<Alt>(r)) {
+        nullable = false;
+        for (RE * e : *alt) {
+            bool e_nullable;
+            if (!lastChars(e, chars, e_nullable)) return false;
+            nullable |= e_nullable;
+        }
+        return true;
+    } else if (Rep * const rep = dyn_cast<Rep>(r)) {
+        if (rep->getUB() == 0) {
+            nullable = true;
+            return true;
+        }
+        if (!lastChars(rep->getRE(), chars, nullable)) return false;
+        nullable |= (rep->getLB() == 0);
+        return true;
+    } else if (Capture * const c = dyn_cast<Capture>(r)) {
+        return lastChars(c->getCapturedRE(), chars, nullable);
+    } else if (Group * const g = dyn_cast<Group>(r)) {
+        return lastChars(g->getRE(), chars, nullable);
+    } else if (Name * const n = dyn_cast<Name>(r)) {
+        return n->getDefinition() && lastChars(n->getDefinition(), chars, nullable);
+    }
+    // A class, or a zero-width item.
+    return firstChars(r, chars, nullable);
+}
+
 // The characters that can be matched by r (not those of its assertions).
 // False if unknown.
 bool allChars(RE * r, UCD::UnicodeSet & chars) {
@@ -249,6 +285,34 @@ bool maximalRun(const std::vector<WalkItem> & items, size_t i, const CC * X) {
     }
     // The end of the match ends the run (the walk stays within the match).
     return true;
+}
+
+
+// Is a run of X at item i always maximal backward within the match: the
+// characters that can precede it within the match are not of X, or it is
+// preceded by a negative lookbehind (?<!Y) with Y including X, or by Start?
+// (The start of the match does not end it: a walk back may continue into an
+// adjacent match.)
+bool maximalRunBackward(const std::vector<WalkItem> & items, size_t i, const CC * X) {
+    for (size_t j = i; j-- > 0; ) {
+        RE * const r = items[j].re;
+        if (items[j].mark >= 0) continue;
+        if (zeroWidthItem(r)) {
+            if (isa<Start>(r)) return true;
+            if (const Assertion * const a = dyn_cast<Assertion>(r)) {
+                if ((a->getKind() == Assertion::Kind::LookBehind) && (a->getSense() == Assertion::Sense::Negative)) {
+                    const CC * const Y = unicodeClass(a->getAsserted());
+                    if (Y && X->subset(*Y)) return true;
+                }
+            }
+            continue;
+        }
+        UCD::UnicodeSet last;
+        bool nullable;
+        if (!lastChars(r, last, nullable) || last.intersects(*X)) return false;
+        if (!nullable) return true;
+    }
+    return false;
 }
 
 }
@@ -347,7 +411,7 @@ std::string toUTF8String(const std::u32string & s) {
 }
 
 bool planCaptureWalk(RE * search, const std::vector<std::string> & captures, CaptureWalk & walk,
-                     RE *& construct, std::string & reason) {
+                     RE *& construct, std::string & reason, bool backward) {
     walk = CaptureWalk{};
     std::map<std::string, unsigned> wanted;
     std::vector<std::string> names;
@@ -367,6 +431,33 @@ bool planCaptureWalk(RE * search, const std::vector<std::string> & captures, Cap
         const auto range = getLengthRange(items[i].re, &cc::Unicode);
         suffix[i] = ((suffix[i + 1] >= 0) && (range.first == range.second)) ? suffix[i + 1] + range.first : -1;
     }
+    // The walk back from the last character of the match: the number of its
+    // steps after the items from each marker on (or -1 where it stops).
+    std::vector<int> back(n, -1);
+    if (backward) {
+        for (size_t i = n; i-- > 0; ) {
+            RE * const r = items[i].re;
+            if (items[i].mark >= 0) {
+                back[i] = static_cast<int>(walk.backSteps.size());
+                continue;
+            }
+            if (zeroWidthItem(r)) continue;
+            const auto range = getLengthRange(r, &cc::Unicode);
+            if (range.first == range.second) {
+                if (range.first > 0) walk.backSteps.push_back(CaptureWalk::Step{range.first, nullptr});
+                continue;
+            }
+            UCD::UnicodeSet chars;
+            if (allChars(r, chars)) {
+                CC * const X = makeCC(std::move(chars), &cc::Unicode);
+                if (maximalRunBackward(items, i, X)) {
+                    walk.backSteps.push_back(CaptureWalk::Step{0, X});
+                    continue;
+                }
+            }
+            break;
+        }
+    }
     std::vector<CaptureWalk::CaptureBoundaries> found(names.size());
     std::vector<bool> seen(names.size(), false);
     bool forward = true;
@@ -382,11 +473,18 @@ bool planCaptureWalk(RE * search, const std::vector<std::string> & captures, Cap
             } else if (suffix[i + 1] >= 0) {
                 b.fromEnd = true;
                 b.at = suffix[i + 1];
+            } else if ((back[i] >= 0) && (prefixMin > 0)) {
+                // (A boundary after a prefix that is not nullable is after a
+                // character of the match, see RE_PipelineBuilder::captureBoundaries.)
+                b.backward = true;
+                b.at = back[i];
             } else {
                 construct = r;
                 reason = std::string("the ") + (open ? "start" : "end") + " of the capture is not found from the "
                          "start of the match (by fixed lengths and maximal runs of a class), nor at a fixed "
-                         "length from its end";
+                         "length from its end" +
+                         (backward ? ", nor by a walk back from its end after a prefix that is not nullable"
+                                   : " (and the walk back from its end, by reversal, is not allowed)");
                 return false;
             }
             if (open) {

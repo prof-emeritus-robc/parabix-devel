@@ -537,50 +537,12 @@ add_test(
   WORKING_DIRECTORY ${QA_DIR}/
   COMMAND python3 u32u8_test.py "${BIN_DIR}/u32u8")
 
+# A few critical combinations of nfd/nfc/nfkd with pipeline and focus modes,
+# kept under one second; `make nfd_test`/`make nfc_test` run the fuller tests.
 add_test(
-  NAME nfd_test
-  WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND python3 nfd_test.py "${BIN_DIR}/nfd")
-
-add_test(
-  NAME nfd_separated_test
-  WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND python3 nfd_test.py -o nfd_output_separated --flags=-SeparatedPipelineStages=2 "${BIN_DIR}/nfd")
-
-add_test(
-  NAME nfd_separated4_test
-  WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND python3 nfd_test.py -o nfd_output_separated4 --flags=-SeparatedPipelineStages=4 "${BIN_DIR}/nfd")
-
-add_test(
-  NAME nfkd_test
-  WORKING_DIRECTORY ${QA_DIR}/nfkd
-  COMMAND python3 nfkd_test.py "${BIN_DIR}/nfkd")
-
-add_test(
-  NAME nfkd_nofocus_test
-  WORKING_DIRECTORY ${QA_DIR}/nfkd
-  COMMAND python3 nfkd_test.py --flags=-NoFocus "${BIN_DIR}/nfkd")
-
-foreach(FOCUS_TOOL_FORM nfd:NFD nfc:NFC nfkd:NFKD)
-    string(REPLACE ":" ";" PAIR ${FOCUS_TOOL_FORM})
-    list(GET PAIR 0 FOCUS_TOOL)
-    list(GET PAIR 1 FOCUS_FORM)
-    add_test(
-      NAME focus_modes_${FOCUS_TOOL}_test
-      WORKING_DIRECTORY ${QA_DIR}/focus
-      COMMAND python3 focus_modes_test.py "${BIN_DIR}/${FOCUS_TOOL}" ${FOCUS_FORM})
-endforeach()
-
-add_test(
-  NAME nfc_test
-  WORKING_DIRECTORY ${QA_DIR}/nfc
-  COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")
-
-add_test(
-  NAME nfc_multistage_test
-  WORKING_DIRECTORY ${QA_DIR}/nfc
-  COMMAND python3 nfc_test.py -o TestOutput_multistage --flags=-MultiStage "${BIN_DIR}/nfc")
+  NAME normalization_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 normalization_test.py "${BIN_DIR}")
 
 add_test(
     NAME editd_test

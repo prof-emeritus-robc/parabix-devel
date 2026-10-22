@@ -564,6 +564,10 @@ Kernel * PipelineBuilder::makeKernel() {
                     sig << '.' << ds;
                 }
             }
+            // the phase segment limit is compiled into the pipeline
+            if (numOfLayers > 0) {
+                sig << "$L" << codegen::PhaseSegmentLimit;
+            }
         }
         sig.flush();
 

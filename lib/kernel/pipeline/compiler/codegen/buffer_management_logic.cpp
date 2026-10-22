@@ -185,7 +185,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                         const BufferNode & bn = mBufferGraph[streamSet];
                         if (bn.crossesPhaseBoundary()) {
                             // TODO: should output scale be per output streamset?
-                            multiplier = DEFAULT_INITIAL_PHASE_SEGMENT_LIMIT;
+                            multiplier = codegen::PhaseSegmentLimit;
                             break;
                         }
                     }
@@ -275,7 +275,7 @@ void PipelineCompiler::allocateOwnedBuffers(KernelBuilder & b, Value * const all
                                 assert (expectedSourceOutputSize);
                                 multiplier = b.CreateMulRational(expectedSourceOutputSize, scaleFactor);
                             } else if (LLVM_UNLIKELY(bn.crossesPhaseBoundary())) {
-                                multiplier = b.CreateCeilUMulRational(maxStrides, (R * Rational{DEFAULT_INITIAL_PHASE_SEGMENT_LIMIT}));
+                                multiplier = b.CreateCeilUMulRational(maxStrides, (R * Rational{codegen::PhaseSegmentLimit}));
                             } else {
                                 multiplier = b.CreateCeilUMulRational(maxStrides, R);
                             }

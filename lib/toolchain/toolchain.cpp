@@ -371,6 +371,11 @@ static cl::opt<unsigned, true> SegmentSizeOption("segment-size", cl::location(Se
 static cl::opt<unsigned, true> BufferSegmentsOption("buffer-segments", cl::location(BufferSegments), cl::init(1),
                                                cl::desc("Buffer Segments"), cl::value_desc("positive integer"));
 
+static cl::opt<unsigned, true> PhaseSegmentLimitOption("phase-segment-limit", cl::location(PhaseSegmentLimit), cl::init(100),
+                                               cl::desc("In a pipeline with phase boundaries, the number of segments a thread may process in a phase "
+                                                        "before moving to the next one, and the number of segments buffered between phases"),
+                                               cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
+
 
 unsigned Z3_Timeout;
 static cl::opt<unsigned, true> Z3_TimeoutOption("Z3-timeout", cl::location(Z3_Timeout), cl::init(3000),
@@ -425,6 +430,7 @@ unsigned BlockSize;
 unsigned SegmentSize;
 
 unsigned BufferSegments;
+unsigned PhaseSegmentLimit;
 unsigned TaskThreads;
 unsigned SegmentThreads;
 
@@ -606,6 +612,9 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
         EnableObjectCache = false;
     } else if (disablePipelineObjectCacheDueToCommandLineOptions()) {
         EnablePipelineObjectCache = false;
+    }
+    if (PhaseSegmentLimit == 0) {
+        report_fatal_error("--phase-segment-limit must be positive");
     }
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
     // The salt becomes part of each cache file name.

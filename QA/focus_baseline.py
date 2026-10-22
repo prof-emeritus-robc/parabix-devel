@@ -9,11 +9,14 @@
 # For each input file and tool configuration, it
 #   - checks that the output with N threads matches the tool's default
 #     configuration with one thread;
-#   - records the best of R wall times with 1 and N threads;
+#   - records the best of R wall times with 1 and N threads, with the system time
+#     of the best run and the peak resident set size;
 #   - records -EnableCycleCounter reports with 1 and N threads and the pipeline
 #     graph, summarized by stage with stage_report.py (including the scaling ceiling);
 #   - estimates the work density: the number of bytes the transform stage
 #     receives, as a fraction of the input.
+#
+# With --layers, each configuration also runs with each given -focus-layers setting.
 #
 # Runs are sequential; N defaults to 3.  The JIT object cache is used as is, and each
 # configuration is run once before measurement, so compilation is not measured.
@@ -23,6 +26,7 @@
 import argparse
 import hashlib
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -51,16 +55,28 @@ def output_digest(cmd):
     return h.hexdigest()
 
 
+class Timing:
+    def __init__(self):
+        self.wall = None    # best wall time, s
+        self.sys = None     # system time of that run, s
+        self.rss = 0        # peak resident set size over all runs, MB
+
+
 def best_time(cmd, repeats):
-    best = None
+    t = Timing()
+    rss_unit = 1 if platform.system() == 'Darwin' else 1024  # ru_maxrss: bytes or KB
     for _ in range(repeats):
         start = time.perf_counter()
-        # No timeout here: with one, Python polls for the child's exit with sleeps of
-        # up to 50 ms, which quantizes the measured times.
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Wait with wait4, not with a timeout: with one, Python polls for the child's
+        # exit with sleeps of up to 50 ms, which quantizes the measured times.
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _, _, usage = os.wait4(p.pid, 0)
         elapsed = time.perf_counter() - start
-        best = elapsed if best is None else min(best, elapsed)
-    return best
+        p.returncode = 0
+        if t.wall is None or elapsed < t.wall:
+            t.wall, t.sys = elapsed, usage.ru_stime
+        t.rss = max(t.rss, usage.ru_maxrss * rss_unit / 1e6)
+    return t
 
 
 def density(cc_path):
@@ -85,12 +101,16 @@ def main():
     ap.add_argument('--config', action='append', default=None,
                     help='a configuration (options separated by spaces, "" for the default) to run '
                          'instead of the built-in list; may be repeated')
+    ap.add_argument('--layers', action='append', default=None,
+                    help='a -focus-layers setting (e.g., "transform" or "placement,transform"; "none" '
+                         'for no boundary) to run with each configuration; may be repeated')
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     N = args.threads
     inputs = sorted(f for f in os.listdir(args.inputs) if f.endswith('.txt'))
-    summary = ['| tool | config | input | MB | work density %% | 1-thread s | %d-thread s | speedup | ceiling | output |' % N,
-               '|---|---|---|---|---|---|---|---|---|---|']
+    summary = ['| tool | config | input | MB | work density %% | 1-thread s | %d-thread s | speedup | ceiling '
+               '| %d-thread sys s | peak RSS MB | output |' % (N, N),
+               '|---|---|---|---|---|---|---|---|---|---|---|---|']
     details = []
     for tool in args.tools.split(','):
         exe = os.path.join(args.bin, tool)
@@ -99,12 +119,15 @@ def main():
             mb = os.path.getsize(path) / 1e6
             reference = output_digest([exe, '--thread-num=1', path])
             configs = [c.split() for c in args.config] if args.config is not None else CONFIGS[tool]
+            if args.layers is not None:
+                configs = [c + ([] if l == 'none' else ['-focus-layers=' + l]) for c in configs for l in args.layers]
             for config in configs:
                 tag = '%s%s.%s' % (tool, ''.join(config), name)
                 base = [exe] + config
                 run(base + ['--thread-num=1', path])  # ensure the configuration is compiled
                 t1 = best_time(base + ['--thread-num=1', path], args.repeats)
                 tN = best_time(base + ['--thread-num=%d' % N, path], args.repeats)
+                rss = max(t1.rss, tN.rss)
                 same = output_digest(base + ['--thread-num=%d' % N, path]) == reference
                 cc1 = os.path.join(args.out, tag + '.cc1')
                 ccN = os.path.join(args.out, tag + '.cc%d' % N)
@@ -118,9 +141,10 @@ def main():
                 stages, overall = stage_report.summarize(cc1, ccN, graph)
                 d = density(cc1) if '-NoFocus' not in config else None
                 cfg = ' '.join(config) or 'default'
-                summary.append('| %s | %s | %s | %.0f | %s | %.3f | %.3f | %.2f | %.1f | %s |'
-                               % (tool, cfg, name, mb, '%.1f' % d if d is not None else '-', t1, tN, t1 / tN,
-                                  overall.get('ceiling', 0.0), 'ok' if same else 'DIFF'))
+                summary.append('| %s | %s | %s | %.0f | %s | %.3f | %.3f | %.2f | %.1f | %.3f | %.0f | %s |'
+                               % (tool, cfg, name, mb, '%.1f' % d if d is not None else '-', t1.wall, tN.wall,
+                                  t1.wall / tN.wall, overall.get('ceiling', 0.0), tN.sys, rss,
+                                  'ok' if same else 'DIFF'))
                 details.append('### %s %s on %s\n\n%s\n' % (tool, cfg, name, stage_report.format_report(stages, overall)))
                 print(summary[-1], flush=True)
     report = os.path.join(args.out, 'report.md')

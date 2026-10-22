@@ -393,11 +393,13 @@ alternative splitting, without `emptyMatchElimination`):
 6. lookahead chain → `chainMatchStarts` (exists; forces full Unicode indexing,
    which `determineREMode` must know: a chain analysis of the *top-level* RE
    for this goal);
-7. ends unique → `MatchStartsFromEnds` from spans and ends (moved from tconv;
-   the analysis is the `endsUnique` test of `lib/ldml/transform_plan.cpp:471`,
-   to be generalised with `CC_Sequence_Search`).
+7. ~~ends unique → `MatchStartsFromEnds` from spans and ends~~ — dropped in
+   milestone 2: it needs exact spans, which come only from named fixed spans,
+   unique prefixes, length classes and chains, whose starts strategies 3–6
+   compute directly (`chainSpans` itself computes the chain's starts).
+   `MatchStartsFromEnds` stays in tconv.
 
-The precondition is that every alternative reaches one of 3–7; otherwise the
+The precondition is that every alternative reaches one of 3–6; otherwise the
 RE is reported (later: region reversal, below).
 
 Tests (sub-second ctests, one test binary, inputs in `QA/`): each strategy, in
@@ -590,10 +592,9 @@ the buffering), and one more RE kernel.
    `removeUnneededCaptures`, `checkPreconditions` for Ends and Span reproducing
    today's fatal errors as reported failures; no other change for Ends/Span
    (icgrep ctests and `-ShowREs` output unchanged).
-2. **MatchStarts public mode** with strategies 1–4 and 7, byte or full
-   Unicode mode, its preconditions; move `MatchStartsFromEnds`; tests.
-3. **Length-class starts** (strategy 5) and `removeNullableSuffix`; chains as
-   the top-level query (strategy 6, forcing Unicode).
+2. **MatchStarts public mode** with strategies 1, 3, 4 and 6 (chains, pulled
+   forward), byte or full Unicode mode, its preconditions; tests.
+3. **Length-class starts** (strategy 5) and `removeNullableSuffix`.
 4. **tconv on MatchStarts**: replace `RulePipelineBuilder::matchStarts` (the
    `(?<=B)(?=T A)` trick) and the starts half of `matchPattern`; tconv
    translates its contexts and boundaries to standard REs; compare outputs
@@ -651,3 +652,32 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   property of the context, not the RE).
 - Test: `re_preconditions_test` (`tests/re_preconditions.cpp`), no pipeline
   compiled.
+
+## Milestone 2 status
+
+- `RE_PipelineBuilder::matchStartsPipeline` (for an RE prepared with the
+  `MatchStarts` goal): a mark at the first code unit of each match (offset 0);
+  in full Unicode indexing, at the character positions.
+- Mode (`determineREMode`): byte mode only when every alternative has a fixed
+  UTF-8 length; otherwise full Unicode indexing; never UTF-8 indexed (also for
+  `SearchReplace`).
+- `ModeTransformation` folds a trailing positive lookahead of variable length
+  into its alternative (`foldTrailingLookaheads`), before `LookAheadNamer`.
+- Strategies, chosen per alternative by `planMatchStarts` (shared by the
+  precondition check and the pipeline); an alternative with none is split by
+  `variableAltPromotion` if each part has one:
+  - fixed length: the ends shifted back by `length - 1 + grepOffset`;
+  - unique prefix (after leading lookbehinds, which then filter the starts):
+    a prefix of fixed length and a suffix that is not nullable, via
+    `uniquePrefixEndsBack`;
+  - chain: `chainSpans` is split into `parseChainForm` (no kernels) and
+    `chainFormStarts` (the starts, or for spans also the streams of the
+    coverage), with full Unicode indexing.
+- Each strategy compiles only the externals that it uses (the final stars of
+  a chain are made only for its coverage): a kernel with an unused output is
+  removed from the pipeline, which then fails.
+- Test: `match_starts_test` (`tests/match_starts.cpp`, `match_starts_test.py`):
+  22 REs over the lines of a multi-script text, compared with Python's `re`
+  (`re.match(line, p)` at each position); 0.2 s with the object cache, about
+  2–3 s on a first run that compiles the kernels.
+

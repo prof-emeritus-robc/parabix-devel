@@ -31,6 +31,7 @@
 #include <re/analysis/collect_ccs.h>
 #include <re/analysis/re_name_gather.h>
 #include <re/analysis/re_inspector.h>
+#include <re/analysis/nullable.h>
 #include <re/analysis/capture-ref.h>
 #include <re/printer/re_printer.h>
 #include <re/toolchain/toolchain.h>
@@ -948,6 +949,23 @@ static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     if (useFixedUTF8 && !ByteModeLookaheads().validateRE(re)) {
         useFixedUTF8 = false;
     }
+    // The starts of the matches (and search and replace) are computed in code
+    // units: in byte mode only for alternatives of fixed length (shifted back
+    // from their ends), and otherwise with full Unicode indexing, never the
+    // UTF-8 indexed mode.
+    const bool codeUnitGoal = (opts.goal == RE_Goal::MatchStarts) || (opts.goal == RE_Goal::SearchReplace);
+    if (useFixedUTF8 && codeUnitGoal) {
+        std::vector<RE *> alts;
+        if (Alt * const alt = dyn_cast<Alt>(re)) {
+            alts.assign(alt->begin(), alt->end());
+        } else {
+            alts.push_back(re);
+        }
+        for (RE * a : alts) {
+            const auto range = getLengthRange(a, &cc::UTF8);
+            if (range.first != range.second) useFixedUTF8 = false;
+        }
+    }
     if (useFixedUTF8) {
         mode.lengthAlphabet = &cc::UTF8;
         mode.indexAlphabet = &cc::UTF8;
@@ -955,7 +973,7 @@ static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
         mode.lengthAlphabet = &cc::Unicode;
         // Determine whether UTF8-indexed or Unicode-indexed streams will
         // be used for regular expression processing.
-        bool useIndexedUTF8 = !opts.unicodeBasisOverride
+        bool useIndexedUTF8 = !codeUnitGoal && !opts.unicodeBasisOverride
                                     && !hasReference(re)
                                     && !opts.forceUnicodeIndexing
                                     && !hasGraphemeClusterBoundary(re)
@@ -1788,9 +1806,29 @@ bool RE_PipelineBuilder::lengthClassSpans(RE * re, StreamSet * spans) {
     return true;
 }
 
-bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
-    // Chains are compiled with one position per code unit.
-    if (mCtxt.mIndexStream != nullptr) return false;
+//
+// A lookahead chain, possibly preceded by lookbehinds and followed by final
+// stars or lookaheads, as matched by chainSpans and chainFormStarts (see
+// parseChainForm).
+//
+struct ChainForm {
+    // A final star: 's' of a class cc, 'c' of a string class (strings).
+    struct Final {
+        char kind;
+        RE * re;
+        CC * cc;
+        std::vector<std::vector<CC *>> strings;
+    };
+    std::vector<RE *> lookbehinds;      // at the start: restrict the starts
+    std::vector<RE *> afterChain;       // lookaheads after the chain
+    std::vector<Final> finals;          // from the right
+    bool occurrenceRequired = false;    // an occurrence of the first final string class
+    std::vector<LookaheadSegment> segments;
+};
+
+// Parse an RE as a chain with final stars (see chainSpans): no kernels are
+// made, so that the form can be checked before compiling.
+static bool parseChainForm(RE * re, const cc::Alphabet * lengthAlphabet, ChainForm & form) {
     std::vector<RE *> elems;
     if (Seq * seq = dyn_cast<Seq>(re)) {
         elems.assign(seq->begin(), seq->end());
@@ -1800,7 +1838,7 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     // Lookbehinds at the start hold at the starts of the matches: they are
     // compiled on their own and restrict the starts of the rest.
     const auto lookbehindEnd = std::find_if_not(elems.begin(), elems.end(), isLookbehind);
-    const std::vector<RE *> lookbehinds(elems.begin(), lookbehindEnd);
+    form.lookbehinds.assign(elems.begin(), lookbehindEnd);
     elems.erase(elems.begin(), lookbehindEnd);
     if (elems.empty()) return false;
     // Negative lookaheads (?!Y) at the end (possibly externalized), following
@@ -1829,7 +1867,7 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     // lookaheads (which the chain itself handles), they are compiled on their
     // own, as the positions where the rest after the chain holds, and the
     // star is the last segment of the chain.
-    std::vector<RE *> afterChain;
+    std::vector<RE *> & afterChain = form.afterChain;
     {
         size_t m = elems.size();
         while ((m > 1) && isLookahead(elems[m - 1])) {
@@ -1850,14 +1888,9 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     // a string class with lb = 1 must be the first final star, and the
     // chain then ends where an occurrence begins.  (Kernels are created only
     // once the form is known.)
-    struct Final {
-        char kind;
-        RE * re;
-        CC * cc;
-        std::vector<std::vector<CC *>> strings;
-    };
-    std::vector<Final> finals;   // from the right
-    bool occurrenceRequired = false;
+    using Final = ChainForm::Final;
+    std::vector<Final> & finals = form.finals;
+    bool & occurrenceRequired = form.occurrenceRequired;
     while (afterChain.empty() && !elems.empty()) {
         Rep * const rep = dyn_cast<Rep>(elems.back());
         if ((rep == nullptr) || (rep->getUB() != Rep::UNBOUNDED_REP)) break;
@@ -1885,7 +1918,7 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
             break;
         }
     }
-    std::vector<LookaheadSegment> segments;
+    std::vector<LookaheadSegment> & segments = form.segments;
     if (elems.empty()) {
         if (!occurrenceRequired) return false;
     } else {
@@ -1914,14 +1947,23 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
                 elems.push_back(makeLookAheadAssertion(makeCC(0, UCD::UNICODE_MAX, alphabet)));
             }
         }
-        if (!parseLookaheadChain(makeSeq(elems.begin(), elems.end()), mCtxt.mLengthAlphabet, segments, false)) {
+        if (!parseLookaheadChain(makeSeq(elems.begin(), elems.end()), lengthAlphabet, segments, false)) {
             return false;
         }
         if (occurrenceRequired || !afterChain.empty()) segments.pop_back();
         if (segments.empty()) return false;
     }
-    std::vector<ChainCoverage::Final> finalSteps;
-    for (auto f = finals.rbegin(); f != finals.rend(); ++f) {
+    return true;
+}
+
+StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vector<ChainStepStreams> & rec,
+                                                std::vector<ChainCoverage::Final> & finalSteps, StreamSet * out) {
+    // The streams of the final stars are made for the coverage (finalSteps
+    // given), or for the starts when an occurrence of the first is required.
+    // (A kernel whose output is not used would be removed from the pipeline.)
+    const bool coverage = (out == nullptr);
+    for (auto f = form.finals.rbegin(); f != form.finals.rend(); ++f) {
+        if (!coverage && !(form.occurrenceRequired && finalSteps.empty())) break;
         StreamSet * strm = nullptr;
         if (f->kind == 's') {
             strm = classStream(f->re, f->cc);
@@ -1936,22 +1978,21 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     // zero-width RE, whose matches are marked at the positions after which
     // they hold, as are the starts).
     StreamSet * Hend = nullptr;
-    if (!afterChain.empty()) {
+    if (!form.afterChain.empty()) {
         Hend = mPB.CreateStreamSet(1);
-        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(afterChain.begin(), afterChain.end()), Hend);
+        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(form.afterChain.begin(), form.afterChain.end()), Hend);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             mPB.captureBitstream("afterChainHolds", Hend);
         }
-    } else if (occurrenceRequired) {
+    } else if (form.occurrenceRequired) {
         Hend = mPB.CreateStreamSet(1);
         mPB.CreateKernelCall<StreamSelect>(Hend, Select(finalSteps.front().strm, {1}));
     }
-    std::vector<ChainStepStreams> rec;
-    StreamSet * starts = segments.empty() ? Hend : chainMatchStarts(segments, &rec, Hend);
-    if (!lookbehinds.empty()) {
+    StreamSet * starts = form.segments.empty() ? Hend : chainMatchStarts(form.segments, &rec, Hend);
+    if (!form.lookbehinds.empty()) {
         StreamSet * const holds = mPB.CreateStreamSet(1);
-        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(lookbehinds.begin(), lookbehinds.end()), holds);
-        StreamSet * const restricted = mPB.CreateStreamSet(1);
+        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(form.lookbehinds.begin(), form.lookbehinds.end()), holds);
+        StreamSet * const restricted = out ? out : mPB.CreateStreamSet(1);
         AndCombine(mPB, starts, holds, restricted);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
             mPB.captureBitstream("chainStarts", starts);
@@ -1959,6 +2000,22 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
         }
         starts = restricted;
     }
+    if (out && (starts != out)) {
+        mPB.CreateKernelCall<StreamSelect>(out, Select(starts, {0}));
+        starts = out;
+    }
+    return starts;
+}
+
+bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
+    // Chains are compiled with one position per code unit.
+    if (mCtxt.mIndexStream != nullptr) return false;
+    ChainForm form;
+    if (!parseChainForm(re, mCtxt.mLengthAlphabet, form)) return false;
+    std::vector<ChainStepStreams> rec;
+    std::vector<ChainCoverage::Final> finalSteps;
+    StreamSet * const starts = chainFormStarts(form, rec, finalSteps);
+    const std::vector<LookaheadSegment> & segments = form.segments;
     std::vector<ChainCoverage::Step> steps;
     for (unsigned i = 0; i < segments.size(); ++i) {
         const LookaheadSegment & seg = segments[i];
@@ -1976,6 +2033,205 @@ bool RE_PipelineBuilder::chainSpans(RE * re, StreamSet * spans) {
     }
     mPB.CreateKernelCall<ChainCoverage>(starts, steps, finalSteps, mCtxt.mMatchFollows, spans);
     return true;
+}
+
+//
+// The strategies for the starts of the matches of an alternative of an RE as
+// compiled (see RE_PipelineBuilder::matchStartsPipeline):
+//   FixedLength:  the ends of the matches, shifted back by the length (and
+//                 the offset of the marks after the ends);
+//   UniquePrefix: after any lookbehinds at its start, a prefix of fixed length
+//                 that can match nowhere else within a match (ParseUniquePrefix),
+//                 followed by a suffix that is not nullable: the matches of the
+//                 prefix that begin matches, restricted to where the
+//                 lookbehinds hold;
+//   Chain:        a lookahead chain with final stars (parseChainForm), with
+//                 Unicode code units.
+//
+enum class StartsStrategy {FixedLength, UniquePrefix, Chain};
+
+struct MatchStartsAlternative {
+    RE * re = nullptr;
+    StartsStrategy strategy = StartsStrategy::FixedLength;
+    std::vector<RE *> lookbehinds;      // UniquePrefix
+    RE * prefix = nullptr;              // UniquePrefix
+    RE * suffix = nullptr;              // UniquePrefix
+    ChainForm chain;                    // Chain
+};
+
+static bool startsStrategy(RE * re, const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet,
+                           MatchStartsAlternative & a) {
+    a.re = re;
+    const auto range = getLengthRange(re, lengthAlphabet);
+    if ((range.first == range.second) && (range.first != INT_MAX)) {
+        a.strategy = StartsStrategy::FixedLength;
+        return true;
+    }
+    std::vector<RE *> elems;
+    if (Seq * seq = dyn_cast<Seq>(re)) {
+        elems.assign(seq->begin(), seq->end());
+    } else {
+        elems.push_back(re);
+    }
+    const auto lookbehindEnd = std::find_if_not(elems.begin(), elems.end(), isLookbehind);
+    RE * prefix, * suffix;
+    std::tie(prefix, suffix) = ParseUniquePrefix(makeSeq(lookbehindEnd, elems.end()));
+    if (!isEmptySeq(prefix) && !isEmptySeq(suffix) && !isNullable(suffix)) {
+        const auto pfxRange = getLengthRange(prefix, lengthAlphabet);
+        if ((pfxRange.first == pfxRange.second) && (pfxRange.first > 0)) {
+            a.strategy = StartsStrategy::UniquePrefix;
+            a.lookbehinds.assign(elems.begin(), lookbehindEnd);
+            a.prefix = prefix;
+            a.suffix = suffix;
+            return true;
+        }
+    }
+    if ((codeUnitAlphabet == &cc::Unicode) && parseChainForm(re, lengthAlphabet, a.chain)) {
+        a.strategy = StartsStrategy::Chain;
+        return true;
+    }
+    return false;
+}
+
+// The strategies of the alternatives of an RE as compiled, and the
+// alternatives that have none.  An alternative with none is split by promoting
+// its variable-length alternations (as for spans, see spanFactoring), if each
+// of the alternatives so formed has one.
+static void planMatchStarts(RE * re, const cc::Alphabet * lengthAlphabet, const cc::Alphabet * codeUnitAlphabet,
+                            std::vector<MatchStartsAlternative> & plan, std::vector<RE *> & unsupported) {
+    std::vector<RE *> alts;
+    if (Alt * const alt = dyn_cast<Alt>(re)) {
+        alts.assign(alt->begin(), alt->end());
+    } else {
+        alts.push_back(re);
+    }
+    if (alts.empty()) {
+        // Matching nothing: no starts, as for a fixed-length RE.
+        MatchStartsAlternative a;
+        a.re = re;
+        plan.push_back(a);
+        return;
+    }
+    const size_t limit = 32;
+    for (RE * r : alts) {
+        MatchStartsAlternative a;
+        if (startsStrategy(r, lengthAlphabet, codeUnitAlphabet, a)) {
+            plan.push_back(std::move(a));
+            continue;
+        }
+        RE * promoted = r;
+        for (unsigned pass = 0; pass < 4; ++pass) {
+            RE * const next = variableAltPromotion(promoted, lengthAlphabet);
+            if ((next == promoted) || (isa<Alt>(next) && (cast<Alt>(next)->size() > limit))) break;
+            promoted = next;
+        }
+        std::vector<MatchStartsAlternative> split;
+        bool supported = isa<Alt>(promoted);
+        if (supported) {
+            for (RE * p : *cast<Alt>(promoted)) {
+                MatchStartsAlternative pa;
+                if (!startsStrategy(p, lengthAlphabet, codeUnitAlphabet, pa)) {
+                    supported = false;
+                    break;
+                }
+                split.push_back(std::move(pa));
+            }
+        }
+        if (supported) {
+            for (auto & pa : split) plan.push_back(std::move(pa));
+        } else {
+            unsupported.push_back(r);
+        }
+    }
+}
+
+void RE_PipelineBuilder::matchStartsPipeline(RE * re, StreamSet * starts) {
+    RE_ModeOptions opts = mModeOptions;
+    opts.goal = RE_Goal::MatchStarts;
+    if (mHaveSourceContext) {
+        matchStartsPipeline(::prepareRE(re, opts), starts);
+        return;
+    }
+    // A hand-built RE_CompilerContext: the RE is compiled as given.
+    matchStartsPipeline(PreparedRE{re, RE_Mode{nullptr, nullptr}, opts}, starts);
+}
+
+void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, StreamSet * starts) {
+    if (prepared.options.goal != RE_Goal::MatchStarts) {
+        llvm::report_fatal_error("matchStartsPipeline: the RE must be prepared with the MatchStarts goal");
+    }
+    usePrepared(prepared);
+    RE * re = prepared.re;
+    ensurePrepared(re);
+    mRE = applyModePasses(re, RE_Goal::MatchStarts);
+    mRE = processReferences(mRE);
+    prepareExternals(mRE);
+    std::vector<MatchStartsAlternative> plan;
+    std::vector<RE *> unsupported;
+    planMatchStarts(mRE, mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet, plan, unsupported);
+    // (The preconditions have been checked by applyModePasses.)
+    assert(unsupported.empty());
+    if (plan.size() == 1) {
+        alternativeStarts(plan.front(), starts);
+        return;
+    }
+    std::vector<StreamSet *> allStarts;
+    for (const MatchStartsAlternative & a : plan) {
+        StreamSet * const s = mPB.CreateStreamSet(1);
+        alternativeStarts(a, s);
+        allStarts.push_back(s);
+    }
+    mPB.CreateKernelCall<StreamsMerge>(allStarts, starts);
+}
+
+void RE_PipelineBuilder::alternativeStarts(const MatchStartsAlternative & a, StreamSet * out) {
+    // Code units are positions: the starts are marked in code units.
+    assert(mCtxt.mIndexStream == nullptr);
+    if (a.strategy == StartsStrategy::FixedLength) {
+        // A match of length L marked at its last code unit plus the offset g
+        // begins L - 1 + g positions before the mark.
+        const int length = getLengthRange(a.re, mCtxt.mLengthAlphabet).first;
+        const int shift = std::max(0, length - 1 + static_cast<int>(grepOffset(a.re)));
+        if (shift == 0) {
+            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, a.re, out);
+        } else {
+            StreamSet * const ends = mPB.CreateStreamSet(1);
+            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, a.re, ends);
+            mPB.CreateKernelCall<ShiftBack>(ends, out, shift);
+        }
+    } else if (a.strategy == StartsStrategy::UniquePrefix) {
+        // The ends of the matches, shifted back to the preceding match of the
+        // prefix (see uniquePrefixEndsBack), which begins them, then back by
+        // the length of the prefix (and the offset of its marks).
+        Name * const pfxName = makeUniquePrefixName(a.prefix);
+        compileExternal(pfxName);
+        auto fp = mCtxt.mExternals.find(pfxName->getFullName());
+        assert(fp != mCtxt.mExternals.end());
+        StreamSet * const pfxStrm = fp->second.extStream;
+        const int shift = fp->second.lgthRange.first - 1 + static_cast<int>(fp->second.offset);
+        StreamSet * const matchEnd = mPB.CreateStreamSet(1);
+        mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq({pfxName, a.suffix}), matchEnd);
+        StreamSet * const endsBack = uniquePrefixEndsBack(pfxStrm, matchEnd);
+        const bool last = (shift <= 0) && a.lookbehinds.empty();
+        StreamSet * const atPrefix = last ? out : mPB.CreateStreamSet(1);
+        AndCombine(mPB, pfxStrm, endsBack, atPrefix);
+        StreamSet * starts = atPrefix;
+        if (shift > 0) {
+            starts = a.lookbehinds.empty() ? out : mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<ShiftBack>(atPrefix, starts, shift);
+        }
+        if (!a.lookbehinds.empty()) {
+            // The lookbehinds, compiled as a zero-width RE, are marked at the
+            // positions where they hold.
+            StreamSet * const holds = mPB.CreateStreamSet(1);
+            mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(a.lookbehinds.begin(), a.lookbehinds.end()), holds);
+            AndCombine(mPB, starts, holds, out);
+        }
+    } else {
+        std::vector<ChainStepStreams> rec;
+        std::vector<ChainCoverage::Final> finalSteps;
+        chainFormStarts(a.chain, rec, finalSteps, out);
+    }
 }
 
 namespace {
@@ -2097,9 +2353,42 @@ struct ModeTransformation {
     re::LookAheadNamer LA;
 };
 
+// For the starts of the matches, a positive lookahead (?=C) of variable length
+// at the end of an alternative R (?=C) is matched as part of it: the starts of
+// R (?=C) are those of RC.  (A lookahead of fixed length is compiled with R.)
+RE * foldTrailingLookaheads(RE * re, const cc::Alphabet * lengthAlphabet) {
+    if (Alt * const alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> folded;
+        bool changed = false;
+        for (RE * a : *alt) {
+            folded.push_back(foldTrailingLookaheads(a, lengthAlphabet));
+            changed |= (folded.back() != a);
+        }
+        return changed ? makeAlt(folded.begin(), folded.end()) : re;
+    }
+    std::vector<RE *> elems;
+    if (Seq * const seq = dyn_cast<Seq>(re)) {
+        elems.assign(seq->begin(), seq->end());
+    } else {
+        elems.push_back(re);
+    }
+    if (elems.empty()) return re;
+    Assertion * const a = dyn_cast<Assertion>(elems.back());
+    if ((a == nullptr) || (a->getKind() != Assertion::Kind::LookAhead) || (a->getSense() != Assertion::Sense::Positive)) {
+        return re;
+    }
+    const auto range = getLengthRange(a->getAsserted(), lengthAlphabet);
+    if (range.first == range.second) return re;
+    elems.back() = a->getAsserted();
+    return makeSeq(elems.begin(), elems.end());
+}
+
 RE * ModeTransformation::transform(RE * re, RE_Goal goal) {
     RE * xfrmedRE = expandPermutes(re);
     xfrmedRE = regular_expression_passes(xfrmedRE, mLengthAlphabet, goal);
+    if (goal == RE_Goal::MatchStarts) {
+        xfrmedRE = foldTrailingLookaheads(xfrmedRE, mLengthAlphabet);
+    }
     xfrmedRE = PE.transformRE(xfrmedRE);
     // CCs of characters of more than one UTF-8 length are computed as externals
     // when the code units are UTF-8.  (With Unicode code units, every CC is one
@@ -2135,7 +2424,7 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
     // The transformations here only check the RE (processReferences applies them).
     QuietREPrinting quiet;
     std::vector<PreconditionFailure> failures;
-    if ((goal == RE_Goal::MatchStarts) || (goal == RE_Goal::SearchReplace)) {
+    if (goal == RE_Goal::SearchReplace) {
         failures.push_back(PreconditionFailure{goal, transformed,
                            std::string("the ") + goalName(goal) + " goal is not yet implemented"});
     }
@@ -2171,6 +2460,19 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
     for (Reference * r : refs.mReferences) {
         failures.push_back(PreconditionFailure{goal, r,
                            "a back reference must be to a capture of fixed length at a fixed distance"});
+    }
+    // The starts of the matches of each alternative (see matchStartsPipeline),
+    // of the RE as compiled.
+    if (goal == RE_Goal::MatchStarts) {
+        std::vector<MatchStartsAlternative> plan;
+        std::vector<RE *> unsupported;
+        planMatchStarts(fixedRefs, mLengthAlphabet, mCodeUnitAlphabet, plan, unsupported);
+        for (RE * u : unsupported) {
+            failures.push_back(PreconditionFailure{goal, u,
+                               "no strategy for the starts of the matches: not of fixed length, without a unique "
+                               "prefix of fixed length followed by a suffix that is not nullable, and not a "
+                               "lookahead chain (with full Unicode indexing)"});
+        }
     }
     return failures;
 }

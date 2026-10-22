@@ -14,6 +14,8 @@
 #include <pablo/pablo.h>
 namespace kernel { class StreamSet; }
 namespace re { struct LookaheadSegment; }
+struct ChainForm;
+struct MatchStartsAlternative;
 namespace cc { class Alphabet; }
 namespace kernel { class PipelineBuilder; }
 
@@ -119,7 +121,9 @@ PreparedRE prepareRE(re::RE * re, const RE_ModeOptions & opts = RE_ModeOptions{}
 // externals: fixed length, a fixed-length unique prefix or a lookahead chain,
 // which requires Unicode code units) and of the back references (to captures
 // of fixed length at fixed distances, of enumerated or codepoint properties).
-// The MatchStarts and SearchReplace goals are not yet implemented.
+// For the MatchStarts goal, each alternative must have a strategy for the
+// starts of its matches (see matchStartsPipeline).  The SearchReplace goal is
+// not yet implemented.
 //
 struct PreconditionFailure {
     re::RE_Goal goal;
@@ -524,6 +528,17 @@ public:
     void matchSpanPipeline(re::RE * re, kernel::StreamSet * matches, kernel::StreamSet * spans);
     void matchSearchPipeline(const PreparedRE & re, kernel::StreamSet * results);
     void matchSpanPipeline(const PreparedRE & re, kernel::StreamSet * matches, kernel::StreamSet * spans);
+
+    // The starts of the matches: a mark at the first code unit of each match
+    // (for an empty match, at its position).  Each alternative of the RE has
+    // the starts of its matches computed by the first strategy that applies:
+    // fixed length, a unique prefix (after lookbehinds) or a lookahead chain;
+    // a trailing lookahead of variable length is matched as part of it.  The RE must be prepared with the
+    // MatchStarts goal, which selects byte mode or full Unicode indexing (never
+    // the UTF-8 indexed mode): in full Unicode indexing, the marks are at the
+    // positions of characters (see usesUnicodeIndexing and getU8Index).
+    void matchStartsPipeline(re::RE * re, kernel::StreamSet * starts);
+    void matchStartsPipeline(const PreparedRE & re, kernel::StreamSet * starts);
     kernel::PipelineBuilder & getPipelineBuilder() {return mPB;}
 
 protected:
@@ -578,6 +593,16 @@ protected:
     kernel::StreamSet * chainMatchStarts(const std::vector<re::LookaheadSegment> & segments,
                                          std::vector<ChainStepStreams> * steps = nullptr,
                                          kernel::StreamSet * Hend = nullptr);
+
+    // The starts of the matches of a chain form (see parseChainForm): for its
+    // coverage, recording the streams of its segments and final stars; or
+    // into out, for the starts alone.
+    kernel::StreamSet * chainFormStarts(const ChainForm & form, std::vector<ChainStepStreams> & rec,
+                                        std::vector<ChainCoverage::Final> & finalSteps,
+                                        kernel::StreamSet * out = nullptr);
+
+    // The starts of the matches of an alternative (see matchStartsPipeline).
+    void alternativeStarts(const MatchStartsAlternative & a, kernel::StreamSet * out);
 
     // The spans of the matches of an RE that is a chain (with no star
     // segment required), possibly followed by final stars, each of a class

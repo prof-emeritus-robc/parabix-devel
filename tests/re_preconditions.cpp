@@ -40,8 +40,13 @@ const PreconditionCase Cases[] = {
     {"(a)\\1", RE_Goal::MatchEnds, &cc::UTF8, true},               // fixed back reference
     {"(a+)\\1", RE_Goal::MatchEnds, &cc::UTF8, false},             // variable capture
     {"abc", RE_Goal::MatchSpans, &cc::UTF8, true},
-    {"abc", RE_Goal::MatchStarts, &cc::UTF8, false},               // not yet implemented
-    {"abc", RE_Goal::SearchReplace, &cc::UTF8, false},
+    {"abc", RE_Goal::MatchStarts, &cc::UTF8, true},                // fixed length (byte mode)
+    {"(?<=a)q[a-z]*u", RE_Goal::MatchStarts, &cc::UTF8, true},     // unique prefix
+    {"[a-z]+ing", RE_Goal::MatchStarts, &cc::UTF8, true},          // chain (Unicode mode)
+    {"ab(?=c+d)", RE_Goal::MatchStarts, &cc::UTF8, true},          // trailing lookahead folded
+    {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::UTF8, false},         // no strategy
+    {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::Unicode, false},
+    {"abc", RE_Goal::SearchReplace, &cc::UTF8, false},             // not yet implemented
 };
 
 struct CaptureCounter final : public RE_Inspector {

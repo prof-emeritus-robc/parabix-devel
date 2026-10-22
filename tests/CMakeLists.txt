@@ -62,6 +62,13 @@ add_test(NAME re_preconditions_test
     WORKING_DIRECTORY ${TEST_BIN_DIR}
     COMMAND ./re_preconditions)
 
+# The MatchStarts mode of the regular expression engine, checked with Python's re
+parabix_add_executable(NAME match_starts SRC match_starts.cpp
+                       DEPS kernel.re kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.util re.parse toolchain)
+add_test(NAME match_starts_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/match_starts_test.py ${TEST_BIN_DIR}/match_starts)
+
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

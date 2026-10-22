@@ -137,6 +137,10 @@ later-phase segment is empty, and the earlier count looked at kernels separately
 - **Remedy 2 of the plan** (releasing skipped partitions without waiting for the previous
   segment) needs a new lock protocol; deferred to Phase 5, where more threads would make
   such waits more frequent.
-- **Tools found broken along the way:** `-TraceDynamicBuffers` crashes nfd with or without
-  boundaries, and `-TraceUnconsumedItemCounts` reports only zeros. The cycle counter
-  reports waits in the partition-jump path as pipeline overhead of a phase's first kernel.
+- **Tools found broken along the way, now fixed:** `-TraceDynamicBuffers` crashed nfd with
+  or without boundaries (its logging functions used scalar-field pointers of the pipeline's
+  main function), and `-TraceUnconsumedItemCounts` and `-TraceProducedItemCounts` reported
+  only zeros (the printer dropped the oldest log chunk). The per-segment reports also
+  stopped at the first phase's segment count; they now cover every phase.
+- **Still open:** the cycle counter reports waits in the partition-jump path as pipeline
+  overhead of a phase's first kernel.

@@ -3,45 +3,54 @@
 # Part of the Parabix Project, under the Open Software License 3.0.
 # SPDX-License-Identifier: OSL-3.0
 #
-# Summarize a -TraceStridesPerSegment report: for each traced kernel, the number of
-# segments, how many of them processed no strides, and the mean number of strides of
-# the others.
+# Summarize a -TraceStridesPerSegment report of a pipeline with phase boundaries.
 #
-# In a pipeline with phase boundaries, each phase numbers its segments separately,
-# and the report lists all phases' kernels side by side by segment number.  A
-# kernel's segments are the rows up to its last nonzero entry; empty segments of a
-# later phase are the ones its threads ran while the earlier phase had produced
-# nothing new for it.
+# Each phase numbers its segments separately, and the report lists all phases'
+# kernels side by side by segment number.  Given the id of the first kernel of each
+# later phase (as in the report's header, e.g., "84" for "84.Invert"), this prints,
+# for each phase, its number of segments and how many of them processed nothing in
+# any of the phase's traced kernels.
 #
-# Usage: python3 phase_segments.py trace.txt
+# A kernel with zero strides in a segment does not by itself mean an empty segment:
+# within a phase, a partition may process nothing in one segment and twice as much
+# in the next.
+#
+# Usage: python3 phase_segments.py trace.txt FIRST_KERNEL_OF_PHASE_2 [FIRST_KERNEL_OF_PHASE_3 ...]
 
 import csv
 import sys
 
 
-def summarize(path):
+def summarize(path, boundaries):
     lines = [l for l in open(path, errors='replace') if l.strip()]
     start = next(i for i, l in enumerate(lines) if l.startswith('SEG #'))
     rows = list(csv.reader(lines[start:]))
-    header, data = rows[0][1:], [r[1:] for r in rows[1:] if r and r[0].strip().isdigit()]
+    header, data = rows[0], [r for r in rows[1:] if r and r[0].strip().isdigit()]
+    starts = [0] + sorted(boundaries)
+
+    def phase_of(column):
+        kid = int(header[column].split('.')[0])
+        return max(i for i, s in enumerate(starts) if kid >= s)
+
+    def value(row, column):
+        return int(row[column]) if column < len(row) and row[column].strip() else 0
+
     result = []
-    for k, name in enumerate(header):
-        counts = [int(r[k]) for r in data if k < len(r) and r[k].strip()]
-        while counts and counts[-1] == 0:
-            counts.pop()
-        nonzero = [c for c in counts if c]
-        result.append((name, len(counts), len(counts) - len(nonzero),
-                       sum(nonzero) / len(nonzero) if nonzero else 0.0))
+    for phase in range(len(starts)):
+        columns = [k for k in range(1, len(header)) if phase_of(k) == phase]
+        busy = [any(value(r, k) for k in columns) for r in data]
+        segments = max((j + 1 for j, b in enumerate(busy) if b), default=0)
+        result.append((phase + 1, len(columns), segments, segments - sum(busy[:segments])))
     return result
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit('usage: phase_segments.py trace.txt')
-    print('| kernel | segments | empty | mean strides of the others |')
+    if len(sys.argv) < 2:
+        sys.exit('usage: phase_segments.py trace.txt [first kernel id of each later phase ...]')
+    print('| phase | traced kernels | segments | empty segments |')
     print('|---|---|---|---|')
-    for name, segments, empty, mean in summarize(sys.argv[1]):
-        print('| %s | %d | %d | %.1f |' % (name[:60], segments, empty, mean))
+    for phase, kernels, segments, empty in summarize(sys.argv[1], [int(a) for a in sys.argv[2:]]):
+        print('| %d | %d | %d | %d |' % (phase, kernels, segments, empty))
 
 
 if __name__ == '__main__':

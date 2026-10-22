@@ -4743,9 +4743,13 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
     return matches;
 }
 
-//  The positions at which a pattern (a sequence of items) matches with its
-//  contexts: the pattern and its after context as a lookahead (which the engine
-//  marks at the position it begins), after a lookbehind of the before context.
+//  The first positions of the matches of a pattern (a sequence of items) with
+//  contexts: the starts of the matches of the pattern followed by its after
+//  context, after a lookbehind of the before context, computed by the
+//  MatchStarts mode of the regular expression engine.  If the engine cannot
+//  compute them (see checkPreconditions), they are the positions at which the
+//  pattern and its after context hold as a lookahead (which the engine marks at
+//  the position it begins).
 StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                                              StreamSet * U21) {
     const Insertions none;
@@ -4756,12 +4760,20 @@ StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * eng
     }
     std::vector<re::RE *> ahead(text.begin(), text.end());
     if (engineAfter) ahead.push_back(ldml::possessiveContext(ldml::expandedContext(engineAfter, none, DeletionMark), true));
-    items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
-    const PreparedRE prepared = prepareRE(re::makeSeq(items.begin(), items.end()));
-    StreamSet * const matches = mP.CreateStreamSet(1);
+    StreamSet * const starts = mP.CreateStreamSet(1);
     RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
-    engine.matchSearchPipeline(prepared, matches);
-    return matches;
+    std::vector<re::RE *> pattern(items);
+    pattern.insert(pattern.end(), ahead.begin(), ahead.end());
+    RE_ModeOptions opts;
+    opts.goal = re::RE_Goal::MatchStarts;
+    const PreparedRE prepared = prepareRE(re::makeSeq(pattern.begin(), pattern.end()), opts);
+    if (checkPreconditions(prepared, &cc::Unicode).empty()) {
+        engine.matchStartsPipeline(prepared, starts);
+        return starts;
+    }
+    items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
+    engine.matchSearchPipeline(prepareRE(re::makeSeq(items.begin(), items.end())), starts);
+    return starts;
 }
 
 //  The stream (or stream set) of the CCs for a vector of sets, at each position of U21.
@@ -4982,7 +4994,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
 
     //  Phase 1.  The matches of the string rules, at their first positions: of a
     //  rule of tier A or B (see FusedRules), computed by the fused kernels; of another,
-    //  by the regular expression engine (at its last character, shifted back).
+    //  by the regular expression engine (its MatchStarts mode, see matchStarts).
     //  Within a filter, the n characters of a match must all be within the mask.
     const size_t numStringRules = step.stringRules.size();
     std::vector<bool> fusedMatch(numStringRules, false);
@@ -5023,21 +5035,21 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     auto engineFirsts = [&](size_t r) {
         const ldml::StringRule & rule = step.stringRules[r];
         const size_t n = texts[r].size();
-        StreamSet * matches = matchPositions(rule.engineBefore, rule.engineAfter, texts[r], U21);
+        std::vector<re::RE *> items;
+        for (const UCD::UnicodeSet & chars : texts[r]) items.push_back(re::makeCC(chars, &cc::Unicode));
+        StreamSet * firsts = matchStarts(rule.engineBefore, rule.engineAfter, items, U21);
         if (mask) {
+            //  (The j-th character of a match, from its first position.)
             for (size_t j = 0; j < n; j++) {
                 StreamSet * within = mask;
                 if (j > 0) {
                     within = P.CreateStreamSet(1);
-                    P.CreateKernelCall<ShiftForward>(mask, within, static_cast<unsigned>(j));
+                    P.CreateKernelCall<ShiftBack>(mask, within, static_cast<unsigned>(j));
                 }
-                matches = combine(matches, within, false);
+                firsts = combine(firsts, within, false);
             }
         }
-        if (n == 1) return matches;
-        StreamSet * const first = P.CreateStreamSet(1);
-        P.CreateKernelCall<ShiftBack>(matches, first, static_cast<unsigned>(n - 1));
-        return first;
+        return firsts;
     };
     auto fusedRule = [&](size_t r) {
         FusedStringRule fr;

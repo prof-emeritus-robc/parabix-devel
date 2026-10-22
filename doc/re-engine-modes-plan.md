@@ -701,3 +701,33 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   mode, nullable suffixes, the empty RE `x*` in Unicode mode), and
   `re_preconditions_test` cases (too many length classes).
 
+## Milestone 4 status
+
+- `RulePipelineBuilder::matchStarts` computes the starts of
+  `(?<=B) T A` (before context as a lookbehind, the text, the after context)
+  with the MatchStarts mode, in place of the zero-width search for
+  `(?<=B)(?=T A)`. tconv checks the preconditions first and falls back to the
+  zero-width search if they fail; in the CLDR transforms (other than the Han
+  transforms), the 149 uses in 68 transforms all use the engine.
+- The first positions of the string rules matched by the engine
+  (`engineFirsts`) are their starts by `matchStarts`, rather than the ends
+  shifted back by `grepOffset` and by the length; within a filter, the mask is
+  checked at each character of a match by shifting it back.
+- `MatchStartsFromEnds` stays in tconv: it gives the first start of each run of
+  spans, not every start (the two differ where a match begins within another),
+  and the spans that it uses are needed for coverage and selection anyway.
+- The contexts were already translated to standard REs by tconv's planning:
+  `ldml::engineContext` drops the text boundary `[$]` where a character must
+  be matched beyond it and turns a final negated set into a negative
+  lookahead (or lookbehind), and `ldml::expandedContext` and
+  `ldml::possessiveContext` give the sets and ICU's possessive matching. No
+  further translation was needed.
+- Verification (build22, LLVM 22): the 285 CLDR transform test files (all but
+  the Han ones) through tconv before and after. Every file that ran before
+  gives the same output. Four that crashed before in LLVM 22 code generation
+  (`computeKnownBits` stack overflow, which also affects tconv at 4f721235f)
+  now run, as their kernels changed: am-fonipa-t-am, ar-t-am and fa-t-am pass
+  all their cases; chr-t-am (am-chr) gives the same output as build18 (LLVM
+  18), with the line breaks lost. 22 files still crash in LLVM 22 code
+  generation. Cases passing: 216244 before, 216959 after.
+

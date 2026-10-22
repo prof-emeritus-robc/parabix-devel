@@ -39,6 +39,10 @@ bool LLVM_READONLY UnicodeLevel2IsSet();
 
 extern int IfInsertionGap;
 
+// The maximum length of a region (between barriers) reversed by the regular
+// expression engine (see kernel::RegionReversal): --reverse-region-limit.
+extern unsigned ReverseRegionLimit;
+
 std::string AnnotateWithREflags(std::string name);
 
 }

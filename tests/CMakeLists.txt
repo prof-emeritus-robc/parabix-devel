@@ -83,6 +83,13 @@ add_test(NAME capture_spans_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/capture_spans_test.py ${TEST_BIN_DIR}/capture_spans)
 
+# Regions reversed in place (kernel::RegionReversal), checked with Python
+parabix_add_executable(NAME region_reversal SRC region_reversal.cpp
+                       DEPS kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.unicode re.toolchain toolchain)
+add_test(NAME region_reversal_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/region_reversal_test.py ${TEST_BIN_DIR}/region_reversal)
+
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

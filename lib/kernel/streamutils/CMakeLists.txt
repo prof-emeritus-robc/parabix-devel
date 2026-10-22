@@ -11,6 +11,7 @@ SRC
     deletion.cpp
     focused_transform.cpp
     pdep_kernel.cpp
+    region_reversal.cpp
     run_index.cpp
     run_replace.cpp
     sentinel.cpp

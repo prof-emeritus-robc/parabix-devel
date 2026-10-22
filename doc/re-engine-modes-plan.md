@@ -18,8 +18,8 @@ Revision 2 (after review of f10feda56):
 - **LDML conventions** (functions, `[$]` and the special treatment of `$`,
   cursors, possessive contexts) are not Parabix RE semantics: tconv translates
   them;
-- a section on **general lookahead by reversing bit stream segments within
-  region boundaries**.
+- a section on **general lookahead by reversing match regions in place**,
+  within a region limit, with characters the RE cannot match as barriers.
 
 ## Goal
 
@@ -454,28 +454,40 @@ to `lib/kernel/re/` (selection, capture walk) and `lib/kernel/streamutils/`
 
 ### The capability
 
-A kernel that **reverses bit stream segments made of whole match regions**:
-given a segment of streams `[0, N)` that begins at a region start and ends just
-after a region follow, it produces the streams in reverse position order,
-`R(X)[i] = X[N - 1 - i]` (bit-reverse each 64-bit word with
-`simd_bitreverse`, reverse the order of the words, and shift by the unused bits
-of the last word). Because matches never cross region boundaries, reversing the
-whole segment reverses every region in place, and the order of the regions,
-which does not matter. For a region `[s, f)` (follow `f`), the reversed
-regions are:
+A kernel that **reverses each match region in place** (`RegionReversal`): for
+a region of positions `[s, f)` (its follow `f`, the position after its last
+character), `R(X)[i] = X[s + f - 1 - i]` for `s <= i < f`, and the positions
+that are not in a region (the region follows, and barriers, below) keep their
+bits. As matches never cross region boundaries, matching in the reversed
+streams matches every region backward, and the regions keep their places: the
+starts and the follows of the reversed regions are those of the regions
+(nothing to recompute), and the reversal is its own inverse. Positions are
+characters (full Unicode indexing): reversing UTF-8 code units would reverse
+the bytes of each character. Reversal is applied to the few streams the
+reversed RE needs (its CC streams and externals, computed forward) rather than
+the 21-bit basis where possible.
 
-- starts′ = `Advance(R(follows), 1)` (the region's last character, at `N - f`);
-- follows′ = `Advance(R(starts), 1)` (at `N - s`, which holds the follow of
-  the preceding region in the original order, or `N` for the first).
+**Region limit.** Regions are at most L positions long, L given by
+`--reverse-region-limit` (default 1000). The kernel has fixed rates, reads its
+inputs with a lookahead of L positions (so that the regions ending in a stride
+are complete), and keeps the part of the region still open at the end of a
+stride (at most L positions of each stream) in its state: it streams with
+bounded buffers, with no complete-region segmentation of the pipeline. A
+region longer than L is a runtime error naming the option (the length of
+regions is a property of the text, not of the RE).
 
-The segment boundary rule is what is new to the pipeline: the kernel may only
-consume up to the last region follow available, so it needs a variable-rate
-input with a "complete regions" consumption bound (like grep's line-oriented
-kernels), a buffer large enough for the longest region, and a flush at the end
-of the text. Positions are characters (full Unicode indexing): reversing UTF-8
-code units would reverse the bytes of each character. Reversal is applied to
-the few streams the reversed RE needs (its CC streams and externals, computed
-forward) rather than the 21-bit basis where possible.
+**Barriers.** The regions of a reversal are the maximal runs of positions
+between barriers: the region follows (line breaks) and, for the purpose of
+reversal only, the positions of any character that the RE cannot match, which
+narrows long lines to the limit (e.g., spaces for an RE of words). A character
+is a barrier if no character class of the RE (including those within its
+assertions) contains it: no match contains it, and an assertion that reaches it
+fails, as it does at the boundary of a region, where nothing is beyond. This
+holds unless the RE has `Start` or `End` anchors (in either direction, after
+reversal), which would match at the barriers: for such an RE, only the region
+follows are barriers. Without match regions (a text as one region, as in tconv
+without `-lines`), the barriers alone delimit the regions, and the end of the
+text ends the last one.
 
 ### Using it
 
@@ -520,8 +532,8 @@ externals. A pipeline is then
 forward kernels ─▶ R ─▶ backward kernels (reversed regions) ─▶ R⁻¹ ─▶ forward kernels
 ```
 
-with one reversal of all the streams needed in each direction (a single
-complete-region segmentation for both), rather than a reversal pair per use.
+with one reversal of all the streams needed in each direction (the same
+regions for both), rather than a reversal pair per use.
 
 What each direction contributes:
 
@@ -573,18 +585,16 @@ boundaries on the side where they are cheap or unique.
 | S&R capture whose end is fixed only from the right | `([a-z0-9]*[a-z])\d+;` | U3 fails on the forward test (the run of `[a-z0-9]` is not maximal) | backward from the match end, the run of `\d` is maximal, so the capture end is unique |
 
 Cases **not** to handle by reversal: fixed length, length classes, unique
-prefix and chains (cheaper forward strategies, no segment constraint); short
+prefix and chains (cheaper forward strategies, no region limit); short
 bounded lookaheads (the `LookAhead` attribute of kernel inputs); REs with
 assertions nested deeply enough in alternating directions that each level
-needs one more reversal pair; texts with very
-long regions, e.g. one region for the whole text (tconv without `-lines`, or a
-file without line breaks): reversal then needs the whole text buffered, which
-gives up streaming — a precondition on the maximum region length, or an
-explicit whole-text option for memory-mapped inputs.
+needs one more reversal pair; texts whose regions, between barriers, exceed
+the region limit (a runtime error; raise `--reverse-region-limit`, at the cost
+of the lookahead buffers).
 
-Costs to measure before adopting it: two reversal kernels per use, the
-complete-region segmentation (smaller effective segments, a phase boundary for
-the buffering), and one more RE kernel.
+Costs to measure before adopting it: two reversal kernels per use (each with a
+lookahead of L positions and a state of L positions per stream), and one more
+RE kernel.
 
 ## Milestones
 
@@ -610,7 +620,8 @@ the buffering), and one more RE kernel.
    through the engine, with functions applied by tconv to `captureSpans`;
    tconv keeps rule ordering, filters, insertions, cursors and deferred rules.
    Done for the groups of a single rule (see the status below).
-9. **Region reversal**: the reversal kernel and complete-region segmentation;
+9. **Region reversal**: the in-place reversal kernel, with the region limit
+   (`--reverse-region-limit`) and barriers (characters the RE cannot match);
    MatchStarts strategy 8 and general lookahead externals, with forward-matched
    lookbehinds as externals of the backward pass; then meeting in the middle
    for capture boundaries; relax the lookahead and U3 preconditions
@@ -912,3 +923,47 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   through the engine, compared with Python's `re.sub` and with
   `--disable-engine-search-replace`; 0.5 s with the object cache), and
   adjacent captures in `replace_test` and `capture_spans_test`.
+
+## Milestone 9 status (begun)
+
+- `kernel::RegionReversal` (`kernel/streamutils/region_reversal.h`): each
+  region of a stream set reversed in place, the regions being the runs of
+  positions between barriers (and the end of the text). A `MultiBlockKernel`
+  with fixed rates, a lookahead of L positions on its inputs and the part of
+  the region open at the end of each invocation (at most L - 1 positions of
+  each stream) in its state; the reversal itself is a C++ function linked into
+  the kernel (`parabix_reverse_regions`). A region longer than L is a fatal
+  error at run time, naming `--reverse-region-limit`.
+- `--reverse-region-limit` (`re::ReverseRegionLimit`, default 1000), with the
+  code generation options, so that every tool has it.
+- MatchStarts strategy 8, starts by reversal (`RE_PipelineBuilder::
+  reversedStarts`): when no forward strategy applies (an alternative without
+  one, or a lookahead without one), the starts are the ends of the matches of
+  `reverse(R)` (the RE as prepared) in the reversed regions, compiled for the
+  MatchEnds goal over the reversed codepoints, shifted back by its offset and
+  reversed back. The barriers are the region follows and the characters that
+  no CC of R can match, including those of its assertions
+  (`re::matchableCodepoints`). The decision is made in the precondition check
+  (`ModeTransformation::failures`, `mStartsByReversal`), before the mode
+  passes, whose kernels the forward strategies would need; a negative
+  lookbehind of R (a negative lookahead of `reverse(R)`) extends a text
+  without regions. Preconditions of the reversal: full Unicode indexing, R
+  not nullable, no `Start`/`End` anchors, and the preconditions of
+  `reverse(R)` for the MatchEnds goal; otherwise the forward failures are
+  reported, with the reason the reversal does not apply.
+- `RE_ModeOptions::startsByReversal` (default true): tconv turns it off for its
+  match starts (a text without `-lines` is one region of any length), so its
+  outputs are unchanged.
+- Tests: `region_reversal_test` (`tests/region_reversal.cpp`,
+  `region_reversal_test.py`, new: regions of lines, of barrier characters,
+  without line regions, across the strides and segments of the pipeline, and
+  the limit error, compared with Python; 0.3 s with the object cache), a group
+  of six REs by reversal in `match_starts_test` (compared with Python's `re`),
+  and reversal cases in `re_preconditions_test`.
+- Next: general lookahead externals by reversal for the Ends mode (with the
+  lookbehinds matched forward as externals of the backward pass), reversal of
+  only the streams the reversed RE needs (rather than the 21-bit basis),
+  anchors with reversal (the region starts and follows of the real regions as
+  externals), meeting in the middle for capture boundaries, and relaxing the
+  lookahead and U3 preconditions accordingly.
+

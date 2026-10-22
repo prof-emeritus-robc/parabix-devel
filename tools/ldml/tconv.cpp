@@ -4863,6 +4863,8 @@ StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * eng
     pattern.insert(pattern.end(), ahead.begin(), ahead.end());
     RE_ModeOptions opts;
     opts.goal = re::RE_Goal::MatchStarts;
+    //  (Not by reversal: a text, or a line with -lines, is one region of any length.)
+    opts.startsByReversal = false;
     const PreparedRE prepared = prepareRE(re::makeSeq(pattern.begin(), pattern.end()), opts);
     if (checkPreconditions(prepared, &cc::Unicode).empty()) {
         engine.matchStartsPipeline(prepared, starts);

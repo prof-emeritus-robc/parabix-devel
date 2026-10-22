@@ -59,6 +59,13 @@ static cl::opt<int, true>
                          cl::desc("minimum number of nonempty elements between inserted if short-circuit tests"),
                          cl::cat(codegen::CodeGenOptions));
 
+unsigned ReverseRegionLimit;
+static cl::opt<unsigned, true>
+    ReverseRegionLimitOption("reverse-region-limit", cl::location(ReverseRegionLimit), cl::init(1000),
+                             cl::desc("maximum length of the regions (between characters the regular expression "
+                                      "cannot match, and line breaks) that it reverses to match backward"),
+                             cl::cat(codegen::CodeGenOptions));
+
 std::string AnnotateWithREflags(std::string name) {
     if (re::AlgorithmOptionIsSet(re::DisableMatchStar)) {
         name += "-MatchStar";

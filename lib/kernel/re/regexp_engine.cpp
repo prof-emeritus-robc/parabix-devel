@@ -32,6 +32,9 @@
 #include <re/analysis/re_analysis.h>
 #include <re/analysis/validation.h>
 #include <re/analysis/collect_ccs.h>
+#include <re/transforms/re_reverse.h>
+#include <kernel/streamutils/region_reversal.h>
+#include <ucd/core/unicode_set.h>
 #include <re/analysis/re_name_gather.h>
 #include <re/analysis/re_inspector.h>
 #include <re/analysis/nullable.h>
@@ -1157,6 +1160,32 @@ static bool hasEndAnchorAnywhere(const RE * re) {
     return false;
 }
 
+// Does the RE have Start or End anchors anywhere (including within
+// assertions and the definitions of names)?
+static bool hasAnchorAnywhere(const RE * re) {
+    if (isa<Start>(re) || isa<End>(re)) return true;
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (hasAnchorAnywhere(e)) return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (hasAnchorAnywhere(e)) return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        return hasAnchorAnywhere(rep->getRE());
+    } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
+        return hasAnchorAnywhere(a->getAsserted());
+    } else if (const Diff * d = dyn_cast<Diff>(re)) {
+        return hasAnchorAnywhere(d->getLH()) || hasAnchorAnywhere(d->getRH());
+    } else if (const re::Intersect * x = dyn_cast<re::Intersect>(re)) {
+        return hasAnchorAnywhere(x->getLH()) || hasAnchorAnywhere(x->getRH());
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        return hasAnchorAnywhere(c->getCapturedRE());
+    } else if (const Group * g = dyn_cast<Group>(re)) {
+        return hasAnchorAnywhere(g->getRE());
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() && hasAnchorAnywhere(n->getDefinition());
+    }
+    return false;
+}
+
 void RE_PipelineBuilder::ensurePrepared(RE *& re) {
     if (mPrepared) return;
     mPrepared = true;
@@ -2210,17 +2239,74 @@ void RE_PipelineBuilder::matchStartsPipeline(RE * re, StreamSet * starts) {
     matchStartsPipeline(PreparedRE{re, RE_Mode{nullptr, nullptr}, opts}, starts);
 }
 
+static std::vector<PreconditionFailure> modeFailures(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding,
+                                                     bool & byReversal);
+
 void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, StreamSet * starts) {
     if (prepared.options.goal != RE_Goal::MatchStarts) {
         llvm::report_fatal_error("matchStartsPipeline: the RE must be prepared with the MatchStarts goal");
     }
     usePrepared(prepared);
     RE * re = prepared.re;
+    // The starts found by reversal, when no forward strategy applies (decided
+    // before the mode passes, which make the kernels of the forward strategies).
+    bool byReversal = false;
+    if (mHaveSourceContext) modeFailures(prepared, mSourceContext.encoding, byReversal);
+    if (byReversal) {
+        // The text is extended as the reversed RE needs it (a negative
+        // lookbehind of the RE is a negative lookahead of the reversed RE).
+        if (hasEndAnchorAnywhere(reverse(re))) mExtendText = true;
+        ensurePrepared(re);
+        reversedStarts(re, starts);
+        return;
+    }
     ensurePrepared(re);
     mRE = applyModePasses(re, RE_Goal::MatchStarts);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
     compileStarts(mRE, starts);
+}
+
+void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
+    if (mCtxt.mCodeUnitAlphabet != &cc::Unicode) {
+        llvm::report_fatal_error("the starts of matches by reversal require full Unicode indexing");
+    }
+    // The barriers of the regions reversed: the region follows, and the
+    // characters that no match of the RE (or assertion within it) can reach.
+    UCD::UnicodeSet matchable;
+    re::CC * barrierChars = re::makeCC(&cc::Unicode);
+    if (matchableCodepoints(re, matchable)) {
+        barrierChars = re::makeCC(UCD::UnicodeSet(0, UCD::UNICODE_MAX) - matchable, &cc::Unicode);
+    }
+    StreamSet * barriers = mPB.CreateStreamSet(1);
+    mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{barrierChars}, mCtxt.mCodeUnitStream, barriers);
+    if (mCtxt.mMatchFollows) {
+        StreamSet * const all = mPB.CreateStreamSet(1);
+        OrCombine(mPB, barriers, mCtxt.mMatchFollows, all);
+        barriers = all;
+    }
+    // The ends of the matches of the reversed RE in the reversed regions
+    // (which are the regions), marked at their last characters, are the
+    // starts of the matches in the regions reversed back.
+    StreamSet * const reversedText = mPB.CreateStreamSet(mCtxt.mCodeUnitStream->getNumElements());
+    mPB.CreateKernelCall<RegionReversal>(barriers, mCtxt.mCodeUnitStream, reversedText, ReverseRegionLimit);
+    RE_ModeOptions opts;
+    opts.goal = RE_Goal::MatchEnds;
+    opts.forceUnicodeIndexing = true;
+    const PreparedRE reversed = prepareRE(reverse(re), opts);
+    RE_PipelineBuilder backward(mPB, RE_context{&cc::Unicode, reversedText, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
+    StreamSet * ends = mPB.CreateStreamSet(1);
+    backward.matchSearchPipeline(reversed, ends);
+    if (const unsigned offset = reversed.grepOffset()) {
+        StreamSet * const shifted = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<ShiftBack>(ends, shifted, offset);
+        ends = shifted;
+    }
+    mPB.CreateKernelCall<RegionReversal>(barriers, ends, starts, ReverseRegionLimit);
+    if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+        mPB.captureBitstream("reversalBarriers", barriers);
+        mPB.captureBitstream("reversedEnds", ends);
+    }
 }
 
 void RE_PipelineBuilder::compileStarts(RE * re, StreamSet * starts) {
@@ -2406,6 +2492,29 @@ RE * RE_PipelineBuilder::spanFactoring(RE * re) {
 }
 
 namespace {
+// Why the starts of the matches of an RE (prepared with the MatchStarts goal)
+// cannot be found by reversal (see RE_PipelineBuilder::reversedStarts), or ""
+// if they can: as the ends of the matches of the reversed RE in the reversed
+// regions, compiled for the MatchEnds goal, with full Unicode indexing (each
+// position a character).  The RE must not match the empty string (an empty
+// match is between positions, which reversal does not map to a start), and
+// must not have anchors (whose matches the barriers of the reversal would
+// create, see kernel::RegionReversal).
+std::string reversalFailure(RE * re, const cc::Alphabet * codeUnitAlphabet) {
+    if (codeUnitAlphabet != &cc::Unicode) return "it requires full Unicode indexing";
+    if (getLengthRange(re, &cc::Unicode).first == 0) return "the RE can match the empty string";
+    if (hasAnchorAnywhere(re)) return "the RE has anchors (^, $), which barriers would match";
+    RE_ModeOptions opts;
+    opts.goal = RE_Goal::MatchEnds;
+    opts.forceUnicodeIndexing = true;
+    const std::vector<PreconditionFailure> failures = checkPreconditions(prepareRE(reverse(re), opts), &cc::Unicode);
+    if (failures.empty()) return "";
+    std::string reason = "the reversed RE: ";
+    for (const PreconditionFailure & f : failures) reason += f.reason + "; ";
+    reason.resize(reason.size() - 2);
+    return reason;
+}
+
 // The RE transformations of the mode passes (see
 // RE_PipelineBuilder::applyModePasses) for the length and code unit alphabets
 // of a mode, apart from the kernels of the names that they introduce, which
@@ -2422,6 +2531,11 @@ struct ModeTransformation {
 
     const cc::Alphabet * const mLengthAlphabet;
     const cc::Alphabet * const mCodeUnitAlphabet;
+    // The RE before the transformations, and whether the starts of its
+    // matches (the MatchStarts goal) are found by reversal (see failures).
+    RE * mSource = nullptr;
+    bool mAllowReversal = true;
+    bool mStartsByReversal = false;
     UCD::PropertyExternalizer PE;
     re::VariableLengthCCNamer CCnamer;
     re::StringClassRepNamer SCnamer;
@@ -2432,6 +2546,7 @@ RE * ModeTransformation::transform(RE * re, RE_Goal goal) {
     // The captures of a search and replace that only the replacement refers
     // to are found from its matches (see re::CaptureWalk): the matches are
     // computed without them.
+    mSource = re;
     if (goal == RE_Goal::SearchReplace) re = removeUnneededCaptures(re);
     RE * xfrmedRE = expandPermutes(re);
     xfrmedRE = regular_expression_passes(xfrmedRE, mLengthAlphabet, goal);
@@ -2470,10 +2585,14 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
     // The transformations here only check the RE (processReferences applies them).
     QuietREPrinting quiet;
     std::vector<PreconditionFailure> failures;
+    // The failures of the forward strategies for the starts of the matches:
+    // for the MatchStarts goal, the starts are otherwise found by reversal,
+    // if it applies (see reversalFailure).
+    std::vector<PreconditionFailure> forward;
     // Lookaheads named as externals (see RE_PipelineBuilder::compileExternal
     // and matchStartPipeline).
     for (const auto & u : LA.mUnsupported) {
-        failures.push_back(PreconditionFailure{goal, u.first, u.second});
+        forward.push_back(PreconditionFailure{goal, u.first, u.second});
     }
     if (mCodeUnitAlphabet != &cc::Unicode) {
         for (const auto & m : LA.mNameMap) {
@@ -2510,18 +2629,31 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
         std::vector<RE *> unsupported;
         planMatchStarts(fixedRefs, mLengthAlphabet, mCodeUnitAlphabet, plan, unsupported);
         for (RE * u : unsupported) {
-            failures.push_back(PreconditionFailure{goal, u,
-                               "no strategy for the starts of the matches: not of fixed length, without a unique "
-                               "prefix of fixed length followed by a suffix that is not nullable, not bounded with "
-                               "at most " + std::to_string(LengthClassLimit) + " lengths, and not a lookahead "
-                               "chain (with full Unicode indexing)"});
+            forward.push_back(PreconditionFailure{goal, u,
+                              "no strategy for the starts of the matches: not of fixed length, without a unique "
+                              "prefix of fixed length followed by a suffix that is not nullable, not bounded with "
+                              "at most " + std::to_string(LengthClassLimit) + " lengths, and not a lookahead "
+                              "chain (with full Unicode indexing)"});
         }
     }
+    if (!forward.empty() && (goal == RE_Goal::MatchStarts) && mAllowReversal) {
+        const std::string reason = reversalFailure(mSource, mCodeUnitAlphabet);
+        if (reason.empty()) {
+            mStartsByReversal = true;
+            forward.clear();
+        } else {
+            forward.push_back(PreconditionFailure{goal, mSource, "and no starts by reversal: " + reason});
+        }
+    }
+    failures.insert(failures.end(), forward.begin(), forward.end());
     return failures;
 }
 }
 
-std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding) {
+// The preconditions of a prepared RE (see checkPreconditions), and whether
+// the starts of its matches are found by reversal (byReversal).
+static std::vector<PreconditionFailure> modeFailures(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding,
+                                                     bool & byReversal) {
     // The alphabets of the RE as compiled (see RE_PipelineBuilder::ensurePrepared).
     const cc::Alphabet * lengthAlphabet = &cc::Unicode;
     const cc::Alphabet * codeUnitAlphabet = &cc::Unicode;
@@ -2532,8 +2664,16 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
     // The passes are run to check the RE, not to compile it.
     QuietREPrinting quiet;
     ModeTransformation M(lengthAlphabet, codeUnitAlphabet);
+    M.mAllowReversal = prepared.options.startsByReversal;
     RE * const transformed = M.transform(prepared.re, prepared.options.goal);
-    return M.failures(transformed, prepared.options.goal);
+    std::vector<PreconditionFailure> failures = M.failures(transformed, prepared.options.goal);
+    byReversal = M.mStartsByReversal;
+    return failures;
+}
+
+std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding) {
+    bool byReversal = false;
+    return modeFailures(prepared, sourceEncoding, byReversal);
 }
 
 std::string preconditionReport(const std::vector<PreconditionFailure> & failures) {
@@ -3176,6 +3316,9 @@ void RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(const PreparedSearchRepl
 
 RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {
     ModeTransformation M(mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet);
+    // (Compiled forward: the starts by reversal are chosen before, see
+    // matchStartsPipeline.)
+    M.mAllowReversal = false;
     RE * const xfrmedRE = M.transform(re, goal);
     const std::vector<PreconditionFailure> failures = M.failures(xfrmedRE, goal);
     if (!failures.empty()) {

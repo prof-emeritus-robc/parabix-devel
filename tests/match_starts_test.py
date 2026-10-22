@@ -61,6 +61,15 @@ GROUPS = [
         ("(?:ab)+c*", "(?:ab)+c*"),
         ("b{2,}", "b{2,}"),
     ],
+    [   # by reversal (no forward strategy): the regions between the characters
+        # the RE cannot match, reversed in place
+        ("q[a-z]*(?![a-z]*e)", "q[a-z]*(?![a-z]*e)"),
+        ("(?:[a-z]+@)+[a-z]+", "(?:[a-z]+@)+[a-z]+"),
+        ("(?:ab|c)+(?![a-z]*x)", "(?:ab|c)+(?![a-z]*x)"),
+        ("(?<!x)(?:[a-z]+@)+[a-z]", "(?<!x)(?:[a-z]+@)+[a-z]"),      # extended text (negative lookahead reversed)
+        ("(?:é|[a-z])+(?![a-zé]*e)", "(?:é|[a-z])+(?![a-zé]*e)"),
+        ("(?:[0-9]+[a-z])+(?![a-z]*c)", "(?:[0-9]+[a-z])+(?![a-z]*c)"),
+    ],
 ]
 
 

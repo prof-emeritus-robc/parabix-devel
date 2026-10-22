@@ -73,6 +73,12 @@ struct RE_ModeOptions {
     unsigned byteCClimit = 6;
     // What the RE is prepared for (see re::RE_Goal), which selects its passes.
     re::RE_Goal goal = re::RE_Goal::MatchEnds;
+    // Whether the starts of matches (the MatchStarts goal) may be found by
+    // reversing the regions of the text when no forward strategy applies
+    // (see RE_PipelineBuilder::reversedStarts): a client whose regions may
+    // exceed the region limit (re::ReverseRegionLimit, a runtime error)
+    // turns it off.
+    bool startsByReversal = true;
 };
 
 struct RE_Mode {
@@ -664,6 +670,11 @@ protected:
     // The starts of the matches of a prepared RE as compiled (after the mode
     // passes, see matchStartsPipeline).
     void compileStarts(re::RE * re, kernel::StreamSet * starts);
+    // The starts of the matches of an RE (prepared with the MatchStarts goal)
+    // by reversal: the ends of the matches of the reversed RE in the regions
+    // reversed in place (kernel::RegionReversal, with the region follows and
+    // the characters the RE cannot match as barriers), reversed back.
+    void reversedStarts(re::RE * re, kernel::StreamSet * starts);
 
     // The starts of the matches of an alternative (see matchStartsPipeline).
     void alternativeStarts(const MatchStartsAlternative & a, kernel::StreamSet * out);

@@ -47,9 +47,13 @@ const PreconditionCase Cases[] = {
     {"ab(?=c+d)", RE_Goal::MatchStarts, &cc::UTF8, true},          // trailing lookahead folded
     {"[ab]{1,3}c", RE_Goal::MatchStarts, &cc::UTF8, true},         // length classes (byte mode)
     {"(?:ab|b)c*", RE_Goal::MatchStarts, &cc::UTF8, true},         // nullable suffix removed
-    {"(?:ab|b){1,9}c", RE_Goal::MatchStarts, &cc::Unicode, false}, // too many length classes
-    {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::UTF8, false},         // no strategy
-    {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::Unicode, false},
+    {"(?:ab|b){1,9}c", RE_Goal::MatchStarts, &cc::Unicode, true},  // too many length classes: by reversal
+    {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::UTF8, true},          // no forward strategy: by reversal
+    {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::Unicode, true},
+    {"x(?=(?:a*b)*c)", RE_Goal::MatchStarts, &cc::UTF8, true},     // (a lookbehind of the reversed RE)
+    {"(?:a*b)*c$", RE_Goal::MatchStarts, &cc::UTF8, false},        // reversal: anchored
+    {"(?:a*b)*c?", RE_Goal::MatchStarts, &cc::UTF8, false},        // reversal: nullable
+    {"(?<=c(?:a*b)*)(?:a*b)*d", RE_Goal::MatchStarts, &cc::UTF8, false}, // reversal: a lookahead without a strategy
     {"abc", RE_Goal::SearchReplace, &cc::UTF8, true},              // (the search pattern alone)
 };
 

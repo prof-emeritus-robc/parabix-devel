@@ -68,6 +68,8 @@ const static std::string KERNEL_THREAD_LOCAL_SUFFIX = ".KTL";
 const static std::string NEXT_LOGICAL_SEGMENT_NUMBER = "@NLSN";
 
 const static std::string PHASE_NEXT_LOGICAL_SEGMENT_NUMBER = "@PLSN";
+const static std::string PHASE_CLAIMED_ITEM_TOTAL = "@PCIT";
+const static std::string PHASE_CLAIMED_ITEM_COUNT_PREFIX = "@PCIC";
 const static std::string PHASE_ITERATION_SEGMENT_LIMIT_STEP = "@PILS";
 
 
@@ -266,6 +268,8 @@ public:
 // inter-kernel codegen functions
 
     void readEarlierPhaseItemCounts(KernelBuilder & b);
+    bool getClaimedEarlierPhaseStreamSets(const unsigned phase, SmallVector<size_t, 16> & streamSets) const;
+    Value * claimPhaseSegment(KernelBuilder & b);
     void readAvailableItemCounts(KernelBuilder & b);
     Value * readAvailableItemCount(KernelBuilder & b, const size_t streamSet);
     void readProcessedItemCounts(KernelBuilder & b);

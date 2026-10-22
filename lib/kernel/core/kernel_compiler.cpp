@@ -1077,6 +1077,8 @@ std::vector<Value *> KernelCompiler::getFinalOutputScalars(KernelBuilder & b) {
 #endif
 #endif
 
+#if PARABIX_SCALAR_FIELD_INDEX_CROSSCHECK
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief addToGroupCountMap
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -1112,6 +1114,8 @@ static size_t computePartialSumOfGroupCounts(flat_map<size_t, size_t> & groups, 
     }
     return partSum;
 }
+
+#endif
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief initializeScalarMap
@@ -1879,65 +1883,33 @@ KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, c
  ** ------------------------------------------------------------------------------------------------------------- */
 KernelCompiler::ScalarRef KernelCompiler::getScalarFieldPtr(KernelBuilder & b, Value * const handle, const ScalarType type, const StringRef name) const {
 
-    // TODO: if we have a scalar map we could extract the indices from the gep even if its not in the same function?
+    // The scalar map holds pointers computed from this kernel's own handles in the current
+    // method; a caller passing another handle (e.g., from a helper function) needs the
+    // field computed from that handle, so always use the field index recorded in the binding.
 
     assert (type == ScalarType::Internal || type == ScalarType::ThreadLocal);
 
-    if (LLVM_UNLIKELY(mScalarFieldMap.empty())) {
-
-        flat_map<size_t, size_t> groups;
-
-        for (const auto & scalar : mInternalScalars) {
-            assert (scalar.getValueType());
-            if (type == scalar.getScalarType()) {
-                addToGroupCountMap(groups, scalar.getGroup());
+    for (const auto & binding : mInternalScalars) {
+        if (type == binding.getScalarType() && name.compare(binding.getName()) == 0) {
+            StructType * stateTy = nullptr;
+            if (type == ScalarType::Internal) {
+                stateTy = mTarget->getSharedStateType(b.getContext()); assert(stateTy);
+            } else {
+                stateTy = mTarget->getThreadLocalStateType(b.getContext()); assert(stateTy);
             }
+            auto & DL = b.getModule()->getDataLayout();
+            const StructLayout * const layout = DL.getStructLayout(stateTy);
+            const auto k = binding.getFieldIndex();
+            assert (k < stateTy->getStructNumElements());
+            FixedArray<Value *, 1> idx;
+            idx[0] = b.getSize(layout->getElementOffset(k));
+            assert (isFromCurrentFunction(b, handle, false));
+            Value * ptr = b.CreateInBoundsGEP(b.getInt8Ty(), handle, idx);
+            assert (stateTy->getStructElementType(k) == binding.getValueType());
+            return ScalarRef{ptr, stateTy->getStructElementType(k)};
         }
-
-        computePartialSumOfGroupCounts(groups, mInputScalars.size());
-
-
-        for (const auto & binding : mInternalScalars) {
-
-            if (type == binding.getScalarType()) {
-
-                auto f = groups.find(binding.getGroup());
-                assert (f != groups.end());
-                const auto index = f->second++;
-
-                if (name.compare(binding.getName()) == 0) {
-
-                    StructType * stateTy = nullptr;
-                    if (type == ScalarType::Internal) {
-                        stateTy = mTarget->getSharedStateType(b.getContext()); assert(stateTy);
-                    } else {
-                        stateTy = mTarget->getThreadLocalStateType(b.getContext()); assert(stateTy);
-                    }
-
-                    auto & DL = b.getModule()->getDataLayout();
-                    const StructLayout * const layout = DL.getStructLayout(stateTy);
-                    const auto k = index * 2 + 1;
-                    assert (k < stateTy->getStructNumElements());
-                    FixedArray<Value *, 1> idx;
-                    idx[0] = b.getSize(layout->getElementOffset(k));
-                    assert (isFromCurrentFunction(b, handle, false));
-                    Value * ptr = b.CreateGEP(b.getInt8Ty(), handle, idx);
-                    assert (stateTy->getStructElementType(k) == binding.getValueType());
-                    return ScalarRef{ptr, binding.getValueType()};
-                }
-            }
-        }
-        return ScalarRef{nullptr, nullptr};
-
-    } else {
-
-        auto f = mScalarFieldMap.find(name);
-        if (LLVM_UNLIKELY(f == mScalarFieldMap.end())) {
-            return ScalarRef{nullptr, nullptr};
-        }
-        return f->second;
-
     }
+    return ScalarRef{nullptr, nullptr};
 
 }
 

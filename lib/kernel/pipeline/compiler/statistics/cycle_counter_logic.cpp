@@ -1071,6 +1071,8 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
         Value * const m = b.CreateAdd(b.CreateMul(N, CHUNK_LENGTH), b.getSize(1));
         Value * const sizeLength = b.CreateAdd(b.CreateMul(m, b.getSize(sizeTySize)), b.getSize(voidPtrTySize));
         Value * const newLog = b.CreatePageAlignedMalloc(sizeLength);
+        // a kernel does not record segments in which its partition was skipped
+        b.CreateMemZero(newLog, sizeLength, voidPtrTySize);
         b.CreateAlignedStore(b.CreateSub(segNo, segIndex), b.CreateGEP(logChunkTy, newLog, offset), SizeTyABIAlignment);
         offset[1] = i32_ONE;
         b.CreateAlignedStore(currentLog, b.CreateGEP(logChunkTy, newLog, offset), PtrTyABIAlignment);
@@ -1088,7 +1090,7 @@ void PipelineCompiler::recordItemCountDeltas(KernelBuilder & b,
         logPhi->addIncoming(currentLog, checkLogOffset);
         logPhi->addIncoming(newLog, allocateNewLogChunk);
 
-        Value * const inputPtr = b.CreateGEP(PointerType::getUnqual(b.getContext()), currentArray, indexPhi);
+        Value * const inputPtr = b.CreateGEP(sizeTy, currentArray, indexPhi);
         Value * const val = b.CreateAlignedLoad(sizeTy, inputPtr, SizeTyABIAlignment);
 
         FixedArray<Value *, 3> offset3;
@@ -1270,7 +1272,8 @@ void PipelineCompiler::printItemCountDeltas(KernelBuilder & b, const StringRef t
         BasicBlock * const exit = b.CreateBasicBlock("getNextLogChunkExit", printLogEntryLoop);
         PointerType * const ptrTy = PointerType::getUnqual(b.getContext());
         Constant * nullPtr = ConstantPointerNull::get(ptrTy);
-        b.CreateBr(loop);
+        // a kernel that never ran has no log
+        b.CreateCondBr(b.CreateIsNull(traceLogArray[i]), exit, loop);
 
         b.SetInsertPoint(loop);
         PHINode * current = b.CreatePHI(ptrTy, 2);
@@ -1284,10 +1287,14 @@ void PipelineCompiler::printItemCountDeltas(KernelBuilder & b, const StringRef t
         Value * const nextChunkPtr = b.CreateAlignedLoad(ptrTy, b.CreateGEP(traceLogType[i], current, offset), PtrTyABIAlignment);
         Value * const noMore = b.CreateICmpEQ(nextChunkPtr, nullPtr);
         current->addIncoming(nextChunkPtr, loop);
-        currentChunk[i] = b.CreateSelect(noMore, nullPtr, current);
+        Value * const foundChunk = b.CreateSelect(found, current, nullPtr);
         b.CreateCondBr(b.CreateOr(found, noMore), exit, loop);
 
         b.SetInsertPoint(exit);
+        PHINode * const chunk = b.CreatePHI(ptrTy, 2);
+        chunk->addIncoming(nullPtr, entry);
+        chunk->addIncoming(foundChunk, loop);
+        currentChunk[i] = chunk;
     }
 
     BasicBlock * const printLogLoopEntry = b.GetInsertBlock();
@@ -1354,10 +1361,11 @@ void PipelineCompiler::printItemCountDeltas(KernelBuilder & b, const StringRef t
 
     b.CreateCall(fTy, Dprintf, args);
 
-    Value * notEndOfChunk = b.CreateICmpNE(indexPhi, CHUNK_LENGTH);
-    Value * notEndOfData = b.CreateICmpULE(actualSegNo, maxSegNo);
+    Value * const nextIndex = b.CreateAdd(indexPhi, sz_ONE);
+    Value * notEndOfChunk = b.CreateICmpNE(nextIndex, CHUNK_LENGTH);
+    Value * notEndOfData = b.CreateICmpULT(b.CreateAdd(baseSegNoPhi, nextIndex), maxSegNo);
 
-    indexPhi->addIncoming(b.CreateAdd(indexPhi, sz_ONE), b.GetInsertBlock());
+    indexPhi->addIncoming(nextIndex, b.GetInsertBlock());
 
     b.CreateCondBr( b.CreateAnd(notEndOfChunk, notEndOfData), printLogEntryLoop, printLogEntryLoopExit);
 
@@ -1414,7 +1422,13 @@ Value * PipelineCompiler::getMaxSegmentNumber(KernelBuilder & b) const {
         Value * const ptr = getSynchronizationLockPtrForKernel(b, kernelId, type);
         return b.CreateAlignedLoad(b.getSizeTy(), ptr, SizeTyABIAlignment);
     };
-    return getKernelSegNo(FirstKernel);
+    // each pipeline phase numbers its segments separately
+    Value * maxSegNo = getKernelSegNo(FirstKernel);
+    for (size_t i = 2; i < PartitionPhaseBoundaries.size(); ++i) {
+        const auto firstKernel = FirstKernelInPartition[PartitionPhaseBoundaries[i - 1]];
+        maxSegNo = b.CreateUMax(maxSegNo, getKernelSegNo(firstKernel));
+    }
+    return maxSegNo;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

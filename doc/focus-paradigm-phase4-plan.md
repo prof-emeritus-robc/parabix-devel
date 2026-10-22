@@ -108,7 +108,7 @@ cache), at 1 and 3 threads, with the scaling ceiling.
      size.
    - `-TraceDynamicBuffers` crashes nfd (exit 139) with or without a boundary, and
      `-TraceUnconsumedItemCounts` reports only zeros; fix or replace them first if
-     they are needed to find it.
+     they are needed to find it. (Both fixed after step 4; see the report.)
 4. **Threads serialized in later phases** (pipeline compiler). Revised after the
    investigation recorded under "Status of the steps".
    - The cause is not empty segments but partition jumps: a later-phase segment

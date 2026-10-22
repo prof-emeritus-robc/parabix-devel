@@ -2693,10 +2693,19 @@ private:
     const re::CaptureWalk mWalk;
 };
 
-// The positions from the start S of a capture to the position before its follow F.
+// The positions from the start S of a capture to the position before its
+// follow F, given the starts and the follows of the capture in all the
+// selected matches.  A position marked by both is either an empty capture or
+// the follow of the capture of a match and the start of the capture of the
+// next (adjacent) match, which is then within a capture: from a start that is
+// not a follow, the captures extend through the positions other than the
+// follows that are not starts.  (Both cases at one position would make the
+// search pattern nullable: an empty capture at the start of a match, after a
+// capture ending at the follow of the previous match.)
 PabloAST * captureCoverage(PabloBuilder & pb, PabloAST * S, PabloAST * F) {
-    PabloAST * const notF = pb.createNot(F);
-    return pb.createAnd(pb.createMatchStar(pb.createAnd(S, notF), notF), notF);
+    PabloAST * const open = pb.createAnd(S, pb.createNot(F));
+    PabloAST * const notClose = pb.createNot(pb.createAnd(F, pb.createNot(S)));
+    return pb.createAnd(pb.createMatchStar(open, notClose), notClose);
 }
 
 // The starts, coverage and follows of captures, given their starts and
@@ -2998,10 +3007,10 @@ void RE_PipelineBuilder::captureSpansPipeline(const PreparedSearchReplace & sr, 
     mPB.CreateKernelCall<CaptureSpans>(marks, spans);
 }
 
-void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr, StreamSet * output,
-                                               StreamSet * follows, StreamSet * replaced) {
+RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const PreparedSearchReplace & sr, bool follows,
+                                                                    bool replaced, StreamSet * result) {
     if (sr.search.options.goal != RE_Goal::SearchReplace) {
-        llvm::report_fatal_error("searchReplacePipeline: the search pattern must be prepared with prepareSearchReplace");
+        llvm::report_fatal_error("search and replace: the search pattern must be prepared with prepareSearchReplace");
     }
     reportFailures(searchReplaceFailures(sr));
     // The replacement: literal pieces around references to captures, in the
@@ -3034,8 +3043,9 @@ void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr,
     // before each anchor, of which only the pieces anchored there are kept.
     // The start of a capture whose prefix in the search pattern is not
     // nullable is never the start of a match: if it is the follow of a match,
-    // it is that of its own match.  (A capture whose prefix is nullable has a
-    // suffix that is not, and its start is within its match.)
+    // it is that of its own match.  (The start of a capture whose prefix is
+    // nullable may be the start of its match, and the follow of the previous
+    // match: its pieces are inserted after those of the previous match.)
     const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
     auto codeUnits = [&](const std::u32string & s) {
         std::vector<unsigned> units;
@@ -3116,37 +3126,52 @@ void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr,
         text = filled;
         keep = kept;
     }
-    auto filtered = [&](StreamSet * s) {
-        StreamSet * const f = mPB.CreateStreamSet(s->getNumElements());
+    auto filtered = [&](StreamSet * s, StreamSet * f) {
+        if (f == nullptr) f = mPB.CreateStreamSet(s->getNumElements());
         FilterByMask(mPB, keep, s, f);
         return f;
     };
-    text = filtered(text);
-    if (resultFollows) resultFollows = filtered(resultFollows);
-    if (resultReplaced) resultReplaced = filtered(resultReplaced);
+    if (result && (result->getNumElements() != text->getNumElements())) {
+        llvm::report_fatal_error("searchReplaceCodeUnitsPipeline: the result must have the basis bits of the code units "
+                                 "of the source (8 for UTF-8, 21 for Unicode)");
+    }
+    ReplacedText r;
+    r.text = filtered(text, result);
+    if (resultFollows) r.follows = filtered(resultFollows, nullptr);
+    if (resultReplaced) r.replaced = filtered(resultReplaced, nullptr);
+    return r;
+}
+
+void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr, StreamSet * output,
+                                               StreamSet * follows, StreamSet * replaced) {
+    ReplacedText r = replaceMatches(sr, follows != nullptr, replaced != nullptr, nullptr);
     // The result in UTF-8 code units, and its follows at their positions.
-    StreamSet * u8basis = text;
-    if (!utf8) {
+    StreamSet * u8basis = r.text;
+    if (mCtxt.mCodeUnitAlphabet != &cc::UTF8) {
         u8basis = mPB.CreateStreamSet(8);
-        U21_to_UTF8(mPB, text, u8basis);
+        U21_to_UTF8(mPB, r.text, u8basis);
         if (follows || replaced) {
             StreamSet * const u8index = mPB.CreateStreamSet(1);
             mPB.CreateKernelCall<UTF8_index>(u8basis, u8index);
             if (follows) {
                 StreamSet * const s = mPB.CreateStreamSet(1);
-                SpreadByMask(mPB, u8index, resultFollows, s);
-                resultFollows = s;
+                SpreadByMask(mPB, u8index, r.follows, s);
+                r.follows = s;
             }
             if (replaced) {
                 StreamSet * const s = mPB.CreateStreamSet(1);
-                SpreadByMask(mPB, u8index, resultReplaced, s);
-                resultReplaced = s;
+                SpreadByMask(mPB, u8index, r.replaced, s);
+                r.replaced = s;
             }
         }
     }
     mPB.CreateKernelCall<P2SKernel>(u8basis, output);
-    if (follows) mPB.CreateKernelCall<StreamSelect>(follows, Select(resultFollows, {0}));
-    if (replaced) mPB.CreateKernelCall<StreamSelect>(replaced, Select(resultReplaced, {0}));
+    if (follows) mPB.CreateKernelCall<StreamSelect>(follows, Select(r.follows, {0}));
+    if (replaced) mPB.CreateKernelCall<StreamSelect>(replaced, Select(r.replaced, {0}));
+}
+
+void RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, StreamSet * codeUnits) {
+    replaceMatches(sr, false, false, codeUnits);
 }
 
 RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {

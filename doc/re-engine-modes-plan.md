@@ -609,6 +609,7 @@ the buffering), and one more RE kernel.
 8. **tconv on S&R**: string rules and MultipleCaptureMultipleReplacement sets
    through the engine, with functions applied by tconv to `captureSpans`;
    tconv keeps rule ordering, filters, insertions, cursors and deferred rules.
+   Done for the groups of a single rule (see the status below).
 9. **Region reversal**: the reversal kernel and complete-region segmentation;
    MatchStarts strategy 8 and general lookahead externals, with forward-matched
    lookbehinds as externals of the backward pass; then meeting in the middle
@@ -830,8 +831,9 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   (`ReplacementAnchors`, `FillSlots`, in place of milestone 6's
   `FillReplacement` after each kept start). A capture whose prefix is not nullable
   never starts at a match start, so its start at a match follow is its own
-  match's follow; a capture whose prefix is nullable has a suffix that is not
-  (U2), so its start is within its match.
+  match's follow; the start of a capture whose prefix is nullable may be the
+  start of its match and the follow of the previous match (its pieces are
+  inserted after those of the previous match).
 - Precondition: the references are in the order of their captures in the
   search pattern, each capture referred to once and not within another.
   Moving or copying captured text (`$2$1`, `$1$1`) is not yet supported (a
@@ -860,3 +862,53 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   compared with `re.finditer`, with and without match regions; 0.5 s with the
   object cache), walks and folding in `re_replacement_test`, search and
   replace cases with captures in `re_preconditions_test`.
+
+## Milestone 8 status
+
+- A conversion group of a single rule, a string rule or a
+  MultipleCaptureMultipleReplacement rule referring to its captures in order
+  (`T0 (B1) T1 ... (Bk) Tk → R0 $1 R1 ... $k Rk`), is applied by the search
+  and replace of the engine (`engineSearchReplace` in `tconv.cpp`) when its
+  preconditions hold, and no filter is in effect; otherwise by tconv's
+  kernels, as before. The search pattern is the rule's text, its captures
+  and its contexts as lookbehind and lookahead, with repetitions possessive
+  as for tconv's own engine matches (`ldml::possessiveContext`); the
+  replacement is built from the plan (`MultipleCaptureMultipleReplacementSet::
+  results` now keeps R1 ... Rk). With no match ending within another, the
+  engine's selection from the left is ICU's. A before context must match as
+  it does in the converted text (`convertedContextMatters`, as for tconv's
+  capture sets), and rules with runs (`S+ → x`) or that may match within
+  their own text are left to tconv.
+- `RE_PipelineBuilder::searchReplaceCodeUnitsPipeline(sr, codeUnits)`: the
+  result as the basis bits of the code units of the source (21 streams for
+  tconv's codepoints), from the same assembly as `searchReplacePipeline`
+  (`replaceMatches`).
+- `tconv --plan` tells, for each group of a single rule, whether the engine
+  applies it, or the engine's reason not to; `--disable-engine-search-replace`
+  keeps every group on tconv's kernels.
+- In the CLDR transforms (other than the Han ones), 9 groups in 8 transforms are planned for
+  the engine (cy-cy_FONIPA, my-my_FONIPA, ru-ja, si-si_FONIPA, si-si_Latn,
+  ta-ta_FONIPA, vec-vec_FONIPA, byn_Latn-byn_Ethi/Xaleget). The test files
+  of si-fonipa-t-si, si-Latn-t-si, ta-fonipa-t-ta, vec-fonipa-t-vec,
+  my-fonipa-t-my and ru-t-ja-Latn give the same output with and without the
+  engine (si-si_Latn has a global filter, so its group stays on the kernels;
+  cy-cy_FONIPA and byn's Xaleget are not implementable for other reasons).
+  Other groups are rejected by the engine for matches that may end within
+  others (possessive optional items, `X?` as `(?!X)|X`, which
+  `matchEndsUnique` does not see through), captures out of order, runs, and
+  self-overlapping string rules.
+- Fix (milestone 7): the coverage of a capture dropped a start at the follow
+  of the previous match's capture (adjacent matches, each a capture:
+  `([a-z])(?!x)` with `${1}q` on `cd` gave `cqq`). A position marked as both
+  a start and a follow is now within a capture if one is open before it
+  (`captureCoverage`).
+- Not done (later work): groups of several rules (one replacement per
+  alternative, as tconv's rule order selects), filters (the matches within
+  the mask, e.g. as an external of the engine), functions applied to
+  `captureSpans`, and MultipleCaptureMultipleReplacement rules that tconv's
+  planner rejects but the engine could apply (a replaced text between
+  captures of variable length: the planner would defer them to the engine).
+- Tests: `tconv_engine_test` (`QA/tconv_engine_test.py`, new: four rules
+  through the engine, compared with Python's `re.sub` and with
+  `--disable-engine-search-replace`; 0.5 s with the object cache), and
+  adjacent captures in `replace_test` and `capture_spans_test`.

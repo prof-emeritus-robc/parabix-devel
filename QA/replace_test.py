@@ -54,6 +54,7 @@ CASES = [
     ("([a-z]*)@([a-z]*)\\.", "x$1y$2z", "([a-z]*)@([a-z]*)\\.", "x\\1y\\2z"),
     ("#([a-z0-9]*)([0-9]);", "$1.${2}", "#([a-z0-9]*)([0-9]);", "\\1.\\2"),
     ("c(a)(t)", "$1$1", "c(a)(t)", "\\1\\1"),
+    ("([a-z])(?![x])", "${1}q", "([a-z])(?![x])", "\\1q"),       # adjacent matches, each a capture
 ]
 
 # (icgrep pattern, icgrep replacement, a part of the expected error)

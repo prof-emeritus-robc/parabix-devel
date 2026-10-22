@@ -593,6 +593,7 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
     for (const re::Capture * cap : captures) set.captures.push_back(cap->getCapturedRE());
     set.texts.assign(texts.begin() + 1, texts.end());
     set.replacements = std::move(replacements);
+    set.results.assign(results.begin() + 1, results.end());
     set.before = source->getBeforeContext();
     set.after = source->getAfterContext();
     set.engineBefore = set.before ? engineContext(set.before, false) : nullptr;

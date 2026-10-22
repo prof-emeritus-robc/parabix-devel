@@ -581,6 +581,11 @@ public:
     void searchReplacePipeline(const PreparedSearchReplace & sr, kernel::StreamSet * output,
                                kernel::StreamSet * follows = nullptr, kernel::StreamSet * replaced = nullptr);
 
+    // The text with the matches replaced, as for searchReplacePipeline, but
+    // as the basis bits of the code units of the source (codeUnits: 8 streams
+    // for UTF-8, 21 for a source of Unicode codepoints, see RE_context).
+    void searchReplaceCodeUnitsPipeline(const PreparedSearchReplace & sr, kernel::StreamSet * codeUnits);
+
     // The captures named (see re::capturesByName) in the matches replaced by
     // searchReplacePipeline, for clients that transform captured text
     // themselves: for each capture, three streams, marking its start (its
@@ -717,6 +722,19 @@ protected:
     // The starts and follows of the captures of a walk in the selected
     // matches (two streams per capture), with Unicode code units.
     kernel::StreamSet * captureBoundaries(const re::CaptureWalk & walk, const SelectedMatches & m);
+
+    // The text with the selected matches replaced (see searchReplacePipeline),
+    // as the basis bits of the code units of the source (written to
+    // result, if given), and, if requested, the region follows of the
+    // result and those of the regions with a replacement, at the positions
+    // of the code units.
+    struct ReplacedText {
+        kernel::StreamSet * text = nullptr;
+        kernel::StreamSet * follows = nullptr;
+        kernel::StreamSet * replaced = nullptr;
+    };
+    ReplacedText replaceMatches(const PreparedSearchReplace & sr, bool follows, bool replaced,
+                                kernel::StreamSet * result);
 
     // Mode determination + source preparation, run once before compiling.
     void ensurePrepared(re::RE *& re);

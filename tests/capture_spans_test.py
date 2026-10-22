@@ -28,7 +28,7 @@ GROUPS = [
     [("([a-zéè]+)@([a-zéèω]+)\\.", 1), ("([^ @.\\n]*)@([^ @.\\n]*)\\.", 2)],     # Unicode characters
     [("#([a-z0-9]*)([0-9]);", 1), ("#([a-z0-9]*)([0-9]);", 2)],           # from the end of the match
     [("([a-z0-9]*)=([a-z]*);", 1), ("([a-z0-9]*)=([a-z]*);", 2)],         # empty captures
-    [("@([a-z]*)(?![a-z])", 1)],                                           # an empty capture at a follow
+    [("@([a-z]*)(?![a-z])", 1), ("([a-z])(?!x)", 1)],                    # an empty capture at a follow; adjacent captures
 ]
 
 

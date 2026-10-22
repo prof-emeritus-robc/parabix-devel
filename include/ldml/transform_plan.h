@@ -171,6 +171,7 @@ struct MultipleCaptureMultipleReplacementSet {
     //  cannot begin with a character it repeats.
     bool greedyStarts = false;
     std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0
+    std::vector<std::u32string> results;                 // R1 ... Rk (as planned, in the order of the captures)
     std::vector<MultipleCaptureMultipleReplacement> rules;
     //  A rule whose result refers to its two captures in reverse order,
     //  T0 (B1) T1 (B2) T2 → R0 $2 R1 $1 R2, with B1 and B2 of fixed lengths, is

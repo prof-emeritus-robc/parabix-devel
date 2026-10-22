@@ -134,6 +134,10 @@ static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input a
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
     cl::desc("Do not simplify the captures of the rules (unreferenced capture removal, trivial and nullable capture elimination)"),
     cl::init(false), cl::cat(TconvOptions));
+static cl::opt<bool> DisableEngineSearchReplace("disable-engine-search-replace",
+                                                cl::desc("Apply no conversion group by the search and replace of the regular "
+                                                         "expression engine (see engineSearchReplace)"),
+                                                cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> KernelCounts("kernel-counts", cl::desc("Report the conversion groups of the transform (with their rules and "
                                   "kernels) and the kernels of its pipeline, built without compiling it, and exit"),
                                   cl::init(false), cl::cat(TconvOptions));
@@ -623,6 +627,7 @@ static std::string printRanges(const UCD::UnicodeSet & set) {
 }
 
 static void printBeforeContextNotes(const ldml::TransformStep & step);
+static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearchReplace * sr = nullptr, std::string * reason = nullptr);
 
 static void printPlan(const std::string & label, const TransformAnalysis & a) {
     llvm::outs() << label << ": " << (a.implementable ? "implementable" : "not implementable") << "\n";
@@ -645,6 +650,12 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         }
         llvm::outs() << "  conversion group: " << step.subgroups.size() << " subgroups, "
                      << step.stringRules.size() << " string rules\n";
+        std::string notByEngine;
+        if (engineSearchReplace(step, nullptr, &notByEngine)) {
+            llvm::outs() << "    applied by the search and replace of the regular expression engine (where no filter applies)\n";
+        } else if (!notByEngine.empty()) {
+            llvm::outs() << "    not applied by the search and replace of the regular expression engine: " << notByEngine << "\n";
+        }
         //  The overlaps of the string rules (see ldml::StringRuleOverlaps).
         const ldml::StringRuleOverlaps overlaps = ldml::analyzeStringRuleOverlaps(step);
         if (!overlaps.pairs.empty()) {
@@ -1953,6 +1964,92 @@ static void captureContextProblems(const ldml::TransformStep & step, std::vector
                                "context may match differently in the converted text)");
         }
     }
+}
+
+//  A conversion group of a single rule, a string rule or a
+//  MultipleCaptureMultipleReplacement rule referring to its captures in order
+//  (T0 (B1) T1 ... (Bk) Tk → R0 $1 R1 ... $k Rk), may be applied by the search
+//  and replace of the regular expression engine (see RE_PipelineBuilder::
+//  searchReplaceCodeUnitsPipeline), if its preconditions hold.  It then
+//  replaces the matches that ICU applies: with no match ending within another
+//  (other than at its end, which the preconditions require), the matches
+//  selected from the left, each after the previous one, with the captures and
+//  contexts matched possessively, as ICU matches them.  The before context
+//  must match as it does in the converted text, against which ICU matches it
+//  (see convertedContextMatters), and a run (S+ → x) is left to the group's
+//  kernels.  The search and replace of the rule, if sr is given; for a group
+//  of a single rule that is not applied by the engine, the reason, if reason
+//  is given.
+static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearchReplace * sr, std::string * reason) {
+    if (DisableEngineSearchReplace) return false;
+    if (!step.subgroups.empty() || !step.insertions.empty() || !step.deferred.empty() || !step.copyCaptures.empty()) return false;
+    if (step.stringRules.size() + step.captureReplacements.size() != 1) return false;
+    re::RE * engineBefore = nullptr, * engineAfter = nullptr;
+    std::vector<re::RE *> items, result;
+    auto text = [&](const std::vector<UCD::UnicodeSet> & sets) {
+        for (const UCD::UnicodeSet & chars : sets) items.push_back(re::makeCC(chars, &cc::Unicode));
+    };
+    auto literal = [&](const std::u32string & s) {
+        for (char32_t c : s) result.push_back(re::makeCC(c, &cc::Unicode));
+    };
+    const Insertions none;
+    if (step.stringRules.size() == 1) {
+        const ldml::StringRule & rule = step.stringRules.front();
+        if (!rule.run.empty() || rule.selfOverlapping) {
+            if (reason) *reason = rule.run.empty() ? "a rule that may match within its own text" : "a rule with a run";
+            return false;
+        }
+        engineBefore = rule.engineBefore;
+        engineAfter = rule.engineAfter;
+        text(rule.text);
+        literal(rule.replacement);
+    } else {
+        const ldml::MultipleCaptureMultipleReplacementSet & set = step.captureReplacements.front();
+        if (set.rules.size() != 1) return false;
+        if (set.reversed || set.moved) {
+            if (reason) *reason = "captures referred to out of order";
+            return false;
+        }
+        engineBefore = set.engineBefore;
+        engineAfter = set.engineAfter;
+        text(set.rules.front().first);
+        literal(set.rules.front().firstReplacement);
+        for (size_t i = 0; i < set.captures.size(); i++) {
+            re::Capture * const capture = re::makeCapture(std::to_string(i + 1),
+                ldml::possessiveContext(ldml::expandedContext(set.captures[i], none, DeletionMark), true));
+            items.push_back(capture);
+            text(set.texts[i]);
+            result.push_back(re::makeReference(capture->getName(), capture, 0));
+            literal(set.results[i]);
+        }
+    }
+    if (engineBefore) {
+        FusedContexts before;
+        if (!fusedContexts(engineBefore, true, before, true) || convertedContextMatters(before, conversionOutcomes(step))) {
+            if (reason) *reason = "a before context that may match differently in the converted text";
+            return false;
+        }
+        items.insert(items.begin(), re::makeLookBehindAssertion(
+            ldml::possessiveContext(ldml::expandedContext(engineBefore, none, DeletionMark), false)));
+    }
+    if (engineAfter) {
+        items.push_back(re::makeLookAheadAssertion(
+            ldml::possessiveContext(ldml::expandedContext(engineAfter, none, DeletionMark), true)));
+    }
+    RE_ModeOptions opts;
+    opts.forceUnicodeIndexing = true;
+    PreparedSearchReplace prepared = prepareSearchReplace(re::makeSeq(items.begin(), items.end()),
+                                                          re::makeSeq(result.begin(), result.end()), opts);
+    const std::vector<PreconditionFailure> failures = checkPreconditions(prepared, &cc::Unicode);
+    if (!failures.empty()) {
+        if (reason) {
+            //  (The reasons, without the constructs, which may be long.)
+            for (const PreconditionFailure & f : failures) *reason += (reason->empty() ? "" : "; ") + f.reason;
+        }
+        return false;
+    }
+    if (sr) *sr = prepared;
+    return true;
 }
 
 static void printBeforeContextNotes(const ldml::TransformStep & step) {
@@ -4927,6 +5024,13 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
 
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
     if (insertionsOnly(step)) return insertionGroup(step, U21);
+    PreparedSearchReplace sr;
+    if (!activeMask() && engineSearchReplace(step, &sr)) {
+        RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
+        StreamSet * const result = mP.CreateStreamSet(21);
+        engine.searchReplaceCodeUnitsPipeline(sr, result);
+        return result;
+    }
     //  Within a mask, a context-free, single-character mapping is applied
     //  only to the masked characters (localCharacterMapping): map runs this
     //  same function again, but on the (unmasked) shortened text, where the

@@ -62,6 +62,13 @@ add_test(NAME re_preconditions_test
     WORKING_DIRECTORY ${TEST_BIN_DIR}
     COMMAND ./re_preconditions)
 
+# Replacement patterns of search and replace and their analyses (no pipeline compiled)
+parabix_add_executable(NAME re_replacement SRC re_replacement.cpp
+                       DEPS re.parse re.analysis re.adt toolchain)
+add_test(NAME re_replacement_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ./re_replacement)
+
 # The MatchStarts mode of the regular expression engine, checked with Python's re
 parabix_add_executable(NAME match_starts SRC match_starts.cpp
                        DEPS kernel.re kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.util re.parse toolchain)

@@ -600,7 +600,7 @@ the buffering), and one more RE kernel.
    translates its contexts and boundaries to standard REs; compare outputs
    on the CLDR test cases (`tconv_coverage.py`) — no change expected.
 5. **Replacement patterns**: parser for `$n`/`${n}`/`${name}`/`\n`,
-   validation, length analysis, literal folding.
+   validation, length analysis, literal folding. Done (see the status below).
 6. **S&R, literal replacements**: U1, U2, no overlap; precondition analyses
    for them; a small `resub`-style tool (or an icgrep `--replace` option) to
    exercise it.
@@ -730,4 +730,28 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   all their cases; chr-t-am (am-chr) gives the same output as build18 (LLVM
   18), with the line breaks lost. 22 files still crash in LLVM 22 code
   generation. Cases passing: 216244 before, 216959 after.
+
+## Milestone 5 status
+
+- `re::parseReplacement(text, search, error)` (`re/parse/replacement_parser.h`):
+  the replacement as an RE, a sequence of literal characters (CCs of one
+  Unicode codepoint) and `Reference`s to the captures of the search pattern.
+  Syntax: `$n`, `${n}`, `${name}`, `\n` (one digit), `$$` and `\$` for `$`, `\\`,
+  `\t \n \r \f \v \e \a`, `\xHH`, `\x{H...}`, and other characters literally
+  (UTF-8, validated). Capture n is the capture named `"\n"` (as the RE parser
+  names them) or `"n"` (as LDML rules do). Errors are returned, not fatal, so
+  that clients can report them; `$0`/`$&` (the whole match) are not supported.
+  The instances of the references follow those of the search pattern's back
+  references.
+- Analyses (`re/analysis/replacement_analysis.h`): `capturesByName`;
+  `unresolvedReferences` (the precondition: none); `foldReplacement` (literal
+  strings and references, a reference to a capture of one string folded into
+  it); `replacementLengthRange` (in characters or UTF-8 code units, references
+  sized by their captures in the search pattern as prepared); `toUTF8String`.
+- The replacement feeds `removeUnneededCaptures(search, {search, replacement})`
+  for the `SearchReplace` goal (milestone 1), now tested with a parsed
+  replacement.
+- Test: `re_replacement_test` (`tests/re_replacement.cpp`), no pipeline
+  compiled: parsing and its errors, LDML and named captures, reference
+  instances, unresolved references, lengths.
 

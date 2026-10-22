@@ -11,6 +11,7 @@
 #include <re/adt/adt.h>
 #include <re/analysis/re_inspector.h>
 #include <re/parse/parser.h>
+#include <re/parse/replacement_parser.h>
 #include <re/printer/re_printer.h>
 #include <re/unicode/regex_passes.h>
 #include <toolchain/toolchain.h>
@@ -86,7 +87,8 @@ int main(int argc, char * argv[]) {
     }
     // The captures referenced by a replacement are kept for SearchReplace only.
     RE * const search = RE_Parser::parse("([a-z]+)@([a-z]+)");
-    RE * const replacement = RE_Parser::parse("(x)(y)\\2");
+    std::string error;
+    RE * const replacement = parseReplacement("<$2>", search, error);
     const unsigned forEnds = captures(resolveModesAndExternalSymbols(search, nullptr, RE_Goal::MatchEnds));
     const unsigned forReplace = captures(resolveModesAndExternalSymbols(search, nullptr, RE_Goal::SearchReplace,
                                                                         replacement));

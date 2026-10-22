@@ -14,8 +14,10 @@ SRC
     parser.cpp
     PCRE_parser.cpp
     Prosite_parser.cpp
+    replacement_parser.cpp
 DEPS
     re.adt
+    re.analysis
     ${Boost_LIBRARIES}
     unicode.data
 )

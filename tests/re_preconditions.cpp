@@ -50,7 +50,7 @@ const PreconditionCase Cases[] = {
     {"(?:ab|b){1,9}c", RE_Goal::MatchStarts, &cc::Unicode, false}, // too many length classes
     {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::UTF8, false},         // no strategy
     {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::Unicode, false},
-    {"abc", RE_Goal::SearchReplace, &cc::UTF8, false},             // not yet implemented
+    {"abc", RE_Goal::SearchReplace, &cc::UTF8, true},              // (the search pattern alone)
 };
 
 struct CaptureCounter final : public RE_Inspector {
@@ -83,6 +83,37 @@ int main(int argc, char * argv[]) {
             llvm::errs() << "FAIL " << c.pattern << " (" << goalName(c.goal) << ", "
                          << c.sourceEncoding->getName() << "): expected "
                          << (c.supported ? "supported" : "unsupported") << "\n" << preconditionReport(failures);
+        }
+    }
+    // Search and replace: the search pattern with its replacement.
+    {
+        struct SearchReplaceCase {
+            const char * search;
+            const char * replacement;
+            bool supported;
+        };
+        const SearchReplaceCase cases[] = {
+            {"cat", "dog", true},
+            {"[a-z]+@", "<at>", true},              // overlapping matches end together
+            {"[0-9]+(?![0-9])", "#", true},
+            {"cr[e\xC3\xA8]me", "cream", true},       // bounded: its strings compared
+            {"(b)c", "$1$1", true},                  // a capture of one string
+            {"[0-9]+", "#", false},                  // greedy or lazy
+            {"ab|abc", "X", false},                  // longest or first
+            {"x{2}", "X", false},                    // overlapping matches with different ends
+            {"x*", "X", false},                      // empty matches
+            {"([a-z]+)@", "$1", false},              // a reference (not yet supported)
+        };
+        for (const SearchReplaceCase & c : cases) {
+            RE * const search = RE_Parser::parse(c.search);
+            std::string error;
+            RE * const replacement = parseReplacement(c.replacement, search, error);
+            const auto failures = checkPreconditions(prepareSearchReplace(search, replacement));
+            if (failures.empty() != c.supported) {
+                errors++;
+                llvm::errs() << "FAIL s/" << c.search << "/" << c.replacement << "/: expected "
+                             << (c.supported ? "supported" : "unsupported") << "\n" << preconditionReport(failures);
+            }
         }
     }
     // The captures referenced by a replacement are kept for SearchReplace only.

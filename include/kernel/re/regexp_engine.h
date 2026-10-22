@@ -137,6 +137,30 @@ std::vector<PreconditionFailure> checkPreconditions(const PreparedRE & prepared,
 // A report of the failures, one per line.
 std::string preconditionReport(const std::vector<PreconditionFailure> & failures);
 
+//
+// A search and replace: the search pattern prepared with the SearchReplace
+// goal (keeping the captures referenced by the replacement), and the
+// replacement (see re::parseReplacement), whose references refer to the
+// captures of the search pattern as parsed.
+//
+struct PreparedSearchReplace {
+    PreparedRE search;
+    re::RE * replacement = nullptr;
+};
+
+PreparedSearchReplace prepareSearchReplace(re::RE * search, re::RE * replacement,
+                                           const RE_ModeOptions & opts = RE_ModeOptions{});
+
+// The preconditions of a search and replace: those of the search pattern
+// (each alternative must have a strategy for the starts of its matches, see
+// matchStartsPipeline); the search pattern must not match the empty string,
+// and no match may end within another (re::matchEndsUnique), so that the
+// matches replaced are the same whatever the matching conventions; every
+// reference of the replacement must be to a capture of the search pattern,
+// and (so far) to a capture that matches one string only.
+std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace & sr,
+                                                    const cc::Alphabet * sourceEncoding = &cc::UTF8);
+
 // The numbers (from 0) of the lines of a buffer that contain a match to an
 // RE (as parsed).  This resolves property values given by regular
 // expressions, as a search over the lines of the property value names.
@@ -540,6 +564,18 @@ public:
     // positions of characters (see usesUnicodeIndexing and getU8Index).
     void matchStartsPipeline(re::RE * re, kernel::StreamSet * starts);
     void matchStartsPipeline(const PreparedRE & re, kernel::StreamSet * starts);
+
+    // The text with the matches of the search pattern replaced: the first
+    // start of each set of overlapping matches is replaced (as every matching
+    // convention selects matches from the left), with the replacement (so far,
+    // a literal string).  output: the UTF-8 code units of the result, as a
+    // byte stream.  With match regions (see RE_context), also the region
+    // follows of the result (follows) and those of the regions in which a
+    // match was replaced (replaced), at their positions in the result; the
+    // source must then end with a region follow.  The preconditions (see
+    // checkPreconditions) must hold: a failure is fatal.
+    void searchReplacePipeline(const PreparedSearchReplace & sr, kernel::StreamSet * output,
+                               kernel::StreamSet * follows = nullptr, kernel::StreamSet * replaced = nullptr);
     kernel::PipelineBuilder & getPipelineBuilder() {return mPB;}
 
 protected:
@@ -601,6 +637,10 @@ protected:
     kernel::StreamSet * chainFormStarts(const ChainForm & form, std::vector<ChainStepStreams> & rec,
                                         std::vector<ChainCoverage::Final> & finalSteps,
                                         kernel::StreamSet * out = nullptr);
+
+    // The starts of the matches of a prepared RE as compiled (after the mode
+    // passes, see matchStartsPipeline).
+    void compileStarts(re::RE * re, kernel::StreamSet * starts);
 
     // The starts of the matches of an alternative (see matchStartsPipeline).
     void alternativeStarts(const MatchStartsAlternative & a, kernel::StreamSet * out);
@@ -665,6 +705,9 @@ private:
     kernel::StreamSet * mFinalMatchStarts;
     kernel::StreamSet * mFinalMatchFollows;
     kernel::StreamSet * mCodeUnitBasis = nullptr;
+    // Was the text extended by one position, as one match region (see
+    // ensurePrepared)?  Its region follow (the only one) is that position.
+    bool mTextExtended = false;
 };
 
 //

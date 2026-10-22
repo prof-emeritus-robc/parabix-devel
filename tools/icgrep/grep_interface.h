@@ -72,6 +72,8 @@ extern bool UnixByteOffsetsFlag; // -u
 extern bool InitialTabFlag; // -T
 extern bool OnlyMatchingFlag; // -o
 extern std::string LabelFlag; // -label
+extern std::string ReplaceFlag; // -replace
+extern bool ReplaceFlagSet;
 extern bool LineBufferedFlag; // -line-buffered
 extern int AfterContext; // -A or -C
 extern int BeforeContext; // -B or -C

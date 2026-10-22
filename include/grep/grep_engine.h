@@ -96,6 +96,9 @@ public:
     void suppressFileMessages(bool b = true) {mSuppressFileMessages = b;}
     void setBinaryFilesOption(argv::BinaryFilesMode mode) {mBinaryFilesMode = mode;}
     void setRecordBreak(GrepRecordBreakKind b);
+    // Print each matching line with its matches replaced (see
+    // re::parseReplacement): EmitMatchesEngine only.
+    void setReplacement(re::RE * replacement) {mReplacement = replacement;}
     void initFileResult(const std::vector<boost::filesystem::path> & filenames);
     bool haveFileBatch();
     void initRE(re::RE * re);
@@ -154,6 +157,8 @@ protected:
     GrepRecordBreakKind mGrepRecordBreak;
 
     PreparedRE mPreparedRE;     // the RE as prepared by the regular expression engine
+    re::RE * mReplacement = nullptr;
+    PreparedSearchReplace mPreparedSR;  // with a replacement: the search and replace
     re:: RE * mRE;
     re::ReferenceInfo mRefInfo;
     std::string mFileSuffix;
@@ -223,6 +228,8 @@ public:
     EmitMatchesEngine(BaseDriver & driver);
     void grepPipeline(kernel::PipelineBuilder & P, kernel::StreamSet * ByteStream);
     void grepCodeGen() override;
+    // The matching lines with their matches replaced (see setReplacement).
+    void replacePipeline(kernel::PipelineBuilder & P, kernel::StreamSet * ByteStream);
 private:
     uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) override;
     bool detectsBinaryByNull() const;

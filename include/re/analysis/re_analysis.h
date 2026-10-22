@@ -126,5 +126,21 @@ bool anyEndAnchor(const RE * r);
 // matched code unit (0 or 1).  indexedUTF8: the RE is compiled over UTF-8 code
 // units with a Unicode character index (the UTF-8 indexed mode).
 unsigned grepOffset(const RE * re, bool indexedUTF8 = false);
+
+// Can no match of re end within another match, other than at its end?  (A
+// sufficient test, on an RE of Unicode CCs.)  Matches that overlap then end at
+// the same position, and each start has one end, so that the matches selected
+// from the left, without overlap, are the same whatever the matching
+// conventions: the first start of each set of overlapping matches.  For a
+// bounded re (with at most 64 strings of character classes), the strings are
+// compared, with its assertions ignored.  Otherwise, for each alternative A of
+// re, one of:
+//   - A ends with End (its matches end at the end of the text or region);
+//   - A ends with a negative lookahead (?!Y), for a class Y including every
+//     character that can occur at a position of a match other than its first
+//     (so a match cannot continue after the end of A);
+//   - no character that can be the last of a match of A can occur at a
+//     position of a match other than its last.
+bool matchEndsUnique(const RE * re);
 }
 

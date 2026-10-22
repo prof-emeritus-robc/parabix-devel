@@ -524,6 +524,11 @@ add_test(
   COMMAND python3 abc_test.py ${BIN_DIR}/icgrep)
 
 add_test(
+  NAME replace_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 replace_test.py ${BIN_DIR}/icgrep)
+
+add_test(
   NAME ldml_trules_test
   COMMAND ${BIN_DIR}/ldml_trules --self-test)
 

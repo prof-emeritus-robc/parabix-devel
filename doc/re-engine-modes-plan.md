@@ -603,7 +603,7 @@ the buffering), and one more RE kernel.
    validation, length analysis, literal folding. Done (see the status below).
 6. **S&R, literal replacements**: U1, U2, no overlap; precondition analyses
    for them; a small `resub`-style tool (or an icgrep `--replace` option) to
-   exercise it.
+   exercise it. Done, with overlapping matches that end together (see the status below).
 7. **S&R, captures**: U3 analysis, capture boundaries, `captureSpans`.
 8. **tconv on S&R**: string rules and MultipleCaptureMultipleReplacement sets
    through the engine, with functions applied by tconv to `captureSpans`;
@@ -754,4 +754,50 @@ to clients, and the pipeline methods treat precondition failures as fatal.
 - Test: `re_replacement_test` (`tests/re_replacement.cpp`), no pipeline
   compiled: parsing and its errors, LDML and named captures, reference
   instances, unresolved references, lengths.
+
+## Milestone 6 status
+
+- `prepareSearchReplace(search, replacement, opts)` gives a
+  `PreparedSearchReplace` (the search pattern prepared with the `SearchReplace`
+  goal, keeping the captures the replacement refers to), with
+  `checkPreconditions(sr)`; `RE_PipelineBuilder::searchReplacePipeline(sr,
+  output, follows, replaced)` gives the text with the matches replaced as a
+  byte stream (UTF-8), and with match regions, the region follows of the
+  result and those of the regions with a replacement.
+- Selection, wider than "no overlap": if no match can end within another,
+  other than at its end (`re::matchEndsUnique`), overlapping matches end
+  together and each start has one end (U1 follows), so every convention
+  replaces the first start of each set of overlapping matches. A start is
+  selected unless it is within the match of an earlier start, bit-parallel
+  (`LeftmostMatchSelection`: the positions from each start through the next
+  end, by `MatchStar` over the positions other than ends; the `InclusiveSpan`
+  intrinsic is a subtraction, wrong for nested starts). `[a-z]+@` on `ab@`
+  replaces `ab@` once.
+- `matchEndsUnique` (a sufficient test, `re_analysis.h`): for a bounded RE (at
+  most 64 strings of classes), the strings are compared (can a match end at a
+  position of another before its last?); otherwise each alternative ends with
+  `End`, with a negative lookahead covering the characters after the first of a
+  match (as possessive `X+` gives `X+(?!X)`), or with characters that cannot be
+  before the last of a match. Rejected, as ambiguous or needing a sequential
+  selection: `\d+`, `ab|abc`, `x{2}`, `aba`.
+- Other preconditions: the search pattern does not match the empty string;
+  every reference is to a capture of the search pattern; references are folded
+  into literals (captures of one string) or rejected (milestone 7).
+- Pipeline: starts (`compileStarts`, the starts strategies), ends (the matches,
+  shifted back by `grepOffset`), selection; each selected match deleted but for
+  its start; `length - 1` positions inserted after it (`ConstantCount`,
+  `InsertionSpreadMask` after, `SpreadByMask`); the literal written at the start
+  and the inserted positions (`FillReplacement`); in byte mode the basis bits are
+  the result, in Unicode mode the codepoints are encoded (`U21_to_UTF8`) and the
+  follows spread to the last byte of their characters (`UTF8_index`). The
+  extension of a text without regions (ensurePrepared) is dropped.
+- icgrep `--replace=REPL`: each matching line with its matches replaced (as
+  ripgrep's `--replace`), with -n, -H, -m; files are processed one at a time
+  (the result's positions are not the batch's), and a text is terminated with
+  a line break. Not with -c/-l/-L/-q, -v, context lines or -Unicode-lines; the
+  replacement may not contain a line break; coloring is off.
+- Tests: `replace_test` (`QA/replace_test.py`, icgrep compared with Python's
+  `re.sub` on the matching lines, 10 replacements in byte and Unicode modes and
+  6 rejections, -n -H over two files; 0.7 s with the object cache), and search
+  and replace cases in `re_preconditions_test`.
 

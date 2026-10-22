@@ -17,6 +17,8 @@
 #include <re/adt/re_end.h>
 #include <re/adt/re_utility.h>
 #include <re/parse/parser.h>
+#include <re/parse/replacement_parser.h>
+#include <re/analysis/replacement_analysis.h>
 #include <re/toolchain/toolchain.h>
 #include <grep/grep_engine.h>
 #include "grep_interface.h"
@@ -141,6 +143,23 @@ int main(int argc, char *argv[]) {
     if (argv::MmapFlag) grep->setPreferMMap();
     grep->setBinaryFilesOption(argv::BinaryFilesFlag);
     grep->initFileResult(allFiles); // unnecessary copy!
+    if (argv::ReplaceFlagSet) {
+        std::string error;
+        re::RE * const replacement = re::parseReplacement(argv::ReplaceFlag, RE, error);
+        if (replacement == nullptr) {
+            llvm::report_fatal_error(llvm::StringRef("--replace: ") + error);
+        }
+        // The lines of the result must be those of the text.
+        std::vector<re::ReplacementItem> items;
+        re::foldReplacement(replacement, RE, items);
+        const char32_t recordBreak = argv::NullDataFlag ? U'\0' : U'\n';
+        for (const re::ReplacementItem & item : items) {
+            if (item.literal.find(recordBreak) != std::u32string::npos) {
+                llvm::report_fatal_error("--replace: the replacement may not contain a line break");
+            }
+        }
+        grep->setReplacement(replacement);
+    }
     grep->initRE(RE);
     grep->grepCodeGen();
     #ifdef REPORT_PAPI_TESTS

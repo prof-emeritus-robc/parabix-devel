@@ -10,6 +10,9 @@
 #include <re/cc/cc_kernel.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/basis/s2p_kernel.h>
+#include <kernel/basis/p2s_kernel.h>
+#include <kernel/unicode/utf8gen.h>
+#include <re/analysis/replacement_analysis.h>
 #include <kernel/bitwise/bixlogic.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
@@ -1006,15 +1009,30 @@ static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     return mode;
 }
 
-PreparedRE prepareRE(RE * re, const RE_ModeOptions & opts) {
+// An RE prepared for the goal of the options, with the replacement of a search
+// and replace (keeping the captures it refers to).
+static PreparedRE prepareFor(RE * re, const RE_ModeOptions & opts, RE * replacement) {
     PreparedRE prepared;
     // Property values given by regular expressions are resolved by a search
     // of the lines of property value names.
-    re = resolveModesAndExternalSymbols(re, matchingLineNumbers, opts.goal);
+    re = resolveModesAndExternalSymbols(re, matchingLineNumbers, opts.goal, replacement);
     prepared.re = regular_expression_passes(re, &cc::Unicode, opts.goal);
     prepared.mode = determineREMode(prepared.re, opts);
     prepared.options = opts;
     return prepared;
+}
+
+PreparedRE prepareRE(RE * re, const RE_ModeOptions & opts) {
+    return prepareFor(re, opts, nullptr);
+}
+
+PreparedSearchReplace prepareSearchReplace(RE * search, RE * replacement, const RE_ModeOptions & opts) {
+    RE_ModeOptions o = opts;
+    o.goal = RE_Goal::SearchReplace;
+    PreparedSearchReplace sr;
+    sr.search = prepareFor(search, o, replacement);
+    sr.replacement = replacement;
+    return sr;
 }
 
 std::pair<int, int> PreparedRE::lengthRange() const {
@@ -1152,6 +1170,7 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
         mPB.CreateKernelCall<ExtendByOne>(source, extended);
         matchFollows = mPB.CreateStreamSet(1, 1);
         mPB.CreateKernelCall<EndOfTextMark>(source, matchFollows);
+        mTextExtended = true;
         matchStarts = mPB.CreateStreamSet(1, 1);
         mPB.CreateKernelCall<StartOfTextMark>(extended, matchStarts);
         source = extended;
@@ -2190,9 +2209,13 @@ void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, Stream
     mRE = applyModePasses(re, RE_Goal::MatchStarts);
     mRE = processReferences(mRE);
     prepareExternals(mRE);
+    compileStarts(mRE, starts);
+}
+
+void RE_PipelineBuilder::compileStarts(RE * re, StreamSet * starts) {
     std::vector<MatchStartsAlternative> plan;
     std::vector<RE *> unsupported;
-    planMatchStarts(mRE, mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet, plan, unsupported);
+    planMatchStarts(re, mCtxt.mLengthAlphabet, mCtxt.mCodeUnitAlphabet, plan, unsupported);
     // (The preconditions have been checked by applyModePasses.)
     assert(unsupported.empty());
     if (plan.size() == 1) {
@@ -2432,10 +2455,6 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
     // The transformations here only check the RE (processReferences applies them).
     QuietREPrinting quiet;
     std::vector<PreconditionFailure> failures;
-    if (goal == RE_Goal::SearchReplace) {
-        failures.push_back(PreconditionFailure{goal, transformed,
-                           std::string("the ") + goalName(goal) + " goal is not yet implemented"});
-    }
     // Lookaheads named as externals (see RE_PipelineBuilder::compileExternal
     // and matchStartPipeline).
     for (const auto & u : LA.mUnsupported) {
@@ -2471,7 +2490,7 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
     }
     // The starts of the matches of each alternative (see matchStartsPipeline),
     // of the RE as compiled.
-    if (goal == RE_Goal::MatchStarts) {
+    if ((goal == RE_Goal::MatchStarts) || (goal == RE_Goal::SearchReplace)) {
         std::vector<MatchStartsAlternative> plan;
         std::vector<RE *> unsupported;
         planMatchStarts(fixedRefs, mLengthAlphabet, mCodeUnitAlphabet, plan, unsupported);
@@ -2508,6 +2527,279 @@ std::string preconditionReport(const std::vector<PreconditionFailure> & failures
         report += std::string(goalName(f.goal)) + ": " + f.reason + ": " + Printer_RE::PrintRE(f.construct) + "\n";
     }
     return report;
+}
+
+//
+// Search and replace.
+//
+namespace {
+
+// The matches selected from the left without overlap, given the starts and
+// the ends (last positions) of the matches, where no match ends within
+// another (re::matchEndsUnique): overlapping matches then end at the same
+// position, and a start is selected unless it is within the match of an
+// earlier start.  Selected: the selected starts; Covered: the positions of the
+// selected matches; Keep: the positions kept when the matches are replaced
+// (not covered, other than the starts if keepStarts), less those of Drop.
+class LeftmostMatchSelection final : public pablo::PabloKernel {
+public:
+    LeftmostMatchSelection(LLVMTypeSystemInterface & ts, StreamSet * Starts, StreamSet * Ends, StreamSet * Drop,
+                           bool keepStarts, StreamSet * Selected, StreamSet * Covered, StreamSet * Keep)
+    : PabloKernel(ts, std::string("LeftmostMatchSelection") + (Drop ? "_drop" : "") + (keepStarts ? "_keep" : ""),
+                  [&] {
+                      Bindings inputs{Binding{"Starts", Starts}, Binding{"Ends", Ends}};
+                      if (Drop) inputs.emplace_back("Drop", Drop);
+                      return inputs;
+                  }(),
+                  {Binding{"Selected", Selected}, Binding{"Covered", Covered}, Binding{"Keep", Keep}}),
+      mHasDrop(Drop != nullptr), mKeepStarts(keepStarts) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const S = getInputStreamSet("Starts")[0];
+        PabloAST * const E = getInputStreamSet("Ends")[0];
+        PabloAST * const notE = pb.createNot(E);
+        // The positions from marks M through the next end: the next end of each
+        // mark is the end of its match.
+        auto through = [&](PabloAST * M) {
+            PabloAST * const run = pb.createMatchStar(pb.createAnd(M, notE), notE);
+            return pb.createOr(pb.createOr(pb.createAnd(M, E), run), pb.createAnd(pb.createAdvance(run, 1), E));
+        };
+        PabloAST * const inside = through(pb.createAdvance(pb.createAnd(S, notE), 1));
+        PabloAST * const selected = pb.createAnd(S, pb.createNot(inside), "selected");
+        PabloAST * const covered = through(selected);
+        PabloAST * keep = pb.createNot(covered);
+        if (mKeepStarts) keep = pb.createOr(keep, selected);
+        if (mHasDrop) keep = pb.createAnd(keep, pb.createNot(getInputStreamSet("Drop")[0]));
+        writeOutputStreamSet("Selected", std::vector<PabloAST *>{selected});
+        writeOutputStreamSet("Covered", std::vector<PabloAST *>{covered});
+        writeOutputStreamSet("Keep", std::vector<PabloAST *>{pb.createInFile(keep)});
+    }
+private:
+    const bool mHasDrop;
+    const bool mKeepStarts;
+};
+
+// The bixnum of a constant count at the marked positions (zero elsewhere).
+class ConstantCount final : public pablo::PabloKernel {
+public:
+    ConstantCount(LLVMTypeSystemInterface & ts, StreamSet * Marks, unsigned count, StreamSet * Counts)
+    : PabloKernel(ts, "ConstantCount" + std::to_string(count) + "_" + std::to_string(Counts->getNumElements()),
+                  {Binding{"Marks", Marks}}, {Binding{"Counts", Counts}}),
+      mCount(count), mBits(Counts->getNumElements()) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const marks = getInputStreamSet("Marks")[0];
+        std::vector<PabloAST *> counts;
+        for (unsigned j = 0; j < mBits; j++) {
+            counts.push_back(((mCount >> j) & 1) ? marks : pb.createZeroes());
+        }
+        writeOutputStreamSet("Counts", counts);
+    }
+private:
+    const unsigned mCount;
+    const unsigned mBits;
+};
+
+// The code units of a literal replacement written at each anchor and the
+// positions after it: code unit k at Advance(Anchors, k).  The text is
+// otherwise unchanged.
+class FillReplacement final : public pablo::PabloKernel {
+public:
+    FillReplacement(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & units, StreamSet * Text,
+                    StreamSet * Anchors, StreamSet * Filled)
+    : PabloKernel(ts, "FillReplacement" + std::to_string(Text->getNumElements()) + "_" + [&] {
+                      std::string sig;
+                      for (unsigned u : units) sig += std::to_string(u) + ",";
+                      return getStringHash(sig);
+                  }(),
+                  {Binding{"Text", Text}, Binding{"Anchors", Anchors}}, {Binding{"Filled", Filled}}),
+      mUnits(units) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> text = getInputStreamSet("Text");
+        PabloAST * const anchors = getInputStreamSet("Anchors")[0];
+        std::vector<PabloAST *> at;
+        PabloAST * any = pb.createZeroes();
+        for (unsigned k = 0; k < mUnits.size(); k++) {
+            at.push_back((k == 0) ? anchors : pb.createAdvance(anchors, k));
+            any = pb.createOr(any, at.back());
+        }
+        std::vector<PabloAST *> filled;
+        for (unsigned b = 0; b < text.size(); b++) {
+            PabloAST * bit = pb.createAnd(text[b], pb.createNot(any));
+            for (unsigned k = 0; k < mUnits.size(); k++) {
+                if ((mUnits[k] >> b) & 1) bit = pb.createOr(bit, at[k]);
+            }
+            filled.push_back(bit);
+        }
+        writeOutputStreamSet("Filled", filled);
+    }
+private:
+    const std::vector<unsigned> mUnits;
+};
+
+// The preconditions of a search and replace other than those of the search
+// pattern as compiled (see ModeTransformation::failures).
+std::vector<PreconditionFailure> searchReplaceFailures(const PreparedSearchReplace & sr) {
+    const RE_Goal goal = RE_Goal::SearchReplace;
+    std::vector<PreconditionFailure> failures;
+    RE * const search = sr.search.re;
+    if (sr.replacement == nullptr) {
+        failures.push_back(PreconditionFailure{goal, search, "no replacement"});
+        return failures;
+    }
+    if (getLengthRange(search, &cc::Unicode).first == 0) {
+        failures.push_back(PreconditionFailure{goal, search, "the search pattern can match the empty string"});
+    }
+    if (!matchEndsUnique(search)) {
+        failures.push_back(PreconditionFailure{goal, search,
+                           "a match may end within another match (other than at its end): which matches are "
+                           "replaced may then depend on the matching conventions (greedy or lazy, longest or "
+                           "first), or need a sequential selection of overlapping matches (not yet supported)"});
+    }
+    for (Reference * r : unresolvedReferences(sr.replacement, search)) {
+        failures.push_back(PreconditionFailure{goal, r, "a reference to a capture that the search pattern does not have"});
+    }
+    std::vector<re::ReplacementItem> items;
+    if (!foldReplacement(sr.replacement, search, items)) {
+        failures.push_back(PreconditionFailure{goal, sr.replacement,
+                           "the replacement is not a sequence of literal characters and references"});
+    }
+    for (const re::ReplacementItem & item : items) {
+        if (item.reference) {
+            failures.push_back(PreconditionFailure{goal, item.reference,
+                               "references to captures (other than captures of one string) are not yet supported"});
+        }
+    }
+    return failures;
+}
+
+}
+
+std::vector<PreconditionFailure> checkPreconditions(const PreparedSearchReplace & sr, const cc::Alphabet * sourceEncoding) {
+    std::vector<PreconditionFailure> failures = checkPreconditions(sr.search, sourceEncoding);
+    for (PreconditionFailure & f : searchReplaceFailures(sr)) failures.push_back(std::move(f));
+    return failures;
+}
+
+void RE_PipelineBuilder::searchReplacePipeline(const PreparedSearchReplace & sr, StreamSet * output,
+                                               StreamSet * follows, StreamSet * replaced) {
+    if (sr.search.options.goal != RE_Goal::SearchReplace) {
+        llvm::report_fatal_error("searchReplacePipeline: the search pattern must be prepared with prepareSearchReplace");
+    }
+    const std::vector<PreconditionFailure> failures = searchReplaceFailures(sr);
+    if (!failures.empty()) {
+        llvm::report_fatal_error(llvm::StringRef("Regular expression engine preconditions not met:\n") +
+                                 preconditionReport(failures));
+    }
+    usePrepared(sr.search);
+    RE * re = sr.search.re;
+    ensurePrepared(re);
+    mRE = applyModePasses(re, RE_Goal::SearchReplace);
+    mRE = processReferences(mRE);
+    prepareExternals(mRE);
+    if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
+        llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
+    }
+    // The starts of the matches, and their ends (last positions).
+    StreamSet * const starts = mPB.CreateStreamSet(1);
+    compileStarts(mRE, starts);
+    StreamSet * ends = mPB.CreateStreamSet(1);
+    mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, mRE, ends);
+    if (const unsigned offset = grepOffset(mRE)) {
+        StreamSet * const shifted = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<ShiftBack>(ends, shifted, offset);
+        ends = shifted;
+    }
+    // The replacement: one literal string (references are folded or excluded
+    // by the preconditions), in code units.
+    std::vector<re::ReplacementItem> items;
+    foldReplacement(sr.replacement, sr.search.re, items);
+    const std::u32string literal = items.empty() ? std::u32string() : items.front().literal;
+    std::vector<unsigned> units;
+    const bool utf8 = (mCtxt.mCodeUnitAlphabet == &cc::UTF8);
+    if (utf8) {
+        for (const char c : toUTF8String(literal)) units.push_back(static_cast<unsigned char>(c));
+    } else {
+        units.assign(literal.begin(), literal.end());
+    }
+    const unsigned length = units.size();
+    // The matches selected, and the positions kept: each match is deleted but
+    // for its start, which becomes the first code unit of the replacement.
+    StreamSet * const selected = mPB.CreateStreamSet(1);
+    StreamSet * const covered = mPB.CreateStreamSet(1);
+    StreamSet * const keep = mPB.CreateStreamSet(1);
+    StreamSet * const drop = mTextExtended ? mCtxt.mMatchFollows : nullptr;
+    mPB.CreateKernelCall<LeftmostMatchSelection>(starts, ends, drop, length > 0, selected, covered, keep);
+    if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+        mPB.captureBitstream("srStarts", starts);
+        mPB.captureBitstream("srEnds", ends);
+        mPB.captureBitstream("srSelected", selected);
+        mPB.captureBitstream("srKeep", keep);
+    }
+    StreamSet * matchedFollows = nullptr;
+    if (replaced) {
+        matchedFollows = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<MatchedLinesKernel>(selected, mCtxt.mMatchFollows, matchedFollows);
+    }
+    auto filtered = [&](StreamSet * s) {
+        StreamSet * const f = mPB.CreateStreamSet(s->getNumElements());
+        FilterByMask(mPB, keep, s, f);
+        return f;
+    };
+    StreamSet * text = filtered(utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream);
+    StreamSet * anchors = (length > 0) ? filtered(selected) : nullptr;
+    StreamSet * resultFollows = follows ? filtered(mCtxt.mMatchFollows) : nullptr;
+    StreamSet * resultReplaced = replaced ? filtered(matchedFollows) : nullptr;
+    // The positions of the rest of the replacement, after each start.
+    if (length > 1) {
+        unsigned bits = 0;
+        while (((length - 1) >> bits) != 0) bits++;
+        StreamSet * const counts = mPB.CreateStreamSet(bits);
+        mPB.CreateKernelCall<ConstantCount>(anchors, length - 1, counts);
+        StreamSet * const spreadMask = mPB.CreateStreamSet(1);
+        InsertionSpreadMask(mPB, counts, spreadMask, kernel::InsertPosition::After);
+        auto spread = [&](StreamSet * s) {
+            StreamSet * const x = mPB.CreateStreamSet(s->getNumElements());
+            SpreadByMask(mPB, spreadMask, s, x);
+            return x;
+        };
+        text = spread(text);
+        anchors = spread(anchors);
+        if (resultFollows) resultFollows = spread(resultFollows);
+        if (resultReplaced) resultReplaced = spread(resultReplaced);
+    }
+    if (length > 0) {
+        StreamSet * const filled = mPB.CreateStreamSet(text->getNumElements());
+        mPB.CreateKernelCall<FillReplacement>(units, text, anchors, filled);
+        text = filled;
+    }
+    // The result in UTF-8 code units, and its follows at their positions.
+    StreamSet * u8basis = text;
+    if (!utf8) {
+        u8basis = mPB.CreateStreamSet(8);
+        U21_to_UTF8(mPB, text, u8basis);
+        if (follows || replaced) {
+            StreamSet * const u8index = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<UTF8_index>(u8basis, u8index);
+            if (follows) {
+                StreamSet * const s = mPB.CreateStreamSet(1);
+                SpreadByMask(mPB, u8index, resultFollows, s);
+                resultFollows = s;
+            }
+            if (replaced) {
+                StreamSet * const s = mPB.CreateStreamSet(1);
+                SpreadByMask(mPB, u8index, resultReplaced, s);
+                resultReplaced = s;
+            }
+        }
+    }
+    mPB.CreateKernelCall<P2SKernel>(u8basis, output);
+    if (follows) mPB.CreateKernelCall<StreamSelect>(follows, Select(resultFollows, {0}));
+    if (replaced) mPB.CreateKernelCall<StreamSelect>(replaced, Select(resultReplaced, {0}));
 }
 
 RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {

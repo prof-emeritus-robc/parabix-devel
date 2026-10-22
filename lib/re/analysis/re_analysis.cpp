@@ -1,6 +1,8 @@
 #include <re/analysis/re_analysis.h>
 
 #include <limits.h>
+#include <algorithm>
+#include <vector>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/adt.h>
@@ -931,6 +933,273 @@ struct LookaheadChainFree : public RE_Validator {
 
 bool hasLookaheadChain(const RE * r) {
     return !LookaheadChainFree().validateRE(r);
+}
+
+
+namespace {
+
+// The characters of a character class item (CC, Any or a combination), or
+// false if r is not one.
+bool classChars(const RE * r, UCD::UnicodeSet & chars) {
+    if (const CC * const cc = dyn_cast<CC>(r)) {
+        if (cc->getAlphabet() != &cc::Unicode) return false;
+        chars = chars + *cc;
+        return true;
+    } else if (isa<Any>(r)) {
+        chars = chars + UCD::UnicodeSet(0, UCD::UNICODE_MAX);
+        return true;
+    } else if (isa<Diff>(r) || isa<Intersect>(r) || isa<Name>(r) ||
+               (isa<PropertyExpression>(r) && (cast<PropertyExpression>(r)->getKind() == PropertyExpression::Kind::Codepoint))) {
+        // (Properties as resolved, and names of classes.)
+        CC * const cc = resolveCharClass(const_cast<RE *>(r));
+        if ((cc == nullptr) || (cc->getAlphabet() != &cc::Unicode)) return false;
+        chars = chars + *cc;
+        return true;
+    }
+    return false;
+}
+
+bool zeroWidth(const RE * r);
+
+// The strings matched by r, as sequences of character classes, ignoring its
+// assertions (so possibly more strings than it matches), at most limit of
+// them; false if r is not bounded or has too many.
+using ClassSequences = std::vector<std::vector<UCD::UnicodeSet>>;
+
+bool classSequences(const RE * r, ClassSequences & out, size_t limit) {
+    out.clear();
+    UCD::UnicodeSet chars;
+    if (classChars(r, chars)) {
+        out.push_back({chars});
+        return true;
+    }
+    if (zeroWidth(r)) {
+        out.push_back({});
+        return true;
+    }
+    auto product = [&](const ClassSequences & a, const ClassSequences & b, ClassSequences & ab) {
+        ab.clear();
+        if (a.size() * b.size() > limit) return false;
+        for (const auto & x : a) {
+            for (const auto & y : b) {
+                ab.push_back(x);
+                ab.back().insert(ab.back().end(), y.begin(), y.end());
+            }
+        }
+        return true;
+    };
+    if (const Seq * seq = dyn_cast<Seq>(r)) {
+        out.push_back({});
+        for (const RE * e : *seq) {
+            ClassSequences es, next;
+            if (!classSequences(e, es, limit) || !product(out, es, next)) return false;
+            out = std::move(next);
+        }
+        return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        for (const RE * e : *alt) {
+            ClassSequences es;
+            if (!classSequences(e, es, limit)) return false;
+            out.insert(out.end(), es.begin(), es.end());
+            if (out.size() > limit) return false;
+        }
+        return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(r)) {
+        if (rep->getUB() == Rep::UNBOUNDED_REP) return false;
+        ClassSequences body, k_copies{{}};
+        if ((rep->getUB() > 0) && !classSequences(rep->getRE(), body, limit)) return false;
+        for (int k = 0; k <= rep->getUB(); k++) {
+            if (k >= rep->getLB()) {
+                out.insert(out.end(), k_copies.begin(), k_copies.end());
+                if (out.size() > limit) return false;
+            }
+            if (k < rep->getUB()) {
+                ClassSequences next;
+                if (!product(k_copies, body, next)) return false;
+                k_copies = std::move(next);
+            }
+        }
+        return true;
+    } else if (const Capture * c = dyn_cast<Capture>(r)) {
+        return classSequences(c->getCapturedRE(), out, limit);
+    } else if (const Group * g = dyn_cast<Group>(r)) {
+        return classSequences(g->getRE(), out, limit);
+    }
+    return false;
+}
+
+// For the strings of a bounded RE: can a match end at a position of another
+// match other than its last (aligning the last class of a with each class of
+// b before its last, and the classes of a before it with those of b)?
+bool classSequencesEndWithin(const ClassSequences & strings) {
+    for (const auto & a : strings) {
+        if (a.empty()) continue;
+        for (const auto & b : strings) {
+            for (size_t j = 0; j + 1 < b.size(); j++) {
+                bool overlap = true;
+                for (size_t t = 0; overlap && (t < a.size()) && (t <= j); t++) {
+                    overlap = a[a.size() - 1 - t].intersects(b[j - t]);
+                }
+                if (overlap) return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Is r zero-width (an assertion, Start or End)?
+bool zeroWidth(const RE * r) {
+    if (isa<Assertion>(r) || isa<Start>(r) || isa<End>(r)) return true;
+    if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(r)) {
+        return pe->getKind() == PropertyExpression::Kind::Boundary;
+    }
+    return false;
+}
+
+// Can r match a nonempty string?
+bool consumes(const RE * r) {
+    return getLengthRange(r, &cc::Unicode).second > 0;
+}
+
+// The characters at the positions of the matches of r (the characters of its
+// assertions are not matched).  False if unknown.
+bool matchedChars(const RE * r, UCD::UnicodeSet & chars) {
+    if (classChars(r, chars)) return true;
+    if (zeroWidth(r)) return true;
+    if (const Seq * seq = dyn_cast<Seq>(r)) {
+        for (const RE * e : *seq) if (!matchedChars(e, chars)) return false;
+        return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        for (const RE * e : *alt) if (!matchedChars(e, chars)) return false;
+        return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(r)) {
+        return (rep->getUB() == 0) || matchedChars(rep->getRE(), chars);
+    } else if (const Capture * c = dyn_cast<Capture>(r)) {
+        return matchedChars(c->getCapturedRE(), chars);
+    } else if (const Group * g = dyn_cast<Group>(r)) {
+        return matchedChars(g->getRE(), chars);
+    } else if (const Name * n = dyn_cast<Name>(r)) {
+        return n->getDefinition() && matchedChars(n->getDefinition(), chars);
+    }
+    return false;
+}
+
+// The characters that can be at the last position of a match of r, and
+// whether r can match the empty string (so that what precedes it can be last).
+bool lastChars(const RE * r, UCD::UnicodeSet & chars, bool & empty) {
+    empty = false;
+    if (classChars(r, chars)) return true;
+    if (zeroWidth(r)) {
+        empty = true;
+        return true;
+    }
+    if (const Seq * seq = dyn_cast<Seq>(r)) {
+        empty = true;
+        for (auto i = seq->rbegin(); empty && (i != seq->rend()); ++i) {
+            if (!lastChars(*i, chars, empty)) return false;
+        }
+        return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        for (const RE * e : *alt) {
+            bool e_empty;
+            if (!lastChars(e, chars, e_empty)) return false;
+            empty |= e_empty;
+        }
+        return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(r)) {
+        if (rep->getUB() == 0) {
+            empty = true;
+            return true;
+        }
+        if (!lastChars(rep->getRE(), chars, empty)) return false;
+        empty |= (rep->getLB() == 0);
+        return true;
+    } else if (const Capture * c = dyn_cast<Capture>(r)) {
+        return lastChars(c->getCapturedRE(), chars, empty);
+    } else if (const Group * g = dyn_cast<Group>(r)) {
+        return lastChars(g->getRE(), chars, empty);
+    } else if (const Name * n = dyn_cast<Name>(r)) {
+        return n->getDefinition() && lastChars(n->getDefinition(), chars, empty);
+    }
+    return false;
+}
+
+// The characters that can be at a position of a match of r followed by
+// another position of the match (beforeLast), or preceded by one (after its
+// first).
+bool innerChars(const RE * r, UCD::UnicodeSet & chars, bool beforeLast) {
+    // A single character is both the first and the last position.
+    UCD::UnicodeSet single;
+    if (classChars(r, single) || zeroWidth(r)) return true;
+    if (const Seq * seq = dyn_cast<Seq>(r)) {
+        std::vector<const RE *> items(seq->begin(), seq->end());
+        if (!beforeLast) std::reverse(items.begin(), items.end());
+        for (size_t i = 0; i < items.size(); ++i) {
+            // An item followed (or preceded) by an item that can consume a
+            // character: all its characters; otherwise, its own inner ones.
+            bool later = false;
+            for (size_t j = i + 1; !later && (j < items.size()); ++j) later = consumes(items[j]);
+            if (later ? !matchedChars(items[i], chars) : !innerChars(items[i], chars, beforeLast)) return false;
+        }
+        return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(r)) {
+        for (const RE * e : *alt) if (!innerChars(e, chars, beforeLast)) return false;
+        return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(r)) {
+        if (rep->getUB() == 0) return true;
+        // (A repetition that may repeat: an earlier copy is followed by a later one.)
+        if ((rep->getUB() == Rep::UNBOUNDED_REP) || (rep->getUB() > 1)) return matchedChars(rep->getRE(), chars);
+        return innerChars(rep->getRE(), chars, beforeLast);
+    } else if (const Capture * c = dyn_cast<Capture>(r)) {
+        return innerChars(c->getCapturedRE(), chars, beforeLast);
+    } else if (const Group * g = dyn_cast<Group>(r)) {
+        return innerChars(g->getRE(), chars, beforeLast);
+    } else if (const Name * n = dyn_cast<Name>(r)) {
+        return n->getDefinition() && innerChars(n->getDefinition(), chars, beforeLast);
+    }
+    return false;
+}
+
+}
+
+bool matchEndsUnique(const RE * re) {
+    // A bounded RE: the precise test on its strings (with its assertions
+    // ignored, a superset of its matches).
+    ClassSequences strings;
+    if (classSequences(re, strings, 64)) {
+        return !classSequencesEndWithin(strings);
+    }
+    UCD::UnicodeSet beforeLast, afterFirst;
+    if (!innerChars(re, beforeLast, true) || !innerChars(re, afterFirst, false)) return false;
+    std::vector<const RE *> alts;
+    if (const Alt * alt = dyn_cast<Alt>(re)) {
+        alts.assign(alt->begin(), alt->end());
+    } else {
+        alts.push_back(re);
+    }
+    for (const RE * a : alts) {
+        const RE * last = a;
+        if (const Seq * seq = dyn_cast<Seq>(a)) {
+            if (seq->empty()) return false;
+            last = seq->back();
+        }
+        if (isa<End>(last)) continue;
+        if (const Assertion * as = dyn_cast<Assertion>(last)) {
+            if ((as->getKind() == Assertion::Kind::LookAhead) && isa<End>(as->getAsserted()) &&
+                    (as->getSense() == Assertion::Sense::Positive)) {
+                continue;
+            }
+            UCD::UnicodeSet Y;
+            if ((as->getKind() == Assertion::Kind::LookAhead) && (as->getSense() == Assertion::Sense::Negative) &&
+                    classChars(as->getAsserted(), Y) && afterFirst.subset(Y)) {
+                continue;
+            }
+        }
+        UCD::UnicodeSet lasts;
+        bool empty;
+        if (!lastChars(a, lasts, empty) || empty || lasts.intersects(beforeLast)) return false;
+    }
+    return true;
 }
 
 }

@@ -280,6 +280,20 @@ void GrepEngine::initRE(re::RE * re) {
     opts.unicodeIndexingOverride = UnicodeIndexing;
     opts.unicodeBasisOverride = UnicodeBasisMode || mColoring;
     opts.byteCClimit = ByteCClimit;
+    if (mReplacement) {
+        // The engine replaces the matches; the lines are printed uncolored.
+        mColoring = false;
+        mPreparedSR = prepareSearchReplace(re, mReplacement, opts);
+        const auto failures = checkPreconditions(mPreparedSR);
+        if (!failures.empty()) {
+            llvm::report_fatal_error(llvm::StringRef("--replace: the search and replace is not supported:\n") +
+                                     preconditionReport(failures));
+        }
+        mPreparedRE = mPreparedSR.search;
+        mRE = mPreparedRE.re;
+        mMode = mPreparedRE.mode;
+        return;
+    }
     mPreparedRE = prepareRE(re, opts);
     mRE = mPreparedRE.re;
     mMode = mPreparedRE.mode;
@@ -674,7 +688,36 @@ void GrepEngine::applyColorization(PipelineBuilder & P,
 
 }
 
+void EmitMatchesEngine::replacePipeline(kernel::PipelineBuilder & P, StreamSet * ByteStream) {
+    grepPrologue(P, ByteStream);
+    RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, mSource, mMatchStarts, mLineBreakStream});
+    RE_PB.setLineBreakStream(mLineBreakStream);
+    // The text with the matches replaced, its line breaks, and the breaks of
+    // the lines in which matches were replaced (doGrep terminates the text).
+    StreamSet * const Replaced = P.CreateStreamSet(1, 8);
+    StreamSet * const Breaks = P.CreateStreamSet(1);
+    StreamSet * ReplacedLines = P.CreateStreamSet(1);
+    RE_PB.searchReplacePipeline(mPreparedSR, Replaced, Breaks, ReplacedLines);
+    mLineBreakStream = Breaks;
+    ReplacedLines = applyMatchLimit(P, ReplacedLines);
+    if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+        P.captureByteData("Replaced", Replaced);
+        P.captureBitstream("ReplacedLines", ReplacedLines);
+    }
+    Scalar * const callbackObject = P.getInputScalar("callbackObject");
+    Kernel * const scanBatchK = P.CreateKernelCall<ScanBatchKernel>(ReplacedLines, mLineBreakStream, Replaced, callbackObject, ScanMatchBlocks);
+    P.LinkFunction(scanBatchK, "get_file_count_wrapper", get_file_count_wrapper);
+    P.LinkFunction(scanBatchK, "get_file_start_pos_wrapper", get_file_start_pos_wrapper);
+    P.LinkFunction(scanBatchK, "set_batch_line_number_wrapper", set_batch_line_number_wrapper);
+    P.LinkFunction(scanBatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
+    P.LinkFunction(scanBatchK, "finalize_match_wrapper", finalize_match_wrapper);
+}
+
 void EmitMatchesEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * ByteStream) {
+    if (mReplacement) {
+        replacePipeline(P, ByteStream);
+        return;
+    }
     grepPrologue(P, ByteStream);
     RE_PipelineBuilder RE_PB(P, RE_context{&cc::UTF8, mSource, mMatchStarts, mLineBreakStream});
     if (mU8index) {
@@ -895,6 +938,15 @@ bool EmitMatchesEngine::detectsBinaryByNull() const {
 
 uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) {
     auto f = mBatchMethod;
+    // With a replacement, the positions of the result are not those of the
+    // text: files are processed one at a time (not as a batch).
+    if (mReplacement && (fileNames.size() > 1)) {
+        uint64_t lines = 0;
+        for (const std::string & fileName : fileNames) {
+            lines += doGrep(std::vector<std::string>{fileName}, strm);
+        }
+        return lines;
+    }
     EmitMatch accum(mShowFileNames, mShowLineNumbers, ((mBeforeContext > 0) || (mAfterContext > 0)), mInitialTab, mGrepRecordBreak);
     accum.setStringStream(&strm);
     AlignedAllocator<char, batch_alignment> alloc;
@@ -926,7 +978,17 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
             }
         }
         if (!skip_binary_file) {
-            f(accum.mBatchBuffer, bytes_read, accum, mMaxCount);
+            const char terminator = (mGrepRecordBreak == GrepRecordBreakKind::Null) ? '\0' : '\n';
+            if (mReplacement && (accum.mBatchBuffer[bytes_read - 1] != terminator)) {
+                // The search and replace requires a text that ends with a line break.
+                char * const terminated = alloc.allocate(bytes_read + 1, 0);
+                memcpy(terminated, accum.mBatchBuffer, bytes_read);
+                terminated[bytes_read] = terminator;
+                f(terminated, bytes_read + 1, accum, mMaxCount);
+                alloc.deallocate(terminated, 0);
+            } else {
+                f(accum.mBatchBuffer, bytes_read, accum, mMaxCount);
+            }
         }
         buf.release();
         if (accum.mLineCount > 0) grepMatchFound = true;

@@ -147,6 +147,13 @@ bool OnlyMatchingFlag;
 static cl::opt<bool, true> OnlyMatchingOption("o", cl::location(OnlyMatchingFlag), cl::desc("Display only the exact strings that match the pattern, with possibly multiple matches per line."), cl::cat(Output_Options), cl::Grouping);
 static cl::alias OnlyMatchingAlias("only-matching", cl::desc("Alias for -o"), cl::aliasopt(OnlyMatchingOption));
 
+std::string ReplaceFlag;
+bool ReplaceFlagSet;
+static cl::opt<std::string, true> ReplaceOption("replace", cl::location(ReplaceFlag), cl::value_desc("replacement"),
+    cl::desc("Print each matching line with its matches replaced: $n, ${n} or \\n for capture n "
+             "(so far, captures of one string only), $$ for $, \\\\ for \\, \\t, \\x{HH...}."),
+    cl::cat(Output_Options));
+
 std::string LabelFlag;
     static cl::opt<std::string, true> LabelOption("label", cl::location(LabelFlag), cl::init("(standard input)"),
                                               cl::desc("Set a label for input lines matched from stdin."), cl::cat(Output_Options));
@@ -230,6 +237,21 @@ void InitializeCommandLineInterface(int argc, char *argv[]) {
     }
     if (LineBufferedFlag) {
         llvm::report_fatal_error("Sorry, -line-buffered is not yet supported.\n");
+    }
+    ReplaceFlagSet = ReplaceOption.getNumOccurrences() > 0;
+    if (ReplaceFlagSet) {
+        if (Mode != NormalMode) {
+            llvm::report_fatal_error("--replace cannot be used with -c, -l, -L or -q.\n");
+        }
+        if (InvertMatchFlag) {
+            llvm::report_fatal_error("--replace cannot be used with -v.\n");
+        }
+        if ((Context != 0) || (AfterContext != 0) || (BeforeContext != 0)) {
+            llvm::report_fatal_error("--replace cannot be used with context lines (-A, -B, -C).\n");
+        }
+        if (UnicodeLinesFlag) {
+            llvm::report_fatal_error("--replace cannot be used with -Unicode-lines.\n");
+        }
     }
     if (Context != 0) {
         if (AfterContext == 0) AfterContext = Context;

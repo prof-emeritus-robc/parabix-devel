@@ -67,12 +67,11 @@ Observations:
 - **Threads wait in the later phases.** On ko with a boundary after the filter, user
   time at 3 threads is 1.92 s against 0.71 s without it. The cycle counter puts 77%
   of the first phase-2 kernel's time in pipeline overhead, and that kernel takes half
-  of all ticks. `-TraceStridesPerSegment` shows many phase-2 and phase-3 segments
-  that process nothing, and the transform working in bursts.
-  The likely cause is that segment n of a phase must wait, kernel by kernel, for
-  segment n−1. A thread that takes a later-phase segment number when there is no
-  new input therefore waits behind the thread that has the data, instead of running
-  phase 1.
+  of all ticks. (A first reading of `-TraceStridesPerSegment`, counting zero entries
+  per kernel, suggested many later-phase segments that process nothing. That was
+  wrong: within a phase a partition may process nothing in one segment and twice as
+  much in the next, and no segment of a later phase is empty in every kernel; see
+  step 4.)
 - **Memory grows with the input, not with the buffer factor.** With a boundary,
   nfd's peak RSS on ko is 92, 166 and 350 MB for 5, 20 and 50 MB inputs (52 MB for
   each without a boundary), and the same with a phase step of 4, 16 or 100
@@ -108,16 +107,21 @@ cache), at 1 and 3 threads, with the scaling ceiling.
    - `-TraceDynamicBuffers` crashes nfd (exit 139) with or without a boundary, and
      `-TraceUnconsumedItemCounts` reports only zeros; fix or replace them first if
      they are needed to find it.
-4. **No empty segments in later phases** (pipeline compiler).
-   - Before a thread takes a segment number of phase p > 1, check that the
-     earlier-phase stream sets it consumes have grown since the last segment of
-     phase p was claimed, or that their producers have terminated; otherwise go on
-     to the next phase. `readEarlierPhaseItemCounts` (issue #26 fix) already reads
-     these counts once per segment.
-   - Alternatives if that is not enough: let only one thread at a time claim
-     segments of a phase whose input has not grown; adapt the step limits as the
-     TODO in `multithreading_model_logic.cpp` proposes (more segments for a phase
-     that keeps making progress, fewer for one that stalls).
+4. **Threads serialized in later phases** (pipeline compiler). Revised after the
+   investigation recorded under "Status of the steps".
+   - The cause is not empty segments but partition jumps: a later-phase segment
+     whose partition finds no new input in the earlier phase's stream sets skips the
+     partition, and must first wait for the previous segment to release every
+     skipped kernel's lock. Consecutive segments then run one after another.
+   - Remedies to try, smallest first:
+     - claim a later-phase segment only if the unconsumed earlier-phase input is
+       enough for it to have its own data beyond what the segments in flight will
+       take (needs a per-stream-set estimate of a segment's consumption);
+     - let a skipped partition's locks be released without waiting for the
+       previous segment when the partition has no state that depends on order
+       (for example, when all its kernels are state-free);
+     - run a later phase with fewer threads, or only after the earlier phase is a
+       given number of segments ahead (Phase 5 territory).
    - Gate: the issue #26 matrix (three tools × every boundary × `-VerifyIR`),
      `focus_modes_*_test`, and the test programs that use phases elsewhere
      (icgrep's phase boundaries in `grep_engine.cpp`).
@@ -204,3 +208,29 @@ cache), at 1 and 3 threads, with the scaling ceiling.
     | nfkd ko | 0.75 / 0.32 | 0.81 / 0.83 | 0.76 / 0.36 | 0.82 / 0.71 |
     | nfc ko.nfd | 0.97 / 0.40 | 0.98 / 0.95 | 0.98 / 0.51 | 0.97 / 0.51 |
     | nfc de.nfd | 0.16 / 0.10 | 0.16 / 0.15 | 0.17 / 0.14 | 0.16 / 0.14 |
+- **Step 4 (later phases):** investigated; no change committed.
+  - **No empty segments.** With step 3's fix, `QA/phase_segments.py` (now counting
+    a segment as empty only if every traced kernel of its phase processed nothing)
+    finds none: nfd on ko with a boundary after the transform runs 65 phase-1 and
+    65 phase-2 segments at 1 thread and 141 / 140 at 3 threads, none of them empty;
+    the trace that suggested empty segments has none either.
+  - **A claim check was tried and reverted.** Before each segment of a later phase,
+    a thread compared the earlier phase's produced counts with those at the phase's
+    last claim, and claimed only if they had grown, or the last segment made progress
+    and input remained unconsumed, or the producers had terminated. It was correct
+    (the 36-run matrix with `-VerifyIR`) but changed neither the segment counts nor
+    the times (nfd ko at 3 threads: 0.31 s with a boundary after the transform,
+    0.68 s after the filter, against 0.32 / 0.66 s).
+  - **Where the threads wait.** On a 600 MB input (nfd, boundary after the filter,
+    3 threads), `sample` puts about half of one thread's samples on three JIT
+    instructions, and lldb shows both other compute threads at the same loop:
+    `ldapr x9, [lock]; cmp x9, segNo; b.ne`, followed by stores of segNo+1 to
+    the locks of a run of consecutive kernels. That is the partition-jump path: the
+    segment skips partitions that have no input and waits for the previous segment
+    to release them. The cycle counter does not measure this wait separately; it
+    appears as pipeline overhead of the first kernel of the phase (89% of that
+    kernel's 29.5M ticks, against 2.3M ticks of execution at 1 thread).
+  - Why partitions find no input: each segment of a later phase reads the earlier
+    phase's counts once, at entry (the issue #26 fix). Segment n+1 starts right after
+    segment n's first kernel, sees nearly the same counts, and finds that segment n
+    has taken them.

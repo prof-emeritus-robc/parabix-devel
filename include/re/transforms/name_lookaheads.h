@@ -39,5 +39,10 @@ const std::string LookaheadChainPrefix = "LAchain_";
 /*  Lookaheads matched by reversal (see RE_PipelineBuilder::reversedStarts)
     are named with this prefix, before the other passes. */
 const std::string ReversedLookaheadPrefix = "LArev_";
+
+/*  Lookbehinds of an RE matched by reversal that are matched forward, as
+    externals of the backward pass (see RE_PipelineBuilder::reversedStarts),
+    are named with this prefix. */
+const std::string ForwardLookbehindPrefix = "LBfwd_";
 }
 

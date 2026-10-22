@@ -18,6 +18,8 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
+# Each pattern is given to icgrep and to Python, or as (icgrep, Python) where
+# Python needs an equivalent.
 PATTERNS = [
     "foo(?![a-z]*bar)",
     "x(?=(?:ab|c)+d)",
@@ -26,6 +28,10 @@ PATTERNS = [
     "[a-z]+(?=(?:ab)+ )",
     "(?:ab|c)(?=[a-z]*(?:ba|cc)+d)x?",
     "é(?=(?:a|é)*b+c)",
+    # a lookbehind of variable length within (matched forward, as it has no
+    # forward strategy as a lookahead of the reversed RE), with an equivalent
+    # for Python
+    ("x(?=[a-c]*(?<=c(?:a*b)*)d)", "x(?=[a-c]*c(?:a*b)*d)"),
 ]
 
 # (pattern, text, a part of the expected error)
@@ -53,7 +59,8 @@ def main():
         path = os.path.join(tmp, "input.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
-        argvs = [[icgrep, "--colors=never", p, path] for p in PATTERNS]
+        patterns = [p if isinstance(p, tuple) else (p, p) for p in PATTERNS]
+        argvs = [[icgrep, "--colors=never", p, path] for p, _ in patterns]
         rejected = []
         for i, (p, t, _) in enumerate(REJECTED):
             rpath = os.path.join(tmp, "rejected%d.txt" % i)
@@ -62,8 +69,8 @@ def main():
             argvs.append([icgrep, p, rpath])
         with ThreadPoolExecutor(max_workers=3) as pool:
             runs = list(pool.map(lambda argv: subprocess.run(argv, capture_output=True), argvs))
-        for p, run in zip(PATTERNS, runs):
-            rx = re.compile(p)
+        for (p, python), run in zip(patterns, runs):
+            rx = re.compile(python)
             want = "".join(l + "\n" for l in text.split("\n")[:-1] if rx.search(l))
             got = run.stdout.decode("utf-8", "replace")
             if run.returncode not in (0, 1) or got != want:

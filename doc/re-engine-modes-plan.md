@@ -969,6 +969,22 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   backward pass would be extended where the forward one is not; the failure
   then also gives the reason reversal does not apply. Examples now compiled:
   `foo(?![a-z]*bar)`, `x(?=(?:ab|c)+d)`, `x(?=(?:a*b)*c)`.
+- Lookbehinds matched forward, as externals of the backward pass
+  (`ForwardLookbehindNamer`, in `reversedStarts`): a lookbehind `(?<=B)` of an
+  RE matched by reversal is the lookahead `(?=reverse(B))` of the reversed RE;
+  where that lookahead has no forward strategy (and B is not nullable and is
+  compiled forward without extending the text), it is named `LBfwd_` + hash
+  (defined by the lookahead) and the external is the ends of B in the text,
+  at their last characters, reversed by the same regions: they mark the
+  characters before which the lookahead holds (`StartIndexed`, offset 1;
+  negated for a negative lookbehind). The same naming is applied to the
+  reversed RE of the preconditions (`reversalFailure`). This replaces the
+  nested reversal of `(?<=c(?:a*b)*)(?:a*b)*d`, and compiles lookaheads with
+  such lookbehinds within, such as `x(?=[a-c]*(?<=c(?:a*b)*)d)`. A negative
+  lookbehind still extends a text without regions (its lookahead holds at
+  the ends of the reversed regions, at the end of the text), so
+  `x(?=(?:a*b)*(?<!a)c)` remains unsupported; each lookbehind matched forward
+  has its own reversal kernel.
 - Tests: `region_reversal_test` (`tests/region_reversal.cpp`,
   `region_reversal_test.py`, new: regions of lines, of barrier characters,
   without line regions, across the strides and segments of the pipeline, and
@@ -977,11 +993,13 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   and reversal cases in `re_preconditions_test`; `reversed_lookahead_test`
   (`QA/reversed_lookahead_test.py`, new: seven lookaheads by reversal, the
   lines icgrep selects compared with Python's `re` on random lines, and two
-  errors; 0.2 s with the object cache). greptest passes.
-- Next: lookbehinds matched forward as externals of the backward pass (rather
-  than recompiled backward), reversal of only the streams the reversed RE
-  needs (rather than the 21-bit basis), one reversal shared by the uses of a
-  pipeline,
+  errors; 0.2 s with the object cache), with lookbehinds of variable length
+  matched forward in `match_starts_test` (compared with a reference that
+  matches the lookbehind on the text before each position) and
+  `reversed_lookahead_test`. greptest passes.
+- Next: reversal of only the streams the reversed RE needs (rather than the
+  21-bit basis), with the lookbehinds matched forward, one reversal shared by
+  the uses of a pipeline,
   anchors with reversal (the region starts and follows of the real regions as
   externals), meeting in the middle for capture boundaries, and relaxing the
   lookahead and U3 preconditions accordingly.

@@ -4,7 +4,10 @@
 #
 #  The MatchStarts mode of the regular expression engine (see match_starts.cpp),
 #  compared with Python's re: within each line, a match starts at the
-#  positions p at which re.match(line, p) succeeds.
+#  positions p at which re.match(line, p) succeeds.  For a lookbehind of
+#  variable length, which Python does not support, the Python pattern is a
+#  triple (B, sense, R): a match of (?<=B)R or (?<!B)R starts at p if B does
+#  (or does not) match the line up to p and R matches at p.
 
 import os
 import re
@@ -19,6 +22,7 @@ TEXT = (
     "café éa éb Ψυχή ab é. done\n"
     "\n"
     "aaab bbbc abcabc xyz abab cc ababx\n"
+    "cabd cbabd xcaabbd abd cab@d ab@cd x@y\n"
 )
 
 # Groups of at most 8 patterns, each run as one pipeline: (Parabix, Python).
@@ -69,12 +73,23 @@ GROUPS = [
         ("(?<!x)(?:[a-z]+@)+[a-z]", "(?<!x)(?:[a-z]+@)+[a-z]"),      # extended text (negative lookahead reversed)
         ("(?:é|[a-z])+(?![a-zé]*e)", "(?:é|[a-z])+(?![a-zé]*e)"),
         ("(?:[0-9]+[a-z])+(?![a-z]*c)", "(?:[0-9]+[a-z])+(?![a-z]*c)"),
+        # lookbehinds of variable length, matched forward (lookaheads without a
+        # forward strategy in the reversed RE)
+        ("(?<=c(?:a*b)*)(?:a*b)*d", ("c(?:a*b)*", True, "(?:a*b)*d")),
+        ("(?<!c(?:a*b)*)(?:[a-z]+@)+[a-z]", ("c(?:a*b)*", False, "(?:[a-z]+@)+[a-z]")),
     ],
 ]
 
 
 def reference(pattern, text, unicode_mode):
-    rx = re.compile(pattern)
+    if isinstance(pattern, tuple):
+        behind, sense, rest = pattern
+        bx = re.compile("(?:%s)\\Z" % behind)
+        rx = re.compile(rest)
+        matches = lambda line, p: (bx.search(line[:p]) is not None) == sense and rx.match(line, p)
+    else:
+        rx = re.compile(pattern)
+        matches = lambda line, p: rx.match(line, p)
     data = text.encode("utf-8")
     marks = set()
     offset = 0
@@ -86,7 +101,7 @@ def reference(pattern, text, unicode_mode):
             pos += len(ch.encode("utf-8"))
         positions.append(pos)
         for p in range(len(line) + 1):
-            if rx.match(line, p):
+            if matches(line, p):
                 if unicode_mode and p < len(line):
                     marks.add(positions[p] + len(line[p].encode("utf-8")) - 1)
                 else:

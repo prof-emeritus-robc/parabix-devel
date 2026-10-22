@@ -2253,6 +2253,10 @@ void RE_PipelineBuilder::matchStartsPipeline(RE * re, StreamSet * starts) {
 static std::vector<PreconditionFailure> modeFailures(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding,
                                                      bool & byReversal);
 
+namespace {
+RE * nameForwardLookbehinds(RE * re, std::vector<std::pair<Name *, Assertion *>> & lookbehinds);
+}
+
 void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, StreamSet * starts) {
     if (prepared.options.goal != RE_Goal::MatchStarts) {
         llvm::report_fatal_error("matchStartsPipeline: the RE must be prepared with the MatchStarts goal");
@@ -2266,7 +2270,8 @@ void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, Stream
     if (byReversal) {
         // The text is extended as the reversed RE needs it (a negative
         // lookbehind of the RE is a negative lookahead of the reversed RE).
-        if (hasEndAnchorAnywhere(reverse(re))) mExtendText = true;
+        std::vector<std::pair<Name *, Assertion *>> lookbehinds;
+        if (hasEndAnchorAnywhere(reverse(nameForwardLookbehinds(re, lookbehinds)))) mExtendText = true;
         ensurePrepared(re);
         reversedStarts(re, starts);
         return;
@@ -2304,8 +2309,30 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
     RE_ModeOptions opts;
     opts.goal = RE_Goal::MatchEnds;
     opts.forceUnicodeIndexing = true;
-    const PreparedRE reversed = prepareRE(reverse(re), opts);
+    // Lookbehinds matched forward (see ForwardLookbehindNamer): the ends of
+    // their asserted REs, at their last characters, reversed, mark the
+    // characters where their lookaheads in the reversed RE hold.
+    std::vector<std::pair<Name *, Assertion *>> lookbehinds;
+    RE * const named = nameForwardLookbehinds(re, lookbehinds);
+    const PreparedRE reversed = prepareRE(reverse(named), opts);
     RE_PipelineBuilder backward(mPB, RE_context{&cc::Unicode, reversedText, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
+    for (const auto & lb : lookbehinds) {
+        RE * const asserted = lb.second->getAsserted();
+        const PreparedRE prepared = prepareRE(asserted, opts);
+        RE_PipelineBuilder forward(mPB, RE_context{&cc::Unicode, mCtxt.mCodeUnitStream, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
+        StreamSet * lbEnds = mPB.CreateStreamSet(1);
+        forward.matchSearchPipeline(prepared, lbEnds);
+        if (const unsigned offset = prepared.grepOffset()) {
+            StreamSet * const shifted = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<ShiftBack>(lbEnds, shifted, offset);
+            lbEnds = shifted;
+        }
+        StreamSet * const marks = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<RegionReversal>(barriers, lbEnds, marks, ReverseRegionLimit);
+        backward.addExternal(lb.first->getFullName(),
+                             ExternalStream{ExternalStreamKind::StartIndexed, 1, getLengthRange(asserted, &cc::Unicode),
+                                            marks, lb.second->getSense() == Assertion::Sense::Negative});
+    }
     StreamSet * ends = mPB.CreateStreamSet(1);
     backward.matchSearchPipeline(reversed, ends);
     if (const unsigned offset = reversed.grepOffset()) {
@@ -2511,20 +2538,23 @@ namespace {
 // match is between positions, which reversal does not map to a start), and
 // must not have anchors (whose matches the barriers of the reversal would
 // create, see kernel::RegionReversal).  Unless extensible (the text of the
-// reversal may be extended, see matchStartsPipeline), the reversed RE must
-// not refer to the end of the text.
+// reversal may be extended, see matchStartsPipeline), the reversed RE, with
+// the lookbehinds matched forward (see ForwardLookbehindNamer), must not
+// refer to the end of the text.
 std::string reversalFailure(RE * re, const cc::Alphabet * codeUnitAlphabet, bool extensible = true) {
     if (codeUnitAlphabet != &cc::Unicode) return "it requires full Unicode indexing";
     if (getLengthRange(re, &cc::Unicode).first == 0) return "the RE can match the empty string";
     if (hasAnchorAnywhere(re)) return "the RE has anchors (^, $), which barriers would match";
-    if (!extensible && hasEndAnchorAnywhere(reverse(re))) {
+    std::vector<std::pair<Name *, Assertion *>> lookbehinds;
+    RE * const named = nameForwardLookbehinds(re, lookbehinds);
+    if (!extensible && hasEndAnchorAnywhere(reverse(named))) {
         return "the reversed RE has a negative lookahead (a negative lookbehind of the RE), for which the text "
                "would be extended";
     }
     RE_ModeOptions opts;
     opts.goal = RE_Goal::MatchEnds;
     opts.forceUnicodeIndexing = true;
-    const std::vector<PreconditionFailure> failures = checkPreconditions(prepareRE(reverse(re), opts), &cc::Unicode);
+    const std::vector<PreconditionFailure> failures = checkPreconditions(prepareRE(reverse(named), opts), &cc::Unicode);
     if (failures.empty()) return "";
     std::string reason = "the reversed RE: ";
     for (const PreconditionFailure & f : failures) reason += f.reason + "; ";
@@ -2551,6 +2581,50 @@ struct ReversedLookaheadNamer final : public NameIntroduction {
 // The precondition failures of the forward compilation of an RE (no reversal).
 std::vector<PreconditionFailure> forwardFailures(RE * re, const cc::Alphabet * lengthAlphabet,
                                                  const cc::Alphabet * codeUnitAlphabet);
+
+// The lookbehinds of an RE whose starts are found by reversal (see
+// RE_PipelineBuilder::reversedStarts) that are matched forward, as externals
+// of the backward pass.  In the reversed RE, a lookbehind (?<=B) is the
+// lookahead (?=reverse(B)), which holds before the characters (of the
+// reversed text) that follow an end of B in the text: the ends of B, marked
+// at their last characters and reversed, mark them (a StartIndexed external).
+// The lookbehinds named are those whose lookaheads in the reversed RE have no
+// forward strategy, where B is not nullable and is compiled forward, without
+// extending the text.  The names (ForwardLookbehindPrefix + a hash) are
+// defined by the lookaheads of the reversed RE (so that a negative one still
+// refers to the end of the text, which the reversed regions need for its
+// matches at their ends, see matchStartsPipeline).
+struct ForwardLookbehindNamer final : public NameIntroduction {
+    ForwardLookbehindNamer() : NameIntroduction("ForwardLookbehindNamer") {}
+    RE * transformAssertion(Assertion * a) override;
+    std::vector<std::pair<Name *, Assertion *>> mLookbehinds;
+};
+
+RE * ForwardLookbehindNamer::transformAssertion(Assertion * a) {
+    if (a->getKind() == Assertion::Kind::LookBehind) {
+        RE * const asserted = a->getAsserted();
+        RE * const lookahead = makeAssertion(reverse(asserted), Assertion::Kind::LookAhead, a->getSense());
+        if ((getLengthRange(asserted, &cc::Unicode).first > 0) && !hasEndAnchorAnywhere(asserted) &&
+            !forwardFailures(lookahead, &cc::Unicode, &cc::Unicode).empty() &&
+            forwardFailures(asserted, &cc::Unicode, &cc::Unicode).empty()) {
+            const std::string name = ForwardLookbehindPrefix + kernel::Kernel::getStringHash(Printer_RE::PrintRE(a));
+            const bool named = mNameMap.count(name) != 0;
+            Name * const n = createName(name, lookahead);
+            if (!named) mLookbehinds.emplace_back(n, a);
+            return n;
+        }
+    }
+    return RE_Transformer::transformAssertion(a);
+}
+
+// The RE with the lookbehinds matched forward named (see
+// ForwardLookbehindNamer), and these lookbehinds.
+RE * nameForwardLookbehinds(RE * re, std::vector<std::pair<Name *, Assertion *>> & lookbehinds) {
+    ForwardLookbehindNamer namer;
+    RE * const named = namer.transformRE(re);
+    lookbehinds = std::move(namer.mLookbehinds);
+    return named;
+}
 
 RE * ReversedLookaheadNamer::transformAssertion(Assertion * a) {
     if ((a->getKind() == Assertion::Kind::LookAhead) && !forwardFailures(a, mLengthAlphabet, mCodeUnitAlphabet).empty()) {

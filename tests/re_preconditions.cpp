@@ -38,7 +38,7 @@ const PreconditionCase Cases[] = {
     {"x(?=b*c)", RE_Goal::MatchEnds, &cc::Unicode, true},
     {"x(?=(?:a*b)*c)", RE_Goal::MatchEnds, &cc::UTF8, true},         // no forward strategy: by reversal
     {"x(?=(?:a*b)*c)", RE_Goal::MatchSpans, &cc::Unicode, true},
-    {"x(?=(?:a*b)*c$)", RE_Goal::MatchEnds, &cc::UTF8, false},       // reversal: anchored
+    {"x(?=(?:a*b)*c$)", RE_Goal::MatchEnds, &cc::UTF8, true},        // reversal, anchored
     {"x(?=(?:a*b)*(?<!a)c)", RE_Goal::MatchEnds, &cc::UTF8, false},  // reversal: would extend the text
     {"x(?=[a-c]*(?<=c(?:a*b)*)d)", RE_Goal::MatchEnds, &cc::UTF8, true}, // reversal, a lookbehind matched forward
     {"(a)\\1", RE_Goal::MatchEnds, &cc::UTF8, true},               // fixed back reference
@@ -54,7 +54,8 @@ const PreconditionCase Cases[] = {
     {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::UTF8, true},          // no forward strategy: by reversal
     {"(?:a*b)*c", RE_Goal::MatchStarts, &cc::Unicode, true},
     {"x(?=(?:a*b)*c)", RE_Goal::MatchStarts, &cc::UTF8, true},     // (a lookbehind of the reversed RE)
-    {"(?:a*b)*c$", RE_Goal::MatchStarts, &cc::UTF8, false},        // reversal: anchored
+    {"(?:a*b)*c$", RE_Goal::MatchStarts, &cc::UTF8, true},         // reversal, anchored
+    {"^(?:a*b)*c", RE_Goal::MatchStarts, &cc::UTF8, true},
     {"(?:a*b)*c?", RE_Goal::MatchStarts, &cc::UTF8, false},        // reversal: nullable
     {"(?<=c(?:a*b)*)(?:a*b)*d", RE_Goal::MatchStarts, &cc::UTF8, true}, // reversal, its lookbehind matched forward
     {"abc", RE_Goal::SearchReplace, &cc::UTF8, true},              // (the search pattern alone)

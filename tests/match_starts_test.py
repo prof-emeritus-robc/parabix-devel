@@ -23,6 +23,8 @@ TEXT = (
     "\n"
     "aaab bbbc abcabc xyz abab cc ababx\n"
     "cabd cbabd xcaabbd abd cab@d ab@cd x@y\n"
+    "abbc ab abc\n"
+    "c q@r abc@d\n"
 )
 
 # Groups of at most 8 patterns, each run as one pipeline: (Parabix, Python).
@@ -77,6 +79,15 @@ GROUPS = [
         # forward strategy in the reversed RE)
         ("(?<=c(?:a*b)*)(?:a*b)*d", ("c(?:a*b)*", True, "(?:a*b)*d")),
         ("(?<!c(?:a*b)*)(?:[a-z]+@)+[a-z]", ("c(?:a*b)*", False, "(?:[a-z]+@)+[a-z]")),
+    ],
+    [   # anchored, by reversal: the anchors of the lines, in the regions between
+        # the barriers reversed
+        ("(?:a*b)*c$", "(?:a*b)*c$"),
+        ("^(?:a*b)*c", "^(?:a*b)*c"),
+        ("(?:[a-z]+@)+[a-z]+$", "(?:[a-z]+@)+[a-z]+$"),
+        ("^(?:[a-z]+@)+[a-z]", "^(?:[a-z]+@)+[a-z]"),
+        ("(?:ab|c)+$", "(?:ab|c)+$"),
+        ("^(?:ab|c)+(?![a-z]*x)", "^(?:ab|c)+(?![a-z]*x)"),
     ],
 ]
 

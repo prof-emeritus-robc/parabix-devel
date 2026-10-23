@@ -32,6 +32,9 @@ PATTERNS = [
     # forward strategy as a lookahead of the reversed RE), with an equivalent
     # for Python
     ("x(?=[a-c]*(?<=c(?:a*b)*)d)", "x(?=[a-c]*c(?:a*b)*d)"),
+    # anchored (the end of the line, in the regions between barriers reversed)
+    "x(?=(?:a*b)*c$)",
+    "x(?![a-d]*(?:ab|c)+$)",
 ]
 
 # (pattern, text, a part of the expected error)

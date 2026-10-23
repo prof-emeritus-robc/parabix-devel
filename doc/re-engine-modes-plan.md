@@ -1009,6 +1009,21 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   `([a-z0-9]*[a-z])(\d+)-([a-z]+);` with `$1.$2.$3`. A run back that reaches
   the start of the match is not taken as maximal (the coverage of an
   adjacent previous match would continue it).
+- Anchors with reversal: `Start` and `End` no longer prevent reversal. In
+  the reversed regions, the anchors of a line are not at its start and
+  follow when barrier characters divide it: the End of a line (at its
+  follow f) is the start of its last region reversed, and its Start (at s)
+  the follow of its first region reversed. The last and first characters
+  of each line (where not barriers, `ForwardAnchorMarks`) are reversed with
+  the same barriers, and `ReversedAnchors` gives where the anchors of the
+  reversed RE hold (with the empty regions at a follow or start that is a
+  barrier); the reversed RE's `Start` and `End` are named (`^rev`, `$rev`,
+  `ReversedAnchorNamer`) as zero-width externals of the backward pass. A text
+  without regions is extended for an anchored RE, so the regions exist
+  (otherwise a fatal error). A lookahead whose asserted RE has a `Start`
+  (an End of the reversed RE) is still not reversed, as it would extend the
+  text. Examples now supported: starts of `(?:a*b)*c$`, `^(?:a*b)*c`,
+  `(?:[a-z]+@)+[a-z]+$`; `x(?=(?:a*b)*c$)`.
 - Tests: `region_reversal_test` (`tests/region_reversal.cpp`,
   `region_reversal_test.py`, new: regions of lines, of barrier characters,
   without line regions, across the strides and segments of the pipeline, and
@@ -1024,12 +1039,13 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   replacements compared with `re.sub`, one more rejection),
   `capture_spans_test` (a group with and without match regions),
   `re_replacement_test` (the planned walks) and `re_preconditions_test`
-  (with and without reversal). greptest passes.
+  (with and without reversal); anchored REs by reversal in
+  `match_starts_test` (a group of six) and `reversed_lookahead_test` (two),
+  and in `re_preconditions_test`. greptest passes.
 - Next: reversal of only the streams the reversed RE needs (rather than the
   21-bit basis), with the lookbehinds matched forward, one reversal shared by
   the uses of a pipeline,
-  anchors with reversal (the region starts and follows of the real regions as
-  externals), and meeting in the middle beyond walks (backward matching of
+  and meeting in the middle beyond walks (backward matching of
   the suffix of the RE from the ends, for boundaries after items that are
   not runs of a class).
 

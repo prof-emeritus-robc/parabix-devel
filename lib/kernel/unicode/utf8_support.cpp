@@ -28,116 +28,104 @@ std::unique_ptr<cc::CC_Compiler> lookaheadCompiler(PabloBuilder & pb, const std:
     return std::make_unique<cc::Parabix_CC_Compiler_Builder>(ahead);
 }
 
-// The classes of a byte for the well-formed sequences (Table 3-7 of the
-// Unicode Standard), for the code units of a compiler.
-struct UTF8_ByteClasses {
-    PabloAST * ASCII;
-    PabloAST * S;                       // 80-BF
-    PabloAST * L2;                      // C2-DF
-    PabloAST * L3a, * L3b, * L3c;       // E0, E1-EC EE-EF, ED
-    PabloAST * L4a, * L4b, * L4c;       // F0, F1-F3, F4
-    PabloAST * A0_BF, * x80_9F, * x90_BF, * x80_8F;
-};
-
-UTF8_ByteClasses byteClasses(PabloBuilder & pb, cc::CC_Compiler & ccc) {
-    auto byte = [&](unsigned lo, unsigned hi) { return ccc.compileCC(makeByte(lo, hi), pb); };
-    UTF8_ByteClasses b;
-    b.ASCII = byte(0x00, 0x7F);
-    b.S = byte(0x80, 0xBF);
-    b.L2 = byte(0xC2, 0xDF);
-    b.L3a = byte(0xE0, 0xE0);
-    b.L3b = pb.createOr(byte(0xE1, 0xEC), byte(0xEE, 0xEF));
-    b.L3c = byte(0xED, 0xED);
-    b.L4a = byte(0xF0, 0xF0);
-    b.L4b = byte(0xF1, 0xF3);
-    b.L4c = byte(0xF4, 0xF4);
-    b.A0_BF = byte(0xA0, 0xBF);
-    b.x80_9F = byte(0x80, 0x9F);
-    b.x90_BF = byte(0x90, 0xBF);
-    b.x80_8F = byte(0x80, 0x8F);
-    return b;
 }
 
-// The state of the well-formed sequences at each position: the leads, and
-// the suffixes that continue a sequence (Bjk: the k-th byte of a sequence of
-// j bytes).
-struct UTF8_Chains {
-    PabloAST * leads;
-    PabloAST * L2, * L3a, * L3b, * L3c, * L4a, * L4b, * L4c;
-    PabloAST * B2, * B32, * B33, * B42, * B43, * B44;
-    // A sequence is complete (ASCII, or a last suffix), still incomplete
-    // (pending: a lead or a suffix before the last), or continued from the
-    // byte before (cont).
-    PabloAST * complete(PabloBuilder & pb, PabloAST * ASCII) const {
-        return pb.createOr(ASCII, pb.createOr3(B2, B33, B44));
-    }
-    PabloAST * pending(PabloBuilder & pb) const { return pb.createOr(leads, pb.createOr3(B32, B42, B43)); }
-    PabloAST * cont(PabloBuilder & pb) const {
-        return pb.createOr(pb.createOr3(B2, B32, B33), pb.createOr3(B42, B43, B44));
-    }
-};
-
-// The suffixes at a position, given the chains at the position before
-// (prev, aligned to this position) and the classes of its byte (b).
-void continueChains(PabloBuilder & pb, const UTF8_Chains & prev, const UTF8_ByteClasses & b, UTF8_Chains & c) {
-    c.B2 = pb.createAnd(prev.L2, b.S);
-    c.B32 = pb.createOr3(pb.createAnd(prev.L3a, b.A0_BF), pb.createAnd(prev.L3b, b.S), pb.createAnd(prev.L3c, b.x80_9F));
-    c.B33 = pb.createAnd(prev.B32, b.S);
-    c.B42 = pb.createOr3(pb.createAnd(prev.L4a, b.x90_BF), pb.createAnd(prev.L4b, b.S), pb.createAnd(prev.L4c, b.x80_8F));
-    c.B43 = pb.createAnd(prev.B42, b.S);
-    c.B44 = pb.createAnd(prev.B43, b.S);
-}
-
-void setLeads(PabloBuilder & pb, const UTF8_ByteClasses & b, UTF8_Chains & c) {
-    c.L2 = b.L2; c.L3a = b.L3a; c.L3b = b.L3b; c.L3c = b.L3c; c.L4a = b.L4a; c.L4b = b.L4b; c.L4c = b.L4c;
-    c.leads = pb.createOr(pb.createOr3(b.L2, b.L3a, pb.createOr(b.L3b, b.L3c)), pb.createOr3(b.L4a, b.L4b, b.L4c));
-}
-}
-
+//
+// The well-formed sequences are those of Table 3-7 of the Unicode Standard.
+// As blocks of text are mostly ASCII, the sequences are found within an
+// if-hierarchy: only blocks with prefix bytes (C0-FF), and within them only
+// those with 2-, 3- or 4-byte leads, compute them.  A lead or a suffix
+// before the last is continued (nonFinal) where the next byte is the next
+// byte of a well-formed sequence (the byte classes looked ahead by 1); the
+// last byte of each well-formed character (ASCII, or the last suffix of a
+// continued sequence) is u8valid.  Every other byte ends a maximal ill-formed
+// subpart: a byte of a sequence not continued, and a byte (other than ASCII)
+// that neither begins nor continues a sequence.
+//
 UTF8_Structure kernel::UTF8_structure(PabloBuilder & pb, const std::vector<PabloAST *> & source, bool initials) {
-    // (Only the streams of this position are advanced: an advance of a stream
-    // looked ahead does not give the first position its value.)
-    std::unique_ptr<cc::CC_Compiler> ccc0 = lookaheadCompiler(pb, source, 0);
-    std::unique_ptr<cc::CC_Compiler> ccc1 = lookaheadCompiler(pb, source, 1);
-    const UTF8_ByteClasses b0 = byteClasses(pb, *ccc0);
-    const UTF8_ByteClasses b1 = byteClasses(pb, *ccc1);
-    UTF8_Chains here;
-    setLeads(pb, b0, here);
-    UTF8_Chains prev;
-    auto adv = [&](PabloAST * x) { return pb.createAdvance(x, 1); };
-    prev.L2 = adv(here.L2); prev.L3a = adv(here.L3a); prev.L3b = adv(here.L3b); prev.L3c = adv(here.L3c);
-    prev.L4a = adv(here.L4a); prev.L4b = adv(here.L4b); prev.L4c = adv(here.L4c);
-    // B32, B42 and B43 of the position before depend on the position before
-    // that, and so on: they are computed in turn.
-    here.B2 = pb.createAnd(prev.L2, b0.S);
-    here.B32 = pb.createOr3(pb.createAnd(prev.L3a, b0.A0_BF), pb.createAnd(prev.L3b, b0.S),
-                            pb.createAnd(prev.L3c, b0.x80_9F));
-    here.B42 = pb.createOr3(pb.createAnd(prev.L4a, b0.x90_BF), pb.createAnd(prev.L4b, b0.S),
-                            pb.createAnd(prev.L4c, b0.x80_8F));
-    here.B33 = pb.createAnd(adv(here.B32), b0.S);
-    here.B43 = pb.createAnd(adv(here.B42), b0.S);
-    here.B44 = pb.createAnd(adv(here.B43), b0.S);
-    // The suffixes of the next position.
-    UTF8_Chains next;
-    continueChains(pb, here, b1, next);
-    // A byte not continued by the next ends a subpart, as does a byte that
-    // neither begins nor continues a sequence (and is not ASCII).
-    PabloAST * const pending = here.pending(pb);
-    PabloAST * const lone = pb.createNot(pb.createOr3(b0.ASCII, pending, here.cont(pb)), "u8lone");
-    PabloAST * const unfinished = pb.createAnd(pending, pb.createNot(next.cont(pb)));
-    UTF8_Structure u;
-    u.validFinal = pb.createInFile(here.complete(pb, b0.ASCII), "u8validFinal");
-    u.errorFinal = pb.createInFile(pb.createOr(unfinished, lone), "u8errorFinal");
+    std::unique_ptr<cc::CC_Compiler> ccc = lookaheadCompiler(pb, source, 0);
+    Zeroes * const ZEROES = pb.createZeroes();
+    PabloAST * const ASCII = pb.createNot(source[7], "ASCII");
+    Var * const nonFinal = pb.createVar("nonFinal", ZEROES);
+    Var * const u8valid = pb.createVar("u8valid", ASCII);
+    // The legal leads, and the suffixes that continue them.
+    Var * const legalLeads = pb.createVar("legalLeads", ZEROES);
+    Var * const u8cont = pb.createVar("u8cont", ZEROES);
+    Var * const validInitial = initials ? pb.createVar("validInitial", ASCII) : nullptr;
+
+    PabloAST * const u8pfx = ccc->compileCC(makeByte(0xC0, 0xFF), pb);
+    auto it = pb.createScope();
+    pb.createIf(u8pfx, it);
+    std::unique_ptr<cc::CC_Compiler> ccc1 = lookaheadCompiler(it, source, 1);
+    std::unique_ptr<cc::CC_Compiler> ccc2 = initials ? lookaheadCompiler(it, source, 2) : nullptr;
+    std::unique_ptr<cc::CC_Compiler> ccc3 = initials ? lookaheadCompiler(it, source, 3) : nullptr;
+    auto byte = [&](cc::CC_Compiler & c, unsigned lo, unsigned hi, PabloBuilder & b) {
+        return c.compileCC(makeByte(lo, hi), b);
+    };
+    PabloAST * const u8pfx2 = byte(*ccc, 0xC2, 0xDF, it);
+    PabloAST * const u8pfx3 = byte(*ccc, 0xE0, 0xEF, it);
+    PabloAST * const u8pfx4 = byte(*ccc, 0xF0, 0xF4, it);
+    it.createAssign(legalLeads, it.createOr3(u8pfx2, u8pfx3, u8pfx4));
+    auto accumulate = [&](PabloBuilder & b, Var * v, PabloAST * x) { b.createAssign(v, b.createOr(v, x)); };
+
+    //
+    // Two-byte sequences
+    auto it2 = it.createScope();
+    it.createIf(u8pfx2, it2);
+    PabloAST * const suffix1_2 = byte(*ccc1, 0x80, 0xBF, it2);
+    PabloAST * const lead2 = it2.createAnd(u8pfx2, suffix1_2, "lead2");
+    PabloAST * const u8scope22 = it2.createAdvance(lead2, 1, "u8scope22");
+    accumulate(it2, nonFinal, lead2);
+    accumulate(it2, u8valid, u8scope22);
+    accumulate(it2, u8cont, u8scope22);
+    if (initials) accumulate(it2, validInitial, lead2);
+
+    //
+    // Three-byte sequences: E0 A0-BF, E1-EC EE-EF 80-BF, ED 80-9F, then 80-BF.
+    auto it3 = it.createScope();
+    it.createIf(u8pfx3, it3);
+    PabloAST * const suffix1_3 = byte(*ccc1, 0x80, 0xBF, it3);
+    PabloAST * const E0 = it3.createAnd(byte(*ccc, 0xE0, 0xE0, it3), byte(*ccc1, 0xA0, 0xBF, it3));
+    PabloAST * const ED = it3.createAnd(byte(*ccc, 0xED, 0xED, it3), byte(*ccc1, 0x80, 0x9F, it3));
+    PabloAST * const EX = it3.createAnd(it3.createOr(byte(*ccc, 0xE1, 0xEC, it3), byte(*ccc, 0xEE, 0xEF, it3)), suffix1_3);
+    PabloAST * const lead3 = it3.createOr3(E0, ED, EX, "lead3");
+    PabloAST * const u8scope32 = it3.createAdvance(lead3, 1, "u8scope32");
+    PabloAST * const mid32 = it3.createAnd(u8scope32, suffix1_3);
+    PabloAST * const u8scope33 = it3.createAdvance(mid32, 1, "u8scope33");
+    accumulate(it3, nonFinal, it3.createOr(lead3, mid32));
+    accumulate(it3, u8valid, u8scope33);
+    accumulate(it3, u8cont, it3.createOr(u8scope32, u8scope33));
+    if (initials) accumulate(it3, validInitial, it3.createAnd(lead3, byte(*ccc2, 0x80, 0xBF, it3)));
+
+    //
+    // Four-byte sequences: F0 90-BF, F1-F3 80-BF, F4 80-8F, then 80-BF 80-BF.
+    auto it4 = it.createScope();
+    it.createIf(u8pfx4, it4);
+    PabloAST * const suffix1_4 = byte(*ccc1, 0x80, 0xBF, it4);
+    PabloAST * const F0 = it4.createAnd(byte(*ccc, 0xF0, 0xF0, it4), byte(*ccc1, 0x90, 0xBF, it4));
+    PabloAST * const F4 = it4.createAnd(byte(*ccc, 0xF4, 0xF4, it4), byte(*ccc1, 0x80, 0x8F, it4));
+    PabloAST * const FX = it4.createAnd(byte(*ccc, 0xF1, 0xF3, it4), suffix1_4);
+    PabloAST * const lead4 = it4.createOr3(F0, F4, FX, "lead4");
+    PabloAST * const u8scope42 = it4.createAdvance(lead4, 1, "u8scope42");
+    PabloAST * const mid42 = it4.createAnd(u8scope42, suffix1_4);
+    PabloAST * const u8scope43 = it4.createAdvance(mid42, 1, "u8scope43");
+    PabloAST * const mid43 = it4.createAnd(u8scope43, suffix1_4);
+    PabloAST * const u8scope44 = it4.createAdvance(mid43, 1, "u8scope44");
+    accumulate(it4, nonFinal, it4.createOr3(lead4, mid42, mid43));
+    accumulate(it4, u8valid, u8scope44);
+    accumulate(it4, u8cont, it4.createOr3(u8scope42, u8scope43, u8scope44));
     if (initials) {
-        std::unique_ptr<cc::CC_Compiler> ccc2 = lookaheadCompiler(pb, source, 2);
-        std::unique_ptr<cc::CC_Compiler> ccc3 = lookaheadCompiler(pb, source, 3);
-        PabloAST * const S2 = ccc2->compileCC(makeByte(0x80, 0xBF), pb);
-        PabloAST * const S3 = ccc3->compileCC(makeByte(0x80, 0xBF), pb);
-        // A lead whose sequence is complete 1, 2 or 3 positions ahead.
-        PabloAST * const valid = pb.createOr(pb.createOr(b0.ASCII, next.B2),
-                                             pb.createOr(pb.createAnd(next.B32, S2), pb.createAnd3(next.B42, S2, S3)));
-        u.validInitial = pb.createInFile(valid, "u8validInitial");
-        u.errorInitial = pb.createInFile(pb.createOr(pb.createAnd(here.leads, pb.createNot(valid)), lone),
+        accumulate(it4, validInitial, it4.createAnd3(lead4, byte(*ccc2, 0x80, 0xBF, it4), byte(*ccc3, 0x80, 0xBF, it4)));
+    }
+
+    UTF8_Structure u;
+    u.validFinal = pb.createInFile(u8valid, "u8validFinal");
+    u.errorFinal = pb.createInFile(pb.createNot(pb.createOr(nonFinal, u8valid)), "u8errorFinal");
+    if (initials) {
+        // A byte (other than ASCII) that neither begins nor continues a sequence.
+        PabloAST * const lone = pb.createAnd(source[7], pb.createNot(pb.createOr(legalLeads, u8cont)), "u8lone");
+        u.validInitial = pb.createInFile(validInitial, "u8validInitial");
+        u.errorInitial = pb.createInFile(pb.createOr(pb.createAnd(legalLeads, pb.createNot(validInitial)), lone),
                                          "u8errorInitial");
     }
     return u;

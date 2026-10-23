@@ -16,7 +16,7 @@ namespace kernel { class StreamSet; }
 namespace re { struct LookaheadSegment; struct CaptureWalk; }
 struct ChainForm;
 struct MatchStartsAlternative;
-namespace cc { class Alphabet; }
+namespace cc { class Alphabet; class MultiplexedAlphabet; }
 namespace kernel { class PipelineBuilder; }
 
 using Alphabets = std::vector<std::pair<const cc::Alphabet *, kernel::StreamSet *>>;
@@ -56,6 +56,12 @@ using ExternalNameMap = std::map<std::string, ExternalStream>;
 //   - encoding == &cc::Unicode: source is already a 21-element Unicode
 //     basis; the engine uses it, and matchStarts/matchFollows, as-is, no
 //     analysis performed.
+//   - encoding a cc::MultiplexedAlphabet of Unicode: source is the basis of
+//     its codes, one position per character, used as for &cc::Unicode.  The
+//     CCs of the RE (as prepared, and of the passes of its pipelines) must
+//     be unions of its exclusive sets; REs that need the codepoints
+//     themselves (references, properties compiled as kernels, the text of
+//     a replacement) are a fatal error.
 struct RE_context {
     const cc::Alphabet * encoding;
     kernel::StreamSet * source;
@@ -183,6 +189,11 @@ public:
 
     void setCodeUnitContext(const cc::Alphabet * a, kernel::StreamSet * s);
 
+    // The code units are characters of the source alphabet of mpx (whose
+    // lengths they are), represented by the basis of its codes: the CCs of
+    // the source alphabet are translated to codes where kernels are made.
+    void setMultiplexedCodeUnitContext(const cc::MultiplexedAlphabet * mpx, kernel::StreamSet * basis);
+
     void setMatchRegions(kernel::StreamSet * starts, kernel::StreamSet * follows);
 
     void setIndexingContext(const cc::Alphabet * a, kernel::StreamSet * s);
@@ -196,6 +207,9 @@ public:
 private:
     const cc::Alphabet * mCodeUnitAlphabet;
     kernel::StreamSet * mCodeUnitStream;
+    // If set, mCodeUnitStream is the basis of its codes, and mCodeUnitAlphabet
+    // its source alphabet (see setMultiplexedCodeUnitContext).
+    const cc::MultiplexedAlphabet * mMultiplexed;
     kernel::StreamSet * mMatchStarts;
     kernel::StreamSet * mMatchFollows;
     const cc::Alphabet * mLengthAlphabet;
@@ -218,6 +232,9 @@ public:
     kernel::Bindings makeOutputBindings(RE_CompilerContext & ctxt, re::RE * r, kernel::StreamSet * results);
 
 private:
+    // The RE as compiled: with a multiplexed context, its CCs translated to codes.
+    struct Multiplexed { re::RE * re; };
+    RE_Kernel(LLVMTypeSystemInterface & ts, RE_CompilerContext & ctxt, Multiplexed re, kernel::StreamSet * results);
     RE_CompilerContext mContext;
     re::RE * mRE;
 };
@@ -706,8 +723,25 @@ protected:
     bool lengthClassSpans(re::RE * re, kernel::StreamSet * spans);
 
     // The basis bits of the code units (transposed from a byte stream if
-    // needed), for CC kernels.
+    // needed), for CC kernels.  With a multiplexed context, the basis of
+    // its codes, over which the CCs given to kernels are codeUnitCC.
     kernel::StreamSet * codeUnitBasis();
+
+    // A CC of the code-unit alphabet as compiled over codeUnitBasis: with a
+    // multiplexed context, its codes (a fatal error if it is not a union of
+    // exclusive sets); otherwise the CC itself.
+    re::CC * codeUnitCC(re::CC * cc) const;
+    std::vector<std::vector<re::CC *>> codeUnitStrings(const std::vector<std::vector<re::CC *>> & strings) const;
+
+    // The streams of CCs of the code-unit alphabet (out: one per CC), over
+    // the codes of a multiplexed context, or otherwise over basis (by
+    // default, codeUnitBasis).
+    void compileClasses(const std::vector<re::CC *> & ccs, kernel::StreamSet * out, kernel::StreamSet * basis = nullptr);
+
+    // The encoding of the code units, for the RE_context of another builder
+    // over the same (or reversed) code units: the multiplexed alphabet, if
+    // any, or the code-unit alphabet.
+    const cc::Alphabet * codeUnitEncoding() const;
 
     // The stream of a character class, given as the RE re (which may be the
     // name of an external, whose stream is then used).

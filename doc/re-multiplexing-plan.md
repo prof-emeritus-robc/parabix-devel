@@ -327,3 +327,52 @@ the number of kernels and reversals that would consume the basis.
   signatures; random CCs with their unions, complements, intersections and
   random sets checked against a direct computation of the codes from the
   basis CCs; 0.03 s). The full ctest suite passes.
+
+## Milestone 2 status
+
+- `RE_CompilerContext::setMultiplexedCodeUnitContext(mpx, basis)`: the code
+  units are characters of the source alphabet of `mpx` (the code-unit and
+  length alphabets stay that source, Unicode, so the analyses, mode passes
+  and checks of the engine are unchanged), represented by the basis of its
+  codes (`mMultiplexed`, bound to RE kernels as `<name>_basis`).
+- `RE_context` accepts a `cc::MultiplexedAlphabet` of Unicode as its
+  encoding: the source is then the basis of its codes, used as a Unicode
+  basis is (`ensurePrepared`). `modeFailures` takes such an encoding as
+  Unicode. This is how the client of milestone 3 (and the test below) gives
+  a multiplexed basis; nothing in the engine multiplexes yet.
+- Translation at the kernel boundary:
+  - `RE_Kernel` translates the CCs of its RE to codes before its signature
+    (`CodeUnitMultiplexer`): within the definitions of the names that are
+    not externals, which the RE compiler compiles from their definitions,
+    keeping the externals as names. The RE compiler is given the
+    multiplexed alphabet as code-unit alphabet.
+  - `RE_PipelineBuilder::compileClasses` replaces the `CharClassesKernel`
+    sites (`classStream`, the named CCs of `applyModePasses`,
+    `reversalBarriers`): over a multiplexed basis, a
+    `MultiplexedClassesKernel` of codes (`Parabix_CC_Compiler_Builder` over
+    the `k` bits); otherwise the kernel as before, over the same basis.
+  - `codeUnitCC` and `codeUnitStrings` translate the CCs given to
+    `StringClassKernel` (string-class reps, chains, final stars), and the
+    run classes of capture walks (`BackwardWalkStreams`, `CaptureBoundaries`,
+    whose kernel names now include the number of basis streams).
+  - Nested builders (the backward pass and the lookbehinds matched forward
+    of `reversedStarts`) are given the same encoding (`codeUnitEncoding`),
+    so the reversed basis is that of the codes.
+- Not with a multiplexed basis (fatal errors naming the reason): property
+  externals (`compileProperty`), references (`processReferences`), and the
+  text of a replacement (`replaceMatches`), which need the codepoints. The
+  precondition of milestone 3 is to keep such REs on the Unicode basis.
+- `codeUnitBasis` transposes a byte stream by its field width (not its
+  number of streams), so that a basis of one code bit is not taken for
+  bytes.
+- Test: `multiplexed_engine_test` (`tests/multiplexed_engine.cpp`,
+  `multiplexed_engine_test.py`, new): 19 patterns in 5 groups, each compiled
+  in one pipeline over the 21-bit basis and over the codes of the
+  multiplexed alphabet of its CCs (as prepared, with the definitions of
+  names), the results compared at every position. Covered: ends, case
+  folding, lookaheads by reversal (positive and negative), starts by
+  reversal, anchors (with and without regions), lookbehinds matched forward,
+  negative lookbehinds within lookaheads by reversal, length classes, string
+  classes, lookahead chains, and capture spans with walks back from the
+  match ends. Each pattern must have results, and a corrupted code basis is
+  detected. 0.2 s with the object cache. The full ctest suite passes.

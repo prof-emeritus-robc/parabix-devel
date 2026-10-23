@@ -67,14 +67,23 @@ using namespace kernel;
 using namespace llvm;
 
 RE_CompilerContext::RE_CompilerContext() : mCodeUnitAlphabet(nullptr), mCodeUnitStream(nullptr),
-    mMatchStarts(nullptr), mMatchFollows(nullptr), mLengthAlphabet(nullptr), mIndexStream(nullptr),
+    mMultiplexed(nullptr), mMatchStarts(nullptr), mMatchFollows(nullptr), mLengthAlphabet(nullptr), mIndexStream(nullptr),
     mCombiningType(RE_CombiningType::None), mCombiningStream(nullptr) {}
 
 void RE_CompilerContext::setCodeUnitContext(const cc::Alphabet * a, StreamSet * basis) {
     mCodeUnitAlphabet = a;
     mLengthAlphabet = a; // default
     mCodeUnitStream = basis;
+    mMultiplexed = nullptr;
     addAlphabet(a, basis);
+}
+
+void RE_CompilerContext::setMultiplexedCodeUnitContext(const cc::MultiplexedAlphabet * mpx, StreamSet * basis) {
+    mCodeUnitAlphabet = mpx->getSourceAlphabet();
+    mLengthAlphabet = mCodeUnitAlphabet;
+    mCodeUnitStream = basis;
+    mMultiplexed = mpx;
+    addAlphabet(mpx, basis);
 }
 
 void RE_CompilerContext::setMatchRegions(StreamSet * starts, StreamSet * follows) {
@@ -101,9 +110,41 @@ void RE_CompilerContext::setCombiningStream(kernel::StreamSet * s, RE_CombiningT
 }
 
 
+namespace {
+// The CCs of the source alphabet of a multiplexed alphabet translated to
+// their codes, within the definitions of the names that are not externals
+// (which are compiled from their definitions, see RE_Compiler).
+struct CodeUnitMultiplexer final : public RE_Transformer {
+    CodeUnitMultiplexer(const cc::MultiplexedAlphabet * mpx, const ExternalNameMap & externals)
+    : RE_Transformer("CodeUnitMultiplexer"), mMultiplexed(mpx), mExternals(externals) {}
+    RE * transformCC(CC * cc) override {
+        if (cc->getAlphabet() == mMultiplexed->getSourceAlphabet()) return mMultiplexed->transformCC(cc);
+        return cc;
+    }
+    RE * transformName(Name * n) override {
+        RE * const defn = n->getDefinition();
+        if ((defn == nullptr) || (mExternals.count(n->getFullName()) == 1)) return n;
+        RE * const t = transform(defn);
+        if (t == defn) return n;
+        return n->hasNamespace() ? makeName(n->getNamespace(), n->getName(), t) : makeName(n->getName(), t);
+    }
+private:
+    const cc::MultiplexedAlphabet * const mMultiplexed;
+    const ExternalNameMap & mExternals;
+};
+
+RE * multiplexedCodeUnits(RE * re, const cc::MultiplexedAlphabet * mpx, const ExternalNameMap & externals) {
+    if (mpx == nullptr) return re;
+    return CodeUnitMultiplexer(mpx, externals).transformRE(re);
+}
+}
+
 RE_Kernel::RE_Kernel(LLVMTypeSystemInterface & ts, RE_CompilerContext & ctxt, RE * re, StreamSet * results)
-: PabloKernel(ts, makeSignature(ctxt, re), makeInputBindings(ctxt, re), makeOutputBindings(ctxt, re, results), {}, {}),
-mContext(ctxt), mRE(re) {
+: RE_Kernel(ts, ctxt, Multiplexed{multiplexedCodeUnits(re, ctxt.mMultiplexed, ctxt.mExternals)}, results) {}
+
+RE_Kernel::RE_Kernel(LLVMTypeSystemInterface & ts, RE_CompilerContext & ctxt, Multiplexed m, StreamSet * results)
+: PabloKernel(ts, makeSignature(ctxt, m.re), makeInputBindings(ctxt, m.re), makeOutputBindings(ctxt, m.re, results), {}, {}),
+mContext(ctxt), mRE(m.re) {
     addAttribute(InfrequentlyUsed());
 }
 
@@ -236,7 +277,9 @@ void RE_Kernel::generatePabloMethod() {
         matchStarts = pb.createExtract(getInputStreamVar("mStarts"), pb.getInteger(0));
         matchFollows = pb.createExtract(getInputStreamVar("mFollows"), pb.getInteger(0));
     }
-    RE_Compiler re_compiler(getEntryScope(), matchStarts, matchFollows, mContext.mCodeUnitAlphabet);
+    // With a multiplexed context, the code units are its codes (the CCs of mRE).
+    const cc::Alphabet * const codeUnits = mContext.mMultiplexed ? mContext.mMultiplexed : mContext.mCodeUnitAlphabet;
+    RE_Compiler re_compiler(getEntryScope(), matchStarts, matchFollows, codeUnits);
     for (auto & a : mContext.mAlphabets) {
         auto alphaName = a.first->getName();
         if (localAlphabets.count(alphaName) == 1) {
@@ -1246,9 +1289,18 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
         }
     }
 
-    if (mSourceContext.encoding == &cc::Unicode) {
-        // Already fully Unicode-encoded by the caller (e.g. csvgrep); use as-is.
-        mCtxt.setCodeUnitContext(&cc::Unicode, source);
+    const auto * const sourceCodes = dyn_cast<cc::MultiplexedAlphabet>(mSourceContext.encoding);
+    if ((mSourceContext.encoding == &cc::Unicode) || sourceCodes) {
+        // Already fully Unicode-encoded by the caller (e.g. csvgrep), or the
+        // codes of a multiplexed alphabet of Unicode; use as-is.
+        if (sourceCodes) {
+            if (sourceCodes->getSourceAlphabet() != &cc::Unicode) {
+                llvm::report_fatal_error("RE_PipelineBuilder: a multiplexed source must be of Unicode");
+            }
+            mCtxt.setMultiplexedCodeUnitContext(sourceCodes, source);
+        } else {
+            mCtxt.setCodeUnitContext(&cc::Unicode, source);
+        }
         if (matchStarts) {
             mCtxt.setMatchRegions(matchStarts, matchFollows);
         }
@@ -1371,6 +1423,10 @@ void RE_PipelineBuilder::addExternal(std::string extName, ExternalStream s) {
 }
 
 void RE_PipelineBuilder::compileProperty(PropertyExpression * pe) {
+    if (mCtxt.mMultiplexed) {
+        llvm::report_fatal_error("RE_PipelineBuilder: property " + llvm::StringRef(pe->getFullName()) +
+                                 " is compiled from the codepoints, not with a multiplexed basis");
+    }
     StreamSet * pStrm  = mPB.CreateStreamSet(1);
     UnicodePropertyLogic(mPB, pe, mCtxt.mCodeUnitStream, mCtxt.mIndexStream, pStrm);
     std::string propName = pe->getFullName();
@@ -1548,7 +1604,8 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
                 StreamSet * const X = classStream(seg->re, seg->cc);
                 mPB.CreateKernelCall<CharClassFillStartsEnds>(X, mCtxt.mMatchFollows, fillStartsEnds);
             } else {
-                mPB.CreateKernelCall<StringClassKernel>(seg->strings, codeUnitBasis(), fillStartsEnds, mCtxt.mMatchFollows);
+                mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(seg->strings), codeUnitBasis(), fillStartsEnds,
+                                                        mCtxt.mMatchFollows);
             }
             StreamSet * const index = mPB.CreateStreamSet(1);
             StreamSet * const good = mPB.CreateStreamSet(1);
@@ -1696,12 +1753,75 @@ void RE_PipelineBuilder::getSpan(RE * re, StreamSet * spans) {
 StreamSet * RE_PipelineBuilder::codeUnitBasis() {
     if (mCodeUnitBasis == nullptr) {
         mCodeUnitBasis = mCtxt.mCodeUnitStream;
-        if (mCodeUnitBasis->getNumElements() == 1) {
+        if (mCodeUnitBasis->getFieldWidth() > 1) {
             mCodeUnitBasis = mPB.CreateStreamSet(8, 1);
             Selected_S2P(mPB, mCtxt.mCodeUnitStream, mCodeUnitBasis);
         }
     }
     return mCodeUnitBasis;
+}
+
+CC * RE_PipelineBuilder::codeUnitCC(CC * cc) const {
+    if (mCtxt.mMultiplexed && (cc->getAlphabet() == mCtxt.mMultiplexed->getSourceAlphabet())) {
+        return mCtxt.mMultiplexed->transformCC(cc);
+    }
+    return cc;
+}
+
+std::vector<std::vector<CC *>> RE_PipelineBuilder::codeUnitStrings(const std::vector<std::vector<CC *>> & strings) const {
+    std::vector<std::vector<CC *>> translated;
+    for (const auto & str : strings) {
+        translated.emplace_back();
+        for (CC * cc : str) translated.back().push_back(codeUnitCC(cc));
+    }
+    return translated;
+}
+
+const cc::Alphabet * RE_PipelineBuilder::codeUnitEncoding() const {
+    if (mCtxt.mMultiplexed) return mCtxt.mMultiplexed;
+    return mCtxt.mCodeUnitAlphabet;
+}
+
+namespace {
+// The streams of classes of the codes of a multiplexed alphabet (given as
+// CCs of the alphabet), over the basis of the codes.
+class MultiplexedClassesKernel final : public pablo::PabloKernel {
+public:
+    MultiplexedClassesKernel(LLVMTypeSystemInterface & ts, std::vector<CC *> ccs, StreamSet * basis, StreamSet * classes)
+    : MultiplexedClassesKernel(ts, signature(ccs, basis), std::move(ccs), basis, classes) {}
+    bool hasSignature() const override { return true; }
+    llvm::StringRef getSignature() const override { return mSignature; }
+protected:
+    MultiplexedClassesKernel(LLVMTypeSystemInterface & ts, std::string sig, std::vector<CC *> && ccs,
+                             StreamSet * basis, StreamSet * classes)
+    : PabloKernel(ts, "mpxcc_" + getStringHash(sig), {Binding{"basis", basis}}, {Binding{"classes", classes}}),
+      mCCs(std::move(ccs)), mSignature(std::move(sig)) {}
+    static std::string signature(const std::vector<CC *> & ccs, StreamSet * basis) {
+        std::string sig = std::to_string(basis->getNumElements());
+        for (const CC * cc : ccs) sig += "|" + cc->canonicalName();
+        return sig;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        cc::Parabix_CC_Compiler_Builder ccc(getInputStreamSet("basis"));
+        std::vector<PabloAST *> classes;
+        for (CC * cc : mCCs) classes.push_back(pb.createInFile(ccc.compileCC(cc, pb)));
+        writeOutputStreamSet("classes", classes);
+    }
+private:
+    const std::vector<CC *> mCCs;
+    const std::string mSignature;
+};
+}
+
+void RE_PipelineBuilder::compileClasses(const std::vector<CC *> & ccs, StreamSet * out, StreamSet * basis) {
+    if (mCtxt.mMultiplexed) {
+        std::vector<CC *> codes;
+        for (CC * cc : ccs) codes.push_back(codeUnitCC(cc));
+        mPB.CreateKernelCall<MultiplexedClassesKernel>(codes, mCtxt.mCodeUnitStream, out);
+    } else {
+        mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, basis ? basis : codeUnitBasis(), out);
+    }
 }
 
 StreamSet * RE_PipelineBuilder::classStream(RE * re, CC * cc) {
@@ -1712,7 +1832,7 @@ StreamSet * RE_PipelineBuilder::classStream(RE * re, CC * cc) {
         if (f != mCtxt.mExternals.end()) return f->second.extStream;
     }
     StreamSet * const strm = mPB.CreateStreamSet(1);
-    mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{cc}, codeUnitBasis(), strm);
+    compileClasses(std::vector<re::CC *>{cc}, strm);
     return strm;
 }
 
@@ -2082,7 +2202,7 @@ StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vec
             strm = classStream(f->re, f->cc);
         } else {
             strm = mPB.CreateStreamSet(3);
-            mPB.CreateKernelCall<StringClassKernel>(f->strings, codeUnitBasis(), strm, mCtxt.mMatchFollows);
+            mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(f->strings), codeUnitBasis(), strm, mCtxt.mMatchFollows);
         }
         finalSteps.push_back(ChainCoverage::Final{f->kind, strm});
     }
@@ -2317,7 +2437,7 @@ StreamSet * RE_PipelineBuilder::reversalBarriers(RE * re) {
         barrierChars = re::makeCC(UCD::UnicodeSet(0, UCD::UNICODE_MAX) - matchable, &cc::Unicode);
     }
     StreamSet * barriers = mPB.CreateStreamSet(1);
-    mPB.CreateKernelFamilyCall<CharClassesKernel>(std::vector<re::CC *>{barrierChars}, mCtxt.mCodeUnitStream, barriers);
+    compileClasses(std::vector<re::CC *>{barrierChars}, barriers, mCtxt.mCodeUnitStream);
     if (mCtxt.mMatchFollows) {
         StreamSet * const all = mPB.CreateStreamSet(1);
         OrCombine(mPB, barriers, mCtxt.mMatchFollows, all);
@@ -2435,7 +2555,7 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
     std::vector<std::pair<Name *, Assertion *>> lookbehinds;
     RE * const named = nameForwardLookbehinds(re, lookbehinds);
     PreparedRE reversed = prepareRE(reverse(named), opts);
-    RE_PipelineBuilder backward(mPB, RE_context{&cc::Unicode, reversedText, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
+    RE_PipelineBuilder backward(mPB, RE_context{codeUnitEncoding(), reversedText, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
     // Without match regions, the reversed text is extended by one position
     // (and made one region) if the reversed RE refers to its end: for a
     // negative lookahead (a negative lookbehind of the RE), which holds at
@@ -2477,7 +2597,8 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
     for (const auto & lb : lookbehinds) {
         RE * const asserted = lb.second->getAsserted();
         const PreparedRE prepared = prepareRE(asserted, opts);
-        RE_PipelineBuilder forward(mPB, RE_context{&cc::Unicode, mCtxt.mCodeUnitStream, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
+        RE_PipelineBuilder forward(mPB, RE_context{codeUnitEncoding(), mCtxt.mCodeUnitStream, mCtxt.mMatchStarts,
+                                                   mCtxt.mMatchFollows});
         StreamSet * lbEnds = mPB.CreateStreamSet(1);
         forward.matchSearchPipeline(prepared, lbEnds);
         if (const unsigned offset = prepared.grepOffset()) {
@@ -2960,6 +3081,10 @@ std::vector<PreconditionFailure> ModeTransformation::failures(RE * transformed, 
 // the starts of its matches are found by reversal (byReversal).
 static std::vector<PreconditionFailure> modeFailures(const PreparedRE & prepared, const cc::Alphabet * sourceEncoding,
                                                      bool & byReversal) {
+    // (The codes of a multiplexed alphabet are characters of its source.)
+    if (const auto * mpx = dyn_cast_or_null<cc::MultiplexedAlphabet>(sourceEncoding)) {
+        sourceEncoding = mpx->getSourceAlphabet();
+    }
     // The alphabets of the RE as compiled (see RE_PipelineBuilder::ensurePrepared).
     const cc::Alphabet * lengthAlphabet = &cc::Unicode;
     const cc::Alphabet * codeUnitAlphabet = &cc::Unicode;
@@ -3114,7 +3239,8 @@ class BackwardWalkStreams final : public pablo::PabloKernel {
 public:
     BackwardWalkStreams(LLVMTypeSystemInterface & ts, const re::CaptureWalk & walk, StreamSet * Basis,
                         StreamSet * Ends, StreamSet * Covered, StreamSet * Streams)
-    : PabloKernel(ts, "BackwardWalkStreams_" + getStringHash(walkStepsSignature(walk.backSteps)),
+    : PabloKernel(ts, "BackwardWalkStreams_" + std::to_string(Basis->getNumElements()) + "_" +
+                      getStringHash(walkStepsSignature(walk.backSteps)),
                   {Binding{"Basis", Basis}, Binding{"Ends", Ends}, Binding{"Covered", Covered}},
                   {Binding{"Streams", Streams}}),
       mSteps(walk.backSteps) {}
@@ -3176,7 +3302,8 @@ public:
     CaptureBoundaries(LLVMTypeSystemInterface & ts, const re::CaptureWalk & walk, StreamSet * Basis,
                       StreamSet * Starts, StreamSet * Ends, StreamSet * Covered, StreamSet * Backward,
                       StreamSet * Marks)
-    : PabloKernel(ts, "CaptureBoundaries_" + getStringHash(captureWalkSignature(walk)),
+    : PabloKernel(ts, "CaptureBoundaries_" + std::to_string(Basis->getNumElements()) + "_" +
+                      getStringHash(captureWalkSignature(walk)),
                   [&] {
                       Bindings inputs{Binding{"Basis", Basis}, Binding{"Starts", Starts},
                                       Binding{"Ends", Ends, FixedRate(1), LookAhead(captureWalkLookahead(walk))},
@@ -3516,6 +3643,10 @@ StreamSet * RE_PipelineBuilder::captureBoundaries(const re::CaptureWalk & walk, 
     if (mCtxt.mCodeUnitAlphabet != &cc::Unicode) {
         llvm::report_fatal_error("the boundaries of captures require full Unicode indexing (see prepareSearchReplace)");
     }
+    // The classes of the runs of the walk, as compiled over the code units.
+    re::CaptureWalk codeUnitWalk = walk;
+    for (re::CaptureWalk::Step & step : codeUnitWalk.steps) if (step.run) step.run = codeUnitCC(step.run);
+    for (re::CaptureWalk::Step & step : codeUnitWalk.backSteps) if (step.run) step.run = codeUnitCC(step.run);
     // The boundaries found by the walk back from the ends of the matches:
     // a forward walk in the regions reversed in place (whose barriers no
     // match crosses), from the last characters of the selected matches.
@@ -3528,7 +3659,7 @@ StreamSet * RE_PipelineBuilder::captureBoundaries(const re::CaptureWalk & walk, 
         for (const re::CaptureWalk::Step & step : walk.backSteps) if (step.run) runs++;
         StreamSet * const barriers = reversalBarriers(search);
         StreamSet * const streams = mPB.CreateStreamSet(2 + runs);
-        mPB.CreateKernelCall<BackwardWalkStreams>(walk, mCtxt.mCodeUnitStream, m.ends, m.covered, streams);
+        mPB.CreateKernelCall<BackwardWalkStreams>(codeUnitWalk, mCtxt.mCodeUnitStream, m.ends, m.covered, streams);
         StreamSet * const reversed = mPB.CreateStreamSet(2 + runs);
         mPB.CreateKernelCall<RegionReversal>(barriers, streams, reversed, ReverseRegionLimit);
         StreamSet * const cursors = mPB.CreateStreamSet(walk.backSteps.size() + 1);
@@ -3540,7 +3671,8 @@ StreamSet * RE_PipelineBuilder::captureBoundaries(const re::CaptureWalk & walk, 
         }
     }
     StreamSet * const marks = mPB.CreateStreamSet(2 * walk.captures.size());
-    mPB.CreateKernelCall<CaptureBoundaries>(walk, mCtxt.mCodeUnitStream, m.selected, m.ends, m.covered, backward, marks);
+    mPB.CreateKernelCall<CaptureBoundaries>(codeUnitWalk, mCtxt.mCodeUnitStream, m.selected, m.ends, m.covered, backward,
+                                            marks);
     return marks;
 }
 
@@ -3653,6 +3785,9 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
         matchedFollows = mPB.CreateStreamSet(1);
         mPB.CreateKernelCall<MatchedLinesKernel>(m.selected, mCtxt.mMatchFollows, matchedFollows);
     }
+    if (mCtxt.mMultiplexed) {
+        llvm::report_fatal_error("RE_PipelineBuilder: the text of a replacement needs the codepoints, not a multiplexed basis");
+    }
     StreamSet * text = utf8 ? codeUnitBasis() : mCtxt.mCodeUnitStream;
     StreamSet * resultFollows = follows ? mCtxt.mMatchFollows : nullptr;
     StreamSet * resultReplaced = matchedFollows;
@@ -3750,13 +3885,13 @@ RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {
     for (auto m : M.CCnamer.mNameMap) {
         std::vector<re::CC *> ccs = {cast<re::CC>(m.second)};
         StreamSet * ccStrm = mPB.CreateStreamSet(1);
-        mPB.CreateKernelFamilyCall<CharClassesKernel>(ccs, mCtxt.mCodeUnitStream, ccStrm);
+        compileClasses(ccs, ccStrm, mCtxt.mCodeUnitStream);
         addExternal(m.first, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ccStrm});
     }
 
     for (auto & m : M.SCnamer.mStrings) {
         StreamSet * fillStartsEnds = mPB.CreateStreamSet(3);
-        mPB.CreateKernelCall<StringClassKernel>(m.second, codeUnitBasis(), fillStartsEnds);
+        mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(m.second), codeUnitBasis(), fillStartsEnds);
         addExternal(m.first, ExternalStream{ExternalStreamKind::StringClassRep, 0, {0, 0}, fillStartsEnds});
     }
 
@@ -3766,6 +3901,9 @@ RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {
 RE * RE_PipelineBuilder::processReferences(RE * re) {
     re::ReferenceInfo mRefInfo = re::buildReferenceInfo(re);
     if (!mRefInfo.twixtREs.empty()) {
+        if (mCtxt.mMultiplexed) {
+            llvm::report_fatal_error("RE_PipelineBuilder: references compare codepoints, not with a multiplexed basis");
+        }
         re::FixedReferenceTransformer FRT(mRefInfo, *mCtxt.mLengthAlphabet);
         RE * xfrmed = FRT.transformRE(re);
         for (auto m : FRT.mNameMap) {

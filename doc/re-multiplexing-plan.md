@@ -421,3 +421,40 @@ the number of kernels and reversals that would consume the basis.
   and `reversed_lookahead_multiplexed_test` run the tests of the same
   names with `--re-multiplex=force` (each under a second with the object
   cache). The full ctest suite passes.
+
+## Milestone 4 status
+
+- The reverse pipelines run over the codes since milestones 2 and 3: the
+  backward pass, the lookbehinds matched forward and nested reversal take
+  the encoding of the forward pass (`codeUnitEncoding`), so the reversed
+  basis is the `k` code streams; capture walks compile their run classes
+  over the codes; the barriers are a class of codes over the `k` bits
+  (`compileClasses`, then OR with the region follows).
+- One reversal for the streams of the forward pass (`reversedStarts`): the
+  code units, the anchor marks (`ForwardAnchorMarks`) and the ends of the
+  lookbehinds matched forward share the barriers, and are reversed by one
+  `RegionReversal` of their concatenation (`streamutils::Select`), then
+  taken apart. Only the reversal back of the ends remains separate (it
+  depends on the backward pass).
+- Measured (`-EnableCycleCounter`, one thread, 65 MB of mostly ASCII
+  text in lines of words), in
+  thousands of cycles:
+
+  | RE | 21-bit, separate | codes, separate | codes, shared |
+  |---|---|---|---|
+  | `x(?=[a-c]*(?<=c(?:a*b)*)d)` (lookbehind) | 43200 | 28127 | 20645 |
+  | `x(?=(?:a*b)*c$)` (anchor) | 43325 | 26278 | 19198 |
+  | `x(?=(?:a*b)*c)` | 33370 | 17793 | 17793 |
+
+  `RegionReversal` dominates: about 6100 per kernel plus about 830 per
+  stream (21 streams 23367, 3 streams 9276, 1 stream 6861). Its fixed
+  cost, per position, comes from its bit-at-a-time loops
+  (`parabix_reverse_regions`): the barriers are scanned and the bits of
+  each region copied one at a time. A word-at-a-time reversal is the next
+  gain, larger now than that of the stream count.
+- The barriers in one kernel with the follows: not done, as both kernels
+  are below 100 in these measurements.
+- Tests: the reversal groups of `match_starts_test`,
+  `reversed_lookahead_test` and `capture_spans_test` and their
+  `_multiplexed` variants (anchored REs and lookbehinds matched forward
+  included). The full ctest suite passes.

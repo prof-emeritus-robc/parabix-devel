@@ -2681,11 +2681,6 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
         llvm::report_fatal_error("the starts of matches by reversal require full Unicode indexing");
     }
     StreamSet * const barriers = reversalBarriers(re);
-    // The ends of the matches of the reversed RE in the reversed regions
-    // (which are the regions), marked at their last characters, are the
-    // starts of the matches in the regions reversed back.
-    StreamSet * const reversedText = mPB.CreateStreamSet(mCtxt.mCodeUnitStream->getNumElements());
-    mPB.CreateKernelCall<RegionReversal>(barriers, mCtxt.mCodeUnitStream, reversedText, ReverseRegionLimit);
     RE_ModeOptions opts;
     opts.goal = RE_Goal::MatchEnds;
     opts.forceUnicodeIndexing = true;
@@ -2695,7 +2690,6 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
     std::vector<std::pair<Name *, Assertion *>> lookbehinds;
     RE * const named = nameForwardLookbehinds(re, lookbehinds);
     PreparedRE reversed = prepareRE(reverse(named), opts);
-    RE_PipelineBuilder backward(mPB, RE_context{codeUnitEncoding(), reversedText, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
     // Without match regions, the reversed text is extended by one position
     // (and made one region) if the reversed RE refers to its end: for a
     // negative lookahead (a negative lookbehind of the RE), which holds at
@@ -2709,18 +2703,59 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
         mPB.CreateKernelCall<ExtendByOne>(s, x);
         return x;
     };
+    // The streams reversed, with the same barriers, by one RegionReversal:
+    // the code units, the marks of the anchors (if the reversed RE has any)
+    // and the ends of the lookbehinds matched forward.
+    std::vector<StreamSet *> forwardStreams{mCtxt.mCodeUnitStream};
     // The anchors of the reversed RE: the Start and End of the regions of
     // the text reversed (the barriers that are not region follows divide
     // them), as zero-width externals.  (A text without regions is extended,
     // and given its own region, for the anchors, see matchStartsPipeline.)
-    if (hasAnchorAnywhere(reversed.re)) {
+    const bool anchored = hasAnchorAnywhere(reversed.re);
+    if (anchored) {
         if ((mCtxt.mMatchStarts == nullptr) || (mCtxt.mMatchFollows == nullptr)) {
             llvm::report_fatal_error("the starts of matches by reversal: anchors require match regions");
         }
         StreamSet * const marks = mPB.CreateStreamSet(2);
         mPB.CreateKernelCall<ForwardAnchorMarks>(mCtxt.mMatchStarts, mCtxt.mMatchFollows, barriers, marks);
-        StreamSet * const reversedMarks = mPB.CreateStreamSet(2);
-        mPB.CreateKernelCall<RegionReversal>(barriers, marks, reversedMarks, ReverseRegionLimit);
+        forwardStreams.push_back(marks);
+    }
+    for (const auto & lb : lookbehinds) {
+        const PreparedRE prepared = prepareRE(lb.second->getAsserted(), opts);
+        RE_PipelineBuilder forward(mPB, RE_context{codeUnitEncoding(), mCtxt.mCodeUnitStream, mCtxt.mMatchStarts,
+                                                   mCtxt.mMatchFollows});
+        StreamSet * lbEnds = mPB.CreateStreamSet(1);
+        forward.matchSearchPipeline(prepared, lbEnds);
+        if (const unsigned offset = prepared.grepOffset()) {
+            StreamSet * const shifted = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<ShiftBack>(lbEnds, shifted, offset);
+            lbEnds = shifted;
+        }
+        forwardStreams.push_back(lbEnds);
+    }
+    // Reversed, and taken apart again in the order given.
+    std::vector<StreamSet *> reversedStreams;
+    if (forwardStreams.size() == 1) {
+        StreamSet * const reversedText = mPB.CreateStreamSet(mCtxt.mCodeUnitStream->getNumElements());
+        mPB.CreateKernelCall<RegionReversal>(barriers, mCtxt.mCodeUnitStream, reversedText, ReverseRegionLimit);
+        reversedStreams.push_back(reversedText);
+    } else {
+        StreamSet * const all = streamutils::Select(mPB, forwardStreams);
+        StreamSet * const reversedAll = mPB.CreateStreamSet(all->getNumElements());
+        mPB.CreateKernelCall<RegionReversal>(barriers, all, reversedAll, ReverseRegionLimit);
+        uint32_t first = 0;
+        for (StreamSet * f : forwardStreams) {
+            std::vector<uint32_t> indices;
+            for (uint32_t i = 0; i < f->getNumElements(); i++) indices.push_back(first + i);
+            reversedStreams.push_back(streamutils::Select(mPB, reversedAll, indices));
+            first += f->getNumElements();
+        }
+    }
+    StreamSet * const reversedText = reversedStreams[0];
+    RE_PipelineBuilder backward(mPB, RE_context{codeUnitEncoding(), reversedText, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
+    unsigned next = 1;
+    if (anchored) {
+        StreamSet * const reversedMarks = reversedStreams[next++];
         StreamSet * const reversedStart = mPB.CreateStreamSet(1);
         StreamSet * const reversedEnd = mPB.CreateStreamSet(1);
         mPB.CreateKernelCall<ReversedAnchors>(reversedMarks, mCtxt.mMatchStarts, mCtxt.mMatchFollows, barriers,
@@ -2736,19 +2771,7 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
     }
     for (const auto & lb : lookbehinds) {
         RE * const asserted = lb.second->getAsserted();
-        const PreparedRE prepared = prepareRE(asserted, opts);
-        RE_PipelineBuilder forward(mPB, RE_context{codeUnitEncoding(), mCtxt.mCodeUnitStream, mCtxt.mMatchStarts,
-                                                   mCtxt.mMatchFollows});
-        StreamSet * lbEnds = mPB.CreateStreamSet(1);
-        forward.matchSearchPipeline(prepared, lbEnds);
-        if (const unsigned offset = prepared.grepOffset()) {
-            StreamSet * const shifted = mPB.CreateStreamSet(1);
-            mPB.CreateKernelCall<ShiftBack>(lbEnds, shifted, offset);
-            lbEnds = shifted;
-        }
-        StreamSet * marks = mPB.CreateStreamSet(1);
-        mPB.CreateKernelCall<RegionReversal>(barriers, lbEnds, marks, ReverseRegionLimit);
-        marks = extendedExternal(marks);
+        StreamSet * const marks = extendedExternal(reversedStreams[next++]);
         backward.addExternal(lb.first->getFullName(),
                              ExternalStream{ExternalStreamKind::StartIndexed, 1, getLengthRange(asserted, &cc::Unicode),
                                             marks, lb.second->getSense() == Assertion::Sense::Negative});

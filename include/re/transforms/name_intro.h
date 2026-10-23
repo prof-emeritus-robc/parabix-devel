@@ -24,13 +24,17 @@ protected:
     void showProcessing() override;
 };
 
+// Names the CCs of characters of more than one encoded length, and, with
+// replacementChar, those of U+FFFD (which also match ill-formed input, see
+// codegen::UTF8Errors).
 class VariableLengthCCNamer final : public NameIntroduction {
 public:
-    VariableLengthCCNamer(unsigned UTF_bits = 8);
+    VariableLengthCCNamer(unsigned UTF_bits = 8, bool replacementChar = false);
 protected:
     RE * transformCC (CC * cc) override;
 private:
     UTF_Encoder mEncoder;
+    const bool mReplacementChar;
 };
 
 class FixedSpanNamer final : public NameIntroduction {

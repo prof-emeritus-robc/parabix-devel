@@ -4,6 +4,7 @@
  */
 
 #include <kernel/unicode/utf8_decoder.h>
+#include <kernel/unicode/utf8_support.h>
 #include <re/adt/re_cc.h>
 #include <pablo/pablo.h>
 #include <re/cc/cc_compiler.h>
@@ -190,8 +191,17 @@ void UTF8_Decoder::generatePabloMethod() {
         level3.createAssign(Unicode_bit[i+6], level3.createOr(Unicode_bit[i+6], sfx43bit));
         level3.createAssign(Unicode_bit[i], level3.createOr(Unicode_bit[i], sfx44bit));
     }
+    //
+    // Each maximal ill-formed subpart (see UTF8_structure) is the character
+    // U+FFFD, at its last byte (Advance) or its first byte (LookAhead).
+    const bool initials = (mBitMovement == BitMovementMode::LookAhead);
+    const UTF8_Structure u = UTF8_structure(main, UTF8_bit, initials);
+    PabloAST * const error = initials ? u.errorInitial : u.errorFinal;
+    PabloAST * const notError = main.createNot(error);
     Var * output = getOutputStreamVar("unicode_bit");
     for (unsigned i = 0; i < 21; i++) {
-        main.createAssign(main.createExtract(output, i), Unicode_bit[i]);
+        PabloAST * value = main.createAnd(Unicode_bit[i], notError);
+        if ((0xFFFD >> i) & 1) value = main.createOr(value, error);
+        main.createAssign(main.createExtract(output, i), value);
     }
 }

@@ -43,14 +43,15 @@ void NameIntroduction::showProcessing() {
     }
 }
 
-VariableLengthCCNamer::VariableLengthCCNamer(unsigned UTF_bits) : NameIntroduction("VariableLengthCCNamer") {
+VariableLengthCCNamer::VariableLengthCCNamer(unsigned UTF_bits, bool replacementChar)
+: NameIntroduction("VariableLengthCCNamer"), mReplacementChar(replacementChar) {
         mEncoder.setCodeUnitBits(UTF_bits);
     }
 
 RE * VariableLengthCCNamer::transformCC (CC * cc) {
     bool variable_length = false;
     variable_length = mEncoder.encoded_length(lo_codepoint(cc->front())) < mEncoder.encoded_length(hi_codepoint(cc->back()));
-    if (variable_length) {
+    if (variable_length || (mReplacementChar && cc->contains(0xFFFD))) {
         return createName(cc->canonicalName(), cc);
     }
     return cc;

@@ -986,14 +986,52 @@ const unsigned LengthClassLimit = 16;
 RE * expandBoundedReps(RE * re, const cc::Alphabet * lengthAlphabet);
 }
 
+namespace {
+// Does the RE (including its assertions and the definitions of names) have a
+// CC of U+FFFD, the character of each maximal ill-formed subpart of UTF-8
+// input with codegen::UTF8ErrorMode::UseReplacementChar?
+struct ReplacementCharClasses final : public RE_Inspector {
+    ReplacementCharClasses() : RE_Inspector(NameProcessingMode::ProcessDefinition, InspectionMode::IgnoreNonUnique) {}
+    void inspectCC(CC * cc) override {
+        if ((cc->getAlphabet() == &cc::Unicode) && cc->contains(0xFFFD)) mFound = true;
+    }
+    bool mFound = false;
+};
+
+bool hasReplacementCharClass(RE * re) {
+    ReplacementCharClasses classes;
+    classes.inspectRE(re);
+    return classes.mFound;
+}
+
+// Whether ill-formed UTF-8 input is characters U+FFFD (as it is up to the
+// first error with Abort), rather than dropped.
+bool replacedUTF8Errors() {
+    return codegen::UTF8Errors != codegen::UTF8ErrorMode::DropBadInput;
+}
+}
+
 static RE_Mode determineREMode(RE * re, const RE_ModeOptions & opts) {
     RE_Mode mode;
+    // Ill-formed UTF-8 input dropped (see codegen::UTF8Errors) leaves the
+    // characters around it adjacent: only the positions of characters (full
+    // Unicode indexing) skip it, not those of code units.
+    if (codegen::UTF8Errors == codegen::UTF8ErrorMode::DropBadInput) {
+        mode.lengthAlphabet = &cc::Unicode;
+        mode.indexAlphabet = &cc::Unicode;
+        return mode;
+    }
     // Determine the unit of length for the RE.  If the RE involves
     // fixed length UTF-8 sequences only, then UTF-8 can be used
     // for most efficient processing.   Otherwise we must use full
     // Unicode length calculations.
     bool useFixedUTF8 = !opts.unicodeIndexingOverride && validateFixedUTF8(re) && !hasPropertyReference(re);
     useFixedUTF8 = useFixedUTF8 && !opts.forceUnicodeIndexing;
+    // A CC of U+FFFD matches each maximal ill-formed subpart of the input, of
+    // 1 to 3 code units.
+    if (useFixedUTF8 && replacedUTF8Errors() && hasReplacementCharClass(re)) {
+        useFixedUTF8 = false;
+    }
     // Byte mode tries every code unit position.  A match that consumes no
     // characters, but is conditioned by lookarounds, could then succeed
     // within a multibyte character.
@@ -1261,6 +1299,31 @@ namespace {
 // multiplexing plan replaces it with an estimate of costs).
 const unsigned MultiplexBitLimit = 12;
 
+// The bits of a code at the marked positions, and of the classes elsewhere.
+class CodeAtMarks final : public pablo::PabloKernel {
+public:
+    CodeAtMarks(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * Marks, unsigned code, StreamSet * Result)
+    : PabloKernel(ts, "CodeAtMarks_" + std::to_string(Classes->getNumElements()) + "_" + std::to_string(code),
+                  {Binding{"Classes", Classes}, Binding{"Marks", Marks}}, {Binding{"Result", Result}}),
+      mCode(code) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * const marks = getInputStreamSet("Marks")[0];
+        PabloAST * const unmarked = pb.createNot(marks);
+        std::vector<PabloAST *> result;
+        for (unsigned i = 0; i < classes.size(); i++) {
+            PabloAST * bit = pb.createAnd(classes[i], unmarked);
+            if ((mCode >> i) & 1) bit = pb.createOr(bit, marks);
+            result.push_back(bit);
+        }
+        writeOutputStreamSet("Result", result);
+    }
+private:
+    const unsigned mCode;
+};
+
 // What, in an RE as prepared (including the definitions of names), needs the
 // codepoints of the text rather than the classes of its CCs: properties
 // (compiled as kernels over the basis), references, CCs of other alphabets
@@ -1435,8 +1498,17 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
     }
     if (mpx) {
         const auto & mpx_basis = mpx->getMultiplexedCCs();
-        StreamSet * const u8CharClasses = mPB.CreateStreamSet(mpx_basis.size());
+        StreamSet * u8CharClasses = mPB.CreateStreamSet(mpx_basis.size());
         mPB.CreateKernelFamilyCall<CharClassesKernel>(mpx_basis, source, u8CharClasses);
+        if (replacedUTF8Errors()) {
+            // Each maximal ill-formed subpart of the input is the character
+            // U+FFFD, at its final code unit (see UTF8_index).
+            StreamSet * const errors = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<UTF8_ErrorMarks>(source, errors, pablo::BitMovementMode::Advance);
+            StreamSet * const replaced = mPB.CreateStreamSet(mpx_basis.size());
+            mPB.CreateKernelCall<CodeAtMarks>(u8CharClasses, errors, mpx->codeOf(0xFFFD), replaced);
+            u8CharClasses = replaced;
+        }
         StreamSet * const codes = mPB.CreateStreamSet(mpx_basis.size());
         FilterByMask(mPB, mU8Index, u8CharClasses, codes);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
@@ -3022,7 +3094,8 @@ struct ModeTransformation {
     bool mStartsByReversal = false;
     std::vector<std::pair<Assertion *, std::string>> mLookaheadsNotReversed;
     UCD::PropertyExternalizer PE;
-    re::VariableLengthCCNamer CCnamer;
+    // (CCs of U+FFFD are named too: they also match ill-formed input.)
+    re::VariableLengthCCNamer CCnamer{8, replacedUTF8Errors()};
     re::StringClassRepNamer SCnamer;
     re::LookAheadNamer LA;
 };
@@ -3955,6 +4028,15 @@ RE * RE_PipelineBuilder::applyModePasses(RE * re, RE_Goal goal) {
         std::vector<re::CC *> ccs = {cast<re::CC>(m.second)};
         StreamSet * ccStrm = mPB.CreateStreamSet(1);
         compileClasses(ccs, ccStrm, mCtxt.mCodeUnitStream);
+        if ((mCtxt.mCodeUnitAlphabet == &cc::UTF8) && replacedUTF8Errors() && ccs[0]->contains(0xFFFD)) {
+            // The maximal ill-formed subparts of the input, at their final
+            // code units, are characters U+FFFD (see codegen::UTF8Errors).
+            StreamSet * const errors = mPB.CreateStreamSet(1);
+            mPB.CreateKernelCall<UTF8_ErrorMarks>(mCtxt.mCodeUnitStream, errors, pablo::BitMovementMode::Advance);
+            StreamSet * const withErrors = mPB.CreateStreamSet(1);
+            OrCombine(mPB, ccStrm, errors, withErrors);
+            ccStrm = withErrors;
+        }
         addExternal(m.first, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, ccStrm});
     }
 

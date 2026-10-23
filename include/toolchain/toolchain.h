@@ -154,6 +154,14 @@ extern std::string ShowASMOption;
 extern const char * ObjectCacheDir;
 extern std::string ObjectCacheSalt;  // set from command line: --object-cache-salt
 extern unsigned CacheDaysLimit;  // set from command line
+
+// The treatment of ill-formed UTF-8 input (--utf8-errors), as for GB 18030
+// input (see gb18030): each maximal ill-formed subpart (as in the Unicode
+// Standard, section 3.9) stops the processing of the input before it
+// (Abort), is dropped (DropBadInput), or is a character U+FFFD
+// (UseReplacementChar, the default).  See kernel::UTF8_index.
+enum class UTF8ErrorMode {Abort, DropBadInput, UseReplacementChar};
+extern UTF8ErrorMode UTF8Errors;
 extern int FreeCallBisectLimit;  // set from command line
 extern llvm::CodeGenOptLevel OptLevel;  // set from command line
 extern llvm::CodeGenOptLevel BackEndOptLevel;  // set from command line

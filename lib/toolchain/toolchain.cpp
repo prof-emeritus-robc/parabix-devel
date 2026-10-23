@@ -405,6 +405,16 @@ std::string TraceOption = "";
 static cl::opt<std::string, true> TraceValueOption("trace", cl::location(TraceOption),
                                             cl::desc("Trace the values of variables beginning with the given prefix."), cl::value_desc("prefix"), cl::cat(CodeGenOptions));
 
+UTF8ErrorMode UTF8Errors;
+static cl::opt<UTF8ErrorMode, true> UTF8ErrorsOption("utf8-errors", cl::location(UTF8Errors),
+    cl::init(UTF8ErrorMode::UseReplacementChar),
+    cl::desc("Treatment of ill-formed UTF-8 input (each maximal ill-formed subpart):"),
+    cl::values(clEnumValN(UTF8ErrorMode::Abort, "abort-on-error", "process the input up to the first error, then stop"),
+               clEnumValN(UTF8ErrorMode::DropBadInput, "drop-bad-characters", "drop the ill-formed input"),
+               clEnumValN(UTF8ErrorMode::UseReplacementChar, "use-replacement-char",
+                          "replace the ill-formed input with U+FFFD (default)")),
+    cl::cat(CodeGenOptions));
+
 bool EnableIllustrator;
 static cl::opt<bool, true> OptEnableIllustrator("enable-illustrator", cl::location(EnableIllustrator),
                                                  cl::desc("Enable bitstream illustrator with the default display width."), cl::init(0), cl::cat(CodeGenOptions));

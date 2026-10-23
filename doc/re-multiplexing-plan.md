@@ -405,12 +405,18 @@ the number of kernels and reversals that would consume the basis.
   binaries that do not link the RE options, which reject the flag). On
   random valid UTF-8 text, icgrep gives the same lines with and without
   multiplexing.
-- **Invalid UTF-8.** The two bases can differ on invalid UTF-8. The codes
-  come from the UTF-8 classes (as in the UTF-8 modes), while the 21-bit basis
-  gives invalid sequences the values that the decoder computes. In the cases
-  examined, the multiplexed result is the consistent one. For example, on
-  the line `\xff\x80qd`, every mode matches `^...d` (each invalid byte is a
-  character of `.`), but only multiplexing also matches `.(?=..d)`.
+- **Invalid UTF-8.** The two bases differed on invalid UTF-8: the 21-bit
+  decoder gave the bits of an ill-formed prefix to the characters after it
+  (fixed in `UTF8_Decoder`), and the UTF-8 classes and the decoder gave
+  ill-formed input different values. Ill-formed input now has defined
+  semantics, `--utf8-errors=abort-on-error|drop-bad-characters|
+  use-replacement-char` (`codegen::UTF8Errors`, default
+  use-replacement-char): each maximal ill-formed subpart (Unicode
+  Standard 3.9) is a U+FFFD, is dropped, or stops the input before it
+  (`kernel::UTF8_structure`, `UTF8_index`, `UTF8_InitialMask`,
+  `UTF8_ErrorMarks`, `UTF8_Decoder`). The multiplexed codes give a subpart
+  the code of U+FFFD (`CodeAtMarks`). Both bases then agree with Python's
+  decoding (`utf8_errors_test`).
 - Tests: `match_starts_multiplexed_test`, `capture_spans_multiplexed_test`
   and `reversed_lookahead_multiplexed_test` run the tests of the same
   names with `--re-multiplex=force` (each under a second with the object

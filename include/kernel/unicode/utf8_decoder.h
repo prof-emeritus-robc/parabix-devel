@@ -21,7 +21,7 @@ UTF8_Decoder (LLVMTypeSystemInterface & ts, StreamSet * u8_basis, StreamSet * un
         if (m == pablo::BitMovementMode::LookAhead) {
             mInputStreamSets.push_back(Binding{"utf8_bit", u8_basis, FixedRate(1), LookAhead(3)});
         } else {
-            mInputStreamSets.push_back(Binding{"utf8_bit", u8_basis});
+            mInputStreamSets.push_back(Binding{"utf8_bit", u8_basis, FixedRate(1), LookAhead(1)});
         }
     }
 

@@ -439,6 +439,66 @@ StreamSet * GrepEngine::grepPipeline(kernel::PipelineBuilder & P, StreamSet * In
 // which returns a count of the matches found (possibly subject to a MaxCount).
 //
 
+//
+// With codegen::UTF8ErrorMode::Abort, the input of each file is searched up
+// to its first maximal ill-formed UTF-8 subpart (see kernel::UTF8_structure),
+// which is reported.  The files of a batch are truncated there as they are
+// loaded (EmitMatchesEngine); with one file per pipeline (GrepEngine), the
+// matched lines are truncated there (UntilNkernel of the errors, N = 1), and
+// the pipeline stops (UTF8_BeforeError).
+//
+
+// The offset of the first byte of the first maximal ill-formed subpart of
+// UTF-8 text (Table 3-7 of the Unicode Standard), or its length.
+static size_t UTF8_errorOffset(const char * text, size_t length) {
+    const unsigned char * const s = reinterpret_cast<const unsigned char *>(text);
+    size_t i = 0;
+    while (i < length) {
+        const unsigned c = s[i];
+        unsigned n = 0;              // the suffixes that follow the lead
+        unsigned lo = 0x80, hi = 0xBF;   // the range of the first suffix
+        if (c < 0x80) { i++; continue; }
+        else if ((c >= 0xC2) && (c <= 0xDF)) n = 1;
+        else if (c == 0xE0) { n = 2; lo = 0xA0; }
+        else if (c == 0xED) { n = 2; hi = 0x9F; }
+        else if ((c >= 0xE1) && (c <= 0xEF)) n = 2;
+        else if (c == 0xF0) { n = 3; lo = 0x90; }
+        else if (c == 0xF4) { n = 3; hi = 0x8F; }
+        else if ((c >= 0xF1) && (c <= 0xF3)) n = 3;
+        else return i;
+        if (i + n >= length) return i;
+        if ((s[i + 1] < lo) || (s[i + 1] > hi)) return i;
+        for (unsigned k = 2; k <= n; k++) {
+            if ((s[i + k] < 0x80) || (s[i + k] > 0xBF)) return i;
+        }
+        i += n + 1;
+    }
+    return length;
+}
+
+static void reportUTF8Error(const std::string & fileName, size_t offset) {
+    llvm::errs() << fileName << ": ill-formed UTF-8 at byte " << offset
+                 << ": the input after it is not searched (--utf8-errors=abort-on-error)\n";
+}
+
+namespace {
+// The marks, through the end of the errors truncated at the first error (see
+// UntilNkernel), where the first error is not a mark: the marks before it.
+class UTF8_BeforeError final : public pablo::PabloKernel {
+public:
+    UTF8_BeforeError(LLVMTypeSystemInterface & ts, StreamSet * Marks, StreamSet * Errors, StreamSet * Result)
+    : PabloKernel(ts, "UTF8_BeforeError", {Binding{"Marks", Marks}, Binding{"Errors", Errors}},
+                  {Binding{"Result", Result}}) {}
+protected:
+    void generatePabloMethod() override {
+        pablo::PabloBuilder pb(getEntryScope());
+        pablo::PabloAST * const marks = getInputStreamSet("Marks")[0];
+        pablo::PabloAST * const errors = getInputStreamSet("Errors")[0];
+        writeOutputStreamSet("Result", std::vector<pablo::PabloAST *>{pb.createAnd(marks, pb.createNot(errors))});
+    }
+};
+}
+
 void GrepEngine::grepCodeGen() {
 
     auto P = CreatePipeline(mGrepDriver,
@@ -450,7 +510,18 @@ void GrepEngine::grepCodeGen() {
     Scalar * const fileDescriptor = P.getInputScalar("fileDescriptor");
     StreamSet * const ByteStream = P.CreateStreamSet(1, ENCODING_BITS);
     P.CreateKernelCall<FDSourceKernel>(useMMap, fileDescriptor, ByteStream);
-    StreamSet * const Matches = grepPipeline(P, ByteStream);
+    StreamSet * Matches = grepPipeline(P, ByteStream);
+    if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) {
+        StreamSet * const basis = P.CreateStreamSet(ENCODING_BITS, 1);
+        Selected_S2P(P, ByteStream, basis);
+        StreamSet * const errors = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<UTF8_ErrorMarks>(basis, errors);
+        StreamSet * const firstError = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<UntilNkernel>(P.CreateConstant(P.getSize(1)), errors, firstError, UntilNMode::TerminateAtN);
+        StreamSet * const before = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<UTF8_BeforeError>(Matches, firstError, before);
+        Matches = before;
+    }
     P.CreateKernelCall<PopcountKernel>(Matches, P.getOutputScalar("countResult"));
     mMainMethod = P.compile();
 }
@@ -890,6 +961,13 @@ uint64_t GrepEngine::doGrep(const std::vector<std::string> & fileNames, std::ost
         if (fileDescriptor == -1) return 0;
         uint64_t grepResult = f(useMMap, fileDescriptor, handler, mMaxCount);
         close(fileDescriptor);
+        if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) {
+            AlignedFileBuffer buf;
+            buf.load(fileName, canMMap(fileName));
+            const size_t offset = UTF8_errorOffset(buf.getBuf(), buf.getBufSize());
+            if (offset < buf.getBufSize()) reportUTF8Error(fileName, offset);
+            buf.release();
+        }
         if (handler.binaryFileSignalled()) {
             llvm::errs() << "Binary file " << fileName << "\n";
         }
@@ -967,6 +1045,17 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         size_t bytes_read = buf.getBufSize();
         if (bytes_read <= 0) return 0;
         accum.mBatchBuffer = buf.getBuf();
+        if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) {
+            const size_t offset = UTF8_errorOffset(accum.mBatchBuffer, bytes_read);
+            if (offset < bytes_read) {
+                reportUTF8Error(fileNames[0], offset);
+                bytes_read = offset;
+                if (bytes_read == 0) {
+                    buf.release();
+                    return 0;
+                }
+            }
+        }
         bool skip_binary_file = false;
         if (detectsBinaryByNull()) {
             auto null_byte_ptr = memchr(accum.mBatchBuffer, char (0), bytes_read);
@@ -1023,6 +1112,14 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         ssize_t bytes_read = read(fd, current_base, fileSize[i]);
         close(fd);
         if (bytes_read <= 0) continue; // No data or error reading the file; skip.
+        if (codegen::UTF8Errors == codegen::UTF8ErrorMode::Abort) {
+            const size_t offset = UTF8_errorOffset(current_base, bytes_read);
+            if (offset < static_cast<size_t>(bytes_read)) {
+                reportUTF8Error(fileNames[i], offset);
+                bytes_read = offset;
+                if (bytes_read == 0) continue;
+            }
+        }
         if (detectsBinaryByNull()) {
             auto null_byte_ptr = memchr(current_base, char (0), bytes_read);
             if (null_byte_ptr != nullptr) { // Binary file;

@@ -13,6 +13,7 @@
 #include <idisa/idisa_builder.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/pipeline_builder.h>
+#include <kernel/unicode/utf8_support.h>
 #include <kernel/core/callback.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -156,8 +157,9 @@ UnicodeLinesKernelBuilder::UnicodeLinesKernelBuilder(LLVMTypeSystemInterface & t
                                                      UnterminatedLineAtEOF eofMode,
                                                      NullCharMode nullMode,
                                                      Scalar * signalNullObject)
-: PabloKernel(ts, "UnicodeLB" + sourceShape(Basis) + EOF_annotation(eofMode) + NullModeAnnotation(nullMode),
-              {Binding{"basis", Basis},
+: PabloKernel(ts, "UnicodeLB" + sourceShape(Basis) + EOF_annotation(eofMode) + NullModeAnnotation(nullMode) +
+                  (codegen::UTF8Errors == codegen::UTF8ErrorMode::DropBadInput ? "_drop" : ""),
+              {Binding{"basis", Basis, FixedRate(), LookAhead(1)},
                   Binding{"lf", LF, FixedRate(), LookAhead(1)}},
               makeOutputBreakBindings(eofMode, LineEnds),
               makeInputScalarBindings(signalNullObject), {}),
@@ -274,7 +276,15 @@ void UnicodeLinesKernelBuilder::generatePabloMethod() {
     pb.createAssign(nonFinal, pb.createOr(nonFinal, CR_before_LF));
 
     Var * const u8index = getOutputStreamVar("u8index");
-    PabloAST * u8final = pb.createNot(nonFinal);
+    // The characters (see UTF8_index): each well-formed character and, unless
+    // ill-formed input is dropped, each maximal ill-formed subpart, at its
+    // final byte, other than the CR of a CR LF.
+    const UTF8_Structure u = UTF8_structure(pb, getInputStreamSet("basis"));
+    PabloAST * u8final = u.validFinal;
+    if (codegen::UTF8Errors != codegen::UTF8ErrorMode::DropBadInput) {
+        u8final = pb.createOr(u8final, u.errorFinal);
+    }
+    u8final = pb.createAnd(u8final, pb.createNot(CR_before_LF));
     PabloAST * notLB = pb.createNot(LineBreak);
     if (mEOFmode == UnterminatedLineAtEOF::Add1) {
         PabloAST * unterminatedLineAtEOF = pb.createAtEOF(pb.createAdvance(notLB, 1), "unterminatedLineAtEOF");

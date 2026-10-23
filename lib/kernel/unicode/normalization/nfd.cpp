@@ -569,21 +569,6 @@ void NFD_Focus::generatePabloMethod() {
     pb.createAssign(pb.createExtract(getOutputStreamVar("mayChangeOnNFD"), pb.getInteger(0)), focus);
 }
 
-//  The first byte of each UTF-8 sequence: the bytes that are not continuation
-//  bytes (10xxxxxx).
-class UTF8_InitialMask : public pablo::PabloKernel {
-public:
-    UTF8_InitialMask(LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * initial)
-    : PabloKernel(ts, "UTF8_InitialMask", {Binding{"basis", Basis}}, {Binding{"initial", initial}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        std::vector<PabloAST *> basis = getInputStreamSet("basis");
-        PabloAST * const continuation = pb.createAnd(basis[7], pb.createNot(basis[6]));
-        pb.createAssign(pb.createExtract(getOutputStreamVar("initial"), pb.getInteger(0)), pb.createNot(continuation));
-    }
-};
-
 static cl::OptionCategory NormalizationOptionCategory("Normalization Options",
     "Options of the normalization (NFD, NFKD) pipelines.");
 

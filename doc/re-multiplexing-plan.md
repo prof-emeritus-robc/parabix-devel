@@ -462,7 +462,7 @@ the number of kernels and reversals that would consume the basis.
 
 ## Automatic choice
 
-- `--re-multiplex=off|auto|force` (default still `off`): `auto` replaces
+- `--re-multiplex=off|auto|force` (default `auto`): `auto` replaces
   `on`. It multiplexes unless the RE needs the full 21-bit basis (the
   reasons of milestone 3: references, which compare codepoints; properties
   and boundaries compiled from the codepoints; the text of a replacement;

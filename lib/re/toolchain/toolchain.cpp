@@ -68,12 +68,12 @@ static cl::opt<unsigned, true>
 
 MultiplexMode Multiplexing;
 static cl::opt<MultiplexMode, true>
-    MultiplexingOption("re-multiplex", cl::location(Multiplexing), cl::init(MultiplexMode::Off),
+    MultiplexingOption("re-multiplex", cl::location(Multiplexing), cl::init(MultiplexMode::Auto),
                        cl::desc("match over the codes of a multiplexed alphabet of the character classes of a "
                                 "regular expression, rather than the 21-bit Unicode basis"),
                        cl::values(clEnumValN(MultiplexMode::Off, "off", "never"),
                                   clEnumValN(MultiplexMode::Auto, "auto", "where the regular expression allows it "
-                                             "and its codes need at most --multiplexed-stream-limit streams"),
+                                             "and its codes need at most --multiplexed-stream-limit streams (default)"),
                                   clEnumValN(MultiplexMode::Force, "force", "wherever the regular expression allows it")),
                        cl::cat(codegen::CodeGenOptions));
 

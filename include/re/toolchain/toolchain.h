@@ -46,7 +46,7 @@ extern unsigned ReverseRegionLimit;
 // Whether the regular expression engine matches over the codes of a
 // multiplexed alphabet of the CCs of an RE, rather than the 21-bit Unicode
 // basis, with full Unicode indexing (see RE_PipelineBuilder::ensurePrepared):
-// --re-multiplex.  Off: never; Auto: where the RE allows it (it does not need
+// --re-multiplex.  Off: never; Auto (the default): where the RE allows it (it does not need
 // the codepoints, as references do) and its codes need at most
 // MultiplexedStreamLimit streams; Force: wherever the RE allows it.
 enum class MultiplexMode {Off, Auto, Force};

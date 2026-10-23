@@ -91,6 +91,9 @@ message(STATUS "LLVM Version Integer: ${LLVM_VERSION_INTEGER}")
 
 ###   Import Dependency: Boost   ###
 
+if (POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)   # use Boost's own BoostConfig.cmake, not CMake's FindBoost
+endif()
 set(Boost_USE_STATIC_LIBS ${USE_STATIC_LIBS})
 set(Boost_USE_MULTITHREADED OFF)
 set(Boost_USE_STATIC_RUNTIME OFF)

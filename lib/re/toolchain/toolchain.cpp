@@ -72,10 +72,17 @@ static cl::opt<MultiplexMode, true>
                        cl::desc("match over the codes of a multiplexed alphabet of the character classes of a "
                                 "regular expression, rather than the 21-bit Unicode basis"),
                        cl::values(clEnumValN(MultiplexMode::Off, "off", "never"),
-                                  clEnumValN(MultiplexMode::On, "on", "where the regular expression allows it "
-                                             "and its codes need few bits"),
+                                  clEnumValN(MultiplexMode::Auto, "auto", "where the regular expression allows it "
+                                             "and its codes need at most --multiplexed-stream-limit streams"),
                                   clEnumValN(MultiplexMode::Force, "force", "wherever the regular expression allows it")),
                        cl::cat(codegen::CodeGenOptions));
+
+unsigned MultiplexedStreamLimit;
+static cl::opt<unsigned, true>
+    MultiplexedStreamLimitOption("multiplexed-stream-limit", cl::location(MultiplexedStreamLimit), cl::init(8),
+                                 cl::desc("with --re-multiplex=auto, the most streams of multiplexed codes used in "
+                                          "place of the 21-bit Unicode basis"),
+                                 cl::cat(codegen::CodeGenOptions));
 
 std::string AnnotateWithREflags(std::string name) {
     if (re::AlgorithmOptionIsSet(re::DisableMatchStar)) {

@@ -1294,11 +1294,6 @@ static bool hasAnchorAnywhere(const RE * re) {
 }
 
 namespace {
-// The bits of the codes of a multiplexed alphabet above which the engine
-// keeps the Unicode basis with --re-multiplex=on (milestone 6 of the
-// multiplexing plan replaces it with an estimate of costs).
-const unsigned MultiplexBitLimit = 12;
-
 // The bits of a code at the marked positions, and of the classes elsewhere.
 class CodeAtMarks final : public pablo::PabloKernel {
 public:
@@ -1483,15 +1478,17 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
         const unsigned bits = mpx->getMultiplexedCCs().size();
         if (bits == 0) {
             mMultiplexingFailure = "the regular expression has no character classes";
-        } else if ((re::Multiplexing == re::MultiplexMode::On) && (bits > MultiplexBitLimit)) {
-            mMultiplexingFailure = "its codes need " + std::to_string(bits) + " bits, more than " +
-                                   std::to_string(MultiplexBitLimit);
+        } else if ((re::Multiplexing == re::MultiplexMode::Auto) && (bits > re::MultiplexedStreamLimit)) {
+            // More streams than the limit are not worth computing from the
+            // UTF-8 basis in place of the 21 of the Unicode basis.
+            mMultiplexingFailure = "its codes need " + std::to_string(bits) + " streams, more than " +
+                                   std::to_string(re::MultiplexedStreamLimit) + " (--multiplexed-stream-limit)";
         }
         if (!mMultiplexingFailure.empty()) mpx = nullptr;
     }
     if (re::PrintOptionIsSet(re::ShowREs)) {
         if (mpx) {
-            llvm::errs() << "Multiplexed: " << mpx->getSize() << " codes, " << mpx->getMultiplexedCCs().size() << " bits\n";
+            llvm::errs() << "Multiplexed: " << mpx->getSize() << " codes, " << mpx->getMultiplexedCCs().size() << " streams\n";
         } else {
             llvm::errs() << "Not multiplexed: " << mMultiplexingFailure << "\n";
         }

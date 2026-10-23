@@ -541,6 +541,11 @@ add_test(
 set_tests_properties(reversed_lookahead_multiplexed_test PROPERTIES ENVIRONMENT "TEST_FLAGS=--re-multiplex=force")
 
 add_test(
+  NAME multiplex_auto_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 multiplex_auto_test.py ${BIN_DIR}/icgrep)
+
+add_test(
   NAME utf8_errors_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 utf8_errors_test.py ${BIN_DIR}/icgrep)

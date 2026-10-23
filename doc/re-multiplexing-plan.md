@@ -156,8 +156,9 @@ apply.
 Not multiplexed:
 - back-references and fixed-distance references, and codepoint properties
   (they compare codepoints, not classes);
-- `k` too large: more than about 12 bits, where the cost of computing the
-  basis from UTF-8 (below) exceeds decoding to `u21`;
+- `k` too large: more than `--multiplexed-stream-limit` streams (default
+  8, see "Automatic choice" below), where the cost of computing the basis
+  from UTF-8 (below) may exceed decoding to `u21`;
 - `unicodeBasisOverride`, and a new `--re-multiplex=off`.
 
 S&R with references in the replacement keeps `u21` (or UTF-8) for the output
@@ -381,8 +382,8 @@ the number of kernels and reversals that would consume the basis.
 
 - `--re-multiplex=off|on|force` (`re::Multiplexing`, default `off`, with the
   code generation options): `on` multiplexes where the RE allows it and its
-  codes need at most 12 bits (`MultiplexBitLimit`, until the cost model of
-  milestone 6); `force` wherever the RE allows it.
+  codes need at most 12 bits; `force` wherever the RE allows it. (`on` is
+  now `auto`, see "Automatic choice".)
 - `ensurePrepared`, full Unicode indexing from a UTF-8 source: the dead
   path is replaced. The codes are those of the multiplexed alphabet of the
   CCs of the RE as prepared (with the definitions of names, so with the CCs
@@ -399,7 +400,7 @@ the number of kernels and reversals that would consume the basis.
   text of a replacement (`searchReplacePipeline`; `captureSpansPipeline`
   is multiplexed), properties and boundaries compiled from the codepoints,
   references, CCs of other alphabets, names without definitions, an RE
-  without CCs, and, with `on`, codes of more than 12 bits.
+  without CCs, and, with `on` (now `auto`), codes of too many bits.
 - Comparison with `off`: with `TEST_FLAGS=--re-multiplex=force`, every test
   of the engine passes, greptest included (the 6 failures are the test
   binaries that do not link the RE options, which reject the flag). On
@@ -458,3 +459,21 @@ the number of kernels and reversals that would consume the basis.
   `reversed_lookahead_test` and `capture_spans_test` and their
   `_multiplexed` variants (anchored REs and lookbehinds matched forward
   included). The full ctest suite passes.
+
+## Automatic choice
+
+- `--re-multiplex=off|auto|force` (default still `off`): `auto` replaces
+  `on`. It multiplexes unless the RE needs the full 21-bit basis (the
+  reasons of milestone 3: references, which compare codepoints; properties
+  and boundaries compiled from the codepoints; the text of a replacement;
+  CCs of other alphabets; names without definitions; no CCs), and then only
+  if its codes need at most `--multiplexed-stream-limit` streams
+  (`re::MultiplexedStreamLimit`, default 8); otherwise the 21-bit basis is
+  used. `force` ignores the limit.
+- The decision is printed with `-ShowREs` ("Multiplexed: n codes, k
+  streams", or "Not multiplexed: " and the reason).
+- Test: `multiplex_auto_test` (`QA/multiplex_auto_test.py`, new: the
+  decisions for a small RE, the same with a limit below its streams, the
+  option off, a reference, a property, and an RE of 600 single-character
+  CCs (10 streams) with `auto` and `force`; the lines selected agree with
+  `off`; 0.2 s).

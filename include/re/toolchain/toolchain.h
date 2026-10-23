@@ -43,6 +43,14 @@ extern int IfInsertionGap;
 // expression engine (see kernel::RegionReversal): --reverse-region-limit.
 extern unsigned ReverseRegionLimit;
 
+// Whether the regular expression engine matches over the codes of a
+// multiplexed alphabet of the CCs of an RE, rather than the 21-bit Unicode
+// basis, with full Unicode indexing (see RE_PipelineBuilder::ensurePrepared):
+// --re-multiplex.  Off: never; On: where the RE allows it and its codes need
+// few bits; Force: wherever the RE allows it.
+enum class MultiplexMode {Off, On, Force};
+extern MultiplexMode Multiplexing;
+
 std::string AnnotateWithREflags(std::string name);
 
 }

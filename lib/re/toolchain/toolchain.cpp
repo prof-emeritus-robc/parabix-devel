@@ -66,6 +66,17 @@ static cl::opt<unsigned, true>
                                       "cannot match, and line breaks) that it reverses to match backward"),
                              cl::cat(codegen::CodeGenOptions));
 
+MultiplexMode Multiplexing;
+static cl::opt<MultiplexMode, true>
+    MultiplexingOption("re-multiplex", cl::location(Multiplexing), cl::init(MultiplexMode::Off),
+                       cl::desc("match over the codes of a multiplexed alphabet of the character classes of a "
+                                "regular expression, rather than the 21-bit Unicode basis"),
+                       cl::values(clEnumValN(MultiplexMode::Off, "off", "never"),
+                                  clEnumValN(MultiplexMode::On, "on", "where the regular expression allows it "
+                                             "and its codes need few bits"),
+                                  clEnumValN(MultiplexMode::Force, "force", "wherever the regular expression allows it")),
+                       cl::cat(codegen::CodeGenOptions));
+
 std::string AnnotateWithREflags(std::string name) {
     if (re::AlgorithmOptionIsSet(re::DisableMatchStar)) {
         name += "-MatchStar";

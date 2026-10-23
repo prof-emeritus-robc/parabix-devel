@@ -533,6 +533,13 @@ add_test(
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 reversed_lookahead_test.py ${BIN_DIR}/icgrep)
 
+# The same, over the codes of multiplexed alphabets where the RE allows them
+add_test(
+  NAME reversed_lookahead_multiplexed_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 reversed_lookahead_test.py ${BIN_DIR}/icgrep)
+set_tests_properties(reversed_lookahead_multiplexed_test PROPERTIES ENVIRONMENT "TEST_FLAGS=--re-multiplex=force")
+
 add_test(
   NAME ldml_trules_test
   COMMAND ${BIN_DIR}/ldml_trules --self-test)

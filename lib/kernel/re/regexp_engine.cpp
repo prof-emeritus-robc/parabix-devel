@@ -1255,6 +1255,41 @@ static bool hasAnchorAnywhere(const RE * re) {
     return false;
 }
 
+namespace {
+// The bits of the codes of a multiplexed alphabet above which the engine
+// keeps the Unicode basis with --re-multiplex=on (milestone 6 of the
+// multiplexing plan replaces it with an estimate of costs).
+const unsigned MultiplexBitLimit = 12;
+
+// What, in an RE as prepared (including the definitions of names), needs the
+// codepoints of the text rather than the classes of its CCs: properties
+// (compiled as kernels over the basis), references, CCs of other alphabets
+// and names without definitions.  The first found is reported.
+struct CodepointNeeds final : public RE_Inspector {
+    CodepointNeeds() : RE_Inspector(NameProcessingMode::ProcessDefinition, InspectionMode::IgnoreNonUnique) {}
+    void inspectName(Name * n) override {
+        if (n->getDefinition() == nullptr) {
+            need("the name " + n->getFullName() + " has no definition");
+        } else {
+            RE_Inspector::inspectName(n);
+        }
+    }
+    void inspectPropertyExpression(PropertyExpression * pe) override {
+        need("the property " + pe->getFullName() + " is compiled from the codepoints");
+    }
+    void inspectReference(Reference * r) override {
+        need("the reference " + r->getName() + " compares codepoints");
+    }
+    void inspectCC(CC * cc) override {
+        if (cc->getAlphabet() != &cc::Unicode) need("a character class of the " + cc->getAlphabet()->getName() + " alphabet");
+    }
+    void need(const std::string & reason) {
+        if (mReason.empty()) mReason = reason;
+    }
+    std::string mReason;
+};
+}
+
 void RE_PipelineBuilder::ensurePrepared(RE *& re) {
     if (mPrepared) return;
     mPrepared = true;
@@ -1362,20 +1397,53 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
         mPB.captureBitstream("mU8index", mU8Index);
     }
 
-    // Kept disabled (and dead) for now -- to be re-enabled in a future step.
-    bool useMultiplexedUnicode = false; //!mModeOptions.unicodeBasisOverride && !hasCodepointReference(re);
-    if (useMultiplexedUnicode) {
-        const auto UnicodeSets = re::collectCCs(re, *mode.indexAlphabet);
-        if (!UnicodeSets.empty()) {
-            auto mpx = cc::makeMultiplexedAlphabet("mpx", UnicodeSets);
-            re = transformCCs(mpx, re, re::NameTransformationMode::None);
-            auto mpx_basis = mpx->getMultiplexedCCs();
-            StreamSet * const u8CharClasses = mPB.CreateStreamSet(mpx_basis.size());
-            mPB.CreateKernelFamilyCall<CharClassesKernel>(mpx_basis, source, u8CharClasses);
-            StreamSet * const unicodeCCs = mPB.CreateStreamSet(mpx_basis.size());
-            FilterByMask(mPB, mU8Index, u8CharClasses, unicodeCCs);
-            mCtxt.setCodeUnitContext(mpx, unicodeCCs);
+    // The code units: the codes of a multiplexed alphabet of the CCs of the
+    // RE (including those of its assertions and the definitions of names),
+    // computed from the UTF-8 basis at the final code units of the
+    // characters, or the 21-bit Unicode basis.  The CCs of the passes of the
+    // pipelines are unions, intersections and complements of these, which
+    // the codes express (see cc::MultiplexedAlphabet::transformCC).
+    cc::MultiplexedAlphabet * mpx = nullptr;
+    if (re::Multiplexing == re::MultiplexMode::Off) {
+        mMultiplexingFailure = "multiplexing is off (--re-multiplex)";
+    } else if (mModeOptions.unicodeBasisOverride) {
+        mMultiplexingFailure = "the Unicode basis is required (unicodeBasisOverride)";
+    } else if (mNeedsCodepoints) {
+        mMultiplexingFailure = "the text of the replacement needs the codepoints";
+    } else {
+        CodepointNeeds needs;
+        needs.inspectRE(re);
+        mMultiplexingFailure = needs.mReason;
+    }
+    if (mMultiplexingFailure.empty()) {
+        mpx = cc::makeMultiplexedAlphabet("mpx", re::collectCCs(re, cc::Unicode, re::NameProcessingMode::ProcessDefinition));
+        const unsigned bits = mpx->getMultiplexedCCs().size();
+        if (bits == 0) {
+            mMultiplexingFailure = "the regular expression has no character classes";
+        } else if ((re::Multiplexing == re::MultiplexMode::On) && (bits > MultiplexBitLimit)) {
+            mMultiplexingFailure = "its codes need " + std::to_string(bits) + " bits, more than " +
+                                   std::to_string(MultiplexBitLimit);
         }
+        if (!mMultiplexingFailure.empty()) mpx = nullptr;
+    }
+    if (re::PrintOptionIsSet(re::ShowREs)) {
+        if (mpx) {
+            llvm::errs() << "Multiplexed: " << mpx->getSize() << " codes, " << mpx->getMultiplexedCCs().size() << " bits\n";
+        } else {
+            llvm::errs() << "Not multiplexed: " << mMultiplexingFailure << "\n";
+        }
+    }
+    if (mpx) {
+        const auto & mpx_basis = mpx->getMultiplexedCCs();
+        StreamSet * const u8CharClasses = mPB.CreateStreamSet(mpx_basis.size());
+        mPB.CreateKernelFamilyCall<CharClassesKernel>(mpx_basis, source, u8CharClasses);
+        StreamSet * const codes = mPB.CreateStreamSet(mpx_basis.size());
+        FilterByMask(mPB, mU8Index, u8CharClasses, codes);
+        if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
+            mPB.captureBixNum("mpxCodes", codes);
+        }
+        mCtxt.setMultiplexedCodeUnitContext(mpx, codes);
+        mMultiplexed = true;
     } else {
         StreamSet * u21_u8indexed = mPB.CreateStreamSet(21);
         mPB.CreateKernelCall<UTF8_Decoder>(source, u21_u8indexed);
@@ -3714,6 +3782,7 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     // With references, a piece may be inserted before the follow of a
     // match, which must be a position of the text: without match regions,
     // the text is extended by one.
+    mNeedsCodepoints = true;
     const SelectedMatches m = selectMatches(sr, n > 0);
     if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
         llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");

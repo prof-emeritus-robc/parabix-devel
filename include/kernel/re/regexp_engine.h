@@ -567,6 +567,10 @@ public:
     void setU8IndexHint(kernel::StreamSet * idx) {mU8IndexHint = idx;}
 
     bool usesUnicodeIndexing() const {return mUsesUnicodeIndexing;}
+    // Whether the code units are the codes of a multiplexed alphabet (see
+    // ensurePrepared), and if not, why (empty before the pipeline is built).
+    bool usesMultiplexing() const {return mMultiplexed;}
+    const std::string & multiplexingFailure() const {return mMultiplexingFailure;}
     kernel::StreamSet * getU8Index() const {return mU8Index;}
     kernel::StreamSet * getMatchStarts() const {return mFinalMatchStarts;}
     kernel::StreamSet * getMatchFollows() const {return mFinalMatchFollows;}
@@ -812,6 +816,11 @@ private:
     bool mTextExtended = false;
     // Extend the text without match regions in any case (see ensurePrepared).
     bool mExtendText = false;
+    // The pipeline needs the codepoints of the text (the text of a
+    // replacement), which a multiplexed basis does not give.
+    bool mNeedsCodepoints = false;
+    bool mMultiplexed = false;
+    std::string mMultiplexingFailure;
 };
 
 //

@@ -89,6 +89,11 @@ parabix_add_executable(NAME match_starts SRC match_starts.cpp
 add_test(NAME match_starts_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/match_starts_test.py ${TEST_BIN_DIR}/match_starts)
+# The same, over the codes of multiplexed alphabets where the RE allows them
+add_test(NAME match_starts_multiplexed_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/match_starts_test.py ${TEST_BIN_DIR}/match_starts)
+set_tests_properties(match_starts_multiplexed_test PROPERTIES ENVIRONMENT "TEST_FLAGS=--re-multiplex=force")
 
 # The boundaries of captures in a search and replace, checked with Python's re
 parabix_add_executable(NAME capture_spans SRC capture_spans.cpp
@@ -96,6 +101,10 @@ parabix_add_executable(NAME capture_spans SRC capture_spans.cpp
 add_test(NAME capture_spans_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/capture_spans_test.py ${TEST_BIN_DIR}/capture_spans)
+add_test(NAME capture_spans_multiplexed_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/capture_spans_test.py ${TEST_BIN_DIR}/capture_spans)
+set_tests_properties(capture_spans_multiplexed_test PROPERTIES ENVIRONMENT "TEST_FLAGS=--re-multiplex=force")
 
 # Regions reversed in place (kernel::RegionReversal), checked with Python
 parabix_add_executable(NAME region_reversal SRC region_reversal.cpp

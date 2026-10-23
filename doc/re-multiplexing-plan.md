@@ -376,3 +376,42 @@ the number of kernels and reversals that would consume the basis.
   classes, lookahead chains, and capture spans with walks back from the
   match ends. Each pattern must have results, and a corrupted code basis is
   detected. 0.2 s with the object cache. The full ctest suite passes.
+
+## Milestone 3 status
+
+- `--re-multiplex=off|on|force` (`re::Multiplexing`, default `off`, with the
+  code generation options): `on` multiplexes where the RE allows it and its
+  codes need at most 12 bits (`MultiplexBitLimit`, until the cost model of
+  milestone 6); `force` wherever the RE allows it.
+- `ensurePrepared`, full Unicode indexing from a UTF-8 source: the dead
+  path is replaced. The codes are those of the multiplexed alphabet of the
+  CCs of the RE as prepared (with the definitions of names, so with the CCs
+  of its assertions), computed from the UTF-8 basis at the final code
+  units of the characters (`CharClassesKernel` of the basis CCs) and
+  filtered by the UTF-8 index (`k` streams), in place of `UTF8_Decoder` and
+  the filtering of 21 streams. Every builder of the pipeline (reversal,
+  lookbehinds matched forward, lookaheads by reversal) uses these codes (see
+  milestone 2). A source already of Unicode (csvgrep, tconv) and the
+  UTF-8 modes are unchanged.
+- Not multiplexed, with the reason (`RE_PipelineBuilder::
+  multiplexingFailure`, and printed with `-ShowREs`, as is the number of
+  codes and bits otherwise): the option off, `unicodeBasisOverride`, the
+  text of a replacement (`searchReplacePipeline`; `captureSpansPipeline`
+  is multiplexed), properties and boundaries compiled from the codepoints,
+  references, CCs of other alphabets, names without definitions, an RE
+  without CCs, and, with `on`, codes of more than 12 bits.
+- Comparison with `off`: with `TEST_FLAGS=--re-multiplex=force`, every test
+  of the engine passes, greptest included (the 6 failures are the test
+  binaries that do not link the RE options, which reject the flag). On
+  random valid UTF-8 text, icgrep gives the same lines with and without
+  multiplexing.
+- **Invalid UTF-8.** The two bases can differ on invalid UTF-8. The codes
+  come from the UTF-8 classes (as in the UTF-8 modes), while the 21-bit basis
+  gives invalid sequences the values that the decoder computes. In the cases
+  examined, the multiplexed result is the consistent one. For example, on
+  the line `\xff\x80qd`, every mode matches `^...d` (each invalid byte is a
+  character of `.`), but only multiplexing also matches `.(?=..d)`.
+- Tests: `match_starts_multiplexed_test`, `capture_spans_multiplexed_test`
+  and `reversed_lookahead_multiplexed_test` run the tests of the same
+  names with `--re-multiplex=force` (each under a second with the object
+  cache). The full ctest suite passes.

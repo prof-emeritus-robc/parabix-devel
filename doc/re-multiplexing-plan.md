@@ -33,7 +33,7 @@ ends), so that
 | Piece | Where | Status |
 |---|---|---|
 | `cc::MultiplexedAlphabet` | `re/alphabet/multiplex_CCs.h`, `lib/re/adt/alphabet/multiplex_CCs.cpp` | breakpoints → exclusive sets → `k` basis CCs (`getMultiplexedCCs`); codes numbered 1, 2, … in codepoint order of first appearance |
-| `MultiplexedAlphabet::transformCC` | same | only for a CC *in the collected set* (by pointer, then by set equality); any other CC is `llvm_unreachable` |
+| `MultiplexedAlphabet::transformCC` | same | any union of exclusive sets, including code 0 (milestone 1); before, only a CC *in the collected set*, any other was `llvm_unreachable` |
 | `re::transformCCs` | `re/transforms/re_multiplex.h` | an `RE_Transformer` replacing the CCs of the source alphabet by their codes |
 | `re::collectCCs` | `lib/re/analysis/collect_ccs.cpp` | the CCs of one alphabet, optionally within the definitions of names |
 | several alphabets in one RE | `RE_Compiler::addAlphabet`, `RE_CompilerContext::addAlphabet`, `RE_Kernel` | each alphabet used by an RE is bound as `<name>_basis`; its shape is in the kernel signature; CCs print with their alphabet name (`mpx_1,3`) |
@@ -294,3 +294,36 @@ the number of kernels and reversals that would consume the basis.
 - The threshold on `k`, and whether a partition can be split: two alphabets of
   `k/2` bits each for disjoint parts of an RE, both bound to the kernel
   through `addAlphabet`.
+
+## Milestone 1 status
+
+- `cc::MultiplexedAlphabet` keeps the partition of the codepoints
+  (`getPartition`: the ranges in increasing order, each with its code,
+  covering all codepoints, code 0 included), built with the basis CCs by
+  `doMultiplexCCs`. The numbering of codes is unchanged (code 0 for the
+  codepoints of no CC, then codepoint order of first ranges), so the basis
+  CCs, and the `\b{g}` and `\b{w}` boundaries that use them, are as before.
+- `codes(s, codes)`: the codes of the exclusive sets whose union is the
+  set `s`, by a merge of the ranges of the partition with the intervals of
+  `s`. It is false if a range is partly in `s`, or if the ranges of one
+  exclusive set disagree (an exclusive set may have several ranges).
+  `expressible(s)` is the same test. `codeOf(cp)` is the code of one
+  codepoint.
+- `transformCC` takes any CC of the source alphabet that is expressible:
+  unions, intersections and complements of the collected CCs, with code 0
+  where they include the codepoints of no CC. A CC that is not expressible
+  is a fatal error naming it, in place of `llvm_unreachable`. The
+  per-CC lists of exclusive sets (`mExclusiveSetIDs`, `findTargetCCIndex`)
+  are gone.
+- `getPartitionSignature()`: the number of codes and the ranges with their
+  codes, for kernel signatures (milestone 2). It does not depend on the
+  order or the names of the CCs.
+- `getSize()` is the number of codes, code 0 included (as before). An
+  alphabet of no CCs has one code (0) for all codepoints and no basis CCs.
+  Its source alphabet defaults to Unicode (it was uninitialized).
+- Test: `multiplexed_alphabet_test` (`tests/multiplexed_alphabet.cpp`, new:
+  fixed cases of codes, unions, complements, code 0, inexpressible sets,
+  exclusive sets of several ranges, the ends of the codepoints and
+  signatures; random CCs with their unions, complements, intersections and
+  random sets checked against a direct computation of the codes from the
+  basis CCs; 0.03 s). The full ctest suite passes.

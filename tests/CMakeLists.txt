@@ -69,6 +69,13 @@ add_test(NAME re_replacement_test
     WORKING_DIRECTORY ${TEST_BIN_DIR}
     COMMAND ./re_replacement)
 
+# Multiplexed alphabets: partitions, codes and their basis (no pipeline compiled)
+parabix_add_executable(NAME multiplexed_alphabet SRC multiplexed_alphabet.cpp
+                       DEPS re.adt)
+add_test(NAME multiplexed_alphabet_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ./multiplexed_alphabet)
+
 # The MatchStarts mode of the regular expression engine, checked with Python's re
 parabix_add_executable(NAME match_starts SRC match_starts.cpp
                        DEPS kernel.re kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.util re.parse toolchain)

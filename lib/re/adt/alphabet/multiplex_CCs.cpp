@@ -3,8 +3,11 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
+#include <algorithm>
+#include <iterator>
 #include <map>
 #include <boost/dynamic_bitset.hpp>
+#include <llvm/ADT/Twine.h>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
@@ -52,14 +55,19 @@ std::map<UCD::codepoint_t, bitset> computeBreakpoints(const CC_Set & CCs) {
     return breakpoints;
 }
 
-void doMultiplexCCs(const CC_Set & CCs,
-                    std::vector<std::vector<unsigned>> & exclusiveSetIDs,
-                    CC_Set & multiplexedCCs) {
+//
+// The partition of the codepoints into the exclusive sets of the CCs, as
+// ranges with their codes (see MultiplexedAlphabet::getPartition), and the
+// basis CCs of the codes.  Code 0 is the set of codepoints in no CC; the
+// others are numbered in codepoint order of their first ranges.  Returns the
+// number of codes, including code 0.
+//
+unsigned doMultiplexCCs(const CC_Set & CCs,
+                        std::vector<std::pair<UCD::codepoint_t, unsigned>> & partition,
+                        CC_Set & multiplexedCCs) {
     
     const auto breakpoints = computeBreakpoints(CCs);
-    // Initialize the exclusiveSetIDs to have one empty vector per source CC.
-    exclusiveSetIDs.clear();
-    exclusiveSetIDs.resize(CCs.size());
+    partition.clear();
     //
     // Exclusive set determination.   
     //
@@ -69,6 +77,9 @@ void doMultiplexCCs(const CC_Set & CCs,
 
     // Entry 0 is for the characters not in any of the CCs.
     CC_set_to_exclusive_set_map.emplace(bitset(CCs.size()), 0);
+    if (breakpoints.empty() || (breakpoints.begin()->first > 0)) {
+        partition.emplace_back(0, 0);
+    }
 
     unsigned current_exclusive_set_idx = 0;
     unsigned multiplexed_bit_count = 0;
@@ -92,14 +103,9 @@ void doMultiplexCCs(const CC_Set & CCs,
         auto idx_iter = CC_set_to_exclusive_set_map.find(current_set);
         if (idx_iter == CC_set_to_exclusive_set_map.end()) {
             // New exclusive class; assign the next sequential integer.
-            //current_exclusive_set_idx = exclusiveSetIDs.size();
             current_exclusive_set_idx = next_set_index;
             next_set_index++;
             CC_set_to_exclusive_set_map.emplace(current_set, current_exclusive_set_idx);
-            
-            for (unsigned CC1 = current_set.find_first(); CC1 < CCs.size(); CC1 = current_set.find_next(CC1)) {
-                exclusiveSetIDs[CC1].push_back(current_exclusive_set_idx);
-            }
             if ((current_exclusive_set_idx & (current_exclusive_set_idx - 1)) == 0) {
                 multiplexed_bit_count++;
                 multiplexedCCs.push_back(re::makeCC());
@@ -108,58 +114,94 @@ void doMultiplexCCs(const CC_Set & CCs,
         else {
             current_exclusive_set_idx = idx_iter->second;
         }
+        partition.emplace_back(range_lo, current_exclusive_set_idx);
     }
+    return next_set_index;
 }
 
 
 
 MultiplexedAlphabet::MultiplexedAlphabet(const std::string name, const CC_Set CCs)
 : Alphabet(name, name, ClassTypeId::MultiplexedAlphabet)
+, mSourceAlphabet(&cc::Unicode)
 , mUnicodeSets(std::move(CCs)) {
     if (!mUnicodeSets.empty()) {
         mSourceAlphabet = mUnicodeSets[0]->getAlphabet();
-        for (unsigned i = 1; i < CCs.size(); i++) {
-            if (CCs[i]->getAlphabet() != mSourceAlphabet) {
+        for (unsigned i = 1; i < mUnicodeSets.size(); i++) {
+            if (mUnicodeSets[i]->getAlphabet() != mSourceAlphabet) {
                 llvm::report_fatal_error("Mismatched source alphabets for Multiplexed Alphabet");
             }
         }
     }
-    doMultiplexCCs(CCs, mExclusiveSetIDs, mMultiplexedCCs);
+    mCodeCount = doMultiplexCCs(mUnicodeSets, mPartition, mMultiplexedCCs);
+    llvm::raw_string_ostream sig(mPartitionSignature);
+    sig.write_hex(mCodeCount);
+    for (const auto & range : mPartition) {
+        sig << ',';
+        sig.write_hex(range.first);
+        sig << ':';
+        sig.write_hex(range.second);
+    }
+    sig.flush();
 }
 
-unsigned long MultiplexedAlphabet::findTargetCCIndex(const re::CC * sourceCC) const {
-    auto f = find(mUnicodeSets.begin(), mUnicodeSets.end(), sourceCC);
-    if (f != mUnicodeSets.end()) {
-        return f - mUnicodeSets.begin();
-    }
+unsigned MultiplexedAlphabet::codeOf(UCD::codepoint_t cp) const {
+    // The last range that begins at or before cp.
+    auto f = std::upper_bound(mPartition.begin(), mPartition.end(), cp,
+                              [](UCD::codepoint_t c, const std::pair<UCD::codepoint_t, unsigned> & range) {
+                                  return c < range.first;
+                              });
+    return std::prev(f)->second;
+}
 
-    const UCD::UnicodeSet* sourceUcd = sourceCC;
-    for (unsigned long i = 0; i < mUnicodeSets.size(); i++) {
-        UCD::UnicodeSet* t = mUnicodeSets[i];
-        if (*t == *sourceUcd) {
-            return i;
+bool MultiplexedAlphabet::codes(const UCD::UnicodeSet & s, std::vector<unsigned> & codes) const {
+    // Whether each code is in s (1), not in s (0), or not yet seen (-1).  An
+    // exclusive set may have several ranges, which must all agree.
+    std::vector<int> in(mCodeCount, -1);
+    auto interval = s.begin();
+    const auto end = s.end();
+    for (unsigned i = 0; i < mPartition.size(); i++) {
+        const UCD::codepoint_t lo = mPartition[i].first;
+        const UCD::codepoint_t hi = (i + 1 < mPartition.size()) ? mPartition[i + 1].first - 1 : UCD::UNICODE_MAX;
+        while ((interval != end) && (re::hi_codepoint(*interval) < lo)) ++interval;
+        int status;
+        if ((interval == end) || (re::lo_codepoint(*interval) > hi)) {
+            status = 0;
+        } else if ((re::lo_codepoint(*interval) <= lo) && (re::hi_codepoint(*interval) >= hi)) {
+            status = 1;
+        } else {
+            return false;   // the range is partly in s
         }
+        int & code = in[mPartition[i].second];
+        if ((code != -1) && (code != status)) return false;
+        code = status;
     }
-    // llvm::report_fatal_error(Printer_RE::PrintRE(sourceCC) + " not found");
-    llvm_unreachable("sourceCC not found");
+    codes.clear();
+    for (unsigned c = 0; c < mCodeCount; c++) {
+        if (in[c] == 1) codes.push_back(c);
+    }
+    return true;
+}
+
+bool MultiplexedAlphabet::expressible(const UCD::UnicodeSet & s) const {
+    std::vector<unsigned> c;
+    return codes(s, c);
 }
 
 re::CC * MultiplexedAlphabet::transformCC(const re::CC * sourceCC) const {
     if (sourceCC->getAlphabet() != mSourceAlphabet) {
         llvm::report_fatal_error("Mismatched source alphabets for transformCC");
     }
-
-    const auto index = findTargetCCIndex(sourceCC);
-    const auto exclusive_IDs = mExclusiveSetIDs[index];
-    re::CC * CC_union = re::makeCC(this);
-    for (auto i : exclusive_IDs) {
-        CC_union = re::makeCC(CC_union, re::makeCC(i, this));
+    std::vector<unsigned> c;
+    if (!codes(*sourceCC, c)) {
+        llvm::report_fatal_error(llvm::Twine("transformCC: ") + sourceCC->canonicalName() +
+                                 " is not a union of the exclusive sets of " + getName());
     }
+    UCD::UnicodeSet codeSet;
+    for (const unsigned i : c) codeSet.insert(i);
+    re::CC * CC_union = re::makeCC(std::move(codeSet), this);
     CC_union->sourceCC = sourceCC;
     return CC_union;
 }
 
-    
-
-    
 }

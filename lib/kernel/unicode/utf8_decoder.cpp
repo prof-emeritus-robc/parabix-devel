@@ -45,17 +45,6 @@ void UTF8_Decoder::generatePabloMethod() {
     //
     // Decode 2-byte UTF-8 sequences.
     PabloAST * u8pfx2 = ccc.compileCC("u8pfx2", re::makeByte(0xC0, 0xDF), level1);
-    //
-    // Unicode bits 6 through 10 are derived from bits 0 through 4 of the prefix byte.
-    //
-    PabloAST * pfx2_bit[5];
-    for (unsigned i = 0; i < 5; i++) {
-        pfx2_bit[i] = level1.createAnd(u8pfx2, UTF8_bit[i]);
-        if (mBitMovement == BitMovementMode::Advance) {
-            pfx2_bit[i] = level1.createAdvance(pfx2_bit[i], 1);
-        }
-        level1.createAssign(Unicode_bit[i+6], level1.createOr(Unicode_bit[i+6], pfx2_bit[i]));
-    }
     // The low 6 bits of the 2nd byte of a 2-byte sequence become the
     // low 6 bits of the Unicode value.
     PabloAST * suffix = nullptr;
@@ -71,6 +60,21 @@ void UTF8_Decoder::generatePabloMethod() {
     if (mBitMovement == BitMovementMode::Advance) {
         suffix = level1.createAnd(UTF8_bit[7], level1.createNot(UTF8_bit[6]));
         scope22 = level1.createAnd(suffix, level1.createAdvance(u8pfx2, 1), "scope22");
+    }
+    //
+    // Unicode bits 6 through 10 are derived from bits 0 through 4 of the prefix byte.
+    // With BitMovementMode::Advance, the bits of each byte moved forward to
+    // the final byte of its sequence are kept only where the sequence is
+    // complete (its scope): the bytes of an ill-formed sequence give no bits
+    // to the characters that follow them.
+    //
+    PabloAST * pfx2_bit[5];
+    for (unsigned i = 0; i < 5; i++) {
+        pfx2_bit[i] = level1.createAnd(u8pfx2, UTF8_bit[i]);
+        if (mBitMovement == BitMovementMode::Advance) {
+            pfx2_bit[i] = level1.createAnd(scope22, level1.createAdvance(pfx2_bit[i], 1));
+        }
+        level1.createAssign(Unicode_bit[i+6], level1.createOr(Unicode_bit[i+6], pfx2_bit[i]));
     }
     PabloAST * suffix2_bit[6];
     for (unsigned i = 0; i < 6; i++) {
@@ -88,17 +92,6 @@ void UTF8_Decoder::generatePabloMethod() {
     //
     // Decode 3-byte UTF-8 sequences.
     PabloAST * u8pfx3 = ccc.compileCC("u8pfx3", re::makeByte(0xE0, 0xEF), level2);
-    //
-    // Bits 12 through 15 are derived from bits 0 through 3 of the prefix byte.
-    //
-    PabloAST * pfx3_bit[4];
-    for (unsigned i = 0; i < 4; i++) {
-        pfx3_bit[i] = level2.createAnd(u8pfx3, UTF8_bit[i]);
-        if (mBitMovement == BitMovementMode::Advance) {
-            pfx3_bit[i] = level2.createAdvance(pfx3_bit[i], 2);
-        }
-        level2.createAssign(Unicode_bit[i+12], level2.createOr(Unicode_bit[i+12], pfx3_bit[i]));
-    }
     // The low 6 bits of the 2nd byte of a 3-byte sequence become the
     // bit 6-11 of the Unicode value, while the low 6 bits of the 3rd byte
     // become the low 6 bits of the Unicode value.
@@ -117,6 +110,17 @@ void UTF8_Decoder::generatePabloMethod() {
         scope32 = level2.createAnd(suffix, level2.createAdvance(u8pfx3, 1), "scope32");
         scope33 = level2.createAnd(suffix, level2.createAdvance(scope32, 1), "scope33");
     }
+    //
+    // Bits 12 through 15 are derived from bits 0 through 3 of the prefix byte.
+    //
+    PabloAST * pfx3_bit[4];
+    for (unsigned i = 0; i < 4; i++) {
+        pfx3_bit[i] = level2.createAnd(u8pfx3, UTF8_bit[i]);
+        if (mBitMovement == BitMovementMode::Advance) {
+            pfx3_bit[i] = level2.createAnd(scope33, level2.createAdvance(pfx3_bit[i], 2));
+        }
+        level2.createAssign(Unicode_bit[i+12], level2.createOr(Unicode_bit[i+12], pfx3_bit[i]));
+    }
     PabloAST * suffix3_bit[6];
     for (unsigned i = 0; i < 6; i++) {
         suffix3_bit[i] = UTF8_bit[i];
@@ -126,7 +130,7 @@ void UTF8_Decoder::generatePabloMethod() {
         PabloAST * sfx32bit = level2.createAnd(scope32, suffix2_bit[i]);
         PabloAST * sfx33bit = level2.createAnd(scope33, suffix3_bit[i]);
         if (mBitMovement == BitMovementMode::Advance) {
-            sfx32bit = level2.createAdvance(sfx32bit, 1);
+            sfx32bit = level2.createAnd(scope33, level2.createAdvance(sfx32bit, 1));
         }
         level2.createAssign(Unicode_bit[i+6], level2.createOr(Unicode_bit[i+6], sfx32bit));
         level2.createAssign(Unicode_bit[i], level2.createOr(Unicode_bit[i], sfx33bit));
@@ -136,17 +140,6 @@ void UTF8_Decoder::generatePabloMethod() {
     // Further nest for 4-byte sequences.
     auto level3 = level2.createScope();
     level2.createIf(u8pfx4, level3);
-    //
-    // Bits 18 through 20 are derived from bits 0 through 2 of the prefix byte.
-    //
-    PabloAST * pfx4_bit[3];
-    for (unsigned i = 0; i < 3; i++) {
-        pfx4_bit[i] = level3.createAnd(u8pfx4, UTF8_bit[i]);
-        if (mBitMovement == BitMovementMode::Advance) {
-            pfx4_bit[i] = level3.createAdvance(pfx4_bit[i], 3);
-        }
-        level3.createAssign(Unicode_bit[i+18], level3.createOr(Unicode_bit[i+18], pfx4_bit[i]));
-    }
     // The low 6 bits of the 2nd byte of a 4-byte sequence become the
     // bit 12-17 of the Unicode value, the low 6 bits of the 3rd byte
     // of a 4-byte sequence become bits 6-11 of the Unicode value,
@@ -169,6 +162,17 @@ void UTF8_Decoder::generatePabloMethod() {
         scope43 = level3.createAnd(u8pfx4, suffix3, "scope43");
         scope44 = level3.createAnd(u8pfx4, suffix4, "scope44");
     }
+    //
+    // Bits 18 through 20 are derived from bits 0 through 2 of the prefix byte.
+    //
+    PabloAST * pfx4_bit[3];
+    for (unsigned i = 0; i < 3; i++) {
+        pfx4_bit[i] = level3.createAnd(u8pfx4, UTF8_bit[i]);
+        if (mBitMovement == BitMovementMode::Advance) {
+            pfx4_bit[i] = level3.createAnd(scope44, level3.createAdvance(pfx4_bit[i], 3));
+        }
+        level3.createAssign(Unicode_bit[i+18], level3.createOr(Unicode_bit[i+18], pfx4_bit[i]));
+    }
     PabloAST * suffix4_bit[6];
     for (unsigned i = 0; i < 6; i++) {
         suffix4_bit[i] = UTF8_bit[i];
@@ -179,8 +183,8 @@ void UTF8_Decoder::generatePabloMethod() {
         PabloAST * sfx43bit = level3.createAnd(scope43, suffix3_bit[i]);
         PabloAST * sfx44bit = level3.createAnd(scope44, suffix4_bit[i]);
         if (mBitMovement == BitMovementMode::Advance) {
-            sfx42bit = level3.createAdvance(sfx42bit, 2);
-            sfx43bit = level3.createAdvance(sfx43bit, 1);
+            sfx42bit = level3.createAnd(scope44, level3.createAdvance(sfx42bit, 2));
+            sfx43bit = level3.createAnd(scope44, level3.createAdvance(sfx43bit, 1));
         }
         level3.createAssign(Unicode_bit[i+12], level3.createOr(Unicode_bit[i+12], sfx42bit));
         level3.createAssign(Unicode_bit[i+6], level3.createOr(Unicode_bit[i+6], sfx43bit));

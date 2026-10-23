@@ -4,7 +4,8 @@
 #
 #  The MatchStarts mode of the regular expression engine (see match_starts.cpp),
 #  compared with Python's re: within each line, a match starts at the
-#  positions p at which re.match(line, p) succeeds.  For a lookbehind of
+#  positions p at which re.match(line, p) succeeds (or within the whole
+#  text, without match regions).  For a lookbehind of
 #  variable length, which Python does not support, the Python pattern is a
 #  triple (B, sense, R): a match of (?<=B)R or (?<!B)R starts at p if B does
 #  (or does not) match the line up to p and R matches at p.
@@ -92,7 +93,21 @@ GROUPS = [
 ]
 
 
-def reference(pattern, text, unicode_mode):
+# Without match regions (-noregions): the text as a whole, ending without a
+# line break, so that a region between barriers ends at the end of the text.
+NOREGIONS_TEXT = "xabc xbc\nxac xaac\nzbbc qc xbc"
+
+NOREGIONS_GROUPS = [
+    [   # lookaheads by reversal whose reversed REs have negative lookaheads:
+        # the reversed text alone extended
+        ("x(?=(?:a*b)*(?<!a)c)", "x(?=(?:a*b)*(?<!a)c)"),
+        ("[a-z](?=(?:a*b)*(?<!a)c)", "[a-z](?=(?:a*b)*(?<!a)c)"),
+        ("x(?=(?:a*b)*c)", "x(?=(?:a*b)*c)"),
+    ],
+]
+
+
+def reference(pattern, text, unicode_mode, regions=True):
     if isinstance(pattern, tuple):
         behind, sense, rest = pattern
         bx = re.compile("(?:%s)\\Z" % behind)
@@ -104,7 +119,7 @@ def reference(pattern, text, unicode_mode):
     data = text.encode("utf-8")
     marks = set()
     offset = 0
-    for line in text.split("\n")[:-1]:
+    for line in (text.split("\n")[:-1] if regions else [text]):
         positions = []      # byte position of each character, and of the line end
         pos = offset
         for ch in line:
@@ -118,19 +133,20 @@ def reference(pattern, text, unicode_mode):
                 else:
                     marks.add(positions[p])
         offset = pos + 1
-    assert offset == len(data)
+    assert offset == len(data) + (0 if regions else 1)
     return marks
 
 
 def main():
     tool = sys.argv[1]
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "input.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(TEXT)
         failures = 0
-        for group in GROUPS:
-            args = [tool]
+        runs = [(group, TEXT, True) for group in GROUPS] + [(group, NOREGIONS_TEXT, False) for group in NOREGIONS_GROUPS]
+        for n, (group, text, regions) in enumerate(runs):
+            path = os.path.join(tmp, "input%d.txt" % n)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            args = [tool] + ([] if regions else ["-noregions"])
             for parabix, _ in group:
                 args += ["-e", parabix]
             args.append(path)
@@ -147,7 +163,7 @@ def main():
                 out = out[nl + 1:]
             for i, (parabix, python) in enumerate(group):
                 got = {p for p, b in enumerate(out) if b & (1 << i)}
-                expected = reference(python, TEXT, modes[i] == "unicode")
+                expected = reference(python, text, modes[i] == "unicode", regions)
                 if got != expected:
                     failures += 1
                     print("FAIL %s (%s): missing %s, extra %s"

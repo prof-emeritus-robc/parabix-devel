@@ -980,11 +980,8 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   negated for a negative lookbehind). The same naming is applied to the
   reversed RE of the preconditions (`reversalFailure`). This replaces the
   nested reversal of `(?<=c(?:a*b)*)(?:a*b)*d`, and compiles lookaheads with
-  such lookbehinds within, such as `x(?=[a-c]*(?<=c(?:a*b)*)d)`. A negative
-  lookbehind still extends a text without regions (its lookahead holds at
-  the ends of the reversed regions, at the end of the text), so
-  `x(?=(?:a*b)*(?<!a)c)` remains unsupported; each lookbehind matched forward
-  has its own reversal kernel.
+  such lookbehinds within, such as `x(?=[a-c]*(?<=c(?:a*b)*)d)`. Each
+  lookbehind matched forward has its own reversal kernel.
 - Capture boundaries by a walk back from the end of the match, meeting the
   forward walk in the middle (U3 relaxed): where the forward walk stops (at
   an item that is neither of fixed length nor a maximal run) and the items
@@ -1024,6 +1021,21 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   (an End of the reversed RE) is still not reversed, as it would extend the
   text. Examples now supported: starts of `(?:a*b)*c$`, `^(?:a*b)*c`,
   `(?:[a-z]+@)+[a-z]+$`; `x(?=(?:a*b)*c$)`.
+- Negative lookbehinds without extending the text: a negative lookbehind of
+  an RE matched by reversal is a negative lookahead of the reversed RE,
+  which holds at the end of the text, where the matches that end with it
+  are marked (one past the last character). Without match regions, the
+  backward pass alone now extends its (reversed) text by one position, as
+  `ensurePrepared` does, with the externals given to it (the lookbehinds
+  matched forward) extended likewise (`ExtendByOne`); its ends, shifted back
+  by the offset, are filtered to the positions of the text
+  (`TextPositionsMask`, `FilterByMask`) before they are reversed back. The
+  text of the forward pass is unchanged, so lookaheads by reversal no
+  longer exclude negative lookbehinds within them: `x(?=(?:a*b)*(?<!a)c)`,
+  and `x(?=[a-d]*(?<!c(?:a*b)*)d)` (matched forward). Still excluded within a
+  lookahead: a `Start` anchor (an `End` of the reversed RE), whose reversed
+  anchors need the regions of the text (`x(?=(?:a*b)*(?<=^x[ab]*)c)`). The
+  public MatchStarts mode still extends the text for such REs, as before.
 - Tests: `region_reversal_test` (`tests/region_reversal.cpp`,
   `region_reversal_test.py`, new: regions of lines, of barrier characters,
   without line regions, across the strides and segments of the pipeline, and
@@ -1041,7 +1053,10 @@ to clients, and the pipeline methods treat precondition failures as fatal.
   `re_replacement_test` (the planned walks) and `re_preconditions_test`
   (with and without reversal); anchored REs by reversal in
   `match_starts_test` (a group of six) and `reversed_lookahead_test` (two),
-  and in `re_preconditions_test`. greptest passes.
+  and in `re_preconditions_test`; a group without match regions in
+  `match_starts_test` (`match_starts -noregions`, a text ending without a
+  line break), the negative lookbehind in `reversed_lookahead_test` (no
+  longer rejected) and `re_preconditions_test`. greptest passes.
 - Next: reversal of only the streams the reversed RE needs (rather than the
   21-bit basis), with the lookbehinds matched forward, one reversal shared by
   the uses of a pipeline,

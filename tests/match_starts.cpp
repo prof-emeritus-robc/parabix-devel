@@ -36,6 +36,7 @@ using namespace kernel;
 static cl::OptionCategory matchStartsOptions("match_starts Options", "match_starts options.");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(matchStartsOptions));
 static cl::list<std::string> patterns("e", cl::desc("A regular expression (up to 8)"), cl::OneOrMore, cl::cat(matchStartsOptions));
+static cl::opt<bool> noRegions("noregions", cl::desc("The text as a whole, without line regions"), cl::cat(matchStartsOptions));
 
 typedef void (*MatchStartsFunctionType)(uint32_t fd);
 
@@ -82,8 +83,9 @@ int main(int argc, char * argv[]) {
         RE_ModeOptions opts;
         opts.goal = re::RE_Goal::MatchStarts;
         const PreparedRE prepared = prepareRE(re::RE_Parser::parse(pattern), opts);
-        RE_PipelineBuilder engine(P, RE_context{&cc::UTF8, basis, lineStarts, breaks});
-        engine.setLineBreakStream(breaks);
+        RE_PipelineBuilder engine(P, noRegions ? RE_context{&cc::UTF8, basis}
+                                               : RE_context{&cc::UTF8, basis, lineStarts, breaks});
+        if (!noRegions) engine.setLineBreakStream(breaks);
         StreamSet * starts = P.CreateStreamSet(1);
         engine.matchStartsPipeline(prepared, starts);
         if (engine.usesUnicodeIndexing()) {

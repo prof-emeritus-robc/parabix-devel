@@ -1160,6 +1160,32 @@ static bool hasEndAnchorAnywhere(const RE * re) {
     return false;
 }
 
+// Does the RE have End anchors anywhere (including within assertions and
+// the definitions of names)?
+static bool hasEndAnywhere(const RE * re) {
+    if (isa<End>(re)) return true;
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (hasEndAnywhere(e)) return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (hasEndAnywhere(e)) return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        return hasEndAnywhere(rep->getRE());
+    } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
+        return hasEndAnywhere(a->getAsserted());
+    } else if (const Diff * d = dyn_cast<Diff>(re)) {
+        return hasEndAnywhere(d->getLH()) || hasEndAnywhere(d->getRH());
+    } else if (const re::Intersect * x = dyn_cast<re::Intersect>(re)) {
+        return hasEndAnywhere(x->getLH()) || hasEndAnywhere(x->getRH());
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        return hasEndAnywhere(c->getCapturedRE());
+    } else if (const Group * g = dyn_cast<Group>(re)) {
+        return hasEndAnywhere(g->getRE());
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() && hasEndAnywhere(n->getDefinition());
+    }
+    return false;
+}
+
 // Does the RE have Start or End anchors anywhere (including within
 // assertions and the definitions of names)?
 static bool hasAnchorAnywhere(const RE * re) {
@@ -2301,6 +2327,20 @@ StreamSet * RE_PipelineBuilder::reversalBarriers(RE * re) {
 }
 
 namespace {
+// The positions of a text, without the position it is extended by (see
+// ExtendByOne): a mask of one more position than the source, all but the
+// last set.
+class TextPositionsMask final : public pablo::PabloKernel {
+public:
+    TextPositionsMask(LLVMTypeSystemInterface & ts, StreamSet * Source, StreamSet * Mask)
+    : PabloKernel(ts, "TextPositionsMask", {Binding{"Source", Source}}, {Binding{"Mask", Mask, FixedRate(), Add1()}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        writeOutputStreamSet("Mask", std::vector<PabloAST *>{pb.createNot(pb.createAtEOF(pb.createOnes()))});
+    }
+};
+
 // The names of the anchors of a reversed RE (see ReversedAnchorNamer).
 const std::string ReversedStartName = "^rev";
 const std::string ReversedEndName = "$rev";
@@ -2396,6 +2436,19 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
     RE * const named = nameForwardLookbehinds(re, lookbehinds);
     PreparedRE reversed = prepareRE(reverse(named), opts);
     RE_PipelineBuilder backward(mPB, RE_context{&cc::Unicode, reversedText, mCtxt.mMatchStarts, mCtxt.mMatchFollows});
+    // Without match regions, the reversed text is extended by one position
+    // (and made one region) if the reversed RE refers to its end: for a
+    // negative lookahead (a negative lookbehind of the RE), which holds at
+    // the end, and for the matches whose ends are then marked there (see
+    // ensurePrepared).  The externals given to it are extended with it, and
+    // the extension is removed from its results.
+    const bool extended = (mCtxt.mMatchStarts == nullptr) && hasEndAnchorAnywhere(reversed.re);
+    auto extendedExternal = [&](StreamSet * s) {
+        if (!extended) return s;
+        StreamSet * const x = mPB.CreateStreamSet(s->getNumElements(), 1);
+        mPB.CreateKernelCall<ExtendByOne>(s, x);
+        return x;
+    };
     // The anchors of the reversed RE: the Start and End of the regions of
     // the text reversed (the barriers that are not region follows divide
     // them), as zero-width externals.  (A text without regions is extended,
@@ -2432,18 +2485,29 @@ void RE_PipelineBuilder::reversedStarts(RE * re, StreamSet * starts) {
             mPB.CreateKernelCall<ShiftBack>(lbEnds, shifted, offset);
             lbEnds = shifted;
         }
-        StreamSet * const marks = mPB.CreateStreamSet(1);
+        StreamSet * marks = mPB.CreateStreamSet(1);
         mPB.CreateKernelCall<RegionReversal>(barriers, lbEnds, marks, ReverseRegionLimit);
+        marks = extendedExternal(marks);
         backward.addExternal(lb.first->getFullName(),
                              ExternalStream{ExternalStreamKind::StartIndexed, 1, getLengthRange(asserted, &cc::Unicode),
                                             marks, lb.second->getSense() == Assertion::Sense::Negative});
     }
     StreamSet * ends = mPB.CreateStreamSet(1);
     backward.matchSearchPipeline(reversed, ends);
+    assert(backward.mTextExtended == extended);
     if (const unsigned offset = reversed.grepOffset()) {
         StreamSet * const shifted = mPB.CreateStreamSet(1);
         mPB.CreateKernelCall<ShiftBack>(ends, shifted, offset);
         ends = shifted;
+    }
+    if (extended) {
+        // (A match marked at the extension, past the last character, is at
+        // that character once shifted back by the offset.)
+        StreamSet * const mask = mPB.CreateStreamSet(1);
+        mPB.CreateKernelCall<TextPositionsMask>(reversedText, mask);
+        StreamSet * const inText = mPB.CreateStreamSet(1);
+        FilterByMask(mPB, mask, ends, inText);
+        ends = inText;
     }
     mPB.CreateKernelCall<RegionReversal>(barriers, ends, starts, ReverseRegionLimit);
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
@@ -2642,18 +2706,20 @@ namespace {
 // position a character).  The RE must not match the empty string (an empty
 // match is between positions, which reversal does not map to a start).  Its
 // anchors are those of the regions of the text, reversed (see
-// ReversedAnchors).  Unless extensible (the text of the reversal may be
-// extended, see matchStartsPipeline), the reversed RE, with the lookbehinds
-// matched forward (see ForwardLookbehindNamer), must not refer to the end of
-// the text.
+// ReversedAnchors), which requires match regions: unless extensible (the
+// text of the reversal may be extended and given its own region, see
+// matchStartsPipeline), the RE must not have a Start anchor (an End anchor
+// of the reversed RE, for which the text would not be extended).  (A
+// reversed RE that refers to the end of the text otherwise, by a negative
+// lookahead, extends the reversed text alone, see reversedStarts.)
 std::string reversalFailure(RE * re, const cc::Alphabet * codeUnitAlphabet, bool extensible = true) {
     if (codeUnitAlphabet != &cc::Unicode) return "it requires full Unicode indexing";
     if (getLengthRange(re, &cc::Unicode).first == 0) return "the RE can match the empty string";
     std::vector<std::pair<Name *, Assertion *>> lookbehinds;
     RE * const named = nameForwardLookbehinds(re, lookbehinds);
-    if (!extensible && hasEndAnchorAnywhere(reverse(named))) {
-        return "the reversed RE refers to the end of the text (a Start anchor or a negative lookbehind of the RE), "
-               "for which the text would be extended";
+    if (!extensible && hasEndAnywhere(reverse(named))) {
+        return "the reversed RE has an End anchor (a Start anchor of the RE), which requires the text to be "
+               "extended, and given its own region";
     }
     RE_ModeOptions opts;
     opts.goal = RE_Goal::MatchEnds;

@@ -35,11 +35,12 @@ PATTERNS = [
     # anchored (the end of the line, in the regions between barriers reversed)
     "x(?=(?:a*b)*c$)",
     "x(?![a-d]*(?:ab|c)+$)",
+    # a negative lookbehind within (a negative lookahead of the reversed RE)
+    "x(?=(?:a*b)*(?<!a)c)",
 ]
 
 # (pattern, text, a part of the expected error)
 REJECTED = [
-    ("x(?=(?:a*b)*(?<!a)c)", "xabc\n", "not by reversal"),    # reversed: a negative lookahead
     ("x(?=(?:a*b)*c)", "x" + "ab" * 800 + "c\n", "reverse-region-limit"),
 ]
 

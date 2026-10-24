@@ -128,8 +128,13 @@ void RE_Inspector::inspectInterleavable(Interleavable * s) {
     }
 }
 
-// A String is inspected as the Seq of its singleton CCs.
 void RE_Inspector::inspectString(String * s) {
+}
+
+void RE_Inspector::inspectStringAsCCs(String * s) {
+    for (const char32_t c : *s) {
+        inspect(makeCC(c));
+    }
 }
 
 void RE_Inspector::inspectPropertyExpression(PropertyExpression * pe) {

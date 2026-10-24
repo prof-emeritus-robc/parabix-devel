@@ -50,6 +50,8 @@ protected:
     virtual bool validatePermute(const Permute * pe);
     virtual bool validateInterleavable(const Interleavable * s);
     virtual bool validateString(const String * s);
+    // Validate a String as the Seq of its singleton Unicode CCs.
+    bool validateStringAsCCs(const String * s);
     virtual bool validatePropertyExpression(const PropertyExpression * pe);
 private:
     std::string mValidatorName;

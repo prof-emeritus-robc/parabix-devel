@@ -232,6 +232,24 @@ RE * RE_Transformer::transformString(String * s) {
     return s;
 }
 
+// The String is kept unless some CC is changed, in which case the result is
+// the Seq of the transformed CCs.  A memoizing transformer may return an
+// equal CC from its cache, so changes are detected by RE equality.
+RE * RE_Transformer::transformStringAsSeq(String * s) {
+    SmallVector<RE *, 16> elems;
+    elems.reserve(s->size());
+    bool any_changed = false;
+    MemoizerComparator lessThan;
+    for (const char32_t c : *s) {
+        RE * const e = makeCC(c);
+        RE * e1 = transform(e);
+        if ((e1 != e) && (lessThan(e, e1) || lessThan(e1, e))) any_changed = true;
+        elems.push_back(e1);
+    }
+    if (!any_changed) return s;
+    return makeSeq(elems.begin(), elems.end());
+}
+
 RE * RE_Transformer::transformPropertyExpression(PropertyExpression * pe) {
     RE * const defn = pe->getResolvedRE();
     if (LLVM_UNLIKELY(defn == nullptr)) return pe;

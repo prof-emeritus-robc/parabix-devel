@@ -43,6 +43,8 @@ protected:
     virtual RE * transformPermute(Permute * p);
     virtual RE * transformInterleavable(Interleavable * s);
     virtual RE * transformString(String * s);
+    // Transform a String as the Seq of its singleton Unicode CCs.
+    RE * transformStringAsSeq(String * s);
     virtual RE * transformPropertyExpression(PropertyExpression * pe);
     virtual void showProcessing();
 protected:

@@ -40,6 +40,10 @@ struct CC_Collector final : public RE_Inspector {
         }
     }
 
+    void inspectString(String * s) final {
+        inspectStringAsCCs(s);
+    }
+
     CC * mUnionCC;
 };
 
@@ -62,6 +66,10 @@ struct SetCollector final : public RE_Inspector {
         if (LLVM_LIKELY(cc->getAlphabet() == alphabet)) {
             ccs.push_back(cc);
         }
+    }
+
+    void inspectString(String * s) final {
+        if (alphabet == &cc::Unicode) inspectStringAsCCs(s);
     }
 
 private:

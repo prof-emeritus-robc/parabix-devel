@@ -14,6 +14,7 @@
 #include <re/analysis/re_analysis.h>
 #include <re/transforms/re_transformer.h>
 #include <kernel/core/kernel.h>
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <re/printer/re_printer.h>
@@ -55,6 +56,14 @@ RE * VariableLengthCCNamer::transformCC (CC * cc) {
         return createName(cc->canonicalName(), cc);
     }
     return cc;
+}
+
+// Singleton CCs are of one encoded length: only U+FFFD may be named.
+RE * VariableLengthCCNamer::transformString (String * s) {
+    if (mReplacementChar && (std::find(s->begin(), s->end(), 0xFFFD) != s->end())) {
+        return transformStringAsSeq(s);
+    }
+    return s;
 }
 
 FixedSpanNamer::FixedSpanNamer(const cc::Alphabet * a) : NameIntroduction("FixedSpanNamer"), mAlphabet(a), mLgthPrefix("len") {}

@@ -141,6 +141,13 @@ bool RE_Validator::validateString(const String * s) {
     return true;
 }
 
+bool RE_Validator::validateStringAsCCs(const String * s) {
+    for (const char32_t c : *s) {
+        if (!validate(makeCC(c))) return false;
+    }
+    return true;
+}
+
 bool RE_Validator::validatePropertyExpression(const PropertyExpression * pe) {
     if (mNameMode == NameProcessingMode::None) return true;
     RE * const d = pe->getResolvedRE();
@@ -160,6 +167,8 @@ public:
     AlphabetValidator(const cc::Alphabet * a) : RE_Validator("AlphabetValidator"), mAlphabet(a) {}
     
     bool validateCC(const CC * cc) override {return cc->getAlphabet() == mAlphabet;}
+    // The CCs of a String are Unicode CCs.
+    bool validateString(const String * s) override {return s->empty() || (mAlphabet == &cc::Unicode);}
 private:
     const cc::Alphabet * mAlphabet;
 };

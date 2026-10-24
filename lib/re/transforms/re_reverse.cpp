@@ -74,6 +74,11 @@ public:
         }
         return makeSeq(list.begin(), list.end());
     }
+    // A String is the Seq of its singleton CCs, reversed as a Seq.
+    RE * transformString (String * s) override {
+        if (s->size() <= 1) return s;
+        return makeString(std::u32string(s->getString().rbegin(), s->getString().rend()));
+    }
     RE * transformStart (Start *) override { return makeEnd();}
     RE * transformEnd (End *) override { return makeStart();}
     RE * transformAssertion (Assertion * a) override {

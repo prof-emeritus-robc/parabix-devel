@@ -76,6 +76,12 @@ public:
         return rg;
     }
     
+    // A String is the Seq of its singleton CCs: single chars.
+    RE * transformString(String * s) override {
+        if (mGraphemeMode && !s->empty()) return makeSeq({s, mGCB});
+        return s;
+    }
+    
     RE * transformGroup(Group * g) override {
         if (g->getMode() == Group::Mode::GraphemeMode) {
             RE * r = g->getRE();
@@ -94,12 +100,18 @@ public:
         bool afterSingleChar = false;
         bool changed = false;
         for (auto i = seq->begin(); i != seq->end(); ++i) {
-            bool atSingleChar = isa<CC>(*i) && (cast<CC>(*i)->count() == 1);
+            // The CCs of a String are single chars within the sequence; an
+            // empty String has none.
+            if (isa<String>(*i) && cast<String>(*i)->empty()) {
+                list.push_back(*i);
+                continue;
+            }
+            bool atSingleChar = (isa<CC>(*i) && (cast<CC>(*i)->count() == 1)) || isa<String>(*i);
             if (afterSingleChar && mGraphemeMode && !atSingleChar) {
                 list.push_back(mGCB);
                 changed = true;
             }
-            if (isa<CC>(*i)) {
+            if (isa<CC>(*i) || isa<String>(*i)) {
                 list.push_back(*i);
             } else {
                 RE * t = transform(*i);

@@ -187,7 +187,7 @@ CC * variableCodepoints(RE * re) {
     } else if (Reference * r = dyn_cast<Reference>(re)) {
         return variableCodepoints(r->getCapture());
     } else if (isa<Any, Assertion, CC, Range, End, PropertyExpression, Start,
-                   Permute, Interleavable>(re)) {
+                   Permute, Interleavable, String>(re)) {
         // Other expressions are all singleCCs, not variable.
         return makeCC();
     }
@@ -209,6 +209,12 @@ unsigned fixedCodepointCount(RE * re, CC * variableCC) {
     } else if (Seq * seq = dyn_cast<Seq>(re)) {
         for (RE * e : *seq) {
             countSoFar += fixedCodepointCount(e, variableCC);
+        }
+        return countSoFar;
+    } else if (String * s = dyn_cast<String>(re)) {
+        // The Seq of its singleton CCs.
+        for (const char32_t c : *s) {
+            if (!variableCC->contains(c)) countSoFar++;
         }
         return countSoFar;
     } else if (Rep * rep = dyn_cast<Rep>(re)) {

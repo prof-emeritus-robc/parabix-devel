@@ -149,8 +149,8 @@ private:
         return makeSeq(result.begin(), result.end());
     }
 
-    // The elements of r as a sequence, seeing through nested sequences and
-    // single alternatives.
+    // The elements of r as a sequence, seeing through nested sequences, Strings
+    // (sequences of singleton CCs) and single alternatives.
     static void flatten(RE * r, std::vector<RE *> & elems) {
         if (Alt * alt = dyn_cast<Alt>(r)) {
             if (alt->size() == 1) {
@@ -160,6 +160,11 @@ private:
         } else if (Seq * seq = dyn_cast<Seq>(r)) {
             for (RE * e : *seq) {
                 flatten(e, elems);
+            }
+            return;
+        } else if (String * s = dyn_cast<String>(r)) {
+            for (const char32_t c : *s) {
+                elems.push_back(makeCC(c));
             }
             return;
         }
@@ -266,6 +271,10 @@ RE * foldTrailingLookaheads(RE * re, const cc::Alphabet * lengthAlphabet) {
         elems.assign(seq->begin(), seq->end());
     } else {
         elems.push_back(re);
+    }
+    // (Empty Strings have no items: the last item precedes them.)
+    while (!elems.empty() && isa<String>(elems.back()) && cast<String>(elems.back())->empty()) {
+        elems.pop_back();
     }
     if (elems.empty()) return re;
     Assertion * const a = dyn_cast<Assertion>(elems.back());

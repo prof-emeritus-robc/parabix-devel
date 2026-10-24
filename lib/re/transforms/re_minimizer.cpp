@@ -128,8 +128,13 @@ protected:
                         if (LLVM_LIKELY(isa<Seq>(re))) {
                             Seq * const seq = cast<Seq>(re);
                             if (LLVM_LIKELY(seq->size() > 1)) {
-                                assert (head == seq->front());
+                                assert (head == headOf(seq));
                                 tailSet.insert(transform(tailOf(seq)));
+                                continue;
+                            }
+                        } else if (String * const s = dyn_cast<String>(re)) {
+                            if (s->size() > 1) {
+                                tailSet.insert(transform(makeString(std::u32string(s->begin() + 1, s->end()))));
                                 continue;
                             }
                         } else if (LLVM_UNLIKELY(isa<Rep>(re))) {
@@ -180,8 +185,13 @@ protected:
                         if (LLVM_LIKELY(isa<Seq>(re))) {
                             Seq * const seq = cast<Seq>(re);
                             if (LLVM_LIKELY(seq->size() > 1)) {
-                                assert (last == seq->back());
+                                assert (last == lastOf(seq));
                                 initSet.insert(transform(initOf(seq)));
+                                continue;
+                            }
+                        } else if (String * const s = dyn_cast<String>(re)) {
+                            if (s->size() > 1) {
+                                initSet.insert(transform(makeString(std::u32string(s->begin(), s->end() - 1))));
                                 continue;
                             }
                         } else if (LLVM_UNLIKELY(isa<Rep>(re))) {
@@ -251,11 +261,19 @@ protected:
         return makeRep(re->getRE(), lb, ub);
     }
 
-    static RE * headOf(RE * const re) {
+    // A String is the Seq of its singleton CCs: its head (or last item) is its
+    // first (or last) CC, memoized so that equal heads are the same RE.
+
+    RE * headOf(RE * const re) {
         if (Seq * seq = dyn_cast<Seq>(re)) {
             if (LLVM_LIKELY(!seq->empty())) {
+                if (String * const s = dyn_cast<String>(seq->front())) {
+                    if (!s->empty()) return transform(makeCC((*s)[0]));
+                }
                 return seq->front();
             }
+        } else if (String * const s = dyn_cast<String>(re)) {
+            if (!s->empty()) return transform(makeCC((*s)[0]));
         } else if (Rep * const rep = dyn_cast<Rep>(re)) {
             if (rep->getLB() > 0) {
                 return rep->getRE();
@@ -265,14 +283,26 @@ protected:
     }
 
     static RE * tailOf(Seq * const seq) {
+        if (String * const s = dyn_cast<String>(seq->front())) {
+            if (s->size() > 1) {
+                List items{makeString(std::u32string(s->begin() + 1, s->end()))};
+                items.insert(items.end(), seq->begin() + 1, seq->end());
+                return makeSeq(items.begin(), items.end());
+            }
+        }
         return makeSeq(seq->begin() + 1, seq->end());
     }
 
-    static RE * lastOf(RE * const re) {
+    RE * lastOf(RE * const re) {
         if (Seq * seq = dyn_cast<Seq>(re)) {
             if (LLVM_LIKELY(!seq->empty())) {
+                if (String * const s = dyn_cast<String>(seq->back())) {
+                    if (!s->empty()) return transform(makeCC((*s)[s->size() - 1]));
+                }
                 return seq->back();
             }
+        } else if (String * const s = dyn_cast<String>(re)) {
+            if (!s->empty()) return transform(makeCC((*s)[s->size() - 1]));
         } else if (Rep * const rep = dyn_cast<Rep>(re)) {
             if (rep->getLB() > 0) {
                 return rep->getRE();
@@ -282,6 +312,13 @@ protected:
     }
 
     static RE * initOf(Seq * const seq) {
+        if (String * const s = dyn_cast<String>(seq->back())) {
+            if (s->size() > 1) {
+                List items(seq->begin(), seq->end() - 1);
+                items.push_back(makeString(std::u32string(s->begin(), s->end() - 1)));
+                return makeSeq(items.begin(), items.end());
+            }
+        }
         return makeSeq(seq->begin(), seq->end() - 1);
     }
 

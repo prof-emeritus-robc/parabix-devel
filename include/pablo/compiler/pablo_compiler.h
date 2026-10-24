@@ -43,6 +43,10 @@ protected:
 
     void compile(KernelBuilder & b);
 
+    // Compile the kernel logic to reprocess a stride before the segment, rebuilding
+    // the carries: outputs are written to scratch memory rather than the output buffers.
+    void compileCarryRebuild(KernelBuilder & b);
+
     void releaseKernelData(KernelBuilder & b);
 
     void clearCarryData(KernelBuilder & b);
@@ -69,6 +73,8 @@ private:
 
     llvm::Value * compileExpression(KernelBuilder & b, const PabloAST * expr, const bool ensureLoaded = true);
 
+    llvm::Value * getCarryRebuildScratchPtr(KernelBuilder & b, const Var * var, llvm::Value * index1, llvm::Value * index2);
+
     static void dumpValueToConsole(KernelBuilder & b, const PabloAST * expr, llvm::Value * value);
 
 private:
@@ -81,6 +87,8 @@ private:
     llvm::BasicBlock *                  mEntryBlock;
     std::vector<llvm::BasicBlock *>     mBasicBlock;
     llvm::SmallVector<const While *, 0> mContainsIllustratedValue;
+    bool                                mRebuildingCarries = false;
+    std::unordered_map<const Var *, llvm::Value *> mCarryRebuildScratch;
 };
 
 }

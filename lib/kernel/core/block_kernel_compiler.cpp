@@ -34,6 +34,11 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
         validateProvisionalLookAheadStride(b);
     }
 
+    const auto rebuildStrides = TARGET->getCarryRebuildStrides();
+    if (LLVM_UNLIKELY(rebuildStrides > 0)) {
+        writeCarryRebuild(b, rebuildStrides);
+    }
+
     BasicBlock * const entryBlock = b.GetInsertBlock();
     mStrideLoopBody = b.CreateBasicBlock(getName() + "_strideLoopBody");
 
@@ -147,6 +152,72 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
     }
 
 
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief writeCarryRebuild
+ *
+ * Reprocess up to the given number of strides before the segment, so that a kernel whose
+ * carries start each segment zeroed has the carries of the prior segment.  The processed item counts of the inputs are moved back to each
+ * stride in turn and then restored.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void BlockKernelCompiler::writeCarryRebuild(KernelBuilder & b, const unsigned strides) {
+
+    const auto stride = mTarget->getStride();
+    const auto & inputs = getInputStreamSetBindings();
+    const auto n = inputs.size();
+    assert (n > 0);
+
+    SmallVector<Value *, 8> initial(n);
+    SmallVector<uint64_t, 8> itemsPerStride(n);
+    unsigned principal = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const Binding & input = inputs[i];
+        if (LLVM_UNLIKELY(!input.getRate().isFixed() || input.isDeferred())) {
+            report_fatal_error(StringRef(getName() + ": rebuilding carries requires Fixed rate inputs"));
+        }
+        initial[i] = b.getProcessedItemCount(input.getName());
+        itemsPerStride[i] = ceiling(getUpperBound(input) * stride);
+        if (input.isPrincipal()) {
+            principal = i;
+        }
+    }
+
+    BasicBlock * const rebuildLoop = b.CreateBasicBlock(getName() + "_rebuildCarriesLoop");
+    BasicBlock * const rebuildStride = b.CreateBasicBlock(getName() + "_rebuildCarriesStride");
+    BasicBlock * const rebuildExit = b.CreateBasicBlock(getName() + "_rebuildCarriesExit");
+    BasicBlock * const rebuildDone = b.CreateBasicBlock(getName() + "_rebuildCarriesDone");
+
+    // Fewer strides precede a segment near the start of the stream, which begins with zeroed carries.
+    BasicBlock * const entry = b.GetInsertBlock();
+    Value * const available = b.CreateUDiv(initial[principal], b.getSize(itemsPerStride[principal]));
+    Value * const count = b.CreateUMin(available, b.getSize(strides));
+    b.CreateLikelyCondBr(b.CreateICmpNE(count, b.getSize(0)), rebuildLoop, rebuildDone);
+
+    b.SetInsertPoint(rebuildLoop);
+    PHINode * const remaining = b.CreatePHI(b.getSizeTy(), 2);
+    remaining->addIncoming(count, entry);
+    for (unsigned i = 0; i < n; ++i) {
+        Value * const offset = b.CreateMul(remaining, b.getSize(itemsPerStride[i]));
+        b.setProcessedItemCount(inputs[i].getName(), b.CreateSub(initial[i], offset));
+    }
+    // The stride logic computes its input addresses in its first block, which must
+    // follow the stores to the processed item counts.
+    b.CreateBr(rebuildStride);
+
+    b.SetInsertPoint(rebuildStride);
+    TARGET->generateCarryRebuildMethod(b);
+    Value * const nextRemaining = b.CreateSub(remaining, b.getSize(1));
+    remaining->addIncoming(nextRemaining, b.GetInsertBlock());
+    b.CreateCondBr(b.CreateICmpEQ(nextRemaining, b.getSize(0)), rebuildExit, rebuildLoop);
+
+    b.SetInsertPoint(rebuildExit);
+    for (unsigned i = 0; i < n; ++i) {
+        b.setProcessedItemCount(inputs[i].getName(), initial[i]);
+    }
+    b.CreateBr(rebuildDone);
+
+    b.SetInsertPoint(rebuildDone);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

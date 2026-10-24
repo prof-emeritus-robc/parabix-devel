@@ -10,6 +10,8 @@
 #include <pablo/ast/pe_zeroes.h>
 #include <pablo/ast/pe_ones.h>
 #include <pablo/passes/passes.h>
+#include <pablo/passes/carryextent.hpp>
+#include <pablo/compiler/printer_pablos.h>
 
 #include <pablo/toolchain/pablo_toolchain.h>
 #include <kernel/core/kernel_builder.h>
@@ -231,13 +233,90 @@ void PabloKernel::addInternalProperties(KernelBuilder & b) {
     }
     generatePabloMethod();
     pablo_function_passes(this);
+    checkCarryExtent(b);
     mPabloCompiler->initializeKernelData(b);
     mPabloCompiler = nullptr;
     mSizeTy = nullptr;
     mStreamTy = nullptr;
 }
 
+bool PabloKernel::rebuildsCarries() const {
+    return EnableRebuildCarries && hasAttribute(kernel::Attribute::KindId::RebuildCarries);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getCarryRebuildStrides
+ *
+ * The strides to reprocess cover the declared CarryExtent, or one stride if none is declared.
+ ** ------------------------------------------------------------------------------------------------------------- */
+unsigned PabloKernel::getCarryRebuildStrides() const {
+    if (LLVM_LIKELY(!rebuildsCarries())) {
+        return 0;
+    }
+    const auto declared = findAttribute(kernel::Attribute::KindId::RebuildCarries).amount();
+    const auto stride = getStride();
+    return (declared == 0) ? 1 : (declared + stride - 1) / stride;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief checkCarryExtent
+ *
+ * Verify that the CarryExtent of a kernel that rebuilds its carries is within its declared amount.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PabloKernel::checkCarryExtent(KernelBuilder & b) const {
+    const auto rebuild = rebuildsCarries();
+    if (LLVM_LIKELY(!rebuild && !ShowCarryExtent)) {
+        return;
+    }
+    const auto result = CarryExtent::analyze(this);
+    if (LLVM_UNLIKELY(ShowCarryExtent)) {
+        std::string tmp;
+        raw_string_ostream out(tmp);
+        out << getName() << ": ";
+        if (result.Qualifies) {
+            out << "CarryExtent " << result.Extent;
+        } else {
+            out << "no CarryExtent: ";
+            PabloPrinter::print(result.Disqualifier, out);
+        }
+        out << "\n";
+        errs() << out.str();
+    }
+    if (rebuild) {
+        const auto declared = findAttribute(kernel::Attribute::KindId::RebuildCarries).amount();
+        const auto limit = getCarryRebuildStrides() * b.getBitBlockWidth();
+        if (LLVM_UNLIKELY(!result.Qualifies || result.Extent > limit)) {
+            std::string tmp;
+            raw_string_ostream out(tmp);
+            out << getName() << ": RebuildCarries";
+            if (declared) {
+                out << "(" << declared << ")";
+            }
+            if (result.Qualifies) {
+                out << " exceeded: the CarryExtent is " << result.Extent << ", more than " << limit;
+            } else {
+                out << " requires Advances to be the only carry-generating operations, but found: ";
+                PabloPrinter::print(result.Disqualifier, out);
+            }
+            report_fatal_error(StringRef(out.str()));
+        }
+    }
+}
+
 void PabloKernel::addAutomaticAttributes() {
+    // The strides reprocessed to rebuild the carries precede the segment, so they must
+    // remain in the input buffers.
+    if (const auto strides = getCarryRebuildStrides()) {
+        for (Binding & input : mInputStreamSets) {
+            const auto items = strides * getStride() * ceiling(input.getRate().getUpperBound());
+            if (input.hasAttribute(kernel::Attribute::KindId::LookBehind)) {
+                const auto current = input.findAttribute(kernel::Attribute::KindId::LookBehind).amount();
+                input.findOrAddAttribute(kernel::Attribute::KindId::LookBehind, std::max<size_t>(current, items));
+            } else {
+                input.addAttribute(LookBehind(items));
+            }
+        }
+    }
     if (!EnableProvisionalLookAheadStride || (mFlags & Kernel::KernelFlags::RequiresIllustratorObject)) {
         return;
     }
@@ -288,6 +367,18 @@ void PabloKernel::generateDoBlockMethod(KernelBuilder & b) {
     mSizeTy = b.getSizeTy();
     mStreamTy = b.getStreamTy();
     mPabloCompiler->compile(b);
+    mPabloCompiler = nullptr;
+    mSizeTy = nullptr;
+    mStreamTy = nullptr;
+}
+
+void PabloKernel::generateCarryRebuildMethod(KernelBuilder & b) {
+    auto & C = b.getContext();
+    mContext = &C;
+    mPabloCompiler = reinterpret_cast<PabloCompiler *>(b.getCompiler());
+    mSizeTy = b.getSizeTy();
+    mStreamTy = b.getStreamTy();
+    mPabloCompiler->compileCarryRebuild(b);
     mPabloCompiler = nullptr;
     mSizeTy = nullptr;
     mStreamTy = nullptr;
@@ -408,6 +499,9 @@ std::string && annotateKernelNameWithPabloDebugFlags(std::string && name) {
     }
     if (CompileOptionIsSet(PabloUseLLVMOptimizationPasses)) {
         name += "+LLVM-opt";
+    }
+    if (!EnableRebuildCarries) {
+        name += "-RebuildCarries";
     }
     return std::move(name);
 }

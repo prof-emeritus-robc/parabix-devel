@@ -893,6 +893,15 @@ protected:
 
     virtual void generateFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingItems);
 
+    // The number of strides before each segment that a kernel which rebuilds its carries
+    // reprocesses, starting from zeroed carries, to compute the carries for the segment.
+    // Zero (the default) if the kernel keeps its carries in kernel state.
+    virtual unsigned getCarryRebuildStrides() const { return 0; }
+
+    // Generate the logic to reprocess one stride before the segment.  The processed item
+    // counts of the inputs locate that stride; no output may be written.
+    virtual void generateCarryRebuildMethod(KernelBuilder & b);
+
     // Adds the ProvisionalLookAheadStride attribute and records it in the kernel name,
     // since it changes the generated code.  Call from the subclass constructor.
     void setProvisionalLookAheadStride();

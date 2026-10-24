@@ -145,18 +145,32 @@ void CarryManager::initializeCarryData(kernel::KernelBuilder & b, PabloKernel * 
         }
     }
 
+    // A kernel that rebuilds its carries starts each segment with zeroed carries, which
+    // a non-persistent scalar provides: it is allocated and zeroed for each call.  The
+    // CarryExtent check has already excluded loops and indexed advances.
+    const auto rebuild = kernel->rebuildsCarries();
+    assert (!rebuild || (!mHasLoop && mIndexedLongAdvanceTotal == 0));
+
     if (LLVM_UNLIKELY(mCarryFrameType->isEmptyTy())) {
         mCarryFrameType = nullptr;
     } else {
         assert (b.getTypeSize(b.getModule()->getDataLayout(), mCarryFrameType) > 0);
-        kernel->addInternalScalar(mCarryFrameType, "carries");
+        if (LLVM_UNLIKELY(rebuild)) {
+            kernel->addNonPersistentScalar(mCarryFrameType, "carries");
+        } else {
+            kernel->addInternalScalar(mCarryFrameType, "carries");
+        }
     }
 
     if (mHasLoop) {
         kernel->addInternalScalar(b.getInt32Ty(), "selector");
     }
     if (mHasLongAdvance) {
-        kernel->addInternalScalar(b.getInt32Ty(), "CarryBlockIndex");
+        if (LLVM_UNLIKELY(rebuild)) {
+            kernel->addNonPersistentScalar(b.getInt32Ty(), "CarryBlockIndex");
+        } else {
+            kernel->addInternalScalar(b.getInt32Ty(), "CarryBlockIndex");
+        }
     }
     for (unsigned i = 0; i < mIndexedLongAdvanceTotal; i++) {
         kernel->addInternalScalar(b.getSizeTy(), "IndexedAdvancePosition" + std::to_string(i));

@@ -48,6 +48,13 @@ add_test(NAME provisional_lookahead_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/provisional_lookahead_test.py ${TEST_BIN_DIR}/provisional_lookahead)
 
+# RebuildCarries: compare rebuilt and stored carries of an advance chain with a reference
+parabix_add_executable(NAME rebuild_carries SRC rebuild_carries.cpp
+                       DEPS pablo.compiler kernel.basis kernel.io kernel.pipeline toolchain)
+add_test(NAME rebuild_carries_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/rebuild_carries_test.py ${TEST_BIN_DIR}/rebuild_carries)
+
 # Clearing of a wide stream's output past its final produced item, checked with a reference
 parabix_add_executable(NAME unwritten_wide_output SRC unwritten_wide_output.cpp
                        DEPS kernel.io kernel.pipeline toolchain)

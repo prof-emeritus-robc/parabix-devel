@@ -1146,7 +1146,9 @@ void PipelineAnalysis::updateInterPartitionThreadLocalBuffers() {
         const auto partId = KernelPartitionId[producer];
         for (const auto input : make_iterator_range(out_edges(streamSet, mBufferGraph))) {
             const auto consumer = target(input, mBufferGraph);
-            if (partId != KernelPartitionId[consumer]) {
+            // A consumer with a LookBehind reads items of the prior segment, which another
+            // thread may have produced; a thread-local buffer would not hold them.
+            if (partId != KernelPartitionId[consumer] || mBufferGraph[input].LookBehind != 0) {
                 bn.Locality = BufferLocality::GloballyShared;
                 break;
             }

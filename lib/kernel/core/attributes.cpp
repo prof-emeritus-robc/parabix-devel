@@ -55,7 +55,7 @@ void Attribute::print(llvm::raw_ostream & out) const noexcept {
         NAME(ExecuteStridesIndividually);
         NAME(Statefree);
         NAME(ProvisionalLookAheadStride);
-        NAME_AMOUNT(RebuildCarries);
+        NAME_AMOUNT(LocalCarries);
         NAME_LABEL(InOut);
         case KindId::__Count: llvm_unreachable("__Count should not be used.");
     }

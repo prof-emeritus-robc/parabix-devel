@@ -58,9 +58,9 @@ static cl::opt<bool, true> EnableProvisionalLookAheadStrideOption("ProvisionalLo
     cl::desc("Give eligible Pablo kernels with lookahead inputs the ProvisionalLookAheadStride attribute (default true)"),
     cl::cat(codegen::CodeGenOptions), cl::init(true));
 
-bool EnableRebuildCarries = true;
-static cl::opt<bool, true> EnableRebuildCarriesOption("RebuildCarries", cl::location(EnableRebuildCarries),
-    cl::desc("Let Pablo kernels with the RebuildCarries attribute rebuild their carries at each segment start (default true)"),
+bool EnableLocalCarries = true;
+static cl::opt<bool, true> EnableLocalCarriesOption("LocalCarries", cl::location(EnableLocalCarries),
+    cl::desc("Let Pablo kernels with the LocalCarries attribute rebuild their carries at each segment start (default true)"),
     cl::cat(codegen::CodeGenOptions), cl::init(true));
 
 bool ShowCarryExtent = false;

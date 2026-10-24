@@ -256,7 +256,9 @@ SingletonCanonicalization::SingletonCanonicalization
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmBasis)
 : PabloKernel(ts, "SingletonCanonicalization" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}},
-{Binding{"XfrmBasis", XfrmBasis}}) {}
+{Binding{"XfrmBasis", XfrmBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void SingletonCanonicalization::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -354,7 +356,9 @@ ExcludedCompositeStage::ExcludedCompositeStage
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmBasis)
 : PabloKernel(ts, "ExcludedCompositeStage" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}},
-{Binding{"XfrmBasis", XfrmBasis}}) {}
+{Binding{"XfrmBasis", XfrmBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ExcludedCompositeStage::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -500,7 +504,9 @@ ApplyLongComposition${pass_no}::ApplyLongComposition${pass_no}
                                    StreamSet * OutputBasis)
 : PabloKernel(ts, "ApplyLongComposition${pass_no}_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"MarkCodeAtStarter", MarkCodeAtStarter}, Binding{"MarkCode", MarkCode}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ApplyLongComposition${pass_no}::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -596,7 +602,9 @@ ShortComposableTranslation${pass_no}::ShortComposableTranslation${pass_no}
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * OutputBasis)
 : PabloKernel(ts, "ShortComposableTranslation${pass_no}_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(7)}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ShortComposableTranslation${pass_no}::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -886,6 +894,7 @@ NFC_Initial_Insertion::NFC_Initial_Insertion
 : PabloKernel(ts, "NFC_Initial_Insertion" + Basis->shapeString() + (WorkMask == nullptr ? "" : "+wkmsk"),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}},
 {Binding{"InsertionBixNum", InsertionBixNum}}), mHasWorkMask(WorkMask != nullptr) {
+    addAttribute(kernel::LocalCarries());
     if (mHasWorkMask) {
         mInputStreamSets.push_back(Binding{"WorkMask", WorkMask});
     }

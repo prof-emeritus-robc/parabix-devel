@@ -3,14 +3,14 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-# Compares the output of rebuild_carries with and without -RebuildCarries over random inputs
+# Compares the output of local_carries with and without -LocalCarries over random inputs
 # whose lengths fall around block and segment boundaries, and checks both against a reference
 # computed here.  The advance chains cover short advances, long advances (of 64 or more) and
 # advances of more than a block, which rebuild their carries from several blocks.  By default,
 # a small set of cases completes in under a second; --extended-testing runs all the
 # combinations of the advance chains, lengths and segment sizes below.
 #
-# usage: rebuild_carries_test.py <path to rebuild_carries> [--extended-testing] [-v]
+# usage: local_carries_test.py <path to local_carries> [--extended-testing] [-v]
 
 import os
 import random
@@ -32,7 +32,7 @@ QUICK_LENGTHS = [0, 257, 10253]
 
 
 def reference(data, chain):
-    """The output of rebuild_carries, computing each stream as an integer whose bit k is
+    """The output of local_carries, computing each stream as an integer whose bit k is
     the stream bit at position k.  Basis stream i holds bit i of each byte."""
     n = len(data)
     mask = (1 << n) - 1
@@ -58,11 +58,11 @@ def reference(data, chain):
 
 
 def run(exe, path, chain, seg, rebuild):
-    cmd = [exe, path, "-adv=" + chain, "-object-cache-salt=rebuild_carries_test"]
+    cmd = [exe, path, "-adv=" + chain, "-object-cache-salt=local_carries_test"]
     if seg is not None:
         cmd.append("-segment-size=" + seg)
     if not rebuild:
-        cmd.append("-RebuildCarries=false")
+        cmd.append("-LocalCarries=false")
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
     except subprocess.TimeoutExpired:

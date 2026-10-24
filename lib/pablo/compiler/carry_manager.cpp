@@ -148,7 +148,7 @@ void CarryManager::initializeCarryData(kernel::KernelBuilder & b, PabloKernel * 
     // A kernel that rebuilds its carries starts each segment with zeroed carries, which
     // a non-persistent scalar provides: it is allocated and zeroed for each call.  The
     // CarryExtent check has already excluded loops and indexed advances.
-    const auto rebuild = kernel->rebuildsCarries();
+    const auto rebuild = kernel->hasLocalCarries();
     assert (!rebuild || (!mHasLoop && mIndexedLongAdvanceTotal == 0));
 
     if (LLVM_UNLIKELY(mCarryFrameType->isEmptyTy())) {

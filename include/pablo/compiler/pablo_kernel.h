@@ -144,10 +144,10 @@ public:
 
     bool requiresExplicitPartialFinalStride() const override;
 
-    // Whether this kernel rebuilds its carries at each segment start (see RebuildCarries in
+    // Whether this kernel rebuilds its carries at each segment start (see LocalCarries in
     // kernel/core/attributes.h) rather than keeping them in kernel state.  This depends only
     // on the attribute, so it is known for a kernel loaded from the cache.
-    bool rebuildsCarries() const;
+    bool hasLocalCarries() const;
 
     unsigned getCarryRebuildStrides() const override;
 

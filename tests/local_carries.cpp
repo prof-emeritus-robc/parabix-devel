@@ -3,14 +3,14 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
-// Test driver for the RebuildCarries kernel attribute.
+// Test driver for the LocalCarries kernel attribute.
 //
 // Reads a file, transposes it to 8 basis bit streams, passes them through a chain
 // of Pablo kernels that each combine an Advance (short, long or of more than a block)
 // with an If-block containing further Advances, and writes the transposed result to
-// stdout.  Each chain kernel declares RebuildCarries, so it rebuilds its carries at
-// the start of each segment; running with -RebuildCarries=false must give identical
-// output, and rebuild_carries_test.py compares the two.
+// stdout.  Each chain kernel declares LocalCarries, so it rebuilds its carries at
+// the start of each segment; running with -LocalCarries=false must give identical
+// output, and local_carries_test.py compares the two.
 
 #include <toolchain/toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
@@ -30,7 +30,7 @@ using namespace llvm;
 using namespace kernel;
 using namespace pablo;
 
-static cl::OptionCategory testOptions("rebuild_carries Options", "Test options.");
+static cl::OptionCategory testOptions("local_carries Options", "Test options.");
 
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(testOptions));
 
@@ -46,7 +46,7 @@ public:
                   {Binding{"output", output}})
     , mAmount(amount) {
         // The longest path is the Advance by amount followed by the Advance by 2 in the If-body.
-        addAttribute(RebuildCarries(amount + 2));
+        addAttribute(LocalCarries(amount + 2));
     }
 protected:
     void generatePabloMethod() override {
@@ -96,7 +96,7 @@ int main(int argc, char *argv[]) {
     if (Advances.empty()) {
         Advances.push_back(1);
     }
-    CPUDriver driver("rebuild_carries");
+    CPUDriver driver("local_carries");
     auto fn = generatePipeline(driver);
     const int fd = open(inputFile.c_str(), O_RDONLY);
     if (fd == -1) {

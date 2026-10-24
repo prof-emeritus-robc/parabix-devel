@@ -346,7 +346,7 @@ struct Attribute {
         // Requirements: every stream input and output is FixedRate(1), no output is InOut,
         // the stride is the block width, and all mutable kernel state is held in kernel scalars.
 
-        RebuildCarries,
+        LocalCarries,
 
         // A Pablo kernel whose only carry-generating operations are Advances may rebuild
         // its carries at the start of each segment rather than keep them in kernel state.
@@ -356,7 +356,7 @@ struct Attribute {
         // the correct carries for the segment, so the kernel has no persistent state and
         // its segments may be processed in any order.
 
-        // RebuildCarries(n) declares that CarryExtent <= n; n = 0 declares that it is at
+        // LocalCarries(n) declares that CarryExtent <= n; n = 0 declares that it is at
         // most the block width.  The Pablo compiler verifies the declaration.
 
         /** COUNT **/
@@ -617,8 +617,8 @@ inline Attribute ProvisionalLookAheadStride() {
     return Attribute(Attribute::KindId::ProvisionalLookAheadStride, 0);
 }
 
-inline Attribute RebuildCarries(const unsigned maxCarryExtent = 0) {
-    return Attribute(Attribute::KindId::RebuildCarries, maxCarryExtent);
+inline Attribute LocalCarries(const unsigned maxCarryExtent = 0) {
+    return Attribute(Attribute::KindId::LocalCarries, maxCarryExtent);
 }
 
 inline Attribute InternallyGenerated() {

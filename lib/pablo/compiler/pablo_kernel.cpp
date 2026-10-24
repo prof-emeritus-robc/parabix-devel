@@ -240,8 +240,8 @@ void PabloKernel::addInternalProperties(KernelBuilder & b) {
     mStreamTy = nullptr;
 }
 
-bool PabloKernel::rebuildsCarries() const {
-    return EnableRebuildCarries && hasAttribute(kernel::Attribute::KindId::RebuildCarries);
+bool PabloKernel::hasLocalCarries() const {
+    return EnableLocalCarries && hasAttribute(kernel::Attribute::KindId::LocalCarries);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -250,10 +250,10 @@ bool PabloKernel::rebuildsCarries() const {
  * The strides to reprocess cover the declared CarryExtent, or one stride if none is declared.
  ** ------------------------------------------------------------------------------------------------------------- */
 unsigned PabloKernel::getCarryRebuildStrides() const {
-    if (LLVM_LIKELY(!rebuildsCarries())) {
+    if (LLVM_LIKELY(!hasLocalCarries())) {
         return 0;
     }
-    const auto declared = findAttribute(kernel::Attribute::KindId::RebuildCarries).amount();
+    const auto declared = findAttribute(kernel::Attribute::KindId::LocalCarries).amount();
     const auto stride = getStride();
     return (declared == 0) ? 1 : (declared + stride - 1) / stride;
 }
@@ -264,7 +264,7 @@ unsigned PabloKernel::getCarryRebuildStrides() const {
  * Verify that the CarryExtent of a kernel that rebuilds its carries is within its declared amount.
  ** ------------------------------------------------------------------------------------------------------------- */
 void PabloKernel::checkCarryExtent(KernelBuilder & b) const {
-    const auto rebuild = rebuildsCarries();
+    const auto rebuild = hasLocalCarries();
     if (LLVM_LIKELY(!rebuild && !ShowCarryExtent)) {
         return;
     }
@@ -283,12 +283,12 @@ void PabloKernel::checkCarryExtent(KernelBuilder & b) const {
         errs() << out.str();
     }
     if (rebuild) {
-        const auto declared = findAttribute(kernel::Attribute::KindId::RebuildCarries).amount();
+        const auto declared = findAttribute(kernel::Attribute::KindId::LocalCarries).amount();
         const auto limit = getCarryRebuildStrides() * b.getBitBlockWidth();
         if (LLVM_UNLIKELY(!result.Qualifies || result.Extent > limit)) {
             std::string tmp;
             raw_string_ostream out(tmp);
-            out << getName() << ": RebuildCarries";
+            out << getName() << ": LocalCarries";
             if (declared) {
                 out << "(" << declared << ")";
             }
@@ -500,8 +500,8 @@ std::string && annotateKernelNameWithPabloDebugFlags(std::string && name) {
     if (CompileOptionIsSet(PabloUseLLVMOptimizationPasses)) {
         name += "+LLVM-opt";
     }
-    if (!EnableRebuildCarries) {
-        name += "-RebuildCarries";
+    if (!EnableLocalCarries) {
+        name += "-LocalCarries";
     }
     return std::move(name);
 }

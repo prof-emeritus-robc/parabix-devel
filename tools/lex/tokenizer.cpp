@@ -401,6 +401,16 @@ static cl::opt<unsigned> BenchLoop(
     cl::init(0),
     cl::cat(wordBreakerFlags));
 
+// --bench-cold-cache: empty the --bpe-tail segment caches before every --bench-loop run, so
+// each timed run starts cold like a one-shot run instead of reusing the words the previous
+// run cached from the same input. The caches are cleared, not freed, so the run still skips
+// the page faults a one-shot run pays.
+static cl::opt<bool> BenchColdCache(
+    "bench-cold-cache",
+    cl::desc("With --bench-loop and --bpe-tail: start every run with empty segment caches."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
 using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 // writeToStdout — convert 8x1 parallel basis bits to serial bytes and write
@@ -758,12 +768,14 @@ int main(int argc, char *argv[]) {
 
             // One discarded warm-up run (first pass pays page-fault / cache-fill cost).
             resetOffsetState();
+            if (BenchColdCache) bpeDropTailCaches();
             bpeFn(buf, nbytes);
 
             std::vector<double> ms;   // per-iteration wall time, milliseconds
             ms.reserve(N);
             for (unsigned i = 0; i < N; ++i) {
                 resetOffsetState();   // spans are cumulative — rewind per iteration
+                if (BenchColdCache) bpeDropTailCaches();
                 auto t0 = std::chrono::steady_clock::now();
                 bpeFn(buf, nbytes);
                 auto t1 = std::chrono::steady_clock::now();

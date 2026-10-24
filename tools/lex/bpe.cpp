@@ -1273,6 +1273,8 @@ static TailScratch & tailScratch() {
     return *sp;
 }
 
+void bpeDropTailCaches() { gTailGeneration++; }
+
 static inline void tailMark(uint64_t * emit, uint32_t p) { emit[p / 64] |= 1ull << (p % 64); }
 static inline uint64_t tailLowMask(size_t k) { return k >= 64 ? ~0ull : (1ull << k) - 1; }
 

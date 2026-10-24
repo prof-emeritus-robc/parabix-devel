@@ -140,6 +140,9 @@ void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
 // on the BPE input as a byte stream (1x8) and the pretoken starts.
 void buildBPEByteTailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * bytes,
                              kernel::StreamSet * segs);
+// --bench-cold-cache: every thread's tail segment cache starts empty on the next pipeline
+// run, as in a one-shot run (the caches survive across --bench-loop runs otherwise).
+void bpeDropTailCaches();
 
 // `boundary` (optional, may be null): a 1-bit per-byte mask marking pretoken
 // STARTS (GPT-2 regex boundaries). When present, merges are blocked from crossing

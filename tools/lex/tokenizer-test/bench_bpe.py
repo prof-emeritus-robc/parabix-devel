@@ -26,21 +26,26 @@ that line — the steady-state peak, exactly what criterion reports.
 
 Usage
 -----
-    python bench_bpe.py                       # default corpus list (12 KB → 12 MB)
+No corpus is built into the script: name the input on the command line, with
+--input (one or more files), --sweep --sweep-source FILE, or --openwebtext.
+
     python bench_bpe.py --input file.txt      # one file
-    python bench_bpe.py --sweep               # 4 KB → 12 MB prefix sweep + line fit
-    python bench_bpe.py --sweep --sweep-max-mb 1   # cheap sub-MB sweep
-    python bench_bpe.py --iters 20            # timed iterations per side
-    python bench_bpe.py --no-adaptive-iters   # same --iters at every size
-    python bench_bpe.py --openwebtext         # add a streamed openwebtext sample
-    python bench_bpe.py --sweep --openwebtext # full 4 KB → 20 MB sweep (needs the
-                                             #   stream: on-disk corpora stop at 12.4 MB)
+    python bench_bpe.py --input a.txt b.txt   # several files, one row each
+    python bench_bpe.py --sweep --sweep-source file.txt    # 4 KB → 20 MB prefix sweep + line fit
+    python bench_bpe.py --sweep --sweep-source file.txt --sweep-max-mb 1   # cheap sub-MB sweep
+    python bench_bpe.py --input FILE --iters 20            # timed iterations per side
+    python bench_bpe.py --input FILE --no-adaptive-iters   # same --iters at every size
+    python bench_bpe.py --openwebtext         # bench a streamed openwebtext sample
+    python bench_bpe.py --sweep --openwebtext # sweep a streamed openwebtext sample
     python bench_bpe.py --openwebtext --owt-bytes 50000000  # bigger sample
-    python bench_bpe.py --parabix-only
-    python bench_bpe.py --hf-only
-    python bench_bpe.py --tiktoken-only
-    python bench_bpe.py --no-tiktoken         # Parabix vs HF only (original 2-way)
-    python bench_bpe.py --svg bench.svg       # also emit a MB/s bar chart
+    python bench_bpe.py --input FILE --parabix-only
+    python bench_bpe.py --input FILE --hf-only
+    python bench_bpe.py --input FILE --tiktoken-only
+    python bench_bpe.py --input FILE --no-tiktoken         # Parabix vs HF only (original 2-way)
+    python bench_bpe.py --input FILE --baseline-threads 4 --parabix-args="... --thread-num=4"
+                                              # equal threads: HF/tiktoken encode_batch on 4
+    python bench_bpe.py --input FILE --parabix-iters 50    # more Parabix samples (its runs are cheap)
+    python bench_bpe.py --input FILE --svg bench.svg       # also emit a MB/s bar chart
 """
 
 import argparse
@@ -61,6 +66,7 @@ import tiktoken
 
 # Defaults only: the repo root is three levels above this script
 # (tools/lex/tokenizer-test/); --tokenizer/--merges/--tokenizer-json override.
+# Corpora have no default: they are always named on the command line.
 REPO_ROOT      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
@@ -69,14 +75,6 @@ TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.js
 TFILES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files")
 OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "bench_bpe_output.txt")
-
-# Default corpus sweep — existing repo files, small → medium.
-DEFAULT_SWEEP = [
-    os.path.join(TFILES, "webtext_10.txt"),
-    os.path.join(TFILES, "webtext_100.txt"),
-    os.path.join(TFILES, "webtext_cases.txt"),
-]
-BIG_FILE = os.path.join(TFILES, "webtext_cases.txt")   # ~13 MB, --big only
 
 # --sweep: cut increasing-size prefixes from a source corpus so we can separate
 # Parabix's fixed per-call floor (intercept) from its true per-byte throughput
@@ -89,13 +87,8 @@ BIG_FILE = os.path.join(TFILES, "webtext_cases.txt")   # ~13 MB, --big only
 # Sizes here are BINARY MB (MiB), so the top entry needs 20,971,520 source bytes
 # — keep OWT_BYTES comfortably above it or the point is silently skipped.
 #
-# The top sizes exceed every corpus on disk: webtext_cases.txt is 12,996,805
-# bytes and already holds ALL 5000 documents of webtext.test.jsonl, so there is
-# no more real text in the repo. Anything past ~12 MB needs --openwebtext, which
-# streams a fresh sample (see ensure_openwebtext) and replaces the sweep source.
-# Without it, sizes above the source are skipped with a reason on stderr.
-SWEEP_SOURCE = BIG_FILE if os.path.isfile(BIG_FILE) else \
-               os.path.join(TFILES, "webtext_100.txt")
+# The source is --sweep-source FILE, or the --openwebtext sample (see
+# ensure_openwebtext). Sizes above the source are skipped with a reason on stderr.
 SWEEP_SIZES  = [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024,
                 4 * 1024 * 1024, 8 * 1024 * 1024, 12 * 1024 * 1024,
                 15 * 1024 * 1024, 20 * 1024 * 1024]
@@ -187,20 +180,38 @@ def run_parabix(path: str, iters: int, extra: list | None = None) -> dict | None
 
 
 # ---------------------------------------------------------------------------
-# HuggingFace side — in-process encode loop, min/median of N iterations
+# --baseline-threads: split the text so HF / tiktoken can use N threads
 # ---------------------------------------------------------------------------
 
-def run_hf(tok, text: str, iters: int) -> dict:
-    """Time HF encode() on the whole-file string, N warm iterations + 1 discard.
+# Cut only between a non-space character and a following space. The pretoken before
+# the space ends there in GPT-2's pretokenizer (no pattern takes a non-space run
+# across a space; only the all-whitespace patterns hold spaces), the next pretoken
+# starts at the space, and the piece before the cut ends in a non-space, so
+# end-of-input does not change how it splits. Any script counts, so non-Latin text
+# gets cuts too. (A cut after "\n" is not safe: a piece ending in "\n\n" turns it
+# into one pretoken, which BPE merges, while the whole text splits it in two.) Each
+# engine still checks once that the pieces' ids, joined, equal one whole-text encode.
+_SAFE_CUT = re.compile(r"(?<=\S)(?= )")
 
-    Whole-file encode mirrors how Parabix processes the input as a single byte
-    stream (rather than encode_batch over pre-split lines)."""
-    nbytes = len(text.encode("utf-8"))
-    tok.encode(text)                       # warm-up (discarded)
+
+def split_for_threads(text: str, pieces: int) -> list[str]:
+    """Cut `text` into about `pieces` chunks at safe pretoken boundaries."""
+    cuts, step = [0], max(1, len(text) // pieces)
+    for i in range(1, pieces):
+        m = _SAFE_CUT.search(text, max(cuts[-1] + 1, i * step))
+        if not m:
+            break
+        cuts.append(m.start())
+    cuts.append(len(text))
+    return [text[a:b] for a, b in zip(cuts, cuts[1:]) if b > a]
+
+
+def _timed(fn, nbytes: int, iters: int) -> dict:
+    """Run fn() `iters` times (already warmed up); min/median/mean ms + peak MB/s."""
     times = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        tok.encode(text)
+        fn()
         times.append((time.perf_counter() - t0) * 1e3)   # ms
     times.sort()
     minv   = times[0]
@@ -215,34 +226,51 @@ def run_hf(tok, text: str, iters: int) -> dict:
         "mean_ms":   mean,
         "mbps":      mbps,
     }
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace side — in-process encode loop, min/median of N iterations
+# ---------------------------------------------------------------------------
+
+def run_hf(tok, text: str, iters: int, chunks: list[str] | None = None) -> dict | None:
+    """Time HF encode() on the whole-file string, N warm iterations + 1 discard.
+
+    Whole-file encode mirrors how Parabix processes the input as a single byte
+    stream (rather than encode_batch over pre-split lines). With `chunks`
+    (--baseline-threads > 1) it times encode_batch over them instead (rayon,
+    RAYON_NUM_THREADS threads), after checking that their ids match one encode."""
+    nbytes = len(text.encode("utf-8"))
+    if chunks:
+        joined = [i for e in tok.encode_batch(chunks) for i in e.ids]   # also the warm-up
+        if joined != tok.encode(text).ids:
+            sys.stderr.write("  [HF] split encode differs from one encode: not timed\n")
+            return None
+        return _timed(lambda: tok.encode_batch(chunks), nbytes, iters)
+    tok.encode(text)                       # warm-up (discarded)
+    return _timed(lambda: tok.encode(text), nbytes, iters)
 
 
 # ---------------------------------------------------------------------------
 # tiktoken side — in-process encode loop, same shape as run_hf
 # ---------------------------------------------------------------------------
 
-def run_tiktoken(enc, text: str, iters: int) -> dict:
-    """Time tiktoken's encode() on the whole-file string, same methodology as run_hf."""
+def run_tiktoken(enc, text: str, iters: int, chunks: list[str] | None = None,
+                 threads: int = 1, ordinary: bool = False) -> dict | None:
+    """Time tiktoken's encode() on the whole-file string, same methodology as run_hf.
+    With `chunks`, encode_batch over them on `threads` threads. `ordinary`: the
+    encode_ordinary forms, which skip the scan of the text for special tokens (the
+    Parabix --bench-loop path does not handle special tokens either)."""
     nbytes = len(text.encode("utf-8"))
-    enc.encode(text)                       # warm-up (discarded)
-    times = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        enc.encode(text)
-        times.append((time.perf_counter() - t0) * 1e3)   # ms
-    times.sort()
-    minv   = times[0]
-    median = statistics.median(times)
-    mean   = statistics.fmean(times)
-    mbps   = (nbytes / (minv / 1e3)) / 1e6 if minv > 0 else 0.0
-    return {
-        "bytes":     nbytes,
-        "iters":     iters,
-        "min_ms":    minv,
-        "median_ms": median,
-        "mean_ms":   mean,
-        "mbps":      mbps,
-    }
+    one   = enc.encode_ordinary if ordinary else enc.encode
+    batch = enc.encode_ordinary_batch if ordinary else enc.encode_batch
+    if chunks:
+        joined = [i for ids in batch(chunks, num_threads=threads) for i in ids]
+        if joined != one(text):
+            sys.stderr.write("  [tiktoken] split encode differs from one encode: not timed\n")
+            return None
+        return _timed(lambda: batch(chunks, num_threads=threads), nbytes, iters)
+    one(text)                              # warm-up (discarded)
+    return _timed(lambda: one(text), nbytes, iters)
 
 
 # ---------------------------------------------------------------------------
@@ -460,8 +488,9 @@ def ensure_openwebtext(cap_bytes: int, max_docs: int, path: str):
 def main():
     global TOKENIZER, MERGES, TOKENIZER_JSON
     ap = argparse.ArgumentParser(description="Parabix vs HuggingFace vs tiktoken BPE throughput benchmark.")
-    ap.add_argument("--input", help="Single corpus file (overrides the default sweep)")
-    ap.add_argument("--big", action="store_true", help="Append the ~13 MB corpus to the sweep")
+    ap.add_argument("--input", nargs="+", metavar="FILE",
+                    help="Corpus file(s) to bench, one row each. Required unless --sweep "
+                         "or --openwebtext gives the input.")
     ap.add_argument("--iters", type=int, default=DEFAULT_ITERS,
                     help=f"Timed iterations per side (default {DEFAULT_ITERS})")
     ap.add_argument("--parabix-only", action="store_true")
@@ -480,9 +509,8 @@ def main():
                     help="Drop sweep sizes above MB megabytes (e.g. 1 for the old "
                          "sub-MB sweep). Default: all sizes up to 20 MB.")
     ap.add_argument("--sweep-source", metavar="PATH",
-                    help="Slice the sweep prefixes from PATH instead of the built-in "
-                         "corpus. Needed to sweep past ~13 MB (e.g. val_1gb.txt). "
-                         "Takes precedence over --openwebtext.")
+                    help="Slice the sweep prefixes from PATH. --sweep needs this or "
+                         "--openwebtext; this takes precedence over --openwebtext.")
     ap.add_argument("--sweep-sizes", metavar="MB[,MB...]",
                     help="Replace the default size ladder with this comma-separated "
                          "list, in MiB (fractions allowed: 0.004 = 4 KB). Example: "
@@ -492,14 +520,26 @@ def main():
                          f"down above {ITER_SCALE_THRESHOLD >> 20} MB (floor {ITER_FLOOR})")
     ap.add_argument("--openwebtext", action="store_true",
                     help="Stream a Skylion007/openwebtext sample (cached in tokenizer_files) "
-                         "and add it to the corpus, or use as the --sweep source")
+                         "and bench it after any --input files, or use it as the --sweep source")
     ap.add_argument("--owt-bytes", type=int, default=OWT_BYTES,
                     help=f"openwebtext sample byte cap (default {OWT_BYTES})")
     ap.add_argument("--owt-docs", type=int, default=OWT_DOCS,
                     help=f"openwebtext sample doc cap (default {OWT_DOCS})")
     ap.add_argument("--parabix-args", default="",
                     help="Extra flags forwarded verbatim to the tokenizer binary, "
-                         "e.g. --parabix-args=\"--geometric-compaction --compact-base=15\"")
+                         "e.g. --parabix-args=\"--partition=bit-tier --thread-num=4\". "
+                         "--pretokenizer=bytelevel is added unless a --pretokenizer is given.")
+    ap.add_argument("--parabix-iters", type=int, metavar="N",
+                    help="Parabix --bench-loop iterations (default: same as HF/tiktoken). "
+                         "Parabix runs are cheap, so more samples cost little.")
+    ap.add_argument("--baseline-threads", type=int, default=1, metavar="N",
+                    help="Threads for HF and tiktoken (default 1: one encode() of the "
+                         "whole text). N > 1 splits the text at safe pretoken boundaries "
+                         "and times encode_batch on N threads; match Parabix's --thread-num "
+                         "for an equal-threads comparison.")
+    ap.add_argument("--tiktoken-ordinary", action="store_true",
+                    help="Time tiktoken's encode_ordinary(_batch), which skips the "
+                         "special-token scan, instead of encode(_batch)")
     ap.add_argument("--tokenizer", default=TOKENIZER,
                     help=f"Parabix tokenizer binary (default: {TOKENIZER})")
     ap.add_argument("--merges", default=MERGES,
@@ -508,6 +548,11 @@ def main():
                     help=f"HuggingFace tokenizer.json (default: {TOKENIZER_JSON})")
     args = ap.parse_args()
     TOKENIZER, MERGES, TOKENIZER_JSON = args.tokenizer, args.merges, args.tokenizer_json
+    if args.sweep and not (args.sweep_source or args.openwebtext):
+        ap.error("--sweep needs --sweep-source FILE (or --openwebtext)")
+    if not (args.input or args.sweep or args.openwebtext):
+        ap.error("no input: give --input FILE [FILE ...], --sweep --sweep-source FILE, "
+                 "or --openwebtext")
     only_flags = [args.parabix_only, args.hf_only, args.tiktoken_only]
     if sum(only_flags) > 1:
         print("Error: --parabix-only / --hf-only / --tiktoken-only are mutually exclusive.")
@@ -516,6 +561,15 @@ def main():
         print(f"Error: tokenizer binary not found: {TOKENIZER}")
         sys.exit(1)
     parabix_extra = shlex.split(args.parabix_args)
+    # Time the pipeline compare_bpe.py validates: without a pretokenizer the tokenizer
+    # takes a different (unchecked) path, and merges are not limited to pretokens.
+    if not any(a.startswith("--pretokenizer") for a in parabix_extra):
+        parabix_extra.insert(0, "--pretokenizer=bytelevel")
+    parabix_threads = next((a.split("=", 1)[1] for a in parabix_extra
+                            if a.startswith("--thread-num=")), "default")
+    if args.baseline_threads > 1:
+        # rayon reads this when HF first runs a batch, so set it before any encode.
+        os.environ["RAYON_NUM_THREADS"] = str(args.baseline_threads)
 
     owt_path = None
     if args.openwebtext:
@@ -525,8 +579,8 @@ def main():
 
     tmpdir = None
     if args.sweep:
-        # --sweep-source beats --openwebtext beats the built-in corpus.
-        sweep_src = args.sweep_source or owt_path or SWEEP_SOURCE
+        # --sweep-source beats --openwebtext.
+        sweep_src = args.sweep_source or owt_path
         if not os.path.isfile(sweep_src):
             print(f"No sweep source corpus: {sweep_src}")
             sys.exit(1)
@@ -562,20 +616,15 @@ def main():
             files.append(fp)
         for sz, why in skipped:
             sys.stderr.write(f"  [sweep] skipping {_fmt_bytes(sz)} ({why})\n")
-    elif args.input:
-        files = [args.input]
     else:
-        files = list(DEFAULT_SWEEP)
-        if args.big:
-            files.append(BIG_FILE)
+        files = list(args.input or [])
         if owt_path:
             files.append(owt_path)
-    # BIG_FILE is also a DEFAULT_SWEEP entry, so --big would otherwise bench the
-    # same 12 MB corpus twice. Dedupe, order-preserving.
-    files = list(dict.fromkeys(f for f in files if os.path.isfile(f)))
-    if not files:
-        print("No corpus files found.")
-        sys.exit(1)
+        missing = [f for f in files if not os.path.isfile(f)]
+        if missing:
+            print(f"Error: input file not found: {', '.join(missing)}")
+            sys.exit(1)
+        files = list(dict.fromkeys(files))   # a file named twice is benched once
 
     want_parabix  = not (args.hf_only or args.tiktoken_only)
     want_hf       = not (args.parabix_only or args.tiktoken_only)
@@ -605,19 +654,34 @@ def main():
         if not args.no_adaptive_iters:
             out.write(f", scaled down above {ITER_SCALE_THRESHOLD >> 20} MB "
                       f"(floor {ITER_FLOOR})")
+        if args.parabix_iters:
+            out.write(f"; Parabix {args.parabix_iters}")
+        out.write(f"\nThreads: Parabix --thread-num={parabix_threads}, "
+                  f"HF/tiktoken {args.baseline_threads}")
+        if args.baseline_threads > 1:
+            out.write(" (encode_batch over the text split at safe pretoken boundaries)")
         out.write("\n" + SEP + "\n")
 
         for path in files:
             it = iters_for(os.path.getsize(path), args.iters,
                            adaptive=not args.no_adaptive_iters)
-            p = run_parabix(path, it, parabix_extra) if want_parabix else None
-            text = None
+            p = run_parabix(path, args.parabix_iters or it, parabix_extra) if want_parabix else None
+            text = chunks = None
             if want_hf or want_tiktoken:
-                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                # newline="": keep "\r\n" as it is in the file. Text mode would drop the
+                # CRs, and HF/tiktoken would tokenize fewer bytes than Parabix reads.
+                with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
                     text = f.read()
-            h = run_hf(tok, text, it) if want_hf else None
-            t = run_tiktoken(tiktoken_enc, text, it) if want_tiktoken else None
+                if args.baseline_threads > 1:
+                    chunks = split_for_threads(text, 4 * args.baseline_threads)
+            h = run_hf(tok, text, it, chunks) if want_hf else None
+            t = run_tiktoken(tiktoken_enc, text, it, chunks, args.baseline_threads,
+                             args.tiktoken_ordinary) if want_tiktoken else None
             results = {"Parabix": p, "HF": h, "tiktoken": t}
+            sizes = {r["bytes"] for r in results.values() if r}
+            if len(sizes) > 1:
+                sys.stderr.write(f"  warning: engines read different byte counts {sorted(sizes)} "
+                                 f"for {path} (invalid UTF-8?)\n")
             write_row(out, os.path.basename(path), results)
             rows.append((path, results))
 
@@ -630,6 +694,8 @@ def main():
         out.write("      HF and tiktoken via preloaded in-process encode() loops (model/\n")
         out.write("      encoding load excluded). Peak MB/s is best-iteration; marginal\n")
         out.write("      MB/s removes the fixed per-call floor (see --sweep).\n")
+        out.write("      All engines read the same bytes (CRLF kept). Compare speedups\n")
+        out.write("      at equal threads: --thread-num=N with --baseline-threads=N.\n")
         out.write(SEP + "\n")
 
     if args.svg:

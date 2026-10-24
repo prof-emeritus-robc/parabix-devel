@@ -580,12 +580,13 @@ Every optimization must be **byte-identical** to the baseline. Two ways to check
 
 ```bash
 cd tokenizer-test
-python3 compare_bpe.py --no-timing                              # baseline
-python3 compare_bpe.py --no-timing --tok-flag=--partition=level # flag under test
+IN=../tokenizer_files/val_4MB.txt
+python3 compare_bpe.py --no-timing --input=$IN                                   # baseline
+python3 compare_bpe.py --no-timing --input=$IN --parabix-args="--partition=level" # flag under test
 ```
 
-`--tok-flag` is repeatable and forwards verbatim to the binary; use the `=` form
-or argparse swallows the next `--...` token. The run prints
+`--input` is required. `--parabix-args` forwards its flags verbatim to the binary;
+use the `=` form or argparse swallows the next `--...` token. The run prints
 `Extra tokenizer flags: …` when any are active — no such line means the default
 path was tested. `--no-timing` skips the throughput section, which builds its
 command *without* `--pretokenizer=bytelevel` and would otherwise JIT and measure a

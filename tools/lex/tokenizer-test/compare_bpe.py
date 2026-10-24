@@ -17,17 +17,16 @@ tiktoken runs its own Rust implementation of the same GPT-2 encoding (its
 "gpt2" built-in encoding), not loaded from this project's files at all --
 a genuinely independent implementation, not just a second config of the same one.
 
-Usage:
-    python compare_bpe.py                              # default input file
-    python compare_bpe.py --input path/to/cases.txt   # custom input file
-    python compare_bpe.py --verbose                    # full token-by-token table always
-    python compare_bpe.py --parabix-only               # skip HF + tiktoken
-    python compare_bpe.py --hf-only                    # skip Parabix + tiktoken
-    python compare_bpe.py --tiktoken-only               # skip Parabix + HF
-    python compare_bpe.py --no-tiktoken                 # Parabix vs HF only (original behavior)
-    python compare_bpe.py --runs 10                    # timed runs per side (default 5)
-    python compare_bpe.py --no-timing                  # skip the timing section
-    python compare_bpe.py --parabix-args="--level-partition --compact-base=2"
+Usage (--input is required: no input file is built into the script):
+    python compare_bpe.py --input path/to/cases.txt
+    python compare_bpe.py --input FILE --verbose         # full token-by-token table always
+    python compare_bpe.py --input FILE --parabix-only    # skip HF + tiktoken
+    python compare_bpe.py --input FILE --hf-only         # skip Parabix + tiktoken
+    python compare_bpe.py --input FILE --tiktoken-only   # skip Parabix + HF
+    python compare_bpe.py --input FILE --no-tiktoken     # Parabix vs HF only (original behavior)
+    python compare_bpe.py --input FILE --runs 10         # timed runs per side (default 5)
+    python compare_bpe.py --input FILE --no-timing       # skip the timing section
+    python compare_bpe.py --input FILE --parabix-args="--partition=level --compact-base=2"
 """
 
 import sys
@@ -47,12 +46,12 @@ import tiktoken
 
 # Defaults only: the repo root is three levels above this script
 # (tools/lex/tokenizer-test/); --tokenizer/--merges/--vocab/--tokenizer-json override.
+# The input file has no default: it is always given with --input.
 REPO_ROOT      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
 MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
-DEFAULT_INPUT  = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/val_4MB.txt")
 OUTPUT_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "compare_bpe_output.txt")
 
@@ -455,8 +454,8 @@ def write_summary(out, results: dict) -> None:
 def main() -> None:
     global SHOW_INPUT, EXTRA_ARGS, TOKENIZER, MERGES, VOCAB, TOKENIZER_JSON
     parser = argparse.ArgumentParser(description="BPE tokenizer comparison test suite.")
-    parser.add_argument("--input",        default=DEFAULT_INPUT,
-                        help=f"Input file (entire file is one test case, default: {DEFAULT_INPUT})")
+    parser.add_argument("--input",        required=True, metavar="FILE",
+                        help="Input file (required; the entire file is one test case)")
     parser.add_argument("--hf-only",      action="store_true",
                         help="Run HuggingFace tokenizer only")
     parser.add_argument("--parabix-only", action="store_true",

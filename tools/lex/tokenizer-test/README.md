@@ -88,16 +88,16 @@ identical model. To re-fetch them manually:
 
 ## Corpora — supply your own
 
-**No test corpus is committed.** The scripts' default input paths point at local
-files that are not in the repo, so a fresh checkout must pass `--input`
-(and, for `bench_bpe.py`, `--sweep-source`) explicitly, or create the corpora
+**No test corpus is committed.** `compare_bpe.py` and `bench_bpe.py` have no
+default input at all: `compare_bpe.py` needs `--input FILE`, and `bench_bpe.py`
+needs `--input FILE [FILE ...]`, `--sweep --sweep-source FILE` or
+`--openwebtext`. The other two scripts still default to a local file that is
+not in the repo, so a fresh checkout must pass `--input` there too, or create it
 first.
 
 | Default the scripts expect | Used by |
 |----------------------------|---------|
 | `build19/test.txt` | `compare_normalizers.py`, `compare_pretokenizers.py` |
-| `tokenizer_files/val_4MB.txt` | `compare_bpe.py` |
-| `tokenizer_files/webtext_10.txt`, `webtext_100.txt`, `webtext_cases.txt` | `bench_bpe.py` default corpus list and sweep source |
 
 Any UTF-8 text works for scripts 1–3. For `bench_bpe.py`, size matters — the
 sweep needs multi-MB inputs to condition its fit (see below), and the easiest way
@@ -217,13 +217,13 @@ One-time setup (spawn + merges load + JIT on one side, `from_file()` on the
 other) is excluded from both. Reported as min / median / mean ms and MB/s.
 
 ```bash
-python compare_bpe.py --input path/to/corpus.txt   # no corpus is committed
-python compare_bpe.py --verbose                    # always print the token table
-python compare_bpe.py --show-input                 # print the input text, not just a byte count
-python compare_bpe.py --runs 10                    # timed iterations per side (timing is ON by default, N=5)
-python compare_bpe.py --no-timing                  # correctness only — the only way to skip timing
-python compare_bpe.py --parabix-only
-python compare_bpe.py --hf-only
+python compare_bpe.py --input path/to/corpus.txt   # --input is required
+python compare_bpe.py --input FILE --verbose       # always print the token table
+python compare_bpe.py --input FILE --show-input    # print the input text, not just a byte count
+python compare_bpe.py --input FILE --runs 10       # timed iterations per side (timing is ON by default, N=5)
+python compare_bpe.py --input FILE --no-timing     # correctness only — the only way to skip timing
+python compare_bpe.py --input FILE --parabix-only
+python compare_bpe.py --input FILE --hf-only
 ```
 
 Output → `compare_bpe_output.txt`.
@@ -286,17 +286,17 @@ so this costs almost no precision. Disable with `--no-adaptive-iters`.
 
 ```bash
 python bench_bpe.py --input file.txt         # one file
+python bench_bpe.py --input a.txt b.txt      # several files, one row each
 python bench_bpe.py --sweep --sweep-source file.txt   # prefix sweep + floor/marginal fit
-python bench_bpe.py --sweep --sweep-max-mb 1 # cheap sub-MB sweep
-python bench_bpe.py --sweep-sizes 1,4,8      # explicit sizes in MB
-python bench_bpe.py --iters 20               # timed iterations per side
-python bench_bpe.py --no-adaptive-iters
-python bench_bpe.py --openwebtext            # stream + cache a real-world sample
+python bench_bpe.py --sweep --sweep-source file.txt --sweep-max-mb 1   # cheap sub-MB sweep
+python bench_bpe.py --sweep --sweep-source file.txt --sweep-sizes 1,4,8   # explicit sizes in MB
+python bench_bpe.py --input FILE --iters 20  # timed iterations per side
+python bench_bpe.py --input FILE --no-adaptive-iters
+python bench_bpe.py --openwebtext            # stream + cache a real-world sample, bench it
 python bench_bpe.py --openwebtext --owt-bytes 50000000
-python bench_bpe.py --big                    # append the large corpus, if present
-python bench_bpe.py --svg bench.svg          # also emit a MB/s bar chart
-python bench_bpe.py --parabix-only
-python bench_bpe.py --hf-only
+python bench_bpe.py --input FILE --svg bench.svg   # also emit a MB/s bar chart
+python bench_bpe.py --input FILE --parabix-only
+python bench_bpe.py --input FILE --hf-only
 ```
 
 `--parabix-args "<flags>"` passes raw tokenizer flags straight through to every

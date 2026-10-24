@@ -848,7 +848,9 @@ protected:
 class MatchStartsFromEnds : public pablo::PabloKernel {
 public:
     MatchStartsFromEnds(LLVMTypeSystemInterface & ts, StreamSet * Spans, StreamSet * Ends, StreamSet * Starts)
-    : PabloKernel(ts, "MatchStartsFromEnds", {Binding{"Spans", Spans}, Binding{"Ends", Ends}}, {Binding{"Starts", Starts}}) {}
+    : PabloKernel(ts, "MatchStartsFromEnds", {Binding{"Spans", Spans}, Binding{"Ends", Ends}}, {Binding{"Starts", Starts}}) {
+        addAttribute(kernel::LocalCarries(1));
+    }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -1091,7 +1093,16 @@ protected:
               v.emplace_back(std::find(sets.begin(), sets.end(), f.streamSet) - sets.begin(), f.index);
           }
           return v;
-      }()) {}
+      }()) {
+        //  Without self-overlapping rules, the matches are of fixed lengths (Advances only).
+        unsigned extent = 0;
+        bool fixed = true;
+        for (const Rule & r : rules) {
+            fixed = fixed && !r.selfOverlapping;
+            if (r.length > 1) extent = std::max(extent, r.length - 1);
+        }
+        if (fixed && extent > 0) addAttribute(kernel::LocalCarries(extent));
+    }
 protected:
     //  The rules, as a hash of their lengths, predecessors and self-overlaps (the
     //  description itself may be too long for a kernel name).
@@ -2536,7 +2547,23 @@ private:
           return v;
       }()),
       mCoverageIn(mConfig.coverage && in.spans != nullptr),
-      mSignature(std::move(sig)) {}
+      mSignature(std::move(sig)) {
+        //  Other than a correction kernel, a kernel matches fixed sequences of sets (Advances
+        //  only), unless a string rule deletes the run following its text.
+        if (mConfig.rounds > 0) return;
+        auto beforeLength = [](const FusedContexts & before) {
+            unsigned B = 0;
+            for (const FusedContext & alt : before) B = std::max(B, static_cast<unsigned>(alt.size()));
+            return B;
+        };
+        unsigned extent = 0;
+        for (const FusedStringRule & r : mConfig.strings) {
+            if (!r.run.empty()) return;
+            extent = std::max(extent, beforeLength(r.before) + static_cast<unsigned>(r.text.size()) - 1);
+        }
+        for (const FusedSubgroup & g : mConfig.subgroups) extent = std::max(extent, beforeLength(g.before));
+        if (extent > 0) addAttribute(kernel::LocalCarries(extent));
+    }
     static Bindings inputs(const FusedRulesConfig & c, const FusedLayout & l, StreamSet * U21, StreamSet * Classes,
                            StreamSet * InText, StreamSet * Mask, StreamSet * Allowed, const FusedState & in) {
         Bindings b;
@@ -3467,7 +3494,23 @@ public:
     : PabloKernel(ts, "CaptureWalk_" + getStringHash(config.signature()),
                   {Binding{"U21", U21, FixedRate(1), LookAhead(std::max(1u, config.lookahead()))}, Binding{"Starts", Starts}},
                   {Binding{"Marks", Marks}}),
-      mConfig(std::move(config)) {}
+      mConfig(std::move(config)) {
+        //  Without repetitions, the walk advances by fixed lengths.
+        unsigned extent = 0;
+        for (unsigned t : mConfig.textLengths) extent += t;
+        for (const auto & c : mConfig.captures) {
+            for (const WalkItem & w : c) {
+                if (w.kind == WalkItem::Kind::Star) return;
+                unsigned step = 1;
+                if (w.kind == WalkItem::Kind::Strings) {
+                    step = 0;
+                    for (const auto & str : w.strings) step = std::max(step, static_cast<unsigned>(str.size()));
+                }
+                extent += step;
+            }
+        }
+        if (extent > 0) addAttribute(kernel::LocalCarries(extent));
+    }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -3789,7 +3832,11 @@ public:
                   StreamSet * Slots, StreamSet * Chars, StreamSet * Keep)
     : PabloKernel(ts, "DeferredSlots_" + getStringHash(config.signature()),
                   {Binding{"Info", Info}, Binding{"Spread", Spread}},
-                  {Binding{"Slots", Slots}, Binding{"Chars", Chars}, Binding{"Keep", Keep}}), mConfig(std::move(config)) {}
+                  {Binding{"Slots", Slots}, Binding{"Chars", Chars}, Binding{"Keep", Keep}}), mConfig(std::move(config)) {
+        size_t extent = 0;
+        for (const std::u32string & r : mConfig.replacements) extent = std::max(extent, r.size());
+        if (extent > 0) addAttribute(kernel::LocalCarries(extent));
+    }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -4502,7 +4549,9 @@ StreamSet * RulePipelineBuilder::fcd(StreamSet * U21) {
 class FCC_Window : public pablo::PabloKernel {
 public:
     FCC_Window(LLVMTypeSystemInterface & ts, StreamSet * Starters, StreamSet * Visible)
-    : PabloKernel(ts, "FCC_Window", {Binding{"Starters", Starters}}, {Binding{"Visible", Visible}}) {}
+    : PabloKernel(ts, "FCC_Window", {Binding{"Starters", Starters}}, {Binding{"Visible", Visible}}) {
+        addAttribute(kernel::LocalCarries(1));
+    }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());

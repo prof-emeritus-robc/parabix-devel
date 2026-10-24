@@ -25,6 +25,10 @@ class KernelBuilder;
 // --CircularBufferImpl). The result must be freeable by munmap.
 extern uint8_t * (*CircularBufferAllocator)(size_t size, size_t hasUnderflow);
 
+// Unmap the circular buffers that released pipeline buffers left for reuse (--CircularBufferPool).
+// Runs at exit; long-running users may call it to give the memory back sooner.
+void releaseCircularBufferPool();
+
 class StreamSetBuffer {
 public:
 

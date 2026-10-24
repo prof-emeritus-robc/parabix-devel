@@ -155,6 +155,8 @@ extern std::string CPUFeatureOptions;
 extern bool UseI64Builder;
 extern PipelineCompilationModeOptions PipelineCompilationMode;
 extern CircularBufferImplOptions CircularBufferImpl;  // set from command line: --CircularBufferImpl
+extern unsigned CircularBufferPoolMiB;  // set from command line: --CircularBufferPool
+extern bool PoisonReusedBuffers;  // set from command line: --PoisonReusedBuffers
 #ifdef ENABLE_PAPI
 extern std::string PapiCounterOptions;
 #endif

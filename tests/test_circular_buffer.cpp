@@ -7,9 +7,12 @@
 // the same pages (a write through any copy is read back through all of them), with and
 // without the underflow copy, and the whole mapping must be freeable by munmap. On macOS
 // the default buffer must be anonymous memory (Mach vm_remap), not the file-backed mapping
-// of a temp file in /tmp, which --CircularBufferImpl=memfd still selects.
+// of a temp file in /tmp, which --CircularBufferImpl=memfd still selects. Then the reuse
+// pool (--CircularBufferPool): a released buffer comes back for the same size only, still
+// mirrored, within the pool's limit, and not after releaseCircularBufferPool().
 
 #include <toolchain/toolchain.h>
+#include <kernel/core/streamset.h>
 #include <idisa/CBuilder.h>
 #include <sys/mman.h>
 #include <cstdint>
@@ -21,6 +24,7 @@
 #endif
 
 extern "C" uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow);
+extern "C" void release_circular_buffer(uint8_t * const addr, const size_t mappedLength);
 
 static unsigned failures = 0;
 
@@ -77,8 +81,55 @@ static void testBuffer(const char * impl, const size_t size, const size_t hasUnd
     check(munmap(base, m * size) == 0, "munmap", impl, size, hasUnderflow);
 }
 
+static bool mirrored(uint8_t * const p, const size_t size) {
+    p[size + 3] = 0x77;
+    return p[3] == 0x77;
+}
+
+static void testPool(const size_t page) {
+    const char * const impl = "pool";
+    codegen::CircularBufferImpl = codegen::CircularBufferImplOptions::Default;
+    codegen::CircularBufferPoolMiB = 1;
+    const size_t size = 4 * page;
+    uint8_t * const a = make_circular_buffer(size, 0);
+    a[0] = a[size - 1] = 0x42;
+    release_circular_buffer(a, 2 * size);
+    // another size misses the pool; the same size gets the released buffer back
+    uint8_t * const b = make_circular_buffer(2 * size, 0);
+    check(b != a, "other size reused", impl, size, 0);
+    uint8_t * const c = make_circular_buffer(size, 0);
+    check(c == a, "same size not reused", impl, size, 0);
+    check(c[0] == 0 && c[size - 1] == 0, "reused buffer not zeroed", impl, size, 0);
+    check(mirrored(c, size), "reused buffer not mirrored", impl, size, 0);
+    // poisoned on reuse when asked
+    release_circular_buffer(c, 2 * size);
+    codegen::PoisonReusedBuffers = true;
+    uint8_t * const d = make_circular_buffer(size, 0);
+    codegen::PoisonReusedBuffers = false;
+    check(d == a && d[0] == 0xA5 && d[size - 1] == 0xA5, "reused buffer not poisoned", impl, size, 0);
+    release_circular_buffer(d, 2 * size);
+    release_circular_buffer(b, 4 * size);
+    // from here on a pooled buffer comes back as 0xA5 and a fresh one as zeros (the address
+    // alone can't tell: the VM often maps a fresh buffer where the last one was unmapped)
+    codegen::PoisonReusedBuffers = true;
+    // past the 1 MiB limit a released buffer is unmapped, not kept
+    const size_t big = (1 << 20) - page;
+    uint8_t * const e = make_circular_buffer(big, 0);
+    release_circular_buffer(e, 2 * big);
+    uint8_t * const f = make_circular_buffer(big, 0);
+    check(f[0] == 0 && mirrored(f, big), "over-limit buffer kept", impl, big, 0);
+    munmap(f, 2 * big);
+    // after a drain the pool hands out nothing it held
+    kernel::releaseCircularBufferPool();
+    uint8_t * const g = make_circular_buffer(size, 0);
+    check(g[0] == 0 && mirrored(g, size), "pooled buffer survived the drain", impl, size, 0);
+    codegen::PoisonReusedBuffers = false;
+    munmap(g, 2 * size);
+}
+
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv);
+    codegen::CircularBufferPoolMiB = 0;  // fresh buffers, so that each impl's mapping is checked
     const size_t page = CBuilder::PAGE_SIZE;
     const size_t sizes[] = {page, 4 * page, 64 * page};
     const struct { codegen::CircularBufferImplOptions opt; const char * name; } impls[] = {
@@ -93,6 +144,7 @@ int main(int argc, char *argv[]) {
             }
         }
     }
+    testPool(page);
     if (failures) {
         std::fprintf(stderr, "%u failure(s)\n", failures);
         return EXIT_FAILURE;

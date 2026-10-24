@@ -9,6 +9,7 @@
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/adt.h>
+#include <re/adt/memoization.h>
 #include <re/toolchain/toolchain.h>
 #include <re/printer/re_printer.h>
 
@@ -59,6 +60,7 @@ case T::Type: to = transform##Type(llvm::cast<Type>(from)); break
         TRANSFORM(Start);
         TRANSFORM(Permute);
         TRANSFORM(Interleavable);
+        TRANSFORM(String);
         TRANSFORM(PropertyExpression);
         // No default: -Wswitch flags any RE type missing here.
     }
@@ -224,6 +226,10 @@ RE * RE_Transformer::transformInterleavable(Interleavable * s) {
     }
     if (!any_changed) return s;
     return makeInterleavable(elems.begin(), elems.end());
+}
+
+RE * RE_Transformer::transformString(String * s) {
+    return s;
 }
 
 RE * RE_Transformer::transformPropertyExpression(PropertyExpression * pe) {

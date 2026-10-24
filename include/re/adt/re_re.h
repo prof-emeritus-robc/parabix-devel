@@ -37,6 +37,7 @@ public:
         , Start
         , Permute
         , Interleavable
+        , String
     };
     inline ClassTypeId getClassTypeId() const {
         return mClassTypeId;

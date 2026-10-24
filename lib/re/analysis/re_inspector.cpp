@@ -41,6 +41,7 @@ void RE_Inspector::inspect(RE * const re) {
         INSPECT(Start);
         INSPECT(Permute);
         INSPECT(Interleavable);
+        INSPECT(String);
         INSPECT(PropertyExpression);
         // No default: -Wswitch flags any RE type missing here.
     }
@@ -125,6 +126,10 @@ void RE_Inspector::inspectInterleavable(Interleavable * s) {
     for (RE * e : *s) {
         inspect(e);
     }
+}
+
+// A String is inspected as the Seq of its singleton CCs.
+void RE_Inspector::inspectString(String * s) {
 }
 
 void RE_Inspector::inspectPropertyExpression(PropertyExpression * pe) {

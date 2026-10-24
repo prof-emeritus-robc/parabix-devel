@@ -98,6 +98,7 @@ const char * getClassTypeName(RE::ClassTypeId t) {
         case T::Start: return "Start";
         case T::Permute: return "Permute";
         case T::Interleavable: return "Interleavable";
+        case T::String: return "String";
     }
     llvm_unreachable("Unknown RE type");
 }

@@ -43,6 +43,7 @@ case T::Type: return validate##Type(llvm::cast<Type>(re)); break
             VALIDATE(Start);
             VALIDATE(Permute);
             VALIDATE(Interleavable);
+            VALIDATE(String);
             VALIDATE(PropertyExpression);
         // No default: -Wswitch flags any RE type missing here.
     }
@@ -133,6 +134,10 @@ bool RE_Validator::validateInterleavable(const Interleavable * s) {
     for (RE * e : *s) {
         if (!validate(e)) return false;
     }
+    return true;
+}
+
+bool RE_Validator::validateString(const String * s) {
     return true;
 }
 

@@ -163,6 +163,20 @@ void REStringBuilder::buildString(const RE * re) {
             comma = true;
         }
         out << "])";
+    } else if (const String * s = dyn_cast<const String>(re)) {
+        // Printable ASCII appears as is; '"', '\\' and all other
+        // codepoints are escaped as \u{hex}.
+        out << "String \"";
+        for (const char32_t c : *s) {
+            if ((c >= 0x20) && (c < 0x7F) && (c != '"') && (c != '\\')) {
+                out << static_cast<char>(c);
+            } else {
+                out << "\\u{";
+                out.write_hex(c);
+                out << '}';
+            }
+        }
+        out << '"';
     } else if (const Group * g = dyn_cast<const Group>(re)) {
         out << "Group(";
         if (g->getMode() == Group::Mode::GraphemeMode) {

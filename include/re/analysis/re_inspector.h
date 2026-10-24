@@ -50,6 +50,7 @@ protected:
     virtual void inspectAssertion(Assertion * a);
     virtual void inspectPermute(Permute * p);
     virtual void inspectInterleavable(Interleavable * s);
+    virtual void inspectString(String * s);
     virtual void inspectPropertyExpression(PropertyExpression * pe);
 private:
     const NameProcessingMode mNameMode;

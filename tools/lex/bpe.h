@@ -128,7 +128,7 @@ struct BPEPassResult {
 // --bpe-tail emitter: finishes BPE per segment over the tokens at `starts` (ids = 16×1 BixNum,
 // segs = segment starts) in order, and hands the finished ids to the sink, in order, a batch
 // per pipeline call.
-// The opt-in framework hooks of the BPE flags (--vm-ring-buffers, --memsource-block-capacity).
+// The opt-in framework hooks of the BPE flags (--memsource-block-capacity).
 // Call before building the pipeline: the source kernel reads its hook when constructed.
 void bpeSetFrameworkHooks();
 

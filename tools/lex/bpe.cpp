@@ -77,11 +77,7 @@
 #include <kernel/streamutils/stream_shift.h>   // IndexedShiftBack (BPE_INDEXED_SHIFT)
 #include <stdexcept>
 #include <boost/intrusive/detail/math.hpp>
-#include <kernel/core/streamset.h>               // CircularBufferAllocator (--vm-ring-buffers)
 #include <kernel/io/source_kernel.h>              // MemorySourceBlockCapacity (--memsource-block-capacity)
-#ifdef __APPLE__
-#include <mach/mach.h>
-#endif
 using boost::intrusive::detail::ceil_log2;
 
 using namespace llvm;
@@ -529,11 +525,6 @@ static cl::opt<unsigned> BPETail(
              "segment in the emitter (0 = off, the default)."),
     cl::init(0));
 
-// --vm-ring-buffers (macOS): build the pipeline's circular buffers with mach vm_remap
-// (kernel::CircularBufferAllocator) instead of the framework's memfd mapping, which on macOS
-// is a temp file in /tmp: mkstemp + unlink + ftruncate per buffer on every pipeline run,
-// ~9% of a 1-thread run, all of it before the worker threads start. Runtime only (the
-// kernels' code is the same), so no cache tag. No effect elsewhere.
 // --tail-direct-input (with --bpe-tail, when no retirement point comes before the cut): hand
 // the tail the last kernel's id bits, live mask and segment starts as they are. Otherwise
 // they go through BPEWidenKernel (to 16 id bits), BPERetirePackKernel and
@@ -571,10 +562,13 @@ static cl::opt<bool> TailCachePool(
              "runs and threads (default off)."),
     cl::init(false));
 
+// --vm-ring-buffers: retired, accepted and ignored. Circular buffers are now built with Mach
+// vm_remap on macOS by default (kernel/core make_circular_buffer); --CircularBufferImpl=memfd
+// selects the old temp-file mapping.
 static cl::opt<bool> VMRingBuffers(
     "vm-ring-buffers",
-    cl::desc("macOS: build circular buffers with vm_remap instead of a temp file (default off)."),
-    cl::init(false));
+    cl::desc("Retired: macOS circular buffers use vm_remap by default (see --CircularBufferImpl)."),
+    cl::init(false), cl::Hidden);
 
 // --memsource-block-capacity: the in-memory source's buffer capacity is the input length
 // rounded up to a whole block (kernel::MemorySourceBlockCapacity). Without it, an input whose
@@ -3374,32 +3368,8 @@ static bool bitXfrmEligible(const MergeRuleGroup & g) {
 //   Returns (matchEnd, vocabID=source). NOTE: emission is Stage-B debug —
 //   matchEnd = active (all ones) prints the id at EVERY byte, so stale interior
 //   ids of swallowed parts still show. Correct emission (consume) is Stage C.
-#ifdef __APPLE__
-// --vm-ring-buffers: the same layout as make_circular_buffer (m = 2 + hasUnderflow copies of
-// one size-byte region, back to back), built by mapping slot 0's pages over the other slots.
-static uint8_t * bpeVMRingBuffer(const size_t size, const size_t hasUnderflow) {
-    const size_t m = 2 + hasUnderflow;
-    const mach_port_t task = mach_task_self();
-    vm_address_t base = 0;
-    if (vm_allocate(task, &base, m * size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
-        report_fatal_error("--vm-ring-buffers: vm_allocate failed");
-    for (size_t i = 1; i < m; i++) {
-        vm_address_t target = base + i * size;
-        vm_prot_t cur, max;
-        if (vm_remap(task, &target, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, base,
-                     FALSE, &cur, &max, VM_INHERIT_DEFAULT) != KERN_SUCCESS || target != base + i * size)
-            report_fatal_error("--vm-ring-buffers: vm_remap failed");
-    }
-    return reinterpret_cast<uint8_t *>(base) + hasUnderflow * size;
-}
-#endif
-
 void bpeSetFrameworkHooks() {
-#ifdef __APPLE__
-    if (VMRingBuffers) kernel::CircularBufferAllocator = bpeVMRingBuffer;
-#else
-    if (VMRingBuffers) std::cerr << "[BPE] --vm-ring-buffers ignored: macOS only\n";
-#endif
+    if (VMRingBuffers) std::cerr << "[BPE] --vm-ring-buffers is retired: vm_remap is the macOS default\n";
     if (MemSourceBlockCapacity) kernel::MemorySourceBlockCapacity = true;
 }
 

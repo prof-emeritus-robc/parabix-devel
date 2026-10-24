@@ -113,6 +113,14 @@ add_test(NAME region_reversal_test
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/region_reversal_test.py ${TEST_BIN_DIR}/region_reversal)
 
+# make_circular_buffer under each --CircularBufferImpl: every copy mirrors the same pages
+parabix_add_executable(NAME test_circular_buffer SRC test_circular_buffer.cpp
+                       DEPS kernel.core toolchain)
+add_test(NAME circular_buffer_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ${TEST_BIN_DIR}/test_circular_buffer)
+
+
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}

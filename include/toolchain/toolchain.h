@@ -84,6 +84,13 @@ enum PipelineCompilationModeOptions {
     , Expensive
 };
 
+// How circular (double-mapped) stream buffers are built: Default is Mach vm_remap on macOS
+// and a memfd mapping elsewhere; Memfd always uses the memfd mapping (a temp file on macOS).
+enum class CircularBufferImplOptions {
+    Default
+    , Memfd
+};
+
 // not an exhaustive list; can be extended but keep __Count as the last entry
 enum class Feature : size_t {
     SSSE3,
@@ -147,6 +154,7 @@ extern std::string DoubleStreamSetSizeOptions;
 extern std::string CPUFeatureOptions;
 extern bool UseI64Builder;
 extern PipelineCompilationModeOptions PipelineCompilationMode;
+extern CircularBufferImplOptions CircularBufferImpl;  // set from command line: --CircularBufferImpl
 #ifdef ENABLE_PAPI
 extern std::string PapiCounterOptions;
 #endif

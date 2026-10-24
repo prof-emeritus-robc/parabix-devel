@@ -30,6 +30,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#undef PAGE_SIZE  // mach's macro (vm_page_size) would hide CBuilder::PAGE_SIZE
+#endif
 
 #include <llvm/Support/raw_os_ostream.h>
 
@@ -76,6 +80,35 @@ return fd;
 
 uint8_t * (*kernel::CircularBufferAllocator)(size_t, size_t) = nullptr;
 
+#ifdef __APPLE__
+// On macOS create_memfd() is a temp file in /tmp (mkstemp + unlink + ftruncate), ~100-250us
+// per buffer, and the buffer's pages are then file-backed. Instead reserve the m copies as
+// anonymous memory and map the pages of copy 0 over each of the others. Returns nullptr on
+// failure, so that the caller can fall back to the memfd mapping.
+static uint8_t * make_mach_circular_buffer(const size_t size, const size_t m) {
+    const mach_port_t task = mach_task_self();
+    vm_address_t base = 0;
+    if (vm_allocate(task, &base, m * size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS) {
+        return nullptr;
+    }
+    for (size_t i = 1; i < m; ++i) {
+        vm_address_t target = base + i * size;
+        vm_prot_t cur, max;
+        if (vm_remap(task, &target, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, base,
+                     FALSE, &cur, &max, VM_INHERIT_DEFAULT) != KERN_SUCCESS || target != base + i * size) {
+            vm_deallocate(task, base, m * size);
+            return nullptr;
+        }
+    }
+    // as with MAP_SHARED, a forked child keeps one set of pages behind every copy
+    if (vm_inherit(task, base, m * size, VM_INHERIT_SHARE) != KERN_SUCCESS) {
+        vm_deallocate(task, base, m * size);
+        return nullptr;
+    }
+    return reinterpret_cast<uint8_t *>(base);
+}
+#endif
+
 extern "C"
 uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
 
@@ -85,6 +118,18 @@ uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
     if (kernel::CircularBufferAllocator) {
         return kernel::CircularBufferAllocator(size, hasUnderflow);
     }
+
+    assert (hasUnderflow == 0 || hasUnderflow == 1);
+
+    const size_t m = 2 + hasUnderflow;
+
+    #ifdef __APPLE__
+    if (codegen::CircularBufferImpl == codegen::CircularBufferImplOptions::Default) {
+        if (uint8_t * const base = make_mach_circular_buffer(size, m)) {
+            return base + (hasUnderflow * size);
+        }
+    }
+    #endif
 
     const auto memfd = create_memfd();
     if (memfd == -1) {
@@ -97,10 +142,6 @@ uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
     if (ftruncate(memfd, size) == -1) {
         report_fatal_error(Twine{"failed to size mmap buffer to ", std::to_string(size)});
     }
-
-    assert (hasUnderflow == 0 || hasUnderflow == 1);
-
-    const size_t m = 2 + hasUnderflow;
 
     uint8_t * const base = (uint8_t*)mmap(NULL, m * size, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
     if (base == MAP_FAILED) {

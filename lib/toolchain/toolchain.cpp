@@ -289,6 +289,14 @@ PipelineCompilationModeOption("pipeline-optimization-level", cl::location(Pipeli
                   cl::values(clEnumValN(PipelineCompilationModeOptions::DefaultFast, "fast", "minimal analysis(default)"),
                              clEnumValN(PipelineCompilationModeOptions::Expensive, "aggressive", "full analysis")), cl::cat(CodeGenOptions));
 
+CircularBufferImplOptions CircularBufferImpl = CircularBufferImplOptions::Default;
+static cl::opt<CircularBufferImplOptions, true>
+CircularBufferImplOption("CircularBufferImpl", cl::location(CircularBufferImpl),
+                  cl::init(CircularBufferImplOptions::Default),
+                  cl::desc("Set how circular stream buffers are built:"),
+                  cl::values(clEnumValN(CircularBufferImplOptions::Default, "default", "Mach vm_remap on macOS, memfd elsewhere (default)"),
+                             clEnumValN(CircularBufferImplOptions::Memfd, "memfd", "memfd mapping (a temp file in /tmp on macOS)")), cl::cat(CodeGenOptions));
+
 static cl::opt<bool, true> EnableObjectCacheOption("enable-object-cache", cl::location(EnableObjectCache), cl::init(true),
                                                    cl::desc("Enable object caching"), cl::cat(CodeGenOptions));
 

@@ -47,6 +47,8 @@ bool matchesEmptyString(const RE * re) {
         return false;
     } else if (isa<CC>(re)) {
         return false;
+    } else if (const String * s = dyn_cast<String>(re)) {
+        return s->empty();
     } else if (const Group * g = dyn_cast<Group>(re)) {
         return matchesEmptyString(g->getRE());
     } else if (const Name * n = dyn_cast<Name>(re)) {

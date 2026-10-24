@@ -42,10 +42,18 @@ bool literalCodepoint(const RE * re, codepoint_t & cp) {
 // The items of a replacement, if it is a sequence of literal characters and
 // references.
 bool replacementItems(RE * replacement, std::vector<RE *> & items) {
+    // (The singleton CCs of a String are items of the sequence.)
+    auto addItem = [&](RE * item) {
+        if (const String * const s = dyn_cast<String>(item)) {
+            for (const char32_t c : *s) items.push_back(makeCC(c));
+        } else {
+            items.push_back(item);
+        }
+    };
     if (Seq * const seq = dyn_cast<Seq>(replacement)) {
-        items.assign(seq->begin(), seq->end());
+        for (RE * item : *seq) addItem(item);
     } else {
-        items.push_back(replacement);
+        addItem(replacement);
     }
     for (RE * item : items) {
         codepoint_t cp;
@@ -60,6 +68,9 @@ bool singleString(RE * re, std::u32string & s) {
     codepoint_t cp;
     if (literalCodepoint(re, cp)) {
         s.push_back(static_cast<char32_t>(cp));
+        return true;
+    } else if (String * const str = dyn_cast<String>(re)) {
+        s.append(str->begin(), str->end());
         return true;
     } else if (Seq * const seq = dyn_cast<Seq>(re)) {
         for (RE * e : *seq) {
@@ -131,6 +142,10 @@ bool firstChars(RE * r, UCD::UnicodeSet & chars, bool & nullable) {
             if (!firstChars(*i, chars, nullable)) return false;
         }
         return true;
+    } else if (String * const s = dyn_cast<String>(r)) {
+        nullable = s->empty();
+        if (!nullable) chars.insert((*s)[0]);
+        return true;
     } else if (Alt * const alt = dyn_cast<Alt>(r)) {
         for (RE * e : *alt) {
             bool e_nullable;
@@ -164,6 +179,10 @@ bool lastChars(RE * r, UCD::UnicodeSet & chars, bool & nullable) {
         for (auto i = seq->rbegin(); nullable && (i != seq->rend()); ++i) {
             if (!lastChars(*i, chars, nullable)) return false;
         }
+        return true;
+    } else if (String * const s = dyn_cast<String>(r)) {
+        nullable = s->empty();
+        if (!nullable) chars.insert((*s)[s->size() - 1]);
         return true;
     } else if (Alt * const alt = dyn_cast<Alt>(r)) {
         nullable = false;
@@ -203,6 +222,9 @@ bool allChars(RE * r, UCD::UnicodeSet & chars) {
     if (Seq * const seq = dyn_cast<Seq>(r)) {
         for (RE * e : *seq) if (!allChars(e, chars)) return false;
         return true;
+    } else if (String * const s = dyn_cast<String>(r)) {
+        for (const char32_t c : *s) chars.insert(c);
+        return true;
     } else if (Alt * const alt = dyn_cast<Alt>(r)) {
         for (RE * e : *alt) if (!allChars(e, chars)) return false;
         return true;
@@ -238,6 +260,11 @@ bool flattenForWalk(RE * r, const std::map<std::string, unsigned> & wanted, std:
         for (RE * e : *seq) {
             if (!flattenForWalk(e, wanted, items, construct, reason)) return false;
         }
+        return true;
+    }
+    if (String * const s = dyn_cast<String>(r)) {
+        // The items of its singleton CCs.
+        for (const char32_t c : *s) items.push_back(WalkItem{makeCC(c), -1});
         return true;
     }
     if (Alt * const alt = dyn_cast<Alt>(r)) {

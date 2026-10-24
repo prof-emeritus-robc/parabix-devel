@@ -85,6 +85,19 @@ std::pair<int, int> getLengthRange(const RE * re, const cc::Alphabet * indexAlph
                                   UTF8_Encoder.encoded_length(hi_codepoint(cc->back())));
         }
         return std::make_pair(1, INT_MAX);
+    } else if (const String * s = dyn_cast<String>(re)) {
+        // The Seq of its singleton Unicode CCs.
+        const int n = s->size();
+        if (indexAlphabet == &cc::Unicode) return std::make_pair(n, n);
+        if (indexAlphabet == &cc::UTF8) {
+            UTF_Encoder UTF8_Encoder(8);
+            int lgth = 0;
+            for (const char32_t c : *s) {
+                lgth += UTF8_Encoder.encoded_length(c);
+            }
+            return std::make_pair(lgth, lgth);
+        }
+        return std::make_pair(n, (n == 0) ? 0 : INT_MAX);
     } else if (const Any * a = dyn_cast<Any>(re)) {
         if (indexAlphabet == a->getAlphabet()) return std::make_pair(1, 1);
         if (indexAlphabet == &cc::UTF8) {
@@ -209,7 +222,38 @@ CC * resolveToCC(RE * r) {
     return nullptr;
 }
 
+// The Seq of the items of r, with the singleton Unicode CCs of a String (or
+// of the Strings of a Seq) in place of the String; nullptr if r has none.
+static Seq * expandStrings(RE * r) {
+    if (const String * s = dyn_cast<String>(r)) {
+        std::vector<RE *> ccs;
+        for (const char32_t c : *s) {
+            ccs.push_back(makeCC(c));
+        }
+        return Seq::Create(ccs.begin(), ccs.end());
+    } else if (const Seq * seq = dyn_cast<Seq>(r)) {
+        if (std::none_of(seq->begin(), seq->end(), [](RE * e) {return isa<String>(e);})) return nullptr;
+        std::vector<RE *> items;
+        for (RE * e : *seq) {
+            if (const String * s = dyn_cast<String>(e)) {
+                for (const char32_t c : *s) {
+                    items.push_back(makeCC(c));
+                }
+            } else {
+                items.push_back(e);
+            }
+        }
+        return Seq::Create(items.begin(), items.end());
+    }
+    return nullptr;
+}
+
 std::pair<RE *, RE *> ParseUniquePrefix(RE * r) {
+    if (Seq * expanded = expandStrings(r)) {
+        auto parse = ParseUniquePrefix(expanded);
+        if (isEmptySeq(parse.first)) return std::make_pair(parse.first, r);
+        return parse;
+    }
     if (Seq * seq = dyn_cast<Seq>(r)) {
         if (seq->size() < 2) {
             // No parse possible.
@@ -282,6 +326,8 @@ int minMatchLength(const RE * re) {
         return 1;
     } else if (isa<CC>(re)) {
         return 1;
+    } else if (const String * s = dyn_cast<String>(re)) {
+        return s->size();
     } else if (const Name * n = dyn_cast<Name>(re)) {
         // An undefined (external) name has an unknown length.
         const RE * const defn = n->getDefinition();
@@ -422,6 +468,15 @@ void ByteTestComplexity::gatherTests(RE * re) {
             }
             if (testCount > testLimit) return;
         }
+    } else if (const String * s = dyn_cast<String>(re)) {
+        // Each singleton CC is an equality test.
+        for (const char32_t c : *s) {
+            if (!equalityTests.contains(c)) {
+                equalityTests.insert(c);
+                testCount++;
+            }
+            if (testCount > testLimit) return;
+        }
     } else if (const Name * n = dyn_cast<Name>(re)) {
         if (RE * const defn = n->getDefinition()) {
             gatherTests(defn);
@@ -487,7 +542,10 @@ bool hasEndAnchor(const RE * re) {
         }
         return true;
     } else if (const Seq * seq = dyn_cast<Seq>(re)) {
-        return (!seq->empty()) && hasEndAnchor(seq->back());
+        // (Empty Strings have no items: the last item precedes them.)
+        auto last = seq->rbegin();
+        while ((last != seq->rend()) && isa<String>(*last) && cast<String>(*last)->empty()) ++last;
+        return (last != seq->rend()) && hasEndAnchor(*last);
     } else if (const Rep * rep = dyn_cast<Rep>(re)) {
         return hasEndAnchor(rep->getRE());
     } else if (const Diff * diff = dyn_cast<Diff>(re)) {
@@ -497,7 +555,7 @@ bool hasEndAnchor(const RE * re) {
     } else if (isa<End>(re)) {
         return true;
     } else if (isa<Any, Assertion, CC, Name, PropertyExpression, Capture, Reference,
-                   Group, Start, Range, Permute, Interleavable>(re)) {
+                   Group, Start, Range, Permute, Interleavable, String>(re)) {
         return false;
     }
     UnexpectedRE("hasEndAnchor", re);
@@ -544,6 +602,9 @@ static bool trackUTF8Characters(const RE * re, unsigned & pending, unsigned & ch
             if (!trackUTF8Characters(e, pending, chars)) return false;
         }
         return true;
+    } else if (const String * s = dyn_cast<String>(re)) {
+        // Its CCs are Unicode CCs, not UTF-8 code units.
+        return s->empty();
     } else if (const Alt * alt = dyn_cast<Alt>(re)) {
         if (alt->empty()) return false;
         bool first = true;
@@ -629,6 +690,8 @@ static unsigned offsetFrom(const RE * re, unsigned in, bool indexedUTF8) {
         return 0;
     } else if (isa<CC>(re)) {
         return 0;
+    } else if (const String * s = dyn_cast<String>(re)) {
+        return s->empty() ? in : 0;
     } else if (const PropertyExpression * pe = dyn_cast<PropertyExpression>(re)) {
         if (pe->getKind() == PropertyExpression::Kind::Boundary) {
             return 1;
@@ -679,8 +742,14 @@ CC * resolveCharClass(RE * r) {
 CC * firstCharClass(RE * r) {
     if (CC * cc = resolveCharClass(r)) return cc;
     if (const Seq * seq = dyn_cast<Seq>(r)) {
-        if (seq->empty() || (getLengthRange(seq->front(), &cc::Unicode).first == 0)) return nullptr;
-        return firstCharClass(seq->front());
+        // (Empty Strings have no items: the first item follows them.)
+        auto first = seq->begin();
+        while ((first != seq->end()) && isa<String>(*first) && cast<String>(*first)->empty()) ++first;
+        if ((first == seq->end()) || (getLengthRange(*first, &cc::Unicode).first == 0)) return nullptr;
+        return firstCharClass(*first);
+    } else if (const String * s = dyn_cast<String>(r)) {
+        if (s->empty()) return nullptr;
+        return makeCC((*s)[0]);
     } else if (const Rep * rep = dyn_cast<Rep>(r)) {
         if (rep->getLB() == 0) return nullptr;
         return firstCharClass(rep->getRE());
@@ -702,8 +771,9 @@ CC * firstCharClass(RE * r) {
     return nullptr;
 }
 
-//  The elements of r as a sequence, seeing through nested sequences and
-//  single alternatives (which unsimplified REs may contain).
+//  The elements of r as a sequence, seeing through nested sequences, Strings
+//  (sequences of singleton CCs) and single alternatives (which unsimplified
+//  REs may contain).
 static void flattenSeq(RE * r, std::vector<RE *> & elems) {
     if (const Alt * alt = dyn_cast<Alt>(r)) {
         if (alt->size() == 1) {
@@ -713,6 +783,11 @@ static void flattenSeq(RE * r, std::vector<RE *> & elems) {
     } else if (const Seq * seq = dyn_cast<Seq>(r)) {
         for (RE * e : *seq) {
             flattenSeq(e, elems);
+        }
+        return;
+    } else if (const String * s = dyn_cast<String>(r)) {
+        for (const char32_t c : *s) {
+            elems.push_back(makeCC(c));
         }
         return;
     }
@@ -988,6 +1063,14 @@ bool classSequences(const RE * r, ClassSequences & out, size_t limit) {
         }
         return true;
     };
+    if (const String * s = dyn_cast<String>(r)) {
+        // One sequence, of its singleton classes.
+        out.push_back({});
+        for (const char32_t c : *s) {
+            out.back().push_back(UCD::UnicodeSet(c));
+        }
+        return true;
+    }
     if (const Seq * seq = dyn_cast<Seq>(r)) {
         out.push_back({});
         for (const RE * e : *seq) {
@@ -1069,6 +1152,9 @@ bool matchedChars(const RE * r, UCD::UnicodeSet & chars) {
     if (const Seq * seq = dyn_cast<Seq>(r)) {
         for (const RE * e : *seq) if (!matchedChars(e, chars)) return false;
         return true;
+    } else if (const String * s = dyn_cast<String>(r)) {
+        for (const char32_t c : *s) chars.insert(c);
+        return true;
     } else if (const Alt * alt = dyn_cast<Alt>(r)) {
         for (const RE * e : *alt) if (!matchedChars(e, chars)) return false;
         return true;
@@ -1098,6 +1184,10 @@ bool lastChars(const RE * r, UCD::UnicodeSet & chars, bool & empty) {
         for (auto i = seq->rbegin(); empty && (i != seq->rend()); ++i) {
             if (!lastChars(*i, chars, empty)) return false;
         }
+        return true;
+    } else if (const String * s = dyn_cast<String>(r)) {
+        empty = s->empty();
+        if (!empty) chars.insert((*s)[s->size() - 1]);
         return true;
     } else if (const Alt * alt = dyn_cast<Alt>(r)) {
         for (const RE * e : *alt) {
@@ -1142,6 +1232,12 @@ bool innerChars(const RE * r, UCD::UnicodeSet & chars, bool beforeLast) {
             if (later ? !matchedChars(items[i], chars) : !innerChars(items[i], chars, beforeLast)) return false;
         }
         return true;
+    } else if (const String * s = dyn_cast<String>(r)) {
+        // Each singleton class other than the last (or the first) is inner.
+        for (size_t i = 1; i < s->size(); ++i) {
+            chars.insert((*s)[beforeLast ? (i - 1) : i]);
+        }
+        return true;
     } else if (const Alt * alt = dyn_cast<Alt>(r)) {
         for (const RE * e : *alt) if (!innerChars(e, chars, beforeLast)) return false;
         return true;
@@ -1180,8 +1276,13 @@ bool matchEndsUnique(const RE * re) {
     for (const RE * a : alts) {
         const RE * last = a;
         if (const Seq * seq = dyn_cast<Seq>(a)) {
-            if (seq->empty()) return false;
-            last = seq->back();
+            // (Empty Strings have no items: the last item precedes them.)
+            auto i = seq->rbegin();
+            while ((i != seq->rend()) && isa<String>(*i) && cast<String>(*i)->empty()) ++i;
+            if (i == seq->rend()) return false;
+            last = *i;
+        } else if (const String * s = dyn_cast<String>(a)) {
+            if (s->empty()) return false;
         }
         if (isa<End>(last)) continue;
         if (const Assertion * as = dyn_cast<Assertion>(last)) {

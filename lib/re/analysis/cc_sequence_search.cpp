@@ -144,6 +144,16 @@ stateVector_t ccSequenceSearchObject::search_from_state(RE * re, stateVector_t v
             CC_matches |= static_cast<stateVector_t>(cc->intersects(*mCCseq[i])) << i;
         }
         return advance(CC_matches, v);
+    } else if (const String * s = dyn_cast<String>(re)) {
+        // The Seq of its singleton CCs.
+        for (const char32_t c : *s) {
+            stateVector_t CC_matches = 0;
+            for (unsigned i = 0; i < mCCseq.size(); i++) {
+                CC_matches |= static_cast<stateVector_t>(mCCseq[i]->contains(c)) << i;
+            }
+            v = advance(CC_matches, v);
+        }
+        return v;
     } else if (!isa<Range, Group, Permute, Interleavable>(re)) {
         UnexpectedRE("CC_Sequence_Search", re);
     }

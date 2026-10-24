@@ -93,6 +93,9 @@ bool matchableCodepoints(RE * re, UCD::UnicodeSet & chars) {
         if (cc->getAlphabet() != &cc::Unicode) return false;
         chars = chars + *cc;
         return true;
+    } else if (const String * const s = dyn_cast<String>(re)) {
+        for (const char32_t c : *s) chars.insert(c);
+        return true;
     } else if (isa<Any>(re)) {
         chars = UCD::UnicodeSet(0, UCD::UNICODE_MAX);
         return true;

@@ -767,6 +767,13 @@ void PipelineAnalysis::identifyPortsThatModifySegmentLength() {
                 #else
                 if (isPartitionRoot) {
                     inputRate.Flags |= partitionRootIOFlag;
+                } else if (ProvisionalStrideKernel.test(kernel)) {
+                    // A provisional stride kernel that is not the partition root reads the full and
+                    // provisional strides of producers in its partition and must process the same
+                    // full strides as the root, whether or not its input buffers are thread-local.
+                    // Checking its input would subtract its lookahead, leaving it a stride behind,
+                    // and its final stride could not process that stride.
+                    continue;
                 } else if (N.isConstant() || N.isExternal() || !N.IsLinear || N.isTruncated()) {
                     inputRate.Flags |= BufferPortType::CanModifySegmentLength;
                 }

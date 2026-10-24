@@ -43,10 +43,12 @@ struct Attribute {
         // that the corresponding circular buffer have a "lookahead extension area"
         // that holds a copy of the data at the physical start of buffer).
 
-        LookBehind, /// NOT DONE
+        LookBehind,
 
         // LookBehind(n) ensures that up to n positions prior to the current processed
-        // item of an input must be stored in linear (contiguous) memory.
+        // item of an input must be stored in linear (contiguous) memory.  The pipeline
+        // withholds them from the consumed item count, from which it addresses the input,
+        // and does not make the input thread-local, since another thread may produce them.
 
         // NOTE: If n is 0, all data will be linear (at the cost of additional
         // memcopies in order to preserve this property)
@@ -344,6 +346,19 @@ struct Attribute {
         // Requirements: every stream input and output is FixedRate(1), no output is InOut,
         // the stride is the block width, and all mutable kernel state is held in kernel scalars.
 
+        LocalCarries,
+
+        // A Pablo kernel whose only carry-generating operations are Advances may rebuild
+        // its carries at the start of each segment rather than keep them in kernel state.
+        // The effect of any position can then reach at most CarryExtent positions forward,
+        // the largest sum of Advance amounts along any path.  Starting from zero carries
+        // and processing the ceil(CarryExtent / BlockWidth) blocks before the segment gives
+        // the correct carries for the segment, so the kernel has no persistent state and
+        // its segments may be processed in any order.
+
+        // LocalCarries(n) declares that CarryExtent <= n; n = 0 declares that it is at
+        // most the block width.  The Pablo compiler verifies the declaration.
+
         /** COUNT **/
 
         __Count
@@ -600,6 +615,10 @@ inline Attribute Statefree() {
 
 inline Attribute ProvisionalLookAheadStride() {
     return Attribute(Attribute::KindId::ProvisionalLookAheadStride, 0);
+}
+
+inline Attribute LocalCarries(const unsigned maxCarryExtent = 0) {
+    return Attribute(Attribute::KindId::LocalCarries, maxCarryExtent);
 }
 
 inline Attribute InternallyGenerated() {

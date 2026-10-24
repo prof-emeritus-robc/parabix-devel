@@ -297,6 +297,16 @@ CircularBufferImplOption("CircularBufferImpl", cl::location(CircularBufferImpl),
                   cl::values(clEnumValN(CircularBufferImplOptions::Default, "default", "Mach vm_remap on macOS, memfd elsewhere (default)"),
                              clEnumValN(CircularBufferImplOptions::Memfd, "memfd", "memfd mapping (a temp file in /tmp on macOS)")), cl::cat(CodeGenOptions));
 
+unsigned CircularBufferPoolMiB = 64;
+static cl::opt<unsigned, true> CircularBufferPoolOption("CircularBufferPool", cl::location(CircularBufferPoolMiB), cl::init(64),
+                                                   cl::desc("MiB of released circular buffers kept for reuse by later pipeline runs "
+                                                            "(0 = unmap each buffer when released)."), cl::cat(CodeGenOptions));
+
+bool PoisonReusedBuffers = false;
+static cl::opt<bool, true> PoisonReusedBuffersOption("PoisonReusedBuffers", cl::location(PoisonReusedBuffers), cl::init(false),
+                                                   cl::desc("Fill each circular buffer taken from the reuse pool with 0xA5 instead "
+                                                            "of zeros (finds code that reads data no kernel wrote)."), cl::cat(CodeGenOptions));
+
 static cl::opt<bool, true> EnableObjectCacheOption("enable-object-cache", cl::location(EnableObjectCache), cl::init(true),
                                                    cl::desc("Enable object caching"), cl::cat(CodeGenOptions));
 

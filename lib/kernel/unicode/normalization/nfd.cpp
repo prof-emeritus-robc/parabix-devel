@@ -374,6 +374,7 @@ LVT2NFD::LVT2NFD (LLVMTypeSystemInterface & ts,
     Binding{"T_index", T_index}},
 // output
 {Binding{"NFD_Basis", NFD_Basis}}) {
+    addAttribute(kernel::LocalCarries());
 }
 
 void LVT2NFD::generatePabloMethod() {

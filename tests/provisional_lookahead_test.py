@@ -5,9 +5,10 @@
 #
 # Compares the output of provisional_lookahead with and without -ProvisionalLookAheadStride over
 # random inputs whose lengths fall around block and segment boundaries, and checks both against
-# a reference computed here.  By default, a small set of cases (one lookahead chain, a few
+# a reference computed here.  By default, a small set of cases (two lookahead chains, a few
 # lengths and segment sizes) completes in under a second; --extended-testing runs all the
-# combinations of the lookahead chains, inversion, lengths and segment sizes below.
+# combinations of the lookahead chains, inversion, lengths and segment sizes below, each with
+# thread-local and with shared (-DisableThreadLocalStreamSets) buffers between the kernels.
 #
 # usage: provisional_lookahead_test.py <path to provisional_lookahead> [--extended-testing] [-v]
 
@@ -26,7 +27,9 @@ LENGTHS = sorted({0, 1, 2, 63, 64, 65, 127, 128, 129, 255, 256, 257, 383, 511, 5
 # The default cases: a chain with a short lookahead and one across blocks, the empty input, a
 # length just past a block boundary and one of several blocks and segments, and the default
 # segment size and segments of one stride.
-QUICK_LOOKAHEAD_CHAINS = ["2,200"]
+# The chains run with thread-local buffers, and the chain of provisional stride kernels in one
+# partition also with shared buffers.
+QUICK_LOOKAHEAD_CHAINS = [("2,200", False), ("1,5", True)]
 QUICK_SEGMENT_SIZES = [None, "1"]
 QUICK_INVERT = [False]
 QUICK_LENGTHS = [0, 257, 10253]
@@ -62,10 +65,12 @@ def reference(data, chain, invert):
     return bytes(result)
 
 
-def run(exe, path, chain, seg, invert, provisional):
+def run(exe, path, chain, seg, invert, provisional, shared):
     cmd = [exe, path, "-la=" + chain, "-object-cache-salt=provisional_test"]
     if invert:
         cmd.append("-invert")
+    if shared:
+        cmd.append("-DisableThreadLocalStreamSets")
     if seg is not None:
         cmd.append("-segment-size=" + seg)
     if not provisional:
@@ -84,7 +89,8 @@ def main():
     exe = sys.argv[1]
     verbose = "-v" in sys.argv[2:]
     if "--extended-testing" in sys.argv[2:]:
-        chains, segment_sizes, inverts, lengths = LOOKAHEAD_CHAINS, SEGMENT_SIZES, INVERT, LENGTHS
+        chains = [(chain, shared) for chain in LOOKAHEAD_CHAINS for shared in (False, True)]
+        segment_sizes, inverts, lengths = SEGMENT_SIZES, INVERT, LENGTHS
     else:
         chains, segment_sizes, inverts, lengths = QUICK_LOOKAHEAD_CHAINS, QUICK_SEGMENT_SIZES, QUICK_INVERT, QUICK_LENGTHS
     rng = random.Random(20261007)
@@ -98,14 +104,14 @@ def main():
             with open(path, "wb") as f:
                 f.write(data)
             files.append((path, data))
-        for chain in chains:
+        for chain, shared in chains:
             for invert in inverts:
                 for path, data in files:
                     expected = reference(data, chain, invert)
                     for seg in segment_sizes:
                         cases += 1
-                        rc0, out0, err0, cmd0 = run(exe, path, chain, seg, invert, False)
-                        rc1, out1, err1, cmd1 = run(exe, path, chain, seg, invert, True)
+                        rc0, out0, err0, cmd0 = run(exe, path, chain, seg, invert, False, shared)
+                        rc1, out1, err1, cmd1 = run(exe, path, chain, seg, invert, True, shared)
                         if rc0 != 0 or rc1 != 0 or out0 != expected or out1 != expected:
                             failures += 1
                             print("FAIL: %s" % cmd1)

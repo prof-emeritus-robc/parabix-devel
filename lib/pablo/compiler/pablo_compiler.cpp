@@ -142,6 +142,8 @@ void PabloCompiler::compile(KernelBuilder & b) {
     mCarryManager->initializeCodeGen(b);
     assert (mKernel);
     PabloBlock * const entryBlock = mKernel->getEntryScope(); assert (entryBlock);
+    // The kernel logic is compiled a second time when it rebuilds its carries.
+    mMarker.clear();
     mMarker.emplace(entryBlock->createZeroes(), b.allZeroes());
     mMarker.emplace(entryBlock->createOnes(), b.allOnes());
     mBranchCount = 0;
@@ -168,6 +170,49 @@ void PabloCompiler::compile(KernelBuilder & b) {
         args[1] = getHandle();
         b.CreateCall(exitKernel, args);
     }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief compileCarryRebuild
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PabloCompiler::compileCarryRebuild(KernelBuilder & b) {
+    assert (!mRebuildingCarries);
+    mRebuildingCarries = true;
+    compile(b);
+    mRebuildingCarries = false;
+    mCarryRebuildScratch.clear();
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getCarryRebuildScratchPtr
+ *
+ * While rebuilding carries, the outputs of the kernel are written to scratch memory,
+ * which LLVM removes along with the logic that only computes outputs.
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * PabloCompiler::getCarryRebuildScratchPtr(KernelBuilder & b, const Var * var, Value * index1, Value * index2) {
+    assert (mRebuildingCarries && var->isKernelParameter() && var->isReadNone());
+    Type * type = CBuilder::convertTypeToLLVMContext(b.getContext(), var->getType());
+    ArrayType * scratchTy = nullptr;
+    if (type->isArrayTy()) {
+        scratchTy = cast<ArrayType>(type);
+    } else {
+        scratchTy = ArrayType::get(type, 1);
+    }
+    Value * scratch = nullptr;
+    const auto f = mCarryRebuildScratch.find(var);
+    if (f == mCarryRebuildScratch.end()) {
+        scratch = b.CreateAllocaAtEntryPoint(scratchTy, nullptr, "carryRebuildScratch");
+        mCarryRebuildScratch.emplace(var, scratch);
+    } else {
+        scratch = f->second;
+    }
+    if (LLVM_UNLIKELY(index2 != nullptr)) {
+        report_fatal_error(StringRef(mKernel->getName() + ": rebuilding carries does not support writing output packs"));
+    }
+    if (var->isScalar()) {
+        return scratch;
+    }
+    return b.CreateGEP(scratchTy, scratch, {b.getInt32(0), index1});
 }
 
 const Var * PabloCompiler::findInputParam(const Statement * const stmt, const Var * const param) const {
@@ -964,7 +1009,9 @@ Value * PabloCompiler::compileExpression(KernelBuilder & b, const PabloAST * con
                     b.SetInsertPoint(mEntryBlock, instIt);
                 }
 #endif
-                if (var->isScalar()) {
+                if (LLVM_UNLIKELY(mRebuildingCarries && var->isReadNone())) {
+                    value = getCarryRebuildScratchPtr(b, var, b.getInt32(0), nullptr);
+                } else if (var->isScalar()) {
                     value = b.getScalarFieldPtr(var->getName()).first;
                 } else if (var->isReadOnly()) {
                     value = b.getInputStreamBlockPtr(var->getName(), b.getInt32(0));
@@ -1178,7 +1225,9 @@ Value * PabloCompiler::getPointerToVar(KernelBuilder & b, const Var * var, Value
             b.SetInsertPoint(mEntryBlock, instIt);
         }
 #endif
-        if (LLVM_UNLIKELY(var->isScalar())) {
+        if (LLVM_UNLIKELY(mRebuildingCarries && var->isReadNone() && !var->isScalar())) {
+            ptr = getCarryRebuildScratchPtr(b, var, index1, index2);
+        } else if (LLVM_UNLIKELY(var->isScalar())) {
             std::string tmp;
             raw_string_ostream out(tmp);
             out << mKernel->getName();

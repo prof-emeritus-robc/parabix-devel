@@ -27,6 +27,8 @@ protected:
 
     void validateProvisionalLookAheadStride(KernelBuilder & b);
 
+    void writeCarryRebuild(KernelBuilder & b, const unsigned strides);
+
     void writeProvisionalStride(KernelBuilder & b, llvm::Value * const numOfBlocks, llvm::BasicBlock * const segmentDone);
 
     llvm::Value * saveKernelState(KernelBuilder & b, llvm::StructType * const stateTy, llvm::Value * const handle);

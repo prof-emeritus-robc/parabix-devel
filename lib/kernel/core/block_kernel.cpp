@@ -6,6 +6,7 @@
 #include <kernel/core/kernel.h>
 #include <kernel/core/block_kernel_compiler.h>
 #include <codegen/LLVMTypeSystemInterface.h>
+#include <llvm/Support/ErrorHandling.h>
 
 namespace kernel {
 
@@ -43,6 +44,13 @@ void BlockOrientedKernel::RepeatDoBlockLogic(KernelBuilder & b) {
  ** ------------------------------------------------------------------------------------------------------------- */
 void BlockOrientedKernel::generateFinalBlockMethod(KernelBuilder & b, llvm::Value * /* remainingItems */) {
     COMPILER->generateDefaultFinalBlockMethod(b);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief generateCarryRebuildMethod
+ ** ------------------------------------------------------------------------------------------------------------- */
+void BlockOrientedKernel::generateCarryRebuildMethod(KernelBuilder & /* b */) {
+    llvm::report_fatal_error(llvm::StringRef(getName() + ": rebuilding carries is not supported by this kernel"));
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

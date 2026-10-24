@@ -45,6 +45,12 @@ extern std::string PabloIllustrateKernelRegEx;
 
 // Give every eligible Pablo kernel with lookahead inputs the ProvisionalLookAheadStride attribute.
 extern bool EnableProvisionalLookAheadStride;
+
+// Let Pablo kernels with the LocalCarries attribute rebuild their carries at each segment start.
+extern bool EnableLocalCarries;
+
+// Report the CarryExtent of each compiled Pablo kernel, or the statement that prevents it.
+extern bool ShowCarryExtent;
 extern std::string PabloIllustrateBitstreamRegEx;
 
 bool CompileOptionIsSet(const PabloCompilationFlags flag);

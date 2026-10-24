@@ -58,6 +58,16 @@ static cl::opt<bool, true> EnableProvisionalLookAheadStrideOption("ProvisionalLo
     cl::desc("Give eligible Pablo kernels with lookahead inputs the ProvisionalLookAheadStride attribute (default true)"),
     cl::cat(codegen::CodeGenOptions), cl::init(true));
 
+bool EnableLocalCarries = true;
+static cl::opt<bool, true> EnableLocalCarriesOption("LocalCarries", cl::location(EnableLocalCarries),
+    cl::desc("Let Pablo kernels with the LocalCarries attribute rebuild their carries at each segment start (default true)"),
+    cl::cat(codegen::CodeGenOptions), cl::init(true));
+
+bool ShowCarryExtent = false;
+static cl::opt<bool, true> ShowCarryExtentOption("ShowCarryExtent", cl::location(ShowCarryExtent),
+    cl::desc("Report the CarryExtent of each compiled Pablo kernel, or the statement that prevents rebuilding its carries"),
+    cl::cat(codegen::JIT_InfoOptions), cl::init(false));
+
 std::string PabloIllustrateKernelRegEx = "";
 static cl::opt<std::string, true> PabloIllustrateKernelOption("pablo-illustrate-kernel", cl::location(PabloIllustrateKernelRegEx), cl::ValueOptional,
     cl::desc("RegEx describing Pablo kernel names to illustrate"), cl::value_desc("regex"), cl::cat(codegen::InstrumentationOptions));

@@ -19,7 +19,12 @@
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/IR/GlobalVariable.h>
 
+#include <algorithm>
 #include <array>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -109,11 +114,105 @@ static uint8_t * make_mach_circular_buffer(const size_t size, const size_t m) {
 }
 #endif
 
+// Circular buffers released by one pipeline run, kept for the next (--CircularBufferPool):
+// every run allocates its internal buffers again, at the same sizes, and a reused buffer
+// costs no mapping calls and no page faults, only zeroing. Keyed by mapped length (both copies); holds
+// buffers made with hasUnderflow == 0 only. Never destroyed, so that a release during
+// static destruction finds it; the atexit drain unmaps what it holds and stops pooling.
+namespace {
+struct CircularBufferPool {
+    std::mutex lock;
+    std::unordered_map<size_t, std::vector<uint8_t *>> buffers;
+    size_t bytes = 0;  // of memory: half the mapped length of each buffer
+    bool atexitRegistered = false;
+    bool drained = false;
+};
+
+CircularBufferPool & circularBufferPool() {
+    static CircularBufferPool * const pool = new CircularBufferPool;
+    return *pool;
+}
+
+void drainCircularBufferPool(const bool final) {
+    auto & pool = circularBufferPool();
+    std::lock_guard<std::mutex> guard(pool.lock);
+    for (auto & entry : pool.buffers) {
+        for (uint8_t * const addr : entry.second) {
+            munmap(addr, entry.first);
+        }
+    }
+    pool.buffers.clear();
+    pool.bytes = 0;
+    pool.drained |= final;
+}
+
+void drainCircularBufferPoolAtExit() {
+    drainCircularBufferPool(true);
+}
+
+uint8_t * takePooledCircularBuffer(const size_t size) {
+    auto & pool = circularBufferPool();
+    uint8_t * addr = nullptr;
+    BEGIN_SCOPED_REGION
+    std::lock_guard<std::mutex> guard(pool.lock);
+    const auto f = pool.buffers.find(2 * size);
+    if (f == pool.buffers.end() || f->second.empty()) {
+        return nullptr;
+    }
+    addr = f->second.back();
+    f->second.pop_back();
+    pool.bytes -= size;
+    END_SCOPED_REGION
+    // A fresh mapping is all zeros and some pipelines read bytes no kernel wrote (test_scan's
+    // filter_no_spans, with an empty filter, fails on a stale buffer), so a reused buffer must
+    // look fresh. Its pages are resident, so this is still far cheaper than a new mapping.
+    std::memset(addr, LLVM_UNLIKELY(codegen::PoisonReusedBuffers) ? 0xA5 : 0, size);
+    return addr;
+}
+}
+
+void kernel::releaseCircularBufferPool() {
+    drainCircularBufferPool(false);
+}
+
+extern "C"
+void release_circular_buffer(uint8_t * const addr, const size_t mappedLength) {
+    if (addr == nullptr) {
+        return;
+    }
+    const size_t limit = size_t{codegen::CircularBufferPoolMiB} << 20;
+    if (limit) {
+        auto & pool = circularBufferPool();
+        std::lock_guard<std::mutex> guard(pool.lock);
+        if (!pool.drained && pool.bytes + mappedLength / 2 <= limit) {
+            auto & list = pool.buffers[mappedLength];
+            // a second release of a pooled buffer would hand it to two streams at once
+            if (LLVM_UNLIKELY(std::find(list.begin(), list.end(), addr) != list.end())) {
+                report_fatal_error("circular buffer released twice");
+            }
+            list.push_back(addr);
+            pool.bytes += mappedLength / 2;
+            if (!pool.atexitRegistered) {
+                pool.atexitRegistered = true;
+                std::atexit(drainCircularBufferPoolAtExit);
+            }
+            return;
+        }
+    }
+    munmap(addr, mappedLength);
+}
+
 extern "C"
 uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
 
     assert (size > 0);
     assert ((size % CBuilder::PAGE_SIZE) == 0);
+
+    if (hasUnderflow == 0 && codegen::CircularBufferPoolMiB) {
+        if (uint8_t * const addr = takePooledCircularBuffer(size)) {
+            return addr;
+        }
+    }
 
     if (kernel::CircularBufferAllocator) {
         return kernel::CircularBufferAllocator(size, hasUnderflow);
@@ -401,6 +500,8 @@ void StreamSetBuffer::assertAccessIsWithinStreamSetMemory(KernelBuilder & b, Con
  ** ------------------------------------------------------------------------------------------------------------- */
 constexpr const char __MAKE_CIRCULAR_BUFFER[] =    "__ss_mcb";
 constexpr auto __MAKE_CIRCULAR_BUFFER_LENGTH = std::string_view(__MAKE_CIRCULAR_BUFFER).size();
+constexpr const char __RELEASE_CIRCULAR_BUFFER[] =    "__ss_fcb";
+constexpr auto __RELEASE_CIRCULAR_BUFFER_LENGTH = std::string_view(__RELEASE_CIRCULAR_BUFFER).size();
 constexpr const char __MAKE_FD_BACKED_BUFFER[] =    "__ss_mfb";
 constexpr auto __MAKE_FD_BACKED_BUFFER_LENGTH = std::string_view(__MAKE_FD_BACKED_BUFFER).size();
 constexpr const char __RESIZE_FD_BACKED_BUFFER[] =    "__ss_rfb";
@@ -413,6 +514,7 @@ constexpr auto __CLOSE_LENGTH = std::string_view(__CLOSE).size();
 void StreamSetBuffer::linkFunctions(KernelBuilder & b) {
     IntegerType * const i32Ty = b.getInt32Ty();
     b.LinkFunction(StringRef{__MAKE_CIRCULAR_BUFFER, __MAKE_CIRCULAR_BUFFER_LENGTH}, make_circular_buffer);
+    b.LinkFunction(StringRef{__RELEASE_CIRCULAR_BUFFER, __RELEASE_CIRCULAR_BUFFER_LENGTH}, release_circular_buffer);
     b.LinkFunction(StringRef{__MAKE_FD_BACKED_BUFFER, __MAKE_FD_BACKED_BUFFER_LENGTH}, make_fd_backed_buffer);
     b.LinkFunction(StringRef{__RESIZE_FD_BACKED_BUFFER, ____RESIZE_FD_BACKED_BUFFER_LENGTH}, resize_fd_backed_buffer);
     b.LinkFunction(StringRef{__MUNMAP, __MUNMAP_LENGTH}, munmap);
@@ -890,8 +992,8 @@ void ManagedDynamicBuffer::releaseBuffer(KernelBuilder & b) const {
         args[0] = addr;
         args[1] = b.CreateMul(b.getTypeSize(getType(b)), b.CreateShl(capacity, 1));
 
-        Function * const fMunmap = m->getFunction(__MUNMAP); assert (fMunmap);
-        b.CreateCall(fMunmap, args);
+        Function * const fRelease = m->getFunction(__RELEASE_CIRCULAR_BUFFER); assert (fRelease);
+        b.CreateCall(fRelease, args);
 
         b.CreateAlignedStore(ConstantPointerNull::get(addrPtrTy), addrField, voidPtrTyAlign);
         b.CreateAlignedStore(b.getSize(0), capacityField, intPtrTyAlign);
@@ -998,7 +1100,9 @@ Value * ManagedDynamicBuffer::modByCapacity(KernelBuilder & b, Value * const off
     }
 }
 
-static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingStruct, Value * const consumed, const bool useFree, const unsigned addrSpace) {
+// Released entries go to free (useFree: linear buffers), to the circular buffer pool (circular)
+// or to munmap (fd-backed buffers).
+static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingStruct, Value * const consumed, const bool useFree, const bool circular, const unsigned addrSpace) {
 
     Module * const m = b.getModule();
     auto & DL = m->getDataLayout();
@@ -1011,6 +1115,8 @@ static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingS
     name << "__check_pending_deletions" << addrSpace;
     if (useFree) {
         name << "F";
+    } else if (circular) {
+        name << "C";
     }
 
     Function * f = m->getFunction(name.str());
@@ -1092,7 +1198,7 @@ static void removeFromPendingDeletions(KernelBuilder & b, Value * const pendingS
         indices4[2] = i32_ZERO;
         indices4[3] = i32_PendingConsumed;
 
-        Function * const fMunmap = m->getFunction(__MUNMAP); assert (fMunmap);
+        Function * const fMunmap = m->getFunction(circular ? __RELEASE_CIRCULAR_BUFFER : __MUNMAP); assert (fMunmap);
 
         Value * const pendingConsumed1Field = b.CreateGEP(handleTy, handle, indices4);
         indices4[3] = i32_PendingAddress;
@@ -1348,7 +1454,7 @@ void ManagedDynamicBuffer::freePendingDeletions(KernelBuilder & b, llvm::Value *
     indices2[0] = b.getInt32(0);
     indices2[1] = b.getInt32(PendingDeletionStruct);
     Value * const handle = b.CreateGEP(getHandleType(b), mHandle, indices2);
-    removeFromPendingDeletions(b, handle, consumed, mLinear, mShape.AddressSpace);
+    removeFromPendingDeletions(b, handle, consumed, mLinear, !mLinear, mShape.AddressSpace);
 }
 
 static void addToPendingDeletions(KernelBuilder & b, Value * const pendingStruct,
@@ -2383,7 +2489,7 @@ void FdBackedDynamicBuffer::freePendingDeletions(KernelBuilder & b, llvm::Value 
     indices2[0] = b.getInt32(0);
     indices2[1] = b.getInt32(PendingDeletionStruct);
     Value * const handle = b.CreateGEP(getHandleType(b), mHandle, indices2);
-    removeFromPendingDeletions(b, handle, consumed, false, mShape.AddressSpace);
+    removeFromPendingDeletions(b, handle, consumed, false, false, mShape.AddressSpace);
 }
 
 Value * FdBackedDynamicBuffer::getMallocAddress(KernelBuilder & b) const {

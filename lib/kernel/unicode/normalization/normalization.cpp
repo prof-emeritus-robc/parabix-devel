@@ -61,6 +61,7 @@ Hangul_Composition::Hangul_Composition (LLVMTypeSystemInterface & ts,
     {Binding{"Basis", Basis, FixedRate(1), LookAhead(5)}, Binding{"L_V_T_Composables", L_V_T_Composables, FixedRate(1), LookAhead(5)}},
 // output
     {Binding{"Output_Basis", Output_Basis}}) {
+    addAttribute(kernel::LocalCarries());
 }
 
 void Hangul_Composition::generatePabloMethod() {

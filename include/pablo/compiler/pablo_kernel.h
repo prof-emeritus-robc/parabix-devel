@@ -144,6 +144,13 @@ public:
 
     bool requiresExplicitPartialFinalStride() const override;
 
+    // Whether this kernel rebuilds its carries at each segment start (see LocalCarries in
+    // kernel/core/attributes.h) rather than keeping them in kernel state.  This depends only
+    // on the attribute, so it is known for a kernel loaded from the cache.
+    bool hasLocalCarries() const;
+
+    unsigned getCarryRebuildStrides() const override;
+
     // Not final: a Pablo kernel may extend it (call this, then add its own selections).
     void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override;
 
@@ -192,6 +199,8 @@ protected:
     // finalizing the KernelStateType.
     void addInternalProperties(KernelBuilder & b) final;
 
+    void checkCarryExtent(KernelBuilder & b) const;
+
     void linkExternalMethods(KernelBuilder & b) final;
 
     std::unique_ptr<kernel::KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) override;
@@ -208,6 +217,8 @@ private:
     void generateFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingBytes) final;
 
     void generateFinalizeMethod(KernelBuilder & b) final;
+
+    void generateCarryRebuildMethod(KernelBuilder & b) final;
 
 private:
 

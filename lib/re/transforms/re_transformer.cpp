@@ -9,7 +9,6 @@
 #include <llvm/Support/ErrorHandling.h>
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/adt.h>
-#include <re/adt/memoization.h>
 #include <re/toolchain/toolchain.h>
 #include <re/printer/re_printer.h>
 
@@ -234,16 +233,19 @@ RE * RE_Transformer::transformString(String * s) {
 
 // The String is kept unless some CC is changed, in which case the result is
 // the Seq of the transformed CCs.  A memoizing transformer may return an
-// equal CC from its cache, so changes are detected by RE equality.
+// equal CC from its cache, so a CC of the same Unicode codepoint is unchanged
+// (the Memoizer compares the codepoints of CCs, not their alphabets).
 RE * RE_Transformer::transformStringAsSeq(String * s) {
     SmallVector<RE *, 16> elems;
     elems.reserve(s->size());
     bool any_changed = false;
-    MemoizerComparator lessThan;
     for (const char32_t c : *s) {
-        RE * const e = makeCC(c);
+        CC * const e = makeCC(c);
         RE * e1 = transform(e);
-        if ((e1 != e) && (lessThan(e, e1) || lessThan(e1, e))) any_changed = true;
+        if (e1 != e) {
+            const CC * const cc1 = dyn_cast<CC>(e1);
+            if ((cc1 == nullptr) || (cc1->getAlphabet() != &cc::Unicode) || !(*cc1 == *e)) any_changed = true;
+        }
         elems.push_back(e1);
     }
     if (!any_changed) return s;

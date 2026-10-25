@@ -173,6 +173,7 @@ RE * parseReplacement(const std::string & text, RE * search, std::string & error
             i += length;
         }
     }
+    packStrings(items);
     return makeSeq(items.begin(), items.end());
 }
 

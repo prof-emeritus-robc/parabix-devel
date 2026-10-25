@@ -38,7 +38,7 @@ RE * BRE_Parser::parse_seq() {
         re = extend_item(re);
         seq.push_back(re);
     }
-    return Seq::Create(seq.begin(), seq.end());
+    return createSeq(seq);
 }
 
 

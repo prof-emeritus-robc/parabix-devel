@@ -7,7 +7,10 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
+#include <llvm/Support/Casting.h>
 #include <re/adt/re_re.h>
+#include <re/adt/re_cc.h>
 
 //
 // A String is a fixed sequence of Unicode codepoints.  It matches exactly
@@ -42,5 +45,33 @@ private:
 };
 
 inline String * makeString(const std::u32string & s) {return String::Create(s);}
+
+// Is re a literal codepoint: a CC of one Unicode codepoint?
+inline bool isLiteralCodepoint(const RE * re) {
+    const CC * const cc = llvm::dyn_cast<CC>(re);
+    return cc && (cc->getAlphabet() == &cc::Unicode) && !cc->empty() && (cc->min_codepoint() == cc->max_codepoint());
+}
+
+// Replace each run of two or more literal codepoints among the items of a
+// sequence by the String of their codepoints.
+inline void packStrings(std::vector<RE *> & items) {
+    std::vector<RE *> packed;
+    packed.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ) {
+        size_t j = i;
+        while ((j < items.size()) && isLiteralCodepoint(items[j])) ++j;
+        if (j - i >= 2) {
+            std::u32string s;
+            for (size_t k = i; k < j; ++k) {
+                s.push_back(llvm::cast<CC>(items[k])->min_codepoint());
+            }
+            packed.push_back(makeString(s));
+            i = j;
+        } else {
+            packed.push_back(items[i++]);
+        }
+    }
+    items.swap(packed);
+}
 
 }

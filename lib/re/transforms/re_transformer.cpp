@@ -233,8 +233,7 @@ RE * RE_Transformer::transformString(String * s) {
 
 // The String is kept unless some CC is changed, in which case the result is
 // the Seq of the transformed CCs.  A memoizing transformer may return an
-// equal CC from its cache, so a CC of the same Unicode codepoint is unchanged
-// (the Memoizer compares the codepoints of CCs, not their alphabets).
+// equal CC from its cache, so a CC of the same Unicode codepoint is unchanged.
 RE * RE_Transformer::transformStringAsSeq(String * s) {
     SmallVector<RE *, 16> elems;
     elems.reserve(s->size());

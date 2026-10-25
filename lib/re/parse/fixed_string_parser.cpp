@@ -25,7 +25,7 @@ RE * FixedStringParser::parse_seq() {
     while (mCursor.more() && (!at('\n'))) {
         seq.push_back(createCC(parse_literal_codepoint()));
     }
-    return Seq::Create(seq.begin(), seq.end());
+    return createSeq(seq);
 }
 
 }

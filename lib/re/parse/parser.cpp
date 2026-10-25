@@ -118,7 +118,7 @@ RE * RE_Parser::parse_seq() {
         re = extend_item(re);
         seq.push_back(re);
     }
-    return Seq::Create(seq.begin(), seq.end());
+    return createSeq(seq);
 }
 
 RE * RE_Parser::parse_next_item(std::string break_chars) {
@@ -587,7 +587,7 @@ RE * RE_Parser::parse_interleavable() {
             re = extend_item(re);
             seq.push_back(re);
         }
-        factors.push_back(Seq::Create(seq.begin(), seq.end()));
+        factors.push_back(createSeq(seq));
         if (!accept("<")) {
             break;
         }
@@ -818,6 +818,14 @@ codepoint_t RE_Parser::parse_hex_codepoint(int mindigits, int maxdigits) {
 
 CC * RE_Parser::createCC(const codepoint_t cp) {
     return CC::Create(cp);
+}
+
+// The sequence of the items parsed, with each run of literal codepoints as a
+// String; the String alone if the items are all literal codepoints.
+RE * RE_Parser::createSeq(std::vector<RE *> & items) {
+    packStrings(items);
+    if ((items.size() == 1) && isa<String>(items[0])) return items[0];
+    return Seq::Create(items.begin(), items.end());
 }
 
 Name * RE_Parser::createName(std::string value) {

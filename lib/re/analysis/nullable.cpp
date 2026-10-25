@@ -56,6 +56,8 @@ bool isNullable(const RE * re) {
             }
         }
         return true;
+    } else if (const String * s = dyn_cast<const String>(re)) {
+        return s->empty();
     } else if (isa<Any, CC, Range, PropertyExpression>(re)) {
         return false;
     } else if (isa<Assertion, Start, End, Reference>(re)) {

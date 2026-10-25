@@ -39,6 +39,18 @@ re::RE * DoubleQuoteEscape::transformCC (re::CC * cc) {
     return cc;
 }
 
+// Each double quote of a String is doubled.
+re::RE * DoubleQuoteEscape::transformString (re::String * s) {
+    std::u32string escaped;
+    escaped.reserve(s->size());
+    for (const char32_t c : *s) {
+        escaped.push_back(c);
+        if (c == mDQ) escaped.push_back(c);
+    }
+    if (escaped.size() == s->size()) return s;
+    return re::makeString(escaped);
+}
+
 re::RE * DoubleQuoteEscape::transformAny (re::Any * a) {
     auto dblEsc = getDoubleEscape();
     return re::makeAlt({dblEsc, re::makeDiff(a, getDQ_CC())});

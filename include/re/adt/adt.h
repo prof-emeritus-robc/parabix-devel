@@ -23,4 +23,5 @@
 #include <re/adt/re_rep.h>
 #include <re/adt/re_seq.h>
 #include <re/adt/re_start.h>
+#include <re/adt/re_string.h>
 #include <re/adt/re_permute.h>

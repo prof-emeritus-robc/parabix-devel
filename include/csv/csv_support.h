@@ -36,6 +36,7 @@ protected:
     re::CC * getDQ_CC();
     re::RE * getDoubleEscape();
     re::RE * transformCC (re::CC * cc) override;
+    re::RE * transformString (re::String * s) override;
     re::RE * transformAny (re::Any * a) override;
     re::RE * transformName (re::Name * name) override;
     re::RE * transformPropertyExpression (re::PropertyExpression * pe) override;

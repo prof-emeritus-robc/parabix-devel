@@ -5,6 +5,7 @@
 
 #include <re/adt/memoization.h>
 
+#include <functional>
 #include <llvm/Support/Casting.h>
 #include <llvm/Support/ErrorHandling.h>
 #include <re/adt/adt.h>
@@ -213,12 +214,18 @@ static bool compare(const RE * const lh, const RE * const rh) {
             return lessThan(cast<Alt>(lh), cast<Alt>(rh));
         case Type::Seq:
             return lessThan(cast<Seq>(lh), cast<Seq>(rh));
-        case Type::Any: case Type::End: case Type::Start:
+        case Type::Any:
+            // (Alphabets are compared by identity.)
+            return std::less<const cc::Alphabet *>()(cast<Any>(lh)->getAlphabet(), cast<Any>(rh)->getAlphabet());
+        case Type::End: case Type::Start:
             return false;
         case Type::Assertion:
             return lessThan(cast<Assertion>(lh), cast<Assertion>(rh));
-        case Type::CC:
-            return cast<CC>(lh)->compare(*cast<CC>(rh)) < 0;
+        case Type::CC: {
+            const int c = cast<CC>(lh)->compare(*cast<CC>(rh));
+            if (c != 0) return c < 0;
+            return std::less<const cc::Alphabet *>()(cast<CC>(lh)->getAlphabet(), cast<CC>(rh)->getAlphabet());
+        }
         case Type::Name:
             return lessThan(cast<Name>(lh), cast<Name>(rh));
         case Type::Capture:
@@ -241,6 +248,8 @@ static bool compare(const RE * const lh, const RE * const rh) {
             return lessThan(cast<Interleavable>(lh), cast<Interleavable>(rh));
         case Type::PropertyExpression:
             return lessThan(cast<PropertyExpression>(lh), cast<PropertyExpression>(rh));
+        case Type::String:
+            return cast<String>(lh)->getString() < cast<String>(rh)->getString();
         // No default: -Wswitch flags any RE type missing here.
     }
     llvm_unreachable("RE object of unknown type given to Memoizer");

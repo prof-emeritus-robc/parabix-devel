@@ -40,6 +40,10 @@ struct CC_Collector final : public RE_Inspector {
         }
     }
 
+    void inspectString(String * s) final {
+        inspectStringAsCCs(s);
+    }
+
     CC * mUnionCC;
 };
 
@@ -64,6 +68,10 @@ struct SetCollector final : public RE_Inspector {
         }
     }
 
+    void inspectString(String * s) final {
+        if (alphabet == &cc::Unicode) inspectStringAsCCs(s);
+    }
+
 private:
     const cc::Alphabet * const alphabet;
     CC_Set & ccs;
@@ -84,6 +92,9 @@ bool matchableCodepoints(RE * re, UCD::UnicodeSet & chars) {
     if (CC * const cc = dyn_cast<CC>(re)) {
         if (cc->getAlphabet() != &cc::Unicode) return false;
         chars = chars + *cc;
+        return true;
+    } else if (const String * const s = dyn_cast<String>(re)) {
+        for (const char32_t c : *s) chars.insert(c);
         return true;
     } else if (isa<Any>(re)) {
         chars = UCD::UnicodeSet(0, UCD::UNICODE_MAX);

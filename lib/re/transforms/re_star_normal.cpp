@@ -28,12 +28,15 @@ inline RE * RE_Star_Normal::star_rule(RE * re) {
                     if (rep->getLB() == 0) {
                         mList.push_back(rep->getRE());
                     }
-                } else if (!isEmptySeq(r)) {
+                } else if (!isEmptySeq(r) && !(isa<String>(r) && cast<String>(r)->empty())) {
                     mList.push_back(r);
                 }
             }
             return makeAlt(mList.begin(), mList.end());
         }
+    } else if (String * s = dyn_cast<String>(re)) {
+        // An empty String is the empty Seq.
+        if (s->empty()) return makeAlt();
     }
     return re;
 }

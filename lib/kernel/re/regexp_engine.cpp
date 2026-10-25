@@ -121,6 +121,10 @@ struct CodeUnitMultiplexer final : public RE_Transformer {
         if (cc->getAlphabet() == mMultiplexed->getSourceAlphabet()) return mMultiplexed->transformCC(cc);
         return cc;
     }
+    RE * transformString(re::String * s) override {
+        if (mMultiplexed->getSourceAlphabet() == &cc::Unicode) return transformStringAsSeq(s);
+        return s;
+    }
     RE * transformName(Name * n) override {
         RE * const defn = n->getDefinition();
         if ((defn == nullptr) || (mExternals.count(n->getFullName()) == 1)) return n;
@@ -994,6 +998,11 @@ struct ReplacementCharClasses final : public RE_Inspector {
     ReplacementCharClasses() : RE_Inspector(NameProcessingMode::ProcessDefinition, InspectionMode::IgnoreNonUnique) {}
     void inspectCC(CC * cc) override {
         if ((cc->getAlphabet() == &cc::Unicode) && cc->contains(0xFFFD)) mFound = true;
+    }
+    void inspectString(re::String * s) override {
+        for (const char32_t c : *s) {
+            if (c == 0xFFFD) mFound = true;
+        }
     }
     bool mFound = false;
 };

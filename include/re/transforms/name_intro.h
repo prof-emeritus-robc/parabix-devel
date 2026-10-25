@@ -13,7 +13,7 @@
 namespace cc {class Alphabet;}
 
 namespace re {
-class RE; class Name; class Alt; class Seq; class Rep; class Assertion; class CC;
+class RE; class Name; class Alt; class Seq; class Rep; class Assertion; class CC; class String;
 
 class NameIntroduction : public RE_Transformer {
 public:
@@ -32,6 +32,7 @@ public:
     VariableLengthCCNamer(unsigned UTF_bits = 8, bool replacementChar = false);
 protected:
     RE * transformCC (CC * cc) override;
+    RE * transformString (String * s) override;
 private:
     UTF_Encoder mEncoder;
     const bool mReplacementChar;

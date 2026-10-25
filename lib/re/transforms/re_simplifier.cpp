@@ -49,6 +49,14 @@ RE * transformSeq(Seq * seq) override {
     return makeSeq(list.begin(), list.end());
 }
 
+// A String is the Seq of its singleton CCs: an empty String is the empty Seq
+// (removed from sequences), and a String of one CC is that CC.
+RE * transformString(String * s) override {
+    if (s->empty()) return makeSeq();
+    if (s->size() == 1) return transform(makeCC((*s)[0]));
+    return s;
+}
+
 RE * transformName(Name * nm) override {
     nm->setDefinition(transform(nm->getDefinition()));
     return nm;

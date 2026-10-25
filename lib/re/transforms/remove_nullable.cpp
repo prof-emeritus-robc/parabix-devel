@@ -146,6 +146,7 @@ protected:
     RE * transformName(Name * n) override;
     RE * transformAlt(Alt * a) override;
     RE * transformSeq(Seq * seq) override;
+    RE * transformString(String * s) override;
     RE * transformRep(Rep * rep) override;
     RE * transformAssertion(Assertion * a) override;
     RE * transformStart(Start * s) override;
@@ -222,6 +223,13 @@ RE * RemoveEmptyTransformer::transformSeq(Seq * seq) {
     }
     if (alts.size() == 1) return alts[0];
     return makeAlt(alts.begin(), alts.end());
+}
+
+// A String is the Seq of its singleton CCs: an empty String matches only
+// the empty string, as the empty Seq does.
+RE * RemoveEmptyTransformer::transformString(String * s) {
+    if (s->empty()) return makeAlt();
+    return s;
 }
 
 RE * RemoveEmptyTransformer::transformAssertion(Assertion * a) {

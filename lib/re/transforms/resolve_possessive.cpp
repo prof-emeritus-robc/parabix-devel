@@ -60,11 +60,16 @@ static RE * withAssertion(RE * e, const int lb, const int ub) {
 //  passed over (which can only add characters); $ ends the items.  Items that
 //  may all be empty, up to the end of the sequence, are followed by whatever
 //  follows it, which is not known here.  (The items may include sequences, such
-//  as resolved repetitions with their following items, which are seen through.)
+//  as resolved repetitions with their following items, which are seen through,
+//  and Strings, which are the sequences of their singleton CCs.)
 static void flattenItems(const std::vector<RE *> & items, std::vector<RE *> & flat) {
     for (RE * item : items) {
         if (Seq * const seq = dyn_cast<Seq>(item)) {
             flattenItems(std::vector<RE *>(seq->begin(), seq->end()), flat);
+        } else if (String * const s = dyn_cast<String>(item)) {
+            for (const char32_t c : *s) {
+                flat.push_back(makeCC(c));
+            }
         } else {
             flat.push_back(item);
         }
@@ -120,8 +125,17 @@ RE * ResolvePossessive::resolve(Rep * rep, const std::vector<RE *> & rest, bool 
                 if (intersectCC(first, S)->empty()) {
                     return makeSeq({makeRep(e, lb, ub), following});
                 }
-                if (CC * const B = resolveCharClass(rest.front())) {
-                    RE * const after = makeSeq(rest.begin() + 1, rest.end());
+                //  A String (not empty, see transformSeq) is the sequence of
+                //  its singleton CCs: its first CC begins the items.
+                RE * front = rest.front();
+                RE * after = makeSeq(rest.begin() + 1, rest.end());
+                if (String * const s = dyn_cast<String>(front)) {
+                    front = makeCC((*s)[0]);
+                    if (s->size() > 1) {
+                        after = makeSeq({makeString(std::u32string(s->begin() + 1, s->end())), after});
+                    }
+                }
+                if (CC * const B = resolveCharClass(front)) {
                     RE * const notS = makeSeq({subtractCC(B, S), after});
                     if (ub == Rep::UNBOUNDED_REP) {
                         return makeSeq({makeRep(e, lb, ub), notS});
@@ -186,7 +200,10 @@ RE * ResolvePossessive::transformSeq(Seq * seq) {
             rest.clear();
             rest.push_back(replaced);
         } else {
-            rest.insert(rest.begin(), transform(items[i]));
+            RE * const t = transform(items[i]);
+            //  An empty String, the empty sequence, has no items.
+            if (isa<String>(t) && cast<String>(t)->empty()) continue;
+            rest.insert(rest.begin(), t);
         }
     }
     mAtLookaheadEnd = atEnd;

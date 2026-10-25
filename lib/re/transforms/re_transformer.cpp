@@ -59,6 +59,7 @@ case T::Type: to = transform##Type(llvm::cast<Type>(from)); break
         TRANSFORM(Start);
         TRANSFORM(Permute);
         TRANSFORM(Interleavable);
+        TRANSFORM(String);
         TRANSFORM(PropertyExpression);
         // No default: -Wswitch flags any RE type missing here.
     }
@@ -224,6 +225,31 @@ RE * RE_Transformer::transformInterleavable(Interleavable * s) {
     }
     if (!any_changed) return s;
     return makeInterleavable(elems.begin(), elems.end());
+}
+
+RE * RE_Transformer::transformString(String * s) {
+    return s;
+}
+
+// The String is kept unless some CC is changed, in which case the result is
+// the Seq of the transformed CCs.  A memoizing transformer may return an
+// equal CC from its cache, so a CC of the same Unicode codepoint is unchanged
+// (the Memoizer compares the codepoints of CCs, not their alphabets).
+RE * RE_Transformer::transformStringAsSeq(String * s) {
+    SmallVector<RE *, 16> elems;
+    elems.reserve(s->size());
+    bool any_changed = false;
+    for (const char32_t c : *s) {
+        CC * const e = makeCC(c);
+        RE * e1 = transform(e);
+        if (e1 != e) {
+            const CC * const cc1 = dyn_cast<CC>(e1);
+            if ((cc1 == nullptr) || (cc1->getAlphabet() != &cc::Unicode) || !(*cc1 == *e)) any_changed = true;
+        }
+        elems.push_back(e1);
+    }
+    if (!any_changed) return s;
+    return makeSeq(elems.begin(), elems.end());
 }
 
 RE * RE_Transformer::transformPropertyExpression(PropertyExpression * pe) {

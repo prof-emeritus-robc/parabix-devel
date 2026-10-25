@@ -7,6 +7,7 @@
 
 #include <map>
 #include <set>
+#include <vector>
 #include <re/adt/re_cc.h>
 #include <re/adt/re_name.h>
 
@@ -230,6 +231,8 @@ protected:
     codepoint_t parse_octal_codepoint(int mindigits, int maxdigits);
 
     CC * createCC(const codepoint_t cp);
+
+    static RE * createSeq(std::vector<RE *> & items);
 
     static std::string canonicalize(const cursor_t begin, const cursor_t end);
 

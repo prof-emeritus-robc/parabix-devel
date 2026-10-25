@@ -114,6 +114,11 @@ const CC * matchableCodepoints(const RE * re) {
         return subtractCC(matchableCodepoints(diff->getLH()), matchableCodepoints(diff->getRH()));
     } else if (const Intersect * e = dyn_cast<Intersect>(re)) {
         return intersectCC(matchableCodepoints(e->getLH()), matchableCodepoints(e->getRH()));
+    } else if (const String * s = dyn_cast<String>(re)) {
+        // The Seq of its singleton CCs matches a single character only if
+        // it has one.
+        if (s->size() == 1) return makeCC((*s)[0]);
+        return makeCC();
     } else if (isa<Any>(re)) {
         return makeCC(0, 0x10FFFF);
     } else if (const Name * n = dyn_cast<Name>(re)) {

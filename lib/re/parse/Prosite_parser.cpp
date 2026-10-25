@@ -30,7 +30,7 @@ namespace re{
             re = extend_item(re);
             seq.push_back(re);
         }
-        return Seq::Create(seq.begin(), seq.end());
+        return createSeq(seq);
     }
 
     RE * RE_Parser_PROSITE::parse_next_item() {

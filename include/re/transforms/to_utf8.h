@@ -30,6 +30,7 @@ public:
     UTF8_Transformer(bool useInternalNaming = false);
 protected:
     RE * transformCC(CC * cc) override;
+    RE * transformString(String * s) override;
     RE * rangeCodeUnits(codepoint_t lo, codepoint_t hi, unsigned index, const unsigned lgth);
     RE * rangeToUTF8(codepoint_t lo, codepoint_t hi);
 

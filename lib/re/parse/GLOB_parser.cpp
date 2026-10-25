@@ -37,7 +37,7 @@ RE * FileGLOB_Parser::parse_seq() {
         }
         seq.push_back(re);
     }
-    return Seq::Create(seq.begin(), seq.end());
+    return createSeq(seq);
 }
 
 const codepoint_t NUL = 0;
@@ -147,7 +147,7 @@ RE * FileGLOB_Parser::parse_bracket_expr () {
                 }
             }
             seqItems.push_back(CC::Create(FILE_PATH_SEPARATOR));
-            return Seq::Create(seqItems.begin(), seqItems.end());
+            return createSeq(seqItems);
         }
         if (accept('[')) {
             if (accept('=')) items.push_back(parse_equivalence_class());

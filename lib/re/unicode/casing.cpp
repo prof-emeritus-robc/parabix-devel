@@ -15,6 +15,7 @@ namespace re {
 class ResolveCaseInsensitiveMode final : public RE_Transformer {
 public:
     RE * transformCC(CC * cc) override;
+    RE * transformString(String * s) override;
     RE * transformName(Name * name) override;
     RE * transformGroup(Group * g) override;
 
@@ -30,6 +31,13 @@ RE * ResolveCaseInsensitiveMode::transformCC(CC * cc) {
         return makeCC(caseInsensitize(*cc));
     }
     return cc;
+}
+
+RE * ResolveCaseInsensitiveMode::transformString(String * s) {
+    if (inCaseInsensitiveMode) {
+        return transformStringAsSeq(s);
+    }
+    return s;
 }
 
 RE * ResolveCaseInsensitiveMode::transformName(Name * name) {

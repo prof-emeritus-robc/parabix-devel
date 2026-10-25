@@ -5,6 +5,7 @@
 
 #include <re/transforms/re_reverse.h>
 
+#include <algorithm>
 #include <map>
 #include <llvm/Support/ErrorHandling.h>
 #include <re/adt/re_cc.h>
@@ -20,6 +21,7 @@
 #include <re/adt/re_diff.h>
 #include <re/adt/re_intersect.h>
 #include <re/adt/re_assertion.h>
+#include <re/adt/re_string.h>
 #include <re/transforms/re_transformer.h>
 
 
@@ -73,6 +75,13 @@ public:
             list.push_back(transform(*i));
         }
         return makeSeq(list.begin(), list.end());
+    }
+    // A String is the Seq of its singleton CCs, reversed as a Seq.
+    RE * transformString (String * s) override {
+        if (s->size() <= 1) return s;
+        std::u32string reversed(s->begin(), s->end());
+        std::reverse(reversed.begin(), reversed.end());
+        return makeString(reversed);
     }
     RE * transformStart (Start *) override { return makeEnd();}
     RE * transformEnd (End *) override { return makeStart();}

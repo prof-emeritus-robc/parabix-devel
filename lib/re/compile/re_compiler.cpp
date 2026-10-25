@@ -150,6 +150,13 @@ Marker RE_Block_Compiler::process(RE * const re, Marker marker) {
         llvm::report_fatal_error("back references not supported in icgrep.");
     } else if (isa<Seq>(re)) {
         return compileSeq(cast<Seq>(re), marker);
+    } else if (String * s = dyn_cast<String>(re)) {
+        // A String is compiled as the Seq of its singleton CCs.
+        std::vector<RE *> ccs;
+        for (const char32_t c : *s) {
+            ccs.push_back(makeCC(c));
+        }
+        return compileSeq(Seq::Create(ccs.begin(), ccs.end()), marker);
     } else if (isa<Alt>(re)) {
         return compileAlt(cast<Alt>(re), marker);
     } else if (Rep * rep = dyn_cast<Rep>(re)) {
@@ -557,6 +564,8 @@ Marker RE_Block_Compiler::compileIntersect(Intersect * const x, Marker marker) {
 static void collectAlphabets(RE * re, std::set<const cc::Alphabet *> & alphabets) {
     if (CC * cc = dyn_cast<CC>(re)) {
         alphabets.insert(cc->getAlphabet());
+    } else if (const String * s = dyn_cast<String>(re)) {
+        if (!s->empty()) alphabets.insert(&cc::Unicode);
     } else if (Name * n = dyn_cast<Name>(re)) {
         if (n->getDefinition()) collectAlphabets(n->getDefinition(), alphabets);
     } else if (Seq * s = dyn_cast<Seq>(re)) {

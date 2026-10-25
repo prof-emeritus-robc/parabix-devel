@@ -143,8 +143,10 @@ def run_hf_bpe(tokenizer_obj, text: str) -> tuple[list[int], list[str]]:
 
 def run_tiktoken_bpe(enc, text: str) -> tuple[list[int], list[str]]:
     """Run tiktoken's built-in "gpt2" encoding -- its own Rust implementation,
-    not loaded from this project's vocab.json/merges.txt at all."""
-    ids = enc.encode(text)
+    not loaded from this project's vocab.json/merges.txt at all. <|endoftext|> in
+    the text is the special token 50256, as in HF and Parabix (tiktoken's default
+    raises on it)."""
+    ids = enc.encode(text, allowed_special="all")
     toks = [enc.decode_single_token_bytes(i).decode("utf-8", errors="replace") for i in ids]
     return ids, toks
 
@@ -221,11 +223,11 @@ def bench_hf(tokenizer_obj, text: str, runs: int) -> dict:
 def bench_tiktoken(enc, text: str, runs: int) -> dict:
     """Fair tiktoken tokenize time: warm best-of-N in-process encode() (encoding
     already loaded by tiktoken.get_encoding() before timing)."""
-    enc.encode(text)                                  # one discarded warm-up
+    enc.encode(text, allowed_special="all")           # one discarded warm-up
     times_ms = []
     for _ in range(runs):
         t0 = time.perf_counter()
-        enc.encode(text)
+        enc.encode(text, allowed_special="all")
         times_ms.append((time.perf_counter() - t0) * 1e3)
     times_ms.sort()
     nbytes = len(text.encode("utf-8"))

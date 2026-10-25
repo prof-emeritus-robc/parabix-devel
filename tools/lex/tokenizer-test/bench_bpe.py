@@ -57,6 +57,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from functools import partial
 from tokenizers import Tokenizer
 import tiktoken
 
@@ -261,8 +262,9 @@ def run_tiktoken(enc, text: str, iters: int, chunks: list[str] | None = None,
     encode_ordinary forms, which skip the scan of the text for special tokens (the
     Parabix --bench-loop path does not handle special tokens either)."""
     nbytes = len(text.encode("utf-8"))
-    one   = enc.encode_ordinary if ordinary else enc.encode
-    batch = enc.encode_ordinary_batch if ordinary else enc.encode_batch
+    # <|endoftext|> is the special token, as in HF and Parabix (the default raises on it)
+    one   = enc.encode_ordinary if ordinary else partial(enc.encode, allowed_special="all")
+    batch = enc.encode_ordinary_batch if ordinary else partial(enc.encode_batch, allowed_special="all")
     if chunks:
         joined = [i for ids in batch(chunks, num_threads=threads) for i in ids]
         if joined != one(text):

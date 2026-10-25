@@ -78,6 +78,10 @@
 #include <stdexcept>
 #include <boost/intrusive/detail/math.hpp>
 #include <kernel/io/source_kernel.h>              // MemorySourceBlockCapacity (--memsource-block-capacity)
+#include <sys/mman.h>                             // --tail-shared-cache-bits
+#include <toolchain/toolchain.h>                  // codegen::SegmentThreads (--tail-shared-cache-bits)
+#include <chrono>                                 // --tail-vocab-table build time
+#include <thread>                                 // --tail-vocab-table builder
 using boost::intrusive::detail::ceil_log2;
 
 using namespace llvm;
@@ -1106,14 +1110,24 @@ private:
 // binary search was 40% slower: one left part such as U+0120 starts thousands of rules.)
 // left / right: one bit per id, set when the id is the left / right part of some rule in
 // the table; a pair failing either (most non-rules) never touches the 2 MB table.
+// pair (--tail-pair-table): the rule of every pair of byte ids (both < 256) in a direct
+// 256 x 256 table, 0xFFFF for none, 128 KB. A pretoken's first round of pairs is all byte
+// pairs: 47% of the lookups of a cache miss on val_4MB and webtext_cases (7 of 15).
 struct TailTable {
     std::vector<uint64_t> slots;
     uint32_t mask = 0, shift = 0;
     unsigned idBits = 16;                // the width of the ids reaching the tail
     uint64_t left[1024], right[1024];
+    std::vector<uint16_t> pair;
+    bool usePair = false;
 };
 static constexpr uint64_t kTailEmpty = ~0ull;
 static TailTable gTail;
+static cl::opt<bool> TailPairTable(
+    "tail-pair-table",
+    cl::desc("With --bpe-tail or --tail-from-bytes: look up rules of two byte ids in a direct "
+             "256 x 256 table instead of the hash table (default off)."),
+    cl::init(false));
 static BPETailSink gTailSink = nullptr;
 
 void bpeTailSetSink(BPETailSink sink) { gTailSink = sink; }
@@ -1121,6 +1135,7 @@ void bpeTailSetSink(BPETailSink sink) { gTailSink = sink; }
 static inline uint32_t tailSlot(uint32_t key) { return (key * 0x9E3779B1u) >> gTail.shift; }
 
 static inline uint16_t tailMerge(uint16_t a, uint16_t b) {
+    if (gTail.usePair && (a | b) < 256) return gTail.pair[(uint32_t(a) << 8) | b];
     if (!((gTail.left[a >> 6] >> (a & 63)) & (gTail.right[b >> 6] >> (b & 63)) & 1)) return 0xFFFF;
     const uint32_t key = (uint32_t(a) << 16) | b;
     for (uint32_t h = tailSlot(key); ; h = (h + 1) & gTail.mask) {
@@ -1221,6 +1236,28 @@ static cl::opt<unsigned> TailCacheBits(
     cl::desc("With --bpe-tail: the tail's per-thread segment cache has 2^N sets of 64 bytes "
              "(default 15, 2 MB)."),
     cl::init(15));
+// --tail-cache-ways=4 (with --tail-from-bytes): 4 entries per set instead of 2, 128 bytes, one
+// cache line on Apple M-series, and a hit moves its entry to the front (LRU) where the 2-way
+// cache keeps insertion order (a miss pushes out the older entry even if it was just hit).
+// Simulated on val_4MB, 2 MB per thread: 1 thread warm 28k -> 16k misses, cold 60k -> 53k;
+// 4 threads warm 14k -> 3k. Runtime only, no cache tag.
+static cl::opt<unsigned> TailCacheWays(
+    "tail-cache-ways",
+    cl::desc("With --tail-from-bytes: entries per tail cache set, 2 (default, insertion order) "
+             "or 4 (least recently used out)."),
+    cl::init(2));
+// --tail-shared-cache-bits=N (with --tail-from-bytes): a second-level cache of 2^N sets x 4
+// entries (128 bytes each) shared by all threads, looked up when a thread's own cache misses.
+// Each thread's cache otherwise learns every word itself: on val_4MB at 4 threads a cold run
+// has 89k misses against 52k at 1 thread. Entries are written once per run and never
+// replaced, so readers need no lock: a writer claims an empty entry (k1 0 -> busy by CAS),
+// fills it and publishes its k1 with a release store; a reader reads an entry only after an
+// acquire load of a published k1. A full set takes no more words. 0 = off (default).
+static cl::opt<unsigned> TailSharedCacheBits(
+    "tail-shared-cache-bits",
+    cl::desc("With --tail-from-bytes: a tail cache of 2^N 128-byte sets shared by all threads, "
+             "behind each thread's own (0 = off, the default)."),
+    cl::init(0));
 static constexpr unsigned kTailCacheOut = 7;
 static std::atomic<uint64_t> gTailGeneration{0};   // bumped whenever gTail is rebuilt
 
@@ -1236,8 +1273,10 @@ struct TailScratch {
     std::vector<uint16_t> t;             // an uncached segment: ids ...
     std::vector<uint32_t> pos;           // ... and positions
     std::vector<TailCacheEntry> cache;
+    TailCacheEntry * sets = nullptr;     // set 0 (cache.data(), or 128-aligned for 4 ways)
     uint64_t generation = 0;
     unsigned setBits = 0;                // log2 of the cache's sets
+    unsigned ways = 0;
 };
 // --tail-cache-pool: scratches not in use; a thread leases one and returns it as it exits.
 static std::mutex gTailPoolMutex;
@@ -1265,15 +1304,54 @@ static TailScratch & tailScratch() {
         sp = &s;
     }
     const uint64_t g = gTailGeneration.load(std::memory_order_relaxed);
-    if (sp->generation != g || sp->setBits != TailCacheBits) {
+    const unsigned ways = TailFromBytes && TailCacheWays == 4 ? 4 : 2;
+    if (sp->generation != g || sp->setBits != TailCacheBits || sp->ways != ways) {
         sp->setBits = std::min<unsigned>(std::max<unsigned>(TailCacheBits, 4), 24);
-        sp->cache.assign(size_t(2) << sp->setBits, TailCacheEntry{});
+        sp->ways = ways;
+        if (ways == 2) {
+            sp->cache.assign(size_t(2) << sp->setBits, TailCacheEntry{});
+            sp->sets = sp->cache.data();
+        } else {   // 4 extra entries so that set 0 can start on a 128-byte line
+            sp->cache.assign((size_t(ways) << sp->setBits) + 4, TailCacheEntry{});
+            sp->sets = reinterpret_cast<TailCacheEntry *>(
+                (reinterpret_cast<uintptr_t>(sp->cache.data()) + 127) & ~uintptr_t(127));
+        }
         sp->generation = g;
     }
     return *sp;
 }
 
-void bpeDropTailCaches() { gTailGeneration++; }
+// --tail-shared-cache-bits: the shared cache (anonymous memory, so it starts zeroed and its
+// pages arrive as they are first written). Reset only while no pipeline runs. A reset of the
+// same size clears it in place, as the threads' own caches are cleared under
+// --bench-cold-cache (a one-shot run pays page faults for both).
+static TailCacheEntry * gTailShared = nullptr;
+static size_t gTailSharedBytes = 0;
+static unsigned gTailSharedShift = 64;
+static constexpr uint64_t kTailSharedBusy = ~0ull;   // a k1 no key has: its length byte is <= 15
+
+static void tailSharedReset() {
+    // one thread shares with no one: the second lookup would only add a miss (+5% measured)
+    const bool on = TailSharedCacheBits && codegen::SegmentThreads > 1;
+    const size_t bytes = on ? size_t(128) << std::min<unsigned>(TailSharedCacheBits, 24) : 0;
+    if (gTailShared && bytes == gTailSharedBytes) {
+        std::memset(gTailShared, 0, bytes);
+        return;
+    }
+    if (gTailShared) munmap(gTailShared, gTailSharedBytes);
+    gTailShared = nullptr;
+    gTailSharedBytes = bytes;
+    if (bytes == 0) return;
+    void * p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) report_fatal_error("--tail-shared-cache-bits: mmap failed");
+    gTailShared = static_cast<TailCacheEntry *>(p);
+    gTailSharedShift = 64 - std::min<unsigned>(TailSharedCacheBits, 24);
+}
+
+void bpeDropTailCaches() {
+    gTailGeneration++;
+    if (gTailShared) tailSharedReset();
+}
 
 static inline void tailMark(uint64_t * emit, uint32_t p) { emit[p / 64] |= 1ull << (p % 64); }
 static inline uint64_t tailLowMask(size_t k) { return k >= 64 ? ~0ull : (1ull << k) - 1; }
@@ -1348,7 +1426,7 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
         mask0[k] = tailLowMask(std::min(k, K::per0) * B);
         mask1[k] = k <= K::per0 ? 0 : tailLowMask((k - K::per0) * B);
     }
-    TailCacheEntry * const cache = S.cache.data();
+    TailCacheEntry * const cache = S.sets;
     const unsigned setShift = 64 - S.setBits;
     auto bitsIn = [&](size_t w, size_t lo, size_t hi) {      // starts bits of word w in [lo, hi)
         uint64_t x = starts[w];
@@ -1472,16 +1550,134 @@ static constexpr unsigned kTailByteKeyMax = 15;   // cached pretokens: 2 .. 15 b
 struct TailByteDesc {
     uint64_t k0, k1;
     TailCacheEntry * set;
+    const TailCacheEntry * vset;         // its --tail-vocab-table set, or null
+    uint64_t h;                          // the key's hash (--tail-shared-cache-bits)
     uint32_t s, len;
 };
 
+// Entries 0 .. w-1 of a W-entry set move down one, entry W-1 drops out (unrolled: a memmove
+// call for 32..96 bytes was 3% of a 1-thread run).
+template <unsigned W>
+static inline void tailShiftDown(TailCacheEntry * set, unsigned w) {
+#pragma clang loop unroll(full)
+    for (unsigned k = W - 1; k > 0; k--)
+        if (k <= w) set[k] = set[k - 1];
+}
+
+// --tail-vocab-table: the vocabulary tokens of 2..kTailByteKeyMax bytes that BPE turns back
+// into themselves, as finished cache entries (one output id) in 4-entry sets, read-only once
+// built. tiktoken returns any pretoken found in its vocabulary without merging; checking
+// each token once at load makes the same shortcut exact for any merge list (for GPT-2 every
+// merge token passes). Measured on val_4MB: 49% of the distinct cacheable pretokens (the
+// cold misses) are one token, webtext_cases 33%.
+static cl::opt<bool> TailVocabTable(
+    "tail-vocab-table",
+    cl::desc("With --tail-from-bytes: answer a cache miss on a pretoken that is itself a "
+             "vocabulary token from a table checked at load (default off)."),
+    cl::init(false));
+// Built on a thread of its own while the pipeline compiles and runs, and published when done
+// (release store; the resolve loop loads it with acquire): until then a miss just merges.
+static std::vector<TailCacheEntry> gTailVocabMem;
+static std::atomic<TailCacheEntry *> gTailVocab{nullptr};
+static unsigned gTailVocabShift = 64;
+static std::thread gTailVocabThread;
+static std::string gTailVocabReport;   // the builder's summary line
+static void tailVocabJoin() {
+    if (!gTailVocabThread.joinable()) return;
+    gTailVocabThread.join();
+    std::cerr << gTailVocabReport;
+}
+
+// --tail-vocab-first (with --tail-vocab-table): look a pretoken up in the vocabulary table
+// first, prefetched like the thread's own set, and keep only the other pretokens in the
+// thread's cache. 90% of pretoken occurrences in val_4MB are one token, and the table is
+// full from the start of a run while each thread's cache starts empty.
+static cl::opt<bool> TailVocabFirst(
+    "tail-vocab-first",
+    cl::desc("With --tail-vocab-table: look pretokens up in the vocabulary table before the "
+             "thread's own cache (default off)."),
+    cl::init(false));
+
+static inline const TailCacheEntry * tailVocabSet(const TailCacheEntry * vocab, uint64_t h) {
+    return vocab + (h >> gTailVocabShift) * 4;
+}
+
+static inline const TailCacheEntry * tailVocabFind(const TailCacheEntry * vs, uint64_t k0, uint64_t k1) {
+    for (unsigned i = 0; i < 4; i++) {
+        if (vs[i].k1 == 0) return nullptr;
+        if (vs[i].k1 == k1 && vs[i].k0 == k0) return &vs[i];
+    }
+    return nullptr;
+}
+
+// --tail-shared-cache-bits: the shared set of a key, and its lookup and insertion.
+static inline TailCacheEntry * tailSharedSet(uint64_t h) { return gTailShared + (h >> gTailSharedShift) * 4; }
+
+static inline const TailCacheEntry * tailSharedFind(TailCacheEntry * ss, uint64_t k0, uint64_t k1) {
+    for (unsigned i = 0; i < 4; i++) {
+        const uint64_t c = __atomic_load_n(&ss[i].k1, __ATOMIC_ACQUIRE);
+        if (c == 0) return nullptr;                  // filled in order: the rest are empty too
+        if (c == k1 && ss[i].k0 == k0) return &ss[i];
+    }
+    return nullptr;
+}
+
+static inline void tailSharedInsert(TailCacheEntry * ss, const TailCacheEntry & f) {
+    for (unsigned i = 0; i < 4; i++) {
+        uint64_t c = __atomic_load_n(&ss[i].k1, __ATOMIC_ACQUIRE);
+        if (c == 0) {
+            if (__atomic_compare_exchange_n(&ss[i].k1, &c, kTailSharedBusy, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                ss[i].k0 = f.k0;
+                ss[i].keep = f.keep;
+                std::memcpy(ss[i].out, f.out, sizeof(f.out));
+                __atomic_store_n(&ss[i].k1, f.k1, __ATOMIC_RELEASE);
+                return;
+            }
+        }
+        if (c == f.k1 && ss[i].k0 == f.k0) return;  // another thread stored it first
+    }
+}
+
+// W = entries per set: 2 keeps insertion order, 4 moves a hit to the front (LRU). VF:
+// --tail-vocab-first.
+template <unsigned W, bool VF>
 static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes, uint32_t * res,
                                    uint64_t * emit) {
     TailCacheEntry * const set = d.set;
     const TailCacheEntry * e;
-    if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
-    else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) e = &set[1];
-    else {
+    unsigned w = W;
+    if constexpr (VF) {
+        if (d.vset) {
+            for (unsigned i = 0; i < 4 && d.vset[i].k1 != 0; i++)
+                if (d.vset[i].k1 == d.k1 && d.vset[i].k0 == d.k0) { e = &d.vset[i]; goto emitIds; }
+        }
+    }
+    if constexpr (W == 2) {
+        if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) w = 0;
+        else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) w = 1;
+    } else {
+        for (unsigned i = 0; i < W; i++)
+            if (set[i].k0 == d.k0 && set[i].k1 == d.k1) { w = i; break; }
+    }
+    if (LLVM_LIKELY(w < W)) {
+        if (W > 2 && w > 0) {                                   // move to the front
+            const TailCacheEntry hit = set[w];
+            tailShiftDown<W>(set, w);
+            set[0] = hit;
+            w = 0;
+        }
+        e = &set[w];
+    } else if (const TailCacheEntry * g = !VF && d.vset ? tailVocabFind(d.vset, d.k0, d.k1) : nullptr) {
+        tailShiftDown<W>(set, W - 1);                           // the last one goes
+        set[0] = *g;
+        e = &set[0];
+    } else if (const TailCacheEntry * g = gTailShared ? tailSharedFind(tailSharedSet(d.h), d.k0, d.k1)
+                                                      : nullptr) {
+        tailShiftDown<W>(set, W - 1);
+        set[0] = *g;
+        e = &set[0];
+    } else {
         uint16_t tt[kTailByteKeyMax];
         uint32_t idx[kTailByteKeyMax];
         size_t m = d.len;
@@ -1491,12 +1687,14 @@ static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes
             for (size_t j = 0; j < m; j++) { res[d.s + idx[j]] = tt[j]; tailMark(emit, d.s + idx[j]); }
             return;
         }
-        set[1] = set[0];
+        tailShiftDown<W>(set, W - 1);                           // the last one goes
         TailCacheEntry & f = set[0];
         f.k0 = d.k0; f.k1 = d.k1; f.keep = 0;
         for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << idx[j]); f.out[j] = tt[j]; }
+        if (gTailShared) tailSharedInsert(tailSharedSet(d.h), f);
         e = &f;
     }
+emitIds:
     unsigned j = 0;
     for (uint32_t keep = e->keep; keep; keep &= keep - 1) {
         const uint32_t q = d.s + __builtin_ctz(keep);
@@ -1509,15 +1707,17 @@ static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes
 // byte a token. Same protocol for res / emit and the segments cut by the call's edges. A
 // pretoken of one byte is its base id; 2 .. kTailByteKeyMax bytes go through the cache
 // (keyed by the bytes, prefetched kTailAhead pretokens ahead); longer ones merge on the spot.
-static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
-                             uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
-    TailScratch & S = tailScratch();
+template <unsigned W, bool VF>
+static void tailResolveBytes(TailScratch & S, const uint8_t * bytes, const uint64_t * segs,
+                             uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n,
+                             uint64_t final) {
     std::fill(emit, emit + numItems / 64, 0);
     if (n > numItems) n = numItems;
     const size_t nWords = (n + 63) / 64;
     if (nWords == 0) return;
-    TailCacheEntry * const cache = S.cache.data();
+    TailCacheEntry * const cache = S.sets;
     const unsigned setShift = 64 - S.setBits;
+    const TailCacheEntry * const vocab = gTailVocab.load(std::memory_order_acquire);   // null until built
     auto segWord = [&](size_t w) { return segs[w] & (w * 64 + 64 > n ? tailLowMask(n - w * 64) : ~0ull); };
     auto openRange = [&](size_t lo, size_t hi, bool segStart) {   // the bytes of a cut segment
         for (size_t p = lo; p < hi; p++) {
@@ -1535,7 +1735,7 @@ static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint3
     TailByteDesc ring[kTailAhead];
     unsigned head = 0, count = 0;
     auto drain = [&] {
-        for (; count; count--, head = (head + 1) % kTailAhead) tailFinishBytes(ring[head], bytes, res, emit);
+        for (; count; count--, head = (head + 1) % kTailAhead) tailFinishBytes<W, VF>(ring[head], bytes, res, emit);
     };
     for (size_t s = first;;) {
         while (sx == 0 && ++sw < nWords) sx = segWord(sw);
@@ -1552,7 +1752,7 @@ static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint3
             tailMark(emit, uint32_t(s));
         } else if (len <= kTailByteKeyMax) {
             if (count == kTailAhead) {
-                tailFinishBytes(ring[head], bytes, res, emit);
+                tailFinishBytes<W, VF>(ring[head], bytes, res, emit);
                 head = (head + 1) % kTailAhead;
                 count--;
             }
@@ -1570,8 +1770,11 @@ static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint3
             d.s = uint32_t(s);
             d.len = uint32_t(len);
             const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
-            d.set = cache + (h >> setShift) * 2;
+            d.set = cache + (h >> setShift) * W;
+            d.h = h;
+            d.vset = vocab ? tailVocabSet(vocab, h) : nullptr;
             __builtin_prefetch(d.set);
+            if (VF && d.vset) __builtin_prefetch(d.vset);
         } else {                                                    // longer: merge it here
             if (S.t.size() < len) { S.t.resize(len); S.pos.resize(len); }
             for (size_t i = 0; i < len; i++) { S.t[i] = gTailBase[bytes[s + i]]; S.pos[i] = uint32_t(s + i); }
@@ -1588,7 +1791,15 @@ static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint3
 
 extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
                                        uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
-    tailResolveBytes(bytes, segs, res, emit, numItems, n, final);
+    TailScratch & S = tailScratch();
+    const bool vf = TailVocabFirst && TailVocabTable;
+    if (S.ways == 4) {
+        if (vf) tailResolveBytes<4, true>(S, bytes, segs, res, emit, numItems, n, final);
+        else tailResolveBytes<4, false>(S, bytes, segs, res, emit, numItems, n, final);
+    } else {
+        if (vf) tailResolveBytes<2, true>(S, bytes, segs, res, emit, numItems, n, final);
+        else tailResolveBytes<2, false>(S, bytes, segs, res, emit, numItems, n, final);
+    }
 }
 
 // BPETailKernel's body: the tokens in order. A cut segment's tokens collect in gTailOpen and
@@ -3388,8 +3599,11 @@ static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, siz
     gTail.mask = (1u << bits) - 1;
     gTail.shift = 32 - bits;
     gTail.idBits = idBits;
+    gTail.usePair = TailPairTable;
+    gTail.pair.assign(TailPairTable ? 65536 : 0, 0xFFFF);
     for (size_t gi = from; gi < ruleRanges.size(); gi++)
         for (const auto & r : ruleRanges[gi].rules) {
+            if (TailPairTable && r.idA < 256 && r.idB < 256) gTail.pair[(r.idA << 8) | r.idB] = uint16_t(r.idAB);
             const uint32_t key = (r.idA << 16) | r.idB;
             uint32_t h = tailSlot(key);
             while (gTail.slots[h] != kTailEmpty && uint32_t(gTail.slots[h] >> 16) != key)
@@ -3399,6 +3613,65 @@ static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, siz
             gTail.right[r.idB >> 6] |= 1ull << (r.idB & 63);
         }
     return numRules;
+}
+
+// --tail-vocab-table: build the table from the rules (gTail must be built) and publish it.
+// Tokens go in by rank, so when a set is full it is a rarer token that is left to the merge
+// path. Runs on gTailVocabThread.
+static void tailVocabBuild(std::vector<MergeRule> rules) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::sort(rules.begin(), rules.end(), [](const MergeRule & a, const MergeRule & b) { return a.idAB < b.idAB; });
+    unsigned maxId = 256;
+    for (const MergeRule & r : rules) maxId = std::max(maxId, r.idAB + 1);
+    struct Bytes { uint8_t len; uint8_t b[kTailByteKeyMax]; };   // len 0: longer than the key
+    std::vector<Bytes> bytesOf(maxId, Bytes{0, {}});
+    for (unsigned by = 0; by < 256; by++) { bytesOf[bpeBaseId(by)].len = 1; bytesOf[bpeBaseId(by)].b[0] = uint8_t(by); }
+    size_t want = 0;
+    for (const MergeRule & r : rules) {
+        const Bytes & a = bytesOf[r.idA], & b = bytesOf[r.idB];
+        if (a.len == 0 || b.len == 0 || a.len + b.len > kTailByteKeyMax) continue;
+        Bytes & t = bytesOf[r.idAB];
+        t.len = uint8_t(a.len + b.len);
+        std::memcpy(t.b, a.b, a.len);
+        std::memcpy(t.b + a.len, b.b, b.len);
+        want++;
+    }
+    unsigned bits = ceil_log2(std::max<size_t>(want / 4, 16));
+    if (const char * e = std::getenv("BPE_VOCAB_BITS")) if (std::atoi(e) >= 4) bits = unsigned(std::atoi(e));
+    gTailVocabMem.assign((size_t(4) << bits) + 4, TailCacheEntry{});
+    TailCacheEntry * const vocab = reinterpret_cast<TailCacheEntry *>(
+        (reinterpret_cast<uintptr_t>(gTailVocabMem.data()) + 127) & ~uintptr_t(127));
+    gTailVocabShift = 64 - bits;
+    size_t stored = 0, unreachable = 0, full = 0;
+    for (const MergeRule & r : rules) {
+        const Bytes & s = bytesOf[r.idAB];
+        const size_t len = s.len;
+        if (len < 2) continue;
+        uint16_t tt[kTailByteKeyMax];
+        uint32_t idx[kTailByteKeyMax];
+        size_t m = len;
+        for (size_t i = 0; i < len; i++) { tt[i] = gTailBase[s.b[i]]; idx[i] = uint32_t(i); }
+        tailMergeSegment(tt, idx, m);
+        if (m != 1 || tt[0] != r.idAB) { unreachable++; continue; }
+        uint64_t a = 0, b = 0;
+        std::memcpy(&a, s.b, std::min<size_t>(len, 8));
+        if (len > 8) std::memcpy(&b, s.b + 8, len - 8);
+        const uint64_t k0 = a, k1 = b | (uint64_t(len) << 56);
+        const uint64_t h = (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+        TailCacheEntry * vs = vocab + (h >> gTailVocabShift) * 4;
+        unsigned i = 0;
+        while (i < 4 && vs[i].k1 != 0) i++;
+        if (i == 4) { full++; continue; }
+        vs[i].k0 = k0; vs[i].k1 = k1; vs[i].keep = 1; vs[i].out[0] = uint16_t(r.idAB);
+        stored++;
+    }
+    gTailVocab.store(vocab, std::memory_order_release);
+    // printed by tailVocabJoin on the main thread: from here it could split another stderr line
+    gTailVocabReport = "[BPE] --tail-vocab-table: " + std::to_string(stored) + " tokens in "
+        + std::to_string((size_t(128) << bits) / 1024) + " KB (" + std::to_string(unreachable)
+        + " not reached by their own merges, " + std::to_string(full) + " left out: full sets), "
+        + std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())
+        + " ms\n";
 }
 
 BPEPassResult buildBPEPassPipeline(
@@ -3415,6 +3688,18 @@ BPEPassResult buildBPEPassPipeline(
         const size_t numRules = buildTailTable(all, 0, 8);
         for (unsigned by = 0; by < 256; by++) gTailBase[by] = uint16_t(bpeBaseId(by));
         gTailOpen.n = 0;
+        tailSharedReset();
+        tailVocabJoin();
+        gTailVocab.store(nullptr, std::memory_order_relaxed);
+        if (TailVocabTable) {
+            std::vector<MergeRule> rules;
+            for (const auto & g : all) rules.insert(rules.end(), g.rules.begin(), g.rules.end());
+            // joined at exit before the statics it reads (gTail, gTailBase) are destroyed
+            static const bool joinAtExit = (std::atexit(tailVocabJoin), true);
+            (void) joinAtExit;
+            if (std::getenv("BPE_VOCAB_SYNC")) tailVocabBuild(std::move(rules));
+            else gTailVocabThread = std::thread(tailVocabBuild, std::move(rules));
+        }
         std::cerr << "[BPE] --tail-from-bytes: no merge kernels; the tail applies all "
                   << numRules << " rules per pretoken\n";
         return {nullptr, nullptr, boundary};

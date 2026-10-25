@@ -393,6 +393,16 @@ static cl::opt<bool> PretokCompressClasses(
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
+// --pretok-class-code (with --pretok-compress-classes): the nine classes fall into 10
+// disjoint categories, so compress their 4-bit code (4 streams, each one Unicode set)
+// instead of the 9 class streams; the boundary kernels decode it.
+static cl::opt<bool> PretokClassCode(
+    "pretok-class-code",
+    cl::desc("With --pretok-compress-classes: compress a 4-bit code of the classes instead of "
+             "the 9 class streams."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
 static cl::opt<unsigned> BenchLoop(
     "bench-loop",
     cl::desc("BPE mode: tokenize the input N times inside one process (excludes OS "
@@ -445,21 +455,33 @@ static void writeToStdout(PipelineBuilder & P, StreamSet * basis) {
 // HuggingFace's benchmark, which tokenizes an already-loaded in-memory string.
 using BPEPipelineFunctionType = void (*)(const char * buffer, size_t length);
 
-static BPEPipelineFunctionType buildBPEPipeline(
-        CPUDriver & driver,
-        const BPETokenizer & bpe) {
+// --memsource-in-place: main loads the input once into a buffer laid out like
+// MemorySourceKernel's own copy (page aligned, zeros through one page past the data), and
+// the source kernel reads that buffer in place instead of copying it on every pipeline call
+// (a serial malloc + memcpy + page faults before the workers start). Any other buffer (the
+// pieces around a <|endoftext|>) is still copied: the pipeline gets inPlace = 0 for it.
+static cl::opt<bool> MemSourceInPlace(
+    "memsource-in-place",
+    cl::desc("BPE mode: let the in-memory source read the padded input buffer in place "
+             "instead of copying it on every pipeline call (default off)."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+using BPEPipelineInPlaceType = void (*)(const char * buffer, size_t length, size_t inPlace);
+static BPEPipelineInPlaceType gBPEInPlaceFn = nullptr;
+static const char * gPaddedBuf = nullptr;   // the padded whole-input buffer, if any
+static size_t gPaddedLen = 0;
+static void bpeInPlaceCall(const char * buffer, size_t length) {
+    gBPEInPlaceFn(buffer, length, buffer == gPaddedBuf && length == gPaddedLen && length > 0 ? 1 : 0);
+}
 
-    auto __tBuild0 = std::chrono::steady_clock::now();
-    bpeSetFrameworkHooks();
-    auto P = CreatePipeline(driver,
-                            Input<const char*>{"buffer"}, Input<size_t>{"length"});
-    Scalar * const buffer = P.getInputScalar("buffer");
-    Scalar * const length = P.getInputScalar("length");
-
+static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const BPETokenizer & bpe,
+                                   Scalar * buffer, Scalar * length, Scalar * inPlace,
+                                   std::chrono::steady_clock::time_point __tBuild0) {
     // Stage 0: in-memory source — no fd, no per-call read(). The caller loads the
     // file once (see main) and passes the resident pointer + length each call.
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
+    if (inPlace) P.CreateKernelCall<MemorySourceKernel>(buffer, length, inPlace, ByteStream);
+    else P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
     StreamSet * BasisBits = P.CreateStreamSet(8, 1);
     P.CreateKernelCall<S2PKernel>(ByteStream, BasisBits);
 
@@ -505,7 +527,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
                                  : normalizedBasis;
     } else if (compressClasses) {
         bpeBasis    = normalizedBasis;
-        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits);
+        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode);
     } else if (PreTokenizer == bytelevel) {
         // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to
         // mark pretoken STARTS. Feed BPE the RAW bytes (BPERangeSeed does bytes_to_unicode
@@ -620,7 +642,7 @@ static BPEPipelineFunctionType buildBPEPipeline(
     }
 
     auto __tBuild1 = std::chrono::steady_clock::now();
-    auto fn = reinterpret_cast<BPEPipelineFunctionType>(P.compile());
+    void * const fn = P.ProgramBuilder::compile();
     auto __tCompile1 = std::chrono::steady_clock::now();
 
     std::cerr << "[BPE] pipeline graph build: "
@@ -630,6 +652,26 @@ static BPEPipelineFunctionType buildBPEPipeline(
               << std::chrono::duration<double, std::milli>(__tCompile1 - __tBuild1).count()
               << " ms\n";
     return fn;
+}
+
+static BPEPipelineFunctionType buildBPEPipeline(
+        CPUDriver & driver,
+        const BPETokenizer & bpe) {
+
+    auto __tBuild0 = std::chrono::steady_clock::now();
+    bpeSetFrameworkHooks();
+    if (MemSourceInPlace) {
+        auto P = CreatePipeline(driver, Input<const char*>{"buffer"}, Input<size_t>{"length"},
+                                Input<size_t>{"inPlace"});
+        gBPEInPlaceFn = reinterpret_cast<BPEPipelineInPlaceType>(buildBPEPipelineBody(
+            P, driver, bpe, P.getInputScalar("buffer"), P.getInputScalar("length"),
+            P.getInputScalar("inPlace"), __tBuild0));
+        return bpeInPlaceCall;
+    }
+    auto P = CreatePipeline(driver,
+                            Input<const char*>{"buffer"}, Input<size_t>{"length"});
+    return reinterpret_cast<BPEPipelineFunctionType>(buildBPEPipelineBody(
+        P, driver, bpe, P.getInputScalar("buffer"), P.getInputScalar("length"), nullptr, __tBuild0));
 }
 
 WordBreakerFunctionType wordBreakerPipeline(CPUDriver & driver) {
@@ -746,6 +788,25 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             buf = static_cast<const char *>(mapping);
+        }
+        // --memsource-in-place: one copy here, laid out like MemorySourceKernel's own (page
+        // aligned, zeroed from the end of the data through one more page), instead of the
+        // kernel's copy on every pipeline call.
+        std::unique_ptr<char, void (*)(void *)> padded(nullptr, std::free);
+        if (MemSourceInPlace && nbytes > 0) {
+            const size_t page = size_t(getpagesize());
+            const size_t size = (nbytes + page - 1) / page * page + page;
+            void * p = nullptr;
+            if (posix_memalign(&p, page, size) != 0) {
+                llvm::errs() << "Error: cannot allocate the input buffer.\n";
+                return 1;
+            }
+            std::memcpy(p, buf, nbytes);
+            std::memset(static_cast<char *>(p) + nbytes, 0, size - nbytes);
+            padded.reset(static_cast<char *>(p));
+            buf = padded.get();
+            gPaddedBuf = buf;
+            gPaddedLen = nbytes;
         }
         // Empty-file / degenerate case: MemorySourceKernel asserts the buffer is
         // 64-byte aligned even when length == 0, so hand it an aligned dummy.

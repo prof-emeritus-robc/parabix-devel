@@ -402,6 +402,22 @@ void MemorySourceKernel::generateInitializeMethod(KernelBuilder & b) {
     b.CreateBr(afterFree);
     b.SetInsertPoint(afterFree);
 
+    Value * const capacity = mBlockCapacity ? b.CreateRoundUp(fileItems, b.getSize(b.getBitBlockWidth()))
+                                            : fileItems;
+    BasicBlock * copyDone = nullptr;
+    if (mInPlace) {   // the caller's buffer is already aligned and padded: no copy
+        BasicBlock * const inPlace = b.CreateBasicBlock("memorySourceInPlace");
+        BasicBlock * const copy = b.CreateBasicBlock("memorySourceCopy");
+        copyDone = b.CreateBasicBlock("memorySourceReady");
+        b.CreateCondBr(b.CreateIsNotNull(b.getScalarField("inPlace")), inPlace, copy);
+        b.SetInsertPoint(inPlace);
+        b.setScalarField("buffer", ConstantPointerNull::get(cast<PointerType>(priorBuffer->getType())));
+        b.setBaseAddress("sourceBuffer", fileSource);
+        b.setCapacity("sourceBuffer", capacity);
+        b.CreateBr(copyDone);
+        b.SetInsertPoint(copy);
+    }
+
     // fileSource may have arbitrary alignment and no overflow past fileBytes, but
     // like every block-based Parabix kernel this one may read a full block past
     // the logical end of the final (partial) stride. Copy into our own buffer,
@@ -417,8 +433,11 @@ void MemorySourceKernel::generateInitializeMethod(KernelBuilder & b) {
     b.CreateMemZero(paddingStart, b.CreateSub(allocBytes, fileBytes), 1);
     b.setScalarField("buffer", ownedBuffer);
     b.setBaseAddress("sourceBuffer", ownedBuffer);
-    b.setCapacity("sourceBuffer", mBlockCapacity ? b.CreateRoundUp(fileItems, b.getSize(b.getBitBlockWidth()))
-                                                 : fileItems);
+    b.setCapacity("sourceBuffer", capacity);
+    if (copyDone) {
+        b.CreateBr(copyDone);
+        b.SetInsertPoint(copyDone);
+    }
 }
 
 void MemorySourceKernel::generateDoSegmentMethod(KernelBuilder & b) {
@@ -541,7 +560,30 @@ MemorySourceKernel::MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fi
 {})
 , mCodeUnitWidth(outputStream->getFieldWidth())
 , mNumElements(outputStream->getNumElements())
-, mBlockCapacity(MemorySourceBlockCapacity) {
+, mBlockCapacity(MemorySourceBlockCapacity)
+, mInPlace(false) {
+    PointerType * const codeUnitPtrTy = PointerType::getUnqual(ts.getContext());
+    addInternalScalar(codeUnitPtrTy, "buffer");
+    addAttribute(MustExplicitlyTerminate());
+    setStride(1);
+}
+
+MemorySourceKernel::MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fileSource, Scalar * fileItems, Scalar * inPlace, StreamSet * const outputStream)
+: SegmentOrientedKernel(ts, makeSourceName("memory_source", outputStream->getFieldWidth(), outputStream->getNumElements())
+                            + (MemorySourceBlockCapacity ? "+bc" : "") + "+ip",
+// input streams
+{},
+// output stream
+{Binding{"sourceBuffer", outputStream, FixedRate(), { ManagedBuffer() }}},
+// input scalar
+{Binding{"fileSource", fileSource}, Binding{"fileItems", fileItems}, Binding{"inPlace", inPlace}},
+{},
+// internal scalars
+{})
+, mCodeUnitWidth(outputStream->getFieldWidth())
+, mNumElements(outputStream->getNumElements())
+, mBlockCapacity(MemorySourceBlockCapacity)
+, mInPlace(true) {
     PointerType * const codeUnitPtrTy = PointerType::getUnqual(ts.getContext());
     addInternalScalar(codeUnitPtrTy, "buffer");
     addAttribute(MustExplicitlyTerminate());

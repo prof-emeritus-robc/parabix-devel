@@ -491,6 +491,29 @@ protected:
     }
 };
 
+// --pretok-class-code: the nine GPT-2 classes fall into 10 disjoint categories, coded in 4
+// bits (b3 b2 b1 b0), so 4 streams are compressed instead of 9:
+//   other 0000, ' 0001, number 0010, whitespace 0100, 0x20 0101,
+//   letter 1000, [sdmt] 1001, l 1010, [rv] 1011, e 1100.
+// Each code bit is one Unicode set (gpt2ClassCode builds them); class i of kGPT2Classes
+// order (space, spaceLit, letter, number, ', sdmt, l, rv, e) decodes from the bits
+// k = {b0, b1, b2, b3}.
+static PabloAST * gpt2DecodeClass(PabloBuilder & pb, const std::vector<PabloAST *> & k, unsigned i) {
+    PabloAST * const b0 = k[0], * const b1 = k[1], * const b2 = k[2], * const b3 = k[3];
+    auto n = [&](PabloAST * x) { return pb.createNot(x); };
+    switch (i) {
+        case 0: return pb.createAnd(n(b3), b2);                                        // space
+        case 1: return pb.createAnd(pb.createAnd(n(b3), b2), b0);                      // 0x20
+        case 2: return b3;                                                             // letter
+        case 3: return pb.createAnd(pb.createAnd(n(b3), n(b2)), pb.createAnd(b1, n(b0)));   // number
+        case 4: return pb.createAnd(pb.createAnd(n(b3), n(b2)), pb.createAnd(n(b1), b0));   // '
+        case 5: return pb.createAnd(pb.createAnd(b3, n(b2)), pb.createAnd(n(b1), b0));      // [sdmt]
+        case 6: return pb.createAnd(pb.createAnd(b3, n(b2)), pb.createAnd(b1, n(b0)));      // l
+        case 7: return pb.createAnd(pb.createAnd(b3, n(b2)), pb.createAnd(b1, b0));         // [rv]
+        default: return pb.createAnd(b3, b2);                                          // e
+    }
+}
+
 // GPT2PretokenBoundaryKernel — GPT-2 pretoken STARTS via CHARACTER-CLASS transitions
 // (parallel leftmost-longest), replacing the RE_Kernel route which over-marks (it
 // matches all positions in parallel, so overlapping arms like " '" vs "'t" and
@@ -531,10 +554,11 @@ public:
                    Binding{"cvr",  cvr,  FixedRate(), LookAhead(2)},
                    Binding{"ce",   ce,   FixedRate(), LookAhead(2)}},
                   {Binding{"boundary", boundary}}), mCombined(false) {}
-    // --pretok-compress-classes: the same nine classes as one set, in kGPT2Classes order.
+    // --pretok-compress-classes: the same nine classes as one set, in kGPT2Classes order, or
+    // (--pretok-class-code, 4 streams) as the 4-bit code of gpt2ClassCode.
     GPT2PretokenBoundaryKernel(LLVMTypeSystemInterface & ts, StreamSet * classes,
                                StreamSet * nonspace, StreamSet * boundary)
-    : PabloKernel(ts, "GPT2PretokenBoundary_c9",
+    : PabloKernel(ts, "GPT2PretokenBoundary_c" + std::to_string(classes->getNumElements()),
                   {Binding{"classes", classes, FixedRate(), LookAhead(2)},
                    Binding{"nonspace", nonspace, FixedRate(), LookAhead(1)}},
                   {Binding{"boundary", boundary}}), mCombined(true) {}
@@ -543,18 +567,23 @@ protected:
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST *> c;
         if (mCombined) c = getInputStreamSet("classes");
-        auto in = [&](const char * name, unsigned i) {
-            return mCombined ? c[i] : getInputStreamSet(name)[0];
+        const bool code4 = mCombined && c.size() == 4;
+        // class i at `ahead` codepoints ahead, decoded from the 4-bit code when code4
+        std::vector<PabloAST *> codeAt[3];
+        auto cls = [&](const char * name, unsigned i, unsigned ahead) -> PabloAST * {
+            if (!code4) {
+                PabloAST * s = mCombined ? c[i] : getInputStreamSet(name)[0];
+                return ahead ? pb.createLookahead(s, ahead) : s;
+            }
+            std::vector<PabloAST *> & k = codeAt[ahead];
+            if (k.empty()) for (PabloAST * s : c) k.push_back(ahead ? pb.createLookahead(s, ahead) : s);
+            return gpt2DecodeClass(pb, k, i);
         };
-        PabloAST * space    = in("space", 0);        // full \p{White_Space}
-        PabloAST * spaceLit = in("spaceLit", 1);     // literal 0x20 only
-        PabloAST * letter   = in("letter", 2);
-        PabloAST * number   = in("number", 3);
-        PabloAST * apos     = in("apostrophe", 4);
-        PabloAST * sdmt     = in("sdmt", 5);         // [sdmt]  (single-letter suffix)
-        PabloAST * cl       = in("cl", 6);           // 'l'     (ll)
-        PabloAST * cvr      = in("cvr", 7);          // [vr]    (ve / re first letter)
-        PabloAST * ce       = in("ce", 8);           // 'e'     (ve / re second letter)
+        PabloAST * space    = cls("space", 0, 0);        // full \p{White_Space}
+        PabloAST * spaceLit = cls("spaceLit", 1, 0);     // literal 0x20 only
+        PabloAST * letter   = cls("letter", 2, 0);
+        PabloAST * number   = cls("number", 3, 0);
+        PabloAST * apos     = cls("apostrophe", 4, 0);
 
         PabloAST * nonspace = pb.createNot(space);
         PabloAST * other    = pb.createAnd(nonspace, pb.createNot(pb.createOr(letter, number)));
@@ -613,10 +642,11 @@ protected:
         PabloAST * aposSwallowed = pb.createOr(SpLitP, Op);   // prev 0x20, or prev Other
         PabloAST * wordApos = pb.createAnd(apos, pb.createNot(aposSwallowed));
         // Peek the 1–2 codepoints after the apostrophe (LookAhead on the suffix classes).
-        PabloAST * single = pb.createAnd(wordApos, pb.createLookahead(sdmt, 1));   // 's 't 'd 'm  (span = 2 cp)
+        // [sdmt] (single-letter suffix), 'l' (ll), [vr] / 'e' (ve / re), 1 or 2 codepoints on
+        PabloAST * single = pb.createAnd(wordApos, cls("sdmt", 5, 1));              // 's 't 'd 'm  (span = 2 cp)
         PabloAST * dbl    = pb.createAnd(wordApos,                                  // 'll 've 're  (span = 3 cp)
-                            pb.createOr(pb.createAnd(pb.createLookahead(cl,  1), pb.createLookahead(cl, 2)),
-                                        pb.createAnd(pb.createLookahead(cvr, 1), pb.createLookahead(ce, 2))));
+                            pb.createOr(pb.createAnd(cls("cl", 6, 1), cls("cl", 6, 2)),
+                                        pb.createAnd(cls("cvr", 7, 1), cls("ce", 8, 2))));
         // Suppress the boundary INSIDE the contraction span (its suffix letters join the
         // apostrophe token): +1 for single/double, +2 for the 2nd letter of a double.
         PabloAST * cSuppress = pb.createOr(pb.createAdvance(pb.createOr(single, dbl), 1),
@@ -643,8 +673,10 @@ public:
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> c = getInputStreamSet("classes");
+        PabloAST * space = c.size() == 4 ? gpt2DecodeClass(pb, c, 0) : c[0];   // --pretok-class-code
         pb.createAssign(pb.createExtract(getOutputStreamVar("nonspace"), pb.getInteger(0)),
-                        pb.createInFile(pb.createNot(getInputStreamSet("classes")[0])));
+                        pb.createInFile(pb.createNot(space)));
     }
 };
 
@@ -1098,7 +1130,7 @@ PreTokenizerResult buildPreTokenizerBoundaries(
 // Number as UnicodePropertyKernelBuilder resolves them), at each UTF-8 sequence's last byte,
 // where UTF8_Decoder leaves the codepoint and UTF8_index marks it. Filtering them by
 // u8index gives exactly what the class kernels compute on the compressed codepoints.
-StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits) {
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode) {
     auto propCC = [](const char * name) {
         auto * pe = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, name);
         pe = cast<re::PropertyExpression>(UCD::linkAndResolve(pe));
@@ -1116,6 +1148,17 @@ StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits) 
         re::makeCC((codepoint_t)0x6C),                                    // 6 l
         re::makeCC(re::makeCC((codepoint_t)0x72), re::makeCC((codepoint_t)0x76)), // 7 [rv]
         re::makeCC((codepoint_t)0x65)};                                   // 8 e
+    if (classCode) {   // --pretok-class-code: the 4 code bits b0..b3 (see gpt2DecodeClass)
+        auto cps = [](std::initializer_list<codepoint_t> list) {
+            re::CC * cc = re::makeCC();
+            for (codepoint_t cp : list) cc = re::makeCC(cc, re::makeCC(cp));
+            return cc;
+        };
+        ccs = {cps({0x27, 0x20, 0x73, 0x64, 0x6D, 0x74, 0x72, 0x76}),   // b0: ' 0x20 s d m t r v
+               re::makeCC(propCC("Number"), cps({0x6C, 0x72, 0x76})),     // b1: Number l r v
+               re::makeCC(propCC("White_Space"), cps({0x65})),             // b2: White_Space e
+               propCC("Letter")};                                          // b3: Letter
+    }
     StreamSet * U21 = P.CreateStreamSet(21, 1);
     P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
     StreamSet * u8index = P.CreateStreamSet(1, 1);

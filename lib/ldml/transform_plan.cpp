@@ -643,12 +643,6 @@ static bool isEmptyText(const re::RE * re) {
     return re == nullptr || (seq && seq->empty());
 }
 
-UCD::UnicodeSet CharMapSubgroup::characters() const {
-    UCD::UnicodeSet all;
-    for (const CharMapping & m : mappings) all = all + m.chars;
-    return all + kept;
-}
-
 //  A context as a single item (through sequences of one item and variables
 //  not defined as sets), or nullptr.
 static const re::RE * singleContextItem(const re::RE * context) {
@@ -1459,6 +1453,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
             //  The earliest rule for a character takes precedence.
             const UCD::UnicodeSet chars = sets.setOf(items.front(), false) - subgroup->characters();
             if (chars.empty()) continue;
+            subgroup->all = subgroup->all + chars;
             if (identity) {
                 subgroup->kept = subgroup->kept + chars;
                 continue;

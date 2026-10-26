@@ -1337,9 +1337,12 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
 
 - `tconv-coverage/coverage.md` has the summary tables and the per-transform
   table; `coverage.json` has the same data for scripting.
-- Use `--jobs 1` or 2: analyzing the Han transforms takes 8–14 GB each. (Runs
-  have used `--jobs 4` on 64 GB; a full run takes about 35 minutes, mostly
-  rerunning failing cases per line.)
+- Analyzing the Han transforms took 8–14 GB each before `planTransform` kept
+  the characters of each subgroup as it adds rules (and the multiplexed sets
+  were built from their intervals); it now takes about 120 MB (Jpan-Latn,
+  Hani-Latn and Hant-Latn, `--kernel-counts`). (Runs have used `--jobs 4` on
+  64 GB; a full run takes about 35 minutes, mostly rerunning failing cases per
+  line.)
 - When comparing tconv versions, give each run its own `-object-cache-salt`.
 - **Kernel counts.** Each transform's `tconv --kernel-counts` output is kept in
   `kernels/`, and gives the groups, rules, group kernels and kernels columns of

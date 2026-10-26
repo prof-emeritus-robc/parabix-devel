@@ -642,13 +642,19 @@ correction, between 108 and 1,853 of each 5,000 differ.
   in the tables.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
-  contexts reach back to each other (`カヽヽヽヽヽ`) leaves the last ones
-  unchanged. Each round may insert positions, and the bounds of the pipeline's
-  buffers grow with the number inserted at a position to the power of the
-  rounds: above 6 rounds the pipeline fails to compile ("failed to allocate
-  virtual address space"), and tconv rejects them. For the same reason, a
-  capture copied counts runs of its repeated set of up to 16 characters; a rule
-  copying a longer run does not apply.
+  contexts reach back to each other leaves the last ones unchanged, unless it is
+  a run of a self-reproducing rule (`カヽヽヽヽヽ`, any length, see
+  `DeferredRuns`). Runs of the voiced mark (`ナヾヾヾヾヾ`, a text of two
+  characters after NFD) are not extended as runs: one mark is converted in each
+  round. The positions the rules may write are inserted once, before
+  the rounds (as many after each trigger as the longest R and copy), and the
+  rounds and `DeferredRuns` work within them, so that the bounds of the
+  pipeline's buffers no longer grow with the number of rounds. (Inserting
+  positions in each round had them grow to the power of the rounds: on an 8 GB
+  machine, Kana-Latn itself failed to compile with the default of 4, "failed to
+  allocate virtual address space".) The runs of the repeated set of a capture
+  copied are counted up to 16 characters, which bounds the positions reserved;
+  a rule copying a longer run does not apply.
 
 ### 3.3 Intended differences from ICU
 

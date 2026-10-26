@@ -640,20 +640,20 @@ correction, between 108 and 1,853 of each 5,000 differ.
   longer takes gigabytes (`2f882cba6`): with the default of 4 rounds, on an
   8 GB machine, the first compilation takes 228 s (300 s of CPU) and 1.5 GB,
   and runs from the object cache 3 s and 274 MB. It is identical to ICU 78.3's
-  `createFromRules` (the rules of Japn-Latn.xml, with its `::` steps) on 505
-  lines: 5 of Japanese text, and 500 random lines of up to 20 characters mixing
+  `createFromRules` (the rules of Japn-Latn.xml, with its `::` steps) on 507
+  lines: 7 of Japanese text and runs of marks, and 500 random lines of up to 20 characters mixing
   the Han characters of its rules, kana, iteration marks, punctuation and ASCII.
-  Runs of more than four voiced iteration marks would differ, as in Kana-Latn
-  (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
+  Runs that switch between plain and voiced iteration marks more often than
+  the rounds allow would differ, as in Kana-Latn (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
   ("failed to allocate virtual address space", or a Z3 error at the default
   of 4), and its analysis exceeded 13 GB.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
   contexts reach back to each other leaves the last ones unchanged, unless it is
-  a run of a self-reproducing rule (`カヽヽヽヽヽ`, any length, see
-  `DeferredRuns`). Runs of the voiced mark (`ナヾヾヾヾヾ`, a text of two
-  characters after NFD) are not extended as runs: one mark is converted in each
-  round. The positions the rules may write are inserted once, before
+  a run of a self-reproducing rule (`カヽヽヽヽヽ`, `ナヾヾヾヾヾ`, any length,
+  see `DeferredRuns`). Within a run, each switch between plain and voiced marks
+  (`カヽヾヽヾ`) still takes a round, as the rule applying after the switch
+  depends on the block before it. The positions the rules may write are inserted once, before
   the rounds (as many after each trigger as the longest R and copy), and the
   rounds and `DeferredRuns` work within them, so that the bounds of the
   pipeline's buffers no longer grow with the number of rounds. (Inserting

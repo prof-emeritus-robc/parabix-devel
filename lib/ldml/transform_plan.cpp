@@ -1103,24 +1103,51 @@ static bool selfReproducingContext(const std::vector<re::RE *> & p, const std::u
 //  Whether a before context may match before a text continuing the run of a
 //  self-reproducing rule, as far as the block R c written before it tells: its
 //  items, matched right to left against the characters the block may have at
-//  each position (from its end: the copy, its fixed items as far as its
-//  repetition, then R, then the copy again), each holding one of them (a repetition of a set holding
-//  none matching nothing).  Beyond what is known of the block, it may match.
+//  each position (from its end: the copy, R, then the copy again; the
+//  repetition of a copy matching any number of characters of its set), each
+//  holding one of them (a repetition of a set holding any number of them).
+//  Beyond what is known of the block, it may match.
 static bool mayMatchBeforeRun(re::RE * before, const std::u32string & r, const CopyCapture & c, CharSetAnalysis & sets) {
     if (before == nullptr) return true;
+    //  The block from its end: sets of one character, or a repetition (star).
     //  (Before the block, the copy c again: at the first text of the run, the
     //  region that the rule copied, and at the next, the copy written before.)
-    std::vector<UCD::UnicodeSet> block(c.suffix.rbegin(), c.suffix.rend());
-    if (!c.star) {
-        block.insert(block.end(), c.prefix.rbegin(), c.prefix.rend());
-        for (size_t i = r.size(); i-- > 0; ) block.push_back(UCD::UnicodeSet(r[i]));
-        block.insert(block.end(), c.prefix.rbegin(), c.prefix.rend());
-    }
+    struct Element {
+        UCD::UnicodeSet chars;
+        bool star;
+    };
+    std::vector<Element> block;
+    auto addCopy = [&]() {
+        for (size_t i = c.suffix.size(); i-- > 0; ) block.push_back(Element{c.suffix[i], false});
+        if (c.star) block.push_back(Element{c.starSet, true});
+        for (size_t i = c.prefix.size(); i-- > 0; ) block.push_back(Element{c.prefix[i], false});
+    };
+    addCopy();
+    for (size_t i = r.size(); i-- > 0; ) block.push_back(Element{UCD::UnicodeSet(r[i]), false});
+    addCopy();
+    const size_t end = block.size();
+    //  The positions of the block reached (end: beyond what is known), with
+    //  the repetitions matching no character skipped.
+    std::vector<bool> reached(end + 1, false);
+    auto close = [&](std::vector<bool> & states) {
+        for (size_t k = 0; k < end; k++) if (states[k] && block[k].star) states[k + 1] = true;
+    };
+    //  The positions reached from states by a character of chars.
+    auto step = [&](const std::vector<bool> & states, const UCD::UnicodeSet & chars) {
+        std::vector<bool> next(end + 1, false);
+        for (size_t k = 0; k < end; k++) {
+            if (!states[k] || !chars.intersects(block[k].chars)) continue;
+            next[block[k].star ? k : k + 1] = true;
+        }
+        close(next);
+        return next;
+    };
+    reached[0] = true;
+    close(reached);
     std::vector<re::RE *> items;
     textItems(before, items);
-    size_t k = 0;
     for (size_t i = items.size(); i-- > 0; ) {
-        if (k >= block.size()) return true;
+        if (reached[end]) return true;
         re::RE * item = items[i];
         while (re::Name * n = dyn_cast<re::Name>(item)) {
             if (isFunctionCall(n) || n->getDefinition() == nullptr || CharSetAnalysis::isSet(n->getDefinition())) break;
@@ -1128,12 +1155,19 @@ static bool mayMatchBeforeRun(re::RE * before, const std::u32string & r, const C
         }
         if (const re::Rep * rep = dyn_cast<re::Rep>(item); rep && rep->getLB() == 0
                 && CharSetAnalysis::isSet(rep->getRE()) && !hasStrings(rep->getRE())) {
-            if (sets.setOf(rep->getRE(), false).intersects(block[k])) return true;
+            const UCD::UnicodeSet chars = sets.setOf(rep->getRE(), false);
+            for (bool grown = true; grown; ) {
+                const std::vector<bool> next = step(reached, chars);
+                grown = false;
+                for (size_t k = 0; k <= end; k++) {
+                    if (next[k] && !reached[k]) reached[k] = grown = true;
+                }
+            }
             continue;
         }
         if (!CharSetAnalysis::isSet(item) || hasStrings(item)) return true;
-        if (!sets.setOf(item, false).intersects(block[k])) return false;
-        k++;
+        reached = step(reached, sets.setOf(item, false));
+        if (std::find(reached.begin(), reached.end(), true) == reached.end()) return false;
     }
     return true;
 }

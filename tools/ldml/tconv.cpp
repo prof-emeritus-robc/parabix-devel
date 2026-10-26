@@ -2444,12 +2444,18 @@ struct FusedSubgroupPlan {
         size_t maxLength = 1;
         for (const ldml::CharMapping * mp : order) maxLength = std::max(maxLength, mp->replacement.size());
         indexBits.assign(maxLength, std::vector<UCD::UnicodeSet>(21));
+        //  (The sets of the characters, of thousands of mappings, built once from
+        //  their intervals rather than by a union for each mapping.)
+        std::vector<UCD::interval_t> allRanges;
+        std::vector<std::vector<UCD::interval_t>> muxRanges(bits);
         for (size_t n = 0; n < order.size(); n++) {
             const ldml::CharMapping & mp = *order[n];
             const UCD::codepoint_t index = static_cast<UCD::codepoint_t>(n);
-            all = all + mp.chars;
-            for (unsigned b = 0; b < bits; b++) {
-                if ((n >> b) & 1) mux[b] = mux[b] + mp.chars;
+            for (const UCD::interval_t & range : mp.chars) {
+                allRanges.push_back(range);
+                for (unsigned b = 0; b < bits; b++) {
+                    if ((n >> b) & 1) muxRanges[b].push_back(range);
+                }
             }
             const size_t length = mp.replacement.size();
             for (size_t i = 0; i < std::max<size_t>(length, 1); i++) {
@@ -2461,6 +2467,22 @@ struct FusedSubgroupPlan {
             }
             if (length > 1) insertIndices[static_cast<unsigned>(length - 1)].insert(index);
         }
+        all = setOfRanges(allRanges);
+        for (unsigned b = 0; b < bits; b++) mux[b] = setOfRanges(muxRanges[b]);
+    }
+    //  The set of the characters of ranges (in any order, possibly overlapping).
+    static UCD::UnicodeSet setOfRanges(std::vector<UCD::interval_t> & ranges) {
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<UCD::interval_t> merged;
+        for (const UCD::interval_t & r : ranges) {
+            if (!merged.empty() && r.first <= merged.back().second + 1) {
+                merged.back().second = std::max(merged.back().second, r.second);
+            } else {
+                merged.push_back(r);
+            }
+        }
+        if (merged.empty()) return UCD::UnicodeSet();
+        return UCD::UnicodeSet(merged.begin(), merged.end());
     }
 };
 

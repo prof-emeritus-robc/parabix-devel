@@ -48,8 +48,8 @@
 #  keeps the previous counts (with --update) or leaves them out; --update also
 #  counts the transforms that the previous results have no counts for.
 #
-#  Transforms whose analysis exceeds the memory available (the Han transforms
-#  need 8-14 GB) are reported as "analysis failed"; use a small --jobs.
+#  Transforms whose analysis exceeds the memory available are reported as
+#  "analysis failed".
 
 import argparse
 import collections

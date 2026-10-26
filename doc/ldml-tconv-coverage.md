@@ -634,12 +634,19 @@ correction, between 108 and 1,853 of each 5,000 differ.
 - **JIT failures of fresh compilations** are more frequent with the larger
   pipelines: NumericPinyin-Latin's first compilation aborts in 2 of 3 runs with
   the `Page21` relocation error; runs from the object cache do not.
-- **Jpan-Latn does not compile.** It is implementable as planned, but its
-  pipeline, with the deferred rules of Kana-Latn twice (also through
-  Hira-Latn), compiles only with `--deferred-rule-rounds` of 1 or 2: with 3 or
-  more, the bounds of its buffers grow too large ("failed to allocate virtual
-  address space", or a Z3 error at the default of 4). It counts as implementable
-  in the tables.
+- **Jpan-Latn compiles slowly.** Its pipeline, with the deferred rules of
+  Kana-Latn twice (also through Hira-Latn), compiles only since the positions
+  of the deferred rules are inserted once (`edbf0b88f`) and its planning no
+  longer takes gigabytes (`2f882cba6`): with the default of 4 rounds, on an
+  8 GB machine, the first compilation takes 228 s (300 s of CPU) and 1.5 GB,
+  and runs from the object cache 3 s and 274 MB. It is identical to ICU 78.3's
+  `createFromRules` (the rules of Japn-Latn.xml, with its `::` steps) on 505
+  lines: 5 of Japanese text, and 500 random lines of up to 20 characters mixing
+  the Han characters of its rules, kana, iteration marks, punctuation and ASCII.
+  Runs of more than four voiced iteration marks would differ, as in Kana-Latn
+  (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
+  ("failed to allocate virtual address space", or a Z3 error at the default
+  of 4), and its analysis exceeded 13 GB.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
   contexts reach back to each other leaves the last ones unchanged, unless it is

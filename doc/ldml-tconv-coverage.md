@@ -640,20 +640,28 @@ correction, between 108 and 1,853 of each 5,000 differ.
   longer takes gigabytes (`2f882cba6`): with the default of 4 rounds, on an
   8 GB machine, the first compilation takes 228 s (300 s of CPU) and 1.5 GB,
   and runs from the object cache 3 s and 274 MB. It is identical to ICU 78.3's
-  `createFromRules` (the rules of Japn-Latn.xml, with its `::` steps) on 507
-  lines: 7 of Japanese text and runs of marks, and 500 random lines of up to 20 characters mixing
+  `createFromRules` (the rules of Japn-Latn.xml, with its `::` steps) on 509
+  lines: 9 of Japanese text and runs of marks, and 500 random lines of up to 20 characters mixing
   the Han characters of its rules, kana, iteration marks, punctuation and ASCII.
-  Runs that switch between plain and voiced iteration marks more often than
-  the rounds allow would differ, as in Kana-Latn (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
+  Consecutive runs of iteration marks that reach back to each other may need
+  more rounds than the default, as in Kana-Latn (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
   ("failed to allocate virtual address space", or a Z3 error at the default
   of 4), and its analysis exceeded 13 GB.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
   contexts reach back to each other leaves the last ones unchanged, unless it is
   a run of a self-reproducing rule (`カヽヽヽヽヽ`, `ナヾヾヾヾヾ`, any length,
-  see `DeferredRuns`). Within a run, each switch between plain and voiced marks
-  (`カヽヾヽヾ`) still takes a round, as the rule applying after the switch
-  depends on the block before it. The positions the rules may write are inserted once, before
+  see `DeferredRuns`), and of rules known to reproduce the same block: a
+  self-reproducing rule that wrote the block just after the same block (in any
+  round) continues the run too, so that a run switching between plain and
+  voiced marks (`ハヾヾヽヾヽ`) takes at most three rounds (a rule that is not
+  self-reproducing, as `k … → g`, then the first mark of each kind). A run whose
+  marks' before contexts reach back to an earlier run (`…ヂヽヾサヾヽヾ`) waits
+  for it: on 4,000 random lines of one to four such runs, 143 differ from ICU
+  with 4 rounds, 12 with 6, none with 8 (single runs: none with 4). Triggers
+  outside the filter (the ヽ of Hira-Latin, which filters ヾ only) are
+  characters like any other: before, they kept the triggers after them from
+  applying. The positions the rules may write are inserted once, before
   the rounds (as many after each trigger as the longest R and copy), and the
   rounds and `DeferredRuns` work within them, so that the bounds of the
   pipeline's buffers no longer grow with the number of rounds. (Inserting

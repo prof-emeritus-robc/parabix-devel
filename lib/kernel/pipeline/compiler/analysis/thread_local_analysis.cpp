@@ -742,10 +742,32 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             return Z3_solver_check(ctx, solver);
         };
 
+        auto setResourceLimit = [&](const unsigned limit) {
+            const auto params = Z3_mk_params(ctx);
+            Z3_params_inc_ref(ctx, params);
+            Z3_params_set_uint(ctx, params, Z3_mk_string_symbol(ctx, "rlimit"), limit);
+            Z3_solver_set_params(ctx, solver, params);
+            Z3_params_dec_ref(ctx, params);
+        };
+
+        // The checks below only prune the end offsets that a start offset must exceed, and
+        // their nonlinear constraints (mod, products of strides) can make Z3 run without end:
+        // nfkd -NoFocus with 256-bit blocks, whose kernels have LocalCarries, compiled for
+        // minutes or more.  They are bounded by a resource limit (deterministic, unlike a
+        // timeout); an unknown result keeps both offsets, which is conservative.
+        constexpr unsigned PRUNING_CHECK_RLIMIT = 1000000;
+
+        auto pruningCheck = [&]() -> Z3_lbool {
+            setResourceLimit(PRUNING_CHECK_RLIMIT);
+            const Z3_lbool r = check();
+            setResourceLimit(0);
+            return r;
+        };
+
         auto neverGreaterThan = [&](Z3_ast a, Z3_ast b) -> bool {
             Z3_solver_push(ctx, solver);
             hard_assert(Z3_mk_gt(ctx, a, b));
-            const Z3_lbool r = check();
+            const Z3_lbool r = pruningCheck();
             Z3_solver_pop(ctx, solver, 1);
             return r == Z3_L_FALSE;
         };
@@ -839,7 +861,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                                      args[0] = Z3_mk_and(ctx, 2, args);
                                      args[1] = Z3_mk_gt(ctx, endOffset[i], endOffset[j]);
                                      hard_assert(Z3_mk_or(ctx, 2, args));
-                                     const Z3_lbool r = check();
+                                     const Z3_lbool r = pruningCheck();
                                      Z3_solver_pop(ctx, solver, 1);
                                      return r == Z3_L_FALSE;
                                  };

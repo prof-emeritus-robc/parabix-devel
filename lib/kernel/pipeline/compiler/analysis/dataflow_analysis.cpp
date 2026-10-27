@@ -3,6 +3,7 @@
 #include <toolchain/toolchain.h>
 #include <boost/dynamic_bitset/dynamic_bitset.hpp>
 #include <boost/graph/connected_components.hpp>
+#include <queue>
 #include <z3.h>
 
 #if Z3_VERSION_INTEGER >= LLVM_VERSION_CODE(4, 7, 0)
@@ -20,79 +21,31 @@ namespace kernel {
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineAnalysis::computeIntraPartitionRepetitionVectors(PartitionGraph & P) {
 
-    #ifdef PRINT_INTRA_PARTITION_VECTOR_GRAPH
-    using Graph = adjacency_list<vecS, vecS, bidirectionalS, no_property, Rational>;
-    #endif
-
     const auto numOfPartitions = num_vertices(P);
 
-    const auto cfg = Z3_mk_config();
-    Z3_set_param_value(cfg, "model", "true");
-    Z3_set_param_value(cfg, "proof", "false");
+    // Each fixed-rate edge within a partition (or on a streamset that joins partitions) is a balance
+    // equation r(producer) * expectedOutput = r(consumer) * expectedInput. The solutions of each
+    // connected set of these equations are the multiples of a single rational vector: propagate it
+    // from a root, check that every edge that closes a cycle agrees, then scale each partition to
+    // its least positive integer solution.
 
-    const auto ctx = Z3_mk_context(cfg);
-    Z3_del_config(cfg);
-    const auto solver = Z3_mk_solver(ctx);
-    Z3_solver_inc_ref(ctx, solver);
+    const auto numOfNodes = num_vertices(Relationships);
 
-    auto hard_assert = [&](Z3_ast c) {
-        Z3_solver_assert(ctx, solver, c);
+    // Balance[u] holds (v, r(v) / r(u)) for every equation between u and v.
+    std::vector<std::vector<std::pair<unsigned, Rational>>> Balance(numOfNodes);
+
+    auto add_balance_equation = [&](const unsigned producer, const Rational & expectedOutput,
+                                    const unsigned consumer, const Rational & expectedInput) {
+        assert (expectedOutput.numerator() > 0 && expectedInput.numerator() > 0);
+        Balance[producer].emplace_back(consumer, expectedOutput / expectedInput);
+        Balance[consumer].emplace_back(producer, expectedInput / expectedOutput);
     };
 
-    const auto intType = Z3_mk_int_sort(ctx);
-
-    auto constant_real = [&](const Rational value) {
-        assert (value.numerator() > 0);
-        return Z3_mk_real(ctx, value.numerator(), value.denominator());
-    };
-
-    auto multiply =[&](Z3_ast X, Z3_ast Y) {
-        assert (X && Y);
-        Z3_ast args[2] = { X, Y };
-        return Z3_mk_mul(ctx, 2, args);
-    };
-
-    const auto ONE = Z3_mk_int(ctx, 1, intType);
-    const auto m = num_vertices(Relationships);
-    std::vector<Z3_ast> VarList(m);
-
-    #ifdef PRINT_INTRA_PARTITION_VECTOR_GRAPH
-    unsigned totalNumOfKernels = 0;
-    for (unsigned producerPartitionId = 0; producerPartitionId < numOfPartitions; ++producerPartitionId) {
-        PartitionData & N = P[producerPartitionId];
-        const auto & K = N.Kernels;
-        totalNumOfKernels += K.size();
-    }
-
-    Graph G(totalNumOfKernels);
-    flat_map<unsigned, unsigned> M;
-    M.reserve(totalNumOfKernels);
-
-    for (unsigned producerPartitionId = 0; producerPartitionId < numOfPartitions; ++producerPartitionId) {
-        PartitionData & N = P[producerPartitionId];
-        const auto & K = N.Kernels;
-        for (const auto u : K) {
-            M.emplace(u, M.size());
-        }
-    }
-    #endif
-
-    for (unsigned producerPartitionId = 0; producerPartitionId < numOfPartitions; ++producerPartitionId) {
-        PartitionData & N = P[producerPartitionId];
-        const auto & K = N.Kernels;
-
-        for (const auto u : K) {
-            auto repVar = Z3_mk_fresh_const(ctx, nullptr, intType);
-            hard_assert(Z3_mk_ge(ctx, repVar, ONE));
-            VarList[u] = repVar; // multiply(rootVar, repVar);
-        }
-
-    }
-
+    {
     flat_set<size_t> joiningStreamSets;
 
     for (unsigned producerPartitionId = 0; producerPartitionId < numOfPartitions; ++producerPartitionId) {
-        PartitionData & N = P[producerPartitionId];
+        const PartitionData & N = P[producerPartitionId];
         const auto & K = N.Kernels;
 
         assert (joiningStreamSets.empty());
@@ -128,8 +81,9 @@ void PipelineAnalysis::computeIntraPartitionRepetitionVectors(PartitionGraph & P
                         // ignore unknown output rates; we cannot reason about them here.
                         if (LLVM_LIKELY(outputRate.isFixed())) {
 
-                            assert (VarList[producer]);
-                            Z3_ast expOutRate = nullptr;
+                            const RelationshipNode & producerNode = Relationships[producer];
+                            assert (producerNode.Type == RelationshipNode::IsKernel);
+                            const auto expectedOutput = outputRate.getRate() * producerNode.Kernel->getStride();
 
                             for (const auto e : make_iterator_range(out_edges(streamSet, Relationships))) {
                                 const auto binding = target(e, Relationships);
@@ -151,32 +105,11 @@ void PipelineAnalysis::computeIntraPartitionRepetitionVectors(PartitionGraph & P
                                         assert (producerPartitionId <= consumerPartitionId);
 
                                         if (producerPartitionId == consumerPartitionId || joiningStreamSets.count(streamSet)) {
-
-                                            if (expOutRate == nullptr) {
-                                                const RelationshipNode & producerNode = Relationships[producer];
-                                                assert (producerNode.Type == RelationshipNode::IsKernel);
-                                                const auto expectedOutput = outputRate.getRate() * producerNode.Kernel->getStride();
-                                                expOutRate = multiply(VarList[producer], constant_real(expectedOutput));
-                                            }
-
                                             const RelationshipNode & consumerNode = Relationships[consumer];
                                             assert (consumerNode.Type == RelationshipNode::IsKernel);
                                             const auto expectedInput = inputRate.getRate() * consumerNode.Kernel->getStride();
-
-                                            const Z3_ast expInRate = multiply(VarList[consumer], constant_real(expectedInput));
-
-                                            #ifdef PRINT_INTRA_PARTITION_VECTOR_GRAPH
-                                            const RelationshipNode & producerNode = Relationships[producer];
-                                            assert (producerNode.Type == RelationshipNode::IsKernel);
-                                            const auto expectedOutput = outputRate.getRate() * producerNode.Kernel->getStride();
-                                            const auto a = M.find(producer)->second;
-                                            const auto b = M.find(consumer)->second;
-                                            add_edge(a, b, expectedOutput / expectedInput, G);
-                                            #endif
-
-                                            hard_assert(Z3_mk_eq(ctx, expOutRate, expInRate));
+                                            add_balance_equation(producer, expectedOutput, consumer, expectedInput);
                                         }
-
                                     }
                                 }
                             }
@@ -188,86 +121,96 @@ void PipelineAnalysis::computeIntraPartitionRepetitionVectors(PartitionGraph & P
 
         joiningStreamSets.clear();
     }
-
-
-    if (LLVM_UNLIKELY(Z3_solver_check(ctx, solver) == Z3_L_FALSE)) {
-        report_fatal_error("Z3 failed to find a solution to minimum expected dataflow problem");
     }
 
+    // A zero entry marks a kernel that has not yet been reached.
+    std::vector<Rational> RelativeRepetitions(numOfNodes, Rational{0});
 
-    const auto model = Z3_solver_get_model(ctx, solver);
-    Z3_model_inc_ref(ctx, model);
+    std::queue<unsigned> Q;
 
-    // TODO: if the root of a partition has a "large" rep vector count, split the partition?
+    for (unsigned partitionId = 0; partitionId < numOfPartitions; ++partitionId) {
+        for (const auto root : P[partitionId].Kernels) {
+            if (RelativeRepetitions[root].numerator() != 0) {
+                continue;
+            }
+            RelativeRepetitions[root] = Rational{1};
+            assert (Q.empty());
+            Q.push(root);
+            while (!Q.empty()) {
+                const auto u = Q.front();
+                Q.pop();
+                for (const auto & eq : Balance[u]) {
+                    const auto v = eq.first;
+                    const auto expected = RelativeRepetitions[u] * eq.second;
+                    auto & R = RelativeRepetitions[v];
+                    if (R.numerator() == 0) {
+                        R = expected;
+                        Q.push(v);
+                    } else if (LLVM_UNLIKELY(R != expected)) {
+                        SmallVector<char, 256> tmp;
+                        raw_svector_ostream msg(tmp);
+                        msg << "Inconsistent fixed rates between "
+                            << Relationships[u].Kernel->getName() << " and "
+                            << Relationships[v].Kernel->getName()
+                            << ": no repetition vector balances their dataflow";
+                        report_fatal_error(StringRef(msg.str()));
+                    }
+                }
+            }
+        }
+    }
 
-    for (unsigned producerPartitionId = 0; producerPartitionId < numOfPartitions; ++producerPartitionId) {
-        PartitionData & N = P[producerPartitionId];
+    for (unsigned partitionId = 0; partitionId < numOfPartitions; ++partitionId) {
+        PartitionData & N = P[partitionId];
         const auto & K = N.Kernels;
-
         const auto n = K.size();
-        N.Repetitions.resize(n);
         assert (n > 0);
-
+        size_t denomLCM = 1;
+        for (const auto k : K) {
+            denomLCM = boost::lcm<size_t>(denomLCM, RelativeRepetitions[k].denominator());
+        }
+        size_t numGCD = 0;
+        for (const auto k : K) {
+            const auto & R = RelativeRepetitions[k];
+            numGCD = boost::gcd<size_t>(numGCD, R.numerator() * (denomLCM / R.denominator()));
+        }
+        N.Repetitions.resize(n);
         for (unsigned i = 0; i < n; ++i) {
-            Z3_ast var = VarList[K[i]]; assert (var);
-            Z3_ast value;
-            if (LLVM_UNLIKELY(Z3_model_eval(ctx, model, var, Z3_L_TRUE, &value) != Z3_L_TRUE)) {
-                report_fatal_error("Unexpected Z3 error when attempting to obtain value from model!");
+            const auto & R = RelativeRepetitions[K[i]];
+            const auto r = (R.numerator() * (denomLCM / R.denominator())) / numGCD;
+            if (LLVM_UNLIKELY(r > std::numeric_limits<unsigned>::max())) {
+                report_fatal_error("Repetition vector entry exceeds the range of an unsigned integer");
             }
-
-            Z3_int64 num, denom;
-            if (LLVM_UNLIKELY(Z3_get_numeral_rational_int64(ctx, value, &num, &denom) != Z3_L_TRUE)) {
-                report_fatal_error("Unexpected Z3 error when attempting to convert model value to number!");
-            }
-            assert (num > 0 && denom == 1);
-            N.Repetitions[i] = num;
-        }
-
-        auto gcdRepCount = N.Repetitions[0];
-        for (unsigned i = 1; i < n; ++i) {
-            gcdRepCount = boost::gcd(gcdRepCount, N.Repetitions[i]);
-        }
-        if (gcdRepCount != 1) {
-            for (unsigned i = 0; i < n; ++i) {
-                N.Repetitions[i] /= gcdRepCount;
-            }
+            N.Repetitions[i] = r;
         }
     }
-
-    Z3_model_dec_ref(ctx, model);
-
-
-
-    Z3_solver_dec_ref(ctx, solver);
-    Z3_del_context(ctx);
 
     #ifdef PRINT_INTRA_PARTITION_VECTOR_GRAPH
     auto & out = errs();
 
     out << "digraph \"V\" {\n";
-    for (unsigned producerPartitionId = 0; producerPartitionId < numOfPartitions; ++producerPartitionId) {
-        PartitionData & N = P[producerPartitionId];
+    for (unsigned partitionId = 0; partitionId < numOfPartitions; ++partitionId) {
+        const PartitionData & N = P[partitionId];
         const auto & K = N.Kernels;
         const auto n = K.size();
         for (unsigned i = 0; i < n; ++i) {
             const auto k = K[i];
             const RelationshipNode & node = Relationships[k];
             assert (node.Type == RelationshipNode::IsKernel);
-            const auto id = M.find(k)->second;
-            const auto & V = N.Repetitions[i];
-            out << "v" << id << " [label=\""
+            out << "v" << k << " [label=\""
                 << k << ". " << node.Kernel->getName()
-                << "  (" << V.numerator() << "/" << V.denominator()
-                << ")\"];\n";
+                << "  (" << N.Repetitions[i] << ")\"];\n";
         }
     }
 
-    for (const auto e : make_iterator_range(edges(G))) {
-        const auto s = source(e, G);
-        const auto t = target(e, G);
-        const auto & V = G[e];
-        out << "v" << s << " -> v" << t <<
-               " [label=\"" << V.numerator() << "/" << V.denominator() << "\"];\n";
+    for (unsigned u = 0; u < numOfNodes; ++u) {
+        for (const auto & eq : Balance[u]) {
+            if (u < eq.first) {
+                const auto & V = eq.second;
+                out << "v" << u << " -> v" << eq.first <<
+                       " [label=\"" << V.numerator() << "/" << V.denominator() << "\"];\n";
+            }
+        }
     }
 
     out << "}\n\n";

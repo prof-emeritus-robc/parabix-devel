@@ -614,15 +614,17 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
                 const BufferPort & port = mBufferGraph[input];
                 const Binding & bind = port.Binding;
                 const ProcessingRate & iRate = bind.getRate();
-                // a greedy input reads whatever is written
-                if (LLVM_LIKELY(!iRate.isGreedy())) {
+                // a greedy input, or an unknown one (e.g. an output of a nested pipeline whose rate
+                // cannot be predicted), reads whatever is written
+                const auto readsAll = iRate.isGreedy() || iRate.isUnknown();
+                if (LLVM_LIKELY(!readsAll)) {
                     const auto expectedInput = (port.Minimum + port.Maximum) * Rational{1, 2};
                     assert (expectedInput.numerator() > 0);
                     Equations.push_back(RatioEquation{consPartId, R.Node, (expectedInput * StrideRepetitionVector[kernel]) / R.Factor,
                                                       R.Fixed && port.Minimum == port.Maximum});
                 }
                 add_edge(prodPartId, consPartId, T);
-                if (port.Minimum != port.Maximum) {
+                if (port.Minimum != port.Maximum || iRate.isUnknown()) {
                     assert (consPartId > 0);
                     T[consPartId].set(consPartId);
                 }

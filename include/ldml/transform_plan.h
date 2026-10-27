@@ -61,7 +61,12 @@ struct CharMapSubgroup {
     UCD::UnicodeSet kept;
     unsigned rules = 0;         // the number of rules
     // All the characters of the mappings and kept.
-    UCD::UnicodeSet characters() const;
+    const UCD::UnicodeSet & characters() const {return all;}
+    // The characters of the rules added to the mappings or kept (by
+    // planTransform), kept with them: the union of thousands of mappings
+    // (such as those of Han characters to their readings) is not recomputed
+    // for each rule.
+    UCD::UnicodeSet all;
 };
 
 // A conversion rule replacing a fixed-length text of two or more characters

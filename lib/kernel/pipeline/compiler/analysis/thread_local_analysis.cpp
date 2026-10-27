@@ -5,15 +5,8 @@
 #include <boost/integer/common_factor.hpp>
 #include <toolchain/toolchain.h>
 #include <queue>
-#include <z3.h>
 
-#if Z3_VERSION_INTEGER >= LLVM_VERSION_CODE(4, 7, 0)
-    typedef int64_t Z3_int64;
-#else
-    typedef long long int        Z3_int64;
-#endif
-
-// #define PRINT_Z3_OPTIMIZATION
+// #define PRINT_THREAD_LOCAL_LAYOUT
 
 using boost::icl::interval_set;
 
@@ -244,6 +237,231 @@ private:
 };
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief ThreadLocalOffsets
+ *
+ * The start and end offsets of each thread-local buffer, as functions of the stride counts of the partition
+ * roots. Each buffer's cost is ceil_L(Value * (r + Overflow)), where r is the stride count of the partition
+ * whose traversal placed it and ceil_L rounds up to a multiple of L, the unit weight denominator LCM. An offset
+ * is the maximum of a set of linear terms over two kinds of variables:
+ *
+ *   - the stride count of each partition root (Var < PartitionCount), bounded below by the number of strides
+ *     at which that partition's buffers are allocated and unbounded above;
+ *
+ *   - the slack that rounds one buffer's cost up to a multiple of L (Var >= PartitionCount), which is
+ *     (-Value * (r + Overflow)) mod L for that buffer: a function of r with a period that divides L.
+ *
+ * Every comparison asks whether one offset is at most another for every assignment of the stride counts, and
+ * holds if each term of the first is at most some term of the second. A pair of terms that depends on a single
+ * stride count is decided exactly by evaluating their difference over one period of its slacks: the
+ * difference changes by its slope at each period, so it is greatest in the first. A pair that depends on
+ * several stride counts bounds each slack in [0, L - 1] independently. Either way the answer is sound; the
+ * second, and comparing offsets term by term, are incomplete.
+ *
+ * Every term is a multiple of L: offsets start at zero and each cost is rounded up to a multiple of it. So a
+ * difference of two terms that is at most L - 1 is at most 0, which recovers much of the precision lost by
+ * bounding each slack separately.
+ ** ------------------------------------------------------------------------------------------------------------- */
+namespace {
+
+struct LinearTerm {
+    flat_map<unsigned, int64_t> Coefficient;
+    int64_t Constant = 0;
+};
+
+using SymbolicOffset = SmallVector<LinearTerm, 2>;
+
+class ThreadLocalOffsets {
+public:
+
+    static constexpr unsigned NoAlias = std::numeric_limits<unsigned>::max();
+
+    ThreadLocalOffsets(const unsigned partitionCount, std::vector<int64_t> && minimumStrides, const int64_t lcm)
+    : PartitionCount(partitionCount)
+    , MinimumStrides(std::move(minimumStrides))
+    , LCM(lcm) {
+
+    }
+
+    static SymbolicOffset zero() {
+        return SymbolicOffset(1);
+    }
+
+    // The cost of the buffer with the given id: ceil_L(value * (r + overflow)) for the stride count r of partitionId.
+    LinearTerm cost(const unsigned id, const unsigned partitionId, const int64_t value, const int64_t overflow) {
+        LinearTerm C;
+        C.Coefficient[partitionId] = value;
+        C.Constant = value * overflow;
+        if (value % LCM == 0) {
+            // value * r is a multiple of L, so the rounding is constant
+            C.Constant += slack(C.Constant);
+        } else {
+            const auto var = PartitionCount + id;
+            Slack.emplace(var, SlackSource{partitionId, value, overflow});
+            C.Coefficient[var] = 1;
+        }
+        return C;
+    }
+
+    static SymbolicOffset add(const SymbolicOffset & X, const LinearTerm & cost) {
+        SymbolicOffset R(X);
+        for (auto & t : R) {
+            for (const auto & c : cost.Coefficient) {
+                t.Coefficient[c.first] += c.second;
+            }
+            t.Constant += cost.Constant;
+        }
+        return R;
+    }
+
+    // The maximum of X and Y, without any term that another term never falls below.
+    SymbolicOffset max(const SymbolicOffset & X, const SymbolicOffset & Y) const {
+        SymbolicOffset R(X);
+        for (const auto & t : Y) {
+            if (std::none_of(R.begin(), R.end(), [&](const LinearTerm & s) { return atMost(t, s, 0, NoAlias, NoAlias); })) {
+                R.erase(std::remove_if(R.begin(), R.end(), [&](const LinearTerm & s) { return atMost(s, t, 0, NoAlias, NoAlias); }), R.end());
+                R.push_back(t);
+            }
+        }
+        return R;
+    }
+
+    // Is X + gap <= Y for every assignment? If alias != NoAlias, the stride count of partition alias is
+    // taken to equal that of partition target.
+    bool atMost(const SymbolicOffset & X, const SymbolicOffset & Y, const int64_t gap,
+                const unsigned alias = NoAlias, const unsigned target = NoAlias) const {
+        for (const auto & t : X) {
+            if (std::none_of(Y.begin(), Y.end(), [&](const LinearTerm & s) { return atMost(t, s, gap, alias, target); })) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+
+    struct SlackSource {
+        unsigned PartitionId;
+        int64_t Value;
+        int64_t Overflow;
+    };
+
+    // the amount that rounds x >= 0 up to a multiple of L
+    int64_t slack(const int64_t x) const {
+        return (LCM - x % LCM) % LCM;
+    }
+
+    bool atMost(const LinearTerm & A, const LinearTerm & B, const int64_t gap, const unsigned alias, const unsigned target) const {
+        auto rename = [&](const unsigned var) {
+            return (var == alias) ? target : var;
+        };
+        flat_map<unsigned, int64_t> stride;
+        flat_map<unsigned, int64_t> slackCoefficient;
+        auto accumulate = [&](const LinearTerm & X, const int64_t sign) {
+            for (const auto & c : X.Coefficient) {
+                if (c.first < PartitionCount) {
+                    stride[rename(c.first)] += sign * c.second;
+                } else {
+                    slackCoefficient[c.first] += sign * c.second;
+                }
+            }
+        };
+        accumulate(A, 1);
+        accumulate(B, -1);
+        const int64_t constant = A.Constant - B.Constant;
+
+        auto minimumStrides = [&](const unsigned partitionId) {
+            auto lb = MinimumStrides[partitionId];
+            if (partitionId == target) {
+                lb = std::max(lb, MinimumStrides[alias]);
+            }
+            return lb;
+        };
+
+        // A - B is a multiple of L, so it is at most the greatest multiple of L not above any bound on it.
+        auto withinBound = [&](const int64_t max) {
+            const auto q = (max >= 0) ? (max / LCM) : -((LCM - 1 - max) / LCM);
+            return q * LCM + gap <= 0;
+        };
+
+        unsigned var = NoAlias;
+        bool singleStrideCount = true;
+        auto uses = [&](const unsigned partitionId) {
+            if (var == NoAlias) {
+                var = partitionId;
+            } else if (var != partitionId) {
+                singleStrideCount = false;
+            }
+        };
+        for (const auto & c : stride) {
+            if (c.second != 0) {
+                uses(c.first);
+            }
+        }
+        for (const auto & c : slackCoefficient) {
+            if (c.second != 0) {
+                uses(rename(Slack.find(c.first)->second.PartitionId));
+            }
+        }
+
+        if (singleStrideCount) {
+            if (var == NoAlias) {
+                return withinBound(constant);
+            }
+            const auto f = stride.find(var);
+            const int64_t slope = (f == stride.end()) ? 0 : f->second;
+            if (slope > 0) {
+                return false;
+            }
+            // each slack repeats after L / gcd(Value, L) strides
+            int64_t period = 1;
+            for (const auto & c : slackCoefficient) {
+                if (c.second != 0) {
+                    const auto & s = Slack.find(c.first)->second;
+                    period = boost::lcm<int64_t>(period, LCM / boost::gcd<int64_t>(s.Value, LCM));
+                }
+            }
+            const auto lb = minimumStrides(var);
+            for (int64_t r = lb; r < lb + period; ++r) {
+                int64_t diff = constant + slope * r;
+                for (const auto & c : slackCoefficient) {
+                    if (c.second != 0) {
+                        const auto & s = Slack.find(c.first)->second;
+                        diff += c.second * slack(s.Value * (r + s.Overflow));
+                    }
+                }
+                if (diff + gap > 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // With no positive coefficient on a stride count, A - B is greatest at the least stride counts and
+        // the largest slack of each positive coefficient.
+        int64_t max = constant;
+        for (const auto & c : stride) {
+            if (c.second > 0) {
+                return false;
+            }
+            max += c.second * minimumStrides(c.first);
+        }
+        for (const auto & c : slackCoefficient) {
+            if (c.second > 0) {
+                max += c.second * (LCM - 1);
+            }
+        }
+        return withinBound(max);
+    }
+
+    const unsigned PartitionCount;
+    const std::vector<int64_t> MinimumStrides;
+    const int64_t LCM;
+    flat_map<unsigned, SlackSource> Slack;
+};
+
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief determineInitialThreadLocalBufferLayout
  *
  * Given our buffer graph, we want to identify the best placement to maximize sequential prefetching behavior with
@@ -265,9 +483,8 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         size_t Value = 0;
         size_t Overflow = 0;
         size_t PartitionId = 0;
-        Z3_ast UnitCost = nullptr;
-        Z3_ast Start = nullptr;
-        Z3_ast End = nullptr;
+        SymbolicOffset Start;
+        SymbolicOffset End;
     };
 
     using ThreadLocalDataGraph = adjacency_list<vecS, vecS, bidirectionalS, TLVertData>;
@@ -292,7 +509,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
     size_t numOfThreadLocalStreamSets = 0U;
 
 
-    #ifdef PRINT_Z3_OPTIMIZATION
+    #ifdef PRINT_THREAD_LOCAL_LAYOUT
     errs() << " -- starting thread local layout\n";
     #endif
 
@@ -554,7 +771,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             }
         }
 
-        #ifdef PRINT_Z3_OPTIMIZATION
+        #ifdef PRINT_THREAD_LOCAL_LAYOUT
         BEGIN_SCOPED_REGION
             auto & out = errs();
             out << "digraph \"" << "I" << "\" {\n";
@@ -589,7 +806,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
         auto O = BA.getResult();
 
-        #ifdef PRINT_Z3_OPTIMIZATION
+        #ifdef PRINT_THREAD_LOCAL_LAYOUT
         errs() << " -- finished thread local layout genetic algorithm phase\n";
         #endif
 
@@ -669,7 +886,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             unvisitedAncestors[i] = in_degree(i, D);
         }
 
-        #ifdef PRINT_Z3_OPTIMIZATION
+        #ifdef PRINT_THREAD_LOCAL_LAYOUT
         BEGIN_SCOPED_REGION
         auto & out = errs();
         out << "digraph \"" << "D" << "\" {\n";
@@ -702,98 +919,43 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
         END_SCOPED_REGION
         #endif
 
-        const auto cfg = Z3_mk_config();
-        Z3_set_param_value(cfg, "model", "true");
-        Z3_set_param_value(cfg, "proof", "false");
-
-        const auto ctx = Z3_mk_context(cfg);
-        Z3_del_config(cfg);
-        const auto solver = Z3_mk_solver(ctx);
-        Z3_solver_inc_ref(ctx, solver);
-
-        auto hard_assert = [&](Z3_ast c) {
-            Z3_solver_assert(ctx, solver, c);
-        };
-
-        const auto intType = Z3_mk_int_sort(ctx);
-
-        auto constant_int = [&](const size_t value) {
-            return Z3_mk_int(ctx, value, intType);
-        };
-
-        auto add = [&](Z3_ast X, Z3_ast Y) {
-            assert (X && Y);
-            Z3_ast args[2] = { X, Y };
-            return Z3_mk_add(ctx, 2, args);
-        };
-
-        auto multiply =[&](Z3_ast X, Z3_ast Y) {
-            assert (X && Y);
-            Z3_ast args[2] = { X, Y };
-            return Z3_mk_mul(ctx, 2, args);
-        };
-
-        auto z3_max = [&](Z3_ast X, Z3_ast Y) {
-            assert (X && Y);
-            return Z3_mk_ite(ctx, Z3_mk_gt(ctx, X, Y), X, Y);
-        };
-
-        auto check = [&]() -> Z3_lbool {
-            return Z3_solver_check(ctx, solver);
-        };
-
-        auto neverGreaterThan = [&](Z3_ast a, Z3_ast b) -> bool {
-            Z3_solver_push(ctx, solver);
-            hard_assert(Z3_mk_gt(ctx, a, b));
-            const Z3_lbool r = check();
-            Z3_solver_pop(ctx, solver, 1);
-            return r == Z3_L_FALSE;
-        };
-
-        const auto DENOM_LCM = Z3_mk_int(ctx, unscaledUnitWeightDenomLCM, intType);
-
-        const auto z3_ZERO = Z3_mk_int(ctx, 0, intType);
-
-        auto round_up_to_nearest_lcm_of_denom_multiple = [&](Z3_ast value) {
-            auto a = Z3_mk_mod(ctx, value, DENOM_LCM);
-            Z3_ast args1[2] = { DENOM_LCM, a };
-            auto b = Z3_mk_sub(ctx, 2, args1);
-            auto c = Z3_mk_mod(ctx, b, DENOM_LCM);
-            Z3_ast args2[2] = { value, c };
-            return Z3_mk_add(ctx, 2, args2);
-        };
+        // the initial stride count is always set to the max during allocation
+        std::vector<int64_t> minimumStrides(PartitionCount, 0);
+        for (unsigned partId = 0; partId < PartitionCount; ++partId) {
+            minimumStrides[partId] = MaximumNumOfStrides[FirstKernelInPartition[partId]];
+        }
+        ThreadLocalOffsets Offsets(PartitionCount, std::move(minimumStrides), (int64_t)unscaledUnitWeightDenomLCM);
 
         std::queue<Vertex> S;
 
-        std::vector<Z3_ast> controlVar(PartitionCount, nullptr);
-
-        SmallVector<Z3_ast, 16> startOffset;
-        SmallVector<Z3_ast, 16> endOffset;
+        SmallVector<SymbolicOffset, 16> startOffset;
+        SmallVector<SymbolicOffset, 16> endOffset;
+        SmallVector<bool, 16> keepEnd;
 
         // Because each buffer is paged aligned, different num of stride counts can change which thread-local buffer
         // starts after different prior buffers. Reason out for all possible num of stride counts which buffers we
         // need to calculate the end offset of first in order to determine what the start position is.
 
+        size_t minSegmentSize = 0;
+
         for (unsigned partId = 0; partId < PartitionCount; ++partId) {
             if (out_degree(partId, D) > 0) {
 
-                const Z3_ast rv = Z3_mk_fresh_const(ctx, nullptr, intType);
-                // the initial stride count is always set to the max during allocation
                 const auto max = MaximumNumOfStrides[FirstKernelInPartition[partId]];
 
-                hard_assert(Z3_mk_ge(ctx, rv, constant_int(max)));
-                controlVar[partId] = rv;
+                // Every partition's offsets are compared assuming its stride count is at least the number at
+                // which its buffers were allocated; at run time one segment size drives all of them.
+                minSegmentSize = std::max<size_t>(minSegmentSize, max);
 
                 auto & Dp = D[partId];
-                Dp.UnitCost = z3_ZERO;
-                Dp.Start = z3_ZERO;
-                Dp.End = z3_ZERO;
+                Dp.Start = ThreadLocalOffsets::zero();
+                Dp.End = ThreadLocalOffsets::zero();
                 Dp.Overflow = max;
 
                 assert (S.empty());
                 for (auto u = partId;;) {
 
-                    assert (D[u].End);
+                    assert (!D[u].End.empty());
 
                     for (auto e : make_iterator_range(out_edges(u, D))) {
                         const auto v = target(e, D);
@@ -810,86 +972,60 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                              ThreadLocalDataGraph::in_edge_iterator ei_begin, ei_end;
                              std::tie(ei_begin, ei_end) = in_edges(v, D);
 
-                             Z3_ast maxPriorEnd = nullptr;
-
-
+                             startOffset.resize(d);
                              endOffset.resize(d);
+                             keepEnd.assign(d, true);
 
-                             if (d == 1) {
-
-                                 const auto s = source(*ei_begin, D);
+                             size_t c = 0;
+                             for (auto ei = ei_begin; ei != ei_end; ++ei, ++c) {
+                                 const auto s = source(*ei, D);
                                  assert (s < num_vertices(D));
-                                 maxPriorEnd = D[s].End;
-                                 endOffset[0] = maxPriorEnd;
+                                 const auto & Ds = D[s];
+                                 assert (!Ds.Start.empty() && !Ds.End.empty());
+                                 startOffset[c] = Ds.Start;
+                                 endOffset[c] = Ds.End;
+                             }
+                             assert (c == d);
 
-                             } else {
+                             // If I cannot start within the range of J and I cannot end after J ends, the
+                             // start of this buffer never depends on the end of I.
+                             auto canRemoveFirst = [&](const size_t i, const size_t j) -> bool {
+                                 return Offsets.atMost(endOffset[i], endOffset[j], 0) &&
+                                     (Offsets.atMost(startOffset[i], startOffset[j], 1) ||
+                                      Offsets.atMost(endOffset[j], startOffset[i], 0));
+                             };
 
-                                 auto canRemoveFirst = [&](const size_t i, const size_t j) -> bool {
-
-                                     assert (startOffset[i] && endOffset[i]);
-                                     assert (startOffset[j] && endOffset[j]);
-
-                                     // If I cannot start within the range of J and I cannot end
-                                     // after J ends, return true.
-
-                                     Z3_solver_push(ctx, solver);
-                                     Z3_ast args[2];
-                                     args[0] = Z3_mk_ge(ctx, startOffset[i], startOffset[j]);
-                                     args[1] = Z3_mk_lt(ctx, startOffset[i], endOffset[j]);
-                                     args[0] = Z3_mk_and(ctx, 2, args);
-                                     args[1] = Z3_mk_gt(ctx, endOffset[i], endOffset[j]);
-                                     hard_assert(Z3_mk_or(ctx, 2, args));
-                                     const Z3_lbool r = check();
-                                     Z3_solver_pop(ctx, solver, 1);
-                                     return r == Z3_L_FALSE;
-                                 };
-
-                                 size_t c = 0;
-                                 startOffset.resize(d);
-                                 for (auto ei = ei_begin; ei != ei_end; ++ei, ++c) {
-                                     const auto s = source(*ei, D);
-                                     const auto & Ds = D[s];
-                                     startOffset[c] = Ds.Start; assert (Ds.Start);
-                                     endOffset[c] = Ds.End; assert (Ds.End);
-                                 }
-                                 assert (c == d);
-
-                                 assert (check() == Z3_L_TRUE);
-
-                                 for (size_t i = 1; i < d; ++i ) {
-                                     assert (endOffset[i]);
-                                     for (size_t j = 0; j < i; ++j) {
-                                         if (endOffset[j]) {
-                                             if (canRemoveFirst(i, j)) {
-                                                 endOffset[i] = nullptr;
-                                                 break;
-                                             }
-
-                                             if (canRemoveFirst(j, i)) {
-                                                 endOffset[j] = nullptr;
-                                             }
+                             for (size_t i = 1; i < d; ++i ) {
+                                 for (size_t j = 0; j < i; ++j) {
+                                     if (keepEnd[j]) {
+                                         if (canRemoveFirst(i, j)) {
+                                             keepEnd[i] = false;
+                                             break;
+                                         }
+                                         if (canRemoveFirst(j, i)) {
+                                             keepEnd[j] = false;
                                          }
                                      }
                                  }
+                             }
 
-                                for (size_t i = 0; i < d; ++i ) {
-                                    if (endOffset[i]) {
-                                        if (maxPriorEnd) {
-                                            maxPriorEnd = z3_max(maxPriorEnd, endOffset[i]);
-                                        } else {
-                                            maxPriorEnd = endOffset[i];
-                                        }
-                                    }
-                                }
+                             SymbolicOffset maxPriorEnd;
+                             for (size_t i = 0; i < d; ++i ) {
+                                 if (keepEnd[i]) {
+                                     if (maxPriorEnd.empty()) {
+                                         maxPriorEnd = endOffset[i];
+                                     } else {
+                                         maxPriorEnd = Offsets.max(maxPriorEnd, endOffset[i]);
+                                     }
+                                 }
+                             }
 
-                            }
-
-                            assert (maxPriorEnd);
+                            assert (!maxPriorEnd.empty());
 
                             if (LLVM_UNLIKELY(v == partId)) {
 
                                 for (size_t i = 0; i < d; ++i ) {
-                                    if (endOffset[i]) {
+                                    if (keepEnd[i]) {
                                         const auto s = source(*(ei_begin + i), D);
                                         assert (s < m);
                                         add_edge(s, m, D);
@@ -903,7 +1039,7 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                                 Rational V{Dv.Value, unscaledUnitWeightDenomLCM};
                                 assert (V.numerator() > 0);
                                 for (size_t i = 0; i < d; ++i ) {
-                                    if (endOffset[i]) {
+                                    if (keepEnd[i]) {
                                         const auto s = source(*(ei_begin + i), D);
                                         assert (s < m);
                                         assert (v <= m);
@@ -911,12 +1047,8 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
                                     }
                                 }
 
-                                Z3_ast cost = add(rv, constant_int(Dv.Overflow));
-                                cost = multiply(cost, constant_int(Dv.Value));
-                                cost = round_up_to_nearest_lcm_of_denom_multiple(cost);
-                                Dv.UnitCost = cost;
                                 Dv.Start = maxPriorEnd;
-                                Dv.End = add(maxPriorEnd, cost);
+                                Dv.End = ThreadLocalOffsets::add(maxPriorEnd, Offsets.cost(v, partId, Dv.Value, Dv.Overflow));
 
                                 S.push(v);
 
@@ -935,8 +1067,6 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             }
         }
 
-        assert (check() == Z3_L_TRUE);
-
         const auto d = in_degree(m, D); assert (d > 0);
 
         ThreadLocalDataGraph::in_edge_iterator ei_begin, ei_end;
@@ -944,7 +1074,8 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
 
         endOffset.resize(d);
 
-        SmallVector<Z3_ast, 16> cVar(d);
+        SmallVector<unsigned, 16> cPartition(d);
+        keepEnd.assign(d, true);
 
         size_t c = 0;
         for (auto ei = ei_begin; ei != ei_end; ++ei, ++c) {
@@ -952,54 +1083,32 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             T[s].Terminal = true;
             const auto & Ds = D[s];
             endOffset[c] = Ds.End;
-            assert (endOffset[c]);
-            assert (endOffset[c] != z3_ZERO);
-            cVar[c] = controlVar[Ds.PartitionId];
+            assert (!endOffset[c].empty());
+            cPartition[c] = Ds.PartitionId;
         }
         assert (c == d);
 
+        // Among the terminal buffers, keep only those whose end may be the greatest when their
+        // partitions' stride counts are equal.
         for (size_t i = 1; i < d; ++i ) {
-            assert (cVar[i]);
             for (size_t j = 0; j < i; ++j) {
-                if (cVar[j]) {
-                    Z3_solver_push(ctx, solver);
-                    hard_assert(Z3_mk_eq(ctx, cVar[i], cVar[j]));
-                    if (neverGreaterThan(endOffset[i], endOffset[j])) {
-                        cVar[i] = nullptr;
-                        Z3_solver_pop(ctx, solver, 1);
+                if (keepEnd[j]) {
+                    const auto same = (cPartition[i] == cPartition[j]);
+                    const auto alias = same ? ThreadLocalOffsets::NoAlias : cPartition[j];
+                    const auto target = same ? ThreadLocalOffsets::NoAlias : cPartition[i];
+                    if (Offsets.atMost(endOffset[i], endOffset[j], 0, alias, target)) {
+                        keepEnd[i] = false;
                         break;
                     }
-                    if (neverGreaterThan(endOffset[j], endOffset[i])) {
-                        cVar[j] = nullptr;
+                    if (Offsets.atMost(endOffset[j], endOffset[i], 0, alias, target)) {
+                        keepEnd[j] = false;
                     }
-                    Z3_solver_pop(ctx, solver, 1);
                 }
             }
         }
 
-        [[maybe_unused]] const auto r = check();
-        assert (r == Z3_L_TRUE);
-
-        const auto model = Z3_solver_get_model(ctx, solver);
-        Z3_model_inc_ref(ctx, model);
-
-        Z3_int64 minSegmentSize = 0;
-
         for (size_t i = 0; i < d; ++i ) {
-            if (cVar[i]) {
-
-                Z3_ast value;
-                if (LLVM_UNLIKELY(Z3_model_eval(ctx, model, cVar[i], Z3_L_TRUE, &value) != Z3_L_TRUE)) {
-                    report_fatal_error("Unexpected Z3 error when attempting to obtain value from model!");
-                }
-
-                Z3_int64 num;
-                if (LLVM_UNLIKELY(Z3_get_numeral_int64(ctx, value, &num) != Z3_L_TRUE)) {
-                    report_fatal_error("Unexpected Z3 error when attempting to convert model value to number!");
-                }
-
-                minSegmentSize = std::max(minSegmentSize, num);
-
+            if (keepEnd[i]) {
                 const auto s = source(*(ei_begin + i), D);
                 assert (s < m);
                 assert (m < num_vertices(T));
@@ -1007,18 +1116,12 @@ void PipelineAnalysis::determineInitialThreadLocalBufferLayout(KernelBuilder & b
             }
         }
 
-
-
-        Z3_model_dec_ref(ctx, model);
-        Z3_solver_dec_ref(ctx, solver);
-        Z3_del_context(ctx);
-
         assert (in_degree(m, T) > 0);
         assert (minSegmentSize > 0);
 
         MinimumThreadLocalSegmentSize = minSegmentSize;
 
-        #ifdef PRINT_Z3_OPTIMIZATION
+        #ifdef PRINT_THREAD_LOCAL_LAYOUT
         BEGIN_SCOPED_REGION
         for (unsigned i = 0; i < PartitionCount; ++i) {
             clear_in_edges(i, D);

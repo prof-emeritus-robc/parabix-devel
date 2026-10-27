@@ -634,21 +634,42 @@ correction, between 108 and 1,853 of each 5,000 differ.
 - **JIT failures of fresh compilations** are more frequent with the larger
   pipelines: NumericPinyin-Latin's first compilation aborts in 2 of 3 runs with
   the `Page21` relocation error; runs from the object cache do not.
-- **Jpan-Latn does not compile.** It is implementable as planned, but its
-  pipeline, with the deferred rules of Kana-Latn twice (also through
-  Hira-Latn), compiles only with `--deferred-rule-rounds` of 1 or 2: with 3 or
-  more, the bounds of its buffers grow too large ("failed to allocate virtual
-  address space", or a Z3 error at the default of 4). It counts as implementable
-  in the tables.
+- **Jpan-Latn compiles slowly.** Its pipeline, with the deferred rules of
+  Kana-Latn twice (also through Hira-Latn), compiles only since the positions
+  of the deferred rules are inserted once (`edbf0b88f`) and its planning no
+  longer takes gigabytes (`2f882cba6`): with the default of 4 rounds, on an
+  8 GB machine, the first compilation takes 228 s (300 s of CPU) and 1.5 GB,
+  and runs from the object cache 3 s and 274 MB. It is identical to ICU 78.3's
+  `createFromRules` (the rules of Japn-Latn.xml, with its `::` steps) on 509
+  lines: 9 of Japanese text and runs of marks, and 500 random lines of up to 20 characters mixing
+  the Han characters of its rules, kana, iteration marks, punctuation and ASCII.
+  Consecutive runs of iteration marks that reach back to each other may need
+  more rounds than the default, as in Kana-Latn (see below). Before, it compiled only with `--deferred-rule-rounds` of 1 or 2
+  ("failed to allocate virtual address space", or a Z3 error at the default
+  of 4), and its analysis exceeded 13 GB.
 - **Rounds of the deferred rules.** The copying rules are applied in rounds
   (`--deferred-rule-rounds`, default 4): a chain of more triggers whose before
-  contexts reach back to each other (`カヽヽヽヽヽ`) leaves the last ones
-  unchanged. Each round may insert positions, and the bounds of the pipeline's
-  buffers grow with the number inserted at a position to the power of the
-  rounds: above 6 rounds the pipeline fails to compile ("failed to allocate
-  virtual address space"), and tconv rejects them. For the same reason, a
-  capture copied counts runs of its repeated set of up to 16 characters; a rule
-  copying a longer run does not apply.
+  contexts reach back to each other leaves the last ones unchanged, unless it is
+  a run of a self-reproducing rule (`カヽヽヽヽヽ`, `ナヾヾヾヾヾ`, any length,
+  see `DeferredRuns`), and of rules known to reproduce the same block: a
+  self-reproducing rule that wrote the block just after the same block (in any
+  round) continues the run too, so that a run switching between plain and
+  voiced marks (`ハヾヾヽヾヽ`) takes at most three rounds (a rule that is not
+  self-reproducing, as `k … → g`, then the first mark of each kind). A run whose
+  marks' before contexts reach back to an earlier run (`…ヂヽヾサヾヽヾ`) waits
+  for it: on 4,000 random lines of one to four such runs, 143 differ from ICU
+  with 4 rounds, 12 with 6, none with 8 (single runs: none with 4). Triggers
+  outside the filter (the ヽ of Hira-Latin, which filters ヾ only) are
+  characters like any other: before, they kept the triggers after them from
+  applying. The positions the rules may write are inserted once, before
+  the rounds (as many after each trigger as the longest R and copy), and the
+  rounds and `DeferredRuns` work within them, so that the bounds of the
+  pipeline's buffers no longer grow with the number of rounds. (Inserting
+  positions in each round had them grow to the power of the rounds: on an 8 GB
+  machine, Kana-Latn itself failed to compile with the default of 4, "failed to
+  allocate virtual address space".) The runs of the repeated set of a capture
+  copied are counted up to 16 characters, which bounds the positions reserved;
+  a rule copying a longer run does not apply.
 
 ### 3.3 Intended differences from ICU
 
@@ -1331,9 +1352,12 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
 
 - `tconv-coverage/coverage.md` has the summary tables and the per-transform
   table; `coverage.json` has the same data for scripting.
-- Use `--jobs 1` or 2: analyzing the Han transforms takes 8–14 GB each. (Runs
-  have used `--jobs 4` on 64 GB; a full run takes about 35 minutes, mostly
-  rerunning failing cases per line.)
+- Analyzing the Han transforms took 8–14 GB each before `planTransform` kept
+  the characters of each subgroup as it adds rules (and the multiplexed sets
+  were built from their intervals); it now takes about 120 MB (Jpan-Latn,
+  Hani-Latn and Hant-Latn, `--kernel-counts`). (Runs have used `--jobs 4` on
+  64 GB; a full run takes about 35 minutes, mostly rerunning failing cases per
+  line.)
 - When comparing tconv versions, give each run its own `-object-cache-salt`.
 - **Kernel counts.** Each transform's `tconv --kernel-counts` output is kept in
   `kernels/`, and gives the groups, rules, group kernels and kernels columns of

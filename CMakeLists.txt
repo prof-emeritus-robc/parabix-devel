@@ -102,17 +102,6 @@ message(STATUS "Found Boost_LIBRARY_DIRS: ${Boost_LIBRARY_DIRS}")
 include_directories("${Boost_INCLUDE_DIRS}")
 link_directories(${Boost_LIBRARY_DIRS})
 
-###   Import Dependency: Z3   ###
-
-find_package(Z3 REQUIRED) # libz3-dev
-message(STATUS "Found Z3 ${Z3_VERSION_STRING} in: ${Z3_INCLUDE_DIR}")
-include_directories(${Z3_INCLUDE_DIR})
-string(REGEX REPLACE "([0-9]+)[.].*" "\\1" Z3_VERSION_MAJOR "${Z3_VERSION_STRING}")
-string(REGEX REPLACE "[0-9]+[.]([0-9]+).*" "\\1" Z3_VERSION_MINOR "${Z3_VERSION_STRING}")
-string(REGEX REPLACE "[0-9]+[.][0-9]+[.]([0-9]+).*" "\\1" Z3_VERSION_PATCH "${Z3_VERSION_STRING}")
-math(EXPR Z3_VERSION_INTEGER "${Z3_VERSION_MAJOR} * 10000 + ${Z3_VERSION_MINOR} * 100 + ${Z3_VERSION_PATCH}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DZ3_VERSION_INTEGER=${Z3_VERSION_INTEGER}")
-
 ###   Import Dependency: ICU   ###
 
 if (ENABLE_ICU)
@@ -295,7 +284,7 @@ endif()
 function(parabix_add_module)
     cmake_parse_arguments(
         ARG             # resultant argument prefix
-        "USES_Z3;USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH" # boolean args
+        "USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH" # boolean args
         "NAME"          # mono-valued arguments:
                         #   NAME: target name
         "SRC;DEPS;CODEGEN_DEPS" # multi-valued arguments:
@@ -334,9 +323,6 @@ function(parabix_add_module)
             target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
         else()
             target_compile_options(${ARG_NAME} PUBLIC ${NO_RTTI})
-        endif()
-        if (ARG_USES_Z3)
-            target_link_libraries(${ARG_NAME} PUBLIC ${Z3_LIBRARIES})
         endif()
         if (ENABLE_PAPI)
             target_link_libraries(${ARG_NAME} PUBLIC ${PAPI_LIBRARIES})
@@ -378,9 +364,6 @@ function(parabix_add_executable)
         target_link_libraries(${ARG_NAME} PUBLIC ${PARABIX_MONO_TARGET})
     else()
         target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
-    endif()
-    if(ARTIFACT_MODE STREQUAL "Single")
-        target_link_libraries(${ARG_NAME} PUBLIC ${Z3_LIBRARIES})
     endif()
     target_link_libraries(${ARG_NAME} PUBLIC toolchain)
     target_link_libraries(${ARG_NAME} PUBLIC kernel.pipeline)
@@ -495,7 +478,7 @@ add_subdirectory(QA/unit-tests)
 
 # Target definition for single library
 if(ARTIFACT_MODE STREQUAL "Single")
-    target_link_libraries(${PARABIX_MONO_TARGET} ${REQ_LLVM_LIBRARIES} ${Boost_LIBRARIES} ${Z3_LIBRARIES} ${LIBBACKTRACE_LIBRARIES})
+    target_link_libraries(${PARABIX_MONO_TARGET} ${REQ_LLVM_LIBRARIES} ${Boost_LIBRARIES} ${LIBBACKTRACE_LIBRARIES})
 endif()
 
 # Source hashes need every target defined (see cmake/ParabixSourceHash.cmake)

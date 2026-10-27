@@ -401,10 +401,6 @@ static cl::opt<unsigned, true> PhaseClaimSegmentsOption("phase-claim-segments", 
                                                cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
 
 
-unsigned Z3_Timeout;
-static cl::opt<unsigned, true> Z3_TimeoutOption("Z3-timeout", cl::location(Z3_Timeout), cl::init(3000),
-                                               cl::desc("Z3 timeout"), cl::value_desc("positive integer"));
-
 static cl::opt<unsigned, true>
 MaxTaskThreadsOption("max-task-threads", cl::location(TaskThreads),
                      cl::init(std::thread::hardware_concurrency()),

@@ -206,7 +206,7 @@ static void icgrep_error_handler(void *UserData, const char * Message, bool GenC
 
 void InitializeCommandLineInterface(int argc, char *argv[]) {
     llvm::install_fatal_error_handler(&icgrep_error_handler);
-    codegen::ParseCommandLineOptions(argc, argv, {&re::RE_Options, &Input_Options, &Output_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&re::RE_Options, &Input_Options, &argv::File_Select_Options, &Output_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     if (argv::RecursiveFlag || argv::DereferenceRecursiveFlag) {
         argv::DirectoriesFlag = argv::Recurse;
     }

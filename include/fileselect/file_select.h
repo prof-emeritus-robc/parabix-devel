@@ -18,6 +18,9 @@ namespace re { class RE; }
 
 namespace argv {
 
+// The file selection options, for ParseCommandLineOptions to show.
+extern llvm::cl::OptionCategory File_Select_Options;
+
 extern bool NoMessagesFlag;  // -s
     
 enum DevDirAction {Read, Skip, Recurse};
@@ -32,5 +35,14 @@ extern bool MmapFlag; // -mmap
 
 extern bool UseStdIn;
     
-std::vector<boost::filesystem::path> getFullFileList(CPUDriver & driver, llvm::cl::list<std::string> & inputFiles);
+// The files to process.  Standard input ("-") sets UseStdIn; with
+// stdinAsPath it is also selected as the path "-", as it is when there are
+// no input files.
+std::vector<boost::filesystem::path> getFullFileList(CPUDriver & driver, llvm::cl::list<std::string> & inputFiles,
+                                                     bool stdinAsPath = false);
+
+// Opens a selected file for reading ("-" is standard input), returning its
+// file descriptor, or -1 after reporting the error (unless -s) when it cannot
+// be opened or is a directory.
+int openInputFile(const boost::filesystem::path & p);
 }

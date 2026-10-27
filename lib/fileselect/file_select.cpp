@@ -10,7 +10,10 @@
 #include <string>
 #include <boost/filesystem.hpp>
 #include <chrono>
+#include <cerrno>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <grep/nested_grep_engine.h>
 #include <grep/searchable_buffer.h>
 #include <llvm/Support/CommandLine.h>
@@ -38,55 +41,55 @@ using error_code = boost::system::error_code;
 
 namespace argv {
 
-static cl::OptionCategory Input_Options("File Selection Options", "These options control the input sources.");
+cl::OptionCategory File_Select_Options("File Selection Options", "These options control the input sources.");
 
 bool NoMessagesFlag;
-static cl::opt<bool, true> NoMessagesOption("s", cl::location(NoMessagesFlag), cl::desc("Suppress messages for file errors."), cl::cat(Input_Options), cl::Grouping);
+static cl::opt<bool, true> NoMessagesOption("s", cl::location(NoMessagesFlag), cl::desc("Suppress messages for file errors."), cl::cat(File_Select_Options), cl::Grouping);
 static cl::alias NoMessagesAlias("no-messages", cl::desc("Alias for -s"), cl::aliasopt(NoMessagesOption));
 
 bool RecursiveFlag;
-static cl::opt<bool, true> RecursiveOption("r", cl::location(RecursiveFlag), cl::desc("Recursively process files within directories, (but follow only top-level symlinks unless -R)."), cl::cat(Input_Options), cl::Grouping);
+static cl::opt<bool, true> RecursiveOption("r", cl::location(RecursiveFlag), cl::desc("Recursively process files within directories, (but follow only top-level symlinks unless -R)."), cl::cat(File_Select_Options), cl::Grouping);
 static cl::alias RecursiveAlias("recursive", cl::desc("Alias for -r"), cl::aliasopt(RecursiveOption));
 
 bool DereferenceRecursiveFlag;
-static cl::opt<bool, true> DereferenceRecursiveOption("R", cl::location(DereferenceRecursiveFlag), cl::desc("Recursively process files within directories, following symlinks at all levels."), cl::cat(Input_Options), cl::Grouping);
+static cl::opt<bool, true> DereferenceRecursiveOption("R", cl::location(DereferenceRecursiveFlag), cl::desc("Recursively process files within directories, following symlinks at all levels."), cl::cat(File_Select_Options), cl::Grouping);
 static cl::alias DereferenceRecursiveAlias("dereference-recursive", cl::desc("Alias for -R"), cl::aliasopt(DereferenceRecursiveOption));
 
 bool MmapFlag;
-static cl::opt<bool, true> MmapOption("mmap", cl::location(MmapFlag),  cl::init(false), cl::desc("Use mmap for file input."), cl::cat(Input_Options));
+static cl::opt<bool, true> MmapOption("mmap", cl::location(MmapFlag),  cl::init(false), cl::desc("Use mmap for file input."), cl::cat(File_Select_Options));
 
 static cl::list<std::string> ExcludeFiles("exclude", cl::ZeroOrMore,
-                                          cl::desc("Exclude files matching the given filename GLOB pattern."), cl::cat(Input_Options));
+                                          cl::desc("Exclude files matching the given filename GLOB pattern."), cl::cat(File_Select_Options));
 
-static cl::opt<std::string> ExcludeFromFlag("exclude-from", cl::desc("Exclude files matching filename GLOB patterns from the given file."), cl::cat(Input_Options));
+static cl::opt<std::string> ExcludeFromFlag("exclude-from", cl::desc("Exclude files matching filename GLOB patterns from the given file."), cl::cat(File_Select_Options));
 
-static cl::list<std::string> ExcludeDirectories("exclude-dir", cl::desc("Exclude directories matching the given pattern."), cl::ZeroOrMore, cl::cat(Input_Options));
+static cl::list<std::string> ExcludeDirectories("exclude-dir", cl::desc("Exclude directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options));
 
 static cl::opt<std::string> ExcludePerDirectory("exclude-per-directory",
                                                 cl::desc(".gitignore (default) or other file specifying files to exclude."),
-                                                cl::init(".gitignore"), cl::cat(Input_Options));
+                                                cl::init(".gitignore"), cl::cat(File_Select_Options));
 
-static cl::list<std::string> IncludeDirectories("include-dir", cl::desc("Include directories matching the given pattern."), cl::ZeroOrMore, cl::cat(Input_Options));
+static cl::list<std::string> IncludeDirectories("include-dir", cl::desc("Include directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options));
 
-static cl::list<std::string> IncludeFiles("include", cl::ZeroOrMore, cl::desc("Include only files matching the given filename GLOB pattern(s)."), cl::cat(Input_Options));
+static cl::list<std::string> IncludeFiles("include", cl::ZeroOrMore, cl::desc("Include only files matching the given filename GLOB pattern(s)."), cl::cat(File_Select_Options));
 
 DevDirAction DevicesFlag;
 static cl::opt<DevDirAction, true> DevicesOption("D", cl::desc("Processing mode for devices:"),
                                                  cl::values(clEnumValN(Read, "read", "Treat devices as files to be searched."),
-                                                            clEnumValN(Skip, "skip", "Silently skip devices.")), cl::cat(Input_Options), cl::location(DevicesFlag), cl::init(Read));
+                                                            clEnumValN(Skip, "skip", "Silently skip devices.")), cl::cat(File_Select_Options), cl::location(DevicesFlag), cl::init(Read));
 static cl::alias DevicesAlias("devices", cl::desc("Alias for -D"), cl::aliasopt(DevicesOption));
 
 DevDirAction DirectoriesFlag;
 static cl::opt<DevDirAction, true> DirectoriesOption("d", cl::desc("Processing mode for directories:"),
                                                      cl::values(clEnumValN(Read, "read", "Print an error message for any listed directories."),
                                                                 clEnumValN(Skip, "skip", "Silently skip directories."),
-                                                                clEnumValN(Recurse, "recurse", "Recursive process directories, equivalent to -r.")), cl::cat(Input_Options), cl::location(DirectoriesFlag), cl::init(Read));
+                                                                clEnumValN(Recurse, "recurse", "Recursive process directories, equivalent to -r.")), cl::cat(File_Select_Options), cl::location(DirectoriesFlag), cl::init(Read));
 static cl::alias DirectoriesAlias("directories", cl::desc("Alias for -d"), cl::aliasopt(DirectoriesOption));
 
-static cl::opt<bool> TraceFileSelect("TraceFileSelect", cl::desc("Trace file selection"), cl::cat(Input_Options));
-static cl::opt<bool> TimeFileSelect("TimeFileSelect", cl::desc("Report the time required for file selection."), cl::cat(Input_Options));
+static cl::opt<bool> TraceFileSelect("TraceFileSelect", cl::desc("Trace file selection"), cl::cat(File_Select_Options));
+static cl::opt<bool> TimeFileSelect("TimeFileSelect", cl::desc("Report the time required for file selection."), cl::cat(File_Select_Options));
 
-static cl::opt<unsigned> GitREcoalescing("git-RE-coalescing", cl::desc("gitignore RE coalescing factor"), cl::init(10), cl::cat(Input_Options));
+static cl::opt<unsigned> GitREcoalescing("git-RE-coalescing", cl::desc("gitignore RE coalescing factor"), cl::init(10), cl::cat(File_Select_Options));
 
 
 
@@ -299,10 +302,8 @@ void recursiveFileSelect(CPUDriver & driver,
     fs::directory_iterator di(dirpath, errc);
     if (errc) {
         // If we cannot enter the directory, keep it in the list of files,
-        // for possible error reporting.
-        if (!NoMessagesFlag) {
-            collectedPaths.push_back(dirpath);
-        }
+        // for error reporting (silent with -s) and the exit status.
+        collectedPaths.push_back(dirpath);
         if (identified) ancestors.pop_back();
         return;
     }
@@ -336,9 +337,7 @@ void recursiveFileSelect(CPUDriver & driver,
         if (errc) {
             // If there was an error, we leave the file in the fileCandidates
             // list for later error processing.
-            if (!NoMessagesFlag) {
-                fileCandidates.append(e.string());
-            }
+            fileCandidates.append(e.string());
         } else if (fs::is_directory(s)) {
             subdirCandidates.append(e.string() + "/");
         } else if (fs::is_regular_file(s) || readDevices) {
@@ -375,10 +374,34 @@ void recursiveFileSelect(CPUDriver & driver,
     if (identified) ancestors.pop_back();
 }
 
-std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> & inputFiles) {
+int openInputFile(const fs::path & p) {
+    const bool isStdIn = (p.string() == "-");
+    const int fd = isStdIn ? ::dup(STDIN_FILENO) : ::open(p.c_str(), O_RDONLY);
+    const char * error = nullptr;
+    struct stat sb;
+    if (fd == -1) {
+        error = (errno == EACCES) ? "Permission denied" : (errno == ENOENT) ? "No such file" : "Failed";
+    } else if ((::fstat(fd, &sb) == 0) && S_ISDIR(sb.st_mode)) {
+        ::close(fd);
+        error = "Is a directory";
+    }
+    if (error == nullptr) return fd;
+    if (!NoMessagesFlag) {
+        llvm::errs() << sys::path::filename(codegen::ProgramName) << ": " << p.string() << ": " << error << ".\n";
+    }
+    return -1;
+}
+
+std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> & inputFiles, bool stdinAsPath) {
     auto file_select_start = std::chrono::high_resolution_clock::now();
     // The vector to accumulate the full list of collected files to be searched.
     std::vector<fs::path> collectedPaths;
+
+    if (stdinAsPath && inputFiles.empty()) {
+        argv::UseStdIn = true;
+        collectedPaths.emplace_back("-");
+        return collectedPaths;
+    }
 
     // In this pass through command line arguments and the file hierarchy,
     // we are just gathering file and subdirectory entries, so we silently
@@ -391,6 +414,7 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
         for (const auto & f : inputFiles) {
             if (f == "-") {  // stdin, will always be searched.
                 argv::UseStdIn = true;
+                if (stdinAsPath) selectPath(collectedPaths, fs::path(f));
                 continue;
             }
             fs::path p(f);
@@ -399,9 +423,7 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
             if (errc) {
                 // If there was an error, we leave the file in the fileCandidates
                 // list for later error processing.
-                if (!NoMessagesFlag) {
-                    selectPath(collectedPaths, std::move(p));
-                }
+                selectPath(collectedPaths, std::move(p));
             } else if (fs::is_directory(s)) {
                 if (DirectoriesFlag == Read) {
                     selectPath(collectedPaths, std::move(p));
@@ -422,6 +444,7 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
     for (const auto & f : inputFiles) {
         if (f == "-") {  // stdin, will always be searched.
             argv::UseStdIn = true;
+            if (stdinAsPath) selectPath(collectedPaths, fs::path(f));
             continue;
         }
         fs::path p(f);
@@ -430,7 +453,7 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
         if (errc) {
             // If there was an error, we leave the file in the fileCandidates
             // list for later error processing.
-            if (!NoMessagesFlag) fileCandidates.append(p.string());
+            fileCandidates.append(p.string());
         } else if (fs::is_directory(s)) {
             if (DirectoriesFlag == Recurse) {
                 dirCandidates.append(p.string() + "/");

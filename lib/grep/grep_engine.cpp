@@ -203,7 +203,7 @@ void GrepEngine::setRecordBreak(GrepRecordBreakKind b) {
 
 namespace fs = boost::filesystem;
 
-std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths, size_t max_batch_size) {
+std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths, size_t max_batch_size, bool skipEmptyFiles) {
     const unsigned maxFilesPerGroup = 32;
     std::vector<std::vector<std::string>> groups;
     // The total size of files in the current group, or 0 if the
@@ -212,6 +212,7 @@ std::vector<std::vector<std::string>> formFileGroups(std::vector<fs::path> paths
     for (auto p : paths) {
         boost::system::error_code errc;
         auto s = fs::file_size(p, errc);
+        if (skipEmptyFiles && !errc && (s == 0)) continue;
         if ((s > 0) && (s + 1 + groupTotalSize < max_batch_size)) {
             s += 1;  // +1 for an extra "\n"
             if (groupTotalSize == 0) {
@@ -241,7 +242,7 @@ void GrepEngine::initFileResult(const std::vector<boost::filesystem::path> & pat
     mResultStrs.resize(n);
     mFileStatus.resize(n, FileStatus::Pending);
     mInputPaths = paths;
-    mFileGroups = formFileGroups(paths, mBatchSize);
+    mFileGroups = formFileGroups(paths, mBatchSize, !reportsEmptyFiles());
     const unsigned numOfThreads = std::min(static_cast<unsigned>(codegen::TaskThreads),
                                            std::max(static_cast<unsigned>(mFileGroups.size()), 1u));
     codegen::setTaskThreads(numOfThreads);
@@ -1032,8 +1033,10 @@ uint64_t EmitMatchesEngine::doGrep(const std::vector<std::string> & fileNames, s
         int32_t fd = openFile(fileNames[0], strm);
         if (fd == -1) return 0;   // File error; skip.
         struct stat st;
-        if (fstat(fd, &st) != 0)  return 0;
-        if (st.st_size == 0) return 0;
+        const bool statOK = fstat(fd, &st) == 0;
+        // The file is read by AlignedFileBuffer::load, which opens it again.
+        if (fd != STDIN_FILENO) close(fd);
+        if (!statOK || (st.st_size == 0)) return 0;
         accum.mFileNames.push_back(fileNames[0]);
         accum.mFileStartPositions.push_back(static_cast<size_t>(0));
         accum.setFileLabel(accum.mFileNames[0]);

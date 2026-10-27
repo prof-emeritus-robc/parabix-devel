@@ -8,7 +8,6 @@ if (ENABLE_PAPI)
 endif()
 
 parabix_add_module(
-USES_Z3
 NAME
     kernel.pipeline
 SRC
@@ -30,7 +29,6 @@ SRC
     compiler/analysis/relationship_analysis.cpp
     compiler/analysis/scheduling_analysis.cpp
     compiler/analysis/simple_scheduling_analysis.cpp
-    compiler/analysis/simple_variable_rate_analysis.cpp
     compiler/analysis/termination_analysis.cpp
     compiler/analysis/thread_local_analysis.cpp
     compiler/analysis/variable_rate_analysis.cpp

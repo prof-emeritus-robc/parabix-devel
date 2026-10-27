@@ -182,7 +182,6 @@ function(parabix_srchash_write_config FILE)
     string(APPEND CONTENT "flags=${FLAGS}\n")
     string(APPEND CONTENT "artifacts=${ARTIFACT_MODE} ${ARTIFACT_TYPE}\n")
     string(APPEND CONTENT "papi=${ENABLE_PAPI}\n")
-    string(APPEND CONTENT "z3=${Z3_FOUND}\n")
     parabix_srchash_write_if_different(${FILE} "${CONTENT}")
 endfunction(parabix_srchash_write_config)
 

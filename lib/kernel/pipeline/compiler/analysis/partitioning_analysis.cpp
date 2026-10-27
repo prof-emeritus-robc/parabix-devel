@@ -192,7 +192,7 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
 
     // wcan through the graph and determine where every non-Fixed relationship exists
     // so that we can construct our initial set of partitions. The goal here is to act
-    // as a naive first pass to simplify the problem before using Z3.
+    // as a naive first pass to simplify the problem for the later stages.
 
     // NOTE: any decisions made during this pass *must* be provably correct for any
     // situation because the choices will *not* be verified.

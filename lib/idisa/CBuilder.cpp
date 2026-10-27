@@ -2336,6 +2336,9 @@ Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
                     assert (&st->getContext() == &C);
                     assert (st->getNumElements() == type->getNumElements());
                     assert (st->isPacked() == type->isPacked());
+                    for (unsigned i = 0; i < st->getNumElements(); ++i) {
+                        assert (st->getElementType(i) == convertType(st->getElementType(i)));
+                    }
                     #endif
                     return st;
                 }
@@ -2406,6 +2409,7 @@ Type * CBuilder::convertTypeToLLVMContext(LLVMContext & C, Type * sourceType) {
     };
 
     if (LLVM_UNLIKELY(sourceType == nullptr || &sourceType->getContext() == &C)) {
+        assert (sourceType == nullptr || sourceType == convertType(sourceType));
         return sourceType;
     } else {
         return convertType(sourceType);

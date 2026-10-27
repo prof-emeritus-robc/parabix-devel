@@ -228,6 +228,7 @@ void CarryManager::initializeCodeGen(kernel::KernelBuilder & b) {
     }
 
     mCarryFrameType = (StructType*)CBuilder::convertTypeToLLVMContext(b.getContext(), mCarryFrameType);
+    assert (&mCarryFrameType->getContext() == &b.getContext());
 
     mCurrentFrame = b.getScalarFieldPtr("carries").first;
     mCurrentFrameIndex = 0;
@@ -384,6 +385,11 @@ void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const e
         indices[1] = b.getInt32(NestedCarryState);
         Value * const carryStateArrayPtr = b.CreateGEP(frame.OuterFrameType, frame.OuterFrame, indices);
         StructType * nestedCarryTy = mCarryInfo->getNestedCarryStateType(); assert (nestedCarryTy);
+        if (&nestedCarryTy->getContext() != &b.getContext()) {
+            nestedCarryTy = cast<StructType>(CBuilder::convertTypeToLLVMContext(b.getContext(), nestedCarryTy));
+            mCarryInfo->setNestedCarryStateType(nestedCarryTy);
+        }
+
         Type * nestedCarryPtrTy = frame.OuterFrameType->getStructElementType(NestedCarryState);
 
         assert (nestedCarryPtrTy->isPointerTy());
@@ -442,6 +448,7 @@ void CarryManager::enterLoopBody(kernel::KernelBuilder & b, BasicBlock * const e
         mCurrentFrame = b.CreateGEP(nestedCarryTy, updatedCarryStateArrayPhi, indexPhi);
         assert (mCurrentFrameType->getStructElementType(NestedCarryState)->isPointerTy());
         mCurrentFrameType = nestedCarryTy;
+        assert (&mCurrentFrameType->getContext() == &b.getContext());
         mCurrentFrameIndex = 0;
 
     }
@@ -461,6 +468,7 @@ void CarryManager::leaveLoopBody(kernel::KernelBuilder & b) {
         const CarryFrame & outer = mCarryFrameStack.back();
         mCurrentFrame = outer.Frame;
         mCurrentFrameType = cast<StructType>(outer.Type);
+        assert (&mCurrentFrameType->getContext() == &b.getContext());
         mCurrentFrameIndex = 3;
         assert (outer.Index == 3);
         mCarryFrameStack.pop_back();
@@ -621,6 +629,7 @@ void CarryManager::enterScope(kernel::KernelBuilder & b) {
     assert (mCurrentFrameIndex < mCurrentFrameType->getStructNumElements());
     mCurrentFrame = b.CreateGEP(mCurrentFrameType, mCurrentFrame, {b.getInt32(0), b.getInt32(mCurrentFrameIndex)});
     mCurrentFrameType = cast<StructType>(mCurrentFrameType->getStructElementType(mCurrentFrameIndex));
+    assert (&mCurrentFrameType->getContext() == &b.getContext());
     // Verify we're pointing to a carry frame struct
     mCurrentFrameIndex = 0;
     mNextSummaryTest = nullptr;
@@ -644,6 +653,7 @@ void CarryManager::leaveScope() {
     const CarryFrame & outer = mCarryFrameStack.back();
     mCurrentFrame = outer.Frame;
     mCurrentFrameType = cast<StructType>(outer.Type);
+    assert (&mCurrentFrameType->getContext() == &mCarryFrameType->getContext());
     mCurrentFrameIndex = outer.Index;
 
     mCarryFrameStack.pop_back();
@@ -737,10 +747,13 @@ Value * CarryManager::addCarryInCarryOut(kernel::KernelBuilder & b, const Statem
     assert (e1->getType() == b.getBitBlockType());
     assert (e1->getType() == e2->getType());
 
+    assert (&cTy->getContext() == &b.getContext());
+
     SmallVector<char, 128> tmp;
     raw_svector_ostream nm(tmp);
     nm << "__addCarryInCarryOut";
     cTy->print(nm);
+
     std::array<Value *, 3> args;
     args[0] = e1;
     args[1] = e2;
@@ -780,6 +793,8 @@ Value * CarryManager::addCarryInCarryOut(kernel::KernelBuilder & b, const Statem
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::subBorrowInBorrowOut(kernel::KernelBuilder & b, const Statement * operation, Value * const e1, Value * const e2) {
     assert (operation);
+    assert (e1->getType() == b.getBitBlockType());
+    assert (e1->getType() == e2->getType());
     Value * const borrowIn = getNextCarryIn(b);
 
     Type * const cTy = borrowIn->getType();
@@ -1165,12 +1180,14 @@ inline Value * CarryManager::longAdvanceCarryInCarryOut(kernel::KernelBuilder & 
  ** ------------------------------------------------------------------------------------------------------------- */
 Value * CarryManager::getNextCarryIn(kernel::KernelBuilder & b) {
     assert (mCurrentFrameIndex < mCurrentFrameType->getStructNumElements());
+    assert (&mCurrentFrameType->getContext() == &b.getContext());
     Constant * const ZERO = b.getInt32(0);
     FixedArray<Value *, 3> indices;
     indices[0] = ZERO;
     indices[1] = b.getInt32(mCurrentFrameIndex);
     indices[2] = mLoopDepth == 0 ? ZERO : mLoopSelector;
     Type * carryTy = mCurrentFrameType->getStructElementType(mCurrentFrameIndex)->getArrayElementType();
+    assert (&carryTy->getContext() == &b.getContext());
     mCarryPackPtr = b.CreateGEP(mCurrentFrameType,  mCurrentFrame, indices);
     Value * const carryIn = b.CreateLoad(carryTy, mCarryPackPtr);
     if (mLoopDepth > 0) {

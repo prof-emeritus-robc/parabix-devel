@@ -27,18 +27,20 @@
 #include <llvm/CodeGen/LiveVariables.h>
 #include <llvm/CodeGen/LiveIntervals.h>
 #include <llvm/CodeGen/MachineValueType.h>
+#include <llvm/CodeGen/MachineLoopInfo.h>
+#include <llvm/ADT/PostOrderIterator.h>
+#include <llvm/CodeGen/TargetRegisterInfo.h>
+#include <llvm/CodeGen/MachineFrameInfo.h>
 #include <llvm/Support/CommandLine.h>
-#include <llvm/Transforms/Utils/Cloning.h>
-#include <toolchain/toolchain.h>
+#include <queue>
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
 
 constexpr auto MAXIMUM_SYMBOL_LENGTH = 4096;
 
-using namespace llvm;
 
-constexpr static StringRef SNIPPET_PREFIX{"_snippet."};
+using namespace llvm;
 
 static cl::opt<FunctionSnippetMode> FunctionSnippetModeOption("function-snippets",
     cl::desc("How pablo function snippets are compiled."),
@@ -51,9 +53,23 @@ FunctionSnippetMode getFunctionSnippetMode() {
     return FunctionSnippetModeOption;
 }
 
+constexpr static StringRef SNIPPET_PREFIX{"__cfs."};
+constexpr static StringRef SNIPPET_INPUT_SUFFIX{"_in"};
+constexpr static StringRef SNIPPET_OUTPUT_SUFFIX{"_out"};
+constexpr static StringRef SNIPPET_METADATA_LABEL{"__cfsmd"};
+
+enum CFAnchorCode {
+    ANCHOR_START = 0,
+    ANCHOR_CALL = 1,
+    ANCHOR_END = 2
+};
+
+using BasicBlockIterator = std::vector<MachineBasicBlock *>::iterator;
+
+using InstrIterator = MachineBasicBlock::instr_iterator;
+
 class FunctionSnippetTokenReplacerPass : public MachineFunctionPass {
 public:
-    static StringRef FUNCTION_SNIPPET_METADATA_LABEL;
 
     static inline char ID = 0;
 
@@ -72,98 +88,52 @@ public:
 
 private:
 
-//    struct CacheOperand {
-//        MachineOperand MO;
-//        unsigned Flags = 0;
-//        union {
-//            const TargetRegisterClass * RegClass = nullptr;
-//            size_t BasicBlockId;
-//        };
-
-//        CacheOperand(const MachineOperand & src)
-//        : MO(src) {
-//            MO.clearParent();
-//        }
-//    };
-
-//    struct CacheInst {
-//        unsigned Opcode;
-//        uint64_t Flags;
-//        DebugLoc DL;
-//        SmallVector<CacheOperand, 2> Operands;
-//        SmallVector<std::pair<unsigned, unsigned>, 0> TiedOperands;
-//        SmallVector<unsigned, 0> EarlyClobberOperands;
-
-//        CacheInst() = default;
-
-//        CacheInst(const MachineInstr & MI)
-//        : Opcode(MI.getOpcode())
-//        , Flags(MI.getFlags())
-//        , DL(MI.getDebugLoc()) {
-
-//        }
-//    };
-
-    using RegMappingList = std::vector<std::pair<MCRegister, Register>>;
-
-    using RegisterMap = DenseMap<Register, Register, DenseMapInfo<Register>>;
-
-//    struct CacheBasicBlock {
-//        const BasicBlock * Source = nullptr;
-//        std::vector<CacheInst> Instructions;
-//        SmallVector<std::pair<size_t, BranchProbability>, 2> Successors;
-//        RegMappingList LiveOuts;
-
-//        CacheBasicBlock(const BasicBlock * bb = nullptr) : Source(bb) {}
-//    };
-
-//    struct CachedMachineFunction {
-//        std::vector<CacheBasicBlock> BasicBlock;
-//        RegMappingList LiveIns;
-//        DenseMap<Register, const TargetRegisterClass *, DenseMapInfo<Register>> RegClassMap;
-//        std::vector<MCRegister> LiveOuts;
-//        size_t NumOfExitBlocks = 0;
-//        std::unique_ptr<MachineFunction> MF;
-//    };
-
-
-    struct CacheBasicBlock {
-        std::vector<const MachineInstr *> Instructions;
-        std::vector<std::pair<size_t, size_t>> MBBOperandSubsitutionList;
-
-        SmallVector<std::pair<size_t, BranchProbability>, 2> Successors;
-        bool IsFunctionExit = false;
+    struct CodeFragment {
+        std::vector<Register> LiveIn;
+        std::vector<Register> LiveOut;
+        std::vector<Register> VRegDefs;
+        std::vector<MachineBasicBlock *> BasicBlocks;
+        MachineBasicBlock::instr_iterator Begin;
+        MachineBasicBlock::instr_iterator End;
+        bool FullyResolved = false;
     };
 
-    struct CachedMachineFunction {
-        std::unique_ptr<MachineFunction> MF;
-        std::vector<CacheBasicBlock> BasicBlock;
-        std::vector<std::pair<MCRegister, Register>> LiveIns;
-        std::vector<std::pair<MCRegister, Register>> LiveOuts;
-        DenseMap<Register, const TargetRegisterClass *, DenseMapInfo<Register>> RegClassMap;
+    using CodeFragmentMap = DenseMap<const Function *, CodeFragment, DenseMapInfo<Function *>>;
 
-        size_t NumOfLiveOuts = 0;
-        size_t NumOfExitBlocks = 0;
-    };
+    using OrderingMap = DenseMap<MachineBasicBlock *, size_t, DenseMapInfo <MachineBasicBlock *>>;
 
-    void serializeToCache(Function & F, MachineFunction & MF, MachineModuleInfo & MMI);
+    using GlobalSet = DenseSet<const GlobalValue *, DenseMapInfo<GlobalValue *>>;
+
+    bool checkForFencedCodeFragment(Module * M,
+                                    MachineFunction & MF,
+                                    BasicBlockIterator & MBBIterator,
+                                    InstrIterator & instrIterator,
+                                    CodeFragmentMap & codeFragments,
+                                    GlobalSet & discoveredGlobals) const;
+
+    bool subsituteCodeFragment(const Function * F,
+                               MachineFunction & MF,
+                               BasicBlockIterator & MBBIterator,
+                               InstrIterator & instrIterator,
+                               const CodeFragmentMap & codeFragments,
+                               GlobalSet & discoveredGlobals) const;
+
+
+    using RegisterVector = SmallVector<Register, 16>;
+    using ToDeleteVector = SmallVector<MachineInstr *, 32>;
+
+    static void getCallsiteVirtualRegisters(MachineFunction & MF, InstrIterator &callsite,
+                                     RegisterVector &uses, RegisterVector & defs, GlobalSet & discoveredGlobals);
+
+    static void eraseCallsite(MachineRegisterInfo & MRI, InstrIterator & callsite);
+
+    template <typename ArrayA, typename ArrayB>
+    static void rerouteLiveSets(const TargetRegisterInfo * const TRI, MachineRegisterInfo & MRI, const TargetInstrInfo * const TII,
+                                InstrIterator ip,
+                                const ArrayA & srcArray, ArrayB & dstArray);
 
     const Function * getCalleeFunction(Module * M, MachineFunction & MF, MachineInstr & call) const;
 
-    void getInputArgumentMapping(const MachineFunction & MF,
-                                 MachineBasicBlock & MBB, MachineBasicBlock::instr_iterator callsite,
-                                 const CachedMachineFunction & cache,
-                                 RegisterMap & globalMap);
-
-    void getOutputArgumentMapping(const MachineFunction &MF,
-                                  MachineBasicBlock &MBB, MachineBasicBlock::instr_iterator callsite,
-                                  const CachedMachineFunction & cachedMF,
-                                  RegisterMap & callerRetMap);
-
-
-
-private:
-    DenseMap<Function *, CachedMachineFunction, DenseMapInfo<Function *>> Cache;
 };
 
 bool FunctionSnippetTokenReplacerPass::doInitialization(Module & M)  {
@@ -171,19 +141,6 @@ bool FunctionSnippetTokenReplacerPass::doInitialization(Module & M)  {
 }
 
 bool FunctionSnippetTokenReplacerPass::doFinalization(Module & M)  {
-
-//    if (Cache.size() > 0) {
-//        auto & MMI = getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
-//        for (auto r : Cache) {
-//            Function & irFunc = *r.first;
-//            MMI.deleteMachineFunctionFor(irFunc);
-//            irFunc.replaceAllUsesWith(UndefValue::get(irFunc.getType()));
-//            irFunc.eraseFromParent();
-//        }
-//    }
-
-//    return (!Cache.empty());
-
     return false;
 }
 
@@ -191,373 +148,886 @@ MachineFunctionPass * createFunctionSnippetTokenReplacerPass() {
     return new FunctionSnippetTokenReplacerPass();
 }
 
-StringRef FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL{"snippetlink"};
+bool inline isMemFence(MachineInstr & I) {
+    if (I.getOpcode() == TargetOpcode::MEMBARRIER) return true;
+    return (I.hasUnmodeledSideEffects() && I.mayLoadOrStore() && !I.isCall() && !I.isReturn());
+}
 
-
-Register extractCallerExpectedDestination(MachineFunction & MF,
-                                          const MachineBasicBlock & MBB,
-                                          const MachineInstr & MI,
-
-                                          MachineInstr *& defunctSelDagCopy) {
-    if (MI.getNumDefs() > 0) {
-        auto op0 = MI.getOperand(0);
-        if (op0.isReg() && op0.isDef()) {
-            auto reg = op0.getReg();
-            if (reg.isVirtual()) {
-                defunctSelDagCopy = nullptr;
-                return reg;
+inline void updateRegCopySource(MachineInstr & MI, Register newVal) {
+    if (LLVM_LIKELY(MI.isCopyLike())) {
+        MI.getOperand(1).setReg(newVal);
+    } else {
+        const auto & desc = MI.getDesc();
+        const auto m = MI.getNumOperands();
+        const auto n = std::min(m, desc.getNumOperands());
+        for (unsigned i = 0; i < n; ++i) {
+            auto & MO = MI.getOperand(i);
+            if (!MO.isReg() || MO.isDef() || MO.isImplicit()) {
+                continue;
+            }
+            const auto & info = desc.operands()[i];
+            if (info.OperandType == MCOI::OPERAND_REGISTER) {
+                MI.getOperand(i).setReg(newVal);
+                return;
             }
         }
+        if (LLVM_LIKELY(n != m)) {
+            MI.getOperand(n).setReg(newVal);
+        }
+
     }
+};
 
-    const MachineRegisterInfo & MRI = MF.getRegInfo();
+inline uint64_t getAnchorCode(const MDNode * const md) {
+    assert (md->getNumOperands() == 1);
+    return cast<ConstantInt>(cast<ConstantAsMetadata>(md->getOperand(0).get())->getValue())->getZExtValue();
+}
 
-    for (const MachineOperand & MO : MI.operands()) {
-        if (MO.isReg() && MO.isDef()) {
-            auto reg = MO.getReg();
-            if (reg.isPhysical()) {
-                auto phyReg = reg.asMCReg();
-                for (MachineOperand & UO : MRI.use_operands(phyReg)) {
-                    MachineInstr * UI = UO.getParent();
-                    if (UI && UI->getParent() == &MBB) {
-                        if (UI->isCopyLike() || UI->isMoveReg()) {
-                            auto virtDest = UI->getOperand(0).getReg();
-                            if (virtDest.isVirtual()) {
-                                defunctSelDagCopy = UI;
-                                return virtDest;
-                            }
-                        }
+inline bool hasNoWork(const Module * const M, const Function * const func) {
+    for (const auto & F : M->functions()) {
+        if (F.hasMetadata(SNIPPET_METADATA_LABEL)) {
+            for (const User * U : F.users()) {
+                if (isa<Instruction>(U)) {
+                    if (cast<Instruction>(U)->getFunction() == func) {
+                        return false;
                     }
                 }
             }
         }
     }
-    return Register{};
+    return true;
 }
 
 bool FunctionSnippetTokenReplacerPass::runOnMachineFunction(MachineFunction & MF) {
 
-    using Prop = MachineFunctionProperties::Property;
+    Function & caller = MF.getFunction();
+    Module * const M = caller.getParent();
 
+    if (hasNoWork(M, &caller)) {
+        return false;
+    }
 
+    ReversePostOrderTraversal<MachineFunction *> RPT(&MF);
+    std::vector<MachineBasicBlock *> ordering(RPT.begin(), RPT.end());
 
-    const auto & props = MF.getProperties();
+    CodeFragmentMap CFMap;
 
-    const auto usedGlobalISel = props.hasProperty(Prop::Legalized) || props.hasProperty(Prop::RegBankSelected);
+    GlobalSet discoveredGlobals;
 
-    auto & MMI = getAnalysis<MachineModuleInfoWrapperPass>().getMMI();
-    auto & MBPI = getAnalysis<MachineBranchProbabilityInfo>();
-    auto & MRI = MF.getRegInfo();
+    for (BasicBlockIterator bbItr = ordering.begin(); bbItr != ordering.end(); ++bbItr) {
 
+        InstrIterator begin = (*bbItr)->instr_begin();
+        InstrIterator end = (*bbItr)->instr_end();
 
-    const TargetInstrInfo * const TII = MF.getSubtarget().getInstrInfo();
+        for (auto instItr = begin; instItr != end; ) {
 
-    RegisterMap GlobalRegMap;
+            assert (instItr->getParent() == *bbItr);
 
-    RegisterMap CallerRetMap;
-
-    DenseMap<Register, MachineInstr *, DenseMapInfo<Register>> OutgoingPhi;
-
-    SmallVector<MachineBasicBlock *, 16> InlinedBasicBlockList;
-
-    using InstrIterator = MachineBasicBlock::instr_iterator;
-
-    const TargetRegisterInfo * TRI = MF.getSubtarget().getRegisterInfo();
-
-    const auto * const CallMask = TRI->getCallPreservedMask(MF, MF.getFunction().getCallingConv());
-
-    auto doSplice = [&](const Function * const callee,
-            MachineBasicBlock & MBB, const InstrIterator callsite,
-            const CachedMachineFunction & cachedMF, InstrIterator & next) -> bool {
-
-        assert (callsite->isCall());
-
-        assert (GlobalRegMap.empty());
-
-        auto getRegister = [&](Register calleeReg) -> Register {
-            if (calleeReg.isPhysical() || !calleeReg.isValid()) {
-                return calleeReg;
-            }
-            auto f = GlobalRegMap.find(calleeReg);
-            assert (f != GlobalRegMap.end());
-            return f->second;
-        };
-
-        callsite->print(errs());
-
-        // Add the caller register -> callee input mappings
-        getInputArgumentMapping(MF, MBB, callsite, cachedMF, GlobalRegMap);
-
-        // Add the callee register -> caller output mappings
-        getOutputArgumentMapping(MF, MBB, callsite, cachedMF, CallerRetMap);
-
-//        MachineInstr * defunctCopy = nullptr;
-//        auto destReg = extractCallerExpectedDestination(MF, MBB, *callsite, defunctCopy);
-//        assert (destReg.isValid() && destReg.isVirtual());
-
-//        const TargetRegisterClass * RC = MRI.getRegClass(destReg);
-//        Register scratchOutput = MRI.createVirtualRegister(RC);
-//        GlobalRegMap.insert(std::make_pair(destReg, scratchOutput));
-
-
-
-        const auto & CBBs = cachedMF.BasicBlock;
-
-        auto & HRI = MF.getRegInfo();
-        const auto numOfCachedMachineBasicBlocks = CBBs.size();
-        assert (numOfCachedMachineBasicBlocks > 0);
-
-        if (LLVM_LIKELY(numOfCachedMachineBasicBlocks == 1)) {
-
-            const auto & CBB = CBBs[0];
-
-//            assert (cachedMF.NumOfExitBlocks == 1);
-            assert (CBB.IsFunctionExit);
-
-            errs() << "INSERTED CODE:\n";
-
-            for (const MachineInstr * I : CBB.Instructions) {
-
-                assert (!I->isReturn());
-                MachineInstr * const MI = MF.CloneMachineInstr(I);
-
-                const auto m = MI->getNumOperands();
-                for (size_t i = 0; i < m; ++i) {
-                    auto & MO = MI->getOperand(i);
-                    if (MO.isReg()) {
-                        const auto calleeReg = MO.getReg();
-                        if (calleeReg.isVirtual()) {
-                            if (MO.isUse()) {
-                                auto f = GlobalRegMap.find(calleeReg);
-                                assert (f != GlobalRegMap.end());
-                                MO.setReg(f->second);
-                            } else {
-                                auto f = CallerRetMap.find(calleeReg);
-                                if (f == CallerRetMap.end()) {
-                                    auto r = cachedMF.RegClassMap.find(calleeReg);
-                                    assert (r != cachedMF.RegClassMap.end());
-                                    Register newReg = MRI.createVirtualRegister(r->second);
-                                    GlobalRegMap[calleeReg] = newReg;
-                                    MO.setReg(newReg);
-                                } else {
-                                    MO.setReg(f->second);
-                                }
+            MachineInstr & I = *instItr;
+            if (I.isCall()) {
+                const Function * const callee = getCalleeFunction(M, MF, I);
+                if (callee) {
+                    MDNode * md = callee->getMetadata(SNIPPET_METADATA_LABEL);
+                    if (md) {
+                        const auto gv = getAnchorCode(md);
+                        if (gv == CFAnchorCode::ANCHOR_CALL) {
+                            if (subsituteCodeFragment(callee, MF, bbItr, instItr, CFMap, discoveredGlobals)) {
+//                                MF.verify(this, "After subsituteCodeFragment");
+                                assert (instItr->getParent() == *bbItr);
+                                end = (*bbItr)->instr_end();
+                                assert (instItr != end);
+                                continue;
                             }
                         }
                     }
                 }
-
-                MBB.insert(callsite, MI);
-
-             //   MI->cloneMemRefs(*cachedMF.MF, *I);
-
-                MI->print(errs());
-
             }
 
-            errs() << "\n\n";
-
-        } else { // snippet function has multiple basicblocks.
-
-            InlinedBasicBlockList.resize(numOfCachedMachineBasicBlocks);
-            InlinedBasicBlockList[0] = &MBB;
-
-            auto insertPoint = std::next(MBB.getIterator());
-            for (unsigned i = 1; i < numOfCachedMachineBasicBlocks; ++i) {
-                auto newBB = MF.CreateMachineBasicBlock();
-                InlinedBasicBlockList[i] = newBB;
-                MF.insert(insertPoint, newBB);
-            }
-
-            MachineBasicBlock * exitBlock = nullptr;
-
-//            assert (cachedMF.NumOfExitBlocks == 1);
-
-//            if (LLVM_LIKELY(cachedMF.NumOfExitBlocks != 1)) {
-//                exitBlock = MF.CreateMachineBasicBlock();
-
-//                auto PhiType = TII->get(TargetOpcode::PHI);
-
-//                assert (OutgoingPhi.empty());
-//                for (auto & entry : CallerRetMap) {
-//                    const auto c = MRI.getRegClass(entry.first);
-//                    auto phiReg = MRI.createVirtualRegister(c);
-//                    auto phiIB = BuildMI(*exitBlock, exitBlock->end(), DebugLoc{}, PhiType, phiReg);
-//                    auto phiNode = phiIB.getInstr();
-//                    MRI.replaceRegWith(entry.second, phiReg);
-//                    entry.second = phiReg;
-//                    OutgoingPhi.insert(std::make_pair(entry.first, phiNode));
-//                }
-
-//                MBB.splice(exitBlock->end(), exitBlock, callsite);
-//                MF.insert(insertPoint, exitBlock);
-//            }
-
-            for (unsigned i = 0; i < numOfCachedMachineBasicBlocks; ++i) {
-
-                const auto & CBB = CBBs[i];
-
-                MachineBasicBlock * const targetBB = InlinedBasicBlockList[i];
-                for (const auto & s : CBB.Successors) {
-                    MachineBasicBlock * newSucc = InlinedBasicBlockList[s.first];
-                    targetBB->addSuccessor(newSucc, s.second);
+            if (isMemFence(I)) {
+                if (checkForFencedCodeFragment(M, MF, bbItr, instItr, CFMap, discoveredGlobals)) {
+//                    MF.verify(this, "After checkForFencedCodeFragment");
+                    assert (instItr->getParent() == *bbItr);
+                    end = (*bbItr)->instr_end();
+                    assert (instItr != end);
+                    continue;
                 }
+            }
+            ++instItr;
+        }
+    }
 
-                const auto m = CBB.Instructions.size();
+    // TODO: we can do this within the loop.
+    auto & MFI = MF.getFrameInfo();
+    MFI.computeMaxCallFrameSize(MF);
+//    MFI.setHasOpaqueSPAdjustment(false);
 
-                const auto & subList = CBB.MBBOperandSubsitutionList;
-
-                auto nextImmSubsitution = subList.begin();
-
-                for (size_t j = 0; j < m; ++j) {
-
-                    const MachineInstr * I = CBB.Instructions[j];
-
-                    MachineInstr * const MI = MF.CloneMachineInstr(I);
-
-                    targetBB->insert(targetBB->end(), MI);
-
-                    const auto n = MI->getNumOperands();
-
-                    for (size_t k = 0; k < n; ++k) {
-                        MachineOperand & MO = MI->getOperand(k);
-                        if (MO.isReg()) {
-                            auto reg = MO.getReg();
+    if (!discoveredGlobals.empty()) {
+        auto & MRI = MF.getRegInfo();
+        for (auto & MBB : MF) {
+            for (auto & MI : make_early_inc_range(MBB)) {
+                for (auto & MO : MI.operands()) {
+                    if (MO.isGlobal() && discoveredGlobals.count(MO.getGlobal())) {
+                        auto & def = MI.getOperand(0);
+                        if (def.isReg()) {
+                            auto reg = def.getReg();
                             if (reg.isVirtual()) {
-                                const auto newReg = getRegister(reg);
-                                MO.ChangeToRegister(newReg, MO.isDef(), MO.isImplicit(), MO.isKill(), MO.isDead(), MO.isUndef(), MO.isDebug());
-                            }
-                        } else if (MO.isImm()) {
-                            if (nextImmSubsitution != subList.end()) {
-                                if (nextImmSubsitution->first == j && nextImmSubsitution->second == k) {
-                                    MO.setMBB(InlinedBasicBlockList[MO.getImm()]);
-                                    ++nextImmSubsitution;
+                                if (MRI.use_empty(reg)) {
+                                    MI.eraseFromParent();
                                 }
                             }
                         }
+                        break;
                     }
-
-                }
-
-                assert (nextImmSubsitution == subList.end());
-
-//                assert (cachedMF.NumOfExitBlocks == 1);
-
-                if (LLVM_UNLIKELY(CBB.IsFunctionExit)) {
-                    MBB.splice(targetBB->end(), targetBB, callsite);
                 }
             }
+        }
+    }
+    return true;
+}
 
-        };
+void simplifyRegCopy(MachineRegisterInfo & MRI, const TargetRegisterInfo * const TRI, Register src, Register dst) {
 
-        GlobalRegMap.clear();
+}
 
-//        if (defunctCopy) {
-//            defunctCopy->eraseFromParent();
-//        }
-
-//        MachineBasicBlock & exit = *callsite->getParent();
-//        const auto & dl = callsite->getDebugLoc();
-//        BuildMI(exit, callsite, dl, TII->get(TargetOpcode::COPY), destReg).addReg(scratchOutput);
-//        for (const auto & mo : callsite->operands()) {
-//            if (mo.isRegMask()) {
-//                BuildMI(exit, callsite, dl, TII->get(TargetOpcode::KILL)).addRegMask(mo.getRegMask());
-//                break;
-//            }
-//        }
-
-        next = std::next(callsite);
-        callsite->eraseFromParent();
-        return (numOfCachedMachineBasicBlocks > 0);
-    };
+void simplifyRegCopy(MachineRegisterInfo & MRI, const TargetRegisterInfo * const TRI, Register reg) {
+    for (const auto & MI : MRI.use_instructions(reg)) {
+        if (MI.isCopy()) {
+            assert (MI.getOperand(1).getReg() == reg);
 
 
-    bool Changed = false;
-    bool ModifiedCFG = false;
 
-    Function & F = MF.getFunction();
+        }
+    }
+}
 
 
-    Module * const M = F.getParent();
+inline bool isVectorConstant(const MachineInstr & I, const TargetInstrInfo * const TII) {
+    if (TII->isTriviallyReMaterializable(I) || TII->isAsCheapAsAMove(I)) {
+       for (const auto & O : I.explicit_uses()) {
+           if (O.isReg() && O.getReg().isValid()) {
+               return false;
+           }
+       }
+       return true;
+    }
+    return false;
+}
 
-    if (Cache.size() > 0) {
-        auto mbb_itr = MF.begin();
-        auto mbb_end = MF.end();
-        while (mbb_itr != mbb_end) {
-            auto itr = mbb_itr->instr_begin();
-restart_after_callsite:
-            auto end = mbb_itr->instr_end();
-            while (itr != end) {
-                MachineInstr & I = *itr;
-                if (I.isCall()) {
-                    const Function * const callee = getCalleeFunction(M, MF, I);
-                    if (callee && callee->hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
-                        const auto f = Cache.find(callee);
-                        assert (f != Cache.end());
-                        const auto & cachedMF = f->second;
+inline bool isNonComputeRegisterAssign(const MachineInstr & I, const TargetInstrInfo * const TII) {
+    switch (I.getOpcode()) {
+        case TargetOpcode::COPY:
+        case TargetOpcode::IMPLICIT_DEF:
+        case TargetOpcode::SUBREG_TO_REG:
+        case TargetOpcode::EXTRACT_SUBREG:
+        case TargetOpcode::INSERT_SUBREG:
+        case TargetOpcode::REG_SEQUENCE:
+        case TargetOpcode::PHI:
+        case TargetOpcode::G_CONSTANT:
+        case TargetOpcode::G_FCONSTANT:
+        case TargetOpcode::G_IMPLICIT_DEF:
+        case TargetOpcode::G_ANYEXT:
+        case TargetOpcode::G_TRUNC:
+            return true;
+    default:
+         return I.isMoveReg() || I.isMoveImmediate() || I.isMetaInstruction() || isVectorConstant(I, TII);
+    }
+}
 
-                        InstrIterator next;
-                        const auto modCFG = doSplice(callee, *mbb_itr, itr, cachedMF, next);
-                        Changed = true;
+inline bool isImplicitDefinition(const MachineInstr & I, const TargetInstrInfo * const TII) {
+    switch (I.getOpcode()) {
+        case TargetOpcode::IMPLICIT_DEF:
+        case TargetOpcode::G_CONSTANT:
+        case TargetOpcode::G_FCONSTANT:
+        case TargetOpcode::G_IMPLICIT_DEF:
+            return true;
+    default:
+        return I.isMoveImmediate() || isVectorConstant(I, TII);
+    }
+}
 
-//                        if (Changed) {
-//                            MRI.invalidateLiveness();
-//                            auto & prop = MF.getProperties();
-//                            prop.reset(MachineFunctionProperties::Property::TracksLiveness);
-//                            if (auto * LV = getAnalysisIfAvailable<LiveVariables>()) {
-//                                LV->releaseMemory();
-//                            }
-//                            if (auto * LIS = getAnalysisIfAvailable<LiveIntervals>()) {
-//                                LIS->releaseMemory();
-//                            }
-//                        }
+inline const TargetRegisterClass * findSmallestCommonRegSuperclass(const TargetRegisterInfo * const TRI,
+                                                                   const TargetRegisterClass * A, const TargetRegisterClass * B,
+                                                                   unsigned & indexA, unsigned & indexB) {
+    const auto n = TRI->getNumSubRegIndices();
+    const TargetRegisterClass * smallestRC = nullptr;
+    unsigned rw = std::numeric_limits<unsigned>::max();
+    for (unsigned i = 1; i != n; ++i) {
+        for (unsigned j = 1; j != n; ++j) {
+            unsigned preA = 0, preB = 0;
+            auto rc = TRI->getCommonSuperRegClass(A, i, B, j, preA, preB);
+            if (rc) {
+                const auto w = TRI->getRegSizeInBits(*rc);
+                if (w < rw) {
+                    smallestRC = rc;
+                    rw = w;
+                    indexA = i;
+                    indexB = j;
+                }
 
-                        #ifndef NDEBUG
-                        MF.verify(nullptr, "Function Snippet Replacement error", true);
-                        #endif
+            }
+        }
+    }
+    return smallestRC;
+}
 
-                        if (modCFG) {
-                            itr = next;
-                            mbb_itr = next->getParent()->getIterator();
-                            mbb_end = MF.end();
-                            ModifiedCFG = true;
-                            goto restart_after_callsite;
+inline bool isBefore(const InstrIterator A, const InstrIterator B) {
+    if (A == B) {
+        return false;
+    }
+    auto * const MBBA = A->getParent();
+    auto * const MBBB = B->getParent();
+    if (LLVM_LIKELY(MBBA == MBBB)) {
+        const auto end = MBBA->instr_end();
+        for (auto a = A, b = B;;) {
+            if (a == B || b == end) return true;
+            if (b == A || a == end) return false;
+            ++a; ++b;
+        }
+    } else {
+        assert (false);
+        return false;
+    }
+}
+
+bool FunctionSnippetTokenReplacerPass::checkForFencedCodeFragment(Module * M,
+                                                                  MachineFunction & MF,
+                                                                  BasicBlockIterator & MBBIterator,
+                                                                  InstrIterator & startIterator,
+                                                                  CodeFragmentMap & codeFragments,
+                                                                  GlobalSet & discoveredGlobals) const {
+
+
+    auto end = (*MBBIterator)->instr_end();
+
+    MachineRegisterInfo & MRI = MF.getRegInfo();
+    auto & ST = MF.getSubtarget();
+    const TargetRegisterInfo * const TRI = ST.getRegisterInfo();
+    const TargetInstrInfo * const TII = ST.getInstrInfo();
+
+    assert (isMemFence(*startIterator));
+
+    auto nextItr = std::next(startIterator);
+
+    const Function * F = nullptr;
+
+    for (; nextItr != end; ++nextItr) {
+        assert (nextItr->getParent() == *MBBIterator);
+        MachineInstr & I = *nextItr;
+        if (LLVM_UNLIKELY(I.isCall())) {
+            F = getCalleeFunction(M, MF, I);
+            if (F) {
+                MDNode * md = F->getMetadata(SNIPPET_METADATA_LABEL);
+                if (md) {
+                    const auto gv = getAnchorCode(md);
+                    if (LLVM_LIKELY(gv == CFAnchorCode::ANCHOR_START)) {
+                        goto found_start_anchor;
+                    }
+                }
+            }
+            return false;
+        } /*else if (isNonComputeRegisterAssign(I, TII)) {
+            continue;
+        }
+        return false;*/
+    }
+    return false;
+
+found_start_anchor:
+
+    CodeFragment CF;
+    CF.FullyResolved = true;
+    CF.BasicBlocks.emplace_back(*MBBIterator);
+
+    BasicBlockIterator mbbItr = MBBIterator;
+
+    RegisterVector LiveIn;
+    RegisterVector LiveOut;
+
+    // Parse the input callsite
+    getCallsiteVirtualRegisters(MF, nextItr, LiveIn, LiveOut, discoveredGlobals);
+    assert (nextItr->getParent() == *mbbItr);
+    rerouteLiveSets(TRI, MRI, TII, nextItr, LiveIn, LiveOut);
+    assert (startIterator->getParent());
+    assert (isMemFence(*startIterator));
+    startIterator->eraseFromParent();
+    assert (nextItr->getParent() == *mbbItr);
+    assert (LiveIn.size() == LiveOut.size());
+
+    CF.Begin = nextItr;
+    CF.LiveIn.assign(LiveOut.begin(), LiveOut.end());
+    LiveIn.clear();
+    LiveOut.clear();
+
+    for (; nextItr != end; ) {
+        assert (nextItr->getParent() == *mbbItr);
+        MachineInstr & I = *nextItr;
+        if (LLVM_UNLIKELY(I.isCall())) {
+            const Function * const F = getCalleeFunction(M, MF, I);
+            if (F) {
+                MDNode * md = F->getMetadata(SNIPPET_METADATA_LABEL);
+                if (md) {
+                    const auto gv = getAnchorCode(md);
+                    if (LLVM_LIKELY(gv == CFAnchorCode::ANCHOR_END)) {
+                        goto found_end_anchor;
+                    } else { assert (gv == CFAnchorCode::ANCHOR_CALL);
+                        if (subsituteCodeFragment(F, MF, mbbItr, nextItr, codeFragments, discoveredGlobals)) {
+                            continue;
                         } else {
-                            itr = next;
+                            CF.FullyResolved = false;
                         }
-                        continue;
                     }
                 }
-                ++itr;
             }
-            ++mbb_itr;
+        } else if (LLVM_UNLIKELY(isMemFence(I))) {
+            if (checkForFencedCodeFragment(M, MF, mbbItr, nextItr, codeFragments, discoveredGlobals)) {
+                end = (*mbbItr)->instr_end();
+                continue;
+            }
         }
 
+        if (I.isBranch()) {
+            ++mbbItr;
+            // If we have nested fragments, they won't exist in the MBBIterator traversal.
+            CF.BasicBlocks.emplace_back(*mbbItr);
+            nextItr = (*mbbItr)->instr_begin();
+            end = (*mbbItr)->instr_end();
+        } else {
+            ++nextItr;
+        }
+    }
+    llvm::report_fatal_error("Error attempting to parse code fragment in " + MF.getName() + ": could not find end anchor.");
+
+found_end_anchor:
+
+    assert (nextItr->getParent() == *mbbItr);
+    getCallsiteVirtualRegisters(MF, nextItr, LiveIn, LiveOut, discoveredGlobals);
+    assert (nextItr->getParent() == *mbbItr);
+    rerouteLiveSets(TRI, MRI, TII, nextItr, LiveIn, LiveOut);
+    CF.End = std::prev(nextItr);
+
+    BEGIN_SCOPED_REGION
+
+    DenseSet<Register, DenseMapInfo<Register>> observedDefs;
+    DenseMap<Register, Register, DenseMapInfo<Register>> internallyRemapped;
+
+    for (auto & liveIn : CF.LiveIn) {
+        internallyRemapped.insert(std::make_pair(liveIn, liveIn));
     }
 
-    if (F.getMetadata(FUNCTION_SNIPPET_METADATA_LABEL)) {
+    const auto & MBBs = CF.BasicBlocks;
+    const auto n = MBBs.size();
+    assert (n > 0);
 
-        errs() << " -- adding snippet from " << MF.getName() << "\n";
+    for (size_t i = 0; i < n; ++i) {
+        InstrIterator start;
+        if (LLVM_LIKELY(i == 0)) {
+            start = CF.Begin;
+        } else {
+            start = MBBs[i]->instr_begin();
+        }
+        InstrIterator end;
+        if (LLVM_LIKELY(i == (n - 1))) {
+            end = nextItr;
+        } else {
+            end = MBBs[i]->instr_end();
+        }
 
-        assert (F.getCallingConv() == CallingConv::Fast);
+        for (auto itr = start; itr != end; ++itr) {
+            MachineInstr & I = *itr;
+            for (auto & op : I.operands()) {
+                if (op.isReg()) {
+                    const auto reg = op.getReg();
+                    if (reg.isVirtual()) {
+                        if (op.isDef()) {
+                            observedDefs.insert(reg);
+                        } else if (LLVM_UNLIKELY(observedDefs.count(reg) == 0))  {
+                            auto f = internallyRemapped.find(reg);
+                            if (f != internallyRemapped.end()) {
+                                op.setReg(f->getSecond());
+                            } else {
+                                MachineInstr * const regDef = MRI.getVRegDef(reg);
+                                if (LLVM_LIKELY(isVectorConstant(*regDef, TII))) {
+                                    Register newConstant = MRI.createVirtualRegister(MRI.getRegClass(reg));
+                                    MachineInstr * const  newConstantDef = MF.CloneMachineInstr(regDef);
+                                    newConstantDef->getOperand(0).setReg(newConstant);
+                                    CF.Begin = MBBs[0]->insert(CF.Begin, newConstantDef);
+                                    op.setReg(newConstant);
+                                    internallyRemapped.insert(std::make_pair(reg, newConstant));
+                                    observedDefs.insert(newConstant);
+                                } else {
+                                   llvm_unreachable("Non-trivial CSE value injection?");
+                                }
+                            }
+                        }
 
-        serializeToCache(F, MF, MMI);
-
-        errs() << " -- added snippet from " << MF.getName() << "\n";
-
+                    }
+                }
+            }
+        }
     }
 
-    if (Changed) {
-        auto & props = MF.getProperties();
-        props.set(MachineFunctionProperties::Property::IsSSA);
-        props.reset(MachineFunctionProperties::Property::TracksLiveness);
-        MRI.invalidateLiveness();
+    CF.VRegDefs.assign(observedDefs.begin(), observedDefs.end());
+
+    END_SCOPED_REGION
+
+    for (; nextItr != end; ) {
+        MachineInstr & I = *nextItr;
+        if (isMemFence(I)) {
+
+            I.eraseFromParent();
+            assert (LiveIn.size() == LiveOut.size());
+            CF.LiveOut.assign(LiveIn.begin(), LiveIn.end());
+            LiveIn.clear();
+            LiveOut.clear();
+
+            // NOTE: mbbItr wasn't changed in the prior loop. it still points to the last MBB traversed of
+            // the original CFG.
+            startIterator = CF.End;
+            MBBIterator = mbbItr;
+
+            auto nm = F->getName();
+            constexpr size_t SNIPPET_INPUT_SUFFIX_LENGTH = SNIPPET_INPUT_SUFFIX.size();
+            const Function * calleeFunc = M->getFunction(nm.substr(0, nm.size() - SNIPPET_INPUT_SUFFIX_LENGTH));
+            assert (calleeFunc);
+
+        //    errs() << "Parsed code fragment " << calleeFunc->getName() << " in " << MF.getFunction().getName() << "\n";
+
+            codeFragments.insert(std::make_pair(calleeFunc, std::move(CF)));
+            return true;
+        }
+        ++nextItr;
     }
 
-    #ifndef NDEBUG
-    MF.verify(nullptr, "Function Snippet Replacement error", true);
-    #endif
-    return Changed;
+    llvm::report_fatal_error("Error attempting to parse code fragment in " + MF.getName() + ": could not find closing memfence.");
+}
+
+bool FunctionSnippetTokenReplacerPass::subsituteCodeFragment(const Function * F,
+                                                             MachineFunction & MF,
+                                                             BasicBlockIterator & MBBIterator,
+                                                             InstrIterator & instrIterator,
+                                                             const CodeFragmentMap & codeFragments,
+                                                             GlobalSet & discoveredGlobals) const {
+    const auto f = codeFragments.find(F);
+    if (LLVM_UNLIKELY(f == codeFragments.end())) {
+        // If this happens, we've visited a callsite before parsing the actual code fragment snippet.
+        // The only thing we can do is defer resolution but because it's possible to have nested code
+        // fragment subsitutions, this can impact the outer subsitution too.
+        return false;
+    }
+    const CodeFragment & CF = f->second;
+    if (LLVM_UNLIKELY(!CF.FullyResolved)) {
+        // We have visited the code fragment but within the fragment is a callsite that we have either
+        // not visited the fragment for or it too had an unresolved callsite. Until we've resolved all
+        // the internal callsites, there is no point in subsituting this fragment for the callsite.
+        return false;
+    }
+
+    MachineRegisterInfo & MRI = MF.getRegInfo();
+    auto & ST = MF.getSubtarget();
+    const TargetRegisterInfo * const TRI = ST.getRegisterInfo();
+    const TargetInstrInfo * const TII = ST.getInstrInfo();
+
+    DenseMap<Register, Register, DenseMapInfo<Register>> RegMap;
+
+    DenseMap<MachineBasicBlock *, MachineBasicBlock *, DenseMapInfo<MachineBasicBlock *>> MBBMap;
+
+    auto getRegister = [&](Register calleeReg) -> Register {
+        assert (calleeReg.isVirtual());
+        assert (calleeReg.isValid());
+        auto f = RegMap.find(calleeReg);
+        assert (f != RegMap.end());
+        return f->second;
+    };
+
+    auto getBasicBlock = [&](const MachineBasicBlock * bb) -> MachineBasicBlock * {
+        auto f = MBBMap.find(bb);
+        assert (f != MBBMap.end());
+        return f->second;
+    };
+
+    RegisterVector LiveIn;
+    RegisterVector LiveOut;
+
+    getCallsiteVirtualRegisters(MF, instrIterator, LiveIn, LiveOut, discoveredGlobals);
+
+    const auto n = CF.LiveIn.size();
+
+    // TODO: this isn't quite what I want. I need a different reroute function that only
+    // creates a new virtual register if a copy is needed to convert classes.
+    RegisterVector mappedLiveIns(n);
+
+    for (size_t i = 0; i < n; ++i) {
+        const auto c = MRI.getRegClass(CF.LiveIn[i]);
+        Register newReg = MRI.createVirtualRegister(c);
+        mappedLiveIns[i] = newReg;
+    }
+
+    rerouteLiveSets(TRI, MRI, TII, instrIterator, LiveIn, mappedLiveIns);
+
+    for (size_t i = 0; i < n; ++i) {
+        RegMap.insert(std::make_pair(CF.LiveIn[i], mappedLiveIns[i]));
+    }
+
+    for (auto vreg : CF.VRegDefs) {
+        const auto c = MRI.getRegClass(vreg);
+        Register newReg = MRI.createVirtualRegister(c);
+        assert (RegMap.count(vreg) == 0);
+        RegMap.insert(std::make_pair(vreg, newReg));
+    }
+
+    const auto & BB = CF.BasicBlocks;
+    assert (BB.size() > 0);
+    MBBMap.insert(std::make_pair(BB[0], *MBBIterator));
+
+    auto currentInsertPoint = instrIterator;
+
+    if (LLVM_UNLIKELY(BB.size() != 1)) {
+
+        const auto n = BB.size();
+        auto ip = std::next((*MBBIterator)->getIterator());
+
+        for (unsigned i = 1; i < n; ++i) {
+            MachineBasicBlock * newBB = MF.CreateMachineBasicBlock();
+            MBBMap.insert(std::make_pair(BB[i], newBB));
+            MF.insert(ip, newBB);
+        }
+
+        auto & MBPI = getAnalysis<MachineBranchProbabilityInfo>();
+
+        for (unsigned i = 0; i < (n - 1); ++i) {
+            MachineBasicBlock * cur = getBasicBlock(BB[i]);
+            for (const auto & s : BB[i]->successors()) {
+                MachineBasicBlock * const newSucc = getBasicBlock(s);
+                auto prob = MBPI.getEdgeProbability(BB[i], s);
+                cur->addSuccessor(newSucc, prob);
+            }
+        }
+    }
+
+    assert (CF.Begin->getParent());
+    auto nextItr = CF.Begin->getIterator();
+    auto currentMBB = MBBIterator;
+
+    for (;;) {
+        const MachineInstr & I = *nextItr;
+        MachineInstr * cloned = MF.CloneMachineInstr(&I);
+        const auto m = I.getNumOperands();
+        for (size_t i = 0; i < m; ++i) {
+            const auto & MO = I.getOperand(i);
+            auto & MC = cloned->getOperand(i);
+            if (MO.isReg()) {
+                const auto reg = MO.getReg();
+                if (reg.isVirtual()) {
+                    MC.setReg(getRegister(reg));
+                }
+            } else if (MO.isMBB()) {
+                MC.setMBB(getBasicBlock(MO.getMBB()));
+            }
+        }
+
+        (*currentMBB)->insert(currentInsertPoint, cloned);
+
+        if (LLVM_UNLIKELY(cloned->isBranch())) {
+            auto CBB = *(++currentMBB);
+            nextItr = CBB->instr_begin();
+            currentInsertPoint = getBasicBlock(CBB)->instr_end();
+        }
+        if (nextItr == CF.End) {
+            break;
+        }
+        ++nextItr;
+    }
+
+
+    const auto m = CF.LiveOut.size();
+
+    RegisterVector mappedLiveOuts(m);
+    for (size_t i = 0; i < m; ++i) {
+        mappedLiveOuts[i] = getRegister(CF.LiveOut[i]);
+    }
+
+    rerouteLiveSets(TRI, MRI, TII, currentInsertPoint, mappedLiveOuts, LiveOut);
+
+    if (LLVM_UNLIKELY(BB.size() != 1)) {
+        (*MBBIterator)->splice(currentInsertPoint, (*currentMBB), instrIterator);
+    }
+
+
+
+    MBBIterator = currentMBB;
+    instrIterator = currentInsertPoint;
+
+
+    return true;
+}
+
+void FunctionSnippetTokenReplacerPass::getCallsiteVirtualRegisters(MachineFunction & MF,
+                                                                   InstrIterator & callsite,
+                                                                   RegisterVector & uses,
+                                                                   RegisterVector & defs,
+                                                                   GlobalSet & discoveredGlobals) {
+
+    MachineRegisterInfo & MRI = MF.getRegInfo();
+    auto & ST = MF.getSubtarget();
+    const TargetRegisterInfo * const TRI = ST.getRegisterInfo();
+    const TargetInstrInfo * const TII = ST.getInstrInfo();
+
+    // adjcallstackdown
+    // copy virtual to physical
+    // callsite
+    // adjcallstackup
+    // copy physical to virtual
+
+    assert (uses.empty());
+    assert (defs.empty());
+
+    Register addrVReg;
+
+//    const uint32_t * clobberMask = nullptr;
+
+    for (auto & op : callsite->operands()) {
+        if (op.isGlobal()) {
+            discoveredGlobals.insert(op.getGlobal());
+        } else if (op.isReg()) {
+            auto reg = op.getReg();
+            assert (reg.isValid());
+            if (op.isImplicit()) {
+                assert (reg.isPhysical());
+                if (MRI.isAllocatable(reg.asMCReg())) {
+                    if (op.isDef()) {
+                        defs.emplace_back(reg);
+                    } else {
+                        uses.emplace_back(reg);
+                    }
+                }
+            } else if (op.isUse() && reg.isVirtual()) {
+                addrVReg = reg;
+            }
+//        } else if (op.isRegMask()) {
+//            clobberMask = op.getRegMask();
+        }
+    }
+
+    assert (defs.size() <= uses.size());
+
+    DenseMap<MCPhysReg, Register, DenseMapInfo<MCPhysReg>> PhyRegMap;
+
+    using StackArgTy = std::pair<int64_t, Register>;
+
+    SmallVector<StackArgTy, 16> StackArgs;
+
+    const auto StackDown = TII->getCallFrameSetupOpcode();
+
+    auto remainingUses = uses.size() + 1;
+
+    // Get all input arguments
+    for (auto itr = std::next(callsite->getReverseIterator());;) {
+        assert (itr != itr->getParent()->instr_rend());
+
+        auto & I = *itr++;
+
+        if (I.isCopy()) {
+
+            const MachineOperand & dst = I.getOperand(0);
+            auto dstReg = dst.getReg();
+            if (dstReg.isPhysical()) {
+                auto srcReg = I.getOperand(1).getReg();
+                I.eraseFromParent();
+                PhyRegMap.insert(std::make_pair(dstReg.asMCReg(), srcReg));
+                if (LLVM_LIKELY(srcReg.isVirtual())) {
+                    if (--remainingUses == 0) {
+                        break;
+                    }
+                }
+            }
+        } else if (I.mayStore() && I.hasOneMemOperand()) {
+            int64_t offset;
+            const MachineOperand * destAddrOp = nullptr;
+            bool scalable;
+            if (TII->getMemOperandWithOffset(I, destAddrOp, offset, scalable, TRI)) {
+                for (auto & MO : I.operands()) {
+                    if (MO.isReg() && MO.isUse()) {
+                        assert (&MO != destAddrOp);
+                        auto reg = MO.getReg();
+                        if (LLVM_LIKELY(reg.isVirtual())) {
+                            I.eraseFromParent();
+                            StackArgs.emplace_back(offset, reg);
+                            if (--remainingUses == 0) {
+                                goto done_input_scan;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (I.getOpcode() == StackDown) {
+            I.eraseFromParent();
+            if (--remainingUses == 0) {
+                break;
+            }
+        }
+    }
+done_input_scan:
+    auto resolveRegisters = [&](auto & V) {
+        assert (V.size() > 0);
+        const auto n = StackArgs.size();
+        assert (n <= V.size());
+        const auto m = V.size() - n;
+        for (size_t i = 0; i < m; ++i) {
+            auto & Vi = V[i];
+            for (;;) {
+                if (Vi.isVirtual()) {
+                    break;
+                }
+                auto f = PhyRegMap.find(Vi.asMCReg());
+                if (LLVM_LIKELY(f != PhyRegMap.end())) {
+                    Vi = f->second;
+                } else {
+                    for (const auto & pair : PhyRegMap) {
+                        if (TRI->regsOverlap(Vi, pair.first)) {
+                            Vi = pair.second;
+                            break;
+                        }
+                    }
+                }
+            }
+            assert (Vi.isVirtual());
+            assert (&V[i] == &Vi);
+        }
+        if (LLVM_UNLIKELY(StackArgs.size() > 0)) {
+            std::sort(StackArgs.begin(), StackArgs.end(), [](const StackArgTy & a, const StackArgTy & b){
+                return a.first < b.first;
+            });
+            for (size_t i = 0; i < n; ++i) {
+                assert (StackArgs[i].second.isVirtual());
+                V[m + i] = StackArgs[i].second;
+            }
+            StackArgs.clear();
+        }
+    };
+
+    resolveRegisters(uses);
+
+    PhyRegMap.clear();
+
+    const auto StackUp = TII->getCallFrameDestroyOpcode();
+
+    auto remainingDefs = defs.size() + 1;
+
+    InstrIterator nextItr = std::next(callsite);
+    for (;;) {
+        assert (nextItr != callsite->getParent()->end());
+        auto & I = *nextItr++;
+
+        if (I.isCopy()) {
+            const MachineOperand & src = I.getOperand(1);
+            auto srcReg = src.getReg();
+            if (srcReg.isPhysical()) {
+                auto defReg = I.getOperand(0).getReg();
+                I.eraseFromParent();
+                PhyRegMap.insert(std::make_pair(srcReg.asMCReg(), defReg));
+                if (LLVM_LIKELY(defReg.isVirtual())) {
+                    if (--remainingDefs == 0) {
+                        break;
+                    }
+                }
+            }
+        } else if (I.mayLoad() && I.hasOneMemOperand()) {
+            int64_t offset;
+            const MachineOperand * destAddrOp = nullptr;
+            bool scalable;
+            if (TII->getMemOperandWithOffset(I, destAddrOp, offset, scalable, TRI)) {
+                for (auto & MO : I.operands()) {
+                    if (MO.isReg() && MO.isDef()) {
+                        assert (&MO != destAddrOp);
+                        auto reg = MO.getReg();
+                        if (LLVM_LIKELY(reg.isVirtual())) {
+                            I.eraseFromParent();
+                            StackArgs.emplace_back(offset, reg);
+                            if (--remainingDefs == 0) {
+                                goto done_retval_scan;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if (I.getOpcode() == StackUp) {
+            I.eraseFromParent();
+            if (--remainingDefs == 0) {
+                break;
+            }
+        }
+    }
+done_retval_scan:
+    resolveRegisters(defs);
+
+
+    assert (callsite->getParent());
+    assert (nextItr->getParent() == callsite->getParent());
+//    if (clobberMask) {
+//        auto & MBB = *callsite->getParent();
+//        BuildMI(MBB, callsite, DebugLoc{}, TII->get(TargetOpcode::KILL)).addRegMask(clobberMask);
+//    }
+    callsite->eraseFromParent();
+    if (addrVReg.isValid() && MRI.use_empty(addrVReg)) {
+        MachineInstr * const addrDef = MRI.getUniqueVRegDef(addrVReg); assert (addrDef);
+        addrDef->eraseFromParent();
+    }
+    assert (nextItr->getParent());
+    callsite = nextItr;
+
+}
+
+void replaceWithOrCopyReg(const TargetRegisterInfo * const TRI, MachineRegisterInfo & MRI, const TargetInstrInfo * const TII,
+                          InstrIterator ip,
+                          const Register & src, Register & dst) {
+
+
+    auto srcRC = MRI.getRegClass(src); assert (srcRC);
+    auto dstRC = MRI.getRegClass(dst); assert (dstRC);
+
+    assert (MRI.getVRegDef(dst) == nullptr);
+    assert (MRI.getVRegDef(src));
+    auto & MBB = *ip->getParent();
+    if (srcRC == dstRC) {
+        MRI.replaceRegWith(dst, src);
+        dst = src;
+    } else {
+        const TargetRegisterClass * const subRC = TRI->getCommonSubClass(srcRC, dstRC);
+        if (srcRC == subRC || dstRC == subRC) {
+            BuildMI(MBB, ip, DebugLoc{}, TII->get(TargetOpcode::COPY), dst).addReg(src);
+        } else {
+            unsigned srcIndex = 0;
+            unsigned dstIndex = 0;
+            const TargetRegisterClass * const superRC = findSmallestCommonRegSuperclass(TRI, srcRC, dstRC, srcIndex, dstIndex);
+            assert ("Cannot occur if there was a valid physical register intermediary. Check this carefully!" && superRC);
+            if (superRC == dstRC) {
+                // widen
+                BuildMI(MBB, ip, DebugLoc{}, TII->get(TargetOpcode::COPY)).addReg(dst, RegState::Define, srcIndex).addReg(src);
+            } else if (superRC == srcRC) {
+                // narrow
+                BuildMI(MBB, ip, DebugLoc{}, TII->get(TargetOpcode::COPY), dst).addReg(src, 0, dstIndex);
+            } else {
+                auto bridge = MRI.createVirtualRegister(superRC);
+                BuildMI(MBB, ip, DebugLoc{}, TII->get(TargetOpcode::COPY)).addReg(bridge, RegState::Define, srcIndex).addReg(src);
+                BuildMI(MBB, ip, DebugLoc{}, TII->get(TargetOpcode::COPY), dst).addReg(bridge, 0, dstIndex);
+            }
+        }
+    }
+
+}
+
+template <typename SrcArrayType, typename DstArrayType>
+inline void FunctionSnippetTokenReplacerPass::rerouteLiveSets(const TargetRegisterInfo * const TRI, MachineRegisterInfo & MRI, const TargetInstrInfo * const TII,
+                                                              InstrIterator ip,
+                                                              const SrcArrayType & srcArray, DstArrayType & dstArray) {
+
+    assert (srcArray.size() == dstArray.size());
+    const auto n = srcArray.size();
+    for (size_t i = 0; i < n; ++i) {
+        replaceWithOrCopyReg(TRI, MRI, TII, ip, srcArray[i], dstArray[i]);
+    }
 }
 
 const Function * FunctionSnippetTokenReplacerPass::getCalleeFunction(Module * M, MachineFunction & MF, MachineInstr & call) const {
@@ -629,441 +1099,7 @@ const Function * FunctionSnippetTokenReplacerPass::getCalleeFunction(Module * M,
         }
     }
 
-
     return nullptr;
-}
-
-using ExpectedRegSet = SmallPtrSet<MCRegister, 16>;
-
-bool inline isRegAssignment(const MachineInstr & MI) {
-    if (MI.isCopyLike() || MI.isMoveReg()) {
-        return true;
-    }
-    const auto opc = MI.getOpcode();
-    if (llvm::isPreISelGenericOpcode(opc) || llvm::isPreISelGenericOptimizationHint(opc)) {
-        if (MI.getNumOperands() == 2) {
-            const MachineOperand & dst = MI.getOperand(0);
-            const MachineOperand & src = MI.getOperand(1);
-            return (dst.isReg() && src.isReg() && dst.isDef() && src.isUse());
-        }
-    }
-    return false;
-}
-
-void FunctionSnippetTokenReplacerPass::getInputArgumentMapping(const MachineFunction & MF,
-                                                               MachineBasicBlock & MBB, MachineBasicBlock::instr_iterator callsite,
-                                                               const CachedMachineFunction & cache,
-                                                               RegisterMap & globalMap) {
-    assert (callsite->getParent() == &MBB);
-    if (LLVM_UNLIKELY(cache.LiveIns.empty())) {
-        return;
-    }
-
-    const TargetRegisterInfo * const CallerTRI = MF.getSubtarget().getRegisterInfo();
-
-    const auto expectedCount = globalMap.size() + cache.LiveIns.size();
-
-    auto itr = std::next(callsite->getReverseIterator());
-find_next:
-    for (;;) {
-        assert (itr != MBB.rend());
-        MachineInstr & MI = *itr++;
-        if (isRegAssignment(MI)) {
-            const MachineOperand & dst = MI.getOperand(0);
-            auto dstReg = dst.getReg();
-            if (dstReg.isPhysical()) {
-                MCRegAliasIterator alias(dstReg.asMCReg(), CallerTRI, true);
-                for (; alias.isValid(); ++alias) {
-                    for (const auto & liveIn : cache.LiveIns) {
-                        MCRegister phyReg = liveIn.first;
-                        if (*alias == phyReg) {
-                            const MachineOperand & src = MI.getOperand(1);
-                            const auto callerVirtReg = src.getReg();
-                            if (callerVirtReg.isVirtual()) {
-                                auto calleeVirtReg = liveIn.second; assert (calleeVirtReg.isVirtual());
-                                errs() << "IN: "; MI.print(errs());
-                                assert (globalMap.count(calleeVirtReg) == 0);
-                                globalMap.insert(std::make_pair(calleeVirtReg, callerVirtReg));
-                                MI.eraseFromParent();
-                                if (globalMap.size() == expectedCount) {
-                                    return;
-                                }
-                                goto find_next;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-}
-
-void FunctionSnippetTokenReplacerPass::getOutputArgumentMapping(const MachineFunction & MF,
-                                                               MachineBasicBlock & MBB, MachineBasicBlock::instr_iterator callsite,
-                                                               const CachedMachineFunction & cache,
-                                                               RegisterMap & callerRetMap) {
-    assert (callerRetMap.empty());
-    assert (callsite->getParent() == &MBB);
-    if (LLVM_UNLIKELY(cache.LiveOuts.empty())) {
-        return;
-    }
-
-    const TargetRegisterInfo * const CallerTRI = MF.getSubtarget().getRegisterInfo();
-
-    MachineBasicBlock::instr_iterator itr = std::next(callsite);
-find_next:
-    while (itr != MBB.end()) {
-        auto & MI = *itr++;
-        if (isRegAssignment(MI)) {
-            auto MO = MI.getOperand(1);
-            if (LLVM_LIKELY(MO.isReg())) {
-                const auto reg = MO.getReg();
-                if (reg.isPhysical()) {
-                    MCRegAliasIterator alias(reg.asMCReg(), CallerTRI, true);
-                    for (; alias.isValid(); ++alias) {
-                        for (const auto & liveOut : cache.LiveOuts) {
-                            MCRegister phyReg = liveOut.first;
-                            if (phyReg == *alias) {
-                                auto callerVirtReg = MI.getOperand(0).getReg();
-                                const auto calleeVirtReg = liveOut.second; assert (calleeVirtReg.isVirtual());
-                                errs() << "OUT: "; MI.print(errs());
-                                assert (callerRetMap.count(calleeVirtReg) == 0);
-                                callerRetMap.insert(std::make_pair(calleeVirtReg, callerVirtReg));
-                                MI.eraseFromParent();
-                                if (callerRetMap.size() == cache.LiveOuts.size()) {
-                                    return;
-                                }
-                                goto find_next;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-}
-
-inline size_t getABIReturnRegisterCount(const MachineFunction & MF, const TargetLowering * TLI, Type * const RetTy) {
-
-    if (RetTy == nullptr || RetTy->isVoidTy()) {
-        return 0;
-    }
-
-    const DataLayout & DL = MF.getDataLayout();
-
-    SmallVector<EVT, 4> RetTys;
-    ComputeValueVTs(*TLI, DL, RetTy, RetTys);
-
-    auto & C = RetTy->getContext();
-
-    size_t numRegisters = 0;
-    for (auto & EVT : RetTys) {
-        numRegisters += TLI->getNumRegistersForCallingConv(C, CallingConv::Fast, EVT);
-    }
-    return numRegisters;
-}
-
-
-inline void FunctionSnippetTokenReplacerPass::serializeToCache(Function &F, MachineFunction &MF, MachineModuleInfo & MMI) {
-
-    assert (F.getCallingConv() == CallingConv::Fast);
-
-
-    const MachineRegisterInfo & MRI = MF.getRegInfo();
-
-    const TargetSubtargetInfo & TSI = MF.getSubtarget();
-
-    const TargetInstrInfo * const TII = TSI.getInstrInfo();
-
-    const TargetLowering * TLI = MF.getSubtarget().getTargetLowering();
-
-    const TargetRegisterInfo * TRI = TSI.getRegisterInfo();
-
-    errs() << "--------------------------------------------------------\n";
-    errs() << "CALLEE FUNCTION: " << MF.getName() << "\n";
-    errs() << "--------------------------------------------------------\n";
-    MF.print(errs());
-    errs() << "--------------------------------------------------------\n";
-
-
-    auto & MBPI = getAnalysis<MachineBranchProbabilityInfo>();
-
-    CachedMachineFunction cache;
-
-    cache.MF = std::make_unique<MachineFunction>(F, MF.getTarget(), TSI, 0, MMI);
-
-    MachineRegisterInfo & newMRI = cache.MF->getRegInfo();
-
-    const auto numOfVirtRegs = MRI.getNumVirtRegs();
-    DenseMap<Register, Register, DenseMapInfo<Register>> RegisterMapping;
-    std::vector<Register> CreatedVirtualRegisters;
-
-//    cache.VRegClass.resize(numOfVirtRegs);
-//    for (size_t i = 0; i < numOfVirtRegs; ++i) {
-//        auto vreg = Register::index2VirtReg(i);
-//        auto c = MRI.getRegClass(vreg); assert (c);
-//        auto v = newMRI.createVirtualRegister(c);
-//        virtRegMap.insert(vreg, v);
-//    }
-
-    DenseSet<const MachineInstr *, DenseMapInfo<MachineInstr *>> skipped;
-
-    for (const auto & LI : MRI.liveins()) {
-        Register reg = LI.second; assert (reg.isVirtual());
-
-//        for (;;) {
-//            const MachineInstr * const def = MRI.getVRegDef(reg);
-//            skipped.insert(def);
-
-//            auto useItr = MRI.use_instr_begin(reg);
-//            if (std::next(useItr) != MRI.use_instr_end()) {
-//                break;
-//            }
-
-//            const MachineInstr & next = *useItr;
-//            if (!next.isCopyLike() && !next.isMoveReg()) {
-//               break;
-//            }
-
-//            reg = next.getOperand(1).getReg();
-//        }
-
-        const TargetRegisterClass * c = MRI.getRegClass(reg);
-        auto v = newMRI.createVirtualRegister(c);
-        cache.LiveIns.emplace_back(LI.first, v);
-        RegisterMapping.insert(std::make_pair(LI.first, v));
-        RegisterMapping.insert(std::make_pair(LI.second, v));
-        CreatedVirtualRegisters.push_back(v);
-
-    }
-
-    if (const MachineConstantPool * src = MF.getConstantPool()) {
-        MachineConstantPool * dst = cache.MF->getConstantPool();
-        for (const auto & entry : src->getConstants()) {
-            dst->getConstantPoolIndex(entry.Val.ConstVal, entry.getAlign());
-        }
-    }
-
-    DenseMap<const MachineBasicBlock *, size_t, DenseMapInfo<const MachineBasicBlock *>> ClonedMBB;
-
-
-
-    const auto n = MF.size();
-
-    cache.BasicBlock.resize(n);
-
-    BEGIN_SCOPED_REGION
-    auto MBBItr = MF.begin();
-    for (size_t i = 0; i < n; ++i, ++MBBItr) {
-        const MachineBasicBlock * bb = &*MBBItr;
-        ClonedMBB.insert(std::make_pair(bb, i));
-    }
-    END_SCOPED_REGION
-
-//    if (const MachineJumpTableInfo * src = MF.getJumpTableInfo()) {
-//        MachineJumpTableInfo * dst = cache.MF->getOrCreateJumpTableInfo(src->getEntryKind());
-//        std::vector<MachineBasicBlock *> targets;
-//        for (const auto & entry : src->getJumpTables()) {
-//            assert (targets.empty());
-//            for (const MachineBasicBlock * srcMBB : entry.MBBs) {
-//                const auto f = ClonedMBB.find(srcMBB);
-//                assert (f != ClonedMBB.end());
-//                targets.emplace_back(f->second);
-//            }
-//            dst->createJumpTableIndex(targets);
-//            targets.clear();
-//        }
-//    }
-
-//    cache.NumOfLiveOuts = getABIReturnRegisterCount(MF, TLI, F.getReturnType());
-
-    const auto frameSetup = TII->getCallFrameSetupOpcode();
-    const auto frameDestroy= TII->getCallFrameDestroyOpcode();
-
-    size_t numOfReturnInsts = 0;
-
-    auto MBBItr = MF.begin();
-    for (size_t i = 0; i < n; ++i) {
-        assert (MBBItr != MF.end());
-        const MachineBasicBlock & MBB = *MBBItr++;
-        auto & CBB = cache.BasicBlock[i];
-
-        CBB.Successors.reserve(MBB.succ_size());
-        for (auto * succ : MBB.successors()) {
-            auto prob = MBPI.getEdgeProbability(&MBB, succ);
-            const auto f = ClonedMBB.find(succ);
-            assert (f != ClonedMBB.end());
-            CBB.Successors.emplace_back(f->second, prob);
-        }
-
-        if (LLVM_LIKELY(MBB.isReturnBlock())) {
-
-            for (const MachineInstr & term : MBB.terminators()) {
-                if (term.isReturn()) {
-                    for (auto & mo : term.operands()) {
-                        if (mo.isReg() && mo.isUse()) {
-                            const auto reg = mo.getReg().asMCReg();
-                            auto itr = std::next(term.getReverseIterator());
-                            for (;;++itr) {
-                                assert (itr != MBB.rend());
-                                if (itr->isCopyLike() || itr->isMoveReg()) {
-                                    if (itr->getOperand(0).getReg() == reg) {
-                                        auto defVirtReg = itr->getOperand(1).getReg();
-                                        const auto * inst = &(*itr);
-                                        for (;;) {
-                                            skipped.insert(inst);
-                                            const auto * const next = MRI.getUniqueVRegDef(defVirtReg);
-                                            if (LLVM_LIKELY(!next || (!next->isCopyLike() && !next->isMoveReg()))) {
-                                                break;
-                                            }
-                                            defVirtReg = next->getOperand(1).getReg();
-                                            inst = next;
-                                        }
-                                        RegisterMapping.insert(std::make_pair(reg, defVirtReg));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-
-        const auto m = MBB.size();
-        auto MIItr = MBB.begin();
-        for (size_t j = 0; j < m; ++j) {
-            const auto & MI = *MIItr++;
-            if (MI.getOpcode() == frameSetup || MI.getOpcode() == frameDestroy || skipped.count(&MI)) {
-                continue;
-            }
-
-            if (MI.isReturn()) {
-                assert (cache.LiveOuts.empty());
-                for (auto & mo : MI.operands()) {
-                    if (mo.isReg() && mo.isUse() && !mo.isImplicit()) {
-                        auto reg = mo.getReg();
-                        assert (reg.isPhysical());
-                        auto f = RegisterMapping.find(reg);
-                        assert (f != RegisterMapping.end());
-                        const auto v = f->second;
-                        cache.LiveOuts.emplace_back(reg.asMCReg(), v);
-                    }
-                }
-
-                assert (getABIReturnRegisterCount(MF, TLI, F.getReturnType()) == cache.LiveOuts.size());
-                CBB.IsFunctionExit = true;
-                numOfReturnInsts++;
-            } else {
-
-                MachineInstr * const cloned = cache.MF->CloneMachineInstr(&MI);
-                if (!MI.memoperands_empty()) {
-                    cloned->setMemRefs(*cache.MF, MI.memoperands());
-                }
-                cloned->setDebugLoc(DebugLoc());
-
-                const auto l = cloned->getNumOperands();
-                for (size_t k = 0; k < l; ++k) {
-                    const auto & MO = MI.getOperand(k);
-                    auto & MC = cloned->getOperand(k);
-
-                    if (MO.isReg() && MO.isUse()) {
-                        const auto reg = MO.getReg();
-                        if (LLVM_LIKELY(reg.isValid())) {
-                            auto f = RegisterMapping.find(reg);
-                            assert (f != RegisterMapping.end());
-                            MC.setReg(f->second);
-                        }
-                    } else if (MO.isMBB()) {
-                        const auto f = ClonedMBB.find(MO.getMBB());
-                        assert (f != ClonedMBB.end());
-                        MC.ChangeToImmediate(f->second);
-                        CBB.MBBOperandSubsitutionList.emplace_back(j, k);
-                    }
-                }
-
-                for (size_t k = 0; k < l; ++k) {
-                    const auto & MO = MI.getOperand(k);
-                    auto & MC = cloned->getOperand(k);
-                    if (MO.isReg() && MO.isDef()) {
-                        auto reg = MO.getReg();
-                        if (LLVM_LIKELY(reg.isValid())) {
-                            if (reg.isVirtual()) {
-                                auto f = RegisterMapping.find(reg);
-                                if (LLVM_LIKELY(f == RegisterMapping.end())) {
-                                    const TargetRegisterClass * c = MRI.getRegClass(reg);
-                                    auto v = newMRI.createVirtualRegister(c);
-                                    RegisterMapping.insert(std::make_pair(reg, v));
-                                    CreatedVirtualRegisters.push_back(v);
-                                    MC.setReg(v);
-                                } else {
-                                    MC.setReg(f->second);
-                                }
-                            } else if (reg.isPhysical()) {
-                                MCRegister phyReg = reg.asMCReg();
-                                const TargetRegisterClass * c = MI.getRegClassConstraint(k, TII, TRI);
-                                if (LLVM_LIKELY(c)) goto found_phy_class;
-                                // If the above check fails, MI may be a polymorphic operation. Check the users to see
-                                // if we can infer what the class is.
-                                for (const MachineOperand & UO : MRI.use_operands(phyReg)) {
-                                    const MachineInstr * UI = UO.getParent();
-                                    if (LLVM_LIKELY(UI && UI->getParent() == MI.getParent())) {
-                                        for (unsigned opIdx = 0, m = UI->getNumOperands(); opIdx != m; ++ opIdx) {
-                                            const MachineOperand & Op = UI->getOperand(opIdx);
-                                            if (&Op == &UO) {
-                                                c = UI->getRegClassConstraint(opIdx, TII, TRI);
-                                                if (LLVM_LIKELY(c)) goto found_phy_class;
-                                            }
-                                        }
-                                    }
-                                }
-                                // If that fails but this is a register assignment, try to infer this operand's class
-                                // from the explicit use operand.
-                                if (MI.isCopyLike() || MI.isMoveReg()) {
-                                    for (size_t defIdx = 0; defIdx < l; ++defIdx) {
-                                        const MachineOperand & DO = MI.getOperand(defIdx);
-                                        if (DO.isReg() && DO.isUse() && !DO.isImplicit()) {
-                                            auto & DC = cloned->getOperand(defIdx);
-                                            c = newMRI.getRegClass(DC.getReg());
-                                            if (LLVM_LIKELY(c)) goto found_phy_class;
-                                        }
-                                    }
-                                }
-                                // If all the checks fail, this must be implicit status flag and anything large enough
-                                // will work. The actual value won't be in the compiled code.
-                                assert (MO.isImplicit());
-                                c = TRI->getMinimalPhysRegClass(phyReg, MVT::Other); assert (c);
-                            found_phy_class:
-                                if (LLVM_LIKELY(c->isAllocatable())) {
-                                    auto v = newMRI.createVirtualRegister(c);
-                                    RegisterMapping[reg] = v;
-                                    CreatedVirtualRegisters.push_back(v);
-                                    MC.setReg(v);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                CBB.Instructions.push_back(cloned);
-            }
-        }
-    }
-
-    assert (MBBItr == MF.end());
-
-    assert (numOfReturnInsts == 1);
-
-    for (const auto & v : CreatedVirtualRegisters) {
-        const TargetRegisterClass * c = newMRI.getRegClass(v); assert (c);
-        cache.RegClassMap.insert(std::make_pair(v, c));
-    }
-
-    Cache.insert(std::make_pair(&F, std::move(cache)));
-
 }
 
 void FunctionSnippetTokenReplacerPass::getAnalysisUsage(AnalysisUsage & AU) const {
@@ -1075,146 +1111,195 @@ void FunctionSnippetTokenReplacerPass::getAnalysisUsage(AnalysisUsage & AU) cons
 Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef name, ArrayRef<Value *> params,
                             std::function<Value *(ArrayRef<Value *>)> functionGenerator) {
 
+
+
     const auto mode = getFunctionSnippetMode();
     if (mode == FunctionSnippetMode::Direct) {
         return functionGenerator(params);
     }
 
-    Module * const m = b.getModule();
+    Module * const Mod = b.getModule();
 
-    SmallVector<char, 128> tmp;
+    SmallVector<char, 256> tmp;
     raw_svector_ostream nm(tmp);
     nm << SNIPPET_PREFIX << name;
 
-    const auto n = params.size();
-    std::vector<Type *> paramTys(n);
-    for (size_t i = 0; i < n; ++i) {
-        paramTys[i] = params[i]->getType();
-    }
+    // TODO: CallFunctionByToken should be placed into IDISA_Builder itself.
 
+    // TODO: it isn't enough to check if its in the module. We need a user in the current function that Builder b is pointed to.
 
+    CallInst * calleeRetVal = nullptr;
 
-    FunctionType * const funcTy = FunctionType::get(retTy, paramTys, false);
-
-    Function * snippetFunction = m->getFunction(nm.str());
+    Function * snippetFunction = Mod->getFunction(nm.str());
     if (snippetFunction == nullptr) {
 
-        Function * const callerFunction = b.GetInsertPoint()->getParent()->getParent();
+        const auto n = params.size();
+        std::vector<Type *> paramTys(n);
+        for (size_t i = 0; i < n; ++i) {
+            paramTys[i] = params[i]->getType();
+        }
 
-        auto ip = b.saveIP();
-
-        snippetFunction = Function::Create(funcTy, Function::InternalLinkage, nm.str(), m);
-
-
-//        snippetFunction->removeFromParent();
-
-//        auto & funcList = m->getFunctionList();
-//        funcList.insert(callerFunction->getIterator(), snippetFunction);
-
-//        m->getValueSymbolTable().
-//        snippetFunction->setName(nm.str());
-
-//        callerFunction->getIterator().
-
-//        funcList.splice(callerFunction->getIterator(), funcList, snippetFunction->getIterator());
-
-        //        snippetFunction->setVisibility(Function::HiddenVisibility);
-                snippetFunction->setCallingConv(CallingConv::Fast);
-
-        //        appendToCompilerUsed(*m, {snippetFunction});
-
-        std::array<Metadata *, 1> C;
-        C[0] = ValueAsMetadata::get(snippetFunction);
-        MDNode * const md = MDNode::get(b.getContext(), C);
-//        std::array<Value *, 1> V;
-//        V[0] = snippetFunction;
-//        OperandBundleDef op(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL.str(), V);
-
-        snippetFunction->setMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL, md);
+        FunctionType * const funcTy = FunctionType::get(retTy, paramTys, false);
 
         if (mode == FunctionSnippetMode::LateIR) {
-            // Opaque to IR optimization: noinline prevents inlining, and the non-call use
-            // in llvm.compiler.used stops IPO passes from changing the signature.
-            snippetFunction->addFnAttr(Attribute::NoInline);
-            appendToCompilerUsed(*m, {snippetFunction});
+
+            snippetFunction = Function::Create(funcTy, Function::InternalLinkage, nm.str(), Mod);
+            snippetFunction->addFnAttr(llvm::Attribute::AlwaysInline);
+
+            auto ip = b.saveIP();
+
+            BasicBlock * const entry = BasicBlock::Create(b.getContext(), "entry", snippetFunction);
+            b.SetInsertPoint(entry);
+
+            auto arg = snippetFunction->arg_begin();
+            auto nextArg = [&]() {
+                assert (arg != snippetFunction->arg_end());
+                Value * const v = &*arg;
+                std::advance(arg, 1);
+                return v;
+            };
+
+            SmallVector<Value *, 16> funcParam(n);
+            for (size_t i = 0; i < n; ++i) {
+                funcParam[i] = nextArg();
+            }
+
+            b.CreateRet(functionGenerator(funcParam));
+
+            b.restoreIP(ip);
+
+            return b.CreateCall(funcTy, snippetFunction, params);
+
+        } else if (mode == FunctionSnippetMode::MIR) {
+
+            const auto n = params.size();
+            size_t m = 1;
+            if (LLVM_LIKELY(retTy->isStructTy())) {
+                m = retTy->getStructNumElements();
+            } else if (LLVM_UNLIKELY(retTy->isVoidTy())){
+                m = 0;
+            }
+
+            SmallVector<Type *, 32> inputParamTys(n);
+            for (size_t i = 0; i < n; ++i) {
+                inputParamTys[i] = params[i]->getType();
+            }
+
+            std::array<Metadata *, 1> C;
+
+            auto applyAttrs = [](Function * func) {
+//                func->setCallingConv(llvm::CallingConv::PreserveAll);
+                func->addFnAttr(llvm::Attribute::Naked);
+                func->setDoesNotAccessMemory();
+                func->setDoesNotThrow();
+                func->setWillReturn();
+                func->setVisibility(GlobalValue::HiddenVisibility);
+                func->setDSOLocal(true);
+            };
+
+
+            FunctionType * const funcTy = FunctionType::get(retTy, inputParamTys, false);
+            snippetFunction = Function::Create(funcTy, Function::ExternalWeakLinkage, nm.str(), Mod);
+            applyAttrs(snippetFunction);
+
+            C[0] = ConstantAsMetadata::get(b.getInt64(CFAnchorCode::ANCHOR_CALL));
+            snippetFunction->setMetadata(SNIPPET_METADATA_LABEL, MDNode::get(b.getContext(), C));
+
+            StructType * const inputRetTy = StructType::get(b.getContext(), inputParamTys);
+            FunctionType * const inputFuncTy = FunctionType::get(inputRetTy, inputParamTys, false);
+            Function *  const inputFunc = Function::Create(inputFuncTy, Function::ExternalWeakLinkage, nm.str() + SNIPPET_INPUT_SUFFIX, Mod);
+            applyAttrs(inputFunc);
+
+            C[0] = ConstantAsMetadata::get(b.getInt64(CFAnchorCode::ANCHOR_START));
+            inputFunc->setMetadata(SNIPPET_METADATA_LABEL, MDNode::get(b.getContext(), C));
+
+
+            SmallVector<Type *, 32> retParamTys(m);
+
+            if (LLVM_LIKELY(retTy->isStructTy())) {
+                for (size_t i = 0; i < m; ++i) {
+                    Type * ty = retTy->getStructElementType(i);
+                    assert (ty->isSingleValueType());
+                    retParamTys[i] = ty;
+                }
+            } else if (LLVM_LIKELY(!retTy->isVoidTy())) {
+                retParamTys[0] = retTy;
+            }
+
+            FunctionType * const outputFuncTy = FunctionType::get(retTy, retParamTys, false);
+            Function *  const outputFunc = Function::Create(outputFuncTy, Function::ExternalWeakLinkage, nm.str() + SNIPPET_OUTPUT_SUFFIX, Mod);
+            applyAttrs(outputFunc);
+
+            C[0] = ConstantAsMetadata::get(b.getInt64(CFAnchorCode::ANCHOR_END));
+            outputFunc->setMetadata(SNIPPET_METADATA_LABEL, MDNode::get(b.getContext(), C));
+
+
+            b.CreateFence(AtomicOrdering::SequentiallyConsistent);
+
+            // The fences acts as both a barrier and a marker for the pass to indicate where the code fragment exists
+            // in the caller. We create and call a stub function so that we know whether the inline code exists somewhere
+            // in the current function and also to determine what registers are the "livein" and "liveout" values of the
+            // inlined code fragment. This requires a bit of a trick since only one set of output values can be read by
+            // the remaining code. We pass the inlined return values into the stub function as input arguments and use
+            // the return value of the stub as the outputs the code fragment so that we can establish a one-to-one
+            // mapping of the registers for subsequent callsite replacements. These subsequent ones only have a single
+            // stub callsite.
+
+            // To prevent CSE from hoisting the computation out of the code fragment, we use a
+            // fake input anchor. Normally this is not a problem except when the value is a phi
+            // node or other hard to clone computation.
+
+            CallInst * inputRetVal = b.CreateCall(inputFuncTy, inputFunc, params);
+            inputRetVal->setCallingConv(llvm::CallingConv::PreserveAll);
+
+            SmallVector<Value *, 16> inputParams(n);
+            for (unsigned i = 0; i < n; ++i) {
+                inputParams[i] = b.CreateExtractValue(inputRetVal, { i });
+            }
+
+            Value * const inlinedRetVal = functionGenerator(inputParams);
+            if (LLVM_UNLIKELY(inlinedRetVal->getType() != retTy)) {
+                SmallVector<char, 256> tmp;
+                raw_svector_ostream msg(tmp);
+                msg << "Error generating function token: expected return type ";
+                retTy->print(msg);
+                msg << " but function generator returned ";
+                inlinedRetVal->getType()->print(msg);
+                report_fatal_error(msg.str());
+            }
+
+            SmallVector<Value *, 16> outputParams(m);
+            if (LLVM_LIKELY(retTy->isStructTy())) {
+                for (unsigned j = 0; j < m; ++j) {
+                    outputParams[j] = b.CreateExtractValue(inlinedRetVal, { j });
+                }
+            } else if (LLVM_LIKELY(!retTy->isVoidTy())){
+                outputParams[0] = inlinedRetVal;
+            }
+
+            CallInst * calleeRetVal = b.CreateCall(outputFuncTy, outputFunc, outputParams);
+//            calleeRetVal->setCallingConv(llvm::CallingConv::PreserveAll);
+            b.CreateFence(AtomicOrdering::SequentiallyConsistent);
+
+            return calleeRetVal;
         }
 
-        BasicBlock * const entry = BasicBlock::Create(b.getContext(), "entry", snippetFunction);
-        b.SetInsertPoint(entry);
-
-        auto arg = snippetFunction->arg_begin();
-        auto nextArg = [&]() {
-            assert (arg != snippetFunction->arg_end());
-            Value * const v = &*arg;
-            std::advance(arg, 1);
-            return v;
-        };
-
-        SmallVector<Value *, 16> funcParam(n);
-        for (size_t i = 0; i < n; ++i) {
-            funcParam[i] = nextArg();
-        }
-
-        Value * const retVal = functionGenerator(funcParam);
-        if (LLVM_UNLIKELY(retVal->getType() != retTy)) {
-            SmallVector<char, 256> tmp;
-            raw_svector_ostream msg(tmp);
-            msg << "Error generating function token: expected return type ";
-            retTy->print(msg);
-            msg << " but function generator returned ";
-            retVal->getType()->print(msg);
-            report_fatal_error(msg.str());
-        }
-
-        b.CreateRet(retVal);
-
-        b.restoreIP(ip);
-
-//        opaqueToken = GlobalAlias::create(funcTy, 0, GlobalValue::WeakAnyLinkage, nm.str(), snippetFunction, m);
-
-//        opaqueToken = Function::Create(funcTy, Function::ExternalLinkage, nm.str(), m);
-////        opaqueToken->addFnAttr(Attribute::ReadNone);
-//        opaqueToken->addFnAttr(Attribute::NoUnwind);
-//        opaqueToken->setCallingConv(CallingConv::Fast);
-//        std::array<Metadata *, 1> C;
-//        C[0] = ValueAsMetadata::get(snippetFunction);
-//        MDNode * const md = MDNode::get(b.getContext(), C);
-//        opaqueToken->setMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL, md);
-
-
-
-    }
-
-    auto & C = b.getContext();
-
-//    std::array<Metadata *, 1> M;
-//    M[0] = ValueAsMetadata::get(snippetFunction);
-//    MDNode * node = MDNode::get(C, M);
-//    MetadataAsValue * mark = MetadataAsValue::get(C, node);
-    CallInst * retStruct = nullptr;
-    if (mode == FunctionSnippetMode::LateIR) {
-        retStruct = b.CreateCall(funcTy, snippetFunction, params);
     } else {
-        std::array<Value *, 1> V;
-        V[0] = ConstantInt::get(b.getInt64Ty(), (uintptr_t)snippetFunction);
-        OperandBundleDef op("cfguardtarget", V);
-        SmallVector<OperandBundleDef, 1> bundle;
-        bundle.emplace_back(std::move(op));
-        retStruct = b.CreateCall(funcTy, snippetFunction, params, bundle);
+        assert (&snippetFunction->getContext() == &b.getContext());
+        FunctionType * const funcTy = snippetFunction->getFunctionType();
+        assert (&funcTy->getContext() == &b.getContext());
+        #ifndef NDEBUG
+        const auto n = funcTy->getNumParams();
+        assert (params.size() == n);
+        for (size_t i = 0; i < n; ++i) {
+            assert (&params[i]->getContext() == &b.getContext());
+            assert (funcTy->getParamType(i) == params[i]->getType());
+        }
+        #endif
+        return b.CreateCall(funcTy, snippetFunction, params);
     }
-    retStruct->setCallingConv(CallingConv::Fast);
 
-//    const auto isAgg = retTy->isAggregateType();
-//    const auto n = isAgg ? retTy->getStructNumElements() : 1U;
-//    SmallVector<Value *, 16> retVal(n);
-//    if (retTy->isAggregateType()) {
-//        for (unsigned i = 0; i < n; ++i) {
-
-//        }
-//    } else {
-//        retVal[0] = retStruct;
-//    }
-    return retStruct;
+    return nullptr;
 }
 
 FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(Module & M, llvm::PassManagerBase & pm, const bool addPostOptimizations)
@@ -1268,40 +1353,4 @@ void FunctionSnippetPassManagerProxy::add(Pass * P) {
 //    }
 }
 
-void inlineFunctionSnippets(Module & M) {
-    SmallVector<Function *, 16> snippets;
-    for (Function & F : M) {
-        if (F.hasMetadata(FunctionSnippetTokenReplacerPass::FUNCTION_SNIPPET_METADATA_LABEL)) {
-            snippets.push_back(&F);
-        }
-    }
-    if (snippets.empty()) {
-        return;
-    }
-    SmallPtrSet<Constant *, 16> snippetSet(snippets.begin(), snippets.end());
-    removeFromUsedLists(M, [&](Constant * C) { return snippetSet.count(C) != 0; });
-    SmallVector<CallBase *, 64> calls;
-    for (Function * F : snippets) {
-        F->removeFnAttr(Attribute::NoInline);
-        calls.clear();
-        for (User * U : F->users()) {
-            if (auto * CB = dyn_cast<CallBase>(U)) {
-                if (CB->getCalledFunction() == F) {
-                    calls.push_back(CB);
-                }
-            }
-        }
-        for (CallBase * CB : calls) {
-            InlineFunctionInfo IFI;
-            const InlineResult r = InlineFunction(*CB, IFI);
-            if (LLVM_UNLIKELY(!r.isSuccess())) {
-                report_fatal_error(Twine("Failed to inline function snippet ") + F->getName() + ": " + r.getFailureReason());
-            }
-        }
-        // Replaced llvm.compiler.used initializers linger as dead constant users.
-        F->removeDeadConstantUsers();
-        if (F->use_empty()) {
-            F->eraseFromParent();
-        }
-    }
-}
+

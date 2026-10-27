@@ -55,7 +55,7 @@ public:
 
     virtual void releaseCarryData(kernel::KernelBuilder & idb);
 
-    virtual void initializeCodeGen(kernel::KernelBuilder & b);
+    void initializeCodeGen(kernel::KernelBuilder & b);
 
     virtual void finalizeCodeGen(kernel::KernelBuilder & b);
 
@@ -146,7 +146,7 @@ protected:
     llvm::StructType *                              mCurrentFrameType;
     unsigned                                        mCurrentFrameIndex;
 
-    const CarryData *                               mCarryInfo;
+    CarryData *                                     mCarryInfo;
 
     llvm::StructType *                              mCarryFrameType;
 

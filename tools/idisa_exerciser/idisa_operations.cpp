@@ -648,7 +648,7 @@ static constexpr OperationIndexEntry genericEntry() {
 template <class ConfigT, ExpectedType Typing, StrucString Name, StrucString HelpOprs, StrucString HelpDesc, auto TestF,
           auto HorizontalStoreExpectedF>
 static constexpr OperationIndexEntry horizontalStoreCheckEntry() {
-    constexpr auto expectedF = [](KernelBuilder &b, const ConfigT &c, const ConfigT::Params &p) -> Value * {
+    constexpr auto expectedF = [](KernelBuilder &b, const ConfigT &c, const typename ConfigT::Params &p) -> Value * {
         unsigned fieldCount = b.getBitBlockWidth() / p.fw;
         // Since this is for the check, use null to ensure consistent results rather than poison
         Value *outBlock = Constant::getNullValue(p.vTy);
@@ -667,7 +667,7 @@ static constexpr OperationIndexEntry horizontalStoreCheckEntry() {
 template <class ConfigT, ExpectedType Typing, StrucString Name, StrucString HelpOprs, StrucString HelpDesc, auto TestF,
           auto ScalarExpectedF>
 static constexpr OperationIndexEntry scalarCheckEntry() {
-    constexpr auto expectedF = [](KernelBuilder &b, const ConfigT &c, const ConfigT::Params &p, Value *outBlock,
+    constexpr auto expectedF = [](KernelBuilder &b, const ConfigT &c, const typename ConfigT::Params &p, Value *outBlock,
                                   unsigned i) -> Value * {
         Value *out = ScalarExpectedF(b, c, p);
         return SafeInsertElement(b, p.fw, outBlock, out, i);
@@ -679,7 +679,7 @@ static constexpr OperationIndexEntry scalarCheckEntry() {
 
 template <class ConfigT, class HorizontalStoreCheckF>
 auto wrapHorizontalStore(HorizontalStoreCheckF &&horizontalStoreCheckF) {
-    return [=](KernelBuilder &b, const ConfigT &c, const ConfigT::Params &p) {
+    return [=](KernelBuilder &b, const ConfigT &c, const typename ConfigT::Params &p) {
         unsigned fieldCount = b.getBitBlockWidth() / p.fw;
         Value *expectedBlock = Constant::getNullValue(b.fwVectorType(p.fw));
         for (unsigned i = 0; i < fieldCount; i++) {
@@ -695,7 +695,7 @@ auto wrapHorizontalStore(HorizontalStoreCheckF &&horizontalStoreCheckF) {
 
 template <class ConfigT, class ScalarCheckF> auto wrapScalar(ScalarCheckF &&scalarCheckF) {
     return wrapHorizontalStore<ConfigT>(
-        [=](KernelBuilder &b, const ConfigT &c, const ConfigT::Params &p, Value *expectedBlock, unsigned i) {
+        [=](KernelBuilder &b, const ConfigT &c, const typename ConfigT::Params &p, Value *expectedBlock, unsigned i) {
             Value *expected = scalarCheckF(b, c, p);
             return SafeInsertElement(b, p.fw, expectedBlock, expected, i);
         });

@@ -34,9 +34,7 @@
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
 #include <llvm/Support/SmallVectorMemoryBuffer.h>
-#include <idisa/passes/function_snippet.h>
 #include <queue>
-#include <optional>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
 #else
@@ -44,6 +42,7 @@
 #endif
 #include <numeric>
 #include <allocator/threadsafe_slaballocator.h>
+#include <idisa/passes/function_snippet.h>
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
@@ -142,7 +141,8 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
 
 enum class CPUDriverTaskType : size_t {
     Declaration = 0,
-    MainFunction = 1
+    ObjectCode = 1,
+    MainFunction = 2
 };
 
 struct CPUDriverTask {
@@ -158,12 +158,10 @@ struct CPUDriverTask {
 
 };
 
+struct CircularTaskBuffer {
 
-
-struct CircularBuffer {
-
-    CircularBuffer(const size_t capacity)
-    : Head(0), Tail(0), Count(0), Buffer(capacity) {
+    CircularTaskBuffer(const size_t capacity)
+    : Buffer(capacity) {
 
     }
 
@@ -198,26 +196,24 @@ struct CircularBuffer {
         return true;
     }
 
+    bool isEmpty() const {
+        return Count == 0;
+    }
+
+    size_t InFlight = 0;
+
 private:
-    size_t Head;
-    size_t Tail;
-    size_t Count;
+    size_t Head = 0;
+    size_t Tail = 0;
+    size_t Count = 0;
     std::vector<CPUDriverTask> Buffer;
 };
 
-struct CircularTaskBuffer : public CircularBuffer {
-
-    CircularTaskBuffer(const size_t capacity)
-    : CircularBuffer(capacity), InFlight(0) {
-
-    }
-
-    size_t InFlight;
-};
-
 class CPUDriverWorkQueue {
+   static constexpr auto OBJECT_COMPILATION_LEVELS = Kernel::KernelCompilationPriority::High + 1;
 public:
-    CPUDriverWorkQueue(size_t initialCapacity) {
+    CPUDriverWorkQueue(size_t initialCapacity)
+    : ObjectQueues({{CircularTaskBuffer(32), CircularTaskBuffer(2), CircularTaskBuffer(2)}}) {
         TaskQueues.reserve(initialCapacity);
     }
 
@@ -245,6 +241,17 @@ public:
         if (Sleeping) cv.notify_one();
     }
 
+    inline void pushObject(CPUDriverTask task) {
+        std::lock_guard<std::mutex> L(mutex);
+        const size_t idx = task.Target->getCompilationPriority();
+        assert (idx < OBJECT_COMPILATION_LEVELS);
+        auto & Q = ObjectQueues[idx];
+        Q.push(task);
+        Q.InFlight++;
+        if (Sleeping) cv.notify_one();
+    }
+
+
     bool pop(CPUDriverTask & task, size_t & level) {
         std::unique_lock<std::mutex> L(mutex);
         for (;;) {
@@ -259,6 +266,16 @@ public:
                     }
                     done = false;
                     break;
+                }
+            }
+
+            for (size_t i = OBJECT_COMPILATION_LEVELS; i--; ) {
+                auto & Q = ObjectQueues[i];
+                if (Q.pop(task)) {
+                    #ifndef NDEBUG
+                    level = std::numeric_limits<size_t>::max();
+                    #endif
+                    return true;
                 }
             }
 
@@ -282,6 +299,15 @@ public:
         cv.notify_all();
     }
 
+    void decrementObjectFlightCount(const size_t level) {
+        std::lock_guard<std::mutex> L(mutex);
+        assert (level < ObjectQueues.size());
+        auto & Q = ObjectQueues[level];
+        assert (Q.InFlight > 0);
+        Q.InFlight--;
+        cv.notify_all();
+    }
+
     // Blocks until every currently queued/in-flight task (across all Declaration/
     // MainFunction levels) has completed, without telling worker threads to exit.
     // Unlike shutdown(), this may be called repeatedly over the compiler's lifetime
@@ -291,6 +317,9 @@ public:
         std::unique_lock<std::mutex> L(mutex);
         cv.wait(L, [this]{
             for (auto & Q : TaskQueues) {
+                if (Q.InFlight) return false;
+            }
+            for (auto & Q : ObjectQueues) {
                 if (Q.InFlight) return false;
             }
             return true;
@@ -306,7 +335,9 @@ public:
     }
 
 private:
+
     std::vector<CircularTaskBuffer> TaskQueues;
+    std::array<CircularTaskBuffer, OBJECT_COMPILATION_LEVELS> ObjectQueues;
     std::mutex mutex;
     std::condition_variable cv;
     size_t Sleeping = 0;
@@ -405,7 +436,6 @@ public:
             for (auto & B : S.blocks()) {
 
                 originalPosition.push_back(B->getContent().data());
-
 
                 const auto align = B->getAlignment(); assert (align);
                 if (maxAlign == 0) {
@@ -613,7 +643,7 @@ public:
                       ParabixObjectCache * objCache)
     : Engine(nullptr)
     , ObjectCache(objCache)
-    , WorkQueue(8)
+    , WorkQueue(Kernel::KernelCompilationPriority::High + 4)
     , Contexts(strategy.ThreadsRequested, nullptr)
     , JITMemoryManager() {
 
@@ -636,18 +666,18 @@ public:
                     size_t taskIndex = 0;
 
                     if (LLVM_LIKELY(WorkQueue.pop(toExecute, taskIndex))) {
-
                         switch (toExecute.TypeId) {
                             case CPUDriverTaskType::Declaration:
                                 assert (taskIndex != std::numeric_limits<size_t>::max());
-                                if (LLVM_LIKELY(materializeDecl(ctx, taskIndex, toExecute.Target))) {
-                                    WorkQueue.decrementTaskFlightCount(taskIndex);
-                                }
+                                materializeDecl(ctx, taskIndex, toExecute.Target);
+                                break;
+                            case CPUDriverTaskType::ObjectCode:
+                                assert (taskIndex == std::numeric_limits<size_t>::max());
+                                materializeObject(ctx, toExecute.Target, toExecute.TargetModule);
                                 break;
                             case CPUDriverTaskType::MainFunction:
                                 assert (taskIndex != std::numeric_limits<size_t>::max());
-                                materializeMain(ctx, toExecute.Target);
-                                WorkQueue.decrementTaskFlightCount(taskIndex);
+                                materializeMain(ctx, taskIndex, toExecute.Target);
                                 break;
                         }
 
@@ -673,6 +703,7 @@ public:
         CPUDriverTask S{CPUDriverTaskType::MainFunction, kernel, nullptr};
         WorkQueue.pushTask(level, S);
     }
+
 
     void * waitUntilCompleted(Kernel * const Target) {
 
@@ -839,6 +870,7 @@ private:
                 Target->copyInternalScalarsFrom(*other);
                 Target->setSharedStateType(other->getSharedStateType());
                 Target->setThreadLocalStateType(other->getThreadLocalStateType());
+                WorkQueue.decrementTaskFlightCount(declLayer);
                 return true;
             } else {
                 // We haven't yet finished declaring the other instance of this one. Re-add this
@@ -855,8 +887,6 @@ private:
         auto & builder = *ctx.Builder;
 
         TargetMachine * const TM = ctx.TargetMachine.get();
-
-        Module * pendingObjectModule = nullptr;
 
         if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
             std::unique_ptr<MemoryBuffer> cached;
@@ -890,7 +920,8 @@ private:
         ctx.CurrentModule = M;
         ctx.Engine = Engine;
         Target->declareStateTypes(builder);
-        pendingObjectModule = M;
+        CPUDriverTask task(CPUDriverTaskType::ObjectCode, Target, M);
+        WorkQueue.pushObject(task);
         END_SCOPED_REGION
 
 record_decl:
@@ -901,20 +932,7 @@ record_decl:
         assert (f->second == nullptr);
         f->second = Target;
         END_SCOPED_REGION
-
-        // Materialize the object body on this same thread/context right away instead of
-        // queueing it as a separate ObjectCode task for another worker thread to pick up.
-        // declareStateTypes() above can cache raw llvm::Type*/Value* pointers inside the
-        // Kernel (e.g. CarryManager's per-scope summary types), and those are only valid
-        // in the LLVMContext that created them. A different worker thread has a different
-        // LLVMContext, so materializing the body there would silently mix types across
-        // contexts -- e.g. CarryManager::castToSummaryType's `carryOutTy == summaryTy`
-        // pointer check fails for two structurally-identical i8 types from different
-        // contexts, producing an invalid same-width "zext i8 to i8" that only a debug
-        // build's IR verifier catches (a release build emits it unnoticed).
-        if (pendingObjectModule) {
-            materializeObject(ctx, Target, pendingObjectModule);
-        }
+        WorkQueue.decrementTaskFlightCount(declLayer);
 
         return true;
     }
@@ -962,8 +980,6 @@ record_decl:
         SmallVector<char, 0> IROutput;
         SmallVector<char, 0> OptIROutput;
 
-        const auto snippetMode = getFunctionSnippetMode();
-
         BEGIN_SCOPED_REGION
         NamedRegionTimer T(Target->getSignature(), Target->getName(),
                            "Kernel", "Kernel Generation",
@@ -976,31 +992,18 @@ record_decl:
         Target->addOptimizationPasses(builder, passes);
         BaseDriver::runAllOptimizationPasses(builder, passes, TM, IROutput, OptIROutput);
 
-        if (snippetMode == FunctionSnippetMode::LateIR) {
-            inlineFunctionSnippets(*M);
-        }
-
         END_SCOPED_REGION
 
-        // All kernel bodies compile at codegen::BackEndOptLevel (default None/-O0;
-        // override with --backend-optimization-level). InfrequentlyUsed kernels used to
-        // get this level unconditionally while other kernels got a hardcoded Default --
-        // that hardcoded Default was itself the source of a long-standing, previously
-        // undiagnosed compile-time/runtime-quality mismatch on the MCJIT backend (see
-        // MCJITBackend's EngineBuilder::create() fix); using one configurable level for
-        // every kernel avoids reintroducing that kind of silent inconsistency.
-        TM->setOptLevel(codegen::BackEndOptLevel);
+        auto optLevel = llvm::CodeGenOptLevel::Default;
+        if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
+            optLevel = codegen::BackEndOptLevel;
+        }
+        TM->setOptLevel(optLevel);
+
 
         legacy::PassManager PM;
 
-        const auto atLeastOpt1 = codegen::BackEndOptLevel != CodeGenOptLevel::None;
-
-        // Only MIR mode needs the snippet splicing pass in the codegen pipeline.
-        std::optional<FunctionSnippetPassManagerProxy> SnippetPM;
-        if (snippetMode == FunctionSnippetMode::MIR) {
-            SnippetPM.emplace(*M, PM, atLeastOpt1);
-        }
-        PassManagerBase & FPM = SnippetPM ? static_cast<PassManagerBase &>(*SnippetPM) : PM;
+        const auto atLeastOpt1 = optLevel != llvm::CodeGenOptLevel::None;
 
         SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> objBuffer;
@@ -1036,12 +1039,8 @@ record_decl:
             // had already emitted -- "symbol '...' is already defined". Reproducible
             // with idisa_exerciser --ShowASM=<path>.
             legacy::PassManager asmPM;
-            std::optional<FunctionSnippetPassManagerProxy> asmSnippetPM;
-            if (snippetMode == FunctionSnippetMode::MIR) {
-                asmSnippetPM.emplace(*M, asmPM, atLeastOpt1);
-            }
-            PassManagerBase & asmFPM = asmSnippetPM ? static_cast<PassManagerBase &>(*asmSnippetPM) : asmPM;
-            if (LLVM_UNLIKELY(TM->addPassesToEmitFile(asmFPM, out, nullptr, ASMFile))) {
+            FunctionSnippetPassManagerProxy FPM(*M, asmPM, atLeastOpt1);
+            if (LLVM_UNLIKELY(TM->addPassesToEmitFile(FPM, out, nullptr, ASMFile))) {
                 report_fatal_error(Twine{"Failed to generate ASM for ", M->getModuleIdentifier()});
             }
             asmPM.run(*M);
@@ -1058,6 +1057,7 @@ record_decl:
         constexpr auto ObjFile = CGFT_ObjectFile;
         #endif
 
+        FunctionSnippetPassManagerProxy FPM(*M, PM, atLeastOpt1);
         if (LLVM_UNLIKELY(TM->addPassesToEmitFile(FPM, out, nullptr, ObjFile))) {
             report_fatal_error(Twine{"Failed to generate object file for ", M->getModuleIdentifier()});
         }
@@ -1080,12 +1080,14 @@ record_decl:
         auto & JITLib = Engine->getMainJITDylib();
         cantFail(linker.add(JITLib, std::move(objCode)));
 
+        WorkQueue.decrementObjectFlightCount(Target->getCompilationPriority());
+
         if (LLVM_UNLIKELY(IROutput.size() || OptIROutput.size() || ASMOutput.size())) {
             recordDebugPrintResult(Target, std::move(IROutput), std::move(OptIROutput), std::move(ASMOutput));
         }
     }
 
-    void materializeMain(CPUDriverContext & C, Kernel * Target) {
+    void materializeMain(CPUDriverContext & C, const size_t declLayer, Kernel * Target) {
 
         TargetMachine * const TM = C.TargetMachine.get();
         auto M = std::make_unique<Module>("main", C);
@@ -1154,7 +1156,7 @@ record_decl:
         }
 
         END_SCOPED_REGION
-
+        WorkQueue.decrementTaskFlightCount(declLayer);
     }
 
     void recordDebugPrintResult(Kernel * const kernel, SmallVector<char, 0> && UnoptIR, SmallVector<char, 0> && OptIR, SmallVector<char, 0> && ASM) {
@@ -1282,7 +1284,6 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
 
     auto Builder = orc::LLJITBuilder();
     Builder.setJITTargetMachineBuilder(std::move(JTMB));
-   // Builder.setNumCompileThreads(0);
     Builder.setCompileFunctionCreator(nullptr);
 
     mCPUDriverCompiler = std::make_unique<CPUDriverCompiler>(

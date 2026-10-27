@@ -6,6 +6,7 @@
  */
 
 #include "idisa_exerciser.h"
+#include <llvm/Support/Format.h>
 
 namespace llvm {
 class Type;
@@ -31,8 +32,10 @@ class OperationConfig {
         llvm::Type *i64Ty; // Just handy: int64 type
     };
 
-    static std::string operandFDIdent(unsigned index) { return std::format("operand{}_fd", index + 1); }
-    static std::string operandIdent(unsigned index) { return std::format("operand{}", index + 1); }
+    static std::string operandFDIdent(unsigned index) {
+        return llvm::formatv("operand{1}_fd", index + 1) ;
+    }
+    static std::string operandIdent(unsigned index) { return llvm::formatv("operand{1}", index + 1); }
     static constexpr const char *testOutputIdent = "test_output";
     static constexpr const char *expectedOutputIdent = "expected_output";
     static constexpr const char *failureCountIdent = "failure_count";
@@ -76,7 +79,7 @@ class OperationConfig {
     void logKernelBuilder(kernel::KernelBuilder &b) {
         assert(mKernelBuilderID.empty());
         mKernelBuilderID =
-            std::format("{} @ block {} b, lane {} b", b.getBuilderUniqueName(), b.getBitBlockWidth(), b.getLaneWidth());
+            llvm::formatv("{1} @ block {2} b, lane {3} b", b.getBuilderUniqueName(), b.getBitBlockWidth(), b.getLaneWidth());
     }
     llvm::StringRef getKernelBuilderID() const { return mKernelBuilderID; }
 

@@ -14,10 +14,6 @@
 //           FunctionSnippetTokenReplacerPass (see FunctionSnippetPassManagerProxy).
 enum class FunctionSnippetMode { Direct, LateIR, MIR };
 
-FunctionSnippetMode getFunctionSnippetMode();
-
-// LateIR mode: inline all snippet functions in M and delete them.
-void inlineFunctionSnippets(llvm::Module & M);
 
 llvm::Value * CallFunctionByToken(IDISA::IDISA_Builder & b,
                                   llvm::Type * retTy, llvm::StringRef name, llvm::ArrayRef<llvm::Value *> params,

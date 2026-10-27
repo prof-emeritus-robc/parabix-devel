@@ -3,6 +3,7 @@
  *  SPDX-License-Identifier: OSL-3.0
  */
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 #include <llvm/Support/CommandLine.h>
@@ -95,8 +96,17 @@ int main(int argc, char *argv[]) {
     const auto allFiles = argv::getFullFileList(driver, inputFiles);
     if (inputFiles.empty()) {
         argv::UseStdIn = true;
-    } else if ((allFiles.size() > 1) && !argv::NoFilenameFlag) {
-        argv::WithFilenameFlag = true;
+    } else if (!argv::NoFilenameFlag) {
+        // As in GNU grep, file names are shown when there are several files,
+        // or for files found by recursing into a directory.
+        const auto isDirectory = [](const std::string & f) {
+            boost::system::error_code errc;
+            return fs::is_directory(f, errc);
+        };
+        if ((allFiles.size() > 1) || ((argv::DirectoriesFlag == argv::Recurse) &&
+                std::any_of(inputFiles.begin(), inputFiles.end(), isDirectory))) {
+            argv::WithFilenameFlag = true;
+        }
     }
 
     std::unique_ptr<grep::GrepEngine> grep;

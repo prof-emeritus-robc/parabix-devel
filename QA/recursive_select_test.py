@@ -7,6 +7,7 @@
 #  .gitignore, symlinks found while recursing (followed only with -R),
 #  directory loops (-R), FIFOs (skipped unless -D read), an unreadable
 #  directory with a .gitignore (whose patterns must not apply elsewhere),
+#  file names shown for files found in a directory (unless -h),
 #  and -TraceFileSelect output.
 #
 #  recursive_select_test.py <icgrep binary>
@@ -74,6 +75,11 @@ def main():
             traced = [line for line in err.splitlines() if line.startswith("Selecting:")]
             check(traced and all(line != "Selecting: " for line in traced),
                   "-TraceFileSelect printed empty names: %s" % traced)
+            # -r shows file names found in a directory, even just one
+            out, err = run(icgrep, ["-r", "hit", "zz"], d)
+            check(out == "zz/f.txt:hit\n", "-r hit zz printed %r" % out)
+            out, err = run(icgrep, ["-r", "-h", "hit", "zz"], d)
+            check(out == "hit\n", "-r -h hit zz printed %r" % out)
             out, err = run(icgrep, ["-R", "-l", "hit", "root"], d)
             check("root/link.txt" in out.split(), "-R did not follow root/link.txt")
             check("recursive directory loop" in err, "-R did not report the loop root/sub/loop")

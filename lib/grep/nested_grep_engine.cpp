@@ -46,11 +46,32 @@ protected:
         Value * const source = b.getRawInputPointer("breaks", processed);
         Value * const produced = b.getProducedItemCount("matches");
         Value * const target = b.getRawOutputPointer("matches", produced);
-        Value * const toCopy = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        // The stride is in items (bits); the copy is in bytes.
+        Value * const toCopy = b.CreateMul(numOfStrides, b.getSize(getStride() / 8));
         b.CreateMemCpy(target, source, toCopy, b.getBitBlockWidth() / 8);
     }
 
 };
+
+// The level kernels are family kernels shared by the programs of all
+// the levels above them, so each use rebinds the kernel to the streams of
+// the pipeline using it.  This is safe because push() compiles each program
+// before any later push() rebinds its kernels.
+static Kernel * bindLevelKernel(Kernel * const kernel,
+                                StreamSet * const basisBits,
+                                StreamSet * const u8index,
+                                StreamSet * const breaks,
+                                StreamSet * const matches = nullptr) {
+    assert (kernel->getNumOfStreamInputs() == 3);
+    kernel->setInputStreamSetAt(0, basisBits);
+    kernel->setInputStreamSetAt(1, u8index);
+    kernel->setInputStreamSetAt(2, breaks);
+    if (matches) {
+        assert (kernel->getNumOfStreamOutputs() > 0);
+        kernel->setOutputStreamSetAt(0, matches);
+    }
+    return kernel;
+}
 
 NestedInternalSearchEngine::NestedInternalSearchEngine(BaseDriver & driver)
 : mGrepRecordBreak(GrepRecordBreakKind::LF)
@@ -117,12 +138,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool f
 
         if (LLVM_LIKELY(enclosing != nullptr)) {
             // Reuse the enclosing level's kernel, bound to this pipeline's streams.
-            kernel = enclosing;
-            assert (kernel->getNumOfStreamInputs() == 3);
-            kernel->setInputStreamSetAt(0, basisBits);
-            kernel->setInputStreamSetAt(1, U8index);
-            kernel->setInputStreamSetAt(2, breaks);
-            kernel->setOutputStreamSetAt(0, matches);
+            kernel = bindLevelKernel(enclosing, basisBits, U8index, breaks, matches);
         } else {
             kernel = new CopyBreaksToMatches(P.getTypeSystem(),
                                              basisBits, U8index, breaks,
@@ -147,10 +163,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool f
         StreamSet * resultSoFar = breaks;
         if (outerKernel) {
             Kernel * const chained = E.AddKernelFamilyCall(outerKernel);
-            assert (chained->getNumOfStreamInputs() == 3);
-            chained->setInputStreamSetAt(0, basisBits);
-            chained->setInputStreamSetAt(1, U8index);
-            chained->setInputStreamSetAt(2, breaks);
+            bindLevelKernel(chained, basisBits, U8index, breaks);
             assert (chained->getNumOfStreamOutputs() > 0);
             resultSoFar = chained->getOutputStreamSet(0); assert (resultSoFar);
         }
@@ -200,14 +213,8 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool f
     StreamSet * selected = matches;
     for (size_t k = 1; k < mNested.size(); ++k) {
         if (!mIsFilter[k]) continue;
-        Kernel * const f = mNested[k];
-        assert (f->getNumOfStreamInputs() == 3);
         StreamSet * const filtered = P.CreateStreamSet();
-        f->setInputStreamSetAt(0, basisBits);
-        f->setInputStreamSetAt(1, U8index);
-        f->setInputStreamSetAt(2, breaks);
-        f->setOutputStreamSetAt(0, filtered);
-        P.AddKernelFamilyCall(f);
+        P.AddKernelFamilyCall(bindLevelKernel(mNested[k], basisBits, U8index, breaks, filtered));
         StreamSet * const combined = P.CreateStreamSet();
         AndCombine(P, selected, filtered, combined);
         selected = combined;

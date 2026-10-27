@@ -10,10 +10,12 @@
 #include <string>
 #include <boost/filesystem.hpp>
 #include <chrono>
+#include <sys/stat.h>
 #include <grep/nested_grep_engine.h>
 #include <grep/searchable_buffer.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/Signals.h>
 #include <llvm/Support/raw_ostream.h>
 #include <re/adt/re_re.h>
@@ -183,10 +185,10 @@ re::PatternVector getIncludeExcludePatterns(bool commandLine) {
 namespace fs = boost::filesystem;
 //
 void selectPath(std::vector<fs::path> & collectedPaths, fs::path && p) {
-    collectedPaths.emplace_back(std::move(p));
     if (TraceFileSelect) {
         llvm::errs() << "Selecting: " << p.string() << "\n";
     }
+    collectedPaths.emplace_back(std::move(p));
 }
 
 //
@@ -268,22 +270,30 @@ re::PatternVector coalesceREs(const re::PatternVector sourceREs, unsigned groupi
     return coalesced;
 }
 
+// The (device, inode) identity of a directory, to detect directory loops.
+using DirectoryId = std::pair<dev_t, ino_t>;
+
 void recursiveFileSelect(CPUDriver & driver,
                          const fs::path & dirpath,
                          grep::NestedInternalSearchEngine & pathSelectEngine,
-                         std::vector<fs::path> & collectedPaths) {
+                         std::vector<fs::path> & collectedPaths,
+                         std::vector<DirectoryId> & ancestors) {
 
-    // First update the search REs with any local .gitignore or other exclude file.
-    error_code ec;
-    const auto hasLocalIgnoreFile = !ExcludePerDirectory.empty() && fs::exists(dirpath/ExcludePerDirectory, ec) && !ec;
-
-    if (hasLocalIgnoreFile) {
-        pathSelectEngine.push(coalesceREs(re::parseGitIgnoreFile(dirpath, ExcludePerDirectory), GitREcoalescing));
+    // A directory that is its own ancestor (through symlinks, with -R) is
+    // a loop: skip it, as GNU grep does.
+    struct stat sb;
+    const bool identified = (::stat(dirpath.c_str(), &sb) == 0);
+    if (identified) {
+        const DirectoryId id{sb.st_dev, sb.st_ino};
+        if (std::find(ancestors.begin(), ancestors.end(), id) != ancestors.end()) {
+            if (!NoMessagesFlag) {
+                llvm::errs() << sys::path::filename(codegen::ProgramName) << ": warning: \""
+                             << dirpath.string() << "\": recursive directory loop.\n";
+            }
+            return;
+        }
+        ancestors.push_back(id);
     }
-    // Gather files and subdirectories.
-    // TODO: verify whether these are discarded before recursion
-    grep::SearchableBuffer fileCandidates;
-    grep::SearchableBuffer subdirCandidates;
 
     error_code errc;
     fs::directory_iterator di(dirpath, errc);
@@ -293,12 +303,35 @@ void recursiveFileSelect(CPUDriver & driver,
         if (!NoMessagesFlag) {
             collectedPaths.push_back(dirpath);
         }
+        if (identified) ancestors.pop_back();
         return;
     }
+
+    // Update the search REs with any local .gitignore or other exclude file.
+    error_code ec;
+    const auto hasLocalIgnoreFile = !ExcludePerDirectory.empty() && fs::exists(dirpath/ExcludePerDirectory, ec) && !ec;
+
+    if (hasLocalIgnoreFile) {
+        pathSelectEngine.push(coalesceREs(re::parseGitIgnoreFile(dirpath, ExcludePerDirectory), GitREcoalescing));
+    }
+    // Gather files and subdirectories.
+    grep::SearchableBuffer fileCandidates;
+    grep::SearchableBuffer subdirCandidates;
+
+    // Devices, FIFOs and sockets found while recursing are read only when
+    // -D read is given explicitly (GNU grep).
+    const bool readDevices = (DevicesFlag == Read) && (DevicesOption.getNumOccurrences() > 0);
     const auto di_end = fs::directory_iterator();
     while (di != di_end) {
         const auto & e = di->path();
         error_code errc;
+        // Without -R, symlinks found while recursing are not followed.
+        if (!DereferenceRecursiveFlag && fs::is_symlink(di->symlink_status(errc))) {
+            error_code errc2;
+            di.increment(errc2);
+            if (errc2) break;
+            continue;
+        }
         const auto s = fs::status(e, errc);
         if (errc) {
             // If there was an error, we leave the file in the fileCandidates
@@ -307,12 +340,8 @@ void recursiveFileSelect(CPUDriver & driver,
                 fileCandidates.append(e.string());
             }
         } else if (fs::is_directory(s)) {
-            if (fs::is_symlink(e) && !DereferenceRecursiveFlag) {
-                di.increment(errc);
-                continue;
-            }
             subdirCandidates.append(e.string() + "/");
-        } else if (fs::is_regular_file(s) || DevicesFlag == Read) {
+        } else if (fs::is_regular_file(s) || readDevices) {
             fileCandidates.append(e.string());
         }
         error_code errc2;
@@ -336,13 +365,14 @@ void recursiveFileSelect(CPUDriver & driver,
         directoryAccum.setFullPathEntries(subdirCount);
         pathSelectEngine.doGrep(subdirCandidates.data(), subdirCandidates.size(), directoryAccum);
         for (const auto & subdir : selectedDirectories) {
-            recursiveFileSelect(driver, subdir, pathSelectEngine, collectedPaths);
+            recursiveFileSelect(driver, subdir, pathSelectEngine, collectedPaths, ancestors);
         }
     }
 
     if (hasLocalIgnoreFile) {
         pathSelectEngine.pop();
     }
+    if (identified) ancestors.pop_back();
 }
 
 std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> & inputFiles) {
@@ -449,8 +479,9 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
         pathSelectEngine.pop();
         pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), GitREcoalescing), true);
         // Select files from subdirectories using the recursive process.
+        std::vector<DirectoryId> ancestors;
         for (const auto & dirpath : selectedDirectories) {
-            recursiveFileSelect(driver, dirpath, pathSelectEngine, collectedPaths);
+            recursiveFileSelect(driver, dirpath, pathSelectEngine, collectedPaths, ancestors);
         }
     }
     if (TimeFileSelect) {

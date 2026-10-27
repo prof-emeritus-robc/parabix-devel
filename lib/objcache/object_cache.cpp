@@ -1,6 +1,7 @@
 #include <objcache/object_cache.h>
 
 #include <objcache/object_cache_util.hpp>
+#include <srchash/source_hash.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/driver/driver.h>
@@ -17,8 +18,13 @@
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/ADT/STLFunctionalExtras.h>
+#include <llvm/ADT/StringExtras.h>
+#include <llvm/Support/SHA1.h>
 #include <system_error>
 #include <csignal>
+#include <cstdlib>
+#include <unistd.h>
+#include <llvm/Support/Signals.h>
 
 using namespace llvm;
 using namespace boost;
@@ -38,39 +44,46 @@ bool ParabixObjectCache::mStartedCacheCleanupDaemon = false;
 // file exists.
 //
 
-#define MONTH_1 \
-    ((__DATE__ [0] == 'O' || __DATE__ [0] == 'N' || __DATE__ [0] == 'D') ? '1' : '0')
-#define MONTH_2 \
-    (__DATE__ [2] == 'n' ? (__DATE__ [1] == 'a' ? '1' : '6') \
-    : __DATE__ [2] == 'b' ? '2' \
-    : __DATE__ [2] == 'r' ? (__DATE__ [0] == 'M' ? '3' : '4') \
-    : __DATE__ [2] == 'y' ? '5' \
-    : __DATE__ [2] == 'l' ? '7' \
-    : __DATE__ [2] == 'g' ? '8' \
-    : __DATE__ [2] == 'p' ? '9' \
-    : __DATE__ [2] == 't' ? '0' \
-    : __DATE__ [2] == 'v' ? '1' : '2')
-#define DAY_1 (__DATE__[4] == ' ' ? '0' : __DATE__[4])
-#define DAY_2 (__DATE__[5])
-#define YEAR_1 (__DATE__[9])
-#define YEAR_2 (__DATE__[10])
-#define HOUR_1 (__TIME__[0])
-#define HOUR_2 (__TIME__[1])
-#define MINUTE_1 (__TIME__[3])
-#define MINUTE_2 (__TIME__[4])
-#define SECOND_1 (__TIME__[6])
-#define SECOND_2 (__TIME__[7])
-
-
-
-
-const static auto CACHE_PREFIX = PARABIX_VERSION +
-                          std::string{'@',
-                          MONTH_1, MONTH_2, DAY_1, DAY_2, YEAR_1, YEAR_2,
-                          HOUR_1, HOUR_2, MINUTE_1, MINUTE_2, SECOND_1, SECOND_2,
-                          '_'};
+// Each cached kernel is keyed by its cache name, which ends with the kernel's
+// source tag (Kernel::getSourceTag): changing the source of a module that can
+// shape a kernel's code (or the build configuration) invalidates that kernel's
+// entry, and no other.  An --object-cache-salt adds a further component,
+// giving experiments their own entries.
+static const std::string & cachePrefix() {
+    static const std::string prefix = [] {
+        std::string p = "parabix-";
+        if (!codegen::ObjectCacheSalt.empty()) {
+            p += "salt-" + codegen::ObjectCacheSalt + "_";
+        }
+        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            errs() << "Object cache prefix: " << p << "\n";
+        }
+        return p;
+    }();
+    return prefix;
+}
 
 const static auto SIGNATURE = "signature";
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief traceSourceTag
+ *
+ * Reports where a kernel's source tag comes from: the image defining the kernel's class, plus, for
+ * kernels that call nested kernels, the tags of those kernels.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static void traceSourceTag(const kernel::Kernel * const kernel) {
+    using TypeId = kernel::Kernel::TypeId;
+    const void * const vtable = *reinterpret_cast<const void * const *>(kernel);
+    const bool hasSourceHash = !parabix::getImageSourceHash(vtable).empty();
+    errs() << "Source tag of " << kernel->getName() << ": " << kernel->getSourceTag()
+           << " (" << (hasSourceHash ? "source hash" : "no source hash, build ID") << " of "
+           << parabix::getImageName(vtable);
+    const auto id = kernel->getTypeId();
+    if (id == TypeId::Pipeline || id == TypeId::OptimizationBranch) {
+        errs() << ", with the tags of its nested kernels";
+    }
+    errs() << ")\n";
+}
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief getSignature
@@ -90,33 +103,101 @@ inline bool isNonMatchingSignature(const MDString * const received, const String
     return expected.compare(received->getString()) != 0;
 }
 
+// Each .kernel file records the --optimization-level and --backend-optimization-level
+// its object was compiled at, as a single node holding the two levels as integers.
+// The levels are not part of the cache key: one entry per kernel is kept, and it is
+// replaced only when a run asks for a higher level than the entry was compiled at.
+const static auto OPT_LEVELS = "parabix.opt-levels";
+
+// Each .kernel file records a hash of the IR its object was compiled from, taken right after
+// generation (before any optimization), and the PARABIX_VERSION of the build that wrote it,
+// as a single node holding the two strings.  Read only by -VerifyCache.
+const static auto IR_HASH = "parabix.ir-hash";
+
+using OptLevels = std::pair<unsigned, unsigned>;
+
+static OptLevels requestedOptLevels() {
+    return OptLevels{static_cast<unsigned>(codegen::OptLevel), static_cast<unsigned>(codegen::BackEndOptLevel)};
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief readOptLevels
+ *
+ * Entries written before the levels were recorded have no node. They are read as none/none,
+ * so any run that requests a higher level recompiles and replaces them.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static OptLevels readOptLevels(const Module * const M) {
+    OptLevels levels{static_cast<unsigned>(CodeGenOptLevel::None), static_cast<unsigned>(CodeGenOptLevel::None)};
+    const NamedMDNode * const md = M->getNamedMetadata(OPT_LEVELS);
+    if (md && md->getNumOperands() == 1 && md->getOperand(0)->getNumOperands() == 2) {
+        const MDNode * const node = md->getOperand(0);
+        const auto front = mdconst::dyn_extract<ConstantInt>(node->getOperand(0));
+        const auto back = mdconst::dyn_extract<ConstantInt>(node->getOperand(1));
+        if (front && back) {
+            levels = OptLevels{static_cast<unsigned>(front->getZExtValue()), static_cast<unsigned>(back->getZExtValue())};
+        }
+    }
+    return levels;
+}
+
+static void writeOptLevels(Module * const M, const OptLevels levels) {
+    LLVMContext & C = M->getContext();
+    IntegerType * const int32Ty = Type::getInt32Ty(C);
+    Metadata * const ops[2] = {ConstantAsMetadata::get(ConstantInt::get(int32Ty, levels.first)),
+                               ConstantAsMetadata::get(ConstantInt::get(int32Ty, levels.second))};
+    NamedMDNode * const md = M->getOrInsertNamedMetadata(OPT_LEVELS);
+    md->clearOperands();
+    md->addOperand(MDNode::get(C, ops));
+}
+
+static const char * optLevelName(const unsigned level) {
+    switch (static_cast<CodeGenOptLevel>(level)) {
+        case CodeGenOptLevel::None: return "none";
+        case CodeGenOptLevel::Less: return "less";
+        case CodeGenOptLevel::Default: return "standard";
+        case CodeGenOptLevel::Aggressive: return "aggressive";
+    }
+    return "unknown";
+}
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief loadCachedObjectFile
  ** ------------------------------------------------------------------------------------------------------------- */
 ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept {
+    return lookupCachedObjectFile(builder, kernel, builder.getContext());
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief lookupCachedObjectFile
+ *
+ * Finds the entry for the kernel, parsing its .kernel file into C.
+ ** ------------------------------------------------------------------------------------------------------------- */
+ParabixObjectCache::LoadResult ParabixObjectCache::lookupCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel, LLVMContext & C) noexcept {
 
     // Have we already seen this signature before? if so, we can safely assume that the ExecutionEngine
     // will have a compiled module for this kernel when we execute the pipeline.
 
     std::lock_guard<std::mutex> L(mCacheMutex);
 
-    if (LLVM_UNLIKELY(codegen::ObjectCacheForceUpdate)) {
+    if (LLVM_UNLIKELY(codegen::UpdateObjectCache)) {
         if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-            errs() << "Forcing recompilation (--update-object-cache, or --optimization-level"
-                      "/--backend-optimization-level set): " << kernel->makeCacheName(builder)
+            errs() << "Forcing recompilation (--update-object-cache): " << kernel->makeCacheName(builder)
                    << KERNEL_FILE_EXTENSION << "\n";
         }
         return LoadResult{nullptr, nullptr};
     }
 
     Path fileName(mCachePath);
-    sys::path::append(fileName, CACHE_PREFIX);
+    sys::path::append(fileName, cachePrefix());
     const auto moduleId = kernel->makeCacheName(builder);
     fileName.append(moduleId);
     fileName.append(KERNEL_FILE_EXTENSION);
+    if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+        traceSourceTag(kernel);
+    }
     auto kernelBuffer = MemoryBuffer::getFile(fileName, false, false, false);
     if (kernelBuffer) {
-        auto loadedFile = parseBitcodeFile((*kernelBuffer)->getMemBufferRef(), builder.getContext());
+        auto loadedFile = parseBitcodeFile((*kernelBuffer)->getMemBufferRef(), C);
         if (LLVM_LIKELY(loadedFile)) {
 
             std::unique_ptr<Module> H{std::move(*loadedFile)};
@@ -133,6 +214,19 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
                     return LoadResult{nullptr, nullptr};
                 }
             }
+            // An entry compiled at the requested levels or higher (in both the front end
+            // and the back end) is used as is. Otherwise the kernel is recompiled at the
+            // requested levels and saveCachedObjectFile replaces the entry.
+            const auto cachedLevels = readOptLevels(H.get());
+            const auto requested = requestedOptLevels();
+            if (LLVM_UNLIKELY(cachedLevels.first < requested.first || cachedLevels.second < requested.second)) {
+                if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+                    errs() << "Recompiling at a higher optimization level: " << moduleId << KERNEL_FILE_EXTENSION
+                           << " (cached " << optLevelName(cachedLevels.first) << "/" << optLevelName(cachedLevels.second)
+                           << ", requested " << optLevelName(requested.first) << "/" << optLevelName(requested.second) << ")\n";
+                }
+                return LoadResult{nullptr, nullptr};
+            }
             sys::path::replace_extension(fileName, OBJECT_FILE_EXTENSION);
             auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), false, false, false);
             if (LLVM_LIKELY(objectBuffer)) {
@@ -147,7 +241,12 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
                 fs::last_write_time(fileName.c_str(), access_time);
 
                 if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-                    errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
+                    errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION
+                           << " (" << optLevelName(cachedLevels.first) << "/" << optLevelName(cachedLevels.second) << ")\n";
+                    if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::VerifyCache) && !kernel->hasDeterministicCodeGeneration())) {
+                        errs() << "Not verified (nondeterministic code generation): " << cachePrefix() << moduleId
+                               << KERNEL_FILE_EXTENSION << "\n";
+                    }
                 }
 
                 return std::make_pair(std::move(obj), std::move(H));
@@ -155,8 +254,177 @@ ParabixObjectCache::LoadResult ParabixObjectCache::loadCachedObjectFile(kernel::
         } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
             errs() << "Failed to load cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
         }
+    } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+        errs() << "No cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
     }
     return LoadResult{nullptr, nullptr};
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief computeIRHash
+ *
+ * A SHA-1 of the printed module.  The suffixes LLVM appends to make a name unique within its
+ * LLVMContext (e.g. %Foo.3 for a struct type) depend on whatever else that context holds, which
+ * varies from run to run, so they are dropped first.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static std::string computeIRHash(const Module & M) {
+    std::string ir;
+    raw_string_ostream out(ir);
+    M.print(out, nullptr);
+    out.flush();
+    auto isIdentChar = [](const char c) {
+        return isAlnum(c) || c == '_' || c == '.' || c == '$' || c == '-';
+    };
+    std::string normal;
+    normal.reserve(ir.size());
+    const auto n = ir.size();
+    for (size_t i = 0; i < n; ) {
+        const char c = ir[i++];
+        normal.push_back(c);
+        if (c != '%' && c != '@') continue;
+        const size_t start = i;
+        while (i < n && isIdentChar(ir[i])) ++i;
+        size_t end = i;
+        // drop a trailing ".<digits>", but leave a name that is only digits alone
+        size_t d = end;
+        while (d > start && isDigit(ir[d - 1])) --d;
+        if (d < end && d > start + 1 && ir[d - 1] == '.') {
+            end = d - 1;
+        }
+        normal.append(ir, start, end - start);
+    }
+    SHA1 hash;
+    hash.update(normal);
+    const auto digest = hash.final();
+    return toHex(ArrayRef<uint8_t>(digest.data(), digest.size()), /*LowerCase=*/true);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief recordIRHash
+ ** ------------------------------------------------------------------------------------------------------------- */
+void ParabixObjectCache::recordIRHash(Module & M) {
+    LLVMContext & C = M.getContext();
+    const auto hash = computeIRHash(M);
+    Metadata * const ops[2] = {MDString::get(C, hash), MDString::get(C, PARABIX_VERSION)};
+    NamedMDNode * const md = M.getOrInsertNamedMetadata(IR_HASH);
+    md->clearOperands();
+    md->addOperand(MDNode::get(C, ops));
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief loadCachedObjectFileForVerification
+ ** ------------------------------------------------------------------------------------------------------------- */
+ParabixObjectCache::VerificationEntry ParabixObjectCache::loadCachedObjectFileForVerification(kernel::KernelBuilder & builder, kernel::Kernel * kernel) noexcept {
+    VerificationEntry entry;
+    LLVMContext C;
+    auto loaded = lookupCachedObjectFile(builder, kernel, C);
+    if (loaded.second) {
+        entry.Object = std::move(loaded.first);
+        const NamedMDNode * const md = loaded.second->getNamedMetadata(IR_HASH);
+        if (md && md->getNumOperands() == 1 && md->getOperand(0)->getNumOperands() == 2) {
+            const MDNode * const node = md->getOperand(0);
+            if (const auto hash = dyn_cast<MDString>(node->getOperand(0))) {
+                entry.IRHash = hash->getString().str();
+            }
+            if (const auto writer = dyn_cast<MDString>(node->getOperand(1))) {
+                entry.WrittenBy = writer->getString().str();
+            }
+        }
+        // a module parsed from a file is named after it
+        entry.FileName = loaded.second->getModuleIdentifier();
+    }
+    // the module must go before the context it lives in
+    loaded.second.reset();
+    return entry;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief verifyIRHash
+ ** ------------------------------------------------------------------------------------------------------------- */
+bool ParabixObjectCache::verifyIRHash(const kernel::Kernel * kernel, const Module & M, const VerificationEntry & entry) {
+    // Called on compilation worker threads: hold the cache lock while tracing, as the other
+    // traces do, so that lines from different threads cannot interleave.
+    auto trace = [&](StringRef what) {
+        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            std::lock_guard<std::mutex> L(mCacheMutex);
+            errs() << what << sys::path::filename(entry.FileName) << "\n";
+        }
+    };
+    if (LLVM_UNLIKELY(entry.IRHash.empty())) {
+        trace("Cannot verify (no IR hash recorded), recompiling: ");
+        return false;
+    }
+    if (LLVM_LIKELY(computeIRHash(M) == entry.IRHash)) {
+        trace("Verified cache file: ");
+        return true;
+    }
+
+    // PARABIX_VERSION is "parabixgit-<commit>" as of configure time.
+    auto commitOf = [](StringRef version) {
+        const auto dash = version.rfind('-');
+        return dash == StringRef::npos ? version : version.substr(dash + 1);
+    };
+    const StringRef writtenBy = entry.WrittenBy.empty() ? StringRef("unknown") : StringRef(entry.WrittenBy);
+    const StringRef thisCommit = commitOf(PARABIX_VERSION);
+    const StringRef thatCommit = commitOf(writtenBy);
+
+    const void * const vtable = *reinterpret_cast<const void * const *>(kernel);
+    const auto image = parabix::getImageName(vtable);
+    const auto modules = parabix::getImageModules(vtable);
+    const auto id = kernel->getTypeId();
+    const bool callsKernels = (id == kernel::Kernel::TypeId::Pipeline || id == kernel::Kernel::TypeId::OptimizationBranch);
+
+    std::string msg;
+    raw_string_ostream out(msg);
+    out << sys::path::filename(codegen::ProgramName) << " ERROR: object cache verification (-VerifyCache) failed for kernel " << kernel->getName() << "\n"
+           "\n"
+           "  cache entry: " << entry.FileName << "\n"
+           "  written by:  " << writtenBy << " (revision at configure time); this is " << PARABIX_VERSION << "\n"
+           "  source tag:  " << kernel->getSourceTag() << ", from the source hash of " << image << "\n"
+           "\n"
+           "The IR generated for this kernel now differs from the IR its cached object was compiled\n"
+           "from, although both have the same cache name: something that shapes this kernel's code\n"
+           "is missing from its cache key.  Either\n"
+           "\n"
+           "  - source outside the modules in the key changed, and code from it runs while this kernel\n"
+           "    is generated.  The key covers these modules (all that " << image << " links, transitively):\n"
+           "      " << (modules.empty() ? std::string("(none registered)") : modules) << "\n"
+           "    Add the module holding that code to the DEPS of the target that builds " << image << ";\n";
+    if (callsKernels) {
+        out << "\n"
+               "  - or, since this kernel calls nested kernels, a property of one of them that its code\n"
+               "    depends on is missing from its source tag (see getSourceTag);\n";
+    }
+    out << "\n"
+           "  - or a parameter or command-line option changes the generated IR without changing the\n"
+           "    kernel's name or signature: record it in the name (the kernel's constructor, or\n"
+           "    Kernel::annotateKernelNameWithDebugFlags) or in its signature.\n"
+           "\n"
+           "To narrow it down:\n"
+           "\n";
+    if (thatCommit != thisCommit) {
+        out << "  1. List what changed since the entry was written, and look for files outside the\n"
+               "     modules above:\n"
+               "       git diff --stat " << thatCommit << " -- lib include tools\n";
+    } else {
+        out << "  1. The entry was written by a build configured at this same revision, so the change is\n"
+               "     in uncommitted work or in commits made since configuring: look through git status\n"
+               "     and git diff for files outside the modules above.\n";
+    }
+    out << "  2. If no source outside those modules changed, compare the command-line options of the\n"
+           "     run that wrote the entry with this one's.\n"
+           "  3. To see the difference itself, run with -enable-object-cache=0 -ShowUnoptimizedIR=new.ll,\n"
+           "     build the writer's revision and run it the same way with -ShowUnoptimizedIR=old.ll,\n"
+           "     then diff the definitions for " << kernel->getName() << ".\n"
+           "\n"
+           "Without -VerifyCache the entry is used as is; --update-object-cache recompiles it.\n";
+    out.flush();
+    // This runs on a compilation worker thread: exit() (as report_fatal_error's handlers call)
+    // would run static destructors under the other threads' feet, so leave without them.
+    const auto written = ::write(STDERR_FILENO, msg.data(), msg.size());
+    (void)written;
+    sys::RunInterruptHandlers();
+    std::_Exit(EXIT_FAILURE);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -213,7 +481,7 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
     auto moduleId = M.getModuleIdentifier();
 
     Path objectName(mCachePath);
-    sys::path::append(objectName, CACHE_PREFIX);
+    sys::path::append(objectName, cachePrefix());
     objectName.append(moduleId);
     objectName.append(OBJECT_FILE_EXTENSION);
 
@@ -239,13 +507,16 @@ void ParabixObjectCache::saveCachedObjectFile(const Module & M, llvm::MemoryBuff
             md->addOperand(og.getOperand(i));
         }
     }
+    writeOptLevels(H.get(), requestedOptLevels());
 
     writeCacheFileAtomically(objectName, [&](raw_fd_ostream & out) {
         WriteBitcodeToFile(*H, out);
     });
 
     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-        errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
+        const auto levels = requestedOptLevels();
+        errs() << "Wrote cache file: " << moduleId << KERNEL_FILE_EXTENSION
+               << " (" << optLevelName(levels.first) << "/" << optLevelName(levels.second) << ")\n";
     }
 }
 
@@ -363,7 +634,13 @@ inline size_t parseInt(const StringRef & str, const StringRef & label) {
  * @brief loadCacheSettings
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void ParabixObjectCache::loadCacheSettings() noexcept {
-    getDefaultCachePath(mCachePath);
+    if (codegen::ObjectCacheDir) {
+        mCachePath.assign(codegen::ObjectCacheDir);
+        // the cache cleanup daemon is handed this path; resolve it now
+        sys::fs::make_absolute(mCachePath);
+    } else {
+        getDefaultCachePath(mCachePath);
+    }
     #if 0
 
     const auto configPath = getConfigPath();

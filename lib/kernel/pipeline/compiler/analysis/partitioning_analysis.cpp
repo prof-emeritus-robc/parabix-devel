@@ -217,6 +217,19 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
 
     std::vector<unsigned> forcedPartitionRoot;
 
+    // Rate ids introduced by outputs with an Add attribute.  A kernel's rate set is the
+    // union of its inputs', so a kernel reading both a stream extended by an Add and a
+    // stream that is not would otherwise share a partition with the consumers of the
+    // extended stream alone, even though its own inputs end at different positions.
+    BitSet addRateIds(n + numOfPhases);
+
+    // A kernel with the ProvisionalLookAheadStride attribute may share the partition of the
+    // provisional kernels that produce all of its inputs, rather than starting a new one,
+    // provided that the cumulative lookahead along the chain stays below its stride.
+    // provisionalChainLA[i] records, for a streamset node i produced by such a chain, the
+    // cumulative lookahead up to and including its producer; -1 otherwise.
+    std::vector<int> provisionalChainLA(m, -1);
+
     for (unsigned i = 0; i < m; ++i) {
 
         const auto u = sequence[i];
@@ -229,6 +242,11 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
             bool hasInputRateChange = false;
             bool hasLookAheads = false;
             auto demarcateOutputs = (node.Kernel == mPipelineKernel);
+            const bool isProvisional = (node.Kernel != mPipelineKernel) &&
+                node.Kernel->hasAttribute(AttrId::ProvisionalLookAheadStride);
+            // cumulative lookahead of this kernel within a provisional chain; -1 if not part of one
+            int kernelChainLA = -1;
+            int joinedChainLA = -1;
 
             const auto initialRateId = nextRateId;
 
@@ -310,11 +328,65 @@ PartitionGraph PipelineAnalysis::generatePartitionGraph() {
                 }
             }
 
+            // Fixed-rate inputs must agree on which Add-extended streams they derive from;
+            // otherwise the kernel may be unable to process the final strides its partition
+            // root does (e.g., an input of N items alongside one of N+1 items that fills an
+            // exact stride), and it must determine its own number of strides.
+            BEGIN_SCOPED_REGION
+            BitSet addIds;
+            bool first = true;
+            for (const auto e : make_iterator_range(in_edges(i, G))) {
+                const Binding & bind = Relationships[G[e]].Binding;
+                if (bind.hasAttribute(AttrId::ZeroExtended)) {
+                    continue;
+                }
+                BitSet ids = G[source(e, G)];
+                ids &= addRateIds;
+                if (first) {
+                    addIds = std::move(ids);
+                    first = false;
+                } else if (ids != addIds) {
+                    hasInputRateChange = true;
+                    goto found_rate_change;
+                }
+            }
+            END_SCOPED_REGION
+
+            // Determine whether this provisional kernel can continue the provisional chain of its
+            // producers: every input must come from the chain, through producers with the same rate set.
+            if (isProvisional && !hasInputRateChange) {
+                int c = 0;
+                const BitSet * producerRates = nullptr;
+                for (const auto e : make_iterator_range(in_edges(i, G))) {
+                    const auto streamSet = source(e, G);
+                    const int chain = provisionalChainLA[streamSet];
+                    if (chain < 0) {
+                        c = -1;
+                        break;
+                    }
+                    const BitSet & R = G[streamSet];
+                    if (producerRates && *producerRates != R) {
+                        c = -1;
+                        break;
+                    }
+                    producerRates = &R;
+                    const Binding & bind = Relationships[G[e]].Binding;
+                    const int la = bind.hasLookahead() ? static_cast<int>(bind.getLookahead()) : 0;
+                    c = std::max(c, chain + la);
+                }
+                if (c >= 0 && static_cast<size_t>(c) < node.Kernel->getStride()) {
+                    joinedChainLA = c;
+                }
+            }
+
             if (hasInputRateChange) {
 found_rate_change:
                 assert (nextRateId < n);
                 V.set(nextRateId++);
                 forcedPartitionRoot.push_back(i);
+            } else if (joinedChainLA >= 0) {
+                // continues the provisional chain within the partition of its producers
+                kernelChainLA = joinedChainLA;
             } else if (hasLookAheads) {
 
                 assert (LookAheadIds.empty());
@@ -364,6 +436,20 @@ found_rate_change:
                 LookAheadIds.clear();
             }
 
+            if (isProvisional && kernelChainLA < 0) {
+                // this kernel starts a new partition; its chain begins with its own lookahead
+                int la = 0;
+                for (const auto e : make_iterator_range(in_edges(i, G))) {
+                    const Binding & bind = Relationships[G[e]].Binding;
+                    if (bind.hasLookahead()) {
+                        la = std::max(la, static_cast<int>(bind.getLookahead()));
+                    }
+                }
+                if (static_cast<size_t>(la) < node.Kernel->getStride()) {
+                    kernelChainLA = la;
+                }
+            }
+
             assert (V.any());
 
             // Now iterate through the outputs
@@ -376,12 +462,18 @@ found_rate_change:
                 BitSet & O = G[target(e, G)];
                 O |= V;
 
+                const bool isExtended = rate.isFixed() &&
+                    (b.hasAttribute(AttrId::Add) || b.hasAttribute(AttrId::AddCarry));
+
+                provisionalChainLA[target(e, G)] = kernelChainLA;
+
                 if (rate.isFixed() && !demarcateOutputs) {
 
                     // Check the attributes to see whether any impose a partition change
                     for (const Attribute & attr : b.getAttributes()) {
                         switch (attr.getKind()) {
                             case AttrId::Add:
+                            case AttrId::AddCarry:
                             // TODO: if we computed the transitive add/subtracts prior to partitioning,
                             // we could more safely associate them with the dataflow
                             case AttrId::Delayed:
@@ -397,12 +489,19 @@ found_rate_change:
                 } else {
 add_output_rate:    assert (nextRateId < n);
                     assert (!V.test(nextRateId));
+                    // consumers of this output are in another partition
+                    provisionalChainLA[target(e, G)] = -1;
+                    if (isExtended) {
+                        addRateIds.set(nextRateId);
+                    }
                     O.set(nextRateId++);
                 }
 
             }
 
-            if (initialRateId == nextRateId && !hasLookAheads) {
+            // Provisional kernels must not be transferred between partitions; moving one would
+            // break the chain that supplies data beyond the full strides to its consumers.
+            if (initialRateId == nextRateId && !hasLookAheads && !isProvisional) {
                 assert (!hasInputRateChange);
                 assert (!demarcateOutputs);
                 potentiallyMergable.push_back(i);
@@ -917,6 +1016,10 @@ start_of_transfer_loop:
                         goto start_of_transfer_loop;
                     }
 
+                    // The earliest position of a partition whose root consumes this kernel's
+                    // output; the kernel must remain scheduled before any such partition.
+                    unsigned rootConsumerPos = -1U;
+
                     for (auto e : make_iterator_range(out_edges(currentPartId, partGraph))) {
                         auto & bi = partGraph[e];
                         if (bi.Producer == potentiallyTransferedKernel) {
@@ -931,6 +1034,7 @@ start_of_transfer_loop:
                             const auto selectedRoot = roots[0];
 
                             if (c == selectedRoot) {
+                                rootConsumerPos = std::min<unsigned>(rootConsumerPos, ordinal[consumerPartId]);
                                 const auto & H = partitionPostDominators[consumerPartId];
                                 assert (H.test(consumerPartId) == 1);
                                 assert (H.test(currentPartId) == 0);
@@ -973,6 +1077,65 @@ start_of_transfer_loop:
                             if (pos < transferPos) {
                                 transferPos = pos;
                             }
+                        }
+                    }
+
+                    // Pruning the destinations dominated by a root consumer may leave only
+                    // destinations on a parallel path that is scheduled after that consumer's
+                    // partition (e.g., two lookaheads sharing a character class kernel); moving
+                    // the kernel there would create a cycle.  The pruned edges are gone, so the
+                    // kernel is no longer a candidate for transfer.
+                    if ((transferPos != -1U) && (transferPos >= rootConsumerPos)) {
+                        itr = Transfer.erase(itr);
+                        goto start_of_transfer_loop;
+                    }
+
+                    // A kernel may not be moved into a partition unless the other partitions that
+                    // consume its output follow that partition.  In its own partition, the kernel
+                    // processes all of its available input, ahead of any consumer; in the target
+                    // partition, it is limited by that partition's root, and a consumer in an
+                    // independent partition could get ahead of it (e.g., two ExpandFilters sharing
+                    // an Invert of their spread mask, each in the partition of its stream expansion).
+                    // A thread-local buffer feeding such a consumer would then not be fully consumed.
+                    if (transferPos != -1U) {
+                        const auto & D = partitionPostDominators[ordering[transferPos]];
+                        for (const auto e : make_iterator_range(out_edges(currentPartId, partGraph))) {
+                            if (partGraph[e].Producer == potentiallyTransferedKernel && !D.test(target(e, partGraph))) {
+                                transferPos = -1U;
+                                break;
+                            }
+                        }
+                    }
+
+                    // A kernel may not be moved into a partition in which a consumer reads its
+                    // output with a lookahead: only a provisional stride kernel may look ahead into
+                    // data produced within its own partition, and only along a chain of provisional
+                    // stride kernels from the partition root (see identifyProvisionalStrideKernels).
+                    if (transferPos != -1U) {
+                        const auto & members = partGraph[ordering[transferPos]].AllKernels;
+                        for (const auto e : make_iterator_range(out_edges(potentiallyTransferedKernel, G))) {
+                            for (const auto f : make_iterator_range(out_edges(target(e, G), G))) {
+                                const Binding & bind = Relationships[G[f]].Binding;
+                                if (bind.hasLookahead() && bind.getLookahead() > 0 &&
+                                        std::find(members.begin(), members.end(), target(f, G)) != members.end()) {
+                                    transferPos = -1U;
+                                }
+                            }
+                        }
+                    }
+
+                    // A kernel may not be moved into a partition whose streams are extended by a
+                    // different set of Add attributes; its inputs would end at different positions
+                    // than those of the partition root.
+                    if (transferPos != -1U) {
+                        const auto & target = partGraph[ordering[transferPos]].AllKernels;
+                        assert (!target.empty());
+                        BitSet a = G[potentiallyTransferedKernel];
+                        a &= addRateIds;
+                        BitSet b = G[target.front()];
+                        b &= addRateIds;
+                        if (a != b) {
+                            transferPos = -1U;
                         }
                     }
 
@@ -1101,29 +1264,13 @@ start_of_transfer_loop:
 
     if (hasMultipleRootsInSinglePartition) {
 
-        size_t bestScore = 0;
-        InternalPartitionGraph bestSelection;
-
-        std::function<void(std::vector<unsigned> &)> enumerateAllOptions = [&](std::vector<unsigned> & vec) {
-            for (auto i = vec.size(); i < componentCount; ++i) {
-                auto & roots = P[i].PotentialRoots;
-                assert (roots.size() > 0);
-                if (roots.size() == 1) {
-                    vec.push_back(roots[0]);
-                } else {
-                    const auto l = vec.size();
-                    for (auto j = 0; j < roots.size(); ++j) {
-                        vec.push_back(roots[j]);
-                        enumerateAllOptions(vec);
-                        vec.resize(l);
-                    }
-                    return;
-                }
-            }
-            InternalPartitionGraph filteredClone(componentCount);
+        //  The partition graph with the given choice of root for each component,
+        //  and its score (the number of kernels transferred to adjacent partitions).
+        auto evaluate = [&](const std::vector<unsigned> & vec, InternalPartitionGraph & clone) -> size_t {
+            clone = InternalPartitionGraph(componentCount);
             for (unsigned i = 0; i < componentCount; ++i) {
                 const auto & Pi = P[i];
-                auto & Gi = filteredClone[i];
+                auto & Gi = clone[i];
                 Gi.PartitionId = Pi.PartitionId;
                 Gi.PhaseId = Pi.PhaseId;
                 Gi.AllKernels.assign(Pi.AllKernels.begin(), Pi.AllKernels.end());
@@ -1133,18 +1280,79 @@ start_of_transfer_loop:
             for (auto e : make_iterator_range(edges(P))) {
                 const auto & bi = P[e];
                 assert (bi.Producer != -1U && bi.Consumer != -1U);
-                add_edge(source(e, P), target(e, P), BindingInfo{bi.Producer, bi.Consumer}, filteredClone);
+                add_edge(source(e, P), target(e, P), BindingInfo{bi.Producer, bi.Consumer}, clone);
             }
-            const auto score = transferKernelsToAdjacentPartitions(filteredClone) + 1UL;
-            if (score > bestScore) {
-                bestScore = score;
-                bestSelection = filteredClone;
-            }
+            return transferKernelsToAdjacentPartitions(clone) + 1UL;
         };
 
-        std::vector<unsigned> selection;
-        selection.reserve(synchronousPartitionCount);
-        enumerateAllOptions(selection);
+        //  The number of combinations of roots (saturating).
+        constexpr size_t MaxEnumeratedSelections = 4096;
+        size_t combinations = 1;
+        for (unsigned i = 0; i < componentCount; ++i) {
+            const auto r = P[i].PotentialRoots.size();
+            combinations = (combinations > MaxEnumeratedSelections / r) ? MaxEnumeratedSelections + 1 : combinations * r;
+        }
+
+        size_t bestScore = 0;
+        InternalPartitionGraph bestSelection;
+
+        if (combinations <= MaxEnumeratedSelections) {
+
+            std::function<void(std::vector<unsigned> &)> enumerateAllOptions = [&](std::vector<unsigned> & vec) {
+                for (auto i = vec.size(); i < componentCount; ++i) {
+                    auto & roots = P[i].PotentialRoots;
+                    assert (roots.size() > 0);
+                    if (roots.size() == 1) {
+                        vec.push_back(roots[0]);
+                    } else {
+                        const auto l = vec.size();
+                        for (auto j = 0; j < roots.size(); ++j) {
+                            vec.push_back(roots[j]);
+                            enumerateAllOptions(vec);
+                            vec.resize(l);
+                        }
+                        return;
+                    }
+                }
+                InternalPartitionGraph filteredClone;
+                const auto score = evaluate(vec, filteredClone);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestSelection = filteredClone;
+                }
+            };
+
+            std::vector<unsigned> selection;
+            selection.reserve(synchronousPartitionCount);
+            enumerateAllOptions(selection);
+
+        } else {
+
+            //  Too many combinations to enumerate (the number grows exponentially with
+            //  the components having several potential roots): the root of each such
+            //  component is chosen in turn, the others fixed, by the best score.
+            std::vector<unsigned> selection(componentCount);
+            for (unsigned i = 0; i < componentCount; ++i) selection[i] = P[i].PotentialRoots[0];
+            InternalPartitionGraph clone;
+            bestScore = evaluate(selection, bestSelection);
+            for (unsigned i = 0; i < componentCount; ++i) {
+                const auto & roots = P[i].PotentialRoots;
+                if (roots.size() == 1) continue;
+                auto best = selection[i];
+                for (auto j = 1; j < roots.size(); ++j) {
+                    selection[i] = roots[j];
+                    const auto score = evaluate(selection, clone);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestSelection = clone;
+                        best = roots[j];
+                    }
+                }
+                selection[i] = best;
+            }
+
+        }
+
         assert (bestScore > 0);
         P = bestSelection;
     } else {
@@ -1735,6 +1943,89 @@ void PipelineAnalysis::determinePartitionJumpIndices() {
     PartitionJumpTargetId[(PartitionCount - 1)] = (PartitionCount - 1);
 
 #endif
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief identifyProvisionalStrideKernels
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineAnalysis::identifyProvisionalStrideKernels() {
+
+    ProvisionalStrideKernel.resize(LastKernel + 1);
+    ProvisionalChainLookAhead.assign(LastKernel + 1, 0);
+    PartitionProvisionalLookAhead.assign(PartitionCount, 0);
+
+    for (auto kernel = FirstKernel; kernel <= LastKernel; ++kernel) {
+        const Kernel * const kernelObj = getKernel(kernel);
+        const auto partitionId = KernelPartitionId[kernel];
+        const auto isRoot = (FirstKernelInPartition[partitionId] == kernel);
+        bool active = false;
+        unsigned chain = 0;
+        if (kernelObj->hasAttribute(AttrId::ProvisionalLookAheadStride)) {
+            active = true;
+            for (const auto e : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                const BufferPort & port = mBufferGraph[e];
+                const auto la = static_cast<unsigned>(std::max(port.LookAhead, 0));
+                if (isRoot) {
+                    chain = std::max(chain, la);
+                } else {
+                    const auto producer = parent(source(e, mBufferGraph), mBufferGraph);
+                    if (KernelPartitionId[producer] != partitionId || !ProvisionalStrideKernel.test(producer)) {
+                        active = false;
+                        break;
+                    }
+                    chain = std::max(chain, ProvisionalChainLookAhead[producer] + la);
+                }
+            }
+            if (active && chain >= kernelObj->getStride()) {
+                active = false;
+            }
+        }
+        if (active) {
+            ProvisionalStrideKernel.set(kernel);
+            ProvisionalChainLookAhead[kernel] = chain;
+        } else if (!isRoot) {
+            // A kernel that looks ahead into data produced within its own partition depends on
+            // the provisional strides of its producers.
+            for (const auto e : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                const BufferPort & port = mBufferGraph[e];
+                if (port.LookAhead > 0) {
+                    const auto producer = parent(source(e, mBufferGraph), mBufferGraph);
+                    if (LLVM_UNLIKELY(KernelPartitionId[producer] == partitionId)) {
+                        SmallVector<char, 256> tmp;
+                        raw_svector_ostream msg(tmp);
+                        msg << kernelObj->getName() << " looks ahead into data produced within its partition "
+                               "by " << getKernel(producer)->getName() << " but is not a provisional stride kernel";
+                        report_fatal_error(msg.str());
+                    }
+                }
+            }
+        }
+    }
+
+    for (auto kernel = FirstKernel; kernel <= LastKernel; ++kernel) {
+        if (ProvisionalStrideKernel.test(kernel)) {
+            const auto partitionId = KernelPartitionId[kernel];
+            auto & L = PartitionProvisionalLookAhead[partitionId];
+            L = std::max(L, ProvisionalChainLookAhead[kernel]);
+            // A provisional stride writes one stride past the full strides, and its lookahead
+            // reads the whole of the stride after that.
+            const int overflow = 2 * static_cast<int>(getKernel(kernel)->getStride());
+            for (const auto e : make_iterator_range(in_edges(kernel, mBufferGraph))) {
+                BufferPort & port = mBufferGraph[e];
+                port.RequiredOverflowSpace = std::max(port.RequiredOverflowSpace, overflow);
+                BufferPort & producerPort = mBufferGraph[in_edge(source(e, mBufferGraph), mBufferGraph)];
+                producerPort.RequiredOverflowSpace = std::max(producerPort.RequiredOverflowSpace, overflow);
+                // The producer must also leave this space free past what it produced: the provisional
+                // stride reads its inputs over a whole stride past the full strides, and the lookahead
+                // beyond it, which is past the end of the buffer if the data reaches it.
+                producerPort.ProvisionalOverflow = std::max(producerPort.ProvisionalOverflow, overflow);
+            }
+            for (const auto e : make_iterator_range(out_edges(kernel, mBufferGraph))) {
+                BufferPort & port = mBufferGraph[e];
+                port.RequiredOverflowSpace = std::max(port.RequiredOverflowSpace, overflow);
+            }
+        }
+    }
 }
 
 } // end of namespace kernel

@@ -4,16 +4,20 @@
  */
 #pragma once
 
-#include <pablo/pablo.h>
 #include <pablo/toolchain/pablo_toolchain.h>
 #include <kernel/pipeline/pipeline_builder.h>
 #include <ucd/utf/utf_encoder.h>
 #include <ucd/utf/transchar.h>
+#include <pablo/pablo.h>
+#include <ucd/algo/normalization.h>
+#include <kernel/streamutils/focused_transform.h>
+#include <memory>
 
 using StreamSet = kernel::StreamSet;
 using PipelineBuilder = kernel::PipelineBuilder;
 namespace re {class CC;}
 namespace pablo {class PabloBuilder; class PabloAST; class Var;}
+namespace llvm { namespace cl { class OptionCategory; } }
 
 // Hangul Composition Kernels for NFC (See Unicode section 3.12).
 //
@@ -223,11 +227,14 @@ void LongComposablePipeline(PipelineBuilder & P,
 //  (d) a mask to select only those portions of the basis that are
 //      relevant to the work to be performed.
 
+//  The insertion and deletion amounts are computed at the last byte of each UTF-8
+//  sequence (Advance) or at its first byte (LookAhead).
 void ComputeWorkPlacement(PipelineBuilder & P,
                           std::vector<re::CC *> insertionBixNumCCs,
                           std::vector<re::CC *> deletionBixNumCCs,
                           StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
-                          StreamSet * WorkPlacementMask);
+                          StreamSet * WorkPlacementMask,
+                          pablo::BitMovementMode m = pablo::BitMovementMode::Advance);
 
 struct BitXfrmSpec {
     unsigned BitXfrmIndex;
@@ -247,11 +254,49 @@ void UpdateBitXfrms(pablo::PabloBuilder & pb,
                     std::vector<pablo::PabloAST *> & sets,
                     std::vector<BitXfrmSpec> & xfrmSpecs);
 
+//
+//  FCD (as ICU's FCD normalizer and the Any-FCD transform): the text is left
+//  as it is where it passes the FCD test, and elsewhere decomposed (NFD) in
+//  regions.  A violation is a character v with leading canonical combining class
+//  lccc(v) != 0 below the trailing class tccc of the character before it (the
+//  classes of the first and last characters of their NFD).  Its region begins
+//  at the last character before it with lccc = 0, or after the last one with
+//  tccc <= 1 if later, and ends before the next character with lccc = 0.
+//  FCD_RegionMask marks the regions of a U21-indexed text; the regions,
+//  decomposed with NFD (with the other characters as barriers), give the FCD.
+//
+void FCD_RegionMask(PipelineBuilder & P, StreamSet * U21, StreamSet * Regions);
+
+// NFC Support
+//
+//  NFC as a focused transform, with placement after the transform: the
+//  transform decides which positions of its working space remain.
+
+// The focus of NFC: the UTF-8 sequences that may change (composable sequences
+// and excluded composites).
+void DetermineNFC_WorkSelection(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask);
+
+// NFC of the UTF-8 basis bits U8_Basis.  The transform works in a working space,
+// U8_Basis with room inserted for decompositions; ValidWorkMask marks the positions
+// of the working space that remain in TransformedBasis.  Given a WorkMask, room is
+// inserted only within the work regions (for transforming a whole text).
+void NFC_Transform(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * TransformedBasis,
+                   StreamSet * ValidWorkMask, StreamSet * WorkMask = nullptr);
+
+// The placement of the transformed work regions in the output, given the
+// ValidWorkMask from NFC_Transform of the work regions.
+void NFC_WorkPlacement(PipelineBuilder & P, StreamSet * U8_Basis, StreamSet * WorkSelectionMask,
+                       StreamSet * ValidWorkMask, StreamSet * WorkPlacementMask);
+
 // NFD Support
 
+// The data of the UTF-8 placement of NFD (or, with UCD::DecompositionOptions::NFKD,
+// of NFKD).
 class NFD_BixData {
 public:
-    NFD_BixData();
+    NFD_BixData(UCD::DecompositionOptions opt = UCD::DecompositionOptions::NFD);
+    // The characters that the decomposition changes.
+    re::CC * Decomposable_CC();
     std::vector<re::CC *> NFD_Insertion_BixNumCCs();
     std::vector<re::CC *> UTF8_Insertion_BixNumCCs();
     std::vector<re::CC *> UTF8_Deletion_BixNumCCs();
@@ -267,12 +312,20 @@ private:
     unicode::TranslationMap mNFD_CharMap[4];
     UCD::UnicodeSet mHangul_Precomposed_LV;
     UCD::UnicodeSet mHangul_Precomposed_LVT;
+    UCD::UnicodeSet mDecomposable;
 };
+
+// The category of the normalization command line options (-u8-bit-movement), for
+// codegen::ParseCommandLineOptions.
+llvm::cl::OptionCategory & NormalizationOptions();
 
 class NFD_PipelineBuilder {
 public:
-    NFD_PipelineBuilder(PipelineBuilder & P) :
-        mPB(P) {}
+    // The marks of the UTF-8 kernels are placed as given by -u8-bit-movement.
+    NFD_PipelineBuilder(PipelineBuilder & P);
+
+    // Mark the last byte (Advance) or the first byte (LookAhead) of each UTF-8 sequence.
+    void setBitMovement(pablo::BitMovementMode m) { mBitMovement = m; }
 
     StreamSet * NFD_U21_Pipeline(StreamSet * U21_Basis);
 
@@ -280,7 +333,14 @@ public:
 
     void DetermineNFD_WorkItems(StreamSet * U8_Basis, StreamSet * u8index, StreamSet * workItems);
 
+    // The focus of NFD: the UTF-8 sequences that may change.
+    void DetermineNFD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask);
+
+    // DetermineNFD_WorkSelection, with gap filling, then FilterByMask of the basis bits.
     void NFD_FilterStage(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * WorkingBasis);
+
+    // Fill gaps of at most this many unchanged bytes between work regions (0: none).
+    void setFillRunGaps(unsigned maxGap) { mFillRunGaps = maxGap; }
 
     void ComputeWorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask);
 
@@ -288,7 +348,25 @@ public:
 
     void NFKD_U8_Pipeline(StreamSet * WorkingBasis, StreamSet * TransformedBasis);
 
+    // The focus of NFKD: the characters with a decomposition (canonical or
+    // compatibility) or a nonzero combining class, and the character after each.
+    void DetermineNFKD_WorkSelection(StreamSet * BasisBits, StreamSet * WorkSelectionMask);
+
+    void ComputeNFKD_WorkPlacementMask(StreamSet * BasisBits, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask);
+
 private:
+    NFD_BixData & NFKD_Data();
+
+    unsigned mFillRunGaps = 0;
+    pablo::BitMovementMode mBitMovement;
     PipelineBuilder & mPB;
     NFD_BixData NFD_Data;
+    std::unique_ptr<NFD_BixData> mNFKD_Data;
 };
+
+//  The normalization forms as focused transforms (see kernel/streamutils/focused_transform.h),
+//  built with the stages above.  The NFD and NFKD transforms use the given
+//  NFD_PipelineBuilder, which must outlive them.
+kernel::FocusedTransform NFD_FocusedTransform(NFD_PipelineBuilder & builder, const kernel::FocusOptions & options);
+kernel::FocusedTransform NFKD_FocusedTransform(NFD_PipelineBuilder & builder, const kernel::FocusOptions & options);
+kernel::FocusedTransform NFC_FocusedTransform(const kernel::FocusOptions & options);

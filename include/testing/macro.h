@@ -8,8 +8,6 @@
 #include <tuple>
 #include <testing/test_case.hpp>
 #include <testing/runtime.h>
-#include <testing/stream_gen.hpp>
-#include <toolchain/toolchain.h>
 
 #define TEST_CASE(NAME, ...)                                                                                    \
 template<typename... Ps>                                                                                        \
@@ -47,4 +45,7 @@ int main(int argc, char ** argv) {                                              
 }
 
 
-#define CASE(X) (std::tuple<std::string, TestCaseInvocationType>(std::string(#X), invoke_##X))
+#define CASE(X) (std::tuple<std::string, TestCaseInvocationType, bool>(std::string(#X), invoke_##X, false))
+
+// A test case that runs only with --extended-testing.
+#define EXTENDED_CASE(X) (std::tuple<std::string, TestCaseInvocationType, bool>(std::string(#X), invoke_##X, true))

@@ -38,6 +38,8 @@ public:
 
     std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) final;
 
+    std::string getSourceTag() const final;
+
 protected:
 
     OptimizationBranch(LLVMTypeSystemInterface & ts,

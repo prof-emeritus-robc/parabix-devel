@@ -6,6 +6,8 @@
 #include <kernel/streamutils/run_index.h>
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
+#include <llvm/ADT/Twine.h>
+#include <llvm/Support/ErrorHandling.h>
 
 using namespace pablo;
 
@@ -45,8 +47,10 @@ mIndexCount(runIndex->getNumElements()),
 mOverflow(overflow != nullptr),
 mRunKind(kind),
 mNumbering(n) {
-    assert(mIndexCount > 0);
-    assert(mIndexCount <= 5);
+    // generatePabloMethod has the alternating masks for index bits 0 through 5 only.
+    if (LLVM_UNLIKELY(mIndexCount == 0 || mIndexCount > 6)) {
+        llvm::report_fatal_error("RunIndex: 1 to 6 index streams are supported, not " + llvm::Twine(mIndexCount));
+    }
 }
 
 void RunIndex::generatePabloMethod() {

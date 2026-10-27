@@ -6,6 +6,7 @@
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <kernel/core/streamset.h>
 #include <llvm/Analysis/ConstantFolding.h>
+#include <kernel/illustrator/illustrator.h>
 #ifdef ENABLE_PAPI
 #include <papi.h>
 #include <boost/tokenizer.hpp>
@@ -253,6 +254,41 @@ void PipelineKernel::recursivelyListFamilyKernels(llvm::raw_ostream & familyName
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getStageLabel
+ ** ------------------------------------------------------------------------------------------------------------- */
+StringRef PipelineKernel::getStageLabel(const Kernel * const kernel) const {
+    if (mStageLabels.empty()) {
+        return StringRef{};
+    }
+    for (size_t i = 0; i < mKernels.size(); ++i) {
+        if (mKernels[i].Object == kernel) {
+            StringRef label;
+            for (const auto & L : mStageLabels) {
+                if (L.second > i) break;
+                label = L.first;
+            }
+            return label;
+        }
+    }
+    return StringRef{};
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getSourceTag
+ *
+ * The pipeline's code depends on the state types, bindings and family interfaces of its kernels,
+ * so their source tags are folded into its own.
+ ** ------------------------------------------------------------------------------------------------------------- */
+std::string PipelineKernel::getSourceTag() const {
+    std::string tags = Kernel::getSourceTag();
+    for (const auto & k : mKernels) {
+        tags.push_back(',');
+        tags.append(k.Object->getSourceTag());
+    }
+    return getStringHash(tags).substr(0, 16);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief createRepeatingStreamSet
  ** ------------------------------------------------------------------------------------------------------------- */
 Kernel::ParamMap::PairEntry PipelineKernel::createRepeatingStreamSet(KernelBuilder & b, const RepeatingStreamSet * ss, const size_t maxStrideLength) const {
@@ -409,8 +445,8 @@ void PipelineKernel::addOptimizationPasses(KernelBuilder & b, SelectedOptimizati
     // whatever it held before (typically null) by then, so without this bracket
     // COMPILER resolves to null here -- a null-pointer dereference that only actually
     // touches memory (and so only actually crashes) once there are real optimization
-    // passes to add, i.e. under any non-default --optimization-level/
-    // --backend-optimization-level.
+    // passes to add, i.e. under an --optimization-level or
+    // --backend-optimization-level above none.
     struct CompilerScope {
         const PipelineKernel * const Self;
         KernelBuilder & B;

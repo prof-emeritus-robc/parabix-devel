@@ -41,8 +41,9 @@ void RE_Inspector::inspect(RE * const re) {
         INSPECT(Start);
         INSPECT(Permute);
         INSPECT(Interleavable);
+        INSPECT(String);
         INSPECT(PropertyExpression);
-        default: llvm_unreachable("Unknown RE type");
+        // No default: -Wswitch flags any RE type missing here.
     }
     #undef INSPECT
 }
@@ -124,6 +125,15 @@ void RE_Inspector::inspectPermute(Permute * p) {
 void RE_Inspector::inspectInterleavable(Interleavable * s) {
     for (RE * e : *s) {
         inspect(e);
+    }
+}
+
+void RE_Inspector::inspectString(String * s) {
+}
+
+void RE_Inspector::inspectStringAsCCs(String * s) {
+    for (const char32_t c : *s) {
+        inspect(makeCC(c));
     }
 }
 

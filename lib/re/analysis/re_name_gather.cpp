@@ -45,6 +45,10 @@ struct ExternalCollector final : public RE_Inspector {
         mAlphabets.insert(alpha->getName());
     }
 
+    void inspectString(String * s) override {
+        if (!s->empty()) mAlphabets.insert(cc::Unicode.getName());
+    }
+
     std::set<std::string> & mExternals;
     std::set<std::string> & mAlphabets;
 };

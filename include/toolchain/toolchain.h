@@ -57,6 +57,7 @@ enum DebugFlags {
     DisableCacheAlignedKernelStructs,
     DisableInOutAttributes,
     ForcePipelineRecompilation,
+    VerifyCache,
     DebugFlagSentinel
 };
 
@@ -81,6 +82,13 @@ enum StatisticsFlags {
 enum PipelineCompilationModeOptions {
     DefaultFast
     , Expensive
+};
+
+// How circular (double-mapped) stream buffers are built: Default is Mach vm_remap on macOS
+// and a memfd mapping elsewhere; Memfd always uses the memfd mapping (a temp file on macOS).
+enum class CircularBufferImplOptions {
+    Default
+    , Memfd
 };
 
 // not an exhaustive list; can be extended but keep __Count as the last entry
@@ -146,12 +154,24 @@ extern std::string DoubleStreamSetSizeOptions;
 extern std::string CPUFeatureOptions;
 extern bool UseI64Builder;
 extern PipelineCompilationModeOptions PipelineCompilationMode;
+extern CircularBufferImplOptions CircularBufferImpl;  // set from command line: --CircularBufferImpl
+extern unsigned CircularBufferPoolMiB;  // set from command line: --CircularBufferPool
+extern bool PoisonReusedBuffers;  // set from command line: --PoisonReusedBuffers
 #ifdef ENABLE_PAPI
 extern std::string PapiCounterOptions;
 #endif
 extern std::string ShowASMOption;
 extern const char * ObjectCacheDir;
+extern std::string ObjectCacheSalt;  // set from command line: --object-cache-salt
 extern unsigned CacheDaysLimit;  // set from command line
+
+// The treatment of ill-formed UTF-8 input (--utf8-errors), as for GB 18030
+// input (see gb18030): each maximal ill-formed subpart (as in the Unicode
+// Standard, section 3.9) stops the processing of the input before it
+// (Abort), is dropped (DropBadInput), or is a character U+FFFD
+// (UseReplacementChar, the default).  See kernel::UTF8_index.
+enum class UTF8ErrorMode {Abort, DropBadInput, UseReplacementChar};
+extern UTF8ErrorMode UTF8Errors;
 extern int FreeCallBisectLimit;  // set from command line
 extern llvm::CodeGenOptLevel OptLevel;  // set from command line
 extern llvm::CodeGenOptLevel BackEndOptLevel;  // set from command line
@@ -159,6 +179,8 @@ const unsigned LaneWidth = 64;
 extern unsigned BlockSize;  // set from command line
 extern unsigned SegmentSize; // set from command line
 extern unsigned BufferSegments;
+extern unsigned PhaseSegmentLimit; // set from command line: --phase-segment-limit
+extern unsigned PhaseClaimSegments; // set from command line: --phase-claim-segments
 extern unsigned TaskThreads;
 extern unsigned SegmentThreads;
 extern unsigned ScanBlocks;
@@ -167,12 +189,6 @@ extern bool EnableModuleInliner;
 extern bool EnablePipelineObjectCache;
 extern bool UseCustomJITMemoryManager;
 extern bool UpdateObjectCache;  // set from command line: --update-object-cache
-// True if UpdateObjectCache is set, or --optimization-level/--backend-optimization-level
-// were explicitly given on the command line; derived once in ParseCommandLineOptions.
-// When true, the object cache is bypassed on load (forcing recompilation) and the
-// resulting object replaces whatever was previously cached, so a cache built under one
-// optimization setting is never silently reused after the setting changes.
-extern bool ObjectCacheForceUpdate;
 extern unsigned CompileThreads;
 extern bool UseMCJIT;
 extern bool EnableDynamicMultithreading;

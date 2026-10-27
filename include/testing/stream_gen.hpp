@@ -18,11 +18,11 @@
 #include <util/aligned_allocator.h>
 #include <llvm/IR/Type.h>
 #include <llvm/Support/ErrorHandling.h>
-#include <kernel/core/idisa_target.h>
-#include <kernel/io/source_kernel.h>
 #include <testing/stream_parsing.hpp>
-#include <toolchain/toolchain.h>
 #include <kernel/pipeline/program_builder.h>
+#include <kernel/io/source_kernel.h>
+#include <kernel/core/idisa_target.h>
+#include <toolchain/toolchain.h>
 
 namespace testing {
 

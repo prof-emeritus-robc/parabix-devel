@@ -31,14 +31,14 @@ Why a dedicated script instead of running bench_bpe.py --parabix-only twice
 
 Usage
 -----
-    # default: baseline vs --level-partition on val_2MB
+    # default: baseline vs --partition=level on val_2MB
     python bench_configs.py
 
     # explicit configs, NAME=FLAGS (first one is the baseline for speedups)
     python bench_configs.py \
         --config 'baseline=' \
-        --config 'level=--level-partition' \
-        --config 'level+compact=--level-partition --compact-base=40'
+        --config 'level=--partition=level' \
+        --config 'level+compact=--partition=level --compact-base=40'
 
     # floor / marginal-rate split, plus an output-identity check
     python bench_configs.py --sizes 0.25,1,4,8 --verify
@@ -67,7 +67,9 @@ import tempfile
 # Paths
 # ---------------------------------------------------------------------------
 
-REPO_ROOT   = "/Users/munizahashim/parabix-devel"
+# Defaults only: the repo root is three levels above this script
+# (tools/lex/tokenizer-test/); --input/--tokenizer/--merges override.
+REPO_ROOT   = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
 TOKENIZER   = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 MERGES      = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
 TFILES      = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files")
@@ -77,7 +79,7 @@ OUTPUT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 # Default comparison when the user names no configs: the current default
 # partition against the level schedule.
-DEFAULT_CONFIGS = [("baseline", ""), ("level-partition", "--level-partition")]
+DEFAULT_CONFIGS = [("baseline", ""), ("level", "--partition=level")]
 
 DEFAULT_ITERS  = 5
 DEFAULT_ROUNDS = 3
@@ -334,11 +336,12 @@ def parse_config(spec: str) -> tuple[str, list]:
 
 
 def main() -> None:
+    global TOKENIZER, MERGES
     ap = argparse.ArgumentParser(
         description="Benchmark Parabix BPE configurations against each other (no HuggingFace).")
     ap.add_argument("--config", action="append", default=[], metavar="NAME=FLAGS",
                     help="Config to time, repeatable. The FIRST is the baseline for "
-                         "speedup columns. Example: --config 'level=--level-partition'")
+                         "speedup columns. Example: --config 'level=--partition=level'")
     ap.add_argument("--input", default=DEFAULT_INPUT,
                     help=f"Corpus (default {DEFAULT_INPUT})")
     ap.add_argument("--sizes", metavar="MB[,MB...]",
@@ -357,7 +360,12 @@ def main() -> None:
                          "cheaper and NOT the pipeline compare_bpe.py validates — so the "
                          "numbers would describe a config nobody checks for correctness. "
                          "Pass --common-flags='' to time that raw path deliberately.")
+    ap.add_argument("--tokenizer", default=TOKENIZER,
+                    help=f"Parabix tokenizer binary (default: {TOKENIZER})")
+    ap.add_argument("--merges", default=MERGES,
+                    help=f"merges.txt (default: {MERGES})")
     args = ap.parse_args()
+    TOKENIZER, MERGES = args.tokenizer, args.merges
 
     if not os.path.isfile(TOKENIZER):
         sys.exit(f"No tokenizer binary at {TOKENIZER} — run: make -C build19 -j8 tokenizer")

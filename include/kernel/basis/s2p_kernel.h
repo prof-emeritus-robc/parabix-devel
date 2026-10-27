@@ -4,10 +4,9 @@
  */
 #pragma once
 
-#include <re/alphabet/alphabet.h>
-#include <pablo/pablo.h>
 #include <kernel/pipeline/driver/driver.h>
 #include <string>
+#include <pablo/compiler/pablo_kernel.h>
 
 namespace IDISA { class IDISA_Builder; }  // lines 14-14
 namespace llvm { class Value; }

@@ -14,9 +14,8 @@
  */
 #ifndef LINEBREAK_KERNEL_H
 #define LINEBREAK_KERNEL_H
-
 #include <pablo/pablo.h>
-#include <re/alphabet/alphabet.h>
+
 
 namespace kernel { class KernelBuilder; }
 namespace kernel { class PipelineBuilder; }

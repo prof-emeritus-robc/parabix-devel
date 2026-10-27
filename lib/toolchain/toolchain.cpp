@@ -181,6 +181,9 @@ KernelFlags(cl::desc("Flags controlling kernel/pipeline compilation"),
                         clEnumVal(EnableMProtect, "Use mprotect to cause a write fault when erroneously "
                                                   "overwriting kernel state / stream space."),
                         clEnumVal(ForcePipelineRecompilation, "Disable object cache lookup for any PipelineKernel."),
+                        clEnumVal(VerifyCache, "On an object cache hit, regenerate the kernel's IR anyway and check that it matches "
+                                               "the IR the cached object was compiled from, reporting any dependency missing "
+                                               "from the kernel's cache key."),
                         clEnumVal(VerifyIR, "Run the IR verification pass.")),
             cl::cat(CodeGenOptions));
 
@@ -271,10 +274,10 @@ OptimizationLevel("optimization-level", cl::location(OptLevel), cl::init(CodeGen
                              clEnumValN(CodeGenOptLevel::Default, "standard", "standard optimizations"),
                              clEnumValN(CodeGenOptLevel::Aggressive, "aggressive", "aggressive optimizations")), cl::cat(CodeGenOptions));
 static cl::opt<CodeGenOptLevel, true>
-BackEndOptOption("backend-optimization-level", cl::location(BackEndOptLevel), cl::init(CodeGenOptLevel::None), cl::desc("Set the back-end optimization level:"),
-                  cl::values(clEnumValN(CodeGenOptLevel::None, "none", "no optimizations (default)"),
+BackEndOptOption("backend-optimization-level", cl::location(BackEndOptLevel), cl::init(CodeGenOptLevel::Default), cl::desc("Set the back-end optimization level:"),
+                  cl::values(clEnumValN(CodeGenOptLevel::None, "none", "no optimizations"),
                              clEnumValN(CodeGenOptLevel::Less, "less", "trivial optimizations"),
-                             clEnumValN(CodeGenOptLevel::Default, "standard", "standard optimizations"),
+                             clEnumValN(CodeGenOptLevel::Default, "standard", "standard optimizations (default)"),
                              clEnumValN(CodeGenOptLevel::Aggressive, "aggressive", "aggressive optimizations")), cl::cat(CodeGenOptions));
 
 PipelineCompilationModeOptions PipelineCompilationMode = PipelineCompilationModeOptions::DefaultFast;
@@ -286,14 +289,32 @@ PipelineCompilationModeOption("pipeline-optimization-level", cl::location(Pipeli
                   cl::values(clEnumValN(PipelineCompilationModeOptions::DefaultFast, "fast", "minimal analysis(default)"),
                              clEnumValN(PipelineCompilationModeOptions::Expensive, "aggressive", "full analysis")), cl::cat(CodeGenOptions));
 
+CircularBufferImplOptions CircularBufferImpl = CircularBufferImplOptions::Default;
+static cl::opt<CircularBufferImplOptions, true>
+CircularBufferImplOption("CircularBufferImpl", cl::location(CircularBufferImpl),
+                  cl::init(CircularBufferImplOptions::Default),
+                  cl::desc("Set how circular stream buffers are built:"),
+                  cl::values(clEnumValN(CircularBufferImplOptions::Default, "default", "Mach vm_remap on macOS, memfd elsewhere (default)"),
+                             clEnumValN(CircularBufferImplOptions::Memfd, "memfd", "memfd mapping (a temp file in /tmp on macOS)")), cl::cat(CodeGenOptions));
+
+unsigned CircularBufferPoolMiB = 64;
+static cl::opt<unsigned, true> CircularBufferPoolOption("CircularBufferPool", cl::location(CircularBufferPoolMiB), cl::init(64),
+                                                   cl::desc("MiB of released circular buffers kept for reuse by later pipeline runs "
+                                                            "(0 = unmap each buffer when released)."), cl::cat(CodeGenOptions));
+
+bool PoisonReusedBuffers = false;
+static cl::opt<bool, true> PoisonReusedBuffersOption("PoisonReusedBuffers", cl::location(PoisonReusedBuffers), cl::init(false),
+                                                   cl::desc("Fill each circular buffer taken from the reuse pool with 0xA5 instead "
+                                                            "of zeros (finds code that reads data no kernel wrote)."), cl::cat(CodeGenOptions));
+
 static cl::opt<bool, true> EnableObjectCacheOption("enable-object-cache", cl::location(EnableObjectCache), cl::init(true),
                                                    cl::desc("Enable object caching"), cl::cat(CodeGenOptions));
 
 bool UpdateObjectCache = false;
 static cl::opt<bool, true> UpdateObjectCacheOption("update-object-cache", cl::location(UpdateObjectCache), cl::init(false),
                                                    cl::desc("Force existing object cache entries to be recompiled and replaced, "
-                                                            "rather than reused. Implied if --optimization-level or "
-                                                            "--backend-optimization-level is explicitly set."), cl::cat(CodeGenOptions));
+                                                            "rather than reused. (Entries compiled at a lower --optimization-level "
+                                                            "or --backend-optimization-level than requested are replaced anyway.)"), cl::cat(CodeGenOptions));
 
 static cl::opt<bool, true> EnableModuleInlinerOption("enable-kernel-module-inliner", cl::location(EnableModuleInliner), cl::init(false),
                                                    cl::desc("Run a whole-module inliner pass over each kernel's IR before object generation."), cl::cat(CodeGenOptions));
@@ -302,15 +323,23 @@ static cl::opt<bool, true> TraceObjectCacheOption("trace-object-cache", cl::loca
                                                    cl::desc("Trace object cache retrieval."), cl::cat(JIT_InfoOptions));
 
 static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""),
-                                                 cl::desc("Path to the object cache diretory"), cl::cat(CodeGenOptions));
+                                                 cl::desc("Path to the object cache directory"), cl::cat(CodeGenOptions));
+
+std::string ObjectCacheSalt;
+static cl::opt<std::string, true> ObjectCacheSaltOption("object-cache-salt", cl::location(ObjectCacheSalt), cl::init(""),
+                                                        cl::desc("Extra string added to the key of every object cache entry, so that "
+                                                                 "experimental builds or settings get their own entries rather than "
+                                                                 "reusing (or overwriting) the normal ones. Letters, digits, '.', '_' "
+                                                                 "and '-' only."), cl::cat(CodeGenOptions));
 
 // The custom allocator keeps persistent, long-lived exec/data slab pools rather than
 // allocating a small dedicated region per compiled object as LLVM's default in-process
-// memory manager does. That's a deliberate linking-speed optimization, but under LLVM 21
-// it can place exec and data content too far apart for Mach-O compact-unwind info's
-// 32-bit deltas, so it defaults to off there; LLVM < 21 is unaffected and defaults to on.
+// memory manager does. That's a deliberate linking-speed optimization, but from LLVM 20,
+// where JITLink began emitting Mach-O compact-unwind info, it can place exec and data
+// content too far apart for that info's 32-bit deltas, so it defaults to off there;
+// LLVM < 20 is unaffected and defaults to on.
 static cl::opt<bool, true> UseCustomJITMemoryManagerOption("use-custom-jit-memory-manager", cl::location(UseCustomJITMemoryManager),
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(20, 0, 0)
     cl::init(false),
     #else
     cl::init(true),
@@ -360,6 +389,17 @@ static cl::opt<unsigned, true> SegmentSizeOption("segment-size", cl::location(Se
 static cl::opt<unsigned, true> BufferSegmentsOption("buffer-segments", cl::location(BufferSegments), cl::init(1),
                                                cl::desc("Buffer Segments"), cl::value_desc("positive integer"));
 
+static cl::opt<unsigned, true> PhaseSegmentLimitOption("phase-segment-limit", cl::location(PhaseSegmentLimit), cl::init(100),
+                                               cl::desc("In a pipeline with phase boundaries, the number of segments a thread may process in a phase "
+                                                        "before moving to the next one, and the number of segments buffered between phases"),
+                                               cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
+
+static cl::opt<unsigned, true> PhaseClaimSegmentsOption("phase-claim-segments", cl::location(PhaseClaimSegments), cl::init(4),
+                                               cl::desc("In a pipeline with phase boundaries, the number of segments the most recent earlier "
+                                                        "phase must have started since a later phase's last segment before a thread claims "
+                                                        "another segment of the later phase (at most --phase-segment-limit)"),
+                                               cl::value_desc("positive integer"), cl::cat(CodeGenOptions));
+
 
 unsigned Z3_Timeout;
 static cl::opt<unsigned, true> Z3_TimeoutOption("Z3-timeout", cl::location(Z3_Timeout), cl::init(3000),
@@ -382,6 +422,16 @@ static cl::opt<unsigned, true> ScanBlocksOption("scan-blocks", cl::location(Scan
 std::string TraceOption = "";
 static cl::opt<std::string, true> TraceValueOption("trace", cl::location(TraceOption),
                                             cl::desc("Trace the values of variables beginning with the given prefix."), cl::value_desc("prefix"), cl::cat(CodeGenOptions));
+
+UTF8ErrorMode UTF8Errors;
+static cl::opt<UTF8ErrorMode, true> UTF8ErrorsOption("utf8-errors", cl::location(UTF8Errors),
+    cl::init(UTF8ErrorMode::UseReplacementChar),
+    cl::desc("Treatment of ill-formed UTF-8 input (each maximal ill-formed subpart):"),
+    cl::values(clEnumValN(UTF8ErrorMode::Abort, "abort-on-error", "process the input up to the first error, then stop"),
+               clEnumValN(UTF8ErrorMode::DropBadInput, "drop-bad-characters", "drop the ill-formed input"),
+               clEnumValN(UTF8ErrorMode::UseReplacementChar, "use-replacement-char",
+                          "replace the ill-formed input with U+FFFD (default)")),
+    cl::cat(CodeGenOptions));
 
 bool EnableIllustrator;
 static cl::opt<bool, true> OptEnableIllustrator("enable-illustrator", cl::location(EnableIllustrator),
@@ -414,6 +464,8 @@ unsigned BlockSize;
 unsigned SegmentSize;
 
 unsigned BufferSegments;
+unsigned PhaseSegmentLimit;
+unsigned PhaseClaimSegments;
 unsigned TaskThreads;
 unsigned SegmentThreads;
 
@@ -424,7 +476,6 @@ bool EnableModuleInliner = false;
 bool EnablePipelineObjectCache = true;
 bool TraceObjectCache;
 bool UseCustomJITMemoryManager = true;
-bool ObjectCacheForceUpdate = false;
 
 unsigned CacheDaysLimit;
 
@@ -465,7 +516,10 @@ bool LLVM_READONLY AnyDebugOptionIsSet() {
     #ifdef FORCE_ASSERTIONS
     return true;
     #endif
-    return (KernelFlags.getBits() != 0) || 
+    // -VerifyCache only checks cached kernels against the code generated for them, so it
+    // must not change that code (as debug options do, e.g. by adding instrumentation).
+    const auto kernelFlags = KernelFlags.getBits() & ~(1u << VerifyCache);
+    return (kernelFlags != 0) ||
            (JIT_InfoFlags.getBits() != 0) || 
            (StatisticsOptions.getBits() != 0);
 }
@@ -594,16 +648,20 @@ void ParseCommandLineOptions(int argc, const char * const *argv, std::initialize
     } else if (disablePipelineObjectCacheDueToCommandLineOptions()) {
         EnablePipelineObjectCache = false;
     }
-    // A cache entry compiled under one --optimization-level/--backend-optimization-level
-    // setting is not distinguished from one compiled under another (they share the same
-    // cache key), so silently reusing it would serve code built at the wrong opt level.
-    // Rather than growing the cache with a separate entry per opt level, explicitly
-    // setting either flag (or passing --update-object-cache directly) forces existing
-    // entries to be recompiled and replaced in place.
-    ObjectCacheForceUpdate = UpdateObjectCache
-        || (OptimizationLevel.getNumOccurrences() > 0)
-        || (BackEndOptOption.getNumOccurrences() > 0);
+    if (PhaseSegmentLimit == 0) {
+        report_fatal_error("--phase-segment-limit must be positive");
+    }
+    if (PhaseClaimSegments == 0) {
+        report_fatal_error("--phase-claim-segments must be positive");
+    }
+    PhaseClaimSegments = std::min(PhaseClaimSegments, PhaseSegmentLimit);
     ObjectCacheDir = ObjectCacheDirOption.empty() ? nullptr : ObjectCacheDirOption.data();
+    // The salt becomes part of each cache file name.
+    for (const char c : ObjectCacheSalt) {
+        if (!(isalnum(static_cast<unsigned char>(c)) || (c == '.') || (c == '_') || (c == '-'))) {
+            report_fatal_error(Twine("--object-cache-salt may contain only letters, digits, '.', '_' and '-': ") + ObjectCacheSalt);
+        }
+    }
     target_Options.MCOptions.AsmVerbose = true;
 
     if (UseMCJIT) {

@@ -14,7 +14,7 @@ SRC
     re_analysis.cpp
     re_inspector.cpp
     re_name_gather.cpp
-    re_local.cpp
+    replacement_analysis.cpp
     validation.cpp
 DEPS
     re.adt

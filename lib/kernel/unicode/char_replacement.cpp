@@ -14,6 +14,8 @@
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/data/PropertyObjectTable.h>
 #include <re/adt/re_cc.h>
+#include <toolchain/toolchain.h>
+#include <kernel/pipeline/pipeline_builder.h>
 
 using namespace kernel;
 using namespace llvm;

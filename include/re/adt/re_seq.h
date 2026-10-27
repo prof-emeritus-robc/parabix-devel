@@ -24,6 +24,13 @@ public:
     static inline bool classof(const void *) {
         return false;
     }
+    template<typename iterator> static Seq * Create(const iterator begin, const iterator end) {return new Seq(begin, end);}
+    static Seq * Create(std::initializer_list<RE *> list) {
+        return new Seq(list.begin(), list.end());
+    }
+    static Seq * Create() {
+        return new Seq();
+    }
 protected:
     friend Seq * makeSeq();
     template<typename iterator> friend RE * makeSeq(const iterator, const iterator);

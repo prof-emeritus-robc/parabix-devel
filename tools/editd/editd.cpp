@@ -45,8 +45,6 @@ static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<regex> <input
 static cl::list<std::string> pattVector("e", cl::desc("pattern"), cl::ZeroOrMore);
 static cl::opt<std::string> PatternFilename("f", cl::desc("Take patterns (one per line) from a file"), cl::value_desc("regex file"), cl::init(""));
 
-static cl::opt<bool> CaseInsensitive("i", cl::desc("Ignore case distinctions in the pattern and the file."));
-
 static cl::opt<int> editDistance("edit-dist", cl::desc("Edit Distance Value"), cl::init(2));
 static cl::opt<int> optPosition("opt-pos", cl::desc("Optimize position"), cl::init(0));
 static cl::opt<int> stepSize("step-size", cl::desc("Step Size"), cl::init(3));

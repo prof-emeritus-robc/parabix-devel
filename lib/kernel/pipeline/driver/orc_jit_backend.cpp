@@ -889,28 +889,36 @@ private:
         TargetMachine * const TM = ctx.TargetMachine.get();
 
         if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
-            std::unique_ptr<MemoryBuffer> cached;
-            std::unique_ptr<Module> M;
-            std::tie(cached, M) = ObjectCache->loadCachedObjectFile(builder, Target);
-            if (M) {
 
-                setModuleTargetTriple(M, TM->getTargetTriple());
-                M->setDataLayout(ctx.DataLayout);
+            if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::VerifyCache) && Target->hasDeterministicCodeGeneration())) {
+                // Generate the kernel as if it were not cached; materializeObject links the cached
+                // object instead of compiling the module only if the IR matches the entry's.
+            } else {
+                std::unique_ptr<MemoryBuffer> cached;
+                std::unique_ptr<Module> M;
+                std::tie(cached, M) = ObjectCache->loadCachedObjectFile(builder, Target);
+                if (M) {
 
-                Target->loadCachedKernel(M.get());
-                Target->recordScalarFieldIndices();
-                builder.setModule(M.get());
-                ctx.CurrentModule = M.get();
-                ctx.Engine = Engine;
+                    setModuleTargetTriple(M, TM->getTargetTriple());
+                    M->setDataLayout(ctx.DataLayout);
 
-                Target->linkExternalMethods(builder);
+                    Target->loadCachedKernel(M.get());
+                    Target->recordScalarFieldIndices();
+                    builder.setModule(M.get());
+                    ctx.CurrentModule = M.get();
+                    ctx.Engine = Engine;
 
-                auto & linker = Engine->getObjLinkingLayer();
-                auto & JITLib = Engine->getMainJITDylib();
-                cantFail(linker.add(JITLib, std::move(cached)));
-                goto record_decl;
+                    Target->linkExternalMethods(builder);
+
+                    auto & linker = Engine->getObjLinkingLayer();
+                    auto & JITLib = Engine->getMainJITDylib();
+                    cantFail(linker.add(JITLib, std::move(cached)));
+                    goto record_decl;
+                }
             }
         }
+
+
 
         BEGIN_SCOPED_REGION
         Module * const M = Target->makeEmptyModule(builder); assert (M);
@@ -988,22 +996,40 @@ record_decl:
 
         Target->generateKernel(builder, TM, GlobalValue::ExternalLinkage);
 
+        if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::VerifyCache) && Target->hasDeterministicCodeGeneration())) {
+            if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
+                auto verification = ObjectCache->loadCachedObjectFileForVerification(builder, Target);
+                if (LLVM_UNLIKELY(verification.Object != nullptr)) {
+                    // -VerifyCache: a mismatch is a fatal error; an entry without a hash is recompiled.
+                    if (ObjectCache->verifyIRHash(Target, *M, verification)) {
+                        delete M;
+                        auto & linker = Engine->getObjLinkingLayer();
+                        auto & JITLib = Engine->getMainJITDylib();
+                        cantFail(linker.add(JITLib, std::move(verification.Object)));
+                        WorkQueue.decrementObjectFlightCount(Target->getCompilationPriority());
+                        return;
+                    }
+                }
+            }
+        }
+
+
+        if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
+            ParabixObjectCache::recordIRHash(*M);
+        }
+
         Kernel::SelectedOptimizationPasses passes;
         Target->addOptimizationPasses(builder, passes);
         BaseDriver::runAllOptimizationPasses(builder, passes, TM, IROutput, OptIROutput);
 
         END_SCOPED_REGION
 
-        auto optLevel = llvm::CodeGenOptLevel::Default;
-        if (LLVM_UNLIKELY(Target->hasAttribute(AttrId::InfrequentlyUsed))) {
-            optLevel = codegen::BackEndOptLevel;
-        }
-        TM->setOptLevel(optLevel);
 
+        TM->setOptLevel(codegen::BackEndOptLevel);
 
         legacy::PassManager PM;
 
-        const auto atLeastOpt1 = optLevel != llvm::CodeGenOptLevel::None;
+        const auto atLeastOpt1 = codegen::BackEndOptLevel != llvm::CodeGenOptLevel::None;
 
         SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> objBuffer;
@@ -1292,7 +1318,7 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
                                   mDriver.mObjectCache.get());
 
     // Our custom CPUDriverJITMemoryManager's persistent exec/data slab pools are a
-    // linking-speed optimization, but under LLVM 21 they can trigger "__TEXT,__unwind_info,
+    // linking-speed optimization, but from LLVM 20 they can trigger "__TEXT,__unwind_info,
     // delta to end of functions ... exceeds 32 bits" JIT session errors from JITLink's
     // Mach-O/arm64 compact-unwind handling (confirmed specific to our allocator; LLVM's own
     // InProcessMemoryManager, which allocates a small dedicated region per object rather

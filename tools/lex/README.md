@@ -48,8 +48,8 @@ make tokenizer
 ```
 
 All compiled tools land under `build19/bin/`; the tokenizer binary is
-`build19/bin/tokenizer`. The test scripts in `tokenizer-test/` hard-code
-`build19`, so prefer that directory name.
+`build19/bin/tokenizer`. The test scripts in `tokenizer-test/` default to that
+binary; pass `--tokenizer=PATH` to use another build directory.
 
 ## Tokenizer
 
@@ -249,7 +249,7 @@ many more kernels, which is what drives the fixed per-call dispatch floor (see
 The Python ground truth for this partition is
 `tools/lex/merge_analysis.py::clean_range_analysis`.
 
-### Alternative partition — ASAP level scheduling (`--level-partition`)
+### Alternative partition — ASAP level scheduling (`--partition=level`)
 
 The clean-range walk closes a group at the **first** violating rule and never
 rewinds, so groups are contiguous rank intervals. That contiguity, not the two
@@ -257,7 +257,7 @@ conditions, sets the kernel count: 1098 of the 1123 groups close on a conflict,
 and at each break ~179 of the next 200 rules would still have fit. Group size
 saturates near 44, and 50000 / 44.5 = 1123.
 
-`--level-partition` drops contiguity only. Each rule takes its earliest legal
+`--partition=level` drops contiguity only. Each rule takes its earliest legal
 kernel:
 
 ```
@@ -475,9 +475,20 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 
 | Flag | Default | Cache tag | What it does |
 |---|---|---|---|
-| `--level-partition` | off | (via rule set + `o{bits}`) | Partition merge rules by **ASAP level scheduling** (minimum kernel count) instead of contiguous clean id ranges. Full GPT-2: **1123 → 283 kernels**. Same two correctness conditions, only the packing changes — see [Alternative partition](#alternative-partition--asap-level-scheduling---level-partition). Verified byte-identical output. |
-| `--compact-base=N` | `0` (off) | `L{maxLen}` | Base kernel index at which `FilterByMask` compaction first shrinks the inter-kernel streams. `0` = no compaction. Larger streams stay full-width; compaction trades a per-point compact/expand cost for cheaper downstream kernels. |
-| `--geometric-compaction` | off | (via `L`) | Space the compaction points geometrically instead of arithmetically (denser early, sparser later). Only meaningful with `--compact-base > 0`. |
+| `--partition=level` | (one of `--partition`'s values; default `clean`) | (via rule set + `o{bits}`) | Partition merge rules by **ASAP level scheduling** (minimum kernel count) instead of contiguous clean id ranges. Full GPT-2: **1123 → 283 kernels**. Same two correctness conditions, only the packing changes — see [Alternative partition](#alternative-partition--asap-level-scheduling---partitionlevel). Verified byte-identical output. |
+| `--partition=bit-tier` | (one of `--partition`'s values; default `clean`) | (via rule set + `w{bits}`/`o{bits}`) | Confine each kernel to merged ids of **one bit length**: tier *b* = rules with `idAB` in `[2^(b-1), 2^b)`, each tier partitioned on its own via ASAP level scheduling, tiers run in order. Mutually exclusive with `level`/`asymmetric`/`chain`. The first kernel of tier N+1 reads N-bit ids and writes N+1 bits; the rest of the tier reads and writes N+1 bits. Full GPT-2: 283 → 299 kernels, **but** ASAP piles most of a tier into its first level (tier 16's first kernel has 8023 rules), which makes Pablo compile time blow up — `--max-merges-per-kernel` (default 500) splits such kernels. |
+| `--max-merges-per-kernel=N` | `500` | (via rule set) | Split any partition group with more than `N` rules into consecutive kernels of about `n/ceil(n/N)` rules. With `--if-test-significant-bits` (and no `--asymmetric-seam`/`--chain-veto`) chunks are filled **by gate key**, keeping each `--chain-partition` tree whole, so rules sharing a gate stay in one kernel; otherwise in rank order. Exact either way: a group's rules have no dependencies or seams among them. Also the default `--key-cluster` move cap. `0` = no cap. No effect on full GPT-2 with plain clean ranges (max 196) or plain `--partition=level` (max 373). |
+| `--key-cluster` | off | `kc1_` | With `--partition=level` and `--if-test-significant-bits`: move rules later, within their compaction segment, so rules sharing a gate key share a kernel. Under `--partition=bit-tier` it runs per tier using global kernel indices (`--if-group-lower-limit`) and the real compaction points (linear/geometric counted across tiers; under `--compaction=by-output-bits` each tier is one segment). |
+| `--key-cluster-cap=N` | `--max-merges-per-kernel` | — | Override key-cluster's move cap: never move a rule into a kernel already holding `N` rules (`0` = none). Rules at their ASAP level are not capped; `--max-merges-per-kernel` splits those. |
+| `--bit-xfrm-limit=N` | `0` (off) | `BPEXfrm_` kernel name (`st_` for subtiers) | Build every merge kernel whose **output ids have at most N bits** (with `--partition=bit-tier`: tiers 9..N) as a bit transformation (`BPEXfrmKernel`, see [Bit-transformation kernels](#bit-transformation-kernels---bit-xfrm-limit)) instead of per-rule gates. Ids over 10 bits are split into subtiers: classes over the low 20−N bits of idA and all N bits of idB, one block per value of idA's high bits. Kernels with `--chain-partition`, `--asymmetric-seam` or `--chain-veto` rules, or under `--indexed-shift`, keep the per-rule body. Replaces `--max-bit-xfrm-limit` and `--full-subtiering-limit`. |
+| `--subtier-gating-bits=K` | `17` (no gates) | `sg{K}_` | Put a subtier block in a `createIf` only when its key shows the keyed id has at least K bits. Gates almost never skip a block (large ids occur in nearly every block), so the default gates none; `0` gates every subtier (10–25% slower in tiers 12–14). |
+| `--subtier-grouping-by-min-ID=N` | `0` (off) | `gm_` | In tiers ≥ N, key a rule with idA > idB on idB's high bits (read at its lookahead), classes over the low bits of idB and all bits of idA: about a third fewer subtiers per kernel in tiers 13–16, but only faster while every subtier is gated. |
+| `--self-merge-block` | off | `smb_` | Resolve a kernel's self-merges (X+X→XX) together: per span L, equality with the next token (XOR, OR-reduce, negate) AND membership in the kernel's X set gates one block that pairs each run left to right and stamps by bit transformation. Merge and bit-transformation kernels; −2% (default backend) to −7% (aggressive) single-threaded on 20 MB of Finnish Wikibooks. |
+| `--bit-frequency-statistics` | off | — | Report how many output tokens have ids of at least N bits, N = 10..16. |
+| `--merge-frequency-statistics` | off | — | Report, per merge id bit tier, the merges made and how many join two ids of at least N bits, N = 10..16 (one counting kernel after each merge kernel). |
+| `--compaction=MODE` | (see text) | (via `L`) | Compaction schedule. `linear`: a `FilterByMask` after every `--compact-base` kernels. `geometric`: after `--compact-base` kernels, then doubling the interval. `by-output-bits`: between two kernels whose output id widths differ (after each bit tier under `--partition=bit-tier`); `--compact-base=N` is then the **minimum kernel number**, so a width change after fewer than N kernels is skipped and compaction waits for the next one. Not given: `linear` if `--compact-base > 0` (`geometric` with `--geometric-compaction`), else none. Conflicting settings (e.g. `--geometric-compaction` with another mode, or `linear`/`geometric` without `--compact-base`) halt with a message. |
+| `--compact-base=N` | `0` (off) | `L{maxLen}` | `linear`/`geometric`: kernels per compaction interval (`0` = no compaction). `by-output-bits`: minimum kernel number for a compaction. `BPE_COMPACT_EVERY` overrides it. Compaction trades a per-point filter cost for cheaper downstream kernels. |
+| `--geometric-compaction` | off | (via `L`) | Same as `--compaction=geometric`; needs `--compact-base > 0`. |
 | `--if-group-lower-limit=N` | `-1` (off) | `g{size}_` | **Master switch for grouped-if.** For kernels at/after index `N`, replace the one-`createIf`-per-rule structure with range-gated group gates (rules sorted by `idA`, chopped into chunks, one `createIf` per chunk on the id range it spans). A block with no live id in a chunk's range skips that whole chunk. `-1` = per-rule ifs everywhere. Left at its default, it becomes `0` whenever `--if-group-size`, `--if-group-count` or `--if-test-significant-bits` is given. |
 | `--if-group-count=K` | `1` | `g{rules/K}_` | Grouped kernels get **K gates each**; gate size = `rules/K` (scales with kernel). Only active with `--if-group-lower-limit >= 0`. |
 | `--if-group-size=S` | `1` | `g{S}_` | **Fixed** `S` rules per gate regardless of kernel size (gate count = `rules/S`). **Overrides `--if-group-count` when `!= 1`.** `1` = defer to `--if-group-count`. |
@@ -486,7 +497,7 @@ therefore A/B two flag settings back-to-back **without** wiping the cache.
 
 ### Compaction and slot distances
 
-`--compact-base=N` inserts a `FilterByMask` after every N kernels. Merges kill
+`--compaction` (with `--compact-base=N`) inserts `FilterByMask` points between kernels. Merges kill
 positions but do not shrink the stream, so without it every later kernel keeps
 scanning dead bytes. The filter keeps exactly the live token starts, one position
 each — call those **slots**.
@@ -511,7 +522,7 @@ if (k != kernelOf.end() && (long) k->second <= lastCompactKernel)
 
 This was previously approximated by `id < frontier` (`frontier = g.hi`), which is
 equivalent **only** when groups tile the id axis in rank order — true for clean
-ranges, false under `--level-partition` where `hi` is a running max. Every id then
+ranges, false under `--partition=level` where `hi` is a running max. Every id then
 tested as already built, every `lenA` collapsed to 1, and merges whose left part
 postdates the squeeze silently never fired (`Ġrestaurant` → `Ġrestaur` + `ant`;
 3134 tokens instead of 2708 on `webtext_10`). Word prefixes stayed correct because
@@ -531,6 +542,36 @@ moves the peek-ahead work inside those gates so cold chunks skip it too, while
 peek placements are mutually exclusive — precedence in the kernel body is
 indexed-nextId > in-group > in-gate > hoisted (default).
 
+### Bit-transformation kernels (`--bit-xfrm-limit`)
+
+For a kernel with an N-bit input id stream, `BPEXfrmKernel` buckets the rules by
+`L = lenA` (the lookahead distance to B's start) and forms one 2N-bit vector per
+bucket: the N id bits at `p` followed by the N id bits at `p+L`, so a rule's
+`(idA, idB)` pair is the value `idA | idB << N`. For each output bit `j`, the
+values of the rules whose `idAB` bit `j` differs from `idA` bit `j` (for `j >= N`:
+whose `idAB` bit `j` is set) form a set, compiled by `cc::Parabix_CC_Compiler`
+over that vector. Then
+
+```
+change_j = OR over L of ( CC_{L,j} AND live AND NOT boundary(p+L) )
+out_j    = in_j XOR change_j
+```
+
+and the union of each bucket's values gives its fire stream, which consumes B's
+start (`live &= ~Advance(fire_L, L)`). This is exact because at most one rule
+fires per position (the frozen id selects `idA`, and rules sharing `idA` share `L`)
+and same-kernel rules never touch each other's positions. Self-merges `X+X` keep a
+per-rule stamp (per-run pairing is not a set membership test) or join
+`--self-merge-block`.
+
+`re::CC` holds codepoints up to `0x10FFFF`, so a pair value has 20 bits. Ids of more
+than 10 bits are split into **subtiers**: the classes take the low 20−N bits of idA
+and all N bits of idB, and the high 2N−20 bits of idA (4 subtiers in the 11-bit tier,
+16 in the 12-bit tier, …) name a rule's subtier. Each subtier present in a kernel is
+one block — its classes ANDed with "idA's high bits at `p` equal the key" — shared by
+every `L`. Every rule belongs to exactly one block, so the result equals the unsplit
+form. By default the blocks are not in `createIf`s (`--subtier-gating-bits`).
+
 ### Correctness testing
 
 Every optimization must be **byte-identical** to the baseline. Two ways to check.
@@ -540,7 +581,7 @@ Every optimization must be **byte-identical** to the baseline. Two ways to check
 ```bash
 cd tokenizer-test
 python3 compare_bpe.py --no-timing                              # baseline
-python3 compare_bpe.py --no-timing --tok-flag=--level-partition # flag under test
+python3 compare_bpe.py --no-timing --tok-flag=--partition=level # flag under test
 ```
 
 `--tok-flag` is repeatable and forwards verbatim to the binary; use the `=` form
@@ -594,6 +635,95 @@ Notes:
 - Cross-run absolute MB/s is noisy; trust only **back-to-back** A/B deltas.
 - Confirm a flag engaged by inspecting the IR on a debug build:
   `build_debug/bin/tokenizer --ShowOptimizedPablo --ToShow="BPEMerge*" --merges=tools/lex/merges.txt <flags> build19/test.txt`.
+
+### Results: id-bit tiers, compaction and bit-transformation kernels (2026-10-01)
+
+Full GPT-2 merges, `--pretokenizer=bytelevel`, one macOS machine. Every
+configuration below produced output byte-identical to `--partition=level`, both on a
+300 KB mixed text/source file and on the first 1 MB of `QA/TestCorpora/Twain.txt`.
+Not yet compared against HuggingFace.
+
+These results predate `--bit-xfrm-limit` (2026-10-06), which replaced
+`--max-bit-xfrm-limit` and its wide-id scheme (an if-block per pair of high bits of
+idA and idB) with subtiers. On 20 MB of Finnish Wikibooks, single-threaded with
+`--compaction=by-output-bits --self-merge-block`, subtiers were 10–13% cheaper than
+that scheme in each of tiers 12–16, and all-tier bit transformation (`--bit-xfrm-limit=16`)
+cut merge-kernel time from 23.2 s (tiers 15–16 per-rule) to 15.7 s at the default
+backend level.
+
+Abbreviations: **LT** = `--partition=bit-tier`;
+**KC** = `--if-test-significant-bits=3 --key-cluster`; **bits** =
+`--compaction=by-output-bits`; **xN** = `--max-bit-xfrm-limit=N` as defined at the
+time, when it selected inputs of **fewer than** N bits (x11 here = today's
+`--max-bit-xfrm-limit=10`). Default
+`--max-merges-per-kernel=500` throughout.
+
+**Throughput**: `--bench-loop=5`, 1 MB Twain, median ms per tokenization from two
+processes. Treat differences under about 5% as noise.
+
+| Config | Kernels | Median ms |
+|---|---|---|
+| `--partition=level` | 283 | 3146 / 3204 |
+| LT, no compaction | 342 | 4213 / 4224 |
+| LT + bits | 342 | 1749 / 1769 |
+| LT + bits + x9 / x10 / x11 | 342 | 1727–1786 / 1720–1728 / 1675–1685 |
+| `--partition=level --compaction=geometric --compact-base=2` (7 points, like LT + bits) | 283 | 1370 / 1406 |
+| `--partition=level` + KC | 297 | 1325 / 1344 |
+| LT + KC, no compaction | 331 | 1371 / 1380 |
+| LT + KC + bits | 331 | 656 / 718 |
+| LT + KC + bits + x9 / x10 / x11 | 331 | 676–677 / 636–651 / 646–649 |
+
+**Bit-transformation kernels, per kernel**: `-EnableCycleCounter` cycles for the
+32 kernels with 8–10-bit inputs, compared position by position:
+
+| Input → output bits | Kernels | LT + bits: per-rule → x11 | LT + KC + bits: per-rule → x11 |
+|---|---|---|---|
+| 8 → 9 | 1 | 0.24× | 0.55× |
+| 9 → 9 | 14 | 0.25× | 0.40× |
+| 9 → 10 | 1 | 0.23× | 0.51× |
+| 10 → 10 | 15 | 0.25× | 0.46× |
+| 10 → 11 | 1 | 0.12× | 0.42× |
+| all 32 | 32 | 0.19× | 0.44× |
+
+Compile time with the object cache off: LT + bits 93.0 s → 94.9 s with x11;
+LT + KC + bits 37.9 s → 37.6 s.
+
+Findings:
+- Compaction gives the large gains. Tiering alone slows LT by 33% and leaves KC
+  unchanged; tiering plus `by-output-bits` compaction makes KC about 2× faster.
+- For LT, tier-boundary compaction is not the best placement: untiered
+  `--partition=level` with geometric compaction at base 2 (also 7 points) beats
+  LT + bits. KC with geometric compaction has not been measured.
+- Bit-transformation kernels are 2–5× cheaper than per-rule kernels, but the
+  8–10-bit kernels are only 3–4% of merge-kernel cycles, so end-to-end time improves
+  by just 2–4%. Most time is in the 11–16-bit kernels, past the 21-bit `re::CC`
+  limit.
+
+**Gated bit transformation for all widths** (2026-10-02). `--max-bit-xfrm-limit=N`
+now means "at most N input bits", and ids over 10 bits are gated by if-blocks on
+their high bits. Same setup as above; xN below uses the new meaning. All
+configurations match `--partition=level` on both inputs.
+
+| Config | Bit-xfrm kernels | Median ms (1 MB Twain) | Compile, cache off |
+|---|---|---|---|
+| LT + bits + x10 | 32 of 342 | 1618 / 1628 | — |
+| LT + bits + x13 | 108 of 342 | 1491 / 1494 | — |
+| LT + bits + x16 | 342 of 342 | **344 / 379** | 15.7 s (93.0 s without) |
+| LT + KC + bits + x10 | 32 of 331 | 655 / 670 | — |
+| LT + KC + bits + x13 | 106 of 331 | 605 / 623 | — |
+| LT + KC + bits + x16 | 331 of 331 | **293 / 301** | 13.6 s (37.9 s without) |
+
+Merge-kernel cycles with x16, relative to the per-rule body of the same partition
+(`-EnableCycleCounter`, 1 MB Twain), by input id width:
+
+| Input bits | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| LT + bits | 0.22× | 0.21× | 0.14× | 0.19× | 0.18× | 0.17× | 0.15× | 0.14× | 0.14× | **0.15×** |
+| LT + KC + bits | 0.55× | 0.41× | 0.43× | 0.44× | 0.41× | 0.36× | 0.34× | 0.32× | 0.28× | **0.32×** |
+
+The gated form is cheapest relative to per-rule kernels at the widest ids, where most
+of the time was. Untiered partitions with x16 (e.g. with geometric compaction) have
+not been benchmarked yet.
 
 ## Testing
 

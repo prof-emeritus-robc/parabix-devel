@@ -5,6 +5,7 @@
 #include <kernel/bitwise/bixlogic.h>
 #include <kernel/core/kernel_builder.h>
 #include <pablo/pablo.h>
+#include <kernel/pipeline/pipeline_builder.h>
 
 using namespace llvm;
 using namespace pablo;

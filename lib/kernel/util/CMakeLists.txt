@@ -19,6 +19,12 @@ DEPS
     pablo.bixnum
     re.cc
     kernel.pipeline
-    kernel.basis
     kernel.streamutils
+    kernel.unicode
+# kernel.streamutils is linked only to build pipelines from its kernels.
+CODEGEN_DEPS
+    pablo.compiler
+    pablo.bixnum
+    re.cc
+    kernel.unicode
 )

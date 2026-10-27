@@ -1,8 +1,8 @@
 #include <grep/nested_grep_engine.h>
+#include <grep/grep_kernel.h>
+#include <kernel/bitwise/bixlogic.h>
 #include <re/unicode/regex_passes.h>
 #include <re/unicode/casing.h>
-#include <re/transforms/exclude_CC.h>
-#include <re/transforms/to_utf8.h>
 #include <re/unicode/re_name_resolve.h>
 #include <kernel/io/source_kernel.h>
 #include <kernel/basis/s2p_kernel.h>
@@ -54,14 +54,14 @@ protected:
 
 NestedInternalSearchEngine::NestedInternalSearchEngine(BaseDriver & driver)
 : mGrepRecordBreak(GrepRecordBreakKind::LF)
-, mCaseInsensitive(false)
 , mGrepDriver(driver)
-, mNested(1, nullptr) {
+, mNested(1, nullptr)
+, mIsFilter(1, false) {
 
 
 }
 
-void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
+void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool filter) {
     // If we have no patterns and this is the "root" pattern,
     // we'll still need an empty gitignore kernel even if it
     // just returns the record break stream for input.
@@ -97,14 +97,32 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
     assert (mNested.size() > 0 && mNested[0] == nullptr);
     assert (mNested.size() == 1 || mNested[1] != nullptr);
+    assert (mIsFilter.size() == mNested.size());
 
     Kernel * kernel = nullptr;
 
+    // The level whose selection this level modifies: the nearest enclosing
+    // level that is not a filter (none, for a filter level).
+    Kernel * enclosing = nullptr;
+    if (!filter) {
+        for (size_t k = mNested.size() - 1; k > 0; --k) {
+            if (!mIsFilter[k]) {
+                enclosing = mNested[k];
+                break;
+            }
+        }
+    }
+
     if (LLVM_UNLIKELY(patterns.empty())) {
 
-        if (LLVM_LIKELY(mNested.size() > 1)) {
-            kernel = mNested.back(); assert (kernel);
-            mNested.push_back(kernel);
+        if (LLVM_LIKELY(enclosing != nullptr)) {
+            // Reuse the enclosing level's kernel, bound to this pipeline's streams.
+            kernel = enclosing;
+            assert (kernel->getNumOfStreamInputs() == 3);
+            kernel->setInputStreamSetAt(0, basisBits);
+            kernel->setInputStreamSetAt(1, U8index);
+            kernel->setInputStreamSetAt(2, breaks);
+            kernel->setOutputStreamSetAt(0, matches);
         } else {
             kernel = new CopyBreaksToMatches(P.getTypeSystem(),
                                              basisBits, U8index, breaks,
@@ -122,16 +140,10 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 
         E.setStride(E.getTypeSystem().getBitBlockWidth());
 
-        std::string tmp;
-        raw_string_ostream name(tmp);
-        name << "gitignore";
-
         const auto n = patterns.size();
         assert (n > 0);
-        SmallVector<Kernel *, 32> pipeline;
-        pipeline.reserve(n + 1);
 
-        Kernel * const outerKernel = mNested.back();
+        Kernel * const outerKernel = enclosing;
         StreamSet * resultSoFar = breaks;
         if (outerKernel) {
             Kernel * const chained = E.AddKernelFamilyCall(outerKernel);
@@ -139,18 +151,12 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             chained->setInputStreamSetAt(0, basisBits);
             chained->setInputStreamSetAt(1, U8index);
             chained->setInputStreamSetAt(2, breaks);
-            pipeline.push_back(chained);
             assert (chained->getNumOfStreamOutputs() > 0);
             resultSoFar = chained->getOutputStreamSet(0); assert (resultSoFar);
         }
 
-        RE_CompilerContext ctxt;
-        ctxt.setCodeUnitContext(&cc::UTF8, basisBits);
-        ctxt.setIndexingContext(&cc::Unicode, U8index);
         StreamSet * matchStarts = E.CreateStreamSet(1, 1);
         E.CreateKernelCall<LineStartsKernel>(breaks, matchStarts);
-        ctxt.setMatchRegions(matchStarts, breaks);
-        RE_PipelineBuilder RE_PB(E, ctxt);
 
         for (unsigned i = 0; i != n; ++i) {
             StreamSet * MatchResults = nullptr;
@@ -160,61 +166,67 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
             } else {
                 MatchResults = E.CreateStreamSet();
             }
-
-            auto r = resolveCaseInsensitiveMode(patterns[i].second, mCaseInsensitive);
-            r = regular_expression_passes(r);
-            //r = re::exclude_CC(r, breakCC);
-            //r = resolveAnchors(r, breakCC);
-            r = toUTF8(r);
             // check if we need to combine the current result with the new set of matches
+            // (a filter level starts from no records, others from all records)
             const bool exclude = (patterns[i].first == re::PatternKind::Exclude);
-            if (i || outerKernel || exclude) {
-                ctxt.setCombiningStream(resultSoFar, exclude ? RE_CombiningType::Exclude : RE_CombiningType::Include);
+            if (i || outerKernel || exclude || !filter) {
+                StreamSet * const matchedRecords = E.CreateStreamSet();
+                matchingRecords(E, patterns[i].second, basisBits, U8index, breaks, matchStarts, matchedRecords);
+                if (exclude) {
+                    StreamSet * const unmatchedRecords = E.CreateStreamSet();
+                    E.CreateKernelCall<InvertMatchesKernel>(matchedRecords, breaks, unmatchedRecords);
+                    AndCombine(E, resultSoFar, unmatchedRecords, MatchResults);
+                } else {
+                    OrCombine(E, resultSoFar, matchedRecords, MatchResults);
+                }
+            } else {
+                matchingRecords(E, patterns[i].second, basisBits, U8index, breaks, matchStarts, MatchResults);
             }
-            Kernel * K = E.CreateKernelFamilyCall<RE_Kernel>(ctxt, r, MatchResults);
-            pipeline.push_back(K);
             resultSoFar = MatchResults;
 
         }
         assert (resultSoFar == E.getOutputStreamSet(0));
 
-        mGrepDriver.generateUncachedKernels();
-
-        for (Kernel * K : pipeline) {
-            char flags = '0';
-            if (K->getSharedStateType()) {
-                flags += 1;
-            }
-            if (LLVM_UNLIKELY(K->getThreadLocalStateType())) {
-                flags += 2;
-            }
-            if (LLVM_UNLIKELY(K->allocatesInternalStreamSets())) {
-                flags += 4;
-            }
-            name << flags;
-        }
-        name.flush();
-
-        E.setUniqueName(name.str());
-
+        // The default signature identifies each kernel of the nested pipeline
+        // (family calls by family name, others, including the RE kernels, by
+        // signature), so nested pipelines that differ never share an object
+        // cache entry.
         kernel = E.makeKernel();
     }
 
     P.AddKernelFamilyCall(kernel);
 
+    // Restrict the selection to the records selected by the filter levels.
+    StreamSet * selected = matches;
+    for (size_t k = 1; k < mNested.size(); ++k) {
+        if (!mIsFilter[k]) continue;
+        Kernel * const f = mNested[k];
+        assert (f->getNumOfStreamInputs() == 3);
+        StreamSet * const filtered = P.CreateStreamSet();
+        f->setInputStreamSetAt(0, basisBits);
+        f->setInputStreamSetAt(1, U8index);
+        f->setInputStreamSetAt(2, breaks);
+        f->setOutputStreamSetAt(0, filtered);
+        P.AddKernelFamilyCall(f);
+        StreamSet * const combined = P.CreateStreamSet();
+        AndCombine(P, selected, filtered, combined);
+        selected = combined;
+    }
+
     if (MatchCoordinateBlocks > 0) {
         StreamSet * const MatchCoords = P.CreateStreamSet(3, sizeof(size_t) * 8);
-        P.CreateKernelCall<MatchCoordinatesKernel>(matches, breaks, MatchCoords, MatchCoordinateBlocks);
+        P.CreateKernelCall<MatchCoordinatesKernel>(selected, breaks, MatchCoords, MatchCoordinateBlocks);
         Kernel * const matchK = P.CreateKernelCall<MatchReporter>(byteStream, MatchCoords, accumulator);
         P.LinkFunction(matchK, "accumulate_match_wrapper", accumulate_match_wrapper);
         P.LinkFunction(matchK, "finalize_match_wrapper", finalize_match_wrapper);
     } else {
-        Kernel * const scanMatchK = P.CreateKernelCall<ScanMatchKernel>(matches, breaks, byteStream, accumulator, ScanMatchBlocks);
+        Kernel * const scanMatchK = P.CreateKernelCall<ScanMatchKernel>(selected, breaks, byteStream, accumulator, ScanMatchBlocks);
         P.LinkFunction(scanMatchK, "accumulate_match_wrapper", accumulate_match_wrapper);
         P.LinkFunction(scanMatchK, "finalize_match_wrapper", finalize_match_wrapper);
     }
 
     mNested.push_back(kernel);
+    mIsFilter.push_back(filter);
 
     mMainMethod.push_back(P.compile());
     assert (mMainMethod.size() + 1 == mNested.size());
@@ -225,6 +237,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns) {
 void NestedInternalSearchEngine::pop() {
     assert (mNested.size() > 1);
     mNested.pop_back();
+    mIsFilter.pop_back();
     assert (mMainMethod.size() > 0);
     mMainMethod.pop_back();
     assert (mMainMethod.size() + 1 == mNested.size());

@@ -1,17 +1,14 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 
-# module: re.compile
+# module: re.transforms
 
 parabix_add_module(
 NAME
     re.transforms
 SRC
-    assertion_transformations.cpp
-    exclude_CC.cpp
     name_intro.cpp
     name_lookaheads.cpp
-    re_contextual_simplification.cpp
     re_minimizer.cpp
     re_multiplex.cpp
     re_reverse.cpp
@@ -21,11 +18,14 @@ SRC
     re_transformer.cpp
     reference_transform.cpp
     remove_nullable.cpp
-    replaceCC.cpp
     resolve_diffs.cpp
+    resolve_possessive.cpp
+    resolve_ranges.cpp
     to_utf8.cpp
     expand_permutes.cpp
     variable_alt_promotion.cpp
+    assertion_transformations.cpp
+    capture_removal.cpp
 DEPS
     re.analysis
     re.printer

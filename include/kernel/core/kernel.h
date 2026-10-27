@@ -14,7 +14,6 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/Support/Compiler.h>
-#include <kernel/illustrator/illustrator.h>
 #include <codegen/FunctionTypeBuilder.h>
 #include <codegen/LLVMTypeSystemInterface.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
@@ -289,7 +288,24 @@ public:
 
     LLVM_READNONE std::string getFamilyName() const;
 
+    // A short hash of the source of every Parabix module whose code can shape the
+    // code generated for this kernel: the source hash of the image that defines the
+    // kernel's class (see srchash/source_hash.h), which covers that module and all
+    // the modules it depends on.  Kernels that compile calls to nested kernels fold
+    // in the tags of those kernels.
+    virtual std::string getSourceTag() const;
+
+    // Whether generating this kernel twice from the same source and options yields the same
+    // IR.  -VerifyCache compares cached kernels with freshly generated IR only when it does.
+    virtual bool hasDeterministicCodeGeneration() const { return true; }
+
     virtual bool isCachable() const { return true; }
+
+    // Called by the PipelineBuilder when the kernel is added to a pipeline, after construction
+    // is complete but before the kernel is registered with the driver.  A kernel type may add
+    // attributes it can determine automatically; any that change the generated code must also
+    // be recorded in the kernel name.
+    virtual void addAutomaticAttributes() { }
 
     virtual bool hasSignature() const { return false; }
 
@@ -432,6 +448,12 @@ public:
         mInternalScalars.emplace_back(ScalarType::ThreadLocal, type, name, group, rule);
     }
 
+    // True if this kernel has any output scalar, any thread-local state, or any persistent
+    // internal scalar other than the base buffer handles and termination signal (see
+    // addBaseInternalScalars), i.e., state that one invocation may leave for the next.
+    // Shared state fields not described by an internal scalar are also treated as state.
+    bool hasPersistentMutableState() const;
+
     llvm::StructType * getSharedStateType() const {
         return mSharedStateType;
     }
@@ -539,7 +561,11 @@ public:
         MemCpyOptPass,
         AggressiveInstCombinePass,
         NewGVNPass,
-        PHICanonicalizerPass
+        PHICanonicalizerPass,
+        // Not a pass: a kernel that adds this marker in addOptimizationPasses drops
+        // InstCombine from the base pass list the driver runs on every kernel. For
+        // kernels whose IR is already simplified upstream (e.g. Pablo-generated).
+        NoInstCombinePass
     };
 
     using SelectedOptimizationPasses = llvm::SmallVector<OptimizationPass, 6>;
@@ -719,6 +745,14 @@ protected:
     // KernelCompiler::allocateOwnedBufferHandleStorage.
     void addBaseInternalScalars(LLVMTypeSystemInterface & ts);
 
+public:
+    // Called by the PipelineBuilder once construction is complete. Kernels that add
+    // stream bindings in their constructor body (after the Kernel constructor has run
+    // addBaseInternalScalars) would otherwise lack the buffer handles and output flags
+    // of those bindings; this adds whatever is missing.
+    void completeBaseInternalScalars(LLVMTypeSystemInterface & ts);
+protected:
+
     struct FunctionLink {
         const std::string           UnmanagedName;
         llvm::FunctionType * const  FuncType;
@@ -838,6 +872,10 @@ public:
 
     std::unique_ptr<KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) override;
 
+    // Whether the stream I/O and attributes of this kernel permit the ProvisionalLookAheadStride
+    // attribute; if not, reason (when given) describes the first requirement that is not met.
+    bool meetsProvisionalLookAheadStrideRequirements(std::string * reason = nullptr) const;
+
 protected:
 
     // Each BlockOrientedKernel must provide its own logic for generating
@@ -854,6 +892,19 @@ protected:
     void RepeatDoBlockLogic(KernelBuilder & b);
 
     virtual void generateFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingItems);
+
+    // The number of strides before each segment that a kernel which rebuilds its carries
+    // reprocesses, starting from zeroed carries, to compute the carries for the segment.
+    // Zero (the default) if the kernel keeps its carries in kernel state.
+    virtual unsigned getCarryRebuildStrides() const { return 0; }
+
+    // Generate the logic to reprocess one stride before the segment.  The processed item
+    // counts of the inputs locate that stride; no output may be written.
+    virtual void generateCarryRebuildMethod(KernelBuilder & b);
+
+    // Adds the ProvisionalLookAheadStride attribute and records it in the kernel name,
+    // since it changes the generated code.  Call from the subclass constructor.
+    void setProvisionalLookAheadStride();
 
     BlockOrientedKernel(LLVMTypeSystemInterface & ts,
                         std::string && kernelName,

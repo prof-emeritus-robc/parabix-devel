@@ -5994,6 +5994,7 @@ NFC_Initial_Insertion::NFC_Initial_Insertion
 : PabloKernel(ts, "NFC_Initial_Insertion" + Basis->shapeString() + (WorkMask == nullptr ? "" : "+wkmsk"),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}},
 {Binding{"InsertionBixNum", InsertionBixNum}}), mHasWorkMask(WorkMask != nullptr) {
+    addAttribute(kernel::LocalCarries());
     if (mHasWorkMask) {
         mInputStreamSets.push_back(Binding{"WorkMask", WorkMask});
     }
@@ -6038,7 +6039,9 @@ SingletonCanonicalization::SingletonCanonicalization
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmBasis)
 : PabloKernel(ts, "SingletonCanonicalization" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}},
-{Binding{"XfrmBasis", XfrmBasis}}) {}
+{Binding{"XfrmBasis", XfrmBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void SingletonCanonicalization::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -6586,7 +6589,9 @@ ExcludedCompositeStage::ExcludedCompositeStage
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * XfrmBasis)
 : PabloKernel(ts, "ExcludedCompositeStage" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}},
-{Binding{"XfrmBasis", XfrmBasis}}) {}
+{Binding{"XfrmBasis", XfrmBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ExcludedCompositeStage::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -7182,7 +7187,9 @@ ShortComposableTranslation0::ShortComposableTranslation0
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * OutputBasis)
 : PabloKernel(ts, "ShortComposableTranslation0_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(7)}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ShortComposableTranslation0::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -7918,7 +7925,9 @@ ShortComposableTranslation1::ShortComposableTranslation1
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * OutputBasis)
 : PabloKernel(ts, "ShortComposableTranslation1_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(7)}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ShortComposableTranslation1::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -8045,7 +8054,9 @@ ShortComposableTranslation3::ShortComposableTranslation3
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * OutputBasis)
 : PabloKernel(ts, "ShortComposableTranslation3_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(7)}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ShortComposableTranslation3::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -8315,7 +8326,9 @@ ShortComposableTranslation4::ShortComposableTranslation4
     (LLVMTypeSystemInterface & ts, StreamSet * Basis, StreamSet * OutputBasis)
 : PabloKernel(ts, "ShortComposableTranslation4_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(7)}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ShortComposableTranslation4::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -8818,7 +8831,9 @@ ApplyLongComposition0::ApplyLongComposition0
                                    StreamSet * OutputBasis)
 : PabloKernel(ts, "ApplyLongComposition0_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"MarkCodeAtStarter", MarkCodeAtStarter}, Binding{"MarkCode", MarkCode}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ApplyLongComposition0::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -10271,7 +10286,9 @@ ApplyLongComposition1::ApplyLongComposition1
                                    StreamSet * OutputBasis)
 : PabloKernel(ts, "ApplyLongComposition1_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"MarkCodeAtStarter", MarkCodeAtStarter}, Binding{"MarkCode", MarkCode}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ApplyLongComposition1::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -11321,7 +11338,9 @@ ApplyLongComposition2::ApplyLongComposition2
                                    StreamSet * OutputBasis)
 : PabloKernel(ts, "ApplyLongComposition2_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"MarkCodeAtStarter", MarkCodeAtStarter}, Binding{"MarkCode", MarkCode}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ApplyLongComposition2::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -14527,7 +14546,9 @@ ApplyLongComposition3::ApplyLongComposition3
                                    StreamSet * OutputBasis)
 : PabloKernel(ts, "ApplyLongComposition3_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"MarkCodeAtStarter", MarkCodeAtStarter}, Binding{"MarkCode", MarkCode}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ApplyLongComposition3::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());
@@ -17392,7 +17413,9 @@ ApplyLongComposition4::ApplyLongComposition4
                                    StreamSet * OutputBasis)
 : PabloKernel(ts, "ApplyLongComposition4_" + Basis->shapeString(),
 {Binding{"Basis", Basis, FixedRate(), LookAhead(3)}, Binding{"MarkCodeAtStarter", MarkCodeAtStarter}, Binding{"MarkCode", MarkCode}},
-{Binding{"OutputBasis", OutputBasis}}) {}
+{Binding{"OutputBasis", OutputBasis}}) {
+    addAttribute(kernel::LocalCarries());
+}
 
 void ApplyLongComposition4::generatePabloMethod() {
     pablo::PabloBuilder pb(getEntryScope());

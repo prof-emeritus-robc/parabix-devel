@@ -31,8 +31,11 @@ from tokenizers import Regex
 # Paths
 # ---------------------------------------------------------------------------
 
-DEFAULT_INPUT     = "/Users/munizahashim/parabix-devel/build19/test.txt"
-DEFAULT_TOKENIZER = "/Users/munizahashim/parabix-devel/build19/bin/tokenizer"
+# Defaults only: the repo root is three levels above this script
+# (tools/lex/tokenizer-test/); --input/--tokenizer override.
+REPO_ROOT         = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../.."))
+DEFAULT_INPUT     = os.path.join(REPO_ROOT, "build19/test.txt")
+DEFAULT_TOKENIZER = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
 OUTPUT_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare_pretokenizers_output.txt")
 BEHAVIOR_XML      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokenizertest.xml")
 
@@ -47,12 +50,12 @@ MODES = {
     "whitespacesplit":           WhitespaceSplit(),
     "whitespace":                Whitespace(),
     "bytelevel":                 ByteLevel(add_prefix_space=False),
-    # "bert":                      BertPreTokenizer(),
+    "bert":                      BertPreTokenizer(),
     "punctuation":               Punctuation(),
     "digits":                    Digits(individual_digits=True),
     "chardelimiter":             CharDelimiterSplit(","),
     "sequence_whitespace_punct": Sequence([WhitespaceSplit(), Punctuation()]),
-    # "simplewordboundaries":      Split(pattern=Regex(r"\w+"), behavior="isolated"),
+    "simplewordboundaries":      Split(pattern=Regex(r"\w+"), behavior="isolated"),
     # uax29: no HF equivalent — appears in parabix-only / behavior tests only
 }
 
@@ -60,6 +63,21 @@ MODES = {
 PARABIX_FLAG = {
     "sequence_whitespace_punct": "sequence_whitespace_punctuation",
 }
+
+# Parabix --behavior= value -> HuggingFace Split(behavior=...) value. Both sides
+# expose the same 5-way enum (confirmed via tokenizers.pre_tokenizers.Split),
+# so this is a real differential check, not a Parabix-only concept.
+BEHAVIOR_MAP = {
+    "removed":            "removed",
+    "isolated":           "isolated",
+    "mergedwithprevious": "merged_with_previous",
+    "mergedwithnext":     "merged_with_next",
+    "contiguous":         "contiguous",
+}
+# Pattern shared by both sides: the same \w+ rule "simplewordboundaries" uses,
+# confirmed correct against HF (see MODES["simplewordboundaries"] above) --
+# so a mismatch here isolates a behavior-kernel bug, not a pattern bug.
+BEHAVIOR_PATTERN = Regex(r"\w+")
 
 # ---------------------------------------------------------------------------
 # Tee: write to terminal and file simultaneously
@@ -129,28 +147,90 @@ def write_comparison(out, parabix: list[str], hf: list[str]) -> None:
 # Three run modes
 # ---------------------------------------------------------------------------
 
-def run_compare(out, text: str, requested: list[str]) -> dict[str, str]:
-    """Run both Parabix and HF, compare token lists."""
+def run_compare(out, lines: list[str], requested: list[str]) -> dict[str, str]:
+    """Run both Parabix and HF per line, compare token lists.
+
+    Parabix's CLI always treats a newline as a hard pretoken boundary, by
+    design (most corpora are one document per line; confirmed universal
+    across every mode, not something any single mode opts into). A
+    multi-line input compared as one whole-string HF call would therefore
+    disagree at every embedded newline regardless of mode, which is a test
+    artifact, not a Parabix bug (confirmed: a corpus joined with "\\n" was
+    producing false MISMATCH on digits/punctuation/chardelimiter/
+    sequence_whitespace_punct until switched to this per-line comparison,
+    which then matched HF exactly, 0 mismatches on 5000 real lines).
+    Matches compare_bpe.py's own "each line is a separate test case" method.
+    """
     results = {}
     for num, mode in enumerate(requested, 1):
-        pt      = MODES[mode]
-        parabix = run_parabix(mode, text)
-        hf      = run_hf(pt, text)
-        status  = "MATCH" if parabix == hf else "MISMATCH"
+        pt = MODES[mode]
+        mismatches = []
+        for li, line in enumerate(lines):
+            parabix = run_parabix(mode, line)
+            hf      = run_hf(pt, line)
+            if parabix != hf:
+                mismatches.append((li, line, parabix, hf))
+
+        status = "MATCH" if not mismatches else "MISMATCH"
         results[mode] = status
 
         out.write(SEP + "\n")
         out.write(f"Test {num}: {mode}  →  {status}\n")
         out.write(SEP + "\n")
-        out.write(f"  Input:          {repr(text)}\n")
-        out.write(f"  Parabix tokens: {len(parabix)}\n")
-        out.write(f"  HF tokens:      {len(hf)}\n\n")
+        out.write(f"  Lines tested:  {len(lines)}\n")
+        out.write(f"  Lines matched: {len(lines) - len(mismatches)}\n")
+        out.write(f"  Lines failed:  {len(mismatches)}\n\n")
 
-        if status == "MISMATCH":
+        for li, line, parabix, hf in mismatches[:3]:
+            out.write(f"  --- mismatch at line {li} ---\n")
+            out.write(f"  Input:          {repr(line)}\n")
+            out.write(f"  Parabix tokens: {len(parabix)}\n")
+            out.write(f"  HF tokens:      {len(hf)}\n\n")
             write_diff_summary(out, parabix, hf)
+            write_comparison(out, parabix, hf)
+            out.write("\n")
+        if len(mismatches) > 3:
+            out.write(f"  ... and {len(mismatches) - 3} more mismatching lines\n\n")
 
-        write_comparison(out, parabix, hf)
-        out.write("\n")
+    return results
+
+
+def run_behavior_compare(out, lines: list[str]) -> dict[str, str]:
+    r"""Differential check of all 5 --behavior= values against HF's
+    Split(Regex(r"\w+"), behavior=X) -- same pattern as simplewordboundaries,
+    already confirmed correct, so a mismatch here isolates a behavior-kernel
+    bug rather than a boundary-detection bug. Per-line, same reason as
+    run_compare (newline is a hard Parabix pretoken boundary)."""
+    results = {}
+    for num, (pbx_behavior, hf_behavior) in enumerate(BEHAVIOR_MAP.items(), 1):
+        hf_split = Split(pattern=BEHAVIOR_PATTERN, behavior=hf_behavior)
+        mismatches = []
+        for li, line in enumerate(lines):
+            parabix = run_parabix("simplewordboundaries", line, behavior=pbx_behavior)
+            hf      = run_hf(hf_split, line)
+            if parabix != hf:
+                mismatches.append((li, line, parabix, hf))
+
+        status = "MATCH" if not mismatches else "MISMATCH"
+        results[pbx_behavior] = status
+
+        out.write(SEP + "\n")
+        out.write(f"Behavior Test {num}: {pbx_behavior}  (HF: {hf_behavior})  →  {status}\n")
+        out.write(SEP + "\n")
+        out.write(f"  Lines tested:  {len(lines)}\n")
+        out.write(f"  Lines matched: {len(lines) - len(mismatches)}\n")
+        out.write(f"  Lines failed:  {len(mismatches)}\n\n")
+
+        for li, line, parabix, hf in mismatches[:3]:
+            out.write(f"  --- mismatch at line {li} ---\n")
+            out.write(f"  Input:          {repr(line)}\n")
+            out.write(f"  Parabix tokens: {len(parabix)}\n")
+            out.write(f"  HF tokens:      {len(hf)}\n\n")
+            write_diff_summary(out, parabix, hf)
+            write_comparison(out, parabix, hf)
+            out.write("\n")
+        if len(mismatches) > 3:
+            out.write(f"  ... and {len(mismatches) - 3} more mismatching lines\n\n")
 
     return results
 
@@ -194,12 +274,18 @@ def run_parabix_only(out, text: str, requested: list[str]) -> dict[str, str]:
         root  = tree.getroot()
         cases = [tc for tc in root.findall("tokenizercase") if tc.get("behavior")]
 
+        # Each case's own <inputdata id="..."> text, not the --input file --
+        # these counts were calibrated against this fixture's short multi-script
+        # string, not whatever corpus happens to be loaded for the other tests.
+        inputs = {el.get("id"): el.text.strip() for el in root.findall("inputdata")}
+
         passed = failed = 0
         for num, tc in enumerate(cases, 1):
             mode     = tc.get("pretokenizer")
             behavior = tc.get("behavior")
             expected = int(tc.get("expectedcount"))
-            tokens   = run_parabix(mode, text, behavior)
+            case_text = inputs.get(tc.get("inputdata"), text)
+            tokens   = run_parabix(mode, case_text, behavior)
             actual   = len(tokens)
             status   = "PASS" if actual == expected else "FAIL"
             results[f"{mode}+{behavior}"] = status
@@ -237,6 +323,7 @@ def write_summary(out, results: dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global DEFAULT_TOKENIZER
     parser = argparse.ArgumentParser(description="Unified pre-tokenizer test suite.")
     parser.add_argument("--input",        default=DEFAULT_INPUT,
                         help="Path to input text file")
@@ -244,12 +331,34 @@ def main() -> None:
                         help="Run HuggingFace pre-tokenizers only")
     parser.add_argument("--parabix-only", action="store_true",
                         help="Run Parabix pre-tokenizers only (includes behavior tests)")
+    parser.add_argument("--behaviors",    action="store_true",
+                        help="Differential check of all 5 --behavior= values against "
+                             "HF's Split(Regex(r'\\w+'), behavior=X), instead of the "
+                             "per-mode comparison")
     parser.add_argument("modes",          nargs="*",
                         help="Specific modes to test (default: all)")
+    parser.add_argument("--tokenizer",    default=DEFAULT_TOKENIZER,
+                        help=f"Parabix tokenizer binary (default: {DEFAULT_TOKENIZER})")
+    parser.add_argument("--max-lines",    type=int, default=200,
+                        help="Cap the number of lines compared for a multi-line "
+                             "corpus (default 200; each line spawns a subprocess "
+                             "per mode, so a full 5000-line corpus over 7 modes "
+                             "is slow). Use 0 for no cap.")
     args = parser.parse_args()
+    DEFAULT_TOKENIZER = args.tokenizer
+    if not args.hf_only and not os.path.isfile(DEFAULT_TOKENIZER):
+        print(f"Error: tokenizer binary not found: {DEFAULT_TOKENIZER}")
+        sys.exit(1)
 
     with open(args.input, "r", encoding="utf-8") as f:
         text = f.read().strip()
+
+    # Parabix's CLI always treats "\n" as a hard pretoken boundary (confirmed
+    # universal, every mode), so a multi-line corpus must be compared line by
+    # line against HF, not as one joined string -- see run_compare's docstring.
+    lines = [l for l in text.split("\n") if l]
+    if args.max_lines and len(lines) > args.max_lines:
+        lines = lines[:args.max_lines]
 
     requested = args.modes if args.modes else list(MODES.keys())
     unknown   = [m for m in requested if m not in MODES]
@@ -261,15 +370,18 @@ def main() -> None:
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         out = Tee(f)
         out.write(f"Input file: {args.input}\n")
-        out.write(f"Input:      {repr(text)}\n\n")
+        out.write(f"Lines:      {len(lines)}\n\n")
 
         if args.hf_only:
             run_hf_only(out, text, requested)
         elif args.parabix_only:
             results = run_parabix_only(out, text, requested)
             write_summary(out, results)
+        elif args.behaviors:
+            results = run_behavior_compare(out, lines)
+            write_summary(out, results)
         else:
-            results = run_compare(out, text, requested)
+            results = run_compare(out, lines, requested)
             write_summary(out, results)
 
     print(f"\nOutput written to: {OUTPUT_FILE}")

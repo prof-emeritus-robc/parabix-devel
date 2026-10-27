@@ -7,13 +7,12 @@
 
 #include <string>
 #include <vector>
-#include <kernel/core/kernel_builder.h>
-#include <kernel/pipeline/program_builder.h>
-#include <re/adt/adt.h>
-#include <re/adt/re_re.h>
 #include <re/transforms/re_transformer.h>
+#include <re/adt/adt.h>
 #include <ucd/core/unicode_set.h>
+namespace re { class RE; }
 
+namespace kernel { class PipelineBuilder; class StreamSet; }
 using PipelineBuilder = kernel::PipelineBuilder;
 using StreamSet = kernel::StreamSet;
 
@@ -37,6 +36,7 @@ protected:
     re::CC * getDQ_CC();
     re::RE * getDoubleEscape();
     re::RE * transformCC (re::CC * cc) override;
+    re::RE * transformString (re::String * s) override;
     re::RE * transformAny (re::Any * a) override;
     re::RE * transformName (re::Name * name) override;
     re::RE * transformPropertyExpression (re::PropertyExpression * pe) override;

@@ -146,6 +146,19 @@ void PipelineAnalysis::generateInitialBufferGraph(KernelBuilder & b) {
                     case AttrId::Add:
                         maxAdd = std::max<unsigned>(maxAdd, attr.amount());
                         break;
+                    case AttrId::AddCarry:
+                        if (LLVM_UNLIKELY(port.Type != PortType::Output || !rate.isFixed() ||
+                                          binding.getNumElements() != 1 || binding.getFieldWidth() != 1)) {
+                            SmallVector<char, 0> tmp;
+                            raw_svector_ostream out(tmp);
+                            out << "AddCarry attribute may only be applied to a Fixed rate output "
+                                   "of a single bitstream: "
+                                << kernelObj->getName() << "." << binding.getName();
+                            report_fatal_error(out.str());
+                        }
+                        bp.Flags |= BufferPortType::IsAddCarry;
+                        maxAdd = std::max<unsigned>(maxAdd, 1);
+                        break;
                     case AttrId::Delayed:
                         bp.Delay = std::max<unsigned>(bp.Delay, attr.amount());
                         break;
@@ -754,6 +767,13 @@ void PipelineAnalysis::identifyPortsThatModifySegmentLength() {
                 #else
                 if (isPartitionRoot) {
                     inputRate.Flags |= partitionRootIOFlag;
+                } else if (ProvisionalStrideKernel.test(kernel)) {
+                    // A provisional stride kernel that is not the partition root reads the full and
+                    // provisional strides of producers in its partition and must process the same
+                    // full strides as the root, whether or not its input buffers are thread-local.
+                    // Checking its input would subtract its lookahead, leaving it a stride behind,
+                    // and its final stride could not process that stride.
+                    continue;
                 } else if (N.isConstant() || N.isExternal() || !N.IsLinear || N.isTruncated()) {
                     inputRate.Flags |= BufferPortType::CanModifySegmentLength;
                 }
@@ -1199,13 +1219,11 @@ void PipelineAnalysis::setStreamSetLockIds() {
 
 constexpr static unsigned MANAGED_BUFFER_INIT_POPULATION_SIZE = 15;
 
-constexpr static unsigned MANAGED_BUFFER_GA_MAX_INIT_TIME_SECONDS = 2;
-
 constexpr static unsigned MANAGED_BUFFER_POPULATION_SIZE = 30;
 
-constexpr static unsigned MANAGED_BUFFER_GA_MAX_TIME_SECONDS = 15;
-
 constexpr static unsigned MANAGED_BUFFER_GA_STALLS = 50;
+
+constexpr static unsigned MANAGED_BUFFER_GA_MAX_GENERATIONS = 10 * MANAGED_BUFFER_GA_STALLS;
 
 using ConflictGraph = adjacency_list<hash_setS, vecS, undirectedS>;
 
@@ -1323,9 +1341,8 @@ struct ManagedBufferOptimizer final : public PermutationBasedEvolutionaryAlgorit
                           , const ConflictGraph & I
                           , pipeline_random_engine & srcRng)
     : PermutationBasedEvolutionaryAlgorithm (numOfLocalStreamSets,
-                                             MANAGED_BUFFER_GA_MAX_INIT_TIME_SECONDS,
                                              MANAGED_BUFFER_INIT_POPULATION_SIZE,
-                                             MANAGED_BUFFER_GA_MAX_TIME_SECONDS,
+                                             MANAGED_BUFFER_GA_MAX_GENERATIONS,
                                              MANAGED_BUFFER_POPULATION_SIZE,
                                              MANAGED_BUFFER_GA_STALLS,
                                              std::max(codegen::SegmentThreads, codegen::TaskThreads),

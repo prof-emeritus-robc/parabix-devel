@@ -12,15 +12,16 @@ SRC
     grep_toolchain.cpp
     nested_grep_engine.cpp
 DEPS
+    re.parse
     kernel.pipeline
     kernel.basis
+    kernel.bitwise
     kernel.io
     kernel.re
     kernel.scan
     kernel.streamutils
     kernel.util
     kernel.unicode
-    re.parse
     re.compile
     re.unicode
     re.transforms

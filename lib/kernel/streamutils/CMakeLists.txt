@@ -9,8 +9,11 @@ NAME
 SRC
     collapse.cpp
     deletion.cpp
+    focused_transform.cpp
     pdep_kernel.cpp
+    region_reversal.cpp
     run_index.cpp
+    run_replace.cpp
     sentinel.cpp
     sorting.cpp
     stream_select.cpp
@@ -26,5 +29,10 @@ DEPS
     kernel.pipeline
     kernel.basis
     kernel.bitwise
+    kernel.scan
+# The other kernel modules are linked only to build pipelines from their kernels;
+# InsertionSpreadMaskKernel derives from kernel.scan's TwoLevelScanKernel.
+CODEGEN_DEPS
+    pablo.bixnum
     kernel.scan
 )

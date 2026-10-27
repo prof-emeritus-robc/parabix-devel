@@ -6,9 +6,9 @@
 #pragma once
 
 #include <kernel/basis/p2s_kernel.h>
+#include <kernel/pipeline/pipeline_builder.h>
 #include <kernel/streamutils/collapse.h>
 #include <kernel/streamutils/deletion.h>
-#include <kernel/pipeline/pipeline_builder.h>
 
 namespace kernel {
 namespace streamutils {

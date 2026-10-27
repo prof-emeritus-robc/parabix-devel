@@ -11,6 +11,4 @@ class RE;
 
 bool isNullable(const RE * re);
 
-bool isZeroWidth(const RE * re);
-
 }

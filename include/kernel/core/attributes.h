@@ -43,10 +43,12 @@ struct Attribute {
         // that the corresponding circular buffer have a "lookahead extension area"
         // that holds a copy of the data at the physical start of buffer).
 
-        LookBehind, /// NOT DONE
+        LookBehind,
 
         // LookBehind(n) ensures that up to n positions prior to the current processed
-        // item of an input must be stored in linear (contiguous) memory.
+        // item of an input must be stored in linear (contiguous) memory.  The pipeline
+        // withholds them from the consumed item count, from which it addresses the input,
+        // and does not make the input thread-local, since another thread may produce them.
 
         // NOTE: If n is 0, all data will be linear (at the cost of additional
         // memcopies in order to preserve this property)
@@ -196,6 +198,14 @@ struct Attribute {
 
         // NOTE: currently supports only the removal of "added" items.
 
+        AddCarry,
+
+        // Applies only to a single-stream, Fixed rate output bitstream.  The final item count
+        // is extended by one position exactly when the kernel writes a 1 bit at the position
+        // one past the end of its principal input (the EOFbit position); i.e., the produced
+        // item count is the available item count of that input plus the value of that bit.
+        // Buffers are sized as for Add1; the pipeline reads the bit after the final invocation.
+
         Linear,
 
         // Either an input buffer is required to be linearly accessible or a managed output
@@ -314,6 +324,40 @@ struct Attribute {
 
         // Note that that this does not guarantee that the pipeline compiler will mark
         // this kernel as statefree if it is unsafe to do so.
+
+        ProvisionalLookAheadStride,
+
+        // A block-oriented kernel with lookahead inputs may be called with N full strides
+        // plus additional input data that is less than one stride.  The kernel processes
+        // the N full strides normally (using the additional data as lookahead for the
+        // last of them), and then processes one further "provisional" stride as if it
+        // were a full stride.  The kernel state after the N full strides is preserved;
+        // any state changes made by the provisional stride are discarded, so that the
+        // provisional stride is reprocessed as a normal stride on the next call.
+
+        // The processed and produced item counts of the kernel reflect only the N full
+        // strides.  Output beyond them is valid up to the accessible input items less the
+        // lookahead amount; it is rewritten with the same values by the next call.  Only
+        // provisional stride kernels in the same partition read this extra output, which
+        // allows a chain of such kernels to share a partition while their total lookahead
+        // is less than a stride.  The partition root then limits its full strides by that
+        // total lookahead, and the final segment is processed normally.
+
+        // Requirements: every stream input and output is FixedRate(1), no output is InOut,
+        // the stride is the block width, and all mutable kernel state is held in kernel scalars.
+
+        LocalCarries,
+
+        // A Pablo kernel whose only carry-generating operations are Advances may rebuild
+        // its carries at the start of each segment rather than keep them in kernel state.
+        // The effect of any position can then reach at most CarryExtent positions forward,
+        // the largest sum of Advance amounts along any path.  Starting from zero carries
+        // and processing the ceil(CarryExtent / BlockWidth) blocks before the segment gives
+        // the correct carries for the segment, so the kernel has no persistent state and
+        // its segments may be processed in any order.
+
+        // LocalCarries(n) declares that CarryExtent <= n; n = 0 declares that it is at
+        // most the block width.  The Pablo compiler verifies the declaration.
 
         /** COUNT **/
 
@@ -434,6 +478,10 @@ private:
 
 inline Attribute Add1() {
     return Attribute(Attribute::KindId::Add, 1);
+}
+
+inline Attribute AddCarry() {
+    return Attribute(Attribute::KindId::AddCarry, 1);
 }
 
 inline Attribute Truncate(const unsigned k = 1) {
@@ -563,6 +611,14 @@ inline Attribute ExecuteStridesIndividually() {
 
 inline Attribute Statefree() {
     return Attribute(Attribute::KindId::Statefree, 0);
+}
+
+inline Attribute ProvisionalLookAheadStride() {
+    return Attribute(Attribute::KindId::ProvisionalLookAheadStride, 0);
+}
+
+inline Attribute LocalCarries(const unsigned maxCarryExtent = 0) {
+    return Attribute(Attribute::KindId::LocalCarries, maxCarryExtent);
 }
 
 inline Attribute InternallyGenerated() {

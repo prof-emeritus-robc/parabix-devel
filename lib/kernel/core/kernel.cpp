@@ -21,6 +21,11 @@
 #endif
 #include <boost/intrusive/detail/math.hpp>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <toolchain/toolchain.h>
+#include <kernel/illustrator/illustrator.h>
+#include <srchash/source_hash.h>
+#include <llvm/ADT/DenseMap.h>
+#include <mutex>
 
 using namespace llvm;
 using namespace boost;
@@ -59,6 +64,7 @@ const static auto PAPI_INITIALIZE_EVENTSET = "_PAPIInitializeEventSet";
 const static auto SHARED_SUFFIX = "_shared_state";
 const static auto THREAD_LOCAL_SUFFIX = "_thread_local";
 constexpr static auto STATE_TYPE_METADATA_SUFFIX = "_state_types";
+constexpr static auto INTERNAL_SCALARS_METADATA_SUFFIX = "_internal_scalars";
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
@@ -153,6 +159,7 @@ bool Kernel::requiresExplicitPartialFinalStride() const {
                     if (LLVM_LIKELY(attr.amount() > 0)) {
                         return true;
                     }
+                case AttrId::AddCarry:
                 case AttrId::Deferred:
                     return true;
                 default: break;
@@ -206,11 +213,14 @@ std::unique_ptr<KernelCompiler> Kernel::instantiateKernelCompiler(KernelBuilder 
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief makeCacheName
+ *
+ * The source tag makes the name change whenever the source of a module that can shape this kernel's
+ * code changes, and only then.
  ** ------------------------------------------------------------------------------------------------------------- */
 std::string Kernel::makeCacheName(KernelBuilder & b) {
     std::string cacheName;
     raw_string_ostream out(cacheName);
-    out << getName() << '_' << b.getBuilderUniqueName();
+    out << getName() << '_' << b.getBuilderUniqueName() << '_' << getSourceTag();
 #if 0
     auto appendStreamSetType = [&](const char code, const Bindings & bindings) {
         for (const auto & binding : bindings) {
@@ -300,6 +310,34 @@ void Kernel::loadCachedKernel(const Module * m) {
     mThreadLocalStateType = nullIfEmpty(cast<StructType>(tlType));
     assert (mThreadLocalStateType == nullptr ||
             (!mThreadLocalStateType->isOpaque() && &mThreadLocalStateType->getContext() == &m->getContext()));
+
+    // Restore the internal scalar list recorded by constructStateTypes. Scalars added
+    // during code generation (which a cached kernel skips) would otherwise be missing.
+    auto scalarMetadata = m->getNamedMetadata(getName() + INTERNAL_SCALARS_METADATA_SUFFIX);
+    if (LLVM_LIKELY(scalarMetadata != nullptr)) {
+        InternalScalars restored;
+        restored.reserve(scalarMetadata->getNumOperands());
+        auto getInt = [](const MDNode * node, const unsigned i) {
+            return (unsigned)cast<ConstantInt>(cast<ConstantAsMetadata>(node->getOperand(i))->getValue())->getZExtValue();
+        };
+        for (const MDNode * node : scalarMetadata->operands()) {
+            assert (node->getNumOperands() == 5);
+            const auto name = cast<MDString>(node->getOperand(0))->getString();
+            const auto scalarType = static_cast<ScalarType>(getInt(node, 1));
+            const auto rule = static_cast<ThreadLocalScalarAccumulationRule>(getInt(node, 3));
+            Type * const type = cast<ConstantAsMetadata>(node->getOperand(4))->getType();
+            restored.emplace_back(scalarType, type, name, getInt(node, 2), rule);
+        }
+        // Keep any scalar that was not recorded (e.g., one without a first-class type).
+        for (const InternalScalar & scalar : mInternalScalars) {
+            const auto f = std::find_if(restored.begin(), restored.end(),
+                                        [&](const InternalScalar & r) { return r.getName() == scalar.getName(); });
+            if (LLVM_UNLIKELY(f == restored.end())) {
+                restored.push_back(scalar);
+            }
+        }
+        mInternalScalars = std::move(restored);
+    }
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -694,6 +732,24 @@ void Kernel::constructStateTypes(KernelBuilder & b) {
         stateTypes[0] = makeTypeMetadata(sharedStateType, strShared);
         stateTypes[1] = makeTypeMetadata(threadLocalStateType, strThreadLocal);
         structTypeMetadata->addOperand(MDNode::get(m->getContext(), stateTypes));
+
+        // Record the internal scalars, including any added during code generation (e.g.,
+        // Pablo carries), so that loadCachedKernel can restore the complete list.
+        SmallVector<char, 256> tmpScalars;
+        auto strScalars = concat(getName(), INTERNAL_SCALARS_METADATA_SUFFIX, tmpScalars);
+        NamedMDNode * const scalarMetadata = m->getOrInsertNamedMetadata(strScalars);
+        IntegerType * const int32Ty = b.getInt32Ty();
+        for (const InternalScalar & scalar : mInternalScalars) {
+            Type * const type = CBuilder::convertTypeToLLVMContext(C, scalar.getValueType());
+            if (LLVM_UNLIKELY(!type->isFirstClassType())) continue;
+            FixedArray<Metadata *, 5> fields;
+            fields[0] = MDString::get(C, scalar.getName());
+            fields[1] = ConstantAsMetadata::get(ConstantInt::get(int32Ty, (unsigned)scalar.getScalarType()));
+            fields[2] = ConstantAsMetadata::get(ConstantInt::get(int32Ty, scalar.getGroup()));
+            fields[3] = ConstantAsMetadata::get(ConstantInt::get(int32Ty, (unsigned)scalar.getAccumulationRule()));
+            fields[4] = ConstantAsMetadata::get(Constant::getNullValue(type));
+            scalarMetadata->addOperand(MDNode::get(C, fields));
+        }
     }
     assert (structTypeMetadata->getNumOperands() == 1);
 
@@ -1802,6 +1858,33 @@ std::string Kernel::getFamilyName() const {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief getSourceTag
+ ** ------------------------------------------------------------------------------------------------------------- */
+std::string Kernel::getSourceTag() const {
+    // The vtable of a kernel class is emitted in the image that defines the class (or, for
+    // a class without an out-of-line virtual function, in an image that links that one), so
+    // the image holding it has a source hash covering the kernel's module.  Tags are
+    // memoized per vtable.
+    const void * const vtable = *reinterpret_cast<const void * const *>(this);
+    static std::mutex lock;
+    static DenseMap<const void *, std::string> tags;
+    std::lock_guard<std::mutex> L(lock);
+    auto & tag = tags[vtable];
+    if (tag.empty()) {
+        std::string id = parabix::getImageSourceHash(vtable);
+        if (LLVM_UNLIKELY(id.empty())) {
+            // Built without a source hash: fall back to the linker's identity of the image.
+            id = "build-id:" + parabix::getImageBuildID(vtable);
+            if (LLVM_UNLIKELY(id.size() == 9)) {
+                id = "version:" PARABIX_VERSION;
+            }
+        }
+        tag = getStringHash(id).substr(0, 16);
+    }
+    return tag;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief annotateKernelNameWithDebugFlags
  ** ------------------------------------------------------------------------------------------------------------- */
 /* static */ std::string Kernel::annotateKernelNameWithDebugFlags(const TypeId id, const unsigned flags, std::string && name) {
@@ -1874,6 +1957,35 @@ static inline unsigned collectOutputFlags(const Bindings & streamSets) {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief hasPersistentMutableState
+ ** ------------------------------------------------------------------------------------------------------------- */
+bool Kernel::hasPersistentMutableState() const {
+    if (!mOutputScalars.empty() || mThreadLocalStateType) {
+        return true;
+    }
+    size_t sharedScalars = mInputScalars.size();
+    for (const InternalScalar & scalar : mInternalScalars) {
+        if (scalar.getScalarType() == ScalarType::NonPersistent) continue;
+        if (scalar.getScalarType() == ScalarType::ThreadLocal) return true;
+        ++sharedScalars;
+        const StringRef name(scalar.getName());
+        if (name == TERMINATION_SIGNAL) continue;
+        if (name.ends_with(BUFFER_HANDLE_SUFFIX) && scalar.getValueType()->isPointerTy()) continue;
+        return true;
+    }
+    // As a safeguard, treat any shared state field not described by an internal scalar
+    // as state. The flattened layout is [pad, field, ..., pad].
+    if (mSharedStateType) {
+        const auto n = mSharedStateType->getStructNumElements();
+        assert ((n % 2) == 1);
+        if (((n - 1) / 2) > sharedScalars) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief addBaseInternalScalars
  ** ------------------------------------------------------------------------------------------------------------- */
 void Kernel::addBaseInternalScalars(LLVMTypeSystemInterface & ts) {
@@ -1881,6 +1993,32 @@ void Kernel::addBaseInternalScalars(LLVMTypeSystemInterface & ts) {
         addInternalScalar(ts.getVoidPtrTy(), output.getName() + BUFFER_HANDLE_SUFFIX);
     }
     addInternalScalar(ts.getSizeTy(), TERMINATION_SIGNAL);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief completeBaseInternalScalars
+ ** ------------------------------------------------------------------------------------------------------------- */
+void Kernel::completeBaseInternalScalars(LLVMTypeSystemInterface & ts) {
+    const auto outputFlags = collectOutputFlags(mOutputStreamSets);
+    const auto addedFlags = outputFlags & ~mFlags;
+    if (LLVM_UNLIKELY(addedFlags != 0)) {
+        mFlags |= addedFlags;
+        // keep the name consistent with annotateKernelNameWithDebugFlags
+        if (((addedFlags & KernelFlags::HasInOutStreamSet) != 0) && codegen::DebugOptionIsSet(codegen::DisableInOutAttributes)) {
+            mKernelName += "_NoIOAttr";
+        }
+        if (((addedFlags & KernelFlags::HasInternallyManagedStreamSet) != 0) && codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers)) {
+            mKernelName += "_TDB";
+        }
+    }
+    for (const Binding & output : mOutputStreamSets) {
+        const auto name = output.getName() + BUFFER_HANDLE_SUFFIX;
+        const auto f = std::find_if(mInternalScalars.begin(), mInternalScalars.end(),
+                                    [&](const InternalScalar & scalar) { return scalar.getName() == name; });
+        if (f == mInternalScalars.end()) {
+            addInternalScalar(ts.getVoidPtrTy(), name);
+        }
+    }
 }
 
 // CONSTRUCTOR

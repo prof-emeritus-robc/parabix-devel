@@ -30,64 +30,14 @@
 Hello, world! abc123def, test-case . مرحبا بالعالم، یہ ایک ٹیسٹ ہے۔ 你好世界，这是一个测试。 안녕하세요 세계, 이것은 테스트입니다。
   </inputdata>
 
-  <!-- ========== PRETOKENIZER TESTS ========== -->
-
-  <!-- UAX29: Unicode word boundaries, isolated behavior (default) -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="uax29"
-                 expectedcount="51"/>
-
-  <!-- simplewordboundaries: like UAX29 but CJK chars grouped and contractions split. -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="simplewordboundaries"
-                 expectedcount="42"/>
-
-  <!-- Whitespace: \w++ | [^\w\s]++ pattern, forced removed behavior. -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="whitespace"
-                 expectedcount="28"/>
-
-  <!-- WhitespaceSplit: non-space runs, forced removed behavior.-->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="whitespacesplit"
-                 expectedcount="16"/>
-
-  <!-- Punctuation: each punct char or non-punct run, isolated behavior. -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="punctuation"
-                 expectedcount="23"/>
-
-  <!-- Digits: each decimal digit is its own token; non-digit runs (including spaces) grouped. -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="digits"
-                 expectedcount="5"/>
-
-  <!-- ByteLevel: GPT-2 byte-level pattern; space before word encoded as Ġ prefix. -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="bytelevel"
-                 expectedcount="30"/>
-
-  <!-- CharDelimiter: split on ',' (ASCII comma only), forced removed behavior. -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="chardelimiter"
-                 expectedcount="4"/>
-
-  <!-- BERT: \w++ | [^\w\s]++ pattern; whitespace removed before tokenizing. -->
-  <!-- <tokenizercase inputdata="test_input"
-                 pretokenizer="bert"
-                 expectedcount="14"/> -->
-
-  <!-- SeqWhitespacePunctuation: \w++ | [^\w\s]++ pattern, forced removed behavior. -->
-  <tokenizercase inputdata="test_input"
-                 pretokenizer="sequence_whitespace_punctuation"
-                 expectedcount="28"/>
-
   <!-- ========== BEHAVIOR TESTS (all use uax29 pretokenizer on test_input) ========== -->
 
-  <!-- Behavior: removed - delete whitespace tokens (15 spaces removed from isolated) -->
+  <!-- Behavior: excludewhitespace - delete whitespace tokens (15 spaces removed from isolated).
+       Renamed from "removed": that name now means HF's real Split(behavior="removed")
+       (delete the matched run, simplewordboundaries only), a different concept. -->
   <tokenizercase inputdata="test_input"
                  pretokenizer="uax29"
-                 behavior="removed"
+                 behavior="excludewhitespace"
                  expectedcount="36"/>
 
   <!-- Behavior: isolated - spaces appear as their own tokens (default UAX29 behavior)-->

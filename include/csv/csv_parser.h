@@ -9,9 +9,8 @@
 
 #include <string>
 #include <vector>
-#include <ucd/core/unicode_set.h>
-#include <kernel/core/kernel_builder.h>
-#include <kernel/pipeline/program_builder.h>
+#include <kernel/pipeline/pipeline_builder.h>
+#include <ucd/core/UCD_Config.h>
 
 using PipelineBuilder = kernel::PipelineBuilder;
 using StreamSet = kernel::StreamSet;

@@ -553,6 +553,7 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
             hasManagedOutput = true;
         } else {
             vba = getVirtualBaseAddress(b, rt, bn, produced, bn.isNonThreadLocal(), true);
+            mOutputVirtualBaseAddress[rt.Port] = vba;
             #ifdef PRINT_DEBUG_MESSAGES
             debugPrint(b, makeBufferName(mKernelId, rt.Port) + "_produced = %" PRIu64, produced);
             #ifndef PRINT_DEBUG_MESSAGES_NO_ADDRESS_DISPLAY
@@ -614,6 +615,52 @@ void PipelineCompiler::buildKernelCallArgumentList(KernelBuilder & b, ArgVec & a
     }
 
     assert (args.size() == mKernelDoSegmentFunctionType->getNumParams());
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief resolveAddCarryItemCount
+ *
+ * The final invocation of a kernel with an AddCarry output is given room to write one item past the end of
+ * its principal input. Keep that item only if the kernel set it to 1.
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * PipelineCompiler::resolveAddCarryItemCount(KernelBuilder & b, const StreamSetPort outputPort, Value * const produced) {
+    Value * const vba = mOutputVirtualBaseAddress[outputPort];
+    if (LLVM_UNLIKELY(vba == nullptr)) {
+        const Binding & output = getOutputBinding(outputPort);
+        report_fatal_error(StringRef(mKernel->getName()) + "." + output.getName() +
+                           ": AddCarry is not supported for managed or shared output buffers");
+    }
+    const auto prefix = makeBufferName(mKernelId, outputPort);
+    BasicBlock * const entry = b.GetInsertBlock();
+    BasicBlock * const readCarry = b.CreateBasicBlock(prefix + "_readAddCarry", mKernelCompletionCheck);
+    BasicBlock * const resolved = b.CreateBasicBlock(prefix + "_resolvedAddCarry", mKernelCompletionCheck);
+    Constant * const sz_ZERO = b.getSize(0);
+    Constant * const sz_ONE = b.getSize(1);
+    Value * const isFinal = b.CreateIsNotNull(mIsFinalInvocation);
+    Value * const wroteItems = b.CreateIsNotNull(mCurrentLinearOutputItems[outputPort]);
+    b.CreateUnlikelyCondBr(b.CreateAnd(isFinal, wroteItems), readCarry, resolved);
+
+    b.SetInsertPoint(readCarry);
+    Value * const position = b.CreateSub(produced, sz_ONE);
+    Constant * const BLOCK_WIDTH = b.getSize(b.getBitBlockWidth());
+    const StreamSetBuffer * const buffer = getOutputBuffer(outputPort);
+    // vba is relative to absolute item positions over the linear region the kernel just wrote
+    Value * const blockPtr = buffer->StreamSetBuffer::getStreamBlockPtr(b, vba, sz_ZERO, b.CreateUDiv(position, BLOCK_WIDTH));
+    Value * const offset = b.CreateURem(position, BLOCK_WIDTH);
+    Value * const bytePtr = b.CreateInBoundsGEP(b.getInt8Ty(), blockPtr, b.CreateLShr(offset, 3));
+    Value * const byte = b.CreateZExt(b.CreateLoad(b.getInt8Ty(), bytePtr), b.getSizeTy());
+    Value * const carry = b.CreateAnd(b.CreateLShr(byte, b.CreateAnd(offset, 7)), sz_ONE);
+    Value * const extended = b.CreateAdd(position, carry);
+    #ifdef PRINT_DEBUG_MESSAGES
+    debugPrint(b, prefix + "_addCarry = %" PRIu64, carry);
+    #endif
+    b.CreateBr(resolved);
+
+    b.SetInsertPoint(resolved);
+    PHINode * const phi = b.CreatePHI(b.getSizeTy(), 2, prefix + "_producedWithCarry");
+    phi->addIncoming(produced, entry);
+    phi->addIncoming(extended, readCarry);
+    return phi;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -698,6 +745,9 @@ void PipelineCompiler::updateProcessedAndProducedItemCounts(KernelBuilder & b, V
         const ProcessingRate & rate = output.getRate();
         if (LLVM_LIKELY(rate.isFixed() || rate.isPartialSum())) {
             produced = b.CreateAdd(mCurrentProducedItemCountPhi[outputPort], mCurrentLinearOutputItems[outputPort]);
+            if (LLVM_UNLIKELY(mBufferGraph[getOutput(mKernelId, outputPort)].isAddCarry())) {
+                produced = resolveAddCarryItemCount(b, outputPort, produced);
+            }
             assert (output.isDeferred() ^ (mCurrentProducedDeferredItemCountPhi[outputPort] == nullptr));
             if (mCurrentProducedDeferredItemCountPhi[outputPort]) {
                 assert (mReturnedProducedItemCountPtr[outputPort]);

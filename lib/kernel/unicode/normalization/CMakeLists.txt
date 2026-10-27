@@ -14,9 +14,20 @@ parabix_add_module(
 NAME
     kernel.unicode.normalization
 SRC
+    fcd.cpp
+    nfc.cpp
     nfd.cpp
     normalization-generated.cpp
     normalization.cpp
 DEPS
     kernel.unicode
+# kernel.unicode (and the kernel modules it links) are used only to build pipelines from
+# their kernels; these are the modules the normalization kernels' generation uses.
+CODEGEN_DEPS
+    re.unicode
+    re.cc
+    pablo.compiler
+    pablo.bixnum
+    unicode.algo
+    unicode.data
 )

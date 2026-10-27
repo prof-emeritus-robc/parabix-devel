@@ -113,8 +113,6 @@ private:
     template<typename PabloBlockOrBuilder>
     pablo::PabloAST * make_range(re::codepoint_t lo, re::codepoint_t hi, PabloBlockOrBuilder & pb);
     template<typename PabloBlockOrBuilder>
-    pablo::PabloAST * make_octet_range(const unsigned mask, const unsigned basis_idx, PabloBlockOrBuilder & pb);
-    template<typename PabloBlockOrBuilder>
     pablo::PabloAST * char_or_range_expr(const re::codepoint_t lo, const re::codepoint_t hi, PabloBlockOrBuilder & pb);
     template<typename PabloBlockOrBuilder>
     pablo::PabloAST * bit_pattern_expr(const unsigned pattern, const unsigned basis_idx, unsigned selected_bits, PabloBlockOrBuilder & pb);

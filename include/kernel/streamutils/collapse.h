@@ -6,7 +6,8 @@
 #pragma once
 
 #include <kernel/core/kernel.h>
-#include <kernel/pipeline/pipeline_builder.h>
+namespace kernel { class PipelineBuilder; }
+namespace kernel { class StreamSet; }
 
 namespace kernel {
 

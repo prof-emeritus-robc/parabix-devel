@@ -7,6 +7,7 @@
 
 #include <map>
 #include <set>
+#include <vector>
 #include <re/adt/re_cc.h>
 #include <re/adt/re_name.h>
 
@@ -14,7 +15,7 @@ namespace re { class Name; class Capture; class Reference;}
 
 namespace re {
 
-enum RE_Syntax {FixedStrings, BRE, ERE, FileGLOB, GitGLOB, PCRE, PROSITE};
+enum RE_Syntax {FixedStrings, BRE, ERE, FileGLOB, GrepGLOB, GitGLOB, PCRE, PROSITE};
 
 enum ModeFlagType : unsigned {
     DEFAULT_MODE = 0,
@@ -181,6 +182,8 @@ protected:
     
     RE * parse_mode_group(bool & closing_paren_parsed);
 
+    RE * parse_lookahead_body();
+
     RE * parse_capture_body();
     
     Reference * parse_back_reference();
@@ -188,8 +191,6 @@ protected:
     virtual bool isSetEscapeChar(char c);
 
     virtual RE * extend_item(RE * re);
-
-    RE * parseGraphemeBoundary(RE * re);
 
     virtual std::pair<int, int> parse_range_bound();
 
@@ -223,8 +224,6 @@ protected:
     RE * makeAtomicGroup(RE * r);
     RE * makeBranchResetGroup(RE * r);
 
-    codepoint_t parse_codepoint();
-
     virtual codepoint_t parse_escaped_codepoint();
 
     codepoint_t parse_hex_codepoint(int mindigits, int maxdigits);
@@ -232,6 +231,8 @@ protected:
     codepoint_t parse_octal_codepoint(int mindigits, int maxdigits);
 
     CC * createCC(const codepoint_t cp);
+
+    static RE * createSeq(std::vector<RE *> & items);
 
     static std::string canonicalize(const cursor_t begin, const cursor_t end);
 
@@ -247,6 +248,7 @@ protected:
     bool                        fByteMode;
     ModeFlagSet                 fModeFlagSet;
     bool                        fNested;
+    bool                        fIgnoreCase = false;    // -i applies (set by parse)
     unsigned                    mGroupsOpen;
     Cursor                      mCursor;
     unsigned                    mCaptureGroupCount;

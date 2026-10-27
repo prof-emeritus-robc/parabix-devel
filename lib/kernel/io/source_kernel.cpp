@@ -417,7 +417,8 @@ void MemorySourceKernel::generateInitializeMethod(KernelBuilder & b) {
     b.CreateMemZero(paddingStart, b.CreateSub(allocBytes, fileBytes), 1);
     b.setScalarField("buffer", ownedBuffer);
     b.setBaseAddress("sourceBuffer", ownedBuffer);
-    b.setCapacity("sourceBuffer", fileItems);
+    b.setCapacity("sourceBuffer", mBlockCapacity ? b.CreateRoundUp(fileItems, b.getSize(b.getBitBlockWidth()))
+                                                 : fileItems);
 }
 
 void MemorySourceKernel::generateDoSegmentMethod(KernelBuilder & b) {
@@ -524,8 +525,11 @@ FDSourceKernel::FDSourceKernel(LLVMTypeSystemInterface & ts, Scalar * const useM
     setStride(1);
 }
 
+bool MemorySourceBlockCapacity = false;
+
 MemorySourceKernel::MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fileSource, Scalar * fileItems, StreamSet * const outputStream)
-: SegmentOrientedKernel(ts, makeSourceName("memory_source", outputStream->getFieldWidth(), outputStream->getNumElements()),
+: SegmentOrientedKernel(ts, makeSourceName("memory_source", outputStream->getFieldWidth(), outputStream->getNumElements())
+                            + (MemorySourceBlockCapacity ? "+bc" : ""),
 // input streams
 {},
 // output stream
@@ -536,7 +540,8 @@ MemorySourceKernel::MemorySourceKernel(LLVMTypeSystemInterface & ts, Scalar * fi
 // internal scalars
 {})
 , mCodeUnitWidth(outputStream->getFieldWidth())
-, mNumElements(outputStream->getNumElements()) {
+, mNumElements(outputStream->getNumElements())
+, mBlockCapacity(MemorySourceBlockCapacity) {
     PointerType * const codeUnitPtrTy = PointerType::getUnqual(ts.getContext());
     addInternalScalar(codeUnitPtrTy, "buffer");
     addAttribute(MustExplicitlyTerminate());

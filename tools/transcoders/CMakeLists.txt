@@ -30,7 +30,6 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.util
     re.cc
     toolchain
 )
@@ -46,7 +45,6 @@ DEPS
     kernel.pipeline
     kernel.streamutils
     kernel.unicode
-    re.adt
     re.cc
     toolchain
 )
@@ -88,7 +86,6 @@ SRC
     xch.cpp
 DEPS
     pablo.compiler
-    pablo.bixnum
     kernel.basis
     kernel.io
     kernel.pipeline
@@ -104,7 +101,6 @@ NAME
 SRC
     nfd.cpp
 DEPS
-    pablo.compiler
     pablo.bixnum
     kernel.basis
     kernel.bitwise
@@ -148,7 +144,6 @@ DEPS
     kernel.pipeline
     kernel.streamutils
     kernel.unicode.normalization
-    re.cc
     toolchain
 )
 

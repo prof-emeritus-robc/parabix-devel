@@ -382,8 +382,9 @@ void BixNumCompiler::Div(BixNum dividend, unsigned divisor,
     unsigned dividend_bits = dividend.size();
     unsigned divisor_bits = floor_log2(divisor)+1;
     if (dividend_bits < divisor_bits) {
+        // The dividend is less than the divisor: it is the remainder.
         quotient = BixNum(dividend_bits, mPB.createZeroes());
-        remainder = Create(divisor);
+        remainder = dividend;
         return;
     }
     if ((divisor & 1) == 0) {

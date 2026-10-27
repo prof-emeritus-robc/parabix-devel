@@ -1,13 +1,11 @@
 #pragma once
 
-#include <codegen/FunctionTypeBuilder.h>
 #include <llvm/ExecutionEngine/GenericValue.h>
 #include <llvm/ExecutionEngine/Orc/SymbolStringPool.h>
 #include <llvm/ADT/StringSet.h>
 #include <kernel/core/kernel.h>
 #include <kernel/core/relationship.h>
 #include <llvm/IR/Constants.h>
-#include <kernel/illustrator/illustrator.h>
 #include <string>
 #include <vector>
 #include <memory>

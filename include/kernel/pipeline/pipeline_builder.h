@@ -51,6 +51,10 @@ public:
         return mDriver.CreateStreamSet(NumElements, FieldWidth);
     }
 
+    // A stream set of NumElements streams of the given FieldWidth having no
+    // items: produced by a kernel that terminates immediately.
+    StreamSet * CreateEmptyStreamSet(const unsigned NumElements = 1, const unsigned FieldWidth = 1);
+
     Scalar * CreateConstant(llvm::Constant * value) {
         return mDriver.CreateConstant(value);
     }
@@ -61,9 +65,11 @@ public:
 
     using pattern_t = std::vector<uint64_t>;
 
+    // Only dynamic repeating streamsets are internally generated (their data
+    // is provided at initialization); static ones are compiled in.
     #define RETURN_REPSTREAMSET(...) \
         RepeatingStreamSet * const ss = mDriver.CreateRepeatingStreamSet(__VA_ARGS__); \
-        mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
+        if (ss->isDynamic()) mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
         return ss
 
     RepeatingStreamSet * CreateRepeatingStreamSet(unsigned FieldWidth, pattern_t string, const bool isDynamic = true) {
@@ -85,7 +91,7 @@ public:
 
     #define RETURN_REPSTREAMSET(...) \
         RepeatingStreamSet * const ss = mDriver.CreateUnalignedRepeatingStreamSet(__VA_ARGS__); \
-        mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
+        if (ss->isDynamic()) mTarget->mInternallyGeneratedStreamSets.push_back(ss); \
         return ss
 
     RepeatingStreamSet * CreateUnalignedRepeatingStreamSet(unsigned FieldWidth, pattern_t string, const bool isDynamic = true) {
@@ -118,6 +124,11 @@ public:
 
     PipelinePhaseBoundary * InsertPhaseBoundary() {
         return mTarget->InsertPhaseBoundary();
+    }
+
+    // Label the kernels created from now on as belonging to the given stage, for reporting.
+    void SetStageLabel(llvm::StringRef label) {
+        mTarget->SetStageLabel(label);
     }
 
     template<typename... OtherBoundaryTypes>
@@ -211,6 +222,12 @@ public:
     }
 
 
+    // The number of kernel calls added to this pipeline so far (a nested
+    // pipeline or optimization branch counts as one).
+    size_t getNumOfKernelCalls() const {
+        return mTarget->getKernels().size();
+    }
+
     LLVMTypeSystemInterface & getTypeSystem() {
         return *mDriver.getMainBuilder();
     }
@@ -228,6 +245,9 @@ protected:
     // eventual pipeline configuration
     PipelineKernel * const  mTarget;
     bool                    mExternallySynchronized = false;
+    // Set for a top-level program (ProgramBuilder), whose compiled "main"
+    // constructs the specific kernels of its family calls.
+    bool                    mIsProgram = false;
 };
 
 /** ------------------------------------------------------------------------------------------------------------- *

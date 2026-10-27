@@ -38,6 +38,7 @@ SRC
     ../passes/codemotionpass.cpp
     ../passes/distributivepass.cpp
     ../passes/flattenif.cpp
+    ../passes/carryextent.cpp
     ../passes/pablo_simplifier.cpp
     ../passes/passes.cpp
     ../passes/schedulingprepass.cpp

@@ -167,6 +167,17 @@ void BaseDriver::addKernel(not_null<Kernel *> kernel) {
         }
     }
 
+    // A preserved kernel may be added again (e.g. reused as a family call in a
+    // later pipeline).  Transfer its ownership rather than taking a second one,
+    // which would delete it twice once preserved kernels are released.
+    for (auto i = mPreservedKernel.rbegin(); i != mPreservedKernel.rend(); ++i) {
+        if (i->get() == kernel) {
+            i->release();
+            mPreservedKernel.erase(std::next(i).base());
+            break;
+        }
+    }
+
     mUncachedKernel.emplace_back(kernel);
 
 }
@@ -331,13 +342,18 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
     FPM.addPass(RemoveRedundantAllocaAndGEPInstructions());
     FPM.addPass(SimplifyCFGPass());
     FPM.addPass(SROAPass(SROAOptions::ModifyCFG));
+    // A kernel can opt out of InstCombine by adding the NoInstCombinePass marker.
+    const bool kernelSkipsInstCombine =
+        std::find(passes.begin(), passes.end(), Kernel::OptimizationPass::NoInstCombinePass) != passes.end();
+    if (!kernelSkipsInstCombine) {
     #if LLVM_VERSION_INTEGER < LLVM_VERSION_CODE(20, 0, 0)
-    FPM.addPass(llvm::InstCombinePass());
+        FPM.addPass(llvm::InstCombinePass());
     #else
-    llvm::InstCombineOptions Opts;
-    //Opts.VerifyFixpoint = false;
-    FPM.addPass(llvm::InstCombinePass(Opts));
+        llvm::InstCombineOptions Opts;
+        //Opts.VerifyFixpoint = false;
+        FPM.addPass(llvm::InstCombinePass(Opts));
     #endif
+    }
     FPM.addPass(DCEPass());
     FPM.addPass(ReassociatePass());
     FPM.addPass(GVNPass());
@@ -366,6 +382,8 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
                 break;
             case P::PHICanonicalizerPass:
                 FPM.addPass(PHICanonicalizerPass());
+                break;
+            case P::NoInstCombinePass:   // marker only, handled above
                 break;
         }
     }

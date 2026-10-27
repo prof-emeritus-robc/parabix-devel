@@ -48,6 +48,8 @@ void PipelineCompiler::executeKernel(KernelBuilder & b) {
 
     const auto checkOutputChannels = initializeOutputStreamSetBuffersBeforeSegmentInvocation(b);
 
+    resetProvisionalAvailableItemCounts(b);
+
     mMayHaveInsufficientIO = checkInputChannels || checkOutputChannels;
 
     assert (mNextPartitionEntryPoint);
@@ -163,6 +165,7 @@ void PipelineCompiler::executeKernel(KernelBuilder & b) {
 
     b.SetInsertPoint(mKernelLoopCall);
     writeKernelCall(b);
+    recordProvisionalAvailableItemCounts(b);
 
     /// -------------------------------------------------------------------------------------
     /// KERNEL EXPLICIT TERMINATION CHECK

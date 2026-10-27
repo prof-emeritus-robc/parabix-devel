@@ -6,7 +6,6 @@
 #include <re/adt/re_rep.h>
 
 #include <re/adt/adt.h>
-#include <re/analysis/nullable.h>
 
 using namespace llvm;
 
@@ -21,7 +20,7 @@ inline int ubCombine(const int h1, const int h2) {
     }
 }
     
-RE * makeRep(RE * re, int lb, const int ub) {
+RE * makeRep(RE * re, int lb, const int ub, Rep::Kind k) {
     if (LLVM_UNLIKELY(lb == Rep::UNBOUNDED_REP)) {
         report_fatal_error("repetition lower bound must be finite!");
     }
@@ -36,7 +35,10 @@ RE * makeRep(RE * re, int lb, const int ub) {
         // Repeated match of empty string: just match once.
         return re;
     }
-    if (Rep * rep = dyn_cast<Rep>(re)) {
+    //  Nested repetitions are combined only if both are standard: e.g., (a*+)? is
+    //  not a* (a possessive repetition takes all the repetitions it can).
+    Rep * const nested = (k == Rep::Kind::Standard) ? dyn_cast<Rep>(re) : nullptr;
+    if (Rep * rep = (nested && nested->getKind() == Rep::Kind::Standard) ? nested : nullptr) {
         int l = rep->getLB();
         int u = rep->getUB();
         if (lb == ub) {
@@ -87,29 +89,7 @@ RE * makeRep(RE * re, int lb, const int ub) {
             return re;
         }
     }
-    return Rep::Create(re, lb, ub);
+    return Rep::Create(re, lb, ub, k);
 }
 
-RE * unrollFirst(Rep * rep) {
-    RE * e = rep->getRE();
-    auto lb = rep->getLB();
-    auto ub = rep->getUB();
-    if (ub == 0) return makeAlt();  // Can't unroll - return unmatchable regexp.
-    // Unroll one copy of the loop and simplify.
-    RE * reduced = makeRep(e, lb == 0 ? lb : lb - 1, ub == Rep::UNBOUNDED_REP ? ub : ub - 1);
-    RE * unrolled = makeSeq({e, reduced});
-    if (lb == 0) return makeAlt({makeSeq(), unrolled});
-    else return unrolled;
-}
-RE * unrollLast(Rep * rep) {
-    RE * e = rep->getRE();
-    auto lb = rep->getLB();
-    auto ub = rep->getUB();
-    if (ub == 0) return makeAlt();  // Can't unroll - return unmatchable regexp.
-    // Unroll one copy of the loop and simplify.
-    RE * reduced = makeRep(e, lb == 0 ? lb : lb - 1, ub == Rep::UNBOUNDED_REP ? ub : ub - 1);
-    RE * unrolled = makeSeq({reduced, e});
-    if (lb == 0) return makeAlt({makeSeq(), unrolled});
-    else return unrolled;
-}
 }

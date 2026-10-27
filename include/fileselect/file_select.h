@@ -12,7 +12,7 @@
 #include <vector>
 #include <llvm/Support/CommandLine.h>
 #include <boost/filesystem.hpp>
-#include <kernel/pipeline/driver/cpudriver.h>
+class CPUDriver;
 
 namespace re { class RE; }
 

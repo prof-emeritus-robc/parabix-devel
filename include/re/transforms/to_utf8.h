@@ -6,16 +6,13 @@
 #pragma once
 
 #include <ucd/utf/utf_encoder.h>
-#include <re/adt/adt.h>
 #include <re/transforms/re_transformer.h>
+#include <re/adt/adt.h>
 
 namespace re {class CC;}
 namespace re {
 
 class EncodingTransformer : public RE_Transformer {
-public:
-    const cc::Alphabet * getIndexingAlphabet() const {return mIndexingAlphabet;}
-    const cc::Alphabet * getEncodingAlphabet() const {return mEncodingAlphabet;}
 protected:
     EncodingTransformer(std::string transformationName,
                         const cc::Alphabet * indexingAlphabet,
@@ -33,6 +30,7 @@ public:
     UTF8_Transformer(bool useInternalNaming = false);
 protected:
     RE * transformCC(CC * cc) override;
+    RE * transformString(String * s) override;
     RE * rangeCodeUnits(codepoint_t lo, codepoint_t hi, unsigned index, const unsigned lgth);
     RE * rangeToUTF8(codepoint_t lo, codepoint_t hi);
 

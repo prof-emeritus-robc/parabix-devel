@@ -6,6 +6,7 @@
 #include <pablo/parse/kernel_signature.h>
 
 #include <llvm/Support/raw_ostream.h>
+#include <pablo/parse/pablo_type.h>
 
 namespace pablo {
 namespace parse {

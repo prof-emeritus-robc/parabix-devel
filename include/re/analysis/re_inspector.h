@@ -6,8 +6,8 @@
 #pragma once
 
 #include <set>
-#include <re/adt/adt_forward_decl.h>
 #include <re/adt/memoization.h>
+#include <re/adt/adt_forward_decl.h>
 
 namespace re {
 
@@ -50,6 +50,9 @@ protected:
     virtual void inspectAssertion(Assertion * a);
     virtual void inspectPermute(Permute * p);
     virtual void inspectInterleavable(Interleavable * s);
+    virtual void inspectString(String * s);
+    // Inspect a String as the Seq of its singleton Unicode CCs.
+    void inspectStringAsCCs(String * s);
     virtual void inspectPropertyExpression(PropertyExpression * pe);
 private:
     const NameProcessingMode mNameMode;

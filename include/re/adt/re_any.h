@@ -12,7 +12,7 @@ namespace re {
 
 class Any : public RE {
 public:
-    static Any * Create(const cc::Alphabet * a) {return new Any(a);}
+    static Any * Create(const cc::Alphabet * a = &cc::Unicode) {return new Any(a);}
     RE_SUBTYPE(Any)
     const cc::Alphabet * getAlphabet() const {return mAlphabet;}
 private:

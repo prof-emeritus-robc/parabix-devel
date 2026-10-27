@@ -4,7 +4,7 @@ namespace re {
 
 class RE;
 
-RE * resolveCaseInsensitiveMode(RE * re, const bool globallyCaseInsensitive);
+RE * resolveCaseInsensitiveMode(RE * re);
 
 }
 

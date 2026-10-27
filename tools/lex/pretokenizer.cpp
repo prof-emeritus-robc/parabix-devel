@@ -8,6 +8,7 @@
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
 #include <re/adt/adt.h>
+#include <re/adt/re_utility.h>
 #include <re/parse/parser.h>
 #include <re/unicode/resolve_properties.h>
 #include <re/cc/cc_kernel.h>
@@ -17,17 +18,22 @@
 #include <re/transforms/re_transformer.h>
 #include <re/transforms/re_multiplex.h>
 #include <kernel/core/kernel_builder.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
 #include <kernel/unicode/UCD_property_kernel.h>
 #include <kernel/unicode/charclasses.h>
+#include <kernel/unicode/utf8_decoder.h>
+#include <kernel/unicode/utf8_support.h>
 #include <kernel/unicode/boundary_kernels.h>
 #include <kernel/streamutils/deletion.h>
 #include <kernel/streamutils/pdep_kernel.h>
+#include <ucd/data/PropertyObjects.h>
+#include <ucd/data/PropertyObjectTable.h>
 #include <pablo/pablo.h>
 #include <llvm/Support/raw_ostream.h>
 #include <map>
 #include <vector>
 #include <string>
+#include <toolchain/toolchain.h>
 
 using namespace llvm;
 using namespace codegen;
@@ -46,7 +52,8 @@ static std::string SplitCode(SplitBehaviorMode s) {
     if (s == contiguous)        return "c";
     if (s == mergedwithprevious) return "p";
     if (s == mergedwithnext)    return "n";
-    if (s == removed)           return "r";
+    if (s == excludewhitespace) return "r";
+    if (s == removed)           return "x";
     return "d";
 }
 
@@ -317,7 +324,7 @@ protected:
         PabloAST * result = nullptr;
         if (mBehavior == contiguous)        result = pb.createOr(SplitRun1, SplitRunFollow);
         else if (mBehavior == mergedwithprevious) result = SplitRunFollow;
-        else if (mBehavior == removed)      result = SplitRunFollow;
+        else if (mBehavior == excludewhitespace) result = SplitRunFollow;
         else if (mBehavior == mergedwithnext) result = SplitRun1;
         else /* isolated */                 result = pb.createOr(SplitMarks, SplitRunFollow);
         writeOutputStreamSet("ResultBoundaries", std::vector<PabloAST*>{result});
@@ -471,6 +478,19 @@ protected:
     }
 };
 
+// InFile(ones) at the rate of `ref`: marks every input position, 0 past the end.
+class InFileOnesKernel : public PabloKernel {
+public:
+    InFileOnesKernel(LLVMTypeSystemInterface & ts, StreamSet * ref, StreamSet * ones)
+    : PabloKernel(ts, "InFileOnes", {Binding{"ref", ref}}, {Binding{"ones", ones}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        pb.createAssign(pb.createExtract(getOutputStreamVar("ones"), pb.getInteger(0)),
+                        pb.createInFile(pb.createOnes()));
+    }
+};
+
 // GPT2PretokenBoundaryKernel — GPT-2 pretoken STARTS via CHARACTER-CLASS transitions
 // (parallel leftmost-longest), replacing the RE_Kernel route which over-marks (it
 // matches all positions in parallel, so overlapping arms like " '" vs "'t" and
@@ -510,19 +530,31 @@ public:
                    Binding{"cl",   cl,   FixedRate(), LookAhead(2)},
                    Binding{"cvr",  cvr,  FixedRate(), LookAhead(2)},
                    Binding{"ce",   ce,   FixedRate(), LookAhead(2)}},
-                  {Binding{"boundary", boundary}}) {}
+                  {Binding{"boundary", boundary}}), mCombined(false) {}
+    // --pretok-compress-classes: the same nine classes as one set, in kGPT2Classes order.
+    GPT2PretokenBoundaryKernel(LLVMTypeSystemInterface & ts, StreamSet * classes,
+                               StreamSet * nonspace, StreamSet * boundary)
+    : PabloKernel(ts, "GPT2PretokenBoundary_c9",
+                  {Binding{"classes", classes, FixedRate(), LookAhead(2)},
+                   Binding{"nonspace", nonspace, FixedRate(), LookAhead(1)}},
+                  {Binding{"boundary", boundary}}), mCombined(true) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        PabloAST * space    = getInputStreamSet("space")[0];      // full \p{White_Space}
-        PabloAST * spaceLit = getInputStreamSet("spaceLit")[0];   // literal 0x20 only
-        PabloAST * letter   = getInputStreamSet("letter")[0];
-        PabloAST * number   = getInputStreamSet("number")[0];
-        PabloAST * apos     = getInputStreamSet("apostrophe")[0];
-        PabloAST * sdmt     = getInputStreamSet("sdmt")[0];   // [sdmt]  (single-letter suffix)
-        PabloAST * cl       = getInputStreamSet("cl")[0];     // 'l'     (ll)
-        PabloAST * cvr      = getInputStreamSet("cvr")[0];    // [vr]    (ve / re first letter)
-        PabloAST * ce       = getInputStreamSet("ce")[0];     // 'e'     (ve / re second letter)
+        std::vector<PabloAST *> c;
+        if (mCombined) c = getInputStreamSet("classes");
+        auto in = [&](const char * name, unsigned i) {
+            return mCombined ? c[i] : getInputStreamSet(name)[0];
+        };
+        PabloAST * space    = in("space", 0);        // full \p{White_Space}
+        PabloAST * spaceLit = in("spaceLit", 1);     // literal 0x20 only
+        PabloAST * letter   = in("letter", 2);
+        PabloAST * number   = in("number", 3);
+        PabloAST * apos     = in("apostrophe", 4);
+        PabloAST * sdmt     = in("sdmt", 5);         // [sdmt]  (single-letter suffix)
+        PabloAST * cl       = in("cl", 6);           // 'l'     (ll)
+        PabloAST * cvr      = in("cvr", 7);          // [vr]    (ve / re first letter)
+        PabloAST * ce       = in("ce", 8);           // 'e'     (ve / re second letter)
 
         PabloAST * nonspace = pb.createNot(space);
         PabloAST * other    = pb.createAnd(nonspace, pb.createNot(pb.createOr(letter, number)));
@@ -598,23 +630,83 @@ protected:
 
         writeOutputStreamSet("boundary", std::vector<PabloAST*>{boundary});
     }
+private:
+    const bool mCombined;
+};
+
+// --pretok-compress-classes: InFileNonSpaceKernel on stream 0 (space) of the class set.
+class GPT2NonSpaceKernel : public PabloKernel {
+public:
+    GPT2NonSpaceKernel(LLVMTypeSystemInterface & ts, StreamSet * classes, StreamSet * nonspace)
+    : PabloKernel(ts, "GPT2NonSpace_c" + std::to_string(classes->getNumElements()),
+                  {Binding{"classes", classes}}, {Binding{"nonspace", nonspace}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        pb.createAssign(pb.createExtract(getOutputStreamVar("nonspace"), pb.getInteger(0)),
+                        pb.createInFile(pb.createNot(getInputStreamSet("classes")[0])));
+    }
+};
+
+// --pretok-compress-classes: ByteLevelGPT2Kernel's firstbyte output alone (the first byte
+// of each UTF-8 sequence), without its 21 codepoint streams.
+class GPT2FirstByteKernel : public PabloKernel {
+public:
+    GPT2FirstByteKernel(LLVMTypeSystemInterface & ts, StreamSet * BasisBits, StreamSet * FirstByteMask)
+    : PabloKernel(ts, "GPT2FirstByte",
+                  {Binding{"basis", BasisBits}}, {Binding{"firstbyte", FirstByteMask}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> b = getInputStreamSet("basis");
+        PabloAST * isCont = pb.createAnd(b[7], pb.createNot(b[6]));
+        writeOutputStreamSet("firstbyte", std::vector<PabloAST *>{pb.createNot(isCont)});
+    }
 };
 
 //  Helper functions
+
+// HF's \w, the Unicode word class of its regex engine (UTS #18): Alphabetic, marks,
+// decimal digits, connector punctuation and the joiners ZWNJ/ZWJ. Not Letter + Number +
+// '_': that left combining marks out of words (splitting "a" + U+0301, and Devanagari or
+// Hebrew words at every vowel sign or point) and let other numbers such as superscript 2
+// and 1/2 into them. Checked against HF's Whitespace() and Split(\w+) over every assigned
+// codepoint in 4 contexts; what still differs is characters newer than HF's tables.
+// onig: the \w of HF's tokenizers.Regex (Oniguruma), which Split() patterns use, instead
+// of the Rust regex crate behind Whitespace(): it adds the Latin-1 numbers 2 3 1 1/4 1/2
+// 3/4 (U+00B2, U+00B3, U+00B9, U+00BC..U+00BE) and leaves out ZWNJ and ZWJ.
+static re::CC * hfWordCC(bool onig) {
+    auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(UCD::getPropertyObject(UCD::gc));
+    auto binarySet = [](UCD::property_t p) {
+        return llvm::cast<UCD::BinaryPropertyObject>(UCD::getPropertyObject(p))->GetCodepointSet("Y");
+    };
+    UCD::UnicodeSet word = binarySet(UCD::Alpha) + gcObj->GetCodepointSet("M")
+                         + gcObj->GetCodepointSet("Nd") + gcObj->GetCodepointSet("Pc");
+    if (onig) {
+        word = word + UCD::UnicodeSet(0xB2, 0xB3) + UCD::UnicodeSet(0xB9, 0xB9)
+                    + UCD::UnicodeSet(0xBC, 0xBE);
+    } else {
+        word = word + binarySet(UCD::Join_C);
+    }
+    return re::makeCC(std::move(word), &cc::Unicode);
+}
 
 static void whiteSpaceLogic(PipelineBuilder & P,
                              StreamSet * U21Basis,
                              StreamSet * WSmask,
                              StreamSet * results)
 {
-    re::RE * rule1 = re::generateRE_TokenizerRule(re::WhitespaceBoundary);
-    RE_CompilerContext ctxt;
-    ctxt.setCodeUnitContext(&cc::Unicode, U21Basis);
-    RE_PipelineBuilder RE_PB(P, ctxt);
+    // generateRE_TokenizerRule(WhitespaceBoundary) parses the same
+    // \w++|[^\w\s]++ string as BertPreTokenizer, which matchSearchPipeline
+    // mis-compiles (confirmed: drops punct->word transitions after a short
+    // possessive match). Build \w/\W transitions by hand instead, same
+    // technique used for simpleWordBoundaries.
+    StreamSet * WS_WordClass = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{hfWordCC(false)}, U21Basis, WS_WordClass);
     StreamSet * wsb = P.CreateStreamSet(1);
-    RE_PB.matchSearchPipeline(rule1, wsb);
+    P.CreateKernelCall<BoundaryKernel>(WS_WordClass, nullptr, wsb);
     StreamSet * wsFollows = P.CreateStreamSet(1);
-    P.CreateKernelCall<SplitMarksToTokens>(removed, WSmask, wsFollows);
+    P.CreateKernelCall<SplitMarksToTokens>(excludewhitespace, WSmask, wsFollows);
     P.CreateKernelCall<OrKernel>(wsFollows, wsb, results);
     SHOW_STREAM(results);
 }
@@ -655,6 +747,50 @@ static StreamSet * buildREBasedTokenizer(
     return WordBoundaries;
 }
 
+// BERT's punctuation rule = true \p{Punctuation} (Unicode gc=P) OR four
+// hardcoded ASCII ranges (!-/, :-@, [-`, {-~). The framework's
+// PunctuationBoundary ([[:punct:]]) is \p{Punctuation} ONLY, so it misses 9
+// ASCII chars that are Unicode Symbol not Punctuation: $ + < = > ^ ` | ~.
+// Confirmed directly against HF on "a~b". Built locally (tools/lex only,
+// not boundaries.cpp) so other programs keep the narrower POSIX meaning.
+//
+// This constructs the RE by hand instead of parsing a wider bracket-expr
+// string, replicating the parser's own "X++" possessive expansion (see
+// parser.cpp extend_item) so it compiles through the exact same
+// regex-engine boundary logic as the original pattern: every punctuation
+// char isolated individually, INCLUDING from its punctuation neighbors.
+// (A first attempt used a CC-transition/BoundaryKernel approach instead --
+// that merges runs of consecutive punctuation, e.g. "...", "!!", "()",
+// into one token, and regressed corpus accuracy from 53 to 156/200 failing
+// lines. The single-char smoke test couldn't catch it.)
+//
+// HF's punctuation table is Unicode 8.0 (its unicode_categories crate), so the class is
+// gc=P restricted to characters of Unicode <= 8.0, plus the two whose category changed
+// since: U+166D CANADIAN SYLLABICS CHI SIGN (now So) and U+111C9 SHARADA SANDHI MARK (now
+// Mn) were Po then. With the current tables, 142 newer characters split where HF keeps
+// them in the word (per-codepoint sweep against Punctuation() and BertPreTokenizer()).
+static re::RE * buildBertPunctuationRule() {
+    auto * gcObj = llvm::cast<UCD::EnumeratedPropertyObject>(
+        UCD::getPropertyObject(UCD::gc));
+    auto * ageObj = llvm::cast<UCD::EnumeratedPropertyObject>(
+        UCD::getPropertyObject(UCD::age));
+    UCD::UnicodeSet upTo8;
+    for (int v = UCD::AGE_ns::V1_1; v <= UCD::AGE_ns::V8_0; v++)
+        upTo8 = upTo8 + ageObj->GetCodepointSet(v);
+    re::CC * punctCC = re::makeCC((gcObj->GetCodepointSet("P") & upTo8)
+                                  + UCD::UnicodeSet(0x166D, 0x166D) + UCD::UnicodeSet(0x111C9, 0x111C9),
+                                  &cc::Unicode);
+    re::CC * asciiPunctCC = re::makeCC({{0x21,0x2F},{0x3A,0x40},
+                                         {0x5B,0x60},{0x7B,0x7E}}, &cc::Unicode);
+    re::CC * bertPunctCC = re::makeCC(punctCC, asciiPunctCC);
+    re::RE * notBertPunctCC = re::makeComplement(bertPunctCC);
+    re::RE * possessiveRun = re::makeSeq({
+        re::makeRep(notBertPunctCC, 1, re::Rep::UNBOUNDED_REP),
+        re::makeNegativeLookAheadAssertion(notBertPunctCC)});
+    re::RE * rule = re::makeAlt({bertPunctCC, possessiveRun});
+    return UCD::linkAndResolve(rule);
+}
+
 struct TokenizerConfig {
     re::RE_TokenizerKind kind;
     std::string prefix;
@@ -663,7 +799,6 @@ struct TokenizerConfig {
 const static std::map<PreTokenizerMode, TokenizerConfig> TokenizerConfigs = {
     {whitespace,   {re::WhitespaceBoundary,    "WS"}},
     {whitespacesplit, {re::WhitespaceSplitBoundary, "WSS"}},
-    {punctuation,  {re::PunctuationBoundary,   "PC"}},
     {bytelevel,    {re::ByteLevelBoundary,      "BL"}},
     {bert,         {re::BertPreTokenizer,       "BERT"}}
 };
@@ -685,18 +820,38 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     P.CreateKernelCall<UnicodePropertyKernelBuilder>(numberProp, U21codepoints, NumberStream);
     SHOW_STREAM(NumberStream);
 
-    // Whitespace mask (may be replaced for bytelevel)
+    // Whitespace mask: full \p{White_Space} (HF's \s -- 0x20, tab/newline, NBSP
+    // U+00A0, etc.), shared by every pretokenizer mode's "excludewhitespace"/
+    // "isolated"/"merged*"/"contiguous" behavior logic below (may be replaced for bytelevel
+    // and chardelimiter, which need their own semantics). Previously this was
+    // WhitespaceDetector, literal 0x20 ONLY -- correct for bytelevel's "optional
+    // leading space" rule, but wrong for every other mode, which must discard
+    // tab/newline/NBSP/etc. as plain delimiters the same way HF's Whitespace()
+    // and WhitespaceSplit() do. Confirmed by differential test: those chars were
+    // surviving as their own stray tokens instead of being discarded.
+    auto wsProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "White_Space");
+    wsProp = cast<re::PropertyExpression>(UCD::linkAndResolve(wsProp));
     StreamSet * WhitespaceMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<WhitespaceDetector>(U21codepoints, WhitespaceMask);
+    P.CreateKernelCall<UnicodePropertyKernelBuilder>(wsProp, U21codepoints, WhitespaceMask);
     SHOW_STREAM(WhitespaceMask);
 
     StreamSet * WordBoundaries = nullptr;
+    StreamSet * SW_WordClass = nullptr;  // set below iff preTokenizer == simpleWordBoundaries
 
     if (preTokenizer == simpleWordBoundaries) {
-        auto wb = re::makePropertyExpression(PropertyExpression::Kind::Boundary, "word");
-        wb = cast<re::PropertyExpression>(UCD::linkAndResolve(wb));
+        // CLI help says "Boundaries between \w and \W characters" (a plain
+        // character-class transition), NOT full UAX#29 word segmentation --
+        // the previous UnicodePropertyLogic("word" boundary) call implemented
+        // the latter, which is a different algorithm (confirmed divergent
+        // from HF's Split(Regex(r"\w+"), isolated) on a stress sentence).
+        // \w = hfWordCC(onig): HF's reference is Split(Regex(r"\w+")). BoundaryKernel
+        // marks every transition of that mask, same mechanism already used for
+        // chardelimiter below.
+        SW_WordClass = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{hfWordCC(true)}, U21codepoints, SW_WordClass);
+
         WordBoundaries = P.CreateStreamSet(1, 1);
-        UnicodePropertyLogic(P, wb, U21codepoints, WordBoundaries);
+        P.CreateKernelCall<BoundaryKernel>(SW_WordClass, nullptr, WordBoundaries);
     }
     else if (preTokenizer == whitespace) {
         WordBoundaries = P.CreateStreamSet(1, 1);
@@ -734,20 +889,23 @@ PreTokenizerResult buildPreTokenizerBoundaries(
         P.CreateKernelCall<CharClassesKernel>(
             std::vector<re::CC *>{re::makeCC((codepoint_t)0x65)}, U21codepoints, BL_e);   // e
         // Full \p{White_Space} (HF's \s): 0x20, tab/newline, NBSP U+00A0, etc. Drives
-        // run-splitting. WhitespaceMask (from WhitespaceDetector) is the literal 0x20
-        // ONLY, which is HF's " ?" attaching space — pass it as spaceLit.
-        auto wsProp = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, "White_Space");
-        wsProp = cast<re::PropertyExpression>(UCD::linkAndResolve(wsProp));
-        StreamSet * BL_WSpace = P.CreateStreamSet(1);
-        P.CreateKernelCall<UnicodePropertyKernelBuilder>(wsProp, U21codepoints, BL_WSpace);
+        // run-splitting. The shared WhitespaceMask computed above is now this same
+        // full set (post-fix), so it's reused directly here instead of rebuilding it.
+        StreamSet * BL_WSpace = WhitespaceMask;
         // nonspace = InFile(NOT space): lets the boundary kernel tell "next codepoint
         // is a non-space" apart from "no next codepoint", so a TRAILING whitespace run
         // is not split (HF's "\s+(?!\S)" matches the whole run at end-of-input).
         StreamSet * BL_NonSpace = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<InFileNonSpaceKernel>(BL_WSpace, BL_NonSpace);
+        // spaceLit: the literal byte 0x20 ONLY (HF's " ?" optional-leading-space
+        // rule) -- narrower than BL_WSpace. Built fresh here via WhitespaceDetector,
+        // since the shared WhitespaceMask is now the broad \p{White_Space} set, not
+        // this literal one.
+        StreamSet * BL_SpaceLit = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<WhitespaceDetector>(U21codepoints, BL_SpaceLit);
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<GPT2PretokenBoundaryKernel>(
-            BL_WSpace, BL_NonSpace, WhitespaceMask, BL_Letter, NumberStream, BL_Apostrophe,
+            BL_WSpace, BL_NonSpace, BL_SpaceLit, BL_Letter, NumberStream, BL_Apostrophe,
             BL_sdmt, BL_l, BL_vr, BL_e, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
 
@@ -774,14 +932,29 @@ PreTokenizerResult buildPreTokenizerBoundaries(
             std::vector<re::CC *>{neverCC}, GPT2Codepoints, BL_WhitespaceMask);
         WhitespaceMask = BL_WhitespaceMask;
     }
-    else if (preTokenizer == sequence_whitespace_punctuation) {
-        StreamSet * preTokenStrm1 = P.CreateStreamSet(1, 1);
-        whiteSpaceLogic(P, U21codepoints, WhitespaceMask, preTokenStrm1);
-        StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "PC",
-            re::generateRE_TokenizerRule(re::PunctuationBoundary), U21codepoints);
+    else if (preTokenizer == bert || preTokenizer == sequence_whitespace_punctuation) {
+        // HF reference is Sequence([WhitespaceSplit(), Punctuation()]) --
+        // WhitespaceSplit splits ONLY on literal whitespace runs (its own
+        // "\S+(?!\S)|\s+(?!\s)" rule), unlike Whitespace()'s \w/[^\w\s]
+        // word-vs-nonword split. whiteSpaceLogic() implements the latter
+        // (correct for the standalone "whitespace" mode below), so reusing
+        // it here was wrong: e.g. "<A3>10million" (<A3> is Symbol, not
+        // \w and not Punctuation) got isolated as its own token under the
+        // \w/[^\w\s] split, but WhitespaceSplit() leaves it attached to
+        // "10million" since there's no whitespace inside it. Use the same
+        // WhitespaceSplitBoundary rule the (passing) "whitespacesplit"
+        // mode uses instead.
+        StreamSet * preTokenStrm1 = buildREBasedTokenizer(P, "WSS",
+            re::generateRE_TokenizerRule(re::WhitespaceSplitBoundary), U21codepoints);
+        StreamSet * preTokenStrm2 = buildREBasedTokenizer(P, "BPC",
+            buildBertPunctuationRule(), U21codepoints);
         WordBoundaries = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<OrKernel>(preTokenStrm1, preTokenStrm2, WordBoundaries);
         SHOW_STREAM(WordBoundaries);
+    }
+    else if (preTokenizer == punctuation) {
+        WordBoundaries = buildREBasedTokenizer(P, "BPC",
+            buildBertPunctuationRule(), U21codepoints);
     }
     else if (preTokenizer == chardelimiter) {
         uint32_t delimCP;
@@ -840,24 +1013,59 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     P.CreateKernelCall<UnicodeAlphanumericDetector>(U21codepoints, AlphanumericMask, LetterStream, NumberStream);
     SHOW_STREAM(AlphanumericMask);
 
-    // Compute effective behavior (some pretokenizers force "removed")
+    // Compute effective behavior (some pretokenizers force "excludewhitespace")
     SplitBehaviorMode effectiveBehavior = splitBehavior;
     if (preTokenizer == bert || preTokenizer == sequence_whitespace_punctuation ||
         preTokenizer == whitespacesplit || preTokenizer == whitespace ||
         preTokenizer == chardelimiter) {
-        effectiveBehavior = removed;
+        effectiveBehavior = excludewhitespace;
     }
 
     // Apply behavior kernel to compute insertion boundaries
     StreamSet * insertionBoundaries = U21_tokenBoundaries;
-    if (effectiveBehavior == removed) {
+    if (effectiveBehavior == excludewhitespace) {
         StreamSet * notWhitespaceMask = P.CreateStreamSet(1);
         P.CreateKernelCall<NotKernel>(WhitespaceMask, notWhitespaceMask);
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWhitespaceMask, insertionBoundaries);
-    } else if (effectiveBehavior == isolated && preTokenizer != digits && preTokenizer != punctuation) {
+    } else if (effectiveBehavior == removed && preTokenizer == simpleWordBoundaries) {
+        // HF's real Split(pattern, "removed"): the matched run (here, \w+)
+        // is deleted entirely, keeping only the gaps. The actual character
+        // deletion happens in stage 2b (applyTokenSeparatorInsertion) via
+        // FilterByMask on WordClassMask; here we only need to drop the
+        // boundary mark at each word-run start so stage 2b's LF-insertion
+        // doesn't insert a separator for a run that's about to vanish
+        // (leaving a stray empty token).
+        StreamSet * notWordClass = P.CreateStreamSet(1);
+        P.CreateKernelCall<NotKernel>(SW_WordClass, notWordClass);
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWordClass, insertionBoundaries);
+    } else if (effectiveBehavior == isolated && preTokenizer != digits && preTokenizer != punctuation
+               && preTokenizer != simpleWordBoundaries) {
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<IsolatedBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
+    } else if (effectiveBehavior == mergedwithprevious && preTokenizer == simpleWordBoundaries) {
+        // HF's Split(pattern, "merged_with_previous") merges each MATCH (here,
+        // a \w+ run) backward into the non-matching run before it, by dropping
+        // the match's own run-start mark -- keep only \W-run starts. The very
+        // first run, if it's a word, has nothing to merge into and would need
+        // to keep its mark, but RemoveFirstMarkKernel unconditionally clears
+        // position 0 afterwards anyway, so no extra case is needed (verified
+        // against HF on leading/trailing word and gap combinations).
+        StreamSet * notWordClass = P.CreateStreamSet(1);
+        P.CreateKernelCall<NotKernel>(SW_WordClass, notWordClass);
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, notWordClass, insertionBoundaries);
+    } else if (effectiveBehavior == mergedwithnext && preTokenizer == simpleWordBoundaries) {
+        // Mirror of the above: each match merges forward into the following
+        // gap, by dropping the GAP's run-start mark instead -- keep only
+        // \w-run starts.
+        insertionBoundaries = P.CreateStreamSet(1);
+        P.CreateKernelCall<AndKernel>(U21_tokenBoundaries, SW_WordClass, insertionBoundaries);
+    } else if (effectiveBehavior == contiguous && preTokenizer == simpleWordBoundaries) {
+        // Confirmed identical to "isolated" for a \w+/\W+ alternation (no
+        // adjacent same-class runs are possible), so no transformation needed.
+        insertionBoundaries = U21_tokenBoundaries;
     } else if (effectiveBehavior == mergedwithprevious) {
         insertionBoundaries = P.CreateStreamSet(1);
         P.CreateKernelCall<MergedWithPreviousBehavior>(U21_tokenBoundaries, WhitespaceMask, insertionBoundaries);
@@ -881,11 +1089,53 @@ PreTokenizerResult buildPreTokenizerBoundaries(
         U21codepoints,
         AlphanumericMask,
         PunctuationStream,
-        effectiveBehavior
+        effectiveBehavior,
+        SW_WordClass
     };
 }
 
-//  Stage 2b: spread + insert LF + filter 
+// The bytelevel classes of buildPreTokenizerBoundaries (same sets: White_Space, Letter and
+// Number as UnicodePropertyKernelBuilder resolves them), at each UTF-8 sequence's last byte,
+// where UTF8_Decoder leaves the codepoint and UTF8_index marks it. Filtering them by
+// u8index gives exactly what the class kernels compute on the compressed codepoints.
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits) {
+    auto propCC = [](const char * name) {
+        auto * pe = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, name);
+        pe = cast<re::PropertyExpression>(UCD::linkAndResolve(pe));
+        return cast<re::CC>(pe->getResolvedRE());
+    };
+    std::vector<re::CC *> ccs{
+        propCC("White_Space"),                                            // 0 space
+        re::makeCC((codepoint_t)0x20),                                    // 1 spaceLit
+        propCC("Letter"),                                                 // 2 letter
+        propCC("Number"),                                                 // 3 number
+        re::makeCC((codepoint_t)0x27),                                    // 4 apostrophe
+        re::makeCC(re::makeCC((codepoint_t)0x64),                         // 5 [sdmt]
+                   re::makeCC(re::makeCC((codepoint_t)0x6D),
+                              re::makeCC((codepoint_t)0x73, (codepoint_t)0x74))),
+        re::makeCC((codepoint_t)0x6C),                                    // 6 l
+        re::makeCC(re::makeCC((codepoint_t)0x72), re::makeCC((codepoint_t)0x76)), // 7 [rv]
+        re::makeCC((codepoint_t)0x65)};                                   // 8 e
+    StreamSet * U21 = P.CreateStreamSet(21, 1);
+    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
+    StreamSet * u8index = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
+    StreamSet * classes = P.CreateStreamSet(ccs.size(), 1);
+    P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+    StreamSet * classesC = P.CreateStreamSet(ccs.size(), 1);
+    FilterByMask(P, u8index, classes, classesC);
+    StreamSet * nonspace = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<GPT2NonSpaceKernel>(classesC, nonspace);
+    StreamSet * boundary = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<GPT2PretokenBoundaryKernel>(classesC, nonspace, boundary);
+    StreamSet * firstByte = P.CreateStreamSet(1, 1);
+    P.CreateKernelCall<GPT2FirstByteKernel>(BasisBits, firstByte);
+    StreamSet * byteBoundary = P.CreateStreamSet(1, 1);
+    SpreadByMask(P, firstByte, boundary, byteBoundary);
+    return byteBoundary;
+}
+
+//  Stage 2b: spread + insert LF + filter
 
 StreamSet * applyTokenSeparatorInsertion(
     PipelineBuilder & P,
@@ -919,13 +1169,48 @@ StreamSet * applyTokenSeparatorInsertion(
     StreamSet * tokenMask = P.CreateStreamSet(1);
     P.CreateKernelCall<NotKernel>(spreadWhitespaceMask, tokenMask);
 
-    if (result.effectiveBehavior == removed) {
+    // The real slots of the spread stream: the input codepoints and the inserted
+    // separators. A slot past the input reads 0 (a trailing U+0000 in punctuation and
+    // simplewordboundaries output) and is dropped at the end; a U+0000 that is in the
+    // input stays, as in HF. (Filtering every U+0000 deleted real NULs from tokens.)
+    StreamSet * inputOnes = P.CreateStreamSet(1);
+    P.CreateKernelCall<InFileOnesKernel>(result.WhitespaceMask, inputOnes);
+    StreamSet * spreadInput = P.CreateStreamSet(1);
+    SpreadByMask(P, lineInsertMask, inputOnes, spreadInput);
+    StreamSet * insertedSlots = P.CreateStreamSet(1);
+    P.CreateKernelCall<NotKernel>(lineInsertMask, insertedSlots);
+    StreamSet * realSlots = P.CreateStreamSet(1);
+    P.CreateKernelCall<OrKernel>(spreadInput, insertedSlots, realSlots);
+
+    if (result.effectiveBehavior == excludewhitespace) {
         StreamSet * newBasis = P.CreateStreamSet(21);
         FilterByMask(P, tokenMask, tokenBasis, newBasis);
         tokenBasis = newBasis;
         StreamSet * newBoundaries = P.CreateStreamSet(1);
         FilterByMask(P, tokenMask, spreadTokenBoundaries, newBoundaries);
         spreadTokenBoundaries = newBoundaries;
+        StreamSet * newReal = P.CreateStreamSet(1);
+        FilterByMask(P, tokenMask, realSlots, newReal);
+        realSlots = newReal;
+    } else if (result.effectiveBehavior == removed && result.WordClassMask != nullptr) {
+        // HF's real "removed": delete the matched \w+ characters entirely,
+        // same FilterByMask mechanism as excludewhitespace above, keyed on
+        // word-class instead of whitespace. Guarded on WordClassMask being
+        // set (only simpleWordBoundaries populates it) so a stray
+        // --behavior=removed on another mode is a safe no-op, not a crash.
+        StreamSet * spreadWordClassMask = P.CreateStreamSet(1);
+        SpreadByMask(P, lineInsertMask, result.WordClassMask, spreadWordClassMask);
+        StreamSet * notWordClassMask = P.CreateStreamSet(1);
+        P.CreateKernelCall<NotKernel>(spreadWordClassMask, notWordClassMask);
+        StreamSet * newBasis = P.CreateStreamSet(21);
+        FilterByMask(P, notWordClassMask, tokenBasis, newBasis);
+        tokenBasis = newBasis;
+        StreamSet * newBoundaries = P.CreateStreamSet(1);
+        FilterByMask(P, notWordClassMask, spreadTokenBoundaries, newBoundaries);
+        spreadTokenBoundaries = newBoundaries;
+        StreamSet * newReal = P.CreateStreamSet(1);
+        FilterByMask(P, notWordClassMask, realSlots, newReal);
+        realSlots = newReal;
     }
 
     StreamSet * finalU21codepoints = tokenBasis;
@@ -935,12 +1220,9 @@ StreamSet * applyTokenSeparatorInsertion(
                                      spreadPunctuationStream, finalU21codepoints, TransformedBoundaries);
     SHOW_STREAM(TransformedBoundaries);
 
-    // Remove trailing null codepoints (U+0000) from zero-padded stream end
-    re::CC * nonNullCC = re::makeCC(0x01, 0x10FFFF);
-    StreamSet * nonNullMask = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{nonNullCC}, finalU21codepoints, nonNullMask);
+    // Drop the slots past the input (see realSlots above).
     StreamSet * filteredU21 = P.CreateStreamSet(21);
-    FilterByMask(P, nonNullMask, finalU21codepoints, filteredU21);
+    FilterByMask(P, realSlots, finalU21codepoints, filteredU21);
 
     return filteredU21;
 }

@@ -28,7 +28,7 @@
  *                       inPlayMask &= NOT(Advance(merge, lenA)). B is read from the
  *                       INPUT via LookAhead (forward reads are input-only; sourceIn
  *                       declares LookAhead(maxLen)). `source` threads kernel→kernel
- *                       (width grows to ceil_log2(hi+1) bits per range), so a
+ *                       (width grows to ceil_log2(hi) bits per range), so a
  *                       higher-rank merge sees ids stamped by lower-rank ones (the
  *                       Ġthe→Ġthey cascade).
  *
@@ -50,35 +50,75 @@
 #include <functional>
 #include <iostream>
 #include <map>
+#include <atomic>
+#include <memory>
+#include <queue>
+#include <array>
+#include <iomanip>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstdint>
 #include <nlohmann/json.hpp>
 #include <llvm/Support/CommandLine.h>
+#include <llvm/Support/MathExtras.h>
 #include <pablo/pablo.h>
 #include <pablo/bixnum/bixnum.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
 #include <re/adt/re_cc.h>
+#include <ucd/core/unicode_set.h>
 #include <kernel/pipeline/program_builder.h>
+#include <kernel/core/kernel_builder.h>        // BPEStuckKernel (--retire-stuck)
+#include <kernel/basis/p2s_kernel.h>
+#include <llvm/IR/Module.h>
 #include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/pdep_kernel.h>    // SpreadByMask (--retire-words)
 #include <kernel/streamutils/stream_shift.h>   // IndexedShiftBack (BPE_INDEXED_SHIFT)
 #include <stdexcept>
 #include <boost/intrusive/detail/math.hpp>
+#include <kernel/core/streamset.h>               // CircularBufferAllocator (--vm-ring-buffers)
+#include <kernel/io/source_kernel.h>              // MemorySourceBlockCapacity (--memsource-block-capacity)
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 using boost::intrusive::detail::ceil_log2;
 
 using namespace llvm;
 // Every optional BPE optimization defaults OFF — a bare run is the plain, unoptimized
 // pipeline, and each optimization is opted into on the command line. 
+// --compaction: where FilterByMask compaction goes between merge kernels.
+//   linear         — after every N kernels (N = --compact-base).
+//   geometric      — after N kernels, then 2N more, 4N more, ... (N = --compact-base).
+//   by-output-bits — between two kernels whose output id widths differ, i.e. after the
+//                    last kernel of each width (with --partition=bit-tier: after
+//                    each bit tier). --compact-base=N is the minimum kernel number: a width
+//                    change after fewer than N kernels is skipped, deferring compaction to
+//                    the next width change.
+// Not given: linear when --compact-base > 0 (geometric with --geometric-compaction),
+// otherwise no compaction. Conflicting settings halt (see compactionMode).
+enum class CompactionMode { None, Linear, Geometric, ByOutputBits };
+static cl::opt<CompactionMode> Compaction(
+    "compaction",
+    cl::desc("FilterByMask compaction schedule between merge kernels:"),
+    cl::values(clEnumValN(CompactionMode::Linear, "linear",
+                          "after every --compact-base kernels"),
+               clEnumValN(CompactionMode::Geometric, "geometric",
+                          "after --compact-base kernels, then doubling the interval"),
+               clEnumValN(CompactionMode::ByOutputBits, "by-output-bits",
+                          "between kernels whose output id widths differ, from kernel "
+                          "--compact-base on")),
+    cl::init(CompactionMode::None));
+
 static cl::opt<unsigned> CompactionBase(
     "compact-base",
-    cl::desc("Base kernel at which filter-by-mask compaction is first applied "
-             "(0 = off, the default)."),
+    cl::desc("linear/geometric compaction: kernels per compaction interval (0 = off, the "
+             "default). by-output-bits: minimum kernel number for a compaction."),
     cl::init(0));
 
 static cl::opt<bool> GeometricCompaction(
     "geometric-compaction",
-    cl::desc("Use a geometric rather than an arithmetic compaction schecule."),
+    cl::desc("Same as --compaction=geometric."),
     cl::init(false));
 
 // Grouped-if: rules sharing a first id (idA) collapse under ONE createIf gate
@@ -163,127 +203,130 @@ static unsigned effGroupSize(size_t n) {
 // hoisting one shared shift per distinct lenA outside all gates. Inside = skippable on cold
 // blocks but DUPLICATED per rule (loses the per-lenA dedup); outside (default) = shared but
 // runs every block. 
-// --level-partition: schedule merge rules into the MINIMUM number of kernels instead
-// of cutting the rank-sorted rule list into contiguous id ranges.
+// --partition=mode: how merge rules are packed into kernels. Same shape as
+// --compaction=mode. clean is the default and most battle-tested; the others trade
+// more risk for fewer kernels.
 //
-// The clean-range walk (buildMergeRuleRanges, step 3) closes a group at the FIRST rule
-// that violates either constraint, so a group is necessarily a consecutive interval of
-// rank. Measured over full GPT-2: 1098 of its 1123 groups close on a seam conflict, and
-// at each break ~179 of the next 200 rules would still have fit in the group being
-// closed — ~90% of the available packing is discarded purely to keep groups contiguous.
-// Group size therefore saturates near 44 (a new rule must clash with NONE of the ~44
-// already present) and 50000/44.5 = 1123.
+//   clean       Cut the rank-sorted rule list into contiguous id ranges, closing a
+//               group at the FIRST rule that violates a dependency/seam constraint.
+//               Measured over full GPT-2: 1098 of its 1123 groups close on a seam
+//               conflict, and at each break ~179 of the next 200 rules would still
+//               have fit — ~90% of the available packing discarded purely to keep
+//               groups contiguous. Group size saturates near 44, 50000/44.5 = 1123.
 //
-// Level scheduling drops contiguity only. Each rule takes its EARLIEST legal kernel:
-//     level(r) = 1 + max( level(producer of idA), level(producer of idB),
-//                         level of any lower-rank rule seaming with r )
-// A violator no longer ends the group — it defers ITSELF while the rest keep filling the
-// current level. Kernel count becomes the constraint DAG's longest path (a provable
-// minimum, nothing can go earlier than its own dependencies) rather than a function of
-// how often violations occur: 1123 -> 283, mean group size 44.5 -> 176.7.
+//   level       Drop contiguity only: each rule takes its EARLIEST legal kernel,
+//                 level(r) = 1 + max( level(producer of idA), level(producer of idB),
+//                                     level of any lower-rank rule seaming with r )
+//               A violator defers ITSELF instead of ending the group. Kernel count
+//               becomes the constraint DAG's longest path (a provable minimum):
+//               1123 -> 283, mean group size 44.5 -> 176.7. BOTH correctness
+//               constraints (T4 + the clean-range conflict test) still hold exactly;
+//               only the packing changes. Levels are NOT rank intervals — level 1
+//               legitimately holds rank 0 alongside rank 47815.
 //
-// BOTH correctness constraints are preserved exactly (T4 + the clean-range conflict
-// test); only the packing changes. Levels are NOT rank intervals — level 1 legitimately
-// holds rank 0 alongside rank 47815.
-static cl::opt<bool> LevelPartition(
-    "level-partition",
-    cl::desc("Partition merge rules by ASAP level scheduling (minimum kernel count) "
-             "instead of contiguous clean id ranges."),
-    cl::init(false));
+//   asymmetric  level, plus drop the maxRight/idA seam (keep maxLeft/idB). Two rules
+//               sharing token t where an earlier rule used t as its B part and a
+//               later rule uses t as its A part (e.g. rank11 "Ġ+o" vs rank17 "o+r" on
+//               "Ġor") no longer need separate levels: rank11's fire clears t's
+//               live-start bit in inPlayMask, and the later rule's gate reads that
+//               mask LIVE. The other direction (maxLeft/idB) stays a hard separation —
+//               B-detect is a forward LookAhead on the FROZEN kernel input (T5), so it
+//               can never see a same-kernel restamp. Cuts 283 -> 76 kernels (measured
+//               via merge_analysis.py's scheduling model; first C++ implementation —
+//               less battle-tested than level).
+//
+//   chain       level, plus two more relaxations, always together:
+//               - chain-partition: a rule whose idA was STAMPED by an earlier
+//                 same-level rule shares that level instead of taking the next one —
+//                 a dependency chain A+B->AB, AB+C->ABC... collapses into ONE kernel.
+//                 Same mechanism as asymmetric, one level up: a same-kernel rule's ID
+//                 read goes live (idAcc) instead of frozen, via createIf's normal
+//                 Var-reassignment-as-Sel join (no nested createIf, T6 -- chain rules
+//                 stay SIBLING ifs in rank order).
+//               - chain-veto: relaxes the OTHER seam (maxLeft/idB) that asymmetric
+//                 leaves intact, by paying for it with a runtime test instead of a
+//                 kernel boundary. Rules A+B->AB (rank1), C+D->CD (rank2), AB+C->ABC
+//                 (rank3): maxLeft[C] normally forces ABC one level later, because on
+//                 "ABCD" the lower-rank CD must consume C first. Instead, ABC checks
+//                 CD itself -- the id one slot past the merged token is read from the
+//                 FROZEN kernel input and compared against D:
+//                   veto     = EQ(LookAhead(src, lenA+lenB), idD)  // + one per competitor
+//                   fire_ABC = fire_AB AND hasC AND NOT veto
+//               "ABCD" -> veto=1, ABC suppressed, CD fires same kernel; "ABCX" ->
+//               veto=0, ABC fires. Both match HF. The competitor set is exact and
+//               small (rank order guarantees every same-or-earlier-level competitor is
+//               already placed); a competitor that could itself be beaten by a
+//               lower-rank rule carries its own non-empty vetoIdB, and THAT makes this
+//               rule fall back to the strict level instead of approximating.
+//               In both idA (chain-partition) and idB (chain-veto), the RIGHT-hand
+//               producer side always needs a real kernel boundary -- B-detection is a
+//               forward LookAhead on the frozen input (T5) and can never see a
+//               same-kernel producer.
+// BitTier: confine every kernel to merged ids of ONE bit length. Tier b holds the rules
+// with idAB in [2^(b-1), 2^b) — tier 9 = ids 256..511, tier 10 = 512..1023, … Each tier is
+// partitioned on its own via ASAP level scheduling (same as Level) and the tiers run in
+// order, so the first kernel of tier N+1 reads an N-bit id stream and writes N+1 bits, and
+// every later kernel of that tier reads and writes N+1 bits. Both correctness constraints
+// carry across a tier boundary for free: every rule of a lower tier has lower rank and
+// runs in a strictly earlier kernel, which is exactly what the dependency and seam
+// constraints ask of an earlier rule. Only the packing changes. Mutually exclusive with
+// Level/Asymmetric/Chain (one PartitionMode at a time).
+enum class PartitionMode { Clean, Level, Asymmetric, Chain, BitTier };
+static cl::opt<PartitionMode> Partition(
+    "partition",
+    cl::desc("Merge-rule partitioning strategy:"),
+    cl::values(
+        clEnumValN(PartitionMode::Clean, "clean",
+            "Contiguous clean id ranges (default, most battle-tested)."),
+        clEnumValN(PartitionMode::Level, "level",
+            "ASAP level scheduling: minimum kernel count (283 vs 1123)."),
+        clEnumValN(PartitionMode::Asymmetric, "asymmetric",
+            "Level scheduling, relaxed maxRight seam (76 kernels; less battle-tested)."),
+        clEnumValN(PartitionMode::Chain, "chain",
+            "Level scheduling, same-level dependency chains + veto (fewer kernels; "
+            "slower in testing so far)."),
+        clEnumValN(PartitionMode::BitTier, "bit-tier",
+            "ASAP level scheduling confined to one merged-id bit length per kernel, "
+            "tiers run in order, so each kernel grows the id stream by at most one bit.")),
+    cl::init(PartitionMode::Clean));
+static bool isLevelPartition()  { return Partition != PartitionMode::Clean; }
+static bool isAsymmetricSeam()  { return Partition == PartitionMode::Asymmetric; }
+static bool isChainPartition()  { return Partition == PartitionMode::Chain; }
+static bool isChainVeto()       { return Partition == PartitionMode::Chain; }
+static bool isBitTierPartition() { return Partition == PartitionMode::BitTier; }
 
-// Asymmetric seam (--level-partition only): drop the maxRight/idA seam constraint,
-// keep maxLeft/idB. Two rules sharing token t where an earlier (lower-rank) rule used
-// t as ITS right/B part and a later rule uses t as ITS left/A part (e.g. rank11 "Ġ+o"
-// vs rank17 "o+r" on "Ġor") no longer need separate levels: rank11's fire clears t's
-// live-start bit in inPlayMask, and eqAstart's gate now reads that mask LIVE (see
-// below), so rank17 correctly sees t already consumed even inside the same kernel.
-// The other direction (maxLeft/idB — e.g. rank40 "o+m" vs rank49 "r+o" on "from")
-// stays a hard separation: rank49's B-detect is a forward LookAhead on the FROZEN
-// kernel input (Pablo: LookAhead legal only on a declared input binding, T5), so it
-// can never observe rank40's same-kernel restamp of o's position. Needs a real kernel
-// boundary. Cuts 283 -> 76 kernels (measured via merge_analysis.py's scheduling model;
-// this flag is the first C++ implementation — verify byte-identical vs HF before
-// trusting it for anything beyond experimentation).
-static cl::opt<bool> AsymmetricSeam(
-    "asymmetric-seam",
-    cl::desc("With --level-partition, drop the maxRight seam constraint (keep maxLeft) "
-             "for a tighter (but less battle-tested) level schedule."),
-    cl::init(false));
+// Cap the rules per merge kernel: a partition group with more than this many rules is
+// split into ceil(n/cap) consecutive kernels of near-equal size, in rank order. Pablo's
+// compile time is superlinear in kernel size, and --partition=bit-tier puts most of a
+// bit tier into its first level (8023 rules in the 16-bit tier's first kernel). Splitting
+// is exact: the rules of one group have
+// no dependencies or seams among each other that a later kernel could break —
+//   - dependency / seam: a lower-rank rule moves to an EARLIER kernel, which is what
+//     both constraints ask of it anyway;
+//   - --partition=chain: needsLiveId is recomputed per chunk; a child whose producer
+//     landed in an earlier chunk reads the producer's stamp from its frozen input;
+//   - --partition=chain: a competitor in an earlier chunk has already stamped its merged id
+//     over this rule's idB slot, so B-detect fails exactly where the veto would fire;
+//   - --partition=asymmetric: an earlier chunk's consume reaches this kernel through meIn.
+// 0 = no cap.
+static cl::opt<unsigned> MaxMergesPerKernel(
+    "max-merges-per-kernel",
+    cl::desc("Split any merge kernel with more than this many rules into consecutive "
+             "kernels of near-equal size (0 = no cap). Default 500."),
+    cl::init(500));
 
-// Chain partition (--level-partition only): let a rule whose idA was STAMPED by an
-// earlier (lower-rank) rule in the SAME level share that level instead of taking the
-// next one — a dependency chain A+B->AB, AB+C->ABC, ABC+D->ABCD... collapses into ONE
-// kernel instead of one per link. Same mechanism as --asymmetric-seam, one level up:
-// there, a same-kernel rule's MASK read goes live (inPlayMask) so it sees an earlier
-// rule's consume; here, a same-kernel rule's ID read goes live (idAcc) so it sees an
-// earlier rule's STAMP. Both rely on the same Pablo property — createIf auto-joins a
-// Var's reassignment as a Sel when the gated scope closes, so a LATER sibling
-// createIf reading that Var outward-of-scope already observes it. No nested createIf
-// (T6) — chain rules stay SIBLING ifs in rank order, just reading a live Var instead
-// of a frozen one.
-//
-// The other producer (idB, the RIGHT part) stays a hard separation, same as maxLeft
-// under --asymmetric-seam: B-detection is a forward LookAhead on the FROZEN kernel
-// input (T5), so a same-kernel producer of idB can never be seen — that side always
-// needs a real kernel boundary.
-//
-static cl::opt<bool> ChainPartition(
-    "chain-partition",
-    cl::desc("With --level-partition, let a rule whose idA was stamped by an earlier "
-             "same-level rule share that level (dependency chains collapse into one "
-             "kernel) instead of taking the next level."),
-    cl::init(false));
-
-// Chain veto (--level-partition): relax the maxLeft/idB seam — "a lower-rank rule
-// already claims my idB as ITS idA" — and pay for it with a runtime test instead of a
-// kernel boundary.
-//
-// Rules A+B->AB (rank 1), C+D->CD (rank 2), AB+C->ABC (rank 3). maxLeft[C] == CD's
-// level forces ABC one level later, because on "ABCD" the lower-rank CD must consume C
-// first and ABC must NOT fire. Instead of the split, ABC checks CD itself: the id one
-// slot PAST the merged token (offset lenA+lenB, i.e. right after C) is read from the
-// FROZEN kernel input and compared against D.
-//     veto     = EQ(LookAhead(src, lenA+lenB), idD)   // ... OR idE, one per competitor
-//     fire_ABC = fire_AB AND hasC AND NOT veto
-// "ABCD" -> veto=1, ABC suppressed, CD fires in the same kernel. "ABCX" -> veto=0, ABC
-// fires. Both match HF.
-//
-// Competitor set is exact and small. Rules are scheduled in rank order, so every
-// lower-rank rule with idA == this rule's idB is already placed when this rule lands:
-//   - competitor at a STRICTLY EARLIER level already stamped its merged id over idB's
-//     slot, so this rule's own B-detect fails on its own — no veto term needed;
-//   - a LATER-level competitor cannot exist, rank order places it first;
-//   - a SAME-level competitor is exactly what this flag creates, and exactly what
-//     vetoIdB lists.
-//
-// Veto recursion is handled by REFUSING the relaxation, never by approximating it. A
-// competitor can itself be beaten (D+E at a lower rank kills C+D, so ABC SHOULD fire —
-// a depth-1 veto would wrongly suppress it). Such a competitor carries a non-empty
-// vetoIdB of its own, so if any candidate is itself vetoed, this rule falls back to the
-// strict level and takes the kernel split.
-//
-// Independent of --chain-partition: the veto reads ONLY the frozen kernel input, never
-// the producer's fire or a live idAcc, so it is emitted identically for a flat sibling
-// rule (emitBody) and a nested chain child (emitChainBody).
-static cl::opt<bool> ChainVeto(
-    "chain-veto",
-    cl::desc("With --level-partition, let a rule share its level with the lower-rank "
-             "rules claiming its idB, suppressing the merge at runtime when such a "
-             "competitor applies, instead of splitting the kernel."),
-    cl::init(false));
-
-// --chain-partition emission shape. Output-identical: Pablo ORs pending carries into
+// --partition=chain emission shape. Output-identical: Pablo ORs pending carries into
 // every if test (CarryManager::generateEntrySummaryTest), so fusing same-condition ifs,
 // or dropping one whose body is a no-op when its condition is zero, changes nothing.
 static cl::opt<bool> ChainFuseSiblings(
     "chain-fuse-siblings",
-    cl::desc("With --chain-partition, nest all chain-children of a rule under ONE createIf "
+    cl::desc("With --partition=chain, nest all chain-children of a rule under ONE createIf "
              "on its fire instead of one createIf per child."),
     cl::init(false));
 
 static cl::opt<bool> ChainUngateRoots(
     "chain-ungate-roots",
-    cl::desc("With --chain-partition on grouped kernels, drop a chain root's own createIf "
+    cl::desc("With --partition=chain on grouped kernels, drop a chain root's own createIf "
              "when the group gate already tests its full idA."),
     cl::init(false));
 
@@ -320,7 +363,7 @@ static cl::opt<unsigned> IndexedShift(
 // entry-scope accumulators (anyFire, setBit[i], fireByLen[lenA]); the kernel then
 // applies ONE Advance per DISTINCT lenA and ONE Sel per id bit at the end.
 //
-// Carry ops per kernel: one per RULE (~177 under --level-partition) → one per
+// Carry ops per kernel: one per RULE (~177 under --partition=level) → one per
 // distinct lenA (≤ maxLen; 8 under --compact-base=2 --geometric-compaction).
 // Gate body drops from ~20 ops + 1 carry + W_out+1 mutated Vars to
 // popcount(idAB)+2 Ors, 0 carries — so createIf also drops its carry save/restore.
@@ -344,6 +387,352 @@ static cl::opt<bool> BatchWriteback(
              "distinct lenA + ONE Sel per id bit at the end of each merge kernel, "
              "instead of one Advance + a full stamp per rule."),
     cl::init(false));
+
+// Apply the end-of-file mask ONCE per merge kernel instead of once per id compare.
+// cc::Parabix_CC_Compiler::compileCC wraps every result in InFile (cc_compiler.cpp:144),
+// one extra load+not+and per compare per block — 35,104 of them in the entry scopes alone
+// at the best config, ~16% of the always-run ops. With this flag the compares are built
+// as the same balanced AND tree (so Pablo CSE shares them exactly as before) but without
+// the InFile, and InFile is applied once to the kernel's live-start mask instead. Every
+// gate and every fire is ANDed with that mask, so nothing changes inside the file; past
+// EOF the threaded mask now reads 0 instead of 1. Cache tag io1_ (only when on).
+static cl::opt<bool> InFileOnce(
+    "infile-once",
+    cl::desc("Apply the end-of-file mask once per merge kernel (on the live-start mask) "
+             "instead of once per id compare."),
+    cl::init(false));
+
+// Grouped kernels with --if-test-significant-bits: fold the live-start mask into each
+// gate's id-compare AND tree instead of ANDing it onto the finished compare. The gate
+// condition was And(idHi_compare, meInFrozen) — one private AND per gate, ~35k across the
+// pipeline, all in the always-run entry scope. With the mask as one more leaf of the tree
+// it lands on a partial product that gates with the same bit length share (Pablo CSE), so
+// that AND is paid a handful of times per kernel instead of once per gate. Same value:
+// AND is associative and commutative. Cache tag gm1_.
+static cl::opt<bool> GateMaskFold(
+    "gate-mask-fold",
+    cl::desc("Grouped kernels: fold the live-start mask into each gate's shared id-compare "
+             "tree instead of one AND per gate."),
+    cl::init(false));
+
+// Compile time: leave InstCombine out of the LLVM IR passes for the BPE merge kernels
+// only (via the NoInstCombinePass marker in addOptimizationPasses; every other kernel and
+// every other tool keeps it). Profiling a cold 283-kernel compile put InstCombine at ~29%
+// of compile CPU, while Pablo has already simplified the and/or/not trees it works on.
+// Measured: cold compile 44 s -> 34 s, runtime unchanged (<=1%), compare_bpe MATCH.
+// Cache tag ic1_ (the IR passes are not part of the cache key otherwise).
+static cl::opt<bool> SkipInstCombine(
+    "skip-instcombine",
+    cl::desc("BPE merge kernels: skip LLVM's InstCombine pass (faster compile)."),
+    cl::init(false));
+
+// Merge kernel gate codegen. The skip path of a grouped gate (the code run on every block
+// the gate does not enter, ~95% of them) measured ~18 AArch64 instructions on a cached
+// best-config kernel: 6 ANDs, 6 for the test, 5 spill loads/stores. The two flags below
+// attack the test and the spills through PabloKernel hooks that are off by default.
+// Measured on val_4MB (bit-tier config, M3, 3 interleaved rounds, bench min, 2026-10-15):
+// --if-reduce-test -7.3%, --if-unlikely-weight=32 alone -5.9%, both -9.2%; compare_bpe MATCH.
+//
+// --if-reduce-test (PabloKernel::reduceIfTest): test each gate with a max-reduce over its
+// 32-bit lanes. AArch64: umaxv, fmov, cbz instead of cmeq, bic (a {1,2} constant kept
+// live in a register), addp, fmov, tst, b.eq. Meant for ARM; x86 bitblock_any is already
+// short. Cache tag rt1_.
+static cl::opt<bool> IfReduceTest(
+    "if-reduce-test",
+    cl::desc("BPE merge kernels: test each if condition with a max-reduce (shorter on AArch64)."),
+    cl::init(false));
+
+// --if-unlikely-weight=N (PabloKernel::ifBodyUnlikelyWeight): give every if of a grouped
+// merge kernel branch_weights 1:N. Gates are entered on ~5% of blocks, but without weights
+// LLVM treats each body as half the time hot, keeps body-only values in registers and
+// spills the skip path instead. Grouped kernels only: the flat early kernels gate on common
+// ids. 0 = off. Cache tag uwN_.
+static cl::opt<unsigned> IfUnlikelyWeight(
+    "if-unlikely-weight",
+    cl::desc("Grouped BPE merge kernels: mark if bodies unlikely with branch weights 1:N "
+             "(0 = off, the default)."),
+    cl::init(0));
+
+// --retire-words: at every FilterByMask point, also drop the finished words from the
+// stream. In the compacted frame every position is a live token start, so a token that
+// starts a word and is followed by another word start is a whole word. BPE never merges
+// across words, so no later kernel can change it. Late kernels then scan about half the
+// positions (model, bit-tier config on the 1 MiB sample: 1.59x fewer positions, -39%
+// cycle-weighted merge work). The retired ids go back in order before emission:
+// SpreadByMask(keep) plus an OR of the retired ids at each point, then
+// SpreadByMask(inPlayMask) between points, so the emitter scans the frame of the first
+// retiring point. Dropping a word can make X tokens of two different words adjacent, so
+// self-merge runs also break at word starts under this flag. Needs --compaction and a
+// pretokenizer. Cache tag rw1_.
+// Measured (bit-tier + --if-reduce-test --if-unlikely-weight=32, M3, 2026-10-15): bench_bpe
+// val_4MB 201 -> 167 ms (-17%, 3 interleaved rounds), -20% at 1 thread; cold compile +3 s
+// (19 -> 22 s); compare_bpe MATCH on every tokenizer_files input up to val.txt (50 MB).
+static cl::opt<bool> RetireWords(
+    "retire-words",
+    cl::desc("BPE: drop finished single-token words from the stream at each compaction "
+             "point (needs --compaction and a pretokenizer)."),
+    cl::init(false));
+
+// --retire-points=i,j,...: with --retire-words, retire only at these FilterByMask points
+// (1 = the first). Empty = every point. A point saves (words it retires) x (kernels after
+// it); points that retire few words late cost more than they save.
+static cl::list<unsigned> RetirePoints(
+    "retire-points", cl::CommaSeparated,
+    cl::desc("With --retire-words: the compaction points (1-based) that retire words; "
+             "default all."));
+
+// --retire-frozen (with --retire-words): also retire frozen tokens, whose id no rule of a
+// later kernel uses as its left or right part, so they can never merge again. GPT-2 has no
+// rule with NUL (id 188) at all, so every NUL of a tar stream is frozen from the start. The
+// token after a dropped frozen token gets a boundary bit (a barrier), so the merge kernels
+// never join its neighbours, and one-token segments between barriers retire too. Model,
+// bit-tier on the 1 MiB sample: 2.95x fewer merge positions (-68% cycle-weighted) vs 1.59x
+// (-38%) for single-token words alone. Cache tag: the frozen set's hash in BPE_Retire.
+static cl::opt<bool> RetireFrozen(
+    "retire-frozen",
+    cl::desc("With --retire-words: also retire tokens no later rule can merge."),
+    cl::init(false));
+
+// --retire-stuck=N (with --retire-words): from compaction point N on (1-based), retire every
+// segment that can never change again: no adjacent pair (a, b) in it is a rule of a later
+// kernel. BPE only ever merges an adjacent pair that is a rule, so such a segment is final.
+// Segments run between word starts, barriers and frozen tokens; frozen tokens retire as
+// under --retire-frozen. A pair test is too big for bit-parallel code, so it is scalar: at
+// each such point BPEStuckKernel hands the Fp blocks to bpe_retire_stuck (C++), which looks
+// the pairs up in a bloom filter of the remaining rules and the ids in a frozen-id bitmap. It
+// replaces BPEFrozenKernel and BPERetireKernel there. Model (firesim/retire_more.py, LF 1 MiB
+// sample): from point 5 on, 18.6% less cycle-weighted merge work than --retire-frozen, for a
+// scan of 0.2 tokens per input byte. Measured (M3, 3 interleaved rounds, bench_bpe):
+// --retire-stuck=5 val_4MB 117.4 -> 109.9 ms (-6.4%), webtext_cases 241 -> 221 ms (-8.3%);
+// earlier points cost more scanning than they save. 0 = off. Cache tag: the tables' hash
+// in BPE_Stuck16.
+static cl::opt<unsigned> RetireStuck(
+    "retire-stuck",
+    cl::desc("With --retire-words: from compaction point N on (1-based), also retire segments "
+             "in which no adjacent pair is a later rule (0 = off, the default)."),
+    cl::init(0));
+
+// --bpe-tail=P (needs a pretokenizer and --compaction): stop the merge kernels at
+// compaction point P (1-based) and finish BPE in the emitter. From there each segment
+// (between word starts and retirement barriers) gets the standard algorithm: merge its
+// lowest-ranked adjacent pair among the rules of the kernels not built, until none is
+// left. The bit-parallel kernels apply the early, frequent merges to the dense stream;
+// the late tiers rarely fire on a short residue, which a scalar loop handles far more
+// cheaply than ~200 kernels that each scan every live position. Same output: the rules of
+// the kernels run can no longer apply (their parts are all built by then), so what is left
+// is plain rank-order BPE on the remaining rules. The emitter's scan runs in order on one
+// thread, so a segment can span pipeline calls. 0 = off. Cache tag: "_t" on the merge-back
+// kernels, which carry an 18th stream, the segment starts.
+static cl::opt<unsigned> BPETail(
+    "bpe-tail",
+    cl::desc("Stop the merge kernels at compaction point P (1-based) and finish BPE per "
+             "segment in the emitter (0 = off, the default)."),
+    cl::init(0));
+
+// --vm-ring-buffers (macOS): build the pipeline's circular buffers with mach vm_remap
+// (kernel::CircularBufferAllocator) instead of the framework's memfd mapping, which on macOS
+// is a temp file in /tmp: mkstemp + unlink + ftruncate per buffer on every pipeline run,
+// ~9% of a 1-thread run, all of it before the worker threads start. Runtime only (the
+// kernels' code is the same), so no cache tag. No effect elsewhere.
+// --tail-direct-input (with --bpe-tail, when no retirement point comes before the cut): hand
+// the tail the last kernel's id bits, live mask and segment starts as they are. Otherwise
+// they go through BPEWidenKernel (to 16 id bits), BPERetirePackKernel and
+// BPERetireUnpackKernel, which with no merge-back in between copy 18 streams twice for
+// nothing; P2S16Kernel zero-pads the missing id bits itself. Cache tag: the kernels differ
+// (BPE_TailSeg, and P2S16 named by its input's shape).
+static cl::opt<bool> TailDirectInput(
+    "tail-direct-input",
+    cl::desc("With --bpe-tail and no retirement point before the cut: feed the tail the "
+             "kernel streams directly, without the widen/pack/unpack copies (default off)."),
+    cl::init(false));
+
+// --tail-from-bytes (needs a pretokenizer): no merge kernels at all, and no partition (the
+// partition and compaction flags are inert). The --bpe-tail emitter runs rank-order BPE
+// with every rule on each pretoken, straight from the input bytes, and its per-thread word
+// cache is keyed by the pretoken's bytes (2..15 of them: two 8-byte loads, no id
+// gathering). Cheaper than the hybrid because a cache hit costs about the same at any cut
+// and nothing else runs: no BPERangeSeed, no bit-transformation kernels, no P2S16.
+// Single-thread harness (val_4MB): the whole BPE in 10.8 ms warm / 14.8 ms cold, vs ~30 ms
+// for the 15 kernels + the --bpe-tail=1 tail. Cache tag: BPE_TailResolveBytes.
+static cl::opt<bool> TailFromBytes(
+    "tail-from-bytes",
+    cl::desc("With a pretokenizer: build no merge kernels; the tail applies every rule per "
+             "pretoken from the raw bytes (default off)."),
+    cl::init(false));
+
+// --tail-cache-pool: keep the tail's per-thread scratch (its 2 MB segment cache) in a pool
+// that outlives the pipeline's worker threads. The pipeline starts new workers on every run,
+// so without it each worker allocates, zeroes and page-faults a fresh cache and starts with
+// it cold. With it a worker takes a cache a finished thread left, still valid (the
+// generation check drops it when the rule table changes). Runtime only, no cache tag.
+static cl::opt<bool> TailCachePool(
+    "tail-cache-pool",
+    cl::desc("With --bpe-tail: reuse the tail's per-thread segment caches across pipeline "
+             "runs and threads (default off)."),
+    cl::init(false));
+
+static cl::opt<bool> VMRingBuffers(
+    "vm-ring-buffers",
+    cl::desc("macOS: build circular buffers with vm_remap instead of a temp file (default off)."),
+    cl::init(false));
+
+// --memsource-block-capacity: the in-memory source's buffer capacity is the input length
+// rounded up to a whole block (kernel::MemorySourceBlockCapacity). Without it, an input whose
+// last segment has 1..127 bytes (length % --segment-size in 1..127, at least 4 segments in)
+// gets its final partial block read from block 0: the last tokens are made from the
+// file's first bytes (found as bug 6: long.txt at --segment-size=4096; 70 * 16384 + 38 bytes
+// fails at the default size). Cache tag "+bc" on the source kernel.
+static cl::opt<bool> MemSourceBlockCapacity(
+    "memsource-block-capacity",
+    cl::desc("Round the in-memory source's buffer capacity up to a whole block (fixes wrong "
+             "last tokens when the last segment is under one block; default off)."),
+    cl::init(false));
+
+// --bit-xfrm-limit=N: build every merge kernel whose output ids have at most N bits as a
+// bit transformation (BPEXfrmKernel) instead of per-rule gates: every output bit is the
+// input bit XOR a "change" stream, a character class over the (idA, idB) pair. With
+// --partition=bit-tier these are the kernels of merge id bit tiers 9..N. Ids of
+// up to kXfrmLowBits bits fit the 20-bit class whole; wider ids are split into subtiers
+// (see BPEXfrmKernel). 0 = off.
+static cl::opt<unsigned> BitXfrmLimit(
+    "bit-xfrm-limit",
+    cl::desc("Build merge kernels whose output ids have at most N bits as bit "
+             "transformations, ids over 10 bits by subtiers (0 = off, the default)."),
+    cl::init(0));
+
+// --subtier-grouping-by-min-ID=N: in the subtiered kernels of merge id bit tiers >= N, key
+// each rule's subtier by its SMALLER part. Rules with idA < idB (group A) keep the idA key;
+// rules with idA > idB (group B) take the high bits of idB as their key and build their
+// character classes over (low bits of idB, all bits of idA). The smaller part is the one
+// that tends to be small, so a kernel's rules fall into fewer subtiers (about a third
+// fewer per kernel in tiers 13-16). idB is read L slots ahead, so group B's subtiers are
+// split by L; in tiers 11-12 that costs more than the grouping saves. 0 = off (default):
+// measured at limit 14, grouping only helps while every subtier is gated, and without
+// gates it is no faster (default backend level) or slightly slower (aggressive).
+static cl::opt<unsigned> SubtierGroupingByMinID(
+    "subtier-grouping-by-min-ID",
+    cl::desc("Key the subtiers of bit-transformation kernels of merge id bit tiers >= N "
+             "by the high bits of the smaller part id (0 = off, the default)."),
+    cl::init(0));
+
+static bool subtierGroupingApplies(unsigned tierBits) {
+    return SubtierGroupingByMinID > 0 && tierBits >= SubtierGroupingByMinID;
+}
+
+// --subtier-gating-bits=K: a subtier gets an if-gate only when its key shows that the
+// keyed part (idA, or the smaller part under --subtier-grouping-by-min-ID) has at least K
+// bits; other subtiers are computed unconditionally in the kernel's top scope. A gate can
+// only skip a block where its key is absent from the whole block, which in practice needs
+// large ids (see --bit-frequency-statistics). 0 = gate every subtier; the default 17 gates
+// none, which measured fastest (tiers 12-14 10-25% cheaper than with every subtier gated).
+static cl::opt<unsigned> SubtierGatingBits(
+    "subtier-gating-bits",
+    cl::desc("Gate a subtier of bit-transformation kernels with an if only when its keyed "
+             "part id has at least K bits (0 = gate every subtier; default 17 = no gates)."),
+    cl::init(17));
+
+// --self-merge-block: resolve a kernel's self-merges (X+X -> XX) together in one gated
+// block instead of per rule (see emitSelfMergeBlock).
+static cl::opt<bool> SelfMergeBlock(
+    "self-merge-block",
+    cl::desc("BPE merge kernels: resolve all self-merges of a kernel in one block gated "
+             "by an any-self-merge test, stamping by bit transformation."),
+    cl::init(false));
+
+static cl::opt<bool> KeyCluster(
+    "key-cluster",
+    cl::desc("With --partition=level/asymmetric/chain and --if-test-significant-bits: move rules (only later, only "
+             "inside their compaction segment) so rules sharing a gate key share a kernel."),
+    cl::init(false));
+
+static cl::opt<unsigned> KeyClusterCap(
+    "key-cluster-cap",
+    cl::desc("With --key-cluster: never move a rule into a kernel already holding this many "
+             "rules (0 = no cap). Default: the --max-merges-per-kernel value."),
+    cl::init(0));
+
+// Key-cluster's move cap: --key-cluster-cap when given, else --max-merges-per-kernel, so
+// clustering never builds a kernel that splitOversizedGroups would cut up again.
+static unsigned effKeyClusterCap() {
+    return KeyClusterCap.getNumOccurrences() > 0 ? (unsigned) KeyClusterCap : (unsigned) MaxMergesPerKernel;
+}
+
+// Effective count-based compaction interval: BPE_COMPACT_EVERY overrides --compact-base.
+static unsigned effCompactEvery() {
+    if (const char * ce = std::getenv("BPE_COMPACT_EVERY")) return (unsigned) std::atoi(ce);
+    return CompactionBase;
+}
+
+static const char * compactionName(CompactionMode m) {
+    switch (m) {
+        case CompactionMode::Linear:       return "linear";
+        case CompactionMode::Geometric:    return "geometric";
+        case CompactionMode::ByOutputBits: return "by-output-bits";
+        default:                           return "none";
+    }
+}
+
+// Effective --compaction mode, after folding in the legacy --geometric-compaction and the
+// --compact-base default. Conflicting or incomplete settings halt immediately.
+static CompactionMode compactionMode() {
+    static const CompactionMode mode = [] {
+        auto halt = [](const std::string & msg) {
+            std::cerr << "tokenizer: compaction settings conflict: " << msg << "\n";
+            std::exit(1);
+        };
+        const bool given = Compaction.getNumOccurrences() > 0;
+        CompactionMode m = Compaction;
+        if (GeometricCompaction) {
+            if (given && m != CompactionMode::Geometric)
+                halt(std::string("--geometric-compaction contradicts --compaction=") + compactionName(m));
+            m = CompactionMode::Geometric;
+        } else if (!given) {
+            m = effCompactEvery() > 0 ? CompactionMode::Linear : CompactionMode::None;
+        }
+        if ((m == CompactionMode::Linear || m == CompactionMode::Geometric) && effCompactEvery() == 0)
+            halt(std::string(GeometricCompaction ? "--geometric-compaction" : "--compaction=")
+                 + (GeometricCompaction ? "" : compactionName(m))
+                 + " needs --compact-base=N with N > 0 (the compaction interval)");
+        return m;
+    }();
+    return mode;
+}
+
+// The count-based schedule (--compaction=linear/geometric), stepped one kernel at a time.
+// applyCompactionSchedule and keyCluster both use it, so key-cluster's segments are the
+// real compaction segments. step() returns true when this kernel ends a segment; it never
+// does under by-output-bits or no compaction.
+struct CompactionCounter {
+    unsigned next, since = 0;
+    CompactionCounter()
+    : next(compactionMode() == CompactionMode::Linear || compactionMode() == CompactionMode::Geometric
+           ? effCompactEvery() : 0) {}
+    bool step() {
+        if (next == 0 || ++since < next) return false;
+        since = 0;
+        if (compactionMode() == CompactionMode::Geometric) next *= 2;
+        return true;
+    }
+};
+
+// Where one levelPartition call sits in the whole pipeline: the global index of its first
+// kernel and the compaction count on entry. --partition=bit-tier partitions each
+// bit tier separately, so key-cluster needs these to see global kernel indices
+// (--if-group-lower-limit) and the real compaction points. The defaults describe a
+// partition of the whole rule list.
+struct PartitionContext {
+    unsigned kernelOffset = 0;
+    CompactionCounter counter;
+};
+
+// Gate key of idA under --if-test-significant-bits=K: the K bits from idA's highest 1 bit,
+// tagged with the count of low bits below them. Rules with equal keys share a grouped-if gate.
+static uint64_t gateKeyOf(unsigned idA) {
+    const unsigned K = IfTestSignificantBits;
+    const unsigned b = idA ? 32u - __builtin_clz(idA) : 0;
+    const unsigned lo = (b > K) ? b - K : 0;
+    return (uint64_t(lo) << 32) | (idA >> lo);
+}
 
 
 
@@ -422,6 +811,17 @@ protected:
 //   33..126      −33      0..93         173          →255     255
 //   127..160     +94      221..254      174..255     −68      106..187
 // (e.g. space 32 → 220 = 'Ġ', 'y' 121 → 88, 't' 116 → 83.)
+// GPT-2's base id of a byte (bytes_to_unicode order, T1): piecewise byte + offset, a
+// bijection over 0..255.
+static unsigned bpeBaseId(unsigned by) {
+    if (by <= 32)  return by + 188;
+    if (by <= 126) return by - 33;
+    if (by <= 160) return by + 94;
+    if (by <= 172) return by - 67;
+    if (by == 173) return 255;
+    return by - 68;                        // 174..255
+}
+
 class BPERangeSeed : public PabloKernel {
 public:
     BPERangeSeed(LLVMTypeSystemInterface & ts, StreamSet * basis,
@@ -444,14 +844,7 @@ protected:
         // bijection over 0..255): 0..32→+188  33..126→-33  127..160→+94  161..172→-67
         // 173→255  174..255→-68.
         cc::Parabix_CC_Compiler_Builder ccc(basisBits);
-        auto idOf = [](unsigned by) -> unsigned {
-            if (by <= 32)  return by + 188;
-            if (by <= 126) return by - 33;
-            if (by <= 160) return by + 94;
-            if (by <= 172) return by - 67;
-            if (by == 173) return 255;
-            return by - 68;                        // 174..255
-        };
+        auto idOf = bpeBaseId;
         const unsigned IDBITS = 8;                 // base ids are 0..255
         std::vector<PabloAST*> idBits(IDBITS);
         for (unsigned k = 0; k < IDBITS; k++) {
@@ -477,33 +870,1127 @@ protected:
     }
 };
 
-// ─── BPEOnesKernel ──────────────────────────────────────────────────────────
-// Emit an all-ones 1-bit stream at the rate of `anchor` (consumed for its RATE
-// only, never read). Used right after a FilterByMask compaction: every position
-// that survived the filter was, by construction, a LIVE token start, so the fresh
-// inPlayMask at the new (shorter) rate is all ones.
-//
-// createInFile, not a bare Not(Zeroes): the compacted stream's item count is a
-// popcount and rarely lands on a block boundary, so a bare all-ones bleeds into the
-// final block's PADDING. Those padded ones survive to matchEnd and the scan emits
-// them as junk tokens past end-of-input (observed: exactly 128 rows of `id=0`).
-// InFile(x) compiles to x AND NOT EOFmask, so the padding reads 0. Same primitive as
-// the EOF trailing-whitespace fix in InFileNonSpaceKernel (pretokenizer.cpp).
-class BPEOnesKernel : public PabloKernel {
+// BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
+// bits. The emitter (P2S16Kernel) reads exactly 16 streams, but the final id stream
+// is only ceil_log2(hi) wide — fewer than 16 under --merges-limit — and reading a
+// narrower stream set as 16 elements misaligns every block.
+class BPEWidenKernel : public PabloKernel {
 public:
-    BPEOnesKernel(LLVMTypeSystemInterface & ts, StreamSet * anchor, StreamSet * ones)
-    // Name says InFile: the body is data-independent so the cache key is the name
-    // alone, and the pre-InFile version would otherwise be served from objcache.
-    : PabloKernel(ts, "BPE_OnesInFile",
-                  {Binding{"anchor", anchor}},
-                  {Binding{"ones",   ones}}) {}
+    BPEWidenKernel(LLVMTypeSystemInterface & ts, StreamSet * idIn, StreamSet * idOut)
+    : PabloKernel(ts, "BPE_Widen" + std::to_string(idIn->getNumElements())
+                        + "to" + std::to_string(idOut->getNumElements()),
+                  {Binding{"idIn", idIn}},
+                  {Binding{"idOut", idOut}}) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
-        pb.createAssign(pb.createExtract(getOutputStreamVar("ones"), pb.getInteger(0)),
-                        pb.createInFile(pb.createNot(pb.createZeroes())));
+        std::vector<PabloAST*> in = getInputStreamSet("idIn");
+        Var * out = getOutputStreamVar("idOut");
+        for (unsigned i = 0; i < out->getType()->getArrayNumElements(); i++)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)),
+                            i < in.size() ? in[i] : pb.createZeroes());
     }
 };
+
+// --retire-words kernels. The merge-back carries each frame's tokens as one 17-stream
+// set: the 16 id bits plus bit 16, the token-start mask the emitter scans. Under --bpe-tail
+// an 18th stream (bit 17) marks the segment starts for the emitter's BPE; every retired
+// token is final, so it is one by itself.
+static constexpr unsigned kRetireStreams = 17;
+static constexpr unsigned kTailStreams = 18;
+
+// A retirement point works in two frames: the one before the point's FilterByMask (Fp:
+// live token starts marked by inPlayMask, consumed positions in between) and the compacted
+// one (Fc: every position a live token start). Only the 1-bit streams visit Fc. The ids
+// are filtered once, from Fp, by the combined mask, and the merge-back reads the retired
+// ids straight from Fp.
+
+// --retire-frozen, in Fp: frozen = live token starts whose id no later rule uses as a part,
+// so they can never merge again. segStarts = word starts plus the live start right after
+// each frozen token (the barrier), found forward through the consumed positions in between.
+// testSet / negate: the frozen ids, or (negate) their complement when it has fewer intervals.
+class BPEFrozenKernel : public PabloKernel {
+public:
+    BPEFrozenKernel(LLVMTypeSystemInterface & ts, StreamSet * idIn, StreamSet * liveIn,
+                    StreamSet * boundaryIn, const UCD::UnicodeSet & testSet, bool negate,
+                    uint64_t setHash, StreamSet * frozen, StreamSet * segStarts)
+    : PabloKernel(ts, "BPE_Frozen" + std::to_string(setHash) + (negate ? "n" : "")
+                        + "_w" + std::to_string(idIn->getNumElements()),
+                  {Binding{"idIn", idIn}, Binding{"liveIn", liveIn}, Binding{"boundaryIn", boundaryIn}},
+                  {Binding{"frozen", frozen}, Binding{"segStarts", segStarts}}),
+      mTestSet(testSet), mNegate(negate) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> idBits = getInputStreamSet("idIn");
+        PabloAST * const live = getInputStreamSet("liveIn")[0];
+        cc::Parabix_CC_Compiler ccc(idBits);
+        PabloAST * inSet = ccc.compileCC("retireSet", re::makeCC(UCD::UnicodeSet(mTestSet)), pb);
+        PabloAST * fz = pb.createInFile(pb.createAnd(live, mNegate ? pb.createNot(inSet) : inSet), "frozen");
+        PabloAST * afterFrozen = pb.createAnd(pb.createMatchStar(pb.createAdvance(fz, (int64_t) 1),
+                                                                 pb.createNot(live)), live);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("frozen"), pb.getInteger(0)), fz);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("segStarts"), pb.getInteger(0)),
+                        pb.createOr(getInputStreamSet("boundaryIn")[0], afterFrozen));
+    }
+private:
+    const UCD::UnicodeSet mTestSet;
+    const bool mNegate;
+};
+
+// In Fc: finished = the token starts a segment and so does the next one, i.e. it is a whole
+// segment. A segment is a word, cut further under --retire-frozen: a frozen token is
+// finished too, and the token after it starts a segment. (That barrier also goes into the
+// boundary stream of the kept frame, from BPEFrozenKernel's segStarts, so the merge kernels
+// never join the tokens on both sides of a dropped frozen token.) keep = the rest of the
+// file. Past the last token the lookahead reads 0, so the last segment is never retired
+// unless frozen.
+class BPERetireKernel : public PabloKernel {
+public:
+    BPERetireKernel(LLVMTypeSystemInterface & ts, StreamSet * boundaryIn, StreamSet * frozenIn,
+                    StreamSet * keep)
+    : PabloKernel(ts, std::string("BPE_Retire") + (frozenIn ? "_f" : ""),
+                  frozenIn ? std::vector<Binding>{Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(1)},
+                                                  Binding{"frozenIn", frozenIn}}
+                           : std::vector<Binding>{Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(1)}},
+                  {Binding{"keep", keep}}),
+      mHasFrozen(frozenIn != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const wordStart = getInputStreamSet("boundaryIn")[0];
+        PabloAST * segStart = wordStart;
+        PabloAST * frozen = nullptr;
+        if (mHasFrozen) {
+            frozen = getInputStreamSet("frozenIn")[0];
+            segStart = pb.createOr(wordStart, pb.createAdvance(frozen, (int64_t) 1), "segStart");
+        }
+        // next token starts a segment = it starts a word, or this token is frozen
+        PabloAST * fin = pb.createAnd(segStart, pb.createLookahead(wordStart, (int64_t) 1));
+        if (frozen) fin = pb.createOr(fin, frozen);
+        PabloAST * keep = pb.createInFile(pb.createNot(fin), "keep");
+        pb.createAssign(pb.createExtract(getOutputStreamVar("keep"), pb.getInteger(0)), keep);
+    }
+private:
+    const bool mHasFrozen;
+};
+
+// --retire-stuck tables, one per stuck point, built with the pipeline; BPEStuckKernel bakes
+// its point's index into its call.
+//   frozen: one bit per id, set when no rule of a later kernel uses the id as a part
+//   pairs:  a one-hash bloom filter over idA << 16 | idB of every rule of a later kernel.
+//           A false positive only keeps a segment; the lookup is one load, no branch
+//           (an exact probing hash set made the kernel ~1 cycle/position slower).
+static constexpr unsigned kStuckBloomBits = 21;   // 256 KiB; <= 50k pairs -> <= 2.4% false hits
+struct StuckTables {
+    std::vector<uint64_t> frozen;
+    std::vector<uint64_t> pairs;
+};
+static std::vector<StuckTables> gStuckTables;
+
+static inline uint32_t stuckHash(uint32_t key) { return (key * 0x9E3779B1u) >> (32 - kStuckBloomBits); }
+
+static inline bool stuckPairLive(const StuckTables & t, uint32_t key) {
+    const uint32_t h = stuckHash(key);
+    return (t.pairs[h >> 6] >> (h & 63)) & 1;
+}
+
+// BPEStuckKernel's body, on numItems positions of Fp (whole blocks; the first n are input).
+//   ids: one 16-bit id per position (P2S16); live: token starts; seg: segment starts (word
+//   starts and barriers). kept: the live starts that stay; segOut: the segment starts of the
+//   kept frame (word starts, barriers, and the start after each frozen token).
+// Pass 1 walks the tokens: frozen bit F, segment start S (seg, or the previous token was
+// frozen), and L = the pair (previous token, this token) may be a later rule. Pass 2 is
+// bit-parallel over the words: a token stays if its segment has an L, i.e. an L lies
+// before it in the segment (forward MatchStar by long addition through non-barrier
+// positions) or at/after it (the same on bit-reversed words, word order reversed).
+//   state[0]: bit 0 = the forward fill runs past the call (the open segment has an L),
+//   bit 1 = the last token was frozen, bit 2 = a token was seen; state[1] = its id.
+// Past the end of a non-final call the backward fill starts with a carry, so the segment
+// still open there is kept (it may continue). Its later tokens still retire if it turns out
+// stuck: no merge can reach the kept head, as its pairs are not rules and the next kept
+// token starts a segment.
+extern "C" void bpe_retire_stuck(uint64_t slot, const uint16_t * ids, const uint64_t * live,
+                                 const uint64_t * seg, uint64_t * kept, uint64_t * segOut,
+                                 uint64_t numItems, uint64_t n, uint64_t final, uint64_t * state) {
+    const StuckTables & t = gStuckTables[slot];
+    const uint64_t numWords = numItems / 64;
+    thread_local std::vector<uint64_t> tmp;
+    tmp.resize(3 * numWords);
+    uint64_t * const frozenW = tmp.data(), * const barrierW = frozenW + numWords,
+             * const fwdW = barrierW + numWords;
+    bool prevFrozen = state[0] & 2, seen = state[0] & 4;
+    uint32_t prevId = (uint32_t) state[1];
+    for (uint64_t wi = 0; wi < numWords; wi++) {
+        uint64_t lv = wi * 64 < n ? live[wi] : 0, beyond = 0;
+        if (wi * 64 < n && n - wi * 64 < 64) {
+            beyond = ~0ull << (n - wi * 64);
+            lv &= ~beyond;
+        } else if (wi * 64 >= n) {
+            beyond = ~0ull;
+        }
+        uint64_t L = 0, F = 0, AF = 0;
+        for (uint64_t m = lv; m; m &= m - 1) {
+            const unsigned p = __builtin_ctzll(m);
+            const uint32_t id = ids[wi * 64 + p];
+            const uint64_t fz = (t.frozen[id >> 6] >> (id & 63)) & 1;
+            L |= uint64_t(stuckPairLive(t, (prevId << 16) | id)) << p;
+            AF |= uint64_t(prevFrozen | !seen) << p;
+            F |= fz << p;
+            prevId = id; prevFrozen = fz; seen = true;
+        }
+        const uint64_t S = ((wi * 64 < n ? seg[wi] : 0) & lv) | AF;
+        const uint64_t barrier = S | F | (final ? beyond : 0);
+        kept[wi] = L & ~barrier;
+        segOut[wi] = S & ~F;
+        frozenW[wi] = F | ~lv;          // not a kept candidate: frozen, or no token here
+        barrierW[wi] = barrier;
+    }
+    // forward: fwd = MatchStar(L, ~barrier), minus the barrier it stops on
+    uint64_t carry = state[0] & 1;
+    for (uint64_t wi = 0; wi < numWords; wi++) {
+        const uint64_t C = ~barrierW[wi], L = kept[wi];
+        uint64_t s1, s2;
+        const bool c1 = __builtin_add_overflow(L, C, &s1);
+        const bool c2 = __builtin_add_overflow(s1, carry, &s2);
+        carry = c1 | c2;
+        fwdW[wi] = ((s2 ^ C) | L) & C;
+    }
+    const uint64_t fwdOut = carry;
+    // backward: the same on reversed bits, keeping the segment start it stops on
+    carry = final ? 0 : 1;
+    for (uint64_t wi = numWords; wi-- > 0; ) {
+        const uint64_t C = llvm::reverseBits<uint64_t>(~barrierW[wi]), L = llvm::reverseBits<uint64_t>(kept[wi]);
+        uint64_t s1, s2;
+        const bool c1 = __builtin_add_overflow(L, C, &s1);
+        const bool c2 = __builtin_add_overflow(s1, carry, &s2);
+        carry = c1 | c2;
+        const uint64_t bwd = llvm::reverseBits<uint64_t>((s2 ^ C) | L);
+        const uint64_t keep = (fwdW[wi] | bwd) & ~frozenW[wi];
+        kept[wi] = keep;
+        segOut[wi] &= keep;
+    }
+    state[0] = fwdOut | (prevFrozen ? 2 : 0) | (seen ? 4 : 0);
+    state[1] = prevId;
+}
+
+// --retire-stuck, in Fp: one call of bpe_retire_stuck per invocation; it writes keptPre and
+// the kept frame's segment starts (still in Fp) directly, so nothing visits Fc. ids16 is the
+// id stream packed by P2S16Kernel, one i16 per position.
+class BPEStuckKernel final : public MultiBlockKernel {
+public:
+    BPEStuckKernel(LLVMTypeSystemInterface & ts, StreamSet * ids, StreamSet * live, StreamSet * seg,
+                   StreamSet * kept, StreamSet * segOut, unsigned slot, uint64_t tableHash)
+    : MultiBlockKernel(ts, "BPE_Stuck16_s" + std::to_string(slot) + "_h" + std::to_string(tableHash),
+                       {Binding{"ids", ids}, Binding{"live", live}, Binding{"seg", seg}},
+                       {Binding{"kept", kept}, Binding{"segOut", segOut}},
+                       {}, {},
+                       {InternalScalar{ArrayType::get(ts.getInt64Ty(), 2), "state"}}),
+      mSlot(slot) {}
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_retire_stuck");
+        if (fn == nullptr) report_fatal_error("BPE_Stuck: bpe_retire_stuck is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("live"));
+        Value * const final = b.CreateZExt(b.isFinal(), b.getInt64Ty());
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInt64(mSlot), b.getInputStreamBlockPtr("ids", zero),
+                      b.getInputStreamBlockPtr("live", zero), b.getInputStreamBlockPtr("seg", zero),
+                      b.getOutputStreamBlockPtr("kept", zero), b.getOutputStreamBlockPtr("segOut", zero),
+                      numItems, n, final, b.getScalarFieldPtr("state").first});
+    }
+private:
+    const unsigned mSlot;
+};
+
+// --bpe-tail runtime. gTail: open addressing over every rule of a kernel the pipeline did not
+// build, one 64-bit slot each: (idA << 16 | idB) << 16 | idAB, all ones = empty (idAB = 256
+// + the merge's rank, so the lower id is the higher priority). Load <= 1/4, so a pair that
+// is no rule, the common case, mostly ends at its first slot. (A table grouped by idA with a
+// binary search was 40% slower: one left part such as U+0120 starts thousands of rules.)
+// left / right: one bit per id, set when the id is the left / right part of some rule in
+// the table; a pair failing either (most non-rules) never touches the 2 MB table.
+struct TailTable {
+    std::vector<uint64_t> slots;
+    uint32_t mask = 0, shift = 0;
+    unsigned idBits = 16;                // the width of the ids reaching the tail
+    uint64_t left[1024], right[1024];
+};
+static constexpr uint64_t kTailEmpty = ~0ull;
+static TailTable gTail;
+static BPETailSink gTailSink = nullptr;
+
+void bpeTailSetSink(BPETailSink sink) { gTailSink = sink; }
+
+static inline uint32_t tailSlot(uint32_t key) { return (key * 0x9E3779B1u) >> gTail.shift; }
+
+static inline uint16_t tailMerge(uint16_t a, uint16_t b) {
+    if (!((gTail.left[a >> 6] >> (a & 63)) & (gTail.right[b >> 6] >> (b & 63)) & 1)) return 0xFFFF;
+    const uint32_t key = (uint32_t(a) << 16) | b;
+    for (uint32_t h = tailSlot(key); ; h = (h + 1) & gTail.mask) {
+        const uint64_t e = gTail.slots[h];
+        if (e == kTailEmpty) return 0xFFFF;
+        if (uint32_t(e >> 16) == key) return uint16_t(e);
+    }
+}
+
+// Standard BPE on one segment, in place: merge the lowest-ranked adjacent pair (leftmost on
+// a tie, as HF and tiktoken do) until no pair is a rule. t[0..n) are the ids and pos[0..n)
+// their positions; both lose the merged-away tokens, and n is updated. Segments of up to 64
+// tokens (nearly all) shift in plain arrays. Longer ones (one word of 100k tokens, e.g. a
+// run of one letter) use HF's merge_all: a linked list and a min-heap of (id, position)
+// pairs, skipping a popped pair whose tokens changed since; O(n log n). A long segment in
+// which no pair is a rule (a run of NULs, say) returns before building any of that.
+static void tailMergeLong(uint16_t * t, uint32_t * pos, size_t & n) {
+    size_t first = 0;
+    while (first + 1 < n && tailMerge(t[first], t[first + 1]) == 0xFFFF) first++;
+    if (first + 1 >= n) return;
+    thread_local std::vector<uint32_t> prev, next;
+    thread_local std::vector<uint8_t> gone;
+    using Item = std::pair<uint32_t, uint32_t>;          // (idAB, left position)
+    thread_local std::vector<Item> heap;
+    prev.resize(n); next.resize(n);
+    gone.assign(n, 0);
+    heap.clear();
+    for (size_t i = 0; i < n; i++) { prev[i] = uint32_t(i - 1); next[i] = uint32_t(i + 1); }
+    auto push = [&](uint32_t i) {
+        if (i >= n || next[i] >= n) return;
+        const uint16_t m = tailMerge(t[i], t[next[i]]);
+        if (m != 0xFFFF) { heap.emplace_back(m, i); std::push_heap(heap.begin(), heap.end(), std::greater<Item>()); }
+    };
+    for (uint32_t i = uint32_t(first); i + 1 < n; i++) push(i);
+    while (!heap.empty()) {
+        std::pop_heap(heap.begin(), heap.end(), std::greater<Item>());
+        const auto [m, i] = heap.back();
+        heap.pop_back();
+        if (gone[i] || next[i] >= n || tailMerge(t[i], t[next[i]]) != m) continue;   // stale
+        const uint32_t j = next[i];
+        t[i] = uint16_t(m);
+        gone[j] = 1;
+        next[i] = next[j];
+        if (next[j] < n) prev[next[j]] = i;
+        if (prev[i] < n) push(prev[i]);
+        push(i);
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) if (!gone[i]) { t[w] = t[i]; pos[w] = pos[i]; w++; }
+    n = w;
+}
+
+static inline void tailMergeSegment(uint16_t * t, uint32_t * pos, size_t & n) {
+    if (n < 2) return;
+    if (n > 64) { tailMergeLong(t, pos, n); return; }
+    uint16_t r[64];
+    size_t m = n - 1;                    // pairs
+    for (size_t i = 0; i < m; i++) r[i] = tailMerge(t[i], t[i + 1]);
+    for (;;) {
+        size_t best = 0;
+        for (size_t i = 1; i < m; i++) if (r[i] < r[best]) best = i;
+        if (m == 0 || r[best] == 0xFFFF) break;
+        t[best] = r[best];
+        for (size_t i = best + 1; i + 1 < n; i++) { t[i] = t[i + 1]; pos[i] = pos[i + 1]; }
+        for (size_t i = best; i + 1 < m; i++) r[i] = r[i + 1];
+        n--; m--;
+        if (best > 0) r[best - 1] = tailMerge(t[best - 1], t[best]);
+        if (best < m) r[best] = tailMerge(t[best], t[best + 1]);
+    }
+}
+
+// A growable scratch array of segment tokens: ids and positions.
+struct TailSegBuf {
+    std::vector<uint16_t> t;
+    std::vector<uint32_t> pos;
+    size_t n = 0;
+    void push(uint16_t id, uint32_t p) {
+        if (n == t.size()) { t.resize(std::max<size_t>(256, 2 * n)); pos.resize(t.size()); }
+        t[n] = id; pos[n] = p; n++;
+    }
+};
+
+// Per-thread cache of finished segments: words repeat, so most segments are a lookup instead
+// of a run of merges (HF's BPE keeps a word cache too). Key (TailKey<B>, B = gTail.idBits):
+// k0 holds input ids 0 .. 64/B - 1, k1 the next 60/B ids and the count in its top 4 bits, so
+// with 9-bit ids (--bpe-tail=1) segments of up to 13 tokens fit. Value: which input tokens
+// start an output token (bit i = token i) and the output ids; a result of more than
+// kTailCacheOut tokens is not cached. Two ways of 32 bytes per 64-byte set; a miss moves
+// way 0 to way 1 and fills way 0.
+struct TailCacheEntry {
+    uint64_t k0, k1;                     // k0 == k1 == 0: empty (a key's count is never 0)
+    uint16_t keep;
+    uint16_t out[7];
+};
+// --tail-cache-bits=N: 2^N sets x 64 bytes per thread (default 15: 2 MB).
+static cl::opt<unsigned> TailCacheBits(
+    "tail-cache-bits",
+    cl::desc("With --bpe-tail: the tail's per-thread segment cache has 2^N sets of 64 bytes "
+             "(default 15, 2 MB)."),
+    cl::init(15));
+static constexpr unsigned kTailCacheOut = 7;
+static std::atomic<uint64_t> gTailGeneration{0};   // bumped whenever gTail is rebuilt
+
+template <unsigned B> struct TailKey {
+    static constexpr unsigned per0 = 64 / B, per1 = 60 / B;
+    static constexpr unsigned max = per0 + per1;               // cached segments: 2 .. max tokens
+    static constexpr unsigned fast = max < 8 ? max : 8;        // gathered without a loop
+};
+
+// The resolve kernel's per-thread state, fetched once per call: on macOS every access to a
+// thread_local with a constructor is a _tlv_get_addr call.
+struct TailScratch {
+    std::vector<uint16_t> t;             // an uncached segment: ids ...
+    std::vector<uint32_t> pos;           // ... and positions
+    std::vector<TailCacheEntry> cache;
+    uint64_t generation = 0;
+    unsigned setBits = 0;                // log2 of the cache's sets
+};
+// --tail-cache-pool: scratches not in use; a thread leases one and returns it as it exits.
+static std::mutex gTailPoolMutex;
+static std::vector<std::unique_ptr<TailScratch>> gTailPool;
+struct TailScratchLease {
+    TailScratch * s = nullptr;
+    ~TailScratchLease() {
+        if (s == nullptr) return;
+        std::lock_guard<std::mutex> lock(gTailPoolMutex);
+        gTailPool.emplace_back(s);
+    }
+};
+static TailScratch & tailScratch() {
+    TailScratch * sp;
+    if (TailCachePool) {
+        thread_local TailScratchLease lease;
+        if (lease.s == nullptr) {
+            std::lock_guard<std::mutex> lock(gTailPoolMutex);
+            if (gTailPool.empty()) lease.s = new TailScratch;
+            else { lease.s = gTailPool.back().release(); gTailPool.pop_back(); }
+        }
+        sp = lease.s;
+    } else {
+        thread_local TailScratch s;
+        sp = &s;
+    }
+    const uint64_t g = gTailGeneration.load(std::memory_order_relaxed);
+    if (sp->generation != g || sp->setBits != TailCacheBits) {
+        sp->setBits = std::min<unsigned>(std::max<unsigned>(TailCacheBits, 4), 24);
+        sp->cache.assign(size_t(2) << sp->setBits, TailCacheEntry{});
+        sp->generation = g;
+    }
+    return *sp;
+}
+
+static inline void tailMark(uint64_t * emit, uint32_t p) { emit[p / 64] |= 1ull << (p % 64); }
+static inline uint64_t tailLowMask(size_t k) { return k >= 64 ? ~0ull : (1ull << k) - 1; }
+
+// A cached segment on its way through the resolve loop: its tokens (positions, ids), its key
+// and its cache set, whose line was prefetched when the descriptor was made.
+struct TailDesc {
+    uint64_t k0, k1;
+    TailCacheEntry * set;
+    uint32_t cnt;
+    uint32_t p[16];
+    uint16_t t[16];
+};
+
+// Look d up (or merge it and fill the cache) and write its output ids at their positions.
+static inline void tailFinishDesc(const TailDesc & d, uint32_t * res, uint64_t * emit) {
+    TailCacheEntry * const set = d.set;
+    const TailCacheEntry * e;
+    if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
+    else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) e = &set[1];
+    else {
+        uint16_t tt[16];
+        uint32_t idx[16];
+        size_t m = d.cnt;
+        for (size_t i = 0; i < m; i++) { tt[i] = d.t[i]; idx[i] = uint32_t(i); }
+        tailMergeSegment(tt, idx, m);
+        if (m > kTailCacheOut) {
+            for (size_t j = 0; j < m; j++) { res[d.p[idx[j]]] = tt[j]; tailMark(emit, d.p[idx[j]]); }
+            return;
+        }
+        set[1] = set[0];
+        TailCacheEntry & f = set[0];
+        f.k0 = d.k0; f.k1 = d.k1; f.keep = 0;
+        for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << idx[j]); f.out[j] = tt[j]; }
+        e = &f;
+    }
+    unsigned j = 0;
+    for (uint32_t keep = e->keep; keep; keep &= keep - 1) {
+        const uint32_t q = d.p[__builtin_ctz(keep)];
+        res[q] = e->out[j++];
+        tailMark(emit, q);
+    }
+}
+
+// The tail runs in two kernels. BPETailResolveKernel is data-parallel: each call finishes
+// every segment that lies wholly inside its own blocks and writes one word per token start:
+// the finished id, or the input id with kTailOpen for a token of a segment cut by the call's
+// edges (bit kTailSeg on the first token of such a segment); a bit in `emit` marks each of
+// these, and not the tokens merged into their left neighbour. BPETailKernel then walks the
+// marked words in order on one thread, emits, and finishes the cut segments, a couple per call.
+static constexpr uint32_t kTailOpen = 1u << 16, kTailSeg = 1u << 18;
+
+// The resolve loop walks the segment starts. A segment of one token is its own output; one
+// of 2 .. TailKey<B>::max tokens becomes a TailDesc, whose cache set is prefetched and which
+// is finished kTailAhead segments later, so the cache's memory latency overlaps the work on
+// the segments in between (a lookup right away stalls on it: 30% slower); a longer segment
+// is merged on the spot. A segment's tokens are the `starts` bits up to the next segment
+// start; up to `fast` of them are gathered from one 64-bit window without a loop.
+static constexpr unsigned kTailAhead = 4;
+
+template <unsigned B>
+static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
+                        uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+    using K = TailKey<B>;
+    TailScratch & S = tailScratch();
+    std::fill(emit, emit + numItems / 64, 0);
+    if (n > numItems) n = numItems;
+    const size_t nWords = (n + 63) / 64;
+    if (nWords == 0) return;
+    uint64_t mask0[K::max + 1], mask1[K::max + 1];   // the key bits of a segment of k tokens
+    for (unsigned k = 0; k <= K::max; k++) {
+        mask0[k] = tailLowMask(std::min(k, K::per0) * B);
+        mask1[k] = k <= K::per0 ? 0 : tailLowMask((k - K::per0) * B);
+    }
+    TailCacheEntry * const cache = S.cache.data();
+    const unsigned setShift = 64 - S.setBits;
+    auto bitsIn = [&](size_t w, size_t lo, size_t hi) {      // starts bits of word w in [lo, hi)
+        uint64_t x = starts[w];
+        if (w * 64 < lo) x &= ~tailLowMask(lo - w * 64);
+        if (w * 64 + 64 > hi) x &= tailLowMask(hi - w * 64);
+        return x;
+    };
+    auto segWord = [&](size_t w) { return segs[w] & (w * 64 + 64 > n ? tailLowMask(n - w * 64) : ~0ull); };
+    size_t sw = 0;
+    uint64_t sx = segWord(0);
+    while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+    const size_t first = sx ? sw * 64 + __builtin_ctzll(sx) : n;
+    for (size_t w = 0; w * 64 < first; w++)                     // cut by the left edge
+        for (uint64_t x = bitsIn(w, 0, first); x; x &= x - 1) {
+            const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
+            res[p] = ids[p] | kTailOpen;
+            tailMark(emit, p);
+        }
+    if (!sx) return;
+    sx &= sx - 1;
+    TailDesc ring[kTailAhead];
+    unsigned head = 0, count = 0;
+    auto drain = [&] {
+        for (; count; count--, head = (head + 1) % kTailAhead) tailFinishDesc(ring[head], res, emit);
+    };
+    for (size_t s = first;;) {
+        while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+        const bool last = sx == 0;
+        const size_t e = last ? n : sw * 64 + __builtin_ctzll(sx);
+        if (last && !final) {                                   // may go on in the next call
+            drain();
+            uint32_t seg = kTailSeg;
+            for (size_t w = s / 64; w * 64 < n; w++)
+                for (uint64_t x = bitsIn(w, s, n); x; x &= x - 1) {
+                    const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
+                    res[p] = ids[p] | kTailOpen | seg;
+                    seg = 0;
+                    tailMark(emit, p);
+                }
+            return;
+        }
+        const size_t len = e - s, w = s / 64;
+        const unsigned b = s % 64;
+        const uint64_t next = w + 1 < nWords ? starts[w + 1] : 0;
+        uint64_t m = ((starts[w] >> b) | ((next << 1) << (63 - b))) & tailLowMask(len);
+        const unsigned cnt = len <= 64 ? __builtin_popcountll(m) : K::max + 1;
+        if (cnt == 1) {
+            res[s] = ids[s];
+            tailMark(emit, uint32_t(s));
+        } else if (cnt <= K::max) {
+            if (count == kTailAhead) {
+                tailFinishDesc(ring[head], res, emit);
+                head = (head + 1) % kTailAhead;
+                count--;
+            }
+            TailDesc & d = ring[(head + count++) % kTailAhead];
+            if (LLVM_LIKELY(cnt <= K::fast)) {
+                for (unsigned i = 0; i < K::fast; i++) {              // past cnt: the start again
+                    const unsigned o = m ? __builtin_ctzll(m) : 0;
+                    d.p[i] = uint32_t(s + o);
+                    d.t[i] = ids[s + o];
+                    m &= m - 1;
+                }
+            } else {
+                for (unsigned i = 0; m; i++, m &= m - 1) {
+                    d.p[i] = uint32_t(s + __builtin_ctzll(m));
+                    d.t[i] = ids[d.p[i]];
+                }
+            }
+            uint64_t k0 = 0, k1 = 0;
+            for (unsigned i = 0; i < K::max; i++) {
+                const uint64_t id = i < cnt ? d.t[i] : 0;
+                if (i < K::per0) k0 |= id << (i * B);
+                else k1 |= id << ((i - K::per0) * B);
+            }
+            d.k0 = k0 & mask0[cnt];
+            d.k1 = (k1 & mask1[cnt]) | (uint64_t(cnt) << 60);
+            d.cnt = cnt;
+            const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+            d.set = cache + (h >> setShift) * 2;
+            __builtin_prefetch(d.set);
+        } else {                                                // longer: merge it here
+            if (S.t.size() < e - s) { S.t.resize(e - s); S.pos.resize(e - s); }
+            size_t k = 0;
+            for (size_t x = w; x * 64 < e; x++)
+                for (uint64_t y = bitsIn(x, s, e); y; y &= y - 1) {
+                    const uint32_t p = uint32_t(x * 64 + __builtin_ctzll(y));
+                    S.t[k] = ids[p]; S.pos[k] = p; k++;
+                }
+            tailMergeSegment(S.t.data(), S.pos.data(), k);
+            for (size_t i = 0; i < k; i++) { res[S.pos[i]] = S.t[i]; tailMark(emit, S.pos[i]); }
+        }
+        if (last) break;
+        sx &= sx - 1;
+        s = e;
+    }
+    drain();
+}
+
+// emit: one bit per token the emitter must visit (finished or cut), so it skips the
+// merged-away ones without reading them.
+extern "C" void bpe_tail_resolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
+                                 uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n,
+                                 uint64_t final) {
+    switch (gTail.idBits) {
+#define TAIL_CASE(B) case B: tailResolve<B>(ids, starts, segs, res, emit, numItems, n, final); return;
+        TAIL_CASE(8) TAIL_CASE(9) TAIL_CASE(10) TAIL_CASE(11) TAIL_CASE(12)
+        TAIL_CASE(13) TAIL_CASE(14) TAIL_CASE(15) TAIL_CASE(16)
+#undef TAIL_CASE
+        default: report_fatal_error("--bpe-tail: unsupported id width");
+    }
+}
+
+// --tail-from-bytes: the tokens are the input bytes, as their GPT-2 base ids (T1).
+static uint16_t gTailBase[256];
+static constexpr unsigned kTailByteKeyMax = 15;   // cached pretokens: 2 .. 15 bytes
+
+// A cached pretoken on its way through the byte resolve loop: its start (relative to the
+// call), length, key (k0 = bytes 0..7, k1 = bytes 8..14 and the length in the top byte)
+// and prefetched cache set.
+struct TailByteDesc {
+    uint64_t k0, k1;
+    TailCacheEntry * set;
+    uint32_t s, len;
+};
+
+static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes, uint32_t * res,
+                                   uint64_t * emit) {
+    TailCacheEntry * const set = d.set;
+    const TailCacheEntry * e;
+    if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
+    else if (set[1].k0 == d.k0 && set[1].k1 == d.k1) e = &set[1];
+    else {
+        uint16_t tt[kTailByteKeyMax];
+        uint32_t idx[kTailByteKeyMax];
+        size_t m = d.len;
+        for (size_t i = 0; i < m; i++) { tt[i] = gTailBase[bytes[d.s + i]]; idx[i] = uint32_t(i); }
+        tailMergeSegment(tt, idx, m);
+        if (m > kTailCacheOut) {
+            for (size_t j = 0; j < m; j++) { res[d.s + idx[j]] = tt[j]; tailMark(emit, d.s + idx[j]); }
+            return;
+        }
+        set[1] = set[0];
+        TailCacheEntry & f = set[0];
+        f.k0 = d.k0; f.k1 = d.k1; f.keep = 0;
+        for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << idx[j]); f.out[j] = tt[j]; }
+        e = &f;
+    }
+    unsigned j = 0;
+    for (uint32_t keep = e->keep; keep; keep &= keep - 1) {
+        const uint32_t q = d.s + __builtin_ctz(keep);
+        res[q] = e->out[j++];
+        tailMark(emit, q);
+    }
+}
+
+// tailResolve for --tail-from-bytes: segments are the pretokens (segs = their starts), every
+// byte a token. Same protocol for res / emit and the segments cut by the call's edges. A
+// pretoken of one byte is its base id; 2 .. kTailByteKeyMax bytes go through the cache
+// (keyed by the bytes, prefetched kTailAhead pretokens ahead); longer ones merge on the spot.
+static void tailResolveBytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
+                             uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+    TailScratch & S = tailScratch();
+    std::fill(emit, emit + numItems / 64, 0);
+    if (n > numItems) n = numItems;
+    const size_t nWords = (n + 63) / 64;
+    if (nWords == 0) return;
+    TailCacheEntry * const cache = S.cache.data();
+    const unsigned setShift = 64 - S.setBits;
+    auto segWord = [&](size_t w) { return segs[w] & (w * 64 + 64 > n ? tailLowMask(n - w * 64) : ~0ull); };
+    auto openRange = [&](size_t lo, size_t hi, bool segStart) {   // the bytes of a cut segment
+        for (size_t p = lo; p < hi; p++) {
+            res[p] = gTailBase[bytes[p]] | kTailOpen | (segStart && p == lo ? kTailSeg : 0);
+            tailMark(emit, uint32_t(p));
+        }
+    };
+    size_t sw = 0;
+    uint64_t sx = segWord(0);
+    while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+    const size_t first = sx ? sw * 64 + __builtin_ctzll(sx) : n;
+    openRange(0, first, false);                                     // cut by the left edge
+    if (!sx) return;
+    sx &= sx - 1;
+    TailByteDesc ring[kTailAhead];
+    unsigned head = 0, count = 0;
+    auto drain = [&] {
+        for (; count; count--, head = (head + 1) % kTailAhead) tailFinishBytes(ring[head], bytes, res, emit);
+    };
+    for (size_t s = first;;) {
+        while (sx == 0 && ++sw < nWords) sx = segWord(sw);
+        const bool last = sx == 0;
+        const size_t e = last ? n : sw * 64 + __builtin_ctzll(sx);
+        if (last && !final) {                                       // may go on in the next call
+            drain();
+            openRange(s, n, true);
+            return;
+        }
+        const size_t len = e - s;
+        if (len == 1) {
+            res[s] = gTailBase[bytes[s]];
+            tailMark(emit, uint32_t(s));
+        } else if (len <= kTailByteKeyMax) {
+            if (count == kTailAhead) {
+                tailFinishBytes(ring[head], bytes, res, emit);
+                head = (head + 1) % kTailAhead;
+                count--;
+            }
+            TailByteDesc & d = ring[(head + count++) % kTailAhead];
+            uint64_t a = 0, b = 0;
+            if (LLVM_LIKELY(s + 16 <= n)) {                         // stays inside the call
+                std::memcpy(&a, bytes + s, 8);
+                std::memcpy(&b, bytes + s + 8, 8);
+            } else {
+                for (size_t i = 0; i < len; i++)
+                    (i < 8 ? a : b) |= uint64_t(bytes[s + i]) << (8 * (i % 8));
+            }
+            d.k0 = len >= 8 ? a : a & tailLowMask(len * 8);
+            d.k1 = (len > 8 ? b & tailLowMask((len - 8) * 8) : 0) | (uint64_t(len) << 56);
+            d.s = uint32_t(s);
+            d.len = uint32_t(len);
+            const uint64_t h = (d.k0 ^ (d.k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+            d.set = cache + (h >> setShift) * 2;
+            __builtin_prefetch(d.set);
+        } else {                                                    // longer: merge it here
+            if (S.t.size() < len) { S.t.resize(len); S.pos.resize(len); }
+            for (size_t i = 0; i < len; i++) { S.t[i] = gTailBase[bytes[s + i]]; S.pos[i] = uint32_t(s + i); }
+            size_t k = len;
+            tailMergeSegment(S.t.data(), S.pos.data(), k);
+            for (size_t i = 0; i < k; i++) { res[S.pos[i]] = S.t[i]; tailMark(emit, S.pos[i]); }
+        }
+        if (last) break;
+        sx &= sx - 1;
+        s = e;
+    }
+    drain();
+}
+
+extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
+                                       uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+    tailResolveBytes(bytes, segs, res, emit, numItems, n, final);
+}
+
+// BPETailKernel's body: the tokens in order. A cut segment's tokens collect in gTailOpen and
+// are finished when the next segment starts; everything else is emitted as it comes. The
+// finished ids of a call go to gTailOutBuf (uninitialized, grown as needed: a call never
+// emits more tokens than it has positions) and then to the sink in one batch.
+static TailSegBuf gTailOpen;
+static std::unique_ptr<uint16_t[]> gTailOutBuf;
+static size_t gTailOutCap = 0;
+
+static size_t tailFlushOpen(uint16_t * out, size_t k) {
+    tailMergeSegment(gTailOpen.t.data(), gTailOpen.pos.data(), gTailOpen.n);
+    for (size_t i = 0; i < gTailOpen.n; i++) out[k++] = gTailOpen.t[i];
+    gTailOpen.n = 0;
+    return k;
+}
+
+extern "C" void bpe_tail_block(const uint32_t * res, const uint64_t * starts,
+                               uint64_t numItems, uint64_t n, uint64_t final) {
+    const size_t room = std::min(n, numItems) + gTailOpen.n;
+    if (room > gTailOutCap) {
+        gTailOutCap = std::max<size_t>(room, 2 * gTailOutCap);
+        gTailOutBuf.reset(new uint16_t[gTailOutCap]);
+    }
+    uint16_t * const out = gTailOutBuf.get();
+    size_t k = 0;
+    for (uint64_t wi = 0; wi * 64 < n && wi * 64 < numItems; wi++) {
+        uint64_t st = starts[wi];
+        if (n - wi * 64 < 64) st &= (1ull << (n - wi * 64)) - 1;
+        for (; st; st &= st - 1) {
+            const uint32_t v = res[wi * 64 + __builtin_ctzll(st)];
+            if (LLVM_LIKELY((v & kTailOpen) == 0)) {
+                if (LLVM_UNLIKELY(gTailOpen.n != 0)) k = tailFlushOpen(out, k);
+                out[k++] = uint16_t(v);
+            } else {
+                if ((v & kTailSeg) && gTailOpen.n != 0) k = tailFlushOpen(out, k);
+                gTailOpen.push(uint16_t(v), 0);
+            }
+        }
+    }
+    if (final && gTailOpen.n != 0) k = tailFlushOpen(out, k);
+    if (gTailSink && k) gTailSink(out, k);
+}
+
+// --bpe-tail kernels, both thin wrappers around their C++ bodies above.
+class BPETailResolveKernel final : public MultiBlockKernel {
+public:
+    BPETailResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * ids16, StreamSet * starts,
+                         StreamSet * segs, StreamSet * res, StreamSet * emit)
+    : MultiBlockKernel(ts, "BPE_TailResolve",
+                       {Binding{"ids", ids16}, Binding{"starts", starts}, Binding{"segs", segs}},
+                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+        // No state between calls (the C++ body only uses thread_local scratch), so the
+        // pipeline may run its calls on several threads at once.
+        addAttribute(Statefree());
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_tail_resolve");
+        if (fn == nullptr) report_fatal_error("BPE_TailResolve: bpe_tail_resolve is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("ids", zero), b.getInputStreamBlockPtr("starts", zero),
+                      b.getInputStreamBlockPtr("segs", zero), b.getOutputStreamBlockPtr("res", zero),
+                      b.getOutputStreamBlockPtr("emit", zero), numItems, n,
+                      b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+    }
+};
+
+// Side-effecting, so the pipeline keeps it and runs it in order, one call at a time.
+class BPETailKernel final : public MultiBlockKernel {
+public:
+    BPETailKernel(LLVMTypeSystemInterface & ts, StreamSet * res, StreamSet * starts)
+    : MultiBlockKernel(ts, "BPE_Tail",
+                       {Binding{"res", res}, Binding{"starts", starts}},
+                       {}, {}, {}, {}) {
+        addAttribute(SideEffecting());
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_tail_block");
+        if (fn == nullptr) report_fatal_error("BPE_Tail: bpe_tail_block is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("res", zero), b.getInputStreamBlockPtr("starts", zero),
+                      numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+    }
+};
+
+// --tail-from-bytes: BPETailResolveKernel on the input bytes and the pretoken starts.
+class BPETailByteResolveKernel final : public MultiBlockKernel {
+public:
+    BPETailByteResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * segs,
+                             StreamSet * res, StreamSet * emit)
+    : MultiBlockKernel(ts, "BPE_TailResolveBytes",
+                       {Binding{"bytes", bytes}, Binding{"segs", segs}},
+                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+        addAttribute(Statefree());   // see BPETailResolveKernel
+    }
+protected:
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_tail_resolve_bytes");
+        if (fn == nullptr) report_fatal_error("BPE_TailResolveBytes: bpe_tail_resolve_bytes is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("segs"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("bytes", zero), b.getInputStreamBlockPtr("segs", zero),
+                      b.getOutputStreamBlockPtr("res", zero), b.getOutputStreamBlockPtr("emit", zero),
+                      numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
+    }
+};
+
+void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * segs) {
+    StreamSet * res = P.CreateStreamSet(1, 32);
+    StreamSet * emit = P.CreateStreamSet(1, 1);
+    Kernel * const r = P.CreateKernelCall<BPETailByteResolveKernel>(bytes, segs, res, emit);
+    P.LinkFunction(r, "bpe_tail_resolve_bytes", bpe_tail_resolve_bytes);
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
+    P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
+}
+
+// --tail-direct-input: the tail's segment starts, the word starts that are live tokens (what
+// BPERetirePackKernel's 18th stream holds).
+class BPETailSegKernel final : public PabloKernel {
+public:
+    BPETailSegKernel(LLVMTypeSystemInterface & ts, StreamSet * boundary, StreamSet * live, StreamSet * segs)
+    : PabloKernel(ts, "BPE_TailSeg",
+                  {Binding{"boundary", boundary}, Binding{"live", live}},
+                  {Binding{"segs", segs}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        pb.createAssign(pb.createExtract(getOutputStreamVar("segs"), pb.getInteger(0)),
+                        pb.createAnd(getInputStreamSet("boundary")[0], getInputStreamSet("live")[0]));
+    }
+};
+
+void buildBPETailEmitter(PipelineBuilder & P, StreamSet * ids, StreamSet * starts, StreamSet * segs) {
+    StreamSet * ids16 = P.CreateStreamSet(1, 16);
+    if (ids->getNumElements() < 16) {   // --tail-direct-input: P2S16Kernel zero-pads
+        StreamSets idSets{ids};
+        P.CreateKernelCall<P2S16Kernel>(idSets, ids16);
+    } else {
+        P.CreateKernelCall<P2S16Kernel>(ids, ids16);
+    }
+    StreamSet * res = P.CreateStreamSet(1, 32);
+    StreamSet * emit = P.CreateStreamSet(1, 1);
+    Kernel * const r = P.CreateKernelCall<BPETailResolveKernel>(ids16, starts, segs, res, emit);
+    P.LinkFunction(r, "bpe_tail_resolve", bpe_tail_resolve);
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
+    P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
+}
+
+// Merge-back at one retirement point, in Fp: `later` = the tokens that survived the point,
+// spread back to Fp by keptPre; `ids` = Fp's id stream. The retired tokens are the live
+// starts that were not kept (liveIn & ~keptPre): OR in their id and start bit.
+class BPERetireMergeKernel : public PabloKernel {
+public:
+    BPERetireMergeKernel(LLVMTypeSystemInterface & ts, StreamSet * later, StreamSet * ids,
+                         StreamSet * liveIn, StreamSet * keptPre, StreamSet * merged)
+    : PabloKernel(ts, "BPE_RetireMerge" + std::to_string(ids->getNumElements())
+                        + (later->getNumElements() == kTailStreams ? "_t" : ""),
+                  {Binding{"later", later}, Binding{"ids", ids}, Binding{"liveIn", liveIn},
+                   Binding{"keptPre", keptPre}},
+                  {Binding{"merged", merged}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> later = getInputStreamSet("later");
+        std::vector<PabloAST *> ids = getInputStreamSet("ids");
+        PabloAST * const fin = pb.createAnd(getInputStreamSet("liveIn")[0],
+                                            pb.createNot(getInputStreamSet("keptPre")[0]), "retired");
+        Var * out = getOutputStreamVar("merged");
+        for (unsigned i = 0; i + 1 < kRetireStreams; i++)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)),
+                            i < ids.size() ? pb.createOr(later[i], pb.createAnd(ids[i], fin))
+                                           : later[i]);
+        for (unsigned i = kRetireStreams - 1; i < later.size(); i++)   // start (and segment)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)), pb.createOr(later[i], fin));
+    }
+};
+
+// The final 16-bit id stream and its token-start mask as one 17-stream set. No mask
+// (the last kernel was followed by a FilterByMask) means every position is a token start.
+// segIn (--bpe-tail): the segment starts, packed as stream 17.
+class BPERetirePackKernel : public PabloKernel {
+public:
+    BPERetirePackKernel(LLVMTypeSystemInterface & ts, StreamSet * idIn, StreamSet * maskIn,
+                        StreamSet * packed, StreamSet * segIn = nullptr)
+    : PabloKernel(ts, std::string("BPE_RetirePack") + (maskIn ? "_m1" : "_m0") + (segIn ? "_t" : ""),
+                  bindings(idIn, maskIn, segIn),
+                  {Binding{"packed", packed}}),
+      mHasMask(maskIn != nullptr), mHasSeg(segIn != nullptr) {}
+protected:
+    static std::vector<Binding> bindings(StreamSet * idIn, StreamSet * maskIn, StreamSet * segIn) {
+        std::vector<Binding> b{Binding{"idIn", idIn}};
+        if (maskIn) b.emplace_back("maskIn", maskIn);
+        if (segIn) b.emplace_back("segIn", segIn);
+        return b;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> id = getInputStreamSet("idIn");
+        Var * out = getOutputStreamVar("packed");
+        for (unsigned i = 0; i + 1 < kRetireStreams; i++)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(i)), id[i]);
+        PabloAST * mask = mHasMask ? getInputStreamSet("maskIn")[0]
+                                   : pb.createInFile(pb.createOnes());
+        pb.createAssign(pb.createExtract(out, pb.getInteger(kRetireStreams - 1)), mask);
+        if (mHasSeg)
+            pb.createAssign(pb.createExtract(out, pb.getInteger(kRetireStreams)),
+                            pb.createAnd(getInputStreamSet("segIn")[0], mask));
+    }
+private:
+    const bool mHasMask, mHasSeg;
+};
+
+// Splits the merged-back 17-stream set into the emitter's 16 id bits and start mask, and
+// with --bpe-tail (18 streams) the segment starts into segOut.
+class BPERetireUnpackKernel : public PabloKernel {
+public:
+    BPERetireUnpackKernel(LLVMTypeSystemInterface & ts, StreamSet * packed, StreamSet * idOut,
+                          StreamSet * maskOut, StreamSet * segOut = nullptr)
+    : PabloKernel(ts, std::string("BPE_RetireUnpack") + (segOut ? "_t" : ""),
+                  {Binding{"packed", packed}},
+                  segOut ? std::vector<Binding>{Binding{"idOut", idOut}, Binding{"maskOut", maskOut},
+                                                Binding{"segOut", segOut}}
+                         : std::vector<Binding>{Binding{"idOut", idOut}, Binding{"maskOut", maskOut}}),
+      mHasSeg(segOut != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> in = getInputStreamSet("packed");
+        Var * id = getOutputStreamVar("idOut");
+        for (unsigned i = 0; i + 1 < kRetireStreams; i++)
+            pb.createAssign(pb.createExtract(id, pb.getInteger(i)), in[i]);
+        pb.createAssign(pb.createExtract(getOutputStreamVar("maskOut"), pb.getInteger(0)),
+                        in[kRetireStreams - 1]);
+        if (mHasSeg)
+            pb.createAssign(pb.createExtract(getOutputStreamVar("segOut"), pb.getInteger(0)),
+                            in[kRetireStreams]);
+    }
+private:
+    const bool mHasSeg;
+};
+
+// --bit-frequency-statistics: over the surviving token starts (`live`), count all tokens
+// (`total`) and, for each N in [kBitFreqLo, kBitFreqHi], the tokens whose id has at least
+// N bits, i.e. id >= 2^(N-1) (`atLeastN`).
+static cl::opt<bool> BitFrequencyStatistics(
+    "bit-frequency-statistics",
+    cl::desc("BPE mode: report how many output tokens have ids of at least N bits, for "
+             "N = 10..16."),
+    cl::init(false));
+
+static constexpr unsigned kBitFreqLo = 10, kBitFreqHi = 16;
+
+class BPEBitFrequencyKernel : public PabloKernel {
+public:
+    BPEBitFrequencyKernel(LLVMTypeSystemInterface & ts, StreamSet * id, StreamSet * live)
+    : PabloKernel(ts, "BPE_BitFreq" + std::to_string(id->getNumElements()),
+                  {Binding{"id", id}, Binding{"live", live}},
+                  {},
+                  {},
+                  outputScalars(ts)) {}
+protected:
+    static std::vector<Binding> outputScalars(LLVMTypeSystemInterface & ts) {
+        std::vector<Binding> out {Binding{ts.getSizeTy(), "total"}};
+        for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++)
+            out.push_back(Binding{ts.getSizeTy(), "atLeast" + std::to_string(n)});
+        return out;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> id = getInputStreamSet("id");
+        PabloAST * live = pb.createInFile(getInputStreamSet("live")[0]);
+        pb.createAssign(getOutputScalarVar("total"), pb.createCount(live));
+        // bits[N-1 .. W) has a 1, accumulated from the top bit down
+        PabloAST * any = pb.createZeroes();
+        for (unsigned n = kBitFreqHi; n >= kBitFreqLo; n--) {
+            if (n - 1 < id.size()) any = pb.createOr(any, id[n - 1]);
+            pb.createAssign(getOutputScalarVar("atLeast" + std::to_string(n)),
+                            pb.createCount(pb.createAnd(any, live)));
+        }
+    }
+};
+
+static void bpe_report_bit_frequency(uint64_t total, uint64_t n10, uint64_t n11, uint64_t n12,
+                                     uint64_t n13, uint64_t n14, uint64_t n15, uint64_t n16) {
+    const uint64_t counts[] = {n10, n11, n12, n13, n14, n15, n16};
+    std::cerr << "[BPE] bit frequency statistics: " << total << " tokens\n";
+    for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++) {
+        const uint64_t c = counts[n - kBitFreqLo];
+        std::cerr << "[BPE]   ids of >= " << n << " bits (id >= " << (1u << (n - 1)) << "): "
+                  << c << " (" << (total ? 100.0 * c / total : 0.0) << "%)\n";
+    }
+}
+
+// --merge-frequency-statistics: after each merge kernel, count the merges it made
+// (`merges`, the B starts it consumed) and, for each N in [kBitFreqLo, kBitFreqHi], the
+// merges whose A and B ids both have at least N bits (`bothN`). B is a consumed start of
+// the kernel's input live mask, A the live start before it, so A's size flag reaches B
+// by an IndexedAdvance over that mask.
+static cl::opt<bool> MergeFrequencyStatistics(
+    "merge-frequency-statistics",
+    cl::desc("BPE mode: report, per merge id bit tier, how many merges have both part ids "
+             "of at least N bits, for N = 10..16."),
+    cl::init(false));
+
+static bool hasStreamInput(const Kernel * k, llvm::StringRef name);   // defined below
+
+class BPEMergeFrequencyKernel : public PabloKernel {
+public:
+    BPEMergeFrequencyKernel(LLVMTypeSystemInterface & ts, StreamSet * id, StreamSet * liveIn,
+                            StreamSet * liveOut)
+    : PabloKernel(ts, "BPE_MergeFreq" + std::to_string(id->getNumElements()) + (liveIn ? "" : "_fa1"),
+                  inputs(id, liveIn, liveOut),
+                  {},
+                  {},
+                  outputScalars(ts)) {}
+protected:
+    // liveIn is null right after a FilterByMask compaction: every position is live then.
+    static std::vector<Binding> inputs(StreamSet * id, StreamSet * liveIn, StreamSet * liveOut) {
+        std::vector<Binding> in {Binding{"id", id}, Binding{"liveOut", liveOut}};
+        if (liveIn) in.push_back(Binding{"liveIn", liveIn});
+        return in;
+    }
+    static std::vector<Binding> outputScalars(LLVMTypeSystemInterface & ts) {
+        std::vector<Binding> out {Binding{ts.getSizeTy(), "merges"}};
+        for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++)
+            out.push_back(Binding{ts.getSizeTy(), "both" + std::to_string(n)});
+        return out;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> id = getInputStreamSet("id");
+        PabloAST * liveIn = hasStreamInput(this, "liveIn")
+            ? getInputStreamSet("liveIn")[0]
+            : pb.createInFile(pb.createNot(pb.createZeroes()));
+        PabloAST * consumed = pb.createInFile(pb.createAnd(liveIn, pb.createNot(getInputStreamSet("liveOut")[0])),
+                                              "consumedB");
+        pb.createAssign(getOutputScalarVar("merges"), pb.createCount(consumed));
+        PabloAST * any = pb.createZeroes();   // id has a 1 in bits [N-1, W)
+        for (unsigned n = kBitFreqHi; n >= kBitFreqLo; n--) {
+            if (n - 1 < id.size()) any = pb.createOr(any, id[n - 1]);
+            PabloAST * big = pb.createAnd(any, liveIn);
+            PabloAST * prevBig = pb.createIndexedAdvance(big, liveIn, 1);
+            pb.createAssign(getOutputScalarVar("both" + std::to_string(n)),
+                            pb.createCount(pb.createAnd(consumed, pb.createAnd(big, prevBig))));
+        }
+    }
+};
+
+// merge statistics per output id width (tier): [0] merges, [1 + N - kBitFreqLo] bothN
+static std::map<uint64_t, std::array<uint64_t, 2 + kBitFreqHi - kBitFreqLo>> gMergeFreq;
+
+// One instance per tier: the tier is a template argument, not a call argument, because a
+// pipeline constant scalar passed to a CreateCall crashes getFinalOutputScalars.
+template <unsigned tier>
+static void bpe_record_merge_frequency(uint64_t merges, uint64_t b10, uint64_t b11, uint64_t b12,
+                                       uint64_t b13, uint64_t b14, uint64_t b15, uint64_t b16) {
+    const uint64_t v[] = {merges, b10, b11, b12, b13, b14, b15, b16};
+    auto & row = gMergeFreq[tier];
+    for (unsigned i = 0; i < row.size(); i++) row[i] += v[i];
+}
+
+using MergeFrequencyRecorder = decltype(bpe_record_merge_frequency<16>);
+
+template <unsigned... tiers>
+static MergeFrequencyRecorder * mergeFrequencyRecorder(unsigned tier, std::integer_sequence<unsigned, tiers...>) {
+    MergeFrequencyRecorder * fns[] = {bpe_record_merge_frequency<tiers>...};
+    return tier < sizeof...(tiers) ? fns[tier] : nullptr;
+}
+
+void reportBPEStatistics() {
+    if (gMergeFreq.empty()) return;
+    std::array<uint64_t, 2 + kBitFreqHi - kBitFreqLo> all{};
+    std::cerr << "[BPE] merge frequency statistics: merges whose A and B ids both have >= N bits\n"
+              << "[BPE]   tier      merges";
+    for (unsigned n = kBitFreqLo; n <= kBitFreqHi; n++) std::cerr << std::setw(11) << ("both>=" + std::to_string(n));
+    std::cerr << "\n";
+    auto printRow = [](const std::string & label, const auto & row) {
+        std::cerr << "[BPE]   " << std::setw(4) << label << std::setw(12) << row[0];
+        for (unsigned i = 1; i < row.size(); i++) std::cerr << std::setw(11) << row[i];
+        std::cerr << "\n";
+    };
+    for (const auto & [tier, row] : gMergeFreq) {
+        printRow(std::to_string(tier), row);
+        for (unsigned i = 0; i < row.size(); i++) all[i] += row[i];
+    }
+    printRow("all", all);
+    gMergeFreq.clear();
+}
 
 // Hash a rule group's (idA,idB,idAB,lenA,lenB) list → unique cache name per kernel,
 // since the Pablo body is data-dependent (same shape, different rules). lenA MUST be
@@ -524,22 +2011,35 @@ uint64_t hashRuleSet(const std::vector<MergeRule> & rules) {
     return h;
 }
 
-// ─── applyCompactionSchedule (BPE_COMPACT_EVERY=K) ──────────────────────────
+// ─── applyCompactionSchedule (--compaction) ──────────────────────────────────
 // Decide WHERE to inject a FilterByMask compaction into the merge-kernel chain, and
 // rewrite every rule's merge distance to match the resulting coordinate space. This
 // is pure preprocessing.
 //
 // This is a preprocessing step that prepares the merge pipeline before any kernels are created.
-// Returns compactAfter[i] = inject a compaction after merge kernel i. K = 0 returns
+// Returns compactAfter[i] = inject a compaction after merge kernel i. No compaction returns
 // all-false and leaves every lenA untouched, so the byte-space path stays bit-exact.
-static std::vector<bool> applyCompactionSchedule(
-        std::vector<MergeRuleGroup> & ruleRanges, unsigned K) {
-    unsigned nextCompaction = K;
-
-    //  Compact after every K kernels. The first block is always byte space (F=256),
-    //  so the first K kernels see the original lenA = byte distance. 
+static std::vector<bool> applyCompactionSchedule(std::vector<MergeRuleGroup> & ruleRanges) {
+    //  The first block is always byte space (F=256), so the kernels before the first
+    //  compaction see the original lenA = byte distance.
+    const CompactionMode mode = compactionMode();
+    const unsigned base = effCompactEvery();
     std::vector<bool> compactAfter(ruleRanges.size(), false);
-    if (nextCompaction == 0) return compactAfter;
+    if (mode == CompactionMode::None) return compactAfter;
+
+    // by-output-bits: kernel i ends its width when the next non-empty kernel writes a
+    // wider id stream (the last kernel of its bit tier). Never after the last.
+    std::vector<bool> widthGrowsAfter(ruleRanges.size(), false);
+    if (mode == CompactionMode::ByOutputBits) {
+        size_t prev = ruleRanges.size();
+        for (size_t i = 0; i < ruleRanges.size(); i++) {
+            if (ruleRanges[i].rules.empty()) continue;
+            if (prev < ruleRanges.size()
+                    && ceil_log2(ruleRanges[i].hi) > ceil_log2(ruleRanges[prev].hi))
+                widthGrowsAfter[prev] = true;
+            prev = i;
+        }
+    }
 
     // parts[idAB] = (idA, idB) for every merged token. Base ids (< 256) are absent —
     // they are atomic and terminate the recursion. lookup table
@@ -548,6 +2048,7 @@ static std::vector<bool> applyCompactionSchedule(
     std::map<unsigned, size_t> kernelOf;
     for (size_t gi = 0; gi < ruleRanges.size(); gi++)
         for (const auto & r : ruleRanges[gi].rules) {
+            if (ruleRanges[gi].tailOnly) break;   // never a kernel: nothing to measure
             parts.emplace(r.idAB, std::make_pair(r.idA, r.idB));
             kernelOf.emplace(r.idAB, gi);
         }
@@ -560,7 +2061,7 @@ static std::vector<bool> applyCompactionSchedule(
     // sits on top of several, so its span is the sum of its parts'. Kernels run in order
     // and a compaction happens after a specific kernel, so kernelOf IS the build time.
     // Testing `id < hi` instead is equivalent only when groups tile the id axis in rank
-    // order, which --level-partition does not.
+    // order, which --partition=level does not.
     std::function<unsigned(unsigned)> slotSpan = [&](unsigned id) -> unsigned {
         if (id < 256) return 1;               // base byte — the seed supplies it
         auto k = kernelOf.find(id);
@@ -578,17 +2079,19 @@ static std::vector<bool> applyCompactionSchedule(
     // Walk the rule ranges in order, counting kernels since the last compaction. When
     // we hit K, mark this range for compaction and advance lastCompactKernel to i.
     // Recompute every rule's lenA as a SLOT distance in the resulting compacted frame.
-    unsigned sinceCompact = 0, nCompact = 0, firstBlockDisagree = 0;
+    CompactionCounter counter;
+    unsigned nCompact = 0, firstBlockDisagree = 0, kernelNo = 0;
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
-        if (g.rules.empty()) continue;
+        if (g.rules.empty() || g.tailOnly) continue;
+        ++kernelNo;
         unsigned maxDist = 0;
         for (auto & r : g.rules) {
             unsigned d = slotSpan(r.idA);
             if (nCompact == 0 && d != r.lenA) firstBlockDisagree++;
             r.lenA = d;
             if (d > maxDist) maxDist = d;
-            // --chain-veto: the probe sits one slot past idB, so its slot-space distance
+            // --partition=chain: the probe sits one slot past idB, so its slot-space distance
             // is slotSpan(idA) + slotSpan(idB) — lenB alone is still a BYTE count here.
             // It can exceed every lenA in the group, so it must widen maxDist too, or the
             // LookAhead binding comes up short and the kernel refuses to compile (T5).
@@ -602,17 +2105,16 @@ static std::vector<bool> applyCompactionSchedule(
         // Decide whether to compact after this range. If we do, every token stamped by
         // kernel <= i is now one slot wide, so the memo (built against the previous
         // compaction point) is stale and must be dropped.
-        if (++sinceCompact < nextCompaction) continue;
+        const bool compact = (mode == CompactionMode::ByOutputBits)
+            ? widthGrowsAfter[i] && kernelNo >= base
+            : counter.step();
+        if (!compact) continue;
         compactAfter[i] = true;
         lastCompactKernel = (long) i;
         memo.clear();
-        sinceCompact = 0;
-        if (GeometricCompaction) {
-            nextCompaction *=2;
-        }
         nCompact++;
     }
-    std::cerr << "[BPE] compaction: BPE_COMPACT_EVERY=" << K << " -> "
+    std::cerr << "[BPE] compaction: " << compactionName(mode) << " base=" << base << " -> "
               << nCompact << " FilterByMask points\n";
     if (firstBlockDisagree)
         std::cerr << "[BPE] WARNING: " << firstBlockDisagree
@@ -639,7 +2141,12 @@ static std::vector<bool> applyCompactionSchedule(
 // EveryNth gives GLOBAL parity of the X starts; MatchStar spreads each run's
 // starting parity across the run so the odd/even choice RESETS per run (otherwise a
 // preceding odd-length run would flip the next run's pairing).
-static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigned L) {
+//
+// wordStart (--retire-words, else null): pretoken starts. A run then also breaks at a word
+// start: once whole words are dropped from the stream, the last X of one word can sit right
+// before the first X of another, and one joined run would shift the second word's pairing.
+static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigned L,
+                                      PabloAST * wordStart = nullptr) {
     // X-token body: the L bytes each X covers (start .. start+L-1). For L==1 this is
     // just isX; the body connects consecutive X tokens so MatchStar spans the gaps.
     PabloAST * body = isX;
@@ -647,14 +2154,123 @@ static PabloAST * selfMergeFireStarts(PabloBuilder & pb, PabloAST * isX, unsigne
         body = pb.createOr(body, pb.createAdvance(isX, (int64_t) k));
     // A run starts at an X with no X-token ending immediately L bytes before it.
     PabloAST * runStart = pb.createAnd(isX, pb.createNot(pb.createAdvance(isX, (int64_t) L)));
+    if (wordStart) runStart = pb.createOr(runStart, pb.createAnd(isX, wordStart));
     PabloAST * A1 = pb.createEveryNth(isX, pb.getInteger(2));  // global 1st,3rd,5th…
     PabloAST * A2 = pb.createXor(isX, A1);                     // global 2nd,4th,6th…
     PabloAST * A1_start = pb.createAnd(runStart, A1);
     PabloAST * A2_start = pb.createAnd(runStart, A2);
-    PabloAST * A1_runs = pb.createMatchStar(A1_start, body);   // runs whose 1st X is global-odd
-    PabloAST * A2_runs = pb.createMatchStar(A2_start, body);   // runs whose 1st X is global-even
+    // Spread each run start over its run. With word starts, spread from the position after
+    // the start through `cont` (the body minus word starts), so it stops before the next
+    // word's first X instead of running into it.
+    auto spread = [&](PabloAST * start) -> PabloAST * {
+        if (!wordStart) return pb.createMatchStar(start, body);
+        PabloAST * cont = pb.createAnd(body, pb.createNot(wordStart));
+        PabloAST * reach = pb.createMatchStar(pb.createAdvance(start, (int64_t) 1), cont);
+        return pb.createOr(start, pb.createAnd(reach, cont));
+    };
+    PabloAST * A1_runs = spread(A1_start);   // runs whose 1st X is global-odd
+    PabloAST * A2_runs = spread(A2_start);   // runs whose 1st X is global-even
     // Per-run 1st,3rd,5th X = the fire (A-start) positions.
     return pb.createOr(pb.createAnd(A1_runs, A1), pb.createAnd(A2_runs, A2));
+}
+
+// Shared by every kernel below that takes an optional "meIn" (inPlayMask) input:
+// omitted (nullptr) right after a FilterByMask compaction, where it's provably
+// all-ones (every surviving position just passed that filter on the real mask).
+static void bindOptional(std::vector<kernel::Binding> & in, const char * name, StreamSet * s) {
+    if (s) in.push_back(Binding{name, s});
+}
+// true iff this kernel instance actually has a stream bound under `name` -- lets a
+// kernel body ask "was meIn given?" without each kernel needing its own stored flag.
+static bool hasStreamInput(const Kernel * k, llvm::StringRef name) {
+    for (auto & b : k->getInputStreamSetBindings())
+        if (b.getName() == name) return true;
+    return false;
+}
+
+// Self-merges handled by emitSelfMergeBlock (--self-merge-block): every self-merge of the
+// group, except a --chain-partition chain root (whose dependents nest in its own gate).
+static std::vector<const MergeRule *> blockSelfMerges(const MergeRuleGroup & g) {
+    std::vector<const MergeRule *> out;
+    if (!SelfMergeBlock) return out;
+    std::unordered_set<unsigned> chainParents;   // idA of every needsLiveId rule
+    for (const auto & r : g.rules)
+        if (r.needsLiveId) chainParents.insert(r.idA);
+    for (const auto & r : g.rules)
+        if (r.idA == r.idB && !chainParents.count(r.idAB)) out.push_back(&r);
+    return out;
+}
+
+// emitSelfMergeBlock (--self-merge-block) — all of a kernel's self-merges X+X -> XX at once.
+//   eq_L  = NOT OR_i (id_i XOR id_i L slots ahead): the token at p equals the next one,
+//           when the token at p spans L slots. One per distinct span L of the rules' X.
+//   E_L   = InFile(mask(L) AND eq_L AND CC(S_L)(id)), S_L = the X's of span L. The
+//           membership test is required, not just a filter: for a token whose span is
+//           not L, the id L slots ahead is a stale interior id and may match.
+// A run of k equal tokens X at stride L gives k-1 consecutive E_L positions, and runs of
+// different tokens never join (the E positions of XXYY are 2L apart), so the per-run
+// pairing selfMergeFireStarts(E_L, L) fires at the 1st, 3rd, ... X of every run that has
+// a partner. The OR of all E_L gates one if-block holding that pairing and the stamp,
+// a bit transformation: change_j = CC_j(id) AND fire, where CC_j holds the X whose XX
+// differs from X in bit j (X selects its rule, so one class serves every L).
+// mask(L) = live start mask AND NOT (pretoken boundary at p+L); ahead(L) = the W id bits
+// L slots ahead. Returns change Vars (W_out) and fire Vars per L, zero outside the block;
+// the caller applies out_j = id_j XOR change_j and consumes Advance(fire_L, L).
+struct SelfMergeBlockResult {
+    std::vector<Var *> change;
+    std::map<unsigned, Var *> fireByL;
+};
+static SelfMergeBlockResult emitSelfMergeBlock(
+        PabloBuilder & pb, const std::vector<PabloAST *> & idBits, unsigned W_out,
+        const std::vector<const MergeRule *> & rules,
+        const std::function<std::vector<PabloAST *>(unsigned)> & ahead,
+        const std::function<PabloAST *(unsigned)> & mask) {
+    SelfMergeBlockResult res;
+    if (rules.empty()) return res;
+    const unsigned W = idBits.size();
+    cc::Parabix_CC_Compiler ccc(idBits);
+    std::map<unsigned, UCD::UnicodeSet> xByL;
+    std::vector<UCD::UnicodeSet> changeSet(W_out);
+    for (const MergeRule * r : rules) {
+        xByL[r->lenA].insert(r->idA);
+        for (unsigned j = 0; j < W_out; j++) {
+            const unsigned inBit = (j < W) ? ((r->idA >> j) & 1u) : 0u;
+            if (((r->idAB >> j) & 1u) != inBit) changeSet[j].insert(r->idA);
+        }
+    }
+    std::map<unsigned, PabloAST *> E;
+    PabloAST * anySelf = nullptr;
+    for (auto & [L, xs] : xByL) {
+        const std::vector<PabloAST *> nxt = ahead(L);
+        PabloAST * diff = nullptr;
+        for (unsigned i = 0; i < W; i++) {
+            PabloAST * d = pb.createXor(idBits[i], nxt[i]);
+            diff = diff ? pb.createOr(diff, d) : d;
+        }
+        PabloAST * isX = ccc.compileCC("selfX_L" + std::to_string(L), re::makeCC(std::move(xs)), pb);
+        PabloAST * e = pb.createAnd(pb.createAnd(mask(L), isX), pb.createNot(diff));
+        E[L] = pb.createInFile(e, "selfEq_L" + std::to_string(L));
+        anySelf = anySelf ? pb.createOr(anySelf, E[L]) : E[L];
+    }
+    for (unsigned j = 0; j < W_out; j++)
+        res.change.push_back(changeSet[j].empty() ? nullptr
+                             : pb.createVar("selfChange_" + std::to_string(j), pb.createZeroes()));
+    for (const auto & [L, e] : E)
+        res.fireByL[L] = pb.createVar("selfFire_L" + std::to_string(L), pb.createZeroes());
+    auto body = pb.createScope();
+    PabloAST * fireAll = nullptr;
+    for (const auto & [L, e] : E) {
+        PabloAST * f = selfMergeFireStarts(body, e, L);
+        body.createAssign(res.fireByL[L], f);
+        fireAll = fireAll ? body.createOr(fireAll, f) : f;
+    }
+    for (unsigned j = 0; j < W_out; j++) {
+        if (!res.change[j]) continue;
+        PabloAST * cj = ccc.compileCC("selfChg_" + std::to_string(j), re::makeCC(std::move(changeSet[j])), body);
+        body.createAssign(res.change[j], body.createAnd(cj, fireAll));
+    }
+    pb.createIf(anySelf, body);
+    return res;
 }
 
 // BPEMergeKernel — one id-range, REAL BPE merge on the id stream (START-anchored).
@@ -699,24 +2315,43 @@ public:
                         + (LookaheadInGate ? "la1_" : "la0_")
                         + (LookaheadInGroup ? "lg1_" : "lg0_")
                         + (BatchWriteback ? "bw1_" : "bw0_")
-                        + (ChainPartition ? "cp1_" : "cp0_")
-                        + (ChainVeto ? "cv1_" : "cv0_")
+                        + (isChainPartition() ? "cp1_" : "cp0_")
+                        + (isChainVeto() ? "cv1_" : "cv0_")
                         + (ChainFuseSiblings ? "fs1_" : "fs0_")
                         + (ChainUngateRoots ? "ur1_" : "ur0_")
+                        + (InFileOnce ? "io1_" : "")   // off = body identical to before → keep old names
+                        + (GateMaskFold ? "gm1_" : "")
+                        + (SkipInstCombine ? "ic1_" : "")
+                        + (KeyCluster ? "kc1_" : "")
+                        + (IfReduceTest ? "rt1_" : "")
+                        + (grouped && IfUnlikelyWeight > 0 ? "uw" + std::to_string(IfUnlikelyWeight) + "_" : "")
+                        + (RetireWords && boundaryIn ? "rw1_" : "")
+                        + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
+                                                 // FilterByMask, its inPlayMask is built
+                                                 // locally instead of bound as an input
+                        + (!nextIdIn && !blockSelfMerges(group).empty() ? "smb_" : "")
                         + "w" + std::to_string(sourceIn->getNumElements())
-                        + "o" + std::to_string(ceil_log2(group.hi + 1))
+                        + "o" + std::to_string(ceil_log2(group.hi))
                         + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
                   mergeInputs(sourceIn, meIn, boundaryIn, nextIdIn, maxLen),
                   {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
       mRuleGroup(group), mHasBoundary(boundaryIn != nullptr), mUseNextId(nextIdIn != nullptr),
       mGrouped(grouped) {}
 protected:
+    // --skip-instcombine: ask the driver to drop InstCombine for this kernel only.
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override {
+        PabloKernel::addOptimizationPasses(b, passes);
+        if (SkipInstCombine) passes.push_back(OptimizationPass::NoInstCombinePass);
+    }
+    // --if-unlikely-weight / --if-reduce-test (see their definitions)
+    unsigned ifBodyUnlikelyWeight() const override { return mGrouped ? (unsigned) IfUnlikelyWeight : 0u; }
+    bool reduceIfTest() const override { return IfReduceTest; }
     static std::vector<kernel::Binding> mergeInputs(
             StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
             StreamSet * nextIdIn, unsigned maxLen) {
         std::vector<kernel::Binding> in {
-            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)},
-            Binding{"meIn", meIn} };
+            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)} };
+        bindOptional(in, "meIn", meIn);
         if (boundaryIn)
             in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
         if (nextIdIn)   // Deferred producer (IndexedShiftBack), 2. Kernel receives both as input bindings
@@ -728,7 +2363,7 @@ protected:
         PabloBuilder pb(getEntryScope());
         std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
         const unsigned W = srcBits.size();
-        const unsigned W_out = ceil_log2(mRuleGroup.hi + 1);
+        const unsigned W_out = ceil_log2(mRuleGroup.hi);
         PabloAST * zeroes = pb.createZeroes();
 
         // idAcc — the id stream we mutate; starts as a copy of the input ids.
@@ -745,7 +2380,21 @@ protected:
         // Threaded kernel→kernel (meIn/meOut), seeded all-ones. Each fired merge clears
         // B's start (interior seam); A's start survives as AB's start. Final mask marks
         // the surviving (outermost) token STARTS — the stream emission scans.
-        Var * inPlayMask = pb.createVar("inPlayMask", getInputStreamSet("meIn")[0]);
+        // --infile-once: the end-of-file mask is applied here, once, instead of inside every
+        // id compare (see eqId below).
+        //
+        // No meIn stream given (right after a FilterByMask). Every position here just
+        // passed that filter, so it's already known to be live — build "all ones"
+        // directly instead of reading it. This also lets every rule's AND(eqId,
+        // inPlayMask) below collapse to just eqId for free.
+        // Must use InFile (not a bare all-ones): the filtered stream's length rarely
+        // lands on a block boundary, so a bare all-ones would leak into the leftover
+        // padding and show up as junk tokens past the real end of input.
+        PabloAST * const meInMasked = !hasStreamInput(this, "meIn")
+            ? pb.createInFile(pb.createNot(pb.createZeroes()), "meInFile")
+            : (InFileOnce ? pb.createInFile(getInputStreamSet("meIn")[0], "meInFile")
+                          : getInputStreamSet("meIn")[0]);
+        Var * inPlayMask = pb.createVar("inPlayMask", meInMasked);
 
         // 3. Read the copy inside the body
         // nextIdBN — indexed mode: the NEXT LIVE token's id at each position (precomputed
@@ -781,6 +2430,7 @@ protected:
         // LookAhead on the boundaryIn input (declares LookAhead(maxLen)). Null when no
         // boundary stream was supplied → no gating (mHasBoundary == false).
         PabloAST * boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
+        PabloAST * const runWordStart = RetireWords ? boundaryBit : nullptr;   // see selfMergeFireStarts
         std::map<unsigned, PabloAST*> boundaryAheadByLen;
         if (mHasBoundary && !LookaheadInGate && !grpCache) {   // in-gate/in-group build it below
             for (const auto & r : mRuleGroup.rules) {
@@ -796,14 +2446,48 @@ protected:
         std::vector<PabloAST*> frozenBits(W_out);       // entry idAcc value, immutable
         for (unsigned i = 0; i < W_out; i++) frozenBits[i] = (i < W) ? srcBits[i] : zeroes;
         BixNum      srcFrozen(frozenBits.begin(), frozenBits.end());
-        PabloAST *  meInFrozen = getInputStreamSet("meIn")[0];
+        PabloAST *  meInFrozen = meInMasked;
+
+        // eqId(bits, v) = (bits == v): the same balanced AND tree the binary
+        // cc::Parabix_CC_Compiler builds for a single value (bit_pattern_expr: one term per
+        // bit, NOT for a 0 bit, pairwise AND reduction), so Pablo CSE shares the partial
+        // products across compares in a scope exactly as compileCC's trees did. compileCC
+        // then wraps the result in InFile; without --infile-once so does eqId (identical
+        // body), with it the InFile is dropped — every gate and fire is ANDed with
+        // meInFrozen/inPlayMask, which already carry it (meInMasked above).
+        // `extra` (optional) is ANDed in as one more leaf, placed FIRST so it pairs with the
+        // lowest tested bit: that product is shared by every compare over the same bits
+        // (placed last, an even bit count would carry it to the root — one private AND).
+        auto eqId = [&](auto & bld, const BixNum & bits, unsigned v,
+                        const std::string & name = std::string(),
+                        PabloAST * extra = nullptr) -> PabloAST * {
+            std::vector<PabloAST*> terms;
+            terms.reserve(bits.size() + 1);
+            if (extra) terms.push_back(extra);
+            for (unsigned i = 0; i < bits.size(); i++)
+                terms.push_back(((v >> i) & 1u) ? bits[i] : bld.createNot(bits[i]));
+            if (terms.empty()) terms.push_back(bld.createOnes());
+            while (terms.size() > 1) {
+                std::vector<PabloAST*> next;
+                next.reserve(terms.size() / 2 + 1);
+                for (size_t i = 0; i + 1 < terms.size(); i += 2)
+                    next.push_back(bld.createAnd(terms[i], terms[i + 1]));
+                if (terms.size() % 2 == 1) next.push_back(terms.back());
+                terms.swap(next);
+            }
+            if (!InFileOnce)
+                return bld.createInFile(terms[0], name.empty() ? std::string("expr") : name);
+            if (!name.empty() && isa<And>(terms[0]))   // label only an And we built, never an input bit
+                cast<Statement>(terms[0])->setName(bld.makeName(name));
+            return terms[0];
+        };
 
         // ── Batched write-back accumulators (--batch-writeback) ──────────────────
         // Each rule's gate only ORs its fire in here; the id-stamp write is applied
         // once at the end of the kernel. setBit[i] = positions where id bit i must
         // become 1, anyFire = positions where SOME rule fired (drives the bit clear).
         //
-        // --asymmetric-seam can put two rules in the SAME kernel where the second
+        // --partition=asymmetric can put two rules in the SAME kernel where the second
         // one's idA is the first one's idB (MergeRule::needsFlush, set by
         // tagFlushPoints) — the second rule's eqAstart MUST see the first rule's
         // consume, or it wrongly fires on a position that's already been taken.
@@ -830,7 +2514,7 @@ protected:
         //     grouped-if kernels.
         const bool groupNeedsLiveMask = std::any_of(mRuleGroup.rules.begin(), mRuleGroup.rules.end(),
                                                      [](const MergeRule & r) { return r.needsFlush; });
-        // --chain-partition rules (a chain root and every rule nested under it) keep
+        // --partition=chain rules (a chain root and every rule nested under it) keep
         // the EAGER write-back: a parent stamps idAB and its child stamps idABC at the
         // SAME position, so the child must overwrite the parent, and the batch
         // accumulators only OR — they cannot express "the later one wins". Batching
@@ -844,18 +2528,23 @@ protected:
         //     `idAcc & ~anyFire` preserves the eager chain stamp untouched.
         //   - MASK: a chain rule consumes at its idB's start. The maxLeft constraint
         //     forbids any same-kernel rule from having that idB as ITS idA (or, under
-        //     --chain-veto, makes it stand down at runtime), so no batched rule reads
+        //     --partition=chain, makes it stand down at runtime), so no batched rule reads
         //     the position a chain consume clears.
         //
         // childrenOf[idAB] = the rules in THIS group whose idA == idAB (i.e. every rule
         // that should nest inside idAB's own gate — see emitChain below). Empty, so
-        // isChainRule is always false, whenever --chain-partition is off.
+        // isChainRule is always false, whenever --partition=chain is off.
         std::unordered_map<unsigned, std::vector<const MergeRule*>> childrenOf;
         for (const auto & r : mRuleGroup.rules)
             if (r.needsLiveId) childrenOf[r.idA].push_back(&r);
         auto isChainRule = [&](const MergeRule & r) {
             return r.needsLiveId || childrenOf.count(r.idAB) != 0;
         };
+        // --self-merge-block: these self-merges are resolved together after the other rules
+        // (emitSelfMergeBlock) and skipped by every per-rule path below.
+        const std::vector<const MergeRule *> blockSelf =
+            mUseNextId ? std::vector<const MergeRule *>() : blockSelfMerges(mRuleGroup);
+        const std::unordered_set<const MergeRule *> inSelfBlock(blockSelf.begin(), blockSelf.end());
         const bool batch     = BatchWriteback && !mUseNextId;  // defer the id-stamp
         const bool deferMask = batch && !groupNeedsLiveMask;   // also defer the mask consume
         std::vector<Var *> setBit;
@@ -868,7 +2557,7 @@ protected:
             anyFire = pb.createVar("anyFire", zeroes);
             if (deferMask)
                 for (const auto & r : mRuleGroup.rules)
-                    if (!isChainRule(r) && fireByLen.find(r.lenA) == fireByLen.end())
+                    if (!isChainRule(r) && !inSelfBlock.count(&r) && fireByLen.find(r.lenA) == fireByLen.end())
                         fireByLen.emplace(r.lenA,
                             pb.createVar("fireByLen_" + std::to_string(r.lenA), zeroes));
         }
@@ -889,32 +2578,31 @@ protected:
         // by the time a later rule in this same kernel calls eqAstart again (back at
         // the outer scope), inPlayMask already reflects every earlier rule's consume in
         // THIS kernel. Under the shipped partition schemes (clean-range default,
-        // --level-partition symmetric seam) this is a no-op — conflict-freedom already
+        // --partition=level symmetric seam) this is a no-op — conflict-freedom already
         // guarantees no rule's fire touches a position another same-kernel rule reads 
         auto eqAstart = [&](auto & bld, unsigned id) -> PabloAST * {
-            cc::Parabix_CC_Compiler_Builder ccS(srcFrozen);
-            return bld.createAnd(ccS.compileCC(re::makeCC(id), bld), inPlayMask, "Astart_" + std::to_string(id));
+            return bld.createAnd(eqId(bld, srcFrozen, id), inPlayMask, "Astart_" + std::to_string(id));
         };
 
-        // --chain-veto: suppress this rule where a lower-rank competitor claims its idB.
+        // --partition=chain: suppress this rule where a lower-rank competitor claims its idB.
         // Reads the id one slot PAST idB (r.vetoOff) from the frozen kernel input; if it
         // is that competitor's right part, the competitor applies here, wins on rank, and
         // this merge must not fire. One peek serves every competitor (all probe the same
         // slot), one EQ each. Returns `fire` untouched when the rule carries no veto, so
         // both emission paths call it unconditionally. Reads nothing but the kernel
-        // input, which is why it needs neither nesting nor --chain-partition.
+        // input, which is why it needs neither nesting nor --partition=chain.
         auto applyVeto = [&](auto & body, const MergeRule & r, PabloAST * fire) -> PabloAST * {
             if (r.vetoIdB.empty()) return fire;
             if (mUseNextId)   // --indexed-shift: no byte-distance LookAhead exists here
-                llvm::report_fatal_error("--chain-veto is incompatible with --indexed-shift");
+                llvm::report_fatal_error("--partition=chain is incompatible with --indexed-shift");
             std::vector<PabloAST*> vbits(W);
             for (unsigned i = 0; i < W; i++)
                 vbits[i] = body.createLookahead(srcBits[i], (int64_t) r.vetoOff);
-            cc::Parabix_CC_Compiler_Builder ccVeto(BixNum(vbits.begin(), vbits.end()));
+            const BixNum vetoBits(vbits.begin(), vbits.end());
             PabloAST * veto = nullptr;
             for (unsigned vid : r.vetoIdB) {
-                PabloAST * hit = ccVeto.compileCC("veto_" + std::to_string(r.idB) + "_" + std::to_string(vid),
-                                                  re::makeCC(vid), body);
+                PabloAST * hit = eqId(body, vetoBits, vid,
+                                      "veto_" + std::to_string(r.idB) + "_" + std::to_string(vid));
                 veto = veto ? body.createOr(veto, hit) : hit;
             }
             // The competitor only wins if it could actually FIRE, and it is subject to
@@ -955,24 +2643,20 @@ protected:
                 if (bLowDone >= bPeek->size()) {
                     BstartAtA = nullptr;
                 } else {
-                    cc::Parabix_CC_Compiler_Builder ccHiB(BixNum(bPeek->begin() + bLowDone, bPeek->end()));
-                    BstartAtA = ccHiB.compileCC(bstartName, re::makeCC(r.idB >> bLowDone), body);
+                    BstartAtA = eqId(body, BixNum(bPeek->begin() + bLowDone, bPeek->end()),
+                                     r.idB >> bLowDone, bstartName);
                 }
             } else if (mUseNextId) {
-                cc::Parabix_CC_Compiler_Builder ccNext(nextIdBN);
-                BstartAtA = ccNext.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, nextIdBN, r.idB, bstartName);
             } else if (grpAhead) {   // chunk-cached shared peek (built once per lenA in the gate)
-                cc::Parabix_CC_Compiler_Builder ccAhead(grpAhead->at(r.lenA));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, grpAhead->at(r.lenA), r.idB, bstartName);
             } else if (LookaheadInGate) {
                 std::vector<PabloAST*> bits(W);
                 for (unsigned i = 0; i < W; i++)
                     bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
-                cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, BixNum(bits.begin(), bits.end()), r.idB, bstartName);
             } else {
-                cc::Parabix_CC_Compiler_Builder ccAhead(aheadByLenA.at(r.lenA));
-                BstartAtA = ccAhead.compileCC(bstartName, re::makeCC(r.idB), body);
+                BstartAtA = eqId(body, aheadByLenA.at(r.lenA), r.idB, bstartName);
             }
             PabloAST * fire = !BstartAtA ? fireStart : body.createAnd(fireStart, BstartAtA, "fire1_" + std::to_string(r.idA) + "_" + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {  // block merges where B begins a new pretoken (cross-boundary)
@@ -1056,7 +2740,7 @@ protected:
             // subset of its input, so fireStart IS the gate value — no extra And.
             PabloAST * fireStart = eqAstart(pb, r.idA);
             if (r.idA == r.idB)
-                fireStart = selfMergeFireStarts(pb, fireStart, r.lenA);
+                fireStart = selfMergeFireStarts(pb, fireStart, r.lenA, runWordStart);
             auto body = pb.createScope();
             emitBody(body, r, fireStart);
             pb.createIf(fireStart, body);
@@ -1077,9 +2761,9 @@ protected:
             inPlayMask = freshMask;
         };
 
-        // ── --chain-partition: REAL nested createIf ─────────────────────────────
+        // ── --partition=chain: REAL nested createIf ─────────────────────────────
         // A rule flagged needsLiveId (its idA was stamped by an earlier SAME-level
-        // rule — see levelPartition's ChainPartition branch) is emitted physically
+        // rule — see levelPartition's chain-partition branch) is emitted physically
         // INSIDE that producer's gate, instead of as a sibling createIf reading a
         // live Var. Isolated from emitBody/emitRule (used by every other path,
         // including plain-sibling non-chain rules in the SAME kernel) so no other
@@ -1113,8 +2797,8 @@ protected:
             std::vector<PabloAST*> bits(W);
             for (unsigned i = 0; i < W; i++)
                 bits[i] = body.createLookahead(srcBits[i], (int64_t) r.lenA);
-            cc::Parabix_CC_Compiler_Builder ccAhead(BixNum(bits.begin(), bits.end()));
-            PabloAST * BstartAtA = ccAhead.compileCC("Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB), re::makeCC(r.idB), body);
+            PabloAST * BstartAtA = eqId(body, BixNum(bits.begin(), bits.end()), r.idB,
+                                        "Bstart_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
             PabloAST * fire = body.createAnd(fireStart, BstartAtA, "chainfire_" + std::to_string(r.idA) + "_"  + std::to_string(r.idB) + "_" + std::to_string(r.idAB));
             if (mHasBoundary) {
                 PabloAST * bAhead = body.createLookahead(boundaryBit, (int64_t) r.lenA);
@@ -1159,6 +2843,7 @@ protected:
         if (!mGrouped) {
             for (const auto & r : mRuleGroup.rules) {
                 if (r.needsLiveId) continue;      // emitted as a nested child above, not a root
+                if (inSelfBlock.count(&r)) continue;
                 if (!childrenOf.count(r.idAB)) {
                     emitRule(r);                   // no chain involved — untouched path
                     continue;
@@ -1167,7 +2852,7 @@ protected:
                 // inside via emitChain instead of a flat sibling loop.
                 PabloAST * fireStart = eqAstart(pb, r.idA);
                 if (r.idA == r.idB)
-                    fireStart = selfMergeFireStarts(pb, fireStart, r.lenA);
+                    fireStart = selfMergeFireStarts(pb, fireStart, r.lenA, runWordStart);
                 emitChain(pb, r, fireStart);
                 // Same rebind emitRule does after every rule — a later sibling's
                 // eqAstart must not reuse the pre-chain inPlayMask pointer.
@@ -1194,7 +2879,7 @@ protected:
             // rather than paid in full outside (range gate) and again inside (per-rule EQ).
             // Sorted by idA → equal keys are contiguous (same L, same prefix).
             //
-            // --chain-partition: only the nested CHILDREN sit out the chunk loop —
+            // --partition=chain: only the nested CHILDREN sit out the chunk loop —
             // emitChain emits each of them physically inside its producer's gate, so
             // they must not also appear as a chunk rule. Chain ROOTS stay in, and get
             // their nest built inside the chunk gate (see emitChain call below), so a
@@ -1205,7 +2890,7 @@ protected:
             std::vector<const MergeRule*> sorted;
             sorted.reserve(mRuleGroup.rules.size());
             for (const auto & r : mRuleGroup.rules)
-                if (!r.needsLiveId) sorted.push_back(&r);
+                if (!r.needsLiveId && !inSelfBlock.count(&r)) sorted.push_back(&r);
             std::sort(sorted.begin(), sorted.end(),
                       [](const MergeRule* a, const MergeRule* b){ return a->idA < b->idA; });
 
@@ -1245,9 +2930,11 @@ protected:
                 if (hiBits > 0) {
                     const unsigned prefix = sorted[s]->idA >> loBits;
                     const BixNum hiFrozen(frozenBits.begin() + loBits, frozenBits.end());
-                    cc::Parabix_CC_Compiler_Builder ccHi(hiFrozen);
-                    inRange = ccHi.compileCC("idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
-                                             re::makeCC(prefix), pb);
+                    // --gate-mask-fold: the mask rides inside the shared tree, so inRange
+                    // IS the gate condition (prefixAstart still ANDs the live inPlayMask).
+                    inRange = eqId(pb, hiFrozen, prefix,
+                                   "idHi_" + std::to_string(loBits) + "_" + std::to_string(prefix),
+                                   GateMaskFold ? meInFrozen : nullptr);
                 } else {
                     unsigned gLo = sorted[s]->idA, gHi = sorted[e-1]->idA;   // sorted → tight range
                     cc::Parabix_CC_Compiler_Builder ccId(frozenBits);
@@ -1285,8 +2972,7 @@ protected:
                         PabloAST * m = inRange;
                         if (loBits > 0) {
                             const unsigned lo = idA & ((1u << loBits) - 1u);
-                            cc::Parabix_CC_Compiler_Builder ccLo(loFrozen);
-                            m = body.createAnd(m, ccLo.compileCC(re::makeCC(lo), body), "idMatch_" + std::to_string(idA));
+                            m = body.createAnd(m, eqId(body, loFrozen, lo), "idMatch_" + std::to_string(idA));
                         }
                         f = idMatchInGroup.emplace(idA, m).first;
                     }
@@ -1313,7 +2999,7 @@ protected:
                     const MergeRule & r = *sorted[k];
                     PabloAST * fireStart = (hiBits > 0) ? prefixAstart(r.idA) : eqAstart(body, r.idA);
                     if (r.idA == r.idB)
-                        fireStart = selfMergeFireStarts(body, fireStart, r.lenA);
+                        fireStart = selfMergeFireStarts(body, fireStart, r.lenA, runWordStart);
                     // Chain root: build its own createIf inside THIS chunk gate and nest
                     // its children in it, instead of emitting flat at the outer scope.
                     // The root's gate is then doubly guarded (chunk prefix, then its own
@@ -1336,9 +3022,8 @@ protected:
                     PabloAST * embedCond = fireStart;
                     if (bLowUsed > 0) {
                         const unsigned lowB = r.idB & ((1u << bLowUsed) - 1u);
-                        cc::Parabix_CC_Compiler_Builder ccLoB(BixNum(bPeek.begin(), bPeek.begin() + bLowUsed));
-                        PabloAST * bLoMatch = ccLoB.compileCC(
-                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB), re::makeCC(lowB), body);
+                        PabloAST * bLoMatch = eqId(body, BixNum(bPeek.begin(), bPeek.begin() + bLowUsed), lowB,
+                            "idBlo_" + std::to_string(bLowUsed) + "_" + std::to_string(lowB));
                         embedCond = body.createAnd(fireStart, bLoMatch,
                             "embed_" + std::to_string(r.idA) + "_" + std::to_string(r.idB));
                     }
@@ -1346,12 +3031,37 @@ protected:
                     emitBody(inner, r, embedCond, grpAhead, grpBoundary, &bPeek, bLowUsed);
                     body.createIf(embedCond, inner);
                 }
-                pb.createIf(pb.createAnd(inRange, meInFrozen), body);
+                const bool maskInRange = GateMaskFold && hiBits > 0;
+                pb.createIf(maskInRange ? inRange : pb.createAnd(inRange, meInFrozen), body);
             }
         }
 
         // ── Apply whatever's left in the batch accumulators ─────────────────────
         if (batch) flushWriteback();
+
+        // ── --self-merge-block ───────────────────────────────────────────────────
+        // Read from the frozen input like every other rule; its fire and consume
+        // positions are disjoint from theirs (seam constraints), so XOR-ing its change
+        // into the accumulated ids after them equals applying it in rank order.
+        if (!blockSelf.empty()) {
+            auto ahead = [&](unsigned L) -> std::vector<PabloAST *> {
+                auto f = aheadByLenA.find(L);
+                if (f != aheadByLenA.end()) return std::vector<PabloAST *>(f->second.begin(), f->second.end());
+                std::vector<PabloAST *> bits(W);
+                for (unsigned i = 0; i < W; i++) bits[i] = pb.createLookahead(srcBits[i], (int64_t) L);
+                return bits;
+            };
+            auto mask = [&](unsigned L) -> PabloAST * {
+                if (!mHasBoundary) return meInFrozen;
+                return pb.createAnd(meInFrozen, pb.createNot(pb.createLookahead(boundaryBit, (int64_t) L)));
+            };
+            auto res = emitSelfMergeBlock(pb, srcBits, W_out, blockSelf, ahead, mask);
+            for (unsigned i = 0; i < W_out; i++)
+                if (res.change[i]) pb.createAssign(idAcc[i], pb.createXor(idAcc[i], res.change[i]));
+            for (const auto & [L, fire] : res.fireByL)
+                pb.createAssign(inPlayMask,
+                    pb.createAnd(inPlayMask, pb.createNot(pb.createAdvance(fire, (int64_t) L))));
+        }
 
         Var * sOut = getOutputStreamVar("sourceOut");
         for (unsigned i = 0; i < W_out; i++)
@@ -1364,6 +3074,295 @@ private:
     bool mUseNextId;
     bool mGrouped;
 };
+// ─── BPEXfrmKernel (--bit-xfrm-limit) ───────────────────────────────────────
+// A merge kernel built as a set of bit transformations instead of per-rule gates. Same
+// bindings and semantics as BPEMergeKernel; it handles groups whose rules read only the
+// frozen kernel input (no --partition=chain nest, --partition=asymmetric live mask or
+// --partition=chain; see bitXfrmEligible).
+//
+// For an input id stream of N <= kXfrmLowBits bits, rules are bucketed by L = lenA, the
+// lookahead distance at which their B part starts. For each L the kernel forms one 2N-bit
+// vector
+//     V_L = [ id bits 0..N-1 at p ,  id bits 0..N-1 at p+L ]
+// so a rule's (idA, idB) pair is the value idA | idB << N. For every output bit j, the
+// rules of that bucket whose idAB bit j differs from idA bit j (for j >= N: whose idAB
+// bit j is set, the input bit being 0) form a set of such values; cc::Parabix_CC_Compiler
+// compiles it over V_L, and
+//     change_j = OR over L of ( CC_{L,j}(V_L) AND live AND NOT boundary(p+L) )
+//     out_j    = in_j XOR change_j.
+// The union of a bucket's values, under the same mask, is its fire stream, and the B
+// starts are consumed as in BPEMergeKernel: live &= NOT Advance(fire_L, L).
+//
+// Subtiers (N > kXfrmLowBits): re::CC codepoints stop at 0x10FFFF, so a pair value can
+// hold 20 bits. The classes take the low 20-N bits of idA and all N bits of idB; the
+// remaining high 2N-20 bits of idA name the rule's subtier, and each subtier present in
+// the kernel is one block: its classes ANDed with (idA's subtier bits at p == the key),
+// all L sharing the block. --subtier-gating-bits puts a block in an if when its key
+// shows a large idA; --subtier-grouping-by-min-ID keys rules with idA > idB on idB.
+//
+// Exactness: within one kernel at most one rule fires at a position (the frozen id there
+// selects idA, and rules sharing idA share L and so read one B slot), and same-kernel
+// rules never touch each other's positions (dependency + seam constraints), so XOR-ing
+// all change streams from the frozen input equals applying the rules one by one.
+//
+// Self-merges X+X need per-run pairing (selfMergeFireStarts), which a character class
+// cannot express; they keep a per-rule stamp here, or join --self-merge-block. The seam
+// constraints keep every other rule off their positions, so the stamp and the change
+// streams never meet.
+static constexpr unsigned kXfrmLowBits = 10;
+
+class BPEXfrmKernel : public PabloKernel {
+public:
+    BPEXfrmKernel(LLVMTypeSystemInterface & ts,
+                  StreamSet * sourceIn, StreamSet * meIn, StreamSet * boundaryIn,
+                  StreamSet * sourceOut, StreamSet * meOut,
+                  MergeRuleGroup group, uint64_t shapeHash, unsigned maxLen)
+    : PabloKernel(ts, std::string("BPEXfrm_") + (boundaryIn ? "b1_" : "")
+                        + (SkipInstCombine ? "ic1_" : "")
+                        + (RetireWords && boundaryIn ? "rw1_" : "")
+                        + (sourceIn->getNumElements() > kXfrmLowBits
+                               ? std::string("st_")
+                                 + (subtierGroupingApplies(ceil_log2(group.hi)) ? "gm_" : "")
+                                 + (SubtierGatingBits > 0 ? "sg" + std::to_string(SubtierGatingBits) + "_" : "")
+                               : std::string())
+                        + (!blockSelfMerges(group).empty() ? "smb_" : "")
+                        + (meIn ? "" : "fa1_")   // meIn omitted: first kernel after a
+                                                 // FilterByMask, inPlayMask built locally
+                        + "w" + std::to_string(sourceIn->getNumElements())
+                        + "o" + std::to_string(ceil_log2(group.hi))
+                        + "L" + std::to_string(maxLen) + "_h" + std::to_string(shapeHash),
+                  xfrmInputs(sourceIn, meIn, boundaryIn, maxLen),
+                  {Binding{"sourceOut", sourceOut}, Binding{"meOut", meOut}}),
+      mRuleGroup(std::move(group)), mHasBoundary(boundaryIn != nullptr) {}
+protected:
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override {
+        PabloKernel::addOptimizationPasses(b, passes);
+        if (SkipInstCombine) passes.push_back(OptimizationPass::NoInstCombinePass);
+    }
+    static std::vector<kernel::Binding> xfrmInputs(StreamSet * sourceIn, StreamSet * meIn,
+                                                   StreamSet * boundaryIn, unsigned maxLen) {
+        std::vector<kernel::Binding> in {
+            Binding{"sourceIn", sourceIn, FixedRate(), LookAhead(maxLen)} };
+        bindOptional(in, "meIn", meIn);
+        if (boundaryIn)
+            in.push_back(Binding{"boundaryIn", boundaryIn, FixedRate(), LookAhead(maxLen)});
+        return in;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST*> srcBits = getInputStreamSet("sourceIn");
+        const unsigned N = srcBits.size();
+        const unsigned W_out = ceil_log2(mRuleGroup.hi);
+        // No meIn stream given (right after a FilterByMask): every position here just
+        // passed that filter, so it's already known to be live -- build "all ones"
+        // directly (InFile, so leftover block padding doesn't read as live).
+        PabloAST * const live = hasStreamInput(this, "meIn")
+            ? getInputStreamSet("meIn")[0]
+            : pb.createInFile(pb.createNot(pb.createZeroes()), "meInFile");
+        PabloAST * const boundaryBit = mHasBoundary ? getInputStreamSet("boundaryIn")[0] : nullptr;
+
+        // Per lookahead distance L: the CC rules and the self-merges.
+        std::map<unsigned, std::vector<const MergeRule *>> byLen;
+        std::vector<const MergeRule *> selfMerges;
+        for (const auto & r : mRuleGroup.rules)
+            (r.idA == r.idB ? selfMerges : byLen[r.lenA]).push_back(&r);
+
+        std::map<unsigned, std::vector<PabloAST *>> aheadBits;   // id bits L slots ahead
+        auto ahead = [&](unsigned L) -> const std::vector<PabloAST *> & {
+            auto & v = aheadBits[L];
+            if (v.empty())
+                for (unsigned i = 0; i < N; i++) v.push_back(pb.createLookahead(srcBits[i], (int64_t) L));
+            return v;
+        };
+        // gate(L) = live AND NOT (a pretoken boundary at B's start)
+        auto gate = [&](unsigned L) -> PabloAST * {
+            if (!mHasBoundary) return live;
+            return pb.createAnd(live, pb.createNot(pb.createLookahead(boundaryBit, (int64_t) L)),
+                                "gate_L" + std::to_string(L));
+        };
+
+        std::vector<PabloAST *> change(W_out, nullptr);
+        PabloAST * consumed = nullptr;   // B starts to clear from the live mask
+        auto orInto = [&](PabloAST *& acc, PabloAST * v) { acc = acc ? pb.createOr(acc, v) : v; };
+
+        // Ids of N bits: the classes take the low NloA bits of idA and all N bits of idB.
+        // Subtiers (H): N > kXfrmLowBits, NloA = 2*kXfrmLowBits - N, and the high N-NloA
+        // bits of idA (the subtier key) select a block.
+        const bool H = N > kXfrmLowBits;
+        const unsigned NloA = H ? 2 * kXfrmLowBits - N : N, NloB = N;
+        const unsigned loMaskA = (1u << NloA) - 1u, loMaskB = (1u << NloB) - 1u;
+        // --subtier-grouping-by-min-ID: rules with idA > idB (group B) swap the roles: idB
+        // gives the NloA keyed bits, idA all NloB bits.
+        const bool byMin = H && subtierGroupingApplies(W_out);
+
+        // Compile one block's sets in `bld` over the low-bit pair vector, masked by `mask`,
+        // handing each result to addFire / addChange. keyB: the block is keyed on idB
+        // (group B), so idB's bits come first in the pair vector.
+        auto buildSets = [&](auto & bld, const std::vector<const MergeRule *> & rs,
+                             const std::vector<PabloAST *> & bBits, PabloAST * mask, bool keyB,
+                             const std::string & tag, auto && addFire, auto && addChange) {
+            const std::vector<PabloAST *> & keyed = keyB ? bBits : srcBits;
+            const std::vector<PabloAST *> & other = keyB ? srcBits : bBits;
+            std::vector<PabloAST *> pairBits(keyed.begin(), keyed.begin() + NloA);
+            pairBits.insert(pairBits.end(), other.begin(), other.begin() + NloB);
+            cc::Parabix_CC_Compiler ccc(pairBits);
+            UCD::UnicodeSet fireSet;
+            std::vector<UCD::UnicodeSet> changeSet(W_out);
+            for (const MergeRule * r : rs) {
+                const unsigned k = keyB ? r->idB : r->idA, o = keyB ? r->idA : r->idB;
+                const re::codepoint_t v = (k & loMaskA) | ((o & loMaskB) << NloA);
+                fireSet.insert(v);
+                for (unsigned j = 0; j < W_out; j++) {
+                    const unsigned inBit = (j < N) ? ((r->idA >> j) & 1u) : 0u;
+                    if (((r->idAB >> j) & 1u) != inBit) changeSet[j].insert(v);
+                }
+            }
+            addFire(bld.createAnd(ccc.compileCC("fire" + tag, re::makeCC(std::move(fireSet)), bld), mask));
+            for (unsigned j = 0; j < W_out; j++) {
+                if (changeSet[j].empty()) continue;
+                PabloAST * cj = ccc.compileCC("chg" + std::to_string(j) + tag,
+                                              re::makeCC(std::move(changeSet[j])), bld);
+                addChange(j, bld.createAnd(cj, mask));
+            }
+        };
+
+        // H: accumulators the subtier blocks OR into (Pablo joins them at each if's end).
+        std::vector<Var *> changeVar(W_out, nullptr);
+        auto changeAcc = [&](unsigned j) -> Var * {
+            if (!changeVar[j]) changeVar[j] = pb.createVar("change_" + std::to_string(j), pb.createZeroes());
+            return changeVar[j];
+        };
+        // (high bits [lo, N) of `bits`) == v, as one AND tree; null when lo == N
+        auto eqHigh = [&](const std::vector<PabloAST *> & bits, unsigned lo, unsigned v) -> PabloAST * {
+            PabloAST * e = nullptr;
+            for (unsigned i = lo; i < N; i++) {
+                PabloAST * t = ((v >> (i - lo)) & 1u) ? bits[i] : pb.createNot(bits[i]);
+                e = e ? pb.createAnd(e, t) : t;
+            }
+            return e;
+        };
+
+        if (!H) {
+            for (const auto & [L, rules] : byLen) {
+                PabloAST * fire = nullptr;
+                buildSets(pb, rules, ahead(L), gate(L), false, "_L" + std::to_string(L),
+                          [&](PabloAST * f) { fire = f; },
+                          [&](unsigned j, PabloAST * c) { orInto(change[j], c); });
+                orInto(consumed, pb.createAdvance(fire, (int64_t) L));
+            }
+        } else {
+            // One block per subtier, all L sharing it. Group B blocks (--subtier-grouping-
+            // by-min-ID) are keyed on idB's high bits, read L slots ahead, so each has one L.
+            // Key: (group: 0 = keyed on idA, 1 = on idB; L, or 0 for group 0; keyed high bits).
+            std::map<std::tuple<unsigned, unsigned, unsigned>,
+                     std::map<unsigned, std::vector<const MergeRule *>>> blocks;
+            for (const auto & [L, rules] : byLen)
+                for (const MergeRule * r : rules) {
+                    if (byMin && r->idA > r->idB)
+                        blocks[{1u, L, r->idB >> NloA}][L].push_back(r);
+                    else
+                        blocks[{0u, 0u, r->idA >> NloA}][L].push_back(r);
+                }
+            std::map<unsigned, Var *> fireL;
+            for (const auto & [L, rules] : byLen)
+                fireL[L] = pb.createVar("fire_L" + std::to_string(L), pb.createZeroes());
+            // Emit one block's sets into `bld`: the if body, or the top scope when ungated.
+            auto emitSets = [&](auto & bld, const std::map<unsigned, std::vector<const MergeRule *>> & rulesByL,
+                                PabloAST * cond, bool keyB, const std::string & btag) {
+                for (const auto & [L, rs] : rulesByL) {
+                    // the condition already carries `live`; add L's boundary gate if any
+                    PabloAST * mask = (keyB || !mHasBoundary) ? cond : bld.createAnd(cond, gate(L));
+                    Var * fire = fireL[L];
+                    buildSets(bld, rs, ahead(L), mask, keyB, btag + (keyB ? "" : "_L" + std::to_string(L)),
+                              [&](PabloAST * f) { bld.createAssign(fire, bld.createOr(fire, f)); },
+                              [&](unsigned j, PabloAST * c) {
+                                  Var * acc = changeAcc(j);
+                                  bld.createAssign(acc, bld.createOr(acc, c));
+                              });
+                }
+            };
+            for (const auto & [key, rulesByL] : blocks) {
+                const auto & [grp, keyL, hiK] = key;
+                const bool keyB = grp == 1;
+                const std::string btag = (keyB ? "_L" + std::to_string(keyL) + "_kb" : "_a") + std::to_string(hiK);
+                PabloAST * hiEq = eqHigh(keyB ? ahead(keyL) : srcBits, NloA, hiK);
+                PabloAST * cond = pb.createAnd(hiEq, keyB ? gate(keyL) : live, "hi" + btag);
+                // --subtier-gating-bits: gate only a subtier whose keyed part has >= K bits.
+                const unsigned keyedBits = hiK ? (32u - __builtin_clz(hiK)) + NloA : 0u;
+                const bool gated = SubtierGatingBits == 0 || keyedBits >= SubtierGatingBits;
+                if (!gated) {
+                    emitSets(pb, rulesByL, cond, keyB, btag);
+                    continue;
+                }
+                auto body = pb.createScope();
+                emitSets(body, rulesByL, cond, keyB, btag);
+                pb.createIf(cond, body);
+            }
+            for (const auto & [L, fire] : fireL)
+                orInto(consumed, pb.createAdvance(fire, (int64_t) L));
+        }
+        for (unsigned j = 0; j < W_out; j++)
+            if (changeVar[j]) orInto(change[j], changeVar[j]);
+
+        // --self-merge-block: the self-merges join the bit transformation as one gated block.
+        const std::vector<const MergeRule *> blockSelf = blockSelfMerges(mRuleGroup);
+        if (!blockSelf.empty()) {
+            auto res = emitSelfMergeBlock(pb, srcBits, W_out, blockSelf,
+                                          [&](unsigned L) { return ahead(L); }, gate);
+            for (unsigned j = 0; j < W_out; j++)
+                if (res.change[j]) orInto(change[j], res.change[j]);
+            for (const auto & [L, fire] : res.fireByL)
+                orInto(consumed, pb.createAdvance(fire, (int64_t) L));
+            selfMerges.clear();
+        }
+
+        // out_j = in_j XOR change_j
+        std::vector<PabloAST *> outBits(W_out);
+        for (unsigned j = 0; j < W_out; j++) {
+            PabloAST * in = (j < N) ? srcBits[j] : pb.createZeroes();
+            outBits[j] = change[j] ? pb.createXor(in, change[j], "xfrm_" + std::to_string(j)) : in;
+        }
+
+        // Self-merges: per-run pairing, then an explicit stamp of idAB.
+        for (const MergeRule * r : selfMerges) {
+            std::vector<PabloAST *> terms;
+            auto eqTerms = [&](const std::vector<PabloAST *> & bits, unsigned id) {
+                PabloAST * e = nullptr;
+                for (unsigned i = 0; i < N; i++) {
+                    PabloAST * t = ((id >> i) & 1u) ? bits[i] : pb.createNot(bits[i]);
+                    e = e ? pb.createAnd(e, t) : t;
+                }
+                return e;
+            };
+            PabloAST * isX = pb.createInFile(pb.createAnd(eqTerms(srcBits, r->idA), live));
+            PabloAST * fire = selfMergeFireStarts(pb, isX, r->lenA,
+                                                  RetireWords ? boundaryBit : nullptr);
+            fire = pb.createAnd(fire, eqTerms(ahead(r->lenA), r->idB));
+            fire = pb.createAnd(fire, gate(r->lenA), "selffire_" + std::to_string(r->idAB));
+            orInto(consumed, pb.createAdvance(fire, (int64_t) r->lenA));
+            for (unsigned j = 0; j < W_out; j++)
+                outBits[j] = ((r->idAB >> j) & 1u) ? pb.createOr(outBits[j], fire)
+                                                   : pb.createAnd(outBits[j], pb.createNot(fire));
+        }
+
+        Var * sOut = getOutputStreamVar("sourceOut");
+        for (unsigned j = 0; j < W_out; j++)
+            pb.createAssign(pb.createExtract(sOut, pb.getInteger(j)), outBits[j]);
+        PabloAST * meOut = consumed ? pb.createAnd(live, pb.createNot(consumed), "liveOut") : live;
+        pb.createAssign(pb.createExtract(getOutputStreamVar("meOut"), pb.getInteger(0)), meOut);
+    }
+private:
+    MergeRuleGroup mRuleGroup;
+    bool mHasBoundary;
+};
+
+// A group can be built by BPEXfrmKernel iff every rule reads only the frozen kernel input.
+static bool bitXfrmEligible(const MergeRuleGroup & g) {
+    for (const auto & r : g.rules)
+        if (r.needsLiveId || r.needsFlush || !r.vetoIdB.empty()) return false;
+    return true;
+}
+
 // ─── Pipeline (merge-kernel design) ──────────────────────────────────────────
 // buildBPEPassPipeline — real BPE merge on the id stream.
 //   1. buildMergeRuleRanges() partitions merges into clean id-ranges (dependency-independent
@@ -1375,19 +3374,86 @@ private:
 //   Returns (matchEnd, vocabID=source). NOTE: emission is Stage-B debug —
 //   matchEnd = active (all ones) prints the id at EVERY byte, so stale interior
 //   ids of swallowed parts still show. Correct emission (consume) is Stage C.
+#ifdef __APPLE__
+// --vm-ring-buffers: the same layout as make_circular_buffer (m = 2 + hasUnderflow copies of
+// one size-byte region, back to back), built by mapping slot 0's pages over the other slots.
+static uint8_t * bpeVMRingBuffer(const size_t size, const size_t hasUnderflow) {
+    const size_t m = 2 + hasUnderflow;
+    const mach_port_t task = mach_task_self();
+    vm_address_t base = 0;
+    if (vm_allocate(task, &base, m * size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
+        report_fatal_error("--vm-ring-buffers: vm_allocate failed");
+    for (size_t i = 1; i < m; i++) {
+        vm_address_t target = base + i * size;
+        vm_prot_t cur, max;
+        if (vm_remap(task, &target, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, task, base,
+                     FALSE, &cur, &max, VM_INHERIT_DEFAULT) != KERN_SUCCESS || target != base + i * size)
+            report_fatal_error("--vm-ring-buffers: vm_remap failed");
+    }
+    return reinterpret_cast<uint8_t *>(base) + hasUnderflow * size;
+}
+#endif
+
+void bpeSetFrameworkHooks() {
+#ifdef __APPLE__
+    if (VMRingBuffers) kernel::CircularBufferAllocator = bpeVMRingBuffer;
+#else
+    if (VMRingBuffers) std::cerr << "[BPE] --vm-ring-buffers ignored: macOS only\n";
+#endif
+    if (MemSourceBlockCapacity) kernel::MemorySourceBlockCapacity = true;
+}
+
+// The --bpe-tail rule table (gTail) from the rules of groups `from` on; idBits: the width
+// of the ids reaching the tail. Returns the number of rules.
+static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRanges, size_t from, unsigned idBits) {
+    size_t numRules = 0;
+    for (size_t gi = from; gi < ruleRanges.size(); gi++) numRules += ruleRanges[gi].rules.size();
+    const unsigned bits = std::max<unsigned>(4, ceil_log2(4 * numRules + 1));
+    gTail.slots.assign(size_t(1) << bits, kTailEmpty);
+    gTailGeneration++;
+    std::fill(std::begin(gTail.left), std::end(gTail.left), 0);
+    std::fill(std::begin(gTail.right), std::end(gTail.right), 0);
+    gTail.mask = (1u << bits) - 1;
+    gTail.shift = 32 - bits;
+    gTail.idBits = idBits;
+    for (size_t gi = from; gi < ruleRanges.size(); gi++)
+        for (const auto & r : ruleRanges[gi].rules) {
+            const uint32_t key = (r.idA << 16) | r.idB;
+            uint32_t h = tailSlot(key);
+            while (gTail.slots[h] != kTailEmpty && uint32_t(gTail.slots[h] >> 16) != key)
+                h = (h + 1) & gTail.mask;
+            gTail.slots[h] = (uint64_t(key) << 16) | r.idAB;
+            gTail.left[r.idA >> 6] |= 1ull << (r.idA & 63);
+            gTail.right[r.idB >> 6] |= 1ull << (r.idB & 63);
+        }
+    return numRules;
+}
+
 BPEPassResult buildBPEPassPipeline(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
         const BPETokenizer & bpe,
         kernel::StreamSet * boundary) {
 
-    auto ruleRanges = bpe.buildMergeRuleRanges();
+    compactionMode();   // validate the compaction settings first: conflicts halt here
+    // --tail-from-bytes: every rule goes to the tail, which reads the bytes itself
+    // (buildBPEByteTailEmitter); no merge kernel and no id stream.
+    if (TailFromBytes && boundary) {
+        const auto all = bpe.buildMergeRuleRanges(BPETokenizer::kTailAllRules);
+        const size_t numRules = buildTailTable(all, 0, 8);
+        for (unsigned by = 0; by < 256; by++) gTailBase[by] = uint16_t(bpeBaseId(by));
+        gTailOpen.n = 0;
+        std::cerr << "[BPE] --tail-from-bytes: no merge kernels; the tail applies all "
+                  << numRules << " rules per pretoken\n";
+        return {nullptr, nullptr, boundary};
+    }
+    if (TailFromBytes)
+        std::cerr << "[BPE] --tail-from-bytes ignored: it needs a pretokenizer\n";
+    auto ruleRanges = bpe.buildMergeRuleRanges(boundary ? (unsigned) BPETail : 0u);
+    gStuckTables.clear();
 
-    // Inject a FilterByMask compaction after every K merge kernels and rewrite the
-    // rules' merge distances into the compacted (slot) frame. Default K = 40, so
-    // compactions land after kernel 40, 80, 120, ... (28 points for 1123 kernels).
-    unsigned compactEvery = CompactionBase;
-    if (const char * ce = std::getenv("BPE_COMPACT_EVERY")) compactEvery = (unsigned) std::atoi(ce);
+    // Inject FilterByMask compactions per --compaction and rewrite the rules' merge
+    // distances into the compacted (slot) frame.
     // BPE_INDEXED_SHIFT: replace each kernel's multi-bit source LookAheads with ONE
     // IndexedShiftBack(inPlayMask, source) → next-live id, and consume via inline
     // createIndexedAdvance.
@@ -1412,12 +3478,13 @@ BPEPassResult buildBPEPassPipeline(
     if (useIndexedShift)
         std::cerr << "[BPE] --indexed-shift: first " << indexedShiftN
                   << " kernels via IndexedShiftBack (1 shift/kernel)\n";
-    auto compactAfter = applyCompactionSchedule(ruleRanges, compactEvery);
+    auto compactAfter = applyCompactionSchedule(ruleRanges);
 
     // debug: dump the merge-range groups to stderr. BPE_GROUPS=1 for the
     // per-group [lo,hi) xN maxLen=M lines too (verbose, 1 line/kernel).
     std::cerr << "[BPE] " << ruleRanges.size() << " merge-range kernels ("
-              << (LevelPartition ? "ASAP level schedule" : "contiguous clean ranges") << ")\n";
+              << (isLevelPartition() ? "ASAP level schedule" : "contiguous clean ranges")
+              << (isBitTierPartition() ? ", per merge id bit width" : "") << ")\n";
     if (std::getenv("BPE_GROUPS")) {
         for (const auto & g : ruleRanges)
             std::cerr << "[" << g.lo << "," << g.hi << ") x" << g.rules.size()
@@ -1437,7 +3504,7 @@ BPEPassResult buildBPEPassPipeline(
             for (unsigned i = 0; i < g.rules.size() && i < cap; i++) {
                 const auto & r = g.rules[i];
                 std::cerr << "    idA=" << r.idA << " idB=" << r.idB
-                          << " lenB=" << r.lenB << " -> idAB=" << r.idAB
+                          << " lenA=" << r.lenA << " lenB=" << r.lenB << " -> idAB=" << r.idAB
                           << "  (" << bpe.decodeToken(r.idA) << "+" << bpe.decodeToken(r.idB)
                           << "->" << bpe.decodeToken(r.idAB) << ")\n";
             }
@@ -1471,10 +3538,53 @@ BPEPassResult buildBPEPassPipeline(
     // kernel→kernel; `inPlayMask` (seeded active = all ones) threads too, each kernel
     // clearing the token starts it consumes, so the final mask marks surviving starts.
     StreamSet * inPlayMask = active;
+    unsigned nXfrm = 0, nXfrmIneligible = 0;   // --bit-xfrm-limit kernel counts
+
+    // --retire-words: one entry per FilterByMask point from the first retiring one on, for
+    // the merge-back below.
+    //   prevMask: the mask that FilterByMask used: live token starts in Fp, the frame
+    //             before the point
+    //   keptPre:  the live starts the point kept, in Fp; idsPre: Fp's id stream. Both null
+    //             at a point that does not retire (--retire-points): the merge-back only
+    //             steps through it.
+    // A retiring point sends only 1-bit streams to the compacted frame (Fc): word starts
+    // and frozen marks are filtered by prevMask, BPERetireKernel decides keep there, and
+    // keep and the segment starts are spread back to Fp. The ids are then filtered once,
+    // by keptPre, instead of by prevMask and again by keep.
+    struct RetirePoint {
+        StreamSet * prevMask; StreamSet * keptPre; StreamSet * idsPre;
+    };
+    std::vector<RetirePoint> retirePoints;
+    const bool retire = RetireWords && boundary && compactionMode() != CompactionMode::None;
+    if (RetireWords && !retire)
+        std::cerr << "[BPE] --retire-words ignored: it needs --compaction and a pretokenizer\n";
+    // --retire-frozen: lastPartUse[id] = 1 + the last kernel with a rule that has id as its
+    // left or right part (absent = never a part). After kernel i, an id is frozen iff its
+    // entry is absent or <= i + 1.
+    std::unordered_map<unsigned, size_t> lastPartUse;
+    if (retire && (RetireFrozen || RetireStuck))
+        for (size_t gi = 0; gi < ruleRanges.size(); gi++)
+            for (const auto & r : ruleRanges[gi].rules)
+                for (unsigned id : {r.idA, r.idB}) {
+                    size_t & u = lastPartUse[id];
+                    u = std::max(u, gi + 1);
+                }
+    unsigned compactionPoint = 0, nRetiring = 0;
+    bool tailCut = false;   // --bpe-tail stopped the kernels; `boundary` is the segment starts
+    StreamSet * tailSegs = nullptr;   // --bpe-tail: the segment starts, in the emitter's frame
+    gTailOpen.n = 0;
+    if (BPETail && !boundary)
+        std::cerr << "[BPE] --bpe-tail ignored: it needs a pretokenizer\n";
+    auto retiresAt = [&](unsigned point) {
+        return RetirePoints.empty()
+            || std::find(RetirePoints.begin(), RetirePoints.end(), point) != RetirePoints.end();
+    };
+
     for (size_t i = 0; i < ruleRanges.size(); i++) {
         auto & g = ruleRanges[i];
         if (g.rules.empty()) continue;
-        unsigned output_bits = ceil_log2(g.hi+1);
+        if (g.tailOnly) report_fatal_error("BPE: the --bpe-tail rules were reached as a kernel");
+        unsigned output_bits = ceil_log2(g.hi);
         StreamSet * sOut  = P.CreateStreamSet(output_bits, 1);
         StreamSet * meOut = P.CreateStreamSet(1, 1);
         // 1. Make the copied/shifted stream
@@ -1482,18 +3592,47 @@ BPEPassResult buildBPEPassPipeline(
         // Only the first indexedShiftN kernels convert (isolation); rest stay byte-space.
         StreamSet * nextId = nullptr;
         if (useIndexedShift && i < indexedShiftN) {
+            // CAUTION: inPlayMask may be nullptr here (first kernel after a
+            // FilterByMask). Unlike BPEMergeKernel/BPEXfrmKernel below, IndexedShiftBack
+            // is a shared framework kernel (include/kernel/streamutils/stream_shift.h)
+            // and does NOT know how to build inPlayMask locally when it's missing --
+            // not reachable with the current --compaction schedule + --indexed-shift
+            // combination, but would need a framework-side change (opt-in, default off)
+            // to support, not just a bpe.cpp one.
             nextId = P.CreateStreamSet(source->getNumElements(), 1);
             P.CreateKernelCall<IndexedShiftBack>(inPlayMask, source, nextId);
         }
         // Grouped-if for kernels at/after the lower limit (later kernels); -1 = off.
-        // A --chain-partition rule no longer disqualifies the whole kernel: the
+        // A --partition=chain rule no longer disqualifies the whole kernel: the
         // grouped-if path now skips just the chain-involved rules and emits them
         // its chain roots' nests inside its chunk gates (see isChainRule / emitChain in
         // BPEMergeKernel::generatePabloMethod).
         const int groupLowerLimit = effIfGroupLowerLimit();
         bool grouped = (groupLowerLimit >= 0) && ((long) i >= (long) groupLowerLimit);
-        P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
-                                           g, hashRuleSet(g.rules), g.maxLen, grouped);
+        const bool xfrmWidth = output_bits <= BitXfrmLimit;
+        if (xfrmWidth && !nextId && bitXfrmEligible(g)) {
+            // inPlayMask may be nullptr here (first kernel after a FilterByMask) --
+            // BPEXfrmKernel builds it locally in that case (see hasStreamInput in its
+            // generatePabloMethod), same as BPEMergeKernel.
+            P.CreateKernelCall<BPEXfrmKernel>(source, inPlayMask, boundary, sOut, meOut,
+                                              g, hashRuleSet(g.rules), g.maxLen);
+            nXfrm++;
+        } else {
+            if (xfrmWidth) nXfrmIneligible++;
+            P.CreateKernelCall<BPEMergeKernel>(source, inPlayMask, boundary, nextId, sOut, meOut,
+                                               g, hashRuleSet(g.rules), g.maxLen, grouped);
+        }
+        if (MergeFrequencyStatistics) {
+            Kernel * k = P.CreateKernelCall<BPEMergeFrequencyKernel>(source, inPlayMask, meOut);
+            MergeFrequencyRecorder * rec =
+                mergeFrequencyRecorder(output_bits, std::make_integer_sequence<unsigned, 17>());
+            if (!rec) throw std::runtime_error("--merge-frequency-statistics: id width over 16 bits");
+            // one call name per kernel: the pipeline merges calls that share a name
+            P.CreateCall("bpe_record_merge_frequency_" + std::to_string(i), *rec,
+                         {k->getOutputScalarAt(0), k->getOutputScalarAt(1), k->getOutputScalarAt(2),
+                          k->getOutputScalarAt(3), k->getOutputScalarAt(4), k->getOutputScalarAt(5),
+                          k->getOutputScalarAt(6), k->getOutputScalarAt(7)});
+        }
         source     = sOut;
         inPlayMask = meOut;
 
@@ -1503,19 +3642,193 @@ BPEPassResult buildBPEPassPipeline(
         // the wrong token. The fresh mask is all-ones because every position that
         // survived the filter was, by construction, a live token start.
         if (!compactAfter[i]) continue;
+        ++compactionPoint;
+        if (BPETail && compactionPoint == BPETail && boundary) {
+            // --bpe-tail: no more kernels. The emitter finishes the rules of kernels i+1 on.
+            // The ids reaching the tail are below 2^output_bits.
+            const size_t numRules = buildTailTable(ruleRanges, i + 1, output_bits);
+            tailCut = true;
+            std::cerr << "[BPE] --bpe-tail: " << (i + 1) << " of " << ruleRanges.size()
+                      << " merge kernels built; the emitter applies the other " << numRules << " rules\n";
+            break;
+        }
+        const bool retireHere = retire && retiresAt(compactionPoint);
         StreamSet * sourceC = P.CreateStreamSet(output_bits, 1);
-        FilterByMask(P, inPlayMask, source, sourceC);
-        if (boundary) {
+        if (!retireHere) {
+            FilterByMask(P, inPlayMask, source, sourceC);
+            if (boundary) {
+                StreamSet * boundaryC = P.CreateStreamSet(1, 1);
+                FilterByMask(P, inPlayMask, boundary, boundaryC);
+                boundary = boundaryC;
+            }
+            if (retire && !retirePoints.empty())
+                retirePoints.push_back({inPlayMask, nullptr, nullptr});
+        } else {
+            // Drop the finished words too (see the RetirePoint comment above). Every
+            // surviving position stays a live token start, so the next kernel still builds
+            // its all-ones mask locally.
+            ++nRetiring;
+            auto frozenId = [&](unsigned id) {
+                const auto f = lastPartUse.find(id);
+                return f == lastPartUse.end() || f->second <= i + 1;
+            };
+            if (RetireStuck && compactionPoint >= RetireStuck) {
+                // --retire-stuck: the frozen-id bitmap and the pairs of every later rule.
+                StuckTables tab;
+                uint64_t hash = 1469598103934665603ull;
+                auto mix = [&](uint64_t v) { hash = (hash ^ v) * 1099511628211ull; };
+                tab.frozen.assign(65536 / 64, 0);
+                for (unsigned id = 0; id < 65536; id++)
+                    if (frozenId(id)) tab.frozen[id >> 6] |= 1ull << (id & 63);
+                for (uint64_t w : tab.frozen) mix(w);
+                tab.pairs.assign((size_t(1) << kStuckBloomBits) / 64, 0);
+                for (size_t gi = i + 1; gi < ruleRanges.size(); gi++)
+                    for (const auto & r : ruleRanges[gi].rules) {
+                        const uint32_t key = (r.idA << 16) | r.idB;
+                        const uint32_t h = stuckHash(key);
+                        tab.pairs[h >> 6] |= 1ull << (h & 63);
+                        mix(key);
+                    }
+                const unsigned slot = gStuckTables.size();
+                gStuckTables.push_back(std::move(tab));
+                StreamSet * keptPre = P.CreateStreamSet(1, 1);
+                StreamSet * segPre = P.CreateStreamSet(1, 1);
+                // P2S16Kernel's StreamSets form names the kernel by the input's shape; the
+                // single-set form names every width "p2s_16", like the emitter's 16-bit one.
+                StreamSet * ids16 = P.CreateStreamSet(1, 16);
+                StreamSets idSets{source};
+                P.CreateKernelCall<P2S16Kernel>(idSets, ids16);
+                Kernel * const sk = P.CreateKernelCall<BPEStuckKernel>(ids16, inPlayMask, boundary,
+                                                                      keptPre, segPre, slot, hash);
+                P.LinkFunction(sk, "bpe_retire_stuck", bpe_retire_stuck);
+                FilterByMask(P, keptPre, source, sourceC);
+                StreamSet * boundaryK = P.CreateStreamSet(1, 1);
+                FilterByMask(P, keptPre, segPre, boundaryK);
+                retirePoints.push_back({inPlayMask, keptPre, source});
+                boundary = boundaryK;
+                source = sourceC;
+                inPlayMask = nullptr;
+                continue;
+            }
+            // --retire-frozen: the frozen ids below 2^output_bits, as intervals, and their
+            // complement; the kernel tests whichever has fewer intervals.
+            UCD::UnicodeSet frozenSet, liveSet;
+            uint64_t setHash = 1469598103934665603ull;
+            bool negate = false;
+            if (RetireFrozen) {
+                const unsigned idLimit = 1u << output_bits;
+                unsigned runStart = 0;
+                bool runFrozen = true;
+                for (unsigned id = 0; id <= idLimit; id++) {
+                    const bool fz = (id < idLimit) && frozenId(id);
+                    if (id < idLimit && id > 0 && fz == runFrozen) continue;
+                    if (id > 0) {
+                        (runFrozen ? frozenSet : liveSet).insert_range(runStart, id - 1);
+                        setHash = (setHash ^ (((uint64_t) runStart << 1) | runFrozen)) * 1099511628211ull;
+                    }
+                    runStart = id;
+                    runFrozen = fz;
+                }
+                negate = liveSet.size() < frozenSet.size();
+            }
+            // 1-bit streams only to Fc: the word starts and (--retire-frozen) frozen marks.
             StreamSet * boundaryC = P.CreateStreamSet(1, 1);
             FilterByMask(P, inPlayMask, boundary, boundaryC);
-            boundary = boundaryC;
+            StreamSet * frozenC = nullptr;
+            StreamSet * segPre = boundary;   // segment starts in Fp: word starts, plus barriers
+            if (RetireFrozen) {
+                StreamSet * frozenPre = P.CreateStreamSet(1, 1);
+                segPre = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<BPEFrozenKernel>(source, inPlayMask, boundary,
+                                                    negate ? liveSet : frozenSet, negate, setHash,
+                                                    frozenPre, segPre);
+                frozenC = P.CreateStreamSet(1, 1);
+                FilterByMask(P, inPlayMask, frozenPre, frozenC);
+            }
+            StreamSet * keep = P.CreateStreamSet(1, 1);
+            P.CreateKernelCall<BPERetireKernel>(boundaryC, frozenC, keep);
+            // keep back to Fp, then one filter of the ids and segment starts.
+            StreamSet * keptPre = P.CreateStreamSet(1, 1);
+            SpreadByMask(P, inPlayMask, keep, keptPre);
+            FilterByMask(P, keptPre, source, sourceC);
+            StreamSet * boundaryK = P.CreateStreamSet(1, 1);
+            FilterByMask(P, keptPre, segPre, boundaryK);
+            retirePoints.push_back({inPlayMask, keptPre, source});
+            boundary = boundaryK;
         }
-        StreamSet * onesC = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<BPEOnesKernel>(sourceC, onesC);
         source     = sourceC;
-        inPlayMask = onesC;
+        // nullptr, not BPEOnesKernel: whichever kernel consumes this next builds the
+        // constant locally (see hasStreamInput in each kernel's generatePabloMethod)
+        // instead of reading it from a materialized stream -- one fewer kernel, and
+        // LLVM folds away every rule's now-trivial AND(eqId, inPlayMask) for free.
+        inPlayMask = nullptr;
     }
 
+    if (BitXfrmLimit > 0)
+        std::cerr << "[BPE] bit-xfrm-limit=" << BitXfrmLimit << ": " << nXfrm
+                  << " bit-transformation kernels" << (nXfrmIneligible
+                      ? ", " + std::to_string(nXfrmIneligible) + " kernels kept per-rule "
+                        "(chain/asymmetric-seam/veto rules or --indexed-shift)" : std::string())
+                  << "\n";
+    // --tail-direct-input: no merge-back to do, so skip the widen/pack/unpack copies.
+    if (TailDirectInput && tailCut && retirePoints.empty() && inPlayMask != nullptr) {
+        StreamSet * segs = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<BPETailSegKernel>(boundary, inPlayMask, segs);
+        return {inPlayMask, source, segs};
+    }
+    // The emitter packs exactly 16 id bits (P2S16Kernel); widen a narrower final stream.
+    if (source->getNumElements() < 16) {
+        StreamSet * source16 = P.CreateStreamSet(16, 1);
+        P.CreateKernelCall<BPEWidenKernel>(source, source16);
+        source = source16;
+    }
+    // --retire-words merge-back, last point first, one 17-stream spread per point: at a
+    // retiring point SpreadByMask(keptPre) puts the later survivors back at their positions
+    // in Fp and BPERetireMergeKernel ORs in the retired tokens, whose ids Fp still holds; at
+    // any other point SpreadByMask(prevMask) steps back to Fp, with 0 (no token) at the
+    // positions it had dropped as consumed. The emitter scans Fp of the first retiring point.
+    // Not MergeByMask(keep, later, retired): it counts keep both ways (PopcountOf and
+    // PopcountOfNot), and on some inputs the pipeline's two-way popcount kernel then
+    // over-counts the filtered frame: later kernels ran on up to 1.9x phantom positions
+    // (right output, 1.7x slower; val_4MB LF with --retire-points=5, 2026-10-15).
+    // --bpe-tail: the same, with the segment starts as an 18th stream (see kTailStreams).
+    if (!retirePoints.empty() || tailCut) {
+        const unsigned numStreams = tailCut ? kTailStreams : kRetireStreams;
+        StreamSet * cur = P.CreateStreamSet(numStreams, 1);
+        P.CreateKernelCall<BPERetirePackKernel>(source, inPlayMask, cur, tailCut ? boundary : nullptr);
+        for (size_t m = retirePoints.size(); m-- > 0; ) {
+            const RetirePoint & rp = retirePoints[m];
+            StreamSet * spread = P.CreateStreamSet(numStreams, 1);
+            SpreadByMask(P, rp.keptPre ? rp.keptPre : rp.prevMask, cur, spread);
+            cur = spread;
+            if (rp.keptPre) {
+                StreamSet * merged = P.CreateStreamSet(numStreams, 1);
+                P.CreateKernelCall<BPERetireMergeKernel>(cur, rp.idsPre, rp.prevMask, rp.keptPre, merged);
+                cur = merged;
+            }
+        }
+        StreamSet * ids = P.CreateStreamSet(16, 1);
+        StreamSet * starts = P.CreateStreamSet(1, 1);
+        tailSegs = tailCut ? P.CreateStreamSet(1, 1) : nullptr;
+        P.CreateKernelCall<BPERetireUnpackKernel>(cur, ids, starts, tailSegs);
+        source = ids;
+        inPlayMask = starts;
+        if (!retirePoints.empty()) {
+            std::cerr << "[BPE] --retire-words: retiring at " << nRetiring << " of "
+                      << compactionPoint << " compaction points";
+            if (!gStuckTables.empty())
+                std::cerr << " (" << gStuckTables.size() << " with --retire-stuck)";
+            std::cerr << "\n";
+        }
+    }
+    if (tailCut) return {inPlayMask, source, tailSegs};
+    if (BitFrequencyStatistics) {
+        Kernel * k = P.CreateKernelCall<BPEBitFrequencyKernel>(source, inPlayMask);
+        P.CreateCall("bpe_report_bit_frequency", bpe_report_bit_frequency,
+                     {k->getOutputScalarAt(0), k->getOutputScalarAt(1), k->getOutputScalarAt(2),
+                      k->getOutputScalarAt(3), k->getOutputScalarAt(4), k->getOutputScalarAt(5),
+                      k->getOutputScalarAt(6), k->getOutputScalarAt(7)});
+    }
     // inPlayMask marks surviving (outermost) token STARTS; vocabID = source (start-anchored,
     // id stamped at each token's start). Emission scans inPlayMask and reads source there.
     return {inPlayMask, source};
@@ -1692,7 +4005,7 @@ static unsigned rawByteLen(const std::string & s) {
 // the token-grid conflict test (interior sub-token byte overlaps are NOT counted —
 // interior bytes are not live token starts). Mirrors merge_analysis.py
 // clean_range_analysis (id-based merges_overlap). Rules stay idAB-ASC = rank-ASC.
-// levelPartition — ASAP level schedule of the rank-sorted rules (see --level-partition).
+// levelPartition — ASAP level schedule of the rank-sorted rules (see --partition=level).
 // Same two constraints as the clean-range walk, minus the contiguity requirement:
 //   dependency — a rule's parts must be stamped by a STRICTLY earlier kernel (T4), so
 //                level(r) > level(producer(idA)) and > level(producer(idB));
@@ -1710,11 +4023,14 @@ static unsigned rawByteLen(const std::string & s) {
 // NOTE `hi` is a WIDTH BOUND ONLY — under levels it is ~50k from the first kernel on, so
 // it is NOT an "everything below is already stamped" watermark; applyCompactionSchedule
 // asks kernelOf[] instead. `lo` is the level's lowest idAB — informational (debug dump).
-// --chain-veto bookkeeping, reported on the [BPE] stderr dump.
+// --partition=chain bookkeeping, reported on the [BPE] stderr dump.
 static unsigned gChainVetoRelaxed = 0;   // rules carrying a runtime veto
 static unsigned gChainVetoTerms   = 0;   // total competitor EQs those rules emit
 
-static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules) {
+static void keyCluster(std::vector<std::vector<MergeRule>> & levels, const PartitionContext & ctx);
+
+static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> & rules,
+                                                  const PartitionContext & ctx = PartitionContext()) {
     std::unordered_map<unsigned, unsigned> prodLevel;   // idAB -> level of the kernel that stamps i
     // token -> highest level using it as idA  
     // maxLeft[68] = 1      <- token e(68) was last used as a LEFT part in kernel 1
@@ -1733,7 +4049,7 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
             if (it != m.end() && it->second + 1u > lvl) lvl = it->second + 1u;
         };
         // sameOrAfter: like `after`, but level ITSELF is acceptable (not level+1). Used
-        // only for the --asymmetric-seam maxRight relaxation: the live-mask read makes
+        // only for the --partition=asymmetric maxRight relaxation: the live-mask read makes
         // same-kernel coexistence correct (rank order inside the kernel still runs the
         // consumer before the dependent), but the rule must never land STRICTLY EARLIER
         // than the token's consumer.
@@ -1742,27 +4058,27 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
             if (it != m.end() && it->second > lvl) lvl = it->second;
         };
         // dependency: idA must be stamped by a lower-OR-SAME kernel under
-        // --chain-partition (excluding self-merges, see ChainPartition's comment);
+        // --partition=chain (excluding self-merges, see the enum's comment);
         // otherwise (default) strictly a lower kernel, same as idB below.
-        if (ChainPartition && r.idA != r.idB) sameOrAfter(prodLevel, r.idA);
+        if (isChainPartition() && r.idA != r.idB) sameOrAfter(prodLevel, r.idA);
         else after(prodLevel, r.idA);
         after(prodLevel, r.idB);      // dependency: idB stamped by a lower kernel
-        // seam: an earlier rule consumed this token as its B. Under --asymmetric-seam,
-        // softened to same-level-or-after — the runtime gate now reads inPlayMask LIVE
-        // (see eqAstart), so a same-kernel earlier consume is visible without a level
-        // split, but the rule still can't jump to an EARLIER level than its consumer.
-        // EXCEPT self-merges (idA==idB): selfMergeFireStarts' run-parity math assumes a
-        // STATIC isX (see its call site comment — "no same-kernel rule can have
-        // consumed an X-run position... so frozen==live"). 
-        if (AsymmetricSeam && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
+        // seam: an earlier rule consumed this token as its B. Under --partition=asymmetric
+        // (or chain), softened to same-level-or-after — the runtime gate now reads
+        // inPlayMask LIVE (see eqAstart), so a same-kernel earlier consume is visible
+        // without a level split, but the rule still can't jump to an EARLIER level than
+        // its consumer. EXCEPT self-merges (idA==idB): selfMergeFireStarts' run-parity
+        // math assumes a STATIC isX (see its call site comment — "no same-kernel rule
+        // can have consumed an X-run position... so frozen==live").
+        if (isAsymmetricSeam() && r.idA != r.idB) sameOrAfter(maxRight, r.idA);
         else after(maxRight, r.idA);
-        // seam: an earlier rule claimed this token as its A. Without --chain-veto this is
-        // a hard split — the forward LookAhead reads frozen input only (T5), so a
+        // seam: an earlier rule claimed this token as its A. Without --partition=chain
+        // this is a hard split — the forward LookAhead reads frozen input only (T5), so a
         // same-kernel competitor's consume of idB is invisible. With it, the rule tests
-        // the competitor itself and stands down at runtime (see ChainVeto).
+        // the competitor itself and stands down at runtime (see the enum's comment).
         std::vector<unsigned> veto;
         bool relaxed = false;
-        if (ChainVeto && r.idA != r.idB) {
+        if (isChainVeto() && r.idA != r.idB) {
             unsigned lvlStrict = lvl, lvlRelaxed = lvl;      // lvl = level ignoring maxLeft
             auto ml = maxLeft.find(r.idB);
             if (ml != maxLeft.end()) {
@@ -1797,7 +4113,7 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         // needsLiveId: true exactly when idA's producer landed at THIS SAME level —
         // only possible via the sameOrAfter(prodLevel, r.idA) branch above (the plain
         // after() branch always forces a STRICTLY later level), so this is a no-op
-        // (always false) whenever --chain-partition is off.
+        // (always false) whenever --partition=chain is off.
         MergeRule rc = r;
         {
             auto it = prodLevel.find(r.idA);
@@ -1818,7 +4134,8 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
         keepMax(maxLeft,  r.idA, lvl);
         keepMax(maxRight, r.idB, lvl);
     }
-    // map the level-partitioned rules into MergeRuleGroups, 
+    if (KeyCluster) keyCluster(levels, ctx);
+    // map the level-partitioned rules into MergeRuleGroups,
     // each level will be a MergeRuleGroup, and compute the lo/hi/maxLen for each group.
     std::vector<MergeRuleGroup> ranges;
     unsigned runningMax = 255;                          // base alphabet occupies 0..255, the largest token ID we've seen so far is 255
@@ -1840,12 +4157,288 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
     return ranges;
 }
 
+// --key-cluster: re-level the ASAP schedule so rules sharing a gate key (idA's
+// --if-test-significant-bits=K key, as in the grouped path) land in ONE kernel and
+// share one gate test, instead of each kernel of a segment testing the same key.
+// A rule only moves LATER, and only inside its ASAP compaction segment (so every
+// stream length is unchanged). Every rank-order dependency and seam constraint of
+// levelPartition's strict pass is re-checked against the NEW levels while placing,
+// so the result is as valid as ASAP. Port of analysis/bpe_model/partition/
+// chain_sched.py key_cluster ('KC: chain, keep today nests'): model -38%
+// block-weighted gate tests, same 283 kernels, 0 fire mismatches vs HF.
+static void keyCluster(std::vector<std::vector<MergeRule>> & levels, const PartitionContext & ctx) {
+    const int lowerLimit = effIfGroupLowerLimit();
+    if (isAsymmetricSeam() || isChainVeto() || IfTestSignificantBits == 0 || lowerLimit < 0) {
+        std::cerr << "[BPE] --key-cluster ignored: needs grouping with --if-test-significant-bits, "
+                     "and --partition=level (not asymmetric or chain)\n";
+        return;
+    }
+    const bool chain = isChainPartition();
+    const unsigned NL = levels.size();
+    // Level l (1-based) is global kernel ctx.kernelOffset + l - 1, which is grouped iff that
+    // index >= lowerLimit, i.e. iff l > localLimit.
+    const long localLimit = (long) lowerLimit - (long) ctx.kernelOffset;
+    // Rules in rank order (= idAB order) with their ASAP level E0 (1-based).
+    std::vector<MergeRule> rules;
+    std::vector<unsigned> E0;
+    for (unsigned l = 0; l < NL; l++)
+        for (const auto & r : levels[l]) { rules.push_back(r); E0.push_back(l + 1); }
+    const size_t R = rules.size();
+    {
+        std::vector<size_t> ord(R);
+        for (size_t i = 0; i < R; i++) ord[i] = i;
+        std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return rules[a].idAB < rules[b].idAB; });
+        std::vector<MergeRule> rs; std::vector<unsigned> es;
+        for (size_t i : ord) { rs.push_back(rules[i]); es.push_back(E0[i]); }
+        rules.swap(rs); E0.swap(es);
+    }
+    // segEnd[l] = last level of l's compaction segment (same points applyCompactionSchedule
+    // picks, continuing the count from ctx; the last level always ends a segment).
+    std::vector<unsigned> segEnd(NL + 1, NL);
+    {
+        std::vector<unsigned> ends;
+        CompactionCounter counter = ctx.counter;
+        for (unsigned l = 1; l <= NL; l++)
+            if (counter.step()) ends.push_back(l);
+        for (unsigned l = 1; l <= NL; l++) {
+            auto it = std::lower_bound(ends.begin(), ends.end(), l);
+            segEnd[l] = (it != ends.end()) ? *it : NL;
+        }
+    }
+    using Map = std::unordered_map<unsigned, unsigned>;
+    auto get = [](const Map & m, unsigned k) -> unsigned { auto it = m.find(k); return it == m.end() ? 0 : it->second; };
+    auto keepMax = [](Map & m, unsigned k, unsigned v) { unsigned & s = m[k]; if (v > s) s = v; };
+    auto keepMin = [](Map & m, unsigned k, unsigned v) { auto it = m.find(k); if (it == m.end() || v < it->second) m[k] = v; };
+    auto bound = [](const Map & m, unsigned k, unsigned off, unsigned & u) {
+        auto it = m.find(k); if (it != m.end()) u = std::min(u, it->second - off);
+    };
+    // ALAP (reverse rank order): the latest level each rule can take with every later rule
+    // at or below ITS latest level, capped at the end of the rule's ASAP segment.
+    std::vector<unsigned> L(R);
+    {
+        Map minLns, minLs, minR;   // token -> min level of a later rule using it as A (non-self / self), as B
+        for (size_t p = R; p-- > 0; ) {
+            const MergeRule & r = rules[p];
+            unsigned u = segEnd[E0[p]];
+            bound(minLns, r.idAB, chain ? 0 : 1, u);   // a later rule built on idAB (nestable under chain)
+            bound(minLs,  r.idAB, 1, u);
+            bound(minR,   r.idAB, 1, u);
+            bound(minLns, r.idB, 1, u);                // seam: a later rule's A is our B
+            bound(minLs,  r.idB, 1, u);
+            bound(minR,   r.idA, 1, u);                // seam: a later rule's B is our A
+            L[p] = std::max(u, E0[p]);                 // ASAP is feasible, so u >= E0 (defensive)
+            keepMin(r.idA == r.idB ? minLs : minLns, r.idA, L[p]);
+            keepMin(minR, r.idB, L[p]);
+        }
+    }
+    // Rules left in place: the flat kernels (below the grouping limit) and today's nests.
+    std::vector<char> skip(R);
+    for (size_t q = 0; q < R; q++) skip[q] = ((long) E0[q] <= localLimit) || rules[q].needsLiveId;
+    // Per key: fewest levels that stab every rule's window [lo, L] (greedy by right end),
+    // each point pulled down to the latest left end it covers.
+    std::unordered_map<uint64_t, std::vector<size_t>> byKey;
+    for (size_t q = 0; q < R; q++) if (!skip[q]) byKey[gateKeyOf(rules[q].idA)].push_back(q);
+    auto stab = [&](const std::vector<unsigned> & lo) {
+        std::vector<unsigned> tgt = lo;
+        for (auto & kv : byKey) {
+            std::vector<size_t> idx = kv.second;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return L[a] < L[b]; });
+            while (!idx.empty()) {
+                const unsigned point = L[idx[0]];
+                unsigned p2 = 0;
+                std::vector<size_t> rest;
+                for (size_t v : idx) if (lo[v] <= point) p2 = std::max(p2, lo[v]); else rest.push_back(v);
+                for (size_t v : idx) if (lo[v] <= point) tgt[v] = p2;
+                idx.swap(rest);
+            }
+        }
+        return tgt;
+    };
+    // Rank-order placement: earliest legal level ep from the rules ALREADY placed, then
+    // the target clipped into [ep, L]. nested[q] = idA's producer sits at the same level.
+    const unsigned cap = effKeyClusterCap();
+    std::vector<unsigned> lv(R), cnt(NL + 2);
+    std::vector<char> nested(R);
+    auto realize = [&](const std::vector<unsigned> & tgt) {
+        Map prod, maxL, maxR;
+        std::fill(cnt.begin(), cnt.end(), 0);
+        for (size_t q = 0; q < R; q++) {
+            const MergeRule & r = rules[q];
+            const bool nestable = chain && r.idA != r.idB;
+            const unsigned ep = std::max({1u, get(prod, r.idA) + (nestable ? 0u : 1u), get(prod, r.idB) + 1u,
+                                          get(maxR, r.idA) + 1u, get(maxL, r.idB) + 1u});
+            unsigned l;
+            if (rules[q].needsLiveId && get(prod, r.idA) == ep) l = ep;   // keep today's nest
+            else l = std::max(ep, std::min(tgt[q], L[q]));
+            if (cap > 0 && l > ep && cnt[l] >= cap) l = ep;
+            if (l >= cnt.size()) cnt.resize(l + 1);
+            lv[q] = l; cnt[l]++;
+            nested[q] = nestable && get(prod, r.idA) == l;
+            prod[r.idAB] = l;
+            keepMax(maxL, r.idA, l);
+            keepMax(maxR, r.idB, l);
+        }
+    };
+    // Static gate count: distinct (level, key) over grouped, non-nested rules.
+    auto gates = [&](const std::vector<unsigned> & lvls, const std::vector<char> & nst) {
+        std::unordered_set<uint64_t> s;
+        for (size_t q = 0; q < R; q++)
+            if ((long) lvls[q] > localLimit && !nst[q]) s.insert((uint64_t(lvls[q]) << 40) ^ gateKeyOf(rules[q].idA));
+        return s.size();
+    };
+    std::vector<char> nested0(R);
+    for (size_t q = 0; q < R; q++) nested0[q] = rules[q].needsLiveId;
+    const size_t gates0 = gates(E0, nested0);
+    size_t bestGates = gates0;
+    std::vector<unsigned> best = E0;
+    std::vector<char> bestNested = nested0;
+    std::vector<unsigned> lo = E0;
+    for (int it = 0; it < 3; it++) {
+        realize(stab(lo));
+        const size_t g = gates(lv, nested);
+        if (g < bestGates) { bestGates = g; best = lv; bestNested = nested; }
+        // next round's windows: the lower bound from every predecessor except the
+        // chain parent (it can follow the rule), under the schedule just built
+        Map prod, maxL, maxR;
+        for (size_t q = 0; q < R; q++) {
+            const MergeRule & r = rules[q];
+            unsigned x = std::max({1u, get(prod, r.idB) + 1u, get(maxR, r.idA) + 1u, get(maxL, r.idB) + 1u});
+            if (!chain || r.idA == r.idB || r.idA < 256) x = std::max(x, get(prod, r.idA) + 1u);
+            lo[q] = std::max(x, E0[q]);
+            prod[r.idAB] = lv[q]; keepMax(maxL, r.idA, lv[q]); keepMax(maxR, r.idB, lv[q]);
+        }
+    }
+    size_t maxBefore = 0, maxAfter = 0;
+    for (auto & v : levels) maxBefore = std::max(maxBefore, v.size());
+    std::vector<std::vector<MergeRule>> out(*std::max_element(best.begin(), best.end()));
+    for (size_t q = 0; q < R; q++) {
+        MergeRule rc = rules[q];
+        rc.needsLiveId = bestNested[q];
+        out[best[q] - 1].push_back(rc);        // q runs in rank order → each level stays rank-sorted
+    }
+    for (auto & v : out) maxAfter = std::max(maxAfter, v.size());
+    std::cerr << "[BPE] --key-cluster: static gates " << gates0 << " -> " << bestGates
+              << ", max rules/kernel " << maxBefore << " -> " << maxAfter << "\n";
+    levels.swap(out);
+}
+
+// splitOversizedGroups — apply --max-merges-per-kernel (see MaxMergesPerKernel). Each
+// chunk keeps the group's `hi` (a valid width bound, and it keeps `hi` monotone), and its
+// rules stay in rank order. nSplit counts the groups split.
+//
+// Key-aware split (with --if-test-significant-bits, unless --partition=asymmetric or
+// --partition=chain): chunks are filled by gate key, so rules sharing a gate stay in one kernel
+// (what --key-cluster gathered is not scattered again). Any assignment of a group's rules
+// to consecutive kernels is valid when no two of them are rank-order dependent — no
+// dependency or seam lies inside a group — except a --partition=chain nest, whose child
+// reads its producer's stamp in the same kernel; a chain tree is therefore kept whole.
+// --partition=asymmetric and --partition=chain relate same-group rules by rank, so with either of
+// those the split stays in rank order.
+static std::vector<MergeRuleGroup> splitOversizedGroups(std::vector<MergeRuleGroup> groups,
+                                                        unsigned & nSplit) {
+    const size_t cap = MaxMergesPerKernel;
+    if (cap == 0) return groups;
+    const bool byKey = IfTestSignificantBits > 0 && !isAsymmetricSeam() && !isChainVeto();
+    std::vector<MergeRuleGroup> out;
+    for (auto & g : groups) {
+        const size_t n = g.rules.size();
+        if (n <= cap) { out.push_back(std::move(g)); continue; }
+        const size_t k = (n + cap - 1) / cap;
+        nSplit++;
+        std::vector<std::vector<MergeRule>> chunks;
+        if (!byKey) {
+            for (size_t c = 0; c < k; c++)
+                chunks.emplace_back(g.rules.begin() + n * c / k, g.rules.begin() + n * (c + 1) / k);
+        } else {
+            // units: a chain tree (root + every needsLiveId descendant) or a single rule,
+            // keyed by the root's gate key, in rank order of their roots
+            std::vector<std::vector<MergeRule>> units;
+            std::vector<uint64_t> unitKey;
+            std::unordered_map<unsigned, size_t> unitOf;   // idAB -> unit stamping it
+            for (const auto & r : g.rules) {
+                auto p = r.needsLiveId ? unitOf.find(r.idA) : unitOf.end();
+                size_t u;
+                if (p != unitOf.end()) u = p->second;
+                else { u = units.size(); units.emplace_back(); unitKey.push_back(gateKeyOf(r.idA)); }
+                units[u].push_back(r);
+                unitOf[r.idAB] = u;
+            }
+            std::vector<size_t> ord(units.size());
+            for (size_t u = 0; u < ord.size(); u++) ord[u] = u;
+            std::stable_sort(ord.begin(), ord.end(),
+                             [&](size_t a, size_t b) { return unitKey[a] < unitKey[b]; });
+            // Fill chunks toward the even size n/k, never splitting a key unless it alone
+            // exceeds the cap, and never exceeding the cap except for one oversized tree.
+            const size_t target = (n + k - 1) / k;
+            std::vector<MergeRule> cur;
+            auto close = [&] { if (!cur.empty()) { chunks.push_back(std::move(cur)); cur.clear(); } };
+            for (size_t i = 0; i < ord.size(); ) {
+                size_t j = i, keySize = 0;
+                for (; j < ord.size() && unitKey[ord[j]] == unitKey[ord[i]]; j++) keySize += units[ord[j]].size();
+                if (cur.size() + keySize > cap) close();
+                for (; i < j; i++) {
+                    const auto & unit = units[ord[i]];
+                    if (!cur.empty() && cur.size() + unit.size() > cap) close();
+                    cur.insert(cur.end(), unit.begin(), unit.end());
+                }
+                if (cur.size() >= target) close();
+            }
+            close();
+            for (auto & c : chunks)
+                std::sort(c.begin(), c.end(),
+                          [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
+        }
+        for (auto & c : chunks) {
+            MergeRuleGroup sub;
+            sub.hi = g.hi;
+            sub.rules = std::move(c);
+            sub.lo = sub.rules.front().idAB;
+            std::unordered_set<unsigned> stamped;   // idABs stamped in this chunk
+            for (auto & r : sub.rules) {
+                if (r.needsLiveId) r.needsLiveId = stamped.count(r.idA) != 0;
+                stamped.insert(r.idAB);
+                sub.maxLen = std::max(sub.maxLen, std::max(r.lenA + r.lenB, r.vetoOff));
+            }
+            out.push_back(std::move(sub));
+        }
+    }
+    return out;
+}
+
+// cleanRangePartition — the default contiguous clean-range walk: lo = first rule's
+// idAB (its parts always precede it, so it always fits); extend while the rule is
+// dependency-independent (idA<lo && idB<lo) AND token-adjacency-overlap-free vs every
+// rule already in the group. The first rule violating either starts the next range.
+static std::vector<MergeRuleGroup> cleanRangePartition(const std::vector<MergeRule> & rules) {
+    std::vector<MergeRuleGroup> ranges;
+    size_t i = 0, n = rules.size();
+    while (i < n) {
+        MergeRuleGroup g;
+        g.lo = rules[i].idAB;                        // new range starts here
+        while (i < n && rules[i].idA < g.lo && rules[i].idB < g.lo) {
+            const MergeRule & cur = rules[i];
+            bool overlap = false;                    // token-adjacency: right == left
+            for (const MergeRule & p : g.rules)
+                if (cur.idB == p.idA || p.idB == cur.idA) { overlap = true; break; }
+            if (overlap) break;
+            unsigned mergedLen = cur.lenA + cur.lenB;
+            if (mergedLen > g.maxLen) g.maxLen = mergedLen;
+            g.rules.push_back(cur);
+            ++i;
+        }
+        g.hi = (i < n) ? rules[i].idAB               // next range's lo
+                       : rules[n - 1].idAB + 1;      // last range: past top id
+        ranges.push_back(std::move(g));
+    }
+    return ranges;
+}
+
 // Mark rules whose gate needs a POST-write live mask: an earlier (lower-rank) rule
 // in the SAME group already consumed this rule's idA as its own idB. Under the
-// default symmetric seam test (clean-range and --level-partition without
-// --asymmetric-seam) this can never occur — the seam test forbids both overlap
-// directions within one group — so this pass is a no-op there. Under
-// --asymmetric-seam it is exactly the ONE relaxed direction (see AsymmetricSeam's
+// default symmetric seam test (--partition=clean or level) this can never occur —
+// the seam test forbids both overlap directions within one group — so this pass is
+// a no-op there. Under --partition=asymmetric (or chain) it is exactly the ONE
+// relaxed direction (see isAsymmetricSeam()'s
 // `sameOrAfter(maxRight, r.idA)` in levelPartition). --batch-writeback defers the
 // inPlayMask clear to the end of the kernel; a flagged rule must force a flush of
 // the pending write-back first, or its eqAstart sees the kernel's frozen entry
@@ -1853,14 +4446,15 @@ static std::vector<MergeRuleGroup> levelPartition(const std::vector<MergeRule> &
 static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
     unsigned totalFlags = 0, totalRules = 0, groupsWithFlags = 0;
     for (auto & g : groups) {
+        if (g.tailOnly) continue;
         std::unordered_set<unsigned> consumedAsB;   // idB values used by earlier rules in this group
         unsigned before = totalFlags;
         for (auto & r : g.rules) {
             // Two reasons a rule's gate must read the LIVE mask rather than the kernel's
             // frozen entry mask:
-            //  1. --asymmetric-seam: an earlier rule in this group consumed this rule's
+            //  1. --partition=asymmetric: an earlier rule in this group consumed this rule's
             //     idA as ITS idB, so idA is already gone and the gate has to see that.
-            //  2. --chain-veto: this rule now shares its kernel with the lower-rank rules
+            //  2. --partition=chain: this rule now shares its kernel with the lower-rank rules
             //     claiming its idB — that sharing is exactly what the veto buys. Those
             //     competitors fire first and clear starts around this rule's B, so the
             //     same staleness applies and the frozen entry mask would hide it.
@@ -1876,7 +4470,7 @@ static void tagFlushPoints(std::vector<MergeRuleGroup> & groups) {
                   << groups.size() << " groups\n";
 }
 
-std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
+std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges(unsigned tailPoint) const {
     // 1. Resolve every raw merge → MergeRule.
     std::vector<MergeRule> rules;
     unsigned skipped = 0;                            // parts not found in the vocab
@@ -1900,15 +4494,80 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
     std::sort(rules.begin(), rules.end(),
               [](const MergeRule & x, const MergeRule & y) { return x.idAB < y.idAB; });
 
-    // 3. Partition. --level-partition takes the ASAP level schedule (minimum kernel
-    //    count, same constraints); the default is the clean_range walk: lo = first
-    //    rule's idAB (its parts always precede it, so it always fits); extend while the
-    //    rule is dependency-independent (idA<lo && idB<lo) AND token-adjacency-overlap-
-    //    free vs every rule already in the group. The first rule violating either
-    //    starts the next range.
-    if (LevelPartition) {
-        auto groups = levelPartition(rules);
-        tagFlushPoints(groups);
+    // --tail-from-bytes: every rule goes to the tail, so nothing is partitioned.
+    if (tailPoint == kTailAllRules) {
+        MergeRuleGroup g;
+        g.rules = std::move(rules);
+        if (!g.rules.empty()) { g.lo = g.rules.front().idAB; g.hi = g.rules.back().idAB + 1; }
+        g.tailOnly = true;
+        return {std::move(g)};
+    }
+
+    // 3. Partition. --partition=level/asymmetric/chain/bit-tier take the ASAP level
+    //    schedule (minimum kernel count, same constraints); --partition=clean (default) is
+    //    the clean_range walk (see cleanRangePartition). --partition=bit-tier partitions
+    //    each idAB bit tier separately (via the ASAP level schedule) and concatenates the
+    //    tiers in order (see isBitTierPartition). Oversized groups are split right after
+    //    each partition (--max-merges-per-kernel), so a tier's context counts the kernels
+    //    that will really precede it.
+    unsigned nSplit = 0;
+    auto partition = [&](const std::vector<MergeRule> & rs, const PartitionContext & ctx) {
+        return splitOversizedGroups(isLevelPartition() ? levelPartition(rs, ctx) : cleanRangePartition(rs),
+                                    nSplit);
+    };
+    std::vector<MergeRuleGroup> groups;
+    if (isBitTierPartition()) {
+        // rules are rank-sorted, so each bit tier is a contiguous run of them
+        PartitionContext ctx;
+        size_t i = 0, n = rules.size();
+        // --bpe-tail under by-output-bits: the compaction points sit at the ends of tiers
+        // (applyCompactionSchedule), so the tail's cut is known as the tiers are partitioned.
+        // The tiers past it never become kernels: their rules go to the tail as one
+        // unpartitioned group, which saves partitioning ~50k rules (~75 ms per run) and
+        // leaves the kernels before the cut as they were.
+        const bool tailCutKnown = tailPoint > 0 && compactionMode() == CompactionMode::ByOutputBits;
+        unsigned points = 0, kernelsSoFar = 0;
+        while (i < n) {
+            if (tailCutKnown && points == tailPoint) {
+                MergeRuleGroup g;
+                g.rules.assign(rules.begin() + i, rules.end());
+                g.lo = g.rules.front().idAB;
+                g.hi = g.rules.back().idAB + 1;
+                g.tailOnly = true;
+                std::cerr << "[BPE] --bpe-tail: " << g.rules.size() << " rules past the cut left "
+                          "unpartitioned\n";
+                groups.push_back(std::move(g));
+                break;
+            }
+            const unsigned bits = ceil_log2(rules[i].idAB + 1);   // bit length of idAB
+            size_t j = i;
+            while (j < n && ceil_log2(rules[j].idAB + 1) == bits) ++j;
+            auto tier = partition(std::vector<MergeRule>(rules.begin() + i, rules.begin() + j), ctx);
+            std::cerr << "[BPE] merge id bits " << bits << ": " << (j - i) << " rules in "
+                      << tier.size() << " kernels\n";
+            // advance the context past this tier: the count steps once per kernel, as in
+            // applyCompactionSchedule
+            ctx.kernelOffset += tier.size();
+            for (size_t t = 0; t < tier.size(); t++) ctx.counter.step();
+            for (auto & g : tier) {
+                if (!g.rules.empty()) kernelsSoFar++;
+                groups.push_back(std::move(g));
+            }
+            // by-output-bits places a point after a tier's last kernel when a wider tier
+            // follows and at least --compact-base kernels have run (applyCompactionSchedule)
+            if (j < n && kernelsSoFar >= effCompactEvery()) points++;
+            i = j;
+        }
+    } else {
+        groups = partition(rules, PartitionContext());
+    }
+    if (nSplit)
+        std::cerr << "[BPE] max-merges-per-kernel=" << MaxMergesPerKernel << ": split " << nSplit
+                  << " kernels -> " << groups.size() << " kernels total"
+                  << (IfTestSignificantBits > 0 && !isAsymmetricSeam() && !isChainVeto() ? " (by gate key)" : "")
+                  << "\n";
+    tagFlushPoints(groups);
+    if (isLevelPartition()) {
         if (std::getenv("BPE_CHAIN_STATS")) {
             unsigned n = 0, total = 0;
             for (auto & g : groups) {
@@ -1918,33 +4577,10 @@ std::vector<MergeRuleGroup> BPETokenizer::buildMergeRuleRanges() const {
             std::cerr << "[BPE] chain-partition: " << n << "/" << total
                        << " rules flagged needsLiveId\n";
         }
-        if (ChainVeto)
+        if (isChainVeto())
             std::cerr << "[BPE] chain-veto: " << gChainVetoRelaxed
                       << " rules kept their level via a runtime veto ("
                       << gChainVetoTerms << " competitor EQs)\n";
-        return groups;
     }
-
-    std::vector<MergeRuleGroup> ranges;
-    size_t i = 0, n = rules.size();
-    while (i < n) {
-        MergeRuleGroup g;
-        g.lo = rules[i].idAB;                        // new range starts here
-        while (i < n && rules[i].idA < g.lo && rules[i].idB < g.lo) {
-            const MergeRule & cur = rules[i];
-            bool overlap = false;                    // token-adjacency: right == left
-            for (const MergeRule & p : g.rules)
-                if (cur.idB == p.idA || p.idB == cur.idA) { overlap = true; break; }
-            if (overlap) break;
-            unsigned mergedLen = cur.lenA + cur.lenB;
-            if (mergedLen > g.maxLen) g.maxLen = mergedLen;
-            g.rules.push_back(cur);
-            ++i;
-        }
-        g.hi = (i < n) ? rules[i].idAB               // next range's lo
-                       : rules[n - 1].idAB + 1;      // last range: past top id
-        ranges.push_back(std::move(g));
-    }
-    tagFlushPoints(ranges);
-    return ranges;
+    return groups;
 }

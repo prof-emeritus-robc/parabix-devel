@@ -27,7 +27,6 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.util
     toolchain
 )
 
@@ -41,13 +40,13 @@ SRC
     ztf-logic.cpp
     ztf-runs.cpp
 DEPS
-    grep
+    re.unicode
+    unicode.utf
     pablo.compiler
     kernel.basis
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.util
     toolchain
 )
 

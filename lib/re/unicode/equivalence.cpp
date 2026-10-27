@@ -25,21 +25,31 @@ using namespace re;
 using namespace llvm;
 namespace UCD {
     
-std::u32string getStringPiece(Seq * s, unsigned position) {
+// The string of the singleton Unicode CCs and Strings of s from position, and
+// the number of elements of s that it spans.
+std::u32string getStringPiece(Seq * s, unsigned position, unsigned & elements) {
     unsigned pos = position;
     unsigned size = s->size();
     std::u32string rslt;
-    while ((pos < size) && isa<CC>((*s)[pos])) {
-        CC * cc = cast<CC>((*s)[pos]);
-        if (cc->getAlphabet() != &cc::Unicode) return rslt;
-        if (cc->empty()) return rslt;
-        codepoint_t lo = lo_codepoint(cc->front());
-        codepoint_t hi = hi_codepoint(cc->back());
-        if (lo != hi) // not a singleton CC; end of the string piece.
-            return rslt;
-        rslt.push_back(lo);
+    while (pos < size) {
+        RE * const e = (*s)[pos];
+        if (String * const str = dyn_cast<String>(e)) {
+            // The singleton CCs of a String continue the string piece.
+            rslt.append(str->begin(), str->end());
+        } else if (CC * const cc = dyn_cast<CC>(e)) {
+            if (cc->empty()) break;
+            if (cc->getAlphabet() != &cc::Unicode) break;
+            codepoint_t lo = lo_codepoint(cc->front());
+            codepoint_t hi = hi_codepoint(cc->back());
+            if (lo != hi) // not a singleton CC; end of the string piece.
+                break;
+            rslt.push_back(lo);
+        } else {
+            break;
+        }
         pos++;
     }
+    elements = pos - position;
     return rslt;
 }
     
@@ -78,6 +88,7 @@ public:
         selfLC(sLCobj->GetReflexiveSet())
         {}
 protected:
+    re::RE * transformString(re::String * s) override;
     re::RE * transformSeq(re::Seq * seq) override;
     re::RE * transformGroup(re::Group * g) override;
     void find_precomposed(std::u32string & s, std::vector<unsigned> & sss,
@@ -123,6 +134,19 @@ RE * ClusterMatchTransformer::transformGroup(Group * g) {
     return makeGroup(mode, t, sense);
 }
 
+// A String is the Seq of its singleton CCs: a string piece, unless it is of
+// one CC (as a Seq of one CC is that CC), which is unchanged.
+RE * ClusterMatchTransformer::transformString(String * s) {
+    if (s->size() <= 1) return s;
+    const std::u32string stringPiece = s->getString();
+    RE * e = addEquivalents(stringPiece);
+    if (Seq * t = dyn_cast<Seq>(e)) {
+        unsigned telements;
+        if ((t->size() == stringPiece.size()) && (getStringPiece(t, 0, telements) == stringPiece)) return s;
+    }
+    return e;
+}
+
 RE * ClusterMatchTransformer::transformSeq(Seq * seq) {
     // find and process all string pieces
     unsigned size = seq->size();
@@ -131,15 +155,17 @@ RE * ClusterMatchTransformer::transformSeq(Seq * seq) {
     unsigned i = 0;
     bool changed = false;
     while (i < size) {
-        std::u32string stringPiece = getStringPiece(seq, i);
+        unsigned elements;
+        std::u32string stringPiece = getStringPiece(seq, i, elements);
         if (stringPiece.size() > 0) {
             RE * e = addEquivalents(stringPiece);
             if (Seq * t = dyn_cast<Seq>(e)) {
                 unsigned tsize = t->size();
-                if ((tsize != size) || (getStringPiece(t,0) != stringPiece)) changed = true;
+                unsigned telements;
+                if ((tsize != size) || (getStringPiece(t, 0, telements) != stringPiece)) changed = true;
             } else changed = true;
             list.push_back(addEquivalents(stringPiece));
-            i += stringPiece.size();
+            i += elements;
         } else {
             RE * r = (*seq)[i];
             RE * t = transform(r);
@@ -452,6 +478,7 @@ public:
     EquivalentCodepointsTransformer(EquivalenceOptions opt = Canonical);
 protected:
     re::RE * transformCC(re::CC * cc) override;
+    re::RE * transformString(re::String * s) override;
     re::RE * transformGroup(re::Group * g) override;
 private:
     EquivalenceOptions mOptions;
@@ -497,6 +524,10 @@ RE * EquivalentCodepointsTransformer::transformGroup(Group * g) {
 
 RE * EquivalentCodepointsTransformer::transformCC(CC * cc) {
     return add_equivalent_codepoints(cc, mOptions);
+}
+
+RE * EquivalentCodepointsTransformer::transformString(String * s) {
+    return transformStringAsSeq(s);
 }
 
 RE * addEquivalentCodepoints(RE * re, UCD::EquivalenceOptions eqopt) {

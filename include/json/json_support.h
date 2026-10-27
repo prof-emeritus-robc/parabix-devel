@@ -5,9 +5,8 @@
  */
 #pragma once
 
-#include <kernel/core/kernel_builder.h>
-#include <kernel/pipeline/program_builder.h>
 
+namespace kernel { class PipelineBuilder; class StreamSet; }
 using PipelineBuilder = kernel::PipelineBuilder;
 using StreamSet = kernel::StreamSet;
 

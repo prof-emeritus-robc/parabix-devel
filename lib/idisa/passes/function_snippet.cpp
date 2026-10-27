@@ -32,6 +32,7 @@
 #include <llvm/CodeGen/TargetRegisterInfo.h>
 #include <llvm/CodeGen/MachineFrameInfo.h>
 #include <llvm/Support/CommandLine.h>
+#include <toolchain/toolchain.h>
 #include <queue>
 
 #define BEGIN_SCOPED_REGION {

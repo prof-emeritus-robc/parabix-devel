@@ -548,50 +548,71 @@ UnicodeSet UnicodeSet::operator^(const UnicodeSet & other) const noexcept {
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief compare
+ *
+ * A total order on sets, consistent with set equality: the sets are compared
+ * as sequences of quads.  The representation of a set is not necessarily
+ * canonical (adjacent runs may have the same type and Mixed quads may be
+ * empty or full), so the quads represented are compared, walking both run
+ * lists together; Empty and Full runs compare as all-zero and all-one quads.
+ ** ------------------------------------------------------------------------------------------------------------- */
+int UnicodeSet::compare(const UnicodeSet & other) const noexcept {
+    const run_t * ra = mRuns;
+    const run_t * const raEnd = mRuns + mRunLength;
+    const run_t * rb = other.mRuns;
+    const run_t * const rbEnd = other.mRuns + other.mRunLength;
+    const bitquad_t * qa = mQuads;
+    const bitquad_t * qb = other.mQuads;
+    unsigned remainingA = 0;
+    unsigned remainingB = 0;
+    for (;;) {
+        while (remainingA == 0 && ra != raEnd) {
+            remainingA = lengthOf(*ra++);
+        }
+        while (remainingB == 0 && rb != rbEnd) {
+            remainingB = lengthOf(*rb++);
+        }
+        if (remainingA == 0 || remainingB == 0) {
+            // Both sets represent all quads, so both end together.
+            return (remainingA == remainingB) ? 0 : ((remainingA < remainingB) ? -1 : 1);
+        }
+        const run_type_t ta = typeOf(*(ra - 1));
+        const run_type_t tb = typeOf(*(rb - 1));
+        const unsigned n = std::min(remainingA, remainingB);
+        if (ta != Mixed && tb != Mixed) {
+            if (ta != tb) {
+                return (ta == Empty) ? -1 : 1;
+            }
+        } else {
+            for (unsigned i = 0; i < n; ++i) {
+                const bitquad_t a = (ta == Mixed) ? *qa++ : ((ta == Full) ? FULL_QUAD_MASK : 0);
+                const bitquad_t b = (tb == Mixed) ? *qb++ : ((tb == Full) ? FULL_QUAD_MASK : 0);
+                if (a != b) {
+                    return (a < b) ? -1 : 1;
+                }
+            }
+        }
+        remainingA -= n;
+        remainingB -= n;
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief equality
+ *
+ * Set equality.
  ** ------------------------------------------------------------------------------------------------------------- */
 bool UnicodeSet::operator==(const UnicodeSet & other) const noexcept {
-    if (LLVM_LIKELY(mRunLength != other.mRunLength || mQuadLength != other.mQuadLength)) {
-        return false;
-    }
-    for (unsigned i = 0; i < mQuadLength; ++i) {
-        if (mQuads[i] != other.mQuads[i]) {
-            return false;
-        }
-    }
-    for (unsigned i = 0; i < mRunLength; ++i) {
-        if (mRuns[i] != other.mRuns[i]) {
-            return false;
-        }
-    }
-    return true;
+    return compare(other) == 0;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief less operator
+ *
+ * Proper subset.  This is a partial order: use compare for a total order.
  ** ------------------------------------------------------------------------------------------------------------- */
 bool UnicodeSet::operator<(const UnicodeSet & other) const noexcept {
-    if (LLVM_LIKELY(mRunLength != other.mRunLength)) {
-        return mRunLength < other.mRunLength;
-    } else if (LLVM_LIKELY(mQuadLength != other.mQuadLength)) {
-        return (mQuadLength < other.mQuadLength);
-    } else { // equal run and quad lengths; test their individual values
-        for (unsigned i = 0; i < mRunLength; ++i) {
-            if (mRuns[i] < other.mRuns[i]) {
-                return true;
-            } else if (mRuns[i] > other.mRuns[i]) {
-                return false;
-            }
-        }
-        for (unsigned i = 0; i < mQuadLength; ++i) {
-            if (mQuads[i] < other.mQuads[i]) {
-                return true;
-            } else if (mQuads[i] > other.mQuads[i]) {
-                return false;
-            }
-        }
-        return false;
-    }
+    return subset(other) && !(*this == other);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -1030,12 +1051,15 @@ bool UnicodeSet::subset(const UnicodeSet & other) const noexcept {
         if (i1.type() == Empty || i2.type() == Full) {
             i1 += n;
             i2 += n;
-        } else if (i1.type() == Full || i2.type() == Empty) {
+        } else if (i1.type() != Mixed && i2.type() != Mixed) {
+            // i1 is Full and i2 is Empty.
             return false;
-        } else { //both Mixed
-            assert (i1.type() == Mixed && i2.type() == Mixed);
+        } else {
+            // Compare the quads (a Mixed quad may be empty or full).
             for (; n; --n, ++i1, ++i2) {
-                if (i1.quad() &~ i2.quad()) return false;
+                const bitquad_t q1 = (i1.type() == Mixed) ? i1.quad() : FULL_QUAD_MASK;
+                const bitquad_t q2 = (i2.type() == Mixed) ? i2.quad() : 0;
+                if (q1 &~ q2) return false;
             }
         }
     }

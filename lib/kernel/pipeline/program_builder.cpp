@@ -57,7 +57,7 @@ Kernel * ProgramBuilder::makeKernel() {
 
 ProgramBuilder::ProgramBuilder(BaseDriver & driver, PipelineKernel * const kernel)
 : PipelineBuilder(driver, kernel) {
-
+    mIsProgram = true;
 }
 
 }

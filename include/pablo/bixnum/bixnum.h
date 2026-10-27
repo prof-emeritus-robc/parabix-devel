@@ -5,7 +5,6 @@
 
 #pragma once
 
-#include <pablo/ast/pabloAST.h>
 #include <pablo/ast/builder.hpp>
 
 namespace pablo {

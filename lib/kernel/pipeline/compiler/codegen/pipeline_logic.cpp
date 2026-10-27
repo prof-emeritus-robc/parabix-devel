@@ -117,6 +117,14 @@ void PipelineCompiler::addPipelineKernelProperties(KernelBuilder & b) {
 
         if (numOfPhases != 2) {
             mTarget->addThreadLocalScalar(sizeTy, PHASE_ITERATION_SEGMENT_LIMIT_STEP + std::to_string(phase), getCacheLineGroupId(firstKernelInCurrentPhase));
+            SmallVector<size_t, 16> claimed;
+            if (getClaimedEarlierPhaseStreamSets(phase, claimed)) {
+                mTarget->addInternalScalar(sizeTy, PHASE_CLAIMED_ITEM_TOTAL + std::to_string(phase), getCacheLineGroupId(firstKernelInCurrentPhase));
+                mTarget->addInternalScalar(sizeTy, PHASE_CLAIMED_SEGMENT_NUMBER + std::to_string(phase), getCacheLineGroupId(firstKernelInCurrentPhase));
+                for (const auto streamSet : claimed) {
+                    mTarget->addThreadLocalScalar(sizeTy, PHASE_CLAIMED_ITEM_COUNT_PREFIX + std::to_string(phase) + "_" + std::to_string(streamSet), 0);
+                }
+            }
         }
 
         for (auto i = firstKernelInCurrentPhase; i < oneAfterLastKernelInCurrentPhase; ++i) {
@@ -322,6 +330,8 @@ void PipelineCompiler::generateInitializeMethod(KernelBuilder & b) {
 
     initializeScalarValues(b);
 
+    initializeStaticRepeatingStreamSets(b);
+
     initializeKernelAssertions(b);
 
     Constant * const unterminated = getTerminationSignal(b, TerminationSignal::None);
@@ -503,7 +513,7 @@ void PipelineCompiler::generateInitializeThreadLocalMethod(KernelBuilder & b) {
 
         if (numOfPhases != 2) {
             // TODO: is there a way to predict better initial phase segment limits?
-            b.setScalarField(PHASE_ITERATION_SEGMENT_LIMIT_STEP + std::to_string(phase), b.getSize(DEFAULT_INITIAL_PHASE_SEGMENT_LIMIT));
+            b.setScalarField(PHASE_ITERATION_SEGMENT_LIMIT_STEP + std::to_string(phase), b.getSize(codegen::PhaseSegmentLimit));
         }
 
         for (auto i = firstKernelInCurrentPhase; i < oneAfterLastKernelInCurrentPhase; ++i) {

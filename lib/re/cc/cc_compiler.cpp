@@ -458,13 +458,6 @@ PabloAST * Parabix_Ternary_CC_Compiler::LE_Range(const unsigned N, const unsigne
 }
 
 template<typename PabloBlockOrBuilder>
-PabloAST * Parabix_Ternary_CC_Compiler::make_octet_range(const unsigned mask, const unsigned basis_idx, PabloBlockOrBuilder & pb) {
-    if (mask == 0xFF) return pb.createOnes();
-    assert(mEncodingBits > basis_idx + 2);
-    return pb.createTernary(pb.getInteger(mask), getBasisVar(basis_idx + 2, pb), getBasisVar(basis_idx + 1, pb), getBasisVar(basis_idx, pb));
-}
-
-template<typename PabloBlockOrBuilder>
 PabloAST * Parabix_Ternary_CC_Compiler::make_octets_expr(const std::vector<octet_pair_t> octets, PabloBlockOrBuilder & pb) {
     std::vector<PabloAST *> terms;
     for (auto octet : octets) {

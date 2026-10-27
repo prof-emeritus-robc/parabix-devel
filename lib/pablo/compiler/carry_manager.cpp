@@ -9,6 +9,7 @@
 #include <pablo/ast/codegenstate.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/Analysis/ConstantFolding.h>
 #include <llvm/Transforms/Utils/Local.h>
 #include <pablo/ast/branch.h>
@@ -88,6 +89,22 @@ enum NonCarryCollapsingMode {
 
 #define LONG_ADVANCE_BREAKPOINT 64
 
+bool isDynamicallyAllocatedType(const Type * const ty);
+
+static bool containsDynamicallyAllocatedTypeRecursively(const Type * const ty) {
+    if (isDynamicallyAllocatedType(ty)) {
+        return true;
+    }
+    if (isa<StructType>(ty) || isa<ArrayType>(ty)) {
+        for (unsigned i = 0; i < ty->getNumContainedTypes(); ++i) {
+            if (containsDynamicallyAllocatedTypeRecursively(ty->getContainedType(i))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief initializeCarryData
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -120,18 +137,41 @@ void CarryManager::initializeCarryData(kernel::KernelBuilder & b, PabloKernel * 
     mCarryFrameType = analyse(b, entryScope);
 
 
+    if (LLVM_UNLIKELY(kernel->hasAttribute(kernel::Attribute::KindId::ProvisionalLookAheadStride))) {
+        // The provisional stride saves and restores the kernel state by copying it; carry data
+        // allocated on the heap would be modified in place and could not be restored.
+        if (LLVM_UNLIKELY(containsDynamicallyAllocatedTypeRecursively(mCarryFrameType))) {
+            report_fatal_error(StringRef(kernel->getName() + ": ProvisionalLookAheadStride cannot be used "
+                                         "with variable-length While loop carry data"));
+        }
+    }
+
+    // A kernel that rebuilds its carries starts each segment with zeroed carries, which
+    // a non-persistent scalar provides: it is allocated and zeroed for each call.  The
+    // CarryExtent check has already excluded loops and indexed advances.
+    const auto rebuild = kernel->hasLocalCarries();
+    assert (!rebuild || (!mHasLoop && mIndexedLongAdvanceTotal == 0));
+
     if (LLVM_UNLIKELY(mCarryFrameType->isEmptyTy())) {
         mCarryFrameType = nullptr;
     } else {
         assert (b.getTypeSize(b.getModule()->getDataLayout(), mCarryFrameType) > 0);
-        kernel->addInternalScalar(mCarryFrameType, "carries");
+        if (LLVM_UNLIKELY(rebuild)) {
+            kernel->addNonPersistentScalar(mCarryFrameType, "carries");
+        } else {
+            kernel->addInternalScalar(mCarryFrameType, "carries");
+        }
     }
 
     if (mHasLoop) {
         kernel->addInternalScalar(b.getInt32Ty(), "selector");
     }
     if (mHasLongAdvance) {
-        kernel->addInternalScalar(b.getInt32Ty(), "CarryBlockIndex");
+        if (LLVM_UNLIKELY(rebuild)) {
+            kernel->addNonPersistentScalar(b.getInt32Ty(), "CarryBlockIndex");
+        } else {
+            kernel->addInternalScalar(b.getInt32Ty(), "CarryBlockIndex");
+        }
     }
     for (unsigned i = 0; i < mIndexedLongAdvanceTotal; i++) {
         kernel->addInternalScalar(b.getSizeTy(), "IndexedAdvancePosition" + std::to_string(i));
@@ -314,7 +354,13 @@ Value * CarryManager::generateEntrySummaryTest(kernel::KernelBuilder & b, Value 
         mNextSummaryTest = nullptr;
     }
     if (LLVM_LIKELY(condition->getType() == b.getBitBlockType())) {
-        condition = b.bitblock_any(condition);
+        if (LLVM_UNLIKELY(mKernel->reduceIfTest())) {
+            // nonzero iff some 32-bit lane is nonzero (see PabloKernel::reduceIfTest)
+            Value * const maxLane = b.CreateUnaryIntrinsic(llvm::Intrinsic::vector_reduce_umax, b.fwCast(32, condition));
+            condition = b.CreateICmpNE(maxLane, ConstantInt::getNullValue(maxLane->getType()));
+        } else {
+            condition = b.bitblock_any(condition);
+        }
     }
     assert ("summary test was not consumed" && (mNextSummaryTest == nullptr));
     return condition;

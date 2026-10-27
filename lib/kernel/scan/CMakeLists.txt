@@ -15,4 +15,7 @@ SRC
     scanmatchgen.cpp
 DEPS
     kernel.pipeline
+    idisa
+    kernel.core
+    toolchain
 )

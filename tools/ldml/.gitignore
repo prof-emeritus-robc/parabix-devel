@@ -1,0 +1,3 @@
+# Output of tconv_coverage.py (--out tools/ldml/tconv-coverage): plans, test inputs and
+# the coverage results, regenerated or updated incrementally (--update).
+tconv-coverage/

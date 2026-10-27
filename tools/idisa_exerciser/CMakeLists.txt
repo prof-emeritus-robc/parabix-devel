@@ -14,7 +14,6 @@ SRC
     idisa_operations.cpp
     safe_ops.cpp
 DEPS
-    kernel.basis
     kernel.io
     kernel.pipeline
     kernel.util

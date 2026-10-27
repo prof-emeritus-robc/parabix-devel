@@ -13,6 +13,7 @@
 #include <idisa/idisa_builder.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/pipeline_builder.h>
+#include <kernel/unicode/utf8_support.h>
 #include <kernel/core/callback.h>
 #include <llvm/Support/raw_ostream.h>
 
@@ -48,7 +49,7 @@ std::string NullModeAnnotation(NullCharMode nullMode) {
 
 Bindings makeOutputBreakBindings(UnterminatedLineAtEOF eofMode, StreamSet * lb) {
     if (eofMode == UnterminatedLineAtEOF::Add1) {
-        return {Binding{"LB", lb, FixedRate(), Add1()}};
+        return {Binding{"LB", lb, FixedRate(), AddCarry()}};
     }
     return {Binding{"LB", lb}};
 }
@@ -156,15 +157,16 @@ UnicodeLinesKernelBuilder::UnicodeLinesKernelBuilder(LLVMTypeSystemInterface & t
                                                      UnterminatedLineAtEOF eofMode,
                                                      NullCharMode nullMode,
                                                      Scalar * signalNullObject)
-: PabloKernel(ts, "UnicodeLB" + sourceShape(Basis) + EOF_annotation(eofMode) + NullModeAnnotation(nullMode),
-              {Binding{"basis", Basis},
+: PabloKernel(ts, "UnicodeLB" + sourceShape(Basis) + EOF_annotation(eofMode) + NullModeAnnotation(nullMode) +
+                  (codegen::UTF8Errors == codegen::UTF8ErrorMode::DropBadInput ? "_drop" : ""),
+              {Binding{"basis", Basis, FixedRate(), LookAhead(1)},
                   Binding{"lf", LF, FixedRate(), LookAhead(1)}},
               makeOutputBreakBindings(eofMode, LineEnds),
               makeInputScalarBindings(signalNullObject), {}),
 mEOFmode(eofMode),
 mNullMode(nullMode) {
     if (eofMode == UnterminatedLineAtEOF::Add1) {
-        getOutputStreamSetBindings().emplace_back("u8index", u8index, FixedRate(), Add1());
+        getOutputStreamSetBindings().emplace_back("u8index", u8index, FixedRate(), AddCarry());
     } else {
         getOutputStreamSetBindings().emplace_back("u8index", u8index);
     }
@@ -274,13 +276,23 @@ void UnicodeLinesKernelBuilder::generatePabloMethod() {
     pb.createAssign(nonFinal, pb.createOr(nonFinal, CR_before_LF));
 
     Var * const u8index = getOutputStreamVar("u8index");
-    PabloAST * u8final = pb.createNot(nonFinal);
-    pb.createAssign(pb.createExtract(u8index, pb.getInteger(0)), u8final);
+    // The characters (see UTF8_index): each well-formed character and, unless
+    // ill-formed input is dropped, each maximal ill-formed subpart, at its
+    // final byte, other than the CR of a CR LF.
+    const UTF8_Structure u = UTF8_structure(pb, getInputStreamSet("basis"));
+    PabloAST * u8final = u.validFinal;
+    if (codegen::UTF8Errors != codegen::UTF8ErrorMode::DropBadInput) {
+        u8final = pb.createOr(u8final, u.errorFinal);
+    }
+    u8final = pb.createAnd(u8final, pb.createNot(CR_before_LF));
     PabloAST * notLB = pb.createNot(LineBreak);
     if (mEOFmode == UnterminatedLineAtEOF::Add1) {
         PabloAST * unterminatedLineAtEOF = pb.createAtEOF(pb.createAdvance(notLB, 1), "unterminatedLineAtEOF");
         pb.createAssign(LineBreak, pb.createOr(LineBreak, unterminatedLineAtEOF));
+        // LB and u8index are both AddCarry outputs: u8index must be extended exactly when LB is.
+        u8final = pb.createOr(pb.createInFile(u8final), unterminatedLineAtEOF);
     }
+    pb.createAssign(pb.createExtract(u8index, pb.getInteger(0)), u8final);
     pb.createAssign(pb.createExtract(getOutputStreamVar("LB"), pb.getInteger(0)), LineBreak);
 }
 
@@ -316,7 +328,7 @@ void NullDelimiterKernel::generatePabloMethod() {
     if (getInputStreamSet("Source").size() == 1) {
         ccc = std::make_unique<cc::Direct_CC_Compiler>(pb.createExtract(getInput(0), pb.getInteger(0)));
     } else {
-        ccc = std::make_unique<cc::Parabix_CC_Compiler_Builder>(getInputStreamSet("basis"));
+        ccc = std::make_unique<cc::Parabix_CC_Compiler_Builder>(getInputStreamSet("Source"));
     }
     PabloAST * NUL = ccc->compileCC("NUL", makeByte(0x0), pb);
     if (mEOFmode == UnterminatedLineAtEOF::Add1) {

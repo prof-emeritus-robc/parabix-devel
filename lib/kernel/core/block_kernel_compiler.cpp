@@ -29,6 +29,16 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
 
     const auto hasFinalBlock = true; // mTarget->requiresExplicitPartialFinalStride();
 
+    const auto hasProvisionalStride = mTarget->hasAttribute(Attribute::KindId::ProvisionalLookAheadStride);
+    if (LLVM_UNLIKELY(hasProvisionalStride)) {
+        validateProvisionalLookAheadStride(b);
+    }
+
+    const auto rebuildStrides = TARGET->getCarryRebuildStrides();
+    if (LLVM_UNLIKELY(rebuildStrides > 0)) {
+        writeCarryRebuild(b, rebuildStrides);
+    }
+
     BasicBlock * const entryBlock = b.GetInsertBlock();
     mStrideLoopBody = b.CreateBasicBlock(getName() + "_strideLoopBody");
 
@@ -37,10 +47,19 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
     BasicBlock * const stridesDone = b.CreateBasicBlock(getName() + "_stridesDone");
     BasicBlock * doFinalBlock = nullptr;
     BasicBlock * segmentDone = nullptr;
+    // A kernel with a provisional stride continues to checkProvisional, rather than
+    // segmentDone, after its full strides in a non-final segment.
+    BasicBlock * checkProvisional = nullptr;
+    BasicBlock * stridesExit = nullptr;
 
     if (hasFinalBlock) {
         doFinalBlock = b.CreateBasicBlock(getName() + "_doFinalBlock");
         segmentDone = b.CreateBasicBlock(getName() + "_segmentDone");
+        stridesExit = segmentDone;
+        if (LLVM_UNLIKELY(hasProvisionalStride)) {
+            checkProvisional = b.CreateBasicBlock(getName() + "_checkProvisional");
+            stridesExit = checkProvisional;
+        }
         b.CreateUnlikelyCondBr(mIsFinal, doFinalBlock, mStrideLoopBody);
     } else {
         b.CreateBr(mStrideLoopBody);
@@ -51,7 +70,7 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
     b.SetInsertPoint(mStrideLoopBody);
     mStrideLoopTarget = nullptr;
     if (hasFinalBlock && b.supportsIndirectBr()) {
-        Value * const baseTarget = BlockAddress::get(segmentDone);
+        Value * const baseTarget = BlockAddress::get(stridesExit);
         mStrideLoopTarget = b.CreatePHI(baseTarget->getType(), 2, "strideTarget");
         mStrideLoopTarget->addIncoming(baseTarget, entryBlock);
     }
@@ -89,11 +108,16 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
 
         // Now conditionally perform the final block processing depending on the doFinal parameter.
         if (mStrideLoopTarget) {
+            // The destinations are the targets of the stride loop: stridesExit, and the
+            // blocks added by the final block method and the provisional stride.  The
+            // final block is not one of them (it is reached by the branch on mIsFinal);
+            // listed as a destination, its address never taken, it would be removed by
+            // the optimizer without its branch weight, leaving the !prof metadata with
+            // more weights than destinations (a broken module).
             mStrideLoopBranch = b.CreateIndirectBr(mStrideLoopTarget, 3);
-            mStrideLoopBranch->addDestination(doFinalBlock);
-            mStrideLoopBranch->addDestination(segmentDone);
+            mStrideLoopBranch->addDestination(stridesExit);
         } else {
-            b.CreateUnlikelyCondBr(mIsFinal, doFinalBlock, segmentDone);
+            b.CreateUnlikelyCondBr(mIsFinal, doFinalBlock, stridesExit);
         }
 
         doFinalBlock->moveAfter(stridesDone);
@@ -103,6 +127,12 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
         b.SetInsertPoint(doFinalBlock);
         writeFinalBlockMethod(b, getRemainingItems(b));
         b.CreateBr(segmentDone);
+
+        if (LLVM_UNLIKELY(hasProvisionalStride)) {
+            checkProvisional->moveAfter(b.GetInsertBlock());
+            b.SetInsertPoint(checkProvisional);
+            writeProvisionalStride(b, numOfBlocks, segmentDone);
+        }
 
         segmentDone->moveAfter(b.GetInsertBlock());
 
@@ -114,7 +144,7 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
             const auto destinations = mStrideLoopBranch->getNumDestinations();
             SmallVector<uint32_t, 16> weights(destinations);
             for (unsigned i = 0; i < destinations; ++i) {
-                weights[i] = (mStrideLoopBranch->getDestination(i) == segmentDone) ? 100 : 1;
+                weights[i] = (mStrideLoopBranch->getDestination(i) == stridesExit) ? 100 : 1;
             }
             mStrideLoopBranch->setMetadata(LLVMContext::MD_prof, mdb.createBranchWeights(weights));
         }
@@ -122,6 +152,158 @@ void BlockKernelCompiler::generateMultiBlockLogic(KernelBuilder & b, Value * con
     }
 
 
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief writeCarryRebuild
+ *
+ * Reprocess up to the given number of strides before the segment, so that a kernel whose
+ * carries start each segment zeroed has the carries of the prior segment.  The processed item counts of the inputs are moved back to each
+ * stride in turn and then restored.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void BlockKernelCompiler::writeCarryRebuild(KernelBuilder & b, const unsigned strides) {
+
+    const auto stride = mTarget->getStride();
+    const auto & inputs = getInputStreamSetBindings();
+    const auto n = inputs.size();
+    assert (n > 0);
+
+    SmallVector<Value *, 8> initial(n);
+    SmallVector<uint64_t, 8> itemsPerStride(n);
+    unsigned principal = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const Binding & input = inputs[i];
+        if (LLVM_UNLIKELY(!input.getRate().isFixed() || input.isDeferred())) {
+            report_fatal_error(StringRef(getName() + ": rebuilding carries requires Fixed rate inputs"));
+        }
+        initial[i] = b.getProcessedItemCount(input.getName());
+        itemsPerStride[i] = ceiling(getUpperBound(input) * stride);
+        if (input.isPrincipal()) {
+            principal = i;
+        }
+    }
+
+    BasicBlock * const rebuildLoop = b.CreateBasicBlock(getName() + "_rebuildCarriesLoop");
+    BasicBlock * const rebuildStride = b.CreateBasicBlock(getName() + "_rebuildCarriesStride");
+    BasicBlock * const rebuildExit = b.CreateBasicBlock(getName() + "_rebuildCarriesExit");
+    BasicBlock * const rebuildDone = b.CreateBasicBlock(getName() + "_rebuildCarriesDone");
+
+    // Fewer strides precede a segment near the start of the stream, which begins with zeroed carries.
+    BasicBlock * const entry = b.GetInsertBlock();
+    Value * const available = b.CreateUDiv(initial[principal], b.getSize(itemsPerStride[principal]));
+    Value * const count = b.CreateUMin(available, b.getSize(strides));
+    b.CreateLikelyCondBr(b.CreateICmpNE(count, b.getSize(0)), rebuildLoop, rebuildDone);
+
+    b.SetInsertPoint(rebuildLoop);
+    PHINode * const remaining = b.CreatePHI(b.getSizeTy(), 2);
+    remaining->addIncoming(count, entry);
+    for (unsigned i = 0; i < n; ++i) {
+        Value * const offset = b.CreateMul(remaining, b.getSize(itemsPerStride[i]));
+        b.setProcessedItemCount(inputs[i].getName(), b.CreateSub(initial[i], offset));
+    }
+    // The stride logic computes its input addresses in its first block, which must
+    // follow the stores to the processed item counts.
+    b.CreateBr(rebuildStride);
+
+    b.SetInsertPoint(rebuildStride);
+    TARGET->generateCarryRebuildMethod(b);
+    Value * const nextRemaining = b.CreateSub(remaining, b.getSize(1));
+    remaining->addIncoming(nextRemaining, b.GetInsertBlock());
+    b.CreateCondBr(b.CreateICmpEQ(nextRemaining, b.getSize(0)), rebuildExit, rebuildLoop);
+
+    b.SetInsertPoint(rebuildExit);
+    for (unsigned i = 0; i < n; ++i) {
+        b.setProcessedItemCount(inputs[i].getName(), initial[i]);
+    }
+    b.CreateBr(rebuildDone);
+
+    b.SetInsertPoint(rebuildDone);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief validateProvisionalLookAheadStride
+ ** ------------------------------------------------------------------------------------------------------------- */
+void BlockKernelCompiler::validateProvisionalLookAheadStride(KernelBuilder & /* b */) {
+    std::string reason;
+    if (LLVM_UNLIKELY(!TARGET->meetsProvisionalLookAheadStrideRequirements(&reason))) {
+        SmallVector<char, 256> tmp;
+        raw_svector_ostream out(tmp);
+        out << getName() << ": ProvisionalLookAheadStride requires " << reason;
+        report_fatal_error(out.str());
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief writeProvisionalStride
+ *
+ * Called in a non-final segment after the full strides.  If the accessible input extends past the
+ * full strides, process one further stride as if it were a full stride, then restore the kernel state
+ * to its value after the full strides so that the provisional stride is reprocessed next time.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void BlockKernelCompiler::writeProvisionalStride(KernelBuilder & b, Value * const numOfBlocks, BasicBlock * const segmentDone) {
+
+    BasicBlock * const doProvisional = b.CreateBasicBlock(getName() + "_doProvisionalStride", segmentDone);
+    BasicBlock * const provisionalDone = b.CreateBasicBlock(getName() + "_provisionalStrideDone", segmentDone);
+
+    // All stream inputs are FixedRate(1), so the full strides cover numOfBlocks * stride items.
+    Value * const fullItems = b.CreateMul(numOfBlocks, b.getSize(mTarget->getStride()));
+    Value * const hasProvisional = b.CreateICmpUGT(getRemainingItems(b), fullItems);
+    b.CreateLikelyCondBr(hasProvisional, doProvisional, segmentDone);
+
+    b.SetInsertPoint(doProvisional);
+    // the stride loop does not advance the item counts after its last stride
+    incrementCountableItemCounts(b);
+    Value * const savedShared = saveKernelState(b, mTarget->getSharedStateType(), getHandle());
+    Value * const savedThreadLocal = saveKernelState(b, mTarget->getThreadLocalStateType(), getThreadLocalHandle());
+
+    if (b.supportsIndirectBr()) {
+        // Reenter the stride loop body for exactly one stride and resume at provisionalDone.
+        mStrideLoopBranch->addDestination(provisionalDone);
+        BasicBlock * const current = b.GetInsertBlock();
+        mStrideLoopTarget->addIncoming(BlockAddress::get(provisionalDone), current);
+        mStrideBlockIndex->addIncoming(b.CreateSub(numOfBlocks, b.getSize(1)), current);
+        b.CreateBr(mStrideLoopBody);
+    } else {
+        std::vector<Value *> args;
+        args.reserve(1 + mAccessibleInputItems.size());
+        args.push_back(b.getHandle());
+        args.insert(args.end(), mAccessibleInputItems.begin(), mAccessibleInputItems.end());
+        b.CreateCall(mDoBlockMethod->getFunctionType(), mDoBlockMethod, args);
+        b.CreateBr(provisionalDone);
+    }
+
+    b.SetInsertPoint(provisionalDone);
+    restoreKernelState(b, mTarget->getSharedStateType(), getHandle(), savedShared);
+    restoreKernelState(b, mTarget->getThreadLocalStateType(), getThreadLocalHandle(), savedThreadLocal);
+    b.CreateBr(segmentDone);
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief saveKernelState
+ ** ------------------------------------------------------------------------------------------------------------- */
+Value * BlockKernelCompiler::saveKernelState(KernelBuilder & b, StructType * const stateTy, Value * const handle) {
+    if (stateTy == nullptr || handle == nullptr || stateTy->isEmptyTy()) {
+        return nullptr;
+    }
+    const DataLayout & DL = b.getModule()->getDataLayout();
+    const auto size = DL.getTypeAllocSize(stateTy);
+    const auto align = DL.getABITypeAlign(stateTy).value();
+    Value * const saved = b.CreateAllocaAtEntryPoint(stateTy, nullptr, "savedKernelState");
+    b.CreateMemCpy(saved, handle, size, align);
+    return saved;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief restoreKernelState
+ ** ------------------------------------------------------------------------------------------------------------- */
+void BlockKernelCompiler::restoreKernelState(KernelBuilder & b, StructType * const stateTy, Value * const handle, Value * const saved) {
+    if (saved == nullptr) {
+        return;
+    }
+    const DataLayout & DL = b.getModule()->getDataLayout();
+    const auto size = DL.getTypeAllocSize(stateTy);
+    const auto align = DL.getABITypeAlign(stateTy).value();
+    b.CreateMemCpy(handle, saved, size, align);
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *

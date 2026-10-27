@@ -44,7 +44,6 @@ public:
     virtual ~Name() {}
 protected:
     friend Name * makeName(const std::string & name, RE * cc);
-    friend Name * makeZeroWidth(const std::string & name, RE * zerowidth);
     friend Name * makeName(CC * const cc);
     friend Name * makeName(const std::string &, RE *);
     friend Name * makeName(const std::string &, const std::string &, RE *);
@@ -97,7 +96,7 @@ inline void Name::setDefinition(RE * definition) {
 
 inline bool Name::operator < (const Name & other) const {
     if (LLVM_LIKELY(mDefinition && other.mDefinition && llvm::isa<CC>(mDefinition) && llvm::isa<CC>(other.mDefinition))) {
-        return *llvm::cast<CC>(mDefinition) < *llvm::cast<CC>(other.mDefinition);
+        return llvm::cast<CC>(mDefinition)->compare(*llvm::cast<CC>(other.mDefinition)) < 0;
     } else if (mNamespaceLength < other.mNamespaceLength) {
         return true;
     } else if (mNamespaceLength > other.mNamespaceLength) {
@@ -118,14 +117,14 @@ inline bool Name::operator < (const Name & other) const {
 
 inline bool Name::operator < (const CC & other) const {
     if (mDefinition && llvm::isa<CC>(mDefinition)) {
-        return *llvm::cast<CC>(mDefinition) < other;
+        return llvm::cast<CC>(mDefinition)->compare(other) < 0;
     }
     return RE::ClassTypeId::Name < RE::ClassTypeId::CC;
 }
 
 inline bool Name::operator > (const CC & other) const {
     if (mDefinition && llvm::isa<CC>(mDefinition)) {
-        return other < *llvm::cast<CC>(mDefinition);
+        return other.compare(*llvm::cast<CC>(mDefinition)) < 0;
     }
     return RE::ClassTypeId::CC < RE::ClassTypeId::Name;
 }
@@ -141,10 +140,6 @@ inline Name * makeName(const std::string & property, const std::string & value, 
 inline Name * makeName(CC * const cc) {
     const std::string name = cc->canonicalName();
     return new Name(nullptr, 0, name.c_str(), name.length(), cc);
-}
-
-inline Name * makeZeroWidth(const std::string & name, RE * zerowidth = NULL) {
-    return new Name(nullptr, 0, name.c_str(), name.length(), zerowidth);
 }
 
 template <typename To, typename FromTy> bool defined(FromTy * e) {

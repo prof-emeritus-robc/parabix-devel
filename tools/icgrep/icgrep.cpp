@@ -17,6 +17,8 @@
 #include <re/adt/re_end.h>
 #include <re/adt/re_utility.h>
 #include <re/parse/parser.h>
+#include <re/parse/replacement_parser.h>
+#include <re/analysis/replacement_analysis.h>
 #include <re/toolchain/toolchain.h>
 #include <grep/grep_engine.h>
 #include "grep_interface.h"
@@ -62,9 +64,6 @@ re::RE * readRE() {
     if (argv::RegexpVector.size() == 0) {
         argv::RegexpVector.push_back(inputFiles[0]);
         inputFiles.erase(inputFiles.begin());
-    }
-    if (argv::IgnoreCaseFlag) {
-        globalFlags |= re::CASE_INSENSITIVE_MODE_FLAG;
     }
 
     std::vector<re::RE *> REs;
@@ -128,7 +127,6 @@ int main(int argc, char *argv[]) {
             break;
         default: llvm_unreachable("Invalid grep mode!");
     }
-    if (argv::IgnoreCaseFlag) grep->setCaseInsensitive();
     if (argv::InvertMatchFlag) grep->setInvertMatches();
     if (argv::UnicodeLinesFlag) {
         grep->setRecordBreak(grep::GrepRecordBreakKind::Unicode);
@@ -145,6 +143,23 @@ int main(int argc, char *argv[]) {
     if (argv::MmapFlag) grep->setPreferMMap();
     grep->setBinaryFilesOption(argv::BinaryFilesFlag);
     grep->initFileResult(allFiles); // unnecessary copy!
+    if (argv::ReplaceFlagSet) {
+        std::string error;
+        re::RE * const replacement = re::parseReplacement(argv::ReplaceFlag, RE, error);
+        if (replacement == nullptr) {
+            llvm::report_fatal_error(llvm::StringRef("--replace: ") + error);
+        }
+        // The lines of the result must be those of the text.
+        std::vector<re::ReplacementItem> items;
+        re::foldReplacement(replacement, RE, items);
+        const char32_t recordBreak = argv::NullDataFlag ? U'\0' : U'\n';
+        for (const re::ReplacementItem & item : items) {
+            if (item.literal.find(recordBreak) != std::u32string::npos) {
+                llvm::report_fatal_error("--replace: the replacement may not contain a line break");
+            }
+        }
+        grep->setReplacement(replacement);
+    }
     grep->initRE(RE);
     grep->grepCodeGen();
     #ifdef REPORT_PAPI_TESTS

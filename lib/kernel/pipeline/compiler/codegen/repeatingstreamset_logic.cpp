@@ -237,6 +237,26 @@ void PipelineCompiler::generateGlobalDataForRepeatingStreamSet(KernelBuilder & b
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
+ * @brief initializeStaticRepeatingStreamSets
+ *
+ * Static (non-dynamic) repeating streamsets are produced by the pipeline input rather than by any
+ * kernel, so allocateOwnedBuffers never reaches them. Build their pattern data and record their
+ * base address and modulus here, in the initialize method, before the kernel method is generated.
+ ** ------------------------------------------------------------------------------------------------------------- */
+void PipelineCompiler::initializeStaticRepeatingStreamSets(KernelBuilder & b) {
+    for (auto streamSet = FirstStreamSet; streamSet <= LastStreamSet; ++streamSet) {
+        const BufferNode & bn = mBufferGraph[streamSet];
+        if (LLVM_UNLIKELY(bn.isConstant() && !bn.isTruncated())) {
+            const RelationshipNode & rn = mStreamGraph[streamSet];
+            assert (rn.Type == RelationshipNode::IsStreamSet);
+            if (!cast<RepeatingStreamSet>(rn.Relationship)->isDynamic()) {
+                generateGlobalDataForRepeatingStreamSet(b, streamSet);
+            }
+        }
+    }
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
  * @brief addRepeatingStreamSetBufferProperties
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::addRepeatingStreamSetBufferProperties(KernelBuilder & b) {

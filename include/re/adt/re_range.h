@@ -20,6 +20,6 @@ private:
     RE * const mHi;
 };
 
-RE * makeRange(RE * lh, RE * rh);
+inline RE * makeRange(RE * lh, RE * rh) {return Range::Create(lh, rh);}
 }
 

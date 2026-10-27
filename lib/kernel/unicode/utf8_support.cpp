@@ -8,105 +8,149 @@
 #include <re/cc/cc_compiler.h>         // for CC_Compiler
 #include <re/cc/cc_compiler_target.h>
 #include <re/cc/cc_kernel.h>
+#include <llvm/Support/ErrorHandling.h>
 
 using namespace kernel;
 using namespace pablo;
 using namespace re;
 using namespace llvm;
 
-void UTF8_index::generatePabloMethod() {
-    PabloBuilder pb(getEntryScope());
-    std::unique_ptr<cc::CC_Compiler> ccc;
-    bool useDirectCC = getInput(0)->getType()->getArrayNumElements() == 1;
-    if (useDirectCC) {
-        ccc = std::make_unique<cc::Direct_CC_Compiler>(pb.createExtract(getInput(0), pb.getInteger(0)));
-    } else {
-        ccc = std::make_unique<cc::Parabix_CC_Compiler_Builder>(getInputStreamSet("source"));
+namespace {
+// A compiler of byte classes for the code units of the source, looked ahead
+// by k positions.
+std::unique_ptr<cc::CC_Compiler> lookaheadCompiler(PabloBuilder & pb, const std::vector<PabloAST *> & source, unsigned k) {
+    if (source.size() != 8) {
+        // (A lookahead of a byte stream is not compiled correctly.)
+        llvm::report_fatal_error("UTF8_structure: the source must be the 8 basis bit streams of the UTF-8 code units");
     }
+    std::vector<PabloAST *> ahead;
+    for (PabloAST * s : source) ahead.push_back(k == 0 ? s : pb.createLookahead(s, k));
+    return std::make_unique<cc::Parabix_CC_Compiler_Builder>(ahead);
+}
 
+}
+
+//
+// The well-formed sequences are those of Table 3-7 of the Unicode Standard.
+// As blocks of text are mostly ASCII, the sequences are found within an
+// if-hierarchy: only blocks with prefix bytes (C0-FF), and within them only
+// those with 2-, 3- or 4-byte leads, compute them.  A lead or a suffix
+// before the last is continued (nonFinal) where the next byte is the next
+// byte of a well-formed sequence (the byte classes looked ahead by 1); the
+// last byte of each well-formed character (ASCII, or the last suffix of a
+// continued sequence) is u8valid.  Every other byte ends a maximal ill-formed
+// subpart: a byte of a sequence not continued, and a byte (other than ASCII)
+// that neither begins nor continues a sequence.
+//
+UTF8_Structure kernel::UTF8_structure(PabloBuilder & pb, const std::vector<PabloAST *> & source, bool initials) {
+    std::unique_ptr<cc::CC_Compiler> ccc = lookaheadCompiler(pb, source, 0);
     Zeroes * const ZEROES = pb.createZeroes();
+    PabloAST * const ASCII = pb.createNot(source[7], "ASCII");
+    Var * const nonFinal = pb.createVar("nonFinal", ZEROES);
+    Var * const u8valid = pb.createVar("u8valid", ASCII);
+    // The legal leads, and the suffixes that continue them.
+    Var * const legalLeads = pb.createVar("legalLeads", ZEROES);
+    Var * const u8cont = pb.createVar("u8cont", ZEROES);
+    Var * const validInitial = initials ? pb.createVar("validInitial", ASCII) : nullptr;
+
     PabloAST * const u8pfx = ccc->compileCC(makeByte(0xC0, 0xFF), pb);
-
-
-    Var * const nonFinal = pb.createVar("nonFinal", u8pfx);
-    Var * const u8invalid = pb.createVar("u8invalid", ZEROES);
-    Var * const valid_pfx = pb.createVar("valid_pfx", u8pfx);
-
     auto it = pb.createScope();
     pb.createIf(u8pfx, it);
-    PabloAST * const u8pfx2 = ccc->compileCC(makeByte(0xC2, 0xDF), it);
-    PabloAST * const u8pfx3 = ccc->compileCC(makeByte(0xE0, 0xEF), it);
-    PabloAST * const u8pfx4 = ccc->compileCC(makeByte(0xF0, 0xF4), it);
+    std::unique_ptr<cc::CC_Compiler> ccc1 = lookaheadCompiler(it, source, 1);
+    std::unique_ptr<cc::CC_Compiler> ccc2 = initials ? lookaheadCompiler(it, source, 2) : nullptr;
+    std::unique_ptr<cc::CC_Compiler> ccc3 = initials ? lookaheadCompiler(it, source, 3) : nullptr;
+    auto byte = [&](cc::CC_Compiler & c, unsigned lo, unsigned hi, PabloBuilder & b) {
+        return c.compileCC(makeByte(lo, hi), b);
+    };
+    PabloAST * const u8pfx2 = byte(*ccc, 0xC2, 0xDF, it);
+    PabloAST * const u8pfx3 = byte(*ccc, 0xE0, 0xEF, it);
+    PabloAST * const u8pfx4 = byte(*ccc, 0xF0, 0xF4, it);
+    it.createAssign(legalLeads, it.createOr3(u8pfx2, u8pfx3, u8pfx4));
+    auto accumulate = [&](PabloBuilder & b, Var * v, PabloAST * x) { b.createAssign(v, b.createOr(v, x)); };
 
     //
     // Two-byte sequences
-    Var * const anyscope = it.createVar("anyscope", ZEROES);
     auto it2 = it.createScope();
     it.createIf(u8pfx2, it2);
-    it2.createAssign(anyscope, it2.createAdvance(u8pfx2, 1));
-
+    PabloAST * const suffix1_2 = byte(*ccc1, 0x80, 0xBF, it2);
+    PabloAST * const lead2 = it2.createAnd(u8pfx2, suffix1_2, "lead2");
+    PabloAST * const u8scope22 = it2.createAdvance(lead2, 1, "u8scope22");
+    accumulate(it2, nonFinal, lead2);
+    accumulate(it2, u8valid, u8scope22);
+    accumulate(it2, u8cont, u8scope22);
+    if (initials) accumulate(it2, validInitial, lead2);
 
     //
-    // Three-byte sequences
-    Var * const EF_invalid = it.createVar("EF_invalid", ZEROES);
+    // Three-byte sequences: E0 A0-BF, E1-EC EE-EF 80-BF, ED 80-9F, then 80-BF.
     auto it3 = it.createScope();
     it.createIf(u8pfx3, it3);
-    PabloAST * const u8scope32 = it3.createAdvance(u8pfx3, 1);
-    it3.createAssign(nonFinal, it3.createOr(nonFinal, u8scope32));
-    PabloAST * const u8scope33 = it3.createAdvance(u8pfx3, 2);
-    PabloAST * const u8scope3X = it3.createOr(u8scope32, u8scope33);
-    it3.createAssign(anyscope, it3.createOr(anyscope, u8scope3X));
-
-    PabloAST * const advE0 = it3.createAdvance(ccc->compileCC(makeByte(0xE0), it3), 1, "advEO");
-    PabloAST * const range80_9F = ccc->compileCC(makeByte(0x80, 0x9F), it3);
-    PabloAST * const E0_invalid = it3.createAnd(advE0, range80_9F, "E0_invalid");
-
-    PabloAST * const advED = it3.createAdvance(ccc->compileCC(makeByte(0xED), it3), 1, "advED");
-    PabloAST * const rangeA0_BF = ccc->compileCC(makeByte(0xA0, 0xBF), it3);
-    PabloAST * const ED_invalid = it3.createAnd(advED, rangeA0_BF, "ED_invalid");
-
-    PabloAST * const EX_invalid = it3.createOr(E0_invalid, ED_invalid);
-    it3.createAssign(EF_invalid, EX_invalid);
+    PabloAST * const suffix1_3 = byte(*ccc1, 0x80, 0xBF, it3);
+    PabloAST * const E0 = it3.createAnd(byte(*ccc, 0xE0, 0xE0, it3), byte(*ccc1, 0xA0, 0xBF, it3));
+    PabloAST * const ED = it3.createAnd(byte(*ccc, 0xED, 0xED, it3), byte(*ccc1, 0x80, 0x9F, it3));
+    PabloAST * const EX = it3.createAnd(it3.createOr(byte(*ccc, 0xE1, 0xEC, it3), byte(*ccc, 0xEE, 0xEF, it3)), suffix1_3);
+    PabloAST * const lead3 = it3.createOr3(E0, ED, EX, "lead3");
+    PabloAST * const u8scope32 = it3.createAdvance(lead3, 1, "u8scope32");
+    PabloAST * const mid32 = it3.createAnd(u8scope32, suffix1_3);
+    PabloAST * const u8scope33 = it3.createAdvance(mid32, 1, "u8scope33");
+    accumulate(it3, nonFinal, it3.createOr(lead3, mid32));
+    accumulate(it3, u8valid, u8scope33);
+    accumulate(it3, u8cont, it3.createOr(u8scope32, u8scope33));
+    if (initials) accumulate(it3, validInitial, it3.createAnd(lead3, byte(*ccc2, 0x80, 0xBF, it3)));
 
     //
-    // Four-byte sequences
+    // Four-byte sequences: F0 90-BF, F1-F3 80-BF, F4 80-8F, then 80-BF 80-BF.
     auto it4 = it.createScope();
     it.createIf(u8pfx4, it4);
-    PabloAST * const u8scope42 = it4.createAdvance(u8pfx4, 1, "u8scope42");
-    PabloAST * const u8scope43 = it4.createAdvance(u8scope42, 1, "u8scope43");
-    PabloAST * const u8scope44 = it4.createAdvance(u8scope43, 1, "u8scope44");
-    PabloAST * const u8scope4nonfinal = it4.createOr(u8scope42, u8scope43);
-    it4.createAssign(nonFinal, it4.createOr(nonFinal, u8scope4nonfinal));
-    PabloAST * const u8scope4X = it4.createOr(u8scope4nonfinal, u8scope44);
-    it4.createAssign(anyscope, it4.createOr(anyscope, u8scope4X));
-    PabloAST * const F0_invalid = it4.createAnd(it4.createAdvance(ccc->compileCC(makeByte(0xF0), it4), 1), ccc->compileCC(makeByte(0x80, 0x8F), it4));
-    PabloAST * const F4_invalid = it4.createAnd(it4.createAdvance(ccc->compileCC(makeByte(0xF4), it4), 1), ccc->compileCC(makeByte(0x90, 0xBF), it4));
-    PabloAST * const FX_invalid = it4.createOr(F0_invalid, F4_invalid);
-    it4.createAssign(EF_invalid, it4.createOr(EF_invalid, FX_invalid));
+    PabloAST * const suffix1_4 = byte(*ccc1, 0x80, 0xBF, it4);
+    PabloAST * const F0 = it4.createAnd(byte(*ccc, 0xF0, 0xF0, it4), byte(*ccc1, 0x90, 0xBF, it4));
+    PabloAST * const F4 = it4.createAnd(byte(*ccc, 0xF4, 0xF4, it4), byte(*ccc1, 0x80, 0x8F, it4));
+    PabloAST * const FX = it4.createAnd(byte(*ccc, 0xF1, 0xF3, it4), suffix1_4);
+    PabloAST * const lead4 = it4.createOr3(F0, F4, FX, "lead4");
+    PabloAST * const u8scope42 = it4.createAdvance(lead4, 1, "u8scope42");
+    PabloAST * const mid42 = it4.createAnd(u8scope42, suffix1_4);
+    PabloAST * const u8scope43 = it4.createAdvance(mid42, 1, "u8scope43");
+    PabloAST * const mid43 = it4.createAnd(u8scope43, suffix1_4);
+    PabloAST * const u8scope44 = it4.createAdvance(mid43, 1, "u8scope44");
+    accumulate(it4, nonFinal, it4.createOr3(lead4, mid42, mid43));
+    accumulate(it4, u8valid, u8scope44);
+    accumulate(it4, u8cont, it4.createOr3(u8scope42, u8scope43, u8scope44));
+    if (initials) {
+        accumulate(it4, validInitial, it4.createAnd3(lead4, byte(*ccc2, 0x80, 0xBF, it4), byte(*ccc3, 0x80, 0xBF, it4)));
+    }
 
-    //
-    // Invalid cases
-    PabloAST * const legalpfx = it.createOr(it.createOr(u8pfx2, u8pfx3), u8pfx4);
-    //  Any scope that does not have a suffix byte, and any suffix byte that is not in
-    //  a scope is a mismatch, i.e., invalid UTF-8.
-    PabloAST * const u8suffix = ccc->compileCC("u8suffix", makeByte(0x80, 0xBF), it);
-    PabloAST * const mismatch = it.createXor(anyscope, u8suffix);
-    //
-    PabloAST * const pfx_invalid = it.createXor(valid_pfx, legalpfx);
-    it.createAssign(u8invalid, it.createOr(pfx_invalid, it.createOr(mismatch, EF_invalid)));
-    PabloAST * const u8valid = it.createNot(u8invalid, "u8valid");
-    //
-    it.createAssign(nonFinal, it.createAnd(nonFinal, u8valid));
+    UTF8_Structure u;
+    u.validFinal = pb.createInFile(u8valid, "u8validFinal");
+    u.errorFinal = pb.createInFile(pb.createNot(pb.createOr(nonFinal, u8valid)), "u8errorFinal");
+    if (initials) {
+        // A byte (other than ASCII) that neither begins nor continues a sequence.
+        PabloAST * const lone = pb.createAnd(source[7], pb.createNot(pb.createOr(legalLeads, u8cont)), "u8lone");
+        u.validInitial = pb.createInFile(validInitial, "u8validInitial");
+        u.errorInitial = pb.createInFile(pb.createOr(pb.createAnd(legalLeads, pb.createNot(validInitial)), lone),
+                                         "u8errorInitial");
+    }
+    return u;
+}
 
+void UTF8_index::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const UTF8_Structure u = UTF8_structure(pb, getInputStreamSet("source"));
+    PabloAST * u8final = u.validFinal;
+    if (mMode != codegen::UTF8ErrorMode::DropBadInput) {
+        u8final = pb.createOr(u8final, u.errorFinal);
+    }
     Var * const u8index = getOutputStreamVar("u8index");
-    PabloAST * u8final = pb.createInFile(pb.createNot(nonFinal));
     if (getNumOfStreamInputs() > 1) {
         u8final = pb.createOr(u8final, getInputStreamSet("u8_LB")[0]);
     }
     pb.createAssign(pb.createExtract(u8index, pb.getInteger(0)), u8final);
 }
 
-UTF8_index::UTF8_index(LLVMTypeSystemInterface & ts, StreamSet * Source, StreamSet * u8index, StreamSet * u8_LB)
+static std::string utf8ErrorAnnotation(codegen::UTF8ErrorMode mode) {
+    return (mode == codegen::UTF8ErrorMode::DropBadInput) ? "_drop" : "";
+}
+
+UTF8_index::UTF8_index(LLVMTypeSystemInterface & ts, StreamSet * Source, StreamSet * u8index, StreamSet * u8_LB,
+                       codegen::UTF8ErrorMode mode)
 : PabloKernel(ts, [&]() -> std::string {
     std::stringstream s;
     s << "UTF8_index_";
@@ -114,12 +158,53 @@ UTF8_index::UTF8_index(LLVMTypeSystemInterface & ts, StreamSet * Source, StreamS
     if (u8_LB) {
         s << "_LB";
     }
+    s << utf8ErrorAnnotation(mode);
     return s.str();}(),
-{}, {Binding{"u8index", u8index}}) {
-    mInputStreamSets.push_back(Binding{"source", Source});
+{}, {}), mMode(mode) {
     if (u8_LB) {
+        // A line-break stream produced with UnterminatedLineAtEOF::Add1 has one
+        // extra position (AddCarry) exactly when the final line is unterminated.
+        // u8final copies that bit, so u8index is extended exactly when u8_LB is
+        // (as in UnicodeLinesKernelBuilder); otherwise filtering the line breaks
+        // by this index drops it and the final line is never matched.
+        mInputStreamSets.push_back(Binding{"source", Source, FixedRate(), {ZeroExtended(), LookAhead(1)}});
         mInputStreamSets.push_back(Binding{"u8_LB", u8_LB, FixedRate(), Principal()});
+        mOutputStreamSets.push_back(Binding{"u8index", u8index, FixedRate(), AddCarry()});
+    } else {
+        mInputStreamSets.push_back(Binding{"source", Source, FixedRate(), LookAhead(1)});
+        mOutputStreamSets.push_back(Binding{"u8index", u8index});
     }
+}
+
+UTF8_InitialMask::UTF8_InitialMask(LLVMTypeSystemInterface & ts, StreamSet * Source, StreamSet * initial,
+                                   codegen::UTF8ErrorMode mode)
+: PabloKernel(ts, "UTF8_InitialMask_" + Source->shapeString() + utf8ErrorAnnotation(mode),
+              {Binding{"source", Source, FixedRate(), LookAhead(3)}}, {Binding{"initial", initial}}),
+  mMode(mode) {}
+
+void UTF8_InitialMask::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const UTF8_Structure u = UTF8_structure(pb, getInputStreamSet("source"), true);
+    PabloAST * initial = u.validInitial;
+    if (mMode != codegen::UTF8ErrorMode::DropBadInput) {
+        initial = pb.createOr(initial, u.errorInitial);
+    }
+    pb.createAssign(pb.createExtract(getOutputStreamVar("initial"), pb.getInteger(0)), initial);
+}
+
+UTF8_ErrorMarks::UTF8_ErrorMarks(LLVMTypeSystemInterface & ts, StreamSet * Source, StreamSet * errors,
+                                 pablo::BitMovementMode m)
+: PabloKernel(ts, "UTF8_ErrorMarks_" + Source->shapeString() + pablo::BitMovementMode_string(m),
+              {Binding{"source", Source, FixedRate(), LookAhead(m == pablo::BitMovementMode::LookAhead ? 3 : 1)}},
+              {Binding{"errors", errors}}),
+  mBitMovement(m) {}
+
+void UTF8_ErrorMarks::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const bool initials = (mBitMovement == pablo::BitMovementMode::LookAhead);
+    const UTF8_Structure u = UTF8_structure(pb, getInputStreamSet("source"), initials);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("errors"), pb.getInteger(0)),
+                    initials ? u.errorInitial : u.errorFinal);
 }
 
 U8Spans::U8Spans(LLVMTypeSystemInterface & ts, StreamSet * marks, StreamSet * u8index, StreamSet * spans, pablo::BitMovementMode m)

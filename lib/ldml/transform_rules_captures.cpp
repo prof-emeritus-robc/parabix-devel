@@ -1,0 +1,551 @@
+/*
+ *  Part of the Parabix Project, under the Open Software License 3.0.
+ *  SPDX-License-Identifier: OSL-3.0
+ */
+
+#include <ldml/transform_rules.h>
+#include <ldml/transform_rules_printer.h>
+#include <re/adt/adt.h>
+#include <re/transforms/capture_removal.h>
+#include "charset_analysis.h"
+#include <functional>
+#include <map>
+#include <set>
+
+using namespace llvm;
+using namespace re;
+
+namespace ldml {
+
+namespace {
+
+// An optional item: a repetition with a lower bound of 0, or a variable
+// defined as one.
+bool isOptionalItem(const RE * re) {
+    if (const Rep * rep = dyn_cast<Rep>(re)) {
+        return rep->getLB() == 0;
+    }
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && isOptionalItem(n->getDefinition());
+    }
+    return false;
+}
+
+// The optional item with a lower bound of 1.
+RE * presentForm(RE * item) {
+    if (Name * n = dyn_cast<Name>(item)) {
+        return presentForm(n->getDefinition());
+    }
+    Rep * rep = cast<Rep>(item);
+    return makeRep(rep->getRE(), 1, rep->getUB());
+}
+
+// The optional items of a nullable capture: either the captured RE itself,
+// or all the items of a captured sequence of optional items.  Empty if
+// the capture is not nullable in this sense.
+std::vector<RE *> optionalItems(const Capture * c) {
+    RE * captured = c->getCapturedRE();
+    if (isOptionalItem(captured)) return {captured};
+    std::vector<RE *> items;
+    if (const Seq * seq = dyn_cast<Seq>(captured)) {
+        for (RE * e : *seq) {
+            if (!isOptionalItem(e)) return {};
+            items.push_back(e);
+        }
+    }
+    return items;
+}
+
+void findNullableCaptures(RE * re, bool withinRep, bool includeRepeated, std::vector<Capture *> & found) {
+    if (re == nullptr) return;
+    if (Capture * c = dyn_cast<Capture>(re)) {
+        if (!optionalItems(c).empty() && (includeRepeated || !withinRep)) found.push_back(c);
+        findNullableCaptures(c->getCapturedRE(), withinRep, includeRepeated, found);
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) findNullableCaptures(e, withinRep, includeRepeated, found);
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        findNullableCaptures(rep->getRE(), true, includeRepeated, found);
+    }
+}
+
+// A fixed string: a single codepoint, a variable defined as a fixed string,
+// or a nonempty sequence of fixed strings.
+bool isFixedString(const RE * re) {
+    if (const CC * cc = dyn_cast<CC>(re)) {
+        return cc->size() == 1 && lo_codepoint(cc->front()) == hi_codepoint(cc->front());
+    }
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && isFixedString(n->getDefinition());
+    }
+    if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) {
+            if (!isFixedString(e)) return false;
+        }
+        return !seq->empty();
+    }
+    return false;
+}
+
+void collectCaptures(RE * re, std::set<const Capture *> & captures) {
+    if (Capture * c = dyn_cast<Capture>(re)) {
+        captures.insert(c);
+        collectCaptures(c->getCapturedRE(), captures);
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) collectCaptures(e, captures);
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        collectCaptures(rep->getRE(), captures);
+    }
+}
+
+//  Rewrites a rule, replacing the content of a target capture.  If the new
+//  content is empty, the capture is deleted and its references replaced by
+//  the empty string; if it is a fixed string, the capture and its
+//  references are replaced by that string.  References to deleted
+//  captures are replaced by the empty string.  All captures of the source
+//  side are renumbered in order and the references of the result side updated.
+//  With no target, the captures are just renumbered.
+class CaptureRewriter {
+public:
+    CaptureRewriter(Capture * target = nullptr, RE * newContent = nullptr, std::set<const Capture *> deleted = {})
+    : mTarget(target), mNewContent(newContent), mDeleted(std::move(deleted)) {
+        if (target == nullptr) {
+            // renumbering only
+        } else if (isEmptySeq(newContent)) {
+            mDeleted.insert(target);
+        } else if (isFixedString(newContent)) {
+            mReplacement = newContent;
+        }
+    }
+    ConversionRule * rewrite(const ConversionRule * r) {
+        const RuleSide * src = r->getLeftSide();
+        const RuleSide * res = r->getRightSide();
+        // Captures are numbered in order of their opening parentheses.
+        RE * before = nonEmpty(rewriteSource(src->getBeforeContext()));
+        RE * text = rewriteSource(src->getText());
+        RE * after = nonEmpty(rewriteSource(src->getAfterContext()));
+        RuleSide * source = RuleSide::Create(before, text, false, nullptr, 0, after);
+        RuleSide * result = RuleSide::Create(nonEmpty(rewriteResult(res->getBeforeContext())),
+                                             rewriteResult(res->getCompletedResult()),
+                                             res->hasCursor(),
+                                             rewriteResult(res->getResultToRevisit()),
+                                             res->getCursorOffset(),
+                                             nonEmpty(rewriteResult(res->getAfterContext())));
+        return makeConversionRule(source, Direction::Forward, result);
+    }
+private:
+    static RE * nonEmpty(RE * context) {
+        return (context == nullptr || isEmptySeq(context)) ? nullptr : context;
+    }
+    RE * rewriteSource(RE * re);
+    RE * rewriteResult(RE * re);
+
+    Capture * const mTarget;
+    RE * const mNewContent;
+    std::set<const Capture *> mDeleted;
+    RE * mReplacement = nullptr;    // the fixed string replacing the target
+    std::map<const Capture *, Capture *> mRenumbered;
+    unsigned mCaptureCount = 0;
+};
+
+RE * CaptureRewriter::rewriteSource(RE * re) {
+    if (re == nullptr) return nullptr;
+    if (Capture * c = dyn_cast<Capture>(re)) {
+        RE * captured = c->getCapturedRE();
+        if (c == mTarget) {
+            if (mDeleted.count(c) != 0) return makeSeq();
+            if (mReplacement) return mReplacement;
+            captured = mNewContent;
+        }
+        const std::string name = std::to_string(++mCaptureCount);
+        Capture * renumbered = makeCapture(name, rewriteSource(captured));
+        mRenumbered.emplace(c, renumbered);
+        return renumbered;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> items;
+        bool changed = false;
+        for (RE * e : *seq) {
+            items.push_back(rewriteSource(e));
+            changed |= items.back() != e;
+        }
+        return changed ? makeSeq(items.begin(), items.end()) : re;
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        RE * r = rewriteSource(rep->getRE());
+        return (r != rep->getRE()) ? makeRep(r, rep->getLB(), rep->getUB()) : re;
+    }
+    return re;
+}
+
+RE * CaptureRewriter::rewriteResult(RE * re) {
+    if (re == nullptr) return nullptr;
+    if (Reference * ref = dyn_cast<Reference>(re)) {
+        if (mDeleted.count(ref->getCapture()) != 0) {
+            return makeSeq();
+        }
+        if (ref->getCapture() == mTarget && mReplacement) {
+            return mReplacement;
+        }
+        auto f = mRenumbered.find(ref->getCapture());
+        if (f == mRenumbered.end()) return re;
+        return makeReference(f->second->getName(), f->second, ref->getInstance());
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n)) {
+            RE * arg = rewriteResult(n->getDefinition());
+            return (arg != n->getDefinition()) ? makeFunctionCall(getFunctionID(n), arg) : re;
+        }
+        return re;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> items;
+        bool changed = false;
+        for (RE * e : *seq) {
+            items.push_back(rewriteResult(e));
+            changed |= items.back() != e;
+        }
+        return changed ? makeSeq(items.begin(), items.end()) : re;
+    }
+    return re;
+}
+
+void eliminate(ConversionRule * r, std::vector<Rule *> & result) {
+    const std::vector<Capture *> nullable = findNullableCaptures(r->getLeftSide());
+    if (nullable.empty()) {
+        result.push_back(r);
+        return;
+    }
+    // Split on the first nullable capture into a rule for each combination
+    // of its optional items being present or absent, from all present to
+    // none present, the first item varying slowest.   The new rules are
+    // split further on any remaining nullable captures.
+    Capture * target = nullable.front();
+    const std::vector<RE *> items = optionalItems(target);
+    const size_t k = items.size();
+    for (size_t absent = 0; absent < (size_t{1} << k); absent++) {
+        std::vector<RE *> content;
+        std::set<const Capture *> deleted;
+        for (size_t i = 0; i < k; i++) {
+            if ((absent >> (k - 1 - i)) & 1) {
+                collectCaptures(items[i], deleted);
+            } else {
+                content.push_back(presentForm(items[i]));
+            }
+        }
+        RE * newContent = makeSeq(content.begin(), content.end());
+        eliminate(CaptureRewriter(target, newContent, std::move(deleted)).rewrite(r), result);
+    }
+}
+
+bool referencesCapture(const RE * re, const Capture * c) {
+    if (re == nullptr) return false;
+    if (const Reference * ref = dyn_cast<Reference>(re)) {
+        return ref->getCapture() == c;
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return isFunctionCall(n) && referencesCapture(n->getDefinition(), c);
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) {
+            if (referencesCapture(e, c)) return true;
+        }
+    }
+    return false;
+}
+
+//  The capture of a trivial capture rule, or nullptr: a forward rule whose
+//  text to replace is, or begins with, a capture and whose completed result
+//  begins with a reference to it.
+Capture * trivialCapture(const ConversionRule * r) {
+    if (r->getDirection() != Direction::Forward) return nullptr;
+    RE * const text = r->getLeftSide()->getText();
+    Capture * c = dyn_cast<Capture>(text);
+    if (const Seq * seq = dyn_cast<Seq>(text); seq && seq->size() >= 2) c = dyn_cast<Capture>(seq->front());
+    if (c == nullptr) return nullptr;
+    RE * completed = r->getRightSide()->getCompletedResult();
+    const RE * front = completed;
+    if (const Seq * seq = dyn_cast<Seq>(completed)) {
+        if (seq->empty()) return nullptr;
+        front = seq->front();
+    }
+    const Reference * ref = dyn_cast<Reference>(front);
+    return (ref && ref->getCapture() == c) ? c : nullptr;
+}
+
+//  before { (X) Y } after → $n rest | revisit ;   becomes
+//  before X { Y } after → rest | revisit ;
+//  The capture is retained in the before context if it is referenced
+//  elsewhere in the result.
+Rule * eliminateTrivialCapture(ConversionRule * r) {
+    const RuleSide * src = r->getLeftSide();
+    const RuleSide * res = r->getRightSide();
+    Capture * c = trivialCapture(r);
+    if (c == nullptr) return r;
+    RE * completed = res->getCompletedResult();
+    std::vector<RE *> items;
+    if (const Seq * seq = dyn_cast<Seq>(completed)) {
+        items.assign(seq->begin(), seq->end());
+    } else {
+        items.push_back(completed);
+    }
+    RE * rest = makeSeq(items.begin() + 1, items.end());
+    const bool referenced = referencesCapture(rest, c) || referencesCapture(res->getResultToRevisit(), c);
+    RE * moved = referenced ? static_cast<RE *>(c) : c->getCapturedRE();
+    RE * before = src->hasBeforeContext() ? makeSeq({src->getBeforeContext(), moved}) : moved;
+    RE * text = makeSeq();
+    if (const Seq * seq = dyn_cast<Seq>(src->getText())) text = makeSeq(seq->begin() + 1, seq->end());
+    RuleSide * source = RuleSide::Create(before, text, false, nullptr, 0, src->getAfterContext());
+    RuleSide * result = RuleSide::Create(nullptr, rest, res->hasCursor(), res->getResultToRevisit(), res->getCursorOffset(), nullptr);
+    // Renumber the captures, as the moved capture may no longer be a capture.
+    return CaptureRewriter().rewrite(makeConversionRule(source, Direction::Forward, result));
+}
+
+//  Whether a trivial capture rule with a text (X) Y may also match within its
+//  own text without changing the result: its text is (X) X+ (the repetition
+//  possessive, so that the transformed rule X { X+ } takes the whole run).
+bool selfOverlapSafe(const ConversionRule * r) {
+    const Seq * seq = dyn_cast<Seq>(r->getLeftSide()->getText());
+    if (seq == nullptr || seq->size() != 2) return false;
+    const Capture * c = dyn_cast<Capture>(seq->front());
+    const Rep * rep = dyn_cast<Rep>(seq->back());
+    return c && rep && rep->getLB() >= 1 && rep->getUB() == Rep::UNBOUNDED_REP
+           && printPattern(rep->getRE()) == printPattern(c->getCapturedRE());
+}
+
+//  Whether the transformed rule X { Y } → rest of a trivial capture rule with a
+//  text (X) Y cannot apply again right after itself: its before context, matched
+//  against the converted text (in which X is followed by rest), cannot match
+//  there, as rest is not empty and its last character cannot be the last of X.
+//  (With an empty rest, X { Y } → would apply to each Y following X, where
+//  (X) Y → $1 applies only once.)
+bool notReapplied(const ConversionRule * r, const Capture * c) {
+    RE * completed = r->getRightSide()->getCompletedResult();
+    const Seq * seq = dyn_cast<Seq>(completed);
+    if (seq == nullptr || seq->size() < 2) return false;
+    std::function<bool (const RE *, char32_t &)> lastChar = [&](const RE * re, char32_t & last) {
+        if (const CC * cc = dyn_cast<CC>(re)) {
+            if (cc->count() != 1) return false;
+            last = static_cast<char32_t>(cc->min_codepoint());
+            return true;
+        } else if (const Seq * s = dyn_cast<Seq>(re)) {
+            return !s->empty() && lastChar(s->back(), last);
+        } else if (const Name * n = dyn_cast<Name>(re)) {
+            return !isFunctionCall(n) && n->getDefinition() && lastChar(n->getDefinition(), last);
+        }
+        return false;
+    };
+    char32_t last;
+    if (!lastChar(seq->back(), last)) return false;
+    //  The characters X may match (a superset of those it may end with).
+    std::function<bool (const RE *, UCD::UnicodeSet &)> chars = [&](const RE * re, UCD::UnicodeSet & set) {
+        CharSetAnalysis sets;
+        if (CharSetAnalysis::isSet(re)) {
+            set = set + sets.setOf(re, true);
+            return true;
+        } else if (const Seq * s = dyn_cast<Seq>(re)) {
+            for (const RE * e : *s) if (!chars(e, set)) return false;
+            return true;
+        } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+            for (const RE * e : *alt) if (!chars(e, set)) return false;
+            return true;
+        } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+            return chars(rep->getRE(), set);
+        } else if (const Name * n = dyn_cast<Name>(re)) {
+            return !isFunctionCall(n) && n->getDefinition() && chars(n->getDefinition(), set);
+        }
+        return false;
+    };
+    UCD::UnicodeSet x;
+    return chars(c->getCapturedRE(), x) && !x.contains(last);
+}
+
+} // end anonymous namespace
+
+std::vector<Capture *> findNullableCaptures(const RuleSide * side, bool includeRepeated) {
+    std::vector<Capture *> found;
+    findNullableCaptures(side->getBeforeContext(), false, includeRepeated, found);
+    findNullableCaptures(side->getText(), false, includeRepeated, found);
+    findNullableCaptures(side->getAfterContext(), false, includeRepeated, found);
+    return found;
+}
+
+std::vector<Rule *> TrivialCaptureElimination(const std::vector<Rule *> & rules, TrivialCaptureStats * stats, bool allowEmptyText,
+                                              bool allowFollowingText) {
+    std::vector<Rule *> result(rules);
+    RuleOverlapAnalysis analysis;
+    // The group of each rule: the transform rules separate groups.
+    std::vector<size_t> groupStart(rules.size());
+    std::vector<size_t> groupEnd(rules.size());
+    for (size_t i = 0, start = 0; i <= rules.size(); i++) {
+        if (i == rules.size() || isa<TransformRule>(rules[i])) {
+            for (size_t j = start; j < i; j++) {
+                groupStart[j] = start;
+                groupEnd[j] = i;
+            }
+            start = i + 1;
+        }
+    }
+    auto competitor = [&](size_t j) -> const ConversionRule * {
+        const ConversionRule * s = dyn_cast<ConversionRule>(result[j]);
+        return (s && appliesForward(s->getDirection())) ? s : nullptr;
+    };
+    for (size_t i = 0; i < rules.size(); i++) {
+        ConversionRule * r = dyn_cast<ConversionRule>(rules[i]);
+        if (r == nullptr || trivialCapture(r) == nullptr) continue;
+        if (!allowEmptyText && isa<Capture>(r->getLeftSide()->getText())) continue;
+        if (!allowFollowingText && isa<Seq>(r->getLeftSide()->getText()) && !selfOverlapSafe(r)) continue;
+        if (stats) stats->candidates++;
+        TrivialCaptureStats::Blocked blocked{r, {}, {}};
+        for (size_t j = groupStart[i]; j < groupEnd[i]; j++) {
+            if (j == i) continue;
+            const ConversionRule * s = competitor(j);
+            if (s == nullptr) continue;
+            // A later rule that may match at the start of X.
+            if (j > i && analysis.mayOverlap(r, s)) blocked.laterRules.push_back(s);
+            // Any rule that may match at a position within X.
+            if (analysis.mayMatchWithin(s, r)) blocked.withinRules.push_back(s);
+        }
+        // With a text (X) Y, also the rule itself, within X or at Y.
+        if (isa<Seq>(r->getLeftSide()->getText()) && !selfOverlapSafe(r)
+                && (analysis.mayMatchWithin(r, r) || !notReapplied(r, trivialCapture(r)))) {
+            blocked.withinRules.push_back(r);
+        }
+        if (!blocked.laterRules.empty() || !blocked.withinRules.empty()) {
+            if (stats) {
+                stats->blockedByLaterRule += !blocked.laterRules.empty();
+                stats->blockedWithinCapture += blocked.laterRules.empty();
+                stats->blocked.push_back(std::move(blocked));
+            }
+            continue;
+        }
+        ConversionRule * transformed = cast<ConversionRule>(eliminateTrivialCapture(r));
+        result[i] = transformed;
+        if (stats) {
+            stats->transformed.push_back(transformed);
+            // An earlier rule that may match at the end of X, where the
+            // transformed rule now applies.
+            for (size_t j = groupStart[i]; j < i; j++) {
+                const ConversionRule * s = competitor(j);
+                if (s && analysis.mayOverlap(s, transformed)) {
+                    stats->endPositionConflicts++;
+                    break;
+                }
+            }
+        }
+    }
+    return result;
+}
+
+namespace {
+
+//  The references of a result side part, including those in the arguments of
+//  function calls.
+void collectReferences(RE * re, std::vector<RE *> & refs) {
+    if (re == nullptr) return;
+    if (isa<Reference>(re)) {
+        refs.push_back(re);
+    } else if (Name * n = dyn_cast<Name>(re)) {
+        if (isFunctionCall(n)) collectReferences(n->getDefinition(), refs);
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) collectReferences(e, refs);
+    }
+}
+
+//  Renumbers the captures of a source side in order (by name, as the
+//  captures enclosing removed ones are new objects) and updates the
+//  references of the result side.
+class CaptureRenamer {
+public:
+    RE * source(RE * re) {
+        if (re == nullptr) return nullptr;
+        if (Capture * c = dyn_cast<Capture>(re)) {
+            const std::string name = std::to_string(++mCount);
+            Capture * renamed = makeCapture(name, source(c->getCapturedRE()));
+            mByName.emplace(c->getName(), renamed);
+            return renamed;
+        } else if (Seq * seq = dyn_cast<Seq>(re)) {
+            std::vector<RE *> items;
+            for (RE * e : *seq) items.push_back(source(e));
+            return makeSeq(items.begin(), items.end());
+        } else if (Rep * rep = dyn_cast<Rep>(re)) {
+            return makeRep(source(rep->getRE()), rep->getLB(), rep->getUB());
+        }
+        return re;
+    }
+    RE * result(RE * re) {
+        if (re == nullptr) return nullptr;
+        if (Reference * ref = dyn_cast<Reference>(re)) {
+            auto f = mByName.find(ref->getName());
+            if (f == mByName.end()) return re;
+            return makeReference(f->second->getName(), f->second, ref->getInstance());
+        } else if (Name * n = dyn_cast<Name>(re)) {
+            if (isFunctionCall(n)) return makeFunctionCall(getFunctionID(n), result(n->getDefinition()));
+            return re;
+        } else if (Seq * seq = dyn_cast<Seq>(re)) {
+            std::vector<RE *> items;
+            for (RE * e : *seq) items.push_back(result(e));
+            return makeSeq(items.begin(), items.end());
+        }
+        return re;
+    }
+private:
+    unsigned mCount = 0;
+    std::map<std::string, Capture *> mByName;
+};
+
+}
+
+std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules) {
+    std::vector<Rule *> result;
+    for (Rule * r : rules) {
+        ConversionRule * const c = dyn_cast<ConversionRule>(r);
+        if (c == nullptr || c->getDirection() != Direction::Forward) {
+            result.push_back(r);
+            continue;
+        }
+        const RuleSide * const src = c->getLeftSide();
+        const RuleSide * const res = c->getRightSide();
+        std::vector<RE *> refs;
+        collectReferences(res->getBeforeContext(), refs);
+        collectReferences(res->getCompletedResult(), refs);
+        collectReferences(res->getResultToRevisit(), refs);
+        collectReferences(res->getAfterContext(), refs);
+        std::set<const Capture *> captures;
+        for (RE * part : {src->getBeforeContext(), src->getText(), src->getAfterContext()}) {
+            if (part) collectCaptures(part, captures);
+        }
+        std::set<std::string> referenced;
+        for (RE * ref : refs) referenced.insert(cast<Reference>(ref)->getName());
+        bool unreferenced = false;
+        for (const Capture * cap : captures) unreferenced |= referenced.count(cap->getName()) == 0;
+        if (!unreferenced) {
+            result.push_back(r);
+            continue;
+        }
+        RE * const referencing = makeSeq(refs.begin(), refs.end());
+        auto remove = [&](RE * part) {return part ? removeUnneededCaptures(part, referencing) : nullptr;};
+        CaptureRenamer renamer;
+        // Captures are numbered in order of their opening parentheses.
+        RE * const before = renamer.source(remove(src->getBeforeContext()));
+        RE * const text = renamer.source(remove(src->getText()));
+        RE * const after = renamer.source(remove(src->getAfterContext()));
+        RuleSide * const source = RuleSide::Create(before, text, false, nullptr, 0, after);
+        RuleSide * const replaced = RuleSide::Create(renamer.result(res->getBeforeContext()),
+                                                     renamer.result(res->getCompletedResult()),
+                                                     res->hasCursor(),
+                                                     renamer.result(res->getResultToRevisit()),
+                                                     res->getCursorOffset(),
+                                                     renamer.result(res->getAfterContext()));
+        result.push_back(makeConversionRule(source, Direction::Forward, replaced));
+    }
+    return result;
+}
+
+std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules) {
+    std::vector<Rule *> result;
+    for (Rule * r : rules) {
+        ConversionRule * c = dyn_cast<ConversionRule>(r);
+        if (c && c->getDirection() == Direction::Forward) {
+            eliminate(c, result);
+        } else {
+            result.push_back(r);
+        }
+    }
+    return result;
+}
+
+}

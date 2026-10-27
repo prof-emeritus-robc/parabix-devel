@@ -26,8 +26,9 @@ endfunction(parabix_add_kernel_test)
 
 ###   Test Targets   ###
 parabix_add_kernel_test(meta_tests kernel.streamutils)
-parabix_add_kernel_test(test_scan kernel.basis kernel.scan kernel.unicode)
+parabix_add_kernel_test(test_scan kernel.basis kernel.scan kernel.unicode kernel.util)
 parabix_add_kernel_test(test_bit_movement kernel.streamutils)
+parabix_add_kernel_test(test_run_replace kernel.streamutils)
 parabix_add_kernel_test(index_test kernel.streamutils)
 parabix_add_kernel_test(nesting_tests kernel.util)
 parabix_add_kernel_test(everynth_tests pablo.compiler)
@@ -35,7 +36,97 @@ parabix_add_kernel_test(test_repeatingstreamset kernel.io)
 parabix_add_kernel_test(test_bitwise_kernels kernel.bitwise)
 parabix_add_kernel_test(test_bytefilterandspread kernel.io kernel.streamutils)
 parabix_add_kernel_test(test_emptyprogram kernel.io)
+parabix_add_kernel_test(test_emptystreamset kernel.basis kernel.streamutils)
 parabix_add_kernel_test(test_truncatedstreamset kernel.io)
+parabix_add_kernel_test(test_sorting kernel.streamutils)
+parabix_add_kernel_test(test_hex_decode kernel.util)
+
+# ProvisionalLookAheadStride: compare provisional and normal processing of a lookahead chain with a reference
+parabix_add_executable(NAME provisional_lookahead SRC provisional_lookahead.cpp
+                       DEPS pablo.compiler kernel.basis kernel.io kernel.pipeline toolchain)
+add_test(NAME provisional_lookahead_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/provisional_lookahead_test.py ${TEST_BIN_DIR}/provisional_lookahead)
+
+# LocalCarries: compare rebuilt and stored carries of an advance chain with a reference
+parabix_add_executable(NAME local_carries SRC local_carries.cpp
+                       DEPS pablo.compiler kernel.basis kernel.io kernel.pipeline toolchain)
+add_test(NAME local_carries_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/local_carries_test.py ${TEST_BIN_DIR}/local_carries)
+
+# Clearing of a wide stream's output past its final produced item, checked with a reference
+parabix_add_executable(NAME unwritten_wide_output SRC unwritten_wide_output.cpp
+                       DEPS kernel.io kernel.pipeline toolchain)
+add_test(NAME unwritten_wide_output_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/unwritten_wide_output_test.py ${TEST_BIN_DIR}/unwritten_wide_output)
+
+# The preconditions of the regular expression engine and the passes of its goals (no pipeline compiled)
+parabix_add_executable(NAME re_preconditions SRC re_preconditions.cpp
+                       DEPS kernel.re re.parse re.unicode toolchain)
+add_test(NAME re_preconditions_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ./re_preconditions)
+
+# Replacement patterns of search and replace and their analyses (no pipeline compiled)
+parabix_add_executable(NAME re_replacement SRC re_replacement.cpp
+                       DEPS re.parse re.analysis re.adt re.unicode toolchain)
+add_test(NAME re_replacement_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ./re_replacement)
+
+# Multiplexed alphabets: partitions, codes and their basis (no pipeline compiled)
+parabix_add_executable(NAME multiplexed_alphabet SRC multiplexed_alphabet.cpp
+                       DEPS re.adt)
+add_test(NAME multiplexed_alphabet_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ./multiplexed_alphabet)
+
+# The regular expression engine over the codes of a multiplexed alphabet, compared with the Unicode basis
+parabix_add_executable(NAME multiplexed_engine SRC multiplexed_engine.cpp
+                       DEPS kernel.re kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.unicode kernel.util re.parse toolchain)
+add_test(NAME multiplexed_engine_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/multiplexed_engine_test.py ${TEST_BIN_DIR}/multiplexed_engine)
+
+# The MatchStarts mode of the regular expression engine, checked with Python's re
+parabix_add_executable(NAME match_starts SRC match_starts.cpp
+                       DEPS kernel.re kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.util re.parse toolchain)
+add_test(NAME match_starts_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/match_starts_test.py ${TEST_BIN_DIR}/match_starts)
+# The same, over the codes of multiplexed alphabets where the RE allows them
+add_test(NAME match_starts_multiplexed_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/match_starts_test.py ${TEST_BIN_DIR}/match_starts)
+set_tests_properties(match_starts_multiplexed_test PROPERTIES ENVIRONMENT "TEST_FLAGS=--re-multiplex=force")
+
+# The boundaries of captures in a search and replace, checked with Python's re
+parabix_add_executable(NAME capture_spans SRC capture_spans.cpp
+                       DEPS kernel.re kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.util re.parse toolchain)
+add_test(NAME capture_spans_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/capture_spans_test.py ${TEST_BIN_DIR}/capture_spans)
+add_test(NAME capture_spans_multiplexed_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/capture_spans_test.py ${TEST_BIN_DIR}/capture_spans)
+set_tests_properties(capture_spans_multiplexed_test PROPERTIES ENVIRONMENT "TEST_FLAGS=--re-multiplex=force")
+
+# Regions reversed in place (kernel::RegionReversal), checked with Python
+parabix_add_executable(NAME region_reversal SRC region_reversal.cpp
+                       DEPS kernel.basis kernel.io kernel.pipeline kernel.streamutils kernel.unicode re.toolchain toolchain)
+add_test(NAME region_reversal_test
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/region_reversal_test.py ${TEST_BIN_DIR}/region_reversal)
+
+# make_circular_buffer under each --CircularBufferImpl: every copy mirrors the same pages
+parabix_add_executable(NAME test_circular_buffer SRC test_circular_buffer.cpp
+                       DEPS kernel.core toolchain)
+add_test(NAME circular_buffer_test
+    WORKING_DIRECTORY ${TEST_BIN_DIR}
+    COMMAND ${TEST_BIN_DIR}/test_circular_buffer)
+
 
 # `make kernel-tests` to run all kernel tests
 add_custom_target(kernel-tests

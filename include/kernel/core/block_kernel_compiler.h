@@ -25,6 +25,16 @@ protected:
 
     void writeFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingItems);
 
+    void validateProvisionalLookAheadStride(KernelBuilder & b);
+
+    void writeCarryRebuild(KernelBuilder & b, const unsigned strides);
+
+    void writeProvisionalStride(KernelBuilder & b, llvm::Value * const numOfBlocks, llvm::BasicBlock * const segmentDone);
+
+    llvm::Value * saveKernelState(KernelBuilder & b, llvm::StructType * const stateTy, llvm::Value * const handle);
+
+    void restoreKernelState(KernelBuilder & b, llvm::StructType * const stateTy, llvm::Value * const handle, llvm::Value * const saved);
+
 private:
 
     llvm::Function *            mDoBlockMethod;

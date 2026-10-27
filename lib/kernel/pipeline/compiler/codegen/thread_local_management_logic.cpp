@@ -186,12 +186,15 @@ void PipelineCompiler::updateThreadLocalMemoryLoopExitPhiNodes(KernelBuilder & b
  * @brief updateThreadLocalMemoryAtInsufficentIOPhiNodes
  ** ------------------------------------------------------------------------------------------------------------- */
 void PipelineCompiler::updateThreadLocalMemoryAtInsufficentIOPhiNodes(KernelBuilder & b) {
+    // If the partition root executed at least once before running out of input, the
+    // other kernels in the partition will process those strides using the thread-local
+    // memory laid out by the last iteration, so pass that layout (the loop entry values)
+    // through rather than undef.
     BasicBlock * const exitBlock = b.GetInsertBlock();
-    mThreadLocalStreamSetBaseAddressAtExitPhi->addIncoming(UndefValue::get(b.getInt8PtrTy()), exitBlock);
-    Constant * undefVal = UndefValue::get(b.getSizeTy());
+    mThreadLocalStreamSetBaseAddressAtExitPhi->addIncoming(mThreadLocalStreamSetBaseAddressAtEntryPhi, exitBlock);
     for (auto streamSet : mIsThreadLocalStreamSet) {
-        mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(undefVal, exitBlock);
-        mThreadLocalEndOffsetAtExitPhi[streamSet]->addIncoming(undefVal, exitBlock);
+        mThreadLocalStartOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalStartOffsetAtEntryPhi[streamSet], exitBlock);
+        mThreadLocalEndOffsetAtExitPhi[streamSet]->addIncoming(mThreadLocalEndOffsetAtEntryPhi[streamSet], exitBlock);
     }
 }
 

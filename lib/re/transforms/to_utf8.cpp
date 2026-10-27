@@ -64,6 +64,10 @@ RE * UTF8_Transformer::transformCC(CC * cc) {
     return xfrmd;
 }
 
+RE * UTF8_Transformer::transformString(String * s) {
+    return transformStringAsSeq(s);
+}
+
 UTF8_Transformer::UTF8_Transformer(bool useInternalNaming) :
 EncodingTransformer("ToUTF8", &cc::Unicode, &cc::UTF8),
     mInternalNaming(useInternalNaming) {

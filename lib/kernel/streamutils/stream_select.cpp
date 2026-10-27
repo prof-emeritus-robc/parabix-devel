@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <kernel/core/kernel_builder.h>
 #include <llvm/Support/ErrorHandling.h>
+#include <kernel/pipeline/pipeline_builder.h>
 
 using namespace llvm;
 

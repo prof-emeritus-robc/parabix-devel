@@ -26,8 +26,14 @@ enum PreTokenizerMode {
     sequence_whitespace_punctuation
 };
 
-// Split behavior modes for delimiter handling
+// Split behavior modes for delimiter handling.
+// NOTE: "removed" here is HF's real Split(pattern, behavior="removed") --
+// the MATCH is deleted entirely, keeping only the gaps. This is distinct
+// from "excludewhitespace", which several modes force internally and which
+// only ever drops literal whitespace characters (it used to be misnamed
+// "removed", sharing a name with HF's concept without sharing its meaning).
 enum SplitBehaviorMode {
+    excludewhitespace,
     removed,
     isolated,
     mergedwithprevious,
@@ -47,6 +53,9 @@ struct PreTokenizerResult {
     StreamSet * AlphanumericMask;
     StreamSet * PunctuationStream;
     SplitBehaviorMode effectiveBehavior;
+    StreamSet * WordClassMask;         // \w mask; set only for simpleWordBoundaries,
+                                        // nullptr otherwise. Used by the real "removed"
+                                        // behavior to delete matched \w+ characters.
 };
 
 // Stage 2a: compute token boundaries and apply split-behavior rules.
@@ -59,6 +68,12 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     PreTokenizerMode preTokenizer,
     SplitBehaviorMode splitBehavior,
     const std::string & delimiterString);
+
+// --pretok-compress-classes: the byte-domain GPT-2 pretoken starts of buildPreTokenizerBoundaries
+// (bytelevel, no normalizer), straight from the UTF-8 BasisBits. The nine classes are computed
+// on the decoded codepoints in place and only they are compressed to one slot per codepoint,
+// instead of all 21 codepoint bits. Returns U21tokenBoundaries' byte-domain equivalent.
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits);
 
 // Stage 2b: spread codepoints, insert LF separators, filter whitespace.
 // Takes the PreTokenizerResult and returns the final U21 codepoint stream

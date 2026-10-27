@@ -39,6 +39,8 @@ using Scalars = PipelineKernel::Scalars;
  * @brief initializeKernel
  ** ------------------------------------------------------------------------------------------------------------- */
 Kernel * PipelineBuilder::initializeKernel(Kernel * const kernel, const unsigned flags) {
+    kernel->completeBaseInternalScalars(getTypeSystem());
+    kernel->addAutomaticAttributes();
     mDriver.addKernel(kernel);
     mTarget->mKernels.emplace_back(kernel, flags);
     return kernel;
@@ -59,6 +61,36 @@ StreamSet * PipelineBuilder::CreateRepeatingBixNum(unsigned bixNumBits, pattern_
         }
     }
     return CreateRepeatingStreamSet(1, templatePattern, isDynamic);
+}
+
+namespace {
+
+// Produces no items: the kernel terminates in its first segment.
+class EmptyStreamSetKernel final : public SegmentOrientedKernel {
+public:
+    EmptyStreamSetKernel(LLVMTypeSystemInterface & ts, StreamSet * const Empty)
+    : SegmentOrientedKernel(ts, "EmptyStreamSet" + std::to_string(Empty->getNumElements()) + "x" + std::to_string(Empty->getFieldWidth()),
+    {},
+    {Binding{"Empty", Empty}},
+    {}, {}, {}) {
+        addAttribute(MustExplicitlyTerminate());
+    }
+protected:
+    void generateDoSegmentMethod(KernelBuilder & b) override {
+        b.setProducedItemCount("Empty", b.getSize(0));
+        b.setTerminationSignal();
+    }
+};
+
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief CreateEmptyStreamSet
+ ** ------------------------------------------------------------------------------------------------------------- */
+StreamSet * PipelineBuilder::CreateEmptyStreamSet(const unsigned NumElements, const unsigned FieldWidth) {
+    StreamSet * const Empty = CreateStreamSet(NumElements, FieldWidth);
+    CreateKernelCall<EmptyStreamSetKernel>(Empty);
+    return Empty;
 }
 
 /** ------------------------------------------------------------------------------------------------------------- *
@@ -278,6 +310,12 @@ Kernel * PipelineBuilder::makeKernel() {
             }
         }
 
+        // Stage labels change the cycle counter report, so a labelled pipeline must
+        // not share a cache entry with an unlabelled one.
+        for (const auto & L : mTarget->mStageLabels) {
+            sig << "\nS" << L.second << ':' << L.first;
+        }
+
         if (numOfNestedKernelFamilyCalls) {
             sig << '\n';
             mTarget->recursivelyListFamilyKernels(sig);
@@ -435,7 +473,12 @@ Kernel * PipelineBuilder::makeKernel() {
 
             sig << typeCode[(unsigned)r->getClassTypeId()];
 
-            if (LLVM_UNLIKELY(isa<RepeatingStreamSet>(r))) {
+            if (LLVM_UNLIKELY(isa<ScalarConstant>(r))) {
+                // the value is compiled into the pipeline
+                sig << '(';
+                cast<ScalarConstant>(r)->value(mDriver.getContext())->print(sig);
+                sig << ')';
+            } else if (LLVM_UNLIKELY(isa<RepeatingStreamSet>(r))) {
                 const RepeatingStreamSet * rs = cast<RepeatingStreamSet>(r);
                 if (rs->isUnaligned()) {
                     sig << 'U';
@@ -521,6 +564,10 @@ Kernel * PipelineBuilder::makeKernel() {
                     sig << '.' << ds;
                 }
             }
+            // the phase segment limit is compiled into the pipeline
+            if (numOfLayers > 0) {
+                sig << "$L" << codegen::PhaseSegmentLimit << '.' << codegen::PhaseClaimSegments;
+            }
         }
         sig.flush();
 
@@ -554,7 +601,13 @@ Kernel * PipelineBuilder::makeKernel() {
 
     signature = PipelineKernel::annotateSignatureWithPipelineFlags(std::move(signature));
 
-    if (LLVM_UNLIKELY(mTarget->hasInternallyGeneratedStreamSets())) {
+    // Likewise, a family call is listed in the signature only by its family name,
+    // but a top-level program's "main" constructs the specific family kernels (e.g.
+    // the RE kernels of a nested grep pipeline).  Two programs differing only in
+    // those kernels would otherwise share a "_main", and the second would run the
+    // first one's kernels.
+    const bool programWithFamilyCalls = mIsProgram && (mTarget->getNumOfNestedKernelFamilyCalls() > 0);
+    if (LLVM_UNLIKELY(mTarget->hasInternallyGeneratedStreamSets() || programWithFamilyCalls)) {
         // A dynamic RepeatingStreamSet's actual pattern data is deliberately left out of
         // the signature above (it's substituted in later, when addOrDeclareMainFunction
         // bakes it into the compiled "main" as an LLVM Constant -- see

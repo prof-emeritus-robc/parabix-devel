@@ -22,4 +22,9 @@ DEPS
     re.unicode
     pablo.compiler
     pablo.bixnum
+# kernel.bitwise and kernel.streamutils are linked only to build pipelines from their kernels.
+CODEGEN_DEPS
+    re.unicode
+    pablo.compiler
+    pablo.bixnum
 )

@@ -16,7 +16,9 @@
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include <kernel/streamutils/deletion.h>
+#include <kernel/streamutils/focused_transform.h>
 #include <kernel/streamutils/pdep_kernel.h>
+#include <kernel/streamutils/run_replace.h>
 #include <kernel/streamutils/run_index.h>
 #include <kernel/streamutils/sentinel.h>
 #include <kernel/streamutils/sorting.h>
@@ -51,6 +53,7 @@
 #include <ucd/data/PropertyObjectTable.h>
 #include <ucd/utf/utf_compiler.h>
 #include <re/toolchain/toolchain.h>
+#include <kernel/core/streamsetptr.h>
 
 using namespace kernel;
 using namespace llvm;
@@ -60,19 +63,23 @@ using namespace pablo;
 //  See the LLVM CommandLine Library Manual https://llvm.org/docs/CommandLine.html
 static cl::OptionCategory NFD_Options("Decompositon Options", "Decompositon Options.");
 static cl::opt<std::string> inputFile(cl::Positional, cl::desc("<input file>"), cl::Required, cl::cat(NFD_Options));
-static cl::opt<bool> NoFocus("NoFocus", cl::desc("Process the entire file without filtering to narrow the focus of work"), cl::init(false), cl::cat(NFD_Options));
-static cl::opt<bool> ByteMerging("ByteMerging", cl::desc("Use byte stream merging of transformed and unmodified data"), cl::init(false), cl::cat(NFD_Options));
-static cl::opt<bool> ByteReplace("ByteReplace", cl::desc("Perform byte merging using the ByteReplaceByMask kernel"), cl::init(false), cl::cat(NFD_Options));
+//  Aliases for the Focused Transform Options (-reintegrate, -unmodified-filter).
+static cl::opt<bool> ByteMerging("ByteMerging", cl::desc("Same as -reintegrate=byte-spread"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> ByteReplace("ByteReplace", cl::desc("Same as -reintegrate=byte-replace"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> RunFiltering("RunFilter", cl::desc("Same as -unmodified-filter=run (with byte-spread reintegration unless another is given)"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> RunMerging("RunMerge", cl::desc("Same as -reintegrate=run"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> RunReplacement("RunReplace", cl::desc("Same as -RunFilter -RunMerge"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<int> SeparatedPipelineStages("SeparatedPipelineStages", cl::desc("Use multiple separated pipeline stages"), cl::init(0), cl::cat(NFD_Options));
 static cl::opt<bool> FilterViolations("FilterViolations", cl::desc("Only include reorderable sequences in work items if they are misordered or start with a decomposable character"), cl::init(false), cl::cat(NFD_Options));
 static cl::opt<bool> UseIndexedShiftBack("IndexedShiftBack", cl::desc("Use IndexedShiftBack in place of Filter/Spread combination"), cl::init(false), cl::cat(NFD_Options));
-static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers"), cl::init(false), cl::cat(NFD_Options));
+static cl::opt<bool> UseLayers("UseLayers", cl::desc("With -SeparatedPipelineStages=4, a phase boundary after the filter"), cl::init(false), cl::cat(NFD_Options));
 
 #define SHOW_STREAM(name) if (codegen::EnableIllustrator) P.captureBitstream(#name, name)
 #define SHOW_BIXNUM(name) if (codegen::EnableIllustrator) P.captureBixNum(#name, name)
 #define SHOW_BYTES(name) if (codegen::EnableIllustrator) P.captureByteData(#name, name)
 
 void source_input_stage(PipelineBuilder & P, Scalar *const fileDescriptor, StreamSet * ByteStream, StreamSet * BasisBits) {
+    P.SetStageLabel("source");
 
     P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
 
@@ -96,27 +103,54 @@ SourceInputFunctionType source_input_pipeline(CPUDriver & driver) {
     return P.compile();
 }
 
-typedef void (*NFD_FilterFunctionType)(const StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, StreamSetPtr &);
+//  The focused-transform options of nfd: the library options with the earlier nfd
+//  options as aliases.
+static FocusOptions NFD_FocusOptions() {
+    FocusOptions options = FocusOptions::fromCommandLine();
+    if (RunReplacement) {
+        RunFiltering = RunMerging = true;
+    }
+    if (RunFiltering) {
+        options.UnmodifiedFilter = UnmodifiedFilterMode::Run;
+    }
+    if (RunMerging) {
+        options.Reintegration = ReintegrationMode::Run;
+    } else if (ByteReplace) {
+        options.Reintegration = ReintegrationMode::ByteReplace;
+    } else if ((ByteMerging || RunFiltering) && options.Reintegration == ReintegrationMode::Bit) {
+        options.Reintegration = ReintegrationMode::ByteSpread;
+    }
+    return options;
+}
+
+//  The form of the source the reintegration stage takes: bytes or basis bits.
+static bool ReintegratesBytes() {
+    return NFD_FocusOptions().Reintegration != ReintegrationMode::Bit;
+}
+
+typedef void (*NFD_FilterFunctionType)(const StreamSetPtr &, const StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, StreamSetPtr &);
 
 NFD_FilterFunctionType NFD_filter_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver,
+                            Input<streamset_t>("ByteStream", 1, 8),
                             Input<streamset_t>("BasisBits", 8, 1),
                             Output<streamset_t>("WorkSelectionMask", 1, 1, ReturnedBuffer(1)),
                             Output<streamset_t>("FinalWorkPlacementMask", 1, 1, ReturnedBuffer(1)),
                             Output<streamset_t>("WorkingBasis", 8, 1, ReturnedBuffer(1))
                             );
     NFD_PipelineBuilder NFD_builder(P);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     StreamSet * const BasisBits = P.getInputStreamSet("BasisBits");
     StreamSet * const WorkSelectionMask = P.getOutputStreamSet("WorkSelectionMask");
     StreamSet * const FinalWorkPlacementMask = P.getOutputStreamSet("FinalWorkPlacementMask");
     StreamSet * const WorkingBasis = P.getOutputStreamSet("WorkingBasis");
 
-    NFD_builder.NFD_FilterStage(BasisBits, WorkSelectionMask, WorkingBasis);
-    if (UseLayers) {
+    NFD.focus(P, BasisBits, WorkSelectionMask);
+    NFD.filter(P, P.getInputStreamSet("ByteStream"), BasisBits, WorkSelectionMask, WorkingBasis);
+    if (UseLayers || NFD.getOptions().layerAfter(FocusStage::Filter)) {
         P.InsertPhaseBoundary();
     }
-
-    NFD_builder.ComputeWorkPlacementMask(BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
+    NFD.placement(P, BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
     return P.compile();
 }
 
@@ -128,108 +162,61 @@ NFD_TransformFunctionType NFD_transform_pipeline(CPUDriver & driver) {
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1))
                             );
     NFD_PipelineBuilder NFD_builder(P);
-    StreamSet * const WorkingBasis = P.getInputStreamSet("WorkingBasis");
-    StreamSet * const TransformedBasis = P.getOutputStreamSet("TransformedBasis");
-
-    NFD_builder.NFD_U8_Pipeline(WorkingBasis, TransformedBasis);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
+    NFD.transform(P, P.getInputStreamSet("WorkingBasis"), P.getOutputStreamSet("TransformedBasis"));
     return P.compile();
-}
-
-void OutputAssemblyStage(PipelineBuilder & P, StreamSet * WorkSelectionMask, StreamSet * FinalWorkPlacementMask, StreamSet * Source, StreamSet * TransformedBasis) {
-
-    StreamSet * const NonModifiedMask = P.CreateStreamSet(1, 1);
-    Invert(P, WorkSelectionMask, NonModifiedMask);
-    SHOW_STREAM(NonModifiedMask);
-
-    StreamSet * const OutputBytes = P.CreateStreamSet(1, 8);
-    if (ByteMerging) {
-        StreamSet * const NonModified = P.CreateStreamSet(1, 8);
-        FilterByMask(P, NonModifiedMask, Source, NonModified);
-        SHOW_BYTES(NonModified);
-
-        StreamSet * const NonModifiedPlacementMask = P.CreateStreamSet(1, 1);
-        Invert(P, FinalWorkPlacementMask, NonModifiedPlacementMask);
-        SHOW_STREAM(NonModifiedPlacementMask);
-
-        StreamSet * const NonModifiedPlaced = P.CreateStreamSet(1, 8);
-        SpreadByMask(P, NonModifiedPlacementMask, NonModified, NonModifiedPlaced);
-
-        StreamSet * const TransformedBytes = P.CreateStreamSet(1, 8);
-        P.CreateKernelCall<P2SKernel>(TransformedBasis, TransformedBytes);
-
-        if (ByteReplace) {
-            P.CreateKernelCall<ByteReplaceByMask>(FinalWorkPlacementMask, NonModifiedPlaced, TransformedBytes, OutputBytes);
-        } else {
-            StreamSet * const TransformedPlaced = P.CreateStreamSet(1, 8);
-            SpreadByMask(P, FinalWorkPlacementMask, TransformedBytes, TransformedPlaced);
-
-            OrCombine(P, NonModifiedPlaced, TransformedPlaced, OutputBytes);
-        }
-    } else {
-        StreamSet * const NonModifiedBasis = P.CreateStreamSet(8);
-        FilterByMask(P, NonModifiedMask, Source, NonModifiedBasis);
-        SHOW_BIXNUM(NonModifiedBasis);
-
-        StreamSet * const OutputBasis = P.CreateStreamSet(8);
-        MergeByMask(P, FinalWorkPlacementMask, TransformedBasis, NonModifiedBasis, OutputBasis);
-        SHOW_BIXNUM(OutputBasis);
-
-        P.CreateKernelCall<P2SKernel>(OutputBasis, OutputBytes);
-    }
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
-}
-
-void SimpleOutputStage(PipelineBuilder & P, StreamSet * TransformedBasis) {
-    StreamSet * const OutputBytes = P.CreateStreamSet(1, 8);
-    P.CreateKernelCall<P2SKernel>(TransformedBasis, OutputBytes);
-    P.CreateKernelCall<StdOutKernel>(OutputBytes);
 }
 
 typedef void (*CombinedWorkFunctionType)(StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, StreamSetPtr &, uint32_t fd);
 
 CombinedWorkFunctionType generate_combined_work_pipeline(CPUDriver & driver) {
+    const bool bytes = ReintegratesBytes();
     auto P = CreatePipeline(driver,
                             Output<streamset_t>("WorkSelectionMask", 1, 1, ReturnedBuffer(1)),
                             Output<streamset_t>("FinalWorkPlacementMask", 1, 1, ReturnedBuffer(1)),
-                            Output<streamset_t>("ByteStream", 1, 8, ReturnedBuffer(1)),
+                            // the source data in the form generate_output_pipeline expects
+                            Output<streamset_t>("Source", bytes ? 1 : 8, bytes ? 8 : 1, ReturnedBuffer(1)),
                             Output<streamset_t>("TransformedBasis", 8, 1, ReturnedBuffer(1)),
                             Input<uint32_t>("inputFileDecriptor")
                             );
     NFD_PipelineBuilder NFD_builder(P);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     StreamSet * const WorkSelectionMask = P.getOutputStreamSet("WorkSelectionMask");
     StreamSet * const FinalWorkPlacementMask = P.getOutputStreamSet("FinalWorkPlacementMask");
-    StreamSet * const ByteStream = P.getOutputStreamSet("ByteStream");
+    StreamSet * const Source = P.getOutputStreamSet("Source");
     StreamSet * const TransformedBasis = P.getOutputStreamSet("TransformedBasis");
 
-    StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
+    StreamSet * const ByteStream = bytes ? Source : P.CreateStreamSet(1, 8);
+    StreamSet * const BasisBits = bytes ? P.CreateStreamSet(8, 1) : Source;
     source_input_stage(P, fileDescriptor, ByteStream, BasisBits);
 
-    StreamSet * WorkingBasis = P.CreateStreamSet(8, 1);
-    NFD_builder.NFD_FilterStage(BasisBits, WorkSelectionMask, WorkingBasis);
-    NFD_builder.ComputeWorkPlacementMask(BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
-
-    NFD_builder.NFD_U8_Pipeline(WorkingBasis, TransformedBasis);
-
+    NFD.focus(P, BasisBits, WorkSelectionMask);
+    StreamSet * const WorkingBasis = NFD.filter(P, ByteStream, BasisBits, WorkSelectionMask);
+    NFD.placement(P, BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
+    NFD.transform(P, WorkingBasis, TransformedBasis);
     return P.compile();
 }
 
 typedef void (*OutputAssemblyFunctionType)(const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &, const StreamSetPtr &);
 
 OutputAssemblyFunctionType generate_output_pipeline(CPUDriver & driver) {
+    const bool bytes = ReintegratesBytes();
     auto P = CreatePipeline(driver,
                             Input<streamset_t>("WorkSelectionMask", 1, 1),
                             Input<streamset_t>("FinalWorkPlacementMask", 1, 1),
-                            Input<streamset_t>("Source", ByteMerging ? 1 : 8, ByteMerging ? 8 : 1),
+                            Input<streamset_t>("Source", bytes ? 1 : 8, bytes ? 8 : 1),
                             Input<streamset_t>("TransformedBasis", 8, 1)
                             );
-    StreamSet * const WorkSelectionMask = P.getInputStreamSet("WorkSelectionMask");
-    StreamSet * const FinalWorkPlacementMask = P.getInputStreamSet("FinalWorkPlacementMask");
+    NFD_PipelineBuilder NFD_builder(P);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     StreamSet * const Source = P.getInputStreamSet("Source");
-    StreamSet * const TransformedBasis = P.getInputStreamSet("TransformedBasis");
-
-    OutputAssemblyStage(P, WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis);
+    StreamSet * const OutputBytes = NFD.reintegrate(P, P.getInputStreamSet("WorkSelectionMask"),
+                                                    P.getInputStreamSet("FinalWorkPlacementMask"),
+                                                    bytes ? Source : nullptr, bytes ? nullptr : Source,
+                                                    P.getInputStreamSet("TransformedBasis"));
+    P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
 }
 
@@ -238,54 +225,45 @@ typedef void (*XfrmFunctionType)(uint32_t fd);
 XfrmFunctionType generate_unitary_pipeline(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>("inputFileDecriptor"));
     NFD_PipelineBuilder NFD_builder(P);
+    const auto NFD = NFD_FocusedTransform(NFD_builder, NFD_FocusOptions());
     Scalar * fileDescriptor = P.getInputScalar("inputFileDecriptor");
 
     StreamSet * ByteStream = P.CreateStreamSet(1, 8);
     StreamSet * const BasisBits = P.CreateStreamSet(8, 1);
     source_input_stage(P, fileDescriptor, ByteStream, BasisBits);
 
-    if (NoFocus) {
-        StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
-        NFD_builder.NFD_U8_Pipeline(BasisBits, TransformedBasis);
-
-        SimpleOutputStage(P, TransformedBasis);
-    } else {
-        StreamSet * WorkSelectionMask = P.CreateStreamSet(1, 1);
-        StreamSet * FinalWorkPlacementMask = P.CreateStreamSet(1, 1);
-        StreamSet * WorkingBasis = P.CreateStreamSet(8, 1);
-        NFD_builder.NFD_FilterStage(BasisBits, WorkSelectionMask, WorkingBasis);
-        NFD_builder.ComputeWorkPlacementMask(BasisBits, WorkSelectionMask, FinalWorkPlacementMask);
-
-        StreamSet * TransformedBasis = P.CreateStreamSet(8, 1);
-        NFD_builder.NFD_U8_Pipeline(WorkingBasis, TransformedBasis);
-
-        OutputAssemblyStage(P, WorkSelectionMask, FinalWorkPlacementMask, ByteMerging ? ByteStream : BasisBits, TransformedBasis);
-    }
+    StreamSet * const OutputBytes = NFD.build(P, ByteStream, BasisBits);
+    P.CreateKernelCall<StdOutKernel>(OutputBytes);
     return P.compile();
 }
 
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&NFD_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
+    codegen::ParseCommandLineOptions(argc, argv, {&NFD_Options, &FocusedTransformOptions(), &NormalizationOptions(), &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     const int fd = open(inputFile.c_str(), O_RDONLY);
     if (LLVM_UNLIKELY(fd == -1)) {
         llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
         exit(-1);
     }
-    if (ByteReplace) ByteMerging = true;
     if (UseIndexedShiftBack) FilterViolations = true;
+    if (SeparatedPipelineStages == 4 && (UseLayers || NFD_FocusOptions().layerAfter(FocusStage::Filter)) &&
+            NFD_FocusOptions().FocusFilter != FocusFilterMode::Bit) {
+        // With a phase boundary, a filter stage that reads the ByteStream input of the
+        // filter pipeline makes the pipeline compiler report a cycle.
+        llvm::report_fatal_error("-SeparatedPipelineStages=4 with -UseLayers requires -focus-filter=bit");
+    }
     CPUDriver driver("NFD_function");
     if (SeparatedPipelineStages == 2) {
         CombinedWorkFunctionType working_stages = generate_combined_work_pipeline(driver);
         kernel::StreamSetPtr WorkSelectionMask;
         kernel::StreamSetPtr FinalWorkPlacementMask;
-        kernel::StreamSetPtr ByteStream;
+        kernel::StreamSetPtr Source;
         kernel::StreamSetPtr TransformedBasis;
-        working_stages(WorkSelectionMask, FinalWorkPlacementMask, ByteStream, TransformedBasis, fd);
+        working_stages(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis, fd);
         close(fd);
 
         OutputAssemblyFunctionType stage3 = generate_output_pipeline(driver);
-        stage3(WorkSelectionMask, FinalWorkPlacementMask, ByteStream, TransformedBasis);
+        stage3(WorkSelectionMask, FinalWorkPlacementMask, Source, TransformedBasis);
     } else if (SeparatedPipelineStages == 4) {
         SourceInputFunctionType stage0 = source_input_pipeline(driver);
         kernel::StreamSetPtr ByteStream;
@@ -297,14 +275,14 @@ int main(int argc, char *argv[]) {
         kernel::StreamSetPtr WorkSelectionMask;
         kernel::StreamSetPtr FinalWorkPlacementMask;
         kernel::StreamSetPtr WorkingBasis;
-        stage1(BasisBits, WorkSelectionMask, FinalWorkPlacementMask, WorkingBasis);
+        stage1(ByteStream, BasisBits, WorkSelectionMask, FinalWorkPlacementMask, WorkingBasis);
 
         NFD_TransformFunctionType stage2 = NFD_transform_pipeline(driver);
         kernel::StreamSetPtr TransformedBasis;
         stage2(WorkingBasis, TransformedBasis);
 
         OutputAssemblyFunctionType stage3 = generate_output_pipeline(driver);
-        stage3(WorkSelectionMask, FinalWorkPlacementMask, ByteMerging ? ByteStream : BasisBits, TransformedBasis);
+        stage3(WorkSelectionMask, FinalWorkPlacementMask, ReintegratesBytes() ? ByteStream : BasisBits, TransformedBasis);
     } else {
         XfrmFunctionType fn = generate_unitary_pipeline(driver);
         fn(fd);

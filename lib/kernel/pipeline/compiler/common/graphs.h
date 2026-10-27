@@ -421,6 +421,7 @@ enum BufferPortType : unsigned {
     IsShared = 32,
     IsManaged = 64,
     CanModifySegmentLength = 128,
+    IsAddCarry = 256,
     Illustrated = 512,
     InputMayBeTruncated = 1024,
     InputMayBeImplicitlyZeroExtended = 2048,
@@ -447,6 +448,10 @@ struct BufferPort {
     int LookAhead = 0;
     int LookBehind = 0;
     int EmptyOverflow = 0;
+    // On an output: space its producer leaves free past the produced items for a
+    // consumer with a provisional stride, which reads a stride (and its lookahead)
+    // beyond them (see identifyProvisionalStrideKernels).
+    int ProvisionalOverflow = 0;
 
     bool isPrincipal() const {
         return (Flags & BufferPortType::IsPrincipal) != 0;
@@ -466,6 +471,10 @@ struct BufferPort {
 
     bool isRelative() const {
         return (Flags & BufferPortType::IsRelative) != 0;
+    }
+
+    bool isAddCarry() const {
+        return (Flags & BufferPortType::IsAddCarry) != 0;
     }
 
     bool isShared() const {

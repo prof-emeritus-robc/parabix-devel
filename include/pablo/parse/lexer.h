@@ -8,9 +8,9 @@
 #include <memory>
 #include <vector>
 #include <boost/optional.hpp>
-#include <pablo/parse/error.h>
-#include <pablo/parse/token.h>
 #include <pablo/parse/source_file.h>
+#include <pablo/parse/error.h>
+namespace pablo { namespace parse { class Token; } }
 
 namespace pablo {
 namespace parse {

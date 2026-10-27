@@ -14,7 +14,6 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.util
     toolchain
 )
 
@@ -46,7 +45,6 @@ DEPS
     kernel.pipeline
     kernel.streamutils
     kernel.unicode
-    kernel.util
     toolchain
     re.cc
     re.parse

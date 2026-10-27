@@ -21,7 +21,7 @@
 #include <re/parse/fixed_string_parser.h>
 #include <re/adt/adt.h>
 #include <re/adt/re_utility.h>
-#include <re/printer/re_printer.h>
+#include <re/toolchain/toolchain.h>
 #include <ucd/core/unicode_set.h>
 #include <ucd/data/RadicalSets.h>
 
@@ -46,6 +46,9 @@ RE * RE_Parser::parse(const std::string & regular_expression, ModeFlagSet initia
         case RE_Syntax::FileGLOB:
             parser = std::make_unique<FileGLOB_Parser>(regular_expression);
             break;
+        case RE_Syntax::GrepGLOB:
+            parser = std::make_unique<FileGLOB_Parser>(regular_expression, GLOB_kind::Grep);
+            break;
         case RE_Syntax::GitGLOB:
             parser = std::make_unique<FileGLOB_Parser>(regular_expression, GLOB_kind::GIT);
             break;
@@ -58,6 +61,14 @@ RE * RE_Parser::parse(const std::string & regular_expression, ModeFlagSet initia
     }
     parser->fByteMode = ByteMode;
     parser->fModeFlagSet = initialFlags;
+    // (-i applies to search patterns, not to the file name patterns of
+    // --include/--exclude and .gitignore files.)
+    parser->fIgnoreCase = re::IgnoreCaseFlag && (syntax != RE_Syntax::GrepGLOB) && (syntax != RE_Syntax::GitGLOB);
+    if (parser->fIgnoreCase) {
+        // parse_RE wraps the result in a case-insensitive group; the mode flag
+        // must agree so that (?-i) and (?-i:...) register as changes.
+        parser->fModeFlagSet |= CASE_INSENSITIVE_MODE_FLAG;
+    }
     parser->mGroupsOpen = 0;
     parser->fNested = false;
     parser->mCaptureGroupCount = 0;
@@ -79,7 +90,12 @@ RE * RE_Parser::makeBranchResetGroup(RE * r) {
 }
 
 RE * RE_Parser::parse_RE() {
-    return parse_alt();
+    RE * top_level_result = parse_alt();
+    if (fIgnoreCase) {
+        top_level_result =
+            Group::Create(Group::Mode::CaseInsensitiveMode, top_level_result, Group::Sense::On);
+    }
+    return top_level_result;
 }
 
 RE * RE_Parser::parse_alt() {
@@ -93,7 +109,7 @@ RE * RE_Parser::parse_alt() {
     
 RE * RE_Parser::parse_seq() {
     std::vector<RE *> seq;
-    if (!mCursor.more() || (*mCursor == '|') || ((mGroupsOpen > 0) && (*mCursor == ')'))) return makeSeq();
+    if (!mCursor.more() || (*mCursor == '|') || ((mGroupsOpen > 0) && (*mCursor == ')'))) return Seq::Create();
     for (;;) {
         RE * re = parse_next_item();
         if (re == nullptr) {
@@ -102,7 +118,7 @@ RE * RE_Parser::parse_seq() {
         re = extend_item(re);
         seq.push_back(re);
     }
-    return makeSeq(seq.begin(), seq.end());
+    return createSeq(seq);
 }
 
 RE * RE_Parser::parse_next_item(std::string break_chars) {
@@ -110,15 +126,15 @@ RE * RE_Parser::parse_next_item(std::string break_chars) {
     else if (((mGroupsOpen > 0) && at(')')) || (fNested && at('}'))) return nullptr;
     else if (accept('^')) return Start::Create();
     else if (accept('$')) return End::Create();
-    else if (accept('.')) return makeAny();
+    else if (accept('.')) return Any::Create();
     else if (accept('(')) return parse_group();
     else if (accept('[')) return parse_extended_bracket_expression();
     else if (accept('\\')) return parse_escaped();
     else {
         auto cp = parse_literal_codepoint();
         auto radicalSet = UCD::getRadicalSet(cp);
-        if (radicalSet == nullptr) return createCC(cp);
-        return makeCC(*radicalSet);
+        if (radicalSet == nullptr) return CC::Create(cp);
+        return CC::Create(*radicalSet);
     }
 }
 
@@ -153,15 +169,15 @@ RE * RE_Parser::parse_mode_group(bool & closing_paren_parsed) {
         RE * group_expr = parse_alt();
         auto changed = fModeFlagSet ^ savedModeFlagSet;
         if ((changed & CASE_INSENSITIVE_MODE_FLAG) != 0) {
-            group_expr = makeGroup(Group::Mode::CaseInsensitiveMode, group_expr,
+            group_expr = Group::Create(Group::Mode::CaseInsensitiveMode, group_expr,
                                    (fModeFlagSet & CASE_INSENSITIVE_MODE_FLAG) == 0 ? Group::Sense::Off : Group::Sense::On);
         }
         if ((changed & GRAPHEME_CLUSTER_MODE) != 0) {
-            group_expr = makeGroup(Group::Mode::GraphemeMode, group_expr,
+            group_expr = Group::Create(Group::Mode::GraphemeMode, group_expr,
                                    (fModeFlagSet & GRAPHEME_CLUSTER_MODE) == 0 ? Group::Sense::Off : Group::Sense::On);
         }
         if ((changed & COMPATIBLE_EQUIVALENCE_MODE) != 0) {
-            group_expr = makeGroup(Group::Mode::CompatibilityMode, group_expr,
+            group_expr = Group::Create(Group::Mode::CompatibilityMode, group_expr,
                                    (fModeFlagSet & COMPATIBLE_EQUIVALENCE_MODE) == 0 ? Group::Sense::Off : Group::Sense::On);
         }
         fModeFlagSet = savedModeFlagSet;
@@ -174,20 +190,20 @@ RE * RE_Parser::parse_mode_group(bool & closing_paren_parsed) {
         if ((changed & (CASE_INSENSITIVE_MODE_FLAG|GRAPHEME_CLUSTER_MODE|COMPATIBLE_EQUIVALENCE_MODE)) != 0) {
             RE * group_expr = parse_seq();
             if ((changed & CASE_INSENSITIVE_MODE_FLAG) != 0) {
-                group_expr = makeGroup(Group::Mode::CaseInsensitiveMode, group_expr,
+                group_expr = Group::Create(Group::Mode::CaseInsensitiveMode, group_expr,
                                        (fModeFlagSet & CASE_INSENSITIVE_MODE_FLAG) == 0 ? Group::Sense::Off : Group::Sense::On);
             }
             if ((changed & GRAPHEME_CLUSTER_MODE) != 0) {
-                group_expr = makeGroup(Group::Mode::GraphemeMode, group_expr,
+                group_expr = Group::Create(Group::Mode::GraphemeMode, group_expr,
                                        (fModeFlagSet & GRAPHEME_CLUSTER_MODE) == 0 ? Group::Sense::Off : Group::Sense::On);
             }
             if ((changed & COMPATIBLE_EQUIVALENCE_MODE) != 0) {
-                group_expr = makeGroup(Group::Mode::CompatibilityMode, group_expr,
+                group_expr = Group::Create(Group::Mode::CompatibilityMode, group_expr,
                                        (fModeFlagSet & COMPATIBLE_EQUIVALENCE_MODE) == 0 ? Group::Sense::Off : Group::Sense::On);
             }
             return group_expr;
         }
-        else return makeSeq();
+        else return Seq::Create();
     }
 
 }
@@ -200,17 +216,25 @@ RE * RE_Parser::parse_group() {
     if (accept('?')) {
         if (accept('#')) {
             while (mCursor.more() && !at(')')) ++mCursor;
-            group_expr = makeSeq();
+            group_expr = Seq::Create();
         } else if (accept(':')) { // Non-capturing paren
             group_expr = parse_alt();
         } else if (accept('=')) { // positive look ahead
-            group_expr = makeLookAheadAssertion(parse_alt());
+            group_expr = Assertion::Create(parse_lookahead_body(),
+                                           Assertion::Kind::LookAhead,
+                                           Assertion::Sense::Positive);
         } else if (accept('!')) { // negative look ahead
-            group_expr = makeNegativeLookAheadAssertion(parse_alt());
+            group_expr = Assertion::Create(parse_lookahead_body(),
+                                           Assertion::Kind::LookAhead,
+                                           Assertion::Sense::Negative);
         } else if (accept("<=")) { // positive look behind
-            group_expr = makeLookBehindAssertion(parse_alt());
+            group_expr = Assertion::Create(parse_alt(),
+                                           Assertion::Kind::LookBehind,
+                                           Assertion::Sense::Positive);
         } else if (accept("<!")) { // negative look behind
-            group_expr = makeNegativeLookBehindAssertion(parse_alt());
+            group_expr = Assertion::Create(parse_alt(),
+                                           Assertion::Kind::LookBehind,
+                                           Assertion::Sense::Negative);
         } else if (accept('>')) {
             group_expr = makeAtomicGroup(parse_alt());
         } else if (accept('|')) {
@@ -233,11 +257,20 @@ RE * RE_Parser::parse_group() {
     return group_expr;
 }
     
+RE * RE_Parser::parse_lookahead_body() {
+    const auto capturesBefore = mCaptureGroupCount;
+    RE * asserted = parse_alt();
+    if (mCaptureGroupCount != capturesBefore) {
+        ParseFailure("Capture groups inside lookahead assertions are not supported.");
+    }
+    return asserted;
+}
+
 RE * RE_Parser::parse_capture_body() {
     RE * captured = parse_alt();
     mCaptureGroupCount++;
     std::string captureName = "\\" + std::to_string(mCaptureGroupCount);
-    Capture * capture  = makeCapture(captureName, captured);
+    Capture * capture  = Capture::Create(captureName, captured);
     mCaptureMap.emplace(captureName, std::make_pair(capture, 0));
     return capture;
 }
@@ -250,7 +283,7 @@ Reference * RE_Parser::parse_back_reference() {
         Capture * captured = f->second.first;
         unsigned instanceCount = f->second.second;
         //llvm::errs() << "instanceCount:" << instanceCount << "\n";
-        Reference * ref = makeReference(backref, captured, instanceCount);
+        Reference * ref = Reference::Create(backref, captured, instanceCount);
         f->second = std::make_pair(captured, instanceCount+1);
         return ref;
     }
@@ -274,18 +307,12 @@ RE * RE_Parser::extend_item(RE * re) {
     }
     if (ENABLE_EXTENDED_QUANTIFIERS && accept('?')) {
         // Non-greedy qualifier: no difference for Parabix RE matching
-        re = makeRep(re, lb, ub);
+        re = Rep::Create(re, lb, ub);
     } else if (ENABLE_EXTENDED_QUANTIFIERS && accept('+')) {
         // Possessive qualifier
-        if (ub == Rep::UNBOUNDED_REP) {
-            re = makeSeq({makeRep(re, lb, ub), makeNegativeLookAheadAssertion(re)});
-        } else if (lb == ub) {
-            re = makeRep(re, ub, ub);
-        } else /* if (lb < ub) */{
-            re = makeAlt({makeSeq({makeRep(re, lb, ub-1), makeNegativeLookAheadAssertion(re)}), makeRep(re, ub, ub)});
-        }
+        re = Rep::Create(re, lb, ub, Rep::Kind::Possessive);
     } else {
-        re = makeRep(re, lb, ub);
+        re = Rep::Create(re, lb, ub);
     }
     // The quantified expression may be extended with a further quantifier, e,g., [a-z]{6,7}{2,3}
     return extend_item(re);
@@ -331,13 +358,6 @@ RE * RE_Parser::parse_escaped() {
     if (isSetEscapeChar(*mCursor)) {
         return parseEscapedSet();
     }
-    else if (atany("xo0")) {
-        codepoint_t cp = parse_escaped_codepoint();
-        if ((cp <= 0xFF)) {
-            return makeByte(cp);
-        }
-        else return createCC(cp);
-    }
     else if (atany("123456789")) {
         return parse_back_reference();
     }
@@ -357,17 +377,17 @@ RE * RE_Parser::parseEscapedSet() {
                 re = parsePropertyExpression(PropertyExpression::Kind::Boundary);
                 require('}');
             } else {
-                re = makePropertyExpression(PropertyExpression::Kind::Boundary, "word");
+                re = PropertyExpression::Create(PropertyExpression::Kind::Boundary, "word");
             }
             return complemented ? makeZerowidthComplement(re) : re;
         case 'd':
-            re = makePropertyExpression("digit");
+            re = PropertyExpression::Create(PropertyExpression::Kind::Codepoint, "digit");
             return complemented ? makeComplement(re) : re;
         case 's':
-            re = makePropertyExpression("whitespace");
+            re = PropertyExpression::Create(PropertyExpression::Kind::Codepoint, "whitespace");
             return complemented ? makeComplement(re) : re;
         case 'w':
-            re = makePropertyExpression("word");
+            re = PropertyExpression::Create(PropertyExpression::Kind::Codepoint, "word");
             return complemented ? makeComplement(re) : re;
         case 'q':
             require('{');
@@ -382,8 +402,8 @@ RE * RE_Parser::parseEscapedSet() {
         case 'X': {
             // \X is equivalent to ".+?\b{g}"; proceed the minimal number of characters (but at least one)
             // to get to the next extended grapheme cluster boundary.
-            RE * GCB = makePropertyExpression(PropertyExpression::Kind::Boundary, "g");
-            return makeSeq({makeAny(), makeRep(makeSeq({makeZerowidthComplement(GCB), makeAny()}), 0, Rep::UNBOUNDED_REP), GCB});
+            RE * GCB = PropertyExpression::Create(PropertyExpression::Kind::Boundary, "g");
+            return Seq::Create({Any::Create(), Rep::Create(Seq::Create({makeZerowidthComplement(GCB), Any::Create()}), 0, Rep::UNBOUNDED_REP), GCB});
         }
         case 'N':
             re = parseNamePatternExpression();
@@ -472,7 +492,7 @@ RE * RE_Parser::parsePropertyExpression(PropertyExpression::Kind k) {
     std::string prop = canonicalize(start, prop_end);
     while (accept(' ') || accept('\t')) {/* skip whitespace, do nothing */}
     if (at('}') || at(":]")) {
-        return makePropertyExpression(k, prop);
+        return PropertyExpression::Create(k, prop);
     }
     PropertyExpression::Operator op = PropertyExpression::Operator::Eq;
     if (accept("!=")) {
@@ -497,7 +517,7 @@ RE * RE_Parser::parsePropertyExpression(PropertyExpression::Kind k) {
             current = (++mCursor).pos();
         }
         ++mCursor;
-        return makePropertyExpression(k, prop, op, std::string(val_start, current));
+        return PropertyExpression::Create(k, prop, op, std::string(val_start, current));
     }
     if (*val_start == '@') {
         // property-value is @property@ or @identity@
@@ -515,12 +535,12 @@ RE * RE_Parser::parsePropertyExpression(PropertyExpression::Kind k) {
             current = (++mCursor).pos();
         }
         ++mCursor;
-        return makePropertyExpression(k, prop, op, std::string(val_start, current));
+        return PropertyExpression::Create(k, prop, op, std::string(val_start, current));
     }
     if (accept('\\')) {
         // property-value is a property reference
         Reference * ref = parse_back_reference();
-        PropertyExpression * propref = makePropertyExpression(k, prop, op, ref->getName());
+        PropertyExpression * propref = PropertyExpression::Create(k, prop, op, ref->getName());
         propref->setResolvedRE(ref);
         return propref;
     }
@@ -537,7 +557,7 @@ RE * RE_Parser::parsePropertyExpression(PropertyExpression::Kind k) {
             }
             ++mCursor;
         }
-        return makePropertyExpression(k, prop, op, std::string(val_start, mCursor.pos()));
+        return PropertyExpression::Create(k, prop, op, std::string(val_start, mCursor.pos()));
     }
 }
 
@@ -567,7 +587,7 @@ RE * RE_Parser::parse_interleavable() {
             re = extend_item(re);
             seq.push_back(re);
         }
-        factors.push_back(makeSeq(seq.begin(), seq.end()));
+        factors.push_back(createSeq(seq));
         if (!accept("<")) {
             break;
         }
@@ -575,7 +595,7 @@ RE * RE_Parser::parse_interleavable() {
     if (factors.size() == 1) {
         return factors[0];
     }
-    return makeInterleavable(factors.begin(), factors.end());
+    return Interleavable::Create(factors.begin(), factors.end());
 }
 
 RE * RE_Parser::parseNamePatternExpression(){
@@ -592,7 +612,8 @@ RE * RE_Parser::parseNamePatternExpression(){
     }
     nameRegexp << "$";
     require('}');
-    return makePropertyExpression("na", nameRegexp.str());
+    PropertyExpression::Operator op = PropertyExpression::Operator::Eq;
+    return PropertyExpression::Create(PropertyExpression::Kind::Codepoint, "na", op, nameRegexp.str());
 }
 
 
@@ -606,10 +627,10 @@ RE * RE_Parser::parse_extended_bracket_expression () {
     while (have_new_expr) {
         if (accept("&&")) {
             RE * t2 = parse_bracketed_items();
-            t1 = makeIntersect(t1, t2);
+            t1 = Intersect::Create(t1, t2);
         } else if (accept("--")) {
             RE * t2 = parse_bracketed_items();
-            t1 = makeDiff(t1, t2);
+            t1 = Diff::Create(t1, t2);
         }
         else have_new_expr = false;
     }
@@ -634,10 +655,10 @@ RE * RE_Parser::parse_bracketed_items () {
             if (at('N') || !isSetEscapeChar(*mCursor)) items.push_back(range_extend(parse_escaped_char_item()));
             else items.push_back(parseEscapedSet());
         } else {
-            items.push_back(range_extend(makeCC(parse_literal_codepoint())));
+            items.push_back(range_extend(CC::Create(parse_literal_codepoint())));
         }
     } while (mCursor.more() && !at(']') && !at("&&") && (!at("--") || at("--]")));
-    return makeAlt(items.begin(), items.end());
+    return Alt::Create(items.begin(), items.end());
 }
 
 //  Given an individual character expression, check for and parse
@@ -655,9 +676,9 @@ RE * RE_Parser::range_extend(RE * char_expr1) {
         if (accept('.')) char_expr2 = parse_collation_element();
         else ParseFailure("Error in range expression");
     } else {
-        char_expr2 = makeCC(parse_literal_codepoint());
+        char_expr2 = CC::Create(parse_literal_codepoint());
     }
-    return makeRange(char_expr1, char_expr2);
+    return Range::Create(char_expr1, char_expr2);
 }
 
 RE * RE_Parser::parse_equivalence_class() {
@@ -691,21 +712,14 @@ RE * RE_Parser::parse_permute_class() {
     std::vector<RE *> elems;
     while (mCursor.more() && !at('|')) {
         auto cp = parse_literal_codepoint();
-        elems.push_back(makeCC(cp));
+        elems.push_back(CC::Create(cp));
     }
     require("|]");
-    return makePermute(elems.begin(), elems.end());
+    return Permute::Create(elems.begin(), elems.end());
 }
 
 RE * RE_Parser::parse_escaped_char_item() {
     if (accept('N')) return parseNamePatternExpression();
-    else if (atany("xo0")) {
-        codepoint_t cp = parse_escaped_codepoint();
-        if ((cp <= 0xFF)) {
-            return makeByte(cp);
-        }
-        else return createCC(cp);
-    }
     else return createCC(parse_escaped_codepoint());
 }
 
@@ -803,7 +817,15 @@ codepoint_t RE_Parser::parse_hex_codepoint(int mindigits, int maxdigits) {
 }
 
 CC * RE_Parser::createCC(const codepoint_t cp) {
-    return makeCC(cp);
+    return CC::Create(cp);
+}
+
+// The sequence of the items parsed, with each run of literal codepoints as a
+// String; the String alone if the items are all literal codepoints.
+RE * RE_Parser::createSeq(std::vector<RE *> & items) {
+    packStrings(items);
+    if ((items.size() == 1) && isa<String>(items[0])) return items[0];
+    return Seq::Create(items.begin(), items.end());
 }
 
 Name * RE_Parser::createName(std::string value) {

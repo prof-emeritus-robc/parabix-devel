@@ -126,6 +126,9 @@ public:
 
     bool isCachable() const override;
 
+    // Adds ProvisionalLookAheadStride when the kernel has lookahead inputs and meets its requirements.
+    void addAutomaticAttributes() override;
+
     String * makeName(const llvm::StringRef prefix) const;
 
     Integer * getInteger(const int64_t value, unsigned intWidth = 64) const;
@@ -141,7 +144,15 @@ public:
 
     bool requiresExplicitPartialFinalStride() const override;
 
-    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const final;
+    // Whether this kernel rebuilds its carries at each segment start (see LocalCarries in
+    // kernel/core/attributes.h) rather than keeping them in kernel state.  This depends only
+    // on the attribute, so it is known for a kernel loaded from the cache.
+    bool hasLocalCarries() const;
+
+    unsigned getCarryRebuildStrides() const override;
+
+    // Not final: a Pablo kernel may extend it (call this, then add its own selections).
+    void addOptimizationPasses(KernelBuilder & b, SelectedOptimizationPasses & passes) const override;
 
 protected:
 
@@ -153,6 +164,17 @@ protected:
                 std::vector<kernel::Binding> scalar_outputs = {});
 
     virtual void generatePabloMethod() = 0;
+
+    // Optional If codegen for this kernel. Both default off, so a kernel that does not
+    // override them compiles exactly as before.
+    //  ifBodyUnlikelyWeight(): N > 0 gives every If branch_weights 1:N (body : skip), so
+    //    LLVM lays the bodies out of line and puts register spills in them, not on the
+    //    skip path.
+    //  reduceIfTest(): test an If condition with an unsigned max-reduce over its 32-bit
+    //    lanes instead of bitblock_any (on AArch64: umaxv, fmov, cbz instead of six
+    //    instructions and a constant vector).
+    virtual unsigned ifBodyUnlikelyWeight() const { return 0; }
+    virtual bool reduceIfTest() const { return false; }
 
     llvm::IntegerType * getSizeTy() const {
         assert (mSizeTy); return mSizeTy;
@@ -177,6 +199,8 @@ protected:
     // finalizing the KernelStateType.
     void addInternalProperties(KernelBuilder & b) final;
 
+    void checkCarryExtent(KernelBuilder & b) const;
+
     void linkExternalMethods(KernelBuilder & b) final;
 
     std::unique_ptr<kernel::KernelCompiler> instantiateKernelCompiler(KernelBuilder & b) override;
@@ -193,6 +217,8 @@ private:
     void generateFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingBytes) final;
 
     void generateFinalizeMethod(KernelBuilder & b) final;
+
+    void generateCarryRebuildMethod(KernelBuilder & b) final;
 
 private:
 

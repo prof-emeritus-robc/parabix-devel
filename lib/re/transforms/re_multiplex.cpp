@@ -24,6 +24,12 @@ public:
         }
         return cc;
     };
+    RE * transformString(String * s) override {
+        if (mMultiplexedAlphabet->getSourceAlphabet() == &cc::Unicode) {
+            return transformStringAsSeq(s);
+        }
+        return s;
+    }
 private:
     const cc::MultiplexedAlphabet * const mMultiplexedAlphabet;
 };

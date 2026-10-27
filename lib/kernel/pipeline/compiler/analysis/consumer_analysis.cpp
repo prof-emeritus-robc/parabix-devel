@@ -234,6 +234,30 @@ redo_inout_check:
         }
         assert (index == out_degree(id, mConsumerGraph));
 
+        // Each phase has its own transitory consumed item counts, so the last consumer
+        // of this stream set in each phase before the phase of its last consumer
+        // writes the phase's consumed item count to a slot of its own, and the
+        // producer takes the minimum of them (see readConsumedItemCount.)
+        if (PartitionPhaseBoundaries.size() > 2 && lc != PipelineOutput) {
+            const auto lastPhase = mBufferGraph[lc].ProducedPhaseId;
+            flat_map<unsigned, ConsumerGraph::edge_descriptor> lastInPhase;
+            for (auto f : make_iterator_range(out_edges(id, mConsumerGraph))) {
+                const auto consumer = target(f, mConsumerGraph);
+                const auto phase = mBufferGraph[consumer].ProducedPhaseId;
+                if (phase != lastPhase) {
+                    auto g = lastInPhase.find(phase);
+                    if (g == lastInPhase.end()) {
+                        lastInPhase.emplace(phase, f);
+                    } else if (target(g->second, mConsumerGraph) < consumer) {
+                        g->second = f;
+                    }
+                }
+            }
+            for (const auto & g : lastInPhase) {
+                mConsumerGraph[g.second].Flags |= ConsumerEdge::WriteConsumedCount;
+            }
+        }
+
     }
 
 

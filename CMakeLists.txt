@@ -74,6 +74,7 @@ message(STATUS "Host Processor ${CMAKE_HOST_SYSTEM_PROCESSOR}")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64") 
 set(PARABIX_TARGETS_TO_BUILD AArch64 ARM)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_ARM_TARGET")
+add_link_options(LINKER:-no_warn_duplicate_libraries)
 else()
 set(PARABIX_TARGETS_TO_BUILD X86)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_X86_TARGET")
@@ -82,7 +83,6 @@ endif()
 llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} orcjit jitlink mcjit native IRReader Linker IRPrinter Passes)
 
 include_directories(${LLVM_INCLUDE_DIRS})
-link_directories(${LLVM_LIBRARY_DIRS})
 add_definitions(${LLVM_DEFINITIONS})
 math(EXPR LLVM_VERSION_INTEGER "${LLVM_VERSION_MAJOR} * 10000 + ${LLVM_VERSION_MINOR} * 100 + ${LLVM_VERSION_PATCH}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DLLVM_VERSION_INTEGER=${LLVM_VERSION_INTEGER}")
@@ -91,6 +91,9 @@ message(STATUS "LLVM Version Integer: ${LLVM_VERSION_INTEGER}")
 
 ###   Import Dependency: Boost   ###
 
+if (POLICY CMP0167)
+    cmake_policy(SET CMP0167 NEW)   # use Boost's own BoostConfig.cmake, not CMake's FindBoost
+endif()
 set(Boost_USE_STATIC_LIBS ${USE_STATIC_LIBS})
 set(Boost_USE_MULTITHREADED OFF)
 set(Boost_USE_STATIC_RUNTIME OFF)
@@ -238,6 +241,13 @@ set(CMAKE_REQUIRED_FLAGS)
 # Define parabix version
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_VERSION='\"${Parabix_REVISION}\"'")
 
+# Kernels defined in an image without a registered source hash fall back to the
+# image's linker build ID (see lib/srchash/source_hash.cpp); make sure ELF
+# binaries always carry an NT_GNU_BUILD_ID note.  Mach-O binaries get LC_UUID by default.
+if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+    add_link_options(-Wl,--build-id)
+endif()
+
 # Use gold linker on Linux:gcc
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
@@ -266,6 +276,7 @@ function(parabix_set_library_name NAME)
 endfunction(parabix_set_library_name)
 
 include(CMakeParseArguments)
+include(ParabixSourceHash)
 
 # Release & Debug flags
 
@@ -284,17 +295,26 @@ endif()
 function(parabix_add_module)
     cmake_parse_arguments(
         ARG             # resultant argument prefix
-        "USES_Z3;USES_CERNROOT;REQUIRES_RTTI"       # boolean args
+        "USES_Z3;USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH" # boolean args
         "NAME"          # mono-valued arguments:
                         #   NAME: target name
-        "SRC;DEPS"      # multi-valued arguments:
+        "SRC;DEPS;CODEGEN_DEPS" # multi-valued arguments:
                         #   SRC:  source file list
                         #   DEPS: target dependencies
+                        #   CODEGEN_DEPS: the DEPS whose code can run while this module's
+                        #       kernels are generated (see cmake/ParabixSourceHash.cmake)
         ${ARGN}         # arguments to parse
     )
     if(NOT ARG_NAME)
         message(FATAL_ERROR "parabix_add_module: A target name is required")
     endif()
+    # The public headers of lib/<path> are in include/<path>
+    file(RELATIVE_PATH MODULE_PATH ${PROJECT_SOURCE_DIR}/lib ${CMAKE_CURRENT_SOURCE_DIR})
+    set(INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include/${MODULE_PATH})
+    if("CODEGEN_DEPS" IN_LIST ARGN)
+        set(SRCHASH_CODEGEN_ARGS CODEGEN_DEPS ${ARG_CODEGEN_DEPS})
+    endif()
+    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} ${SRCHASH_CODEGEN_ARGS} INCLUDE_DIR ${INCLUDE_DIR})
     if(ARTIFACT_MODE STREQUAL "Single")
         foreach(SRC ${ARG_SRC})
             target_sources(${PARABIX_MONO_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${SRC})
@@ -306,6 +326,9 @@ function(parabix_add_module)
             add_library(${ARG_NAME} SHARED ${ARG_SRC})
         endif()
         parabix_set_library_name(${ARG_NAME})
+        if(NOT ARG_NO_SOURCE_HASH)
+            parabix_srchash_attach(${ARG_NAME})
+        endif()
         target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
         if (ARG_REQUIRES_RTTI)
             target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
@@ -348,6 +371,8 @@ function(parabix_add_executable)
         message(FATAL_ERROR "parabix_add_executable: A target name is required")
     endif()
     add_executable(${ARG_NAME} ${ARG_SRC})
+    parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} toolchain kernel.pipeline)
+    parabix_srchash_attach(${ARG_NAME})
     target_compile_options(${ARG_NAME} PRIVATE ${NO_RTTI})
     if(ARTIFACT_MODE STREQUAL "Single")
         target_link_libraries(${ARG_NAME} PUBLIC ${PARABIX_MONO_TARGET})
@@ -390,6 +415,7 @@ if(ARTIFACT_MODE STREQUAL "Single")
     else()
         add_library(${PARABIX_MONO_TARGET} SHARED "")
     endif()
+    parabix_srchash_attach(${PARABIX_MONO_TARGET})
 endif()
 
 # Framework Libraries
@@ -417,6 +443,7 @@ add_subdirectory(lib/re/printer)
 add_subdirectory(lib/re/toolchain)
 add_subdirectory(lib/re/transforms)
 add_subdirectory(lib/re/unicode)
+add_subdirectory(lib/srchash)
 add_subdirectory(lib/testing)
 add_subdirectory(lib/toolchain)
 add_subdirectory(lib/ucd/algo)
@@ -426,6 +453,7 @@ add_subdirectory(lib/ucd/utf)
 add_subdirectory(lib/audio)
 add_subdirectory(lib/csv)
 add_subdirectory(lib/json)
+add_subdirectory(lib/ldml)
 
 # Kernel Libraries
 add_subdirectory(lib/kernel/basis)
@@ -456,15 +484,22 @@ if (GENERATE_TOOLS)
     add_subdirectory(tools/audio)
     add_subdirectory(tools/util)
     add_subdirectory(tools/csv)
+    add_subdirectory(tools/ldml)
 endif()
 
 # Kernel Tests
 add_subdirectory(tests)
 
+# Standalone unit tests
+add_subdirectory(QA/unit-tests)
+
 # Target definition for single library
 if(ARTIFACT_MODE STREQUAL "Single")
     target_link_libraries(${PARABIX_MONO_TARGET} ${REQ_LLVM_LIBRARIES} ${Boost_LIBRARIES} ${Z3_LIBRARIES} ${LIBBACKTRACE_LIBRARIES})
 endif()
+
+# Source hashes need every target defined (see cmake/ParabixSourceHash.cmake)
+parabix_srchash_finalize()
 
 ###   Test Suite   ###
 
@@ -493,6 +528,42 @@ add_test(
   COMMAND python3 abc_test.py ${BIN_DIR}/icgrep)
 
 add_test(
+  NAME replace_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 replace_test.py ${BIN_DIR}/icgrep)
+
+add_test(
+  NAME reversed_lookahead_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 reversed_lookahead_test.py ${BIN_DIR}/icgrep)
+
+# The same, over the codes of multiplexed alphabets where the RE allows them
+add_test(
+  NAME reversed_lookahead_multiplexed_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 reversed_lookahead_test.py ${BIN_DIR}/icgrep)
+set_tests_properties(reversed_lookahead_multiplexed_test PROPERTIES ENVIRONMENT "TEST_FLAGS=--re-multiplex=force")
+
+add_test(
+  NAME multiplex_auto_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 multiplex_auto_test.py ${BIN_DIR}/icgrep)
+
+add_test(
+  NAME utf8_errors_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 utf8_errors_test.py ${BIN_DIR}/icgrep)
+
+add_test(
+  NAME ldml_trules_test
+  COMMAND ${BIN_DIR}/ldml_trules --self-test)
+
+add_test(
+  NAME tconv_engine_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_engine_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME u8u16_test
   WORKING_DIRECTORY ${QA_DIR}/u8u16
   COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")
@@ -502,15 +573,12 @@ add_test(
   WORKING_DIRECTORY ${QA_DIR}/
   COMMAND python3 u32u8_test.py "${BIN_DIR}/u32u8")
 
+# A few critical combinations of nfd/nfc/nfkd with pipeline and focus modes,
+# kept under one second; `make nfd_test`/`make nfc_test` run the fuller tests.
 add_test(
-  NAME nfd_test
-  WORKING_DIRECTORY ${QA_DIR}/nfd
-  COMMAND python3 nfd_test.py "${BIN_DIR}/nfd")
-
-add_test(
-  NAME nfc_test
-  WORKING_DIRECTORY ${QA_DIR}/nfc
-  COMMAND python3 nfc_test.py "${BIN_DIR}/nfc")
+  NAME normalization_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 normalization_test.py "${BIN_DIR}")
 
 add_test(
     NAME editd_test
@@ -531,6 +599,21 @@ add_test(
   NAME json_test
   WORKING_DIRECTORY ${QA_DIR}/json
   COMMAND python3 json_test.py "${BIN_DIR}/json")
+
+add_test(
+  NAME objcache_test
+  WORKING_DIRECTORY ${QA_DIR}/objcache
+  COMMAND python3 objcache_test.py "${BIN_DIR}")
+
+add_test(
+  NAME xch_test
+  WORKING_DIRECTORY ${QA_DIR}/xch
+  COMMAND python3 xch_test.py "${BIN_DIR}/xch")
+
+add_test(
+  NAME hexlines_test
+  WORKING_DIRECTORY ${QA_DIR}/hexlines
+  COMMAND python3 hexlines_test.py "${BIN_DIR}/hexlines")
 
 add_test(
   NAME csv2json_test
@@ -570,6 +653,11 @@ add_custom_target (base64_test
 add_custom_target(gb18030_test
   WORKING_DIRECTORY ${QA_DIR}/gb18030
   COMMAND python3 gb18030_test.py "${BIN_DIR}/gb18030")
+
+# Also edits sources (restoring them) and rebuilds, checking which cached kernels are invalidated
+add_custom_target(objcache_test
+  WORKING_DIRECTORY ${QA_DIR}/objcache
+  COMMAND python3 objcache_test.py --build-dir "${PROJECT_BINARY_DIR}" "${BIN_DIR}")
 
 add_custom_target(nfd_test
   WORKING_DIRECTORY ${QA_DIR}/nfd
@@ -625,3 +713,20 @@ add_custom_target (json_perf
 add_custom_target (csv2json_test
   WORKING_DIRECTORY ${QA_DIR}/csv/csv2json
   COMMAND python3 csv2json_test.py "${BIN_DIR}/csv2json")
+
+# Custom test targets run the tools directly, so each must depend on the tools
+# it runs; otherwise e.g. `make greptest` tests whatever icgrep binary is already
+# in the build directory, stale or absent.
+foreach(TEST_AND_TOOL
+        greptest:icgrep proptest:icgrep abc_test:icgrep
+        u8u16_test:u8u16 u32u8_test:u32u8 editd_test:editd base64_test:base64
+        gb18030_test:gb18030 nfd_test:nfd nfc_test:nfc
+        xml_test:xml json_test:json json_perf:json csv2json_test:csv2json)
+    string(REPLACE ":" ";" PAIR ${TEST_AND_TOOL})
+    list(GET PAIR 0 TEST_TARGET)
+    list(GET PAIR 1 TOOL_TARGET)
+    if (TARGET ${TOOL_TARGET})
+        add_dependencies(${TEST_TARGET} ${TOOL_TARGET})
+    endif()
+endforeach()
+

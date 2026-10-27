@@ -5,13 +5,8 @@
 #pragma once
 
 #include <pablo/pablo.h>
-#include <re/alphabet/alphabet.h>
-#include <re/alphabet/multiplex_CCs.h>
-#include <re/analysis/capture-ref.h>
-#include <re/analysis/re_analysis.h>
-#include <re/analysis/re_name_gather.h>
-#include <re/transforms/to_utf8.h>
 #include <kernel/pipeline/program_builder.h>
+#include <kernel/re/regexp_engine.h>   // MatchedLinesKernel
 
 namespace IDISA { class IDISA_Builder; }
 namespace cc { class Alphabet; }
@@ -19,13 +14,6 @@ namespace re { class CC; class RE; }
 namespace grep { class GrepEngine; }
 
 namespace kernel {
-
-class MatchedLinesKernel : public pablo::PabloKernel {
-public:
-    MatchedLinesKernel(LLVMTypeSystemInterface & ts, StreamSet * OriginalMatches, StreamSet * LineBreakStream, StreamSet * Matches);
-protected:
-    void generatePabloMethod() override;
-};
 
 class InvertMatchesKernel : public BlockOrientedKernel {
 public:

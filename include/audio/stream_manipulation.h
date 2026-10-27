@@ -1,11 +1,10 @@
 #pragma once
-#include <kernel/pipeline/pipeline_builder.h>
-#include <kernel/core/kernel_builder.h>
-#include <kernel/core/relationship.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Constants.h>
+#include <kernel/pipeline/pipeline_builder.h>
+namespace kernel { class KernelBuilder; }
 
 using namespace kernel;
 using namespace llvm;

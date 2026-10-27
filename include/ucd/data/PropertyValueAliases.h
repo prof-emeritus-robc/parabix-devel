@@ -10,7 +10,6 @@
 
 #include <cstdint>
 #include <string>
-#include <ucd/data/PropertyAliases.h>
 #include <unordered_map>
 #include <vector>
 namespace UCD {

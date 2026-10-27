@@ -13,13 +13,13 @@
 #include <set>
 #include <thread>
 #include <boost/filesystem.hpp>
-#include <re/analysis/capture-ref.h>
-#include <re/alphabet/multiplex_CCs.h>
 #include <re/parse/GLOB_parser.h>
 #include <kernel/core/callback.h>
 #include <kernel/util/linebreak_kernel.h>
-#include <kernel/re/regexp_kernel.h>
+#include <kernel/re/regexp_engine.h>
+#include <re/analysis/capture-ref.h>
 #include <grep/grep_kernel.h>
+#include <re/transforms/to_utf8.h>
 
 namespace re { class CC; class Name; class RE; }
 namespace llvm { namespace cl { class OptionCategory; } }
@@ -32,9 +32,6 @@ namespace grep {
 extern unsigned ByteCClimit;
 
 enum class GrepRecordBreakKind {Null, LF, Unicode};
-
-class InternalSearchEngine;
-class InternalMultiSearchEngine;
 
 enum GrepSignal : unsigned {BinaryFile};
 
@@ -73,8 +70,6 @@ class EmitMatch;
 
 class GrepEngine {
     enum class FileStatus {Pending, GrepComplete, PrintComplete};
-    friend class InternalSearchEngine;
-    friend class InternalMultiSearchEngine;
     typedef uint64_t (*GrepFunctionType)(uint32_t useMMap, uint32_t fileDescriptor, GrepCallBackObject &, size_t maxCount);
     typedef uint64_t (*GrepBatchFunctionType)(const char * buffer, size_t length, EmitMatch &, size_t maxCount);
 public:
@@ -97,11 +92,13 @@ public:
     void setMaxCount(int m) {mMaxCount = m;}
     void setGrepStdIn(bool b = true) {mGrepStdIn = b;}
     void setInvertMatches(bool b = true) {mInvertMatches = b;}
-    void setCaseInsensitive(bool b = true)  {mCaseInsensitive = b;}
 
     void suppressFileMessages(bool b = true) {mSuppressFileMessages = b;}
     void setBinaryFilesOption(argv::BinaryFilesMode mode) {mBinaryFilesMode = mode;}
     void setRecordBreak(GrepRecordBreakKind b);
+    // Print each matching line with its matches replaced (see
+    // re::parseReplacement): EmitMatchesEngine only.
+    void setReplacement(re::RE * replacement) {mReplacement = replacement;}
     void initFileResult(const std::vector<boost::filesystem::path> & filenames);
     bool haveFileBatch();
     void initRE(re::RE * re);
@@ -141,12 +138,10 @@ protected:
     unsigned mBeforeContext;
     unsigned mAfterContext;
     bool mInitialTab;
-    bool mCaseInsensitive;
     bool mInvertMatches;
     int mMaxCount;
     bool mGrepStdIn;
     NullCharMode mNullMode;
-    RE_CompilerContext mCtxt;
     BaseDriver & mGrepDriver;
     GrepFunctionType mMainMethod;
     size_t mBatchSize;
@@ -161,15 +156,17 @@ protected:
     bool grepMatchFound;
     GrepRecordBreakKind mGrepRecordBreak;
 
+    PreparedRE mPreparedRE;     // the RE as prepared by the regular expression engine
+    re::RE * mReplacement = nullptr;
+    PreparedSearchReplace mPreparedSR;  // with a replacement: the search and replace
     re:: RE * mRE;
     re::ReferenceInfo mRefInfo;
     std::string mFileSuffix;
-    const cc::Alphabet * mIndexAlphabet;
-    const cc::Alphabet * mLengthAlphabet;
+    RE_Mode mMode;
+    kernel::StreamSet * mSource;
+    kernel::StreamSet * mMatchStarts;
     kernel::StreamSet * mLineBreakStream;
     kernel::StreamSet * mU8index;
-    kernel::StreamSet * mU21;
-    kernel::StreamSet * mU21_LB;
     std::vector<std::string> mSpanNames;
     re::UTF8_Transformer mUTF8_Transformer;
     std::thread::id mEngineThread;
@@ -183,11 +180,13 @@ protected:
 class EmitMatch : public MatchAccumulator {
     friend class EmitMatchesEngine;
 public:
-    EmitMatch(bool showFileNames, bool showLineNumbers, bool showContext, bool initialTab)
+    EmitMatch(bool showFileNames, bool showLineNumbers, bool showContext, bool initialTab,
+              GrepRecordBreakKind recordBreak = GrepRecordBreakKind::LF)
         : mShowFileNames(showFileNames),
         mShowLineNumbers(showLineNumbers),
         mContextGroups(showContext),
         mInitialTab(initialTab),
+        mRecordBreak(recordBreak),
         mCurrentFile(0),
         mLineCount(0),
         mLineNum(0),
@@ -201,10 +200,13 @@ public:
     size_t getFileStartPos(size_t fileNo) override;
     void setBatchLineNumber(size_t fileNo, size_t batchLine) override;
 protected:
+    bool isTerminated(const char * line_start, const char * line_end) const;
+    void terminateRecord();
     bool mShowFileNames;
     bool mShowLineNumbers;
     bool mContextGroups;
     bool mInitialTab;
+    GrepRecordBreakKind mRecordBreak;
     unsigned mCurrentFile;
     size_t mLineCount;
     size_t mLineNum;
@@ -226,8 +228,11 @@ public:
     EmitMatchesEngine(BaseDriver & driver);
     void grepPipeline(kernel::PipelineBuilder & P, kernel::StreamSet * ByteStream);
     void grepCodeGen() override;
+    // The matching lines with their matches replaced (see setReplacement).
+    void replacePipeline(kernel::PipelineBuilder & P, kernel::StreamSet * ByteStream);
 private:
     uint64_t doGrep(const std::vector<std::string> & fileNames, std::ostringstream & strm) override;
+    bool detectsBinaryByNull() const;
 };
 
 class CountOnlyEngine final : public GrepEngine {
@@ -252,74 +257,9 @@ public:
 
 
 
-class InternalSearchEngine {
-    typedef void (*GrepFunctionType)(const char * buffer, const size_t length, MatchAccumulator *);
-public:
-    InternalSearchEngine(BaseDriver & driver);
 
-    InternalSearchEngine(const std::unique_ptr<grep::GrepEngine> & engine);
 
-    ~InternalSearchEngine();
 
-    void setRecordBreak(GrepRecordBreakKind b) {mGrepRecordBreak = b;}
-    void setCaseInsensitive()  {mCaseInsensitive = true;}
-
-    void grepCodeGen(re::RE * matchingRE);
-
-    void doGrep(const char * search_buffer, size_t bufferLength, MatchAccumulator & accum);
-
-private:
-    GrepRecordBreakKind mGrepRecordBreak;
-    bool mCaseInsensitive;
-    BaseDriver & mGrepDriver;
-    GrepFunctionType mMainMethod;
-};
-
-enum class PatternKind {Include, Exclude};
-class InternalMultiSearchEngine {
-    typedef void (*GrepFunctionType)(const char * buffer, const size_t length, MatchAccumulator *);
-public:
-    InternalMultiSearchEngine(BaseDriver & driver);
-
-    InternalMultiSearchEngine(const std::unique_ptr<grep::GrepEngine> & engine);
-
-    ~InternalMultiSearchEngine() {};
-
-    void setRecordBreak(GrepRecordBreakKind b) {mGrepRecordBreak = b;}
-    void setCaseInsensitive() {mCaseInsensitive = true;}
-
-    void grepCodeGen(const re::PatternVector & patterns);
-
-    void doGrep(const char * search_buffer, size_t bufferLength, MatchAccumulator & accum);
-
-private:
-    GrepRecordBreakKind mGrepRecordBreak;
-    bool mCaseInsensitive;
-    BaseDriver & mGrepDriver;
-    GrepFunctionType mMainMethod;
-};
-
-/**
- * Returns which lines of a given buffer matches with a given regex pattern.
- *
- * @param pattern the regex pattern.
- * @param buffer the buffer to search for a match.
- * @param bufSize the size of the buffer.
- *
- * @return a vector with the lines that match the regex pattern.
- */
-std::vector<uint64_t> lineNumGrep(re::RE * pattern, const char * buffer, size_t bufSize);
-
-/**
- * Returns whether a given buffer matches with a given regex pattern.
- *
- * @param pattern the regex pattern.
- * @param buffer the buffer to search for a match.
- * @param bufSize the size of the buffer.
- *
- * @return true if there is any matches and false otherwise.
- */
-bool matchOnlyGrep(re::RE * pattern, const char * buffer, size_t bufSize);
 
 }
 

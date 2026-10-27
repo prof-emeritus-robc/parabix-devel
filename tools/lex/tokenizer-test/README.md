@@ -16,6 +16,7 @@ with the repo venv active.
 | 3 | `compare_bpe.py`           | correctness + timing | Full BPE encoding → token IDs, plus a fair head-to-head timing section |
 | 4 | `bench_bpe.py`             | performance | Throughput (MB/s), size sweep, fixed-floor vs marginal-rate fit, SVG charts |
 | 5 | `bench_configs.py`         | performance (Parabix only) | N flag configurations timed against each other — interleaved rounds, per-config floor/marginal fit, output-identity check |
+| 6 | `selfmerge_test.py`        | correctness (no HF) | Self-merges (X+X→XX): runs of repeated tokens of length 1–12, checked against a built-in reference BPE for several flag configurations |
 
 Scripts 1–3 print `MATCH` / `MISMATCH` per case; all five tee their output to
 `<script>_output.txt` in this directory (those result files are not committed).
@@ -25,8 +26,9 @@ Scripts 1–3 print `MATCH` / `MISMATCH` per case; all five tee their output to
 ## Requirements
 
 - **Python 3.10+**
-- **A built tokenizer binary** at `<repo>/build19/bin/tokenizer`
-  (`make -C build19 -j8 tokenizer`).
+- **A built tokenizer binary**, by default `<repo>/build19/bin/tokenizer`
+  (`make -C build19 -j8 tokenizer`). `compare_bpe.py` and `bench_bpe.py` take
+  another one via `--tokenizer PATH`.
 - **HuggingFace `tokenizers`** (PyPI, no account or token needed).
 - **`datasets`** (PyPI) — only for `bench_bpe.py --openwebtext`, which streams a
   fresh corpus sample from the Hub instead of downloading the 40 GB dataset.
@@ -42,20 +44,29 @@ pip install datasets            # optional: only for --openwebtext
 python -c "import tokenizers; print(tokenizers.__version__)"
 ```
 
-### Paths are hard-coded
+### Paths
 
-Every script defines its paths as constants near the top:
+Every script finds the repo from its own location (three levels up from
+`tools/lex/tokenizer-test/`), so it runs from any directory and any checkout.
+Every path can be overridden on the command line:
 
-```python
-REPO_ROOT      = "/Users/munizahashim/parabix-devel"
-TOKENIZER      = os.path.join(REPO_ROOT, "build19/bin/tokenizer")
-MERGES         = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/merges.txt")
-VOCAB          = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/vocab.json")
-TOKENIZER_JSON = os.path.join(REPO_ROOT, "tools/lex/tokenizer_files/tokenizer.json")
+| Option | Default | `compare_bpe` | `bench_bpe` | `bench_configs` | `compare_normalizers`, `compare_pretokenizers` |
+|---|---|---|---|---|---|
+| `--input PATH` | see each script below | ✓ | ✓ | ✓ | ✓ |
+| `--tokenizer PATH` | `<repo>/build19/bin/tokenizer` | ✓ | ✓ | ✓ | ✓ |
+| `--merges PATH` | `<repo>/tools/lex/tokenizer_files/merges.txt` | ✓ | ✓ | ✓ | — |
+| `--tokenizer-json PATH` | `<repo>/tools/lex/tokenizer_files/tokenizer.json` | ✓ | ✓ | — | — |
+| `--vocab PATH` | `<repo>/tools/lex/tokenizer_files/vocab.json` | ✓ | — | — | — |
+
+Each script stops with an error when the tokenizer binary is missing (except
+with `--hf-only`).
+
+```bash
+python compare_bpe.py --no-timing --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
+python bench_bpe.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer \
+    --parabix-args="--pretokenizer=bytelevel --partition=level"
+python compare_pretokenizers.py --input=/path/to/test.txt --tokenizer=/path/to/build/bin/tokenizer
 ```
-
-If your checkout lives elsewhere, or you build into a directory other than
-`build19`, edit `REPO_ROOT` / `TOKENIZER` in each script you use.
 
 ---
 
@@ -325,14 +336,14 @@ Three things it does that repeating `bench_bpe.py` cannot:
   faster-but-wrong config is not a win.
 
 ```bash
-# default pair: no flags vs --level-partition, on val_2MB
+# default pair: no flags vs --partition=level, on val_2MB
 python bench_configs.py
 
 # explicit configs — NAME=FLAGS, first one is the speedup baseline
 python bench_configs.py \
     --config 'baseline=' \
-    --config 'level=--level-partition' \
-    --config 'level+compact=--level-partition --compact-base=40'
+    --config 'level=--partition=level' \
+    --config 'level+compact=--partition=level --compact-base=40'
 
 # floor / marginal split + output-identity check
 python bench_configs.py --input ../tokenizer_files/val_4MB.txt \
@@ -371,12 +382,12 @@ python3 bench_configs.py \
     --input ../tokenizer_files/val_8MB.txt \
     --sizes 0.25,1,2,4,7.5 \
     --config 'baseline=' \
-    --config 'level=--level-partition' \
-    --config 'level+compact=--level-partition --geometric-compaction --compact-base=15' \
+    --config 'level=--partition=level' \
+    --config 'level+compact=--partition=level --geometric-compaction --compact-base=15' \
     --verify
 ```
 
-Read the floor/marginal table, not the per-size MB/s. `--level-partition` cuts
+Read the floor/marginal table, not the per-size MB/s. `--partition=level` cuts
 kernel count, so it moves the **floor** roughly in proportion; compaction shrinks
 the stream every kernel scans, so it moves the **marginal MB/s**. A flag that
 moves neither is doing nothing. `floor @ largest` says how much of the biggest
@@ -385,6 +396,28 @@ measure the floor and will shrink as the input grows.
 
 Sweeping the compaction interval is the same command with several
 `--compact-base=N` configs.
+
+---
+
+## 6. `selfmerge_test.py`
+
+Correctness of self-merges, which the merge kernels resolve with run-parity logic: a
+run of equal tokens must pair left to right, each token used once (`XXXXX` → `XX XX X`).
+The script generates its own input (runs of length 1–12 of single bytes, multi-byte
+characters and multi-character units, in several contexts, plus mixed alternations)
+and compares the tokenizer's ids with a self-contained reference BPE built from
+`merges.txt` (priority queue, lowest rank then leftmost first, as in HuggingFace), so
+it needs neither HuggingFace nor `vocab.json`.
+
+```bash
+python selfmerge_test.py --tokenizer ../../../build22/bin/tokenizer
+python selfmerge_test.py --config 'mine=--partition=level --compact-base=2' --keep /tmp/sm
+```
+
+Each `--config NAME=FLAGS` is one tokenizer run (the default is a built-in set of merge
+strategies); `--keep DIR` saves the input, the reference ids and each output. Prints
+`MATCH` / `MISMATCH` per configuration and exits 1 on any mismatch. The first run of a
+new configuration pays its JIT compile.
 
 ---
 
@@ -399,7 +432,7 @@ The binary's CLI is documented once, in the parent
 - **[BPE optimization parameters](../README.md#bpe-optimization-parameters)** —
   `--compact-base`, `--geometric-compaction`, `--if-group-lower-limit`,
   `--if-group-count`, `--if-group-size`, `--lookahead-in-gate`,
-  `--lookahead-in-group`, `--level-partition`, `--indexed-shift`, each with its
+  `--lookahead-in-group`, `--partition=level`, `--indexed-shift`, each with its
   objcache-name tag. All default OFF. Sweep them against HF via
   `bench_bpe.py --parabix-args`, or against each other via
   [`bench_configs.py --config`](#5-bench_configspy); the parent's

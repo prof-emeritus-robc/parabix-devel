@@ -20,6 +20,15 @@ namespace kernel {
 class PipelineKernel;
 class KernelBuilder;
 
+// Opt-in hook, null by default: when set, circular (double-mapped) buffers are built by this
+// function instead of the default (Mach vm_remap on macOS, a memfd elsewhere; see
+// --CircularBufferImpl). The result must be freeable by munmap.
+extern uint8_t * (*CircularBufferAllocator)(size_t size, size_t hasUnderflow);
+
+// Unmap the circular buffers that released pipeline buffers left for reuse (--CircularBufferPool).
+// Runs at exit; long-running users may call it to give the memory back sooner.
+void releaseCircularBufferPool();
+
 class StreamSetBuffer {
 public:
 

@@ -43,10 +43,12 @@ case T::Type: return validate##Type(llvm::cast<Type>(re)); break
             VALIDATE(Start);
             VALIDATE(Permute);
             VALIDATE(Interleavable);
+            VALIDATE(String);
             VALIDATE(PropertyExpression);
-        default: llvm_unreachable("Unknown RE type");
+        // No default: -Wswitch flags any RE type missing here.
     }
 #undef VALIDATE
+    llvm_unreachable("Unknown RE type");
 }
 
 bool RE_Validator::validateName(const Name * nm) {
@@ -135,6 +137,17 @@ bool RE_Validator::validateInterleavable(const Interleavable * s) {
     return true;
 }
 
+bool RE_Validator::validateString(const String * s) {
+    return true;
+}
+
+bool RE_Validator::validateStringAsCCs(const String * s) {
+    for (const char32_t c : *s) {
+        if (!validate(makeCC(c))) return false;
+    }
+    return true;
+}
+
 bool RE_Validator::validatePropertyExpression(const PropertyExpression * pe) {
     if (mNameMode == NameProcessingMode::None) return true;
     RE * const d = pe->getResolvedRE();
@@ -154,6 +167,8 @@ public:
     AlphabetValidator(const cc::Alphabet * a) : RE_Validator("AlphabetValidator"), mAlphabet(a) {}
     
     bool validateCC(const CC * cc) override {return cc->getAlphabet() == mAlphabet;}
+    // The CCs of a String are Unicode CCs.
+    bool validateString(const String * s) override {return s->empty() || (mAlphabet == &cc::Unicode);}
 private:
     const cc::Alphabet * mAlphabet;
 };
@@ -162,20 +177,4 @@ bool validateAlphabet(const cc::Alphabet * a, const RE * r) {
     return AlphabetValidator(a).validateRE(r);
 }
     
-class AssertionFreeValidator : public RE_Validator {
-public:
-    AssertionFreeValidator() : RE_Validator("AssertionFreeValidator") {}
-    
-    bool validateAssertion(const Assertion * a) override {return false;}
-    bool validateStart(const Start * s) override {return false;}
-    bool validateEnd(const End * e) override {return false;}
-    bool validatePropertyExpression(const PropertyExpression * pe) override {
-        return true;
-    }
-};
-
-bool validateAssertionFree(const RE * r) {
-    return AssertionFreeValidator().validateRE(r);
-}
-
 }

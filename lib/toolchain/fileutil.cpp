@@ -6,6 +6,8 @@
 #include <toolchain/fileutil.h>
 #include <string>
 #include <boost/filesystem.hpp>
+#include <algorithm>
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -30,9 +32,19 @@ bool canMMap(const std::string & fileName) {
     return !errc && is_regular_file(s);
 }
 
-AlignedFileBuffer::AlignedFileBuffer() {}
+AlignedFileBuffer::AlignedFileBuffer()
+: mDidMMap(false)
+, mBuffer(nullptr)
+, mAlignedSize(0)
+, mBufSize(0) {
 
+}
+
+// If the file cannot be read, the buffer is left empty: getBufSize() returns 0 and getBuf() nullptr.
 void AlignedFileBuffer::load(const std::string & fileName, bool preferMMap) {
+    mDidMMap = false;
+    mBuffer = nullptr;
+    mBufSize = 0;
     bool useMMap = preferMMap && canMMap(fileName);
     int32_t fd;
     int flags = O_RDONLY;
@@ -46,22 +58,18 @@ void AlignedFileBuffer::load(const std::string & fileName, bool preferMMap) {
     } else {
         fd = open(fileName.c_str(), flags);
         if (fd == -1) {
-            mBufSize = -1;
             return;
         }
     }
     struct stat st;
     if (fstat(fd, &st) != 0) {
-        mBufSize = -1;
+        close(fd);
         return;
     }
     useMMap = useMMap && (st.st_size > 0);
     if (useMMap) {
         auto mmap_ptr = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (LLVM_UNLIKELY(mmap_ptr == MAP_FAILED)) {
-            mBufSize = -1;
-            mDidMMap = false;
-        } else {
+        if (LLVM_LIKELY(mmap_ptr != MAP_FAILED)) {
             mBuffer = reinterpret_cast<char *>(mmap_ptr);
             mBufSize = st.st_size;
             mDidMMap = true;
@@ -72,8 +80,24 @@ void AlignedFileBuffer::load(const std::string & fileName, bool preferMMap) {
         if (mBuffer == nullptr) {
             report_fatal_error("Unable to allocate aligned file buffer");
         }
-        mBufSize = read(fd, mBuffer, st.st_size);
-        mDidMMap = false;
+        // read may return fewer bytes than requested, and on macOS fails for more than INT_MAX bytes
+        constexpr size_t MaximumReadSize = 1UL << 30;
+        const size_t size = st.st_size;
+        size_t total = 0;
+        while (total < size) {
+            const auto n = read(fd, mBuffer + total, std::min(size - total, MaximumReadSize));
+            if (n > 0) {
+                total += n;
+            } else if (n == 0) {
+                break;
+            } else if (errno != EINTR) {
+                mAlloc.deallocate(mBuffer, 0);
+                mBuffer = nullptr;
+                total = 0;
+                break;
+            }
+        }
+        mBufSize = total;
     }
     close(fd);
 }
@@ -89,8 +113,11 @@ char * AlignedFileBuffer::getBuf() {
 void AlignedFileBuffer::release() {
     if (mDidMMap) {
         munmap(reinterpret_cast<void *>(mBuffer), mBufSize);
-    } else if (mBufSize > 0) {
+    } else if (mBuffer) {
         mAlloc.deallocate(mBuffer, 0);
     }
+    mDidMMap = false;
+    mBuffer = nullptr;
+    mBufSize = 0;
 }
 

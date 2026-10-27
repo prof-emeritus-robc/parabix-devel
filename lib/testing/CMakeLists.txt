@@ -10,8 +10,7 @@ SRC
     assert.cpp
     runtime.cpp
 DEPS
-    kernel.core
     kernel.io
+    kernel.core
     kernel.pipeline
-    kernel.util
 )

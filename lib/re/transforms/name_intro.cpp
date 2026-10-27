@@ -14,8 +14,10 @@
 #include <re/analysis/re_analysis.h>
 #include <re/transforms/re_transformer.h>
 #include <kernel/core/kernel.h>
+#include <algorithm>
 #include <map>
 #include <memory>
+#include <re/printer/re_printer.h>
 
 using namespace llvm;
 
@@ -42,17 +44,26 @@ void NameIntroduction::showProcessing() {
     }
 }
 
-VariableLengthCCNamer::VariableLengthCCNamer(unsigned UTF_bits) : NameIntroduction("VariableLengthCCNamer") {
+VariableLengthCCNamer::VariableLengthCCNamer(unsigned UTF_bits, bool replacementChar)
+: NameIntroduction("VariableLengthCCNamer"), mReplacementChar(replacementChar) {
         mEncoder.setCodeUnitBits(UTF_bits);
     }
 
 RE * VariableLengthCCNamer::transformCC (CC * cc) {
     bool variable_length = false;
     variable_length = mEncoder.encoded_length(lo_codepoint(cc->front())) < mEncoder.encoded_length(hi_codepoint(cc->back()));
-    if (variable_length) {
+    if (variable_length || (mReplacementChar && cc->contains(0xFFFD))) {
         return createName(cc->canonicalName(), cc);
     }
     return cc;
+}
+
+// Singleton CCs are of one encoded length: only U+FFFD may be named.
+RE * VariableLengthCCNamer::transformString (String * s) {
+    if (mReplacementChar && (std::find(s->begin(), s->end(), 0xFFFD) != s->end())) {
+        return transformStringAsSeq(s);
+    }
+    return s;
 }
 
 FixedSpanNamer::FixedSpanNamer(const cc::Alphabet * a) : NameIntroduction("FixedSpanNamer"), mAlphabet(a), mLgthPrefix("len") {}
@@ -95,6 +106,16 @@ RE * FixedSpanNamer::transform(RE * r) {
     return makeAlt(mNewAlts.begin(), mNewAlts.end());
 }
 
+static const std::string UniquePrefixNamespace = "uniquePrefix";
+
+Name * makeUniquePrefixName(RE * prefix) {
+    return makeName(UniquePrefixNamespace, Printer_RE::PrintRE(prefix), prefix);
+}
+
+bool isUniquePrefixName(const Name * n) {
+    return n->hasNamespace() && n->getNamespace() == UniquePrefixNamespace;
+}
+
 UniquePrefixNamer::UniquePrefixNamer() : NameIntroduction("UniquePrefixNamer") {}
 
 RE * UniquePrefixNamer::transform(RE * r) {
@@ -108,8 +129,7 @@ RE * UniquePrefixNamer::transform(RE * r) {
                 alts.push_back(e);
             } else {
                 fixedPrefixFound = true;
-                std::string prefixName = Printer_RE::PrintRE(prefix);
-                Name * pfx = makeName(prefixName, prefix);
+                Name * pfx = makeUniquePrefixName(prefix);
                 std::string altName = Printer_RE::PrintRE(e);
                 Name * n = createName(altName, makeSeq({pfx, suffix}));
                 alts.push_back(n);
@@ -125,8 +145,7 @@ RE * UniquePrefixNamer::transform(RE * r) {
     if (isEmptySeq(prefix) || isEmptySeq(suffix)) {
         return r;
     }
-    std::string prefixName = Printer_RE::PrintRE(prefix);
-    Name * pfx = makeName(prefixName, prefix);
+    Name * pfx = makeUniquePrefixName(prefix);
     std::string rName = Printer_RE::PrintRE(r);
     return createName(rName, makeSeq({pfx, suffix}));
 }
@@ -145,6 +164,7 @@ CC * variableCodepoints(RE * re) {
             }
         }
         if (accumCC) return accumCC;
+        return makeCC();
     } else if (Rep * rep = dyn_cast<Rep>(re)) {
         if (rep->getLB() == rep->getUB()) {
             return variableCodepoints(rep->getRE());
@@ -166,9 +186,12 @@ CC * variableCodepoints(RE * re) {
         return variableCodepoints(c->getCapturedRE());
     } else if (Reference * r = dyn_cast<Reference>(re)) {
         return variableCodepoints(r->getCapture());
+    } else if (isa<Any, Assertion, CC, Range, End, PropertyExpression, Start,
+                   Permute, Interleavable, String>(re)) {
+        // Other expressions are all singleCCs, not variable.
+        return makeCC();
     }
-    // Other expressions are all singleCCs, not variable.
-    return makeCC();
+    UnexpectedRE("variableCodepoints", re);
 }
 
 unsigned fixedCodepointCount(RE * re, CC * variableCC) {
@@ -186,6 +209,12 @@ unsigned fixedCodepointCount(RE * re, CC * variableCC) {
     } else if (Seq * seq = dyn_cast<Seq>(re)) {
         for (RE * e : *seq) {
             countSoFar += fixedCodepointCount(e, variableCC);
+        }
+        return countSoFar;
+    } else if (String * s = dyn_cast<String>(re)) {
+        // The Seq of its singleton CCs.
+        for (const char32_t c : *s) {
+            if (!variableCC->contains(c)) countSoFar++;
         }
         return countSoFar;
     } else if (Rep * rep = dyn_cast<Rep>(re)) {
@@ -218,8 +247,10 @@ unsigned fixedCodepointCount(RE * re, CC * variableCC) {
         return fixedCodepointCount(c->getCapturedRE(), variableCC);
     } else if (Reference * r = dyn_cast<Reference>(re)) {
         return fixedCodepointCount(r->getCapture(), variableCC);
+    } else if (isa<Any, Assertion, Range, End, Start, Permute, Interleavable>(re)) {
+        return 0;
     }
-    return 0;
+    UnexpectedRE("fixedCodepointCount", re);
 }
 
 std::string Repeated_CC_Seq_Namer::genSym() {
@@ -261,6 +292,36 @@ RE * Repeated_CC_Seq_Namer::transform(RE * r) {
         return makeAlt(newAlts.begin(), newAlts.end());
     }
     return r;
+}
+
+StringClassRepNamer::StringClassRepNamer(const cc::Alphabet * codeUnitAlphabet) :
+    NameIntroduction("StringClassRepNamer"), mAlphabet(codeUnitAlphabet) {}
+
+RE * StringClassRepNamer::transformAssertion(Assertion * a) {
+    return a;
+}
+
+RE * StringClassRepNamer::transformRep(Rep * rep) {
+    RE * const repeated = rep->getRE();
+    const int lb = rep->getLB();
+    if ((rep->getUB() != Rep::UNBOUNDED_REP) || (resolveCharClass(repeated) != nullptr)) {
+        return RE_Transformer::transformRep(rep);
+    }
+    std::vector<std::vector<CC *>> strings;
+    if (!parseStringClass(repeated, strings) || !isRepeatableStringClass(strings)) {
+        return RE_Transformer::transformRep(rep);
+    }
+    for (const auto & str : strings) {
+        for (CC * cc : str) {
+            if (cc->getAlphabet() != mAlphabet) return RE_Transformer::transformRep(rep);
+        }
+    }
+    const std::string name = "StrRep_" + kernel::Kernel::getStringHash(Printer_RE::PrintRE(repeated));
+    Name * n = createName(name, repeated);
+    mStrings.emplace(n->getFullName(), std::move(strings));
+    RE * const star = makeRep(n, 0, Rep::UNBOUNDED_REP);
+    if (lb == 0) return star;
+    return makeSeq({makeRep(repeated, lb, lb), star});
 }
 
 class Canonical_External_Names : public RE_Transformer {

@@ -14,7 +14,6 @@ DEPS
     kernel.io
     kernel.pipeline
     kernel.streamutils
-    kernel.util
     util
     toolchain
 )

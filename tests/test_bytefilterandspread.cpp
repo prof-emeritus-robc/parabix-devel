@@ -21,6 +21,8 @@
 #include <random>
 #include <util/aligned_allocator.h>
 #include <limits>
+#include <toolchain/toolchain.h>
+#include <kernel/core/streamsetptr.h>
 #if BOOST_VERSION >= 107600
 #include <boost/core/bit.hpp>
 #endif

@@ -6,7 +6,6 @@
 
 #include <kernel/core/kernel.h>
 #include <llvm/IR/Value.h>
-#include <kernel/pipeline/driver/driver.h>
 #include <kernel/streamutils/stream_select.h>
 
 namespace IDISA { class IDISA_Builder; }

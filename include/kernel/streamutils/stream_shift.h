@@ -40,6 +40,23 @@ protected:
 };
 
 //
+//  For each position marker by the marker stream, exchange data in the
+//  region from the marker forward a total of swapback_length + distance
+//  by shifting the segment of streamset data of length swapback_length
+//  from the end of the region to the beginning, while shifting forward
+//  the rest of the region forward to make room.  The regions may not
+//  overlap (adjacent regions are fine), and must end within the streams.
+//
+class SwapBack final : public pablo::PabloKernel {
+public:
+    SwapBack(LLVMTypeSystemInterface & ts, StreamSet * marker,  StreamSet * inputs, StreamSet * outputs, unsigned swapback_length, unsigned distance);
+protected:
+    void generatePabloMethod() override;
+    unsigned mSwapBackLength;
+    unsigned mDistance;
+};
+
+//
 //  Shift bit streams forward according to an index stream.   The index stream
 //  marks positions that participate in the shift.  Bits at positions marked
 //  by 1 bits in the index stream are shifted forward to the nth following

@@ -29,6 +29,7 @@ void Attribute::print(llvm::raw_ostream & out) const noexcept {
         NAME(SupressNonRegionZeroFill);
         NAME(RequiresPopCountArray); NAME(RequiresNegatedPopCountArray);
         NAME_AMOUNT(Add); NAME_AMOUNT(Truncate);
+        NAME(AddCarry);
         NAME_AMOUNT(RoundUpTo);
         NAME_AMOUNT(Delayed);
         NAME(ManagedBuffer);
@@ -53,6 +54,8 @@ void Attribute::print(llvm::raw_ostream & out) const noexcept {
         NAME(EmptyWriteOverflow);
         NAME(ExecuteStridesIndividually);
         NAME(Statefree);
+        NAME(ProvisionalLookAheadStride);
+        NAME_AMOUNT(LocalCarries);
         NAME_LABEL(InOut);
         case KindId::__Count: llvm_unreachable("__Count should not be used.");
     }

@@ -3,14 +3,8 @@
 #include <toolchain/toolchain.h>
 #include <boost/dynamic_bitset/dynamic_bitset.hpp>
 #include <boost/graph/connected_components.hpp>
+#include <numeric>
 #include <queue>
-#include <z3.h>
-
-#if Z3_VERSION_INTEGER >= LLVM_VERSION_CODE(4, 7, 0)
-    typedef int64_t Z3_int64;
-#else
-    typedef long long int        Z3_int64;
-#endif
 
 // #define PRINT_INTRA_PARTITION_VECTOR_GRAPH
 
@@ -301,6 +295,255 @@ void PipelineAnalysis::calculatePartialSumStepFactors(KernelBuilder & b) {
 }
 
 
+namespace {
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief RatioEquation
+ *
+ * value(V) = value(U) * Ratio, over positive node values. An exact equation relates fixed rates; any
+ * other relates expected rates.
+ ** ------------------------------------------------------------------------------------------------------------- */
+struct RatioEquation {
+    unsigned U;
+    unsigned V;
+    Rational Ratio;
+    bool Exact;
+};
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief RatioForest
+ *
+ * Node values implied by a consistent set of ratio equations: each component holds the values of its nodes
+ * relative to one another.
+ ** ------------------------------------------------------------------------------------------------------------- */
+class RatioForest {
+public:
+
+    explicit RatioForest(const unsigned numOfNodes)
+    : Component(numOfNodes)
+    , Value(numOfNodes, Rational{1})
+    , Members(numOfNodes) {
+        for (unsigned i = 0; i < numOfNodes; ++i) {
+            Component[i] = i;
+            Members[i].push_back(i);
+        }
+    }
+
+    // Adds the equation if it agrees with those already added; returns whether it does.
+    bool add(const RatioEquation & eq) {
+        const auto cu = Component[eq.U];
+        const auto cv = Component[eq.V];
+        const auto expected = Value[eq.U] * eq.Ratio;
+        if (cu == cv) {
+            return Value[eq.V] == expected;
+        }
+        // merge the smaller component into the larger
+        auto from = cv, into = cu;
+        auto scale = expected / Value[eq.V];
+        if (Members[cv].size() > Members[cu].size()) {
+            std::swap(from, into);
+            scale = Rational{1} / scale;
+        }
+        for (const auto w : Members[from]) {
+            Value[w] *= scale;
+            Component[w] = into;
+        }
+        Members[into].insert(Members[into].end(), Members[from].begin(), Members[from].end());
+        Members[from].clear();
+        return true;
+    }
+
+    std::vector<unsigned> Component;
+    std::vector<Rational> Value;
+    std::vector<std::vector<unsigned>> Members;
+};
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief equationBlocks
+ *
+ * Partitions the equations into the biconnected blocks of the multigraph they form over the nodes (Tarjan's
+ * algorithm, tracking the equation that reached each node so that parallel equations form a block).
+ ** ------------------------------------------------------------------------------------------------------------- */
+std::vector<std::vector<unsigned>> equationBlocks(const unsigned numOfNodes, const std::vector<RatioEquation> & equations) {
+
+    std::vector<std::vector<std::pair<unsigned, unsigned>>> incident(numOfNodes); // (equation, other node)
+    for (unsigned i = 0; i < equations.size(); ++i) {
+        const auto & eq = equations[i];
+        incident[eq.U].emplace_back(i, eq.V);
+        incident[eq.V].emplace_back(i, eq.U);
+    }
+
+    constexpr unsigned Unvisited = std::numeric_limits<unsigned>::max();
+    std::vector<unsigned> order(numOfNodes, Unvisited);
+    std::vector<unsigned> low(numOfNodes, 0);
+    std::vector<bool> seen(equations.size(), false);
+    std::vector<unsigned> stack;
+    std::vector<std::vector<unsigned>> blocks;
+    unsigned counter = 0;
+
+    struct Frame {
+        unsigned Node;
+        unsigned ParentEquation;
+        unsigned Next;
+    };
+    std::vector<Frame> dfs;
+
+    for (unsigned root = 0; root < numOfNodes; ++root) {
+        if (order[root] != Unvisited) {
+            continue;
+        }
+        order[root] = low[root] = counter++;
+        dfs.push_back(Frame{root, Unvisited, 0});
+        while (!dfs.empty()) {
+            auto & F = dfs.back();
+            const auto u = F.Node;
+            if (F.Next < incident[u].size()) {
+                const auto eq = incident[u][F.Next].first;
+                const auto v = incident[u][F.Next].second;
+                ++F.Next;
+                if (eq == F.ParentEquation || seen[eq]) {
+                    continue;
+                }
+                seen[eq] = true;
+                stack.push_back(eq);
+                if (order[v] == Unvisited) {
+                    order[v] = low[v] = counter++;
+                    dfs.push_back(Frame{v, eq, 0});
+                } else {
+                    low[u] = std::min(low[u], order[v]);
+                }
+            } else {
+                const auto parentEquation = F.ParentEquation;
+                dfs.pop_back();
+                if (dfs.empty()) {
+                    continue;
+                }
+                const auto p = dfs.back().Node;
+                low[p] = std::min(low[p], low[u]);
+                if (low[u] >= order[p]) {
+                    // p separates the equations above parentEquation on the stack from the rest
+                    std::vector<unsigned> block;
+                    for (;;) {
+                        const auto eq = stack.back();
+                        stack.pop_back();
+                        block.push_back(eq);
+                        if (eq == parentEquation) {
+                            break;
+                        }
+                    }
+                    std::sort(block.begin(), block.end());
+                    blocks.emplace_back(std::move(block));
+                }
+            }
+        }
+    }
+    assert (stack.empty());
+    return blocks;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief maximumConsistentEquations
+ *
+ * Returns which equations to keep: a largest set of them that some positive node values satisfy. Every cycle
+ * of equations lies within one biconnected block, so a set is consistent if and only if its restriction to each
+ * block is, and each block is maximized on its own by trying to drop 0, 1, 2, ... of its equations. Among
+ * equally large sets, it keeps exact equations over expected ones, then earlier equations over later ones. A
+ * block whose search exceeds a fixed budget instead keeps each equation, in that order of preference, that
+ * agrees with those already kept.
+ ** ------------------------------------------------------------------------------------------------------------- */
+std::vector<bool> maximumConsistentEquations(const unsigned numOfNodes, const std::vector<RatioEquation> & equations) {
+
+    constexpr size_t MAXIMUM_SUBSETS_PER_BLOCK = 1U << 16;
+
+    std::vector<bool> keep(equations.size(), true);
+
+    for (const auto & block : equationBlocks(numOfNodes, equations)) {
+        const auto n = block.size();
+        if (n == 1) {
+            continue;
+        }
+
+        // order the block's equations from most to least preferred to keep
+        std::vector<unsigned> preferred(block);
+        std::stable_sort(preferred.begin(), preferred.end(), [&](const unsigned a, const unsigned b) {
+            return equations[a].Exact && !equations[b].Exact;
+        });
+
+        // renumber the block's nodes so that each check is proportional to its size
+        flat_map<unsigned, unsigned> local;
+        std::vector<RatioEquation> E;
+        E.reserve(n);
+        for (const auto i : preferred) {
+            const auto & eq = equations[i];
+            const auto u = local.emplace(eq.U, local.size()).first->second;
+            const auto v = local.emplace(eq.V, local.size()).first->second;
+            E.push_back(RatioEquation{u, v, eq.Ratio, eq.Exact});
+        }
+        const unsigned m = local.size();
+
+        std::vector<bool> drop(n, false);
+
+        auto consistent = [&]() {
+            RatioForest F(m);
+            for (unsigned i = 0; i < n; ++i) {
+                if (!drop[i] && !F.add(E[i])) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        bool found = consistent();
+        size_t subsets = 1;
+        // choose the k equations to drop as c[0] < ... < c[k - 1] over reversed indices, in lexicographic order
+        std::vector<unsigned> c;
+        for (unsigned k = 1; !found && k < n && subsets < MAXIMUM_SUBSETS_PER_BLOCK; ++k) {
+            c.resize(k);
+            std::iota(c.begin(), c.end(), 0U);
+            for (;;) {
+                std::fill(drop.begin(), drop.end(), false);
+                for (const auto j : c) {
+                    drop[n - 1 - j] = true;
+                }
+                if (consistent()) {
+                    found = true;
+                    break;
+                }
+                if (++subsets >= MAXIMUM_SUBSETS_PER_BLOCK) {
+                    break;
+                }
+                // advance to the next combination
+                int i = k - 1;
+                while (i >= 0 && c[i] == n - k + i) {
+                    --i;
+                }
+                if (i < 0) {
+                    break;
+                }
+                ++c[i];
+                for (unsigned j = i + 1; j < k; ++j) {
+                    c[j] = c[j - 1] + 1;
+                }
+            }
+        }
+
+        if (!found) {
+            RatioForest F(m);
+            for (unsigned i = 0; i < n; ++i) {
+                drop[i] = !F.add(E[i]);
+            }
+        }
+
+        for (unsigned i = 0; i < n; ++i) {
+            keep[preferred[i]] = !drop[i];
+        }
+    }
+
+    return keep;
+}
+
+}
+
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief calculateRelativeToInputDataTransferIORates
  ** ------------------------------------------------------------------------------------------------------------- */
@@ -315,71 +558,38 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
 
     using Graph = adjacency_list<hash_setS, vecS, undirectedS>;
 
-    const auto cfg = Z3_mk_config();
-    Z3_set_param_value(cfg, "model", "true");
-    Z3_set_param_value(cfg, "proof", "false");
-    const auto ctx = Z3_mk_context(cfg);
-    Z3_del_config(cfg);
-    const auto solver = Z3_mk_optimize(ctx);
-    Z3_optimize_inc_ref(ctx, solver);
-
-    auto hard_assert = [&](Z3_ast c) {
-        Z3_optimize_assert(ctx, solver, c);
-    };
-
-    auto soft_assert = [&](Z3_ast c) {
-        Z3_optimize_assert_soft(ctx, solver, c, "1", nullptr);
-    };
-
-    auto check = [&]() -> Z3_lbool {
-        #if Z3_VERSION_INTEGER >= LLVM_VERSION_CODE(4, 5, 0)
-        return Z3_optimize_check(ctx, solver, 0, nullptr);
-        #else
-        return Z3_optimize_check(ctx, solver);
-        #endif
-    };
-
-    const auto varType = Z3_mk_real_sort(ctx);
-
-    auto constant_real = [&](const Rational & value) {
-        return Z3_mk_real(ctx, value.numerator(), value.denominator());
-    };
-
-    auto multiply =[&](Z3_ast X, const Rational & value) {
-        if ((value.numerator() == 1) && (value.denominator() == 1)) {
-            return X;
-        }
-        Z3_ast args[2] = { X, constant_real(value) };
-        return Z3_mk_mul(ctx, 2, args);
-    };
-
-
     NonFixedTaintGraph T(PartitionCount);
     for (unsigned prodId = 0; prodId < PartitionCount; ++prodId) {
         T[prodId].resize(PartitionCount, false);
     }
 
-    const auto z3_ZERO = constant_real(0);
+    // The expected rates are the values of a set of nodes: one per partition, scaling the stride
+    // repetition vector of its kernels, and one per streamset whose rate cannot be predicted (a
+    // pipeline input or an unknown output rate). Every other streamset's rate is its producer's
+    // partition value times a known factor.
+    struct StreamSetRate {
+        unsigned Node = 0;
+        Rational Factor{0};
+        bool Fixed = false;
+    };
 
-    const auto z3_ONE = constant_real(1);
+    const auto numOfNodes = PartitionCount + (LastStreamSet - FirstStreamSet + 1U);
 
-    std::vector<Z3_ast> VarList(LastStreamSet + 1U, nullptr);
+    auto unpredictableRateNode = [&](const size_t streamSet) -> unsigned {
+        assert (FirstStreamSet <= streamSet && streamSet <= LastStreamSet);
+        return PartitionCount + (streamSet - FirstStreamSet);
+    };
 
-    std::vector<Z3_ast> PartitionVarList(PartitionCount, nullptr);
+    std::vector<StreamSetRate> Rate(LastStreamSet + 1U);
 
-    for (unsigned i = 0; i < PartitionCount; ++i) {
-        auto rootVar = Z3_mk_fresh_const(ctx, nullptr, varType);
-        hard_assert(Z3_mk_gt(ctx, rootVar, z3_ZERO));
-        PartitionVarList[i] = rootVar;
-    }
+    // Each input that crosses partitions expects its consumer to read what its producer writes.
+    std::vector<RatioEquation> Equations;
 
     // we cannot predict how much data will be passed to a pipeline
     if (out_degree(PipelineInput, mBufferGraph) > 0) {
         for (const auto input : make_iterator_range(out_edges(PipelineInput, mBufferGraph))) {
-            Z3_ast expOutRate = Z3_mk_fresh_const(ctx, nullptr, varType);
-            hard_assert(Z3_mk_gt(ctx, expOutRate, z3_ZERO));
             const auto streamSet = target(input, mBufferGraph);
-            VarList[streamSet] = expOutRate;
+            Rate[streamSet] = StreamSetRate{unpredictableRateNode(streamSet), Rational{1}, false};
         }
 
         // if the pipeline has input, allow the pipeline to adjust the segment size
@@ -391,18 +601,12 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
     assert (KernelPartitionId[PipelineOutput] == PartitionCount - 1);
     assert (PipelineOutput == FirstKernelInPartition[PartitionCount - 1]);
 
-    for (unsigned i = PipelineInput; i <= PipelineOutput; ++i) {
-        const auto partId = KernelPartitionId[i];
-        assert (partId < PartitionCount);
-        auto rootVar = PartitionVarList[partId];
-        VarList[i] = multiply(rootVar, StrideRepetitionVector[i]);
-    }
-
     for (auto kernel = FirstKernel; kernel <= PipelineOutput; ++kernel) {
 
         for (const auto input : make_iterator_range(in_edges(kernel, mBufferGraph))) {
             const auto streamSet = source(input, mBufferGraph);
-            assert (VarList[streamSet] != nullptr);
+            const StreamSetRate & R = Rate[streamSet];
+            assert (R.Factor.numerator() > 0);
             const auto producer = parent(streamSet, mBufferGraph);
             const auto prodPartId = KernelPartitionId[producer];
             const auto consPartId = KernelPartitionId[kernel];
@@ -410,18 +614,12 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
                 const BufferPort & port = mBufferGraph[input];
                 const Binding & bind = port.Binding;
                 const ProcessingRate & iRate = bind.getRate();
-                if (LLVM_UNLIKELY(iRate.isGreedy())) {
-                    // VarList[streamSet] == VarList[streamSet]
-                } else {
+                // a greedy input reads whatever is written
+                if (LLVM_LIKELY(!iRate.isGreedy())) {
                     const auto expectedInput = (port.Minimum + port.Maximum) * Rational{1, 2};
                     assert (expectedInput.numerator() > 0);
-                    Z3_ast expInRate = multiply(VarList[kernel], expectedInput);
-                    auto r = Z3_mk_eq(ctx, expInRate, VarList[streamSet]);
-//                    if (iRate.isFixed()) {
-//                        hard_assert(r);
-//                    } else {
-                        soft_assert(r);
-//                    }
+                    Equations.push_back(RatioEquation{consPartId, R.Node, (expectedInput * StrideRepetitionVector[kernel]) / R.Factor,
+                                                      R.Fixed && port.Minimum == port.Maximum});
                 }
                 add_edge(prodPartId, consPartId, T);
                 if (port.Minimum != port.Maximum) {
@@ -433,24 +631,21 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
 
         for (const auto output : make_iterator_range(out_edges(kernel, mBufferGraph))) {
             const auto streamSet = target(output, mBufferGraph);
-            assert (VarList[streamSet] == nullptr);
+            assert (Rate[streamSet].Factor.numerator() == 0);
             const BufferPort & port = mBufferGraph[output];
             const Binding & bind = port.Binding;
             const ProcessingRate & oRate = bind.getRate();
 
-            Z3_ast expOutRate = nullptr;
-
             if (LLVM_UNLIKELY(oRate.isUnknown())) {
                 // we cannot predict how much data will be passed to a pipeline
-                expOutRate = Z3_mk_fresh_const(ctx, nullptr, varType);
+                Rate[streamSet] = StreamSetRate{unpredictableRateNode(streamSet), Rational{1}, false};
             } else {
                 const auto expectedOutput = (port.Minimum + port.Maximum) * Rational{1, 2};
                 assert (expectedOutput.numerator() > 0);
-                expOutRate = multiply(VarList[kernel], expectedOutput);
+                Rate[streamSet] = StreamSetRate{KernelPartitionId[kernel], expectedOutput * StrideRepetitionVector[kernel],
+                                                port.Minimum == port.Maximum};
             }
 
-            hard_assert(Z3_mk_gt(ctx, expOutRate, z3_ZERO));
-            VarList[streamSet] = expOutRate;
             if (port.Minimum != port.Maximum) {
                 for (const auto input : make_iterator_range(out_edges(streamSet, mBufferGraph))) {
                     const auto consumer = target(input, mBufferGraph);
@@ -463,62 +658,66 @@ void PipelineAnalysis::calculateRelativeToInputDataTransferIORates() {
         }
     }
 
-    SmallVector<Z3_ast, 2> fakeIOVars;
+    // Satisfy as many equations as possible; two nodes are in the same component once a kept equation
+    // relates them.
+    const auto keep = maximumConsistentEquations(numOfNodes, Equations);
+    RatioForest Forest(numOfNodes);
+    for (unsigned i = 0; i < Equations.size(); ++i) {
+        if (keep[i]) {
+            [[maybe_unused]] const auto consistent = Forest.add(Equations[i]);
+            assert (consistent);
+        }
+    }
+    const auto & Component = Forest.Component;
+    auto & Value = Forest.Value;
+    const auto & Members = Forest.Members;
+
+    // Each component is only determined up to scale: rates are relative to one stride of the first kernel
+    // without input in it (or of the pipeline input), failing that of the first kernel of its lowest
+    // numbered partition. A streamset whose rate cannot be predicted and that no equation relates to
+    // any partition has a rate of one.
+    std::vector<unsigned> anchors;
     for (unsigned kernel = FirstKernel; kernel <= LastKernel; ++kernel) {
         if (in_degree(kernel, mBufferGraph) == 0) {
-            fakeIOVars.push_back(VarList[kernel]);
+            anchors.push_back(kernel);
         }
     }
-
-    if (fakeIOVars.empty()) {
-        fakeIOVars.push_back(VarList[PipelineInput]);
+    if (anchors.empty()) {
+        anchors.push_back(PipelineInput);
     }
 
-    const auto m = fakeIOVars.size(); assert (m > 0);
-
-    SmallVector<Z3_ast, 2> fakeIOConstraint(m);
-    for (unsigned i = 0; i < m; ++i) {
-        fakeIOConstraint[i] = Z3_mk_eq(ctx, fakeIOVars[i], z3_ONE);
+    std::vector<bool> normalized(numOfNodes, false);
+    auto normalize = [&](const unsigned component, const Rational & scale) {
+        for (const auto w : Members[component]) {
+            Value[w] *= scale;
+        }
+        normalized[component] = true;
+    };
+    for (const auto kernel : anchors) {
+        const auto partId = KernelPartitionId[kernel];
+        const auto c = Component[partId];
+        if (!normalized[c]) {
+            normalize(c, Rational{1} / (Value[partId] * StrideRepetitionVector[kernel]));
+        }
     }
-
-    Z3_ast constraint;
-    if (m == 1) {
-        constraint = fakeIOConstraint[0];
-    } else {
-        constraint = Z3_mk_or(ctx, m, fakeIOConstraint.data());
+    for (unsigned c = 0; c < numOfNodes; ++c) {
+        if (!Members[c].empty() && !normalized[c]) {
+            const auto lowest = *std::min_element(Members[c].begin(), Members[c].end());
+            if (lowest < PartitionCount) {
+                normalize(c, Rational{1} / (Value[lowest] * StrideRepetitionVector[FirstKernelInPartition[lowest]]));
+            } else {
+                assert (Members[c].size() == 1);
+                normalize(c, Rational{1} / Value[lowest]);
+            }
+        }
     }
-    hard_assert(constraint);
-
-    if (LLVM_UNLIKELY(check() == Z3_L_FALSE)) {
-        report_fatal_error("Z3 failed to find a solution to the maximum permitted dataflow problem");
-    }
-
-    const auto model = Z3_optimize_get_model(ctx, solver);
-    Z3_model_inc_ref(ctx, model);
 
     for (auto streamSet = FirstStreamSet; streamSet <= LastStreamSet; ++streamSet) {
-        Z3_ast value;
-        if (LLVM_UNLIKELY(Z3_model_eval(ctx, model, VarList[streamSet], Z3_L_TRUE, &value) != Z3_L_TRUE)) {
-            report_fatal_error("Unexpected Z3 error when attempting to obtain value from model!");
-        }
-
-        Z3_int64 num, denom;
-        if (LLVM_UNLIKELY(Z3_get_numeral_rational_int64(ctx, value, &num, &denom) != Z3_L_TRUE)) {
-            report_fatal_error("Unexpected Z3 error when attempting to convert model value to number!");
-        }
-
-        assert (denom > 0);
-        assert (num > 0);
-
+        const StreamSetRate & R = Rate[streamSet];
+        assert (R.Factor.numerator() > 0);
         BufferNode & bn = mBufferGraph[streamSet];
-        bn.RelativeIORate = Rational{num, denom};
+        bn.RelativeIORate = Value[R.Node] * R.Factor;
     }
-
-    Z3_model_dec_ref(ctx, model);
-    Z3_optimize_dec_ref(ctx, solver);
-    Z3_del_context(ctx);
-    Z3_reset_memory();
-
 
     #ifndef NDEBUG
     const reverse_traversal ordering(PartitionCount);

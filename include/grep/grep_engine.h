@@ -104,6 +104,8 @@ public:
     void initRE(re::RE * re);
     virtual void grepCodeGen();
     bool searchAllFiles();
+    // Whether an input file could not be read (reported unless suppressed).
+    bool fileErrorFound() const {return mFileErrorFound;}
     void DoGrepThreadMethod();
     virtual void showResult(uint64_t grepResult, const std::string & fileName, std::ostringstream & strm);
 
@@ -157,6 +159,7 @@ protected:
     std::vector<std::ostringstream> mResultStrs;
     std::vector<FileStatus> mFileStatus;
     bool grepMatchFound;
+    std::atomic<bool> mFileErrorFound{false};
     GrepRecordBreakKind mGrepRecordBreak;
 
     PreparedRE mPreparedRE;     // the RE as prepared by the regular expression engine

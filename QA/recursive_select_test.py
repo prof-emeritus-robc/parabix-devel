@@ -7,7 +7,8 @@
 #  .gitignore, symlinks found while recursing (followed only with -R),
 #  directory loops (-R), FIFOs (skipped unless -D read), an unreadable
 #  directory with a .gitignore (whose patterns must not apply elsewhere),
-#  file names shown for files found in a directory (unless -h),
+#  file names shown for files found in a directory (unless -h), exit
+#  status 2 for a file that cannot be read,
 #  and -TraceFileSelect output.
 #
 #  recursive_select_test.py <icgrep binary>
@@ -80,6 +81,12 @@ def main():
             check(out == "zz/f.txt:hit\n", "-r hit zz printed %r" % out)
             out, err = run(icgrep, ["-r", "-h", "hit", "zz"], d)
             check(out == "hit\n", "-r -h hit zz printed %r" % out)
+            # exit status 2 for a file that cannot be read, also with -s,
+            # unless -q finds a match
+            for args, expected_status in ((["hit", "nosuch", "zz/f.txt"], 2), (["-s", "hit", "nosuch", "zz/f.txt"], 2),
+                                          (["-q", "hit", "nosuch", "zz/f.txt"], 0), (["-q", "miss", "nosuch", "zz/f.txt"], 2)):
+                status = subprocess.run([icgrep] + args, cwd=d, capture_output=True, timeout=10).returncode
+                check(status == expected_status, "icgrep %s exited %d" % (" ".join(args), status))
             out, err = run(icgrep, ["-R", "-l", "hit", "root"], d)
             check("root/link.txt" in out.split(), "-R did not follow root/link.txt")
             check("recursive directory loop" in err, "-R did not report the loop root/sub/loop")

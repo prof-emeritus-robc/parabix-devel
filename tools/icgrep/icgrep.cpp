@@ -169,5 +169,10 @@ int main(int argc, char *argv[]) {
     jitExecution.stop();
     jitExecution.write(std::cerr);
     #endif
+    // As in GNU grep, a file error takes precedence over the match result,
+    // except for a match found with -q.
+    if (grep->fileErrorFound() && !(matchFound && (argv::Mode == argv::QuietMode))) {
+        return argv::FileErrorExitCode;
+    }
     return matchFound ? argv::MatchFoundExitCode : argv::MatchNotFoundExitCode;
 }

@@ -1186,6 +1186,7 @@ int32_t GrepEngine::openFile(const std::string & fileName, std::ostringstream & 
         #endif
         int32_t fileDescriptor = open(fileName.c_str(), flags);
         if (LLVM_UNLIKELY(fileDescriptor == -1)) {
+            mFileErrorFound = true;
             if (!mSuppressFileMessages) {
                 msgstrm << "icgrep: \"" << fileName << "\": ";
                 if (errno == EACCES) {
@@ -1201,6 +1202,7 @@ int32_t GrepEngine::openFile(const std::string & fileName, std::ostringstream & 
             return fileDescriptor;
         }
         if (stat(fileName.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
+            mFileErrorFound = true;
             if (!mSuppressFileMessages) {
                 msgstrm << "icgrep: " << fileName << ": Is a directory.\n";
             }

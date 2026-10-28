@@ -83,10 +83,53 @@ NestedInternalSearchEngine::NestedInternalSearchEngine(BaseDriver & driver)
 }
 
 void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool filter) {
-    // If we have no patterns and this is the "root" pattern,
-    // we'll still need an empty gitignore kernel even if it
-    // just returns the record break stream for input.
-    // Otherwise just reuse the parent kernel.
+
+    assert (mNested.size() > 0 && mNested[0] == nullptr);
+    assert (mIsFilter.size() == mNested.size());
+
+    // The level whose selection this level modifies: the nearest enclosing
+    // level that is not a filter or empty (none, for a filter level).
+    Kernel * enclosing = nullptr;
+    if (!filter) {
+        for (size_t k = mNested.size() - 1; k > 0; --k) {
+            if (!mIsFilter[k] && mNested[k]) {
+                enclosing = mNested[k];
+                break;
+            }
+        }
+    }
+
+    // An empty level that is not a filter selects what the level below it
+    // selects: the enclosing selection (or all records), restricted by the
+    // filters.  Reuse that level's program, unless the level below is a
+    // filter above the enclosing level, whose program ignores it.
+    if (patterns.empty() && !filter && !mMainMethod.empty() && (!mIsFilter.back() || enclosing == nullptr)) {
+        mNested.push_back(nullptr);
+        mIsFilter.push_back(false);
+        mMainMethod.push_back(mMainMethod.back());
+        return;
+    }
+
+    // A level is determined by its kind, its patterns, the enclosing level
+    // and the filter levels: reuse an identical level compiled earlier.
+    std::string levelKey;
+    {
+        raw_string_ostream key(levelKey);
+        key << filter << ' ' << static_cast<int>(mGrepRecordBreak) << ' ' << enclosing;
+        for (size_t k = 1; k < mNested.size(); ++k) {
+            if (mIsFilter[k]) key << ' ' << mNested[k];
+        }
+        for (const auto & p : patterns) {
+            key << '\n' << (p.first == re::PatternKind::Exclude ? '-' : '+') << Printer_RE::PrintRE(p.second);
+        }
+    }
+    const auto f = mCompiledLevels.find(levelKey);
+    if (f != mCompiledLevels.end()) {
+        mNested.push_back(f->second.kernel);
+        mIsFilter.push_back(filter);
+        mMainMethod.push_back(f->second.main);
+        return;
+    }
 
     const auto preserve = mGrepDriver.getPreservesKernels();
     mGrepDriver.setPreserveKernels(true);
@@ -116,23 +159,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool f
 
     StreamSet * const matches = P.CreateStreamSet();
 
-    assert (mNested.size() > 0 && mNested[0] == nullptr);
-    assert (mNested.size() == 1 || mNested[1] != nullptr);
-    assert (mIsFilter.size() == mNested.size());
-
     Kernel * kernel = nullptr;
-
-    // The level whose selection this level modifies: the nearest enclosing
-    // level that is not a filter (none, for a filter level).
-    Kernel * enclosing = nullptr;
-    if (!filter) {
-        for (size_t k = mNested.size() - 1; k > 0; --k) {
-            if (!mIsFilter[k]) {
-                enclosing = mNested[k];
-                break;
-            }
-        }
-    }
 
     if (LLVM_UNLIKELY(patterns.empty())) {
 
@@ -237,6 +264,7 @@ void NestedInternalSearchEngine::push(const re::PatternVector & patterns, bool f
 
     mMainMethod.push_back(P.compile());
     assert (mMainMethod.size() + 1 == mNested.size());
+    mCompiledLevels.emplace(std::move(levelKey), CompiledLevel{kernel, mMainMethod.back()});
 
     mGrepDriver.setPreserveKernels(preserve);
 }

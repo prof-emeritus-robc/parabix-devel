@@ -274,103 +274,179 @@ re::PatternVector coalesceREs(const re::PatternVector sourceREs, unsigned groupi
 // The (device, inode) identity of a directory, to detect directory loops.
 using DirectoryId = std::pair<dev_t, ino_t>;
 
-void recursiveFileSelect(CPUDriver & driver,
-                         const fs::path & dirpath,
-                         grep::NestedInternalSearchEngine & pathSelectEngine,
-                         std::vector<fs::path> & collectedPaths,
-                         std::vector<DirectoryId> & ancestors,
-                         const std::string & ignoreFileName) {
-
-    // A directory that is its own ancestor (through symlinks, with -R) is
-    // a loop: skip it, as GNU grep does.
-    struct stat sb;
-    const bool identified = (::stat(dirpath.c_str(), &sb) == 0);
-    if (identified) {
-        const DirectoryId id{sb.st_dev, sb.st_ino};
-        if (std::find(ancestors.begin(), ancestors.end(), id) != ancestors.end()) {
-            if (!NoMessagesFlag) {
-                llvm::errs() << sys::path::filename(codegen::ProgramName) << ": warning: \""
-                             << dirpath.string() << "\": recursive directory loop.\n";
-            }
-            return;
-        }
-        ancestors.push_back(id);
+// Records the indices of the selected entries of a search buffer.
+class EntrySelectAccumulator : public grep::MatchAccumulator {
+public:
+    EntrySelectAccumulator(std::vector<size_t> & selected) : mSelected(selected) {}
+    void accumulate_match(const size_t entryIdx, char *, char *) override {
+        mSelected.push_back(entryIdx);
     }
+private:
+    std::vector<size_t> & mSelected;
+};
 
-    error_code errc;
-    fs::directory_iterator di(dirpath, errc);
-    if (errc) {
-        // If we cannot enter the directory, keep it in the list of files,
-        // for error reporting (silent with -s) and the exit status.
-        collectedPaths.push_back(dirpath);
-        if (identified) ancestors.pop_back();
-        return;
-    }
+// A directory found while recursing: its entries (full paths, directories
+// ending with "/"), read before any of them is selected, and those selected.
+struct DirectoryEntries {
+    fs::path path;
+    bool readable = false;
+    bool isLoop = false;
+    bool identified = false;
+    DirectoryId id;
+    bool hasIgnoreFile = false;
+    re::PatternVector ignorePatterns;
+    std::vector<std::string> names;
+    std::vector<size_t> selected;
+};
 
-    // Update the search REs with any local .gitignore or other exclude file.
-    error_code ec;
-    const auto hasLocalIgnoreFile = !ignoreFileName.empty() && fs::exists(dirpath/ignoreFileName, ec) && !ec;
-
-    if (hasLocalIgnoreFile) {
-        pathSelectEngine.push(coalesceREs(re::parseGitIgnoreFile(dirpath, ignoreFileName), GitREcoalescing));
-    }
-    // Gather files and subdirectories.
-    grep::SearchableBuffer fileCandidates;
-    grep::SearchableBuffer subdirCandidates;
-
+// The state of a recursive file selection.
+struct RecursiveSelection {
+    grep::NestedInternalSearchEngine & engine;
+    std::vector<fs::path> & collectedPaths;
+    const std::string & ignoreFileName;
     // Devices, FIFOs and sockets found while recursing are read only when
     // -D read is given explicitly (GNU grep).
     const bool readDevices = (DevicesFlag == Read) && (DevicesOption.getNumOccurrences() > 0);
+    // The directories being recursed into, to detect loops (only possible
+    // with -R, as symlinks found while recursing are otherwise not followed).
+    std::vector<DirectoryId> ancestors;
+};
+
+static void readDirectory(DirectoryEntries & d, RecursiveSelection & r) {
+    // A directory that is its own ancestor (through symlinks) is a loop:
+    // skip it, as GNU grep does.
+    struct stat sb;
+    if (DereferenceRecursiveFlag && (::stat(d.path.c_str(), &sb) == 0)) {
+        d.identified = true;
+        d.id = DirectoryId{sb.st_dev, sb.st_ino};
+        if (std::find(r.ancestors.begin(), r.ancestors.end(), d.id) != r.ancestors.end()) {
+            if (!NoMessagesFlag) {
+                llvm::errs() << sys::path::filename(codegen::ProgramName) << ": warning: \""
+                             << d.path.string() << "\": recursive directory loop.\n";
+            }
+            d.isLoop = true;
+            return;
+        }
+    }
+    error_code errc;
+    fs::directory_iterator di(d.path, errc);
+    if (errc) return;
+    d.readable = true;
     const auto di_end = fs::directory_iterator();
     while (di != di_end) {
         const auto & e = di->path();
+        // The entry type, as the directory listing gives it where it can
+        // (without a stat of each entry).
         error_code errc;
-        // Without -R, symlinks found while recursing are not followed.
-        if (!DereferenceRecursiveFlag && fs::is_symlink(di->symlink_status(errc))) {
-            error_code errc2;
-            di.increment(errc2);
-            if (errc2) break;
-            continue;
+        auto s = di->symlink_status(errc);
+        if (!errc && fs::is_symlink(s)) {
+            // Without -R, symlinks found while recursing are not followed
+            // (but a symlinked ignore file still applies).
+            if (!DereferenceRecursiveFlag) {
+                if (!r.ignoreFileName.empty() && (e.filename() == r.ignoreFileName)) {
+                    d.hasIgnoreFile = fs::is_regular_file(di->status(errc));
+                }
+                error_code errc2;
+                di.increment(errc2);
+                if (errc2) break;
+                continue;
+            }
+            s = di->status(errc);
         }
-        const auto s = fs::status(e, errc);
         if (errc) {
-            // If there was an error, we leave the file in the fileCandidates
-            // list for later error processing.
-            fileCandidates.append(e.string());
+            // If there was an error, we leave the file in the candidates
+            // for later error processing.
+            d.names.push_back(e.string());
         } else if (fs::is_directory(s)) {
-            subdirCandidates.append(e.string() + "/");
-        } else if (fs::is_regular_file(s) || readDevices) {
-            fileCandidates.append(e.string());
+            d.names.push_back(e.string() + "/");
+        } else if (fs::is_regular_file(s) || r.readDevices) {
+            if (!r.ignoreFileName.empty() && (e.filename() == r.ignoreFileName)) {
+                d.hasIgnoreFile = true;
+            }
+            d.names.push_back(e.string());
         }
         error_code errc2;
         di.increment(errc2);
         if (errc2) break;
     }
-
-    // For each directory, update counts for candidates generated at this level.
-    //
-    const auto fileCount = fileCandidates.getCandidateCount();
-    if (fileCount > 0) {
-        FileSelectAccumulator fileAccum(collectedPaths);
-        fileAccum.setFullPathEntries(fileCount);
-        pathSelectEngine.doGrep(fileCandidates.data(), fileCandidates.size(), fileAccum);
+    if (d.hasIgnoreFile) {
+        d.ignorePatterns = coalesceREs(re::parseGitIgnoreFile(d.path, r.ignoreFileName), GitREcoalescing);
     }
+}
 
-    const auto subdirCount = subdirCandidates.getCandidateCount();
-    if (subdirCount > 0) {
-        std::vector<fs::path> selectedDirectories;
-        FileSelectAccumulator directoryAccum(selectedDirectories);
-        directoryAccum.setFullPathEntries(subdirCount);
-        pathSelectEngine.doGrep(subdirCandidates.data(), subdirCandidates.size(), directoryAccum);
-        for (const auto & subdir : selectedDirectories) {
-            recursiveFileSelect(driver, subdir, pathSelectEngine, collectedPaths, ancestors, ignoreFileName);
+// Selects the entries of the given directories with the current level of
+// the search engine, in one search.
+static void selectEntries(const std::vector<DirectoryEntries *> & dirs, RecursiveSelection & r) {
+    grep::SearchableBuffer candidates;
+    for (DirectoryEntries * d : dirs) {
+        for (const auto & name : d->names) {
+            candidates.append(name);
         }
     }
-
-    if (hasLocalIgnoreFile) {
-        pathSelectEngine.pop();
+    if (candidates.getCandidateCount() == 0) return;
+    std::vector<size_t> selected;
+    EntrySelectAccumulator accum(selected);
+    r.engine.doGrep(candidates.data(), candidates.size(), accum);
+    // Distribute the selected entries (in increasing order) to their directories.
+    size_t first = 0;
+    auto d = dirs.begin();
+    for (const auto i : selected) {
+        while (i >= first + (*d)->names.size()) {
+            first += (*d)->names.size();
+            ++d;
+            assert (d != dirs.end());
+        }
+        (*d)->selected.push_back(i - first);
     }
-    if (identified) ancestors.pop_back();
+}
+
+// Selects the files in and below the given directories (the selected
+// subdirectories of one directory, or the command line directories), in
+// order, each directory's files before those of its subdirectories.  The
+// entries of the directories without their own ignore file are selected in
+// one search, with the current level of the search engine.
+static void selectInDirectories(const std::vector<fs::path> & dirpaths, RecursiveSelection & r) {
+    std::vector<DirectoryEntries> dirs(dirpaths.size());
+    std::vector<DirectoryEntries *> batch;
+    for (size_t i = 0; i < dirpaths.size(); ++i) {
+        DirectoryEntries & d = dirs[i];
+        d.path = dirpaths[i];
+        readDirectory(d, r);
+        if (d.readable) {
+            if (d.hasIgnoreFile) {
+                r.engine.push(d.ignorePatterns);
+                selectEntries({&d}, r);
+                r.engine.pop();
+            } else {
+                batch.push_back(&d);
+            }
+        }
+    }
+    selectEntries(batch, r);
+    for (DirectoryEntries & d : dirs) {
+        if (d.isLoop) continue;
+        if (!d.readable) {
+            // If we cannot enter the directory, keep it in the list of files,
+            // for error reporting (silent with -s) and the exit status.
+            r.collectedPaths.push_back(d.path);
+            continue;
+        }
+        std::vector<fs::path> subdirs;
+        for (const auto i : d.selected) {
+            const auto & name = d.names[i];
+            if (name.back() == '/') {
+                subdirs.emplace_back(name);
+            } else {
+                selectPath(r.collectedPaths, fs::path(name));
+            }
+        }
+        if (subdirs.empty()) continue;
+        if (d.hasIgnoreFile) r.engine.push(d.ignorePatterns);
+        if (d.identified) r.ancestors.push_back(d.id);
+        selectInDirectories(subdirs, r);
+        if (d.identified) r.ancestors.pop_back();
+        if (d.hasIgnoreFile) r.engine.pop();
+    }
 }
 
 int openInputFile(const fs::path & p) {
@@ -520,10 +596,8 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
         // The per-directory ignore file, if the tool or the command line asks for one.
         const bool useIgnoreFiles = mConfig.useIgnoreFiles || (ExcludePerDirectory.getNumOccurrences() > 0);
         const std::string ignoreFileName = useIgnoreFiles ? ExcludePerDirectory.getValue() : std::string();
-        std::vector<DirectoryId> ancestors;
-        for (const auto & dirpath : selectedDirectories) {
-            recursiveFileSelect(driver, dirpath, pathSelectEngine, collectedPaths, ancestors, ignoreFileName);
-        }
+        RecursiveSelection r{pathSelectEngine, collectedPaths, ignoreFileName};
+        selectInDirectories(selectedDirectories, r);
     }
     if (TimeFileSelect) {
         auto file_select_done = std::chrono::high_resolution_clock::now();

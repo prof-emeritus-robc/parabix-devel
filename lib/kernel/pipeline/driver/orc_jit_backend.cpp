@@ -1107,7 +1107,10 @@ record_decl:
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        C.TargetMachine->setOptLevel(codegen::BackEndOptLevel);
+        // "main" only sets up and calls the kernels, which are compiled
+        // separately at codegen::BackEndOptLevel: optimizing its code would
+        // cost far more (several msec per program) than it could ever save.
+        C.TargetMachine->setOptLevel(CodeGenOptLevel::None);
 
         SmallVector<char, 0> objBuffer;
         objBuffer.reserve(4096 + M->getInstructionCount() * 16);

@@ -66,7 +66,7 @@ static cl::opt<std::string> ExcludeFromFlag("exclude-from", cl::desc("Exclude fi
 static cl::list<std::string> ExcludeDirectories("exclude-dir", cl::desc("Exclude directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options));
 
 static cl::opt<std::string> ExcludePerDirectory("exclude-per-directory",
-                                                cl::desc(".gitignore (default) or other file specifying files to exclude."),
+                                                cl::desc("File in each directory specifying files to exclude while recursing (default .gitignore; used by default only by icgrep).  Empty for none."),
                                                 cl::init(".gitignore"), cl::cat(File_Select_Options));
 
 static cl::list<std::string> IncludeDirectories("include-dir", cl::desc("Include directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options));
@@ -278,7 +278,8 @@ void recursiveFileSelect(CPUDriver & driver,
                          const fs::path & dirpath,
                          grep::NestedInternalSearchEngine & pathSelectEngine,
                          std::vector<fs::path> & collectedPaths,
-                         std::vector<DirectoryId> & ancestors) {
+                         std::vector<DirectoryId> & ancestors,
+                         const std::string & ignoreFileName) {
 
     // A directory that is its own ancestor (through symlinks, with -R) is
     // a loop: skip it, as GNU grep does.
@@ -308,10 +309,10 @@ void recursiveFileSelect(CPUDriver & driver,
 
     // Update the search REs with any local .gitignore or other exclude file.
     error_code ec;
-    const auto hasLocalIgnoreFile = !ExcludePerDirectory.empty() && fs::exists(dirpath/ExcludePerDirectory, ec) && !ec;
+    const auto hasLocalIgnoreFile = !ignoreFileName.empty() && fs::exists(dirpath/ignoreFileName, ec) && !ec;
 
     if (hasLocalIgnoreFile) {
-        pathSelectEngine.push(coalesceREs(re::parseGitIgnoreFile(dirpath, ExcludePerDirectory), GitREcoalescing));
+        pathSelectEngine.push(coalesceREs(re::parseGitIgnoreFile(dirpath, ignoreFileName), GitREcoalescing));
     }
     // Gather files and subdirectories.
     grep::SearchableBuffer fileCandidates;
@@ -362,7 +363,7 @@ void recursiveFileSelect(CPUDriver & driver,
         directoryAccum.setFullPathEntries(subdirCount);
         pathSelectEngine.doGrep(subdirCandidates.data(), subdirCandidates.size(), directoryAccum);
         for (const auto & subdir : selectedDirectories) {
-            recursiveFileSelect(driver, subdir, pathSelectEngine, collectedPaths, ancestors);
+            recursiveFileSelect(driver, subdir, pathSelectEngine, collectedPaths, ancestors, ignoreFileName);
         }
     }
 
@@ -390,8 +391,8 @@ int openInputFile(const fs::path & p) {
     return -1;
 }
 
-FileSelection::FileSelection(CPUDriver & driver, const cl::list<std::string> & inputFiles, const bool stdinAsPath)
-: mStdinAsPath(stdinAsPath) {
+FileSelection::FileSelection(CPUDriver & driver, const cl::list<std::string> & inputFiles, const FileSelectConfig & config)
+: mConfig(config) {
     // -r and -R imply -d recurse.
     if (RecursiveFlag || DereferenceRecursiveFlag) {
         DirectoriesFlag = Recurse;
@@ -400,7 +401,7 @@ FileSelection::FileSelection(CPUDriver & driver, const cl::list<std::string> & i
 }
 
 bool FileSelection::showFileNames() const {
-    const auto files = mPaths.size() + ((mStdIn && !mStdinAsPath) ? 1 : 0);
+    const auto files = mPaths.size() + ((mStdIn && !mConfig.stdinAsPath) ? 1 : 0);
     return (files > 1) || mRecursedIntoDirectory;
 }
 
@@ -412,7 +413,7 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
     if (inputFiles.empty()) {
         mStdIn = true;
         mDefaultStdIn = true;
-        if (mStdinAsPath) collectedPaths.emplace_back("-");
+        if (mConfig.stdinAsPath) collectedPaths.emplace_back("-");
         return collectedPaths;
     }
 
@@ -427,7 +428,7 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
         for (const auto & f : inputFiles) {
             if (f == "-") {  // stdin, will always be searched.
                 mStdIn = true;
-                if (mStdinAsPath) selectPath(collectedPaths, fs::path(f));
+                if (mConfig.stdinAsPath) selectPath(collectedPaths, fs::path(f));
                 continue;
             }
             fs::path p(f);
@@ -457,7 +458,7 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
     for (const auto & f : inputFiles) {
         if (f == "-") {  // stdin, will always be searched.
             mStdIn = true;
-            if (mStdinAsPath) selectPath(collectedPaths, fs::path(f));
+            if (mConfig.stdinAsPath) selectPath(collectedPaths, fs::path(f));
             continue;
         }
         fs::path p(f);
@@ -516,9 +517,12 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
         pathSelectEngine.pop();
         pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), GitREcoalescing), true);
         // Select files from subdirectories using the recursive process.
+        // The per-directory ignore file, if the tool or the command line asks for one.
+        const bool useIgnoreFiles = mConfig.useIgnoreFiles || (ExcludePerDirectory.getNumOccurrences() > 0);
+        const std::string ignoreFileName = useIgnoreFiles ? ExcludePerDirectory.getValue() : std::string();
         std::vector<DirectoryId> ancestors;
         for (const auto & dirpath : selectedDirectories) {
-            recursiveFileSelect(driver, dirpath, pathSelectEngine, collectedPaths, ancestors);
+            recursiveFileSelect(driver, dirpath, pathSelectEngine, collectedPaths, ancestors, ignoreFileName);
         }
     }
     if (TimeFileSelect) {

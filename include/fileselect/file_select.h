@@ -33,6 +33,16 @@ extern bool DereferenceRecursiveFlag; // -R
 
 extern bool MmapFlag; // -mmap
 
+// How a tool selects its files.
+struct FileSelectConfig {
+    // Select standard input in place, as the path "-" (see FileSelection).
+    bool stdinAsPath = false;
+    // While recursing, apply the per-directory ignore files
+    // (--exclude-per-directory, .gitignore by default).  When false they
+    // are applied only if --exclude-per-directory is given.
+    bool useIgnoreFiles = true;
+};
+
 // The files selected for processing: those named by the input file
 // arguments, and those found by recursing into directories with -r or -R,
 // that the include and exclude options select.  Standard input is selected
@@ -41,7 +51,8 @@ extern bool MmapFlag; // -mmap
 // for openInputFile to report.
 class FileSelection {
 public:
-    FileSelection(CPUDriver & driver, const llvm::cl::list<std::string> & inputFiles, bool stdinAsPath = false);
+    FileSelection(CPUDriver & driver, const llvm::cl::list<std::string> & inputFiles,
+                  const FileSelectConfig & config = FileSelectConfig());
 
     const std::vector<boost::filesystem::path> & paths() const {return mPaths;}
     size_t size() const {return mPaths.size();}
@@ -65,7 +76,7 @@ public:
 private:
     std::vector<boost::filesystem::path> selectFiles(CPUDriver & driver, const llvm::cl::list<std::string> & inputFiles);
 
-    const bool mStdinAsPath;
+    const FileSelectConfig mConfig;
     bool mStdIn = false;
     bool mDefaultStdIn = false;
     bool mRecursedIntoDirectory = false;

@@ -109,7 +109,10 @@ bool mp(MatchPriorFunctionType fn_ptr, const fs::path & path, const std::string 
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     CPUDriver driver("mp");
-    const argv::FileSelection allFiles(driver, inputFiles, true);
+    argv::FileSelectConfig config;
+    config.stdinAsPath = true;
+    config.useIgnoreFiles = false;
+    const argv::FileSelection allFiles(driver, inputFiles, config);
     const auto fileCount = allFiles.size();
 
     auto matchPriorFunctionPtr = mpPipelineGen(driver);

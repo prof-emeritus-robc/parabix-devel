@@ -5,7 +5,8 @@
 #  Input files of wc, ucount and matchprior: standard input (by default and
 #  as "-"), no row for a file that cannot be read (with an error message,
 #  silent with -s) and exit status 1, a total whenever more than one file is
-#  selected (also with -r), and the file selection options shown by --help.
+#  selected (also with -r), .gitignore files applied only when asked for,
+#  and the file selection options shown by --help.
 #
 #  wc_files_test.py <bin directory>
 
@@ -54,6 +55,16 @@ def main():
               "ucount -r dir: %s" % rows)
         rows, err, status = run(ucount, ["\\p{L}"], d, b"ab\n")
         check(rows == [["2"]], "ucount on standard input: %s" % rows)
+        os.makedirs(os.path.join(d, "ign"))
+        for name, text in ((".gitignore", "skip.txt\n"), ("keep.txt", "k\n"), ("skip.txt", "s\n")):
+            with open(os.path.join(d, "ign", name), "w") as out:
+                out.write(text)
+        rows, err, status = run(wc, ["-r", "ign"], d)
+        check(sorted(r[-1] for r in rows) == ["ign/.gitignore", "ign/keep.txt", "ign/skip.txt", "total"],
+              "wc -r applied .gitignore: %s" % rows)
+        rows, err, status = run(wc, ["-r", "--exclude-per-directory=.gitignore", "ign"], d)
+        check(sorted(r[-1] for r in rows) == ["ign/.gitignore", "ign/keep.txt", "total"],
+              "wc -r --exclude-per-directory=.gitignore: %s" % rows)
         rows, err, status = run(matchprior, ["nosuch"], d)
         check(err == "matchprior: nosuch: No such file.\n" and status == 1, "matchprior nosuch: %r %d" % (err, status))
         for tool in (wc, ucount, matchprior):

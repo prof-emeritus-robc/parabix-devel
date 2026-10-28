@@ -54,7 +54,6 @@ static cl::opt<bool> Lookahead("lookahead", cl::desc("Use UTF Compiler lookahead
 static cl::opt<bool> NoS2P("NoS2P", cl::desc("Don't transpose - use byte data directly"), cl::cat(ucFlags));
 static cl::opt<bool> U21("u21", cl::desc("Use Unicode 21 bits"), cl::cat(ucFlags));
 
-std::vector<fs::path> allFiles;
 
 typedef uint64_t (*UCountFunctionType)(uint32_t fd);
 
@@ -117,8 +116,8 @@ UCountFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
 }
 
 // Counts a file, returning false (after reporting the error) if it cannot be read.
-bool ucount1(UCountFunctionType fn_ptr, const uint32_t fileIdx, uint64_t & count) {
-    const int fd = argv::openInputFile(allFiles[fileIdx]);
+bool ucount1(UCountFunctionType fn_ptr, const fs::path & path, uint64_t & count) {
+    const int fd = argv::openInputFile(path);
     if (LLVM_UNLIKELY(fd == -1)) {
         return false;
     }
@@ -129,12 +128,9 @@ bool ucount1(UCountFunctionType fn_ptr, const uint32_t fileIdx, uint64_t & count
 
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&ucFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    if (argv::RecursiveFlag || argv::DereferenceRecursiveFlag) {
-        argv::DirectoriesFlag = argv::Recurse;
-    }
     CPUDriver driver("wc");
 
-    allFiles = argv::getFullFileList(driver, inputFiles, true);
+    const argv::FileSelection allFiles(driver, inputFiles, true);
     const auto fileCount = allFiles.size();
 
     UCountFunctionType uCountFunctionPtr = nullptr;
@@ -155,7 +151,7 @@ int main(int argc, char *argv[]) {
     uint64_t totalCount = 0;
 
     for (unsigned i = 0; i < fileCount; ++i) {
-        counted[i] = ucount1(uCountFunctionPtr, i, theCounts[i]);
+        counted[i] = ucount1(uCountFunctionPtr, allFiles[i], theCounts[i]);
         totalCount += theCounts[i];
     }
     
@@ -169,11 +165,11 @@ int main(int argc, char *argv[]) {
             if (!counted[i]) continue;
             std::cout << std::setw(displayColumnWidth);
             std::cout << theCounts[i] << std::setw(displayColumnWidth);
-            // Standard input read by default is not named.
-            if (!inputFiles.empty()) std::cout << " " << allFiles[i].string();
+            const auto name = allFiles.displayName(i);
+            if (!name.empty()) std::cout << " " << name;
             std::cout << std::endl;
         }
-        if (fileCount > 1) {
+        if (allFiles.showTotal()) {
             std::cout << std::setw(displayColumnWidth-1);
             std::cout << totalCount;
             std::cout << " total" << std::endl;

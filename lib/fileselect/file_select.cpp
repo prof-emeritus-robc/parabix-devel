@@ -149,8 +149,6 @@ static re::RE * selectionPattern(const std::string & glob, bool directory, bool 
     return re::makeSeq({re::makeAlt({re::makeStart(), re::makeCC('/')}), globRE, re::makeEnd()});
 }
 
-bool UseStdIn;
-
 re::PatternVector getIncludeExcludePatterns(bool commandLine) {
     using Pattern = re::PatternKind;
     re::PatternVector signedPatterns;
@@ -392,14 +390,29 @@ int openInputFile(const fs::path & p) {
     return -1;
 }
 
-std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> & inputFiles, bool stdinAsPath) {
+FileSelection::FileSelection(CPUDriver & driver, const cl::list<std::string> & inputFiles, const bool stdinAsPath)
+: mStdinAsPath(stdinAsPath) {
+    // -r and -R imply -d recurse.
+    if (RecursiveFlag || DereferenceRecursiveFlag) {
+        DirectoriesFlag = Recurse;
+    }
+    mPaths = selectFiles(driver, inputFiles);
+}
+
+bool FileSelection::showFileNames() const {
+    const auto files = mPaths.size() + ((mStdIn && !mStdinAsPath) ? 1 : 0);
+    return (files > 1) || mRecursedIntoDirectory;
+}
+
+std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::list<std::string> & inputFiles) {
     auto file_select_start = std::chrono::high_resolution_clock::now();
     // The vector to accumulate the full list of collected files to be searched.
     std::vector<fs::path> collectedPaths;
 
-    if (stdinAsPath && inputFiles.empty()) {
-        argv::UseStdIn = true;
-        collectedPaths.emplace_back("-");
+    if (inputFiles.empty()) {
+        mStdIn = true;
+        mDefaultStdIn = true;
+        if (mStdinAsPath) collectedPaths.emplace_back("-");
         return collectedPaths;
     }
 
@@ -413,8 +426,8 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
     if ((DirectoriesFlag != Recurse) && (ExcludeFiles.empty()) && (IncludeFiles.empty()) && (ExcludeFromFlag.empty())) {
         for (const auto & f : inputFiles) {
             if (f == "-") {  // stdin, will always be searched.
-                argv::UseStdIn = true;
-                if (stdinAsPath) selectPath(collectedPaths, fs::path(f));
+                mStdIn = true;
+                if (mStdinAsPath) selectPath(collectedPaths, fs::path(f));
                 continue;
             }
             fs::path p(f);
@@ -443,8 +456,8 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
     // First level of processing:  command line files and directories.
     for (const auto & f : inputFiles) {
         if (f == "-") {  // stdin, will always be searched.
-            argv::UseStdIn = true;
-            if (stdinAsPath) selectPath(collectedPaths, fs::path(f));
+            mStdIn = true;
+            if (mStdinAsPath) selectPath(collectedPaths, fs::path(f));
             continue;
         }
         fs::path p(f);
@@ -499,6 +512,7 @@ std::vector<fs::path> getFullFileList(CPUDriver & driver, cl::list<std::string> 
         // Each of these candidates is a full path return from command line argument processing.
         directoryAccum.setFullPathEntries(commandLineDirCandidates);
         pathSelectEngine.doGrep(dirCandidates.data(), dirCandidates.size(), directoryAccum);
+        mRecursedIntoDirectory = !selectedDirectories.empty();
         pathSelectEngine.pop();
         pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), GitREcoalescing), true);
         // Select files from subdirectories using the recursive process.

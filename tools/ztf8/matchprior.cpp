@@ -36,7 +36,6 @@ static cl::opt<unsigned> priorDistance("distance", cl::desc("distance for prior 
 
 static int defaultDisplayColumnWidth = 10;  // default field width
 
-std::vector<fs::path> allFiles;
 
 using namespace kernel;
 
@@ -92,8 +91,8 @@ size_t file_size(const int fd) {
 }
 
 // Reports a file, returning false (after reporting the error) if it cannot be read.
-bool mp(MatchPriorFunctionType fn_ptr, const uint32_t fileIdx) {
-    const int fd = argv::openInputFile(allFiles[fileIdx]);
+bool mp(MatchPriorFunctionType fn_ptr, const fs::path & path, const std::string & name) {
+    const int fd = argv::openInputFile(path);
     if (LLVM_UNLIKELY(fd == -1)) {
         return false;
     }
@@ -101,8 +100,7 @@ bool mp(MatchPriorFunctionType fn_ptr, const uint32_t fileIdx) {
     std::cout << std::setw(defaultDisplayColumnWidth);
     std::cout << countResult << std::setw(defaultDisplayColumnWidth);
     std::cout << file_size(fd);
-    // Standard input read by default is not named.
-    if (!inputFiles.empty()) std::cout << " " << allFiles[fileIdx].string();
+    if (!name.empty()) std::cout << " " << name;
     std::cout << std::endl;
     close(fd);
     return true;
@@ -110,17 +108,14 @@ bool mp(MatchPriorFunctionType fn_ptr, const uint32_t fileIdx) {
 
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    if (argv::RecursiveFlag || argv::DereferenceRecursiveFlag) {
-        argv::DirectoriesFlag = argv::Recurse;
-    }
     CPUDriver driver("mp");
-    allFiles = argv::getFullFileList(driver, inputFiles, true);
+    const argv::FileSelection allFiles(driver, inputFiles, true);
     const auto fileCount = allFiles.size();
 
     auto matchPriorFunctionPtr = mpPipelineGen(driver);
     bool allRead = true;
     for (unsigned i = 0; i < fileCount; ++i) {
-        allRead &= mp(matchPriorFunctionPtr, i);
+        allRead &= mp(matchPriorFunctionPtr, allFiles[i], allFiles.displayName(i));
     }
     return allRead ? 0 : 1;
 }

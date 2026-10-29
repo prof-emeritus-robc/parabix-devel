@@ -332,6 +332,11 @@ struct TransformStep {
     UCD::UnicodeSet deferredTriggers;
     std::vector<UCD::UnicodeSet> deferredTails;
     UCD::UnicodeSet deferredReach;
+    // The prefix runs (see ComposeRevisits), in a group of their own, and their
+    // rules.  At each run P S^n of the characters of a prefix run (with all of
+    // them within the filters), the characters become A^n P.
+    std::vector<PrefixRun> prefixRuns;
+    std::vector<const ConversionRule *> prefixRunRules;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

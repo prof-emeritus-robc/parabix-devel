@@ -536,7 +536,8 @@ static std::string revisitRecordJSON(const ldml::RevisitRecord & r) {
     using Outcome = ldml::RevisitRecord::Outcome;
     std::string out = "{\"rule\":" + jsonString(ldml::printRule(r.rule));
     out += ",\"outcome\":";
-    out += r.outcome == Outcome::Suffix ? "\"suffix\"" : r.outcome == Outcome::Composed ? "\"composed\"" : "\"not composed\"";
+    out += r.outcome == Outcome::Suffix ? "\"suffix\"" : r.outcome == Outcome::Composed ? "\"composed\""
+           : r.outcome == Outcome::PrefixRun ? "\"prefix run\"" : "\"not composed\"";
     if (r.outcome == Outcome::NotComposed) out += ",\"reason\":" + jsonString(r.reason);
     out += ",\"composedRules\":" + std::to_string(r.composedRules);
     out += ",\"composed\":[";
@@ -693,6 +694,11 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
                          << step.transform.getText() << "\n";
+            continue;
+        }
+        if (!step.prefixRuns.empty()) {
+            llvm::outs() << "  prefix runs: " << step.prefixRuns.size() << " rules\n";
+            for (const ldml::ConversionRule * c : step.prefixRunRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
             continue;
         }
         llvm::outs() << "  conversion group: " << step.subgroups.size() << " subgroups, "
@@ -4370,6 +4376,92 @@ private:
     const bool mMasked;
 };
 
+//  The prefix runs of a group (see ldml::TransformStep::prefixRuns).  At each
+//  run P S^n (n >= 1) of the characters of prefix run r, within the mask, the
+//  characters become M^n P, with M the marker of r (PrefixRunMarker + r, then
+//  replaced by its string A): with PS the positions of P followed by S, the
+//  run is MatchStar(Advance(PS, 1), S) & S, its last position the one not
+//  followed by S; PS and the run but its last position become M, and the last
+//  position P, whose bits are carried along the run (by MatchStar again, for
+//  the prefix runs with the same S together).  Classes: the sets P of the
+//  prefix runs, then the distinct sets S (runSets gives that of each prefix run).
+static constexpr UCD::codepoint_t PrefixRunMarker = 0xD801;
+
+class PrefixRuns final : public pablo::PabloKernel {
+public:
+    PrefixRuns(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & runSets, unsigned numRunSets,
+               StreamSet * U21, StreamSet * Classes, StreamSet * Mask, StreamSet * Result)
+    : PabloKernel(ts, "PrefixRuns_" + std::to_string(numRunSets) + "_" + [&] {
+                      std::string s;
+                      for (unsigned r : runSets) s += std::to_string(r) + ".";
+                      return s;
+                  }() + (Mask ? "m" : ""),
+                  bindings(U21, Classes, Mask), {Binding{"Result", Result}})
+    , mRunSets(runSets), mNumRunSets(numRunSets), mMasked(Mask != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * const mask = mMasked ? getInputStreamSet("Mask")[0] : nullptr;
+        const size_t runs = mRunSets.size();
+        //  The positions followed by a character of each S (within the mask).
+        std::vector<PabloAST *> ahead(mNumRunSets);
+        for (unsigned s = 0; s < mNumRunSets; s++) {
+            ahead[s] = pb.createLookahead(classes[runs + s], 1);
+            if (mask) ahead[s] = pb.createAnd(ahead[s], pb.createLookahead(mask, 1));
+        }
+        std::vector<PabloAST *> starts(runs);
+        PabloAST * anyStart = pb.createZeroes();
+        for (size_t r = 0; r < runs; r++) {
+            PabloAST * const p = mask ? pb.createAnd(classes[r], mask) : classes[r];
+            starts[r] = pb.createAnd(p, ahead[mRunSets[r]]);
+            anyStart = pb.createOr(anyStart, starts[r]);
+        }
+        std::vector<Var *> result(basis.size());
+        for (size_t b = 0; b < basis.size(); b++) result[b] = pb.createVar("result" + std::to_string(b), basis[b]);
+        auto body = pb.createScope();
+        pb.createIf(anyStart, body);
+        PabloAST * changed = body.createZeroes();
+        std::vector<PabloAST *> bits(basis.size(), body.createZeroes());
+        for (unsigned s = 0; s < mNumRunSets; s++) {
+            PabloAST * const S = mask ? body.createAnd(classes[runs + s], mask) : classes[runs + s];
+            PabloAST * setStarts = body.createZeroes();
+            PabloAST * lasts = body.createZeroes();
+            for (size_t r = 0; r < runs; r++) {
+                if (mRunSets[r] != s) continue;
+                PabloAST * const run = body.createAnd(body.createMatchStar(body.createAdvance(starts[r], 1), S), S);
+                PabloAST * const marked = body.createOr(starts[r], body.createAnd(run, ahead[s]));
+                const UCD::codepoint_t marker = PrefixRunMarker + r;
+                for (size_t b = 0; b < basis.size(); b++) {
+                    if ((marker >> b) & 1) bits[b] = body.createOr(bits[b], marked);
+                }
+                setStarts = body.createOr(setStarts, starts[r]);
+                lasts = body.createOr(lasts, body.createAnd(run, body.createNot(ahead[s])));
+                changed = body.createOr(changed, body.createOr(starts[r], run));
+            }
+            //  The characters to revisit, carried to the last positions of the runs.
+            for (size_t b = 0; b < basis.size(); b++) {
+                PabloAST * const from = body.createAdvance(body.createAnd(setStarts, basis[b]), 1);
+                bits[b] = body.createOr(bits[b], body.createAnd(body.createMatchStar(from, S), lasts));
+            }
+        }
+        for (size_t b = 0; b < basis.size(); b++) {
+            body.createAssign(result[b], body.createOr(body.createAnd(basis[b], body.createNot(changed)), bits[b]));
+        }
+        writeOutputStreamSet("Result", std::vector<PabloAST *>(result.begin(), result.end()));
+    }
+private:
+    static Bindings bindings(StreamSet * U21, StreamSet * Classes, StreamSet * Mask) {
+        Bindings b{Binding{"U21", U21}, Binding{"Classes", Classes, FixedRate(1), LookAhead(1)}};
+        if (Mask) b.emplace_back("Mask", Mask, FixedRate(1), LookAhead(1));
+        return b;
+    }
+    const std::vector<unsigned> mRunSets;
+    const unsigned mNumRunSets;
+    const bool mMasked;
+};
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -4426,6 +4518,7 @@ private:
     StreamSet * conversionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * hexJava(StreamSet * U21);
@@ -4462,7 +4555,7 @@ private:
 
 //  The rules of a conversion group, of all kinds.
 static size_t groupRules(const ldml::TransformStep & step) {
-    size_t rules = step.rules.size() + step.insertions.size() + step.deferred.size();
+    size_t rules = step.rules.size() + step.insertions.size() + step.deferred.size() + step.prefixRuns.size();
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) rules += set.rules.size();
     return rules;
 }
@@ -6321,6 +6414,36 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
 }
 
 //  The deferred rules of a group (see ldml::DeferredRule and DeferredPlan).
+//  The prefix runs of a group: the PrefixRuns kernel leaves the markers of the
+//  prefix runs in the place of their strings A, which a conversion group of
+//  single-character rules (marker → A) then writes.
+StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    std::vector<UCD::UnicodeSet> sets;
+    std::vector<UCD::UnicodeSet> runSets;
+    std::vector<unsigned> runSetOf;
+    for (const ldml::PrefixRun & pr : step.prefixRuns) sets.push_back(pr.first);
+    for (const ldml::PrefixRun & pr : step.prefixRuns) {
+        auto f = std::find(runSets.begin(), runSets.end(), pr.run);
+        runSetOf.push_back(static_cast<unsigned>(f - runSets.begin()));
+        if (f == runSets.end()) runSets.push_back(pr.run);
+    }
+    sets.insert(sets.end(), runSets.begin(), runSets.end());
+    StreamSet * const Classes = classes(sets, U21);
+    StreamSet * const Marked = mP.CreateStreamSet(21);
+    mP.CreateKernelCall<PrefixRuns>(runSetOf, static_cast<unsigned>(runSets.size()), U21, Classes, activeMask(), Marked);
+    ldml::TransformStep markers;
+    markers.kind = ldml::TransformStep::Kind::Conversion;
+    ldml::CharMapSubgroup subgroup;
+    for (size_t r = 0; r < step.prefixRuns.size(); r++) {
+        const UCD::UnicodeSet marker(PrefixRunMarker + static_cast<UCD::codepoint_t>(r));
+        subgroup.mappings.push_back(ldml::CharMapping{marker, step.prefixRuns[r].replacement});
+        subgroup.all = subgroup.all + marker;
+        subgroup.rules++;
+    }
+    markers.subgroups.push_back(std::move(subgroup));
+    return conversionGroup(markers, Marked);
+}
+
 StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     DeferredConfig config;
@@ -6514,6 +6637,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (step.filter) popFilter();
         } else {
             const size_t kernels = mP.getNumOfKernelCalls();
+            if (!step.prefixRuns.empty()) U21 = prefixRunsGroup(step, U21);
             if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
                 U21 = conversionGroup(step, U21);
             }

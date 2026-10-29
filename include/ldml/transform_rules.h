@@ -796,6 +796,18 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  with no repetitions) apply together, or the revisits do not end within
 //  8 rule applications (as with ll → | l ;).
 //
+//  A prefix run: a rule whose text is a character of a set P and one of a set
+//  S, and whose text to revisit is its character of P,
+//      (P) S → A | $1 ;    or    p S → A | p ;
+//  (without contexts, A a fixed string; ICU also revisits A in the first form,
+//  which must then not match).  On P S^n, ICU applies it n times, leaving
+//  A^n P with P to revisit.  If the other rules of its group cannot see the
+//  difference (see prefixRunConflict in transform_rules_revisit.cpp), the
+//  prefix runs of a group are moved to a group of their own, before the rest
+//  of the group (separated by :: Null ;), where they are implemented together
+//  as one step (TransformStep::prefixRuns).  Otherwise they are composed as
+//  other rules are (which fails on their unbounded runs).
+//
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.
 //  With records, each rule with text to revisit is also described: how it was
@@ -811,7 +823,7 @@ struct RevisitTrigger {
 };
 struct RevisitRecord {
     const Rule * rule;
-    enum class Outcome {Suffix, Composed, NotComposed} outcome;
+    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun} outcome;
     std::string reason;             // if not composed
     unsigned composedRules = 0;
     std::vector<const Rule *> composed;     // the rules replacing it
@@ -824,10 +836,20 @@ struct RevisitStats {
     unsigned composed = 0;          // replaced by composed rules
     unsigned composedRules = 0;     // the composed rules replacing them
     std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
+    unsigned prefixRuns = 0;        // moved to a group of their own
     bool keepRecords = false;
     std::vector<RevisitRecord> records;
 };
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats = nullptr);
+
+//  The sets P and S and the string A of a prefix run (see ComposeRevisits).
+struct PrefixRun {
+    UCD::UnicodeSet first;          // P
+    UCD::UnicodeSet run;            // S
+    std::u32string replacement;     // A
+    bool revisitsReplacement = false;   // (P) S → A | $1 ;  (ICU revisits A $1)
+};
+bool prefixRun(const ConversionRule * rule, PrefixRun & run);
 
 //  Expansion of function calls on captures of single characters.
 //

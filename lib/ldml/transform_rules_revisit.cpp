@@ -9,9 +9,13 @@
 #include <ldml/transform_rules.h>
 #include <map>
 #include <set>
+#include <ldml/transform_plan.h>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
 #include "charset_analysis.h"
+#include <ucd/data/PropertyAliases.h>
+#include <ucd/data/PropertyObjects.h>
+#include <ucd/data/PropertyObjectTable.h>
 
 using namespace llvm;
 using namespace re;
@@ -774,6 +778,101 @@ bool hasRevisit(const ConversionRule * c) {
     return !empty || result->getCursorOffset() != 0;
 }
 
+//  Whether the prefix runs of a group (isRun) can be applied before the other
+//  rules of the group, as a group of their own: the empty string if so, or
+//  the reason why not.  On P S^n x, ICU applies the prefix run n times and
+//  then the rules of the group to P x, after A^n; applied first, the prefix
+//  runs leave A^n P x, to which the rest of the group is applied.  The rest of
+//  the group must therefore
+//    - not apply at P S before a prefix run would (no rule before a prefix run
+//      may match its P followed by S, in its text or after context), and not
+//      insert,
+//    - not match P after the first character of its text (ICU would not reach
+//      P),
+//    - not match A, which ICU has converted, unless ICU revisits A (as with
+//      (P) S → A | $1 ;) and the rule matches A alone,
+//    - not see P S^n replaced by A^n P in its after contexts: each set of
+//      the after contexts contains all of the characters of P, S and A, or
+//      none (and in the first case A has one character, so that the lengths
+//      are the same); unassigned code points are disregarded,
+//    - not revisit P followed by S, or at the end of the text to revisit (where
+//      S may follow), as the prefix runs no longer apply then.
+//  The before contexts see A^n P as ICU does.  Within the prefix runs, the
+//  sets P must be disjoint, and neither S nor A may contain characters of P.
+std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vector<bool> & isRun,
+                              const std::vector<PrefixRun> & runs) {
+    UCD::UnicodeSet first, run, replaced;
+    bool singleReplacement = true;
+    bool revisitsReplacement = true;
+    for (const PrefixRun & pr : runs) {
+        if (first.intersects(pr.first)) return "the sets of the characters to revisit of two prefix runs intersect";
+        first = first + pr.first;
+        run = run + pr.run;
+        for (char32_t c : pr.replacement) replaced.insert(c);
+        singleReplacement &= pr.replacement.size() == 1;
+        revisitsReplacement &= pr.revisitsReplacement;
+    }
+    if (first.intersects(run)) return "a character to revisit may be repeated";
+    if (replaced.intersects(first)) return "a replacement may begin a prefix run";
+    static const UCD::UnicodeSet unassigned = UCD::getPropertyObject(UCD::gc)->GetCodepointSet("Cn");
+    const UCD::UnicodeSet changed = (first + run + replaced) - unassigned;
+    //  The prefix runs after each rule.
+    std::vector<std::vector<const PrefixRun *>> later(rules.size() + 1);
+    size_t r = runs.size();
+    for (size_t k = rules.size(); k-- > 0; ) {
+        later[k] = later[k + 1];
+        if (isRun[k]) later[k].push_back(&runs[--r]);
+    }
+    for (size_t k = 0; k < rules.size(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(rules[k]);
+        if (c == nullptr || isRun[k]) continue;
+        const RuleSide * source = c->getSourceSide(Direction::Forward);
+        const std::vector<PatternItem> text = patternItems(source->getText());
+        if (text.empty()) return "an insertion rule may apply: " + printRule(c);
+        const bool single = text.size() == 1 && !text[0].repeated;
+        //  What may follow the first character of the text: the next item of the
+        //  text, or of the after context (nullptr: anything).
+        const UCD::UnicodeSet * next = nullptr;
+        std::vector<PatternItem> after;
+        if (!single) {
+            if (!text[0].repeated) next = &text[1].chars;
+        } else if (source->hasAfterContext()) {
+            after = patternItems(source->getAfterContext());
+            if (!after.empty() && !after[0].repeated) next = &after[0].chars;
+        }
+        for (const PrefixRun * pr : later[k]) {
+            if (text[0].chars.intersects(pr->first) && (next == nullptr || next->intersects(pr->run))) {
+                return "a rule before a prefix run may apply instead: " + printRule(c);
+            }
+        }
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (text[i].chars.intersects(replaced) && !(single && revisitsReplacement)) {
+                return "a rule may match a replacement: " + printRule(c);
+            }
+            if ((i > 0 || text[i].repeated) && text[i].chars.intersects(first)) {
+                return "a rule may match a character to revisit within its text: " + printRule(c);
+            }
+        }
+        if (source->hasAfterContext()) {
+            for (const PatternItem & item : patternItems(source->getAfterContext())) {
+                if (item.chars.intersects(changed) && !(changed.subset(item.chars) && singleReplacement)) {
+                    return "an after context may see the text of a prefix run: " + printRule(c);
+                }
+            }
+        }
+        if (RE * revisit = c->getResultSide(Direction::Forward)->getResultToRevisit()) {
+            const std::vector<PatternItem> items = patternItems(revisit);
+            for (size_t i = 0; i < items.size(); ++i) {
+                if (items[i].chars.intersects(first)
+                        && (items[i].repeated || i + 1 == items.size() || items[i + 1].chars.intersects(run))) {
+                    return "a rule revisits a character to revisit of a prefix run: " + printRule(c);
+                }
+            }
+        }
+    }
+    return "";
+}
+
 std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
     std::vector<Rule *> out;
     size_t start = 0;
@@ -808,6 +907,39 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 r = s;
             }
         }
+        //  Then the prefix runs, moved to a group of their own if the rest of the
+        //  group cannot see the difference.
+        std::vector<bool> isRun(rewritten.size(), false);
+        std::vector<PrefixRun> runs;
+        for (size_t k = 0; k < rewritten.size(); ++k) {
+            ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
+            PrefixRun pr;
+            if (c && !isRewritten[k] && hasRevisit(c) && prefixRun(c, pr)) {
+                isRun[k] = true;
+                runs.push_back(pr);
+            }
+        }
+        const std::string runConflict = runs.empty() ? "" : prefixRunConflict(rewritten, isRun, runs);
+        if (!runs.empty() && runConflict.empty()) {
+            std::vector<Rule *> rest;
+            std::vector<bool> restRewritten;
+            for (size_t k = 0; k < rewritten.size(); ++k) {
+                if (!isRun[k]) {
+                    rest.push_back(rewritten[k]);
+                    restRewritten.push_back(isRewritten[k]);
+                    continue;
+                }
+                out.push_back(rewritten[k]);
+                if (mStats) {
+                    mStats->prefixRuns++;
+                    if (mStats->keepRecords) mStats->records.push_back(RevisitRecord{rewritten[k], RevisitRecord::Outcome::PrefixRun});
+                }
+            }
+            out.push_back(makeTransformRule(TransformID("Null")));
+            rewritten = std::move(rest);
+            isRewritten = std::move(restRewritten);
+            isRun.assign(rewritten.size(), false);
+        }
         std::vector<GroupRule> group;
         for (size_t k = 0; k < rewritten.size(); ++k) {
             if (ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k])) {
@@ -833,9 +965,10 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 record.composed.assign(composed.begin(), composed.end());
                 out.insert(out.end(), composed.begin(), composed.end());
             } catch (const NotComposed & e) {
-                if (mStats) mStats->notComposed.emplace_back(c, e.reason);
+                const std::string reason = isRun[k] ? "a prefix run, but " + runConflict : e.reason;
+                if (mStats) mStats->notComposed.emplace_back(c, reason);
                 record.outcome = RevisitRecord::Outcome::NotComposed;
-                record.reason = e.reason;
+                record.reason = reason;
                 out.push_back(c);
             }
             if (mRecord) mStats->records.push_back(std::move(record));
@@ -846,6 +979,38 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
     return out;
 }
 
+}
+
+bool prefixRun(const ConversionRule * c, PrefixRun & pr) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    if (!result->hasCursor() || result->getCursorOffset() != 0 || result->getResultToRevisit() == nullptr) return false;
+    std::vector<RE *> text, revisit;
+    textAtoms(source->getText(), text);
+    textAtoms(result->getResultToRevisit(), revisit);
+    if (text.size() != 2 || revisit.size() != 1) return false;
+    CharSetAnalysis sets;
+    auto setOf = [&sets](RE * re, UCD::UnicodeSet & s) {
+        if (!CharSetAnalysis::isSet(re) || hasStrings(re) || hasBoundary(re)) return false;
+        s = sets.setOf(re, false);
+        return !s.empty();
+    };
+    const Capture * const capture = dyn_cast<Capture>(text[0]);
+    std::vector<RE *> captured;
+    if (capture) textAtoms(capture->getCapturedRE(), captured); else captured.push_back(text[0]);
+    if (captured.size() != 1 || !setOf(captured[0], pr.first) || !setOf(text[1], pr.run)) return false;
+    if (const Reference * ref = dyn_cast<Reference>(revisit[0])) {
+        if (capture == nullptr || ref->getName() != capture->getName()) return false;
+        pr.revisitsReplacement = true;
+    } else {
+        UCD::UnicodeSet s;
+        if (capture || !setOf(revisit[0], s) || s.count() != 1 || !(s == pr.first)) return false;
+        pr.revisitsReplacement = false;
+    }
+    pr.replacement.clear();
+    if (!resultString(result->getCompletedResult(), {}, pr.replacement)) return false;
+    return true;
 }
 
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats) {

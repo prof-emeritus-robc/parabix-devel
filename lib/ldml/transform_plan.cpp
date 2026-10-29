@@ -1222,6 +1222,21 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
             }
         }
     }
+    //  The prefix runs (see ComposeRevisits) of the groups of prefix runs alone.
+    std::set<const Rule *> prefixRuns;
+    for (size_t start = 0; start < rules.size(); ) {
+        size_t end = start;
+        bool allRuns = true;
+        while (end < rules.size() && !isa<TransformRule>(rules[end])) {
+            PrefixRun run;
+            if (const ConversionRule * c = dyn_cast<ConversionRule>(rules[end])) allRuns &= prefixRun(c, run);
+            ++end;
+        }
+        for (size_t k = start; k < end && allRuns; ++k) {
+            if (isa<ConversionRule>(rules[k])) prefixRuns.insert(rules[k]);
+        }
+        start = end + 1;
+    }
     size_t groupIndex = 0;
     for (Rule * r : rules) {
         if (FilterRule * f = dyn_cast<FilterRule>(r)) {
@@ -1240,6 +1255,18 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
             const RuleSide * source = c->getSourceSide(Direction::Forward);
             const RuleSide * result = c->getResultSide(Direction::Forward);
             re::RE * const text = source->getText();
+            //  A prefix run (see ComposeRevisits), in a group of prefix runs.
+            if (PrefixRun run; prefixRuns.count(c) && prefixRun(c, run)) {
+                if (group == nullptr) {
+                    TransformStep step;
+                    step.kind = TransformStep::Kind::Conversion;
+                    plan.steps.push_back(std::move(step));
+                    group = &plan.steps.back();
+                }
+                group->prefixRuns.push_back(run);
+                group->prefixRunRules.push_back(c);
+                continue;
+            }
             if (unsupportedLookahead(source->getAfterContext())) {
                 plan.problems.push_back(printRule(r) + "  (the after context repeats a set with strings or a sequence, "
                                         "which the regular expression engine does not support in lookaheads)");
@@ -1768,6 +1795,24 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
         for (const DeferredRule & d : step.deferred) {
             plan.problems.push_back(printRule(d.rule) + "  (a rule deferred after the BeforeCaptureCopy rules of its group, but "
                                     + reason + ")");
+        }
+    }
+    //  The prefix runs of a group are applied together, as a group of their own
+    //  (with no other rules), and the sets of their characters to revisit are
+    //  disjoint and do not intersect the sets of the characters repeated.
+    for (const TransformStep & step : plan.steps) {
+        if (step.prefixRuns.empty()) continue;
+        std::string reason;
+        UCD::UnicodeSet first, run;
+        for (const PrefixRun & pr : step.prefixRuns) {
+            if (first.intersects(pr.first)) reason = "the sets of the characters to revisit of two prefix runs intersect";
+            first = first + pr.first;
+            run = run + pr.run;
+        }
+        if (first.intersects(run)) reason = "a character to revisit may be repeated";
+        if (reason.empty()) continue;
+        for (const ConversionRule * c : step.prefixRunRules) {
+            plan.problems.push_back(printRule(c) + "  (a prefix run, but " + reason + ")");
         }
     }
     return plan;

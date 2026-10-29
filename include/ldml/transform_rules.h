@@ -798,11 +798,34 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.
+//  With records, each rule with text to revisit is also described: how it was
+//  handled, and the rules applying to its text to revisit (along any path of
+//  the composition, until it was abandoned).
+struct RevisitTrigger {
+    const Rule * rule;              // as in the group (rewritten if a suffix revisit)
+    unsigned depth;                 // its first application along a path (1: on the text to revisit)
+    bool conditional = false;       // on characters beyond the text or contexts not implied
+    bool extends = false;           // matched characters beyond the text to revisit
+    bool revisits = false;          // its own result has text to revisit (originally)
+    bool blocking = false;          // the rule composition was abandoned on
+};
+struct RevisitRecord {
+    const Rule * rule;
+    enum class Outcome {Suffix, Composed, NotComposed} outcome;
+    std::string reason;             // if not composed
+    unsigned composedRules = 0;
+    std::vector<const Rule *> composed;     // the rules replacing it
+    unsigned paths = 0;             // complete paths (before deduplication)
+    unsigned maxApplications = 0;   // on a complete path
+    std::vector<RevisitTrigger> triggered;
+};
 struct RevisitStats {
     unsigned candidates = 0;        // rules with text to revisit
     unsigned composed = 0;          // replaced by composed rules
     unsigned composedRules = 0;     // the composed rules replacing them
     std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
+    bool keepRecords = false;
+    std::vector<RevisitRecord> records;
 };
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats = nullptr);
 

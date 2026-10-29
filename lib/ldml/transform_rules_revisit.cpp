@@ -272,6 +272,7 @@ bool ruleResult(const RuleSide * result, const std::map<std::string, std::u32str
 //  A rule of the group, as applied to the text to revisit.
 struct GroupRule {
     ConversionRule * rule;
+    bool revisits = false;      // its result has text to revisit (before any rewriting)
     //  The sets of the items of the text, or of its first items if the text
     //  is not a fixed-length sequence of characters (then !fixed).
     std::vector<UCD::UnicodeSet> text;
@@ -300,6 +301,26 @@ struct Path {
     std::vector<const Rule *> applied;          // the rules applied
 };
 
+//  Record a rule applying to the text to revisit (see RevisitRecord).
+void noteTrigger(RevisitRecord * record, const GroupRule & g, unsigned depth, bool conditional, bool extends, bool blocking) {
+    if (record == nullptr) return;
+    for (RevisitTrigger & t : record->triggered) {
+        if (t.rule == g.rule) {
+            t.depth = std::min(t.depth, depth);
+            t.conditional |= conditional;
+            t.extends |= extends;
+            t.blocking |= blocking;
+            return;
+        }
+    }
+    RevisitTrigger t{g.rule, depth};
+    t.conditional = conditional;
+    t.extends = extends;
+    t.revisits = g.revisits;
+    t.blocking = blocking;
+    record->triggered.push_back(t);
+}
+
 class Composer {
 public:
     Composer(RevisitStats * stats) : mStats(stats) {}
@@ -317,6 +338,7 @@ private:
     Rule * suffixRevisit(ConversionRule * r);
     CharSetAnalysis mSets;
     RevisitStats * mStats;
+    RevisitRecord * mRecord = nullptr;
     const std::vector<GroupRule> * mGroup = nullptr;
     std::set<std::string> mEmitted;
 };
@@ -439,10 +461,12 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
         }
         if (!possible) continue;
         if (!g.fixed) {
+            noteTrigger(mRecord, g, p.applied.size() + 1, true, q.beyond.size() > p.beyond.size(), true);
             throw NotComposed{"a rule whose text is not a fixed-length sequence of characters may apply "
                               "to the text to revisit: " + printRule(g.rule)};
         }
         if (q.beyond.size() > MaxExtension) {
+            noteTrigger(mRecord, g, p.applied.size() + 1, true, true, true);
             std::string rules;
             for (const Rule * r : p.applied) rules += printRule(r) + " then ";
             throw NotComposed{"the text to revisit is extended by more than " + std::to_string(MaxExtension) + " characters: "
@@ -478,6 +502,7 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
         bool afterImplied = alwaysMatches(after);
         for (const auto & a : p.after) afterImplied |= a.first == q.beyond.size() && implies(a.second, after, true);
         const bool unconditional = q.beyond.size() == p.beyond.size() && beforeImplied && afterImplied;
+        noteTrigger(mRecord, g, p.applied.size() + 1, !unconditional, q.beyond.size() > p.beyond.size(), false);
         q.after.emplace_back(q.beyond.size(), std::move(after));
         //  The characters beyond referenced by the result are enumerated.
         std::set<std::string> names;
@@ -552,6 +577,10 @@ void Composer::apply(const GroupRule & g, Path q, const std::vector<MatchedChar>
 
 //  The composed rule of a complete path.
 void Composer::finish(Path p, RE * text, std::vector<Rule *> & composed) {
+    if (mRecord) {
+        mRecord->paths++;
+        mRecord->maxApplications = std::max<unsigned>(mRecord->maxApplications, p.applied.size());
+    }
     Context after;
     for (auto & a : p.after) {
         for (size_t k = a.first; k < p.beyond.size(); ++k) {
@@ -769,14 +798,22 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 if (mStats) {
                     mStats->composed++;
                     mStats->composedRules++;
+                    if (mStats->keepRecords) {
+                        mStats->records.push_back(RevisitRecord{c, RevisitRecord::Outcome::Suffix});
+                        mStats->records.back().composedRules = 1;
+                        mStats->records.back().composed.push_back(s);
+                    }
                 }
                 isRewritten[&r - rewritten.data()] = true;
                 r = s;
             }
         }
         std::vector<GroupRule> group;
-        for (Rule * r : rewritten) {
-            if (ConversionRule * c = dyn_cast<ConversionRule>(r)) group.push_back(groupRule(c));
+        for (size_t k = 0; k < rewritten.size(); ++k) {
+            if (ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k])) {
+                group.push_back(groupRule(c));
+                group.back().revisits = isRewritten[k] || hasRevisit(c);
+            }
         }
         for (size_t k = 0; k < rewritten.size(); ++k) {
             ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
@@ -784,17 +821,25 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 out.push_back(rewritten[k]);
                 continue;
             }
+            RevisitRecord record{c, RevisitRecord::Outcome::Composed};
+            mRecord = mStats && mStats->keepRecords ? &record : nullptr;
             try {
                 std::vector<Rule *> composed = composeRule(c, group);
                 if (mStats) {
                     mStats->composed++;
                     mStats->composedRules += composed.size();
                 }
+                record.composedRules = composed.size();
+                record.composed.assign(composed.begin(), composed.end());
                 out.insert(out.end(), composed.begin(), composed.end());
             } catch (const NotComposed & e) {
                 if (mStats) mStats->notComposed.emplace_back(c, e.reason);
+                record.outcome = RevisitRecord::Outcome::NotComposed;
+                record.reason = e.reason;
                 out.push_back(c);
             }
+            if (mRecord) mStats->records.push_back(std::move(record));
+            mRecord = nullptr;
         }
         start = end;
     }

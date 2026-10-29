@@ -120,6 +120,8 @@ static cl::opt<unsigned> DeferredRounds("deferred-rule-rounds",
     cl::desc("Rounds of applying the rules deferred after the BeforeCaptureCopy rules of a group, to the converted text "
              "(exact for chains of up to this many triggers whose before contexts reach back to each other)"),
     cl::init(8), cl::cat(TconvOptions));
+static cl::opt<bool> RevisitReport("revisit-report", cl::desc("Report each rule with text to revisit, how it is composed and the rules "
+                                   "applying to its text to revisit (one JSON object per line), and exit"), cl::cat(TconvOptions));
 static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would be implemented and exit"),
                               cl::init(false), cl::cat(TconvOptions));
 //  The classes of the bits of multiplexed mapping numbers (see FusedSubgroupPlan)
@@ -335,6 +337,7 @@ struct TransformAnalysis {
     bool implementable = false;
     ldml::TransformPlan plan;
     std::vector<std::string> problems;
+    std::vector<std::string> revisitReport;     // with --revisit-report
 };
 
 class TransformAnalyzer {
@@ -512,6 +515,48 @@ bool TransformAnalyzer::evaluateFunction(const ldml::TransformID & transform, co
     return true;
 }
 
+static std::string jsonString(const std::string & s) {
+    std::string out = "\"";
+    for (const char c : s) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (static_cast<unsigned char>(c) < 0x20) {
+            char buf[8];
+            snprintf(buf, sizeof(buf), "\\u%04x", c);
+            out += buf;
+        } else {
+            out += c;
+        }
+    }
+    return out + "\"";
+}
+
+static std::string revisitRecordJSON(const ldml::RevisitRecord & r) {
+    using Outcome = ldml::RevisitRecord::Outcome;
+    std::string out = "{\"rule\":" + jsonString(ldml::printRule(r.rule));
+    out += ",\"outcome\":";
+    out += r.outcome == Outcome::Suffix ? "\"suffix\"" : r.outcome == Outcome::Composed ? "\"composed\"" : "\"not composed\"";
+    if (r.outcome == Outcome::NotComposed) out += ",\"reason\":" + jsonString(r.reason);
+    out += ",\"composedRules\":" + std::to_string(r.composedRules);
+    out += ",\"composed\":[";
+    for (size_t k = 0; k < r.composed.size(); ++k) out += (k ? "," : "") + jsonString(ldml::printRule(r.composed[k]));
+    out += "]";
+    out += ",\"paths\":" + std::to_string(r.paths);
+    out += ",\"maxApplications\":" + std::to_string(r.maxApplications);
+    out += ",\"triggered\":[";
+    for (size_t k = 0; k < r.triggered.size(); ++k) {
+        const ldml::RevisitTrigger & t = r.triggered[k];
+        if (k) out += ",";
+        out += "{\"rule\":" + jsonString(ldml::printRule(t.rule)) + ",\"depth\":" + std::to_string(t.depth);
+        out += std::string(",\"conditional\":") + (t.conditional ? "true" : "false");
+        out += std::string(",\"extends\":") + (t.extends ? "true" : "false");
+        out += std::string(",\"revisits\":") + (t.revisits ? "true" : "false");
+        out += std::string(",\"blocking\":") + (t.blocking ? "true" : "false") + "}";
+    }
+    return out + "]}";
+}
+
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 
@@ -529,7 +574,9 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
             return evaluateFunction(t, chars, groups, unchanged, reason);
         }, &cstats);
         ldml::RevisitStats rstats;
+        rstats.keepRecords = RevisitReport;
         rules = ldml::ComposeRevisits(rules, &rstats);
+        for (const ldml::RevisitRecord & r : rstats.records) a.revisitReport.push_back(revisitRecordJSON(r));
         //  Capture simplification.  (Rules whose text is only a capture, or
         //  continues after it, are kept as MultipleCaptureMultipleReplacement
         //  rules, rather than insertion rules or rules with the capture as a
@@ -6670,7 +6717,7 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (TransformName.empty() || (InputFile.empty() && !ShowPlan && !KernelCounts)) {
+    if (TransformName.empty() || (InputFile.empty() && !ShowPlan && !KernelCounts && !RevisitReport)) {
         llvm::errs() << "Usage: " << argv[0] << " [options] <transform name> <input file>\n"
                      << "       " << argv[0] << " [options] --rules-file=<rules file> <input file>\n"
                      << "       " << argv[0] << " [options] --list-transforms\n";
@@ -6683,6 +6730,15 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     if (KernelCounts) return printKernelCounts(registry, entry);
+    if (RevisitReport) {
+        TransformAnalyzer analyzer(registry);
+        const TransformAnalysis & a = analyzer.analyze(entry);
+        for (const std::string & p : a.problems) {
+            if (p.compare(0, 18, "rules not loaded: ") == 0) llvm::errs() << entry->canonicalName << ": " << p << "\n";
+        }
+        for (const std::string & line : a.revisitReport) llvm::outs() << line << "\n";
+        return 0;
+    }
     if (ShowPlan) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);

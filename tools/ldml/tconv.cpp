@@ -4376,34 +4376,61 @@ private:
     const bool mMasked;
 };
 
-//  The prefix runs of a group (see ldml::TransformStep::prefixRuns).  At each
-//  run P S^n (n >= 1) of the characters of prefix run r, within the mask, the
-//  characters become A^n P: with PS the positions of P followed by S, the run
-//  is MatchStar(Advance(PS, 1), S) & S, its last position the one not followed
-//  by S.  The last position gets the character of P, whose bits are carried
-//  along the run (by MatchStar again, for the prefix runs with the same S
-//  together); PS and the run but its last position (the A positions) get 0,
-//  for A to be written there (see PrefixRunFill), after the insertion of
-//  |A| - 1 positions after each (Counts), or are deleted where A is empty
-//  (Delete).  Select marks the A positions (stream 0) and gives the index of
-//  their A among the distinct strings A (streams 1 to selectBits, multiplexed).
-//  Classes: the sets P of the prefix runs, then the distinct sets S (runSets
-//  gives that of each prefix run); replacements: the index of the A of each.
+//  The prefix runs of a group (see ldml::TransformStep::prefixRuns), by family
+//  (the prefix runs with the same set P; see ldml::prefixRunFamilies), the
+//  families with the same texts S (in the same order) sharing a run class.  At
+//  each run P S^n (n >= 1, each S one of the texts of the family, of length m),
+//  within the mask, the characters become A^n P.  With Full the positions
+//  followed by a text S of the class (Full_t by text t: the lookaheads of its
+//  sets, ANDed), the run of a family is MatchStar(Advance(P & Full, 1), Fill)
+//  & Fill, Fill the positions within the matches of the texts (Full advanced 1
+//  to m).  As the matches of the texts of a family do not overlap, a run is a
+//  sequence of matches, each beginning after the one before, which end at the
+//  positions of the run in Advance(Full, m).  The positions of P and those
+//  ends that are followed by another match (the anchors) get the A of the
+//  match that follows (by Full_t); the last end gets the character of P, whose
+//  bits are carried along the run (by MatchStar again, for the families of a
+//  run class together); the other positions of the run (if m > 1) are deleted.
+//  The anchors get 0, for A to be written there (see PrefixRunFill), after the
+//  insertion of |A| - 1 positions after each (Counts), or are deleted where A
+//  is empty (Delete).  Select marks the anchors (stream 0) and gives the index
+//  of their A among the distinct strings A (streams 1 to selectBits,
+//  multiplexed).  Classes: the sets P of the families, then the sets of the
+//  texts S.
+struct PrefixRunClass {
+    std::vector<std::vector<unsigned>> texts;   // the sets of each text S (indices among the sets of S)
+};
+struct PrefixRunFamily {
+    unsigned runClass;
+    std::vector<unsigned> replacements;         // the A of each text of the run class
+};
+
 class PrefixRuns final : public pablo::PabloKernel {
 public:
-    PrefixRuns(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & runSets, unsigned numRunSets,
-               const std::vector<unsigned> & replacements, const std::vector<unsigned> & lengths,
+    PrefixRuns(LLVMTypeSystemInterface & ts, const std::vector<PrefixRunClass> & runClasses,
+               const std::vector<PrefixRunFamily> & families, const std::vector<unsigned> & lengths,
                StreamSet * U21, StreamSet * Classes, StreamSet * Mask,
                StreamSet * Result, StreamSet * Select, StreamSet * Counts, StreamSet * Delete)
     : PabloKernel(ts, "PrefixRuns" + [&] {
-                      std::string sig = "_" + std::to_string(numRunSets) + (Mask ? "m" : "");
-                      for (size_t r = 0; r < runSets.size(); r++) sig += "_" + std::to_string(runSets[r]) + "." + std::to_string(replacements[r]);
+                      std::string sig = Mask ? "_m" : "_";
+                      for (const PrefixRunClass & c : runClasses) {
+                          sig += "_c";
+                          for (const std::vector<unsigned> & t : c.texts) {
+                              sig += "t";
+                              for (unsigned s : t) sig += std::to_string(s) + ".";
+                          }
+                      }
+                      for (const PrefixRunFamily & f : families) {
+                          sig += "_f" + std::to_string(f.runClass);
+                          for (unsigned a : f.replacements) sig += "." + std::to_string(a);
+                      }
                       for (unsigned n : lengths) sig += "_l" + std::to_string(n);
+                      sig += Delete ? "d" : "";
                       //  A long signature is hashed (the kernel name is a file name in the object cache).
                       return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
                   }(),
-                  inputBindings(U21, Classes, Mask), outputBindings(Result, Select, Counts, Delete))
-    , mRunSets(runSets), mNumRunSets(numRunSets), mReplacements(replacements), mLengths(lengths)
+                  inputBindings(U21, Classes, Mask, maxTextLength(runClasses)), outputBindings(Result, Select, Counts, Delete))
+    , mRunClasses(runClasses), mFamilies(families), mLengths(lengths)
     , mMasked(Mask != nullptr), mSelectBits(Select->getNumElements() - 1)
     , mCountBits(Counts ? Counts->getNumElements() : 0), mDelete(Delete != nullptr) {}
 protected:
@@ -4412,19 +4439,45 @@ protected:
         const std::vector<PabloAST *> basis = getInputStreamSet("U21");
         const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
         PabloAST * const mask = mMasked ? getInputStreamSet("Mask")[0] : nullptr;
-        const size_t runs = mRunSets.size();
-        //  The positions followed by a character of each S (within the mask).
-        std::vector<PabloAST *> ahead(mNumRunSets);
-        for (unsigned s = 0; s < mNumRunSets; s++) {
-            ahead[s] = pb.createLookahead(classes[runs + s], 1);
-            if (mask) ahead[s] = pb.createAnd(ahead[s], pb.createLookahead(mask, 1));
+        const size_t numFamilies = mFamilies.size();
+        //  The positions followed, j positions on, by a character of a set of S
+        //  (within the mask).
+        std::map<std::pair<unsigned, unsigned>, PabloAST *> aheadOf;
+        auto ahead = [&](unsigned s, unsigned j) {
+            PabloAST *& a = aheadOf[{s, j}];
+            if (a == nullptr) {
+                a = pb.createLookahead(classes[numFamilies + s], j);
+                if (mask) a = pb.createAnd(a, pb.createLookahead(mask, j));
+            }
+            return a;
+        };
+        //  The positions followed by each text of each run class, and by any.
+        std::vector<std::vector<PabloAST *>> full(mRunClasses.size());
+        std::vector<PabloAST *> fullAny(mRunClasses.size());
+        for (size_t c = 0; c < mRunClasses.size(); c++) {
+            fullAny[c] = pb.createZeroes();
+            for (const std::vector<unsigned> & text : mRunClasses[c].texts) {
+                PabloAST * f = ahead(text[0], 1);
+                for (unsigned j = 1; j < text.size(); j++) f = pb.createAnd(f, ahead(text[j], j + 1));
+                full[c].push_back(f);
+                fullAny[c] = pb.createOr(fullAny[c], f);
+            }
         }
-        std::vector<PabloAST *> starts(runs);
+        //  The positions within the matches, and their ends (outside the If, so
+        //  that the advances carry across blocks however the If goes).
+        std::vector<PabloAST *> fill(mRunClasses.size()), ends(mRunClasses.size());
+        for (size_t c = 0; c < mRunClasses.size(); c++) {
+            const unsigned m = static_cast<unsigned>(mRunClasses[c].texts.front().size());
+            fill[c] = pb.createZeroes();
+            for (unsigned k = 1; k <= m; k++) fill[c] = pb.createOr(fill[c], pb.createAdvance(fullAny[c], k));
+            ends[c] = m == 1 ? fill[c] : pb.createAdvance(fullAny[c], m);
+        }
+        std::vector<PabloAST *> starts(numFamilies);
         PabloAST * anyStart = pb.createZeroes();
-        for (size_t r = 0; r < runs; r++) {
-            PabloAST * const p = mask ? pb.createAnd(classes[r], mask) : classes[r];
-            starts[r] = pb.createAnd(p, ahead[mRunSets[r]]);
-            anyStart = pb.createOr(anyStart, starts[r]);
+        for (size_t f = 0; f < numFamilies; f++) {
+            PabloAST * const p = mask ? pb.createAnd(classes[f], mask) : classes[f];
+            starts[f] = pb.createAnd(p, fullAny[mFamilies[f].runClass]);
+            anyStart = pb.createOr(anyStart, starts[f]);
         }
         auto vars = [&](const std::string & name, unsigned n, const std::vector<PabloAST *> * init) {
             std::vector<Var *> v(n);
@@ -4442,39 +4495,44 @@ protected:
         std::vector<PabloAST *> sel(mSelectBits + 1, body.createZeroes());
         std::vector<PabloAST *> cnt(mCountBits, body.createZeroes());
         PabloAST * del = body.createZeroes();
-        for (unsigned s = 0; s < mNumRunSets; s++) {
-            PabloAST * const S = mask ? body.createAnd(classes[runs + s], mask) : classes[runs + s];
-            PabloAST * setStarts = body.createZeroes();
+        for (size_t c = 0; c < mRunClasses.size(); c++) {
+            const unsigned m = static_cast<unsigned>(mRunClasses[c].texts.front().size());
+            PabloAST * classStarts = body.createZeroes();
             PabloAST * lasts = body.createZeroes();
-            for (size_t r = 0; r < runs; r++) {
-                if (mRunSets[r] != s) continue;
-                PabloAST * const run = body.createAnd(body.createMatchStar(body.createAdvance(starts[r], 1), S), S);
-                PabloAST * const at = body.createOr(starts[r], body.createAnd(run, ahead[s]));
-                const unsigned a = mReplacements[r];
-                const unsigned length = mLengths[a];
-                sel[0] = body.createOr(sel[0], at);
-                for (unsigned j = 0; j < mSelectBits; j++) {
-                    if ((a >> j) & 1) sel[j + 1] = body.createOr(sel[j + 1], at);
+            for (size_t f = 0; f < numFamilies; f++) {
+                if (mFamilies[f].runClass != c) continue;
+                PabloAST * const run = body.createAnd(body.createMatchStar(body.createAdvance(starts[f], 1), fill[c]), fill[c]);
+                PabloAST * const runEnds = m == 1 ? run : body.createAnd(run, ends[c]);
+                PabloAST * const anchors = body.createOr(starts[f], body.createAnd(runEnds, fullAny[c]));
+                for (size_t t = 0; t < full[c].size(); t++) {
+                    PabloAST * const at = body.createAnd(anchors, full[c][t]);
+                    const unsigned a = mFamilies[f].replacements[t];
+                    const unsigned length = mLengths[a];
+                    sel[0] = body.createOr(sel[0], at);
+                    for (unsigned j = 0; j < mSelectBits; j++) {
+                        if ((a >> j) & 1) sel[j + 1] = body.createOr(sel[j + 1], at);
+                    }
+                    if (length == 0) del = body.createOr(del, at);
+                    for (unsigned b = 0; b < mCountBits && length > 1; b++) {
+                        if (((length - 1) >> b) & 1) cnt[b] = body.createOr(cnt[b], at);
+                    }
                 }
-                if (length == 0) del = body.createOr(del, at);
-                for (unsigned c = 0; c < mCountBits && length > 1; c++) {
-                    if (((length - 1) >> c) & 1) cnt[c] = body.createOr(cnt[c], at);
-                }
-                setStarts = body.createOr(setStarts, starts[r]);
-                lasts = body.createOr(lasts, body.createAnd(run, body.createNot(ahead[s])));
-                changed = body.createOr(changed, body.createOr(starts[r], run));
+                if (m > 1) del = body.createOr(del, body.createAnd(run, body.createNot(ends[c])));
+                classStarts = body.createOr(classStarts, starts[f]);
+                lasts = body.createOr(lasts, body.createAnd(runEnds, body.createNot(fullAny[c])));
+                changed = body.createOr(changed, body.createOr(starts[f], run));
             }
             //  The characters to revisit, carried to the last positions of the runs.
             for (size_t b = 0; b < basis.size(); b++) {
-                PabloAST * const from = body.createAdvance(body.createAnd(setStarts, basis[b]), 1);
-                bits[b] = body.createOr(bits[b], body.createAnd(body.createMatchStar(from, S), lasts));
+                PabloAST * const from = body.createAdvance(body.createAnd(classStarts, basis[b]), 1);
+                bits[b] = body.createOr(bits[b], body.createAnd(body.createMatchStar(from, fill[c]), lasts));
             }
         }
         for (size_t b = 0; b < basis.size(); b++) {
             body.createAssign(result[b], body.createOr(body.createAnd(basis[b], body.createNot(changed)), bits[b]));
         }
         for (unsigned k = 0; k <= mSelectBits; k++) body.createAssign(select[k], sel[k]);
-        for (unsigned c = 0; c < mCountBits; c++) body.createAssign(counts[c], cnt[c]);
+        for (unsigned b = 0; b < mCountBits; b++) body.createAssign(counts[b], cnt[b]);
         if (mDelete) body.createAssign(deleted[0], del);
         writeOutputStreamSet("Result", std::vector<PabloAST *>(result.begin(), result.end()));
         writeOutputStreamSet("Select", std::vector<PabloAST *>(select.begin(), select.end()));
@@ -4482,9 +4540,14 @@ protected:
         if (mDelete) writeOutputStreamSet("Delete", std::vector<PabloAST *>(deleted.begin(), deleted.end()));
     }
 private:
-    static Bindings inputBindings(StreamSet * U21, StreamSet * Classes, StreamSet * Mask) {
-        Bindings b{Binding{"U21", U21}, Binding{"Classes", Classes, FixedRate(1), LookAhead(1)}};
-        if (Mask) b.emplace_back("Mask", Mask, FixedRate(1), LookAhead(1));
+    static unsigned maxTextLength(const std::vector<PrefixRunClass> & runClasses) {
+        unsigned m = 1;
+        for (const PrefixRunClass & c : runClasses) m = std::max(m, static_cast<unsigned>(c.texts.front().size()));
+        return m;
+    }
+    static Bindings inputBindings(StreamSet * U21, StreamSet * Classes, StreamSet * Mask, unsigned lookahead) {
+        Bindings b{Binding{"U21", U21}, Binding{"Classes", Classes, FixedRate(1), LookAhead(lookahead)}};
+        if (Mask) b.emplace_back("Mask", Mask, FixedRate(1), LookAhead(lookahead));
         return b;
     }
     static Bindings outputBindings(StreamSet * Result, StreamSet * Select, StreamSet * Counts, StreamSet * Delete) {
@@ -4493,9 +4556,8 @@ private:
         if (Delete) b.emplace_back("Delete", Delete);
         return b;
     }
-    const std::vector<unsigned> mRunSets;
-    const unsigned mNumRunSets;
-    const std::vector<unsigned> mReplacements;
+    const std::vector<PrefixRunClass> mRunClasses;
+    const std::vector<PrefixRunFamily> mFamilies;
     const std::vector<unsigned> mLengths;
     const bool mMasked;
     const unsigned mSelectBits;
@@ -6507,24 +6569,58 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
 //  The prefix runs of a group: the PrefixRuns kernel moves the characters of
 //  P to the ends of their runs and marks the positions of the strings A; the
 //  positions for the further characters of A are inserted after them, A is
-//  written (PrefixRunFill), and the positions of empty strings A are deleted.
+//  written (PrefixRunFill), and the positions of empty strings A, and those
+//  within texts S of more than one character, are deleted.
 StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    std::vector<UCD::UnicodeSet> sets;
-    std::vector<UCD::UnicodeSet> runSets;
-    std::vector<unsigned> runSetOf;
+    //  The families (by P), each with its texts and the index of their A.
+    std::vector<UCD::UnicodeSet> firsts;
+    std::vector<std::vector<std::vector<UCD::UnicodeSet>>> familyTexts;
+    std::vector<std::vector<unsigned>> familyReplacements;
     std::vector<std::u32string> replacements;
-    std::vector<unsigned> replacementOf;
     for (const ldml::PrefixRun & pr : step.prefixRuns) {
-        sets.push_back(pr.first);
-        auto f = std::find(runSets.begin(), runSets.end(), pr.run);
-        runSetOf.push_back(static_cast<unsigned>(f - runSets.begin()));
-        if (f == runSets.end()) runSets.push_back(pr.run);
+        auto f = std::find(firsts.begin(), firsts.end(), pr.first);
+        if (f == firsts.end()) {
+            firsts.push_back(pr.first);
+            familyTexts.emplace_back();
+            familyReplacements.emplace_back();
+            f = firsts.end() - 1;
+        }
         auto g = std::find(replacements.begin(), replacements.end(), pr.replacement);
-        replacementOf.push_back(static_cast<unsigned>(g - replacements.begin()));
-        if (g == replacements.end()) replacements.push_back(pr.replacement);
+        if (g == replacements.end()) {
+            replacements.push_back(pr.replacement);
+            g = replacements.end() - 1;
+        }
+        familyTexts[f - firsts.begin()].push_back(pr.run);
+        familyReplacements[f - firsts.begin()].push_back(static_cast<unsigned>(g - replacements.begin()));
     }
+    //  The run classes (the families with the same texts) and the sets of S.
+    std::vector<UCD::UnicodeSet> runSets;
+    std::vector<std::vector<std::vector<UCD::UnicodeSet>>> classTexts;
+    std::vector<PrefixRunClass> runClasses;
+    std::vector<PrefixRunFamily> families;
+    for (size_t f = 0; f < firsts.size(); f++) {
+        auto c = std::find(classTexts.begin(), classTexts.end(), familyTexts[f]);
+        if (c == classTexts.end()) {
+            classTexts.push_back(familyTexts[f]);
+            PrefixRunClass k;
+            for (const std::vector<UCD::UnicodeSet> & text : familyTexts[f]) {
+                k.texts.emplace_back();
+                for (const UCD::UnicodeSet & s : text) {
+                    auto r = std::find(runSets.begin(), runSets.end(), s);
+                    k.texts.back().push_back(static_cast<unsigned>(r - runSets.begin()));
+                    if (r == runSets.end()) runSets.push_back(s);
+                }
+            }
+            runClasses.push_back(std::move(k));
+            c = classTexts.end() - 1;
+        }
+        families.push_back(PrefixRunFamily{static_cast<unsigned>(c - classTexts.begin()), familyReplacements[f]});
+    }
+    std::vector<UCD::UnicodeSet> sets = firsts;
     sets.insert(sets.end(), runSets.begin(), runSets.end());
+    bool interior = false;
+    for (const PrefixRunClass & k : runClasses) interior |= k.texts.front().size() > 1;
     std::vector<unsigned> lengths;
     unsigned maxLength = 0;
     bool anyEmpty = false;
@@ -6544,9 +6640,8 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
     StreamSet * Result = P.CreateStreamSet(21);
     StreamSet * Select = P.CreateStreamSet(selectBits + 1);
     StreamSet * const Counts = countBits ? P.CreateStreamSet(countBits) : nullptr;
-    StreamSet * Delete = anyEmpty ? P.CreateStreamSet(1) : nullptr;
-    P.CreateKernelCall<PrefixRuns>(runSetOf, static_cast<unsigned>(runSets.size()), replacementOf, lengths,
-                                   U21, Classes, activeMask(), Result, Select, Counts, Delete);
+    StreamSet * Delete = anyEmpty || interior ? P.CreateStreamSet(1) : nullptr;
+    P.CreateKernelCall<PrefixRuns>(runClasses, families, lengths, U21, Classes, activeMask(), Result, Select, Counts, Delete);
     if (Counts) {
         StreamSet * const SpreadMask = P.CreateStreamSet(1);
         InsertionSpreadMask(P, Counts, SpreadMask, kernel::InsertPosition::After);

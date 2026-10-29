@@ -1798,18 +1798,10 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
         }
     }
     //  The prefix runs of a group are applied together, as a group of their own
-    //  (with no other rules), and the sets of their characters to revisit are
-    //  disjoint and do not intersect the sets of the characters repeated.
+    //  (with no other rules), in families (see prefixRunFamilies).
     for (const TransformStep & step : plan.steps) {
         if (step.prefixRuns.empty()) continue;
-        std::string reason;
-        UCD::UnicodeSet first, run;
-        for (const PrefixRun & pr : step.prefixRuns) {
-            if (first.intersects(pr.first)) reason = "the sets of the characters to revisit of two prefix runs intersect";
-            first = first + pr.first;
-            run = run + pr.run;
-        }
-        if (first.intersects(run)) reason = "a character to revisit may be repeated";
+        const std::string reason = prefixRunFamilies(step.prefixRuns);
         if (reason.empty()) continue;
         for (const ConversionRule * c : step.prefixRunRules) {
             plan.problems.push_back(printRule(c) + "  (a prefix run, but " + reason + ")");

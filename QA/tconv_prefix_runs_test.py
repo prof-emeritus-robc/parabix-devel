@@ -2,9 +2,9 @@
 #  Part of the Parabix Project, under the Open Software License 3.0.
 #  SPDX-License-Identifier: OSL-3.0
 #
-#  tconv: prefix runs, (P) S → A | $1 ; and p S → A | p ; which ICU applies
-#  to each run P S^n to leave A^n P (see ComposeRevisits in
-#  include/ldml/transform_rules.h).  Each rules file must be planned with its
+#  tconv: prefix runs, (P) S → A | $1 ; and p S → A | p ; with S of one or
+#  more characters, which ICU applies to each run P S^n to leave A^n P (see
+#  ComposeRevisits in include/ldml/transform_rules.h).  Each rules file must be planned with its
 #  prefix runs in a group of their own (tconv --plan), and its result must be
 #  ICU's (as given by uconv -x on the same rules), including on a run longer
 #  than a block.
@@ -37,6 +37,16 @@ CASES = [
     (r":: [a-f\~] ; ([ab]) \~ → xyz | $1 ; ([cd]) \~ → | $1 ; ([ef]) \~ → q | $1 ; a → A ; c → C ; e → E ;",
      "a~~c~~e~~ b~d~f~ g~a~ c~~~~X ~e\n",
      "xyzxyzACqqE xyzbdqf g~xyzA CX ~E\n"),
+    # Texts S of two characters, a family (the same P) with two texts mixed in
+    # a run, an empty replacement.
+    ("t e \\~ → | t ; t o \\~ → | t ; t → T ; e → E ; o → O ; \\~ → \\- ;",
+     "te~o~e~ x te~ te to~a t~ te~~ te~o\nt" + "e~o~" * LONG + "x\n",
+     "T x T TE Ta T- T- TO\nTx\n"),
+    # Texts S of three characters, with a set, replacements of two and zero
+    # characters.
+    ("([ab]) x [yz] w → PQ | $1 ; ([ab]) v y w → | $1 ; a → A ; b → B ; x → X ; y → Y ;",
+     "ax y wbvywax z w avywvyw axywX bvyw axzwvywaxyw\na" + "xzwvyw" * LONG + "\n",
+     "AX Y wBAX z w A PQAX B PQAPQA\n" + "PQ" * LONG + "A\n"),
 ]
 
 

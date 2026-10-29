@@ -793,26 +793,28 @@ bool hasRevisit(const ConversionRule * c) {
 //      (P) S → A | $1 ;) and the rule matches A alone,
 //    - not see P S^n replaced by A^n P in its after contexts: each set of
 //      the after contexts contains all of the characters of P, S and A, or
-//      none (and in the first case A has one character, so that the lengths
-//      are the same); unassigned code points are disregarded,
+//      none (and in the first case A has as many characters as S, so that the
+//      lengths are the same); unassigned code points are disregarded,
 //    - not revisit P followed by S, or at the end of the text to revisit (where
 //      S may follow), as the prefix runs no longer apply then.
 //  The before contexts see A^n P as ICU does.  Within the prefix runs, the
-//  sets P must be disjoint, and neither S nor A may contain characters of P.
+//  families must be as prefixRunFamilies requires, and A may not contain
+//  characters of P.
 std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vector<bool> & isRun,
                               const std::vector<PrefixRun> & runs) {
-    UCD::UnicodeSet first, run, replaced;
-    bool singleReplacement = true;
+    const std::string families = prefixRunFamilies(runs);
+    if (!families.empty()) return families;
+    UCD::UnicodeSet first, run, runStart, replaced;
+    bool sameLength = true;
     bool revisitsReplacement = true;
     for (const PrefixRun & pr : runs) {
-        if (first.intersects(pr.first)) return "the sets of the characters to revisit of two prefix runs intersect";
         first = first + pr.first;
-        run = run + pr.run;
+        for (const UCD::UnicodeSet & s : pr.run) run = run + s;
+        runStart = runStart + pr.run.front();
         for (char32_t c : pr.replacement) replaced.insert(c);
-        singleReplacement &= pr.replacement.size() == 1;
+        sameLength &= pr.replacement.size() == pr.run.size();
         revisitsReplacement &= pr.revisitsReplacement;
     }
-    if (first.intersects(run)) return "a character to revisit may be repeated";
     if (replaced.intersects(first)) return "a replacement may begin a prefix run";
     static const UCD::UnicodeSet unassigned = UCD::getPropertyObject(UCD::gc)->GetCodepointSet("Cn");
     const UCD::UnicodeSet changed = (first + run + replaced) - unassigned;
@@ -841,7 +843,7 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             if (!after.empty() && !after[0].repeated) next = &after[0].chars;
         }
         for (const PrefixRun * pr : later[k]) {
-            if (text[0].chars.intersects(pr->first) && (next == nullptr || next->intersects(pr->run))) {
+            if (text[0].chars.intersects(pr->first) && (next == nullptr || next->intersects(pr->run.front()))) {
                 return "a rule before a prefix run may apply instead: " + printRule(c);
             }
         }
@@ -855,7 +857,7 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
         }
         if (source->hasAfterContext()) {
             for (const PatternItem & item : patternItems(source->getAfterContext())) {
-                if (item.chars.intersects(changed) && !(changed.subset(item.chars) && singleReplacement)) {
+                if (item.chars.intersects(changed) && !(changed.subset(item.chars) && sameLength)) {
                     return "an after context may see the text of a prefix run: " + printRule(c);
                 }
             }
@@ -864,7 +866,7 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             const std::vector<PatternItem> items = patternItems(revisit);
             for (size_t i = 0; i < items.size(); ++i) {
                 if (items[i].chars.intersects(first)
-                        && (items[i].repeated || i + 1 == items.size() || items[i + 1].chars.intersects(run))) {
+                        && (items[i].repeated || i + 1 == items.size() || items[i + 1].chars.intersects(runStart))) {
                     return "a rule revisits a character to revisit of a prefix run: " + printRule(c);
                 }
             }
@@ -981,6 +983,42 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
 
 }
 
+//  The prefix runs with the same set P form a family, whose texts S, of the
+//  same length, may follow each other in a run.  The sets P of two families
+//  must be disjoint, and contain no character of a set of S.  Within a family,
+//  no two matches of its texts S may overlap (other than a match with itself):
+//  a run is then a sequence of matches, each beginning where the one before
+//  ends, as ICU applies them.
+std::string prefixRunFamilies(const std::vector<PrefixRun> & runs) {
+    UCD::UnicodeSet first, run;
+    for (size_t i = 0; i < runs.size(); ++i) {
+        const PrefixRun & a = runs[i];
+        for (size_t j = 0; j < i; ++j) {
+            const PrefixRun & b = runs[j];
+            if (!a.first.intersects(b.first)) continue;
+            if (!(a.first == b.first) || a.run.size() != b.run.size()) {
+                return "the sets of the characters to revisit of two prefix runs intersect";
+            }
+        }
+        first = first + a.first;
+        for (const UCD::UnicodeSet & s : a.run) run = run + s;
+    }
+    if (first.intersects(run)) return "a character to revisit may be repeated";
+    for (const PrefixRun & a : runs) {
+        for (const PrefixRun & b : runs) {
+            if (!(a.first == b.first)) continue;
+            const size_t m = a.run.size();
+            //  A match of S of a followed, d characters on, by one of S of b.
+            for (size_t d = &a == &b ? 1 : 0; d < m; ++d) {
+                bool overlap = true;
+                for (size_t i = 0; i + d < m && overlap; ++i) overlap = a.run[d + i].intersects(b.run[i]);
+                if (overlap) return "the texts of two prefix runs (or of one) may overlap";
+            }
+        }
+    }
+    return "";
+}
+
 bool prefixRun(const ConversionRule * c, PrefixRun & pr) {
     const RuleSide * source = c->getSourceSide(Direction::Forward);
     const RuleSide * result = c->getResultSide(Direction::Forward);
@@ -989,7 +1027,7 @@ bool prefixRun(const ConversionRule * c, PrefixRun & pr) {
     std::vector<RE *> text, revisit;
     textAtoms(source->getText(), text);
     textAtoms(result->getResultToRevisit(), revisit);
-    if (text.size() != 2 || revisit.size() != 1) return false;
+    if (text.size() < 2 || revisit.size() != 1) return false;
     CharSetAnalysis sets;
     auto setOf = [&sets](RE * re, UCD::UnicodeSet & s) {
         if (!CharSetAnalysis::isSet(re) || hasStrings(re) || hasBoundary(re)) return false;
@@ -999,7 +1037,11 @@ bool prefixRun(const ConversionRule * c, PrefixRun & pr) {
     const Capture * const capture = dyn_cast<Capture>(text[0]);
     std::vector<RE *> captured;
     if (capture) textAtoms(capture->getCapturedRE(), captured); else captured.push_back(text[0]);
-    if (captured.size() != 1 || !setOf(captured[0], pr.first) || !setOf(text[1], pr.run)) return false;
+    if (captured.size() != 1 || !setOf(captured[0], pr.first)) return false;
+    pr.run.assign(text.size() - 1, UCD::UnicodeSet());
+    for (size_t i = 1; i < text.size(); ++i) {
+        if (!setOf(text[i], pr.run[i - 1])) return false;
+    }
     if (const Reference * ref = dyn_cast<Reference>(revisit[0])) {
         if (capture == nullptr || ref->getName() != capture->getName()) return false;
         pr.revisitsReplacement = true;

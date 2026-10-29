@@ -796,12 +796,15 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  with no repetitions) apply together, or the revisits do not end within
 //  8 rule applications (as with ll → | l ;).
 //
-//  A prefix run: a rule whose text is a character of a set P and one of a set
-//  S, and whose text to revisit is its character of P,
-//      (P) S → A | $1 ;    or    p S → A | p ;
+//  A prefix run: a rule whose text is a character of a set P followed by
+//  characters of sets S = S1 ... Sm (m >= 1), and whose text to revisit is
+//  its character of P,
+//      (P) S1 ... Sm → A | $1 ;    or    p S1 ... Sm → A | p ;
 //  (without contexts, A a fixed string; ICU also revisits A in the first form,
 //  which must then not match).  On P S^n, ICU applies it n times, leaving
-//  A^n P with P to revisit.  If the other rules of its group cannot see the
+//  A^n P with P to revisit.  The prefix runs with the same P form a family,
+//  whose texts S may follow each other in a run (P Sa Sb → Aa Ab P).  If the
+//  other rules of its group cannot see the
 //  difference (see prefixRunConflict in transform_rules_revisit.cpp), the
 //  prefix runs of a group are moved to a group of their own, before the rest
 //  of the group (separated by :: Null ;), where they are implemented together
@@ -845,11 +848,14 @@ std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitSt
 //  The sets P and S and the string A of a prefix run (see ComposeRevisits).
 struct PrefixRun {
     UCD::UnicodeSet first;          // P
-    UCD::UnicodeSet run;            // S
+    std::vector<UCD::UnicodeSet> run;   // S: the sets S1 ... Sm
     std::u32string replacement;     // A
     bool revisitsReplacement = false;   // (P) S → A | $1 ;  (ICU revisits A $1)
 };
 bool prefixRun(const ConversionRule * rule, PrefixRun & run);
+//  Whether prefix runs may be applied together (see the definition): the empty
+//  string if so, or the reason why not.
+std::string prefixRunFamilies(const std::vector<PrefixRun> & runs);
 
 //  Expansion of function calls on captures of single characters.
 //

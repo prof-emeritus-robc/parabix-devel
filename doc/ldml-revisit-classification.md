@@ -1,6 +1,7 @@
 # Revisit rules in the CLDR transforms: what the revisit triggers
 
-*October 28, 2026; updated October 29 for the prefix runs (class P). CLDR
+*October 28, 2026; updated October 29 for the prefix runs (class P), with S
+of one or more characters. CLDR
 transforms from `~/cldr/common/transforms` (with the local W7 fixes, including
 the Greek_Latin_UNGEGN capture fix), tconv with `--revisit-report`.*
 
@@ -263,11 +264,14 @@ rules fold the whole chain, with characters beyond and contexts as in D.
 ## P: prefix runs (173 rules, 7 transforms)
 
 *Triggers:* the rule itself. A prefix run is a rule `(P) S → A | $1 ;` or
-`p S → A | p ;`: its text is a character of a set P and one of a set S, it has
-no contexts, and its text to revisit is its character of P. On `P S^n x`, ICU
-applies it n times and leaves `A^n P`, with `P` then converted by the rest of
-the group (with the after context `x`). (In the first form ICU also revisits
-`A`, which then must not match.)
+`p S → A | p ;`: its text is a character of a set P followed by a text S of
+characters of sets S1 … Sm (m ≥ 1), it has no contexts, and its text to
+revisit is its character of P. On `P S^n x`, ICU applies it n times and leaves
+`A^n P`, with `P` then converted by the rest of the group (with the after
+context `x`). (In the first form ICU also revisits `A`, which then must not
+match.) The prefix runs with the same set P form a family, whose texts may
+follow each other in a run: with `te\~ → | t ;` and `to\~ → | t ;`, ICU turns
+`te~o~e~x` into `tx`.
 
 - Ethi-Latn/ALALOC, Aethiopi, Beta_Metsehaf, IES_JES_1964, Lambdin (167
   rules): `([ሀ-ሇ]) $ጥበቅ → $ሀ | $1 ;`, one per consonant series: on
@@ -289,39 +293,59 @@ the group (with the after context `x`). (In the first form ICU also revisits
      reach P), nor A (which ICU has converted), unless ICU revisits A and the
      rule matches A alone;
    - each set of the after contexts contains all of the characters of P, S
-     and A or none (unassigned code points aside), and if all, A has one
-     character: an after context sees `A^n P` where ICU saw `P S^n`;
+     and A or none (unassigned code points aside), and if all, A has as many
+     characters as S: an after context sees `A^n P` where ICU saw `P S^n`;
    - no rule revisits P followed by S, or P at the end of its text to
      revisit;
-   - the sets P are disjoint, and S and A contain no character of P.
+   - the sets P of two prefix runs are equal (a family, whose texts S then
+     have the same length) or disjoint, and S and A contain no character of
+     P (`prefixRunFamilies`);
+   - no two matches of the texts S of a family may overlap, other than a
+     match with itself: for each two texts (or one with itself) and each
+     shift d < m (0 < d for one text), some position of the overlap has
+     disjoint sets. A run is then a sequence of matches, each beginning where
+     the one before ends, as ICU applies them.
 
    The before contexts see `A^n P` as in ICU. Otherwise the rules stay in the
    group, and are reported with the reason (`a prefix run, but …`).
 2. *Plan* (`planTransform`). A group of prefix runs alone becomes a step with
    `TransformStep::prefixRuns` (P, S, A for each rule).
-3. *Kernel* (`PrefixRuns` in tconv). For each prefix run r, with the
-   character classes of P and S and a lookahead of 1:
-   `laS = Lookahead(S, 1)`, `PS = P & laS`, then, within an `If` on the
-   union of the PS,
-   `run = MatchStar(Advance(PS, 1), S) & S` and `last = run & ~laS`.
-   The positions `last` get the character of P, carried along the run bit by
-   bit: for each of the 21 basis bits b, `MatchStar(Advance(PS & b, 1), S) &
-   last` (once for all the prefix runs with the same S). The A positions,
-   `PS | (run & ~last)`, get 0, and the kernel writes, as bit streams:
-   - the mask of the A positions, with the index of their A among the k
+3. *Kernel* (`PrefixRuns` in tconv). By family, the families with the same
+   texts S sharing a run class, with the character classes of the sets P and
+   of the sets of S, and a lookahead of the longest m:
+   - for each text t, `Full_t = Lookahead(S1, 1) & … & Lookahead(Sm, m)`
+     (each also within the filter), and `Full` their union for the class;
+   - `Fill = Advance(Full, 1) | … | Advance(Full, m)`, the positions within
+     matches, and `Ends = Advance(Full, m)`, those that end one;
+   - `PS = P & Full`, then, within an `If` on the union of the PS,
+     `run = MatchStar(Advance(PS, 1), Fill) & Fill`. As matches do not
+     overlap, the run is a sequence of matches, each beginning after the one
+     before.
+
+   The anchors, `PS | (run & Ends & Full)` (P and the ends followed by another
+   match), get the A of the text that follows (`Full_t`). The last end,
+   `run & Ends & ~Full`, gets the character of P, carried along the run bit
+   by bit: for each of the 21 basis bits b, `MatchStar(Advance(PS & b, 1),
+   Fill) & last` (once for all the families of a run class). The other
+   positions of the run (`run & ~Ends`, when m > 1) are deleted. The anchors
+   get 0, and the kernel writes, as bit streams:
+   - the mask of the anchors, with the index of their A among the k
      distinct strings A multiplexed on ⌈log₂ k⌉ selector streams;
    - the number of positions to insert after each, |A| − 1 (a BixNum), if some
      A has more than one character;
-   - the positions to delete, those of empty strings A, if any.
+   - the positions to delete, those of empty strings A and within the texts,
+     if any.
 
-   The run stops at characters outside the filter.
+   With m = 1, `Fill` and `Ends` are S, and this is the kernel of the single
+   characters S. The run stops at characters outside the filter.
 4. *Insertion and fill.* The positions are inserted (`InsertionSpreadMask`,
    then `SpreadByMask` of the text, the mask and selectors, the deletions and
    the filter masks, whose inserted positions inherit them). The mask and
    selectors, shifted forward j positions (`ShiftForward`, for j < max |A|),
    mark the positions of the j-th characters of each A, whose bits are then
-   set (`PrefixRunFill`). Finally, the positions of empty strings A are deleted
-   (`FilterByMask`, with the filter masks).
+   set (`PrefixRunFill`). Finally, the positions of empty strings A, and
+   those within the texts, are deleted (`FilterByMask`, with the filter
+   masks).
 
 On Ethi-Latn/ALALOC (33 prefix runs, many distinct A of one to three
 characters, within the filter `[:Ethiopic:]`) the step has 12 kernels; on
@@ -335,7 +359,14 @@ marks, with 1 and 3 threads. The CLDR test data of these transforms (which
 have no runs) passes. `QA/tconv_prefix_runs_test.py` (`make check`) covers a
 captured P with A of two characters (and a run of 600), a literal P with an
 empty A, A of one character, and A of three, zero and one characters in one
-group within a filter, against ICU's results. The CLDR test data of the 4 `_Geminate`
+group within a filter, and texts S of two and three characters (families of
+two texts mixed in runs, of 300 matches), against ICU's results. Prefix runs
+with S of one to three characters were fuzzed against ICU's `createFromRules`
+(`uconv -x`): 381 random rule sets (families of one to three texts, captured
+and literal P, sets within the texts, A of zero to three characters, other
+rules, filters), 5 random lines each, some with runs of up to 400 matches,
+also with 3 threads and segment size 1, all identical; 69 more were refused
+as overlapping. The extension changes the plan of no CLDR transform. The CLDR test data of the 4 `_Geminate`
 variants (6,888 cases each) passes: their first step, am_Ethi-am_Ethi/Geminate,
 inserts the gemination marks that the prefix runs then apply to. (It crashed on
 macOS until the JIT compile threads were given 8 MB stacks: LLVM's
@@ -361,10 +392,17 @@ The 173 prefix runs of class P were in this class. What remains:
 
 - Khmr-Latn/UNGEGN (65 rules) `â្ក → k | â ;`, `ô្គ → k | ô ;`, …: every
   `â្C` rule revisits `â`, which begins all of them, so a run of subscript
-  consonants `â ្C1 ្C2 …` is consumed one at a time. S is two characters
-  (`្C`), and each selects its own output;
-- ja_Latn-ru and ja_Latn-ko `te\~ → | t ;`, `to\~ → | t ;`,
-  `tsu\~ → | ts ;`: S of two characters, A empty;
+  consonants `â ្C1 ្C2 …` is consumed one at a time. These are prefix runs
+  with S of two characters (`្C`), in two families (`â` and `ô`), but `â` and
+  `ô` are not in the input: the consonant rules of the same group produce
+  them, `ក → k | â ;`, and revisit them, so the prefix runs cannot be applied
+  first (`a rule revisits a character to revisit of a prefix run`);
+- ja_Latn-ru and ja_Latn-ko `te\~ → | t ;`, `to\~ → | t ;` (prefix runs with
+  S of two characters, A empty) and `tsu\~ → | ts ;` (P of two characters).
+  In ja_Latn-ru, the after context of `\~ } tsu → ;` would see `te~su`
+  become `tsu`; in ja_Latn-ko, that of `t } t → ᆺ` sees the `t` of a run
+  (its single set sees only P, which a run with A empty leaves in place, so
+  this conflict could be refined). Both have other revisits;
 - prefix runs whose groups do not allow the split: xh-xh_FONIPA `rh → | r ;`
   (`gr → ɣ` would match its `r` within its text), it-am and it-ja
   `($consonant) \' → | $1 ;` (`cqu`), fa-fa_FONIPA `([َ-ِ]) ّ → ّ | $1 ;`
@@ -374,10 +412,11 @@ The 173 prefix runs of class P were in this class. What remains:
   `ss → | \~s ;`, `($consonant) s } $vowel → | $1 \~s ;`; ja_Latn-ru
   `i $lengthMarker → | ii ;`; ja_Latn-ko `e $lengthMarker → | ei ;`.
 
-*Possible implementation:* the PrefixRuns kernel generalizes to S of a fixed
-length k (a run of k-character units: MatchStar over units, with the unit
-starts and ends marked), and to an output per unit (Khmer: a marker per S,
-selected by the unit, rather than per rule). The conflicts of the split are
+*Possible implementation:* prefix runs with S of several characters, in
+families, are implemented (above). Khmr-Latn/UNGEGN needs the rules that
+produce P, `C → B | â`, applied with the prefix runs: on `C (្C')^n`, `B`
+at C, each A at the first position of its match (the coeng), the other
+positions deleted, and `â` at the last. The conflicts of the split are
 specific to each group; some (xh, it) are real: ICU would not reach P.
 
 ## L: long chains (3 rules, 2 transforms)

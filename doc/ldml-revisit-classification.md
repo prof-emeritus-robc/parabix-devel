@@ -141,7 +141,7 @@ contexts other than sequences of sets would have to be combined, or a cursor
 is placed beyond a result. Part 2 is the rules for which this happens.
 
 **Prefix runs** (class P) are not composed: they are moved out of their group
-and applied by a kernel of their own (see P below).
+and applied by kernels of their own (see P below).
 
 The classes below differ in which of these steps do the work.
 
@@ -304,14 +304,28 @@ the group (with the after context `x`). (In the first form ICU also revisits
    `laS = Lookahead(S, 1)`, `PS = P & laS`, then, within an `If` on the
    union of the PS,
    `run = MatchStar(Advance(PS, 1), S) & S` and `last = run & ~laS`.
-   The positions `PS | (run & ~last)` are set to a marker of r (a surrogate
-   code point, `0xD801 + r`), and the positions `last` to the character of P,
-   carried along the run bit by bit: for each of the 21 basis bits b,
-   `MatchStar(Advance(PS & b, 1), S) & last` (once for all the prefix runs
-   with the same S). The run stops at characters outside the filter.
-4. *Markers.* A conversion group of single-character rules `marker → A`
-   then writes A, of any length (empty A deletes the positions), with the
-   usual machinery for insertions, deletions and filter masks.
+   The positions `last` get the character of P, carried along the run bit by
+   bit: for each of the 21 basis bits b, `MatchStar(Advance(PS & b, 1), S) &
+   last` (once for all the prefix runs with the same S). The A positions,
+   `PS | (run & ~last)`, get 0, and the kernel writes, as bit streams:
+   - the mask of the A positions, with the index of their A among the k
+     distinct strings A multiplexed on ⌈log₂ k⌉ selector streams;
+   - the number of positions to insert after each, |A| − 1 (a BixNum), if some
+     A has more than one character;
+   - the positions to delete, those of empty strings A, if any.
+
+   The run stops at characters outside the filter.
+4. *Insertion and fill.* The positions are inserted (`InsertionSpreadMask`,
+   then `SpreadByMask` of the text, the mask and selectors, the deletions and
+   the filter masks, whose inserted positions inherit them). The mask and
+   selectors, shifted forward j positions (`ShiftForward`, for j < max |A|),
+   mark the positions of the j-th characters of each A, whose bits are then
+   set (`PrefixRunFill`). Finally, the positions of empty strings A are deleted
+   (`FilterByMask`, with the filter masks).
+
+On Ethi-Latn/ALALOC (33 prefix runs, many distinct A of one to three
+characters, within the filter `[:Ethiopic:]`) the step has 12 kernels; on
+ro_FONIPA-ja (3 prefix runs, A empty) 5.
 
 *Verification.* For the 7 transforms (and the 5 using them: Ethi-Latn, ro-ja,
 and the 4 `_Geminate` variants), the output matches ICU (`uconv -x` on the
@@ -319,8 +333,9 @@ same CLDR rule text): 408 random texts each, rich in runs, including runs of
 40 marks crossing block boundaries, and a 15 MB text with runs of up to 700
 marks, with 1 and 3 threads. The CLDR test data of these transforms (which
 have no runs) passes. `QA/tconv_prefix_runs_test.py` (`make check`) covers a
-captured P with A of two characters, a literal P with an empty A, and A of one
-character, against ICU's results. The CLDR test data of the 4 `_Geminate`
+captured P with A of two characters (and a run of 600), a literal P with an
+empty A, A of one character, and A of three, zero and one characters in one
+group within a filter, against ICU's results. The CLDR test data of the 4 `_Geminate`
 variants (6,888 cases each) passes: their first step, am_Ethi-am_Ethi/Geminate,
 inserts the gemination marks that the prefix runs then apply to. (It crashed on
 macOS until the JIT compile threads were given 8 MB stacks: LLVM's

@@ -4378,26 +4378,34 @@ private:
 
 //  The prefix runs of a group (see ldml::TransformStep::prefixRuns).  At each
 //  run P S^n (n >= 1) of the characters of prefix run r, within the mask, the
-//  characters become M^n P, with M the marker of r (PrefixRunMarker + r, then
-//  replaced by its string A): with PS the positions of P followed by S, the
-//  run is MatchStar(Advance(PS, 1), S) & S, its last position the one not
-//  followed by S; PS and the run but its last position become M, and the last
-//  position P, whose bits are carried along the run (by MatchStar again, for
-//  the prefix runs with the same S together).  Classes: the sets P of the
-//  prefix runs, then the distinct sets S (runSets gives that of each prefix run).
-static constexpr UCD::codepoint_t PrefixRunMarker = 0xD801;
-
+//  characters become A^n P: with PS the positions of P followed by S, the run
+//  is MatchStar(Advance(PS, 1), S) & S, its last position the one not followed
+//  by S.  The last position gets the character of P, whose bits are carried
+//  along the run (by MatchStar again, for the prefix runs with the same S
+//  together); PS and the run but its last position (the A positions) get 0,
+//  for A to be written there (see PrefixRunFill), after the insertion of
+//  |A| - 1 positions after each (Counts), or are deleted where A is empty
+//  (Delete).  Select marks the A positions (stream 0) and gives the index of
+//  their A among the distinct strings A (streams 1 to selectBits, multiplexed).
+//  Classes: the sets P of the prefix runs, then the distinct sets S (runSets
+//  gives that of each prefix run); replacements: the index of the A of each.
 class PrefixRuns final : public pablo::PabloKernel {
 public:
     PrefixRuns(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & runSets, unsigned numRunSets,
-               StreamSet * U21, StreamSet * Classes, StreamSet * Mask, StreamSet * Result)
-    : PabloKernel(ts, "PrefixRuns_" + std::to_string(numRunSets) + "_" + [&] {
-                      std::string s;
-                      for (unsigned r : runSets) s += std::to_string(r) + ".";
-                      return s;
-                  }() + (Mask ? "m" : ""),
-                  bindings(U21, Classes, Mask), {Binding{"Result", Result}})
-    , mRunSets(runSets), mNumRunSets(numRunSets), mMasked(Mask != nullptr) {}
+               const std::vector<unsigned> & replacements, const std::vector<unsigned> & lengths,
+               StreamSet * U21, StreamSet * Classes, StreamSet * Mask,
+               StreamSet * Result, StreamSet * Select, StreamSet * Counts, StreamSet * Delete)
+    : PabloKernel(ts, "PrefixRuns" + [&] {
+                      std::string sig = "_" + std::to_string(numRunSets) + (Mask ? "m" : "");
+                      for (size_t r = 0; r < runSets.size(); r++) sig += "_" + std::to_string(runSets[r]) + "." + std::to_string(replacements[r]);
+                      for (unsigned n : lengths) sig += "_l" + std::to_string(n);
+                      //  A long signature is hashed (the kernel name is a file name in the object cache).
+                      return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
+                  }(),
+                  inputBindings(U21, Classes, Mask), outputBindings(Result, Select, Counts, Delete))
+    , mRunSets(runSets), mNumRunSets(numRunSets), mReplacements(replacements), mLengths(lengths)
+    , mMasked(Mask != nullptr), mSelectBits(Select->getNumElements() - 1)
+    , mCountBits(Counts ? Counts->getNumElements() : 0), mDelete(Delete != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -4418,12 +4426,22 @@ protected:
             starts[r] = pb.createAnd(p, ahead[mRunSets[r]]);
             anyStart = pb.createOr(anyStart, starts[r]);
         }
-        std::vector<Var *> result(basis.size());
-        for (size_t b = 0; b < basis.size(); b++) result[b] = pb.createVar("result" + std::to_string(b), basis[b]);
+        auto vars = [&](const std::string & name, unsigned n, const std::vector<PabloAST *> * init) {
+            std::vector<Var *> v(n);
+            for (unsigned k = 0; k < n; k++) v[k] = pb.createVar(name + std::to_string(k), init ? (*init)[k] : pb.createZeroes());
+            return v;
+        };
+        const std::vector<Var *> result = vars("result", basis.size(), &basis);
+        const std::vector<Var *> select = vars("select", mSelectBits + 1, nullptr);
+        const std::vector<Var *> counts = vars("count", mCountBits, nullptr);
+        const std::vector<Var *> deleted = vars("delete", mDelete ? 1 : 0, nullptr);
         auto body = pb.createScope();
         pb.createIf(anyStart, body);
         PabloAST * changed = body.createZeroes();
         std::vector<PabloAST *> bits(basis.size(), body.createZeroes());
+        std::vector<PabloAST *> sel(mSelectBits + 1, body.createZeroes());
+        std::vector<PabloAST *> cnt(mCountBits, body.createZeroes());
+        PabloAST * del = body.createZeroes();
         for (unsigned s = 0; s < mNumRunSets; s++) {
             PabloAST * const S = mask ? body.createAnd(classes[runs + s], mask) : classes[runs + s];
             PabloAST * setStarts = body.createZeroes();
@@ -4431,10 +4449,16 @@ protected:
             for (size_t r = 0; r < runs; r++) {
                 if (mRunSets[r] != s) continue;
                 PabloAST * const run = body.createAnd(body.createMatchStar(body.createAdvance(starts[r], 1), S), S);
-                PabloAST * const marked = body.createOr(starts[r], body.createAnd(run, ahead[s]));
-                const UCD::codepoint_t marker = PrefixRunMarker + r;
-                for (size_t b = 0; b < basis.size(); b++) {
-                    if ((marker >> b) & 1) bits[b] = body.createOr(bits[b], marked);
+                PabloAST * const at = body.createOr(starts[r], body.createAnd(run, ahead[s]));
+                const unsigned a = mReplacements[r];
+                const unsigned length = mLengths[a];
+                sel[0] = body.createOr(sel[0], at);
+                for (unsigned j = 0; j < mSelectBits; j++) {
+                    if ((a >> j) & 1) sel[j + 1] = body.createOr(sel[j + 1], at);
+                }
+                if (length == 0) del = body.createOr(del, at);
+                for (unsigned c = 0; c < mCountBits && length > 1; c++) {
+                    if (((length - 1) >> c) & 1) cnt[c] = body.createOr(cnt[c], at);
                 }
                 setStarts = body.createOr(setStarts, starts[r]);
                 lasts = body.createOr(lasts, body.createAnd(run, body.createNot(ahead[s])));
@@ -4449,17 +4473,83 @@ protected:
         for (size_t b = 0; b < basis.size(); b++) {
             body.createAssign(result[b], body.createOr(body.createAnd(basis[b], body.createNot(changed)), bits[b]));
         }
+        for (unsigned k = 0; k <= mSelectBits; k++) body.createAssign(select[k], sel[k]);
+        for (unsigned c = 0; c < mCountBits; c++) body.createAssign(counts[c], cnt[c]);
+        if (mDelete) body.createAssign(deleted[0], del);
         writeOutputStreamSet("Result", std::vector<PabloAST *>(result.begin(), result.end()));
+        writeOutputStreamSet("Select", std::vector<PabloAST *>(select.begin(), select.end()));
+        if (mCountBits) writeOutputStreamSet("Counts", std::vector<PabloAST *>(counts.begin(), counts.end()));
+        if (mDelete) writeOutputStreamSet("Delete", std::vector<PabloAST *>(deleted.begin(), deleted.end()));
     }
 private:
-    static Bindings bindings(StreamSet * U21, StreamSet * Classes, StreamSet * Mask) {
+    static Bindings inputBindings(StreamSet * U21, StreamSet * Classes, StreamSet * Mask) {
         Bindings b{Binding{"U21", U21}, Binding{"Classes", Classes, FixedRate(1), LookAhead(1)}};
         if (Mask) b.emplace_back("Mask", Mask, FixedRate(1), LookAhead(1));
         return b;
     }
+    static Bindings outputBindings(StreamSet * Result, StreamSet * Select, StreamSet * Counts, StreamSet * Delete) {
+        Bindings b{Binding{"Result", Result}, Binding{"Select", Select}};
+        if (Counts) b.emplace_back("Counts", Counts);
+        if (Delete) b.emplace_back("Delete", Delete);
+        return b;
+    }
     const std::vector<unsigned> mRunSets;
     const unsigned mNumRunSets;
+    const std::vector<unsigned> mReplacements;
+    const std::vector<unsigned> mLengths;
     const bool mMasked;
+    const unsigned mSelectBits;
+    const unsigned mCountBits;
+    const bool mDelete;
+};
+
+//  The strings A of the prefix runs written at their positions, after the
+//  insertions: Selected[j] is the selection of PrefixRuns (spread), shifted j
+//  positions forward, which marks the positions that get the j-th character of
+//  the A it selects (Basis has 0 there).
+class PrefixRunFill final : public pablo::PabloKernel {
+public:
+    PrefixRunFill(LLVMTypeSystemInterface & ts, const std::vector<std::u32string> & replacements,
+                  const std::vector<StreamSet *> & Selected, StreamSet * Basis, StreamSet * Result)
+    : PabloKernel(ts, "PrefixRunFill" + [&] {
+                      std::string sig;
+                      for (const std::u32string & t : replacements) {
+                          sig += "_";
+                          for (char32_t ch : t) sig += std::to_string(static_cast<unsigned>(ch)) + ".";
+                      }
+                      //  A long signature is hashed (the kernel name is a file name in the object cache).
+                      return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
+                  }(),
+                  [&] {
+                      Bindings inputs{Binding{"Basis", Basis}};
+                      for (size_t j = 0; j < Selected.size(); j++) inputs.emplace_back("Selected" + std::to_string(j), Selected[j]);
+                      return inputs;
+                  }(),
+                  {Binding{"Result", Result}}),
+      mReplacements(replacements), mShifts(Selected.size()) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        for (unsigned j = 0; j < mShifts; j++) {
+            const std::vector<PabloAST *> sel = getInputStreamSet("Selected" + std::to_string(j));
+            for (size_t i = 0; i < mReplacements.size(); i++) {
+                if (j >= mReplacements[i].size()) continue;
+                //  The positions of A number i: those selected with index i.
+                PabloAST * at = sel[0];
+                for (size_t k = 1; k < sel.size(); k++) {
+                    at = pb.createAnd(at, ((i >> (k - 1)) & 1) ? sel[k] : pb.createNot(sel[k]));
+                }
+                for (unsigned b = 0; b < basis.size(); b++) {
+                    if ((mReplacements[i][j] >> b) & 1) basis[b] = pb.createOr(basis[b], at);
+                }
+            }
+        }
+        writeOutputStreamSet("Result", basis);
+    }
+private:
+    const std::vector<std::u32string> mReplacements;
+    const unsigned mShifts;
 };
 
 class RulePipelineBuilder {
@@ -6414,34 +6504,83 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
 }
 
 //  The deferred rules of a group (see ldml::DeferredRule and DeferredPlan).
-//  The prefix runs of a group: the PrefixRuns kernel leaves the markers of the
-//  prefix runs in the place of their strings A, which a conversion group of
-//  single-character rules (marker → A) then writes.
+//  The prefix runs of a group: the PrefixRuns kernel moves the characters of
+//  P to the ends of their runs and marks the positions of the strings A; the
+//  positions for the further characters of A are inserted after them, A is
+//  written (PrefixRunFill), and the positions of empty strings A are deleted.
 StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    PipelineBuilder & P = mP;
     std::vector<UCD::UnicodeSet> sets;
     std::vector<UCD::UnicodeSet> runSets;
     std::vector<unsigned> runSetOf;
-    for (const ldml::PrefixRun & pr : step.prefixRuns) sets.push_back(pr.first);
+    std::vector<std::u32string> replacements;
+    std::vector<unsigned> replacementOf;
     for (const ldml::PrefixRun & pr : step.prefixRuns) {
+        sets.push_back(pr.first);
         auto f = std::find(runSets.begin(), runSets.end(), pr.run);
         runSetOf.push_back(static_cast<unsigned>(f - runSets.begin()));
         if (f == runSets.end()) runSets.push_back(pr.run);
+        auto g = std::find(replacements.begin(), replacements.end(), pr.replacement);
+        replacementOf.push_back(static_cast<unsigned>(g - replacements.begin()));
+        if (g == replacements.end()) replacements.push_back(pr.replacement);
     }
     sets.insert(sets.end(), runSets.begin(), runSets.end());
-    StreamSet * const Classes = classes(sets, U21);
-    StreamSet * const Marked = mP.CreateStreamSet(21);
-    mP.CreateKernelCall<PrefixRuns>(runSetOf, static_cast<unsigned>(runSets.size()), U21, Classes, activeMask(), Marked);
-    ldml::TransformStep markers;
-    markers.kind = ldml::TransformStep::Kind::Conversion;
-    ldml::CharMapSubgroup subgroup;
-    for (size_t r = 0; r < step.prefixRuns.size(); r++) {
-        const UCD::UnicodeSet marker(PrefixRunMarker + static_cast<UCD::codepoint_t>(r));
-        subgroup.mappings.push_back(ldml::CharMapping{marker, step.prefixRuns[r].replacement});
-        subgroup.all = subgroup.all + marker;
-        subgroup.rules++;
+    std::vector<unsigned> lengths;
+    unsigned maxLength = 0;
+    bool anyEmpty = false;
+    for (const std::u32string & a : replacements) {
+        lengths.push_back(static_cast<unsigned>(a.size()));
+        maxLength = std::max(maxLength, lengths.back());
+        anyEmpty |= a.empty();
     }
-    markers.subgroups.push_back(std::move(subgroup));
-    return conversionGroup(markers, Marked);
+    auto bitsFor = [](unsigned n) {
+        unsigned bits = 0;
+        while ((n >> bits) != 0) bits++;
+        return bits;
+    };
+    const unsigned selectBits = bitsFor(static_cast<unsigned>(replacements.size()) - 1);
+    const unsigned countBits = maxLength > 1 ? bitsFor(maxLength - 1) : 0;
+    StreamSet * const Classes = classes(sets, U21);
+    StreamSet * Result = P.CreateStreamSet(21);
+    StreamSet * Select = P.CreateStreamSet(selectBits + 1);
+    StreamSet * const Counts = countBits ? P.CreateStreamSet(countBits) : nullptr;
+    StreamSet * Delete = anyEmpty ? P.CreateStreamSet(1) : nullptr;
+    P.CreateKernelCall<PrefixRuns>(runSetOf, static_cast<unsigned>(runSets.size()), replacementOf, lengths,
+                                   U21, Classes, activeMask(), Result, Select, Counts, Delete);
+    if (Counts) {
+        StreamSet * const SpreadMask = P.CreateStreamSet(1);
+        InsertionSpreadMask(P, Counts, SpreadMask, kernel::InsertPosition::After);
+        auto spread = [&](StreamSet *& s) {
+            StreamSet * const t = P.CreateStreamSet(s->getNumElements(), s->getFieldWidth());
+            SpreadByMask(P, SpreadMask, s, t);
+            s = t;
+        };
+        spread(Result);
+        spread(Select);
+        if (Delete) spread(Delete);
+        //  The inserted positions are within the filters, as the A positions.
+        spreadMasks(SpreadMask);
+    }
+    if (maxLength > 0) {
+        std::vector<StreamSet *> selected{Select};
+        for (unsigned j = 1; j < maxLength; j++) {
+            StreamSet * const s = P.CreateStreamSet(Select->getNumElements());
+            P.CreateKernelCall<ShiftForward>(Select, s, j);
+            selected.push_back(s);
+        }
+        StreamSet * const Filled = P.CreateStreamSet(21);
+        P.CreateKernelCall<PrefixRunFill>(replacements, selected, Result, Filled);
+        Result = Filled;
+    }
+    if (Delete) {
+        StreamSet * const keep = P.CreateStreamSet(1);
+        Invert(P, Delete, keep);
+        StreamSet * const kept = P.CreateStreamSet(21);
+        FilterByMask(P, keep, Result, kept);
+        filterMasks(keep);
+        Result = kept;
+    }
+    return Result;
 }
 
 StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {

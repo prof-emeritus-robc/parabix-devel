@@ -33,6 +33,10 @@ CASES = [
     (r"([xy]) \- → \= | $1 ; x → X ; y → Y ;",
      "x--y x- -x y---\n",
      "==XY =X -X ===Y\n"),
+    # Replacements of three, zero and one characters together, within a filter.
+    (r":: [a-f\~] ; ([ab]) \~ → xyz | $1 ; ([cd]) \~ → | $1 ; ([ef]) \~ → q | $1 ; a → A ; c → C ; e → E ;",
+     "a~~c~~e~~ b~d~f~ g~a~ c~~~~X ~e\n",
+     "xyzxyzACqqE xyzbdqf g~xyzA CX ~E\n"),
 ]
 
 
@@ -55,7 +59,7 @@ def main():
             runs = list(pool.map(lambda argv: subprocess.run(argv, capture_output=True), argvs))
         for i, (rule, _, want) in enumerate(CASES):
             plan, run = runs[2 * i: 2 * i + 2]
-            if b"prefix runs: 1 rules" not in plan.stdout or b": implementable" not in plan.stdout:
+            if b"prefix runs: " not in plan.stdout or b": implementable" not in plan.stdout:
                 failures += 1
                 print("FAIL %s: not planned as a prefix run\n%s" % (rule, plan.stdout.decode("utf-8", "replace")))
             got = run.stdout.decode("utf-8", "replace")

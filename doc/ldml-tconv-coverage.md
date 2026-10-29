@@ -1,7 +1,8 @@
 # tconv: status of the LDML / CLDR transforms
 
-*Status of `tools/ldml/tconv` on branch LDML at `323305975`: with rules with text
-to revisit composed at compile time (W6), overlapping string matches selected
+*Status of `tools/ldml/tconv` on branch LDML at `239c4cfe4`: with rules with text
+to revisit composed at compile time, and prefix runs (`(P) S → A | $1`) applied
+by a kernel of their own (W6, §5), overlapping string matches selected
 sequentially (W2b2, §4.2), variable-length texts expanded, as runs, or as
 MultipleCaptureMultipleReplacement rules (W3, §5; with exact starts, selected
 together with string rules, and with captures of finitely many lengths
@@ -12,35 +13,19 @@ captures of before contexts copied (W5, §5), unreferenced captures removed
 (§5), and the built-ins Hex-Any (all variants), Any-CaseFold, Any-FCD, Any-FCC,
 Any-Hex/XML10 and Any-Remove (§2.1),
 against CLDR `common/transforms` and `common/testData/transforms` at commit
-`7cdeb9e` (2026-10-09). October 17, 2026.*
+`7cdeb9e` (2026-10-09), with the local fixes of W7 (`~/cldr`). October 29, 2026.*
 
-*This run used the CLDR transforms without the local fixes of W7 (§5), from a
-copy (`~/transforms`, 380 files rather than 381), so Latin-ug and ug-Latin,
-implementable with them, are counted as blocked by W7 here, and
-Grek-Latn/UNGEGN and Latn-Grek/UNGEGN report the parse problem rather than the
-W3, W4 and W6 problems they have with the fixes. Any-FCD, Any-FCC,
-Any-Hex/XML10 and Any-Remove, and the transforms that the capture changes affect
-(Kana-Latn, Hira-Latn, Jpan-Latn, Zawgyi-my, my-Zawgyi, my-my_FONIPA,
-si-si_FONIPA, fa-fa_FONIPA) and the W3 changes affect (NumericPinyin-Latin,
-am_FONIPA-am, am-am_FONIPA, byn Xaleget, cy-cy_FONIPA, and the transforms
-through them), were added
-to the results by an incremental update (`tconv_coverage.py --update`, see
-[Reproducing](#reproducing)); the generated tables and blocks of this report are
-marked `<!-- coverage:… -->`.*
-
-*Update at `585ccdeba` (October 18, 2026): a full run of `tconv_coverage.py`
-at `07794b04b` (`d92fd824b` with `tconv --kernel-counts`), with the same CLDR
-data, without the local fixes of W7. It adds the kernel counts of each
-transform to the per-transform table (§4.4). Its generated blocks replace
-those of the run at `323305975`; the rest of the report still describes that
-run. The test results are the same (253 files, 246,751 cases, the same 217
-failures). 371 transforms are implementable rather than 372: on a 15 GB
-machine, the analysis of Jpan-Latn exceeds the memory available (killed at
-13.3 GB after 112 s, also when run alone), so it is counted as "analysis
-failed" (W9) and has no kernel counts. Hani-Latn and Hant-Latn, whose analysis
-needs several GB each, failed when run two at a time and were run again one
-at a time, with Any-CaseFold (whose kernels were counted in its direct
-pipeline).*
+*This is a full run of `tconv_coverage.py` (all 455 names planned, kernels
+counted and CLDR test files run, `--jobs 3`, on a 15 GB machine). Unlike the
+runs at `323305975` and `585ccdeba`, it uses the CLDR transforms with the local
+fixes of W7, so Latin-ug and ug-Latin are implementable, and Grek-Latn/UNGEGN
+and Latn-Grek/UNGEGN report their W3, W4 and W6 problems rather than the parse
+problem. From the run at `585ccdeba` (371 implementable), 15 more transforms
+are implementable (386): the ten Ethi-Latn romanizations (five of them
+`_Geminate`), ro-ja and ro_FONIPA-ja by prefix runs, Jpan-Latn, whose analysis
+no longer exceeds the memory (`308aad759`), and Latin-ug and ug-Latin by the
+local fixes. The generated tables and blocks of this report are marked
+`<!-- coverage:… -->`.*
 
 This report covers:
 
@@ -61,18 +46,27 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 371 (87%) |
-| …of which public (not `visibility="internal"`) | 393 | 340 (87%) |
+| Transforms defined by CLDR files (380 files) | 425 | 386 (91%) |
+| …of which public (not `visibility="internal"`) | 393 | 355 (90%) |
 <!-- /coverage:summary -->
 
-- **Tests.** Of the 284 CLDR test files, 253 belong to implementable transforms.
-  Their 246,751 cases fail only in two files, where the test data disagrees with
+- **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
+  Their 263,287 cases fail only in two files, where the test data disagrees with
   the rules and with ICU (§3): ka-ka_Latn/BGN (215 cases) and my-my_FONIPA (2).
-  The coverage script now runs each case as a text of its own (`tconv --lines`
+  The coverage script runs each case as a text of its own (`tconv --lines`
   for the cases that fail in the text of all the cases), which removed 10,675
-  spurious failures. Of the transforms made implementable since `02e77ee59`, only
-  the `*-am` and `am-*` transforms have CLDR test data (23 files, 6,083 cases, all
-  passing); all were checked against ICU 78.3 (§2.3).
+  spurious failures. The 8 files of the transforms made implementable by prefix
+  runs (16,536 cases, two `_Geminate` files of 6,888 each among them) all pass,
+  as does am_Ethi-am_Ethi/Geminate (6,888), whose first compilation no longer
+  overflows the JIT thread's stack (`fa7352b10`).
+- **Prefix runs** (W6, §5), `([ሀ-ሇ…]) $ጥበቅ → $ሀ | $1`: a rule that revisits its
+  prefix P after a text S of one character turns each run P S…S into A…A P.
+  These rules, where no other rule of the group interferes, are split into a
+  group of their own and applied by one kernel: the positions to replace are
+  found by `MatchStar`, P's characters are carried to the end of the run, and
+  replacements A of other than one character are written by insertion and
+  multiplexed selectors. The ten Ethi-Latn romanizations, ro-ja and
+  ro_FONIPA-ja are implementable.
 - **More MultipleCaptureMultipleReplacement rules** (W3, §5): exact starts by
   the regular expression engine where sets of such rules overlap, string rules
   and such rules selected together, and captures of finitely many lengths
@@ -138,25 +132,26 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   - W3 variable-length texts: 7 transforms (Latn-Arab, blt-blt_FONIPA,
     Latin-NumericPinyin and Latn-Bopo through it, byn Xaleget, my-Zawgyi and
     Zawgyi-my);
-  - W6 revisits not composed (unbounded runs, variable-length texts): 23;
-  - W7 parser semantics: 4 in this run (2 with the local CLDR fixes);
-  - W5 back-references: none alone (fa-fa_FONIPA, sk-ja and sk_FONIPA-ja also
-    need W6).
+  - W6 revisits neither composed nor prefix runs: 13 (Khmr-Latn/UNGEGN,
+    Latn-Grek/UNGEGN, Latn-Hira, Latn-Kana, my-my_Latn, it-am, it-ja,
+    ja_Latn-ru, xh-xh_FONIPA and the four `xh-*` transforms through it);
+  - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
+    runs solved; fa-fa_FONIPA also needs W3 and W6);
+  - W8 built-ins: 1 (Thai-Latn, `Any-BreakInternal`);
+  - W7 parser semantics: none, with the local CLDR fixes.
 
   Each of these is concentrated in a few rule files (§5).
 
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          371  ███████████████████████████████████
-+ W6 revisit                 395  █████████████████████████████████████
-+ W3 variable-length text    414  ███████████████████████████████████████
-+ W7 parser semantics        418  ███████████████████████████████████████
+now                          386  ████████████████████████████████████
++ W6 revisit                 399  ██████████████████████████████████████
++ W3 variable-length text    418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
-+ W10 engine lookaheads      422  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
-+ W8 built-ins               424  ████████████████████████████████████████
-+ W9 analysis scale          425  ████████████████████████████████████████
++ W10 engine lookaheads      424  ████████████████████████████████████████
++ W8 built-ins               425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
 
@@ -296,7 +291,7 @@ The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
 `Hex-Any/Plain`, which ICU 78.3 does not have. `Hex-Any` is no longer an alias
 of `Hex-Any/Java`: as in ICU, it accepts every escape form.
 
-### 2.2 Transforms defined by rules (372 of 425)
+### 2.2 Transforms defined by rules (386 of 425)
 
 Implementable now:
 
@@ -318,8 +313,8 @@ Implementable now:
 - with variable-length texts: und_FONIPA-fa, -ar and -chr and the transforms to
   Persian, Arabic and Cherokee through them (about 50), InterIndic-Arabic and the
   nine Indic→Arabic transforms, ro, rm, chr and es_419 FONIPA, Latin-ASCII,
-  de-ASCII, hy-hy_Latn/BGN, Latn-Hebr, tr-Lower and az-Lower (and ug-Latin and
-  Latin-ug, with the local fixes of W7);
+  de-ASCII, hy-hy_Latn/BGN, Latn-Hebr, tr-Lower and az-Lower, and ug-Latin and
+  Latin-ug (with the local fixes of W7);
 - with MultipleCaptureMultipleReplacement rules: si-si_FONIPA, si-si_Latn,
   ta-ta_FONIPA, si-ar, si-fa, si-chr; with identity rules, vec-vec_FONIPA;
 - with insertion rules: ConjoiningJamo-Latin, Hang-Latn, Jamo-Latn,
@@ -329,6 +324,9 @@ Implementable now:
 - with function calls on captures: az-, el-, lt- and tr-Title,
   Latn-Ethi/ALALOC and Latn-Ethi/SERA;
 - with captures of before contexts copied: Kana-Latn, Hira-Latn and Jpan-Latn;
+- with prefix runs: Ethi-Latn and its romanizations Aethiopi, ALALOC,
+  Beta_Metsehaf and IES_JES_1964 (each also `_Geminate`) and Lambdin, ro-ja and
+  ro_FONIPA-ja;
 - with MultipleCaptureMultipleReplacement rules matched by exact starts, selected
   with string rules, or expanded: am_FONIPA-am and the `*-am` transforms through
   it, am-am_FONIPA, am-ar, am-chr, am-fa, NumericPinyin-Latin and Bopo-Latn.
@@ -340,7 +338,7 @@ The per-transform status is in the table.
 **CLDR test data.** Every test file in `common/testData/transforms` is mapped to
 its transform by alias, and those of implementable transforms are run:
 
-- 230 files, 240,668 cases;
+- 261 files, 263,287 cases;
 - all but two files pass entirely (§3).
 
 The failures are in §3.
@@ -427,6 +425,15 @@ texts of two characters, conversions in the same group) are identical to ICU's
 `createFromRules` on 5,000 random lines each. Hira-Latn was checked on a few
 lines only (through ICU it would use ICU's own Katakana-Latin), and Jpan-Latn
 was not run.
+
+**Prefix runs (W6, `71749b4e9`, `239c4cfe4`).** `QA/tconv_prefix_runs_test.py`
+(ctest `tconv_prefix_runs_test`) checks four rule sets against ICU's results:
+captured and literal prefixes, replacements of zero to three characters, a
+filter, and a run of 600 (longer than a block). Six transforms with prefix runs
+are identical to ICU 78.3 on 408 random texts each, and a 15 MB file gives the
+same output with 1 and 3 threads. The CLDR test files of the transforms made
+implementable (8 files, 16,536 cases) all pass. Of all the transforms, only the
+12 made implementable change status.
 
 **Unreferenced captures removed.** Removing the captures that the results
 never refer to (`9043a6b5b`) changes the plans of four transforms and the
@@ -920,13 +927,14 @@ compiling it):
   only the direct pipeline implements, is counted there, decoding and
   encoding included.
 
-In the run at `07794b04b`, the 371 implementable CLDR-defined transforms have
-a median of 227 kernels. The largest are am_FONIPA-am (2,605; its own groups have
-602 rules in 2,457 kernels) and the `*-am` transforms through it (up to 3,070,
-my-am).
-Other large groups are NumericPinyin-Latin (75 rules, 1,946 kernels) and
-Latin-ASCII (847 rules, 688 kernels). Over all the transforms, 319
-conversion groups have 69,373 rules.
+In the run at `239c4cfe4`, the 386 implementable CLDR-defined transforms have
+a median of 228 kernels. The largest are am_FONIPA-am (2,614; its own groups have
+602 rules in 2,465 kernels), the `*-am` transforms through it (up to 3,093,
+my-am) and Jpan-Latn (3,027). Other large groups are NumericPinyin-Latin (75
+rules, 2,206 kernels) and Latin-ASCII (847 rules, 650 kernels). Over all the
+transforms, 331 conversion groups have 74,326 rules. A group of prefix runs
+takes 5 kernels (ro_FONIPA-ja) to 12 (the Ethiopic romanizations, whose
+replacements have one to three characters).
 
 ## 5. What is not covered
 
@@ -936,19 +944,19 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 22 | 7 | M–L (the rest) |
-| W6 text to revisit, not composed | 40 | 24 | L (with W3) |
-| W5 back-references | 3 | 0 | M |
-| W7 parser semantics (#5, #6) | 4 | 4 | S |
+| W3 variable-length texts | 23 | 7 | M–L (the rest) |
+| W6 text to revisit, not composed | 28 | 13 | L (with W3) |
+| W5 back-references | 3 | 2 | M |
+| W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
-| W4 insertion rules (with string rules) | 1 | 0 | M |
+| W4 insertion rules (with string rules) | 2 | 0 | M |
 | W8 built-ins (Any-BreakInternal) | 1 | 1 | L |
-| W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 1 | 1 | L |
+| W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 0 | 0 | L |
 <!-- /coverage:work-items -->
 
-(W7 counts the run without the local CLDR fixes; with them, it blocks nothing,
-Latin-ug and ug-Latin are implementable, and the two Greek UNGEGN transforms
-need W3, W4 and W6.)
+(This run uses the local CLDR fixes of W7: W7 blocks nothing, Latin-ug and
+ug-Latin are implementable, and the two Greek UNGEGN transforms need W3, W4 and
+W6.)
 
 Done since the first assessment:
 
@@ -956,7 +964,8 @@ Done since the first assessment:
 - W2a single-character rules within string rules (`9119ae0d`);
 - W2b1 one-way string rule overlaps (`1ed0394e`);
 - W2c expanded non-final characters (`029371343`);
-- W6 revisits, where composition is finite (`eea89e00d`);
+- W6 revisits, where composition is finite (`eea89e00d`), and prefix runs
+  (`71749b4e9`, `239c4cfe4`);
 - W2b2 two-way, cyclic and self-overlapping string rules, by sequential
   selection (`c230d569a`);
 - W3 finite texts, runs and SingleCaptureDoubleReplacement rules (`379de8796`);
@@ -977,7 +986,7 @@ Done since the first assessment:
   Any-Remove (`335e35694`).
 
 W7 blocks nothing where the proposed CLDR fixes are applied locally (see W7
-below); this run did not apply them.
+below), as in this run.
 
 **W6 revisit** (`x } [^x] → | ks`, `t } [^hṭ̱] → $ta | $virama`). The text after
 `|` is processed again by the same group. Most such rules are now replaced at
@@ -1001,6 +1010,24 @@ extracted:
   `P S → A | S`, is rewritten as `P } S → A`, which leaves the same text with
   the cursor at the same place. This handles runs such as ja_Latn-ko's
   `kk → ᆺ | k` on `kkkk`, which no finite composition covers.
+- **Prefix runs** (`71749b4e9`, `239c4cfe4`). A rule `(P) S → A | $1` (or
+  `p S → A | p`), with S a set of one character, revisits its prefix, which
+  matches again: ICU turns each run P S…S into A…A P. Where no other rule of
+  the group can match within such runs, sees them in its contexts, or matches
+  the replacements (`prefixRunConflict` checks this), these rules are split
+  into a group of their own, before the rest (`:: Null ;` between them), and
+  applied by the `PrefixRuns` kernel: `laS = Lookahead(S, 1)`, the run
+  `MatchStar(Advance(P & laS), S) & S`, P's bits carried by `MatchStar` to the
+  last S, and A written at P and at the other S of the run. Replacements of one
+  character are written in place; otherwise the kernel gives a mask of the
+  positions of each A (multiplexed into ⌈log₂ k⌉ selector streams for k
+  replacements), the positions are spread by `InsertionSpreadMask`, the
+  `PrefixRunFill` kernel writes each A from the selectors, and the positions of
+  empty replacements are deleted. The Ethiopic gemination rules
+  (`([ሀ-ሇ…]) $ጥበቅ → $ሀ | $1`) and ro_FONIPA-ja's `t͡ → | t` (A empty: the tie
+  bars of a run are deleted) are prefix runs;
+  `tconv --revisit-report` lists every revisit rule with its outcome, and
+  `doc/ldml-revisit-classification.md` classifies them.
 - **ICU's cursor.** For a result with references to captures, ICU places the
   cursor after the last reference before `|`, or at the start of the result
   (§3.3). The composition follows ICU here: `([ሀ-ሇ]) $ጥበቅ → $ሀ | $1` revisits
@@ -1024,14 +1051,19 @@ blocked by other items:
   and two self-overlapping three-character rules; Latin-ConjoiningJamo is left
   with `eo`/`oe`. Both are now implementable by sequential selection.
 - **Not composed** (`tconv --plan` gives the reason):
-  - unbounded runs, where a rule revisits text that it matches again further
-    on: Khmr-Latn/UNGEGN's `ô្គ → k | ô`, it-am's `($consonant) ' → | $1`, the
-    Ethiopic gemination rules (`$ጥበቅ` repeated);
+  - unbounded runs that are not prefix runs, because S has two characters
+    (Khmr-Latn/UNGEGN's `ô្គ → k | ô`) or other rules interfere (it-am's
+    `($consonant) ' → | $1`, xh-xh_FONIPA, fa-fa_FONIPA's `یّ`, pl's after
+    contexts);
   - rules with variable-length texts that may apply to the text to revisit:
     Grek-Latn's `($lcgvowel+ $ddotmac?) $rough → h | $1`, am_Ethi-d0_Morse's
     `([:lo:]) ([:zs:]+) ([:lo:]) → | $1 ⁄⁂⁄ $2 $3`.
 
   Both are W3 cases.
+
+Prefix runs then made 12 more transforms implementable (the ten Ethi-Latn
+romanizations, ro-ja and ro_FONIPA-ja), and removed the W6 problems of sk-ja
+and sk_FONIPA-ja. W6 is now needed by 28 transforms, and alone blocks 13.
 
 **W3 variable-length texts.** Three mechanisms now cover most of it:
 
@@ -1221,8 +1253,7 @@ with strings, also W3 and W6), sk_FONIPA-ja and sk-ja (also W6).
 **W4 insertion rules** (§4.2) are implemented. They remain only in Grek-Latn and
 Grek-Latn/UNGEGN (`[Pp] { } [ΣςσϷϸϺϻ] → \'`), in groups with string rules, and
 with rules whose after contexts have repetitions, which the correction kernel
-does not match. Both transforms also need W3 and W6 (in this run, Grek-Latn/UNGEGN
-reports only its W7 parse problem).
+does not match. Both transforms also need W3 and W6.
 
 **W10 engine lookaheads.** cy-cy_FONIPA's after contexts `$cons* $end` repeat
 `$cons`, a set with strings (`{m̥}{d͡ʒ}`). ICU matches it possessively, taking
@@ -1237,9 +1268,11 @@ differs (`yw } $cons* [^bdm$]` on `ywm̥`). cy-cy_FONIPA also needs W3.
   which `5efe07bd2` rejects as a ruleset bug.
 - Latin-ug and ug-Latin have `[:separator:]*` matching the empty text.
 
-Both have proposed CLDR fixes, applied locally in `~/cldr`. This run used
-transforms without them (`~/transforms`), so these four transforms are reported
-as blocked by W7.
+Both have proposed CLDR fixes, applied locally in `~/cldr`, which this run
+uses: Latin-ug and ug-Latin are implementable, and the two Greek UNGEGN
+transforms report their W3, W4 and W6 problems. (The runs at `323305975` and
+`585ccdeba` used transforms without them, `~/transforms`, and counted these four
+transforms as blocked by W7.)
 
 **W8 and W9.** Thai-Latn now needs only `Any-BreakInternal`, which uses a
 dictionary word break (its Thai-ThaiLogical step is implemented). Jpan-Latn,
@@ -1261,13 +1294,14 @@ The per-transform table lists the problem classes of every transform.
      fixpoint (issue #21), exact for chains of any length.
 2. **W3 and W6.** Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
-   Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits not
-   composed (24 transforms, mostly unbounded runs, which the run rules of W3 now
-   make approachable).
+   Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
+   neither composed nor prefix runs (28 transforms, 13 blocked by W6 alone:
+   runs with a text S of two characters, as in Khmr-Latn/UNGEGN, and prefix
+   runs with interfering rules, as in it-am and xh-xh_FONIPA).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
-4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. Run
-   the coverage with them (`~/cldr`), as the earlier reports did.
+4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. With
+   them (`~/cldr`, as in this run), W7 blocks nothing.
 5. **W5 back-references.** The copy of a set with strings (fa-fa_FONIPA), with
    W6 in fa-fa_FONIPA, sk-ja and sk_FONIPA-ja; and the deferred rules exact for
    chains of any length (a fixpoint rather than rounds, with buffer bounds that
@@ -1334,6 +1368,11 @@ tconv on every implementable transform.
 | `03e837f5f` | string rules and MultipleCaptureMultipleReplacement rules selected together: am_FONIPA-am and 18 `*-am` |
 | `323305975` | captures of finitely many lengths expanded: am-am_FONIPA, am-ar, am-chr, am-fa: 372 |
 | `07794b04b`, `585ccdeba` | `tconv --kernel-counts`; kernel columns in the per-transform table: 371 on 15 GB (Jpan-Latn's analysis exceeds the memory) |
+| `0684aaa5b`, `308aad759` | deferred rules' positions inserted once; large mappings planned without quadratic set unions: Jpan-Latn compiles, 374 with the local W7 fixes (`9cebbc6aa`) |
+| `b77584f46` | `tconv --revisit-report`; classification of the CLDR revisit rules (`doc/ldml-revisit-classification.md`) |
+| `71749b4e9` | W6 prefix runs, `(P) S → A \| $1`, applied by a kernel of their own |
+| `fa7352b10` | JIT compile threads with 8 MB stacks: am_Ethi-am_Ethi/Geminate no longer crashes in its first compilation |
+| `239c4cfe4` | prefix runs with replacements of other than one character, by mask, insertion and fill: the Ethi-Latn romanizations, ro-ja, ro_FONIPA-ja: 386 |
 
 ## Reproducing
 
@@ -1364,8 +1403,10 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
   the per-transform table. With `--update`, the kernels of the transforms
   planned again are counted again, with those of all the transforms using
   them, directly or not; `--no-kernel-counts` keeps the previous counts.
-- The run at `89e922e4f` used `--transforms-dir ~/transforms`, without the local
-  W7 fixes; use a checkout with them to count Latin-ug and ug-Latin.
+- The runs at `89e922e4f` to `585ccdeba` used `--transforms-dir ~/transforms`,
+  without the local W7 fixes; the run at `239c4cfe4` used `~/cldr`, with them
+  (`--transforms-dir ~/cldr/common/transforms --test-data
+  ~/cldr/common/testData/transforms --jobs 3`, about two hours on 15 GB).
 - **Incremental updates.** After a change to tconv, update the results instead of
   a full run: `--update` keeps the previous results in `--out` and plans (and
   tests) only the selected transforms (`--only NAME …`, `--builtins`,
@@ -1382,10 +1423,10 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
 
   ```
   python3 tools/ldml/tconv_coverage.py --tconv build18/bin/tconv \
-      --transforms-dir ~/transforms --test-data ~/testData/transforms \
+      --transforms-dir ~/cldr/common/transforms --test-data ~/cldr/common/testData/transforms \
       --out tools/ldml/tconv-coverage --update --only Any-FCD Any-FCC \
       --table-doc doc/ldml-tconv-coverage-table.md --report-doc doc/ldml-tconv-coverage.md \
-      --note '…' --cldr-note 'without the local fixes of W7'
+      --note '…' --cldr-note 'with the local fixes of W7'
   ```
 
   `tools/ldml/tconv-coverage/` is ignored by git (`tools/ldml/.gitignore`).

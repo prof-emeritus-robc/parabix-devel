@@ -34,6 +34,7 @@
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
 #include <llvm/Support/SmallVectorMemoryBuffer.h>
+#include <llvm/Support/thread.h>
 #include <queue>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
@@ -623,7 +624,7 @@ public:
 
         for (size_t i = 0; i < strategy.ThreadsRequested; ++i) {
             CPUDriverContext & ctx = *(Contexts[i]);
-            Threads.emplace_back([this, &ctx]() {
+            Threads.emplace_back(std::optional<unsigned>(CompileThreadStackSize), [this, &ctx]() {
                 // NOTE: the ThreadSafeSlabAllocator itself is not passed into any class but is used invisibly
                 // behind the scenes. Do not remove this!
 
@@ -1236,7 +1237,11 @@ private:
 
     std::mutex                                      PrecompiledStateObjectMutex;
 
-    std::vector<std::thread>                        Threads;
+    //  The worker threads, with stacks of their own size: LLVM's analyses recurse
+    //  deeply on large kernels (ScalarEvolution, in the loop passes, overflows
+    //  the 512 KB of a std::thread on macOS for am_Ethi-am_Ethi/Geminate).
+    static constexpr unsigned                       CompileThreadStackSize = 8u << 20;
+    std::vector<llvm::thread>                       Threads;
 
     std::mutex                                      DebugPrintMutex;
     SmallVector<DebugPrintingResult, 0>             DebugPrintResults;

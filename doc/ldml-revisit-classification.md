@@ -320,9 +320,12 @@ same CLDR rule text): 408 random texts each, rich in runs, including runs of
 marks, with 1 and 3 threads. The CLDR test data of these transforms (which
 have no runs) passes. `QA/tconv_prefix_runs_test.py` (`make check`) covers a
 captured P with A of two characters, a literal P with an empty A, and A of one
-character, against ICU's results. (The 4 `_Geminate` variants are now
-implementable, but their first step, am_Ethi-am_Ethi/Geminate, crashes on any
-input, as it did before this change.)
+character, against ICU's results. The CLDR test data of the 4 `_Geminate`
+variants (6,888 cases each) passes: their first step, am_Ethi-am_Ethi/Geminate,
+inserts the gemination marks that the prefix runs then apply to. (It crashed on
+macOS until the JIT compile threads were given 8 MB stacks: LLVM's
+ScalarEvolution overflowed the 512 KB stack of a std::thread compiling its
+7,718 string rules.)
 
 # Part 2. Rules not yet implemented (261 rules)
 

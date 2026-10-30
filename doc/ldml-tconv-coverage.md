@@ -31,7 +31,9 @@ local fixes. The generated tables and blocks of this report are marked
 in families (`247f3112e`), and the triggers that produce their P (`03c89572a`), planned
 again by an incremental update (`--update --only Khmr-Latn/UNGEGN`; the
 families changed the plan of no transform): Khmr-Latn/UNGEGN is
-implementable (387).*
+implementable (387). Then prefix runs with A empty that the split does not
+allow, as run rules (`96ff91dd7`, `--update --only xh-xh_FONIPA`): xh-xh_FONIPA and the
+four `xh-*` transforms through it are implementable (392).*
 
 This report covers:
 
@@ -52,8 +54,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 387 (91%) |
-| …of which public (not `visibility="internal"`) | 393 | 356 (91%) |
+| Transforms defined by CLDR files (380 files) | 425 | 392 (92%) |
+| …of which public (not `visibility="internal"`) | 393 | 361 (92%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -77,6 +79,10 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   in a run), and the rules that produce P, as Khmer's `ក → k | â`, are
   applied first, in a group of their own, except where a covering rule
   (`្ក → kâ`) consumes their character: Khmr-Latn/UNGEGN is implementable.
+  Where the split is not allowed, a prefix run with A empty becomes run rules
+  if the other rules match P only as single characters: xh-xh_FONIPA's
+  `rh → | r` (kept from the split by `gr → ɣ`) is `r h+ → r`, and the five xh
+  transforms are implementable.
 - **More MultipleCaptureMultipleReplacement rules** (W3, §5): exact starts by
   the regular expression engine where sets of such rules overlap, string rules
   and such rules selected together, and captures of finitely many lengths
@@ -142,9 +148,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   - W3 variable-length texts: 7 transforms (Latn-Arab, blt-blt_FONIPA,
     Latin-NumericPinyin and Latn-Bopo through it, byn Xaleget, my-Zawgyi and
     Zawgyi-my);
-  - W6 revisits neither composed nor prefix runs: 12 (Latn-Grek/UNGEGN,
-    Latn-Hira, Latn-Kana, my-my_Latn, it-am, it-ja,
-    ja_Latn-ru, xh-xh_FONIPA and the four `xh-*` transforms through it);
+  - W6 revisits neither composed nor prefix runs: 7 (Latn-Grek/UNGEGN,
+    Latn-Hira, Latn-Kana, my-my_Latn, it-am, it-ja and ja_Latn-ru);
   - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
     runs solved; fa-fa_FONIPA also needs W3 and W6);
   - W8 built-ins: 1 (Thai-Latn, `Any-BreakInternal`);
@@ -155,9 +160,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          387  ████████████████████████████████████
-+ W6 revisit                 399  ██████████████████████████████████████
-+ W3 variable-length text    418  ███████████████████████████████████████
+now                          392  █████████████████████████████████████
++ W3 variable-length text    399  ██████████████████████████████████████
++ W6 revisit                 418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
 + W10 engine lookaheads      424  ████████████████████████████████████████
@@ -301,7 +306,7 @@ The registry (`lib/ldml/transform_registry.cpp`) lists `Any-Hex/Plain` and
 `Hex-Any/Plain`, which ICU 78.3 does not have. `Hex-Any` is no longer an alias
 of `Hex-Any/Java`: as in ICU, it accepts every escape form.
 
-### 2.2 Transforms defined by rules (387 of 425)
+### 2.2 Transforms defined by rules (392 of 425)
 
 Implementable now:
 
@@ -336,7 +341,8 @@ Implementable now:
 - with captures of before contexts copied: Kana-Latn, Hira-Latn and Jpan-Latn;
 - with prefix runs: Ethi-Latn and its romanizations Aethiopi, ALALOC,
   Beta_Metsehaf and IES_JES_1964 (each also `_Geminate`) and Lambdin, ro-ja and
-  ro_FONIPA-ja, and with their triggers, Khmr-Latn/UNGEGN;
+  ro_FONIPA-ja, and with their triggers, Khmr-Latn/UNGEGN; as run rules,
+  xh-xh_FONIPA, xh-am, xh-ar, xh-chr and xh-fa;
 - with MultipleCaptureMultipleReplacement rules matched by exact starts, selected
   with string rules, or expanded: am_FONIPA-am and the `*-am` transforms through
   it, am-am_FONIPA, am-ar, am-chr, am-fa, NumericPinyin-Latin and Bopo-Latn.
@@ -955,7 +961,7 @@ those of invoked transforms).
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
 | W3 variable-length texts | 23 | 7 | M–L (the rest) |
-| W6 text to revisit, not composed | 27 | 12 | L (with W3) |
+| W6 text to revisit, not composed | 22 | 7 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1062,7 +1068,7 @@ blocked by other items:
   with `eo`/`oe`. Both are now implementable by sequential selection.
 - **Not composed** (`tconv --plan` gives the reason):
   - unbounded runs that are not prefix runs, because other rules interfere
-    (it-am's `($consonant) ' → | $1`, xh-xh_FONIPA, fa-fa_FONIPA's `یّ`,
+    (it-am's `($consonant) ' → | $1`, fa-fa_FONIPA's `یّ`,
     pl's after contexts, ja_Latn-ru's `\~ } tsu → ;`) or P has two
     characters (ja_Latn-ru's `tsu\~ → | ts`);
   - rules with variable-length texts that may apply to the text to revisit:
@@ -1075,8 +1081,9 @@ Prefix runs then made 12 more transforms implementable (the ten Ethi-Latn
 romanizations, ro-ja and ro_FONIPA-ja), and removed the W6 problems of sk-ja
 and sk_FONIPA-ja. Prefix runs of several characters, with their triggers
 (`ក → k | â`, applied first except where `្ក → kâ` consumes the consonant),
-made Khmr-Latn/UNGEGN implementable. W6 is now needed by 27 transforms, and
-alone blocks 12.
+made Khmr-Latn/UNGEGN implementable, and run rules for prefix runs with A
+empty (`rh → | r` as `r h+ → r`) the five xh transforms. W6 is now needed by
+22 transforms, and alone blocks 7.
 
 **W3 variable-length texts.** Three mechanisms now cover most of it:
 
@@ -1308,8 +1315,8 @@ The per-transform table lists the problem classes of every transform.
 2. **W3 and W6.** Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
-   neither composed nor prefix runs (27 transforms, 12 blocked by W6 alone:
-   mostly prefix runs with interfering rules, as in it-am and xh-xh_FONIPA).
+   neither composed nor prefix runs (22 transforms, 7 blocked by W6 alone:
+   prefix runs with interfering rules, as in it-am, and other runs).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. With
@@ -1387,6 +1394,7 @@ tconv on every implementable transform.
 | `239c4cfe4` | prefix runs with replacements of other than one character, by mask, insertion and fill: the Ethi-Latn romanizations, ro-ja, ro_FONIPA-ja: 386 |
 | `247f3112e` | prefix runs with texts S of several characters, in families |
 | `03c89572a` | triggers of prefix runs (`ក → k \| â`), applied first: Khmr-Latn/UNGEGN: 387 |
+| `96ff91dd7` | prefix runs with A empty as run rules (`rh → \| r` as `r h+ → r`): the five xh transforms: 392 |
 
 ## Reproducing
 

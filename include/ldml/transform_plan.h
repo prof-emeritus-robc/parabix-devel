@@ -341,6 +341,13 @@ struct TransformStep {
     // the same E, M, A and Y; X the union of theirs), and their rules.
     ChainRevisit chainRevisit;
     std::vector<const ConversionRule *> chainRevisitRules;
+    // The mark run edits (see ComposeRevisits), in a group of their own, in
+    // order, their rules, and the items of the rules kept before them, which
+    // apply instead where they match.
+    std::vector<MarkRunEdit> markRunEdits;
+    std::vector<const ConversionRule *> markRunEditRules;
+    std::vector<std::vector<UCD::UnicodeSet>> markRunKept;
+    std::vector<unsigned> markRunKeptBefore;    // the edits before each kept rule
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

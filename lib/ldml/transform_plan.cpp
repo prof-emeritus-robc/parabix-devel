@@ -1266,6 +1266,30 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
         }
         start = end + 1;
     }
+    //  The mark run edits (see ComposeRevisits) of the groups of mark run edits
+    //  and rules kept before them alone.
+    std::set<const Rule *> markRuns;
+    for (size_t start = 0; start < rules.size(); ) {
+        size_t end = start;
+        bool all = true;
+        std::vector<MarkRunEdit> edits;
+        while (end < rules.size() && !isa<TransformRule>(rules[end])) {
+            if (const ConversionRule * c = dyn_cast<ConversionRule>(rules[end])) {
+                MarkRunEdit e;
+                std::vector<UCD::UnicodeSet> items;
+                if (markRunEdit(c, e)) {
+                    edits.push_back(e);
+                } else {
+                    all &= keptText(c, items);
+                }
+            }
+            ++end;
+        }
+        for (size_t k = start; k < end && all && !edits.empty(); ++k) {
+            if (isa<ConversionRule>(rules[k])) markRuns.insert(rules[k]);
+        }
+        start = end + 1;
+    }
     size_t groupIndex = 0;
     for (Rule * r : rules) {
         if (FilterRule * f = dyn_cast<FilterRule>(r)) {
@@ -1294,6 +1318,35 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
                 }
                 group->prefixRuns.push_back(run);
                 group->prefixRunRules.push_back(c);
+                continue;
+            }
+            //  A mark run edit (see ComposeRevisits), or a rule kept before them,
+            //  in a group of mark run edits.
+            if (markRuns.count(c)) {
+                if (group == nullptr) {
+                    TransformStep step;
+                    step.kind = TransformStep::Kind::Conversion;
+                    plan.steps.push_back(std::move(step));
+                    group = &plan.steps.back();
+                }
+                MarkRunEdit e;
+                std::vector<UCD::UnicodeSet> items;
+                //  Within the filter (ICU's text matches no other character).
+                auto within = [&](UCD::UnicodeSet & set) {
+                    if (plan.filter) set = set & plan.filterSet;
+                };
+                if (markRunEdit(c, e)) {
+                    for (UCD::UnicodeSet & p : e.prefix) within(p);
+                    within(e.run);
+                    within(e.firstRun);
+                    for (UCD::UnicodeSet & t : e.suffix) within(t);
+                    group->markRunEdits.push_back(e);
+                    group->markRunEditRules.push_back(c);
+                } else if (keptText(c, items)) {
+                    for (UCD::UnicodeSet & i : items) within(i);
+                    group->markRunKept.push_back(items);
+                    group->markRunKeptBefore.push_back(static_cast<unsigned>(group->markRunEdits.size()));
+                }
                 continue;
             }
             //  A chain revisit (see ComposeRevisits), in a group of chain revisits.

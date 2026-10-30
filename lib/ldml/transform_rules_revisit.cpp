@@ -434,6 +434,10 @@ private:
     bool chainRevisitSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
                            std::vector<bool> & isChain, ChainRevisit & chain, std::string & reason);
     bool chainUnseen(const ConversionRule * r, const ChainRevisit & chain, const UCD::UnicodeSet & first, std::string & reason);
+    bool markRunSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
+                      std::vector<bool> & isEdit, std::vector<bool> & isKept, std::string & reason);
+    bool markRunUnseen(const ConversionRule * r, const MarkRunEdit & e, std::string & reason);
+    bool keptCandidate(const ConversionRule * r);
     CharSetAnalysis mSets;
     RevisitStats * mStats;
     RevisitRecord * mRecord = nullptr;
@@ -1630,6 +1634,225 @@ bool Composer::chainRevisitSplit(const std::vector<Rule *> & group, const UCD::U
     return true;
 }
 
+//  A rule that the mark run edits keep before them (see markRunSplit): its
+//  text and after context sequences of sets, without a before context.
+bool Composer::keptCandidate(const ConversionRule * r) {
+    const RuleSide * source = r->getSourceSide(Direction::Forward);
+    if (source->hasBeforeContext()) return false;
+    std::vector<Item> items;
+    if (!collectItems(source->getText(), items) || items.empty()) return false;
+    if (source->hasAfterContext() && !collectItems(source->getAfterContext(), items)) return false;
+    for (const Item & item : items) {
+        if (item.star || item.optional || item.boundary || item.chars.empty()) return false;
+    }
+    return true;
+}
+
+//  Whether a rule of a group cannot see the difference made by applying a
+//  mark run edit e (P R* T → C, the run revisited) before the group, where
+//  it matches from a position before P (matched possessively, as in
+//  chainUnseen): its text may not match P (ICU would not reach P), and its
+//  after context, over P, must treat the characters of P and C alike (C
+//  as long as the part of P it sees), and may not reach T (deleted).
+bool Composer::markRunUnseen(const ConversionRule * r, const MarkRunEdit & e, std::string & reason) {
+    const RuleSide * source = r->getSourceSide(Direction::Forward);
+    std::vector<Item> items;
+    if (!collectItems(source->getText(), items)) {
+        reason = "the text of " + printRule(r) + " is not a sequence of sets";
+        return false;
+    }
+    const size_t textItems = items.size();
+    if (source->hasAfterContext() && !collectItems(source->getAfterContext(), items)) {
+        reason = "the after context of " + printRule(r) + " is not a sequence of sets";
+        return false;
+    }
+    //  The pattern: P, R (if R+), R*, T.
+    struct Element {
+        UCD::UnicodeSet chars;
+        bool star;
+        int prefix;             // its position in P, or -1
+        bool suffix;
+    };
+    std::vector<Element> pattern;
+    for (size_t j = 0; j < e.prefix.size(); ++j) pattern.push_back(Element{e.prefix[j], false, static_cast<int>(j), false});
+    if (e.nonEmpty) pattern.push_back(Element{e.run, false, -1, false});
+    pattern.push_back(Element{e.run, true, -1, false});
+    for (const UCD::UnicodeSet & t : e.suffix) pattern.push_back(Element{t, false, -1, true});
+    struct State {
+        size_t item;
+        size_t at;
+        UCD::UnicodeSet excluded;
+        bool fromText;
+    };
+    std::vector<State> pending, seen;
+    auto push = [&](State st) {
+        while (true) {
+            //  The run may end (T, after it, has no character of R).
+            if (st.at < pattern.size() && pattern[st.at].star) {
+                State past = st;
+                past.at++;
+                bool known = false;
+                for (const State & o : seen) known |= o.item == past.item && o.at == past.at && o.excluded == past.excluded && o.fromText == past.fromText;
+                if (!known) {
+                    seen.push_back(past);
+                    pending.push_back(past);
+                }
+            }
+            for (const State & o : seen) {
+                if (o.item == st.item && o.at == st.at && o.excluded == st.excluded && o.fromText == st.fromText) return;
+            }
+            seen.push_back(st);
+            pending.push_back(st);
+            if (st.item < items.size() && (items[st.item].optional || items[st.item].star)) {
+                st.excluded = st.excluded + items[st.item].chars;
+                st.item++;
+            } else {
+                return;
+            }
+        }
+    };
+    auto next = [&](size_t i) {return items[i].star ? i : i + 1;};
+    for (size_t i = 0; i < items.size(); ++i) {
+        //  From the second character of the text (or within a repetition), or
+        //  in the after context (from its first, for an insertion).
+        if (!((i > 0 || items[i].star || i >= textItems) && items[i].chars.intersects(e.prefix.front()))) continue;
+        push(State{i, 0, UCD::UnicodeSet(), i < textItems});
+    }
+    while (!pending.empty()) {
+        const State st = pending.back();
+        pending.pop_back();
+        if (st.fromText && (st.item >= textItems || st.at == pattern.size())) {
+            reason = printRule(r) + " may match the text of a mark run edit after the first character of its text";
+            return false;
+        }
+        if (st.item >= items.size() || st.at == pattern.size()) continue;
+        const Item & item = items[st.item];
+        const Element & el = pattern[st.at];
+        const UCD::UnicodeSet chars = (el.chars - st.excluded) & item.chars;
+        if (el.suffix && !chars.empty()) {
+            reason = printRule(r) + " may see the text deleted by a mark run edit";
+            return false;
+        }
+        if (el.prefix >= 0 && !st.fromText) {
+            //  ICU sees P, the rest of the group C there.
+            const size_t j = static_cast<size_t>(el.prefix);
+            const UCD::UnicodeSet p = el.chars - st.excluded;
+            if (p.empty()) continue;
+            const bool pIn = p.intersects(item.chars);
+            if (!pIn && (j >= e.replacement.size() || !item.chars.contains(e.replacement[j]))) continue;
+            if (j >= e.replacement.size() || !p.subset(item.chars) || !item.chars.contains(e.replacement[j])
+                    || st.excluded.contains(e.replacement[j])) {
+                reason = printRule(r) + " may see the text replaced by a mark run edit";
+                return false;
+            }
+        }
+        if (!chars.empty()) push(State{next(st.item), el.star ? st.at : st.at + 1, UCD::UnicodeSet(), st.fromText});
+    }
+    return true;
+}
+
+//  The mark run edits of a group (see ComposeRevisits; isEdit), if they may
+//  be applied before the rest of the group, in a group of their own:
+//    - within the filter;
+//    - each rule before a mark run edit that may begin at its P either
+//      cannot match where it does, or is kept before the edits (a text and
+//      after context of sets, no before context; isKept);
+//    - no other rule can see the difference (markRunUnseen), nor match a
+//      character of C (which ICU does not revisit).
+//  The edits that do not pass are left in the group (and are then among the
+//  other rules for those that do).
+bool Composer::markRunSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
+                            std::vector<bool> & isEdit, std::vector<bool> & isKept, std::string & reason) {
+    isEdit.assign(group.size(), false);
+    isKept.assign(group.size(), false);
+    std::vector<MarkRunEdit> edits;
+    std::vector<size_t> at;
+    for (size_t k = 0; k < group.size(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+        MarkRunEdit e;
+        if (c == nullptr || !hasRevisit(c) || !markRunEdit(c, e)) continue;
+        if (filter) {
+            for (UCD::UnicodeSet & p : e.prefix) p = p & *filter;
+            e.run = e.run & *filter;
+            e.firstRun = e.firstRun & *filter;
+            for (UCD::UnicodeSet & t : e.suffix) t = t & *filter;
+            bool empty = false;
+            for (const UCD::UnicodeSet & p : e.prefix) empty |= p.empty();
+            for (const UCD::UnicodeSet & t : e.suffix) empty |= t.empty();
+            if (empty) {
+                reason = "a mark run edit outside the filter";
+                return false;
+            }
+        }
+        edits.push_back(e);
+        at.push_back(k);
+        isEdit[k] = true;
+    }
+    //  Each edit against the other rules (and the edits left), until those
+    //  left pass.
+    auto passes = [&](size_t n) {
+        for (size_t k = 0; k < group.size(); ++k) {
+            const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+            if (c == nullptr || isEdit[k]) continue;
+            const RuleSide * source = c->getSourceSide(Direction::Forward);
+            std::vector<Item> text;
+            if (!collectItems(source->getText(), text)) {
+                reason = "the text of " + printRule(c) + " is not a sequence of sets";
+                return false;
+            }
+            for (const Item & item : text) {
+                for (char32_t ch : edits[n].replacement) {
+                    if (item.chars.contains(ch)) {
+                        reason = printRule(c) + " may match a character that a mark run edit leaves";
+                        return false;
+                    }
+                }
+            }
+            if (k < at[n]) {
+                //  Before the edit: may it apply at its P instead?
+                UCD::UnicodeSet first;
+                bool nullable = false;
+                if (!firstChars(source->getText(), first, nullable)
+                        || (nullable && (!source->hasAfterContext() || !firstChars(source->getAfterContext(), first, nullable)))) {
+                    reason = "the first characters of " + printRule(c) + " are not known";
+                    return false;
+                }
+                if (first.intersects(edits[n].prefix.front()) && !keptCandidate(c)) {
+                    reason = printRule(c) + " may apply at the text of a mark run edit before it";
+                    return false;
+                }
+            }
+            if (!markRunUnseen(c, edits[n], reason)) return false;
+        }
+        return true;
+    };
+    for (size_t n = 0; n < edits.size(); ) {
+        if (passes(n)) {
+            ++n;
+            continue;
+        }
+        isEdit[at[n]] = false;
+        edits.erase(edits.begin() + n);
+        at.erase(at.begin() + n);
+        n = 0;
+    }
+    if (edits.empty()) return false;
+    //  The rules kept before the edits.
+    for (size_t k = 0; k < group.size(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+        if (c == nullptr || isEdit[k]) continue;
+        for (size_t n = 0; n < edits.size(); ++n) {
+            UCD::UnicodeSet first;
+            bool nullable = false;
+            const RuleSide * source = c->getSourceSide(Direction::Forward);
+            firstChars(source->getText(), first, nullable);
+            if (nullable && source->hasAfterContext()) firstChars(source->getAfterContext(), first, nullable);
+            if (k < at[n] && first.intersects(edits[n].prefix.front())) isKept[k] = true;
+        }
+    }
+    return true;
+}
+
 std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
     std::vector<Rule *> out;
     //  The global filter (contexts see the characters outside it).
@@ -1682,7 +1905,9 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
         std::vector<bool> isChain;
         ChainRevisit chain;
         std::string chainReason;
+        bool split = false;
         if (chainRevisitSplit(rewritten, filter ? &*filter : nullptr, isChain, chain, chainReason)) {
+            split = true;
             std::vector<Rule *> rest;
             for (size_t k = 0; k < rewritten.size(); ++k) {
                 if (!isChain[k]) {
@@ -1711,6 +1936,44 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                         mStats->records.push_back(RevisitRecord{c, RevisitRecord::Outcome::ChainRevisit});
                         mStats->records.back().composedRules = 1;
                         mStats->records.back().composed.push_back(r);
+                    }
+                }
+            }
+            out.push_back(makeTransformRule(TransformID("Null")));
+            rewritten = std::move(rest);
+        }
+        //  The mark run edits, in a group of their own before (see
+        //  markRunSplit), after the rules kept there (leaving their text).
+        std::vector<bool> isEdit, isKept;
+        std::string editReason;
+        if (!split && markRunSplit(rewritten, filter ? &*filter : nullptr, isEdit, isKept, editReason)) {
+            std::vector<Rule *> rest;
+            for (size_t k = 0; k < rewritten.size(); ++k) {
+                ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
+                if (isKept[k]) {
+                    const RuleSide * source = c->getSourceSide(Direction::Forward);
+                    std::vector<Item> text, after;
+                    collectItems(source->getText(), text);
+                    if (source->hasAfterContext()) collectItems(source->getAfterContext(), after);
+                    std::vector<RE *> t, a;
+                    for (const Item & item : text) t.push_back(makeCC(item.chars));
+                    for (const Item & item : after) a.push_back(makeCC(item.chars));
+                    Capture * const capture = makeCapture("kept", makeSeq(t.begin(), t.end()));
+                    out.push_back(makeConversionRule(makeRuleSide(nullptr, capture, a.empty() ? nullptr : makeSeq(a.begin(), a.end())),
+                                                     Direction::Forward, makeRuleSide(makeReference("kept", capture, 0))));
+                }
+                if (!isEdit[k]) {
+                    rest.push_back(rewritten[k]);
+                    continue;
+                }
+                out.push_back(c);
+                if (mStats) {
+                    mStats->candidates++;
+                    mStats->markRunEdits++;
+                    if (mStats->keepRecords) {
+                        mStats->records.push_back(RevisitRecord{c, RevisitRecord::Outcome::MarkRunEdit});
+                        mStats->records.back().composedRules = 1;
+                        mStats->records.back().composed.push_back(c);
                     }
                 }
             }
@@ -1984,6 +2247,153 @@ bool chainRevisit(const ConversionRule * c, ChainRevisit & ch) {
     }
     if (!ch.star.contains(ch.replacement) || ch.star.intersects(ch.last) || ch.first.contains(ch.replacement)) return false;
     return !ch.first.intersects(ch.last) || fixedInStar;
+}
+
+//  The sets of a sequence of sets (through variables and captures).
+static bool plainItems(RE * re, CharSetAnalysis & sets, std::vector<UCD::UnicodeSet> & items) {
+    if (CharSetAnalysis::isSet(re)) {
+        if (hasStrings(re) || hasBoundary(re)) return false;
+        items.push_back(sets.setOf(re, false));
+        return !items.back().empty();
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) {
+            if (!plainItems(e, sets, items)) return false;
+        }
+        return true;
+    } else if (Alt * alt = dyn_cast<Alt>(re); alt && alt->size() == 1) {
+        return plainItems(alt->front(), sets, items);
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        return plainItems(c->getCapturedRE(), sets, items);
+    } else if (Name * name = dyn_cast<Name>(re)) {
+        return !isFunctionCall(name) && name->getDefinition() && plainItems(name->getDefinition(), sets, items);
+    }
+    return false;
+}
+
+bool markRunEdit(const ConversionRule * c, MarkRunEdit & e) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    if (!result->hasCursor() || result->getCursorOffset() != 0 || result->getResultToRevisit() == nullptr) return false;
+    e.replacement.clear();
+    if (!resultString(result->getCompletedResult(), {}, e.replacement)) return false;
+    std::vector<RE *> text, revisit, captured;
+    textAtoms(source->getText(), text);
+    textAtoms(result->getResultToRevisit(), revisit);
+    if (revisit.size() != 1) return false;
+    const Reference * ref = dyn_cast<Reference>(revisit[0]);
+    if (ref == nullptr) return false;
+    size_t k = 0;
+    while (k < text.size() && !isa<Capture>(text[k])) ++k;
+    if (k == 0 || k + 1 >= text.size()) return false;
+    const Capture * cap = cast<Capture>(text[k]);
+    if (cap->getName() != ref->getName()) return false;
+    CharSetAnalysis sets;
+    e.prefix.clear();
+    e.suffix.clear();
+    for (size_t j = 0; j < k; ++j) {
+        if (!plainItems(text[j], sets, e.prefix)) return false;
+    }
+    for (size_t j = k + 1; j < text.size(); ++j) {
+        if (isa<Capture>(text[j]) || !plainItems(text[j], sets, e.suffix)) return false;
+    }
+    textAtoms(cap->getCapturedRE(), captured);
+    if (captured.size() != 1 && captured.size() != 2) return false;
+    const Rep * rep = dyn_cast<Rep>(captured.back());
+    if (rep == nullptr || rep->getLB() > (captured.size() == 1 ? 1 : 0) || rep->getUB() != Rep::UNBOUNDED_REP) return false;
+    std::vector<UCD::UnicodeSet> run, firstRun;
+    if (!plainItems(rep->getRE(), sets, run) || run.size() != 1) return false;
+    e.run = run[0];
+    e.nonEmpty = rep->getLB() == 1 || captured.size() == 2;
+    e.firstRun = e.run;
+    if (captured.size() == 2) {
+        //  F R*, as the rules are made exclusive (F within R).
+        if (!plainItems(captured[0], sets, firstRun) || firstRun.size() != 1 || !firstRun[0].subset(e.run)) return false;
+        e.firstRun = firstRun[0];
+    }
+    if (e.replacement.size() > e.prefix.size()) return false;
+    if (e.prefix.front().intersects(e.run) || e.suffix.front().intersects(e.run)) return false;
+    for (size_t j = 1; j < e.prefix.size(); ++j) {
+        if (!e.prefix[j].subset(e.run)) return false;
+    }
+    for (const UCD::UnicodeSet & t : e.suffix) {
+        if (e.prefix.front().intersects(t)) return false;
+    }
+    return true;
+}
+
+bool keptText(const ConversionRule * c, std::vector<UCD::UnicodeSet> & items) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || result->hasCursor()) return false;
+    std::vector<RE *> text, res;
+    textAtoms(source->getText(), text);
+    textAtoms(result->getText(), res);
+    if (text.size() != 1 || res.size() != 1) return false;
+    const Capture * cap = dyn_cast<Capture>(text[0]);
+    const Reference * ref = dyn_cast<Reference>(res[0]);
+    if (cap == nullptr || ref == nullptr || ref->getName() != cap->getName()) return false;
+    CharSetAnalysis sets;
+    items.clear();
+    if (!plainItems(cap->getCapturedRE(), sets, items)) return false;
+    return !source->hasAfterContext() || plainItems(source->getAfterContext(), sets, items);
+}
+
+MarkRunGroups SetAsideMarkRunGroups(std::vector<Rule *> & rules) {
+    MarkRunGroups groups;
+    std::vector<Rule *> out;
+    size_t transforms = 0;
+    for (size_t start = 0; start < rules.size(); ) {
+        if (!isa<ConversionRule>(rules[start])) {
+            if (isa<TransformRule>(rules[start])) transforms++;
+            out.push_back(rules[start++]);
+            continue;
+        }
+        size_t end = start;
+        bool all = true, edit = false;
+        for (; end < rules.size() && isa<ConversionRule>(rules[end]); ++end) {
+            const ConversionRule * c = cast<ConversionRule>(rules[end]);
+            MarkRunEdit e;
+            std::vector<UCD::UnicodeSet> items;
+            if (markRunEdit(c, e)) {
+                edit = true;
+            } else {
+                all &= keptText(c, items);
+            }
+        }
+        if (all && edit) {
+            groups.emplace_back(transforms, std::vector<Rule *>(rules.begin() + start, rules.begin() + end));
+        } else {
+            out.insert(out.end(), rules.begin() + start, rules.begin() + end);
+        }
+        start = end;
+    }
+    rules = std::move(out);
+    return groups;
+}
+
+void RestoreMarkRunGroups(std::vector<Rule *> & rules, const MarkRunGroups & groups) {
+    std::vector<Rule *> out;
+    size_t transforms = 0, g = 0;
+    auto insert = [&]() {
+        while (g < groups.size() && groups[g].first == transforms) {
+            out.insert(out.end(), groups[g].second.begin(), groups[g].second.end());
+            g++;
+        }
+    };
+    size_t k = 0;
+    //  Before the first transform rule: after the filter rules.
+    for (; k < rules.size() && isa<FilterRule>(rules[k]); ++k) out.push_back(rules[k]);
+    insert();
+    for (; k < rules.size(); ++k) {
+        out.push_back(rules[k]);
+        if (isa<TransformRule>(rules[k])) {
+            transforms++;
+            insert();
+        }
+    }
+    insert();
+    rules = std::move(out);
 }
 
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats) {

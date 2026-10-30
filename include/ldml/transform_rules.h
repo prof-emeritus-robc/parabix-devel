@@ -836,6 +836,16 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  replace each character of X that follows E M1 ... Mk [A X]* (see
 //  ChainRevisit).
 //
+//  A mark run edit replaces a fixed text P before a run of a set R (marks)
+//  by C, deletes a fixed text T after the run, and revisits the run,
+//      P ($R*) T → C | $1 ;    (or $R+)
+//  as Latn-Arab's t ($notAbove+) ̈ → ة | $1 ; does.  The mark run edits of
+//  a group are applied before the rest of the
+//  group, in a group of their own, where the rest of the group cannot see
+//  the difference (see markRunSplit in transform_rules_revisit.cpp); the
+//  rules before them that ICU would apply instead at P are kept there as
+//  rules leaving their text unchanged, (text) } after → $1 ;.
+//
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.
 //  With records, each rule with text to revisit is also described: how it was
@@ -851,7 +861,7 @@ struct RevisitTrigger {
 };
 struct RevisitRecord {
     const Rule * rule;
-    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger, ChainRevisit} outcome;
+    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger, ChainRevisit, MarkRunEdit} outcome;
     std::string reason;             // if not composed
     unsigned composedRules = 0;
     std::vector<const Rule *> composed;     // the rules replacing it
@@ -866,6 +876,7 @@ struct RevisitStats {
     std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
     unsigned prefixRuns = 0;        // moved to a group of their own (with their triggers)
     unsigned chainRevisits = 0;     // moved to a group of their own
+    unsigned markRunEdits = 0;      // moved to a group of their own
     bool keepRecords = false;
     std::vector<RevisitRecord> records;
 };
@@ -899,6 +910,37 @@ struct ChainRevisit {
     char32_t replacement = 0;               // Y
 };
 bool chainRevisit(const ConversionRule * rule, ChainRevisit & chain);
+
+//  The sets and the replacement of a mark run edit (see ComposeRevisits),
+//  P ($R*) T → C | $1 ;  In a group of its own, with others, it applies at
+//  each P followed by a run of R and T, where no rule
+//  before it applies (with the same P, the first of them), leaving C, the
+//  run and the text after T.  The rule must be such that this holds: C no
+//  longer than P, the characters of P after the first within R (so that
+//  the run is the same for the rules of a group), T and the first
+//  character of P not in R, and the first character of P not in T or the
+//  rest of P (no two applications overlap).
+struct MarkRunEdit {
+    std::vector<UCD::UnicodeSet> prefix;    // P
+    UCD::UnicodeSet run;                    // R
+    bool nonEmpty = false;                  // R+, or F R* (F within R)
+    UCD::UnicodeSet firstRun;               // F (R for R+)
+    std::vector<UCD::UnicodeSet> suffix;    // T
+    std::u32string replacement;             // C
+};
+bool markRunEdit(const ConversionRule * rule, MarkRunEdit & edit);
+//  A rule leaving its text unchanged, (text) } after → $1 ; with the items
+//  of its text and after context (sets, in order), as the mark run edits
+//  keep the rules that ICU would apply instead (see ComposeRevisits).
+bool keptText(const ConversionRule * rule, std::vector<UCD::UnicodeSet> & items);
+
+//  The groups of mark run edits and the rules kept before them (see
+//  ComposeRevisits), set aside while the later passes rewrite the rules
+//  (which would change their form), each with the number of transform
+//  rules before it, and put back.
+using MarkRunGroups = std::vector<std::pair<size_t, std::vector<Rule *>>>;
+MarkRunGroups SetAsideMarkRunGroups(std::vector<Rule *> & rules);
+void RestoreMarkRunGroups(std::vector<Rule *> & rules, const MarkRunGroups & groups);
 
 //  Expansion of function calls on captures of single characters.
 //

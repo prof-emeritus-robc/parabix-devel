@@ -539,7 +539,8 @@ static std::string revisitRecordJSON(const ldml::RevisitRecord & r) {
     out += r.outcome == Outcome::Suffix ? "\"suffix\"" : r.outcome == Outcome::Composed ? "\"composed\""
            : r.outcome == Outcome::PrefixRun ? "\"prefix run\""
            : r.outcome == Outcome::PrefixRunTrigger ? "\"prefix run trigger\""
-           : r.outcome == Outcome::ChainRevisit ? "\"chain revisit\"" : "\"not composed\"";
+           : r.outcome == Outcome::ChainRevisit ? "\"chain revisit\""
+           : r.outcome == Outcome::MarkRunEdit ? "\"mark run edit\"" : "\"not composed\"";
     if (r.outcome == Outcome::NotComposed) out += ",\"reason\":" + jsonString(r.reason);
     out += ",\"composedRules\":" + std::to_string(r.composedRules);
     out += ",\"composed\":[";
@@ -580,6 +581,8 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         rstats.keepRecords = RevisitReport;
         rules = ldml::ComposeRevisits(rules, &rstats);
         for (const ldml::RevisitRecord & r : rstats.records) a.revisitReport.push_back(revisitRecordJSON(r));
+        //  (The mark run edits keep their form; see ldml::SetAsideMarkRunGroups.)
+        const ldml::MarkRunGroups markRunGroups = ldml::SetAsideMarkRunGroups(rules);
         //  Capture simplification.  (Rules whose text is only a capture, or
         //  continues after it, are kept as MultipleCaptureMultipleReplacement
         //  rules, rather than insertion rules or rules with the capture as a
@@ -593,6 +596,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         rules = ldml::ExpandFiniteTexts(rules, &fstats);
         ldml::DisambiguationStats dstats;
         rules = ldml::DisambiguateOrder(rules, &dstats);
+        ldml::RestoreMarkRunGroups(rules, markRunGroups);
         a.plan = ldml::planTransform(rules);
         //  The reasons the rules with text to revisit were not composed: these
         //  rules remain, in order, as the rules with that problem.
@@ -697,6 +701,10 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
                          << step.transform.getText() << "\n";
             continue;
+        }
+        if (!step.markRunEditRules.empty()) {
+            llvm::outs() << "  mark run edits: " << step.markRunEditRules.size() << " rules, " << step.markRunKept.size() << " kept\n";
+            for (const ldml::ConversionRule * c : step.markRunEditRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
         }
         if (!step.chainRevisitRules.empty()) {
             llvm::outs() << "  chain revisits: " << step.chainRevisitRules.size() << " rules\n";
@@ -4429,6 +4437,147 @@ private:
     const bool mMasked;
 };
 
+//  The mark run edits of a group (see ldml::MarkRunEdit), by family (the
+//  edits with the same R and T), given the starts of the matches of
+//  [P1] R* T for each family (with P1 the union of the first sets of their
+//  P): the first edit (in order) whose family matches there and whose P
+//  matches (and the first character of the run, for R+) applies, unless a
+//  rule kept before it matches there.  Its P becomes C (the rest of P
+//  deleted), and T, after the run, is deleted.  Classes: the sets of P, R,
+//  T and the kept rules, by index.
+struct MarkRunConfig {
+    struct Edit {
+        unsigned family;
+        std::vector<unsigned> prefix;       // classes
+        bool nonEmpty;
+        unsigned firstRun;                  // class (if nonEmpty)
+        std::u32string replacement;
+    };
+    struct Family {
+        unsigned run;                       // class
+        unsigned suffixLength;
+    };
+    std::vector<Edit> edits;
+    std::vector<Family> families;
+    std::vector<std::vector<unsigned>> kept;
+    std::vector<unsigned> keptBefore;
+    unsigned lookahead() const {
+        unsigned m = 0;
+        for (const Edit & e : edits) m = std::max(m, static_cast<unsigned>(e.prefix.size()) - (e.nonEmpty ? 0 : 1));
+        for (const std::vector<unsigned> & k : kept) m = std::max(m, static_cast<unsigned>(k.size()) - 1);
+        return m;
+    }
+    std::string signature() const {
+        std::string sig;
+        for (const Family & f : families) sig += "_f" + std::to_string(f.run) + "t" + std::to_string(f.suffixLength);
+        for (const Edit & e : edits) {
+            sig += "_e" + std::to_string(e.family) + ":";
+            for (unsigned c : e.prefix) sig += std::to_string(c) + ".";
+            sig += e.nonEmpty ? "+" + std::to_string(e.firstRun) : "*";
+            for (char32_t ch : e.replacement) sig += std::to_string(static_cast<unsigned>(ch)) + ",";
+        }
+        for (size_t k = 0; k < kept.size(); ++k) {
+            sig += "_k" + std::to_string(keptBefore[k]) + ":";
+            for (unsigned c : kept[k]) sig += std::to_string(c) + ".";
+        }
+        return sig;
+    }
+};
+
+class MarkRunEdits final : public pablo::PabloKernel {
+public:
+    MarkRunEdits(LLVMTypeSystemInterface & ts, const MarkRunConfig & config, StreamSet * U21, StreamSet * Starts,
+                 StreamSet * Classes, StreamSet * Mask, StreamSet * Result, StreamSet * Delete)
+    : PabloKernel(ts, "MarkRunEdits_" + getStringHash(config.signature()) + (Mask ? "m" : ""),
+                  inputBindings(U21, Starts, Classes, Mask, config.lookahead()), {Binding{"Result", Result}, Binding{"Delete", Delete}})
+    , mConfig(config), mMasked(Mask != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        std::vector<PabloAST *> starts = getInputStreamSet("Starts");
+        PabloAST * const mask = mMasked ? getInputStreamSet("Mask")[0] : nullptr;
+        //  The characters of a class j positions on (within the mask).
+        std::map<std::pair<unsigned, unsigned>, PabloAST *> aheadOf;
+        auto ahead = [&](unsigned c, unsigned j) {
+            PabloAST *& a = aheadOf[{c, j}];
+            if (a == nullptr) {
+                a = j == 0 ? classes[c] : pb.createLookahead(classes[c], j);
+                if (mask) a = pb.createAnd(a, j == 0 ? mask : pb.createLookahead(mask, j));
+            }
+            return a;
+        };
+        auto sequence = [&](const std::vector<unsigned> & sets) {
+            PabloAST * m = ahead(sets[0], 0);
+            for (unsigned j = 1; j < sets.size(); j++) m = pb.createAnd(m, ahead(sets[j], j));
+            return m;
+        };
+        if (mask) {
+            for (PabloAST *& st : starts) st = pb.createAnd(st, mask);
+        }
+        std::vector<PabloAST *> kept;
+        for (const std::vector<unsigned> & k : mConfig.kept) kept.push_back(sequence(k));
+        PabloAST * claimed = pb.createZeroes();
+        std::vector<PabloAST *> applied, familyStarts(mConfig.families.size(), pb.createZeroes());
+        for (size_t n = 0; n < mConfig.edits.size(); n++) {
+            const MarkRunConfig::Edit & e = mConfig.edits[n];
+            PabloAST * m = pb.createAnd(starts[e.family], sequence(e.prefix));
+            if (e.nonEmpty) m = pb.createAnd(m, ahead(e.firstRun, static_cast<unsigned>(e.prefix.size())));
+            for (size_t k = 0; k < kept.size(); k++) {
+                if (mConfig.keptBefore[k] <= n) m = pb.createAnd(m, pb.createNot(kept[k]));
+            }
+            m = pb.createAnd(m, pb.createNot(claimed));
+            claimed = pb.createOr(claimed, m);
+            familyStarts[e.family] = pb.createOr(familyStarts[e.family], m);
+            applied.push_back(m);
+        }
+        //  T, after the run of each family (P after its first character is
+        //  within R).
+        PabloAST * deleted = pb.createZeroes();
+        for (size_t f = 0; f < mConfig.families.size(); f++) {
+            PabloAST * const run = ahead(mConfig.families[f].run, 0);
+            PabloAST * const ends = pb.createAnd(pb.createMatchStar(pb.createAdvance(familyStarts[f], 1), run), pb.createNot(run));
+            for (unsigned j = 0; j < mConfig.families[f].suffixLength; j++) {
+                deleted = pb.createOr(deleted, j == 0 ? ends : pb.createAdvance(ends, j));
+            }
+        }
+        PabloAST * replaced = pb.createZeroes();
+        std::vector<PabloAST *> bits(basis.size(), pb.createZeroes());
+        for (size_t n = 0; n < mConfig.edits.size(); n++) {
+            const MarkRunConfig::Edit & e = mConfig.edits[n];
+            for (unsigned j = 0; j < e.prefix.size(); j++) {
+                PabloAST * const at = j == 0 ? applied[n] : pb.createAdvance(applied[n], j);
+                if (j >= e.replacement.size()) {
+                    deleted = pb.createOr(deleted, at);
+                    continue;
+                }
+                replaced = pb.createOr(replaced, at);
+                for (size_t b = 0; b < basis.size(); b++) {
+                    if ((e.replacement[j] >> b) & 1) bits[b] = pb.createOr(bits[b], at);
+                }
+            }
+        }
+        std::vector<Var *> result(basis.size());
+        for (size_t b = 0; b < basis.size(); b++) result[b] = pb.createVar("result" + std::to_string(b), basis[b]);
+        auto body = pb.createScope();
+        pb.createIf(replaced, body);
+        for (size_t b = 0; b < basis.size(); b++) {
+            body.createAssign(result[b], body.createOr(body.createAnd(basis[b], body.createNot(replaced)), bits[b]));
+        }
+        writeOutputStreamSet("Result", std::vector<PabloAST *>(result.begin(), result.end()));
+        writeOutputStreamSet("Delete", std::vector<PabloAST *>{deleted});
+    }
+private:
+    static Bindings inputBindings(StreamSet * U21, StreamSet * Starts, StreamSet * Classes, StreamSet * Mask, unsigned lookahead) {
+        Bindings b{Binding{"U21", U21}, Binding{"Starts", Starts}, Binding{"Classes", Classes, FixedRate(1), LookAhead(lookahead)}};
+        if (Mask) b.emplace_back("Mask", Mask, FixedRate(1), LookAhead(lookahead));
+        return b;
+    }
+    const MarkRunConfig mConfig;
+    const bool mMasked;
+};
+
 //  The prefix runs of a group (see ldml::TransformStep::prefixRuns), by family
 //  (the prefix runs with the same set P; see ldml::prefixRunFamilies), the
 //  families with the same texts S (in the same order) sharing a run class.  At
@@ -4725,6 +4874,7 @@ private:
     StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * chainRevisitsGroup(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * hexJava(StreamSet * U21);
@@ -4762,7 +4912,7 @@ private:
 //  The rules of a conversion group, of all kinds.
 static size_t groupRules(const ldml::TransformStep & step) {
     size_t rules = step.rules.size() + step.insertions.size() + step.deferred.size() + step.prefixRuns.size()
-                   + step.chainRevisitRules.size();
+                   + step.chainRevisitRules.size() + step.markRunEditRules.size();
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) rules += set.rules.size();
     return rules;
 }
@@ -6746,6 +6896,67 @@ StreamSet * RulePipelineBuilder::chainRevisitsGroup(const ldml::TransformStep & 
     return Result;
 }
 
+//  The mark run edits of a group (MarkRunEdits), on the starts of the
+//  matches of [P1] R* T of each family from the regular expression engine;
+//  the deleted positions are then removed.
+StreamSet * RulePipelineBuilder::markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    std::vector<UCD::UnicodeSet> sets;
+    auto index = [&](const UCD::UnicodeSet & s) {
+        auto f = std::find(sets.begin(), sets.end(), s);
+        if (f == sets.end()) {
+            sets.push_back(s);
+            return static_cast<unsigned>(sets.size() - 1);
+        }
+        return static_cast<unsigned>(f - sets.begin());
+    };
+    MarkRunConfig config;
+    //  The families, by R and T, with the union of the first sets of P.
+    std::vector<const ldml::MarkRunEdit *> families;
+    std::vector<UCD::UnicodeSet> firsts;
+    for (const ldml::MarkRunEdit & e : step.markRunEdits) {
+        size_t f = 0;
+        while (f < families.size() && !(families[f]->run == e.run && families[f]->suffix == e.suffix)) f++;
+        if (f == families.size()) {
+            families.push_back(&e);
+            firsts.emplace_back();
+            config.families.push_back(MarkRunConfig::Family{index(e.run), static_cast<unsigned>(e.suffix.size())});
+        }
+        firsts[f] = firsts[f] + e.prefix.front();
+        MarkRunConfig::Edit edit{static_cast<unsigned>(f), {}, e.nonEmpty, 0, e.replacement};
+        for (const UCD::UnicodeSet & p : e.prefix) edit.prefix.push_back(index(p));
+        if (e.nonEmpty) edit.firstRun = index(e.firstRun);
+        config.edits.push_back(edit);
+    }
+    for (size_t k = 0; k < step.markRunKept.size(); k++) {
+        config.kept.emplace_back();
+        for (const UCD::UnicodeSet & s : step.markRunKept[k]) config.kept.back().push_back(index(s));
+        config.keptBefore.push_back(step.markRunKeptBefore[k]);
+    }
+    std::vector<StreamSet *> familyStarts;
+    for (size_t f = 0; f < families.size(); f++) {
+        std::vector<re::RE *> pattern{re::makeCC(firsts[f], &cc::Unicode),
+                                      re::makeRep(re::makeCC(families[f]->run, &cc::Unicode), 0, re::Rep::UNBOUNDED_REP)};
+        for (const UCD::UnicodeSet & t : families[f]->suffix) pattern.push_back(re::makeCC(t, &cc::Unicode));
+        familyStarts.push_back(matchStarts(nullptr, nullptr, pattern, U21));
+    }
+    StreamSet * Starts = familyStarts.front();
+    if (familyStarts.size() > 1) {
+        Starts = P.CreateStreamSet(familyStarts.size());
+        P.CreateKernelCall<CollectStreams>(familyStarts, Starts);
+    }
+    StreamSet * const Classes = classes(sets, U21);
+    StreamSet * Result = P.CreateStreamSet(21);
+    StreamSet * const Delete = P.CreateStreamSet(1);
+    P.CreateKernelCall<MarkRunEdits>(config, U21, Starts, Classes, activeMask(), Result, Delete);
+    StreamSet * const keep = P.CreateStreamSet(1);
+    Invert(P, Delete, keep);
+    StreamSet * const kept = P.CreateStreamSet(21);
+    FilterByMask(P, keep, Result, kept);
+    filterMasks(keep);
+    return kept;
+}
+
 StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     DeferredConfig config;
@@ -6940,6 +7151,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
         } else {
             const size_t kernels = mP.getNumOfKernelCalls();
             if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
+            if (!step.markRunEditRules.empty()) U21 = markRunEditsGroup(step, U21);
             if (!step.prefixRuns.empty()) U21 = prefixRunsGroup(step, U21);
             if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
                 U21 = conversionGroup(step, U21);

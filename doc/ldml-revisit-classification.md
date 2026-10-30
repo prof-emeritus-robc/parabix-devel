@@ -2,7 +2,8 @@
 
 *October 28, 2026; updated October 29 for the prefix runs (class P), with S
 of one or more characters, and their triggers, for classes V (V′) and K
-(K′), and on October 30 for the chain revisits (class I). CLDR
+(K′), and on October 30 for the chain revisits (class I) and the mark run
+edits (class M). CLDR
 transforms from `~/cldr/common/transforms` (with the local W7 fixes, including
 the Greek_Latin_UNGEGN capture fix), tconv with `--revisit-report`.*
 
@@ -43,7 +44,7 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 
 ## Summary
 
-**932 revisit rules in 46 transforms: 828 implemented, 104 not yet.**
+**932 revisit rules in 46 transforms: 837 implemented, 95 not yet.**
 
 | | Class | What the revisit triggers | Rules | Transforms | Composed rules per revisit rule (median / max) |
 |---|---|---|---:|---:|---|
@@ -57,10 +58,11 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 | | **V′** formerly V | the rules of the group, once a rule inserting and revisiting all is set apart as an insertion rule, or a rule not of fixed length is seen not to begin at the text to revisit | 86 | 6 | — |
 | | **K′** formerly K | the rules of the group, with contexts combined item by item (possessive repetitions and optional items) | 3 | 2 | — |
 | | **I** chain revisits | the rule itself, on its capture extended by its replacement, through a run of marks; applied first, in a group of its own | 2 | 1 | — |
+| | **M** mark run edits | the rules of the group, on the run of marks between the replaced letter and the deleted mark; applied first, in a group of their own | 8 | 2 | — |
 | **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 33 | 8 | — |
 | | **L** long chains | different rules, consuming further input in turn | 3 | 2 | — |
-| | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 19 | 4 | — |
-| | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 49 | 5 | — |
+| | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 18 | 3 | — |
+| | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 41 | 4 | — |
 | | **K** contexts not combinable | contexts with repetitions or optional items that must be combined | 0 | 0 | — |
 
 Two structural facts stand out:
@@ -84,7 +86,7 @@ x = extends beyond the text to revisit, r = revisits in turn, B = blocking.
 `⇒` introduces the composed rules that replace a revisit rule, as
 `--revisit-report` prints them.
 
-# Part 1. Rules implemented by tconv (828 rules)
+# Part 1. Rules implemented by tconv (837 rules)
 
 ## How tconv implements revisits
 
@@ -527,7 +529,49 @@ file with a family (QA `tconv_chain_revisits_test.py`). Latn-Grek's 6 rules
 and moving the breathing rules too does not preserve the results (`ph`,
 `ch`, `rh`, `th` take the `h` before ICU reaches it).
 
-# Part 2. Rules not yet implemented (104 rules)
+## M: mark run edits (8 rules, 2 transforms)
+
+*Triggers:* the rules of the group, on the run of marks. Latn-Arab
+`t ($notAbove+) ̈ → ة | $1 ;` and 7 rules of Latin-ThaiLogical
+(`f ($notAbove*) ̄ → ฝ | $1 ;`, …) replace a letter followed by marks and a
+final mark above, delete the final mark, and revisit the marks between
+(ICU's canonical order puts the other marks first). They were N.
+
+*Implementation:* a mark run edit, `P ($R*) T → C | $1 ;` (or `$R+`; C no
+longer than P, `markRunEdit`), applies in a group of its own at each `P`
+followed by a run of `R` and `T`, where no rule before it applies.
+`MarkRunEdits` in tconv applies the edits of a group together, by family
+(the same `R` and `T`): the regular expression engine gives the starts of
+`[P1] R* T` for each family, and one Pablo kernel picks the first edit (in
+order) whose `P` matches there, unless a rule kept before it matches,
+writes `C` over `P` and deletes `T` after the run (a MatchStar). The mark
+run edits of a group are applied before the rest of the group when the
+rest cannot see the difference (`markRunSplit`, `markRunUnseen`):
+
+- each rule before an edit that may begin at its `P` is kept before the
+  edits, leaving its text (`(text) } after → $1 ;`): Latn-Arab's
+  `t ̣ → ط ;` applies instead of the edit on `t ̣ ̈`;
+- no other rule may match the text of an edit after the first character of
+  its own text (ICU would not reach `P`), or see `T`, or see `P` with an
+  after context that treats `P` and `C` differently;
+- no other rule's text may match a character of `C` (which ICU does not
+  revisit).
+
+The edits that fail are left in the group: Latin-ThaiLogical's
+`h ($notAbove*) ̄ → ห | $1 ;` (`k̄h → ข ;` takes the `h` first) and
+`u ($notAbove*) ̄ → ู | $1 ;` (U+0E39 is a mark, which the `h` rule's run
+may see). The sets are within the global filter (in ICU, a mark outside it
+ends the run). The later passes, which would change the form of the group,
+leave it aside (`SetAsideMarkRunGroups`).
+
+Latn-Arab is implementable, identical to ICU 78.3's `createFromRules` on its
+file's rules (reverse) on 40,000 random lines (3,364 with ة). The moved
+Latin-ThaiLogical edits, done by hand in a `::(Null);` group, give ICU's
+results on 20,000 lines; with them, `z → | s ;` (V) composes. QA
+`tconv_mark_run_edits_test.py` covers two families, a kept rule, `R+` and
+`R*`, a mark outside the filter and a run longer than a block.
+
+# Part 2. Rules not yet implemented (95 rules)
 
 tconv leaves these rules unchanged, and reports their transforms as not
 implementable ("the result has text to revisit", with the reason the
@@ -577,7 +621,7 @@ P.
 *Possible implementation:* raising the limits for these rules (the my-my_Latn
 case is finite), or the fixpoint of R for ja_Latn-ko.
 
-## V: a variable-length rule may be triggered (19 rules, 4 transforms)
+## V: a variable-length rule may be triggered (18 rules, 3 transforms)
 
 *Triggers:* a rule whose text is not a fixed-length sequence of characters,
 which may begin at the text to revisit. The composition stops at the first
@@ -588,7 +632,6 @@ such rule. What remains (86 more were V before the changes of V′ above):
 | `($lcgvowel+ $ddotmac?) $rough → h \| $1 ;` (and 1 more rough breathing rule) | Grek-Latn | 8 |
 | `$notLetter { ($evowel $macron? $evowel2 $macron?) } [^$smooth$rough] → \| $1 $smooth ;` (formerly the iota subscript rule, now class I) | Latn-Grek | 6 |
 | `[Pp] { } [ΣςσϷϸϺϻ] → \' ;` (insertion) | Grek-Latn/UNGEGN, Grek-Latn | 2 + 2 |
-| `ṣ ($notAbove*) ̄ → ศ \| $1 ;` | Latin-ThaiLogical | 1 |
 
 Here the blocking rule may begin at the revisited text: Grek-Latn/UNGEGN's
 `ϲ → | σ ;` revisits `σ`, which the insertion rule's after context matches
@@ -598,12 +641,12 @@ Here the blocking rule may begin at the revisited text: Grek-Latn/UNGEGN's
 variable length and revisit them (rough breathing, iota subscript); the
 transforms have many other problems (W3, W4, N).
 
-## N: the revisit rule cannot be enumerated (49 rules, 5 transforms)
+## N: the revisit rule cannot be enumerated (41 rules, 4 transforms)
 
 *Triggers:* not explored. The rule's own result references a capture that is
 not a single character (`Latn-Grek h ($evowel $macron? $ddot?) → | $1 $rough ;`,
-26 rules, the rough and smooth breathing; Latin-ThaiLogical `h ($notAbove*) ̄ → ห | $1 ;`; Latn-Arab
-`t ($notAbove+) ̈ → ة | $1 ;`; Zawgyi-my `^ ၄ ($nondigits) → | ၎ $1 ;`), or a
+26 rules, the rough and smooth breathing; Latin-ThaiLogical `h ($notAbove*) ̄ → ห | $1 ;`
+and `u ($notAbove*) ̄ → ู | $1 ;`, which cannot be mark run edits (class M); Zawgyi-my `^ ၄ ($nondigits) → | ၎ $1 ;`), or a
 capture of more than 64 characters (Grek-Latn `Ε ($glower) $rough → H | ε $1 ;`).
 Most move a run of combining marks (`$1`) past a letter, and revisit the
 marks: they are reorderings, and the revisit only lets later rules convert the

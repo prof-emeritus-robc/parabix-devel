@@ -42,7 +42,7 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 
 ## Summary
 
-**932 revisit rules in 46 transforms: 736 implemented, 196 not yet.**
+**932 revisit rules in 46 transforms: 737 implemented, 195 not yet.**
 
 | | Class | What the revisit triggers | Rules | Transforms | Composed rules per revisit rule (median / max) |
 |---|---|---|---:|---:|---|
@@ -52,8 +52,8 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 | | **C** context-conditional | several rules, chosen by contexts on the known text | 3 | 2 | 3 / 9 |
 | | **D** lookahead-conditional | several rules, chosen by 1–2 characters that follow the revisited text | 160 | 16 | 18 / 43 |
 | | **E** chained | rules that themselves revisit, ending within a few applications | 42 | 6 | 3 / 25 |
-| | **P** prefix runs | the rule itself, on P S^n, leaving A^n P; applied first, as a group of their own (after their triggers, which produce P) | 238 | 8 | — |
-| **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 34 | 9 | — |
+| | **P** prefix runs | the rule itself, on P S^n, leaving A^n P; applied first, as a group of their own (after their triggers, which produce P), or, with A empty, as run rules | 239 | 9 | — |
+| **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 33 | 8 | — |
 | | **L** long chains | different rules, consuming further input in turn | 3 | 2 | — |
 | | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 104 | 8 | — |
 | | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 52 | 6 | — |
@@ -71,7 +71,8 @@ Two structural facts stand out:
   own output plus the next input character, as often as the input repeats:
   the mirror image of the suffix revisits (S). The 238 whose groups allow
   it (with the rules producing their P, in Khmr-Latn/UNGEGN) are now
-  implemented (P); 34 remain (R).
+  implemented (P), as is xh-xh_FONIPA's `rh → | r`, as a run rule; 33
+  remain (R).
 
 Notation in the examples: `→ d1 [flags] rule` is a rule triggered at
 application depth 1 (on the text to revisit), with flags c = conditional,
@@ -79,7 +80,7 @@ x = extends beyond the text to revisit, r = revisits in turn, B = blocking.
 `⇒` introduces the composed rules that replace a revisit rule, as
 `--revisit-report` prints them.
 
-# Part 1. Rules implemented by tconv (736 rules)
+# Part 1. Rules implemented by tconv (737 rules)
 
 ## How tconv implements revisits
 
@@ -261,7 +262,7 @@ rules fold the whole chain, with characters beyond and contexts as in D.
   rules;
 - ro_FONIPA-ja `ŋ → | nɡ ;` → `d1 [r] ɡ → | g` (a normalization chain).
 
-## P: prefix runs (238 rules, 8 transforms)
+## P: prefix runs (239 rules, 9 transforms)
 
 *Triggers:* the rule itself. A prefix run is a rule `(P) S → A | $1 ;` or
 `p S → A | p ;`: its text is a character of a set P followed by a text S of
@@ -376,6 +377,20 @@ On Ethi-Latn/ALALOC (33 prefix runs, many distinct A of one to three
 characters, within the filter `[:Ethiopic:]`) the step has 12 kernels; on
 ro_FONIPA-ja (3 prefix runs, A empty) 5.
 
+*Run rules.* A prefix run whose group does not allow the split, with A
+empty and S of one character, where every other rule that may match a
+character p of P matches it alone (one character, no after context, a fixed
+result without a cursor), is replaced by run rules (`prefixRunAsRun`): ICU
+deletes the run and applies to p the first of these rules whose before
+context matches, as `before { p S+ → f(p) ;` does, one for each such rule in
+order (and `p S+ → p ;` if none applies unconditionally). These are ordinary
+rules of the group, at the place of the prefix run; the split, where the
+group allows it, comes first. xh-xh_FONIPA's `rh → | r ;`, which `gr → ɣ`
+keeps from the split, becomes `r h+ → r ;`: xh-xh_FONIPA and the four `xh-*`
+transforms through it are implementable. xh-xh_FONIPA is identical to ICU
+78.3 on 5,000 random lines and passes its 47 CLDR test cases; 27 random rule
+sets rewritten this way are identical to ICU.
+
 *Verification.* For the 7 transforms (and the 5 using them: Ethi-Latn, ro-ja,
 and the 4 `_Geminate` variants), the output matches ICU (`uconv -x` on the
 same CLDR rule text): 408 random texts each, rich in runs, including runs of
@@ -408,13 +423,13 @@ macOS until the JIT compile threads were given 8 MB stacks: LLVM's
 ScalarEvolution overflowed the 512 KB stack of a std::thread compiling its
 7,718 string rules.)
 
-# Part 2. Rules not yet implemented (196 rules)
+# Part 2. Rules not yet implemented (195 rules)
 
 tconv leaves these rules unchanged, and reports their transforms as not
 implementable ("the result has text to revisit", with the reason the
 composition was abandoned).
 
-## R: runs (34 rules, 9 transforms)
+## R: runs (33 rules, 8 transforms)
 
 *Triggers:* the revisit rule itself, or a rule of the same family. The
 revisited text is the *start* of the rule's text, so each application leaves
@@ -431,8 +446,7 @@ The 238 prefix runs and triggers of class P were in this class. What remains:
   become `tsu`; in ja_Latn-ko, that of `t } t → ᆺ` sees the `t` of a run
   (its single set sees only P, which a run with A empty leaves in place, so
   this conflict could be refined). Both have other revisits;
-- prefix runs whose groups do not allow the split: xh-xh_FONIPA `rh → | r ;`
-  (`gr → ɣ` would match its `r` within its text), it-am and it-ja
+- prefix runs whose groups do not allow the split: it-am and it-ja
   `($consonant) \' → | $1 ;` (`cqu`), fa-fa_FONIPA `([َ-ِ]) ّ → ّ | $1 ;`
   (`یّ → jj` matches its replacement, a shadda, with another character),
   pl_FONIPA-ja `t͡ → | t ;` (the after context of `^ t } t → ト` sees its `t`);

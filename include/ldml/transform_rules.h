@@ -811,8 +811,10 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  as one step (TransformStep::prefixRuns).  The rules producing a P that ICU
 //  then revisits, C → B | p ; (triggers), are applied before them, as
 //  C → B p ; in a group of their own, where ICU reaches C (see
-//  prefixRunConflict).  Otherwise they are composed as other rules are
-//  (which fails on their unbounded runs).
+//  prefixRunConflict).  Otherwise they are composed as other rules are, or,
+//  where that fails on their unbounded runs, with A empty and the other rules
+//  matching P only as single characters, replaced by run rules
+//  (before { p S+ → f(p) ; see prefixRunAsRun).
 //
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.

@@ -1006,6 +1006,75 @@ bool prefixRunTrigger(const ConversionRule * c, const UCD::UnicodeSet & first, P
     return resultString(result->getCompletedResult(), {}, tr.replacement);
 }
 
+//  A prefix run with A empty, P S → | P ; (S of one character), where every
+//  other rule of the group that may match a character of P matches it alone
+//  (a single character, no after context, a fixed result without a cursor).
+//  ICU deletes the run S^n and applies to p the first of these rules whose
+//  before context matches (or leaves it), as the run rules
+//      before { p S+ → f(p) ;
+//  do, one for each such rule (in order) and character p of P, until one
+//  without a before context (or then p S+ → p ;).
+bool prefixRunAsRun(const ConversionRule * c, const std::vector<Rule *> & group, std::vector<Rule *> & out) {
+    PrefixRun pr;
+    if (!prefixRun(c, pr) || !pr.replacement.empty() || pr.run.size() != 1 || pr.first.count() > 64) return false;
+    struct AtP {
+        const ConversionRule * rule;
+        UCD::UnicodeSet text;
+        std::string capture;        // the name of the capture of the text, if any
+    };
+    std::vector<AtP> atP;
+    CharSetAnalysis sets;
+    for (const Rule * r : group) {
+        const ConversionRule * other = dyn_cast<ConversionRule>(r);
+        if (other == nullptr || other == c) continue;
+        const RuleSide * source = other->getSourceSide(Direction::Forward);
+        const std::vector<PatternItem> items = patternItems(source->getText());
+        if (items.empty()) return false;
+        bool atFirst = items[0].chars.intersects(pr.first);
+        for (const PatternItem & item : items) atFirst |= item.repeated && item.chars.intersects(pr.first);
+        if (!atFirst) continue;
+        std::vector<RE *> text;
+        textAtoms(source->getText(), text);
+        if (text.size() != 1 || items.size() != 1 || items[0].repeated || source->hasAfterContext()) return false;
+        const RuleSide * result = other->getResultSide(Direction::Forward);
+        if (result->hasCursor()) return false;
+        AtP a{other, UCD::UnicodeSet(), ""};
+        RE * set = text[0];
+        if (const Capture * cap = dyn_cast<Capture>(set)) {
+            a.capture = cap->getName();
+            set = cap->getCapturedRE();
+        }
+        if (!CharSetAnalysis::isSet(set) || hasStrings(set) || hasBoundary(set)) return false;
+        a.text = sets.setOf(set, false);
+        atP.push_back(a);
+    }
+    RE * const run = makeRep(makeCC(pr.run.front()), 1, Rep::UNBOUNDED_REP);
+    for (const auto & range : pr.first) {
+        for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range); ++ch) {
+            RE * const text = makeSeq({makeCC(ch), run});
+            bool unconditional = false;
+            for (const AtP & a : atP) {
+                if (!a.text.contains(ch)) continue;
+                std::map<std::string, std::u32string> refs;
+                if (!a.capture.empty()) refs[a.capture] = std::u32string(1, static_cast<char32_t>(ch));
+                std::u32string result;
+                if (!resultString(a.rule->getResultSide(Direction::Forward)->getCompletedResult(), refs, result)) return false;
+                RE * const before = a.rule->getSourceSide(Direction::Forward)->getBeforeContext();
+                out.push_back(makeConversionRule(makeRuleSide(before, text, nullptr), Direction::Forward, makeRuleSide(literal(result))));
+                if (before == nullptr) {
+                    unconditional = true;
+                    break;
+                }
+            }
+            if (!unconditional) {
+                out.push_back(makeConversionRule(makeRuleSide(nullptr, text, nullptr), Direction::Forward,
+                                                 makeRuleSide(makeCC(ch))));
+            }
+        }
+    }
+    return true;
+}
+
 std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
     std::vector<Rule *> out;
     size_t start = 0;
@@ -1146,6 +1215,22 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 record.composed.assign(composed.begin(), composed.end());
                 out.insert(out.end(), composed.begin(), composed.end());
             } catch (const NotComposed & e) {
+                //  A prefix run with A empty, as a run rule.
+                if (isRun[k]) {
+                    std::vector<Rule *> runRules;
+                    if (prefixRunAsRun(c, rewritten, runRules)) {
+                        if (mStats) {
+                            mStats->composed++;
+                            mStats->composedRules += runRules.size();
+                        }
+                        record.composedRules = runRules.size();
+                        record.composed.assign(runRules.begin(), runRules.end());
+                        out.insert(out.end(), runRules.begin(), runRules.end());
+                        if (mRecord) mStats->records.push_back(std::move(record));
+                        mRecord = nullptr;
+                        continue;
+                    }
+                }
                 const std::string reason = isRun[k] ? "a prefix run, but " + runConflict : e.reason;
                 if (mStats) mStats->notComposed.emplace_back(c, reason);
                 record.outcome = RevisitRecord::Outcome::NotComposed;

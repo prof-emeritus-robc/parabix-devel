@@ -29,6 +29,7 @@ DEPS
     kernel.streamutils
     kernel.scan
     kernel.bitwise
+    kernel.util
     toolchain
     re.cc
     re.parse

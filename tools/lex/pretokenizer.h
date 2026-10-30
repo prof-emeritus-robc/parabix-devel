@@ -74,7 +74,12 @@ PreTokenizerResult buildPreTokenizerBoundaries(
 // on the decoded codepoints in place and only they are compressed to one slot per codepoint,
 // instead of all 21 codepoint bits. Returns U21tokenBoundaries' byte-domain equivalent.
 // classCode (--pretok-class-code): compress the 4-bit code of the nine classes instead.
-StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode = false);
+// byteDomain (--pretok-byte-domain, with classCode): no compression at all; the boundary rules
+// run on the bytes (GPT2ByteClassKernel + GPT2ByteBoundaryKernel).
+// utf8Classes (--pretok-utf8-classes, with byteDomain): compile the classes on the UTF-8 bytes
+// instead of on UTF8_Decoder's codepoints.
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode = false,
+                                    bool byteDomain = false, bool utf8Classes = false);
 
 // Stage 2b: spread codepoints, insert LF separators, filter whitespace.
 // Takes the PreTokenizerResult and returns the final U21 codepoint stream

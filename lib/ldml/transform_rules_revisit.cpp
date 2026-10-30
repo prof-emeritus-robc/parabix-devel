@@ -9,6 +9,8 @@
 #include <ldml/transform_rules.h>
 #include <map>
 #include <set>
+#include <deque>
+#include <algorithm>
 #include <optional>
 #include <ldml/transform_plan.h>
 #include <ldml/transform_rules_printer.h>
@@ -73,18 +75,20 @@ bool hasBoundary(const RE * re) {
 }
 
 //  An item of a context: a set of characters, possibly including the text
-//  boundary, or a (possessive) repetition of such a set.
+//  boundary, or a (possessive) repetition of such a set, or an optional one.
 struct Item {
     UCD::UnicodeSet chars;
     bool boundary = false;
     bool star = false;
+    bool optional = false;
     bool operator==(const Item & other) const {
-        return chars == other.chars && boundary == other.boundary && star == other.star;
+        return chars == other.chars && boundary == other.boundary && star == other.star && optional == other.optional;
     }
 };
 
 //  A context: absent or empty (no condition), a sequence of items, or
-//  (if not simple) another pattern, which can only be kept unchanged.
+//  (if not simple) another pattern, which can only be kept unchanged (or
+//  combined with another, as regular expressions; see conjoin).
 struct Context {
     RE * re = nullptr;        // the original pattern, while unchanged
     bool simple = true;
@@ -96,7 +100,7 @@ struct Context {
 bool alwaysMatches(const Context & c) {
     if (!c.simple) return false;
     for (const Item & i : c.items) {
-        if (!i.star) return false;
+        if (!i.star && !i.optional) return false;
     }
     return true;
 }
@@ -110,7 +114,7 @@ bool implies(const Context & a, const Context & b, bool front) {
     for (size_t k = 0; k < b.items.size(); k++) {
         const Item & x = front ? a.items[k] : a.items[a.items.size() - 1 - k];
         const Item & y = front ? b.items[k] : b.items[b.items.size() - 1 - k];
-        if (x.star || y.star) return false;
+        if (x.star || y.star || x.optional || y.optional) return false;
         if (!x.chars.subset(y.chars) || (x.boundary && !y.boundary)) return false;
     }
     return true;
@@ -128,6 +132,19 @@ Match consume(Context & c, UCD::UnicodeSet & s, bool front) {
     c.re = nullptr;
     while (!c.items.empty()) {
         Item & item = front ? c.items.front() : c.items.back();
+        //  An optional item, matched possessively: taken if the character is
+        //  in its set, else skipped.
+        if (item.optional) {
+            if (s.subset(item.chars)) {
+                if (front) c.items.erase(c.items.begin()); else c.items.pop_back();
+                return Match::Ok;
+            }
+            if (!s.intersects(item.chars)) {
+                if (front) c.items.erase(c.items.begin()); else c.items.pop_back();
+                continue;
+            }
+            throw NotComposed{"an optional item in a context matches some of the characters"};
+        }
         if (item.star) {
             if (s.subset(item.chars)) return Match::Ok;
             if (!s.intersects(item.chars)) {
@@ -143,24 +160,92 @@ Match consume(Context & c, UCD::UnicodeSet & s, bool front) {
     return Match::Ok;
 }
 
+RE * contextRE(const Context & c, bool before);
+
+//  Contexts with repetitions or optional items, item by item, where each is
+//  matched possessively: a repetition or optional item disjoint from the item
+//  of the other context matches nothing there, and one including it matches
+//  it.  Ok or Fail, or false if they cannot be combined so.
+bool conjoinPossessive(const std::vector<Item> & a, const std::vector<Item> & b, bool front, Match & m,
+                       std::vector<Item> & out) {
+    std::deque<Item> x, y, items;
+    for (const Item & i : a) {
+        if (front) x.push_back(i); else x.push_front(i);
+    }
+    for (const Item & i : b) {
+        if (front) y.push_back(i); else y.push_front(i);
+    }
+    m = Match::Ok;
+    while (!x.empty() && !y.empty()) {
+        Item & p = x.front();
+        Item & q = y.front();
+        if (p.boundary || q.boundary) return false;
+        const bool pv = p.star || p.optional, qv = q.star || q.optional;
+        if (!pv && !qv) {
+            Item i;
+            i.chars = p.chars & q.chars;
+            if (i.chars.empty()) m = Match::Fail;
+            items.push_back(i);
+            x.pop_front();
+            y.pop_front();
+        } else if (pv && qv) {
+            if (!(p == q)) return false;
+            items.push_back(p);
+            x.pop_front();
+            y.pop_front();
+        } else {
+            std::deque<Item> & vs = pv ? x : y;
+            std::deque<Item> & fs = pv ? y : x;
+            Item & v = vs.front();
+            Item & f = fs.front();
+            if (!f.chars.intersects(v.chars)) {
+                vs.pop_front();
+            } else if (f.chars.subset(v.chars)) {
+                items.push_back(f);
+                fs.pop_front();
+                if (v.optional) vs.pop_front();
+            } else {
+                return false;
+            }
+        }
+    }
+    for (const Item & i : x) items.push_back(i);
+    for (const Item & i : y) items.push_back(i);
+    out.assign(items.begin(), items.end());
+    if (!front) std::reverse(out.begin(), out.end());
+    return true;
+}
+
 //  Both contexts: before contexts are aligned at the end, after contexts at
-//  the start.  Fail if they cannot both match.
+//  the start.  Fail if they cannot both match.  Contexts that are not
+//  sequences of sets, or have repetitions or optional items, are combined as
+//  regular expressions: b (an after context) as a lookahead at the start of
+//  a, or (a before context) as a lookbehind at its end.
 Match conjoin(Context & a, const Context & b, bool front) {
     if (b.empty()) return Match::Ok;
     if (a.empty()) {
         a = b;
         return Match::Ok;
     }
-    if (!a.simple || !b.simple) {
-        if (a.re && a.re == b.re) return Match::Ok;
-        throw NotComposed{"two contexts that are not sequences of sets apply"};
-    }
-    bool star = false;
-    for (const Item & i : a.items) star |= i.star;
-    for (const Item & i : b.items) star |= i.star;
-    if (star) {
-        if (a.items == b.items) return Match::Ok;
-        throw NotComposed{"two contexts with repetitions apply"};
+    bool repeated = !a.simple || !b.simple;
+    for (const Item & i : a.items) repeated |= i.star || i.optional;
+    for (const Item & i : b.items) repeated |= i.star || i.optional;
+    if (repeated) {
+        if ((a.re && a.re == b.re) || (a.simple && b.simple && a.items == b.items)) return Match::Ok;
+        std::vector<Item> items;
+        Match m;
+        if (a.simple && b.simple && conjoinPossessive(a.items, b.items, front, m, items)) {
+            if (m == Match::Fail) return Match::Fail;
+            a.re = nullptr;
+            a.items = std::move(items);
+            return Match::Ok;
+        }
+        RE * const x = contextRE(a, !front);
+        RE * const y = contextRE(b, !front);
+        a.re = front ? makeSeq({makeLookAheadAssertion(y), x}) : makeSeq({x, makeLookBehindAssertion(y)});
+        a.simple = false;
+        a.items.clear();
+        return Match::Ok;
     }
     const size_t n = std::max(a.items.size(), b.items.size());
     std::vector<Item> items(n);
@@ -197,6 +282,7 @@ RE * contextRE(const Context & c, bool before) {
             e = Alt::Create({e, boundary});
         }
         if (i.star) e = makeRep(e, 0, Rep::UNBOUNDED_REP);
+        if (i.optional) e = makeRep(e, 0, 1);
         seq.push_back(e);
     }
     return makeSeq(seq.begin(), seq.end());
@@ -374,6 +460,11 @@ bool Composer::collectItems(RE * re, std::vector<Item> & items) {
         if (!collectItems(rep->getRE(), body) || body.size() != 1) return false;
         const int lb = rep->getLB();
         const int ub = rep->getUB();
+        if (lb == 0 && ub == 1) {
+            items.push_back(body.front());
+            items.back().optional = true;
+            return true;
+        }
         if (ub != Rep::UNBOUNDED_REP && ub != lb) return false;
         for (int k = 0; k < lb; ++k) items.push_back(body.front());
         if (ub == Rep::UNBOUNDED_REP) {

@@ -1,7 +1,8 @@
 # Revisit rules in the CLDR transforms: what the revisit triggers
 
 *October 28, 2026; updated October 29 for the prefix runs (class P), with S
-of one or more characters, and their triggers, and for class V (V′). CLDR
+of one or more characters, and their triggers, and for classes V (V′) and K
+(K′). CLDR
 transforms from `~/cldr/common/transforms` (with the local W7 fixes, including
 the Greek_Latin_UNGEGN capture fix), tconv with `--revisit-report`.*
 
@@ -42,7 +43,7 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 
 ## Summary
 
-**932 revisit rules in 46 transforms: 823 implemented, 109 not yet.**
+**932 revisit rules in 46 transforms: 826 implemented, 106 not yet.**
 
 | | Class | What the revisit triggers | Rules | Transforms | Composed rules per revisit rule (median / max) |
 |---|---|---|---:|---:|---|
@@ -54,11 +55,12 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 | | **E** chained | rules that themselves revisit, ending within a few applications | 42 | 6 | 3 / 25 |
 | | **P** prefix runs | the rule itself, on P S^n, leaving A^n P; applied first, as a group of their own (after their triggers, which produce P), or, with A empty, as run rules | 239 | 9 | — |
 | | **V′** formerly V | the rules of the group, once a rule inserting and revisiting all is set apart as an insertion rule, or a rule not of fixed length is seen not to begin at the text to revisit | 86 | 6 | — |
+| | **K′** formerly K | the rules of the group, with contexts combined item by item (possessive repetitions and optional items) | 3 | 2 | — |
 | **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 33 | 8 | — |
 | | **L** long chains | different rules, consuming further input in turn | 3 | 2 | — |
 | | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 19 | 4 | — |
 | | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 51 | 5 | — |
-| | **K** contexts not combinable | contexts with repetitions or optional items that must be combined | 3 | 2 | — |
+| | **K** contexts not combinable | contexts with repetitions or optional items that must be combined | 0 | 0 | — |
 
 Two structural facts stand out:
 
@@ -81,7 +83,7 @@ x = extends beyond the text to revisit, r = revisits in turn, B = blocking.
 `⇒` introduces the composed rules that replace a revisit rule, as
 `--revisit-report` prints them.
 
-# Part 1. Rules implemented by tconv (823 rules)
+# Part 1. Rules implemented by tconv (826 rules)
 
 ## How tconv implements revisits
 
@@ -458,7 +460,30 @@ composition stopped at a rule whose text is not of fixed length.
   cs_FONIPA-ja and es_FONIPA-ja then need only the runs of sets with strings
   (`[{i̯}iɪ]+ → i ;`, W3).
 
-# Part 2. Rules not yet implemented (109 rules)
+## K′: contexts with repetitions or optional items (3 rules, 2 transforms)
+
+*Triggers:* as other revisits. Latn-Grek/UNGEGN `W } $vowel → | B ;` and
+`U } $vowel → | B ;` revisit `B`, whose rule `B } $beforeLower → Μπ ;` has
+the after context `$accent* $lower`; Latn-Kana `þ → | th ;` revisits `h`,
+whose rule `$voweled_basekana [゙゚]? { h → ー ;` has an optional item.
+
+*Implementation:* a context item may be optional (`x?`), matched
+possessively against the known text: taken if the character is in its set,
+skipped if not (`consume`). Two contexts with repetitions or optional items
+are combined item by item, each matched possessively (`conjoinPossessive`):
+a repetition or optional item disjoint from the other context's item there
+matches nothing, one including it matches it. `$vowel` and
+`$accent* $lower` give `[$vowel & $lower]`, as `$vowel` has no accent.
+Otherwise they are combined as regular expressions, one as a lookahead at
+the start of the other (after contexts, `(?=B) A`) or a lookbehind at its
+end (before contexts): the composition then succeeds, but DisambiguateOrder
+cannot yet order rules with such contexts (it reports them order
+dependent), so no transform uses it. Latn-Grek/UNGEGN and Latn-Kana (and
+Latn-Hira, through it) are implementable, identical to ICU 78.3's
+`createFromRules` on the rules of their files (reverse and forward) on
+2,000 random lines each.
+
+# Part 2. Rules not yet implemented (106 rules)
 
 tconv leaves these rules unchanged, and reports their transforms as not
 implementable ("the result has text to revisit", with the reason the
@@ -544,14 +569,12 @@ moved marks.
 reordering is already handled by MoveRegions); then they would fall into B
 or D.
 
-## K: contexts that cannot be combined (3 rules, 2 transforms)
+## K: contexts that cannot be combined (0 rules)
 
-Latn-Grek/UNGEGN `W } $vowel → | B ;` → `B } $beforeLower → Μπ ;` (two
-contexts with repetitions), and Latn-Kana `þ → | th ;` (a context with an
-optional item, `$voweled_basekana [゙゚]?`).
-
-*Possible implementation:* combine contexts as regular expressions rather than
-as sequences of sets.
+The 3 rules of this class are now implemented (K′). Contexts that the item
+by item combination cannot combine are combined as regular expressions;
+DisambiguateOrder would need to explore their lookaheads (as automata, with
+the rules' own) to order the rules using them.
 
 ## Other observations
 

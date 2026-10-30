@@ -271,6 +271,11 @@ std::string printItem(const RE * re) {
     } else if (isa<Seq>(re)) {
         if (isString(re)) return printQuoted(re);
         return printSequence(re);
+    } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
+        // Not expressible in rule syntax (contexts combined by ComposeRevisits).
+        const bool ahead = a->getKind() == Assertion::Kind::LookAhead;
+        const bool positive = a->getSense() == Assertion::Sense::Positive;
+        return std::string(ahead ? "(?" : "(?<") + (positive ? "=" : "!") + printSequence(a->getAsserted()) + ")";
     }
     return printSet(re);
 }

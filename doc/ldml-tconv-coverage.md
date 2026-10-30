@@ -36,7 +36,9 @@ allow, as run rules (`96ff91dd7`, `--update --only xh-xh_FONIPA`): xh-xh_FONIPA 
 four `xh-*` transforms through it are implementable (392). Then contexts
 with repetitions or optional items combined (`--update --only
 Latn-Grek/UNGEGN Latn-Kana`): Latn-Grek/UNGEGN, Latn-Kana and Latn-Hira are
-implementable (395).*
+implementable (395). Then Latn-Grek's iota subscript rules as chain revisits,
+in a group of their own (`ef4e202f9`, `--update --only Latn-Grek`): Latn-Grek remains
+blocked (W3, W6), with fewer problems.*
 
 This report covers:
 
@@ -1090,7 +1092,10 @@ made Khmr-Latn/UNGEGN implementable, and run rules for prefix runs with A
 empty (`rh → | r` as `r h+ → r`) the five xh transforms. W6 is now needed by
 22 transforms, and alone blocks 7. Contexts with repetitions or optional
 items, combined item by item, made Latn-Grek/UNGEGN, Latn-Kana and
-Latn-Hira implementable: W6 is needed by 19, and alone blocks 4.
+Latn-Hira implementable: W6 is needed by 19, and alone blocks 4. Latn-Grek's
+iota subscript rules, which revisit their capture extended by U+0345 to the
+next `i`, are chain revisits, applied first by a Pablo kernel (a MatchStar
+through the run of accents); its rough and smooth breathing rules remain.
 
 **W3 variable-length texts.** Three mechanisms now cover most of it:
 
@@ -1404,6 +1409,7 @@ tconv on every implementable transform.
 | `96ff91dd7` | prefix runs with A empty as run rules (`rh → \| r` as `r h+ → r`): the five xh transforms: 392 |
 | `27321f4e9` | insert-and-revisit rules as insertion passes (am_Ethi-d0_Morse's separator); V checks by first characters |
 | `8a0b58af8` | contexts with repetitions or optional items combined: Latn-Grek/UNGEGN, Latn-Kana, Latn-Hira: 395 |
+| `ef4e202f9` | chain revisits (Latn-Grek's iota subscript), in a group of their own: 395 |
 
 ## Reproducing
 

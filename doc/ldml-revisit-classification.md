@@ -1,7 +1,7 @@
 # Revisit rules in the CLDR transforms: what the revisit triggers
 
 *October 28, 2026; updated October 29 for the prefix runs (class P), with S
-of one or more characters. CLDR
+of one or more characters, and their triggers. CLDR
 transforms from `~/cldr/common/transforms` (with the local W7 fixes, including
 the Greek_Latin_UNGEGN capture fix), tconv with `--revisit-report`.*
 
@@ -42,7 +42,7 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 
 ## Summary
 
-**932 revisit rules in 46 transforms: 671 implemented, 261 not yet.**
+**932 revisit rules in 46 transforms: 736 implemented, 196 not yet.**
 
 | | Class | What the revisit triggers | Rules | Transforms | Composed rules per revisit rule (median / max) |
 |---|---|---|---:|---:|---|
@@ -52,8 +52,8 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 | | **C** context-conditional | several rules, chosen by contexts on the known text | 3 | 2 | 3 / 9 |
 | | **D** lookahead-conditional | several rules, chosen by 1–2 characters that follow the revisited text | 160 | 16 | 18 / 43 |
 | | **E** chained | rules that themselves revisit, ending within a few applications | 42 | 6 | 3 / 25 |
-| | **P** prefix runs | the rule itself, on P S^n, leaving A^n P; applied first, as a group of their own | 173 | 7 | — |
-| **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 99 | 10 | — |
+| | **P** prefix runs | the rule itself, on P S^n, leaving A^n P; applied first, as a group of their own (after their triggers, which produce P) | 238 | 8 | — |
+| **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 34 | 9 | — |
 | | **L** long chains | different rules, consuming further input in turn | 3 | 2 | — |
 | | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 104 | 8 | — |
 | | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 52 | 6 | — |
@@ -69,9 +69,9 @@ Two structural facts stand out:
   rule's text to revisit is a *prefix* of a rule's own text (`rh → | r`,
   `([ሀ-ሇ]) $ጥበቅ → $ሀ | $1`, `â្ក → k | â`), so the rule applies again to its
   own output plus the next input character, as often as the input repeats:
-  the mirror image of the suffix revisits (S). The 173 whose text is two
-  single characters, and whose groups allow it, are now implemented (P); 99
-  remain (R).
+  the mirror image of the suffix revisits (S). The 238 whose groups allow
+  it (with the rules producing their P, in Khmr-Latn/UNGEGN) are now
+  implemented (P); 34 remain (R).
 
 Notation in the examples: `→ d1 [flags] rule` is a rule triggered at
 application depth 1 (on the text to revisit), with flags c = conditional,
@@ -79,7 +79,7 @@ x = extends beyond the text to revisit, r = revisits in turn, B = blocking.
 `⇒` introduces the composed rules that replace a revisit rule, as
 `--revisit-report` prints them.
 
-# Part 1. Rules implemented by tconv (671 rules)
+# Part 1. Rules implemented by tconv (736 rules)
 
 ## How tconv implements revisits
 
@@ -261,7 +261,7 @@ rules fold the whole chain, with characters beyond and contexts as in D.
   rules;
 - ro_FONIPA-ja `ŋ → | nɡ ;` → `d1 [r] ɡ → | g` (a normalization chain).
 
-## P: prefix runs (173 rules, 7 transforms)
+## P: prefix runs (238 rules, 8 transforms)
 
 *Triggers:* the rule itself. A prefix run is a rule `(P) S → A | $1 ;` or
 `p S → A | p ;`: its text is a character of a set P followed by a text S of
@@ -278,7 +278,14 @@ follow each other in a run: with `te\~ → | t ;` and `to\~ → | t ;`, ICU turn
   `ሀ፟፟፟ል`, `hhh` then `ሀ` (`ha`), then `ል` (`l`): `hhhhal`;
 - ro_FONIPA-ja `e̯ → | e ;`, `o̯ → | o ;`, `t͡ → | t ;` and sk_FONIPA-ja
   `t͡ → | t ;`, `r̩ → | r ;`, `u̯ → | u ;` (A empty: the run of marks is
-  deleted).
+  deleted);
+- Khmr-Latn/UNGEGN (65 rules): the prefix runs `â្ក → k | â ;`,
+  `ô្គ → k | ô ;`, … (S of two characters, a coeng and a consonant; two
+  families, `â` and `ô`), and their 33 triggers, `ក → k | â ;`, … A trigger
+  `C → B | p ;` produces the P of a prefix run (the inherent vowel of the
+  consonant's series), which ICU then revisits: on `ក្ខ្តា`, `k` and `â`,
+  then `kh` and `t` by the prefix runs, then `âា → a`: `kkhta` (on
+  `ក្ខ្ញា`, the run stops at `្ញ`, of the other series: `kkhânhôa`).
 
 *Implementation:*
 
@@ -308,6 +315,24 @@ follow each other in a run: with `te\~ → | t ;` and `to\~ → | t ;`, ICU turn
 
    The before contexts see `A^n P` as in ICU. Otherwise the rules stay in the
    group, and are reported with the reason (`a prefix run, but …`).
+
+   *Triggers.* The rules `C → B | p ;` (C a set, no contexts, B a fixed
+   string, p a character of a P) are applied first, as `C → B p ;`, in a
+   group of their own before the prefix runs, except where ICU does not reach
+   C: after a character k of a covering rule `k c → … ;` (no contexts, c in
+   C), which consumes c with k (Khmer's `្ក → kâ ;`, for a coeng not after
+   P). That group is `k { c → c ;` for the covered pairs, then the triggers.
+   The conditions, beyond those above (`prefixRunConflict`):
+   - no rule before a trigger may match its C;
+   - no rule matches a character of C after the first character of its text,
+     other than the covering rules, and the texts S, where each such character
+     must be covered after the character before it (in Khmer, every consonant
+     of a run has a covering rule);
+   - ICU applies a covering rule wherever its k c occurs: no other rule that
+     may match k followed by c comes before it, and no rule matches k after
+     the first character of its text (the coeng's own `្ → ;` comes last);
+   - no rule revisits a character of C; B contains no character of C, P, S or
+     k, and the other rules may not match it (as A).
 2. *Plan* (`planTransform`). A group of prefix runs alone becomes a step with
    `TransformStep::prefixRuns` (P, S, A for each rule).
 3. *Kernel* (`PrefixRuns` in tconv). By family, the families with the same
@@ -366,20 +391,30 @@ with S of one to three characters were fuzzed against ICU's `createFromRules`
 and literal P, sets within the texts, A of zero to three characters, other
 rules, filters), 5 random lines each, some with runs of up to 400 matches,
 also with 3 threads and segment size 1, all identical; 69 more were refused
-as overlapping. The extension changes the plan of no CLDR transform. The CLDR test data of the 4 `_Geminate`
+as overlapping. The extension changes the plan of no CLDR transform.
+With the triggers, Khmr-Latn/UNGEGN (which has no CLDR test data) is
+identical to ICU 78.3 (`uconv -x` on its rule text, and through the registry
+name) on 9,000 random lines of Khmer syllables with stacks of up to six
+subscript consonants, vowels, signs, independent vowels, stray coengs and
+`â`/`ô` (also with 3 threads and segment size 1). Random groups of triggers,
+prefix runs of two characters, covering rules, rules on P and a final rule
+on k were fuzzed against ICU: 244 implementable rule sets, 20 lines each,
+identical; 128 were refused (a run character without a covering rule, or a
+rule on k before the covering rules). Of the CLDR transforms, only
+Khmr-Latn/UNGEGN changes plan. The CLDR test data of the 4 `_Geminate`
 variants (6,888 cases each) passes: their first step, am_Ethi-am_Ethi/Geminate,
 inserts the gemination marks that the prefix runs then apply to. (It crashed on
 macOS until the JIT compile threads were given 8 MB stacks: LLVM's
 ScalarEvolution overflowed the 512 KB stack of a std::thread compiling its
 7,718 string rules.)
 
-# Part 2. Rules not yet implemented (261 rules)
+# Part 2. Rules not yet implemented (196 rules)
 
 tconv leaves these rules unchanged, and reports their transforms as not
 implementable ("the result has text to revisit", with the reason the
 composition was abandoned).
 
-## R: runs (99 rules, 10 transforms)
+## R: runs (34 rules, 9 transforms)
 
 *Triggers:* the revisit rule itself, or a rule of the same family. The
 revisited text is the *start* of the rule's text, so each application leaves
@@ -388,15 +423,8 @@ gives up when the match extends more than 4 characters beyond the text (or
 after 8 applications). These are the "unbounded runs" of the coverage report
 (§5, W6).
 
-The 173 prefix runs of class P were in this class. What remains:
+The 238 prefix runs and triggers of class P were in this class. What remains:
 
-- Khmr-Latn/UNGEGN (65 rules) `â្ក → k | â ;`, `ô្គ → k | ô ;`, …: every
-  `â្C` rule revisits `â`, which begins all of them, so a run of subscript
-  consonants `â ្C1 ្C2 …` is consumed one at a time. These are prefix runs
-  with S of two characters (`្C`), in two families (`â` and `ô`), but `â` and
-  `ô` are not in the input: the consonant rules of the same group produce
-  them, `ក → k | â ;`, and revisit them, so the prefix runs cannot be applied
-  first (`a rule revisits a character to revisit of a prefix run`);
 - ja_Latn-ru and ja_Latn-ko `te\~ → | t ;`, `to\~ → | t ;` (prefix runs with
   S of two characters, A empty) and `tsu\~ → | ts ;` (P of two characters).
   In ja_Latn-ru, the after context of `\~ } tsu → ;` would see `te~su`
@@ -413,11 +441,9 @@ The 173 prefix runs of class P were in this class. What remains:
   `i $lengthMarker → | ii ;`; ja_Latn-ko `e $lengthMarker → | ei ;`.
 
 *Possible implementation:* prefix runs with S of several characters, in
-families, are implemented (above). Khmr-Latn/UNGEGN needs the rules that
-produce P, `C → B | â`, applied with the prefix runs: on `C (្C')^n`, `B`
-at C, each A at the first position of its match (the coeng), the other
-positions deleted, and `â` at the last. The conflicts of the split are
-specific to each group; some (xh, it) are real: ICU would not reach P.
+families, and their triggers are implemented (above). The conflicts of the
+split are specific to each group; some (xh, it) are real: ICU would not reach
+P.
 
 ## L: long chains (3 rules, 2 transforms)
 

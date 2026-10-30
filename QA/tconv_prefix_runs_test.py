@@ -47,6 +47,11 @@ CASES = [
     ("([ab]) x [yz] w → PQ | $1 ; ([ab]) v y w → | $1 ; a → A ; b → B ; x → X ; y → Y ;",
      "ax y wbvywax z w avywvyw axywX bvyw axzwvywaxyw\na" + "xzwvyw" * LONG + "\n",
      "AX Y wBAX z w A PQAX B PQAPQA\n" + "PQ" * LONG + "A\n"),
+    # Triggers producing P (as Khmer's ក → k | â ;), with covering rules
+    # (\+ k → K ;) for the characters not reached after a \+.
+    ("p \\+ k → x | p ; p \\+ g → yz | p ; p a → A ; \\+ k → K ; \\+ g → G ; k → Q | p ; g → RR | p ; \\+ → ;",
+     "k+k+ga g+gk +ka k++ka pa p+k a+g\nk" + "+g+k" * LONG + "a\n",
+     "QxyzA RRyzpQp Ka QpKa A xp aG\nQ" + "yzx" * LONG + "A\n"),
 ]
 
 

@@ -808,8 +808,11 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  difference (see prefixRunConflict in transform_rules_revisit.cpp), the
 //  prefix runs of a group are moved to a group of their own, before the rest
 //  of the group (separated by :: Null ;), where they are implemented together
-//  as one step (TransformStep::prefixRuns).  Otherwise they are composed as
-//  other rules are (which fails on their unbounded runs).
+//  as one step (TransformStep::prefixRuns).  The rules producing a P that ICU
+//  then revisits, C → B | p ; (triggers), are applied before them, as
+//  C → B p ; in a group of their own, where ICU reaches C (see
+//  prefixRunConflict).  Otherwise they are composed as other rules are
+//  (which fails on their unbounded runs).
 //
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.
@@ -826,7 +829,7 @@ struct RevisitTrigger {
 };
 struct RevisitRecord {
     const Rule * rule;
-    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun} outcome;
+    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger} outcome;
     std::string reason;             // if not composed
     unsigned composedRules = 0;
     std::vector<const Rule *> composed;     // the rules replacing it
@@ -839,7 +842,7 @@ struct RevisitStats {
     unsigned composed = 0;          // replaced by composed rules
     unsigned composedRules = 0;     // the composed rules replacing them
     std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
-    unsigned prefixRuns = 0;        // moved to a group of their own
+    unsigned prefixRuns = 0;        // moved to a group of their own (with their triggers)
     bool keepRecords = false;
     std::vector<RevisitRecord> records;
 };

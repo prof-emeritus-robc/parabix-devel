@@ -800,8 +800,33 @@ bool hasRevisit(const ConversionRule * c) {
 //  The before contexts see A^n P as ICU does.  Within the prefix runs, the
 //  families must be as prefixRunFamilies requires, and A may not contain
 //  characters of P.
+//
+//  A trigger, C → B | p ; (C a set, no contexts, B a fixed string, p a
+//  character of a set P), produces the P of a prefix run, which ICU then
+//  revisits.  The triggers are applied first, as C → B p ; (in a group of
+//  their own, before the prefix runs), except where ICU does not reach C:
+//  where a covering rule, k c → … ; (no contexts, c of a trigger), consumes
+//  it with the character k before it.  Then
+//    - no rule before a trigger may match its C (ICU would apply it instead),
+//    - no rule matches the characters of C within its text, other than the
+//      covering rules (and the texts S of the prefix runs, where each such
+//      character must be covered as well, after the character before it),
+//    - ICU applies the covering rules wherever k c occurs: no other rule
+//      matching k followed by c comes before a covering rule of k c, and no
+//      rule matches k after the first character of its text,
+//    - no rule revisits a character of C, and B contains no character of C,
+//      P, S or k (as A, B is not to be matched by the other rules).
+//  covered gives the pairs (k, c) of the covering rules.
+struct PrefixRunTrigger {
+    UCD::UnicodeSet text;           // C
+    std::u32string replacement;     // B
+    char32_t revisit;               // p
+};
+
 std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vector<bool> & isRun,
-                              const std::vector<PrefixRun> & runs) {
+                              const std::vector<PrefixRun> & runs, const std::vector<bool> & isTrigger,
+                              const std::vector<PrefixRunTrigger> & triggers,
+                              std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> & covered) {
     const std::string families = prefixRunFamilies(runs);
     if (!families.empty()) return families;
     UCD::UnicodeSet first, run, runStart, replaced;
@@ -816,8 +841,51 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
         revisitsReplacement &= pr.revisitsReplacement;
     }
     if (replaced.intersects(first)) return "a replacement may begin a prefix run";
+    //  The characters of the triggers, and the covering rules.
+    UCD::UnicodeSet triggered, triggerOutput;
+    for (const PrefixRunTrigger & tr : triggers) {
+        triggered = triggered + tr.text;
+        for (char32_t c : tr.replacement) triggerOutput.insert(c);
+    }
+    std::vector<bool> isCovering(rules.size(), false);
+    UCD::UnicodeSet coveringFirst;
+    covered.clear();
+    for (size_t k = 0; k < rules.size() && !triggers.empty(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(rules[k]);
+        if (c == nullptr || isRun[k] || isTrigger[k]) continue;
+        const RuleSide * source = c->getSourceSide(Direction::Forward);
+        const std::vector<PatternItem> text = patternItems(source->getText());
+        if (text.size() == 2 && !text[0].repeated && !text[1].repeated && text[1].chars.intersects(triggered)
+                && !source->hasBeforeContext() && !source->hasAfterContext()) {
+            isCovering[k] = true;
+            covered.emplace_back(text[0].chars, text[1].chars & triggered);
+            coveringFirst = coveringFirst + text[0].chars;
+        }
+    }
+    if (!triggers.empty()) {
+        if (triggered.intersects(first) || triggered.intersects(coveringFirst) || first.intersects(coveringFirst)) {
+            return "the characters of the triggers, of P and before the triggers intersect";
+        }
+        if (triggerOutput.intersects(triggered + first + run + coveringFirst)) {
+            return "a trigger's replacement may be matched by a prefix run or a trigger";
+        }
+        //  The characters of C in the texts S, after the characters before them.
+        for (const PrefixRun & pr : runs) {
+            for (size_t j = 0; j < pr.run.size(); ++j) {
+                const UCD::UnicodeSet c = pr.run[j] & triggered;
+                if (c.empty()) continue;
+                if (j == 0) return "a prefix run matches the character of a trigger after P";
+                UCD::UnicodeSet reached;
+                for (const auto & kc : covered) {
+                    if (pr.run[j - 1].subset(kc.first)) reached = reached + kc.second;
+                }
+                if (!c.subset(reached)) return "a prefix run matches the character of a trigger not covered";
+            }
+        }
+        replaced = replaced + triggerOutput;
+    }
     static const UCD::UnicodeSet unassigned = UCD::getPropertyObject(UCD::gc)->GetCodepointSet("Cn");
-    const UCD::UnicodeSet changed = (first + run + replaced) - unassigned;
+    const UCD::UnicodeSet changed = (first + run + replaced + triggered) - unassigned;
     //  The prefix runs after each rule.
     std::vector<std::vector<const PrefixRun *>> later(rules.size() + 1);
     size_t r = runs.size();
@@ -825,12 +893,53 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
         later[k] = later[k + 1];
         if (isRun[k]) later[k].push_back(&runs[--r]);
     }
+    //  The triggers after each rule.
+    std::vector<UCD::UnicodeSet> laterTriggers(rules.size() + 1);
+    size_t tk = triggers.size();
+    for (size_t k = rules.size(); k-- > 0; ) {
+        laterTriggers[k] = laterTriggers[k + 1];
+        if (isTrigger[k]) laterTriggers[k] = laterTriggers[k] + triggers[--tk].text;
+    }
     for (size_t k = 0; k < rules.size(); ++k) {
         const ConversionRule * c = dyn_cast<ConversionRule>(rules[k]);
-        if (c == nullptr || isRun[k]) continue;
+        if (c == nullptr || isRun[k] || isTrigger[k]) continue;
         const RuleSide * source = c->getSourceSide(Direction::Forward);
         const std::vector<PatternItem> text = patternItems(source->getText());
         if (text.empty()) return "an insertion rule may apply: " + printRule(c);
+        if (!triggers.empty()) {
+            if (text[0].chars.intersects(laterTriggers[k])) return "a rule before a trigger may apply instead: " + printRule(c);
+            for (size_t i = 0; i < text.size(); ++i) {
+                if ((i > 0 || text[i].repeated) && text[i].chars.intersects(triggered) && !isCovering[k]) {
+                    return "a rule matches the character of a trigger within its text: " + printRule(c);
+                }
+                if ((i > 0 || text[i].repeated) && text[i].chars.intersects(coveringFirst)) {
+                    return "a rule matches a character before a trigger within its text: " + printRule(c);
+                }
+            }
+            //  A rule matching k followed by c before the covering rules of k c.
+            if (!isCovering[k] && text[0].chars.intersects(coveringFirst)) {
+                const UCD::UnicodeSet * next = nullptr;
+                std::vector<PatternItem> after;
+                if (text.size() > 1) {
+                    next = &text[1].chars;
+                } else if (source->hasAfterContext()) {
+                    after = patternItems(source->getAfterContext());
+                    if (!after.empty() && !after[0].repeated) next = &after[0].chars;
+                }
+                for (size_t j = k + 1; j < rules.size(); ++j) {
+                    if (!isCovering[j]) continue;
+                    const std::vector<PatternItem> cover = patternItems(cast<ConversionRule>(rules[j])->getSourceSide(Direction::Forward)->getText());
+                    if (text[0].chars.intersects(cover[0].chars) && (next == nullptr || next->intersects(cover[1].chars & triggered))) {
+                        return "a rule before a covering rule may apply instead: " + printRule(c);
+                    }
+                }
+            }
+            if (RE * revisit = c->getResultSide(Direction::Forward)->getResultToRevisit()) {
+                for (const PatternItem & item : patternItems(revisit)) {
+                    if (item.chars.intersects(triggered)) return "a rule revisits the character of a trigger: " + printRule(c);
+                }
+            }
+        }
         const bool single = text.size() == 1 && !text[0].repeated;
         //  What may follow the first character of the text: the next item of the
         //  text, or of the after context (nullptr: anything).
@@ -873,6 +982,28 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
         }
     }
     return "";
+}
+
+//  A trigger of the prefix runs (see prefixRunConflict): C → B | p ; with p
+//  in first.
+bool prefixRunTrigger(const ConversionRule * c, const UCD::UnicodeSet & first, PrefixRunTrigger & tr) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    if (!result->hasCursor() || result->getCursorOffset() != 0 || result->getResultToRevisit() == nullptr) return false;
+    std::vector<RE *> text, revisit;
+    textAtoms(source->getText(), text);
+    textAtoms(result->getResultToRevisit(), revisit);
+    if (text.size() != 1 || revisit.size() != 1) return false;
+    if (!CharSetAnalysis::isSet(text[0]) || hasStrings(text[0]) || hasBoundary(text[0])) return false;
+    if (!CharSetAnalysis::isSet(revisit[0]) || hasStrings(revisit[0])) return false;
+    CharSetAnalysis sets;
+    tr.text = sets.setOf(text[0], false);
+    const UCD::UnicodeSet p = sets.setOf(revisit[0], false);
+    if (tr.text.empty() || p.count() != 1 || !p.subset(first)) return false;
+    tr.revisit = static_cast<char32_t>(lo_codepoint(*p.begin()));
+    tr.replacement.clear();
+    return resultString(result->getCompletedResult(), {}, tr.replacement);
 }
 
 std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
@@ -921,11 +1052,59 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 runs.push_back(pr);
             }
         }
-        const std::string runConflict = runs.empty() ? "" : prefixRunConflict(rewritten, isRun, runs);
+        //  And the triggers of the prefix runs, if all such rules are.
+        std::vector<bool> isTrigger(rewritten.size(), false);
+        std::vector<PrefixRunTrigger> triggers;
+        UCD::UnicodeSet runFirst;
+        for (const PrefixRun & pr : runs) runFirst = runFirst + pr.first;
+        for (size_t k = 0; k < rewritten.size() && !runs.empty(); ++k) {
+            ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
+            PrefixRunTrigger tr;
+            if (c && !isRun[k] && !isRewritten[k] && hasRevisit(c) && prefixRunTrigger(c, runFirst, tr)) {
+                isTrigger[k] = true;
+                triggers.push_back(tr);
+            }
+        }
+        std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> covered;
+        std::string runConflict = runs.empty() ? "" : prefixRunConflict(rewritten, isRun, runs, isTrigger, triggers, covered);
+        if (!triggers.empty() && !runConflict.empty()) {
+            //  Without the triggers (whose P are then revisited by ICU only in the rest of the group).
+            const std::string withTriggers = runConflict;
+            std::vector<bool> none(rewritten.size(), false);
+            runConflict = prefixRunConflict(rewritten, isRun, runs, none, {}, covered);
+            if (!runConflict.empty()) runConflict = withTriggers;
+            isTrigger = none;
+            triggers.clear();
+        }
         if (!runs.empty() && runConflict.empty()) {
+            //  The triggers first, C → B p ; except after the characters k of
+            //  the covering rules k c (k { c → c ;).
+            if (!triggers.empty()) {
+                for (const auto & kc : covered) {
+                    for (const auto & range : kc.second) {
+                        for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range); ++ch) {
+                            out.push_back(makeConversionRule(makeRuleSide(makeCC(kc.first), makeCC(ch), nullptr), Direction::Forward,
+                                                             makeRuleSide(makeCC(ch))));
+                        }
+                    }
+                }
+                size_t tr = 0;
+                for (size_t k = 0; k < rewritten.size(); ++k) {
+                    if (!isTrigger[k]) continue;
+                    const PrefixRunTrigger & trigger = triggers[tr++];
+                    out.push_back(makeConversionRule(makeRuleSide(makeCC(trigger.text)), Direction::Forward,
+                                                     makeRuleSide(literal(trigger.replacement + std::u32string(1, trigger.revisit)))));
+                    if (mStats) {
+                        mStats->prefixRuns++;
+                        if (mStats->keepRecords) mStats->records.push_back(RevisitRecord{rewritten[k], RevisitRecord::Outcome::PrefixRunTrigger});
+                    }
+                }
+                out.push_back(makeTransformRule(TransformID("Null")));
+            }
             std::vector<Rule *> rest;
             std::vector<bool> restRewritten;
             for (size_t k = 0; k < rewritten.size(); ++k) {
+                if (isTrigger[k]) continue;
                 if (!isRun[k]) {
                     rest.push_back(rewritten[k]);
                     restRewritten.push_back(isRewritten[k]);

@@ -38,7 +38,8 @@ with repetitions or optional items combined (`--update --only
 Latn-Grek/UNGEGN Latn-Kana`): Latn-Grek/UNGEGN, Latn-Kana and Latn-Hira are
 implementable (395). Then Latn-Grek's iota subscript rules as chain revisits,
 in a group of their own (`ef4e202f9`, `--update --only Latn-Grek`): Latn-Grek remains
-blocked (W3, W6), with fewer problems.*
+blocked (W3, W6), with fewer problems. Then mark run edits (`1317f8cfa`, `--update --only
+Latn-Arab Latin-ThaiLogical Latn-Thai`): Latn-Arab is implementable (396).*
 
 This report covers:
 
@@ -59,8 +60,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 395 (93%) |
-| …of which public (not `visibility="internal"`) | 393 | 364 (93%) |
+| Transforms defined by CLDR files (380 files) | 425 | 396 (93%) |
+| …of which public (not `visibility="internal"`) | 393 | 365 (93%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -165,8 +166,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          395  █████████████████████████████████████
-+ W3 variable-length text    402  ██████████████████████████████████████
+now                          396  █████████████████████████████████████
++ W3 variable-length text    404  ██████████████████████████████████████
 + W6 revisit                 418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
@@ -967,8 +968,8 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 23 | 7 | M–L (the rest) |
-| W6 text to revisit, not composed | 19 | 4 | L (with W3) |
+| W3 variable-length texts | 22 | 8 | M–L (the rest) |
+| W6 text to revisit, not composed | 17 | 4 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1096,6 +1097,10 @@ Latn-Hira implementable: W6 is needed by 19, and alone blocks 4. Latn-Grek's
 iota subscript rules, which revisit their capture extended by U+0345 to the
 next `i`, are chain revisits, applied first by a Pablo kernel (a MatchStar
 through the run of accents); its rough and smooth breathing rules remain.
+Mark run edits, `P ($R*) T → C | $1 ;` applied first by one Pablo kernel per
+group (on the starts of `[P1] R* T` from the regular expression engine), made
+Latn-Arab implementable and left Latin-ThaiLogical and Latn-Thai blocked by
+W3 alone.
 
 **W3 variable-length texts.** Three mechanisms now cover most of it:
 
@@ -1410,6 +1415,7 @@ tconv on every implementable transform.
 | `27321f4e9` | insert-and-revisit rules as insertion passes (am_Ethi-d0_Morse's separator); V checks by first characters |
 | `8a0b58af8` | contexts with repetitions or optional items combined: Latn-Grek/UNGEGN, Latn-Kana, Latn-Hira: 395 |
 | `ef4e202f9` | chain revisits (Latn-Grek's iota subscript), in a group of their own: 395 |
+| `1317f8cfa` | mark run edits, in a group of their own: Latn-Arab: 396 |
 
 ## Reproducing
 

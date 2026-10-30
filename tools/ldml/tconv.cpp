@@ -538,7 +538,8 @@ static std::string revisitRecordJSON(const ldml::RevisitRecord & r) {
     out += ",\"outcome\":";
     out += r.outcome == Outcome::Suffix ? "\"suffix\"" : r.outcome == Outcome::Composed ? "\"composed\""
            : r.outcome == Outcome::PrefixRun ? "\"prefix run\""
-           : r.outcome == Outcome::PrefixRunTrigger ? "\"prefix run trigger\"" : "\"not composed\"";
+           : r.outcome == Outcome::PrefixRunTrigger ? "\"prefix run trigger\""
+           : r.outcome == Outcome::ChainRevisit ? "\"chain revisit\"" : "\"not composed\"";
     if (r.outcome == Outcome::NotComposed) out += ",\"reason\":" + jsonString(r.reason);
     out += ",\"composedRules\":" + std::to_string(r.composedRules);
     out += ",\"composed\":[";
@@ -696,6 +697,10 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
                          << step.transform.getText() << "\n";
             continue;
+        }
+        if (!step.chainRevisitRules.empty()) {
+            llvm::outs() << "  chain revisits: " << step.chainRevisitRules.size() << " rules\n";
+            for (const ldml::ConversionRule * c : step.chainRevisitRules) llvm::outs() << "    " << ldml::printRule(c) << "\n";
         }
         if (!step.prefixRuns.empty()) {
             llvm::outs() << "  prefix runs: " << step.prefixRuns.size() << " rules\n";
@@ -4377,6 +4382,53 @@ private:
     const bool mMasked;
 };
 
+//  The chain revisits of a group (see ldml::ChainRevisit): each character of
+//  X that follows E M1 ... Mk [A X]* (within the mask) becomes Y.  Classes:
+//  E, M1 ... Mk, A, X.
+class ChainRevisits final : public pablo::PabloKernel {
+public:
+    ChainRevisits(LLVMTypeSystemInterface & ts, unsigned fixed, char32_t replacement,
+                  StreamSet * U21, StreamSet * Classes, StreamSet * Mask, StreamSet * Result)
+    : PabloKernel(ts, "ChainRevisits" + std::to_string(fixed) + "_" + std::to_string(static_cast<unsigned>(replacement)) + (Mask ? "m" : ""),
+                  inputBindings(U21, Classes, Mask), {Binding{"Result", Result}})
+    , mFixed(fixed), mReplacement(replacement), mMasked(Mask != nullptr) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("U21");
+        std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        if (mMasked) {
+            PabloAST * const mask = getInputStreamSet("Mask")[0];
+            for (PabloAST *& c : classes) c = pb.createAnd(c, mask);
+        }
+        //  E M1 ... Mk, then the runs of A and X after them.
+        PabloAST * prefix = classes[0];
+        for (unsigned j = 1; j <= mFixed; j++) prefix = pb.createAnd(pb.createAdvance(prefix, 1), classes[j]);
+        PabloAST * const star = classes[mFixed + 1];
+        PabloAST * const last = classes[mFixed + 2];
+        PabloAST * const run = pb.createMatchStar(pb.createAdvance(prefix, 1), pb.createOr(star, last));
+        PabloAST * const replaced = pb.createAnd(run, last);
+        std::vector<Var *> result(basis.size());
+        for (size_t b = 0; b < basis.size(); b++) result[b] = pb.createVar("result" + std::to_string(b), basis[b]);
+        auto body = pb.createScope();
+        pb.createIf(replaced, body);
+        for (size_t b = 0; b < basis.size(); b++) {
+            PabloAST * const kept = body.createAnd(basis[b], body.createNot(replaced));
+            body.createAssign(result[b], ((mReplacement >> b) & 1) ? body.createOr(kept, replaced) : kept);
+        }
+        writeOutputStreamSet("Result", std::vector<PabloAST *>(result.begin(), result.end()));
+    }
+private:
+    static Bindings inputBindings(StreamSet * U21, StreamSet * Classes, StreamSet * Mask) {
+        Bindings b{Binding{"U21", U21}, Binding{"Classes", Classes}};
+        if (Mask) b.emplace_back("Mask", Mask);
+        return b;
+    }
+    const unsigned mFixed;
+    const char32_t mReplacement;
+    const bool mMasked;
+};
+
 //  The prefix runs of a group (see ldml::TransformStep::prefixRuns), by family
 //  (the prefix runs with the same set P; see ldml::prefixRunFamilies), the
 //  families with the same texts S (in the same order) sharing a run class.  At
@@ -4672,6 +4724,7 @@ private:
     StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * chainRevisitsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionsEligible();
     StreamSet * titlecase(StreamSet * U21);
     StreamSet * hexJava(StreamSet * U21);
@@ -4708,7 +4761,8 @@ private:
 
 //  The rules of a conversion group, of all kinds.
 static size_t groupRules(const ldml::TransformStep & step) {
-    size_t rules = step.rules.size() + step.insertions.size() + step.deferred.size() + step.prefixRuns.size();
+    size_t rules = step.rules.size() + step.insertions.size() + step.deferred.size() + step.prefixRuns.size()
+                   + step.chainRevisitRules.size();
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) rules += set.rules.size();
     return rules;
 }
@@ -6679,6 +6733,19 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
     return Result;
 }
 
+//  The chain revisits of a group (ChainRevisits).
+StreamSet * RulePipelineBuilder::chainRevisitsGroup(const ldml::TransformStep & step, StreamSet * U21) {
+    const ldml::ChainRevisit & chain = step.chainRevisit;
+    std::vector<UCD::UnicodeSet> sets{chain.first};
+    sets.insert(sets.end(), chain.fixed.begin(), chain.fixed.end());
+    sets.push_back(chain.star);
+    sets.push_back(chain.last);
+    StreamSet * const Classes = classes(sets, U21);
+    StreamSet * const Result = mP.CreateStreamSet(21);
+    mP.CreateKernelCall<ChainRevisits>(static_cast<unsigned>(chain.fixed.size()), chain.replacement, U21, Classes, activeMask(), Result);
+    return Result;
+}
+
 StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     DeferredConfig config;
@@ -6872,6 +6939,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (step.filter) popFilter();
         } else {
             const size_t kernels = mP.getNumOfKernelCalls();
+            if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
             if (!step.prefixRuns.empty()) U21 = prefixRunsGroup(step, U21);
             if (!step.subgroups.empty() || !step.stringRules.empty() || !step.captureReplacements.empty() || !step.insertions.empty()) {
                 U21 = conversionGroup(step, U21);

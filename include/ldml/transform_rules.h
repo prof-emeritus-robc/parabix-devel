@@ -822,6 +822,20 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  where the rest of the group cannot see the difference (see
 //  insertionRevisit in transform_rules_revisit.cpp).
 //
+//  A chain revisit replaces the last character X of its text, after a
+//  capture of a character of E, characters of fixed sets M1 ... Mk and a
+//  repetition of a set A, by a character Y of A, and revisits all,
+//      (E M1 ... Mk A*) X → | $1 Y ;
+//  so that ICU applies it again on the same capture, extended by Y, to the
+//  next X after A*.  The chain revisits of a group (with the same E, M, A
+//  and Y) are applied before the rest of the group, in a group of their
+//  own, where the rest of the group cannot see the difference (see
+//  chainRevisitSplit in transform_rules_revisit.cpp); E then also has the
+//  characters c that the group replaces by a character of E, revisited,
+//  where followed by M1 (as c → | e ;).  In a group of their own, they
+//  replace each character of X that follows E M1 ... Mk [A X]* (see
+//  ChainRevisit).
+//
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.
 //  With records, each rule with text to revisit is also described: how it was
@@ -837,7 +851,7 @@ struct RevisitTrigger {
 };
 struct RevisitRecord {
     const Rule * rule;
-    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger} outcome;
+    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger, ChainRevisit} outcome;
     std::string reason;             // if not composed
     unsigned composedRules = 0;
     std::vector<const Rule *> composed;     // the rules replacing it
@@ -851,6 +865,7 @@ struct RevisitStats {
     unsigned composedRules = 0;     // the composed rules replacing them
     std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
     unsigned prefixRuns = 0;        // moved to a group of their own (with their triggers)
+    unsigned chainRevisits = 0;     // moved to a group of their own
     bool keepRecords = false;
     std::vector<RevisitRecord> records;
 };
@@ -867,6 +882,23 @@ bool prefixRun(const ConversionRule * rule, PrefixRun & run);
 //  Whether prefix runs may be applied together (see the definition): the empty
 //  string if so, or the reason why not.
 std::string prefixRunFamilies(const std::vector<PrefixRun> & runs);
+
+//  The sets and the replacement of a chain revisit (see ComposeRevisits),
+//  (E M1 ... Mk A*) X → | $1 Y ;  In a group of chain revisits alone (with
+//  the same E, M, A and Y), each character of X that follows
+//  E M1 ... Mk [A X]* becomes Y: ICU applies the rule at E, and again on
+//  the capture extended by Y, through the run of A and X.  The rule must
+//  be such that this holds: Y in A, X not in A, Y not in E or M, M not
+//  meeting X, and, if E meets X (whose characters may be replaced before
+//  they are reached as E), M within A.
+struct ChainRevisit {
+    UCD::UnicodeSet first;                  // E
+    std::vector<UCD::UnicodeSet> fixed;     // M1 ... Mk
+    UCD::UnicodeSet star;                   // A
+    UCD::UnicodeSet last;                   // X
+    char32_t replacement = 0;               // Y
+};
+bool chainRevisit(const ConversionRule * rule, ChainRevisit & chain);
 
 //  Expansion of function calls on captures of single characters.
 //

@@ -431,6 +431,9 @@ private:
                std::vector<int> referenced, RE * text, std::vector<Rule *> & composed);
     void finish(Path p, RE * text, std::vector<Rule *> & composed);
     Rule * suffixRevisit(ConversionRule * r);
+    bool chainRevisitSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
+                           std::vector<bool> & isChain, ChainRevisit & chain, std::string & reason);
+    bool chainUnseen(const ConversionRule * r, const ChainRevisit & chain, const UCD::UnicodeSet & first, std::string & reason);
     CharSetAnalysis mSets;
     RevisitStats * mStats;
     RevisitRecord * mRecord = nullptr;
@@ -453,6 +456,8 @@ bool Composer::collectItems(RE * re, std::vector<Item> & items) {
         return true;
     } else if (Alt * alt = dyn_cast<Alt>(re); alt && alt->size() == 1) {
         return collectItems(alt->front(), items);
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        return collectItems(c->getCapturedRE(), items);
     } else if (Name * name = dyn_cast<Name>(re)) {
         return !isFunctionCall(name) && name->getDefinition() && collectItems(name->getDefinition(), items);
     } else if (Rep * rep = dyn_cast<Rep>(re)) {
@@ -1333,6 +1338,298 @@ bool prefixRunAsRun(const ConversionRule * c, const std::vector<Rule *> & group,
     return true;
 }
 
+//  Whether a rule of a group cannot see the difference made by applying the
+//  chain revisits of the group (with first, E and the characters c that the
+//  group revisits as one of E) before the group: where, in a match of the
+//  rule (its text and after context, from a position before E), E is
+//  followed by M1 ... Mk and A*, its items do not distinguish X from Y
+//  (ICU replaces X only when it reaches E).  The items are matched
+//  possessively: an optional item or a repetition is left only on a
+//  character it does not match.  A rule whose text consumes E (after its
+//  first character) must revisit, with ICU then applying the chain revisits
+//  at E: its text to revisit is that from E on (a character of E, or the
+//  characters of E as captured) followed by characters of A not in M,
+//  inserted only after M1 ... Mk.  A rule whose text to revisit has a
+//  character of E must be such a rule.
+bool Composer::chainUnseen(const ConversionRule * r, const ChainRevisit & chain, const UCD::UnicodeSet & first,
+                           std::string & reason) {
+    const RuleSide * source = r->getSourceSide(Direction::Forward);
+    const RuleSide * result = r->getResultSide(Direction::Forward);
+    std::vector<Item> items;
+    if (!collectItems(source->getText(), items)) {
+        reason = "the text of " + printRule(r) + " is not a sequence of sets";
+        return false;
+    }
+    const size_t textItems = items.size();
+    if (source->hasAfterContext() && !collectItems(source->getAfterContext(), items)) {
+        reason = "the after context of " + printRule(r) + " is not a sequence of sets";
+        return false;
+    }
+    //  E after the first character of the text (at the first, the chain
+    //  revisits apply first, or, for c, as c → | e ;).
+    bool consumes = false;
+    for (size_t i = 0; i < textItems; ++i) consumes |= (i > 0 || items[i].star) && items[i].chars.intersects(first);
+    const bool revisits = hasRevisit(r);
+    bool inserts = false;       // characters of A after the text to revisit
+    std::vector<RE *> revisit;
+    bool revisitsFirst = false;
+    if (revisits) {
+        textAtoms(result->getResultToRevisit(), revisit);
+        for (RE * e : revisit) {
+            revisitsFirst |= CharSetAnalysis::isSet(e) && !hasStrings(e) && mSets.setOf(e, false).intersects(first);
+        }
+    }
+    if (revisits && (consumes || revisitsFirst)) {
+        //  The text to revisit, from the first atom of the text with E.
+        std::vector<RE *> text;
+        textAtoms(source->getText(), text);
+        std::u32string completed;
+        const bool all = result->getCursorOffset() == 0 && resultString(result->getCompletedResult(), {}, completed) && completed.empty();
+        bool ok = all;
+        size_t a = 0;
+        for (; ok && a < text.size(); ++a) {
+            std::vector<Item> atomItems;
+            if (!collectItems(text[a], atomItems)) ok = false;
+            bool hasFirst = false;
+            for (const Item & item : atomItems) hasFirst |= item.chars.intersects(first);
+            if (hasFirst) break;
+        }
+        size_t k = 0;
+        auto literal = [&](RE * e, const UCD::UnicodeSet & within) {
+            if (!CharSetAnalysis::isSet(e) || hasStrings(e)) return false;
+            const UCD::UnicodeSet c = mSets.setOf(e, false);
+            return c.count() == 1 && c.subset(within);
+        };
+        if (ok && a < text.size() && !isa<Capture>(text[a])) {
+            //  A character of E replacing the atom (a set within E and c).
+            ok = CharSetAnalysis::isSet(text[a]) && !hasStrings(text[a]) && mSets.setOf(text[a], false).subset(first)
+                 && !revisit.empty() && literal(revisit[0], chain.first);
+            k = 1;
+            ++a;
+        }
+        for (; ok && a < text.size(); ++a, ++k) {
+            const Capture * c = dyn_cast<Capture>(text[a]);
+            const Reference * ref = k < revisit.size() ? dyn_cast<Reference>(revisit[k]) : nullptr;
+            ok = c && ref && ref->getName() == c->getName();
+        }
+        UCD::UnicodeSet m;
+        for (const UCD::UnicodeSet & f : chain.fixed) m = m + f;
+        for (; ok && k < revisit.size(); ++k) {
+            ok = literal(revisit[k], chain.star - m);
+            inserts = true;
+        }
+        //  Or, at its first character, a character replaced by one revisited
+        //  (as c → | e ; where not followed by M1, or else c is in E).
+        if (!ok && !consumes) {
+            ok = all && text.size() == 1 && CharSetAnalysis::isSet(text[0]) && !hasStrings(text[0]) && revisit.size() == 1
+                 && literal(revisit[0], ~UCD::UnicodeSet());
+        }
+        if (!ok) {
+            reason = printRule(r) + (consumes ? " matches a character of E and does not revisit it as the chain revisits require"
+                                              : " revisits a character of E");
+            return false;
+        }
+    }
+    //  The matches from a position before E: states (item, chain position,
+    //  characters excluded by the optional items and repetitions left, and
+    //  whether E was matched by the text).
+    const size_t k = chain.fixed.size();
+    struct State {
+        size_t item;
+        size_t at;              // M1 ... Mk, then k: within [A X]*
+        UCD::UnicodeSet excluded;
+        bool fromText;
+    };
+    std::vector<State> pending, seen;
+    auto push = [&](State st) {
+        //  Leaving optional items and repetitions.
+        while (true) {
+            for (const State & o : seen) {
+                if (o.item == st.item && o.at == st.at && o.excluded == st.excluded && o.fromText == st.fromText) return;
+            }
+            seen.push_back(st);
+            pending.push_back(st);
+            if (st.item < items.size() && (items[st.item].optional || items[st.item].star)) {
+                st.excluded = st.excluded + items[st.item].chars;
+                st.item++;
+            } else {
+                return;
+            }
+        }
+    };
+    auto next = [&](size_t i) {return items[i].star ? i : i + 1;};
+    for (size_t i = 0; i < items.size(); ++i) {
+        if ((i > 0 || items[i].star) && items[i].chars.intersects(first)) push(State{next(i), 0, UCD::UnicodeSet(), i < textItems});
+    }
+    while (!pending.empty()) {
+        const State st = pending.back();
+        pending.pop_back();
+        //  The characters that may come next (in the chain).
+        const UCD::UnicodeSet following = (st.at < k ? chain.fixed[st.at] : chain.star + chain.last) - st.excluded;
+        if (following.empty()) continue;
+        if (st.fromText && st.item == textItems) {
+            //  The end of the text, with E consumed: ICU reaches E again only
+            //  by revisiting it, and then E M must not be separated.
+            if (!revisits) {
+                reason = printRule(r) + " matches a character of E (followed by M) and does not revisit it";
+                return false;
+            }
+            if (inserts && st.at < k) {
+                reason = printRule(r) + " inserts characters between E and M";
+                return false;
+            }
+        }
+        if (st.item >= items.size()) continue;
+        const Item & item = items[st.item];
+        if (st.at < k) {
+            if (following.intersects(item.chars)) push(State{next(st.item), st.at + 1, UCD::UnicodeSet(), st.fromText});
+            continue;
+        }
+        if ((chain.star - st.excluded).intersects(item.chars)) push(State{next(st.item), k, UCD::UnicodeSet(), st.fromText});
+        //  A character of X (Y once the chain revisits are applied first).
+        const UCD::UnicodeSet x = chain.last - st.excluded;
+        if (x.empty()) continue;
+        const bool yIn = item.chars.contains(chain.replacement);
+        if (st.excluded.contains(chain.replacement) || (x.intersects(item.chars) && !(yIn && x.subset(item.chars)))
+                || (yIn && !x.intersects(item.chars))) {
+            reason = printRule(r) + " may see a character of X that a chain revisit replaces";
+            return false;
+        }
+        if (yIn) push(State{next(st.item), k, UCD::UnicodeSet(), st.fromText});
+    }
+    return true;
+}
+
+//  The chain revisits of a group (see ComposeRevisits; isChain), if they may
+//  be applied before the rest of the group, in a group of their own:
+//    - all with the same E, M, A and Y (chain, with X the union), within the
+//      filter (Y as well, which ICU revisits),
+//    - no rule before them may begin at a character of E (ICU would apply it
+//      at E instead),
+//    - the characters c that the first rule applying at c followed by M1
+//      replaces by a character of E, revisited, c → | e ; (without contexts),
+//      are added to E (ICU revisits e M1 ...), where no other rule may apply
+//      at c followed by M1 before it,
+//    - no other rule can see the difference (chainUnseen).
+bool Composer::chainRevisitSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
+                                 std::vector<bool> & isChain, ChainRevisit & chain, std::string & reason) {
+    isChain.assign(group.size(), false);
+    bool any = false;
+    size_t last = 0;
+    for (size_t k = 0; k < group.size(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+        ChainRevisit ch;
+        if (c == nullptr || !hasRevisit(c) || !chainRevisit(c, ch)) continue;
+        if (any) {
+            if (!(ch.first == chain.first) || ch.fixed != chain.fixed || !(ch.star == chain.star) || ch.replacement != chain.replacement) {
+                reason = "chain revisits with different sets";
+                return false;
+            }
+            chain.last = chain.last + ch.last;
+        } else {
+            chain = ch;
+            any = true;
+        }
+        isChain[k] = true;
+        last = k;
+    }
+    if (!any) return false;
+    if (filter) {
+        chain.first = chain.first & *filter;
+        for (UCD::UnicodeSet & m : chain.fixed) m = m & *filter;
+        chain.star = chain.star & *filter;
+        chain.last = chain.last & *filter;
+        bool empty = chain.first.empty() || chain.last.empty() || !filter->contains(chain.replacement);
+        for (const UCD::UnicodeSet & m : chain.fixed) empty |= m.empty();
+        if (empty) {
+            reason = "chain revisits outside the filter";
+            return false;
+        }
+    }
+    //  The characters with which a rule may begin.
+    auto firstOf = [&](const ConversionRule * r, UCD::UnicodeSet & f) {
+        const RuleSide * source = r->getSourceSide(Direction::Forward);
+        bool nullable = false;
+        f = UCD::UnicodeSet();
+        if (!firstChars(source->getText(), f, nullable)) return false;
+        if (nullable && (!source->hasAfterContext() || !firstChars(source->getAfterContext(), f, nullable) || nullable)) return false;
+        return true;
+    };
+    for (size_t k = 0; k < last; ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+        if (c == nullptr || isChain[k]) continue;
+        UCD::UnicodeSet f;
+        if (!firstOf(c, f) || f.intersects(chain.first)) {
+            reason = printRule(c) + " may apply at E before the chain revisits";
+            return false;
+        }
+    }
+    //  c → | e ; without contexts, e in E.
+    auto revisitsAsFirst = [&](const ConversionRule * r) {
+        const RuleSide * source = r->getSourceSide(Direction::Forward);
+        const RuleSide * result = r->getResultSide(Direction::Forward);
+        if (!hasRevisit(r) || source->hasBeforeContext() || source->hasAfterContext() || result->getCursorOffset() != 0) return false;
+        std::u32string completed;
+        if (!resultString(result->getCompletedResult(), {}, completed) || !completed.empty()) return false;
+        std::vector<RE *> text, revisit;
+        textAtoms(source->getText(), text);
+        textAtoms(result->getResultToRevisit(), revisit);
+        if (text.size() != 1 || revisit.size() != 1 || !CharSetAnalysis::isSet(text[0]) || hasStrings(text[0]) || hasBoundary(text[0])) return false;
+        if (!CharSetAnalysis::isSet(revisit[0]) || hasStrings(revisit[0])) return false;
+        const UCD::UnicodeSet e = mSets.setOf(revisit[0], false);
+        return e.count() == 1 && e.subset(chain.first);
+    };
+    UCD::UnicodeSet candidates;
+    for (size_t k = 0; k < group.size(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+        if (c == nullptr || isChain[k] || !revisitsAsFirst(c)) continue;
+        std::vector<RE *> text;
+        textAtoms(c->getSourceSide(Direction::Forward)->getText(), text);
+        candidates = candidates + (mSets.setOf(text[0], false) - chain.first);
+    }
+    if (filter) candidates = candidates & *filter;
+    if (candidates.count() > 256) {
+        reason = "too many characters revisited as E";
+        return false;
+    }
+    const UCD::UnicodeSet m1 = chain.fixed.empty() ? chain.star + chain.last : chain.fixed.front();
+    UCD::UnicodeSet first = chain.first;
+    for (const auto & range : candidates) {
+        for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range); ++ch) {
+            for (size_t k = 0; k < group.size(); ++k) {
+                const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+                if (c == nullptr || isChain[k]) continue;
+                UCD::UnicodeSet f;
+                if (!firstOf(c, f)) {
+                    reason = "the first characters of " + printRule(c) + " are not known";
+                    return false;
+                }
+                if (!f.contains(ch)) continue;
+                const RuleSide * source = c->getSourceSide(Direction::Forward);
+                std::vector<Item> items;
+                bool ok = collectItems(source->getText(), items) && (!source->hasAfterContext() || collectItems(source->getAfterContext(), items));
+                ok = ok && !items.empty() && !items[0].optional && !items[0].star && items[0].chars.contains(ch);
+                if (ok && items.size() > 1) {
+                    if (!items[1].optional && !items[1].star && !items[1].chars.intersects(m1)) continue;
+                    ok = false;
+                }
+                if (!ok || source->hasBeforeContext()) {
+                    reason = printRule(c) + " may apply at a character revisited as E";
+                    return false;
+                }
+                if (revisitsAsFirst(c)) first.insert(ch);
+                break;
+            }
+        }
+    }
+    for (size_t k = 0; k < group.size(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+        if (c && !isChain[k] && !chainUnseen(c, chain, first, reason)) return false;
+    }
+    chain.first = first;
+    return true;
+}
+
 std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
     std::vector<Rule *> out;
     //  The global filter (contexts see the characters outside it).
@@ -1379,6 +1676,46 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 rewritten.erase(rewritten.begin() + k);
             }
             break;
+        }
+        //  The chain revisits, in a group of their own before (see
+        //  chainRevisitSplit), with E extended.
+        std::vector<bool> isChain;
+        ChainRevisit chain;
+        std::string chainReason;
+        if (chainRevisitSplit(rewritten, filter ? &*filter : nullptr, isChain, chain, chainReason)) {
+            std::vector<Rule *> rest;
+            for (size_t k = 0; k < rewritten.size(); ++k) {
+                if (!isChain[k]) {
+                    rest.push_back(rewritten[k]);
+                    continue;
+                }
+                ConversionRule * c = cast<ConversionRule>(rewritten[k]);
+                ChainRevisit own;
+                chainRevisit(c, own);
+                std::vector<RE *> text;
+                textAtoms(c->getSourceSide(Direction::Forward)->getText(), text);
+                std::vector<RE *> captured{makeCC(chain.first)};
+                for (const UCD::UnicodeSet & m : chain.fixed) captured.push_back(makeCC(m));
+                captured.push_back(makeRep(makeCC(chain.star), 0, Rep::UNBOUNDED_REP));
+                const std::string name = cast<Capture>(text[0])->getName();
+                Capture * const capture = makeCapture(name, makeSeq(captured.begin(), captured.end()));
+                RE * const last = makeCC(filter ? own.last & *filter : own.last);
+                Rule * const r = makeConversionRule(makeRuleSide(nullptr, makeSeq({capture, last}), nullptr), Direction::Forward,
+                                                    makeRuleSide(nullptr, makeSeq(), makeSeq({makeReference(name, capture, 0),
+                                                                                              makeCC(chain.replacement)}), 0, nullptr));
+                out.push_back(r);
+                if (mStats) {
+                    mStats->candidates++;
+                    mStats->chainRevisits++;
+                    if (mStats->keepRecords) {
+                        mStats->records.push_back(RevisitRecord{c, RevisitRecord::Outcome::ChainRevisit});
+                        mStats->records.back().composedRules = 1;
+                        mStats->records.back().composed.push_back(r);
+                    }
+                }
+            }
+            out.push_back(makeTransformRule(TransformID("Null")));
+            rewritten = std::move(rest);
         }
         std::vector<bool> isRewritten(rewritten.size(), false);
         for (Rule *& r : rewritten) {
@@ -1607,6 +1944,46 @@ bool prefixRun(const ConversionRule * c, PrefixRun & pr) {
     pr.replacement.clear();
     if (!resultString(result->getCompletedResult(), {}, pr.replacement)) return false;
     return true;
+}
+
+bool chainRevisit(const ConversionRule * c, ChainRevisit & ch) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    if (!result->hasCursor() || result->getCursorOffset() != 0 || result->getResultToRevisit() == nullptr) return false;
+    std::u32string completed;
+    if (!resultString(result->getCompletedResult(), {}, completed) || !completed.empty()) return false;
+    std::vector<RE *> text, revisit, captured;
+    textAtoms(source->getText(), text);
+    textAtoms(result->getResultToRevisit(), revisit);
+    if (text.size() != 2 || revisit.size() != 2) return false;
+    const Capture * cap = dyn_cast<Capture>(text[0]);
+    const Reference * ref = dyn_cast<Reference>(revisit[0]);
+    if (cap == nullptr || ref == nullptr || ref->getName() != cap->getName()) return false;
+    CharSetAnalysis sets;
+    auto set = [&](RE * e, UCD::UnicodeSet & s) {
+        if (!CharSetAnalysis::isSet(e) || hasStrings(e) || hasBoundary(e)) return false;
+        s = sets.setOf(e, false);
+        return !s.empty();
+    };
+    UCD::UnicodeSet y;
+    if (!set(text[1], ch.last) || !set(revisit[1], y) || y.count() != 1) return false;
+    ch.replacement = static_cast<char32_t>(lo_codepoint(*y.begin()));
+    textAtoms(cap->getCapturedRE(), captured);
+    if (captured.size() < 2) return false;
+    const Rep * rep = dyn_cast<Rep>(captured.back());
+    if (rep == nullptr || rep->getLB() != 0 || rep->getUB() != Rep::UNBOUNDED_REP || !set(rep->getRE(), ch.star)) return false;
+    if (!set(captured.front(), ch.first)) return false;
+    ch.fixed.clear();
+    bool fixedInStar = true;
+    for (size_t k = 1; k + 1 < captured.size(); ++k) {
+        UCD::UnicodeSet m;
+        if (!set(captured[k], m) || m.intersects(ch.last) || m.contains(ch.replacement)) return false;
+        fixedInStar &= m.subset(ch.star);
+        ch.fixed.push_back(m);
+    }
+    if (!ch.star.contains(ch.replacement) || ch.star.intersects(ch.last) || ch.first.contains(ch.replacement)) return false;
+    return !ch.first.intersects(ch.last) || fixedInStar;
 }
 
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats) {

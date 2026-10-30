@@ -337,6 +337,10 @@ struct TransformStep {
     // them within the filters), the characters become A^n P.
     std::vector<PrefixRun> prefixRuns;
     std::vector<const ConversionRule *> prefixRunRules;
+    // The chain revisits (see ComposeRevisits), in a group of their own (with
+    // the same E, M, A and Y; X the union of theirs), and their rules.
+    ChainRevisit chainRevisit;
+    std::vector<const ConversionRule *> chainRevisitRules;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

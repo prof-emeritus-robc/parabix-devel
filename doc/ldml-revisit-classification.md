@@ -1,8 +1,8 @@
 # Revisit rules in the CLDR transforms: what the revisit triggers
 
 *October 28, 2026; updated October 29 for the prefix runs (class P), with S
-of one or more characters, and their triggers, and for classes V (V′) and K
-(K′). CLDR
+of one or more characters, and their triggers, for classes V (V′) and K
+(K′), and on October 30 for the chain revisits (class I). CLDR
 transforms from `~/cldr/common/transforms` (with the local W7 fixes, including
 the Greek_Latin_UNGEGN capture fix), tconv with `--revisit-report`.*
 
@@ -43,7 +43,7 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 
 ## Summary
 
-**932 revisit rules in 46 transforms: 826 implemented, 106 not yet.**
+**932 revisit rules in 46 transforms: 828 implemented, 104 not yet.**
 
 | | Class | What the revisit triggers | Rules | Transforms | Composed rules per revisit rule (median / max) |
 |---|---|---|---:|---:|---|
@@ -56,10 +56,11 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 | | **P** prefix runs | the rule itself, on P S^n, leaving A^n P; applied first, as a group of their own (after their triggers, which produce P), or, with A empty, as run rules | 239 | 9 | — |
 | | **V′** formerly V | the rules of the group, once a rule inserting and revisiting all is set apart as an insertion rule, or a rule not of fixed length is seen not to begin at the text to revisit | 86 | 6 | — |
 | | **K′** formerly K | the rules of the group, with contexts combined item by item (possessive repetitions and optional items) | 3 | 2 | — |
+| | **I** chain revisits | the rule itself, on its capture extended by its replacement, through a run of marks; applied first, in a group of its own | 2 | 1 | — |
 | **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 33 | 8 | — |
 | | **L** long chains | different rules, consuming further input in turn | 3 | 2 | — |
 | | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 19 | 4 | — |
-| | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 51 | 5 | — |
+| | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 49 | 5 | — |
 | | **K** contexts not combinable | contexts with repetitions or optional items that must be combined | 0 | 0 | — |
 
 Two structural facts stand out:
@@ -83,7 +84,7 @@ x = extends beyond the text to revisit, r = revisits in turn, B = blocking.
 `⇒` introduces the composed rules that replace a revisit rule, as
 `--revisit-report` prints them.
 
-# Part 1. Rules implemented by tconv (826 rules)
+# Part 1. Rules implemented by tconv (828 rules)
 
 ## How tconv implements revisits
 
@@ -483,7 +484,50 @@ Latn-Hira, through it) are implementable, identical to ICU 78.3's
 `createFromRules` on the rules of their files (reverse and forward) on
 2,000 random lines each.
 
-# Part 2. Rules not yet implemented (106 rules)
+## I: chain revisits (2 rules, 1 transform)
+
+*Triggers:* the rule itself. Latn-Grek's iota subscript rules,
+`($evowel $macron $accentMinus*) i → | $1 $iotasub ;` (and `I`), replace the
+`i` after a long vowel and its accents by U+0345 and revisit the capture,
+which then extends over U+0345 (an accent) to the next `i`: on `ā i ̄ i`,
+ICU applies the rule twice. They were N (the capture is not one character),
+and they blocked 6 rules of V.
+
+*Implementation:* a chain revisit, `(E M1 ... Mk A*) X → | $1 Y ;` with
+`Y` in `A` (`chainRevisit`), replaces in a group of its own each `X` that
+follows `E M1 ... Mk [A X]*`, which a Pablo kernel computes with a
+MatchStar (`ChainRevisits` in tconv). Before contexts cannot express it:
+ICU matches them backward, and `$accentMinus*` would take the macron. The
+chain revisits of a group are applied before the rest of the group, in a
+group of their own, when the rest cannot see the difference
+(`chainRevisitSplit`, `chainUnseen`):
+
+- no rule before them may begin at `E` (ICU would apply it there instead);
+- the characters `c` that the first rule applying at `c` followed by `M1`
+  replaces by a character of `E`, revisited, are added to `E`: `j → | i ;`
+  and `v → | u ;` where `v } $vowel → | b ;` does not apply before a macron,
+  giving `[$evowel jJvwVW]`;
+- where another rule's text and after context may match from before `E`
+  through `E M1 ... Mk A*`, matched possessively, their sets treat `X` and `Y`
+  alike;
+- a rule matching `E` after the first character of its text must revisit
+  it, so that ICU reaches `E` again: its text to revisit must be the text
+  from `E` (or a character of `E` in its place) followed by characters of
+  `A` not in `M`, inserted only after `M1 ... Mk` (the rough and smooth
+  breathing rules, `h ($evowel $macron? $ddot?) → | $1 $rough ;`, insert
+  `̔` or `̓`), and a rule revisiting a character of `E` must be such a rule,
+  or replace a single character.
+
+With the rules of Latn-Grek moved this way (by hand, into a `::(Null);`
+group), ICU 78.3's `createFromRules` gives the same results as on the
+original rules on 25,000 random lines (4,112 of them with U+0345); without
+`jJvwVW` in `E`, 38 lines differ. tconv gives ICU's results on a test rules
+file with a family (QA `tconv_chain_revisits_test.py`). Latn-Grek's 6 rules
+`j → | i ;`, … are still V, now blocked by the smooth breathing rule (N),
+and moving the breathing rules too does not preserve the results (`ph`,
+`ch`, `rh`, `th` take the `h` before ICU reaches it).
+
+# Part 2. Rules not yet implemented (104 rules)
 
 tconv leaves these rules unchanged, and reports their transforms as not
 implementable ("the result has text to revisit", with the reason the
@@ -542,7 +586,7 @@ such rule. What remains (86 more were V before the changes of V′ above):
 | Blocking rule | Transform | Revisit rules blocked |
 |---|---|---:|
 | `($lcgvowel+ $ddotmac?) $rough → h \| $1 ;` (and 1 more rough breathing rule) | Grek-Latn | 8 |
-| `($evowel $macron $accentMinus*) i → \| $1 $iotasub ;` | Latn-Grek | 6 |
+| `$notLetter { ($evowel $macron? $evowel2 $macron?) } [^$smooth$rough] → \| $1 $smooth ;` (formerly the iota subscript rule, now class I) | Latn-Grek | 6 |
 | `[Pp] { } [ΣςσϷϸϺϻ] → \' ;` (insertion) | Grek-Latn/UNGEGN, Grek-Latn | 2 + 2 |
 | `ṣ ($notAbove*) ̄ → ศ \| $1 ;` | Latin-ThaiLogical | 1 |
 
@@ -554,11 +598,11 @@ Here the blocking rule may begin at the revisited text: Grek-Latn/UNGEGN's
 variable length and revisit them (rough breathing, iota subscript); the
 transforms have many other problems (W3, W4, N).
 
-## N: the revisit rule cannot be enumerated (51 rules, 5 transforms)
+## N: the revisit rule cannot be enumerated (49 rules, 5 transforms)
 
 *Triggers:* not explored. The rule's own result references a capture that is
-not a single character (`Latn-Grek ($evowel $macron $accentMinus*) i → | $1 $iotasub ;`,
-28 rules; Latin-ThaiLogical `h ($notAbove*) ̄ → ห | $1 ;`; Latn-Arab
+not a single character (`Latn-Grek h ($evowel $macron? $ddot?) → | $1 $rough ;`,
+26 rules, the rough and smooth breathing; Latin-ThaiLogical `h ($notAbove*) ̄ → ห | $1 ;`; Latn-Arab
 `t ($notAbove+) ̈ → ة | $1 ;`; Zawgyi-my `^ ၄ ($nondigits) → | ၎ $1 ;`), or a
 capture of more than 64 characters (Grek-Latn `Ε ($glower) $rough → H | ε $1 ;`).
 Most move a run of combining marks (`$1`) past a letter, and revisit the

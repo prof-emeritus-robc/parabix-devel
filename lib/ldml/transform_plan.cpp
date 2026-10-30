@@ -1239,6 +1239,33 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
         }
         start = end + 1;
     }
+    //  The chain revisits (see ComposeRevisits) of the groups of chain revisits
+    //  alone, with the same E, M, A and Y.
+    std::set<const Rule *> chainRevisits;
+    for (size_t start = 0; start < rules.size(); ) {
+        size_t end = start;
+        bool allChains = true, any = false;
+        ChainRevisit first;
+        while (end < rules.size() && !isa<TransformRule>(rules[end])) {
+            ChainRevisit ch;
+            if (const ConversionRule * c = dyn_cast<ConversionRule>(rules[end])) {
+                if (!chainRevisit(c, ch)) {
+                    allChains = false;
+                } else if (!any) {
+                    first = ch;
+                    any = true;
+                } else {
+                    allChains &= ch.first == first.first && ch.fixed == first.fixed && ch.star == first.star
+                                 && ch.replacement == first.replacement;
+                }
+            }
+            ++end;
+        }
+        for (size_t k = start; k < end && allChains && any; ++k) {
+            if (isa<ConversionRule>(rules[k])) chainRevisits.insert(rules[k]);
+        }
+        start = end + 1;
+    }
     size_t groupIndex = 0;
     for (Rule * r : rules) {
         if (FilterRule * f = dyn_cast<FilterRule>(r)) {
@@ -1267,6 +1294,22 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
                 }
                 group->prefixRuns.push_back(run);
                 group->prefixRunRules.push_back(c);
+                continue;
+            }
+            //  A chain revisit (see ComposeRevisits), in a group of chain revisits.
+            if (ChainRevisit ch; chainRevisits.count(c) && chainRevisit(c, ch)) {
+                if (group == nullptr) {
+                    TransformStep step;
+                    step.kind = TransformStep::Kind::Conversion;
+                    plan.steps.push_back(std::move(step));
+                    group = &plan.steps.back();
+                }
+                if (group->chainRevisitRules.empty()) {
+                    group->chainRevisit = ch;
+                } else {
+                    group->chainRevisit.last = group->chainRevisit.last + ch.last;
+                }
+                group->chainRevisitRules.push_back(c);
                 continue;
             }
             if (unsupportedLookahead(source->getAfterContext())) {

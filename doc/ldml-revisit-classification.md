@@ -1,7 +1,7 @@
 # Revisit rules in the CLDR transforms: what the revisit triggers
 
 *October 28, 2026; updated October 29 for the prefix runs (class P), with S
-of one or more characters, and their triggers. CLDR
+of one or more characters, and their triggers, and for class V (V′). CLDR
 transforms from `~/cldr/common/transforms` (with the local W7 fixes, including
 the Greek_Latin_UNGEGN capture fix), tconv with `--revisit-report`.*
 
@@ -42,7 +42,7 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 
 ## Summary
 
-**932 revisit rules in 46 transforms: 737 implemented, 195 not yet.**
+**932 revisit rules in 46 transforms: 823 implemented, 109 not yet.**
 
 | | Class | What the revisit triggers | Rules | Transforms | Composed rules per revisit rule (median / max) |
 |---|---|---|---:|---:|---|
@@ -53,10 +53,11 @@ with `tconv --revisit-report NAME` (one JSON object per line).
 | | **D** lookahead-conditional | several rules, chosen by 1–2 characters that follow the revisited text | 160 | 16 | 18 / 43 |
 | | **E** chained | rules that themselves revisit, ending within a few applications | 42 | 6 | 3 / 25 |
 | | **P** prefix runs | the rule itself, on P S^n, leaving A^n P; applied first, as a group of their own (after their triggers, which produce P), or, with A empty, as run rules | 239 | 9 | — |
+| | **V′** formerly V | the rules of the group, once a rule inserting and revisiting all is set apart as an insertion rule, or a rule not of fixed length is seen not to begin at the text to revisit | 86 | 6 | — |
 | **Not yet** | **R** runs | the rule itself (or its family) again, on its own output and the next input, without bound | 33 | 8 | — |
 | | **L** long chains | different rules, consuming further input in turn | 3 | 2 | — |
-| | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 104 | 8 | — |
-| | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 52 | 6 | — |
+| | **V** variable-length trigger | a rule whose text has a repetition, or an insertion rule | 19 | 4 | — |
+| | **N** revisit rule not enumerable | not explored: its referenced capture is not one character, or has more than 64 | 51 | 5 | — |
 | | **K** contexts not combinable | contexts with repetitions or optional items that must be combined | 3 | 2 | — |
 
 Two structural facts stand out:
@@ -80,7 +81,7 @@ x = extends beyond the text to revisit, r = revisits in turn, B = blocking.
 `⇒` introduces the composed rules that replace a revisit rule, as
 `--revisit-report` prints them.
 
-# Part 1. Rules implemented by tconv (737 rules)
+# Part 1. Rules implemented by tconv (823 rules)
 
 ## How tconv implements revisits
 
@@ -423,7 +424,41 @@ macOS until the JIT compile threads were given 8 MB stacks: LLVM's
 ScalarEvolution overflowed the 512 KB stack of a std::thread compiling its
 7,718 string rules.)
 
-# Part 2. Rules not yet implemented (195 rules)
+## V′: formerly blocked by a variable-length rule (86 rules, 6 transforms)
+
+*Triggers:* as other revisits (mostly A, B or D). They were V: the
+composition stopped at a rule whose text is not of fixed length.
+
+- am_Ethi-d0_Morse (52 rules, `ፙ → | ምያ ;`, …, and the blocking rule
+  itself): its first rule, `([:Lo:]) ([:Zs:]+) ([:Lo:]) → | $1⁄⁂⁄$2$3 ;`,
+  inserts a word separator and revisits all. ICU tries it first wherever the
+  cursor reaches, on text not converted yet, so it is the insertion rule
+  `[:Lo:] { } [:Zs:]+ [:Lo:] → ⁄⁂⁄ ;` (with the sets within the global
+  filter, as contexts see the characters outside it), applied in a group of
+  its own before the rest (`insertionRevisit`, `ComposeRevisits`). Then the
+  revisit rules compose as class A rules do. The conditions: the rule is the
+  first of its group, its text a sequence of captures of sets (or repetitions
+  of sets), its result the references in order with a fixed string M between
+  two; no other rule matches a character of T1 after the first character of
+  its text or sees one in an after context; M has no character of T1 or T2;
+  and a text another rule revisits has no character of T2 after its first,
+  and ends with a character of T1 only if the rule's text is a single set
+  within T1. Insertion rules whose after context begins with a repetition of
+  a set (`[:Zs:]+`) are now planned (the regular expression engine matches
+  the context). With the rest of the transform's rules, against ICU 78.3 on
+  3,000 random lines: identical. The transform still needs
+  `([.-]) ' ' [$] → $1 ;` (a text with the end of the text, in its last
+  group).
+- cs_FONIPA-ja and es_FONIPA-ja (12), Latn-Grek/UNGEGN (12), Grek-Latn (7)
+  and Grek-Latn/UNGEGN (1): the blocking rule could not begin at the text to
+  revisit, as `[{i̯}iɪ]+ → i ;` cannot at `e` (`ɛ → | e ;`). The composer now
+  skips a rule not of fixed length whose first characters (`Composer::
+  firstChars`, of the text, and of the after context if the text may be
+  empty, as for an insertion rule) exclude the first character to revisit.
+  cs_FONIPA-ja and es_FONIPA-ja then need only the runs of sets with strings
+  (`[{i̯}iɪ]+ → i ;`, W3).
+
+# Part 2. Rules not yet implemented (109 rules)
 
 tconv leaves these rules unchanged, and reports their transforms as not
 implementable ("the result has text to revisit", with the reason the
@@ -473,38 +508,28 @@ P.
 *Possible implementation:* raising the limits for these rules (the my-my_Latn
 case is finite), or the fixpoint of R for ja_Latn-ko.
 
-## V: a variable-length rule may be triggered (104 rules, 8 transforms)
+## V: a variable-length rule may be triggered (19 rules, 4 transforms)
 
-*Triggers:* a rule whose text is not a fixed-length sequence of characters.
-The composition stops at the first such rule. Almost all come from 7 rules:
+*Triggers:* a rule whose text is not a fixed-length sequence of characters,
+which may begin at the text to revisit. The composition stops at the first
+such rule. What remains (86 more were V before the changes of V′ above):
 
 | Blocking rule | Transform | Revisit rules blocked |
 |---|---|---:|
-| `([:lo:]) ([:zs:]+) ([:lo:]) → \| $1 ⁄⁂⁄ $2 $3 ;` | am_Ethi-d0_Morse | 52 |
-| `($lcgvowel+ $ddotmac?) $rough → h \| $1 ;` | Grek-Latn | 17 |
-| `($shiftForwardVowels*) v $under → υ $1 ;` | Latn-Grek/UNGEGN | 12 |
+| `($lcgvowel+ $ddotmac?) $rough → h \| $1 ;` (and 1 more rough breathing rule) | Grek-Latn | 8 |
 | `($evowel $macron $accentMinus*) i → \| $1 $iotasub ;` | Latn-Grek | 6 |
-| `[{i̯}iɪ]+ → i ;` / `[{i̯}ij]+ → i ;` | cs_FONIPA-ja / es_FONIPA-ja | 6 + 6 |
-| `[Pp] { } [ΣςσϷϸϺϻ] → \' ;` (insertion) | Grek-Latn/UNGEGN | 3 |
+| `[Pp] { } [ΣςσϷϸϺϻ] → \' ;` (insertion) | Grek-Latn/UNGEGN, Grek-Latn | 2 + 2 |
+| `ṣ ($notAbove*) ̄ → ศ \| $1 ;` | Latin-ThaiLogical | 1 |
 
-For example, am_Ethi-d0_Morse `ፙ → | ምያ ;` revisits `ምያ`, whose `ም` (or `ያ`)
-may begin the word-separator rule `([:lo:]) ([:zs:]+) ([:lo:])`. In most V
-cases the blocking rule matches only a first character of the text to revisit
-(a letter, a vowel), and the rest of its text is a run in the following input,
-so V reduces to "a run follows the revisit".
+Here the blocking rule may begin at the revisited text: Grek-Latn/UNGEGN's
+`ϲ → | σ ;` revisits `σ`, which the insertion rule's after context matches
+(with `P` before it).
 
-The 3 Grek-Latn/UNGEGN cases are spurious: `explore` rejects a rule that is not
-of fixed length as soon as its first items match, before checking its contexts.
-The insertion rule `[Pp] { } [ΣςσϷϸϺϻ]` has no text items, so it "matches"
-anywhere, but its after context cannot match `φ` (`ϕ → | φ ;`), `β` or `Υ`.
+*Possible implementation:* these blocking rules move or carry captures of
+variable length and revisit them (rough breathing, iota subscript); the
+transforms have many other problems (W3, W4, N).
 
-*Possible implementation:* check a non-fixed rule's contexts before
-abandoning (the 3 Grek-Latn/UNGEGN rules); for the rest, let the W3 run rules
-be triggered rules, with the run read from the following input (in the 52
-am_Ethi-d0_Morse cases only the first item `[:lo:]` of the blocking rule
-involves the revisited text).
-
-## N: the revisit rule cannot be enumerated (52 rules, 6 transforms)
+## N: the revisit rule cannot be enumerated (51 rules, 5 transforms)
 
 *Triggers:* not explored. The rule's own result references a capture that is
 not a single character (`Latn-Grek ($evowel $macron $accentMinus*) i → | $1 $iotasub ;`,

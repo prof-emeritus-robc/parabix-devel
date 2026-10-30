@@ -755,7 +755,9 @@ static bool insertionRule(const ConversionRule * c, InsertionRule & ins, CharSet
     ins.singleBefore = single && plainSet(single);
     ins.engineBefore = engineContext(before, false);
     re::RE * const after = source->getAfterContext();
-    const re::RE * const first = firstContextItem(after);
+    const re::RE * first = firstContextItem(after);
+    //  (Or with a repetition of a set, at least once: its first character.)
+    if (const re::Rep * rep = dyn_cast_or_null<re::Rep>(first); rep && rep->getLB() >= 1) first = rep->getRE();
     if (first == nullptr || !plainSet(first)) {
         reason = "its after context does not begin with a character of a set";
         return false;

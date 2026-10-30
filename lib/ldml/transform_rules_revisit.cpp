@@ -9,6 +9,7 @@
 #include <ldml/transform_rules.h>
 #include <map>
 #include <set>
+#include <optional>
 #include <ldml/transform_plan.h>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
@@ -281,6 +282,9 @@ struct GroupRule {
     //  is not a fixed-length sequence of characters (then !fixed).
     std::vector<UCD::UnicodeSet> text;
     bool fixed = true;
+    //  If !fixed: the characters with which a match may begin (or, for an
+    //  insertion rule, which may follow it), if known.
+    std::optional<UCD::UnicodeSet> first;
     bool startAnchor = false;   // ^ at the start of the text (as [$] ending the before context)
     bool endAnchor = false;     // $ at the end of the text (as [$] starting the after context)
     std::map<std::string, std::pair<unsigned, unsigned>> captures;  // items [first, last)
@@ -334,6 +338,7 @@ private:
     bool collectItems(RE * re, std::vector<Item> & items);
     GroupRule groupRule(ConversionRule * r);
     void textItems(RE * re, GroupRule & g);
+    bool firstChars(RE * re, UCD::UnicodeSet & first, bool & nullable);
     std::vector<Rule *> composeRule(ConversionRule * r, const std::vector<GroupRule> & group);
     void explore(Path p, RE * text, std::vector<Rule *> & composed);
     void apply(const GroupRule & g, Path q, const std::vector<MatchedChar> & matched,
@@ -416,6 +421,48 @@ void Composer::textItems(RE * re, GroupRule & g) {
     }
 }
 
+//  The characters with which a match of re may begin (strings within sets by
+//  their characters), added to first, and whether it may be empty; false if
+//  not known.
+bool Composer::firstChars(RE * re, UCD::UnicodeSet & first, bool & nullable) {
+    if (CharSetAnalysis::isSet(re)) {
+        first = first + mSets.setOf(re, true);
+        nullable = false;
+        return true;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        nullable = true;
+        for (RE * e : *seq) {
+            bool n = false;
+            if (!firstChars(e, first, n)) return false;
+            if (!n) {
+                nullable = false;
+                break;
+            }
+        }
+        return true;
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        nullable = false;
+        for (RE * e : *alt) {
+            bool n = false;
+            if (!firstChars(e, first, n)) return false;
+            nullable |= n;
+        }
+        return true;
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        if (!firstChars(rep->getRE(), first, nullable)) return false;
+        nullable |= rep->getLB() == 0;
+        return true;
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        return firstChars(c->getCapturedRE(), first, nullable);
+    } else if (Name * name = dyn_cast<Name>(re)) {
+        return !isFunctionCall(name) && name->getDefinition() && firstChars(name->getDefinition(), first, nullable);
+    } else if (isBoundary(re) || isa<Start>(re) || isa<End>(re)) {
+        nullable = true;
+        return true;
+    }
+    return false;
+}
+
 GroupRule Composer::groupRule(ConversionRule * r) {
     GroupRule g;
     g.rule = r;
@@ -424,6 +471,19 @@ GroupRule Composer::groupRule(ConversionRule * r) {
     if (g.text.empty()) g.fixed = false;
     g.before = context(source->getBeforeContext());
     g.after = context(source->getAfterContext());
+    if (!g.fixed && !g.startAnchor) {
+        //  The first characters of the text, and of the after context if the
+        //  text may be empty (as that of an insertion rule).
+        UCD::UnicodeSet first;
+        bool nullable = false;
+        if (firstChars(source->getText(), first, nullable)) {
+            if (!nullable) {
+                g.first = first;
+            } else if (source->hasAfterContext() && firstChars(source->getAfterContext(), first, nullable) && !nullable) {
+                g.first = first;
+            }
+        }
+    }
     if (g.startAnchor) {
         if (!g.before.simple) g.fixed = false;
         g.before.re = nullptr;
@@ -464,6 +524,8 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
             }
         }
         if (!possible) continue;
+        //  A rule whose text is not of fixed length, which cannot begin here.
+        if (!g.fixed && g.first && !g.first->contains(p.pending[0])) continue;
         if (!g.fixed) {
             noteTrigger(mRecord, g, p.applied.size() + 1, true, q.beyond.size() > p.beyond.size(), true);
             throw NotComposed{"a rule whose text is not a fixed-length sequence of characters may apply "
@@ -984,6 +1046,111 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
     return "";
 }
 
+//  A rule inserting a fixed string M between captures and revisiting all,
+//      (T1) ... (Ti) (Ti+1) ... (Tk) → | $1 ... $i M $i+1 ... $k ;
+//  (each Tj a set, or a repetition of a set, the first rule of its group, no
+//  contexts), as an insertion rule applied before the group (in a group of
+//  its own),
+//      T1 ... Ti { } Ti+1 ... Tk → M ;
+//  with the sets within the filter (contexts see the characters outside it,
+//  which the text of the rule cannot match).  ICU tries the rule first at
+//  each position the cursor reaches, on the text not converted yet, so the
+//  insertion rule applies at the same positions where
+//    - no other rule matches a character of T1 after the first character of
+//      its text (the cursor reaches every character of T1),
+//    - no after context of another rule may see a character of T1 (and the
+//      insertion after it),
+//    - M contains no character of T1 or T2 (ICU revisits M), nor does a text
+//      that another rule revisits after its first character T2, and if its
+//      last character may be in T1, the text of that rule is a single set
+//      within T1 (ICU tried the rule there, followed by the same text).
+bool insertionRevisit(const ConversionRule * c, const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
+                      Rule *& insertion) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    if (!result->hasCursor() || result->getCursorOffset() != 0 || result->getResultToRevisit() == nullptr) return false;
+    std::u32string completed;
+    if (!resultString(result->getCompletedResult(), {}, completed) || !completed.empty()) return false;
+    std::vector<RE *> text, revisit;
+    textAtoms(source->getText(), text);
+    textAtoms(result->getResultToRevisit(), revisit);
+    if (text.size() < 2) return false;
+    CharSetAnalysis sets;
+    std::vector<UCD::UnicodeSet> items(text.size());
+    std::vector<std::pair<int, int>> bounds(text.size());
+    std::vector<std::string> names(text.size());
+    for (size_t j = 0; j < text.size(); ++j) {
+        const Capture * cap = dyn_cast<Capture>(text[j]);
+        if (cap == nullptr) return false;
+        names[j] = cap->getName();
+        RE * re = cap->getCapturedRE();
+        bounds[j] = {1, 1};
+        if (const Rep * r = dyn_cast<Rep>(re)) {
+            if (r->getLB() < 1) return false;
+            bounds[j] = {r->getLB(), r->getUB()};
+            re = r->getRE();
+        }
+        if (!CharSetAnalysis::isSet(re) || hasStrings(re) || hasBoundary(re)) return false;
+        items[j] = sets.setOf(re, false);
+        if (filter) items[j] = items[j] & *filter;
+        if (items[j].empty()) return false;
+    }
+    //  The result: the references in order, with M between two of them.
+    size_t next = 0, at = 0;
+    std::u32string inserted;
+    for (RE * e : revisit) {
+        if (const Reference * ref = dyn_cast<Reference>(e)) {
+            if (next == text.size() || ref->getName() != names[next]) return false;
+            ++next;
+        } else if (CharSetAnalysis::isSet(e) && !hasStrings(e)) {
+            const UCD::UnicodeSet s = sets.setOf(e, false);
+            if (s.count() != 1 || next == 0 || next == text.size() || (!inserted.empty() && at != next)) return false;
+            at = next;
+            inserted.push_back(static_cast<char32_t>(lo_codepoint(*s.begin())));
+        } else {
+            return false;
+        }
+    }
+    if (next != text.size() || inserted.empty()) return false;
+    UCD::UnicodeSet m;
+    for (char32_t ch : inserted) m.insert(ch);
+    if (m.intersects(items[0]) || m.intersects(items[1])) return false;
+    for (const Rule * r : group) {
+        const ConversionRule * other = dyn_cast<ConversionRule>(r);
+        if (other == nullptr || other == c) continue;
+        const RuleSide * os = other->getSourceSide(Direction::Forward);
+        const std::vector<PatternItem> otherText = patternItems(os->getText());
+        for (size_t i = 0; i < otherText.size(); ++i) {
+            if ((i > 0 || otherText[i].repeated) && otherText[i].chars.intersects(items[0])) return false;
+        }
+        if (os->hasAfterContext()) {
+            for (const PatternItem & item : patternItems(os->getAfterContext())) {
+                if (item.chars.intersects(items[0])) return false;
+            }
+        }
+        if (RE * rv = other->getResultSide(Direction::Forward)->getResultToRevisit()) {
+            const std::vector<PatternItem> y = patternItems(rv);
+            for (size_t i = 1; i < y.size(); ++i) {
+                if (y[i].repeated || y[i].chars.intersects(items[1])) return false;
+            }
+            if (!y.empty() && (y.back().repeated || y.back().chars.intersects(items[0]))) {
+                if (otherText.size() != 1 || otherText[0].repeated || !otherText[0].chars.subset(items[0])) return false;
+            }
+        }
+    }
+    auto item = [&](size_t j) {
+        RE * const s = makeCC(items[j]);
+        return bounds[j] == std::make_pair(1, 1) ? s : makeRep(s, bounds[j].first, bounds[j].second);
+    };
+    std::vector<RE *> before, after;
+    for (size_t j = 0; j < at; ++j) before.push_back(item(j));
+    for (size_t j = at; j < text.size(); ++j) after.push_back(item(j));
+    insertion = makeConversionRule(makeRuleSide(makeSeq(before.begin(), before.end()), makeSeq(), makeSeq(after.begin(), after.end())),
+                                   Direction::Forward, makeRuleSide(literal(inserted)));
+    return true;
+}
+
 //  A trigger of the prefix runs (see prefixRunConflict): C → B | p ; with p
 //  in first.
 bool prefixRunTrigger(const ConversionRule * c, const UCD::UnicodeSet & first, PrefixRunTrigger & tr) {
@@ -1077,6 +1244,15 @@ bool prefixRunAsRun(const ConversionRule * c, const std::vector<Rule *> & group,
 
 std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
     std::vector<Rule *> out;
+    //  The global filter (contexts see the characters outside it).
+    std::optional<UCD::UnicodeSet> filter;
+    for (const Rule * r : rules) {
+        if (const FilterRule * f = dyn_cast<FilterRule>(r); f && !f->isInverse()) {
+            CharSetAnalysis sets;
+            filter = sets.setOf(f->getFilterSet(), false);
+            break;
+        }
+    }
     size_t start = 0;
     while (start < rules.size()) {
         //  A group: the conversion rules (and variable definitions) between
@@ -1090,6 +1266,29 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
         //  First the rules whose text to revisit is the end of their text, which
         //  are rewritten (and applied as rewritten in the compositions).
         std::vector<Rule *> rewritten(rules.begin() + start, rules.begin() + end);
+        //  A first rule inserting a string between its captures and revisiting
+        //  all, as an insertion rule in a group before (see insertionRevisit).
+        for (size_t k = 0; k < rewritten.size(); ++k) {
+            ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
+            if (c == nullptr) continue;
+            Rule * insertion = nullptr;
+            if (hasRevisit(c) && insertionRevisit(c, rewritten, filter ? &*filter : nullptr, insertion)) {
+                if (mStats) {
+                    mStats->candidates++;
+                    mStats->composed++;
+                    mStats->composedRules++;
+                    if (mStats->keepRecords) {
+                        mStats->records.push_back(RevisitRecord{c, RevisitRecord::Outcome::Composed});
+                        mStats->records.back().composedRules = 1;
+                        mStats->records.back().composed.push_back(insertion);
+                    }
+                }
+                out.push_back(insertion);
+                out.push_back(makeTransformRule(TransformID("Null")));
+                rewritten.erase(rewritten.begin() + k);
+            }
+            break;
+        }
         std::vector<bool> isRewritten(rewritten.size(), false);
         for (Rule *& r : rewritten) {
             ConversionRule * c = dyn_cast<ConversionRule>(r);

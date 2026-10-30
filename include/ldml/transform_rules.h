@@ -816,6 +816,12 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  matching P only as single characters, replaced by run rules
 //  (before { p S+ → f(p) ; see prefixRunAsRun).
 //
+//  A first rule of a group inserting a fixed string between captures and
+//  revisiting all, (T1) (T2+) (T3) → | $1 M $2 $3 ; is applied before the
+//  group as an insertion rule, T1 { } T2+ T3 → M ; in a group of its own,
+//  where the rest of the group cannot see the difference (see
+//  insertionRevisit in transform_rules_revisit.cpp).
+//
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.
 //  With records, each rule with text to revisit is also described: how it was

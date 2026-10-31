@@ -47,7 +47,10 @@ Latn-Grek/UNGEGN Latn-Hebr si-si_Latn`): byn_Latn-byn_Ethi/Xaleget and
 my-Zawgyi are implementable (398). Then captures of fixed strings replaced by
 the strings, and captures of sets with strings selected by their walks
 (`11eb18fd0`, `--update --only Latin-NumericPinyin Latn-Bopo my-Zawgyi`): Latin-NumericPinyin
-and Latn-Bopo are implementable (400).*
+and Latn-Bopo are implementable (400). Then rules keeping the characters of
+their captures as string rules, with their before contexts matched against
+the converted text (`a9e44f8d8`, `--update --only blt-blt_FONIPA am-am_FONIPA my-Zawgyi`):
+blt-blt_FONIPA is implementable (401).*
 
 This report covers:
 
@@ -68,8 +71,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 400 (94%) |
-| …of which public (not `visibility="internal"`) | 393 | 369 (94%) |
+| Transforms defined by CLDR files (380 files) | 425 | 401 (94%) |
+| …of which public (not `visibility="internal"`) | 393 | 370 (94%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -174,9 +177,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          400  ██████████████████████████████████████
-+ W3 variable-length text    404  ██████████████████████████████████████
-+ W6 revisit                 418  ███████████████████████████████████████
+now                          401  ██████████████████████████████████████
++ W6 revisit                 405  ██████████████████████████████████████
++ W3 variable-length text    418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
 + W10 engine lookaheads      424  ████████████████████████████████████████
@@ -984,7 +987,7 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 18 | 4 | M–L (the rest) |
+| W3 variable-length texts | 17 | 3 | M–L (the rest) |
 | W6 text to revisit, not composed | 17 | 4 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
@@ -1269,11 +1272,40 @@ cases were not real:
   engine's matches allow `o1n`, so the sets with strings of two characters
   are now selected by their walks.
 
-blt-blt_FONIPA's 46 rules are real: its tone rules insert a tone after a
+blt-blt_FONIPA's 46 rules were real: its tone rules insert a tone after a
 syllable's final consonant, which may be the `$LO` that the next syllable's
-before context (`$LO $W? $V12 { ($CHK) → $1 ˧˥ ;`) sees, so they need the
-before contexts of the sets matched against the converted text, as FusedRules
-does for the string rules (in rounds).
+before context (`$LO $W? $V12 { ($CHK) → $1 ˧˥ ;`) sees. Such rules, whose
+captures are sequences of sets and whose results insert only after the last
+position, are now planned as string rules keeping the characters of their
+captures (`StringRule::kept`: in the replacement, a position kept or deleted,
+then the rest), so that the correction kernel of the group matches their
+before contexts against the converted text, in rounds, as for the other string
+rules; an optional set at the end of the text gives two rules, present, then
+absent before another character. (Enumerating the characters instead gave
+2,408 string rules, more than a correction kernel takes, 256: the group then
+fell back to the text itself, with a warning, and was wrong on 1 line in
+3,000; a correction kernel of that size did not compile in 10 minutes.) Three
+other problems came out of blt:
+
+- MoveRegions lost the last character of a capture moved at the end of the
+  text (`($V1) ($C $W?) → $2 $1 ;` on `ꪹꪂ`): CaptureWalk gave the position after
+  the capture, which does not exist there; it now gives its last character;
+- NullableCaptureElimination did not match the optional items possessively: of
+  `{($LO $W? $V123 $F?)} $NOT_IPA_TONE`, the rule with `$F` absent applied where
+  `$F` was there but the after context failed after it; an item absent now
+  requires the next character not to be in its set (an item present after it,
+  or the first set of the after context, without those characters; or, at the
+  end of the text with no after context, a character not in them or the end);
+- the regular expression engine does not match a set with strings
+  possessively, so a start of a walk set may be of another match; the walk
+  branches now test their sets, and their after contexts at their ends.
+
+blt-blt_FONIPA is identical to ICU on 12,000 random lines and passes its 682
+CLDR test cases. Implementable transforms with the warning (a group of more than
+256 string rules whose before contexts may see conversions) remain:
+und_FONIPA-ar (383 rules), Latin-InterIndic (31), Hans-Hant (10), lt-Title (9),
+Latn-Ethi/SERA (8), Latn-Cyrl, Latn-Grek/UNGEGN and el-Title (2 each), and
+es-ar, es-fa, es_419-ar and es_419-fa (1 each).
 
 **The MultipleCaptureMultipleReplacement pattern** generalizes the above:
 `T0 (B1) T1 … (Bk) Tk → R0 $1 R1 … $k Rk`, with fixed-length Ti, fixed texts Ri
@@ -1473,6 +1505,7 @@ tconv on every implementable transform.
 | `1317f8cfa` | mark run edits, in a group of their own: Latn-Arab: 396 |
 | `75e82e277`, `00bea45f0` | MultipleCaptureMultipleReplacement matches selected by their walks; their sets within the filter: byn_Latn-byn_Ethi/Xaleget, my-Zawgyi: 398 |
 | `11eb18fd0` | captures of fixed strings as strings, sets with strings by walks: Latin-NumericPinyin, Latn-Bopo: 400 |
+| `a9e44f8d8` | rules keeping the characters of their captures as string rules (converted before contexts); captures moved at the end; possessive optional items: blt-blt_FONIPA: 401 |
 
 ## Reproducing
 

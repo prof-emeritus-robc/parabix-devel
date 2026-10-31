@@ -144,6 +144,7 @@ private:
     std::set<const Capture *> mDeleted;
     RE * mReplacement = nullptr;    // the fixed string replacing the target
     std::map<const Capture *, Capture *> mRenumbered;
+    std::map<std::string, Capture *> mRenumberedByName;
     unsigned mCaptureCount = 0;
 };
 
@@ -159,6 +160,7 @@ RE * CaptureRewriter::rewriteSource(RE * re) {
         const std::string name = std::to_string(++mCaptureCount);
         Capture * renumbered = makeCapture(name, rewriteSource(captured));
         mRenumbered.emplace(c, renumbered);
+        mRenumberedByName.emplace(c->getName(), renumbered);
         return renumbered;
     } else if (Seq * seq = dyn_cast<Seq>(re)) {
         std::vector<RE *> items;
@@ -178,14 +180,21 @@ RE * CaptureRewriter::rewriteSource(RE * re) {
 RE * CaptureRewriter::rewriteResult(RE * re) {
     if (re == nullptr) return nullptr;
     if (Reference * ref = dyn_cast<Reference>(re)) {
-        if (mDeleted.count(ref->getCapture()) != 0) {
+        //  (By the capture, or by its name: earlier rewritings may leave
+        //  references to other captures of the same name.)
+        const bool target = mTarget && (ref->getCapture() == mTarget || ref->getName() == mTarget->getName());
+        if (mDeleted.count(ref->getCapture()) != 0 || (target && mDeleted.count(mTarget) != 0)) {
             return makeSeq();
         }
-        if (ref->getCapture() == mTarget && mReplacement) {
+        if (target && mReplacement) {
             return mReplacement;
         }
         auto f = mRenumbered.find(ref->getCapture());
-        if (f == mRenumbered.end()) return re;
+        if (f == mRenumbered.end()) {
+            auto g = mRenumberedByName.find(ref->getName());
+            if (g == mRenumberedByName.end()) return re;
+            return makeReference(g->second->getName(), g->second, ref->getInstance());
+        }
         return makeReference(f->second->getName(), f->second, ref->getInstance());
     } else if (Name * n = dyn_cast<Name>(re)) {
         if (isFunctionCall(n)) {
@@ -531,6 +540,42 @@ std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules
                                                      res->getCursorOffset(),
                                                      renamer.result(res->getAfterContext()));
         result.push_back(makeConversionRule(source, Direction::Forward, replaced));
+    }
+    return result;
+}
+
+//  The captures of fixed strings of a source side part, outside repetitions.
+static void findFixedCaptures(RE * re, std::vector<Capture *> & found) {
+    if (re == nullptr) return;
+    if (Capture * c = dyn_cast<Capture>(re)) {
+        if (isFixedString(c->getCapturedRE())) {
+            found.push_back(c);
+        } else {
+            findFixedCaptures(c->getCapturedRE(), found);
+        }
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) findFixedCaptures(e, found);
+    }
+}
+
+std::vector<Rule *> FixedCaptureElimination(const std::vector<Rule *> & rules) {
+    std::vector<Rule *> result;
+    for (Rule * r : rules) {
+        ConversionRule * c = dyn_cast<ConversionRule>(r);
+        if (c == nullptr || c->getDirection() != Direction::Forward) {
+            result.push_back(r);
+            continue;
+        }
+        //  One capture at a time (the rewriting renumbers the others).
+        while (true) {
+            std::vector<Capture *> found;
+            const RuleSide * src = c->getLeftSide();
+            for (RE * part : {src->getBeforeContext(), src->getText(), src->getAfterContext()}) findFixedCaptures(part, found);
+            if (found.empty()) break;
+            CaptureRewriter rewriter(found.front(), found.front()->getCapturedRE());
+            c = rewriter.rewrite(c);
+        }
+        result.push_back(c);
     }
     return result;
 }

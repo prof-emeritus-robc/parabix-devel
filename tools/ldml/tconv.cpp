@@ -589,6 +589,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         //  before context, other than (X) X+.)
         if (!DisableCaptureSimplification) {
             rules = ldml::RemoveUnreferencedCaptures(rules);
+            rules = ldml::FixedCaptureElimination(rules);
             rules = ldml::TrivialCaptureElimination(rules, nullptr, false, false);
             rules = ldml::NullableCaptureElimination(rules);
         }

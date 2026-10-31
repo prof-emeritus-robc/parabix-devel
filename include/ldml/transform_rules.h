@@ -721,6 +721,17 @@ std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules
 //  NullableCaptureElimination, which then see only the captures that matter.
 std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules);
 
+//  Fixed capture elimination.
+//
+//  A capture of a fixed string (a sequence of single characters, or variables
+//  defined as such, not within a repetition), as the (̆) of
+//      e { (̆) r → r $1 ;
+//  is replaced by that string, and so are its references: e { ̆ r → r ̆ ;.
+//  The capture matches only that string, so the rules are equivalent, and a
+//  rule with no other captures may then be planned as a string rule.  Rules
+//  other than forward conversion rules are unchanged.
+std::vector<Rule *> FixedCaptureElimination(const std::vector<Rule *> & rules);
+
 //  Expansion of finite texts.
 //
 //  A forward conversion rule whose text to replace has finitely many lengths

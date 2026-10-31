@@ -683,6 +683,27 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
             set.walkStarts = true;
         }
     }
+    //  A capture with a set with strings (of two characters): ICU takes the
+    //  longest string, which the ends of the engine's matches do not tell (a
+    //  start may have several), so the matches are selected by their walks.
+    if (!set.walkStarts) {
+        std::vector<WalkElement> elements;
+        bool walk = true;
+        for (const UCD::UnicodeSet & chars : first) elements.push_back(WalkElement{chars, WalkElement::Kind::Set});
+        for (size_t i = 0; i < k && walk; i++) {
+            walk = walkElements(captures[i]->getCapturedRE(), elements, sets);
+            for (const UCD::UnicodeSet & chars : texts[i + 1]) elements.push_back(WalkElement{chars, WalkElement::Kind::Set});
+        }
+        bool strings = false;
+        for (const WalkElement & e : elements) strings |= e.kind == WalkElement::Kind::Strings;
+        if (walk && strings && walkBranches(elements, set.walkBranches)) {
+            set.walkStarts = true;
+            set.startsByFirst = false;
+            set.singleCharacter = false;
+        } else {
+            set.walkBranches.clear();
+        }
+    }
     //  The replacements at the boundaries.  A boundary i (at Ti) is at a fixed
     //  offset from the start if the captures before it have fixed lengths, or
     //  from the end if those after it do.

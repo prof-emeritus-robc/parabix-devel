@@ -44,7 +44,10 @@ Then MultipleCaptureMultipleReplacement matches that may end within another,
 selected by the lengths of their possessive walks, with the sets of these
 rules within the filter (`75e82e277`, `00bea45f0`, `--update --only byn_Latn-byn_Ethi/Xaleget my-Zawgyi
 Latn-Grek/UNGEGN Latn-Hebr si-si_Latn`): byn_Latn-byn_Ethi/Xaleget and
-my-Zawgyi are implementable (398).*
+my-Zawgyi are implementable (398). Then captures of fixed strings replaced by
+the strings, and captures of sets with strings selected by their walks
+(`11eb18fd0`, `--update --only Latin-NumericPinyin Latn-Bopo my-Zawgyi`): Latin-NumericPinyin
+and Latn-Bopo are implementable (400).*
 
 This report covers:
 
@@ -65,8 +68,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 398 (94%) |
-| …of which public (not `visibility="internal"`) | 393 | 367 (93%) |
+| Transforms defined by CLDR files (380 files) | 425 | 400 (94%) |
+| …of which public (not `visibility="internal"`) | 393 | 369 (94%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -171,7 +174,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          398  █████████████████████████████████████
+now                          400  ██████████████████████████████████████
 + W3 variable-length text    404  ██████████████████████████████████████
 + W6 revisit                 418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
@@ -363,7 +366,10 @@ Implementable now:
   another, selected by the lengths of their possessive walks:
   byn_Latn-byn_Ethi/Xaleget and my-Zawgyi (identical to ICU 78.3's
   `createFromRules` on their files' rules on 40,000 and 2,000 random lines;
-  neither has CLDR test data).
+  neither has CLDR test data);
+- with captures of fixed strings replaced by the strings, and sets with strings
+  selected by their walks: Latin-NumericPinyin and Latn-Bopo (identical to
+  ICU on 10,000 random pinyin lines each; no CLDR test data).
 
 The per-transform status is in the table.
 
@@ -978,7 +984,7 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 20 | 6 | M–L (the rest) |
+| W3 variable-length texts | 18 | 4 | M–L (the rest) |
 | W6 text to revisit, not composed | 17 | 4 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
@@ -1247,6 +1253,28 @@ compound.) `tconv --lines` costs about 8 ms a line for my-Zawgyi, the cost of
 running a pipeline of 2,493 kernels, mostly the regular expression engines of its
 130 sets (129 of one rule) (0.3 s for 2,000 lines as one text).
 
+**Before contexts on the converted text** (MultipleCaptureMultipleReplacement
+rules): ICU matches a before context against the converted text; the
+MultipleCaptureMultipleReplacement sets match it against the text itself
+(the regular expression engine), so a set whose group may convert what its
+before context sees is not implemented (`convertedContextMatters`). Two
+cases were not real:
+
+- a capture of a fixed string, as Latin-NumericPinyin's `e { (̆) r → r $1 ;`:
+  it is the string itself (`FixedCaptureElimination`, `e { ̆ r → r ̆ ;`), a
+  string rule, whose before context FusedRules matches against the converted
+  text;
+- the same rule's group has `(̄) ([{on}{ng}inou]) → $2 1 ;`, whose set with
+  strings ICU matches by the longest string (`̄on → on1`); the ends of the
+  engine's matches allow `o1n`, so the sets with strings of two characters
+  are now selected by their walks.
+
+blt-blt_FONIPA's 46 rules are real: its tone rules insert a tone after a
+syllable's final consonant, which may be the `$LO` that the next syllable's
+before context (`$LO $W? $V12 { ($CHK) → $1 ˧˥ ;`) sees, so they need the
+before contexts of the sets matched against the converted text, as FusedRules
+does for the string rules (in rounds).
+
 **The MultipleCaptureMultipleReplacement pattern** generalizes the above:
 `T0 (B1) T1 … (Bk) Tk → R0 $1 R1 … $k Rk`, with fixed-length Ti, fixed texts Ri
 and the references in the order of the captures. `ldml_trules --classify-rules`
@@ -1444,6 +1472,7 @@ tconv on every implementable transform.
 | `ef4e202f9` | chain revisits (Latn-Grek's iota subscript), in a group of their own: 395 |
 | `1317f8cfa` | mark run edits, in a group of their own: Latn-Arab: 396 |
 | `75e82e277`, `00bea45f0` | MultipleCaptureMultipleReplacement matches selected by their walks; their sets within the filter: byn_Latn-byn_Ethi/Xaleget, my-Zawgyi: 398 |
+| `11eb18fd0` | captures of fixed strings as strings, sets with strings by walks: Latin-NumericPinyin, Latn-Bopo: 400 |
 
 ## Reproducing
 

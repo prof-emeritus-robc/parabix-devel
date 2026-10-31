@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <set>
 #include <map>
 #include <string>
 #include <vector>
@@ -91,7 +92,17 @@ struct StringRule {
     // The rule then has no after context, and its group is selected
     // sequentially (TransformStep::sequentialSelection).
     UCD::UnicodeSet run;
+    // Whether the replacement keeps characters of the text: StringRuleKept at
+    // a position of the replacement (one for each position of the text but
+    // the last, which has the rest) keeps the character of the text there,
+    // and StringRuleDeleted deletes it.  As planned for a rule whose captures
+    // are of single characters (see planTransform), as
+    //     $LO $W? { ꪿ ($F) → $1 ˧˥ ;   (text ꪿ $F, replacement deleted, kept, ˧˥)
+    bool kept = false;
 };
+
+constexpr UCD::codepoint_t StringRuleKept = 0xFDD1;     // (a noncharacter)
+constexpr UCD::codepoint_t StringRuleDeleted = 0xD800;  // (the deletion mark of tconv)
 
 // A MultipleCaptureMultipleReplacement rule: a conversion rule
 //      before { T0 (B1) T1 (B2) ... (Bk) Tk } after → R0 $1 R1 $2 ... $k Rk ;
@@ -153,7 +164,8 @@ struct BoundaryReplacement {
 //  A branch of the possessive walk of the matches of a set from their starts
 //  (see MultipleCaptureMultipleReplacementSet::walkStarts): where the
 //  characters at the offsets of in are in their sets, and those at the
-//  offsets of out are not (the optional items taken or not), a match has
+//  offsets of out are not (the sets, the optional items taken or not, the
+//  strings), a match has
 //  length positions, then (if run) a run of the characters of runSet, then
 //  the characters of suffix.
 struct WalkBranch {
@@ -386,8 +398,14 @@ struct TransformPlan {
 };
 
 // The plan for the forward rules of a transform (as given by
-// ExtractForwardRules or ExtractReverseBackwardRules).
-TransformPlan planTransform(const std::vector<Rule *> & rules);
+// ExtractForwardRules or ExtractReverseBackwardRules).  The rules of
+// keptCaptures whose texts are of single characters and whose results refer
+// to their captures in order, with no text inserted but after the last
+// position, are planned as string rules keeping the characters of their
+// captures (StringRule::kept), rather than MultipleCaptureMultipleReplacement
+// rules, so that their before contexts may be matched against the converted
+// text.
+TransformPlan planTransform(const std::vector<Rule *> & rules, const std::set<const Rule *> * keptCaptures = nullptr);
 
 //  The overlaps of the string rules of a conversion group.
 //

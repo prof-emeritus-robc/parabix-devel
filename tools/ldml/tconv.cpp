@@ -562,6 +562,7 @@ static std::string revisitRecordJSON(const ldml::RevisitRecord & r) {
 }
 
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
+static void convertedContextCaptureRules(const ldml::TransformStep & step, std::set<const ldml::Rule *> & rules);
 static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
@@ -599,6 +600,16 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         rules = ldml::DisambiguateOrder(rules, &dstats);
         ldml::RestoreMarkRunGroups(rules, markRunGroups);
         a.plan = ldml::planTransform(rules);
+        //  The MultipleCaptureMultipleReplacement rules whose before contexts may
+        //  match differently in the converted text (see captureContextProblems)
+        //  as string rules keeping the characters of their captures (whose
+        //  before contexts are matched against the converted text; see
+        //  ldml::StringRule::kept), planned again.
+        {
+            std::set<const ldml::Rule *> converted;
+            for (const ldml::TransformStep & step : a.plan.steps) convertedContextCaptureRules(step, converted);
+            if (!converted.empty()) a.plan = ldml::planTransform(rules, &converted);
+        }
         //  The reasons the rules with text to revisit were not composed: these
         //  rules remain, in order, as the rules with that problem.
         //  Likewise for the rules whose texts were not expanded.
@@ -822,6 +833,7 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
 //  in decoded UTF-8, so that these positions are distinguished from the characters
 //  of the text (including U+0000), also when matching contexts.
 static constexpr UCD::codepoint_t DeletionMark = 0xD800;
+static_assert(DeletionMark == ldml::StringRuleDeleted, "the deletion mark of the string rules keeping characters");
 
 //  Filled: the 21-bit basis with the filler codepoint at the positions not in
 //  the spread mask (the inserted positions, which hold 0 in the basis).
@@ -985,6 +997,11 @@ struct WalkConfig {
         }
         return m;
     }
+    unsigned maxLength() const {
+        unsigned m = 1;
+        for (const Branch & b : branches) m = std::max(m, b.length);
+        return m;
+    }
     std::string signature() const {
         std::string sig;
         for (const Branch & b : branches) {
@@ -996,19 +1013,29 @@ struct WalkConfig {
     }
 };
 
-//  The starts of the matches in each branch of their walk.
+//  The starts of the matches in each branch of their walk: the starts found
+//  by the engine where the walk of the branch holds, and (given After, the
+//  positions at which the after context matches) its after context matches
+//  at its end (for a branch without a run).  The engine does not match a set
+//  with strings possessively, so a start may be of another match.
 class WalkBranchStarts final : public pablo::PabloKernel {
 public:
-    WalkBranchStarts(LLVMTypeSystemInterface & ts, const WalkConfig & config, StreamSet * Starts, StreamSet * Classes, StreamSet * Branches)
-    : PabloKernel(ts, "WalkBranchStarts_" + getStringHash(config.signature()),
-                  {Binding{"Starts", Starts}, Binding{"Classes", Classes, FixedRate(1), LookAhead(config.lookahead())}},
+    WalkBranchStarts(LLVMTypeSystemInterface & ts, const WalkConfig & config, StreamSet * Starts, StreamSet * Classes, StreamSet * After,
+                     StreamSet * Branches)
+    : PabloKernel(ts, "WalkBranchStarts_" + getStringHash(config.signature()) + (After ? "a" : ""),
+                  [&] {
+                      Bindings b{Binding{"Starts", Starts}, Binding{"Classes", Classes, FixedRate(1), LookAhead(config.lookahead())}};
+                      if (After) b.emplace_back("After", After, FixedRate(1), LookAhead(config.maxLength()));
+                      return b;
+                  }(),
                   {Binding{"Branches", Branches}})
-    , mConfig(config) {}
+    , mConfig(config), mAfter(After != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         PabloAST * const starts = getInputStreamSet("Starts")[0];
         const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * const after = mAfter ? getInputStreamSet("After")[0] : nullptr;
         auto at = [&](unsigned offset, unsigned c) {
             return offset == 0 ? classes[c] : pb.createLookahead(classes[c], offset);
         };
@@ -1017,12 +1044,14 @@ protected:
             PabloAST * s = starts;
             for (const auto & t : b.in) s = pb.createAnd(s, at(t.first, t.second));
             for (const auto & t : b.out) s = pb.createAnd(s, pb.createNot(at(t.first, t.second)));
+            if (after && b.run < 0) s = pb.createAnd(s, pb.createLookahead(after, b.length));
             out.push_back(s);
         }
         writeOutputStreamSet("Branches", out);
     }
 private:
     const WalkConfig mConfig;
+    const bool mAfter;
 };
 
 //  Of the selected matches of a set walked in branches (Selected, and the
@@ -1756,7 +1785,9 @@ static constexpr size_t FusedMaxAlternatives = 32;
 
 //  At most this many string rules, or subgroups, in a correction kernel for a
 //  whole group (larger groups keep their before contexts matched against the text).
-static constexpr size_t FusedMaxWholeGroupRules = 256;
+static cl::opt<unsigned> FusedMaxWholeGroupRules("whole-group-rules", cl::desc("The most string rules (or subgroups) of a group "
+                                                 "whose before contexts are matched against the converted text in one correction kernel"),
+                                                 cl::init(256), cl::cat(TconvOptions));
 
 namespace {
 
@@ -1990,6 +2021,12 @@ static std::vector<ConversionOutcome> conversionOutcomes(const ldml::TransformSt
             } else if (j < m) {
                 out = sr.replacement.substr(j);
             }
+            //  (A character kept, with the rest after it; a character deleted.)
+            if (!out.empty() && out.front() == ldml::StringRuleKept) {
+                if (out.size() > 1) outcomes.push_back(ConversionOutcome{sr.text[j], out.substr(1), 0});
+                continue;
+            }
+            if (!out.empty() && out.front() == ldml::StringRuleDeleted) out = out.substr(1);
             outcomes.push_back(ConversionOutcome{sr.text[j], out});
         }
         if (!sr.run.empty()) outcomes.push_back(ConversionOutcome{sr.run, std::u32string()});
@@ -2166,6 +2203,19 @@ static bool walkItems(const re::RE * re, std::vector<WalkItem> & items) {
     return false;
 }
 
+//  The MultipleCaptureMultipleReplacement rules of a group whose before contexts
+//  its conversions may make match differently in the converted text.
+static void convertedContextCaptureRules(const ldml::TransformStep & step, std::set<const ldml::Rule *> & rules) {
+    if (step.captureReplacements.empty()) return;
+    const std::vector<ConversionOutcome> outcomes = conversionOutcomes(step);
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        if (set.engineBefore == nullptr) continue;
+        FusedContexts before;
+        if (fusedContexts(set.engineBefore, true, before, true) && !convertedContextMatters(before, outcomes)) continue;
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) rules.insert(r.rule);
+    }
+}
+
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
     if (step.captureReplacements.empty()) return;
     //  The captures of the rules whose regions are moved must be found by a
@@ -2225,6 +2275,7 @@ static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearch
     const Insertions none;
     if (step.stringRules.size() == 1) {
         const ldml::StringRule & rule = step.stringRules.front();
+        if (rule.kept) return false;
         if (!rule.run.empty() || rule.selfOverlapping) {
             if (reason) *reason = rule.run.empty() ? "a rule that may match within its own text" : "a rule with a run";
             return false;
@@ -2346,7 +2397,9 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
     UCD::UnicodeSet stringRuleChars;
     for (const ldml::StringRule & sr : step.stringRules) {
         for (const UCD::UnicodeSet & t : sr.text) stringRuleChars = stringRuleChars + t;
-        for (char32_t c : sr.replacement) stringRuleChars.insert(c);
+        for (char32_t c : sr.replacement) {
+            if (c != ldml::StringRuleKept && c != ldml::StringRuleDeleted) stringRuleChars.insert(c);
+        }
     }
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         FusedContexts fusedBefore, fusedAfter;
@@ -3159,7 +3212,10 @@ void FusedRules::generatePabloMethod() {
             for (unsigned j = 0; j < n; j++) {
                 PabloAST * const at = j ? pb.createAdvance(first, j) : first;
                 if (mConfig.coverage) res.spans = pb.createOr(res.spans, at);
-                changeChar(at, j < m ? static_cast<UCD::codepoint_t>(rule.replacement[j]) : DeletionMark, &rule.text[j]);
+                //  (A character kept: no change; see ldml::StringRule::kept.)
+                if (j >= m || rule.replacement[j] != ldml::StringRuleKept) {
+                    changeChar(at, j < m ? static_cast<UCD::codepoint_t>(rule.replacement[j]) : DeletionMark, &rule.text[j]);
+                }
                 last = at;
             }
             for (unsigned j = n; j < m; j++) changeMark(j - n + 1, last, static_cast<UCD::codepoint_t>(rule.replacement[j]));
@@ -3766,47 +3822,64 @@ protected:
             return ahead[k]->compileCC(re::makeCC(set, &cc::Unicode), pb);
         };
         PabloAST * cursor = getInputStreamSet("Starts")[0];
-        PabloAST * startI = nullptr, * startJ = nullptr, * afterJ = nullptr;
+        PabloAST * startI = nullptr, * startJ = nullptr;
+        //  The last character consumed (the position before the cursor: there is
+        //  none after the end of the text), within capture j.
+        PabloAST * last = pb.createZeroes();
         for (size_t c = 0; c <= mConfig.captures.size(); c++) {
             if (mConfig.textLengths[c]) cursor = pb.createAdvance(cursor, mConfig.textLengths[c]);
             if (c == mConfig.captures.size()) break;
             if (c == mConfig.first) startI = cursor;
             if (c == mConfig.moved) startJ = cursor;
+            const bool tracked = c == mConfig.moved;
             for (const WalkItem & w : mConfig.captures[c]) {
                 switch (w.kind) {
-                    case WalkItem::Kind::Set:
-                        cursor = pb.createAdvance(pb.createAnd(cursor, cls(0, w.set)), 1);
+                    case WalkItem::Kind::Set: {
+                        PabloAST * const m = pb.createAnd(cursor, cls(0, w.set));
+                        if (tracked) last = m;
+                        cursor = pb.createAdvance(m, 1);
                         break;
+                    }
                     case WalkItem::Kind::Optional: {
                         PabloAST * const in = cls(0, w.set);
-                        cursor = pb.createOr(pb.createAdvance(pb.createAnd(cursor, in), 1), pb.createAnd(cursor, pb.createNot(in)));
+                        PabloAST * const taken = pb.createAnd(cursor, in);
+                        //  (Not taken: the cursor, after last, is at a character not in the set.)
+                        if (tracked) last = pb.createOr(taken, pb.createAnd(last, pb.createNot(cls(1, w.set))));
+                        cursor = pb.createOr(pb.createAdvance(taken, 1), pb.createAnd(cursor, pb.createNot(in)));
                         break;
                     }
                     case WalkItem::Kind::Star: {
                         PabloAST * const in = cls(0, w.set);
-                        cursor = pb.createAnd(pb.createMatchStar(cursor, in), pb.createNot(in));
+                        PabloAST * const reached = pb.createMatchStar(cursor, in);
+                        if (tracked) {
+                            PabloAST * const notNext = pb.createNot(cls(1, w.set));
+                            last = pb.createOr(pb.createAnd(pb.createAnd(reached, in), notNext), pb.createAnd(last, notNext));
+                        }
+                        cursor = pb.createAnd(reached, pb.createNot(in));
                         break;
                     }
                     case WalkItem::Kind::Strings: {
                         PabloAST * taken = pb.createZeroes();
                         PabloAST * next = pb.createZeroes();
+                        PabloAST * ends = pb.createZeroes();
                         for (const auto & str : w.strings) {
                             PabloAST * m = pb.createAnd(cursor, pb.createNot(taken));
                             for (unsigned k = 0; k < str.size(); k++) m = pb.createAnd(m, cls(k, str[k]));
                             next = pb.createOr(next, pb.createAdvance(m, str.size()));
+                            if (tracked) ends = pb.createOr(ends, str.size() > 1 ? pb.createAdvance(m, str.size() - 1) : m);
                             taken = pb.createOr(taken, m);
                         }
+                        if (tracked) last = ends;
                         cursor = next;
                         break;
                     }
                 }
             }
-            if (c == mConfig.moved) afterJ = cursor;
         }
         Var * const marks = getOutputStreamVar("Marks");
         pb.createAssign(pb.createExtract(marks, pb.getInteger(0)), startI);
         pb.createAssign(pb.createExtract(marks, pb.getInteger(1)), startJ);
-        pb.createAssign(pb.createExtract(marks, pb.getInteger(2)), afterJ);
+        pb.createAssign(pb.createExtract(marks, pb.getInteger(2)), last);
     }
 private:
     const CaptureWalkConfig mConfig;
@@ -5906,6 +5979,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             texts.back().push_back(r);
         }
         if (!texts.back().empty() && (rule.replacement.size() < rule.text.size() || !rule.run.empty())) needDeletion = true;
+        //  (A character deleted by a rule keeping others; see ldml::StringRule::kept.)
+        if (rule.replacement.find(static_cast<char32_t>(ldml::StringRuleDeleted)) != std::u32string::npos) needDeletion = true;
     }
     for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
         for (const ldml::BoundaryReplacement & br : set.replacements) {
@@ -6200,8 +6275,14 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 }
                 if (walkSets.empty()) walkSets.push_back(UCD::UnicodeSet());
                 StreamSet * const walkClasses = classes(walkSets, U21);
+                //  The positions at which the after context matches (where it begins).
+                StreamSet * afterAt = nullptr;
+                if (set.engineAfter) {
+                    afterAt = matchStarts(nullptr, nullptr,
+                                          {ldml::possessiveContext(ldml::expandedContext(set.engineAfter, Insertions(), DeletionMark), true)}, U21);
+                }
                 StreamSet * const branches = P.CreateStreamSet(walk.branches.size());
-                P.CreateKernelCall<WalkBranchStarts>(walk, all, walkClasses, branches);
+                P.CreateKernelCall<WalkBranchStarts>(walk, all, walkClasses, afterAt, branches);
                 std::vector<unsigned> lengths, suffixes;
                 for (const WalkConfig::Branch & b : walk.branches) {
                     lengths.push_back(b.length);
@@ -6715,8 +6796,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     P.CreateKernelCall<StreamSelect>(out, Select(marks, {k}));
                     return out;
                 };
-                StreamSet * const endJ = P.CreateStreamSet(1);
-                P.CreateKernelCall<ShiftBack>(select(2), endJ, 1);
+                StreamSet * const endJ = select(2);
                 //  Capture i is kept after the text inserted before it (if any).
                 int keptAt = 0;
                 for (const ldml::BoundaryReplacement & br : set.replacements) {

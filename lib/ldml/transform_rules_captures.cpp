@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <optional>
 
 using namespace llvm;
 using namespace re;
@@ -227,18 +228,75 @@ void eliminate(ConversionRule * r, std::vector<Rule *> & result) {
     Capture * target = nullable.front();
     const std::vector<RE *> items = optionalItems(target);
     const size_t k = items.size();
+    //  ICU matches the optional items possessively: an item absent (of a set)
+    //  means that the next character is not in its set.  Before an item
+    //  present, the item does not match those characters; at the end of the
+    //  text (the capture last), the after context begins with a character not
+    //  in them, or the end of the text.  (Elsewhere, the rule is unchanged.)
+    CharSetAnalysis sets;
+    auto itemSet = [&](RE * item, UCD::UnicodeSet & chars) {
+        while (Name * n = dyn_cast<Name>(item)) {
+            if (isFunctionCall(n) || n->getDefinition() == nullptr) return false;
+            item = n->getDefinition();
+        }
+        const Rep * rep = dyn_cast<Rep>(item);
+        if (rep == nullptr || !CharSetAnalysis::isSet(rep->getRE()) || !(sets.setOf(rep->getRE(), true) == sets.setOf(rep->getRE(), false))) {
+            return false;
+        }
+        chars = sets.setOf(rep->getRE(), false);
+        return true;
+    };
+    RE * const text = r->getLeftSide()->getText();
+    const Seq * textSeq = dyn_cast<Seq>(text);
+    const bool last = text == target || (textSeq && !textSeq->empty() && textSeq->back() == target);
     for (size_t absent = 0; absent < (size_t{1} << k); absent++) {
         std::vector<RE *> content;
         std::set<const Capture *> deleted;
+        UCD::UnicodeSet excluded;
+        bool known = true;
         for (size_t i = 0; i < k; i++) {
             if ((absent >> (k - 1 - i)) & 1) {
                 collectCaptures(items[i], deleted);
+                UCD::UnicodeSet chars;
+                if (itemSet(items[i], chars)) excluded = excluded + chars; else known = false;
             } else {
-                content.push_back(presentForm(items[i]));
+                RE * present = presentForm(items[i]);
+                UCD::UnicodeSet chars;
+                if (known && !excluded.empty() && itemSet(items[i], chars) && chars.intersects(excluded)) {
+                    //  (A single item may be just its set.)
+                    const Rep * rep = dyn_cast<Rep>(present);
+                    present = rep ? makeRep(makeCC(chars - excluded), rep->getLB(), rep->getUB()) : makeCC(chars - excluded);
+                }
+                content.push_back(present);
+                excluded = UCD::UnicodeSet();
+                known = true;
             }
         }
         RE * newContent = makeSeq(content.begin(), content.end());
-        eliminate(CaptureRewriter(target, newContent, std::move(deleted)).rewrite(r), result);
+        ConversionRule * rewritten = CaptureRewriter(target, newContent, std::move(deleted)).rewrite(r);
+        if (last && known && !excluded.empty()) {
+            //  The next character: that of the first set of the after context (if
+            //  it begins with one, without the text boundary), or any.
+            const RuleSide * src = rewritten->getLeftSide();
+            RE * after = nullptr;
+            if (!src->hasAfterContext()) {
+                after = makeAlt({makeCC(~excluded), makeBoundarySet(false)});
+            } else {
+                std::vector<RE *> items;
+                RE * const context = src->getAfterContext();
+                if (const Seq * seq = dyn_cast<Seq>(context)) items.assign(seq->begin(), seq->end()); else items.push_back(context);
+                if (!items.empty() && CharSetAnalysis::isSet(items.front()) && !mayIncludeTextBoundary(items.front())
+                        && sets.setOf(items.front(), true) == sets.setOf(items.front(), false)) {
+                    items.front() = makeCC(sets.setOf(items.front(), false) - excluded);
+                    after = makeSeq(items.begin(), items.end());
+                }
+            }
+            if (after) {
+                RuleSide * const source = RuleSide::Create(src->getBeforeContext(), src->getText(), false, nullptr, 0, after);
+                rewritten = makeConversionRule(source, Direction::Forward, rewritten->getRightSide());
+            }
+        }
+        eliminate(rewritten, result);
     }
 }
 

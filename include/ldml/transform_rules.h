@@ -43,6 +43,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <set>
 #include <vector>
 #include <functional>
 #include <llvm/Support/Casting.h>

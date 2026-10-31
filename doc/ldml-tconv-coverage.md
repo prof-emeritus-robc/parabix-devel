@@ -39,7 +39,12 @@ Latn-Grek/UNGEGN Latn-Kana`): Latn-Grek/UNGEGN, Latn-Kana and Latn-Hira are
 implementable (395). Then Latn-Grek's iota subscript rules as chain revisits,
 in a group of their own (`ef4e202f9`, `--update --only Latn-Grek`): Latn-Grek remains
 blocked (W3, W6), with fewer problems. Then mark run edits (`1317f8cfa`, `--update --only
-Latn-Arab Latin-ThaiLogical Latn-Thai`): Latn-Arab is implementable (396).*
+Latn-Arab Latin-ThaiLogical Latn-Thai`): Latn-Arab is implementable (396).
+Then MultipleCaptureMultipleReplacement matches that may end within another,
+selected by the lengths of their possessive walks, with the sets of these
+rules within the filter (`75e82e277`, `00bea45f0`, `--update --only byn_Latn-byn_Ethi/Xaleget my-Zawgyi
+Latn-Grek/UNGEGN Latn-Hebr si-si_Latn`): byn_Latn-byn_Ethi/Xaleget and
+my-Zawgyi are implementable (398).*
 
 This report covers:
 
@@ -60,8 +65,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 396 (93%) |
-| …of which public (not `visibility="internal"`) | 393 | 365 (93%) |
+| Transforms defined by CLDR files (380 files) | 425 | 398 (94%) |
+| …of which public (not `visibility="internal"`) | 393 | 367 (93%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -166,7 +171,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          396  █████████████████████████████████████
+now                          398  █████████████████████████████████████
 + W3 variable-length text    404  ██████████████████████████████████████
 + W6 revisit                 418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
@@ -353,7 +358,12 @@ Implementable now:
   Latn-Kana and Latn-Hira;
 - with MultipleCaptureMultipleReplacement rules matched by exact starts, selected
   with string rules, or expanded: am_FONIPA-am and the `*-am` transforms through
-  it, am-am_FONIPA, am-ar, am-chr, am-fa, NumericPinyin-Latin and Bopo-Latn.
+  it, am-am_FONIPA, am-ar, am-chr, am-fa, NumericPinyin-Latin and Bopo-Latn;
+- with MultipleCaptureMultipleReplacement rules whose matches may end within
+  another, selected by the lengths of their possessive walks:
+  byn_Latn-byn_Ethi/Xaleget and my-Zawgyi (identical to ICU 78.3's
+  `createFromRules` on their files' rules on 40,000 and 2,000 random lines;
+  neither has CLDR test data).
 
 The per-transform status is in the table.
 
@@ -968,7 +978,7 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 22 | 8 | M–L (the rest) |
+| W3 variable-length texts | 20 | 6 | M–L (the rest) |
 | W6 text to revisit, not composed | 17 | 4 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
@@ -1218,7 +1228,24 @@ The W3 rules that remain mostly also have other problems:
 - runs of sets with strings (`[{i̯}ij]+`);
 - text boundaries in the text (`\. ([$])`);
 - MultipleCaptureMultipleReplacement rules whose starts cannot be told apart
-  (byn Xaleget, my-Zawgyi, Zawgyi-my).
+  and whose walks have more than one run (Zawgyi-my).
+
+**Matches that may end within another** (`MultipleCaptureMultipleReplacementSet::
+walkStarts`): their starts come from the regular expression engine (MatchStarts),
+one Pablo kernel (`WalkBranchStarts`) splits them by the branch of their
+possessive walk (an optional item taken or not, a string of two characters of a
+set or its first character, tested by lookahead), each branch with a fixed
+length, or a fixed length, a run and a fixed suffix, and LeftmostMatches selects
+them from the left, alone or with the other sets and the string rules (it now
+covers a suffix after a run); `WalkSpans` gives the spans and ends of those
+selected. The sets of these rules are within the global filter: a character
+outside it ends ICU's text, where a set with the text boundary matches (ICU's
+`[^0-9.]`), so such a set at the end of the pattern also matches it, and the
+result leaves it. (ICU differs for a single group of rules, where a rule before
+whose set has that character stops the matching there; the CLDR transforms are
+compound.) `tconv --lines` costs about 8 ms a line for my-Zawgyi, the cost of
+running a pipeline of 2,493 kernels, mostly the regular expression engines of its
+130 sets (129 of one rule) (0.3 s for 2,000 lines as one text).
 
 **The MultipleCaptureMultipleReplacement pattern** generalizes the above:
 `T0 (B1) T1 … (Bk) Tk → R0 $1 R1 … $k Rk`, with fixed-length Ti, fixed texts Ri
@@ -1416,6 +1443,7 @@ tconv on every implementable transform.
 | `8a0b58af8` | contexts with repetitions or optional items combined: Latn-Grek/UNGEGN, Latn-Kana, Latn-Hira: 395 |
 | `ef4e202f9` | chain revisits (Latn-Grek's iota subscript), in a group of their own: 395 |
 | `1317f8cfa` | mark run edits, in a group of their own: Latn-Arab: 396 |
+| `75e82e277`, `00bea45f0` | MultipleCaptureMultipleReplacement matches selected by their walks; their sets within the filter: byn_Latn-byn_Ethi/Xaleget, my-Zawgyi: 398 |
 
 ## Reproducing
 

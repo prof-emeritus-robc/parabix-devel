@@ -771,6 +771,7 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             llvm::outs() << "    " << (set.captures.size() == 1 ? "SingleCaptureDoubleReplacement" : "MultipleCaptureMultipleReplacement")
                          << " rules, matched together (" << set.rules.size() << ", starts by "
                          << (set.startsByFirst ? "their first characters" : set.singleCharacter ? "their ends (one character)"
+                             : set.walkStarts ? "the engine, selected by the lengths of " + std::to_string(set.walkBranches.size()) + " walk branches"
                              : set.exactStarts ? "the engine (all starts)" : "the ends of matches") << ")"
                          << (set.reversed ? ", captures reversed (SwapBack " + std::to_string(set.swapLength) + ", " + std::to_string(set.swapDistance) + ")" : "")
                          << (set.moved ? ", captures " + std::to_string(set.moveFirst + 1) + " to " + std::to_string(set.moveCapture)
@@ -1042,11 +1043,14 @@ protected:
         PabloAST * const selected = getInputStreamSet("Selected")[0];
         const std::vector<PabloAST *> branches = getInputStreamSet("Branches");
         const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * starts = pb.createZeroes();
         PabloAST * spans = pb.createZeroes();
         PabloAST * ends = pb.createZeroes();
         for (size_t i = 0; i < mConfig.branches.size(); i++) {
             const WalkConfig::Branch & b = mConfig.branches[i];
+            //  (Selected may include the matches of other sets and rules.)
             PabloAST * const s = pb.createAnd(selected, branches[i]);
+            starts = pb.createOr(starts, s);
             for (unsigned j = 0; j < b.length; j++) spans = pb.createOr(spans, j ? pb.createAdvance(s, j) : s);
             PabloAST * const last = b.length > 1 ? pb.createAdvance(s, b.length - 1) : s;
             if (b.run < 0) {
@@ -1066,7 +1070,7 @@ protected:
                 ends = pb.createOr(ends, pb.createAnd(pb.createOr(run, last), pb.createNot(pb.createLookahead(r, 1))));
             }
         }
-        writeOutputStreamSet("Chosen", std::vector<PabloAST *>{selected, spans, ends});
+        writeOutputStreamSet("Chosen", std::vector<PabloAST *>{starts, spans, ends});
     }
 private:
     const WalkConfig mConfig;

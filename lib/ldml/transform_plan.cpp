@@ -414,6 +414,51 @@ static bool walkBranches(const std::vector<WalkElement> & elements, std::vector<
     return true;
 }
 
+//  A pattern of a text with its sets within the filter: ICU's text matches no
+//  other character.  A character outside the filter ends ICU's text, where a
+//  set with the text boundary matches (with no character): at the end of the
+//  pattern (last), such a set also matches a character outside the filter,
+//  which the result then leaves as it is, as ICU does.
+static re::RE * withinFilter(re::RE * re, const UCD::UnicodeSet & filter, CharSetAnalysis & sets, bool last) {
+    if (CharSetAnalysis::isSet(re) && !hasStrings(re)) {
+        if (mayIncludeTextBoundary(re)) {
+            return last ? re::makeAlt({re, re::makeCC(~filter, &cc::Unicode)}) : re;
+        }
+        return re::makeCC(sets.setOf(re, false) & filter, &cc::Unicode);
+    } else if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        std::vector<re::RE *> items;
+        for (size_t i = 0; i < seq->size(); i++) {
+            items.push_back(withinFilter((*seq)[i], filter, sets, last && i + 1 == seq->size()));
+        }
+        return re::makeSeq(items.begin(), items.end());
+    } else if (re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        std::vector<re::RE *> items;
+        for (re::RE * e : *alt) items.push_back(withinFilter(e, filter, sets, last));
+        return re::makeAlt(items.begin(), items.end());
+    } else if (re::Rep * r = dyn_cast<re::Rep>(re)) {
+        return re::makeRep(withinFilter(r->getRE(), filter, sets, false), r->getLB(), r->getUB());
+    } else if (re::Name * n = dyn_cast<re::Name>(re); n && n->getDefinition() && !isFunctionCall(n)) {
+        return withinFilter(n->getDefinition(), filter, sets, last);
+    }
+    return re;
+}
+
+static void withinFilter(MultipleCaptureMultipleReplacementSet & set, MultipleCaptureMultipleReplacement & rule,
+                         const UCD::UnicodeSet & filter, CharSetAnalysis & sets) {
+    for (size_t i = 0; i < set.captures.size(); i++) {
+        set.captures[i] = withinFilter(set.captures[i], filter, sets, i + 1 == set.captures.size() && set.texts.back().empty());
+    }
+    for (auto & t : set.texts) for (UCD::UnicodeSet & chars : t) chars = chars & filter;
+    for (UCD::UnicodeSet & chars : rule.first) chars = chars & filter;
+    set.startChars = set.startChars & filter;
+    for (WalkBranch & b : set.walkBranches) {
+        for (auto & t : b.in) t.second = t.second & filter;
+        for (auto & t : b.out) t.second = t.second & filter;
+        b.runSet = b.runSet & filter;
+        for (UCD::UnicodeSet & chars : b.suffix) chars = chars & filter;
+    }
+}
+
 static bool multipleCaptureMultipleReplacement(const ConversionRule * c, MultipleCaptureMultipleReplacement & rule,
                                                MultipleCaptureMultipleReplacementSet & set, CharSetAnalysis & sets,
                                                std::string & reason) {
@@ -1652,6 +1697,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
             //  not, with a result referring to its captures in order).
             if (!identity && (!singleChars || !fixedString(result->getText(), fixedResult))
                     && multipleCaptureMultipleReplacement(c, capture, set, sets, captureReason)) {
+                if (plan.filter) withinFilter(set, capture, plan.filterSet, sets);
                 if (group == nullptr) {
                     TransformStep step;
                     step.kind = TransformStep::Kind::Conversion;

@@ -1120,6 +1120,34 @@ extracted:
   whose text is a capture (`([ab]) → B`) applied to every character, and a
   string rule could apply within an applied match in the correction kernel
   (§3.1).
+- **Not yet: blocking marks** (it-am, it-ja). Their group begins with
+  `($consonant) \' → | $1 ; \' → ;`, so every apostrophe is deleted, and its
+  only effect is on what matches (with ICU's `createFromRules`): a run of
+  apostrophes after a consonant at which the cursor is, the first character of
+  a match or a revisited one, is deleted before the rules are tried there
+  (`c'ha` as `cha`, `K`; `b'sa` as `bsa`), but one after a consonant within a
+  match blocks it (`ch'a` gives `Ca`, not `K`; `c'h'a`, `ch''a` likewise; the
+  after context of `($consonant) s } $vowel` sees it in `bs'a`), and one after
+  the last character of a text without an after context changes nothing
+  (`ch'`). Applied before the group, the prefix run makes the blocked matches
+  match: 27 rules of each file have a consonant within their texts (`cha` …
+  `cho`, `ghi`, `gli`, `gna` …, `thi` …, `sci`, `cqu`, `tzu`, and the two
+  `$1 \~s`, `$1 \~z` rules), and the 14 revisit rules not composed fail on
+  chains through the apostrophe rule. Which consonants are cursor positions
+  depends on the matches, so no change of the deletions alone is exact. The
+  design: the prefix run step also gives a stream D of the positions that
+  follow a deleted run; each rule of the rest of the group has the offsets at
+  which a deleted run is transparent (1, after its first character; for a
+  composed rule, also those after the points where its chain revisits); and a
+  match with D at another offset within its text or after context does not
+  apply. The condition is local to each match (it does not depend on the
+  selection), and is checked wherever the group finds matches: the fused
+  kernels, the engine's context matches, and the MultipleCaptureMultipleReplacement
+  rules. With it, two conflicts of prefixRunConflict are relaxed where the
+  prefix runs only delete: a revisited P that is the original character at its
+  position (`tz → | zz`), and triggers whose texts are within P (it-ja's
+  `k → | c`, `q → | c`, whose runs are already deleted). It would make it-am
+  and it-ja implementable.
 
 Of the 43 transforms that W6 alone blocked, 9 are now implementable (Hebr-Latn,
 Latn-Cyrl, ru-zh, es-am, es-es_FONIPA, es_FONIPA-am, Ethi-Latn/ES3842,

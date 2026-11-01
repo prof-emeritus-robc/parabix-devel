@@ -80,7 +80,11 @@ insertion revisits beyond the first rule of a group (`920d7551f`, `--update
 Then prefix runs with exceptions (`19d0a02a2`, `07b1a4c13`, `--update --only
 pl_FONIPA-ja pl-ja am_FONIPA-am und_FONIPA-chr`, the last two for their plans
 as printed): pl_FONIPA-ja and pl-ja are implementable (409), and W6 alone
-blocks 4.*
+blocks 4. Then prefix runs that only delete, revisited P and characters of S
+in after contexts (`9238f5c0c`: ja_Latn-ko from 16 problems to 6), and repeated
+captures of characters enumerated (`5c1ed53ee`, `--update --only sk_FONIPA-ja
+sk-ja ja_Latn-ko`): sk_FONIPA-ja and sk-ja are implementable (411), and W5 is
+needed by fa-fa_FONIPA alone.*
 
 This report covers:
 
@@ -101,8 +105,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 409 (96%) |
-| …of which public (not `visibility="internal"`) | 393 | 378 (96%) |
+| Transforms defined by CLDR files (380 files) | 425 | 411 (97%) |
+| …of which public (not `visibility="internal"`) | 393 | 380 (97%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -207,12 +211,12 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          409  ██████████████████████████████████████
-+ W3 variable-length text    413  ███████████████████████████████████████
-+ W6 revisit                 418  ███████████████████████████████████████
-+ W5 captures/functions      421  ████████████████████████████████████████
-+ W4 insertion               423  ████████████████████████████████████████
-+ W10 engine lookaheads      424  ████████████████████████████████████████
+now                          411  ███████████████████████████████████████
++ W3 variable-length text    415  ███████████████████████████████████████
++ W6 revisit                 420  ████████████████████████████████████████
++ W4 insertion               422  ████████████████████████████████████████
++ W10 engine lookaheads      423  ████████████████████████████████████████
++ W5 captures/functions      424  ████████████████████████████████████████
 + W8 built-ins               425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
@@ -1009,7 +1013,7 @@ those of invoked transforms).
 |---|---:|---:|---|
 | W3 variable-length texts | 8 | 4 | M–L (the rest) |
 | W6 text to revisit, not composed | 8 | 4 | L (with W3) |
-| W5 back-references | 3 | 2 | M |
+| W5 back-references | 1 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
 | W4 insertion rules (with string rules) | 2 | 0 | M |
@@ -1444,6 +1448,17 @@ mappings, and other transforms through their plans, on single characters. This
 made az-, el-, lt- and tr-Title and Latn-Ethi/ALALOC and /SERA implementable, and
 removed W5 from the Pinyin transforms and my-Zawgyi.
 
+**Repeated captures** (`5c1ed53ee`). A rule referring more than once to a
+capture of a character of a set, as sk_FONIPA-ja's `([b-df-hk-npr-tvzʃʒ]) ː →
+$1 $1` (a length mark doubling the consonant), has a result that is not a fixed
+string: `ldml::EnumerateRepeatedCaptures` replaces it by a rule for each
+character of the set, in order (`bː → bb`, `cː → cc`, …; for each combination
+of the characters of such captures, at most 64), where the references are items
+of the result (not within function calls). This made sk_FONIPA-ja and sk-ja
+implementable; fa-fa_FONIPA alone still needs W5 (the copy of a capture of a
+set with strings from its before context, `([$IPA_CONSONANT$VOWEL\|]) { ّ →
+$1`, with its W6 rule `([َ ِ ُ])ّ → ّ | $1`).
+
 **Unreferenced captures** are removed before the other capture simplifications
 (`ldml::RemoveUnreferencedCaptures`, `9043a6b5b`, with `re::removeUnneededCaptures`):
 a capture that the result never refers to, such as the grouping in
@@ -1541,7 +1556,7 @@ The per-transform table lists the problem classes of every transform.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. With
    them (`~/cldr`, as in this run), W7 blocks nothing.
 5. **W5 back-references.** The copy of a set with strings (fa-fa_FONIPA), with
-   W6 in fa-fa_FONIPA, sk-ja and sk_FONIPA-ja; and the deferred rules exact for
+   W6 in fa-fa_FONIPA; and the deferred rules exact for
    chains of any length (a fixpoint rather than rounds, with buffer bounds that
    do not compound).
 6. **Built-ins and pipeline size.**
@@ -1626,6 +1641,7 @@ tconv on every implementable transform.
 | `b45845a25` | runs of sets with strings: cs-ja, cs_FONIPA-ja, es-ja, es_419-ja, es_FONIPA-ja: 406 |
 | `920d7551f` | insertion revisits beyond the first rule of a group: my-my_Latn: 407 |
 | `19d0a02a2`, `07b1a4c13` | prefix runs seen by the last item of an after context, and with exceptions: pl_FONIPA-ja, pl-ja: 409 |
+| `9238f5c0c`, `5c1ed53ee` | prefix runs with revisited P and characters of S in after contexts (ja_Latn-ko); repeated captures enumerated: sk_FONIPA-ja, sk-ja: 411 |
 
 ## Reproducing
 

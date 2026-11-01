@@ -89,9 +89,32 @@ static bool plainSet(const re::RE * re) {
 //  possessively, taking the longest run: S+ is S then a run of S, S* a run of
 //  S, and (S T*)+ (as in ($alif) $alif+ with $alif = [أإآا] [:M:]*) is S then
 //  a run of the characters of S and T.
-static bool runItem(re::RE * re, std::vector<re::RE *> & first, UCD::UnicodeSet & run, CharSetAnalysis & sets) {
+static std::set<std::u32string> setStrings(const re::RE * re);
+
+//  The strings of a set with strings that may be a run's (see
+//  StringRule::runStrings), with the characters of one character of the set:
+//  each string begins with one of them, and no proper suffix of a string is a
+//  proper prefix of a string.
+static bool runStringsOf(const re::RE * set, CharSetAnalysis & sets, UCD::UnicodeSet & singles, std::vector<std::u32string> & strings) {
+    const std::set<std::u32string> all = setStrings(set);
+    if (all.empty()) return false;
+    singles = sets.setOf(set, false);
+    for (const std::u32string & w : all) {
+        if (w.size() < 2 || !singles.contains(w[0])) return false;
+        for (const std::u32string & t : all) {
+            for (size_t k = 1; k < w.size(); k++) {
+                if (k + t.size() > w.size() && w.compare(k, std::u32string::npos, t, 0, w.size() - k) == 0) return false;
+            }
+        }
+    }
+    strings.assign(all.begin(), all.end());
+    return true;
+}
+
+static bool runItem(re::RE * re, std::vector<re::RE *> & first, UCD::UnicodeSet & run, CharSetAnalysis & sets,
+                    UCD::UnicodeSet & runSingles, std::vector<std::u32string> & runStrings) {
     if (re::Name * n = dyn_cast<re::Name>(re)) {
-        return !isFunctionCall(n) && n->getDefinition() && runItem(n->getDefinition(), first, run, sets);
+        return !isFunctionCall(n) && n->getDefinition() && runItem(n->getDefinition(), first, run, sets, runSingles, runStrings);
     }
     re::Rep * const rep = dyn_cast<re::Rep>(re);
     if (rep == nullptr || rep->getUB() != re::Rep::UNBOUNDED_REP || rep->getLB() > 1) return false;
@@ -103,6 +126,16 @@ static bool runItem(re::RE * re, std::vector<re::RE *> & first, UCD::UnicodeSet 
     if (plainSet(body)) {
         if (rep->getLB() == 1) first.push_back(body);
         run = sets.setOf(body, false);
+        return true;
+    }
+    //  A set with strings: the text a character of one character (with which
+    //  each string begins), and the run the rest, through the strings.
+    if (CharSetAnalysis::isSet(body) && hasStrings(body) && rep->getLB() == 1 && runStringsOf(body, sets, runSingles, runStrings)) {
+        first.push_back(re::makeCC(runSingles, &cc::Unicode));
+        run = runSingles;
+        for (const std::u32string & w : runStrings) {
+            for (char32_t c : w) run.insert(static_cast<UCD::codepoint_t>(c));
+        }
         return true;
     }
     const re::Seq * seq = dyn_cast<re::Seq>(body);
@@ -1757,10 +1790,11 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 continue;
             }
             //  A run at the end of the text (see StringRule::run).
-            UCD::UnicodeSet run;
+            UCD::UnicodeSet run, runSingles;
+            std::vector<std::u32string> runStrings;
             if (!items.empty()) {
                 std::vector<re::RE *> first;
-                if (runItem(items.back(), first, run, sets)) {
+                if (runItem(items.back(), first, run, sets, runSingles, runStrings)) {
                     items.pop_back();
                     items.insert(items.end(), first.begin(), first.end());
                 }
@@ -1909,6 +1943,8 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
             if (items.size() > 1 || !run.empty()) {
                 StringRule s;
                 s.run = run;
+                s.runSingles = runSingles;
+                s.runStrings = runStrings;
                 for (re::RE * item : items) s.text.push_back(sets.setOf(item, false));
                 s.replacement = replacement;
                 s.before = before;

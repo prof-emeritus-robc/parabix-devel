@@ -92,6 +92,17 @@ struct StringRule {
     // The rule then has no after context, and its group is selected
     // sequentially (TransformStep::sequentialSelection).
     UCD::UnicodeSet run;
+    // A run of a set with strings (of two or more characters), [{i̯} i ɪ]+ :
+    // run has all the characters of the set, runSingles those of one
+    // character (including the first of each string), and runStrings the
+    // strings.  The run is then the longest run of positions each of a
+    // character of runSingles or within an occurrence of a string: ICU's run,
+    // taking the longest string at each step, as no string ends with the
+    // beginning of another (a proper suffix of one is no proper prefix of
+    // another), so that no occurrence begins within one ICU takes and extends
+    // past it.
+    UCD::UnicodeSet runSingles;
+    std::vector<std::u32string> runStrings;
     // Whether the replacement keeps characters of the text: StringRuleKept at
     // a position of the replacement (one for each position of the text but
     // the last, which has the rest) keeps the character of the text there,

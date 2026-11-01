@@ -2540,6 +2540,9 @@ struct FusedStringRule {
     int match = -1;
     bool converted = false;     // in a correction kernel: its before context is matched against the converted text
     UCD::UnicodeSet run;        // the set of the run following the text, deleted (see ldml::StringRule::run)
+    //  The run of a set with strings (see ldml::StringRule::runStrings).
+    UCD::UnicodeSet runSingles;
+    std::vector<std::u32string> runStrings;
     //  If keep >= 0 (text of one character): the character is kept, with the
     //  replacement inserted around it, the character at index keep of the result
     //  (see ldml::BoundaryReplacement).
@@ -2578,8 +2581,84 @@ struct FusedInsertion {
 struct MatchClass {
     unsigned length;
     UCD::UnicodeSet run;
-    bool operator==(const MatchClass & other) const {return length == other.length && run == other.run;}
-    bool includes(const FusedStringRule & r) const {return r.text.size() == length && r.run == run;}
+    std::vector<std::u32string> runStrings;     // (see FusedStringRule::runStrings)
+    UCD::UnicodeSet runSingles;
+    bool operator==(const MatchClass & other) const {
+        return length == other.length && run == other.run && runStrings == other.runStrings;
+    }
+    bool includes(const FusedStringRule & r) const {return r.text.size() == length && r.run == run && r.runStrings == runStrings;}
+};
+
+//  The positions of a run of a set with strings (see ldml::StringRule::runStrings):
+//  those of a character of one character, and those within an occurrence of
+//  a string (found at its first position by looking ahead); at offset 0 of
+//  classOf (the class of a set at an offset after the position).
+static PabloAST * runPositions(PabloBuilder & pb, const UCD::UnicodeSet & singles, const std::vector<std::u32string> & strings,
+                               const std::function<PabloAST * (unsigned, const UCD::UnicodeSet &)> & classOf) {
+    PabloAST * positions = classOf(0, singles);
+    for (const std::u32string & w : strings) {
+        PabloAST * at = classOf(0, UCD::UnicodeSet(static_cast<UCD::codepoint_t>(w[0])));
+        for (unsigned j = 1; j < w.size(); j++) {
+            at = pb.createAnd(at, classOf(j, UCD::UnicodeSet(static_cast<UCD::codepoint_t>(w[j]))));
+        }
+        for (unsigned j = 1; j < w.size(); j++) positions = pb.createOr(positions, pb.createAdvance(at, j));
+    }
+    return positions;
+}
+
+//  The lookahead of runPositions.
+static unsigned runLookahead(const std::vector<std::u32string> & strings) {
+    unsigned l = 0;
+    for (const std::u32string & w : strings) l = std::max<unsigned>(l, w.size() - 1);
+    return l;
+}
+
+//  The sets of the classes of runPositions: the characters of one character,
+//  then each character of the strings.
+static std::vector<UCD::UnicodeSet> runClassSets(const UCD::UnicodeSet & singles, const std::vector<std::u32string> & strings) {
+    std::vector<UCD::UnicodeSet> sets{singles};
+    for (const std::u32string & w : strings) {
+        for (char32_t ch : w) {
+            const UCD::UnicodeSet c(static_cast<UCD::codepoint_t>(ch));
+            if (std::find(sets.begin(), sets.end(), c) == sets.end()) sets.push_back(c);
+        }
+    }
+    return sets;
+}
+
+//  The positions of a run of a set with strings (see runPositions), from the
+//  classes of runClassSets.
+class RunPositions final : public pablo::PabloKernel {
+public:
+    RunPositions(LLVMTypeSystemInterface & ts, const UCD::UnicodeSet & singles, const std::vector<std::u32string> & strings,
+                 StreamSet * Classes, StreamSet * Positions)
+    : PabloKernel(ts, "RunPositions_" + getStringHash(signature(singles, strings)),
+                  {Binding{"Classes", Classes, FixedRate(1), LookAhead(std::max(1u, runLookahead(strings)))}},
+                  {Binding{"Positions", Positions}})
+    , mSingles(singles), mStrings(strings) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        const std::vector<UCD::UnicodeSet> sets = runClassSets(mSingles, mStrings);
+        auto classOf = [&](unsigned offset, const UCD::UnicodeSet & set) -> PabloAST * {
+            PabloAST * const c = classes[std::find(sets.begin(), sets.end(), set) - sets.begin()];
+            return offset ? pb.createLookahead(c, offset) : c;
+        };
+        writeOutputStreamSet("Positions", std::vector<PabloAST *>{runPositions(pb, mSingles, mStrings, classOf)});
+    }
+private:
+    static std::string signature(const UCD::UnicodeSet & singles, const std::vector<std::u32string> & strings) {
+        std::string s;
+        for (const auto & range : singles) s += std::to_string(range.first) + "-" + std::to_string(range.second) + ",";
+        for (const std::u32string & w : strings) {
+            s += "w";
+            for (char32_t ch : w) s += std::to_string(ch) + ",";
+        }
+        return s;
+    }
+    const UCD::UnicodeSet mSingles;
+    const std::vector<std::u32string> mStrings;
 };
 
 struct FusedRulesConfig {
@@ -2655,6 +2734,7 @@ struct FusedLayout {
     FusedLayout(const FusedRulesConfig & c, const FusedState & in) {
         for (const FusedStringRule & r : c.strings) {
             const unsigned n = r.text.size(), m = r.resultLength();
+            lookahead = std::max(lookahead, runLookahead(r.runStrings));
             if (r.match < 0) {
                 for (const FusedContext & a : r.after) lookahead = std::max<unsigned>(lookahead, n - 1 + a.size());
                 maskLookahead = std::max<unsigned>(maskLookahead, n - 1);
@@ -2863,6 +2943,12 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
     };
     for (const FusedStringRule & r : c.strings) {
         add(r.run);
+        if (!r.runStrings.empty()) {
+            add(r.runSingles);
+            for (const std::u32string & w : r.runStrings) {
+                for (char32_t ch : w) add(UCD::UnicodeSet(static_cast<UCD::codepoint_t>(ch)));
+            }
+        }
         if (r.match >= 0) continue;
         for (const UCD::UnicodeSet & t : r.text) add(t);
         addContext(r.before);
@@ -3016,6 +3102,10 @@ private:
         for (const MatchClass & k : c.startsByLength) {
             s += "n" + std::to_string(k.length);
             if (!k.run.empty()) appendSet(s, k.run);
+            for (const std::u32string & w : k.runStrings) {
+                s += "w";
+                for (char32_t ch : w) s += std::to_string(ch) + ",";
+            }
         }
         if (c.rounds) {
             s += "R" + std::to_string(c.rounds);
@@ -3051,6 +3141,10 @@ private:
             if (!r.run.empty()) {
                 s += "+";
                 appendSet(s, r.run);
+                for (const std::u32string & w : r.runStrings) {
+                    s += "w";
+                    for (char32_t ch : w) s += std::to_string(ch) + ",";
+                }
             }
             if (r.keep >= 0) s += "k" + std::to_string(r.keep);
             s += ">";
@@ -3244,7 +3338,7 @@ void FusedRules::generatePabloMethod() {
     //  The run following the text of a rule (within the mask), given the last
     //  positions of its applied matches.
     auto runTail = [&](const FusedStringRule & rule, PabloAST * last) -> PabloAST * {
-        PabloAST * runChars = classAt(0, rule.run);
+        PabloAST * runChars = rule.runStrings.empty() ? classAt(0, rule.run) : runPositions(pb, rule.runSingles, rule.runStrings, classAt);
         if (mask) runChars = pb.createAnd(runChars, mask);
         return pb.createAnd(pb.createMatchStar(pb.createAdvance(last, 1), runChars), runChars);
     };
@@ -6207,6 +6301,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         FusedStringRule fr;
         fr.text = texts[r];
         fr.run = step.stringRules[r].run;
+        fr.runSingles = step.stringRules[r].runSingles;
+        fr.runStrings = step.stringRules[r].runStrings;
         fr.replacement = step.stringRules[r].replacement;
         fr.before = befores[r];
         fr.after = afters[r];
@@ -6265,27 +6361,52 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     };
     auto selectionClasses = [&](const std::vector<MatchClass> & classes) {
         SelectionClasses c;
-        std::vector<UCD::UnicodeSet> runSets;
+        std::vector<const MatchClass *> runSets;
+        bool strings = false;
         for (const MatchClass & k : classes) {
             c.lengths.push_back(k.length);
             if (k.run.empty()) {
                 c.runOf.push_back(-1);
                 continue;
             }
-            auto f = std::find(runSets.begin(), runSets.end(), k.run);
+            auto f = std::find_if(runSets.begin(), runSets.end(), [&](const MatchClass * o) {
+                return o->run == k.run && o->runStrings == k.runStrings;
+            });
             if (f == runSets.end()) {
-                runSets.push_back(k.run);
+                runSets.push_back(&k);
                 f = runSets.end() - 1;
             }
+            strings |= !k.runStrings.empty();
             c.runOf.push_back(static_cast<int>(f - runSets.begin()));
         }
         if (!runSets.empty()) {
-            std::vector<re::CC *> ccs;
-            for (const UCD::UnicodeSet & set : runSets) ccs.push_back(re::makeCC(set, &cc::Unicode));
-            StreamSet * runs = P.CreateStreamSet(ccs.size());
-            P.CreateKernelCall<CharClassesKernel>(ccs, U21, runs);
+            StreamSet * runs = nullptr;
+            if (!strings) {
+                std::vector<re::CC *> ccs;
+                for (const MatchClass * k : runSets) ccs.push_back(re::makeCC(k->run, &cc::Unicode));
+                runs = P.CreateStreamSet(ccs.size());
+                P.CreateKernelCall<CharClassesKernel>(ccs, U21, runs);
+            } else {
+                //  (The positions of a run of a set with strings, see RunPositions.)
+                std::vector<StreamSet *> each;
+                for (const MatchClass * k : runSets) {
+                    StreamSet * const one = P.CreateStreamSet(1);
+                    if (k->runStrings.empty()) {
+                        P.CreateKernelCall<CharClassesKernel>(std::vector<re::CC *>{re::makeCC(k->run, &cc::Unicode)}, U21, one);
+                    } else {
+                        std::vector<re::CC *> ccs;
+                        for (const UCD::UnicodeSet & set : runClassSets(k->runSingles, k->runStrings)) ccs.push_back(re::makeCC(set, &cc::Unicode));
+                        StreamSet * const classSet = P.CreateStreamSet(ccs.size());
+                        P.CreateKernelCall<CharClassesKernel>(ccs, U21, classSet);
+                        P.CreateKernelCall<RunPositions>(k->runSingles, k->runStrings, classSet, one);
+                    }
+                    each.push_back(one);
+                }
+                runs = P.CreateStreamSet(each.size());
+                P.CreateKernelCall<CollectStreams>(each, runs);
+            }
             if (mask) {
-                StreamSet * const masked = P.CreateStreamSet(ccs.size());
+                StreamSet * const masked = P.CreateStreamSet(runSets.size());
                 P.CreateKernelCall<MaskStreams>(runs, mask, masked);
                 runs = masked;
             }
@@ -6579,7 +6700,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             //  (LeftmostMatches), and a kernel applying the rules where selected.
             std::vector<MatchClass> byLengthOf;
             for (const FusedStringRule & r : config.strings) {
-                const MatchClass k{static_cast<unsigned>(r.text.size()), r.run};
+                const MatchClass k{static_cast<unsigned>(r.text.size()), r.run, r.runStrings, r.runSingles};
                 if (std::find(byLengthOf.begin(), byLengthOf.end(), k) == byLengthOf.end()) byLengthOf.push_back(k);
             }
             const SelectionClasses selection = selectionClasses(byLengthOf);
@@ -6619,7 +6740,10 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             //  The matches that apply are selected sequentially, from the left (see
             //  LeftmostMatches), given the matches of the rules by the lengths of
             //  their texts.  The rules are then applied where selected.
-            auto classOf = [&](size_t r) {return MatchClass{static_cast<unsigned>(texts[r].size()), step.stringRules[r].run};};
+            auto classOf = [&](size_t r) {
+                const ldml::StringRule & sr = step.stringRules[r];
+                return MatchClass{static_cast<unsigned>(texts[r].size()), sr.run, sr.runStrings, sr.runSingles};
+            };
             std::vector<MatchClass> byLengthOf;
             for (size_t r = 0; r < numStringRules; r++) {
                 const MatchClass k = classOf(r);

@@ -612,6 +612,11 @@ add_test(
   COMMAND python3 tconv_text_anchors_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_run_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_run_strings_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME u8u16_test
   WORKING_DIRECTORY ${QA_DIR}/u8u16
   COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")

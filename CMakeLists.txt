@@ -495,6 +495,11 @@ add_test(
   COMMAND python3 greptest.py --random_flag_count=2 --tests_per_grepcase=2 ${BIN_DIR}/icgrep)
 
 add_test(
+  NAME possessive_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 possessive_strings_test.py ${BIN_DIR}/icgrep)
+
+add_test(
   NAME proptest
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 greptest.py -d ${QA_DIR} -t ${QA_DIR}/proptest.xml ${BIN_DIR}/icgrep)

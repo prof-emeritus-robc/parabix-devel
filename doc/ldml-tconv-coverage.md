@@ -66,7 +66,13 @@ are those of the earlier runs, with no failures (and so no discrepancies).
 Then the anchors of texts moved to their contexts (`85277dbd7`, `--update
 --only ja_Latn-ko pl_FONIPA-ja fa-fa_FONIPA Zawgyi-my`): W3 is needed by 13
 transforms (17 before), and W6 alone blocks 7 (4): ja_Latn-ko, pl_FONIPA-ja and
-pl-ja need only W6.*
+pl-ja need only W6. Then the last captures of texts of sets including the text
+boundary (`9a4a0c6a6`, `--update --only` the ten transforms whose plans
+changed): rules that a variable-length rule kept from being composed now are,
+and W6 is needed by 11 (17); W3 alone blocks 9 (3): am_Ethi-d0_Morse (its
+`([.-])' '[$]` in a filtered run), cs-ja, cs_FONIPA-ja, es-ja, es_419-ja and
+es_FONIPA-ja (runs of sets with strings), besides Latin-ThaiLogical, Latn-Thai
+and Zawgyi-my.*
 
 This report covers:
 
@@ -194,8 +200,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
 now                          401  ██████████████████████████████████████
-+ W6 revisit                 408  ██████████████████████████████████████
-+ W3 variable-length text    418  ███████████████████████████████████████
++ W3 variable-length text    410  ███████████████████████████████████████
++ W6 revisit                 418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
 + W10 engine lookaheads      424  ████████████████████████████████████████
@@ -993,8 +999,8 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 13 | 3 | M–L (the rest) |
-| W6 text to revisit, not composed | 17 | 7 | L (with W3) |
+| W3 variable-length texts | 13 | 9 | M–L (the rest) |
+| W6 text to revisit, not composed | 11 | 7 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1181,8 +1187,11 @@ W3 alone.
   `([.-])' '[$] → $1`). The runs are those of the filter's mask, which the
   pipeline carries through the steps: the end of a run, a position whose next
   is not within the mask (or the end of the text), could be given to the
-  engine as an external stream. An end-capable set within a capture at the
-  end of the text (Zawgyi-my's `^ ၄ ($nondigits) → | ၎ $1`) is not yet moved.
+  engine as an external stream. A capture of such a set, the last item of a
+  text, likewise becomes two rules, the second with the capture empty (its
+  references removed); revisited unchanged, as Zawgyi-my's `^ ၄ ($nondigits) →
+  | ၎ $1`, it is instead the after context (`^ { ၄ } $nondigits → | ၎`), from
+  which ICU revisits the text alike (`9a4a0c6a6`).
 
 Also: trivial capture elimination now accepts `(X) Y → $1 …` (as `X { Y → …`)
 where the rule cannot match within itself, other than as `(X) X+`. This
@@ -1550,6 +1559,7 @@ tconv on every implementable transform.
 | `a9e44f8d8` | rules keeping the characters of their captures as string rules (converted before contexts); captures moved at the end; possessive optional items: blt-blt_FONIPA: 401 |
 | `0e561c416`, `22d03949b`, `345b69bf1` | possessive sets with strings in after contexts checked by the engine; sets with strings in contexts taking their longest strings; test cases with ICU's results counted as discrepancies (217): 401 |
 | `85277dbd7` | anchors of texts moved to their contexts: W3 needed by 13, W6 alone blocks 7: 401 |
+| `9a4a0c6a6` | last captures of sets including the text boundary: W6 needed by 11, W3 alone blocks 9: 401 |
 
 ## Reproducing
 

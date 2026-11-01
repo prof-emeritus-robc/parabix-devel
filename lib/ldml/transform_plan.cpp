@@ -119,29 +119,24 @@ static bool runItem(re::RE * re, std::vector<re::RE *> & first, UCD::UnicodeSet 
 
 static bool isEmptyText(const re::RE * re);
 
-//  Whether an after context, matched by the regular expression engine as a
-//  lookahead, has an unbounded repetition of something other than a set of
-//  single characters (such as a set with strings, [{m̥}m]*): the engine does
-//  not support such variable-length lookaheads (their bodies must have a unique
-//  prefix, or be chains of repeated sets).
-static bool unsupportedLookahead(const re::RE * re) {
+bool repeatsStringsOrSequences(const re::RE * re) {
     if (re == nullptr) return false;
     if (const re::Rep * rep = dyn_cast<re::Rep>(re)) {
         //  (A repeated set may be captured, as in ([ab])*.)
         const re::RE * body = rep->getRE();
         while (const re::Capture * c = dyn_cast<re::Capture>(body)) body = c->getCapturedRE();
         if (rep->getUB() == re::Rep::UNBOUNDED_REP && !(CharSetAnalysis::isSet(body) && !hasStrings(body))) return true;
-        return unsupportedLookahead(rep->getRE());
+        return repeatsStringsOrSequences(rep->getRE());
     } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
-        for (const re::RE * e : *seq) if (unsupportedLookahead(e)) return true;
+        for (const re::RE * e : *seq) if (repeatsStringsOrSequences(e)) return true;
     } else if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
-        for (const re::RE * e : *alt) if (unsupportedLookahead(e)) return true;
+        for (const re::RE * e : *alt) if (repeatsStringsOrSequences(e)) return true;
     } else if (const re::Name * n = dyn_cast<re::Name>(re)) {
         if (!isFunctionCall(n) && n->getDefinition() && !CharSetAnalysis::isSet(n->getDefinition())) {
-            return unsupportedLookahead(n->getDefinition());
+            return repeatsStringsOrSequences(n->getDefinition());
         }
     } else if (const re::Capture * c = dyn_cast<re::Capture>(re)) {
-        return unsupportedLookahead(c->getCapturedRE());
+        return repeatsStringsOrSequences(c->getCapturedRE());
     }
     return false;
 }
@@ -1670,11 +1665,6 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 group->chainRevisitRules.push_back(c);
                 continue;
             }
-            if (unsupportedLookahead(source->getAfterContext())) {
-                plan.problems.push_back(printRule(r) + "  (the after context repeats a set with strings or a sequence, "
-                                        "which the regular expression engine does not support in lookaheads)");
-                continue;
-            }
             std::vector<re::RE *> items;
             textItems(text, items);
             //  A deferred rule (see DeferredRule): its text begins with a trigger
@@ -1860,6 +1850,15 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
             //  not, with a result referring to its captures in order).
             if (!identity && (!singleChars || !fixedString(result->getText(), fixedResult))
                     && multipleCaptureMultipleReplacement(c, capture, set, sets, captureReason)) {
+                //  (Its after context is also matched within the lookaheads by which
+                //  the starts of its matches are found, where the engine does not
+                //  support such repetitions; see repeatsStringsOrSequences.)
+                if (repeatsStringsOrSequences(source->getAfterContext())) {
+                    plan.problems.push_back(printRule(r) + "  (the after context of a MultipleCaptureMultipleReplacement rule "
+                                            "repeats a set with strings or a sequence, which the regular expression engine "
+                                            "does not support in lookaheads (those finding its starts))");
+                    continue;
+                }
                 if (plan.filter) withinFilter(set, capture, plan.filterSet, sets);
                 if (group == nullptr) {
                     TransformStep step;
@@ -2063,7 +2062,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
         for (MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
             if (!set.walkStarts) continue;
             bool supported = true;
-            for (const re::RE * c : set.captures) supported &= !unsupportedLookahead(c);
+            for (const re::RE * c : set.captures) supported &= !repeatsStringsOrSequences(c);
             const bool possible = supported || greedyMatchesPossessive(set, sets);
             set.greedyStarts = !supported;
             if (possible) continue;
@@ -2077,7 +2076,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 if (set.startsByFirst || set.singleCharacter || set.walkStarts) continue;
                 //  The starts found by the engine, with the captures in a lookahead.
                 bool supported = true;
-                for (const re::RE * c : set.captures) supported &= !unsupportedLookahead(c);
+                for (const re::RE * c : set.captures) supported &= !repeatsStringsOrSequences(c);
                 if (supported || greedyMatchesPossessive(set, sets)) {
                     set.exactStarts = true;
                     set.greedyStarts = !supported;

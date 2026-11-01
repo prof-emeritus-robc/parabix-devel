@@ -589,6 +589,7 @@ static std::string revisitRecordJSON(const ldml::RevisitRecord & r) {
 static void captureContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 static void convertedContextCaptureRules(const ldml::TransformStep & step, std::set<const ldml::Rule *> & rules);
 static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
+static void lookaheadContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
@@ -672,6 +673,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         for (const ldml::TransformStep & step : a.plan.steps) {
             captureContextProblems(step, a.plan.problems);
             insertionContextProblems(step, a.plan.problems);
+            lookaheadContextProblems(step, a.plan.problems);
         }
         a.problems = a.plan.problems;
         //  The bit changes of the subgroups of a group are combined, assuming that
@@ -5710,6 +5712,49 @@ static RE_ModeOptions engineOptions() {
     return opts;
 }
 
+//  The contexts as the engine matches them: possessively, as ICU does (see
+//  ldml::possessiveContext), resolved to sets of characters by
+//  ldml::expandedContext (without inserted positions).
+static re::RE * possessiveBefore(re::RE * engineBefore) {
+    return ldml::possessiveContext(ldml::expandedContext(engineBefore, Insertions(), DeletionMark), false);
+}
+
+static re::RE * possessiveAfter(re::RE * engineAfter) {
+    return ldml::possessiveContext(ldml::expandedContext(engineAfter, Insertions(), DeletionMark), true);
+}
+
+//  The pattern of matchPattern: the text, after a lookbehind of the before
+//  context and followed by a lookahead of the after context.
+static re::RE * contextPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text) {
+    std::vector<re::RE *> items;
+    if (engineBefore) items.push_back(re::makeLookBehindAssertion(possessiveBefore(engineBefore)));
+    for (re::RE * item : text) items.push_back(item);
+    if (engineAfter) items.push_back(re::makeLookAheadAssertion(possessiveAfter(engineAfter)));
+    return re::makeSeq(items.begin(), items.end());
+}
+
+//  The pattern of matchStarts: the text and the after context, after a
+//  lookbehind of the before context, for the MatchStarts mode (startsOptions),
+//  or, asLookahead, within a lookahead (matched at the starts).
+static re::RE * startsPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text, bool asLookahead) {
+    std::vector<re::RE *> items;
+    if (engineBefore) items.push_back(re::makeLookBehindAssertion(possessiveBefore(engineBefore)));
+    std::vector<re::RE *> ahead(text.begin(), text.end());
+    if (engineAfter) ahead.push_back(possessiveAfter(engineAfter));
+    if (asLookahead) {
+        items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
+    } else {
+        items.insert(items.end(), ahead.begin(), ahead.end());
+    }
+    return re::makeSeq(items.begin(), items.end());
+}
+
+static RE_ModeOptions startsOptions() {
+    RE_ModeOptions opts = engineOptions();
+    opts.goal = re::RE_Goal::MatchStarts;
+    return opts;
+}
+
 //  The positions of the last characters of the matches of a text (a sequence of
 //  sets) with contexts.  With spans, also the positions of the characters of the
 //  texts of the matches, from the first to the last (the match spans of the
@@ -5725,21 +5770,7 @@ StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * 
 //  sequence of items) with contexts, and optionally the spans of the matches.
 StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                                               StreamSet * U21, StreamSet ** spans) {
-    std::vector<re::RE *> items;
-    //  ICU matches contexts possessively (see ldml::possessiveContext).  (The
-    //  contexts are resolved to sets of characters by ldml::expandedContext,
-    //  without inserted positions.)
-    const Insertions none;
-    if (engineBefore) {
-        items.push_back(re::makeLookBehindAssertion(
-            ldml::possessiveContext(ldml::expandedContext(engineBefore, none, DeletionMark), false)));
-    }
-    for (re::RE * item : text) items.push_back(item);
-    if (engineAfter) {
-        items.push_back(re::makeLookAheadAssertion(
-            ldml::possessiveContext(ldml::expandedContext(engineAfter, none, DeletionMark), true)));
-    }
-    re::RE * const pattern = re::makeSeq(items.begin(), items.end());
+    re::RE * const pattern = contextPattern(engineBefore, engineAfter, text);
     //  The engine marks a match at an offset after its last character (e.g. 1
     //  for a pattern ending with a zero-width lookahead): shift the marks back.
     const PreparedRE prepared = prepareRE(pattern, engineOptions());
@@ -5768,28 +5799,61 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
 //  the position it begins).
 StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                                              StreamSet * U21) {
-    const Insertions none;
-    std::vector<re::RE *> items;
-    if (engineBefore) {
-        items.push_back(re::makeLookBehindAssertion(
-            ldml::possessiveContext(ldml::expandedContext(engineBefore, none, DeletionMark), false)));
-    }
-    std::vector<re::RE *> ahead(text.begin(), text.end());
-    if (engineAfter) ahead.push_back(ldml::possessiveContext(ldml::expandedContext(engineAfter, none, DeletionMark), true));
     StreamSet * const starts = mP.CreateStreamSet(1);
     RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
-    std::vector<re::RE *> pattern(items);
-    pattern.insert(pattern.end(), ahead.begin(), ahead.end());
-    RE_ModeOptions opts = engineOptions();
-    opts.goal = re::RE_Goal::MatchStarts;
-    const PreparedRE prepared = prepareRE(re::makeSeq(pattern.begin(), pattern.end()), opts);
+    const PreparedRE prepared = prepareRE(startsPattern(engineBefore, engineAfter, text, false), startsOptions());
     if (checkPreconditions(prepared, &cc::Unicode).empty()) {
         engine.matchStartsPipeline(prepared, starts);
         return starts;
     }
-    items.push_back(re::makeLookAheadAssertion(re::makeSeq(ahead.begin(), ahead.end())));
-    engine.matchSearchPipeline(prepareRE(re::makeSeq(items.begin(), items.end()), engineOptions()), starts);
+    engine.matchSearchPipeline(prepareRE(startsPattern(engineBefore, engineAfter, text, true), engineOptions()), starts);
     return starts;
+}
+
+//  The rules whose after contexts repeat a set with strings or a sequence (see
+//  ldml::repeatsStringsOrSequences), in a form that the engine does not support
+//  in the lookaheads by which they are matched: those of matchStarts (string
+//  rules) and of matchPattern (single-character rules, insertion rules,
+//  deferred rules).  (Their repetitions are resolved possessively,
+//  re::resolvePossessiveQuantifiers: where what follows a repetition of a set
+//  with strings cannot begin with its characters, or at the end of the context,
+//  without assertions.)
+static void lookaheadContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems) {
+    auto failures = [](re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text, bool starts) {
+        std::string reasons;
+        if (engineAfter == nullptr || !ldml::repeatsStringsOrSequences(engineAfter)) return reasons;
+        std::vector<re::RE *> items;
+        for (const UCD::UnicodeSet & chars : text) items.push_back(re::makeCC(chars, &cc::Unicode));
+        std::vector<PreconditionFailure> fs;
+        if (!starts) {
+            fs = checkPreconditions(prepareRE(contextPattern(engineBefore, engineAfter, items), engineOptions()), &cc::Unicode);
+        } else if (!checkPreconditions(prepareRE(startsPattern(engineBefore, engineAfter, items, false), startsOptions()),
+                                       &cc::Unicode).empty()) {
+            fs = checkPreconditions(prepareRE(startsPattern(engineBefore, engineAfter, items, true), engineOptions()), &cc::Unicode);
+        }
+        //  (The reasons, without the constructs, which may be long.)
+        for (const PreconditionFailure & f : fs) {
+            if (reasons.find(f.reason) == std::string::npos) reasons += (reasons.empty() ? "" : "; ") + f.reason;
+        }
+        return reasons;
+    };
+    auto problem = [&](const std::string & rule, const std::string & reasons) {
+        if (reasons.empty()) return;
+        problems.push_back(rule + "  (the after context repeats a set with strings or a sequence, which the regular "
+                           "expression engine does not support in lookaheads in this form: " + reasons + ")");
+    };
+    for (const ldml::StringRule & s : step.stringRules) {
+        problem(ldml::printRule(s.rule), failures(s.engineBefore, s.engineAfter, s.text, true));
+    }
+    for (const ldml::CharMapSubgroup & s : step.subgroups) {
+        problem("single-character rules [" + s.contextKey + "]", failures(s.engineBefore, s.engineAfter, {s.characters()}, false));
+    }
+    for (const ldml::InsertionRule & ins : step.insertions) {
+        problem(ldml::printRule(ins.rule), failures(nullptr, ins.engineAfter, {ins.before}, false));
+    }
+    for (const ldml::DeferredRule & d : step.deferred) {
+        problem(ldml::printRule(d.rule), failures(d.engineBefore, d.engineAfter, d.text, false));
+    }
 }
 
 //  The stream (or stream set) of the CCs for a vector of sets, at each position of U21.

@@ -486,6 +486,17 @@ StringRuleOverlaps analyzeStringRuleOverlaps(const TransformStep & step);
 re::RE * expandedContext(re::RE * context, const std::map<unsigned, UCD::UnicodeSet> & insertions,
                          UCD::codepoint_t filler);
 
+// Whether a pattern (an after context, or a capture), matched by the regular
+// expression engine within a lookahead, has an unbounded repetition of
+// something other than a set of single characters (such as a set with
+// strings, [{m̥}m]*).  The engine supports such variable-length lookaheads
+// only in some forms (with a unique prefix, or as chains of repeated sets),
+// after resolving the repetitions possessively, as ICU matches them
+// (re::resolvePossessiveQuantifiers): the lookaheads of the starts of
+// MultipleCaptureMultipleReplacement rules are not among them; the others are
+// checked with the engine's preconditions (tconv).
+bool repeatsStringsOrSequences(const re::RE * re);
+
 // The characters that the set items of a pattern (e.g. a context) may match,
 // including those of the variables it uses.
 UCD::UnicodeSet patternCharacters(re::RE * pattern);

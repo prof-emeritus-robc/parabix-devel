@@ -353,11 +353,13 @@ re::RE * engineContext(re::RE * context, bool afterContext);
 // A context for the regular expression engine (see engineContext), with its
 // repetitions possessive, as ICU matches them.  An after context is matched
 // forward from the position: its repetitions are made possessive
-// (re::Rep::Kind::Possessive), which the engine resolves.  A before context is
+// (re::Rep::Kind::Possessive), which the engine resolves, taking the longest
+// string of a set with strings at each repetition, as ICU does (see
+// re::PossessiveChoice).  A before context is
 // matched backward from the position, so that each repetition takes as many
 // repetitions as possible to its left: e{lb,} becomes (?<!e) e{lb,}, and
 // e{lb,ub} becomes (?<!e) e{lb,ub-1} | e{ub}.  (The engine resolves possessive
-// repetitions forward, as PCRE does, also within lookbehinds.)
+// repetitions forward, also within lookbehinds.)
 re::RE * possessiveContext(re::RE * context, bool afterContext);
 
 // The set of "." in rules, matching any character other than line and

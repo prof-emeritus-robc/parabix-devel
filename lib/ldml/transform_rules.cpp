@@ -223,9 +223,9 @@ RE * engineContext(RE * context, bool afterContext) {
 namespace {
 
 // The alternatives of a set with strings, longest first: ICU matches the
-// longest of the strings of a set (and its characters) at a position, while
-// the engine resolves a possessive repetition as PCRE does, each repetition
-// taking the first alternative that matches.
+// longest of the strings of a set (and its characters) at a position.  (The
+// engine resolves a possessive repetition of them with the longest too, see
+// re::PossessiveChoice; the order also gives it with PossessiveChoice::First.)
 RE * longestFirst(RE * re) {
     RE * body = re;
     while (Name * n = dyn_cast<Name>(body)) {

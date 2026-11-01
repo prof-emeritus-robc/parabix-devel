@@ -329,6 +329,114 @@ bool referencesCaptures(const RE * re) {
 
 }
 
+//  The members of a set other than the end of the text (End), through its
+//  alternations, differences, intersections and variables, with end set if it
+//  has the end (a negated set [^X] is the difference of a set with it and X);
+//  nullptr if it has no other member.
+static RE * withoutEnd(RE * re, bool & end) {
+    if (isa<End>(re)) {
+        end = true;
+        return nullptr;
+    } else if (Name * n = dyn_cast<Name>(re); n && !isFunctionCall(n) && n->getDefinition()) {
+        bool e = false;
+        RE * const rest = withoutEnd(n->getDefinition(), e);
+        if (!e) return re;
+        end = true;
+        return rest;
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        std::vector<RE *> rest;
+        bool e = false;
+        for (RE * a : *alt) {
+            RE * const x = withoutEnd(a, e);
+            if (x && !(isa<CC>(x) && cast<CC>(x)->empty())) rest.push_back(x);
+        }
+        if (!e) return re;
+        end = true;
+        return rest.empty() ? nullptr : makeAlt(rest.begin(), rest.end());
+    } else if (Diff * d = dyn_cast<Diff>(re)) {
+        bool l = false, r = false;
+        RE * const lh = withoutEnd(d->getLH(), l);
+        RE * const rh = withoutEnd(d->getRH(), r);
+        if (!l || r) return re;
+        end = true;
+        if (lh == nullptr) return nullptr;
+        return rh ? makeDiff(lh, rh) : lh;
+    } else if (Intersect * x = dyn_cast<Intersect>(re)) {
+        bool l = false, r = false;
+        RE * const lh = withoutEnd(x->getLH(), l);
+        RE * const rh = withoutEnd(x->getRH(), r);
+        if (!l || !r) return re;
+        end = true;
+        if (lh == nullptr || rh == nullptr) return nullptr;
+        return makeIntersect(lh, rh);
+    }
+    return re;
+}
+
+std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
+    //  With a global filter and transform rules, ICU applies each rule set to
+    //  each run of the characters of the filter (in the text given, which the
+    //  rule sets before change): a set of the text that includes the text
+    //  boundary also matches at the end of a run, which the text of a step does
+    //  not tell (the characters a step before inserts are within the run of the
+    //  character they follow).  Such sets are then left as they are.
+    bool filter = false, transforms = false;
+    for (const Rule * r : rules) {
+        if (const FilterRule * f = dyn_cast<FilterRule>(r); f && !f->isInverse()) filter = true;
+        transforms |= isa<TransformRule>(r);
+    }
+    const bool runs = filter && transforms;
+    std::vector<Rule *> out;
+    for (Rule * r : rules) {
+        ConversionRule * c = dyn_cast<ConversionRule>(r);
+        const RuleSide * source = c ? c->getSourceSide(Direction::Forward) : nullptr;
+        if (source == nullptr || source->getText() == nullptr) {
+            out.push_back(r);
+            continue;
+        }
+        RE * const text = source->getText();
+        std::vector<RE *> items;
+        if (Seq * seq = dyn_cast<Seq>(text)) items.assign(seq->begin(), seq->end()); else items.push_back(text);
+        RE * before = source->getBeforeContext();
+        RE * const after = source->getAfterContext();
+        RuleSide * const result = c->getResultSide(Direction::Forward);
+        auto rule = [&](RE * b, const std::vector<RE *> & t, RE * a) {
+            return makeConversionRule(makeRuleSide(b, makeSeq(t.begin(), t.end()), a), Direction::Forward, result);
+        };
+        bool changed = false;
+        //  ^ at the start of the text: its before context.
+        if (before == nullptr && items.size() > 1 && isa<Start>(items.front())) {
+            before = makeStart();
+            items.erase(items.begin());
+            changed = true;
+        }
+        if (after == nullptr && items.size() > 1) {
+            //  $ at the end of the text: its after context.
+            if (isa<End>(items.back())) {
+                items.pop_back();
+                out.push_back(rule(before, items, makeEnd()));
+                continue;
+            }
+            //  A last set including the end of the text: a character of the
+            //  set, or (matching nothing) the end of the text.
+            bool boundary = false;
+            RE * const chars = withoutEnd(items.back(), boundary);
+            if (boundary && !runs) {
+                if (chars) {
+                    std::vector<RE *> withChar(items);
+                    withChar.back() = chars;
+                    out.push_back(rule(before, withChar, nullptr));
+                }
+                items.pop_back();
+                out.push_back(rule(before, items, makeEnd()));
+                continue;
+            }
+        }
+        out.push_back(changed ? rule(before, items, after) : r);
+    }
+    return out;
+}
+
 std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats) {
     std::vector<Rule *> out;
     Expander expander;

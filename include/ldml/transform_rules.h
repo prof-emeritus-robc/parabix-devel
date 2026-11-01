@@ -775,6 +775,22 @@ struct FiniteTextStats {
 };
 std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats = nullptr);
 
+//  The anchors of the texts of forward conversion rules (as ICU matches them,
+//  in the text being transliterated), moved to their contexts: ^ at the start
+//  of a text without a before context becomes its before context, and $ at the
+//  end of a text without an after context its after context.  A set including
+//  the text boundary as the last of two or more items of a text without an
+//  after context (as the parser resolves it to End, e.g. [^a] or [x$]), which
+//  ICU matches as a character of the set or, matching nothing, at the end of
+//  the text, becomes two rules: the text with the characters of the set, and
+//  the text without it, with the after context $ (they cannot both match at a
+//  position).  With a global filter and transform rules, as ICU then applies
+//  the rules to each run of the characters of the filter (of the text given),
+//  such a set also matches nothing at the end of a run, which the text of a
+//  rule set does not tell: it is then left as it is.  A text that is the
+//  anchor alone is left unchanged.
+std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules);
+
 //  Composition of revisits.
 //
 //  A forward conversion rule whose result has text to revisit,

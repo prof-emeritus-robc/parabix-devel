@@ -599,6 +599,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
     try {
         std::vector<ldml::Rule *> rules = direction == ldml::TransformDirection::Forward
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
+        rules = ldml::MoveTextAnchors(rules);
         //  (Before revisits are composed: a result calling a function may have
         //  text to revisit.)
         ldml::FunctionCallStats cstats;

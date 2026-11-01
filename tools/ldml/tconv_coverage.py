@@ -474,7 +474,9 @@ def classify(args, entries):
                          'S-match-within-string-rule')
         for line in lines:
             if line.startswith('  transform '):
-                used = resolve(line.split()[-1])
+                #  (The name is last, but for a built-in applied by ICU.)
+                used = resolve(line[:-len(' (applied by ICU)')].split()[-1] if line.endswith(' (applied by ICU)')
+                               else line.split()[-1])
                 if used:
                     uses.add(used)
                 else:
@@ -609,7 +611,7 @@ def summary(entries):
     md.append('%d built-in names, %d implemented: %s\n' % (
         len(builtins), sum(e['implementable'] for e in builtins),
         ', '.join(e['name'] for e in builtins if e['implementable'])))
-    md.append('Not implemented: %s\n' % ', '.join(e['name'] for e in builtins if not e['implementable']))
+    md.append('Not implemented: %s\n' % (', '.join(e['name'] for e in builtins if not e['implementable']) or 'none'))
     for label, pop in pops:
         md.append('## %s transforms: %d\n' % (label.capitalize(), len(pop)))
         md.append('Implementable now: %d\n' % sum(e['implementable'] for e in pop))

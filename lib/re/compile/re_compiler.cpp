@@ -671,10 +671,15 @@ Marker RE_Block_Compiler::compileRep(int lb, int ub, RE * repeated, Marker marke
                 marker = processUnboundedRep(repeated, marker);
             } else if (lb < ub) {
                 //marker = processBoundedRep(repeated, ub - lb, marker, IfInsertionGap);
+                //  The marker is at the last character of the lower bound (AtEnd).
+                //  MatchStar marks the run of masked positions from it and the
+                //  position after the run, which is not a repetition: the
+                //  repetitions end at the masked positions only (the cursor is
+                //  one, a character of cc within the limit).
                 PabloAST * cursor = marker.stream();
                 PabloAST * upperLimitMask = reachable(cursor, lengths.first, ub - lb, nullptr);
                 PabloAST * masked = mPB.createAnd(cc, upperLimitMask, "masked");
-                PabloAST * bounded = mPB.createAnd(mPB.createMatchStar(cursor, masked), upperLimitMask, "bounded");
+                PabloAST * bounded = mPB.createAnd(mPB.createMatchStar(cursor, masked), masked, "bounded");
                 marker = Marker(bounded);
             }
             return marker;

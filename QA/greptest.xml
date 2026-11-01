@@ -1293,6 +1293,22 @@ bababab
 <grepcase regexp="(?:aaaa){3}" datafile="rep_overlap" greplines="5"/>
 <grepcase regexp="(?:bb){4}" datafile="rep_overlap" greplines=""/>
 
+<!-- A bounded repetition of a code unit ends at a repeated code unit: c{1,3}
+     is not c.{0,2} (cbb, ccbb). -->
+<datafile id="bounded_code_unit">
+cb
+ccb
+cccb
+ccccb
+cbb
+cxb
+ccbb
+b
+</datafile>
+<grepcase regexp="^c{1,3}b$" datafile="bounded_code_unit" greplines="2 3 4"/>
+<grepcase regexp="^c{2,3}b$" datafile="bounded_code_unit" greplines="3 4"/>
+<grepcase regexp="^c{0,3}b$" datafile="bounded_code_unit" greplines="2 3 4 9"/>
+
 <!-- An alternation of ASCII sequences after a nullable alternation is not a
      single UTF-8 encoded character and must not be end-aligned. -->
 <datafile id="alt_alignment">

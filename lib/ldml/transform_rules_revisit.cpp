@@ -958,8 +958,9 @@ bool hasRevisit(const ConversionRule * c) {
 //      none (and in the first case A has as many characters as S, so that the
 //      lengths are the same); unassigned code points are disregarded.  Where
 //      the prefix runs only delete S (A empty, no triggers), the last set of
-//      an after context may contain characters of P (none of S): it sees the
-//      P that stays in place (and not what follows it), as ICU does,
+//      an after context may contain characters of P (which stay in place), and
+//      a set characters of S where they are not within a run (preceded by a
+//      set of no character of P or S): it then sees what ICU does,
 //    - not revisit P followed by S, or at the end of the text to revisit (where
 //      S may follow), as the prefix runs no longer apply then.
 //  The before contexts see A^n P as ICU does.  Within the prefix runs, the
@@ -1021,6 +1022,23 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
     //  Whether the prefix runs only delete their texts S (A empty, no triggers),
     //  leaving each P where it is.
     const bool deleteOnly = replaced.empty() && triggers.empty();
+    //  Whether two characters of P have the same prefix runs (the same texts S,
+    //  with the same A).
+    auto runsOf = [&](UCD::codepoint_t ch) {
+        std::vector<std::pair<std::vector<UCD::UnicodeSet>, std::u32string>> of;
+        for (const PrefixRun & pr : runs) {
+            if (pr.first.contains(ch)) of.emplace_back(pr.run, pr.replacement);
+        }
+        std::sort(of.begin(), of.end(), [](const auto & a, const auto & b) {
+            if (a.second != b.second) return a.second < b.second;
+            if (a.first.size() != b.first.size()) return a.first.size() < b.first.size();
+            for (size_t i = 0; i < a.first.size(); ++i) {
+                if (!(a.first[i] == b.first[i])) return a.first[i] < b.first[i];
+            }
+            return false;
+        });
+        return of;
+    };
     //  The characters of the triggers, and the covering rules.
     UCD::UnicodeSet triggered, triggerOutput;
     for (const PrefixRunTrigger & tr : triggers) {
@@ -1162,10 +1180,16 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             const std::vector<PatternItem> afterItems = patternItems(source->getAfterContext());
             for (size_t i = 0; i < afterItems.size(); ++i) {
                 const PatternItem & item = afterItems[i];
-                //  (The last item may see a P that the prefix runs leave where it
-                //  is, where they only delete S: it does not see what follows.)
-                const bool keptP = deleteOnly && i + 1 == afterItems.size() && !item.repeated
-                                   && !item.chars.intersects(run + replaced + triggered);
+                //  (Where the prefix runs only delete S, an item sees the character
+                //  ICU does where it is not changed: a P stays where it is, seen by
+                //  the last item, which does not see what follows (the run after a
+                //  P within the context would bring later characters into it); and
+                //  a character of S is not within a run if preceded, in the text or
+                //  the context, by an item of no character of P or S.)
+                const PatternItem * const before = i > 0 ? &afterItems[i - 1] : &text.back();
+                const bool keptP = deleteOnly && !item.repeated && !item.chars.intersects(replaced + triggered)
+                                   && (!item.chars.intersects(first) || i + 1 == afterItems.size())
+                                   && (!item.chars.intersects(run) || (!before->repeated && !before->chars.intersects(first + run)));
                 if (item.chars.intersects(changed) && !(changed.subset(item.chars) && sameLength) && !keptP) {
                     return "an after context may see the text of a prefix run: " + printRule(c);
                 }
@@ -1176,6 +1200,19 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             for (size_t i = 0; i < items.size(); ++i) {
                 if (items[i].chars.intersects(first)
                         && (items[i].repeated || i + 1 == items.size() || items[i + 1].chars.intersects(runStart))) {
+                    //  (A rule of one character revisiting, at the end, a character
+                    //  r whose prefix runs are those of each of its characters, where
+                    //  they only delete: the run after it, deleted before, is that of
+                    //  r, ' ' { t → | d with te~ and de~.)
+                    bool same = deleteOnly && !items[i].repeated && i + 1 == items.size() && items[i].chars.count() == 1
+                                && text.size() == 1 && !text[0].repeated && text[0].chars.count() <= 64 && text[0].chars.subset(first);
+                    if (same) {
+                        const auto r = runsOf(lo_codepoint(*items[i].chars.begin()));
+                        for (const auto & range : text[0].chars) {
+                            for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range) && same; ++ch) same = runsOf(ch) == r;
+                        }
+                    }
+                    if (same) continue;
                     return "a rule revisits a character to revisit of a prefix run: " + printRule(c);
                 }
             }

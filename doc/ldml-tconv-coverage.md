@@ -76,7 +76,11 @@ and Zawgyi-my. Then runs of sets with strings (`b45845a25`, `--update --only
 cs-ja cs_FONIPA-ja es-ja es_419-ja es_FONIPA-ja`): the five are implementable
 (406), with no failing or discrepant test cases, and W3 is needed by 8. Then
 insertion revisits beyond the first rule of a group (`920d7551f`, `--update
---only my-my_Latn`): my-my_Latn is implementable (407), and W6 alone blocks 6.*
+--only my-my_Latn`): my-my_Latn is implementable (407), and W6 alone blocks 6.
+Then prefix runs with exceptions (`19d0a02a2`, `07b1a4c13`, `--update --only
+pl_FONIPA-ja pl-ja am_FONIPA-am und_FONIPA-chr`, the last two for their plans
+as printed): pl_FONIPA-ja and pl-ja are implementable (409), and W6 alone
+blocks 4.*
 
 This report covers:
 
@@ -97,8 +101,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 407 (96%) |
-| …of which public (not `visibility="internal"`) | 393 | 376 (96%) |
+| Transforms defined by CLDR files (380 files) | 425 | 409 (96%) |
+| …of which public (not `visibility="internal"`) | 393 | 378 (96%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -203,9 +207,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          407  ██████████████████████████████████████
-+ W6 revisit                 413  ███████████████████████████████████████
-+ W3 variable-length text    418  ███████████████████████████████████████
+now                          409  ██████████████████████████████████████
++ W3 variable-length text    413  ███████████████████████████████████████
++ W6 revisit                 418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
 + W10 engine lookaheads      424  ████████████████████████████████████████
@@ -1004,7 +1008,7 @@ those of invoked transforms).
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
 | W3 variable-length texts | 8 | 4 | M–L (the rest) |
-| W6 text to revisit, not composed | 10 | 6 | L (with W3) |
+| W6 text to revisit, not composed | 8 | 4 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1086,7 +1090,15 @@ extracted:
   (`([ሀ-ሇ…]) $ጥበቅ → $ሀ | $1`) and ro_FONIPA-ja's `t͡ → | t` (A empty: the tie
   bars of a run are deleted) are prefix runs;
   `tconv --revisit-report` lists every revisit rule with its outcome, and
-  `doc/ldml-revisit-classification.md` classifies them.
+  `doc/ldml-revisit-classification.md` classifies them. Where the prefix runs
+  only delete (A empty, no triggers), the last item of an after context may
+  see their P, which stays in place (`19d0a02a2`). And a rule before such a
+  prefix run that applies at its P S, `P S X } C → R` (pl_FONIPA-ja's
+  `t͡ʂa → ツァ`, `t͡ʂ } $word_boundary → チ`, before `t͡ → | t`), is an exception
+  of the prefix run rather than a conflict (`07b1a4c13`): ICU deletes S until
+  `P S X` remains, to which it applies the rule, so the prefix run is applied as
+  `P S* { S } (?!X C) → ;` in a group of its own, keeping the last S where an
+  exception follows, for the rule to apply in the rest of the group.
 - **Insertion passes** (`27321f4e9`, `920d7551f`). A rule inserting a fixed
   string between its captures and revisiting all, `(T1) (T2) → | $1 M $2`, is
   the insertion rule `T1 { } T2 → M` in a group of its own before its group,
@@ -1585,6 +1597,7 @@ tconv on every implementable transform.
 | `9a4a0c6a6` | last captures of sets including the text boundary: W6 needed by 11, W3 alone blocks 9: 401 |
 | `b45845a25` | runs of sets with strings: cs-ja, cs_FONIPA-ja, es-ja, es_419-ja, es_FONIPA-ja: 406 |
 | `920d7551f` | insertion revisits beyond the first rule of a group: my-my_Latn: 407 |
+| `19d0a02a2`, `07b1a4c13` | prefix runs seen by the last item of an after context, and with exceptions: pl_FONIPA-ja, pl-ja: 409 |
 
 ## Reproducing
 

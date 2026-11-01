@@ -6,8 +6,13 @@
 #  not implement (the built-in Any-Name, a rules file whose run is followed by
 #  an after context) is applied by ICU by default, and with --use-ICU=0 is an
 #  error (exit status 2); a transform tconv implements (Any-Upper) is applied
-#  by ICU where --use-ICU matches its name, with the same result.  Skipped
-#  (passing) if tconv is built without ICU.
+#  by ICU where --use-ICU matches its name, with the same result.  A stage
+#  ICU applies within a global filter (Any-BreakInternal) sees the text around
+#  each run, as ICU does: no break after a mark that begins a run after a
+#  character outside the filter.  The built-ins ICU applies whenever they are
+#  called for (Any-Name, Name-Any, Any-BreakInternal) are planned as
+#  implementable, unless --use-ICU=0.  Skipped (passing) if tconv is built
+#  without ICU.
 #
 #  tconv_icu_test.py <tconv binary>
 
@@ -17,6 +22,7 @@ import sys
 import tempfile
 
 RULES = "a b+ } c → X ;\nb → Y ;\n"
+BREAKS = ":: [\u0e01-\u0e5b] ;\n:: Any-BreakInternal ;\n\u0e1e → p ;\n"
 
 # (arguments, input, expected output, or None for exit status 2)
 CASES = [
@@ -26,6 +32,13 @@ CASES = [
     (["--use-ICU=Any-Upp.*", "Any-Upper"], "a\u00df", "ASS"),
     (["--rules-file={rules}"], "abbc abd", "Xc aYd"),
     (["--use-ICU=0", "--rules-file={rules}"], "abbc abd", None),
+    (["--plan", "Any-Name"], "", "Any-Name (built-in, applied by ICU): implementable\n"),
+    (["--plan", "Name-Any"], "", "Name-Any (built-in, applied by ICU): implementable\n"),
+    (["--use-ICU=0", "--plan", "Any-BreakInternal"], "", None),
+    (["Name-Any"], "\\N{LATIN SMALL LETTER SHARP S}", "\u00df"),
+    (["--rules-file={breaks}"], "a\u0e35\u0e1e", "a\u0e35p"),
+    (["--rules-file={breaks}"], "\u0e35\u0e1e", "\u0e35 p"),
+    (["--rules-file={breaks}"], "1\u0e35\u0e1e \u0e35\u0e1e", "1\u0e35p \u0e35 p"),
 ]
 
 
@@ -36,6 +49,9 @@ def main():
         rules = os.path.join(tmp, "rules.txt")
         with open(rules, "w", encoding="utf-8") as f:
             f.write(RULES)
+        breaks = os.path.join(tmp, "breaks.txt")
+        with open(breaks, "w", encoding="utf-8") as f:
+            f.write(BREAKS)
         input = os.path.join(tmp, "input.txt")
         probe = subprocess.run([tconv, "Any-Name", os.devnull], capture_output=True)
         if b"built without ICU" in probe.stderr:
@@ -44,7 +60,7 @@ def main():
         for args, text, want in CASES:
             with open(input, "w", encoding="utf-8") as f:
                 f.write(text)
-            argv = [tconv] + [a.format(rules=rules) for a in args] + [input]
+            argv = [tconv] + [a.format(rules=rules, breaks=breaks) for a in args] + [input]
             run = subprocess.run(argv, capture_output=True)
             got = run.stdout.decode("utf-8", "replace")
             if want is None:

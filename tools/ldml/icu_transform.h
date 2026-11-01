@@ -37,6 +37,10 @@ public:
     ~ICUTransform();
     //  The text (UTF-8) transformed.
     std::string apply(const std::string & text) const;
+    //  The text transformed between the texts before and after it, which the
+    //  transform sees as contexts (as ICU transforms a run of a filtered text,
+    //  in the text of the run's surroundings) but leaves.
+    std::string apply(const std::string & before, const std::string & text, const std::string & after) const;
 private:
     struct Impl;
     explicit ICUTransform(Impl * impl);

@@ -406,6 +406,14 @@ static bool isImplementedBuiltIn(const std::string & canonicalName) {
                        [&](const std::pair<std::string, Transform> & p) {return p.first == canonicalName;});
 }
 
+//  The built-in transforms that tconv applies by ICU, whenever they are called
+//  for (by name, or as stages of the transforms whose rules invoke them), if
+//  tconv is built with ICU (unless --use-ICU=0): planned as implementable.
+static bool isICUBuiltIn(const std::string & canonicalName) {
+    return (canonicalName == "Any-BreakInternal" || canonicalName == "Any-Name" || canonicalName == "Name-Any")
+           && UseICU != "0" && tconv::ICUTransform::available();
+}
+
 static std::string printCodepoints(const std::u32string & s) {
     std::string out;
     for (char32_t c : s) {
@@ -426,7 +434,7 @@ const TransformAnalysis & TransformAnalyzer::analyze(const ldml::TransformEntry 
         return mResults.emplace(name + " (recursive)", std::move(a)).first->second;
     }
     if (entry->isBuiltIn()) {
-        a.implementable = isImplementedBuiltIn(name);
+        a.implementable = isImplementedBuiltIn(name) || isICUBuiltIn(name);
         if (!a.implementable) a.problems.push_back("built-in transform " + name + " is not implemented");
         return mResults.emplace(name, std::move(a)).first->second;
     }
@@ -521,6 +529,10 @@ bool TransformAnalyzer::evaluateFunction(const ldml::TransformID & transform, co
     } else {
         if (chars.count() > 4096) {
             reason = "the capture has too many characters to evaluate " + name + " on";
+            return false;
+        }
+        if (isICUBuiltIn(name)) {
+            reason = name + " is applied by ICU, not evaluated";
             return false;
         }
         const TransformAnalysis & a = analyze(entry);
@@ -744,7 +756,7 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
     for (const ldml::TransformStep & step : a.plan.steps) {
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
-                         << step.transform.getText() << "\n";
+                         << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "") << "\n";
             continue;
         }
         if (!step.markRunEditRules.empty()) {
@@ -5267,6 +5279,10 @@ public:
         size_t kernels;
     };
     const std::vector<GroupCount> & groupCounts() const {return mGroupCounts;}
+    //  The built-in transforms applied by ICU (see isICUBuiltIn) left out, as
+    //  stages of no kernels (for --kernel-counts: a transform that invokes them
+    //  runs them as ICU stages, outside its pipelines).
+    void omitICUBuiltIns() {mOmitICUBuiltIns = true;}
 private:
     //  Filters.  As in ICU, a filter selects the characters of the text that a
     //  transform may change, once, when the transform is applied: the steps of
@@ -5343,6 +5359,7 @@ private:
     bool mInvokedWithFilter = false;
     unsigned mDepth = 0;
     std::vector<GroupCount> mGroupCounts;
+    bool mOmitICUBuiltIns = false;
 };
 
 //  The rules of a conversion group, of all kinds.
@@ -5448,7 +5465,7 @@ StreamSet * RulePipelineBuilder::localCharacterMapping(StreamSet * U21, const st
 
 StreamSet * RulePipelineBuilder::builtIn(const std::string & name, StreamSet * U21) {
     PipelineBuilder & P = mP;
-    if (name == "Any-Null") return U21;
+    if (name == "Any-Null" || (mOmitICUBuiltIns && isICUBuiltIn(name))) return U21;
     if (name == "Any-NFD" || name == "Any-NFKD" || name == "Any-NFC" || name == "Any-NFKC" || name == "Any-FCC") {
         return activeMask() ? maskedNormalization(name, U21) : normalization(name, U21);
     }
@@ -7943,6 +7960,7 @@ static int printKernelCounts(const ldml::TransformRegistry & registry, const ldm
     StreamSet * const U21 = U21_Of(P, BasisOf(P, ByteStream));
     const size_t base = P.getNumOfKernelCalls();
     RulePipelineBuilder builder(P, registry, analyzer);
+    builder.omitICUBuiltIns();
     if (entry->canonicalName == "Any-CaseFold") {
         const size_t kernels = P.getNumOfKernelCalls();
         directPipeline(P, Transform::CaseFold, ByteStream);
@@ -8111,8 +8129,16 @@ static void writeAll(int fd, const std::string & text) {
     }
 }
 
+//  While filteredRunner applies its stages to a run, the text before the run
+//  (as transformed) and after it (as it is), which ICU's stages see as their
+//  contexts, as ICU sees them (its break iterators too).
+static const std::pair<std::string, std::string> * runSurroundings = nullptr;
+
 static Runner icuRunner(std::shared_ptr<tconv::ICUTransform> t) {
-    return [t](int fd) {writeAll(STDOUT_FILENO, t->apply(readAll(fd)));};
+    return [t](int fd) {
+        const std::string text = readAll(fd);
+        writeAll(STDOUT_FILENO, runSurroundings ? t->apply(runSurroundings->first, text, runSurroundings->second) : t->apply(text));
+    };
 }
 
 //  A temporary file (removed when closed).
@@ -8155,6 +8181,13 @@ static Runner filteredRunner(Runner inner, const UCD::UnicodeSet & filter) {
         const std::string text = readAll(fd);
         std::string out, run;
         size_t i = 0;
+        auto transformRun = [&]() {
+            const std::pair<std::string, std::string> surroundings{out, text.substr(i)};
+            runSurroundings = &surroundings;
+            out += runOn(inner, run);
+            runSurroundings = nullptr;
+            run.clear();
+        };
         while (i < text.size()) {
             //  The next character (UTF-8; invalid bytes as they are, outside the filter).
             const unsigned char b = static_cast<unsigned char>(text[i]);
@@ -8165,13 +8198,12 @@ static Runner filteredRunner(Runner inner, const UCD::UnicodeSet & filter) {
             if (filter.contains(cp) && !(n == 1 && b >= 0x80)) {
                 run.append(text, i, n);
             } else {
-                if (!run.empty()) out += runOn(inner, run);
-                run.clear();
+                if (!run.empty()) transformRun();
                 out.append(text, i, n);
             }
             i += n;
         }
-        if (!run.empty()) out += runOn(inner, run);
+        if (!run.empty()) transformRun();
         writeAll(STDOUT_FILENO, out);
     };
 }
@@ -8200,6 +8232,62 @@ static Runner stagedRunner(std::vector<Runner> stages) {
         }
         if (in != fd) close(in);
     };
+}
+
+//  The steps of a transform: the runs of those tconv applies (as a plan of
+//  those steps), and each of the transforms ICU applies (with the filter of
+//  the step), on each run of the text within the filter of the transform (if
+//  any; see filteredRunner); or false, and the reason.
+static bool stagedTransformRunner(CPUDriver & driver, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                  const TransformAnalysis & a, const std::function<bool(const ldml::TransformStep &)> & byICU,
+                                  Runner & result, std::string & error) {
+    std::vector<Runner> stages;
+    std::vector<ldml::TransformStep> run;
+    auto endRun = [&]() {
+        if (run.empty()) return;
+        TransformAnalysis part = a;
+        part.plan.steps = run;
+        part.plan.filter = nullptr;
+        part.problems.clear();
+        part.plan.problems.clear();
+        part.implementable = true;
+        const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part);
+        stages.push_back([fn](int in) {fn(static_cast<uint32_t>(in));});
+        run.clear();
+    };
+    for (const ldml::TransformStep & step : a.plan.steps) {
+        if (step.kind != ldml::TransformStep::Kind::Transform || !byICU(step)) {
+            run.push_back(step);
+            continue;
+        }
+        endRun();
+        std::optional<UCD::UnicodeSet> filter;
+        if (step.filter) filter = step.filterSet;
+        const std::string id = step.transform.getText();
+        std::shared_ptr<tconv::ICUTransform> t = icuTransform(registry, analyzer, id, registry.lookup(id), filter ? &*filter : nullptr, error);
+        if (!t) return false;
+        stages.push_back(icuRunner(t));
+    }
+    endRun();
+    const Runner runner = stagedRunner(stages);
+    result = a.plan.filter ? filteredRunner(runner, a.plan.filterSet) : runner;
+    return true;
+}
+
+//  Whether a step invokes a built-in transform that ICU applies whenever it
+//  is called for (see isICUBuiltIn), or a transform whose rules invoke one
+//  (at any depth): applied by ICU, as tconv's pipelines do not include them.
+static bool invokesICUBuiltIn(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                              const ldml::TransformStep & step, std::set<std::string> && seen = {}) {
+    if (step.kind != ldml::TransformStep::Kind::Transform) return false;
+    const ldml::TransformEntry * used = registry.lookup(step.transform.getText());
+    if (used == nullptr) return false;
+    if (used->isBuiltIn()) return isICUBuiltIn(used->canonicalName);
+    if (!seen.insert(used->canonicalName).second) return false;
+    for (const ldml::TransformStep & s : analyzer.analyze(used).plan.steps) {
+        if (invokesICUBuiltIn(registry, analyzer, s, std::move(seen))) return true;
+    }
+    return false;
 }
 
 int main(int argc, char *argv[]) {
@@ -8295,6 +8383,19 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         CPUDriver driver("tconv");
+        //  The built-ins ICU applies, as stages (see stagedTransformRunner).
+        auto byICU = [&](const ldml::TransformStep & step) {return invokesICUBuiltIn(registry, analyzer, step);};
+        if (std::any_of(a.plan.steps.begin(), a.plan.steps.end(), byICU)) {
+            Runner runner;
+            std::string error;
+            if (!stagedTransformRunner(driver, registry, analyzer, a, byICU, runner, error)) {
+                llvm::errs() << "Error: " << error << "\n";
+                return 2;
+            }
+            applyToInput(runner, fd);
+            close(fd);
+            return 0;
+        }
         TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
         applyToInput([fn](int in) {fn(static_cast<uint32_t>(in));}, fd);
         close(fd);
@@ -8326,7 +8427,8 @@ int main(int argc, char *argv[]) {
     if (ShowPlan) {
         TransformAnalyzer analyzer(registry);
         const TransformAnalysis & a = analyzer.analyze(entry);
-        printPlan(entry->canonicalName + (entry->isBuiltIn() ? " (built-in)" : " (" + entry->file + ")"), a);
+        printPlan(entry->canonicalName + (!entry->isBuiltIn() ? " (" + entry->file + ")"
+                                          : isICUBuiltIn(entry->canonicalName) ? " (built-in, applied by ICU)" : " (built-in)"), a);
         return a.implementable ? 0 : 2;
     }
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),
@@ -8354,7 +8456,7 @@ int main(int argc, char *argv[]) {
     //  as tconv does not implement its own rules, or only the transforms its
     //  rules invoke that ICU applies (in stages with the rest).
     const bool implemented = impl != implementedTransforms.end() || analyzer.analyze(entry).implementable;
-    bool wholeICU = icu->selected(entry, TransformName);
+    bool wholeICU = icu->selected(entry, TransformName) || (entry->isBuiltIn() && isICUBuiltIn(entry->canonicalName));
     if (!wholeICU && !implemented && (entry->isBuiltIn() || !ownProblems(analyzer.analyze(entry)).empty())) {
         if (icu->off) return notImplemented("");
         wholeICU = true;
@@ -8362,7 +8464,8 @@ int main(int argc, char *argv[]) {
     auto byICU = [&](const ldml::TransformStep & step) {
         const std::string id = step.transform.getText();
         const ldml::TransformEntry * used = registry.lookup(id);
-        return icu->selected(used, id) || (!icu->off && (used == nullptr || !analyzer.analyze(used).implementable));
+        return icu->selected(used, id) || invokesICUBuiltIn(registry, analyzer, step)
+               || (!icu->off && (used == nullptr || !analyzer.analyze(used).implementable));
     };
     bool staged = false;
     if (!wholeICU && !entry->isBuiltIn()) {
@@ -8391,45 +8494,13 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     if (staged) {
-        //  The steps of the transform: the runs of those tconv applies (as a plan
-        //  of those steps), and each of the transforms ICU applies (with the
-        //  filter of the step), on each run of the text within the filter of the
-        //  transform (if any; see filteredRunner).
-        const TransformAnalysis & a = analyzer.analyze(entry);
-        std::vector<Runner> stages;
-        std::vector<ldml::TransformStep> run;
-        auto endRun = [&]() {
-            if (run.empty()) return;
-            TransformAnalysis part = a;
-            part.plan.steps = run;
-            part.plan.filter = nullptr;
-            part.problems.clear();
-            part.plan.problems.clear();
-            part.implementable = true;
-            const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part);
-            stages.push_back([fn](int in) {fn(static_cast<uint32_t>(in));});
-            run.clear();
-        };
-        for (const ldml::TransformStep & step : a.plan.steps) {
-            if (step.kind != ldml::TransformStep::Kind::Transform || !byICU(step)) {
-                run.push_back(step);
-                continue;
-            }
-            endRun();
-            std::optional<UCD::UnicodeSet> filter;
-            if (step.filter) filter = step.filterSet;
-            std::string error;
-            const std::string id = step.transform.getText();
-            std::shared_ptr<tconv::ICUTransform> t = icuTransform(registry, analyzer, id, registry.lookup(id), filter ? &*filter : nullptr, error);
-            if (!t) {
-                llvm::errs() << "Error: " << error << "\n";
-                return 2;
-            }
-            stages.push_back(icuRunner(t));
+        Runner runner;
+        std::string error;
+        if (!stagedTransformRunner(driver, registry, analyzer, analyzer.analyze(entry), byICU, runner, error)) {
+            llvm::errs() << "Error: " << error << "\n";
+            return 2;
         }
-        endRun();
-        const Runner runner = stagedRunner(stages);
-        applyToInput(a.plan.filter ? filteredRunner(runner, a.plan.filterSet) : runner, fd);
+        applyToInput(runner, fd);
         close(fd);
         return 0;
     }

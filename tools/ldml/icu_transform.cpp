@@ -93,6 +93,17 @@ std::string ICUTransform::apply(const std::string & text) const {
     return out;
 }
 
+std::string ICUTransform::apply(const std::string & before, const std::string & text, const std::string & after) const {
+    icu::UnicodeString u = icu::UnicodeString::fromUTF8(before + text + after);
+    const int32_t start = icu::UnicodeString::fromUTF8(before).length();
+    const int32_t following = icu::UnicodeString::fromUTF8(after).length();
+    UTransPosition position{0, u.length(), start, u.length() - following};
+    mImpl->t->finishTransliteration(u, position);
+    std::string out;
+    u.tempSubString(start, u.length() - following - start).toUTF8String(out);
+    return out;
+}
+
 #else
 
 struct ICUTransform::Impl {};
@@ -123,6 +134,10 @@ std::unique_ptr<ICUTransform> ICUTransform::fromRules(const std::string &, const
 ICUTransform::~ICUTransform() = default;
 
 std::string ICUTransform::apply(const std::string & text) const {
+    return text;
+}
+
+std::string ICUTransform::apply(const std::string &, const std::string & text, const std::string &) const {
     return text;
 }
 

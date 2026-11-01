@@ -72,7 +72,9 @@ changed): rules that a variable-length rule kept from being composed now are,
 and W6 is needed by 11 (17); W3 alone blocks 9 (3): am_Ethi-d0_Morse (its
 `([.-])' '[$]` in a filtered run), cs-ja, cs_FONIPA-ja, es-ja, es_419-ja and
 es_FONIPA-ja (runs of sets with strings), besides Latin-ThaiLogical, Latn-Thai
-and Zawgyi-my.*
+and Zawgyi-my. Then runs of sets with strings (`b45845a25`, `--update --only
+cs-ja cs_FONIPA-ja es-ja es_419-ja es_FONIPA-ja`): the five are implementable
+(406), with no failing or discrepant test cases, and W3 is needed by 8.*
 
 This report covers:
 
@@ -93,8 +95,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 401 (94%) |
-| …of which public (not `visibility="internal"`) | 393 | 370 (94%) |
+| Transforms defined by CLDR files (380 files) | 425 | 406 (96%) |
+| …of which public (not `visibility="internal"`) | 393 | 375 (95%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -199,9 +201,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          401  ██████████████████████████████████████
-+ W3 variable-length text    410  ███████████████████████████████████████
-+ W6 revisit                 418  ███████████████████████████████████████
+now                          406  ██████████████████████████████████████
++ W6 revisit                 413  ███████████████████████████████████████
++ W3 variable-length text    418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
 + W10 engine lookaheads      424  ████████████████████████████████████████
@@ -999,7 +1001,7 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 13 | 9 | M–L (the rest) |
+| W3 variable-length texts | 8 | 4 | M–L (the rest) |
 | W6 text to revisit, not composed | 11 | 7 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
@@ -1153,6 +1155,14 @@ W3 alone.
   and covered. Groups with runs are selected sequentially: `LeftmostMatches`
   follows the run of the selected match by counting trailing ones, across words
   and strides. Only runs without an after context are supported.
+  A run of a set with strings, `[{i̯} i ɪ]+ → i` (cs_FONIPA-ja, es_FONIPA-ja;
+  `b45845a25`), is the longest run of positions each of a character of one
+  character of the set or within an occurrence of a string (found at its first
+  position by lookahead, the rest of it by advances), by `MatchStar`: ICU's run,
+  taking the longest string at each step, where each string begins with a
+  character of one character of the set and no proper suffix of a string is a
+  proper prefix of a string (`[{ab} {bc}]+` on `abc` takes `ab` alone, which
+  the positions would not tell, and is not planned).
 - **SingleCaptureDoubleReplacement rules**, `before { A (B) C } after → D $1 E`
   (`TransformStep::singleCaptureDoubleReplacements`). Here A and C have fixed
   lengths, B is any pattern, and D and E are fixed strings. B stays in place, so
@@ -1560,6 +1570,7 @@ tconv on every implementable transform.
 | `0e561c416`, `22d03949b`, `345b69bf1` | possessive sets with strings in after contexts checked by the engine; sets with strings in contexts taking their longest strings; test cases with ICU's results counted as discrepancies (217): 401 |
 | `85277dbd7` | anchors of texts moved to their contexts: W3 needed by 13, W6 alone blocks 7: 401 |
 | `9a4a0c6a6` | last captures of sets including the text boundary: W6 needed by 11, W3 alone blocks 9: 401 |
+| `b45845a25` | runs of sets with strings: cs-ja, cs_FONIPA-ja, es-ja, es_419-ja, es_FONIPA-ja: 406 |
 
 ## Reproducing
 

@@ -433,13 +433,26 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
     //  rule sets before change): a set of the text that includes the text
     //  boundary also matches at the end of a run, which the text of a step does
     //  not tell (the characters a step before inserts are within the run of the
-    //  character they follow).  Such sets are then left as they are.
-    bool filter = false, transforms = false;
+    //  character they follow), but the filter's mask does: the end of the text
+    //  is then also a position outside the filter (FilterRunEndMark).
+    //  (The characters of the set are then those of the filter, as the text of
+    //  a rule matches within a run.)
+    const FilterRule * filter = nullptr;
+    bool transforms = false;
     for (const Rule * r : rules) {
-        if (const FilterRule * f = dyn_cast<FilterRule>(r); f && !f->isInverse()) filter = true;
+        if (const FilterRule * f = dyn_cast<FilterRule>(r); f && !f->isInverse() && filter == nullptr) filter = f;
         transforms |= isa<TransformRule>(r);
     }
     const bool runs = filter && transforms;
+    RE * const end = runs ? static_cast<RE *>(Alt::Create({makeCC(FilterRunEndMark), makeEnd()})) : makeEnd();
+    CharSetAnalysis sets;
+    static const UCD::UnicodeSet nonCharacters = UCD::UnicodeSet(0xFDD0, 0xFDEF);
+    const UCD::UnicodeSet filterChars = runs ? sets.setOf(filter->getFilterSet(), false) - nonCharacters : UCD::UnicodeSet();
+    auto withinFilter = [&](RE * set) -> RE * {
+        if (!runs || set == nullptr) return set;
+        const UCD::UnicodeSet chars = sets.setOf(set, false) & filterChars;
+        return chars.empty() ? nullptr : makeCC(chars);
+    };
     std::vector<Rule *> out;
     for (Rule * r : rules) {
         ConversionRule * c = dyn_cast<ConversionRule>(r);
@@ -478,14 +491,14 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
             //  position (^ 4 ($nd) → | X $1 as ^ 4 } $nd → | X).
             if (Capture * const capture = dyn_cast<Capture>(items.back())) {
                 bool boundary = false;
-                RE * const chars = withoutEnd(capture->getCapturedRE(), boundary);
+                RE * const chars = withinFilter(withoutEnd(capture->getCapturedRE(), boundary));
                 RE * const revisit = result->getResultToRevisit();
                 std::vector<RE *> revisited;
                 if (revisit) {
                     if (Seq * seq = dyn_cast<Seq>(revisit)) revisited.assign(seq->begin(), seq->end()); else revisited.push_back(revisit);
                 }
                 const Reference * const last = revisited.empty() ? nullptr : dyn_cast<Reference>(revisited.back());
-                if (boundary && !runs && result->hasCursor() && result->getCursorOffset() == 0 && last && last->getCapture() == capture
+                if (boundary && result->hasCursor() && result->getCursorOffset() == 0 && last && last->getCapture() == capture
                         && !(result->getCompletedResult() && refersTo(result->getCompletedResult(), capture))) {
                     revisited.pop_back();
                     bool once = true;
@@ -495,11 +508,19 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
                                                                     makeSeq(revisited.begin(), revisited.end()), 0,
                                                                     result->getAfterContext());
                         items.pop_back();
-                        out.push_back(rule(before, items, capture->getCapturedRE(), context));
+                        //  (Its end of the text also the end of a run, see FilterRunEndMark.)
+                        RE * after = capture->getCapturedRE();
+                        if (end != nullptr && !isa<End>(end)) {
+                            std::vector<RE *> alts;
+                            if (chars) alts.push_back(chars);
+                            alts.push_back(end);
+                            after = makeAlt(alts.begin(), alts.end());
+                        }
+                        out.push_back(rule(before, items, after, context));
                         continue;
                     }
                 }
-                if (boundary && !runs) {
+                if (boundary) {
                     Capture * const withChar = chars ? makeCapture(capture->getName(), chars) : nullptr;
                     RuleSide * const charResult = withChar ? rebindResult(result, capture, withChar) : nullptr;
                     RuleSide * const endResult = rebindResult(result, capture, nullptr);
@@ -510,7 +531,7 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
                             out.push_back(rule(before, text, nullptr, charResult));
                         }
                         items.pop_back();
-                        out.push_back(rule(before, items, makeEnd(), endResult));
+                        out.push_back(rule(before, items, end, endResult));
                         continue;
                     }
                 }
@@ -518,15 +539,15 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
             //  A last set including the end of the text: a character of the
             //  set, or (matching nothing) the end of the text.
             bool boundary = false;
-            RE * const chars = withoutEnd(items.back(), boundary);
-            if (boundary && !runs) {
+            RE * const chars = withinFilter(withoutEnd(items.back(), boundary));
+            if (boundary) {
                 if (chars) {
                     std::vector<RE *> withChar(items);
                     withChar.back() = chars;
                     out.push_back(rule(before, withChar, nullptr));
                 }
                 items.pop_back();
-                out.push_back(rule(before, items, makeEnd()));
+                out.push_back(rule(before, items, end));
                 continue;
             }
         }

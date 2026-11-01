@@ -96,6 +96,7 @@
 #include <kernel/re/regexp_engine.h>
 #include <re/adt/adt.h>
 #include <re/transforms/resolve_possessive.h>
+#include <re/analysis/re_name_gather.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
@@ -1136,6 +1137,30 @@ protected:
     }
 private:
     const WalkConfig mConfig;
+};
+
+//  The streams of Classes, those at the indices given ORed with the positions
+//  outside Mask (see ldml::FilterRunEndMark).
+class OutsideMask final : public pablo::PabloKernel {
+public:
+    OutsideMask(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * Mask, const std::vector<unsigned> & indices, StreamSet * Out)
+    : PabloKernel(ts, "OutsideMask" + std::to_string(Classes->getNumElements()) + [&] {
+                      std::string s;
+                      for (unsigned i : indices) s += "_" + std::to_string(i);
+                      return s;
+                  }(),
+                  {Binding{"Classes", Classes}, Binding{"Mask", Mask}}, {Binding{"Out", Out}})
+    , mIndices(indices) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * const outside = pb.createNot(getInputStreamSet("Mask")[0]);
+        for (unsigned i : mIndices) classes[i] = pb.createOr(classes[i], outside);
+        writeOutputStreamSet("Out", classes);
+    }
+private:
+    const std::vector<unsigned> mIndices;
 };
 
 //  Single streams collected into a stream set.
@@ -5300,6 +5325,7 @@ private:
     StreamSet * matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                              StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text, StreamSet * U21);
+    RE_context engineContext(StreamSet * U21, const re::RE * pattern);
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
                                StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21);
@@ -5877,8 +5903,38 @@ static re::RE * possessiveBefore(re::RE * engineBefore) {
     return ldml::possessiveContext(ldml::expandedContext(engineBefore, Insertions(), DeletionMark), false);
 }
 
+//  The name of the positions outside the global filter (see
+//  ldml::FilterRunEndMark) in the patterns of the engine: an external of the
+//  engine, the positions outside the active mask.
+static const std::string FilterRunEndName = "tconvFilterRunEnd";
+
+//  A pattern with the sets including ldml::FilterRunEndMark matching the
+//  positions outside the filter (FilterRunEndName) instead.
+class FilterRunEnds final : public re::RE_Transformer {
+public:
+    FilterRunEnds() : re::RE_Transformer("FilterRunEnds") {}
+    bool used = false;
+protected:
+    re::RE * transformCC(re::CC * cc) override {
+        if (!ldml::marksFilterRunEnd(*cc)) return cc;
+        used = true;
+        static re::Name * const outside = re::makeName(FilterRunEndName, re::makeCC(ldml::FilterRunEndMark, &cc::Unicode));
+        re::CC * const rest = re::subtractCC(cc, re::makeCC(ldml::FilterRunEndMark, &cc::Unicode));
+        return rest->empty() ? static_cast<re::RE *>(outside) : re::makeAlt({rest, outside});
+    }
+};
+
 static re::RE * possessiveAfter(re::RE * engineAfter) {
-    return ldml::possessiveContext(ldml::expandedContext(engineAfter, Insertions(), DeletionMark), true);
+    FilterRunEnds runEnds;
+    return runEnds.transformRE(ldml::possessiveContext(ldml::expandedContext(engineAfter, Insertions(), DeletionMark), true));
+}
+
+//  Whether a pattern refers to the positions outside the filter (FilterRunEndName).
+static bool usesFilterRunEnds(const re::RE * re) {
+    std::set<re::Name *> names;
+    re::gatherNames(const_cast<re::RE *>(re), names);
+    for (const re::Name * n : names) if (n->getFullName() == FilterRunEndName) return true;
+    return false;
 }
 
 //  The pattern of matchPattern: the text, after a lookbehind of the before
@@ -5926,6 +5982,18 @@ StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * 
 
 //  The positions of the last characters of the matches of a pattern (a
 //  sequence of items) with contexts, and optionally the spans of the matches.
+//  The engine's context for a pattern on U21: with the positions outside the
+//  filter (the active mask) as FilterRunEndName, if the pattern refers to them.
+RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pattern) {
+    RE_context context{&cc::Unicode, U21};
+    if (StreamSet * const mask = activeMask(); mask && usesFilterRunEnds(pattern)) {
+        StreamSet * const outside = mP.CreateStreamSet(1);
+        Invert(mP, mask, outside);
+        context.externals.emplace_back(FilterRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, outside});
+    }
+    return context;
+}
+
 StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                                               StreamSet * U21, StreamSet ** spans) {
     re::RE * const pattern = contextPattern(engineBefore, engineAfter, text);
@@ -5933,7 +6001,7 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
     //  for a pattern ending with a zero-width lookahead): shift the marks back.
     const PreparedRE prepared = prepareRE(pattern, engineOptions());
     StreamSet * matches = mP.CreateStreamSet(1);
-    RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
+    RE_PipelineBuilder engine(mP, engineContext(U21, pattern));
     if (spans) {
         *spans = mP.CreateStreamSet(1);
         engine.matchSpanPipeline(prepared, matches, *spans);
@@ -5958,7 +6026,7 @@ StreamSet * RulePipelineBuilder::matchPattern(re::RE * engineBefore, re::RE * en
 StreamSet * RulePipelineBuilder::matchStarts(re::RE * engineBefore, re::RE * engineAfter, const std::vector<re::RE *> & text,
                                              StreamSet * U21) {
     StreamSet * const starts = mP.CreateStreamSet(1);
-    RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
+    RE_PipelineBuilder engine(mP, engineContext(U21, startsPattern(engineBefore, engineAfter, text, false)));
     const PreparedRE prepared = prepareRE(startsPattern(engineBefore, engineAfter, text, false), startsOptions());
     if (checkPreconditions(prepared, &cc::Unicode).empty()) {
         engine.matchStartsPipeline(prepared, starts);
@@ -6328,9 +6396,19 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         for (size_t i = 0; i < sets.size(); i++) (muxKeys.count(setKey(sets[i])) ? mux : rest).push_back(i);
         auto kernelOf = [&](const std::vector<size_t> & indices) {
             std::vector<re::CC *> ccs;
-            for (size_t i : indices) ccs.push_back(re::makeCC(sets[i], &cc::Unicode));
-            StreamSet * const classes = P.CreateStreamSet(ccs.size());
+            std::vector<unsigned> outside;      // the sets with ldml::FilterRunEndMark
+            for (size_t i : indices) {
+                if (mask && ldml::marksFilterRunEnd(sets[i])) outside.push_back(static_cast<unsigned>(ccs.size()));
+                ccs.push_back(re::makeCC(sets[i], &cc::Unicode));
+            }
+            StreamSet * classes = P.CreateStreamSet(ccs.size());
             P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+            if (!outside.empty()) {
+                //  (Their classes also hold the positions outside the filter.)
+                StreamSet * const marked = P.CreateStreamSet(ccs.size());
+                P.CreateKernelCall<OutsideMask>(classes, mask, outside, marked);
+                classes = marked;
+            }
             return classes;
         };
         if (mux.empty()) return kernelOf(rest);

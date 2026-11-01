@@ -796,6 +796,19 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  rule set does not tell: it is then left as it is.  A text that is the
 //  anchor alone is left unchanged.
 std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules);
+//  In an after context, a position outside the global filter, as the end of a
+//  run of the characters of the filter (a noncharacter, not in the text): with
+//  a global filter and transform rules, the text of a rule matching nothing at
+//  the end of the text matches also at the end of such a run (see
+//  MoveTextAnchors); the pipeline gives its class the positions outside the
+//  filter's mask, which it carries through the steps.
+constexpr UCD::codepoint_t FilterRunEndMark = 0xFDD2;
+//  Whether a set of a context marks the end of a filtered run: it contains
+//  FilterRunEndMark, which is added only with the next noncharacter absent (a
+//  set complemented, as [^c], contains both, and does not).
+inline bool marksFilterRunEnd(const UCD::UnicodeSet & set) {
+    return set.contains(FilterRunEndMark) && !set.contains(FilterRunEndMark + 1);
+}
 
 //  The rules referring more than once to a capture of a character of a set
 //  (([bcd]) ː → $1 $1), each the references items of its result, replaced by

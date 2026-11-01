@@ -1406,10 +1406,23 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
         if (matchStarts) {
             mCtxt.setMatchRegions(matchStarts, matchFollows);
         }
+        //  The client's externals (extended as the text is).
+        for (const auto & e : mSourceContext.externals) {
+            ExternalStream x = e.second;
+            if (mTextExtended) {
+                StreamSet * const extended = mPB.CreateStreamSet(x.extStream->getNumElements(), 1);
+                mPB.CreateKernelCall<ExtendByOne>(x.extStream, extended);
+                x.extStream = extended;
+            }
+            addExternal(e.first, x);
+        }
         mUsesUnicodeIndexing = true;
         mFinalMatchStarts = matchStarts;
         mFinalMatchFollows = matchFollows;
         return;
+    }
+    if (!mSourceContext.externals.empty()) {
+        llvm::report_fatal_error("RE_PipelineBuilder: externals of the client are for a source of Unicode only");
     }
 
     RE_Mode mode = mHaveMode ? mMode : determineREMode(re, mModeOptions);

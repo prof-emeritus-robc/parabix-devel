@@ -67,6 +67,11 @@ struct RE_context {
     kernel::StreamSet * source;
     kernel::StreamSet * matchStarts = nullptr;
     kernel::StreamSet * matchFollows = nullptr;
+    //  Externals of the client, by name (a name of the RE with that full name
+    //  is compiled as the external, rather than by its definition), as streams
+    //  of the positions of the source; for a source of Unicode (or of the codes
+    //  of a multiplexed alphabet of it) only.
+    std::vector<std::pair<std::string, ExternalStream>> externals = {};
 };
 
 struct RE_ModeOptions {

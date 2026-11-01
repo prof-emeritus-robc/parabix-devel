@@ -1148,22 +1148,28 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
 
 //  A rule inserting a fixed string M between captures and revisiting all,
 //      (T1) ... (Ti) (Ti+1) ... (Tk) → | $1 ... $i M $i+1 ... $k ;
-//  (each Tj a set, or a repetition of a set, the first rule of its group, no
-//  contexts), as an insertion rule applied before the group (in a group of
-//  its own),
+//  (each Tj a set, or a repetition of a set, no contexts), as an insertion
+//  rule applied before the group (in a group of its own),
 //      T1 ... Ti { } Ti+1 ... Tk → M ;
 //  with the sets within the filter (contexts see the characters outside it,
 //  which the text of the rule cannot match).  ICU tries the rule first at
 //  each position the cursor reaches, on the text not converted yet, so the
 //  insertion rule applies at the same positions where
 //    - no other rule matches a character of T1 after the first character of
-//      its text (the cursor reaches every character of T1),
+//      its text (the cursor reaches every character of T1), or, where T1 and
+//      T2 are sets (not repeated), such a character is followed, in its text
+//      (or after context), by one not in T2 (no insertion there),
 //    - no after context of another rule may see a character of T1 (and the
 //      insertion after it),
 //    - M contains no character of T1 or T2 (ICU revisits M), nor does a text
 //      that another rule revisits after its first character T2, and if its
 //      last character may be in T1, the text of that rule is a single set
-//      within T1 (ICU tried the rule there, followed by the same text).
+//      within T1 (ICU tried the rule there, followed by the same text);
+//    - no rule before it in its group (which ICU tries first) may apply where
+//      it matches: at a character of T1 followed by one of T2 (each then a
+//      set, not repeated), its text and after context begin with a character
+//      of T1, followed by a character not in T2 (and it has no before
+//      context), or begin with none.
 bool insertionRevisit(const ConversionRule * c, const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
                       Rule *& insertion) {
     const RuleSide * source = c->getSourceSide(Direction::Forward);
@@ -1217,12 +1223,36 @@ bool insertionRevisit(const ConversionRule * c, const std::vector<Rule *> & grou
     for (char32_t ch : inserted) m.insert(ch);
     if (m.intersects(items[0]) || m.intersects(items[1])) return false;
     for (const Rule * r : group) {
+        if (r == c) break;
+        const ConversionRule * other = dyn_cast<ConversionRule>(r);
+        if (other == nullptr) continue;
+        const RuleSide * os = other->getSourceSide(Direction::Forward);
+        std::vector<PatternItem> seen = patternItems(os->getText());
+        if (seen.empty()) return false;
+        if (os->hasAfterContext()) {
+            for (const PatternItem & item : patternItems(os->getAfterContext())) seen.push_back(item);
+        }
+        if (!seen[0].chars.intersects(items[0])) continue;
+        if (bounds[0] != std::make_pair(1, 1) || bounds[1] != std::make_pair(1, 1) || os->hasBeforeContext() || seen[0].repeated
+                || seen.size() == 1 || seen[1].repeated || seen[1].chars.intersects(items[1])) {
+            return false;
+        }
+    }
+    for (const Rule * r : group) {
         const ConversionRule * other = dyn_cast<ConversionRule>(r);
         if (other == nullptr || other == c) continue;
         const RuleSide * os = other->getSourceSide(Direction::Forward);
         const std::vector<PatternItem> otherText = patternItems(os->getText());
         for (size_t i = 0; i < otherText.size(); ++i) {
-            if ((i > 0 || otherText[i].repeated) && otherText[i].chars.intersects(items[0])) return false;
+            if (!((i > 0 || otherText[i].repeated) && otherText[i].chars.intersects(items[0]))) continue;
+            //  (Where T1 and T2 are sets, not repeated: no insertion there, if
+            //  what follows the character, in its text or after context, is a
+            //  character not in T2.)
+            const bool single = bounds[0] == std::make_pair(1, 1) && bounds[1] == std::make_pair(1, 1);
+            std::vector<PatternItem> next(otherText.begin() + i + 1, otherText.end());
+            if (next.empty() && os->hasAfterContext()) next = patternItems(os->getAfterContext());
+            if (single && !otherText[i].repeated && !next.empty() && !next[0].repeated && !next[0].chars.intersects(items[1])) continue;
+            return false;
         }
         if (os->hasAfterContext()) {
             for (const PatternItem & item : patternItems(os->getAfterContext())) {
@@ -1877,8 +1907,9 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
         //  First the rules whose text to revisit is the end of their text, which
         //  are rewritten (and applied as rewritten in the compositions).
         std::vector<Rule *> rewritten(rules.begin() + start, rules.begin() + end);
-        //  A first rule inserting a string between its captures and revisiting
-        //  all, as an insertion rule in a group before (see insertionRevisit).
+        //  A rule inserting a string between its captures and revisiting all (the
+        //  first that may), as an insertion rule in a group before (see
+        //  insertionRevisit).
         for (size_t k = 0; k < rewritten.size(); ++k) {
             ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
             if (c == nullptr) continue;
@@ -1897,8 +1928,8 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 out.push_back(insertion);
                 out.push_back(makeTransformRule(TransformID("Null")));
                 rewritten.erase(rewritten.begin() + k);
+                break;
             }
-            break;
         }
         //  The chain revisits, in a group of their own before (see
         //  chainRevisitSplit), with E extended.

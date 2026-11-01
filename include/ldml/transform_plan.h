@@ -150,6 +150,20 @@ struct BoundaryReplacement {
 //     first characters of the after context) may occur nowhere else in a match.
 // As information flows forward only, from the start of a match to its end,
 // only T0 and R0 may differ between the rules of a set.
+//  A branch of the possessive walk of the matches of a set from their starts
+//  (see MultipleCaptureMultipleReplacementSet::walkStarts): where the
+//  characters at the offsets of in are in their sets, and those at the
+//  offsets of out are not (the optional items taken or not), a match has
+//  length positions, then (if run) a run of the characters of runSet, then
+//  the characters of suffix.
+struct WalkBranch {
+    std::vector<std::pair<unsigned, UCD::UnicodeSet>> in, out;
+    unsigned length = 0;
+    bool run = false;
+    UCD::UnicodeSet runSet;
+    std::vector<UCD::UnicodeSet> suffix;
+};
+
 struct MultipleCaptureMultipleReplacementSet {
     std::vector<re::RE *> captures;                      // B1 ... Bk
     std::vector<std::vector<UCD::UnicodeSet>> texts;     // T1 ... Tk
@@ -175,6 +189,13 @@ struct MultipleCaptureMultipleReplacementSet {
     //  with strings there): the same matches, if what follows each repetition
     //  cannot begin with a character it repeats.
     bool greedyStarts = false;
+    //  Where a match may end within another of the set (and the starts are not
+    //  known by the first characters): the starts found by the engine (as with
+    //  exactStarts, greedyStarts as there), of which those that apply are
+    //  selected from the left by the lengths of the matches, in the branches
+    //  of their possessive walk (no run before a later optional item).
+    bool walkStarts = false;
+    std::vector<WalkBranch> walkBranches;
     std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0
     std::vector<std::u32string> results;                 // R1 ... Rk (as planned, in the order of the captures)
     std::vector<MultipleCaptureMultipleReplacement> rules;

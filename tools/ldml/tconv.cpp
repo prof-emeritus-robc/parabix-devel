@@ -963,6 +963,115 @@ protected:
     }
 };
 
+//  The branches of the possessive walks of the matches of a set (see
+//  ldml::MultipleCaptureMultipleReplacementSet::walkStarts), by class index:
+//  the characters at offsets in sets (or not), the length before the run,
+//  the run (or -1) and the length after it.
+struct WalkConfig {
+    struct Branch {
+        std::vector<std::pair<unsigned, unsigned>> in, out;
+        unsigned length;
+        int run;
+        unsigned suffix;
+    };
+    std::vector<Branch> branches;
+    unsigned lookahead() const {
+        unsigned m = 1;
+        for (const Branch & b : branches) {
+            for (const auto & t : b.in) m = std::max(m, t.first);
+            for (const auto & t : b.out) m = std::max(m, t.first);
+        }
+        return m;
+    }
+    std::string signature() const {
+        std::string sig;
+        for (const Branch & b : branches) {
+            sig += "_b" + std::to_string(b.length) + "r" + std::to_string(b.run) + "s" + std::to_string(b.suffix);
+            for (const auto & t : b.in) sig += "+" + std::to_string(t.first) + ":" + std::to_string(t.second);
+            for (const auto & t : b.out) sig += "-" + std::to_string(t.first) + ":" + std::to_string(t.second);
+        }
+        return sig;
+    }
+};
+
+//  The starts of the matches in each branch of their walk.
+class WalkBranchStarts final : public pablo::PabloKernel {
+public:
+    WalkBranchStarts(LLVMTypeSystemInterface & ts, const WalkConfig & config, StreamSet * Starts, StreamSet * Classes, StreamSet * Branches)
+    : PabloKernel(ts, "WalkBranchStarts_" + getStringHash(config.signature()),
+                  {Binding{"Starts", Starts}, Binding{"Classes", Classes, FixedRate(1), LookAhead(config.lookahead())}},
+                  {Binding{"Branches", Branches}})
+    , mConfig(config) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const starts = getInputStreamSet("Starts")[0];
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        auto at = [&](unsigned offset, unsigned c) {
+            return offset == 0 ? classes[c] : pb.createLookahead(classes[c], offset);
+        };
+        std::vector<PabloAST *> out;
+        for (const WalkConfig::Branch & b : mConfig.branches) {
+            PabloAST * s = starts;
+            for (const auto & t : b.in) s = pb.createAnd(s, at(t.first, t.second));
+            for (const auto & t : b.out) s = pb.createAnd(s, pb.createNot(at(t.first, t.second)));
+            out.push_back(s);
+        }
+        writeOutputStreamSet("Branches", out);
+    }
+private:
+    const WalkConfig mConfig;
+};
+
+//  Of the selected matches of a set walked in branches (Selected, and the
+//  starts by branch): their starts, spans and ends.  A run ends at the first
+//  character not in it (the last of the run is followed by none), then the
+//  suffix follows.
+class WalkSpans final : public pablo::PabloKernel {
+public:
+    WalkSpans(LLVMTypeSystemInterface & ts, const WalkConfig & config, StreamSet * Selected, StreamSet * Branches,
+              StreamSet * Classes, StreamSet * Chosen)
+    : PabloKernel(ts, "WalkSpans_" + getStringHash(config.signature()),
+                  {Binding{"Selected", Selected}, Binding{"Branches", Branches},
+                   Binding{"Classes", Classes, FixedRate(1), LookAhead(1)}},
+                  {Binding{"Chosen", Chosen}})
+    , mConfig(config) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const selected = getInputStreamSet("Selected")[0];
+        const std::vector<PabloAST *> branches = getInputStreamSet("Branches");
+        const std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * spans = pb.createZeroes();
+        PabloAST * ends = pb.createZeroes();
+        for (size_t i = 0; i < mConfig.branches.size(); i++) {
+            const WalkConfig::Branch & b = mConfig.branches[i];
+            PabloAST * const s = pb.createAnd(selected, branches[i]);
+            for (unsigned j = 0; j < b.length; j++) spans = pb.createOr(spans, j ? pb.createAdvance(s, j) : s);
+            PabloAST * const last = b.length > 1 ? pb.createAdvance(s, b.length - 1) : s;
+            if (b.run < 0) {
+                ends = pb.createOr(ends, last);
+                continue;
+            }
+            PabloAST * const r = classes[b.run];
+            PabloAST * const reached = pb.createMatchStar(pb.createAdvance(s, b.length), r);
+            PabloAST * const run = pb.createAnd(reached, r);
+            PabloAST * const after = pb.createAnd(reached, pb.createNot(r));
+            spans = pb.createOr(spans, run);
+            if (b.suffix > 0) {
+                for (unsigned j = 0; j < b.suffix; j++) spans = pb.createOr(spans, j ? pb.createAdvance(after, j) : after);
+                ends = pb.createOr(ends, b.suffix > 1 ? pb.createAdvance(after, b.suffix - 1) : after);
+            } else {
+                //  The last character of the run, or the one before an empty run.
+                ends = pb.createOr(ends, pb.createAnd(pb.createOr(run, last), pb.createNot(pb.createLookahead(r, 1))));
+            }
+        }
+        writeOutputStreamSet("Chosen", std::vector<PabloAST *>{selected, spans, ends});
+    }
+private:
+    const WalkConfig mConfig;
+};
+
 //  Single streams collected into a stream set.
 class CollectStreams : public pablo::PabloKernel {
 public:
@@ -1292,22 +1401,25 @@ private:
 //  The matches that apply, selected sequentially from the left as ICU applies
 //  them: given the first positions of the matches by class (Starts, a stream
 //  for each class: the matches of the texts of lengths[k], followed by a run of
-//  the characters of Runs[runs[k]] if runs[k] >= 0), a match applies if it does
+//  the characters of Runs[runs[k]] if runs[k] >= 0, then by suffixes[k]
+//  characters (if given)), a match applies if it does
 //  not begin within an applied match (after its first position: within its
 //  text, or its run).  At most one match is expected at a position; if there
 //  are several, the one of the earliest class applies.  The 64-bit words of
 //  the matches are scanned in order, with the applied matches found by counting
 //  trailing zeroes, and the end of a run by counting trailing ones; the
 //  positions still covered by the last applied match (a number of positions,
-//  then possibly a run) are carried to the next word (and stride).
+//  then possibly a run, then its suffix) are carried to the next word (and
+//  stride).
 class LeftmostMatches final : public MultiBlockKernel {
 public:
     LeftmostMatches(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & lengths, const std::vector<int> & runs,
-                    StreamSet * Starts, StreamSet * Runs, StreamSet * Selected)
+                    StreamSet * Starts, StreamSet * Runs, StreamSet * Selected, const std::vector<unsigned> & suffixes = {})
     : MultiBlockKernel(ts, "LeftmostMatches" + [&] {
                            std::string sig;
                            for (size_t k = 0; k < lengths.size(); k++) {
                                sig += "_" + std::to_string(lengths[k]) + (runs[k] >= 0 ? "r" + std::to_string(runs[k]) : "");
+                               if (k < suffixes.size() && suffixes[k]) sig += "s" + std::to_string(suffixes[k]);
                            }
                            //  (A file name of the object cache.)
                            return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
@@ -1318,8 +1430,13 @@ public:
                            return inputs;
                        }(),
                        {Binding{"Selected", Selected}}, {}, {},
-                       {InternalScalar{ts.getInt64Ty(), "covered"}, InternalScalar{ts.getInt64Ty(), "run"}}),
-      mLengths(lengths), mRuns(runs), mRunCount(Runs ? Runs->getNumElements() : 0) {
+                       {InternalScalar{ts.getInt64Ty(), "covered"}, InternalScalar{ts.getInt64Ty(), "run"},
+                        InternalScalar{ts.getInt64Ty(), "suffix"}}),
+      mLengths(lengths), mRuns(runs), mSuffixes([&] {
+          std::vector<unsigned> v(suffixes);
+          v.resize(lengths.size(), 0);
+          return v;
+      }()), mRunCount(Runs ? Runs->getNumElements() : 0) {
         setStride(ts.getBitBlockWidth());
     }
 protected:
@@ -1343,6 +1460,7 @@ protected:
         BasicBlock * const done = b.CreateBasicBlock("done");
         Value * const covered0 = b.getScalarField("covered");
         Value * const run0 = b.CreateSub(b.getScalarField("run"), b.getInt64(1));   // stored + 1 (0: none)
+        Value * const suffix0 = b.getScalarField("suffix");
         b.CreateCondBr(b.CreateICmpEQ(numOfStrides, ZERO), done, blockLoop);
 
         b.SetInsertPoint(blockLoop);
@@ -1352,6 +1470,8 @@ protected:
         blockCovered->addIncoming(covered0, entry);
         PHINode * const blockRun = b.CreatePHI(i64Ty, 2);
         blockRun->addIncoming(run0, entry);
+        PHINode * const blockSuffix = b.CreatePHI(i64Ty, 2);
+        blockSuffix->addIncoming(suffix0, entry);
         auto wordPtr = [&](const std::string & name, unsigned i) {
             return b.CreatePointerCast(b.getInputStreamBlockPtr(name, b.getInt32(i), blockNo), PointerType::getUnqual(b.getContext()));
         };
@@ -1369,6 +1489,8 @@ protected:
         covered->addIncoming(blockCovered, blockLoop);
         PHINode * const run = b.CreatePHI(i64Ty, 2);
         run->addIncoming(blockRun, blockLoop);
+        PHINode * const suffix = b.CreatePHI(i64Ty, 2);
+        suffix->addIncoming(blockSuffix, blockLoop);
         std::vector<Value *> words, runWords;
         Value * any = W0;
         for (Value * ptr : inWords) {
@@ -1393,12 +1515,18 @@ protected:
         Value * const allCovered = b.CreateICmpUGE(covered, W64);
         Value * const base = b.CreateSelect(allCovered, W0, covered);
         Value * const hasRun = b.CreateICmpNE(run, NONE);
-        Value * const end0 = b.CreateSelect(hasRun, runEnd(run, base), base);
-        Value * const toEnd = b.CreateOr(allCovered, b.CreateICmpUGE(end0, W64));
+        Value * const runEnd0 = b.CreateSelect(hasRun, runEnd(run, base), base);
+        //  The run continues past the word, or ends there, followed by its suffix.
+        Value * const runBeyond = b.CreateAnd(hasRun, b.CreateICmpUGE(runEnd0, W64));
+        Value * const end0 = b.CreateAdd(runEnd0, b.CreateSelect(hasRun, suffix, W0));
+        Value * const pending = b.CreateOr(allCovered, runBeyond);
+        Value * const toEnd = b.CreateOr(pending, b.CreateICmpUGE(end0, W64));
         Value * const coverMask = b.CreateSelect(toEnd, b.getInt64(-1), lowMask(b.CreateSelect(toEnd, W0, end0)));
         Value * const candidates = b.CreateAnd(any, b.CreateNot(coverMask));
-        Value * const carried = b.CreateSelect(allCovered, b.CreateSub(covered, W64), W0);
-        Value * const carriedRun = b.CreateSelect(toEnd, run, NONE);
+        Value * const carried = b.CreateSelect(allCovered, b.CreateSub(covered, W64),
+                                               b.CreateSelect(b.CreateOr(runBeyond, b.CreateICmpULT(end0, W64)), W0, b.CreateSub(end0, W64)));
+        Value * const carriedRun = b.CreateSelect(pending, run, NONE);
+        Value * const carriedSuffix = b.CreateSelect(pending, suffix, W0);
         BasicBlock * const wordStart = b.GetInsertBlock();
         b.CreateBr(selectLoop);
 
@@ -1412,29 +1540,41 @@ protected:
         nextCovered->addIncoming(carried, wordStart);
         PHINode * const nextRun = b.CreatePHI(i64Ty, 2);
         nextRun->addIncoming(carriedRun, wordStart);
+        PHINode * const nextSuffix = b.CreatePHI(i64Ty, 2);
+        nextSuffix->addIncoming(carriedSuffix, wordStart);
         b.CreateCondBr(b.CreateICmpEQ(remaining, W0), wordDone, selectOne);
 
         b.SetInsertPoint(selectOne);
         Value * const pos = b.CreateCountForwardZeroes(remaining);
         Value * length = b.getInt64(mLengths.back());
         Value * matchRun = b.getInt64(mRuns.back());
+        Value * matchSuffix = b.getInt64(mSuffixes.back());
         for (int i = static_cast<int>(mLengths.size()) - 2; i >= 0; i--) {
             Value * const bit = b.CreateICmpNE(b.CreateAnd(b.CreateLShr(words[i], pos), b.getInt64(1)), W0);
             length = b.CreateSelect(bit, b.getInt64(mLengths[i]), length);
             matchRun = b.CreateSelect(bit, b.getInt64(mRuns[i]), matchRun);
+            matchSuffix = b.CreateSelect(bit, b.getInt64(mSuffixes[i]), matchSuffix);
         }
-        //  The end of the text, then of its run.
+        //  The end of the text, then of its run, then of its suffix.
         Value * const textEnd = b.CreateAdd(pos, length);
         Value * const textBeyond = b.CreateICmpUGE(textEnd, W64);
         Value * const withRun = b.CreateICmpNE(matchRun, NONE);
-        Value * const end = b.CreateSelect(b.CreateAnd(withRun, b.CreateNot(textBeyond)),
-                                           runEnd(matchRun, b.CreateSelect(textBeyond, W0, textEnd)), textEnd);
+        Value * const runEndAt = b.CreateSelect(b.CreateAnd(withRun, b.CreateNot(textBeyond)),
+                                                runEnd(matchRun, b.CreateSelect(textBeyond, W0, textEnd)), textEnd);
+        Value * const runBeyondHere = b.CreateAnd(withRun, b.CreateICmpUGE(runEndAt, W64));
+        Value * const end = b.CreateAdd(runEndAt, b.CreateSelect(withRun, matchSuffix, W0));
         Value * const beyond = b.CreateICmpUGE(end, W64);
         Value * const keep = b.CreateSelect(beyond, W0, b.CreateShl(b.getInt64(-1), b.CreateSelect(beyond, W0, end)));
         remaining->addIncoming(b.CreateAnd(remaining, keep), selectOne);
         selected->addIncoming(b.CreateOr(selected, b.CreateShl(b.getInt64(1), pos)), selectOne);
-        nextCovered->addIncoming(b.CreateSelect(beyond, b.CreateSub(textEnd, b.CreateSelect(textBeyond, W64, textEnd)), nextCovered), selectOne);
-        nextRun->addIncoming(b.CreateSelect(beyond, matchRun, nextRun), selectOne);
+        //  Carried: the rest of the text (then the run and suffix), the run (then
+        //  the suffix), or the rest of the suffix.
+        Value * const pendingRun = b.CreateOr(textBeyond, runBeyondHere);
+        Value * const carriedCount = b.CreateSelect(textBeyond, b.CreateSub(textEnd, W64),
+                                                    b.CreateSelect(runBeyondHere, W0, b.CreateSub(end, W64)));
+        nextCovered->addIncoming(b.CreateSelect(beyond, carriedCount, nextCovered), selectOne);
+        nextRun->addIncoming(b.CreateSelect(beyond, b.CreateSelect(pendingRun, matchRun, NONE), nextRun), selectOne);
+        nextSuffix->addIncoming(b.CreateSelect(beyond, b.CreateSelect(pendingRun, matchSuffix, W0), nextSuffix), selectOne);
         b.CreateBr(selectLoop);
 
         b.SetInsertPoint(wordDone);
@@ -1443,6 +1583,7 @@ protected:
         wordNo->addIncoming(nextWord, wordDone);
         covered->addIncoming(nextCovered, wordDone);
         run->addIncoming(nextRun, wordDone);
+        suffix->addIncoming(nextSuffix, wordDone);
         b.CreateCondBr(b.CreateICmpULT(nextWord, WORDS_PER_BLOCK), wordLoop, blockDone);
 
         b.SetInsertPoint(blockDone);
@@ -1450,6 +1591,7 @@ protected:
         blockNo->addIncoming(nextBlock, blockDone);
         blockCovered->addIncoming(nextCovered, blockDone);
         blockRun->addIncoming(nextRun, blockDone);
+        blockSuffix->addIncoming(nextSuffix, blockDone);
         b.CreateCondBr(b.CreateICmpULT(nextBlock, numOfStrides), blockLoop, done);
 
         b.SetInsertPoint(done);
@@ -1459,12 +1601,17 @@ protected:
         PHINode * const finalRun = b.CreatePHI(i64Ty, 2);
         finalRun->addIncoming(run0, entry);
         finalRun->addIncoming(nextRun, blockDone);
+        PHINode * const finalSuffix = b.CreatePHI(i64Ty, 2);
+        finalSuffix->addIncoming(suffix0, entry);
+        finalSuffix->addIncoming(nextSuffix, blockDone);
         b.setScalarField("covered", finalCovered);
         b.setScalarField("run", b.CreateAdd(finalRun, b.getInt64(1)));
+        b.setScalarField("suffix", finalSuffix);
     }
 private:
     const std::vector<unsigned> mLengths;
     const std::vector<int> mRuns;
+    const std::vector<unsigned> mSuffixes;
     const unsigned mRunCount;
 };
 
@@ -5963,6 +6110,13 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * ends = nullptr;
         StreamSet * starts = nullptr;
         StreamSet * firstStarts = nullptr;  // (with exactStarts: the first start of each span)
+        //  With walkStarts: the starts by branch, the walk, the classes of its
+        //  sets, and the runs of the branches (indexes in runs, or -1).
+        StreamSet * branches = nullptr;
+        WalkConfig walk;
+        StreamSet * walkClasses = nullptr;
+        std::vector<int> runOf;
+        std::vector<UCD::UnicodeSet> runs;
     };
     std::vector<CaptureMatches> captureMatches;
     bool capturesMatched = false;
@@ -5970,6 +6124,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     //  sets), and the runs of the sets.
     StreamSet * jointSelected = nullptr;
     std::vector<StreamSet *> jointRuns;
+    std::vector<unsigned> jointSuffixes;    // (by class, with walkStarts sets)
     auto matchCaptures = [&]() {
         capturesMatched = true;
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
@@ -5988,16 +6143,86 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             //  Only the streams used are made (the pipeline compiler fails on kernels
             //  whose outputs are unused): the starts, if replacements are made from
             //  them, the spans are covered or selected, and the spans, for the starts.
-            bool needStarts = n0 > 0 || needCoverage || step.captureSelection || set.reversed || set.moved;
+            bool needStarts = n0 > 0 || needCoverage || step.captureSelection || set.reversed || set.moved || set.walkStarts;
             for (const ldml::BoundaryReplacement & br : set.replacements) needStarts |= !br.fromEnd;
             CaptureMatches m;
-            m.ends = matchPattern(set.engineBefore, set.engineAfter, items, U21,
-                                  (needStarts && !set.singleCharacter) ? &m.spans : nullptr);
+            if (!set.walkStarts) {
+                m.ends = matchPattern(set.engineBefore, set.engineAfter, items, U21,
+                                      (needStarts && !set.singleCharacter) ? &m.spans : nullptr);
+            }
             if (!needStarts) {
                 //  (Only the ends are used.)
             } else if (set.singleCharacter) {
                 m.starts = m.ends;
                 m.spans = m.ends;
+            } else if (set.walkStarts) {
+                //  Every start, found by the engine (see exactStarts), selected from
+                //  the left by the lengths of the branches of their walks.
+                std::vector<re::RE *> lookahead = items;
+                if (set.greedyStarts) {
+                    lookahead.clear();
+                    for (size_t j = 0; j < n0; j++) lookahead.push_back(items[j]);
+                    for (size_t i = 0; i < set.captures.size(); i++) {
+                        lookahead.push_back(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark));
+                        for (const UCD::UnicodeSet & chars : set.texts[i]) lookahead.push_back(re::makeCC(chars, &cc::Unicode));
+                    }
+                }
+                StreamSet * all = matchStarts(set.engineBefore, set.engineAfter, lookahead, U21);
+                if (mask) all = combine(all, mask, false);
+                std::vector<UCD::UnicodeSet> walkSets;
+                auto index = [&](const UCD::UnicodeSet & u) {
+                    auto f = std::find(walkSets.begin(), walkSets.end(), u);
+                    if (f != walkSets.end()) return static_cast<unsigned>(f - walkSets.begin());
+                    walkSets.push_back(u);
+                    return static_cast<unsigned>(walkSets.size() - 1);
+                };
+                WalkConfig walk;
+                std::vector<int> runSets;           // the run of each branch, by its index among the runs
+                std::vector<UCD::UnicodeSet> runs;
+                for (const ldml::WalkBranch & wb : set.walkBranches) {
+                    WalkConfig::Branch b{{}, {}, wb.length, -1, static_cast<unsigned>(wb.suffix.size())};
+                    for (const auto & t : wb.in) b.in.emplace_back(t.first, index(t.second));
+                    for (const auto & t : wb.out) b.out.emplace_back(t.first, index(t.second));
+                    int r = -1;
+                    if (wb.run) {
+                        b.run = static_cast<int>(index(wb.runSet));
+                        auto f = std::find(runs.begin(), runs.end(), wb.runSet);
+                        r = static_cast<int>(f - runs.begin());
+                        if (f == runs.end()) runs.push_back(wb.runSet);
+                    }
+                    runSets.push_back(r);
+                    walk.branches.push_back(b);
+                }
+                if (walkSets.empty()) walkSets.push_back(UCD::UnicodeSet());
+                StreamSet * const walkClasses = classes(walkSets, U21);
+                StreamSet * const branches = P.CreateStreamSet(walk.branches.size());
+                P.CreateKernelCall<WalkBranchStarts>(walk, all, walkClasses, branches);
+                std::vector<unsigned> lengths, suffixes;
+                for (const WalkConfig::Branch & b : walk.branches) {
+                    lengths.push_back(b.length);
+                    suffixes.push_back(b.suffix);
+                }
+                m.branches = branches;
+                m.walk = walk;
+                m.walkClasses = walkClasses;
+                m.runOf = runSets;
+                m.runs = runs;
+                //  (Where the matches of the sets are selected together, there; see below.)
+                if (!step.captureSelection) {
+                    StreamSet * const runStreams = runs.empty() ? nullptr : classes(runs, U21);
+                    StreamSet * const selected = P.CreateStreamSet(1);
+                    P.CreateKernelCall<LeftmostMatches>(lengths, runSets, branches, runStreams, selected, suffixes);
+                    StreamSet * const chosen = P.CreateStreamSet(3);
+                    P.CreateKernelCall<WalkSpans>(walk, selected, branches, walkClasses, chosen);
+                    auto select = [&](unsigned k) {
+                        StreamSet * const out = P.CreateStreamSet(1);
+                        P.CreateKernelCall<StreamSelect>(out, Select(chosen, {k}));
+                        return out;
+                    };
+                    m.starts = select(0);
+                    m.spans = select(1);
+                    m.ends = select(2);
+                }
             } else if (set.startsByFirst) {
                 UCD::UnicodeSet firstChars = set.startChars;
                 for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
@@ -6210,6 +6435,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 matchCaptures();
                 std::vector<StreamSet *> startSets{starts}, runSets;
                 std::vector<std::pair<unsigned, unsigned>> startOrder, runOrder;
+                jointSuffixes.assign(selection.lengths.size(), 0);
                 for (unsigned k = 0; k < byLengthOf.size(); k++) startOrder.emplace_back(0, k);
                 const unsigned firstRun = selection.runs ? selection.runs->getNumElements() : 0;
                 if (selection.runs) {
@@ -6218,24 +6444,50 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 }
                 for (size_t i = 0; i < captureMatches.size(); i++) {
                     CaptureMatches & m = captureMatches[i];
+                    if (m.branches) {
+                        //  A class for each branch of the walks of the set (see
+                        //  walkStarts), of its length and run.
+                        jointRuns.push_back(nullptr);
+                        std::vector<int> runIndex;
+                        if (!m.runs.empty()) {
+                            StreamSet * const r = classes(m.runs, U21);
+                            for (unsigned k = 0; k < m.runs.size(); k++) {
+                                runIndex.push_back(static_cast<int>(runOrder.size()));
+                                runOrder.emplace_back(runSets.size(), k);
+                            }
+                            runSets.push_back(r);
+                        }
+                        const unsigned set = static_cast<unsigned>(startSets.size());
+                        startSets.push_back(m.branches);
+                        for (unsigned b = 0; b < m.walk.branches.size(); b++) {
+                            startOrder.emplace_back(set, b);
+                            selection.lengths.push_back(m.walk.branches[b].length);
+                            jointSuffixes.push_back(m.walk.branches[b].suffix);
+                            selection.runOf.push_back(m.runOf[b] < 0 ? -1 : runIndex[m.runOf[b]]);
+                        }
+                        continue;
+                    }
                     StreamSet * const run = P.CreateStreamSet(1);
                     P.CreateKernelCall<SpanContinuation>(m.spans, m.firstStarts ? m.firstStarts : m.starts, run);
                     jointRuns.push_back(run);
                     startOrder.emplace_back(startSets.size(), 0);
                     startSets.push_back(m.starts);
+                    selection.lengths.push_back(1);
+                    jointSuffixes.push_back(0);
+                    selection.runOf.push_back(static_cast<int>(runOrder.size()));
                     runOrder.emplace_back(runSets.size(), 0);
                     runSets.push_back(run);
-                    selection.lengths.push_back(1);
-                    selection.runOf.push_back(static_cast<int>(firstRun + i));
                 }
                 StreamSet * const allStarts = P.CreateStreamSet(startOrder.size());
                 P.CreateKernelCall<MergeStreamSets>(startSets, startOrder, allStarts);
-                StreamSet * const allRuns = P.CreateStreamSet(runOrder.size());
-                P.CreateKernelCall<MergeStreamSets>(runSets, runOrder, allRuns);
                 starts = allStarts;
-                selection.runs = allRuns;
+                if (!runOrder.empty()) {
+                    StreamSet * const allRuns = P.CreateStreamSet(runOrder.size());
+                    P.CreateKernelCall<MergeStreamSets>(runSets, runOrder, allRuns);
+                    selection.runs = allRuns;
+                }
             }
-            P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected);
+            P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected, jointSuffixes);
             SHOW_STREAM(selected);
             jointSelected = selected;
         } else if (!step.stringOrder.empty()) {
@@ -6341,32 +6593,67 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         //  the rest of its span.  The spans and ends are then those of the matches
         //  selected.
         if (step.captureSelection) {
-            std::vector<StreamSet *> runStreams = jointRuns;
+            std::vector<StreamSet *> runStreamOf = jointRuns;     // the run of each set (not walked)
             StreamSet * selected = jointSelected;
             if (!step.jointSelection) {
-                std::vector<StreamSet *> startStreams;
-                for (CaptureMatches & m : captureMatches) {
+                runStreamOf.assign(captureMatches.size(), nullptr);
+                std::vector<StreamSet *> startStreams, runStreams;
+                std::vector<unsigned> lengths, suffixes;
+                std::vector<int> runOf;
+                for (size_t i = 0; i < captureMatches.size(); i++) {
+                    CaptureMatches & m = captureMatches[i];
+                    if (m.branches) {
+                        //  A class for each branch of the walks of the set (see
+                        //  walkStarts), of its length and run.
+                        std::vector<int> runIndex;
+                        if (!m.runs.empty()) {
+                            StreamSet * const r = classes(m.runs, U21);
+                            for (size_t k = 0; k < m.runs.size(); k++) {
+                                StreamSet * const one = P.CreateStreamSet(1);
+                                P.CreateKernelCall<StreamSelect>(one, Select(r, {static_cast<unsigned>(k)}));
+                                runIndex.push_back(static_cast<int>(runStreams.size()));
+                                runStreams.push_back(one);
+                            }
+                        }
+                        for (size_t b = 0; b < m.walk.branches.size(); b++) {
+                            StreamSet * const one = P.CreateStreamSet(1);
+                            P.CreateKernelCall<StreamSelect>(one, Select(m.branches, {static_cast<unsigned>(b)}));
+                            startStreams.push_back(one);
+                            lengths.push_back(m.walk.branches[b].length);
+                            suffixes.push_back(m.walk.branches[b].suffix);
+                            runOf.push_back(m.runOf[b] < 0 ? -1 : runIndex[m.runOf[b]]);
+                        }
+                        continue;
+                    }
                     StreamSet * const run = P.CreateStreamSet(1);
                     P.CreateKernelCall<SpanContinuation>(m.spans, m.firstStarts ? m.firstStarts : m.starts, run);
                     startStreams.push_back(m.starts);
+                    lengths.push_back(1);
+                    suffixes.push_back(0);
+                    runOf.push_back(static_cast<int>(runStreams.size()));
                     runStreams.push_back(run);
+                    runStreamOf[i] = run;
                 }
                 StreamSet * const starts = P.CreateStreamSet(startStreams.size());
                 P.CreateKernelCall<CollectStreams>(startStreams, starts);
-                StreamSet * const runs = P.CreateStreamSet(runStreams.size());
-                P.CreateKernelCall<CollectStreams>(runStreams, runs);
-                std::vector<unsigned> lengths(captureMatches.size(), 1);
-                std::vector<int> runOf;
-                for (size_t i = 0; i < captureMatches.size(); i++) runOf.push_back(static_cast<int>(i));
+                StreamSet * runs = nullptr;
+                if (!runStreams.empty()) {
+                    runs = P.CreateStreamSet(runStreams.size());
+                    P.CreateKernelCall<CollectStreams>(runStreams, runs);
+                }
                 selected = P.CreateStreamSet(1);
-                P.CreateKernelCall<LeftmostMatches>(lengths, runOf, starts, runs, selected);
+                P.CreateKernelCall<LeftmostMatches>(lengths, runOf, starts, runs, selected, suffixes);
                 SHOW_STREAM(selected);
             }
             for (size_t i = 0; i < captureMatches.size(); i++) {
                 const ldml::MultipleCaptureMultipleReplacementSet & set = step.captureReplacements[i];
                 CaptureMatches & m = captureMatches[i];
                 StreamSet * const chosen = P.CreateStreamSet(3);
-                P.CreateKernelCall<SelectedSpans>(m.starts, runStreams[i], m.ends, selected, chosen);
+                if (m.branches) {
+                    P.CreateKernelCall<WalkSpans>(m.walk, selected, m.branches, m.walkClasses, chosen);
+                } else {
+                    P.CreateKernelCall<SelectedSpans>(m.starts, runStreamOf[i], m.ends, selected, chosen);
+                }
                 //  (Only the streams used are selected.)
                 bool usesStarts = !set.rules.front().first.empty() || needCoverage || set.reversed || set.moved, usesEnds = false;
                 for (const ldml::BoundaryReplacement & br : set.replacements) {

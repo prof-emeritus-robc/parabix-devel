@@ -306,6 +306,114 @@ static bool firstContextSet(re::RE * context, UCD::UnicodeSet & chars, CharSetAn
 //  A MultipleCaptureMultipleReplacement rule (see
 //  MultipleCaptureMultipleReplacementSet): the rule, and its set (without
 //  rules), or false (with the reason, if the rule has the form).
+//  The elements of a possessive walk of a pattern (see WalkBranch): a set
+//  (one character), an optional one (taken if there), a run, or a set with
+//  strings of two characters (the longest that matches: a string, of a
+//  first character and one of those that follow it in the strings, or else
+//  a character of the set).
+static std::set<std::u32string> setStrings(const re::RE * re);
+struct WalkElement {
+    UCD::UnicodeSet set;
+    enum class Kind {Set, Optional, Run, Strings} kind;
+    std::map<UCD::codepoint_t, UCD::UnicodeSet> pairs = {};     // first character → second characters
+};
+
+static bool walkElements(re::RE * re, std::vector<WalkElement> & out, CharSetAnalysis & sets) {
+    //  (A negated set may include the text boundary, which a text does not match.)
+    if (CharSetAnalysis::isSet(re) && !hasStrings(re)) {
+        out.push_back(WalkElement{sets.setOf(re, false), WalkElement::Kind::Set});
+        return true;
+    } else if (CharSetAnalysis::isSet(re)) {
+        WalkElement e{sets.setOf(re, false), WalkElement::Kind::Strings};
+        for (const std::u32string & str : setStrings(re)) {
+            if (str.size() != 2) return false;
+            e.pairs[str[0]].insert(str[1]);
+        }
+        if (e.pairs.empty() || e.pairs.size() > 4) return false;
+        out.push_back(e);
+        return true;
+    } else if (re::Seq * seq = dyn_cast<re::Seq>(re)) {
+        for (re::RE * e : *seq) {
+            if (!walkElements(e, out, sets)) return false;
+        }
+        return true;
+    } else if (re::Alt * alt = dyn_cast<re::Alt>(re); alt && alt->size() == 1) {
+        return walkElements(alt->front(), out, sets);
+    } else if (re::Name * n = dyn_cast<re::Name>(re); n && n->getDefinition() && !isFunctionCall(n)) {
+        return walkElements(n->getDefinition(), out, sets);
+    } else if (re::Rep * rep = dyn_cast<re::Rep>(re)) {
+        if (!CharSetAnalysis::isSet(rep->getRE()) || hasStrings(rep->getRE())) return false;
+        const UCD::UnicodeSet chars = sets.setOf(rep->getRE(), false);
+        for (int i = 0; i < rep->getLB(); i++) out.push_back(WalkElement{chars, WalkElement::Kind::Set});
+        if (rep->getUB() == re::Rep::UNBOUNDED_REP) {
+            out.push_back(WalkElement{chars, WalkElement::Kind::Run});
+        } else {
+            for (int i = rep->getLB(); i < rep->getUB(); i++) out.push_back(WalkElement{chars, WalkElement::Kind::Optional});
+        }
+        return true;
+    }
+    return false;
+}
+
+//  The branches of a possessive walk (at most 16): one run, after which only
+//  sets.
+static bool walkBranches(const std::vector<WalkElement> & elements, std::vector<WalkBranch> & out) {
+    std::vector<WalkBranch> branches(1);
+    for (const WalkElement & e : elements) {
+        std::vector<WalkBranch> next;
+        for (WalkBranch b : branches) {
+            if (b.run) {
+                if (e.kind != WalkElement::Kind::Set) return false;
+                b.suffix.push_back(e.set);
+                next.push_back(b);
+            } else if (e.kind == WalkElement::Kind::Set) {
+                b.length++;
+                next.push_back(b);
+            } else if (e.kind == WalkElement::Kind::Strings) {
+                //  A string of each first character, that character alone (if in
+                //  the set), or another character.
+                UCD::UnicodeSet firsts;
+                for (const auto & p : e.pairs) {
+                    firsts.insert(p.first);
+                    WalkBranch pair = b;
+                    pair.in.emplace_back(b.length, UCD::UnicodeSet(p.first));
+                    pair.in.emplace_back(b.length + 1, p.second);
+                    pair.length += 2;
+                    next.push_back(pair);
+                    if (e.set.contains(p.first)) {
+                        WalkBranch alone = b;
+                        alone.in.emplace_back(b.length, UCD::UnicodeSet(p.first));
+                        alone.out.emplace_back(b.length + 1, p.second);
+                        alone.length++;
+                        next.push_back(alone);
+                    }
+                }
+                b.out.emplace_back(b.length, firsts);
+                b.length++;
+                next.push_back(b);
+            } else if (e.kind == WalkElement::Kind::Optional) {
+                WalkBranch taken = b;
+                taken.in.emplace_back(b.length, e.set);
+                taken.length++;
+                b.out.emplace_back(b.length, e.set);
+                next.push_back(taken);
+                next.push_back(b);
+            } else {
+                b.run = true;
+                b.runSet = e.set;
+                next.push_back(b);
+            }
+        }
+        if (next.size() > 16) return false;
+        branches = std::move(next);
+    }
+    for (const WalkBranch & b : branches) {
+        if (b.length == 0) return false;
+    }
+    out = std::move(branches);
+    return true;
+}
+
 static bool multipleCaptureMultipleReplacement(const ConversionRule * c, MultipleCaptureMultipleReplacement & rule,
                                                MultipleCaptureMultipleReplacementSet & set, CharSetAnalysis & sets,
                                                std::string & reason) {
@@ -514,8 +622,20 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
             endsUnique = !next.intersects(all);
         }
         if (!endsUnique) {
-            reason = "the starts of its matches cannot be told apart (a match may end within another)";
-            return false;
+            //  The starts found by the engine, selected by the lengths of their
+            //  possessive walks.
+            std::vector<WalkElement> elements;
+            bool walk = true;
+            for (const UCD::UnicodeSet & chars : first) elements.push_back(WalkElement{chars, WalkElement::Kind::Set});
+            for (size_t i = 0; i < k && walk; i++) {
+                walk = walkElements(captures[i]->getCapturedRE(), elements, sets);
+                for (const UCD::UnicodeSet & chars : texts[i + 1]) elements.push_back(WalkElement{chars, WalkElement::Kind::Set});
+            }
+            if (!walk || !walkBranches(elements, set.walkBranches)) {
+                reason = "the starts of its matches cannot be told apart (a match may end within another)";
+                return false;
+            }
+            set.walkStarts = true;
         }
     }
     //  The replacements at the boundaries.  A boundary i (at Ti) is at a fixed
@@ -628,7 +748,7 @@ static std::string captureReplacementKey(const MultipleCaptureMultipleReplacemen
         for (char32_t ch : br.replacement) key += " " + std::to_string(static_cast<unsigned>(ch));
         for (const UCD::UnicodeSet & chars : br.text) appendSet(key, chars);
     }
-    key += set.startsByFirst ? " first" : (set.singleCharacter ? " single" : " ends");
+    key += set.startsByFirst ? " first" : (set.singleCharacter ? " single" : (set.walkStarts ? " walk" : " ends"));
     if (set.reversed) {
         key += " swap" + std::to_string(set.swapLength) + "/" + std::to_string(set.swapDistance) + "/" + std::to_string(set.swapBefore);
     }
@@ -1729,9 +1849,23 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven) {
             }
         }
         if (step.jointSelection) step.captureSelection = true;
+        //  The starts of the sets selected by their walks (see walkStarts), found
+        //  by the engine; their matches are selected alone.
+        for (MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+            if (!set.walkStarts) continue;
+            bool supported = true;
+            for (const re::RE * c : set.captures) supported &= !unsupportedLookahead(c);
+            const bool possible = supported || greedyMatchesPossessive(set, sets);
+            set.greedyStarts = !supported;
+            if (possible) continue;
+            for (const MultipleCaptureMultipleReplacement & r : set.rules) {
+                plan.problems.push_back(printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but the starts of its "
+                                        "matches cannot be told apart (a match may end within another))");
+            }
+        }
         if (step.captureSelection) {
             for (MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
-                if (set.startsByFirst || set.singleCharacter) continue;
+                if (set.startsByFirst || set.singleCharacter || set.walkStarts) continue;
                 //  The starts found by the engine, with the captures in a lookahead.
                 bool supported = true;
                 for (const re::RE * c : set.captures) supported &= !unsupportedLookahead(c);

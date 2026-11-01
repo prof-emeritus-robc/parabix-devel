@@ -52,6 +52,18 @@ their captures as string rules, with their before contexts matched against
 the converted text (`a9e44f8d8`, `--update --only blt-blt_FONIPA am-am_FONIPA my-Zawgyi`):
 blt-blt_FONIPA is implementable (401).*
 
+*Update (November 1, 2026): the engine's possessive repetitions of sets with
+strings, taking the longest string (`2276cddd3`); after contexts repeating them
+checked against the engine's preconditions (`0e561c416`); the sets with strings
+of contexts taking their longest strings, backward in before contexts
+(`22d03949b`); and the test cases whose results are ICU's, where the test data
+disagrees, counted as discrepancies rather than failures (§3, `345b69bf1`), by an incremental
+update (`--update --only ka-ka_Latn/BGN my-my_FONIPA cy-cy_FONIPA`). No status
+changes (401); cy-cy_FONIPA's W10 problems go from 4 to 2 (it also needs W3).
+The 217 failing cases of ka-ka_Latn/BGN and my-my_FONIPA are discrepancies, and
+no test case fails. The other test files were not run again: their results
+are those of the earlier runs, with no failures (and so no discrepancies).*
+
 This report covers:
 
 - which transforms tconv implements, and how correct they are against the CLDR
@@ -252,7 +264,7 @@ the global filter `[:Greek:]`), the global filters `:: [a-z] ; :: Remove ;` and
 (`a > ae ; :: [ae] Remove ; e > E ;`, `:: [a-m] ; :: [aeiou] Remove ; [a-z] > X ;`)
 and an unfiltered Remove before NFC and after conversion rules; Any-Remove on
 its own gives empty output. Also with segment sizes 1 and 3, 3 threads, and
-`--EnableAsserts --VerifyIR` (one run aborted in the JIT, §3.2). The one
+`--EnableAsserts --VerifyIR`. The one
 difference is U+1D25C, which is `Mn` in the Unicode data of Parabix and
 unassigned in ICU 78.3; the comparisons are on the lines without the characters
 ICU treats as unassigned.
@@ -311,9 +323,7 @@ tconv's results are identical to them. Against ICU 78.3:
   (Greek and Vietnamese multiple accents, ǭ, the Sinhala and Kannada two-part
   vowels, Hangul jamo; 2,257 of them differ from NFC) identical, also with
   segment sizes 1 and 3 and 3 threads; with the filter `[^\u0302]`, identical to
-  `createFromRules`. With `--EnableAsserts --VerifyIR` the output is identical;
-  some runs that compile the pipeline afresh abort in the JIT ("Failed to
-  materialize symbols", §3.2), which runs from the object cache do not.
+  `createFromRules`. With `--EnableAsserts --VerifyIR` the output is identical.
 
 <!-- coverage:builtins-missing -->
 Not implemented: `Any-Name`, `Name-Any`, `Any-Hex/Plain`, `Hex-Any/Plain` and `Any-BreakInternal`.
@@ -526,14 +536,31 @@ segment sizes 1 to 3, 1 to 3 threads, and `-EnableAsserts -VerifyIR`.
 On 8 corrected transforms, the output is also identical with segment sizes 1 to
 3, 1 to 3 threads, and `-EnableAsserts -VerifyIR`.
 
-## 3. Correctness: known failures
+## 3. Correctness: known failures and discrepancies
 
-Two test files fail, where the test data disagrees with the rules and with ICU
-78.3:
+The test files with failing cases (tconv's result differs from the expected one
+and from ICU 78.3's):
 
-- ka-ka_Latn/BGN (215 of 682 cases): the test data expects `ʼ` (U+02BC) where the
-  rules give `’` (U+2019);
-- my-my_FONIPA (2 of 1,228): the expected results end with a space.
+<!-- coverage:failing-tests -->
+No test file fails.
+<!-- /coverage:failing-tests -->
+
+**Discrepancies.** A case whose expected result differs from tconv's, where
+tconv's is ICU's (the transform ICU 78.3 makes from the same rules, `tconv
+--use-ICU`, each case a text of its own), is a discrepancy, not a failure: the
+test data disagrees with the rules, tconv and ICU.
+
+<!-- coverage:discrepant-tests -->
+- ka-ka_Latn/BGN (ka-Latn-t-ka-m0-bgn-2009.txt: 215 of 682 cases)
+- my-my_FONIPA (my-fonipa-t-my.txt: 2 of 1228 cases)
+<!-- /coverage:discrepant-tests -->
+
+- ka-ka_Latn/BGN: the test data expects `ʼ` (U+02BC) where the rules give `’`
+  (U+2019);
+- my-my_FONIPA: the expected results end with a space.
+
+(Both were reported as failures before the discrepancies were told apart, at
+`a9e44f8d8`.)
 
 Each line of the test data is a separate text. `tconv_coverage.py` runs all the
 cases of a file as one text, one per line, and then runs the cases that fail
@@ -656,34 +683,9 @@ correction, between 108 and 1,853 of each 5,000 differ.
 
 ### 3.2 Robustness
 
-- **Unexplained crash.** In one of the full regression runs, tconv crashed once
-  (exit 139) on Spacedhan-Han with the mixed corpus, while four transforms ran
-  in parallel. It was not reproduced in about 230 further runs:
-  - sequential runs;
-  - concurrent cold starts sharing a cache salt;
-  - runs under compile load.
-- **Reading past the end of the text.** The fused kernels assume that a
-  `Lookahead` past the end of the text reads zeros. They read the character
-  classes and a stream of the text positions (`TextPositions`) with lookahead.
-  Existing Pablo kernels such as `Misorder_Check` make the same assumption, and
-  no test showed a difference at text endings. However, the pipeline's guarantee
-  of this has not been confirmed.
-- **NFC memory bounds** (fixed). With `--EnableAsserts`, the direct pipeline of
-  Any-NFC failed a memory bounds assertion in `NFC_CandidateClass`: the
-  provisional stride of a kernel with lookahead read a block past the end of
-  its input buffer when the producer, not itself a provisional stride kernel,
-  had filled it (`81816aedb`). A second assertion, in the `elemMerge` of the
-  output, came from the count of the partial sums of a terminated popcount
-  kernel (`61225fd63`). Both are fixed on master, merged here.
-- **JIT.** Some runs that compile a pipeline afresh (not from the object cache)
-  abort with "LLVM ERROR: Failed to materialize symbols" (seen with Any-FCC and
-  `--EnableAsserts`, about 1 run in 3), or with a JIT session error, a
-  relocation out of range of a `Page21` fixup in `SingletonCanonicalization`
-  (seen once with `:: NFD ; :: [:Mn:] Remove ; :: NFC ;` and `--EnableAsserts`);
-  not investigated.
-- **JIT failures of fresh compilations** are more frequent with the larger
-  pipelines: NumericPinyin-Latin's first compilation aborts in 2 of 3 runs with
-  the `Page21` relocation error; runs from the object cache do not.
+The limitations of tconv itself (not of the regular expression engine or the
+Parabix pipeline framework on which it runs):
+
 - **Jpan-Latn compiles slowly.** Its pipeline, with the deferred rules of
   Kana-Latn twice (also through Hira-Latn), compiles only since the positions
   of the deferred rules are inserted once (`edbf0b88f`) and its planning no
@@ -1196,7 +1198,14 @@ it (`1230cb8e4`; `($L) ːwaː` of am_FONIPA-am).
   and intersections of sets (`[$vowel-[aeAE]]` lost `{ü}`), and the engine
   resolves a possessive repetition as PCRE does, taking the first alternative:
   the alternatives are now ordered longest first, as ICU matches the longest
-  string of a set.
+  string of a set.  (Since `2276cddd3`, the engine takes the longest string
+  itself, and `0e561c416` removed the ordering.)  Contexts did not take the longest string of a set with
+  strings that was not repeated, nor, in before contexts, of a repeated one
+  (taken from the right): a string's proper prefix (after) or suffix (before)
+  in the set could match instead (`a [{ab} b] { c` matched `abc`). They now do,
+  with the set made unambiguous outward from the text, `w (?!t')` or `(?<!t')
+  w`, in the engine's patterns and in the fused kernels (`22d03949b`,
+  `QA/tconv_context_strings_test.py`).
 - The pipeline compiler enumerated every combination of the roots of its
   partitions (exponential in their number): NumericPinyin-Latin's pipeline
   spent over 10 minutes there. Beyond 4,096 combinations it now chooses each
@@ -1381,10 +1390,19 @@ does not match. Both transforms also need W3 and W6.
 
 **W10 engine lookaheads.** cy-cy_FONIPA's after contexts `$cons* $end` repeat
 `$cons`, a set with strings (`{m̥}{d͡ʒ}`). ICU matches it possessively, taking
-the longest string at each step; the regular expression engine supports the
-greedy form but not a possessive repetition of alternatives inside a lookahead
-(the possessive form adds negative lookaheads within it), and the greedy form
-differs (`yw } $cons* [^bdm$]` on `ywm̥`). cy-cy_FONIPA also needs W3.
+the longest string at each step, which the greedy form does not
+(`yw } $cons* [^bdm$]` on `ywm̥`). The regular expression engine now resolves
+such a repetition as ICU does (`2276cddd3`: the strings of the set made
+unambiguous, the longest taken), and tconv checks the engine's preconditions
+on the lookaheads that a rule's pipeline builds (`0e561c416`): the `yw` string
+rules of cy-cy_FONIPA are planned, and QA/tconv_possessive_lookahead_test.py
+checks such rules against ICU. The engine does not support these forms in a
+lookahead of variable length without a unique prefix: the `y { } $cons* …`
+single-character rules (whose after contexts are matched alone, as
+lookaheads) and the MultipleCaptureMultipleReplacement rules (whose starts are
+found by lookaheads of their captures and after contexts) remain W10, where
+the greedy form of the captures is used only if it gives the same matches.
+cy-cy_FONIPA also needs W3.
 
 **W7.**
 
@@ -1432,7 +1450,6 @@ The per-transform table lists the problem classes of every transform.
 6. **Built-ins and pipeline size.**
    - Built-ins: `Any-Name` and `Name-Any`, and
      `Any-BreakInternal` for Thai-Latn.
-   - The JIT failures of fresh compilations (§3.2).
    - Pipeline size: a single-kernel sort network, or sharing normalizations
      between steps.
 
@@ -1506,6 +1523,7 @@ tconv on every implementable transform.
 | `75e82e277`, `00bea45f0` | MultipleCaptureMultipleReplacement matches selected by their walks; their sets within the filter: byn_Latn-byn_Ethi/Xaleget, my-Zawgyi: 398 |
 | `11eb18fd0` | captures of fixed strings as strings, sets with strings by walks: Latin-NumericPinyin, Latn-Bopo: 400 |
 | `a9e44f8d8` | rules keeping the characters of their captures as string rules (converted before contexts); captures moved at the end; possessive optional items: blt-blt_FONIPA: 401 |
+| `0e561c416`, `22d03949b`, `345b69bf1` | possessive sets with strings in after contexts checked by the engine; sets with strings in contexts taking their longest strings; test cases with ICU's results counted as discrepancies (217): 401 |
 
 ## Reproducing
 
@@ -1531,6 +1549,10 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
   64 GB; a full run takes about 35 minutes, mostly rerunning failing cases per
   line.)
 - When comparing tconv versions, give each run its own `-object-cache-salt`.
+- **Interrupted runs.** The results of each transform (plan, kernel counts,
+  test files) are saved as they are computed, in `<out>/progress.jsonl`; running
+  the same command again (with the same tconv binary, directories and selection)
+  resumes the run, computing only the rest. `--no-resume` starts it afresh.
 - **Kernel counts.** Each transform's `tconv --kernel-counts` output is kept in
   `kernels/`, and gives the groups, rules, group kernels and kernels columns of
   the per-transform table. With `--update`, the kernels of the transforms
@@ -1551,7 +1573,7 @@ python3 tools/ldml/tconv_coverage.py --tconv build/bin/tconv \
   table (with `--note` and `--cldr-note` for its header), and
   `--report-doc doc/ldml-tconv-coverage.md` the blocks of this report between
   `<!-- coverage:NAME -->` markers (summary, chart, builtins-missing,
-  work-items); the rest of the report is edited by hand, from `changes.md`. For
+  work-items, failing-tests, discrepant-tests); the rest of the report is edited by hand, from `changes.md`. For
   Any-FCD and Any-FCC:
 
   ```

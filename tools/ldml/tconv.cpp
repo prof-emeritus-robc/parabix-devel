@@ -38,8 +38,25 @@
 //      filters (:: [set] ;) and filtered transform rules (:: [set] ID ;):
 //      the filter is computed once, as a mask of the positions of the text
 //      where the transform may change characters (see RulePipelineBuilder).
-//  Any other known name is reported with its canonical name as not yet
-//  implemented.
+//  Any other known name is applied by ICU (if tconv is built with it, see
+//  tools/ldml/CMakeLists.txt), or with --use-ICU=0 reported with its canonical
+//  name as not yet implemented.
+//
+//  --use-ICU=0|<regex>: the transforms applied by ICU (tools/ldml/
+//  icu_transform.cpp).  With a regular expression, the transform given, and the
+//  transforms that its rules invoke (:: X ;), are applied by ICU where their
+//  names (canonical, alias, or as given) match it; by default (and with a
+//  regular expression), so are those tconv does not implement; with 0, none.
+//  ICU makes a transform from the rules of its CLDR file, as tconv reads them,
+//  with the transforms its rules invoke from their files too (registered with
+//  ICU under the names by which they are invoked), and a built-in transform is
+//  ICU's own.  A transform whose own rules tconv implements, but not all the
+//  transforms they invoke, is applied in stages: the runs of its steps by tconv
+//  pipelines, the transforms invoked by ICU, each on the output of the one
+//  before (through temporary files), on each run of the text within the
+//  transform's filter (as ICU applies all its steps to each run).  (Only the
+//  transforms invoked directly are applied in stages: one that invokes another
+//  not implemented is applied by ICU as a whole.)
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -97,6 +114,10 @@
 #include <ucd/data/PropertyObjects.h>
 #include <ucd/algo/normalization.h>
 #include <ucd/data/PropertyObjectTable.h>
+#include "icu_transform.h"
+#include <regex>
+#include <functional>
+#include <optional>
 
 using namespace kernel;
 using namespace llvm;
@@ -131,6 +152,10 @@ static cl::opt<bool> ShowPlan("plan", cl::desc("Report how the transform would b
 static cl::opt<unsigned> MuxClassKernels("mux-class-kernels",
     cl::desc("The number of kernels computing the classes of multiplexed mapping numbers (0: with the other classes)"),
     cl::init(3), cl::cat(TconvOptions), cl::Hidden);
+static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied by ICU (if tconv is built with it): 0 for none, or "
+                                   "a regular expression matching the names of transforms (the transform given, and those its rules "
+                                   "invoke); the transforms tconv does not implement are applied by ICU, unless 0"),
+                                   cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
                            cl::init(false), cl::cat(TconvOptions));
 static cl::opt<bool> DisableCaptureSimplification("disable-capture-simplification",
@@ -7627,7 +7652,7 @@ static TransformFunctionType generateRulePipelineFromAnalysis(CPUDriver & driver
 //  Applies a transform function to the input: the whole text, or with --lines,
 //  each line as a text of its own (given through a pipe), followed by its line
 //  break.
-static void applyToInput(TransformFunctionType fn, int fd) {
+static void applyToInput(const std::function<void (int)> & fn, int fd) {
     if (!Lines) {
         fn(fd);
         return;
@@ -7658,6 +7683,193 @@ static void applyToInput(TransformFunctionType fn, int fd) {
         if (write(STDOUT_FILENO, "\n", 1) != 1) exit(1);
         pos = nl + 1;
     }
+}
+
+//  The transforms applied by ICU (see --use-ICU): those whose names match the
+//  pattern, and (unless --use-ICU=0) those that tconv does not implement.
+struct ICUPolicy {
+    bool off = false;
+    std::optional<std::regex> pattern;
+    //  (Throws std::regex_error for a pattern that is not a regular expression.)
+    ICUPolicy() {
+        if (UseICU == "0") {
+            off = true;
+        } else if (!UseICU.empty()) {
+            pattern.emplace(UseICU.getValue(), std::regex::ECMAScript);
+        }
+    }
+    //  Whether a transform (by the name given, or its entry, if any) is applied by ICU by its name.
+    bool selected(const ldml::TransformEntry * e, const std::string & name) const {
+        if (!pattern) return false;
+        if (std::regex_match(name, *pattern)) return true;
+        if (e == nullptr) return false;
+        if (std::regex_match(e->canonicalName, *pattern)) return true;
+        for (const std::string & alias : e->aliases) {
+            if (std::regex_match(alias, *pattern)) return true;
+        }
+        return false;
+    }
+};
+
+//  The problems of a transform other than those of the transforms its rules
+//  invoke (which ICU may then apply).
+static std::vector<std::string> ownProblems(const TransformAnalysis & a) {
+    std::vector<std::string> own;
+    for (const std::string & p : a.problems) {
+        if (p.compare(0, 24, "unimplemented transform ") != 0 && p.compare(0, 18, "unknown transform ") != 0) own.push_back(p);
+    }
+    return own;
+}
+
+//  The tRule text of a transform defined by a CLDR file.
+static std::string ruleText(const ldml::TransformEntry * e) {
+    std::string text;
+    for (const std::string & part : ldml::extractTRules(readFile(e->file))) text += part + "\n";
+    return text;
+}
+
+//  Registers with ICU the transforms defined by CLDR files that the rules of a
+//  transform invoke (and those that theirs invoke), under the names by which
+//  they are invoked, so that ICU applies those of the transforms directory.
+static void registerInvokedWithICU(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                   const ldml::TransformEntry * entry) {
+    static std::set<std::string> registered;
+    for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
+        if (step.kind != ldml::TransformStep::Kind::Transform) continue;
+        const std::string id = step.transform.getText();
+        const ldml::TransformEntry * used = registry.lookup(id);
+        if (used == nullptr || used->isBuiltIn() || !registered.insert(id).second) continue;
+        registerInvokedWithICU(registry, analyzer, used);
+        std::string error;
+        //  (If ICU cannot make it, its own transform of that name applies.)
+        tconv::ICUTransform::registerRules(id, ruleText(used), used->direction == ldml::TransformDirection::Backward, error);
+    }
+}
+
+//  The ICU transform of a transform (by its entry, or else the name given),
+//  restricted to a filter (if any), or nullptr and the reason.
+static std::shared_ptr<tconv::ICUTransform> icuTransform(const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer,
+                                                         const std::string & name, const ldml::TransformEntry * entry,
+                                                         const UCD::UnicodeSet * filter, std::string & error) {
+    std::vector<std::pair<uint32_t, uint32_t>> ranges;
+    if (filter) {
+        for (const auto & r : *filter) ranges.emplace_back(r.first, r.second);
+    }
+    const auto * f = filter ? &ranges : nullptr;
+    if (entry == nullptr || entry->isBuiltIn()) return tconv::ICUTransform::fromName(entry ? entry->canonicalName : name, f, error);
+    registerInvokedWithICU(registry, analyzer, entry);
+    return tconv::ICUTransform::fromRules(entry->canonicalName, ruleText(entry), entry->direction == ldml::TransformDirection::Backward,
+                                          f, error);
+}
+
+//  A transform applied to the text of a file descriptor, written to the
+//  standard output.
+using Runner = std::function<void (int)>;
+
+static std::string readAll(int fd) {
+    std::string text;
+    char buffer[1 << 16];
+    for (ssize_t n; (n = read(fd, buffer, sizeof(buffer))) > 0; ) text.append(buffer, static_cast<size_t>(n));
+    return text;
+}
+
+static void writeAll(int fd, const std::string & text) {
+    for (size_t i = 0; i < text.size(); ) {
+        const ssize_t n = write(fd, text.data() + i, text.size() - i);
+        if (n <= 0) exit(1);
+        i += static_cast<size_t>(n);
+    }
+}
+
+static Runner icuRunner(std::shared_ptr<tconv::ICUTransform> t) {
+    return [t](int fd) {writeAll(STDOUT_FILENO, t->apply(readAll(fd)));};
+}
+
+//  A temporary file (removed when closed).
+static int temporaryFile() {
+    const char * dir = getenv("TMPDIR");
+    std::string path = std::string(dir && *dir ? dir : "/tmp") + "/tconvXXXXXX";
+    const int fd = mkstemp(path.data());
+    if (fd == -1) {
+        llvm::errs() << "Error: cannot create a temporary file.\n";
+        exit(1);
+    }
+    unlink(path.c_str());
+    return fd;
+}
+
+//  A runner applied to a text, its output as a string.
+static std::string runOn(const Runner & runner, const std::string & text) {
+    const int in = temporaryFile(), out = temporaryFile();
+    writeAll(in, text);
+    lseek(in, 0, SEEK_SET);
+    fflush(stdout);
+    const int saved = dup(STDOUT_FILENO);
+    dup2(out, STDOUT_FILENO);
+    runner(in);
+    fflush(stdout);
+    dup2(saved, STDOUT_FILENO);
+    close(saved);
+    close(in);
+    lseek(out, 0, SEEK_SET);
+    std::string result = readAll(out);
+    close(out);
+    return result;
+}
+
+//  A runner applied to the runs of the characters within a filter (the global
+//  filter of a transform: ICU applies all its steps to each run of its text,
+//  and leaves the other characters), the others copied.
+static Runner filteredRunner(Runner inner, const UCD::UnicodeSet & filter) {
+    return [inner, filter](int fd) {
+        const std::string text = readAll(fd);
+        std::string out, run;
+        size_t i = 0;
+        while (i < text.size()) {
+            //  The next character (UTF-8; invalid bytes as they are, outside the filter).
+            const unsigned char b = static_cast<unsigned char>(text[i]);
+            size_t n = b < 0x80 ? 1 : (b >> 5) == 6 ? 2 : (b >> 4) == 14 ? 3 : (b >> 3) == 30 ? 4 : 1;
+            if (i + n > text.size()) n = 1;
+            UCD::codepoint_t cp = n == 1 ? b : (b & (0x7F >> n));
+            for (size_t k = 1; k < n; k++) cp = (cp << 6) | (static_cast<unsigned char>(text[i + k]) & 0x3F);
+            if (filter.contains(cp) && !(n == 1 && b >= 0x80)) {
+                run.append(text, i, n);
+            } else {
+                if (!run.empty()) out += runOn(inner, run);
+                run.clear();
+                out.append(text, i, n);
+            }
+            i += n;
+        }
+        if (!run.empty()) out += runOn(inner, run);
+        writeAll(STDOUT_FILENO, out);
+    };
+}
+
+//  The stages applied in turn, each to the output of the one before (in a
+//  temporary file), the last writing to the standard output.
+static Runner stagedRunner(std::vector<Runner> stages) {
+    return [stages](int fd) {
+        int in = fd;
+        for (size_t i = 0; i < stages.size(); i++) {
+            if (i + 1 == stages.size()) {
+                stages[i](in);
+                break;
+            }
+            const int out = temporaryFile();
+            fflush(stdout);
+            const int saved = dup(STDOUT_FILENO);
+            dup2(out, STDOUT_FILENO);
+            stages[i](in);
+            fflush(stdout);
+            dup2(saved, STDOUT_FILENO);
+            close(saved);
+            lseek(out, 0, SEEK_SET);
+            if (in != fd) close(in);
+            in = out;
+        }
+        if (in != fd) close(in);
+    };
 }
 
 int main(int argc, char *argv[]) {
@@ -7708,13 +7920,30 @@ int main(int argc, char *argv[]) {
             printPlan("rules file " + RulesFile, a);
             return a.implementable ? 0 : 2;
         }
-        if (!a.implementable) {
+        //  Not implementable: applied by ICU (unless --use-ICU=0).
+        if (!a.implementable && (UseICU == "0" || !tconv::ICUTransform::available())) {
             llvm::errs() << "Rules file " << RulesFile << " is not implementable";
             if (!a.problems.empty()) {
                 llvm::errs() << ": " << a.problems.size() << " problems (see --plan), e.g.\n  " << a.problems.front();
             }
             llvm::errs() << "\n";
             return 2;
+        }
+        if (!a.implementable) {
+            std::string error;
+            std::shared_ptr<tconv::ICUTransform> t = tconv::ICUTransform::fromRules("tconv-rules", readFile(RulesFile), false, nullptr, error);
+            if (!t) {
+                llvm::errs() << "Error: " << error << "\n";
+                return 2;
+            }
+            const int fd = open(inputFile.c_str(), O_RDONLY);
+            if (LLVM_UNLIKELY(fd == -1)) {
+                llvm::errs() << "Error: cannot open " << inputFile << " for processing.\n";
+                return 1;
+            }
+            applyToInput(icuRunner(t), fd);
+            close(fd);
+            return 0;
         }
         const int fd = open(inputFile.c_str(), O_RDONLY);
         if (LLVM_UNLIKELY(fd == -1)) {
@@ -7723,7 +7952,7 @@ int main(int argc, char *argv[]) {
         }
         CPUDriver driver("tconv");
         TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, a);
-        applyToInput(fn, fd);
+        applyToInput([fn](int in) {fn(static_cast<uint32_t>(in));}, fd);
         close(fd);
         return 0;
     }
@@ -7759,17 +7988,46 @@ int main(int argc, char *argv[]) {
     auto impl = std::find_if(implementedTransforms.begin(), implementedTransforms.end(),
                              [&](const std::pair<std::string, Transform> & p) {return p.first == entry->canonicalName;});
     TransformAnalyzer analyzer(registry);
-    if (impl == implementedTransforms.end() && !analyzer.analyze(entry).implementable) {
+    std::optional<ICUPolicy> icu;
+    try {
+        icu.emplace();
+    } catch (const std::regex_error & e) {
+        llvm::errs() << "Error: --use-ICU=" << UseICU << " is not a regular expression: " << e.what() << "\n";
+        return 1;
+    }
+    auto notImplemented = [&](const std::string & why) {
         llvm::errs() << "Transform " << TransformName << " (canonical name " << entry->canonicalName
                      << (entry->isBuiltIn() ? ", built-in" : ", defined in " + entry->file)
-                     << ") is known but not yet implemented";
+                     << ") is known but not yet implemented" << why;
         const TransformAnalysis & a = analyzer.analyze(entry);
         if (!a.problems.empty()) {
             llvm::errs() << ": " << a.problems.size() << " problems (see --plan), e.g.\n  " << a.problems.front();
         }
         llvm::errs() << "\n";
         return 2;
+    };
+    //  The transform applied by ICU (see --use-ICU): all of it, by its name or
+    //  as tconv does not implement its own rules, or only the transforms its
+    //  rules invoke that ICU applies (in stages with the rest).
+    const bool implemented = impl != implementedTransforms.end() || analyzer.analyze(entry).implementable;
+    bool wholeICU = icu->selected(entry, TransformName);
+    if (!wholeICU && !implemented && (entry->isBuiltIn() || !ownProblems(analyzer.analyze(entry)).empty())) {
+        if (icu->off) return notImplemented("");
+        wholeICU = true;
     }
+    auto byICU = [&](const ldml::TransformStep & step) {
+        const std::string id = step.transform.getText();
+        const ldml::TransformEntry * used = registry.lookup(id);
+        return icu->selected(used, id) || (!icu->off && (used == nullptr || !analyzer.analyze(used).implementable));
+    };
+    bool staged = false;
+    if (!wholeICU && !entry->isBuiltIn()) {
+        for (const ldml::TransformStep & step : analyzer.analyze(entry).plan.steps) {
+            staged |= step.kind == ldml::TransformStep::Kind::Transform && byICU(step);
+        }
+        if (!staged && !implemented) return notImplemented("");
+    }
+    if ((wholeICU || staged) && !tconv::ICUTransform::available()) return notImplemented(" (and tconv was built without ICU)");
 
     const int fd = open(InputFile.c_str(), O_RDONLY);
     if (LLVM_UNLIKELY(fd == -1)) {
@@ -7777,6 +8035,60 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     CPUDriver driver("tconv");
+    if (wholeICU) {
+        std::string error;
+        std::shared_ptr<tconv::ICUTransform> t = icuTransform(registry, analyzer, TransformName, entry, nullptr, error);
+        if (!t) {
+            llvm::errs() << "Error: " << error << "\n";
+            return 2;
+        }
+        applyToInput(icuRunner(t), fd);
+        close(fd);
+        return 0;
+    }
+    if (staged) {
+        //  The steps of the transform: the runs of those tconv applies (as a plan
+        //  of those steps), and each of the transforms ICU applies (with the
+        //  filter of the step), on each run of the text within the filter of the
+        //  transform (if any; see filteredRunner).
+        const TransformAnalysis & a = analyzer.analyze(entry);
+        std::vector<Runner> stages;
+        std::vector<ldml::TransformStep> run;
+        auto endRun = [&]() {
+            if (run.empty()) return;
+            TransformAnalysis part = a;
+            part.plan.steps = run;
+            part.plan.filter = nullptr;
+            part.problems.clear();
+            part.plan.problems.clear();
+            part.implementable = true;
+            const TransformFunctionType fn = generateRulePipelineFromAnalysis(driver, registry, analyzer, part);
+            stages.push_back([fn](int in) {fn(static_cast<uint32_t>(in));});
+            run.clear();
+        };
+        for (const ldml::TransformStep & step : a.plan.steps) {
+            if (step.kind != ldml::TransformStep::Kind::Transform || !byICU(step)) {
+                run.push_back(step);
+                continue;
+            }
+            endRun();
+            std::optional<UCD::UnicodeSet> filter;
+            if (step.filter) filter = step.filterSet;
+            std::string error;
+            const std::string id = step.transform.getText();
+            std::shared_ptr<tconv::ICUTransform> t = icuTransform(registry, analyzer, id, registry.lookup(id), filter ? &*filter : nullptr, error);
+            if (!t) {
+                llvm::errs() << "Error: " << error << "\n";
+                return 2;
+            }
+            stages.push_back(icuRunner(t));
+        }
+        endRun();
+        const Runner runner = stagedRunner(stages);
+        applyToInput(a.plan.filter ? filteredRunner(runner, a.plan.filterSet) : runner, fd);
+        close(fd);
+        return 0;
+    }
     //  Lowercasing needs the Final_Sigma context, and titlecasing word
     //  boundaries, provided by the rule pipeline.
     const bool direct = impl != implementedTransforms.end() && impl->second != Transform::Lower
@@ -7788,7 +8100,7 @@ int main(int argc, char *argv[]) {
                         && impl->second != Transform::Remove;
     TransformFunctionType fn = direct ? generatePipeline(driver, impl->second)
                                       : generateRulePipeline(driver, registry, analyzer, entry);
-    applyToInput(fn, fd);
+    applyToInput([fn](int in) {fn(static_cast<uint32_t>(in));}, fd);
     close(fd);
     return 0;
 }

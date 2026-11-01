@@ -6,6 +6,7 @@
 #
 #  tconv_coverage.py --tconv <tconv binary> --transforms-dir <CLDR common/transforms>
 #                    [--test-data <CLDR common/testData/transforms>] [--jobs N]
+#                    [--tconv-threads N]
 #                    [--out <directory>]
 #
 #  Runs tconv --plan on every transform tconv knows (built-in and defined by
@@ -13,7 +14,10 @@
 #  needed to implement them, and propagates the classes through the transform
 #  rules (:: X) that invoke other transforms.  With --test-data, each CLDR test
 #  file of an implementable transform is run through tconv and compared with
-#  its expected results.
+#  its expected results.  A case whose result differs from the expected one
+#  but is ICU's (tconv --use-ICU, the transform made by ICU from the same
+#  rules) is a discrepancy, where the test data disagrees with the rules, tconv
+#  and ICU, not a failure.
 #
 #  Writes to the output directory (default ./tconv-coverage):
 #      plans/<name>.txt     the --plan output of each transform ('/' as '%')
@@ -50,16 +54,24 @@
 #
 #  Transforms whose analysis exceeds the memory available are reported as
 #  "analysis failed".
+#
+#  Interrupted runs: the results of each transform (its plan, kernel counts and
+#  test files) are saved as they are computed, in <out>/progress.jsonl; run again
+#  with the same arguments (and the same tconv binary), a run interrupted takes
+#  them from there and computes only the rest (see Progress).  --no-resume starts
+#  it afresh.
 
 import argparse
 import collections
 import concurrent.futures
 import datetime
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 
 #  Work items: the problem classes of tconv --plan, grouped by the kind of
 #  work needed in tconv / the Parabix framework (see doc/ldml-tconv-coverage.md).
@@ -87,12 +99,92 @@ WORK_ITEMS = collections.OrderedDict([
 CLASS_TO_ITEM = {c: w for w, cs in WORK_ITEMS.items() for c in cs}
 
 
+#  The results of a run as they are computed (plans, kernel counts, test files),
+#  appended to <out>/progress.jsonl, so that a run interrupted (by a reboot, or
+#  killed) does not compute them again: run again with the same arguments, it
+#  takes them from the file and computes only the others.  The first line of the
+#  file identifies the run (the tconv binary by its digest, the directories and
+#  the selection), and the results are used only by a run that it identifies
+#  the same way (otherwise, or with --no-resume, the file is started afresh).
+#  The file is removed once the run's results are written.
+class Progress:
+    def __init__(self, args):
+        self.path = os.path.join(args.out, 'progress.jsonl')
+        digest = hashlib.sha256()
+        with open(args.tconv, 'rb') as f:
+            for block in iter(lambda: f.read(1 << 20), b''):
+                digest.update(block)
+        self.header = dict(tconv=digest.hexdigest(), transforms_dir=os.path.abspath(args.transforms_dir),
+                           test_data=args.test_data and os.path.abspath(args.test_data), update=args.update,
+                           only=args.only, builtins=args.builtins, blocked=args.blocked,
+                           kernel_counts=not args.no_kernel_counts)
+        self.records = {}
+        self.lock = threading.Lock()
+        lines = []
+        if not args.no_resume and os.path.exists(self.path):
+            with open(self.path, encoding='utf-8') as f:
+                lines = f.read().split('\n')
+            try:
+                same = json.loads(lines[0]) == self.header
+            except ValueError:
+                same = False
+            if not same:
+                print('tconv_coverage.py: %s is of another run (tconv, directories or selection): started afresh'
+                      % self.path, file=sys.stderr)
+                lines = []
+        for line in lines[1:]:
+            try:
+                r = json.loads(line)
+            except ValueError:      # (the last line, if the run was interrupted while writing it)
+                continue
+            self.records[self.key(r['phase'], r['name'], r.get('file'))] = r['value']
+        if self.records:
+            phases = collections.Counter(k[0] for k in self.records)
+            print('tconv_coverage.py: resuming from %s: %s' % (self.path, ', '.join(
+                '%d %s' % (phases[p], p) for p in ('plan', 'kernels', 'test') if phases[p])), file=sys.stderr)
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(self.header) + '\n')
+            for (phase, name, test), value in self.records.items():
+                f.write(json.dumps(dict(phase=phase, name=name, file=test, value=value), ensure_ascii=False) + '\n')
+
+    @staticmethod
+    def key(phase, name, test=None):
+        return (phase, name, test)
+
+    def get(self, phase, name, test=None):
+        return self.records.get(self.key(phase, name, test))
+
+    def has(self, phase, name, test=None):
+        return self.key(phase, name, test) in self.records
+
+    def put(self, phase, name, value, test=None):
+        with self.lock:
+            self.records[self.key(phase, name, test)] = value
+            with open(self.path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(dict(phase=phase, name=name, file=test, value=value), ensure_ascii=False) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+
+    def finish(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+
+#  The tconv command (with --tconv-threads, at most that many threads for the
+#  pipelines and for their compilation).
+def tconv_command(args):
+    command = [args.tconv, '--transforms-dir=' + args.transforms_dir]
+    if args.tconv_threads:
+        command += ['--thread-num=%d' % args.tconv_threads, '--compile-threads=%d' % args.tconv_threads]
+    return command
+
+
 def file_name(name):
     return name.replace('/', '%') + '.txt'
 
 
 def list_transforms(args):
-    out = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, '--list-transforms'],
+    out = subprocess.run(tconv_command(args) + ['--list-transforms'],
                          capture_output=True, text=True, check=True).stdout
     entries = collections.OrderedDict()
     for line in out.splitlines():
@@ -165,14 +257,18 @@ def run_plans(args, entries, names):
     os.makedirs(plans, exist_ok=True)
 
     def run(name):
+        path = os.path.join(plans, file_name(name))
+        if args.progress.has('plan', name) and os.path.exists(path):
+            return name, args.progress.get('plan', name)
         try:
-            r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, '--plan', name],
+            r = subprocess.run(tconv_command(args) + ['--plan', name],
                                capture_output=True, timeout=args.timeout)
             text, rc = (r.stdout + r.stderr).decode('utf-8', 'replace'), r.returncode
         except subprocess.TimeoutExpired:
             text, rc = 'timeout\n', None
-        with open(os.path.join(plans, file_name(name)), 'w', encoding='utf-8') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(text)
+        args.progress.put('plan', name, rc)
         return name, rc
 
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
@@ -186,15 +282,20 @@ def run_kernel_counts(args, entries, names):
     os.makedirs(kernels, exist_ok=True)
 
     def run(name):
+        path = os.path.join(kernels, file_name(name))
+        if args.progress.has('kernels', name) and os.path.exists(path):
+            return name, args.progress.get('kernels', name)
         try:
-            r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, '--kernel-counts', name],
+            r = subprocess.run(tconv_command(args) + ['--kernel-counts', name],
                                capture_output=True, timeout=args.timeout)
             text = (r.stdout + r.stderr).decode('utf-8', 'replace')
         except subprocess.TimeoutExpired:
             text = 'timeout\n'
-        with open(os.path.join(kernels, file_name(name)), 'w', encoding='utf-8') as f:
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(text)
-        return name, parse_kernel_counts(text)
+        counts = parse_kernel_counts(text)
+        args.progress.put('kernels', name, counts)
+        return name, counts
 
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
         for name, counts in ex.map(run, names):
@@ -432,19 +533,24 @@ def run_tests(args, entries, names=None, previous=None):
             if old is not None:
                 e.setdefault('test_results', {})[f] = old
                 continue
+        if args.progress.has('test', name, f):
+            e.setdefault('test_results', {})[f] = args.progress.get('test', name, f)
+            continue
         with open(os.path.join(args.test_data, f), encoding='utf-8') as t:
             pairs = [l.rstrip('\n').split('\t') for l in t if '\t' in l and not l.startswith('#')]
         src = os.path.join(tests, f)
         with open(src, 'w', encoding='utf-8') as t:
             t.write(''.join(p[0] + '\n' for p in pairs))
         try:
-            r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, name, src],
+            r = subprocess.run(tconv_command(args) + [name, src],
                                capture_output=True, timeout=args.timeout)
         except subprocess.TimeoutExpired:
             e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(pairs), timeout=True)
+            args.progress.put('test', name, e['test_results'][f], f)
             continue
         out = r.stdout.decode('utf-8', 'replace').split('\n')
         failing = [i for i, p in enumerate(pairs) if i >= len(out) or out[i] != p[1]]
+        results = {i: out[i] if i < len(out) else None for i in failing}
         # Each case is a text of its own: in the text of all the cases, one per
         # line, a context may see the line break instead of the text boundary.
         # The failing cases are run again, each as a text (tconv --lines, which
@@ -454,13 +560,45 @@ def run_tests(args, entries, names=None, previous=None):
             with open(retry, 'w', encoding='utf-8') as t:
                 t.write(''.join(pairs[i][0] + '\n' for i in failing))
             try:
-                r = subprocess.run([args.tconv, '--transforms-dir=' + args.transforms_dir, '--lines', name, retry],
+                r = subprocess.run(tconv_command(args) + ['--lines', name, retry],
                                    capture_output=True, timeout=args.timeout)
                 out = r.stdout.decode('utf-8', 'replace').split('\n')
-                failing = [i for k, i in enumerate(failing) if k >= len(out) or out[k] != pairs[i][1]]
+                results = {i: out[k] if k < len(out) else None for k, i in enumerate(failing)}
+                failing = [i for i in failing if results[i] != pairs[i][1]]
             except subprocess.TimeoutExpired:
                 pass
-        e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(failing))
+        # A case that fails where tconv gives ICU's result (the transform made
+        # by ICU from the same rules, tconv --use-ICU) is a discrepancy: the
+        # test data disagrees with the rules, tconv and ICU.
+        discrepant = discrepancies(args, name, src, pairs, failing, results)
+        e.setdefault('test_results', {})[f] = dict(total=len(pairs), failed=len(failing) - len(discrepant),
+                                                   discrepant=len(discrepant))
+        args.progress.put('test', name, e['test_results'][f], f)
+
+
+#  The failing cases (indexes in pairs) whose results by tconv (results) are
+#  ICU's, each case run as a text (tconv --use-ICU --lines); none if tconv is
+#  built without ICU.
+def discrepancies(args, name, src, pairs, failing, results):
+    if not failing:
+        return []
+    cases = src + '.icu'
+    with open(cases, 'w', encoding='utf-8') as t:
+        t.write(''.join(pairs[i][0] + '\n' for i in failing))
+    try:
+        r = subprocess.run(tconv_command(args) + ['--use-ICU=.*', '--lines', name, cases],
+                           capture_output=True, timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        return []
+    if r.returncode != 0:
+        return []
+    out = r.stdout.decode('utf-8', 'replace').split('\n')
+    return [i for k, i in enumerate(failing) if k < len(out) and results.get(i) == out[k]]
+
+
+#  A test file's results: failed/total, and the discrepancies (see run_tests).
+def test_result(f, r):
+    return '%s %d/%d%s' % (f, r['failed'], r['total'], ', %d discrepant' % r['discrepant'] if r.get('discrepant') else '')
 
 
 def summary(entries):
@@ -512,7 +650,8 @@ def summary(entries):
                   ', '.join('%d rules: %d groups' % kv for kv in sorted(cycles.items())))
     md.append('## Transforms\n')
     md.append('Status: **ok** implementable; otherwise the work items needed (own problems and those of the '
-              'transforms used).  Tests: CLDR test files (failed/total cases for implementable transforms).  '
+              'transforms used).  Tests: CLDR test files (failed/total cases for implementable transforms, and the '
+              'discrepant cases: those where the test data disagrees with the rules, tconv and ICU).  '
               'Groups, rules: the conversion groups of the transform\'s own rules (not of the transforms it uses), '
               'and their rules (as planned: without the rules reported as problems).  Group kernels: the kernels '
               'of these groups; kernels: of the whole transform, including its filters and the transforms it '
@@ -522,7 +661,7 @@ def summary(entries):
     for e in sorted(entries.values(), key=lambda e: (e['builtin'], e['name'].lower())):
         status = '**ok**' if e['implementable'] else ', '.join(w.split()[0] for w in e['work']) or '?'
         own = ', '.join('%s (%d)' % (c, n) for c, n in sorted(e['own'].items()))
-        tests = ', '.join('%s %d/%d' % (f, r['failed'], r['total']) for f, r in e.get('test_results', {}).items()) \
+        tests = ', '.join(test_result(f, r) for f, r in e.get('test_results', {}).items()) \
             or ', '.join(e.get('tests', []))
         k = e.get('kernels') or {}
         cell = lambda v: '' if v is None else str(v)
@@ -593,6 +732,7 @@ def totals(entries):
         t[w + ': needed by'] = sum(1 for e in pop if w in e['work'])
         t[w + ': only blocker of'] = sum(1 for e in pop if e['work'] == [w])
     t['failing test cases'] = sum(r['failed'] for e in entries.values() for r in e.get('test_results', {}).values())
+    t['discrepant test cases'] = sum(r.get('discrepant', 0) for e in entries.values() for r in e.get('test_results', {}).values())
     return t
 
 
@@ -628,7 +768,8 @@ def changes(previous, entries, names, meta):
             diffs.append('kernels %s → %s' % (ko if ko is not None else 'none', kn if kn is not None else 'none'))
         for f in sorted(set(old.get('test_results', {})) | set(e.get('test_results', {}))):
             a, b = old.get('test_results', {}).get(f), e.get('test_results', {}).get(f)
-            fmt = lambda r: '%d/%d failed' % (r['failed'], r['total']) if r else 'not run'
+            fmt = lambda r: '%d/%d failed%s' % (r['failed'], r['total'], ', %d discrepant' % r['discrepant']
+                                                 if r.get('discrepant') else '') if r else 'not run'
             if a != b:
                 diffs.append('%s %s → %s' % (f, fmt(a), fmt(b)))
         if diffs:
@@ -729,9 +870,16 @@ def block_failing_tests(entries, old):
     return '\n'.join(rows) if rows else 'No test file fails.'
 
 
+def block_discrepant_tests(entries, old):
+    rows = ['- %s (%s: %d of %d cases)' % (e['name'], f, r['discrepant'], r['total'])
+            for e in entries.values() for f, r in sorted(e.get('test_results', {}).items()) if r.get('discrepant')]
+    return '\n'.join(rows) if rows else 'No test file has discrepancies.'
+
+
 REPORT_BLOCKS = collections.OrderedDict([
     ('summary', block_summary), ('chart', block_chart), ('builtins-missing', block_builtins_missing),
-    ('work-items', block_work_items), ('failing-tests', block_failing_tests)])
+    ('work-items', block_work_items), ('failing-tests', block_failing_tests),
+    ('discrepant-tests', block_discrepant_tests)])
 
 
 def update_report(path, entries):
@@ -756,6 +904,8 @@ def main():
     ap.add_argument('--test-data')
     ap.add_argument('--jobs', type=int, default=2)
     ap.add_argument('--timeout', type=int, default=1200)
+    ap.add_argument('--tconv-threads', type=int, metavar='N',
+                    help='at most N threads for each tconv run (its pipelines and their compilation)')
     ap.add_argument('--out', default='tconv-coverage')
     ap.add_argument('--update', action='store_true', help='keep the previous results in --out; plan and test only the selected transforms')
     ap.add_argument('--only', nargs='+', metavar='NAME', help='with --update: these transforms')
@@ -768,6 +918,8 @@ def main():
     ap.add_argument('--note', help='for --table-doc: what the tconv version includes')
     ap.add_argument('--cldr-note', help='for --table-doc: about the CLDR data (e.g. local fixes applied or not)')
     ap.add_argument('--report-doc', metavar='PATH', help='rewrite the generated blocks of the status report')
+    ap.add_argument('--no-resume', action='store_true',
+                    help='do not resume an interrupted run from <out>/progress.jsonl (start it afresh)')
     args = ap.parse_args()
     if (args.only or args.builtins or args.blocked or args.force) and not args.update:
         ap.error('--only, --builtins, --blocked and --force apply to --update')
@@ -789,6 +941,7 @@ def main():
         else:
             print('tconv_coverage.py: no %s; assuming the previous results used these directories' % meta_path,
                   file=sys.stderr)
+    args.progress = Progress(args)
     entries = list_transforms(args)
     names = select(args, entries, previous)
     print('tconv_coverage.py: planning %d transforms' % len(names), file=sys.stderr)
@@ -841,6 +994,7 @@ def main():
         found = update_report(args.report_doc, entries)
         print('tconv_coverage.py: %s: blocks rewritten: %s' % (args.report_doc, ', '.join(found) or 'none (no markers)'),
               file=sys.stderr)
+    args.progress.finish()
 
 
 if __name__ == '__main__':

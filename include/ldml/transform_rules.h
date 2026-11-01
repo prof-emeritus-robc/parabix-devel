@@ -861,7 +861,7 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules);
 //  matching P only as single characters, replaced by run rules
 //  (before { p S+ → f(p) ; see prefixRunAsRun).
 //
-//  A first rule of a group inserting a fixed string between captures and
+//  A rule of a group inserting a fixed string between captures and
 //  revisiting all, (T1) (T2+) (T3) → | $1 M $2 $3 ; is applied before the
 //  group as an insertion rule, T1 { } T2+ T3 → M ; in a group of its own,
 //  where the rest of the group cannot see the difference (see

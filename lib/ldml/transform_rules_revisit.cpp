@@ -956,7 +956,10 @@ bool hasRevisit(const ConversionRule * c) {
 //    - not see P S^n replaced by A^n P in its after contexts: each set of
 //      the after contexts contains all of the characters of P, S and A, or
 //      none (and in the first case A has as many characters as S, so that the
-//      lengths are the same); unassigned code points are disregarded,
+//      lengths are the same); unassigned code points are disregarded.  Where
+//      the prefix runs only delete S (A empty, no triggers), the last set of
+//      an after context may contain characters of P (none of S): it sees the
+//      P that stays in place (and not what follows it), as ICU does,
 //    - not revisit P followed by S, or at the end of the text to revisit (where
 //      S may follow), as the prefix runs no longer apply then.
 //  The before contexts see A^n P as ICU does.  Within the prefix runs, the
@@ -1003,6 +1006,9 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
         revisitsReplacement &= pr.revisitsReplacement;
     }
     if (replaced.intersects(first)) return "a replacement may begin a prefix run";
+    //  Whether the prefix runs only delete their texts S (A empty, no triggers),
+    //  leaving each P where it is.
+    const bool deleteOnly = replaced.empty() && triggers.empty();
     //  The characters of the triggers, and the covering rules.
     UCD::UnicodeSet triggered, triggerOutput;
     for (const PrefixRunTrigger & tr : triggers) {
@@ -1127,8 +1133,14 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             }
         }
         if (source->hasAfterContext()) {
-            for (const PatternItem & item : patternItems(source->getAfterContext())) {
-                if (item.chars.intersects(changed) && !(changed.subset(item.chars) && sameLength)) {
+            const std::vector<PatternItem> afterItems = patternItems(source->getAfterContext());
+            for (size_t i = 0; i < afterItems.size(); ++i) {
+                const PatternItem & item = afterItems[i];
+                //  (The last item may see a P that the prefix runs leave where it
+                //  is, where they only delete S: it does not see what follows.)
+                const bool keptP = deleteOnly && i + 1 == afterItems.size() && !item.repeated
+                                   && !item.chars.intersects(run + replaced + triggered);
+                if (item.chars.intersects(changed) && !(changed.subset(item.chars) && sameLength) && !keptP) {
                     return "an after context may see the text of a prefix run: " + printRule(c);
                 }
             }

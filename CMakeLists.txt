@@ -622,6 +622,11 @@ add_test(
   COMMAND python3 tconv_insertion_revisit_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_prefix_run_contexts_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_prefix_run_contexts_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME u8u16_test
   WORKING_DIRECTORY ${QA_DIR}/u8u16
   COMMAND python3 u8u16_test.py --flags=-thread-num=2 "${BIN_DIR}/u8u16")

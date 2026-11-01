@@ -784,7 +784,13 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  ICU matches as a character of the set or, matching nothing, at the end of
 //  the text, becomes two rules: the text with the characters of the set, and
 //  the text without it, with the after context $ (they cannot both match at a
-//  position).  With a global filter and transform rules, as ICU then applies
+//  position).  Likewise a capture of such a set, the last item of a text: the
+//  text with the capture of the characters of the set (the references to it
+//  rebound), and the text without it, with the after context $ and its
+//  references (items of the result, not within function calls) removed, as
+//  the capture is empty; or, if it is revisited unchanged (its only reference
+//  the last item of the text to revisit), its after context, from which the
+//  text is revisited alike.  With a global filter and transform rules, as ICU then applies
 //  the rules to each run of the characters of the filter (of the text given),
 //  such a set also matches nothing at the end of a run, which the text of a
 //  rule set does not tell: it is then left as it is.  A text that is the

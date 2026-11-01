@@ -6,7 +6,9 @@
 #  matches them: ^ at the start of a text and $ at its end are its contexts,
 #  and a set including the text boundary as the last item of a text ([^b],
 #  [x $]) matches a character of the set or, matching nothing, the end of the
-#  text (a [^b] replaces a final a).  The expected results are ICU's
+#  text (a [^b] replaces a final a); a capture of such a set, the last item
+#  of a text, a character of the set or, empty, the end of the text (revisited
+#  unchanged, ^ 4 ($nd) → | W $1, as an after context).  The expected results are ICU's
 #  (createFromRules, each line a text).
 #
 #  tconv_text_anchors_test.py <tconv binary>
@@ -21,7 +23,12 @@ RULES = ("a [^b] \u2192 X ;\n"
          "n $ \u2192 N ;\n"
          "$B = [\\u0020 $] ;\n"
          "q $B \u2192 Z ;\n"
-         "([\\-\\.]) \\u0020 [$] \u2192 $1 ;\n")
+         "([\\-\\.]) \\u0020 [$] \u2192 $1 ;\n"
+         "$nd = [^0-9] ;\n"
+         "^ 4 ($nd) \u2192 | W $1 ;\n"
+         "W h \u2192 V ;\n"
+         "W \u2192 U ;\n"
+         "5 ($nd) \u2192 $1 T ;\n")
 
 # (line, expected result)
 CASES = [
@@ -40,6 +47,15 @@ CASES = [
     ('o- p', 'o- p'),
     ('o.', 'o.'),
     ('o. ', 'o.'),
+    ('4', 'U'),
+    ('4h', 'V'),
+    ('45', '4T'),
+    ('x4h', 'x4h'),
+    ('4hh', 'Vh'),
+    ('5', 'T'),
+    ('5h', 'hT'),
+    ('56', '56'),
+    ('x5', 'xT'),
 ]
 
 

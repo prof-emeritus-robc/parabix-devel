@@ -373,6 +373,60 @@ static RE * withoutEnd(RE * re, bool & end) {
     return re;
 }
 
+//  Whether a pattern (of a result) refers to a capture, anywhere in it
+//  (including the arguments of function calls).
+static bool refersTo(const RE * re, const Capture * capture) {
+    if (const Reference * r = dyn_cast<Reference>(re)) {
+        return r->getCapture() == capture;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (refersTo(e, capture)) return true;
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (refersTo(e, capture)) return true;
+    } else if (const Rep * rep = dyn_cast<Rep>(re)) {
+        return refersTo(rep->getRE(), capture);
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() && refersTo(n->getDefinition(), capture);
+    } else if (const Capture * c = dyn_cast<Capture>(re)) {
+        return refersTo(c->getCapturedRE(), capture);
+    }
+    return false;
+}
+
+//  A part of a result with the references to a capture (items of the part)
+//  referring to another (by), or, with by nullptr, removed; false if a
+//  reference to it is not such an item (within a function call).
+static bool rebind(RE * part, const Capture * capture, Capture * by, RE *& out) {
+    if (part == nullptr) {
+        out = nullptr;
+        return true;
+    }
+    std::vector<RE *> items;
+    if (Seq * seq = dyn_cast<Seq>(part)) items.assign(seq->begin(), seq->end()); else items.push_back(part);
+    std::vector<RE *> rebound;
+    for (RE * item : items) {
+        if (const Reference * r = dyn_cast<Reference>(item); r && r->getCapture() == capture) {
+            if (by) rebound.push_back(Reference::Create(r->getName(), by, r->getInstance(), r->getReferencedProperty()));
+        } else if (refersTo(item, capture)) {
+            return false;
+        } else {
+            rebound.push_back(item);
+        }
+    }
+    out = makeSeq(rebound.begin(), rebound.end());
+    return true;
+}
+
+//  The result side of a rule with the references to a capture rebound (see
+//  rebind), or nullptr.
+static RuleSide * rebindResult(const RuleSide * result, const Capture * capture, Capture * by) {
+    RE * completed = nullptr, * revisit = nullptr;
+    if (!rebind(result->getCompletedResult(), capture, by, completed) || !rebind(result->getResultToRevisit(), capture, by, revisit)) {
+        return nullptr;
+    }
+    return RuleSide::Create(result->getBeforeContext(), completed, result->hasCursor(), revisit, result->getCursorOffset(),
+                            result->getAfterContext());
+}
+
 std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
     //  With a global filter and transform rules, ICU applies each rule set to
     //  each run of the characters of the filter (in the text given, which the
@@ -400,8 +454,8 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
         RE * before = source->getBeforeContext();
         RE * const after = source->getAfterContext();
         RuleSide * const result = c->getResultSide(Direction::Forward);
-        auto rule = [&](RE * b, const std::vector<RE *> & t, RE * a) {
-            return makeConversionRule(makeRuleSide(b, makeSeq(t.begin(), t.end()), a), Direction::Forward, result);
+        auto rule = [&](RE * b, const std::vector<RE *> & t, RE * a, RuleSide * r = nullptr) {
+            return makeConversionRule(makeRuleSide(b, makeSeq(t.begin(), t.end()), a), Direction::Forward, r ? r : result);
         };
         bool changed = false;
         //  ^ at the start of the text: its before context.
@@ -416,6 +470,50 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
                 items.pop_back();
                 out.push_back(rule(before, items, makeEnd()));
                 continue;
+            }
+            //  A last capture of such a set: of a character of the set, or
+            //  (empty, its references removed) the end of the text.  Revisited
+            //  unchanged (the last of the text to revisit, its only reference),
+            //  it is its after context, the text then revisited from the same
+            //  position (^ 4 ($nd) → | X $1 as ^ 4 } $nd → | X).
+            if (Capture * const capture = dyn_cast<Capture>(items.back())) {
+                bool boundary = false;
+                RE * const chars = withoutEnd(capture->getCapturedRE(), boundary);
+                RE * const revisit = result->getResultToRevisit();
+                std::vector<RE *> revisited;
+                if (revisit) {
+                    if (Seq * seq = dyn_cast<Seq>(revisit)) revisited.assign(seq->begin(), seq->end()); else revisited.push_back(revisit);
+                }
+                const Reference * const last = revisited.empty() ? nullptr : dyn_cast<Reference>(revisited.back());
+                if (boundary && !runs && result->hasCursor() && result->getCursorOffset() == 0 && last && last->getCapture() == capture
+                        && !(result->getCompletedResult() && refersTo(result->getCompletedResult(), capture))) {
+                    revisited.pop_back();
+                    bool once = true;
+                    for (const RE * e : revisited) once &= !refersTo(e, capture);
+                    if (once) {
+                        RuleSide * const context = RuleSide::Create(result->getBeforeContext(), result->getCompletedResult(), true,
+                                                                    makeSeq(revisited.begin(), revisited.end()), 0,
+                                                                    result->getAfterContext());
+                        items.pop_back();
+                        out.push_back(rule(before, items, capture->getCapturedRE(), context));
+                        continue;
+                    }
+                }
+                if (boundary && !runs) {
+                    Capture * const withChar = chars ? makeCapture(capture->getName(), chars) : nullptr;
+                    RuleSide * const charResult = withChar ? rebindResult(result, capture, withChar) : nullptr;
+                    RuleSide * const endResult = rebindResult(result, capture, nullptr);
+                    if ((withChar == nullptr || charResult) && endResult) {
+                        if (withChar) {
+                            std::vector<RE *> text(items);
+                            text.back() = withChar;
+                            out.push_back(rule(before, text, nullptr, charResult));
+                        }
+                        items.pop_back();
+                        out.push_back(rule(before, items, makeEnd(), endResult));
+                        continue;
+                    }
+                }
             }
             //  A last set including the end of the text: a character of the
             //  set, or (matching nothing) the end of the text.

@@ -62,7 +62,11 @@ update (`--update --only ka-ka_Latn/BGN my-my_FONIPA cy-cy_FONIPA`). No status
 changes (401); cy-cy_FONIPA's W10 problems go from 4 to 2 (it also needs W3).
 The 217 failing cases of ka-ka_Latn/BGN and my-my_FONIPA are discrepancies, and
 no test case fails. The other test files were not run again: their results
-are those of the earlier runs, with no failures (and so no discrepancies).*
+are those of the earlier runs, with no failures (and so no discrepancies).
+Then the anchors of texts moved to their contexts (`85277dbd7`, `--update
+--only ja_Latn-ko pl_FONIPA-ja fa-fa_FONIPA Zawgyi-my`): W3 is needed by 13
+transforms (17 before), and W6 alone blocks 7 (4): ja_Latn-ko, pl_FONIPA-ja and
+pl-ja need only W6.*
 
 This report covers:
 
@@ -190,7 +194,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
 now                          401  ██████████████████████████████████████
-+ W6 revisit                 405  ██████████████████████████████████████
++ W6 revisit                 408  ██████████████████████████████████████
 + W3 variable-length text    418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
@@ -989,8 +993,8 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 17 | 3 | M–L (the rest) |
-| W6 text to revisit, not composed | 17 | 4 | L (with W3) |
+| W3 variable-length texts | 13 | 3 | M–L (the rest) |
+| W6 text to revisit, not composed | 17 | 7 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1158,6 +1162,27 @@ W3 alone.
   - These rules may not overlap the string rules of their group.
 
   This covers Latn-Hebr, tr-Lower and az-Lower, and rules with fixed-length B.
+- **Anchors** (`ldml::MoveTextAnchors`, `85277dbd7`). ICU matches `^` at the
+  start of a text and `$` at its end as anchors of the text being
+  transliterated: without a before (after) context they become it (`^ k } g →
+  ᆺ`, `n $ → ᆫ`). A set including the text boundary as the last item of a text
+  (`[^b]`, `[x $]`, `[$]`) matches a character of the set or, matching nothing,
+  the end of the text: such a rule becomes two, the text with the characters
+  of the set, and the text without it, with the after context `$` (`a [^b] →
+  X` replaces a final `a`). In the regular expression engine, `^` matches at
+  the region start and `$` at the region follow, past the last character.
+  With a global filter and transform rules, ICU applies each rule set to each
+  run of the characters of the filter (of the text given; contexts see beyond
+  the run, and the anchors are those of the text), and such a set also matches
+  at the end of a run (`:: [a-z] ; :: Null ; b a [$] → X ;` gives `X1` on
+  `ba1`). The text of a rule set does not tell where the runs end (the
+  characters a step before inserts are within the run of the character they
+  follow), so these sets are left as they are (am_Ethi-d0_Morse's
+  `([.-])' '[$] → $1`). The runs are those of the filter's mask, which the
+  pipeline carries through the steps: the end of a run, a position whose next
+  is not within the mask (or the end of the text), could be given to the
+  engine as an external stream. An end-capable set within a capture at the
+  end of the text (Zawgyi-my's `^ ၄ ($nondigits) → | ၎ $1`) is not yet moved.
 
 Also: trivial capture elimination now accepts `(X) Y → $1 …` (as `X { Y → …`)
 where the rule cannot match within itself, other than as `(X) X+`. This
@@ -1524,6 +1549,7 @@ tconv on every implementable transform.
 | `11eb18fd0` | captures of fixed strings as strings, sets with strings by walks: Latin-NumericPinyin, Latn-Bopo: 400 |
 | `a9e44f8d8` | rules keeping the characters of their captures as string rules (converted before contexts); captures moved at the end; possessive optional items: blt-blt_FONIPA: 401 |
 | `0e561c416`, `22d03949b`, `345b69bf1` | possessive sets with strings in after contexts checked by the engine; sets with strings in contexts taking their longest strings; test cases with ICU's results counted as discrepancies (217): 401 |
+| `85277dbd7` | anchors of texts moved to their contexts: W3 needed by 13, W6 alone blocks 7: 401 |
 
 ## Reproducing
 

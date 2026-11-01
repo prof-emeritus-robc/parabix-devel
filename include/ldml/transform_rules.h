@@ -797,6 +797,12 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  anchor alone is left unchanged.
 std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules);
 
+//  The rules referring more than once to a capture of a character of a set
+//  (([bcd]) ː → $1 $1), each the references items of its result, replaced by
+//  a rule for each character of the set (bː → bb, cː → cc, …; for each
+//  combination of the characters of such captures, at most 64), in order.
+std::vector<Rule *> EnumerateRepeatedCaptures(const std::vector<Rule *> & rules);
+
 //  Composition of revisits.
 //
 //  A forward conversion rule whose result has text to revisit,

@@ -535,6 +535,127 @@ std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules) {
     return out;
 }
 
+//  Whether a set has only characters (no strings), through its alternations,
+//  differences, intersections and variables.
+static bool charactersOnly(const RE * re) {
+    if (const Name * n = dyn_cast<Name>(re)) {
+        return !isFunctionCall(n) && n->getDefinition() && charactersOnly(n->getDefinition());
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * a : *alt) if (!charactersOnly(a)) return false;
+        return true;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        return seq->size() == 1 && charactersOnly(seq->front());
+    } else if (const Diff * d = dyn_cast<Diff>(re)) {
+        return charactersOnly(d->getLH());
+    } else if (const Intersect * x = dyn_cast<Intersect>(re)) {
+        return charactersOnly(x->getLH()) || charactersOnly(x->getRH());
+    }
+    return !isBoundary(re);
+}
+
+//  The references to a capture in a pattern of a result (anywhere), counted;
+//  false where one is not an item of the pattern (within a function call).
+static bool countReferences(const RE * re, const Capture * capture, unsigned & count, bool top = true) {
+    if (const Reference * r = dyn_cast<Reference>(re)) {
+        if (r->getCapture() == capture) {
+            if (!top) return false;
+            count++;
+        }
+        return true;
+    } else if (const Seq * seq = dyn_cast<Seq>(re)) {
+        for (const RE * e : *seq) if (!countReferences(e, capture, count, top)) return false;
+        return true;
+    } else if (const Name * n = dyn_cast<Name>(re)) {
+        return n->getDefinition() == nullptr || countReferences(n->getDefinition(), capture, count, false);
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        for (const RE * e : *alt) if (!countReferences(e, capture, count, false)) return false;
+        return true;
+    }
+    return true;
+}
+
+//  A part of a result with the references to the captures given replaced by
+//  their characters.
+static RE * replaceReferences(RE * part, const std::map<const Capture *, UCD::codepoint_t> & chars) {
+    if (part == nullptr) return nullptr;
+    std::vector<RE *> items;
+    if (Seq * seq = dyn_cast<Seq>(part)) items.assign(seq->begin(), seq->end()); else items.push_back(part);
+    for (RE *& item : items) {
+        if (const Reference * r = dyn_cast<Reference>(item)) {
+            const auto f = chars.find(r->getCapture());
+            if (f != chars.end()) item = makeCC(f->second);
+        }
+    }
+    return makeSeq(items.begin(), items.end());
+}
+
+std::vector<Rule *> EnumerateRepeatedCaptures(const std::vector<Rule *> & rules) {
+    constexpr size_t MaxRules = 64;
+    std::vector<Rule *> out;
+    CharSetAnalysis sets;
+    for (Rule * r : rules) {
+        ConversionRule * c = dyn_cast<ConversionRule>(r);
+        const RuleSide * source = c ? c->getSourceSide(Direction::Forward) : nullptr;
+        if (source == nullptr || source->getText() == nullptr) {
+            out.push_back(r);
+            continue;
+        }
+        const RuleSide * result = c->getResultSide(Direction::Forward);
+        std::vector<RE *> items;
+        if (Seq * seq = dyn_cast<Seq>(source->getText())) items.assign(seq->begin(), seq->end()); else items.push_back(source->getText());
+        //  The captures of single characters of the text referred to more than
+        //  once (the references items of the result).
+        std::vector<std::pair<size_t, UCD::UnicodeSet>> enumerated;
+        bool repeated = false, ok = true;
+        size_t combinations = 1;
+        for (size_t i = 0; i < items.size() && ok; ++i) {
+            const Capture * cap = dyn_cast<Capture>(items[i]);
+            if (cap == nullptr || !CharSetAnalysis::isSet(cap->getCapturedRE()) || !charactersOnly(cap->getCapturedRE())) continue;
+            unsigned count = 0;
+            ok = countReferences(result->getCompletedResult() ? result->getCompletedResult() : makeSeq(), cap, count)
+                 && (result->getResultToRevisit() == nullptr || countReferences(result->getResultToRevisit(), cap, count));
+            if (!ok || count == 0) continue;
+            const UCD::UnicodeSet chars = sets.setOf(cap->getCapturedRE(), false);
+            if (chars.empty()) {
+                ok = false;
+                break;
+            }
+            combinations *= chars.count();
+            repeated |= count > 1;
+            enumerated.emplace_back(i, chars);
+        }
+        if (!ok || !repeated || combinations > MaxRules) {
+            out.push_back(r);
+            continue;
+        }
+        //  Each combination of the characters of the captures, in order.
+        std::vector<std::map<const Capture *, UCD::codepoint_t>> combos(1);
+        for (const auto & e : enumerated) {
+            std::vector<std::map<const Capture *, UCD::codepoint_t>> next;
+            for (const auto & m : combos) {
+                for (const auto & range : e.second) {
+                    for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range); ++ch) {
+                        auto n = m;
+                        n[cast<Capture>(items[e.first])] = ch;
+                        next.push_back(std::move(n));
+                    }
+                }
+            }
+            combos = std::move(next);
+        }
+        for (const auto & m : combos) {
+            std::vector<RE *> text(items);
+            for (const auto & e : enumerated) text[e.first] = makeCC(m.at(cast<Capture>(items[e.first])));
+            RuleSide * const side = makeRuleSide(source->getBeforeContext(), makeSeq(text.begin(), text.end()), source->getAfterContext());
+            RuleSide * const res = RuleSide::Create(result->getBeforeContext(), replaceReferences(result->getCompletedResult(), m),
+                                                    result->hasCursor(), replaceReferences(result->getResultToRevisit(), m),
+                                                    result->getCursorOffset(), result->getAfterContext());
+            out.push_back(makeConversionRule(side, Direction::Forward, res));
+        }
+    }
+    return out;
+}
+
 std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats) {
     std::vector<Rule *> out;
     Expander expander;

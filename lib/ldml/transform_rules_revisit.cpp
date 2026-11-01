@@ -988,10 +988,22 @@ struct PrefixRunTrigger {
     char32_t revisit;               // p
 };
 
+//
+//  With exceptions, where the prefix runs only delete their texts S (A empty,
+//  no triggers), each a single set, a rule before a prefix run whose text is
+//  its P and S followed by characters X (no before context; P S X } C → R)
+//  is an exception of the prefix run, given in exceptions (for each prefix
+//  run, the patterns X C), rather than a conflict: on P S^n X C, ICU deletes S
+//  until P S X remains, to which it applies the rule.  The prefix runs are
+//  then applied as P S* { S } (?!X C) → ;  (X not beginning with a character
+//  of S, so that S may follow) keeping the last S where X C follows, for the
+//  rule to apply in the rest of the group.
 std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vector<bool> & isRun,
                               const std::vector<PrefixRun> & runs, const std::vector<bool> & isTrigger,
                               const std::vector<PrefixRunTrigger> & triggers,
-                              std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> & covered) {
+                              std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> & covered,
+                              std::vector<std::vector<RE *>> * exceptions = nullptr) {
+    if (exceptions) exceptions->assign(runs.size(), {});
     const std::string families = prefixRunFamilies(runs);
     if (!families.empty()) return families;
     UCD::UnicodeSet first, run, runStart, replaced;
@@ -1121,6 +1133,20 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
         }
         for (const PrefixRun * pr : later[k]) {
             if (text[0].chars.intersects(pr->first) && (next == nullptr || next->intersects(pr->run.front()))) {
+                //  An exception of the prefix run: P S X } C → R.
+                std::vector<RE *> x;
+                bool exception = exceptions && deleteOnly && pr->run.size() == 1 && !source->hasBeforeContext()
+                                 && text.size() >= 3 && text[0].chars == pr->first && text[1].chars == pr->run.front()
+                                 && !text[2].chars.intersects(pr->run.front());
+                for (size_t i = 0; i < text.size() && exception; ++i) {
+                    exception = !text[i].repeated;
+                    if (exception && i >= 2) x.push_back(makeCC(text[i].chars));
+                }
+                if (exception) {
+                    if (source->hasAfterContext()) x.push_back(source->getAfterContext());
+                    (*exceptions)[pr - runs.data()].push_back(makeSeq(x.begin(), x.end()));
+                    continue;
+                }
                 return "a rule before a prefix run may apply instead: " + printRule(c);
             }
         }
@@ -2069,6 +2095,20 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
         }
         std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> covered;
         std::string runConflict = runs.empty() ? "" : prefixRunConflict(rewritten, isRun, runs, isTrigger, triggers, covered);
+        //  Or as deletions with exceptions (see prefixRunConflict).
+        std::vector<std::vector<RE *>> exceptions;
+        if (!runConflict.empty() && runConflict.compare(0, 40, "a rule before a prefix run may apply ins") == 0) {
+            std::vector<bool> none(rewritten.size(), false);
+            std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> noCover;
+            if (prefixRunConflict(rewritten, isRun, runs, none, {}, noCover, &exceptions).empty()) {
+                runConflict.clear();
+                isTrigger = none;
+                triggers.clear();
+                covered.clear();
+            } else {
+                exceptions.clear();
+            }
+        }
         if (!triggers.empty() && !runConflict.empty()) {
             //  Without the triggers (whose P are then revisited by ICU only in the rest of the group).
             const std::string withTriggers = runConflict;
@@ -2105,6 +2145,7 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             }
             std::vector<Rule *> rest;
             std::vector<bool> restRewritten;
+            size_t runIndex = 0;
             for (size_t k = 0; k < rewritten.size(); ++k) {
                 if (isTrigger[k]) continue;
                 if (!isRun[k]) {
@@ -2112,7 +2153,18 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                     restRewritten.push_back(isRewritten[k]);
                     continue;
                 }
-                out.push_back(rewritten[k]);
+                const PrefixRun & pr = runs[runIndex];
+                const std::vector<RE *> xs = exceptions.empty() ? std::vector<RE *>() : exceptions[runIndex];
+                ++runIndex;
+                if (exceptions.empty()) {
+                    out.push_back(rewritten[k]);
+                } else {
+                    //  P S* { S } (?!X C) → ;
+                    RE * const S = makeCC(pr.run.front());
+                    RE * const before = makeSeq({makeCC(pr.first), makeRep(S, 0, Rep::UNBOUNDED_REP)});
+                    RE * const after = xs.empty() ? nullptr : makeNegativeLookAheadAssertion(makeAlt(xs.begin(), xs.end()));
+                    out.push_back(makeConversionRule(makeRuleSide(before, S, after), Direction::Forward, makeRuleSide(makeSeq())));
+                }
                 if (mStats) {
                     mStats->prefixRuns++;
                     if (mStats->keepRecords) mStats->records.push_back(RevisitRecord{rewritten[k], RevisitRecord::Outcome::PrefixRun});

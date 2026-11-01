@@ -74,7 +74,9 @@ and W6 is needed by 11 (17); W3 alone blocks 9 (3): am_Ethi-d0_Morse (its
 es_FONIPA-ja (runs of sets with strings), besides Latin-ThaiLogical, Latn-Thai
 and Zawgyi-my. Then runs of sets with strings (`b45845a25`, `--update --only
 cs-ja cs_FONIPA-ja es-ja es_419-ja es_FONIPA-ja`): the five are implementable
-(406), with no failing or discrepant test cases, and W3 is needed by 8.*
+(406), with no failing or discrepant test cases, and W3 is needed by 8. Then
+insertion revisits beyond the first rule of a group (`920d7551f`, `--update
+--only my-my_Latn`): my-my_Latn is implementable (407), and W6 alone blocks 6.*
 
 This report covers:
 
@@ -95,8 +97,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 30 | 25 |
-| Transforms defined by CLDR files (380 files) | 425 | 406 (96%) |
-| …of which public (not `visibility="internal"`) | 393 | 375 (95%) |
+| Transforms defined by CLDR files (380 files) | 425 | 407 (96%) |
+| …of which public (not `visibility="internal"`) | 393 | 376 (96%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -201,7 +203,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          406  ██████████████████████████████████████
+now                          407  ██████████████████████████████████████
 + W6 revisit                 413  ███████████████████████████████████████
 + W3 variable-length text    418  ███████████████████████████████████████
 + W5 captures/functions      421  ████████████████████████████████████████
@@ -1002,7 +1004,7 @@ those of invoked transforms).
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
 | W3 variable-length texts | 8 | 4 | M–L (the rest) |
-| W6 text to revisit, not composed | 11 | 7 | L (with W3) |
+| W6 text to revisit, not composed | 10 | 6 | L (with W3) |
 | W5 back-references | 3 | 2 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1085,6 +1087,17 @@ extracted:
   bars of a run are deleted) are prefix runs;
   `tconv --revisit-report` lists every revisit rule with its outcome, and
   `doc/ldml-revisit-classification.md` classifies them.
+- **Insertion passes** (`27321f4e9`, `920d7551f`). A rule inserting a fixed
+  string between its captures and revisiting all, `(T1) (T2) → | $1 M $2`, is
+  the insertion rule `T1 { } T2 → M` in a group of its own before its group,
+  where the rest of the group cannot see the difference (`insertionRevisit`).
+  It need not be the first rule of its group: where T1 and T2 are sets, no rule
+  before it may apply where it matches (begin with a character of T1 followed
+  by one of T2, or with one of T1 alone), and a character of T1 within the text
+  of another rule, which ICU does not reach as a position for the insertion,
+  is allowed where it is followed by a character not in T2: my-my_Latn's
+  `($consonants) ($consonants) → | $1 a $2`, rule 412 of about 560, despite
+  `($consonants) ြောင့် → | $1 yount` (whose `င` is followed by `်`).
 - **ICU's cursor.** For a result with references to captures, ICU places the
   cursor after the last reference before `|`, or at the start of the result
   (§3.3). The composition follows ICU here: `([ሀ-ሇ]) $ጥበቅ → $ሀ | $1` revisits
@@ -1571,6 +1584,7 @@ tconv on every implementable transform.
 | `85277dbd7` | anchors of texts moved to their contexts: W3 needed by 13, W6 alone blocks 7: 401 |
 | `9a4a0c6a6` | last captures of sets including the text boundary: W6 needed by 11, W3 alone blocks 9: 401 |
 | `b45845a25` | runs of sets with strings: cs-ja, cs_FONIPA-ja, es-ja, es_419-ja, es_FONIPA-ja: 406 |
+| `920d7551f` | insertion revisits beyond the first rule of a group: my-my_Latn: 407 |
 
 ## Reproducing
 

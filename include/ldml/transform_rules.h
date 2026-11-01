@@ -351,16 +351,25 @@ const re::Name * originalVariable(const re::Name * n);
 // replaced by their changed definitions.
 re::RE * engineContext(re::RE * context, bool afterContext);
 // A context for the regular expression engine (see engineContext), with its
-// repetitions possessive, as ICU matches them.  An after context is matched
-// forward from the position: its repetitions are made possessive
-// (re::Rep::Kind::Possessive), which the engine resolves, taking the longest
-// string of a set with strings at each repetition, as ICU does (see
-// re::PossessiveChoice).  A before context is
-// matched backward from the position, so that each repetition takes as many
-// repetitions as possible to its left: e{lb,} becomes (?<!e) e{lb,}, and
-// e{lb,ub} becomes (?<!e) e{lb,ub-1} | e{ub}.  (The engine resolves possessive
+// repetitions possessive and its sets with strings taking their longest
+// strings, as ICU matches them.  An after context is matched forward from the
+// position: its repetitions are made possessive (re::Rep::Kind::Possessive),
+// which the engine resolves, taking the longest string of a set with strings
+// at each repetition, as ICU does (see re::PossessiveChoice); a set with
+// strings that is not repeated is made unambiguous, w (?!t'), where w is a
+// proper prefix of a longer string w t' (see re::unambiguousAlternatives).  A
+// before context is matched backward from the position, so that each
+// repetition takes as many repetitions as possible to its left: e{lb,} becomes
+// (?<!e) e{lb,}, and e{lb,ub} becomes (?<!e) e{lb,ub-1} | e{ub}; and its sets
+// with strings, repeated or not, are made unambiguous backward, (?<!t') w,
+// where w is a proper suffix of a longer string t' w, so that each takes its
+// longest string ending at the position.  (The engine resolves possessive
 // repetitions forward, also within lookbehinds.)
 re::RE * possessiveContext(re::RE * context, bool afterContext);
+// A capture for the regular expression engine, with its repetitions possessive
+// (as an after context, possessiveContext), its sets with strings that are not
+// repeated left as they are.
+re::RE * possessiveCapture(re::RE * capture);
 
 // The set of "." in rules, matching any character other than line and
 // paragraph separators: [^[:Zp:][:Zl:]\r\n$]

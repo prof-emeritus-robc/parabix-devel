@@ -110,13 +110,18 @@ static bool orderedStrings(RE * r, std::vector<std::vector<CC *>> & strings) {
 //      only where none of them matches: w (?!t'...);
 //    - the characters of a set of one character that begin longer strings are
 //      such strings w (the others have no conflict).
-//  At each position, at most one alternative then matches.
-static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts) {
+//  At each position, at most one alternative then matches.  Backward (matched
+//  from the right, as the repetitions of an ICU before context; see
+//  unambiguousAlternatives), the same with the ends of the strings: a string
+//  w that is a proper suffix of preferred strings t' w is taken only where none
+//  of them matches, (?<!t'...) w, and with firsts the characters with which
+//  the matches end; at each end position, at most one alternative matches.
+static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bool backward = false) {
     std::vector<std::vector<CC *>> alternatives;
     if (!orderedStrings(e, alternatives)) return nullptr;
     const cc::Alphabet * alphabet = nullptr;
     bool multi = false;
-    UCD::UnicodeSet starts;                     // the first characters of the strings of several characters
+    UCD::UnicodeSet starts;                     // the first (backward: last) characters of the strings of several characters
     for (const auto & a : alternatives) {
         for (CC * cc : a) {
             if (alphabet && cc->getAlphabet() != alphabet) return nullptr;
@@ -127,7 +132,7 @@ static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts) {
             for (CC * cc : a) {
                 if (cc->count() != 1) return nullptr;
             }
-            starts.insert(lo_codepoint(a.front()->front()));
+            starts.insert(lo_codepoint((backward ? a.back() : a.front())->front()));
         }
     }
     if (!multi) return nullptr;
@@ -168,25 +173,38 @@ static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts) {
     std::vector<RE *> alts;
     UCD::UnicodeSet first = others;
     if (!others.empty()) alts.push_back(makeCC(std::move(others), alphabet));
+    //  Whether t begins (backward: ends) with w.
+    auto extends = [&](const std::u32string & t, const std::u32string & w) {
+        return backward ? t.compare(t.size() - w.size(), w.size(), w) == 0 : t.compare(0, w.size(), w) == 0;
+    };
+    auto literal = [&](const std::u32string & text) {
+        std::vector<RE *> items;
+        for (char32_t c : text) items.push_back(makeCC(static_cast<UCD::codepoint_t>(c), alphabet));
+        return makeSeq(items.begin(), items.end());
+    };
     for (const Literal & w : distinct) {
         bool dropped = false;
         std::vector<RE *> guards;
         for (const Literal & t : distinct) {
             if (&t == &w || !preferred(t, w)) continue;
-            if (t.text.size() < w.text.size() && w.text.compare(0, t.text.size(), t.text) == 0) {
+            if (t.text.size() < w.text.size() && extends(w.text, t.text)) {
                 dropped = true;
-            } else if (t.text.size() > w.text.size() && t.text.compare(0, w.text.size(), w.text) == 0) {
-                std::vector<RE *> suffix;
-                for (size_t k = w.text.size(); k < t.text.size(); k++) suffix.push_back(makeCC(static_cast<UCD::codepoint_t>(t.text[k]), alphabet));
-                guards.push_back(makeSeq(suffix.begin(), suffix.end()));
+            } else if (t.text.size() > w.text.size() && extends(t.text, w.text)) {
+                //  The rest of t, beyond w.
+                const size_t n = t.text.size() - w.text.size();
+                guards.push_back(literal(backward ? t.text.substr(0, n) : t.text.substr(w.text.size())));
             }
         }
         if (dropped) continue;
-        std::vector<RE *> items;
-        for (char32_t c : w.text) items.push_back(makeCC(static_cast<UCD::codepoint_t>(c), alphabet));
-        if (!guards.empty()) items.push_back(makeNegativeLookAheadAssertion(makeAlt(guards.begin(), guards.end())));
-        alts.push_back(makeSeq(items.begin(), items.end()));
-        first.insert(static_cast<UCD::codepoint_t>(w.text.front()));
+        RE * const text = literal(w.text);
+        if (guards.empty()) {
+            alts.push_back(text);
+        } else if (backward) {
+            alts.push_back(makeSeq({makeNegativeLookBehindAssertion(makeAlt(guards.begin(), guards.end())), text}));
+        } else {
+            alts.push_back(makeSeq({text, makeNegativeLookAheadAssertion(makeAlt(guards.begin(), guards.end()))}));
+        }
+        first.insert(static_cast<UCD::codepoint_t>(backward ? w.text.back() : w.text.front()));
     }
     firsts = makeCC(std::move(first), alphabet);
     return makeAlt(alts.begin(), alts.end());
@@ -385,6 +403,11 @@ RE * ResolvePossessive::transformAssertion(Assertion * a) {
 
 RE * resolvePossessiveQuantifiers(RE * re, PossessiveChoice choice) {
     return ResolvePossessive(choice).transformRE(re);
+}
+
+RE * unambiguousAlternatives(RE * e, PossessiveChoice choice, bool backward) {
+    CC * ends = nullptr;
+    return unambiguousStrings(e, choice, ends, backward);
 }
 
 }

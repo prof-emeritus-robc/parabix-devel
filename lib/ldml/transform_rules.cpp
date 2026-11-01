@@ -8,6 +8,7 @@
 #include <re/adt/re_utility.h>
 #include <re/analysis/re_analysis.h>
 #include <re/transforms/re_transformer.h>
+#include <re/transforms/resolve_possessive.h>
 #include <algorithm>
 #include <map>
 #include <cctype>
@@ -222,27 +223,60 @@ RE * engineContext(RE * context, bool afterContext) {
 
 namespace {
 
+//  A set with strings (an alternation of literal strings and sets of single
+//  characters, as expandedContext gives it) made unambiguous, so that it
+//  matches only ICU's choice, its longest string matching at the position
+//  (forward: beginning there; backward: ending there), or nullptr if re is not
+//  such a set.
+RE * longestString(RE * re, bool backward) {
+    if (!isa<Alt>(re)) return nullptr;
+    return unambiguousAlternatives(re, PossessiveChoice::Longest, backward);
+}
+
+//  With sets, a set with strings that is not repeated is made unambiguous
+//  (longestString); a repeated one is resolved by the engine, as the
+//  repetition is possessive.
 class ForwardPossessive final : public RE_Transformer {
 public:
-    ForwardPossessive() : RE_Transformer("ForwardPossessive") {}
-    RE * transformRep(Rep * rep) override {
-        return Rep::Create(transform(rep->getRE()), rep->getLB(), rep->getUB(), Rep::Kind::Possessive);
+    explicit ForwardPossessive(bool sets) : RE_Transformer("ForwardPossessive"), mSets(sets) {}
+    RE * transformAlt(Alt * alt) override {
+        if (mSets) {
+            if (RE * const longest = longestString(alt, false)) return longest;
+        }
+        return RE_Transformer::transformAlt(alt);
     }
+    RE * transformRep(Rep * rep) override {
+        RE * const body = rep->getRE();
+        RE * const e = longestString(body, false) ? body : transform(body);
+        return Rep::Create(e, rep->getLB(), rep->getUB(), Rep::Kind::Possessive);
+    }
+private:
+    const bool mSets;
 };
 
+//  Each set with strings made unambiguous backward (longestString), so that a
+//  repetition of it takes ICU's choices from the right, and the run of
+//  repetitions ends where no further one matches.
 class BackwardPossessive final : public RE_Transformer {
 public:
     BackwardPossessive() : RE_Transformer("BackwardPossessive") {}
+    RE * transformAlt(Alt * alt) override {
+        if (RE * const longest = longestString(alt, true)) return longest;
+        return RE_Transformer::transformAlt(alt);
+    }
     RE * transformRep(Rep * rep) override {
         RE * const e = transform(rep->getRE());
+        //  No further repetition: where no string of a set ends, its longest does
+        //  not either (its plain form, without the assertions of e).
+        RE * const further = longestString(rep->getRE(), true) ? rep->getRE() : e;
         const int lb = rep->getLB();
         const int ub = rep->getUB();
         if (ub == Rep::UNBOUNDED_REP) {
-            return makeSeq({makeNegativeLookBehindAssertion(e), makeRep(e, lb, ub)});
+            return makeSeq({makeNegativeLookBehindAssertion(further), makeRep(e, lb, ub)});
         } else if (lb == ub) {
             return makeRep(e, ub, ub);
         }
-        return makeAlt({makeSeq({makeNegativeLookBehindAssertion(e), makeRep(e, lb, ub - 1)}),
+        return makeAlt({makeSeq({makeNegativeLookBehindAssertion(further), makeRep(e, lb, ub - 1)}),
                         makeRep(e, ub, ub)});
     }
 };
@@ -250,8 +284,12 @@ public:
 }
 
 RE * possessiveContext(RE * context, bool afterContext) {
-    if (afterContext) return ForwardPossessive().transformRE(context);
+    if (afterContext) return ForwardPossessive(true).transformRE(context);
     return BackwardPossessive().transformRE(context);
+}
+
+RE * possessiveCapture(RE * capture) {
+    return ForwardPossessive(false).transformRE(capture);
 }
 
 bool isTextBoundary(const RE * re) {

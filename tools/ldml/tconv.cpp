@@ -45,8 +45,9 @@
 //  --use-ICU=0|<regex>: the transforms applied by ICU (tools/ldml/
 //  icu_transform.cpp).  With a regular expression, the transform given, and the
 //  transforms that its rules invoke (:: X ;), are applied by ICU where their
-//  names (canonical, alias, or as given) match it; by default (and with a
-//  regular expression), so are those tconv does not implement; with 0, none.
+//  names (canonical, alias, or as given) match it, and a rules file
+//  (--rules-file) where its path matches it; by default (and with a regular
+//  expression), so are those tconv does not implement; with 0, none.
 //  ICU makes a transform from the rules of its CLDR file, as tconv reads them,
 //  with the transforms its rules invoke from their files too (registered with
 //  ICU under the names by which they are invoked), and a built-in transform is
@@ -94,6 +95,7 @@
 #include <ldml/transform_registry.h>
 #include <kernel/re/regexp_engine.h>
 #include <re/adt/adt.h>
+#include <re/transforms/resolve_possessive.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>
 #include <re/cc/cc_compiler_target.h>
@@ -154,7 +156,8 @@ static cl::opt<unsigned> MuxClassKernels("mux-class-kernels",
     cl::init(3), cl::cat(TconvOptions), cl::Hidden);
 static cl::opt<std::string> UseICU("use-ICU", cl::desc("The transforms applied by ICU (if tconv is built with it): 0 for none, or "
                                    "a regular expression matching the names of transforms (the transform given, and those its rules "
-                                   "invoke); the transforms tconv does not implement are applied by ICU, unless 0"),
+                                   "invoke), or the path of a rules file; the transforms tconv does not implement are "
+                                   "applied by ICU, unless 0"),
                                    cl::init(""), cl::cat(TconvOptions));
 static cl::opt<bool> Lines("lines", cl::desc("Transform each line of the input as a text of its own (as the cases of the CLDR test data)"),
                            cl::init(false), cl::cat(TconvOptions));
@@ -1887,6 +1890,51 @@ private:
         alt[pos].boundary = alt[pos].boundary && item.boundary;
         return !alt[pos].chars.empty() || alt[pos].boundary;
     }
+    //  The sequences of sets of an RE, outward (the alternatives of an
+    //  alternation, each a set or a sequence of sets), if it is such.
+    bool fixedSequences(re::RE * re, std::vector<std::vector<UCD::UnicodeSet>> & seqs) {
+        using namespace re;
+        if (Alt * a = dyn_cast<Alt>(re); a && !isSetRE(re)) {
+            for (RE * x : *a) {
+                if (!fixedSequences(x, seqs)) return false;
+            }
+            return true;
+        }
+        std::vector<UCD::UnicodeSet> seq;
+        if (isSetRE(re)) {
+            seq.push_back(setOfRE(re));
+        } else if (Seq * s = dyn_cast<Seq>(re)) {
+            for (RE * x : *s) {
+                if (!isSetRE(x)) return false;
+                seq.push_back(setOfRE(x));
+            }
+            if (mBefore) std::reverse(seq.begin(), seq.end());
+        } else {
+            return false;
+        }
+        if (seq.empty()) return false;
+        seqs.push_back(std::move(seq));
+        return true;
+    }
+    //  The alternatives of alt in which none of the sequences excluded (from
+    //  index k) matches outward from pos: each sequence matches up to one of its
+    //  positions, where a character not in its set, or the text boundary, is.
+    void exclude(const std::vector<std::vector<UCD::UnicodeSet>> & excluded, size_t k, const FusedContext & alt, size_t pos,
+                 const std::function<void (FusedContext)> & then) {
+        if (mFailed) return;
+        if (k == excluded.size()) {
+            then(alt);
+            return;
+        }
+        const std::vector<UCD::UnicodeSet> & seq = excluded[k];
+        for (size_t j = 0; j < seq.size(); j++) {
+            FusedContext a = alt;
+            bool ok = true;
+            for (size_t m = 0; m < j && ok; m++) ok = constrain(a, pos + m, FusedItem{seq[m], false});
+            if (ok) ok = constrain(a, pos + j, FusedItem{UCD::UnicodeSet(0, 0x10FFFF) - seq[j], true});
+            if (ok) exclude(excluded, k + 1, a, pos, then);
+        }
+    }
     //  Extend the alternative alt (positions before pos assigned) by the
     //  elements from index i (in outward order).
     void extend(const std::vector<re::RE *> & elements, size_t i, FusedContext alt, size_t pos, std::vector<FusedContext> & out) {
@@ -1929,14 +1977,28 @@ private:
             }
             if (sets) {
                 item(it);
+            } else if (RE * const longest = re::unambiguousAlternatives(a, re::PossessiveChoice::Longest, mBefore)) {
+                //  A set with strings: only its longest string matching outward
+                //  from the text, as ICU takes it (each alternative of the
+                //  unambiguous form, with its assertions).
+                if (Alt * const alts = dyn_cast<Alt>(longest)) {
+                    for (RE * x : *alts) extend(rest({x}), 0, alt, pos, out);
+                } else {
+                    extend(rest({longest}), 0, alt, pos, out);
+                }
             } else {
                 for (RE * x : *a) extend(rest({x}), 0, alt, pos, out);
             }
         } else if (Assertion * as = dyn_cast<Assertion>(e)) {
-            //  (?!X) or (?<!X): a character not in X, or the text boundary.
-            if (as->getSense() == Assertion::Sense::Negative && isSetRE(as->getAsserted())
-                    && (as->getKind() == Assertion::Kind::LookAhead || as->getKind() == Assertion::Kind::LookBehind)) {
-                item(FusedItem{UCD::UnicodeSet(0, 0x10FFFF) - setOfRE(as->getAsserted()), true});
+            //  (?!X) in an after context, or (?<!X) in a before context, X a set or
+            //  fixed sequences of sets: at the position (zero-width), no sequence
+            //  of X matching outward, each having a position at which it does not
+            //  (a character not in its set, or the text boundary).
+            std::vector<std::vector<UCD::UnicodeSet>> excluded;
+            if (as->getSense() == Assertion::Sense::Negative
+                    && as->getKind() == (mBefore ? Assertion::Kind::LookBehind : Assertion::Kind::LookAhead)
+                    && fixedSequences(as->getAsserted(), excluded)) {
+                exclude(excluded, 0, alt, pos, [&](FusedContext a) {extend(elements, i + 1, std::move(a), pos, out);});
             } else {
                 mFailed = true;
             }
@@ -2324,7 +2386,7 @@ static bool engineSearchReplace(const ldml::TransformStep & step, PreparedSearch
         literal(set.rules.front().firstReplacement);
         for (size_t i = 0; i < set.captures.size(); i++) {
             re::Capture * const capture = re::makeCapture(std::to_string(i + 1),
-                ldml::possessiveContext(ldml::expandedContext(set.captures[i], none, DeletionMark), true));
+                ldml::possessiveCapture(ldml::expandedContext(set.captures[i], none, DeletionMark)));
             items.push_back(capture);
             text(set.texts[i]);
             result.push_back(re::makeReference(capture->getName(), capture, 0));
@@ -6306,7 +6368,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
             for (size_t i = 0; i < set.captures.size(); i++) {
                 //  (A capture matched possessively, as ICU matches it, with its sets resolved.)
-                items.push_back(ldml::possessiveContext(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark), true));
+                items.push_back(ldml::possessiveCapture(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark)));
                 for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
             }
             //  Only the streams used are made (the pipeline compiler fails on kernels
@@ -7993,7 +8055,21 @@ int main(int argc, char *argv[]) {
             llvm::errs() << "\n";
             return 2;
         }
-        if (!a.implementable) {
+        //  Also applied by ICU where --use-ICU matches the path of the rules file.
+        bool selected = false;
+        if (!UseICU.empty() && UseICU != "0") {
+            try {
+                selected = std::regex_match(RulesFile.getValue(), std::regex(UseICU.getValue(), std::regex::ECMAScript));
+            } catch (const std::regex_error & e) {
+                llvm::errs() << "Error: --use-ICU=" << UseICU << " is not a regular expression: " << e.what() << "\n";
+                return 1;
+            }
+        }
+        if (selected && !tconv::ICUTransform::available()) {
+            llvm::errs() << "Error: rules file " << RulesFile << " selected by --use-ICU, but tconv was built without ICU\n";
+            return 2;
+        }
+        if (!a.implementable || selected) {
             std::string error;
             std::shared_ptr<tconv::ICUTransform> t = tconv::ICUTransform::fromRules("tconv-rules", readFile(RulesFile), false, nullptr, error);
             if (!t) {

@@ -61,6 +61,7 @@ struct CharMapSubgroup {
     // are not changed, but take precedence over later rules for them.
     UCD::UnicodeSet kept;
     unsigned rules = 0;         // the number of rules
+    std::vector<const ConversionRule *> sourceRules;    // the rules, in order
     // All the characters of the mappings and kept.
     const UCD::UnicodeSet & characters() const {return all;}
     // The characters of the rules added to the mappings or kept (by
@@ -343,6 +344,14 @@ struct TransformStep {
     // the rule applies only if it does not begin within an applied match of
     // these.  Empty otherwise.
     std::vector<size_t> stringOrder;
+    // For each string rule, the earlier rules of the group (string rules or
+    // single-character rules) that it yields to at the same position: it
+    // applies only where none of them matches at its first position (see
+    // DisambiguationStats::prioritized; set by the client after planning).
+    std::vector<std::vector<const ConversionRule *>> stringPriority;
+    // Likewise for each subgroup, the earlier rules that a rule of it yields
+    // to (the subgroup applies only where none of them matches).
+    std::vector<std::vector<const ConversionRule *>> subgroupPriority;
     std::vector<std::vector<size_t>> stringPredecessors;
     // Otherwise (cyclic, two-way or longer self-overlaps), the matches are
     // selected sequentially, from the left: a match applies if it does not

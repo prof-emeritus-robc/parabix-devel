@@ -617,6 +617,11 @@ add_test(
   COMMAND python3 tconv_filter_run_end_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_blocking_marks_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_blocking_marks_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_run_strings_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_run_strings_test.py ${BIN_DIR}/tconv)

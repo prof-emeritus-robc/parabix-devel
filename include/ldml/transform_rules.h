@@ -617,6 +617,11 @@ struct DisambiguationStats {
     size_t deletionClosures = 0;     // before contexts extended by deleted characters (see below)
     std::vector<std::pair<const Rule *, const Rule *>> failedPairs;  // (E, replacement rule) failing verification
     std::map<std::string, size_t> unresolvedReasons;   // the unresolved pairs by reason
+    //  The pairs (E, L) left to priority: an earlier rule E with blocking marks
+    //  (see DeletedRunBlockMark) that L, at the same position, does not have
+    //  where E is blocked, so that L applies after a deleted run there.  The
+    //  pipeline applies L only where E does not match (at its first position).
+    std::vector<std::pair<const Rule *, const Rule *>> prioritized;
 };
 //
 //  Deletion closure.  Before contexts are matched against the converted text.
@@ -809,6 +814,29 @@ constexpr UCD::codepoint_t FilterRunEndMark = 0xFDD2;
 inline bool marksFilterRunEnd(const UCD::UnicodeSet & set) {
     return set.contains(FilterRunEndMark) && !set.contains(FilterRunEndMark + 1);
 }
+//  In a set of the text or the after context of a rule of the group after
+//  prefix runs that only delete (see ComposeRevisits), a position that does
+//  not follow a run they deleted (a noncharacter, not in the text): there ICU
+//  would still have found the run, which blocks the match.  The pipeline
+//  gives the class of such a set only its characters at the positions not
+//  following a deleted run (as the prefix runs step marks them).  As with
+//  FilterRunEndMark, the next noncharacter is absent from such a set.
+constexpr UCD::codepoint_t DeletedRunBlockMark = 0xFDD4;
+inline bool marksDeletedRunBlock(const UCD::UnicodeSet & set) {
+    return set.contains(DeletedRunBlockMark) && !set.contains(DeletedRunBlockMark + 1);
+}
+//  The complement of such a set, which an analysis may form (as the context
+//  [^r] that keeps a rule from applying where a marked r would follow), has
+//  the next noncharacter and not DeletedRunBlockMark: it matches its
+//  characters, and any character at the positions that follow a deleted run.
+inline bool marksDeletedRunAllow(const UCD::UnicodeSet & set) {
+    return set.contains(DeletedRunBlockMark + 1) && !set.contains(DeletedRunBlockMark);
+}
+inline UCD::UnicodeSet withDeletedRunBlock(const UCD::UnicodeSet & set) {
+    UCD::UnicodeSet marked = set;
+    marked.insert(DeletedRunBlockMark);
+    return marked - UCD::UnicodeSet(DeletedRunBlockMark + 1);
+}
 
 //  The rules referring more than once to a capture of a character of a set
 //  (([bcd]) ː → $1 $1), each the references items of its result, replaced by
@@ -878,7 +906,13 @@ std::vector<Rule *> EnumerateRepeatedCaptures(const std::vector<Rule *> & rules)
 //  prefixRunConflict).  Otherwise they are composed as other rules are, or,
 //  where that fails on their unbounded runs, with A empty and the other rules
 //  matching P only as single characters, replaced by run rules
-//  (before { p S+ → f(p) ; see prefixRunAsRun).
+//  (before { p S+ → f(p) ; see prefixRunAsRun).  Where the prefix runs only
+//  delete, the rest of the group may see the difference where ICU does not
+//  reach a P: a run after a P within a match, or seen by an after context,
+//  blocks the match (it-am's ($consonant) \' → | $1 ; makes ch'a not match
+//  cha).  The rules of the rest of the group then have blocking marks (see
+//  DeletedRunBlockMark), at the offsets of their matches at which such a run
+//  may have been deleted (other than where ICU reaches P and deletes it).
 //
 //  A rule of a group inserting a fixed string between captures and
 //  revisiting all, (T1) (T2+) (T3) → | $1 M $2 $3 ; is applied before the
@@ -941,6 +975,7 @@ struct RevisitStats {
     unsigned prefixRuns = 0;        // moved to a group of their own (with their triggers)
     unsigned chainRevisits = 0;     // moved to a group of their own
     unsigned markRunEdits = 0;      // moved to a group of their own
+    unsigned blockingMarks = 0;     // groups after prefix runs given blocking marks
     bool keepRecords = false;
     std::vector<RevisitRecord> records;
 };

@@ -393,6 +393,12 @@ struct Path {
     Context before;                             // on the text before the text of the rule
     std::vector<std::pair<unsigned, Context>> after;  // on the text after it, at an offset
     std::vector<const Rule *> applied;          // the rules applied
+    //  With blocking marks (see Composer::mBlock): the offsets (from the start
+    //  of the text of the composed rule) after which ICU has deleted a run of
+    //  the prefix runs, at a character of P it reached, and those at which a
+    //  run may be within a match along the path (to be marked).
+    std::set<unsigned> transparent{1};
+    std::set<unsigned> blocked;
 };
 
 //  Record a rule applying to the text to revisit (see RevisitRecord).
@@ -415,6 +421,105 @@ void noteTrigger(RevisitRecord * record, const GroupRule & g, unsigned depth, bo
     record->triggered.push_back(t);
 }
 
+//  The blocking marks of a rule of the group after prefix runs that only
+//  delete (see DeletedRunBlockMark): its text and after context (in order,
+//  at offsets from the start of the text) with the sets marked at the offsets
+//  at which a match may follow a run that the prefix runs deleted, where ICU
+//  would still have found the run.  With own, these are the offsets after a
+//  character of P other than the first of the text (at which ICU deletes the
+//  run before it tries the rule); otherwise (for a composed rule) those given.
+//  The set at such an offset may not contain a first character of a text S
+//  (ICU might match it there), and the offsets must be fixed.
+struct BlockMarker {
+    UCD::UnicodeSet first;              // P
+    UCD::UnicodeSet runStart;           // the first sets of the texts S
+    bool own = true;
+    std::set<unsigned> offsets;         // (if !own) the offsets to mark
+    std::set<unsigned> marked;          // the offsets marked
+    std::string failure;                // why the rule cannot be marked
+    RE * mark(RE * re);
+    CharSetAnalysis mSets;
+    std::optional<unsigned> mAt = 0;    // the offset of the next item, if fixed
+    bool mAfterP = false;               // the item before it may be a character of P
+};
+
+RE * BlockMarker::mark(RE * re) {
+    if (!failure.empty()) return re;
+    if (CharSetAnalysis::isSet(re) && !hasStrings(re)) {
+        const UCD::UnicodeSet s = mSets.setOf(re, false);
+        const bool afterRun = own ? mAfterP && mAt && *mAt >= 2 : mAt && offsets.count(*mAt);
+        if (own && mAfterP && !mAt) failure = "a set after a character of P at an offset that is not fixed";
+        RE * result = re;
+        if (afterRun) {
+            if (hasBoundary(re)) failure = "a set including the text boundary after a character of P";
+            if (s.intersects(runStart)) failure = "a set after a character of P may match the text of a prefix run";
+            marked.insert(*mAt);
+            result = makeCC(withDeletedRunBlock(s));
+        }
+        mAfterP = s.intersects(first);
+        if (mAt) ++*mAt;
+        return result;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        std::vector<RE *> items;
+        bool changed = false;
+        for (RE * e : *seq) {
+            items.push_back(mark(e));
+            changed |= items.back() != e;
+        }
+        return changed ? makeSeq(items.begin(), items.end()) : re;
+    } else if (Alt * alt = dyn_cast<Alt>(re); alt && alt->size() == 1) {
+        RE * const e = mark(alt->front());
+        return e == alt->front() ? re : e;
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        //  (A composed rule has a literal result, which refers to no capture.)
+        RE * const e = mark(c->getCapturedRE());
+        if (e == c->getCapturedRE()) return re;
+        if (own) failure = "a set of a capture after a character of P";
+        return own ? re : e;
+    } else if (Name * name = dyn_cast<Name>(re); name && !isFunctionCall(name) && name->getDefinition()) {
+        RE * const e = mark(name->getDefinition());
+        return e == name->getDefinition() ? re : e;
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        if (rep->getLB() == rep->getUB()) {
+            std::vector<RE *> items;
+            bool changed = false;
+            for (int k = 0; k < rep->getLB(); ++k) {
+                items.push_back(mark(rep->getRE()));
+                changed |= items.back() != rep->getRE();
+            }
+            return changed ? makeSeq(items.begin(), items.end()) : re;
+        }
+        const bool body = CharSetAnalysis::isSet(rep->getRE()) && !hasStrings(rep->getRE());
+        if (own && (!body || mSets.setOf(rep->getRE(), false).intersects(first) || (mAfterP && !(mAt && *mAt == 1)))) {
+            failure = "a repetition after or of a character of P";
+        }
+        mAt.reset();
+        mAfterP = mAfterP && rep->getLB() == 0;
+        return re;
+    } else if (isBoundary(re) || isa<Start>(re) || isa<End>(re) || isa<Assertion>(re)) {
+        return re;
+    }
+    if (own && mAfterP) failure = "an item of variable length after a character of P";
+    mAt.reset();
+    mAfterP = false;
+    return re;
+}
+
+//  A rule with its blocking marks (see BlockMarker), or nullptr (with the
+//  marker's failure).
+ConversionRule * blockMarked(ConversionRule * c, BlockMarker & marker) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    RE * const text = marker.mark(source->getText());
+    RE * const after = source->getAfterContext() ? marker.mark(source->getAfterContext()) : nullptr;
+    if (marker.failure.empty() && !marker.own && marker.marked != marker.offsets) {
+        marker.failure = "an offset after a character of P beyond the text and the after context, or not fixed";
+    }
+    if (!marker.failure.empty()) return nullptr;
+    if (text == source->getText() && after == source->getAfterContext()) return c;
+    return makeConversionRule(makeRuleSide(source->getBeforeContext(), text, after), Direction::Forward,
+                              c->getResultSide(Direction::Forward));
+}
+
 class Composer {
 public:
     Composer(RevisitStats * stats) : mStats(stats) {}
@@ -426,10 +531,12 @@ private:
     void textItems(RE * re, GroupRule & g);
     bool firstChars(RE * re, UCD::UnicodeSet & first, bool & nullable);
     std::vector<Rule *> composeRule(ConversionRule * r, const std::vector<GroupRule> & group);
+    std::vector<Rule *> composeRuleOnce(ConversionRule * r, const std::vector<GroupRule> & group);
     void explore(Path p, RE * text, std::vector<Rule *> & composed);
     void apply(const GroupRule & g, Path q, const std::vector<MatchedChar> & matched,
                std::vector<int> referenced, RE * text, std::vector<Rule *> & composed);
-    void finish(Path p, RE * text, std::vector<Rule *> & composed);
+    void finish(Path p, RE * text, std::vector<Rule *> & composed, std::optional<unsigned> split = std::nullopt);
+    bool returnsToText(const Path & p) const;
     Rule * suffixRevisit(ConversionRule * r);
     bool chainRevisitSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
                            std::vector<bool> & isChain, ChainRevisit & chain, std::string & reason);
@@ -443,6 +550,18 @@ private:
     RevisitRecord * mRecord = nullptr;
     const std::vector<GroupRule> * mGroup = nullptr;
     std::set<std::string> mEmitted;
+    //  The blocking marks of the group after prefix runs that only delete (see
+    //  prefixRunConflict), if any (first empty if none): the composed rules are
+    //  marked at the offsets of the runs within their matches; mTextLength is
+    //  the length of the text of the rule composed.
+    BlockMarker mBlock;
+    bool mBlocking = false;
+    unsigned mTextLength = 0;
+    //  Where the composition fails, it is retried ending the paths where the
+    //  text to revisit returns to the text of the composed rule (see
+    //  returnsToText), whose sets (of single characters there) are these.
+    bool mReturns = false;
+    std::vector<UCD::UnicodeSet> mTextSets;
 };
 
 bool Composer::collectItems(RE * re, std::vector<Item> & items) {
@@ -607,6 +726,16 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
     if (composed.size() > MaxComposedRules) {
         throw NotComposed{"more than " + std::to_string(MaxComposedRules) + " composed rules"};
     }
+    //  At the last character of the text to revisit, a character of P, ICU
+    //  deletes the run after it (if any) before it tries the rules.
+    if (mBlocking && p.pending.size() == 1 && mBlock.first.contains(p.pending[0])) {
+        p.transparent.insert(mTextLength + static_cast<unsigned>(p.beyond.size()));
+    }
+    if (mReturns && returnsToText(p)) {
+        const unsigned split = mTextLength + static_cast<unsigned>(p.beyond.size()) - static_cast<unsigned>(p.pending.size());
+        finish(std::move(p), text, composed, split);
+        return;
+    }
     for (const GroupRule & g : *mGroup) {
         Path q = p;
         std::vector<MatchedChar> matched;
@@ -663,11 +792,51 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
             }
         }
         if (!possible) continue;
+        //  With blocking marks: the boundaries that the match (its text, then its
+        //  after context) crosses beyond the text to revisit, where a run deleted
+        //  after a character of P, not reached by ICU, would block it.
+        bool blockedHere = false;
+        if (mBlocking) {
+            std::vector<UCD::UnicodeSet> beyond(q.beyond.begin() + p.beyond.size(), q.beyond.end());
+            std::vector<UCD::UnicodeSet> unknown;   // after an item of variable length
+            for (const Item & item : after.items) {
+                if (item.boundary && item.chars.empty()) continue;
+                if (item.star || item.optional || !unknown.empty()) {
+                    unknown.push_back(item.chars);
+                } else {
+                    beyond.push_back(item.chars);
+                }
+            }
+            const unsigned b0 = mTextLength + static_cast<unsigned>(p.beyond.size());
+            bool afterP = mBlock.first.contains(p.pending.back());
+            for (size_t j = 0; j < beyond.size(); ++j) {
+                if (afterP && !q.transparent.count(b0 + j)) {
+                    if (beyond[j].intersects(mBlock.runStart)) {
+                        throw NotComposed{"blocking marks: a rule may match the text of a prefix run after a character of P: "
+                                          + printRule(g.rule)};
+                    }
+                    q.blocked.insert(b0 + static_cast<unsigned>(j));
+                    blockedHere = true;
+                }
+                afterP = beyond[j].intersects(mBlock.first);
+            }
+            for (size_t j = 0; j < unknown.size(); ++j) {
+                if (afterP || (j + 1 < unknown.size() && unknown[j].intersects(mBlock.first)) || !after.simple) {
+                    throw NotComposed{"blocking marks: an after context of variable length after a character of P: "
+                                      + printRule(g.rule)};
+                }
+            }
+            if (!after.simple && afterP) {
+                throw NotComposed{"blocking marks: an after context not a sequence of sets after a character of P: "
+                                  + printRule(g.rule)};
+            }
+        }
         //  A rule matching within the text to revisit, with its contexts matched
-        //  by the known text, applies: the later rules are not tried.
+        //  by the known text, applies: the later rules are not tried (unless a
+        //  run may block it).
         bool afterImplied = alwaysMatches(after);
         for (const auto & a : p.after) afterImplied |= a.first == q.beyond.size() && implies(a.second, after, true);
-        const bool unconditional = q.beyond.size() == p.beyond.size() && beforeImplied && afterImplied;
+        const bool unconditional = q.beyond.size() == p.beyond.size() && beforeImplied && afterImplied && !blockedHere;
         noteTrigger(mRecord, g, p.applied.size() + 1, !unconditional, q.beyond.size() > p.beyond.size(), false);
         q.after.emplace_back(q.beyond.size(), std::move(after));
         //  The characters beyond referenced by the result are enumerated.
@@ -741,8 +910,29 @@ void Composer::apply(const GroupRule & g, Path q, const std::vector<MatchedChar>
     explore(std::move(q), text, composed);
 }
 
-//  The composed rule of a complete path.
-void Composer::finish(Path p, RE * text, std::vector<Rule *> & composed) {
+//  Whether the text to revisit is the text of the composed rule (and the
+//  characters beyond it) where it is, after a rule applied: ICU then goes on
+//  at its first character as it would on the text of the composed rule, so
+//  that the path may end there, with the rest of the text as an after context
+//  (as the suffix revisits do, P S → A | S as P } S → A).  With blocking
+//  marks, no run may have been deleted within it, or after it unless ICU
+//  deletes that run at its first character.
+bool Composer::returnsToText(const Path & p) const {
+    const size_t n = p.pending.size();
+    const size_t end = mTextLength + p.beyond.size();
+    if (p.applied.empty() || n == 0 || end < n + 1 || mTextSets.size() != mTextLength) return false;
+    auto original = [&](size_t o) -> const UCD::UnicodeSet & {return o < mTextLength ? mTextSets[o] : p.beyond[o - mTextLength];};
+    for (size_t i = 0; i < n; ++i) {
+        const UCD::UnicodeSet & s = original(end - n + i);
+        if (s.count() != 1 || !s.contains(p.pending[i])) return false;
+        if (mBlocking && i + 1 < n && s.intersects(mBlock.first)) return false;
+    }
+    return !(mBlocking && n > 1 && p.transparent.count(static_cast<unsigned>(end)));
+}
+
+//  The composed rule of a complete path (with split, its text ending at that
+//  offset, the rest an after context: see returnsToText).
+void Composer::finish(Path p, RE * text, std::vector<Rule *> & composed, std::optional<unsigned> split) {
     if (mRecord) {
         mRecord->paths++;
         mRecord->maxApplications = std::max<unsigned>(mRecord->maxApplications, p.applied.size());
@@ -760,13 +950,29 @@ void Composer::finish(Path p, RE * text, std::vector<Rule *> & composed) {
         items.push_back(makeCC(s));
     }
     RE * const before = contextRE(p.before, true);
-    RE * const fullText = p.beyond.empty() ? text : makeSeq(items.begin(), items.end());
-    RE * const afterRE = contextRE(after, false);
+    RE * fullText = p.beyond.empty() ? text : makeSeq(items.begin(), items.end());
+    RE * afterRE = contextRE(after, false);
+    if (split) {
+        std::vector<RE *> head, tail;
+        for (size_t o = 0; o < mTextLength + p.beyond.size(); ++o) {
+            RE * const item = makeCC(o < mTextLength ? mTextSets[o] : p.beyond[o - mTextLength]);
+            (o < *split ? head : tail).push_back(item);
+        }
+        if (afterRE) tail.push_back(afterRE);
+        fullText = makeSeq(head.begin(), head.end());
+        afterRE = makeSeq(tail.begin(), tail.end());
+    }
     //  A rule whose condition is that of an earlier rule never applies.
-    const std::string key = (before ? printPattern(before) : "") + " { " + printPattern(fullText) + " } " + (afterRE ? printPattern(afterRE) : "");
+    std::string key = (before ? printPattern(before) : "") + " { " + printPattern(fullText) + " } " + (afterRE ? printPattern(afterRE) : "");
+    for (unsigned o : p.blocked) key += " " + std::to_string(o);
     if (!mEmitted.insert(key).second) return;
-    composed.push_back(makeConversionRule(makeRuleSide(before, fullText, afterRE), Direction::Forward,
-                                          makeRuleSide(literal(p.out))));
+    ConversionRule * rule = makeConversionRule(makeRuleSide(before, fullText, afterRE), Direction::Forward, makeRuleSide(literal(p.out)));
+    if (mBlocking) {
+        BlockMarker marker{mBlock.first, mBlock.runStart, false, p.blocked};
+        rule = blockMarked(rule, marker);
+        if (rule == nullptr) throw NotComposed{"blocking marks: " + marker.failure};
+    }
+    composed.push_back(rule);
 }
 
 //  The text with captures replaced by characters.
@@ -806,6 +1012,28 @@ void findCaptures(RE * re, std::map<std::string, Capture *> & found, bool repeat
 }
 
 std::vector<Rule *> Composer::composeRule(ConversionRule * r, const std::vector<GroupRule> & group) {
+    GroupRule own;
+    textItems(r->getSourceSide(Direction::Forward)->getText(), own);
+    mTextSets = own.fixed ? own.text : std::vector<UCD::UnicodeSet>();
+    mTextLength = static_cast<unsigned>(mTextSets.size());
+    mReturns = false;
+    try {
+        return composeRuleOnce(r, group);
+    } catch (const NotComposed & e) {
+        if (mTextSets.empty()) throw;
+        mReturns = true;
+        try {
+            std::vector<Rule *> composed = composeRuleOnce(r, group);
+            mReturns = false;
+            return composed;
+        } catch (const NotComposed &) {
+            mReturns = false;
+            throw e;
+        }
+    }
+}
+
+std::vector<Rule *> Composer::composeRuleOnce(ConversionRule * r, const std::vector<GroupRule> & group) {
     mGroup = &group;
     mEmitted.clear();
     const RuleSide * source = r->getSourceSide(Direction::Forward);
@@ -854,7 +1082,20 @@ std::vector<Rule *> Composer::composeRule(ConversionRule * r, const std::vector<
         }
         p.before = context(source->getBeforeContext());
         p.after.emplace_back(0, context(source->getAfterContext()));
-        explore(std::move(p), replaceCaptures(source->getText(), chars), composed);
+        RE * const enumeratedText = replaceCaptures(source->getText(), chars);
+        GroupRule own;
+        textItems(enumeratedText, own);
+        mTextSets = own.fixed ? own.text : std::vector<UCD::UnicodeSet>();
+        if (mBlocking) {
+            //  The runs within the match of the rule itself.
+            if (mTextSets.empty()) throw NotComposed{"blocking marks: the text is not a fixed-length sequence of characters"};
+            BlockMarker marker{mBlock.first, mBlock.runStart};
+            marker.mark(source->getText());
+            if (source->getAfterContext()) marker.mark(source->getAfterContext());
+            if (!marker.failure.empty()) throw NotComposed{"blocking marks: " + marker.failure};
+            p.blocked = marker.marked;
+        }
+        explore(std::move(p), enumeratedText, composed);
         size_t k = 0;
         for (; k < enumerated.size(); ++k) {
             if (++index[k] < enumerated[k].second.size()) break;
@@ -999,12 +1240,27 @@ struct PrefixRunTrigger {
 //  then applied as P S* { S } (?!X C) → ;  (X not beginning with a character
 //  of S, so that S may follow) keeping the last S where X C follows, for the
 //  rule to apply in the rest of the group.
+//
+//  With blocking (where the prefix runs only delete, without triggers or
+//  exceptions), the rest of the group may be given blocking marks (see
+//  DeletedRunBlockMark and BlockMarker): a match then does not apply where a
+//  run the prefix runs deleted is within it, other than after its first
+//  character (or, for a composed rule, after a character at which ICU
+//  revisits).  With them, the after contexts may see the texts of the prefix
+//  runs, and, where the rest of the group deletes S wherever ICU reaches it
+//  (each S a single set, deleted by the first rule matching its characters,
+//  S → ; with no contexts), a rule may match P after the first character of
+//  its text (a run after it, deleted before, is reached and deleted by ICU
+//  when it follows the last character of a match), and revisit P at the end
+//  of its text to revisit (the composition tells where ICU deletes the run
+//  after it).  *blocking tells whether the marks are needed.
 std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vector<bool> & isRun,
                               const std::vector<PrefixRun> & runs, const std::vector<bool> & isTrigger,
                               const std::vector<PrefixRunTrigger> & triggers,
                               std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> & covered,
-                              std::vector<std::vector<RE *>> * exceptions = nullptr) {
+                              std::vector<std::vector<RE *>> * exceptions = nullptr, bool * blocking = nullptr) {
     if (exceptions) exceptions->assign(runs.size(), {});
+    if (blocking) *blocking = false;
     const std::string families = prefixRunFamilies(runs);
     if (!families.empty()) return families;
     UCD::UnicodeSet first, run, runStart, replaced;
@@ -1022,6 +1278,22 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
     //  Whether the prefix runs only delete their texts S (A empty, no triggers),
     //  leaving each P where it is.
     const bool deleteOnly = replaced.empty() && triggers.empty();
+    //  With blocking marks: whether the rest of the group deletes S wherever
+    //  ICU reaches it.
+    const bool canBlock = blocking && deleteOnly && exceptions == nullptr;
+    bool runDeleted = canBlock && std::all_of(runs.begin(), runs.end(), [](const PrefixRun & pr) {return pr.run.size() == 1;});
+    for (size_t k = 0; k < rules.size() && runDeleted; ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(rules[k]);
+        if (c == nullptr || isRun[k]) continue;
+        const RuleSide * source = c->getSourceSide(Direction::Forward);
+        const std::vector<PatternItem> text = patternItems(source->getText());
+        if (!text.empty() && !text[0].chars.intersects(run)) continue;
+        std::u32string completed, revisit;
+        runDeleted = text.size() == 1 && !text[0].repeated && run.subset(text[0].chars) && !source->hasBeforeContext()
+                     && !source->hasAfterContext() && ruleResult(c->getResultSide(Direction::Forward), {}, completed, revisit)
+                     && completed.empty() && revisit.empty();
+        break;
+    }
     //  Whether two characters of P have the same prefix runs (the same texts S,
     //  with the same A).
     auto runsOf = [&](UCD::codepoint_t ch) {
@@ -1173,10 +1445,17 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
                 return "a rule may match a replacement: " + printRule(c);
             }
             if ((i > 0 || text[i].repeated) && text[i].chars.intersects(first)) {
+                if (runDeleted) {
+                    *blocking = true;
+                    continue;
+                }
                 return "a rule may match a character to revisit within its text: " + printRule(c);
             }
         }
-        if (source->hasAfterContext()) {
+        if (canBlock && source->hasAfterContext()) {
+            //  (Seen by the blocking marks, where a set may follow a character of P.)
+            *blocking = true;
+        } else if (source->hasAfterContext()) {
             const std::vector<PatternItem> afterItems = patternItems(source->getAfterContext());
             for (size_t i = 0; i < afterItems.size(); ++i) {
                 const PatternItem & item = afterItems[i];
@@ -1213,6 +1492,10 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
                         }
                     }
                     if (same) continue;
+                    if (runDeleted && !items[i].repeated && i + 1 == items.size()) {
+                        *blocking = true;
+                        continue;
+                    }
                     return "a rule revisits a character to revisit of a prefix run: " + printRule(c);
                 }
             }
@@ -2131,7 +2414,9 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             }
         }
         std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> covered;
-        std::string runConflict = runs.empty() ? "" : prefixRunConflict(rewritten, isRun, runs, isTrigger, triggers, covered);
+        bool blocking = false;
+        std::string runConflict = runs.empty() ? "" : prefixRunConflict(rewritten, isRun, runs, isTrigger, triggers, covered,
+                                                                        nullptr, &blocking);
         //  Or as deletions with exceptions (see prefixRunConflict).
         std::vector<std::vector<RE *>> exceptions;
         if (!runConflict.empty() && runConflict.compare(0, 40, "a rule before a prefix run may apply ins") == 0) {
@@ -2139,6 +2424,7 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> noCover;
             if (prefixRunConflict(rewritten, isRun, runs, none, {}, noCover, &exceptions).empty()) {
                 runConflict.clear();
+                blocking = false;
                 isTrigger = none;
                 triggers.clear();
                 covered.clear();
@@ -2150,10 +2436,34 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             //  Without the triggers (whose P are then revisited by ICU only in the rest of the group).
             const std::string withTriggers = runConflict;
             std::vector<bool> none(rewritten.size(), false);
-            runConflict = prefixRunConflict(rewritten, isRun, runs, none, {}, covered);
+            runConflict = prefixRunConflict(rewritten, isRun, runs, none, {}, covered, nullptr, &blocking);
             if (!runConflict.empty()) runConflict = withTriggers;
             isTrigger = none;
             triggers.clear();
+        }
+        //  With blocking marks, the rules of the rest of the group that are not
+        //  composed, marked (see BlockMarker); the composed rules are marked
+        //  as they are composed.
+        std::map<const Rule *, Rule *> blockMarkedRules;
+        mBlocking = false;
+        if (!runs.empty() && runConflict.empty() && blocking) {
+            mBlock = BlockMarker{};
+            for (const PrefixRun & pr : runs) {
+                mBlock.first = mBlock.first + pr.first;
+                mBlock.runStart = mBlock.runStart + pr.run.front();
+            }
+            for (size_t k = 0; k < rewritten.size() && runConflict.empty(); ++k) {
+                ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
+                if (c == nullptr || isRun[k] || isTrigger[k] || (!isRewritten[k] && hasRevisit(c))) continue;
+                BlockMarker marker{mBlock.first, mBlock.runStart};
+                if (ConversionRule * m = blockMarked(c, marker)) {
+                    blockMarkedRules[c] = m;
+                } else {
+                    runConflict = "blocking marks: " + marker.failure + ": " + printRule(c);
+                }
+            }
+            mBlocking = runConflict.empty();
+            if (mStats && mBlocking) mStats->blockingMarks++;
         }
         if (!runs.empty() && runConflict.empty()) {
             //  The triggers first, C → B p ; except after the characters k of
@@ -2222,7 +2532,8 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
         for (size_t k = 0; k < rewritten.size(); ++k) {
             ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
             if (c == nullptr || isRewritten[k] || !hasRevisit(c)) {
-                out.push_back(rewritten[k]);
+                auto m = blockMarkedRules.find(rewritten[k]);
+                out.push_back(m == blockMarkedRules.end() ? rewritten[k] : m->second);
                 continue;
             }
             RevisitRecord record{c, RevisitRecord::Outcome::Composed};
@@ -2262,6 +2573,7 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             if (mRecord) mStats->records.push_back(std::move(record));
             mRecord = nullptr;
         }
+        mBlocking = false;
         start = end;
     }
     return out;

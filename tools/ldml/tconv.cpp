@@ -606,6 +606,9 @@ static void captureContextProblems(const ldml::TransformStep & step, std::vector
 static void convertedContextCaptureRules(const ldml::TransformStep & step, std::set<const ldml::Rule *> & rules);
 static void insertionContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
 static void lookaheadContextProblems(const ldml::TransformStep & step, std::vector<std::string> & problems);
+static void blockingMarkProblems(const ldml::TransformPlan & plan, const ldml::TransformRegistry & registry,
+                                 std::vector<std::string> & problems);
+static bool inStringRulesOrSubgroups(const ldml::TransformStep & step, const ldml::ConversionRule * r);
 
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
@@ -654,6 +657,35 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
             for (const ldml::TransformStep & step : a.plan.steps) convertedContextCaptureRules(step, converted);
             if (!converted.empty()) a.plan = ldml::planTransform(rules, &converted);
         }
+        //  The pairs left to priority by DisambiguateOrder, as string rules of
+        //  the same group (see ldml::TransformStep::stringPriority).
+        for (const auto & pr : dstats.prioritized) {
+            const ldml::ConversionRule * const e = llvm::cast<ldml::ConversionRule>(pr.first);
+            bool found = false;
+            for (ldml::TransformStep & step : a.plan.steps) {
+                if (!inStringRulesOrSubgroups(step, e)) continue;
+                for (size_t r = 0; r < step.stringRules.size() && !found; r++) {
+                    if (step.stringRules[r].rule != pr.second) continue;
+                    step.stringPriority.resize(step.stringRules.size());
+                    step.stringPriority[r].push_back(e);
+                    found = true;
+                }
+                //  (A single-character rule: its subgroup yields.)
+                for (size_t g = 0; g < step.subgroups.size() && !found; g++) {
+                    const auto & of = step.subgroups[g].sourceRules;
+                    if (std::find(of.begin(), of.end(), pr.second) == of.end()) continue;
+                    step.subgroupPriority.resize(step.subgroups.size());
+                    step.subgroupPriority[g].push_back(e);
+                    found = true;
+                }
+                if (found) break;
+            }
+            if (!found) {
+                a.plan.problems.push_back(ldml::printRule(llvm::cast<ldml::ConversionRule>(pr.second))
+                                          + "  (left to priority after " + ldml::printRule(llvm::cast<ldml::ConversionRule>(pr.first))
+                                          + ", but they are not string or single-character rules of a group)");
+            }
+        }
         //  The reasons the rules with text to revisit were not composed: these
         //  rules remain, in order, as the rules with that problem.
         //  Likewise for the rules whose texts were not expanded.
@@ -693,6 +725,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
             insertionContextProblems(step, a.plan.problems);
             lookaheadContextProblems(step, a.plan.problems);
         }
+        blockingMarkProblems(a.plan, mRegistry, a.plan.problems);
         a.problems = a.plan.problems;
         //  The bit changes of the subgroups of a group are combined, assuming that
         //  no two rules of a group may apply at the same position.
@@ -818,8 +851,19 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             }
         }
         printBeforeContextNotes(step);
-        for (const ldml::StringRule & sr : step.stringRules) {
-            llvm::outs() << "    string rule: " << ldml::printRule(sr.rule) << "\n";
+        for (size_t r = 0; r < step.stringRules.size(); r++) {
+            llvm::outs() << "    string rule: " << ldml::printRule(step.stringRules[r].rule) << "\n";
+            if (r < step.stringPriority.size()) {
+                for (const ldml::ConversionRule * e : step.stringPriority[r]) {
+                    llvm::outs() << "      only where this does not match first: " << ldml::printRule(e) << "\n";
+                }
+            }
+        }
+        for (size_t g = 0; g < step.subgroupPriority.size(); g++) {
+            for (const ldml::ConversionRule * e : step.subgroupPriority[g]) {
+                llvm::outs() << "    single-character rules [" << step.subgroups[g].contextKey << "] only where this does not match first: "
+                             << ldml::printRule(e) << "\n";
+            }
         }
         if (step.jointSelection) {
             llvm::outs() << "    string rules and MultipleCaptureMultipleReplacement rules selected together\n";
@@ -1173,6 +1217,53 @@ protected:
     }
 private:
     const std::vector<unsigned> mIndices;
+};
+
+//  The streams of Classes, those at the indices given without the positions
+//  that follow a run deleted by prefix runs (After; see
+//  ldml::DeletedRunBlockMark).
+class NotAfterDeletedRuns final : public pablo::PabloKernel {
+public:
+    //  (The classes of the complements, at the indices allowed, hold those
+    //  positions instead; see ldml::marksDeletedRunAllow.)
+    NotAfterDeletedRuns(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * After, const std::vector<unsigned> & indices,
+                        const std::vector<unsigned> & allowed, StreamSet * Out)
+    : PabloKernel(ts, "NotAfterDeletedRuns" + std::to_string(Classes->getNumElements()) + [&] {
+                      std::string s;
+                      for (unsigned i : indices) s += "_" + std::to_string(i);
+                      s += "_or";
+                      for (unsigned i : allowed) s += "_" + std::to_string(i);
+                      return s;
+                  }(),
+                  {Binding{"Classes", Classes}, Binding{"After", After}}, {Binding{"Out", Out}})
+    , mIndices(indices), mAllowed(allowed) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        PabloAST * const after = getInputStreamSet("After")[0];
+        PabloAST * const notAfter = pb.createNot(after);
+        for (unsigned i : mIndices) classes[i] = pb.createAnd(classes[i], notAfter);
+        for (unsigned i : mAllowed) classes[i] = pb.createOr(classes[i], after);
+        writeOutputStreamSet("Out", classes);
+    }
+private:
+    const std::vector<unsigned> mIndices;
+    const std::vector<unsigned> mAllowed;
+};
+
+//  The positions kept after deleted ones (Delete): where prefix runs that only
+//  delete leave each P, at the end of its run.
+class KeptAfterDeleted final : public pablo::PabloKernel {
+public:
+    KeptAfterDeleted(LLVMTypeSystemInterface & ts, StreamSet * Delete, StreamSet * Kept)
+    : PabloKernel(ts, "KeptAfterDeleted", {Binding{"Delete", Delete}}, {Binding{"Kept", Kept}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const del = getInputStreamSet("Delete")[0];
+        writeOutputStreamSet("Kept", std::vector<PabloAST *>{pb.createAnd(pb.createNot(del), pb.createAdvance(del, 1))});
+    }
 };
 
 //  Single streams collected into a stream set.
@@ -5345,12 +5436,19 @@ private:
     StreamSet * matchPositions(re::RE * engineBefore, re::RE * engineAfter, const std::vector<UCD::UnicodeSet> & text,
                                StreamSet * U21, StreamSet ** spans = nullptr);
     StreamSet * classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21);
+    StreamSet * notAfterDeletedRuns(const std::vector<UCD::UnicodeSet> & sets, StreamSet * classes);
     StreamSet * combine(StreamSet * a, StreamSet * b, bool isOr);
     PipelineBuilder & mP;
     const ldml::TransformRegistry & mRegistry;
     TransformAnalyzer & mAnalyzer;
     NFD_PipelineBuilder mNFD;
     std::vector<StreamSet *> mMasks;
+    //  The positions following a run deleted by the prefix runs of the step
+    //  before (if they only delete), for the blocking marks of the rules of
+    //  this step (see ldml::DeletedRunBlockMark); and those of this step's
+    //  prefix runs, for the next (past :: Null ;).
+    StreamSet * mDeletedRunEnds = nullptr;
+    StreamSet * mNextDeletedRunEnds = nullptr;
     //  Whether the transform applied is a single conversion group with its own
     //  filter (or one where it is invoked), whose insertions the filter does
     //  not restrict (see insertionGroup), and whether the transform about to be
@@ -5924,33 +6022,57 @@ static re::RE * possessiveBefore(re::RE * engineBefore) {
 //  ldml::FilterRunEndMark) in the patterns of the engine: an external of the
 //  engine, the positions outside the active mask.
 static const std::string FilterRunEndName = "tconvFilterRunEnd";
+static const std::string DeletedRunEndName = "tconvDeletedRunEnd";
+static const std::string NotDeletedRunEndName = "tconvNotDeletedRunEnd";
 
 //  A pattern with the sets including ldml::FilterRunEndMark matching the
-//  positions outside the filter (FilterRunEndName) instead.
+//  positions outside the filter (FilterRunEndName) instead, and those with
+//  ldml::DeletedRunBlockMark only at positions not following a run deleted
+//  by prefix runs (NotDeletedRunEndName, intersected: re::resolveDiffs would
+//  take a difference with a name defined as a CC for a difference of sets),
+//  and their complements also at those positions (DeletedRunEndName).
 class FilterRunEnds final : public re::RE_Transformer {
 public:
     FilterRunEnds() : re::RE_Transformer("FilterRunEnds") {}
-    bool used = false;
 protected:
     re::RE * transformCC(re::CC * cc) override {
-        if (!ldml::marksFilterRunEnd(*cc)) return cc;
-        used = true;
+        const bool runEnd = ldml::marksFilterRunEnd(*cc);
+        const bool blocked = ldml::marksDeletedRunBlock(*cc);
+        const bool allowed = ldml::marksDeletedRunAllow(*cc);
+        if (!runEnd && !blocked && !allowed) return cc;
         static re::Name * const outside = re::makeName(FilterRunEndName, re::makeCC(ldml::FilterRunEndMark, &cc::Unicode));
-        re::CC * const rest = re::subtractCC(cc, re::makeCC(ldml::FilterRunEndMark, &cc::Unicode));
-        return rest->empty() ? static_cast<re::RE *>(outside) : re::makeAlt({rest, outside});
+        //  (Defined as code unit CCs, of length 1, which no simplification
+        //  combines with the Unicode CCs of the sets.)
+        static re::Name * const deleted = re::makeName(DeletedRunEndName, re::makeCC(0xD4, 0xD4, &cc::Byte));
+        static re::Name * const notDeleted = re::makeName(NotDeletedRunEndName, re::makeCC(0xD5, 0xD5, &cc::Byte));
+        re::CC * rest = cc;
+        if (runEnd) rest = re::subtractCC(rest, re::makeCC(ldml::FilterRunEndMark, &cc::Unicode));
+        if (blocked) rest = re::subtractCC(rest, re::makeCC(ldml::DeletedRunBlockMark, &cc::Unicode));
+        if (allowed) rest = re::subtractCC(rest, re::makeCC(ldml::DeletedRunBlockMark + 1, &cc::Unicode));
+        re::RE * chars = blocked && !rest->empty() ? re::Intersect::Create(rest, notDeleted) : static_cast<re::RE *>(rest);
+        if (allowed) chars = rest->empty() ? static_cast<re::RE *>(deleted) : re::makeAlt({rest, deleted});
+
+        if (!runEnd) return chars;
+        return rest->empty() ? static_cast<re::RE *>(outside) : re::makeAlt({chars, outside});
     }
 };
+
+static re::RE * withContextMarks(re::RE * re) {
+    FilterRunEnds marks;
+    return marks.transformRE(re);
+}
 
 static re::RE * possessiveAfter(re::RE * engineAfter) {
     FilterRunEnds runEnds;
     return runEnds.transformRE(ldml::possessiveContext(ldml::expandedContext(engineAfter, Insertions(), DeletionMark), true));
 }
 
-//  Whether a pattern refers to the positions outside the filter (FilterRunEndName).
-static bool usesFilterRunEnds(const re::RE * re) {
+//  Whether a pattern refers to an external of the pipeline (FilterRunEndName,
+//  DeletedRunEndName).
+static bool usesExternal(const re::RE * re, const std::string & name) {
     std::set<re::Name *> names;
     re::gatherNames(const_cast<re::RE *>(re), names);
-    for (const re::Name * n : names) if (n->getFullName() == FilterRunEndName) return true;
+    for (const re::Name * n : names) if (n->getFullName() == name) return true;
     return false;
 }
 
@@ -5961,7 +6083,7 @@ static re::RE * contextPattern(re::RE * engineBefore, re::RE * engineAfter, cons
     if (engineBefore) items.push_back(re::makeLookBehindAssertion(possessiveBefore(engineBefore)));
     for (re::RE * item : text) items.push_back(item);
     if (engineAfter) items.push_back(re::makeLookAheadAssertion(possessiveAfter(engineAfter)));
-    return re::makeSeq(items.begin(), items.end());
+    return withContextMarks(re::makeSeq(items.begin(), items.end()));
 }
 
 //  The pattern of matchStarts: the text and the after context, after a
@@ -5977,7 +6099,7 @@ static re::RE * startsPattern(re::RE * engineBefore, re::RE * engineAfter, const
     } else {
         items.insert(items.end(), ahead.begin(), ahead.end());
     }
-    return re::makeSeq(items.begin(), items.end());
+    return withContextMarks(re::makeSeq(items.begin(), items.end()));
 }
 
 static RE_ModeOptions startsOptions() {
@@ -6003,10 +6125,22 @@ StreamSet * RulePipelineBuilder::matchPositions(re::RE * engineBefore, re::RE * 
 //  filter (the active mask) as FilterRunEndName, if the pattern refers to them.
 RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pattern) {
     RE_context context{&cc::Unicode, U21};
-    if (StreamSet * const mask = activeMask(); mask && usesFilterRunEnds(pattern)) {
+    if (StreamSet * const mask = activeMask(); mask && usesExternal(pattern, FilterRunEndName)) {
         StreamSet * const outside = mP.CreateStreamSet(1);
         Invert(mP, mask, outside);
         context.externals.emplace_back(FilterRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, outside});
+    }
+    const bool deleted = usesExternal(pattern, DeletedRunEndName), notDeleted = usesExternal(pattern, NotDeletedRunEndName);
+    if ((deleted || notDeleted) && mDeletedRunEnds == nullptr) {
+        llvm::report_fatal_error("tconv: blocking marks without the prefix runs before them");
+    }
+    if (deleted) {
+        context.externals.emplace_back(DeletedRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, mDeletedRunEnds});
+    }
+    if (notDeleted) {
+        StreamSet * const notAfter = mP.CreateStreamSet(1);
+        Invert(mP, mDeletedRunEnds, notAfter);
+        context.externals.emplace_back(NotDeletedRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, notAfter});
     }
     return context;
 }
@@ -6099,12 +6233,82 @@ static void lookaheadContextProblems(const ldml::TransformStep & step, std::vect
     }
 }
 
+//  Whether a rule is among the string rules or the subgroups of a step.
+static bool inStringRulesOrSubgroups(const ldml::TransformStep & step, const ldml::ConversionRule * r) {
+    for (const ldml::StringRule & s : step.stringRules) if (s.rule == r) return true;
+    for (const ldml::CharMapSubgroup & g : step.subgroups) {
+        if (std::find(g.sourceRules.begin(), g.sourceRules.end(), r) != g.sourceRules.end()) return true;
+    }
+    return false;
+}
+
+//  Whether a pattern has a set with a blocking mark (ldml::DeletedRunBlockMark).
+static bool hasBlockingMark(const re::RE * re) {
+    if (re == nullptr) return false;
+    if (const re::CC * cc = llvm::dyn_cast<re::CC>(re)) {
+        return ldml::marksDeletedRunBlock(*cc) || ldml::marksDeletedRunAllow(*cc);
+    }
+    if (const re::Seq * seq = llvm::dyn_cast<re::Seq>(re)) {
+        return std::any_of(seq->begin(), seq->end(), [](const re::RE * e) {return hasBlockingMark(e);});
+    }
+    if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+        return std::any_of(alt->begin(), alt->end(), [](const re::RE * e) {return hasBlockingMark(e);});
+    }
+    if (const re::Rep * rep = llvm::dyn_cast<re::Rep>(re)) return hasBlockingMark(rep->getRE());
+    if (const re::Capture * c = llvm::dyn_cast<re::Capture>(re)) return hasBlockingMark(c->getCapturedRE());
+    if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) return hasBlockingMark(n->getDefinition());
+    if (const re::Assertion * a = llvm::dyn_cast<re::Assertion>(re)) return hasBlockingMark(a->getAsserted());
+    if (const re::Diff * d = llvm::dyn_cast<re::Diff>(re)) return hasBlockingMark(d->getLH()) || hasBlockingMark(d->getRH());
+    if (const re::Intersect * x = llvm::dyn_cast<re::Intersect>(re)) return hasBlockingMark(x->getLH()) || hasBlockingMark(x->getRH());
+    return false;
+}
+
+//  The blocking marks (see ldml::DeletedRunBlockMark) must be in the rules of
+//  the conversion group right after prefix runs that only delete (past
+//  :: Null ;), whose deleted runs the pipeline gives them.
+static void blockingMarkProblems(const ldml::TransformPlan & plan, const ldml::TransformRegistry & registry,
+                                 std::vector<std::string> & problems) {
+    bool after = false;
+    for (const ldml::TransformStep & step : plan.steps) {
+        if (step.kind == ldml::TransformStep::Kind::Transform) {
+            const ldml::TransformEntry * e = registry.lookup(step.transform.getText());
+            if (step.filter || e == nullptr || e->canonicalName != "Any-Null") after = false;
+            continue;
+        }
+        for (const ldml::ConversionRule * r : step.rules) {
+            const ldml::RuleSide * source = r->getSourceSide(ldml::Direction::Forward);
+            if ((!after || !step.prefixRuns.empty()) && (hasBlockingMark(source->getText()) || hasBlockingMark(source->getAfterContext()))) {
+                problems.push_back(ldml::printRule(r) + "  (a blocking mark, not in the group right after prefix runs that only delete)");
+            }
+        }
+        after = !step.prefixRuns.empty() && std::all_of(step.prefixRuns.begin(), step.prefixRuns.end(),
+                                                        [](const ldml::PrefixRun & pr) {return pr.replacement.empty();});
+    }
+}
+
 //  The stream (or stream set) of the CCs for a vector of sets, at each position of U21.
+//  (A set with a blocking mark, ldml::DeletedRunBlockMark, has its characters
+//  where no deleted run precedes them.)
 StreamSet * RulePipelineBuilder::classes(const std::vector<UCD::UnicodeSet> & sets, StreamSet * U21) {
     std::vector<re::CC *> ccs;
     for (const UCD::UnicodeSet & s : sets) ccs.push_back(re::makeCC(s, &cc::Unicode));
     StreamSet * const result = mP.CreateStreamSet(ccs.size());
     mP.CreateKernelCall<CharClassesKernel>(ccs, U21, result);
+    return notAfterDeletedRuns(sets, result);
+}
+
+//  The classes of sets with blocking marks without the positions following a
+//  deleted run (see mDeletedRunEnds).
+StreamSet * RulePipelineBuilder::notAfterDeletedRuns(const std::vector<UCD::UnicodeSet> & sets, StreamSet * classes) {
+    std::vector<unsigned> blocked, allowed;
+    for (size_t i = 0; i < sets.size(); i++) {
+        if (ldml::marksDeletedRunBlock(sets[i])) blocked.push_back(static_cast<unsigned>(i));
+        if (ldml::marksDeletedRunAllow(sets[i])) allowed.push_back(static_cast<unsigned>(i));
+    }
+    if (blocked.empty() && allowed.empty()) return classes;
+    if (mDeletedRunEnds == nullptr) llvm::report_fatal_error("tconv: blocking marks without the prefix runs before them");
+    StreamSet * const result = mP.CreateStreamSet(classes->getNumElements());
+    mP.CreateKernelCall<NotAfterDeletedRuns>(classes, mDeletedRunEnds, blocked, allowed, result);
     return result;
 }
 
@@ -6251,7 +6455,7 @@ StreamSet * RulePipelineBuilder::insertionGroup(const ldml::TransformStep & step
 StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & step, StreamSet * U21) {
     if (insertionsOnly(step)) return insertionGroup(step, U21);
     PreparedSearchReplace sr;
-    if (!activeMask() && engineSearchReplace(step, &sr)) {
+    if (!activeMask() && !mDeletedRunEnds && engineSearchReplace(step, &sr)) {
         RE_PipelineBuilder engine(mP, RE_context{&cc::Unicode, U21});
         StreamSet * const result = mP.CreateStreamSet(21);
         engine.searchReplaceCodeUnitsPipeline(sr, result);
@@ -6360,11 +6564,24 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                          && fusedContexts(rule.engineBefore, true, convertedBefores[r], true)
                          && convertedContextMatters(convertedBefores[r], outcomes);
     }
+    //  The string rules applied only where earlier ones do not match at their
+    //  first positions (see ldml::TransformStep::stringPriority): their matches
+    //  are given to the kernels (see engineFirsts), with their before contexts
+    //  matched against the text as it is.
+    auto prioritized = [&](size_t r) {return r < step.stringPriority.size() && !step.stringPriority[r].empty();};
+    auto yields = [&](size_t g) {return g < step.subgroupPriority.size() && !step.subgroupPriority[g].empty();};
+    for (size_t r = 0; r < numStringRules; r++) {
+        if (prioritized(r)) {
+            fusedMatch[r] = false;
+            convertible[r] = false;
+        }
+    }
     std::vector<bool> correctedString(numStringRules, false);
     for (size_t r = 0; r < numStringRules; r++) {
         correctedString[r] = convertible[r] && step.stringOrder.empty() && !needCoverage;
     }
-    auto engineFirsts = [&](size_t r) {
+    std::function<StreamSet *(size_t)> engineFirsts;
+    auto matchFirsts = [&](size_t r) {
         const ldml::StringRule & rule = step.stringRules[r];
         const size_t n = texts[r].size();
         std::vector<re::RE *> items;
@@ -6382,6 +6599,31 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             }
         }
         return firsts;
+    };
+    //  The first positions of the matches of an earlier rule that others yield
+    //  to: a string rule, or a single-character rule (with the contexts of its
+    //  subgroup).
+    auto earlierFirsts = [&](const ldml::ConversionRule * e) -> StreamSet * {
+        for (size_t r = 0; r < numStringRules; r++) {
+            if (step.stringRules[r].rule == e) return matchFirsts(r);
+        }
+        for (const ldml::CharMapSubgroup & g : step.subgroups) {
+            if (std::find(g.sourceRules.begin(), g.sourceRules.end(), e) == g.sourceRules.end()) continue;
+            const std::vector<ldml::PatternItem> text = ldml::patternItems(e->getSourceSide(ldml::Direction::Forward)->getText());
+            return matchPositions(g.engineBefore, g.engineAfter, {text.front().chars}, U21);
+        }
+        llvm::report_fatal_error("tconv: a rule yielded to is not in its group");
+    };
+    //  The first positions of the matches of a string rule, other than where an
+    //  earlier rule it yields to matches (as ICU tries that rule first).
+    engineFirsts = [&](size_t r) {
+        StreamSet * firsts = matchFirsts(r);
+        if (!prioritized(r)) return firsts;
+        StreamSet * earlier = nullptr;
+        for (const ldml::ConversionRule * e : step.stringPriority[r]) earlier = combine(earlier, earlierFirsts(e), true);
+        StreamSet * const notEarlier = P.CreateStreamSet(1);
+        Invert(P, earlier, notEarlier);
+        return combine(firsts, notEarlier, false);
     };
     auto fusedRule = [&](size_t r) {
         FusedStringRule fr;
@@ -6426,7 +6668,9 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 P.CreateKernelCall<OutsideMask>(classes, mask, outside, marked);
                 classes = marked;
             }
-            return classes;
+            std::vector<UCD::UnicodeSet> of;
+            for (size_t i : indices) of.push_back(sets[i]);
+            return notAfterDeletedRuns(of, classes);
         };
         if (mux.empty()) return kernelOf(rest);
         std::vector<std::vector<size_t>> parts;
@@ -6721,8 +6965,10 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     if (correct && (!step.stringOrder.empty() || needCoverage)) {
         for (size_t r = 0; r < numStringRules; r++) wholeGroup |= convertible[r];
         if (numStringRules > FusedMaxWholeGroupRules || step.subgroups.size() > FusedMaxWholeGroupRules) wholeGroup = false;
-        //  (The coverage of the MultipleCaptureMultipleReplacement rules is not known to the correction kernel.)
+        //  (The coverage of the MultipleCaptureMultipleReplacement rules is not known to the correction kernel,
+        //  nor are the subgroups that yield to string rules, see yields.)
         if (!step.captureReplacements.empty()) wholeGroup = false;
+        for (size_t g = 0; g < step.subgroups.size(); g++) wholeGroup &= !yields(g);
     }
     if (wholeGroup) {
         FusedRulesConfig config;
@@ -7286,7 +7532,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     //  (With insertion rules, a before context may also see the texts
                     //  inserted.)
                     FusedContexts starBefore, after;
-                    if (correct && subgroup.engineBefore && fusedContexts(subgroup.engineAfter, false, after)
+                    if (correct && !yields(g) && subgroup.engineBefore && fusedContexts(subgroup.engineAfter, false, after)
                             && fusedContexts(subgroup.engineBefore, true, starBefore, true)
                             && (!step.insertions.empty() || convertedContextMatters(starBefore, outcomes))) {
                         fg.before = starBefore;
@@ -7296,13 +7542,22 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                         continue;
                     }
                 }
-                if (!fusedContexts(subgroup.engineBefore, true, fg.before) || !fusedContexts(subgroup.engineAfter, false, fg.after)) {
+                if (yields(g) || !fusedContexts(subgroup.engineBefore, true, fg.before) || !fusedContexts(subgroup.engineAfter, false, fg.after)) {
                     fg.before = {FusedContext()};
                     fg.after = {FusedContext()};
                     UCD::UnicodeSet all;
                     for (const ldml::CharMapping & m : maps[g]) all = all + m.chars;
                     fg.match = static_cast<int>(config.sources.size());
-                    config.sources.push_back(FusedMatchSource{matchPositions(subgroup.engineBefore, subgroup.engineAfter, {all}, U21), 0});
+                    StreamSet * positions = matchPositions(subgroup.engineBefore, subgroup.engineAfter, {all}, U21);
+                    if (yields(g)) {
+                        //  (Not where an earlier string rule it yields to matches.)
+                        StreamSet * earlier = nullptr;
+                        for (const ldml::ConversionRule * e : step.subgroupPriority[g]) earlier = combine(earlier, earlierFirsts(e), true);
+                        StreamSet * const notEarlier = P.CreateStreamSet(1);
+                        Invert(P, earlier, notEarlier);
+                        positions = combine(positions, notEarlier, false);
+                    }
+                    config.sources.push_back(FusedMatchSource{positions, 0});
                 }
                 mappings += fg.mappings.size();
                 config.subgroups.push_back(std::move(fg));
@@ -7623,6 +7878,16 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
         FilterByMask(P, keep, Result, kept);
         filterMasks(keep);
         Result = kept;
+        if (maxLength == 0 && !Counts) {
+            //  The positions following the runs deleted (after each P, at the
+            //  end of its run), for the blocking marks of the next step.
+            StreamSet * const moved = P.CreateStreamSet(1);
+            P.CreateKernelCall<KeptAfterDeleted>(Delete, moved);
+            StreamSet * const movedKept = P.CreateStreamSet(1);
+            FilterByMask(P, keep, moved, movedKept);
+            mNextDeletedRunEnds = P.CreateStreamSet(1);
+            P.CreateKernelCall<ShiftForward>(movedKept, mNextDeletedRunEnds, 1);
+        }
     }
     return Result;
 }
@@ -7884,8 +8149,19 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     const bool insertAnywhere = mInsertAnywhere;
     mInsertAnywhere = a.plan.steps.size() == 1 && (a.plan.filter || invokedWithFilter);
     const bool outermost = mDepth++ == 0;
+    StreamSet * const deletedRunEnds = mDeletedRunEnds;
+    StreamSet * const nextDeletedRunEnds = mNextDeletedRunEnds;
+    mNextDeletedRunEnds = nullptr;
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
     for (const ldml::TransformStep & step : a.plan.steps) {
+        //  (The positions of the runs deleted by prefix runs, for the step after
+        //  them, past :: Null ;.)
+        const bool null = step.kind == ldml::TransformStep::Kind::Transform && !step.filter
+                          && mRegistry.lookup(step.transform.getText()) && mRegistry.lookup(step.transform.getText())->canonicalName == "Any-Null";
+        if (!null) {
+            mDeletedRunEnds = mNextDeletedRunEnds;
+            mNextDeletedRunEnds = nullptr;
+        }
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             if (step.filter) pushFilter(step.filterSet, U21);
             mInvokedWithFilter = step.filter != nullptr;
@@ -7905,6 +8181,8 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
         }
     }
     if (a.plan.filter) popFilter();
+    mDeletedRunEnds = deletedRunEnds;
+    mNextDeletedRunEnds = nextDeletedRunEnds;
     mDepth--;
     mInsertAnywhere = insertAnywhere;
     return U21;

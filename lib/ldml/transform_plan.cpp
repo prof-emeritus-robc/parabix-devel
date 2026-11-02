@@ -1973,6 +1973,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 subgroup->contextKey = key;
             }
             subgroup->rules++;
+            subgroup->sourceRules.push_back(c);
             //  The earliest rule for a character takes precedence.
             const UCD::UnicodeSet chars = sets.setOf(items.front(), false) - subgroup->characters();
             if (chars.empty()) continue;

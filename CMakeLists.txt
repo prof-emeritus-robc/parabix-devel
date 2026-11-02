@@ -627,6 +627,11 @@ add_test(
   COMMAND python3 tconv_mark_run_lookahead_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_insertion_fold_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_insertion_fold_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_run_strings_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_run_strings_test.py ${BIN_DIR}/tconv)

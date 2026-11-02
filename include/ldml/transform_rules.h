@@ -982,6 +982,7 @@ struct RevisitStats {
     unsigned chainRevisits = 0;     // moved to a group of their own
     unsigned markRunEdits = 0;      // moved to a group of their own
     unsigned markRunLookaheads = 0; // left with a lookahead and a marker (RunEditMark)
+    unsigned foldedInsertions = 0;  // insertion rules folded into the rules before them
     unsigned blockingMarks = 0;     // groups after prefix runs given blocking marks
     bool keepRecords = false;
     std::vector<RevisitRecord> records;

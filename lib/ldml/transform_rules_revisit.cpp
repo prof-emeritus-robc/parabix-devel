@@ -586,6 +586,7 @@ private:
     bool markRunUnseen(const ConversionRule * r, const MarkRunEdit & e, std::string & reason);
     bool keptCandidate(const ConversionRule * r);
     bool textChars(RE * re, UCD::UnicodeSet & chars);
+    bool foldInsertion(std::vector<Rule *> & group, size_t i, const UCD::UnicodeSet * filter, std::vector<Rule *> & before);
     Rule * markRunLookahead(const ConversionRule * c, const MarkRunEdit & e, const std::vector<Rule *> & group, char32_t mark);
     CharSetAnalysis mSets;
     RevisitStats * mStats;
@@ -2255,6 +2256,116 @@ Rule * Composer::markRunLookahead(const ConversionRule * c, const MarkRunEdit & 
                               Direction::Forward, makeRuleSide(literal(e.replacement + std::u32string(1, mark))));
 }
 
+//  An insertion rule B { } A → I of a group (B and A sets, I a string not
+//  ending with a character of B), folded into the rules whose results end
+//  with a character of B: each such rule r (without an after context or text
+//  to revisit) gets a variant r } A' → (its result) I, just before it, and
+//  each deletion (without contexts) a variant B { r } A' → I.  ICU
+//  inserts I where the cursor is before a character of A after a character
+//  of B, which, with
+//    - no rule before the insertion beginning with a character of A' (nor a
+//      text that may be empty),
+//    - each character of B within the filter replaced by a rule (a set
+//      alone, without contexts), so that none is left as it is,
+//    - no other rule revisiting text that may begin with a character of A,
+//      but rules C → | x... (C a set alone, without contexts, x in A) that
+//      alone match the characters of C, which make A' = A + C,
+//    - no rule leaving a character of B before text to revisit,
+//  happens just after such a rule r matches before a character of A' (the
+//  text after the cursor is unchanged), or, after a character of B outside
+//  the filter (which the before context sees, as it is), at a character of
+//  A': there, the insertion (B - filter) { } A' → I in a group before
+//  (before).
+bool Composer::foldInsertion(std::vector<Rule *> & group, size_t i, const UCD::UnicodeSet * filter, std::vector<Rule *> & before) {
+    const ConversionRule * const ins = dyn_cast<ConversionRule>(group[i]);
+    if (ins == nullptr) return false;
+    const RuleSide * const source = ins->getSourceSide(Direction::Forward);
+    const RuleSide * const result = ins->getResultSide(Direction::Forward);
+    std::vector<RE *> atoms;
+    textAtoms(source->getText(), atoms);
+    if (!atoms.empty() || !source->hasBeforeContext() || !source->hasAfterContext() || result->hasCursor()) return false;
+    std::u32string inserted;
+    if (!resultString(result->getText(), {}, inserted) || inserted.empty()) return false;
+    std::vector<Item> b, a;
+    if (!collectItems(source->getBeforeContext(), b) || b.size() != 1 || !collectItems(source->getAfterContext(), a) || a.size() != 1) return false;
+    for (const Item & item : {b[0], a[0]}) {
+        if (item.boundary || item.star || item.optional || item.chars.empty()) return false;
+    }
+    const UCD::UnicodeSet B = b[0].chars, A = a[0].chars;
+    if (B.contains(inserted.back())) return false;
+    UCD::UnicodeSet extended = A, replaced;
+    std::vector<UCD::UnicodeSet> firsts(group.size()), feeding(group.size());
+    std::vector<bool> producer(group.size(), false);
+    for (size_t k = 0; k < group.size(); ++k) {
+        const ConversionRule * c = dyn_cast<ConversionRule>(group[k]);
+        if (c == nullptr || k == i) continue;
+        const RuleSide * s = c->getSourceSide(Direction::Forward);
+        const RuleSide * r = c->getResultSide(Direction::Forward);
+        bool nullable = false;
+        if (!firstChars(s->getText(), firsts[k], nullable) || nullable) return false;
+        std::vector<Item> text;
+        const bool alone = !s->hasBeforeContext() && !s->hasAfterContext() && collectItems(s->getText(), text) && text.size() == 1
+                           && !text[0].star && !text[0].optional && !text[0].boundary;
+        if (alone) replaced = replaced + text[0].chars;
+        if (r->hasCursor()) {
+            std::vector<RE *> completed, revisit;
+            textAtoms(r->getCompletedResult(), completed);
+            textAtoms(r->getResultToRevisit(), revisit);
+            UCD::UnicodeSet last, next;
+            if (!completed.empty() && (!textChars(completed.back(), last) || last.intersects(B))) return false;
+            if (revisit.empty()) continue;
+            if (!textChars(revisit.front(), next)) return false;
+            if (!next.intersects(A)) continue;
+            if (!alone || !completed.empty() || r->getCursorOffset() != 0 || !next.subset(A)) return false;
+            feeding[k] = text[0].chars;
+            extended = extended + text[0].chars;
+        } else {
+            std::vector<RE *> res;
+            textAtoms(r->getText(), res);
+            UCD::UnicodeSet last;
+            if (res.empty()) {
+                //  (A deletion leaves the result before it.)
+                if (s->hasBeforeContext() || s->hasAfterContext()) return false;
+                producer[k] = true;
+                continue;
+            }
+            if (!textChars(res.back(), last)) return false;
+            if (!last.intersects(B)) continue;
+            std::u32string out;
+            if (s->hasAfterContext() || !resultString(r->getText(), {}, out) || out.empty() || !B.contains(out.back())) return false;
+            producer[k] = true;
+        }
+    }
+    for (size_t k = 0; k < group.size(); ++k) {
+        if (k == i || !isa<ConversionRule>(group[k])) continue;
+        if (k < i && firsts[k].intersects(extended)) return false;
+        for (size_t j = 0; j < group.size(); ++j) {
+            if (j != k && j != i && isa<ConversionRule>(group[j]) && !feeding[k].empty() && firsts[j].intersects(feeding[k])) return false;
+        }
+    }
+    if (!(filter ? B & *filter : B).subset(replaced)) return false;
+    if (filter && !(B - *filter).empty()) {
+        before.push_back(makeConversionRule(makeRuleSide(makeCC(B - *filter), makeSeq(), makeCC(extended)), Direction::Forward,
+                                            makeRuleSide(literal(inserted))));
+    }
+    std::vector<Rule *> out;
+    for (size_t k = 0; k < group.size(); ++k) {
+        if (k == i) continue;
+        if (producer[k]) {
+            const ConversionRule * c = cast<ConversionRule>(group[k]);
+            const RuleSide * s = c->getSourceSide(Direction::Forward);
+            std::u32string res;
+            resultString(c->getResultSide(Direction::Forward)->getText(), {}, res);
+            RE * const before = res.empty() ? source->getBeforeContext() : s->getBeforeContext();
+            out.push_back(makeConversionRule(makeRuleSide(before, s->getText(), makeCC(extended)), Direction::Forward,
+                                             makeRuleSide(literal(res + inserted))));
+        }
+        out.push_back(group[k]);
+    }
+    group = std::move(out);
+    return true;
+}
+
 //  A rule that the mark run edits keep before them (see markRunSplit): its
 //  text and after context sequences of sets, without a before context.
 bool Composer::keptCandidate(const ConversionRule * r) {
@@ -2506,6 +2617,20 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
         //  First the rules whose text to revisit is the end of their text, which
         //  are rewritten (and applied as rewritten in the compositions).
         std::vector<Rule *> rewritten(rules.begin() + start, rules.begin() + end);
+        //  The insertion rules that may be folded into the rules before them
+        //  (see foldInsertion).
+        std::vector<Rule *> outside;
+        for (size_t k = 0; k < rewritten.size(); ) {
+            if (foldInsertion(rewritten, k, filter ? &*filter : nullptr, outside)) {
+                if (mStats) mStats->foldedInsertions++;
+            } else {
+                ++k;
+            }
+        }
+        if (!outside.empty()) {
+            out.insert(out.end(), outside.begin(), outside.end());
+            out.push_back(makeTransformRule(TransformID("Null")));
+        }
         //  A rule inserting a string between its captures and revisiting all (the
         //  first that may), as an insertion rule in a group before (see
         //  insertionRevisit).

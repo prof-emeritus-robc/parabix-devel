@@ -195,6 +195,10 @@ struct MultipleCaptureMultipleReplacementSet {
     re::RE * after = nullptr;
     re::RE * engineBefore = nullptr;
     re::RE * engineAfter = nullptr;
+    //  Whether engineBefore, matched against the text itself, is a before
+    //  context on the converted text translated to the text (see
+    //  sourceBeforeContext in tconv).
+    bool sourceBefore = false;
     bool startsByFirst = false;
     //  If startsByFirst: the characters at which the matches begin (those of
     //  T0[0] or, with T0 empty, of the set with which B1 begins).

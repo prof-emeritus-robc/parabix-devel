@@ -1266,6 +1266,57 @@ protected:
     }
 };
 
+//  The streams of Classes, those at the indices given (the last characters of
+//  P of several characters, see ldml::PrefixRun) only where the classes of the
+//  characters before them (in Prefixes) precede them.
+class PrecededBy final : public pablo::PabloKernel {
+public:
+    PrecededBy(LLVMTypeSystemInterface & ts, StreamSet * Classes, StreamSet * Prefixes,
+               const std::vector<std::pair<unsigned, std::vector<unsigned>>> & specs, StreamSet * Out)
+    : PabloKernel(ts, "PrecededBy" + std::to_string(Classes->getNumElements()) + "_" + std::to_string(Prefixes->getNumElements()) + [&] {
+                      std::string s;
+                      for (const auto & sp : specs) {
+                          s += "_" + std::to_string(sp.first) + ":";
+                          for (unsigned j : sp.second) s += std::to_string(j) + ",";
+                      }
+                      return s;
+                  }(),
+                  {Binding{"Classes", Classes}, Binding{"Prefixes", Prefixes}}, {Binding{"Out", Out}})
+    , mSpecs(specs) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> classes = getInputStreamSet("Classes");
+        std::vector<PabloAST *> prefixes = getInputStreamSet("Prefixes");
+        for (const auto & sp : mSpecs) {
+            const unsigned k = static_cast<unsigned>(sp.second.size());
+            for (unsigned j = 0; j < k; j++) {
+                classes[sp.first] = pb.createAnd(classes[sp.first], pb.createAdvance(prefixes[sp.second[j]], k - j));
+            }
+        }
+        writeOutputStreamSet("Out", classes);
+    }
+private:
+    const std::vector<std::pair<unsigned, std::vector<unsigned>>> mSpecs;
+};
+
+//  The positions following runs deleted before (Prior), carried through the
+//  deletions of a step (Delete): those kept, and for those deleted, the next
+//  position kept.
+class AfterDeletedCarried final : public pablo::PabloKernel {
+public:
+    AfterDeletedCarried(LLVMTypeSystemInterface & ts, StreamSet * Prior, StreamSet * Delete, StreamSet * Out)
+    : PabloKernel(ts, "AfterDeletedCarried", {Binding{"Prior", Prior}, Binding{"Delete", Delete}}, {Binding{"Out", Out}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const prior = getInputStreamSet("Prior")[0];
+        PabloAST * const del = getInputStreamSet("Delete")[0];
+        PabloAST * const moved = pb.createMatchStar(pb.createAdvance(pb.createAnd(prior, del), 1), del);
+        writeOutputStreamSet("Out", std::vector<PabloAST *>{pb.createAnd(pb.createNot(del), pb.createOr(prior, moved))});
+    }
+};
+
 //  Single streams collected into a stream set.
 class CollectStreams : public pablo::PabloKernel {
 public:
@@ -2200,7 +2251,27 @@ private:
 }
 
 //  The alternatives of a context, if they can be matched in a fused kernel.
+//  Whether a pattern has a set marked to match after a deleted run as well
+//  (ldml::marksDeletedRunAllow): it is matched by the engine (see FilterRunEnds),
+//  which also matches it at the end of the text after a deleted run.
+static bool hasAllowMark(const re::RE * re) {
+    if (re == nullptr) return false;
+    if (const re::CC * cc = llvm::dyn_cast<re::CC>(re)) return ldml::marksDeletedRunAllow(*cc);
+    if (const re::Seq * seq = llvm::dyn_cast<re::Seq>(re)) {
+        return std::any_of(seq->begin(), seq->end(), [](const re::RE * e) {return hasAllowMark(e);});
+    }
+    if (const re::Alt * alt = llvm::dyn_cast<re::Alt>(re)) {
+        return std::any_of(alt->begin(), alt->end(), [](const re::RE * e) {return hasAllowMark(e);});
+    }
+    if (const re::Rep * rep = llvm::dyn_cast<re::Rep>(re)) return hasAllowMark(rep->getRE());
+    if (const re::Capture * c = llvm::dyn_cast<re::Capture>(re)) return hasAllowMark(c->getCapturedRE());
+    if (const re::Name * n = llvm::dyn_cast<re::Name>(re)) return hasAllowMark(n->getDefinition());
+    if (const re::Assertion * a = llvm::dyn_cast<re::Assertion>(re)) return hasAllowMark(a->getAsserted());
+    return false;
+}
+
 static bool fusedContexts(re::RE * context, bool before, FusedContexts & alternatives, bool allowStar = false) {
+    if (hasAllowMark(context)) return false;
     return ContextExpansion(before, allowStar).expand(context, alternatives);
 }
 
@@ -5449,6 +5520,9 @@ private:
     //  prefix runs, for the next (past :: Null ;).
     StreamSet * mDeletedRunEnds = nullptr;
     StreamSet * mNextDeletedRunEnds = nullptr;
+    //  Likewise the characters followed by such a run (at the end of the text too).
+    StreamSet * mDeletedRunAfter = nullptr;
+    StreamSet * mNextDeletedRunAfter = nullptr;
     //  Whether the transform applied is a single conversion group with its own
     //  filter (or one where it is invoked), whose insertions the filter does
     //  not restrict (see insertionGroup), and whether the transform about to be
@@ -6024,6 +6098,7 @@ static re::RE * possessiveBefore(re::RE * engineBefore) {
 static const std::string FilterRunEndName = "tconvFilterRunEnd";
 static const std::string DeletedRunEndName = "tconvDeletedRunEnd";
 static const std::string NotDeletedRunEndName = "tconvNotDeletedRunEnd";
+static const std::string DeletedRunAfterName = "tconvDeletedRunAfter";
 
 //  A pattern with the sets including ldml::FilterRunEndMark matching the
 //  positions outside the filter (FilterRunEndName) instead, and those with
@@ -6035,6 +6110,23 @@ class FilterRunEnds final : public re::RE_Transformer {
 public:
     FilterRunEnds() : re::RE_Transformer("FilterRunEnds") {}
 protected:
+    //  A sequence ending with a set marked to match after a deleted run as well
+    //  (the last item of an after context, ldml::marksDeletedRunAllow): X Y as
+    //  X Y where no run was deleted before Y, or X followed by a deleted run
+    //  (DeletedRunAfterName), with nothing after it (also at the end of the text).
+    re::RE * transformSeq(re::Seq * seq) override {
+        re::CC * const last = seq->size() >= 2 ? llvm::dyn_cast<re::CC>(seq->back()) : nullptr;
+        if (last == nullptr || !ldml::marksDeletedRunAllow(*last)) return re::RE_Transformer::transformSeq(seq);
+        static re::Name * const after = re::makeName(DeletedRunAfterName, re::makeCC(0xD6, 0xD6, &cc::Byte));
+        static re::Name * const notDeleted = re::makeName(NotDeletedRunEndName, re::makeCC(0xD5, 0xD5, &cc::Byte));
+        std::vector<re::RE *> items;
+        for (auto i = seq->begin(); i + 1 != seq->end(); ++i) items.push_back(transform(*i));
+        re::CC * const rest = re::subtractCC(last, re::makeCC(ldml::DeletedRunBlockMark + 1, &cc::Unicode));
+        std::vector<re::RE *> ended(items.begin(), items.end());
+        ended.back() = re::Intersect::Create(ended.back(), after);
+        items.push_back(re::Intersect::Create(rest, notDeleted));
+        return re::makeAlt({re::makeSeq(ended.begin(), ended.end()), re::makeSeq(items.begin(), items.end())});
+    }
     re::RE * transformCC(re::CC * cc) override {
         const bool runEnd = ldml::marksFilterRunEnd(*cc);
         const bool blocked = ldml::marksDeletedRunBlock(*cc);
@@ -6131,6 +6223,10 @@ RE_context RulePipelineBuilder::engineContext(StreamSet * U21, const re::RE * pa
         context.externals.emplace_back(FilterRunEndName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, outside});
     }
     const bool deleted = usesExternal(pattern, DeletedRunEndName), notDeleted = usesExternal(pattern, NotDeletedRunEndName);
+    if (usesExternal(pattern, DeletedRunAfterName)) {
+        if (mDeletedRunAfter == nullptr) llvm::report_fatal_error("tconv: blocking marks without the prefix runs before them");
+        context.externals.emplace_back(DeletedRunAfterName, ExternalStream{ExternalStreamKind::FixedLength, 0, {1, 1}, mDeletedRunAfter});
+    }
     if ((deleted || notDeleted) && mDeletedRunEnds == nullptr) {
         llvm::report_fatal_error("tconv: blocking marks without the prefix runs before them");
     }
@@ -7840,7 +7936,32 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
     };
     const unsigned selectBits = bitsFor(static_cast<unsigned>(replacements.size()) - 1);
     const unsigned countBits = maxLength > 1 ? bitsFor(maxLength - 1) : 0;
-    StreamSet * const Classes = classes(sets, U21);
+    StreamSet * Classes = classes(sets, U21);
+    //  (P of several characters: its last only after the characters before it.)
+    std::vector<UCD::UnicodeSet> prefixSets;
+    std::vector<std::pair<unsigned, std::vector<unsigned>>> preceded;
+    for (size_t f = 0; f < firsts.size(); f++) {
+        const ldml::PrefixRun * of = nullptr;
+        for (const ldml::PrefixRun & pr : step.prefixRuns) {
+            if (pr.first == firsts[f]) {
+                if (of && of->prefix != pr.prefix) llvm::report_fatal_error("tconv: prefix runs of the same P with different characters before it");
+                of = &pr;
+            }
+        }
+        if (of == nullptr || of->prefix.empty()) continue;
+        std::vector<unsigned> indices;
+        for (const UCD::UnicodeSet & p : of->prefix) {
+            indices.push_back(static_cast<unsigned>(prefixSets.size()));
+            prefixSets.push_back(p);
+        }
+        preceded.emplace_back(static_cast<unsigned>(f), indices);
+    }
+    if (!preceded.empty()) {
+        StreamSet * const Prefixes = classes(prefixSets, U21);
+        StreamSet * const Out = P.CreateStreamSet(Classes->getNumElements());
+        P.CreateKernelCall<PrecededBy>(Classes, Prefixes, preceded, Out);
+        Classes = Out;
+    }
     StreamSet * Result = P.CreateStreamSet(21);
     StreamSet * Select = P.CreateStreamSet(selectBits + 1);
     StreamSet * const Counts = countBits ? P.CreateStreamSet(countBits) : nullptr;
@@ -7880,13 +8001,28 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
         Result = kept;
         if (maxLength == 0 && !Counts) {
             //  The positions following the runs deleted (after each P, at the
-            //  end of its run), for the blocking marks of the next step.
+            //  end of its run), for the blocking marks of the next step; with
+            //  those of prefix runs before (P of one character, before these of
+            //  several), carried through these deletions.
             StreamSet * const moved = P.CreateStreamSet(1);
             P.CreateKernelCall<KeptAfterDeleted>(Delete, moved);
             StreamSet * const movedKept = P.CreateStreamSet(1);
             FilterByMask(P, keep, moved, movedKept);
             mNextDeletedRunEnds = P.CreateStreamSet(1);
             P.CreateKernelCall<ShiftForward>(movedKept, mNextDeletedRunEnds, 1);
+            mNextDeletedRunAfter = movedKept;
+            if (mDeletedRunAfter) {
+                StreamSet * const afterKept = P.CreateStreamSet(1);
+                FilterByMask(P, keep, mDeletedRunAfter, afterKept);
+                mNextDeletedRunAfter = combine(mNextDeletedRunAfter, afterKept, true);
+            }
+            if (mDeletedRunEnds) {
+                StreamSet * const carried = P.CreateStreamSet(1);
+                P.CreateKernelCall<AfterDeletedCarried>(mDeletedRunEnds, Delete, carried);
+                StreamSet * const carriedKept = P.CreateStreamSet(1);
+                FilterByMask(P, keep, carried, carriedKept);
+                mNextDeletedRunEnds = combine(mNextDeletedRunEnds, carriedKept, true);
+            }
         }
     }
     return Result;
@@ -8151,7 +8287,10 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     const bool outermost = mDepth++ == 0;
     StreamSet * const deletedRunEnds = mDeletedRunEnds;
     StreamSet * const nextDeletedRunEnds = mNextDeletedRunEnds;
+    StreamSet * const deletedRunAfter = mDeletedRunAfter;
+    StreamSet * const nextDeletedRunAfter = mNextDeletedRunAfter;
     mNextDeletedRunEnds = nullptr;
+    mNextDeletedRunAfter = nullptr;
     if (a.plan.filter) pushFilter(a.plan.filterSet, U21);
     for (const ldml::TransformStep & step : a.plan.steps) {
         //  (The positions of the runs deleted by prefix runs, for the step after
@@ -8161,6 +8300,8 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
         if (!null) {
             mDeletedRunEnds = mNextDeletedRunEnds;
             mNextDeletedRunEnds = nullptr;
+            mDeletedRunAfter = mNextDeletedRunAfter;
+            mNextDeletedRunAfter = nullptr;
         }
         if (step.kind == ldml::TransformStep::Kind::Transform) {
             if (step.filter) pushFilter(step.filterSet, U21);
@@ -8183,6 +8324,8 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
     if (a.plan.filter) popFilter();
     mDeletedRunEnds = deletedRunEnds;
     mNextDeletedRunEnds = nextDeletedRunEnds;
+    mDeletedRunAfter = deletedRunAfter;
+    mNextDeletedRunAfter = nextDeletedRunAfter;
     mDepth--;
     mInsertAnywhere = insertAnywhere;
     return U21;

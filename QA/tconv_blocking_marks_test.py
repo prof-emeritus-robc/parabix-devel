@@ -8,7 +8,8 @@
 #  within a match or its after context, other than after its first character
 #  (or after a character at which ICU revisits).  The rules that DisambiguateOrder
 #  cannot keep apart from an earlier marked rule apply only where it does not
-#  match (TransformStep::stringPriority, subgroupPriority).  The expected
+#  match (TransformStep::stringPriority, subgroupPriority).  Prefix runs of P of
+#  several characters (tsu~ → | ts) are applied after the others.  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
 #  tconv_blocking_marks_test.py <tconv binary>
@@ -32,6 +33,9 @@ GROUPS = [
     # Composed alternatives left to priority (ss → | ~s)
     ("$c = [bcdfghlmnpqrstvz] ;\n($c) \\' \u2192 | $1 ;\n\\' \u2192 ;\nss \u2192 | \\~s ;\n\\~sa \u2192 S ;\n[:^Letter:] { sa \u2192 Q ;\ns \u2192 Z ;\na \u2192 A ;\n",
      [("ss'a", '~Q'), ('ssa', 'S'), ('sa', 'Q'), ("s'a", 'Q'), ("sss'a", '~~Q'), ("ss's'a", '~~Q')]),
+    # Prefix runs of P of several characters (tsu~ → | ts), after those of one (te~ → | t)
+    ("te\\~ \u2192 | t ;\nto\\~ \u2192 | t ;\ntsu\\~ \u2192 | ts ;\nts \u2192 C ;\nt \u2192 T ;\n\\~tsu \u2192 | tsu ;\ns \u2192 S ;\nu \u2192 U ;\ne \u2192 E ;\no \u2192 O ;\na \u2192 A ;\n",
+     [('tsu~a', 'CA'), ('tsu~u~a', 'CA'), ('te~su~a', 'CA'), ('te~tsu~a', 'TCA'), ('~tsu~a', 'CA'), ('~tsa', '~CA'), ('~te~su', '~CU'), ('tsu~', 'C'), ('~tsu~', 'C'), ('tsu~e~a', 'CE~A'), ('~tsu~u~', 'C'), ('te~to~a', 'TTA'), ('tsu', 'CU')]),
 ]
 
 

@@ -982,8 +982,14 @@ struct RevisitStats {
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats = nullptr);
 
 //  The sets P and S and the string A of a prefix run (see ComposeRevisits).
+//  A prefix run may also have a text P of several characters, p1 ... pk S →
+//  | p1 ... pk ; (literal characters, A empty: ja_Latn-ru's tsu~ → | ts ;):
+//  first is then the set of pk, and prefix those of p1 ... pk-1, which
+//  precede it.  Such runs are applied after the others, in a group of their
+//  own (where the characters of P stay where they are).
 struct PrefixRun {
-    UCD::UnicodeSet first;          // P
+    UCD::UnicodeSet first;          // P (or its last character)
+    std::vector<UCD::UnicodeSet> prefix;    // the characters of P before its last
     std::vector<UCD::UnicodeSet> run;   // S: the sets S1 ... Sm
     std::u32string replacement;     // A
     bool revisitsReplacement = false;   // (P) S → A | $1 ;  (ICU revisits A $1)

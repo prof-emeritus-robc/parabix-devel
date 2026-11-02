@@ -430,33 +430,71 @@ void noteTrigger(RevisitRecord * record, const GroupRule & g, unsigned depth, bo
 //  run before it tries the rule); otherwise (for a composed rule) those given.
 //  The set at such an offset may not contain a first character of a text S
 //  (ICU might match it there), and the offsets must be fixed.
+//  With prefix runs of P of several characters (see PrefixRun), the run after
+//  such a P at the start of the text is deleted first too (ICU, at its first
+//  character, deletes it), and the last item of an after context, after the
+//  last character of P, that contains the first characters of the texts S of
+//  the runs that may follow it matches after a deleted run as well (where
+//  ICU sees the first character of the run; marksDeletedRunAllow).
 struct BlockMarker {
-    UCD::UnicodeSet first;              // P
+    UCD::UnicodeSet first;              // P (and the last characters of P of several)
     UCD::UnicodeSet runStart;           // the first sets of the texts S
+    std::vector<std::vector<UCD::UnicodeSet>> sequences;    // the P of several characters
+    std::vector<std::pair<UCD::UnicodeSet, UCD::UnicodeSet>> starts;   // (P or its last character, S1)
     bool own = true;
     std::set<unsigned> offsets;         // (if !own) the offsets to mark
     std::set<unsigned> marked;          // the offsets marked
     std::string failure;                // why the rule cannot be marked
+    bool inAfter = false;               // marking the after context
     RE * mark(RE * re);
     CharSetAnalysis mSets;
     std::optional<unsigned> mAt = 0;    // the offset of the next item, if fixed
     bool mAfterP = false;               // the item before it may be a character of P
+    UCD::UnicodeSet mPrevious;          // the item before it
+    std::vector<bool> mPrefixOf;        // the sequences that the items so far begin
+    bool mAllowed = false;              // an item marked to match after a deleted run (the last)
 };
 
 RE * BlockMarker::mark(RE * re) {
     if (!failure.empty()) return re;
     if (CharSetAnalysis::isSet(re) && !hasStrings(re)) {
         const UCD::UnicodeSet s = mSets.setOf(re, false);
-        const bool afterRun = own ? mAfterP && mAt && *mAt >= 2 : mAt && offsets.count(*mAt);
+        if (mAllowed) failure = "an item after one matching the first character of a prefix run";
+        //  (After a P of several characters that the text begins with.)
+        bool transparent = false;
+        if (mAt) {
+            if (mPrefixOf.empty()) mPrefixOf.assign(sequences.size(), *mAt == 0);
+            for (size_t q = 0; q < sequences.size(); ++q) transparent |= mPrefixOf[q] && sequences[q].size() == *mAt;
+        }
+        const bool afterRun = own ? mAfterP && mAt && *mAt >= 2 && !transparent : mAt && offsets.count(*mAt);
         if (own && mAfterP && !mAt) failure = "a set after a character of P at an offset that is not fixed";
         RE * result = re;
         if (afterRun) {
             if (hasBoundary(re)) failure = "a set including the text boundary after a character of P";
-            if (s.intersects(runStart)) failure = "a set after a character of P may match the text of a prefix run";
-            marked.insert(*mAt);
-            result = makeCC(withDeletedRunBlock(s));
+            //  The first characters of the runs that may have been deleted here.
+            UCD::UnicodeSet s1;
+            for (const auto & st : starts) {
+                if (st.first.intersects(mPrevious)) s1 = s1 + st.second;
+            }
+            if (inAfter && !s1.empty() && s1.subset(s)) {
+                marked.insert(*mAt);
+                mAllowed = true;
+                UCD::UnicodeSet allowed = s;
+                allowed.insert(DeletedRunBlockMark + 1);
+                result = makeCC(allowed - UCD::UnicodeSet(DeletedRunBlockMark));
+            } else {
+                if (s.intersects(s1)) failure = "a set after a character of P may match the text of a prefix run";
+                marked.insert(*mAt);
+                result = makeCC(withDeletedRunBlock(s));
+            }
+        }
+        if (mAt) {
+            for (size_t q = 0; q < sequences.size(); ++q) {
+                mPrefixOf[q] = mPrefixOf[q] && *mAt < sequences[q].size() && s.subset(sequences[q][*mAt]);
+            }
         }
         mAfterP = s.intersects(first);
+        mPrevious = s;
         if (mAt) ++*mAt;
         return result;
     } else if (Seq * seq = dyn_cast<Seq>(re)) {
@@ -510,6 +548,7 @@ RE * BlockMarker::mark(RE * re) {
 ConversionRule * blockMarked(ConversionRule * c, BlockMarker & marker) {
     const RuleSide * source = c->getSourceSide(Direction::Forward);
     RE * const text = marker.mark(source->getText());
+    marker.inAfter = true;
     RE * const after = source->getAfterContext() ? marker.mark(source->getAfterContext()) : nullptr;
     if (marker.failure.empty() && !marker.own && marker.marked != marker.offsets) {
         marker.failure = "an offset after a character of P beyond the text and the after context, or not fixed";
@@ -731,6 +770,13 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
     if (mBlocking && p.pending.size() == 1 && mBlock.first.contains(p.pending[0])) {
         p.transparent.insert(mTextLength + static_cast<unsigned>(p.beyond.size()));
     }
+    //  (Likewise at the first character of a P of several characters, the text to revisit.)
+    for (const auto & seq : mBlock.sequences) {
+        if (!mBlocking || seq.size() != p.pending.size()) continue;
+        bool is = true;
+        for (size_t i = 0; i < seq.size() && is; ++i) is = seq[i].contains(p.pending[i]);
+        if (is) p.transparent.insert(mTextLength + static_cast<unsigned>(p.beyond.size()));
+    }
     if (mReturns && returnsToText(p)) {
         const unsigned split = mTextLength + static_cast<unsigned>(p.beyond.size()) - static_cast<unsigned>(p.pending.size());
         finish(std::move(p), text, composed, split);
@@ -809,9 +855,15 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
             }
             const unsigned b0 = mTextLength + static_cast<unsigned>(p.beyond.size());
             bool afterP = mBlock.first.contains(p.pending.back());
+            UCD::UnicodeSet previous(p.pending.back());
             for (size_t j = 0; j < beyond.size(); ++j) {
+                UCD::UnicodeSet s1;
+                for (const auto & st : mBlock.starts) {
+                    if (st.first.intersects(previous)) s1 = s1 + st.second;
+                }
+                previous = beyond[j];
                 if (afterP && !q.transparent.count(b0 + j)) {
-                    if (beyond[j].intersects(mBlock.runStart)) {
+                    if (beyond[j].intersects(s1)) {
                         throw NotComposed{"blocking marks: a rule may match the text of a prefix run after a character of P: "
                                           + printRule(g.rule)};
                     }
@@ -968,7 +1020,9 @@ void Composer::finish(Path p, RE * text, std::vector<Rule *> & composed, std::op
     if (!mEmitted.insert(key).second) return;
     ConversionRule * rule = makeConversionRule(makeRuleSide(before, fullText, afterRE), Direction::Forward, makeRuleSide(literal(p.out)));
     if (mBlocking) {
-        BlockMarker marker{mBlock.first, mBlock.runStart, false, p.blocked};
+        BlockMarker marker = mBlock;
+        marker.own = false;
+        marker.offsets = p.blocked;
         rule = blockMarked(rule, marker);
         if (rule == nullptr) throw NotComposed{"blocking marks: " + marker.failure};
     }
@@ -1089,7 +1143,7 @@ std::vector<Rule *> Composer::composeRuleOnce(ConversionRule * r, const std::vec
         if (mBlocking) {
             //  The runs within the match of the rule itself.
             if (mTextSets.empty()) throw NotComposed{"blocking marks: the text is not a fixed-length sequence of characters"};
-            BlockMarker marker{mBlock.first, mBlock.runStart};
+            BlockMarker marker = mBlock;
             marker.mark(source->getText());
             if (source->getAfterContext()) marker.mark(source->getAfterContext());
             if (!marker.failure.empty()) throw NotComposed{"blocking marks: " + marker.failure};
@@ -1261,8 +1315,34 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
                               std::vector<std::vector<RE *>> * exceptions = nullptr, bool * blocking = nullptr) {
     if (exceptions) exceptions->assign(runs.size(), {});
     if (blocking) *blocking = false;
-    const std::string families = prefixRunFamilies(runs);
-    if (!families.empty()) return families;
+    //  (The prefix runs with P of several characters, applied after the others:
+    //  their families apart, and the first characters of their P, which ICU
+    //  must reach as it does P.)
+    std::vector<PrefixRun> single, several;
+    UCD::UnicodeSet singleFirst, severalStart, severalLast;
+    for (const PrefixRun & pr : runs) {
+        if (pr.prefix.empty()) {
+            single.push_back(pr);
+            singleFirst = singleFirst + pr.first;
+        } else {
+            several.push_back(pr);
+            severalStart = severalStart + pr.prefix.front();
+            severalLast = severalLast + pr.first;
+        }
+    }
+    for (const std::vector<PrefixRun> * part : {&single, &several}) {
+        const std::string families = part->empty() ? "" : prefixRunFamilies(*part);
+        if (!families.empty()) return families;
+    }
+    if (!several.empty()) {
+        if (blocking == nullptr || exceptions != nullptr || !triggers.empty()) {
+            return "a prefix run with P of several characters, applied only with blocking marks";
+        }
+        if (severalLast.intersects(singleFirst)) return "a prefix run with P of several characters ending with the P of another";
+    }
+    //  The characters of P that ICU must reach: those of P of one character,
+    //  and the first of P of several.
+    const UCD::UnicodeSet reached = singleFirst + severalStart;
     UCD::UnicodeSet first, run, runStart, replaced;
     bool sameLength = true;
     bool revisitsReplacement = true;
@@ -1422,6 +1502,24 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             if (!after.empty() && !after[0].repeated) next = &after[0].chars;
         }
         for (const PrefixRun * pr : later[k]) {
+            if (!pr->prefix.empty()) {
+                //  (P of several characters: the items of the text and after
+                //  context, as far as they go, against P and S1.)
+                std::vector<PatternItem> seen = text;
+                if (source->hasAfterContext()) {
+                    for (const PatternItem & item : patternItems(source->getAfterContext())) seen.push_back(item);
+                }
+                std::vector<UCD::UnicodeSet> seq = pr->prefix;
+                seq.push_back(pr->first);
+                seq.push_back(pr->run.front());
+                bool applies = true;
+                for (size_t i = 0; i < seq.size() && i < seen.size() && applies; ++i) {
+                    if (seen[i].repeated) break;
+                    applies = seen[i].chars.intersects(seq[i]);
+                }
+                if (applies) return "a rule before a prefix run may apply instead: " + printRule(c);
+                continue;
+            }
             if (text[0].chars.intersects(pr->first) && (next == nullptr || next->intersects(pr->run.front()))) {
                 //  An exception of the prefix run: P S X } C → R.
                 std::vector<RE *> x;
@@ -1444,8 +1542,8 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             if (text[i].chars.intersects(replaced) && !(single && revisitsReplacement)) {
                 return "a rule may match a replacement: " + printRule(c);
             }
-            if ((i > 0 || text[i].repeated) && text[i].chars.intersects(first)) {
-                if (runDeleted) {
+            if ((i > 0 || text[i].repeated) && text[i].chars.intersects(reached)) {
+                if (runDeleted && !text[i].chars.intersects(severalStart)) {
                     *blocking = true;
                     continue;
                 }
@@ -1477,6 +1575,14 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
         if (RE * revisit = c->getResultSide(Direction::Forward)->getResultToRevisit()) {
             const std::vector<PatternItem> items = patternItems(revisit);
             for (size_t i = 0; i < items.size(); ++i) {
+                //  (The first character of a P of several characters, followed by
+                //  the rest of P, or at the end.)
+                if (items[i].chars.intersects(severalStart) && (items[i].repeated || i + 1 == items.size() || items[i + 1].repeated
+                        || std::any_of(several.begin(), several.end(), [&](const PrefixRun & pr) {
+                               return items[i + 1].chars.intersects(pr.prefix.size() > 1 ? pr.prefix[1] : pr.first);
+                           }))) {
+                    return "a rule revisits the first character of a prefix run of several characters: " + printRule(c);
+                }
                 if (items[i].chars.intersects(first)
                         && (items[i].repeated || i + 1 == items.size() || items[i + 1].chars.intersects(runStart))) {
                     //  (A rule of one character revisiting, at the end, a character
@@ -1671,7 +1777,7 @@ bool prefixRunTrigger(const ConversionRule * c, const UCD::UnicodeSet & first, P
 //  without a before context (or then p S+ → p ;).
 bool prefixRunAsRun(const ConversionRule * c, const std::vector<Rule *> & group, std::vector<Rule *> & out) {
     PrefixRun pr;
-    if (!prefixRun(c, pr) || !pr.replacement.empty() || pr.run.size() != 1 || pr.first.count() > 64) return false;
+    if (!prefixRun(c, pr) || !pr.prefix.empty() || !pr.replacement.empty() || pr.run.size() != 1 || pr.first.count() > 64) return false;
     struct AtP {
         const ConversionRule * rule;
         UCD::UnicodeSet text;
@@ -2451,11 +2557,16 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             for (const PrefixRun & pr : runs) {
                 mBlock.first = mBlock.first + pr.first;
                 mBlock.runStart = mBlock.runStart + pr.run.front();
+                mBlock.starts.emplace_back(pr.first, pr.run.front());
+                if (!pr.prefix.empty()) {
+                    mBlock.sequences.push_back(pr.prefix);
+                    mBlock.sequences.back().push_back(pr.first);
+                }
             }
             for (size_t k = 0; k < rewritten.size() && runConflict.empty(); ++k) {
                 ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
                 if (c == nullptr || isRun[k] || isTrigger[k] || (!isRewritten[k] && hasRevisit(c))) continue;
-                BlockMarker marker{mBlock.first, mBlock.runStart};
+                BlockMarker marker = mBlock;
                 if (ConversionRule * m = blockMarked(c, marker)) {
                     blockMarkedRules[c] = m;
                 } else {
@@ -2492,6 +2603,10 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             }
             std::vector<Rule *> rest;
             std::vector<bool> restRewritten;
+            //  (The prefix runs with P of several characters, in a group of
+            //  their own after the others.)
+            std::vector<Rule *> several;
+            bool anySingle = false;
             size_t runIndex = 0;
             for (size_t k = 0; k < rewritten.size(); ++k) {
                 if (isTrigger[k]) continue;
@@ -2503,13 +2618,17 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 const PrefixRun & pr = runs[runIndex];
                 const std::vector<RE *> xs = exceptions.empty() ? std::vector<RE *>() : exceptions[runIndex];
                 ++runIndex;
-                if (exceptions.empty()) {
+                if (!pr.prefix.empty()) {
+                    several.push_back(rewritten[k]);
+                } else if (exceptions.empty()) {
+                    anySingle = true;
                     out.push_back(rewritten[k]);
                 } else {
                     //  P S* { S } (?!X C) → ;
                     RE * const S = makeCC(pr.run.front());
                     RE * const before = makeSeq({makeCC(pr.first), makeRep(S, 0, Rep::UNBOUNDED_REP)});
                     RE * const after = xs.empty() ? nullptr : makeNegativeLookAheadAssertion(makeAlt(xs.begin(), xs.end()));
+                    anySingle = true;
                     out.push_back(makeConversionRule(makeRuleSide(before, S, after), Direction::Forward, makeRuleSide(makeSeq())));
                 }
                 if (mStats) {
@@ -2517,7 +2636,11 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                     if (mStats->keepRecords) mStats->records.push_back(RevisitRecord{rewritten[k], RevisitRecord::Outcome::PrefixRun});
                 }
             }
-            out.push_back(makeTransformRule(TransformID("Null")));
+            if (anySingle) out.push_back(makeTransformRule(TransformID("Null")));
+            if (!several.empty()) {
+                out.insert(out.end(), several.begin(), several.end());
+                out.push_back(makeTransformRule(TransformID("Null")));
+            }
             rewritten = std::move(rest);
             isRewritten = std::move(restRewritten);
             isRun.assign(rewritten.size(), false);
@@ -2625,13 +2748,33 @@ bool prefixRun(const ConversionRule * c, PrefixRun & pr) {
     std::vector<RE *> text, revisit;
     textAtoms(source->getText(), text);
     textAtoms(result->getResultToRevisit(), revisit);
-    if (text.size() < 2 || revisit.size() != 1) return false;
     CharSetAnalysis sets;
     auto setOf = [&sets](RE * re, UCD::UnicodeSet & s) {
         if (!CharSetAnalysis::isSet(re) || hasStrings(re) || hasBoundary(re)) return false;
         s = sets.setOf(re, false);
         return !s.empty();
     };
+    pr.prefix.clear();
+    if (revisit.size() > 1) {
+        //  p1 ... pk S → | p1 ... pk ;  (literal characters, A empty)
+        std::u32string completed;
+        if (text.size() <= revisit.size() || !resultString(result->getCompletedResult(), {}, completed) || !completed.empty()) {
+            return false;
+        }
+        for (size_t i = 0; i < revisit.size(); ++i) {
+            UCD::UnicodeSet t, r;
+            if (!setOf(text[i], t) || !setOf(revisit[i], r) || t.count() != 1 || !(t == r)) return false;
+            if (i + 1 < revisit.size()) pr.prefix.push_back(t); else pr.first = t;
+        }
+        pr.run.assign(text.size() - revisit.size(), UCD::UnicodeSet());
+        for (size_t i = revisit.size(); i < text.size(); ++i) {
+            if (!setOf(text[i], pr.run[i - revisit.size()])) return false;
+        }
+        pr.replacement.clear();
+        pr.revisitsReplacement = false;
+        return true;
+    }
+    if (text.size() < 2 || revisit.size() != 1) return false;
     const Capture * const capture = dyn_cast<Capture>(text[0]);
     std::vector<RE *> captured;
     if (capture) textAtoms(capture->getCapturedRE(), captured); else captured.push_back(text[0]);

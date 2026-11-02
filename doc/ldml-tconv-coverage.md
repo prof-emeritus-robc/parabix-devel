@@ -116,7 +116,12 @@ a marker (`587215146`, `--update --only ja_Latn-ru`): ja_Latn-ru is
 implementable (417), with no failing test cases, and agrees with ICU on 6,000
 random lines (with `yi`, `ī`, `ji`, `dji~`, `tsu~` and the `~` runs); W6 alone
 blocks no transform, and is needed by 4 (Grek-Latn, Latn-Grek,
-Grek-Latn/UNGEGN and fa-fa_FONIPA, with W3, W4 or W5).*
+Grek-Latn/UNGEGN and fa-fa_FONIPA, with W3, W4 or W5). Then mark run edits
+left in their group with a lookahead and a mark (`2bc2e73a1`, `--update --only
+Latin-ThaiLogical Latn-Thai`): Latin-ThaiLogical and Latn-Thai are
+implementable (419); neither has CLDR test data, and both agree with ICU on
+20,000 random lines (dense with `h`, `k`, `s`, `z`, `u` and the marks below
+and above); W3 is needed by 5 and alone blocks Zawgyi-my.*
 
 This report covers:
 
@@ -137,8 +142,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 417 (98%) |
-| …of which public (not `visibility="internal"`) | 393 | 386 (98%) |
+| Transforms defined by CLDR files (380 files) | 425 | 419 (99%) |
+| …of which public (not `visibility="internal"`) | 393 | 387 (98%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -229,9 +234,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     cases.
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
-  - W3 variable-length texts: 7 transforms (Latn-Arab, blt-blt_FONIPA,
-    Latin-NumericPinyin and Latn-Bopo through it, byn Xaleget, my-Zawgyi and
-    Zawgyi-my);
+  - W3 variable-length texts: 1 transform (Zawgyi-my; Latin-ThaiLogical and
+    Latn-Thai are implementable with mark run edits left in their group, §5);
   - W6 revisits neither composed nor prefix runs: none alone (it-am, it-ja,
     ja_Latn-ko and ja_Latn-ru are implementable, §5);
   - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
@@ -244,7 +248,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          417  ███████████████████████████████████████
+now                          419  ███████████████████████████████████████
 + W3 variable-length text    420  ████████████████████████████████████████
 + W10 engine lookaheads      421  ████████████████████████████████████████
 + W6 revisit                 422  ████████████████████████████████████████
@@ -452,6 +456,8 @@ Implementable now:
 - with the ends of the runs of a global filter in after contexts:
   am_Ethi-d0_Morse;
 - with a built-in applied by ICU as a stage: Thai-Latn (`Any-BreakInternal`);
+- with mark run edits in a group of their own, and left in their group with a
+  lookahead and a mark: Latin-ThaiLogical and Latn-Thai through it;
 - with blocking marks after prefix runs that only delete, and rules left to
   priority: it-am and it-ja; with revisits composed up to a return to the
   text: ja_Latn-ko; with prefix runs of P of several characters, and a revisit
@@ -1062,7 +1068,7 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 7 | 3 | M–L (the rest) |
+| W3 variable-length texts | 5 | 1 | M–L (the rest) |
 | W6 text to revisit, not composed | 4 | 0 | L (with W3) |
 | W5 back-references | 1 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
@@ -1261,6 +1267,21 @@ extracted:
   in a group after it (where no rule's before context could see `и`). The
   blocking marks also allow prefix runs that replace their texts with as many
   characters beside those that delete.
+- **Mark run edits left in their group, with a lookahead and a mark**
+  (`2bc2e73a1`). Latin-ThaiLogical's `h ($notAbove*) ̄ → ห | $1` cannot be
+  applied before its group: ICU does not reach the `h` of `k̄h̄` (`k̄h → ข`
+  takes it), nor, by parity, the last `h` of an even run (`h → | k` makes
+  `kh } $notHAccent0 → ค` of each pair: `hh̖̄ → ค̖̄`, `hhh̖̄ → คห̖`). Such an
+  edit `P R* T → C | $1` stays in the group as `P } R* T → C M`, M a
+  noncharacter (`RunEditMark`, U+FDD8 on, one for each R and T), so that the
+  group's own selection decides where ICU reaches P, and a group after it
+  deletes M with T, `M (R*) T → | $1`, a mark run edit. ICU revisits R* with
+  T deleted, the group sees M and T, which it cannot tell when no rule of the
+  group begins with a character of R or T and none has a before context. An
+  edit is also no longer moved before its group when another rule revisits
+  text that may begin its P: `z → | s` makes the `s` of `z̄`, which ICU then
+  edits (`z̄ → ส`). Latin-ThaiLogical's `f`, `a`, `i` and `ụ` edits are still
+  applied before the group, its `h`, `u`, `s` and `ṣ` edits with lookaheads.
 
 Of the 43 transforms that W6 alone blocked, 9 are now implementable (Hebr-Latn,
 Latn-Cyrl, ru-zh, es-am, es-es_FONIPA, es_FONIPA-am, Ethi-Latn/ES3842,
@@ -1299,7 +1320,8 @@ through the run of accents); its rough and smooth breathing rules remain.
 Mark run edits, `P ($R*) T → C | $1 ;` applied first by one Pablo kernel per
 group (on the starts of `[P1] R* T` from the regular expression engine), made
 Latn-Arab implementable and left Latin-ThaiLogical and Latn-Thai blocked by
-W3 alone.
+W3 alone; edits left in their group with a lookahead and a mark (§5, W6) made
+them implementable too.
 
 **W3 variable-length texts.** Three mechanisms now cover most of it:
 
@@ -1660,7 +1682,10 @@ The per-transform table lists the problem classes of every transform.
      order of ICU (§3.3) to ICU.
    - Replace the rounds of the converted-text correction by a Pablo `While`
      fixpoint (issue #21), exact for chains of any length.
-2. **W3 and W6.** Before contexts that the conversions change in
+2. **W3 and W6.** Zawgyi-my, which W3 alone blocks (runs of `ေ` reordered
+   across a capture, runs of spaces followed by after contexts, and
+   MultipleCaptureMultipleReplacement rules whose walks have several runs);
+   cy-cy_FONIPA with W10. Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
    neither composed nor prefix runs (4 transforms, none blocked by W6 alone:
@@ -1761,6 +1786,7 @@ tconv on every implementable transform.
 | `0550a1483`, `2770c3519` | Any-Name, Name-Any and Any-BreakInternal applied by ICU when called for, ICU stages seeing the text around their runs; Any-Hex/Plain and Hex-Any/Plain dropped: Thai-Latn: 413; built-ins 28 of 28 |
 | `f2cb92480` | blocking marks for prefix runs that only delete; revisits composed up to a return to the text; rules left to priority: it-am, it-ja, ja_Latn-ko: 416 |
 | `0d35780df`, `587215146` | prefix runs whose P has several characters; revisits composed one step into a prefix run, split with a marker: ja_Latn-ru: 417 |
+| `2bc2e73a1` | mark run edits left in their group with a lookahead and a mark: Latin-ThaiLogical, Latn-Thai: 419 |
 
 ## Reproducing
 

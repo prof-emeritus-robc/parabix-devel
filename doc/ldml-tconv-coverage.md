@@ -121,7 +121,15 @@ left in their group with a lookahead and a mark (`2bc2e73a1`, `--update --only
 Latin-ThaiLogical Latn-Thai`): Latin-ThaiLogical and Latn-Thai are
 implementable (419); neither has CLDR test data, and both agree with ICU on
 20,000 random lines (dense with `h`, `k`, `s`, `z`, `u` and the marks below
-and above); W3 is needed by 5 and alone blocks Zawgyi-my.*
+and above); W3 is needed by 5 and alone blocks Zawgyi-my. Then insertion rules
+folded into the rules before them, and the before contexts of capture rules
+translated from the converted text to the text itself (`8f13868d4`, `--update
+--only Grek-Latn/UNGEGN Latn-Grek/UNGEGN Grek-Latn`): Grek-Latn/UNGEGN is
+implementable (420), and W4 is needed by none. It has no CLDR test data; on
+30,000 random lines it differs from ICU on 15, each a `ͺ` (deleted) before σ,
+whose before context `$afterLetter`, with a repetition, is matched against the
+text itself (a warning of its plan). Latn-Grek/UNGEGN is identical to ICU on
+ICU's 30,000 Grek-Latn/UNGEGN results.*
 
 This report covers:
 
@@ -142,8 +150,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 419 (99%) |
-| …of which public (not `visibility="internal"`) | 393 | 387 (98%) |
+| Transforms defined by CLDR files (380 files) | 425 | 420 (99%) |
+| …of which public (not `visibility="internal"`) | 393 | 388 (99%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -200,9 +208,11 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   Any-BreakInternal are applied by ICU wherever they are called for.
 - **Insertion rules** (W4, §4.2), such as `a { } [$E $EO $EU] → $sep`: in groups
   of their own, and in groups with single-character rules, whose before contexts
-  then see the text inserted, as in ICU. With them, ConjoiningJamo-Latin,
-  Hang-Latn and Jamo-Latn, my-my_FONIPA (and my-ar, -chr, -fa), and Han-Spacedhan
-  (and Hani-Latn, Hant-Latn, Han-Latin/Names) are implementable.
+  then see the text inserted, as in ICU, and in groups with string rules,
+  folded into the rules whose results end with a character of their before
+  contexts (§5). With them, ConjoiningJamo-Latin, Hang-Latn and Jamo-Latn,
+  my-my_FONIPA (and my-ar, -chr, -fa), Han-Spacedhan (and Hani-Latn,
+  Hant-Latn, Han-Latin/Names) and Grek-Latn/UNGEGN are implementable.
 - **MultipleCaptureMultipleReplacement rules** (§5, W3), generalizing
   SingleCaptureDoubleReplacement: `T0 (B1) T1 … (Bk) Tk → R0 $1 R1 … $k Rk`, with
   after contexts and empty T0. si-si_FONIPA, si-si_Latn, ta-ta_FONIPA and the
@@ -248,11 +258,10 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          419  ███████████████████████████████████████
-+ W3 variable-length text    420  ████████████████████████████████████████
-+ W10 engine lookaheads      421  ████████████████████████████████████████
-+ W6 revisit                 422  ████████████████████████████████████████
-+ W4 insertion               424  ████████████████████████████████████████
+now                          420  ████████████████████████████████████████
++ W3 variable-length text    421  ████████████████████████████████████████
++ W6 revisit                 423  ████████████████████████████████████████
++ W10 engine lookaheads      424  ████████████████████████████████████████
 + W5 captures/functions      425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
@@ -461,7 +470,9 @@ Implementable now:
 - with blocking marks after prefix runs that only delete, and rules left to
   priority: it-am and it-ja; with revisits composed up to a return to the
   text: ja_Latn-ko; with prefix runs of P of several characters, and a revisit
-  composed one step and split with a marker: ja_Latn-ru.
+  composed one step and split with a marker: ja_Latn-ru;
+- with insertion rules folded into the rules before them, and the before
+  contexts of capture rules translated to the text itself: Grek-Latn/UNGEGN.
 
 The per-transform status is in the table.
 
@@ -1068,19 +1079,19 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 5 | 1 | M–L (the rest) |
-| W6 text to revisit, not composed | 4 | 0 | L (with W3) |
+| W3 variable-length texts | 4 | 1 | M–L (the rest) |
+| W6 text to revisit, not composed | 3 | 0 | L (with W3) |
 | W5 back-references | 1 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
-| W4 insertion rules (with string rules) | 2 | 0 | M |
+| W4 insertion rules (with string rules) | 0 | 0 | M |
 | W8 built-ins (Any-BreakInternal) | 0 | 0 | L |
 | W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 0 | 0 | L |
 <!-- /coverage:work-items -->
 
 (This run uses the local CLDR fixes of W7: W7 blocks nothing, Latin-ug and
-ug-Latin are implementable, and the two Greek UNGEGN transforms need W3, W4 and
-W6.)
+ug-Latin are implementable, and the two Greek UNGEGN transforms are
+implementable.)
 
 Done since the first assessment:
 
@@ -1095,8 +1106,8 @@ Done since the first assessment:
 - W3 finite texts, runs and SingleCaptureDoubleReplacement rules (`379de8796`);
 - W3 MultipleCaptureMultipleReplacement rules (`1bc9ef253`), identity rules and
   starts by the first set of B1 (`08c303c30`);
-- W4 insertion rules (`3b6ee29fa`, `4f26e7d02`, `a3a64eda2`), and the scale of
-  Han-Latin (`02e77ee59`);
+- W4 insertion rules (`3b6ee29fa`, `4f26e7d02`, `a3a64eda2`; in groups with
+  string rules, folded, `8f13868d4`), and the scale of Han-Latin (`02e77ee59`);
 - two captures of fixed lengths in reverse order (`7e927d2d7`, SwapBack), and
   captures of variable lengths moved out of order (`a090553b4`, MoveRegions);
 - W5 function calls on captures of single characters (`687470e89`);
@@ -1282,6 +1293,10 @@ extracted:
   text that may begin its P: `z → | s` makes the `s` of `z̄`, which ICU then
   edits (`z̄ → ส`). Latin-ThaiLogical's `f`, `a`, `i` and `ụ` edits are still
   applied before the group, its `h`, `u`, `s` and `ṣ` edits with lookaheads.
+- **Revisits that feed a folded insertion** (`8f13868d4`). Grek-Latn/UNGEGN's
+  `ϲ → | σ` and `Ϲ → | Σ` revisit a character after which the insertion
+  `[Pp] { } [ΣςσϷϸϺϻ] → \'` may apply: folding the insertion (below) with
+  `ϲ`, `Ϲ` added to its after context composes them.
 
 Of the 43 transforms that W6 alone blocked, 9 are now implementable (Hebr-Latn,
 Latn-Cyrl, ru-zh, es-am, es-es_FONIPA, es_FONIPA-am, Ethi-Latn/ES3842,
@@ -1630,10 +1645,28 @@ W5 now needs only back-references, in 3 transforms, none of which it alone
 blocks: fa-fa_FONIPA (`([$IPA_CONSONANT$VOWEL\|]) { ّ → $1`, a copy of a set
 with strings, also W3 and W6), sk_FONIPA-ja and sk-ja (also W6).
 
-**W4 insertion rules** (§4.2) are implemented. They remain only in Grek-Latn and
-Grek-Latn/UNGEGN (`[Pp] { } [ΣςσϷϸϺϻ] → \'`), in groups with string rules, and
-with rules whose after contexts have repetitions, which the correction kernel
-does not match. Both transforms also need W3 and W6.
+**W4 insertion rules** (§4.2) are implemented, and needed by none. In a group
+with string rules, an insertion `B { } A → I` is folded into the rules whose
+results end with a character of B (`8f13868d4`): each gets a variant
+`r } A' → (its result) I` just before it (`π } [Σσ…] → p\'`), and each deletion
+without contexts a variant `B { r } A' → I` (`[Pp] { ̓ } [Σσ…] → \'`), A'
+extended by the rules `C → | x` (x in A) that feed it (`ϲ → | σ`). This
+requires that no rule before the insertion begins with a character of A', that
+every character of B within the filter is replaced by a context-free rule, and
+that no other rule revisits into A or leaves a character of B before text to
+revisit. After the characters of B outside the global filter (Latin `p`), which
+ICU's before context sees, the insertion is applied in a group before
+(`apΣ → ap'S`). Grek-Latn/UNGEGN is implementable with it, and with the before
+contexts of its two υ rules (`$fmaker { υ ($shiftForwardVowels*) } … → $1 f
+$under`), which ICU matches against the converted text, translated to the text
+itself where the group's conversions allow (each character read back by its
+conversion, deleted characters skipped, the strings of several characters
+units the context rejects). In a group with capture rules, the string rules
+whose before contexts are matched against the converted text are now applied
+by the whole-group correction kernel, after the capture rules (they were
+matched against the text itself: `ͺμπΕ`), and no single-character rule applies
+at the start of a capture rule's match (`υ → y`, whose context excludes the υ
+rules' in the converted text). Grek-Latn still needs W3 and W6.
 
 **W10 engine lookaheads.** cy-cy_FONIPA's after contexts `$cons* $end` repeat
 `$cons`, a set with strings (`{m̥}{d͡ʒ}`). ICU matches it possessively, taking
@@ -1688,8 +1721,10 @@ The per-transform table lists the problem classes of every transform.
    cy-cy_FONIPA with W10. Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
-   neither composed nor prefix runs (4 transforms, none blocked by W6 alone:
-   Grek-Latn, Latn-Grek and Grek-Latn/UNGEGN with W3, fa-fa_FONIPA with W5).
+   neither composed nor prefix runs (3 transforms, none blocked by W6 alone:
+   Grek-Latn and Latn-Grek with W3, fa-fa_FONIPA with W5). Before contexts with
+   repetitions translated to the text itself, as for the capture rules
+   (Grek-Latn/UNGEGN's `$afterLetter { σ` after a deleted `ͺ`).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. With
@@ -1787,6 +1822,7 @@ tconv on every implementable transform.
 | `f2cb92480` | blocking marks for prefix runs that only delete; revisits composed up to a return to the text; rules left to priority: it-am, it-ja, ja_Latn-ko: 416 |
 | `0d35780df`, `587215146` | prefix runs whose P has several characters; revisits composed one step into a prefix run, split with a marker: ja_Latn-ru: 417 |
 | `2bc2e73a1` | mark run edits left in their group with a lookahead and a mark: Latin-ThaiLogical, Latn-Thai: 419 |
+| `8f13868d4` | insertion rules folded into the rules before them; before contexts of capture rules translated from the converted text; converted contexts by capture rules: Grek-Latn/UNGEGN: 420 |
 
 ## Reproducing
 

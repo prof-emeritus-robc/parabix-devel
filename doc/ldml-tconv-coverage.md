@@ -109,7 +109,14 @@ may match differently in the converted text (an apostrophe after a vowel,
 deleted in the group, before `[:^Letter:] { so`; and the ~ written by a
 composed rule ending at a return to the text, before `[:^Letter:] { zi`);
 ja_Latn-ko agrees with ICU on 5,000 random lines (length marks, ~ chains,
-geminates), and byn_Latn-byn_Ethi/Xaleget on 5,000.*
+geminates), and byn_Latn-byn_Ethi/Xaleget on 5,000. Then prefix runs whose P
+has several characters (`0d35780df`: ja_Latn-ru's `tsu~ → | ts`, from 8
+problems to 1), and revisits composed one step into prefix-run form, split with
+a marker (`587215146`, `--update --only ja_Latn-ru`): ja_Latn-ru is
+implementable (417), with no failing test cases, and agrees with ICU on 6,000
+random lines (with `yi`, `ī`, `ji`, `dji~`, `tsu~` and the `~` runs); W6 alone
+blocks no transform, and is needed by 4 (Grek-Latn, Latn-Grek,
+Grek-Latn/UNGEGN and fa-fa_FONIPA, with W3, W4 or W5).*
 
 This report covers:
 
@@ -130,8 +137,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 416 (98%) |
-| …of which public (not `visibility="internal"`) | 393 | 385 (98%) |
+| Transforms defined by CLDR files (380 files) | 425 | 417 (98%) |
+| …of which public (not `visibility="internal"`) | 393 | 386 (98%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -225,8 +232,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   - W3 variable-length texts: 7 transforms (Latn-Arab, blt-blt_FONIPA,
     Latin-NumericPinyin and Latn-Bopo through it, byn Xaleget, my-Zawgyi and
     Zawgyi-my);
-  - W6 revisits neither composed nor prefix runs: 1 (ja_Latn-ru; it-am,
-    it-ja and ja_Latn-ko are implementable with blocking marks, §5);
+  - W6 revisits neither composed nor prefix runs: none alone (it-am, it-ja,
+    ja_Latn-ko and ja_Latn-ru are implementable, §5);
   - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
     runs solved; fa-fa_FONIPA also needs W3 and W6);
   - W8 built-ins: none (Thai-Latn's `Any-BreakInternal` is applied by ICU);
@@ -237,11 +244,11 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          416  ███████████████████████████████████████
-+ W3 variable-length text    419  ███████████████████████████████████████
-+ W6 revisit                 421  ████████████████████████████████████████
-+ W4 insertion               423  ████████████████████████████████████████
-+ W10 engine lookaheads      424  ████████████████████████████████████████
+now                          417  ███████████████████████████████████████
++ W3 variable-length text    420  ████████████████████████████████████████
++ W10 engine lookaheads      421  ████████████████████████████████████████
++ W6 revisit                 422  ████████████████████████████████████████
++ W4 insertion               424  ████████████████████████████████████████
 + W5 captures/functions      425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
@@ -447,7 +454,8 @@ Implementable now:
 - with a built-in applied by ICU as a stage: Thai-Latn (`Any-BreakInternal`);
 - with blocking marks after prefix runs that only delete, and rules left to
   priority: it-am and it-ja; with revisits composed up to a return to the
-  text: ja_Latn-ko.
+  text: ja_Latn-ko; with prefix runs of P of several characters, and a revisit
+  composed one step and split with a marker: ja_Latn-ru.
 
 The per-transform status is in the table.
 
@@ -1055,7 +1063,7 @@ those of invoked transforms).
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
 | W3 variable-length texts | 7 | 3 | M–L (the rest) |
-| W6 text to revisit, not composed | 5 | 1 | L (with W3) |
+| W6 text to revisit, not composed | 4 | 0 | L (with W3) |
 | W5 back-references | 1 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1225,6 +1233,34 @@ extracted:
   matching; `TransformStep::stringPriority`, `subgroupPriority`, printed by
   `--plan`). The remaining differences from ICU are at rules whose before
   contexts the plan warns may match differently in the converted text.
+
+- **Prefix runs of P of several characters** (`0d35780df`). ja_Latn-ru's
+  `tsu~ → | ts` deletes the runs of `u~` after `ts` (`tsu~u~a → ца`). A rule
+  `p1 … pk S → | p1 … pk` (literal characters, only deleting) is a prefix run
+  with P its last character, preceded by the others (`PrefixRun::prefix`), in
+  a group of its own after the other prefix runs: `te~ → | t` brings `t` next
+  to `s` in `te~su~a`, which ICU then deletes too (`ца`). The pipeline gives
+  P's class only where the characters before it precede it (`PrecededBy`),
+  and carries the positions after the runs deleted before through these
+  deletions. An earlier rule matching P's sequence is a conflict, P's first
+  character may not be matched after the first character of a text, and the
+  run after such a P at the start of a text is transparent. The after
+  context of `\~ } tsu → ;` sees the run's `u` (`~tsu~a → ца`, but
+  `~tsa → ~ца`): its last item, after `s`, also matches after a deleted run,
+  as the engine matches `t (s followed by a deleted run) | t s (u not after
+  one)`, at the end of the text too.
+- **One step of composition, split with a marker** (`587215146`).
+  `i $lengthMarker → | i i` revisits `ii`, of which the first `i` becomes `и`
+  unconditionally (`ī̄ → иии`): `Composer::prefixRunStep` composes that step,
+  `i $lengthMarker → и | i`, a prefix run. Applied before the group, it would
+  not be exact: `yi → и` consumes the `i` (`yī → и`, the mark then deleted),
+  as does `dji~`, and `j → | zy` makes `y` before `i` as it goes. So the rule
+  is split with a marker M (U+FDE0, a noncharacter) that keeps ICU's cursor:
+  `i } $lengthMarker → M` where the rule was, `M { $lengthMarker → | i` first
+  in the group (whose composition is finite, `M { lM } lM → M`), and `M → и`
+  in a group after it (where no rule's before context could see `и`). The
+  blocking marks also allow prefix runs that replace their texts with as many
+  characters beside those that delete.
 
 Of the 43 transforms that W6 alone blocked, 9 are now implementable (Hebr-Latn,
 Latn-Cyrl, ru-zh, es-am, es-es_FONIPA, es_FONIPA-am, Ethi-Latn/ES3842,
@@ -1627,9 +1663,8 @@ The per-transform table lists the problem classes of every transform.
 2. **W3 and W6.** Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
-   neither composed nor prefix runs (5 transforms, 1 blocked by W6 alone:
-   ja_Latn-ru, with prefix runs whose P has two characters, `tsu~ → | ts`,
-   and `i $lengthMarker → | ii`, a prefix run after one step of composition).
+   neither composed nor prefix runs (4 transforms, none blocked by W6 alone:
+   Grek-Latn, Latn-Grek and Grek-Latn/UNGEGN with W3, fa-fa_FONIPA with W5).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. With
@@ -1725,6 +1760,7 @@ tconv on every implementable transform.
 | `58ec782da` | ends of the runs of a global filter in after contexts: am_Ethi-d0_Morse: 412 |
 | `0550a1483`, `2770c3519` | Any-Name, Name-Any and Any-BreakInternal applied by ICU when called for, ICU stages seeing the text around their runs; Any-Hex/Plain and Hex-Any/Plain dropped: Thai-Latn: 413; built-ins 28 of 28 |
 | `f2cb92480` | blocking marks for prefix runs that only delete; revisits composed up to a return to the text; rules left to priority: it-am, it-ja, ja_Latn-ko: 416 |
+| `0d35780df`, `587215146` | prefix runs whose P has several characters; revisits composed one step into a prefix run, split with a marker: ja_Latn-ru: 417 |
 
 ## Reproducing
 

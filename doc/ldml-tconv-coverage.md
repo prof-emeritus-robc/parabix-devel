@@ -129,7 +129,14 @@ implementable (420), and W4 is needed by none. It has no CLDR test data; on
 30,000 random lines it differs from ICU on 15, each a `ͺ` (deleted) before σ,
 whose before context `$afterLetter`, with a repetition, is matched against the
 text itself (a warning of its plan). Latn-Grek/UNGEGN is identical to ICU on
-ICU's 30,000 Grek-Latn/UNGEGN results.*
+ICU's 30,000 Grek-Latn/UNGEGN results. Then lookahead chains over possessive
+repetitions of sets with strings (`86cf1f797`, W10: guarded strings,
+`m(?!̥) | m̥`) and cy-cy_FONIPA's stress placement (`06ce8fcce`, `--update
+--only cy-cy_FONIPA`): cy-cy_FONIPA is implementable (421), its 613 CLDR test
+cases pass, identical to ICU, as are 5,000 random lines; W10 is needed by none,
+and W3 by 3. Two engine bugs of search and replace found on the way are fixed:
+a NUL after each text (a position after the text kept), and the end of an
+empty text unmarked.*
 
 This report covers:
 
@@ -150,8 +157,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 420 (99%) |
-| …of which public (not `visibility="internal"`) | 393 | 388 (99%) |
+| Transforms defined by CLDR files (380 files) | 425 | 421 (99%) |
+| …of which public (not `visibility="internal"`) | 393 | 389 (99%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -245,7 +252,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
   - W3 variable-length texts: 1 transform (Zawgyi-my; Latin-ThaiLogical and
-    Latn-Thai are implementable with mark run edits left in their group, §5);
+    Latn-Thai are implementable with mark run edits left in their group, and
+    cy-cy_FONIPA with capture rules over sets with strings, §5);
   - W6 revisits neither composed nor prefix runs: none alone (it-am, it-ja,
     ja_Latn-ko and ja_Latn-ru are implementable, §5);
   - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
@@ -258,10 +266,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          420  ████████████████████████████████████████
-+ W3 variable-length text    421  ████████████████████████████████████████
-+ W6 revisit                 423  ████████████████████████████████████████
-+ W10 engine lookaheads      424  ████████████████████████████████████████
+now                          421  ████████████████████████████████████████
++ W3 variable-length text    422  ████████████████████████████████████████
++ W6 revisit                 424  ████████████████████████████████████████
 + W5 captures/functions      425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
@@ -472,7 +479,10 @@ Implementable now:
   text: ja_Latn-ko; with prefix runs of P of several characters, and a revisit
   composed one step and split with a marker: ja_Latn-ru;
 - with insertion rules folded into the rules before them, and the before
-  contexts of capture rules translated to the text itself: Grek-Latn/UNGEGN.
+  contexts of capture rules translated to the text itself: Grek-Latn/UNGEGN;
+- with lookahead chains over possessive repetitions of sets with strings, and
+  capture rules whose starts the engine finds with possessive captures:
+  cy-cy_FONIPA.
 
 The per-transform status is in the table.
 
@@ -1079,11 +1089,11 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 4 | 1 | M–L (the rest) |
+| W3 variable-length texts | 3 | 1 | M–L (the rest) |
 | W6 text to revisit, not composed | 3 | 0 | L (with W3) |
 | W5 back-references | 1 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
-| W10 engine lookaheads | 1 | 0 | M |
+| W10 engine lookaheads | 0 | 0 | M |
 | W4 insertion rules (with string rules) | 0 | 0 | M |
 | W8 built-ins (Any-BreakInternal) | 0 | 0 | L |
 | W9 Jpan-Latn (Hira-Latn, Kana-Latn) | 0 | 0 | L |
@@ -1680,9 +1690,32 @@ checks such rules against ICU. The engine does not support these forms in a
 lookahead of variable length without a unique prefix: the `y { } $cons* …`
 single-character rules (whose after contexts are matched alone, as
 lookaheads) and the MultipleCaptureMultipleReplacement rules (whose starts are
-found by lookaheads of their captures and after contexts) remain W10, where
+found by lookaheads of their captures and after contexts) remained W10, where
 the greedy form of the captures is used only if it gives the same matches.
-cy-cy_FONIPA also needs W3.
+
+W10 is now needed by none (`86cf1f797`, `06ce8fcce`). The unambiguous
+alternatives of such a repetition are guarded strings (`m(?!̥) | m̥`): a
+lookahead chain takes them as a string class (re::parseGuardedStringClass),
+whose StringClassKernel counts an occurrence of a string only where none of
+its guards follows (the guards do not change where occurrences may overlap,
+isRepeatableStringClass). The (?!X) after X{lb,}+ is a one-character
+lookahead where every first character of X is an alternative of its own, the
+assertions before the end of the text that hold there are dropped, and a
+final (?=$) is $. A chain's externals are compiled as its kernels are made, so
+that names it does not use leave no unread kernel. The capture rules whose
+captures repeat such sets have their exact starts found with possessive
+captures in a lookahead (engineStarts), which tconv checks the engine
+supports. cy-cy_FONIPA's stress rules `$end $cons* { ($vowel+ $cons*) } $end
+→ ˈ $1` have before contexts that the insertions of their group cannot
+change (every match ends at the end of the text), matched against the text
+itself (unchangedBeforeContext). cy-cy_FONIPA is implementable.
+
+Two bugs of the engine's search and replace (by which tconv applies groups of
+one rule) were found with it: a position after the text was kept (a NUL after
+each text, with Unicode code units and the text not extended), and
+EndOfTextMark did not mark the end of an empty text. (getSpan's last resort,
+the end of a match less its minimum length, is exact only for fixed lengths;
+cy-cy_FONIPA's capture rules no longer reach it, as a final (?=$) is a chain.)
 
 **W7.**
 
@@ -1717,8 +1750,8 @@ The per-transform table lists the problem classes of every transform.
      fixpoint (issue #21), exact for chains of any length.
 2. **W3 and W6.** Zawgyi-my, which W3 alone blocks (runs of `ေ` reordered
    across a capture, runs of spaces followed by after contexts, and
-   MultipleCaptureMultipleReplacement rules whose walks have several runs);
-   cy-cy_FONIPA with W10. Before contexts that the conversions change in
+   MultipleCaptureMultipleReplacement rules whose walks have several runs).
+   Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
    neither composed nor prefix runs (3 transforms, none blocked by W6 alone:
@@ -1823,6 +1856,7 @@ tconv on every implementable transform.
 | `0d35780df`, `587215146` | prefix runs whose P has several characters; revisits composed one step into a prefix run, split with a marker: ja_Latn-ru: 417 |
 | `2bc2e73a1` | mark run edits left in their group with a lookahead and a mark: Latin-ThaiLogical, Latn-Thai: 419 |
 | `8f13868d4` | insertion rules folded into the rules before them; before contexts of capture rules translated from the converted text; converted contexts by capture rules: Grek-Latn/UNGEGN: 420 |
+| `86cf1f797`, `06ce8fcce` | lookahead chains over possessive repetitions of sets with strings (guarded strings, W10); capture rules over such sets, with before contexts unchanged by their insertions; search and replace keeping no position after the text: cy-cy_FONIPA: 421 |
 
 ## Reproducing
 

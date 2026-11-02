@@ -585,6 +585,8 @@ private:
                       std::vector<bool> & isEdit, std::vector<bool> & isKept, std::string & reason);
     bool markRunUnseen(const ConversionRule * r, const MarkRunEdit & e, std::string & reason);
     bool keptCandidate(const ConversionRule * r);
+    bool textChars(RE * re, UCD::UnicodeSet & chars);
+    Rule * markRunLookahead(const ConversionRule * c, const MarkRunEdit & e, const std::vector<Rule *> & group, char32_t mark);
     CharSetAnalysis mSets;
     RevisitStats * mStats;
     RevisitRecord * mRecord = nullptr;
@@ -2192,6 +2194,67 @@ bool Composer::chainRevisitSplit(const std::vector<Rule *> & group, const UCD::U
     return true;
 }
 
+//  The characters that a text (or a result) may have.
+bool Composer::textChars(RE * re, UCD::UnicodeSet & chars) {
+    if (CharSetAnalysis::isSet(re)) {
+        if (hasStrings(re)) return false;
+        chars = chars + mSets.setOf(re, false);
+        return true;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) {
+            if (!textChars(e, chars)) return false;
+        }
+        return true;
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        for (RE * e : *alt) {
+            if (!textChars(e, chars)) return false;
+        }
+        return true;
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        return textChars(rep->getRE(), chars);
+    } else if (Capture * c = dyn_cast<Capture>(re)) {
+        return textChars(c->getCapturedRE(), chars);
+    } else if (Reference * ref = dyn_cast<Reference>(re)) {
+        return ref->getCapture() && textChars(ref->getCapture()->getCapturedRE(), chars);
+    } else if (Name * name = dyn_cast<Name>(re)) {
+        return !isFunctionCall(name) && name->getDefinition() && textChars(name->getDefinition(), chars);
+    }
+    return isBoundary(re) || isa<Start>(re) || isa<End>(re);
+}
+
+//  A mark run edit c (P R* T → C | $1, as e) of a group, left in the group
+//  as P } R* T → C M (with F R* for F R*, R R* for R+; M the mark of its R
+//  and T), for a group of its own after the group to delete M and T (see
+//  RunEditMark), if the group cannot see the difference: ICU revisits R*
+//  (after C) in the group with T deleted, the group sees M and T, which it
+//  does not when
+//    - no rule of the group begins with a character of R or T (the rules
+//      see the text after C from where they begin, before contexts aside);
+//    - no rule of the group has a before context (which would see M, or R*
+//      followed by T).
+//  The rules matching before P see P R* T in both.
+Rule * Composer::markRunLookahead(const ConversionRule * c, const MarkRunEdit & e, const std::vector<Rule *> & group, char32_t mark) {
+    UCD::UnicodeSet seen = e.run + e.firstRun;
+    for (const UCD::UnicodeSet & t : e.suffix) seen = seen + t;
+    if (seen.contains(mark)) return nullptr;
+    for (const Rule * r : group) {
+        const ConversionRule * o = dyn_cast<ConversionRule>(r);
+        if (o == nullptr) continue;
+        const RuleSide * source = o->getSourceSide(Direction::Forward);
+        if (source->hasBeforeContext()) return nullptr;
+        UCD::UnicodeSet first;
+        bool nullable = false;
+        if (!firstChars(source->getText(), first, nullable) || nullable || first.intersects(seen)) return nullptr;
+    }
+    std::vector<RE *> text, after;
+    for (const UCD::UnicodeSet & p : e.prefix) text.push_back(makeCC(p));
+    if (e.nonEmpty) after.push_back(makeCC(e.firstRun));
+    after.push_back(makeRep(makeCC(e.run), 0, Rep::UNBOUNDED_REP));
+    for (const UCD::UnicodeSet & t : e.suffix) after.push_back(makeCC(t));
+    return makeConversionRule(makeRuleSide(nullptr, makeSeq(text.begin(), text.end()), makeSeq(after.begin(), after.end())),
+                              Direction::Forward, makeRuleSide(literal(e.replacement + std::u32string(1, mark))));
+}
+
 //  A rule that the mark run edits keep before them (see markRunSplit): its
 //  text and after context sequences of sets, without a before context.
 bool Composer::keptCandidate(const ConversionRule * r) {
@@ -2316,7 +2379,8 @@ bool Composer::markRunUnseen(const ConversionRule * r, const MarkRunEdit & e, st
 //      cannot match where it does, or is kept before the edits (a text and
 //      after context of sets, no before context; isKept);
 //    - no other rule can see the difference (markRunUnseen), nor match a
-//      character of C (which ICU does not revisit).
+//      character of C (which ICU does not revisit), nor revisit a character
+//      of P (which ICU would then match with the edit).
 //  The edits that do not pass are left in the group (and are then among the
 //  other rules for those that do).
 bool Composer::markRunSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
@@ -2364,6 +2428,13 @@ bool Composer::markRunSplit(const std::vector<Rule *> & group, const UCD::Unicod
                         reason = printRule(c) + " may match a character that a mark run edit leaves";
                         return false;
                     }
+                }
+            }
+            if (RE * revisit = c->getResultSide(Direction::Forward)->getResultToRevisit()) {
+                UCD::UnicodeSet chars;
+                if (!textChars(revisit, chars) || chars.intersects(edits[n].prefix.front())) {
+                    reason = printRule(c) + " may revisit the text of a mark run edit";
+                    return false;
                 }
             }
             if (k < at[n]) {
@@ -2538,6 +2609,48 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             }
             out.push_back(makeTransformRule(TransformID("Null")));
             rewritten = std::move(rest);
+        }
+        //  The mark run edits left, with a lookahead and a mark (see
+        //  markRunLookahead), all or none (not with a global filter, which
+        //  the mark would be outside of).
+        std::vector<std::pair<char32_t, MarkRunEdit>> runMarks;
+        if (!filter) {
+            std::vector<Rule *> lookahead = rewritten;
+            std::vector<std::pair<char32_t, MarkRunEdit>> marks;
+            std::vector<std::pair<const ConversionRule *, Rule *>> edits;
+            bool all = true;
+            for (Rule *& r : lookahead) {
+                ConversionRule * c = dyn_cast<ConversionRule>(r);
+                MarkRunEdit e;
+                if (c == nullptr || !hasRevisit(c) || !markRunEdit(c, e)) continue;
+                size_t m = 0;
+                while (m < marks.size() && !(marks[m].second.run == e.run && marks[m].second.suffix == e.suffix)) ++m;
+                if (m == RunEditMarks) {
+                    all = false;
+                    break;
+                }
+                if (m == marks.size()) marks.emplace_back(static_cast<char32_t>(RunEditMark + m), e);
+                r = markRunLookahead(c, e, rewritten, marks[m].first);
+                if (r == nullptr) {
+                    all = false;
+                    break;
+                }
+                edits.emplace_back(c, r);
+            }
+            if (all && !edits.empty()) {
+                for (const auto & [c, l] : edits) {
+                    if (mStats == nullptr) continue;
+                    mStats->candidates++;
+                    mStats->markRunLookaheads++;
+                    if (mStats->keepRecords) {
+                        mStats->records.push_back(RevisitRecord{c, RevisitRecord::Outcome::MarkRunLookahead});
+                        mStats->records.back().composedRules = 1;
+                        mStats->records.back().composed.push_back(l);
+                    }
+                }
+                rewritten = std::move(lookahead);
+                runMarks = std::move(marks);
+            }
         }
         std::vector<bool> isRewritten(rewritten.size(), false);
         for (Rule *& r : rewritten) {
@@ -2807,6 +2920,19 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             }
             if (mRecord) mStats->records.push_back(std::move(record));
             mRecord = nullptr;
+        }
+        //  (The marks of the mark run edits left with a lookahead, deleted with
+        //  T in a group of their own: M (R*) T → | $1.)
+        if (!runMarks.empty()) {
+            out.push_back(makeTransformRule(TransformID("Null")));
+            for (const auto & m : runMarks) {
+                std::vector<RE *> text{makeCC(static_cast<codepoint_t>(m.first))};
+                Capture * const run = makeCapture("run", makeRep(makeCC(m.second.run), 0, Rep::UNBOUNDED_REP));
+                text.push_back(run);
+                for (const UCD::UnicodeSet & t : m.second.suffix) text.push_back(makeCC(t));
+                out.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq(text.begin(), text.end()), nullptr), Direction::Forward,
+                                                 makeRuleSide(nullptr, makeSeq(), makeReference("run", run, 0), 0, nullptr)));
+            }
         }
         //  (The markers of the rules split above, replaced in a group of their own.)
         if (!markers.empty()) {

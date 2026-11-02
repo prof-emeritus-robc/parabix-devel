@@ -581,7 +581,8 @@ static std::string revisitRecordJSON(const ldml::RevisitRecord & r) {
            : r.outcome == Outcome::PrefixRun ? "\"prefix run\""
            : r.outcome == Outcome::PrefixRunTrigger ? "\"prefix run trigger\""
            : r.outcome == Outcome::ChainRevisit ? "\"chain revisit\""
-           : r.outcome == Outcome::MarkRunEdit ? "\"mark run edit\"" : "\"not composed\"";
+           : r.outcome == Outcome::MarkRunEdit ? "\"mark run edit\""
+           : r.outcome == Outcome::MarkRunLookahead ? "\"mark run lookahead\"" : "\"not composed\"";
     if (r.outcome == Outcome::NotComposed) out += ",\"reason\":" + jsonString(r.reason);
     out += ",\"composedRules\":" + std::to_string(r.composedRules);
     out += ",\"composed\":[";

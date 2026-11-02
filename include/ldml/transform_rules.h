@@ -822,6 +822,12 @@ inline bool marksFilterRunEnd(const UCD::UnicodeSet & set) {
 //  following a deleted run (as the prefix runs step marks them).  As with
 //  FilterRunEndMark, the next noncharacter is absent from such a set.
 constexpr UCD::codepoint_t DeletedRunBlockMark = 0xFDD4;
+//  A mark run edit P R* T → C | $1 that cannot be moved to a group of its
+//  own is left in its group as P } R* T → C M, M a noncharacter (one for each
+//  R and T, from RunEditMark on), which a group of its own after it deletes
+//  with T, M (R*) T → | $1 (see ComposeRevisits).
+constexpr UCD::codepoint_t RunEditMark = 0xFDD8;
+constexpr unsigned RunEditMarks = 8;
 inline bool marksDeletedRunBlock(const UCD::UnicodeSet & set) {
     return set.contains(DeletedRunBlockMark) && !set.contains(DeletedRunBlockMark + 1);
 }
@@ -959,7 +965,7 @@ struct RevisitTrigger {
 };
 struct RevisitRecord {
     const Rule * rule;
-    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger, ChainRevisit, MarkRunEdit} outcome;
+    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger, ChainRevisit, MarkRunEdit, MarkRunLookahead} outcome;
     std::string reason;             // if not composed
     unsigned composedRules = 0;
     std::vector<const Rule *> composed;     // the rules replacing it
@@ -975,6 +981,7 @@ struct RevisitStats {
     unsigned prefixRuns = 0;        // moved to a group of their own (with their triggers)
     unsigned chainRevisits = 0;     // moved to a group of their own
     unsigned markRunEdits = 0;      // moved to a group of their own
+    unsigned markRunLookaheads = 0; // left with a lookahead and a marker (RunEditMark)
     unsigned blockingMarks = 0;     // groups after prefix runs given blocking marks
     bool keepRecords = false;
     std::vector<RevisitRecord> records;

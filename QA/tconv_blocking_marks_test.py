@@ -9,7 +9,9 @@
 #  (or after a character at which ICU revisits).  The rules that DisambiguateOrder
 #  cannot keep apart from an earlier marked rule apply only where it does not
 #  match (TransformStep::stringPriority, subgroupPriority).  Prefix runs of P of
-#  several characters (tsu~ → | ts) are applied after the others.  The expected
+#  several characters (tsu~ → | ts) are applied after the others.  A revisit
+#  that is a prefix run after one step of composition is split with a marker
+#  (Composer::prefixRunStep).  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
 #  tconv_blocking_marks_test.py <tconv binary>
@@ -36,6 +38,9 @@ GROUPS = [
     # Prefix runs of P of several characters (tsu~ → | ts), after those of one (te~ → | t)
     ("te\\~ \u2192 | t ;\nto\\~ \u2192 | t ;\ntsu\\~ \u2192 | ts ;\nts \u2192 C ;\nt \u2192 T ;\n\\~tsu \u2192 | tsu ;\ns \u2192 S ;\nu \u2192 U ;\ne \u2192 E ;\no \u2192 O ;\na \u2192 A ;\n",
      [('tsu~a', 'CA'), ('tsu~u~a', 'CA'), ('te~su~a', 'CA'), ('te~tsu~a', 'TCA'), ('~tsu~a', 'CA'), ('~tsa', '~CA'), ('~te~su', '~CU'), ('tsu~', 'C'), ('~tsu~', 'C'), ('tsu~e~a', 'CE~A'), ('~tsu~u~', 'C'), ('te~to~a', 'TTA'), ('tsu', 'CU')]),
+    # A revisit composed one step into a prefix run, split with a marker (i $m → | i i as i } $m → M, M { $m → | i)
+    ("$m = [\\u0304] ;\ni $m \u2192 | i i ;\n$m \u2192 ;\ni\\~e \u2192 | ye ;\ni \u2192 I ;\nk \u2192 K ;\nyi \u2192 Y ;\nye \u2192 E ;\ny \u2192 X ;\na \u2192 A ;\n",
+     [('i\u0304', 'II'), ('i\u0304\u0304', 'III'), ('i\u0304\u0304a', 'IIIA'), ('yi\u0304', 'Y'), ('ki\u0304\u0304', 'KIII'), ('i\u0304~e', 'IE'), ('y\u0304i', 'XI'), ('i', 'I')]),
 ]
 
 

@@ -6377,8 +6377,9 @@ static void blockingMarkProblems(const ldml::TransformPlan & plan, const ldml::T
                 problems.push_back(ldml::printRule(r) + "  (a blocking mark, not in the group right after prefix runs that only delete)");
             }
         }
-        after = !step.prefixRuns.empty() && std::all_of(step.prefixRuns.begin(), step.prefixRuns.end(),
-                                                        [](const ldml::PrefixRun & pr) {return pr.replacement.empty();});
+        //  (As the pipeline gives them: where runs are deleted, and none inserts.)
+        after = std::any_of(step.prefixRuns.begin(), step.prefixRuns.end(), [](const ldml::PrefixRun & pr) {return pr.replacement.empty();})
+                && std::all_of(step.prefixRuns.begin(), step.prefixRuns.end(), [](const ldml::PrefixRun & pr) {return pr.replacement.size() <= 1;});
     }
 }
 
@@ -7999,7 +8000,7 @@ StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & ste
         FilterByMask(P, keep, Result, kept);
         filterMasks(keep);
         Result = kept;
-        if (maxLength == 0 && !Counts) {
+        if (!Counts) {
             //  The positions following the runs deleted (after each P, at the
             //  end of its run), for the blocking marks of the next step; with
             //  those of prefix runs before (P of one character, before these of

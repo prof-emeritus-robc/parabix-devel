@@ -575,6 +575,7 @@ private:
     void apply(const GroupRule & g, Path q, const std::vector<MatchedChar> & matched,
                std::vector<int> referenced, RE * text, std::vector<Rule *> & composed);
     void finish(Path p, RE * text, std::vector<Rule *> & composed, std::optional<unsigned> split = std::nullopt);
+    Rule * prefixRunStep(ConversionRule * r, const std::vector<GroupRule> & group);
     bool returnsToText(const Path & p) const;
     Rule * suffixRevisit(ConversionRule * r);
     bool chainRevisitSplit(const std::vector<Rule *> & group, const UCD::UnicodeSet * filter,
@@ -601,6 +602,8 @@ private:
     //  returnsToText), whose sets (of single characters there) are these.
     bool mReturns = false;
     std::vector<UCD::UnicodeSet> mTextSets;
+    //  (See prefixRunStep: the character at which the paths end, revisited.)
+    std::optional<char32_t> mStopAt;
 };
 
 bool Composer::collectItems(RE * re, std::vector<Item> & items) {
@@ -776,6 +779,11 @@ void Composer::explore(Path p, RE * text, std::vector<Rule *> & composed) {
         bool is = true;
         for (size_t i = 0; i < seq.size() && is; ++i) is = seq[i].contains(p.pending[i]);
         if (is) p.transparent.insert(mTextLength + static_cast<unsigned>(p.beyond.size()));
+    }
+    if (mStopAt && p.pending.size() == 1 && p.pending[0] == *mStopAt && !p.applied.empty() && p.beyond.empty()) {
+        composed.push_back(makeConversionRule(makeRuleSide(contextRE(p.before, true), text, contextRE(p.after.front().second, false)),
+                                              Direction::Forward, makeRuleSide(nullptr, literal(p.out), literal(p.pending), 0, nullptr)));
+        return;
     }
     if (mReturns && returnsToText(p)) {
         const unsigned split = mTextLength + static_cast<unsigned>(p.beyond.size()) - static_cast<unsigned>(p.pending.size());
@@ -960,6 +968,41 @@ void Composer::apply(const GroupRule & g, Path q, const std::vector<MatchedChar>
     q.out += completed;
     q.pending = revisit + q.pending.substr(std::min(q.pending.size(), matched.size()));
     explore(std::move(q), text, composed);
+}
+
+void textAtoms(RE * re, std::vector<RE *> & atoms);
+
+//  A rule p S → A | R p ; (p a character, no contexts) whose composition fails
+//  (on unbounded runs) as the prefix run it is after one step of composition:
+//  the rules applying to R, followed by p, apply unconditionally (on the
+//  characters of R and p alone), giving p S → A A' | p ; (ja_Latn-ru's
+//  i $lengthMarker → | i i ; as i $lengthMarker → и | i ;).  Or nullptr.
+Rule * Composer::prefixRunStep(ConversionRule * r, const std::vector<GroupRule> & group) {
+    const RuleSide * source = r->getSourceSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return nullptr;
+    std::vector<RE *> text;
+    textAtoms(source->getText(), text);
+    std::u32string completed, revisit;
+    if (text.size() < 2 || !ruleResult(r->getResultSide(Direction::Forward), {}, completed, revisit) || revisit.size() < 2) return nullptr;
+    UCD::UnicodeSet p;
+    if (!CharSetAnalysis::isSet(text[0]) || hasStrings(text[0]) || hasBoundary(text[0])) return nullptr;
+    p = mSets.setOf(text[0], false);
+    if (p.count() != 1 || !p.contains(revisit.back())) return nullptr;
+    try {
+        composeRule(r, group);
+        return nullptr;
+    } catch (const NotComposed &) {}
+    mStopAt = revisit.back();
+    std::vector<Rule *> composed;
+    try {
+        composed = composeRuleOnce(r, group);
+    } catch (const NotComposed &) {
+        composed.clear();
+    }
+    mStopAt.reset();
+    PrefixRun pr;
+    if (composed.size() != 1 || !prefixRun(cast<ConversionRule>(composed[0]), pr) || !pr.prefix.empty()) return nullptr;
+    return composed[0];
 }
 
 //  Whether the text to revisit is the text of the composed rule (and the
@@ -1358,10 +1401,25 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
     //  Whether the prefix runs only delete their texts S (A empty, no triggers),
     //  leaving each P where it is.
     const bool deleteOnly = replaced.empty() && triggers.empty();
+    //  With blocking marks, the prefix runs that replace their texts S (A not
+    //  empty) do so with as many characters (they delete nothing), and the
+    //  rest of the group may not see them: their characters (of P, S and A),
+    //  in its after contexts, as without the marks.
+    UCD::UnicodeSet replacing;
+    bool replacingSameLength = true;
+    for (const PrefixRun & pr : runs) {
+        if (pr.replacement.empty()) continue;
+        replacing = replacing + pr.first;
+        for (const UCD::UnicodeSet & r : pr.run) replacing = replacing + r;
+        for (char32_t c : pr.replacement) replacing.insert(c);
+        replacingSameLength &= pr.replacement.size() == pr.run.size() && !pr.revisitsReplacement && pr.prefix.empty();
+    }
     //  With blocking marks: whether the rest of the group deletes S wherever
     //  ICU reaches it.
-    const bool canBlock = blocking && deleteOnly && exceptions == nullptr;
-    bool runDeleted = canBlock && std::all_of(runs.begin(), runs.end(), [](const PrefixRun & pr) {return pr.run.size() == 1;});
+    const bool canBlock = blocking && triggers.empty() && exceptions == nullptr && replacingSameLength
+                          && std::any_of(runs.begin(), runs.end(), [](const PrefixRun & pr) {return pr.replacement.empty();});
+    bool runDeleted = canBlock && replacing.empty()
+                      && std::all_of(runs.begin(), runs.end(), [](const PrefixRun & pr) {return pr.run.size() == 1;});
     for (size_t k = 0; k < rules.size() && runDeleted; ++k) {
         const ConversionRule * c = dyn_cast<ConversionRule>(rules[k]);
         if (c == nullptr || isRun[k]) continue;
@@ -1551,8 +1609,14 @@ std::string prefixRunConflict(const std::vector<Rule *> & rules, const std::vect
             }
         }
         if (canBlock && source->hasAfterContext()) {
-            //  (Seen by the blocking marks, where a set may follow a character of P.)
+            //  (Seen by the blocking marks, where a set may follow a character of P;
+            //  the runs replacing, by none of its sets, or with all their characters.)
             *blocking = true;
+            for (const PatternItem & item : patternItems(source->getAfterContext())) {
+                if (item.chars.intersects(replacing) && !replacing.subset(item.chars)) {
+                    return "an after context may see the text of a prefix run: " + printRule(c);
+                }
+            }
         } else if (source->hasAfterContext()) {
             const std::vector<PatternItem> afterItems = patternItems(source->getAfterContext());
             for (size_t i = 0; i < afterItems.size(); ++i) {
@@ -2494,6 +2558,53 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
                 r = s;
             }
         }
+        //  The rules that are prefix runs after one step of composition (see
+        //  prefixRunStep), p S → A | p ; split with a marker M (a noncharacter)
+        //  to keep ICU's cursor: p } S → M ; applies where ICU applies the rule
+        //  (at p, as it is reached), and, first in the group, M { S → | p ;
+        //  revisits p after M, where ICU would after A, whose rules compose
+        //  (each run of S, one at a time); a group after this one replaces M by
+        //  A.  The other rules may not have before contexts that would see A.
+        std::vector<std::pair<char32_t, std::u32string>> markers;
+        {
+            std::vector<GroupRule> all;
+            for (Rule * r : rewritten) {
+                if (ConversionRule * c = dyn_cast<ConversionRule>(r)) {
+                    all.push_back(groupRule(c));
+                    all.back().revisits = hasRevisit(c);
+                }
+            }
+            std::vector<Rule *> first;
+            for (size_t k = 0; k < rewritten.size(); ++k) {
+                ConversionRule * c = dyn_cast<ConversionRule>(rewritten[k]);
+                PrefixRun pr;
+                if (c == nullptr || isRewritten[k] || !hasRevisit(c) || prefixRun(c, pr) || markers.size() == 16) continue;
+                Rule * const step = prefixRunStep(c, all);
+                if (step == nullptr || !prefixRun(cast<ConversionRule>(step), pr) || pr.replacement.empty() || pr.first.count() != 1) continue;
+                UCD::UnicodeSet a;
+                for (char32_t ch : pr.replacement) a.insert(ch);
+                bool seen = false;
+                for (Rule * r : rewritten) {
+                    const ConversionRule * o = dyn_cast<ConversionRule>(r);
+                    if (o == nullptr || !o->getSourceSide(Direction::Forward)->hasBeforeContext()) continue;
+                    for (const PatternItem & item : patternItems(o->getSourceSide(Direction::Forward)->getBeforeContext())) {
+                        seen |= item.chars.intersects(a);
+                    }
+                }
+                if (seen) continue;
+                const char32_t m = static_cast<char32_t>(0xFDE0 + markers.size());
+                std::vector<RE *> run;
+                for (const UCD::UnicodeSet & set : pr.run) run.push_back(makeCC(set));
+                RE * const p = makeCC(pr.first);
+                rewritten[k] = makeConversionRule(makeRuleSide(nullptr, p, makeSeq(run.begin(), run.end())), Direction::Forward,
+                                                  makeRuleSide(literal(std::u32string(1, m))));
+                first.push_back(makeConversionRule(makeRuleSide(makeCC(static_cast<codepoint_t>(m)), makeSeq(run.begin(), run.end()), nullptr),
+                                                   Direction::Forward, makeRuleSide(nullptr, makeSeq(), p, 0, nullptr)));
+                markers.emplace_back(m, pr.replacement);
+            }
+            rewritten.insert(rewritten.begin(), first.begin(), first.end());
+            isRewritten.insert(isRewritten.begin(), first.size(), false);
+        }
         //  Then the prefix runs, moved to a group of their own if the rest of the
         //  group cannot see the difference.
         std::vector<bool> isRun(rewritten.size(), false);
@@ -2555,6 +2666,7 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
         if (!runs.empty() && runConflict.empty() && blocking) {
             mBlock = BlockMarker{};
             for (const PrefixRun & pr : runs) {
+                if (!pr.replacement.empty()) continue;     // (deleting nothing)
                 mBlock.first = mBlock.first + pr.first;
                 mBlock.runStart = mBlock.runStart + pr.run.front();
                 mBlock.starts.emplace_back(pr.first, pr.run.front());
@@ -2695,6 +2807,14 @@ std::vector<Rule *> Composer::compose(const std::vector<Rule *> & rules) {
             }
             if (mRecord) mStats->records.push_back(std::move(record));
             mRecord = nullptr;
+        }
+        //  (The markers of the rules split above, replaced in a group of their own.)
+        if (!markers.empty()) {
+            out.push_back(makeTransformRule(TransformID("Null")));
+            for (const auto & m : markers) {
+                out.push_back(makeConversionRule(makeRuleSide(makeCC(static_cast<codepoint_t>(m.first))), Direction::Forward,
+                                                 makeRuleSide(literal(m.second))));
+            }
         }
         mBlocking = false;
         start = end;

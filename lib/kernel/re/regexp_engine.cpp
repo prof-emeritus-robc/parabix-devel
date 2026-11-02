@@ -720,8 +720,9 @@ EndOfTextMark::EndOfTextMark(LLVMTypeSystemInterface & ts, StreamSet * source, S
 
 void EndOfTextMark::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
-    PabloAST * const advOnes = pb.createAdvance(pb.createOnes(), 1);
-    writeOutputStreamSet("mark", std::vector<PabloAST *>{pb.createAtEOF(advOnes)});
+    // The position after the last code unit (that of an empty text too, which
+    // an advance of the ones would not mark).
+    writeOutputStreamSet("mark", std::vector<PabloAST *>{pb.createAtEOF(pb.createOnes())});
 }
 
 ExtendByOne::ExtendByOne(LLVMTypeSystemInterface & ts, StreamSet * source, StreamSet * extended)
@@ -2273,6 +2274,8 @@ static bool parseChainForm(RE * re, const cc::Alphabet * lengthAlphabet, ChainFo
     } else {
         elems.push_back(re);
     }
+    // A final lookahead of the end of the text, (?=$), is the end of the text.
+    if (!elems.empty() && isEndLookahead(elems.back())) elems.back() = makeEnd();
     // Lookbehinds at the start hold at the starts of the matches: they are
     // compiled on their own and restrict the starts of the rest.
     const auto lookbehindEnd = std::find_if_not(elems.begin(), elems.end(), isLookbehind);
@@ -2417,6 +2420,7 @@ StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vec
     // they hold, as are the starts).
     StreamSet * Hend = nullptr;
     if (!form.afterChain.empty()) {
+        for (RE * e : form.afterChain) prepareExternals(e);
         Hend = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(form.afterChain.begin(), form.afterChain.end()), Hend);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
@@ -2428,6 +2432,7 @@ StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vec
     }
     StreamSet * starts = form.segments.empty() ? Hend : chainMatchStarts(form.segments, &rec, Hend);
     if (!form.lookbehinds.empty()) {
+        for (RE * e : form.lookbehinds) prepareExternals(e);
         StreamSet * const holds = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(form.lookbehinds.begin(), form.lookbehinds.end()), holds);
         StreamSet * const restricted = out ? out : mPB.CreateStreamSet(1);
@@ -2630,7 +2635,8 @@ void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, Stream
     ensurePrepared(re);
     mRE = applyModePasses(re, RE_Goal::MatchStarts);
     mRE = processReferences(mRE);
-    prepareExternals(mRE);
+    // (The externals are compiled for the kernels of each alternative, as they
+    // are made: a lookahead chain may not use them all; see alternativeStarts.)
     compileStarts(mRE, starts);
 }
 
@@ -2901,10 +2907,12 @@ void RE_PipelineBuilder::alternativeStarts(const MatchStartsAlternative & a, Str
     // Code units are positions: the starts are marked in code units.
     assert(mCtxt.mIndexStream == nullptr);
     if (a.strategy == StartsStrategy::FixedLength) {
+        prepareExternals(a.re);
         fixedLengthStarts(a.re, getLengthRange(a.re, mCtxt.mLengthAlphabet).first, out);
     } else if (a.strategy == StartsStrategy::LengthClasses) {
         std::vector<StreamSet *> classStarts;
         for (const auto & c : a.classes) {
+            prepareExternals(c.second);
             StreamSet * const s = (a.classes.size() == 1) ? out : mPB.CreateStreamSet(1);
             fixedLengthStarts(c.second, c.first, s);
             classStarts.push_back(s);
@@ -2918,6 +2926,8 @@ void RE_PipelineBuilder::alternativeStarts(const MatchStartsAlternative & a, Str
         // the length of the prefix (and the offset of its marks).
         Name * const pfxName = makeUniquePrefixName(a.prefix);
         compileExternal(pfxName);
+        prepareExternals(a.suffix);
+        for (RE * lb : a.lookbehinds) prepareExternals(lb);
         auto fp = mCtxt.mExternals.find(pfxName->getFullName());
         assert(fp != mCtxt.mExternals.end());
         StreamSet * const pfxStrm = fp->second.extStream;
@@ -3858,6 +3868,7 @@ RE_PipelineBuilder::SelectedMatches RE_PipelineBuilder::selectMatches(const Prep
     m.keep = mPB.CreateStreamSet(1);
     StreamSet * const drop = mTextExtended ? mCtxt.mMatchFollows : nullptr;
     mPB.CreateKernelCall<LeftmostMatchSelection>(starts, ends, drop, m.selected, m.covered, m.keep);
+
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         mPB.captureBitstream("srStarts", starts);
         mPB.captureBitstream("srEnds", ends);
@@ -3944,7 +3955,17 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     // match, which must be a position of the text: without match regions,
     // the text is extended by one.
     mNeedsCodepoints = true;
-    const SelectedMatches m = selectMatches(sr, n > 0);
+    SelectedMatches m = selectMatches(sr, n > 0);
+    if (!mTextExtended && (mCtxt.mCodeUnitAlphabet == &cc::Unicode) && (mCtxt.mMultiplexed == nullptr)) {
+        // The positions kept are those of the code units: the streams of the
+        // matches may have a position after the text (where a lookahead was
+        // tested), which is not a code unit to keep.
+        StreamSet * const units = mPB.CreateStreamSet(1);
+        compileClasses(std::vector<re::CC *>{makeCC(0, UCD::UNICODE_MAX, &cc::Unicode)}, units, mCtxt.mCodeUnitStream);
+        StreamSet * const keep = mPB.CreateStreamSet(1);
+        AndCombine(mPB, m.keep, units, keep);
+        m.keep = keep;
+    }
     if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
         llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
     }

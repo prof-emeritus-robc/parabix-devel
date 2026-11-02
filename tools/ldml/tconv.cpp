@@ -96,6 +96,7 @@
 #include <kernel/re/regexp_engine.h>
 #include <re/adt/adt.h>
 #include <re/transforms/resolve_possessive.h>
+#include <re/analysis/re_analysis.h>
 #include <re/analysis/re_name_gather.h>
 #include <re/cc/cc_kernel.h>
 #include <re/cc/cc_compiler.h>
@@ -2512,10 +2513,13 @@ static void convertedContextCaptureRules(const ldml::TransformStep & step, std::
     }
 }
 
-//  The characters of a pattern of sets (through variables), or false.
+//  The characters of a pattern of sets (through variables; the start and end
+//  of the text match none), or false.
 static bool patternChars(const re::RE * re, UCD::UnicodeSet & chars) {
     if (const re::CC * cc = dyn_cast<re::CC>(re)) {
         chars = chars + *cc;
+        return true;
+    } else if (isa<re::Start>(re) || isa<re::End>(re)) {
         return true;
     } else if (const re::Seq * seq = dyn_cast<re::Seq>(re)) {
         for (const re::RE * e : *seq) if (!patternChars(e, chars)) return false;
@@ -2804,9 +2808,63 @@ static re::RE * sourceBeforeContext(const ldml::TransformStep & step, const ldml
     return re::makeAlt(all.begin(), all.end());
 }
 
+//  Whether the before context of a set of MultipleCaptureMultipleReplacement
+//  rules is the same in the converted text as in the text itself, in a group
+//  of such rules alone, whose matches are converted by inserting a text before
+//  them (R0, with T0 empty) and keep the rest (no Ti, no Ri after the
+//  captures): the converted text differs only by these insertions, before
+//  matches that begin with a character of V (those with which the first
+//  capture begins, never empty).  The next match begins after the end of such
+//  a match, and the context, none of whose characters is in V, cannot reach
+//  back over its first character to the text inserted.  Nor can it where every
+//  match ends at the end of the text (its after context, $), as no match
+//  follows it.  (cy-cy_FONIPA's $end $cons* { ($vowel+ $cons*) } $end → ˈ $1,
+//  after ($vowel+ $cons+ $vowel+ $cons*) } $end → ˈ $1, with $end = [$ ]: the
+//  end of the text, as ICU ignores the space.)
+static bool atTextEnd(const re::RE * re) {
+    if (isa<re::End>(re)) return true;
+    if (const re::Name * n = dyn_cast<re::Name>(re)) return n->getDefinition() && atTextEnd(n->getDefinition());
+    if (const re::Seq * seq = dyn_cast<re::Seq>(re)) return !seq->empty() && atTextEnd(seq->front());
+    if (const re::Alt * alt = dyn_cast<re::Alt>(re)) {
+        for (const re::RE * a : *alt) {
+            const re::CC * const cc = dyn_cast<re::CC>(a);
+            if (!(cc && cc->empty()) && !atTextEnd(a)) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool unchangedBeforeContext(const ldml::TransformStep & step, const ldml::MultipleCaptureMultipleReplacementSet & target) {
+    if (!step.subgroups.empty() || !step.stringRules.empty() || !step.insertions.empty() || !step.deferred.empty()) return false;
+    UCD::UnicodeSet V;
+    bool atEnd = true;
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        if (set.moved || set.reversed || set.captures.empty()) return false;
+        atEnd &= set.engineAfter && atTextEnd(set.engineAfter);
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            if (!r.first.empty()) return false;
+        }
+        for (const std::vector<UCD::UnicodeSet> & t : set.texts) {
+            if (!t.empty()) return false;
+        }
+        for (const std::u32string & r : set.results) {
+            if (!r.empty()) return false;
+        }
+        re::RE * const first = set.captures.front();
+        if (re::getLengthRange(first, &cc::Unicode).first < 1) return false;
+        re::CC * const firsts = re::firstCharClass(first);
+        if (firsts == nullptr) return false;
+        V = V + *firsts;
+    }
+    UCD::UnicodeSet context;
+    return (patternChars(target.engineBefore, context) && !context.intersects(V)) || atEnd;
+}
+
 //  The before contexts of the MultipleCaptureMultipleReplacement rules of the
 //  steps of a plan that may match differently in the converted text,
-//  translated to the text where they may be (see sourceBeforeContext).
+//  translated to the text where they may be (see sourceBeforeContext), or
+//  the same there (see unchangedBeforeContext).
 static void translateCaptureContexts(ldml::TransformPlan & plan) {
     for (ldml::TransformStep & step : plan.steps) {
         if (step.captureReplacements.empty()) continue;
@@ -2817,6 +2875,8 @@ static void translateCaptureContexts(ldml::TransformPlan & plan) {
             if (fusedContexts(set.engineBefore, true, before, true) && !convertedContextMatters(before, outcomes)) continue;
             if (re::RE * s = sourceBeforeContext(step, set)) {
                 set.engineBefore = s;
+                set.sourceBefore = true;
+            } else if (unchangedBeforeContext(step, set)) {
                 set.sourceBefore = true;
             }
         }
@@ -6644,6 +6704,35 @@ static void lookaheadContextProblems(const ldml::TransformStep & step, std::vect
     }
     for (const ldml::DeferredRule & d : step.deferred) {
         problem(ldml::printRule(d.rule), failures(d.engineBefore, d.engineAfter, d.text, false));
+    }
+    //  The MultipleCaptureMultipleReplacement rules whose exact starts are found
+    //  with their captures matched possessively in a lookahead (see
+    //  engineStarts), as matchCaptures does.
+    for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
+        if (!set.engineStarts) continue;
+        const size_t n0 = set.rules.front().first.size();
+        std::vector<re::RE *> items;
+        for (size_t j = 0; j < n0; j++) {
+            UCD::UnicodeSet chars;
+            for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) chars = chars + r.first[j];
+            items.push_back(re::makeCC(chars, &cc::Unicode));
+        }
+        for (size_t i = 0; i < set.captures.size(); i++) {
+            items.push_back(ldml::possessiveCapture(ldml::expandedContext(set.captures[i], Insertions(), DeletionMark)));
+            for (const UCD::UnicodeSet & chars : set.texts[i]) items.push_back(re::makeCC(chars, &cc::Unicode));
+        }
+        std::vector<PreconditionFailure> fs;
+        if (!checkPreconditions(prepareRE(startsPattern(set.engineBefore, set.engineAfter, items, false), startsOptions()),
+                                &cc::Unicode).empty()) {
+            fs = checkPreconditions(prepareRE(startsPattern(set.engineBefore, set.engineAfter, items, true), engineOptions()),
+                                    &cc::Unicode);
+        }
+        if (fs.empty()) continue;
+        for (const ldml::MultipleCaptureMultipleReplacement & r : set.rules) {
+            problems.push_back(ldml::printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but the matches of "
+                               "other such rules may overlap its matches, not all of whose starts are known: the engine "
+                               "does not support its captures in a lookahead in this form: " + fs.front().reason + ")");
+        }
     }
 }
 

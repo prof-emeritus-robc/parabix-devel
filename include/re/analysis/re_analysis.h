@@ -98,6 +98,10 @@ struct LookaheadSegment {
 // the class (preceded by a fixed segment, for a lower bound above 1).
 // With requireStar false, a chain need not have a star segment (for the
 // coverage of match spans).
+// Is r (through names) a lookahead of the end of the text, (?=$)?  At the end
+// of a pattern, it is the end of the text.
+bool isEndLookahead(RE * r);
+
 bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vector<LookaheadSegment> & segments,
                          bool requireStar = true);
 

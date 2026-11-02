@@ -116,7 +116,8 @@ static bool orderedStrings(RE * r, std::vector<std::vector<CC *>> & strings) {
 //  w that is a proper suffix of preferred strings t' w is taken only where none
 //  of them matches, (?<!t'...) w, and with firsts the characters with which
 //  the matches end; at each end position, at most one alternative matches.
-static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bool backward = false) {
+static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bool backward = false,
+                               CC ** singles = nullptr) {
     std::vector<std::vector<CC *>> alternatives;
     if (!orderedStrings(e, alternatives)) return nullptr;
     const cc::Alphabet * alphabet = nullptr;
@@ -206,6 +207,16 @@ static RE * unambiguousStrings(RE * e, PossessiveChoice choice, CC *& firsts, bo
         }
         first.insert(static_cast<UCD::codepoint_t>(backward ? w.text.back() : w.text.front()));
     }
+    //  The first characters that are alternatives of their own (guarded only by
+    //  the rest of the longer alternatives they begin, which are alternatives
+    //  too): at such a character, an alternative always matches.
+    if (singles) {
+        UCD::UnicodeSet alone = others;
+        for (const Literal & w : distinct) {
+            if (w.text.size() == 1) alone.insert(static_cast<UCD::codepoint_t>(w.text.front()));
+        }
+        *singles = makeCC(std::move(alone), alphabet);
+    }
     firsts = makeCC(std::move(first), alphabet);
     return makeAlt(alts.begin(), alts.end());
 }
@@ -279,7 +290,8 @@ RE * ResolvePossessive::resolve(Rep * rep, const std::vector<RE *> & rest, bool 
     //  A class of strings, made unambiguous: its repetitions reach the same
     //  positions however they are matched.
     CC * firsts = nullptr;
-    if (RE * const d = S ? nullptr : unambiguousStrings(e, mChoice, firsts)) {
+    CC * singles = nullptr;
+    if (RE * const d = S ? nullptr : unambiguousStrings(e, mChoice, firsts, false, &singles)) {
         RE * const following = makeSeq(rest.begin(), rest.end());
         if (lb == ub || (rest.empty() && atLookaheadEnd) || (!rest.empty() && isa<End>(rest.front()))) {
             return makeSeq({makeRep(d, lb, ub), following});
@@ -289,6 +301,14 @@ RE * ResolvePossessive::resolve(Rep * rep, const std::vector<RE *> & rest, bool 
             if (first && first->getAlphabet() == firsts->getAlphabet() && intersectCC(first, firsts)->empty()) {
                 return makeSeq({makeRep(d, lb, ub), following});
             }
+        }
+        //  Where every first character is an alternative of its own, (?!d) holds
+        //  exactly where the next character is not a first character: a
+        //  one-character lookahead (as a lookahead chain allows).
+        if (singles && firsts->getAlphabet() == singles->getAlphabet() && subtractCC(firsts, singles)->empty()) {
+            RE * const notFirst = makeNegativeLookAheadAssertion(firsts);
+            if (ub == Rep::UNBOUNDED_REP) return makeSeq({makeRep(d, lb, ub), notFirst, following});
+            return makeSeq({makeAlt({makeSeq({makeRep(d, lb, ub - 1), notFirst}), makeRep(d, ub, ub)}), following});
         }
         return makeSeq({withAssertion(d, lb, ub), following});
     }

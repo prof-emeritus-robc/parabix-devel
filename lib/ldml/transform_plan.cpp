@@ -2114,15 +2114,14 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 //  The starts found by the engine, with the captures in a lookahead.
                 bool supported = true;
                 for (const re::RE * c : set.captures) supported &= !repeatsStringsOrSequences(c);
+                set.exactStarts = true;
                 if (supported || greedyMatchesPossessive(set, sets)) {
-                    set.exactStarts = true;
                     set.greedyStarts = !supported;
                     continue;
                 }
-                for (const MultipleCaptureMultipleReplacement & r : set.rules) {
-                    plan.problems.push_back(printRule(r.rule) + "  (a MultipleCaptureMultipleReplacement rule, but the matches of "
-                                            "other such rules may overlap its matches, not all of whose starts are known)");
-                }
+                //  (Possessive captures in the lookahead, which tconv checks the
+                //  engine supports in their form.)
+                set.engineStarts = true;
             }
         }
     }

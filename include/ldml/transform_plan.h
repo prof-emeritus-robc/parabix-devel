@@ -217,6 +217,11 @@ struct MultipleCaptureMultipleReplacementSet {
     //  with strings there): the same matches, if what follows each repetition
     //  cannot begin with a character it repeats.
     bool greedyStarts = false;
+    //  With exactStarts, whether the captures (repeating sets with strings or
+    //  sequences, not matched greedily) are matched possessively in the
+    //  lookahead, in a form that tconv checks the engine supports (see
+    //  lookaheadContextProblems in tconv).
+    bool engineStarts = false;
     //  Where a match may end within another of the set (and the starts are not
     //  known by the first characters): the starts found by the engine (as with
     //  exactStarts, greedyStarts as there), of which those that apply are

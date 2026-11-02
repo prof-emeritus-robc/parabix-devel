@@ -914,6 +914,16 @@ bool isRepeatableStringClass(const std::vector<std::vector<CC *>> & strings) {
     return true;
 }
 
+bool isEndLookahead(RE * r) {
+    while (const Name * n = dyn_cast<Name>(r)) {
+        if (n->getDefinition() == nullptr) return false;
+        r = n->getDefinition();
+    }
+    const Assertion * const a = dyn_cast<Assertion>(r);
+    return a && (a->getKind() == Assertion::Kind::LookAhead) && (a->getSense() == Assertion::Sense::Positive)
+           && isa<End>(a->getAsserted());
+}
+
 // Does the zero-width assertion r (through names, alternations and sequences
 // of assertions) hold at the end of the text?  A negative lookahead of an RE
 // that matches at least one character does.
@@ -942,6 +952,8 @@ bool parseLookaheadChain(RE * body, const cc::Alphabet * lengthAlpha, std::vecto
     segments.clear();
     std::vector<RE *> elems;
     flattenSeq(body, elems);
+    // A final lookahead of the end of the text, (?=$), is the end of the text.
+    if (!elems.empty() && isEndLookahead(elems.back())) elems.back() = makeEnd();
     // Assertions just before the end of the text that hold there (as after a
     // possessive repetition X{lb,}+ (?!X) $) are dropped.
     if (!elems.empty() && isa<End>(elems.back())) {

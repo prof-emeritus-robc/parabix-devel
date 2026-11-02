@@ -97,7 +97,19 @@ all 28 built-ins are implemented. The CLDR test file of am_Ethi-d0_Morse,
 text and each line a text, and tconv agrees with ICU on 3,000 random lines of
 Ethiopic text with spaces and dashes. Thai-Latn has no CLDR test file: it
 agrees with ICU on 3,507 lines of Thai text (with Latin letters, digits and
-punctuation between runs).*
+punctuation between runs). Then blocking marks for prefix runs that only
+delete, revisits composed up to a return to the text, and rules left to
+priority (`f2cb92480`, `--update --only it-am it-ja ja_Latn-ko ja_Latn-ru
+byn_Latn-byn_Ethi/Xaleget`, the last for its plan as printed, changed by
+`58ec782da`): it-am, it-ja and ja_Latn-ko are implementable (416), with no
+failing test cases; W6 is needed by 5 and alone blocks ja_Latn-ru (from 8
+problems to 2). On 6,000 random lines dense with apostrophes, it-am and it-ja
+differ from ICU on 6 and 19, all at rules whose before contexts the plan warns
+may match differently in the converted text (an apostrophe after a vowel,
+deleted in the group, before `[:^Letter:] { so`; and the ~ written by a
+composed rule ending at a return to the text, before `[:^Letter:] { zi`);
+ja_Latn-ko agrees with ICU on 5,000 random lines (length marks, ~ chains,
+geminates), and byn_Latn-byn_Ethi/Xaleget on 5,000.*
 
 This report covers:
 
@@ -118,8 +130,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 413 (97%) |
-| …of which public (not `visibility="internal"`) | 393 | 382 (97%) |
+| Transforms defined by CLDR files (380 files) | 425 | 416 (98%) |
+| …of which public (not `visibility="internal"`) | 393 | 385 (98%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -213,8 +225,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
   - W3 variable-length texts: 7 transforms (Latn-Arab, blt-blt_FONIPA,
     Latin-NumericPinyin and Latn-Bopo through it, byn Xaleget, my-Zawgyi and
     Zawgyi-my);
-  - W6 revisits neither composed nor prefix runs: 4 (my-my_Latn, it-am,
-    it-ja and ja_Latn-ru);
+  - W6 revisits neither composed nor prefix runs: 1 (ja_Latn-ru; it-am,
+    it-ja and ja_Latn-ko are implementable with blocking marks, §5);
   - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
     runs solved; fa-fa_FONIPA also needs W3 and W6);
   - W8 built-ins: none (Thai-Latn's `Any-BreakInternal` is applied by ICU);
@@ -225,9 +237,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          413  ███████████████████████████████████████
-+ W6 revisit                 417  ███████████████████████████████████████
-+ W3 variable-length text    421  ████████████████████████████████████████
+now                          416  ███████████████████████████████████████
++ W3 variable-length text    419  ███████████████████████████████████████
++ W6 revisit                 421  ████████████████████████████████████████
 + W4 insertion               423  ████████████████████████████████████████
 + W10 engine lookaheads      424  ████████████████████████████████████████
 + W5 captures/functions      425  ████████████████████████████████████████
@@ -432,7 +444,10 @@ Implementable now:
   ICU on 10,000 random pinyin lines each; no CLDR test data);
 - with the ends of the runs of a global filter in after contexts:
   am_Ethi-d0_Morse;
-- with a built-in applied by ICU as a stage: Thai-Latn (`Any-BreakInternal`).
+- with a built-in applied by ICU as a stage: Thai-Latn (`Any-BreakInternal`);
+- with blocking marks after prefix runs that only delete, and rules left to
+  priority: it-am and it-ja; with revisits composed up to a return to the
+  text: ja_Latn-ko.
 
 The per-transform status is in the table.
 
@@ -1040,7 +1055,7 @@ those of invoked transforms).
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
 | W3 variable-length texts | 7 | 3 | M–L (the rest) |
-| W6 text to revisit, not composed | 8 | 4 | L (with W3) |
+| W6 text to revisit, not composed | 5 | 1 | L (with W3) |
 | W5 back-references | 1 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 1 | 0 | M |
@@ -1152,7 +1167,7 @@ extracted:
   whose text is a capture (`([ab]) → B`) applied to every character, and a
   string rule could apply within an applied match in the correction kernel
   (§3.1).
-- **Not yet: blocking marks** (it-am, it-ja). Their group begins with
+- **Blocking marks** (it-am, it-ja; `f2cb92480`). Their group begins with
   `($consonant) \' → | $1 ; \' → ;`, so every apostrophe is deleted, and its
   only effect is on what matches (with ICU's `createFromRules`): a run of
   apostrophes after a consonant at which the cursor is, the first character of
@@ -1180,6 +1195,36 @@ extracted:
   position (`tz → | zz`), and triggers whose texts are within P (it-ja's
   `k → | c`, `q → | c`, whose runs are already deleted). It would make it-am
   and it-ja implementable.
+
+  As implemented (`f2cb92480`), D is the stream of the positions after the
+  runs that prefix runs deleted (where only deleting, as the kernel leaves P
+  at the end of its run: the kept positions after a moved P), and the rules
+  of the group after them have *blocking marks* (`ldml::DeletedRunBlockMark`,
+  U+FDD4, a noncharacter in their sets): a marked set matches its characters
+  only where D does not hold. The marks are where a match may follow a deleted
+  run that ICU would still have found: after a character of P other than the
+  first of the text (`BlockMarker`), and, for a composed rule, at the
+  boundaries its path crosses, other than where ICU revisited a character of
+  P just before the boundary (and so deleted the run there first). With them,
+  `prefixRunConflict` allows after contexts that see the texts of the prefix
+  runs and, where the rest of the group deletes S wherever ICU reaches it
+  (`' → ;`), P within texts and revisited at the end of a text to revisit.
+  The pipeline gives D to the class kernels (`NotAfterDeletedRuns`) and to the
+  engine (an external, intersected: `re::resolveDiffs` would fold a
+  difference with a name defined as a CC). The composition of the revisits
+  then failed on unbounded chains such as `ss → | \~s` on `sss…`; a
+  composition that fails is retried ending its paths where the text to
+  revisit returns to the text of the composed rule, as the suffix revisits do
+  (`s } s → ~`), which also made ja_Latn-ko implementable. DisambiguateOrder
+  does not see the marks as characters; where it cannot keep a later rule
+  apart from a marked earlier rule (the composed alternatives `ss [a﷔] → ሣ`
+  and `ssa → ~ሣ`, the second for where a run was deleted), it leaves the pair
+  to priority: the later string rule, or subgroup of single-character rules,
+  applies only where the earlier rule does not match at the same position
+  (`starts & ~earlier`, as the deferred rules' kernel takes the first rule
+  matching; `TransformStep::stringPriority`, `subgroupPriority`, printed by
+  `--plan`). The remaining differences from ICU are at rules whose before
+  contexts the plan warns may match differently in the converted text.
 
 Of the 43 transforms that W6 alone blocked, 9 are now implementable (Hebr-Latn,
 Latn-Cyrl, ru-zh, es-am, es-es_FONIPA, es_FONIPA-am, Ethi-Latn/ES3842,
@@ -1582,8 +1627,9 @@ The per-transform table lists the problem classes of every transform.
 2. **W3 and W6.** Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
-   neither composed nor prefix runs (19 transforms, 4 blocked by W6 alone:
-   prefix runs with interfering rules, as in it-am, and other runs).
+   neither composed nor prefix runs (5 transforms, 1 blocked by W6 alone:
+   ja_Latn-ru, with prefix runs whose P has two characters, `tsu~ → | ts`,
+   and `i $lengthMarker → | ii`, a prefix run after one step of composition).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. With
@@ -1678,6 +1724,7 @@ tconv on every implementable transform.
 | `9238f5c0c`, `5c1ed53ee` | prefix runs with revisited P and characters of S in after contexts (ja_Latn-ko); repeated captures enumerated: sk_FONIPA-ja, sk-ja: 411 |
 | `58ec782da` | ends of the runs of a global filter in after contexts: am_Ethi-d0_Morse: 412 |
 | `0550a1483`, `2770c3519` | Any-Name, Name-Any and Any-BreakInternal applied by ICU when called for, ICU stages seeing the text around their runs; Any-Hex/Plain and Hex-Any/Plain dropped: Thai-Latn: 413; built-ins 28 of 28 |
+| `f2cb92480` | blocking marks for prefix runs that only delete; revisits composed up to a return to the text; rules left to priority: it-am, it-ja, ja_Latn-ko: 416 |
 
 ## Reproducing
 

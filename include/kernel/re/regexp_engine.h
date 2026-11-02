@@ -347,15 +347,20 @@ class StringClassKernel : public pablo::PabloKernel {
 public:
     // With the region follows (the position after each match region),
     // occurrences that include a region follow are excluded.
+    // With guards (see re::parseGuardedStringClass), an occurrence of
+    // strings[i] counts only where none of guards[i] follows it (within the
+    // region).
     StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
                       kernel::StreamSet * basis, kernel::StreamSet * fillStartsEnds,
-                      kernel::StreamSet * follows = nullptr);
+                      kernel::StreamSet * follows = nullptr,
+                      std::vector<std::vector<std::vector<re::CC *>>> guards = {});
     bool hasSignature() const override { return true; }
     llvm::StringRef getSignature() const override { return mSignature; }
 protected:
     void generatePabloMethod() override;
 private:
     const std::vector<std::vector<re::CC *>> mStrings;
+    const std::vector<std::vector<std::vector<re::CC *>>> mGuards;
     const bool mHasFollows;
     const std::string mSignature;
 };

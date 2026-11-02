@@ -33,6 +33,15 @@ CC * firstCharClass(RE * r);
 // character classes, with at least one string of two or more characters.
 bool parseStringClass(RE * r, std::vector<std::vector<CC *>> & strings);
 
+// Parse r as an alternation of guarded strings: each a sequence of items
+// resolving to character classes, possibly followed by a negative lookahead
+// (?!g1|g2|...) of guard strings (sequences of character classes), as a
+// possessive repetition of strings is made unambiguous (re::resolvePossessive:
+// m(?!̥) | m̥).  guards[i] holds the guards of strings[i] (none: empty).  At
+// least one string has two or more characters, or a guard.
+bool parseGuardedStringClass(RE * r, std::vector<std::vector<CC *>> & strings,
+                             std::vector<std::vector<std::vector<CC *>>> & guards);
+
 // Can (s1|s2|...)* be matched as a run of the string class: from each
 // starting position of a string, by MatchStar over the positions within
 // occurrences of the strings (the fill), stopping just after the end of an
@@ -56,6 +65,10 @@ struct LookaheadSegment {
     // (cc is then the class of all their characters).
     std::vector<std::vector<CC *>> strings = {};
     CC * first = nullptr;
+    // The guards of the strings (see parseGuardedStringClass): an occurrence of
+    // strings[i] counts only where none of guards[i] follows it.  (Empty: no
+    // guards.)
+    std::vector<std::vector<std::vector<CC *>>> guards = {};
     // An assertion segment is a run of one-character lookaheads (?=Y) or
     // (?!Y), within the chain or at its end (it is then an end segment): cc is
     // the class of the characters at which they all hold, and negated is true

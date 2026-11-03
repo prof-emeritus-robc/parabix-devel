@@ -806,6 +806,16 @@ std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned
 //  (Zawgyi-my's ေ ့+ ($consonant) → $1 ေ့.)  split counts the rules split.
 std::vector<Rule *> SplitMiddleRuns(const std::vector<Rule *> & rules, unsigned * split = nullptr);
 
+//  A forward conversion rule whose before context is a capture of a set with
+//  strings alone, as rules in its place, one for each string (the longest
+//  first) and one for the single characters of the set: ICU matches the set
+//  right to left, taking the longest string that ends where the text begins
+//  (and nothing before it in the context could then fail).  The captures of
+//  the rules are then sequences of sets.  (fa-fa_FONIPA's
+//  ([$IPA_CONSONANT|$VOWEL]) { ّ → $1, with {t͡ʃ} and {d͡ʒ}.)  expanded counts
+//  the rules expanded.
+std::vector<Rule *> ExpandContextCaptureStrings(const std::vector<Rule *> & rules, unsigned * expanded = nullptr);
+
 //  The anchors of the texts of forward conversion rules (as ICU matches them,
 //  in the text being transliterated), moved to their contexts: ^ at the start
 //  of a text without a before context becomes its before context, and $ at the

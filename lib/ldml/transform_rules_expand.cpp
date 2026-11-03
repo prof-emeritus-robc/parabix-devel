@@ -1100,4 +1100,58 @@ std::vector<Rule *> SplitMiddleRuns(const std::vector<Rule *> & rules, unsigned 
     return out;
 }
 
+std::vector<Rule *> ExpandContextCaptureStrings(const std::vector<Rule *> & rules, unsigned * expanded) {
+    std::vector<Rule *> out;
+    Expander expander;
+    for (Rule * r : rules) {
+        ConversionRule * const c = dyn_cast<ConversionRule>(r);
+        std::vector<Rule *> replaced;
+        [&] {
+            if (c == nullptr) return;
+            const RuleSide * const source = c->getSourceSide(Direction::Forward);
+            const Capture * const capture = source->getBeforeContext() ? dyn_cast<Capture>(source->getBeforeContext()) : nullptr;
+            if (capture == nullptr || !CharSetAnalysis::isSet(capture->getCapturedRE())) return;
+            UCD::UnicodeSet chars;
+            std::set<std::u32string> strings;
+            if (!expander.alternatives(capture->getCapturedRE(), chars, strings) || strings.empty()) return;
+            //  The strings, longest first (ICU takes the longest that ends there).
+            std::vector<std::u32string> order(strings.begin(), strings.end());
+            std::stable_sort(order.begin(), order.end(), [](const std::u32string & a, const std::u32string & b) {
+                return a.size() > b.size();
+            });
+            auto variant = [&](RE * captured) -> Rule * {
+                Capture * const by = makeCapture(capture->getName(), captured);
+                RuleSide * const result = rebindResult(c->getResultSide(Direction::Forward), capture, by);
+                if (result == nullptr) return nullptr;
+                return makeConversionRule(makeRuleSide(by, source->getText(), source->getAfterContext()), Direction::Forward, result);
+            };
+            for (const std::u32string & str : order) {
+                std::vector<RE *> items;
+                for (char32_t ch : str) items.push_back(makeCC(static_cast<UCD::codepoint_t>(ch)));
+                Rule * const v = variant(makeSeq(items.begin(), items.end()));
+                if (v == nullptr) {
+                    replaced.clear();
+                    return;
+                }
+                replaced.push_back(v);
+            }
+            if (!chars.empty()) {
+                Rule * const v = variant(makeCC(chars));
+                if (v == nullptr) {
+                    replaced.clear();
+                    return;
+                }
+                replaced.push_back(v);
+            }
+        }();
+        if (replaced.empty()) {
+            out.push_back(r);
+        } else {
+            if (expanded) (*expanded)++;
+            out.insert(out.end(), replaced.begin(), replaced.end());
+        }
+    }
+    return out;
+}
+
 }

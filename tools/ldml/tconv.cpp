@@ -646,6 +646,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
         }
         rules = ldml::SplitLeadingRuns(rules);
         rules = ldml::SplitMiddleRuns(rules);
+        rules = ldml::ExpandContextCaptureStrings(rules);
         ldml::FiniteTextStats fstats;
         rules = ldml::ExpandFiniteTexts(rules, &fstats);
         ldml::DisambiguationStats dstats;

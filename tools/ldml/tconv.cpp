@@ -1084,6 +1084,7 @@ struct WalkConfig {
         unsigned length;
         int run;
         unsigned suffix;
+        std::vector<std::pair<int, unsigned>> more = {};    // further runs (classes) and their suffixes
     };
     std::vector<Branch> branches;
     unsigned lookahead() const {
@@ -1103,6 +1104,7 @@ struct WalkConfig {
         std::string sig;
         for (const Branch & b : branches) {
             sig += "_b" + std::to_string(b.length) + "r" + std::to_string(b.run) + "s" + std::to_string(b.suffix);
+            for (const auto & m : b.more) sig += "m" + std::to_string(m.first) + "s" + std::to_string(m.second);
             for (const auto & t : b.in) sig += "+" + std::to_string(t.first) + ":" + std::to_string(t.second);
             for (const auto & t : b.out) sig += "-" + std::to_string(t.first) + ":" + std::to_string(t.second);
         }
@@ -1184,18 +1186,26 @@ protected:
                 ends = pb.createOr(ends, last);
                 continue;
             }
-            PabloAST * const r = classes[b.run];
-            PabloAST * const reached = pb.createMatchStar(pb.createAdvance(s, b.length), r);
-            PabloAST * const run = pb.createAnd(reached, r);
-            PabloAST * const after = pb.createAnd(reached, pb.createNot(r));
-            spans = pb.createOr(spans, run);
-            if (b.suffix > 0) {
-                for (unsigned j = 0; j < b.suffix; j++) spans = pb.createOr(spans, j ? pb.createAdvance(after, j) : after);
-                ends = pb.createOr(ends, b.suffix > 1 ? pb.createAdvance(after, b.suffix - 1) : after);
-            } else {
-                //  The last character of the run, or the one before an empty run.
-                ends = pb.createOr(ends, pb.createAnd(pb.createOr(run, last), pb.createNot(pb.createLookahead(r, 1))));
+            //  Each run, then its suffix: from the position after the text, the
+            //  last character so far tracked (that of the run, or the one before
+            //  an empty run).
+            std::vector<std::pair<int, unsigned>> segments{{b.run, b.suffix}};
+            segments.insert(segments.end(), b.more.begin(), b.more.end());
+            PabloAST * position = pb.createAdvance(s, b.length);
+            PabloAST * lastSoFar = last;
+            for (const auto & segment : segments) {
+                PabloAST * const r = classes[segment.first];
+                PabloAST * const reached = pb.createMatchStar(position, r);
+                PabloAST * const run = pb.createAnd(reached, r);
+                PabloAST * const after = pb.createAnd(reached, pb.createNot(r));
+                spans = pb.createOr(spans, run);
+                lastSoFar = pb.createAnd(pb.createOr(run, lastSoFar), pb.createNot(pb.createLookahead(r, 1)));
+                const unsigned n = segment.second;
+                for (unsigned j = 0; j < n; j++) spans = pb.createOr(spans, j ? pb.createAdvance(after, j) : after);
+                if (n > 0) lastSoFar = n > 1 ? pb.createAdvance(after, n - 1) : after;
+                position = n > 0 ? pb.createAdvance(after, n) : after;
             }
+            ends = pb.createOr(ends, lastSoFar);
         }
         writeOutputStreamSet("Chosen", std::vector<PabloAST *>{starts, spans, ends});
     }
@@ -1655,24 +1665,31 @@ private:
 //  them: given the first positions of the matches by class (Starts, a stream
 //  for each class: the matches of the texts of lengths[k], followed by a run of
 //  the characters of Runs[runs[k]] if runs[k] >= 0, then by suffixes[k]
-//  characters (if given)), a match applies if it does
-//  not begin within an applied match (after its first position: within its
-//  text, or its run).  At most one match is expected at a position; if there
-//  are several, the one of the earliest class applies.  The 64-bit words of
-//  the matches are scanned in order, with the applied matches found by counting
-//  trailing zeroes, and the end of a run by counting trailing ones; the
-//  positions still covered by the last applied match (a number of positions,
-//  then possibly a run, then its suffix) are carried to the next word (and
+//  characters (if given), then by further runs and their suffixes, more[k], of
+//  possessive walks), a match applies if it does not begin within an applied
+//  match (after its first position: within its text, or its runs).  At most
+//  one match is expected at a position; if there are several, the one of the
+//  earliest class applies.  The 64-bit words of the matches are scanned in
+//  order, with the applied matches found by counting trailing zeroes, and the
+//  end of a run by counting trailing ones; the positions still covered by the
+//  last applied match (a number of positions, then the segments of its runs
+//  and their suffixes, from one of them) are carried to the next word (and
 //  stride).
 class LeftmostMatches final : public MultiBlockKernel {
 public:
+    //  A run (an index of Runs) followed by a number of characters.
+    using Segment = std::pair<int, unsigned>;
     LeftmostMatches(LLVMTypeSystemInterface & ts, const std::vector<unsigned> & lengths, const std::vector<int> & runs,
-                    StreamSet * Starts, StreamSet * Runs, StreamSet * Selected, const std::vector<unsigned> & suffixes = {})
+                    StreamSet * Starts, StreamSet * Runs, StreamSet * Selected, const std::vector<unsigned> & suffixes = {},
+                    const std::vector<std::vector<Segment>> & more = {})
     : MultiBlockKernel(ts, "LeftmostMatches" + [&] {
                            std::string sig;
                            for (size_t k = 0; k < lengths.size(); k++) {
                                sig += "_" + std::to_string(lengths[k]) + (runs[k] >= 0 ? "r" + std::to_string(runs[k]) : "");
                                if (k < suffixes.size() && suffixes[k]) sig += "s" + std::to_string(suffixes[k]);
+                               if (k < more.size()) {
+                                   for (const Segment & m : more[k]) sig += "m" + std::to_string(m.first) + "s" + std::to_string(m.second);
+                               }
                            }
                            //  (A file name of the object cache.)
                            return sig.size() > 64 ? "_" + getStringHash(sig) : sig;
@@ -1683,13 +1700,24 @@ public:
                            return inputs;
                        }(),
                        {Binding{"Selected", Selected}}, {}, {},
-                       {InternalScalar{ts.getInt64Ty(), "covered"}, InternalScalar{ts.getInt64Ty(), "run"},
-                        InternalScalar{ts.getInt64Ty(), "suffix"}}),
-      mLengths(lengths), mRuns(runs), mSuffixes([&] {
-          std::vector<unsigned> v(suffixes);
-          v.resize(lengths.size(), 0);
-          return v;
-      }()), mRunCount(Runs ? Runs->getNumElements() : 0) {
+                       {InternalScalar{ts.getInt64Ty(), "covered"}, InternalScalar{ts.getInt64Ty(), "segment"}}),
+      mLengths(lengths), mRunCount(Runs ? Runs->getNumElements() : 0) {
+        //  The segments of the classes, in a table: the first of each class, and
+        //  the next of each.
+        for (size_t k = 0; k < lengths.size(); k++) {
+            if (runs[k] < 0) {
+                mFirst.push_back(-1);
+                continue;
+            }
+            std::vector<Segment> chain{{runs[k], k < suffixes.size() ? suffixes[k] : 0}};
+            if (k < more.size()) chain.insert(chain.end(), more[k].begin(), more[k].end());
+            mFirst.push_back(static_cast<int>(mSegments.size()));
+            for (size_t i = 0; i < chain.size(); i++) {
+                mSegments.push_back(chain[i]);
+                mNext.push_back(i + 1 < chain.size() ? static_cast<int>(mSegments.size()) : -1);
+            }
+            mChain = std::max(mChain, static_cast<unsigned>(chain.size()));
+        }
         setStride(ts.getBitBlockWidth());
     }
 protected:
@@ -1712,8 +1740,7 @@ protected:
         BasicBlock * const blockDone = b.CreateBasicBlock("blockDone");
         BasicBlock * const done = b.CreateBasicBlock("done");
         Value * const covered0 = b.getScalarField("covered");
-        Value * const run0 = b.CreateSub(b.getScalarField("run"), b.getInt64(1));   // stored + 1 (0: none)
-        Value * const suffix0 = b.getScalarField("suffix");
+        Value * const segment0 = b.CreateSub(b.getScalarField("segment"), b.getInt64(1));   // stored + 1 (0: none)
         b.CreateCondBr(b.CreateICmpEQ(numOfStrides, ZERO), done, blockLoop);
 
         b.SetInsertPoint(blockLoop);
@@ -1721,10 +1748,8 @@ protected:
         blockNo->addIncoming(ZERO, entry);
         PHINode * const blockCovered = b.CreatePHI(i64Ty, 2);
         blockCovered->addIncoming(covered0, entry);
-        PHINode * const blockRun = b.CreatePHI(i64Ty, 2);
-        blockRun->addIncoming(run0, entry);
-        PHINode * const blockSuffix = b.CreatePHI(i64Ty, 2);
-        blockSuffix->addIncoming(suffix0, entry);
+        PHINode * const blockSegment = b.CreatePHI(i64Ty, 2);
+        blockSegment->addIncoming(segment0, entry);
         auto wordPtr = [&](const std::string & name, unsigned i) {
             return b.CreatePointerCast(b.getInputStreamBlockPtr(name, b.getInt32(i), blockNo), PointerType::getUnqual(b.getContext()));
         };
@@ -1740,10 +1765,8 @@ protected:
         wordNo->addIncoming(ZERO, blockLoop);
         PHINode * const covered = b.CreatePHI(i64Ty, 2);
         covered->addIncoming(blockCovered, blockLoop);
-        PHINode * const run = b.CreatePHI(i64Ty, 2);
-        run->addIncoming(blockRun, blockLoop);
-        PHINode * const suffix = b.CreatePHI(i64Ty, 2);
-        suffix->addIncoming(blockSuffix, blockLoop);
+        PHINode * const segment = b.CreatePHI(i64Ty, 2);
+        segment->addIncoming(blockSegment, blockLoop);
         std::vector<Value *> words, runWords;
         Value * any = W0;
         for (Value * ptr : inWords) {
@@ -1751,6 +1774,12 @@ protected:
             any = b.CreateOr(any, words.back());
         }
         for (Value * ptr : runPtrs) runWords.push_back(b.CreateLoad(i64Ty, b.CreateGEP(i64Ty, ptr, wordNo)));
+        //  The value of a table of the segments at a segment g.
+        auto table = [&](Value * g, const std::function<int64_t (size_t)> & value) {
+            Value * v = b.getInt64(-1);
+            for (size_t i = 0; i < mSegments.size(); i++) v = b.CreateSelect(b.CreateICmpEQ(g, b.getInt64(i)), b.getInt64(value(i)), v);
+            return v;
+        };
         //  The word of the run r (zero if none).
         auto runWord = [&](Value * r) {
             Value * w = W0;
@@ -1765,21 +1794,46 @@ protected:
         auto lowMask = [&](Value * n) {     // the positions below n (< 64)
             return b.CreateSub(b.CreateShl(b.getInt64(1), n), b.getInt64(1));
         };
+        //  The positions covered from position on, then by the segments from g:
+        //  their end, if within the word, or what is carried to the next word
+        //  (beyond: a number of positions, then the segments from a segment).
+        struct Advance {
+            Value * end;
+            Value * beyond;
+            Value * covered;
+            Value * segment;
+        };
+        auto advance = [&](Value * position, Value * g) {
+            Value * beyond = b.CreateICmpUGE(position, W64);
+            Value * carriedCovered = b.CreateSelect(beyond, b.CreateSub(position, W64), W0);
+            Value * carriedSegment = b.CreateSelect(beyond, g, NONE);
+            Value * finished = b.CreateOr(beyond, b.CreateICmpEQ(g, NONE));
+            Value * pos = position;
+            for (unsigned i = 0; i < mChain; i++) {
+                Value * const active = b.CreateNot(finished);
+                Value * const r = table(g, [&](size_t j) {return mSegments[j].first;});
+                Value * const sfx = table(g, [&](size_t j) {return mSegments[j].second;});
+                Value * const next = table(g, [&](size_t j) {return mNext[j];});
+                Value * const runEndAt = runEnd(r, b.CreateSelect(active, pos, W0));
+                Value * const runBeyond = b.CreateAnd(active, b.CreateICmpUGE(runEndAt, W64));
+                Value * const after = b.CreateAdd(runEndAt, sfx);
+                Value * const sfxBeyond = b.CreateAnd(b.CreateAnd(active, b.CreateNot(runBeyond)), b.CreateICmpUGE(after, W64));
+                carriedCovered = b.CreateSelect(runBeyond, W0, b.CreateSelect(sfxBeyond, b.CreateSub(after, W64), carriedCovered));
+                carriedSegment = b.CreateSelect(runBeyond, g, b.CreateSelect(sfxBeyond, next, carriedSegment));
+                beyond = b.CreateOr(beyond, b.CreateOr(runBeyond, sfxBeyond));
+                pos = b.CreateSelect(b.CreateAnd(active, b.CreateNot(runBeyond)), after, pos);
+                finished = b.CreateOr(finished, b.CreateOr(b.CreateOr(runBeyond, sfxBeyond), b.CreateICmpEQ(next, NONE)));
+                g = b.CreateSelect(active, next, g);
+            }
+            return Advance{pos, beyond, carriedCovered, carriedSegment};
+        };
         Value * const allCovered = b.CreateICmpUGE(covered, W64);
-        Value * const base = b.CreateSelect(allCovered, W0, covered);
-        Value * const hasRun = b.CreateICmpNE(run, NONE);
-        Value * const runEnd0 = b.CreateSelect(hasRun, runEnd(run, base), base);
-        //  The run continues past the word, or ends there, followed by its suffix.
-        Value * const runBeyond = b.CreateAnd(hasRun, b.CreateICmpUGE(runEnd0, W64));
-        Value * const end0 = b.CreateAdd(runEnd0, b.CreateSelect(hasRun, suffix, W0));
-        Value * const pending = b.CreateOr(allCovered, runBeyond);
-        Value * const toEnd = b.CreateOr(pending, b.CreateICmpUGE(end0, W64));
-        Value * const coverMask = b.CreateSelect(toEnd, b.getInt64(-1), lowMask(b.CreateSelect(toEnd, W0, end0)));
+        const Advance a0 = advance(b.CreateSelect(allCovered, W0, covered), b.CreateSelect(allCovered, NONE, segment));
+        Value * const toEnd = b.CreateOr(allCovered, a0.beyond);
+        Value * const coverMask = b.CreateSelect(toEnd, b.getInt64(-1), lowMask(b.CreateSelect(toEnd, W0, a0.end)));
         Value * const candidates = b.CreateAnd(any, b.CreateNot(coverMask));
-        Value * const carried = b.CreateSelect(allCovered, b.CreateSub(covered, W64),
-                                               b.CreateSelect(b.CreateOr(runBeyond, b.CreateICmpULT(end0, W64)), W0, b.CreateSub(end0, W64)));
-        Value * const carriedRun = b.CreateSelect(pending, run, NONE);
-        Value * const carriedSuffix = b.CreateSelect(pending, suffix, W0);
+        Value * const carried = b.CreateSelect(allCovered, b.CreateSub(covered, W64), b.CreateSelect(a0.beyond, a0.covered, W0));
+        Value * const carriedSegment = b.CreateSelect(allCovered, segment, b.CreateSelect(a0.beyond, a0.segment, NONE));
         BasicBlock * const wordStart = b.GetInsertBlock();
         b.CreateBr(selectLoop);
 
@@ -1791,43 +1845,27 @@ protected:
         selected->addIncoming(W0, wordStart);
         PHINode * const nextCovered = b.CreatePHI(i64Ty, 2);
         nextCovered->addIncoming(carried, wordStart);
-        PHINode * const nextRun = b.CreatePHI(i64Ty, 2);
-        nextRun->addIncoming(carriedRun, wordStart);
-        PHINode * const nextSuffix = b.CreatePHI(i64Ty, 2);
-        nextSuffix->addIncoming(carriedSuffix, wordStart);
+        PHINode * const nextSegment = b.CreatePHI(i64Ty, 2);
+        nextSegment->addIncoming(carriedSegment, wordStart);
         b.CreateCondBr(b.CreateICmpEQ(remaining, W0), wordDone, selectOne);
 
         b.SetInsertPoint(selectOne);
         Value * const pos = b.CreateCountForwardZeroes(remaining);
         Value * length = b.getInt64(mLengths.back());
-        Value * matchRun = b.getInt64(mRuns.back());
-        Value * matchSuffix = b.getInt64(mSuffixes.back());
+        Value * first = b.getInt64(mFirst.back());
         for (int i = static_cast<int>(mLengths.size()) - 2; i >= 0; i--) {
             Value * const bit = b.CreateICmpNE(b.CreateAnd(b.CreateLShr(words[i], pos), b.getInt64(1)), W0);
             length = b.CreateSelect(bit, b.getInt64(mLengths[i]), length);
-            matchRun = b.CreateSelect(bit, b.getInt64(mRuns[i]), matchRun);
-            matchSuffix = b.CreateSelect(bit, b.getInt64(mSuffixes[i]), matchSuffix);
+            first = b.CreateSelect(bit, b.getInt64(mFirst[i]), first);
         }
-        //  The end of the text, then of its run, then of its suffix.
-        Value * const textEnd = b.CreateAdd(pos, length);
-        Value * const textBeyond = b.CreateICmpUGE(textEnd, W64);
-        Value * const withRun = b.CreateICmpNE(matchRun, NONE);
-        Value * const runEndAt = b.CreateSelect(b.CreateAnd(withRun, b.CreateNot(textBeyond)),
-                                                runEnd(matchRun, b.CreateSelect(textBeyond, W0, textEnd)), textEnd);
-        Value * const runBeyondHere = b.CreateAnd(withRun, b.CreateICmpUGE(runEndAt, W64));
-        Value * const end = b.CreateAdd(runEndAt, b.CreateSelect(withRun, matchSuffix, W0));
-        Value * const beyond = b.CreateICmpUGE(end, W64);
-        Value * const keep = b.CreateSelect(beyond, W0, b.CreateShl(b.getInt64(-1), b.CreateSelect(beyond, W0, end)));
-        remaining->addIncoming(b.CreateAnd(remaining, keep), selectOne);
-        selected->addIncoming(b.CreateOr(selected, b.CreateShl(b.getInt64(1), pos)), selectOne);
-        //  Carried: the rest of the text (then the run and suffix), the run (then
-        //  the suffix), or the rest of the suffix.
-        Value * const pendingRun = b.CreateOr(textBeyond, runBeyondHere);
-        Value * const carriedCount = b.CreateSelect(textBeyond, b.CreateSub(textEnd, W64),
-                                                    b.CreateSelect(runBeyondHere, W0, b.CreateSub(end, W64)));
-        nextCovered->addIncoming(b.CreateSelect(beyond, carriedCount, nextCovered), selectOne);
-        nextRun->addIncoming(b.CreateSelect(beyond, b.CreateSelect(pendingRun, matchRun, NONE), nextRun), selectOne);
-        nextSuffix->addIncoming(b.CreateSelect(beyond, b.CreateSelect(pendingRun, matchSuffix, W0), nextSuffix), selectOne);
+        //  The end of the text, then of its segments.
+        const Advance a = advance(b.CreateAdd(pos, length), first);
+        BasicBlock * const selectedAt = b.GetInsertBlock();
+        Value * const keep = b.CreateSelect(a.beyond, W0, b.CreateShl(b.getInt64(-1), b.CreateSelect(a.beyond, W0, a.end)));
+        remaining->addIncoming(b.CreateAnd(remaining, keep), selectedAt);
+        selected->addIncoming(b.CreateOr(selected, b.CreateShl(b.getInt64(1), pos)), selectedAt);
+        nextCovered->addIncoming(b.CreateSelect(a.beyond, a.covered, nextCovered), selectedAt);
+        nextSegment->addIncoming(b.CreateSelect(a.beyond, a.segment, nextSegment), selectedAt);
         b.CreateBr(selectLoop);
 
         b.SetInsertPoint(wordDone);
@@ -1835,37 +1873,33 @@ protected:
         Value * const nextWord = b.CreateAdd(wordNo, ONE);
         wordNo->addIncoming(nextWord, wordDone);
         covered->addIncoming(nextCovered, wordDone);
-        run->addIncoming(nextRun, wordDone);
-        suffix->addIncoming(nextSuffix, wordDone);
+        segment->addIncoming(nextSegment, wordDone);
         b.CreateCondBr(b.CreateICmpULT(nextWord, WORDS_PER_BLOCK), wordLoop, blockDone);
 
         b.SetInsertPoint(blockDone);
         Value * const nextBlock = b.CreateAdd(blockNo, ONE);
         blockNo->addIncoming(nextBlock, blockDone);
         blockCovered->addIncoming(nextCovered, blockDone);
-        blockRun->addIncoming(nextRun, blockDone);
-        blockSuffix->addIncoming(nextSuffix, blockDone);
+        blockSegment->addIncoming(nextSegment, blockDone);
         b.CreateCondBr(b.CreateICmpULT(nextBlock, numOfStrides), blockLoop, done);
 
         b.SetInsertPoint(done);
         PHINode * const finalCovered = b.CreatePHI(i64Ty, 2);
         finalCovered->addIncoming(covered0, entry);
         finalCovered->addIncoming(nextCovered, blockDone);
-        PHINode * const finalRun = b.CreatePHI(i64Ty, 2);
-        finalRun->addIncoming(run0, entry);
-        finalRun->addIncoming(nextRun, blockDone);
-        PHINode * const finalSuffix = b.CreatePHI(i64Ty, 2);
-        finalSuffix->addIncoming(suffix0, entry);
-        finalSuffix->addIncoming(nextSuffix, blockDone);
+        PHINode * const finalSegment = b.CreatePHI(i64Ty, 2);
+        finalSegment->addIncoming(segment0, entry);
+        finalSegment->addIncoming(nextSegment, blockDone);
         b.setScalarField("covered", finalCovered);
-        b.setScalarField("run", b.CreateAdd(finalRun, b.getInt64(1)));
-        b.setScalarField("suffix", finalSuffix);
+        b.setScalarField("segment", b.CreateAdd(finalSegment, b.getInt64(1)));
     }
 private:
     const std::vector<unsigned> mLengths;
-    const std::vector<int> mRuns;
-    const std::vector<unsigned> mSuffixes;
     const unsigned mRunCount;
+    std::vector<int> mFirst;            // the first segment of each class (-1: none)
+    std::vector<Segment> mSegments;
+    std::vector<int> mNext;             // the next segment of each (-1: none)
+    unsigned mChain = 0;                // the most segments of a class
 };
 
 //  The codepoint standing for the characters outside the filter of a filtered
@@ -7315,6 +7349,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
         StreamSet * walkClasses = nullptr;
         std::vector<int> runOf;
         std::vector<UCD::UnicodeSet> runs;
+        std::vector<std::vector<std::pair<int, unsigned>>> moreOf;     // the further runs of each branch (indexes in runs)
     };
     std::vector<CaptureMatches> captureMatches;
     bool capturesMatched = false;
@@ -7323,6 +7358,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     StreamSet * jointSelected = nullptr;
     std::vector<StreamSet *> jointRuns;
     std::vector<unsigned> jointSuffixes;    // (by class, with walkStarts sets)
+    std::vector<std::vector<LeftmostMatches::Segment>> jointMore;     // (their further runs)
     auto matchCaptures = [&]() {
         capturesMatched = true;
         for (const ldml::MultipleCaptureMultipleReplacementSet & set : step.captureReplacements) {
@@ -7377,18 +7413,29 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 WalkConfig walk;
                 std::vector<int> runSets;           // the run of each branch, by its index among the runs
                 std::vector<UCD::UnicodeSet> runs;
+                std::vector<std::vector<std::pair<int, unsigned>>> moreOf;
                 for (const ldml::WalkBranch & wb : set.walkBranches) {
                     WalkConfig::Branch b{{}, {}, wb.length, -1, static_cast<unsigned>(wb.suffix.size())};
                     for (const auto & t : wb.in) b.in.emplace_back(t.first, index(t.second));
                     for (const auto & t : wb.out) b.out.emplace_back(t.first, index(t.second));
                     int r = -1;
+                    auto runIndex = [&](const UCD::UnicodeSet & u) {
+                        const auto f = std::find(runs.begin(), runs.end(), u);
+                        const int i = static_cast<int>(f - runs.begin());
+                        if (f == runs.end()) runs.push_back(u);
+                        return i;
+                    };
+                    std::vector<std::pair<int, unsigned>> more;
                     if (wb.run) {
                         b.run = static_cast<int>(index(wb.runSet));
-                        auto f = std::find(runs.begin(), runs.end(), wb.runSet);
-                        r = static_cast<int>(f - runs.begin());
-                        if (f == runs.end()) runs.push_back(wb.runSet);
+                        r = runIndex(wb.runSet);
+                        for (const auto & m : wb.moreRuns) {
+                            b.more.emplace_back(static_cast<int>(index(m.first)), m.second);
+                            more.emplace_back(runIndex(m.first), m.second);
+                        }
                     }
                     runSets.push_back(r);
+                    moreOf.push_back(more);
                     walk.branches.push_back(b);
                 }
                 if (walkSets.empty()) walkSets.push_back(UCD::UnicodeSet());
@@ -7411,11 +7458,12 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 m.walkClasses = walkClasses;
                 m.runOf = runSets;
                 m.runs = runs;
+                m.moreOf = moreOf;
                 //  (Where the matches of the sets are selected together, there; see below.)
                 if (!step.captureSelection) {
                     StreamSet * const runStreams = runs.empty() ? nullptr : classes(runs, U21);
                     StreamSet * const selected = P.CreateStreamSet(1);
-                    P.CreateKernelCall<LeftmostMatches>(lengths, runSets, branches, runStreams, selected, suffixes);
+                    P.CreateKernelCall<LeftmostMatches>(lengths, runSets, branches, runStreams, selected, suffixes, moreOf);
                     StreamSet * const chosen = P.CreateStreamSet(3);
                     P.CreateKernelCall<WalkSpans>(walk, selected, branches, walkClasses, chosen);
                     auto select = [&](unsigned k) {
@@ -7487,6 +7535,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 std::vector<StreamSet *> startStreams, runStreams;
                 std::vector<unsigned> lengths, suffixes;
                 std::vector<int> runOf;
+                std::vector<std::vector<LeftmostMatches::Segment>> more;
                 for (size_t i = 0; i < captureMatches.size(); i++) {
                     CaptureMatches & m = captureMatches[i];
                     if (m.branches) {
@@ -7509,6 +7558,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                             lengths.push_back(m.walk.branches[b].length);
                             suffixes.push_back(m.walk.branches[b].suffix);
                             runOf.push_back(m.runOf[b] < 0 ? -1 : runIndex[m.runOf[b]]);
+                            more.emplace_back();
+                            for (const auto & x : m.moreOf[b]) more.back().emplace_back(runIndex[x.first], x.second);
                         }
                         continue;
                     }
@@ -7517,6 +7568,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     startStreams.push_back(m.starts);
                     lengths.push_back(1);
                     suffixes.push_back(0);
+                    more.emplace_back();
                     runOf.push_back(static_cast<int>(runStreams.size()));
                     runStreams.push_back(run);
                     runStreamOf[i] = run;
@@ -7529,7 +7581,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     P.CreateKernelCall<CollectStreams>(runStreams, runs);
                 }
                 selected = P.CreateStreamSet(1);
-                P.CreateKernelCall<LeftmostMatches>(lengths, runOf, starts, runs, selected, suffixes);
+                P.CreateKernelCall<LeftmostMatches>(lengths, runOf, starts, runs, selected, suffixes, more);
                 SHOW_STREAM(selected);
             }
             for (size_t i = 0; i < captureMatches.size(); i++) {
@@ -7890,6 +7942,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                 std::vector<StreamSet *> startSets{starts}, runSets;
                 std::vector<std::pair<unsigned, unsigned>> startOrder, runOrder;
                 jointSuffixes.assign(selection.lengths.size(), 0);
+                jointMore.assign(selection.lengths.size(), {});
                 for (unsigned k = 0; k < byLengthOf.size(); k++) startOrder.emplace_back(0, k);
                 const unsigned firstRun = selection.runs ? selection.runs->getNumElements() : 0;
                 if (selection.runs) {
@@ -7918,6 +7971,8 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                             selection.lengths.push_back(m.walk.branches[b].length);
                             jointSuffixes.push_back(m.walk.branches[b].suffix);
                             selection.runOf.push_back(m.runOf[b] < 0 ? -1 : runIndex[m.runOf[b]]);
+                            jointMore.emplace_back();
+                            for (const auto & x : m.moreOf[b]) jointMore.back().emplace_back(runIndex[x.first], x.second);
                         }
                         continue;
                     }
@@ -7928,6 +7983,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     startSets.push_back(m.starts);
                     selection.lengths.push_back(1);
                     jointSuffixes.push_back(0);
+                    jointMore.emplace_back();
                     selection.runOf.push_back(static_cast<int>(runOrder.size()));
                     runOrder.emplace_back(runSets.size(), 0);
                     runSets.push_back(run);
@@ -7941,7 +7997,7 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     selection.runs = allRuns;
                 }
             }
-            P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected, jointSuffixes);
+            P.CreateKernelCall<LeftmostMatches>(selection.lengths, selection.runOf, starts, selection.runs, selected, jointSuffixes, jointMore);
             SHOW_STREAM(selected);
             jointSelected = selected;
         } else if (!step.stringOrder.empty()) {
@@ -8247,8 +8303,29 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
     }
     //  The regions moved after capture j: their characters taken out, in order
     //  (FilterByMask), and put into as many positions inserted after capture j
-    //  (InsertionSpreadMask, MergeByMask).  The marks of the regions moved later,
-    //  and the masks, are kept in step.
+    //  (InsertionSpreadMask, MergeByMask).  The matches of the sets do not
+    //  overlap (they are selected), so the regions of all the sets are moved
+    //  together, as one move (their starts shifted to the starts of the regions):
+    //  moving them one set after another would keep the marks of the later ones
+    //  in step with each move, which compounds the rates of the streams.
+    if (moves.size() > 1) {
+        Move all{nullptr, 0, nullptr, nullptr};
+        for (const Move & mv : moves) {
+            StreamSet * xStart = mv.startI;
+            if (mv.offset != 0) {
+                xStart = P.CreateStreamSet(1);
+                if (mv.offset > 0) {
+                    P.CreateKernelCall<ShiftForward>(mv.startI, xStart, static_cast<unsigned>(mv.offset));
+                } else {
+                    P.CreateKernelCall<ShiftBack>(mv.startI, xStart, static_cast<unsigned>(-mv.offset));
+                }
+            }
+            all.startI = combine(all.startI, xStart, true);
+            all.startJ = combine(all.startJ, mv.startJ, true);
+            all.endJ = combine(all.endJ, mv.endJ, true);
+        }
+        moves = {all};
+    }
     for (size_t m = 0; m < moves.size(); m++) {
         const Move & mv = moves[m];
         StreamSet * xStart = mv.startI;

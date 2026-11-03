@@ -386,16 +386,23 @@ static bool walkElements(re::RE * re, std::vector<WalkElement> & out, CharSetAna
     return false;
 }
 
-//  The branches of a possessive walk (at most 16): one run, after which only
-//  sets.
+//  The branches of a possessive walk (at most 16): after the first run, only
+//  sets and further runs (each run taking the longest run of its set).
 static bool walkBranches(const std::vector<WalkElement> & elements, std::vector<WalkBranch> & out) {
     std::vector<WalkBranch> branches(1);
     for (const WalkElement & e : elements) {
         std::vector<WalkBranch> next;
         for (WalkBranch b : branches) {
             if (b.run) {
-                if (e.kind != WalkElement::Kind::Set) return false;
-                b.suffix.push_back(e.set);
+                if (e.kind == WalkElement::Kind::Run) {
+                    b.moreRuns.emplace_back(e.set, 0);
+                } else if (e.kind != WalkElement::Kind::Set) {
+                    return false;
+                } else if (b.moreRuns.empty()) {
+                    b.suffix.push_back(e.set);
+                } else {
+                    b.moreRuns.back().second++;
+                }
                 next.push_back(b);
             } else if (e.kind == WalkElement::Kind::Set) {
                 //  (Tested too: the engine's starts may be of other matches, as
@@ -492,6 +499,7 @@ static void withinFilter(MultipleCaptureMultipleReplacementSet & set, MultipleCa
         for (auto & t : b.out) t.second = t.second & filter;
         b.runSet = b.runSet & filter;
         for (UCD::UnicodeSet & chars : b.suffix) chars = chars & filter;
+        for (auto & m : b.moreRuns) m.first = m.first & filter;
     }
 }
 

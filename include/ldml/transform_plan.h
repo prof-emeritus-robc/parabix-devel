@@ -187,6 +187,9 @@ struct WalkBranch {
     bool run = false;
     UCD::UnicodeSet runSet;
     std::vector<UCD::UnicodeSet> suffix;
+    //  Further runs after the suffix, each followed by a number of characters
+    //  (of sets, not tested: the walk of a start found by the engine holds).
+    std::vector<std::pair<UCD::UnicodeSet, unsigned>> moreRuns;
 };
 
 struct MultipleCaptureMultipleReplacementSet {

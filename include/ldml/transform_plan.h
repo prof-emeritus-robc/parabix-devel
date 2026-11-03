@@ -90,8 +90,9 @@ struct StringRule {
     bool selfOverlapping = false;
     // A run: the text is followed by the longest run of characters of this set
     // (possibly none), which is deleted (S+ → x ; has the text S and the run S).
-    // The rule then has no after context, and its group is selected
-    // sequentially (TransformStep::sequentialSelection).
+    // An after context then follows the run (after: S* A, for a run of single
+    // characters), and the group is selected sequentially
+    // (TransformStep::sequentialSelection).
     UCD::UnicodeSet run;
     // A run of a set with strings (of two or more characters), [{i̯} i ɪ]+ :
     // run has all the characters of the set, runSingles those of one

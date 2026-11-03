@@ -1920,8 +1920,8 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 problem = "the text to replace is not a fixed-length sequence of characters";
             } else if (boundary) {
                 problem = "the text to replace includes the text boundary";
-            } else if (!run.empty() && source->getAfterContext()) {
-                problem = "the text to replace ends with a repetition followed by an after context";
+            } else if (!run.empty() && source->getAfterContext() && !runStrings.empty()) {
+                problem = "the text to replace ends with a repetition of a set with strings followed by an after context";
             } else if (result->hasCursor() && (!isEmptyText(result->getResultToRevisit()) || result->getCursorOffset() != 0)) {
                 problem = "the result has text to revisit";
             } else if (!identity && !fixedString(result->getText(), replacement)) {
@@ -1938,7 +1938,10 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 group = &plan.steps.back();
             }
             re::RE * const before = source->getBeforeContext();
-            re::RE * const after = source->getAfterContext();
+            re::RE * after = source->getAfterContext();
+            //  (A run followed by an after context: the context holds after the
+            //  longest run, R* A, from the end of the text.)
+            if (after && !run.empty()) after = re::makeSeq({re::makeRep(re::makeCC(run), 0, re::Rep::UNBOUNDED_REP), after});
             group->rules.push_back(c);
             if (items.size() > 1 || !run.empty()) {
                 StringRule s;

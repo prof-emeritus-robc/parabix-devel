@@ -851,39 +851,48 @@ std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned
     CharSetAnalysis sets;
     //  The conversion rules of the group so far.
     std::vector<const ConversionRule *> earlier;
-    //  Whether an earlier rule may match at a position within a run of R
-    //  followed by a text beginning with a character of next (its first item
-    //  then a set meeting R, and the characters after it may be of R or next),
-    //  or, with n = 0, at a character of next.
+    //  Where an earlier rule may match within a run of R followed by a text
+    //  beginning with a character of next (its first item then a set meeting
+    //  R): at a character of the run followed by another (Within), or by the
+    //  text (AtLast: a character after it may be of next); or, with n = 0, at a
+    //  character of next (Within).
+    enum class Match {None, AtLast, Within};
     auto mayMatch = [&](const ConversionRule * e, const UCD::UnicodeSet & R, const UCD::UnicodeSet & next, bool atNext) {
         const RuleSide * const s = e->getSourceSide(Direction::Forward);
         RE * const text = s->getText() ? withoutCaptures(s->getText()) : nullptr;
         UCD::UnicodeSet first;
         bool nullable = false;
-        if (text == nullptr || !textFirsts(text, sets, first, nullable) || nullable) return true;
-        if (atNext && first.intersects(next)) return true;
-        if (!first.intersects(R)) return false;
+        if (text == nullptr || !textFirsts(text, sets, first, nullable) || nullable) return Match::Within;
+        if (atNext && first.intersects(next)) return Match::Within;
+        if (!first.intersects(R)) return Match::None;
         std::vector<RE *> items;
         if (const Seq * seq = dyn_cast<Seq>(text)) items.assign(seq->begin(), seq->end()); else items.push_back(text);
-        if (!CharSetAnalysis::isSet(items.front())) return true;
+        if (!CharSetAnalysis::isSet(items.front())) return Match::Within;
         items.erase(items.begin());
         if (s->hasAfterContext()) items.push_back(s->getAfterContext());
         UCD::UnicodeSet second;
         nullable = false;
-        if (!textFirsts(makeSeq(items.begin(), items.end()), sets, second, nullable) || nullable) return true;
-        return second.intersects(R + next);
+        if (!textFirsts(makeSeq(items.begin(), items.end()), sets, second, nullable) || nullable) return Match::Within;
+        if (second.intersects(R)) return Match::Within;
+        return second.intersects(next) ? Match::AtLast : Match::None;
     };
+    //  The position in out of each earlier rule (as written there).
+    std::map<const ConversionRule *, size_t> outAt;
     for (size_t i = 0; i < rules.size(); i++) {
         Rule * const r = rules[i];
         ConversionRule * const c = dyn_cast<ConversionRule>(r);
         if (c == nullptr) {
-            if (!isa<VariableDefinitionRule>(r)) earlier.clear();
+            if (!isa<VariableDefinitionRule>(r)) {
+                earlier.clear();
+                outAt.clear();
+            }
             out.push_back(r);
             continue;
         }
         LeadingRun run;
         if (!leadingRun(c, expander, sets, run)) {
             earlier.push_back(c);
+            outAt[c] = out.size();
             out.push_back(r);
             continue;
         }
@@ -900,13 +909,31 @@ std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned
         }
         UCD::UnicodeSet next;
         for (const auto & b : block) next = next + b.second.restFirst;
+        //  An earlier rule that may match at the last character of the run
+        //  (before Ti), and not within it, does not where the run has at least
+        //  two characters, ICU's rule then applying at its first: the rules
+        //  R{k} Ti → Ci (k = max(n, 2)), placed before the first such earlier
+        //  rule (which they then precede where the run has exactly k), take
+        //  the last k characters of the run (and the deletion the others).
         bool blocked = false;
-        for (const ConversionRule * e : earlier) blocked |= mayMatch(e, run.chars, next, run.n == 0);
+        size_t moveTo = SIZE_MAX;
+        for (const ConversionRule * e : earlier) {
+            const Match m = mayMatch(e, run.chars, next, run.n == 0);
+            if (m == Match::Within) blocked = true;
+            if (m == Match::AtLast && run.n > 0) {
+                //  (Not before a rule split here.)
+                const size_t at = outAt.count(e) ? outAt.at(e) : SIZE_MAX;
+                if (at == SIZE_MAX) blocked = true; else moveTo = std::min(moveTo, at);
+            }
+            if (m == Match::AtLast && run.n == 0) blocked = true;
+        }
         if (blocked) {
             earlier.push_back(c);
+            outAt[c] = out.size();
             out.push_back(r);
             continue;
         }
+        const int k = moveTo == SIZE_MAX ? run.n : std::max(run.n, 2);
         //  R } R{n,} (T1 | T2 | ...) → ; then R{n} Ti → Ci in order.
         std::vector<RE *> alternatives;
         for (const auto & b : block) {
@@ -915,25 +942,160 @@ std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned
             if (s->hasAfterContext()) items.push_back(s->getAfterContext());
             alternatives.push_back(makeSeq(items.begin(), items.end()));
         }
-        RE * const after = makeSeq({makeRep(run.R, run.n, Rep::UNBOUNDED_REP), makeAlt(alternatives.begin(), alternatives.end())});
+        RE * const after = makeSeq({makeRep(run.R, k, Rep::UNBOUNDED_REP), makeAlt(alternatives.begin(), alternatives.end())});
         out.push_back(makeConversionRule(makeRuleSide(nullptr, run.R, after), Direction::Forward, makeRuleSide(makeSeq())));
-        size_t k = 0;
+        std::vector<Rule *> fixed;
+        size_t b = 0;
         for (size_t x = i; x < j; x++) {
-            if (k < block.size() && block[k].first == x) {
+            if (b < block.size() && block[b].first == x) {
                 ConversionRule * const d = cast<ConversionRule>(rules[x]);
                 const RuleSide * const s = d->getSourceSide(Direction::Forward);
-                std::vector<RE *> last(static_cast<size_t>(run.n), run.R);
-                last.push_back(block[k].second.rest);
-                out.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq(last.begin(), last.end()), s->getAfterContext()),
-                                                 Direction::Forward, d->getResultSide(Direction::Forward)));
+                std::vector<RE *> last(static_cast<size_t>(k), run.R);
+                last.push_back(block[b].second.rest);
+                fixed.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq(last.begin(), last.end()), s->getAfterContext()),
+                                                   Direction::Forward, d->getResultSide(Direction::Forward)));
+                //  (With the rules moved, those of the shorter runs, R{j} Ti → Ci for
+                //  n <= j < k, stay in place, after the earlier rule.)
+                for (int len = run.n; moveTo != SIZE_MAX && len < k; len++) {
+                    std::vector<RE *> shorter(static_cast<size_t>(len), run.R);
+                    shorter.push_back(block[b].second.rest);
+                    out.push_back(makeConversionRule(makeRuleSide(nullptr, makeSeq(shorter.begin(), shorter.end()), s->getAfterContext()),
+                                                     Direction::Forward, d->getResultSide(Direction::Forward)));
+                }
                 earlier.push_back(d);
-                k++;
+                b++;
+            } else if (moveTo == SIZE_MAX) {
+                out.insert(out.end(), fixed.begin(), fixed.end());
+                fixed.clear();
+                out.push_back(rules[x]);
             } else {
                 out.push_back(rules[x]);
             }
         }
+        if (moveTo == SIZE_MAX) {
+            out.insert(out.end(), fixed.begin(), fixed.end());
+        } else {
+            out.insert(out.begin() + moveTo, fixed.begin(), fixed.end());
+            for (auto & at : outAt) if (at.second >= moveTo) at.second += fixed.size();
+        }
+        for (size_t x = i; x < j; x++) {
+            if (const ConversionRule * d = dyn_cast<ConversionRule>(rules[x])) outAt[d] = SIZE_MAX;
+        }
         if (split) *split += block.size();
         i = j - 1;
+    }
+    return out;
+}
+
+//  The marker of a rule split by SplitMiddleRuns (counting down from U+FDEF,
+//  as the markers of the revisits count up from U+FDE0).
+static constexpr UCD::codepoint_t MiddleRunMarkLast = 0xFDEF;
+
+std::vector<Rule *> SplitMiddleRuns(const std::vector<Rule *> & rules, unsigned * split) {
+    //  (Not with a global filter, which the markers would have to pass.)
+    for (const Rule * r : rules) {
+        if (isa<FilterRule>(r)) return rules;
+    }
+    Expander expander;
+    CharSetAnalysis sets;
+    std::vector<Rule *> out;
+    unsigned markers = 0;
+    size_t start = 0;
+    while (start < rules.size()) {
+        //  A group: the conversion rules and variable definitions up to the next
+        //  other rule.
+        size_t end = start;
+        while (end < rules.size() && (isa<ConversionRule>(rules[end]) || isa<VariableDefinitionRule>(rules[end]))) end++;
+        if (end == start) {
+            out.push_back(rules[start++]);
+            continue;
+        }
+        bool contexts = false;
+        for (size_t i = start; i < end; i++) {
+            if (const ConversionRule * c = dyn_cast<ConversionRule>(rules[i])) contexts |= c->getSourceSide(Direction::Forward)->hasBeforeContext();
+        }
+        std::vector<Rule *> first, body, after;
+        for (size_t i = start; i < end; i++) {
+            ConversionRule * const c = dyn_cast<ConversionRule>(rules[i]);
+            std::vector<Rule *> replaced;
+            [&] {
+                if (c == nullptr || contexts || markers > 15) return;
+                const RuleSide * const source = c->getSourceSide(Direction::Forward);
+                const RuleSide * const result = c->getResultSide(Direction::Forward);
+                if (result->hasCursor()) return;
+                RE * const text = source->getText();
+                const Seq * const seq = text ? dyn_cast<Seq>(text) : nullptr;
+                if (seq == nullptr) return;
+                std::vector<RE *> items(seq->begin(), seq->end());
+                size_t at = 0;
+                while (at < items.size() && !isa<Rep>(items[at])) at++;
+                if (at == 0 || at + 1 >= items.size()) return;
+                const Rep * const rep = cast<Rep>(items[at]);
+                if (rep->getLB() < 1 || rep->getUB() != Rep::UNBOUNDED_REP || !CharSetAnalysis::isSet(rep->getRE())) return;
+                UCD::UnicodeSet chars;
+                std::set<std::u32string> strings;
+                if (!expander.alternatives(rep->getRE(), chars, strings) || !strings.empty()) return;
+                RE * const X = makeSeq(items.begin(), items.begin() + at);
+                RE * const T = makeSeq(items.begin() + at + 1, items.end());
+                if (!expander.isFixed(X) || !expander.isFixed(T) || referencesCaptures(X)) return;
+                //  (The result may refer to the captures of T only.)
+                for (size_t j = 0; j < at; j++) {
+                    if (isa<Capture>(items[j])) return;
+                }
+                UCD::UnicodeSet tFirst, xLast;
+                bool nullable = false;
+                if (!textFirsts(T, sets, tFirst, nullable) || nullable || tFirst.intersects(chars)) return;
+                RE * const R = rep->getRE();
+                RE * const mark = makeCC(MiddleRunMarkLast - markers);
+                std::vector<RE *> ahead{makeRep(R, rep->getLB(), Rep::UNBOUNDED_REP), withoutCaptures(T)};
+                if (source->hasAfterContext()) ahead.push_back(source->getAfterContext());
+                //  X } R{lb,} T → M, in place.
+                replaced.push_back(makeConversionRule(makeRuleSide(nullptr, X, makeSeq(ahead.begin(), ahead.end())),
+                                                      Direction::Forward, makeRuleSide(mark)));
+                //  M { R → ; and M { T → C, first in the group (M is followed by the
+                //  run and T).  A T of one captured set, with a result of literals
+                //  and the capture, as rules of single characters (whose before
+                //  contexts are matched against the converted text).
+                first.push_back(makeConversionRule(makeRuleSide(mark, R, nullptr), Direction::Forward, makeRuleSide(makeSeq())));
+                const Capture * const capture = (at + 2 == items.size()) ? dyn_cast<Capture>(items[at + 1]) : nullptr;
+                UCD::UnicodeSet tChars;
+                std::set<std::u32string> tStrings;
+                if (capture && CharSetAnalysis::isSet(capture->getCapturedRE())
+                        && expander.alternatives(capture->getCapturedRE(), tChars, tStrings) && tStrings.empty() && tChars.count() <= 128) {
+                    for (const auto & range : tChars) {
+                        for (UCD::codepoint_t ch = lo_codepoint(range); ch <= hi_codepoint(range); ch++) {
+                            RE * const out = replaceReferences(result->getText(), {{capture, ch}});
+                            first.push_back(makeConversionRule(makeRuleSide(mark, makeCC(ch), source->getAfterContext()),
+                                                               Direction::Forward, makeRuleSide(out)));
+                        }
+                    }
+                } else {
+                    first.push_back(makeConversionRule(makeRuleSide(mark, T, source->getAfterContext()),
+                                                       Direction::Forward, c->getResultSide(Direction::Forward)));
+                }
+                //  M → ; in a group after.
+                after.push_back(makeConversionRule(makeRuleSide(mark), Direction::Forward, makeRuleSide(makeSeq())));
+                markers++;
+            }();
+            if (replaced.empty()) {
+                body.push_back(rules[i]);
+            } else {
+                if (split) (*split)++;
+                body.insert(body.end(), replaced.begin(), replaced.end());
+            }
+        }
+        //  (Variable definitions before the rules that may refer to them.)
+        size_t defs = 0;
+        while (defs < body.size() && isa<VariableDefinitionRule>(body[defs])) defs++;
+        out.insert(out.end(), body.begin(), body.begin() + defs);
+        out.insert(out.end(), first.begin(), first.end());
+        out.insert(out.end(), body.begin() + defs, body.end());
+        if (!after.empty()) {
+            out.push_back(makeTransformRule(TransformID("Null")));
+            out.insert(out.end(), after.begin(), after.end());
+            out.push_back(makeTransformRule(TransformID("Null")));
+        }
+        start = end;
     }
     return out;
 }

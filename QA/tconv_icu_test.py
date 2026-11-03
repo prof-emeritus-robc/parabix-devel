@@ -4,7 +4,7 @@
 #
 #  tconv --use-ICU (see tools/ldml/icu_transform.h): a transform tconv does
 #  not implement (the built-in Any-Name, a rules file with a run within its
-#  text) is applied by ICU by default, and with --use-ICU=0 is an
+#  text, in a group with a before context) is applied by ICU by default, and with --use-ICU=0 is an
 #  error (exit status 2); a transform tconv implements (Any-Upper) is applied
 #  by ICU where --use-ICU matches its name, with the same result.  A stage
 #  ICU applies within a global filter (Any-BreakInternal) sees the text around
@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 
-RULES = "a b+ c → X ;\nb → Y ;\n"
+RULES = "a b+ c → X ;\nq { b → Z ;\nb → Y ;\n"
 BREAKS = ":: [\u0e01-\u0e5b] ;\n:: Any-BreakInternal ;\n\u0e1e → p ;\n"
 
 # (arguments, input, expected output, or None for exit status 2)

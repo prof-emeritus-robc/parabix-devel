@@ -793,6 +793,19 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  split counts the rules split.
 std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned * split = nullptr);
 
+//  A forward conversion rule whose text has a run of a set R after a fixed
+//  text X, X R+ T → C (T fixed, the result referring to captures of T only,
+//  no cursor), in a group without before contexts and without a global
+//  filter, with a marker M (a noncharacter, from U+FDEF down): X } R+ T → M
+//  in its place, M { R } R* T → ; and M { T → C first in its group (they apply
+//  only after M, the run then deleted), and M → ; in a group after it.  ICU
+//  applies the rule at X, where the rules before it in its group are tried
+//  first, as they are at X; the characters of the run and T, which ICU does
+//  not reach, are converted after M, as nothing before them in the converted
+//  text but M and the run deleted, and no before context sees M.
+//  (Zawgyi-my's ေ ့+ ($consonant) → $1 ေ့.)  split counts the rules split.
+std::vector<Rule *> SplitMiddleRuns(const std::vector<Rule *> & rules, unsigned * split = nullptr);
+
 //  The anchors of the texts of forward conversion rules (as ICU matches them,
 //  in the text being transliterated), moved to their contexts: ^ at the start
 //  of a text without a before context becomes its before context, and $ at the

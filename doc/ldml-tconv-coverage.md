@@ -136,7 +136,16 @@ repetitions of sets with strings (`86cf1f797`, W10: guarded strings,
 cases pass, identical to ICU, as are 5,000 random lines; W10 is needed by none,
 and W3 by 3. Two engine bugs of search and replace found on the way are fixed:
 a NUL after each text (a position after the text kept), and the end of an
-empty text unmarked.*
+empty text unmarked. Then Zawgyi-my (`3d94638d0`, `5032fb2ca`, `b374fdbca`,
+`f4ca44892`, `--update --only Zawgyi-my`): rules whose texts begin with a run
+split (each character of the run deleted where the rest follows, a block of
+rules beginning with the same run sharing one deletion), run rules with after
+contexts, capture rules selected by walks of several runs, the regions of
+several sets moved together, and a run within a text split with a marker:
+Zawgyi-my is implementable (422), its 93 CLDR test cases pass, and it is
+identical to ICU on 20,000 random lines of its range; W3 is needed by 2
+(Grek-Latn, Latn-Grek, with W6) and alone blocks none. Replanning all 453
+transforms changes only Zawgyi-my.*
 
 This report covers:
 
@@ -157,8 +166,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 421 (99%) |
-| …of which public (not `visibility="internal"`) | 393 | 389 (99%) |
+| Transforms defined by CLDR files (380 files) | 425 | 422 (99%) |
+| …of which public (not `visibility="internal"`) | 393 | 390 (99%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -251,9 +260,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     cases.
   - Cold start, including JIT compilation, of Deva-Latn went from 66 s to 4.5 s.
 - **Remaining work.** By the number of transforms each item alone unblocks:
-  - W3 variable-length texts: 1 transform (Zawgyi-my; Latin-ThaiLogical and
-    Latn-Thai are implementable with mark run edits left in their group, and
-    cy-cy_FONIPA with capture rules over sets with strings, §5);
+  - W3 variable-length texts: none alone (Latin-ThaiLogical and Latn-Thai are
+    implementable with mark run edits left in their group, cy-cy_FONIPA with
+    capture rules over sets with strings, and Zawgyi-my with runs split, §5);
   - W6 revisits neither composed nor prefix runs: none alone (it-am, it-ja,
     ja_Latn-ko and ja_Latn-ru are implementable, §5);
   - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
@@ -266,8 +275,7 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          421  ████████████████████████████████████████
-+ W3 variable-length text    422  ████████████████████████████████████████
+now                          422  ████████████████████████████████████████
 + W6 revisit                 424  ████████████████████████████████████████
 + W5 captures/functions      425  ████████████████████████████████████████
 ```
@@ -482,7 +490,11 @@ Implementable now:
   contexts of capture rules translated to the text itself: Grek-Latn/UNGEGN;
 - with lookahead chains over possessive repetitions of sets with strings, and
   capture rules whose starts the engine finds with possessive captures:
-  cy-cy_FONIPA.
+  cy-cy_FONIPA;
+- with leading runs split (also in blocks, and before a rule matching at their
+  last character), run rules with after contexts, capture rules selected by
+  walks of several runs, regions of several sets moved together, and runs
+  within texts split with a marker: Zawgyi-my.
 
 The per-transform status is in the table.
 
@@ -1089,7 +1101,7 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 3 | 1 | M–L (the rest) |
+| W3 variable-length texts | 2 | 0 | M–L (the rest) |
 | W6 text to revisit, not composed | 3 | 0 | L (with W3) |
 | W5 back-references | 1 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
@@ -1498,7 +1510,7 @@ W3 alone now blocks 7 transforms:
   change), and Latn-Bopo through Latin-NumericPinyin;
 - byn Xaleget and my-Zawgyi (rules whose starts cannot be told apart);
 - Zawgyi-my (runs followed by after contexts, the text boundary in the text,
-  and starts that cannot be told apart).
+  and starts that cannot be told apart), now implementable (below).
 
 The W3 rules that remain mostly also have other problems:
 
@@ -1507,7 +1519,36 @@ The W3 rules that remain mostly also have other problems:
 - runs of sets with strings (`[{i̯}ij]+`);
 - text boundaries in the text (`\. ([$])`);
 - MultipleCaptureMultipleReplacement rules whose starts cannot be told apart
-  and whose walks have more than one run (Zawgyi-my).
+  and whose walks have more than one run (Zawgyi-my, now selected by such walks).
+
+**Zawgyi-my** (`3d94638d0`, `5032fb2ca`, `b374fdbca`, `f4ca44892`) is
+implementable with five mechanisms:
+
+- *Leading runs split* (ldml::SplitLeadingRuns): R{n,} T → C becomes
+  R } R{n,} T → ; (each character of the run but the last n deleted where T
+  follows) and R{n} T → C in its place, as ICU applies the rule at the first
+  character of the run it reaches (`ြ* ႊ → ွှ`). A block of rules beginning
+  with the same run (the five `ေ+` rules) shares one deletion,
+  R } R{n,} (T1 | T2 | ...) → ; then R{n} Ti → Ci in order. No earlier rule
+  of the group may match within such a run; one that may match at its last
+  character only (`($wspace) ့` before `($wspace+) (mark) → $2`) is preceded
+  by the rules R{k} Ti → Ci (k = max(n, 2)), which take the last k characters
+  of the run, those of the shorter runs staying in place.
+- *Run rules with after contexts*: a text followed by the longest run of a
+  set, deleted, with an after context that holds after the run (S* A): the
+  U+200B runs at the start and the end of a text.
+- *Walks of several runs*: a possessive walk may have further runs after its
+  first, each followed by sets; LeftmostMatches covers a selected match
+  through the segments of its runs, and WalkSpans spans it
+  (`($umedial*) (ေ+) ($umedial*) → $1 $3 $2`, five variants).
+- *Regions moved together*: the regions moved after their captures by several
+  sets of a group are moved as one (the matches selected do not overlap);
+  moved one set after another, the marks kept in step compounded the stream
+  rates until the pipeline's buffers exhausted the virtual address space.
+- *Runs within texts split with a marker* (ldml::SplitMiddleRuns):
+  X R+ T → C becomes X } R+ T → M (a noncharacter) in its place, M { R → ;
+  and M { T → C first in the group, and M → ; in a group after it, in a group
+  without before contexts or a global filter (`ေ ့+ ($consonant) → $1 ေ့`).
 
 **Matches that may end within another** (`MultipleCaptureMultipleReplacementSet::
 walkStarts`): their starts come from the regular expression engine (MatchStarts),
@@ -1748,10 +1789,7 @@ The per-transform table lists the problem classes of every transform.
      order of ICU (§3.3) to ICU.
    - Replace the rounds of the converted-text correction by a Pablo `While`
      fixpoint (issue #21), exact for chains of any length.
-2. **W3 and W6.** Zawgyi-my, which W3 alone blocks (runs of `ေ` reordered
-   across a capture, runs of spaces followed by after contexts, and
-   MultipleCaptureMultipleReplacement rules whose walks have several runs).
-   Before contexts that the conversions change in
+2. **W3 and W6.** Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
    neither composed nor prefix runs (3 transforms, none blocked by W6 alone:
@@ -1857,6 +1895,7 @@ tconv on every implementable transform.
 | `2bc2e73a1` | mark run edits left in their group with a lookahead and a mark: Latin-ThaiLogical, Latn-Thai: 419 |
 | `8f13868d4` | insertion rules folded into the rules before them; before contexts of capture rules translated from the converted text; converted contexts by capture rules: Grek-Latn/UNGEGN: 420 |
 | `86cf1f797`, `06ce8fcce` | lookahead chains over possessive repetitions of sets with strings (guarded strings, W10); capture rules over such sets, with before contexts unchanged by their insertions; search and replace keeping no position after the text: cy-cy_FONIPA: 421 |
+| `3d94638d0`, `5032fb2ca`, `b374fdbca`, `f4ca44892` | leading runs split (in blocks, before a rule matching at their last character); run rules with after contexts; walks of several runs; regions of several sets moved together; runs within texts split with a marker: Zawgyi-my: 422 |
 
 ## Reproducing
 

@@ -5,7 +5,9 @@
 #  tconv: run rules (a text followed by the longest run of a set, deleted)
 #  with an after context, which holds after the run (S* A from the end of the
 #  text): ^ { a+ } [^bd], a+ $, and Zawgyi-my's last group (the U+200B runs at
-#  the start and end of a text, among the runs of spaces).  The expected
+#  the start and end of a text, among the runs of spaces); and texts after ^
+#  (whose lookbehind, compiled alone, is an RE kernel of no other input, given
+#  the code units).  The expected
 #  results are ICU's (createFromRules, each line a text).
 #
 #  tconv_run_contexts_test.py <tconv binary>
@@ -57,6 +59,10 @@ GROUPS = [
      [("\u200b\u200bab", "ab"), ("\u200ba", "a"), ("a\u200b\u200b", "a"), ("\u200b \u200ba", " \u200ba"),
       ("a \u200b b", "a \u200b b"), ("\u200b\u102d", "\u102d"), ("  \u102d", "\u102d"), ("\u200b", ""),
       ("\u200b\u200b", ""), (" \u200b ", " \u200b "), ("a\u200b", "a"), ("\u102d\u102d\u102d ", "\u102d ")]),
+    ("^ { ab } b* d \u2192 Q ;\n"
+     "^ { a+ } x \u2192 Z ;\n"
+     "a \u2192 q ;\n",
+     [("abd", "Qd"), ("abbbd", "Qbbd"), ("ab", "qb"), ("abbc", "qbbc"), ("xabd", "xqbd"), ("aax", "Zx"), ("ax", "Zx"), ("x", "x"), ("", ""), ("abx", "qbx"), ("aabd", "qqbd")]),
 ]
 
 

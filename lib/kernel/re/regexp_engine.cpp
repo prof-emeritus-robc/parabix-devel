@@ -143,6 +143,23 @@ RE * multiplexedCodeUnits(RE * re, const cc::MultiplexedAlphabet * mpx, const Ex
 }
 }
 
+// Whether an RE kernel would have no input streams (an RE of anchors alone,
+// such as (?<=^), without match regions): the code units are then an input
+// (unused), which gives the kernel the length of the text.
+bool RE_Kernel::needsTextInput(RE_CompilerContext & ctxt, RE * re) {
+    if (ctxt.mMatchStarts || ctxt.mIndexStream || ctxt.mCombiningType != RE_CombiningType::None) return false;
+    std::set<std::string> localExternals;
+    std::set<std::string> localAlphabets;
+    gatherExternals(re, localExternals, localAlphabets);
+    for (auto & a : ctxt.mAlphabets) {
+        if (localAlphabets.count(a.first->getName()) == 1) return false;
+    }
+    for (const auto & e : ctxt.mExternals) {
+        if (localExternals.count(e.first) == 1) return false;
+    }
+    return true;
+}
+
 RE_Kernel::RE_Kernel(LLVMTypeSystemInterface & ts, RE_CompilerContext & ctxt, RE * re, StreamSet * results)
 : RE_Kernel(ts, ctxt, Multiplexed{multiplexedCodeUnits(re, ctxt.mMultiplexed, ctxt.mExternals)}, results) {}
 
@@ -202,6 +219,9 @@ std::string RE_Kernel::makeSignature(RE_CompilerContext & ctxt, RE * re) {
             externalList.push_back(name);
         }
     }
+    if (needsTextInput(ctxt, re)) {
+        sigstrm << "+T";
+    }
     if (ctxt.mCombiningType == RE_CombiningType::Exclude) {
         sigstrm << "&~";
     } else if (ctxt.mCombiningType == RE_CombiningType::Include) {
@@ -259,6 +279,9 @@ Bindings RE_Kernel::makeInputBindings(RE_CompilerContext & ctxt, RE * re) {
     }
     if (ctxt.mCombiningType != RE_CombiningType::None) {
         externalBindings.emplace_back("toCombine", ctxt.mCombiningStream, FixedRate(), Add1());
+    }
+    if (needsTextInput(ctxt, re)) {
+        externalBindings.emplace_back("text", ctxt.mCodeUnitStream);
     }
     return externalBindings;
 }

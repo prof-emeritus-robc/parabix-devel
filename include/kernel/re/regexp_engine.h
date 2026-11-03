@@ -235,6 +235,7 @@ public:
     std::string makeSignature(RE_CompilerContext & ctxt, re::RE * r);
     kernel::Bindings makeInputBindings(RE_CompilerContext & ctxt, re::RE * r);
     kernel::Bindings makeOutputBindings(RE_CompilerContext & ctxt, re::RE * r, kernel::StreamSet * results);
+    static bool needsTextInput(RE_CompilerContext & ctxt, re::RE * r);
 
 private:
     // The RE as compiled: with a multiplexed context, its CCs translated to codes.

@@ -780,6 +780,19 @@ struct FiniteTextStats {
 };
 std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats = nullptr);
 
+//  A forward conversion rule whose text begins with a run of at least n
+//  characters of a set R, R{n,} T → C (written R ... R R* T or R ... R R+ T),
+//  T a text of fixed length (with the captures the result may refer to),
+//  without a before context or a cursor, as two rules in its place:
+//  R } R{n,} T → ; deleting each character of the run but the last n where T
+//  follows, then R{n} T → C, each with the rule's after context.  ICU applies
+//  the rule at the first character of the run it reaches, which no rule
+//  before it in its group may then begin with (nor, with n = 0, with a first
+//  character of T, where the rule would have applied first); T may not begin
+//  with a character of R.  (Zawgyi-my's ြ* ႊ → ွှ, ($wspace)+ (X) → $2.)
+//  split counts the rules split.
+std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned * split = nullptr);
+
 //  The anchors of the texts of forward conversion rules (as ICU matches them,
 //  in the text being transliterated), moved to their contexts: ^ at the start
 //  of a text without a before context becomes its before context, and $ at the

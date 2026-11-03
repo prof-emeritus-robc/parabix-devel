@@ -642,6 +642,11 @@ add_test(
   COMMAND python3 tconv_capture_strings_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_leading_runs_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_leading_runs_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_run_strings_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_run_strings_test.py ${BIN_DIR}/tconv)

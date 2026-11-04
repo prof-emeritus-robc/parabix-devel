@@ -403,6 +403,26 @@ static cl::opt<bool> PretokClassCode(
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
+// --pretok-byte-domain (with --pretok-class-code): find the GPT-2 pretoken starts on the bytes
+// themselves (each class at its codepoint's first and last byte, moved by fixed lookaheads
+// chosen by the UTF-8 lead byte), with no compression to one slot per codepoint and no
+// spreading back: drops FilterByMask, SpreadByMask and UTF8_index.
+static cl::opt<bool> PretokByteDomain(
+    "pretok-byte-domain",
+    cl::desc("With --pretok-class-code: compute the pretoken boundaries in the byte domain, "
+             "without compressing the classes to codepoints."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
+// --pretok-utf8-classes (with --pretok-byte-domain): compile the 4 class-code sets on the UTF-8
+// bytes (marked at each sequence's last byte) instead of decoding codepoints first.
+static cl::opt<bool> PretokUTF8Classes(
+    "pretok-utf8-classes",
+    cl::desc("With --pretok-byte-domain: compute the classes from the UTF-8 bytes, without "
+             "decoding codepoints."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+
 static cl::opt<unsigned> BenchLoop(
     "bench-loop",
     cl::desc("BPE mode: tokenize the input N times inside one process (excludes OS "
@@ -527,7 +547,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
                                  : normalizedBasis;
     } else if (compressClasses) {
         bpeBasis    = normalizedBasis;
-        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode);
+        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode, PretokByteDomain, PretokUTF8Classes);
     } else if (PreTokenizer == bytelevel) {
         // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to
         // mark pretoken STARTS. Feed BPE the RAW bytes (BPERangeSeed does bytes_to_unicode
@@ -626,7 +646,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
                 bpeBytes = P.CreateStreamSet(1, 8);
                 P.CreateKernelCall<P2SKernel>(bpeBasis, bpeBytes);
             }
-            buildBPEByteTailEmitter(P, bpeBytes, tr.segStarts);
+            buildBPEByteTailEmitter(P, bpeBytes, tr.segStarts, bpeBasis);
         } else {
             buildBPETailEmitter(P, vocabID, matchEnd, tr.segStarts);
         }

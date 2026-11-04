@@ -1091,6 +1091,52 @@ using MarkRunGroups = std::vector<std::pair<size_t, std::vector<Rule *>>>;
 MarkRunGroups SetAsideMarkRunGroups(std::vector<Rule *> & rules);
 void RestoreMarkRunGroups(std::vector<Rule *> & rules, const MarkRunGroups & groups);
 
+//  Front-letter revisits (Greek-Latin's rough breathing): consecutive rules of
+//  a group of the forms, in order,
+//      V O? R } A* L → X | v $1 ;      (V among some uppercase vowels)
+//      V (G O?) R → X | v $1 ;
+//      (Wl+ D?) R → x | $1 ;
+//      (W+ D?) R → X | $1 ;
+//  which delete a mark R after a run of vowels (W, Wl the lowercase ones, O
+//  within the ends D) and write a letter (X or x) before the run, revisiting
+//  the run (with V lowercased to v): ICU applies them again at the same
+//  position while they match, each pass taking the next R, so that all the
+//  letters precede the run.  The rules before the family in the group may
+//  include rules marking a vowel by a mark M (one of D) before a mark I,
+//      F } S* I → | F M ;
+//  (no other rule before them may begin with a vowel), and the group may
+//  revisit single characters as vowels, c → | d ;  The family is set aside
+//  (before ComposeRevisits, which would compose the rules around it), each
+//  with the number of transform rules before its group, and applied before
+//  the rest of the group (see TransformStep::frontLetters): where ICU's passes
+//  start, which roughs they take and the letters they write, all at once,
+//  for the rest of the group to apply to the text without the marks taken,
+//  with letters written before the runs.
+struct FrontLetterVowel {
+    char32_t upper = 0;                     // V
+    char32_t lower = 0;                     // v
+    UCD::UnicodeSet optional;               // O (empty if none)
+};
+struct FrontLetterRevisits {
+    char32_t mark = 0;                      // R
+    UCD::UnicodeSet vowels;                 // W
+    UCD::UnicodeSet lowerVowels;            // Wl
+    UCD::UnicodeSet ends;                   // D
+    char32_t lowerLetter = 0;               // x
+    char32_t upperLetter = 0;               // X
+    std::vector<FrontLetterVowel> upper;    // the V of the first rules
+    UCD::UnicodeSet accents;                // A
+    UCD::UnicodeSet lowers;                 // L
+    UCD::UnicodeSet letters;                // G
+    UCD::UnicodeSet iotaFirsts;             // F (empty if none)
+    UCD::UnicodeSet iotaSkip;               // S
+    char32_t iota = 0;                      // I
+    char32_t iotaMark = 0;                  // M
+    std::vector<std::pair<char32_t, char32_t>> revisits;   // c → | d
+};
+using FrontLetterFamilies = std::vector<std::pair<size_t, FrontLetterRevisits>>;
+FrontLetterFamilies SetAsideFrontLetterRevisits(std::vector<Rule *> & rules);
+
 //  Expansion of function calls on captures of single characters.
 //
 //  A forward conversion rule whose result calls a transform on a capture of

@@ -414,6 +414,13 @@ struct TransformStep {
     std::vector<const ConversionRule *> markRunEditRules;
     std::vector<std::vector<UCD::UnicodeSet>> markRunKept;
     std::vector<unsigned> markRunKeptBefore;    // the edits before each kept rule
+    // The front-letter revisits of the group (see FrontLetterRevisits),
+    // applied before its other rules, if any; and whether this is the last
+    // step of the group (the group may be planned as several steps, joined by
+    // :: Null ;), after which the letters are placed.
+    bool hasFrontLetters = false;
+    FrontLetterRevisits frontLetters;
+    bool frontLettersEnd = false;
     // A transform rule: the transform, and its filter set (if any).
     TransformID transform;
     re::RE * filter = nullptr;

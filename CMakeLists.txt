@@ -672,6 +672,11 @@ add_test(
   COMMAND python3 tconv_run_strings_test.py ${BIN_DIR}/tconv)
 
 add_test(
+  NAME tconv_front_letters_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_front_letters_test.py ${BIN_DIR}/tconv)
+
+add_test(
   NAME tconv_insertion_revisit_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_insertion_revisit_test.py ${BIN_DIR}/tconv)

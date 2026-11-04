@@ -3354,6 +3354,316 @@ void RestoreMarkRunGroups(std::vector<Rule *> & rules, const MarkRunGroups & gro
     rules = std::move(out);
 }
 
+namespace {
+
+//  A set of characters (no strings), or false.
+bool frontSet(RE * re, CharSetAnalysis & sets, UCD::UnicodeSet & set) {
+    if (!CharSetAnalysis::isSet(re) || hasStrings(re) || hasBoundary(re)) return false;
+    set = sets.setOf(re, false);
+    return !set.empty();
+}
+
+//  A single character, or false.
+bool frontChar(RE * re, CharSetAnalysis & sets, char32_t & ch) {
+    UCD::UnicodeSet set;
+    if (!frontSet(re, sets, set) || set.count() != 1) return false;
+    ch = static_cast<char32_t>(set.front().first);
+    return true;
+}
+
+//  X* (or X? for optional), X a set.
+bool frontRep(RE * re, CharSetAnalysis & sets, int lb, int ub, UCD::UnicodeSet & set) {
+    const Rep * rep = dyn_cast<Rep>(re);
+    return rep && rep->getLB() == lb && rep->getUB() == ub && frontSet(rep->getRE(), sets, set);
+}
+
+std::vector<RE *> atomsOf(RE * re) {
+    std::vector<RE *> atoms;
+    if (re) textAtoms(re, atoms);
+    return atoms;
+}
+
+//  The completed result X of a rule X | ... (a single character, or none for
+//  an empty completed result), the revisited atoms, or false.
+bool frontResult(const RuleSide * result, std::u32string & completed, std::vector<RE *> & revisit) {
+    if (!result->hasCursor() || result->getCursorOffset() != 0 || result->getResultToRevisit() == nullptr) return false;
+    completed.clear();
+    if (!resultString(result->getCompletedResult(), {}, completed)) return false;
+    revisit = atomsOf(result->getResultToRevisit());
+    return true;
+}
+
+bool resultChar(RE * re, char32_t & ch) {
+    std::u32string s;
+    if (!resultString(re, {}, s) || s.size() != 1) return false;
+    ch = s[0];
+    return true;
+}
+
+//  The kinds of rules of the family.
+enum class FrontKind {None, Context, Letter, Run};
+struct FrontRule {
+    FrontKind kind = FrontKind::None;
+    char32_t mark = 0, letter = 0;
+    char32_t upper = 0, lower = 0;          // V, v (Context, Letter)
+    UCD::UnicodeSet optional;               // O (Context, Letter)
+    UCD::UnicodeSet accents, lowers;        // A, L (Context)
+    UCD::UnicodeSet letters;                // G (Letter)
+    UCD::UnicodeSet vowels, ends;           // W, D (Run)
+};
+
+FrontRule frontRule(const ConversionRule * c) {
+    FrontRule f;
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext()) return f;
+    std::u32string completed;
+    std::vector<RE *> revisit;
+    if (!frontResult(result, completed, revisit) || completed.size() != 1) return f;
+    f.letter = completed[0];
+    CharSetAnalysis sets;
+    const std::vector<RE *> text = atomsOf(source->getText());
+    if (text.size() < 2 || !frontChar(text.back(), sets, f.mark)) return f;
+    //  (W+ D?) R → x | $1 ;
+    if (text.size() == 2 && !source->hasAfterContext()) {
+        const Capture * cap = dyn_cast<Capture>(text[0]);
+        if (cap == nullptr || revisit.size() != 1) return f;
+        const Reference * ref = dyn_cast<Reference>(revisit[0]);
+        if (ref == nullptr || ref->getName() != cap->getName()) return f;
+        const std::vector<RE *> run = atomsOf(cap->getCapturedRE());
+        if (run.empty() || run.size() > 2 || !frontRep(run[0], sets, 1, Rep::UNBOUNDED_REP, f.vowels)) return f;
+        if (run.size() == 2 && !frontRep(run[1], sets, 0, 1, f.ends)) return f;
+        f.kind = FrontKind::Run;
+        return f;
+    }
+    //  V O? R } A* L → X | v $1 ;  and  V (G O?) R → X | v $1 ;
+    if (!frontChar(text[0], sets, f.upper)) return f;
+    const Capture * cap = text.size() == 3 ? dyn_cast<Capture>(text[1]) : nullptr;
+    if (text.size() == 3 && cap == nullptr) return f;
+    if (revisit.size() != (cap ? 2 : 1) || !resultChar(revisit[0], f.lower)) return f;
+    if (cap) {
+        const Reference * ref = dyn_cast<Reference>(revisit[1]);
+        if (ref == nullptr || ref->getName() != cap->getName()) return f;
+    }
+    const std::vector<RE *> captured = cap ? atomsOf(cap->getCapturedRE()) : std::vector<RE *>{};
+    if (source->hasAfterContext()) {
+        const std::vector<RE *> after = atomsOf(source->getAfterContext());
+        if (after.size() != 2 || !frontRep(after[0], sets, 0, Rep::UNBOUNDED_REP, f.accents)
+                || !frontSet(after[1], sets, f.lowers)) return f;
+        if (captured.size() > 1 || (captured.size() == 1 && !frontRep(captured[0], sets, 0, 1, f.optional))) return f;
+        f.kind = FrontKind::Context;
+        return f;
+    }
+    if (cap == nullptr || captured.empty() || captured.size() > 2 || !frontSet(captured[0], sets, f.letters)) return f;
+    if (captured.size() == 2 && !frontRep(captured[1], sets, 0, 1, f.optional)) return f;
+    f.kind = FrontKind::Letter;
+    return f;
+}
+
+//  F } S* I → | F M ;
+bool iotaRule(const ConversionRule * c, char32_t & first, UCD::UnicodeSet & skip, char32_t & iota, char32_t & mark) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || !source->hasAfterContext()) return false;
+    std::u32string completed;
+    std::vector<RE *> revisit;
+    if (!frontResult(result, completed, revisit) || !completed.empty() || revisit.size() != 2) return false;
+    CharSetAnalysis sets;
+    const std::vector<RE *> text = atomsOf(source->getText());
+    const std::vector<RE *> after = atomsOf(source->getAfterContext());
+    char32_t again = 0;
+    return text.size() == 1 && frontChar(text[0], sets, first) && after.size() == 2
+           && frontRep(after[0], sets, 0, Rep::UNBOUNDED_REP, skip) && frontChar(after[1], sets, iota)
+           && resultChar(revisit[0], again) && again == first && resultChar(revisit[1], mark);
+}
+
+//  c → | d ;
+bool charRevisit(const ConversionRule * c, char32_t & from, char32_t & to) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    const RuleSide * result = c->getResultSide(Direction::Forward);
+    if (source->hasBeforeContext() || source->hasAfterContext()) return false;
+    std::u32string completed;
+    std::vector<RE *> revisit;
+    if (!frontResult(result, completed, revisit) || !completed.empty() || revisit.size() != 1) return false;
+    CharSetAnalysis sets;
+    const std::vector<RE *> text = atomsOf(source->getText());
+    return text.size() == 1 && frontChar(text[0], sets, from) && resultChar(revisit[0], to);
+}
+
+//  The characters with which a text may begin (a superset), or false.
+bool textFirstChars(RE * re, CharSetAnalysis & sets, UCD::UnicodeSet & firsts) {
+    if (CharSetAnalysis::isSet(re)) {
+        if (hasStrings(re) || hasBoundary(re)) return false;
+        firsts = firsts + sets.setOf(re, false);
+        return true;
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        return !seq->empty() && textFirstChars(seq->front(), sets, firsts);
+    } else if (Alt * alt = dyn_cast<Alt>(re)) {
+        for (RE * a : *alt) {
+            if (!textFirstChars(a, sets, firsts)) return false;
+        }
+        return true;
+    } else if (Capture * cap = dyn_cast<Capture>(re)) {
+        return textFirstChars(cap->getCapturedRE(), sets, firsts);
+    } else if (Rep * rep = dyn_cast<Rep>(re)) {
+        return rep->getLB() >= 1 && textFirstChars(rep->getRE(), sets, firsts);
+    } else if (Name * name = dyn_cast<Name>(re)) {
+        return !isFunctionCall(name) && name->getDefinition() && textFirstChars(name->getDefinition(), sets, firsts);
+    }
+    return false;
+}
+
+//  The characters at which a rule may apply (a superset): those with which its
+//  text may begin, or for an insertion rule (an empty text), its after
+//  context; or false.
+bool ruleFirstChars(const ConversionRule * c, CharSetAnalysis & sets, UCD::UnicodeSet & firsts) {
+    const RuleSide * source = c->getSourceSide(Direction::Forward);
+    RE * const text = source->getText();
+    if (const Seq * seq = dyn_cast<Seq>(text); seq && seq->empty()) {
+        return source->hasAfterContext() && textFirstChars(source->getAfterContext(), sets, firsts);
+    }
+    return textFirstChars(text, sets, firsts);
+}
+
+//  The family of the rules [first, end) of a group (conversion rules only),
+//  given the other rules of the group, or false.
+bool frontLetterFamily(const std::vector<const ConversionRule *> & group, size_t first, size_t end, FrontLetterRevisits & fam) {
+    std::vector<FrontRule> rules;
+    for (size_t k = first; k < end; k++) rules.push_back(frontRule(group[k]));
+    //  Context* Letter* Run Run, the runs lower then any.
+    size_t k = 0;
+    while (k < rules.size() && rules[k].kind == FrontKind::Context) k++;
+    while (k < rules.size() && rules[k].kind == FrontKind::Letter) k++;
+    if (k + 2 != rules.size() || rules[k].kind != FrontKind::Run || rules[k + 1].kind != FrontKind::Run) return false;
+    const FrontRule & lc = rules[k];
+    const FrontRule & any = rules[k + 1];
+    fam = FrontLetterRevisits{};
+    fam.mark = any.mark;
+    fam.vowels = any.vowels;
+    fam.lowerVowels = lc.vowels;
+    fam.ends = any.ends;
+    fam.lowerLetter = lc.letter;
+    fam.upperLetter = any.letter;
+    if (!(lc.ends == any.ends) || lc.mark != fam.mark || fam.lowerLetter == fam.upperLetter) return false;
+    if (!fam.lowerVowels.subset(fam.vowels) || fam.vowels.intersects(fam.ends)) return false;
+    bool haveContext = false, haveLetter = false;
+    for (size_t j = 0; j < k; j++) {
+        const FrontRule & r = rules[j];
+        if (r.mark != fam.mark || r.letter != fam.upperLetter) return false;
+        if (!r.optional.subset(fam.ends)) return false;
+        auto v = std::find_if(fam.upper.begin(), fam.upper.end(), [&](const FrontLetterVowel & u) {return u.upper == r.upper;});
+        if (v == fam.upper.end()) {
+            fam.upper.push_back(FrontLetterVowel{r.upper, r.lower, r.optional});
+        } else if (v->lower != r.lower || !(v->optional == r.optional)) {
+            return false;
+        }
+        if (r.kind == FrontKind::Context) {
+            if (haveContext && (!(r.accents == fam.accents) || !(r.lowers == fam.lowers))) return false;
+            fam.accents = r.accents;
+            fam.lowers = r.lowers;
+            haveContext = true;
+        } else {
+            if (haveLetter && !(r.letters == fam.letters)) return false;
+            fam.letters = r.letters;
+            haveLetter = true;
+        }
+    }
+    //  Each V among the first rules has a rule of each kind (the same O), and
+    //  the uppercase vowels are those V.
+    UCD::UnicodeSet uppers;
+    for (const FrontLetterVowel & v : fam.upper) {
+        uppers.insert(v.upper);
+        if (!fam.lowerVowels.contains(v.lower)) return false;
+    }
+    if (!haveContext || !haveLetter || !(uppers == fam.vowels - fam.lowerVowels) || 2 * fam.upper.size() != k) return false;
+    //  R a mark among the accents (as are the ends), no vowel, end or letter;
+    //  the accents no letters.
+    const UCD::UnicodeSet mark(fam.mark);
+    if (!mark.subset(fam.accents) || !fam.ends.subset(fam.accents) || fam.accents.intersects(fam.lowers)
+            || mark.intersects(fam.vowels + fam.ends + fam.letters + fam.lowers) || fam.vowels.intersects(fam.accents)) return false;
+    //  The rules of the group before the family: rules marking vowels (F } S* I
+    //  → | F M), and rules beginning with no vowel.
+    CharSetAnalysis sets;
+    for (size_t j = 0; j < first; j++) {
+        char32_t f = 0, i = 0, m = 0;
+        UCD::UnicodeSet skip;
+        if (iotaRule(group[j], f, skip, i, m)) {
+            if (!fam.iotaFirsts.empty() && (!(skip == fam.iotaSkip) || i != fam.iota || m != fam.iotaMark)) return false;
+            if (!fam.vowels.contains(f) || !fam.ends.contains(m) || skip.contains(m) || fam.vowels.contains(i) || fam.ends.contains(i)
+                    || i == fam.mark || !fam.accents.contains(i)) return false;
+            fam.iotaFirsts.insert(f);
+            fam.iotaSkip = skip;
+            fam.iota = i;
+            fam.iotaMark = m;
+            continue;
+        }
+        UCD::UnicodeSet firsts;
+        if (!ruleFirstChars(group[j], sets, firsts)) return false;
+        if (firsts.intersects(fam.vowels + fam.letters)) return false;
+    }
+    //  The characters the group revisits as vowels (c → | d), anywhere in the
+    //  group, when no rule before applies to c.
+    for (size_t j = 0; j < group.size(); j++) {
+        if (j >= first && j < end) continue;
+        char32_t from = 0, to = 0;
+        if (!charRevisit(group[j], from, to) || !fam.vowels.contains(to)) continue;
+        if (fam.vowels.contains(from) || fam.ends.contains(from) || from == fam.mark || fam.accents.contains(from)) return false;
+        for (size_t i = 0; i < j; i++) {
+            if (i >= first && i < end) continue;
+            UCD::UnicodeSet firsts;
+            if (!ruleFirstChars(group[i], sets, firsts) || firsts.contains(from)) return false;
+        }
+        fam.revisits.emplace_back(from, to);
+    }
+    return true;
+}
+
+} // namespace
+
+FrontLetterFamilies SetAsideFrontLetterRevisits(std::vector<Rule *> & rules) {
+    FrontLetterFamilies families;
+    std::vector<Rule *> out;
+    size_t transforms = 0;
+    for (size_t start = 0; start < rules.size(); ) {
+        if (isa<TransformRule>(rules[start])) {
+            transforms++;
+            out.push_back(rules[start++]);
+            continue;
+        }
+        //  The group: the rules up to the next transform rule.
+        size_t end = start;
+        while (end < rules.size() && !isa<TransformRule>(rules[end])) end++;
+        std::vector<const ConversionRule *> group;
+        std::vector<size_t> at;
+        for (size_t k = start; k < end; k++) {
+            if (const ConversionRule * c = dyn_cast<ConversionRule>(rules[k])) {
+                group.push_back(c);
+                at.push_back(k);
+            }
+        }
+        //  The family: the first rule of the third kind, the rules of the first
+        //  two kinds before it, and the rule after it.
+        std::set<size_t> family;
+        for (size_t k = 0; k + 1 < group.size() && family.empty(); k++) {
+            if (frontRule(group[k]).kind != FrontKind::Run) continue;
+            size_t first = k;
+            while (first > 0 && frontRule(group[first - 1]).kind == FrontKind::Letter) first--;
+            while (first > 0 && frontRule(group[first - 1]).kind == FrontKind::Context) first--;
+            FrontLetterRevisits fam;
+            if (frontLetterFamily(group, first, k + 2, fam)) {
+                for (size_t j = first; j < k + 2; j++) family.insert(at[j]);
+                families.emplace_back(transforms, std::move(fam));
+            }
+        }
+        for (size_t k = start; k < end; k++) {
+            if (!family.count(k)) out.push_back(rules[k]);
+        }
+        start = end;
+    }
+    rules = std::move(out);
+    return families;
+}
+
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats) {
     return Composer(stats).compose(rules);
 }

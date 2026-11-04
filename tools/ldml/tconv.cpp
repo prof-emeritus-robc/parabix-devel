@@ -613,6 +613,38 @@ static void blockingMarkProblems(const ldml::TransformPlan & plan, const ldml::T
                                  std::vector<std::string> & problems);
 static bool inStringRulesOrSubgroups(const ldml::TransformStep & step, const ldml::ConversionRule * r);
 
+//  The front-letter revisits set aside (see ldml::FrontLetterRevisits), each
+//  in the conversion step of its group (the group after the given number of
+//  transform rules), at its beginning: a step of its own if the group has
+//  no other rules.
+static void attachFrontLetters(ldml::TransformPlan & plan, const ldml::FrontLetterFamilies & families) {
+    //  (The :: Null ; steps join the steps that the planning makes of a group.)
+    auto transform = [&](size_t k) {
+        if (plan.steps[k].kind != ldml::TransformStep::Kind::Transform) return false;
+        const std::string id = plan.steps[k].transform.getText();
+        return id != "Null" && id != "Any-Null";
+    };
+    for (const auto & f : families) {
+        size_t transforms = 0, k = 0;
+        while (k < plan.steps.size() && transforms < f.first) {
+            if (transform(k)) transforms++;
+            k++;
+        }
+        if (k == plan.steps.size() || plan.steps[k].kind != ldml::TransformStep::Kind::Conversion) {
+            ldml::TransformStep step;
+            step.kind = ldml::TransformStep::Kind::Conversion;
+            plan.steps.insert(plan.steps.begin() + static_cast<std::ptrdiff_t>(k), std::move(step));
+        }
+        plan.steps[k].hasFrontLetters = true;
+        plan.steps[k].frontLetters = f.second;
+        size_t last = k;
+        for (size_t j = k + 1; j < plan.steps.size() && !transform(j); j++) {
+            if (plan.steps[j].kind == ldml::TransformStep::Kind::Conversion) last = j;
+        }
+        plan.steps[last].frontLettersEnd = true;
+    }
+}
+
 TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *> & parsed, ldml::TransformDirection direction) {
     TransformAnalysis a;
     try {
@@ -620,6 +652,8 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
                                           ? ldml::ExtractForwardRules(parsed) : ldml::ExtractReverseBackwardRules(parsed);
         rules = ldml::MoveTextAnchors(rules);
         rules = ldml::EnumerateRepeatedCaptures(rules);
+        //  (Set aside before revisits are composed: see ldml::FrontLetterRevisits.)
+        const ldml::FrontLetterFamilies frontLetters = ldml::SetAsideFrontLetterRevisits(rules);
         //  (Before revisits are composed: a result calling a function may have
         //  text to revisit.)
         ldml::FunctionCallStats cstats;
@@ -667,6 +701,7 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
                 translateCaptureContexts(a.plan);
             }
         }
+        attachFrontLetters(a.plan, frontLetters);
         //  The pairs left to priority by DisambiguateOrder, as string rules of
         //  the same group (see ldml::TransformStep::stringPriority).
         for (const auto & pr : dstats.prioritized) {
@@ -801,6 +836,13 @@ static void printPlan(const std::string & label, const TransformAnalysis & a) {
             llvm::outs() << "  transform " << (step.filter ? ldml::printUnicodeSet(step.filter) + " " : "")
                          << step.transform.getText() << (isICUBuiltIn(step.transform.getText()) ? " (applied by ICU)" : "") << "\n";
             continue;
+        }
+        if (step.hasFrontLetters) {
+            const ldml::FrontLetterRevisits & f = step.frontLetters;
+            llvm::outs() << "  front-letter revisits: mark " << printCodepoints(std::u32string(1, f.mark)) << ", "
+                         << f.upper.size() << " uppercase vowels, letters " << printCodepoints({f.lowerLetter, f.upperLetter})
+                         << (f.iotaFirsts.empty() ? "" : ", with the marking of vowels before " + printCodepoints(std::u32string(1, f.iota)))
+                         << ", " << f.revisits.size() << " characters revisited as vowels\n";
         }
         if (!step.markRunEditRules.empty()) {
             llvm::outs() << "  mark run edits: " << step.markRunEditRules.size() << " rules, " << step.markRunKept.size() << " kept\n";
@@ -5840,6 +5882,365 @@ private:
     const unsigned mShifts;
 };
 
+//  Front-letter revisits (see ldml::FrontLetterRevisits; RulePipelineBuilder::
+//  frontLettersBegin).  The classes of a family, in order: R, W, Wl, D, G, G
+//  without the vowels, A, L, S, I, F, the characters revisited as vowels (c),
+//  those revisited as uppercase vowels; then for each set O of the uppercase
+//  vowels (by their sets O), those V (and the c revisited as them) and O; then
+//  the characters lowercased (each V, and each c revisited as one).
+struct FrontLetterLayout {
+    unsigned groups = 0;                    // the distinct sets O
+    std::vector<bool> groupHasMark;         // whether M is within O
+    std::vector<char32_t> lowered;          // the lowercase of each character lowercased
+    enum : unsigned {R, W, Wl, D, G, GNotW, A, L, S, I, F, Rev, RevUp, First};
+    unsigned vowels(unsigned k) const {return First + 2 * k;}
+    unsigned optional(unsigned k) const {return First + 2 * k + 1;}
+    unsigned lower(unsigned j) const {return First + 2 * groups + j;}
+    std::string signature() const {
+        std::string sig = std::to_string(groups) + "_";
+        for (bool m : groupHasMark) sig += m ? "m" : "n";
+        for (char32_t c : lowered) sig += "_" + std::to_string(static_cast<unsigned>(c));
+        return sig;
+    }
+};
+
+//  The runs of a family whose condition depends on how they end, at their ends
+//  (Mark, shifted back to their starts by IndexedShiftBack along Index): the
+//  runs of vowels (from a vowel or a c) followed by D? R; the runs of accents
+//  followed by L; the runs of S from after an F that end at I; the runs of R
+//  followed by a letter of G (not a vowel), the O of each group, and R.
+class FrontLetterScan final : public pablo::PabloKernel {
+public:
+    FrontLetterScan(LLVMTypeSystemInterface & ts, const FrontLetterLayout & layout, StreamSet * Classes,
+                    StreamSet * SegIdx, StreamSet * SegMark, StreamSet * AccIdx, StreamSet * AccMark,
+                    StreamSet * IotaIdx, StreamSet * IotaMark, StreamSet * LateIdx, StreamSet * LateMark)
+    : PabloKernel(ts, "FrontLetterScan" + layout.signature(),
+                  {Binding{"Classes", Classes, FixedRate(1), LookAhead(3)}},
+                  {Binding{"SegIdx", SegIdx}, Binding{"SegMark", SegMark}, Binding{"AccIdx", AccIdx}, Binding{"AccMark", AccMark},
+                   Binding{"IotaIdx", IotaIdx}, Binding{"IotaMark", IotaMark}, Binding{"LateIdx", LateIdx}, Binding{"LateMark", LateMark}})
+    , mLayout(layout) {}
+protected:
+    void generatePabloMethod() override;
+private:
+    const FrontLetterLayout mLayout;
+};
+
+//  The structure of the runs, shared by FrontLetterScan and FrontLetterFlags.
+struct FrontLetterRuns {
+    PabloAST * segStart, * segOK, * accStart, * accOK, * iotaStart, * iotaDirect, * iotaHit, * rStart;
+    std::vector<PabloAST *> lateOK;
+    FrontLetterRuns(PabloBuilder & pb, const FrontLetterLayout & L, const std::vector<PabloAST *> & c) {
+        using FL = FrontLetterLayout;
+        auto ahead = [&](unsigned k, unsigned n) {return pb.createLookahead(c[k], n);};
+        PabloAST * const vowelsOrRev = pb.createOr(c[FL::W], c[FL::Rev]);
+        segStart = pb.createAnd(vowelsOrRev, pb.createNot(pb.createAnd(c[FL::W], pb.createAdvance(vowelsOrRev, 1))));
+        PabloAST * const segEnd = pb.createAnd(vowelsOrRev, pb.createNot(ahead(FL::W, 1)));
+        PabloAST * const tail = pb.createOr(ahead(FL::R, 1), pb.createAnd(ahead(FL::D, 1), ahead(FL::R, 2)));
+        segOK = pb.createAnd(segEnd, tail);
+        accStart = pb.createAnd(c[FL::A], pb.createNot(pb.createAdvance(c[FL::A], 1)));
+        PabloAST * const accEnd = pb.createAnd(c[FL::A], pb.createNot(ahead(FL::A, 1)));
+        accOK = pb.createAnd(accEnd, ahead(FL::L, 1));
+        PabloAST * const cs = pb.createAdvance(c[FL::F], 1);
+        iotaStart = pb.createAnd(cs, c[FL::S]);
+        iotaDirect = pb.createAnd(cs, c[FL::I]);
+        iotaHit = pb.createAnd(pb.createAdvance(pb.createMatchStar(iotaStart, c[FL::S]), 1), c[FL::I]);
+        rStart = pb.createAnd(c[FL::R], pb.createNot(pb.createAdvance(c[FL::R], 1)));
+        PabloAST * const rEnd = pb.createAnd(c[FL::R], pb.createNot(ahead(FL::R, 1)));
+        for (unsigned k = 0; k < L.groups; k++) {
+            PabloAST * const after = pb.createOr(ahead(FL::R, 2), pb.createAnd(ahead(L.optional(k), 2), ahead(FL::R, 3)));
+            lateOK.push_back(pb.createAnd(pb.createAnd(rEnd, ahead(FL::GNotW, 1)), after));
+        }
+        mRunIdx = {pb.createOr(segStart, segEnd), pb.createOr(accStart, accEnd), pb.createOr(iotaStart, iotaHit), pb.createOr(rStart, rEnd)};
+    }
+    std::vector<PabloAST *> mRunIdx;
+};
+
+void FrontLetterScan::generatePabloMethod() {
+    PabloBuilder pb(getEntryScope());
+    const FrontLetterRuns r(pb, mLayout, getInputStreamSet("Classes"));
+    auto put = [&](const std::string & name, unsigned i, PabloAST * value) {
+        pb.createAssign(pb.createExtract(getOutputStreamVar(name), pb.getInteger(i)), value);
+    };
+    put("SegIdx", 0, r.mRunIdx[0]);
+    put("SegMark", 0, pb.createAnd(r.segOK, pb.createNot(r.segStart)));
+    put("AccIdx", 0, r.mRunIdx[1]);
+    put("AccMark", 0, pb.createAnd(r.accOK, pb.createNot(r.accStart)));
+    put("IotaIdx", 0, r.mRunIdx[2]);
+    put("IotaMark", 0, r.iotaHit);
+    put("LateIdx", 0, r.mRunIdx[3]);
+    for (unsigned k = 0; k < mLayout.groups; k++) put("LateMark", k, pb.createAnd(r.lateOK[k], pb.createNot(r.rStart)));
+}
+
+//  The conditions of the runs at their starts (see FrontLetterScan): Flags
+//  holds the vowel runs followed by D? R, the accent runs followed by L, the
+//  positions after F where S* I follows, and for each group the runs of R
+//  followed by G O? R (G not a vowel).
+class FrontLetterFlags final : public pablo::PabloKernel {
+public:
+    FrontLetterFlags(LLVMTypeSystemInterface & ts, const FrontLetterLayout & layout, StreamSet * Classes,
+                     StreamSet * Seg, StreamSet * Acc, StreamSet * Iota, StreamSet * Late, StreamSet * Flags)
+    : PabloKernel(ts, "FrontLetterFlags" + layout.signature(),
+                  {Binding{"Classes", Classes, FixedRate(1), LookAhead(3)}, Binding{"Seg", Seg}, Binding{"Acc", Acc},
+                   Binding{"Iota", Iota}, Binding{"Late", Late}},
+                  {Binding{"Flags", Flags}})
+    , mLayout(layout) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const FrontLetterRuns r(pb, mLayout, getInputStreamSet("Classes"));
+        std::vector<PabloAST *> flags;
+        flags.push_back(pb.createAnd(r.segStart, pb.createOr(getInputStreamSet("Seg")[0], r.segOK)));
+        flags.push_back(pb.createAnd(r.accStart, pb.createOr(getInputStreamSet("Acc")[0], r.accOK)));
+        flags.push_back(pb.createOr(r.iotaDirect, pb.createAnd(r.iotaStart, getInputStreamSet("Iota")[0])));
+        const std::vector<PabloAST *> late = getInputStreamSet("Late");
+        for (unsigned k = 0; k < mLayout.groups; k++) flags.push_back(pb.createAnd(r.rStart, pb.createOr(late[k], r.lateOK[k])));
+        writeOutputStreamSet("Flags", flags);
+    }
+private:
+    const FrontLetterLayout mLayout;
+};
+
+//  The decisions of a family (see the derivation in RulePipelineBuilder::
+//  frontLettersBegin): the roughs deleted (Rdel), the normal starts and the
+//  first roughs they take (NormIdx, for the counts to be shifted back to the
+//  starts), and Dec: the starts lowercased (Low), those writing one letter
+//  (One), the first rough of each start (F), the letter of each rough taken
+//  (U: the uppercase), whether its start is uppercase (CaseF, at F), and the
+//  roughs taken other than the first of a start.
+class FrontLetterDecisions final : public pablo::PabloKernel {
+public:
+    FrontLetterDecisions(LLVMTypeSystemInterface & ts, const FrontLetterLayout & layout, StreamSet * Classes, StreamSet * Flags,
+                         StreamSet * Rdel, StreamSet * NormIdx, StreamSet * Dec)
+    : PabloKernel(ts, "FrontLetterDecisions" + layout.signature(),
+                  {Binding{"Classes", Classes, FixedRate(1), LookAhead(3)}, Binding{"Flags", Flags, FixedRate(1), LookAhead(2)}},
+                  {Binding{"Rdel", Rdel}, Binding{"NormIdx", NormIdx}, Binding{"Dec", Dec}})
+    , mLayout(layout) {}
+protected:
+    void generatePabloMethod() override;
+private:
+    const FrontLetterLayout mLayout;
+};
+
+void FrontLetterDecisions::generatePabloMethod() {
+    using FL = FrontLetterLayout;
+    const FL & L = mLayout;
+    PabloBuilder pb(getEntryScope());
+    const std::vector<PabloAST *> c = getInputStreamSet("Classes");
+    const std::vector<PabloAST *> flags = getInputStreamSet("Flags");
+    auto ahead = [&](unsigned k, unsigned n) {return pb.createLookahead(c[k], n);};
+    auto flagAhead = [&](unsigned k, unsigned n) {return n == 0 ? flags[k] : pb.createLookahead(flags[k], n);};
+    auto And = [&](PabloAST * a, PabloAST * b) {return pb.createAnd(a, b);};
+    auto Or = [&](PabloAST * a, PabloAST * b) {return pb.createOr(a, b);};
+    auto Not = [&](PabloAST * a) {return pb.createNot(a);};
+    auto Adv = [&](PabloAST * a) {return pb.createAdvance(a, 1);};
+    PabloAST * const R = c[FL::R];
+    PabloAST * const notR = Not(R);
+    //  The first R after each position of M.
+    auto firstR = [&](PabloAST * m) {
+        PabloAST * const reach = pb.createMatchStar(Adv(m), notR);
+        return And(Or(reach, Adv(And(reach, notR))), R);
+    };
+    PabloAST * const nextR = ahead(FL::R, 1);
+    //  The vowels marked before I (F } S* I → | F M): they keep only R right after.
+    PabloAST * const iota = And(c[FL::F], flagAhead(2, 1));
+    PabloAST * const iotaBlocks = And(iota, Not(nextR));
+    //  Pass 1 (in the source): V O? R } A* L (68), V G O? R (76), a run of
+    //  vowels D? R (84, 85; a c as its vowel at the start).
+    PabloAST * const cand8485 = And(flags[0], Not(iotaBlocks));
+    PabloAST * cand68 = pb.createZeroes(), * cand76 = pb.createZeroes();
+    std::vector<PabloAST *> vowelsOf(L.groups);
+    for (unsigned k = 0; k < L.groups; k++) {
+        PabloAST * const V = c[L.vowels(k)];
+        vowelsOf[k] = V;
+        PabloAST * const K = Or(nextR, And(ahead(L.optional(k), 1), ahead(FL::R, 2)));
+        PabloAST * c68 = And(And(V, K), And(flagAhead(1, 1), Not(iotaBlocks)));
+        if (!L.groupHasMark[k]) c68 = And(c68, Not(iota));
+        cand68 = Or(cand68, c68);
+        PabloAST * const after = Or(ahead(FL::R, 2), And(ahead(L.optional(k), 2), ahead(FL::R, 3)));
+        cand76 = Or(cand76, And(V, And(ahead(FL::G, 1), after)));
+    }
+    PabloAST * const cand = Or(Or(cand68, cand76), cand8485);
+    //  76 across a letter not a vowel (a blocker): the start takes its R alone.
+    PabloAST * const blk76 = And(And(cand76, Not(cand68)), ahead(FL::GNotW, 1));
+    //  Blockers: not a vowel, R or D; or a character other than R after D (R
+    //  between).
+    PabloAST * const prevD = And(pb.createMatchStar(Adv(c[FL::D]), R), notR);
+    PabloAST * const B = And(notR, Or(Not(Or(c[FL::W], c[FL::D])), prevD));
+    PabloAST * const notB = Not(B);
+    //  Cov: a candidate before, with no blocker after it up to here; Earlier: a
+    //  candidate before, with no R since (the same first R).
+    PabloAST * const Cov = And(pb.createMatchStar(Adv(cand), notB), notB);
+    PabloAST * const Earlier = Adv(And(pb.createMatchStar(cand, notR), notR));
+    PabloAST * const start0 = And(And(cand, Not(Earlier)), Or(Not(Cov), blk76));
+    //  A c right after a start by 76 (its letter), which sees its R deleted.
+    PabloAST * const eps = And(c[FL::Rev], Adv(And(start0, blk76)));
+    PabloAST * const A1 = And(nextR, Or(Or(ahead(FL::R, 2), And(ahead(FL::D, 2), ahead(FL::R, 3))), And(flagAhead(0, 2), ahead(FL::W, 2))));
+    PabloAST * const A2 = And(And(ahead(FL::D, 1), ahead(FL::R, 2)), ahead(FL::R, 3));
+    PabloAST * const epsStart = And(eps, Or(A1, A2));
+    PabloAST * const Start = Or(start0, epsStart);
+    //  Late starts: an uppercase vowel within the passes of another, by 76 across
+    //  the roughs those passes delete.
+    PabloAST * late = pb.createZeroes();
+    for (unsigned k = 0; k < L.groups; k++) late = Or(late, And(vowelsOf[k], flagAhead(3 + k, 1)));
+    PabloAST * const Late = And(And(late, Or(Cov, Earlier)), Not(Start));
+    PabloAST * LateT = pb.createZeroes();
+    for (unsigned k = 0; k < L.groups; k++) {
+        PabloAST * const GL = And(c[FL::GNotW], Adv(pb.createMatchStar(Adv(And(Late, vowelsOf[k])), R)));
+        LateT = Or(LateT, And(R, Or(Adv(GL), Adv(And(Adv(GL), c[L.optional(k)])))));
+    }
+    PabloAST * const Rdel = And(R, Or(Or(Cov, firstR(cand)), LateT));
+    PabloAST * const Low = Or(And(Start, Or(cand68, cand76)), Late);
+    //  The letters: uppercase if the start is lowercased, or an uppercase vowel
+    //  is within the passes (from the start, not lowercased, to the rough).
+    PabloAST * const UC = And(c[FL::W], Not(c[FL::Wl]));
+    PabloAST * const Up = Or(UC, c[FL::RevUp]);
+    PabloAST * const upper = And(Or(UC, And(c[FL::RevUp], Start)), Not(And(Start, Low)));
+    PabloAST * const Xs = pb.createMatchStar(upper, Or(Not(Start), And(upper, Start)));
+    PabloAST * const LowT = firstR(And(Start, Low));
+    PabloAST * const U = And(Rdel, Or(Or(LateT, LowT), Xs));
+    PabloAST * const epsT = firstR(firstR(epsStart));
+    PabloAST * const nonEps = And(Start, Not(epsStart));
+    PabloAST * const F = Or(Or(firstR(nonEps), epsT), LateT);
+    PabloAST * const CaseF = And(F, Or(firstR(And(nonEps, Up)), LateT));
+    PabloAST * const Normal = And(Start, Not(blk76));
+    PabloAST * const NormalF = Or(firstR(And(Normal, Not(epsStart))), epsT);
+    PabloAST * const One = Or(And(Start, blk76), Late);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("Rdel"), pb.getInteger(0)), Rdel);
+    pb.createAssign(pb.createExtract(getOutputStreamVar("NormIdx"), pb.getInteger(0)), Or(Normal, NormalF));
+    writeOutputStreamSet("Dec", std::vector<PabloAST *>{Low, One, F, U, CaseF, And(Rdel, Not(F))});
+}
+
+//  In the roughs taken (compressed): the number of letters of each start, at
+//  the last rough of its own (Mark, shifted back to the first along Index)
+//  or at the first (Direct, a start of one), and the letters, as their uppercase
+//  and the case of their start.
+class FrontLetterCounts final : public pablo::PabloKernel {
+public:
+    FrontLetterCounts(LLVMTypeSystemInterface & ts, StreamSet * K, StreamSet * NF, StreamSet * RunIdx,
+                      StreamSet * Index, StreamSet * Mark, StreamSet * Direct, StreamSet * Letters)
+    : PabloKernel(ts, "FrontLetterCounts" + std::to_string(Mark->getNumElements()),
+                  {Binding{"K", K}, Binding{"NF", NF, FixedRate(1), LookAhead(1)}, Binding{"RunIdx", RunIdx}},
+                  {Binding{"Index", Index}, Binding{"Mark", Mark}, Binding{"Direct", Direct}, Binding{"Letters", Letters}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        BixNumCompiler bnc(pb);
+        const std::vector<PabloAST *> k = getInputStreamSet("K");
+        PabloAST * const F = k[0];
+        PabloAST * const NF = getInputStreamSet("NF")[0];
+        PabloAST * const last = pb.createNot(pb.createLookahead(NF, 1));
+        PabloAST * const lastNF = pb.createAnd(last, NF);
+        const BixNum idx = getInputStreamSet("RunIdx");
+        Var * const mark = getOutputStreamVar("Mark");
+        const unsigned bits = static_cast<unsigned>(mark->getType()->getArrayNumElements());
+        const BixNum count = bnc.AddModular(bnc.ZeroExtend(idx, bits), 2);
+        for (unsigned b = 0; b < bits; b++) pb.createAssign(pb.createExtract(mark, pb.getInteger(b)), pb.createAnd(count[b], lastNF));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("Index"), pb.getInteger(0)), pb.createOr(F, lastNF));
+        pb.createAssign(pb.createExtract(getOutputStreamVar("Direct"), pb.getInteger(0)), pb.createAnd(F, last));
+        PabloAST * const caseOf = pb.createMatchStar(pb.createAnd(F, k[2]), NF);
+        writeOutputStreamSet("Letters", std::vector<PabloAST *>{caseOf, k[1]});
+    }
+};
+
+//  The text the rest of the group applies to, before the roughs are deleted
+//  and the letters inserted: the starts lowercased (Lowered), and the number of
+//  letters at each start (Counts: the counts shifted back to the normal starts,
+//  or one).
+class FrontLetterLowered final : public pablo::PabloKernel {
+public:
+    FrontLetterLowered(LLVMTypeSystemInterface & ts, const FrontLetterLayout & layout, StreamSet * U21, StreamSet * Classes,
+                       StreamSet * Dec, StreamSet * Shifted, StreamSet * Lowered, StreamSet * Counts)
+    : PabloKernel(ts, "FrontLetterLowered" + layout.signature(),
+                  {Binding{"U21", U21}, Binding{"Classes", Classes}, Binding{"Dec", Dec}, Binding{"Shifted", Shifted}},
+                  {Binding{"Lowered", Lowered}, Binding{"Counts", Counts}})
+    , mLayout(layout) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("U21");
+        const std::vector<PabloAST *> c = getInputStreamSet("Classes");
+        const std::vector<PabloAST *> dec = getInputStreamSet("Dec");
+        PabloAST * const low = dec[0];
+        std::vector<PabloAST *> bits(basis.size(), pb.createZeroes());
+        for (size_t j = 0; j < mLayout.lowered.size(); j++) {
+            PabloAST * const at = pb.createAnd(low, c[mLayout.lower(static_cast<unsigned>(j))]);
+            for (unsigned b = 0; b < basis.size(); b++) {
+                if ((mLayout.lowered[j] >> b) & 1) bits[b] = pb.createOr(bits[b], at);
+            }
+        }
+        for (unsigned b = 0; b < basis.size(); b++) basis[b] = pb.createOr(pb.createAnd(basis[b], pb.createNot(low)), bits[b]);
+        writeOutputStreamSet("Lowered", basis);
+        std::vector<PabloAST *> counts = getInputStreamSet("Shifted");
+        counts[0] = pb.createOr(counts[0], dec[1]);
+        writeOutputStreamSet("Counts", counts);
+    }
+private:
+    const FrontLetterLayout mLayout;
+};
+
+//  The placeholders of the letters (see RulePipelineBuilder::frontLettersBegin),
+//  by the case of their start and their own: Latin letters of the case of the
+//  start, which the rest of the group does not change.
+static constexpr char32_t FrontPlaceholders[2][2] = {{0x0267, 0xA727}, {0xA726, 0x2C67}};
+
+//  The placeholders written at the inserted positions (not in SpreadMask).
+class FrontLetterFill final : public pablo::PabloKernel {
+public:
+    FrontLetterFill(LLVMTypeSystemInterface & ts, StreamSet * SpreadMask, StreamSet * Basis, StreamSet * Letters, StreamSet * Filled)
+    : PabloKernel(ts, "FrontLetterFill",
+                  {Binding{"SpreadMask", SpreadMask}, Binding{"Basis", Basis}, Binding{"Letters", Letters}}, {Binding{"Filled", Filled}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const inserted = pb.createInFile(pb.createNot(getInputStreamSet("SpreadMask")[0]));
+        const std::vector<PabloAST *> letters = getInputStreamSet("Letters");
+        std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        for (unsigned upperStart = 0; upperStart < 2; upperStart++) {
+            for (unsigned upperLetter = 0; upperLetter < 2; upperLetter++) {
+                PabloAST * at = pb.createAnd(inserted, upperStart ? letters[0] : pb.createNot(letters[0]));
+                at = pb.createAnd(at, upperLetter ? letters[1] : pb.createNot(letters[1]));
+                for (unsigned b = 0; b < basis.size(); b++) {
+                    if ((FrontPlaceholders[upperStart][upperLetter] >> b) & 1) basis[b] = pb.createOr(basis[b], at);
+                }
+            }
+        }
+        writeOutputStreamSet("Filled", basis);
+    }
+};
+
+//  The letters at the placeholders (Placed): the letters of the family.
+class FrontLetterPlace final : public pablo::PabloKernel {
+public:
+    FrontLetterPlace(LLVMTypeSystemInterface & ts, char32_t lowerLetter, char32_t upperLetter,
+                     StreamSet * Basis, StreamSet * Placed, StreamSet * Result)
+    : PabloKernel(ts, "FrontLetterPlace" + std::to_string(static_cast<unsigned>(lowerLetter)) + "_"
+                      + std::to_string(static_cast<unsigned>(upperLetter)),
+                  {Binding{"Basis", Basis}, Binding{"Placed", Placed}}, {Binding{"Result", Result}})
+    , mLower(lowerLetter), mUpper(upperLetter) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("Basis");
+        PabloAST * const placed = getInputStreamSet("Placed")[0];
+        auto is = [&](char32_t cp) {
+            PabloAST * m = placed;
+            for (unsigned b = 0; b < basis.size(); b++) m = pb.createAnd(m, ((cp >> b) & 1) ? basis[b] : pb.createNot(basis[b]));
+            return m;
+        };
+        PabloAST * const upper = pb.createOr(is(FrontPlaceholders[0][1]), is(FrontPlaceholders[1][1]));
+        PabloAST * const lower = pb.createAnd(placed, pb.createNot(upper));
+        for (unsigned b = 0; b < basis.size(); b++) {
+            PabloAST * bit = pb.createAnd(basis[b], pb.createNot(placed));
+            if ((mLower >> b) & 1) bit = pb.createOr(bit, lower);
+            if ((mUpper >> b) & 1) bit = pb.createOr(bit, upper);
+            basis[b] = bit;
+        }
+        writeOutputStreamSet("Result", basis);
+    }
+private:
+    const char32_t mLower, mUpper;
+};
+
 class RulePipelineBuilder {
 public:
     RulePipelineBuilder(PipelineBuilder & P, const ldml::TransformRegistry & registry, TransformAnalyzer & analyzer)
@@ -5901,6 +6302,8 @@ private:
     StreamSet * insertionGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * deferredRules(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21);
+    StreamSet * frontLettersEnd(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * chainRevisitsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * markRunEditsGroup(const ldml::TransformStep & step, StreamSet * U21);
     StreamSet * insertionsEligible();
@@ -5947,6 +6350,8 @@ private:
     unsigned mDepth = 0;
     std::vector<GroupCount> mGroupCounts;
     bool mOmitICUBuiltIns = false;
+    //  The letters of the front-letter revisits being applied (see frontLettersBegin).
+    std::pair<char32_t, char32_t> mFrontLetters;
 };
 
 //  The rules of a conversion group, of all kinds.
@@ -8390,6 +8795,147 @@ StreamSet * RulePipelineBuilder::transform(const ldml::TransformEntry * entry, S
 //  positions for the further characters of A are inserted after them, A is
 //  written (PrefixRunFill), and the positions of empty strings A, and those
 //  within texts S of more than one character, are deleted.
+//  The front-letter revisits of a group (see ldml::FrontLetterRevisits),
+//  applied before its other rules.  ICU applies the rules of the family at a
+//  position again (revisiting the run, with the letter written before it)
+//  while they match, each pass taking the next R: a pass by the last two
+//  rules continues over the vowels (and R), with D only right before the R it
+//  takes; the passes stop at the first blocker after the start (a character
+//  other than a vowel, R or D, or one after D).  So the passes of a start take
+//  the first R after it and every R up to that blocker; no start takes an R
+//  within another's passes; and the starts are, in the source, the positions
+//  where a rule applies first (pass 1), unless a position before applies with
+//  the same first R (Earlier), or reaches it with no blocker between (Cov),
+//  the start's own rule crossing none (as a pass by 76 may, across a letter of
+//  G not a vowel: such a start takes its R alone).  Two starts arise from the
+//  roughs that the passes before delete: an uppercase vowel within them,
+//  followed by those roughs and a letter of G not a vowel, O? and R (Late:
+//  76 applies there), and a c after a start by 76 (its letter of G), which
+//  sees that start's R deleted.  (Checked against ICU's passes, rule by rule,
+//  on random texts.)  The text the rest of the group applies to: the roughs
+//  taken deleted, the starts by the first two rules (and the Late) lowercased,
+//  and before each start its letters, in order, as placeholders (see
+//  FrontPlaceholders): letters of the case of the start's vowel, for the
+//  contexts of the rules applying before it to see what ICU's see there (the
+//  source); the placeholders are outside the filters of the group (in a mask
+//  of their own, the first of the masks), and become the letters after it.
+//  Each condition of a run that depends on how it ends is computed at its end
+//  and shifted back to its start (IndexedShiftBack); the number of letters of
+//  each start is counted among the roughs taken (compressed: those of a start
+//  follow one another, from its first), and shifted back to the start (up to
+//  65 letters a start).
+StreamSet * RulePipelineBuilder::frontLettersBegin(const ldml::TransformStep & step, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    const ldml::FrontLetterRevisits & f = step.frontLetters;
+    FrontLetterLayout L;
+    auto revisitedAs = [&](const UCD::UnicodeSet & vowels) {
+        UCD::UnicodeSet chars;
+        for (const auto & r : f.revisits) if (vowels.contains(r.second)) chars.insert(r.first);
+        return chars;
+    };
+    std::vector<UCD::UnicodeSet> optionals, groupVowels;
+    for (const ldml::FrontLetterVowel & v : f.upper) {
+        size_t g = 0;
+        while (g < optionals.size() && !(optionals[g] == v.optional)) g++;
+        if (g == optionals.size()) {
+            optionals.push_back(v.optional);
+            groupVowels.emplace_back();
+        }
+        groupVowels[g].insert(v.upper);
+    }
+    L.groups = static_cast<unsigned>(optionals.size());
+    UCD::UnicodeSet iotaSet;
+    if (!f.iotaFirsts.empty()) iotaSet.insert(f.iota);
+    std::vector<UCD::UnicodeSet> sets = {UCD::UnicodeSet(f.mark), f.vowels, f.lowerVowels, f.ends, f.letters, f.letters - f.vowels,
+                                         f.accents, f.lowers, f.iotaSkip, iotaSet, f.iotaFirsts, revisitedAs(f.vowels),
+                                         revisitedAs(f.vowels - f.lowerVowels)};
+    for (unsigned k = 0; k < L.groups; k++) {
+        L.groupHasMark.push_back(f.iotaFirsts.empty() || optionals[k].contains(f.iotaMark));
+        sets.push_back(groupVowels[k] + revisitedAs(groupVowels[k]));
+        sets.push_back(optionals[k]);
+    }
+    for (const ldml::FrontLetterVowel & v : f.upper) {
+        const UCD::UnicodeSet upper(v.upper);
+        sets.push_back(upper + revisitedAs(upper));
+        L.lowered.push_back(v.lower);
+    }
+    StreamSet * const Classes = classes(sets, U21);
+    //  The conditions of the runs, at their starts.
+    StreamSet * const SegIdx = P.CreateStreamSet(1), * const SegMark = P.CreateStreamSet(1);
+    StreamSet * const AccIdx = P.CreateStreamSet(1), * const AccMark = P.CreateStreamSet(1);
+    StreamSet * const IotaIdx = P.CreateStreamSet(1), * const IotaMark = P.CreateStreamSet(1);
+    StreamSet * const LateIdx = P.CreateStreamSet(1), * const LateMark = P.CreateStreamSet(L.groups);
+    P.CreateKernelCall<FrontLetterScan>(L, Classes, SegIdx, SegMark, AccIdx, AccMark, IotaIdx, IotaMark, LateIdx, LateMark);
+    auto shiftBack = [&](StreamSet * index, StreamSet * marks) {
+        StreamSet * const shifted = P.CreateStreamSet(marks->getNumElements());
+        P.CreateKernelCall<IndexedShiftBack>(index, marks, shifted);
+        return shifted;
+    };
+    StreamSet * const Flags = P.CreateStreamSet(3 + L.groups);
+    P.CreateKernelCall<FrontLetterFlags>(L, Classes, shiftBack(SegIdx, SegMark), shiftBack(AccIdx, AccMark),
+                                         shiftBack(IotaIdx, IotaMark), shiftBack(LateIdx, LateMark), Flags);
+    StreamSet * const Rdel = P.CreateStreamSet(1), * const NormIdx = P.CreateStreamSet(1), * const Dec = P.CreateStreamSet(6);
+    P.CreateKernelCall<FrontLetterDecisions>(L, Classes, Flags, Rdel, NormIdx, Dec);
+    SHOW_STREAM(Rdel);
+    //  The counts, among the roughs taken, then at the starts.
+    constexpr unsigned CountBits = 7;
+    StreamSet * const K = P.CreateStreamSet(3), * const NF = P.CreateStreamSet(1);
+    FilterByMask(P, Rdel, Dec, K, 2);
+    FilterByMask(P, Rdel, Dec, NF, 5);
+    StreamSet * const RunIdx = P.CreateStreamSet(6);
+    P.CreateKernelCall<RunIndex>(NF, RunIdx, nullptr, RunIndex::Kind::RunOf1, RunIndex::Numbering::RunOnly);
+    StreamSet * const Index = P.CreateStreamSet(1), * const Mark = P.CreateStreamSet(CountBits);
+    StreamSet * const Direct = P.CreateStreamSet(1), * const Letters = P.CreateStreamSet(2);
+    P.CreateKernelCall<FrontLetterCounts>(K, NF, RunIdx, Index, Mark, Direct, Letters);
+    StreamSet * const CountF = P.CreateStreamSet(CountBits);
+    OrCombine(P, shiftBack(Index, Mark), Direct, CountF);
+    StreamSet * const CountAtF = P.CreateStreamSet(CountBits);
+    SpreadByMask(P, Rdel, CountF, CountAtF);
+    StreamSet * const Lowered = P.CreateStreamSet(21), * const Counts = P.CreateStreamSet(CountBits);
+    P.CreateKernelCall<FrontLetterLowered>(L, U21, Classes, Dec, shiftBack(NormIdx, CountAtF), Lowered, Counts);
+    SHOW_BIXNUM(Counts);
+    //  The roughs taken deleted, and the placeholders inserted.
+    StreamSet * const Keep = P.CreateStreamSet(1);
+    Invert(P, Rdel, Keep);
+    StreamSet * const Kept = P.CreateStreamSet(21), * const KeptCounts = P.CreateStreamSet(CountBits);
+    FilterByMask(P, Keep, Lowered, Kept);
+    FilterByMask(P, Keep, Counts, KeptCounts);
+    filterMasks(Keep);
+    StreamSet * const SpreadMask = P.CreateStreamSet(1);
+    InsertionSpreadMask(P, KeptCounts, SpreadMask, kernel::InsertPosition::Before);
+    StreamSet * const Spread = P.CreateStreamSet(21);
+    SpreadByMask(P, SpreadMask, Kept, Spread);
+    for (StreamSet *& mask : mMasks) {
+        StreamSet * const spread = P.CreateStreamSet(1);
+        SpreadByMask(P, SpreadMask, mask, spread);
+        mask = spread;
+    }
+    StreamSet * const Inserted = P.CreateStreamSet(1);
+    Invert(P, SpreadMask, Inserted);
+    StreamSet * const SpreadLetters = P.CreateStreamSet(2);
+    SpreadByMask(P, Inserted, Letters, SpreadLetters);
+    StreamSet * const Filled = P.CreateStreamSet(21);
+    P.CreateKernelCall<FrontLetterFill>(SpreadMask, Spread, SpreadLetters, Filled);
+    SHOW_BIXNUM(Filled);
+    mMasks.insert(mMasks.begin(), SpreadMask);
+    mFrontLetters = {f.lowerLetter, f.upperLetter};
+    return Filled;
+}
+
+//  The placeholders of the front-letter revisits (outside the first mask) as
+//  their letters, within the filters (as the replacements of the roughs).
+StreamSet * RulePipelineBuilder::frontLettersEnd(const ldml::TransformStep & step, StreamSet * U21) {
+    PipelineBuilder & P = mP;
+    StreamSet * const front = mMasks.front();
+    mMasks.erase(mMasks.begin());
+    StreamSet * const Placed = P.CreateStreamSet(1);
+    Invert(P, front, Placed);
+    StreamSet * const Result = P.CreateStreamSet(21);
+    P.CreateKernelCall<FrontLetterPlace>(mFrontLetters.first, mFrontLetters.second, U21, Placed, Result);
+    for (StreamSet *& mask : mMasks) mask = combine(mask, Placed, true);
+    return Result;
+}
+
 StreamSet * RulePipelineBuilder::prefixRunsGroup(const ldml::TransformStep & step, StreamSet * U21) {
     PipelineBuilder & P = mP;
     //  The families (by P), each with its texts and the index of their A.
@@ -8830,6 +9376,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
             if (step.filter) popFilter();
         } else {
             const size_t kernels = mP.getNumOfKernelCalls();
+            if (step.hasFrontLetters) U21 = frontLettersBegin(step, U21);
             if (!step.chainRevisitRules.empty()) U21 = chainRevisitsGroup(step, U21);
             if (!step.markRunEditRules.empty()) U21 = markRunEditsGroup(step, U21);
             if (!step.prefixRuns.empty()) U21 = prefixRunsGroup(step, U21);
@@ -8837,6 +9384,7 @@ StreamSet * RulePipelineBuilder::applyAnalysis(const TransformAnalysis & a, Stre
                 U21 = conversionGroup(step, U21);
             }
             if (!step.deferred.empty()) U21 = deferredRules(step, U21);
+            if (step.frontLettersEnd) U21 = frontLettersEnd(step, U21);
             if (outermost && groupRules(step) > 0) mGroupCounts.push_back({groupRules(step), mP.getNumOfKernelCalls() - kernels});
         }
     }

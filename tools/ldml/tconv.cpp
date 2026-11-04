@@ -3092,9 +3092,8 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
     }
     const bool needCoverage = (step.coverStringRules || hasConvertedSubgroup(step, outcomes)) && changingMappings;
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
-        FusedContexts before, after;
-        if (s.engineBefore && fusedContexts(s.engineBefore, true, before, true) && fusedContexts(s.engineAfter, false, after)
-                && convertedContextMatters(before, outcomes)) {
+        FusedContexts before;
+        if (s.engineBefore && fusedContexts(s.engineBefore, true, before, true) && convertedContextMatters(before, outcomes)) {
             llvm::outs() << "    before context matched against the converted text: [" << s.contextKey << "]\n";
         }
     }
@@ -3150,7 +3149,7 @@ static void printBeforeContextNotes(const ldml::TransformStep & step) {
     }
     for (const ldml::CharMapSubgroup & s : step.subgroups) {
         FusedContexts fusedBefore, fusedAfter;
-        if (s.before == nullptr || (fusedContexts(s.engineBefore, true, fusedBefore, true) && fusedContexts(s.engineAfter, false, fusedAfter))) continue;
+        if (s.before == nullptr || fusedContexts(s.engineBefore, true, fusedBefore, true)) continue;
         const std::vector<ldml::PatternItem> items = ldml::patternItems(s.before);
         const bool closedForm = items.size() == 2 && !items[0].repeated && items[1].repeated;
         bool changes = false;
@@ -3211,10 +3210,15 @@ struct FusedStringRule {
 //  A subgroup of single-character rules: matched in the kernel, with its
 //  contexts, or (match >= 0) given by an input stream of the positions where
 //  its rules match.  Its rules apply there within Allowed (or the mask).
+//  A subgroup whose before context is matched against the converted text, but
+//  whose after context is not a fused context (an unbounded repetition), may
+//  have the positions of its characters where its after context matches given
+//  instead (afterMatch, with no after context).
 struct FusedSubgroup {
     FusedContexts before{FusedContext()}, after{FusedContext()};
     std::vector<ldml::CharMapping> mappings;
     int match = -1;
+    int afterMatch = -1;
     bool converted = false;     // as for FusedStringRule
 };
 
@@ -3402,7 +3406,7 @@ struct FusedLayout {
             }
         }
         for (const FusedSubgroup & g : c.subgroups) {
-            if (g.match < 0) {
+            if (g.match < 0 && g.afterMatch < 0) {
                 for (const FusedContext & a : g.after) lookahead = std::max<unsigned>(lookahead, a.size());
             }
             for (const ldml::CharMapping & m : g.mappings) {
@@ -3621,7 +3625,7 @@ static std::vector<UCD::UnicodeSet> fusedClassSets(const FusedRulesConfig & c) {
         if (g.match < 0) {
             add(plan.all);
             addContext(g.before);
-            addContext(g.after);
+            if (g.afterMatch < 0) addContext(g.after);
         }
         for (const UCD::UnicodeSet & set : plan.mux) add(set);
         for (const auto & position : plan.bitSets) {
@@ -3828,7 +3832,7 @@ private:
                 s += source(g.match);
             } else {
                 appendContext(s, g.before);
-                appendContext(s, g.after);
+                if (g.afterMatch >= 0) s += "a" + source(g.afterMatch); else appendContext(s, g.after);
             }
             if (g.converted) s += "c";
             for (const ldml::CharMapping & m : g.mappings) {
@@ -3952,8 +3956,10 @@ void FusedRules::generatePabloMethod() {
     std::vector<PabloAST *> ats;
     for (const FusedSubgroup & g : mConfig.subgroups) {
         const FusedSubgroupPlan plan(g);
+        const FusedContexts & before = (correction && g.converted) ? FusedContexts{FusedContext()} : g.before;
         PabloAST * at = g.match >= 0 ? source(g.match)
-                        : pb.createAnd(classAt(0, plan.all), contexts((correction && g.converted) ? FusedContexts{FusedContext()} : g.before, g.after, 1));
+                        : g.afterMatch >= 0 ? pb.createAnd(source(g.afterMatch), contexts(before, FusedContexts{FusedContext()}, 1))
+                        : pb.createAnd(classAt(0, plan.all), contexts(before, g.after, 1));
         if (allowed && !mConfig.groupCoverage) at = pb.createAnd(at, allowed);
         ats.push_back(at);
     }
@@ -8215,10 +8221,18 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
             FusedSubgroup fg;
             fg.mappings = maps[g];
             FusedContexts starBefore;
-            if (fusedContexts(subgroup.engineAfter, false, fg.after) && fusedContexts(subgroup.engineBefore, true, starBefore, true)
-                    && convertedContextMatters(starBefore, outcomes)) {
+            const bool fusedAfter = fusedContexts(subgroup.engineAfter, false, fg.after);
+            if (fusedContexts(subgroup.engineBefore, true, starBefore, true) && convertedContextMatters(starBefore, outcomes)) {
                 fg.before = starBefore;
                 fg.converted = true;
+                if (!fusedAfter) {
+                    //  (The after context, matched by the engine, in the text.)
+                    UCD::UnicodeSet all;
+                    for (const ldml::CharMapping & m : maps[g]) all = all + m.chars;
+                    fg.after = {FusedContext()};
+                    fg.afterMatch = static_cast<int>(config.sources.size());
+                    config.sources.push_back(FusedMatchSource{matchPositions(nullptr, subgroup.engineAfter, {all}, U21), 0});
+                }
             } else if (fusedContexts(subgroup.engineBefore, true, fg.before) && fusedContexts(subgroup.engineAfter, false, fg.after)) {
                 fg.converted = false;
             } else {
@@ -8531,12 +8545,20 @@ StreamSet * RulePipelineBuilder::conversionGroup(const ldml::TransformStep & ste
                     //  (With insertion rules, a before context may also see the texts
                     //  inserted.)
                     FusedContexts starBefore, after;
-                    if (correct && !yields(g) && subgroup.engineBefore && fusedContexts(subgroup.engineAfter, false, after)
+                    if (correct && !yields(g) && subgroup.engineBefore
                             && fusedContexts(subgroup.engineBefore, true, starBefore, true)
                             && (!step.insertions.empty() || convertedContextMatters(starBefore, outcomes))) {
                         fg.before = starBefore;
-                        fg.after = after;
                         fg.converted = true;
+                        if (fusedContexts(subgroup.engineAfter, false, after)) {
+                            fg.after = after;
+                        } else {
+                            //  (The after context, matched by the engine, in the text.)
+                            UCD::UnicodeSet all;
+                            for (const ldml::CharMapping & m : maps[g]) all = all + m.chars;
+                            fg.afterMatch = static_cast<int>(correction.sources.size());
+                            correction.sources.push_back(FusedMatchSource{matchPositions(nullptr, subgroup.engineAfter, {all}, U21), 0});
+                        }
                         correction.subgroups.push_back(std::move(fg));
                         continue;
                     }

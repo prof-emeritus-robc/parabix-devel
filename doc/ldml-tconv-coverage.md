@@ -145,7 +145,19 @@ several sets moved together, and a run within a text split with a marker:
 Zawgyi-my is implementable (422), its 93 CLDR test cases pass, and it is
 identical to ICU on 20,000 random lines of its range; W3 is needed by 2
 (Grek-Latn, Latn-Grek, with W6) and alone blocks none. Replanning all 453
-transforms changes only Zawgyi-my.*
+transforms changes only Zawgyi-my. Then fa-fa_FONIPA's before context
+capturing a set with strings, expanded one rule per string, longest first
+(`3987326eb`): W5 is needed by none, and W6 alone blocks fa-fa_FONIPA. Then
+Greek-Latin's rough breathing as front-letter revisits (`3471879aa`), and
+before contexts with repetitions matched against the converted text when their
+after contexts, with repetitions too, are matched by the regular expression
+engine (`65350b3ce`; `--update --only` the 19 transforms concerned):
+Grek-Latn is implementable (423). It has no CLDR test data; on 50,000 random
+lines it differs from ICU on 2, an iota subscript before a macron, out of
+canonical order, at the end of a text (ICU's own normalization). The CLDR test
+results of the 18 transforms with such contexts are unchanged, and
+Grek-Latn/UNGEGN is identical to ICU on its 30,000 random lines (from 15
+differences, its `ͺ` before σ).*
 
 This report covers:
 
@@ -166,8 +178,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 422 (99%) |
-| …of which public (not `visibility="internal"`) | 393 | 390 (99%) |
+| Transforms defined by CLDR files (380 files) | 425 | 423 (100%) |
+| …of which public (not `visibility="internal"`) | 393 | 391 (99%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -262,11 +274,13 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 - **Remaining work.** By the number of transforms each item alone unblocks:
   - W3 variable-length texts: none alone (Latin-ThaiLogical and Latn-Thai are
     implementable with mark run edits left in their group, cy-cy_FONIPA with
-    capture rules over sets with strings, and Zawgyi-my with runs split, §5);
-  - W6 revisits neither composed nor prefix runs: none alone (it-am, it-ja,
-    ja_Latn-ko and ja_Latn-ru are implementable, §5);
-  - W5 back-references: 2 (sk-ja and sk_FONIPA-ja, whose W6 problems prefix
-    runs solved; fa-fa_FONIPA also needs W3 and W6);
+    capture rules over sets with strings, Zawgyi-my with runs split, and
+    Grek-Latn with front-letter revisits, §5; Latn-Grek also needs W6);
+  - W6 revisits neither composed nor prefix runs: 1 (fa-fa_FONIPA's
+    `([َ ِ ُ])ّ → ّ | $1`; it-am, it-ja, ja_Latn-ko and ja_Latn-ru are
+    implementable, §5);
+  - W5 back-references: none (fa-fa_FONIPA's copy of a set with strings is
+    expanded, §5);
   - W8 built-ins: none (Thai-Latn's `Any-BreakInternal` is applied by ICU);
   - W7 parser semantics: none, with the local CLDR fixes.
 
@@ -275,9 +289,9 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          422  ████████████████████████████████████████
+now                          423  ████████████████████████████████████████
 + W6 revisit                 424  ████████████████████████████████████████
-+ W5 captures/functions      425  ████████████████████████████████████████
++ W3 variable-length text    425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
 
@@ -494,7 +508,10 @@ Implementable now:
 - with leading runs split (also in blocks, and before a rule matching at their
   last character), run rules with after contexts, capture rules selected by
   walks of several runs, regions of several sets moved together, and runs
-  within texts split with a marker: Zawgyi-my.
+  within texts split with a marker: Zawgyi-my;
+- with front-letter revisits (the rough breathing's letters written before the
+  runs of vowels), and before contexts with repetitions matched against the
+  converted text with their after contexts matched by the engine: Grek-Latn.
 
 The per-transform status is in the table.
 
@@ -781,12 +798,23 @@ is skipped (within a position's converted text, and across positions whose
 converted text is all in the set, or deleted, by `MatchStar`), and the first
 other character must be in the item beyond it.
 
-All the before contexts of the implementable transforms that their conversions
-may change are now matched against the converted text: no transform has the
-warning of `tconv --plan`. Matching only some of them against the converted text
-is not safe: rules whose contexts `DisambiguateOrder` made complementary must be
-matched against the same text, or neither may apply (ky-ky_FONIPA left `к`
-unconverted in words like `бисидк` until its repetitions were matched too).
+A rule whose before context can be matched against the converted text but
+whose after context has a repetition too (`$ignore [:Uppercase_Letter:] {
+$rough } $ignore [^…]`, from `DisambiguateOrder`) was matched by the regular
+expression engine, both contexts in the text itself (`65350b3ce`); its after
+context is now matched by the engine (the positions of its characters where it
+holds, given to the correction kernel), and its before context against the
+converted text, as for insertion rules. Matching only some of them against the
+converted text is not safe: rules whose contexts `DisambiguateOrder` made
+complementary must be matched against the same text, or neither may apply
+(ky-ky_FONIPA left `к` unconverted in words like `бисидк` until its
+repetitions were matched too; Greek-Latin left a rough breathing after a
+deleted smooth breathing, `Υ̓̔`, until these after contexts were). Ten
+implementable transforms keep the warning of `tconv --plan`, for before
+contexts that are not fused (more than one repetition, as lt-Title's
+`[:softdotted:] […]* […]*`, or several items beyond a repetition): Hans-Hant,
+Latin-InterIndic, Latn-Ethi/SERA, Latn-Grek/UNGEGN, Zawgyi-my, it-am, it-ja,
+und_FONIPA-ar, lt-Title and nl-Title.
 
 **Tested against ICU** (rules applied by `createFromRules`): 27 rule sets with
 deletions, chains, expansions, fallback rules, selected and covered string rules,
@@ -1101,9 +1129,9 @@ those of invoked transforms).
 <!-- coverage:work-items -->
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
-| W3 variable-length texts | 2 | 0 | M–L (the rest) |
-| W6 text to revisit, not composed | 3 | 0 | L (with W3) |
-| W5 back-references | 1 | 0 | M |
+| W3 variable-length texts | 1 | 0 | M–L (the rest) |
+| W6 text to revisit, not composed | 2 | 1 | L (with W3) |
+| W5 back-references | 0 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 0 | 0 | M |
 | W4 insertion rules (with string rules) | 0 | 0 | M |
@@ -1341,6 +1369,34 @@ blocked by other items:
     `([:lo:]) ([:zs:]+) ([:lo:]) → | $1 ⁄⁂⁄ $2 $3`.
 
   Both are W3 cases.
+
+**Front-letter revisits** (`3471879aa`, `ldml::FrontLetterRevisits`). Greek-
+Latin's 16 rough breathing rules write H or h before a run of vowels and delete
+the rough breathing after it, revisiting the run (`($gvowel+ $ddotmac?) $rough
+→ H | $1`, `Α ($glower $macron?) $rough → H | α $1`): ICU applies them again at
+the same position while they match, each pass taking the next rough breathing,
+so that all the letters precede the run (`αωωἑἁν → hhaōōean`), the letter of
+each pass chosen anew (`ἱὝ → hHiÚ`). The family is recognised by its form and
+set aside before revisits are composed (the iota subscript rules around it then
+compose), and applied before the rest of its group, all at once: the passes of a
+start take the first rough breathing after it and every one up to the first
+blocker after the start (a character other than a vowel, a rough breathing or a
+diaeresis or macron, or one after a diaeresis or macron), so that the starts are
+the positions where a rule of the family applies first in the source, but for
+those with the same first rough breathing as one before, or reached by one
+before with no blocker between; two further starts arise from the rough
+breathings the passes delete (an uppercase vowel followed by them, a lowercase
+consonant and a rough breathing, and `ϵ` after a start by the second form).
+Conditions that depend on how a run ends are computed at its end and shifted
+back to its start (`IndexedShiftBack`); the letters of each start are counted
+among the rough breathings taken. The rest of the group sees the text without
+them, the vowels lowercased by the first forms, and before each start its
+letters as placeholders (Latin letters of the case of the start's vowel, outside
+the filters, so that the contexts of the rules applying before it see what
+ICU's see), which become H and h after the group's last step (the planner splits
+Greek-Latin's group in three, joined by `:: Null ;`). The decisions were checked
+against ICU's passes, rule by rule, on 50,000 random lines. Latn-Grek's mirror
+rules (`h ($evowel …) → | $1 $rough`) are not covered.
 
 Prefix runs then made 12 more transforms implementable (the ten Ethi-Latn
 romanizations, ro-ja and ro_FONIPA-ja), and removed the W6 problems of sk-ja
@@ -1656,9 +1712,11 @@ string: `ldml::EnumerateRepeatedCaptures` replaces it by a rule for each
 character of the set, in order (`bː → bb`, `cː → cc`, …; for each combination
 of the characters of such captures, at most 64), where the references are items
 of the result (not within function calls). This made sk_FONIPA-ja and sk-ja
-implementable; fa-fa_FONIPA alone still needs W5 (the copy of a capture of a
-set with strings from its before context, `([$IPA_CONSONANT$VOWEL\|]) { ّ →
-$1`, with its W6 rule `([َ ِ ُ])ّ → ّ | $1`).
+implementable; fa-fa_FONIPA needed W5 for the copy of a capture of a set with
+strings from its before context, `([$IPA_CONSONANT$VOWEL\|]) { ّ → $1`, now
+expanded one rule per string, longest first (`3987326eb`,
+`ldml::ExpandContextCaptureStrings`, as ICU takes the longest string ending
+at the position); its W6 rule `([َ ِ ُ])ّ → ّ | $1` remains.
 
 **Unreferenced captures** are removed before the other capture simplifications
 (`ldml::RemoveUnreferencedCaptures`, `9043a6b5b`, with `re::removeUnneededCaptures`):
@@ -1692,9 +1750,8 @@ contexts of the deferred rules (seeing the converted text) must be sets that
 the other rules' changes cannot tell apart. Kana-Latn, Hira-Latn and Jpan-Latn
 are implementable.
 
-W5 now needs only back-references, in 3 transforms, none of which it alone
-blocks: fa-fa_FONIPA (`([$IPA_CONSONANT$VOWEL\|]) { ّ → $1`, a copy of a set
-with strings, also W3 and W6), sk_FONIPA-ja and sk-ja (also W6).
+W5 is now needed by none: the back-references of sk_FONIPA-ja and sk-ja are
+enumerated (above), and fa-fa_FONIPA's copy of a set with strings expanded.
 
 **W4 insertion rules** (§4.2) are implemented, and needed by none. In a group
 with string rules, an insertion `B { } A → I` is folded into the rules whose
@@ -1717,7 +1774,8 @@ whose before contexts are matched against the converted text are now applied
 by the whole-group correction kernel, after the capture rules (they were
 matched against the text itself: `ͺμπΕ`), and no single-character rule applies
 at the start of a capture rule's match (`υ → y`, whose context excludes the υ
-rules' in the converted text). Grek-Latn still needs W3 and W6.
+rules' in the converted text). Grek-Latn is now implementable (front-letter
+revisits, §5).
 
 **W10 engine lookaheads.** cy-cy_FONIPA's after contexts `$cons* $end` repeat
 `$cons`, a set with strings (`{m̥}{d͡ʒ}`). ICU matches it possessively, taking
@@ -1792,16 +1850,16 @@ The per-transform table lists the problem classes of every transform.
 2. **W3 and W6.** Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
-   neither composed nor prefix runs (3 transforms, none blocked by W6 alone:
-   Grek-Latn and Latn-Grek with W3, fa-fa_FONIPA with W5). Before contexts with
-   repetitions translated to the text itself, as for the capture rules
-   (Grek-Latn/UNGEGN's `$afterLetter { σ` after a deleted `ͺ`).
+   neither composed nor prefix runs (2 transforms: fa-fa_FONIPA, which W6 alone
+   blocks, needing the whole-group correction with capture rules; Latn-Grek
+   with W3, whose rough breathing rules mirror Greek-Latin's front-letter
+   revisits). Before contexts with more than one repetition matched against
+   the converted text (§3.1: ten implementable transforms with the warning).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
 4. **W7.** Small; it depends on whether to adopt the proposed CLDR fixes. With
    them (`~/cldr`, as in this run), W7 blocks nothing.
-5. **W5 back-references.** The copy of a set with strings (fa-fa_FONIPA), with
-   W6 in fa-fa_FONIPA; and the deferred rules exact for
+5. **Deferred rules.** The deferred rules exact for
    chains of any length (a fixpoint rather than rounds, with buffer bounds that
    do not compound).
 6. **Built-ins and pipeline size.**
@@ -1896,6 +1954,8 @@ tconv on every implementable transform.
 | `8f13868d4` | insertion rules folded into the rules before them; before contexts of capture rules translated from the converted text; converted contexts by capture rules: Grek-Latn/UNGEGN: 420 |
 | `86cf1f797`, `06ce8fcce` | lookahead chains over possessive repetitions of sets with strings (guarded strings, W10); capture rules over such sets, with before contexts unchanged by their insertions; search and replace keeping no position after the text: cy-cy_FONIPA: 421 |
 | `3d94638d0`, `5032fb2ca`, `b374fdbca`, `f4ca44892` | leading runs split (in blocks, before a rule matching at their last character); run rules with after contexts; walks of several runs; regions of several sets moved together; runs within texts split with a marker: Zawgyi-my: 422 |
+| `3987326eb` | before contexts capturing a set with strings expanded, longest first: fa-fa_FONIPA no longer needs W5 |
+| `3471879aa`, `65350b3ce` | front-letter revisits (the rough breathing); before contexts with repetitions matched against the converted text with their after contexts matched by the engine: Grek-Latn: 423 |
 
 ## Reproducing
 

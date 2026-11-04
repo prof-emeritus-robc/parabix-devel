@@ -806,6 +806,32 @@ std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned
 //  (Zawgyi-my's ေ ့+ ($consonant) → $1 ေ့.)  split counts the rules split.
 std::vector<Rule *> SplitMiddleRuns(const std::vector<Rule *> & rules, unsigned * split = nullptr);
 
+//  Run moves: a forward conversion rule (P) S → S | $1 (P a set, S one
+//  character, no contexts), which ICU applies again and again as P is
+//  revisited before each S of a run, writing the run and then converting P
+//  with what follows the run.  In its place, for each rule E after it in its
+//  group whose text P' T may begin with a character of P (in order),
+//  P'&P } S+ T C → M (C E's after context, M a mark, a noncharacter from
+//  RunMoveMark on, one for each T and result R of E), then, for a P that no
+//  such rule converts, P } S+ → M with the result P.  First in the group,
+//  M S+ { T → R, or, for an empty T, M S* { S } S → S and M S* { S → S R
+//  (at the last S of the run: ICU inserts nothing at the end of the text);
+//  M → ; in a group after it.  The group's own selection thus decides where
+//  ICU reaches P, and no capture rules are added.  Requires: no global
+//  filter; no rule before it in the group may begin with a character of P,
+//  and no other rule with a character of S, or revisit text; the rules E have
+//  no before contexts, fixed nonempty results, texts beginning with a set,
+//  and T not beginning with S; no before context of the group may see an S
+//  followed by the first character of a result R (where it could reach M).
+//  (fa-fa_FONIPA's ([َ-ِ]) ّ → ّ | $1, as NFD orders the vowel before the
+//  shadda.)  moved counts the rules replaced.
+std::vector<Rule *> MarkRunMoves(const std::vector<Rule *> & rules, unsigned * moved = nullptr);
+
+//  The marks of MarkRunMoves: supplementary noncharacters (U+1FFFE, U+1FFFF,
+//  U+2FFFE, …), at most RunMoveMarks.
+constexpr unsigned RunMoveMarks = 32;
+inline UCD::codepoint_t RunMoveMark(unsigned k) {return 0x1FFFE + 0x10000 * (k / 2) + (k % 2);}
+
 //  A forward conversion rule whose before context is a capture of a set with
 //  strings alone, as rules in its place, one for each string (the longest
 //  first) and one for the single characters of the set: ICU matches the set

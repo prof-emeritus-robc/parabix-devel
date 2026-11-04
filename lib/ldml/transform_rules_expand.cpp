@@ -12,6 +12,7 @@
 #include <set>
 #include <ldml/transform_rules_printer.h>
 #include <re/adt/adt.h>
+#include <ldml/transform_plan.h>
 #include "charset_analysis.h"
 
 using namespace llvm;
@@ -1150,6 +1151,198 @@ std::vector<Rule *> ExpandContextCaptureStrings(const std::vector<Rule *> & rule
             if (expanded) (*expanded)++;
             out.insert(out.end(), replaced.begin(), replaced.end());
         }
+    }
+    return out;
+}
+
+std::vector<Rule *> MarkRunMoves(const std::vector<Rule *> & rules, unsigned * moved) {
+    //  (Not with a global filter, which the marks would have to pass.)
+    for (const Rule * r : rules) {
+        if (isa<FilterRule>(r)) return rules;
+    }
+    Expander expander;
+    CharSetAnalysis sets;
+    auto itemsOf = [](RE * re) {
+        std::vector<RE *> items;
+        if (Seq * seq = dyn_cast<Seq>(re)) items.assign(seq->begin(), seq->end()); else if (re) items.push_back(re);
+        return items;
+    };
+    //  The characters of a set (or false).
+    auto setChars = [&](RE * re, UCD::UnicodeSet & chars) {
+        std::set<std::u32string> strings;
+        return CharSetAnalysis::isSet(re) && expander.alternatives(re, chars, strings) && strings.empty() && !chars.empty();
+    };
+    //  The rule (P) S → S | $1: P and S, or false.
+    auto runMove = [&](const ConversionRule * c, UCD::UnicodeSet & P, UCD::codepoint_t & s) {
+        const RuleSide * const source = c->getSourceSide(Direction::Forward);
+        const RuleSide * const result = c->getResultSide(Direction::Forward);
+        if (source->hasBeforeContext() || source->hasAfterContext() || !result->hasCursor() || result->getCursorOffset() != 0) return false;
+        const std::vector<RE *> text = itemsOf(source->getText());
+        if (text.size() != 2) return false;
+        const Capture * const capture = dyn_cast<Capture>(text[0]);
+        UCD::UnicodeSet S;
+        if (capture == nullptr || !setChars(capture->getCapturedRE(), P) || !setChars(text[1], S) || S.count() != 1) return false;
+        s = lo_codepoint(*S.begin());
+        std::u32string completed;
+        const std::vector<RE *> revisit = itemsOf(result->getResultToRevisit());
+        return literalString(result->getCompletedResult(), completed) && completed == std::u32string(1, static_cast<char32_t>(s))
+               && revisit.size() == 1 && isa<Reference>(revisit[0]) && cast<Reference>(revisit[0])->getCapture() == capture
+               && !P.contains(s);
+    };
+    std::vector<Rule *> out;
+    unsigned marks = 0;
+    size_t start = 0;
+    while (start < rules.size()) {
+        size_t end = start;
+        while (end < rules.size() && (isa<ConversionRule>(rules[end]) || isa<VariableDefinitionRule>(rules[end]))) end++;
+        if (end == start) {
+            out.push_back(rules[start++]);
+            continue;
+        }
+        std::vector<Rule *> group(rules.begin() + start, rules.begin() + end);
+        start = end;
+        //  The rule (one per group), and the first characters of the others.
+        size_t ci = group.size();
+        UCD::UnicodeSet P;
+        UCD::codepoint_t s = 0;
+        for (size_t i = 0; i < group.size() && ci == group.size(); i++) {
+            const ConversionRule * const c = dyn_cast<ConversionRule>(group[i]);
+            if (c && runMove(c, P, s)) ci = i;
+        }
+        if (ci == group.size()) {
+            out.insert(out.end(), group.begin(), group.end());
+            continue;
+        }
+        struct Move {
+            RE * head;                  // P' & P
+            RE * rest;                  // T (nullptr: empty)
+            RE * after;                 // E's after context
+            std::u32string result;      // R
+        };
+        std::vector<Move> moves;
+        UCD::UnicodeSet converted;      // the characters of P that a rule E always converts
+        std::vector<RE *> befores;      // the before contexts of the group
+        bool ok = true;
+        for (size_t k = 0; k < group.size() && ok; k++) {
+            const ConversionRule * const e = dyn_cast<ConversionRule>(group[k]);
+            if (e == nullptr || k == ci) continue;
+            const RuleSide * const es = e->getSourceSide(Direction::Forward);
+            const RuleSide * const er = e->getResultSide(Direction::Forward);
+            if (es->hasBeforeContext()) befores.push_back(es->getBeforeContext());
+            UCD::UnicodeSet first;
+            bool nullable = false;
+            if (es->getText() == nullptr || !textFirsts(es->getText(), sets, first, nullable) || nullable || first.contains(s) || er->hasCursor()) {
+                ok = false;
+                break;
+            }
+            if (!first.intersects(P)) continue;
+            //  A rule E (after the rule).
+            std::u32string fixed;
+            const std::vector<RE *> etext = itemsOf(withoutCaptures(es->getText()));
+            UCD::UnicodeSet head;
+            if (k < ci || es->hasBeforeContext() || !literalString(er->getText(), fixed) || fixed.empty() || etext.empty()
+                    || !setChars(etext[0], head)) {
+                ok = false;
+                break;
+            }
+            RE * rest = nullptr;
+            if (etext.size() > 1) {
+                rest = makeSeq(etext.begin() + 1, etext.end());
+                UCD::UnicodeSet restFirst;
+                bool restNullable = false;
+                if (!textFirsts(rest, sets, restFirst, restNullable) || restNullable || restFirst.contains(s)) {
+                    ok = false;
+                    break;
+                }
+            } else if (!es->hasAfterContext()) {
+                converted = converted + (head & P);
+            }
+            moves.push_back(Move{makeCC(head & P), rest, es->getAfterContext(), fixed});
+        }
+        //  P } S+ → M with the result P, for the characters no rule E always converts.
+        const UCD::UnicodeSet unconverted = P - converted;
+        if (ok && unconverted.count() > 4) ok = false;
+        for (const auto & range : unconverted) {
+            for (UCD::codepoint_t p = lo_codepoint(range); ok && p <= hi_codepoint(range); p++) {
+                moves.push_back(Move{makeCC(p), nullptr, nullptr, std::u32string(1, static_cast<char32_t>(p))});
+            }
+        }
+        //  No before context may see S followed by the first character of a
+        //  result (an item with S, then one with the character, or with S
+        //  again, repeated).
+        for (RE * before : befores) {
+            const std::vector<PatternItem> items = patternItems(before);
+            for (size_t i = 0; i < items.size() && ok; i++) {
+                if (!items[i].chars.contains(s)) continue;
+                if (i + 1 == items.size()) continue;
+                for (const Move & m : moves) {
+                    if (items[i + 1].chars.contains(m.result[0]) || (items[i].repeated && items[i + 1].chars.contains(s))) ok = false;
+                }
+            }
+        }
+        //  The marks, one for each T and R.
+        auto keyOf = [](const Move & m) {
+            std::string key = m.rest ? printPattern(m.rest) : std::string();
+            for (char32_t ch : m.result) key += "/" + std::to_string(static_cast<unsigned>(ch));
+            return key;
+        };
+        std::map<std::string, UCD::codepoint_t> markOf;
+        for (const Move & m : moves) {
+            const std::string key = keyOf(m);
+            if (markOf.count(key) == 0) {
+                if (marks + markOf.size() >= RunMoveMarks) ok = false; else markOf.emplace(key, RunMoveMark(marks + markOf.size()));
+            }
+        }
+        if (!ok) {
+            out.insert(out.end(), group.begin(), group.end());
+            continue;
+        }
+        RE * const run = makeRep(makeCC(s), 1, Rep::UNBOUNDED_REP);
+        RE * const anyRun = makeRep(makeCC(s), 0, Rep::UNBOUNDED_REP);
+        auto literal = [](const std::u32string & str) {
+            std::vector<RE *> items;
+            for (char32_t ch : str) items.push_back(makeCC(static_cast<UCD::codepoint_t>(ch)));
+            return makeSeq(items.begin(), items.end());
+        };
+        std::vector<Rule *> first, replaced;
+        std::set<UCD::codepoint_t> written;
+        UCD::UnicodeSet used;
+        for (const Move & m : moves) {
+            const std::string key = keyOf(m);
+            const UCD::codepoint_t mark = markOf.at(key);
+            used.insert(mark);
+            //  P' } S+ T C → M, in place.
+            std::vector<RE *> ahead{run};
+            if (m.rest) ahead.push_back(m.rest);
+            if (m.after) ahead.push_back(m.after);
+            replaced.push_back(makeConversionRule(makeRuleSide(nullptr, m.head, makeSeq(ahead.begin(), ahead.end())),
+                                                  Direction::Forward, makeRuleSide(makeCC(mark))));
+            if (!written.insert(mark).second) continue;
+            if (m.rest) {
+                //  M S+ { T → R.
+                first.push_back(makeConversionRule(makeRuleSide(makeSeq({makeCC(mark), run}), m.rest, nullptr),
+                                                   Direction::Forward, makeRuleSide(literal(m.result))));
+            } else {
+                //  M S* { S } S → S, M S* { S → S R.
+                first.push_back(makeConversionRule(makeRuleSide(makeSeq({makeCC(mark), anyRun}), makeCC(s), makeCC(s)),
+                                                   Direction::Forward, makeRuleSide(makeCC(s))));
+                first.push_back(makeConversionRule(makeRuleSide(makeSeq({makeCC(mark), anyRun}), makeCC(s), nullptr),
+                                                   Direction::Forward, makeRuleSide(literal(std::u32string(1, static_cast<char32_t>(s)) + m.result))));
+            }
+        }
+        marks += markOf.size();
+        if (moved) (*moved)++;
+        group.erase(group.begin() + ci);
+        group.insert(group.begin() + ci, replaced.begin(), replaced.end());
+        //  (Variable definitions before the rules that may refer to them.)
+        size_t defs = 0;
+        while (defs < group.size() && isa<VariableDefinitionRule>(group[defs])) defs++;
+        out.insert(out.end(), group.begin(), group.begin() + defs);
+        out.insert(out.end(), first.begin(), first.end());
+        out.insert(out.end(), group.begin() + defs, group.end());
+        out.push_back(makeTransformRule(TransformID("Null")));
+        out.push_back(makeConversionRule(makeRuleSide(makeCC(used)), Direction::Forward, makeRuleSide(makeSeq())));
+        out.push_back(makeTransformRule(TransformID("Null")));
     }
     return out;
 }

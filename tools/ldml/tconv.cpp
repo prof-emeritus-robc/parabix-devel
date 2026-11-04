@@ -662,6 +662,8 @@ TransformAnalysis TransformAnalyzer::analyzeRules(const std::vector<ldml::Rule *
                                                      UCD::UnicodeSet & unchanged, std::string & reason) {
             return evaluateFunction(t, chars, groups, unchanged, reason);
         }, &cstats);
+        //  (Before revisits are composed: see ldml::MarkRunMoves.)
+        rules = ldml::MarkRunMoves(rules);
         ldml::RevisitStats rstats;
         rstats.keepRecords = RevisitReport;
         rules = ldml::ComposeRevisits(rules, &rstats);
@@ -4825,6 +4827,16 @@ struct DeferredConfig {
     unsigned numTails = 0;
     bool masked = false;
     bool written = false;
+    //  Whether a rule deletes its trigger alone (a text of one character, no
+    //  replacement, no copy): the converted text before the next trigger is then
+    //  the same, and a run of triggers is deleted in one round (see DeferredPlan).
+    bool runDeletion(size_t i) const {return textLengths[i] == 1 && replacements[i].empty() && captures[i] < 0;}
+    bool anyRunDeletion() const {
+        for (size_t i = 0; i < textLengths.size(); i++) {
+            if (runDeletion(i)) return true;
+        }
+        return false;
+    }
     unsigned maxCopy() const {
         unsigned m = 0;
         for (size_t k = 0; k < prefix.size(); k++) m = std::max(m, prefix[k] + suffix[k] + (starClass[k] >= 0 ? DeferredMaxRun : 0));
@@ -4843,7 +4855,7 @@ struct DeferredConfig {
         return bits;
     }
     std::string signature() const {
-        std::string sig = std::to_string(numTails) + "t" + (masked ? "m" : "") + (written ? "w" : "");
+        std::string sig = std::to_string(numTails) + "t" + (masked ? "m" : "") + (written ? "w" : "") + (anyRunDeletion() ? "d" : "");
         for (size_t k = 0; k < prefix.size(); k++) {
             sig += "/" + std::to_string(prefix[k]) + "," + std::to_string(suffix[k]) + "," + std::to_string(starClass[k]);
         }
@@ -4868,12 +4880,17 @@ class DeferredPlan final : public pablo::PabloKernel {
 public:
     DeferredPlan(LLVMTypeSystemInterface & ts, DeferredConfig config, const std::vector<StreamSet *> & Matches, StreamSet * Classes,
                  const std::vector<StreamSet *> & Runs, StreamSet * Mask, StreamSet * Written, StreamSet * Count, StreamSet * Info,
-                 StreamSet * Reach)
+                 StreamSet * Reach, const std::vector<StreamSet *> & Bare = {})
     : PabloKernel(ts, "DeferredPlan_" + getStringHash(config.signature()),
                   [&] {
                       Bindings b;
                       for (size_t i = 0; i < Matches.size(); i++) {
                           b.emplace_back("M" + std::to_string(i), Matches[i], FixedRate(1),
+                                         LookAhead(std::max(1u, config.textLengths[i] - 1)));
+                      }
+                      //  (With a rule deleting runs: the matches without the before contexts.)
+                      for (size_t i = 0; i < Bare.size(); i++) {
+                          b.emplace_back("B" + std::to_string(i), Bare[i], FixedRate(1),
                                          LookAhead(std::max(1u, config.textLengths[i] - 1)));
                       }
                       b.emplace_back("Classes", Classes);
@@ -4953,6 +4970,38 @@ protected:
             if (mConfig.captures[i] >= 0) a = pb.createAnd(a, pb.createNot(unknown[mConfig.captures[i]]));
             applied.push_back(a);
             taken = pb.createOr(taken, starts[i]);
+        }
+        //  A rule deleting its trigger alone, applied at a trigger t, leaves the
+        //  converted text before the next trigger as it was: there, it applies
+        //  again (its before context matching again) if its text and after context
+        //  match, and no rule before it applies: one whose text and after context
+        //  match only if they matched at t too (where its before context then did
+        //  not, nor will it there).  So through the run of such triggers after t,
+        //  which are blocked by it (not ready): the shortest of the runs allowed by
+        //  each rule before it.  (A run stopped short is continued in the rounds
+        //  after.)
+        if (mConfig.anyRunDeletion()) {
+            std::vector<PabloAST *> bare;
+            for (size_t i = 0; i < n; i++) {
+                PabloAST * b = getInputStreamSet("B" + std::to_string(i))[0];
+                if (mConfig.textLengths[i] > 1) b = pb.createLookahead(b, mConfig.textLengths[i] - 1);
+                bare.push_back(b);
+            }
+            auto runFrom = [&](PabloAST * starts, PabloAST * through) {
+                return pb.createAnd(pb.createMatchStar(pb.createAdvance(starts, 1), through), through);
+            };
+            for (size_t i = 0; i < n; i++) {
+                if (!mConfig.runDeletion(i)) continue;
+                PabloAST * const base = pb.createAnd(pb.createAnd(triggers, bare[i]), pb.createNot(ready));
+                PabloAST * run = runFrom(applied[i], base);
+                for (size_t j = 0; j < i; j++) {
+                    PabloAST * const known = pb.createAnd(applied[i], bare[j]);
+                    PabloAST * const unknown = pb.createAnd(applied[i], pb.createNot(bare[j]));
+                    PabloAST * const allowed = pb.createOr(runFrom(known, base), runFrom(unknown, pb.createAnd(base, pb.createNot(bare[j]))));
+                    run = pb.createAnd(run, allowed);
+                }
+                applied[i] = pb.createOr(applied[i], run);
+            }
         }
         BixNum copied = bnc.ZeroExtend(bnc.Create(0), Bits);
         BixNum rlen = bnc.ZeroExtend(bnc.Create(0), Bits);
@@ -9293,7 +9342,17 @@ StreamSet * RulePipelineBuilder::deferredRules(const ldml::TransformStep & step,
         StreamSet * const count = P.CreateStreamSet(config.countBits());
         StreamSet * const info = P.CreateStreamSet(step.deferred.size() + 1);
         StreamSet * const reach = P.CreateStreamSet(std::max(1u, config.maxCopy()));
-        P.CreateKernelCall<DeferredPlan>(config, matches, classStreams, runs, mask, textWritten, count, info, reach);
+        //  (One for each distinct text and after context.)
+        std::vector<StreamSet *> bare;
+        if (config.anyRunDeletion()) {
+            std::vector<StreamSet *> byKey;
+            for (size_t key : matchKeys) {
+                const ldml::DeferredRule & d = step.deferred[key];
+                byKey.push_back(matchPositions(nullptr, d.engineAfter, d.text, text));
+            }
+            for (size_t i = 0; i < step.deferred.size(); i++) bare.push_back(byKey[matchOf[i]]);
+        }
+        P.CreateKernelCall<DeferredPlan>(config, matches, classStreams, runs, mask, textWritten, count, info, reach, bare);
         SHOW_BIXNUM(count);
         StreamSet * const region = P.CreateStreamSet(1);
         P.CreateKernelCall<DeferredRegion>(reach, region);

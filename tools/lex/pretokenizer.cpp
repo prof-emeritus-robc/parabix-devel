@@ -1126,11 +1126,139 @@ PreTokenizerResult buildPreTokenizerBoundaries(
     };
 }
 
+// --pretok-byte-domain: the GPT-2 boundaries on the bytes themselves, with no compression to
+// one slot per codepoint and no spreading back. Each class (the 4-bit code) is wanted at two
+// places of a codepoint: at its first byte (this codepoint's class) and at its last byte (so
+// that the previous codepoint's class is Advance(1) from a first byte). UTF8_Decoder leaves
+// the codepoint at its last byte; the lead byte says how far that is (0..3 bytes on), so the
+// first-byte copy is a lookahead of 0..3 selected by the lead byte. Valid UTF-8 assumed (as
+// for HF, which takes a decoded string).
+// Outputs: F (code at first bytes), L (code at last bytes), first, last, and
+// nonspace = InFile(first byte of a non-White_Space codepoint).
+class GPT2ByteClassKernel final : public PabloKernel {
+public:
+    GPT2ByteClassKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * classes,
+                        StreamSet * F, StreamSet * L, StreamSet * first, StreamSet * last, StreamSet * nonspace)
+    : PabloKernel(ts, "GPT2ByteClass",
+                  {Binding{"basis", basis, FixedRate(), LookAhead(1)},
+                   Binding{"classes", classes, FixedRate(), LookAhead(3)}},
+                  {Binding{"F", F}, Binding{"L", L}, Binding{"first", first}, Binding{"last", last},
+                   Binding{"nonspace", nonspace}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> b = getInputStreamSet("basis");
+        std::vector<PabloAST *> c = getInputStreamSet("classes");
+        auto n = [&](PabloAST * x) { return pb.createNot(x); };
+        PabloAST * cont  = pb.createAnd(b[7], n(b[6]));
+        PabloAST * first = pb.createInFile(n(cont));
+        PabloAST * nextCont = pb.createAnd(pb.createLookahead(b[7], 1), n(pb.createLookahead(b[6], 1)));
+        PabloAST * last  = pb.createInFile(n(nextCont));
+        PabloAST * lead  = pb.createAnd(b[7], b[6]);
+        PabloAST * len1  = n(b[7]);
+        PabloAST * len2  = pb.createAnd(lead, n(b[5]));
+        PabloAST * len3  = pb.createAnd(pb.createAnd(lead, b[5]), n(b[4]));
+        PabloAST * len4  = pb.createAnd(pb.createAnd(lead, b[5]), b[4]);
+        std::vector<PabloAST *> F(c.size()), L(c.size());
+        for (unsigned i = 0; i < c.size(); i++) {
+            F[i] = pb.createOr(pb.createOr(pb.createAnd(len1, c[i]), pb.createAnd(len2, pb.createLookahead(c[i], 1))),
+                               pb.createOr(pb.createAnd(len3, pb.createLookahead(c[i], 2)),
+                                           pb.createAnd(len4, pb.createLookahead(c[i], 3))));
+            L[i] = pb.createAnd(c[i], last);
+        }
+        writeOutputStreamSet("F", F);
+        writeOutputStreamSet("L", L);
+        writeOutputStreamSet("first", std::vector<PabloAST *>{first});
+        writeOutputStreamSet("last", std::vector<PabloAST *>{last});
+        PabloAST * spaceF = gpt2DecodeClass(pb, F, 0);
+        writeOutputStreamSet("nonspace", std::vector<PabloAST *>{pb.createInFile(pb.createAnd(first, n(spaceF)))});
+    }
+};
+
+// --pretok-byte-domain: GPT2PretokenBoundaryKernel's rules on bytes, evaluated at first bytes.
+// This codepoint's class: F. The previous codepoint's: Advance(L, 1) (its last byte is the
+// byte before). The next codepoint starts len bytes on (len from the lead byte), so its
+// nonspace is a lookahead of 1..4 selected by the lead byte. The contraction rules only
+// look across ', s, d, m, t, l, v, r, e: one byte each, so codepoint and byte distances agree.
+class GPT2ByteBoundaryKernel final : public PabloKernel {
+public:
+    GPT2ByteBoundaryKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * F, StreamSet * L,
+                           StreamSet * first, StreamSet * last, StreamSet * nonspace, StreamSet * boundary)
+    : PabloKernel(ts, "GPT2ByteBoundary",
+                  {Binding{"basis", basis},
+                   Binding{"F", F, FixedRate(), LookAhead(2)},
+                   Binding{"L", L},
+                   Binding{"first", first}, Binding{"last", last},
+                   Binding{"nonspace", nonspace, FixedRate(), LookAhead(4)}},
+                  {Binding{"boundary", boundary}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> b = getInputStreamSet("basis");
+        std::vector<PabloAST *> F = getInputStreamSet("F");
+        std::vector<PabloAST *> L = getInputStreamSet("L");
+        PabloAST * first = getInputStreamSet("first")[0];
+        PabloAST * last = getInputStreamSet("last")[0];
+        PabloAST * nonspaceIn = getInputStreamSet("nonspace")[0];
+        auto n = [&](PabloAST * x) { return pb.createNot(x); };
+        std::vector<PabloAST *> FAhead[3];
+        auto clsF = [&](unsigned i, unsigned ahead) {
+            std::vector<PabloAST *> & k = FAhead[ahead];
+            if (k.empty()) for (PabloAST * s : F) k.push_back(ahead ? pb.createLookahead(s, ahead) : s);
+            return gpt2DecodeClass(pb, k, i);
+        };
+        // this codepoint (at its first byte)
+        PabloAST * space    = clsF(0, 0);
+        PabloAST * letter   = clsF(2, 0);
+        PabloAST * number   = clsF(3, 0);
+        PabloAST * apos     = clsF(4, 0);
+        PabloAST * nonspace = nonspaceIn;
+        PabloAST * other    = pb.createAnd(nonspace, n(pb.createOr(letter, number)));
+        // the previous codepoint (at its last byte, one byte back)
+        PabloAST * spaceL    = gpt2DecodeClass(pb, L, 0);
+        PabloAST * spaceLitL = gpt2DecodeClass(pb, L, 1);
+        PabloAST * letterL   = gpt2DecodeClass(pb, L, 2);
+        PabloAST * numberL   = gpt2DecodeClass(pb, L, 3);
+        PabloAST * otherL    = pb.createAnd(last, n(pb.createOr(spaceL, pb.createOr(letterL, numberL))));
+        PabloAST * Lp     = pb.createAdvance(letterL, 1);
+        PabloAST * Np     = pb.createAdvance(numberL, 1);
+        PabloAST * Op     = pb.createAdvance(otherL, 1);
+        PabloAST * Wp     = pb.createAdvance(spaceL, 1);
+        PabloAST * SpLitP = pb.createAdvance(spaceLitL, 1);
+        PabloAST * sameClass = pb.createOr(pb.createAnd(letter, Lp),
+                               pb.createOr(pb.createAnd(number, Np), pb.createAnd(other, Op)));
+        // the next codepoint is a non-space: it starts 1..4 bytes on, by this lead byte
+        PabloAST * lead = pb.createAnd(b[7], b[6]);
+        PabloAST * len1 = n(b[7]);
+        PabloAST * len2 = pb.createAnd(lead, n(b[5]));
+        PabloAST * len3 = pb.createAnd(pb.createAnd(lead, b[5]), n(b[4]));
+        PabloAST * len4 = pb.createAnd(pb.createAnd(lead, b[5]), b[4]);
+        PabloAST * nsAhead = pb.createOr(pb.createOr(pb.createAnd(len1, pb.createLookahead(nonspaceIn, 1)),
+                                                     pb.createAnd(len2, pb.createLookahead(nonspaceIn, 2))),
+                                         pb.createOr(pb.createAnd(len3, pb.createLookahead(nonspaceIn, 3)),
+                                                     pb.createAnd(len4, pb.createLookahead(nonspaceIn, 4))));
+        // the rules of GPT2PretokenBoundaryKernel (see there)
+        PabloAST * wsBeforeNS = pb.createAnd(space, nsAhead);
+        PabloAST * spaceStart = pb.createAnd(space, n(Wp));
+        PabloAST * wordStart  = pb.createAnd(nonspace, pb.createAnd(n(sameClass), n(SpLitP)));
+        PabloAST * boundary = pb.createOr(wsBeforeNS, pb.createOr(spaceStart, wordStart));
+        PabloAST * wordApos = pb.createAnd(apos, n(pb.createOr(SpLitP, Op)));
+        PabloAST * single = pb.createAnd(wordApos, clsF(5, 1));
+        PabloAST * dbl    = pb.createAnd(wordApos, pb.createOr(pb.createAnd(clsF(6, 1), clsF(6, 2)),
+                                                               pb.createAnd(clsF(7, 1), clsF(8, 2))));
+        PabloAST * cSuppress = pb.createOr(pb.createAdvance(pb.createOr(single, dbl), 1), pb.createAdvance(dbl, 2));
+        PabloAST * cForce = pb.createOr(pb.createAdvance(single, 2), pb.createAdvance(dbl, 3));
+        boundary = pb.createOr(pb.createAnd(boundary, n(cSuppress)), cForce);
+        writeOutputStreamSet("boundary", std::vector<PabloAST *>{pb.createAnd(boundary, first)});
+    }
+};
+
 // The bytelevel classes of buildPreTokenizerBoundaries (same sets: White_Space, Letter and
 // Number as UnicodePropertyKernelBuilder resolves them), at each UTF-8 sequence's last byte,
 // where UTF8_Decoder leaves the codepoint and UTF8_index marks it. Filtering them by
 // u8index gives exactly what the class kernels compute on the compressed codepoints.
-StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode) {
+StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode, bool byteDomain,
+                                    bool utf8Classes) {
     auto propCC = [](const char * name) {
         auto * pe = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, name);
         pe = cast<re::PropertyExpression>(UCD::linkAndResolve(pe));
@@ -1159,12 +1287,29 @@ StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, 
                re::makeCC(propCC("White_Space"), cps({0x65})),             // b2: White_Space e
                propCC("Letter")};                                          // b3: Letter
     }
-    StreamSet * U21 = P.CreateStreamSet(21, 1);
-    P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
+    StreamSet * classes = P.CreateStreamSet(ccs.size(), 1);
+    if (byteDomain && classCode && utf8Classes) {
+        // --pretok-utf8-classes: the classes compiled to UTF-8 byte sequences, marked at each
+        // sequence's last byte as on the decoded codepoints, with no UTF8_Decoder
+        P.CreateKernelCall<CharClassesKernel>(ccs, BasisBits, classes);
+    } else {
+        StreamSet * U21 = P.CreateStreamSet(21, 1);
+        P.CreateKernelCall<UTF8_Decoder>(BasisBits, U21);
+        P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
+    }
+    if (byteDomain && classCode) {   // --pretok-byte-domain
+        StreamSet * F = P.CreateStreamSet(ccs.size(), 1);
+        StreamSet * L = P.CreateStreamSet(ccs.size(), 1);
+        StreamSet * first = P.CreateStreamSet(1, 1);
+        StreamSet * last = P.CreateStreamSet(1, 1);
+        StreamSet * nonspace = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<GPT2ByteClassKernel>(BasisBits, classes, F, L, first, last, nonspace);
+        StreamSet * byteBoundary = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<GPT2ByteBoundaryKernel>(BasisBits, F, L, first, last, nonspace, byteBoundary);
+        return byteBoundary;
+    }
     StreamSet * u8index = P.CreateStreamSet(1, 1);
     P.CreateKernelCall<UTF8_index>(BasisBits, u8index);
-    StreamSet * classes = P.CreateStreamSet(ccs.size(), 1);
-    P.CreateKernelCall<CharClassesKernel>(ccs, U21, classes);
     StreamSet * classesC = P.CreateStreamSet(ccs.size(), 1);
     FilterByMask(P, u8index, classes, classesC);
     StreamSet * nonspace = P.CreateStreamSet(1, 1);

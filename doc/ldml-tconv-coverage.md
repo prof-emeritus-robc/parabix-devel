@@ -157,7 +157,15 @@ lines it differs from ICU on 2, an iota subscript before a macron, out of
 canonical order, at the end of a text (ICU's own normalization). The CLDR test
 results of the 18 transforms with such contexts are unchanged, and
 Grek-Latn/UNGEGN is identical to ICU on its 30,000 random lines (from 15
-differences, its `ͺ` before σ).*
+differences, its `ͺ` before σ). Then fa-fa_FONIPA's shadda rule as run moves
+with marks, and deferred deletions through runs of triggers in one round
+(`53121b04a`, `--update --only fa-fa_FONIPA Kana-Latn Hira-Latn Latn-Hira
+ja_Hrkt-ja_Latn/BGN`): fa-fa_FONIPA is implementable (424), passes its 2,547
+CLDR test cases, and is identical to ICU on 20,000 random lines and 20,000
+lines with shadda runs of up to 11; Kana-Latn, whose deferred deletions now
+also run in one round, is identical to ICU on 5,000 random lines with runs of
+iteration marks (its kernels 1,053 → 1,149). W6 is needed by Latn-Grek alone
+(with W3).*
 
 This report covers:
 
@@ -178,8 +186,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 | | names | implementable |
 |---|---:|---:|
 | Built-in transforms (UTS #35 / ICU) | 28 | 28 |
-| Transforms defined by CLDR files (380 files) | 425 | 423 (100%) |
-| …of which public (not `visibility="internal"`) | 393 | 391 (99%) |
+| Transforms defined by CLDR files (380 files) | 425 | 424 (100%) |
+| …of which public (not `visibility="internal"`) | 393 | 392 (100%) |
 <!-- /coverage:summary -->
 
 - **Tests.** Of the 284 CLDR test files, 261 belong to implementable transforms.
@@ -276,9 +284,10 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
     implementable with mark run edits left in their group, cy-cy_FONIPA with
     capture rules over sets with strings, Zawgyi-my with runs split, and
     Grek-Latn with front-letter revisits, §5; Latn-Grek also needs W6);
-  - W6 revisits neither composed nor prefix runs: 1 (fa-fa_FONIPA's
-    `([َ ِ ُ])ّ → ّ | $1`; it-am, it-ja, ja_Latn-ko and ja_Latn-ru are
-    implementable, §5);
+  - W6 revisits neither composed nor prefix runs: none alone (Latn-Grek's
+    mirror of Greek-Latin's rough breathing, with W3; fa-fa_FONIPA's
+    `([َ ِ ُ])ّ → ّ | $1` is applied as run moves with marks, and it-am, it-ja,
+    ja_Latn-ko and ja_Latn-ru are implementable, §5);
   - W5 back-references: none (fa-fa_FONIPA's copy of a set with strings is
     expanded, §5);
   - W8 built-ins: none (Thai-Latn's `Any-BreakInternal` is applied by ICU);
@@ -289,9 +298,8 @@ The numbers can be regenerated with `tools/ldml/tconv_coverage.py` (see
 <!-- coverage:chart -->
 ```
 cumulative implementable CLDR-defined transforms (of 425), greedy order
-now                          423  ████████████████████████████████████████
-+ W6 revisit                 424  ████████████████████████████████████████
-+ W3 variable-length text    425  ████████████████████████████████████████
+now                          424  ████████████████████████████████████████
++ W6 revisit                 425  ████████████████████████████████████████
 ```
 <!-- /coverage:chart -->
 
@@ -511,7 +519,10 @@ Implementable now:
   within texts split with a marker: Zawgyi-my;
 - with front-letter revisits (the rough breathing's letters written before the
   runs of vowels), and before contexts with repetitions matched against the
-  converted text with their after contexts matched by the engine: Grek-Latn.
+  converted text with their after contexts matched by the engine: Grek-Latn;
+- with run moves (the shadda after a vowel, written before the vowel's
+  conversion) by marks, and deferred deletions through runs of triggers in
+  one round: fa-fa_FONIPA.
 
 The per-transform status is in the table.
 
@@ -1130,7 +1141,7 @@ those of invoked transforms).
 | work item | needed by | the only blocker of | effort |
 |---|---:|---:|---|
 | W3 variable-length texts | 1 | 0 | M–L (the rest) |
-| W6 text to revisit, not composed | 2 | 1 | L (with W3) |
+| W6 text to revisit, not composed | 1 | 0 | L (with W3) |
 | W5 back-references | 0 | 0 | M |
 | W7 parser semantics (#5, #6) | 0 | 0 | S |
 | W10 engine lookaheads | 0 | 0 | M |
@@ -1397,6 +1408,39 @@ ICU's see), which become H and h after the group's last step (the planner splits
 Greek-Latin's group in three, joined by `:: Null ;`). The decisions were checked
 against ICU's passes, rule by rule, on 50,000 random lines. Latn-Grek's mirror
 rules (`h ($evowel …) → | $1 $rough`) are not covered.
+
+**Run moves** (`53121b04a`, `ldml::MarkRunMoves`). fa-fa_FONIPA's `([َ ِ ُ])ّ → ّ |
+$1` (NFD puts the vowel before the shadda) writes the shadda and revisits the
+vowel, which ICU then matches again, so that the whole run of shaddas is
+written and the vowel converted with what follows the run (`ِّی → ّej`). The
+rule is replaced, before revisits are composed, by a mark for each rule E of
+its group beginning with the vowel (text P T, result R), in the group's order:
+`P } ّ+ T C → M` where the rule was (C E's after context), so that the group's
+own selection decides where ICU reaches the vowel (`اِّ` takes it with the
+alef); first in the group, `M ّ+ { T → R`, or for an empty T, `M ّ* { ّ } ّ →
+ّ` and `M ّ* { ّ → ّR` (the result at the last shadda: ICU inserts nothing at
+the end of a text); and the marks deleted in a group after it. The marks are
+supplementary noncharacters (`RunMoveMark`), one for each T and R (10). The
+rewritten rules give ICU's results for the original ones on 42,547 lines. It
+requires that no rule before the moved one begins with a vowel and no other
+rule with the shadda or with text to revisit, that the rules E have fixed
+nonempty results and no before contexts, and that no before context of the
+group may see a shadda followed by the first character of a result (where it
+could reach a mark). An earlier version composed the move into capture rules,
+`P (ّ+) T → $run R`: the group then selected its string and capture rules
+together, without the correction of its before contexts matched against the
+converted text (52 of the 2,547 CLDR cases differed from ICU).
+
+**Deferred deletions through runs** (`53121b04a`). A deferred rule deleting its
+trigger alone (no replacement, no copy) leaves the converted text before the
+next trigger as it was, so in each round it now also applies through the run
+of triggers after one where it applied, as long as its text and after context
+match there and those of no rule before it do where they did not at the start
+of the run (whose before contexts then failed, and fail again). Runs of more
+than `--deferred-rule-rounds` (8) triggers were left partly undeleted, one per
+round: fa-fa_FONIPA's last group, `([$IPA_CONSONANT$VOWEL\|]) { ّ → $1` and
+`ّ → ;`, kept shaddas after a vowel's run of 9 or more. Kana-Latn's two deletions of
+`ヽ` (without a voicing mark after it) take the same path.
 
 Prefix runs then made 12 more transforms implementable (the ten Ethi-Latn
 romanizations, ro-ja and ro_FONIPA-ja), and removed the W6 problems of sk-ja
@@ -1850,10 +1894,10 @@ The per-transform table lists the problem classes of every transform.
 2. **W3 and W6.** Before contexts that the conversions change in
    MultipleCaptureMultipleReplacement rules (blt-blt_FONIPA,
    Latin-NumericPinyin), captures revisited (Latn-Arab), and the revisits
-   neither composed nor prefix runs (2 transforms: fa-fa_FONIPA, which W6 alone
-   blocks, needing the whole-group correction with capture rules; Latn-Grek
-   with W3, whose rough breathing rules mirror Greek-Latin's front-letter
-   revisits). Before contexts with more than one repetition matched against
+   neither composed nor prefix runs (Latn-Grek, with W3, whose rough breathing
+   rules mirror Greek-Latin's front-letter revisits; fa-fa_FONIPA's are run
+   moves with marks). The whole-group correction of converted before contexts
+   where string and capture rules are selected together. Before contexts with more than one repetition matched against
    the converted text (§3.1: ten implementable transforms with the warning).
 3. **Converted-text contexts in large groups** (§5): the correction for groups
    of more than 256 rules, which affects Latin-InterIndic.
@@ -1956,6 +2000,7 @@ tconv on every implementable transform.
 | `3d94638d0`, `5032fb2ca`, `b374fdbca`, `f4ca44892` | leading runs split (in blocks, before a rule matching at their last character); run rules with after contexts; walks of several runs; regions of several sets moved together; runs within texts split with a marker: Zawgyi-my: 422 |
 | `3987326eb` | before contexts capturing a set with strings expanded, longest first: fa-fa_FONIPA no longer needs W5 |
 | `3471879aa`, `65350b3ce` | front-letter revisits (the rough breathing); before contexts with repetitions matched against the converted text with their after contexts matched by the engine: Grek-Latn: 423 |
+| `53121b04a` | run moves with marks (the shadda after a vowel); deferred deletions through runs in one round: fa-fa_FONIPA: 424 |
 
 ## Reproducing
 

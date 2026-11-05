@@ -1369,6 +1369,21 @@ static cl::opt<bool> TailLongCache(
     "tail-long-cache",
     cl::desc("With --tail-from-bytes: cache the BPE of pretokens over 15 bytes (default off)."),
     cl::init(false));
+// --tail-long-admit=N (with --tail-long-cache): which long pretokens are kept. 0 (default): all.
+// 1: a cut one only when one of its pieces had to merge as a long piece (> 15 bytes); its other
+// pieces are in the vocabulary table or the thread cache after this, so doing it again is cheap.
+// Uncut ones are always kept. 2: any long pretoken only the second time it is seen (a 2^17-bit
+// "seen once" map per thread, cleared after 2^15 first sightings): multi_4MB's long pretokens
+// are 81% distinct, so most stores were never read. 3: those that needed long merging at once,
+// the others on their second sighting (code_4MB's cut long pretokens repeat: 1 made it slower).
+// Runtime only, no cache tag.
+static cl::opt<unsigned> TailLongAdmit(
+    "tail-long-admit",
+    cl::desc("With --tail-long-cache: 0 keep every long pretoken, 1 only those that needed long "
+             "merging, 2 only on their second sighting, 3 those that needed long merging at once "
+             "and the others on their second sighting (default 0)."),
+    cl::init(0));
+static constexpr unsigned kTailLongSeenBits = 17, kTailLongSeenMax = 1u << 15;
 static constexpr unsigned kTailLongMax = 4096;       // longer pretokens always merge
 static constexpr unsigned kTailLongIndexBits = 14;   // 16K slots of 16 bytes
 static constexpr size_t kTailLongArena = size_t(4) << 20;
@@ -1426,6 +1441,8 @@ struct TailScratch {
     std::vector<TailLongSlot> longIndex;
     std::vector<uint8_t> longArena;
     size_t longUsed = 0, longCount = 0;
+    std::vector<uint64_t> longSeen;      // --tail-long-admit=2: hashes seen once
+    size_t longSeenN = 0;
 };
 // --tail-cache-pool: scratches not in use; a thread leases one and returns it as it exits.
 static std::mutex gTailPoolMutex;
@@ -1461,6 +1478,8 @@ static TailScratch & tailScratch() {
             sp->longIndex.assign(size_t(1) << kTailLongIndexBits, TailLongSlot{0, 0, 0});
             sp->longArena.resize(kTailLongArena);
             sp->longUsed = sp->longCount = 0;
+            if (TailLongAdmit >= 2) sp->longSeen.assign(size_t(1) << (kTailLongSeenBits - 6), 0);
+            sp->longSeenN = 0;
         }
         sp->generation = g;
     }
@@ -1789,8 +1808,34 @@ static inline bool tailHard(uint8_t x, uint8_t y) {
     const unsigned k = (unsigned(x) << 8) | y;
     return (gTailHard[k >> 6] >> (k & 63)) & 1;
 }
+// --tail-trigram-split (with --tail-hard-split): more exact cuts in pretokens over 15 bytes.
+// A token covering the spot between bytes i - 1 and i (start p < i < end q) either starts at
+// or before i - 2 and holds the 3 bytes w[i-2..i], or starts at i - 1 and begins with
+// w[i-1..i+1], or is exactly w[i-1..i]. Every token made while merging is a vocabulary token,
+// so when none of the three exists no merge can cross the spot: it is a cut. A hard pair (no
+// token holds w[i-1], w[i]) passes all three. Three bitmaps from the tokens' bytes: trigrams
+// inside tokens and 3-byte token prefixes (2^24 bits = 2 MB each), 2-byte tokens (8 KB).
+// Distinct long misses: bytes left in pieces over 15 bytes, code_4MB 28% → 6%. Runtime only.
+static cl::opt<bool> TailTrigramSplit(
+    "tail-trigram-split",
+    cl::desc("With --tail-hard-split: also cut pretokens over 15 bytes where no token can cover "
+             "the 3 bytes around a spot (default off)."),
+    cl::init(false));
+static std::vector<uint64_t> gTailTri3, gTailPre3;   // bit a << 16 | b << 8 | c
+static uint64_t gTailTok2[1024];                     // bit a << 8 | b: a 2-byte token
+static inline bool tailBit(const uint64_t * m, unsigned k) { return (m[k >> 6] >> (k & 63)) & 1; }
+// A cut between w[j - 1] and w[j] of a pretoken w[0, len) of more than 15 bytes.
+static inline bool tailLongCut(const uint8_t * w, size_t j, size_t len) {
+    if (tailHard(w[j - 1], w[j])) return true;
+    if (!TailTrigramSplit) return false;
+    const unsigned x = w[j - 1], y = w[j];
+    if (tailBit(gTailTok2, x << 8 | y)) return false;
+    if (j >= 2 && tailBit(gTailTri3.data(), unsigned(w[j - 2]) << 16 | x << 8 | y)) return false;
+    if (j + 1 < len && tailBit(gTailPre3.data(), x << 16 | y << 8 | w[j + 1])) return false;
+    return true;
+}
 static inline bool tailHasCut(const uint8_t * w, size_t len) {
-    for (size_t j = 1; j < len; j++) if (tailHard(w[j - 1], w[j])) return true;
+    for (size_t j = 1; j < len; j++) if (tailLongCut(w, j, len)) return true;
     return false;
 }
 // The cuts of a pretoken of len <= 15 bytes from its key (k0: bytes 0..7, k1: bytes 8..14 and
@@ -1862,7 +1907,7 @@ template <unsigned W>
 static size_t tailSplitMerge(const TailPieces & P, const uint8_t * w, size_t len, uint16_t * tt, uint32_t * idx) {
     size_t m = 0, a = 0;
     for (size_t j = 1; j <= len; j++) {
-        if (j < len && !tailHard(w[j - 1], w[j])) continue;
+        if (j < len && !(len > kTailByteKeyMax ? tailLongCut(w, j, len) : tailHard(w[j - 1], w[j]))) continue;
         m += tailPieceMerge<W>(P, w + a, j - a, tt + m, idx + m, uint32_t(a));
         a = j;
     }
@@ -1944,13 +1989,15 @@ static inline uint64_t tailBytesKey(const uint8_t * w, size_t L, uint64_t & k0, 
 // bytes: merged here) or queued for the batch.
 template <unsigned W>
 static bool tailSplitQueue(TailScratch & S, const TailPieces & P, const uint8_t * bytes, size_t s, size_t len,
-                           uint32_t * res, uint64_t * emit, uint32_t cuts = 0) {   // cuts: len <= 15
+                           uint32_t * res, uint64_t * emit, uint32_t cuts = 0,     // cuts: len <= 15
+                           bool * hadLong = nullptr) {                        // set: a piece over 15 bytes
+
     bool queued = false;
     size_t a = 0;
     if (len <= kTailByteKeyMax) cuts |= 1u << len;                  // then j runs over the cuts and len
     for (size_t j = len <= kTailByteKeyMax ? __builtin_ctz(cuts) : 1; j <= len;
          j = len <= kTailByteKeyMax ? (cuts &= cuts - 1, cuts ? __builtin_ctz(cuts) : len + 1) : j + 1) {
-        if (len > kTailByteKeyMax && j < len && !tailHard(bytes[s + j - 1], bytes[s + j])) continue;
+        if (len > kTailByteKeyMax && j < len && !tailLongCut(bytes + s, j, len)) continue;
         const size_t L = j - a;
         const uint8_t * const w = bytes + s + a;
         const uint32_t q = uint32_t(s + a);
@@ -1960,6 +2007,7 @@ static bool tailSplitQueue(TailScratch & S, const TailPieces & P, const uint8_t 
             if (S.t.size() < L) { S.t.resize(L); S.pos.resize(L); }
             size_t m = L;
             for (size_t i = 0; i < L; i++) { S.t[i] = gTailBase[w[i]]; S.pos[i] = uint32_t(i); }
+            if (hadLong) *hadLong = true;
             tailMergeSegment(S.t.data(), S.pos.data(), m);
             for (size_t i = 0; i < m; i++) { res[q + S.pos[i]] = S.t[i]; tailMark(emit, q + S.pos[i]); }
             continue;
@@ -2096,6 +2144,22 @@ static inline uint64_t tailLongHash(const uint8_t * p, size_t len) {
     return (h ^ (h >> 29)) * 0x9E3779B97F4A7C15ull;
 }
 
+// --tail-long-admit: keep the long pretoken of hash h (costly: it had to merge a long piece)?
+static inline bool tailLongAdmit(TailScratch & S, uint64_t h, bool costly) {
+    if (TailLongAdmit == 0) return true;
+    if (TailLongAdmit == 1 || (TailLongAdmit == 3 && costly)) return costly;
+    const unsigned k = unsigned(h) & ((1u << kTailLongSeenBits) - 1);   // the index uses the top bits
+    uint64_t & w = S.longSeen[k >> 6];
+    const uint64_t b = 1ull << (k & 63);
+    if (w & b) return true;
+    w |= b;
+    if (++S.longSeenN > kTailLongSeenMax) {
+        std::fill(S.longSeen.begin(), S.longSeen.end(), 0);
+        S.longSeenN = 0;
+    }
+    return false;
+}
+
 // A pretoken of more than kTailByteKeyMax bytes, bytes[s, s + len): merge it and write its
 // tokens. With --tail-long-cache, look it up first and keep what was merged.
 template <unsigned W>
@@ -2129,8 +2193,10 @@ static void tailLongPretoken(TailScratch & S, const uint8_t * bytes, size_t s, s
     size_t k = len;
     const bool cut = pieces && tailHasCut(bytes + s, len);
     if (cut && TailBatchBPE) {                                      // its pieces, then kept whole
-        const bool queued = tailSplitQueue<W>(S, *pieces, bytes, s, len, res, emit);
-        if (cached) tailPostAdd<W>(S, TailPost{0, 0, h, nullptr, uint32_t(s), uint32_t(len), true}, queued, bytes, res, emit);
+        bool hadLong = false;
+        const bool queued = tailSplitQueue<W>(S, *pieces, bytes, s, len, res, emit, 0, &hadLong);
+        if (cached && tailLongAdmit(S, h, hadLong))
+            tailPostAdd<W>(S, TailPost{0, 0, h, nullptr, uint32_t(s), uint32_t(len), true}, queued, bytes, res, emit);
         return;
     }
     if (cut) {
@@ -2141,7 +2207,7 @@ static void tailLongPretoken(TailScratch & S, const uint8_t * bytes, size_t s, s
         tailMergeSegment(S.t.data(), S.pos.data(), k);
     }
     for (size_t i = 0; i < k; i++) { res[S.pos[i]] = S.t[i]; tailMarkTok(emit, S.pos[i], i); }
-    if (!cached) return;
+    if (!cached || !tailLongAdmit(S, h, true)) return;
     const size_t need = 4 + ((len + 3) & ~size_t(3)) + 4 * k;
     if (S.longUsed + need > S.longArena.size() || 2 * (S.longCount + 1) > slots) {   // full: start over
         std::fill(S.longIndex.begin(), S.longIndex.end(), TailLongSlot{0, 0, 0});
@@ -4672,6 +4738,35 @@ BPEPassResult buildBPEPassPipeline(
                 last[r->idAB] = last[r->idB];
                 const unsigned k = (unsigned(last[r->idA]) << 8) | first[r->idB];
                 gTailHard[k >> 6] &= ~(1ull << (k & 63));
+            }
+            if (TailTrigramSplit) {                 // every token's bytes: its trigrams, prefix, 2-byte tokens
+                const auto t0 = std::chrono::steady_clock::now();
+                std::vector<std::string> tb(maxId);
+                for (unsigned by = 0; by < 256; by++) tb[bpeBaseId(by)] = std::string(1, char(by));
+                gTailTri3.assign(size_t(1) << 18, 0);
+                gTailPre3.assign(size_t(1) << 18, 0);
+                std::fill(std::begin(gTailTok2), std::end(gTailTok2), 0);
+                auto setBit = [](uint64_t * m, unsigned k) { m[k >> 6] |= 1ull << (k & 63); };
+                for (const MergeRule * r : byRank) {
+                    std::string & t = tb[r->idAB];
+                    t = tb[r->idA] + tb[r->idB];
+                    const uint8_t * u = reinterpret_cast<const uint8_t *>(t.data());
+                    const size_t n = t.size();
+                    if (n == 2) setBit(gTailTok2, unsigned(u[0]) << 8 | u[1]);
+                    if (n >= 3) setBit(gTailPre3.data(), unsigned(u[0]) << 16 | unsigned(u[1]) << 8 | u[2]);
+                    for (size_t i = 0; i + 3 <= n; i++)
+                        setBit(gTailTri3.data(), unsigned(u[i]) << 16 | unsigned(u[i + 1]) << 8 | u[i + 2]);
+                }
+                if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "trigram") {
+                    size_t c3 = 0, cp = 0, c2 = 0;
+                    for (uint64_t x : gTailTri3) c3 += __builtin_popcountll(x);
+                    for (uint64_t x : gTailPre3) cp += __builtin_popcountll(x);
+                    for (uint64_t x : gTailTok2) c2 += __builtin_popcountll(x);
+                    std::cerr << "[BPE] --tail-trigram-split: " << c3 << " trigrams, " << cp << " prefixes, " << c2
+                              << " 2-byte tokens, "
+                              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()
+                              << " ms\n";
+                }
             }
         }
         gTailOpen.n = 0;

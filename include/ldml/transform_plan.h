@@ -192,6 +192,10 @@ struct WalkBranch {
     std::vector<std::pair<UCD::UnicodeSet, unsigned>> moreRuns;
 };
 
+//  Whether planTransform merges rules as the variants of a set (see
+//  MultipleCaptureMultipleReplacementSet::variants); tconv --capture-variants.
+extern bool MergeCaptureVariants;
+
 struct MultipleCaptureMultipleReplacementSet {
     std::vector<re::RE *> captures;                      // B1 ... Bk
     std::vector<std::vector<UCD::UnicodeSet>> texts;     // T1 ... Tk
@@ -236,6 +240,37 @@ struct MultipleCaptureMultipleReplacementSet {
     std::vector<BoundaryReplacement> replacements;       // other than at a non-empty T0
     std::vector<std::u32string> results;                 // R1 ... Rk (as planned, in the order of the captures)
     std::vector<MultipleCaptureMultipleReplacement> rules;
+    //  Variants: rules of the same conversion group that would otherwise be sets
+    //  of their own, differing from the first rule of the set only in the
+    //  characters at one position of a text (the selector,
+    //  texts[selectorText][selectorPos], whose characters occur in no other
+    //  item of a match) and in their results (as rules expanded from a function
+    //  call on a capture of single characters, as NumericPinyin-Latin's
+    //  &NumericPinyin-Pinyin($3)), where no rule of the group between the first
+    //  rule of the set and the variant may match where the variant does (so
+    //  that the set applies it where ICU would).  The group's own rules alone
+    //  decide this: the replacements are made within the group, as ICU makes
+    //  them, so that its before contexts see the converted text ICU's do.  One
+    //  for each rule of the set, in order: its characters at the selector, and
+    //  its replacements and results.  The set is matched once, with the union of
+    //  their characters at the selector (texts); replacements holds the union of
+    //  their replacements, one for each position (with the characters of all and
+    //  the first one's replacement), which the kernels apply for each variant at
+    //  the matches whose selector holds its characters.  The selector is at
+    //  selectorOffset from the start, or from the end (the last position) if
+    //  selectorFromEnd.
+    struct Variant {
+        UCD::UnicodeSet chars;
+        std::vector<BoundaryReplacement> replacements;
+        std::vector<std::u32string> results;
+    };
+    std::vector<Variant> variants;
+    unsigned selectorText = 0;
+    unsigned selectorPos = 0;
+    bool selectorFromEnd = false;
+    unsigned selectorOffset = 0;
+    //  The least length of a match.
+    unsigned minLength = 0;
     //  A rule whose result refers to its two captures in reverse order,
     //  T0 (B1) T1 (B2) T2 → R0 $2 R1 $1 R2, with B1 and B2 of fixed lengths, is
     //  planned as T0 (B1) T1 (B2) T2 → R0 R1 $1 $2 R2, and the region R1 B1 B2 of

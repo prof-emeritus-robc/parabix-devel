@@ -663,6 +663,7 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
         totalMin += minLength[i];
         totalMax = (maxLength[i] == Unbounded || totalMax == Unbounded) ? Unbounded : totalMax + maxLength[i];
     }
+    set.minLength = totalMin;
     set.singleCharacter = !set.startsByFirst && totalMin == 1 && totalMax == 1;
     if (!set.startsByFirst && !set.singleCharacter) {
         bool endsUnique = false;
@@ -831,6 +832,117 @@ static bool multipleCaptureMultipleReplacement(const ConversionRule * c, Multipl
     rule.first = first;
     rule.firstReplacement = results.front();
     rule.rule = c;
+    return true;
+}
+
+bool MergeCaptureVariants = true;
+
+//  Whether two boundary replacements are at the same position, of the same kind.
+static bool sameSlot(const BoundaryReplacement & a, const BoundaryReplacement & b) {
+    return a.kind == b.kind && a.fromEnd == b.fromEnd && a.offset == b.offset && a.capture == b.capture
+           && (a.keepAt == 0) == (b.keepAt == 0) && a.text.size() == b.text.size();
+}
+
+//  Merges the set c of one rule into the set s as a variant (see
+//  MultipleCaptureMultipleReplacementSet::variants), if c differs from the
+//  first rule of s only in the characters at one position of a text (disjoint
+//  from those of the variants of s, and from every other item of a match) and
+//  in its results.  (Whether no rule between them may match where c does is
+//  for the caller to check.)
+static bool mergeVariant(MultipleCaptureMultipleReplacementSet & s, const MultipleCaptureMultipleReplacementSet & c,
+                         const MultipleCaptureMultipleReplacement & cr) {
+    auto plain = [](const MultipleCaptureMultipleReplacementSet & x) {
+        return !x.reversed && !x.moved && !x.walkStarts && x.walkBranches.empty();
+    };
+    if (!plain(s) || !plain(c) || s.startsByFirst != c.startsByFirst || s.singleCharacter != c.singleCharacter) return false;
+    if (s.rules.size() != std::max<size_t>(1, s.variants.size())) return false;
+    const MultipleCaptureMultipleReplacement & first = s.rules.front();
+    if (cr.firstReplacement != first.firstReplacement || cr.first.size() != first.first.size()) return false;
+    for (size_t j = 0; j < cr.first.size(); j++) {
+        if (!(cr.first[j] == first.first[j])) return false;
+    }
+    auto pattern = [](const re::RE * re) {return re ? printPattern(re) : std::string();};
+    if (pattern(s.before) != pattern(c.before) || pattern(s.after) != pattern(c.after) || s.captures.size() != c.captures.size()
+            || s.texts.size() != c.texts.size()) return false;
+    for (size_t i = 0; i < s.captures.size(); i++) {
+        if (pattern(s.captures[i]) != pattern(c.captures[i])) return false;
+    }
+    //  The one position at which the texts differ.
+    int ti = -1, tj = -1;
+    for (size_t i = 0; i < s.texts.size(); i++) {
+        if (s.texts[i].size() != c.texts[i].size()) return false;
+        for (size_t j = 0; j < s.texts[i].size(); j++) {
+            if (s.texts[i][j] == c.texts[i][j]) continue;
+            if (ti >= 0) return false;
+            ti = static_cast<int>(i);
+            tj = static_cast<int>(j);
+        }
+    }
+    if (ti < 0) return false;
+    if (!s.variants.empty() && (static_cast<unsigned>(ti) != s.selectorText || static_cast<unsigned>(tj) != s.selectorPos)) return false;
+    const UCD::UnicodeSet & D = c.texts[ti][tj];
+    const UCD::UnicodeSet & U = s.texts[ti][tj];
+    if (D.intersects(U)) return false;
+    //  The selector's characters in no other item of a match.
+    UCD::UnicodeSet others;
+    for (const UCD::UnicodeSet & chars : first.first) others = others + chars;
+    for (size_t i = 0; i < s.texts.size(); i++) {
+        for (size_t j = 0; j < s.texts[i].size(); j++) {
+            if (static_cast<int>(i) != ti || static_cast<int>(j) != tj) others = others + s.texts[i][j];
+        }
+    }
+    for (re::RE * cap : s.captures) others = others + patternCharacters(cap);
+    if (others.intersects(D) || others.intersects(U)) return false;
+    //  The replacements: at the same positions (one around a capture), the text
+    //  of the one at the selector differing there alone.
+    auto checkReplacements = [&](const std::vector<BoundaryReplacement> & brs) {
+        std::set<unsigned> kept;
+        for (const BoundaryReplacement & br : brs) {
+            if (br.kind == BoundaryReplacement::Kind::Keep && !kept.insert(br.capture).second) return false;
+        }
+        return true;
+    };
+    if (!checkReplacements(c.replacements) || !checkReplacements(s.replacements)) return false;
+    //  The position of the selector in a match: that of the replacement of its text.
+    bool found = false, fromEnd = false;
+    unsigned offset = 0;
+    for (const BoundaryReplacement & br : c.replacements) {
+        if (br.kind != BoundaryReplacement::Kind::Replace || br.text.size() != c.texts[ti].size()) continue;
+        bool same = true;
+        for (size_t j = 0; j < br.text.size() && same; j++) same = br.text[j] == c.texts[ti][j];
+        if (!same) continue;
+        found = true;
+        fromEnd = br.fromEnd;
+        offset = br.fromEnd ? br.offset - static_cast<unsigned>(tj) : br.offset + static_cast<unsigned>(tj);
+    }
+    if (!found || (!s.variants.empty() && (fromEnd != s.selectorFromEnd || offset != s.selectorOffset))) return false;
+    //  (Carried between the start and the end of a match: of two positions at least.)
+    for (const BoundaryReplacement & br : c.replacements) {
+        if (br.fromEnd != fromEnd && c.minLength < 2) return false;
+    }
+    for (const BoundaryReplacement & br : s.replacements) {
+        if (br.fromEnd != fromEnd && s.minLength < 2) return false;
+    }
+    if (s.variants.empty()) {
+        s.variants.push_back(MultipleCaptureMultipleReplacementSet::Variant{U, s.replacements, s.results});
+        s.selectorText = static_cast<unsigned>(ti);
+        s.selectorPos = static_cast<unsigned>(tj);
+        s.selectorFromEnd = fromEnd;
+        s.selectorOffset = offset;
+    }
+    s.variants.push_back(MultipleCaptureMultipleReplacementSet::Variant{D, c.replacements, c.results});
+    s.texts[ti][tj] = U + D;
+    //  The union of the replacements, one for each position.
+    for (const BoundaryReplacement & br : c.replacements) {
+        bool merged = false;
+        for (BoundaryReplacement & o : s.replacements) {
+            if (!sameSlot(o, br)) continue;
+            for (size_t j = 0; j < o.text.size(); j++) o.text[j] = o.text[j] + br.text[j];
+            merged = true;
+        }
+        if (!merged) s.replacements.push_back(br);
+    }
+    s.rules.push_back(cr);
     return true;
 }
 
@@ -1632,6 +1744,12 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
         start = end + 1;
     }
     size_t groupIndex = 0;
+    //  The conversion rules of the current group so far, and the index among
+    //  them of the first rule of each of its MultipleCaptureMultipleReplacement
+    //  sets (for the variants; see mergeVariant).
+    std::vector<const ConversionRule *> groupRules;
+    std::vector<size_t> setFirst;
+    RuleOverlapAnalysis overlap;
     for (Rule * r : rules) {
         if (FilterRule * f = dyn_cast<FilterRule>(r)) {
             plan.filter = f->getFilterSet();
@@ -1639,6 +1757,8 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
         } else if (TransformRule * t = dyn_cast<TransformRule>(r)) {
             group = nullptr;
             groupIndex++;
+            groupRules.clear();
+            setFirst.clear();
             TransformStep step;
             step.kind = TransformStep::Kind::Transform;
             step.transform = t->getForwardID();
@@ -1646,6 +1766,7 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
             if (step.filter) step.filterSet = sets.setOf(step.filter, false);
             plan.steps.push_back(std::move(step));
         } else if (ConversionRule * c = dyn_cast<ConversionRule>(r)) {
+            groupRules.push_back(c);
             const RuleSide * source = c->getSourceSide(Direction::Forward);
             const RuleSide * result = c->getResultSide(Direction::Forward);
             re::RE * const text = source->getText();
@@ -1911,11 +2032,31 @@ TransformPlan planTransform(const std::vector<Rule *> & rulesGiven, const std::s
                 const std::string key = captureReplacementKey(set, capture);
                 MultipleCaptureMultipleReplacementSet * found = nullptr;
                 for (MultipleCaptureMultipleReplacementSet & s : group->captureReplacements) {
-                    if (captureReplacementKey(s, s.rules.front()) == key) found = &s;
+                    if (s.variants.empty() && captureReplacementKey(s, s.rules.front()) == key) found = &s;
+                }
+                if (found == nullptr && MergeCaptureVariants && setFirst.size() == group->captureReplacements.size()) {
+                    //  As a variant of a set, if no rule since the first of the set
+                    //  (other than its own) may match where it does: the set then
+                    //  applies it where it did.
+                    for (size_t si = 0; si < group->captureReplacements.size(); si++) {
+                        MultipleCaptureMultipleReplacementSet & s = group->captureReplacements[si];
+                        bool clear = true;
+                        for (size_t x = setFirst[si] + 1; x + 1 < groupRules.size() && clear; x++) {
+                            bool own = false;
+                            for (const MultipleCaptureMultipleReplacement & m : s.rules) own |= m.rule == groupRules[x];
+                            clear = own || !overlap.mayOverlap(groupRules[x], c);
+                        }
+                        if (clear && mergeVariant(s, set, capture)) {
+                            found = &s;
+                            break;
+                        }
+                    }
+                    if (found) continue;
                 }
                 if (found == nullptr) {
                     group->captureReplacements.push_back(set);
                     found = &group->captureReplacements.back();
+                    setFirst.push_back(groupRules.size() - 1);
                 }
                 found->rules.push_back(std::move(capture));
                 continue;

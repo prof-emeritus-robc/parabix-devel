@@ -208,7 +208,12 @@ StatisticsOptions(cl::desc("Statistics gathering options"),
                                                   "due to insufficient input items / output space."),
                         clEnumVal(TraceStridesPerSegment, "Trace number of strides executed over segments."),
                         clEnumVal(TraceProducedItemCounts, "Trace produced item count deltas over segments."),
-                        clEnumVal(TraceUnconsumedItemCounts, "Trace unconsumed item counts over segments.")),
+                        clEnumVal(TraceUnconsumedItemCounts, "Trace unconsumed item counts over segments."),
+
+                        clEnumVal(CollectCompilationPassMetrics, "Display Compilation pass time (in cycles).")
+
+
+                        ),
              cl::cat(InstrumentationOptions));
 
 std::string ShowIROption = OmittedOption;

@@ -16,6 +16,7 @@ namespace kernel { class PipelineAnalysis; }
 namespace kernel { class PipelineBuilder; }
 namespace kernel { class ProgramBuilder; }
 namespace llvm { class TargetMachine; }
+namespace llvm { class PassInstrumentationCallbacks; }
 namespace kernel {template<typename ... Args> class TypedProgramBuilder; }
 
 class CBuilder;
@@ -66,8 +67,10 @@ public:
         return *mContext;
     }
 
-    static void runAllOptimizationPasses(kernel::KernelBuilder & b, kernel::Kernel::SelectedOptimizationPasses & passes,
-                                         llvm::TargetMachine * TM,
+    static void runAllOptimizationPasses(kernel::KernelBuilder & b,
+                                         kernel::Kernel::SelectedOptimizationPasses & passes,
+                                         llvm::TargetMachine * const TM,
+                                         llvm::PassInstrumentationCallbacks * const PIC,
                                          llvm::SmallVector<char, 0> & UnoptimizedIROutput,
                                          llvm::SmallVector<char, 0> & OptimizedIROutput);
 

@@ -33,6 +33,7 @@
 #include <llvm/CodeGen/MachineFrameInfo.h>
 #include <llvm/Support/CommandLine.h>
 #include <toolchain/toolchain.h>
+#include <idisa/passes/pass_measurements.h>
 #include <queue>
 
 #define BEGIN_SCOPED_REGION {
@@ -77,6 +78,10 @@ public:
     FunctionSnippetTokenReplacerPass()
     : MachineFunctionPass(ID) {
 
+    }
+
+    StringRef getPassName() const override {
+        return StringRef{"FunctionSnippetReplacement"};
     }
 
     bool doInitialization(Module & M) override;
@@ -779,6 +784,8 @@ void FunctionSnippetTokenReplacerPass::getCallsiteVirtualRegisters(MachineFuncti
     // adjcallstackup
     // copy physical to virtual
 
+
+
     assert (uses.empty());
     assert (defs.empty());
 
@@ -1104,7 +1111,7 @@ const Function * FunctionSnippetTokenReplacerPass::getCalleeFunction(Module * M,
 }
 
 void FunctionSnippetTokenReplacerPass::getAnalysisUsage(AnalysisUsage & AU) const {
-    AU.addRequired<MachineModuleInfoWrapperPass>();
+  //  AU.addRequired<MachineModuleInfoWrapperPass>();
     AU.addRequired<MachineBranchProbabilityInfo>();
     MachineFunctionPass::getAnalysisUsage(AU);
 }
@@ -1303,10 +1310,11 @@ Value * CallFunctionByToken(IDISA::IDISA_Builder & b, Type * retTy, StringRef na
     return nullptr;
 }
 
-FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(Module & M, llvm::PassManagerBase & pm, const bool addPostOptimizations)
+FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(Module & M, llvm::PassManagerBase & pm, PassMeasurements * PICObj)
 : BasePM(pm)
-, AddPostOptimizations(addPostOptimizations)
-, AlreadyInsertedFunctionSnippetPass(false) {
+, PICObj(PICObj)
+, AlreadyInsertedFunctionSnippetPass(false)
+, ValidPhaseForInstrumentation(false) {
     // TODO: we need to scan through the function declarations in M to see if any snippets are single use ones.
     // We can add a LLVM AlwaysInline attribute to those to let LLVM deal with them completely. Only if we have a
     // multi-use snippet do we need to run the snippet inliner pass on M. This has the added benefit of the pass
@@ -1325,32 +1333,121 @@ FunctionSnippetPassManagerProxy::FunctionSnippetPassManagerProxy(Module & M, llv
 
 }
 
+class PassInstrumentationStartCallback : public llvm::MachineFunctionPass {
+public:
+
+    static inline char ID = 0;
+
+    PassInstrumentationStartCallback(PassMeasurements & obj, StringRef name)
+    : MachineFunctionPass(ID)
+    , CallBackObj(obj)
+    , Name(name) {
+
+    }
+
+    bool runOnMachineFunction(MachineFunction & MF) override {
+        CallBackObj.startTimerCallback(Name, &MF);
+        return false;
+    }
+
+protected:
+
+    void getAnalysisUsage(AnalysisUsage &AU) const override {
+        AU.setPreservesAll();
+        MachineFunctionPass::getAnalysisUsage(AU);
+    }
+
+private:
+    PassMeasurements & CallBackObj;
+    StringRef Name;
+};
+
+class PassInstrumentationEndCallback : public llvm::MachineFunctionPass {
+public:
+
+    static inline char ID = 0;
+
+    PassInstrumentationEndCallback(PassMeasurements & obj, bool isAnalysis, StringRef name)
+    : MachineFunctionPass(ID)
+    , CallBackObj(obj)
+    , IsAnalysisPass(isAnalysis)
+    , Name(name) {
+
+    }
+
+    bool runOnMachineFunction(MachineFunction & MF) override {
+        CallBackObj.endTimerCallback(Name, &MF, !IsAnalysisPass);
+        return false;
+    }
+
+protected:
+
+    void getAnalysisUsage(AnalysisUsage & AU) const override {
+        AU.setPreservesAll();
+        MachineFunctionPass::getAnalysisUsage(AU);
+    }
+
+private:
+    PassMeasurements & CallBackObj;
+    bool IsAnalysisPass;
+    StringRef Name;
+};
+
+inline bool isAnalysisPass(const Pass * P) {
+    auto info = PassRegistry::getPassRegistry()->getPassInfo(P->getPassID());
+    if (info) {
+        return info->isAnalysis();
+    } else {
+        return false;
+    }
+}
+
 
 void FunctionSnippetPassManagerProxy::add(Pass * P) {
 //    if (AlreadyInsertedFunctionSnippetPass) {
 //        BasePM.add(P);
 //    } else {
-        if (P->getPassID() == &TargetPassConfig::ID) {
+        const auto PassId = P->getPassID();
+        if (PassId == &TargetPassConfig::ID) {
             auto * TPC = static_cast<TargetPassConfig *>(P);
             TPC->setRequiresCodeGenSCCOrder();
         }
-        BasePM.add(P);
-        if (P->getPassID() == &FinalizeISelID) {
-            BasePM.add(createFunctionSnippetTokenReplacerPass());
-            if (AddPostOptimizations) {
-                const PassRegistry & PR = *PassRegistry::getPassRegistry();
-                auto addPassById = [&](AnalysisID PassId) {
-                    auto * PI = PR.getPassInfo(&PassId);
-                    if (PI) {
-                        BasePM.add(PI->createPass());
-                    }
-                };
-                addPassById(&MachineCSEID);
-                addPassById(&PeepholeOptimizerID);
-                addPassById(&DeadMachineInstructionElimID);
+        const auto passName = P->getPassName();
+
+        if (LLVM_UNLIKELY(PICObj && !ValidPhaseForInstrumentation)) {
+            AnalysisUsage AU;
+            P->getAnalysisUsage(AU);
+            for (const llvm::AnalysisID ID : AU.getRequiredSet()) {
+                if (ID == &llvm::MachineModuleInfoWrapperPass::ID) {
+                    ValidPhaseForInstrumentation = true;
+                    break;
+                }
             }
         }
-        AlreadyInsertedFunctionSnippetPass = true;
+
+
+        auto *  const PIC = (ValidPhaseForInstrumentation && P->getAsImmutablePass() != nullptr) ? PICObj : nullptr;
+
+        if (PIC) {
+            BasePM.add(new PassInstrumentationStartCallback(*PIC, passName));
+        }
+        BasePM.add(P);
+        if (PIC) {
+            BasePM.add(new PassInstrumentationEndCallback(*PIC, isAnalysisPass(P), passName));
+        }
+        if (PassId == &FinalizeISelID) {
+            Pass * snippetPass = createFunctionSnippetTokenReplacerPass();
+            auto callbackName = snippetPass->getPassName();
+            if (PICObj) {
+                BasePM.add(new PassInstrumentationStartCallback(*PICObj, callbackName));
+            }
+            BasePM.add(snippetPass);
+            if (PICObj) {
+                BasePM.add(new PassInstrumentationEndCallback(*PICObj, false, callbackName));
+            }
+            AlreadyInsertedFunctionSnippetPass = true;
+        }
+
 //    }
 }
 

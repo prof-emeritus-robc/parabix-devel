@@ -13,6 +13,7 @@ SRC
     idisa_i64_builder.cpp
     idisa_arm_builder.cpp
     passes/function_snippet.cpp
+    passes/pass_measurements.cpp
 DEPS
     toolchain
     ${Boost_LIBRARIES})
@@ -28,6 +29,7 @@ SRC
     # idisa_nvptx_builder.cpp
     idisa_sse_builder.cpp
     passes/function_snippet.cpp
+    passes/pass_measurements.cpp
 DEPS
     toolchain
     ${Boost_LIBRARIES})

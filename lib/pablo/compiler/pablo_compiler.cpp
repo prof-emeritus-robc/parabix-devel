@@ -194,13 +194,7 @@ Value * PabloCompiler::getCarryRebuildScratchPtr(KernelBuilder & b, const Var * 
     assert (mRebuildingCarries && var->isKernelParameter() && var->isReadNone());
     const auto shape = StreamSetBuffer::resolveType(var->getType(), 0);
     auto vecTy = FixedVectorType::get(b.getIntNTy(shape.FieldWidth), b.getBitBlockWidth() / shape.FieldWidth);
-//    Type * type = CBuilder::convertTypeToLLVMContext(b.getContext(), var->getType());
     auto scratchTy = ArrayType::get(vecTy, shape.ElementCount);
-//    if (type->isArrayTy()) {
-//        scratchTy = cast<ArrayType>(type);
-//    } else {
-//        scratchTy = ArrayType::get(type, 1);
-//    }
 
     Value * scratch = nullptr;
     const auto f = mCarryRebuildScratch.find(var);

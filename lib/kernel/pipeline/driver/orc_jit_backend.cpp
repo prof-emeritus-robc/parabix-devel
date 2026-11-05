@@ -33,6 +33,7 @@
 #include <llvm/ADT/StringExtras.h>
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
+#include <llvm/CodeGen/TargetPassConfig.h>
 #include <llvm/Support/SmallVectorMemoryBuffer.h>
 #include <queue>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
@@ -43,6 +44,7 @@
 #include <numeric>
 #include <allocator/threadsafe_slaballocator.h>
 #include <idisa/passes/function_snippet.h>
+#include <idisa/passes/pass_measurements.h>
 
 #define BEGIN_SCOPED_REGION {
 #define END_SCOPED_REGION }
@@ -52,6 +54,25 @@ using namespace llvm::orc;
 using namespace kernel;
 
 using AttrId = kernel::Attribute::KindId;
+
+#if (defined(__has_builtin) && __has_builtin(__builtin_readcyclecounter)) || defined(__GNUC__)
+#elif defined(_MSC_VER)
+#include <intrin.h>
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <x86intrin.h>
+#else
+#include <chrono>
+#endif
+
+inline uint64_t getCycleCount() {
+    #if (defined(__has_builtin) && __has_builtin(__builtin_readcyclecounter)) || defined(__GNUC__)
+    return __builtin_readcyclecounter();
+    #elif defined(_MSC_VER) || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    return __rdtsc();
+    #else
+    return static_cast<uint64_t>(std::chrono::steady_clock::now().count());
+    #endif
+}
 
 // Module::setTargetTriple took a StringRef prior to LLVM 21 and takes a Triple from LLVM 21 onward.
 template <typename ModulePtr>
@@ -68,6 +89,7 @@ inline void setModuleTargetTriple(ModulePtr && M, const Triple & T) {
 // in their constructors. The pipeline is the only know exception. Thus very few dependencies would be needed.
 
 
+
 struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
     std::unique_ptr<llvm::TargetMachine>    TargetMachine;
     std::unique_ptr<KernelBuilder>          Builder;
@@ -75,6 +97,7 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
     llvm::orc::LLJIT *                      Engine;
     llvm::DataLayout                        DataLayout;
     llvm::orc::SymbolMap                    NewSymbolList;
+    std::unique_ptr<PassMeasurements>       Measurements;
 
     CPUDriverContext(JITTargetMachineBuilder & JTMB, const StringMap<bool> & features)
     : TargetMachine(cantFail(JTMB.createTargetMachine()))
@@ -83,6 +106,9 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
     , Engine(nullptr)
     , DataLayout(TargetMachine->createDataLayout()) {
         Builder->setFunctionLinkCallback(this);
+        if (LLVM_UNLIKELY(codegen::StatisticsOptionIsSet(codegen::CollectCompilationPassMetrics))) {
+            Measurements = std::make_unique<PassMeasurements>(TargetMachine.get());
+        }
     }
 
     llvm::Function * LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
@@ -138,6 +164,72 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
 
     virtual ~CPUDriverContext() {}
 };
+
+void printPassMeasurementStatistics(std::vector<CPUDriverContext *> & contexts) {
+    const auto n = contexts.size();
+    assert (n > 0);
+    auto & M0 = contexts[0]->Measurements; assert (M0);
+
+    for (size_t i = 1; i < n; ++i) {
+        auto & MI = contexts[i]->Measurements; assert (MI);
+        M0->update(*MI.get());
+    }
+
+    const auto & measurements = M0->Measurements;
+
+    double sumMean = 0;
+    size_t maxNameLength = 0;
+    for (const auto & M : measurements) {
+        sumMean += M.Mean;
+        maxNameLength = std::max(maxNameLength, M.Name.size());
+    }
+    maxNameLength += 8;
+
+    struct Node {
+        const PassMeasurement * Metric = nullptr;
+        SmallVector<Node *, 1> Children;
+    };
+
+    const auto m = measurements.size();
+
+    std::function<void(size_t, unsigned)> postOrderPrint = [&](const size_t measurementIndex, const unsigned indent) {
+
+        auto & M = measurements[measurementIndex];
+        const auto normMean = (M.Mean * 100.0 / sumMean);
+        const auto normStdDev = (M.getStdDev() * 100.0 / M.Mean);
+        const auto modPerc = (double)M.ModifiedCount / (double)M.Count;
+
+        const auto & nm = M.Name;
+
+        errs().indent(indent);
+        errs() << nm;
+        errs().indent(maxNameLength - indent - nm.size());
+
+        errs() << ", " << llvm::formatv("{0,6}", M.Count);
+        errs() << ", " << llvm::formatv("{0,6:f2}", normMean);
+        errs() << ", " << llvm::formatv("{0,6:f2}", normStdDev);
+        errs() << ", " << llvm::formatv("{0,6:f2}", modPerc);
+        errs() << '\n';
+
+        // TODO: this is very inefficient but m is not expected to be large
+        for (size_t i = 0; i < m; ++i) {
+            auto & measure = measurements[i];
+            if (measure.Parent == measurementIndex) {
+                postOrderPrint(i, indent + 2);
+            }
+        }
+    };
+
+    for (size_t i = 0; i < m; ++i) {
+        auto & measure = measurements[i];
+        if (measure.Parent == PassMeasurements::MAX_INT) {
+            postOrderPrint(i, 0);
+        }
+
+    }
+
+
+}
 
 enum class CPUDriverTaskType : size_t {
     Declaration = 0,
@@ -786,6 +878,10 @@ public:
         DriverLinkedSymbols = symMap;
     }
 
+    std::vector<CPUDriverContext *> & getContexts() {
+        return Contexts;
+    }
+
     ~CPUDriverCompiler() {
         // No further compilation will be requested at this point; permanently stop the
         // worker pool (waitUntilCompleted() only drains, it never does this) and wait
@@ -918,8 +1014,6 @@ private:
             }
         }
 
-
-
         BEGIN_SCOPED_REGION
         Module * const M = Target->makeEmptyModule(builder); assert (M);
         setModuleTargetTriple(M, TM->getTargetTriple());
@@ -1013,27 +1107,28 @@ record_decl:
             }
         }
 
-
         if (LLVM_LIKELY(ObjectCache && Target->isCachable())) {
             ParabixObjectCache::recordIRHash(*M);
         }
 
-        Kernel::SelectedOptimizationPasses passes;
-        Target->addOptimizationPasses(builder, passes);
-        BaseDriver::runAllOptimizationPasses(builder, passes, TM, IROutput, OptIROutput);
-
         END_SCOPED_REGION
 
+        PassInstrumentationCallbacks * PICObj = nullptr;
+        auto & measurements = C.Measurements;
+        if (LLVM_UNLIKELY(measurements.get())) {
+            PassInstrumentationCallbacks & PIC = measurements->PIC;
+            PICObj = &PIC;
+        }
 
+        Kernel::SelectedOptimizationPasses passes;
+        Target->addOptimizationPasses(builder, passes);
         TM->setOptLevel(codegen::BackEndOptLevel);
+        BaseDriver::runAllOptimizationPasses(builder, passes, TM, PICObj, IROutput, OptIROutput);
 
         legacy::PassManager PM;
 
-        const auto atLeastOpt1 = codegen::BackEndOptLevel != llvm::CodeGenOptLevel::None;
-
         SmallVector<char, 0> ASMOutput;
         SmallVector<char, 0> objBuffer;
-
 
         std::unique_ptr<SmallVectorMemoryBuffer> objCode;
 
@@ -1065,7 +1160,7 @@ record_decl:
             // had already emitted -- "symbol '...' is already defined". Reproducible
             // with idisa_exerciser --ShowASM=<path>.
             legacy::PassManager asmPM;
-            FunctionSnippetPassManagerProxy FPM(*M, asmPM, atLeastOpt1);
+            FunctionSnippetPassManagerProxy FPM(*M, asmPM, nullptr);
             if (LLVM_UNLIKELY(TM->addPassesToEmitFile(FPM, out, nullptr, ASMFile))) {
                 report_fatal_error(Twine{"Failed to generate ASM for ", M->getModuleIdentifier()});
             }
@@ -1083,7 +1178,7 @@ record_decl:
         constexpr auto ObjFile = CGFT_ObjectFile;
         #endif
 
-        FunctionSnippetPassManagerProxy FPM(*M, PM, atLeastOpt1);
+        FunctionSnippetPassManagerProxy FPM(*M, PM, measurements.get());
         if (LLVM_UNLIKELY(TM->addPassesToEmitFile(FPM, out, nullptr, ObjFile))) {
             report_fatal_error(Twine{"Failed to generate object file for ", M->getModuleIdentifier()});
         }
@@ -1302,8 +1397,7 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
         .setCodeModel(CodeModel::Large)
         .setCodeGenOptLevel(codegen::BackEndOptLevel);
 
-
-    const size_t numOfThreads = std::max(codegen::CompileThreads, 1U);
+    const size_t numOfThreads = 1U; // std::max(codegen::CompileThreads, 1U);
 
     mAllLinkedSymbols = std::make_unique<SymbolMap>();
 
@@ -1432,6 +1526,10 @@ void * OrcJITBackend::finalizeObject(kernel::Kernel * const pk) {
 
     mDriver.mCachedKernel.clear();
     mDriver.mCompiledKernel.clear();
+
+    if (LLVM_UNLIKELY(codegen::StatisticsOptionIsSet(codegen::CollectCompilationPassMetrics))) {
+        printPassMeasurementStatistics(mCPUDriverCompiler->getContexts());
+    }
 
     //    llvm::reportAndResetTimings();
     //    llvm::PrintStatistics();

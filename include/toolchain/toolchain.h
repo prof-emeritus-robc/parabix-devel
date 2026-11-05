@@ -76,6 +76,7 @@ enum StatisticsFlags {
     TraceProducedItemCounts,
     TraceUnconsumedItemCounts,
     TraceBlockedIO,
+    CollectCompilationPassMetrics,
     StatisticsFlagSentinel
 };
 

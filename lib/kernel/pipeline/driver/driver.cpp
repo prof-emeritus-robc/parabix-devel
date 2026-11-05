@@ -236,18 +236,31 @@ private:
  ** ------------------------------------------------------------------------------------------------------------- */
 void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
                                           Kernel::SelectedOptimizationPasses & passes,
-                                          TargetMachine * TM,
+                                          TargetMachine * const TM,
+                                          PassInstrumentationCallbacks * const PIC,
                                           SmallVector<char, 0> & UnoptimizedIROutput,
                                           SmallVector<char, 0> & OptimizedIROutput) {
 
-
-    PassInstrumentationCallbacks PIC;
-
+    LoopAnalysisManager LAM;
     CGSCCAnalysisManager CGAM;
     FunctionAnalysisManager FAM;
     ModuleAnalysisManager MAM;
 
-    CGAM.registerPass([&] { return PassInstrumentationAnalysis(&PIC); });
+    if (LLVM_UNLIKELY(PIC)) {
+        LAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+        CGAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+        MAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+        FAM.registerPass([&] { return PassInstrumentationAnalysis(PIC); });
+    }
+
+    CGAM.registerPass([&] { return FunctionAnalysisManagerCGSCCProxy(); });
+    CGAM.registerPass([&] { return ModuleAnalysisManagerCGSCCProxy(MAM); });
+
+    MAM.registerPass([&] { return FunctionAnalysisManagerModuleProxy(FAM); });
+    MAM.registerPass([&] { return CGSCCAnalysisManagerModuleProxy(CGAM); });
+
+    FAM.registerPass([&] { return ModuleAnalysisManagerFunctionProxy(MAM); });
+    FAM.registerPass([&] { return CGSCCAnalysisManagerFunctionProxy(CGAM); });
 
     #ifndef NDEBUG
     #define ADD_VERIFY_IR_PASS true
@@ -259,39 +272,30 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
     if (ADD_VERIFY_IR_PASS) {
         MAM.registerPass([&] { return VerifierAnalysis(); });
     }
-    MAM.registerPass([&] { return ProfileSummaryAnalysis(); });
-    MAM.registerPass([&] { return PassInstrumentationAnalysis(&PIC); });
-    MAM.registerPass([&] { return InlineAdvisorAnalysis(); });
-    MAM.registerPass([&] { return LazyCallGraphAnalysis(); });
+//    MAM.registerPass([&] { return ProfileSummaryAnalysis(); });
+
+//    MAM.registerPass([&] { return InlineAdvisorAnalysis(); });
+//    MAM.registerPass([&] { return LazyCallGraphAnalysis(); });
+
+//    FAM.registerPass([&] { return TargetIRAnalysis(); });
+
+//    FAM.registerPass([&] { return AssumptionAnalysis(); });
+//    FAM.registerPass([&] { return DominatorTreeAnalysis(); });
+//    FAM.registerPass([&] { return PostDominatorTreeAnalysis(); });
+//    FAM.registerPass([&] { return TargetLibraryAnalysis(); });
+//    FAM.registerPass([&] { return AAManager(); });
+
+//    FAM.registerPass([&] { return LoopAnalysis(); });
+//    FAM.registerPass([&] { return PhiValuesAnalysis(); });
+//    FAM.registerPass([&] { return MemoryDependenceAnalysis(); });
+//    FAM.registerPass([&] { return MemorySSAAnalysis(); });
+//    FAM.registerPass([&] { return OptimizationRemarkEmitterAnalysis(); });
+
+//    FAM.registerPass([&] { return BranchProbabilityAnalysis(); });
+//    FAM.registerPass([&] { return BlockFrequencyAnalysis(); });
 
 
-    FAM.registerPass([&] { return PassInstrumentationAnalysis(&PIC); });
-    FAM.registerPass([&] { return TargetIRAnalysis(); });
 
-    FAM.registerPass([&] { return AssumptionAnalysis(); });
-    FAM.registerPass([&] { return DominatorTreeAnalysis(); });
-    FAM.registerPass([&] { return PostDominatorTreeAnalysis(); });
-    FAM.registerPass([&] { return TargetLibraryAnalysis(); });
-    FAM.registerPass([&] { return AAManager(); });
-
-    FAM.registerPass([&] { return LoopAnalysis(); });
-    FAM.registerPass([&] { return PhiValuesAnalysis(); });
-    FAM.registerPass([&] { return MemoryDependenceAnalysis(); });
-    FAM.registerPass([&] { return MemorySSAAnalysis(); });
-    FAM.registerPass([&] { return OptimizationRemarkEmitterAnalysis(); });
-
-    FAM.registerPass([&] { return BranchProbabilityAnalysis(); });
-    FAM.registerPass([&] { return BlockFrequencyAnalysis(); });
-
-
-    CGAM.registerPass([&] { return FunctionAnalysisManagerCGSCCProxy(); });
-    CGAM.registerPass([&] { return ModuleAnalysisManagerCGSCCProxy(MAM); });
-
-    MAM.registerPass([&] { return FunctionAnalysisManagerModuleProxy(FAM); });
-    MAM.registerPass([&] { return CGSCCAnalysisManagerModuleProxy(CGAM); });
-
-    FAM.registerPass([&] { return ModuleAnalysisManagerFunctionProxy(MAM); });
-    FAM.registerPass([&] { return CGSCCAnalysisManagerFunctionProxy(CGAM); });
 
     // The passes above (in particular ModuleInlinerPass, added below) can depend on
     // additional analyses that vary by LLVM version and are otherwise easy to miss
@@ -300,8 +304,8 @@ void BaseDriver::runAllOptimizationPasses(KernelBuilder & b,
     // PassBuilder::register*Analyses only fills in analyses that aren't already
     // registered above, so our explicit choices (e.g. PassInstrumentationAnalysis
     // bound to our own PIC) are preserved.
-    LoopAnalysisManager LAM;
-    PassBuilder PB(TM, PipelineTuningOptions(), std::nullopt, &PIC);
+
+    PassBuilder PB(TM, PipelineTuningOptions(), std::nullopt, PIC);
     PB.registerModuleAnalyses(MAM);
     PB.registerCGSCCAnalyses(CGAM);
     PB.registerFunctionAnalyses(FAM);

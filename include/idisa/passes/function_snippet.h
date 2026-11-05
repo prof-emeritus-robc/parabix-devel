@@ -20,19 +20,20 @@ llvm::Value * CallFunctionByToken(IDISA::IDISA_Builder & b,
                                   std::function<llvm::Value *(llvm::ArrayRef<llvm::Value *>)> functionGenerator);
 
 
-
+struct PassMeasurements;
 
 class FunctionSnippetPassManagerProxy final : public llvm::legacy::PassManagerBase {
 public:
 
-    FunctionSnippetPassManagerProxy(llvm::Module & M, llvm::legacy::PassManagerBase & pm, const bool addPostOptimizations);
+    FunctionSnippetPassManagerProxy(llvm::Module & M, llvm::legacy::PassManagerBase & pm, PassMeasurements * PICObj);
 
     void add(llvm::Pass * P) override;
 
 private:
     llvm::legacy::PassManagerBase & BasePM;
-    const bool AddPostOptimizations;
+    PassMeasurements * const PICObj;
     bool AlreadyInsertedFunctionSnippetPass;
+    bool ValidPhaseForInstrumentation = false;
 };
 
 

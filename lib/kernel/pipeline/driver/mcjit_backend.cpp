@@ -213,7 +213,7 @@ void MCJITBackend::generateUncachedKernels() {
         Kernel::SelectedOptimizationPasses passes;
         Target->addOptimizationPasses(builder, passes);
         SmallVector<char, 0> unoptIR, optIR;
-        BaseDriver::runAllOptimizationPasses(builder, passes, mTarget, unoptIR, optIR);
+        BaseDriver::runAllOptimizationPasses(builder, passes, mTarget, nullptr, unoptIR, optIR);
         // TODO: --ShowIR/--ShowUnoptimizedIR output capture (unoptIR/optIR above) is not
         // yet wired to a debug-output stream under MCJIT mode; ORC's equivalent lives in
         // CPUDriverCompiler::printDebugOutput. Low priority: these flags are debugging aids,

@@ -84,6 +84,11 @@
 #endif
 #include <chrono>                                 // --tail-vocab-table build time
 #include <thread>                                 // --tail-vocab-table builder
+#include <cstdio>                                 // --tail-vocab-file
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 using boost::intrusive::detail::ceil_log2;
 
 using namespace llvm;
@@ -4477,6 +4482,99 @@ inline static size_t buildTailTable(const std::vector<MergeRuleGroup> & ruleRang
     return numRules;
 }
 
+// --tail-vocab-file=PATH (with --tail-vocab-table): keep the finished table in PATH, so later
+// runs read it instead of building it. The build runs BPE once over every token (~7.5 ms of
+// CPU on a thread of its own for GPT-2), and a short run starts before it is done: its first
+// words go without the table. A loaded table is published before the pipeline runs. The file
+// is keyed by the rules, the base ids, the set hash and the layout; a missing, stale or broken
+// file is built as without the flag and then written (temporary file + rename, so a run never
+// sees half a file). Runtime only, no cache tag.
+static cl::opt<std::string> TailVocabFile(
+    "tail-vocab-file",
+    cl::desc("With --tail-vocab-table: read the table from this file, or build it and write it "
+             "there when the file is missing or was made from other rules (default: none)."),
+    cl::init(""));
+static constexpr uint32_t kTailVocabFileVersion = 1;   // bump when the build's output changes
+struct TailVocabFileHeader {                           // the file: this, then 4 << bits entries
+    char magic[8];
+    uint32_t version, entrySize, keyMax, bits;
+    uint64_t key, stored, unreachable, full;
+    uint8_t pad[128 - 56];                             // entries 128-byte aligned, as built
+};
+static_assert(sizeof(TailVocabFileHeader) == 128, "vocabulary file header layout");
+static constexpr char kTailVocabMagic[8] = {'B', 'P', 'E', 'V', 'O', 'C', 'A', 'B'};
+static void * gTailVocabMap = nullptr;                 // the mapped file, while in use
+static size_t gTailVocabMapSize = 0;
+static uint64_t gTailVocabFileKey = 0;                 // the key the builder writes with
+
+// The vocabulary set of key (k0, k1), as the walk and the scan kernel compute it.
+static inline uint64_t tailVocabSetHash(uint64_t k0, uint64_t k1) {
+    return (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+}
+static inline uint64_t tailMix64(uint64_t x) {         // splitmix64's finalizer
+    x += 0x9E3779B97F4A7C15ull;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    return x ^ (x >> 31);
+}
+// What the table is made from. The rules are summed (any group order gives the same key);
+// idAB = 256 + rank, so a reordered merge list changes it.
+static uint64_t tailVocabKey(const std::vector<MergeRuleGroup> & all) {
+    uint64_t sum = 0, n = 0;
+    for (const auto & g : all)
+        for (const MergeRule & r : g.rules) {
+            sum += tailMix64((uint64_t(r.idA) << 42) ^ (uint64_t(r.idB) << 21) ^ r.idAB);
+            n++;
+        }
+    uint64_t k = tailMix64(sum ^ tailMix64(n));
+    for (unsigned by = 0; by < 256; by++) k = tailMix64(k ^ (uint64_t(by) << 32) ^ gTailBase[by]);
+    const char * e = std::getenv("BPE_VOCAB_BITS");
+    k = tailMix64(k ^ (uint64_t(e ? std::atoi(e) : 0) << 48) ^ (uint64_t(kTailVocabFileVersion) << 32)
+                  ^ (sizeof(TailCacheEntry) << 8) ^ kTailByteKeyMax);
+    return tailMix64(k ^ tailVocabSetHash(0x0123456789ABCDEFull, 0x0F00000000000042ull));
+}
+// Publish the table in `path` if it was made with `key`; false (nothing changed) otherwise.
+static bool tailVocabLoad(const std::string & path, uint64_t key) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    TailVocabFileHeader hd;
+    const bool okHead = ::fstat(fd, &st) == 0 && size_t(st.st_size) >= sizeof hd
+        && ::pread(fd, &hd, sizeof hd, 0) == ssize_t(sizeof hd)
+        && std::memcmp(hd.magic, kTailVocabMagic, 8) == 0 && hd.version == kTailVocabFileVersion
+        && hd.entrySize == sizeof(TailCacheEntry) && hd.keyMax == kTailByteKeyMax && hd.key == key
+        && hd.bits >= 4 && hd.bits <= 24
+        && size_t(st.st_size) == sizeof hd + (sizeof(TailCacheEntry) << (hd.bits + 2));
+    void * map = okHead ? ::mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0) : MAP_FAILED;
+    ::close(fd);
+    if (map == MAP_FAILED) return false;
+    if (gTailVocabMap) ::munmap(gTailVocabMap, gTailVocabMapSize);
+    gTailVocabMap = map;
+    gTailVocabMapSize = size_t(st.st_size);
+    gTailVocabShift = 64 - hd.bits;
+    gTailVocab.store(reinterpret_cast<TailCacheEntry *>(static_cast<char *>(map) + sizeof hd),
+                     std::memory_order_release);
+    std::cerr << "[BPE] --tail-vocab-table: " << hd.stored << " tokens in "
+              << ((size_t(128) << hd.bits) / 1024) << " KB, read from " << path << " in "
+              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count()
+              << " ms\n";
+    return true;
+}
+// Write the built table to `path` (all or nothing); the outcome, for the build's report line.
+static std::string tailVocabSave(const std::string & path, const TailVocabFileHeader & hd,
+                                 const TailCacheEntry * vocab) {
+    const std::string tmp = path + ".tmp." + std::to_string(::getpid());
+    const size_t entries = size_t(4) << hd.bits;
+    FILE * f = std::fopen(tmp.c_str(), "wb");
+    bool ok = f && std::fwrite(&hd, sizeof hd, 1, f) == 1
+        && std::fwrite(vocab, sizeof(TailCacheEntry), entries, f) == entries;
+    if (f) ok = std::fclose(f) == 0 && ok;
+    if (ok) ok = std::rename(tmp.c_str(), path.c_str()) == 0;
+    if (!ok) { std::remove(tmp.c_str()); return "; could not write " + path; }
+    return "; written to " + path;
+}
+
 // --tail-vocab-table: build the table from the rules (gTail must be built) and publish it.
 // Tokens go in by rank, so when a set is full it is a rarer token that is left to the merge
 // path. Runs on gTailVocabThread.
@@ -4519,8 +4617,7 @@ static void tailVocabBuild(std::vector<MergeRule> rules) {
         std::memcpy(&a, s.b, std::min<size_t>(len, 8));
         if (len > 8) std::memcpy(&b, s.b + 8, len - 8);
         const uint64_t k0 = a, k1 = b | (uint64_t(len) << 56);
-        const uint64_t h = (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
-        TailCacheEntry * vs = vocab + (h >> gTailVocabShift) * 4;
+        TailCacheEntry * vs = vocab + (tailVocabSetHash(k0, k1) >> gTailVocabShift) * 4;
         unsigned i = 0;
         while (i < 4 && vs[i].k1 != 0) i++;
         if (i == 4) { full++; continue; }
@@ -4528,12 +4625,24 @@ static void tailVocabBuild(std::vector<MergeRule> rules) {
         stored++;
     }
     gTailVocab.store(vocab, std::memory_order_release);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::string saved;
+    if (!TailVocabFile.empty()) {
+        TailVocabFileHeader hd{};
+        std::memcpy(hd.magic, kTailVocabMagic, 8);
+        hd.version = kTailVocabFileVersion;
+        hd.entrySize = sizeof(TailCacheEntry);
+        hd.keyMax = kTailByteKeyMax;
+        hd.bits = bits;
+        hd.key = gTailVocabFileKey;
+        hd.stored = stored; hd.unreachable = unreachable; hd.full = full;
+        saved = tailVocabSave(TailVocabFile, hd, vocab);
+    }
     // printed by tailVocabJoin on the main thread: from here it could split another stderr line
     gTailVocabReport = "[BPE] --tail-vocab-table: " + std::to_string(stored) + " tokens in "
         + std::to_string((size_t(128) << bits) / 1024) + " KB (" + std::to_string(unreachable)
         + " not reached by their own merges, " + std::to_string(full) + " left out: full sets), "
-        + std::to_string(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count())
-        + " ms\n";
+        + std::to_string(ms) + " ms" + saved + "\n";
 }
 
 BPEPassResult buildBPEPassPipeline(
@@ -4568,7 +4677,10 @@ BPEPassResult buildBPEPassPipeline(
         gTailOpen.n = 0;
         tailVocabJoin();
         gTailVocab.store(nullptr, std::memory_order_relaxed);
-        if (TailVocabTable) {
+        if (TailVocabTable && !TailVocabFile.empty()
+                && tailVocabLoad(TailVocabFile, gTailVocabFileKey = tailVocabKey(all))) {
+            // published: no builder thread
+        } else if (TailVocabTable) {
             std::vector<MergeRule> rules;
             for (const auto & g : all) rules.insert(rules.end(), g.rules.begin(), g.rules.end());
             // joined at exit before the statics it reads (gTail, gTailBase) are destroyed

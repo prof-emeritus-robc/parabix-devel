@@ -165,7 +165,15 @@ CLDR test cases, and is identical to ICU on 20,000 random lines and 20,000
 lines with shadda runs of up to 11; Kana-Latn, whose deferred deletions now
 also run in one round, is identical to ICU on 5,000 random lines with runs of
 iteration marks (its kernels 1,053 → 1,149). W6 is needed by Latn-Grek alone
-(with W3).*
+(with W3). Then capture rules of a conversion group differing in one text
+character and their results merged as the variants of one set (`d97c03f75`,
+`--update --only` the 25 transforms concerned): NumericPinyin-Latin's kernels
+2,355 → 848 (70 sets → 14) and Bopo-Latn's 2,532 → 969, with fewer for
+Latn-Grek/UNGEGN, Zawgyi-my and my-Zawgyi; the six give the same output with
+and without the merge and through ICU on 5,000 random lines each, and the CLDR
+test results of the 25 are unchanged. (am_FONIPA-am and the 19 transforms
+through it count 144 kernels more than at their last update, from a change
+since then, not the merge, which takes 3 from am_FONIPA-am: not yet traced.)*
 
 This report covers:
 
@@ -1442,6 +1450,29 @@ round: fa-fa_FONIPA's last group, `([$IPA_CONSONANT$VOWEL\|]) { ّ → $1` and
 `ّ → ;`, kept shaddas after a vowel's run of 9 or more. Kana-Latn's two deletions of
 `ヽ` (without a voicing mark after it) take the same path.
 
+**Capture variants** (`d97c03f75`, `MultipleCaptureMultipleReplacementSet::variants`).
+A function call on a capture of single characters is expanded into one rule
+per value (W5, §5), and a MultipleCaptureMultipleReplacement rule so expanded
+became one set per value, each matched by the engine on its own:
+NumericPinyin-Latin's three rules `$1 &NumericPinyin-Pinyin($3) $2 ← ([aAeE])
+($vowel* $consonant*) ($digit)` … made 70 sets (five tone digits, and the
+shapes of the optional runs), about 30 kernels each. Within a conversion group,
+rules differing from the first rule of a set only in the characters at one
+position of a text (the selector, whose characters occur in no other item of
+a match) and in their results are now variants of that set, where no rule of
+the group between them may match where the variant does (so that the set
+applies it where ICU would). The set is matched once, with the union at the
+selector; the variant of each match, by the characters at its selector, is
+carried to the positions of its replacements (shifted, or between the start
+and the end of the match, `IndexedShiftBack` and `IndexedAdvance` along the
+starts and ends of the matches selected), and one fused kernel per position
+applies the replacements of the variants. The replacements are made within the
+group, as ICU makes them, so its before contexts see ICU's converted text: a
+call deferred past the group, with a placeholder where its value goes, could
+not tell `a53` → `ǎ` from `a43` → `à3` (tone 5 writes nothing, and the letter
+before it is then seen by `[:Letter:] { ($digit)`). `--capture-variants=false`
+turns the merge off.
+
 Prefix runs then made 12 more transforms implementable (the ten Ethi-Latn
 romanizations, ro-ja and ro_FONIPA-ja), and removed the W6 problems of sk-ja
 and sk_FONIPA-ja. Prefix runs of several characters, with their triggers
@@ -2001,6 +2032,7 @@ tconv on every implementable transform.
 | `3987326eb` | before contexts capturing a set with strings expanded, longest first: fa-fa_FONIPA no longer needs W5 |
 | `3471879aa`, `65350b3ce` | front-letter revisits (the rough breathing); before contexts with repetitions matched against the converted text with their after contexts matched by the engine: Grek-Latn: 423 |
 | `53121b04a` | run moves with marks (the shadda after a vowel); deferred deletions through runs in one round: fa-fa_FONIPA: 424 |
+| `d97c03f75` | capture rules of a group differing in one text character merged as variants: NumericPinyin-Latin 2,355 → 848 kernels |
 
 ## Reproducing
 

@@ -646,7 +646,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
                 bpeBytes = P.CreateStreamSet(1, 8);
                 P.CreateKernelCall<P2SKernel>(bpeBasis, bpeBytes);
             }
-            buildBPEByteTailEmitter(P, bpeBytes, tr.segStarts);
+            buildBPEByteTailEmitter(P, bpeBytes, bpeBasis, tr.segStarts);
         } else {
             buildBPETailEmitter(P, vocabID, matchEnd, tr.segStarts);
         }

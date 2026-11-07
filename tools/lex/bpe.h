@@ -137,9 +137,10 @@ void bpeTailSetSink(BPETailSink sink);
 void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
                          kernel::StreamSet * starts, kernel::StreamSet * segs);
 // --tail-from-bytes (buildBPEPassPipeline returned vocabID == nullptr): the same emitter, run
-// on the BPE input as a byte stream (1x8) and the pretoken starts.
+// on the BPE input as a byte stream (1x8), its basis bits (8x1, for --tail-unit-cuts) and the
+// pretoken starts.
 void buildBPEByteTailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * bytes,
-                             kernel::StreamSet * segs);
+                             kernel::StreamSet * basis, kernel::StreamSet * segs);
 // --bench-cold-cache: every thread's tail segment cache starts empty on the next pipeline
 // run, as in a one-shot run (the caches survive across --bench-loop runs otherwise).
 void bpeDropTailCaches();

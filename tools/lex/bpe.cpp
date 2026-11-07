@@ -827,6 +827,29 @@ static unsigned bpeBaseId(unsigned by) {
     return by - 68;                        // 174..255
 }
 
+// The 8 bits of each byte's base id, as streams. id(byte) is a fixed byte->id bijection:
+// piecewise byte + offset (T1). Expressed as CCs instead of BixNum arithmetic: for each id
+// bit k, the SET of bytes whose id has bit k set is a byte character class, so compileCC over
+// the byte basis yields that id-bit stream directly. Data-independent, so a kernel computing
+// it can keep a constant cache name.
+static std::vector<PabloAST *> bpeBaseIdBits(PabloBuilder & pb, const std::vector<PabloAST *> & basisBits) {
+    cc::Parabix_CC_Compiler_Builder ccc(basisBits);
+    std::vector<PabloAST *> idBits(8);
+    for (unsigned k = 0; k < 8; k++) {
+        re::CC * cc = nullptr;                      // bytes whose id has bit k set
+        for (unsigned by = 0; by < 256; ) {
+            if ((bpeBaseId(by) >> k) & 1u) {
+                const unsigned lo = by;
+                while (by < 256 && ((bpeBaseId(by) >> k) & 1u)) by++;
+                re::CC * const part = re::makeByte(lo, by - 1);
+                cc = cc ? re::makeCC(cc, part) : part;
+            } else ++by;
+        }
+        idBits[k] = cc ? ccc.compileCC(cc, pb) : pb.createZeroes();
+    }
+    return idBits;
+}
+
 class BPERangeSeed : public PabloKernel {
 public:
     BPERangeSeed(LLVMTypeSystemInterface & ts, StreamSet * basis,
@@ -841,29 +864,7 @@ protected:
         PabloAST * zeroes = pb.createZeroes();
         PabloAST * ones   = pb.createNot(zeroes);
 
-        // id(byte) is a fixed byte->id bijection: piecewise byte + offset (T1). Expressed
-        // as CC instead of BixNum arithmetic: for each id output bit k, the SET of bytes
-        // whose id has bit k set is a byte character class, so compileCC over the byte
-        // basis yields that id-bit stream directly — no Select/AddModular/SubModular.
-        // Data-independent (constant) → cache name stays constant. Ranges (must stay a
-        // bijection over 0..255): 0..32→+188  33..126→-33  127..160→+94  161..172→-67
-        // 173→255  174..255→-68.
-        cc::Parabix_CC_Compiler_Builder ccc(basisBits);
-        auto idOf = bpeBaseId;
-        const unsigned IDBITS = 8;                 // base ids are 0..255
-        std::vector<PabloAST*> idBits(IDBITS);
-        for (unsigned k = 0; k < IDBITS; k++) {
-            re::CC * cc = nullptr;                  // bytes whose id has bit k set
-            for (unsigned by = 0; by < 256; ) {
-                if ((idOf(by) >> k) & 1u) {
-                    unsigned lo = by;
-                    while (by < 256 && ((idOf(by) >> k) & 1u)) by++;
-                    re::CC * part = re::makeByte(lo, by - 1);
-                    cc = cc ? re::makeCC(cc, part) : part;
-                } else ++by;
-            }
-            idBits[k] = cc ? ccc.compileCC(cc, pb) : zeroes;
-        }
+        const std::vector<PabloAST*> idBits = bpeBaseIdBits(pb, basisBits);   // (T1)
         // Write the id into the 16-bit `source` stream (ids ≤255 → high bits 0),
         // active = all 1s, end = all 0s. idBits[i] = the i-th id bit (a compiled CC).
         Var * sOut = getOutputStreamVar("source");
@@ -873,6 +874,77 @@ protected:
         pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)), ones);
         pb.createAssign(pb.createExtract(getOutputStreamVar("end"),    pb.getInteger(0)), zeroes);
     }
+};
+
+// --tail-unit-seed: the base id of every byte as 8 bit streams (BPERangeSeed's id bits alone).
+class BPEBaseIdKernel final : public PabloKernel {
+public:
+    BPEBaseIdKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * ids)
+    : PabloKernel(ts, "BPE_BaseIds", {Binding{"basis", basis}}, {Binding{"ids", ids}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        writeOutputStreamSet("ids", bpeBaseIdBits(pb, getInputStreamSet("basis")));
+    }
+};
+
+// --tail-unit-cuts: the pretoken starts cut at every frozen byte (a byte whose base id is in
+// no rule), and the positions whose token is already known. No token holds a frozen byte and
+// any other byte, so the BPE of a pretoken is the BPE of its pieces between such cuts (as for
+// --tail-hard-split), and every frozen byte is a pretoken of its own. Outputs:
+//   cuts = InFile(segs | F | Advance(F, 1)), F the frozen bytes: the pretoken starts after the cuts;
+//   unit = cuts & next(cuts): the pretokens of one byte, whose token is the byte's base id. At
+//          the input's last byte next(cuts) is whatever lies past the end, and either value is
+//          right: a start there is a pretoken of one byte, and a 0 only means not marked;
+//   scan = cuts & ~(unit & Advance(unit, 1)): the starts the resolve scan walks. A unit start
+//          right after another unit is dropped, so a run of units costs one scan step, while
+//          every start that ends a longer pretoken stays.
+// The frozen set depends on the merge list, so its bits are in the kernel's name.
+class BPEUnitCutsKernel final : public PabloKernel {
+public:
+    BPEUnitCutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * segs,
+                      StreamSet * cuts, StreamSet * unit, StreamSet * scan, const std::array<uint64_t, 4> & frozen)
+    : PabloKernel(ts, "BPE_UnitCuts_" + hexName(frozen),
+                  {Binding{"basis", basis, FixedRate(), LookAhead(1)},
+                   Binding{"segs", segs, FixedRate(), LookAhead(1)}},
+                  {Binding{"cuts", cuts}, Binding{"unit", unit}, Binding{"scan", scan}})
+    , mFrozen(frozen) {}
+protected:
+    static std::string hexName(const std::array<uint64_t, 4> & f) {
+        char buf[68];
+        std::snprintf(buf, sizeof(buf), "%016llx%016llx%016llx%016llx", (unsigned long long) f[3],
+                      (unsigned long long) f[2], (unsigned long long) f[1], (unsigned long long) f[0]);
+        return buf;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        PabloAST * const segs = getInputStreamSet("segs")[0];
+        re::CC * frozenCC = nullptr;
+        for (unsigned by = 0; by < 256; by++) {
+            if (((mFrozen[by >> 6] >> (by & 63)) & 1) == 0) continue;
+            re::CC * const part = re::makeByte(by, by);
+            frozenCC = frozenCC ? re::makeCC(frozenCC, part) : part;
+        }
+        PabloAST * F = pb.createZeroes(), * Fnext = pb.createZeroes();
+        if (frozenCC) {
+            cc::Parabix_CC_Compiler_Builder ccc(basis);
+            F = ccc.compileCC(frozenCC, pb);
+            std::vector<PabloAST *> next(basis.size());
+            for (unsigned i = 0; i < basis.size(); i++) next[i] = pb.createLookahead(basis[i], 1);
+            cc::Parabix_CC_Compiler_Builder cccNext(next);
+            Fnext = cccNext.compileCC(frozenCC, pb);
+        }
+        PabloAST * const cuts = pb.createInFile(pb.createOr(segs, pb.createOr(F, pb.createAdvance(F, 1))));
+        // cuts at p + 1: segs or F there, or F at p (which cuts after itself)
+        PabloAST * const cutsNext = pb.createOr(pb.createLookahead(segs, 1), pb.createOr(Fnext, F));
+        PabloAST * const unit = pb.createAnd(cuts, cutsNext);
+        PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(unit, pb.createAdvance(unit, 1))));
+        writeOutputStreamSet("cuts", std::vector<PabloAST *>{cuts});
+        writeOutputStreamSet("unit", std::vector<PabloAST *>{unit});
+        writeOutputStreamSet("scan", std::vector<PabloAST *>{scan});
+    }
+    const std::array<uint64_t, 4> mFrozen;
 };
 
 // BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
@@ -1721,6 +1793,28 @@ static cl::opt<bool> TailScanIRCache(
     cl::desc("With --tail-scan-kernel: also finish hits on the first entry of the thread cache's "
              "set in generated code (default off)."),
     cl::init(false));
+// --tail-unit-cuts (with --tail-scan-kernel): BPEUnitCutsKernel cuts the pretokens at every
+// frozen byte and marks the pretokens of one byte (unit), whose token is the byte's base id.
+// The scan kernel walks its `scan` starts: a start after a unit start is a run of units, which
+// it finishes by writing their base ids (a scalar loop over the table) and nothing else; any
+// other start is a pretoken as before. A call's edges are not cut where they fall in a run of
+// units (unit is exact there: BPEUnitCutsKernel looks one byte past the call). Runtime and
+// kernel names: BPE_UnitCuts_<frozen set>, BPE_TailScanIR..._u.
+static cl::opt<bool> TailUnitCuts(
+    "tail-unit-cuts",
+    cl::desc("With --tail-scan-kernel: cut pretokens at frozen bytes and finish the pretokens of one "
+             "byte without resolving them (default off)."),
+    cl::init(false));
+// --tail-unit-seed (implies --tail-unit-cuts): the base ids of all bytes come from bit streams,
+// BPEBaseIdKernel's 8 id bits packed to 16-bit ids by P2S16Kernel, and the scan kernel updates
+// that id stream in place (InOut) instead of writing the ids of units or of one-byte
+// pretokens. Kernel name tag: BPE_TailScanIR..._us.
+static cl::opt<bool> TailUnitSeed(
+    "tail-unit-seed",
+    cl::desc("With --tail-scan-kernel: start the tail's ids as every byte's base id, computed with "
+             "bit streams and packed by P2S16 (implies --tail-unit-cuts; default off)."),
+    cl::init(false));
+static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed; }
 // Measurement only (wrong output): pretokens of more than N bytes get a 0 and nothing else,
 // in BPETailScanKernel.
 static cl::opt<unsigned> TailSkipLong("tail-skip-long", cl::init(0), cl::Hidden);
@@ -2325,6 +2419,11 @@ struct TailByteWalk {
       setShift(64 - S.setBits), vocab(gTailVocab.load(std::memory_order_acquire)),
       pieces{cache, setShift, vocab, n}, split(TailHardSplit && vocab) {}
 
+    void unitRange(size_t lo, size_t hi) {                  // --tail-unit-cuts: bytes of units
+        if (TailUnitSeed) return;                           // their ids are there already
+        for (size_t p = lo; p < hi; p++) res[p] = gTailBase[bytes[p]];
+    }
+
     void openRange(size_t lo, size_t hi, bool segStart) {   // the bytes of a cut segment
         if (segStart && lo < hi) tailMark(seg, uint32_t(lo));
         for (size_t p = lo; p < hi; p++) {
@@ -2429,22 +2528,32 @@ template <unsigned W>
 struct TailWalkCall {
     TailByteWalk<W> walk;
     bool final;
+    const uint64_t * unit;                    // --tail-unit-cuts: the units, else null
+    bool isUnit(uint64_t p) const { return unit && p < walk.n && ((unit[p / 64] >> (p % 64)) & 1); }
 };
 
+// With --tail-unit-cuts, a call edge that falls in a run of units cuts nothing: if the call's
+// first byte (or the last scan start) is a unit, every byte up to the next scan start (or the
+// call's end) is one, as the scan stream drops only units that follow units.
 template <unsigned W>
 static void tailWalkStart(uint64_t call, uint64_t prev, uint64_t p) {
-    TailByteWalk<W> & walk = reinterpret_cast<TailWalkCall<W> *>(call)->walk;
-    if (LLVM_UNLIKELY(prev == kTailNoStart)) walk.openRange(0, p, false);   // cut by the left edge
-    else walk.word(prev, p);
+    TailWalkCall<W> & c = *reinterpret_cast<TailWalkCall<W> *>(call);
+    TailByteWalk<W> & walk = c.walk;
+    if (LLVM_LIKELY(prev != kTailNoStart)) walk.word(prev, p);
+    else if (c.isUnit(0)) walk.unitRange(0, p);
+    else walk.openRange(0, p, false);                                // cut by the left edge
 }
 
 template <unsigned W>
 static void tailWalkEnd(uint64_t call, uint64_t prev) {
     TailWalkCall<W> & c = *reinterpret_cast<TailWalkCall<W> *>(call);
     TailByteWalk<W> & walk = c.walk;
-    if (prev == kTailNoStart) walk.openRange(0, walk.n, false);       // no start in the call
+    if (prev == kTailNoStart) {                                      // no start in the call
+        if (c.isUnit(0)) walk.unitRange(0, walk.n);
+        else walk.openRange(0, walk.n, false);
+    } else if (c.isUnit(prev)) walk.unitRange(prev, walk.n);
     else if (c.final) walk.word(prev, walk.n);
-    else walk.openRange(prev, walk.n, true);                          // may go on in the next call
+    else walk.openRange(prev, walk.n, true);                         // may go on in the next call
     walk.drain();
 }
 
@@ -2461,13 +2570,16 @@ struct TailIRCtx {
 static_assert(sizeof(TailCacheEntry) == 32 && offsetof(TailCacheEntry, out) == 18,
               "the generated vocabulary probe reads 32-byte entries, out[0] at byte 18");
 
+// segs: the starts whose first token is a token start (with --tail-unit-cuts, the cut starts:
+// emit begins as a copy); unit: --tail-unit-cuts's units, else null.
 template <unsigned W>
-static uint64_t tailWalkBeginIR(const uint8_t * bytes, const uint64_t * segs, uint16_t * res, uint64_t * emit,
-                                uint64_t * open, uint64_t * seg, uint64_t numItems, uint64_t n, uint64_t final) {
+static uint64_t tailWalkBeginIR(const uint8_t * bytes, const uint64_t * segs, const uint64_t * unit, uint16_t * res,
+                                uint64_t * emit, uint64_t * open, uint64_t * seg, uint64_t numItems, uint64_t n,
+                                uint64_t final) {
     using Call = TailWalkCall<W>;
     alignas(Call) thread_local unsigned char mem[sizeof(Call)];
     n = std::min(n, numItems);
-    Call * const c = new (mem) Call{TailByteWalk<W>(tailScratch(), bytes, res, emit, open, seg, n), final != 0};
+    Call * const c = new (mem) Call{TailByteWalk<W>(tailScratch(), bytes, res, emit, open, seg, n), final != 0, unit};
     const TailStartBits st(segs, n);
     for (size_t i = 0; i < st.nWords; i++) emit[i] = st.word(i);   // every pretoken's first token
     std::fill(emit + st.nWords, emit + numItems / 64, 0);
@@ -2683,17 +2795,35 @@ protected:
 // --tail-scan-kernel: BPETailByteResolveKernel as a two-level scan over the pretoken starts.
 // The scan keeps the previous start in a loop variable; at each start it finishes the pretoken
 // between the two in generated code (generateIRWord) or calls bpe_tail_ir_slow for it.
+// --tail-unit-cuts: segs is BPEUnitCutsKernel's scan stream, cuts its cut starts (emit's first
+// value) and unit its units; a step from a unit start is a run of units. --tail-unit-seed: resIn
+// holds every byte's base id and res updates it in place.
 class BPETailScanKernel final : public TwoLevelScanKernel {
 public:
     BPETailScanKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * segs,
-                      StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg, unsigned cacheWays)
+                      StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg, unsigned cacheWays,
+                      StreamSet * cuts = nullptr, StreamSet * unit = nullptr, StreamSet * resIn = nullptr)
     : TwoLevelScanKernel(ts, std::string("BPE_TailScanIR") + (cacheWays ? "c" + std::to_string(cacheWays) : "")
-                             + (TailSkipLong ? "_skip" + std::to_string(TailSkipLong) : ""),
+                             + (TailSkipLong ? "_skip" + std::to_string(TailSkipLong) : "")
+                             + (unit ? (resIn ? "_us" : "_u") : ""),
                          64, "segs", {LoopVar("prev", ts.getInt64Ty())})
-    , mCacheWays(cacheWays) {
+    , mCacheWays(cacheWays), mUnitCuts(unit != nullptr), mSeeded(resIn != nullptr) {
         mInputStreamSets.push_back(Binding{"segs", segs, FixedRate(1), Principal()});
         mInputStreamSets.push_back(Binding{"bytes", bytes});
-        mOutputStreamSets.push_back(Binding{"res", res});
+        if (mUnitCuts) {
+            mInputStreamSets.push_back(Binding{"cuts", cuts});
+            mInputStreamSets.push_back(Binding{"unit", unit});
+        }
+        if (mSeeded) {
+            // LLVM's greedy register allocator crashes (SplitEditor::deleteRematVictims, LLVM 19
+            // and 22) compiling the pipeline function when resIn is a thread-local buffer, as it
+            // did for --tail-len-kernels' InOut chain; LookBehind(1) keeps it out of one (so
+            // would -DisableThreadLocalStreamSets).
+            mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), LookBehind(1)});
+            mOutputStreamSets.push_back(Binding{"res", res, FixedRate(1), InOut("resIn")});
+        } else {
+            mOutputStreamSets.push_back(Binding{"res", res});
+        }
         mOutputStreamSets.push_back(Binding{"emit", emit});
         mOutputStreamSets.push_back(Binding{"open", open});
         mOutputStreamSets.push_back(Binding{"seg", seg});
@@ -2716,9 +2846,12 @@ protected:
         mRes = b.getOutputStreamBlockPtr("res", zero);
         mEmit = b.getOutputStreamBlockPtr("emit", zero);
         Type * const i8 = b.getInt8Ty(), * const i64 = b.getInt64Ty(), * const ptr = PointerType::getUnqual(b.getContext());
+        mUnit = mUnitCuts ? b.getInputStreamBlockPtr("unit", zero) : nullptr;
+        Value * const firstStarts = b.getInputStreamBlockPtr(mUnitCuts ? "cuts" : "segs", zero);
         Value * const ctx = b.CreateIntToPtr(
             b.CreateCall(fn->getFunctionType(), fn,
-                         {mBytes, b.getInputStreamBlockPtr("segs", zero), mRes, mEmit,
+                         {mBytes, firstStarts, mUnitCuts ? mUnit : ConstantPointerNull::get(cast<PointerType>(ptr)),
+                          mRes, mEmit,
                           b.getOutputStreamBlockPtr("open", zero), b.getOutputStreamBlockPtr("seg", zero),
                           numItems, mN, b.CreateZExt(b.isFinal(), b.getInt64Ty())}),
             ptr);
@@ -2756,6 +2889,30 @@ protected:
         b.CreateBr(done);
 
         b.SetInsertPoint(word);
+        if (mUnitCuts) {                            // a step from a unit start: a run of units
+            BasicBlock * const units = b.CreateBasicBlock("irUnits");
+            BasicBlock * const pretoken = b.CreateBasicBlock("irPretoken");
+            Value * const uw = b.CreateLoad(i64, b.CreateGEP(i64, mUnit, b.CreateLShr(prev, 6)));
+            Value * const isUnit = b.CreateTrunc(b.CreateLShr(uw, b.CreateAnd(prev, c64(63))), b.getInt1Ty());
+            b.CreateCondBr(isUnit, units, pretoken);
+            b.SetInsertPoint(units);
+            if (mSeeded) {
+                b.CreateBr(done);                   // their base ids are in res already
+            } else {                                // [prev, p): each byte's base id
+                BasicBlock * const loop = b.CreateBasicBlock("irUnitLoop");
+                BasicBlock * const entry = b.GetInsertBlock();
+                b.CreateBr(loop);
+                b.SetInsertPoint(loop);
+                PHINode * const q = b.CreatePHI(i64, 2);
+                q->addIncoming(prev, entry);
+                Value * const by = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, q)), i64);
+                b.CreateStore(b.CreateLoad(i16, b.CreateGEP(i16, mBaseIds, by)), b.CreateGEP(i16, mRes, q));
+                Value * const q1 = b.CreateAdd(q, c64(1));
+                q->addIncoming(q1, loop);
+                b.CreateCondBr(b.CreateICmpULT(q1, p), loop, done);
+            }
+            b.SetInsertPoint(pretoken);
+        }
         Value * const len = b.CreateSub(p, prev);
         if (TailSkipLong) {                         // measurement only
             BasicBlock * const keep = b.CreateBasicBlock("irKeep");
@@ -2769,9 +2926,11 @@ protected:
         b.CreateCondBr(b.CreateICmpEQ(len, c64(1)), one, multi);
 
         b.SetInsertPoint(one);                      // one byte: its base id
-        Value * const byte = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, prev)), i64);
-        Value * const baseId = b.CreateLoad(i16, b.CreateGEP(i16, mBaseIds, byte));
-        b.CreateStore(baseId, b.CreateGEP(i16, mRes, prev));
+        if (!mSeeded) {                             // (--tail-unit-seed: there already)
+            Value * const byte = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, prev)), i64);
+            Value * const baseId = b.CreateLoad(i16, b.CreateGEP(i16, mBaseIds, byte));
+            b.CreateStore(baseId, b.CreateGEP(i16, mRes, prev));
+        }
         b.CreateBr(done);
 
         b.SetInsertPoint(multi);                    // 2 .. 15 bytes inside the call, table built
@@ -2850,6 +3009,8 @@ protected:
         b.CreateCall(fn->getFunctionType(), fn, {mCall, loopVarFinalValues[0]});
     }
     const unsigned mCacheWays;
+    const bool mUnitCuts, mSeeded;
+    Value * mUnit = nullptr;                                                 // --tail-unit-cuts
     Value * mBase = nullptr, * mCall = nullptr;
     Value * mBytes = nullptr, * mRes = nullptr, * mN = nullptr;
     Value * mVocab = nullptr, * mVShift = nullptr, * mBaseIds = nullptr;
@@ -2863,12 +3024,45 @@ static void linkTailWalkIR(PipelineBuilder & P, Kernel * k) {
     P.LinkFunction(k, "bpe_tail_walk_end", tailWalkEnd<kTailCacheWays>);
 }
 
-void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * segs) {
+void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * basis, StreamSet * segs) {
     StreamSet * res = P.CreateStreamSet(1, 16);
     StreamSet * emit = P.CreateStreamSet(1, 1);
     StreamSet * open = P.CreateStreamSet(1, 1);
     StreamSet * seg = P.CreateStreamSet(1, 1);
-    if (TailScanKernel) {
+    if (tailUnitCuts() && !TailScanKernel) {
+        std::cerr << "tokenizer: --tail-unit-cuts and --tail-unit-seed need --tail-scan-kernel\n";
+        std::exit(1);
+    }
+    if (TailScanKernel && tailUnitCuts()) {
+        // frozen bytes: base id in no rule, as left or right part (gTail.left / right)
+        std::array<uint64_t, 4> frozen{};
+        unsigned nFrozen = 0;
+        for (unsigned by = 0; by < 256; by++) {
+            const unsigned id = bpeBaseId(by);
+            if (((gTail.left[id >> 6] | gTail.right[id >> 6]) >> (id & 63)) & 1) continue;
+            frozen[by >> 6] |= 1ull << (by & 63);
+            nFrozen++;
+        }
+        std::cerr << "[BPE] --tail-unit-cuts: " << nFrozen << " frozen bytes"
+                  << (TailUnitSeed ? ", ids seeded from bit streams (--tail-unit-seed)" : "") << "\n";
+        StreamSet * cuts = P.CreateStreamSet(1, 1);
+        StreamSet * unit = P.CreateStreamSet(1, 1);
+        StreamSet * scan = P.CreateStreamSet(1, 1);
+        P.CreateKernelCall<BPEUnitCutsKernel>(basis, segs, cuts, unit, scan, frozen);
+        StreamSet * resIn = nullptr;
+        if (TailUnitSeed) {
+            StreamSet * ids8 = P.CreateStreamSet(8, 1);
+            P.CreateKernelCall<BPEBaseIdKernel>(basis, ids8);
+            resIn = P.CreateStreamSet(1, 16);
+            StreamSets idSets{ids8};
+            P.CreateKernelCall<P2S16Kernel>(idSets, resIn);
+        }
+        TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the cuts
+        const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
+        Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, scan, res, emit, open, seg, cacheWays,
+                                                                 cuts, unit, resIn);
+        linkTailWalkIR(P, r);
+    } else if (TailScanKernel) {
         TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the starts
         const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
         Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, segs, res, emit, open, seg, cacheWays);

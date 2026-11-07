@@ -1516,7 +1516,7 @@ struct TailDesc {
 };
 
 // Look d up (or merge it and fill the cache) and write its output ids at their positions.
-static inline void tailFinishDesc(const TailDesc & d, uint32_t * res, uint64_t * emit) {
+static inline void tailFinishDesc(const TailDesc & d, uint16_t * res, uint64_t * emit) {
     TailCacheEntry * const set = d.set;
     const TailCacheEntry * e;
     if (LLVM_LIKELY(set[0].k0 == d.k0 && set[0].k1 == d.k1)) e = &set[0];
@@ -1546,12 +1546,13 @@ static inline void tailFinishDesc(const TailDesc & d, uint32_t * res, uint64_t *
 }
 
 // The tail runs in two kernels. BPETailResolveKernel is data-parallel: each call finishes
-// every segment that lies wholly inside its own blocks and writes one word per token start:
-// the finished id, or the input id with kTailOpen for a token of a segment cut by the call's
-// edges (bit kTailSeg on the first token of such a segment); a bit in `emit` marks each of
-// these, and not the tokens merged into their left neighbour. BPETailKernel then walks the
-// marked words in order on one thread, emits, and finishes the cut segments, a couple per call.
-static constexpr uint32_t kTailOpen = 1u << 16, kTailSeg = 1u << 18;
+// every segment that lies wholly inside its own blocks and writes one 16-bit id per token
+// start in `res`: the finished id, or the input id for a token of a segment cut by the call's
+// edges, which the bit stream `open` marks (and `seg` the first token of such a segment); a
+// bit in `emit` marks each of these, and not the tokens merged into their left neighbour.
+// open and seg are 0 everywhere else. BPETailKernel then walks the marked ids in order on one
+// thread, emits, and finishes the cut segments, a couple per call.
+static inline void tailClearBits(uint64_t * bits, uint64_t numItems) { std::fill(bits, bits + numItems / 64, 0); }
 
 // The resolve loop walks the segment starts. A segment of one token is its own output; one
 // of 2 .. TailKey<B>::max tokens becomes a TailDesc, whose cache set is prefetched and which
@@ -1563,10 +1564,13 @@ static constexpr unsigned kTailAhead = 4;
 
 template <unsigned B>
 static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
-                        uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+                        uint16_t * res, uint64_t * emit, uint64_t * open, uint64_t * seg,
+                        uint64_t numItems, uint64_t n, uint64_t final) {
     using K = TailKey<B>;
     TailScratch & S = tailScratch();
     std::fill(emit, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
     if (n > numItems) n = numItems;
     const size_t nWords = (n + 63) / 64;
     if (nWords == 0) return;
@@ -1591,7 +1595,8 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
     for (size_t w = 0; w * 64 < first; w++)                     // cut by the left edge
         for (uint64_t x = bitsIn(w, 0, first); x; x &= x - 1) {
             const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
-            res[p] = ids[p] | kTailOpen;
+            res[p] = ids[p];
+            tailMark(open, p);
             tailMark(emit, p);
         }
     if (!sx) return;
@@ -1607,12 +1612,14 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
         const size_t e = last ? n : sw * 64 + __builtin_ctzll(sx);
         if (last && !final) {                                   // may go on in the next call
             drain();
-            uint32_t seg = kTailSeg;
+            bool segStart = true;
             for (size_t w = s / 64; w * 64 < n; w++)
                 for (uint64_t x = bitsIn(w, s, n); x; x &= x - 1) {
                     const uint32_t p = uint32_t(w * 64 + __builtin_ctzll(x));
-                    res[p] = ids[p] | kTailOpen | seg;
-                    seg = 0;
+                    res[p] = ids[p];
+                    tailMark(open, p);
+                    if (segStart) tailMark(seg, p);
+                    segStart = false;
                     tailMark(emit, p);
                 }
             return;
@@ -1678,10 +1685,10 @@ static void tailResolve(const uint16_t * ids, const uint64_t * starts, const uin
 // emit: one bit per token the emitter must visit (finished or cut), so it skips the
 // merged-away ones without reading them.
 extern "C" void bpe_tail_resolve(const uint16_t * ids, const uint64_t * starts, const uint64_t * segs,
-                                 uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n,
-                                 uint64_t final) {
+                                 uint16_t * res, uint64_t * emit, uint64_t * open, uint64_t * seg,
+                                 uint64_t numItems, uint64_t n, uint64_t final) {
     switch (gTail.idBits) {
-#define TAIL_CASE(B) case B: tailResolve<B>(ids, starts, segs, res, emit, numItems, n, final); return;
+#define TAIL_CASE(B) case B: tailResolve<B>(ids, starts, segs, res, emit, open, seg, numItems, n, final); return;
         TAIL_CASE(8) TAIL_CASE(9) TAIL_CASE(10) TAIL_CASE(11) TAIL_CASE(12)
         TAIL_CASE(13) TAIL_CASE(14) TAIL_CASE(15) TAIL_CASE(16)
 #undef TAIL_CASE
@@ -1920,9 +1927,9 @@ static size_t tailSplitMerge(const TailPieces & P, const uint8_t * w, size_t len
 // 6 lanes: 4 were ~2% slower, 8 the same (1 thread, val_4MB and webtext_cases).
 static constexpr unsigned kTailLanes = 6;
 template <unsigned W>
-static void tailPostKeep(TailScratch & S, const uint8_t * bytes, const uint32_t * res, const uint64_t * emit);
+static void tailPostKeep(TailScratch & S, const uint8_t * bytes, const uint16_t * res, const uint64_t * emit);
 template <unsigned W>
-static void tailBatchFlush(TailScratch & S, const uint8_t * bytes, uint32_t * res, uint64_t * emit) {
+static void tailBatchFlush(TailScratch & S, const uint8_t * bytes, uint16_t * res, uint64_t * emit) {
     const unsigned n = S.batchN;
     S.batchN = 0;
     if (n == 0) { tailPostKeep<W>(S, bytes, res, emit); return; }
@@ -1989,7 +1996,7 @@ static inline uint64_t tailBytesKey(const uint8_t * w, size_t L, uint64_t & k0, 
 // bytes: merged here) or queued for the batch.
 template <unsigned W>
 static bool tailSplitQueue(TailScratch & S, const TailPieces & P, const uint8_t * bytes, size_t s, size_t len,
-                           uint32_t * res, uint64_t * emit, uint32_t cuts = 0,     // cuts: len <= 15
+                           uint16_t * res, uint64_t * emit, uint32_t cuts = 0,     // cuts: len <= 15
                            bool * hadLong = nullptr) {                        // set: a piece over 15 bytes
 
     bool queued = false;
@@ -2038,12 +2045,12 @@ static bool tailSplitQueue(TailScratch & S, const TailPieces & P, const uint8_t 
 }
 
 template <unsigned W>
-static void tailPostKeepOne(TailScratch & S, const TailPost & t, const uint8_t * bytes, const uint32_t * res,
+static void tailPostKeepOne(TailScratch & S, const TailPost & t, const uint8_t * bytes, const uint16_t * res,
                             const uint64_t * emit);
 // Keep the cut pretoken t now if none of its pieces waits (queued false), else after the flush.
 template <unsigned W>
 static inline void tailPostAdd(TailScratch & S, const TailPost & t, bool queued, const uint8_t * bytes,
-                               uint32_t * res, uint64_t * emit) {
+                               uint16_t * res, uint64_t * emit) {
     if (!queued) { tailPostKeepOne<W>(S, t, bytes, res, emit); return; }
     if (S.postN == kTailBatch) tailBatchFlush<W>(S, bytes, res, emit);
     S.post[S.postN++] = t;
@@ -2052,7 +2059,7 @@ static inline void tailPostAdd(TailScratch & S, const TailPost & t, bool queued,
 // A pretoken of 2 .. kTailByteKeyMax bytes that is not in the vocabulary table: the thread cache,
 // else merged (or queued for the batch).
 template <unsigned W>
-static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes, uint32_t * res,
+static inline void tailFinishBytes(const TailByteDesc & d, const uint8_t * bytes, uint16_t * res,
                                    uint64_t * emit, const TailPieces * pieces = nullptr,
                                    TailScratch * batch = nullptr) {
     TailCacheEntry * const set = d.set;
@@ -2164,7 +2171,7 @@ static inline bool tailLongAdmit(TailScratch & S, uint64_t h, bool costly) {
 // tokens. With --tail-long-cache, look it up first and keep what was merged.
 template <unsigned W>
 static void tailLongPretoken(TailScratch & S, const uint8_t * bytes, size_t s, size_t len,
-                             uint32_t * res, uint64_t * emit, const TailPieces * pieces) {
+                             uint16_t * res, uint64_t * emit, const TailPieces * pieces) {
     const bool cached = TailLongCache && len <= kTailLongMax;
     const size_t slots = size_t(1) << kTailLongIndexBits;
     uint64_t h = 0;
@@ -2228,13 +2235,13 @@ static void tailLongPretoken(TailScratch & S, const uint8_t * bytes, size_t s, s
 // --tail-batch-bpe with --tail-hard-split: keep the cut pretokens whose pieces are all written,
 // their tokens read back from res at the emit bits.
 template <unsigned W>
-static void tailPostKeep(TailScratch & S, const uint8_t * bytes, const uint32_t * res, const uint64_t * emit) {
+static void tailPostKeep(TailScratch & S, const uint8_t * bytes, const uint16_t * res, const uint64_t * emit) {
     const unsigned n = S.postN;
     S.postN = 0;
     for (unsigned i = 0; i < n; i++) tailPostKeepOne<W>(S, S.post[i], bytes, res, emit);
 }
 template <unsigned W>
-static void tailPostKeepOne(TailScratch & S, const TailPost & t, const uint8_t * bytes, const uint32_t * res,
+static void tailPostKeepOne(TailScratch & S, const TailPost & t, const uint8_t * bytes, const uint16_t * res,
                             const uint64_t * emit) {
     {
         auto tokens = [&](auto && f) {                              // f(offset) at each token
@@ -2298,8 +2305,10 @@ template <unsigned W>
 struct TailByteWalk {
     TailScratch & S;
     const uint8_t * const bytes;
-    uint32_t * const res;
+    uint16_t * const res;
     uint64_t * const emit;
+    uint64_t * const open;                // the bytes of the segments cut by the call's edges
+    uint64_t * const seg;                 // ... and the first byte of the one cut by its right edge
     const size_t n;
     TailCacheEntry * const cache;
     const unsigned setShift;
@@ -2310,14 +2319,17 @@ struct TailByteWalk {
     const TailPieces * piecesOn() const { return split ? &pieces : nullptr; }
     TailScratch * batchOn() const { return TailBatchBPE ? &S : nullptr; }
 
-    TailByteWalk(TailScratch & S, const uint8_t * bytes, uint32_t * res, uint64_t * emit, size_t n)
-    : S(S), bytes(bytes), res(res), emit(emit), n(n), cache(S.sets),
+    TailByteWalk(TailScratch & S, const uint8_t * bytes, uint16_t * res, uint64_t * emit, uint64_t * open,
+                 uint64_t * seg, size_t n)
+    : S(S), bytes(bytes), res(res), emit(emit), open(open), seg(seg), n(n), cache(S.sets),
       setShift(64 - S.setBits), vocab(gTailVocab.load(std::memory_order_acquire)),
       pieces{cache, setShift, vocab, n}, split(TailHardSplit && vocab) {}
 
     void openRange(size_t lo, size_t hi, bool segStart) {   // the bytes of a cut segment
+        if (segStart && lo < hi) tailMark(seg, uint32_t(lo));
         for (size_t p = lo; p < hi; p++) {
-            res[p] = gTailBase[bytes[p]] | kTailOpen | (segStart && p == lo ? kTailSeg : 0);
+            res[p] = gTailBase[bytes[p]];
+            tailMark(open, uint32_t(p));
             tailMark(emit, uint32_t(p));
         }
     }
@@ -2377,16 +2389,18 @@ struct TailByteWalk {
 
 template <unsigned W>
 static void tailResolveBytes(TailScratch & S, const uint8_t * bytes, TailStartBits starts,
-                             uint32_t * res, uint64_t * emit, uint64_t numItems, uint64_t n,
-                             uint64_t final) {
+                             uint16_t * res, uint64_t * emit, uint64_t * open, uint64_t * seg,
+                             uint64_t numItems, uint64_t n, uint64_t final) {
     size_t copied = 0;
     if (TailEmitFromSegs) {                                         // every start of the call
         copied = starts.nWords;
         for (size_t i = 0; i < copied; i++) emit[i] = starts.word(i);
     }
     std::fill(emit + copied, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
     if (n == 0) return;
-    TailByteWalk<W> walk(S, bytes, res, emit, n);
+    TailByteWalk<W> walk(S, bytes, res, emit, open, seg, n);
     const size_t first = starts.next();
     walk.openRange(0, first, false);                                // cut by the left edge
     if (first == n) return;
@@ -2448,15 +2462,17 @@ static_assert(sizeof(TailCacheEntry) == 32 && offsetof(TailCacheEntry, out) == 1
               "the generated vocabulary probe reads 32-byte entries, out[0] at byte 18");
 
 template <unsigned W>
-static uint64_t tailWalkBeginIR(const uint8_t * bytes, const uint64_t * segs, uint32_t * res, uint64_t * emit,
-                                uint64_t numItems, uint64_t n, uint64_t final) {
+static uint64_t tailWalkBeginIR(const uint8_t * bytes, const uint64_t * segs, uint16_t * res, uint64_t * emit,
+                                uint64_t * open, uint64_t * seg, uint64_t numItems, uint64_t n, uint64_t final) {
     using Call = TailWalkCall<W>;
     alignas(Call) thread_local unsigned char mem[sizeof(Call)];
     n = std::min(n, numItems);
-    Call * const c = new (mem) Call{TailByteWalk<W>(tailScratch(), bytes, res, emit, n), final != 0};
+    Call * const c = new (mem) Call{TailByteWalk<W>(tailScratch(), bytes, res, emit, open, seg, n), final != 0};
     const TailStartBits st(segs, n);
     for (size_t i = 0; i < st.nWords; i++) emit[i] = st.word(i);   // every pretoken's first token
     std::fill(emit + st.nWords, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
     const TailCacheEntry * const vocab = gTailVocab.load(std::memory_order_acquire);
     thread_local TailIRCtx ctx;
     ctx = TailIRCtx{reinterpret_cast<uint64_t>(c), vocab, gTailVocabShift,
@@ -2485,12 +2501,13 @@ static void tailWalkSlowIR(uint64_t call, uint64_t s, uint64_t e) {
     reinterpret_cast<TailWalkCall<W> *>(call)->walk.word(s, e);
 }
 
-extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint32_t * res,
-                                       uint64_t * emit, uint64_t numItems, uint64_t n, uint64_t final) {
+extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint16_t * res,
+                                       uint64_t * emit, uint64_t * open, uint64_t * seg, uint64_t numItems,
+                                       uint64_t n, uint64_t final) {
     n = std::min(n, numItems);
     TailScratch & S = tailScratch();
     const TailStartBits starts(segs, n);
-    tailResolveBytes<kTailCacheWays>(S, bytes, starts, res, emit, numItems, n, final);
+    tailResolveBytes<kTailCacheWays>(S, bytes, starts, res, emit, open, seg, numItems, n, final);
 }
 
 // BPETailKernel's body: the tokens in order. A cut segment's tokens collect in gTailOpen and
@@ -2510,10 +2527,10 @@ static size_t tailFlushOpen(uint16_t * out, size_t k) {
 
 // --tail-simd-emit (with --tail-from-bytes): BPETailKernel compacts the finished ids of each 64
 // positions 8 at a time: the 8 emit bits pick a byte shuffle (a 256-entry table) that moves
-// those positions' ids (res narrowed to 16 bits) to the front of a 16-byte store, and the
-// output advances by their count; no branch per token (the scalar loop's exit mispredicted
-// once per 64 positions, and it was ~0.9 ns per token on one thread, ~10% of a run). A word
-// holding a token with kTailOpen (a segment cut by a call's edge) is redone by the scalar loop.
+// those positions' ids to the front of a 16-byte store, and the output advances by their count;
+// no branch per token (the scalar loop's exit mispredicted once per 64 positions, and it was
+// ~0.9 ns per token on one thread, ~10% of a run). A word with an open token (a segment cut by
+// a call's edge) is done by the scalar loop.
 // Runtime only, no cache tag.
 static cl::opt<bool> TailSIMDEmit(
     "tail-simd-emit",
@@ -2533,31 +2550,22 @@ struct TailEmitShuffles {
     }
 };
 static const TailEmitShuffles gTailEmitShuffles;
-// The ids at the set bits of st (positions res[0, 64)) to out; false (out untouched past its
-// 64 + 8 entries of room) if one of them has a flag above its 16 id bits.
-static inline bool tailEmitWord(const uint32_t * res, uint64_t st, uint16_t * out, size_t & k) {
-    const uint16x8_t bit = {1, 2, 4, 8, 16, 32, 64, 128};
-    uint16x8_t flags = vdupq_n_u16(0);
+// The ids at the set bits of st (positions res[0, 64)) to out, which has 64 + 8 entries of room.
+static inline void tailEmitWord(const uint16_t * res, uint64_t st, uint16_t * out, size_t & k) {
     uint16_t * o = out + k;
 #pragma clang loop unroll(full)
     for (unsigned g = 0; g < 8; g++) {
         const unsigned eb = unsigned(st >> (8 * g)) & 0xFF;
-        const uint32x4_t a = vld1q_u32(res + 8 * g), b = vld1q_u32(res + 8 * g + 4);
-        const uint16x8_t ids = vcombine_u16(vmovn_u32(a), vmovn_u32(b));
-        const uint16x8_t hi = vcombine_u16(vshrn_n_u32(a, 16), vshrn_n_u32(b, 16));
-        flags = vorrq_u16(flags, vandq_u16(hi, vtstq_u16(vdupq_n_u16(uint16_t(eb)), bit)));
-        const uint8x16_t sh = vld1q_u8(gTailEmitShuffles.idx[eb]);
-        vst1q_u8(reinterpret_cast<uint8_t *>(o), vqtbl1q_u8(vreinterpretq_u8_u16(ids), sh));
+        const uint8x16_t ids = vreinterpretq_u8_u16(vld1q_u16(res + 8 * g));
+        vst1q_u8(reinterpret_cast<uint8_t *>(o), vqtbl1q_u8(ids, vld1q_u8(gTailEmitShuffles.idx[eb])));
         o += __builtin_popcount(eb);
     }
-    if (vmaxvq_u16(flags) != 0) return false;
     k = size_t(o - out);
-    return true;
 }
 #endif
 
-extern "C" void bpe_tail_block(const uint32_t * res, const uint64_t * starts,
-                               uint64_t numItems, uint64_t n, uint64_t final) {
+extern "C" void bpe_tail_block(const uint16_t * res, const uint64_t * starts, const uint64_t * open,
+                               const uint64_t * seg, uint64_t numItems, uint64_t n, uint64_t final) {
     const size_t room = std::min(n, numItems) + gTailOpen.n + 16;   // + 16: the last 16-byte store
     if (room > gTailOutCap) {
         gTailOutCap = std::max<size_t>(room, 2 * gTailOutCap);
@@ -2568,18 +2576,24 @@ extern "C" void bpe_tail_block(const uint32_t * res, const uint64_t * starts,
     for (uint64_t wi = 0; wi * 64 < n && wi * 64 < numItems; wi++) {
         uint64_t st = starts[wi];
         if (n - wi * 64 < 64) st &= (1ull << (n - wi * 64)) - 1;
+        const uint64_t op = open[wi] & st;
+        if (LLVM_LIKELY(op == 0 && gTailOpen.n == 0)) {             // only finished ids
 #if defined(__aarch64__)
-        if (TailSIMDEmit && gTailOpen.n == 0 && wi * 64 + 64 <= numItems && tailEmitWord(res + wi * 64, st, out, k))
-            continue;
+            if (TailSIMDEmit && wi * 64 + 64 <= numItems) { tailEmitWord(res + wi * 64, st, out, k); continue; }
 #endif
+            for (; st; st &= st - 1) out[k++] = res[wi * 64 + __builtin_ctzll(st)];
+            continue;
+        }
+        const uint64_t sg = seg[wi];
         for (; st; st &= st - 1) {
-            const uint32_t v = res[wi * 64 + __builtin_ctzll(st)];
-            if (LLVM_LIKELY((v & kTailOpen) == 0)) {
-                if (LLVM_UNLIKELY(gTailOpen.n != 0)) k = tailFlushOpen(out, k);
-                out[k++] = uint16_t(v);
+            const unsigned b = unsigned(__builtin_ctzll(st));
+            const uint16_t v = res[wi * 64 + b];
+            if (((op >> b) & 1) == 0) {
+                if (gTailOpen.n != 0) k = tailFlushOpen(out, k);
+                out[k++] = v;
             } else {
-                if ((v & kTailSeg) && gTailOpen.n != 0) k = tailFlushOpen(out, k);
-                gTailOpen.push(uint16_t(v), 0);
+                if (((sg >> b) & 1) && gTailOpen.n != 0) k = tailFlushOpen(out, k);
+                gTailOpen.push(v, 0);
             }
         }
     }
@@ -2591,10 +2605,11 @@ extern "C" void bpe_tail_block(const uint32_t * res, const uint64_t * starts,
 class BPETailResolveKernel final : public MultiBlockKernel {
 public:
     BPETailResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * ids16, StreamSet * starts,
-                         StreamSet * segs, StreamSet * res, StreamSet * emit)
+                         StreamSet * segs, StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg)
     : MultiBlockKernel(ts, "BPE_TailResolve",
                        {Binding{"ids", ids16}, Binding{"starts", starts}, Binding{"segs", segs}},
-                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+                       {Binding{"res", res}, Binding{"emit", emit}, Binding{"open", open}, Binding{"seg", seg}},
+                       {}, {}, {}) {
         // No state between calls (the C++ body only uses thread_local scratch), so the
         // pipeline may run its calls on several threads at once.
         addAttribute(Statefree());
@@ -2609,7 +2624,8 @@ protected:
         b.CreateCall(fn->getFunctionType(), fn,
                      {b.getInputStreamBlockPtr("ids", zero), b.getInputStreamBlockPtr("starts", zero),
                       b.getInputStreamBlockPtr("segs", zero), b.getOutputStreamBlockPtr("res", zero),
-                      b.getOutputStreamBlockPtr("emit", zero), numItems, n,
+                      b.getOutputStreamBlockPtr("emit", zero), b.getOutputStreamBlockPtr("open", zero),
+                      b.getOutputStreamBlockPtr("seg", zero), numItems, n,
                       b.CreateZExt(b.isFinal(), b.getInt64Ty())});
     }
 };
@@ -2617,9 +2633,10 @@ protected:
 // Side-effecting, so the pipeline keeps it and runs it in order, one call at a time.
 class BPETailKernel final : public MultiBlockKernel {
 public:
-    BPETailKernel(LLVMTypeSystemInterface & ts, StreamSet * res, StreamSet * starts)
+    BPETailKernel(LLVMTypeSystemInterface & ts, StreamSet * res, StreamSet * starts, StreamSet * open,
+                  StreamSet * seg)
     : MultiBlockKernel(ts, "BPE_Tail",
-                       {Binding{"res", res}, Binding{"starts", starts}},
+                       {Binding{"res", res}, Binding{"starts", starts}, Binding{"open", open}, Binding{"seg", seg}},
                        {}, {}, {}, {}) {
         addAttribute(SideEffecting());
     }
@@ -2632,6 +2649,7 @@ protected:
         Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
         b.CreateCall(fn->getFunctionType(), fn,
                      {b.getInputStreamBlockPtr("res", zero), b.getInputStreamBlockPtr("starts", zero),
+                      b.getInputStreamBlockPtr("open", zero), b.getInputStreamBlockPtr("seg", zero),
                       numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
     }
 };
@@ -2640,10 +2658,11 @@ protected:
 class BPETailByteResolveKernel final : public MultiBlockKernel {
 public:
     BPETailByteResolveKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * segs,
-                             StreamSet * res, StreamSet * emit)
+                             StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg)
     : MultiBlockKernel(ts, "BPE_TailResolveBytes",
                        {Binding{"bytes", bytes}, Binding{"segs", segs}},
-                       {Binding{"res", res}, Binding{"emit", emit}}, {}, {}, {}) {
+                       {Binding{"res", res}, Binding{"emit", emit}, Binding{"open", open}, Binding{"seg", seg}},
+                       {}, {}, {}) {
         addAttribute(Statefree());   // see BPETailResolveKernel
     }
 protected:
@@ -2656,6 +2675,7 @@ protected:
         b.CreateCall(fn->getFunctionType(), fn,
                      {b.getInputStreamBlockPtr("bytes", zero), b.getInputStreamBlockPtr("segs", zero),
                       b.getOutputStreamBlockPtr("res", zero), b.getOutputStreamBlockPtr("emit", zero),
+                      b.getOutputStreamBlockPtr("open", zero), b.getOutputStreamBlockPtr("seg", zero),
                       numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
     }
 };
@@ -2666,7 +2686,7 @@ protected:
 class BPETailScanKernel final : public TwoLevelScanKernel {
 public:
     BPETailScanKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * segs,
-                      StreamSet * res, StreamSet * emit, unsigned cacheWays)
+                      StreamSet * res, StreamSet * emit, StreamSet * open, StreamSet * seg, unsigned cacheWays)
     : TwoLevelScanKernel(ts, std::string("BPE_TailScanIR") + (cacheWays ? "c" + std::to_string(cacheWays) : "")
                              + (TailSkipLong ? "_skip" + std::to_string(TailSkipLong) : ""),
                          64, "segs", {LoopVar("prev", ts.getInt64Ty())})
@@ -2675,6 +2695,8 @@ public:
         mInputStreamSets.push_back(Binding{"bytes", bytes});
         mOutputStreamSets.push_back(Binding{"res", res});
         mOutputStreamSets.push_back(Binding{"emit", emit});
+        mOutputStreamSets.push_back(Binding{"open", open});
+        mOutputStreamSets.push_back(Binding{"seg", seg});
         addAttribute(Statefree());   // see BPETailResolveKernel
     }
 protected:
@@ -2697,6 +2719,7 @@ protected:
         Value * const ctx = b.CreateIntToPtr(
             b.CreateCall(fn->getFunctionType(), fn,
                          {mBytes, b.getInputStreamBlockPtr("segs", zero), mRes, mEmit,
+                          b.getOutputStreamBlockPtr("open", zero), b.getOutputStreamBlockPtr("seg", zero),
                           numItems, mN, b.CreateZExt(b.isFinal(), b.getInt64Ty())}),
             ptr);
         mCall = b.CreateLoad(i64, ctx);
@@ -2715,7 +2738,7 @@ protected:
     // The pretoken [prev, p), as TailByteWalk's word() + finish() would for one byte or a
     // vocabulary hit; anything else goes to bpe_tail_ir_slow.
     void generateIRWord(KernelBuilder & b, Value * prev, Value * p) {
-        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i32 = b.getInt32Ty(), * const i64 = b.getInt64Ty();
+        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
         auto c64 = [&](uint64_t v) { return b.getInt64(v); };
         BasicBlock * const first = b.CreateBasicBlock("irFirst");
         BasicBlock * const word = b.CreateBasicBlock("irWord");
@@ -2739,7 +2762,7 @@ protected:
             BasicBlock * const skip = b.CreateBasicBlock("irSkip");
             b.CreateCondBr(b.CreateICmpUGT(len, c64(TailSkipLong)), skip, keep);
             b.SetInsertPoint(skip);
-            b.CreateStore(b.getInt32(0), b.CreateGEP(i32, mRes, prev));
+            b.CreateStore(b.getInt16(0), b.CreateGEP(i16, mRes, prev));
             b.CreateBr(done);
             b.SetInsertPoint(keep);
         }
@@ -2748,7 +2771,7 @@ protected:
         b.SetInsertPoint(one);                      // one byte: its base id
         Value * const byte = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, prev)), i64);
         Value * const baseId = b.CreateLoad(i16, b.CreateGEP(i16, mBaseIds, byte));
-        b.CreateStore(b.CreateZExt(baseId, i32), b.CreateGEP(i32, mRes, prev));
+        b.CreateStore(baseId, b.CreateGEP(i16, mRes, prev));
         b.CreateBr(done);
 
         b.SetInsertPoint(multi);                    // 2 .. 15 bytes inside the call, table built
@@ -2782,7 +2805,7 @@ protected:
 
         b.SetInsertPoint(hit);                      // a vocabulary token: one id
         Value * const out = b.CreateGEP(i8, set, b.CreateAdd(b.CreateShl(way, 5), c64(offsetof(TailCacheEntry, out))));
-        b.CreateStore(b.CreateZExt(b.CreateLoad(i16, out), i32), b.CreateGEP(i32, mRes, prev));
+        b.CreateStore(b.CreateLoad(i16, out), b.CreateGEP(i16, mRes, prev));
         b.CreateBr(done);
 
         if (mCacheWays) {                           // the thread cache's most recent entry
@@ -2806,7 +2829,7 @@ protected:
             j->addIncoming(c64(0), cacheHit);
             Value * const q = b.CreateAdd(prev, b.CreateCountForwardZeroes(keep));
             Value * const tok = b.CreateLoad(i16, b.CreateGEP(i16, outs, j));
-            b.CreateStore(b.CreateZExt(tok, i32), b.CreateGEP(i32, mRes, q));
+            b.CreateStore(tok, b.CreateGEP(i16, mRes, q));
             Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(q, 6));
             b.CreateStore(b.CreateOr(b.CreateLoad(i64, ew), b.CreateShl(c64(1), b.CreateAnd(q, c64(63)))), ew);
             Value * const nextKeep = b.CreateAnd(keep, b.CreateSub(keep, c64(1)));
@@ -2841,18 +2864,20 @@ static void linkTailWalkIR(PipelineBuilder & P, Kernel * k) {
 }
 
 void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * segs) {
-    StreamSet * res = P.CreateStreamSet(1, 32);
+    StreamSet * res = P.CreateStreamSet(1, 16);
     StreamSet * emit = P.CreateStreamSet(1, 1);
+    StreamSet * open = P.CreateStreamSet(1, 1);
+    StreamSet * seg = P.CreateStreamSet(1, 1);
     if (TailScanKernel) {
         TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the starts
         const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
-        Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, segs, res, emit, cacheWays);
+        Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, segs, res, emit, open, seg, cacheWays);
         linkTailWalkIR(P, r);
     } else {
-        Kernel * const r = P.CreateKernelCall<BPETailByteResolveKernel>(bytes, segs, res, emit);
+        Kernel * const r = P.CreateKernelCall<BPETailByteResolveKernel>(bytes, segs, res, emit, open, seg);
         P.LinkFunction(r, "bpe_tail_resolve_bytes", bpe_tail_resolve_bytes);
     }
-    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit, open, seg);
     P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
 }
 
@@ -2880,11 +2905,13 @@ void buildBPETailEmitter(PipelineBuilder & P, StreamSet * ids, StreamSet * start
     } else {
         P.CreateKernelCall<P2S16Kernel>(ids, ids16);
     }
-    StreamSet * res = P.CreateStreamSet(1, 32);
+    StreamSet * res = P.CreateStreamSet(1, 16);
     StreamSet * emit = P.CreateStreamSet(1, 1);
-    Kernel * const r = P.CreateKernelCall<BPETailResolveKernel>(ids16, starts, segs, res, emit);
+    StreamSet * open = P.CreateStreamSet(1, 1);
+    StreamSet * seg = P.CreateStreamSet(1, 1);
+    Kernel * const r = P.CreateKernelCall<BPETailResolveKernel>(ids16, starts, segs, res, emit, open, seg);
     P.LinkFunction(r, "bpe_tail_resolve", bpe_tail_resolve);
-    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit);
+    Kernel * const k = P.CreateKernelCall<BPETailKernel>(res, emit, open, seg);
     P.LinkFunction(k, "bpe_tail_block", bpe_tail_block);
 }
 

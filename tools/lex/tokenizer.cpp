@@ -550,7 +550,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
         bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode, PretokByteDomain, PretokUTF8Classes);
     } else if (PreTokenizer == bytelevel) {
         // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to
-        // mark pretoken STARTS. Feed BPE the RAW bytes (BPERangeSeed does bytes_to_unicode
+        // mark pretoken STARTS. Feed BPE the RAW bytes (BPEBaseIdKernel does bytes_to_unicode
         // ONCE — using ptResult's Ġ-remapped bytes would double-encode) plus the
         // byte-domain boundary mask (ptResult.U21tokenBoundaries, already 1-per-byte for
         // bytelevel) so merges can't cross a pretoken boundary .

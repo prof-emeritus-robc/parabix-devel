@@ -114,7 +114,7 @@ private:
 // buildBPEPassPipeline
 //   Builds the merge-kernel BPE pipeline:
 //     - buildMergeRuleRanges() groups merges into id-ranges (rank order).
-//     - BPERangeSeed seeds source = base id of each raw byte (active=1s, end=0s).
+//     - BPEBaseIdKernel seeds source = base id of each raw byte (active=1s).
 //     - One BPEMergeKernel per range (lowest first) glues adjacent ids into
 //       `source`, threaded kernel→kernel (the Ġthe→Ġthey cascade).
 //   Returns (matchEnd=active, vocabID=source). Emission is Stage-B debug

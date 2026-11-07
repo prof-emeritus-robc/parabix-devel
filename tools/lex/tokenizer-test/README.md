@@ -186,7 +186,7 @@ pretoken-**start mask** (`GPT2PretokenBoundaryKernel`), and BPE consumes the
 **raw** byte basis plus that mask, so merges cannot cross a pretoken boundary.
 
 > ⚠️ **Double-encode trap.** Do not pipe `--pretokenizer=bytelevel` *text output*
-> into a second BPE call. `BPERangeSeed` already applies GPT-2 `bytes_to_unicode`
+> into a second BPE call. `BPEBaseIdKernel` already applies GPT-2 `bytes_to_unicode`
 > to the raw bytes. Feeding it pre-encoded text encodes twice: a space `0x20`
 > becomes `Ġ`, emitted as UTF-8 `0xC4 0xA0`, which the seed re-maps to ids
 > 128/254 instead of the correct `Ġ` id 220.

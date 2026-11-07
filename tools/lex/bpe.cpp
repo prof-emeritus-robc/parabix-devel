@@ -18,8 +18,8 @@
  *      Mirrors merge_analysis.py::clean_range_analysis.
  *
  *  Runtime pipeline (one BPEMergeKernel per clean range, lowest range first):
- *      BPERangeSeed   — source = base id of each RAW byte (8-bit), active = 1s,
- *                       end = 0s (end is legacy/unused).
+ *      BPEBaseIdKernel — source = base id of each RAW byte (8-bit, BixNum arithmetic),
+ *                       active = 1s (kernel name BPE_BaseIds+active).
  *      BPEMergeKernel — START-anchored, per rule (rank order):
  *                         Astart    = EQ(source, idA)                  // A starts here
  *                         BstartAtA = EQ(LookAhead(source, lenA), idB) // B lenA ahead
@@ -40,7 +40,7 @@
  *  ──────────
  *  BPEMergeKernel name encodes hashRuleSet(the group's rule list), so two merges
  *  files producing the same range shape but different rules still get distinct
- *  cache entries. BPERangeSeed is shape-only (constant name).
+ *  cache entries. BPEBaseIdKernel is data-independent (constant name).
  */
 
 #include "bpe.h"
@@ -553,7 +553,7 @@ static cl::opt<bool> TailDirectInput(
 // with every rule on each pretoken, straight from the input bytes, and its per-thread word
 // cache is keyed by the pretoken's bytes (2..15 of them: two 8-byte loads, no id
 // gathering). Cheaper than the hybrid because a cache hit costs about the same at any cut
-// and nothing else runs: no BPERangeSeed, no bit-transformation kernels, no P2S16.
+// and nothing else runs: no base-id kernel, no bit-transformation kernels, no P2S16.
 // Single-thread harness (val_4MB): the whole BPE in 10.8 ms warm / 14.8 ms cold, vs ~30 ms
 // for the 15 kernels + the --bpe-tail=1 tail. Cache tag: BPE_TailResolveBytes.
 static cl::opt<bool> TailFromBytes(
@@ -792,32 +792,18 @@ protected:
     }
 };
 
-// BPERangeSeed — the FIRST BPE kernel. It turns each raw input byte into its
-// base-alphabet token id: the starting single-byte token, before any merge.
-// Outputs:
-//   source (16-bit) — base id of each byte   (the id stream the merges build on)
-//   active (1-bit)  — all 1s                  (reused downstream as emit-all)
-//   end    (1-bit)  — all 0s                  (legacy; unused)
-//
-// GPT-2's byte-level alphabet (encoder.py bytes_to_unicode) maps
-// each raw byte to a printable char, then encoder.json assigns each char an id =
-// its POSITION in the alphabet. The alphabet lists the 188 "printable" bytes
-// first (ids 0..187), then the 68 remaining bytes (ids 188..255). So a byte's id
-// is NOT its value and NOT its unicode code point — it is its position.
-//
-// Composing byte→char→id gives a closed-form piecewise map: id = byte + offset,
-// one offset per contiguous byte range. We compute it by ARITHMETIC (a few range
-// masks + Sel) instead of a 256-way EQ lookup table — far fewer Pablo ops. The
-// alphabet is a fixed spec, so this kernel is data-independent (constant cache
-// name). 
+// GPT-2's byte-level alphabet (encoder.py bytes_to_unicode) maps each raw byte to a printable
+// char, then encoder.json assigns each char an id = its POSITION in the alphabet. The alphabet
+// lists the 188 "printable" bytes first (ids 0..187), then the 68 remaining bytes (ids
+// 188..255), each group in byte order. So a byte's id is NOT its value and NOT its unicode
+// code point — it is its position, and within each contiguous byte range id = byte + offset:
 //
 //   byte range   offset   id            byte range   offset   id
 //   0..32        +188     188..220      161..172     −67      94..105
 //   33..126      −33      0..93         173          →255     255
 //   127..160     +94      221..254      174..255     −68      106..187
 // (e.g. space 32 → 220 = 'Ġ', 'y' 121 → 88, 't' 116 → 83.)
-// GPT-2's base id of a byte (bytes_to_unicode order, T1): piecewise byte + offset, a
-// bijection over 0..255.
+// GPT-2's base id of a byte (bytes_to_unicode order, T1): a bijection over 0..255.
 static unsigned bpeBaseId(unsigned by) {
     if (by <= 32)  return by + 188;
     if (by <= 126) return by - 33;
@@ -827,65 +813,53 @@ static unsigned bpeBaseId(unsigned by) {
     return by - 68;                        // 174..255
 }
 
-// The 8 bits of each byte's base id, as streams. id(byte) is a fixed byte->id bijection:
-// piecewise byte + offset (T1). Expressed as CCs instead of BixNum arithmetic: for each id
-// bit k, the SET of bytes whose id has bit k set is a byte character class, so compileCC over
-// the byte basis yields that id-bit stream directly. Data-independent, so a kernel computing
-// it can keep a constant cache name.
+// The 8 bits of every byte's base id as bit streams, by BixNum arithmetic: id = byte + offset
+// (mod 256), and as 8-bit constants 0..32 and 174..255 share their offset:
+//   0..32, 174..255: 0xBC (+188 = -68)   33..126: 0xDF (-33)   127..160: 0x5E (+94)
+//   161..172: 0xBD (-67)                 173: 0x52 (+82)
+// Four compares split the ranges, offset bit k is the OR of the ranges whose offset has bit k,
+// then one 8-bit modular add (Xor3 / Majority3 per bit): 77 Pablo statements, where one
+// character class per id bit took 776.
 static std::vector<PabloAST *> bpeBaseIdBits(PabloBuilder & pb, const std::vector<PabloAST *> & basisBits) {
-    cc::Parabix_CC_Compiler_Builder ccc(basisBits);
-    std::vector<PabloAST *> idBits(8);
+    BixNumCompiler bnc(pb);
+    const BixNum b(basisBits.begin(), basisBits.end());
+    PabloAST * const lt33 = bnc.ULT(b, 33), * const lt127 = bnc.ULT(b, 127);
+    PabloAST * const lt161 = bnc.ULT(b, 161), * const lt173 = bnc.ULT(b, 173);
+    PabloAST * const r1 = pb.createAnd(lt127, pb.createNot(lt33));        // 33..126
+    PabloAST * const r2 = pb.createAnd(lt161, pb.createNot(lt127));       // 127..160
+    PabloAST * const r3 = pb.createAnd(lt173, pb.createNot(lt161));       // 161..172
+    PabloAST * const r4 = bnc.EQ(b, 173);                                 // 173
+    PabloAST * const r0 = pb.createNot(pb.createOr(pb.createOr(r1, r2), pb.createOr(r3, r4)));
+    const std::pair<PabloAST *, unsigned> ranges[] = {{r0, 0xBC}, {r1, 0xDF}, {r2, 0x5E}, {r3, 0xBD}, {r4, 0x52}};
+    BixNum offset(8);
     for (unsigned k = 0; k < 8; k++) {
-        re::CC * cc = nullptr;                      // bytes whose id has bit k set
-        for (unsigned by = 0; by < 256; ) {
-            if ((bpeBaseId(by) >> k) & 1u) {
-                const unsigned lo = by;
-                while (by < 256 && ((bpeBaseId(by) >> k) & 1u)) by++;
-                re::CC * const part = re::makeByte(lo, by - 1);
-                cc = cc ? re::makeCC(cc, part) : part;
-            } else ++by;
-        }
-        idBits[k] = cc ? ccc.compileCC(cc, pb) : pb.createZeroes();
+        PabloAST * bit = pb.createZeroes();
+        for (const auto & r : ranges) if ((r.second >> k) & 1) bit = pb.createOr(bit, r.first);
+        offset[k] = bit;
     }
-    return idBits;
+    return bnc.AddModular(b, offset);
 }
 
-class BPERangeSeed : public PabloKernel {
-public:
-    BPERangeSeed(LLVMTypeSystemInterface & ts, StreamSet * basis,
-                 StreamSet * source, StreamSet * active, StreamSet * end)
-    : PabloKernel(ts, "BPERangeSeed",
-                  {Binding{"basis", basis}},
-                  {Binding{"source", source}, Binding{"active", active}, Binding{"end", end}}) {}
-protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        std::vector<PabloAST*> basisBits = getInputStreamSet("basis");
-        PabloAST * zeroes = pb.createZeroes();
-        PabloAST * ones   = pb.createNot(zeroes);
-
-        const std::vector<PabloAST*> idBits = bpeBaseIdBits(pb, basisBits);   // (T1)
-        // Write the id into the 16-bit `source` stream (ids ≤255 → high bits 0),
-        // active = all 1s, end = all 0s. idBits[i] = the i-th id bit (a compiled CC).
-        Var * sOut = getOutputStreamVar("source");
-        for (unsigned i = 0; i < 8; i++) {
-            pb.createAssign(pb.createExtract(sOut, pb.getInteger(i)), idBits[i]);
-        }
-        pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)), ones);
-        pb.createAssign(pb.createExtract(getOutputStreamVar("end"),    pb.getInteger(0)), zeroes);
-    }
-};
-
-// --tail-unit-seed: the base id of every byte as 8 bit streams (BPERangeSeed's id bits alone).
+// BPEBaseIdKernel — each raw input byte's base-alphabet token id: the starting single-byte
+// token, before any merge, as 8 bit streams (ids). The merge pipeline's first kernel: ids is
+// the id stream the merges build on, and with `active` it also seeds the in-play mask (all
+// 1s: every byte starts as a live token start); kernel name BPE_BaseIds+active. Alone
+// (--tail-unit-seed), BPE_BaseIds. Data-independent, so the names are constant.
 class BPEBaseIdKernel final : public PabloKernel {
 public:
-    BPEBaseIdKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * ids)
-    : PabloKernel(ts, "BPE_BaseIds", {Binding{"basis", basis}}, {Binding{"ids", ids}}) {}
+    BPEBaseIdKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * ids, StreamSet * active = nullptr)
+    : PabloKernel(ts, active ? "BPE_BaseIds+active" : "BPE_BaseIds", {Binding{"basis", basis}},
+                  active ? Bindings{Binding{"ids", ids}, Binding{"active", active}} : Bindings{Binding{"ids", ids}})
+    , mActive(active != nullptr) {}
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         writeOutputStreamSet("ids", bpeBaseIdBits(pb, getInputStreamSet("basis")));
+        if (mActive)
+            pb.createAssign(pb.createExtract(getOutputStreamVar("active"), pb.getInteger(0)),
+                            pb.createNot(pb.createZeroes()));
     }
+    const bool mActive;
 };
 
 // --tail-unit-cuts: the pretoken starts cut at every frozen byte (a byte whose base id is in
@@ -4725,7 +4699,7 @@ static bool bitXfrmEligible(const MergeRuleGroup & g) {
 // buildBPEPassPipeline — real BPE merge on the id stream.
 //   1. buildMergeRuleRanges() partitions merges into clean id-ranges (dependency-independent
 //      + token-adjacency-overlap-free, rank order).
-//   2. BPERangeSeed seeds source = base id of each RAW byte (active=1s, end=0s).
+//   2. BPEBaseIdKernel seeds source = base id of each RAW byte (active=1s).
 //   3. One BPEMergeKernel per range (ascending = rank order) glues adjacent ids:
 //      for each rule (A,B→AB) it detects A's end, checks B at +lenB, stamps idAB.
 //      `source` threads kernel→kernel; lower-rank merges feed higher-rank ones.
@@ -5075,11 +5049,10 @@ BPEPassResult buildBPEPassPipeline(
         }
     }
 
-    // Seed: source = base id of each raw byte, active = ones, end = zeroes.
+    // Seed: source = base id of each raw byte, active = ones.
     StreamSet * source = P.CreateStreamSet(8, 1);
     StreamSet * active = P.CreateStreamSet(1, 1);
-    StreamSet * end    = P.CreateStreamSet(1, 1);
-    P.CreateKernelCall<BPERangeSeed>(basis, source, active, end);
+    P.CreateKernelCall<BPEBaseIdKernel>(basis, source, active);
     if (std::getenv("BPE_DBG") && std::string(std::getenv("BPE_DBG")) == "seed")
         return {active, source};   // dump seed source at every byte
     // BPE_DBG=bound: dump the pretoken-boundary mask — prints the base id at each

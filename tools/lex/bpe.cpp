@@ -950,14 +950,27 @@ struct BPERunCutParams {
 // the cuts at p + 1 (for the units: positions p whose piece is one byte). With guard, the cut
 // logic is inside an If on "a run byte in this block"; Pablo ORs any pending carry into the
 // test, so the Advance of a run's end into the next block is not lost.
-static std::pair<PabloAST *, PabloAST *> bpeHardRunCuts(PabloBuilder & pb, const std::vector<PabloAST *> & basis,
+// The basis bits at p (cur), p - 1 (prev: Advance), p + 1 and p + 2 (next, next2: Lookahead; next2
+// only when asked), computed once for the cut generators.
+struct BPEShiftedBasis {
+    std::vector<PabloAST *> cur, prev, next, next2;
+};
+static BPEShiftedBasis bpeShiftBasis(PabloBuilder & pb, const std::vector<PabloAST *> & basis, bool next2) {
+    BPEShiftedBasis B{basis, std::vector<PabloAST *>(basis.size()), std::vector<PabloAST *>(basis.size()), {}};
+    if (next2) B.next2.resize(basis.size());
+    for (unsigned i = 0; i < basis.size(); i++) {
+        B.prev[i] = pb.createAdvance(basis[i], 1);
+        B.next[i] = pb.createLookahead(basis[i], 1);
+        if (next2) B.next2[i] = pb.createLookahead(basis[i], 2);
+    }
+    return B;
+}
+static std::pair<PabloAST *, PabloAST *> bpeHardRunCuts(PabloBuilder & pb, const BPEShiftedBasis & B,
                                                         const BPERunCutParams & P) {
     PabloAST * const zero = pb.createZeroes();
-    std::vector<PabloAST *> prevB(basis.size()), nextB(basis.size());
+    const std::vector<PabloAST *> & basis = B.cur, & prevB = B.prev, & nextB = B.next;
     PabloAST * diffPrev = zero, * diffNext = zero;
     for (unsigned i = 0; i < basis.size(); i++) {
-        prevB[i] = pb.createAdvance(basis[i], 1);
-        nextB[i] = pb.createLookahead(basis[i], 1);
         diffPrev = pb.createOr(diffPrev, pb.createXor(basis[i], prevB[i]));
         diffNext = pb.createOr(diffNext, pb.createXor(basis[i], nextB[i]));
     }
@@ -998,23 +1011,32 @@ static std::pair<PabloAST *, PabloAST *> bpeHardRunCuts(PabloBuilder & pb, const
     pb.createIf(hr, body);
     return {cutV, nxtV};
 }
+static std::string bpeHexName(const std::array<uint64_t, 4> & f) {
+    char buf[68];
+    std::snprintf(buf, sizeof(buf), "%016llx%016llx%016llx%016llx", (unsigned long long) f[3],
+                  (unsigned long long) f[2], (unsigned long long) f[1], (unsigned long long) f[0]);
+    return buf;
+}
 class BPEUnitCutsKernel final : public PabloKernel {
 public:
     BPEUnitCutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * segs,
                       StreamSet * cuts, StreamSet * unit, StreamSet * scan, const std::array<uint64_t, 4> & frozen,
-                      const BPERunCutParams & runs = BPERunCutParams{})
-    : PabloKernel(ts, "BPE_UnitCuts_" + hexName(frozen)
-                      + (runs.cutN ? runs.tag() : ""),
-                  {Binding{"basis", basis, FixedRate(), LookAhead(std::max(1u, runs.cutN))},
-                   Binding{"segs", segs, FixedRate(), LookAhead(1)}},
-                  {Binding{"cuts", cuts}, Binding{"unit", unit}, Binding{"scan", scan}})
-    , mFrozen(frozen), mRuns(runs) {}
+                      const BPERunCutParams & runs = BPERunCutParams{}, StreamSet * pairCuts = nullptr)
+    : PabloKernel(ts, "BPE_UnitCuts_" + bpeHexName(frozen)
+                      + (runs.cutN ? runs.tag() : "") + (pairCuts ? "_pc" : "") + (unit ? "" : "_c"),
+                  inputs(basis, segs, pairCuts, runs.cutN, unit == nullptr),
+                  unit ? Bindings{Binding{"cuts", cuts}, Binding{"unit", unit}, Binding{"scan", scan}}
+                       : Bindings{Binding{"cuts", cuts}})
+    , mFrozen(frozen), mRuns(runs), mPairCuts(pairCuts != nullptr), mCutsOnly(unit == nullptr) {}
 protected:
-    static std::string hexName(const std::array<uint64_t, 4> & f) {
-        char buf[68];
-        std::snprintf(buf, sizeof(buf), "%016llx%016llx%016llx%016llx", (unsigned long long) f[3],
-                      (unsigned long long) f[2], (unsigned long long) f[1], (unsigned long long) f[0]);
-        return buf;
+    // cutsOnly (--len-scan: BPE_LenSelect makes its own scan and cover streams from the cuts): no
+    // units, so nothing at p + 1 is needed but the run cuts' next byte.
+    static Bindings inputs(StreamSet * basis, StreamSet * segs, StreamSet * pairCuts, unsigned cutN, bool cutsOnly) {
+        const unsigned la = cutsOnly ? (cutN ? std::max(1u, cutN) : 0) : std::max(1u, cutN);
+        Bindings in{Binding{"basis", basis, FixedRate(), LookAhead(la)},
+                    Binding{"segs", segs, FixedRate(), LookAhead(cutsOnly ? 0 : 1)}};
+        if (pairCuts) in.emplace_back("pairCuts", pairCuts, FixedRate(), LookAhead(cutsOnly ? 0 : 1));
+        return in;
     }
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -1030,6 +1052,8 @@ protected:
         if (frozenCC) {
             cc::Parabix_CC_Compiler_Builder ccc(basis);
             F = ccc.compileCC(frozenCC, pb);
+        }
+        if (frozenCC && !mCutsOnly) {
             std::vector<PabloAST *> next(basis.size());
             for (unsigned i = 0; i < basis.size(); i++) next[i] = pb.createLookahead(basis[i], 1);
             cc::Parabix_CC_Compiler_Builder cccNext(next);
@@ -1037,13 +1061,22 @@ protected:
         }
         PabloAST * cuts = pb.createOr(segs, pb.createOr(F, pb.createAdvance(F, 1)));
         // cuts at p + 1: segs or F there, or F at p (which cuts after itself)
-        PabloAST * cutsNext = pb.createOr(pb.createLookahead(segs, 1), pb.createOr(Fnext, F));
+        PabloAST * cutsNext = mCutsOnly ? nullptr : pb.createOr(pb.createLookahead(segs, 1), pb.createOr(Fnext, F));
         if (mRuns.cutN) {                          // hard self-pair cuts inside runs >= cutN (bpeHardRunCuts)
-            const auto rc = bpeHardRunCuts(pb, basis, mRuns);
+            const auto rc = bpeHardRunCuts(pb, bpeShiftBasis(pb, basis, false), mRuns);
             cuts = pb.createOr(cuts, rc.first);
-            cutsNext = pb.createOr(cutsNext, rc.second);
+            if (!mCutsOnly) cutsNext = pb.createOr(cutsNext, rc.second);
+        }
+        if (mPairCuts) {                           // --pair-cuts: a cut before p (BPEPairCutsKernel)
+            PabloAST * const pc = getInputStreamSet("pairCuts")[0];
+            cuts = pb.createOr(cuts, pc);
+            if (!mCutsOnly) cutsNext = pb.createOr(cutsNext, pb.createLookahead(pc, 1));
         }
         cuts = pb.createInFile(cuts);
+        if (mCutsOnly) {
+            writeOutputStreamSet("cuts", std::vector<PabloAST *>{cuts});
+            return;
+        }
         PabloAST * const unit = pb.createAnd(cuts, cutsNext);
         PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(unit, pb.createAdvance(unit, 1))));
         writeOutputStreamSet("cuts", std::vector<PabloAST *>{cuts});
@@ -1052,6 +1085,182 @@ protected:
     }
     const std::array<uint64_t, 4> mFrozen;
     const BPERunCutParams mRuns;
+    const bool mPairCuts, mCutsOnly;
+};
+
+// The bytes b with pred(b), as a class; null when there are none.
+template <typename Pred> static re::CC * bpeByteClass(Pred pred) {
+    re::CC * cc = nullptr;
+    for (unsigned by = 0; by < 256; by++) {
+        if (!pred(by)) continue;
+        re::CC * const part = re::makeByte(by, by);
+        cc = cc ? re::makeCC(cc, part) : part;
+    }
+    return cc;
+}
+// mode 3. For each UTF-8 lead byte L in some pair inside a token (the others are frozen and
+// cut already), at a position p holding L: a cut before p if no token holds (byte p - 1, L),
+// a cut before p + 1 if none holds (L, byte p + 1), and (e280, L = E2) a cut before p + 2 if
+// byte p + 1 is 80 and no token holds (80, byte p + 2). Two outer Ifs on the leads 110xxxxx and
+// 111xxxxx, an inner If per group of leads. Inside the Ifs only Lookahead reads the next
+// bytes; the previous byte (Advance) and the shifts of the marks are outside, so no carry is
+// inside an If.
+// e2: the cuts at E2 computed: 1 before it, 2 after it, 4 in E2 80 y (needs B.next2).
+static PabloAST * bpeLeadKeyedCuts(PabloBuilder & pb, const BPEShiftedBasis & B, const std::vector<uint16_t> & inside,
+                                   unsigned e2) {
+    auto isInside = [&](unsigned x, unsigned y) {
+        return std::binary_search(inside.begin(), inside.end(), uint16_t((x << 8) | y));
+    };
+    const bool e280 = (e2 & 4) != 0;
+    const std::vector<PabloAST *> & next2 = B.next2;
+    cc::Parabix_CC_Compiler_Builder curC(B.cur), prevC(B.prev), nextC(B.next);
+    std::array<bool, 256> active{};
+    for (uint16_t k : inside) active[k >> 8] = active[k & 0xFF] = true;
+    static const std::vector<std::vector<uint8_t>> kGroups = {
+        {0xC2}, {0xC3}, {0xC4, 0xC5}, {0xCB, 0xCC}, {0xCE, 0xCF}, {0xD0, 0xD1}, {0xD6, 0xD7}, {0xD8, 0xD9},
+        {0xE0}, {0xE1}, {0xE2}, {0xE3, 0xE4}, {0xE5, 0xE6}, {0xE7, 0xE8}, {0xE9}, {0xEB, 0xEC}, {0xED, 0xEE, 0xEF}, {0xF0}};
+    std::vector<std::vector<uint8_t>> groups;
+    std::array<bool, 256> grouped{};
+    for (const auto & g : kGroups) {
+        std::vector<uint8_t> act;
+        for (uint8_t L : g) if (active[L]) { act.push_back(L); grouped[L] = true; }
+        if (!act.empty()) groups.push_back(act);
+    }
+    for (unsigned L = 0xC0; L < 0xF8; L++)    // a lead of another vocabulary, not in kGroups
+        if (active[L] && !grouped[L]) groups.push_back({uint8_t(L)});
+    PabloAST * const zero = pb.createZeroes();
+    Var * const before = pb.createVar("leadCutBefore", zero);
+    Var * const after = pb.createVar("leadCutAfter", zero);
+    Var * const third = pb.createVar("leadCutThird", zero);
+    for (const auto & outer : {std::pair<unsigned, unsigned>{0xC0, 0xDF}, std::pair<unsigned, unsigned>{0xE0, 0xF7}}) {
+        auto ob = pb.createScope();
+        bool any = false;
+        for (const auto & g : groups) {
+            if (g.front() < outer.first || g.front() > outer.second) continue;
+            any = true;
+            auto gb = ob.createScope();
+            for (uint8_t L : g) {
+                PabloAST * const isL = curC.compileCC(re::makeByte(L, L), gb);
+                const bool doBefore = L != 0xE2 || (e2 & 1), doAfter = L != 0xE2 || (e2 & 2);
+                if (re::CC * const pre = doBefore ? bpeByteClass([&](unsigned x) { return !isInside(x, L); }) : nullptr)
+                    gb.createAssign(before, gb.createOr(before, gb.createAnd(isL, prevC.compileCC(pre, gb))));
+                if (re::CC * const suc = doAfter ? bpeByteClass([&](unsigned y) { return !isInside(L, y); }) : nullptr)
+                    gb.createAssign(after, gb.createOr(after, gb.createAnd(isL, nextC.compileCC(suc, gb))));
+                if (e280 && L == 0xE2) {
+                    if (re::CC * const t = bpeByteClass([&](unsigned y) { return !isInside(0x80, y); })) {
+                        cc::Parabix_CC_Compiler_Builder next2C(next2);
+                        PabloAST * const m = gb.createAnd(isL, gb.createAnd(nextC.compileCC(re::makeByte(0x80, 0x80), gb),
+                                                                            next2C.compileCC(t, gb)));
+                        gb.createAssign(third, gb.createOr(third, m));
+                    }
+                }
+            }
+            re::CC * gcc = nullptr;
+            for (uint8_t L : g) gcc = gcc ? re::makeCC(gcc, re::makeByte(L, L)) : re::makeByte(L, L);
+            ob.createIf(curC.compileCC(gcc, ob), gb);
+        }
+        if (any) pb.createIf(curC.compileCC(re::makeByte(outer.first, outer.second), pb), ob);
+    }
+    PabloAST * cuts = pb.createOr(before, pb.createAdvance(after, 1));
+    if (e280) cuts = pb.createOr(cuts, pb.createAdvance(third, 2));
+    return cuts;
+}
+
+// --pair-cuts: pairCuts[p] = 1 where no token holds bytes p - 1, p next to each other (tailHard),
+// a cut before p. The pairs inside tokens are given as x << 8 | y (x the earlier byte), ascending.
+// mode 1: every pair. With guard, the pairs of two ASCII bytes are a 14-bit class over the low
+//         7 bits of both bytes, and the pairs with a byte >= 0x80 a 16-bit class inside an If on
+//         "bit 7 of either byte".
+// mode 2: only the pairs with a byte >= 0x80 (the If of mode 1); no ASCII pair is cut.
+// mode 3: keyed on the UTF-8 lead bytes (generateLeadKeyed); with e280 also inside E2 80 y.
+class BPEPairCutsKernel final : public PabloKernel {
+public:
+    BPEPairCutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * pairCuts,
+                      std::vector<uint16_t> inside, unsigned mode, bool guard, bool e280, const std::string & tag,
+                      unsigned e2 = 7)
+    : PabloKernel(ts, "BPE_PairCuts" + std::string(mode == 3 ? (e280 ? "Le_" : "L_") : mode == 2 ? "h_" : guard ? "g_" : "_") + tag
+                      + (mode == 3 && e2 != 7 ? "_e2" + std::to_string(e2) : ""),
+                  {Binding{"basis", basis, FixedRate(), LookAhead(mode == 3 ? (e280 ? 2 : 1) : 0)}},
+                  {Binding{"pairCuts", pairCuts}})
+    , mInside(std::move(inside)), mMode(mode), mGuard(guard || mode == 2), mE280(e280 && mode == 3), mE2(e2) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        std::vector<PabloAST *> cur = getInputStreamSet("basis");
+        if (mMode == 3) {
+            const BPEShiftedBasis B = bpeShiftBasis(pb, cur, mE280);
+            writeOutputStreamSet("pairCuts", std::vector<PabloAST *>{pb.createInFile(bpeLeadKeyedCuts(pb, B, mInside, mE280 ? mE2 : mE2 & 3))});
+            return;
+        }
+        std::vector<PabloAST *> prev(8);
+        for (unsigned i = 0; i < 8; i++) prev[i] = pb.createAdvance(cur[i], 1);
+        std::vector<PabloAST *> bits16(cur.begin(), cur.end());
+        bits16.insert(bits16.end(), prev.begin(), prev.end());
+        PabloAST * inside = nullptr;
+        if (!mGuard) {
+            UCD::UnicodeSet all;
+            for (uint16_t k : mInside) all.insert(k);
+            inside = cc::Parabix_CC_Compiler(bits16).compileCC("pairIn", re::makeCC(std::move(all)), pb);
+        } else {
+            UCD::UnicodeSet ascii, high;
+            for (uint16_t k : mInside) {
+                if (k & 0x8080) high.insert(k);
+                else ascii.insert(((k >> 8) << 7) | (k & 0x7F));
+            }
+            std::vector<PabloAST *> bits14(cur.begin(), cur.begin() + 7);
+            bits14.insert(bits14.end(), prev.begin(), prev.begin() + 7);
+            PabloAST * const hi = pb.createOr(cur[7], prev[7]);
+            Var * const inH = pb.createVar("pairInH", pb.createZeroes());
+            auto body = pb.createScope();
+            body.createAssign(inH, cc::Parabix_CC_Compiler(bits16).compileCC("pairInH", re::makeCC(std::move(high)), body));
+            pb.createIf(hi, body);
+            if (mMode == 2) {                      // an ASCII pair is never cut
+                inside = pb.createOr(pb.createNot(hi), inH);
+            } else {
+                PabloAST * const inA = cc::Parabix_CC_Compiler(bits14).compileCC("pairInA", re::makeCC(std::move(ascii)), pb);
+                inside = pb.createOr(pb.createAnd(inA, pb.createNot(hi)), inH);
+            }
+        }
+        writeOutputStreamSet("pairCuts", std::vector<PabloAST *>{pb.createInFile(pb.createNot(inside))});
+    }
+    const std::vector<uint16_t> mInside;
+    const unsigned mMode;
+    const bool mGuard, mE280;
+    const unsigned mE2;
+};
+
+// --combined-cuts (--len-scan with --pair-cuts=3): the cuts of BPEUnitCutsKernel (cuts only) and
+// BPEPairCutsKernel in one kernel: the segment starts, the frozen bytes (cut before and after), the
+// run cuts and the lead-keyed pair cuts, from one set of shifted basis bits (bpeShiftBasis).
+class BPECutsKernel final : public PabloKernel {
+public:
+    BPECutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * segs, StreamSet * cuts,
+                  const std::array<uint64_t, 4> & frozen, const BPERunCutParams & runs,
+                  std::vector<uint16_t> inside, unsigned e2, const std::string & pairTag)
+    : PabloKernel(ts, "BPE_Cuts_" + bpeHexName(frozen) + (runs.cutN ? runs.tag() : "") + "_pL" + pairTag
+                      + "_e2" + std::to_string(e2),
+                  {Binding{"basis", basis, FixedRate(), LookAhead(std::max(runs.cutN, (e2 & 4) ? 2u : 1u))},
+                   Binding{"segs", segs}},
+                  {Binding{"cuts", cuts}})
+    , mFrozen(frozen), mRuns(runs), mInside(std::move(inside)), mE2(e2) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        const std::vector<PabloAST *> basis = getInputStreamSet("basis");
+        const BPEShiftedBasis B = bpeShiftBasis(pb, basis, (mE2 & 4) != 0);
+        PabloAST * cuts = getInputStreamSet("segs")[0];
+        if (re::CC * const frozenCC = bpeByteSetCC(mFrozen)) {      // a frozen byte is a piece of its own
+            PabloAST * const F = cc::Parabix_CC_Compiler_Builder(basis).compileCC(frozenCC, pb);
+            cuts = pb.createOr(cuts, pb.createOr(F, pb.createAdvance(F, 1)));
+        }
+        if (mRuns.cutN) cuts = pb.createOr(cuts, bpeHardRunCuts(pb, B, mRuns).first);
+        cuts = pb.createOr(cuts, bpeLeadKeyedCuts(pb, B, mInside, mE2));
+        writeOutputStreamSet("cuts", std::vector<PabloAST *>{pb.createInFile(cuts)});
+    }
+    const std::array<uint64_t, 4> mFrozen;
+    const BPERunCutParams mRuns;
+    const std::vector<uint16_t> mInside;
+    const unsigned mE2;
 };
 
 // BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
@@ -1946,11 +2155,44 @@ static bool byteRunCuts() { return ByteRunCuts && TailScanKernel; }
 // --len-scan=N (with --tail-scan-kernel; implies --tail-unit-cuts): the pieces of 2 .. N bytes
 // (between the cuts) are resolved by kernels of their own, BPE_len<L>_pretokenScan, each a two-level
 // scan over the end marks of the pieces of length L, and skipped by the general scan
-// (BPE_Len2Select). N = 2 so far: the byte pair is looked up in a direct 64K table. 0 = off.
+// (BPE_LenSelect<N>). L = 2: a direct 64K byte-pair table; L = 3 .. 15: a table of the L-byte tokens
+// in 64-byte buckets. N = 2 .. 15; 0 = off.
+// --pair-cut-e2=MASK (--pair-cuts=3): which cuts at the lead E2 are computed: 1 before it, 2 after
+// it, 4 in E2 80 y (with --pair-cut-e280); 7 (all) by default. A cut left out is only a longer piece.
+static cl::opt<unsigned> PairCutE2("pair-cut-e2", cl::desc("With --pair-cuts=3: the cuts at E2, 1 before it, 2 after "
+    "it, 4 in E2 80 y (default 7)."), cl::init(7));
+// --combined-cuts (on by default; with --len-scan and --pair-cuts=3): one kernel, BPE_Cuts, for
+// BPE_UnitCuts and BPE_PairCuts.
+static cl::opt<bool> CombinedCuts("combined-cuts", cl::desc("With --len-scan and --pair-cuts=3: compute the cuts in "
+    "one kernel, BPE_Cuts (default on)."), cl::init(true));
 static cl::opt<unsigned> LenScan("len-scan", cl::desc("With --tail-scan-kernel: resolve the pieces of 2 .. N "
-    "bytes in kernels of their own, BPE_len<L>_pretokenScan (0 = off, the default; N = 2 so far)."), cl::init(0));
+    "bytes in kernels of their own, BPE_len<L>_pretokenScan (N = 2 .. 15; 0 = off, the default)."), cl::init(0));
 static bool lenScan() { return LenScan >= 2 && TailScanKernel; }
-static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed || byteRunCuts() || lenScan(); }
+// --len-long-kernel (with --len-scan and --tail-unit-seed; on by default): BPE_LongPieces resolves
+// the pieces of more than N bytes in place of the general scan (BPE_TailScanIR).
+static cl::opt<bool> LenLongKernel("len-long-kernel", cl::desc("With --len-scan and --tail-unit-seed: the "
+    "pieces of more than N bytes in BPE_LongPieces, not the general scan (default on)."), cl::init(true));
+// --len-select-if=K[,K2...]: BPE_LenSelect computes the starts of pieces longer than K bytes inside
+// an If on "a piece of more than K bytes starts in the block" (nested for each further threshold,
+// ascending); none by default.
+static cl::list<unsigned> LenSelectIf("len-select-if", cl::desc("With --len-scan: compute the longer "
+    "lengths' starts inside nested Ifs, one per threshold (ascending)."), cl::CommaSeparated);
+// --pair-cuts=1 (with --tail-scan-kernel; implies --tail-unit-cuts): cut between every two bytes
+// that no token holds next to each other (tailHard), from a kernel of its own, BPE_PairCuts.
+// GPT-2: 2,689 of the 65,536 byte pairs occur inside tokens (2,074 ASCII, 615 with a byte
+// >= 0x80). --pair-cut-guard: the pairs with a byte >= 0x80 inside an If, the ASCII pairs as a
+// 14-bit class outside it. --pair-cuts=2: only the pairs with a byte >= 0x80 (the If), no ASCII
+// pair is cut. --pair-cuts=3: keyed on the UTF-8 lead bytes, the pairs (byte before, lead) and
+// (lead, next byte), in Ifs on groups of leads; --pair-cut-e280 also the pairs (80, y) in E2 80 y.
+static cl::opt<unsigned> PairCuts("pair-cuts", cl::desc("With --tail-scan-kernel: cut between the byte pairs that no "
+    "token holds: 1 all, 2 those with a byte >= 0x80, 3 those next to a UTF-8 lead byte (implies --tail-unit-cuts; "
+    "default 0, off)."), cl::init(0));
+static cl::opt<bool> PairCutE280("pair-cut-e280", cl::desc("With --pair-cuts=3: also cut between 80 and y in "
+    "E2 80 y (default on)."), cl::init(true));
+static cl::opt<bool> PairCutGuard("pair-cut-guard", cl::desc("With --pair-cuts: the pairs with a non-ASCII "
+    "byte inside an If guard, the ASCII pairs a 14-bit class (default on)."), cl::init(true));
+static bool pairCuts() { return PairCuts && TailScanKernel; }
+static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed || byteRunCuts() || lenScan() || pairCuts(); }
 // Measurement only (wrong output): pretokens of more than N bytes get a 0 and nothing else,
 // in BPETailScanKernel.
 static cl::opt<unsigned> TailSkipLong("tail-skip-long", cl::init(0), cl::Hidden);
@@ -2774,6 +3016,43 @@ static void tailWalkSlowIR(uint64_t call, uint64_t s, uint64_t e) {
     reinterpret_cast<TailWalkCall<W> *>(call)->walk.word(s, e);
 }
 
+// --len-scan with --tail-unit-seed: BPE_LongPieces, in place of the general scan. Every piece of
+// 1 .. N bytes is resolved by the seed and BPE_len<L>_pretokenScan; this resolves the rest: the
+// pieces of more than N bytes (lng: their starts) and the input's last piece (also in lng, as the
+// cut after it is not in the input). emit starts as a copy of the cuts; a long piece cut by the
+// call's right edge, or continued from the previous call (position 0 neither a cut nor covered:
+// cover = the bytes of the pieces of 1 .. N bytes), goes to open / seg, as tailWalkStart and
+// tailWalkEnd do.
+extern "C" void bpe_long_block(const uint8_t * bytes, const uint64_t * lng, const uint64_t * cuts,
+                               const uint64_t * cover, uint16_t * res, uint64_t * emit, uint64_t * open,
+                               uint64_t * seg, uint64_t numItems, uint64_t n, uint64_t final) {
+    n = std::min(n, numItems);
+    const TailStartBits c(cuts, n);
+    for (size_t i = 0; i < c.nWords; i++) emit[i] = c.word(i);       // every piece's first token
+    std::fill(emit + c.nWords, emit + numItems / 64, 0);
+    tailClearBits(open, numItems);
+    tailClearBits(seg, numItems);
+    if (n == 0) return;
+    auto bit = [](const uint64_t * v, size_t p) { return (v[p / 64] >> (p % 64)) & 1; };
+    auto nextCut = [&](size_t p) -> size_t {                         // the first cut at p or later; n if none
+        for (size_t w = p / 64; w < c.nWords; w++) {
+            uint64_t x = c.word(w);
+            if (w == p / 64) x &= ~0ull << (p % 64);
+            if (x) return w * 64 + __builtin_ctzll(x);
+        }
+        return n;
+    };
+    TailByteWalk<kTailCacheWays> walk(tailScratch(), bytes, res, emit, open, seg, n);
+    if (!bit(cuts, 0) && !bit(cover, 0)) walk.openRange(0, nextCut(1), false);   // cut by the left edge
+    TailStartBits L(lng, n);
+    for (size_t s = L.next(); s < n; s = L.next()) {
+        const size_t e = nextCut(s + 1);
+        if (e == n && !final) walk.openRange(s, n, true);            // may go on in the next call
+        else walk.word(s, e);
+    }
+    walk.drain();
+}
+
 extern "C" void bpe_tail_resolve_bytes(const uint8_t * bytes, const uint64_t * segs, uint16_t * res,
                                        uint64_t * emit, uint64_t * open, uint64_t * seg, uint64_t numItems,
                                        uint64_t n, uint64_t final) {
@@ -3189,134 +3468,484 @@ protected:
     Value * mVDesc = nullptr;                                                // --tail-vocab-layout=1
 };
 
-// --len-scan: the pieces of exactly two bytes. From the cuts (piece starts) and units (one-byte
-// pieces) of BPEUnitCutsKernel:
-//   s2    = cuts & ~next(cuts) & next2(cuts)   the starts of two-byte pieces
-//   e2    = Advance(s2, 1)                     their end marks
-//   cover = unit | s2 | e2                     the bytes of the pieces the general scan does not resolve
-//   scan  = cuts & ~(cover & Advance(cover, 1))
-// The general scan (BPETailScanKernel) takes scan and cover in place of its scan and unit streams: a
-// step from a covered start is a run of units and two-byte pieces, whose bytes it gives their base
-// ids; BPE_len2_pretokenScan then fixes the two-byte pieces. Past the end of the input next2(cuts)
-// may read anything, but a start it marks there is a last piece of two bytes or one, and either is
-// resolved right.
-class BPELen2SelectKernel final : public PabloKernel {
+// --len-scan with --tail-unit-seed: the pieces the length kernels do not resolve (bpe_long_block).
+class BPELongPiecesKernel final : public MultiBlockKernel {
 public:
-    BPELen2SelectKernel(LLVMTypeSystemInterface & ts, StreamSet * cuts, StreamSet * unit,
-                        StreamSet * scan, StreamSet * cover, StreamSet * s2, StreamSet * e2)
-    : PabloKernel(ts, "BPE_Len2Select",
-                  {Binding{"cuts", cuts, FixedRate(), LookAhead(2)}, Binding{"unit", unit}},
-                  {Binding{"scan", scan}, Binding{"cover", cover}, Binding{"s2", s2}, Binding{"e2", e2}}) {}
+    BPELongPiecesKernel(LLVMTypeSystemInterface & ts, StreamSet * bytes, StreamSet * lng, StreamSet * cuts,
+                        StreamSet * cover, StreamSet * resIn, StreamSet * res, StreamSet * emit,
+                        StreamSet * open, StreamSet * seg)
+    : MultiBlockKernel(ts, "BPE_LongPieces",
+                       // LookBehind(1) on resIn: see BPETailScanKernel
+                       {Binding{"bytes", bytes}, Binding{"long", lng, FixedRate(1), Principal()},
+                        Binding{"cuts", cuts}, Binding{"cover", cover},
+                        Binding{"resIn", resIn, FixedRate(1), LookBehind(1)}},
+                       {Binding{"res", res, FixedRate(1), InOut("resIn")}, Binding{"emit", emit},
+                        Binding{"open", open}, Binding{"seg", seg}},
+                       {}, {}, {}) {
+        addAttribute(Statefree());   // see BPETailResolveKernel
+    }
 protected:
-    void generatePabloMethod() override {
-        PabloBuilder pb(getEntryScope());
-        PabloAST * const cuts = getInputStreamSet("cuts")[0];
-        PabloAST * const unit = getInputStreamSet("unit")[0];
-        PabloAST * const s2 = pb.createAnd3(cuts, pb.createNot(pb.createLookahead(cuts, 1)), pb.createLookahead(cuts, 2));
-        PabloAST * const e2 = pb.createAdvance(s2, 1);
-        PabloAST * const cover = pb.createOr3(unit, s2, e2);
-        PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(cover, pb.createAdvance(cover, 1))));
-        writeOutputStreamSet("scan", std::vector<PabloAST *>{scan});
-        writeOutputStreamSet("cover", std::vector<PabloAST *>{cover});
-        writeOutputStreamSet("s2", std::vector<PabloAST *>{s2});
-        writeOutputStreamSet("e2", std::vector<PabloAST *>{e2});
+    void generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) override {
+        Function * const fn = b.getModule()->getFunction("bpe_long_block");
+        if (fn == nullptr) report_fatal_error("BPE_LongPieces: bpe_long_block is not linked");
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(numOfStrides, b.getSize(getStride()));
+        Value * const n = b.CreateUMin(numItems, b.getAccessibleItemCount("long"));
+        b.CreateCall(fn->getFunctionType(), fn,
+                     {b.getInputStreamBlockPtr("bytes", zero), b.getInputStreamBlockPtr("long", zero),
+                      b.getInputStreamBlockPtr("cuts", zero), b.getInputStreamBlockPtr("cover", zero),
+                      b.getOutputStreamBlockPtr("res", zero), b.getOutputStreamBlockPtr("emit", zero),
+                      b.getOutputStreamBlockPtr("open", zero), b.getOutputStreamBlockPtr("seg", zero),
+                      numItems, n, b.CreateZExt(b.isFinal(), b.getInt64Ty())});
     }
 };
 
-// --len-scan: the BPE of a two-byte piece b0 b1 is the rule's id if (b0, b1) is a rule, else the two
-// base ids: one load from this table, the id of each byte pair or 0xFFFF (128 KB, built with gTail).
-static std::vector<uint16_t> gTailPairBytes;
-static uint64_t tailLen2Table() { return reinterpret_cast<uint64_t>(gTailPairBytes.data()); }
-
-// BPE_len2_pretokenScan: a two-level scan over the end marks e of the two-byte pieces. The general
-// scan has already given both bytes their base ids and the start its emit bit, so at e it only
-// fixes the piece: a rule gives res[e - 1] = its id; no rule sets emit at e (the second token).
-// Bytes are read at e - 1 (LookBehind(1)). A call writes only its own positions: a piece starting
-// before the call (e at 0) is fixed by the previous call, which checks its last byte (s2) and reads
-// the next byte past its end (LookAhead(1)); the emit bit at e is this call's. res and emit are
-// updated in place (InOut), after the general scan. LookBehind(1) on resIn keeps it out of a
-// thread-local buffer, as for --tail-unit-seed (an LLVM register allocator crash otherwise).
-class BPELen2ScanKernel final : public TwoLevelScanKernel {
+// --len-scan=N: the pieces of exactly L bytes, L = 2 .. N. From the cuts (piece starts) of
+// BPEUnitCutsKernel:
+//   s<L>  = cuts & ~next(cuts) & .. & ~next<L-1>(cuts) & next<L>(cuts)   the starts of L-byte pieces
+//   cover = the bytes of the pieces of 1 .. N bytes   (the pieces the general scan does not resolve)
+//   scan  = cuts & ~(cover & Advance(cover, 1))
+// The general scan (BPETailScanKernel) takes scan and cover in place of its scan and unit streams: a
+// step from a covered start is a run of units and short pieces, whose bytes it gives their base
+// ids; BPE_len<L>_pretokenScan then fixes the pieces of length L. cuts is InFile, so a piece ending
+// at the end of the input is not marked (no cut after it): it counts as longer than N, and the
+// general scan resolves it.
+class BPELenSelectKernel final : public PabloKernel {
 public:
-    BPELen2ScanKernel(LLVMTypeSystemInterface & ts, StreamSet * e2, StreamSet * s2, StreamSet * bytes,
-                      StreamSet * resIn, StreamSet * emitIn, StreamSet * res, StreamSet * emit)
-    : TwoLevelScanKernel(ts, "BPE_len2_pretokenScan", 64, "e2", {}) {
-        mInputStreamSets.push_back(Binding{"e2", e2, FixedRate(1), Principal()});
-        mInputStreamSets.push_back(Binding{"s2", s2});
-        mInputStreamSets.push_back(Binding{"bytes", bytes, FixedRate(1), {LookBehind(1), LookAhead(1)}});
-        mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), LookBehind(1)});
-        mInputStreamSets.push_back(Binding{"emitIn", emitIn});
+    BPELenSelectKernel(LLVMTypeSystemInterface & ts, unsigned N, StreamSet * cuts,
+                       StreamSet * scan, StreamSet * cover, StreamSet * starts,
+                       std::vector<unsigned> ifs = {}, bool longOut = false)
+    : PabloKernel(ts, "BPE_LenSelect" + std::to_string(N) + ifTag(ifs) + (longOut ? "_long" : ""),
+                  {Binding{"cuts", cuts, FixedRate(), LookAhead(N)}},
+                  {Binding{longOut ? "long" : "scan", scan}, Binding{"cover", cover}, Binding{"starts", starts}})
+    , mN(N), mIfs(std::move(ifs)), mLongOut(longOut) {}
+protected:
+    static std::string ifTag(const std::vector<unsigned> & ifs) {
+        std::string t;
+        for (unsigned k : ifs) t += "_if" + std::to_string(k);
+        return t;
+    }
+    // A = the starts of pieces of at least L bytes: s<L> = A & next<L>, then A &= ~next<L>, for
+    // L = from .. N; past a threshold K (pieces of more than K bytes), the rest in an If on A.
+    // Returns A for pieces of more than N bytes.
+    PabloAST * lengths(PabloBuilder & pb, PabloAST * const cuts, PabloAST * A, unsigned from, unsigned k) {
+        for (unsigned L = from; L <= mN; L++) {
+            if (k < mIfs.size() && L == mIfs[k] + 1) {           // A: the pieces of more than L - 1 bytes
+                Var * const longV = pb.createVar("long" + std::to_string(L), pb.createZeroes());
+                for (unsigned M = L; M <= mN; M++) {               // (an outer If's Vars serve)
+                    if (mStartVar[M] == nullptr) mStartVar[M] = pb.createVar("s" + std::to_string(M) + "v", pb.createZeroes());
+                }
+                auto body = pb.createScope();
+                body.createAssign(longV, lengths(body, cuts, A, L, k + 1));
+                pb.createIf(A, body);
+                return longV;
+            }
+            PabloAST * const next = pb.createLookahead(cuts, L);
+            PabloAST * const sL = pb.createAnd(A, next);
+            if (mStartVar[L]) pb.createAssign(mStartVar[L], sL);
+            else mStart[L] = sL;
+            A = pb.createAnd(A, pb.createNot(next));
+        }
+        return A;
+    }
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const cuts = getInputStreamSet("cuts")[0];
+        PabloAST * cover = nullptr;
+        mStart.assign(mN + 1, nullptr);
+        mStartVar.assign(mN + 1, nullptr);
+        PabloAST * const A2 = pb.createAnd(cuts, pb.createNot(pb.createLookahead(cuts, 1)));
+        PabloAST * const longS = lengths(pb, cuts, A2, 2, 0);
+        std::vector<PabloAST *> starts;                    // one stream set: stream L - 2 for length L
+        for (unsigned L = 2; L <= mN; L++) starts.push_back(mStartVar[L] ? mStartVar[L] : mStart[L]);
+        writeOutputStreamSet("starts", starts);
+        // cover = every byte not in a piece of more than N bytes (unit pieces included): the
+        // longer pieces' starts and the non-cut bytes after them, up to the next cut.
+        PabloAST * const notCut = pb.createNot(cuts);
+        PabloAST * const longBody = pb.createOr(longS, pb.createAnd(pb.createMatchStar(pb.createAdvance(longS, 1), notCut), notCut));
+        cover = pb.createInFile(pb.createNot(longBody));
+        if (mLongOut) {                             // BPE_LongPieces: the long pieces' starts
+            writeOutputStreamSet("long", std::vector<PabloAST *>{pb.createInFile(longS)});
+        } else {
+            PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(cover, pb.createAdvance(cover, 1))));
+            writeOutputStreamSet("scan", std::vector<PabloAST *>{scan});
+        }
+        writeOutputStreamSet("cover", std::vector<PabloAST *>{cover});
+    }
+    const unsigned mN;
+    const std::vector<unsigned> mIfs;
+    const bool mLongOut;
+    std::vector<PabloAST *> mStart;
+    std::vector<Var *> mStartVar;
+};
+
+// --len-scan, L = 2: the BPE of a two-byte piece b0 b1 is the rule's id if (b0, b1) is a rule, else
+// the two base ids: one load from this table, the id of each byte pair or 0xFFFF (128 KB).
+static std::vector<uint16_t> gTailPairBytes;
+// --len-scan, L = 3 .. 15: the L-byte tokens whose BPE is themselves, by key (byte 0 lowest; a NUL
+// is in no token, so a key is never 0), in 64-byte buckets, 2^bits of them per length:
+//   L = 3, 4:   8 u32 keys, 8 ids;                 bucket (key * 0x9E3779B1) >> (32 - bits)
+//   L = 5 .. 8: 6 u64 keys, 6 ids;                 bucket (key * kTailLenM) >> (64 - bits)
+//   L > 8:      3 keys k0 (bytes 0..7), k1 (bytes 8..L-1), 3 ids;
+//               bucket ((k0 ^ k1 * kTailLenM1) * kTailLenM) >> (64 - bits)
+// A token whose bucket is full is left out (a lookup then misses, and the miss path gives the
+// same tokens).
+static constexpr uint64_t kTailLenM = 0x9E3779B97F4A7C15ull, kTailLenM1 = 0xC2B2AE3D27D4EB4Full;
+struct alignas(64) TailLenBucket {
+    uint32_t key[8];                         // 0: empty
+    uint16_t id[8];
+    uint16_t pad[8];
+};
+struct alignas(64) TailLenBucket64 {
+    uint64_t key[6];
+    uint16_t id[6];
+    uint32_t pad;
+};
+struct alignas(64) TailLenBucket128 {
+    uint64_t key[6];                         // k0, k1 of way 0, of way 1, of way 2
+    uint16_t id[3];
+    uint16_t pad[5];
+};
+static_assert(sizeof(TailLenBucket64) == 64 && sizeof(TailLenBucket128) == 64, "64-byte buckets");
+static constexpr unsigned kTailLenMax = 15;      // = kTailByteKeyMax: the misses use the thread cache
+static unsigned tailLenWays(unsigned L) { return L <= 4 ? 8 : L <= 8 ? 6 : 3; }
+struct TailLenTable {
+    std::vector<TailLenBucket> buckets;      // the 64-byte buckets, in L's format
+    unsigned bits = 0;
+};
+static TailLenTable gTailLenTab[kTailLenMax + 1];   // [3 .. kTailLenMax]
+static uint64_t tailLenTable2() { return reinterpret_cast<uint64_t>(gTailPairBytes.data()); }
+template <unsigned L> static uint64_t tailLenTable() { return reinterpret_cast<uint64_t>(gTailLenTab[L].buckets.data()); }
+static uint64_t (* const kTailLenTables[kTailLenMax + 1])() = {
+    nullptr, nullptr, tailLenTable2, tailLenTable<3>, tailLenTable<4>, tailLenTable<5>, tailLenTable<6>,
+    tailLenTable<7>, tailLenTable<8>, tailLenTable<9>, tailLenTable<10>, tailLenTable<11>, tailLenTable<12>,
+    tailLenTable<13>, tailLenTable<14>, tailLenTable<15>};
+
+// The emit bits of a piece starting at s: bit i of mask for position s + i. A piece may end in
+// the next call's first word, which that call (state free: perhaps on another thread at the same
+// time) also updates, so the bits go in by atomic or.
+static inline void tailLenEmit(uint64_t * emit, uint64_t s, uint32_t mask) {
+    if (mask == 0) return;
+    const unsigned off = unsigned(s % 64);
+    __atomic_fetch_or(&emit[s / 64], uint64_t(mask) << off, __ATOMIC_RELAXED);
+    if (off > 64 - kTailLenMax && (uint64_t(mask) >> (64 - off)) != 0)
+        __atomic_fetch_or(&emit[s / 64 + 1], uint64_t(mask) >> (64 - off), __ATOMIC_RELAXED);
+}
+// --tail-batch-bpe: the queued pieces of BPE_len<L>_pretokenScan, merged together as by
+// tailBatchFlush, with their emit bits by tailLenEmit.
+static void tailLenFlush(TailScratch & S, const uint8_t * bytes, uint16_t * res, uint64_t * emit) {
+    constexpr unsigned W = kTailCacheWays;
+    const unsigned n = S.batchN;
+    S.batchN = 0;
+    TailLane lane[kTailLanes];
+    bool live[kTailLanes];
+    unsigned next = 0, nlive = 0;
+    auto load = [&](unsigned k) {
+        live[k] = next < n;
+        if (!live[k]) return;
+        lane[k].unit = next;
+        tailLaneInit(lane[k], bytes + S.batch[next].s, S.batch[next].len);
+        next++;
+    };
+    auto finish = [&](const TailLane & l) {
+        const TailBPEUnit & u = S.batch[l.unit];
+        unsigned m = 0;
+        for (uint32_t x = l.L; x; x &= x - 1, m++) {
+            const uint32_t p = uint32_t(__builtin_ctz(x));
+            res[u.s + p] = l.T[p];
+        }
+        tailLenEmit(emit, u.s, l.L & ~1u);
+        TailCacheEntry * const set = u.set;
+        if (m > kTailCacheOut) return;
+        if ((set[0].k0 == u.k0 && set[0].k1 == u.k1) || (set[1].k0 == u.k0 && set[1].k1 == u.k1)) return;
+        tailShiftDown<W>(set, W - 1);                               // the last one goes
+        TailCacheEntry & f = set[0];
+        f.k0 = u.k0; f.k1 = u.k1; f.keep = uint16_t(l.L);
+        m = 0;
+        for (uint32_t x = l.L; x; x &= x - 1) f.out[m++] = l.T[__builtin_ctz(x)];
+    };
+    for (unsigned k = 0; k < kTailLanes; k++) { load(k); nlive += live[k]; }
+    while (nlive) {
+#pragma clang loop unroll(full)
+        for (unsigned k = 0; k < kTailLanes; k++) {
+            if (!live[k] || tailLaneStep(lane[k])) continue;
+            finish(lane[k]);
+            load(k);
+            nlive -= !live[k];
+        }
+    }
+}
+// At the end of a call of BPE_len<L>_pretokenScan: its queued pieces.
+extern "C" void bpe_len_flush(const uint8_t * bytes, uint16_t * res, uint64_t * emit) {
+    TailScratch & S = tailScratch();
+    if (S.batchN) tailLenFlush(S, bytes, res, emit);
+}
+// The miss path of BPE_len<L>_pretokenScan: the tokens of the piece bytes[s, s + len), from the
+// thread cache (keyed as the general scan keys its pretokens) or BPE on the base ids (with
+// --tail-batch-bpe, queued: written by tailLenFlush); each token's id at its start and, past the
+// first token, its emit bit. lim: the end of the readable bytes.
+extern "C" void bpe_len_miss(const uint8_t * bytes, uint16_t * res, uint64_t * emit, int64_t s, uint64_t len,
+                             int64_t lim) {
+    uint64_t a = 0, b = 0;
+    if (LLVM_LIKELY(s + 16 <= lim)) {
+        std::memcpy(&a, bytes + s, 8);
+        std::memcpy(&b, bytes + s + 8, 8);
+    } else {
+        for (size_t i = 0; i < len; i++) (i < 8 ? a : b) |= uint64_t(bytes[s + int64_t(i)]) << (8 * (i % 8));
+    }
+    const uint64_t k0 = len >= 8 ? a : a & tailLowMask(len * 8);
+    const uint64_t k1 = (len > 8 ? b & tailLowMask((len - 8) * 8) : 0) | (uint64_t(len) << 56);
+    const uint64_t h = (k0 ^ (k1 * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+    TailScratch & S = tailScratch();
+    TailCacheEntry * const set = S.sets + (h >> (64 - S.setBits)) * kTailCacheWays;
+    static_assert(kTailCacheWays == 2, "the thread cache's sets have 2 entries");
+    const TailCacheEntry * e = nullptr;
+    if (LLVM_LIKELY(set[0].k0 == k0 && set[0].k1 == k1)) e = &set[0];
+    else if (set[1].k0 == k0 && set[1].k1 == k1) e = &set[1];
+    if (LLVM_UNLIKELY(e == nullptr) && TailBatchBPE) {
+        S.batch[S.batchN++] = TailBPEUnit{k0, k1, set, uint32_t(s), uint32_t(len)};
+        if (S.batchN == kTailBatch) tailLenFlush(S, bytes, res, emit);
+        return;
+    }
+    if (LLVM_UNLIKELY(e == nullptr)) {
+        uint16_t t[kTailLenMax];
+        uint32_t pos[kTailLenMax];
+        size_t m = len;
+        for (size_t i = 0; i < len; i++) { t[i] = gTailBase[bytes[s + int64_t(i)]]; pos[i] = uint32_t(i); }
+        tailMergeSegment(t, pos, m);
+        if (m > kTailCacheOut) {
+            uint32_t mask = 0;
+            for (size_t j = 0; j < m; j++) { res[s + pos[j]] = t[j]; mask |= 1u << pos[j]; }
+            tailLenEmit(emit, uint64_t(s), mask & ~1u);
+            return;
+        }
+        tailShiftDown<kTailCacheWays>(set, kTailCacheWays - 1);   // the last one goes
+        TailCacheEntry & f = set[0];
+        f.k0 = k0; f.k1 = k1; f.keep = 0;
+        for (size_t j = 0; j < m; j++) { f.keep |= uint16_t(1u << pos[j]); f.out[j] = t[j]; }
+        e = &f;
+    }
+    unsigned j = 0;
+    for (uint32_t keep = e->keep; keep; keep &= keep - 1) res[s + __builtin_ctz(keep)] = e->out[j++];
+    tailLenEmit(emit, uint64_t(s), uint32_t(e->keep) & ~1u);
+}
+// BPE_len<L>_pretokenScan: a two-level scan over the starts s of the pieces of L bytes. The
+// general scan has already given every byte its base id and the piece's start its emit bit, so at
+// s this only fixes the piece's tokens. A piece starting in the call is finished there, also when
+// it ends in the next call's first L - 1 positions: LookAhead(L - 1) on bytes, resIn and emitIn has
+// them written by the kernels before this one, and no kernel after it has read them yet; so there
+// is no edge case. (The final call's last pieces are marked only when they end in the input, see
+// BPELenSelectKernel.) L = 2: one load from the direct pair table; a rule gives res[s] its id, no
+// rule sets emit at s + 1. L = 3, 4: the key from one 4-byte load ending at s + L - 1, its bucket's
+// 8 keys compared at once; L = 5 .. 8: one 8-byte load, 6 keys; L > 8: two 8-byte loads, 3 key
+// pairs. A hit gives res[s] the token's id, a miss calls bpe_len_miss. res and emit are updated
+// in place (InOut), after the general scan; emit by atomic or (tailLenEmit); LookBehind(1) on resIn
+// keeps it out of a thread-local buffer (an LLVM register allocator crash otherwise, as for
+// --tail-unit-seed).
+class BPELenScanKernel final : public TwoLevelScanKernel {
+public:
+    BPELenScanKernel(LLVMTypeSystemInterface & ts, unsigned L, StreamSet * starts,
+                     StreamSet * bytes, StreamSet * resIn, StreamSet * emitIn, StreamSet * res, StreamSet * emit)
+    : TwoLevelScanKernel(ts, "BPE_len" + std::to_string(L) + "_pretokenScan"
+                             + (L >= 3 ? "_b" + std::to_string(gTailLenTab[L].bits) : std::string())
+                             + "_of" + std::to_string(starts->getNumElements()),
+                         64, "starts", {}, int(L - 2))
+    , mL(L) {
+        mInputStreamSets.push_back(Binding{"starts", starts, FixedRate(1), Principal()});
+        mInputStreamSets.push_back(Binding{"bytes", bytes, FixedRate(1), {LookBehind(7), LookAhead(L - 1)}});
+        mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), {LookBehind(1), LookAhead(L - 1)}});
+        mInputStreamSets.push_back(Binding{"emitIn", emitIn, FixedRate(1), LookAhead(L - 1)});
         mOutputStreamSets.push_back(Binding{"res", res, FixedRate(1), InOut("resIn")});
         mOutputStreamSets.push_back(Binding{"emit", emit, FixedRate(1), InOut("emitIn")});
         addAttribute(Statefree());
     }
 protected:
+    Function * linked(KernelBuilder & b, StringRef name) {
+        Function * const fn = b.getModule()->getFunction(name);
+        if (fn == nullptr) report_fatal_error(StringRef("BPE_len_pretokenScan: ") + name + " is not linked");
+        return fn;
+    }
     void initialize(KernelBuilder & b) override {
         Value * const zero = b.getInt32(0);
         Value * const numItems = b.CreateMul(b.getNumOfStrides(), b.getSize(getStride()));
-        mN = b.CreateUMin(numItems, b.getAccessibleItemCount("e2"));
-        mBase = b.getProcessedItemCount("e2");
-        mFinal = b.isFinal();
+        mN = b.CreateUMin(numItems, b.getAccessibleItemCount("starts"));
+        mBase = b.getProcessedItemCount("starts");
         mBytes = b.getInputStreamBlockPtr("bytes", zero);
-        mS2 = b.getInputStreamBlockPtr("s2", zero);
         mRes = b.getOutputStreamBlockPtr("res", zero);
         mEmit = b.getOutputStreamBlockPtr("emit", zero);
-        Function * const fn = b.getModule()->getFunction("bpe_len2_table");
-        if (fn == nullptr) report_fatal_error("BPE_len2_pretokenScan: bpe_len2_table is not linked");
+        Function * const fn = linked(b, tableName());
         mTable = b.CreateIntToPtr(b.CreateCall(fn->getFunctionType(), fn, {}), PointerType::getUnqual(b.getContext()));
         mLoopVarInitialValues = {};
     }
     void wordPrologueLogic(KernelBuilder &, Value *, std::vector<Value *>, std::vector<Value *> &) override {}
-    Value * pairId(KernelBuilder & b, Value * p) {              // the rule id of bytes p - 1, p, or 0xFFFF
+    Value * pairId(KernelBuilder & b, Value * p) {              // L = 2: the rule id of bytes p - 1, p, or 0xFFFF
         Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
         Value * const b0 = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(1)))), i64);
         Value * const b1 = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, p)), i64);
         return b.CreateLoad(i16, b.CreateGEP(i16, mTable, b.CreateOr(b.CreateShl(b0, 8), b1)));
     }
     void generateProcessingLogic(KernelBuilder & b, Value * absItemPos, std::vector<Value *> &) override {
-        Type * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
-        Value * const p = b.CreateSub(absItemPos, mBase);
-        Value * const id = pairId(b, p);
-        BasicBlock * const merged = b.CreateBasicBlock("len2Merged");
-        BasicBlock * const apart = b.CreateBasicBlock("len2Apart");
-        BasicBlock * const store = b.CreateBasicBlock("len2Store");
-        BasicBlock * const done = b.CreateBasicBlock("len2Done");
-        b.CreateLikelyCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), merged, apart);
-        b.SetInsertPoint(merged);                   // one token at the start, if the start is ours
-        b.CreateCondBr(b.CreateICmpNE(p, b.getInt64(0)), store, done);
-        b.SetInsertPoint(store);
-        b.CreateStore(id, b.CreateGEP(i16, mRes, b.CreateSub(p, b.getInt64(1))));
+        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i32 = b.getInt32Ty(), * const i64 = b.getInt64Ty();
+        Value * const s = b.CreateSub(absItemPos, mBase);          // the piece [s, p]
+        Value * const p = b.CreateAdd(s, b.getInt64(mL - 1));
+        BasicBlock * const hit = b.CreateBasicBlock("lenHit");
+        BasicBlock * const miss = b.CreateBasicBlock("lenMiss");
+        BasicBlock * const done = b.CreateBasicBlock("lenDone");
+        Value * id = nullptr;
+        if (mL == 2) {
+            id = pairId(b, p);
+            b.CreateLikelyCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), hit, miss);
+        } else if (mL <= 4) {
+            Value * x = b.CreateAlignedLoad(i32, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(3))), 1);
+            if (mL == 3) x = b.CreateLShr(x, b.getInt32(8));
+            const unsigned bits = gTailLenTab[mL].bits;
+            Value * const bucket = b.CreateZExt(b.CreateLShr(b.CreateMul(x, b.getInt32(0x9E3779B1u)), b.getInt32(32 - bits)), i64);
+            Value * const set = b.CreateGEP(i8, mTable, b.CreateShl(bucket, b.getInt64(6)));
+            FixedVectorType * const v8 = FixedVectorType::get(i32, 8);
+            Value * const keys = b.CreateAlignedLoad(v8, set, 32);
+            Value * const eq = b.CreateICmpEQ(keys, b.CreateVectorSplat(8, x));
+            Value * const mask = b.CreateZExt(b.CreateBitCast(eq, i8), i32);
+            Value * const way = b.CreateCountForwardZeroes(b.CreateOr(mask, b.getInt32(0x100)));
+            id = b.CreateLoad(i16, b.CreateGEP(i8, set, b.CreateZExt(b.CreateAdd(b.getInt32(32), b.CreateShl(way, b.getInt32(1))), i64)));
+            b.CreateLikelyCondBr(b.CreateICmpULT(way, b.getInt32(8)), hit, miss);
+        } else {                                    // u64 keys (L <= 8) or k0, k1 pairs
+            const unsigned bits = gTailLenTab[mL].bits;
+            // bytes e - 7 .. e: the key's last min(L, 8) bytes at the top
+            Value * const top = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(7))), 1);
+            Value * h = nullptr, * splat = nullptr;
+            if (mL <= 8) {
+                Value * const key = b.CreateLShr(top, b.getInt64(8 * (8 - mL)));
+                h = b.CreateMul(key, b.getInt64(kTailLenM));
+                splat = b.CreateVectorSplat(8, key);
+            } else {
+                Value * const k0 = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, s), 1);
+                Value * const k1 = b.CreateLShr(top, b.getInt64(8 * (16 - mL)));
+                h = b.CreateMul(b.CreateXor(k0, b.CreateMul(k1, b.getInt64(kTailLenM1))), b.getInt64(kTailLenM));
+                Value * v = UndefValue::get(FixedVectorType::get(i64, 8));
+                for (unsigned i = 0; i < 8; i++) v = b.CreateInsertElement(v, i % 2 ? k1 : k0, b.getInt32(i));
+                splat = v;
+            }
+            Value * const bucket = b.CreateLShr(h, b.getInt64(64 - bits));
+            Value * const set = b.CreateGEP(i8, mTable, b.CreateShl(bucket, b.getInt64(6)));
+            Value * const keys = b.CreateAlignedLoad(FixedVectorType::get(i64, 8), set, 64);
+            Value * mask = b.CreateZExt(b.CreateBitCast(b.CreateICmpEQ(keys, splat), i8), i32);
+            if (mL <= 8) mask = b.CreateAnd(mask, b.getInt32(0x3F));               // ways 0 .. 5
+            else mask = b.CreateAnd(b.CreateAnd(mask, b.CreateLShr(mask, b.getInt32(1))), b.getInt32(0x15));
+            Value * way = b.CreateCountForwardZeroes(b.CreateOr(mask, b.getInt32(0x100)));
+            if (mL > 8) way = b.CreateLShr(way, b.getInt32(1));                       // 0, 1, 2; 4: none
+            const unsigned ways = tailLenWays(mL);
+            id = b.CreateLoad(i16, b.CreateGEP(i8, set, b.CreateZExt(b.CreateAdd(b.getInt32(48), b.CreateShl(way, b.getInt32(1))), i64)));
+            b.CreateLikelyCondBr(b.CreateICmpULT(way, b.getInt32(ways)), hit, miss);
+        }
+        b.SetInsertPoint(hit);                      // one token at the start
+        b.CreateStore(id, b.CreateGEP(i16, mRes, s));
         b.CreateBr(done);
-        b.SetInsertPoint(apart);                    // two tokens: the second starts at e
-        Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(p, 6));
-        b.CreateStore(b.CreateOr(b.CreateLoad(i64, ew), b.CreateShl(b.getInt64(1), b.CreateAnd(p, b.getInt64(63)))), ew);
+        b.SetInsertPoint(miss);
+        if (mL == 2) {                              // two tokens: the second starts at e
+            Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(p, 6));   // atomic: see tailLenEmit
+            b.CreateAtomicRMW(AtomicRMWInst::Or, ew, b.CreateShl(b.getInt64(1), b.CreateAnd(p, b.getInt64(63))),
+                              MaybeAlign(8), AtomicOrdering::Monotonic);
+        } else {
+            Function * const fn = linked(b, "bpe_len_miss");
+            b.CreateCall(fn->getFunctionType(), fn, {mBytes, mRes, mEmit, s, b.getInt64(mL), b.CreateAdd(mN, b.getInt64(mL - 1))});
+        }
         b.CreateBr(done);
         b.SetInsertPoint(done);
     }
     void finalize(KernelBuilder & b, std::vector<Value *> &) override {
-        // a two-byte piece starting at the call's last byte ends in the next call: its id is ours
-        Type * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
-        BasicBlock * const check = b.CreateBasicBlock("len2Edge");
-        BasicBlock * const fix = b.CreateBasicBlock("len2EdgeFix");
-        BasicBlock * const store = b.CreateBasicBlock("len2EdgeStore");
-        BasicBlock * const exit = b.CreateBasicBlock("len2EdgeDone");
-        b.CreateCondBr(b.CreateOr(mFinal, b.CreateICmpEQ(mN, b.getSize(0))), exit, check);
-        b.SetInsertPoint(check);
-        Value * const last = b.CreateSub(mN, b.getSize(1));
-        Value * const sw = b.CreateLoad(i64, b.CreateGEP(i64, mS2, b.CreateLShr(last, 6)));
-        Value * const isS2 = b.CreateTrunc(b.CreateLShr(sw, b.CreateAnd(last, b.getInt64(63))), b.getInt1Ty());
-        b.CreateCondBr(isS2, fix, exit);
-        b.SetInsertPoint(fix);
-        Value * const id = pairId(b, mN);           // bytes n - 1, n
-        b.CreateCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), store, exit);
-        b.SetInsertPoint(store);
-        b.CreateStore(id, b.CreateGEP(i16, mRes, last));
-        b.CreateBr(exit);
-        b.SetInsertPoint(exit);
+        if (mL == 2) return;                        // (no miss path)
+        Function * const fn = linked(b, "bpe_len_flush");
+        b.CreateCall(fn->getFunctionType(), fn, {mBytes, mRes, mEmit});
     }
-    Value * mN = nullptr, * mBase = nullptr, * mFinal = nullptr;
-    Value * mBytes = nullptr, * mS2 = nullptr, * mRes = nullptr, * mEmit = nullptr, * mTable = nullptr;
+    // Each length's table under a name of its own: the JIT resolves a linked name once for the
+    // whole pipeline, so kernels linking one name to different functions would share one of them.
+    std::string tableName() const { return "bpe_len" + std::to_string(mL) + "_table"; }
+public:
+    static std::string tableNameFor(unsigned L) { return "bpe_len" + std::to_string(L) + "_table"; }
+protected:
+    const unsigned mL;
+    Value * mN = nullptr, * mBase = nullptr;
+    Value * mBytes = nullptr, * mRes = nullptr, * mEmit = nullptr, * mTable = nullptr;
 };
+
+// --len-scan: the tables. The pair table from gTail.pair (rules of two base ids); the L-byte token
+// tables from every rule's bytes (gTail.slots: (idA << 16 | idB) << 16 | idAB), keeping the tokens
+// whose BPE on their own bytes is themselves.
+static void tailLenBuildTables(unsigned N) {
+    gTailPairBytes.assign(65536, 0xFFFF);
+    unsigned nPairs = 0;
+    for (unsigned b0 = 0; b0 < 256; b0++)
+        for (unsigned b1 = 0; b1 < 256; b1++) {
+            const uint16_t id = gTail.pair[(bpeBaseId(b0) << 8) | bpeBaseId(b1)];
+            gTailPairBytes[(b0 << 8) | b1] = id;
+            nPairs += id != 0xFFFF;
+        }
+    std::cerr << "[BPE] --len-scan=" << N << ": " << nPairs << " byte-pair rules";
+    if (N >= 3) {
+        std::unordered_map<uint32_t, uint32_t> parts;            // idAB -> idA << 16 | idB
+        for (uint64_t e : gTail.slots) if (e != kTailEmpty) parts[uint32_t(e & 0xFFFF)] = uint32_t(e >> 16);
+        std::unordered_map<uint32_t, std::string> memo;
+        std::function<const std::string &(uint32_t)> bytesOf = [&](uint32_t id) -> const std::string & {
+            auto it = memo.find(id);
+            if (it != memo.end()) return it->second;
+            std::string str;
+            if (id < 256) { for (unsigned by = 0; by < 256; by++) if (bpeBaseId(by) == id) str = std::string(1, char(by)); }
+            else { const uint32_t ab = parts.at(id); str = bytesOf(ab >> 16) + bytesOf(ab & 0xFFFF); }
+            return memo.emplace(id, std::move(str)).first->second;
+        };
+        // BPE_LEN_LOAD: the buckets' load at most (default 0.5), sizing each length's table
+        const char * const loadEnv = std::getenv("BPE_LEN_LOAD");
+        const double load = loadEnv ? std::atof(loadEnv) : 0.5;
+        size_t totalKB = 0;
+        unsigned totalDropped = 0;
+        for (unsigned L = 3; L <= N; L++) {
+            struct Tok { uint64_t k0, k1; uint16_t id; };
+            std::vector<Tok> toks;
+            for (const auto & kv : parts) {
+                const std::string & str = bytesOf(kv.first);
+                if (str.size() != L) continue;
+                uint16_t t[kTailLenMax]; uint32_t pos[kTailLenMax]; size_t m = L;
+                for (unsigned i = 0; i < L; i++) { t[i] = gTailBase[uint8_t(str[i])]; pos[i] = i; }
+                tailMergeSegment(t, pos, m);
+                if (m != 1 || t[0] != kv.first) continue;
+                Tok tk{0, 0, uint16_t(kv.first)};
+                for (unsigned i = 0; i < L; i++) (i < 8 ? tk.k0 : tk.k1) |= uint64_t(uint8_t(str[i])) << (8 * (i % 8));
+                if (tk.k0 == 0) continue;                                // (no such token)
+                toks.push_back(tk);
+            }
+            std::sort(toks.begin(), toks.end(), [](const Tok & x, const Tok & y) { return x.id < y.id; });
+            const unsigned ways = tailLenWays(L);
+            TailLenTable & tab = gTailLenTab[L];
+            tab.bits = std::max(4u, unsigned(ceil_log2(size_t(std::ceil(toks.size() / (ways * load))))));
+            tab.buckets.assign(size_t(1) << tab.bits, TailLenBucket{});
+            unsigned dropped = 0;
+            for (const Tok & tk : toks) {                                // in rank order
+                unsigned w = 0;
+                if (L <= 4) {
+                    TailLenBucket & bk = tab.buckets[uint32_t(uint32_t(tk.k0) * 0x9E3779B1u) >> (32 - tab.bits)];
+                    while (w < ways && bk.key[w] != 0) w++;
+                    if (w < ways) { bk.key[w] = uint32_t(tk.k0); bk.id[w] = tk.id; }
+                } else if (L <= 8) {
+                    auto & bk = reinterpret_cast<TailLenBucket64 &>(tab.buckets[(tk.k0 * kTailLenM) >> (64 - tab.bits)]);
+                    while (w < ways && bk.key[w] != 0) w++;
+                    if (w < ways) { bk.key[w] = tk.k0; bk.id[w] = tk.id; }
+                } else {
+                    const uint64_t h = (tk.k0 ^ (tk.k1 * kTailLenM1)) * kTailLenM;
+                    auto & bk = reinterpret_cast<TailLenBucket128 &>(tab.buckets[h >> (64 - tab.bits)]);
+                    while (w < ways && bk.key[2 * w] != 0) w++;
+                    if (w < ways) { bk.key[2 * w] = tk.k0; bk.key[2 * w + 1] = tk.k1; bk.id[w] = tk.id; }
+                }
+                dropped += w == ways;
+            }
+            totalKB += tab.buckets.size() * 64 / 1024;
+            totalDropped += dropped;
+            std::cerr << (L == 3 ? "; L:tokens/KB/left out " : " ") << L << ":" << toks.size() << "/"
+                      << (tab.buckets.size() * 64 / 1024) << "/" << dropped;
+        }
+        std::cerr << "; " << totalKB << " KB, " << totalDropped << " left out (load " << load << ")";
+    }
+    std::cerr << "\n";
+}
 
 static void linkTailWalkIR(PipelineBuilder & P, Kernel * k) {
     P.LinkFunction(k, "bpe_tail_ir_begin", tailWalkBeginIR<kTailCacheWays>);
@@ -3330,8 +3959,12 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
     StreamSet * emit = P.CreateStreamSet(1, 1);
     StreamSet * open = P.CreateStreamSet(1, 1);
     StreamSet * seg = P.CreateStreamSet(1, 1);
-    if ((TailUnitCuts || TailUnitSeed || (ByteRunCuts.getNumOccurrences() > 0 && ByteRunCuts != 0)) && !TailScanKernel) {
-        std::cerr << "tokenizer: --tail-unit-cuts, --tail-unit-seed and --byte-run-cuts need --tail-scan-kernel\n";
+    if ((TailUnitCuts || TailUnitSeed || PairCuts || (ByteRunCuts.getNumOccurrences() > 0 && ByteRunCuts != 0)) && !TailScanKernel) {
+        std::cerr << "tokenizer: --tail-unit-cuts, --tail-unit-seed, --byte-run-cuts and --pair-cuts need --tail-scan-kernel\n";
+        std::exit(1);
+    }
+    if (PairCuts > 3) {
+        std::cerr << "tokenizer: --pair-cuts is 0, 1, 2 or 3\n";
         std::exit(1);
     }
     if (TailScanKernel && tailUnitCuts()) {
@@ -3347,8 +3980,8 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
         std::cerr << "[BPE] --tail-unit-cuts: " << nFrozen << " frozen bytes"
                   << (TailUnitSeed ? ", ids seeded from bit streams (--tail-unit-seed)" : "") << "\n";
         StreamSet * cuts = P.CreateStreamSet(1, 1);
-        StreamSet * unit = P.CreateStreamSet(1, 1);
-        StreamSet * scan = P.CreateStreamSet(1, 1);
+        StreamSet * unit = lenScan() ? nullptr : P.CreateStreamSet(1, 1);   // (see BPEUnitCutsKernel)
+        StreamSet * scan = lenScan() ? nullptr : P.CreateStreamSet(1, 1);
         BPERunCutParams runs;
         runs.cutN = !byteRunCuts() ? 0 : ByteRunCuts == 1 ? 2 : unsigned(ByteRunCuts);
         if (runs.cutN) {
@@ -3374,7 +4007,35 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
             std::cerr << "[BPE] --byte-run-cuts=" << runs.cutN << ": " << runs.hardRuns.size() << " ASCII hard self-pair bytes ("
                       << nHard << " in all)" << (runs.edges ? ", edges " + std::to_string(runs.edges) : std::string()) << (runs.guard ? ", guarded" : "") << "\n";
         }
-        P.CreateKernelCall<BPEUnitCutsKernel>(basis, segs, cuts, unit, scan, frozen, runs);
+        StreamSet * pairCutSet = nullptr;
+        const bool combined = CombinedCuts && lenScan() && pairCuts() && PairCuts == 3;   // BPE_Cuts
+        if (pairCuts()) {
+            std::vector<uint16_t> inside;
+            uint64_t h = 1469598103934665603ull;
+            unsigned nHigh = 0;
+            for (unsigned k = 0; k < 65536; k++) {
+                if (tailHard(uint8_t(k >> 8), uint8_t(k))) continue;
+                inside.push_back(uint16_t(k));
+                nHigh += (k & 0x8080) != 0;
+                h = (h ^ k) * 1099511628211ull;
+            }
+            char tag[24];
+            std::snprintf(tag, sizeof(tag), "%016llx", (unsigned long long) h);
+            std::cerr << "[BPE] --pair-cuts: " << inside.size() << " byte pairs inside tokens ("
+                      << inside.size() - nHigh << " ASCII, " << nHigh << " with a byte >= 0x80)"
+                      << (PairCuts == 3 ? (PairCutE280 ? ", those next to a UTF-8 lead byte and in E2 80 y cut"
+                                                       : ", those next to a UTF-8 lead byte cut")
+                          : PairCuts == 2 ? ", only those with a byte >= 0x80 cut" : PairCutGuard ? ", guarded" : "") << "\n";
+            const unsigned e2 = PairCutE2 & (PairCutE280 ? 7u : 3u);
+            if (combined) {
+                P.CreateKernelCall<BPECutsKernel>(basis, segs, cuts, frozen, runs, std::move(inside), e2, tag);
+            } else {
+                pairCutSet = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<BPEPairCutsKernel>(basis, pairCutSet, std::move(inside), unsigned(PairCuts),
+                                                      bool(PairCutGuard), bool(PairCutE280), tag, e2);
+            }
+        }
+        if (!combined) P.CreateKernelCall<BPEUnitCutsKernel>(basis, segs, cuts, unit, scan, frozen, runs, pairCutSet);
         StreamSet * resIn = nullptr;
         if (TailUnitSeed) {
             StreamSet * ids8 = P.CreateStreamSet(8, 1);
@@ -3383,39 +4044,50 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
             StreamSets idSets{ids8};
             P.CreateKernelCall<P2S16Kernel>(idSets, resIn);
         }
-        StreamSet * scanIn = scan, * unitIn = unit, * s2 = nullptr, * e2 = nullptr;
-        if (LenScan > 2) {
-            std::cerr << "tokenizer: --len-scan supports N = 2 so far\n";
+        StreamSet * scanIn = scan, * unitIn = unit;
+        StreamSet * lenStarts = nullptr;
+        if (LenScan > kTailLenMax) {
+            std::cerr << "tokenizer: --len-scan supports N = 2 .. " << kTailLenMax << "\n";
             std::exit(1);
         }
+        const bool longKernel = lenScan() && TailUnitSeed && LenLongKernel;
         if (lenScan()) {
-            gTailPairBytes.assign(65536, 0xFFFF);
-            unsigned nPairs = 0;
-            for (unsigned b0 = 0; b0 < 256; b0++)
-                for (unsigned b1 = 0; b1 < 256; b1++) {
-                    const uint16_t id = gTail.pair[(bpeBaseId(b0) << 8) | bpeBaseId(b1)];
-                    gTailPairBytes[(b0 << 8) | b1] = id;
-                    nPairs += id != 0xFFFF;
-                }
-            std::cerr << "[BPE] --len-scan=" << LenScan << ": " << nPairs << " byte-pair rules\n";
+            tailLenBuildTables(LenScan);
             scanIn = P.CreateStreamSet(1, 1);
             unitIn = P.CreateStreamSet(1, 1);
-            s2 = P.CreateStreamSet(1, 1);
-            e2 = P.CreateStreamSet(1, 1);
-            P.CreateKernelCall<BPELen2SelectKernel>(cuts, unit, scanIn, unitIn, s2, e2);
+            lenStarts = P.CreateStreamSet(LenScan - 1, 1);         // stream L - 2: the starts of length L
+            P.CreateKernelCall<BPELenSelectKernel>(unsigned(LenScan), cuts, scanIn, unitIn, lenStarts,
+                                                   std::vector<unsigned>(LenSelectIf.begin(), LenSelectIf.end()),
+                                                   longKernel);
         }
         TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the cuts
-        const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
-        Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, scanIn, res, emit, open, seg, cacheWays,
-                                                                 cuts, unitIn, resIn);
-        linkTailWalkIR(P, r);
-        if (lenScan()) {
-            StreamSet * const res2 = P.CreateStreamSet(1, 16);
-            StreamSet * const emit2 = P.CreateStreamSet(1, 1);
-            Kernel * const k2 = P.CreateKernelCall<BPELen2ScanKernel>(e2, s2, bytes, res, emit, res2, emit2);
-            P.LinkFunction(k2, "bpe_len2_table", tailLen2Table);
-            res = res2;
-            emit = emit2;
+        if (longKernel) {                    // scanIn: the long pieces' starts; unitIn: cover
+            Kernel * const r = P.CreateKernelCall<BPELongPiecesKernel>(bytes, scanIn, cuts, unitIn, resIn,
+                                                                       res, emit, open, seg);
+            P.LinkFunction(r, "bpe_long_block", bpe_long_block);
+        } else {
+            const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
+            Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, scanIn, res, emit, open, seg, cacheWays,
+                                                                     cuts, unitIn, resIn);
+            linkTailWalkIR(P, r);
+        }
+        if (lenScan()) {                     // BPE_len<L>_pretokenScan, chained on res and emit
+            for (unsigned L = 2; L <= LenScan; L++) {
+                StreamSet * const resL = P.CreateStreamSet(1, 16);
+                StreamSet * const emitL = P.CreateStreamSet(1, 1);
+                Kernel * const kL = P.CreateKernelCall<BPELenScanKernel>(L, lenStarts, bytes,
+                                                                         res, emit, resL, emitL);
+                if (L == 2) P.LinkFunction(kL, BPELenScanKernel::tableNameFor(2), tailLenTable2);
+                else {
+                    P.LinkFunction(kL, BPELenScanKernel::tableNameFor(L),
+                                  FunctionTypeBuilder<uint64_t()>::get(P.getTypeSystem().getContext()),
+                                  reinterpret_cast<void *>(kTailLenTables[L]));
+                    P.LinkFunction(kL, "bpe_len_miss", bpe_len_miss);
+                    P.LinkFunction(kL, "bpe_len_flush", bpe_len_flush);
+                }
+                res = resL;
+                emit = emitL;
+            }
         }
     } else if (TailScanKernel) {
         TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the starts
@@ -5382,7 +6054,7 @@ BPEPassResult buildBPEPassPipeline(
         const auto all = bpe.buildMergeRuleRanges(BPETokenizer::kTailAllRules);
         const size_t numRules = buildTailTable(all, 0, 8);
         for (unsigned by = 0; by < 256; by++) gTailBase[by] = uint16_t(bpeBaseId(by));
-        if (TailHardSplit || byteRunCuts()) {       // the byte pairs inside tokens, by rank
+        if (TailHardSplit || byteRunCuts() || pairCuts()) {   // the byte pairs inside tokens, by rank
             std::vector<const MergeRule *> byRank;
             unsigned maxId = 256;
             for (const auto & g : all)

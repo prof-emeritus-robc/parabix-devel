@@ -1139,11 +1139,22 @@ class GPT2ByteClassKernel final : public PabloKernel {
 public:
     GPT2ByteClassKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * classes,
                         StreamSet * F, StreamSet * L, StreamSet * first, StreamSet * last, StreamSet * nonspace)
-    : PabloKernel(ts, "GPT2ByteClass",
+    : PabloKernel(ts, "GPT2ByteClassSeq",
                   {Binding{"basis", basis, FixedRate(), LookAhead(1)},
                    Binding{"classes", classes, FixedRate(), LookAhead(3)}},
                   {Binding{"F", F}, Binding{"L", L}, Binding{"first", first}, Binding{"last", last},
-                   Binding{"nonspace", nonspace}}) {}
+                   Binding{"nonspace", nonspace}}) {
+        // Run in segment order. This kernel has lookahead and no carries, so the framework
+        // gives it a provisional lookahead stride (+PLS: it also writes one stride past its
+        // output, computed without the lookahead, for the next call to rewrite) AND runs it data
+        // parallel (state free). Then a late provisional write can land after the next
+        // segment's call wrote the real values: at --segment-size=256 and 4 threads, a false
+        // pretoken start at a segment's first byte (stress.txt: a different output on most runs;
+        // gone with -ProvisionalLookAheadStride=false or with this attribute). SideEffecting is
+        // the attribute that makes isKernelStateFree say no; "Seq" in the name keeps cached
+        // pipelines built with the old scheduling from being reused.
+        addAttribute(SideEffecting());
+    }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());

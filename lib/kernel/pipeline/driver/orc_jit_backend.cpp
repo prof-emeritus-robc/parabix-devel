@@ -116,7 +116,15 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
             single.insert(std::make_pair(mangled, def));
             auto err = MainJD.define(orc::absoluteSymbols(std::move(single)));
             if (err) {
-                handleAllErrors(std::move(err), [](const DuplicateDefinition &) { /* already visible; fine */ });
+                // Already visible: fine if it is the same function. A name linked to another
+                // function is an error, since every kernel calling it would get the first one.
+                handleAllErrors(std::move(err), [&](const DuplicateDefinition &) {
+                    auto prior = ES.lookup(makeJITDylibSearchOrder({&MainJD}), mangled);
+                    if (prior && prior->getAddress() != addr) {
+                        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
+                    }
+                    if (!prior) consumeError(prior.takeError());
+                });
             }
         }
         return f;
@@ -1422,12 +1430,18 @@ void * OrcJITBackend::finalizeObject(kernel::Kernel * const pk) {
 
 llvm::Function * OrcJITBackend::LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
     assert (&functionType->getContext() == &mDriver.mMainModule->getContext());
+    MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
+    auto symbol = M(unmangledName);
+    auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
+    // A linked name resolves to one address for the whole program: linking it again to another
+    // function would silently give every caller the first one.
+    const auto linked = mAllLinkedSymbols->find(symbol);
+    if (LLVM_UNLIKELY(linked != mAllLinkedSymbols->end() && linked->second.getAddress() != addr)) {
+        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
+    }
     Function * f = mDriver.mMainModule->getFunction(unmangledName);
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mDriver.mMainModule);
-        MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
-        auto symbol = M(unmangledName);
-        auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
         mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
     }
     return f;

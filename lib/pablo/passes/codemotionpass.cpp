@@ -5,6 +5,7 @@
 #include <pablo/ast/branch.h>
 #include <pablo/ast/ps_assign.h>
 #include <pablo/ast/pe_var.h>
+#include <pablo/ast/pablo_intrinsic.h>
 #include <boost/container/flat_set.hpp>
 #ifndef NDEBUG
 #include <pablo/compiler/pabloverifier.hpp>
@@ -19,6 +20,39 @@ using namespace llvm;
 namespace pablo {
 
 using TypeId = PabloAST::ClassTypeId;
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief hasCrossBlockState
+ *
+ * Whether the statement (or, for a branch, any statement in its body) carries state from one block to the next.
+ * Such a statement must not be sunk into a nested branch: in a block where the branch is skipped, its carry-out
+ * is never computed, so the next block reads a zero carry-in. E.g. Advance(x, 1) moved into If(c) loses x's last
+ * bit at every block end where c is zero.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static bool hasCrossBlockState(const Statement * const stmt) {
+    if (const IntrinsicCall * const call = dyn_cast<IntrinsicCall>(stmt)) {
+        return call->isCarryProducing();
+    }
+    if (isa<CarryProducingStatement>(stmt)) {
+        return true;
+    }
+    switch (stmt->getClassTypeId()) {
+        case TypeId::Count:
+        case TypeId::EveryNth:
+        case TypeId::TerminateAt:
+            return true;
+        default:
+            break;
+    }
+    if (const Branch * const br = dyn_cast<Branch>(stmt)) {
+        for (const Statement * inner : *br->getBody()) {
+            if (hasCrossBlockState(inner)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 /** ------------------------------------------------------------------------------------------------------------- *
  * @brief ScopeSet
@@ -181,8 +215,10 @@ struct CodeMotionPassContainer {
                 if (temp == nullptr) {
                     break;
                 } else if (temp == block) {
-                    // we can move the statement into a nested scope
-                    stmt->insertBefore(scope->front());
+                    // we can move the statement into a nested scope, unless it carries state across blocks
+                    if (LLVM_LIKELY(!hasCrossBlockState(stmt))) {
+                        stmt->insertBefore(scope->front());
+                    }
                     break;
                 }
             }

@@ -192,12 +192,16 @@ void PabloCompiler::compileCarryRebuild(KernelBuilder & b) {
 Value * PabloCompiler::getCarryRebuildScratchPtr(KernelBuilder & b, const Var * var, Value * index1, Value * index2) {
     assert (mRebuildingCarries && var->isKernelParameter() && var->isReadNone());
     Type * type = CBuilder::convertTypeToLLVMContext(b.getContext(), var->getType());
-    ArrayType * scratchTy = nullptr;
+    unsigned n = 1;
     if (type->isArrayTy()) {
-        scratchTy = cast<ArrayType>(type);
-    } else {
-        scratchTy = ArrayType::get(type, 1);
+        n = type->getArrayNumElements();
+        type = type->getArrayElementType();
     }
+    // Pablo stream types are zero-width placeholder vectors; store full bit blocks.
+    if (type->isVectorTy()) {
+        type = b.getBitBlockType();
+    }
+    ArrayType * const scratchTy = ArrayType::get(type, n);
     Value * scratch = nullptr;
     const auto f = mCarryRebuildScratch.find(var);
     if (f == mCarryRebuildScratch.end()) {

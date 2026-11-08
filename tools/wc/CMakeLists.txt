@@ -27,17 +27,3 @@ DEPS
     re.cc
     re.parse
 )
-
-parabix_add_executable(
-NAME
-    gcount
-SRC
-    gcount.cpp
-DEPS
-    fileselect
-    kernel.basis
-    kernel.io
-    kernel.unicode
-    re.cc
-    re.parse
-)

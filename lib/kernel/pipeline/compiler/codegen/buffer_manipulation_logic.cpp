@@ -462,7 +462,13 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
         } else {
             processedItems = mCurrentProcessedItemCountPhi[inputPort];
         }
-        args[2] = processedItems;
+        // A LookBehind input reads items before the processed position: copy from the
+        // block holding the first of them, so that they are in the masked buffer too.
+        Value * copyStart = processedItems;
+        if (LLVM_UNLIKELY(port.LookBehind > 0)) {
+            copyStart = b.CreateUnsignedSaturatingSub(processedItems, b.getSize(port.LookBehind));
+        }
+        args[2] = copyStart;
         Value * const maxItems = b.CreateAdd(mCurrentProcessedItemCountPhi[inputPort], accessibleItems[inputPort.Number]);
         args[3] = maxItems;
         assert (port.RequiredOverflowSpace >= 0);
@@ -486,7 +492,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
             const auto & DL = m->getDataLayout();
             const auto ts = b.getTypeSize(DL, buffer->getType(b));
             maskedCapacity = b.CreateMulRational(maskedBytes, Rational{b.getBitBlockWidth(), ts});
-            maskedCapacity = b.CreateAdd(processedItems, maskedCapacity);
+            maskedCapacity = b.CreateAdd(copyStart, maskedCapacity);
         }
         assert (maskedAddress->getType()->isPointerTy());
 

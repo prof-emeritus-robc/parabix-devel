@@ -92,10 +92,8 @@ int main(int argc, char *argv[]) {
 
     auto RE = readRE();
 
-    const auto allFiles = argv::getFullFileList(driver, inputFiles);
-    if (inputFiles.empty()) {
-        argv::UseStdIn = true;
-    } else if ((allFiles.size() > 1) && !argv::NoFilenameFlag) {
+    const argv::FileSelection allFiles(driver, inputFiles);
+    if (allFiles.showFileNames() && !argv::NoFilenameFlag) {
         argv::WithFilenameFlag = true;
     }
 
@@ -138,11 +136,11 @@ int main(int argc, char *argv[]) {
     grep->setContextLines(argv::BeforeContext, argv::AfterContext);
 
     grep->setStdinLabel(argv::LabelFlag);
-    if (argv::UseStdIn) grep->setGrepStdIn();
+    if (allFiles.stdinSelected()) grep->setGrepStdIn();
     if (argv::NoMessagesFlag) grep->suppressFileMessages();
     if (argv::MmapFlag) grep->setPreferMMap();
     grep->setBinaryFilesOption(argv::BinaryFilesFlag);
-    grep->initFileResult(allFiles); // unnecessary copy!
+    grep->initFileResult(allFiles.paths()); // unnecessary copy!
     if (argv::ReplaceFlagSet) {
         std::string error;
         re::RE * const replacement = re::parseReplacement(argv::ReplaceFlag, RE, error);
@@ -171,5 +169,10 @@ int main(int argc, char *argv[]) {
     jitExecution.stop();
     jitExecution.write(std::cerr);
     #endif
+    // As in GNU grep, a file error takes precedence over the match result,
+    // except for a match found with -q.
+    if (grep->fileErrorFound() && !(matchFound && (argv::Mode == argv::QuietMode))) {
+        return argv::FileErrorExitCode;
+    }
     return matchFound ? argv::MatchFoundExitCode : argv::MatchNotFoundExitCode;
 }

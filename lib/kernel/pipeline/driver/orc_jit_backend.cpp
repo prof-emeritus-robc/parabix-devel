@@ -34,6 +34,7 @@
 #include <llvm/ADT/Statistic.h>
 #include <llvm/IR/PassTimingInfo.h>
 #include <llvm/Support/SmallVectorMemoryBuffer.h>
+#include <llvm/Support/thread.h>
 #include <queue>
 #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(17, 0, 0)
 #include <llvm/TargetParser/Host.h>
@@ -115,7 +116,15 @@ struct CPUDriverContext : public LLVMContext, public FunctionLinkCallback {
             single.insert(std::make_pair(mangled, def));
             auto err = MainJD.define(orc::absoluteSymbols(std::move(single)));
             if (err) {
-                handleAllErrors(std::move(err), [](const DuplicateDefinition &) { /* already visible; fine */ });
+                // Already visible: fine if it is the same function. A name linked to another
+                // function is an error, since every kernel calling it would get the first one.
+                handleAllErrors(std::move(err), [&](const DuplicateDefinition &) {
+                    auto prior = ES.lookup(makeJITDylibSearchOrder({&MainJD}), mangled);
+                    if (prior && prior->getAddress() != addr) {
+                        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
+                    }
+                    if (!prior) consumeError(prior.takeError());
+                });
             }
         }
         return f;
@@ -623,7 +632,7 @@ public:
 
         for (size_t i = 0; i < strategy.ThreadsRequested; ++i) {
             CPUDriverContext & ctx = *(Contexts[i]);
-            Threads.emplace_back([this, &ctx]() {
+            Threads.emplace_back(std::optional<unsigned>(CompileThreadStackSize), [this, &ctx]() {
                 // NOTE: the ThreadSafeSlabAllocator itself is not passed into any class but is used invisibly
                 // behind the scenes. Do not remove this!
 
@@ -1107,7 +1116,10 @@ record_decl:
                            "Module", "Object Generation",
                            codegen::TimeKernelsIsEnabled);
 
-        C.TargetMachine->setOptLevel(codegen::BackEndOptLevel);
+        // "main" only sets up and calls the kernels, which are compiled
+        // separately at codegen::BackEndOptLevel: optimizing its code would
+        // cost far more (several msec per program) than it could ever save.
+        C.TargetMachine->setOptLevel(CodeGenOptLevel::None);
 
         SmallVector<char, 0> objBuffer;
         objBuffer.reserve(4096 + M->getInstructionCount() * 16);
@@ -1233,7 +1245,11 @@ private:
 
     std::mutex                                      PrecompiledStateObjectMutex;
 
-    std::vector<std::thread>                        Threads;
+    //  The worker threads, with stacks of their own size: LLVM's analyses recurse
+    //  deeply on large kernels (ScalarEvolution, in the loop passes, overflows
+    //  the 512 KB of a std::thread on macOS for am_Ethi-am_Ethi/Geminate).
+    static constexpr unsigned                       CompileThreadStackSize = 8u << 20;
+    std::vector<llvm::thread>                       Threads;
 
     std::mutex                                      DebugPrintMutex;
     SmallVector<DebugPrintingResult, 0>             DebugPrintResults;
@@ -1414,12 +1430,18 @@ void * OrcJITBackend::finalizeObject(kernel::Kernel * const pk) {
 
 llvm::Function * OrcJITBackend::LinkFunction(llvm::StringRef unmangledName, llvm::FunctionType * functionType, void * functionPointer) {
     assert (&functionType->getContext() == &mDriver.mMainModule->getContext());
+    MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
+    auto symbol = M(unmangledName);
+    auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
+    // A linked name resolves to one address for the whole program: linking it again to another
+    // function would silently give every caller the first one.
+    const auto linked = mAllLinkedSymbols->find(symbol);
+    if (LLVM_UNLIKELY(linked != mAllLinkedSymbols->end() && linked->second.getAddress() != addr)) {
+        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
+    }
     Function * f = mDriver.mMainModule->getFunction(unmangledName);
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mDriver.mMainModule);
-        MangleAndInterner M(mEngine->getExecutionSession(), mEngine->getDataLayout());
-        auto symbol = M(unmangledName);
-        auto addr = orc::ExecutorAddr::fromPtr(functionPointer);
         mAllLinkedSymbols->insert(std::make_pair(symbol, ExecutorSymbolDef{addr, JITSymbolFlags::Exported}));
     }
     return f;

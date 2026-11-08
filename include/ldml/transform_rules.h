@@ -43,6 +43,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <set>
 #include <vector>
 #include <functional>
 #include <llvm/Support/Casting.h>
@@ -350,14 +351,25 @@ const re::Name * originalVariable(const re::Name * n);
 // replaced by their changed definitions.
 re::RE * engineContext(re::RE * context, bool afterContext);
 // A context for the regular expression engine (see engineContext), with its
-// repetitions possessive, as ICU matches them.  An after context is matched
-// forward from the position: its repetitions are made possessive
-// (re::Rep::Kind::Possessive), which the engine resolves.  A before context is
-// matched backward from the position, so that each repetition takes as many
-// repetitions as possible to its left: e{lb,} becomes (?<!e) e{lb,}, and
-// e{lb,ub} becomes (?<!e) e{lb,ub-1} | e{ub}.  (The engine resolves possessive
-// repetitions forward, as PCRE does, also within lookbehinds.)
+// repetitions possessive and its sets with strings taking their longest
+// strings, as ICU matches them.  An after context is matched forward from the
+// position: its repetitions are made possessive (re::Rep::Kind::Possessive),
+// which the engine resolves, taking the longest string of a set with strings
+// at each repetition, as ICU does (see re::PossessiveChoice); a set with
+// strings that is not repeated is made unambiguous, w (?!t'), where w is a
+// proper prefix of a longer string w t' (see re::unambiguousAlternatives).  A
+// before context is matched backward from the position, so that each
+// repetition takes as many repetitions as possible to its left: e{lb,} becomes
+// (?<!e) e{lb,}, and e{lb,ub} becomes (?<!e) e{lb,ub-1} | e{ub}; and its sets
+// with strings, repeated or not, are made unambiguous backward, (?<!t') w,
+// where w is a proper suffix of a longer string t' w, so that each takes its
+// longest string ending at the position.  (The engine resolves possessive
+// repetitions forward, also within lookbehinds.)
 re::RE * possessiveContext(re::RE * context, bool afterContext);
+// A capture for the regular expression engine, with its repetitions possessive
+// (as an after context, possessiveContext), its sets with strings that are not
+// repeated left as they are.
+re::RE * possessiveCapture(re::RE * capture);
 
 // The set of "." in rules, matching any character other than line and
 // paragraph separators: [^[:Zp:][:Zl:]\r\n$]
@@ -605,6 +617,11 @@ struct DisambiguationStats {
     size_t deletionClosures = 0;     // before contexts extended by deleted characters (see below)
     std::vector<std::pair<const Rule *, const Rule *>> failedPairs;  // (E, replacement rule) failing verification
     std::map<std::string, size_t> unresolvedReasons;   // the unresolved pairs by reason
+    //  The pairs (E, L) left to priority: an earlier rule E with blocking marks
+    //  (see DeletedRunBlockMark) that L, at the same position, does not have
+    //  where E is blocked, so that L applies after a deleted run there.  The
+    //  pipeline applies L only where E does not match (at its first position).
+    std::vector<std::pair<const Rule *, const Rule *>> prioritized;
 };
 //
 //  Deletion closure.  Before contexts are matched against the converted text.
@@ -721,6 +738,17 @@ std::vector<Rule *> NullableCaptureElimination(const std::vector<Rule *> & rules
 //  NullableCaptureElimination, which then see only the captures that matter.
 std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules);
 
+//  Fixed capture elimination.
+//
+//  A capture of a fixed string (a sequence of single characters, or variables
+//  defined as such, not within a repetition), as the (̆) of
+//      e { (̆) r → r $1 ;
+//  is replaced by that string, and so are its references: e { ̆ r → r ̆ ;.
+//  The capture matches only that string, so the rules are equivalent, and a
+//  rule with no other captures may then be planned as a string rule.  Rules
+//  other than forward conversion rules are unchanged.
+std::vector<Rule *> FixedCaptureElimination(const std::vector<Rule *> & rules);
+
 //  Expansion of finite texts.
 //
 //  A forward conversion rule whose text to replace has finitely many lengths
@@ -751,6 +779,138 @@ struct FiniteTextStats {
     std::vector<std::pair<const Rule *, std::string>> notExpanded;  // with the reason
 };
 std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteTextStats * stats = nullptr);
+
+//  A forward conversion rule whose text begins with a run of at least n
+//  characters of a set R, R{n,} T → C (written R ... R R* T or R ... R R+ T),
+//  T a text of fixed length (with the captures the result may refer to),
+//  without a before context or a cursor, as two rules in its place:
+//  R } R{n,} T → ; deleting each character of the run but the last n where T
+//  follows, then R{n} T → C, each with the rule's after context.  ICU applies
+//  the rule at the first character of the run it reaches, which no rule
+//  before it in its group may then begin with (nor, with n = 0, with a first
+//  character of T, where the rule would have applied first); T may not begin
+//  with a character of R.  (Zawgyi-my's ြ* ႊ → ွှ, ($wspace)+ (X) → $2.)
+//  split counts the rules split.
+std::vector<Rule *> SplitLeadingRuns(const std::vector<Rule *> & rules, unsigned * split = nullptr);
+
+//  A forward conversion rule whose text has a run of a set R after a fixed
+//  text X, X R+ T → C (T fixed, the result referring to captures of T only,
+//  no cursor), in a group without before contexts and without a global
+//  filter, with a marker M (a noncharacter, from U+FDEF down): X } R+ T → M
+//  in its place, M { R } R* T → ; and M { T → C first in its group (they apply
+//  only after M, the run then deleted), and M → ; in a group after it.  ICU
+//  applies the rule at X, where the rules before it in its group are tried
+//  first, as they are at X; the characters of the run and T, which ICU does
+//  not reach, are converted after M, as nothing before them in the converted
+//  text but M and the run deleted, and no before context sees M.
+//  (Zawgyi-my's ေ ့+ ($consonant) → $1 ေ့.)  split counts the rules split.
+std::vector<Rule *> SplitMiddleRuns(const std::vector<Rule *> & rules, unsigned * split = nullptr);
+
+//  Run moves: a forward conversion rule (P) S → S | $1 (P a set, S one
+//  character, no contexts), which ICU applies again and again as P is
+//  revisited before each S of a run, writing the run and then converting P
+//  with what follows the run.  In its place, for each rule E after it in its
+//  group whose text P' T may begin with a character of P (in order),
+//  P'&P } S+ T C → M (C E's after context, M a mark, a noncharacter from
+//  RunMoveMark on, one for each T and result R of E), then, for a P that no
+//  such rule converts, P } S+ → M with the result P.  First in the group,
+//  M S+ { T → R, or, for an empty T, M S* { S } S → S and M S* { S → S R
+//  (at the last S of the run: ICU inserts nothing at the end of the text);
+//  M → ; in a group after it.  The group's own selection thus decides where
+//  ICU reaches P, and no capture rules are added.  Requires: no global
+//  filter; no rule before it in the group may begin with a character of P,
+//  and no other rule with a character of S, or revisit text; the rules E have
+//  no before contexts, fixed nonempty results, texts beginning with a set,
+//  and T not beginning with S; no before context of the group may see an S
+//  followed by the first character of a result R (where it could reach M).
+//  (fa-fa_FONIPA's ([َ-ِ]) ّ → ّ | $1, as NFD orders the vowel before the
+//  shadda.)  moved counts the rules replaced.
+std::vector<Rule *> MarkRunMoves(const std::vector<Rule *> & rules, unsigned * moved = nullptr);
+
+//  The marks of MarkRunMoves: supplementary noncharacters (U+1FFFE, U+1FFFF,
+//  U+2FFFE, …), at most RunMoveMarks.
+constexpr unsigned RunMoveMarks = 32;
+inline UCD::codepoint_t RunMoveMark(unsigned k) {return 0x1FFFE + 0x10000 * (k / 2) + (k % 2);}
+
+//  A forward conversion rule whose before context is a capture of a set with
+//  strings alone, as rules in its place, one for each string (the longest
+//  first) and one for the single characters of the set: ICU matches the set
+//  right to left, taking the longest string that ends where the text begins
+//  (and nothing before it in the context could then fail).  The captures of
+//  the rules are then sequences of sets.  (fa-fa_FONIPA's
+//  ([$IPA_CONSONANT|$VOWEL]) { ّ → $1, with {t͡ʃ} and {d͡ʒ}.)  expanded counts
+//  the rules expanded.
+std::vector<Rule *> ExpandContextCaptureStrings(const std::vector<Rule *> & rules, unsigned * expanded = nullptr);
+
+//  The anchors of the texts of forward conversion rules (as ICU matches them,
+//  in the text being transliterated), moved to their contexts: ^ at the start
+//  of a text without a before context becomes its before context, and $ at the
+//  end of a text without an after context its after context.  A set including
+//  the text boundary as the last of two or more items of a text without an
+//  after context (as the parser resolves it to End, e.g. [^a] or [x$]), which
+//  ICU matches as a character of the set or, matching nothing, at the end of
+//  the text, becomes two rules: the text with the characters of the set, and
+//  the text without it, with the after context $ (they cannot both match at a
+//  position).  Likewise a capture of such a set, the last item of a text: the
+//  text with the capture of the characters of the set (the references to it
+//  rebound), and the text without it, with the after context $ and its
+//  references (items of the result, not within function calls) removed, as
+//  the capture is empty; or, if it is revisited unchanged (its only reference
+//  the last item of the text to revisit), its after context, from which the
+//  text is revisited alike.  With a global filter and transform rules, as ICU then applies
+//  the rules to each run of the characters of the filter (of the text given),
+//  such a set also matches nothing at the end of a run, which the text of a
+//  rule set does not tell: it is then left as it is.  A text that is the
+//  anchor alone is left unchanged.
+std::vector<Rule *> MoveTextAnchors(const std::vector<Rule *> & rules);
+//  In an after context, a position outside the global filter, as the end of a
+//  run of the characters of the filter (a noncharacter, not in the text): with
+//  a global filter and transform rules, the text of a rule matching nothing at
+//  the end of the text matches also at the end of such a run (see
+//  MoveTextAnchors); the pipeline gives its class the positions outside the
+//  filter's mask, which it carries through the steps.
+constexpr UCD::codepoint_t FilterRunEndMark = 0xFDD2;
+//  Whether a set of a context marks the end of a filtered run: it contains
+//  FilterRunEndMark, which is added only with the next noncharacter absent (a
+//  set complemented, as [^c], contains both, and does not).
+inline bool marksFilterRunEnd(const UCD::UnicodeSet & set) {
+    return set.contains(FilterRunEndMark) && !set.contains(FilterRunEndMark + 1);
+}
+//  In a set of the text or the after context of a rule of the group after
+//  prefix runs that only delete (see ComposeRevisits), a position that does
+//  not follow a run they deleted (a noncharacter, not in the text): there ICU
+//  would still have found the run, which blocks the match.  The pipeline
+//  gives the class of such a set only its characters at the positions not
+//  following a deleted run (as the prefix runs step marks them).  As with
+//  FilterRunEndMark, the next noncharacter is absent from such a set.
+constexpr UCD::codepoint_t DeletedRunBlockMark = 0xFDD4;
+//  A mark run edit P R* T → C | $1 that cannot be moved to a group of its
+//  own is left in its group as P } R* T → C M, M a noncharacter (one for each
+//  R and T, from RunEditMark on), which a group of its own after it deletes
+//  with T, M (R*) T → | $1 (see ComposeRevisits).
+constexpr UCD::codepoint_t RunEditMark = 0xFDD8;
+constexpr unsigned RunEditMarks = 8;
+inline bool marksDeletedRunBlock(const UCD::UnicodeSet & set) {
+    return set.contains(DeletedRunBlockMark) && !set.contains(DeletedRunBlockMark + 1);
+}
+//  The complement of such a set, which an analysis may form (as the context
+//  [^r] that keeps a rule from applying where a marked r would follow), has
+//  the next noncharacter and not DeletedRunBlockMark: it matches its
+//  characters, and any character at the positions that follow a deleted run.
+inline bool marksDeletedRunAllow(const UCD::UnicodeSet & set) {
+    return set.contains(DeletedRunBlockMark + 1) && !set.contains(DeletedRunBlockMark);
+}
+inline UCD::UnicodeSet withDeletedRunBlock(const UCD::UnicodeSet & set) {
+    UCD::UnicodeSet marked = set;
+    marked.insert(DeletedRunBlockMark);
+    return marked - UCD::UnicodeSet(DeletedRunBlockMark + 1);
+}
+
+//  The rules referring more than once to a capture of a character of a set
+//  (([bcd]) ː → $1 $1), each the references items of its result, replaced by
+//  a rule for each character of the set (bː → bb, cː → cc, …; for each
+//  combination of the characters of such captures, at most 64), in order.
+std::vector<Rule *> EnumerateRepeatedCaptures(const std::vector<Rule *> & rules);
 
 //  Composition of revisits.
 //
@@ -796,15 +956,212 @@ std::vector<Rule *> ExpandFiniteTexts(const std::vector<Rule *> & rules, FiniteT
 //  with no repetitions) apply together, or the revisits do not end within
 //  8 rule applications (as with ll → | l ;).
 //
+//  A prefix run: a rule whose text is a character of a set P followed by
+//  characters of sets S = S1 ... Sm (m >= 1), and whose text to revisit is
+//  its character of P,
+//      (P) S1 ... Sm → A | $1 ;    or    p S1 ... Sm → A | p ;
+//  (without contexts, A a fixed string; ICU also revisits A in the first form,
+//  which must then not match).  On P S^n, ICU applies it n times, leaving
+//  A^n P with P to revisit.  The prefix runs with the same P form a family,
+//  whose texts S may follow each other in a run (P Sa Sb → Aa Ab P).  If the
+//  other rules of its group cannot see the
+//  difference (see prefixRunConflict in transform_rules_revisit.cpp), the
+//  prefix runs of a group are moved to a group of their own, before the rest
+//  of the group (separated by :: Null ;), where they are implemented together
+//  as one step (TransformStep::prefixRuns).  The rules producing a P that ICU
+//  then revisits, C → B | p ; (triggers), are applied before them, as
+//  C → B p ; in a group of their own, where ICU reaches C (see
+//  prefixRunConflict).  Otherwise they are composed as other rules are, or,
+//  where that fails on their unbounded runs, with A empty and the other rules
+//  matching P only as single characters, replaced by run rules
+//  (before { p S+ → f(p) ; see prefixRunAsRun).  Where the prefix runs only
+//  delete, the rest of the group may see the difference where ICU does not
+//  reach a P: a run after a P within a match, or seen by an after context,
+//  blocks the match (it-am's ($consonant) \' → | $1 ; makes ch'a not match
+//  cha).  The rules of the rest of the group then have blocking marks (see
+//  DeletedRunBlockMark), at the offsets of their matches at which such a run
+//  may have been deleted (other than where ICU reaches P and deletes it).
+//
+//  A rule of a group inserting a fixed string between captures and
+//  revisiting all, (T1) (T2+) (T3) → | $1 M $2 $3 ; is applied before the
+//  group as an insertion rule, T1 { } T2+ T3 → M ; in a group of its own,
+//  where the rest of the group cannot see the difference (see
+//  insertionRevisit in transform_rules_revisit.cpp).
+//
+//  A chain revisit replaces the last character X of its text, after a
+//  capture of a character of E, characters of fixed sets M1 ... Mk and a
+//  repetition of a set A, by a character Y of A, and revisits all,
+//      (E M1 ... Mk A*) X → | $1 Y ;
+//  so that ICU applies it again on the same capture, extended by Y, to the
+//  next X after A*.  The chain revisits of a group (with the same E, M, A
+//  and Y) are applied before the rest of the group, in a group of their
+//  own, where the rest of the group cannot see the difference (see
+//  chainRevisitSplit in transform_rules_revisit.cpp); E then also has the
+//  characters c that the group replaces by a character of E, revisited,
+//  where followed by M1 (as c → | e ;).  In a group of their own, they
+//  replace each character of X that follows E M1 ... Mk [A X]* (see
+//  ChainRevisit).
+//
+//  A mark run edit replaces a fixed text P before a run of a set R (marks)
+//  by C, deletes a fixed text T after the run, and revisits the run,
+//      P ($R*) T → C | $1 ;    (or $R+)
+//  as Latn-Arab's t ($notAbove+) ̈ → ة | $1 ; does.  The mark run edits of
+//  a group are applied before the rest of the
+//  group, in a group of their own, where the rest of the group cannot see
+//  the difference (see markRunSplit in transform_rules_revisit.cpp); the
+//  rules before them that ICU would apply instead at P are kept there as
+//  rules leaving their text unchanged, (text) } after → $1 ;.
+//
 //  The rules of other kinds are unchanged; apply ExtractForwardRules or
 //  ExtractReverseBackwardRules first.
+//  With records, each rule with text to revisit is also described: how it was
+//  handled, and the rules applying to its text to revisit (along any path of
+//  the composition, until it was abandoned).
+struct RevisitTrigger {
+    const Rule * rule;              // as in the group (rewritten if a suffix revisit)
+    unsigned depth;                 // its first application along a path (1: on the text to revisit)
+    bool conditional = false;       // on characters beyond the text or contexts not implied
+    bool extends = false;           // matched characters beyond the text to revisit
+    bool revisits = false;          // its own result has text to revisit (originally)
+    bool blocking = false;          // the rule composition was abandoned on
+};
+struct RevisitRecord {
+    const Rule * rule;
+    enum class Outcome {Suffix, Composed, NotComposed, PrefixRun, PrefixRunTrigger, ChainRevisit, MarkRunEdit, MarkRunLookahead} outcome;
+    std::string reason;             // if not composed
+    unsigned composedRules = 0;
+    std::vector<const Rule *> composed;     // the rules replacing it
+    unsigned paths = 0;             // complete paths (before deduplication)
+    unsigned maxApplications = 0;   // on a complete path
+    std::vector<RevisitTrigger> triggered;
+};
 struct RevisitStats {
     unsigned candidates = 0;        // rules with text to revisit
     unsigned composed = 0;          // replaced by composed rules
     unsigned composedRules = 0;     // the composed rules replacing them
     std::vector<std::pair<const Rule *, std::string>> notComposed;  // with the reason
+    unsigned prefixRuns = 0;        // moved to a group of their own (with their triggers)
+    unsigned chainRevisits = 0;     // moved to a group of their own
+    unsigned markRunEdits = 0;      // moved to a group of their own
+    unsigned markRunLookaheads = 0; // left with a lookahead and a marker (RunEditMark)
+    unsigned foldedInsertions = 0;  // insertion rules folded into the rules before them
+    unsigned blockingMarks = 0;     // groups after prefix runs given blocking marks
+    bool keepRecords = false;
+    std::vector<RevisitRecord> records;
 };
 std::vector<Rule *> ComposeRevisits(const std::vector<Rule *> & rules, RevisitStats * stats = nullptr);
+
+//  The sets P and S and the string A of a prefix run (see ComposeRevisits).
+//  A prefix run may also have a text P of several characters, p1 ... pk S →
+//  | p1 ... pk ; (literal characters, A empty: ja_Latn-ru's tsu~ → | ts ;):
+//  first is then the set of pk, and prefix those of p1 ... pk-1, which
+//  precede it.  Such runs are applied after the others, in a group of their
+//  own (where the characters of P stay where they are).
+struct PrefixRun {
+    UCD::UnicodeSet first;          // P (or its last character)
+    std::vector<UCD::UnicodeSet> prefix;    // the characters of P before its last
+    std::vector<UCD::UnicodeSet> run;   // S: the sets S1 ... Sm
+    std::u32string replacement;     // A
+    bool revisitsReplacement = false;   // (P) S → A | $1 ;  (ICU revisits A $1)
+};
+bool prefixRun(const ConversionRule * rule, PrefixRun & run);
+//  Whether prefix runs may be applied together (see the definition): the empty
+//  string if so, or the reason why not.
+std::string prefixRunFamilies(const std::vector<PrefixRun> & runs);
+
+//  The sets and the replacement of a chain revisit (see ComposeRevisits),
+//  (E M1 ... Mk A*) X → | $1 Y ;  In a group of chain revisits alone (with
+//  the same E, M, A and Y), each character of X that follows
+//  E M1 ... Mk [A X]* becomes Y: ICU applies the rule at E, and again on
+//  the capture extended by Y, through the run of A and X.  The rule must
+//  be such that this holds: Y in A, X not in A, Y not in E or M, M not
+//  meeting X, and, if E meets X (whose characters may be replaced before
+//  they are reached as E), M within A.
+struct ChainRevisit {
+    UCD::UnicodeSet first;                  // E
+    std::vector<UCD::UnicodeSet> fixed;     // M1 ... Mk
+    UCD::UnicodeSet star;                   // A
+    UCD::UnicodeSet last;                   // X
+    char32_t replacement = 0;               // Y
+};
+bool chainRevisit(const ConversionRule * rule, ChainRevisit & chain);
+
+//  The sets and the replacement of a mark run edit (see ComposeRevisits),
+//  P ($R*) T → C | $1 ;  In a group of its own, with others, it applies at
+//  each P followed by a run of R and T, where no rule
+//  before it applies (with the same P, the first of them), leaving C, the
+//  run and the text after T.  The rule must be such that this holds: C no
+//  longer than P, the characters of P after the first within R (so that
+//  the run is the same for the rules of a group), T and the first
+//  character of P not in R, and the first character of P not in T or the
+//  rest of P (no two applications overlap).
+struct MarkRunEdit {
+    std::vector<UCD::UnicodeSet> prefix;    // P
+    UCD::UnicodeSet run;                    // R
+    bool nonEmpty = false;                  // R+, or F R* (F within R)
+    UCD::UnicodeSet firstRun;               // F (R for R+)
+    std::vector<UCD::UnicodeSet> suffix;    // T
+    std::u32string replacement;             // C
+};
+bool markRunEdit(const ConversionRule * rule, MarkRunEdit & edit);
+//  A rule leaving its text unchanged, (text) } after → $1 ; with the items
+//  of its text and after context (sets, in order), as the mark run edits
+//  keep the rules that ICU would apply instead (see ComposeRevisits).
+bool keptText(const ConversionRule * rule, std::vector<UCD::UnicodeSet> & items);
+
+//  The groups of mark run edits and the rules kept before them (see
+//  ComposeRevisits), set aside while the later passes rewrite the rules
+//  (which would change their form), each with the number of transform
+//  rules before it, and put back.
+using MarkRunGroups = std::vector<std::pair<size_t, std::vector<Rule *>>>;
+MarkRunGroups SetAsideMarkRunGroups(std::vector<Rule *> & rules);
+void RestoreMarkRunGroups(std::vector<Rule *> & rules, const MarkRunGroups & groups);
+
+//  Front-letter revisits (Greek-Latin's rough breathing): consecutive rules of
+//  a group of the forms, in order,
+//      V O? R } A* L → X | v $1 ;      (V among some uppercase vowels)
+//      V (G O?) R → X | v $1 ;
+//      (Wl+ D?) R → x | $1 ;
+//      (W+ D?) R → X | $1 ;
+//  which delete a mark R after a run of vowels (W, Wl the lowercase ones, O
+//  within the ends D) and write a letter (X or x) before the run, revisiting
+//  the run (with V lowercased to v): ICU applies them again at the same
+//  position while they match, each pass taking the next R, so that all the
+//  letters precede the run.  The rules before the family in the group may
+//  include rules marking a vowel by a mark M (one of D) before a mark I,
+//      F } S* I → | F M ;
+//  (no other rule before them may begin with a vowel), and the group may
+//  revisit single characters as vowels, c → | d ;  The family is set aside
+//  (before ComposeRevisits, which would compose the rules around it), each
+//  with the number of transform rules before its group, and applied before
+//  the rest of the group (see TransformStep::frontLetters): where ICU's passes
+//  start, which roughs they take and the letters they write, all at once,
+//  for the rest of the group to apply to the text without the marks taken,
+//  with letters written before the runs.
+struct FrontLetterVowel {
+    char32_t upper = 0;                     // V
+    char32_t lower = 0;                     // v
+    UCD::UnicodeSet optional;               // O (empty if none)
+};
+struct FrontLetterRevisits {
+    char32_t mark = 0;                      // R
+    UCD::UnicodeSet vowels;                 // W
+    UCD::UnicodeSet lowerVowels;            // Wl
+    UCD::UnicodeSet ends;                   // D
+    char32_t lowerLetter = 0;               // x
+    char32_t upperLetter = 0;               // X
+    std::vector<FrontLetterVowel> upper;    // the V of the first rules
+    UCD::UnicodeSet accents;                // A
+    UCD::UnicodeSet lowers;                 // L
+    UCD::UnicodeSet letters;                // G
+    UCD::UnicodeSet iotaFirsts;             // F (empty if none)
+    UCD::UnicodeSet iotaSkip;               // S
+    char32_t iota = 0;                      // I
+    char32_t iotaMark = 0;                  // M
+    std::vector<std::pair<char32_t, char32_t>> revisits;   // c → | d
+};
+using FrontLetterFamilies = std::vector<std::pair<size_t, FrontLetterRevisits>>;
+FrontLetterFamilies SetAsideFrontLetterRevisits(std::vector<Rule *> & rules);
 
 //  Expansion of function calls on captures of single characters.
 //

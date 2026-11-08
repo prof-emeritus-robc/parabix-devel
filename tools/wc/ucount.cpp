@@ -29,6 +29,7 @@
 #include <grep/grep_kernel.h>
 #include <toolchain/toolchain.h>
 #include <fileselect/file_select.h>
+#include <algorithm>
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
@@ -47,13 +48,12 @@ static cl::OptionCategory ucFlags("Command Flags", "ucount options");
 
 static cl::opt<std::string> CC_expr(cl::Positional, cl::desc("<Unicode character class expression>"), cl::Required, cl::cat(ucFlags));
 static cl::opt<bool> CountOnly("c", cl::desc("CountOnly flag for compatibility with greptest"), cl::cat(ucFlags));
-static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::OneOrMore, cl::cat(ucFlags));
+static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::ZeroOrMore, cl::cat(ucFlags));
 
 static cl::opt<bool> Lookahead("lookahead", cl::desc("Use UTF Compiler lookahead mode"), cl::cat(ucFlags));
 static cl::opt<bool> NoS2P("NoS2P", cl::desc("Don't transpose - use byte data directly"), cl::cat(ucFlags));
 static cl::opt<bool> U21("u21", cl::desc("Use Unicode 21 bits"), cl::cat(ucFlags));
 
-std::vector<fs::path> allFiles;
 
 typedef uint64_t (*UCountFunctionType)(uint32_t fd);
 
@@ -115,40 +115,25 @@ UCountFunctionType pipelineGen(CPUDriver & driver, re::Name * CC_name) {
     return P.compile();
 }
 
-uint64_t ucount1(UCountFunctionType fn_ptr, const uint32_t fileIdx) {
-    std::string fileName = allFiles[fileIdx].string();
-    struct stat sb;
-    const int fd = open(fileName.c_str(), O_RDONLY);
+// Counts a file, returning false (after reporting the error) if it cannot be read.
+bool ucount1(UCountFunctionType fn_ptr, const fs::path & path, uint64_t & count) {
+    const int fd = argv::openInputFile(path);
     if (LLVM_UNLIKELY(fd == -1)) {
-        if (errno == EACCES) {
-            std::cerr << "ucount: " << fileName << ": Permission denied.\n";
-        }
-        else if (errno == ENOENT) {
-            std::cerr << "ucount: " << fileName << ": No such file.\n";
-        }
-        else {
-            std::cerr << "ucount: " << fileName << ": Failed.\n";
-        }
-        return 0;
+        return false;
     }
-    if (stat(fileName.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        std::cerr << "ucount: " << fileName << ": Is a directory.\n";
-        close(fd);
-        return 0;
-    }
-    auto r = fn_ptr(fd);
+    count = fn_ptr(fd);
     close(fd);
-    return r;
+    return true;
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&ucFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    if (argv::RecursiveFlag || argv::DereferenceRecursiveFlag) {
-        argv::DirectoriesFlag = argv::Recurse;
-    }
+    codegen::ParseCommandLineOptions(argc, argv, {&ucFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     CPUDriver driver("wc");
 
-    allFiles = argv::getFullFileList(driver, inputFiles);
+    argv::FileSelectConfig config;
+    config.stdinAsPath = true;
+    config.useIgnoreFiles = false;
+    const argv::FileSelection allFiles(driver, inputFiles, config);
     const auto fileCount = allFiles.size();
 
     UCountFunctionType uCountFunctionPtr = nullptr;
@@ -164,13 +149,12 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     
-    std::vector<uint64_t> theCounts;
-    
-    theCounts.resize(fileCount);
+    std::vector<uint64_t> theCounts(fileCount, 0);
+    std::vector<bool> counted(fileCount);
     uint64_t totalCount = 0;
 
     for (unsigned i = 0; i < fileCount; ++i) {
-        theCounts[i] = ucount1(uCountFunctionPtr, i);
+        counted[i] = ucount1(uCountFunctionPtr, allFiles[i], theCounts[i]);
         totalCount += theCounts[i];
     }
     
@@ -181,16 +165,19 @@ int main(int argc, char *argv[]) {
         int displayColumnWidth = std::to_string(totalCount).size() + 1;
         if (displayColumnWidth < defaultDisplayColumnWidth) displayColumnWidth = defaultDisplayColumnWidth;
         for (unsigned i = 0; i < fileCount; ++i) {
+            if (!counted[i]) continue;
             std::cout << std::setw(displayColumnWidth);
             std::cout << theCounts[i] << std::setw(displayColumnWidth);
-            std::cout << " " << allFiles[i].string() << std::endl;
+            const auto name = allFiles.displayName(i);
+            if (!name.empty()) std::cout << " " << name;
+            std::cout << std::endl;
         }
-        if (inputFiles.size() > 1) {
+        if (allFiles.showTotal()) {
             std::cout << std::setw(displayColumnWidth-1);
             std::cout << totalCount;
             std::cout << " total" << std::endl;
         }
     }
 
-    return 0;
+    return std::all_of(counted.begin(), counted.end(), [](bool c) {return c;}) ? 0 : 1;
 }

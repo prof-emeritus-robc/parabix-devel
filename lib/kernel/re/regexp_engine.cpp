@@ -143,6 +143,23 @@ RE * multiplexedCodeUnits(RE * re, const cc::MultiplexedAlphabet * mpx, const Ex
 }
 }
 
+// Whether an RE kernel would have no input streams (an RE of anchors alone,
+// such as (?<=^), without match regions): the code units are then an input
+// (unused), which gives the kernel the length of the text.
+bool RE_Kernel::needsTextInput(RE_CompilerContext & ctxt, RE * re) {
+    if (ctxt.mMatchStarts || ctxt.mIndexStream || ctxt.mCombiningType != RE_CombiningType::None) return false;
+    std::set<std::string> localExternals;
+    std::set<std::string> localAlphabets;
+    gatherExternals(re, localExternals, localAlphabets);
+    for (auto & a : ctxt.mAlphabets) {
+        if (localAlphabets.count(a.first->getName()) == 1) return false;
+    }
+    for (const auto & e : ctxt.mExternals) {
+        if (localExternals.count(e.first) == 1) return false;
+    }
+    return true;
+}
+
 RE_Kernel::RE_Kernel(LLVMTypeSystemInterface & ts, RE_CompilerContext & ctxt, RE * re, StreamSet * results)
 : RE_Kernel(ts, ctxt, Multiplexed{multiplexedCodeUnits(re, ctxt.mMultiplexed, ctxt.mExternals)}, results) {}
 
@@ -202,6 +219,9 @@ std::string RE_Kernel::makeSignature(RE_CompilerContext & ctxt, RE * re) {
             externalList.push_back(name);
         }
     }
+    if (needsTextInput(ctxt, re)) {
+        sigstrm << "+T";
+    }
     if (ctxt.mCombiningType == RE_CombiningType::Exclude) {
         sigstrm << "&~";
     } else if (ctxt.mCombiningType == RE_CombiningType::Include) {
@@ -259,6 +279,9 @@ Bindings RE_Kernel::makeInputBindings(RE_CompilerContext & ctxt, RE * re) {
     }
     if (ctxt.mCombiningType != RE_CombiningType::None) {
         externalBindings.emplace_back("toCombine", ctxt.mCombiningStream, FixedRate(), Add1());
+    }
+    if (needsTextInput(ctxt, re)) {
+        externalBindings.emplace_back("text", ctxt.mCodeUnitStream);
     }
     return externalBindings;
 }
@@ -526,29 +549,46 @@ void StarLookaheadIndex::generatePabloMethod() {
     writeOutputStreamSet("index", std::vector<PabloAST *>{index});
 }
 
-static unsigned maxStringLength(const std::vector<std::vector<re::CC *>> & strings) {
+using StringGuards = std::vector<std::vector<std::vector<re::CC *>>>;
+
+// The length of the longest string (with its longest guard, if any).
+static unsigned maxStringLength(const std::vector<std::vector<re::CC *>> & strings, const StringGuards & guards = {}) {
     size_t L = 1;
-    for (const auto & str : strings) L = std::max(L, str.size());
+    for (size_t i = 0; i < strings.size(); ++i) {
+        size_t g = 0;
+        if (i < guards.size()) {
+            for (const auto & guard : guards[i]) g = std::max(g, guard.size());
+        }
+        L = std::max(L, strings[i].size() + g);
+    }
     return static_cast<unsigned>(L);
 }
 
-static std::string stringClassSignature(const std::vector<std::vector<re::CC *>> & strings, StreamSet * basis) {
+static std::string stringClassSignature(const std::vector<std::vector<re::CC *>> & strings, StreamSet * basis,
+                                        const StringGuards & guards = {}) {
     std::string sig;
     raw_string_ostream out(sig);
     out << basis->getNumElements();
-    for (const auto & str : strings) {
+    for (size_t i = 0; i < strings.size(); ++i) {
         out << "|";
-        for (re::CC * cc : str) out << cc->canonicalName() << ";";
+        for (re::CC * cc : strings[i]) out << cc->canonicalName() << ";";
+        if (i < guards.size()) {
+            for (const auto & guard : guards[i]) {
+                out << "!";
+                for (re::CC * cc : guard) out << cc->canonicalName() << ";";
+            }
+        }
     }
     out.flush();
     return sig;
 }
 
 StringClassKernel::StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<std::vector<re::CC *>> strings,
-                                     StreamSet * basis, StreamSet * fillStartsEnds, StreamSet * follows)
-: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis) + (follows ? "_f" : "")),
+                                     StreamSet * basis, StreamSet * fillStartsEnds, StreamSet * follows,
+                                     StringGuards guards)
+: PabloKernel(ts, "StringClass_" + Kernel::getStringHash(stringClassSignature(strings, basis, guards) + (follows ? "_f" : "")),
               [&] {
-                  const unsigned la = maxStringLength(strings) - 1;
+                  const unsigned la = maxStringLength(strings, guards) - 1;
                   Bindings inputs;
                   inputs.emplace_back("basis", basis, FixedRate(1), LookAhead(la));
                   if (follows) inputs.emplace_back("follows", follows, FixedRate(1), LookAhead(la));
@@ -556,14 +596,15 @@ StringClassKernel::StringClassKernel(LLVMTypeSystemInterface & ts, std::vector<s
               }(),
               {Binding{"fillStartsEnds", fillStartsEnds}}),
   mStrings(std::move(strings)),
+  mGuards(std::move(guards)),
   mHasFollows(follows != nullptr),
-  mSignature(stringClassSignature(mStrings, basis) + (follows ? "_f" : "")) {
+  mSignature(stringClassSignature(mStrings, basis, mGuards) + (follows ? "_f" : "")) {
 }
 
 void StringClassKernel::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
     const std::vector<PabloAST *> basis = getInputStreamSet("basis");
-    const unsigned L = maxStringLength(mStrings);
+    const unsigned L = maxStringLength(mStrings, mGuards);
     // The basis looked ahead by each offset, and a character class compiler for each.
     std::vector<std::unique_ptr<cc::Parabix_CC_Compiler>> compilers;
     for (unsigned v = 0; v < L; ++v) {
@@ -592,6 +633,20 @@ void StringClassKernel::generatePabloMethod() {
         }
         if (mHasFollows) {
             start = pb.createAnd(start, followFree[str.size() - 1]);
+        }
+        // Not where a guard follows (within the region).
+        const size_t i = &str - mStrings.data();
+        if (i < mGuards.size()) {
+            for (const auto & guard : mGuards[i]) {
+                PabloAST * follows = pb.createInFile(pb.createOnes());
+                for (unsigned k = 0; k < guard.size(); ++k) {
+                    follows = pb.createAnd(follows, compilers[str.size() + k]->compileCC(guard[k], pb));
+                }
+                if (mHasFollows) {
+                    follows = pb.createAnd(follows, followFree[str.size() + guard.size() - 1]);
+                }
+                start = pb.createAnd(start, pb.createNot(follows));
+            }
         }
         const unsigned M = static_cast<unsigned>(str.size());
         auto f = startsByLength.find(M);
@@ -688,8 +743,9 @@ EndOfTextMark::EndOfTextMark(LLVMTypeSystemInterface & ts, StreamSet * source, S
 
 void EndOfTextMark::generatePabloMethod() {
     PabloBuilder pb(getEntryScope());
-    PabloAST * const advOnes = pb.createAdvance(pb.createOnes(), 1);
-    writeOutputStreamSet("mark", std::vector<PabloAST *>{pb.createAtEOF(advOnes)});
+    // The position after the last code unit (that of an empty text too, which
+    // an advance of the ones would not mark).
+    writeOutputStreamSet("mark", std::vector<PabloAST *>{pb.createAtEOF(pb.createOnes())});
 }
 
 ExtendByOne::ExtendByOne(LLVMTypeSystemInterface & ts, StreamSet * source, StreamSet * extended)
@@ -1406,10 +1462,23 @@ void RE_PipelineBuilder::ensurePrepared(RE *& re) {
         if (matchStarts) {
             mCtxt.setMatchRegions(matchStarts, matchFollows);
         }
+        //  The client's externals (extended as the text is).
+        for (const auto & e : mSourceContext.externals) {
+            ExternalStream x = e.second;
+            if (mTextExtended) {
+                StreamSet * const extended = mPB.CreateStreamSet(x.extStream->getNumElements(), 1);
+                mPB.CreateKernelCall<ExtendByOne>(x.extStream, extended);
+                x.extStream = extended;
+            }
+            addExternal(e.first, x);
+        }
         mUsesUnicodeIndexing = true;
         mFinalMatchStarts = matchStarts;
         mFinalMatchFollows = matchFollows;
         return;
+    }
+    if (!mSourceContext.externals.empty()) {
+        llvm::report_fatal_error("RE_PipelineBuilder: externals of the client are for a source of Unicode only");
     }
 
     RE_Mode mode = mHaveMode ? mMode : determineREMode(re, mModeOptions);
@@ -1618,9 +1687,6 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
                                          a->getSense() == Assertion::Sense::Negative});
         return;
     }
-    //  Need to compile this defn.   Make sure all referenced externals
-    //  are compiled first.
-    prepareExternals(defn);
     //
     // The defining expression can now be compiled.  In most cases,
     // a single RE_Kernel can be used.   However, for lookahead
@@ -1629,6 +1695,19 @@ void RE_PipelineBuilder::compileExternal(Name * n) {
     Assertion * const la = dyn_cast<Assertion>(defn);
     const bool lookahead = la && (la->getKind() == Assertion::Kind::LookAhead) &&
                            (getLengthRange(la->getAsserted(), mCtxt.mLengthAlphabet).second > 0);
+    //  Need to compile this defn.   Make sure all referenced externals
+    //  are compiled first: for a lookahead chain, those of the kernels of its
+    //  segments, as they are made (see chainMatchStarts), as the chain may
+    //  not use the others (the guards of its string classes, assertions
+    //  before the end of the text).
+    bool chain = false;
+    if (lookahead) {
+        const auto r = getLengthRange(la->getAsserted(), mCtxt.mLengthAlphabet);
+        const Seq * const seq = dyn_cast<Seq>(la->getAsserted());
+        const Name * const front = (seq && !seq->empty()) ? dyn_cast<Name>(seq->front()) : nullptr;
+        chain = (r.first != r.second) && !(front && isUniquePrefixName(front));
+    }
+    if (!chain) prepareExternals(defn);
     unsigned offset = grepOffset(defn, mCtxt.mIndexStream != nullptr);
     if (!lookahead) {
         // Not a lookahead; compile using a single kernel call.
@@ -1712,6 +1791,7 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
             std::vector<StreamSet *> classes;
             std::vector<bool> negated;
             for (Assertion * la : seg->assertions) {
+                prepareExternals(la->getAsserted());
                 StreamSet * const Y = mPB.CreateStreamSet(1);
                 mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, la->getAsserted(), Y);
                 classes.push_back(Y);
@@ -1734,6 +1814,7 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
             continue;
         }
         if (!seg->star) {
+            prepareExternals(seg->re);
             StreamSet * const Fends = mPB.CreateStreamSet(1);
             mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, seg->re, Fends);
             StreamSet * const result = mPB.CreateStreamSet(1);
@@ -1744,14 +1825,16 @@ StreamSet * RE_PipelineBuilder::chainMatchStarts(const std::vector<LookaheadSegm
         if (!seg->strings.empty()) {
             // A string class (see StringClassStarIndex).
             StreamSet * const fillStartsEnds = mPB.CreateStreamSet(3);
-            if ((seg->strings.size() == 1) && (seg->strings[0].size() == 1)) {
+            if ((seg->strings.size() == 1) && (seg->strings[0].size() == 1) && seg->guards.empty()) {
                 // A class X (of one-character strings): fill, starts and ends
                 // are all X, which may already be an external.
                 StreamSet * const X = classStream(seg->re, seg->cc);
                 mPB.CreateKernelCall<CharClassFillStartsEnds>(X, mCtxt.mMatchFollows, fillStartsEnds);
             } else {
+                StringGuards guards;
+                for (const auto & g : seg->guards) guards.push_back(codeUnitStrings(g));
                 mPB.CreateKernelCall<StringClassKernel>(codeUnitStrings(seg->strings), codeUnitBasis(), fillStartsEnds,
-                                                        mCtxt.mMatchFollows);
+                                                        mCtxt.mMatchFollows, std::move(guards));
             }
             StreamSet * const index = mPB.CreateStreamSet(1);
             StreamSet * const good = mPB.CreateStreamSet(1);
@@ -2214,6 +2297,8 @@ static bool parseChainForm(RE * re, const cc::Alphabet * lengthAlphabet, ChainFo
     } else {
         elems.push_back(re);
     }
+    // A final lookahead of the end of the text, (?=$), is the end of the text.
+    if (!elems.empty() && isEndLookahead(elems.back())) elems.back() = makeEnd();
     // Lookbehinds at the start hold at the starts of the matches: they are
     // compiled on their own and restrict the starts of the rest.
     const auto lookbehindEnd = std::find_if_not(elems.begin(), elems.end(), isLookbehind);
@@ -2358,6 +2443,7 @@ StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vec
     // they hold, as are the starts).
     StreamSet * Hend = nullptr;
     if (!form.afterChain.empty()) {
+        for (RE * e : form.afterChain) prepareExternals(e);
         Hend = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(form.afterChain.begin(), form.afterChain.end()), Hend);
         if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
@@ -2369,6 +2455,7 @@ StreamSet * RE_PipelineBuilder::chainFormStarts(const ChainForm & form, std::vec
     }
     StreamSet * starts = form.segments.empty() ? Hend : chainMatchStarts(form.segments, &rec, Hend);
     if (!form.lookbehinds.empty()) {
+        for (RE * e : form.lookbehinds) prepareExternals(e);
         StreamSet * const holds = mPB.CreateStreamSet(1);
         mPB.CreateKernelFamilyCall<RE_Kernel>(mCtxt, makeSeq(form.lookbehinds.begin(), form.lookbehinds.end()), holds);
         StreamSet * const restricted = out ? out : mPB.CreateStreamSet(1);
@@ -2571,7 +2658,8 @@ void RE_PipelineBuilder::matchStartsPipeline(const PreparedRE & prepared, Stream
     ensurePrepared(re);
     mRE = applyModePasses(re, RE_Goal::MatchStarts);
     mRE = processReferences(mRE);
-    prepareExternals(mRE);
+    // (The externals are compiled for the kernels of each alternative, as they
+    // are made: a lookahead chain may not use them all; see alternativeStarts.)
     compileStarts(mRE, starts);
 }
 
@@ -2842,10 +2930,12 @@ void RE_PipelineBuilder::alternativeStarts(const MatchStartsAlternative & a, Str
     // Code units are positions: the starts are marked in code units.
     assert(mCtxt.mIndexStream == nullptr);
     if (a.strategy == StartsStrategy::FixedLength) {
+        prepareExternals(a.re);
         fixedLengthStarts(a.re, getLengthRange(a.re, mCtxt.mLengthAlphabet).first, out);
     } else if (a.strategy == StartsStrategy::LengthClasses) {
         std::vector<StreamSet *> classStarts;
         for (const auto & c : a.classes) {
+            prepareExternals(c.second);
             StreamSet * const s = (a.classes.size() == 1) ? out : mPB.CreateStreamSet(1);
             fixedLengthStarts(c.second, c.first, s);
             classStarts.push_back(s);
@@ -2859,6 +2949,8 @@ void RE_PipelineBuilder::alternativeStarts(const MatchStartsAlternative & a, Str
         // the length of the prefix (and the offset of its marks).
         Name * const pfxName = makeUniquePrefixName(a.prefix);
         compileExternal(pfxName);
+        prepareExternals(a.suffix);
+        for (RE * lb : a.lookbehinds) prepareExternals(lb);
         auto fp = mCtxt.mExternals.find(pfxName->getFullName());
         assert(fp != mCtxt.mExternals.end());
         StreamSet * const pfxStrm = fp->second.extStream;
@@ -3799,6 +3891,7 @@ RE_PipelineBuilder::SelectedMatches RE_PipelineBuilder::selectMatches(const Prep
     m.keep = mPB.CreateStreamSet(1);
     StreamSet * const drop = mTextExtended ? mCtxt.mMatchFollows : nullptr;
     mPB.CreateKernelCall<LeftmostMatchSelection>(starts, ends, drop, m.selected, m.covered, m.keep);
+
     if (LLVM_UNLIKELY(codegen::EnableIllustrator)) {
         mPB.captureBitstream("srStarts", starts);
         mPB.captureBitstream("srEnds", ends);
@@ -3885,7 +3978,17 @@ RE_PipelineBuilder::ReplacedText RE_PipelineBuilder::replaceMatches(const Prepar
     // match, which must be a position of the text: without match regions,
     // the text is extended by one.
     mNeedsCodepoints = true;
-    const SelectedMatches m = selectMatches(sr, n > 0);
+    SelectedMatches m = selectMatches(sr, n > 0);
+    if (!mTextExtended && (mCtxt.mCodeUnitAlphabet == &cc::Unicode) && (mCtxt.mMultiplexed == nullptr)) {
+        // The positions kept are those of the code units: the streams of the
+        // matches may have a position after the text (where a lookahead was
+        // tested), which is not a code unit to keep.
+        StreamSet * const units = mPB.CreateStreamSet(1);
+        compileClasses(std::vector<re::CC *>{makeCC(0, UCD::UNICODE_MAX, &cc::Unicode)}, units, mCtxt.mCodeUnitStream);
+        StreamSet * const keep = mPB.CreateStreamSet(1);
+        AndCombine(mPB, m.keep, units, keep);
+        m.keep = keep;
+    }
     if ((follows || replaced) && (mCtxt.mMatchFollows == nullptr)) {
         llvm::report_fatal_error("searchReplacePipeline: the follows of the result require match regions");
     }

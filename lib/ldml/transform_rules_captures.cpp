@@ -11,6 +11,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <optional>
 
 using namespace llvm;
 using namespace re;
@@ -144,6 +145,7 @@ private:
     std::set<const Capture *> mDeleted;
     RE * mReplacement = nullptr;    // the fixed string replacing the target
     std::map<const Capture *, Capture *> mRenumbered;
+    std::map<std::string, Capture *> mRenumberedByName;
     unsigned mCaptureCount = 0;
 };
 
@@ -159,6 +161,7 @@ RE * CaptureRewriter::rewriteSource(RE * re) {
         const std::string name = std::to_string(++mCaptureCount);
         Capture * renumbered = makeCapture(name, rewriteSource(captured));
         mRenumbered.emplace(c, renumbered);
+        mRenumberedByName.emplace(c->getName(), renumbered);
         return renumbered;
     } else if (Seq * seq = dyn_cast<Seq>(re)) {
         std::vector<RE *> items;
@@ -178,14 +181,21 @@ RE * CaptureRewriter::rewriteSource(RE * re) {
 RE * CaptureRewriter::rewriteResult(RE * re) {
     if (re == nullptr) return nullptr;
     if (Reference * ref = dyn_cast<Reference>(re)) {
-        if (mDeleted.count(ref->getCapture()) != 0) {
+        //  (By the capture, or by its name: earlier rewritings may leave
+        //  references to other captures of the same name.)
+        const bool target = mTarget && (ref->getCapture() == mTarget || ref->getName() == mTarget->getName());
+        if (mDeleted.count(ref->getCapture()) != 0 || (target && mDeleted.count(mTarget) != 0)) {
             return makeSeq();
         }
-        if (ref->getCapture() == mTarget && mReplacement) {
+        if (target && mReplacement) {
             return mReplacement;
         }
         auto f = mRenumbered.find(ref->getCapture());
-        if (f == mRenumbered.end()) return re;
+        if (f == mRenumbered.end()) {
+            auto g = mRenumberedByName.find(ref->getName());
+            if (g == mRenumberedByName.end()) return re;
+            return makeReference(g->second->getName(), g->second, ref->getInstance());
+        }
         return makeReference(f->second->getName(), f->second, ref->getInstance());
     } else if (Name * n = dyn_cast<Name>(re)) {
         if (isFunctionCall(n)) {
@@ -218,18 +228,75 @@ void eliminate(ConversionRule * r, std::vector<Rule *> & result) {
     Capture * target = nullable.front();
     const std::vector<RE *> items = optionalItems(target);
     const size_t k = items.size();
+    //  ICU matches the optional items possessively: an item absent (of a set)
+    //  means that the next character is not in its set.  Before an item
+    //  present, the item does not match those characters; at the end of the
+    //  text (the capture last), the after context begins with a character not
+    //  in them, or the end of the text.  (Elsewhere, the rule is unchanged.)
+    CharSetAnalysis sets;
+    auto itemSet = [&](RE * item, UCD::UnicodeSet & chars) {
+        while (Name * n = dyn_cast<Name>(item)) {
+            if (isFunctionCall(n) || n->getDefinition() == nullptr) return false;
+            item = n->getDefinition();
+        }
+        const Rep * rep = dyn_cast<Rep>(item);
+        if (rep == nullptr || !CharSetAnalysis::isSet(rep->getRE()) || !(sets.setOf(rep->getRE(), true) == sets.setOf(rep->getRE(), false))) {
+            return false;
+        }
+        chars = sets.setOf(rep->getRE(), false);
+        return true;
+    };
+    RE * const text = r->getLeftSide()->getText();
+    const Seq * textSeq = dyn_cast<Seq>(text);
+    const bool last = text == target || (textSeq && !textSeq->empty() && textSeq->back() == target);
     for (size_t absent = 0; absent < (size_t{1} << k); absent++) {
         std::vector<RE *> content;
         std::set<const Capture *> deleted;
+        UCD::UnicodeSet excluded;
+        bool known = true;
         for (size_t i = 0; i < k; i++) {
             if ((absent >> (k - 1 - i)) & 1) {
                 collectCaptures(items[i], deleted);
+                UCD::UnicodeSet chars;
+                if (itemSet(items[i], chars)) excluded = excluded + chars; else known = false;
             } else {
-                content.push_back(presentForm(items[i]));
+                RE * present = presentForm(items[i]);
+                UCD::UnicodeSet chars;
+                if (known && !excluded.empty() && itemSet(items[i], chars) && chars.intersects(excluded)) {
+                    //  (A single item may be just its set.)
+                    const Rep * rep = dyn_cast<Rep>(present);
+                    present = rep ? makeRep(makeCC(chars - excluded), rep->getLB(), rep->getUB()) : makeCC(chars - excluded);
+                }
+                content.push_back(present);
+                excluded = UCD::UnicodeSet();
+                known = true;
             }
         }
         RE * newContent = makeSeq(content.begin(), content.end());
-        eliminate(CaptureRewriter(target, newContent, std::move(deleted)).rewrite(r), result);
+        ConversionRule * rewritten = CaptureRewriter(target, newContent, std::move(deleted)).rewrite(r);
+        if (last && known && !excluded.empty()) {
+            //  The next character: that of the first set of the after context (if
+            //  it begins with one, without the text boundary), or any.
+            const RuleSide * src = rewritten->getLeftSide();
+            RE * after = nullptr;
+            if (!src->hasAfterContext()) {
+                after = makeAlt({makeCC(~excluded), makeBoundarySet(false)});
+            } else {
+                std::vector<RE *> items;
+                RE * const context = src->getAfterContext();
+                if (const Seq * seq = dyn_cast<Seq>(context)) items.assign(seq->begin(), seq->end()); else items.push_back(context);
+                if (!items.empty() && CharSetAnalysis::isSet(items.front()) && !mayIncludeTextBoundary(items.front())
+                        && sets.setOf(items.front(), true) == sets.setOf(items.front(), false)) {
+                    items.front() = makeCC(sets.setOf(items.front(), false) - excluded);
+                    after = makeSeq(items.begin(), items.end());
+                }
+            }
+            if (after) {
+                RuleSide * const source = RuleSide::Create(src->getBeforeContext(), src->getText(), false, nullptr, 0, after);
+                rewritten = makeConversionRule(source, Direction::Forward, rewritten->getRightSide());
+            }
+        }
+        eliminate(rewritten, result);
     }
 }
 
@@ -531,6 +598,42 @@ std::vector<Rule *> RemoveUnreferencedCaptures(const std::vector<Rule *> & rules
                                                      res->getCursorOffset(),
                                                      renamer.result(res->getAfterContext()));
         result.push_back(makeConversionRule(source, Direction::Forward, replaced));
+    }
+    return result;
+}
+
+//  The captures of fixed strings of a source side part, outside repetitions.
+static void findFixedCaptures(RE * re, std::vector<Capture *> & found) {
+    if (re == nullptr) return;
+    if (Capture * c = dyn_cast<Capture>(re)) {
+        if (isFixedString(c->getCapturedRE())) {
+            found.push_back(c);
+        } else {
+            findFixedCaptures(c->getCapturedRE(), found);
+        }
+    } else if (Seq * seq = dyn_cast<Seq>(re)) {
+        for (RE * e : *seq) findFixedCaptures(e, found);
+    }
+}
+
+std::vector<Rule *> FixedCaptureElimination(const std::vector<Rule *> & rules) {
+    std::vector<Rule *> result;
+    for (Rule * r : rules) {
+        ConversionRule * c = dyn_cast<ConversionRule>(r);
+        if (c == nullptr || c->getDirection() != Direction::Forward) {
+            result.push_back(r);
+            continue;
+        }
+        //  One capture at a time (the rewriting renumbers the others).
+        while (true) {
+            std::vector<Capture *> found;
+            const RuleSide * src = c->getLeftSide();
+            for (RE * part : {src->getBeforeContext(), src->getText(), src->getAfterContext()}) findFixedCaptures(part, found);
+            if (found.empty()) break;
+            CaptureRewriter rewriter(found.front(), found.front()->getCapturedRE());
+            c = rewriter.rewrite(c);
+        }
+        result.push_back(c);
     }
     return result;
 }

@@ -235,16 +235,22 @@ TwoLevelScanKernel::TwoLevelScanKernel(LLVMTypeSystemInterface & ts,
                                        std::string && kernel_name,
                                        unsigned scanWordWidth,
                                        std::string scanStreamName,
-                                       std::vector<LoopVar> loopVars) :
-    MultiStrideKernel(ts, kernel_name + "_" + std::to_string(scanWordWidth),
+                                       std::vector<LoopVar> loopVars,
+                                       int scanStreamIndex) :
+    MultiStrideKernel(ts, kernel_name + "_" + std::to_string(scanWordWidth)
+                          + (scanStreamIndex < 0 ? "" : "_s" + std::to_string(scanStreamIndex) + "_"),
                       maxScanBlocks(ts, scanWordWidth), loopVars),
-    mScanWordWidth(scanWordWidth), mScanStreamName(scanStreamName) {}
+    mScanWordWidth(scanWordWidth), mScanStreamName(scanStreamName), mScanStreamIndex(scanStreamIndex) {}
+
+unsigned TwoLevelScanKernel::scanCount(KernelBuilder & b) const {
+    return mScanStreamIndex < 0 ? b.getInputStreamSet(mScanStreamName)->getNumElements() : 1;
+}
 
 void TwoLevelScanKernel::strideLogic(KernelBuilder & b,
                                      Value * priorBlocksDone, Value * blocksToDo,
                                      std::vector<PHINode *> loopVarPhi,
                                      std::vector<Value *> & loopVarUpdates) {
-    const unsigned streamCount = b.getInputStreamSet(mScanStreamName)->getNumElements();
+    const unsigned streamCount = scanCount(b);
     const unsigned loopVariableCount = mLoopVars.size();
     IntegerType * const sizeTy = b.getSizeTy();
     IntegerType * const scanWordTy = b.getIntNTy(mScanWordWidth);
@@ -295,7 +301,7 @@ void TwoLevelScanKernel::strideLogic(KernelBuilder & b,
     Value * scanWord = nullptr;
     std::vector<Value *> indexWord(streamCount);
     for (unsigned i = 0; i < streamCount; i++) {
-        Value * base_ptr = b.getInputStreamBlockPtr(mScanStreamName, b.getSize(i), scanWordBlock);
+        Value * base_ptr = b.getInputStreamBlockPtr(mScanStreamName, b.getSize(scanFirst() + i), scanWordBlock);
         indexWord[i] = b.CreateLoad(scanWordTy, b.CreateGEP(scanWordTy, base_ptr, wordPosInBlock));
         if (i == 0) {
             scanWord = indexWord[i];
@@ -395,7 +401,7 @@ void TwoLevelScanKernel::generateIndexComputation(KernelBuilder & b,
     Constant * const ZERO = b.getSize(0);
     Constant * const ONE = b.getSize(1);
     Constant * const SCANWORDS_PER_BLOCK = b.getSize(b.getBitBlockWidth()/mScanWordWidth);
-    const unsigned streamCount = b.getInputStreamSet(mScanStreamName)->getNumElements();
+    const unsigned streamCount = scanCount(b);
     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
         Constant * SIZE_BITS = b.getSize(sizeof(std::size_t) * 8);
         Value * IndexBitsRequired = b.CreateMul(blocksToDo, SCANWORDS_PER_BLOCK);
@@ -421,7 +427,7 @@ void TwoLevelScanKernel::generateIndexComputation(KernelBuilder & b,
     Value * wordCounter = b.CreateMul(blockCounter, SCANWORDS_PER_BLOCK);
 
     for (unsigned i = 0; i < streamCount; i++) {
-        Value * s = b.loadInputStreamBlock(mScanStreamName, b.getSize(i), inputBlockIndex);
+        Value * s = b.loadInputStreamBlock(mScanStreamName, b.getSize(scanFirst() + i), inputBlockIndex);
         Value * anyBitInField = b.simd_any(mScanWordWidth, s);
         Value * indexMask = b.CreateZExt(b.hsimd_signmask(mScanWordWidth, anyBitInField), sizeTy);
         masks[i] = b.CreateOr(maskPhi[i], b.CreateShl(indexMask, wordCounter));

@@ -441,6 +441,36 @@ static cl::opt<bool> BenchColdCache(
     cl::init(false),
     cl::cat(wordBreakerFlags));
 
+// --auto-segment-size: choose --segment-size from the input's size and --thread-num, unless
+// --segment-size is given. The pipeline bakes the segment length in when it is built, so this
+// runs before the build. Bigger segments save per-segment work (sync, kernel calls, edge
+// words): 4 threads, 50 MB / 256 MB inputs -7% at 128K-256K. Too few segments per thread
+// leave threads idle on uneven text (4 MB multi-language at 64K, 16 per thread: +4%), so the
+// size grows (powers of two from the default 16K, at most 256K) only while every thread
+// still gets at least kAutoSegPerThread segments. A 4 MB input at 4 threads keeps 16K.
+static cl::opt<bool> AutoSegmentSize(
+    "auto-segment-size",
+    cl::desc("BPE mode: pick --segment-size from the input size and --thread-num "
+             "(16K..256K, >= 64 segments per thread) unless --segment-size is given (default off)."),
+    cl::init(false),
+    cl::cat(wordBreakerFlags));
+static constexpr uint64_t kAutoSegPerThread = 64;
+static constexpr unsigned kAutoSegMin = 16384, kAutoSegMax = 262144;
+
+static void applyAutoSegmentSize(const std::string & path) {
+    if (!AutoSegmentSize) return;
+    auto & opts = cl::getRegisteredOptions();
+    auto it = opts.find("segment-size");
+    if (it != opts.end() && it->second->getNumOccurrences() != 0) return;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0 || st.st_size <= 0) return;
+    const uint64_t perSeg = uint64_t(st.st_size) / (uint64_t(std::max(1u, codegen::SegmentThreads)) * kAutoSegPerThread);
+    unsigned seg = kAutoSegMin;
+    while (seg < kAutoSegMax && uint64_t(seg) * 2 <= perSeg) seg *= 2;
+    codegen::SegmentSize = std::max(codegen::SegmentSize, seg);
+    std::cerr << "[BPE] --auto-segment-size: " << codegen::SegmentSize << "\n";
+}
+
 using WordBreakerFunctionType = void (*)(uint32_t fd);
 
 // writeToStdout — convert 8x1 parallel basis bits to serial bytes and write
@@ -783,6 +813,7 @@ int main(int argc, char *argv[]) {
                                 "NORMALIZED text, which may not align with the input file.\n";
         }
 
+        applyAutoSegmentSize(inputFile);
         CPUDriver driver("bpe_tokenizer");
         BPEPipelineFunctionType bpeFn = buildBPEPipeline(driver, bpe);
 

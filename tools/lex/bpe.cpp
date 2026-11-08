@@ -1943,7 +1943,14 @@ static cl::opt<bool> ByteRunGuard("byte-run-guard", cl::desc("With --byte-run-cu
 // --byte-run-cuts is on by default, but applies only with --tail-scan-kernel (the run cuts are units
 // of the scan kernel); given explicitly without it, it is an error.
 static bool byteRunCuts() { return ByteRunCuts && TailScanKernel; }
-static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed || byteRunCuts(); }
+// --len-scan=N (with --tail-scan-kernel; implies --tail-unit-cuts): the pieces of 2 .. N bytes
+// (between the cuts) are resolved by kernels of their own, BPE_len<L>_pretokenScan, each a two-level
+// scan over the end marks of the pieces of length L, and skipped by the general scan
+// (BPE_Len2Select). N = 2 so far: the byte pair is looked up in a direct 64K table. 0 = off.
+static cl::opt<unsigned> LenScan("len-scan", cl::desc("With --tail-scan-kernel: resolve the pieces of 2 .. N "
+    "bytes in kernels of their own, BPE_len<L>_pretokenScan (0 = off, the default; N = 2 so far)."), cl::init(0));
+static bool lenScan() { return LenScan >= 2 && TailScanKernel; }
+static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed || byteRunCuts() || lenScan(); }
 // Measurement only (wrong output): pretokens of more than N bytes get a 0 and nothing else,
 // in BPETailScanKernel.
 static cl::opt<unsigned> TailSkipLong("tail-skip-long", cl::init(0), cl::Hidden);
@@ -3146,6 +3153,135 @@ protected:
     Value * mCache = nullptr, * mCShift = nullptr, * mEmit = nullptr;       // --tail-scan-ir-cache
 };
 
+// --len-scan: the pieces of exactly two bytes. From the cuts (piece starts) and units (one-byte
+// pieces) of BPEUnitCutsKernel:
+//   s2    = cuts & ~next(cuts) & next2(cuts)   the starts of two-byte pieces
+//   e2    = Advance(s2, 1)                     their end marks
+//   cover = unit | s2 | e2                     the bytes of the pieces the general scan does not resolve
+//   scan  = cuts & ~(cover & Advance(cover, 1))
+// The general scan (BPETailScanKernel) takes scan and cover in place of its scan and unit streams: a
+// step from a covered start is a run of units and two-byte pieces, whose bytes it gives their base
+// ids; BPE_len2_pretokenScan then fixes the two-byte pieces. Past the end of the input next2(cuts)
+// may read anything, but a start it marks there is a last piece of two bytes or one, and either is
+// resolved right.
+class BPELen2SelectKernel final : public PabloKernel {
+public:
+    BPELen2SelectKernel(LLVMTypeSystemInterface & ts, StreamSet * cuts, StreamSet * unit,
+                        StreamSet * scan, StreamSet * cover, StreamSet * s2, StreamSet * e2)
+    : PabloKernel(ts, "BPE_Len2Select",
+                  {Binding{"cuts", cuts, FixedRate(), LookAhead(2)}, Binding{"unit", unit}},
+                  {Binding{"scan", scan}, Binding{"cover", cover}, Binding{"s2", s2}, Binding{"e2", e2}}) {}
+protected:
+    void generatePabloMethod() override {
+        PabloBuilder pb(getEntryScope());
+        PabloAST * const cuts = getInputStreamSet("cuts")[0];
+        PabloAST * const unit = getInputStreamSet("unit")[0];
+        PabloAST * const s2 = pb.createAnd3(cuts, pb.createNot(pb.createLookahead(cuts, 1)), pb.createLookahead(cuts, 2));
+        PabloAST * const e2 = pb.createAdvance(s2, 1);
+        PabloAST * const cover = pb.createOr3(unit, s2, e2);
+        PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(cover, pb.createAdvance(cover, 1))));
+        writeOutputStreamSet("scan", std::vector<PabloAST *>{scan});
+        writeOutputStreamSet("cover", std::vector<PabloAST *>{cover});
+        writeOutputStreamSet("s2", std::vector<PabloAST *>{s2});
+        writeOutputStreamSet("e2", std::vector<PabloAST *>{e2});
+    }
+};
+
+// --len-scan: the BPE of a two-byte piece b0 b1 is the rule's id if (b0, b1) is a rule, else the two
+// base ids: one load from this table, the id of each byte pair or 0xFFFF (128 KB, built with gTail).
+static std::vector<uint16_t> gTailPairBytes;
+static uint64_t tailLen2Table() { return reinterpret_cast<uint64_t>(gTailPairBytes.data()); }
+
+// BPE_len2_pretokenScan: a two-level scan over the end marks e of the two-byte pieces. The general
+// scan has already given both bytes their base ids and the start its emit bit, so at e it only
+// fixes the piece: a rule gives res[e - 1] = its id; no rule sets emit at e (the second token).
+// Bytes are read at e - 1 (LookBehind(1)). A call writes only its own positions: a piece starting
+// before the call (e at 0) is fixed by the previous call, which checks its last byte (s2) and reads
+// the next byte past its end (LookAhead(1)); the emit bit at e is this call's. res and emit are
+// updated in place (InOut), after the general scan. LookBehind(1) on resIn keeps it out of a
+// thread-local buffer, as for --tail-unit-seed (an LLVM register allocator crash otherwise).
+class BPELen2ScanKernel final : public TwoLevelScanKernel {
+public:
+    BPELen2ScanKernel(LLVMTypeSystemInterface & ts, StreamSet * e2, StreamSet * s2, StreamSet * bytes,
+                      StreamSet * resIn, StreamSet * emitIn, StreamSet * res, StreamSet * emit)
+    : TwoLevelScanKernel(ts, "BPE_len2_pretokenScan", 64, "e2", {}) {
+        mInputStreamSets.push_back(Binding{"e2", e2, FixedRate(1), Principal()});
+        mInputStreamSets.push_back(Binding{"s2", s2});
+        mInputStreamSets.push_back(Binding{"bytes", bytes, FixedRate(1), {LookBehind(1), LookAhead(1)}});
+        mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), LookBehind(1)});
+        mInputStreamSets.push_back(Binding{"emitIn", emitIn});
+        mOutputStreamSets.push_back(Binding{"res", res, FixedRate(1), InOut("resIn")});
+        mOutputStreamSets.push_back(Binding{"emit", emit, FixedRate(1), InOut("emitIn")});
+        addAttribute(Statefree());
+    }
+protected:
+    void initialize(KernelBuilder & b) override {
+        Value * const zero = b.getInt32(0);
+        Value * const numItems = b.CreateMul(b.getNumOfStrides(), b.getSize(getStride()));
+        mN = b.CreateUMin(numItems, b.getAccessibleItemCount("e2"));
+        mBase = b.getProcessedItemCount("e2");
+        mFinal = b.isFinal();
+        mBytes = b.getInputStreamBlockPtr("bytes", zero);
+        mS2 = b.getInputStreamBlockPtr("s2", zero);
+        mRes = b.getOutputStreamBlockPtr("res", zero);
+        mEmit = b.getOutputStreamBlockPtr("emit", zero);
+        Function * const fn = b.getModule()->getFunction("bpe_len2_table");
+        if (fn == nullptr) report_fatal_error("BPE_len2_pretokenScan: bpe_len2_table is not linked");
+        mTable = b.CreateIntToPtr(b.CreateCall(fn->getFunctionType(), fn, {}), PointerType::getUnqual(b.getContext()));
+        mLoopVarInitialValues = {};
+    }
+    void wordPrologueLogic(KernelBuilder &, Value *, std::vector<Value *>, std::vector<Value *> &) override {}
+    Value * pairId(KernelBuilder & b, Value * p) {              // the rule id of bytes p - 1, p, or 0xFFFF
+        Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
+        Value * const b0 = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(1)))), i64);
+        Value * const b1 = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, p)), i64);
+        return b.CreateLoad(i16, b.CreateGEP(i16, mTable, b.CreateOr(b.CreateShl(b0, 8), b1)));
+    }
+    void generateProcessingLogic(KernelBuilder & b, Value * absItemPos, std::vector<Value *> &) override {
+        Type * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
+        Value * const p = b.CreateSub(absItemPos, mBase);
+        Value * const id = pairId(b, p);
+        BasicBlock * const merged = b.CreateBasicBlock("len2Merged");
+        BasicBlock * const apart = b.CreateBasicBlock("len2Apart");
+        BasicBlock * const store = b.CreateBasicBlock("len2Store");
+        BasicBlock * const done = b.CreateBasicBlock("len2Done");
+        b.CreateLikelyCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), merged, apart);
+        b.SetInsertPoint(merged);                   // one token at the start, if the start is ours
+        b.CreateCondBr(b.CreateICmpNE(p, b.getInt64(0)), store, done);
+        b.SetInsertPoint(store);
+        b.CreateStore(id, b.CreateGEP(i16, mRes, b.CreateSub(p, b.getInt64(1))));
+        b.CreateBr(done);
+        b.SetInsertPoint(apart);                    // two tokens: the second starts at e
+        Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(p, 6));
+        b.CreateStore(b.CreateOr(b.CreateLoad(i64, ew), b.CreateShl(b.getInt64(1), b.CreateAnd(p, b.getInt64(63)))), ew);
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+    }
+    void finalize(KernelBuilder & b, std::vector<Value *> &) override {
+        // a two-byte piece starting at the call's last byte ends in the next call: its id is ours
+        Type * const i16 = b.getInt16Ty(), * const i64 = b.getInt64Ty();
+        BasicBlock * const check = b.CreateBasicBlock("len2Edge");
+        BasicBlock * const fix = b.CreateBasicBlock("len2EdgeFix");
+        BasicBlock * const store = b.CreateBasicBlock("len2EdgeStore");
+        BasicBlock * const exit = b.CreateBasicBlock("len2EdgeDone");
+        b.CreateCondBr(b.CreateOr(mFinal, b.CreateICmpEQ(mN, b.getSize(0))), exit, check);
+        b.SetInsertPoint(check);
+        Value * const last = b.CreateSub(mN, b.getSize(1));
+        Value * const sw = b.CreateLoad(i64, b.CreateGEP(i64, mS2, b.CreateLShr(last, 6)));
+        Value * const isS2 = b.CreateTrunc(b.CreateLShr(sw, b.CreateAnd(last, b.getInt64(63))), b.getInt1Ty());
+        b.CreateCondBr(isS2, fix, exit);
+        b.SetInsertPoint(fix);
+        Value * const id = pairId(b, mN);           // bytes n - 1, n
+        b.CreateCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), store, exit);
+        b.SetInsertPoint(store);
+        b.CreateStore(id, b.CreateGEP(i16, mRes, last));
+        b.CreateBr(exit);
+        b.SetInsertPoint(exit);
+    }
+    Value * mN = nullptr, * mBase = nullptr, * mFinal = nullptr;
+    Value * mBytes = nullptr, * mS2 = nullptr, * mRes = nullptr, * mEmit = nullptr, * mTable = nullptr;
+};
+
 static void linkTailWalkIR(PipelineBuilder & P, Kernel * k) {
     P.LinkFunction(k, "bpe_tail_ir_begin", tailWalkBeginIR<kTailCacheWays>);
     P.LinkFunction(k, "bpe_tail_ir_slow", tailWalkSlowIR<kTailCacheWays>);
@@ -3211,11 +3347,40 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
             StreamSets idSets{ids8};
             P.CreateKernelCall<P2S16Kernel>(idSets, resIn);
         }
+        StreamSet * scanIn = scan, * unitIn = unit, * s2 = nullptr, * e2 = nullptr;
+        if (LenScan > 2) {
+            std::cerr << "tokenizer: --len-scan supports N = 2 so far\n";
+            std::exit(1);
+        }
+        if (lenScan()) {
+            gTailPairBytes.assign(65536, 0xFFFF);
+            unsigned nPairs = 0;
+            for (unsigned b0 = 0; b0 < 256; b0++)
+                for (unsigned b1 = 0; b1 < 256; b1++) {
+                    const uint16_t id = gTail.pair[(bpeBaseId(b0) << 8) | bpeBaseId(b1)];
+                    gTailPairBytes[(b0 << 8) | b1] = id;
+                    nPairs += id != 0xFFFF;
+                }
+            std::cerr << "[BPE] --len-scan=" << LenScan << ": " << nPairs << " byte-pair rules\n";
+            scanIn = P.CreateStreamSet(1, 1);
+            unitIn = P.CreateStreamSet(1, 1);
+            s2 = P.CreateStreamSet(1, 1);
+            e2 = P.CreateStreamSet(1, 1);
+            P.CreateKernelCall<BPELen2SelectKernel>(cuts, unit, scanIn, unitIn, s2, e2);
+        }
         TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the cuts
         const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;
-        Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, scan, res, emit, open, seg, cacheWays,
-                                                                 cuts, unit, resIn);
+        Kernel * const r = P.CreateKernelCall<BPETailScanKernel>(bytes, scanIn, res, emit, open, seg, cacheWays,
+                                                                 cuts, unitIn, resIn);
         linkTailWalkIR(P, r);
+        if (lenScan()) {
+            StreamSet * const res2 = P.CreateStreamSet(1, 16);
+            StreamSet * const emit2 = P.CreateStreamSet(1, 1);
+            Kernel * const k2 = P.CreateKernelCall<BPELen2ScanKernel>(e2, s2, bytes, res, emit, res2, emit2);
+            P.LinkFunction(k2, "bpe_len2_table", tailLen2Table);
+            res = res2;
+            emit = emit2;
+        }
     } else if (TailScanKernel) {
         TailEmitFromSegs = true;                                     // tailWalkBeginIR copies the starts
         const unsigned cacheWays = TailScanIRCache ? kTailCacheWays : 0;

@@ -874,15 +874,141 @@ protected:
 //          right after another unit is dropped, so a run of units costs one scan step, while
 //          every start that ends a longer pretoken stays.
 // The frozen set depends on the merge list, so its bits are in the kernel's name.
+//
+// Runs of equal bytes (--byte-run-cuts=N). Pablo looks ahead only on
+// inputs, so a run of N equal bytes starting at p is found from the basis looked ahead by N-1:
+// eq[p] = (byte p+N-1 == byte p+N-2), and run[p] = AND of Advance(eq, k), k = 0 .. N-2, by
+// doubling; inRun = OR of Advance(run, k), k = 0 .. N-1: the bytes of the runs of N or more.
+// A hard self-pair byte c (no token holds c c) has a safe cut between any two copies, so
+// --byte-run-cuts cuts there inside such runs: every interior byte is a unit.
+static PabloAST * bpeRunStarts(PabloBuilder & pb, const std::vector<PabloAST *> & basis, unsigned N) {
+    PabloAST * diff = pb.createZeroes();
+    for (PabloAST * b : basis) {
+        PabloAST * const la = pb.createLookahead(b, N - 1);
+        diff = pb.createOr(diff, pb.createXor(la, pb.createAdvance(la, 1)));
+    }
+    PabloAST * const eq = pb.createNot(diff);
+    // AND of Advance(eq, k) for k < N - 1: W(m) covers m terms; W(m + n) = W(m) & Advance(W(n), m)
+    PabloAST * acc = nullptr; unsigned have = 0;
+    PabloAST * pow = eq; unsigned powLen = 1;
+    for (unsigned need = N - 1; need; need >>= 1) {
+        if (need & 1) {
+            acc = acc ? pb.createAnd(acc, pb.createAdvance(pow, have)) : pow;
+            have += powLen;
+        }
+        if (need > 1) { pow = pb.createAnd(pow, pb.createAdvance(pow, powLen)); powLen *= 2; }
+    }
+    return acc;
+}
+static PabloAST * bpeRunCover(PabloBuilder & pb, PabloAST * runStarts, unsigned N) {
+    PabloAST * acc = nullptr; unsigned have = 0;
+    PabloAST * pow = runStarts; unsigned powLen = 1;
+    for (unsigned need = N; need; need >>= 1) {
+        if (need & 1) {
+            acc = acc ? pb.createOr(acc, pb.createAdvance(pow, have)) : pow;
+            have += powLen;
+        }
+        if (need > 1) { pow = pb.createOr(pow, pb.createAdvance(pow, powLen)); powLen *= 2; }
+    }
+    return acc;
+}
+static re::CC * bpeByteSetCC(const std::array<uint64_t, 4> & set) {
+    re::CC * cc = nullptr;
+    for (unsigned by = 0; by < 256; by++) {
+        if (((set[by >> 6] >> (by & 63)) & 1) == 0) continue;
+        re::CC * const part = re::makeByte(by, by);
+        cc = cc ? re::makeCC(cc, part) : part;
+    }
+    return cc;
+}
+// A hard self-pair byte c and the bytes x that no token holds before it (pre) or y after it
+// (suf): the run's edge cuts of --byte-run-edges.
+struct BPEHardRun {
+    uint8_t c;
+    std::array<uint64_t, 4> pre{}, suf{};
+};
+struct BPERunCutParams {
+    unsigned cutN = 0;                       // --byte-run-cuts: hard self-pair cuts in runs >= cutN
+    unsigned edges = 0;                      // --byte-run-edges: 1 cut before runs at a hard prefix, 2 also after
+    bool guard = false;                      // --byte-run-guard: compute the cuts inside an If
+    std::vector<BPEHardRun> hardRuns;        // the run bytes (ASCII hard self-pair bytes)
+    std::array<uint64_t, 4> hardSelf{};      // bytes c with no token holding c c (frozen excluded)
+    std::string tag() const {                // the parameters, for the kernel name
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+        for (const auto & r : hardRuns) { mix(r.c); for (unsigned i = 0; i < 4; i++) { mix(r.pre[i]); mix(r.suf[i]); } }
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+        return "_rc" + std::to_string(cutN) + "e" + std::to_string(edges) + (guard ? "g" : "") + "_" + buf;
+    }
+};
+
+// The generator for --byte-run-cuts: cuts between the copies of a hard self-pair byte c in every
+// run of N or more (N = 2: every pair), and with edges the cut before the run (prefix x with no
+// token holding x c) and after it (next byte y with no token holding c y). Every such cut is
+// between a hard pair, so the BPE of the pieces is the BPE of the whole. Returns the cuts and
+// the cuts at p + 1 (for the units: positions p whose piece is one byte). With guard, the cut
+// logic is inside an If on "a run byte in this block"; Pablo ORs any pending carry into the
+// test, so the Advance of a run's end into the next block is not lost.
+static std::pair<PabloAST *, PabloAST *> bpeHardRunCuts(PabloBuilder & pb, const std::vector<PabloAST *> & basis,
+                                                        const BPERunCutParams & P) {
+    PabloAST * const zero = pb.createZeroes();
+    std::vector<PabloAST *> prevB(basis.size()), nextB(basis.size());
+    PabloAST * diffPrev = zero, * diffNext = zero;
+    for (unsigned i = 0; i < basis.size(); i++) {
+        prevB[i] = pb.createAdvance(basis[i], 1);
+        nextB[i] = pb.createLookahead(basis[i], 1);
+        diffPrev = pb.createOr(diffPrev, pb.createXor(basis[i], prevB[i]));
+        diffNext = pb.createOr(diffNext, pb.createXor(basis[i], nextB[i]));
+    }
+    PabloAST * const eqPrev = pb.createNot(diffPrev), * const eqNext = pb.createNot(diffNext);
+    PabloAST * const inRun = P.cutN <= 2 ? pb.createOr(eqPrev, eqNext)
+                                         : bpeRunCover(pb, bpeRunStarts(pb, basis, P.cutN), P.cutN);
+    std::array<uint64_t, 4> hset{};
+    for (const auto & r : P.hardRuns) hset[r.c >> 6] |= 1ull << (r.c & 63);
+    cc::Parabix_CC_Compiler_Builder cur(basis), prev(prevB), next(nextB);
+    PabloAST * const hr = pb.createAnd(cur.compileCC(bpeByteSetCC(hset), pb), inRun);
+    auto emit = [&](PabloBuilder & b, PabloAST *& cut, PabloAST *& nxt) {
+        cut = b.createAnd(hr, eqPrev);               // c c: cut before the second
+        nxt = b.createAnd(hr, eqNext);               // the next byte is that second
+        if (!P.edges) return;
+        for (const auto & r : P.hardRuns) {
+            PabloAST * const isC = b.createAnd(cur.compileCC(re::makeByte(r.c, r.c), b), inRun);
+            PabloAST * const first = b.createAnd(isC, diffPrev), * const last = b.createAnd(isC, diffNext);
+            if (re::CC * const pre = bpeByteSetCC(r.pre))
+                cut = b.createOr(cut, b.createAnd(first, prev.compileCC(pre, b)));      // x | c c ...
+            if (re::CC * const suf = P.edges >= 2 ? bpeByteSetCC(r.suf) : nullptr) {
+                cut = b.createOr(cut, b.createAnd(b.createAdvance(last, 1), cur.compileCC(suf, b)));   // ... c c | y
+                nxt = b.createOr(nxt, b.createAnd(last, next.compileCC(suf, b)));
+            }
+        }
+    };
+    if (!P.guard) {
+        PabloAST * cut, * nxt;
+        emit(pb, cut, nxt);
+        return {cut, nxt};
+    }
+    Var * const cutV = pb.createVar("runCut", zero);
+    Var * const nxtV = pb.createVar("runCutNext", zero);
+    auto body = pb.createScope();
+    PabloAST * cut, * nxt;
+    emit(body, cut, nxt);
+    body.createAssign(cutV, cut);
+    body.createAssign(nxtV, nxt);
+    pb.createIf(hr, body);
+    return {cutV, nxtV};
+}
 class BPEUnitCutsKernel final : public PabloKernel {
 public:
     BPEUnitCutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * segs,
-                      StreamSet * cuts, StreamSet * unit, StreamSet * scan, const std::array<uint64_t, 4> & frozen)
-    : PabloKernel(ts, "BPE_UnitCuts_" + hexName(frozen),
-                  {Binding{"basis", basis, FixedRate(), LookAhead(1)},
+                      StreamSet * cuts, StreamSet * unit, StreamSet * scan, const std::array<uint64_t, 4> & frozen,
+                      const BPERunCutParams & runs = BPERunCutParams{})
+    : PabloKernel(ts, "BPE_UnitCuts_" + hexName(frozen)
+                      + (runs.cutN ? runs.tag() : ""),
+                  {Binding{"basis", basis, FixedRate(), LookAhead(std::max(1u, runs.cutN))},
                    Binding{"segs", segs, FixedRate(), LookAhead(1)}},
                   {Binding{"cuts", cuts}, Binding{"unit", unit}, Binding{"scan", scan}})
-    , mFrozen(frozen) {}
+    , mFrozen(frozen), mRuns(runs) {}
 protected:
     static std::string hexName(const std::array<uint64_t, 4> & f) {
         char buf[68];
@@ -909,9 +1035,15 @@ protected:
             cc::Parabix_CC_Compiler_Builder cccNext(next);
             Fnext = cccNext.compileCC(frozenCC, pb);
         }
-        PabloAST * const cuts = pb.createInFile(pb.createOr(segs, pb.createOr(F, pb.createAdvance(F, 1))));
+        PabloAST * cuts = pb.createOr(segs, pb.createOr(F, pb.createAdvance(F, 1)));
         // cuts at p + 1: segs or F there, or F at p (which cuts after itself)
-        PabloAST * const cutsNext = pb.createOr(pb.createLookahead(segs, 1), pb.createOr(Fnext, F));
+        PabloAST * cutsNext = pb.createOr(pb.createLookahead(segs, 1), pb.createOr(Fnext, F));
+        if (mRuns.cutN) {                          // hard self-pair cuts inside runs >= cutN (bpeHardRunCuts)
+            const auto rc = bpeHardRunCuts(pb, basis, mRuns);
+            cuts = pb.createOr(cuts, rc.first);
+            cutsNext = pb.createOr(cutsNext, rc.second);
+        }
+        cuts = pb.createInFile(cuts);
         PabloAST * const unit = pb.createAnd(cuts, cutsNext);
         PabloAST * const scan = pb.createAnd(cuts, pb.createNot(pb.createAnd(unit, pb.createAdvance(unit, 1))));
         writeOutputStreamSet("cuts", std::vector<PabloAST *>{cuts});
@@ -919,6 +1051,7 @@ protected:
         writeOutputStreamSet("scan", std::vector<PabloAST *>{scan});
     }
     const std::array<uint64_t, 4> mFrozen;
+    const BPERunCutParams mRuns;
 };
 
 // BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
@@ -1788,7 +1921,29 @@ static cl::opt<bool> TailUnitSeed(
     cl::desc("With --tail-scan-kernel: start the tail's ids as every byte's base id, computed with "
              "bit streams and packed by P2S16 (implies --tail-unit-cuts; default off)."),
     cl::init(false));
-static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed; }
+// --byte-run-cuts=N (implies --tail-unit-cuts): inside every run of N or more copies of a hard
+// self-pair byte c (no token holds c c: the space, among others; GPT-2 has no space-run tokens),
+// cut between the copies, so each interior copy is a unit. Default 2 (every run); 0 = off.
+static cl::opt<unsigned> ByteRunCuts(
+    "byte-run-cuts",
+    cl::desc("With --tail-scan-kernel: cut runs of N or more equal hard self-pair bytes into units "
+             "(implies --tail-unit-cuts; default 2, 0 = off)."),
+    cl::init(2));
+// --byte-run-edges (with --byte-run-cuts): also cut before a run where its prefix byte x and
+// first byte c are a hard pair (no token holds x c; e.g. \n before an indentation run), and
+// after it where its last byte and the next are. --byte-run-guard: compute the run cuts
+// inside a Pablo If on "a run byte in this block".
+static cl::opt<unsigned> ByteRunEdges("byte-run-edges", cl::desc("With --byte-run-cuts: also cut before a run at "
+    "a hard prefix pair (1, the default), and after it at a hard suffix pair (2); 0 = neither."), cl::init(1));
+// --byte-run-bytes: which hard self-pair bytes form runs: 0 the space only (default), 1 every ASCII one.
+static cl::opt<unsigned> ByteRunBytes("byte-run-bytes", cl::desc("With --byte-run-cuts: run bytes, 0 the space "
+    "(default), 1 every ASCII hard self-pair byte."), cl::init(0));
+static cl::opt<bool> ByteRunGuard("byte-run-guard", cl::desc("With --byte-run-cuts: compute the run cuts "
+    "inside an If guard (default on)."), cl::init(true));
+// --byte-run-cuts is on by default, but applies only with --tail-scan-kernel (the run cuts are units
+// of the scan kernel); given explicitly without it, it is an error.
+static bool byteRunCuts() { return ByteRunCuts && TailScanKernel; }
+static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed || byteRunCuts(); }
 // Measurement only (wrong output): pretokens of more than N bytes get a 0 and nothing else,
 // in BPETailScanKernel.
 static cl::opt<unsigned> TailSkipLong("tail-skip-long", cl::init(0), cl::Hidden);
@@ -3003,8 +3158,8 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
     StreamSet * emit = P.CreateStreamSet(1, 1);
     StreamSet * open = P.CreateStreamSet(1, 1);
     StreamSet * seg = P.CreateStreamSet(1, 1);
-    if (tailUnitCuts() && !TailScanKernel) {
-        std::cerr << "tokenizer: --tail-unit-cuts and --tail-unit-seed need --tail-scan-kernel\n";
+    if ((TailUnitCuts || TailUnitSeed || (ByteRunCuts.getNumOccurrences() > 0 && ByteRunCuts != 0)) && !TailScanKernel) {
+        std::cerr << "tokenizer: --tail-unit-cuts, --tail-unit-seed and --byte-run-cuts need --tail-scan-kernel\n";
         std::exit(1);
     }
     if (TailScanKernel && tailUnitCuts()) {
@@ -3022,7 +3177,32 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
         StreamSet * cuts = P.CreateStreamSet(1, 1);
         StreamSet * unit = P.CreateStreamSet(1, 1);
         StreamSet * scan = P.CreateStreamSet(1, 1);
-        P.CreateKernelCall<BPEUnitCutsKernel>(basis, segs, cuts, unit, scan, frozen);
+        BPERunCutParams runs;
+        runs.cutN = !byteRunCuts() ? 0 : ByteRunCuts == 1 ? 2 : unsigned(ByteRunCuts);
+        if (runs.cutN) {
+            unsigned nHard = 0;
+            for (unsigned by = 0; by < 256; by++)
+                if (((frozen[by >> 6] >> (by & 63)) & 1) == 0 && tailHard(uint8_t(by), uint8_t(by))) {
+                    runs.hardSelf[by >> 6] |= 1ull << (by & 63);
+                    nHard++;
+                }
+            runs.edges = ByteRunEdges;
+            runs.guard = ByteRunGuard;
+            for (unsigned c = 0; c < 128; c++) {     // the run bytes: ASCII hard self-pair bytes
+                if (((runs.hardSelf[c >> 6] >> (c & 63)) & 1) == 0) continue;
+                if (ByteRunBytes == 0 && c != 0x20) continue;
+                BPEHardRun r{uint8_t(c), {}, {}};
+                for (unsigned x = 0; x < 256; x++) {
+                    if (x == c) continue;
+                    if (tailHard(uint8_t(x), uint8_t(c))) r.pre[x >> 6] |= 1ull << (x & 63);
+                    if (tailHard(uint8_t(c), uint8_t(x))) r.suf[x >> 6] |= 1ull << (x & 63);
+                }
+                runs.hardRuns.push_back(r);
+            }
+            std::cerr << "[BPE] --byte-run-cuts=" << runs.cutN << ": " << runs.hardRuns.size() << " ASCII hard self-pair bytes ("
+                      << nHard << " in all)" << (runs.edges ? ", edges " + std::to_string(runs.edges) : std::string()) << (runs.guard ? ", guarded" : "") << "\n";
+        }
+        P.CreateKernelCall<BPEUnitCutsKernel>(basis, segs, cuts, unit, scan, frozen, runs);
         StreamSet * resIn = nullptr;
         if (TailUnitSeed) {
             StreamSet * ids8 = P.CreateStreamSet(8, 1);
@@ -4919,7 +5099,7 @@ BPEPassResult buildBPEPassPipeline(
         const auto all = bpe.buildMergeRuleRanges(BPETokenizer::kTailAllRules);
         const size_t numRules = buildTailTable(all, 0, 8);
         for (unsigned by = 0; by < 256; by++) gTailBase[by] = uint16_t(bpeBaseId(by));
-        if (TailHardSplit) {                        // the byte pairs inside tokens, by rank
+        if (TailHardSplit || byteRunCuts()) {       // the byte pairs inside tokens, by rank
             std::vector<const MergeRule *> byRank;
             unsigned maxId = 256;
             for (const auto & g : all)

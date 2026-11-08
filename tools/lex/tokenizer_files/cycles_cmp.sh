@@ -8,13 +8,19 @@
 # Usage: ./cycles_cmp.sh INPUT THREADS "name:extra flags" ["name:extra flags" ...]
 #   ./cycles_cmp.sh val_4MB.txt 1 "best:" "L8:--tail-len-groups=8" "L8k:--tail-len-groups=8 --tail-len-kernels"
 # INPUT: a path, or a file name in this folder (tokenizer_files).
-# Env: LOOPS (default 20), ROUNDS (default 3), OUT (raw output folder, default $TMPDIR/cycles_cmp).
-# Self-contained: the paths come from this script's location (tools/lex/tokenizer_files).
+# Env: LOOPS (default 10), ROUNDS (default 2), OUT (output folder, default this folder),
+#      TOK (the tokenizer; default the newest <repo>/build*/bin/tokenizer), PY (default python3).
+# Output: the comparison table on the terminal, and cc_<name>_<input>_t<threads>.txt per config
+# (the raw cycle-counter tables); a rerun overwrites them.
+# No fixed paths: everything is found from this script's location (tools/lex/tokenizer_files).
 
-T=${0:A:h}                                   # tools/lex/tokenizer_files
-R=${T:h:h:h}                                 # the repository
-TOK=$R/build19/bin/tokenizer
-PY=$R/.venv/bin/python; [[ -x $PY ]] || PY=python3
+T=${0:A:h}                                   # this folder: tools/lex/tokenizer_files
+R=${T:h:h:h}                                 # the repository, three levels up
+if [[ -z $TOK ]]; then                       # the most recently built tokenizer in any build folder
+  builds=($R/build*/bin/tokenizer(N.om))
+  TOK=${builds[1]}
+fi
+PY=${PY:-python3}                            # the summary needs only the standard library
 # The best config (the thesis configuration; same as BEST in config.sh), without
 # --pretokenizer and --thread-num, and the cold-cache benchmark flags.
 BEST="--skip-identity-normalize --memsource-block-capacity --pretok-compress-classes --pretok-class-code --pretok-byte-domain --pretok-utf8-classes --tail-from-bytes --tail-vocab-table --memsource-in-place --tail-long-cache --tail-scan-kernel --tail-scan-ir-cache --tail-batch-bpe --tail-hard-split --tail-simd-emit --tail-trigram-split --tail-long-admit=3"
@@ -27,24 +33,26 @@ fi
 INPUT=$1; TH=$2; shift 2
 [[ -f $INPUT ]] || INPUT=$T/$INPUT
 [[ -f $INPUT ]] || { echo "cycles_cmp: no input file $1"; exit 1; }
-[[ -x $TOK ]] || { echo "cycles_cmp: no tokenizer at $TOK (build it: make -C build19 tokenizer)"; exit 1; }
-LOOPS=${LOOPS:-20}
-ROUNDS=${ROUNDS:-3}
-D=${OUT:-${TMPDIR:-/tmp}/cycles_cmp}
+[[ -x $TOK ]] || { echo "cycles_cmp: no tokenizer found in $R/build*/bin (build it, or set TOK=path)"; exit 1; }
+echo "tokenizer: $TOK"
+LOOPS=${LOOPS:-10}
+ROUNDS=${ROUNDS:-2}
+D=${OUT:-$T}
 mkdir -p $D
-for spec in "$@"; do : > $D/${spec%%:*}_${INPUT:t:r}_t$TH.txt; done
+raw() { echo $D/cc_$1_${INPUT:t:r}_t$TH.txt; }
+for spec in "$@"; do : > $(raw ${spec%%:*}); done
 for r in $(seq 1 $ROUNDS); do
   for spec in "$@"; do
     name=${spec%%:*}; extra=${spec#*:}
     $TOK --merges=$T/merges.txt --pretokenizer=bytelevel ${=BEST} ${=extra} --thread-num=$TH ${=COLD} \
-        --bench-loop=$LOOPS -EnableCycleCounter $INPUT > /dev/null 2> $D/tmp.txt
-    echo "ROUND $r" >> $D/${name}_${INPUT:t:r}_t$TH.txt
-    cat $D/tmp.txt >> $D/${name}_${INPUT:t:r}_t$TH.txt
+        --bench-loop=$LOOPS -EnableCycleCounter $INPUT > /dev/null 2> $D/cc_tmp.txt
+    echo "ROUND $r" >> $(raw $name)
+    cat $D/cc_tmp.txt >> $(raw $name)
   done
 done
-rm -f $D/tmp.txt
+rm -f $D/cc_tmp.txt
 files=()
-for spec in "$@"; do files+=("${spec%%:*}=$D/${spec%%:*}_${INPUT:t:r}_t$TH.txt"); done
+for spec in "$@"; do files+=("${spec%%:*}=$(raw ${spec%%:*})"); done
 $PY - "${files[@]}" <<'EOF'
 import re, sys, statistics
 def short(n):
@@ -82,4 +90,4 @@ for k in order:
     if k == 'TOTAL (pipeline)': print('-' * (w + 12 * len(cfgs)))
     print(f"{k:{w}}" + ''.join(f"{data[(c, k)]:12.3f}" if (c, k) in data else f"{'-':>12}" for c in cfgs))
 EOF
-echo "raw output: $D"
+echo "raw tables: $D/cc_<name>_${INPUT:t:r}_t$TH.txt"

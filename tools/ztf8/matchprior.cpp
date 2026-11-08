@@ -30,13 +30,12 @@ using namespace codegen;
 
 static cl::OptionCategory matchpriorFlags("Command Flags", "matchprior options");
 
-static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::OneOrMore, cl::cat(matchpriorFlags));
+static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::ZeroOrMore, cl::cat(matchpriorFlags));
 
 static cl::opt<unsigned> priorDistance("distance", cl::desc("distance for prior match (default 2)"), cl::init(2),  cl::cat(matchpriorFlags));
 
 static int defaultDisplayColumnWidth = 10;  // default field width
 
-std::vector<fs::path> allFiles;
 
 using namespace kernel;
 
@@ -91,47 +90,35 @@ size_t file_size(const int fd) {
     return st.st_size;
 }
 
-void mp(MatchPriorFunctionType fn_ptr, const uint32_t fileIdx) {
-    std::string fileName = allFiles[fileIdx].string();
-    struct stat sb;
-    const int fd = open(fileName.c_str(), O_RDONLY);
+// Reports a file, returning false (after reporting the error) if it cannot be read.
+bool mp(MatchPriorFunctionType fn_ptr, const fs::path & path, const std::string & name) {
+    const int fd = argv::openInputFile(path);
     if (LLVM_UNLIKELY(fd == -1)) {
-        if (errno == EACCES) {
-            std::cerr << "matchprior: " << fileName << ": Permission denied.\n";
-        }
-        else if (errno == ENOENT) {
-            std::cerr << "matchprior: " << fileName << ": No such file.\n";
-        }
-        else {
-            std::cerr << "matchprior: " << fileName << ": Failed.\n";
-        }
-        return;
-    }
-    if (stat(fileName.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        std::cerr << "matchprior: " << fileName << ": Is a directory.\n";
-        close(fd);
-        return;
+        return false;
     }
     uint64_t countResult = fn_ptr(fd);
     std::cout << std::setw(defaultDisplayColumnWidth);
     std::cout << countResult << std::setw(defaultDisplayColumnWidth);
     std::cout << file_size(fd);
-    std::cout << " " << fileName << std::endl;
+    if (!name.empty()) std::cout << " " << name;
+    std::cout << std::endl;
     close(fd);
+    return true;
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    if (argv::RecursiveFlag || argv::DereferenceRecursiveFlag) {
-        argv::DirectoriesFlag = argv::Recurse;
-    }
+    codegen::ParseCommandLineOptions(argc, argv, {&matchpriorFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     CPUDriver driver("mp");
-    allFiles = argv::getFullFileList(driver, inputFiles);
+    argv::FileSelectConfig config;
+    config.stdinAsPath = true;
+    config.useIgnoreFiles = false;
+    const argv::FileSelection allFiles(driver, inputFiles, config);
     const auto fileCount = allFiles.size();
 
     auto matchPriorFunctionPtr = mpPipelineGen(driver);
+    bool allRead = true;
     for (unsigned i = 0; i < fileCount; ++i) {
-        mp(matchPriorFunctionPtr, i);
+        allRead &= mp(matchPriorFunctionPtr, allFiles[i], allFiles.displayName(i));
     }
-    return 0;
+    return allRead ? 0 : 1;
 }

@@ -495,6 +495,11 @@ add_test(
   COMMAND python3 greptest.py --random_flag_count=2 --tests_per_grepcase=2 ${BIN_DIR}/icgrep)
 
 add_test(
+  NAME possessive_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 possessive_strings_test.py ${BIN_DIR}/icgrep)
+
+add_test(
   NAME proptest
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 greptest.py -d ${QA_DIR} -t ${QA_DIR}/proptest.xml ${BIN_DIR}/icgrep)
@@ -538,6 +543,16 @@ add_test(
   COMMAND python3 utf8_errors_test.py ${BIN_DIR}/icgrep)
 
 add_test(
+  NAME recursive_select_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 recursive_select_test.py ${BIN_DIR}/icgrep)
+
+add_test(
+  NAME wc_files_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 wc_files_test.py ${BIN_DIR})
+
+add_test(
   NAME ldml_trules_test
   COMMAND ${BIN_DIR}/ldml_trules --self-test)
 
@@ -545,6 +560,161 @@ add_test(
   NAME tconv_engine_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 tconv_engine_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_prefix_runs_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_prefix_runs_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_chain_revisits_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_chain_revisits_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_mark_run_edits_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_mark_run_edits_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_walk_selection_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_walk_selection_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_fixed_captures_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_fixed_captures_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_kept_captures_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_kept_captures_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_icu_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_icu_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_possessive_lookahead_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_possessive_lookahead_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_context_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_context_strings_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_text_anchors_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_text_anchors_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_filter_run_end_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_filter_run_end_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_blocking_marks_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_blocking_marks_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_mark_run_lookahead_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_mark_run_lookahead_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_insertion_fold_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_insertion_fold_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_lookahead_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_lookahead_strings_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_capture_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_capture_strings_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_leading_runs_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_leading_runs_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_run_contexts_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_run_contexts_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_walk_runs_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_walk_runs_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_split_runs_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_split_runs_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_context_capture_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_context_capture_strings_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_run_strings_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_run_strings_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_front_letters_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_front_letters_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_converted_star_contexts_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_converted_star_contexts_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_run_moves_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_run_moves_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_capture_variants_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_capture_variants_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_insertion_revisit_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_insertion_revisit_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_prefix_run_contexts_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_prefix_run_contexts_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_prefix_run_exceptions_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_prefix_run_exceptions_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_prefix_run_revisits_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_prefix_run_revisits_test.py ${BIN_DIR}/tconv)
+
+add_test(
+  NAME tconv_repeated_captures_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 tconv_repeated_captures_test.py ${BIN_DIR}/tconv)
 
 add_test(
   NAME u8u16_test

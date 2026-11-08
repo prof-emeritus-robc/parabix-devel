@@ -23,6 +23,7 @@
 #include <kernel/pipeline/program_builder.h>
 #include <toolchain/toolchain.h>
 #include <fileselect/file_select.h>
+#include <algorithm>
 #include <fcntl.h>
 #include <iomanip>
 #include <iostream>
@@ -40,9 +41,8 @@ using namespace codegen;
 
 static cl::OptionCategory wcFlags("Command Flags", "wc options");
 
-static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::OneOrMore, cl::cat(wcFlags));
+static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::ZeroOrMore, cl::cat(wcFlags));
 
-std::vector<fs::path> allFiles;
 
 enum CountOptions {
     LineOption, WordOption, CharOption, ByteOption
@@ -259,39 +259,25 @@ auto wcPipelineGen(CPUDriver & driver) {
     return P.compile();
 }
 
-void wc(WordCountFunctionType fn_ptr, const uint32_t fileIdx) {
-    std::string fileName = allFiles[fileIdx].string();
-    struct stat sb;
-    const int fd = open(fileName.c_str(), O_RDONLY);
+// Counts a file, returning false (after reporting the error) if it cannot be read.
+bool wc(WordCountFunctionType fn_ptr, const fs::path & path, const uint32_t fileIdx) {
+    const int fd = argv::openInputFile(path);
     if (LLVM_UNLIKELY(fd == -1)) {
-        if (errno == EACCES) {
-            std::cerr << "wc: " << fileName << ": Permission denied.\n";
-        }
-        else if (errno == ENOENT) {
-            std::cerr << "wc: " << fileName << ": No such file.\n";
-        }
-        else {
-            std::cerr << "wc: " << fileName << ": Failed.\n";
-        }
-        return;
-    }
-    if (stat(fileName.c_str(), &sb) == 0 && S_ISDIR(sb.st_mode)) {
-        std::cerr << "wc: " << fileName << ": Is a directory.\n";
-        close(fd);
-        return;
+        return false;
     }
     fn_ptr(fd, fileIdx);
     close(fd);
+    return true;
 }
 
 int main(int argc, char *argv[]) {
-    codegen::ParseCommandLineOptions(argc, argv, {&wcFlags, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
-    if (argv::RecursiveFlag || argv::DereferenceRecursiveFlag) {
-        argv::DirectoriesFlag = argv::Recurse;
-    }
+    codegen::ParseCommandLineOptions(argc, argv, {&wcFlags, &argv::File_Select_Options, &codegen::JIT_InfoOptions, &codegen::InstrumentationOptions});
     CPUDriver driver("wc");
 
-    allFiles = argv::getFullFileList(driver, inputFiles);
+    argv::FileSelectConfig config;
+    config.stdinAsPath = true;
+    config.useIgnoreFiles = false;
+    const argv::FileSelection allFiles(driver, inputFiles, config);
 
     const auto fileCount = allFiles.size();
     if (wcOptions.size() == 0) {
@@ -329,8 +315,9 @@ int main(int argc, char *argv[]) {
     jitExecution.start();
     #endif
 
+    std::vector<bool> counted(fileCount);
     for (unsigned i = 0; i < fileCount; ++i) {
-        wc(wordCountFunctionPtr, i);
+        counted[i] = wc(wordCountFunctionPtr, allFiles[i], i);
     }
 
     size_t maxCount = 0;
@@ -343,6 +330,7 @@ int main(int argc, char *argv[]) {
     if (displayColumnWidth < defaultDisplayColumnWidth) displayColumnWidth = defaultDisplayColumnWidth;
 
     for (unsigned i = 0; i < fileCount; ++i) {
+        if (!counted[i]) continue;
         std::cout << std::setw(displayColumnWidth-1);
         if (CountLines) {
             std::cout << lineCount[i] << std::setw(displayColumnWidth);
@@ -356,9 +344,11 @@ int main(int argc, char *argv[]) {
         if (CountBytes) {
             std::cout << byteCount[i];
         }
-        std::cout << " " << allFiles[i].string() << std::endl;
+        const auto name = allFiles.displayName(i);
+        if (!name.empty()) std::cout << " " << name;
+        std::cout << std::endl;
     }
-    if (allFiles.size() > 1) {
+    if (allFiles.showTotal()) {
         std::cout << std::setw(displayColumnWidth-1);
         if (CountLines) {
             std::cout << TotalLines << std::setw(displayColumnWidth);
@@ -380,5 +370,5 @@ int main(int argc, char *argv[]) {
     jitExecution.write(std::cerr);
     #endif
 
-    return 0;
+    return std::all_of(counted.begin(), counted.end(), [](bool c) {return c;}) ? 0 : 1;
 }

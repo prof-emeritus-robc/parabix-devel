@@ -331,6 +331,11 @@ llvm::Function * MCJITBackend::LinkFunction(llvm::StringRef unmangledName, llvm:
     if (LLVM_UNLIKELY(f == nullptr)) {
         f = Function::Create(functionType, Function::ExternalLinkage, unmangledName, mod);
         mEngine->updateGlobalMapping(f, functionPointer);
+    } else if (void * const prior = mEngine->getPointerToGlobalIfAvailable(f);
+               LLVM_UNLIKELY(prior != nullptr && prior != functionPointer)) {
+        // A linked name resolves to one address: linking it again to another function would
+        // silently give every caller the first one.
+        report_fatal_error(Twine("LinkFunction: ") + unmangledName + " is already linked to a different function");
     }
     return f;
 }

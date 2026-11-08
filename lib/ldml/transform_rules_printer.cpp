@@ -271,6 +271,23 @@ std::string printItem(const RE * re) {
     } else if (isa<Seq>(re)) {
         if (isString(re)) return printQuoted(re);
         return printSequence(re);
+    } else if (const Assertion * a = dyn_cast<Assertion>(re)) {
+        // Not expressible in rule syntax (contexts combined by ComposeRevisits).
+        const bool ahead = a->getKind() == Assertion::Kind::LookAhead;
+        const bool positive = a->getSense() == Assertion::Sense::Positive;
+        return std::string(ahead ? "(?" : "(?<") + (positive ? "=" : "!") + printSequence(a->getAsserted()) + ")";
+    } else if (const Alt * alt = dyn_cast<Alt>(re)) {
+        //  An alternation that is not a set (of characters and strings): its
+        //  alternatives (not expressible in rule syntax, as the exceptions of
+        //  prefix runs).
+        for (const RE * m : *alt) {
+            const bool setMember = isa<CC>(m) || isa<Name>(m) || isa<Diff>(m) || isa<Intersect>(m) || isa<PropertyExpression>(m)
+                                   || isa<Any>(m) || isBoundary(m) || (isa<Seq>(m) && isString(m));
+            if (setMember) continue;
+            std::string s;
+            for (const RE * e : *alt) s += (s.empty() ? "(" : " | ") + printSequence(e);
+            return s + ")";
+        }
     }
     return printSet(re);
 }

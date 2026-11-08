@@ -86,6 +86,7 @@ enum ExitCode {
     MatchFoundExitCode = 0,       // At least one match was found.
     MatchNotFoundExitCode = 1,    // No matches were found.
     InternalFailureCode = 2,      // Fatal error code due to program logic or system problem.
+    FileErrorExitCode = 2,        // An input file could not be read (unless -q found a match).
     UsageErrorCode = 3            // Use of unsupported regexp syntax or error in command line parameters.
 };
 

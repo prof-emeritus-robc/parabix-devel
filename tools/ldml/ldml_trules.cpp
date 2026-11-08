@@ -533,8 +533,10 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"(x) (a*) (y) → $3 $2 $1 ;", "(x) (a+) (y) → $3 $2 $1 ;\n(x) (y) → $2 $1 ;\n"},
     {"(x) (a?) (y) → $3 $2 $1 ;", "(x) a (y) → $2 a $1 ;\n(x) (y) → $2 $1 ;\n"},
     // References within function calls and cursors.
+    //  An item absent: the next character is not in its set (ICU matches it
+    //  possessively), at the end of the text.
     {"$v = [ab] ; x ($v*) → &Any-Hex($1) | y ;",
-     "$v = [ab] ;\nx ($v+) → &Any-Hex($1) | y ;\nx → &Any-Hex() | y ;\n"},
+     "$v = [ab] ;\nx ($v+) → &Any-Hex($1) | y ;\nx } [\\u0000-\\`c-􏿿$] → &Any-Hex() | y ;\n"},
     // Deleting a capture deletes the captures within it.
     {"((a)?) b → $2 $1 ;", "((a)) b → $2 $1 ;\nb → ;\n"},
     // Captures in contexts.
@@ -546,11 +548,10 @@ static const EliminationTestCase eliminationTestCases[] = {
     {"$m = m ; $d = d ; (x) ($m? $d?) y → $2 $1 ;",
      "$m = m ;\n$d = d ;\n(x) $m $d y → $m $d $1 ;\n(x) $m y → $m $1 ;\n(x) $d y → $d $1 ;\n(x) y → $1 ;\n"},
     {"$V = [aeiou] ; z ([jw]? $V?) → $1 ;",
-     "$V = [aeiou] ;\nz ([jw] $V) → $1 ;\nz ([jw]) → $1 ;\nz ($V) → $1 ;\nz → ;\n"},
+     "$V = [aeiou] ;\nz ([jw] $V) → $1 ;\nz ([jw]) } [\\u0000-\\`b-df-hj-np-tv-􏿿$] → $1 ;\nz ($V) → $1 ;\nz } [\\u0000-\\`b-df-hk-np-tvx-􏿿$] → ;\n"},
     {"((a)? b*) c → $2 $1 ;", "((a) b+) c → $2 $1 ;\n((a)) c → $2 $1 ;\n(b+) c → $1 ;\nc → ;\n"},
     {"z { (a? b? c?) → $1 ;",
-     "z { abc → abc ;\nz { ab → ab ;\nz { ac → ac ;\nz { a → a ;\n"
-     "z { bc → bc ;\nz { b → b ;\nz { c → c ;\nz { → ;\n"},
+     "z { abc → abc ;\nz { ab } [\\u0000-bd-􏿿$] → ab ;\nz { ac → ac ;\nz { a } [\\u0000-ad-􏿿$] → a ;\nz { bc → bc ;\nz { b } [\\u0000-bd-􏿿$] → b ;\nz { c → c ;\nz { } [\\u0000-\\`d-􏿿$] → ;\n"},
     {"(x? y?) (z*) w → $2 $1 ;",
      "xy (z+) w → $1 xy ;\nxyw → xy ;\nx (z+) w → $1 x ;\nxw → x ;\ny (z+) w → $1 y ;\nyw → y ;\n(z+) w → $1 ;\nw → ;\n"},
     // Unchanged: captures within repetitions, non-nullable captures, non-forward rules.

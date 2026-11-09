@@ -139,6 +139,9 @@ void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
 // --tail-from-bytes (buildBPEPassPipeline returned vocabID == nullptr): the same emitter, run
 // on the BPE input as a byte stream (1x8), its basis bits (8x1, for --tail-unit-cuts) and the
 // pretoken starts.
+// BPE_DUMP=<prefix> (debug): the byte offsets of the marks of `marks`, written to <prefix>.<name>.
+void bpeDumpStream(kernel::PipelineBuilder & P, kernel::StreamSet * bytes, kernel::StreamSet * marks,
+                   const std::string & name);
 void buildBPEByteTailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * bytes,
                              kernel::StreamSet * basis, kernel::StreamSet * segs);
 // --bench-cold-cache: every thread's tail segment cache starts empty on the next pipeline

@@ -547,6 +547,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
                                  : normalizedBasis;
     } else if (compressClasses) {
         bpeBasis    = normalizedBasis;
+        gPretokDumpSource = ByteStream;
         bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode, PretokByteDomain, PretokUTF8Classes);
     } else if (PreTokenizer == bytelevel) {
         // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to

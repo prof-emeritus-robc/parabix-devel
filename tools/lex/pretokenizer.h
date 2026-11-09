@@ -78,6 +78,8 @@ PreTokenizerResult buildPreTokenizerBoundaries(
 // run on the bytes (GPT2ByteBoundaryLAKernel, on the classes at each codepoint's first byte).
 // utf8Classes (--pretok-utf8-classes, with byteDomain): compile the classes on the UTF-8 bytes
 // instead of on UTF8_Decoder's codepoints.
+// BPE_DUMP (debug): the source byte stream, for dumping the class streams.
+extern StreamSet * gPretokDumpSource;
 StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode = false,
                                     bool byteDomain = false, bool utf8Classes = false);
 

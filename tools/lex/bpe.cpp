@@ -51,6 +51,7 @@
 #include <iostream>
 #include <map>
 #include <atomic>
+#include <mutex>
 #include <memory>
 #include <queue>
 #include <array>
@@ -79,6 +80,8 @@
 #include <boost/intrusive/detail/math.hpp>
 #include <kernel/io/source_kernel.h>              // MemorySourceBlockCapacity (--memsource-block-capacity)
 #include <kernel/scan/base.h>                     // TwoLevelScanKernel (--tail-scan-kernel)
+#include <kernel/scan/reader.h>                   // BPE_DUMP
+#include <kernel/scan/index_generator.h>          // BPE_DUMP
 #if defined(__aarch64__)
 #include <arm_neon.h>                             // --tail-batch-bpe
 #endif
@@ -3954,6 +3957,53 @@ static void linkTailWalkIR(PipelineBuilder & P, Kernel * k) {
     P.LinkFunction(k, "bpe_tail_walk_end", tailWalkEnd<kTailCacheWays>);
 }
 
+// BPE_DUMP=<prefix> (debug): write the byte offsets of the marks of each dumped stream to
+// <prefix>.<name> at exit, one per line, ascending. Every dump scans the source byte stream
+// (the input buffer, --memsource-in-place); its first byte is always a pretoken start, so the
+// lowest pointer of the "segs" dump is the base.
+static constexpr unsigned kBpeDumpSlots = 12;
+static std::mutex gBpeDumpMutex;
+static std::vector<const uint8_t *> gBpeDumpPos[kBpeDumpSlots];
+static std::string gBpeDumpName[kBpeDumpSlots];
+static unsigned gBpeDumpCount = 0;
+static void bpeDumpWrite() {
+    const char * const prefix = std::getenv("BPE_DUMP");
+    const uint8_t * base = nullptr;
+    for (unsigned k = 0; k < gBpeDumpCount; k++)
+        if (gBpeDumpName[k] == "segs" && !gBpeDumpPos[k].empty())
+            base = *std::min_element(gBpeDumpPos[k].begin(), gBpeDumpPos[k].end());
+    if (base == nullptr) return;
+    for (unsigned k = 0; k < gBpeDumpCount; k++) {
+        std::vector<size_t> off;
+        for (const uint8_t * q : gBpeDumpPos[k]) off.push_back(size_t(q - base));
+        std::sort(off.begin(), off.end());
+        std::ofstream out(std::string(prefix) + "." + gBpeDumpName[k]);
+        for (size_t o : off) out << o << "\n";
+    }
+}
+template <unsigned K> void bpeDumpCallback(const uint8_t * p) {
+    std::lock_guard<std::mutex> lock(gBpeDumpMutex);
+    gBpeDumpPos[K].push_back(p);
+}
+template <unsigned... K>
+static void (*bpeDumpCallbackFor(unsigned k, std::integer_sequence<unsigned, K...>))(const uint8_t *) {
+    static void (* const table[])(const uint8_t *) = {bpeDumpCallback<K>...};
+    return table[k];
+}
+void bpeDumpStream(PipelineBuilder & P, StreamSet * bytes, StreamSet * marks, const std::string & name) {
+    if (gBpeDumpCount == kBpeDumpSlots) return;
+    if (gBpeDumpCount == 0) std::atexit(bpeDumpWrite);
+    const unsigned k = gBpeDumpCount++;
+    gBpeDumpName[k] = name;
+    StreamSet * const idx = P.CreateStreamSet(1, 64);
+    P.CreateKernelCall<ScanIndexGenerator>(marks, idx);
+    const std::string fn = "bpe_dump_" + std::to_string(k);
+    Kernel * const r = P.CreateKernelCall<ScanReader>(bytes, idx, fn);
+    void (* const cb)(const uint8_t *) = bpeDumpCallbackFor(k, std::make_integer_sequence<unsigned, kBpeDumpSlots>{});
+    P.LinkFunction(r, fn, FunctionTypeBuilder<void(const uint8_t *)>::get(P.getTypeSystem().getContext()),
+                   reinterpret_cast<void *>(cb));
+}
+
 void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * basis, StreamSet * segs) {
     StreamSet * res = P.CreateStreamSet(1, 16);
     StreamSet * emit = P.CreateStreamSet(1, 1);
@@ -4036,6 +4086,10 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
             }
         }
         if (!combined) P.CreateKernelCall<BPEUnitCutsKernel>(basis, segs, cuts, unit, scan, frozen, runs, pairCutSet);
+        if (std::getenv("BPE_DUMP")) {
+            bpeDumpStream(P, bytes, segs, "segs");
+            bpeDumpStream(P, bytes, cuts, "cuts");
+        }
         StreamSet * resIn = nullptr;
         if (TailUnitSeed) {
             StreamSet * ids8 = P.CreateStreamSet(8, 1);

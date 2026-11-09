@@ -35,6 +35,8 @@
 #include <vector>
 #include <string>
 #include <toolchain/toolchain.h>
+#include <kernel/streamutils/stream_select.h>
+#include "bpe.h"
 
 using namespace llvm;
 using namespace codegen;
@@ -1261,6 +1263,8 @@ protected:
 // Number as UnicodePropertyKernelBuilder resolves them), at each UTF-8 sequence's last byte,
 // where UTF8_Decoder leaves the codepoint and UTF8_index marks it. Filtering them by
 // u8index gives exactly what the class kernels compute on the compressed codepoints.
+StreamSet * gPretokDumpSource = nullptr;
+
 StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode, bool byteDomain,
                                     bool utf8Classes) {
     auto propCC = [](const char * name) {
@@ -1305,6 +1309,13 @@ StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, 
         }
         StreamSet * byteBoundary = P.CreateStreamSet(1, 1);
         P.CreateKernelCall<GPT2ByteBoundaryLAKernel>(BasisBits, classes, byteBoundary);
+        if (gPretokDumpSource && std::getenv("BPE_DUMP_CLASSES")) {   // debug: the class streams
+            for (unsigned i = 0; i < ccs.size(); i++) {
+                StreamSet * const one = P.CreateStreamSet(1, 1);
+                P.CreateKernelCall<StreamSelect>(one, Select(classes, std::vector<uint32_t>{i}));
+                bpeDumpStream(P, gPretokDumpSource, one, "class" + std::to_string(i));
+            }
+        }
         return byteBoundary;
     }
     StreamSet * classes = P.CreateStreamSet(ccs.size(), 1);

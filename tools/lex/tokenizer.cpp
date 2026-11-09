@@ -415,7 +415,7 @@ static cl::opt<bool> PretokByteDomain(
     cl::cat(wordBreakerFlags));
 
 // --pretok-utf8-classes (with --pretok-byte-domain): compile the 4 class-code sets on the UTF-8
-// bytes (marked at each sequence's last byte) instead of decoding codepoints first.
+// bytes (marked at each sequence's first byte) instead of decoding codepoints first.
 static cl::opt<bool> PretokUTF8Classes(
     "pretok-utf8-classes",
     cl::desc("With --pretok-byte-domain: compute the classes from the UTF-8 bytes, without "

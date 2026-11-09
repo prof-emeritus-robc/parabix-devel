@@ -289,14 +289,14 @@ streams (mean 14.2 → 16.0 bits). `hi` is now a **width bound only**, not an
 
 A `source` id stream and a 1-bit `inPlayMask` thread kernel → kernel.
 
-**1. `BPERangeSeed`** turns each raw byte into its base-alphabet id. `id(byte)` is
-a fixed byte→id bijection (GPT-2's `bytes_to_unicode`, a piecewise
-`id = byte + offset`). It is compiled as **character classes**: for each of the 8
-id output bits, the set of bytes whose id has that bit set is a byte character
-class, so `compileCC` over the byte basis yields each id-bit stream directly — no
-BixNum arithmetic and no 256-way lookup. The mapping is constant, so the kernel is
+**1. `BPEBaseIdKernel`** (`BPE_BaseIds+active`) turns each raw byte into its
+base-alphabet id. `id(byte)` is a fixed byte→id bijection (GPT-2's
+`bytes_to_unicode`, a piecewise `id = byte + offset`), computed with **BixNum
+arithmetic**: four range compares choose the offset (0..32 and 174..255 share
+0xBC mod 256), then one 8-bit modular add — 77 Pablo statements, where one
+character class per id bit took 776. The mapping is constant, so the kernel is
 data-independent and its cache name is constant. It also seeds `active` (all ones
-— every byte starts as a live token start) and `end` (all zeros, legacy/unused).
+— every byte starts as a live token start).
 
 **2. One `BPEMergeKernel` per clean range**, ascending = rank order. Each keeps a
 mutable id accumulator `idAcc` (starting from the input `source`) and the 1-bit
@@ -365,7 +365,7 @@ Kernels built with a boundary stream are named `BPEMerge_b1_h{hash}` rather than
 `tokenizer.cpp` supplies this stream when `--pretokenizer=bytelevel` is given in
 BPE mode: the bytelevel pre-tokenizer's only job there is to mark pre-token
 starts, and BPE is fed the **raw** bytes (using the Ġ-remapped bytes would
-double-encode, since `BPERangeSeed` already applies `bytes_to_unicode` once).
+double-encode, since `BPEBaseIdKernel` already applies `bytes_to_unicode` once).
 
 ### Emission
 

@@ -114,7 +114,7 @@ private:
 // buildBPEPassPipeline
 //   Builds the merge-kernel BPE pipeline:
 //     - buildMergeRuleRanges() groups merges into id-ranges (rank order).
-//     - BPERangeSeed seeds source = base id of each raw byte (active=1s, end=0s).
+//     - BPEBaseIdKernel seeds source = base id of each raw byte (active=1s).
 //     - One BPEMergeKernel per range (lowest first) glues adjacent ids into
 //       `source`, threaded kernel→kernel (the Ġthe→Ġthey cascade).
 //   Returns (matchEnd=active, vocabID=source). Emission is Stage-B debug
@@ -137,10 +137,10 @@ void bpeTailSetSink(BPETailSink sink);
 void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
                          kernel::StreamSet * starts, kernel::StreamSet * segs);
 // --tail-from-bytes (buildBPEPassPipeline returned vocabID == nullptr): the same emitter, run
-// on the BPE input as a byte stream (1x8) and the pretoken starts. basis: the same input as
-// 8 basis bits (--tail-bixhash hashes it; may be null).
+// on the BPE input as a byte stream (1x8), its basis bits (8x1, for --tail-unit-cuts) and the
+// pretoken starts.
 void buildBPEByteTailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * bytes,
-                             kernel::StreamSet * segs, kernel::StreamSet * basis = nullptr);
+                             kernel::StreamSet * basis, kernel::StreamSet * segs);
 // --bench-cold-cache: every thread's tail segment cache starts empty on the next pipeline
 // run, as in a one-shot run (the caches survive across --bench-loop runs otherwise).
 void bpeDropTailCaches();

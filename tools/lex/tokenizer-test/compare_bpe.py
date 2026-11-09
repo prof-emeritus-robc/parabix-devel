@@ -112,7 +112,7 @@ def run_parabix_bpe(text: str) -> tuple[list[int], list[str]]:
 
     tokenizer.cpp's --pretokenizer=bytelevel path (buildBPEPipeline, PreTokenizer
     == bytelevel branch) feeds the merge stage the RAW input bytes as bpeBasis —
-    NOT the Ġ-remapped pretokenizer output, which would double-encode (BPERangeSeed
+    NOT the Ġ-remapped pretokenizer output, which would double-encode (BPEBaseIdKernel
     already applies GPT-2 bytes_to_unicode once) — and separately threads the
     regex pretoken-boundary mask through as bpeBoundary, so BPEMergeKernel blocks
     merges that would cross a pretoken boundary. This is the actual HF-equivalent

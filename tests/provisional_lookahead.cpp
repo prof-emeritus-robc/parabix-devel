@@ -40,15 +40,21 @@ static cl::list<unsigned> LookAheads("la", cl::desc("Lookahead amount of each ke
 static cl::opt<bool> Invert("invert", cl::desc("Complement the output of each chain kernel, so that it is nonzero past the end of input"),
                             cl::init(false), cl::cat(testOptions));
 
+static cl::opt<bool> StateFree("statefree", cl::desc("Chain kernels of Lookahead and Xor only (no Advance or MatchStar), "
+                                                     "which the pipeline would otherwise run as state free"),
+                               cl::init(false), cl::cat(testOptions));
+
 class LookAheadMixKernel final : public PabloKernel {
 public:
     LookAheadMixKernel(LLVMTypeSystemInterface & ts, StreamSet * const input, StreamSet * const output,
-                       const unsigned lookAhead, const unsigned index, const bool invert)
-    : PabloKernel(ts, "LookAheadMix" + std::to_string(lookAhead) + "_" + std::to_string(index) + (invert ? "_inv" : ""),
+                       const unsigned lookAhead, const unsigned index, const bool invert, const bool stateFree)
+    : PabloKernel(ts, "LookAheadMix" + std::to_string(lookAhead) + "_" + std::to_string(index) + (invert ? "_inv" : "")
+                      + (stateFree ? "_sf" : ""),
                   {Binding{"input", input, FixedRate(1), LookAhead(lookAhead)}},
                   {Binding{"output", output}})
     , mLookAhead(lookAhead)
-    , mInvert(invert) { }
+    , mInvert(invert)
+    , mStateFree(stateFree) { }
 protected:
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
@@ -57,9 +63,14 @@ protected:
         const unsigned n = in.size();
         for (unsigned i = 0; i < n; ++i) {
             PabloAST * la = pb.createLookahead(in[(i + 1) % n], mLookAhead);
-            PabloAST * adv = pb.createAdvance(in[(i + 2) % n], 3);
-            PabloAST * star = pb.createMatchStar(in[i], in[(i + 3) % n]);
-            PabloAST * out = pb.createXor(pb.createXor(la, adv), star);
+            PabloAST * out = nullptr;
+            if (mStateFree) {
+                out = pb.createXor(la, in[i]);
+            } else {
+                PabloAST * adv = pb.createAdvance(in[(i + 2) % n], 3);
+                PabloAST * star = pb.createMatchStar(in[i], in[(i + 3) % n]);
+                out = pb.createXor(pb.createXor(la, adv), star);
+            }
             if (mInvert) {
                 out = pb.createNot(out);
             }
@@ -69,6 +80,7 @@ protected:
 private:
     const unsigned mLookAhead;
     const bool mInvert;
+    const bool mStateFree;
 };
 
 typedef void (*TestFunctionType)(uint32_t fd);
@@ -83,7 +95,7 @@ static TestFunctionType generatePipeline(CPUDriver & driver) {
     unsigned index = 0;
     for (const auto la : LookAheads) {
         StreamSet * const next = P.CreateStreamSet(8, 1);
-        P.CreateKernelCall<LookAheadMixKernel>(basis, next, la, index++, Invert);
+        P.CreateKernelCall<LookAheadMixKernel>(basis, next, la, index++, Invert, StateFree);
         basis = next;
     }
     StreamSet * const result = P.CreateStreamSet(1, 8);

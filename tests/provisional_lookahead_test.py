@@ -34,8 +34,17 @@ QUICK_SEGMENT_SIZES = [None, "1"]
 QUICK_INVERT = [False]
 QUICK_LENGTHS = [0, 257, 10253]
 
+# A state free provisional stride kernel (Lookahead and Xor only) alone in its partition, which
+# the 200 lookahead of the next kernel gives it. A kernel that runs segments concurrently would
+# have the provisional stride of one segment overwrite the output of the next, written by another
+# thread; the race shows only with several threads and many segments, so the case is repeated.
+STATEFREE_CHAIN = "3,200"
+STATEFREE_LENGTH = 100003
+STATEFREE_THREADS = "8"
+STATEFREE_REPEATS = 12
 
-def reference(data, chain, invert):
+
+def reference(data, chain, invert, statefree=False):
     """The output of provisional_lookahead, computing each stream as an integer whose bit k is
     the stream bit at position k.  Basis stream i holds bit i of each byte."""
     n = len(data)
@@ -48,10 +57,13 @@ def reference(data, chain, invert):
         out = []
         for i in range(8):
             lookahead = streams[(i + 1) % 8] >> la
-            advance = (streams[(i + 2) % 8] << 3) & mask
-            m, c = streams[i], streams[(i + 3) % 8]
-            star = ((((m & c) + c) ^ c) | m) & mask
-            r = lookahead ^ advance ^ star
+            if statefree:
+                r = lookahead ^ streams[i]
+            else:
+                advance = (streams[(i + 2) % 8] << 3) & mask
+                m, c = streams[i], streams[(i + 3) % 8]
+                star = ((((m & c) + c) ^ c) | m) & mask
+                r = lookahead ^ advance ^ star
             if invert:
                 r = ~r & mask
             out.append(r)
@@ -65,10 +77,14 @@ def reference(data, chain, invert):
     return bytes(result)
 
 
-def run(exe, path, chain, seg, invert, provisional, shared):
+def run(exe, path, chain, seg, invert, provisional, shared, statefree=False, threads=None):
     cmd = [exe, path, "-la=" + chain, "-object-cache-salt=provisional_test"]
     if invert:
         cmd.append("-invert")
+    if statefree:
+        cmd.append("-statefree")
+    if threads is not None:
+        cmd.append("-thread-num=" + threads)
     if shared:
         cmd.append("-DisableThreadLocalStreamSets")
     if seg is not None:
@@ -127,6 +143,29 @@ def main():
                                           % (name, first, len(expected), len(out)))
                         elif verbose:
                             print("ok: %s" % cmd1)
+        path = os.path.join(tmp, "statefree.bin")
+        data = bytes(rng.getrandbits(8) for _ in range(STATEFREE_LENGTH))
+        with open(path, "wb") as f:
+            f.write(data)
+        expected = reference(data, STATEFREE_CHAIN, False, statefree=True)
+        cases += 1
+        for _ in range(STATEFREE_REPEATS):
+            rc, out, err, cmd = run(exe, path, STATEFREE_CHAIN, "1", False, True, False,
+                                    statefree=True, threads=STATEFREE_THREADS)
+            if rc != 0 or out != expected:
+                failures += 1
+                print("FAIL: %s" % cmd)
+                if rc != 0:
+                    print("  exited with %d: %s" % (rc, err.strip()[:400]))
+                else:
+                    first = next((i for i, (a, b) in enumerate(zip(expected, out)) if a != b),
+                                 min(len(expected), len(out)))
+                    print("  output differs from reference at byte %d (lengths %d, %d)"
+                          % (first, len(expected), len(out)))
+                break
+        else:
+            if verbose:
+                print("ok: %s (%d runs)" % (cmd, STATEFREE_REPEATS))
     print("%d of %d cases failed" % (failures, cases))
     return 1 if failures else 0
 

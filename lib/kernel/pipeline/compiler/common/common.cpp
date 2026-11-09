@@ -217,6 +217,13 @@ bool PipelineCommonGraphFunctions::isKernelStateFree(KernelBuilder & b, const si
         return false;
     }
 
+    // A provisional stride writes the output of the stride past the full strides, which is the
+    // start of the next segment's output: a later invocation that processed that segment on
+    // another thread would have its output overwritten with the provisional one.
+    if ((mBufferGraphRef[kernel].Type & HasProvisionalStride) != 0) {
+        return false;
+    }
+
     bool notStatefree = kernelObj->getNumOfNestedKernelFamilyCalls() > 0;
 
     for (const Attribute & attr : kernelObj->getAttributes()) {

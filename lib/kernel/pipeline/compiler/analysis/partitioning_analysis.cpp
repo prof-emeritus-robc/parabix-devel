@@ -1983,6 +1983,9 @@ void PipelineAnalysis::identifyProvisionalStrideKernels() {
         if (active) {
             ProvisionalStrideKernel.set(kernel);
             ProvisionalChainLookAhead[kernel] = chain;
+            // A provisional stride writes a stride past the full strides, into the output of the
+            // next segment: the kernel must not run segments concurrently (isKernelStateFree).
+            mBufferGraph[kernel].Type |= HasProvisionalStride;
         } else if (!isRoot) {
             // A kernel that looks ahead into data produced within its own partition depends on
             // the provisional strides of its producers.

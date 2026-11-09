@@ -278,6 +278,8 @@ enum BufferType : unsigned {
     , ManagedOutput = 256
     // ------------------
     , HasIllustratedStreamset = 512
+    // a kernel that runs provisional strides (see identifyProvisionalStrideKernels)
+    , HasProvisionalStride = 1024
     , RequiresEmptyOverflow = 2048
     , HasNonFixedRateConsumer = 4096
     , RequiresConsumedItemCount = 8192

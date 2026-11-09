@@ -404,9 +404,9 @@ static cl::opt<bool> PretokClassCode(
     cl::cat(wordBreakerFlags));
 
 // --pretok-byte-domain (with --pretok-class-code): find the GPT-2 pretoken starts on the bytes
-// themselves (each class at its codepoint's first and last byte, moved by fixed lookaheads
-// chosen by the UTF-8 lead byte), with no compression to one slot per codepoint and no
-// spreading back: drops FilterByMask, SpreadByMask and UTF8_index.
+// themselves (each class at its codepoint's first byte, and advanced to its last byte by the
+// UTF-8 lead byte), with no compression to one slot per codepoint and no spreading back:
+// drops FilterByMask, SpreadByMask and UTF8_index.
 static cl::opt<bool> PretokByteDomain(
     "pretok-byte-domain",
     cl::desc("With --pretok-class-code: compute the pretoken boundaries in the byte domain, "

@@ -2172,6 +2172,15 @@ static cl::opt<bool> CombinedCuts("combined-cuts", cl::desc("With --len-scan and
 static cl::opt<unsigned> LenScan("len-scan", cl::desc("With --tail-scan-kernel: resolve the pieces of 2 .. N "
     "bytes in kernels of their own, BPE_len<L>_pretokenScan (N = 2 .. 15; 0 = off, the default)."), cl::init(0));
 static bool lenScan() { return LenScan >= 2 && TailScanKernel; }
+// --len3-pair-check (with --len-scan=3 or more): the BPE of a 3-byte piece a b c missing from the
+// length-3 table, in generated code from the pair table (gTailPairBytes) instead of bpe_len_miss.
+// The table holds every 3-byte token whose BPE is itself, so a miss is two or three tokens: no rule
+// for (a, b) or (b, c), the three base ids (already in res); else the pair rule of lower id (id =
+// 256 + rank; the left one on a tie) merges, and the result can merge no further (that would be a
+// table hit). Only when the table left no 3-byte token out. Kernel name tag "_pc".
+static cl::opt<bool> Len3PairCheck("len3-pair-check", cl::desc("With --len-scan: resolve the 3-byte pieces "
+    "missing from the table from the pair rules, without the miss path (default on)."),
+    cl::init(true));
 // --len-long-kernel (with --len-scan and --tail-unit-seed; on by default): BPE_LongPieces resolves
 // the pieces of more than N bytes in place of the general scan (BPE_TailScanIR).
 static cl::opt<bool> LenLongKernel("len-long-kernel", cl::desc("With --len-scan and --tail-unit-seed: the "
@@ -3917,9 +3926,11 @@ static unsigned tailLenWays(unsigned L) { return L <= 4 ? 8 : L <= 8 ? 6 : 3; }
 struct TailLenTable {
     std::vector<TailLenBucket> buckets;      // the 64-byte buckets, in L's format
     unsigned bits = 0;
+    unsigned dropped = 0;                    // the tokens left out (bucket full)
 };
 static TailLenTable gTailLenTab[kTailLenMax + 1];   // [3 .. kTailLenMax]
 static uint64_t tailLenTable2() { return reinterpret_cast<uint64_t>(gTailPairBytes.data()); }
+static bool tailLen3PairCheck() { return Len3PairCheck && gTailLenTab[3].dropped == 0; }
 template <unsigned L> static uint64_t tailLenTable() { return reinterpret_cast<uint64_t>(gTailLenTab[L].buckets.data()); }
 static uint64_t (* const kTailLenTables[kTailLenMax + 1])() = {
     nullptr, nullptr, tailLenTable2, tailLenTable<3>, tailLenTable<4>, tailLenTable<5>, tailLenTable<6>,
@@ -4056,9 +4067,10 @@ public:
                      StreamSet * bytes, StreamSet * resIn, StreamSet * emitIn, StreamSet * res, StreamSet * emit)
     : TwoLevelScanKernel(ts, "BPE_len" + std::to_string(L) + "_pretokenScan"
                              + (L >= 3 ? "_b" + std::to_string(gTailLenTab[L].bits) : std::string())
+                             + (L == 3 && tailLen3PairCheck() ? "_pc" : "")
                              + "_of" + std::to_string(starts->getNumElements()),
                          64, "starts", {}, int(L - 2))
-    , mL(L) {
+    , mL(L), mPairCheck(L == 3 && tailLen3PairCheck()) {
         mInputStreamSets.push_back(Binding{"starts", starts, FixedRate(1), Principal()});
         mInputStreamSets.push_back(Binding{"bytes", bytes, FixedRate(1), LookAhead(L == 2 ? 1 : L <= 4 ? 3 : std::max(L - 1, 7u))});
         mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), {LookBehind(1), LookAhead(L - 1)}});
@@ -4083,6 +4095,10 @@ protected:
         mEmit = b.getOutputStreamBlockPtr("emit", zero);
         Function * const fn = linked(b, tableName());
         mTable = b.CreateIntToPtr(b.CreateCall(fn->getFunctionType(), fn, {}), PointerType::getUnqual(b.getContext()));
+        if (mPairCheck) {
+            Function * const pf = linked(b, tableNameFor(2));
+            mPairs = b.CreateIntToPtr(b.CreateCall(pf->getFunctionType(), pf, {}), PointerType::getUnqual(b.getContext()));
+        }
         mLoopVarInitialValues = {};
     }
     void wordPrologueLogic(KernelBuilder &, Value *, std::vector<Value *>, std::vector<Value *> &) override {}
@@ -4100,12 +4116,13 @@ protected:
         BasicBlock * const miss = b.CreateBasicBlock("lenMiss");
         BasicBlock * const done = b.CreateBasicBlock("lenDone");
         Value * id = nullptr;
+        Value * x3 = nullptr;                       // L = 3: bytes s .. s + 2, s lowest
         if (mL == 2) {
             id = pairId(b, p);
             b.CreateLikelyCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), hit, miss);
         } else if (mL <= 4) {
             Value * x = b.CreateAlignedLoad(i32, b.CreateGEP(i8, mBytes, s), 1);
-            if (mL == 3) x = b.CreateAnd(x, b.getInt32(0xFFFFFF));
+            if (mL == 3) x3 = x = b.CreateAnd(x, b.getInt32(0xFFFFFF));
             const unsigned bits = gTailLenTab[mL].bits;
             Value * const bucket = b.CreateZExt(b.CreateLShr(b.CreateMul(x, b.getInt32(0x9E3779B1u)), b.getInt32(32 - bits)), i64);
             Value * const set = b.CreateGEP(i8, mTable, b.CreateShl(bucket, b.getInt64(6)));
@@ -4154,11 +4171,39 @@ protected:
             Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(p, 6));   // atomic: see tailLenEmit
             b.CreateAtomicRMW(AtomicRMWInst::Or, ew, b.CreateShl(b.getInt64(1), b.CreateAnd(p, b.getInt64(63))),
                               MaybeAlign(8), AtomicOrdering::Monotonic);
+            b.CreateBr(done);
+        } else if (mPairCheck) {                    // two or three tokens, from the pair rules
+            Value * const x = b.CreateZExt(x3, i64);
+            Value * const c0 = b.CreateAnd(x, b.getInt64(0xFF));
+            Value * const c1 = b.CreateAnd(b.CreateLShr(x, b.getInt64(8)), b.getInt64(0xFF));
+            Value * const c2 = b.CreateLShr(x, b.getInt64(16));
+            Value * const idL = b.CreateLoad(i16, b.CreateGEP(i16, mPairs, b.CreateOr(b.CreateShl(c0, b.getInt64(8)), c1)));
+            Value * const idR = b.CreateLoad(i16, b.CreateGEP(i16, mPairs, b.CreateOr(b.CreateShl(c1, b.getInt64(8)), c2)));
+            Value * const none = b.CreateICmpEQ(b.CreateAnd(idL, idR), b.getInt16(0xFFFF));
+            Value * const left = b.CreateICmpULE(idL, idR);           // (a, b) merges; 0xFFFF: no rule
+            // a b c: the token at s or s + 1 (none: rewrite s + 1's base id); emit bits at s + 1,
+            // s + 2: none 11, left (ab c) 10, right (a bc) 01.
+            Value * const q = b.CreateAdd(s, b.getInt64(1));
+            Value * const at = b.CreateSelect(b.CreateAnd(left, b.CreateNot(none)), s, q);
+            Value * const rp = b.CreateGEP(i16, mRes, at);
+            Value * const id3 = b.CreateSelect(none, b.CreateLoad(i16, rp), b.CreateSelect(left, idL, idR));
+            b.CreateStore(id3, rp);
+            Value * const m = b.CreateSelect(none, b.getInt64(3), b.CreateSelect(left, b.getInt64(2), b.getInt64(1)));
+            Value * const ew = b.CreateGEP(i64, mEmit, b.CreateLShr(q, b.getInt64(6)));   // atomic: see tailLenEmit
+            Value * const off = b.CreateAnd(q, b.getInt64(63));
+            b.CreateAtomicRMW(AtomicRMWInst::Or, ew, b.CreateShl(m, off), MaybeAlign(8), AtomicOrdering::Monotonic);
+            BasicBlock * const straddle = b.CreateBasicBlock("len3Straddle");
+            b.CreateUnlikelyCondBr(b.CreateAnd(b.CreateICmpEQ(off, b.getInt64(63)), b.CreateICmpUGE(m, b.getInt64(2))),
+                                   straddle, done);
+            b.SetInsertPoint(straddle);         // s + 2 in the next word
+            b.CreateAtomicRMW(AtomicRMWInst::Or, b.CreateGEP(i64, ew, b.getInt64(1)), b.getInt64(1), MaybeAlign(8),
+                              AtomicOrdering::Monotonic);
+            b.CreateBr(done);
         } else {
             Function * const fn = linked(b, "bpe_len_miss");
             b.CreateCall(fn->getFunctionType(), fn, {mBytes, mRes, mEmit, s, b.getInt64(mL), b.CreateAdd(mN, b.getInt64(mL - 1))});
+            b.CreateBr(done);
         }
-        b.CreateBr(done);
         b.SetInsertPoint(done);
     }
     void finalize(KernelBuilder & b, std::vector<Value *> &) override {
@@ -4173,6 +4218,8 @@ public:
     static std::string tableNameFor(unsigned L) { return "bpe_len" + std::to_string(L) + "_table"; }
 protected:
     const unsigned mL;
+    const bool mPairCheck;                          // --len3-pair-check
+    Value * mPairs = nullptr;                       // --len3-pair-check: the pair table
     Value * mN = nullptr, * mBase = nullptr;
     Value * mBytes = nullptr, * mRes = nullptr, * mEmit = nullptr, * mTable = nullptr;
 };
@@ -4246,6 +4293,7 @@ static void tailLenBuildTables(unsigned N) {
                 }
                 dropped += w == ways;
             }
+            tab.dropped = dropped;
             totalKB += tab.buckets.size() * 64 / 1024;
             totalDropped += dropped;
             std::cerr << (L == 3 ? "; L:tokens/KB/left out " : " ") << L << ":" << toks.size() << "/"
@@ -4444,6 +4492,7 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
                                   reinterpret_cast<void *>(kTailLenTables[L]));
                     P.LinkFunction(kL, "bpe_len_miss", bpe_len_miss);
                     P.LinkFunction(kL, "bpe_len_flush", bpe_len_flush);
+                    if (L == 3 && tailLen3PairCheck()) P.LinkFunction(kL, BPELenScanKernel::tableNameFor(2), tailLenTable2);
                 }
                 res = resL;
                 emit = emitL;

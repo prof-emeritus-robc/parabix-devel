@@ -2197,6 +2197,15 @@ static bool byteRunCuts() { return ByteRunCuts && TailScanKernel; }
 static cl::opt<unsigned> LenScan("len-scan", cl::desc("With --tail-scan-kernel: resolve the pieces of 2 .. N "
     "bytes in kernels of their own, BPE_len<L>_pretokenScan (N = 2 .. 15; 0 = off, the default)."), cl::init(0));
 static bool lenScan() { return LenScan >= 2 && TailScanKernel; }
+// --len-hash-search=N (with --len-scan): for each length table, try up to N bucket-hash multipliers
+// at the size of the load asked for (BPE_LEN_LOAD, 0.5), then at twice the size, and so on, until
+// one leaves no bucket over full, so the table holds every token. A multiplier fails at its first
+// full bucket, so most tries are short, and a size whose expected tries (from 8 multipliers' counts of
+// over full buckets) exceed N is skipped. GPT-2: 4096 builds 3.7 MB of tables in 34 ms (1M: 2.9 MB,
+// 348 ms; no search: 2.0 MB with 470 tokens left out); no difference in speed on the test files,
+// where the left-out tokens are under 0.2% of the 5..15-byte pieces. 0: the fixed multipliers.
+static cl::opt<unsigned> LenHashSearch("len-hash-search", cl::desc("With --len-scan: try up to N multipliers "
+    "per table size so that every token fits its bucket (default 4096; 0 = the fixed multiplier)."), cl::init(4096));
 // --len3-pair-check (with --len-scan=3 or more): the BPE of a 3-byte piece a b c missing from the
 // length-3 table, in generated code from the pair table (gTailPairBytes) instead of bpe_len_miss.
 // The table holds every 3-byte token whose BPE is itself, so a miss is two or three tokens: no rule
@@ -3939,13 +3948,15 @@ protected:
 static std::vector<uint16_t> gTailPairBytes;
 // --len-scan, L = 3 .. 15: the L-byte tokens whose BPE is themselves, by key (byte 0 lowest; a NUL
 // is in no token, so a key is never 0), in 64-byte buckets, 2^bits of them per length:
-//   L = 3, 4:   8 u32 keys, 8 ids;                 bucket (key * 0x9E3779B1) >> (32 - bits)
-//   L = 5 .. 8: 6 u64 keys, 6 ids;                 bucket (key * kTailLenM) >> (64 - bits)
+//   L = 3, 4:   8 u32 keys, 8 ids;                 bucket (key * mult) >> (32 - bits), mult 32 bits
+//   L = 5 .. 8: 6 u64 keys, 6 ids;                 bucket (key * mult) >> (64 - bits)
 //   L > 8:      3 keys k0 (bytes 0..7), k1 (bytes 8..L-1), 3 ids;
-//               bucket ((k0 ^ k1 * kTailLenM1) * kTailLenM) >> (64 - bits)
-// A token whose bucket is full is left out (a lookup then misses, and the miss path gives the
-// same tokens).
+//               bucket ((k0 ^ k1 * kTailLenM1) * mult) >> (64 - bits)
+// mult is searched per length (--len-hash-search) so that no bucket overflows; with no search, the
+// fixed multipliers (kLenMult32, kTailLenM), and a token whose bucket is full is left out (a lookup
+// then misses, and the miss path gives the same tokens). bits and mult are in the kernels' names.
 static constexpr uint64_t kTailLenM = 0x9E3779B97F4A7C15ull, kTailLenM1 = 0xC2B2AE3D27D4EB4Full;
+static constexpr uint32_t kLenMult32 = 0x9E3779B1u;
 struct alignas(64) TailLenBucket {
     uint32_t key[8];                         // 0: empty
     uint16_t id[8];
@@ -3968,8 +3979,17 @@ struct TailLenTable {
     std::vector<TailLenBucket> buckets;      // the 64-byte buckets, in L's format
     unsigned bits = 0;
     unsigned dropped = 0;                    // the tokens left out (bucket full)
+    uint64_t mult = 0;                       // the bucket hash's multiplier (L <= 4: 32 bits)
 };
 static TailLenTable gTailLenTab[kTailLenMax + 1];   // [3 .. kTailLenMax]
+// The name tag of length L's table: its bits, and its multiplier when not the fixed one.
+static std::string lenTableTag(unsigned L) {
+    const TailLenTable & t = gTailLenTab[L];
+    const uint64_t fixed = L <= 4 ? kLenMult32 : kTailLenM;
+    char buf[24] = "";
+    if (t.mult != fixed) std::snprintf(buf, sizeof(buf), "m%llx", (unsigned long long) t.mult);
+    return "_b" + std::to_string(t.bits) + buf;
+}
 static uint64_t tailLenTable2() { return reinterpret_cast<uint64_t>(gTailPairBytes.data()); }
 static bool tailLen3PairCheck() { return Len3PairCheck && gTailLenTab[3].dropped == 0; }
 static bool tailLen4PairCheck() {
@@ -4110,8 +4130,9 @@ public:
     BPELenScanKernel(LLVMTypeSystemInterface & ts, unsigned L, StreamSet * starts,
                      StreamSet * bytes, StreamSet * resIn, StreamSet * emitIn, StreamSet * res, StreamSet * emit)
     : TwoLevelScanKernel(ts, "BPE_len" + std::to_string(L) + "_pretokenScan"
-                             + (L >= 3 ? "_b" + std::to_string(gTailLenTab[L].bits) : std::string())
+                             + (L >= 3 ? lenTableTag(L) : std::string())
                              + ((L == 3 && tailLen3PairCheck()) || (L == 4 && tailLen4PairCheck()) ? "_pc" : "")
+                             + (L == 4 && tailLen4PairCheck() ? "_t3" + lenTableTag(3) : std::string())
                              + "_of" + std::to_string(starts->getNumElements()),
                          64, "starts", {}, int(L - 2))
     , mL(L), mPairCheck((L == 3 && tailLen3PairCheck()) || (L == 4 && tailLen4PairCheck())) {
@@ -4156,11 +4177,12 @@ protected:
         Value * const b1 = b.CreateZExt(b.CreateLoad(i8, b.CreateGEP(i8, mBytes, p)), i64);
         return b.CreateLoad(i16, b.CreateGEP(i16, mTable, b.CreateOr(b.CreateShl(b0, 8), b1)));
     }
-    // L = 3, 4: the bucket of the u32 key x in table (2^bits buckets), its 8 keys compared at once:
+    // L = 3, 4: the bucket of the u32 key x in length L's table, its 8 keys compared at once:
     // the way of x (8: none) and the id stored in that way (in the padding for way 8).
-    std::pair<Value *, Value *> probe32(KernelBuilder & b, Value * table, unsigned bits, Value * x) {
+    std::pair<Value *, Value *> probe32(KernelBuilder & b, Value * table, unsigned L, Value * x) {
         Type * const i8 = b.getInt8Ty(), * const i16 = b.getInt16Ty(), * const i32 = b.getInt32Ty(), * const i64 = b.getInt64Ty();
-        Value * const bucket = b.CreateZExt(b.CreateLShr(b.CreateMul(x, b.getInt32(0x9E3779B1u)), b.getInt32(32 - bits)), i64);
+        const TailLenTable & t = gTailLenTab[L];
+        Value * const bucket = b.CreateZExt(b.CreateLShr(b.CreateMul(x, b.getInt32(uint32_t(t.mult))), b.getInt32(32 - t.bits)), i64);
         Value * const set = b.CreateGEP(i8, table, b.CreateShl(bucket, b.getInt64(6)));
         FixedVectorType * const v8 = FixedVectorType::get(i32, 8);
         Value * const keys = b.CreateAlignedLoad(v8, set, 32);
@@ -4187,7 +4209,7 @@ protected:
             if (mL == 3) x = b.CreateAnd(x, b.getInt32(0xFFFFFF));
             xk = x;
             Value * way = nullptr;
-            std::tie(way, id) = probe32(b, mTable, gTailLenTab[mL].bits, x);
+            std::tie(way, id) = probe32(b, mTable, mL, x);
             b.CreateLikelyCondBr(b.CreateICmpULT(way, b.getInt32(8)), hit, miss);
         } else {                                    // u64 keys (L <= 8) or k0, k1 pairs
             const unsigned bits = gTailLenTab[mL].bits;
@@ -4196,13 +4218,13 @@ protected:
             Value * h = nullptr, * splat = nullptr;
             if (mL <= 8) {
                 Value * const key = mL == 8 ? k0 : b.CreateAnd(k0, b.getInt64((uint64_t(1) << (8 * mL)) - 1));
-                h = b.CreateMul(key, b.getInt64(kTailLenM));
+                h = b.CreateMul(key, b.getInt64(gTailLenTab[mL].mult));
                 splat = b.CreateVectorSplat(8, key);
             } else {
                 // bytes p - 7 .. p (p - 7 > s): the key's last L - 8 bytes at the top
                 Value * const top = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(7))), 1);
                 Value * const k1 = b.CreateLShr(top, b.getInt64(8 * (16 - mL)));
-                h = b.CreateMul(b.CreateXor(k0, b.CreateMul(k1, b.getInt64(kTailLenM1))), b.getInt64(kTailLenM));
+                h = b.CreateMul(b.CreateXor(k0, b.CreateMul(k1, b.getInt64(kTailLenM1))), b.getInt64(gTailLenTab[mL].mult));
                 Value * v = UndefValue::get(FixedVectorType::get(i64, 8));
                 for (unsigned i = 0; i < 8; i++) v = b.CreateInsertElement(v, i % 2 ? k1 : k0, b.getInt32(i));
                 splat = v;
@@ -4262,9 +4284,8 @@ protected:
             Value * pr[3];
             for (unsigned i = 0; i < 3; i++)
                 pr[i] = b.CreateLoad(i16, b.CreateGEP(i16, mPairs, b.CreateOr(b.CreateShl(c[i], b.getInt64(8)), c[i + 1])));
-            const unsigned bits3 = gTailLenTab[3].bits;
             auto token3 = [&](Value * k) {          // the id of a 3-byte token whose BPE is itself, or 0xFFFF
-                auto [way, id3] = probe32(b, mTable3, bits3, k);
+                auto [way, id3] = probe32(b, mTable3, 3, k);
                 return b.CreateSelect(b.CreateICmpULT(way, b.getInt32(8)), id3, b.getInt16(0xFFFF));
             };
             Value * const tABC = token3(b.CreateAnd(xk, b.getInt32(0xFFFFFF)));
@@ -4358,7 +4379,8 @@ static void tailLenBuildTables(unsigned N) {
         const char * const loadEnv = std::getenv("BPE_LEN_LOAD");
         const double load = loadEnv ? std::atof(loadEnv) : 0.5;
         size_t totalKB = 0;
-        unsigned totalDropped = 0;
+        unsigned totalDropped = 0, totalTries = 0;
+        const auto t0 = std::chrono::steady_clock::now();
         for (unsigned L = 3; L <= N; L++) {
             struct Tok { uint64_t k0, k1; uint16_t id; };
             std::vector<Tok> toks;
@@ -4378,23 +4400,73 @@ static void tailLenBuildTables(unsigned N) {
             const unsigned ways = tailLenWays(L);
             TailLenTable & tab = gTailLenTab[L];
             tab.bits = std::max(4u, unsigned(ceil_log2(size_t(std::ceil(toks.size() / (ways * load))))));
+            // the value multiplied: the u32 key (L <= 4), the u64 key, or k0 ^ k1 * kTailLenM1
+            std::vector<uint64_t> pre(toks.size());
+            for (size_t i = 0; i < toks.size(); i++)
+                pre[i] = L <= 4 ? uint32_t(toks[i].k0) : L <= 8 ? toks[i].k0 : toks[i].k0 ^ (toks[i].k1 * kTailLenM1);
+            auto bucketOf = [&](uint64_t v, uint64_t mult) -> size_t {
+                return L <= 4 ? size_t(uint32_t(uint32_t(v) * uint32_t(mult)) >> (32 - tab.bits))
+                              : size_t((v * mult) >> (64 - tab.bits));
+            };
+            const uint64_t fixed = L <= 4 ? kLenMult32 : kTailLenM;
+            tab.mult = fixed;
+            // --len-hash-search: the first multiplier with no full bucket, of up to LenHashSearch tried at
+            // each size (the fixed one first, then a splitmix64 sequence), from the size of the load
+            // asked for up; with no search, the fixed one (the length-4 table grown until complete
+            // for --len4-pair-check).
+            if (LenHashSearch) {
+                std::vector<uint8_t> fill;
+                uint64_t seed = 0x5DEECE66Dull * L;
+                auto nextMult = [&] {
+                    uint64_t z = (seed += 0x9E3779B97F4A7C15ull);
+                    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+                    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+                    z = (z ^ (z >> 31)) | 1;
+                    return L <= 4 ? uint64_t(uint32_t(z) | 1) : z;
+                };
+                for (bool found = false; !found && tab.bits < 20; tab.bits += !found) {
+                    fill.assign(size_t(1) << tab.bits, 0);
+                    // A size is searched only if the expected tries are within the budget: e^lambda,
+                    // lambda the mean number of over full buckets of 8 multipliers.
+                    double lambda = 0;
+                    for (unsigned t = 0; t < 8; t++) {
+                        const uint64_t m = t ? nextMult() : fixed;
+                        unsigned over = 0;
+                        for (uint64_t v : pre) over += ++fill[bucketOf(v, m)] == ways + 1;
+                        for (uint64_t v : pre) fill[bucketOf(v, m)] = 0;
+                        lambda += over / 8.0;
+                        totalTries++;
+                        if (over == 0) { found = true; tab.mult = m; break; }
+                    }
+                    if (found || lambda > std::log(double(LenHashSearch)) + 2) continue;
+                    for (unsigned t = 0; t < LenHashSearch && !found; t++) {
+                        const uint64_t m = nextMult();
+                        size_t i = 0;
+                        for (; i < pre.size(); i++)
+                            if (++fill[bucketOf(pre[i], m)] > ways) break;
+                        totalTries++;
+                        if (i == pre.size()) { found = true; tab.mult = m; break; }
+                        for (size_t j = 0; j <= i; j++) fill[bucketOf(pre[j], m)] = 0;   // undo the try
+                    }
+                }
+            }
             unsigned dropped = 0;
             for (;;) {                                                   // grown for --len4-pair-check
                 tab.buckets.assign(size_t(1) << tab.bits, TailLenBucket{});
                 dropped = 0;
-                for (const Tok & tk : toks) {                                // in rank order
+                for (size_t i = 0; i < toks.size(); i++) {                    // in rank order
+                    const Tok & tk = toks[i];
                     unsigned w = 0;
                     if (L <= 4) {
-                        TailLenBucket & bk = tab.buckets[uint32_t(uint32_t(tk.k0) * 0x9E3779B1u) >> (32 - tab.bits)];
+                        TailLenBucket & bk = tab.buckets[bucketOf(pre[i], tab.mult)];
                         while (w < ways && bk.key[w] != 0) w++;
                         if (w < ways) { bk.key[w] = uint32_t(tk.k0); bk.id[w] = tk.id; }
                     } else if (L <= 8) {
-                        auto & bk = reinterpret_cast<TailLenBucket64 &>(tab.buckets[(tk.k0 * kTailLenM) >> (64 - tab.bits)]);
+                        auto & bk = reinterpret_cast<TailLenBucket64 &>(tab.buckets[bucketOf(pre[i], tab.mult)]);
                         while (w < ways && bk.key[w] != 0) w++;
                         if (w < ways) { bk.key[w] = tk.k0; bk.id[w] = tk.id; }
                     } else {
-                        const uint64_t h = (tk.k0 ^ (tk.k1 * kTailLenM1)) * kTailLenM;
-                        auto & bk = reinterpret_cast<TailLenBucket128 &>(tab.buckets[h >> (64 - tab.bits)]);
+                        auto & bk = reinterpret_cast<TailLenBucket128 &>(tab.buckets[bucketOf(pre[i], tab.mult)]);
                         while (w < ways && bk.key[2 * w] != 0) w++;
                         if (w < ways) { bk.key[2 * w] = tk.k0; bk.key[2 * w + 1] = tk.k1; bk.id[w] = tk.id; }
                     }
@@ -4410,6 +4482,9 @@ static void tailLenBuildTables(unsigned N) {
                       << (tab.buckets.size() * 64 / 1024) << "/" << dropped;
         }
         std::cerr << "; " << totalKB << " KB, " << totalDropped << " left out (load " << load << ")";
+        if (LenHashSearch)
+            std::cerr << "; " << totalTries << " multipliers tried in "
+                      << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() << " ms";
     }
     std::cerr << "\n";
 }

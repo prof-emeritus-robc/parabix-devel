@@ -4041,12 +4041,15 @@ extern "C" void bpe_len_miss(const uint8_t * bytes, uint16_t * res, uint64_t * e
 // them written by the kernels before this one, and no kernel after it has read them yet; so there
 // is no edge case. (The final call's last pieces are marked only when they end in the input, see
 // BPELenSelectKernel.) L = 2: one load from the direct pair table; a rule gives res[s] its id, no
-// rule sets emit at s + 1. L = 3, 4: the key from one 4-byte load ending at s + L - 1, its bucket's
-// 8 keys compared at once; L = 5 .. 8: one 8-byte load, 6 keys; L > 8: two 8-byte loads, 3 key
-// pairs. A hit gives res[s] the token's id, a miss calls bpe_len_miss. res and emit are updated
-// in place (InOut), after the general scan; emit by atomic or (tailLenEmit); LookBehind(1) on resIn
-// keeps it out of a thread-local buffer (an LLVM register allocator crash otherwise, as for
-// --tail-unit-seed).
+// rule sets emit at s + 1. L = 3, 4: the key from one 4-byte load at s (L = 3: its low 3 bytes), its
+// bucket's 8 keys compared at once; L = 5 .. 8: one 8-byte load at s, its low L bytes, 6 keys;
+// L > 8: 8-byte loads at s and ending at s + L - 1, 3 key pairs. No load reads before s: the
+// source buffer has nothing before the input's first byte (a piece of fewer than 8 bytes at the
+// start of a page aligned buffer read the unmapped page before it). The loads past s + L - 1 are
+// in the bytes' LookAhead. A hit gives res[s] the token's id, a miss calls bpe_len_miss. res and
+// emit are updated in place (InOut), after the general scan; emit by atomic or (tailLenEmit);
+// LookBehind(1) on resIn keeps it out of a thread-local buffer (an LLVM register allocator crash
+// otherwise, as for --tail-unit-seed).
 class BPELenScanKernel final : public TwoLevelScanKernel {
 public:
     BPELenScanKernel(LLVMTypeSystemInterface & ts, unsigned L, StreamSet * starts,
@@ -4057,7 +4060,7 @@ public:
                          64, "starts", {}, int(L - 2))
     , mL(L) {
         mInputStreamSets.push_back(Binding{"starts", starts, FixedRate(1), Principal()});
-        mInputStreamSets.push_back(Binding{"bytes", bytes, FixedRate(1), {LookBehind(7), LookAhead(L - 1)}});
+        mInputStreamSets.push_back(Binding{"bytes", bytes, FixedRate(1), LookAhead(L == 2 ? 1 : L <= 4 ? 3 : std::max(L - 1, 7u))});
         mInputStreamSets.push_back(Binding{"resIn", resIn, FixedRate(1), {LookBehind(1), LookAhead(L - 1)}});
         mInputStreamSets.push_back(Binding{"emitIn", emitIn, FixedRate(1), LookAhead(L - 1)});
         mOutputStreamSets.push_back(Binding{"res", res, FixedRate(1), InOut("resIn")});
@@ -4101,8 +4104,8 @@ protected:
             id = pairId(b, p);
             b.CreateLikelyCondBr(b.CreateICmpNE(id, b.getInt16(0xFFFF)), hit, miss);
         } else if (mL <= 4) {
-            Value * x = b.CreateAlignedLoad(i32, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(3))), 1);
-            if (mL == 3) x = b.CreateLShr(x, b.getInt32(8));
+            Value * x = b.CreateAlignedLoad(i32, b.CreateGEP(i8, mBytes, s), 1);
+            if (mL == 3) x = b.CreateAnd(x, b.getInt32(0xFFFFFF));
             const unsigned bits = gTailLenTab[mL].bits;
             Value * const bucket = b.CreateZExt(b.CreateLShr(b.CreateMul(x, b.getInt32(0x9E3779B1u)), b.getInt32(32 - bits)), i64);
             Value * const set = b.CreateGEP(i8, mTable, b.CreateShl(bucket, b.getInt64(6)));
@@ -4115,15 +4118,16 @@ protected:
             b.CreateLikelyCondBr(b.CreateICmpULT(way, b.getInt32(8)), hit, miss);
         } else {                                    // u64 keys (L <= 8) or k0, k1 pairs
             const unsigned bits = gTailLenTab[mL].bits;
-            // bytes e - 7 .. e: the key's last min(L, 8) bytes at the top
-            Value * const top = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(7))), 1);
+            // bytes s .. s + 7: the key's first 8 bytes (L <= 8: its low L bytes are the key)
+            Value * const k0 = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, s), 1);
             Value * h = nullptr, * splat = nullptr;
             if (mL <= 8) {
-                Value * const key = b.CreateLShr(top, b.getInt64(8 * (8 - mL)));
+                Value * const key = mL == 8 ? k0 : b.CreateAnd(k0, b.getInt64((uint64_t(1) << (8 * mL)) - 1));
                 h = b.CreateMul(key, b.getInt64(kTailLenM));
                 splat = b.CreateVectorSplat(8, key);
             } else {
-                Value * const k0 = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, s), 1);
+                // bytes p - 7 .. p (p - 7 > s): the key's last L - 8 bytes at the top
+                Value * const top = b.CreateAlignedLoad(i64, b.CreateGEP(i8, mBytes, b.CreateSub(p, b.getInt64(7))), 1);
                 Value * const k1 = b.CreateLShr(top, b.getInt64(8 * (16 - mL)));
                 h = b.CreateMul(b.CreateXor(k0, b.CreateMul(k1, b.getInt64(kTailLenM1))), b.getInt64(kTailLenM));
                 Value * v = UndefValue::get(FixedVectorType::get(i64, 8));

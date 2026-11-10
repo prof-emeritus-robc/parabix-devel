@@ -568,6 +568,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
     //        compare_bpe.py step 1; 0x0A bytes mark separators).
     StreamSet * bpeBasis;
     StreamSet * bpeBoundary = nullptr;   // pretoken-start mask fed to BPE (gates merges)
+    StreamSet * cutClassSet = nullptr;   // the pretokenizer's classes with the cut classes (--cut-classes)
     if (PreTokenizer.getNumOccurrences() == 0) {
         // No pretokenizer. By default treat '\n' as real content — it seeds to
         // id 198 (GPT-2 'Ċ') and flows through the merges, matching HuggingFace
@@ -578,7 +579,11 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
     } else if (compressClasses) {
         bpeBasis    = normalizedBasis;
         gPretokDumpSource = ByteStream;
-        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode, PretokByteDomain, PretokUTF8Classes);
+        // --cut-classes: the BPE cut classes compiled with the pretokenizer's classes
+        const std::vector<re::CC *> cutCCs = PretokClassCode && PretokByteDomain && PretokUTF8Classes
+                                           ? bpeCutClassCCs(bpe) : std::vector<re::CC *>{};
+        bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode, PretokByteDomain, PretokUTF8Classes,
+                                              cutCCs, &cutClassSet);
     } else if (PreTokenizer == bytelevel) {
         // Boundary-gated BPE: the GPT-2 bytelevel pretokenizer's job here is only to
         // mark pretoken STARTS. Feed BPE the RAW bytes (BPEBaseIdKernel does bytes_to_unicode
@@ -677,7 +682,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
                 bpeBytes = P.CreateStreamSet(1, 8);
                 P.CreateKernelCall<P2SKernel>(bpeBasis, bpeBytes);
             }
-            buildBPEByteTailEmitter(P, bpeBytes, bpeBasis, tr.segStarts);
+            buildBPEByteTailEmitter(P, bpeBytes, bpeBasis, tr.segStarts, cutClassSet);
         } else {
             buildBPETailEmitter(P, vocabID, matchEnd, tr.segStarts);
         }

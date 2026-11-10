@@ -1200,12 +1200,13 @@ static PabloAST * gpt2ByteBoundaryRules(PabloBuilder & pb, const std::vector<Pab
 // is Lookahead(any, k) & ~space(Lookahead(F, k)), so a trailing whitespace run is not split.
 // any is only read there, where the lookahead lands on a first byte or on the EOF position:
 // from UTF8_Decoder, continuation bytes hold codepoint 0, so any is 1 at them too, and first
-// comes from the basis. Valid UTF-8 assumed (as for HF, which takes a decoded string).
+// comes from the basis. Valid UTF-8 assumed (as for HF, which takes a decoded string). Only the
+// first 5 classes are read; more (the BPE cut classes) may follow, and their number is in the name.
 class GPT2ByteBoundaryLAKernel final : public PabloKernel {
 public:
     GPT2ByteBoundaryLAKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * classes,
                              StreamSet * boundary)
-    : PabloKernel(ts, "GPT2ByteBoundaryLA",
+    : PabloKernel(ts, "GPT2ByteBoundaryLA" + (classes->getNumElements() == 5 ? std::string() : "_c" + std::to_string(classes->getNumElements())),
                   {Binding{"basis", basis, FixedRate(), LookAhead(1)},
                    Binding{"classes", classes, FixedRate(), LookAhead(4)}},
                   {Binding{"boundary", boundary}}) {}
@@ -1266,7 +1267,7 @@ protected:
 StreamSet * gPretokDumpSource = nullptr;
 
 StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, bool classCode, bool byteDomain,
-                                    bool utf8Classes) {
+                                    bool utf8Classes, const std::vector<re::CC *> & extraCCs, StreamSet ** classesOut) {
     auto propCC = [](const char * name) {
         auto * pe = re::makePropertyExpression(PropertyExpression::Kind::Codepoint, name);
         pe = cast<re::PropertyExpression>(UCD::linkAndResolve(pe));
@@ -1298,7 +1299,9 @@ StreamSet * buildGPT2ByteBoundaries(PipelineBuilder & P, StreamSet * BasisBits, 
     if (byteDomain && classCode) {   // --pretok-byte-domain
         // the classes at each codepoint's first byte, plus "any" (see GPT2ByteBoundaryLAKernel)
         ccs.push_back(re::makeCC((codepoint_t)0, (codepoint_t)0x10FFFF));
+        if (utf8Classes) ccs.insert(ccs.end(), extraCCs.begin(), extraCCs.end());
         StreamSet * classes = P.CreateStreamSet(ccs.size(), 1);
+        if (utf8Classes && classesOut && !extraCCs.empty()) *classesOut = classes;
         if (utf8Classes) {
             // --pretok-utf8-classes: the classes compiled to UTF-8 byte sequences, with no UTF8_Decoder
             P.CreateKernelCall<CharClassesKernel>(ccs, BasisBits, classes, pablo::BitMovementMode::LookAhead);

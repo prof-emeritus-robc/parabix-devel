@@ -881,6 +881,11 @@ protected:
 // doubling; inRun = OR of Advance(run, k), k = 0 .. N-1: the bytes of the runs of N or more.
 // A hard self-pair byte c (no token holds c c) has a safe cut between any two copies, so
 // --byte-run-cuts cuts there inside such runs: every interior byte is a unit.
+// The input's first position. The pretoken starts are never at a continuation byte, so an input
+// that begins with one has no start there, and the pieces would begin after its first bytes.
+static PabloAST * bpeInputStart(PabloBuilder & pb) {
+    return pb.createNot(pb.createAdvance(pb.createOnes(), 1));
+}
 static PabloAST * bpeRunStarts(PabloBuilder & pb, const std::vector<PabloAST *> & basis, unsigned N) {
     PabloAST * diff = pb.createZeroes();
     for (PabloAST * b : basis) {
@@ -1059,7 +1064,8 @@ protected:
             cc::Parabix_CC_Compiler_Builder cccNext(next);
             Fnext = cccNext.compileCC(frozenCC, pb);
         }
-        PabloAST * cuts = pb.createOr(segs, pb.createOr(F, pb.createAdvance(F, 1)));
+        // segs, frozen bytes, and the input's first byte (not a pretoken start if it is a continuation byte)
+        PabloAST * cuts = pb.createOr(pb.createOr(segs, bpeInputStart(pb)), pb.createOr(F, pb.createAdvance(F, 1)));
         // cuts at p + 1: segs or F there, or F at p (which cuts after itself)
         PabloAST * cutsNext = mCutsOnly ? nullptr : pb.createOr(pb.createLookahead(segs, 1), pb.createOr(Fnext, F));
         if (mRuns.cutN) {                          // hard self-pair cuts inside runs >= cutN (bpeHardRunCuts)
@@ -1098,6 +1104,23 @@ template <typename Pred> static re::CC * bpeByteClass(Pred pred) {
     }
     return cc;
 }
+// The UTF-8 leads L with active[L], in groups of one to three that each get an If (GPT-2's leads by
+// how often they occur in text); the leads of another vocabulary not listed here each alone.
+static std::vector<std::vector<uint8_t>> bpeLeadGroups(const std::array<bool, 256> & active) {
+    static const std::vector<std::vector<uint8_t>> kGroups = {
+        {0xC2}, {0xC3}, {0xC4, 0xC5}, {0xCB, 0xCC}, {0xCE, 0xCF}, {0xD0, 0xD1}, {0xD6, 0xD7}, {0xD8, 0xD9},
+        {0xE0}, {0xE1}, {0xE2}, {0xE3, 0xE4}, {0xE5, 0xE6}, {0xE7, 0xE8}, {0xE9}, {0xEB, 0xEC}, {0xED, 0xEE, 0xEF}, {0xF0}};
+    std::vector<std::vector<uint8_t>> groups;
+    std::array<bool, 256> grouped{};
+    for (const auto & g : kGroups) {
+        std::vector<uint8_t> act;
+        for (uint8_t L : g) if (active[L]) { act.push_back(L); grouped[L] = true; }
+        if (!act.empty()) groups.push_back(act);
+    }
+    for (unsigned L = 0xC0; L < 0xF8; L++)
+        if (active[L] && !grouped[L]) groups.push_back({uint8_t(L)});
+    return groups;
+}
 // mode 3. For each UTF-8 lead byte L in some pair inside a token (the others are frozen and
 // cut already), at a position p holding L: a cut before p if no token holds (byte p - 1, L),
 // a cut before p + 1 if none holds (L, byte p + 1), and (e280, L = E2) a cut before p + 2 if
@@ -1116,18 +1139,7 @@ static PabloAST * bpeLeadKeyedCuts(PabloBuilder & pb, const BPEShiftedBasis & B,
     cc::Parabix_CC_Compiler_Builder curC(B.cur), prevC(B.prev), nextC(B.next);
     std::array<bool, 256> active{};
     for (uint16_t k : inside) active[k >> 8] = active[k & 0xFF] = true;
-    static const std::vector<std::vector<uint8_t>> kGroups = {
-        {0xC2}, {0xC3}, {0xC4, 0xC5}, {0xCB, 0xCC}, {0xCE, 0xCF}, {0xD0, 0xD1}, {0xD6, 0xD7}, {0xD8, 0xD9},
-        {0xE0}, {0xE1}, {0xE2}, {0xE3, 0xE4}, {0xE5, 0xE6}, {0xE7, 0xE8}, {0xE9}, {0xEB, 0xEC}, {0xED, 0xEE, 0xEF}, {0xF0}};
-    std::vector<std::vector<uint8_t>> groups;
-    std::array<bool, 256> grouped{};
-    for (const auto & g : kGroups) {
-        std::vector<uint8_t> act;
-        for (uint8_t L : g) if (active[L]) { act.push_back(L); grouped[L] = true; }
-        if (!act.empty()) groups.push_back(act);
-    }
-    for (unsigned L = 0xC0; L < 0xF8; L++)    // a lead of another vocabulary, not in kGroups
-        if (active[L] && !grouped[L]) groups.push_back({uint8_t(L)});
+    const std::vector<std::vector<uint8_t>> groups = bpeLeadGroups(active);
     PabloAST * const zero = pb.createZeroes();
     Var * const before = pb.createVar("leadCutBefore", zero);
     Var * const after = pb.createVar("leadCutAfter", zero);
@@ -1166,7 +1178,7 @@ static PabloAST * bpeLeadKeyedCuts(PabloBuilder & pb, const BPEShiftedBasis & B,
     return cuts;
 }
 
-// --pair-cuts: pairCuts[p] = 1 where no token holds bytes p - 1, p next to each other (tailHard),
+// --pair-cuts: pairCuts[p] = 1 where no token holds bytes p - 1, p next to each other (isHardPair),
 // a cut before p. The pairs inside tokens are given as x << 8 | y (x the earlier byte), ascending.
 // mode 1: every pair. With guard, the pairs of two ASCII bytes are a 14-bit class over the low
 //         7 bits of both bytes, and the pairs with a byte >= 0x80 a 16-bit class inside an If on
@@ -1229,38 +1241,132 @@ protected:
     const unsigned mE2;
 };
 
-// --combined-cuts (--len-scan with --pair-cuts=3): the cuts of BPEUnitCutsKernel (cuts only) and
-// BPEPairCutsKernel in one kernel: the segment starts, the frozen bytes (cut before and after), the
-// run cuts and the lead-keyed pair cuts, from one set of shifted basis bits (bpeShiftBasis).
+// --cut-classes: the cut classes, codepoint classes compiled with the pretokenizer's classes
+// (CharClassesKernel, BitMovementMode::LookAhead) and marked at each codepoint's first byte. They
+// are the last kCutClassCount streams of the class set. A codepoint b1 .. bn is in
+//   Before:     no token holds x b1, for every byte x: a cut before b1;
+//   BeforeCond: b1 a lead not in Before (some x with x b1 inside a token): a cut before b1 when
+//               no token holds the byte before and b1, tested in BPE_Cuts (bpeCondBeforeCuts);
+//   AfterLead:  n > 1 and no token holds b1 b2: a cut after the lead.
+// The UTF compiler confirms every byte of a codepoint, so a class is never set on ill-formed
+// input, which only loses cuts. Frozen bytes are in Before, and the frozen leads in AfterLead;
+// those that start no codepoint (C0, C1, F5-FF) are still cut from the basis. The cuts that
+// depend on a later byte of a codepoint repeat every 64 codepoints (End4 would be 245,760 ranges,
+// In3 29,697), so they are byte-pair tests in BPE_Cuts instead (bpeCodepointPairCuts).
+enum : unsigned { kCutBefore, kCutBeforeCond, kCutAfterLead, kCutClassCount };
+
+// The cuts before the leads of BeforeCond: at a lead L, a cut when no token holds the byte before
+// and L. Inside an If on the class, an If on the 2-byte leads and one on the 3- and 4-byte leads,
+// and an If per group of leads (bpeLeadGroups).
+static PabloAST * bpeCondBeforeCuts(PabloBuilder & pb, const BPEShiftedBasis & B, const std::vector<uint16_t> & inside,
+                                    PabloAST * cond) {
+    std::array<bool, 256> active{};                  // the leads L with some x L inside a token
+    for (uint16_t k : inside)
+        if ((k & 0xFF) >= 0xC0) active[k & 0xFF] = true;
+    cc::Parabix_CC_Compiler_Builder curC(B.cur), prevC(B.prev);
+    Var * const before = pb.createVar("condCutBefore", pb.createZeroes());
+    auto cb = pb.createScope();
+    for (const auto & outer : {std::pair<unsigned, unsigned>{0xC0, 0xDF}, std::pair<unsigned, unsigned>{0xE0, 0xF7}}) {
+        auto ob = cb.createScope();
+        bool any = false;
+        for (const auto & g : bpeLeadGroups(active)) {
+            if (g.front() < outer.first || g.front() > outer.second) continue;
+            any = true;
+            auto gb = ob.createScope();
+            re::CC * gcc = nullptr;
+            for (uint8_t L : g) {
+                gcc = gcc ? re::makeCC(gcc, re::makeByte(L, L)) : re::makeByte(L, L);
+                re::CC * const pre = bpeByteClass([&](unsigned x) {
+                    return !std::binary_search(inside.begin(), inside.end(), uint16_t((x << 8) | L));
+                });
+                if (pre == nullptr) continue;
+                PabloAST * const isL = curC.compileCC(re::makeByte(L, L), gb);
+                gb.createAssign(before, gb.createOr(before, gb.createAnd(isL, prevC.compileCC(pre, gb))));
+            }
+            ob.createIf(curC.compileCC(gcc, ob), gb);
+        }
+        if (any) cb.createIf(curC.compileCC(re::makeByte(outer.first, outer.second), cb), ob);
+    }
+    pb.createIf(cond, cb);
+    return pb.createAnd(before, cond);
+}
+
+// The cuts of --cut-classes that the classes leave out, from the pairs inside tokens (x << 8 | y):
+//   end: a cut before a byte that is not a continuation byte, after a byte z such that no token
+//        holds z y for any such y (the end of a codepoint that never merges with what follows:
+//        the 19 continuation bytes 81 84 8A ... BF, and the control bytes);
+//   continuation pairs: a cut between continuation bytes x y that no token holds next to each
+//        other (inside a codepoint, after its second or third byte; the cut in E2 80 y), a class
+//        over the low 6 bits of both, inside an If on "two continuation bytes in a row".
+static PabloAST * bpeCodepointPairCuts(PabloBuilder & pb, const BPEShiftedBasis & B, const std::vector<uint16_t> & inside) {
+    auto isCont = [](unsigned b) { return (b & 0xC0) == 0x80; };
+    std::array<bool, 256> joins{};                  // z y inside a token for some y not a continuation byte
+    UCD::UnicodeSet contIn;
+    for (uint16_t k : inside) {
+        const unsigned x = k >> 8, y = k & 0xFF;
+        if (!isCont(y)) joins[x] = true;
+        else if (isCont(x)) contIn.insert(((x & 0x3F) << 6) | (y & 0x3F));
+    }
+    PabloAST * const cont = pb.createAnd(B.cur[7], pb.createNot(B.cur[6]));
+    PabloAST * cuts = pb.createZeroes();
+    if (re::CC * const end = bpeByteClass([&](unsigned z) { return !joins[z]; })) {
+        PabloAST * const afterEnd = cc::Parabix_CC_Compiler_Builder(B.prev).compileCC(end, pb);
+        cuts = pb.createAnd(afterEnd, pb.createNot(cont));
+    }
+    PabloAST * const contPair = pb.createAnd(cont, pb.createAnd(B.prev[7], pb.createNot(B.prev[6])));
+    std::vector<PabloAST *> bits12(B.cur.begin(), B.cur.begin() + 6);
+    bits12.insert(bits12.end(), B.prev.begin(), B.prev.begin() + 6);
+    Var * const hard = pb.createVar("contPairCut", pb.createZeroes());
+    auto body = pb.createScope();
+    PabloAST * const in = cc::Parabix_CC_Compiler(bits12).compileCC("contPairIn", re::makeCC(std::move(contIn)), body);
+    body.createAssign(hard, body.createAnd(contPair, body.createNot(in)));
+    pb.createIf(contPair, body);
+    return pb.createOr(cuts, hard);
+}
+
 class BPECutsKernel final : public PabloKernel {
 public:
     BPECutsKernel(LLVMTypeSystemInterface & ts, StreamSet * basis, StreamSet * segs, StreamSet * cuts,
                   const std::array<uint64_t, 4> & frozen, const BPERunCutParams & runs,
-                  std::vector<uint16_t> inside, unsigned e2, const std::string & pairTag)
-    : PabloKernel(ts, "BPE_Cuts_" + bpeHexName(frozen) + (runs.cutN ? runs.tag() : "") + "_pL" + pairTag
-                      + "_e2" + std::to_string(e2),
-                  {Binding{"basis", basis, FixedRate(), LookAhead(std::max(runs.cutN, (e2 & 4) ? 2u : 1u))},
-                   Binding{"segs", segs}},
+                  std::vector<uint16_t> inside, unsigned e2, const std::string & pairTag, StreamSet * classes = nullptr)
+    : PabloKernel(ts, "BPE_Cuts_" + bpeHexName(frozen) + (runs.cutN ? runs.tag() : "")
+                      + (classes ? "_cc" + std::to_string(classes->getNumElements()) + "_p" + pairTag : "_pL" + pairTag + "_e2" + std::to_string(e2)),
+                  inputs(basis, segs, classes, std::max(runs.cutN, (!classes && (e2 & 4)) ? 2u : 1u)),
                   {Binding{"cuts", cuts}})
-    , mFrozen(frozen), mRuns(runs), mInside(std::move(inside)), mE2(e2) {}
+    , mFrozen(frozen), mRuns(runs), mInside(std::move(inside)), mE2(e2), mClasses(classes != nullptr) {}
 protected:
+    static Bindings inputs(StreamSet * basis, StreamSet * segs, StreamSet * classes, unsigned la) {
+        Bindings in{Binding{"basis", basis, FixedRate(), LookAhead(la)}, Binding{"segs", segs}};
+        if (classes) in.emplace_back("classes", classes);
+        return in;
+    }
     void generatePabloMethod() override {
         PabloBuilder pb(getEntryScope());
         const std::vector<PabloAST *> basis = getInputStreamSet("basis");
-        const BPEShiftedBasis B = bpeShiftBasis(pb, basis, (mE2 & 4) != 0);
-        PabloAST * cuts = getInputStreamSet("segs")[0];
+        const BPEShiftedBasis B = bpeShiftBasis(pb, basis, !mClasses && (mE2 & 4) != 0);
+        PabloAST * cuts = pb.createOr(getInputStreamSet("segs")[0], bpeInputStart(pb));
         if (re::CC * const frozenCC = bpeByteSetCC(mFrozen)) {      // a frozen byte is a piece of its own
             PabloAST * const F = cc::Parabix_CC_Compiler_Builder(basis).compileCC(frozenCC, pb);
             cuts = pb.createOr(cuts, pb.createOr(F, pb.createAdvance(F, 1)));
         }
         if (mRuns.cutN) cuts = pb.createOr(cuts, bpeHardRunCuts(pb, B, mRuns).first);
-        cuts = pb.createOr(cuts, bpeLeadKeyedCuts(pb, B, mInside, mE2));
+        if (mClasses) {
+            const std::vector<PabloAST *> c = getInputStreamSet("classes");
+            const unsigned o = c.size() - kCutClassCount;
+            cuts = pb.createOr(cuts, c[o + kCutBefore]);
+            cuts = pb.createOr(cuts, bpeCondBeforeCuts(pb, B, mInside, c[o + kCutBeforeCond]));
+            cuts = pb.createOr(cuts, pb.createAdvance(c[o + kCutAfterLead], 1));
+            cuts = pb.createOr(cuts, bpeCodepointPairCuts(pb, B, mInside));
+        } else {
+            cuts = pb.createOr(cuts, bpeLeadKeyedCuts(pb, B, mInside, mE2));
+        }
         writeOutputStreamSet("cuts", std::vector<PabloAST *>{pb.createInFile(cuts)});
     }
     const std::array<uint64_t, 4> mFrozen;
     const BPERunCutParams mRuns;
     const std::vector<uint16_t> mInside;
     const unsigned mE2;
+    const bool mClasses;
 };
 
 // BPEWidenKernel — copy an N-bit id stream into a wider one, zero-filling the high
@@ -2205,7 +2311,7 @@ static cl::opt<bool> LenLongKernel("len-long-kernel", cl::desc("With --len-scan 
 static cl::list<unsigned> LenSelectIf("len-select-if", cl::desc("With --len-scan: compute the longer "
     "lengths' starts inside nested Ifs, one per threshold (ascending)."), cl::CommaSeparated);
 // --pair-cuts=1 (with --tail-scan-kernel; implies --tail-unit-cuts): cut between every two bytes
-// that no token holds next to each other (tailHard), from a kernel of its own, BPE_PairCuts.
+// that no token holds next to each other (isHardPair), from a kernel of its own, BPE_PairCuts.
 // GPT-2: 2,689 of the 65,536 byte pairs occur inside tokens (2,074 ASCII, 615 with a byte
 // >= 0x80). --pair-cut-guard: the pairs with a byte >= 0x80 inside an If, the ASCII pairs as a
 // 14-bit class outside it. --pair-cuts=2: only the pairs with a byte >= 0x80 (the If), no ASCII
@@ -2219,6 +2325,16 @@ static cl::opt<bool> PairCutE280("pair-cut-e280", cl::desc("With --pair-cuts=3: 
 static cl::opt<bool> PairCutGuard("pair-cut-guard", cl::desc("With --pair-cuts: the pairs with a non-ASCII "
     "byte inside an If guard, the ASCII pairs a 14-bit class (default on)."), cl::init(true));
 static bool pairCuts() { return PairCuts && TailScanKernel; }
+// --cut-classes (on by default; with --combined-cuts, --len-scan and --pair-cuts=3, and the
+// pretokenizer's classes compiled on the UTF-8 bytes): BPE_Cuts reads the cut classes (kCutBefore ..
+// kCutAfterLead, bpeCutClassCCs) from the pretokenizer's CharClassesKernel, and adds the cuts after a
+// codepoint and between continuation bytes (bpeCodepointPairCuts) and the cuts before the leads of
+// BeforeCond (bpeCondBeforeCuts), in place of the lead-keyed cuts.
+static cl::opt<bool> CutClasses("cut-classes", cl::desc("With --combined-cuts and --pretok-utf8-classes: the cuts "
+    "from codepoint classes compiled with the pretokenizer's classes (default on)."), cl::init(true));
+static bool cutClasses() {
+    return CutClasses && CombinedCuts && TailFromBytes && TailScanKernel && LenScan >= 2 && PairCuts == 3;
+}
 static bool tailUnitCuts() { return TailUnitCuts || TailUnitSeed || byteRunCuts() || lenScan() || pairCuts(); }
 // Measurement only (wrong output): pretokens of more than N bytes get a 0 and nothing else,
 // in BPETailScanKernel.
@@ -2335,10 +2451,10 @@ static cl::opt<bool> TailHardSplit(
     cl::desc("With --tail-from-bytes: merge a cache miss as its pieces between byte pairs that no "
              "token holds, each looked up on its own (default off)."),
     cl::init(false));
-static uint64_t gTailHard[1024];   // bit x << 8 | y: no token holds bytes x, y next to each other
-static inline bool tailHard(uint8_t x, uint8_t y) {
+static uint64_t gHardPairs[1024];   // bit x << 8 | y: no token holds bytes x, y next to each other
+static inline bool isHardPair(uint8_t x, uint8_t y) {
     const unsigned k = (unsigned(x) << 8) | y;
-    return (gTailHard[k >> 6] >> (k & 63)) & 1;
+    return (gHardPairs[k >> 6] >> (k & 63)) & 1;
 }
 // --tail-trigram-split (with --tail-hard-split): more exact cuts in pretokens over 15 bytes.
 // A token covering the spot between bytes i - 1 and i (start p < i < end q) either starts at
@@ -2358,7 +2474,7 @@ static uint64_t gTailTok2[1024];                     // bit a << 8 | b: a 2-byte
 static inline bool tailBit(const uint64_t * m, unsigned k) { return (m[k >> 6] >> (k & 63)) & 1; }
 // A cut between w[j - 1] and w[j] of a pretoken w[0, len) of more than 15 bytes.
 static inline bool tailLongCut(const uint8_t * w, size_t j, size_t len) {
-    if (tailHard(w[j - 1], w[j])) return true;
+    if (isHardPair(w[j - 1], w[j])) return true;
     if (!TailTrigramSplit) return false;
     const unsigned x = w[j - 1], y = w[j];
     if (tailBit(gTailTok2, x << 8 | y)) return false;
@@ -2378,7 +2494,7 @@ static inline uint32_t tailCutMask(uint64_t k0, uint64_t k1, size_t len) {
     std::memcpy(b + 8, &k1, 8);
     uint32_t m = 0;
 #pragma clang loop unroll(full)
-    for (unsigned j = 1; j < 15; j++) m |= uint32_t(tailHard(b[j - 1], b[j])) << j;
+    for (unsigned j = 1; j < 15; j++) m |= uint32_t(isHardPair(b[j - 1], b[j])) << j;
     return m & ((1u << len) - 2);
 }
 // What a piece lookup needs: the thread's cache and the vocabulary table (null: no splitting).
@@ -2438,7 +2554,7 @@ template <unsigned W>
 static size_t tailSplitMerge(const TailPieces & P, const uint8_t * w, size_t len, uint16_t * tt, uint32_t * idx) {
     size_t m = 0, a = 0;
     for (size_t j = 1; j <= len; j++) {
-        if (j < len && !(len > kTailByteKeyMax ? tailLongCut(w, j, len) : tailHard(w[j - 1], w[j]))) continue;
+        if (j < len && !(len > kTailByteKeyMax ? tailLongCut(w, j, len) : isHardPair(w[j - 1], w[j]))) continue;
         m += tailPieceMerge<W>(P, w + a, j - a, tt + m, idx + m, uint32_t(a));
         a = j;
     }
@@ -4441,7 +4557,8 @@ void bpeDumpStream(PipelineBuilder & P, StreamSet * bytes, StreamSet * marks, co
                    reinterpret_cast<void *>(cb));
 }
 
-void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * basis, StreamSet * segs) {
+void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet * basis, StreamSet * segs,
+                             StreamSet * cutClassSet) {
     StreamSet * res = P.CreateStreamSet(1, 16);
     StreamSet * emit = P.CreateStreamSet(1, 1);
     StreamSet * open = P.CreateStreamSet(1, 1);
@@ -4474,7 +4591,7 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
         if (runs.cutN) {
             unsigned nHard = 0;
             for (unsigned by = 0; by < 256; by++)
-                if (((frozen[by >> 6] >> (by & 63)) & 1) == 0 && tailHard(uint8_t(by), uint8_t(by))) {
+                if (((frozen[by >> 6] >> (by & 63)) & 1) == 0 && isHardPair(uint8_t(by), uint8_t(by))) {
                     runs.hardSelf[by >> 6] |= 1ull << (by & 63);
                     nHard++;
                 }
@@ -4486,8 +4603,8 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
                 BPEHardRun r{uint8_t(c), {}, {}};
                 for (unsigned x = 0; x < 256; x++) {
                     if (x == c) continue;
-                    if (tailHard(uint8_t(x), uint8_t(c))) r.pre[x >> 6] |= 1ull << (x & 63);
-                    if (tailHard(uint8_t(c), uint8_t(x))) r.suf[x >> 6] |= 1ull << (x & 63);
+                    if (isHardPair(uint8_t(x), uint8_t(c))) r.pre[x >> 6] |= 1ull << (x & 63);
+                    if (isHardPair(uint8_t(c), uint8_t(x))) r.suf[x >> 6] |= 1ull << (x & 63);
                 }
                 runs.hardRuns.push_back(r);
             }
@@ -4501,7 +4618,7 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
             uint64_t h = 1469598103934665603ull;
             unsigned nHigh = 0;
             for (unsigned k = 0; k < 65536; k++) {
-                if (tailHard(uint8_t(k >> 8), uint8_t(k))) continue;
+                if (isHardPair(uint8_t(k >> 8), uint8_t(k))) continue;
                 inside.push_back(uint16_t(k));
                 nHigh += (k & 0x8080) != 0;
                 h = (h ^ k) * 1099511628211ull;
@@ -4514,7 +4631,13 @@ void buildBPEByteTailEmitter(PipelineBuilder & P, StreamSet * bytes, StreamSet *
                                                        : ", those next to a UTF-8 lead byte cut")
                           : PairCuts == 2 ? ", only those with a byte >= 0x80 cut" : PairCutGuard ? ", guarded" : "") << "\n";
             const unsigned e2 = PairCutE2 & (PairCutE280 ? 7u : 3u);
-            if (combined) {
+            if (combined && cutClassSet) {      // --cut-classes: only the frozen bytes that start no codepoint
+                std::array<uint64_t, 4> noStart{};
+                for (unsigned by = 0; by < 256; by++)
+                    if (((frozen[by >> 6] >> (by & 63)) & 1) && ((by & 0xC0) == 0x80 || by == 0xC0 || by == 0xC1 || by >= 0xF5))
+                        noStart[by >> 6] |= 1ull << (by & 63);
+                P.CreateKernelCall<BPECutsKernel>(basis, segs, cuts, noStart, runs, std::move(inside), e2, tag, cutClassSet);
+            } else if (combined) {
                 P.CreateKernelCall<BPECutsKernel>(basis, segs, cuts, frozen, runs, std::move(inside), e2, tag);
             } else {
                 pairCutSet = P.CreateStreamSet(1, 1);
@@ -6538,6 +6661,65 @@ static void tailVocabBuild(std::vector<MergeRule> rules) {
         + std::to_string(ms) + " ms" + saved + "\n";
 }
 
+// gHardPairs from the merge rules: a pair x y is inside a token when some rule joins a token
+// ending in x to one starting with y. Returns the rules in rank order; maxId: 1 + the highest id.
+static std::vector<const MergeRule *> buildHardPairs(const std::vector<MergeRuleGroup> & all, unsigned & maxId) {
+    std::vector<const MergeRule *> byRank;
+    maxId = 256;
+    for (const auto & g : all)
+        for (const MergeRule & r : g.rules) { byRank.push_back(&r); maxId = std::max(maxId, r.idAB + 1); }
+    std::sort(byRank.begin(), byRank.end(), [](const MergeRule * a, const MergeRule * b) { return a->idAB < b->idAB; });
+    std::vector<uint8_t> first(maxId, 0), last(maxId, 0);
+    for (unsigned by = 0; by < 256; by++) first[bpeBaseId(by)] = last[bpeBaseId(by)] = uint8_t(by);
+    std::fill(std::begin(gHardPairs), std::end(gHardPairs), ~0ull);
+    for (const MergeRule * r : byRank) {
+        first[r->idAB] = first[r->idA];
+        last[r->idAB] = last[r->idB];
+        const unsigned k = (unsigned(last[r->idA]) << 8) | first[r->idB];
+        gHardPairs[k >> 6] &= ~(1ull << (k & 63));
+    }
+    return byRank;
+}
+
+std::vector<re::CC *> bpeCutClassCCs(const BPETokenizer & bpe) {
+    if (!cutClasses()) return {};
+    const auto all = bpe.buildMergeRuleRanges(BPETokenizer::kTailAllRules);
+    unsigned maxId;
+    buildHardPairs(all, maxId);
+    std::array<bool, 256> before{}, beforeCond{};
+    for (unsigned b = 0; b < 256; b++) {
+        bool all256 = true;
+        for (unsigned x = 0; x < 256; x++)
+            if (!isHardPair(uint8_t(x), uint8_t(b))) all256 = false;
+        before[b] = all256;
+        beforeCond[b] = !all256 && b >= 0xC0;
+    }
+    std::vector<UCD::UnicodeSet> sets(kCutClassCount);
+    for (unsigned b = 0; b < 0xF5; b++) {           // the codepoints of lead (or ASCII byte) b
+        if ((b & 0xC0) == 0x80 || b == 0xC0 || b == 0xC1) continue;
+        const unsigned n = b < 0x80 ? 1 : b < 0xE0 ? 2 : b < 0xF0 ? 3 : 4;
+        const UCD::codepoint_t lo = n == 1 ? b : n == 2 ? (b & 0x1F) << 6 : n == 3 ? (b & 0x0F) << 12 : (b & 0x07) << 18;
+        const UCD::codepoint_t sub = n == 1 ? 0 : 1u << (6 * (n - 2));   // the codepoints with second byte 80 | j
+        // the second bytes of the shortest form: E0 A0-BF, F0 90-BF, F4 80-8F
+        const unsigned jlo = b == 0xE0 ? 0x20 : b == 0xF0 ? 0x10 : 0, jhi = b == 0xF4 ? 0x0F : 0x3F;
+        const UCD::codepoint_t first = n == 1 ? lo : lo + jlo * sub, last = n == 1 ? lo : lo + (jhi + 1) * sub - 1;
+        if (before[b]) sets[kCutBefore].insert_range(first, last);
+        if (beforeCond[b]) sets[kCutBeforeCond].insert_range(first, last);
+        if (n == 1) continue;
+        for (unsigned j = jlo; j <= jhi; j++)
+            if (isHardPair(uint8_t(b), uint8_t(0x80 | j))) sets[kCutAfterLead].insert_range(lo + j * sub, lo + (j + 1) * sub - 1);
+    }
+    static const char * const kNames[kCutClassCount] = {"Before", "BeforeCond", "AfterLead"};
+    std::vector<re::CC *> ccs;
+    std::cerr << "[BPE] --cut-classes:";
+    for (unsigned c = 0; c < kCutClassCount; c++) {
+        std::cerr << " " << kNames[c] << " " << sets[c].count() << "/" << sets[c].size();
+        ccs.push_back(re::makeCC(std::move(sets[c]), &cc::Unicode));
+    }
+    std::cerr << " (codepoints/ranges)\n";
+    return ccs;
+}
+
 BPEPassResult buildBPEPassPipeline(
         kernel::PipelineBuilder & P,
         kernel::StreamSet * basis,
@@ -6552,20 +6734,8 @@ BPEPassResult buildBPEPassPipeline(
         const size_t numRules = buildTailTable(all, 0, 8);
         for (unsigned by = 0; by < 256; by++) gTailBase[by] = uint16_t(bpeBaseId(by));
         if (TailHardSplit || byteRunCuts() || pairCuts()) {   // the byte pairs inside tokens, by rank
-            std::vector<const MergeRule *> byRank;
             unsigned maxId = 256;
-            for (const auto & g : all)
-                for (const MergeRule & r : g.rules) { byRank.push_back(&r); maxId = std::max(maxId, r.idAB + 1); }
-            std::sort(byRank.begin(), byRank.end(), [](const MergeRule * a, const MergeRule * b) { return a->idAB < b->idAB; });
-            std::vector<uint8_t> first(maxId, 0), last(maxId, 0);
-            for (unsigned by = 0; by < 256; by++) first[bpeBaseId(by)] = last[bpeBaseId(by)] = uint8_t(by);
-            std::fill(std::begin(gTailHard), std::end(gTailHard), ~0ull);
-            for (const MergeRule * r : byRank) {
-                first[r->idAB] = first[r->idA];
-                last[r->idAB] = last[r->idB];
-                const unsigned k = (unsigned(last[r->idA]) << 8) | first[r->idB];
-                gTailHard[k >> 6] &= ~(1ull << (k & 63));
-            }
+            const std::vector<const MergeRule *> byRank = buildHardPairs(all, maxId);
             if (TailTrigramSplit) {                 // every token's bytes: its trigrams, prefix, 2-byte tokens
                 const auto t0 = std::chrono::steady_clock::now();
                 std::vector<std::string> tb(maxId);

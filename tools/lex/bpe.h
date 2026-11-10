@@ -145,11 +145,11 @@ void buildBPETailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * ids,
 void bpeDumpStream(kernel::PipelineBuilder & P, kernel::StreamSet * bytes, kernel::StreamSet * marks,
                    const std::string & name);
 // cutClassSet (optional): the pretokenizer's class streams, ending with the cut classes of
-// bpeCutClassCCs (--cut-classes).
+// bpeCutClassCCs (--pair-cuts=3).
 void buildBPEByteTailEmitter(kernel::PipelineBuilder & P, kernel::StreamSet * bytes,
                              kernel::StreamSet * basis, kernel::StreamSet * segs,
                              kernel::StreamSet * cutClassSet = nullptr);
-// --cut-classes: the codepoint classes of the cuts (kCutBefore .. kCutAfterLead in bpe.cpp), to be compiled
+// --pair-cuts=3: the codepoint classes of the cuts (kCutBefore .. kCutAfterLead in bpe.cpp), to be compiled
 // with the pretokenizer's classes on the UTF-8 bytes; empty when the cuts do not use them. Builds
 // the table of the byte pairs inside tokens from the merge rules.
 std::vector<re::CC *> bpeCutClassCCs(const BPETokenizer & bpe);

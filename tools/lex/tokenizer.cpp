@@ -568,7 +568,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
     //        compare_bpe.py step 1; 0x0A bytes mark separators).
     StreamSet * bpeBasis;
     StreamSet * bpeBoundary = nullptr;   // pretoken-start mask fed to BPE (gates merges)
-    StreamSet * cutClassSet = nullptr;   // the pretokenizer's classes with the cut classes (--cut-classes)
+    StreamSet * cutClassSet = nullptr;   // the pretokenizer's classes with the cut classes (--pair-cuts=3)
     if (PreTokenizer.getNumOccurrences() == 0) {
         // No pretokenizer. By default treat '\n' as real content — it seeds to
         // id 198 (GPT-2 'Ċ') and flows through the merges, matching HuggingFace
@@ -579,7 +579,7 @@ static void * buildBPEPipelineBody(ProgramBuilder & P, CPUDriver & driver, const
     } else if (compressClasses) {
         bpeBasis    = normalizedBasis;
         gPretokDumpSource = ByteStream;
-        // --cut-classes: the BPE cut classes compiled with the pretokenizer's classes
+        // --pair-cuts=3: the BPE cut classes compiled with the pretokenizer's classes
         const std::vector<re::CC *> cutCCs = PretokClassCode && PretokByteDomain && PretokUTF8Classes
                                            ? bpeCutClassCCs(bpe) : std::vector<re::CC *>{};
         bpeBoundary = buildGPT2ByteBoundaries(P, BasisBits, PretokClassCode, PretokByteDomain, PretokUTF8Classes,

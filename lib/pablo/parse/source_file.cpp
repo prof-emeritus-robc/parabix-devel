@@ -8,26 +8,20 @@
 #include <llvm/ADT/SmallString.h>
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Path.h>
+#include <toolchain/install_paths.h>
 
 namespace pablo {
 namespace parse {
 
-inline static std::string appendToBasePath(std::string const & filename) {
-    llvm::SmallString<128> path{};
-#ifdef PARABIX_OBJECT_CACHE
-    path.assign(llvm::sys::path::parent_path(PARABIX_OBJECT_CACHE));
-#else
-    // default: $HOME/.parabix
-    llvm::sys::path::home_directory(path);
-    llvm::sys::path::append(path, ".parabix");
-#endif
-    llvm::sys::path::append(path, "pablosrc", filename);
-    return std::string(path.c_str());
-}
-
 std::shared_ptr<SourceFile> SourceFile::Relative(std::string const & path) {
+    llvm::SmallString<128> relative("pablo");
+    llvm::sys::path::append(relative, path);
+    const std::string found = codegen::findInstalledFile(codegen::InstallDir::Data, relative);
+    if (found.empty()) {
+        return nullptr;
+    }
     try {
-        return std::make_shared<SourceFile>(appendToBasePath(path));
+        return std::make_shared<SourceFile>(found);
     } catch (...) {
         return nullptr;
     }

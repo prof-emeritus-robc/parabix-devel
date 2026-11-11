@@ -19,10 +19,15 @@ NAME
     toolchain
 SRC
     fileutil.cpp
+    install_paths.cpp
     toolchain.cpp
 DEPS
     ${Boost_LIBRARIES}
 )
+
+# Where files installed with Parabix are found (include/toolchain/install_paths.h)
+set_source_files_properties(install_paths.cpp PROPERTIES COMPILE_DEFINITIONS
+    "PARABIX_BINDIR_TO_LIBEXECDIR=\"${PARABIX_BINDIR_TO_LIBEXECDIR}\";PARABIX_BINDIR_TO_DATADIR=\"${PARABIX_BINDIR_TO_DATADIR}\";PARABIX_INSTALL_LIBEXECDIR=\"${CMAKE_INSTALL_FULL_LIBEXECDIR}\";PARABIX_INSTALL_DATADIR=\"${CMAKE_INSTALL_FULL_DATADIR}\"")
 
 if (ARTIFACT_TYPE STREQUAL "Shared")
     if (APPLE)

@@ -14,6 +14,7 @@
 #include <llvm/Support/Debug.h>
 #include <llvm/IR/Module.h>
 #include <toolchain/toolchain.h>
+#include <toolchain/install_paths.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/IR/Verifier.h>
@@ -565,17 +566,19 @@ inline bool ParabixObjectCache::requiresCacheCleanUp() noexcept {
  * @brief initiateCacheCleanUp
  ** ------------------------------------------------------------------------------------------------------------- */
 void ParabixObjectCache::initiateCacheCleanUp() noexcept {
+    // The janitor installed with Parabix (or in the build tree), never one
+    // found on the PATH; without one the cache is not cleaned up.
+    const std::string janitorPath = codegen::findInstalledFile(codegen::InstallDir::Libexec, CACHE_JANITOR_FILE_NAME);
+    if (janitorPath.empty()) {
+        return;
+    }
     if (LLVM_UNLIKELY(requiresCacheCleanUp())) {
         mStartedCacheCleanupDaemon = true;
         const auto pid = fork();
         if (pid == 0) {
             char * const cachePath = const_cast<char *>(mCachePath.c_str());
             char * args[3] = {const_cast<char *>(CACHE_JANITOR_FILE_NAME), cachePath, nullptr};
-            Path janitorFileName(codegen::ProgramName);
-            sys::path::remove_filename(janitorFileName);
-            sys::path::append(janitorFileName, CACHE_JANITOR_FILE_NAME);
-            char * const janitorPath = const_cast<char *>(janitorFileName.c_str());
-            if (execvp(janitorPath, args) < 0) {
+            if (execv(janitorPath.c_str(), args) < 0) {
                 #ifndef NDEBUG
                 SmallVector<char, 1024> tmp;
                 raw_svector_ostream out(tmp);
@@ -590,19 +593,6 @@ void ParabixObjectCache::initiateCacheCleanUp() noexcept {
             #endif
         }
     }
-}
-
-/** ------------------------------------------------------------------------------------------------------------- *
- * @brief getDefaultCachePath
- ** ------------------------------------------------------------------------------------------------------------- */
-inline void getDefaultCachePath(Path & configPath) {
-#ifdef PARABIX_OBJECT_CACHE
-    configPath = PARABIX_OBJECT_CACHE;
-#else
-    // default: $HOME/.parabix/cache
-    sys::path::home_directory(configPath);
-    sys::path::append(configPath, ".parabix", "cache");
-#endif
 }
 
 #if 0
@@ -642,7 +632,7 @@ inline void ParabixObjectCache::loadCacheSettings() noexcept {
         // the cache cleanup daemon is handed this path; resolve it now
         sys::fs::make_absolute(mCachePath);
     } else {
-        getDefaultCachePath(mCachePath);
+        mCachePath.assign(codegen::getDefaultObjectCacheDir());
     }
     #if 0
 

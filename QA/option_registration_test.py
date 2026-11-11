@@ -21,7 +21,9 @@ import os
 import subprocess
 import sys
 
-# Not command-line tools: the object cache cleanup daemon is handed a cache path.
+# Not a command-line tool: the object cache cleanup daemon is handed a cache
+# path.  It is built in <build>/libexec/parabix, but older build trees have
+# it in bin.
 SKIP = {"cachejanitord"}
 
 

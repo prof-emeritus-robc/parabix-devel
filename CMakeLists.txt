@@ -34,7 +34,6 @@ option(REPORT_PAPI_TESTS "Report PAPI testing results" OFF)
 option(LLVM_PATH "LLVM root directory")
 option(GENERATE_TOOLS "Controls whether or not it generate tools" ON)
 option(USE_LIBBACKTRACE "Allows framework to provide more detailed backtraces in JIT compiled code. Library available from github.com/ianlancetaylor/libbacktrace" OFF)
-option(SET_DEFAULT_OBJCACHE_DIR "Whether or not to set the default object cache directory at compile time" ON)
 option(PARABIX_BUILD_TESTS "Build the kernel tests (tests/) and unit tests (QA/unit-tests)" ON)
 
 # Build Artifact Configuration
@@ -197,22 +196,18 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Place compiled executables in build/bin.
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
 
-# Parabix Object Cache default
-if (NOT EXISTS "$ENV{HOME}/.parabix/")
-    MAKE_DIRECTORY("$ENV{HOME}/.parabix/")
-    message("Created $ENV{HOME}/.parabix/")
-endif()
-set(PARABIX_WORKING "$ENV{HOME}/.parabix")
-set(PARABIX_OBJECT_CACHE "${PARABIX_WORKING}/objcache")
-
-if (NOT EXISTS "${PARABIX_OBJECT_CACHE}")
-    MAKE_DIRECTORY("${PARABIX_OBJECT_CACHE}")
-    message("Created: ${PARABIX_OBJECT_CACHE}")
-endif()
-
-if (SET_DEFAULT_OBJCACHE_DIR)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_OBJECT_CACHE='\"${PARABIX_OBJECT_CACHE}\"'")
-endif()
+# Installation directories (GNUInstallDirs), and the files used at run time.
+# Programs find them relative to their own directory, by the relations
+# between the installation directories (include/toolchain/install_paths.h),
+# and the build tree is laid out the same way: <build>/bin with
+# <build>/libexec/parabix and <build>/share/parabix, by default.  The object
+# cache is found at run time (-object-cache-dir, $PARABIX_OBJECT_CACHE_DIR,
+# or ~/.parabix/objcache), so nothing is written outside the build tree.
+include(GNUInstallDirs)
+file(RELATIVE_PATH PARABIX_BINDIR_TO_LIBEXECDIR ${CMAKE_INSTALL_FULL_BINDIR} ${CMAKE_INSTALL_FULL_LIBEXECDIR})
+file(RELATIVE_PATH PARABIX_BINDIR_TO_DATADIR ${CMAKE_INSTALL_FULL_BINDIR} ${CMAKE_INSTALL_FULL_DATADIR})
+get_filename_component(PARABIX_BUILD_LIBEXECDIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PARABIX_BINDIR_TO_LIBEXECDIR}/parabix ABSOLUTE)
+get_filename_component(PARABIX_BUILD_DATADIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PARABIX_BINDIR_TO_DATADIR}/parabix ABSOLUTE)
 
 # Use @rpath for dylibs on macOS
 set(CMAKE_MACOSX_RPATH ON)
@@ -416,24 +411,23 @@ function(parabix_add_executable)
     endif()
 endfunction(parabix_add_executable)
 
-# Creates a pablo source target which copies pablo source files to the parabix
-# cache directory.
+# Creates a pablo source target which copies pablo source files to the data
+# directory of the build tree (<build>/share/parabix/pablo), where the
+# programs reading them find them (pablo::parse::SourceFile::Relative).
 #
 # Usage: parabix_add_pablo_src(target-name source-files...)
 function(parabix_add_pablo_src NAME)
-    set(FILE_LIST "")
+    set(COPIES "")
     foreach(PABLO_FILE ${ARGN})
-        list(APPEND FILE_LIST "${CMAKE_CURRENT_SOURCE_DIR}/${PABLO_FILE}")
+        get_filename_component(PABLO_NAME ${PABLO_FILE} NAME)
+        set(COPY ${PARABIX_BUILD_DATADIR}/pablo/${PABLO_NAME})
+        add_custom_command(OUTPUT ${COPY}
+            COMMAND ${CMAKE_COMMAND} -E make_directory ${PARABIX_BUILD_DATADIR}/pablo
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/${PABLO_FILE} ${COPY}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${PABLO_FILE})
+        list(APPEND COPIES ${COPY})
     endforeach(PABLO_FILE)
-
-    set(PARABIX_PABLO_SRC "${PARABIX_WORKING}/pablosrc/")
-    if (NOT EXISTS "${PARABIX_PABLO_SRC}")
-        MAKE_DIRECTORY("${PARABIX_PABLO_SRC}")
-        message("Created ${PARABIX_PABLO_SRC}")
-    endif()
-    add_custom_target(${NAME}
-        COMMAND cp ${FILE_LIST} ${PARABIX_PABLO_SRC}
-        DEPENDS ${ARGN})
+    add_custom_target(${NAME} DEPENDS ${COPIES})
 endfunction(parabix_add_pablo_src)
 
 

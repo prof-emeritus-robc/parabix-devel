@@ -22,7 +22,7 @@ if(POLICY CMP0079)
     cmake_policy(SET CMP0079 NEW)
 endif()
 
-project(parabix)
+project(parabix VERSION 0.9.0)
 enable_testing()
 
 ###   Build Options   ###
@@ -54,6 +54,20 @@ endif()
 
 # Target for single shared library
 set(PARABIX_MONO_TARGET parabix)
+
+# Installation (cmake/ParabixInstall.cmake), from ARTIFACT_MODE=Single builds only.
+set(PARABIX_INSTALL_SCOPE "User" CACHE STRING
+    "Install for the user building (User, default prefix ~/.local) or for all users (System, default prefix /usr/local)")
+set_property(CACHE PARABIX_INSTALL_SCOPE PROPERTY STRINGS User System)
+if(NOT PARABIX_INSTALL_SCOPE MATCHES "^(User|System)$")
+    message(FATAL_ERROR "PARABIX_INSTALL_SCOPE must be either User or System")
+endif()
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT AND PARABIX_INSTALL_SCOPE STREQUAL "User")
+    set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "Install path prefix" FORCE)
+endif()
+set(PARABIX_INSTALL_TOOLS "default" CACHE STRING
+    "Tools installed by make install: default, dev, all, or tool names (see cmake/ParabixInstall.cmake)")
+option(PARABIX_STATIC_BOOST "Link Boost statically into the single library (ARTIFACT_MODE=Single)" ON)
 
 # Ensure custom FindXYZ.cmake files are found
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
@@ -104,7 +118,13 @@ message(STATUS "LLVM Version Integer: ${LLVM_VERSION_INTEGER}")
 if (POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)   # use Boost's own BoostConfig.cmake, not CMake's FindBoost
 endif()
-set(Boost_USE_STATIC_LIBS ${USE_STATIC_LIBS})
+if(ARTIFACT_MODE STREQUAL "Single" AND PARABIX_STATIC_BOOST)
+    # Part of libparabix, so that installed programs do not depend on the
+    # Boost libraries (and versions) of the build machine.
+    set(Boost_USE_STATIC_LIBS ON)
+else()
+    set(Boost_USE_STATIC_LIBS ${USE_STATIC_LIBS})
+endif()
 set(Boost_USE_MULTITHREADED OFF)
 set(Boost_USE_STATIC_RUNTIME OFF)
 find_package(Boost 1.61 REQUIRED COMPONENTS filesystem iostreams regex)
@@ -127,6 +147,35 @@ if (ENABLE_ICU)
             message(STATUS "Found ICU: ${ICU_ROOT}")
         endif()
     endif()
+endif()
+
+###   Static Boost: its dependencies   ###
+
+if(Boost_USE_STATIC_LIBS)
+    # Static Boost libraries name their own dependencies (e.g., iostreams'
+    # bz2, lzma, z and zstd, regex's ICU) without a directory, which the
+    # linker may not search (e.g., Homebrew's lib, or ICU's); give the ones
+    # found in full.
+    foreach(LIB ${Boost_LIBRARIES})
+        if(NOT TARGET ${LIB})
+            continue()
+        endif()
+        get_target_property(DEPS ${LIB} INTERFACE_LINK_LIBRARIES)
+        if(NOT DEPS)
+            continue()
+        endif()
+        set(RESOLVED "")
+        foreach(DEP ${DEPS})
+            if(DEP MATCHES "^[A-Za-z0-9_+.]+$" AND NOT TARGET ${DEP})
+                find_library(PARABIX_BOOST_DEP_${DEP} ${DEP} HINTS ${ICU_ROOT}/lib)
+                if(PARABIX_BOOST_DEP_${DEP})
+                    set(DEP ${PARABIX_BOOST_DEP_${DEP}})
+                endif()
+            endif()
+            list(APPEND RESOLVED ${DEP})
+        endforeach()
+        set_target_properties(${LIB} PROPERTIES INTERFACE_LINK_LIBRARIES "${RESOLVED}")
+    endforeach()
 endif()
 
 ###   Import Dependency: PAPI   ###
@@ -208,6 +257,36 @@ file(RELATIVE_PATH PARABIX_BINDIR_TO_LIBEXECDIR ${CMAKE_INSTALL_FULL_BINDIR} ${C
 file(RELATIVE_PATH PARABIX_BINDIR_TO_DATADIR ${CMAKE_INSTALL_FULL_BINDIR} ${CMAKE_INSTALL_FULL_DATADIR})
 get_filename_component(PARABIX_BUILD_LIBEXECDIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PARABIX_BINDIR_TO_LIBEXECDIR}/parabix ABSOLUTE)
 get_filename_component(PARABIX_BUILD_DATADIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PARABIX_BINDIR_TO_DATADIR}/parabix ABSOLUTE)
+
+# In ARTIFACT_MODE=Single, the build tree has the installed layout of the
+# libraries as well (<build>/lib/libparabix), and programs find them by a
+# run path relative to their own directory ($ORIGIN/../lib), the one they
+# are installed with.  Installing a program is then copying it, under its
+# installed name (px-<tool>).
+if(ARTIFACT_MODE STREQUAL "Single")
+    file(RELATIVE_PATH PARABIX_BINDIR_TO_LIBDIR ${CMAKE_INSTALL_FULL_BINDIR} ${CMAKE_INSTALL_FULL_LIBDIR})
+    get_filename_component(PARABIX_BUILD_LIBDIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${PARABIX_BINDIR_TO_LIBDIR} ABSOLUTE)
+    if(APPLE)
+        set(PARABIX_RPATH_ORIGIN "@loader_path")
+    else()
+        set(PARABIX_RPATH_ORIGIN "$ORIGIN")
+    endif()
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+    # Libraries outside the project (e.g., ICU) stay where they were found.
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+endif()
+
+# Sets the run path of a Parabix program or library of ARTIFACT_MODE=Single:
+# from its output directory to <build>/lib, as from the installed one.
+function(parabix_set_single_rpath TARGET OUTPUT_DIR)
+    file(RELATIVE_PATH REL ${OUTPUT_DIR} ${PARABIX_BUILD_LIBDIR})
+    if(REL STREQUAL "")
+        set(RPATH "${PARABIX_RPATH_ORIGIN}")
+    else()
+        set(RPATH "${PARABIX_RPATH_ORIGIN}/${REL}")
+    endif()
+    set_target_properties(${TARGET} PROPERTIES INSTALL_RPATH "${RPATH}")
+endfunction(parabix_set_single_rpath)
 
 # Use @rpath for dylibs on macOS
 set(CMAKE_MACOSX_RPATH ON)
@@ -326,6 +405,8 @@ function(parabix_add_module)
             parabix_srchash_attach(${ARG_NAME})
         endif()
         if(ARTIFACT_MODE STREQUAL "Single")
+            set_target_properties(${ARG_NAME} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${PARABIX_BUILD_LIBDIR})
+            parabix_set_single_rpath(${ARG_NAME} ${PARABIX_BUILD_LIBDIR})
             parabix_single_link_later(${ARG_NAME} ${ARG_DEPS})
         else()
             target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
@@ -368,8 +449,25 @@ function(parabix_single_finalize)
     # PRIVATE: the users of the single artifact are not to link the modules'
     # own dependencies (e.g., the LLVM archives) a second time.
     target_link_libraries(${PARABIX_MONO_TARGET} PRIVATE ${MODULES})
-    # What a user of the separate module libraries would get from them.
-    target_link_libraries(${PARABIX_MONO_TARGET} INTERFACE ${Boost_LIBRARIES})
+    if(Boost_USE_STATIC_LIBS AND NOT ARTIFACT_TYPE STREQUAL "Static")
+        # All of Boost's archives are in the artifact, for its users too (on
+        # Apple systems, toolchain's -all_load does this); a second copy in
+        # a program would have its own Boost globals.
+        if(NOT APPLE)
+            set(ARCHIVES "")
+            foreach(LIB ${Boost_LIBRARIES})
+                if(TARGET ${LIB})
+                    list(APPEND ARCHIVES "$<TARGET_LINKER_FILE:${LIB}>")
+                else()
+                    list(APPEND ARCHIVES ${LIB})
+                endif()
+            endforeach()
+            target_link_libraries(${PARABIX_MONO_TARGET} PRIVATE -Wl,--whole-archive ${ARCHIVES} -Wl,--no-whole-archive)
+        endif()
+    else()
+        # What a user of the separate module libraries would get from them.
+        target_link_libraries(${PARABIX_MONO_TARGET} INTERFACE ${Boost_LIBRARIES})
+    endif()
     if(NOT APPLE OR ARTIFACT_TYPE STREQUAL "Static")
         # Not embedded in the artifact (see lib/toolchain/CMakeLists.txt)
         target_link_libraries(${PARABIX_MONO_TARGET} INTERFACE ${REQ_LLVM_LIBRARIES})
@@ -399,10 +497,16 @@ function(parabix_add_executable)
         message(FATAL_ERROR "parabix_add_executable: A target name is required")
     endif()
     add_executable(${ARG_NAME} ${ARG_SRC})
+    # The tools, which cmake/ParabixInstall.cmake installs
+    string(FIND "${CMAKE_CURRENT_SOURCE_DIR}/" "${PROJECT_SOURCE_DIR}/tools/" TOOLS_DIR_POS)
+    if(TOOLS_DIR_POS EQUAL 0)
+        set_property(GLOBAL APPEND PROPERTY PARABIX_TOOLS ${ARG_NAME})
+    endif()
     parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} toolchain kernel.pipeline)
     parabix_srchash_attach(${ARG_NAME})
     target_compile_options(${ARG_NAME} PRIVATE ${NO_RTTI})
     if(ARTIFACT_MODE STREQUAL "Single")
+        parabix_set_single_rpath(${ARG_NAME} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
         parabix_single_link_later(${ARG_NAME} ${ARG_DEPS})
     else()
         target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
@@ -428,20 +532,35 @@ function(parabix_add_pablo_src NAME)
         list(APPEND COPIES ${COPY})
     endforeach(PABLO_FILE)
     add_custom_target(${NAME} DEPENDS ${COPIES})
+    # Installed with the tool <tool> of the target <tool>.pablosrc
+    string(REGEX REPLACE "\\.pablosrc$" "" TOOL ${NAME})
+    foreach(PABLO_FILE ${ARGN})
+        set_property(GLOBAL APPEND PROPERTY PARABIX_PABLO_SOURCES_${TOOL} ${CMAKE_CURRENT_SOURCE_DIR}/${PABLO_FILE})
+    endforeach(PABLO_FILE)
 endfunction(parabix_add_pablo_src)
 
 
 ###   Add Subdirectories   ###
 
 if(ARTIFACT_MODE STREQUAL "Single")
-    if(NOT POLICY CMP0079)
-        message(FATAL_ERROR "ARTIFACT_MODE=Single requires CMake 3.13 or later")
+    # CMP0079 (3.13) for parabix_single_finalize, install(... EXCLUDE_FROM_ALL)
+    # of all kinds (3.14) for cmake/ParabixInstall.cmake
+    if(CMAKE_VERSION VERSION_LESS 3.14)
+        message(FATAL_ERROR "ARTIFACT_MODE=Single requires CMake 3.14 or later")
     endif()
     if(ARTIFACT_TYPE STREQUAL "Static")
         add_library(${PARABIX_MONO_TARGET} STATIC "")
     else()
         add_library(${PARABIX_MONO_TARGET} SHARED "")
+        # The library's ABI is that of its version: 0.9 (until 1.0)
+        set_target_properties(${PARABIX_MONO_TARGET} PROPERTIES
+            VERSION ${PROJECT_VERSION}
+            SOVERSION ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
     endif()
+    set_target_properties(${PARABIX_MONO_TARGET} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${PARABIX_BUILD_LIBDIR}
+        ARCHIVE_OUTPUT_DIRECTORY ${PARABIX_BUILD_LIBDIR})
+    parabix_set_single_rpath(${PARABIX_MONO_TARGET} ${PARABIX_BUILD_LIBDIR})
     parabix_srchash_attach(${PARABIX_MONO_TARGET})
 endif()
 
@@ -529,6 +648,9 @@ endif()
 
 # Source hashes need every target defined (see cmake/ParabixSourceHash.cmake)
 parabix_srchash_finalize()
+
+# Install and uninstall rules, once every program is defined
+include(ParabixInstall)
 
 ###   Test Suite   ###
 

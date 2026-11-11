@@ -1313,7 +1313,16 @@ OrcJITBackend::OrcJITBackend(CPUDriver & driver)
     // InProcessMemoryManager, which allocates a small dedicated region per object rather
     // than long-lived shared pools, does not hit it). --use-custom-jit-memory-manager
     // controls which is used; see toolchain.cpp for its LLVM-version-dependent default.
-    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
+    // (From LLVM 23, ORC passes the creator a default memory manager, which is not used.)
+    #if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+    Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES, jitlink::JITLinkMemoryManager &) {
+        auto objLinker = codegen::UseCustomJITMemoryManager
+            ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())
+            : std::make_unique<ObjectLinkingLayer>(ES, cantFail(jitlink::InProcessMemoryManager::Create()));
+        objLinker->setAutoClaimResponsibilityForObjectSymbols(true);
+        return objLinker;
+    });
+    #elif LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(21, 0, 0)
     Builder.setObjectLinkingLayerCreator([this](ExecutionSession & ES) {
         auto objLinker = codegen::UseCustomJITMemoryManager
             ? std::make_unique<ObjectLinkingLayer>(ES, mCPUDriverCompiler->getJITMemoryManager())

@@ -15,7 +15,7 @@ To build Parabix, you need a development environment that meets a few requiremen
 -  A modern C++ compiler supporting at least C++17.
 -  The [`cmake`](https://cmake.org/download/) build system version 3.12 or better (3.14 or better to install).
 -  [`Boost`](https://www.boost.org/users/download/) libraries version `1.61` or better (Ubuntu `libboost-all-dev`).
--  [`LLVM`](https://releases.llvm.org/download.html) version `16` or later (built in Release mode).
+-  [`LLVM`](https://releases.llvm.org/download.html) version `17` or later (built in Release mode).
 -  [`ICU`](https://icu.unicode.org/) (Ubuntu `libicu-dev`, Homebrew `icu4c`): required by the `tokenizer` tool, and used by `tconv` if found.
 -  Python 3, to run the test suite.
 

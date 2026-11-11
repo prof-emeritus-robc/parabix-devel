@@ -306,11 +306,28 @@ public:
 
     void CreateExit(const int exitCode);
 
+    // IRBuilder's CreateAggregateRet takes an ArrayRef from LLVM 23, a pointer and count before
+    llvm::ReturnInst * CreateAggregateRet(llvm::ArrayRef<llvm::Value *> retVals) {
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+        return IRBuilder<>::CreateAggregateRet(retVals);
+#else
+        return IRBuilder<>::CreateAggregateRet(retVals.data(), retVals.size());
+#endif
+    }
+
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+    llvm::CondBrInst * CreateLikelyCondBr(llvm::Value * Cond, llvm::BasicBlock * True, llvm::BasicBlock * False, const int probability = 90);
+
+    llvm::CondBrInst * CreateUnlikelyCondBr(llvm::Value * Cond, llvm::BasicBlock * True, llvm::BasicBlock * False, const int probability = 90) {
+        return CreateLikelyCondBr(Cond, True, False, 100 - probability);
+    }
+#else
     llvm::BranchInst * CreateLikelyCondBr(llvm::Value * Cond, llvm::BasicBlock * True, llvm::BasicBlock * False, const int probability = 90);
 
     llvm::BranchInst * CreateUnlikelyCondBr(llvm::Value * Cond, llvm::BasicBlock * True, llvm::BasicBlock * False, const int probability = 90) {
         return CreateLikelyCondBr(Cond, True, False, 100 - probability);
     }
+#endif
 
     llvm::BasicBlock * CreateBasicBlock(const llvm::StringRef name = "", llvm::BasicBlock * insertBefore = nullptr);
 

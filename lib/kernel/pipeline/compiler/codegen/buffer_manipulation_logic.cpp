@@ -438,7 +438,7 @@ void PipelineCompiler::zeroInputAfterFinalItemCount(KernelBuilder & b,
                 FixedArray<Value *, 2> fields;
                 fields[0] = retAddress;
                 fields[1] = mallocBytes;
-                b.CreateAggregateRet(fields.data(), 2);
+                b.CreateAggregateRet(fields);
             } else {
                 b.CreateRet(retAddress);
             }

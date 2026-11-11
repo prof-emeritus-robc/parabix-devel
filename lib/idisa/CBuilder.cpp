@@ -1328,7 +1328,12 @@ bool CBuilder::supportsIndirectBr() const {
     return !codegen::DebugOptionIsSet(codegen::DisableIndirectBranch);
 }
 
-BranchInst * CBuilder::CreateLikelyCondBr(Value * Cond, BasicBlock * True, BasicBlock * False, const int probability) {
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+CondBrInst * CBuilder::CreateLikelyCondBr(Value * Cond, BasicBlock * True, BasicBlock * False, const int probability)
+#else
+BranchInst * CBuilder::CreateLikelyCondBr(Value * Cond, BasicBlock * True, BasicBlock * False, const int probability)
+#endif
+{
     MDBuilder mdb(getContext());
     if (probability < 0 || probability > 100) {
         report_fatal_error("branch weight probability must be in [0,100]");
@@ -2244,7 +2249,11 @@ bool RemoveRedundantAssertionsPass::runOnModule(Module & M) {
             auto next = ci->eraseFromParent();
             // note: split automatically inserts an unconditional branch to the new block
             BasicBlock * const assertFinally = bb->splitBasicBlock(next, "__assert_ok");
+#if LLVM_VERSION_INTEGER >= LLVM_VERSION_CODE(23, 0, 0)
+            assert(dyn_cast_or_null<UncondBrInst>(bb->getTerminator()));
+#else
             assert(dyn_cast_or_null<BranchInst>(bb->getTerminator()));
+#endif
             bb->getTerminator()->eraseFromParent();
             builder.SetInsertPoint(bb);
             builder.CreateInvoke(assertFunc, assertFinally, rethrow, args);

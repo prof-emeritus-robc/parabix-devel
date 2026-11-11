@@ -1042,7 +1042,7 @@ inline void KernelCompiler::callGenerateFinalizeMethod(KernelBuilder & b, llvm::
         if (n == 1) {
             b.CreateRet(outputs[0]);
         } else {
-            b.CreateAggregateRet(outputs.data(), n);
+            b.CreateAggregateRet(outputs);
         }
     }
     // b.getDriver().declareFunctionSymbol(mCurrentMethod);

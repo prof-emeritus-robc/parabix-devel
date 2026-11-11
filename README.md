@@ -13,34 +13,146 @@ To build Parabix, you need a development environment that meets a few requiremen
 
 -  Standard C++ development tools including git, C++, etc.
 -  A modern C++ compiler supporting at least C++17.
--  The [`cmake`](https://cmake.org/download/) build system version 3.12 or better.
+-  The [`cmake`](https://cmake.org/download/) build system version 3.12 or better (3.14 or better to install).
 -  [`Boost`](https://www.boost.org/users/download/) libraries version `1.61` or better (Ubuntu `libboost-all-dev`).
--  [`LLVM`](https://releases.llvm.org/download.html) system version `16` or later (built in Release mode).  
+-  [`LLVM`](https://releases.llvm.org/download.html) version `16` or later (built in Release mode).
+-  [`ICU`](https://icu.unicode.org/) (Ubuntu `libicu-dev`, Homebrew `icu4c`): required by the `tokenizer` tool, and used by `tconv` if found.
+-  Python 3, to run the test suite.
 
-### Build
+Linux, the BSDs and macOS are supported.
+
+### Building for development
 
 - Clone parabix-devel from the repository:
   `git clone https://cs-git-research.cs.sfu.ca/cameron/parabix-devel.git`
-- Create a build subdirectory
-  - `cd parabix-devel`
-  - `mkdir build`
-  - `cd build`
-- Create the makefiles
-  `cmake -DCMAKE_BUILD_TYPE=Release ..`
-  - _Note: if you have built/installed a custom LLVM version, you may need to override cmake's default search path._
-`cmake -DCMAKE_PREFIX_PATH=path/to/libllvm -DCMAKE_BUILD_TYPE=Release ..`
-- `make`
-- If you wish to run the test suite, while you are still in the build directory, run the following command:
-`make check`
-- If you run into problems with the cache directory, make sure that your home directory has a `.cache` subdirectory and that is is readable and writable.
+- Create a build directory and the makefiles:
+  ```
+  cd parabix-devel
+  mkdir build
+  cd build
+  cmake -DCMAKE_BUILD_TYPE=Release ..
+  ```
+  If you have built or installed LLVM somewhere CMake does not search, give its location:
+  `cmake -DCMAKE_PREFIX_PATH=/path/to/llvm -DCMAKE_BUILD_TYPE=Release ..` (or `-DLLVM_PATH=/path/to/llvm`).
+- `make -j8` builds everything; `make -j8 icgrep` builds just one tool (and the libraries it needs).
+- `make check` builds everything and runs the test suite.  `-DPARABIX_BUILD_TESTS=OFF` leaves
+  the kernel and unit test programs out of the build.
 
+The tools are then in `build/bin`.  A development build makes a shared library of each
+framework module (in `build/lib`), which the tools in `build/bin` use where they are: it is
+not meant to be installed (see below).
 
-In the configuration above, all compiled tools will then be found on `/path/to/parabix-devel/build/bin`
+### Object cache
 
-### Build Parabix as a lib
+Parabix tools compile their kernels at run time.  The compiled kernels are cached, so that
+later runs start quickly: in `~/.parabix/objcache` of the user running a tool (created when
+first needed), or in `$PARABIX_OBJECT_CACHE_DIR` if that is set.  `-object-cache-dir=<dir>`
+uses another directory for one run, `-enable-object-cache=0` turns the cache off, and
+`-trace-object-cache` reports what is read and written.  A background process
+(`cachejanitord`) removes the entries not used for a week.
 
-To build Parabix as a single lib, run the following command:
-- `cmake -DCMAKE_BUILD_TYPE=Release -DARTIFACT_MODE=Single -DARTIFACT_TYPE=Shared -DGENERATE_TOOLS=OFF ..`
+### Installing
+
+Installations are made from a build configured with `-DARTIFACT_MODE=Single`, which puts
+the whole framework in one shared library, `libparabix`:
+
+```
+mkdir build-install
+cd build-install
+cmake -DCMAKE_BUILD_TYPE=Release -DARTIFACT_MODE=Single -DPARABIX_BUILD_TESTS=OFF ..
+make -j8 install-tools
+```
+
+By default this installs the tools for your own use, under `~/.local` (make sure that
+`~/.local/bin` is on your `PATH`).  The configuration options:
+
+| Option | Values |
+|---|---|
+| `PARABIX_INSTALL_SCOPE` | `User` (default prefix `~/.local`), or `System` for all users (default prefix `/usr/local`) |
+| `CMAKE_INSTALL_PREFIX` | Another installation prefix |
+| `PARABIX_INSTALL_TOOLS` | The tools to install: `default`, `dev`, `all` (both), and tool names, e.g. `"default;ucount"` |
+
+The tool sets:
+
+- `default`: `icgrep`, `wc`, `base64`, `csvcut`, `csvgrep`, `csv2json`, `tconv`, `ldml_trules`,
+  `hexlines`, the transcoders `gb18030`, `u32u16`, `u32u8`, `u8u16`, `x8u16`, and the Unicode
+  normalizers `nfc`, `nfd`, `nfkd`.
+- `dev`: developer tools and demonstrations (`ucount`, `tokenizer`, `xch`, `editd`,
+  `idisa_exerciser`, `idisa_test`, `hashdemo`, `matchprior`, `ufilter`, the audio tools,
+  `ztf-runs`, `ztf-hash`).
+- `json`, `xml` and `ztf1` read Pablo source files at run time.  They are in no set, and can be
+  installed (by name) only for your own use.
+
+The make targets:
+
+| Target | Effect |
+|---|---|
+| `make install-tools` | Builds and installs the tools of `PARABIX_INSTALL_TOOLS` |
+| `make install-<tool>` | Builds and installs one tool, of any set |
+| `make install` | Builds everything, and installs the tools of `PARABIX_INSTALL_TOOLS` |
+| `make installcheck` | Runs the test suite on the installed tools (the tests of tools that are installed) |
+| `make uninstall-<tool>` | Uninstalls one tool; the library goes with the last tool |
+| `make uninstall` | Uninstalls everything |
+
+`DESTDIR=<dir>` stages any installation in another directory.  Uninstalling does not need
+the build directory: `cmake [-DTOOL=<tool>] -P <prefix>/share/parabix/uninstall.cmake`.
+
+The installed files:
+
+| Path (below the prefix) | Contents |
+|---|---|
+| `bin/icgrep`, `bin/px-<tool>` | The tools; all but `icgrep` are prefixed, so as not to hide system commands such as `wc` and `base64` |
+| `lib/libparabix.so.0.9` (`libparabix.0.9.dylib` on macOS) | The Parabix library |
+| `libexec/parabix/cachejanitord` | The object cache cleanup process |
+| `libexec/parabix/bin/` | Unprefixed links to `wc`, `base64`, `csvgrep`, `csvcut`, `csv2json`, `tconv` and `hexlines`, for those who put this directory on their `PATH` |
+| `share/parabix/` | Pablo sources, the records of the installed files, and the uninstall script |
+| `share/doc/parabix/` | READMEs and licenses |
+
+An installation can be moved: the tools find the library and their other files relative to
+their own location.  Boost is linked into `libparabix`, so the tools do not depend on the
+Boost libraries of the machine that built them.
+
+### Installing for all users
+
+```
+cmake -DCMAKE_BUILD_TYPE=Release -DARTIFACT_MODE=Single -DPARABIX_BUILD_TESTS=OFF \
+      -DPARABIX_INSTALL_SCOPE=System ..
+make -j8
+sudo make install-tools
+```
+
+A system installation also has a system-wide object cache: `/var/cache/parabix`
+(`/Library/Caches/parabix` on macOS), or `-DPARABIX_SYSTEM_OBJECT_CACHE_DIR=<dir>`
+(`none` for no system-wide cache).  Installing fills it by running each installed tool once
+(`share/parabix/prewarm.sh`), with the kernels that do not depend on what a run asks for.
+The tools read it after the user's own cache and never write to it; what neither cache has
+is compiled into the user's cache.  The system-wide cache is used only if it belongs to root
+(or to the user running the tool) and no one else can write to it.  Uninstalling removes it.
+
+Kernels are compiled for the processor of the machine compiling them, so the system-wide
+cache is not filled by staged installations (`DESTDIR`, or packages); run
+`sudo sh <prefix>/share/parabix/prewarm.sh` on the machine where the tools are installed.
+
+### Packages
+
+CPack makes binary packages for installing for all users, from a build configured as above
+(with `-DPARABIX_INSTALL_SCOPE=System`):
+
+```
+make -j8
+cpack                # TGZ, and DEB and RPM where dpkg-deb and rpmbuild are available
+cpack -G DEB         # one kind
+```
+
+The DEB and RPM packages install at the configured prefix, fill the system-wide object cache
+when installed, and empty it when removed.  Set the maintainer named in them with
+`-DPARABIX_PACKAGE_MAINTAINER="Name <address>"`.  A TGZ package is unpacked at the prefix it
+was configured for, after which the cache is filled by hand:
+
+```
+sudo tar xzf parabix-0.9.0-<system>.tar.gz -C <prefix> --strip-components=1
+sudo sh <prefix>/share/parabix/prewarm.sh
+```
 
 ### Papers
 
@@ -60,4 +172,3 @@ To build Parabix as a single lib, run the following command:
 
 ### License
 LLVM files are governed by the LLVM Release License in [LLVM-LICENSE.txt](LLVM-LICENSE.txt). `Parabix` is governed by Open Software License `3.0` in [OSL3.0.txt](OSL3.0.txt).
-

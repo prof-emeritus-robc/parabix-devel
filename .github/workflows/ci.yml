@@ -3,8 +3,9 @@
 #
 # Continuous integration: at most one run a day.  The only automatic trigger
 # is the daily schedule (no runs on push or pull request), and a scheduled
-# run is skipped when master has not changed since the last completed run.
-# A run can also be started by hand (Actions tab, "Run workflow").
+# run is skipped when master has not changed since the last scheduled run.
+# A run can also be started by hand (Actions tab, "Run workflow"), of all
+# jobs or one kind: gh workflow run ci.yml -f jobs=freebsd
 #
 # Jobs (all on GitHub's standard runners, free for public repositories):
 #   linux-x64, linux-arm64, macos   development build (ARTIFACT_MODE=Multiple), all tests
@@ -22,6 +23,12 @@ on:
   schedule:
     - cron: "17 9 * * *"     # 09:17 UTC daily
   workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Jobs to run"
+        type: choice
+        options: [all, linux, macos, install, freebsd]
+        default: all
 
 concurrency:
   group: ci
@@ -49,11 +56,12 @@ jobs:
           if [ "${{ github.event_name }}" != "schedule" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          # The commit of the last completed run of this workflow (whatever its result)
-          last=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=master&status=completed&per_page=1" \
+          # The commit of the last completed scheduled run (whatever its result; a
+          # run by hand may have run only some of the jobs)
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=master&event=schedule&status=completed&per_page=1" \
                    --jq '.workflow_runs[0].head_sha // ""')
           if [ "$last" = "${{ github.sha }}" ]; then
-            echo "master is unchanged since the last run ($last): skipping"
+            echo "master is unchanged since the last scheduled run ($last): skipping"
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -62,7 +70,7 @@ jobs:
   linux:
     name: ${{ matrix.name }}
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "linux"]'), inputs.jobs || 'all')
     strategy:
       fail-fast: false
       matrix:
@@ -105,7 +113,7 @@ jobs:
   macos:
     name: macos
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "macos"]'), inputs.jobs || 'all')
     runs-on: macos-15
     timeout-minutes: 180
     steps:
@@ -136,7 +144,7 @@ jobs:
   install:
     name: install (linux-x64, single library)
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "install"]'), inputs.jobs || 'all')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -205,7 +213,7 @@ jobs:
   freebsd:
     name: freebsd
     needs: changes
-    if: needs.changes.outputs.run == 'true'
+    if: needs.changes.outputs.run == 'true' && contains(fromJSON('["all", "freebsd"]'), inputs.jobs || 'all')
     runs-on: ubuntu-24.04
     timeout-minutes: 300
     steps:

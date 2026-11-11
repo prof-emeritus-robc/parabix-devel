@@ -22,6 +22,9 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <sys/mman.h>
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0     // (FreeBSD: memory is not reserved for mappings in any case)
+#endif
 #include <unistd.h>
 #include <stdio.h>
 #include <boost/filesystem.hpp>
@@ -267,7 +270,7 @@ Value * CBuilder::CreateUnlinkCall(Value * path) {
 Value * CBuilder::CreatePosixFAllocate(Value * fileDescriptor, Value * offset, Value * len) {
 #if defined(__APPLE__) || defined(_WIN32)
     return nullptr;
-#elif defined(__linux__)
+#else
     Module * const m = getModule();
     IntegerType * sizeTy = getSizeTy();
     FunctionType * fty = FunctionType::get(sizeTy, {getInt32Ty(), sizeTy, sizeTy}, false);

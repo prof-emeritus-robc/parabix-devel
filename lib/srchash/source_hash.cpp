@@ -14,9 +14,15 @@
 
 #if defined(__APPLE__)
 #include <mach-o/loader.h>
-#elif defined(__linux__)
+#elif defined(__ELF__)
+// (Linux and the BSDs)
 #include <link.h>
+#if defined(__linux__)
 #include <elf.h>
+#endif
+#ifndef NT_GNU_BUILD_ID
+#define NT_GNU_BUILD_ID 3
+#endif
 #endif
 
 namespace parabix {
@@ -140,7 +146,7 @@ std::string getImageBuildID(const void * address) {
     return std::string{};
 }
 
-#elif defined(__linux__)
+#elif defined(__ELF__)
 
 namespace {
 

@@ -62,8 +62,16 @@ set_property(CACHE PARABIX_INSTALL_SCOPE PROPERTY STRINGS User System)
 if(NOT PARABIX_INSTALL_SCOPE MATCHES "^(User|System)$")
     message(FATAL_ERROR "PARABIX_INSTALL_SCOPE must be either User or System")
 endif()
-if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT AND PARABIX_INSTALL_SCOPE STREQUAL "User")
-    set(CMAKE_INSTALL_PREFIX "$ENV{HOME}/.local" CACHE PATH "Install path prefix" FORCE)
+# The prefix follows the scope (also when the scope is changed later), unless
+# it was given: PARABIX_SCOPE_PREFIX is the one last set for a scope.
+if(PARABIX_INSTALL_SCOPE STREQUAL "User")
+    set(SCOPE_PREFIX "$ENV{HOME}/.local")
+else()
+    set(SCOPE_PREFIX "/usr/local")
+endif()
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT OR CMAKE_INSTALL_PREFIX STREQUAL "${PARABIX_SCOPE_PREFIX}")
+    set(CMAKE_INSTALL_PREFIX "${SCOPE_PREFIX}" CACHE PATH "Install path prefix" FORCE)
+    set(PARABIX_SCOPE_PREFIX "${SCOPE_PREFIX}" CACHE INTERNAL "The install prefix set for PARABIX_INSTALL_SCOPE")
 endif()
 set(PARABIX_INSTALL_TOOLS "default" CACHE STRING
     "Tools installed by make install: default, dev, all, or tool names (see cmake/ParabixInstall.cmake)")

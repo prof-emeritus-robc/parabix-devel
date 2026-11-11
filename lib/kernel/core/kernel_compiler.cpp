@@ -315,7 +315,7 @@ inline void KernelCompiler::callGenerateInitializeThreadLocalMethod(KernelBuilde
     auto & DL = b.getModule()->getDataLayout();
     Constant * const threadLocalTySize = b.getTypeSize(threadLocalTy);
     const auto align = DL.getABITypeAlign(threadLocalTy).value();
-    assert (boost::gcd<size_t>(align, CBuilder::PAGE_SIZE) == align);
+    assert (boost::gcd<size_t>(align, CBuilder::PageSize) == align);
     Value * allocedState = b.CreatePageAlignedMalloc(threadLocalTySize);
     b.CreateMemZero(allocedState, threadLocalTySize, align);
     b.CreateBr(initThreadLocal);

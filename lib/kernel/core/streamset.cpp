@@ -37,7 +37,6 @@
 #include <fcntl.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
-#undef PAGE_SIZE  // mach's macro (vm_page_size) would hide CBuilder::PAGE_SIZE
 #endif
 
 #include <llvm/Support/raw_os_ostream.h>
@@ -206,7 +205,7 @@ extern "C"
 uint8_t * make_circular_buffer(const size_t size, const size_t hasUnderflow) {
 
     assert (size > 0);
-    assert ((size % CBuilder::PAGE_SIZE) == 0);
+    assert ((size % CBuilder::PageSize) == 0);
 
     if (hasUnderflow == 0 && codegen::CircularBufferPoolMiB) {
         if (uint8_t * const addr = takePooledCircularBuffer(size)) {
@@ -261,7 +260,7 @@ extern "C"
 uint8_t * make_fd_backed_buffer(const size_t size, int & memfd) {
 
     assert (size > 0);
-    assert ((size % CBuilder::PAGE_SIZE) == 0);
+    assert ((size % CBuilder::PageSize) == 0);
 
     memfd = create_memfd();
     if (memfd == -1) {
@@ -287,7 +286,7 @@ extern "C"
 uint8_t * resize_fd_backed_buffer(const int memfd, uint8_t * const buffer, const size_t priorSize, const size_t newSize) {
 
     assert (newSize > 0);
-    assert ((newSize % CBuilder::PAGE_SIZE) == 0);
+    assert ((newSize % CBuilder::PageSize) == 0);
 
 //    if (msync(buffer, priorSize, MS_SYNC) != 0) {
 //        report_fatal_error(Twine{"failed to sync mmap buffer"});
@@ -858,7 +857,7 @@ void ManagedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capac
 
         if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
             b.CreateAssert(capacity, "capacity cannot be 0.");
-            b.CreateAssertZero(b.CreateURemRational(capacityBytes, CBuilder::PAGE_SIZE), "%" PRIu64 " x %" PRIu64, typeSize, capacity);
+            b.CreateAssertZero(b.CreateURemRational(capacityBytes, CBuilder::PageSize), "%" PRIu64 " x %" PRIu64, typeSize, capacity);
         }
 
         ConstantInt * const sz_ZERO = b.getSize(0);
@@ -938,7 +937,7 @@ void ManagedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capac
     // We want to solve (C * T) mod P = 0, where T and P are constants but C isn't
     // known until after JIT-compilation.
 
-    Rational stridesPerPage{CBuilder::PAGE_SIZE, typeSize};
+    Rational stridesPerPage{CBuilder::PageSize, typeSize};
     Value * capacity = b.CreateRoundUpRational(capacityMultiplier, stridesPerPage.numerator());
     SmallVector<Value *, 6> args(traceDynamicBuffer ? 6 : 3);
     args[0] = getHandle();
@@ -2156,7 +2155,7 @@ void FdBackedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capa
 
         if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::EnableAsserts))) {
             b.CreateAssert(capacity, "capacity cannot be 0.");
-            b.CreateAssertZero(b.CreateURemRational(capacityBytes, CBuilder::PAGE_SIZE), "%" PRIu64 " x %" PRIu64, typeSize, capacity);
+            b.CreateAssertZero(b.CreateURemRational(capacityBytes, CBuilder::PageSize), "%" PRIu64 " x %" PRIu64, typeSize, capacity);
         }
 
 
@@ -2234,7 +2233,7 @@ void FdBackedDynamicBuffer::allocateBuffer(KernelBuilder & b, Value * const capa
     // We want to solve (C * T) mod P = 0, where T and P are constants but C isn't
     // known until after JIT-compilation.
 
-    Rational stridesPerPage{CBuilder::PAGE_SIZE, typeSize};
+    Rational stridesPerPage{CBuilder::PageSize, typeSize};
     Value * capacity = b.CreateRoundUpRational(capacityMultiplier, stridesPerPage.numerator());
     SmallVector<Value *, 6> args(traceDynamicBuffer ? 6 : 3);
     args[0] = getHandle();

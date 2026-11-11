@@ -360,7 +360,7 @@ class CPUDriverJITMemoryManager : public jitlink::JITLinkMemoryManager {
         SlabNode(const size_t size, const Block * near = nullptr)
         : Slab([size, near](){
             std::error_code EC;
-            const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PAGE_SIZE);
+            const auto alignedSize = llvm::alignToPowerOf2(size, CBuilder::PageSize);
             auto slab = Mem::allocateMappedMemory(alignedSize, near, Mem::MF_READ | Mem::MF_WRITE, EC);
             if (EC) {
                 SmallVector<char, 256> tmp;
@@ -516,7 +516,7 @@ public:
             const auto used = n->AllocatedOffset.load(std::memory_order_relaxed);
             const auto alreadyProtected = n->ProtectedOffset;
             if (LLVM_LIKELY(used > alreadyProtected)) {
-                const auto protectEnd = std::min<uintptr_t>(llvm::alignTo(used, CBuilder::PAGE_SIZE), slabEnd);
+                const auto protectEnd = std::min<uintptr_t>(llvm::alignTo(used, CBuilder::PageSize), slabEnd);
                 const Block toProtect(reinterpret_cast<void*>(alreadyProtected), protectEnd - alreadyProtected);
                 const auto ec = Mem::protectMappedMemory(toProtect, Mem::MF_READ | Mem::MF_EXEC);
                 if (ec) {
@@ -579,7 +579,7 @@ private:
                     SlabNode * nextSlab = CurrentSlab.load(std::memory_order_acquire);
                     if (nextSlab == currentSlab) {
                         const auto minSize = std::max<uintptr_t>(currentSlab->Slab.allocatedSize(), totalSize * 4);
-                        const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PAGE_SIZE);
+                        const auto allocSize = llvm::alignToPowerOf2(minSize, CBuilder::PageSize);
                         // Hint near the original exec slab (rather than currentSlab) so growth keeps
                         // accumulating close to the anchor point instead of drifting slab by slab.
                         nextSlab = new SlabNode(allocSize, &ExecSlab.Slab);

@@ -50,7 +50,7 @@ class CBuilder : public virtual llvm::IRBuilder<>, public LLVMTypeSystemInterfac
 
 public:
 
-    const static size_t PAGE_SIZE;
+    const static size_t PageSize;
 
     CBuilder(llvm::LLVMContext & C);
 

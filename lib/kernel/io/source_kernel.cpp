@@ -62,7 +62,7 @@ void MMapSourceKernel::generateInitializeMethod(KernelBuilder & b, const unsigne
     b.CreateBr(exit);
 
     b.SetInsertPoint(emptyFile);
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     Value * const emptyFilePtr = b.CreateAnonymousMMap(b.getSize(pageSize));
     b.setScalarField("buffer", emptyFilePtr);
     b.setBaseAddress("sourceBuffer", emptyFilePtr);
@@ -90,7 +90,7 @@ void MMapSourceKernel::generateDoSegmentMethod(KernelBuilder & b, const unsigned
     // TODO: could we improve overall performance by trying to "preload" the data by reading it? This would increase
     // the cost of this kernel but might allow the first kernel to read the file data be better balanced with it.
 
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     ConstantInt * const CODE_UNIT_BYTES = b.getSize(codeUnitWidth / 8);
 
     Value * const consumedItems = b.getConsumedItemCount("sourceBuffer");
@@ -425,7 +425,7 @@ void MemorySourceKernel::generateInitializeMethod(KernelBuilder & b) {
     // the caller to have provided any. The extra page (beyond rounding fileBytes
     // up to a page) covers the case where fileBytes is itself an exact multiple
     // of the page size.
-    const auto pageSize = CBuilder::PAGE_SIZE;
+    const auto pageSize = CBuilder::PageSize;
     Value * const allocBytes = b.CreateAdd(b.CreateRoundUpRational(fileBytes, pageSize), b.getSize(pageSize));
     Value * const ownedBuffer = b.CreateAlignedMalloc(allocBytes, 64);
     b.CreateMemCpy(ownedBuffer, fileSource, fileBytes, 1);

@@ -92,7 +92,7 @@ using namespace llvm;
 
 static int accumulatedFreeCalls = 0;
 
-const size_t CBuilder::PAGE_SIZE = sys::Process::getPageSizeEstimate();
+const size_t CBuilder::PageSize = sys::Process::getPageSizeEstimate();
 
 extern "C" void free_debug_wrapper(void * ptr) {
     if (accumulatedFreeCalls < codegen::FreeCallBisectLimit) {
@@ -750,7 +750,7 @@ Value * CBuilder::CreateMRemap(Value * addr, Value * oldSize, Value * newSize) {
         }
     } else { // no OS mremap support
         ptr = CreateAnonymousMMap(newSize);
-        CreateMemCpy(ptr, addr, oldSize, CBuilder::PAGE_SIZE);
+        CreateMemCpy(ptr, addr, oldSize, CBuilder::PageSize);
         CreateMUnmap(addr, oldSize);
     }
     return ptr;
@@ -771,7 +771,7 @@ Value * CBuilder::CreateMUnmap(Value * addr, Value * len) {
         IntegerType * const intPtrTy = getIntPtrTy(DL);
         CreateAssert(len, "CreateMUnmap: length cannot be 0");
         Value * const addrValue = CreatePtrToInt(addr, intPtrTy);
-        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE));
+        Value * const pageOffset = CreateURem(addrValue, ConstantInt::get(intPtrTy, CBuilder::PageSize));
         CreateAssertZero(pageOffset, "CreateMUnmap: addr must be a multiple of the page size");
         Value * const boundCheck = CreateICmpULT(addrValue, CreateSub(ConstantInt::getAllOnesValue(intPtrTy), CreateZExtOrTrunc(len, intPtrTy)));
         CreateAssert(boundCheck, "CreateMUnmap: addresses in [addr, addr+len) are outside the valid address space range");
@@ -796,7 +796,7 @@ Value * CBuilder::CreateMProtect(Value * addr, Value * size, const Protect prote
 
         auto & DL = getModule()->getDataLayout();
         IntegerType * const intPtrTy = getIntPtrTy(DL);
-        Constant * const pageSize = ConstantInt::get(intPtrTy, CBuilder::PAGE_SIZE);
+        Constant * const pageSize = ConstantInt::get(intPtrTy, CBuilder::PageSize);
         CreateAssertZero(CreateURem(CreatePtrToInt(addr, intPtrTy), pageSize), "CreateMProtect: addr must be aligned to page boundary");
     }
 

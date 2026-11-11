@@ -54,7 +54,6 @@ static cl::opt<bool> ShowPositions("display", cl::desc("Display the match positi
 
 static cl::opt<bool> UsePhases("phased", cl::desc("Use phased pipeline stages instead of multiple pipelines."), cl::init(false));
 
-static cl::opt<int> Threads("threads", cl::desc("Total number of threads."), cl::init(1));
 
 static cl::opt<bool> MultiEditdKernels("enable-multieditd-kernels", cl::desc("Construct multiple editd kernels in one pipeline."));
 #ifdef USE_MULTI_EDITD_MERGE_GROUPS

@@ -1,0 +1,86 @@
+#  Part of the Parabix Project, under the Open Software License 3.0.
+#  SPDX-License-Identifier: OSL-3.0
+
+# Uninstalls Parabix, or one of its tools, using the records of the files
+# each component installed (cmake/ParabixInstallRecord.cmake).
+# Installed as <prefix>/@PARABIX_UNINSTALL_SCRIPT@, it needs no build tree:
+#
+#   cmake -P <prefix>/@PARABIX_UNINSTALL_SCRIPT@              everything
+#   cmake -DTOOL=<tool> -P <prefix>/@PARABIX_UNINSTALL_SCRIPT@   one tool
+#
+# (make uninstall and make uninstall-<tool> in the build tree run it.)
+# A tool is uninstalled with the Parabix library, the cache daemon and the
+# documents when no other Parabix tool remains.  Options:
+#   -DPREFIX=<prefix>   the installation (default: the one holding this script)
+#   $DESTDIR            as when installing
+# The object caches of users (~/.parabix/objcache) are left alone.
+
+cmake_minimum_required(VERSION 3.14)
+
+if(NOT PREFIX)
+    # This script is <prefix>/@PARABIX_UNINSTALL_SCRIPT@
+    get_filename_component(PREFIX "${CMAKE_CURRENT_LIST_DIR}/@PARABIX_UNINSTALL_SCRIPT_TO_PREFIX@" ABSOLUTE)
+endif()
+set(ROOT "$ENV{DESTDIR}${PREFIX}")
+set(RECORDS "${ROOT}/@PARABIX_RECORD_DIR@")
+
+# Removes the files of a component, and its record.
+function(uninstall_component COMPONENT)
+    set(RECORD "${RECORDS}/${COMPONENT}.txt")
+    file(STRINGS "${RECORD}" FILES)
+    foreach(REL ${FILES})
+        set(FILE "${ROOT}/${REL}")
+        if(EXISTS "${FILE}" OR IS_SYMLINK "${FILE}")
+            message(STATUS "Removing: ${FILE}")
+            file(REMOVE "${FILE}")
+        endif()
+    endforeach()
+    file(REMOVE "${RECORD}")
+endfunction()
+
+function(tool_records OUT)
+    file(GLOB RECORDS_FOUND RELATIVE "${RECORDS}" "${RECORDS}/tool-*.txt")
+    set(${OUT} ${RECORDS_FOUND} PARENT_SCOPE)
+endfunction()
+
+if(NOT EXISTS "${RECORDS}")
+    message(FATAL_ERROR "No Parabix installation in ${ROOT}")
+endif()
+
+if(TOOL)
+    if(NOT EXISTS "${RECORDS}/tool-${TOOL}.txt")
+        message(FATAL_ERROR "${TOOL} is not installed in ${ROOT}")
+    endif()
+    uninstall_component(tool-${TOOL})
+    tool_records(REMAINING)
+    if(REMAINING)
+        string(REPLACE ".txt" "" REMAINING "${REMAINING}")
+        string(REPLACE "tool-" "" REMAINING "${REMAINING}")
+        string(REPLACE ";" " " REMAINING "${REMAINING}")
+        message(STATUS "Still installed: ${REMAINING}")
+        return()
+    endif()
+    message(STATUS "No Parabix tool remains; uninstalling the Parabix runtime")
+else()
+    tool_records(TOOLS)
+    foreach(RECORD ${TOOLS})
+        string(REPLACE ".txt" "" COMPONENT "${RECORD}")
+        uninstall_component(${COMPONENT})
+    endforeach()
+endif()
+
+if(EXISTS "${RECORDS}/runtime.txt")
+    uninstall_component(runtime)
+endif()
+
+# The directories of Parabix, once empty (most specific first)
+foreach(DIR @PARABIX_OWNED_DIRS@)
+    set(DIR "${ROOT}/${DIR}")
+    if(IS_DIRECTORY "${DIR}")
+        file(GLOB ENTRIES LIST_DIRECTORIES true "${DIR}/*" "${DIR}/.*")
+        if(NOT ENTRIES)
+            message(STATUS "Removing: ${DIR}")
+            file(REMOVE_RECURSE "${DIR}")
+        endif()
+    endif()
+endforeach()

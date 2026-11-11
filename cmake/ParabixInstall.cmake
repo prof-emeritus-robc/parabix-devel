@@ -29,6 +29,14 @@
 #
 # Components: runtime (library, daemon, documents) and tool-<tool> for each
 # tool; `cmake -DCOMPONENT=tool-wc -P cmake_install.cmake` installs one.
+# Each records the files it installs in share/parabix/manifests (see
+# cmake/ParabixInstallRecord.cmake).
+#
+# Uninstall:
+#   make uninstall               everything installed to the prefix
+#   make uninstall-<tool>        one tool, and the runtime with the last one
+#   cmake [-DTOOL=<tool>] -P <prefix>/share/parabix/uninstall.cmake
+#                                the same, without the build tree
 
 # The default set: tools for general use.
 set(PARABIX_TOOLS_DEFAULT
@@ -97,7 +105,34 @@ function(parabix_install_name OUT TOOL)
     endif()
 endfunction(parabix_install_name)
 
+# The records of installed files, and the uninstall script
+set(PARABIX_RECORD_DIR ${CMAKE_INSTALL_DATADIR}/parabix/manifests)
+set(PARABIX_UNINSTALL_SCRIPT ${CMAKE_INSTALL_DATADIR}/parabix/uninstall.cmake)
+file(RELATIVE_PATH PARABIX_UNINSTALL_SCRIPT_TO_PREFIX ${CMAKE_INSTALL_FULL_DATADIR}/parabix ${CMAKE_INSTALL_PREFIX})
+# The directories of Parabix, removed once empty (most specific first)
+set(PARABIX_OWNED_DIRS
+    ${CMAKE_INSTALL_LIBEXECDIR}/parabix/bin
+    ${CMAKE_INSTALL_LIBEXECDIR}/parabix
+    ${CMAKE_INSTALL_DATADIR}/parabix/pablo
+    ${PARABIX_RECORD_DIR}
+    ${CMAKE_INSTALL_DATADIR}/parabix
+    ${CMAKE_INSTALL_DOCDIR})
+configure_file(${CMAKE_CURRENT_LIST_DIR}/ParabixUninstall.cmake.in ${PROJECT_BINARY_DIR}/ParabixUninstall.cmake @ONLY)
+
+# Records the files of a component as it is installed: PHASE START before
+# its rules, END after them.
+function(parabix_install_record COMPONENT PHASE)
+    install(CODE "
+        set(PARABIX_RECORD_PHASE ${PHASE})
+        set(PARABIX_RECORD_COMPONENT ${COMPONENT})
+        set(PARABIX_RECORD_DIR \"${PARABIX_RECORD_DIR}\")
+        include(\"${PROJECT_SOURCE_DIR}/cmake/ParabixInstallRecord.cmake\")"
+        COMPONENT ${COMPONENT} ${ARGN})
+endfunction(parabix_install_record)
+
 ###   Component runtime   ###
+
+parabix_install_record(runtime START)
 
 if(TARGET ${PARABIX_MONO_TARGET} AND NOT ARTIFACT_TYPE STREQUAL "Static")
     install(TARGETS ${PARABIX_MONO_TARGET}
@@ -114,6 +149,17 @@ install(FILES
         ${PROJECT_SOURCE_DIR}/LLVM-LICENSE.txt
     DESTINATION ${CMAKE_INSTALL_DOCDIR}
     COMPONENT runtime)
+install(FILES ${PROJECT_BINARY_DIR}/ParabixUninstall.cmake
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/parabix
+    RENAME uninstall.cmake
+    COMPONENT runtime)
+parabix_install_record(runtime END)
+
+# make uninstall: everything installed to the prefix
+add_custom_target(uninstall
+    COMMAND ${CMAKE_COMMAND} -DPREFIX=${CMAKE_INSTALL_PREFIX} -P ${PROJECT_BINARY_DIR}/ParabixUninstall.cmake
+    COMMENT "Uninstalling Parabix from ${CMAKE_INSTALL_PREFIX}"
+    VERBATIM)
 
 ###   Components tool-<tool>   ###
 
@@ -139,6 +185,7 @@ foreach(TOOL ${PARABIX_TOOLS_DEFAULT} ${PARABIX_TOOLS_DEV} ${PARABIX_TOOLS_USER_
         set(EXCLUDE EXCLUDE_FROM_ALL)
     endif()
     parabix_install_name(INSTALL_NAME ${TOOL})
+    parabix_install_record(tool-${TOOL} START ${EXCLUDE})
     # Copied as built: the build tree has the installed run paths.
     install(PROGRAMS $<TARGET_FILE:${TOOL}>
         DESTINATION ${CMAKE_INSTALL_BINDIR}
@@ -164,6 +211,7 @@ foreach(TOOL ${PARABIX_TOOLS_DEFAULT} ${PARABIX_TOOLS_DEV} ${PARABIX_TOOLS_USER_
             list(APPEND CMAKE_INSTALL_MANIFEST_FILES \"\${INSTALLED}\")"
             COMPONENT tool-${TOOL} ${EXCLUDE})
     endif()
+    parabix_install_record(tool-${TOOL} END ${EXCLUDE})
     # make install-<tool>: build and install the tool (with the runtime)
     add_custom_target(install-${TOOL}
         COMMAND ${CMAKE_COMMAND} -DCOMPONENT=runtime -P ${PROJECT_BINARY_DIR}/cmake_install.cmake
@@ -171,6 +219,11 @@ foreach(TOOL ${PARABIX_TOOLS_DEFAULT} ${PARABIX_TOOLS_DEV} ${PARABIX_TOOLS_USER_
         COMMENT "Installing ${INSTALL_NAME}"
         VERBATIM)
     add_dependencies(install-${TOOL} ${TOOL} ${PARABIX_MONO_TARGET} cachejanitord)
+    # make uninstall-<tool>
+    add_custom_target(uninstall-${TOOL}
+        COMMAND ${CMAKE_COMMAND} -DPREFIX=${CMAKE_INSTALL_PREFIX} -DTOOL=${TOOL} -P ${PROJECT_BINARY_DIR}/ParabixUninstall.cmake
+        COMMENT "Uninstalling ${INSTALL_NAME}"
+        VERBATIM)
 endforeach()
 
 # make install-tools: build and install the selected tools only

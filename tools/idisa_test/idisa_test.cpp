@@ -39,7 +39,7 @@ static cl::opt<std::string> Operand2TestFile(cl::Positional, cl::desc("Operand 2
 static cl::opt<std::string> TestOutputFile("o", cl::desc("Test output file."), cl::cat(testFlags));
 static cl::opt<bool> QuietMode("q", cl::desc("Suppress output, set the return code only."), cl::cat(testFlags));
 static cl::opt<int> ShiftMask("ShiftMask", cl::desc("Mask applied to the shift operand (2nd operand) of simd_sllv, srlv, srav, rotl, rotr"), cl::init(0));
-static cl::opt<int> Immediate("i", cl::desc("Immediate value for mvmd_dslli"), cl::init(1));
+static cl::opt<int> Immediate("immediate", cl::desc("Immediate value for mvmd_dslli"), cl::init(1));
 static cl::opt<IDISA::ShuffleMode> ShuffleIndex("ShuffleIndex",
 cl::values(clEnumValN(IDISA::ShuffleMode::TruncateIndex, "Truncate", "Truncate out-of-bound shuffle indexes."),
            clEnumValN(IDISA::ShuffleMode::ZeroOnIndexOver, "ZeroOnOver", "Select zero for shuffle indexes out of bound."),

@@ -65,6 +65,7 @@ static cl::alias FileAlias("file", cl::desc("Alias for -f"), cl::aliasopt(FileOp
  */
     
 static cl::OptionCategory Input_Options("B. Input Options", "These options control the input.");
+static argv::RegisterFileSelectOptions FileSelectOptions;
 
 bool TextFlag;
 static cl::opt<bool, true> TextOption("a", cl::location(TextFlag), cl::desc("Treat each input file as text, even if it is a binary file."), cl::cat(Input_Options), cl::Grouping);

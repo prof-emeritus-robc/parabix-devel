@@ -44,52 +44,77 @@ namespace argv {
 cl::OptionCategory File_Select_Options("File Selection Options", "These options control the input sources.");
 
 bool NoMessagesFlag;
-static cl::opt<bool, true> NoMessagesOption("s", cl::location(NoMessagesFlag), cl::desc("Suppress messages for file errors."), cl::cat(File_Select_Options), cl::Grouping);
-static cl::alias NoMessagesAlias("no-messages", cl::desc("Alias for -s"), cl::aliasopt(NoMessagesOption));
-
 bool RecursiveFlag;
-static cl::opt<bool, true> RecursiveOption("r", cl::location(RecursiveFlag), cl::desc("Recursively process files within directories, (but follow only top-level symlinks unless -R)."), cl::cat(File_Select_Options), cl::Grouping);
-static cl::alias RecursiveAlias("recursive", cl::desc("Alias for -r"), cl::aliasopt(RecursiveOption));
-
 bool DereferenceRecursiveFlag;
-static cl::opt<bool, true> DereferenceRecursiveOption("R", cl::location(DereferenceRecursiveFlag), cl::desc("Recursively process files within directories, following symlinks at all levels."), cl::cat(File_Select_Options), cl::Grouping);
-static cl::alias DereferenceRecursiveAlias("dereference-recursive", cl::desc("Alias for -R"), cl::aliasopt(DereferenceRecursiveOption));
-
 bool MmapFlag;
-static cl::opt<bool, true> MmapOption("mmap", cl::location(MmapFlag),  cl::init(false), cl::desc("Use mmap for file input."), cl::cat(File_Select_Options));
-
-static cl::list<std::string> ExcludeFiles("exclude", cl::ZeroOrMore,
-                                          cl::desc("Exclude files matching the given filename GLOB pattern."), cl::cat(File_Select_Options));
-
-static cl::opt<std::string> ExcludeFromFlag("exclude-from", cl::desc("Exclude files matching filename GLOB patterns from the given file."), cl::cat(File_Select_Options));
-
-static cl::list<std::string> ExcludeDirectories("exclude-dir", cl::desc("Exclude directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options));
-
-static cl::opt<std::string> ExcludePerDirectory("exclude-per-directory",
-                                                cl::desc("File in each directory specifying files to exclude while recursing (default .gitignore; used by default only by icgrep).  Empty for none."),
-                                                cl::init(".gitignore"), cl::cat(File_Select_Options));
-
-static cl::list<std::string> IncludeDirectories("include-dir", cl::desc("Include directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options));
-
-static cl::list<std::string> IncludeFiles("include", cl::ZeroOrMore, cl::desc("Include only files matching the given filename GLOB pattern(s)."), cl::cat(File_Select_Options));
-
 DevDirAction DevicesFlag;
-static cl::opt<DevDirAction, true> DevicesOption("D", cl::desc("Processing mode for devices:"),
-                                                 cl::values(clEnumValN(Read, "read", "Treat devices as files to be searched."),
-                                                            clEnumValN(Skip, "skip", "Silently skip devices.")), cl::cat(File_Select_Options), cl::location(DevicesFlag), cl::init(Read));
-static cl::alias DevicesAlias("devices", cl::desc("Alias for -D"), cl::aliasopt(DevicesOption));
-
 DevDirAction DirectoriesFlag;
-static cl::opt<DevDirAction, true> DirectoriesOption("d", cl::desc("Processing mode for directories:"),
-                                                     cl::values(clEnumValN(Read, "read", "Print an error message for any listed directories."),
-                                                                clEnumValN(Skip, "skip", "Silently skip directories."),
-                                                                clEnumValN(Recurse, "recurse", "Recursive process directories, equivalent to -r.")), cl::cat(File_Select_Options), cl::location(DirectoriesFlag), cl::init(Read));
-static cl::alias DirectoriesAlias("directories", cl::desc("Alias for -d"), cl::aliasopt(DirectoriesOption));
 
-static cl::opt<bool> TraceFileSelect("TraceFileSelect", cl::desc("Trace file selection"), cl::cat(File_Select_Options));
-static cl::opt<bool> TimeFileSelect("TimeFileSelect", cl::desc("Report the time required for file selection."), cl::cat(File_Select_Options));
+namespace {
 
-static cl::opt<unsigned> GitREcoalescing("git-RE-coalescing", cl::desc("gitignore RE coalescing factor"), cl::init(10), cl::cat(File_Select_Options));
+// The file selection options, created by RegisterFileSelectOptions in the
+// tools that select files, so that other tools have none of them.
+struct FileSelectOptions {
+
+cl::opt<bool, true> NoMessagesOption{"s", cl::location(NoMessagesFlag), cl::desc("Suppress messages for file errors."), cl::cat(File_Select_Options), cl::Grouping};
+cl::alias NoMessagesAlias{"no-messages", cl::desc("Alias for -s"), cl::aliasopt(NoMessagesOption)};
+
+cl::opt<bool, true> RecursiveOption{"r", cl::location(RecursiveFlag), cl::desc("Recursively process files within directories, (but follow only top-level symlinks unless -R)."), cl::cat(File_Select_Options), cl::Grouping};
+cl::alias RecursiveAlias{"recursive", cl::desc("Alias for -r"), cl::aliasopt(RecursiveOption)};
+
+cl::opt<bool, true> DereferenceRecursiveOption{"R", cl::location(DereferenceRecursiveFlag), cl::desc("Recursively process files within directories, following symlinks at all levels."), cl::cat(File_Select_Options), cl::Grouping};
+cl::alias DereferenceRecursiveAlias{"dereference-recursive", cl::desc("Alias for -R"), cl::aliasopt(DereferenceRecursiveOption)};
+
+cl::opt<bool, true> MmapOption{"mmap", cl::location(MmapFlag),  cl::init(false), cl::desc("Use mmap for file input."), cl::cat(File_Select_Options)};
+
+cl::list<std::string> ExcludeFiles{"exclude", cl::ZeroOrMore,
+                                   cl::desc("Exclude files matching the given filename GLOB pattern."), cl::cat(File_Select_Options)};
+
+cl::opt<std::string> ExcludeFromFlag{"exclude-from", cl::desc("Exclude files matching filename GLOB patterns from the given file."), cl::cat(File_Select_Options)};
+
+cl::list<std::string> ExcludeDirectories{"exclude-dir", cl::desc("Exclude directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options)};
+
+cl::opt<std::string> ExcludePerDirectory{"exclude-per-directory",
+                                         cl::desc("File in each directory specifying files to exclude while recursing (default .gitignore; used by default only by icgrep).  Empty for none."),
+                                         cl::init(".gitignore"), cl::cat(File_Select_Options)};
+
+cl::list<std::string> IncludeDirectories{"include-dir", cl::desc("Include directories matching the given pattern."), cl::ZeroOrMore, cl::cat(File_Select_Options)};
+
+cl::list<std::string> IncludeFiles{"include", cl::ZeroOrMore, cl::desc("Include only files matching the given filename GLOB pattern(s)."), cl::cat(File_Select_Options)};
+
+cl::opt<DevDirAction, true> DevicesOption{"D", cl::desc("Processing mode for devices:"),
+                                          cl::values(clEnumValN(Read, "read", "Treat devices as files to be searched."),
+                                                     clEnumValN(Skip, "skip", "Silently skip devices.")), cl::cat(File_Select_Options), cl::location(DevicesFlag), cl::init(Read)};
+cl::alias DevicesAlias{"devices", cl::desc("Alias for -D"), cl::aliasopt(DevicesOption)};
+
+cl::opt<DevDirAction, true> DirectoriesOption{"d", cl::desc("Processing mode for directories:"),
+                                              cl::values(clEnumValN(Read, "read", "Print an error message for any listed directories."),
+                                                         clEnumValN(Skip, "skip", "Silently skip directories."),
+                                                         clEnumValN(Recurse, "recurse", "Recursive process directories, equivalent to -r.")), cl::cat(File_Select_Options), cl::location(DirectoriesFlag), cl::init(Read)};
+cl::alias DirectoriesAlias{"directories", cl::desc("Alias for -d"), cl::aliasopt(DirectoriesOption)};
+
+cl::opt<bool> TraceFileSelect{"TraceFileSelect", cl::desc("Trace file selection"), cl::cat(File_Select_Options)};
+cl::opt<bool> TimeFileSelect{"TimeFileSelect", cl::desc("Report the time required for file selection."), cl::cat(File_Select_Options)};
+
+cl::opt<unsigned> GitREcoalescing{"git-RE-coalescing", cl::desc("gitignore RE coalescing factor"), cl::init(10), cl::cat(File_Select_Options)};
+
+};
+
+FileSelectOptions * Registered = nullptr;
+
+FileSelectOptions & registeredOptions() {
+    if (LLVM_UNLIKELY(Registered == nullptr)) {
+        report_fatal_error("file selection without argv::RegisterFileSelectOptions");
+    }
+    return *Registered;
+}
+
+} // anonymous namespace
+
+RegisterFileSelectOptions::RegisterFileSelectOptions() {
+    static FileSelectOptions opts;
+    Registered = &opts;
+}
 
 
 
@@ -119,17 +144,17 @@ static std::vector<SelectionOption> selectionOptions(bool directories) {
         }
     };
     if (directories) {
-        add(IncludeDirectories, re::PatternKind::Include);
-        add(ExcludeDirectories, re::PatternKind::Exclude);
+        add(registeredOptions().IncludeDirectories, re::PatternKind::Include);
+        add(registeredOptions().ExcludeDirectories, re::PatternKind::Exclude);
     } else {
-        add(IncludeFiles, re::PatternKind::Include);
-        add(ExcludeFiles, re::PatternKind::Exclude);
-        if (ExcludeFromFlag.getNumOccurrences()) {
-            std::ifstream globFile(ExcludeFromFlag.c_str());
+        add(registeredOptions().IncludeFiles, re::PatternKind::Include);
+        add(registeredOptions().ExcludeFiles, re::PatternKind::Exclude);
+        if (registeredOptions().ExcludeFromFlag.getNumOccurrences()) {
+            std::ifstream globFile(registeredOptions().ExcludeFromFlag.c_str());
             std::string r;
             if (globFile.is_open()) {
                 while (std::getline(globFile, r)) {
-                    options.push_back(SelectionOption{ExcludeFromFlag.getPosition(), re::PatternKind::Exclude, r});
+                    options.push_back(SelectionOption{registeredOptions().ExcludeFromFlag.getPosition(), re::PatternKind::Exclude, r});
                 }
                 globFile.close();
             }
@@ -186,7 +211,7 @@ re::PatternVector getIncludeExcludePatterns(bool commandLine) {
 namespace fs = boost::filesystem;
 //
 void selectPath(std::vector<fs::path> & collectedPaths, fs::path && p) {
-    if (TraceFileSelect) {
+    if (registeredOptions().TraceFileSelect) {
         llvm::errs() << "Selecting: " << p.string() << "\n";
     }
     collectedPaths.emplace_back(std::move(p));
@@ -306,7 +331,7 @@ struct RecursiveSelection {
     const std::string & ignoreFileName;
     // Devices, FIFOs and sockets found while recursing are read only when
     // -D read is given explicitly (GNU grep).
-    const bool readDevices = (DevicesFlag == Read) && (DevicesOption.getNumOccurrences() > 0);
+    const bool readDevices = (DevicesFlag == Read) && (registeredOptions().DevicesOption.getNumOccurrences() > 0);
     // The directories being recursed into, to detect loops (only possible
     // with -R, as symlinks found while recursing are otherwise not followed).
     std::vector<DirectoryId> ancestors;
@@ -370,7 +395,7 @@ static void readDirectory(DirectoryEntries & d, RecursiveSelection & r) {
         if (errc2) break;
     }
     if (d.hasIgnoreFile) {
-        d.ignorePatterns = coalesceREs(re::parseGitIgnoreFile(d.path, r.ignoreFileName), GitREcoalescing);
+        d.ignorePatterns = coalesceREs(re::parseGitIgnoreFile(d.path, r.ignoreFileName), registeredOptions().GitREcoalescing);
     }
 }
 
@@ -500,7 +525,7 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
 
     // In non-recursive greps with no include/exclude processing, we simply assemble the
     // paths.
-    if ((DirectoriesFlag != Recurse) && (ExcludeFiles.empty()) && (IncludeFiles.empty()) && (ExcludeFromFlag.empty())) {
+    if ((DirectoriesFlag != Recurse) && (registeredOptions().ExcludeFiles.empty()) && (registeredOptions().IncludeFiles.empty()) && (registeredOptions().ExcludeFromFlag.empty())) {
         for (const auto & f : inputFiles) {
             if (f == "-") {  // stdin, will always be searched.
                 mStdIn = true;
@@ -566,7 +591,7 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
     // recursing, with their own patterns (see getIncludeExcludePatterns).
     // These levels are filters: .gitignore patterns (pushed for each
     // directory with such a file) cannot override them.
-    pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(true), GitREcoalescing), true);
+    pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(true), registeredOptions().GitREcoalescing), true);
 
     const auto commandLineFileCandidates = fileCandidates.getCandidateCount();
     if (commandLineFileCandidates > 0) {
@@ -591,15 +616,15 @@ std::vector<fs::path> FileSelection::selectFiles(CPUDriver & driver, const cl::l
         pathSelectEngine.doGrep(dirCandidates.data(), dirCandidates.size(), directoryAccum);
         mRecursedIntoDirectory = !selectedDirectories.empty();
         pathSelectEngine.pop();
-        pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), GitREcoalescing), true);
+        pathSelectEngine.push(coalesceREs(getIncludeExcludePatterns(false), registeredOptions().GitREcoalescing), true);
         // Select files from subdirectories using the recursive process.
         // The per-directory ignore file, if the tool or the command line asks for one.
-        const bool useIgnoreFiles = mConfig.useIgnoreFiles || (ExcludePerDirectory.getNumOccurrences() > 0);
-        const std::string ignoreFileName = useIgnoreFiles ? ExcludePerDirectory.getValue() : std::string();
+        const bool useIgnoreFiles = mConfig.useIgnoreFiles || (registeredOptions().ExcludePerDirectory.getNumOccurrences() > 0);
+        const std::string ignoreFileName = useIgnoreFiles ? registeredOptions().ExcludePerDirectory.getValue() : std::string();
         RecursiveSelection r{pathSelectEngine, collectedPaths, ignoreFileName};
         selectInDirectories(selectedDirectories, r);
     }
-    if (TimeFileSelect) {
+    if (registeredOptions().TimeFileSelect) {
         auto file_select_done = std::chrono::high_resolution_clock::now();
         auto file_select_time = file_select_done - file_select_start;
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(file_select_time).count();

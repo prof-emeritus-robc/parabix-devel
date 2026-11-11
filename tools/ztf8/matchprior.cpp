@@ -29,6 +29,7 @@ using namespace llvm;
 using namespace codegen;
 
 static cl::OptionCategory matchpriorFlags("Command Flags", "matchprior options");
+static argv::RegisterFileSelectOptions FileSelectOptions;
 
 static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::ZeroOrMore, cl::cat(matchpriorFlags));
 

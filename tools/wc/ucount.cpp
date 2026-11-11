@@ -45,6 +45,7 @@ using namespace codegen;
 using namespace kernel;
 
 static cl::OptionCategory ucFlags("Command Flags", "ucount options");
+static argv::RegisterFileSelectOptions FileSelectOptions;
 
 static cl::opt<std::string> CC_expr(cl::Positional, cl::desc("<Unicode character class expression>"), cl::Required, cl::cat(ucFlags));
 static cl::opt<bool> CountOnly("c", cl::desc("CountOnly flag for compatibility with greptest"), cl::cat(ucFlags));

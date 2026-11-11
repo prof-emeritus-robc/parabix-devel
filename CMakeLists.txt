@@ -15,6 +15,13 @@
 
 cmake_minimum_required(VERSION 3.12)
 
+# Allow target_link_libraries on the targets of other directories, as
+# parabix_single_finalize does.  Set before any function is defined, since
+# functions use the policies in effect where they are defined.
+if(POLICY CMP0079)
+    cmake_policy(SET CMP0079 NEW)
+endif()
+
 project(parabix)
 enable_testing()
 
@@ -28,6 +35,7 @@ option(LLVM_PATH "LLVM root directory")
 option(GENERATE_TOOLS "Controls whether or not it generate tools" ON)
 option(USE_LIBBACKTRACE "Allows framework to provide more detailed backtraces in JIT compiled code. Library available from github.com/ianlancetaylor/libbacktrace" OFF)
 option(SET_DEFAULT_OBJCACHE_DIR "Whether or not to set the default object cache directory at compile time" ON)
+option(PARABIX_BUILD_TESTS "Build the kernel tests (tests/) and unit tests (QA/unit-tests)" ON)
 
 # Build Artifact Configuration
 set(ARTIFACT_MODE "Multiple" CACHE STRING "Build framework into a single artifact (Single) or multiple artifacts (Multiple)")
@@ -74,7 +82,10 @@ message(STATUS "Host Processor ${CMAKE_HOST_SYSTEM_PROCESSOR}")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64" OR CMAKE_SYSTEM_PROCESSOR MATCHES "arm64") 
 set(PARABIX_TARGETS_TO_BUILD AArch64 ARM)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_ARM_TARGET")
+if(APPLE)
+# An option of Apple's linker only
 add_link_options(LINKER:-no_warn_duplicate_libraries)
+endif()
 else()
 set(PARABIX_TARGETS_TO_BUILD X86)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_X86_TARGET")
@@ -232,16 +243,10 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_VERSION='\"${Parabix_REVISION}
 
 # Kernels defined in an image without a registered source hash fall back to the
 # image's linker build ID (see lib/srchash/source_hash.cpp); make sure ELF
-# binaries always carry an NT_GNU_BUILD_ID note.  Mach-O binaries get LC_UUID by default.
-if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+# binaries always carry an NT_GNU_BUILD_ID note (Linux and the BSDs alike).
+# Mach-O binaries get LC_UUID by default.
+if (NOT APPLE)
     add_link_options(-Wl,--build-id)
-endif()
-
-# Use gold linker on Linux:gcc
-if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fuse-ld=gold")
-    endif()
 endif()
 
 # Use address sanitizer if desiered
@@ -284,7 +289,10 @@ endif()
 function(parabix_add_module)
     cmake_parse_arguments(
         ARG             # resultant argument prefix
-        "USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH" # boolean args
+        "USES_CERNROOT;REQUIRES_RTTI;NO_SOURCE_HASH;EXCLUDE_FROM_SINGLE" # boolean args
+                        #   EXCLUDE_FROM_SINGLE: in ARTIFACT_MODE=Single, build the module as
+                        #       a library of its own, not as part of the single artifact
+                        #       (for modules only tests use)
         "NAME"          # mono-valued arguments:
                         #   NAME: target name
         "SRC;DEPS;CODEGEN_DEPS" # multi-valued arguments:
@@ -304,10 +312,14 @@ function(parabix_add_module)
         set(SRCHASH_CODEGEN_ARGS CODEGEN_DEPS ${ARG_CODEGEN_DEPS})
     endif()
     parabix_srchash_add_inputs(${ARG_NAME} SRC ${ARG_SRC} DEPS ${ARG_DEPS} ${SRCHASH_CODEGEN_ARGS} INCLUDE_DIR ${INCLUDE_DIR})
-    if(ARTIFACT_MODE STREQUAL "Single")
-        foreach(SRC ${ARG_SRC})
-            target_sources(${PARABIX_MONO_TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/${SRC})
-        endforeach()
+    if(ARTIFACT_MODE STREQUAL "Single" AND NOT ARG_EXCLUDE_FROM_SINGLE)
+        # An object library: its objects are linked into the single artifact
+        # (parabix_single_finalize), and its settings and dependencies apply
+        # to them as they would to a library of its own.
+        add_library(${ARG_NAME} OBJECT ${ARG_SRC})
+        set_target_properties(${ARG_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        set_property(GLOBAL APPEND PROPERTY PARABIX_SINGLE_MODULES ${ARG_NAME})
+        target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
     else()
         if(ARTIFACT_TYPE STREQUAL "Static")
             add_library(${ARG_NAME} STATIC ${ARG_SRC})
@@ -318,29 +330,64 @@ function(parabix_add_module)
         if(NOT ARG_NO_SOURCE_HASH)
             parabix_srchash_attach(${ARG_NAME})
         endif()
-        target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
-        if (ARG_REQUIRES_RTTI)
-            target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
+        if(ARTIFACT_MODE STREQUAL "Single")
+            parabix_single_link_later(${ARG_NAME} ${ARG_DEPS})
         else()
-            target_compile_options(${ARG_NAME} PUBLIC ${NO_RTTI})
-        endif()
-        if (ENABLE_PAPI)
-            target_link_libraries(${ARG_NAME} PUBLIC ${PAPI_LIBRARIES})
-        endif()
-        if (LIBBACKTRACE_FOUND)
-            target_link_libraries(${ARG_NAME} PUBLIC ${LIBBACKTRACE_LIBRARIES})
-            if (LIBUNWIND_FOUND)
-            target_link_libraries(${ARG_NAME} PUBLIC ${LIBUNWIND_LIBRARIES})
-            endif()
-            if (Backtrace_FOUND)
-            target_link_libraries(${ARG_NAME} PUBLIC ${Backtrace_LIBRARIES})
-            endif()
-        endif()
-        IF (CMAKE_BUILD_TYPE MATCHES Debug)
-            target_link_libraries(${ARG_NAME} PUBLIC ${CMAKE_DL_LIBS})
+            target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
         endif()
     endif()
+    if (ARG_REQUIRES_RTTI)
+        target_compile_options(${ARG_NAME} PUBLIC ${RTTI})
+    else()
+        target_compile_options(${ARG_NAME} PUBLIC ${NO_RTTI})
+    endif()
+    if (ENABLE_PAPI)
+        target_link_libraries(${ARG_NAME} PUBLIC ${PAPI_LIBRARIES})
+    endif()
+    if (LIBBACKTRACE_FOUND)
+        target_link_libraries(${ARG_NAME} PUBLIC ${LIBBACKTRACE_LIBRARIES})
+        if (LIBUNWIND_FOUND)
+        target_link_libraries(${ARG_NAME} PUBLIC ${LIBUNWIND_LIBRARIES})
+        endif()
+        if (Backtrace_FOUND)
+        target_link_libraries(${ARG_NAME} PUBLIC ${Backtrace_LIBRARIES})
+        endif()
+    endif()
+    IF (CMAKE_BUILD_TYPE MATCHES Debug)
+        target_link_libraries(${ARG_NAME} PUBLIC ${CMAKE_DL_LIBS})
+    endif()
 endfunction(parabix_add_module)
+
+# In ARTIFACT_MODE=Single, the modules a target depends on are part of the
+# single artifact, so it links that instead of them; linking their object
+# libraries would add a second copy of their objects.  Which DEPS are such
+# modules is known only once all are defined, so the links are made by
+# parabix_single_finalize.
+function(parabix_single_link_later TARGET)
+    set_property(GLOBAL APPEND PROPERTY PARABIX_SINGLE_USERS ${TARGET})
+    set_property(GLOBAL PROPERTY PARABIX_SINGLE_DEPS_${TARGET} ${ARGN})
+endfunction(parabix_single_link_later)
+
+function(parabix_single_finalize)
+    get_property(MODULES GLOBAL PROPERTY PARABIX_SINGLE_MODULES)
+    # PRIVATE: the users of the single artifact are not to link the modules'
+    # own dependencies (e.g., the LLVM archives) a second time.
+    target_link_libraries(${PARABIX_MONO_TARGET} PRIVATE ${MODULES})
+    # What a user of the separate module libraries would get from them.
+    target_link_libraries(${PARABIX_MONO_TARGET} INTERFACE ${Boost_LIBRARIES})
+    if(NOT APPLE OR ARTIFACT_TYPE STREQUAL "Static")
+        # Not embedded in the artifact (see lib/toolchain/CMakeLists.txt)
+        target_link_libraries(${PARABIX_MONO_TARGET} INTERFACE ${REQ_LLVM_LIBRARIES})
+    endif()
+    get_property(USERS GLOBAL PROPERTY PARABIX_SINGLE_USERS)
+    foreach(USER ${USERS})
+        get_property(DEPS GLOBAL PROPERTY PARABIX_SINGLE_DEPS_${USER})
+        if(DEPS)
+            list(REMOVE_ITEM DEPS ${MODULES})
+        endif()
+        target_link_libraries(${USER} PUBLIC ${PARABIX_MONO_TARGET} ${DEPS})
+    endforeach()
+endfunction(parabix_single_finalize)
 
 function(parabix_add_executable)
     cmake_parse_arguments(
@@ -361,12 +408,12 @@ function(parabix_add_executable)
     parabix_srchash_attach(${ARG_NAME})
     target_compile_options(${ARG_NAME} PRIVATE ${NO_RTTI})
     if(ARTIFACT_MODE STREQUAL "Single")
-        target_link_libraries(${ARG_NAME} PUBLIC ${PARABIX_MONO_TARGET})
+        parabix_single_link_later(${ARG_NAME} ${ARG_DEPS})
     else()
         target_link_libraries(${ARG_NAME} PUBLIC ${ARG_DEPS})
+        target_link_libraries(${ARG_NAME} PUBLIC toolchain)
+        target_link_libraries(${ARG_NAME} PUBLIC kernel.pipeline)
     endif()
-    target_link_libraries(${ARG_NAME} PUBLIC toolchain)
-    target_link_libraries(${ARG_NAME} PUBLIC kernel.pipeline)
 endfunction(parabix_add_executable)
 
 # Creates a pablo source target which copies pablo source files to the parabix
@@ -393,6 +440,9 @@ endfunction(parabix_add_pablo_src)
 ###   Add Subdirectories   ###
 
 if(ARTIFACT_MODE STREQUAL "Single")
+    if(NOT POLICY CMP0079)
+        message(FATAL_ERROR "ARTIFACT_MODE=Single requires CMake 3.13 or later")
+    endif()
     if(ARTIFACT_TYPE STREQUAL "Static")
         add_library(${PARABIX_MONO_TARGET} STATIC "")
     else()
@@ -470,15 +520,17 @@ if (GENERATE_TOOLS)
     add_subdirectory(tools/ldml)
 endif()
 
-# Kernel Tests
-add_subdirectory(tests)
+if (PARABIX_BUILD_TESTS)
+    # Kernel Tests
+    add_subdirectory(tests)
 
-# Standalone unit tests
-add_subdirectory(QA/unit-tests)
+    # Standalone unit tests
+    add_subdirectory(QA/unit-tests)
+endif()
 
-# Target definition for single library
+# Links of the single library and of its users, once every module is defined
 if(ARTIFACT_MODE STREQUAL "Single")
-    target_link_libraries(${PARABIX_MONO_TARGET} ${REQ_LLVM_LIBRARIES} ${Boost_LIBRARIES} ${LIBBACKTRACE_LIBRARIES})
+    parabix_single_finalize()
 endif()
 
 # Source hashes need every target defined (see cmake/ParabixSourceHash.cmake)
@@ -551,6 +603,12 @@ add_test(
   NAME wc_files_test
   WORKING_DIRECTORY ${QA_DIR}
   COMMAND python3 wc_files_test.py ${BIN_DIR})
+
+# No two options of a program may share a name (in ARTIFACT_MODE=Single, of any library)
+add_test(
+  NAME option_registration_test
+  WORKING_DIRECTORY ${QA_DIR}
+  COMMAND python3 option_registration_test.py ${BIN_DIR} ${PROJECT_BINARY_DIR}/tests/bin)
 
 add_test(
   NAME ldml_trules_test

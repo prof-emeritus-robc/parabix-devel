@@ -95,7 +95,7 @@ MaxLimitTerminationMode("maxlimit-termination-mode",
                              clEnumValN(UntilNMode::ZeroAfterN, "zero", "fully process the file")));
 
 
-static cl::opt<bool> UseLayers("UseLayers", cl::desc("Use pipeline layers"), cl::init(false));
+static cl::opt<bool> UseLayers("GrepUseLayers", cl::desc("Use pipeline layers"), cl::init(false));
 
 const auto ENCODING_BITS = 8;
 

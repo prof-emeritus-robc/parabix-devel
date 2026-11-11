@@ -1,0 +1,225 @@
+#  Part of the Parabix Project, under the Open Software License 3.0.
+#  SPDX-License-Identifier: OSL-3.0
+#
+# Continuous integration: at most one run a day.  The only automatic trigger
+# is the daily schedule (no runs on push or pull request), and a scheduled
+# run is skipped when master has not changed since the last completed run.
+# A run can also be started by hand (Actions tab, "Run workflow").
+#
+# Jobs (all on GitHub's standard runners, free for public repositories):
+#   linux-x64, linux-arm64, macos   development build (ARTIFACT_MODE=Multiple), all tests
+#   install                         Linux single-library build: tests, a system-wide
+#                                   install with its object cache, make installcheck,
+#                                   uninstall, and a DEB package installed and removed
+#   freebsd                         development build and tests in a FreeBSD VM
+#
+# GitHub disables scheduled workflows of a repository with no activity for
+# 60 days; enable it again in the Actions tab.
+
+name: CI
+
+on:
+  schedule:
+    - cron: "17 9 * * *"     # 09:17 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: ci
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CCACHE_MAXSIZE: 1G
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+jobs:
+  changes:
+    name: New commits?
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # The commit of the last completed run of this workflow (whatever its result)
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?branch=master&status=completed&per_page=1" \
+                   --jq '.workflow_runs[0].head_sha // ""')
+          if [ "$last" = "${{ github.sha }}" ]; then
+            echo "master is unchanged since the last run ($last): skipping"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    name: ${{ matrix.name }}
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake make g++ ccache python3 \
+            llvm-18-dev libpolly-18-dev libboost-all-dev libicu-dev \
+            zlib1g-dev libzstd-dev libxml2-dev libbz2-dev liblzma-dev
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ccache-${{ matrix.name }}-
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/lib/llvm-18 \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 4
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.name }}
+          path: build/Testing/Temporary/LastTest.log
+          retention-days: 7
+
+  macos:
+    name: macos
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install llvm boost icu4c ccache
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-macos-${{ github.sha }}
+          restore-keys: ccache-macos-
+      - name: Configure
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH="$(brew --prefix llvm)" \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 3
+      - name: Upload test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-macos
+          path: build/Testing/Temporary/LastTest.log
+          retention-days: 7
+
+  install:
+    name: install (linux-x64, single library)
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake make g++ ccache python3 dpkg-dev \
+            llvm-18-dev libpolly-18-dev libboost-all-dev libicu-dev \
+            zlib1g-dev libzstd-dev libxml2-dev libbz2-dev liblzma-dev
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-install-${{ github.sha }}
+          restore-keys: ccache-install-
+      - name: Configure (System scope, /usr/local, /var/cache/parabix)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/lib/llvm-18 \
+                -DARTIFACT_MODE=Single -DPARABIX_INSTALL_SCOPE=System \
+                -DPARABIX_PACKAGE_MAINTAINER="Parabix CI" \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 4
+      - name: Install, filling the system-wide object cache
+        run: |
+          sudo cmake --build build --target install-tools
+          sudo chown -R "$(id -u):$(id -g)" build
+          ls -l /var/cache/parabix | head
+          test -n "$(ls /var/cache/parabix/*.kernel)"
+      - name: Test the installed tools
+        run: |
+          cmake --build build --target installcheck
+          # The kernels of a prewarmed tool come from the system-wide cache
+          rm -rf "$RUNNER_TEMP/usercache"
+          PARABIX_OBJECT_CACHE_DIR="$RUNNER_TEMP/usercache" /usr/local/bin/px-wc -trace-object-cache README.md 2>&1 \
+            | tee "$RUNNER_TEMP/trace.txt"
+          grep -q "Read cache file (system cache)" "$RUNNER_TEMP/trace.txt"
+      - name: Uninstall
+        run: |
+          sudo cmake --build build --target uninstall
+          test ! -e /usr/local/share/parabix
+          test ! -e /usr/local/lib/libparabix.so.0.9
+          test ! -e /var/cache/parabix
+      - name: DEB package
+        run: |
+          cd build
+          cpack -G DEB
+          sudo apt-get install -y ./parabix_0.9.0_*.deb
+          /usr/local/bin/icgrep -c Parabix ../README.md
+          test -n "$(ls /var/cache/parabix/*.kernel)"
+          sudo apt-get remove -y parabix
+          test ! -e /var/cache/parabix
+          test ! -e /usr/local/bin/icgrep
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-install
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/installcheck/Testing/Temporary/LastTest.log
+          retention-days: 7
+
+  freebsd:
+    name: freebsd
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          cpu: 4
+          mem: 12288
+          usesh: true
+          prepare: |
+            pkg install -y cmake ninja llvm18 boost-libs icu python3 bash
+          run: |
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/local/llvm18
+            cmake --build build
+            ctest --test-dir build --output-on-failure -j 4

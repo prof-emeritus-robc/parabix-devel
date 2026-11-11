@@ -188,13 +188,77 @@ ParabixObjectCache::LoadResult ParabixObjectCache::lookupCachedObjectFile(kernel
         return LoadResult{nullptr, nullptr};
     }
 
-    Path fileName(mCachePath);
-    sys::path::append(fileName, cachePrefix());
     const auto moduleId = kernel->makeCacheName(builder);
-    fileName.append(moduleId);
-    fileName.append(KERNEL_FILE_EXTENSION);
     if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
         traceSourceTag(kernel);
+    }
+    // The user's cache first, then the system-wide one
+    auto result = lookupCachedObjectFileIn(mCachePath, false, moduleId, kernel, C);
+    if (result.second == nullptr && !mSystemCachePath.empty()) {
+        result = lookupCachedObjectFileIn(mSystemCachePath, true, moduleId, kernel, C);
+    }
+    return result;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief isTrustedSystemCacheFile
+ *
+ * The system-wide cache holds object code that every user runs, so its files (and directory) are used only if
+ * they belong to root, or to the user running the program, and no one else can write them.
+ ** ------------------------------------------------------------------------------------------------------------- */
+static bool isTrustedSystemCacheFile(const char * const path) {
+    struct stat st;
+    if (::stat(path, &st) != 0) {
+        return false;
+    }
+    return (st.st_uid == 0 || st.st_uid == ::geteuid()) && (st.st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief isTrustedSystemCacheDir
+ *
+ * A trusted directory, in directories that no one else can replace it in: each belongs to root or to the user,
+ * and either no one else can write it or it has the sticky bit (as /tmp).
+ ** ------------------------------------------------------------------------------------------------------------- */
+static bool isTrustedSystemCacheDir(const StringRef dir) {
+    Path real;
+    if (sys::fs::real_path(dir, real) || !sys::fs::is_directory(real) || !isTrustedSystemCacheFile(real.c_str())) {
+        return false;
+    }
+    for (StringRef ancestor = sys::path::parent_path(real); !ancestor.empty(); ancestor = sys::path::parent_path(ancestor)) {
+        struct stat st;
+        const std::string path = ancestor.str();
+        if (::stat(path.c_str(), &st) != 0 || (st.st_uid != 0 && st.st_uid != ::geteuid())) {
+            return false;
+        }
+        if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0 && (st.st_mode & S_ISVTX) == 0) {
+            return false;
+        }
+        if (ancestor == sys::path::root_path(ancestor)) {
+            break;
+        }
+    }
+    return true;
+}
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief lookupCachedObjectFileIn
+ *
+ * Finds the entry for the kernel in the cache directory DIR: the user's, or the system-wide one (SYSTEM), which
+ * is only read.
+ ** ------------------------------------------------------------------------------------------------------------- */
+ParabixObjectCache::LoadResult ParabixObjectCache::lookupCachedObjectFileIn(const Path & dir, const bool system, const std::string & moduleId,
+                                                                            kernel::Kernel * kernel, LLVMContext & C) noexcept {
+    const char * const where = system ? " (system cache)" : "";
+    Path fileName(dir);
+    sys::path::append(fileName, cachePrefix());
+    fileName.append(moduleId);
+    fileName.append(KERNEL_FILE_EXTENSION);
+    if (LLVM_UNLIKELY(system && sys::fs::exists(fileName) && !isTrustedSystemCacheFile(fileName.c_str()))) {
+        if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+            errs() << "Untrusted cache file (owner or permissions): " << fileName << "\n";
+        }
+        return LoadResult{nullptr, nullptr};
     }
     auto kernelBuffer = MemoryBuffer::getFile(fileName, false, false, false);
     if (kernelBuffer) {
@@ -229,20 +293,29 @@ ParabixObjectCache::LoadResult ParabixObjectCache::lookupCachedObjectFile(kernel
                 return LoadResult{nullptr, nullptr};
             }
             sys::path::replace_extension(fileName, OBJECT_FILE_EXTENSION);
+            if (LLVM_UNLIKELY(system && !isTrustedSystemCacheFile(fileName.c_str()))) {
+                if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+                    errs() << "Untrusted or missing cache file: " << fileName << "\n";
+                }
+                return LoadResult{nullptr, nullptr};
+            }
             auto objectBuffer = MemoryBuffer::getFile(fileName.c_str(), false, false, false);
             if (LLVM_LIKELY(objectBuffer)) {
 
                 // defaults to <path>/<moduleId>.kernel
                 auto obj = std::move(*objectBuffer);
 
-                // update the modified time of the .o and .kernel files
-                const auto access_time = currentTime();
-                fs::last_write_time(fileName.c_str(), access_time);
-                sys::path::replace_extension(fileName, KERNEL_FILE_EXTENSION);
-                fs::last_write_time(fileName.c_str(), access_time);
+                // update the modified time of the .o and .kernel files, by which
+                // cachejanitord expires them (the system-wide cache is only read)
+                if (!system) {
+                    const auto access_time = currentTime();
+                    fs::last_write_time(fileName.c_str(), access_time);
+                    sys::path::replace_extension(fileName, KERNEL_FILE_EXTENSION);
+                    fs::last_write_time(fileName.c_str(), access_time);
+                }
 
                 if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-                    errs() << "Read cache file: " << moduleId << KERNEL_FILE_EXTENSION
+                    errs() << "Read cache file" << where << ": " << moduleId << KERNEL_FILE_EXTENSION
                            << " (" << optLevelName(cachedLevels.first) << "/" << optLevelName(cachedLevels.second) << ")\n";
                     if (LLVM_UNLIKELY(codegen::DebugOptionIsSet(codegen::VerifyCache) && !kernel->hasDeterministicCodeGeneration())) {
                         errs() << "Not verified (nondeterministic code generation): " << cachePrefix() << moduleId
@@ -253,10 +326,10 @@ ParabixObjectCache::LoadResult ParabixObjectCache::lookupCachedObjectFile(kernel
                 return std::make_pair(std::move(obj), std::move(H));
             }
         } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-            errs() << "Failed to load cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
+            errs() << "Failed to load cache file" << where << ": " << moduleId << KERNEL_FILE_EXTENSION << "\n";
         }
     } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
-        errs() << "No cache file: " << moduleId << KERNEL_FILE_EXTENSION << "\n";
+        errs() << "No cache file" << where << ": " << moduleId << KERNEL_FILE_EXTENSION << "\n";
     }
     return LoadResult{nullptr, nullptr};
 }
@@ -456,6 +529,10 @@ static void writeCacheFileAtomically(const ParabixObjectCache::Path & finalPath,
         raw_fd_ostream out(tempFD, true);
         write(out);
     }
+    // The system-wide cache is read by all users
+    if (LLVM_UNLIKELY(codegen::PrewarmSystemObjectCache)) {
+        sys::fs::setPermissions(tempPath, sys::fs::all_read | sys::fs::owner_write);
+    }
     EC = sys::fs::rename(tempPath, finalPath);
     if (LLVM_UNLIKELY(EC)) {
         sys::fs::remove(tempPath);
@@ -566,6 +643,10 @@ inline bool ParabixObjectCache::requiresCacheCleanUp() noexcept {
  * @brief initiateCacheCleanUp
  ** ------------------------------------------------------------------------------------------------------------- */
 void ParabixObjectCache::initiateCacheCleanUp() noexcept {
+    // The system-wide cache is filled when installing, and never expires.
+    if (LLVM_UNLIKELY(codegen::PrewarmSystemObjectCache)) {
+        return;
+    }
     // The janitor installed with Parabix (or in the build tree), never one
     // found on the PATH; without one the cache is not cleaned up.
     const std::string janitorPath = codegen::findInstalledFile(codegen::InstallDir::Libexec, CACHE_JANITOR_FILE_NAME);
@@ -627,12 +708,28 @@ inline size_t parseInt(const StringRef & str, const StringRef & label) {
  * @brief loadCacheSettings
  ** ------------------------------------------------------------------------------------------------------------- */
 inline void ParabixObjectCache::loadCacheSettings() noexcept {
-    if (codegen::ObjectCacheDir) {
+    if (LLVM_UNLIKELY(codegen::PrewarmSystemObjectCache)) {
+        // Compiling into the system-wide cache (when installing): it is the only one.
+        const auto systemDir = codegen::getSystemObjectCacheDir();
+        if (systemDir.empty()) {
+            report_fatal_error("--prewarm-system-object-cache: there is no system-wide object cache");
+        }
+        mCachePath.assign(systemDir);
+    } else if (codegen::ObjectCacheDir) {
+        // The only cache: not the system-wide one.
         mCachePath.assign(codegen::ObjectCacheDir);
         // the cache cleanup daemon is handed this path; resolve it now
         sys::fs::make_absolute(mCachePath);
     } else {
         mCachePath.assign(codegen::getDefaultObjectCacheDir());
+        const auto systemDir = codegen::getSystemObjectCacheDir();
+        if (!systemDir.empty() && sys::fs::exists(systemDir)) {
+            if (isTrustedSystemCacheDir(systemDir)) {
+                mSystemCachePath.assign(systemDir);
+            } else if (LLVM_UNLIKELY(codegen::TraceObjectCache)) {
+                errs() << "Not using the untrusted system-wide object cache (owner or permissions): " << systemDir << "\n";
+            }
+        }
     }
     #if 0
 
@@ -675,6 +772,9 @@ inline void ParabixObjectCache::loadCacheSettings() noexcept {
     #endif
 
     const auto err = sys::fs::create_directories(mCachePath, true);
+    if (LLVM_UNLIKELY(codegen::PrewarmSystemObjectCache && !err)) {
+        sys::fs::setPermissions(mCachePath, sys::fs::all_read | sys::fs::all_exe | sys::fs::owner_write);
+    }
 
     if (LLVM_UNLIKELY(err)) {
         std::string tmp;

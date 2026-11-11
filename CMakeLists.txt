@@ -68,6 +68,21 @@ endif()
 set(PARABIX_INSTALL_TOOLS "default" CACHE STRING
     "Tools installed by make install: default, dev, all, or tool names (see cmake/ParabixInstall.cmake)")
 option(PARABIX_STATIC_BOOST "Link Boost statically into the single library (ARTIFACT_MODE=Single)" ON)
+# The system-wide object cache: read-only for the tools, filled when
+# installing (see cmake/ParabixInstall.cmake).  Only for System installs.
+set(PARABIX_SYSTEM_OBJECT_CACHE_DIR "" CACHE STRING
+    "System-wide object cache of a System install (empty: /var/cache/parabix, /Library/Caches/parabix on macOS; none: no system cache)")
+set(PARABIX_SYSTEM_CACHE "")
+if(ARTIFACT_MODE STREQUAL "Single" AND PARABIX_INSTALL_SCOPE STREQUAL "System"
+   AND NOT PARABIX_SYSTEM_OBJECT_CACHE_DIR STREQUAL "none")
+    if(PARABIX_SYSTEM_OBJECT_CACHE_DIR)
+        set(PARABIX_SYSTEM_CACHE ${PARABIX_SYSTEM_OBJECT_CACHE_DIR})
+    elseif(APPLE)
+        set(PARABIX_SYSTEM_CACHE /Library/Caches/parabix)
+    else()
+        set(PARABIX_SYSTEM_CACHE /var/cache/parabix)
+    endif()
+endif()
 
 # Ensure custom FindXYZ.cmake files are found
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

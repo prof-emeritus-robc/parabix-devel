@@ -13,7 +13,8 @@
 
 // Set in lib/toolchain/CMakeLists.txt from the GNUInstallDirs directories.
 #if !defined(PARABIX_BINDIR_TO_LIBEXECDIR) || !defined(PARABIX_BINDIR_TO_DATADIR) \
-    || !defined(PARABIX_INSTALL_LIBEXECDIR) || !defined(PARABIX_INSTALL_DATADIR)
+    || !defined(PARABIX_INSTALL_LIBEXECDIR) || !defined(PARABIX_INSTALL_DATADIR) \
+    || !defined(PARABIX_SYSTEM_OBJECT_CACHE_DIR)
 #error "installation directories not defined"
 #endif
 
@@ -62,6 +63,13 @@ std::string getDefaultObjectCacheDir() {
     sys::path::home_directory(path);
     sys::path::append(path, ".parabix", "objcache");
     return std::string(path.str());
+}
+
+std::string getSystemObjectCacheDir() {
+    if (const char * const dir = std::getenv("PARABIX_SYSTEM_OBJECT_CACHE_DIR")) {
+        return dir;
+    }
+    return PARABIX_SYSTEM_OBJECT_CACHE_DIR;
 }
 
 }

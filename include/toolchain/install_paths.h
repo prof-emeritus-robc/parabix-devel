@@ -31,4 +31,11 @@ std::string findInstalledFile(InstallDir dir, llvm::StringRef relativePath);
 // otherwise ~/.parabix/objcache.
 std::string getDefaultObjectCacheDir();
 
+// The system-wide object cache directory, read by all users after their own
+// cache and written only when installing (-prewarm-system-object-cache):
+// $PARABIX_SYSTEM_OBJECT_CACHE_DIR if set (empty for none), otherwise the
+// one configured (PARABIX_SYSTEM_OBJECT_CACHE_DIR in CMake; none unless
+// installing for all users).  Empty if there is none.
+std::string getSystemObjectCacheDir();
+
 }

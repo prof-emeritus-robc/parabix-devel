@@ -89,6 +89,8 @@ protected:
 
 private:
     LoadResult lookupCachedObjectFile(kernel::KernelBuilder & builder, kernel::Kernel * kernel, llvm::LLVMContext & C) noexcept;
+    LoadResult lookupCachedObjectFileIn(const Path & dir, bool system, const std::string & moduleId,
+                                        kernel::Kernel * kernel, llvm::LLVMContext & C) noexcept;
     void initiateCacheCleanUp() noexcept;
     bool requiresCacheCleanUp() noexcept;
     bool cachejanitordAppearsAlive() noexcept;
@@ -96,6 +98,8 @@ private:
     static bool         mStartedCacheCleanupDaemon;
     ObjectBufferCache   mCachedObject;
     Path                mCachePath;
+    // The system-wide cache, read after the user's (mCachePath); empty if none.
+    Path                mSystemCachePath;
     // CPUDriverCompiler's worker threads call loadCachedObjectFile/saveCachedObjectFile
     // concurrently for different kernels; mCachedObject (an llvm::StringMap) and the
     // on-disk .o/.kernel files it mirrors are not otherwise safe against that.

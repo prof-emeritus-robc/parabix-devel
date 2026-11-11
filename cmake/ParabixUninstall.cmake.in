@@ -13,7 +13,8 @@
 # documents when no other Parabix tool remains.  Options:
 #   -DPREFIX=<prefix>   the installation (default: the one holding this script)
 #   $DESTDIR            as when installing
-# The object caches of users (~/.parabix/objcache) are left alone.
+# The object caches of users (~/.parabix/objcache) are left alone; the
+# system-wide one (of a System install) is removed with the runtime.
 
 cmake_minimum_required(VERSION 3.14)
 
@@ -71,6 +72,22 @@ endif()
 
 if(EXISTS "${RECORDS}/runtime.txt")
     uninstall_component(runtime)
+    # The system-wide object cache, filled when installing: its files only
+    # (the directory may have been given as one holding other things)
+    set(SYSTEM_CACHE "@PARABIX_SYSTEM_CACHE@")
+    if(SYSTEM_CACHE AND IS_DIRECTORY "$ENV{DESTDIR}${SYSTEM_CACHE}")
+        set(SYSTEM_CACHE "$ENV{DESTDIR}${SYSTEM_CACHE}")
+        file(GLOB CACHE_FILES "${SYSTEM_CACHE}/*.kernel" "${SYSTEM_CACHE}/*.o" "${SYSTEM_CACHE}/*.tmp-*"
+                              "${SYSTEM_CACHE}/library.sha256")
+        message(STATUS "Removing the system-wide object cache: ${SYSTEM_CACHE}")
+        if(CACHE_FILES)
+            file(REMOVE ${CACHE_FILES})
+        endif()
+        file(GLOB ENTRIES LIST_DIRECTORIES true "${SYSTEM_CACHE}/*" "${SYSTEM_CACHE}/.*")
+        if(NOT ENTRIES)
+            file(REMOVE_RECURSE "${SYSTEM_CACHE}")
+        endif()
+    endif()
 endif()
 
 # The directories of Parabix, once empty (most specific first)

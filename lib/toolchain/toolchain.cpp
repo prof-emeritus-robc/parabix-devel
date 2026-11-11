@@ -329,7 +329,7 @@ static cl::opt<std::string> ObjectCacheDirOption("object-cache-dir", cl::init(""
 bool PrewarmSystemObjectCache = false;
 static cl::opt<bool, true> PrewarmSystemObjectCacheOption("prewarm-system-object-cache", cl::location(PrewarmSystemObjectCache), cl::init(false),
                                                           cl::desc("Compile into the system-wide object cache, read by all users "
-                                                                   "(done when installing, by share/parabix/prewarm.cmake)."),
+                                                                   "(done when installing, by share/parabix/prewarm.sh)."),
                                                           cl::cat(CodeGenOptions), cl::Hidden);
 
 std::string ObjectCacheSalt;

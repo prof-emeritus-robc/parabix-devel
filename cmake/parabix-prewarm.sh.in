@@ -1,0 +1,116 @@
+#!/bin/sh
+#  Part of the Parabix Project, under the Open Software License 3.0.
+#  SPDX-License-Identifier: OSL-3.0
+#
+# Fills the system-wide object cache (@PARABIX_SYSTEM_CACHE@) by running
+# the installed tools once each, on small inputs, with
+# -prewarm-system-object-cache: the kernels they compile are then read by
+# every user's tools, after their own cache (~/.parabix/objcache).  Only
+# kernels that do not depend on what a run asks for (e.g., a regular
+# expression) are of use to other runs.
+#
+# Run (as the owner of the installation, normally root) when installing for
+# all users -- installing does so, and so do the packages' post-install
+# scripts:
+#
+#   sh <prefix>/@PARABIX_PREWARM_SCRIPT@             all installed tools
+#   sh <prefix>/@PARABIX_PREWARM_SCRIPT@ <tool>...   some tools
+#   sh <prefix>/@PARABIX_PREWARM_SCRIPT@ --remove    empty and remove the cache
+#
+# The objects are compiled for the processor of the machine running this,
+# so it is run where the tools are used (not where a package is built).
+# When the installed library has changed, the cache is first emptied: its
+# entries are of the earlier library.  POSIX sh, no other requirement.
+
+CACHE_DIR="@PARABIX_SYSTEM_CACHE@"
+[ -n "$CACHE_DIR" ] || { echo "No system-wide object cache is configured"; exit 0; }
+
+# This script is <prefix>/@PARABIX_PREWARM_SCRIPT@
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd -P)
+PREFIX=$(cd "$SCRIPT_DIR/@PARABIX_UNINSTALL_SCRIPT_TO_PREFIX@" && pwd -P)
+RECORDS="$PREFIX/@PARABIX_RECORD_DIR@"
+
+empty_cache() {
+    rm -f "$CACHE_DIR"/*.kernel "$CACHE_DIR"/*.o "$CACHE_DIR"/*.tmp-* "$CACHE_DIR/library.cksum"
+}
+
+if [ "$1" = "--remove" ]; then
+    if [ -d "$CACHE_DIR" ]; then
+        empty_cache
+        rmdir "$CACHE_DIR" 2>/dev/null
+    fi
+    exit 0
+fi
+
+[ -f "$RECORDS/runtime.txt" ] || { echo "No Parabix installation in $PREFIX" >&2; exit 1; }
+
+# A new library: its kernels have new keys, and the old entries would stay
+# forever (the system-wide cache does not expire).
+LIBRARY=
+while read -r REL; do
+    case "$REL" in
+        @CMAKE_INSTALL_LIBDIR@/libparabix*) [ -L "$PREFIX/$REL" ] || LIBRARY="$PREFIX/$REL" ;;
+    esac
+done < "$RECORDS/runtime.txt"
+SUM=$(cksum < "$LIBRARY")
+mkdir -p "$CACHE_DIR" && chmod 755 "$CACHE_DIR" || exit 1
+if [ "$(cat "$CACHE_DIR/library.cksum" 2>/dev/null)" != "$SUM" ]; then
+    if ls "$CACHE_DIR"/*.kernel > /dev/null 2>&1; then
+        echo "Emptying $CACHE_DIR (entries of an earlier library)"
+    fi
+    empty_cache
+    echo "$SUM" > "$CACHE_DIR/library.cksum"
+fi
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/parabix-prewarm.XXXXXX") || exit 1
+trap 'rm -rf "$WORK"' EXIT
+TXT="$WORK/input.txt"
+CSV="$WORK/input.csv"
+printf 'The quick brown fox jumps over the lazy dog.\n\303\211tude, na\303\257ve caf\303\251; \316\225\316\273\316\273\316\267\316\275\316\271\316\272\316\254 \346\274\242\345\255\227\n' > "$TXT"
+printf 'name,count\nfox,1\ndog,2\n' > "$CSV"
+
+# Runs a tool on its inputs (tools needing particular inputs are not run).
+prewarm() {
+    TOOL=$1
+    case "$TOOL" in
+        icgrep) PROGRAM="$PREFIX/@CMAKE_INSTALL_BINDIR@/icgrep" ;;
+        *)      PROGRAM="$PREFIX/@CMAKE_INSTALL_BINDIR@/px-$TOOL" ;;
+    esac
+    set --
+    case "$TOOL" in
+        icgrep)                set -- "-c fox" "-c -i \\w+" ;;
+        ucount|ufilter)        set -- "\\p{L}" ;;
+        tconv)                 set -- "Latin-ASCII" ;;
+        csvcut|csvgrep|csv2json) set -- "" ;;
+        wc|base64|hexlines|gb18030|nfc|nfd|nfkd|u32u16|u32u8|u8u16|x8u16|tokenizer|editd|hashdemo|matchprior|ztf-runs|stereo2mono)
+                               set -- "" ;;
+        *) return 0 ;;
+    esac
+    case "$TOOL" in
+        csv*) INPUT="$CSV" ;;
+        *)    INPUT="$TXT" ;;
+    esac
+    echo "Prewarming the system-wide object cache: $TOOL"
+    for ARGS in "$@"; do
+        # (word splitting of ARGS intended; icgrep -c exits 1 when nothing matches)
+        (cd "$WORK" && "$PROGRAM" -prewarm-system-object-cache $ARGS "$INPUT" > /dev/null 2> "$WORK/errors")
+        STATUS=$?
+        if [ $STATUS -gt 1 ]; then
+            echo "Prewarming with $TOOL failed ($STATUS): $(head -c 400 "$WORK/errors")" >&2
+        fi
+    done
+}
+
+if [ $# -gt 0 ]; then
+    for TOOL in "$@"; do
+        [ -f "$RECORDS/tool-$TOOL.txt" ] || { echo "$TOOL is not installed in $PREFIX" >&2; exit 1; }
+        prewarm "$TOOL"
+    done
+else
+    for RECORD in "$RECORDS"/tool-*.txt; do
+        [ -f "$RECORD" ] || continue
+        TOOL=$(basename "$RECORD" .txt)
+        prewarm "${TOOL#tool-}"
+    done
+fi
+exit 0

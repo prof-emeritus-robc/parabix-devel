@@ -78,7 +78,7 @@ if(EXISTS "${RECORDS}/runtime.txt")
     if(SYSTEM_CACHE AND IS_DIRECTORY "$ENV{DESTDIR}${SYSTEM_CACHE}")
         set(SYSTEM_CACHE "$ENV{DESTDIR}${SYSTEM_CACHE}")
         file(GLOB CACHE_FILES "${SYSTEM_CACHE}/*.kernel" "${SYSTEM_CACHE}/*.o" "${SYSTEM_CACHE}/*.tmp-*"
-                              "${SYSTEM_CACHE}/library.sha256")
+                              "${SYSTEM_CACHE}/library.cksum")
         message(STATUS "Removing the system-wide object cache: ${SYSTEM_CACHE}")
         if(CACHE_FILES)
             file(REMOVE ${CACHE_FILES})

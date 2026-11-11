@@ -31,9 +31,13 @@
 # PARABIX_SYSTEM_OBJECT_CACHE_DIR (by default /var/cache/parabix, or
 # /Library/Caches/parabix on macOS) after the user's own cache, and never
 # write it.  It is filled when a tool is installed, by running it
-# (share/parabix/prewarm.cmake), unless DESTDIR is set: the objects are for
-# the processor of the machine installing.  Uninstalling the runtime
+# (share/parabix/prewarm.sh), unless the installation is staged (DESTDIR, or
+# a prefix other than the configured one, as for packages): the objects are
+# for the processor of the machine installing.  Uninstalling the runtime
 # removes it.
+#
+# Test the installed tools:
+#   make installcheck            the tests of the build whose tools are installed
 #
 # Components: runtime (library, daemon, documents) and tool-<tool> for each
 # tool; `cmake -DCOMPONENT=tool-wc -P cmake_install.cmake` installs one.
@@ -125,9 +129,10 @@ set(PARABIX_OWNED_DIRS
     ${PARABIX_RECORD_DIR}
     ${CMAKE_INSTALL_DATADIR}/parabix
     ${CMAKE_INSTALL_DOCDIR})
-set(PARABIX_PREWARM_SCRIPT ${CMAKE_INSTALL_DATADIR}/parabix/prewarm.cmake)
+set(PARABIX_PREWARM_SCRIPT ${CMAKE_INSTALL_DATADIR}/parabix/prewarm.sh)
 configure_file(${CMAKE_CURRENT_LIST_DIR}/ParabixUninstall.cmake.in ${PROJECT_BINARY_DIR}/ParabixUninstall.cmake @ONLY)
-configure_file(${CMAKE_CURRENT_LIST_DIR}/ParabixPrewarm.cmake.in ${PROJECT_BINARY_DIR}/ParabixPrewarm.cmake @ONLY)
+configure_file(${CMAKE_CURRENT_LIST_DIR}/parabix-prewarm.sh.in ${PROJECT_BINARY_DIR}/parabix-prewarm.sh @ONLY)
+configure_file(${CMAKE_CURRENT_LIST_DIR}/ParabixInstallCheck.cmake.in ${PROJECT_BINARY_DIR}/ParabixInstallCheck.cmake @ONLY)
 
 # Records the files of a component as it is installed: PHASE START before
 # its rules, END after them.
@@ -164,12 +169,18 @@ install(FILES ${PROJECT_BINARY_DIR}/ParabixUninstall.cmake
     RENAME uninstall.cmake
     COMPONENT runtime)
 if(PARABIX_SYSTEM_CACHE)
-    install(FILES ${PROJECT_BINARY_DIR}/ParabixPrewarm.cmake
+    install(PROGRAMS ${PROJECT_BINARY_DIR}/parabix-prewarm.sh
         DESTINATION ${CMAKE_INSTALL_DATADIR}/parabix
-        RENAME prewarm.cmake
+        RENAME prewarm.sh
         COMPONENT runtime)
 endif()
 parabix_install_record(runtime END)
+
+# make installcheck: the tests of the build, on the installed tools
+add_custom_target(installcheck
+    COMMAND ${CMAKE_COMMAND} -P ${PROJECT_BINARY_DIR}/ParabixInstallCheck.cmake
+    COMMENT "Testing the tools installed in ${CMAKE_INSTALL_PREFIX}"
+    VERBATIM)
 
 # make uninstall: everything installed to the prefix
 add_custom_target(uninstall
@@ -231,11 +242,10 @@ foreach(TOOL ${PARABIX_TOOLS_DEFAULT} ${PARABIX_TOOLS_DEV} ${PARABIX_TOOLS_USER_
     if(PARABIX_SYSTEM_CACHE)
         # Prewarm the system-wide object cache with the tool (see above)
         install(CODE "
-            if(\"\$ENV{DESTDIR}\" STREQUAL \"\")
-                execute_process(COMMAND \${CMAKE_COMMAND} -DTOOL=${TOOL}
-                    -P \"\${CMAKE_INSTALL_PREFIX}/${PARABIX_PREWARM_SCRIPT}\")
+            if(\"\$ENV{DESTDIR}\" STREQUAL \"\" AND CMAKE_INSTALL_PREFIX STREQUAL \"${CMAKE_INSTALL_PREFIX}\")
+                execute_process(COMMAND sh \"\${CMAKE_INSTALL_PREFIX}/${PARABIX_PREWARM_SCRIPT}\" ${TOOL})
             else()
-                message(STATUS \"Not prewarming the system-wide object cache (DESTDIR is set): ${TOOL}\")
+                message(STATUS \"Not prewarming the system-wide object cache (staged installation): ${TOOL}\")
             endif()"
             COMPONENT tool-${TOOL} ${EXCLUDE})
     endif()

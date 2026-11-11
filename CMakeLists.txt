@@ -667,6 +667,103 @@ parabix_srchash_finalize()
 # Install and uninstall rules, once every program is defined
 include(ParabixInstall)
 
+###   Packaging (CPack)   ###
+#
+# Binary packages of an ARTIFACT_MODE=Single build, holding what make install
+# installs (the runtime and the tools of PARABIX_INSTALL_TOOLS), for all users
+# of a system:
+#
+#   cmake -DCMAKE_BUILD_TYPE=Release -DARTIFACT_MODE=Single -DPARABIX_BUILD_TESTS=OFF \
+#         -DPARABIX_INSTALL_SCOPE=System -DCMAKE_INSTALL_PREFIX=/usr/local \
+#         [-DPARABIX_INSTALL_TOOLS="default;<tool>..."] [-DPARABIX_PACKAGE_MAINTAINER="Name <address>"] ..
+#   make -j8
+#   cpack                 all of PARABIX_PACKAGE_GENERATORS: TGZ, and DEB and RPM
+#                         where dpkg-deb and rpmbuild are found
+#   cpack -G DEB          one generator (TGZ, DEB, RPM, ...; see cpack --help)
+#
+# The packages are made like a DESTDIR installation, so the system-wide object
+# cache is not filled then (its objects are for the processor of the machine
+# filling it).  The DEB and RPM packages run <prefix>/share/parabix/prewarm.sh
+# after installing, on the machine installed, and "prewarm.sh --remove" when
+# removed.  A TGZ package holds bin, lib, ... under its top directory; unpack it
+# at the prefix it was configured for (the system-wide cache is fixed), then
+# fill the cache by hand (as root):
+#   tar xzf parabix-<version>-<system>.tar.gz -C <prefix> --strip-components=1
+#   sh <prefix>/share/parabix/prewarm.sh
+# Uninstall a package with the package manager (or, for a TGZ, with
+# <prefix>/share/parabix/uninstall.cmake, which needs CMake).
+#
+# The DEB package's dependencies are found by dpkg-shlibdeps, and the RPM's by
+# rpmbuild.  Not a source package: make package_source is not configured.
+if(ARTIFACT_MODE STREQUAL "Single")
+    if(NOT PARABIX_INSTALL_SCOPE STREQUAL "System")
+        message(STATUS "Packages (cpack) are for PARABIX_INSTALL_SCOPE=System")
+    endif()
+    set(PARABIX_PACKAGE_MAINTAINER "Parabix Project" CACHE STRING "The maintainer named in packages (DEB requires one)")
+    set(PARABIX_PACKAGE_GENERATORS "TGZ" CACHE STRING "The package generators cpack runs by default")
+    find_program(PARABIX_DPKG_DEB dpkg-deb)
+    find_program(PARABIX_RPMBUILD rpmbuild)
+    mark_as_advanced(PARABIX_DPKG_DEB PARABIX_RPMBUILD)
+    set(CPACK_GENERATOR ${PARABIX_PACKAGE_GENERATORS})
+    if(PARABIX_DPKG_DEB)
+        list(APPEND CPACK_GENERATOR DEB)
+    endif()
+    if(PARABIX_RPMBUILD)
+        list(APPEND CPACK_GENERATOR RPM)
+    endif()
+    list(REMOVE_DUPLICATES CPACK_GENERATOR)
+
+    set(CPACK_PACKAGE_NAME parabix)
+    set(CPACK_PACKAGE_VENDOR "Parabix Project")
+    set(CPACK_PACKAGE_CONTACT "${PARABIX_PACKAGE_MAINTAINER}")
+    set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
+        "Unicode text processing tools (icgrep, transcoders, wc, csv, ...) using SIMD parallel bit streams")
+    set(CPACK_RESOURCE_FILE_LICENSE ${PROJECT_SOURCE_DIR}/OSL3.0.txt)
+    set(CPACK_RESOURCE_FILE_README ${PROJECT_SOURCE_DIR}/README.md)
+    set(CPACK_SOURCE_GENERATOR "")
+    # DEB and RPM packages install at the prefix; archives hold bin, lib, ...
+    # under their top directory, to unpack at the prefix:
+    #   tar xzf parabix-<version>-<system>.tar.gz -C <prefix> --strip-components=1
+    file(WRITE ${PROJECT_BINARY_DIR}/CPackProjectConfig.cmake
+        "if(CPACK_GENERATOR MATCHES \"^(DEB|RPM)$\")\n"
+        "    set(CPACK_PACKAGING_INSTALL_PREFIX \"${CMAKE_INSTALL_PREFIX}\")\n"
+        "endif()\n")
+    set(CPACK_PROJECT_CONFIG_FILE ${PROJECT_BINARY_DIR}/CPackProjectConfig.cmake)
+
+    # Scripts run by the package managers: fill the system-wide object cache
+    # after installing, and empty it when removing (not when upgrading).
+    set(PACKAGE_SCRIPTS ${PROJECT_BINARY_DIR}/package-scripts)
+    set(PREWARM "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_DATADIR}/parabix/prewarm.sh")
+    file(WRITE ${PACKAGE_SCRIPTS}/tmp/postinst
+        "#!/bin/sh\n# Fill the system-wide object cache of Parabix\n"
+        "[ ! -f \"${PREWARM}\" ] || sh \"${PREWARM}\" || true\n")
+    file(WRITE ${PACKAGE_SCRIPTS}/tmp/prerm
+        "#!/bin/sh\n# DEB: remove (not upgrade); RPM %preun: 0 when removing\n"
+        "if [ \"$1\" = remove ] || [ \"$1\" = 0 ]; then\n"
+        "    [ ! -f \"${PREWARM}\" ] || sh \"${PREWARM}\" --remove || true\n"
+        "fi\n")
+    file(COPY ${PACKAGE_SCRIPTS}/tmp/postinst ${PACKAGE_SCRIPTS}/tmp/prerm DESTINATION ${PACKAGE_SCRIPTS}
+        FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${PARABIX_PACKAGE_MAINTAINER}")
+    set(CPACK_DEBIAN_PACKAGE_SECTION utils)
+    set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
+    set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
+    set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA ${PACKAGE_SCRIPTS}/postinst ${PACKAGE_SCRIPTS}/prerm)
+
+    set(CPACK_RPM_PACKAGE_LICENSE "OSL-3.0")
+    set(CPACK_RPM_FILE_NAME RPM-DEFAULT)
+    set(CPACK_RPM_POST_INSTALL_SCRIPT_FILE ${PACKAGE_SCRIPTS}/postinst)
+    set(CPACK_RPM_PRE_UNINSTALL_SCRIPT_FILE ${PACKAGE_SCRIPTS}/prerm)
+    # Directories of the system, not of the package
+    set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
+        ${CMAKE_INSTALL_PREFIX} ${CMAKE_INSTALL_FULL_BINDIR} ${CMAKE_INSTALL_FULL_LIBDIR}
+        ${CMAKE_INSTALL_FULL_LIBEXECDIR} ${CMAKE_INSTALL_FULL_DATADIR} ${CMAKE_INSTALL_FULL_DATADIR}/doc)
+
+    include(CPack)
+endif()
+
 ###   Test Suite   ###
 
 set(QA_DIR ${PROJECT_SOURCE_DIR}/QA)

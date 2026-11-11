@@ -103,7 +103,7 @@ message(STATUS "Parabix Revision: ${Parabix_REVISION}")
 
 
 ###   Import Dependency: LLVM   ###
-set (MIN_LLVM_VERSION "16")
+set (MIN_LLVM_VERSION "17")
 if (LLVM_PATH)
 find_package(LLVM REQUIRED CONFIG PATHS ${LLVM_PATH} NO_DEFAULT_PATH)
 else()
@@ -128,6 +128,16 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DPARABIX_X86_TARGET")
 endif()
 
 llvm_map_components_to_libnames(REQ_LLVM_LIBRARIES ${PARABIX_TARGETS_TO_BUILD} orcjit jitlink mcjit native IRReader Linker IRPrinter Passes)
+# The shared module libraries of a development build link LLVM's own shared
+# library where LLVM was built with one (as LLVM's tools are, e.g., in the
+# Linux distributions and FreeBSD).  Linked with the static LLVM libraries,
+# several module libraries would each have a copy of some of LLVM's
+# command-line options ("Option ... registered more than once").
+if(ARTIFACT_MODE STREQUAL "Multiple" AND ARTIFACT_TYPE STREQUAL "Shared" AND NOT APPLE
+   AND LLVM_LINK_LLVM_DYLIB AND TARGET LLVM)
+    set(REQ_LLVM_LIBRARIES LLVM)
+    message(STATUS "Linking LLVM's shared library")
+endif()
 
 include_directories(${LLVM_INCLUDE_DIRS})
 add_definitions(${LLVM_DEFINITIONS})

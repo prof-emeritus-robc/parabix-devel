@@ -185,12 +185,25 @@ if(Boost_USE_STATIC_LIBS)
                 find_library(PARABIX_BOOST_DEP_${DEP} ${DEP} HINTS ${ICU_ROOT}/lib)
                 if(PARABIX_BOOST_DEP_${DEP})
                     set(DEP ${PARABIX_BOOST_DEP_${DEP}})
+                elseif(NOT DEP MATCHES "^(pthread|rt|dl|m|c)$")
+                    # (the linker finds those of the C library itself)
+                    list(APPEND PARABIX_BOOST_DEPS_MISSING ${DEP})
                 endif()
             endif()
             list(APPEND RESOLVED ${DEP})
         endforeach()
         set_target_properties(${LIB} PROPERTIES INTERFACE_LINK_LIBRARIES "${RESOLVED}")
     endforeach()
+    if(PARABIX_BOOST_DEPS_MISSING)
+        list(REMOVE_DUPLICATES PARABIX_BOOST_DEPS_MISSING)
+        string(REPLACE ";" " " MISSING "${PARABIX_BOOST_DEPS_MISSING}")
+        message(FATAL_ERROR
+            "The static Boost libraries need libraries that are not installed: ${MISSING}\n"
+            "Install their development packages (e.g., libbz2-dev liblzma-dev libzstd-dev on "
+            "Debian and Ubuntu; bzip2-devel xz-devel libzstd-devel on Fedora), or link Boost "
+            "dynamically with -DPARABIX_STATIC_BOOST=OFF (the installed tools then depend on "
+            "the Boost libraries of this machine).")
+    endif()
 endif()
 
 ###   Import Dependency: PAPI   ###

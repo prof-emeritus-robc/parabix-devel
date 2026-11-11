@@ -110,7 +110,12 @@ The installed files:
 
 An installation can be moved: the tools find the library and their other files relative to
 their own location.  Boost is linked into `libparabix`, so the tools do not depend on the
-Boost libraries of the machine that built them.
+Boost libraries of the machine that built them.  The static Boost libraries need some
+libraries of their own when linked: the development packages of bzip2, xz (lzma) and zstd
+(Debian and Ubuntu `libbz2-dev liblzma-dev libzstd-dev`, Fedora `bzip2-devel xz-devel
+libzstd-devel`; Homebrew's Boost also needs `icu4c`).  Without them, configure with
+`-DPARABIX_STATIC_BOOST=OFF` to link Boost dynamically instead (the installed tools then use
+the Boost libraries of the machine).
 
 ### Installing for all users
 

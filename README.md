@@ -115,7 +115,9 @@ libraries of their own when linked: the development packages of bzip2, xz (lzma)
 (Debian and Ubuntu `libbz2-dev liblzma-dev libzstd-dev`, Fedora `bzip2-devel xz-devel
 libzstd-devel`; Homebrew's Boost also needs `icu4c`).  Without them, configure with
 `-DPARABIX_STATIC_BOOST=OFF` to link Boost dynamically instead (the installed tools then use
-the Boost libraries of the machine).
+the Boost libraries of the machine).  Static libraries can be part of `libparabix` only if they
+were compiled to be position-independent (`-fPIC`), which the x86-64 Boost packages of Debian
+and Ubuntu are not: configuring checks this, and links Boost dynamically when they are not.
 
 ### Installing for all users
 

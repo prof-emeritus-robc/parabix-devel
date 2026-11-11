@@ -221,5 +221,5 @@ jobs:
             pkg install -y cmake ninja llvm18 boost-libs icu python3 bash
           run: |
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLVM_PATH=/usr/local/llvm18
-            cmake --build build
+            cmake --build build -- -k 0
             ctest --test-dir build --output-on-failure -j 4

@@ -151,10 +151,30 @@ message(STATUS "LLVM Version Integer: ${LLVM_VERSION_INTEGER}")
 if (POLICY CMP0167)
     cmake_policy(SET CMP0167 NEW)   # use Boost's own BoostConfig.cmake, not CMake's FindBoost
 endif()
-if(ARTIFACT_MODE STREQUAL "Single" AND PARABIX_STATIC_BOOST)
+if(ARTIFACT_MODE STREQUAL "Single" AND PARABIX_STATIC_BOOST AND NOT APPLE
+   AND NOT DEFINED PARABIX_BOOST_STATIC_IS_PIC)
+    # Static libraries built without -fPIC cannot be part of a shared library
+    # (as the x86-64 Boost archives of Debian and Ubuntu are).
+    message(STATUS "Checking that the static Boost libraries can be part of a shared library")
+    string(REPLACE ";" "\\;" PREFIX_PATH "${CMAKE_PREFIX_PATH}")
+    try_compile(PARABIX_BOOST_STATIC_IS_PIC
+        "${PROJECT_BINARY_DIR}/CMakeFiles/BoostStaticPicCheck"
+        "${PROJECT_SOURCE_DIR}/cmake/BoostStaticPicCheck" boost_static_pic_check
+        CMAKE_FLAGS "-DCMAKE_PREFIX_PATH=${PREFIX_PATH}" "-DBoost_DIR=${Boost_DIR}"
+                    "-DBOOST_ROOT=${BOOST_ROOT}" "-DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}")
+    set(PARABIX_BOOST_STATIC_IS_PIC ${PARABIX_BOOST_STATIC_IS_PIC} CACHE INTERNAL
+        "The static Boost libraries can be part of a shared library")
+endif()
+if(ARTIFACT_MODE STREQUAL "Single" AND PARABIX_STATIC_BOOST
+   AND (APPLE OR PARABIX_BOOST_STATIC_IS_PIC))
     # Part of libparabix, so that installed programs do not depend on the
     # Boost libraries (and versions) of the build machine.
     set(Boost_USE_STATIC_LIBS ON)
+elseif(ARTIFACT_MODE STREQUAL "Single" AND PARABIX_STATIC_BOOST)
+    message(STATUS "The static Boost libraries are not position-independent (built without "
+                   "-fPIC): linking Boost dynamically, so the installed tools use the Boost "
+                   "libraries of this machine")
+    set(Boost_USE_STATIC_LIBS OFF)
 else()
     set(Boost_USE_STATIC_LIBS ${USE_STATIC_LIBS})
 endif()
